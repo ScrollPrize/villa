@@ -1,0 +1,918 @@
+{
+  "Qual supplied fibers": {
+    "changed_state_rows": 0,
+    "correct_references": 18,
+    "historical_pieces": 369,
+    "historical_record": "/ephemeral/hendrik/fiber_crop_bench/20260923_qual_v1/qual-bp.run.json",
+    "historical_wall_seconds": 6.316657859017141,
+    "independent_missing": 2,
+    "independent_percent": 69.23076923076923,
+    "initial_pieces": 369,
+    "initial_states_identical": true,
+    "ladder": [
+      {
+        "hard_sign_errors": "1",
+        "reference": "0",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "0.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "5",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "5.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "7",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "7.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "9",
+        "winding": "9"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "9.5",
+        "winding": "8.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10",
+        "winding": "10"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10.5",
+        "winding": "10"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11",
+        "winding": "11"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11.5",
+        "winding": "11.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "12.5",
+        "winding": "12.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 66.66666666666667,
+      "ladder_shifts": 8,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "references": 26,
+    "result_record": "/ephemeral/hendrik/fiber_crop_bench/20261002_fast_historical_independent_v1/qual-bp-independent.run.json",
+    "reused_saved_readout": false,
+    "shift_unavailable": "incomplete reference ladder",
+    "tied_rows": 0,
+    "trace_hashes": {
+      ".zattrs": "2637d618b77b7c550c890036ac0d86674e26a7fa0b7e7b646efad1e56fca835d",
+      ".zgroup": "e1e1914ae531ecb50e1ead685ef01895a5452faf5f25f35cd78f1f5de1367470",
+      "traces/.zarray": "86c9411f62f2bbf445ccbfcb528998b07b1938a777c92b86b2a934e027d21564",
+      "traces/0.0.11": "1bc133dd2b4f52c9abdb68c0e7e24a14873162ba4d19a0187d7783c0fbc3bc8c",
+      "traces/0.0.12": "c72fee4c1d13be75a663fb29b4af591e5e7129b9c342336aedd0220d81fae302",
+      "traces/0.0.13": "a75e251f4fb641020b0c0aba8c0327d9efb0e221f2ee01f96de09bfbabf9fc49",
+      "traces/0.0.14": "9dae9725ac2cadf2ace97bc553a016c94fc2e972d2d6b384f0beefd0db6de3c7",
+      "traces/0.1.1": "2b72bf00f6811558308999570051d5401680060267247ee603a07b10fed404ce",
+      "traces/0.1.12": "949e809f252e380d962f677754b47c5cf1a39accc6fe2e4363e4906870f7a0cd",
+      "traces/0.1.2": "240344fef299d12ee78bd18524c7bb487bb230b88163261a268436f92508f878",
+      "traces/0.1.8": "4733b8bbbffcab17255383fffcb5e29778c29e2822deb0fd006378ba2fd5ceb9",
+      "traces/0.1.9": "62ac4627291abef0bbcb46b8be67cc2fc4a7b92e9dbe3d6f1ab062cb91fde5be",
+      "traces/0.10.1": "d823baa6620d59817322e16946d05ac7a034da8f29a68ddcdcdd089a89858e62",
+      "traces/0.10.10": "8a2d5b4d783817198a0222bc923a12d8bcd122c7667417f3746af6bf90571b53",
+      "traces/0.10.6": "94fa35010a329fc1f2666045369ba2174bcc55da6f35af975049a03631ef52ef",
+      "traces/0.10.9": "24b7a6f78ee035cbe0f2534020847c8d0a07ef5f9f9063a598ee551169d90d38",
+      "traces/0.11.10": "d162a270a1cb679a66536f0a0effe92538863aab351c136e9178e480ea0ae48e",
+      "traces/0.11.12": "ae652f9feb0162f6b321911206d715ca4768e9ff68bdc0b9ebd81929fc9d24e3",
+      "traces/0.11.6": "aed676e339132ca4fb22779d577ef5825a12287f8a4c697a1c19bf4c7c55ecc6",
+      "traces/0.12.13": "3fd22b94122b530a12d86db544bce7be36da2d88a54cc67982e6c1c9edcb15db",
+      "traces/0.12.7": "b9246a54f48310b135fe7d64da99d9d79364a8e44a88e9e0265b1128bca69f9d",
+      "traces/0.13.11": "3b5ae0f22181a879ed6e0cc46e8a1bd955460b2c3760fbe8fc0970ca83c34214",
+      "traces/0.13.5": "95dfd8fa631363600c6104fd549b2b38b9681a7b66409e3ff0d37b6186368090",
+      "traces/0.14.0": "0561501c1918e0d3162dca18eef771e9b0f17599d4ec2a6172be22afc884a804",
+      "traces/0.14.15": "ab9bf579e0052c8a2df9b8779730276aeba5f271394e333df3158fc29d0cede2",
+      "traces/0.14.7": "e26cbf502bb3d46395ffcd6aa0289a9b3b143ec7738ad69938ae65e51d3b1216",
+      "traces/0.15.1": "0e25f24d7192c9f546c65ff7c0e2252a38d29ad2419bfd4cb17a26b6b72635df",
+      "traces/0.15.10": "d0b80042bc350b43a17220b147a15d1e53e9020ccc556d9436ee56f186c478c2",
+      "traces/0.15.13": "a7b8f81911e3b884e81c0c4059bc99322665c4b596740b01059e27e1fa4d24e9",
+      "traces/0.15.14": "a839f3f3d92e3a3ce87d4bd1f40ce6154129cd333d97b45ef2f92f5ca1a61aa7",
+      "traces/0.15.2": "ff638dc7b5877d0bba9e7eccdd0f7528ab65f70db56015c32b48cd5881b79e2b",
+      "traces/0.15.6": "59b34fea30c92fd17464822dbea6baf91b74cfeaf55466bfa1b8c0ecf3c18567",
+      "traces/0.15.9": "1c24b9e5d3f79da9c0d1ee5a22f83ad209adab788102c53934f79ca337db7d6a",
+      "traces/0.2.15": "4469ece3d30e141812139d6f8291748bc6ffcfcf89054bf9919b3d87aec55cf0",
+      "traces/0.2.6": "78f0c52144b446b455a4a36e4b30d0b6d83cb978b5dca72bf7e396df64f167df",
+      "traces/0.3.0": "35fdded774e72e69e3812e6e4e8670f4053cfe5a0edae8636f2ac83b06bce881",
+      "traces/0.3.11": "612c21c823dd38fb2f3fd3575e98c6c60e3baf4372566e8d621ca089316df133",
+      "traces/0.3.14": "e439d7a521bfdd08641b9335ba82c141c86834cb7c7cfc9952adb7401067c5ae",
+      "traces/0.3.5": "88845cd570b53d33d3b3cbd1c3b162de0f05041c009bc62def30be9b880079f8",
+      "traces/0.4.10": "0a3960d954114c7707e0eda7c48af40f5dd02e92850a73d2769a8dead6f25ffb",
+      "traces/0.4.12": "4b442ff6f815124983a13842ed27602ad5d8a46d16ea4e2e022f71f953d6ce89",
+      "traces/0.4.6": "ca8c9b1c58db0156bc6380311e929b988f0f6c5fc3aff43636eee7f011262b96",
+      "traces/0.5.1": "d6d78cd68e6ea8ee56cf79b1395473b4d634254a17ebe38a2d44fa9eb1a5f00b",
+      "traces/0.5.13": "1461b934f7ad549fe7a558271859da4eb3c5f2499e434fd64f007fb4d7c054a8",
+      "traces/0.5.9": "5c7bd42f142b2a8517f0c0470400f68b8c0338085a17da6652d59799435efafb",
+      "traces/0.6.10": "f76b3b1c78b9db647e7d773be72972b99d49b2c29c9aa488a6cab312f82986ad",
+      "traces/0.6.6": "47d56ab6341934ff29233f56dd7186aefe3d39c9c95432bd19f7ea274c19eb5d",
+      "traces/0.6.9": "b7ca5413b7e9a188d81c4709fcf25808192b80637696a5fe1232a7cd836d5184",
+      "traces/0.7.13": "1489159dbff3022f29d593cd6193ad56e11d14f0d064fc224a140d4398d25c20",
+      "traces/0.7.3": "fa322fce96583639b409f7114c2027567e45ea932b29e33daac9ba3ff27e970f",
+      "traces/0.8.0": "755583902e50ece6efb613e295a4118e708b7e50d9e94908e073f5341732b290",
+      "traces/0.8.1": "b1c98ee392e1428b110048fb168784adf79b37e771f41e92f46b999411415731",
+      "traces/0.8.9": "384522e4c27b7c7611c3ee7cc79401a9596774ed0fdb0d031009627eaaf2961c",
+      "traces/0.9.14": "a86325f5448768de4648c0044f95b88127371955e61a7588ca3ef29655f8d7b5",
+      "traces/0.9.3": "312f2b8808a90d085179b2d0bce0345fcd9e1306d416a64802d6555c9ced7313",
+      "traces/0.9.4": "f7e084acce826e96dec5230ea054acfb9c9ae7619b60d887bc152198ef47db5d",
+      "traces/0.9.6": "7d291b32f6d765b9ad7e3b880ada9b6a1d6f7903eb355e2ca33e5b4bbe074213",
+      "traces/0.9.8": "7076438e3dbf2afcdbf216e6e07f1b84f9454b8d62d81c3b8ae8ed74eea25cec",
+      "traces/1.0.2": "86bf1c2e4041a1bef43f1facf7fa2d59ce330a30b88c8c4defdda5b00e1d9b11",
+      "traces/1.0.6": "f649e4504435d86ef437ef8f3c6b876e3db93565fdbfc8980a21c1ff9ac600bf",
+      "traces/1.0.8": "1ae39e6324f1848578b23a383996d97a6a08f51c4edd172e2b77921ae70d80bd",
+      "traces/1.11.11": "748906ef8f3da3859d34cf592e1862839299bf486dc4b591a0a185bcc492deb8",
+      "traces/1.12.0": "027663f3b5140e9c14e50164e77d6e6eef56a158217e27d518c6c1c267b3f989",
+      "traces/1.2.11": "343fafd2b00e09e13c51b48fb90a0a0ebbb821702717618827291dfc4f372faa",
+      "traces/1.3.6": "b1e9de99521b49cfc145527e7987a5b356690023c255bb8adefa74a36c8e4a59",
+      "traces/1.3.8": "3ecc73b3e4273c158840463e9400d78b36da74147fcc8a5e7bbd2aa1837d421c",
+      "traces/1.4.1": "0c327b279c9d4bd6743b66d765c0abc340f76565fe6439e66ebcee9ffa090498",
+      "traces/1.5.5": "4a68712474cc5071ce56e0725f0d7ae9ec95d0441949e6f03dda443d2313e6c0",
+      "traces/1.7.2": "1c176e923ce0f73af9b2724f5ae0703de9a602b1e1acff356d2ee04d1461e1cc",
+      "traces/1.9.0": "8f409cf77e5ebe34b84173b57efc9c9671714769e6fa724eec61e29d03d60953",
+      "traces/1.9.11": "9e112349d9149c233b749955e69e5fb6bb277b3ff26c6a39fbb15885461dc7e6",
+      "traces/10.0.12": "cba62de02eb04d85fc79b9e4c3d40c80cf49bf8ee310f26e43414b22ae2b2a4e",
+      "traces/10.0.13": "c84e91a8ca6343366b4c22c854f1b37182d86cb09bef6dc1b1367601963247d3",
+      "traces/10.1.0": "33c17241a22cb23638b31025684739e839fcddf4ae1c076fbded7fc2b50b7019",
+      "traces/10.10.0": "e54793d3d5a01fe8353b128fde2bf6c9cb92b402128f93cb2f06de3e200c8dd4",
+      "traces/10.12.15": "c42108d59cb16098f811a39a4d5ae2d4b5a21cd70ac5c5f432560f2838546185",
+      "traces/10.12.5": "64dda4491a5f711ddaf17113f642cf749b9e13481ad0fba8b20ab302b89fb20d",
+      "traces/10.15.7": "dd0c8629b351a5ff4b736d360e2f0dab08df7149650998b1f438913f8cdadfd2",
+      "traces/10.15.8": "db3fbeed7717e3ae9d189676fbce3727dc5dd9611b430461ffca4bfc1c24c320",
+      "traces/10.2.3": "90760cc614e57036eab9a7da341b92f4398a5a0b20dbc8d4df6e46961c5c3359",
+      "traces/10.4.12": "1c2fddb7c5258f705b413e6be4a3e7e520abbfc14ff54b8f43f26b62c24d443d",
+      "traces/10.8.11": "056a09bb29ff99341493bb89c838e9233e7b59c8d6ee783f070e9e95a09e62ed",
+      "traces/10.8.8": "950c5291db4148bbad9f551678c27149d37eb800eea2269f0b75e95a40882041",
+      "traces/10.9.0": "41f4c024fa703a0ab1692d1b37a80a07bca1c10140599ebf46ff91034a7e22d1",
+      "traces/11.0.11": "6638a95ee16a927f4f25c72d476a9c7ad9418035447568081996489e8c4aa258",
+      "traces/11.0.13": "e1a5d3ba4d528d71e81c7d5c5c9d782f2e7d74b570ab664f698684d30f450e9d",
+      "traces/11.0.2": "ec6f9c5bc3853a17613a9193e9488682265c0bd29350b477e02d9a6af45c48e7",
+      "traces/11.0.9": "b0db738973c35e9dbdb329d5c3e4af3d280657dca0ff18a9ee2d44e836a7e77d",
+      "traces/11.1.14": "b334e39c81203b5f9bccc6d56d456b3227660248900ee0eba32444a07b5020ae",
+      "traces/11.1.7": "212982e43c1b98f2ad618f865a54f13bca56a7a1a48bf86ac04f3e64d53b0fda",
+      "traces/11.10.11": "4bd1cc7662d12ce75b806842d97923f4e07325e1d40b11524eb4742ef036e2f1",
+      "traces/11.11.7": "c8ba83ebcf335f131affcc9e0ae0f3b88b9d9a69412d0f77b30270de0945f9ba",
+      "traces/11.15.15": "a22fc0db7922b79a318dc232c6c60054683ec60261750eacd0295894d4169fce",
+      "traces/11.3.13": "a5ea6126e1e1fb0ca65e61c8f927edb5c2bf04db57061f841bace3ba0cb2076f",
+      "traces/11.3.8": "57d1cd15d5bf0793ba0242e4f511afdf31ed6af2ff9bc08434708535cbfbaba4",
+      "traces/11.4.3": "6a1607cc37b9b8e8e4a56cdf18cfb36300b043ea6149ab82c02c97aad34c722c",
+      "traces/11.7.0": "d4ed9c128ff3cd8022e5579e8326176c01978db05c024b825f963f46c26b5632",
+      "traces/11.8.5": "cf4bd713e5801d9d8cbb8e01d0794bed5dabe8ffadcf694cb9d2db23763ff5b9",
+      "traces/12.0.15": "b0b2e9e2dd928bcc41540072b01280b5c26e720f1476b1ee6659242a986b4495",
+      "traces/12.0.3": "bee9aa9e43759397d98a335bed7d7f4b847c2ba41544067739dcffc64e94c5ac",
+      "traces/12.1.0": "72020d154d6405144554e1ac172f169e3000883e81a029a0b61e3b252f205484",
+      "traces/12.12.6": "899e1c0ae0470c6ad351da54e1269c866b0577a1481f9b86512909df4c35af2e",
+      "traces/12.13.5": "9763d0fc078a5b39c23e846e5fee8d2c0cd1de3ad6d53838780a420f99904d2a",
+      "traces/12.14.15": "50296c70c0ef259d2d74e1b0b3ab8a4a2d26d9282a470aa596d485fc6a5d3cb2",
+      "traces/12.15.0": "5cd4a64906b0f093a3e3105772126b338d7650bd074f2fb10ed11882d29767e0",
+      "traces/12.15.11": "1fdf2f1ee18a400f53e7ac792c94ef3ed66dd8f5b4358ab2092feca7c76523fa",
+      "traces/12.15.14": "13f484e4823d38a29b0f1db4adb8da594e4a29249c373a3087e7b67565aa3af0",
+      "traces/12.15.9": "515b70bf6f25697404cd139554f5ed639a6c7f4fb89225b75ac7317b8eec847a",
+      "traces/12.2.6": "b720a16d6d39b1480eb148e29fc124105c3f97e9b4ff139e5026bb5f507e6177",
+      "traces/12.2.8": "30a786ee7657d16e99bc8c850604792f8ad2abd2eb0a40b7406c1d718fbe25bf",
+      "traces/12.3.5": "201f6d5ab026a1b0f43ccbd449b7cfae82a0224381ada82f37b30a0c207b2199",
+      "traces/12.3.9": "6836479cb603392a6e8c2f3130ebbd7272ee7be2a4358b3f84fbe2a3b9fdbcac",
+      "traces/12.4.4": "fc620d865c242f74f675407dbb9f0a446f033cfaa62bb6df7daf55b1c02c3bcb",
+      "traces/12.4.9": "cefc4e87fafd1c8843b7aa82bcb4193b931eb4c49c39ca8a237f21ffa60485f8",
+      "traces/12.7.4": "d3411f0b6812dcc1d0d96ef1f8db534af38e125093137a98c615dead8fd46fc6",
+      "traces/12.8.3": "1f882357649921304f336c2300d1c868a69539dd7b1ac197e8de952d7a4fdfc6",
+      "traces/13.0.0": "57c325350e5dac9dffe2cc37ebbb4214ab3f8e00cdde40fd33892e69672d3e91",
+      "traces/13.0.10": "605fbc2731a17620adac59067cadefbe4532b70a34ec988f867ec651f25e9265",
+      "traces/13.1.13": "86abbc781560457bdf868966c1dd31ca87a389b0f6e42558472d0062aa52d0e9",
+      "traces/13.1.9": "d65cc99e03849cec34d12f490fb4c0c22697ff4e8accdce94eaae8e6974dedee",
+      "traces/13.11.8": "e427948c9ee4e05ed388e19b460eadce3d443b187acdf2c93f4644d2850e2668",
+      "traces/13.12.11": "84dc13b0f922ae621fedf9eb71ffb495b766b2a999b5671121f09b606ad6860b",
+      "traces/13.14.5": "2444fc5cc0c04148e0bd53c6fa1e91fff86f28aefe4728b22034c5a14c4e1ed1",
+      "traces/13.15.2": "361dc2013a61ca23f5d311514dd9c9052065e19627471fe4c4878c941b0ad6f7",
+      "traces/13.4.1": "6c27b2e43f4930caf642a1566a20356efe5c1fec1c54d65d22730694e57d5236",
+      "traces/13.5.4": "bf11f33fa21e636a9767de27e5f455b591b4717c434b1a5ba369db9c89e5d579",
+      "traces/13.7.15": "4e9da41889dd17404151136b29e83868cc5aea10da0fdcdd68272d7f7c46b345",
+      "traces/13.8.0": "571012aee820ad3e64df5d95a03ce61c896f2e9ae3a55d181523f9fd0b103728",
+      "traces/13.8.10": "d0d8207ac40ec41faa9a44a29867e210adc42ff9ed8d0731cc8c5c3c715c0683",
+      "traces/14.0.9": "3e42cf5e89d2c9196c061b0655ee77aae69ebb446bdaa251ed443c7a5df13bd1",
+      "traces/14.10.1": "75beb89b3ff6c8c410a981080e7d1bb02512781f9d5ce496e713d21f7b199f2e",
+      "traces/14.11.1": "c76994d26cc4778a9a063c6f8c6d1a81be584511e22fd74930320b33954845dd",
+      "traces/14.11.15": "b0c8873a81239ef45f75627086e34bde13d818e69f2a4de2a79b8fb76266454a",
+      "traces/14.12.9": "5367babd3f736f463d4139d251a958c4a4883dffec651d6fb79cde0165b3bd73",
+      "traces/14.13.0": "4c0fedbd956f4519203eb536caba9fffa1b31bfd53dbfd38e2babb1749eb32d4",
+      "traces/14.13.13": "710877f83484a89a8f49e5ec39bb542ab0612a58487214d3f9e4e28d49dcd2ae",
+      "traces/14.15.10": "b255053276c96480d636cd2ae7a1c8c4b84abc208ad0a75a2dce449fe8bce23a",
+      "traces/14.15.6": "c981e10290d419ddd27b191650bae0427d32e5afe7bbb0f1cfcbb320fbeee65e",
+      "traces/14.2.5": "19f2c4cfbd8b8a4eb0d6587b0e4c67a47ce09ccfab6bcd3129f3d343eb95aeb9",
+      "traces/14.3.1": "582ca20ee691385a8ff22fd7deecbdf37a30949ada61fef1e08dfd8d95792852",
+      "traces/14.5.9": "ddd7be2142bd40ab396b664af34530ea7dc1a58fc5ae76f7af74d45888cca405",
+      "traces/14.8.14": "2564d96ae9b8948ebff9de0d55cb99fb8e59a2913c81868adbb783f930e9c96f",
+      "traces/14.8.6": "cf42de0cbeb2d733b68494a43baeed917f8788c3aeb077ea8a9e2b7bd7df746c",
+      "traces/15.0.0": "73252f145f1e6d8f6c07a4d9c5044033ffcb67f761459b432f370d12cf63b00b",
+      "traces/15.0.12": "45495f20e191f41cc7e9bcaff3a8858f466537e34290fef9269aab3c910a4517",
+      "traces/15.0.2": "ef910c0c0b8fb3cb143fd496a9d1a20e889619d8e11785a0078dabb690707aa7",
+      "traces/15.0.4": "90b2d5aaafdb36fe54dae076ae5bc309b68da0e3c03e55dd5cd823f48ceac4f5",
+      "traces/15.0.6": "1b932a01a2c130de2b289e2644b5f471143bd45c69dd07d51b7d6905cb49ef80",
+      "traces/15.12.12": "ac4ffdade6dbf66ad0628068c82549119f2ff04e15754768e18884fe0837b596",
+      "traces/15.13.6": "172e0338e619b392e92dd46234e865e73f4a53a38e432cfc5e08cb1648b38a12",
+      "traces/15.14.12": "8c867ab8d3db6e89103489a1be8907dc88e6e07ba0d44b79b354e59e97fde1a9",
+      "traces/15.14.6": "8ddcbb24c8d337ba6d1131783187ebd50aad86a75805015087eea4afdb847e27",
+      "traces/15.15.9": "fdda1a69b5cbbd341d2acb4a2830a77a200f40293acc7352b245b62b524c6e16",
+      "traces/15.5.2": "98de3d317490023bfc6ee8c3da8d9f4b265c8aa2424980a473a7531ac00fe363",
+      "traces/15.6.14": "5dc609f56cf73f6fb34dfe77c8be9dade79166ba134816ba7ad21047224e08ea",
+      "traces/15.6.3": "571073353efbf2125dfb67bda3273f734d8aac4266f80abe20257838abc93e07",
+      "traces/15.9.3": "a7208033a8be53b2968d83573b79464996c2f380222ec62dcff29caebf89e963",
+      "traces/2.1.0": "1d810fd04bbcea39c6e047b431e2bfa7fc591e54b98f0704112b5bbaa9554588",
+      "traces/2.1.15": "9e196ecea16ad83fa5fde77cae3edc29a6c6cfefd131da7ede3c555b0694ddc0",
+      "traces/2.1.6": "6b2b8b84f563458b93dbd157cd51b6e70a8ad39f3d90227fba2540cf5488b675",
+      "traces/2.11.15": "28e6961b52ef2427804d47e18719a8e01abdbb10ab8603b8bfce4f349c57018b",
+      "traces/2.13.6": "90c0cf4edcd1f830f7a3fef05d5be36e06795fd84f74844b519deddde5b328ad",
+      "traces/2.13.9": "3bc244c4851730807ebd6320ee81ffe74a5886cdd293f924d12046070c7d5565",
+      "traces/2.4.3": "814430fdf1f85085dde8c51f68e5de294a0484ef0c2b535a21cfdfcefdb65504",
+      "traces/2.4.7": "1d869acb9adb21262fd9de0b5019a1802d626e74cf1d1b658733f10e1804c1bb",
+      "traces/2.6.10": "e322808ef029221d76f568ae686c3dfc397971cc8738029c423f59cb1e3d4e3b",
+      "traces/2.7.2": "97b5d926101d73b5a359de9bc3b8c3c9d34190ec9763dead19ff77abee8f7823",
+      "traces/2.7.9": "2d89b7624b7d9f444c8c852a3ee2f028eb1a11b6d4c2a35fc9c870616bcf05ce",
+      "traces/2.8.4": "050a77445e3983d4f7f0c816068119e7e638717aa611275c78a7971b14f90bd0",
+      "traces/2.9.7": "e7d48d7d57524319d3f93345b2ed2e7e069485bc293240314c4e7be847ee47d1",
+      "traces/3.0.12": "51314de3b7796e21e67e8e90ca18a58b5bee1f251af28e114fc754d3dbfdd9db",
+      "traces/3.0.14": "e536cb90a4dd9cadb3f06a4fc3ba34d3361f91a3ae38dd810560ccb8be4dcb04",
+      "traces/3.0.7": "4cf769e5992a1e8d8e86d253d77d7f7cca6bd85de93cad12a4cf5e556c96ded9",
+      "traces/3.10.0": "813d517638b06b99772e21db3ffe7700f3591bb9878a2ca9f8ae97338749c733",
+      "traces/3.13.13": "50100ff2c97674780b8aab9ecb382c3c53ad4be9a13226099d1ad898405ed79b",
+      "traces/3.15.2": "92e1c1e9d43da4239f2ce93e8001359e4d7bffbc5cac83e9507e9f7d243a9fd5",
+      "traces/3.15.5": "eb37554e867b329f94c849da8b7c4c4a37e08e854fce9fea474b14acc3e77301",
+      "traces/3.15.9": "69ca3071effdedc7a5008346930133c199a9764b49ee69d9e1b3ca9285f56092",
+      "traces/3.5.14": "0a01b83d9ef0a5c24b84efea0decb82999c64ff5a206732cd9635e8305c18781",
+      "traces/3.6.8": "2139ed2260a871d26d9ff4d50563ace9b9e9252d6d2ab774518b7a08c7b40fc8",
+      "traces/4.0.1": "dcdf104de19c70ac432daad66a5641ffa5caf99e275ea64a928cae8013b3fc3e",
+      "traces/4.0.13": "5cebd81bdede7eb2266a2061a5baccfe7792dd468c435b5eac54db9baf44283b",
+      "traces/4.12.1": "afa5a277b354bdf7ae1ed4f1c9b15398b893c2432f1fbe4c9b8cceb537b306d4",
+      "traces/4.13.1": "daa800af926e4ff14a7be631e2aac90fb34a84a0f840d30d26f913690343f751",
+      "traces/4.14.0": "bb8714e577ec0488ecc570c2a919bd3b51f95546329e854a3527126c9f859153",
+      "traces/4.14.12": "7f3342b3b302d6575bcbbc2e6ef4876e6bf450927ea868d8a64b731886d5118c",
+      "traces/4.15.0": "a99e756d95b777d835da403eea5ba5a0df1d0b5903c4b8f2f67b1ef4d8c520de",
+      "traces/4.15.11": "40bbef62bec47797b906baec51b155851e5352f97c0a7aa5abf40e689c44555a",
+      "traces/4.15.15": "5879a9eb857a70265f494c1119322967f91a9b24be1023cd687809d463b6776f",
+      "traces/4.3.5": "ddcfa549fef57f3811898642c8387547b15f144029ac3b0a9c4078b29d1e6cce",
+      "traces/4.3.8": "92674b218d6d4c4402b13ff77198e067489e7f8c6047c59e9b13ff4d4ac27938",
+      "traces/4.4.4": "de12c832b317969e285bbd7164eb679894cdbaadbea0157176707decdfffc2c7",
+      "traces/4.4.5": "0287398d072c81a8649dbdd0feb2753fcc51c0414a66eee138aaf5103a033d0c",
+      "traces/4.5.5": "c7c0f8cea01664a044e1b2ac5c68da76e4d1fa313b924398338c0382a69b0166",
+      "traces/4.7.15": "cf01002ebfa1d92cde4b7827a7a9ddaea7718dcca2de69629e641214031c0996",
+      "traces/5.0.11": "9b1e110c8b22df70b6f593f02fa0c53e018443c213c0f2b79be6859dc6a3a2b1",
+      "traces/5.0.12": "c9a4b3e265300e8a4e2af4a6cbf30eb12eb6c5d1ef2881d1a4f8edf6a3c08c3f",
+      "traces/5.0.9": "8189013275bb7adaf3a2c90c80ed8a9a3683db5ec8e8d510dd1ab5059eb00f7a",
+      "traces/5.1.0": "5a2518b017fa9ad4e3c06ecd32d8bbe7421c71a7cb3286a9d6b20c20d7d3914e",
+      "traces/5.1.11": "02d960555bd018c1bd88a4b0d4b85e38235278e3b20dad9fc35a7ce604ada555",
+      "traces/5.10.0": "2daee1ca98477b3ca82c1252f0ae3593f968bcb3c164f31e99c3b021a626c0fc",
+      "traces/5.11.12": "ff38004f50f23f56d771405c7054d7797f992fe0d7d8887f787d4551ea683c99",
+      "traces/5.11.13": "3b9a26aa3db17c6f88eee3acb0358a45d516269cbeab27202fd6306abbc1ea77",
+      "traces/5.11.9": "617583b83e9b336eefbb26fab2fbc2f72687c6a1ee144af42bf30d224b2c251c",
+      "traces/5.14.0": "23c480289b7684e995136552a0f4c3be1471511210f7b25e3f4b5764fb8a2443",
+      "traces/5.14.8": "f824759f62ee4373de2f435681fca9437ece688fae6cb2a5bc9f95c8cfa2d25f",
+      "traces/5.15.13": "b183d267e69225ee74b8e6c78995d9fbde113c3eb297a6984e4027beddc16aae",
+      "traces/5.2.9": "0d86498ad1e7ff0b4b18ad04a59febc17c13a80a0292ac4e3fd2e1729b0d9a8e",
+      "traces/5.6.3": "6ad1a721db236dba96caa8b6099f347cfec91a1b5164695fc7f7b6a6aa11457d",
+      "traces/5.8.3": "1ea48f5aaa60d5f080f40e96ccd2950d7f80a65bcfacd71c855edb0a9fa7def1",
+      "traces/5.8.8": "587c10405c9c6d4a853a73debf8385e7a016116f8a43d7159d2e6de7a5eda8d8",
+      "traces/6.0.11": "59366fdd69c447ff53310f158f63909a4533778a9fdfe549102ef4695534f93a",
+      "traces/6.0.3": "6f4f6b1c05f85fbf3b23470deef7940f20f5f27072b05b1948f90006fc436d0b",
+      "traces/6.0.4": "20d84b74efe89d992344e22d56a9bae2b7443905cf0a3cd7ed652f4878f23bde",
+      "traces/6.1.4": "a268552b8356a3a1518b0a04f74aa651715b15c4520198f07f9309b3679aaf62",
+      "traces/6.11.0": "41e5ee399fc4ad184ce57e6898905f4c82600cabf015c46a9a13750630d47ee6",
+      "traces/6.12.8": "3f6362c1d1b715d20ab87dfb47b7cd8777cc3752f8719b6dcece1dcd4f6171a8",
+      "traces/6.15.11": "ba227ce04e5bd4013560c5c1a55c996af8bd92359c30043cb8be8c4fc0ea6354",
+      "traces/6.2.15": "8f2e051685c9f954db2c595bfd512e2c170be7a13b9d4db3edbd51c02e69baca",
+      "traces/6.5.1": "0153bc385a2ab7b81c197f45e1e485d8e39390bb9918693b82910ec6ef8b9404",
+      "traces/6.5.4": "7b8a5cfdaeb05459e2e44de6699873b26d5ecb7f724cbde2679ed85d99c7a03d",
+      "traces/6.5.9": "7b4cf26316226a9836ffdc2d72deea27ef8536a40671404b90b46b38e820723e",
+      "traces/6.6.15": "1273f29e782aeef9dbd1f97b31a9aea8dc6244243a7e99687d112e19a8886c59",
+      "traces/6.7.9": "e74c3aa7e3c99c7459b160a2fae6895aa165bf0f3a5beb594f36b19989032453",
+      "traces/7.0.1": "1b79ca0e6ce55698c98a413ce34fec7a506327da3176cb73f6f473a5f308469f",
+      "traces/7.0.14": "5a4c24c2c5b086c9753f7d22beffb9a40219afc1467f5d8110000297d5e607e2",
+      "traces/7.0.3": "95ce34e2c883da09851e2821229e265bd2419baaa116be59009a982766bba8f8",
+      "traces/7.10.1": "3a5061bd10bc19fa6492c95234e66f75e1c88d46d9d7bdd84e7aacab09a6fc92",
+      "traces/7.10.2": "3577ccdc6c33c123bf0b25cd24b2e5fd070e8a75179144618a3c094c874c2dac",
+      "traces/7.11.14": "9dd7a912056e5e252cfcd995a2b5a842eb8cd26b3464ffc80c80fa8901c49ed1",
+      "traces/7.13.15": "77cf3e3a71a838e994f02fe4df92b6f795995749e7cc35c2a13e97969fafed0b",
+      "traces/7.15.6": "d05de94cb8bd4f1e312be43b4ec12816886227e70dfe8c245112615662fd1bb5",
+      "traces/7.15.7": "42fda26c96ddf578aca3ec95297aa110a856ab202f0ae4573edfffa52c7f8f84",
+      "traces/7.3.11": "8083d3a2e2cc781924ae8f8e6340db969196b1fb702c4a7b4215d857d558936f",
+      "traces/7.5.0": "e97a31abe5cba030d154c6097d7e292772fd04346e1ef34b1bec913471c99f9f",
+      "traces/7.5.2": "4d5ce70be8a9b752b150e2ff5f96a176ba016a5f1c2ac9160450a0df64108f48",
+      "traces/7.7.0": "72d1b4213c52d4774ea15f480c1fb995c994242a875a5d7451bd5695256830e3",
+      "traces/7.7.6": "9c90a01098efd18156785b8f9c26ae7a2dc1d6628422ddd62ba68aa9c5e5eed4",
+      "traces/7.7.7": "52023f3b52a0f568bd4bc47df0d2d631f69d71e7f92cc587c5398d91ba0b29bc",
+      "traces/7.9.11": "74429ba38bbfeaba25f3564e0e03325703a02b9f8509e86265277a2f002ba8ab",
+      "traces/8.0.10": "910ec166b378c5eb2ae0f78f1a0c574369c90510bf9bc4a712ca05afe676be91",
+      "traces/8.0.15": "b47ecead0d7cdd394064baf919229edd155e8f8de8ddba218ae28df5765c1259",
+      "traces/8.1.1": "947ff8a1e9524c08dce562eb39bced8c0f7a61d43ad72903f72ed47931447737",
+      "traces/8.1.8": "f701b70e29c7a7e160ff765cdfe37b21bebb7eb424df4cd8f4debb8562525c06",
+      "traces/8.10.5": "650f6368153df080b70720648c25bef3cc53722f81fc140c4f89fea738b7e180",
+      "traces/8.12.1": "de10aa4de56e8cc36ea39516c40c7ab20efd6898f2fee4278a246e42d409d6ea",
+      "traces/8.12.12": "07fa9621a67f75a76ed29ff0bfd14bb65b7641159617f3acb1af3efbc2649a39",
+      "traces/8.12.5": "a58ef4b2a029103ae230f031b6569ecd2dea872f0b3fedfb25aa6cd40fc2f51a",
+      "traces/8.15.4": "1686a9857dfeff6bec09048bda25b716cdbd1f987f491a93252a1698b9bf3be9",
+      "traces/8.15.7": "e429ffe7d1a6ec690d09ac069fb362e3f16d9f32acad46876bed2d6622b4d906",
+      "traces/8.2.13": "9108763ce247106365f61670abf038a29a52c00731b0436f4c0f04bf4f32ee75",
+      "traces/8.3.15": "52495f27802a2815c7794bc95e356b35800820719a04f7f20751713685f62de7",
+      "traces/8.3.6": "b4a325706e7420d8caeb7e8fae04cb1386cff19c8aacdfce2997370938273827",
+      "traces/8.4.14": "4f5ab970202e960fb0ea1645b7a8b9e49fd196d62c4972c6891a164cdc58c8d4",
+      "traces/8.5.6": "386e1744c71242604380f80f326c91bd4c5277c6438d5fb29127fc915ee307d5",
+      "traces/8.9.0": "4ee68dec389fe6d77190f559b23463ce1fcdc3135fb7df9c6e4ee573004fc786",
+      "traces/9.0.6": "1dec5818a633f7a7f82c415257b01c5c286ff12fd1157a80f6ceb4d4e96d498e",
+      "traces/9.1.1": "9a95fd62edf50e2bd2764ccfef0339be3c8512b9ae2ed74915605529090a94ca",
+      "traces/9.10.15": "bccc976a0c1cc27a565f24060bccd831314f352e07fc1046aedc720e2bcfd4ef",
+      "traces/9.12.14": "f7767b57d866dbb2e26b5dcf4ac57ac05eea6da528a3839a98b4d26d55cc8173",
+      "traces/9.13.14": "a293cb6937fe6b7ed433e07e180f28dd08dea6ee5db5eb72aa7480a9859bcd0d",
+      "traces/9.15.12": "cf180469747ca44a87d826d2ba931f4469c08c8f2094c6782d135aa28b817c74",
+      "traces/9.2.0": "452d967aedeb6bd89c1266035affc4dfea899e6cbde04a4974f9afdbcc5fc24a",
+      "traces/9.4.14": "1ab44e09186728e047a61f5e33cef125c8d12caf8c22d865a964707df6adf5e6",
+      "traces/9.6.13": "765c2515c4d8bb6b78f4451731d1f3b3b73c89df89aec6652c53f5ce85053f17",
+      "traces/9.6.15": "750ce93b5bf5c9fcf754f22f72cdc9e005236c22a4027c078f5d9bdbe791c3c1",
+      "traces/9.7.0": "b6a92c6f4887eb031a421524d1c52efc495c9f5c1fe346289616aa10d70df25c"
+    },
+    "unbounded_rows": 0,
+    "wall_seconds": 2.8256777920178138
+  },
+  "u22000 hard both signs": {
+    "changed_state_rows": 0,
+    "correct_references": 8,
+    "historical_pieces": 1204,
+    "historical_record": "/ephemeral/hendrik/fiber_crop_bench/20260923_v1/bp-beam-new-perpsign-p1hardsign.run.json",
+    "historical_wall_seconds": 42.11065420403611,
+    "independent_missing": 2,
+    "independent_percent": 30.76923076923077,
+    "initial_pieces": 1204,
+    "initial_states_identical": true,
+    "ladder": [
+      {
+        "hard_sign_errors": "0",
+        "reference": "0",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "0.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "1",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "1.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "23",
+        "reference": "2",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "12",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "4",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "22",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "5",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "5.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "6",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "4",
+        "reference": "6.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "7",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "29",
+        "reference": "7.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "8",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "16",
+        "reference": "9",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "9.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10",
+        "winding": "9"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10.5",
+        "winding": "9.5"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "11",
+        "winding": "11"
+      },
+      {
+        "hard_sign_errors": "10",
+        "reference": "11.5",
+        "winding": "11.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "12.5",
+        "winding": "11.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 75.0,
+      "ladder_shifts": 6,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "references": 26,
+    "result_record": "/ephemeral/hendrik/fiber_crop_bench/20261002_fast_historical_independent_v1/bp-beam-new-perpsign-p1hardsign-independent.run.json",
+    "reused_saved_readout": false,
+    "shift_unavailable": "incomplete reference ladder",
+    "tied_rows": 0,
+    "trace_hashes": {
+      ".zattrs": "a9fc7a28bfc315de6fe8b7cbfe87ba1e1518f236a69e69973c3924cb15efced8",
+      ".zgroup": "e1e1914ae531ecb50e1ead685ef01895a5452faf5f25f35cd78f1f5de1367470",
+      "traces/.zarray": "4cfbae08a57c3e25f6ab3cc00e4efb4ce4b893079a1b3191fa4b1e93915654f2",
+      "traces/0.0.0": "b1dfd92aa36adb5309e82af357654152b90ee351530ea97903d4f7c88cb5a807",
+      "traces/0.0.1": "1de550cf84a9bfdc5abe316aa06a08274475c34f4078e346a1f985357b50b447",
+      "traces/0.1.0": "d7e204de48003e013e82c4d37a228e3ae899d28bcdfd8ea29b6d0ed0222a3cb3",
+      "traces/0.1.1": "4efd457ddf3151dd1399af987812a3b47ed1209bbf9107cbbcbee019bd33e4be",
+      "traces/1.0.0": "c782c132208ddd31add8147eac692e83b3d5136f0cf6f7691e23f3adf2957084",
+      "traces/1.0.1": "dfdee1cf1ff7ba9913dab73e1fc2520d0debc317deb2deaee8fa636a9cea4541",
+      "traces/1.1.0": "3889f40b3f2c01425fb003775a943842129d5cee3f2605f9bb92dada48c18c57",
+      "traces/1.1.1": "304b83c09e69de11454ee172d36f76f47321536a2a7c9377d5199d507cf41d61"
+    },
+    "unbounded_rows": 0,
+    "wall_seconds": 14.50341725803446
+  },
+  "u22000 hard perpendicular": {
+    "changed_state_rows": 0,
+    "correct_references": 9,
+    "historical_pieces": 1204,
+    "historical_record": "/ephemeral/hendrik/fiber_crop_bench/20260923_v1/bp-beam-new1024-independent-reference.run.json",
+    "historical_wall_seconds": 13.829505469009746,
+    "independent_missing": 2,
+    "independent_percent": 34.61538461538461,
+    "initial_pieces": 1204,
+    "initial_states_identical": true,
+    "ladder": [
+      {
+        "hard_sign_errors": "31",
+        "reference": "0",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "0.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "16",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "3.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "5",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "5.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "4",
+        "reference": "6",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "7",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "4",
+        "reference": "7.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "38",
+        "reference": "9",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "9.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11",
+        "winding": "9"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "11.5",
+        "winding": "9.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "12.5",
+        "winding": "9.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 70.83333333333333,
+      "ladder_shifts": 7,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "references": 26,
+    "result_record": "/ephemeral/hendrik/fiber_crop_bench/20260923_v1/bp-beam-new1024-independent-reference.run.json",
+    "reused_saved_readout": true,
+    "shift_unavailable": "incomplete reference ladder",
+    "tied_rows": 0,
+    "trace_hashes": {
+      ".zattrs": "a9fc7a28bfc315de6fe8b7cbfe87ba1e1518f236a69e69973c3924cb15efced8",
+      ".zgroup": "e1e1914ae531ecb50e1ead685ef01895a5452faf5f25f35cd78f1f5de1367470",
+      "traces/.zarray": "4cfbae08a57c3e25f6ab3cc00e4efb4ce4b893079a1b3191fa4b1e93915654f2",
+      "traces/0.0.0": "b1dfd92aa36adb5309e82af357654152b90ee351530ea97903d4f7c88cb5a807",
+      "traces/0.0.1": "1de550cf84a9bfdc5abe316aa06a08274475c34f4078e346a1f985357b50b447",
+      "traces/0.1.0": "d7e204de48003e013e82c4d37a228e3ae899d28bcdfd8ea29b6d0ed0222a3cb3",
+      "traces/0.1.1": "4efd457ddf3151dd1399af987812a3b47ed1209bbf9107cbbcbee019bd33e4be",
+      "traces/1.0.0": "c782c132208ddd31add8147eac692e83b3d5136f0cf6f7691e23f3adf2957084",
+      "traces/1.0.1": "dfdee1cf1ff7ba9913dab73e1fc2520d0debc317deb2deaee8fa636a9cea4541",
+      "traces/1.1.0": "3889f40b3f2c01425fb003775a943842129d5cee3f2605f9bb92dada48c18c57",
+      "traces/1.1.1": "304b83c09e69de11454ee172d36f76f47321536a2a7c9377d5199d507cf41d61"
+    },
+    "unbounded_rows": 0,
+    "wall_seconds": 0
+  },
+  "u22000 original BP": {
+    "changed_state_rows": 4,
+    "correct_references": 15,
+    "historical_pieces": 1204,
+    "historical_record": "/ephemeral/hendrik/fiber_crop_bench/20260923_v1/bp-beam-new.run.json",
+    "historical_wall_seconds": 45.73822001897497,
+    "independent_missing": 2,
+    "independent_percent": 57.69230769230769,
+    "initial_pieces": 1204,
+    "initial_states_identical": false,
+    "ladder": [
+      {
+        "hard_sign_errors": "0",
+        "reference": "0",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "0.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "5",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "5.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "6",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "7",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "7.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8.5",
+        "winding": "8.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "9",
+        "winding": "9"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "9.5",
+        "winding": "10.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10",
+        "winding": "12"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10.5",
+        "winding": "12.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11",
+        "winding": "15"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "11.5",
+        "winding": "15.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "12.5",
+        "winding": "15.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 70.83333333333333,
+      "ladder_shifts": 7,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "references": 26,
+    "result_record": "/ephemeral/hendrik/fiber_crop_bench/20261002_fast_historical_independent_v1/bp-beam-new-independent.run.json",
+    "reused_saved_readout": false,
+    "shift_unavailable": "incomplete reference ladder",
+    "tied_rows": 0,
+    "trace_hashes": {
+      ".zattrs": "a9fc7a28bfc315de6fe8b7cbfe87ba1e1518f236a69e69973c3924cb15efced8",
+      ".zgroup": "e1e1914ae531ecb50e1ead685ef01895a5452faf5f25f35cd78f1f5de1367470",
+      "traces/.zarray": "4cfbae08a57c3e25f6ab3cc00e4efb4ce4b893079a1b3191fa4b1e93915654f2",
+      "traces/0.0.0": "b1dfd92aa36adb5309e82af357654152b90ee351530ea97903d4f7c88cb5a807",
+      "traces/0.0.1": "1de550cf84a9bfdc5abe316aa06a08274475c34f4078e346a1f985357b50b447",
+      "traces/0.1.0": "d7e204de48003e013e82c4d37a228e3ae899d28bcdfd8ea29b6d0ed0222a3cb3",
+      "traces/0.1.1": "4efd457ddf3151dd1399af987812a3b47ed1209bbf9107cbbcbee019bd33e4be",
+      "traces/1.0.0": "c782c132208ddd31add8147eac692e83b3d5136f0cf6f7691e23f3adf2957084",
+      "traces/1.0.1": "dfdee1cf1ff7ba9913dab73e1fc2520d0debc317deb2deaee8fa636a9cea4541",
+      "traces/1.1.0": "3889f40b3f2c01425fb003775a943842129d5cee3f2605f9bb92dada48c18c57",
+      "traces/1.1.1": "304b83c09e69de11454ee172d36f76f47321536a2a7c9377d5199d507cf41d61"
+    },
+    "unbounded_rows": 0,
+    "wall_seconds": 18.079581014986616
+  }
+}

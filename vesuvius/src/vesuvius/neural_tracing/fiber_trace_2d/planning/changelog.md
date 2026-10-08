@@ -1,3 +1,2323 @@
+## 2026-10-07 — Neural follower full-prefix FW/BW
+
+- Reused the exact native monotone reverse verifier and replay rollback for
+  neural callbacks; independent reverse state shares existing GPU batching.
+  Checks every512base vx plus terminal endpoints, ellipse20/40, no history.
+- Both182-direction runs completed, unchanged Flowv5 .5 / Unified .7 confidence,
+  commit8/full gate. Min512: Flow14→5errors but84.840→62.789% retained;
+  Unified13→3errors but86.662→65.357% retained.254/239pieces respectively.
+  Regular tuned EMA999u12100 remains stronger:0errors/233pieces/82.086%.
+- Report includes unfiltered, per-scroll, historical neural controls and all stop
+  categories: docs/benchmarks/neural_follow_reverse_20261007.md and JSON.
+ 149native/37Python tests passed. GPU0–5 runs364/432s excluding manager wait.
+  Neural filtered reseeding uses GT arc (no dense presence maxima); explicit
+  limitation. No default promotion.
+
+## 2026-10-07 — Predicted sheet normals in reviewed tracing
+
+- Added opt-in auxiliary normal export/cache identity/readiness and tracing-only
+  native sampler override; original Lasagna reference acceptance unchanged.
+  All existing scheduling, precision and default behavior retained.
+- Both reviewed182-case comparisons completed with additional matched-cache
+  controls. Min512 EMA999u12100: Lasagna1error/234pieces/82.031% retained versus
+  predicted3/232/81.070%; EMA99u19100: Lasagna3/257/80.773% versus predicted4/258/80.821%.
+  No clear quality improvement; Lasagna stays default. Historical controls and
+  all per-scroll/min0/min512 metrics retained in reviewed_predicted_normals_20261007_v1
+  benchmark MD/JSON.12Python/99native regression cases passed.
+
+## 2026-10-07 — New and historical neural follower comparison
+
+- Integrated upstream853dcf536 through existing native replay/forward-queue bridge;
+  completed Flow v5 u26000 and unified scoring u35000 on all182 directions using
+  GPU0–5. Exact requested confidence .5/.7, commit8 and full gate retained.
+- Min512: Flow14 errors/296 pieces/84.840% retained; unified13/285/86.662%.
+  Tuned EMA999u12100 remains0/233/82.086%. Historical memory and Flowv4
+  recomputed from saved traces using identical metrics; no historical reruns.
+- Full unfiltered/filtered and per-scroll comparisons, provenance and approved
+  runner instructions: docs/benchmarks/neural_follow_20261007.md and JSON.
+  Unified supplied checkpoint is35000 (not example33000). Defaults unchanged.
+
+## 2026-10-07 — 194246 training snapshot comparison
+
+- Corrected initial raw-only omission: current/best EMA99 and EMA999 completed on GPU0–5, frozen before continuation. Min512 errors/pieces/retained: EMA99 current 3/263/77.076%, best 3/258/80.681%; EMA999 current 5/270/77.765%, best 4/251/79.249%. Each took 286–296 s including startup and inference. No separate EMA best-restarts checkpoints exist. Same policy/cohort verified, 48 focused tests passed; full seven-selection comparison plus historical control recorded in report.
+
+- Froze current raw u23300, best-loss raw u20000 and best-restarts raw u17600 before evaluation; ran all 91 fibers / 182 directions with the unchanged winning policy on GPUs 0–5.
+- After 512-vx output filtering: respectively 4/3/4 errors, 291/270/264 pieces, 77.107/78.989/76.844% retained. Previous EMA999 u12100 remains the overall leader: 0 errors, 233 pieces, 82.086%. Before filtering all three new models have 4 errors.
+- Reused shared evaluation and metric helpers; exact cohort/policy audits and 30 focused tests. Full before/after-filter and per-scroll results in `docs/benchmarks/normalwidth_194246_tuned_20261007_v1.md` and JSON. No defaults changed.
+
+## 2026-10-06 — Extended cutoff and targeted tracing tuning
+
+- Completed16new post-modulation runs (.1/.2/.6/.7),28post rows total;
+  cached34configuration before/after512-vx analysis. Preserved prior12post/18short rows exactly.
+- Added reusable tuning runner/plan via approved wrapper, sharing native evaluation
+  and retained-output metrics.19new tracing parameter trials+2controls;21tests pass.
+- Best observed low-error setting:EMA999u12100,postcutoff.4,cos40width,noFW,
+  step12base voxels (CLIstep6),originalweights.0errors even before short filtering;
+  after512filter233pieces82.086%coverage,4.884mmactualpiece mean,3.814mmmedian.
+  Baseline3errors234pieces81.333%. Neighborsteps10/16 and combinednormal.05 do not improve it.
+- Keep higher-coverage alternative.1/cos40/noFW/step8base:8errors230pieces92.423%.
+  Defaults unchanged; benchmark-tuned,GT-assisted filtering caveat explicit. Best
+  min512 result retains noPHerc0332pieces, so0errors is not fullcoverage success.
+- Full global/per-scroll tables and effective settings:
+  docs/benchmarks/reviewed_ema999_trace_tuning_20261006_v1.md and
+  docs/benchmarks/reviewed_ema999_short512_20261006_v1.md.
+
+## 2026-10-06 — Minimum512 output-piece analysis
+
+- Added reusable saved-replay output filter on actual traced base arc; cached18configuration
+  before/after analysis, no retracing/GPU.17tests passed; all minimum0 controls match originals.
+- Positive-cutoff variants lose no additional errors:remaining errors are on longer pieces.
+  Post.4/cos40/FW retains2errors at75.974%coverage,4.334mm actual mean piece,3.513mmmedian.
+  Original online events preserved; discarded piece/coverage and GT-assisted-boundary caveat explicit.
+- Full global/per-scroll comparison and source provenance:
+  docs/benchmarks/reviewed_ema999_short512_20261006_v1.md. No default changes.
+
+## 2026-10-06 — Lower post-modulation cutoffs
+
+- Added eight EMA999u12100 post-modulation runs at.4/.3; reused four.5 rows
+  unchanged.13Python tests,12-row coverage/parity audits passed; no native changes.
+- Cos40/FW:.5→.4 keeps2errors,reduces593→482filtered,retained73.690→76.831%;
+  .3 gives3errors/395filtered/80.279%retained. Cos40/noFW:.4 keeps3errors while
+  reducing577→462filtered and improving87.510→89.847%retained versus.5.
+- Raw.5/cos40/FW remains competitive:2errors/393filtered/76.891%retained.
+  No defaults changed; full12-row sweep plus raw controls/per-scroll metrics in
+  docs/benchmarks/reviewed_postmod_presence_ema999_20261006_v1.md.
+
+## 2026-10-06 — Post-modulation presence cutoff
+
+- Added optional raw/modulated cutoff mode, using saved winning-candidate local
+  evidence including width and all six direction factors, excluding separate
+  smoothness/embedding penalties.505native+4queue+13Python tests passed.
+- Four EMA999u12100 cutoff.5 runs complete, with/without cosine40 andFW512.
+  Errors raw→post:6→4(off/noFW),3→2(off/FW),4→3(cos40/noFW),2→2(cos40/FW).
+  Filtered stops rise in all cases;cos40/FW393→593,retention76.891→73.690%.
+  Defaults unchanged. Full raw/post and per-scroll comparison:
+  docs/benchmarks/reviewed_postmod_presence_ema999_20261006_v1.md.
+
+## 2026-10-06 — Presence cutoff × width × reverse consistency
+
+- Added disabled-by-default raw-presence committed-point filter with separate
+  presence/reverse stop reasons and shared existing rollback/reseed handling.
+- Completed32-run frozen u11000/EMA999u12100 matrix:cutoffs0/.10/.25/.50,
+  width off/cosine40,FW off/full-prefix512. Native503+queue4 and Python12 tests
+  passed; seven historical controls reproduce global/per-scroll metrics.
+- Lowest error count2:EMA999/cosine40/FW/.50, but393filtered stops and76.891%
+  retained. Its cutoff0 control has8errors/142filtered/88.701%retained.
+  Rawu11000 widthoff/FW/cutoff0 remains3errors/230filtered/81.463%retained.
+  No default changes. Complete metrics/provenance in
+  docs/benchmarks/reviewed_presence_width_reverse_matrix_20261006_v1.md.
+
+## 2026-10-06 — Current122417 EMA999 width evaluation
+
+- Frozen EMA999 u12100 (SHA fd9dc4ba...), full91-fiber/182-direction benchmark.
+  Cosine40:44errors without FW/BW;8errors+142filtered with FW512 (88.70%retained).
+  Ungated/noFW control48errors. Matched historical comparisons and per-scroll metrics
+  in docs/benchmarks/normalwidth_122417_current_ema999_20261006_v1.md.
+- Generalized cached width diagnostics without historical hardcoded conclusions;
+  50failure plots, complete coverage, GT/trace prior deviation median3.15/3.42%.
+  Same frozen history favors GT in48% at departure and64% at failure endpoint.
+  No default/scheduling/precision changes.14targeted tests passed.
+
+## 2026-10-06 — Cached width-path diagnostics
+
+- Added native cached scalar-width query sharing embedding sampling, no new reader or inference.
+- Analyzed 91 reference fibers / 182 unweighted traces / 73 failures with complete coverage;
+  archived CSVs, provenance, 73 width/presence/error plots and benchmark report
+  `docs/benchmarks/reviewed_u11000_width_paths_20261006.md`.
+- Median relative width deviation: GT 3.47%, trace 4.04%, outside acceptance ellipse 15.42%.
+  At final departure width favors GT in 48/73 events; not sufficient for a reliable hard cutoff.
+  Recommendations: soft nonzero floor and confidence-qualified global-width updates; defaults unchanged.
+- Approved native build/tests and 12 targeted Python/native-query tests passed.
+
+## 2026-10-06 — Width modulation without reverse filtering
+
+- Follow-up cosine40%:72errors,mean18.9887mm,median4.3543mm versus off73,
+  18.7321/4.3107mm. Marginal difference, defaults unchanged; same report extended.
+
+- Same raw u11000,91fibers/182directions, width cache and beam settings;
+  disabled all FW/BW checks, compared off with cosine10% presence modulation.
+- Off73 error restarts versus cosine10 126; mean18.7321→10.7454mm,
+  median4.3107→3.5894mm. Prior low3 errors under FW/BW came with304filtered
+  stops for cosine10, not improved standalone tracing. Defaults unchanged.
+- Both complete, zero reverse/filtered checks;117.14/128.56s including194/521
+  missing inference tiles. Full metrics: `docs/benchmarks/reviewed_u11000_width_no_reverse_20261006.md`.
+
+## 2026-10-06 — Width tolerance/cosine sweep
+
+- Added optional clipped cos(pi*d/2) width gate; linear remains default. Swept
+  10/20/40/80% limits and same-cache off on raw u11000,91fibers/182directions.
+- Linear80:4errors/187filtered/85.0249% retained versus off3/230/81.4628%;
+  best coverage but not lowest errors. Cosine did not beat the wider linear gates.
+- Existing published predictions reused; changed paths required5567 additional
+  tiles through existing GPU0–5 demand pipeline. All9 full runs complete.
+- Full metrics/commands/provenance: `docs/benchmarks/reviewed_u11000_width_sweep_20261006.md`.
+
+## 2026-10-06 — Cumulative-width tracing experiment
+
+- Optional physical float32 width product through shared inference/cache/sampler;
+  linear presence gate reaches zero at20% deviation from cumulative committed
+  forward mean. Reverse checks freeze that mean; restarts reset it.
+- Full91-fiber u11000 evaluation: errors3→10, filtered233→229,
+  retained81.1133%→81.5878%. Remains opt-in, not a new baseline.
+- Native501-case suite and queue/adapter regressions pass; matched full run
+  completed on GPUs0–5 in324.51s. Full metrics and command:
+  `docs/benchmarks/reviewed_u11000_width20_fw512_20261006.md`.
+
+## 2026-10-06 — Reviewed normal/width/HV model evaluation
+
+- Committed neural follower integration on fiber-exp6 (`ba86eea12`), returned to
+  fiber-exp5 and cleanly fast-forwarded villa's fiber-normal-width-hv (`5d76a43ad`).
+- Evaluated frozen raw u9800 best-by-restarts, u10800 best-loss, u11000 current
+  with full-prefix512 FW/BW20/40 on91fibers/182directions, GPUs0–5.
+- Error/filtered counts7/159,8/213,3/233; retained87.4005%,82.4401%,81.1133%.
+  Historical u40500 remains the coverage/interruption baseline (5/66,94.7436%).
+- Full per-scroll data and provenance: `docs/benchmarks/reviewed_normal_width_fw512_20261006.md`.
+
+## 2026-10-06 — Raw component loss reporting
+
+- Width, H/V, embedding and refinement leaf metrics now exclude configured
+  weights. Combined presence/embedding/refinement retain internal balance;
+  total objective and optimizer gradients are unchanged. Raw refinement values
+  survive zero geometric weights; legacy pending statistics are upgraded.
+- No production training stop/restart for this logging-only update.
+
+## 2026-10-06 — Width sample visualization
+
+- Optional predicted-width column in train/test sample overviews, all five planes;
+  one base voxel per grayscale unit, reusing existing forwards. Production H/V weight0.01.
+- Gaussian tube width supervision and detached20%-width gate on extra sideband
+  loss; regular presence/GT-only counts unchanged. Direction-modulated overview
+  views also gated against center predicted width.
+
+## 2026-10-05 — Correct annotated-training evaluation protocol
+
+- Removed the unrequested derived holdout and its code/data. Both annotation
+  configs use all92 reviewed training pieces and restore the original32-piece
+  test set, resident tracing and cross-section evaluation. Historical smoke/long
+  runs below used the rejected protocol and are not comparison baselines.
+- Added persistent first-raw-test-angle-below10deg trace gate. Training remains
+  stopped pending review; original test data lack baked auxiliary normal labels.
+
+## 2026-10-05 — Reviewed normal, width and H/V training
+
+- Added native reviewed-data normal baking using shared VC3D sampling/corrections,
+  inherited parent H/V, and explicit validity/provenance. Added optional normal,
+  input-voxel width and binary H/V heads with augmentation-aware targets,
+  target-only single-backward normalization, raw/EMA losses and checkpoints.
+- Short fresh managed two-GPU run completed eight updates, with refinement off,
+  76 train/16 parent-disjoint test pieces and no runtime Lasagna manifests.
+  See docs/annotated_training_heads.md and planning/task_log.md for validation.
+
+## 2026-10-05 — Tiled tracing checkpoint for integration
+
+- Completed eight-tile 2048 tracing/local deduplication: 7,322 retained tile
+  lines, 3,722 clipped fragments, 739 seam candidates (715 unique, 24 ambiguous).
+  Internal cut endpoints: 2,439, including 985 unmatched. Full run 4,775.68s,
+  anchor preparation 2,347.49s, assembly 9.40s. See tiled-tracing.md for artifacts.
+- Persist implementation, experimental runners, benchmark tables/plots and
+  planning for integration. Prior validation: 497 native cases, 4 queue Python
+  tests and 9 focused tiled Python tests passed; no new benchmark run for commit.
+- Seam admission relaxation and alternative-aware BP consumption are NOT yet
+  implemented. Existing 80%/32-voxel gates and downstream rejection remain.
+  Preserve candidates rather than incorrectly forcing all alternatives equal.
+
+## 2026-10-04 — Promote tuned overlap-filtered crop baseline
+
+- User selected presence-ranked ellipse10/20, any-positive-overlap whole-piece
+  deduplication with near/far .2/.2, P1 .0375, disabling100/128 and boundary10.
+  Current1024 baseline:65.3846% non-oracle,91.6667% observed shift,
+  −55.1216% removal,88.4615% oracle accuracy. Production and91-fiber defaults unchanged.
+- Added matched2048 runner reusing validated historical dense tracing and shared
+  filtering/BP/reporting helpers. Nine focused tests pass. Global deduplication
+  stopped at user request after3169.7s; no2048 BP score produced. Replaced by
+  experimental1024core/64halo local tracing and deduplication (see tiled-tracing.md).
+
+## 2026-10-03 — Independent BP cost tuning for twelve zero-overlap selections
+
+- Added reusable cost-only sweep through approved runner, shared native BP stage
+  and strict resume provenance. Frozen geometry, min256/median64/500messages.
+- Completed576configurations,91removal solves and12paired exact repeats, no
+  failures.14Python tests passed. Full before/after and weights in
+  volume-cartographer/docs/fiber_benchmark_runs/2026-10-03-overlap-costs.md/json.
+- Best presence-ranked10/20:65.3846%non-oracle/91.6667%shift/−55.1216%removal
+  versus no-dedup61.5385%/87.5%/−28.9207%. Near/far magnitude.2,disable100,
+  boundary10,parallel-one.0375,hard signs. Gains primary metrics, not removal.
+  Bounded two-round tuning on same crop; no automatic default promotion.
+
+## 2026-10-03 — Zero/low-overlap and isotropic post-filter sweep
+
+- Added0%threshold: any positive sampled match, never disjoint pairs. Native
+  measured overlap graphs are reusable across ranks/thresholds, with strict
+  exact-geometry/config/normal identity keys and atomic cache publication.
+- Tested36newsettings:0/10/20% x length/cost/presence x ellipses10/20,20/40,
+  then isotropic10/10,20/20. Same frozen1024 raw40500 pieces and BP parameters.
+  Fresh and cached80%control reproduce previous survivor IDs exactly; baseline
+  scores reproduce61.5385%non-oracle,87.5%shift,-28.9207%removal.
+- Best new: length20/40,f0 gives50%non-oracle,79.1667%shift,-82.9448%removal,
+  435pieces (31.5782% summed length). Isotropic maximum34.6154%. No promotion.
+  Oracle reference accuracy does reach88.4615% versus80.7692%baseline; keep it
+  distinct from the non-oracle metric. All non-oracle runs still observe24/26refs.
+- One audit filter:63.94s fresh measurement vs0.397s cached, identical selection.
+  Native tests90crop cases plus other suites and5Python config tests passed.
+  Report2026-10-03-post-overlap-low.md/json includes all36plus historical12.
+  Approved runner action iso20_post_overlap with low:true, report_only:true.
+
+## 2026-10-03 — Post-fw/bw whole-piece overlap pilot
+
+- Added opt-in native saved-artifact `deduplicate` mode using shared indexed
+  ellipse/angle matching. Every reverse-filtered piece is independent; deterministic
+  global best-first selection by length, sampled mean presence or cost density.
+  Preserve survivor geometry/costs/settings and source/suppressor indices.
+- Matched1024 matrix:10/20 or20/40 ellipse,50% or80% coverage of shorter piece,
+  three quality rankings;12 trials plus freshly verified baseline. No retracing,
+  GPU inference, BP-iteration increase or2048 run.
+- No improvement. Baseline61.5385% non-oracle/87.5%shift/-28.9207%removal.
+  Best filtered accuracy: cost20/40,f80 gives53.8462%/79.1667%/-158.1425%,
+ 501pieces vs1879 and25.1278% of original summed geometry. Other filtered
+  accuracies26.9231–50%. All retain24/26 observed references, so degradation is
+  not merely additional missing references. Keep disabled.
+- Full table/configs/provenance: volume-cartographer/docs/fiber_benchmark_runs/
+  2026-10-03-post-overlap.md/json. Approved action `iso20_post_overlap`.
+  Whole-piece deletion can lose unique tails; offline frozen-pool selection is
+  not online replacement/reseeding. Artifact replay not measured in this pilot.
+
+## 2026-10-03 — Indexed dense coverage-stop pilot
+
+- Added optional accepted-segment spatial-index stopping with worker watermarks,
+  ordered raw-prefix revalidation and terminal reverse checks. Separate stopping
+  radii preserve seed suppression for tuning; default remains off.
+- 1024 control reproduced prior geometry and61.5385% accuracy/87.5%shift exactly.
+  Stop40/80,20/40,10/20,5/10,2/4 trials: best stopping accuracy38.4615% (5/10);
+  none beats control. Tracing41.4–47.4s versus56.9s; geometry greatly reduced.
+  Full report: volume-cartographer/docs/fiber_benchmark_runs/2026-10-03-coverage-stop.md.
+  No2048 rerun/promotion. Artifact replay not measured; historical direct replay
+  does not exercise inter-trace coverage and is not reused as a new score.
+- Earlier2048 matched solve failed534.1M winding states vs4M guard. Same-box
+  audit found5.86x traced length, dominated by recovered distant-seed pieces;
+  report2026-10-03-2048-trace-density-audit.md preserves evidence.
+
+## 2026-10-03 — Accuracy-first iterative BP sweep
+
+- User subsequently selected this winner as the current best/future BP benchmark
+  baseline; documented in specs/current_tracing_baseline.md. Runtime defaults
+  unchanged. Saved full91 raw40500 comparison:16 unfiltered errors versus5 errors
+  plus66 filtered stops (ellipse20/40 full-prefix512), distinct from crop iso20.
+
+- Four coordinate rounds, 125 unique configurations, 55 removal solves plus
+  independent/oracle winner repeats. Strict ranking: non-oracle accuracy,
+  observed shift, then constraint-disable score. Fixed 500 iterations.
+- Winner: min256, median±64/blend1, scale.822, boundary10, P1=.0375,
+  disabling100 per128. Accuracy61.5385% and shift87.5% unchanged; removal
+  −29.5030%→−28.9207%, problematic55515→54665 of243682.
+- Final neighborhood had no improvement. Exact repeat of state/factors/ladder
+  and removal counts. Production defaults unchanged; tuning-crop result only.
+- Reusable approved runner action `iso20_iterative`, checkpoints and full table
+  in `volume-cartographer/docs/fiber_benchmark_runs/2026-10-03-iterative-accuracy.md`.
+
+## 2026-10-03 — Median64 selected baseline and cost sweep
+
+- Recorded median64/min256/P1=.05/disable150/boundary0 as user-selected baseline.
+  Ran18 cost cases +2 bounded combinations using established oracle-removal and
+  independent metrics. Lower P1=.01 only marginally helps removal; zero collapses.
+- Far-perpendicular magnitude.05 + disabling75 gives−17.5073% removal with
+ 61.5385% independent accuracy/83.3333% shift. Far-perpendicular.05 + no parallel
+  sign gives best removal−13.1589% but46.1538%/79.1667% independent/shift.
+  These are tradeoffs, not automatic baseline/default replacements. No-perp-sign
+  unavailable due incompatible gauges.19 valid paired state/factor parity checks;
+ 10 tests pass. Full20-case report2026-10-03-median-costs.md/json; native unchanged.
+
+## 2026-10-03 — Established reference-conditioned removal comparison
+
+- Ran no-probe weight0.05 winner,median64,consensus32 with historical oracle-inliers
+  benchmark. Problematic counts56027/55515/55816 of243682; constraint scores
+  −29.8564%/−29.5030%/−29.7105%. Both probes improve slightly,median best.
+  Oracle76.9231% all; initial states/factors exactly match prior independent runs.
+  Full breakdown in2026-10-03-probe-removal.md/json. Eight tests pass; defaults
+  unchanged. Supersedes geometric audit as answer to requested removal metric.
+
+## 2026-10-03 — Cached probe correctness audit
+
+- Strict reference geometry/contact audit on no-probe, median64 and consensus32
+  winner outputs:468 orthogonal/133 parallel assessable signs, none wrong in
+  each variant. Only0.75% of hard orthogonal factors covered, remainder unknown.
+  Median64 raw magnitude MAE improves about3%, but its magnitude has zero weight;
+  final scores remain61.54%/87.50%. Added reusable audit and seven passing checks.
+  See2026-10-03-probe-correctness.md; no defaults or native behavior changed.
+
+## 2026-10-02 — Orthogonal probes and objective adaptation (opt-in)
+
+- Added conservative +/-source-arc orthogonal probes, median/consensus/half-blend
+  options; preserve original acceptance, owners, soft scores and parallel fields.
+  Eight probe variants keep50% accuracy/87.5% shift despite changing targets.
+- Soft parallel magnitude weight0.05 (from0.1) improves legacy-fine256 to61.54%
+  accuracy/87.5% shift, exact repeat.16/26 correct, no ties. Probes combined with
+  winner add no benefit; prefer simpler no-probe objective. Zero weight collapses
+  to3.85/20.83; weight0.2 and cosine confidence50/83.33.
+-16 valid runs;447 native +48 Python checks. Current leading tested candidate,
+  not production default. Objective also affects reference ranking; no new
+  oracle/removal scores. Full report/JSON in volume-cartographer/docs/fiber_benchmark_runs/
+  2026-10-02-iso20-orthogonal-probes.md. No extra iteration budgets or repair.
+
+## 2026-10-02 — Legacy constraints ported to fine pieces (opt-in)
+
+- Added --legacy-fine-pieces using shared subdivision/remapping: old512/128
+  observations preserved as a multiset, no remeasurement/normalization, fresh
+  fine continuity.16 runs preserve242762 ordinary measurements and mass.
+- Minimum256 + length75/150 per128 voxels, no boundary penalty:50% exact
+  accuracy/87.5% observed shift vs old50%/83.33%; shift count4->3, no ties.
+  Disabled length6.04% vs10.49%. Minimum64 still below baseline; old tuned
+  overlap53.85%/79.17% remains a different tradeoff. No defaults promoted.
+-446 native and46 Python tests pass. Dated full report:
+  volume-cartographer/docs/fiber_benchmark_runs/2026-10-02-iso20-legacy-fine.md
+  and JSON. Only independent readout tested; no new oracle/removal scores.
+
+## 2026-10-02 — Constraint isolation on old overlap (not promoted)
+
+- Added opt-in measurement/readout/ownership ablations, exact frozen class/cost
+  priors and overlap-partitioned length costs. Defaults unchanged.34 native runs
+  on raw40500 iso20,500 iterations,128workers, no inference/retracing.
+- Baseline50% accuracy/83.33% observed shift reproduced exactly. New local
+  scorer alone19.23%/16.67%, losing70.08% of original pair links; consistency
+  rejection26.92%/62.5%, removing28.02%. Reference-only46.15%/83.33%.
+- Binary scores or old graph length+boundary costs each53.85%/79.17%: one
+  accuracy gain but worse shift, not a dominant replacement. New source events
+ 34.62%/29.17%; frozen old mass38.46%/58.33%. No defaults promoted.
+-445 native cases +45 Python checks passed. Full table, link inventory and
+  explicit limitations in docs/fiber_benchmark_runs/2026-10-02-iso20-constraint-isolation.md
+  under volume-cartographer. No new oracle/removal solves; two multi-gauge rows
+  explicitly unavailable. Local geometric subtests remain bundled.
+
+## 2026-10-02 — Coarse/fine source-memory trials (not promoted)
+
+- Added opt-in native deterministic-memory sequence factors: hard512 windows,
+  overlapping512/128 windows, and finite-break chains with disabled-run costs.
+  Fine evidence/length ownership retained once; prepass unchanged; gauges and
+  geometry gaps respected. Conditional DP replaces neither the global solver
+  nor its500-iteration budget. No rejected interval repair used.
+- Seven matched runs: control42.31% accuracy/62.50% shift reproduced exactly;
+  all six memory variants worse (15.38–26.92% accuracy,17.39–30.43% shift).
+  Old overlap baseline50.00%/83.33% remains best. No production default change.
+  Full results: volume-cartographer/docs/fiber_benchmark_runs/2026-10-02-iso20-source-memory.md
+  and adjacent JSON; approved runner action iso20_source_memory.
+- Validation:442 native cases and40 Python checks; exhaustive tiny-factor
+  comparisons, neutral equivalence, deterministic windows and gauge isolation.
+
+## 2026-10-02 — Gap-aware BP follow-ups (no default promotion)
+
+- Tested blended incidence/length costs and winding-only damping; best remains
+  pure length42.31%accuracy/62.50%shift. Added opt-in native checkpoint retention,
+  directed disabled-run opening factors (including fixed prepass Defects), and
+  bounded interval repair using shared normalized BP potentials. Checkpoint
+  selection/cost grid gave no score gain; positive run-opening penalties worse.
+  Repair reduced boundaries61→52 and objective118989→114651 but not winding
+  errors. Overlap50.00%/83.33% remains the relevant baseline. Defaults unchanged.
+- After explicit user correction, remaining benchmark runs capped at500BP
+  iterations; removed higher-budget sweeps from the new runners.440native and
+  40Python checks passed. Full results/commands in2026-10-02-iso20-stable-gap.md
+  and2026-10-02-iso20-stable-followups.md (+JSON); historical table updated.
+
+## 2026-10-02 — Local-event BP gap and length-cost tuning
+
+- Added opt-in hard-continuity active/Defect boundary cost (active-active equality
+  remains hard) and local-event physical-length unary via the existing shared
+  native measure. Defaults unchanged. Completed38 frozen-iso20 trials over
+  minima64/256, boundary/disable costs and500/1000/5000message budgets. Best500
+  setting (min64,gap1000,length300/128vx)42.31%accuracy/62.50%shift versus untuned
+  15.38%/12.50%; it falls to30.77%/58.33% at1000/5000. Overlap50%/83.33% remains
+  better. No promotion. All solves hit message limit; event oracle limitation
+  remains explicit. Full matrix/JSON and historical table updated;437native and
+  18Python checks passed. See2026-10-02-iso20-gap-tuning.md.
+
+## 2026-10-02 — Orthogonal-only cuts and minimum-length sweep
+
+- Removed parallel-transition cuts from local event mode; added --local-min-piece-length with deterministic orthogonal-midpoint spacing/tail checks and intactshortsource handling. Certification/evidence/weights/solver unchanged. Tested8/16/32/64/128/256basevoxels on frozeniso20traces. At64/128/256, independentaccuracy15.3846/15.3846/34.6154%,observedshift12.5/20.8333/16.6667%,pieces8273/4842/2730. Overlapbaseline50%/83.3333%/2732pieces remains stronger. All238464certified measurements retained; no missing referenceevent owners. Oracle scores unavailable due to existingcalibration error at everyminimum. All500message solves hitlimit.436native+4queue+18Python tests passed. Report2026-10-02-iso20-orthogonal-minimum.md and full table updated; no promotion of an experimental minimum.
+
+## 2026-10-02 — Isotropic20 local-event BP trial (partial)
+
+- Reused exact iso20 traces with existing local-constraint-events mode;1879traces become118010clean pieces vs2732overlapping pieces. Independent accuracy11.5385% vs50%; observed shift4.1667% vs83.3333%, with2ambiguous/unbounded readouts. Oracle attempt failed at missing reference-connected gauge calibration; constraint/oracle metrics explicitly unavailable. Reference event mapping4754/4754,missing_owner0. Safe parser support for empty satellite-gauge summaries, no solver edits; earlier five readouts unchanged. See volume-cartographer/docs/fiber_benchmark_runs/2026-10-02-iso20-event-bp.md. No default change.
+
+## 2026-10-02 — Stricter FW/BW consistency crop sweep
+
+- Added optional reverse-only replay radii (defaults20/40 unchanged); tested10/20,5/10 ellipses and20,10,5 isotropic radii with raw40500/full-prefix512/no-history. All five1024³crop variants complete with replay, constraint, oracle/non-oracle and shift metrics. Isotropic20: constraint−25.2365% vs−82.2666%baseline, non-oracle50% vs42.3077%, observed shift83.3333% vs70.8333%; six filtered stops and93.7463%reference retention. No default promotion. Isotropic5 severely over-filters and has an ambiguous reference8 readout. Full table/report/plots updated; default replay exactly reproduced;312native+4queue+42Python tests. See volume-cartographer/docs/fiber_benchmark_runs/2026-10-02-strict-reverse-crop.md.
+
+## 2026-10-02 — Fast historical independent BP metrics
+
+- Filled1024³ u22000/Qual non-oracle and observed24-reference shift columns. Original BP57.6923%/70.8333%; hard-perp34.6154%/70.8333%; hard-both30.7692%/75%; Qual69.2308%/66.6667%. Three CPU solves35.41s total, reused fourth log, no inference. Original BP differs in4/1204initial states, disclosed as current-binary rerun; hard-both/Qual match exactly. Safe missing-gauge parser handling and shared helpers tested. Full table and detailed ladders in volume-cartographer/docs/fiber_benchmark_runs/2026-10-02-{prefix512,fast-historical-independent}.md.
+
+## 2026-10-02 — Raw40500 historical crop replay
+
+- Completed matched1024³ crop replay on cached raw40500 predictions: unfiltered2errors/33.3333%, prefix512 zero errors/100%, with6filtered stops and94.8385%reference distance retained.48directional cases/101.035764mm, cohort identities/lengths and reference hashes checked. CPU1.71/4.11s; no GPU/inference/native changes.42runner/replay tests passed. Updated historical plots, replay date override, and full-metric comparison. Results: volume-cartographer/docs/fiber_benchmark_runs/2026-10-02-prefix512-replay.*.
+
+## 2026-10-02 — Independent raw40500 crop BP readout
+
+- Reused both1024³ traced artifacts/objectives with reference-independent readout, no oracle/pruning: unfiltered9/26=34.6154%, prefix51211/26=42.3077%. Both lack admitted evidence at reference4and12; observed24-reference ladder has7offset changes/70.8333%shift score in both. Full26shift unavailable. No ties/unbounded best candidates. Initial states exactly match previous1212/2394piece solves; no inference or tracing rerun. CPU13.77/34.13s.39CLI/helper tests passed. Details/ladders: volume-cartographer/docs/fiber_benchmark_runs/2026-10-02-prefix512-independent.*.
+
+## 2026-10-02 — Preferred reviewed-tracing baseline
+
+- Promoted full-prefix512/no-history on frozen raw best40500, all91pieces/182directions (no short-sample exclusion):5ordinary errors,66filtered stops,94.7436%retained. Exact snapshot and flags in docs/benchmarks/current_tracing_baseline.md. Selection is cohort-tuned and reference-replay reseeding is GT-assisted.
+- Opt-in GT-free dense-crop periodic-prefix filter reuses the native reverse verifier; preserves old endpoint/backoff behavior. Discards rejected checkpoint intervals and resumes at the next generated vertex, without bridging gaps. Matched1024³ raw40500: constraint benchmark−291.6299→−82.2666%; oracle-reference80.7692→84.6154%. Morepieces546→1661; candidate tracing28.53→45.56s, BP48.28→138.84s. Existing GT-assisted metric definitions preserved; not independentBP accuracy. Report and plots under volume-cartographer/docs/fiber_benchmark_runs/2026-10-02-prefix512.*.
+- Dense crop's serial-owner anchor preparation now uses existing memory-admitted per-cell parallel fitter with CLI thread budget, without changing other schedulers.311native+4Python tests passed including1vs128fixture equivalence. No model/inference/solver numerical settings changed.
+
+## 2026-10-02 — Reverse directional-history seed experiment
+
+- Added optional initial step-direction prior to shared native one-way/extrapolation path. Separate rolling-history sample count preserves actual beam depth/budget/path. Reverse verifier can seed negative local forward edges oldest-to-newest, using actual next vertex; all steps freely inferred and checked. Not exact reversed curvature history and no forced warmup. Defaults unchanged.
+- Frozen40500,91fibers/182directions: cold256 exactly reproduces all previous replay geometry/results (5ordinary/75filtered). At256 H1:7/69, H4:6/70, H8:6/69, so none meets5ordinary cap. H8at128:5/72/98.3165%retained vs old128:5/78/98.1783%; H8at512:6/62/95.0853%, missing cap. Modest improvement at128; old512 still fewest qualifying stops66 with94.7436%retained. No default adoption.
+- Approved runner action reviewed_reverse_history, unchanged cache/inference/192worker pipeline and GPUs0–5. Native23+90+26+86cases and4integration tests,15Pythonconfig tests; strict182case baseline identity audit. Full report: docs/benchmarks/reviewed_reverse_history_40500_20261002.md/.json. Selection tuned on same cohort, not independent validation.
+
+## 2026-10-02 — Full-prefix reverse consistency matrix
+
+- Added opt-in reverse-to-segment-start and all-terminal-endpoint checks to the shared native policy, retaining defaults, matcher,20/40ellipse and inference pipeline. Terminal distance failures converted to filtered stops retain original xyz/reference arc in trace artifacts. No GT in reverse acceptance, but GT-conditioned terminal timing/reseeding remains an explicit diagnostic caveat.
+- Frozen rawu40500,91reviewedfibers/182directions: originalwindow25613ordinary/36filtered/98.4381%retained; window256+terminal8/41/98.3309%. Prefix128:5/78/98.1783%; prefix256:5/75/96.8330%; prefix512:5/66/94.7436%. Plainbaseline16/0/100%. More filtering is not necessarily greater continuity or proven error precision. All complete; no production defaults changed.
+- Approved runner control action reviewed_reverse_prefix. Native suites23+88+26+86cases and4integration tests passed;14Pythonconfiguration tests passed. Exact paths, per-scroll metrics, timings/inference counts in docs/benchmarks/reviewed_reverse_prefix_40500_20261002.md/.json. Convergence shortcut deferred.
+
+## 2026-10-02 — u40500 periodic reverse and GT reverse diagnostics
+
+- Same91/182baseline16ordinaryfailures →13ordinary+36filteredstops,98.438%retained,21.650mmskipped with unchanged256baseperiodic/20x40check/10x20GTreseed. More totalinterruptions49, not an unconditional continuity improvement. Reused checkpoint/cache and parallel pipeline;17tests pass.
+-52probes on13remainingepisodes: tightwrong-routecontrol7/13;GT0tight11/13(regular13/13),GT128/256tight9/13each.6failcontrol;7passcontrolbutalsohaveatleastonetightGTalternative;0diagnosticremainder. GT-assisted/first-segment diagnostic, not deployment detection rate;0/36sustainedconvergence,clippedoffsetsdocumented. Report: docs/benchmarks/reviewed_reference_reverse_halfsigma_sideband_best_raw_20261002.md/.json. No production defaults changed.
+
+## 2026-10-02 — Best raw/EMA sideband comparison
+
+- Froze best rawu40500 and bestEMA99/999u40800 from203634run before evaluation. Same reviewed91fibers/182directions, standard bf16 inference/beam tracing, GPUs0–5, noTTA/filter. Restarts16/22/21; means81.540/60.269/63.008mm. Previousrawu37000:17/77.010mm. Zero infrastructure failures; coordinator269.26/244.02/247.76s. Raw wins this comparison, no defaults changed.
+- Shared freeze helper records per-checkpoint source/hash/time; exact EMA selection guards and12tests. Approved runner reused, no scheduling changes. Reports: docs/benchmarks/reviewed_halfsigma_sideband_best_*_20261002_20261002.md/.json, finalEMA999report includes all results and history. Reviewed32 is validation data, not training inputs; not a blind final-test comparison.
+
+## 2026-10-01 — Latest sideband raw u37000 evaluation
+
+- Frozen current raw from 20261001_203634 (4.736M samples), same reviewed91/182 standard beam evaluation on GPUs0–5.17restarts versus24previousrawu31500; mean77.010mm versus55.447mm. Scroll failures6/0/3/0/8; zero infrastructure failures,254.93s coordinator. Named selection reuses unchanged pipeline;11tests pass. Full comparison: docs/benchmarks/reviewed_halfsigma_current_raw_sideband_reviewed32_v1_20261001.md/.json.
+- Launch config places reviewed32 in test_datasets, not training inputs; original training split remains. This subset is used for validation during training.
+
+## 2026-10-01 — Checkpoint reviewed evaluation work
+## 2026-10-03 — Resident training trace evaluation
+
+- Replaced per-test Python benchmark launch and training-model evacuation with
+  shared callable evaluation and tile inference on resident training replicas.
+- Preserve optimizer/EMA/RNG state and existing inference/tracing math; retain
+  responsive manager polling and safe cancellation before buffer release.
+- Added CPU/native replay and manager-granted GPU lifecycle regression tests.
+
+## 2026-10-03 — Raw best checkpoint by reviewed-trace restarts
+
+- Freeze and hash the exact raw checkpoint used by every reviewed trace, then
+  independently retain the strictly lowest-restart checkpoint as
+  `best_reviewed_trace.pt` without changing dense-loss or EMA best selection.
+- Bind comparisons to the complete reviewed benchmark identity and reconcile
+  interrupted successful finalization while excluding incomplete/revoked work.
+- Expose the new checkpoint as the `best_trace` experiment variant and add
+  focused CPU regression coverage for selection, validation, and recovery.
+
+## 2026-10-02 — Cooperative maintenance survives allocation changes
+
+- Made reviewed-trace maintenance a durable supervisor-owned request rather
+  than an immediately executable cohort-local event.
+- Bound every trace attempt to its exact manager epoch, generation, GPU UUIDs,
+  and grant; revoked attempts are process-group reaped before release and then
+  retried after regrant.
+- Added staged/atomic trace output promotion and exact request deduplication.
+- Validated in production by pausing update-42700 trace attempt 1, observing
+  verified release, resuming into attempt 2, completing the trace once, and
+  continuing training through update 42704.
+
+## 2026-09-28 — Correct failure-trial coordinates and parallel export
+
+- Fix run-local versus original-fiber arc mismatch in global reproduction trials; version coordinate contract and validate independent expected start/end XYZ within0.25 base voxel, both before tracing and when auditing saved results.
+- Discard invalid reproduction outputs only; preserve original evaluation and inference caches. Rerun on GPUs0–5 with192 trace workers.
+- Bounded process-pool audit and reference parsing; parallel annotation/chunk exports, vectorized exact corridor bounds and shared coverage checks.512-file audit median14.38s→0.60s at32 workers, identical results. Details and caveats in training_failure_mining_20260927.md.
+
+## 2026-09-28 — Bounded native failure-search queue
+
+- Replace per-trial eager coroutine stacks with bounded reusable contexts;
+  materialize geometry on admission, search shortest-first and prune larger
+  queued distances after a valid adjacent failure/padding pair. Preserve
+  ordinary evaluation ordering. Record cancelled counts and validate artifacts.
+- Remove extraction-specific inference resource clamps; use producer settings
+  unchanged. Explicit192-CPU tracing budget, all8 GPUs. Native/Python tests pass.
+
+## 2026-09-28 — Lowres-only training hard mining
+
+- Failure sources restricted to best lowres; independent fullres inspection
+  producer reuses shared caches and fills only exported corridors. Preserve
+  reproduction, expansion, union and parallel scheduling. Resume on all8 GPUs.
+
+## 2026-09-28 — Parallel live-cache startup
+
+- Parallel cache validation/decode and dependency preparation using existing
+  input workers, with bounded batches and deterministic coordinator merge.
+  Keep startup barrier and capped background semantics; active run untouched.
+  Regression tests cover concurrency, corruption, missing chunks and errors.
+
+## 2026-09-28 — Resume training hard mining after kernel upgrade
+
+- Resume approved workflow on GPUs0–7, preserving completed Classic/lowres and
+  published inference. Archive interrupted fullres trace output under workflow
+  lock without changing scheduling, inference tuning or prepared evidence.
+  Five regression tests cover archival safety. Kernel now 6.8.0-1062-oracle;
+  ephemeral write/fsync probe passed.
+
+## 2026-09-28 — Diagnose md0/ext4 allocator stall
+
+- Matched Ubuntu Oracle kernel binary to running perf build ID and confirmed
+  missing stripe-aligned allocation fallback (upstream 1f6bc02f1848). Perf
+  executes the exact affected branch; group-search CPU dominates. Recorded
+  journal/write-probe evidence and uncertainty about repeated live allocation
+  groups. No kernel/filesystem or inference-setting changes. See
+  docs/benchmarks/ext4_allocation_stall_20260928.md.
+## 2026-09-29 — Anisotropic Gaussian fiber-presence supervision
+
+- Added opt-in soft Gaussian tube targets around dense 3D fiber lines, using
+  native Lasagna normals, exact augmentation covector transforms, 4:1
+  in-sheet/thickness sigma, bounded support, Gaussian-weighted direction
+  supervision throughout the tube, and target-only loss counts.
+- Updated the high-resolution refinement config to initialize from its best
+  EMA-0.999 weights and saved refined geometry while continuing online
+  refinement in a fresh managed training run.
+
+## 2026-09-28 — Ordinary-only N2 solve/readout
+
+- Same548 N2 source fibers solved without reference nodes or cross factors;
+  original IDs verified exactly and no largest-component filtering. Special
+  post-split reference attachments are unchanged and used only for readout.
+- Full-coverage gauge0 correctness/shift scores:3/10=15.38%/19.23%,
+  10/3=7.69%/15.38%,10/10=15.38%/34.62%. All28 gauge readouts retained;
+  gauge0 covers98.78% of reference observations. Ties and partial-gauge
+  limitations explicit; no fabricated all-gauge score or tuning promotion.
+- Native123/Python27 tests pass; all three runs complete. Full ladders and
+  provenance in volume-cartographer/docs/fiber_benchmark_runs/2026-09-28-n2-unconditioned.*.
+
+## 2026-09-28 — Complete-graph fixed-reference neighborhood diagnostic
+
+- BP-only now retains all winding components by default; legacy largest-only
+  filtering requires an explicit flag. No implicit loss of remote source pieces.
+- Added whole-source N-winding reference neighborhood selection, canonical fixed
+  references, shared combined-graph assembly and per-source/piece/continuation
+  diagnostics. Ordinary H/V/winding/defect states remain joint and free.
+- N2 retains548/2778 sources (19.73%). D10/C10 disables7.04% of pieces with1.29%
+  active continuation jumps, versus8.66%/1.40% for the same fibers scored from
+  the all-fiber solve. Cheaper step cost trades defects for substantially more
+  jumps. All220 reference pieces fixed; all-graph keeps665 unanchored gauges.
+- Four trials completed;123 native and26 Python tests pass. Full results,
+  provenance, commands and limitations in
+  volume-cartographer/docs/fiber_benchmark_runs/2026-09-28-reference-neighborhood.md.
+
+## 2026-09-27 — Preserve certified constraints across piece splitting
+
+- Fixed post-split support filtering/clipping and source-pair parallel evidence
+  reweighting. Certify first; splits change owner IDs only, never validity.
+- Fixed the same dependency in reference cross-constraint extraction: certify
+  on source fibers, then use the shared event-owner remapper for existing pieces.
+- Full six-setting Paris4 2048 rerun: all53,480 certified events retained with
+  parallel on; off intentionally omits17,952. No support rejection or missing
+  reference owners. Native118 and Python34 regression tests pass.
+- Corrected fixed-H/V parallel-on initial accuracy19.23%, versus rerun legacy
+  grouped38.46%; shift scores46.15% versus73.08%. Fine joint-H/V variants remain
+  at11.54% initial accuracy. No default changes; bugfix is not a quality win.
+- Full percentages, ladders, audits, provenance and reusable commands in
+  volume-cartographer/docs/fiber_benchmark_runs/2026-09-27-certified-splits.*.
+  Earlier local-events/local-costs/local-step-costs results are now explicitly
+  marked historical broken-graph experiments, not intended-algorithm results.
+
+## 2026-09-27 — Distance-weighted continuation
+
+- Added opt-in untruncated lambda*absolute physical winding displacement,
+  including H/V phase; retains ordinary evidence and soft pair coupling.
+- D10/parallel-off joint-H/V six-trial experiment complete. Hard and flat-C10
+  controls reproduce previous scores/ladders. Linear lambda {0.1,1,10,100}
+  gives initial accuracy {7.69,11.54,11.54,7.69}% and shift scores
+  {3.85,3.85,7.69,11.54}%, versus flat-C10 7.69%/15.38%.
+  No overall correctness gain, defaults unchanged. Tables/plot/JSON:
+  volume-cartographer/docs/fiber_benchmark_runs/2026-09-27-local-step-costs.*.
+- Approved build/run commands only. 116 native BP tests and 32 Python tests
+  passed; independent plan/implementation reviews passed.
+
+## 2026-09-27 — Independent continuation cuts: completed cost matrix
+
+- Benchmark policy clarified by user: message-limit termination is accepted as
+  a completed solve. Earlier increased budgets did not improve results; do not
+  propose budget increases or use the limit as an excuse for poor scores.
+
+- Completed 24 joint H/V and 8 fixed-H/V trials. Independent piece disabling
+  and flat continuation cuts implemented; no default promotion. Cheap cuts
+  fragment the solution; no overall correctness winner. Full percentage
+  tables/plots: docs/fiber_benchmark_runs/2026-09-27-local-costs.*.
+- Shift diagnostic on saved independent ladders requires 20–25 offset changes
+  across 26 references: poor accuracy is not merely one persistent offset.
+- Native 115 tests and Python 30 tests passed for that implementation.
+
+## 2026-09-27 — Local events and clean constraint-midpoint segmentation
+
+- Added opt-in per-side local direction/distance/sign certification, repeated
+  parallel correspondence, weighted evidence, clean non-overlapping midpoint
+  splits and parallel-on/off ablation. Shared geometry and winding samplers
+  reused; legacy defaults unchanged.
+- Frozen 2048 beam8/reverse-consistency benchmark: legacy removal score
+  −110.6766%, independent accuracy 38.46%; local+parallel −90.5016%/15.38%;
+  local orthogonal-only −74.7873%/11.54%. Not promoted: local conditioned
+  accuracy falls to 57.69%/34.62% versus 100% legacy, and 90.92% of locally
+  accepted events lose support after excessive splitting. Both local variants
+  have identical 68,851 pre-BP pieces, median length 22.80 base voxels.
+- Full methods, caveats, results JSON and SVG:
+  `volume-cartographer/docs/fiber_benchmark_runs/2026-09-27-local-events.md`.
+
+## 2026-09-27 — Controlled retention/constraint alternatives
+
+- Completed31recorded crop trials: centered quality, length/degree costs,
+  localized cut placement with matched controls, and latent ordinary-measurement
+  disablement. Cost10 improves removal score−110.6766%→−78.3149%, with38.46%
+  independent accuracy unchanged; cost100 gives−82.5469%/42.31% but only25/26
+  conditioned-reference readouts correct. Other mechanisms did not give a
+  worthwhile gain. Reference evidence/continuity cannot disable; retained off
+  measurements remain benchmark penalties. Defaults unchanged.107native and
+  24Python tests pass. Full tables, plot and JSON:
+  `volume-cartographer/docs/fiber_benchmark_runs/2026-09-27-density-alternatives.md`.
+
+## 2026-09-24 — Density penalty direct search
+
+- Completed51settings plus baseline, separate mean/median/worst coarse grids and
+  two refinements. Best removal scores -109.6787%/-109.1046%/-108.6632% versus
+  -110.6766% baseline. All selected winners retain38.46%independent accuracy.
+  Worst-density gains2.0134pp with scale0.88913971/floor0.63245553. Defaults
+  unchanged; in-sample, fixed500-message-budget results. Full report/data:
+  `2026-09-24-density-sweep.md` and adjacent resultsJSON in native benchmark docs.
+
+## 2026-09-24 — Density-modulated disablement experiment
+
+- Added optional per-piece winding defect multipliers, shared across all winding
+  unary paths; defaults unchanged. Tested arc-weighted mean/median and maximum
+  native tracer loss density on the reverse-consistency 2048 crop. All retain
+  38.46% independent winding accuracy and worsen removal score from -110.68%
+  to -113.71%/-113.35%/-116.87%. No promotion. 104 native and 32 Python tests
+  pass. Full results and limitations: `2026-09-24-defect-density.md` in native
+  benchmark reports.
+
+## 2026-09-23 — Reproducible Paris4 crop benchmark
+
+- Reverse-consistency unpruned independent BP improves correct reference windings7/26(26.92%)→10/26(38.46%);9/26zero-hard-sign errors. Initial500cap,all6790initial states reproduce preceding run. Full ladder:2026-09-23-reverse-consistency-independent.md.
+
+- User-approved promotion:reverse consistency is now default for CLI dense-beam crop generation feeding BP. Explicit --no-reverse-consistency preserves control runs;historical configs updated. Replay/fiberlet/shared-API defaults unchanged.22CLItests plus default/disabled real-data smoke pass.
+
+- Optional dense-beam reverse consistency added:20/40base ellipse,40base backoff, preserved gaps/provenance and retained forward costs. With40/80suppression/45° gate,2048crop BP removal score improves−169.64%→−110.68%,removed constraints36.50%→24.33%;2778pieces,2.26%checked length skipped.86native/20CLItests pass. Disabled by default. Full report/commands:2026-09-23-reverse-consistency.md.
+
+-40/80,45° unpruned independent reference assignment gives7/26 correct(26.92%) versus original8/26(30.77%),despite improved removal metric;11/26 sign-feasible. Frozen initial states match preceding run. Full ladder:2026-09-23-coverage40x80-angle45-independent.md.
+
+-2048 BP removal benchmark with40/80,45° traces improves score−210.44%→−169.64%;problematic fraction67.79%→62.91%,conditioned reference diagnostic21/26→26/26.339.22s,same capped BP/pruning protocol. See2026-09-23-coverage40x80-angle45-bp.md.
+
+-40/80 seed suppression with45° gate reduces2382→1484 traces and removes the audited winding0.5 duplicates.40/80 reference-matching success remains23/26. Config experiment only,default unchanged; full tables in `volume-cartographer/docs/fiber_benchmark_runs/2026-09-23-coverage40x80-angle45.md`.
+
+- Explicit tangential seed-coverage radius added;40/80 experiment reduces2048 source traces3697→2382 but preserves winding0.5 triplicate.22/26 strong matches unchanged; some partial coverage worsens.83 crop tests pass; defaults unchanged. Full results: `volume-cartographer/docs/fiber_benchmark_runs/2026-09-23-coverage40x80.md`.
+
+- Independent reference assignment now ranks each reference against frozen initial BP using configured weights/hard signs, without reference-assisted solves or pruning. Exposes five alternatives, sign errors, finite loss, ties and unbounded tails.103 native tests and3 CLI checks pass. Completed1024/2048 runs; full results in `volume-cartographer/docs/fiber_benchmark_runs/2026-09-23-independent-reference-assignment.md`. Historical conditioned scores are not initial-BP accuracy.
+
+- Joint-grid BP zero-weight correction: remove fully inactive winding factors
+  before graph preparation; preserve separate original-index diagnostics.
+  Fix support-expansion normalization so neutral messages stay neutral.
+ 100native winding tests plus7runner tests passed; omitted-input equality
+  covers disconnected bridges, defects and short iteration caps. User approved
+  correcting outputs rather than preserving the old finite-iteration artifact.
+  See docs/fiber_benchmark_runs/2026-09-23-inactive-winding-factors.md.
+  Corrected small run: 53.04 s (was 68.69 s), 88.46% exact references.
+  Larger 2048³ run: 24m52s, 80.77% exact; extra context did not improve
+  accuracy. Full assignment table and capped-solver caveats saved separately.
+
+- New beam8 BP ablation: hard perpendicular order +parallel-one weight0.1,
+  other measurement classes disabled. Constraint-119.57% versus-178.90%;
+  exact88.46% unchanged with same three errors. Logged message-limit and
+  defect-neutralization caveats; production defaults unchanged.
+
+- Imported third-party Qual275-fiber collection and added frozen-polyline replay
+  using the shared evaluator. All three crop plots updated: replay0.0464%,
+  constraint-55.31%, exact references84.62%. Documented acquisition-gap-heavy
+  replay semantics, sparse BP graph and preserved native L0 geometry/provenance.
+
+- Added shared-scheduler, canonical-anchor dense VC3D beam candidate generation
+  for BP. Classic/new constraint scores -240.90%/-178.90%, both88.46% exact
+  references; 1145.24s/45.73s. Historical Fiberlet quality filtering is not
+  transferable to beam costs; report and plots label this difference. Added
+  explicit bounded winding state memory guard override (default unchanged).
+
+- Corrected direct comparison to actual VC3D beam defaults, without fullres
+  tuning: Classic50.000%, new33.333% (1/2 failures). Restored the historical
+  failures+1 headline in native summaries, migrated current crop artifacts and
+  added measurements to the existing progress plots. Greedy remains an explicit
+  historical control, not the default VC3D result.
+
+- Added the approved evaluation runner's `crop-benchmark` mode and reproducible
+  direct/fiberlet/BP configs for the handoff's 24 in-crop fibers (48 directions).
+- Integrated crop-scoped canonical on-demand anchor/fiberlet caches into
+  `vc_fiber_trace_chunk`; shared helpers with production preprocessing and
+  preserved the evaluated-anchor view for compact path storage.
+- Recorded new/Classic controls, historical metrics and generation-version
+  caveats in `volume-cartographer/docs/fiber_benchmark_runs/2026-09-23-crop-new-predictions.md`.
+  BP reference-assisted and unassisted results are explicitly separated.
+- Validated 18 native replay tests, 43 storage tests and 3 recording-runner tests.
+
+## 2026-09-19 — Skeleton backend: sub-ports, kept variants, per-sub-port routing
+
+- Measured what the thresholded fibre presence constrains. Its section is a
+  ribbon, one sigma 1.3 base voxels across the sheet and 3.6 along it, and the
+  refined reference sits within 0.3 of the ribbon's centre across the sheet
+  but up to 17.6 from it along the sheet. Where two fibres merge the thinning
+  voxels run between them, and presence is saturated across the ribbon, so
+  nothing local says which side is the fibre.
+- Ports now carry sub-ports: the centre and the two extremes of the section
+  along its long axis (`candidate_min_offset_base`), each centred by a small
+  presence step (`candidate_refine_radius_base`). Every line variant and every
+  region connection between sub-ports is initialised by a cheapest path through
+  the thresholded prediction under the tracing metric's presence and direction
+  terms (`search_radius_base`), refined with Ceres, and kept.
+- Nothing is chosen ahead of tracing. Each sub-port records its cheapest
+  variant into the line and its cheapest connection into the region, and the
+  replay walks sub-port to sub-port along those entries, so no sub-port can be
+  a dead end while any option exists. `route_through_centre` decides whether
+  the seam centre of a wide section is a routing target; the committed configs
+  set it false.
+- Removed the port optimizer (`port_radius_base`, `port_sigma_base`,
+  `optimize_ports`), the choice's `end_cost`, `unexplained_weight` and
+  `explain_radius_base`, and an interim graph recentring. `dump_crop_presence`
+  writes the thresholding input beside the artifacts; `render_line_variants`
+  writes every variant of a line as a named polyline.
+- Case31 traces as one segment from start to end without a restart; its worst
+  deviation from the refined reference goes from 21.17 to 8.69 base voxels and
+  p95 from 13.75 to 5.77. The unrestricted control reproduces it. The two-case
+  run goes from three failures to two, both in its second case.
+- Details in `docs/benchmarks/contrast_case31_skeleton_geometry_20260919.md`.
+
+## 2026-09-18 — Skeleton-topology least-squares tracing prototype
+
+- Added a native `skeleton` replay backend: threshold and thin the stored
+  presence at full resolution, contract a skeleton graph, split it into
+  unambiguous lines and ambiguous regions at 32-base-voxel entry offsets,
+  optimize each split point in its line-normal plane, refine every line and
+  every region connection with Ceres while holding the split points fixed, and
+  choose each region's connections by brute-force enumeration of all port
+  matchings scored jointly with an unexplained-support penalty.
+- Extracted the shared directed-reference replay driver out of the beam tracer
+  so beam, Lasagna and skeleton replay all use one unchanged 40/80/160
+  protocol, and gave `trace.json` a generic `geometry_backend` label.
+- Packaged explicit contrast-choice benchmarks can now hold several cases and
+  companion-fiber roles, and record a choice whose coordinate bindings could
+  not be verified.
+- First result on case31: the full eligible length traced with one
+  `skeleton_terminal` failure and no wrong-route event, against one wrong-route
+  failure for beam and none for fiberlets. Two-case run reaches 98.98 %
+  credited coverage. Details in
+  `docs/benchmarks/contrast_case31_skeleton_20260918.md`.
+
+## 2026-09-18 — Fiber-tracing benchmark runbook
+
+- Added one central inventory of current scientific, targeted-regression,
+  fiberlet, anchor, mini5, contrast and performance benchmarks with exact runner
+  modes, configs, output/completion contracts and detailed-result links.
+- Distinguished immutable short200 v3 evidence from the later GT-review draft,
+  and separated current canonical results from focused diagnostics, helper modes
+  and historical model/embedding sweeps.
+
+## 2026-09-18 — Merge fiber-tweaks
+
+- Merged full-resolution training, frozen refined split-range embeddings and
+  deferred public-remote authentication into `fiber-vischeck` while retaining
+  the current tracing/evaluation work.
+- The semantic refinement resolution supports both existing
+  resume/initialize-from geometry and explicit SHA-verified frozen geometry.
+  Optional embedding-bank selection remains compatible with legacy adapters.
+- Preserved the current task files and fused both durable changelog histories.
+
+## 2026-09-17 — Frozen refined fibers and split-range embeddings
+
+- Added read-only, SHA-verified refined training geometry imports independent
+  of model resume, plus separately normalized short-/long-range embedding banks
+  with explicit downstream bank selection. Legacy behavior is unchanged when
+  the new settings are absent.
+
+## 2026-09-15 — Anisotropic and direction-guided refinement
+
+- Separated surface-normal/tangential bending (production 0.1/1.0), added weak
+  predicted-direction guidance 0.1, full smooth-warp pullback and split
+  objective logs while preserving the original-GT tether, shared raw/EMA
+  targets and independent test pieces.
+
+## 2026-09-15 — Weak result-line bending and refinement loss reporting
+
+- Replaced displacement smoothing with weak arclength bending of the resulting
+  line while retaining training stitching and free test endpoints.
+- Replaced cumulative refinement TensorBoard counters with weighted presence,
+  bending and localization losses; batch means and full-test aggregates are
+  reported. Regression coverage keeps raw/EMA99/EMA999 refined targets equal.
+
+## 2026-09-16 — Refinement default and run062136 evaluations
+
+- Promoted tracing-selected refinement EMA999u22000 (99restarts/68.676mm) as
+  the canonical refinement training default, with explicit model/state
+  initialization (fresh optimizer/progress/EMA), immutable model/geometry hashes,
+  and frozen inference path in `refinement_default_weights.json`.
+- Full50-fiber run062136 best/current evaluations scored114/59.718mm and
+  109/62.433mm. Neither displaced u22000. Full provenance and per-scroll table:
+  docs/benchmarks/refinement_062136_ema999_best_current_20260916.md.
+
+## 2026-09-16 — Best short200 failure review
+
+- Rendered all59best-u22000 failing pieces (62restarts) in46.958s; exact original
+  replay geometry preserved. Review index sorted reported restarts/mm; no exclusions.
+- Added original copies and vc3d reference/trace exports beside images for59+mini5:
+  canonical evalextract/evaltrace author filenames, explicit source/case provenance,
+  separate restart segments; protect edited exports. Approved benchmark-review
+  runner can regenerate index/exports without tracing. See
+  docs/benchmarks/best_u22000_failed59_vis_20260916.md.
+
+## 2026-09-16 — Weighted anchor downstream mini-pilot
+
+- Regular inline visualization completed for all five weighted cases in25.689s;
+  unchanged traces. Short benchmark runner supports opt-in render and CT binding.
+  Saved beam comparison:Classic fails3/5,best-u22000 fails5/5. Images and comparison
+  documented in the same mini5 report; cost oracle paused for visual inspection.
+
+- Five locked historical fiberlet failures, four-iteration weighted fit, full native
+  construction/tracing:43.9985s with cached inference. Restarts5→5,100%coverage,
+  mean2.359517mm unchanged; no failures solved. Default unchanged.
+- Config/subset and per-piece failure arc comparison saved; see
+  docs/benchmarks/mini5_fiberlet_weighted_i4_20260916.md.
+
+## 2026-09-16 — Single-anchor weighted-fit experiment
+
+- Opt-in native iterative weighted centroid/direction-tensor fitter in shared
+  extraction path; owned-cell observations, fixed and moving Gaussians, one anchor,
+  no NMS. Legacy defaults/cache identity unchanged; experimental identity isolated.
+- Completed 20 experimental settings plus legacy on all 200 short pieces.
+  Approximately 32% fewer accepted matches; comparable positional coverage, but
+  no win on direction-qualified coverage. More iterations did not help coverage.
+- Added fitted-axis angular/qualified-coverage metrics; saved full matrix and
+  per-scroll results in docs/benchmarks/short200_anchor_weighted_fit_20260916.md.
+  125 native +263 Python tests passed, 8 skipped. Placement-only; not promoted.
+
+## 2026-09-16 — Anchor-only GT placement benchmark
+
+- Added native anchors backend using canonical cached extraction in a narrow GT
+  tube, shared owner-cell padding, indexed projection and existing acceptance metric.
+  No fiberlet paths/search. Flat endpoint caps and explicit cell-side gap units.
+- Completed200pieces with best-u22000 in52.461s (warmcache plus40inference tiles).
+  99.8467% interior gaps below1cell;max3.7364cells;59/8721empty arc bins;noempty
+  pieces. Cellside32basevoxels. Full per-scroll histograms/endpointstats/inspection
+  ranking and exact commands in docs/benchmarks/short200_anchor_coverage_u22000_20260916.md.
+-122native tests and261Python tests passed;8optional skips. Existing extraction
+  and replay metrics unchanged; placement alone does not measure graph connectivity.
+
+## 2026-09-16 — Short200 beam/fiberlet comparison completed
+
+- Classic153restarts/4.299mm, best-u22000 beam62/10.509mm, same-model
+  fiberlets67/9.737mm on the same200pieces/662.089848mm.
+- Scroll-local224CPU construction and on-demand GPU lease; release30idle seconds.
+  Fiberlet run24m46s includes partial construction-cache reuse and extra inference,
+  not a controlled search-speed measurement. Credited reference coverage99.846%.
+- Results and provenance: docs/benchmarks/short200_classic_fiberlet_20260916.md.
+
+## 2026-09-16 — Short failure benchmark extraction
+
+- Directed100voxel-grid reproduction search with confirmation/padding, original
+  annotation/model/arc provenance, deduplication and native self-proximity exclusion.
+- Resumable trials reuse historical inference and fill missing chunks under one
+  whole-extraction GPU grant. Replaced sequential snapshot/group barriers with
+  bounded concurrent jobs, deterministic selection and coordinated cancellation.
+- Completed accepted200-case v3:41best/50other/109Classic,662.089848mm.
+  Final resumed scheduler21m34s (not total development/extraction attempts).
+  All200annotation hashes/directions/lengths validated. Best-u22000 evaluation
+  on the common benchmark now running. See docs/short_failure_benchmark.md.
+
+## 2026-09-16 — Optional cached fiberlet evaluation
+
+- Added anchor extraction/path generation/graph replay to the live evaluator,
+  reusing production kernels, canonical metadata, inference readiness and caches.
+  Ordinary beam replay remains default; shared inspection supports graph paths.
+- Graph acceptance carries the existing ellipse/excursion policy across edges;
+  seeded-coverage accounting now excludes skipped seed gaps.
+- Real cold/warm pilot gives identical paths with zero warm inference; full-set
+  validation is ongoing. Details: docs/benchmarks/fiberlet_u22000_20260916.md.
+
+## 2026-09-16 — Refinement run212757 best/latest EMA999
+
+- Both full50-fiber evaluations completed without embedding/rendering.
+  Bestu22000:99restarts/68.676mm mean/11.129median, new overall leader.
+  Latestu37100:105/64.789/9.837. Latest−4restarts on0139,+10onParis4.
+- Sequential8GPUexclusive evaluations; frozen before either run. Full historical
+  and per-scroll report: docs/benchmarks/refinement_212757_ema999_best_current_20260916.md.
+
+## 2026-09-15 — Refinement run185710 best EMA99 u17800
+
+- Full50-fiber noembedding evaluation:106restarts,64.183mm mean,
+  10.856mm median. Better than rawu13300 (126),close to EMA999u16500(103).
+- Highest combined median in recorded comparison; best restarts/mean remains
+  EMA999u16500. No rendering. Report/provenance:
+  docs/benchmarks/refinement_185710_best_ema99_u17800_20260915.md.
+
+## 2026-09-15 — Refinement run185710 best raw u13300
+
+- Best raw (test/loss_total selected) full50fiber evaluation:126restarts,
+  54.076mm mean,9.653mm median. Payload model weights used, EMA bank ignored.
+- Best measured EMA999u16500 remains103/66.035. Full table/provenance in
+  docs/benchmarks/refinement_185710_best_raw_u13300_20260915.md.
+- No embedding/rendering. All8GPUs; inference/coordinator345.703s.
+
+## 2026-09-15 — Refinement EMA999 u24200 repeat
+
+- Latest same-run EMA999 regressed:114restarts/59.718mm mean versus
+  u16500 103/66.035; u16500 remains best measured no-embedding checkpoint.
+- Full50-fiber fixedGT protocol unchanged. Dense loss also increased.
+  Report: docs/benchmarks/refinement_131854_ema999_u24200_20260915.md.
+- u16500 visualization verified complete180renders/index and103restarts.
+
+## 2026-09-15 — Refinement run131854 EMA999 u16500 evaluation
+
+- Full50-fiber original-GT no-embedding evaluation completed:103restarts,
+  66.035mm mean,10.504mm median; versusu14400 111/61.318/10.512.
+- All8GPUs, inference/coordinator344.292s. Full comparison/provenance in
+  docs/benchmarks/refinement_131854_ema999_u16500_20260915.md.
+- Previousu14400 visualization also verified completed:180renders,per-fiber
+  index,111restarts unchanged. No rendering requested for this new snapshot.
+
+## 2026-09-15 — Refinement EMA999 u14400 full evaluation
+
+- Frozen latest EMA999 from refinement run20260915_120327; full original-GT
+  50-fiber/180-direction evaluation without embedding or rendering completed.
+- 111 filtered restarts,61.318mm mean,10.512mm median, versus previous
+  non-embedding EMA999u11800 at113/60.242/9.337. Mixed per-scroll changes.
+- All8GPUs via exclusive manager; inference wall343.647s. Full historical and
+  per-scroll comparison/provenance: docs/benchmarks/refinement_ema999_u14400_20260915.md.
+
+## 2026-09-15 — Merge refinement and embedding/evaluation work
+
+- Committed embedding/evaluation state as de6fc71e8, then merged
+  fiber-training-refinement at c3e0d21a8 into fiber-vischeck.
+- No source conflicts; preserved both planning histories under
+  planning/merge_refinement_20260915 and fused both changelog histories.
+- Independent semantic review approved. Native/evaluation suite passed with
+  232 Python tests (8 skipped); refinement/format suite passed 17 (2 skipped).
+  No training or full evaluations rerun.
+
+## 2026-09-15 — Shareable embedding research summary
+
+- Added docs/embedding_experiments_summary_20260915.md covering recorded3D
+  training objectives, diagnostics, policy sweeps, legacy/current full evaluations,
+  mixed-model inference and differentiable calibration/integration. Includes
+  run/artifact/checkpoint references, protocol boundaries and practical conclusion.
+- Validated links/artifact locations and matched saved metrics; independent review
+  passed. Documentation only; no new model/evaluation runs or default changes.
+
+## 2026-09-15 — Causal embedding integration matrix
+
+- Added opt-in physical update cadence, finite observation windows, learned
+  presence/disagreement gate, angular update cap and continuous dual EMA.
+  Native default unchanged; no anchors. Shared EMA/history and fitting helpers.
+- GPU fit45candidates,150steps each; same148windows and30/9/11fiber grouping,
+  shared warm-up extended4096without changing scored branch data. Native/Torch
+  parity270real paths max2.129504e-7;107native/231Python tests passed,8skips.
+- Five full50fiber/180direction finalist evaluations completed:cadencedEMA117,
+  window111,gate110,angular115,dual113restarts versus previous fittedEMA110,
+  originalEMA111,embeddingsoff113,Classic292. No new overall improvement.
+  Gate trades fewer Paris4 errors for more0139/1299 errors; no default promoted.
+- Full matrix, per-scroll/global/split metrics, settings, commands and provenance:
+  docs/benchmarks/embedding_integration_20260915.{md,json}.
+  Usage/math:docs/embedding_integration.md. Approved build/evaluation runners reused.
+
+## 2026-09-15 — Fixed-path differentiable EMA calibration
+
+- Added opt-in native fixed-path scoring/export using shared tracer helpers,
+  cached-only extraction and GPU PyTorch parameter fitting with whole-fiber
+  fit/selection/heldout grouping. Optional zero-anchored smooth distance mapping;
+  linear production defaults unchanged. Approved evaluation runner reused.
+- u11800 presence/direction + u42000 embeddings: fitted linear weight0.0454013,
+  half-life510.432 gives110full-cohort restarts versus111old EMA/113embedding-off.
+  Smooth fit gives117; no default promoted. Heldout20linear/24smooth versus
+  21old EMA/18embedding-off. Small/mixed gain, not a significance claim.
+-103native and219Python tests passed,8optional skips; both50fiber/180direction
+  real evaluations and separate512voxel-window parameter check completed.
+  Full data/limitations/commands: docs/benchmarks/fixed_path_ema_calibration_20260915.{md,json}.
+  Usage: docs/fixed_path_embedding_calibration.md.
+
+## 2026-09-15 — u11800 failure-density inspection ranking
+
+- Saved all 50 original fibers ranked by counted restarts per combined directed
+  eligible reference mm in docs/benchmarks/eligible_ema999_final_u11800_fibers_by_failure_density_20260915.md.
+  Includes per-case counts, forward/reverse IDs, annotation/trace/image links,
+  one-way and directed lengths, and the existing mean convention. Verified
+  per-case counts and lengths against per-fiber totals (113 restarts, 180 cases).
+  Uses saved results only; no evaluation or rendering rerun. This delivers the
+  requested inspection file before the newly authorized fixed-path differentiable
+  EMA scoring experiment; that experiment has not started yet.
+
+## 2026-09-15 — Corrected EMA-only matrix
+
+- Corrected the earlier anchor-policy interpretation: plain EMA-only winner
+  (weight0.25, half-life512basevoxels, no anchors) evaluated on all50fibers
+  for paired best/current and u11800 predictions with each embedding model.
+  Restarts respectively133/211/123/111. All180directions complete per run,
+  original caches reused and model-role identities verified.
+- u11800 + current paired embeddings gives111restarts/61.318mm versus
+  u11800 alone113/60.242mm;0139/Paris4 improve slightly,1299 worsens.
+  Full13-model comparison including all earlier baselines and explicit
+  Anchor-LRU labels: docs/benchmarks/ema_only_matrix_20260915.{md,json}.
+
+## 2026-09-15 — Paired EMA999 matrix and mixed inference
+
+- Completed four paired EMA999 anchor comparisons: current u42000 off/Anchor-LRU
+  205/208 restarts (33.338/32.859mm); best u10800 off/Anchor-LRU 135/139
+  (50.497/49.054mm). Prior non-embedding u11800 remains best combined
+  at113/60.242mm. Full nine-model per-scroll table and provenance:
+  docs/benchmarks/paired_ema999_complete_20260915.{md,json}.
+- Added optional mixed-model live inference: primary presence/nx/ny with
+  alternate embeddings, original-cache composite manifests, per-array demand
+  routing and model-specific pools within one manager grant. Publication and
+  native scoring unchanged. Usage/limits in docs/mixed_inference.md.
+## 2026-09-15 — Fixed-crop test refinement
+
+- Test pieces keep uniform1/8-ellipse step caps without border taper or pinned
+  endpoints; omit artificial outside joins. Training taper/stitching unchanged.
+
+- Independent persistent test-crop curves use original GT image transforms;
+  overlapping test crops no longer modify each other or whole test fibers.
+- Raw/EMA test scalar logging shares component tags including presence/direction.
+- Resume preserves train geometry and optimizer/EMA; legacy whole-test updates
+  intentionally do not initialize the new crop-local targets.
+
+## 2026-09-15 — Opt-in training-feedback GT refinement
+
+- Current detached raw presence refines train/test geometry through a batched
+  semi-implicit, normal-plane constrained solver; native normal loading and fast
+  queues are shared. Original-GT ellipse tether, tapered step caps, resampling,
+  and checkpoint-linked geometry archives preserve inspectability and resume.
+- Disabled by default; configuration and measured solver cost documented in
+  docs/training_refinement.md. Managed continuation launched from update11800.
+
+## 2026-09-14 — Evaluation-ablation merge and final EMA999
+
+- Merged evaluation-ablations into fiber-vischeck at afb14b400 preserving both feature sets, our four active task docs and combined changelog. Parameter-based cache extension replaces obsolete implementation-hash gates; native heartbeat stops after process exit. Validated102native cases and206Python tests (8skipped).
+- Final EMA999u11800 full50fiber eval+vis completed:113restarts/60.242mm mean versus119/57.230mm at u10200;0332/1299 regress, equal-scroll score61.052591 versus69.041084. All180renders and per-fiber index complete. Five-model comparison: docs/benchmarks/eligible_ema999_final_u11800_20260914.md.
+
+## 2026-09-14 — Combined fiber inspection and resumable inference
+
+- Current EMA999 u10200 full matched evaluation:119restarts vs148 forEMA99u5200,
+  combined mean57.230mm vs46.091mm; complete in350.144s. Full Classic/u1800/u5200
+  per-scroll comparison in docs/benchmarks/eligible_ema999_u10200_20260914.md.
+
+- Corrected cross-section alignment: paired traced top/side views share one
+  centerline sampling scale; native restart bands use actual endpoints even
+  when reference progress plateaus. Regression checks actual rendered pixels.
+
+- Named inference caches resume; model keys use checkpoint/inference parameters,
+  not code hashes. Compatible old hash-keyed cache directories remain reusable.
+- Inline combined CT/presence strips at quarter linear resolution, acceptance
+  cross-sections and restart arc metadata; partial per-fiber metrics no longer
+  wait for all rendering. See docs/batched_trace_strips.md.
+
+## 2026-09-14 — Training span eligibility
+
+- 3D training/test loaders retain only spline/traced JSON components and trim
+  extrapolation. Added fresh JSON-only five-scroll LR0.01 EMA config. Separate
+  tracing evaluation unchanged; see docs/training_span_eligibility.md.
+
+## 2026-09-13 — EMA99 tracer reference variants
+
+- Added opt-in best-history and per-beam EMA/seed/gated references to shared
+  native tracer. EMA99 update6500: EMA512 weight.25 gives69 restarts vs87 off
+  and82 original, exact repeats; complete mode sweep and neighboring weights.
+  Defaults unchanged. See docs/embedding_ema99_references_20260913.md.
+
+## 2026-09-13 — Paired embedding tracer tuning
+
+- Generalized existing embedding-only sweep for configured histories and selected-history weight search.
+  Frozen4300 pilot tuned86 off/90 original to82 restarts, exact repeat; local one-fiber result,
+  no default changes. Full results: docs/embedding_paired_tracer_tuning_20260913.md.
+
+## 2026-09-13 — Paired long-range embedding training
+
+- Added same-fiber patch pairs with shared value augmentation, independent geometry,
+  joint contrastive sampling and pair-preserving cooperative microbatch allocation.
+- Validated CPU, native real-data loading and manager-exclusive two-GPU gradients;
+  replacement training starts from scratch at LR 0.01 with 64 pairs/update.
+
+## 2026-09-13 — Embedding-guided live tracing
+
+- Full36 history sweep at0.30:best93 at8/64/Gaussian vs88 at0.25, exact repeat;
+  side-by-side report retained, production defaults unchanged.
+- Fixed-history weight neighbor search:0.25 remains local best88 failures,
+  versus98/103 at0.20/0.30; exact cached repeat, no defaults changed.
+- Added uniform/linear/Gaussian history sweep:36 variants, best88 vs96 off
+  failures on one difficult fiber; exact cached repeat. Defaults unchanged.
+  See docs/embedding_history_sweep_20260913.md for the full matrix and caveats.
+- Added CPU-only cached embedding query/route analysis using shared native
+  sampling; measured GT continuity and baseline failure discrimination across
+  short/long distances. See docs/embedding_route_analysis_20260913.md.
+
+- Opt-in native cosine history cost, signed float32 inference channels using
+  shared demand publication and native interpolation/cache. Weight zero retains
+  ordinary behavior. Shared fixed-budget evaluator grants preserve manager protocol.
+- Current-raw5400 one-fiber bidirectional pilot validated; score unchanged.
+  See docs/embedding_tracing.md for settings, timings, tests and limitations.
+
+## 2026-09-13 — Fixed-budget single-backward embeddings
+
+- Added opt-in local contrastive competition with2048 GT anchors/65536 negatives
+  per128patch, fixed target-only anchor normalization and one backward. Raw/EMA
+  tests log cosine means, patch quantiles, high-similarity fraction and hardest
+  negative gap. New combined-data LR0.01 contrastive config starts from scratch;
+  previous pairwise training and its checkpoints are preserved.
+
+- Re-enabled single-branch embeddings with fixed positive/negative budgets,
+  including zero-presence patches; one combined backward and no extra gradient
+  banks. Fixed shared eligibility ownership in macro-batch staging.
+- Combined five-scroll/Paris4 NML+JSON config at LR0.01 prepared with existing
+  normal sources. CPU/two-GPU gradient tests pass.
+- Embedding geometry uses the existing native LasagnaNormalSampler via a thin
+  vc.volume binding, reusing native chunk caching and decoded-corner tensor
+  interpolation. Invalid normals (including zero grad_mag) replace whole samples
+  deterministically within the original scroll/group; shared queue IDs are stable.
+  No Python normal-data reads, extra validity masks, or spherical fallback.
+
+## 2026-09-12 — Live-training EMA tracing comparisons
+
+- Evaluated frozen current0.999, best0.999 and best0.99 in order on50fibers;
+  manager paused/resumed the same training root, never stopped/relaunched it.
+- Equal-scroll scores6.240/6.180/6.389mm; best0.99 narrowly leads the compared
+  models. Cumulative per-scroll reports preserve classic/600k references,
+  exact checkpoint hashes and best/tie highlights; no pooled overall score.
+
+## 2026-09-12 — EMA and historical training observations
+
+- Optional EMA0.99/.999 with separately tested/current/best/kept exports, raw
+  resumable snapshots and managed RAM state. Foreach FP32 averaging preserves
+  BF16 model computation; two tracks cost0.617ms/update in one-H100 B4 test.
+- Additional historical CP/full-grid/central-presence-loss test source uses
+  the existing shared queue; raw and EMA share each loaded batch. Historical
+  metrics do not select best checkpoints. Old source-availability-mask behavior
+  is not reproduced by the modern loader and is explicitly documented.
+- Regular2M-update S1a config plus approved managed production launcher; see
+  docs/training_ema_historical.md for tags, snapshots, commands and measurements.
+
+## 2026-09-12 — Historical S1a reproduction
+
+- Modern GN/quarter-resolution/augmentation training recovers historical test
+  performance without training changes:17.82deg at217600samples versus18.29old;
+  final18.76deg at300800.8H100 run completes in1637.94s including testing/startup.
+- Same modern final checkpoint measures25.31deg with current evaluation instead
+  of18.76historical-definition. User accepted evaluation mismatch as explanation;
+  further training ablations skipped under requested early-stop criterion.
+- Branch fiber-repro/stage00-modern-oldtest and reproduction artifacts retained;
+  evaluation tooling on fiber-repro/evaluation-ablations. Historical checkpoint
+  audit differs by0.89deg and historical total-loss compatibility is not proven.
+
+## 2026-09-12 — Single-backward training and bounded stop
+
+- Target-only prepass and one backward for ordinary one-branch/conditioned
+  bounded training. Embedding/multi-branch losses temporarily error pending
+  target-only normalization; inference compatibility retained. Matched one-H100
+  B4 BF16 model/loss test16.25→38.93samples/s (not end-to-end throughput).
+- Loader shutdown avoids abandoned queue joins/dead-owner counter locks, with
+  shared TERM/KILL deadlines. Independent client stop guard tracks explicit
+  compute sessions including orphans, preserving shared manager ownership.
+
+## 2026-09-12 — Merge embedding into retrain
+
+- Integrated committed embedding1f24f17d2 into retrain while preserving latest28k/best11k evaluation results. No code conflicts; archived both active task histories and reconciled five planning files. Dense scroll-balanced JSON supervision, unified cooperative queues/startup calibration and responsive manager/recovery changes retained. Validation and merge details in current task log.
+
+## 2026-09-12 — Latest28k then best11k full evaluations
+
+- Frozen latestcurrent28k/3584000samples(loss0.387998919) andbest11k/1408000samples(loss0.360366457) before sequential fresh-inference50fiber/100direction runs under exclusive8GPU manager. Latest399.916s/2516restarts/mean3.089281mm;best398.684s/2214restarts/mean3.492462mm. Best improves overlastbest5k3.218462mm but remains belowclassic3.857546mm. Full highlighted per-scroll mean/median/P05/P95/counts and runtime comparison in docs/benchmarks/collection_182306_latest_best_full_20260912.md/.json;individual raw reports retained.200artifacts audited,bothcommands exit0,managergrants released,training restored. Config/docs only;codeb32f31a55 unchanged.
+
+## 2026-09-11 — Dense, scroll-balanced collection training
+
+- Added per-dataset dense JSON supervision and deterministic continuous
+  scroll-uniform/arc-length-uniform sampling for train/test in the same loader.
+  Enabled the five-scroll collection; legacy CP defaults remain unchanged.
+
+## 2026-09-11 — Unified training/evaluation loading and startup measurement
+
+- Train and dense evaluation use the same optimized bounded sample queue,
+  including cooperative execution and visualization; phase admission prevents
+  future training work blocking evaluation.
+- Added memory measurement using real initial evaluation and optimizer updates,
+  retaining state across physical microbatch changes. CPU validation:181passed,
+  14GPU-only skipped. GPU validation is pending resource availability.
+- Exclusive-to-adaptive transition uses two registrations without changing the
+  locked protocol; user approved this lifecycle. Evaluation retains measured microbatch1.
+
+## 2026-09-11 — Current best5k full five-scroll evaluation
+
+- Evaluated new frozen step5000/640000samples best.pt (2823f517…,dense test loss0.408346925) from runcollection_20260909_5scroll_128_sd1_16x8_20260911_182306. Same50fibers100directions,fresh inference,exclusive8GPUs. Completed402.933s,2411restarts,mean3.218462mm vs same-run3k3.601407mm (10.63%shorter); Paris4 drives regression. Corrected terminal-inclusive mean/median/P05/P95 with all4baselines/per-scroll in docs/benchmarks/collection_182306_best5k_full_20260911.md/.json.100artifacts audited; manager released,training resumed. Config/docs only,previous metric patch preserved.
+
+## 2026-09-11 — Complete reference-segment metric correction
+
+- Supersedes prior failure-only headline statistics and whole-corpus F+1 convention: mean full reference length/(restarts+directed cases); successful terminal segments included in mean and all quantiles. Native source schema5/replay-set2; preserved tracing/diagnostics. Corrected25saved summaries with original backups, audited300main-case artifacts without inference rerun. Corrected global classic/collection17k/collection3k means3.857546/2.707390/3.601407mm; full per-scroll comparison in docs/benchmarks/complete_segments_20260911.md.11native+16CLI+9Python tests passed. Older records below retain their historical explicitly superseded metric definitions.
+
+## 2026-09-11 — Collection run182306 best3k full test
+
+- Captured active training run's best3k/384000samples snapshot (ee4595cd…),
+  evaluated all50testfibers/100directions with fresh inference and exclusive8GPUs.
+  Completed404.521s,2144failures,mean before restart3.298736mm,
+  median0.137113mm,P05/P95 0.001733/17.413631mm. Improved versus previous
+  collection17k but not classic globally. All paired metrics/commands/provenance
+  in docs/benchmarks/collection_182306_best3k_full_20260911.md/.json.
+  No production changes;100artifacts audited,manager released,training resumed.
+
+## 2026-09-11 — Full collection snapshot tracing comparison
+
+- Archived classic per-scroll mean/median/P05/P95 with command/data/snapshot/code revisions in docs/benchmarks/classic_full_5scroll_20260911.md (commitaf1a59c67), linked existing native benchmark log. Deferred GT-heading initialization audit.
+- Collection best17k (native output_stride4) completed all50testfibers/100directions over5scrolls with fresh inference/exclusive8GPUs. Existing shared worker already handles native stride;85focused checks passed. Faster400.888s vs516.699s but worse2885vs1995failures, mean before restart2.486310vs3.427927mm. Classic retained as quality reference; docs/benchmarks/collection_best17k_full_20260911.md/.json contain full provenance/statistics. Read-only audit counts actual terminal suffixes instead of assuming one per direction.
+
+## 2026-09-11 — Dynamic per-GPU inference batching
+
+- Shared tiled worker now supports immediately available dynamic model batches, individual conversion/normalization/result slots and unchanged accumulation. Positive inference.max_batch_size defaults1 and participates in cache identity; actual batch histograms/timings/CUDA peaks recorded. Legacy CLI fixtures repaired and terminal asynchronous-flush progress refreshed;105batching/demand/evaluation/profile tests and64preprocess tests/6subtests passed.
+- Full-set cap8 comparison exposed313s admission-stage overhead in684.879s coordinator time. Exact-order lazy heaps reduce admission to1.35s and coordinator time to516.699s. Matched heap batch1 completes in860.380s: cap8 saves39.95% wall time with78.05% higher normalized worker throughput. All100directions completed in each valid row, fresh inference and identical source membership. Standard classic config now uses256³/cap8 with a fresh namespace; genericAPIdefault1 unchanged.106targeted+64preprocess tests/6subtests passed. Full results and caveats: docs/full_dynamic_inference_batching_20260911.md/.json.
+- Four-fiber implementation/memory pilot caps1/2/4/8 completed fresh:28.372/26.224/28.712/25.094s, summed worker98.623/75.072/67.053/58.001s; cap8 peak35.01GiB allocated/54.67GiB reserved. Cap16OOM before publication, clean abort. No global default changed; full tuning reserved for full collection per user. Details docs/dynamic_inference_batching_20260911.md.
+
+## 2026-09-11 — Four-fiber fresh-inference tile comparison
+
+- Existing approved runner supports explicit filename subsets after full locked collection validation. Four fibers/eight directions completed with fresh inference at512³ and256³, all8GPUs exclusive:34.682s/29.144s coordinator wall,87/537tiles,zero reused predictions,23/22trace failures. Smaller tiles process22.85% fewer voxels but lower voxel-normalized throughput; single-run/cache/blending caveats recorded.23focused tests passed; no default changed. See docs/four_fiber_fresh_inference_20260911.md.
+
+## 2026-09-11 — Canonical batched tracer
+
+- Removed scalar candidate special case at threads1; shared efficient batch/fused paths now apply at any worker count. Exact-grid readiness grouping, valid cube-key collection (no fictitious chunk0), and eligibility-before-gate avoid repeated planning. Numerical change explicitly authorized; within-new-path determinism tested.
+- Cache-only4-direction pilot completed twice in0.982/1.035s, one candidate worker per fiber, zero inference, failures unchanged. Matched old per-direction timings30–52s versus new0.60–1.01s; prior8-way versus new4-way concurrency differs. Original8-case new attempt failed closed on uncached changed-path chunk.318native+77Python tests; report docs/batched_tracer_20260911.md. No full100-case rerun or adaptive worker scheduler implemented.
+
+## 2026-09-11 — Native wait profiling and readiness fast path
+
+- Completed strict cache-only short ABBA comparison through the existing exclusive-manager runner: native mean71.968→65.703s (8.71% less time), bridge entries8986980→243, exact original replay equality, zero inference.318 native/76 Python tests. See docs/cached_trace_profile_20260911.md; preliminary cropped/reserialized pilots are excluded.
+
+- Added per-thread CPU/wait observations through the same approved runner.
+  Kernel denied stack/wait-object attribution; no exact lock claim made.
+- Case-local acknowledged-chunk proofs avoid redundant bridge locks and
+  CPU-permit operations, preserving atomic cancellation and first-read gates.
+  Added opt-in per-case readiness/native stage timing.318 native cases and
+  74 Python tests passed; synthetic bridge calls18→6 with identical traces.
+- Current full evaluation was not interrupted; new code is not hot-injected.
+  Dataset speedup and exact-lock attribution pending an instrumented run.
+  See docs/tracer_wait_profile_20260911.md.
+
+## 2026-09-11 — Unified native fiber/normal decoded cache
+
+- Removed LasagnaChannelChunkCache and its duplicate payload copies, LRU and read pool. Scalar and corner sampling now share regular ChunkCacheService source handles and one native-process decoded budget; extracted the existing bounded local-reference helper for both samplers.
+- Batch evaluation defaults to10% physical RAM and records the effective budget; standalone options configure the service, not individual samplers. Preserved requested-level/readiness/fill and numerical behavior.315 native cases +69 Python tests passed.
+- Authorized full100-direction rerun launched with exclusive manager ownership and a fresh inference namespace, via the unchanged approved runner. Timing pending; details:docs/unified_native_cache_20260911.md.
+
+## 2026-09-11 — Remove artificial live-inference scratch cap
+
+- Removed the64GiB/source cap, touched-byte accounting and per-tile storage
+  polling after they aborted the full evaluation. File-backed accumulators are
+  now uncapped by the application; shared RAM pools remain bounded. Filesystem
+  errors and worker failures still abort without falsely publishing readiness.
+  Full-run restart/timing remains pending; no numerical changes intended.
+
+## 2026-09-11 — Embedding merge and exclusive bbox/inference profile
+
+- Merged fiber-training-embedding preserving embeddings, training sample progress,
+  RAM-only inference and native bbox work. Unified calibration/command exclusive
+  leases while retaining watchdog cleanup; logical224CPU inventory, bootstrap,
+  idle retirement and service-ownership exclusion reviewed/tested.
+- Exclusive8GPU classic profile reached523.19equivalent128³tiles/s versus prior
+  177.86–188.57/s. Coordinator stalls removed; GPU work dominates the buffered
+  40s window, with native-read long-tail waits still needing diagnosis. No claim
+  of full tracer completion or sustained long-run throughput. Tests, conflicts,
+  exact commands and complete breakdown:docs/embedding_manager_merge_profile_20260911.md.
+
+## 2026-09-10 — Unified strict native bbox reads
+
+- Removed duplicate sample_zyx_block API/implementation. read_zyx is the single
+  blocking exact-level native uint8/uint16 bbox reader; read_xyz/slicing delegate.
+  Optional masks/statistics incur no large allocation/per-voxel work when omitted.
+  Missing/outside voxels use declared fill; errors/unresolved/malformed data throw.
+  Allocation/fill/prefetch/copy release the GIL. Python bbox scale fallbacks removed.
+- Inference now reads raw integer full bboxes without the training float adapter.
+  Boundary reflection intentionally changed to declared fill per user instruction.
+  Training-facing interface and arbitrary-coordinate sampling preserved.
+- Installed updated local binding;76targeted tests,3training-adapter tests,
+  expanded24native/profiling tests and native replay wrapper passed. Independent
+  review passed. Post-change GPU comparison blocked by absent manager whose saved
+  224-core inventory conflicts with112physical-core validation; awaiting approval
+  before reconciling shared state. No unmeasured speedup claim.
+- API contract, build/test commands and limitations:
+  docs/unified_bbox_reads_20260910.md.
+
+## 2026-09-10 — Native reader stall diagnosis
+
+- Added opt-in isolated native allocation/read heartbeat controls, disabled by
+  default. No-I/O512³ calls took63.7ms while delaying a2ms Python heartbeat up
+  to65.4ms; C++ buffer initialization occurs before releasing the GIL. Prewarmed
+  native read168ms versus wrapper398ms also exposes integer/float round-trip cost.
+- No optimization implemented yet. GDB attachment denied; source-backed in-process
+  controls used instead. Exact results, sample counts, limitations and commands:
+  docs/live_inference_reader_stalls_20260910.md. Ten profiling tests passed.
+
+## 2026-09-10 — RAM-only demand inference state
+
+- Removed SQLite; existing coordinator dictionaries/sets/deques hold all live
+  scheduling and contribution state. Static provenance and finalized Zarr output
+  remain, with lazy restart validation and safe owned-scratch cleanup. No replacement
+  journal or done markers; unidentified and legacy DB-only roots refused untouched.
+- Sixty targeted tests and independent review passed. Same managed8GPU profile:
+  177.9999→177.8633 fully accumulated128³-equivalent tiles/s: no end-to-end speedup.
+  State updates now0.000275s total, but coordinator waits shifted elsewhere.
+  Commands, stage measurements and integrity/restart limitations are in
+  docs/live_inference_ram_state_20260910.md. Prior manager/profiling history archived
+  in docs/managed_inference_profiling_history_20260910.md.
+
+## 2026-09-10 — Queue visibility checkpoint (paused)
+
+- Shared queue snapshot and short-profile sampled time series added;51 relevant
+  tests pass. Confirmed native block sampler but8 input slots/read threads,
+  independent of128 result slots. No changed scheduling or measured new result.
+- User paused before live JSONL integration and new profile run to commit and
+  merge GPU manager. See docs/live_inference_concurrency_20260910.md.
+
+## 2026-09-10 — Chunk-major accumulator and writable-prefault trial
+
+- Added opt-in contiguous per-output-chunk scratch inside existing channel mmap
+  files, using shared descriptor/read/add helpers and unchanged native arithmetic.
+  Same128 buffers/eight GPUs:113.589→322.899 equivalent128³ input tiles/s (2.84×);
+  mean accumulation task36.392→2.730ms, kernelCPU289.17→43.56s per40s window.
+- Follow-up first-touch MADV_POPULATE_WRITE trial reached336.960 equivalent
+  tiles/s but mean task2.797ms, kernelCPU47.84s and more unfinished publication.
+  No convincing prefault gain; option retained disabled. Profile uses chunk-major,
+  production default remains flat. No full evaluation restart or new syncs.
+- Tests, exact commands, component counters and single-window limitations:
+  docs/live_inference_chunk_major_20260910.md. Existing unrelated changes retained.
+
+## 2026-09-10 — Result-buffer trial and accumulator fault profiling
+
+- Added independent result-slot capacity, retained input counts and production
+  defaults.128 buffers yielded112–114 equivalent128cubed tiles/s, unchanged from
+  8 buffers; extra GPU results accumulated as unfinished backlog.
+- Optional OS profile found289s kernel versus9s user CPU across8 accumulators
+  in40s,19.29million minor faults; native AVX-512 active. Indicates kernel/page
+  fault overhead, not predominantly storage-read waits. No layout fix yet.
+  See docs/live_inference_buffer_experiment_20260910.md for counters, caveats,
+  synchronization audit and reproducible command. No full evaluation restart.
+
+## 2026-09-10 — Demand accumulation simplification
+
+- Removed NPZ staging, canonical-arrival waiting, scratch zero reservation and
+  scratch fsync. Reuse shared chunk-owner accumulation processes directly from
+  RAM, release input slots independently, publish Zarr in background. Demand
+  float addition order may vary as explicitly authorized; sequential unchanged.
+- Corrected owner mapping to hash chunk indices, not voxel coordinates. Final
+  eight-GPU profile:71 tiles/40.003s (1.775/s) versus9/41.485s (0.217/s), observed
+  8.18x with warmer input-cache caveat; mean result queue wait8.132s→0.072s.
+  Tests/review and remaining mmap stalls documented in
+  docs/live_inference_accumulation_fix_20260910.md. No full trace restart.
+- Prior profile/config cleanup is documented in docs/live_inference_profile_20260910.md.
+  Dataset/normal bindings now reside in workload JSON, not scroll-specific CLI flags.
+
+## 2026-09-10 — Native multi-fiber evaluation and on-demand inference
+
+- Classic best91_5k real-checkpoint PHerc0139 pilot completed both directions:
+  0 forward/2 reverse failures,143.65s cold wall,18 inferred tiles,26 ready chunks.
+  User confirmed PHerc1229/1299 identity and Paris4 local normal source;
+  full50-fiber/100-direction cohort launched on eight GPUs, then failed at the
+  600s request timeout (2/100 cases completed); no valid full metrics.
+  Added reproducible preparation/provenance checks, fixed local-only
+  metadata access for remote CT inputs; native fast voxel loading unchanged.
+  See docs/classic_fiber_evaluation_20260910.md; previous implementation validation
+  log preserved in docs/live_inference_implementation_validation_20260910.md.
+
+- Continuation: batch/live `--render` generates strips directly from completed
+  replay objects, default off, retaining the post-hoc API. Ported scoped HiGHS
+  optionality from villa and enabled the evaluator in headless builds. Restored
+  missing registered annotation test and fixed stale replay strip validation to
+  use the shared seven-row/resampled-column geometry. Overlay and failure-marker
+  projection now uses that same position map, tested on long resampled spans. Current-source GCC13
+  CMake build and five native suites pass; 24 Python smoke tests pass. No stuck
+  input cancellation work, as explicitly deferred by the user.
+
+- Added same-core VC3D beam/greedy bidirectional reference replay, stable case
+  artifacts, disconnected exports and post-hoc reference/traced CT strips.
+- Added native batched readiness/control bridge and standalone GPU coordinator,
+  using shared tiled inference with canonical sparse mmap accumulation, durable
+  sibling Zarr publication and source/snapshot-keyed SQLite live cache.
+- Added shared global cache override; host points to
+  `/ephemeral/hendrik/vc3d_cache`, without migrating/deleting old caches.
+- Synthetic offline/live and cold/warm tests pass, including exact scale1/2
+  sequential f16/f32 output parity. Headless native targets now build from source;
+  real-model GPU/perf validation remains pending; concurrency/resource limits are
+  explicit in docs/live_inference_trace_evaluation.md and planning/task_log.md.
+
+## 2026-09-10 — Per-source fiber-length train/test split
+
+- Published reproducible six-source 95/5 split with whole-fiber upward rounding:
+  946 train / 50 test files. Added reusable splitter, source checksums, membership
+  and geometry/branch audit, documentation and seven passing tests. Originals
+  remain unchanged; split directories contain relative symlinks.
+## 2026-09-10 — Local Fiber3D embeddings
+
+- Calibration now acquires exclusive manager ownership before GPU initialization;
+  added training priority shorthand and calibration priority default +100.
+
+- Added automatic manager connection/startup and task-derived CPU/GPU/VRAM
+  requests. Manual calibration reports now have a fingerprinted default path
+  automatically discovered by training, removing manager config preparation.
+
+- Production training now defaults to the cooperative supervisor and shared
+  default socket; only explicit --unmanaged permits debug/test bypass. Updated
+  S1a/embedding launch docs; calibration/request remain mandatory.
+
+- Fixed initial evaluation overflow from 128-bit loader seeds by applying the
+  existing PyTorch seed conversion at the embedding sampler boundary; tested
+  deterministic losses and gradients with real loader-generated seeds.
+
+- Merged S1a retraining/sample-based progress into embedding training. Added
+  the local S1a 16x8 embedding config with LR 0.01 and matching Paris4 normals;
+  retained sample counts through cooperative handoff and shared checkpoints.
+
+- Added opt-in 16-channel embeddings, balanced within-patch cosine supervision,
+  detached-presence negative sampling, and base-coordinate 20/80 Lasagna-normal
+  exclusion. Extended shared-slot transport, ordinary/cooperative sufficient
+  statistics, checkpoint handling and scalar logging. CPU geometry, real local
+  manifest and distributed-gradient tests cover the feature; GPU performance and
+  learning quality remain unmeasured.
+
+## 2026-09-10 — Cooperative GPU management and elastic Fiber3D training
+
+- Added standalone cooperative CPU/GPU/VRAM manager and opt-in Fiber supervisor,
+  shared bounded gradient accumulation, persistent canonical sample ownership,
+  RAM cohort handoff and resumable evaluation. Protocol v1 is locked after CPU
+  conformance/failure tests and real two-GPU S1A calibration, pause/resize and
+  gradient checks. BF16 compute is retained; resized trajectory differences and
+  the bounded accumulation cost are documented, not hidden by relaxed tolerances.
+- Normal cooperative tests have a five-minute total cap; long repeated timing
+  sweeps were cancelled at user request after one complete comparison. Native
+  prerequisites support missing HiGHS and initialize bounded worker pools.
+
+## 2026-09-09 — Sample-based training progress
+
+- Fiber3D TensorBoard scalars/images and console metrics now use cumulative
+  global training samples, with optimizer updates kept explicit in console
+  output and unchanged for scheduling. Added checkpoint sample metadata and
+  changed-batch resume support; benchmark parsers accept both console formats.
+
+## 2026-09-09 — Eight-GPU S1a retraining configs
+
+- Added an opt-in fast-pipeline S1a NML reproduction config at
+  global batch 128 with the recorded LR 0.01 / 100-step warmup recommendation.
+  Added launch commands and historical comparison caveats.
+
+
+## 2026-09-09 — Fiberlets/Fiber3D training integration
+
+- Merged the locked Fiberlets development history into the local
+  `fiber-training` branch, retaining the complete Fiber3D training and Fiberlet/native
+  tracing feature sets and reconciling their shared inference/cache contracts.
+- Extended decode-byte profiling to charge opaque Fiberlet payloads by resident
+  bytes; dense chunk accounting remains unchanged.
+
+## 2026-09-08 — Fiber3D CUDA augmentation suffix
+
+- Added the Fiber3D `all` CUDA value-augmentation suffix. Native workers
+  transport sampled patches as `uint8`, while normalization, intensity
+  transforms, deterministic noise, and Gaussian blurs execute in FP32 on the
+  asynchronous CUDA preparation stream. The warm 128-worker producer reached
+  339.56 samples/s; matched two-H100 training reached 88.020 samples/s globally
+  with 0.855ms mean H2D time.
+- Added bounded two-batch-ahead pinned staging, asynchronous H2D, and CUDA
+  target preparation to the shared Fiber3D training pipeline. Two-GPU native
+  stride-4 throughput increased from 83.812 to 91.719 samples/s.
+- Added configurable GroupNorm and native lower-resolution Fiber3D heads.
+  Native stride-4 GroupNorm raised the matched two-H100 replay ceiling from
+  55.30 to 95.71 samples/s and the real-sample path from 50.23 to 59.15
+  samples/s while preserving stride-1 checkpoint behavior.
+- Added a production-path GPU-resident batch-replay diagnostic and synchronized
+  per-rank throughput artifacts for Fiber3D training; measured the current
+  two-H100 compute ceiling and matched warm-cache real training path.
+
+## 2026-09-09 — Fiber3D on-demand scalar metrics
+
+- Removed unconsumed per-step DDP metric reduction and GPU-to-host scalar
+  conversion while preserving console and TensorBoard schedules. A matched
+  two-H100 batch-28 control measured a 1.12% average throughput improvement.
+
+# 2026-09-07
+
+- Added opt-in normal Fiber training profiling and explicit torch.compile
+  experiments, retaining eager defaults and raw checkpoint/evaluation models.
+
+- Added read-only Fiber training event analysis and documented the S1a 8x8
+  historical baseline for the one-hour held-out-loss target.
+# 2026-09-04: benchmark experiment-step plots
+
+- Changed fiber benchmark progress plots from calendar-distance coordinates to
+  stable chronological experiment steps. Only strict measured Pareto-frontier
+  points are annotated, regressions and assumptions use distinct markers, and
+  legends are placed below the plots.
+- Corrected reference replay reliability to mean segment length over total
+  tested length, `100/(failures+1)`, and migrated benchmark JSON output to the
+  corresponding version-4 summary fields.
+- Made benchmark labels compositional from a validated stable method label plus
+  an optional BP-stage suffix.
+
+# 2026-09-02: conditioned-reference pruning variants
+
+- Added and evaluated union-MAP and conditioned-posterior offender selection on
+  the 1024 reference crop. Neither variant exceeded the untouched production
+  winding result.
+- Added a sign-consistent reference-conditioned fiber-piece working-set
+  diagnostic and separate direct/fresh winding artifacts for evaluation.
+
+# 2026-09-01: fixed-reference winding conflict diagnostics
+
+- Added solver-consistent reference conditioning diagnostics that clamp known
+  reference H/V and winding labels, then report admitted cross-factor conflict
+  rates, hard violations, weighted losses, and ranked offending BP pieces and
+  factors without changing the production reference-free solution.
+- Added a conditioned-to-ordinary warm-start diagnostic and an identical-support
+  neutral control. The 1024 experiment reproduced the cold solution exactly in
+  the neutral control; the conditioned initialization failed to converge after
+  2000 messages and remained a substantially higher-energy state, so it is not
+  classified as a retained ordinary minimum.
+- Kept this expensive experiment opt-in through
+  `--reference-conditioning-diagnostic`; ordinary reference benchmarks continue
+  to run only the production reference-free solution by default.
+
+# 2026-09-01: promote complete-stack 1024 winding tune
+
+- Promoted winding class weights `0,0,0.5,4,1` and sign weights `1,0.5` to the
+  shared solver and CLI defaults after the zero-aware 1024 search improved the
+  complete 26-reference result from 13/26 to 16/26 exact inferred windings.
+
+# 2026-09-01: separate winding value and sign hardness
+
+- Preserved signed winding-value residuals while adding independently weighted
+  perpendicular and parallel sign-hardness terms across BP, decoded scoring,
+  projection, diagnostics, and reference inference.
+- Split agreement, evidence, CSV, and reference benchmark output into structural
+  winding-value and sign-hardness items whose benchmark denominators do not
+  disappear at zero solver weight.
+- Extended winding-weight searches to seven coordinates. A first cutoff-based
+  result was rejected because it excluded parallel-other and parallel-sign
+  items; the corrected no-cutoff 1024 optimum is winding `0.5,0,1,2,1`, sign
+  hardness `0.5,1`, with `8/8` exact reference windings and `4835/5446` correct
+  reference items.
+
+# 2026-09-01: reversible zero-weight refinement
+
+- Extended local winding-class weight refinement so every coordinate tests
+  zero alongside `/2` and `*2`; zero coordinates can later re-enter their
+  immutable positive starting ladder after other weights change.
+- Canonical tagged zero/exponent states now identify cached successful and
+  failed scenarios deterministically.
+- Promoted the resulting `0,4,2,2,1` scale-first 1024 local optimum to the
+  shared and CLI defaults.
+
+# 2026-09-01: hard split continuity and aligned hard signs
+
+- Made source-fiber split continuity exact and edge-local by default across the
+  orientation prepass and final winding assignment. Two active endpoints must
+  share H/V and winding, while a Defect endpoint neutralizes that edge and may
+  split the source into independent active runs. An explicit finite
+  compatibility mode retains the prior behavior.
+- Promoted enabled dominant perpendicular and parallel signs to exact
+  constraints when their raw aligned-normal agreement is within 30 degrees by
+  default, while retaining finite sign penalties for weaker evidence.
+- Added per-class and aggregate final-solution constraint infringement counts
+  and percentages, with Defect-neutralized factors reported separately.
+
+# 2026-09-01: calibrated reference constraint diagnostics
+
+- Unified reference winding diagnostics under the reference-to-BP benchmark's
+  fitted global sign. Signed reference/reference steps are calibrated before
+  quantization and summary counting, while gauge offsets correctly cancel from
+  pairwise differences.
+- Added solver-weighted raw and canonical reference/reference measurement-scale
+  fits for perpendicular, parallel, combined, and per-class scopes, separating
+  continuous integration bias from quantized solver behavior and explicitly
+  labeling parallel-containing diagnostics as counterfactual.
+- Changed the `direction-ablation` joint-grid default to fixed phase `0.5` and
+  reference-calibrated measurement scale `0.822`; adaptive calibration remains
+  available through `--winding-adaptive-calibration`.
+- Added per-reference inferred half-step parity checks and component-gauged H/V
+  endpoint consistency diagnostics for active reference-to-BP constraints.
+- Added unweighted directional raw-step distributions and a four-gauge
+  reference-only phase fit, exposing H-to-V versus V-to-H asymmetry without
+  reusing production solver weights.
+
+# 2026-08-31: weighted reference winding diagnostics
+
+- Added per-reference finite-L1 diagnostics split into perpendicular `0.5` and
+  `1.5+` and parallel `0`, `1`, and `2+` canonical-step groups, including raw
+  versus cutoff-admitted coefficient, loss at truth, and group-only inferred
+  winding.
+- Made measured BP factors mutually exclusive by retaining only their dominant
+  parallel or perpendicular hypothesis, and unified group inference and
+  `est_w` on that admitted factor. The combined row uses lexicographic
+  hard-sign violation handling for contradictory forced-active evidence.
+
+# 2026-08-28: constraint-scaled BP Defect costs
+
+- Restored per-constraint Mixed/Defect cost coefficients in orientation and
+  winding BP while retaining one non-transitive node-local unary, and changed
+  both default coefficients to `1`.
+- Added a stable source-piece-1 versus remaining-pieces final-state table before
+  each reference benchmark for direct Defect-cost tuning.
+
+# 2026-08-28: extended distance-weighted winding evidence
+
+- Raised H/V diagnostic and winding-BP raw winding admission to the exclusive
+  cutoff `4.0` while preserving the legacy parity default.
+- Added fixed power-of-two decay for complete H/V-aware winding contributions
+  by half-integer distance bin without weakening H/V relation or hard sign
+  evidence.
+
+# 2026-08-28: fixed-prepass winding Defect escape
+
+- Allowed fixed-prepass H/V pieces to become Defect during winding without
+  reopening the opposite direction, using a compact two-state-per-winding
+  layout and distinct pre-pass/final class diagnostics.
+
+# 2026-08-27: winding BP modes
+
+- Added a shared fixed-prepass orientation mode for both winding solvers which
+  freezes the initial H/V choice and removes opposite-direction alternatives
+  from subsequent piece-state and message dimensions.
+- Added a calibration-free joint winding mode selected by an explicit fixed
+  phase and scale, removing calibration states/messages while retaining joint
+  H/V/Mixed, integer-support, and component-sign inference.
+- Added strict CLI validation and fixed/adaptive provenance in progress,
+  reports, console summaries, and consistency CSV output.
+- Made probability-band visualization clamp only roundoff-sized endpoint
+  excursions while reporting the exact index/value for genuinely invalid data.
+- Normalized the joint-grid solver's accumulated H/Mixed/V class marginals and
+  centralized the CLI's checked orientation projection so all downstream
+  diagnostics receive a finite value in `[0,1]`.
+
+# 2026-08-27: winding fiber Napari viewer
+
+- Added a strict per-winding H/V/Broken OBJ viewer with stable bright layer
+  colors, cross-winding category presets, and cyclic H+V winding navigation.
+- Extracted shared global-indexed ordered-polyline OBJ parsing and retained the
+  existing presence viewer's specialized quality and crop validation.
+
+# 2026-08-27: signed crop winding belief propagation
+
+- Added live nested progress for interleaved winding initialization,
+  calibration, adaptive support, and message passing without changing solver
+  numerics.
+- Added stored-trace quality-fraction filtering with canonical cost-density
+  ranking and preserved original trace provenance.
+- Reused crop-wide BP-aligned Lasagna normals to give perpendicular trace
+  constraints a component-safe signed winding difference while preserving the
+  existing unsigned magnitude.
+- Added a gauge-fixed continuous difference solve followed by adaptive local
+  integer sum-product BP, with winding marginals, CSV diagnostics, and one OBJ
+  layer per integer MAP winding.
+- Extracted strict piece/continuity topology preparation for both H/V and
+  winding inference and retained the existing H/V/Mixed results unchanged.
+
+# 2026-08-27: BP-aligned Lasagna normal samples
+
+- Extracted the binary pairwise sum-product engine shared by fiber BP and
+  normal sign alignment without changing existing fiber BP behavior.
+- Added reusable Lasagna normal alignment plus a standalone globally anchored
+  bbox command with paired crossed-base/directed-stroke OBJ diagnostics.
+- Parallelized large binary BP solves with deterministic ordered CSR message
+  storage and added split-phase BP timing/effective-worker diagnostics.
+
+# 2026-08-27: crop tracing lookahead context
+
+- Expanded Fiberlet crop graph materialization and speculative rollout by the
+  configured lookahead distance while retaining requested-crop seed ownership,
+  coverage, first-exit clipping, artifacts, and visualization.
+- Separated graph and seed boxes in bulk materialization, retained complete
+  horizon-crossing Fiberlets without an extra maximum-length pad, and added
+  boundary-choice plus sparse-halo regressions.
+
+# 2026-08-27: split-piece fiber BP
+
+- Made finite `--piece-length` constraint pieces the BP nodes, retained
+  canonical same-source continuity evidence, and preserved source-first gauge
+  selection with deterministic exact piece mapping.
+- Added exact dense piece clipping plus piece-level OBJ, CSV, reference, and
+  consistency diagnostics while preserving full source geometry in no-split
+  runs.
+
+# 2026-08-25: durable Fiberlet crop trace artifacts
+
+- Made a sparse Fiberlet Zarr `traces` dataset the authoritative crop-tracing
+  output. It losslessly stores complete float64 base-coordinate paths, seed
+  data, global selected-route cost, and traced length, with strict inventory,
+  ownership, ordinal, and atomic-publication validation.
+- Split `vc_fiber_trace_chunk` into explicit `trace` and `visualize` commands.
+  Trace mode reopens the published artifact before generating line outputs;
+  visualization-only mode needs no source Fiberlets or normal volume.
+- Added deterministic cost-density histograms and ten rank-decile OBJ subsets
+  while retaining byte-identical all/direction/anchor OBJ geometry.
+
+# 2026-08-25: deterministic parallel Fiberlet crop tracing
+
+- Parallelized independent anchor-seed graph traversal while retaining serial
+  strongest-first result integration, coverage suppression, counters, and OBJ
+  order. Speculative traces covered by an earlier result are discarded.
+- Extracted a reusable immutable, storage-key-based replay source and extended
+  the existing chunk-route bulk materializer with complete route geometry,
+  cost profiles, and stored joins. Chunk reads are prefetched in batches;
+  tracing performs no cache queries.
+- Removed the four-worker cache-contention workaround. Host-CPU tracing reduced
+  the 16-seed trace phase from 17.57 s to about 3-4 s on the Paris4 1024-base
+  crop while preserving the original OBJ byte-for-byte.
+- Replaced synchronized seed batches with bounded continuous computation and
+  ordered ticket commits. Converted the materialized graph to contiguous
+  records with borrowed directional adjacency/route views, eliminating route
+  copies during rejected lookahead. The 500-attempt Paris4 crop remains
+  byte-identical and drops from 86.80 s to 79.66 s wall time.
+- Replaced per-branch committed-set and route-vector copies with compact
+  parent-linked lookahead ancestry. Terminal candidates retain indices and use
+  exact linear minimum selection instead of materializing and sorting every
+  route. The same 500-attempt crop remains byte-identical; three Release runs
+  take 46.81-47.01 s wall with 34.24-34.54 s tracing.
+
+# 2026-08-25: Fiberlet producer cache contract v3
+
+- Moved anchor and Fiberlet generation to one new producer-contract namespace
+  after detecting different stale/current records under the unpublished v2
+  identity. Default runs regenerate into v3 directories; explicit incompatible
+  roots remain strict errors and old directories are not modified.
+- Retained compiler identity/version and build configuration as diagnostics but
+  excluded them from cache compatibility. GCC/Clang generated 2,526 versus
+  2,528 focused Fiberlets in one unresolved comparison; the caches remain
+  interchangeable while the exact divergent decisions are investigated.
+- Made fresh prediction and Lasagna-normal samples authoritative for Fiberlet
+  generation and replay transition scoring. Cached endpoint evidence no longer
+  aborts generation when a compatible producer reconstructs slightly different
+  floats. Scheduled failures retain owner key, terminal cache status, and nested
+  generator cause.
+- Raised the exact chunk-route per-entry state guard from one million to five
+  million, the smallest tested bound that completes the 1024-base staged
+  Paris4 workload without partial results.
+
+# 2026-08-24: memory-first staged Fiberlet overlays
+
+- Added a shared bounded write-back LRU for invocation-local reduction layers.
+  Later boxes and stages read serialized anchor and paired prefix/route chunks
+  directly from memory; asynchronous atomic writes occur only under shared
+  cache pressure, with pending buffers still charged to the budget.
+- Logical stage hashing now combines metadata, spilled chunks, and latest
+  in-memory chunks without forcing a flush. Exact stage ID/payload hashes and
+  final populations remain unchanged.
+- The hot four-stage Paris4 Release workload improved from a 3.93 s median to
+  2.90 s; its 5.56 MB of temporary payloads required no disk spills.
+
+# 2026-08-24: arbitrary staged Fiberlet graph reduction
+
+- Replaced point-query graph construction with chunk-granular anchor,
+  prefix, and route loading, cache-free parallel transition construction, and
+  reusable worker pools. On the hot Paris4 512-base two-stage workload,
+  Release wall time fell from an 8.09 s median to 2.46 s while retained-ID and
+  complete overlay-payload hashes remained exact.
+- Exact entry searches use fixed worker-owned partitions and reusable
+  thread-local scratch, with no synchronization in the per-trace loop. The
+  stage-one search alone improved from 0.852 s at one thread to 0.108 s at 32.
+- Corrected stage tables to report inside anchors, all incident Fiberlets, and
+  per-box interior Fiberlets in that stage's complete box union, with separate
+  original, inherited input, and output counts. The joint table remains scoped
+  to the full selected bbox.
+- Replaced the unpublished fixed two-stage driver with repeatable
+  `--stage SIDE,OFFSET_X,OFFSET_Y,OFFSET_Z` analysis passes over a selected
+  base-coordinate bbox.
+- Added same-layout sparse anchor/Fiberlet overlays with missing-chunk
+  fall-through, explicit empty overrides, strict prefix/route pairing, and
+  record-exact monotone replacement checks.
+- Made overlapping boxes consume earlier removals in deterministic order and
+  report per-stage plus joint anchor/all/interior reductions. Derived layers
+  are temporary; initial on-demand caches remain reusable and unchanged.
+
+# 2026-08-24: two-stage regional Fiberlet reduction diagnostic
+
+- Added globally reusable aligned stage-one reduction chunks and centered
+  half-offset stage-two analysis without changing the authoritative anchor or
+  Fiberlet caches.
+- Bounded stage two to exactly the selected stage-one owners; incident-halo
+  requests outside that set are in-memory empty views and cannot start or
+  publish extra preprocessing.
+- A hot Paris4 512/256 run reused all eight stage-one chunks, completed stage
+  two in 1.4 s, and reduced 13,750 incident Fiberlets to 4,168 (69.69%) and
+  5,730 internal Fiberlets to 618 (89.21%).
+- Added conservative directed reachability removal, complete unused-anchor
+  removal, exact bidirectional physical macros, disjoint directed-chain
+  detection, and atomic forced-continuation descriptors for each centered
+  stage-two box. Distinct routes are retained; macros remain in-memory and
+  reference their original ordered Fiberlet geometry and objective scalars.
+- On the same hot crop, post-stage-two simplification removed 51/1,515 anchors,
+  merged 73/4,168 physical Fiberlets into 4,095 macros, and found 1,041
+  one-successor directed states with 2.19-macro mean forced rollout length.
+
+# 2026-08-24: chunk-local optimal Fiberlet-route statistics
+
+- Added a shared on-demand cached-graph diagnostic that finds every exact cheapest
+  directed entry-to-first-exit route through a half-open base-coordinate box.
+  It shares regular replay's strict join-angle and normal/tangent-aware join
+  scoring, rejects all revisited anchors, generates missing canonical chunks
+  through the existing preprocessor/cache/LRU path, and reports the retained
+  union and route distributions without pruning graph payloads.
+- In a populated 128-base Paris4 box, exact optima used 55/62 anchors and
+  1,135/1,369 incident fiberlets. Only 45/252 internal Fiberlets survived,
+  giving an 82.14% internal reduction after boundary-crossing edges are
+  excluded. The bounded cold shared-cache fill took 183.71 s and the hot
+  analysis took 0.29 s.
+
+# 2026-08-22: geometrically weighted fiberlet substep costs
+
+- Restored stored whole-fiberlet and join scoring as the default replay cost
+  evaluator. The slower subsegment/grid evaluator is available explicitly as
+  `--cost-mode stepped`; its profile-weight default remains 1. Aggregate mode
+  does not load cost profiles, and cache identity is unchanged.
+- Added replay-only stepped-mode `--cost-profile-weight` in `[0,1]` to blend
+  each fiberlet's decoded average density with its decoded subsegment densities
+  before geometric weighting.
+- On the full Paris4 radius-768 hot-cache corridor, delayed `W=0.99` falloff
+  produced 5/5/3/2/2 failures at profile weights 0/0.25/0.5/0.75/1. With
+  `W=1`, profile weight zero exactly reproduced the two aggregate-baseline
+  failure arcs.
+- A matched-terminal-weight lookahead sweep found no zero-or-one-failure
+  configuration. H384/T0.25 retained two failures; every H512 setting produced
+  four, H768 produced three or four, and H768/T0.5 hit the route-state limit.
+- Removed two long-route quadratic paths discovered after the 5k validation.
+  Score initialization now reads cumulative prefix scalars and visits only the
+  checkpoint/lookahead suffix, while logical-route cleanup uses a bounded
+  persistent cursor instead of rescanning the complete registry.
+- Made `fiberlet-replay --threads` one shared budget for its concurrently
+  running greedy and fiberlet evaluators. This removes the 32-logical-CPU
+  oversubscription cliff without changing search ordering.
+- A hot-cache full Paris4 radius-768 replay crossed the former 65-percent
+  slowdown point at 12 seconds and completed in 22.34 seconds wall time, with
+  14 greedy and 5 fiberlet failures.
+- Repaired the scorer after the first profile integration changed more than the
+  checkpoint-forward term. Ranking now preserves the authoritative unweighted
+  prefix through the checkpoint and integrates decoded subsegment costs only
+  from the checkpoint through the horizon. Decoded profiles are not rescaled to
+  the separately stored whole-edge cost, and one integrator handles every
+  weight, including `W=1`.
+- Restored conservative relaxed cost-to-go pruning and incremental scalar score
+  state. Ordinary cached arc queries no longer load route payloads; profiles use
+  a bounded decision-local cache. On the Paris4 5k hot-cache benchmark, repaired
+  `W=1` had zero fiberlet failures and median wall/CPU ratios of 1.18x/1.21x
+  versus pinned revision `64e5341`.
+- Added opt-in delayed geometric falloff through replay-only `--cost-delay`;
+  zero preserves immediate decay and 192 base voxels covers half the default
+  lookahead before decay begins.
+- Persisted fixed-sqrt `uint16` cost density for every selected DP route
+  segment and changed exact and bounded graph lookahead to integrate those
+  profiles on a checkpoint-rooted base-distance grid.
+- Added replay-only `--cost-weight` and `--cost-step` controls. Weighted ranking
+  remains separate from the unchanged five-component committed diagnostics.
+- On the Paris4 5,000-base-voxel interval, `W=0.99` at both 16- and
+  32-base-voxel spacing completed with zero fiberlet failures, matching the
+  unweighted stored-profile run.
+- Added bounded decision windows and common-start `fiberlet-replay --arc`
+  diagnostics. Two Paris4 wide-radius failures now have constrained-radius
+  proxy routes and ranked alternative cost decompositions without full-fiber
+  reruns; the proxy is explicitly not treated as a same-graph oracle.
+- Clipped retained diagnostic polylines exactly at their checkpoint and
+  lookahead boundaries. The diagnostic-filter regression now also proves that
+  filtering leaves selected geometry and failure counts unchanged.
+
+# 2026-08-22: fractional fiberlet endpoint evaluation
+
+- Replaced the unpublished combined q1/u8 matrix row with a 0.125-base-voxel
+  endpoint, compact-direction, fixed-sqrt `uint16` scenario. Fractional
+  evaluation quanta use shared eager/cache rounding while canonical float
+  anchors and the persistent compact storage schema remain unchanged.
+
+# 2026-08-22: fixed nonlinear uint16 fiberlet cost view
+
+- Added fixed global square-root encoding of cost per prediction voxel with a
+  ceiling of 256. It reconstructs edge totals with the stored path
+  length without adaptive chunk ranges, cache identity changes, or persisted
+  geometry changes.
+- On the full Paris4 radius-768 replay it matched the compact-float control's
+  two failure arcs and reference-distance distribution while reusing the same
+  unchanged geometry cache.
+
+# 2026-08-22: globally ranked incremental exact fiberlet lookahead
+
+- Replaced one-best-continuation-per-checkpoint-prefix exact replay with one
+  multi-source frontier and globally ranked full-horizon beam population.
+  Winning routes now retain their lookahead suffix across checkpoint advances;
+  multiple winners may share a checkpoint prefix.
+- Added a single raw-loss cutoff shared by all source beams, deterministic
+  fixed-batch parallel expansion and state accounting, and selected-prefix-only
+  reference evaluation.
+
+# 2026-08-22: exact full-width fiberlet replay default
+
+- Restored exact cost-bounded lookahead as the replay default after incremental
+  prefix processing removed the actual long-route slowdown. Finite search
+  widths remain available only as an explicit approximate experiment.
+- On the full Paris4 radius-768 replay, exact search completed in 82.66 seconds
+  with five fiberlet failures versus 58.34 seconds and seven failures for width
+  128, using the same hot cache and unchanged one-million-state cap.
+
+# 2026-08-22: explicit fiber replay phases
+
+- Replaced the misleading weighted replay percentage with independent
+  cache/preprocessing and actual reference-trace progress. Visualization and
+  publication now report as a separate output phase.
+- Compact output now removes completed cache progress, shows elapsed time once,
+  adds a rolling current-speed ETA, and reports the latest bounded lookahead's
+  state-expansion count plus its minimum applied local cutoff loss per
+  prediction voxel.
+
+# 2026-08-21: bounded intermediate fiberlet lookahead
+
+- Added deterministic equal-distance intermediate pruning for graph replay,
+  defaulting to a 128-route working frontier at 48-base-voxel intervals over
+  the existing 192-base-voxel lookahead. Exact A* remains selectable with
+  `--search-width 0` for focused comparisons.
+- Preserved exact logical-front cost semantics: the terminal fiberlet remains
+  whole in graph state while only its in-horizon edge fraction is scored, with
+  its entering join charged once. Replay JSON now records search mode and
+  per-front population/pruning diagnostics.
+
+# 2026-08-20: concise fiberlet replay progress
+
+- Replaced default per-stage, per-chunk, and per-evaluator replay chatter with
+  one monotone overall reference-progress bar and ETA. Detailed profiling rows
+  remain available through `fiberlet-replay --stats`.
+
+# 2026-08-20: on-demand fiberlet storage and replay
+
+- Replaced the unpublished cache payload with strict version 2. Float-cache
+  anchors now retain canonical endpoint prediction/normal samples, and
+  prefixes retain all five cost components, authoritative path length, and
+  exact base-space endpoint steps. Cached joins no longer resample source
+  volumes, and committed route reconstruction matches DP duplicate suppression.
+- Canonicalized replay diagnostic indices across eager and cached graph
+  adapters. On the 5,000-base-voxel Paris4 corridor, cold-cache, warm-cache,
+  and eager replay produce byte-identical 342-point/65-edge fiberlet JSON and
+  OBJ, total loss `91.7058129850775`, and loss density
+  `0.14645713824432563`.
+- Added strict version-1 float32 and compact fiberlet structure-of-arrays
+  codecs with independently compressed fields, checksummed headers, stable
+  anchor/edge identities, and separate connectivity and route payloads.
+- Added local sparse Zarr-v2-layout anchor/fiberlet datasets with atomic chunk
+  publication and on-demand float32 generation through the shared chunk cache.
+- Extended `ChunkCache` with variable-length opaque payloads, independent
+  scheduler lanes, lease-aware eviction, and byte-accurate per-cache/shared
+  accounting.
+- Replaced default corridor-wide replay graph materialization with stable-ID,
+  cache-backed adjacency and route queries. The beam retains no permanent graph
+  copy, and evicted connectivity/geometry reloads transparently. The old eager
+  path remains available only through `--eager-graph` for diagnostics.
+- Fixed a lost completion wakeup in parallel anchor fitting by publishing tile
+  and ready-cell completion under the condition predicate mutex. No polling or
+  timeout recovery was added.
+- Added globally referenced replay progress, stable chunk schedule diagnostics,
+  internal fiberlet phases, and independent greedy/fiberlet terminal rows.
+- Parallelized canonical source-anchor candidate generation and released large
+  prepared candidates on their search workers. On the measured Paris4 chunk
+  `107,34,45`, generation wall fell from 34.795 to 4.344 seconds while prefix
+  and route cache payloads remained byte-identical.
+- Stored decoded anchor, prefix, and route objects directly in the existing
+  lease-aware `ChunkCache` LRU. Prefix chunks build one charged incident index,
+  lookahead uses exact endpoint descriptors, and route geometry is loaded only
+  for committed edges. A cache-warm 100-base-voxel Paris4 replay fell from a
+  17.13-second median to 0.20 seconds with byte-identical output.
+# 2026-08-20: shared anchor observations and proposal evidence
+
+- Built compact anchor observations and presence gradients once per bounded
+  exact-union sample, replacing overlapping tile copies with uint32 index maps.
+- Canonical median anchor wall and CPU improved by 11.7% and 11.4%, total wall
+  by 6.7%, and peak RSS by 7.1%, with byte-identical replay artifacts.
+- Added extraction-profile version 24 with shared-observation and tile-map work
+  counters plus complete raw/compact coexistence memory accounting.
+- Materialized eligible robust-proposal evidence once per cell and reused its
+  contiguous 32-byte records across axis and final-membership passes. Median
+  local-refinement work improved 2.5% and anchor CPU 1.3% with byte-identical
+  replay artifacts; profile version 25 reports record preparation and storage.
+- Restricted production fiberlet corridor admission to the two centerline
+  segments incident to each curved-domain layer. Canonical segment tests fell
+  72%, node-enumeration work about 6.6%, and fiberlet CPU about 1.5%, while the
+  complete replay artifact remained byte-identical.
+- Inserted common eight-corner interpolation cells into one resolved sparse
+  bitmap page. Corner-collection work fell about 65%, preparation CPU about
+  28%, and command wall about 4%, with unchanged sampled voxels and byte-
+  identical replay output.
+
+# 2026-08-19: float final anchor support reduction
+
+- Isolated final refined-anchor evaluation in its own translation unit and kept
+  both compact and expanded observation paths in checked float32 arithmetic.
+- Reduced canonical final-evaluation worker time by 4.9%, anchor CPU by 1.4%,
+  and total wall by 0.4% with byte-identical replay artifacts.
+- Prepared candidate-side normal-aware smoothness once per outgoing fiberlet DP
+  edge and reused it across incoming states. Canonical search wall and DP worker
+  time improved about 2.0% and 2.1%, respectively, with byte-identical replay
+  artifacts.
+- Prepared current-side and candidate-side multiplicative alignment inputs at
+  their natural DP reuse boundaries. Canonical search wall and DP worker time
+  improved another 2.3% each with byte-identical replay artifacts.
+
+# 2026-08-18: solve-local fiberlet DP reuse
+
+- Cached normalized scoring inputs once per retained node and reused each
+  reached node's outgoing descriptors across its incoming DP states.
+- Replaced all-node cumulative state with rolling two-layer float32 costs and
+  packed-key-derived predecessors, cutting canonical search CPU by 45.9% and
+  total CPU by 8.8% while preserving selected geometry and replay failures.
+- Added extraction-profile version 13 with solve-local memory, node/edge reuse,
+  and node-preparation diagnostics.
+- Deferred interior scoring interpolation until first search access and cached
+  it per candidate. This reduced canonical fiberlet CPU by another 35.9%, total
+  wall by 9.7%, and peak RSS by 14.2% with byte-identical replay artifacts.
+- Added extraction-profile version 14 with endpoint, lazy request/miss/hit, and
+  shared/local scoring-memory diagnostics.
+- Reused an exact ordered support-span stencil for complete anchor cells,
+  reducing canonical anchor CPU by 5.5% and total wall by 3.6% with
+  byte-identical replay artifacts.
+- Added extraction-profile version 15 with support-stencil and clipped-cell
+  counts.
+- Traversed the exact owned-cell cube directly during anchor initialization,
+  reducing canonical fit-setup worker time from 11.00 to about 0.09 seconds and
+  anchor CPU by 4.1% with byte-identical replay artifacts.
+- Added extraction-profile version 16 with public discovery, direct owned, and
+  avoided support-visit counts.
+
+# 2026-08-17: robust sampled-direction anchor refinement
+
+- Replaced joint angular line search with deterministic competitive robust
+  sampled-direction aggregation and position-only bounded refinement.
+- Removed pre-refinement close-direction merging, preserved robust membership
+  through peak fitting, and added strict configuration/artifact diagnostics.
+- Reduced the default alternating robust update budget to one measured pass;
+  `--maximum-iterations` remains the documented quality/speed knob for
+  difficult overlapping-fiber fits, and legacy numeric identity is
+  intentionally not required for this fitter.
+- Fused robust histogram/tensor work, reused tile gradients, paired spatial
+  objectives, and reduced peak-response geometry to transverse coordinates.
+- Increased anchor tiles from four to six cells per axis after measured tile
+  sweeps; canonical anchor wall time fell from 11.59 to 10.34 seconds.
+- Stored transient peak-search observations and evaluated transverse peak
+  responses in float32, reducing canonical anchor wall time to 9.76 seconds.
+- Paired overlapping anchor tiles into bounded sampling jobs and reused raw
+  prediction samples across pair halos. This reduced canonical sampler
+  submissions by 32.6% with unchanged extraction output.
+- Replaced per-fiberlet packed-node-key hash maps with bounded direct indexes,
+  reducing canonical replay wall time by 2.1% with unchanged path work and
+  replay quality.
+- Replaced repeated scoring-voxel hash lookups with sparse `16^3` pages and
+  dense page-local indices, reducing interpolation materialization by 4.2%
+  while preserving exact replay artifacts.
+- Prepared compact float32 prediction/normal axes and symmetric tensors once
+  per sampled voxel, reducing interpolation materialization by 26.1% while
+  preserving fiberlet geometry and replay outcomes.
+- Replaced fiberlet interpolation's iterative principal-axis solve with a
+  guarded closed form, reducing resolver materialization by another 8.8% with
+  zero fallbacks and byte-identical replay artifacts.
+
+# 2026-08-17: fiberlet extraction profiling
+
+- Added deterministic anchor and fiberlet workload counters and finer-grained
+  wall, CPU, and summed-worker timings without changing extraction decisions.
+- Added one shared versioned extraction-profile row to `vc_fiberlets benchmark`
+  and full `fiberlet-replay` extraction.
+- Documented a reproducible, exact-output performance protocol and recorded the
+  initial optimization candidates for the fiberlet tracing pipeline.
+- Added extraction-profile version 2 with exclusive anchor-fitting subphases,
+  repeated observation-visit counters, and exact peak-cache/backtracking
+  diagnostics. Measurement identified local component refinement, not
+  seed-pair fitting, as the next dominant extraction hotspot.
+
+# 2026-08-13: fiberlet graph replay
+
+- Replaced the quantized world-axis half-grid DP with a deterministic curved
+  cubic-Hermite domain using 2-voxel arclength planes, parallel-transported
+  frames, 0.5-voxel transverse offsets, and floating-point interpolation.
+- Removed the fiberlet lattice's 45-degree smoothness dead zone and scored
+  graph joins with the same shared local alignment and Lasagna-normal
+  tangent/normal objective, including exactly-once replay accounting.
+- Expanded integer-DP candidate generation from the radius-four shell to every
+  shorter cell offset within the same outer bound and added a strict 25-degree
+  sampled-fiber-direction feasibility constraint.
+- Added deterministic bidirectional fiberlet graphs with strict 45-degree
+  anchor joins and loss-density beam routing with anchor-level lookahead.
+- Added `fiberlet-replay`, shared variable-step reference matching, strict
+  graph/route artifacts, and an independent reloadable napari route layer.
+- Unified reference, greedy, and fiberlet longitudinal comparison scope under
+  `--along`; greedy postroll and exact display cropping now derive from it.
+- Fiberlet graph replay now completes the edge containing its first distance
+  failure and continues for anchor-bounded `--along` postroll, with explicit
+  complete/truncated distances, overshoot/shortfall, and whole-edge identities.
+
+# 2026-08-12: narrower independent anchor NMS
+
+- Decoupled transverse anchor NMS from the peak-refinement window and reduced
+  defaults to 2 transverse and 1 longitudinal prediction voxels.
+- Added the transverse radius to strict experimental anchor artifacts and path
+  loading while retaining conservative external crop context.
+
+# 2026-08-12: fiberlet replay distance filtering
+
+- Added an independent napari fiberlet-radius control that physically removes
+  paths wholly outside the exact reference/failed-trace polyline distance.
+- Set display defaults to 32 base voxels for presence and anchors and 16 for
+  fiberlets, with all three values preserved across artifact reload.
+
+# 2026-08-12: parameter-independent anchor visualization
+
+- Decoupled napari anchor-stage visualization compatibility from extractor
+  parameters. Old, absent, or extended parameter metadata now renders without
+  affecting coordinate, geometry, lineage, or final-output consistency checks.
+
+# 2026-08-12: full 2D anchor subpixel experiment
+
+- Replaced independent 1D peak parabolas with a complete 3x3 least-squares 2D
+  quadratic including cross-coupled curvature and conservative Hessian,
+  half-step, owner-domain, and real-response guards.
+- On the fixed David Paris4 benchmark, the 2D fit reproduced the discrete
+  population exactly but scored below the 1D baseline: 29.07%/43.90% versus
+  29.78%/44.88% anchor/cell hits at 4 vx, and 54.09%/80.42% versus
+  54.59%/81.06% at 8 vx.
+- Extending the signed-gradient sweep above its former maximum found a
+  4-voxel optimum near weight `1.0` and an 8-voxel optimum near `1.3-1.5`;
+  weight `1.2` gave the best equal-weight aggregate for joint-2D.
+- Added matched `discrete`, `separable_1d`, and `joint_2d` benchmark positions
+  from one extraction. The old `0.2` 1D result reproduced exactly. Across the
+  complete `0.0-2.0` sweep, separable-1D beat joint-2D on every 4/8 anchor/cell
+  hit rate; separable weight `1.1` scored 31.14%/46.89% at 4 vx and
+  55.97%/82.64% at 8 vx.
+- Selected separable-1D for production anchor placement and gradient weight
+  `1.0` as the default. Joint-2D remains transient benchmark provenance only.
+
+# 2026-08-12: discrete-versus-subpixel anchor benchmark
+
+- Split refined-anchor localization output into equal-population `discrete`
+  and `subpixel` reports while keeping discrete provenance transient and strict
+  version-1 artifacts unchanged.
+- Selected `0.2` as the default signed gradient weight from the fixed David
+  Paris4 sweep. Explicit CLI and artifact values remain authoritative.
+- At `0.2`, subpixel fitting improved 4-base-voxel anchor/cell hit rates from
+  27.79%/41.94% to 29.78%/44.88% and 8-base-voxel rates from 53.76%/79.86% to
+  54.59%/81.06% relative to the discrete peaks.
+
+# 2026-08-12: signed presence-gradient anchor centering
+
+- Added deterministic presence-only 3D Sobel gradients and reliability-gated
+  inward/outward normal-plane voting to the refined-anchor peak objective.
+- Added strict gradient weight/reliability artifact parameters and
+  `--gradient-weight`, with exact weight-zero fallback.
+- On the supplied David Paris4 reference, the default raised 4-base-voxel
+  anchor/cell hits from 1,002/982 to 1,021/1,000 and 8-base-voxel hits from
+  1,884/1,823 to 1,896/1,832 while reducing mean, median, and p95 distance.
+
+# 2026-08-12: outer-parallel anchor extraction
+
+- Parallelized anchor sampling and fitting over canonical cell jobs while
+  forcing every job's lower-level prediction sampler to one thread.
+- Added aggregate concurrent-halo memory bounding, deterministic indexed result
+  and error assembly, and serialized progress/retain handling.
+
+# 2026-08-12: refined-anchor localization benchmark
+
+- Added `vc_fiberlets anchor-benchmark` to extract only geometric refined
+  anchors in exact reference-intersecting cells and measure their exact
+  base-coordinate distance to a strict fiber's dense line.
+- Added stable distribution output and inclusive 4/8-base-voxel anchor and
+  reference-cell hit rates, with empty refined populations kept explicit.
+- Shared exact polyline-to-cell selection with failed-trace replay while
+  preserving replay's positive-radius tube behavior.
+
+# 2026-08-12: physical replay anchor filtering
+
+- Changed the Napari replay anchor-radius cutoff to physically subset final and
+  staged anchors, cell centers, and refinement offsets instead of leaving
+  transparent depth-occluding geometry in the rendered layers.
+- Retained defensive full geometry/features for reversible slider updates and
+  transactional artifact reload/rollback.
+
+# 2026-08-12: local-maximum fiberlet anchors
+
+- Added deterministic direction-conditioned normal-plane peak search after the
+  existing non-orthogonal anchor direction fit.
+- Integrated the peak response with a `1.5`-voxel transverse Gaussian and a
+  longer `1.5`-cell-side along-direction Gaussian, with complete rotated-kernel
+  halo sizing.
+- Added bounded non-decreasing subvoxel peak fitting, continuous owner-cell
+  constraints, normalized edge response, strict transverse/axial peak fields,
+  and base-voxel CLI controls.
+
+# 2026-08-12: faster replay viewer startup
+
+- Kept detailed anchor-stage layers enabled by default so replay diagnostics are
+  immediately available; `--no-anchor-stages` provides an explicit fast-start
+  opt-out and avoids hashing unused stage artifacts.
+- Preserved strict stage schemas and selected-stage topology across artifact
+  reloads.
+
+# 2026-08-11: dense-fiber failure replay
+
+- Added C++ greedy native replay against dense VC3D fiber geometry with bounded
+  monotone matching, typed failure statuses, and exact postroll handling.
+- Added exact tube-selected anchors, tube-constrained integer fiberlets, sparse
+  replay scoring preload, and content-addressed atomic diagnostic bundles.
+- Added strict napari replay loading with external-Zarr validation and separate
+  reference, trace, failure, anchor, and quality-colored fiberlet layers.
+- Kept replay failure-marker styling compatible across napari Points API
+  versions by avoiding the renamed outline-color keyword.
+- Added a replay presence-tube mask using a one-time reference rasterization and
+  base-voxel distance transform, with a runtime radius slider defaulted from the
+  anchor/fiberlet extraction tube.
+- Added replay stage timing plus per-second anchor and fiberlet progress/ETA;
+  anchor progress distinguishes selected-cell fitting from NMS context.
+- Expanded the replay presence mask to the union of the reference fiber and the
+  complete failed greedy trace, including postroll, for direct comparison.
+- Added `anchor_cells.obj` with every selected cell center and retained-anchor
+  displacement lines, exposed as separate clipped napari diagnostic layers.
+- Added strict initialized/refined/support/selection/NMS anchor-stage JSON
+  diagnostics with stable merge lineage, exact filter causes, and actual NMS
+  suppressors, plus independently toggleable napari comparison layers.
+- Added an independent base-voxel anchor-radius slider that filters every replay
+  anchor diagnostic against the exact reference/failed-trace union distance.
+- Added transactional in-process replay-artifact reload with stable empty
+  layers, strict prediction/crop compatibility, derived-distance refresh, and
+  no presence-Zarr reopening.
+
+# 2026-08-11: fiber-centered anchor refinement
+
+- Replaced fixed cell-centroid anchor positions with bounded halo-backed joint
+  direction/position refinement on a rotating plane through each cell pivot.
+- Added deterministic direction-compatible local-maximum NMS across cells,
+  exact crop-boundary context, strict refinement metadata, and focused
+  convergence, locality, determinism, and artifact validation.
+
+# 2026-08-11: fiberlet loss/quality visualization
+
+- Added length-normalized per-fiberlet trace loss, report-relative visual
+  quality, strict napari metric parsing, per-shape features, a runtime napari
+  colormap selector, and density CLI statistics. Path MTL/material output was
+  removed in favor of napari-owned display color.
+
+# 2026-08-10: integer-DP fiberlet paths
+
+- Added strict anchor-artifact loading, radius-four cell-shell pairing, and
+  deterministic integer prediction-voxel DP with exact virtual endpoints.
+- Added the native tracer's shared multiplicative local alignment loss with
+  lattice-edge integration, finite invalid-prediction bridges, and shared
+  native Lasagna-aware direct curvature.
+- Added `vc_fiberlets paths`, versioned JSON/OBJ output, focused regression
+  tests, and real-crop deterministic validation. Global graph construction,
+  deduplication, extension, and H/V/winding assignment remain deferred.
+- Made base-volume coordinates the only spatial contract exposed by the
+  unshipped fiberlet CLI and JSON/OBJ artifacts; no compatibility aliases or
+  legacy coordinate fields are retained.
+- Added `paths --stats`, explicit score-presence semantics, and two-index OBJ
+  path edges.
+- Added independently loadable central XY/XZ/YZ fiber-presence textured-quad
+  OBJ/MTL/PNG context, with direct presence sampling and `--no-slices` opt-out.
+- Materialized each small crop's fiber/normal scoring volume once and moved
+  exact independent DP searches to a deterministic fixed worker pool, removing
+  repeated sampling and nested thread teams.
+- Added monotonic rate-limited path progress with throughput and ETA on stderr.
+
+# 2026-08-10: C++ fiberlet cell anchors
+
+- Added deterministic cell-based extraction of zero, one, or two
+  non-orthogonal unoriented anchors from canonical Fiber Lasagna
+  `presence/nx/ny`, plus the cache-aware `vc_fiberlets anchors` command and
+  sparse JSON/base-coordinate OBJ artifacts. Connection and path stages remain
+  deferred.
+- Merged near-duplicate fitted directions using an angle-plus-objective test
+  and a joint PCA refit, with strict diagnostics and configurable thresholds.
+- Kept the complete anchor OBJ and added separate deterministic component-zero
+  and component-one OBJ layers for inspection.
+
 # 2026-08-07
 
 - Simplified manager S3 staging to marker-only resumable rclone transfer and
@@ -317,6 +2637,346 @@
   dispatch and restored float16 product rings as the default.
 - Added `--accumulator-workers`, backend/throughput diagnostics, native
   numerical coverage, and process-vs-synchronous output coverage.
+# 2026-08-13: half-voxel fiberlet DP
+
+- Halved anchor-to-anchor fiberlet DP spacing to 0.5 stored prediction voxels,
+  with cached sign-invariant prediction/normal interpolation and unchanged
+  base-coordinate artifacts.
+
+# 2026-08-14: full-reference dual fiber replay
+
+- Added independent reset-capable greedy and fiberlet whole-reference replay,
+  strict version-2 segmented artifacts, optional indexed failure
+  visualizations, and strict napari selection/reload.
+- Replaced whole-graph scoring preloads with deterministic on-demand curve
+  batches through the existing volume samplers and added a reproducible local
+  anchor/fiberlet extraction benchmark with sampling, DP, and peak-memory
+  diagnostics.
+- Replaced curve-batched fiberlet preparation with a global stage-parallel
+  pipeline: each candidate geometry is built once, native corners are globally
+  deduplicated independent of sampler batch size, and materialized nodes are
+  reused by parallel DP. Added actual per-stage process-CPU utilization and
+  coordinate-call diagnostics.
+- Compacted retained fiberlet DP nodes to 24 bytes with checked 32-bit local
+  keys and Lasagna-style axis/presence bytes, removed retained interpolation
+  stencils, and separated prepared-geometry from transient-search memory
+  reporting.
+- Replaced overlapping per-cell anchor reads and the second NMS-context pass
+  with deterministic shared dense tiles over a conservative context population;
+  on the fixed 4096-base-voxel Paris4 workload this reduced anchor time by 42%,
+  total time by 22%, and peak RSS by about 75%.
+- Defaulted `vc_fiberlets benchmark` to the complete reference interval after
+  the first control point; explicit `--along` still requests a shorter interval.
+- Added replay-only `--length` in base voxels so extraction, both evaluators,
+  failure reporting, persisted geometry, and visualizations share one bounded
+  interval; omission retains complete-reference replay.
+- Restored direct replay visualization manifests without a viewer index,
+  published stable per-tracer failure aliases for reload, and restored loading
+  of strict version-1 single-visualization replay artifacts.
+
+# 2026-08-17: CT-rendered replay trace strips
+
+- Added three disconnected, sheet-aligned replay strip OBJ artifacts per
+  failure using the unchanged default `buildLineViewSurfaces()` geometry.
+- Extracted the existing `vc_lasagna_line_probe` fine-to-coarse surface texture,
+  textured-mesh, and TIFF helpers for shared use without changing their sampler
+  behavior.
+- Made `vc_fiberlets fiberlet-replay --vis` require `--volume` to name one
+  concrete CT OME-Zarr array/group. Base trace coordinates are mapped through
+  the parent `multiscales` transform before the unchanged renderer samples that
+  group. Each trace publishes a hashed OBJ/MTL/uncompressed-TIFF triple; the
+  selected group transform is persisted and napari reads only those artifacts.
+- Removed the unpublished replay-only ribbon, mask, uint16, and PNG paths.
+- Accepted equivalent concrete-group paths with or without a trailing directory
+  separator when resolving OME-Zarr multiscales metadata.
+- Replaced fixed replay strip supersampling with automatic endpoint-inclusive
+  source-group voxel resolution. Napari now tessellates the validated textured
+  OBJ to every stored TIFF texel instead of displaying only coarse OBJ-vertex
+  samples.
+- Added `fiber_replay.jpg`, a full-selected-interval top/side CT overview with
+  yellow reference, red greedy, and cyan fiberlet overlays. It uses the same
+  default line-view surfaces and shared renderer, honors `--length`, is emitted
+  even for zero-failure visual runs, and is stored both immutably and at a
+  stable direct-inspection path.
+- Increased only the direct-inspection replay overview to 8x source-group
+  sampling, added full-height pre-reset failure bands, and wrapped long strips
+  into deterministic fraction-aligned panels without resampling. Per-failure
+  OBJ/MTL/TIFF strips remain at native selected-group sampling.
+- Replaced replay's isotropic failure cutoff with one shared Lasagna-normal
+  ellipsoid for greedy samples, fiberlet samples, and fiberlet reseeding: the
+  configured base-voxel radius remains unchanged normal to the sheet and is 4x
+  in the tangent plane. Replay output now stores explicit component diagnostics
+  and rejects inconsistent measurements before publication.
+- Extended the full replay overview with fiberlet-centered top/side CT strips,
+  preserved reset components with explicit raster placement, and changed long
+  output to complete four-strip blocks packed across indexed JPEGs capped at
+  65,000 pixels per dimension.
+
+# 2026-08-17: profiled and accelerated fiberlet extraction
+
+- Added versioned anchor/fiberlet phase profiles to benchmark and replay output,
+  including deterministic work counters and process-CPU measurements.
+- Replaced repeated replay-tube scans with an immutable float32 Boost segment
+  R-tree and prioritized each local corridor's layer-adjacent segment. On the
+  5,000-base-voxel Paris4 replay workload, median wall time fell from 58.61 to
+  25.32 seconds while complete published artifacts remained byte-identical.
+- Added a conservative exact support-sphere broad phase to repeated anchor
+  refined-state evaluation. On the same 5,000-base-voxel replay, median wall
+  time fell from 24.92 to 22.09 seconds and complete artifacts remained
+  byte-identical.
+- Added version-3 local-refinement subphase profiling, identifying repeated
+  refined-state evaluation as roughly 89-90% of remaining local-refinement
+  worker time on the canonical replay.
+
+# 2026-08-18: contiguous anchor peak-grid caching
+
+- Replaced direction-conditioned peak-search ordered maps and repeated grid
+  geometry with checked contiguous row-major caches. The canonical replay's
+  median peak-search worker time improved from roughly 43.9 to 42.84 seconds
+  with byte-identical artifacts and deterministic work counters.
+- Split peak responses into a 16-byte hot stream and sparse retained-evidence
+  storage. Canonical median peak-search worker time improved from 42.84 to
+  39.94 seconds and command wall from 10.43 to 10.25 seconds with unchanged
+  replay artifacts and quality populations.
+- Kept production compact robust direction proposals in float32 through their
+  per-observation loop, widening only fixed-size summaries for the existing
+  double cutoff and eigensolver. Canonical median proposal work improved from
+  25.63 to 23.74 worker-seconds with unchanged populations/failures and a
+  maximum emitted-route displacement of 1.38e-6 base voxels.
+- Isolated retained spatial objectives in a private translation unit and kept
+  production compact objective arithmetic float32 while preserving the public
+  compensated-double path. Canonical median objective work improved from 22.59
+  to 13.86 worker-seconds and command wall from 9.56 to 9.17 seconds with
+  byte-identical replay artifacts.
+
+# 2026-08-19: cooperative ready-cell anchor scheduling
+
+- Work-balanced prepared anchor cells across the bounded sampling-group worker
+  pool while retaining tile-local observation ownership and overlap reuse.
+  Canonical median anchor wall time improved from 5.067 to 4.262 seconds and
+  total wall time from 7.77 to 6.97 seconds with exact replay artifacts.
+- Replaced pair-local raw prediction reuse with bounded exact-union sampling
+  partitions. The canonical replay submitted 77% fewer prediction voxels;
+  median anchor CPU improved 12.1% and command wall 2.2% with exact artifacts.
+- Shared one source-private inline implementation between exported local
+  scoring and the prepared fiberlet DP loop. Canonical median DP search wall
+  improved 9.8% and fiberlet wall 5.7% with exact replay artifacts and work
+  counters.
+- Deferred isotropic-angle evaluation in shared local scoring until an invalid
+  normal or degenerate projected tangent requires it. Canonical median DP
+  search wall improved another 6.2% with byte-identical replay artifacts.
+- Batched the four pair-dependent interior-DP alignment dots across compact
+  valid outgoing lanes while retaining scalar transition relaxation order.
+  Matching optimized runs improved median DP search wall by 5.9% and fiberlet
+  wall by 5.7% with byte-identical replay artifacts.
+- Pre-indexed immutable robust-proposal eligibility during compact anchor
+  fitting. Matching optimized runs reduced median proposal work by 20.4%,
+  anchor CPU by 2.2%, and command wall by 0.9% with byte-identical replay
+  artifacts.
+- Removed redundant robust-membership state copies while retaining the original
+  proposal kernel. Matching optimized runs improved median fitting work 1.6%
+  and command wall 1.1% with byte-identical replay artifacts.
+- Moved direction-conditioned peak signal from the dense response stream into
+  sparse evidence, reducing hot records from 16 to 12 bytes. Matching optimized
+  runs improved median peak-search work 5.0% and anchor CPU 1.5% with byte-
+  identical replay artifacts.
+
+# 2026-08-19: fiberlet storage quantization experiment
+
+- Added a one-extraction C++ benchmark for the proposed anchor-position,
+  compact-axis, and per-chunk cost encodings. Endpoint quantization now feeds
+  the regular curved-plane DP rather than attempting to reuse a baseline route.
+- On the canonical Paris4 interval, no quantization added a tracing failure.
+  Maximum Euclidean line separation was 10.15/9.07/11.46 base voxels for
+  position quanta `1/2/4`, 3.56 for compact axes, 5.35 for `uint8` costs, and
+  zero for `uint16` costs; no persistent encoding was selected.
+
+# 2026-08-20: hoisted compact robust-proposal geometry
+
+- Materialized eligible compact proposal observations once per cell and reused
+  their absolute positions, normalized directions, presence, and logical
+  destinations while retaining the original floating-point geometry order.
+- Published selected anchor cells ahead of context-only cells in each prepared
+  tile's cooperative queue, modestly reducing the measured anchor wall tail
+  while preserving byte-identical output.
+- Enforced finite positions once while preparing compact robust-proposal
+  records, eliminating redundant finite checks in three hot passes and reducing
+  proposal worker time by about 9% with byte-identical replay output.
+- Reused each final-evaluation component Gaussian for its denominator and
+  retained numerator, preserving byte-identical replay output while removing
+  duplicate geometry and exponential evaluation.
+- Reused robust-cutoff membership as sparse per-component centroid indices.
+  This removed 98.8% of centroid visits and reduced centroid worker time by
+  64% while preserving a byte-identical canonical replay artifact.
+- Deferred peak direction validation until after retained-component membership
+  succeeds, reducing peak worker time by another 12% with byte-identical replay
+  output.
+- Reused refinement's exact observed support bounds for peak ownership,
+  removing a complete support scan and another 1.04 worker-seconds from peak
+  work with byte-identical replay output.
+- Reused the generated compact range's finite-position invariant in robust
+  preparation, reducing preparation worker time by 11% with byte-identical
+  replay output.
+- Carried full-halo support bounds from the fixed stencil into compact
+  refinement, reducing robust preparation another 12% with byte-identical
+  replay output.
+- Cached configured direction eligibility once per unique compact observation,
+  reducing robust preparation another 33% and anchor CPU by 2.5% with byte-
+  identical replay output and no compact-record size increase.
+- Split dense peak-denominator traversal from sparse positive evidence and
+  removed the dense evidence-index stream, reducing peak and enclosing wall
+  time with byte-identical replay output.
+
+# 2026-08-20: chunk-native replay corridor selection
+
+- Removed the serial full-corridor anchor-cell enumeration performed before
+  cache-backed replay could start. Reference scheduling now selects storage
+  chunks directly, while requested anchor chunks perform the canonical exact
+  segment-to-cell test locally and retain existing NMS and path containment.
+- On the Paris4 full-fiber radius-768 workload, cache work began after 0.006
+  seconds instead of remaining in serial setup beyond 20 seconds. A bounded
+  20.06-second cold-cache run consumed 560.16 CPU seconds (27.9 effective
+  cores). The 5,000-base-voxel radius-64 replay remained byte-identical and
+  completed in 5.90 seconds.
+
+# 2026-08-20: live cached replay progress
+
+- Added generated-or-persisted chunk-resolution accounting to the concise
+  replay progress estimate and a bounded timer repaint so elapsed time, an
+  estimated fraction, and ETA remain live during long cache preprocessing.
+- Isolated progress observer failures from cache results and made ticker and
+  resolution-state shutdown safe for late worker completion. Radius-64 replay
+  output remained byte-identical.
+
+# 2026-08-22: incremental fiberlet replay prefixes
+
+- Replaced repeated logical-route vector construction and visited-set copying
+  with exact canonical logical histories and immutable Patricia cycle state.
+- Made selected-route reference matching, normal-threshold evaluation, and
+  diagnostic index assignment process only newly selected history suffixes;
+  complete public route output is assembled once at segment termination.
+- Preserved the canonical hot-cache replay bundle byte-for-byte while reducing
+  its median wall time from 7.57 to 3.87 seconds and peak RSS from 202,872 KiB
+  to 102,424-104,900 KiB.
+
+# 2026-08-20: cache-backed quantization comparison
+
+- Replaced the eager full-population quantization CLI with sequential baseline
+  and selected-scenario replays over persistent, fingerprinted, bounded caches.
+- Applied endpoint position/direction quantization before fresh sampling and DP,
+  projected compact logical IDs for ordering, and decoded per-owner-chunk costs.
+- Added indexed line comparison with Euclidean, normal, and tangential
+  distributions for baseline-to-scenario and both replay-to-reference paths.
+- Kept quantized anchor identity cell-local after a full-corridor run showed
+  that anchors from several adjacent cells can round to one Q4 coordinate.
+- Added explicit exact-baseline cache reuse and collision-resistant atomic
+  temporary writes so long interrupted comparisons resume safely.
+
+# 2026-08-21: geometry-cache reuse across cost experiments
+
+- Split anchor/fiberlet geometry quantization from replay-only cost decoding,
+  allowing float, uint8, and uint16 cost comparisons to share persistent
+  geometry and DP caches.
+- Added `--scenario all`, which runs one baseline and all 17 non-baseline
+  scenarios while creating at most eight geometry cache groups.
+- Retained the historical u8-tagged namespace only as opaque compatibility
+  metadata so the completed radius-768 Q4+axis cache remains reusable.
+- Made anchor extraction canonical across all geometry scenarios. Quantized
+  endpoint views are now derived once per loaded anchor chunk under a bounded
+  single-flight LRU, while only fiberlet geometry remains scenario-specific.
+- Added producer-group cache cancellation and draining for batch replay so
+  completed full-corridor quantization results no longer hang or crash during
+  process worker-pool teardown.
+- Added float-position compact-axis `uint8` and `uint16` cost scenarios. Both
+  are graph-only views over the existing compact-axis geometry cache.
+- Full radius-768 validation confirmed the shared namespace. Because the
+  existing compact-axis cache was only partially populated, its per-owner cost
+  range scan completed missing geometry chunks in place; it did not create a
+  cost-specific cache.
+
+# 2026-08-21: focused quantization failure replay
+
+- Added atomic baseline/scenario replay artifacts and exact failure-window
+  reporting to the cache-backed quantization benchmark.
+- Added base-voxel `--arc`/`--length` focused intervals and an original
+  `--seed-key` override for deterministic replay of later failure segments.
+- Replaced focused corridor pre-generation with demand-only access to the
+  completed full-corridor cache and added ranked beam-frontier/cost/route
+  comparison artifacts.
+- Added full-route committed-fiberlet cost distributions plus configurable
+  base-voxel exclusion around replay failures.
+
+# 2026-08-21: fixed-distance fiberlet lookahead experiment
+
+- Added an initial local base-voxel lookahead experiment with proportional
+  active-cost scoring and clipped final-fiberlet geometry. It was not shipped
+  and has now been replaced by the persistent search below.
+- On the focused Q1 failure section, 192 base voxels approximates the measured
+  three-edge median (189.1 base voxels). A hot-cache float/Q1 comparison
+  completed with zero failures in both runs, no committed first-edge
+  divergence, and 0.443/0.305/3.689 base-voxel mean/median/maximum line
+  separation. Float/Q1 replay wall times were 2.05/2.26 seconds.
+
+# 2026-08-21: rolling whole-fiberlet beam search
+
+- Replaced both unpublished local lookahead implementations with one persistent
+  beam of up to 16 whole-fiberlet histories from each uninterrupted segment
+  seed.
+- Added a shared logical checkpoint, 192-base-voxel lookahead, and default
+  48-base-voxel checkpoint advance. Every retained history expands through all
+  valid branches to the common logical horizon; the final edge remains whole.
+- Added one deterministic global top-16 prune, whole-fiberlet commitment through
+  the next checkpoint, shared immutable parent histories, explicit state bounds,
+  clipped final-output materialization, and decision diagnostics.
+- Parallelized independent retained-beam expansion under the existing
+  `--threads` setting. The focused 600-base-voxel radius-768 hot-cache replay
+  fell from 17.30 to 6.97 seconds while preserving the same failure and distance
+  results.
+- Added bounded equal-distance fronts and deterministic uniform-cost label
+  search. Reconvergent histories now retain only the best logical-incoming-arc
+  and front-offset label, while exact proportional front scoring and the exact
+  A* oracle remain available for comparison.
+- Restored immediate `fiber_replay_failure` output in compact-progress mode;
+  failure lines now interrupt and redraw the progress bar instead of being
+  suppressed unless `--stats` is enabled.
+
+# 2026-08-22: configurable exact replay beam width
+
+- Removed the unpublished fixed maximum of 16 graph-replay beams. `--beam`
+  now accepts any positive width while retaining 16 as its default and the
+  generated-state limit as the exact-search work bound.
+- Changed exact completion retention to ordered insertion so wider experiments
+  do not sort the complete retained set after every discovered route.
+- Changed the graph replay default lookahead from 192 to 384 base voxels while
+  retaining the independent default checkpoint advance of 48 base voxels.
+- Failure-window diagnostics now use the available match search span when a
+  replay reset fails without advancing near the reference end.
+# 2026-08-22: compact float-position fiberlet default
+
+- Adopted exact float endpoint positions, compact fitted directions, and fixed
+  sqrt-density `uint16` edge costs with ceiling 256 as the default cache-backed
+  fiberlet replay profile. Preserved an explicit all-float correctness oracle,
+  canonical float anchors, and the unchanged unpublished compact serializer.
+- Added fractional base-voxel endpoint evaluation and replaced the unpublished
+  q1/u8 matrix row with the q1/8 compact-direction sqrt-u16 experiment.
+- Full Paris4 radius-768 evaluation produced two failures for both the new
+  default and exact oracle; q1/8 produced three.
+
+# 2026-08-22: sparse whole-volume fiberlet preprocessing
+
+- Added presence-only sparse scanning and deterministic output-chunk mapping.
+- Added a retained intermediate anchor cache and a combined compact final Zarr
+  with anchors, prefixes, and routes. Expected chunks and completeness are
+  reconstructed directly from source presence, intermediate anchors, and final
+  payload tuples without persisted activity or completion markers.
+- Added read-only combined-dataset cache facets configured from a fresh source
+  scan, atomic partial-tuple recovery, and locked stale-temp cleanup.
+- Added `vc_fiberlets preprocess-volume` with Z/Y/X scheduling, resume, and
+  one-second progress, ETA, and compressed-size projection with persistent
+  minute checkpoints.
+- Replaced the whole-volume anchor barrier with a dependency-driven Z-slab
+  pipeline. Ready fiberlets dynamically consume the shared worker budget first;
+  remaining workers generate deduplicated anchor lookahead.
 
 # 2026-08-06: Lasagna manager durable Fiber runs
 
@@ -408,3 +3068,904 @@
   and 10 TiB / 10,000-tile defaults without changing the normal prefetch path.
 - Made live progress cadence independent of TTY detection and report unique
   remote-missing chunks per listed Z plane.
+
+## 2026-09-07 — Fiber3D per-sample pipeline benchmark
+
+- Added a reusable bounded two-process-stage ordered sample pipeline, split the
+  3D loader at its existing value-augmentation boundary, and measured the real
+  warm S1a path without changing normal training.
+## 2026-09-07
+
+- Added explicit VC3D coordinate-sampler concurrency and stage-resolved Fiber3D
+  loader benchmark metrics without changing normal sampling defaults.
+
+## 2026-09-07 — Requested-level sampling locality
+
+- Reused adjacent dependency footprints and pinned chunk pointers in the exact
+  VC3D scalar path, reducing isolated dependency/interpolation service from
+  617ms to 98ms per S1a training sample without changing sampled bytes.
+
+## 2026-09-07 — Native Fiber3D coordinate generation
+
+- Added a fused GIL-free C++ coordinate generator and explicit
+  `auto|native|eager` loader selection. On the CPU-only S1a benchmark it raised
+  128-loader raw throughput from 116.53 to 227.33 samples/s while remaining
+  within 3.82e-6 base voxels of the eager reference.
+
+## 2026-09-07 — Native Fiber3D anisotropic augmentation
+
+- Replaced repeated CPU `grid_sample` oriented blur with a single-threaded,
+  GIL-free three-pass native stencil. Full augmentation improved from 1.165s to
+  0.494s/sample and the matched pipeline from 22.65 to 58.81 samples/s.
+- Extended the native path to isotropic blur and fused deterministic point
+  transforms, reaching 131.01 ordered samples/s with exactly 128 workers.
+
+## 2026-09-08 — Bounded Fiber3D sample transport
+
+- Added generation-checked shared tensor slots and deferred consumer credits to
+  the reusable ordered pipeline, eliminating multiprocessing tensor transfer and
+  batch-copy stalls.
+- Vectorized the exact native stencil interior and balanced the fixed 128-worker
+  topology, sustaining 229.75 loaded and augmented 128-cubed samples/s (223.95
+  samples/s including startup and drain) on the S1a benchmark.
+
+## 2026-09-08 — Shared Fiber3D sample workers
+
+- Replaced fixed stage processes in the reusable benchmark with an autonomous
+  shared worker entrypoint, gradual bounded admission, exact slot ownership,
+  lazy stage state, and direct bounded inter-stage queues. Three 128-process
+  S1a runs averaged 225.56 loaded+augmented samples/s without GPU use.
+
+## 2026-09-08 — Fiber3D trainer sample-pipeline integration
+
+- Connected the bounded shared per-sample pipeline to DDP training with exact
+  rank-stream mapping and H2D-safe slot release. Two stride-4 GroupNorm runs
+  averaged 83.81 samples/s on two GPUs versus 60.12 for the old DataLoader.
+- Added CPU-batch replay profiling, measuring an 88.22 samples/s
+  transfer/target/model ceiling and isolating the old producer as the main gap.
+## 2026-09-08 — Independent rectangular Fiber3D blur
+
+- Replaced interpolated directional blur with independently randomized
+  separable isotropic and directly evaluated rectangular directional Gaussian
+  kernels, using deterministic low-overhead greedy Conv3d grouping.
+- Removed dense validity/loss masks from batch collation, device transfer,
+  target materialization, and free/conditioned losses; loaded GT lines define
+  positives and every other output voxel is a presence negative.
+- Added reusable actual-distribution blur benchmarks and focused CPU/CUDA
+  regression coverage. The final two-H100 path measured 88.487 samples/s versus
+  the 95.708 samples/s model-only ceiling.
+
+## 2026-09-09 — Fiber3D LR and gradient diagnostics
+
+- Added exact optimizer-global-batch microbatching, linear warmup, a
+  fresh-initialization exponential LR-range mode, and opt-in pre-clip global L2
+  gradient measurement/clipping with console, JSONL, and TensorBoard logging.
+- Added a one-command tuning suite that derives and runs matched fixed-LR and
+  clipping trials, then emits consolidated JSON and Markdown for manual review.
+- Tuned the S1a target global batch 128 on six available H100s. Fixed-run
+  verification selected peak LR 0.01 with 100 warmup updates and rejected
+  clipping at a threshold slightly above the observed p99 norm.
+
+## 2026-09-09 — Distribution-invariant Fiber3D losses
+
+- Replaced rank-local loss means with one packed global sufficient-statistic
+  reduction per optimizer update, including exact gradient scaling through DDP
+  and unequal virtual microbatches.
+- Made legacy two-branch anti-collapse routing stable under rank partitioning by
+  applying its quota per stream/sample. Three matched two-H100 runs measured a
+  0.04% throughput change, within run noise.
+## 2026-08-23 — Managed whole-volume Fiberlet artifacts
+
+- Added durable `las_manager fiberlet` processing with shared tmux lifecycle,
+  configurable native thread budget, strict upstream prediction validation,
+  resumable local anchors, and portable final provenance.
+- Made combined Fiberlet Zarr metadata self-describing and independent of
+  runtime paths, with canonical processing/source fingerprints.
+- Added bounded-memory staging and minimal Atlas `fiberlets` copy-first public
+  representation support without registering a synthetic model.
+# 2026-08-23: catalogue-backed managed Fiberlet normals
+
+- Made the normal selector optional for managed Fiberlet jobs. The manager now
+  distinguishes published regular Lasagna normals from Fiber Lasagna outputs
+  through exact Atlas model channels, caches the remote manifest with the VC
+  read-through marker, and lazily reuses normal chunks.
+- Added explicit Atlas normal selectors, cache-only completion, stable remote
+  dependency provenance/resume, and one-voxel base-shape compatibility.
+- Reused VC3D's canonical open-data Lasagna cache URL, identity directory, and
+  marker schema; manifest SHA-256 is now integrity metadata only.
+- Invalid public origins, cache markers, coordinate metadata, and remote group
+  descriptors now fail explicitly instead of selecting or constructing an
+  alternate cache dependency.
+
+## 2026-08-25 - Anchor-seeded Fiberlet crop tracing
+
+- Added standalone bidirectional crop filling from combined Fiberlet datasets,
+  with deterministic anchor seeds, first-exit clipping, cycle rejection, and
+  ordinary stored edge/join costs.
+- Added replay-compatible 20/80-base-voxel anisotropic anchor coverage with
+  direction discrimination, while intentionally deferring output-fiber
+  deduplication.
+- Added combined sparse-dataset consumption without a source Fiber manifest:
+  absent tuples decode as empty and partial tuples fail.
+- Kept whole-volume production sparse as well: missing/all-zero presence input
+  chunks are not scheduled, and generated empty anchor or Fiberlet chunks are
+  not written.
+- Added line OBJ and optional six-face CT texture visualization through the
+  existing VC3D fine-to-coarse sampler.
+
+## 2026-08-25 - Structural Fiberlet normal compatibility
+
+- Replaced the crop tracer's exact Lasagna manifest byte-hash requirement with
+  base-frame, shape, scale, and normal-channel compatibility validation.
+- Reused the established Lasagna one-chunk padding rule and retained manifest
+  hashes only as provenance.
+
+## 2026-08-25 - Fiberlet crop principal-direction visualization
+
+- Added deterministic non-orthogonal two-direction fitting over accepted
+  traces' local axial steps and 75% arc-length dominant/mixed classification.
+- Preserved the complete line OBJ while adding direction-1, direction-2, and
+  mixed line subsets plus matching actual seed-anchor point OBJs.
+
+## 2026-08-25 — Transient staged replay filtering
+
+- Made staged Fiberlet reduction options available to cache-backed replay.
+- Added globally anchored complete-box planning with backward endpoint-reach
+  expansion across stages and storage-layout-independent source coverage.
+- Kept filtered overlays invocation-local while preserving canonical source
+  caches and the original replay-corridor traversal predicate.
+
+## 2026-08-23 — Explicit shared inference Z-band lifecycle
+
+- Replaced the cross-band multi-device event state machine with a lazy explicit
+  Z-band barrier and exact shared-slot ownership for both Fiber and Lasagna.
+- Made accumulator queue submission nonblocking and flush batches finalize and
+  release their circular generations immediately after full acknowledgement.
+- Replaced the flush timeout/process-limit guess with stage-aware quiescence
+  diagnostics, while retaining bounded per-process Zarr and native/Blosc
+  thread limits.
+- Restored atomic read submission for ordinary local inputs after live-fetch
+  integration had routed even its disabled path through the new staged state.
+  Live materialization now remains a bounded upstream ledger feeding the same
+  queue-based inference stages, with checked per-worker task and slot ownership.
+- Fixed a proven canonical-frontier capacity inversion: one input/result pair
+  is now reserved for the first non-skipped accumulation-frontier tile, so
+  later out-of-order GPU results cannot occupy every result slot and deadlock
+  canonical accumulation. Queue delivery remains fire-and-forget.
+
+## 2026-08-26 - H/V-only fiber-piece labeling diagnostic
+
+- Added an opt-in reduced HiGHS model that solves active/broken and H/V labels
+  without parity variables, constraints, or winding costs.
+- Preserved the existing CSV and five OBJ interface by reporting fixed-even
+  parity, leaving the two odd visualization layers empty.
+- Added an explicit diagnostic switch to retain all finite winding-distance
+  constraints without changing the default 1.5-winding cutoff.
+- Added an exact-perpendicular mixed H/V model with binary broken decisions,
+  continuous piece orientation, true absolute-difference edge losses, and no
+  triangle surrogate.
+- Added deterministic iterative H/V consensus growth over original crop
+  fibers, with spatial/count priority, incremental broken decisions, final
+  H/V/broken OBJ layers, and scheduled growth snapshots.
+- Restricted the primary consensus seed to long crop-spanning candidates and
+  ranked equal-straightness candidates by true distance to the crop center.
+- Added final and milestone broken-fiber OBJ layers alongside consensus H/V.
+- Added opt-in deterministic mutual top-K constraint-strength pruning shared by
+  constraint visualization, HiGHS labeling, and iterative consensus, with
+  source-fiber degree and connectivity diagnostics plus minimum-link recovery
+  of the original positive-strength component partition.
+- Exposed the existing crop-direction dominance fraction to trace and stored
+  visualization commands while preserving the 0.75 default.
+- Replaced binary nearest-axis votes in crop direction grouping with calibrated
+  per-segment angular support, so off-axis and bend length gradually moves a
+  fiber into the mixed visualization group without changing the fitted axes.
+- Added `vc_fiber_trace_chunk direction-diagnostic`, which removes mixed
+  direction groups before canonical constraint extraction and discrete
+  H/V-only MILP solving, then reports component-gauge-aligned orientation and
+  broken-label errors against the initial direction assignment.
+- Added `direction-ablation`, which cumulatively admits Mixed fibers by gradual
+  direction confidence, independently rebuilds and solves coarse checkpoints,
+  and reports H/V versus mixed-defect errors for both the discrete MILP and its
+  thresholded LP relaxation under a trusted-only component gauge.
+- Added a ranked-prefix admission limit for fast, repeatable broken-cost
+  ablation sweeps.
+- Added an opt-in perpendicular-only labeling filter for constraint and
+  direction-ablation experiments, retaining existing same-trace continuity
+  evidence and reporting excluded measured links.
+- Added an opt-in no-split post-solve perpendicular consensus diagnostic with
+  confidence-weighted synchronous updates and short fixed-value OBJ layers.
+
+## 2026-08-27 - Binary BP consistency diagnostics
+
+- Added a HiGHS-free final-cohort BP-only direction-ablation path using the
+  shared perpendicular constraint selector.
+- Added per-fiber hard, unresolved, strength-weighted, soft same-label, neighbor
+  support-balance, and neighbor-certainty diagnostics with CSV output, grouped
+  quantiles, and Mixed-vs-trusted AUROC.
+
+## 2026-08-27 - Binary sum-product BP experiment
+
+- Added deterministic log-space sum-product inference over the existing merged
+  perpendicular fiber factor graph, producing normalized approximate `P(H)`
+  marginals without changing the min-sum path.
+- Added exact-tree, damping, sign, gauge-symmetry, low-temperature,
+  nonconvergence, and deterministic-loop validation plus separate OBJ and CSV
+  artifacts with inference and temperature provenance.
+
+## 2026-08-27 - Explicit Mixed-state BP experiment
+
+- Added categorical V/Mixed/H sum-product inference with measurement-scaled
+  defect costs, normalized state marginals, direct Mixed diagnostics, and
+  separate orientation-projection and Mixed-probability OBJ bands.
+- Replaced measurement-scaled defect factors with a node-local Mixed unary and
+  conditionally neutral Mixed factor rows/columns, preventing Mixed labels from
+  propagating transitively through otherwise orientation-only constraints.
+- Enabled combined parallel/perpendicular BP evidence, normalized merged
+  factors to their decisiveness gap, omitted exact neutral cancellations, and
+  generalized binary and ternary consistency diagnostics to each factor's
+  preferred same/different relation.
+
+## 2026-08-27 - Interleaved winding BP
+
+- Added soft-prior two-stage inference over interleaved A/B integer winding
+  lattices, with aligned signed constraints and bounded global phase/scale
+  calibration in raw Lasagna-integral units.
+- Added joint class/winding CSV diagnostics and consecutive per-winding OBJ
+  layers while retaining independent winding inference for other BP modes.
+
+## 2026-08-27 - Joint adaptive-grid winding BP
+
+- Added a default single-pass `joint-grid` solver over H/Mixed/V, integer
+  winding, crop-global phase/scale calibration, and component-local ladder
+  signs without an orientation pre-pass or post-fit.
+- Added an absolute sliding log-gain grid with warm message retention, settled
+  posterior support changes, explicit resource/shift guards, joint progress,
+  and calibration provenance in the existing CSV/report path.
+- Retained the previous multi-start implementation as explicit
+  `--winding-solver alternating` comparison mode with unchanged defaults.
+- Added exact tiny-factor marginal validation, shared-calibration disconnected
+  component coverage, configuration failures, and a measured 384-crop
+  comparison.
+
+## 2026-08-28 - Winding-free Defect fibers
+
+- Replaced per-winding Defect states and their four-substitution factors with
+  one winding-free Defect state whose incident winding constraints are neutral.
+- Removed pre-pass Defect constraints before continuous initialization, made
+  integer support conditional on active mass, and added explicit winding
+  validity to CSV and OBJ output.
+
+## 2026-08-28 - Quantized interleaved winding targets
+
+- Replaced raw floating-point winding observations in H/V-aware BP with signed
+  half-integer interval targets after raw cutoff admission.
+- Preserved raw and effective targets separately in factor diagnostics and
+  documented a deferred continuous Ceres formulation.
+
+## 2026-08-28 - Hard perpendicular winding order
+
+- Made zero and reversed active-active winding predictions impossible for
+  every accepted nonzero signed perpendicular observation in alternating and
+  joint-grid BP.
+- Added exact negative-infinity-safe cavity accumulation and damping, applied
+  the rule to alternating calibration, and added a deterministic final Defect
+  projection for infeasible independently decoded node marginals.
+
+## 2026-08-28 - Separate prepass and winding Defect controls
+
+- Split the orientation-prepass Mixed unary from the winding-stage Defect
+  unary and exposed both costs with unambiguous diagnostics.
+- Added fixed-prepass H/V/Defect OBJ layers alongside the existing final
+  winding classification.
+
+## 2026-08-28 - BP constraint-class cohort diagnostics
+
+- Added central/non-central admitted winding evidence tables split into
+  continuity, perpendicular-value, perpendicular-sign, parallel-same, and
+  parallel-other terms.
+- Reported endpoint incidence and finite coefficient density by final state,
+  with hard signed-order incidence kept separate from the finite
+  perpendicular-value coefficient, before each reference benchmark.
+
+## 2026-08-28 - Split-piece Defect boundary cost
+
+- Added `--piece-break-cost` to both Defect-capable winding BP solvers to
+  penalize active/Defect transitions between consecutive pieces of one trace.
+- Kept the default at zero and recorded the selected value in console and CSV
+  diagnostics. A 512-voxel-piece sweep showed that strong costs reduce local
+  breaks but can disable complete runs, so no nonzero default was selected.
+
+## 2026-08-31 - Signed median parallel winding constraints
+
+- Reused every tangent-valid paired sample from the parallel-direction walk in
+  one batched winding read and replaced closest-point parallel separation with
+  the aligned signed median.
+- Separated parallel integer-ladder targets from closest-point perpendicular
+  half-ladder targets throughout BP, diagnostics, OBJ grouping, and legacy
+  labeling consumers.
+
+## 2026-08-31 - Normal-alignment progress
+
+- Added bounded phase progress for crop normal sampling, factor/component
+  preparation, normal-sign message passing, and finalization.
+- Added serialized binary-BP iteration callbacks with residuals, safe OpenMP
+  exception propagation, and CLI phase-local/message-limit ETAs.
+
+## 2026-08-31 - Estimate-first reference winding calibration
+
+- Replaced tolerance-based per-constraint gauge calibration with one exact
+  half-step vote per raw `(reference, gauge)` winding estimate.
+- Reused the dominant-factor scorer before and after calibration, separated
+  global sign selection from arbitrary gauge-origin magnitude, and kept the
+  `0.5` tolerance reporting-only.
+
+## 2026-08-31 - Direct winding-factor weight search
+
+- Added independent multipliers for the five canonical perpendicular/parallel
+  winding classes and kept solver/reference diagnostic coefficients identical.
+- Added one-command exhaustive reference grid search with reused preprocessing,
+  fixed-denominator ranking, ETA, failed-scenario isolation, and selected-result
+  artifact output.
+- Added cached `/2`, `*2` coordinate search from an explicit tuple, with strict
+  quality-only moves, bounded exact exponent keys, per-neighborhood progress,
+  and final selected-result artifact output.
+- Promoted the locally selected `8,1,2,2,1` tuple to the shared and CLI default
+  for H/V-aware winding solves; explicit all-ones retains neutral weighting.
+
+## 2026-08-31 - Parallel correspondence grid
+
+- Replaced closest-distance phase refinement with an incremental 2D arc-offset
+  grid that balances target step length against connector perpendicularity.
+- Expanded the optional grid's independent correction range from 5% to 25% of
+  the target step while retaining 5% grid resolution.
+- Kept the expanded grid behind `--parallel-correspondence perpendicular-grid`
+  and restored the established closest-distance walk as the default.
+- Added experimental grid range/objective controls and correspondence geometry
+  columns to winding-factor CSV diagnostics. A fixed 1024-crop reference sweep
+  found no grid setting above the distance baseline: independent grid steps
+  improve perpendicularity but perturb signed winding estimates across hard
+  integer-bin boundaries.
+
+## 2026-09-01 - Winding sign and zero-weight controls
+
+- Allowed individual canonical winding magnitude classes to be disabled with
+  zero weights while keeping zero/no-sign observations out of winding
+  connectivity and Defect incidence.
+- Added independent dominant perpendicular and parallel hard-sign controls,
+  including sign-only inference, with matching solver and reference benchmark
+  semantics.
+- On the fixed 1024 crop, the existing perpendicular-sign configuration
+  (`8,1,2,2,1`, Defect cost 50, piece-break cost 0, BP temperature 2.5)
+  remained the best converged result and reproduced exactly on a second run.
+
+## 2026-09-01 - Confidence-weighted winding evidence
+
+- Added linear and cosine post-decision confidence, linear-angle and raw-dot
+  normal confidence, and deterministic median parallel-normal alignment.
+- Added optional finite sign-infringement penalties with matching solver,
+  connectivity, Defect-incidence, diagnostics, and reference semantics while
+  preserving legacy defaults.
+- The fixed 1024-crop sweep found confidence attenuation harmful, but a finite
+  cost of 44 for both sign classes with Defect cost 100 and temperature 1.25
+  retained 8/8 exact reference windings and increased matched constraints from
+  1,784 to 1,875. These parameters are now the standard defaults; the former
+  hard-sign behavior remains available with `--winding-sign-cost hard`.
+
+## 2026-09-01 - Hard-sign falloff retuning
+
+- Retuned the none, linear, and cosine normal-confidence families independently
+  on the 1024 crop with hard continuation and both hard signs fixed at 30
+  degrees; disabled and alternative hard-sign thresholds were excluded.
+- All selected families reached 8/8 exact reference windings and reproduced
+  deterministic quality counts. Linear confidence with decision cosine and
+  weights `0,2,2,2,1` maximized correct reference constraints at 1369/2100;
+  cosine confidence with decision legacy and weights `0,0.5,2,2,1` retained
+  more active pieces and had lower aggregate infringement.
+- Promoted the reference-objective winner to the shared and CLI defaults.
+  Deferred 2048 larger-context validation.
+
+## 2026-09-01 - Independent winding-value and sign-hardness weights
+
+- Kept the ordinary winding residual signed while separating the additional
+  perpendicular and parallel finite/hard sign penalties into two independently
+  tunable weights.
+- Split agreement, evidence, and reference benchmark reporting into winding
+  value and sign-hardness items with weight-independent structural denominators.
+- Extended exhaustive and local reference tuning from five winding coordinates
+  to five winding plus two sign coordinates.
+
+## 2026-09-01 - Complete reference-fiber diagnostics
+
+- Stopped clipping tagged VC3D reference annotations to the traced crop before
+  visualization, reference constraint extraction, and BP benchmarking.
+- Reference diagnostics now retain one complete dense line per selected JSON
+  fiber in deterministic filename order.
+
+## 2026-09-01 - Fixed-reference conditioned winding solve
+
+- Added exact, non-disableable joint-grid states with fixed H/V, integer
+  winding, and phase-direction sign, including independent gauge anchoring and
+  protected hard-factor projection.
+- Added a second diagnostic solve containing the annotated reference pieces and
+  production reference/BP cross factors while preserving the ordinary graph.
+- Added direct-versus-propagated ordinary state changes and before/after
+  cross-factor agreement tables. On the 1024 crop, winding-magnitude conflicts
+  dominated the response; H/V and signed-order conflicts were comparatively
+  small.
+
+## 2026-09-02 - Fractional Ceres winding experiment
+
+- Added an opt-in continuous Ceres backend for joint horizontalness, activity,
+  and real winding using the exact prepared BP targets and coefficients.
+- Added per-reference fixed-source least-squares diagnostics, fractional
+  artifact publication, progress/cost reporting, and synthetic regression
+  coverage while retaining joint-grid as the default.
+
+## 2026-09-02 - Indexed reference winding visualization
+
+- Published one strict reference OBJ per filename-ordered half-step alongside
+  the aggregate reference artifact and added aggregate/selected/hidden viewer
+  modes with parity-preserving reference-mask navigation.
+- Added BP `raw_w` as the exact selected `est_w` inverse-mapped into published
+  solver winding-layer coordinates, while retaining the existing calibrated
+  `est_w` and Ceres output.
+
+## 2026-09-02 - Reference factor conflict diagnostics
+
+- Split fixed-reference conflict reporting into five winding-magnitude and two
+  sign-factor classes, using the exact materialized solver targets and weights.
+- Added the same seven-class summary for constraints between fixed reference
+  fibers, excluding continuity and same-source links.
+- Hid verbose per-reference piece-pair rows behind
+  `--reference-constraint-details` and made valid opposite-ladder output-layer
+  estimates report `NA` instead of aborting the benchmark.
+
+## 2026-09-02 - Sign-only ordered winding cuts
+
+- Added an opt-in `ordered-cuts` backend after fixed H/V/Mixed inference. It
+  uses the shared dominant signed evidence to fit continuous whole-winding
+  offsets, preserves hard-continuation runs while inserting discrete cuts, and
+  accepts only cuts that strictly reduce exact sign infringements.
+- Added zero-cut and per-split independently calibrated reference results plus
+  a fixed-crop continuous reference ordering fit. The first 1024 experiment
+  reached 86.96% pairwise continuous-order agreement and peaked at 16/26 exact
+  discrete reference windings, showing that a cut-count stopping prior remains
+  necessary.
+
+## 2026-09-02 - Iterative ordered-winding offender removal
+
+- Added an opt-in whole-source-fiber pruning diagnostic based on exact
+  continuous sign-violation percentages, with a complete refit and comparable
+  before/after violation counts after every removal.
+- On the 1024 crop at piece length 384, it removed 122/499 traces and reached
+  zero continuous violations, but reduced reference-oracle agreement from
+  19/26 to 16/26 exact windings, so it remains diagnostic rather than a
+  production filter.
+
+## 2026-09-02 - Fixed-reference offender pruning diagnostic
+
+- Added an opt-in fixed-reference experiment that removes ordinary pieces
+  decoded as Defect, re-solves the exact retained ordinary subgraph from scratch,
+  and publishes final active, conditioned-broken, and final-disabled pieces as
+  separate per-winding OBJ layers.
+- Added diagnostic winding hypotheses for projected Defects, independent gauge
+  alignment after graph splitting, and Napari controls for the two Defect
+  cohorts.
+- Added a second, explicitly labeled reference benchmark for the fresh pruned
+  inference. It reuses retained cross constraints and shares its phase-aware
+  aligned winding frame with the `_pruned` OBJ layers.
+- Added supervised oracle inlier diagnostics. The 1024 reference crop retained
+  997/1360 pieces and reached 24 exact, 0 wrong, and 2 missing references over
+  the full 26-reference set in the direct conditioned result.
+
+## 2026-09-03 - Reference-winding population retention
+
+- Added a calibrated per-winding final-piece benchmark and a unique-constraint
+  pruning benchmark for the annotated reference interval. Both report a
+  problematic fraction and problematic-to-retained percentage without
+  source-fiber or multi-term constraint double counting.
+
+## 2026-09-03 - Fiber pruning benchmark guide
+
+- Added a standalone reproducibility guide for the PHercParis4 1024-crop
+  pruning benchmark, covering source prediction, sparse Fiberlet generation,
+  crop/lookahead coordinates, tracing, oracle evaluation, metric definitions,
+  expected results, and validation.
+
+## 2026-09-03 - Reference endpoint replay benchmark
+
+- Added bidirectional replay of every tagged reference-fiber run inside a
+  requested crop, stopping at the first shared anisotropic-threshold failure.
+- Added versioned JSON metrics for mean traced distance, direction completion,
+  and length-weighted success with explicit physical voxel size.
+- Added reproducible per-run Markdown records and a separate combined benchmark
+  result index for endpoint replay and 1024-crop oracle pruning.
+
+## 2026-09-03 - Whole-run endpoint replay evaluation
+
+- Changed the endpoint benchmark to resume with the ordinary deterministic
+  replay reset after every failure and evaluate the full directional reference
+  run.
+- Added version-2 JSON accounting for every failure, seeded interval coverage,
+  failure density, and failure-free span lengths. Superseded interim benchmark
+  records were removed once the final reliability metric was recorded.
+
+## 2026-09-03 - Endpoint replay reliability metric
+
+- Made total evaluated directed length per failure, plus its percentage of
+  tested length, the endpoint benchmark's only CLI headline metrics.
+- Defined zero failures as the complete tested length and 100 percent while
+  retaining detailed failure and coverage diagnostics in version-2 JSON.
+
+## 2026-09-03 - Direct tracer reference replay
+
+- Added direct greedy and reference-tangent Lasagna normal-transport controls
+  to the whole-run reference replay benchmark without enabling them for crop
+  pruning.
+- Shared forward matching, anisotropic failure evaluation, deterministic reset
+  accounting, and distance-per-failure aggregation across direct backends;
+  version-3 JSON records tracer-specific initialization, spacing, settings, and
+  inputs.
+
+## 2026-09-03 - Fiber benchmark progress plots
+
+- Added reproducible percentage-versus-algorithm-date step plots for reference
+  replay reliability and the negated 1024-crop problematic/retained constraint
+  ratio.
+- Kept raw counts and separate algorithm/measurement provenance in an
+  extensible data file, and marked unexecuted direct crop policies as assumed
+  floor markers without fabricated measurements.
+
+## 2026-09-03 - Transient staged crop filtering
+
+- Added repeatable box-driven Fiberlet reduction stages to crop tracing, with
+  recursive dependency closure, progress, and trace-artifact provenance.
+- Reused the shared staged reduction implementation for analysis and tracing,
+  and promoted transient rewrites to a lossless float32 overlay so repeated
+  stages cannot requantize compact source geometry.
+- Ran the 256-aligned, 256-half-offset, and 512-half-offset schedule over the
+  PHercParis4 1024 crop and produced a 2,000-trace output.
+
+## 2026-09-03 - Optional crop no-overtracing
+
+- Added deterministic covered-anchor stopping for crop Fiberlet traces. The
+  opt-in mode leaves beam search unchanged, truncates geometry and cost only at
+  canonical integration, and distinguishes prior accepted coverage from failed
+  seed attempts.
+- Added an absolute inclusive cost-density selector for stored crop traces and
+  online crop acceptance, alongside the existing rank-fraction selector.
+
+## 2026-09-03 - Baseline threshold benchmark
+
+- Tuned absolute stored-trace quality filtering on the ordinary 1024 crop and
+  selected density `0.25`, improving pre-pruning reference accuracy from 80%
+  to 88% while retaining 451 traces.
+- Added a raw-count-derived pre-pruning exact-reference progress plot alongside
+  the existing replay and crop-constraint plots.
+
+## 2026-09-10 - Live-inference reference evaluation plan
+
+- Planned a standalone multi-source, bidirectional evaluator around the existing VC3D beam tracer, using shared reference failure/reset metrics, dynamic inference requests and temporary file-backed accumulation under a model/source-keyed live_inference cache.
+- Planned durable geometry for every trace with optional post-hoc JSON/OBJ/CT-strip inspection, without retracing. Training invocation is a later hook; no GUI live integration.
+- Identified required extensions: current greedy-only replay wrapper, asynchronous trace sessions, shared inference demand mode, coherent chunk/dependency ledger and an explicit global cache-root override. Current forced-mount resolver prevents a host config-only relocation; functional implementation/configuration and GPU validation are not yet complete.
+
+## 2026-09-03 - Optional ambiguity-stopping crop tracing
+
+- Added opt-in pre-commit stopping when a geometrically distinct exact-horizon
+  route is within a configured relative cost-density margin of the selected
+  Fiberlet route, without changing beam expansion or ranking.
+- Added anisotropic route comparison, diagnostics and artifact provenance, and
+  selected margin `0.40` with stored quality threshold `0.21` on the reference
+  crop after a joint sweep. This tuned point reached 24/24 exact estimates at
+  oracle round zero and remains disabled by default.
+## 2026-09-11 — Communication grace for cooperative training
+
+- Log real manager communication errors, retry with retained identity, allow60s
+  adaptive work before safe-boundary pause and resume after ownership reconciliation.
+  Exclusive calibration may finish its current authorized size offline; new workers
+  still require manager confirmation. No wire fields changed.
+## 2026-09-11 — Actual-forward visualization
+
+- Initial and periodic train/test rendering share bounded detached forward-result
+  capture. Removed broker visualization fetch and repeated augmentation/forward.
+  CPU sheets survive test resize; conditioned panels show actual zero/random
+  queries. Reusable no-argument visualization suite: 20 passed, 2 GPU skips.
+# Saved-test analysis — 2026-09-11
+
+- Committed measured native/inference/integration state (75013f6cc, a238c4598, 175e3645b), then audited all100 saved full-cap8 traces without rerunning. Mean failure-ended reference span3.427927mm; per-scroll/collection counts, terminal handling, historical4.048877mm corpus reliability and reproducible calculation in docs/trace_restart_analysis_20260911.md/.json/.py.
+# 2026-09-13 — Embedding consistency diagnostic
+
+- Added manager-exclusive GT embedding overlap/blend diagnostic and reproducible
+  report (docs/embedding_consistency_20260913.md). Ten-fiber pilot found excellent
+  tile consistency but substantial high-similarity off-GT controls. Tracer
+  integration remains the next task pending review; training resumed unchanged.
+## 2026-09-13 — Experimental embedding appearance memories
+
+- Added opt-in windowed medoids, no-expiry LRU anchors and whole-path spherical
+  appearance summaries, sharing native cosine/EMA infrastructure. Added bounded
+  admission, aggregation controls, tests and per-family refinement harness.
+  Initial windowed/LRU sweeps do not beat EMA69; further evaluation ongoing.
+  See docs/embedding_multi_anchor_20260913.md; defaults unchanged.
+## 2026-09-14 — Many-fiber CT and presence strips
+
+- Inline inspection now downsamples to two base voxels/pixel, labels CT sampling,
+  aligns dense sections to inverse traced-strip positions, and pairs old-end/new-start
+  restart sections. Selection now excludes extrapolated tails and actual Lasagna CP
+  spans for tracing, reference prefetch and rendering; per-fiber metrics pool eligible
+  runs without counting excluded jumps. Original line arcs and per-run links retained.
+- Reuse approved no-argument native replay test runner (JSON configuration) and
+  existing Classic evaluation runner; no ad-hoc environment-prefixed test commands.
+
+- Extended inline replay-set rendering with presence top/side reference/traced
+  views, shared restart-aware overview layout, remote CT base-pyramid support,
+  and source/page/component metadata. Existing tracing defaults unchanged.
+- Isolated native build and synthetic offline/remote/live-readiness tests;
+  usage and limitations: docs/batched_trace_strips.md.
+# 2026-09-14 traced-strip labels
+
+Fixed missing restart IDs in traced CT/presence top/side strips; label committed
+old/new endpoints Rn-/Rn+ after raster assembly. Evaluation metrics unchanged.
+# 2026-09-14 restart episode statistics
+
+Reported restarts now group retries less than80 base voxels apart; all means and
+quantiles use episode partitions. Preserve visual events. CPU-only cached full
+evaluation/reporting modes added; Classic rerun complete, current32000 matched
+rerun blocked on missing cache. Results: docs/benchmarks/restart_episodes80_20260914.md.
+# 2026-09-14 — thickness-only replay tolerance and workspace builds
+
+- Added shared excursion return window and independently specified ellipse
+  thickness/width; compared Classic and EMA99u1800 over all50 fibers.
+- Results: Classic510→292 restarts, EMA99 334→174; full metrics in
+  docs/benchmarks/thickness40_grace160_20260914.md.
+- Reusable no-argument native build now writes inside workspace;21native and
+  136Python regressions pass. No new dependency installation.
+# 2026-09-14 — fresh current EMA99 update5200
+
+- Frozen current EMA99u5200/samples665600, full50-fiber current40/80/grace160
+  protocol:148restarts,20.937888mm mean vs prioru1800 174/19.400077.
+- Full matched per-scroll/combined scores and commands in
+  docs/benchmarks/eligible_ema99_u5200_20260914.md. No tracer/training changes.
+# 2026-09-14 — aggregate mean denominator override
+
+- Report combined directed distance/(reported restarts+1), replacing the
+  aggregate restarts+directed-runs denominator. Actual segments/quantiles intact.
+- Corrected current-protocol three-model table and JSON:
+  docs/benchmarks/combined_restart_mean_20260914.md. No tracing rerun.
+# 2026-09-14 — EMA99u5200 current-policy visualization
+
+- Inspection frame/metadata now use actual ellipse factor;40/80 supported.
+- Full50fibers/180galleries complete under eligible_ema99_u5200_vis_20260914_v1.
+  Exact replay/metric parity with prior nonvisual run; per-fiber index and worst
+  fiber/case ranking saved.22native+138Python tests passed.
+
+# 2026-09-14: embedding sweep paused for cooperative GPU work
+
+Previous embedding refinement task: confirmed best 64 restarts on frozen EMA99
+update6500 versus 87 without embeddings. Completed mechanism/refinement reports
+are in docs/embedding_refinement_summary_20260914.md. Boundary sweep stopped on
+user request after eight families and partial ninth; preserved report under
+`/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_anchor_boundaries_20260914_v1/`.
+Partial support-softmin 67 has not received the final exact-repeat stage.
+# 2026-09-16 Corrected mini5 reference
+
+Versioned user-corrected piece000 and reran weighted4 fiberlet mini5 with vis.
+One restart per case remains; other four replay results exactly unchanged.
+Corrected CP-bounded extent1485.5vs900base voxels. See benchmark report
+`../docs/benchmarks/mini5_corrected_weighted_i4_20260916.md`.
+# 2026-09-16 Merge/split single-case benchmark
+
+Frozen corrected mini5case000 with separate neighboring-fiber hypothesis and
+native CP-bounded geometric profiles. One-case weighted4 baseline reproduces
+exactly. Evidence supports approach/separation and trace switching; physical
+identity remains unconfirmed. Global-assignment experiments not yet implemented.
+
+## 2026-09-17 — Fiberlet graph retuning retained production defaults
+
+- Added a hash-bound, attempt-preserving graph replay sweep behind the approved
+  evaluation runner and tested beam width, step and lookahead on corrected mini5.
+- All 42 completed unique settings retained 5 failures/100% coverage; the best
+  first-failure shift was only +22.762 base voxels, below the +160 promotion gate.
+  One fine-step/long-lookahead candidate timed out and was retained for audit.
+- Kept beam16/step48/lookahead384 and skipped short200 promotion. Full matrix and
+  reproduction details: `../docs/benchmarks/fiberlet_graph_retuning_u22000_20260917.md`.
+
+## 2026-09-17 — Fiberlet construction-DP retuning retained production defaults
+
+- Added strict semantic `fiberlet.path` configuration and a hash-bound,
+  attempt-preserving path-construction sweep behind the approved runner.
+- Tested 25 lattice/reach/objective settings on corrected mini5. Longitudinal4 /
+  transverse0.25 improved summed first-failure progress by +157.169 base voxels
+  but retained all5 failures and missed the locked +160 promotion threshold.
+- Kept the existing construction defaults and skipped short200. Complete results:
+  `../docs/benchmarks/fiberlet_construction_dp_retuning_u22000_20260917.md`.
+
+## 2026-09-17 — Full-resolution demand evaluation completed
+
+- Replaced large POSIX shared-memory GPU result slots with one reusable direct
+  regular-file mmap ring after host-wide shared-memory pressure caused all eight
+  GPU workers to SIGBUS during output copies. Inputs retain their smaller POSIX
+  shared-memory ring; no staged arrays, per-tile files or explicit fsyncs were
+  introduced.
+- Sized the lazily committed hot accumulator arena to the measured live set
+  (163,840 records / 720-GiB virtual capacity), retaining the reusable unbounded
+  spill arena only as a correctness fallback.
+- Completed the native-resolution best-EMA999 five-scroll evaluation: 180/180
+  directions, 127 restart episodes, 53.653-mm combined mean and 8.922-mm median.
+  Native 23/85/17 and Python 283 tests pass (8 skipped). Full provenance and
+  per-scroll metrics:
+  `../docs/benchmarks/fullres_refinement_213753_best_ema999_20260917.md`.
+
+## 2026-09-17 — Live evaluation GPU ownership is demand-scoped
+
+- Removed eager outer GPU grants from ordinary `pilot`/`full` evaluation while
+  retaining fixed grants for bounded profile/fit/audit and short-failure modes.
+- Managed setup now resolves numerical identity without CUDA; gated workers
+  validate precision only after authorization. Warm cached tracing/rendering
+  acquires no GPU, while missing tiles retain the existing 30-second idle
+  release and reacquisition behavior. Exclusive grants still reject unmanaged
+  external CUDA processes before worker authorization.
+- Native 23/85/17 and Python 286 tests pass (8 skipped); no evaluation rerun or
+  cache/numerical identity change.
+## 2026-09-18 — Parallel visualization resume and full-resolution short200 review
+
+- Restored concurrent same-source rich gallery rendering and selected saved-path
+  background prefetch for interrupted visualization resume; retained 135/180
+  existing full-evaluation galleries unchanged.
+- Evaluated/rendered all 200 locked short-failure pieces with best full-resolution
+  EMA999 using the existing named inference cache: 56 restarts, 11.615611 mm
+  mean, 237.084 s end-to-end. Review index and all 200 galleries are complete.
+
+## 2026-09-18 — Ground-truth review copy of short200
+
+- Published an independent 200-annotation review draft of the locked v3 short
+  benchmark, with rewritten local bindings and immutable per-case source
+  provenance. Large extraction scratch remains only in the unchanged source.
+- Removed visually rejected rendered case 147 (piece
+  `148_c34b34ef89821e48c871`) from the active draft and retained its annotation,
+  original manifest, and hashed evidence in recoverable review archives.
+
+## 2026-09-18 — Full-resolution short200 fiberlet evaluation and review
+
+- Completed all 200 immutable short-failure pieces with bounded-width-64
+  fiberlet replay and the full-resolution best EMA999 cache: 60 restart
+  episodes over 662.089848 mm, with zero route-state-limit cases.
+- Compared against the matched beam result (56 episodes): fiberlets improved 20
+  pieces, worsened 23, and newly failed on 17 formerly failure-free pieces.
+- Added resumable rendering directly from saved beam or fiberlet artifacts,
+  without inference or retracing, and indexed complete galleries for all 200
+  fiberlet pieces. Render-only resume now preserves trace and summary artifacts.
+- Full case mapping and review paths:
+  `../docs/benchmarks/short200_fullres_fiberlet_vs_beam_20260918.md`.
+# 2026-09-21 — Full hard-region failure union
+
+- Added the quota-free, model-agnostic union extraction plan for full-resolution,
+  Classic and best output-stride-4 evaluations. It exports GT-only pieces with
+  500-base-voxel context, deduplicates nearby intervals, audits full-resolution
+  cache coverage and prepares stable VC3D channel links.
+
+# 2026-09-22 — Portable failure-piece cache manifests
+
+- Export inference.lasagna.json and inference.json beside the channel Zarrs for
+  all five physical scrolls, including the Paris4 subset. Preserve source base
+  dimensions and scale; validate all relative array bindings. Approved runner
+  supports --export-manifests-only to refresh metadata without inference.
+# 2026-09-23
+
+## 2026-09-24 — Tracer cost and initial classification audit
+
+- Added optional dense forward-step cost capture with exact historical trace
+  verification, plus analysis joining existing reference-removal labels to
+  piece-local total/mean/max costs. All3retraces match; no BP rerun.
+- Current reverse2048removed pieces have median density0.401vs0.247retained,
+  max-step median0.760vs0.580. Matched Classic/new1024initial winding defect
+  fractions14.05%vs7.89%. Reports and per-piece data in
+  `volume-cartographer/docs/fiber_benchmark_runs/2026-09-24-tracer-cost-removal.md`.
+
+- Tested reverse-consistency winding BP at500/1000/5000updates with fixed
+  normal/orientation preprocessing: unchanged38.46%reference accuracy and full
+  ladder; all unconverged. Added optional winding-only iteration limit with
+  unchanged defaults and29passing CLI tests. Results and reproduction in
+  `volume-cartographer/docs/fiber_benchmark_runs/2026-09-23-reverse-consistency-message-limits.md`.
+
+- Added manager-owned, SHA-256-bound snapshot imports and required stable
+  external model identifiers for new inference runs.
+## 2026-09-27 — Finite winding-step audit and parameter search
+
+- Checkpoint before tuning: `dd8c1331e`. New candidates use finite physical
+  winding-step costs, not hard continuation equality or flat break penalties.
+- Corrected downstream diagnostics: positive finite steps are charged, not
+  reported as removed connections. Zero-cost edges retain absent-factor behavior.
+- Added default-off local normalized-MAP decode repair and default-preserving
+  continuation defect-mass ablations. Decoder keeps calibration/gauges/supports
+  fixed and can restore defects, but objective improvement is not accuracy.
+- Reproducible screening skips only reference-assisted solves, validated against
+  full initial ladders. All trials/provenance retained in
+  `volume-cartographer/docs/fiber_benchmark_runs/2026-09-27-winding-step-search.*`.
+- Native122 and Python26 tests pass.48completed trials; best finite initial
+  accuracy26.92% versus legacy38.46%, no candidate promoted. Remaining runs
+  blocked intermittently by md0 filesystem transaction waits. Latest status
+  table: `2026-09-27-winding-step-search-status.md`; task remains incomplete.
+## 2026-09-30 — Integrate training, extraction and crop experiments
+
+- Merge villa's fiber-exps4 (29ff06409) and villa2's fiber-exps
+  (29b2eb56f) into eval-fiber-extraction, then branch as fiber-exp5.
+- Keep extraction task documents and combine durable changelog histories.
+  Retain both independent native replay test additions; production code merges
+  automatically. Update the DDP statistics test mock for short/long embeddings.
+- Workspace RelWithDebInfo build and native replay/tracing/reference tests
+  pass (23/86/22), plus four coordinate-contract CLI tests. No extraction or
+  evaluation rerun; source worktrees and untracked artifacts left untouched.
+- Focused Python suites: 430 passed, 38 skipped, two expected failures;
+  short/long embedding mock corrected after initial regression detection.
+
+# 2026-09-30 — Online Gaussian orientation refinement
+
+- Added opt-in, persistent modulo-pi rotation of anisotropic Gaussian fiber
+  targets during online refinement. Rotation uses equal-radius presence probes,
+  a capped angular update, and a weak tether to the immutable Lasagna normal;
+  legacy geometry-only refinement archives migrate to zero rotation.
+- Prepared the stopped full-resolution Gaussian run to resume from its update
+  18,000 full checkpoint with half-width sigmas and managed GPUs 0-5, leaving
+  GPUs 6-7 reserved.
+- Split Gaussian presence supervision into independently normalized ridge,
+  within-support distribution-negative, and background terms while preserving
+  the prior aggregate loss scale; hardened partial distributed test waves with
+  reference-counted padded-sample leases.
+
+# 2026-10-01 — Gaussian sideband supervision and live cross-sections
+
+- Added opt-in Lasagna-normal-oriented left/right negative sidebands outside
+  dense Gaussian fiber support. The two sides are independently globally
+  normalized and participate in the existing target-counted single-backward
+  training path.
+- Reused deterministic test forwards to publish raw-model aligned presence
+  cross-section mean and q0.1 TIFF/TensorBoard images. Central mean-crop
+  Gaussian fits now report RMSE and normal/width sigma multiples relative to
+  the configured supervised target.
+- Replaced the stopped half-sigma refinement run with a managed GPUs-0-5 resume
+  using 64x16-base sideband half-extents and 0.1 total sideband weight.
+## 2026-10-01 — Training-integrated reviewed failure test
+
+- Locked the union of failures from five canonical reviewed evaluations as a
+  32-piece/64-direction regression cohort. Ordinary training tests and the
+  optimized live-inference/native trace test now use the same SHA-validated
+  subset and report directional restart counts plus implied mean lengths.
+
+## 2026-09-30 — Reviewed-reference three-model tracing comparison
+
+- Froze 91 reviewed annotations from the 2026-09-30 cohort and reused the
+  fast beam/on-demand inference benchmark: 97 eligible runs/194 directions and
+  686.127 mm reference length; one all-Lasagna annotation was excluded.
+- Lowres 212757 best EMA999: 28 restarts/47.319 mm; previous fullres 213753:
+  30/44.266 mm; Gaussian u17700: 32/41.583 mm. No infrastructure failures.
+- Shared readers accept reviewed v4 object control points and validated editor
+  hints without changing reference geometry. Full provenance is in
+  `docs/benchmarks/reviewed_fibers_20260930.*`.
+
+## 2026-09-30 — Corrected approved-reference rerun
+
+- All 91 reference annotations are approved with zero Lasagna spans: 91 pieces,
+  182 directions, and 693.088 mm reference length.
+- With the same models/cache/protocol on GPUs 0-5: lowres 29 restarts/46.206 mm,
+  previous fullres 36/37.464 mm, and Gaussian u17700 32/42.005 mm. Exact results
+  are in `docs/benchmarks/reviewed_fibers_corrected_20260930.*`.
+
+## 2026-10-02 — Allocation-safe training maintenance
+
+- Made periodic reviewed-trace requests durable across cooperative GPU cohort
+  release/replacement. Attempts are tied to exact manager ownership, use exact
+  granted GPU UUIDs, stage output atomically, and are reaped/retried when a
+  manager allocation changes instead of crashing training or retaining GPUs.
+# 2026-10-05: baked held-out test copy
+
+- Preserved the existing32 reviewed test pieces and geometry; baked71,165 native
+  VC3D corrected normal labels and inherited full-parent H/V (one correction).
+  Annotated training configs use the new copy; original data remains unchanged.
+# 2026-10-05: correct normal supervision
+
+- Normal head now shares direction's Gaussian tube/segment assignment and
+  falloff normalization, including axis projection weighting. Log unweighted
+  normal MSE for comparison with direction; total still applies configured weight.
+# 2026-10-07: Older neural FW/BW comparisons
+
+Completed matched unfiltered and full-prefix FW/BW evaluations for Memory and Flowv4 on91 reviewed fibers/182directions, original checkpoint policies preserved through hash-verified historical runtime. Min512 errors6→1 and23→1, but coverage77.053→48.426% and85.831→61.773%. Own tuned EMA999u12100 without FW remains0errors/82.086%/233pieces. No promotion. Full metrics, historical comparisons, per-scroll results and reproduction instructions: `docs/benchmarks/neural_follow_reverse_20261007.md` and companion JSON. Validation149native/38Python tests.

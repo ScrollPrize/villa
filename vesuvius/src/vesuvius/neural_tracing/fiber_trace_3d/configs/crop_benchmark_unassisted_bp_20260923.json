@@ -1,0 +1,66 @@
+{
+  "output_root": "/ephemeral/hendrik/fiber_crop_bench/20260923_v1",
+  "reference_dir": "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+  "input_files": [
+    "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd1-7ff0ce6c/artifacts/PHercParis4-20260411134726-las-sd1-7ff0ce6c.lasagna.json",
+    "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json"
+  ],
+  "commands": [
+    {
+      "name": "bp-classic-unassisted-q021",
+      "binary": "vc_fiber_trace_chunk",
+      "args": [
+        "direction-ablation",
+        "/ephemeral/hendrik/fiber_crop_bench/20260923_v1/crop-trace-classic.zarr",
+        "--normal-manifest",
+        "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+        "--output",
+        "/ephemeral/hendrik/fiber_crop_bench/20260923_v1/bp-classic-unassisted-q021",
+        "--direction-dominance",
+        "0.9",
+        "--piece-length",
+        "512",
+        "--bp-only",
+        "--bp-inference",
+        "sum-product-mixed",
+        "--quality-threshold",
+        "0.21",
+        "--winding-fixed-orientation",
+        "--reference-fiber-dir",
+        "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+        "--reference-fiber-tag",
+        "hendrik_crop1",
+        "--threads",
+        "128"
+      ]
+    },
+    {
+      "name": "bp-7ff0ce6c-unassisted-q021",
+      "binary": "vc_fiber_trace_chunk",
+      "args": [
+        "direction-ablation",
+        "/ephemeral/hendrik/fiber_crop_bench/20260923_v1/crop-trace-7ff0ce6c.zarr",
+        "--normal-manifest",
+        "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+        "--output",
+        "/ephemeral/hendrik/fiber_crop_bench/20260923_v1/bp-7ff0ce6c-unassisted-q021",
+        "--direction-dominance",
+        "0.9",
+        "--piece-length",
+        "512",
+        "--bp-only",
+        "--bp-inference",
+        "sum-product-mixed",
+        "--quality-threshold",
+        "0.21",
+        "--winding-fixed-orientation",
+        "--reference-fiber-dir",
+        "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+        "--reference-fiber-tag",
+        "hendrik_crop1",
+        "--threads",
+        "128"
+      ]
+    }
+  ]
+}

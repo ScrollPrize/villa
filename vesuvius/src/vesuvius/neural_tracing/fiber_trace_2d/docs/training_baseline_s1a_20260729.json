@@ -1,0 +1,216 @@
+{
+  "event_start_unix_seconds": 1785311413.9869123,
+  "elapsed_origin": "first event (excludes process startup before writer creation)",
+  "threshold": 1,
+  "first_threshold_crossing": null,
+  "best_test": {
+    "step": 17700,
+    "wall_time": 1785361698.3238058,
+    "value": 1.0175694227218628,
+    "elapsed_seconds": 50284.3368935585
+  },
+  "last_test": {
+    "step": 19200,
+    "wall_time": 1785366803.43311,
+    "value": 1.1535800695419312,
+    "elapsed_seconds": 55389.446197748184
+  },
+  "config": {
+    "_config_dir": ".",
+    "augment_anisotropic_blur_orientation": "fiber",
+    "augment_anisotropic_blur_probability": 0.5,
+    "augment_anisotropic_blur_roll_degrees": 0,
+    "augment_anisotropic_blur_sigma_across": 0.25,
+    "augment_anisotropic_blur_sigma_along": 1.5,
+    "augment_blur_sigma": 0.5,
+    "augment_brightness": 0.25,
+    "augment_contrast_max": 2,
+    "augment_contrast_min": 0.5,
+    "augment_enabled": true,
+    "augment_flip_probability": 0.5,
+    "augment_gamma_max": 2,
+    "augment_gamma_min": 0.5,
+    "augment_noise_std": 0.125,
+    "augment_rotation_degrees": 180,
+    "augment_scale_max": 1.1,
+    "augment_scale_min": 0.9,
+    "augment_shift_zyx": [
+      32,
+      32,
+      32
+    ],
+    "augment_smooth_displacement_amplitude_zyx": [
+      2,
+      2,
+      2
+    ],
+    "augment_smooth_displacement_control_spacing_zyx": [
+      16,
+      16,
+      16
+    ],
+    "augment_smooth_displacement_mode": "3d",
+    "augment_smooth_displacement_probability": 0.5,
+    "batch_size": 8,
+    "cp_margin_voxels": 4,
+    "datasets": [
+      {
+        "base_volume_path": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+        "base_volume_scale": 1,
+        "fiber_glob": "/ephemeral/hendrik/fiber3d_train/data/fiber_vols/fibers_s1a_*.nml",
+        "transform": [
+          [
+            -0.23841071793061291,
+            -0.19362400462393486,
+            0.0021338753748049444,
+            11024.043667710986
+          ],
+          [
+            -0.19369582314244563,
+            0.23850010646891293,
+            -0.003964264465841007,
+            2861.834433287773
+          ],
+          [
+            -0.0008390736081137979,
+            0.004538179336261518,
+            0.30657436617414124,
+            -9057.070809768327
+          ]
+        ],
+        "transform_invert": true
+      }
+    ],
+    "image_normalization": "zscore",
+    "model_3d": {
+      "conditioned_decoder_enabled": false,
+      "decoder_upsample_mode": "pixelshuffle",
+      "direction_branch_count": 1,
+      "input_channels": 1,
+      "normalization": "batch",
+      "output_channels": 7,
+      "squeeze_excitation": false,
+      "unet_base_channels": 16,
+      "unet_depth": 5
+    },
+    "patch_shape_zyx": [
+      128,
+      128,
+      128
+    ],
+    "prefetch_sampler_workers": 8,
+    "prefetch_workers": 64,
+    "presence_radius_voxels": 2,
+    "round_source_to_chunk_boundaries": true,
+    "seed": 0,
+    "test_datasets": [
+      {
+        "base_volume_path": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+        "base_volume_scale": 1,
+        "fiber_glob": "/ephemeral/hendrik/fiber3d_train/data/test/*.json"
+      }
+    ],
+    "training": {
+      "checkpoint_interval": 100,
+      "device": "auto",
+      "direction_weight": 10,
+      "kept_snapshot_interval": 10000,
+      "learning_rate": 0.01,
+      "loader_prefetch_factor": 2,
+      "loader_worker_device": "cpu",
+      "loader_workers": 8,
+      "max_steps": 10000000,
+      "mixed_precision": "bf16",
+      "presence_weight": 1,
+      "run_name": "s1a_128_1_single_8x8",
+      "run_path": "/ephemeral/hendrik/fiber3d_train/runs",
+      "sample_vis_interval": 500,
+      "scalar_log_interval": 100,
+      "tensorboard_enabled": true,
+      "test_control_points": 0,
+      "test_interval": 100,
+      "test_start_sample_index": 0,
+      "test_trace2cp_block_context_voxels": 4,
+      "test_trace2cp_control_points": 0,
+      "test_trace2cp_enabled": false,
+      "test_trace2cp_patch_shape_hw": [
+        128,
+        128
+      ],
+      "test_trace2cp_presence_enabled": true,
+      "test_trace2cp_rf_margin_px": null,
+      "test_trace2cp_start_sample_index": 0,
+      "test_trace2cp_step_px": 4,
+      "test_trace2cp_strip_z_offset_count": 1,
+      "test_trace2cp_strip_z_offset_step": 1,
+      "test_trace2cp_tile_shape_hw": [
+        128,
+        128
+      ]
+    },
+    "volume_cache_dir": "/ephemeral/hendrik/fiber3d_train/chunk_cache",
+    "volume_cache_memory_mib": null
+  },
+  "timing_sample_filter": "logged steps > 100; not every-step measurements",
+  "timing_ms": {
+    "timing/load_ms": {
+      "count": 191,
+      "mean": 508.4655853990485,
+      "median": 52.607261657714844,
+      "p95": 295.5735626220703,
+      "min": 34.5712776184082,
+      "max": 18744.123046875
+    },
+    "timing/load_wait_ms": {
+      "count": 191,
+      "mean": 459.4101399437607,
+      "median": 0.23433846235275269,
+      "p95": 237.43965911865234,
+      "min": 0.13464409112930298,
+      "max": 18714.83984375
+    },
+    "timing/batch_to_device_ms": {
+      "count": 191,
+      "mean": 44.50128346587975,
+      "median": 44.601531982421875,
+      "p95": 57.223052978515625,
+      "min": 25.320505142211914,
+      "max": 62.71601104736328
+    },
+    "timing/target_ms": {
+      "count": 191,
+      "mean": 4.554159334192725,
+      "median": 4.436193943023682,
+      "p95": 5.391348361968994,
+      "min": 3.3403756618499756,
+      "max": 14.42236042022705
+    },
+    "timing/fw_bw_step_ms": {
+      "count": 191,
+      "mean": 2103.0019708603463,
+      "median": 502.36224365234375,
+      "p95": 10030.57763671875,
+      "min": 444.3564453125,
+      "max": 17573.943359375
+    }
+  },
+  "paired_train_to_test_gap_seconds": {
+    "count": 192,
+    "mean": 58.11088211834431,
+    "median": 53.31759715080261,
+    "p95": 56.61825177669525,
+    "min": 51.36361813545227,
+    "max": 553.5861206054688
+  },
+  "paired_train_to_test_gap_sum_seconds": 11157.289366722107,
+  "gap_caveat": "Approximate rank-0 timestamp gaps; includes logging and scheduling. Do not sum sparse per-step timers to infer total training time.",
+  "event_file": "/ephemeral/hendrik/fiber3d_train/runs/s1a_128_1_single_8x8_20260729_075013/events.out.tfevents.1785311413.inst-tgqtu-nat-rdma-pool.901125.0",
+  "best_within_first_hour": {
+    "step": 1200,
+    "wall_time": 1785314902.3137386,
+    "value": 1.8865118026733398,
+    "elapsed_seconds": 3488.3268263339996
+  },
+  "analysis_code_revision": "b218ace879d3239a63047e1e2039f327929d283e (plus uncommitted analysis tooling)",
+  "reference_checkpoint_sha256": "cdc31509d5d01c97ae4b42baf453feb0fd6698097c83f97b8867da6323cf44f2"
+}

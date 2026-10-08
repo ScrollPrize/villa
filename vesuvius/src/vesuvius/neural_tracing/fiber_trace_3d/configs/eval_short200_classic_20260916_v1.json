@@ -1,0 +1,18 @@
+{
+  "benchmark_manifest": "/ephemeral/hendrik/fiber3d_train2/evaluations/short_failures_200_20260916_v3/manifest.json",
+  "cached_evaluation": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_thickness40_grace160_20260914_v2/full",
+  "checkpoint": "/home/hendrik/runs/s1a_128_1_single_8x8_20260801_084232/snapshots/best91_5k.pt",
+  "checkpoint_sha256": "f389da7914a6da34506f92204bf5441964e96599339dfe79dfc9c48b67165e17",
+  "output_root": "/ephemeral/hendrik/fiber3d_train2/evaluations/short200_classic_20260916_v1",
+  "native_binary": "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_metric",
+  "devices": "0,1,2,3,4,5,6,7",
+  "benchmark_workers": 128,
+  "gpu_manager": {
+    "enabled": true,
+    "exclusive": true,
+    "priority": 100,
+    "cpu_cores": 128,
+    "vram_bytes_per_gpu": 62277025792,
+    "label": "short200-classic"
+  }
+}

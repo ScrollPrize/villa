@@ -1,0 +1,50 @@
+{
+  "benchmark_manifest": "/ephemeral/hendrik/fiber3d_train2/evaluations/short_failures_200_20260916_v3/manifest.json",
+  "cached_evaluation": "/ephemeral/hendrik/fiber3d_train2/evaluations/fullres_refinement_213753_best_ema999_vis_20260917_v1/full",
+  "checkpoint": "/ephemeral/hendrik/fiber3d_train2/evaluations/fullres_refinement_213753_best_ema999_off_20260917_v1/frozen/live_inference/_models/5ec278f71b15b27187b55805310176fe2fa3b00c5264fc528b95bc6d0690206e/snapshot.pt",
+  "checkpoint_sha256": "5ec278f71b15b27187b55805310176fe2fa3b00c5264fc528b95bc6d0690206e",
+  "output_root": "/ephemeral/hendrik/fiber3d_train2/evaluations/short200_skeleton_centre_t160_20260919_v1",
+  "native_binary": "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_metric",
+  "devices": "0,1,2,3,4,5,6,7",
+  "benchmark_workers": 224,
+  "gpu_manager": {
+    "enabled": true,
+    "exclusive": true,
+    "priority": 100,
+    "cpu_cores": 224,
+    "vram_bytes_per_gpu": 62277025792,
+    "label": "short200-skeleton"
+  },
+  "backend": "skeleton",
+  "scroll_sequential": true,
+  "render": false,
+  "log_construction_chunks": false,
+  "skeleton": {
+    "tube_radius_base": 32,
+    "crop_margin_base": 16,
+    "threshold_u8": 160,
+    "min_component_voxels": 8,
+    "junction_merge_max_base": 64,
+    "spur_prune_max_base": 32,
+    "entry_offset_base": 32,
+    "step_base": 8,
+    "nominal_step_base": 48,
+    "weights": {
+      "normal": 0.1,
+      "tangent": 10.0,
+      "isotropic": 2.0,
+      "spacing": 1.0
+    },
+    "choice": {
+      "max_ports": 64
+    },
+    "solver": {
+      "max_iterations": 2000,
+      "function_tolerance": 1e-06
+    },
+    "workers": 16,
+    "route_through_centre": true,
+    "lookahead_length_base": 256,
+    "beam_width": 16
+  }
+}

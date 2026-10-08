@@ -1,0 +1,102 @@
+{
+  "output_root": "/ephemeral/hendrik/fiber_crop_bench/20260923_qual_v1",
+  "reference_dir": "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+  "input_files": [
+    "/home/hendrik/test_datasets/2026-09-23_quals_fibers/Paris4_EXTENDED_min10_L0.vc3d.json",
+    "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json"
+  ],
+  "commands": [
+    {
+      "name": "qual-import",
+      "binary": "vc_fiber_trace_chunk",
+      "args": [
+        "trace",
+        "/home/hendrik/test_datasets/2026-09-23_quals_fibers/Paris4_EXTENDED_min10_L0.vc3d.json",
+        "--trace-tracer",
+        "imported",
+        "--normal-manifest",
+        "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+        "--bbox",
+        "10240",
+        "22016",
+        "6144",
+        "11264",
+        "23040",
+        "7168",
+        "--threads",
+        "128",
+        "--output",
+        "/ephemeral/hendrik/fiber_crop_bench/20260923_qual_v1/qual-crop.zarr",
+        "--obj",
+        "/ephemeral/hendrik/fiber_crop_bench/20260923_qual_v1/qual-crop.obj"
+      ]
+    },
+    {
+      "name": "qual-replay",
+      "binary": "vc_fiber_trace_chunk",
+      "args": [
+        "reference-replay-benchmark",
+        "-",
+        "--replay-tracer",
+        "precomputed",
+        "--candidate-fibers",
+        "/home/hendrik/test_datasets/2026-09-23_quals_fibers/Paris4_EXTENDED_min10_L0.vc3d.json",
+        "--normal-manifest",
+        "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+        "--bbox",
+        "10240",
+        "22016",
+        "6144",
+        "11264",
+        "23040",
+        "7168",
+        "--threads",
+        "128",
+        "--reference-fiber-dir",
+        "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+        "--reference-fiber-tag",
+        "hendrik_crop1",
+        "--base-voxel-size-um",
+        "2.4",
+        "--output",
+        "/ephemeral/hendrik/fiber_crop_bench/20260923_qual_v1/qual-replay.json"
+      ]
+    },
+    {
+      "name": "qual-bp",
+      "binary": "vc_fiber_trace_chunk",
+      "args": [
+        "direction-ablation",
+        "/ephemeral/hendrik/fiber_crop_bench/20260923_qual_v1/qual-crop.zarr",
+        "--normal-manifest",
+        "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+        "--output",
+        "/ephemeral/hendrik/fiber_crop_bench/20260923_qual_v1/qual-bp",
+        "--direction-dominance",
+        "0.9",
+        "--piece-length",
+        "512",
+        "--bp-only",
+        "--bp-inference",
+        "sum-product-mixed",
+        "--winding-fixed-orientation",
+        "--winding-max-candidate-states",
+        "32000000",
+        "--reference-prune-offenders",
+        "--reference-prune-policy",
+        "oracle-inliers",
+        "--reference-oracle-magnitude-weight",
+        "1",
+        "--reference-oracle-accept-message-limit",
+        "--reference-oracle-rounds",
+        "1",
+        "--reference-fiber-dir",
+        "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+        "--reference-fiber-tag",
+        "hendrik_crop1",
+        "--threads",
+        "128"
+      ]
+    }
+  ]
+}

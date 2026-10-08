@@ -27,6 +27,12 @@ development is based around the docs in the planning/ subdir
 
 # some details on execution
 
+- Continue an authorized implementation/performance task through the requested
+  outcome, measurements and validation. A pilot result or status report is not
+  a stopping condition. Keep working until the task is genuinely complete or
+  a blocker requires user input/authority that cannot be resolved in scope.
+  Reuse the approved benchmark runner; do not repeatedly request new entrypoints.
+
 - Deviations from the plan but also findings (successes and failures) should be logged in planning/task_log.md.
 - Any simplification, partial implementation, deferred item, unsupported case,
   or intentionally skipped requirement must be reported explicitly in

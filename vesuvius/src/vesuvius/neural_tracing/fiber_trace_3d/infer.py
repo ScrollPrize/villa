@@ -138,9 +138,12 @@ def _checkpoint_provenance(path: str | Path | None, config: dict[str, Any]) -> d
         "metric_value": scalar(top.get("metric")),
         "architecture": model.get("architecture") if isinstance(model, dict) else None,
         "output_schema": {
-            key: model[key] for key in (
+            **({"annotations": config["annotations"], "annotation_products_exported": False}
+               if config.get("annotations") else {}),
+            **{key: model[key] for key in (
                 "output_channels", "direction_branch_count", "conditioned_decoder_enabled",
-            ) if isinstance(model, dict) and key in model
+                "output_stride",
+            ) if isinstance(model, dict) and key in model},
         },
     }
 
@@ -268,6 +271,7 @@ def _resolve_inference_precision(
     *,
     checkpoint: str | Path | None,
     devices: tuple[torch.device, ...],
+    validate_devices: bool = True,
 ) -> tuple[str, str]:
     from vesuvius.neural_tracing.fiber_trace_3d.train import (
         _mixed_precision_config_from_training,
@@ -299,6 +303,11 @@ def _resolve_inference_precision(
 
     if mode == "auto":
         mode = "off"
+    if not validate_devices:
+        # Live demand inference establishes numerical/cache identity before it
+        # has (or needs) a GPU grant. The gated worker validates this resolved
+        # policy against its authorized device before constructing the model.
+        return mode, source
     try:
         for selected in devices:
             if selected.type == "cuda":

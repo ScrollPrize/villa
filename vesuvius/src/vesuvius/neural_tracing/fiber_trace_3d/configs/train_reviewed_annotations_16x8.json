@@ -1,0 +1,208 @@
+{
+  "sampling_strategy": "scroll_balanced_arclength",
+  "augment_anisotropic_blur_orientation": "fiber",
+  "augment_anisotropic_blur_probability": 0.5,
+  "augment_anisotropic_blur_roll_degrees": 0,
+  "augment_anisotropic_blur_sigma_across": 0.25,
+  "augment_anisotropic_blur_sigma_along": 1.5,
+  "augment_blur_sigma": 0.5,
+  "augment_brightness": 0.25,
+  "augment_contrast_max": 2,
+  "augment_contrast_min": 0.5,
+  "augment_enabled": true,
+  "augment_flip_probability": 0.5,
+  "augment_gamma_max": 2,
+  "augment_gamma_min": 0.5,
+  "augment_noise_std": 0.125,
+  "augment_rotation_degrees": 180,
+  "augment_scale_max": 1.1,
+  "augment_scale_min": 0.9,
+  "augment_shift_zyx": [
+    32,
+    32,
+    32
+  ],
+  "augment_smooth_displacement_amplitude_zyx": [
+    2,
+    2,
+    2
+  ],
+  "augment_smooth_displacement_control_spacing_zyx": [
+    16,
+    16,
+    16
+  ],
+  "augment_smooth_displacement_mode": "3d",
+  "augment_smooth_displacement_probability": 0.5,
+  "batch_size": 16,
+  "cp_margin_voxels": 4,
+  "datasets": [
+    {
+      "base_volume_path": "s3://vesuvius-challenge-open-data/PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr",
+      "base_volume_scale": 1,
+      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-10-05_reviewed_annotators_124643/train/PHerc0139/*.json",
+      "scroll_id": "PHerc0139",
+      "dense_supervision": true
+    },
+    {
+      "base_volume_path": "s3://vesuvius-challenge-open-data/PHerc1299/volumes/20260309130042-2.399um-0.2m-78keV-masked.zarr",
+      "base_volume_scale": 1,
+      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-10-05_reviewed_annotators_124643/train/PHerc1299/*.json",
+      "scroll_id": "PHerc1299",
+      "dense_supervision": true
+    },
+    {
+      "base_volume_path": "s3://vesuvius-challenge-open-data/PHerc1451/volumes/20260319101107-2.399um-0.2m-78keV-masked.zarr",
+      "base_volume_scale": 1,
+      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-10-05_reviewed_annotators_124643/train/PHerc1451/*.json",
+      "scroll_id": "PHerc1451",
+      "dense_supervision": true
+    }
+  ],
+  "image_normalization": "zscore",
+  "model_3d": {
+    "conditioned_decoder_enabled": false,
+    "decoder_upsample_mode": "pixelshuffle",
+    "direction_branch_count": 1,
+    "input_channels": 1,
+    "normalization": "group",
+    "output_channels": 7,
+    "squeeze_excitation": false,
+    "unet_base_channels": 16,
+    "unet_depth": 5,
+    "output_stride": 1
+  },
+  "patch_shape_zyx": [
+    128,
+    128,
+    128
+  ],
+  "prefetch_sampler_workers": 8,
+  "prefetch_workers": 64,
+  "presence_radius_voxels": 1,
+  "presence_target_mode": "anisotropic_gaussian",
+  "presence_gaussian_width_ratio": 4,
+  "presence_gaussian_truncate_sigma": 3,
+  "presence_sideband_weight": 1,
+  "presence_sideband_half_width_base": 64,
+  "presence_sideband_half_height_base": 16,
+  "round_source_to_chunk_boundaries": true,
+  "seed": 0,
+  "test_datasets": [
+    {
+      "base_volume_path": "s3://vesuvius-challenge-open-data/PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr",
+      "base_volume_scale": 1,
+      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-10-05_reviewed_failure_union_baked_v1/test/PHerc0139/*.json",
+      "scroll_id": "PHerc0139",
+      "dense_supervision": true,
+      "lasagna_manifest_path": "embedding_normals/PHerc0139.lasagna.json",
+      "fiber_manifest_path": "/ephemeral/hendrik/fiber3d_train/2026-10-05_reviewed_failure_union_baked_v1/manifest.json",
+      "fiber_manifest_expected_total": 32,
+      "fiber_manifest_collection": "PHerc0139"
+    },
+    {
+      "base_volume_path": "s3://vesuvius-challenge-open-data/PHerc1299/volumes/20260309130042-2.399um-0.2m-78keV-masked.zarr",
+      "base_volume_scale": 1,
+      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-10-05_reviewed_failure_union_baked_v1/test/PHerc1299/*.json",
+      "scroll_id": "PHerc1299",
+      "dense_supervision": true,
+      "lasagna_manifest_path": "embedding_normals/PHerc1299.lasagna.json",
+      "fiber_manifest_path": "/ephemeral/hendrik/fiber3d_train/2026-10-05_reviewed_failure_union_baked_v1/manifest.json",
+      "fiber_manifest_expected_total": 32,
+      "fiber_manifest_collection": "PHerc1299"
+    },
+    {
+      "base_volume_path": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+      "base_volume_scale": 1,
+      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-10-05_reviewed_failure_union_baked_v1/test/PHercParis4/*.json",
+      "scroll_id": "PHercParis4",
+      "dense_supervision": true,
+      "lasagna_manifest_path": "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+      "fiber_manifest_path": "/ephemeral/hendrik/fiber3d_train/2026-10-05_reviewed_failure_union_baked_v1/manifest.json",
+      "fiber_manifest_expected_total": 32,
+      "fiber_manifest_collection": "PHercParis4"
+    }
+  ],
+  "training": {
+    "checkpoint_interval": 100,
+    "device": "auto",
+    "direction_weight": 10,
+    "kept_snapshot_interval": 10000,
+    "learning_rate": 0.01,
+    "loader_prefetch_factor": 2,
+    "loader_worker_device": "cpu",
+    "loader_workers": 8,
+    "max_steps": 2000000,
+    "mixed_precision": "bf16",
+    "presence_weight": 1,
+    "run_name": "reviewed_normal_width_hv_fullres_128_sd1_bs128_ema",
+    "run_path": "/ephemeral/hendrik/fiber3d_train2/runs",
+    "sample_vis_interval": 500,
+    "scalar_log_interval": 100,
+    "tensorboard_enabled": true,
+    "learning_rate_warmup_steps": 100,
+    "gradient_clip_max_norm": null,
+    "initialization_seed": 0,
+    "optimizer_global_batch_size": 128,
+    "compile_mode": "off",
+    "sync_batchnorm": false,
+    "ddp_broadcast_buffers": false,
+    "profile_enabled": false,
+    "sample_pipeline_workers": 128,
+    "sample_pipeline_load_affinity_workers": 87,
+    "sample_pipeline_slots": 2048,
+    "sample_pipeline_initial_in_flight": 128,
+    "sample_pipeline_cuda_prefetch_depth": 2,
+    "sample_pipeline_cuda_value_augmentation": "all",
+    "ema_decays": [
+      0.99,
+      0.999
+    ],
+    "bounded_gradient_accumulation": true,
+    "test_control_points": 0,
+    "test_interval": 100,
+    "test_cross_section_vis_interval": 100,
+    "test_cross_section_width_base": 160,
+    "test_cross_section_height_base": 80,
+    "test_cross_section_histogram_bins": 256,
+    "test_start_sample_index": 0,
+    "test_trace2cp_block_context_voxels": 4,
+    "test_trace2cp_control_points": 0,
+    "test_trace2cp_enabled": false,
+    "test_trace2cp_patch_shape_hw": [
+      128,
+      128
+    ],
+    "test_trace2cp_presence_enabled": true,
+    "test_trace2cp_rf_margin_px": null,
+    "test_trace2cp_start_sample_index": 0,
+    "test_trace2cp_step_px": 4,
+    "test_trace2cp_strip_z_offset_count": 1,
+    "test_trace2cp_strip_z_offset_step": 1,
+    "test_trace2cp_tile_shape_hw": [
+      128,
+      128
+    ],
+    "reviewed_trace_test": {
+      "interval": 100,
+      "template": "/home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_reviewed_failure_training_v1.json",
+      "split_root": "/ephemeral/hendrik/fiber3d_train/2026-10-05_reviewed_failure_union_baked_v1",
+      "native_binary": "/home/hendrik/villa/volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_metric",
+      "runner": "/home/hendrik/villa/vesuvius/scripts/run_classic_fiber_evaluation.py"
+    }
+  },
+  "volume_cache_dir": "/ephemeral/hendrik/fiber3d_train/chunk_cache",
+  "volume_cache_memory_mib": null,
+  "embedding": {
+    "enabled": false
+  },
+  "_config_dir": "/home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs",
+  "refinement": {
+    "enabled": false
+  },
+  "annotations": {
+    "normal_weight": 10,
+    "width_weight": 0.01,
+    "hv_weight": 0.01
+  }
+}

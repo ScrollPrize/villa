@@ -1,0 +1,26 @@
+{
+  "output_root": "/ephemeral/hendrik/fiber_crop_bench/20260923_qual_v1",
+  "reference_dir": "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+  "commands": [
+    {
+      "name": "qual-test_fiber_reference_replay_benchmark",
+      "binary": "test_fiber_reference_replay_benchmark",
+      "args": []
+    },
+    {
+      "name": "qual-test_fiberlet_crop_trace",
+      "binary": "test_fiberlet_crop_trace",
+      "args": []
+    },
+    {
+      "name": "qual-test_fiber_trace3d",
+      "binary": "test_fiber_trace3d",
+      "args": []
+    },
+    {
+      "name": "qual-test_fiber_replay",
+      "binary": "test_fiber_replay",
+      "args": []
+    }
+  ]
+}

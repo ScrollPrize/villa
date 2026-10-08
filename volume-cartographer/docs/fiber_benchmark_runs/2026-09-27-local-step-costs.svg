@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="304">
+<rect width="100%" height="100%" fill="white"/>
+<g font-family="sans-serif" font-size="12"><text x="10" y="20">Local BP costs — removal score (blue; nearer zero better), independent accuracy (green), conditioned accuracy (orange)</text>
+<text x="10" y="48">legacy</text>
+<rect x="310" y="38" width="33.669824427578135" height="10" fill="#4575b4"/>
+<text x="615" y="48">-110.6766%</text>
+<rect x="730" y="38" width="76.92307692307692" height="10" fill="#16855b"/>
+<text x="940" y="48">38.4615%</text>
+<rect x="1020" y="38" width="200.0" height="10" fill="#dc8431"/>
+<text x="1240" y="48">100.0000%</text>
+<text x="10" y="74">local-parallel</text>
+<rect x="310" y="64" width="27.53221722273306" height="10" fill="#4575b4"/>
+<text x="615" y="74">-90.5016%</text>
+<rect x="730" y="64" width="30.76923076923077" height="10" fill="#16855b"/>
+<text x="940" y="74">15.3846%</text>
+<rect x="1020" y="64" width="115.38461538461539" height="10" fill="#dc8431"/>
+<text x="1240" y="74">57.6923%</text>
+<text x="10" y="100">local-orthogonal</text>
+<rect x="310" y="90" width="22.751656135398008" height="10" fill="#4575b4"/>
+<text x="615" y="100">-74.7873%</text>
+<rect x="730" y="90" width="23.076923076923077" height="10" fill="#16855b"/>
+<text x="940" y="100">11.5385%</text>
+<rect x="1020" y="90" width="69.23076923076923" height="10" fill="#dc8431"/>
+<text x="1240" y="100">34.6154%</text>
+<text x="10" y="126">orthogonal-d10-c0p1-distance</text>
+<rect x="310" y="116" width="300.0" height="10" fill="#4575b4"/>
+<text x="615" y="126">-986.1347%</text>
+<rect x="730" y="116" width="15.384615384615385" height="10" fill="#16855b"/>
+<text x="940" y="126">7.6923%</text>
+<rect x="1020" y="116" width="69.23076923076923" height="10" fill="#dc8431"/>
+<text x="1240" y="126">34.6154%</text>
+<text x="10" y="152">orthogonal-d10-c1-distance</text>
+<rect x="310" y="142" width="81.62505003767495" height="10" fill="#4575b4"/>
+<text x="615" y="152">-268.3110%</text>
+<rect x="730" y="142" width="23.076923076923077" height="10" fill="#16855b"/>
+<text x="940" y="152">11.5385%</text>
+<rect x="1020" y="142" width="84.61538461538461" height="10" fill="#dc8431"/>
+<text x="1240" y="152">42.3077%</text>
+<text x="10" y="178">orthogonal-d10-c10</text>
+<rect x="310" y="168" width="6.286300995898988" height="10" fill="#4575b4"/>
+<text x="615" y="178">-20.6638%</text>
+<rect x="730" y="168" width="15.384615384615385" height="10" fill="#16855b"/>
+<text x="940" y="178">7.6923%</text>
+<rect x="1020" y="168" width="84.61538461538461" height="10" fill="#dc8431"/>
+<text x="1240" y="178">42.3077%</text>
+<text x="10" y="204">orthogonal-d10-c10-distance</text>
+<rect x="310" y="194" width="6.701810165747375" height="10" fill="#4575b4"/>
+<text x="615" y="204">-22.0296%</text>
+<rect x="730" y="194" width="23.076923076923077" height="10" fill="#16855b"/>
+<text x="940" y="204">11.5385%</text>
+<rect x="1020" y="194" width="69.23076923076923" height="10" fill="#dc8431"/>
+<text x="1240" y="204">34.6154%</text>
+<text x="10" y="230">orthogonal-d10-c100-distance</text>
+<rect x="310" y="220" width="6.289013133885589" height="10" fill="#4575b4"/>
+<text x="615" y="230">-20.6727%</text>
+<rect x="730" y="220" width="15.384615384615385" height="10" fill="#16855b"/>
+<text x="940" y="230">7.6923%</text>
+<rect x="1020" y="220" width="84.61538461538461" height="10" fill="#dc8431"/>
+<text x="1240" y="230">42.3077%</text>
+<text x="10" y="256">orthogonal-d10-chard</text>
+<rect x="310" y="246" width="6.640889355435177" height="10" fill="#4575b4"/>
+<text x="615" y="256">-21.8294%</text>
+<rect x="730" y="246" width="15.384615384615385" height="10" fill="#16855b"/>
+<text x="940" y="256">7.6923%</text>
+<rect x="1020" y="246" width="84.61538461538461" height="10" fill="#dc8431"/>
+<text x="1240" y="256">42.3077%</text>
+</g></svg>

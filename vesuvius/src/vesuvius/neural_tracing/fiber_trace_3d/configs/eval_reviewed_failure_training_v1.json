@@ -1,0 +1,147 @@
+{
+  "catalog_path": "/ephemeral/hendrik/fiber3d_train2/latest50_eval/catalog.json",
+  "checkpoint": "TRAINING_REPLACES_CHECKPOINT",
+  "checkpoint_sha256": "TRAINING_REPLACES_CHECKPOINT_SHA256",
+  "devices": "0,1,2,3,4,5",
+  "evaluation": {
+    "error_threshold_base_voxels": 40,
+    "excursion_grace_base_voxels": 160,
+    "gpu_manager": {
+      "cpu_cores": 192,
+      "devices": "0,1,2,3,4,5",
+      "enabled": false,
+      "exclusive": true,
+      "label": "training-reviewed-failure-v1",
+      "priority": 100,
+      "vram_bytes_per_gpu": 62277025792
+    },
+    "inference": {
+      "accumulator_dtype": "float16",
+      "accumulator_hot_slots": 114688,
+      "accumulator_layout": "chunk-major",
+      "accumulator_spill_segment_slots": 2048,
+      "accumulator_workers": 128,
+      "border": 32,
+      "chunk_size": 64,
+      "compressor": "blosc-zstd",
+      "emit_embeddings": false,
+      "flush_workers": 128,
+      "input_decode_threads": 8,
+      "input_io_threads": 64,
+      "input_slots": 96,
+      "input_workers": 128,
+      "max_batch_size": 4,
+      "overlap": 96,
+      "precision": "bf16",
+      "request_timeout_seconds": 3600,
+      "result_slots": 32,
+      "scaledown_power": 0,
+      "slots_per_gpu": 1,
+      "tile_size": 256
+    },
+    "inference_cache_namespace": "training-reviewed-failure-v1",
+    "match_refine_steps": 1,
+    "render": false,
+    "tangential_threshold_factor": 2,
+    "trace_args": [
+      "--threads",
+      "1",
+      "--beam-width",
+      "8",
+      "--beam-lookahead-steps",
+      "2",
+      "--step-voxels",
+      "4",
+      "--smoothness-normal-weight",
+      "0.1",
+      "--smoothness-tangent-weight",
+      "10",
+      "--embedding-weight",
+      "0"
+    ],
+    "version": 1,
+    "workers": 128
+  },
+  "native_binary": "/home/hendrik/villa/volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_metric",
+  "output_root": "TRAINING_REPLACES_OUTPUT_ROOT",
+  "pilot_devices": "0,1,2,3,4,5",
+  "pilot_source_id": "PHerc0139",
+  "profile": {
+    "accumulator_layout": "chunk-major",
+    "accumulator_os_metrics": true,
+    "accumulator_prefault": false,
+    "cprofile": false,
+    "gpu_seconds_per_shape": 10,
+    "output_root": "/ephemeral/hendrik/fiber3d_train2/evaluations/inference_profiles",
+    "pipeline_seconds": 40,
+    "reader_responsiveness_probe": false,
+    "result_slots": 128,
+    "source_id": "PHerc0139",
+    "warmup_max_seconds": 120
+  },
+  "sources": [
+    {
+      "expected_test_count": 22,
+      "id": "PHerc0139",
+      "input_level": 1,
+      "input_volume": "s3://vesuvius-challenge-open-data/PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr",
+      "normal": {
+        "kind": "catalogue",
+        "selector": "atlas:20260419180421@L2"
+      },
+      "sample_id": "PHerc0139",
+      "volume_id": "20260102150214"
+    },
+    {
+      "expected_test_count": 1,
+      "id": "PHerc0332",
+      "input_level": 1,
+      "input_volume": "s3://vesuvius-challenge-open-data/PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr",
+      "normal": {
+        "kind": "catalogue",
+        "selector": "atlas:20260419180421@L2"
+      },
+      "sample_id": "PHerc0332",
+      "volume_id": "20251211183505"
+    },
+    {
+      "expected_test_count": 11,
+      "id": "PHerc1299",
+      "input_level": 1,
+      "input_volume": "s3://vesuvius-challenge-open-data/PHerc1299/volumes/20260309130042-2.399um-0.2m-78keV-masked.zarr",
+      "normal": {
+        "kind": "catalogue",
+        "selector": "atlas:20260419180421@L2"
+      },
+      "sample_id": "PHerc1299",
+      "volume_id": "20260309130042"
+    },
+    {
+      "expected_test_count": 1,
+      "id": "PHerc1451",
+      "input_level": 1,
+      "input_volume": "s3://vesuvius-challenge-open-data/PHerc1451/volumes/20260319101107-2.399um-0.2m-78keV-masked.zarr",
+      "normal": {
+        "kind": "catalogue",
+        "selector": "atlas:20260419180421@L2"
+      },
+      "sample_id": "PHerc1451",
+      "volume_id": "20260319101107"
+    },
+    {
+      "expected_test_count": 56,
+      "id": "PHercParis4",
+      "input_level": 1,
+      "input_volume": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+      "normal": {
+        "kind": "manager-run",
+        "selector": "PHercParis4-20260411134726-las-sd2-5b17ff6c"
+      },
+      "sample_id": "PHercParis4",
+      "volume_id": "20260411134726"
+    }
+  ],
+  "split": "test",
+  "split_root": "/home/hendrik/data/2026-10-01_reviewed_failure_union_v1",
+  "version": 1
+}

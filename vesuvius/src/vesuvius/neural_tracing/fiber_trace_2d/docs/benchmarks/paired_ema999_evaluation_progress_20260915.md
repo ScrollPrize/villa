@@ -1,0 +1,21 @@
+# Paired EMA999 evaluation log
+
+New task2026-09-15. Previous final non-embedding u11800 completed and committed53e8ac64e; mergeafb14b400. Workspace clean at start.
+
+Located current and best EMA999 files in stopped paired-contrastive run snapshots. Best accumulator verified in embedding_refinement_summary_20260914.md: ordinary mean novelty-LRU K2/spacing512/weight.10/novelty.10/nearest/no EMA mix (64 tuning restarts vs69 plain EMA). Explicitly communicated interpretation; no retuning. Full50fiber eval only, rendering disabled. Both members of each snapshot pair emit embedding volumes to share inference and differ only in tracing policy.
+
+Independent plan/config review approved; confirmed shared cache parameters and no accidental LRU expiry. Frozen current: u42000/samples5376000/test_ema_0p999/loss_total1.7221921650205905/SHA7ee3f7c19d12188a297b87c7ab02dde0de01792dcea97e4c691384240cc17a15. Best: u10800/samples1382400/loss.8968509409684858/SHA440d8689455023b03993b1f1c8aa5cf47e0b7f02f4523104b85ab6114e8e9dcf. Both embedding16/local_contrastive/paired_patches=true. Configs pinned to frozen copies in respective off output roots; tuned uses same copy. Best means validation total loss, not trace evaluation.
+
+Current/off publication tail: user asked why Python CPU and native low utilization. At~840s no input/GPU work, ~1700publication jobs queued/128active, ~80trace waiters. Pipeline includes separate overlap accumulators, threaded NumPy finalization/compression/Zarr publication then ready notification. _sync_published currently fsyncs each channel file and parent (19channels =>38calls/spatialchunk); not yet profiled to attribute publication cost. Native live mode permits32active cases, singlethread per fiber, releases permits while waiting. Read-only inspection only; no performance changes made during comparison.
+
+Follow-up live /proc thread sample (5.259s, PID2521250):6.871cores total=.783user+6.087system.728threads, dominant futex waits plus filename_create/do_rmdir/wait_transaction_locked/jbd2_log_wait_commit. gdb attachment denied by ptrace policy; cannot uniquely attribute futex waits to GIL. Code inspection: _atomic_zarr_write creates temporary Zarr directory, copies metadata, opens/writes Zarr, renames chunk and removes temp directory per channel. Strong filesystem/locking overhead evidence; no claim of GIL-only bottleneck. Repeated fsyncs implement crash durability, not live-reader visibility. Findings reported; no changes authorized by these questions.
+
+User deferred publication improvements; note future direct chunk writes and grouped channel files with coherent readiness. Keep implementation unchanged now.
+
+Current/off completed all180cases/50fibers,6867.627253mm:205restarts/33.337996mm mean/5.190990median/.199544P05/87.838812P95; native wall1057.094750s. Outer manager task1dd5366c-cd1f-4d20-8f6f-1cbc223dff9a finished completed after publication/shutdown tail. Full six-model global/per-scroll comparison saved docs/benchmarks/paired_ema999_current_off_20260915.{md,json}. Main regression0332=77 vs4previous finalu11800.
+
+Next current/tuned launched via same approved full runner, manager550f6f62-fd5f-4a84-be46-5a8d5a9a0657; exclusive all8 grant confirmed after off release. Existing embedding/presence/normal cache reuse confirmed. Session8059 active. Best/off and best/tuned prepared/validated but not yet launched. User requested interim full table while next run runs; reporting this partial matrix explicitly.
+
+Current/tuned finished exit0, all180cases, matched6867.627253mm.208restarts/32.859461mean/5.020876median/.198012P05/87.771672P95. Native wall309.850135s; reused cache with extra off-path inference. Scroll restart counts59/81/10/0/58 vs off60/77/10/0/58 (0139/0332/1299/1451/Paris4). Equal-scroll normalized31.020111vs31.228526off. Saved full seven-model global/per-scroll comparison in docs/benchmarks/paired_ema999_current_comparison_20260915.{md,json}.
+
+Per user request started next best/off u10800 with approved full runner, session36174. New snapshot-specific cache bc33c45d07886f524241857f47cf87dcca960f6d218bf635834dd7595225fdcd; all8manager-exclusive, cache initialization confirmed. Best/tuned remains pending. No publication changes made.

@@ -1,0 +1,425 @@
+{
+  "remote_auth_probe": {
+    "url": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+    "timeout_seconds": 60
+  },
+  "embedding_milestone": {
+    "step": 5400,
+    "checkpoint": "/ephemeral/hendrik/fiber3d_train2/runs/combined_5scroll_s1a_paired_contrastive_128_sd1_16x8_ema_20260913_174112/snapshots/current.pt",
+    "training_identity": "/ephemeral/hendrik/fiber3d_train2/runs/.launches/combined_5scroll_s1a_paired_contrastive_128_sd1_16x8_ema-20260913_174110/controller.json",
+    "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_paired_step5400_20260913",
+    "baseline": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_route_analysis_20260913_v3/report.json"
+  },
+  "embedding_trace_sweep": {
+    "pilot": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_reference_20260913_v1",
+    "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_remaining_adaptive_refine_20260914_v1",
+    "fill_missing": true,
+    "gpu_manager": {
+      "exclusive": false,
+      "priority": 0,
+      "cpu_cores": 16,
+      "vram_bytes_per_gpu": 21474836480,
+      "label": "embedding-method-comparison"
+    },
+    "native_binary": "/home/hendrik/villa/volume-cartographer/build/dev-quickbuild-gcc/bin/vc_fiber_trace_metric",
+    "controls_only": true,
+    "refine": [
+      {
+        "label": "anchors-transfer",
+        "seed": {
+          "anchors": 2,
+          "count": 64,
+          "ema_mix": 0.9,
+          "falloff": "uniform",
+          "half_life": 128,
+          "mode": "anchors",
+          "spacing": 256,
+          "weight": 0.1,
+          "window": 1024
+        },
+        "axes": {
+          "spacing": [
+            192,
+            256,
+            384,
+            512,
+            768,
+            1024
+          ],
+          "anchors": [
+            1,
+            2,
+            4,
+            8
+          ],
+          "weight": [
+            0.1,
+            0.25,
+            0.5
+          ]
+        },
+        "neighbor_weight": true
+      },
+      {
+        "label": "normalized-mean-novel",
+        "seed": {
+          "mode": "anchors-lru",
+          "aggregation": "normalized-mean",
+          "anchors": 2,
+          "weight": 0.1,
+          "novelty": 0.1,
+          "touch": "nearest",
+          "spacing": 512,
+          "window": 4096,
+          "count": 8,
+          "falloff": "uniform",
+          "ema_mix": 0
+        },
+        "axes": {
+          "weight": [
+            0.05,
+            0.1,
+            0.25,
+            0.5
+          ],
+          "spacing": [
+            32,
+            128,
+            512,
+            1024,
+            2048
+          ],
+          "anchors": [
+            1,
+            2,
+            4,
+            8
+          ],
+          "novelty": [
+            0,
+            0.1,
+            0.2
+          ]
+        },
+        "neighbor_weight": true
+      },
+      {
+        "label": "normalized-mean-plain",
+        "seed": {
+          "mode": "anchors-lru",
+          "aggregation": "normalized-mean",
+          "anchors": 4,
+          "weight": 0.3,
+          "novelty": 0,
+          "touch": "nearest",
+          "spacing": 512,
+          "window": 4096,
+          "count": 8,
+          "falloff": "uniform",
+          "ema_mix": 0
+        },
+        "axes": {
+          "weight": [
+            0.05,
+            0.1,
+            0.25,
+            0.5
+          ],
+          "spacing": [
+            32,
+            128,
+            512,
+            1024,
+            2048
+          ],
+          "anchors": [
+            1,
+            2,
+            4,
+            8
+          ],
+          "novelty": [
+            0,
+            0.1,
+            0.2
+          ]
+        },
+        "neighbor_weight": true
+      },
+      {
+        "label": "normalized-mean-hit",
+        "seed": {
+          "mode": "anchors-lru",
+          "aggregation": "normalized-mean",
+          "anchors": 2,
+          "weight": 0.1,
+          "novelty": 0.1,
+          "touch": "hit",
+          "spacing": 512,
+          "window": 4096,
+          "count": 8,
+          "falloff": "uniform",
+          "ema_mix": 0
+        },
+        "axes": {
+          "weight": [
+            0.05,
+            0.1,
+            0.25,
+            0.5
+          ],
+          "spacing": [
+            32,
+            128,
+            512,
+            1024,
+            2048
+          ],
+          "anchors": [
+            1,
+            2,
+            4,
+            8
+          ],
+          "novelty": [
+            0,
+            0.1,
+            0.2
+          ]
+        },
+        "neighbor_weight": true
+      }
+    ]
+  },
+  "embedding_route_analysis": {
+    "pilot": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_trace_paired_current_20260913_v2",
+    "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_route_paired_current_20260913_v2",
+    "native_binary": "/home/hendrik/villa/volume-cartographer/build/dev-quickbuild-gcc/bin/vc_fiber_trace_metric"
+  },
+  "embedding_trace_pilot": {
+    "checkpoint": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_reference_20260913_v1-frozen/live_inference/_models/0a2651b711e7e5ee6d445ac8c68ff482c1951798ced2f44896c25602e1c50417/snapshot.pt",
+    "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_reference_20260913_v1",
+    "resume": false,
+    "prepared_config": "/ephemeral/hendrik/fiber3d_train2/evaluations/collection_182306_best11k_full256_b8_20260912_v1/full.json",
+    "native_binary": "/home/hendrik/villa/volume-cartographer/build/dev-quickbuild-gcc/bin/vc_fiber_trace_metric",
+    "source_id": "PHerc1229",
+    "weights": [
+      0,
+      0.25
+    ],
+    "devices": "0",
+    "fiber": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910/test/PHerc1229/lt_20260825T075316065_000069.json",
+    "gpu_manager": {
+      "enabled": true,
+      "exclusive": false,
+      "priority": 0,
+      "cpu_cores": 16,
+      "vram_bytes_per_gpu": 21474836480,
+      "label": "embedding-trace-pilot"
+    }
+  },
+  "embedding_consistency": {
+    "checkpoint": "/ephemeral/hendrik/fiber3d_train2/runs/combined_5scroll_s1a_contrastive_128_sd1_16x8_ema_20260913_121417/snapshots/current.pt",
+    "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_consistency_20260913_contrastive_v1",
+    "template": "/home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_collection_182306_best11k_full.json",
+    "cache_root": "/ephemeral/hendrik/fiber3d_train/chunk_cache",
+    "tile": 256,
+    "overlap": 64,
+    "border": 16,
+    "chunk": 32,
+    "fibers_per_scroll": 2,
+    "spacing_input": 2,
+    "length_input": 256
+  },
+  "stage": "repro00_modern_oldtest",
+  "config": "vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/repro00_modern_oldtest.json",
+  "devices": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "timeout_seconds": 14400,
+  "evaluation": {
+    "name": "modern-current-evaluation",
+    "config": "vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_16x8.json",
+    "checkpoint": "/ephemeral/hendrik/fiber3d_train2/reproduction/runs/repro00_modern_oldtest_20260912_101739/snapshots/current.pt",
+    "batch_size": 16,
+    "samples": 128,
+    "overrides": {}
+  },
+  "comparison": {
+    "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/nml_json_combined_20260912",
+    "s1a_raw_evaluation": "/ephemeral/hendrik/fiber3d_train2/evaluations/compare_s1a_600k_best_raw_20260912",
+    "template": "vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_collection_182306_best11k_full.json",
+    "stages": [
+      {
+        "name": "s1a_600k",
+        "config": "vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_ema_16x8.json",
+        "existing_run": "/ephemeral/hendrik/fiber3d_train2/runs/s1a_nml_128_sd1_16x8_ema_20260912_111221",
+        "variants": [
+          "ema"
+        ]
+      },
+      {
+        "name": "json_600k",
+        "config": "vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_compare_5scroll_ema_600k.json",
+        "variants": [
+          "raw",
+          "ema"
+        ]
+      },
+      {
+        "name": "combined_500k",
+        "config": "vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_compare_5scroll_s1a_ema_500k.json",
+        "variants": [
+          "raw",
+          "ema"
+        ]
+      }
+    ]
+  },
+  "trace_evaluation": {
+    "run": "/ephemeral/hendrik/fiber3d_train2/runs/s1a_nml_128_sd1_16x8_ema_20260912_111221",
+    "variant": "raw",
+    "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/compare_s1a_600k_best_raw_20260912",
+    "template": "vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_collection_182306_best11k_full.json"
+  },
+  "production_stop": {
+    "launch": "/ephemeral/hendrik/fiber3d_train2/runs/.launches/finetune_5scroll_s1a_128_sd1_16x8_ema_lr0001-20260912_223739",
+    "samples": 6336000
+  },
+  "comparison_followup": {
+    "launch": "/ephemeral/hendrik/fiber3d_train2/runs/.launches/compare_5scroll_s1a_128_sd1_16x8_ema_500k-20260912_155840",
+    "parent_run": "/ephemeral/hendrik/fiber3d_train2/runs/compare_5scroll_s1a_128_sd1_16x8_ema_500k_20260912_142427",
+    "max_samples": 601600,
+    "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/combined_600k_20260912",
+    "template": "vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_collection_182306_best11k_full.json",
+    "continuation_config": "/ephemeral/hendrik/fiber3d_train2/comparisons/nml_json_combined_20260912/continuation_config.json"
+  },
+  "production": {
+    "config": "/home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_reviewed_annotations_16x8.json",
+    "cuda_visible_devices": "0,1,2,3,4,5"
+  },
+  "trace_series": {
+    "launch": "/ephemeral/hendrik/fiber3d_train2/runs/.launches/5scroll_json_eligible_fullres_refinement_gaussian_halfsigma_sideband1_reviewed32_128_sd1_16x8_ema-20261003_222618",
+    "run": "/ephemeral/hendrik/fiber3d_train2/runs/5scroll_json_eligible_fullres_refinement_gaussian_halfsigma_sideband1_reviewed32_128_sd1_16x8_ema_20261003_222625",
+    "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/sideband1_222625_seven_20261005",
+    "variants": [
+      "best_trace",
+      "best",
+      "current",
+      "best99",
+      "current99",
+      "best999",
+      "current999"
+    ],
+    "expected_training_state": "alive",
+    "template": ".fiber_eval_active.json",
+    "report_baselines": false,
+    "baselines": [
+      {
+        "name": "Classic",
+        "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_full_dynamic256_b8_20260911_v3_heap"
+      },
+      {
+        "name": "NML raw 600k",
+        "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/compare_s1a_600k_best_raw_20260912"
+      },
+      {
+        "name": "NML EMA 600k",
+        "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/nml_json_combined_20260912/s1a_600k_ema"
+      },
+      {
+        "name": "JSON raw 600k",
+        "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/nml_json_combined_20260912/json_600k_raw"
+      },
+      {
+        "name": "JSON EMA 600k",
+        "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/nml_json_combined_20260912/json_600k_ema"
+      },
+      {
+        "name": "Combined raw 600k",
+        "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/combined_600k_20260912/raw"
+      },
+      {
+        "name": "Combined EMA 600k",
+        "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/combined_600k_20260912/ema"
+      },
+      {
+        "name": "Early current999",
+        "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/combined_three_ema_20260912/current999"
+      },
+      {
+        "name": "Early best999",
+        "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/combined_three_ema_20260912/best999"
+      },
+      {
+        "name": "Early best99",
+        "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/combined_three_ema_20260912/best99"
+      },
+      {
+        "name": "Best EMA99",
+        "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/combined_best_pair_20260912_19m/best99-retry1"
+      },
+      {
+        "name": "Best EMA999",
+        "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/combined_best_pair_20260912_19m/best999"
+      },
+      {
+        "name": "Previous current999",
+        "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/combined_current_three_20260912_26m/current999"
+      },
+      {
+        "name": "Previous current99",
+        "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/combined_current_three_20260912_26m/current99"
+      },
+      {
+        "name": "Previous raw",
+        "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/combined_current_three_20260912_26m/current"
+      },
+      {
+        "name": "Finetune current999",
+        "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/finetune_four_20260913/current999"
+      },
+      {
+        "name": "Finetune current99",
+        "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/finetune_four_20260913/current99"
+      },
+      {
+        "name": "Finetune current",
+        "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/finetune_four_20260913/current"
+      },
+      {
+        "name": "Finetune best",
+        "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/finetune_four_20260913/best"
+      }
+    ]
+  },
+  "cross_section_series": {
+    "config": "vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_5scroll_json_eligible_fullres_refinement_ema_16x8.json",
+    "run": "/ephemeral/hendrik/fiber3d_train2/runs/5scroll_json_eligible_fullres_refinement_gaussian_halfsigma_128_sd1_16x8_ema_20260930_155818",
+    "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/cross_sections_gaussian_halfsigma_20261001_v3",
+    "variants": [
+      "best.pt",
+      "current.pt",
+      "best_ema_0p99.pt",
+      "current_ema_0p99.pt",
+      "best_ema_0p999.pt",
+      "current_ema_0p999.pt"
+    ],
+    "devices": "all",
+    "samples": 0,
+    "batch_size": 8,
+    "cpu_workers": 128,
+    "timeout_seconds": 7200,
+    "width_base": 160,
+    "height_base": 80,
+    "histogram_bins": 1024,
+    "exceedance_fractions": [0.001, 0.01, 0.1, 0.2, 0.5]
+  }
+}

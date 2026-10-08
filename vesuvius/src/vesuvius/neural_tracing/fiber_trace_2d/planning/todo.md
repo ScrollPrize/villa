@@ -70,7 +70,9 @@
     - trace multiple fibers (greedily)
     - they make mistakes which depend on where they come from - possibly introduce additional randomness
     - optimize sets of fibers for best explanation of the found predictions
-- [ ] threshold/skeletonize fiber preds and explore the multiple discretet options for scoring!
+- [x] threshold/skeletonize fiber preds and explore the multiple discretet options for scoring!
+    - prototype: docs/skeleton_lsq_tracing.md; first result:
+      docs/benchmarks/contrast_case31_skeleton_20260918.md
 - [ ] check training augmentations again
 - [ ] --vis for fiber trace changes the quality?
 - [ ] fiber jsons should from now on save the volume size they are based on (for scale reference)
@@ -86,6 +88,64 @@
 - [ ] beamsearch
 - [ ] short brute-force lookahead
 - [ ] substep evaluation
+- [x] crop tracing: stop committed output at already traced anchors without
+      excluding covered anchors or Fiberlets from beam-search expansion
+- [x] crop tracing: stop on ambiguity when the best genuinely distinct route
+      outside the acceptance ellipse is within a configurable score/cost margin
+      of the selected route
+- [ ] use staged Fiberlet filtering before crop tracing
+    - materialize the transient filtered overlay through the existing staged
+      cache path, without changing the authoritative combined Fiberlet dataset
+    - benchmark graph preparation and tracing separately against the unfiltered
+      crop graph
+    - compare accepted trace count, cost/quality distribution, and resulting
+      geometry before selecting default filtering stages
+- [ ] store sub-fiberlet cost segments so fixed-distance lookahead can score a
+      final partial fiberlet from local evidence instead of proportional
+      average cost
+- [ ] test distance-decayed lookahead costs so farther evidence changes the
+      decision smoothly instead of treating every point in the horizon equally
+
+# joint winding inference
+
+- [x] replace repeated winding BP calibration passes with a default joint
+      adaptive-grid solver while retaining the current alternating solver for
+      comparison
+    - keep aligned-normal sign resolution as independent preprocessing
+    - jointly infer H/V/Mixed, integer winding, global phase/scale, and legal
+      component ladder-order gauges
+    - use an absolute sliding grid in log gain `log(1/scale)` and canonical
+      phase; preserve retained cell identities and shift only under posterior
+      boundary pressure
+    - aggregate all components into one global calibration posterior
+    - run no H/V pre-pass, calibration multi-starts, or BP restarts in the new
+      mode
+    - default to `joint-grid`; expose the current behavior as `alternating`
+    - see `task_plan.md` for the implementation and validation contract
+# fiberlet artifact format
+- [ ] restore the final Fiberlet artifact contract
+    - [ ] write a separate final Fiberlet Zarr instead of treating the
+          temporary `anchors`, `prefix`, and `routes` construction arrays as
+          the published artifact
+    - [ ] make every final spatial chunk self-contained: it must include all
+          anchors, Fiberlet identifiers/index information, complete routes,
+          geometry, and costs needed to read and traverse that chunk without
+          joining it to another Zarr array; duplicate the required information
+          from the temporary construction datasets
+    - [ ] create each self-contained final chunk on the fly when its Fiberlet
+          chunk is written, rather than requiring a second whole-volume
+          conversion pass
+    - [ ] create the final Zarr metadata when processing starts, including an
+          explicit unfinished/partial marker, and atomically mark it complete
+          only after every expected chunk has been published
+    - [ ] use `/` as the Zarr chunk-key dimension separator (`z/y/x`), not `.`
+          (`z.y.x`), and declare that separator explicitly in the array
+          metadata
+    - [ ] allow the final artifact name/path to be selected by the caller;
+          readers, resume handling, provenance, validation, and upload must use
+          the recorded name rather than assuming `fiberlets.zarr`
+    - [ ] make `las_manager fiberlet run` follow the regular inference naming
+          convention by default, using the managed run name for the final
 
 # multidir
 - [ ] test a loss on multi-dir outputs being perpendicular

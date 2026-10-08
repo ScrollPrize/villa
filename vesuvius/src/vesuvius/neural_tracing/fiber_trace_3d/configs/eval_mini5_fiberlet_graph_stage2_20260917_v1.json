@@ -1,0 +1,45 @@
+{
+  "benchmark_manifest": "/ephemeral/hendrik/fiber3d_train2/evaluations/mini5_corrected_weighted_i4_vis_20260916_v3_inputs/manifest.json",
+  "cached_evaluation": "/ephemeral/hendrik/fiber3d_train2/evaluations/refinement_212757_best_ema999_off_20260916_v1/full",
+  "checkpoint": "/ephemeral/hendrik/fiber3d_train2/evaluations/refinement_212757_best_ema999_off_20260916_v1/frozen/live_inference/_models/67edd3a1bde162c7105ee37d849a0f0b60a9b840dd37fc7ff6e17e0c3a2e9742/snapshot.pt",
+  "checkpoint_sha256": "67edd3a1bde162c7105ee37d849a0f0b60a9b840dd37fc7ff6e17e0c3a2e9742",
+  "output_root": "/ephemeral/hendrik/fiber3d_train2/evaluations/mini5_fiberlet_graph_stage2_20260917_v1",
+  "native_binary": "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_metric",
+  "devices": "0,1,2,3,4,5,6,7",
+  "benchmark_workers": 224,
+  "gpu_manager": {
+    "enabled": true,
+    "exclusive": true,
+    "priority": 100,
+    "cpu_cores": 224,
+    "vram_bytes_per_gpu": 62277025792,
+    "label": "mini5-fiberlet-graph-stage2"
+  },
+  "backend": "fiberlet",
+  "fiberlet": {
+    "storage_chunk_side_base": 128,
+    "beam_width": 16,
+    "lookahead_base_voxels": 384,
+    "beam_step_base_voxels": 48,
+    "construction_workers": 224
+  },
+  "fiberlet_sweep": {
+    "variants": [
+      {"name": "prewarm_b16_s048_l384", "warmup": true, "parameters": {"beam_width": 16, "beam_step_base_voxels": 48, "lookahead_base_voxels": 384}},
+      {"name": "baseline_b16_s048_l384", "parameters": {"beam_width": 16, "beam_step_base_voxels": 48, "lookahead_base_voxels": 384}},
+      {"name": "b08_s048_l096", "parameters": {"beam_width": 8, "beam_step_base_voxels": 48, "lookahead_base_voxels": 96}},
+      {"name": "b32_s048_l096", "parameters": {"beam_width": 32, "beam_step_base_voxels": 48, "lookahead_base_voxels": 96}},
+      {"name": "b64_s048_l096", "parameters": {"beam_width": 64, "beam_step_base_voxels": 48, "lookahead_base_voxels": 96}},
+      {"name": "b08_s024_l096", "parameters": {"beam_width": 8, "beam_step_base_voxels": 24, "lookahead_base_voxels": 96}},
+      {"name": "b32_s024_l096", "parameters": {"beam_width": 32, "beam_step_base_voxels": 24, "lookahead_base_voxels": 96}},
+      {"name": "b64_s024_l096", "parameters": {"beam_width": 64, "beam_step_base_voxels": 24, "lookahead_base_voxels": 96}},
+      {"name": "b08_s032_l096", "parameters": {"beam_width": 8, "beam_step_base_voxels": 32, "lookahead_base_voxels": 96}},
+      {"name": "b32_s032_l096", "parameters": {"beam_width": 32, "beam_step_base_voxels": 32, "lookahead_base_voxels": 96}},
+      {"name": "b64_s032_l096", "parameters": {"beam_width": 64, "beam_step_base_voxels": 32, "lookahead_base_voxels": 96}}
+    ]
+  },
+  "candidate_timeout_seconds": 180,
+  "scroll_sequential": true,
+  "log_construction_chunks": false,
+  "render": false
+}

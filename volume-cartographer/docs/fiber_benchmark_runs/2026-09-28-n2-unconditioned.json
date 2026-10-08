@@ -1,0 +1,5447 @@
+{
+  "version": 1,
+  "runs": [
+    {
+      "cohort": {
+        "cross_factors_for_readout_only": 2861,
+        "ordinary_factors": 42102,
+        "ordinary_pieces": 29597,
+        "reference_cross_factors_in_solve": 0,
+        "reference_nodes_in_solve": 0
+      },
+      "cohort_ids_match": true,
+      "conditioned_artifact": "/ephemeral/hendrik/fiber_crop_bench/20260928_reference_neighborhood_v1/n2-d3-c10_reference_neighborhood.json",
+      "conditioned_sha256": "70b87d9e844775fb64d9b832b863e409a23c1878c2553ac4a3d61fded9875da0",
+      "fibers": 548,
+      "full_coverage_gauges": [
+        0
+      ],
+      "independent_percent": null,
+      "ladder_shift_percent": null,
+      "ladder_shifts": null,
+      "metric_unavailable": "multiple independent gauges per reference require explicit reporting",
+      "name": "n2-d3-c10",
+      "per_gauge": [
+        {
+          "correct_references": 4,
+          "gauge": 0,
+          "independent_missing": 0,
+          "independent_percent": 15.384615384615385,
+          "ladder": [
+            {
+              "hard_sign_errors": "19",
+              "reference": "0",
+              "winding": "13"
+            },
+            {
+              "hard_sign_errors": "30",
+              "reference": "0.5",
+              "winding": "12.5"
+            },
+            {
+              "hard_sign_errors": "18",
+              "reference": "1",
+              "winding": "13"
+            },
+            {
+              "hard_sign_errors": "41",
+              "reference": "1.5",
+              "winding": "9"
+            },
+            {
+              "hard_sign_errors": "33",
+              "reference": "2",
+              "winding": "14"
+            },
+            {
+              "hard_sign_errors": "33",
+              "reference": "2.5",
+              "winding": "14"
+            },
+            {
+              "hard_sign_errors": "42",
+              "reference": "3",
+              "winding": "12"
+            },
+            {
+              "hard_sign_errors": "33",
+              "reference": "3.5",
+              "winding": "14"
+            },
+            {
+              "hard_sign_errors": "44",
+              "reference": "4",
+              "winding": "9"
+            },
+            {
+              "hard_sign_errors": "58",
+              "reference": "4.5",
+              "winding": "13"
+            },
+            {
+              "hard_sign_errors": "56",
+              "reference": "5",
+              "winding": "12"
+            },
+            {
+              "hard_sign_errors": "37",
+              "reference": "5.5",
+              "winding": "12.5"
+            },
+            {
+              "hard_sign_errors": "35",
+              "reference": "6",
+              "winding": "12"
+            },
+            {
+              "hard_sign_errors": "41",
+              "reference": "6.5",
+              "winding": "13"
+            },
+            {
+              "hard_sign_errors": "45",
+              "reference": "7",
+              "winding": "13"
+            },
+            {
+              "hard_sign_errors": "55",
+              "reference": "7.5",
+              "winding": "13"
+            },
+            {
+              "hard_sign_errors": "34",
+              "reference": "8",
+              "winding": "12"
+            },
+            {
+              "hard_sign_errors": "38",
+              "reference": "8.5",
+              "winding": "12"
+            },
+            {
+              "hard_sign_errors": "26",
+              "reference": "9",
+              "winding": "9"
+            },
+            {
+              "hard_sign_errors": "30",
+              "reference": "9.5",
+              "winding": "12"
+            },
+            {
+              "hard_sign_errors": "35",
+              "reference": "10",
+              "winding": "9"
+            },
+            {
+              "hard_sign_errors": "53",
+              "reference": "10.5",
+              "winding": "14"
+            },
+            {
+              "hard_sign_errors": "29",
+              "reference": "11",
+              "winding": "13"
+            },
+            {
+              "hard_sign_errors": "52",
+              "reference": "11.5",
+              "winding": "11.5"
+            },
+            {
+              "hard_sign_errors": "24",
+              "reference": "12",
+              "winding": "12"
+            },
+            {
+              "hard_sign_errors": "40",
+              "reference": "12.5",
+              "winding": "12.5"
+            }
+          ],
+          "ladder_shift_percent": 19.23076923076923,
+          "ladder_shifts": 21,
+          "observations": 2826,
+          "references_with_observations": 26,
+          "tied_best_rows": 10,
+          "unbounded_best_rows": 10
+        },
+        {
+          "correct_references": 0,
+          "gauge": 1,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "10.5",
+              "winding": "9.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 2,
+          "independent_missing": 25,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "3",
+              "winding": "3"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 3,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "11",
+              "winding": "10"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 4,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "6",
+              "winding": "5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 5,
+          "independent_missing": 25,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "8",
+              "winding": "8"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 2,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 6,
+          "independent_missing": 24,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "11.5",
+              "winding": "11.5"
+            },
+            {
+              "hard_sign_errors": "0",
+              "reference": "12.5",
+              "winding": "11.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 2,
+          "references_with_observations": 2,
+          "tied_best_rows": 2,
+          "unbounded_best_rows": 2
+        },
+        {
+          "correct_references": 0,
+          "gauge": 7,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "0",
+              "winding": "-1"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 2,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 8,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "5",
+              "winding": "4"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 9,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "11.5",
+              "winding": "10.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 10,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "11",
+              "winding": "10"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 11,
+          "independent_missing": 25,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "11",
+              "winding": "11"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 12,
+          "independent_missing": 25,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "5.5",
+              "winding": "5.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 13,
+          "independent_missing": 25,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "0",
+              "winding": "0"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 14,
+          "independent_missing": 25,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "6.5",
+              "winding": "6.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 15,
+          "independent_missing": 23,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "10.5",
+              "winding": "11.5"
+            },
+            {
+              "hard_sign_errors": "0",
+              "reference": "11.5",
+              "winding": "11.5"
+            },
+            {
+              "hard_sign_errors": "0",
+              "reference": "12.5",
+              "winding": "9"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 3,
+          "references_with_observations": 3,
+          "tied_best_rows": 3,
+          "unbounded_best_rows": 3
+        },
+        {
+          "correct_references": 1,
+          "gauge": 16,
+          "independent_missing": 25,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "0",
+              "winding": "0"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 17,
+          "independent_missing": 25,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "6.5",
+              "winding": "6.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 18,
+          "independent_missing": 24,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "5",
+              "winding": "5"
+            },
+            {
+              "hard_sign_errors": "0",
+              "reference": "10",
+              "winding": "2.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 2,
+          "references_with_observations": 2,
+          "tied_best_rows": 2,
+          "unbounded_best_rows": 2
+        },
+        {
+          "correct_references": 1,
+          "gauge": 19,
+          "independent_missing": 25,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "0",
+              "winding": "0"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 20,
+          "independent_missing": 25,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "12.5",
+              "winding": "12.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 21,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "4.5",
+              "winding": "3.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 22,
+          "independent_missing": 24,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "2",
+              "winding": "2"
+            },
+            {
+              "hard_sign_errors": "0",
+              "reference": "3",
+              "winding": "2"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 2,
+          "references_with_observations": 2,
+          "tied_best_rows": 2,
+          "unbounded_best_rows": 2
+        },
+        {
+          "correct_references": 1,
+          "gauge": 23,
+          "independent_missing": 25,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "0",
+              "winding": "0"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 24,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "7",
+              "winding": "6"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 2,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 25,
+          "independent_missing": 25,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "12",
+              "winding": "12"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 26,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "7",
+              "winding": "6"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 27,
+          "independent_missing": 25,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "11",
+              "winding": "11"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        }
+      ],
+      "pieces": 29597,
+      "provenance": {
+        "binary_sha256": "bd946311b3257f802742da0dcb2815046e0bb7a899ea34fc5be65a1ee7515ef8",
+        "build_type": "RelWithDebInfo",
+        "command": [
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_chunk",
+          "direction-ablation",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr",
+          "--normal-manifest",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+          "--output",
+          "/ephemeral/hendrik/fiber_crop_bench/20260928_n2_unconditioned_v1/n2-d3-c10",
+          "--direction-dominance",
+          "0.9",
+          "--piece-length",
+          "512",
+          "--bp-only",
+          "--bp-inference",
+          "sum-product-mixed",
+          "--reference-fiber-dir",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+          "--reference-fiber-tag",
+          "hendrik_crop1",
+          "--threads",
+          "64",
+          "--winding-weights",
+          "0,0,0,0.1,0",
+          "--winding-sign-weights",
+          "1,0",
+          "--winding-hard-signs",
+          "perpendicular",
+          "--winding-sign-cost",
+          "hard",
+          "--winding-hard-sign-angle",
+          "off",
+          "--winding-max-candidate-states",
+          "32000000",
+          "--local-constraint-events",
+          "--reference-neighborhood-windings",
+          "2",
+          "--winding-continuity-step-cost",
+          "10",
+          "--winding-defect-cost",
+          "3",
+          "--winding-message-iterations",
+          "500",
+          "--local-no-parallel",
+          "--reference-neighborhood-unconditioned",
+          "--reference-independent"
+        ],
+        "inputs": {
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd1-7ff0ce6c/artifacts/PHercParis4-20260411134726-las-sd1-7ff0ce6c.lasagna.json": "293cf8cb76bf07e621d3eab401904114e374225d3932f960b7a0d3d550594755",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json": "e18d1074759ef6db32538963ab13b9071dc8af334af7d991bbf77442e58453ff"
+        },
+        "references": {
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064452831_000002.json": "d17ad691e02a8a476300ac0ff56cc5a6244d34f89f683ed273ff39c5dc138726",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064812002_000003.json": "2f4af3d2ba2b4ea6ca4111bcb87ab8d585d68dc7391bea0cb7f8e945fcaecc45",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065143381_000004.json": "5e5626d31c03d4fd8f510f8eb637e5df740a4a84999e0ebd4994bd0fc05fd26a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065643794_000005.json": "904711cb839c5e1d4a80c35009348d1dcb945975658904f976b68dd3009c15bd",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072253909_000006.json": "066bce1b199be6ae740378409c0c7ee4e2ae15ca7f9095190fb6d8e5d0a28028",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072717899_000007.json": "fe0ae2ad23db46f9ebea752e2e229427ccb932bbdec2bda12f2b54ff3f3628ff",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T073017594_000008.json": "19c0ae145078fd5553bb6c80353996ef8d02b167bc18d7b46eb13bc13dd0fd0a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T074703971_000009.json": "70ba5ab35fc08d046eb20eb9a5ba12adeac0e56a984800d8363ab185b49bcb21",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T102631471_000010.json": "0f0d290ecc32d42b53829518bd68fac99ced7d202ac939866e3dd9c7c06bc336",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105412524_000011.json": "3e91ed087f823690e8fb238e831270b7b432d5e1dc4e2520e934786e121f51b8",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105602115_000012.json": "9df341a1a61d2be410648e0da2f1d53e59a5b989462af61ed3826b51506fd6fe",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160540656_000013.json": "106141ae627655102ca2cc4aba6039555d750932f05b996aa2e3056bbb04dae4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160642323_000014.json": "8995247d04c62f7f421f20d3973fe907d159cf15a8bcfc52d45e8a47f686a3b4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160716356_000015.json": "3f870c22039b77becd8945fb7d38378a360f7bd7d2bcc816272dfd596973622c",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160812289_000016.json": "9c6a41b3454a04a37adc2a3dd4aa9ea9806525f481420358f8c12bdcccd1fdeb",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161032692_000017.json": "67918572c79cc166da81172a3e24ed01d78e8b471bc2c8d583a25a51c2a10df1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161219869_000018.json": "14ebb8e782fdadb8734af5f67948a9bdbe58f5089e1b46f66d37e0aeb1587b9d",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162005620_000019.json": "6461910faa5c12b9a1ffd1dceac24c5ed9626fab66914278e0097e68c56f8656",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162100631_000020.json": "0912f1593746e92dbf6ab7a50b183faab0765074fac86a7c3309e2ef66c64608",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162112825_000021.json": "6a0ffd62111ad098b4054a6fe71c9ac43dd96681ffef29a9d7927834311680cf",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162212264_000022.json": "2b222c9aecc1e03d0d61f7877b9b6ab0b329a442bf55d82ea24f4d28620f174b",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162324568_000023.json": "6a10d1044fc1ec1c487a3ba2e7a3f73cf05538ccda970d226c4fa02333d83283",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162413303_000024.json": "2fe404f9fd7eff16f4f6f0033e8d0ca598581bc0153107b8c8c6ac19b24b6465",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162425442_000025.json": "9c77b0839564818a7548380419ca8912e3753513afccfb515633eed8fe2a1af1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162507413_000026.json": "17da40bd53a5de5f4b87a6a4e3014336cf2c0d8e6b9123236e427f46dda591e4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162541128_000027.json": "99e51aad66cae4480d0013b6744523133c819da07fe68da11177544b372adb15"
+        },
+        "repetitions": 1,
+        "returncode": 0,
+        "revision": "a185b07687130ca086e7b3af1d940127ffe08486",
+        "shared_libraries": {
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/core/libvc_fiber_tracer.so": "97a6dbc722a55c58cae6032a60f58e856bbb5f86c1b171b22faa90977ca5f739"
+        },
+        "started_utc": "2026-09-28T13:56:48Z",
+        "wall_seconds": 117.27682332099994
+      },
+      "readout_summaries": [
+        {
+          "admitted": "85",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "13",
+          "gauge": "0",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "15.5",
+          "min_candidate": "9.5",
+          "observations": "85",
+          "reference": "0",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "2",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "7",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "3",
+          "min_candidate": "-1",
+          "observations": "2",
+          "reference": "0",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "13",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "1.5",
+          "min_candidate": "-2.5",
+          "observations": "1",
+          "reference": "0",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "16",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "4",
+          "min_candidate": "0",
+          "observations": "1",
+          "reference": "0",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "19",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "4",
+          "min_candidate": "0",
+          "observations": "1",
+          "reference": "0",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "23",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "1.5",
+          "min_candidate": "-2.5",
+          "observations": "1",
+          "reference": "0",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "74",
+          "best_ties": "5",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "4",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "15.5",
+          "min_candidate": "9",
+          "observations": "78",
+          "reference": "0.5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "87",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "13",
+          "gauge": "0",
+          "inactive": "3",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "15.5",
+          "min_candidate": "9.5",
+          "observations": "90",
+          "reference": "1",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "88",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "8",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "15.5",
+          "min_candidate": "9",
+          "observations": "96",
+          "reference": "1.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "86",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "4",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "15.5",
+          "min_candidate": "9",
+          "observations": "90",
+          "reference": "2",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "22",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "3.5",
+          "min_candidate": "-0.5",
+          "observations": "1",
+          "reference": "2",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "77",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "10",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "15.5",
+          "min_candidate": "9",
+          "observations": "87",
+          "reference": "2.5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "113",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "10",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "15.5",
+          "min_candidate": "9",
+          "observations": "123",
+          "reference": "3",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "2",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "4.5",
+          "min_candidate": "0.5",
+          "observations": "1",
+          "reference": "3",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "22",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "3.5",
+          "min_candidate": "-0.5",
+          "observations": "1",
+          "reference": "3",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "109",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "9",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "15.5",
+          "min_candidate": "9",
+          "observations": "118",
+          "reference": "3.5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "105",
+          "best_ties": "5",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "6",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "15.5",
+          "min_candidate": "9",
+          "observations": "111",
+          "reference": "4",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "127",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "13",
+          "gauge": "0",
+          "inactive": "14",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "15.5",
+          "min_candidate": "9.5",
+          "observations": "141",
+          "reference": "4.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "21",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "7.5",
+          "min_candidate": "3.5",
+          "observations": "1",
+          "reference": "4.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "118",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "6",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "15.5",
+          "min_candidate": "9",
+          "observations": "124",
+          "reference": "5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "8",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "8",
+          "min_candidate": "4",
+          "observations": "1",
+          "reference": "5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "18",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "6.5",
+          "min_candidate": "2.5",
+          "observations": "1",
+          "reference": "5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "101",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "15",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "15.5",
+          "min_candidate": "9",
+          "observations": "116",
+          "reference": "5.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "12",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "7",
+          "min_candidate": "3",
+          "observations": "1",
+          "reference": "5.5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "89",
+          "best_ties": "7",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "5",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "15.5",
+          "min_candidate": "9",
+          "observations": "94",
+          "reference": "6",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "4",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "9",
+          "min_candidate": "5",
+          "observations": "1",
+          "reference": "6",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "115",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "7",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "15.5",
+          "min_candidate": "9",
+          "observations": "122",
+          "reference": "6.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "14",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "10.5",
+          "min_candidate": "6.5",
+          "observations": "1",
+          "reference": "6.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "17",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "10.5",
+          "min_candidate": "6.5",
+          "observations": "1",
+          "reference": "6.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "96",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "6",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "15.5",
+          "min_candidate": "9",
+          "observations": "102",
+          "reference": "7",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "2",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "24",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "10",
+          "min_candidate": "6",
+          "observations": "2",
+          "reference": "7",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "26",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "10",
+          "min_candidate": "6",
+          "observations": "1",
+          "reference": "7",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "121",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "10",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "15.5",
+          "min_candidate": "9",
+          "observations": "131",
+          "reference": "7.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "93",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "9",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "15.5",
+          "min_candidate": "9",
+          "observations": "102",
+          "reference": "8",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "2",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "5",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "12",
+          "min_candidate": "8",
+          "observations": "2",
+          "reference": "8",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "128",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "8",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "15.5",
+          "min_candidate": "9",
+          "observations": "136",
+          "reference": "8.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "87",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "9",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "15.5",
+          "min_candidate": "9",
+          "observations": "96",
+          "reference": "9",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "103",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "7",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "15.5",
+          "min_candidate": "9",
+          "observations": "110",
+          "reference": "9.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "105",
+          "best_ties": "5",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "3",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "15.5",
+          "min_candidate": "9",
+          "observations": "108",
+          "reference": "10",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "18",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "6.5",
+          "min_candidate": "2.5",
+          "observations": "1",
+          "reference": "10",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "123",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "7",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "15.5",
+          "min_candidate": "9",
+          "observations": "130",
+          "reference": "10.5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "1",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "13.5",
+          "min_candidate": "9.5",
+          "observations": "1",
+          "reference": "10.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "15",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "13",
+          "min_candidate": "9",
+          "observations": "1",
+          "reference": "10.5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "93",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "3",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "15.5",
+          "min_candidate": "9",
+          "observations": "96",
+          "reference": "11",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "3",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "14",
+          "min_candidate": "10",
+          "observations": "1",
+          "reference": "11",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "10",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "14",
+          "min_candidate": "10",
+          "observations": "1",
+          "reference": "11",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "11",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "12.5",
+          "min_candidate": "8.5",
+          "observations": "1",
+          "reference": "11",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "27",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "12.5",
+          "min_candidate": "8.5",
+          "observations": "1",
+          "reference": "11",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "127",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "11",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "15.5",
+          "min_candidate": "9",
+          "observations": "138",
+          "reference": "11.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "6",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "13",
+          "min_candidate": "9",
+          "observations": "1",
+          "reference": "11.5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "9",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "14.5",
+          "min_candidate": "10.5",
+          "observations": "1",
+          "reference": "11.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "15",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "13",
+          "min_candidate": "9",
+          "observations": "1",
+          "reference": "11.5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "82",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "3",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "15.5",
+          "min_candidate": "9",
+          "observations": "85",
+          "reference": "12",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "25",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "13.5",
+          "min_candidate": "9.5",
+          "observations": "1",
+          "reference": "12",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "106",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "11",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "15.5",
+          "min_candidate": "9",
+          "observations": "117",
+          "reference": "12.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "6",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "13",
+          "min_candidate": "9",
+          "observations": "1",
+          "reference": "12.5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "15",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "13",
+          "min_candidate": "9",
+          "observations": "1",
+          "reference": "12.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "20",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "16.5",
+          "min_candidate": "12.5",
+          "observations": "1",
+          "reference": "12.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        }
+      ],
+      "references": 26,
+      "tied_best_rows": 42,
+      "unbounded_best_rows": 42
+    },
+    {
+      "cohort": {
+        "cross_factors_for_readout_only": 2861,
+        "ordinary_factors": 42102,
+        "ordinary_pieces": 29597,
+        "reference_cross_factors_in_solve": 0,
+        "reference_nodes_in_solve": 0
+      },
+      "cohort_ids_match": true,
+      "conditioned_artifact": "/ephemeral/hendrik/fiber_crop_bench/20260928_reference_neighborhood_v1/n2-d10-c3_reference_neighborhood.json",
+      "conditioned_sha256": "69601f697304d3e1363ae8d13a25f1c597f846f41f67ea49c991e90d329620d1",
+      "fibers": 548,
+      "full_coverage_gauges": [
+        0
+      ],
+      "independent_percent": null,
+      "ladder_shift_percent": null,
+      "ladder_shifts": null,
+      "metric_unavailable": "multiple independent gauges per reference require explicit reporting",
+      "name": "n2-d10-c3",
+      "per_gauge": [
+        {
+          "correct_references": 2,
+          "gauge": 0,
+          "independent_missing": 0,
+          "independent_percent": 7.6923076923076925,
+          "ladder": [
+            {
+              "hard_sign_errors": "28",
+              "reference": "0",
+              "winding": "4.5"
+            },
+            {
+              "hard_sign_errors": "30",
+              "reference": "0.5",
+              "winding": "2"
+            },
+            {
+              "hard_sign_errors": "25",
+              "reference": "1",
+              "winding": "4.5"
+            },
+            {
+              "hard_sign_errors": "47",
+              "reference": "1.5",
+              "winding": "2"
+            },
+            {
+              "hard_sign_errors": "35",
+              "reference": "2",
+              "winding": "2"
+            },
+            {
+              "hard_sign_errors": "37",
+              "reference": "2.5",
+              "winding": "2"
+            },
+            {
+              "hard_sign_errors": "45",
+              "reference": "3",
+              "winding": "2"
+            },
+            {
+              "hard_sign_errors": "36",
+              "reference": "3.5",
+              "winding": "2"
+            },
+            {
+              "hard_sign_errors": "47",
+              "reference": "4",
+              "winding": "6.5"
+            },
+            {
+              "hard_sign_errors": "67",
+              "reference": "4.5",
+              "winding": "5.5"
+            },
+            {
+              "hard_sign_errors": "58",
+              "reference": "5",
+              "winding": "5"
+            },
+            {
+              "hard_sign_errors": "52",
+              "reference": "5.5",
+              "winding": "5"
+            },
+            {
+              "hard_sign_errors": "34",
+              "reference": "6",
+              "winding": "4.5"
+            },
+            {
+              "hard_sign_errors": "46",
+              "reference": "6.5",
+              "winding": "4.5"
+            },
+            {
+              "hard_sign_errors": "49",
+              "reference": "7",
+              "winding": "6.5"
+            },
+            {
+              "hard_sign_errors": "65",
+              "reference": "7.5",
+              "winding": "2"
+            },
+            {
+              "hard_sign_errors": "49",
+              "reference": "8",
+              "winding": "2"
+            },
+            {
+              "hard_sign_errors": "38",
+              "reference": "8.5",
+              "winding": "5.5"
+            },
+            {
+              "hard_sign_errors": "33",
+              "reference": "9",
+              "winding": "6.5"
+            },
+            {
+              "hard_sign_errors": "42",
+              "reference": "9.5",
+              "winding": "5.5"
+            },
+            {
+              "hard_sign_errors": "34",
+              "reference": "10",
+              "winding": "6"
+            },
+            {
+              "hard_sign_errors": "56",
+              "reference": "10.5",
+              "winding": "2.5"
+            },
+            {
+              "hard_sign_errors": "37",
+              "reference": "11",
+              "winding": "3"
+            },
+            {
+              "hard_sign_errors": "42",
+              "reference": "11.5",
+              "winding": "6"
+            },
+            {
+              "hard_sign_errors": "34",
+              "reference": "12",
+              "winding": "5.5"
+            },
+            {
+              "hard_sign_errors": "16",
+              "reference": "12.5",
+              "winding": "6"
+            }
+          ],
+          "ladder_shift_percent": 15.384615384615385,
+          "ladder_shifts": 22,
+          "observations": 2826,
+          "references_with_observations": 26,
+          "tied_best_rows": 14,
+          "unbounded_best_rows": 14
+        },
+        {
+          "correct_references": 0,
+          "gauge": 1,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "10.5",
+              "winding": "10"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 2,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "3",
+              "winding": "1.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 3,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "11",
+              "winding": "10.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 4,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "6",
+              "winding": "5.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 5,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "8",
+              "winding": "6.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 2,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 6,
+          "independent_missing": 24,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "11.5",
+              "winding": "10"
+            },
+            {
+              "hard_sign_errors": "0",
+              "reference": "12.5",
+              "winding": "10"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 2,
+          "references_with_observations": 2,
+          "tied_best_rows": 2,
+          "unbounded_best_rows": 2
+        },
+        {
+          "correct_references": 0,
+          "gauge": 7,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "0",
+              "winding": "-0.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 2,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 8,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "5",
+              "winding": "4.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 9,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "11.5",
+              "winding": "11"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 10,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "11",
+              "winding": "10.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 11,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "11",
+              "winding": "9.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 12,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "5.5",
+              "winding": "4"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 13,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "0",
+              "winding": "-1.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 14,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "6.5",
+              "winding": "5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 15,
+          "independent_missing": 23,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "10.5",
+              "winding": "9.5"
+            },
+            {
+              "hard_sign_errors": "0",
+              "reference": "11.5",
+              "winding": "9.5"
+            },
+            {
+              "hard_sign_errors": "0",
+              "reference": "12.5",
+              "winding": "12"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 3,
+          "references_with_observations": 3,
+          "tied_best_rows": 3,
+          "unbounded_best_rows": 3
+        },
+        {
+          "correct_references": 0,
+          "gauge": 16,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "0",
+              "winding": "-1.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 17,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "6.5",
+              "winding": "5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 18,
+          "independent_missing": 24,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "5",
+              "winding": "3.5"
+            },
+            {
+              "hard_sign_errors": "0",
+              "reference": "10",
+              "winding": "6"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 2,
+          "references_with_observations": 2,
+          "tied_best_rows": 2,
+          "unbounded_best_rows": 2
+        },
+        {
+          "correct_references": 0,
+          "gauge": 19,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "0",
+              "winding": "-1.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 20,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "12.5",
+              "winding": "11"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 21,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "4.5",
+              "winding": "4"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 22,
+          "independent_missing": 24,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "2",
+              "winding": "0.5"
+            },
+            {
+              "hard_sign_errors": "0",
+              "reference": "3",
+              "winding": "0.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 2,
+          "references_with_observations": 2,
+          "tied_best_rows": 2,
+          "unbounded_best_rows": 2
+        },
+        {
+          "correct_references": 0,
+          "gauge": 23,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "0",
+              "winding": "-1.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 24,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "7",
+              "winding": "6.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 2,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 25,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "12",
+              "winding": "10.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 26,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "7",
+              "winding": "6.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 27,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "11",
+              "winding": "9.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        }
+      ],
+      "pieces": 29597,
+      "provenance": {
+        "binary_sha256": "bd946311b3257f802742da0dcb2815046e0bb7a899ea34fc5be65a1ee7515ef8",
+        "build_type": "RelWithDebInfo",
+        "command": [
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_chunk",
+          "direction-ablation",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr",
+          "--normal-manifest",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+          "--output",
+          "/ephemeral/hendrik/fiber_crop_bench/20260928_n2_unconditioned_v1/n2-d10-c3",
+          "--direction-dominance",
+          "0.9",
+          "--piece-length",
+          "512",
+          "--bp-only",
+          "--bp-inference",
+          "sum-product-mixed",
+          "--reference-fiber-dir",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+          "--reference-fiber-tag",
+          "hendrik_crop1",
+          "--threads",
+          "64",
+          "--winding-weights",
+          "0,0,0,0.1,0",
+          "--winding-sign-weights",
+          "1,0",
+          "--winding-hard-signs",
+          "perpendicular",
+          "--winding-sign-cost",
+          "hard",
+          "--winding-hard-sign-angle",
+          "off",
+          "--winding-max-candidate-states",
+          "32000000",
+          "--local-constraint-events",
+          "--reference-neighborhood-windings",
+          "2",
+          "--winding-continuity-step-cost",
+          "3",
+          "--winding-defect-cost",
+          "10",
+          "--winding-message-iterations",
+          "500",
+          "--local-no-parallel",
+          "--reference-neighborhood-unconditioned",
+          "--reference-independent"
+        ],
+        "inputs": {
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd1-7ff0ce6c/artifacts/PHercParis4-20260411134726-las-sd1-7ff0ce6c.lasagna.json": "293cf8cb76bf07e621d3eab401904114e374225d3932f960b7a0d3d550594755",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json": "e18d1074759ef6db32538963ab13b9071dc8af334af7d991bbf77442e58453ff"
+        },
+        "references": {
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064452831_000002.json": "d17ad691e02a8a476300ac0ff56cc5a6244d34f89f683ed273ff39c5dc138726",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064812002_000003.json": "2f4af3d2ba2b4ea6ca4111bcb87ab8d585d68dc7391bea0cb7f8e945fcaecc45",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065143381_000004.json": "5e5626d31c03d4fd8f510f8eb637e5df740a4a84999e0ebd4994bd0fc05fd26a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065643794_000005.json": "904711cb839c5e1d4a80c35009348d1dcb945975658904f976b68dd3009c15bd",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072253909_000006.json": "066bce1b199be6ae740378409c0c7ee4e2ae15ca7f9095190fb6d8e5d0a28028",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072717899_000007.json": "fe0ae2ad23db46f9ebea752e2e229427ccb932bbdec2bda12f2b54ff3f3628ff",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T073017594_000008.json": "19c0ae145078fd5553bb6c80353996ef8d02b167bc18d7b46eb13bc13dd0fd0a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T074703971_000009.json": "70ba5ab35fc08d046eb20eb9a5ba12adeac0e56a984800d8363ab185b49bcb21",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T102631471_000010.json": "0f0d290ecc32d42b53829518bd68fac99ced7d202ac939866e3dd9c7c06bc336",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105412524_000011.json": "3e91ed087f823690e8fb238e831270b7b432d5e1dc4e2520e934786e121f51b8",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105602115_000012.json": "9df341a1a61d2be410648e0da2f1d53e59a5b989462af61ed3826b51506fd6fe",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160540656_000013.json": "106141ae627655102ca2cc4aba6039555d750932f05b996aa2e3056bbb04dae4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160642323_000014.json": "8995247d04c62f7f421f20d3973fe907d159cf15a8bcfc52d45e8a47f686a3b4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160716356_000015.json": "3f870c22039b77becd8945fb7d38378a360f7bd7d2bcc816272dfd596973622c",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160812289_000016.json": "9c6a41b3454a04a37adc2a3dd4aa9ea9806525f481420358f8c12bdcccd1fdeb",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161032692_000017.json": "67918572c79cc166da81172a3e24ed01d78e8b471bc2c8d583a25a51c2a10df1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161219869_000018.json": "14ebb8e782fdadb8734af5f67948a9bdbe58f5089e1b46f66d37e0aeb1587b9d",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162005620_000019.json": "6461910faa5c12b9a1ffd1dceac24c5ed9626fab66914278e0097e68c56f8656",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162100631_000020.json": "0912f1593746e92dbf6ab7a50b183faab0765074fac86a7c3309e2ef66c64608",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162112825_000021.json": "6a0ffd62111ad098b4054a6fe71c9ac43dd96681ffef29a9d7927834311680cf",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162212264_000022.json": "2b222c9aecc1e03d0d61f7877b9b6ab0b329a442bf55d82ea24f4d28620f174b",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162324568_000023.json": "6a10d1044fc1ec1c487a3ba2e7a3f73cf05538ccda970d226c4fa02333d83283",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162413303_000024.json": "2fe404f9fd7eff16f4f6f0033e8d0ca598581bc0153107b8c8c6ac19b24b6465",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162425442_000025.json": "9c77b0839564818a7548380419ca8912e3753513afccfb515633eed8fe2a1af1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162507413_000026.json": "17da40bd53a5de5f4b87a6a4e3014336cf2c0d8e6b9123236e427f46dda591e4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162541128_000027.json": "99e51aad66cae4480d0013b6744523133c819da07fe68da11177544b372adb15"
+        },
+        "repetitions": 1,
+        "returncode": 0,
+        "revision": "a185b07687130ca086e7b3af1d940127ffe08486",
+        "shared_libraries": {
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/core/libvc_fiber_tracer.so": "97a6dbc722a55c58cae6032a60f58e856bbb5f86c1b171b22faa90977ca5f739"
+        },
+        "started_utc": "2026-09-28T13:56:49Z",
+        "wall_seconds": 115.59156213799997
+      },
+      "readout_summaries": [
+        {
+          "admitted": "85",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "12",
+          "gauge": "0",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "7.5",
+          "min_candidate": "2",
+          "observations": "85",
+          "reference": "0",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "2",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "7",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "1",
+          "min_candidate": "-3",
+          "observations": "2",
+          "reference": "0",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "13",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "2.5",
+          "min_candidate": "-1.5",
+          "observations": "1",
+          "reference": "0",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "16",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "-0",
+          "min_candidate": "-4",
+          "observations": "1",
+          "reference": "0",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "19",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "-0",
+          "min_candidate": "-4",
+          "observations": "1",
+          "reference": "0",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "23",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "2.5",
+          "min_candidate": "-1.5",
+          "observations": "1",
+          "reference": "0",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "78",
+          "best_ties": "5",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "78",
+          "reference": "0.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "89",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "1",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "90",
+          "reference": "1",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "96",
+          "best_ties": "5",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "96",
+          "reference": "1.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "90",
+          "best_ties": "5",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "90",
+          "reference": "2",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "22",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "4.5",
+          "min_candidate": "0.5",
+          "observations": "1",
+          "reference": "2",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "87",
+          "best_ties": "5",
+          "calibrated": "1",
+          "evaluated": "13",
+          "gauge": "0",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8",
+          "min_candidate": "2",
+          "observations": "87",
+          "reference": "2.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "123",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "123",
+          "reference": "3",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "2",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "5.5",
+          "min_candidate": "1.5",
+          "observations": "1",
+          "reference": "3",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "22",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "4.5",
+          "min_candidate": "0.5",
+          "observations": "1",
+          "reference": "3",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "118",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "13",
+          "gauge": "0",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8",
+          "min_candidate": "2",
+          "observations": "118",
+          "reference": "3.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "111",
+          "best_ties": "5",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "111",
+          "reference": "4",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "141",
+          "best_ties": "5",
+          "calibrated": "1",
+          "evaluated": "13",
+          "gauge": "0",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8",
+          "min_candidate": "2",
+          "observations": "141",
+          "reference": "4.5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "21",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "5.5",
+          "min_candidate": "1.5",
+          "observations": "1",
+          "reference": "4.5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "123",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "1",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "124",
+          "reference": "5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "8",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "6",
+          "min_candidate": "2",
+          "observations": "1",
+          "reference": "5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "18",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "7.5",
+          "min_candidate": "3.5",
+          "observations": "1",
+          "reference": "5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "116",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "116",
+          "reference": "5.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "12",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "8",
+          "min_candidate": "4",
+          "observations": "1",
+          "reference": "5.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "94",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "13",
+          "gauge": "0",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8",
+          "min_candidate": "2",
+          "observations": "94",
+          "reference": "6",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "4",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "7",
+          "min_candidate": "3",
+          "observations": "1",
+          "reference": "6",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "121",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "13",
+          "gauge": "0",
+          "inactive": "1",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8",
+          "min_candidate": "2",
+          "observations": "122",
+          "reference": "6.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "14",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "6.5",
+          "min_candidate": "2.5",
+          "observations": "1",
+          "reference": "6.5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "17",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "6.5",
+          "min_candidate": "2.5",
+          "observations": "1",
+          "reference": "6.5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "100",
+          "best_ties": "5",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "2",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "102",
+          "reference": "7",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "2",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "24",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8",
+          "min_candidate": "4",
+          "observations": "2",
+          "reference": "7",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "26",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8",
+          "min_candidate": "4",
+          "observations": "1",
+          "reference": "7",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "131",
+          "best_ties": "6",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "131",
+          "reference": "7.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "102",
+          "best_ties": "6",
+          "calibrated": "1",
+          "evaluated": "13",
+          "gauge": "0",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8",
+          "min_candidate": "2",
+          "observations": "102",
+          "reference": "8",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "2",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "5",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8",
+          "min_candidate": "4",
+          "observations": "2",
+          "reference": "8",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "136",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "13",
+          "gauge": "0",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2.5",
+          "observations": "136",
+          "reference": "8.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "95",
+          "best_ties": "5",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "1",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "96",
+          "reference": "9",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "110",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "13",
+          "gauge": "0",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2.5",
+          "observations": "110",
+          "reference": "9.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "108",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "13",
+          "gauge": "0",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2.5",
+          "observations": "108",
+          "reference": "10",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "18",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "7.5",
+          "min_candidate": "3.5",
+          "observations": "1",
+          "reference": "10",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "129",
+          "best_ties": "5",
+          "calibrated": "1",
+          "evaluated": "13",
+          "gauge": "0",
+          "inactive": "1",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2.5",
+          "observations": "130",
+          "reference": "10.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "1",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "11.5",
+          "min_candidate": "7.5",
+          "observations": "1",
+          "reference": "10.5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "15",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "13.5",
+          "min_candidate": "9.5",
+          "observations": "1",
+          "reference": "10.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "96",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "12",
+          "gauge": "0",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "3",
+          "observations": "96",
+          "reference": "11",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "3",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "12",
+          "min_candidate": "8",
+          "observations": "1",
+          "reference": "11",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "10",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "12",
+          "min_candidate": "8",
+          "observations": "1",
+          "reference": "11",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "11",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "13.5",
+          "min_candidate": "9.5",
+          "observations": "1",
+          "reference": "11",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "27",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "13.5",
+          "min_candidate": "9.5",
+          "observations": "1",
+          "reference": "11",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "137",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "12",
+          "gauge": "0",
+          "inactive": "1",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "3",
+          "observations": "138",
+          "reference": "11.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "6",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "14",
+          "min_candidate": "10",
+          "observations": "1",
+          "reference": "11.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "9",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "12.5",
+          "min_candidate": "8.5",
+          "observations": "1",
+          "reference": "11.5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "15",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "13.5",
+          "min_candidate": "9.5",
+          "observations": "1",
+          "reference": "11.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "84",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "13",
+          "gauge": "0",
+          "inactive": "1",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2.5",
+          "observations": "85",
+          "reference": "12",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "25",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "14.5",
+          "min_candidate": "10.5",
+          "observations": "1",
+          "reference": "12",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "116",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "11",
+          "gauge": "0",
+          "inactive": "1",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "3.5",
+          "observations": "117",
+          "reference": "12.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "6",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "14",
+          "min_candidate": "10",
+          "observations": "1",
+          "reference": "12.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "15",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "13.5",
+          "min_candidate": "9.5",
+          "observations": "1",
+          "reference": "12.5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "20",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "12.5",
+          "min_candidate": "8.5",
+          "observations": "1",
+          "reference": "12.5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        }
+      ],
+      "references": 26,
+      "tied_best_rows": 46,
+      "unbounded_best_rows": 46
+    },
+    {
+      "cohort": {
+        "cross_factors_for_readout_only": 2861,
+        "ordinary_factors": 42102,
+        "ordinary_pieces": 29597,
+        "reference_cross_factors_in_solve": 0,
+        "reference_nodes_in_solve": 0
+      },
+      "cohort_ids_match": true,
+      "conditioned_artifact": "/ephemeral/hendrik/fiber_crop_bench/20260928_reference_neighborhood_v1/n2-d10-c10_reference_neighborhood.json",
+      "conditioned_sha256": "d48856d72cecf395339e0dd06bcf15ec3a6dfecc4bc551206d9736c983bad756",
+      "fibers": 548,
+      "full_coverage_gauges": [
+        0
+      ],
+      "independent_percent": null,
+      "ladder_shift_percent": null,
+      "ladder_shifts": null,
+      "metric_unavailable": "multiple independent gauges per reference require explicit reporting",
+      "name": "n2-d10-c10",
+      "per_gauge": [
+        {
+          "correct_references": 4,
+          "gauge": 0,
+          "independent_missing": 0,
+          "independent_percent": 15.384615384615385,
+          "ladder": [
+            {
+              "hard_sign_errors": "19",
+              "reference": "0",
+              "winding": "6"
+            },
+            {
+              "hard_sign_errors": "27",
+              "reference": "0.5",
+              "winding": "5.5"
+            },
+            {
+              "hard_sign_errors": "18",
+              "reference": "1",
+              "winding": "6"
+            },
+            {
+              "hard_sign_errors": "26",
+              "reference": "1.5",
+              "winding": "5.5"
+            },
+            {
+              "hard_sign_errors": "31",
+              "reference": "2",
+              "winding": "7"
+            },
+            {
+              "hard_sign_errors": "33",
+              "reference": "2.5",
+              "winding": "6.5"
+            },
+            {
+              "hard_sign_errors": "42",
+              "reference": "3",
+              "winding": "5"
+            },
+            {
+              "hard_sign_errors": "32",
+              "reference": "3.5",
+              "winding": "7"
+            },
+            {
+              "hard_sign_errors": "46",
+              "reference": "4",
+              "winding": "2.5"
+            },
+            {
+              "hard_sign_errors": "57",
+              "reference": "4.5",
+              "winding": "4.5"
+            },
+            {
+              "hard_sign_errors": "41",
+              "reference": "5",
+              "winding": "5"
+            },
+            {
+              "hard_sign_errors": "30",
+              "reference": "5.5",
+              "winding": "5.5"
+            },
+            {
+              "hard_sign_errors": "33",
+              "reference": "6",
+              "winding": "6"
+            },
+            {
+              "hard_sign_errors": "27",
+              "reference": "6.5",
+              "winding": "5.5"
+            },
+            {
+              "hard_sign_errors": "43",
+              "reference": "7",
+              "winding": "6"
+            },
+            {
+              "hard_sign_errors": "57",
+              "reference": "7.5",
+              "winding": "6.5"
+            },
+            {
+              "hard_sign_errors": "39",
+              "reference": "8",
+              "winding": "6"
+            },
+            {
+              "hard_sign_errors": "47",
+              "reference": "8.5",
+              "winding": "4.5"
+            },
+            {
+              "hard_sign_errors": "28",
+              "reference": "9",
+              "winding": "2"
+            },
+            {
+              "hard_sign_errors": "38",
+              "reference": "9.5",
+              "winding": "4.5"
+            },
+            {
+              "hard_sign_errors": "32",
+              "reference": "10",
+              "winding": "2"
+            },
+            {
+              "hard_sign_errors": "53",
+              "reference": "10.5",
+              "winding": "5.5"
+            },
+            {
+              "hard_sign_errors": "28",
+              "reference": "11",
+              "winding": "6"
+            },
+            {
+              "hard_sign_errors": "32",
+              "reference": "11.5",
+              "winding": "4.5"
+            },
+            {
+              "hard_sign_errors": "25",
+              "reference": "12",
+              "winding": "5"
+            },
+            {
+              "hard_sign_errors": "38",
+              "reference": "12.5",
+              "winding": "4.5"
+            }
+          ],
+          "ladder_shift_percent": 34.61538461538461,
+          "ladder_shifts": 17,
+          "observations": 2826,
+          "references_with_observations": 26,
+          "tied_best_rows": 7,
+          "unbounded_best_rows": 7
+        },
+        {
+          "correct_references": 0,
+          "gauge": 1,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "10.5",
+              "winding": "9.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 2,
+          "independent_missing": 25,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "3",
+              "winding": "3"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 3,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "11",
+              "winding": "10"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 4,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "6",
+              "winding": "5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 5,
+          "independent_missing": 25,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "8",
+              "winding": "8"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 2,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 6,
+          "independent_missing": 24,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "11.5",
+              "winding": "11.5"
+            },
+            {
+              "hard_sign_errors": "0",
+              "reference": "12.5",
+              "winding": "11.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 2,
+          "references_with_observations": 2,
+          "tied_best_rows": 2,
+          "unbounded_best_rows": 2
+        },
+        {
+          "correct_references": 0,
+          "gauge": 7,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "0",
+              "winding": "-1"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 2,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 8,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "5",
+              "winding": "4"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 9,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "11.5",
+              "winding": "10.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 10,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "11",
+              "winding": "10"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 11,
+          "independent_missing": 25,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "11",
+              "winding": "11"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 12,
+          "independent_missing": 25,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "5.5",
+              "winding": "5.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 13,
+          "independent_missing": 25,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "0",
+              "winding": "0"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 14,
+          "independent_missing": 25,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "6.5",
+              "winding": "6.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 15,
+          "independent_missing": 23,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "10.5",
+              "winding": "11.5"
+            },
+            {
+              "hard_sign_errors": "0",
+              "reference": "11.5",
+              "winding": "11.5"
+            },
+            {
+              "hard_sign_errors": "0",
+              "reference": "12.5",
+              "winding": "9"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 3,
+          "references_with_observations": 3,
+          "tied_best_rows": 3,
+          "unbounded_best_rows": 3
+        },
+        {
+          "correct_references": 1,
+          "gauge": 16,
+          "independent_missing": 25,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "0",
+              "winding": "0"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 17,
+          "independent_missing": 25,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "6.5",
+              "winding": "6.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 18,
+          "independent_missing": 24,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "5",
+              "winding": "5"
+            },
+            {
+              "hard_sign_errors": "0",
+              "reference": "10",
+              "winding": "2.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 2,
+          "references_with_observations": 2,
+          "tied_best_rows": 2,
+          "unbounded_best_rows": 2
+        },
+        {
+          "correct_references": 1,
+          "gauge": 19,
+          "independent_missing": 25,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "0",
+              "winding": "0"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 20,
+          "independent_missing": 25,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "12.5",
+              "winding": "12.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 21,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "4.5",
+              "winding": "3.5"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 22,
+          "independent_missing": 24,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "2",
+              "winding": "2"
+            },
+            {
+              "hard_sign_errors": "0",
+              "reference": "3",
+              "winding": "2"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 2,
+          "references_with_observations": 2,
+          "tied_best_rows": 2,
+          "unbounded_best_rows": 2
+        },
+        {
+          "correct_references": 1,
+          "gauge": 23,
+          "independent_missing": 25,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "0",
+              "winding": "0"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 24,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "7",
+              "winding": "6"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 2,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 25,
+          "independent_missing": 25,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "12",
+              "winding": "12"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 0,
+          "gauge": 26,
+          "independent_missing": 25,
+          "independent_percent": 0,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "7",
+              "winding": "6"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        },
+        {
+          "correct_references": 1,
+          "gauge": 27,
+          "independent_missing": 25,
+          "independent_percent": 3.8461538461538463,
+          "ladder": [
+            {
+              "hard_sign_errors": "0",
+              "reference": "11",
+              "winding": "11"
+            }
+          ],
+          "ladder_shift_percent": null,
+          "ladder_shifts": null,
+          "metric_unavailable": "partial component ladder",
+          "observations": 1,
+          "references_with_observations": 1,
+          "tied_best_rows": 1,
+          "unbounded_best_rows": 1
+        }
+      ],
+      "pieces": 29597,
+      "provenance": {
+        "binary_sha256": "bd946311b3257f802742da0dcb2815046e0bb7a899ea34fc5be65a1ee7515ef8",
+        "build_type": "RelWithDebInfo",
+        "command": [
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_chunk",
+          "direction-ablation",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr",
+          "--normal-manifest",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+          "--output",
+          "/ephemeral/hendrik/fiber_crop_bench/20260928_n2_unconditioned_v1/n2-d10-c10",
+          "--direction-dominance",
+          "0.9",
+          "--piece-length",
+          "512",
+          "--bp-only",
+          "--bp-inference",
+          "sum-product-mixed",
+          "--reference-fiber-dir",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+          "--reference-fiber-tag",
+          "hendrik_crop1",
+          "--threads",
+          "64",
+          "--winding-weights",
+          "0,0,0,0.1,0",
+          "--winding-sign-weights",
+          "1,0",
+          "--winding-hard-signs",
+          "perpendicular",
+          "--winding-sign-cost",
+          "hard",
+          "--winding-hard-sign-angle",
+          "off",
+          "--winding-max-candidate-states",
+          "32000000",
+          "--local-constraint-events",
+          "--reference-neighborhood-windings",
+          "2",
+          "--winding-continuity-step-cost",
+          "10",
+          "--winding-defect-cost",
+          "10",
+          "--winding-message-iterations",
+          "500",
+          "--local-no-parallel",
+          "--reference-neighborhood-unconditioned",
+          "--reference-independent"
+        ],
+        "inputs": {
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd1-7ff0ce6c/artifacts/PHercParis4-20260411134726-las-sd1-7ff0ce6c.lasagna.json": "293cf8cb76bf07e621d3eab401904114e374225d3932f960b7a0d3d550594755",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json": "e18d1074759ef6db32538963ab13b9071dc8af334af7d991bbf77442e58453ff"
+        },
+        "references": {
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064452831_000002.json": "d17ad691e02a8a476300ac0ff56cc5a6244d34f89f683ed273ff39c5dc138726",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064812002_000003.json": "2f4af3d2ba2b4ea6ca4111bcb87ab8d585d68dc7391bea0cb7f8e945fcaecc45",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065143381_000004.json": "5e5626d31c03d4fd8f510f8eb637e5df740a4a84999e0ebd4994bd0fc05fd26a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065643794_000005.json": "904711cb839c5e1d4a80c35009348d1dcb945975658904f976b68dd3009c15bd",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072253909_000006.json": "066bce1b199be6ae740378409c0c7ee4e2ae15ca7f9095190fb6d8e5d0a28028",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072717899_000007.json": "fe0ae2ad23db46f9ebea752e2e229427ccb932bbdec2bda12f2b54ff3f3628ff",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T073017594_000008.json": "19c0ae145078fd5553bb6c80353996ef8d02b167bc18d7b46eb13bc13dd0fd0a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T074703971_000009.json": "70ba5ab35fc08d046eb20eb9a5ba12adeac0e56a984800d8363ab185b49bcb21",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T102631471_000010.json": "0f0d290ecc32d42b53829518bd68fac99ced7d202ac939866e3dd9c7c06bc336",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105412524_000011.json": "3e91ed087f823690e8fb238e831270b7b432d5e1dc4e2520e934786e121f51b8",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105602115_000012.json": "9df341a1a61d2be410648e0da2f1d53e59a5b989462af61ed3826b51506fd6fe",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160540656_000013.json": "106141ae627655102ca2cc4aba6039555d750932f05b996aa2e3056bbb04dae4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160642323_000014.json": "8995247d04c62f7f421f20d3973fe907d159cf15a8bcfc52d45e8a47f686a3b4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160716356_000015.json": "3f870c22039b77becd8945fb7d38378a360f7bd7d2bcc816272dfd596973622c",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160812289_000016.json": "9c6a41b3454a04a37adc2a3dd4aa9ea9806525f481420358f8c12bdcccd1fdeb",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161032692_000017.json": "67918572c79cc166da81172a3e24ed01d78e8b471bc2c8d583a25a51c2a10df1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161219869_000018.json": "14ebb8e782fdadb8734af5f67948a9bdbe58f5089e1b46f66d37e0aeb1587b9d",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162005620_000019.json": "6461910faa5c12b9a1ffd1dceac24c5ed9626fab66914278e0097e68c56f8656",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162100631_000020.json": "0912f1593746e92dbf6ab7a50b183faab0765074fac86a7c3309e2ef66c64608",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162112825_000021.json": "6a0ffd62111ad098b4054a6fe71c9ac43dd96681ffef29a9d7927834311680cf",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162212264_000022.json": "2b222c9aecc1e03d0d61f7877b9b6ab0b329a442bf55d82ea24f4d28620f174b",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162324568_000023.json": "6a10d1044fc1ec1c487a3ba2e7a3f73cf05538ccda970d226c4fa02333d83283",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162413303_000024.json": "2fe404f9fd7eff16f4f6f0033e8d0ca598581bc0153107b8c8c6ac19b24b6465",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162425442_000025.json": "9c77b0839564818a7548380419ca8912e3753513afccfb515633eed8fe2a1af1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162507413_000026.json": "17da40bd53a5de5f4b87a6a4e3014336cf2c0d8e6b9123236e427f46dda591e4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162541128_000027.json": "99e51aad66cae4480d0013b6744523133c819da07fe68da11177544b372adb15"
+        },
+        "repetitions": 1,
+        "returncode": 0,
+        "revision": "a185b07687130ca086e7b3af1d940127ffe08486",
+        "shared_libraries": {
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/core/libvc_fiber_tracer.so": "97a6dbc722a55c58cae6032a60f58e856bbb5f86c1b171b22faa90977ca5f739"
+        },
+        "started_utc": "2026-09-28T13:56:50Z",
+        "wall_seconds": 109.1936699480002
+      },
+      "readout_summaries": [
+        {
+          "admitted": "84",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "13",
+          "gauge": "0",
+          "inactive": "1",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2.5",
+          "observations": "85",
+          "reference": "0",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "2",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "7",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "3",
+          "min_candidate": "-1",
+          "observations": "2",
+          "reference": "0",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "13",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "1.5",
+          "min_candidate": "-2.5",
+          "observations": "1",
+          "reference": "0",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "16",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "4",
+          "min_candidate": "0",
+          "observations": "1",
+          "reference": "0",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "19",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "4",
+          "min_candidate": "0",
+          "observations": "1",
+          "reference": "0",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "23",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "1.5",
+          "min_candidate": "-2.5",
+          "observations": "1",
+          "reference": "0",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "74",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "4",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "78",
+          "reference": "0.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "86",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "13",
+          "gauge": "0",
+          "inactive": "4",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2.5",
+          "observations": "90",
+          "reference": "1",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "91",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "5",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "96",
+          "reference": "1.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "85",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "13",
+          "gauge": "0",
+          "inactive": "5",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2.5",
+          "observations": "90",
+          "reference": "2",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "22",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "3.5",
+          "min_candidate": "-0.5",
+          "observations": "1",
+          "reference": "2",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "79",
+          "best_ties": "5",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "8",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "87",
+          "reference": "2.5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "114",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "9",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "123",
+          "reference": "3",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "2",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "4.5",
+          "min_candidate": "0.5",
+          "observations": "1",
+          "reference": "3",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "22",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "3.5",
+          "min_candidate": "-0.5",
+          "observations": "1",
+          "reference": "3",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "109",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "9",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "118",
+          "reference": "3.5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "109",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "13",
+          "gauge": "0",
+          "inactive": "2",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2.5",
+          "observations": "111",
+          "reference": "4",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "131",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "10",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "141",
+          "reference": "4.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "21",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "7.5",
+          "min_candidate": "3.5",
+          "observations": "1",
+          "reference": "4.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "115",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "9",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "124",
+          "reference": "5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "8",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "8",
+          "min_candidate": "4",
+          "observations": "1",
+          "reference": "5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "18",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "6.5",
+          "min_candidate": "2.5",
+          "observations": "1",
+          "reference": "5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "109",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "7",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "116",
+          "reference": "5.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "12",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "7",
+          "min_candidate": "3",
+          "observations": "1",
+          "reference": "5.5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "89",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "5",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "94",
+          "reference": "6",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "4",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "9",
+          "min_candidate": "5",
+          "observations": "1",
+          "reference": "6",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "119",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "3",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "122",
+          "reference": "6.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "14",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "10.5",
+          "min_candidate": "6.5",
+          "observations": "1",
+          "reference": "6.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "17",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "10.5",
+          "min_candidate": "6.5",
+          "observations": "1",
+          "reference": "6.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "95",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "7",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "102",
+          "reference": "7",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "2",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "24",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "10",
+          "min_candidate": "6",
+          "observations": "2",
+          "reference": "7",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "26",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "10",
+          "min_candidate": "6",
+          "observations": "1",
+          "reference": "7",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "122",
+          "best_ties": "5",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "9",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "131",
+          "reference": "7.5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "99",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "3",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "102",
+          "reference": "8",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "2",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "5",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "12",
+          "min_candidate": "8",
+          "observations": "2",
+          "reference": "8",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "133",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "3",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "136",
+          "reference": "8.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "86",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "10",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "96",
+          "reference": "9",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "106",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "4",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "110",
+          "reference": "9.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "102",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "6",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "108",
+          "reference": "10",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "18",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "6.5",
+          "min_candidate": "2.5",
+          "observations": "1",
+          "reference": "10",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "123",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "13",
+          "gauge": "0",
+          "inactive": "7",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8",
+          "min_candidate": "2",
+          "observations": "130",
+          "reference": "10.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "1",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "13.5",
+          "min_candidate": "9.5",
+          "observations": "1",
+          "reference": "10.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "15",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "13",
+          "min_candidate": "9",
+          "observations": "1",
+          "reference": "10.5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "87",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "14",
+          "gauge": "0",
+          "inactive": "9",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8.5",
+          "min_candidate": "2",
+          "observations": "96",
+          "reference": "11",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "3",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "14",
+          "min_candidate": "10",
+          "observations": "1",
+          "reference": "11",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "10",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "14",
+          "min_candidate": "10",
+          "observations": "1",
+          "reference": "11",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "11",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "12.5",
+          "min_candidate": "8.5",
+          "observations": "1",
+          "reference": "11",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "27",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "12.5",
+          "min_candidate": "8.5",
+          "observations": "1",
+          "reference": "11",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "130",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "13",
+          "gauge": "0",
+          "inactive": "8",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8",
+          "min_candidate": "2",
+          "observations": "138",
+          "reference": "11.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "6",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "13",
+          "min_candidate": "9",
+          "observations": "1",
+          "reference": "11.5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "9",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "14.5",
+          "min_candidate": "10.5",
+          "observations": "1",
+          "reference": "11.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "15",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "13",
+          "min_candidate": "9",
+          "observations": "1",
+          "reference": "11.5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "82",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "12",
+          "gauge": "0",
+          "inactive": "3",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8",
+          "min_candidate": "2.5",
+          "observations": "85",
+          "reference": "12",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "25",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "13.5",
+          "min_candidate": "9.5",
+          "observations": "1",
+          "reference": "12",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "112",
+          "best_ties": "1",
+          "calibrated": "1",
+          "evaluated": "13",
+          "gauge": "0",
+          "inactive": "5",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "8",
+          "min_candidate": "2",
+          "observations": "117",
+          "reference": "12.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "6",
+          "inactive": "0",
+          "lower_unbounded_best": "0",
+          "lower_unbounded_feasible": "0",
+          "max_candidate": "13",
+          "min_candidate": "9",
+          "observations": "1",
+          "reference": "12.5",
+          "upper_unbounded_best": "1",
+          "upper_unbounded_feasible": "1",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "15",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "13",
+          "min_candidate": "9",
+          "observations": "1",
+          "reference": "12.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        },
+        {
+          "admitted": "1",
+          "best_ties": "4",
+          "calibrated": "1",
+          "evaluated": "9",
+          "gauge": "20",
+          "inactive": "0",
+          "lower_unbounded_best": "1",
+          "lower_unbounded_feasible": "1",
+          "max_candidate": "16.5",
+          "min_candidate": "12.5",
+          "observations": "1",
+          "reference": "12.5",
+          "upper_unbounded_best": "0",
+          "upper_unbounded_feasible": "0",
+          "zero_weight": "0"
+        }
+      ],
+      "references": 26,
+      "tied_best_rows": 39,
+      "unbounded_best_rows": 39
+    }
+  ]
+}

@@ -1,92 +1,21 @@
-# Task log: rolling live OME-Zarr input cache for shared 3D inference
+# Neural FW/BW task log
 
-## Planning findings
+- Completed older-model matrix: all four runs182/182 directions. Flowv4 matched control102.92s; FW224.90s and1499reverse checks. Min0 errors43→3, retained99.622→69.397%; FW528confidence/518reverse stops. Min512 errors23→1, pieces352→309, retained85.831→61.773%, FW90confidence/148reverse stops, mean3.568mm/median2.461mm. No default promotion: fewer errors but substantial lost coverage. Memory results below also complete.
+- Expanded report explicitly includes saved own tuned EMA999u12100 WITHOUT FW/BW: min5120errors,86presence stops,233pieces,82.086%,mean13.079mm/median3.814mm. Width40% cosine and post-modulated cutoff0.4 remain enabled; not an unmodulated control. Report regeneration only, no GPU allocation. All historical and matched rows, min0/min512 and per-scroll data retained.149native/38Python tests passed for the extension. Limitations remain GT-arc neural reseeding, GT-assisted min512 filtering, and BF16/control variation; old models use verified frozen upstream runtime, not current incompatible loader.
 
-- Bulk auto-download currently completes before inference. TensorStore's
-  existing bounded read-ahead only reads already-local chunks and is not a
-  remote materialization cache.
-- The shared runner currently uses transient local chunk existence both to
-  skip model tiles and to classify supported output chunks. Live caching must
-  make these checks authoritative against remote inventory or an initially
-  empty/evicted cache can incorrectly suppress valid inference.
-- Canonical traversal is Z-major with lazily materialized axis lattices. The
-  live window can therefore remain bounded at 10,000 events and a safe eviction
-  frontier can advance only after a complete canonical model Z row commits.
-- At the current 512/96/32 defaults, PHercParis4 scale 0 has 6,241 tiles per
-  model Z row. A 10,000-tile window spans at most three model Z positions and
-  approximately 7--12 128-voxel input Zarr planes. The configured 10 TiB cache
-  target is much larger than the immediate forward working set.
-- A conservative target requires no ahead/LRU deletion: when over target,
-  delete oldest whole planes strictly behind the safe boundary; if none are
-  available, report and temporarily remain over target.
-- `preprocess_cos_omezarr.py` still contains a duplicated automatic-download
-  wrapper even though Fiber imports the shared runner helper. This task will
-  remove that divergence rather than add another backend-specific cache path.
-- Independent review required remote inventory to remain active-plane bounded,
-  clarified sparse-plane eviction, preserved `.noremote` as advisory only,
-  separated the 10,000 descriptor/materialization window from the much smaller
-  TensorStore tile-array window, and strengthened local accounting, metadata
-  validation, shared/exclusive locking, and fatal transport-error behavior.
-- Current uncommitted downloader retry/progress/scanner-failure changes are the
-  baseline for this task and must be preserved rather than rewritten away.
+- Follow-up requested memory/Flowv4 and explicit own EMA999 without FW. Historical rows were unfiltered only. Plan extends same task to both with original batch8/16case workers, and matched current-code unfiltered controls because upstream changed since historical runs. Shared filter/scheduling untouched.
+- Compatibility inspection: current legacy loader rejects memory='decisions'. Reuse frozen historical model/rollout package from ba86eea12 as a versioned runtime artifact (not a reimplementation). All181 Python file hashes match each saved historical run. Namespace activation corrected for namespace packages. Original forward cap was3×remaining GT arc, now explicitly retained. Memory policy .4/full/8,3refinement steps; Flowv4 checkpoint policy .5/prefix/16,0refinement steps. Heading hash matches both. Matched controls still planned to measure integration/batching variation.
+- Independent extension/implementation review approved the frozen runtime path and restored callback/length semantics.149native/38Python tests passed, including old policy/batch preservation. Memory reverse pilot completed; Flow reverse pilot queued via manager.
+- Both older-model reverse pilots passed. Started full matrix via same approved command, control older_matrix true: memory control→memory FW/BW→Flowv4 control→Flowv4 FW/BW. Each182directions, GPU0–5. Report after each full run, historical rows retained separately.
+- Memory matched control completed101.30s: min0 14errors/99.042% retained; min5126errors/340pieces/77.053%,225confidence stops. Memory FW completed212.42s,1525reverse checks: min0 3errors/63.940% retained,1137confidence/546reverse stops; min5121error/287pieces/48.426%,84confidence/153reverse stops,mean2.809mm,median1.711mm. Strong error reduction but major coverage loss. Historical memory min5126errors/336pieces/76.542% remains a distinct saved row. Flowv4 next.
 
-## Deviations
-
-- Live fetching initially manages only the primary selected input scale.
-  Lasagna `pred_dt` is an independent post-inference external source; live mode
-  rejects a separately remote `pred_dt` rather than silently materializing a
-  second unbounded cache. Already-local `pred_dt` behavior remains unchanged.
-- S3 list responses are consumed as keys, not object-size projections. Progress
-  therefore reports exact completed resident/downloaded bytes, current transfer
-  rate, and in-flight chunk count, but does not invent a projected-byte total.
-  Actual completed bytes remain the sole eviction trigger as required.
-
-## Implementation
-
-- Added `lasagna/live_omezarr_cache.py` with selected-level metadata validation,
-  authoritative lazy per-Z remote inventory, atomic retrying raw-chunk transfer,
-  aggregate local accounting, shared/exclusive advisory locking, and
-  conservative whole-plane eviction.
-- Kept canonical event generation lazy while separating the 10,000-item live
-  materialization window from the existing bounded TensorStore/full-tile read
-  window. Durable completed outputs are skipped before fetch. Serial and
-  multi-device paths call the same shared scheduler.
-- Changed live source-support checks to use authoritative remote inventory,
-  never transient local cache contents or `.noremote` state.
-- Removed the duplicate Lasagna downloader implementation and routed Fiber and
-  Lasagna through the shared automatic-download helper. Bulk download takes the
-  same exclusive selected-level lock used by live mutation; ordinary tiled
-  readers take a shared lock.
-- Added Fiber, Lasagna, and manager CLI flags, manager completion, source-link
-  initialization without bulk prefetch, portable provenance, and final manager
-  cache statistics. Normal non-live prefetch and no-prefetch behavior remains
-  unchanged.
-- Made progress refresh once per second through both terminals and manager
-  pipes, with newline history checkpoints at most once per minute while work
-  advances. Remote-missing accounting now counts each absent chunk once when
-  its Z-plane inventory is first listed instead of counting overlapping tile
-  requests repeatedly.
-- Updated shared inference specs, code-structure documentation, Lasagna README,
-  manager documentation, and changelog.
-
-## Validation
-
-- `python -m py_compile` passed for the new cache, shared runner, downloader,
-  both inference entry points, and manager modules.
-- `pytest lasagna/tests/test_live_omezarr_cache.py
-  lasagna/tests/test_live_tiled_predict3d.py
-  lasagna/tests/test_download_omezarr.py lasagna/tests/test_manager.py -q`:
-  **77 passed**.
-- Two focused legacy shared-runner tests covering normal Python-Zarr/TensorStore
-  serial equivalence and lazy canonical events: **2 passed**.
-- Fiber CLI/signature tests including live options and invalid combinations:
-  **7 passed, 199 deselected**.
-- Fiber, Lasagna, and manager `--help` smoke checks expose all three live flags.
-- `git diff --check` passed.
-- Focused progress/missing-accounting regression validation: **11 passed**.
-- No real S3/full-volume performance run was made, so no throughput or peak-cache
-  claim is reported. The focused synthetic tests verify window ordering,
-  pre-fetch resume rejection, selected-scale isolation, exact accounting, and
-  safe-plane deletion. A broader local suite attempt encountered an existing
-  Zarr 3/Python 3.14 synchronous `open_group` stall in an unrelated atomic-output
-  test; the focused normal-runner tests complete successfully.
+- Prior work committed:956a81c1e,510339f25. Branch fiber-exp5.
+- Plan: shared native consistency; Flowv5 and Unified unchanged model policies; GPU0–5. Neural reseeding cannot use dense presence peaks and retains reference-arc progression; this is an explicit comparison limitation.
+- Independent review approved with explicit GT-arc reseed, separate reverse state, shared exact verifier and completion-based acceptance. Implemented these requirements.
+- Approved runner build passed; native suites99+23+27 cases and Python36 tests passed, including full-prefix/terminal success, lateral/wrong-way/duplicate/confidence failure, existing history/width regressions. Pilot next.
+- Additional rollback/GT-error endpoint test passed (37Python total); independent implementation review found no blocking defect. Both GPU pilots completed with nested reverse inference through the existing queue. Full182-case runs started for both models, sequential model scheduling on GPU0–5.
+- Flowv5 full completed:1533 reverse checks,364.24s to last case. Min0:26→8 error episodes,97.172→71.448% retained;454 reverse stops/2776 confidence stops. Min512:14→5 errors,296→254 pieces,84.840→62.789% retained;74reverse/78confidence stops,mean5.509mm,median2.485mm. Thus error reduction costs substantial coverage; no promotion. Unified pending.
+- Unified full completed:1392reverse checks,432.38s to last case. Min0:24→5errors,96.320→70.919% retained;391reverse/3812confidence stops. Min512:13→3errors,285→239pieces,86.662→65.357% retained;60reverse/75confidence stops,mean6.518mm,median2.795mm.
+- Both full182-direction runs complete. Report includes historical memory/Flowv4, unchanged unfiltered new-model controls and tuned regular EMA999u12100 (min512:0errors/233pieces/82.086%). Exact reference geometry and checkpoint/policy/precision audits passed. Historical controls were not rerun; BF16 batching sensitivity remains.
+- Approved command for all builds/tests/pilots/full runs/report: `bash /home/hendrik/villa3/scripts/run_training_failure_mining`. Control action `neural_follow`, operation `build` / tests true / reverse true with pilot true or false / operation report. Tests:149native +37Python passed, including disabled parity. GPUs0–5,192CPU manager grant, unchanged batching/loading settings.
+- Durable results: docs/benchmarks/neural_follow_reverse_20261007.md and JSON; artifacts /ephemeral/hendrik/fiber3d_train2/evaluations/neural_follow_reverse_91_20261007_v1. Shared native verifier rather than duplicated Python geometry. No default promotion. Explicit limitation: GT-arc neural reseeding differs from dense-presence-aligned regular reseeding; min512 output analysis is GT-assisted. Older memory/Flowv4 not new FW/BW trials.

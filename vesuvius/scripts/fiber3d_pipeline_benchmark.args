@@ -1,0 +1,36 @@
+# One command-line argument per line. The launcher command itself stays fixed
+# so a single execution approval covers subsequent benchmark configurations.
+--samples
+4096
+--warmup-samples
+128
+--verify-samples
+0
+--shared-workers
+128
+--initial-in-flight
+128
+--shared-load-affinity-workers
+120
+--raw-queue-capacity
+128
+--result-queue-capacity
+128
+--max-in-flight
+512
+--cache-state
+warm
+--volume-io-threads
+1
+--volume-decode-threads
+1
+--volume-sample-threads
+1
+--disable-locality-stats
+--geometry-backend
+native
+--value-augmentation-backend
+native
+--shared-tensor-slots
+--defer-cuda-augmentation
+all

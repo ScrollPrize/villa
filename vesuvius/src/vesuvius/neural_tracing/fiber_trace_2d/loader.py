@@ -2324,8 +2324,8 @@ class FiberStrip2DLoader:
         c1 = c10 * (1.0 - fy) + c11 * fy
         return float(c0 * (1.0 - fz) + c1 * fz)
 
+    @staticmethod
     def _normal_sample_context(
-        self,
         record: _Record,
         point_zyx_base: np.ndarray,
         *,
@@ -2471,8 +2471,9 @@ class FiberStrip2DLoader:
             )
         return normal.astype(np.float32)
 
-    def _lasagna_normals_at_zyx_batch(
-        self,
+    @classmethod
+    def sample_lasagna_normals_at_zyx_batch(
+        cls,
         record: _Record,
         points_zyx_base: np.ndarray,
         *,
@@ -2491,22 +2492,22 @@ class FiberStrip2DLoader:
         if line_indices.shape != (count,):
             raise ValueError("line_indices must have shape [N]")
 
-        grad_cube, grad_frac, grad_in_bounds = self._interpolation_cubes_block(
+        grad_cube, grad_frac, grad_in_bounds = cls._interpolation_cubes_block(
             record.grad_mag,
             points,
             array_spacing_base=record.grad_mag_spacing_base,
         )
-        grad_value = self._trilinear_cubes(grad_cube, grad_frac)
+        grad_value = cls._trilinear_cubes(grad_cube, grad_frac)
         assert record.nx is not None
         assert record.ny is not None
         assert record.nx_spacing_base is not None
         assert record.ny_spacing_base is not None
-        nx_cube, nx_frac, nx_in_bounds = self._interpolation_cubes_block(
+        nx_cube, nx_frac, nx_in_bounds = cls._interpolation_cubes_block(
             record.nx,
             points,
             array_spacing_base=record.nx_spacing_base,
         )
-        ny_cube, _ny_frac, ny_in_bounds = self._interpolation_cubes_block(
+        ny_cube, _ny_frac, ny_in_bounds = cls._interpolation_cubes_block(
             record.ny,
             points,
             array_spacing_base=record.ny_spacing_base,
@@ -2550,7 +2551,7 @@ class FiberStrip2DLoader:
             if not bool(grad_in_bounds[int(local_index)]):
                 invalid_by_line[line_index] = (
                     "missing Lasagna grad_mag sample at fiber line point: "
-                    + self._normal_sample_context(
+                    + cls._normal_sample_context(
                         record,
                         point,
                         channel="grad_mag",
@@ -2562,7 +2563,7 @@ class FiberStrip2DLoader:
             elif not (np.isfinite(grad_value[int(local_index)]) and grad_value[int(local_index)] > 0.0):
                 invalid_by_line[line_index] = (
                     f"Lasagna grad_mag sample is zero at fiber line point value={grad_value[int(local_index)]:.6g}: "
-                    + self._normal_sample_context(
+                    + cls._normal_sample_context(
                         record,
                         point,
                         channel="grad_mag",
@@ -2576,7 +2577,7 @@ class FiberStrip2DLoader:
                 spacing = record.nx_spacing_base if missing == "nx" else record.ny_spacing_base
                 invalid_by_line[line_index] = (
                     "missing Lasagna nx/ny sample at fiber line point: "
-                    + self._normal_sample_context(
+                    + cls._normal_sample_context(
                         record,
                         point,
                         channel=missing,
@@ -2588,7 +2589,7 @@ class FiberStrip2DLoader:
             elif not (np.isfinite(total_weight[int(local_index)]) and total_weight[int(local_index)] > 1.0e-12):
                 invalid_by_line[line_index] = (
                     "degenerate Lasagna normal sample at fiber line point: "
-                    + self._normal_sample_context(
+                    + cls._normal_sample_context(
                         record,
                         point,
                         channel="nx",
@@ -2600,7 +2601,7 @@ class FiberStrip2DLoader:
             else:
                 invalid_by_line[line_index] = (
                     "degenerate Lasagna normal sample at fiber line point after principal-axis solve: "
-                    + self._normal_sample_context(
+                    + cls._normal_sample_context(
                         record,
                         point,
                         channel="nx",
@@ -2610,6 +2611,9 @@ class FiberStrip2DLoader:
                     )
                 )
         return normals, valid, invalid_by_line
+
+    # Preserve existing callers; both names share the exact sampling implementation.
+    _lasagna_normals_at_zyx_batch = sample_lasagna_normals_at_zyx_batch
 
     def _line_window_for_patch(
         self,

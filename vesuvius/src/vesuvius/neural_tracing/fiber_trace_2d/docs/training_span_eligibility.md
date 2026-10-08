@@ -1,0 +1,85 @@
+# Training span eligibility
+
+The 3D file-backed loader filters training and test-loss data identically:
+only `cspline` and `trace` spans are retained, regardless of length. Line points
+outside the original first/last control points are removed. Rejected spans
+split the fiber into contiguous components; no synthetic bridge is created.
+Supervision uses the selected component only. Scroll-balanced sampling remains
+uniform per scroll and uniform over retained arclength within the scroll.
+
+NML explicitly annotated edges remain usable: their parser-generated legacy
+Lasagna metadata does not describe actual interpolation. JSON without eligible
+provenance is skipped; an empty dataset raises an error. Source files are not
+modified. The separate 50-fiber tracing evaluator is deliberately unchanged.
+Test losses and sample indices therefore differ from older training runs.
+
+## New training
+
+`train_5scroll_json_eligible_ema_16x8.json` uses the five-scroll train/test JSON
+split, no NML or historical auxiliary test source, no embeddings, LR0.01,
+128 patches/update (16 per GPU at full allocation), BF16/GroupNorm/stride4,
+2M updates, EMA0.99/0.999, tests and checkpoints every100 updates.
+It starts fresh; do not pass `--resume`.
+
+```bash
+source /home/hendrik/.venv_las/bin/activate
+python -m vesuvius.neural_tracing.fiber_trace_3d.train /home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_5scroll_json_eligible_ema_16x8.json
+```
+
+Manager handling remains automatic. After validation, the user-requested fresh
+run was launched as `5scroll_json_eligible_128_sd1_16x8_ema_20260914_105436` in
+`/ephemeral/hendrik/fiber3d_train2/runs`. It completed startup calibration and
+entered adaptive training; manager scheduling may pause/resume it.
+
+The full-resolution comparison config is
+`train_5scroll_json_eligible_fullres_ema_16x8.json`. It is an exact copy of the
+regular configuration except for `model_3d.output_stride: 1` and the distinct
+run name `5scroll_json_eligible_fullres_128_sd1_16x8_ema`. It starts from random
+initialization with no refinement, embedding, or resume source. Its config
+fingerprint is distinct, so cooperative startup measures stride-1 memory rather
+than accepting the stride-4 calibration.
+
+The managed run launched at 2026-09-16 19:23 UTC as
+`5scroll_json_eligible_fullres_128_sd1_16x8_ema_20260916_192344`. Startup
+measured microbatch 8, saved calibration fingerprint
+`7fa1c121dd3ca12a56efeda8046f3725d81bdd565c281961e115ca977d6305e5`,
+then re-registered for adaptive training. It reached update 200 and completed
+the update-100 and update-200 raw/EMA tests during launch verification.
+
+The subsequent contrastive variant is
+`train_5scroll_json_eligible_paired_contrastive_ema_16x8.json`: identical regular
+settings plus16 embedding channels, paired local contrastive loss (64pairs per
+128patch update), prior normal manifests, temperature0.1/margin0.2/weight1.
+Both patches belong to the same retained component. No NML is reintroduced.
+On user request the regular run was stopped and this variant launched fresh
+at20260914_164401, without resuming weights. Its config equivalence test passed.
+
+## Verification
+
+Approved caller: `vesuvius/scripts/run_fiber3d_cooperative_tests`, selecting
+`training-spans` in its adjacent JSON. CPU geometry, loader integration,
+deterministic length-weighted sampling and actual corpus audit; no changed GPU
+math and no GPU use required.
+
+Validation:38 focused tests passed (2 CUDA skips),32.75s;317 existing sampling,
+queue, loss and normal-loading regression tests passed (11 skips,2 expected
+failures),26.06s. Approved runner output under
+`/ephemeral/hendrik/fiber3d_train2/cooperative-tests/20260914_104925_629191`
+and `20260914_105208_737537`. No training-speed claim is made for this data-policy
+change. Ambiguous repeated CP coordinates fail explicitly; the full configured
+JSON corpus passes the exact CP mapping.
+
+The full-resolution config comparison was validated separately by the same
+approved `training-spans` suite: 40 passed, 2 CUDA-gated skips in 33.02s, output
+`20260916_191912_825700`. No performance claim is made before the real run.
+
+| Scroll | Train sources → components | Test sources → components |
+|---|---:|---:|
+| PHerc0139 | 197 → 382 | 10 → 31 |
+| PHerc0332 | 74 → 88 | 3 → 3 |
+| PHerc1299 | 77 → 98 | 5 → 5 |
+| PHerc1451 | 5 → 16 | 2 → 2 |
+| PHercParis4 | 593 → 940 | 30 → 49 |
+
+Splitting does not assign equal weight to each component. Original corpus paths
+and detailed retained lengths are printed by the local regression test.

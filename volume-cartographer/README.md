@@ -80,6 +80,14 @@ To build from source on macOS, use the Homebrew LLVM build helper:
 scripts/build_macos.sh --install-deps
 ```
 
+HiGHS is optional. CMake enables fiber-trace LP/MILP labeling when it finds
+`highs::highs`; otherwise only that solver is disabled, with an explicit runtime
+error if requested. Python volume access, fiberlet preprocessing and other
+tracing methods remain available. Set `-DVC_ENABLE_HIGHS=OFF` to disable it
+explicitly, or provide `highs_DIR` when HiGHS is installed outside standard paths.
+For native test-hang diagnostics, `VC_TEST_TRACE=1` prints each test case before
+running it; normal test output remains compact without that environment variable.
+
 After dependencies are installed, rebuilds can use:
 
 ```bash

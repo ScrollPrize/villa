@@ -122,7 +122,7 @@ def test_parse_vc3d_fiber_validates_and_preserves_xyz_order():
         )
 
 
-def test_parse_vc3d_fiber_v3_segment_metadata():
+def test_parse_vc3d_fiber_v3_segment_metadata(tmp_path):
     segment = {
         "optimizer": "native_fiber_trace3d",
         "metadata_version": 3,
@@ -180,6 +180,39 @@ def test_parse_vc3d_fiber_v3_segment_metadata():
     assert fiber.control_point_segments[0].meeting_error_base_voxels == 2.5
     assert fiber.control_point_segments[0].meeting_error_ratio == 1.25
     assert fiber.control_point_segments[1] is None
+    from vc3d_fiber_format import serialize_segment_metadata
+    assert serialize_segment_metadata(fiber.control_point_segments[0]) == segment
+    from vc3d_fiber_format import parse_segment_metadata
+    tagged = dict(segment, tags=["damaged"])
+    assert serialize_segment_metadata(parse_segment_metadata(tagged, version=4)) == tagged
+
+    reviewed = {
+        "type": "vc3d_fiber", "version": 4,
+        "optimization_mode": "native_fiber_trace3d",
+        "line_points": [[1, 2, 3], [4, 5, 6]],
+        "control_points": [
+            {"position": [1, 2, 3], "segment_to_next": segment,
+             "direction": [1, 0, 0], "display_normal": [0, 1, 0],
+             "display_normal_source": "manual"},
+            {"position": [4, 5, 6]},
+        ],
+    }
+    reviewed_fiber = parse_vc3d_fiber(reviewed)
+    np.testing.assert_array_equal(reviewed_fiber.line_points_xyz, fiber.line_points_xyz)
+    assert reviewed_fiber.control_point_segments == fiber.control_point_segments
+    reviewed["control_points"][0]["unknown_hint"] = 1
+    with pytest.raises(ValueError, match="unknown fields"):
+        parse_vc3d_fiber(reviewed)
+    from vesuvius.neural_tracing.fiber_trace_3d.refinement import GeometryStore, RefinementConfig, export_metadata
+    import zipfile
+    store = GeometryStore(tmp_path / "geometry")
+    key = "a" * 64
+    store.register(key, fiber.line_points_zyx, {"export": export_metadata(fiber)}, RefinementConfig())
+    store.save(tmp_path / "fibers.zip")
+    with zipfile.ZipFile(tmp_path / "fibers.zip") as archive:
+        roundtrip = parse_vc3d_fiber(json.loads(archive.read(key + "/fiber.json")))
+    assert roundtrip.control_point_segments == fiber.control_point_segments
+    np.testing.assert_allclose(roundtrip.control_points_xyz, fiber.control_points_xyz)
 
     invalid = {
         "type": "vc3d_fiber",

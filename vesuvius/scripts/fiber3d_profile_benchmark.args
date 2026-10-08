@@ -1,0 +1,18 @@
+# One CLI argument per line. The fixed caller parses this file without eval.
+--evaluation-only
+--reference
+/home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_collection_20260909_5scroll_16x8.json
+--backend
+pipeline
+--devices
+all
+--samples
+512
+--batch-size
+16
+--passes
+2
+--cpu-workers
+128
+--timeout
+300

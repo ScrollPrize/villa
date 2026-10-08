@@ -1,0 +1,252 @@
+[
+  {
+    "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_cached_batched_20260911_v2/run_0_entries_4096/summary.json",
+    "status": "corrected",
+    "original_sha256": "d0981c260aa3fee1f0c31b1b75d6cbefb02302a6ef2c4bd3d18944078d4cacc8",
+    "corrected_sha256": "9e45173a499240e3edb00c45c058a0fa920f76350f30f20cec5c685edbbfce15",
+    "directions": 4,
+    "failures": 20,
+    "segments": 24,
+    "mean_mm": 1.555541804220635
+  },
+  {
+    "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_cached_batched_20260911_v2/run_1_entries_4096/summary.json",
+    "status": "corrected",
+    "original_sha256": "e6c85bebd7eb412b996269fe4dc6477fd011cf26c55d5af9d42a66fce8a5d65e",
+    "corrected_sha256": "07c7ab41373e2da6cbb59f770f41c198a1e59e29ac7afd751125f156cdd9eedb",
+    "directions": 4,
+    "failures": 20,
+    "segments": 24,
+    "mean_mm": 1.555541804220635
+  },
+  {
+    "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_cached_batched_20260911_v3/run_0_entries_4096/summary.json",
+    "status": "corrected",
+    "original_sha256": "05f82e67f533135de41beb55bff0ea05a92a38553730bf5f76313b9857b8bf44",
+    "corrected_sha256": "08cc8425d9861802361a9ad867b5c639a38e99a1784d3ff504067bd091408ff4",
+    "directions": 4,
+    "failures": 20,
+    "segments": 24,
+    "mean_mm": 1.555541804220635
+  },
+  {
+    "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_cached_batched_20260911_v3/run_1_entries_4096/summary.json",
+    "status": "corrected",
+    "original_sha256": "51b52078e86c18299e29501f06d71e3dcb4c628c8bcae8c67dd83595c3a2a47c",
+    "corrected_sha256": "65132d1e6f8d524715a8ee12f1f9c00bc2f6c867254bbc7a488015b79d54d74d",
+    "directions": 4,
+    "failures": 20,
+    "segments": 24,
+    "mean_mm": 1.555541804220635
+  },
+  {
+    "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_cached_readiness_20260911_v2/run_0_entries_0/summary.json",
+    "status": "corrected",
+    "original_sha256": "4d7958b0d50cf53a8b8f91ef5ebb6ec265110d3acf65f750244fe8a65204d135",
+    "corrected_sha256": "99d808e58d335bbc6fec51761f2e0e4f97ced03b491720cf3514f70085af2ef7",
+    "directions": 8,
+    "failures": 21,
+    "segments": 29,
+    "mean_mm": 3.5023102059379982
+  },
+  {
+    "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_cached_readiness_20260911_v2/run_1_entries_4096/summary.json",
+    "status": "corrected",
+    "original_sha256": "29f58071b92a66aedc25ec20ce54dfe22e653884239bd8d8d369b78b5ee3f55f",
+    "corrected_sha256": "a8d99e91a2a8d1c1697a1a5570aff904b21824e23949dc39db2aa16712046329",
+    "directions": 8,
+    "failures": 21,
+    "segments": 29,
+    "mean_mm": 3.5023102059379982
+  },
+  {
+    "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_cached_readiness_20260911_v2/run_2_entries_4096/summary.json",
+    "status": "corrected",
+    "original_sha256": "02c2c38422ac1f1c7326dc194312e1df57bee1f612566a7c2f4440b0716e76d2",
+    "corrected_sha256": "bc0c6d2f992330811141e209c08ce69c1983314c7c5585f3e651bb0318c3f1a5",
+    "directions": 8,
+    "failures": 21,
+    "segments": 29,
+    "mean_mm": 3.5023102059379982
+  },
+  {
+    "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_cached_readiness_20260911_v2/run_3_entries_0/summary.json",
+    "status": "corrected",
+    "original_sha256": "894d477a889ddd2d3686d61617dff7a5e1ff446b57f0353f699eb5530ba1f682",
+    "corrected_sha256": "33b9e25c20c280f10f759c4e889015feecb8c3871e1a51ca4ede39c2048d269f",
+    "directions": 8,
+    "failures": 21,
+    "segments": 29,
+    "mean_mm": 3.5023102059379982
+  },
+  {
+    "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_cached_readiness_20260911_v3/run_0_entries_0/summary.json",
+    "status": "corrected",
+    "original_sha256": "2f9e0dc7b028de125f89d4622a7de2767b95e65ca47b5458c234c2bcb0c3e811",
+    "corrected_sha256": "02474b13a5d567314eb140ee7c8863455847ae3ea4839fb007a2332bdc74ad4c",
+    "directions": 8,
+    "failures": 22,
+    "segments": 30,
+    "mean_mm": 3.385566685260244
+  },
+  {
+    "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_cached_readiness_20260911_v3/run_1_entries_4096/summary.json",
+    "status": "corrected",
+    "original_sha256": "8e705b36cdb7164111af98a5aa21b9cba2cd58534ea8ba05ee872446501f38f2",
+    "corrected_sha256": "cd336fc4fb6afcbdb21a2b6021e9c80aad646c86f00d5a356c4c23626c52652f",
+    "directions": 8,
+    "failures": 22,
+    "segments": 30,
+    "mean_mm": 3.385566685260244
+  },
+  {
+    "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_cached_readiness_20260911_v3/run_2_entries_4096/summary.json",
+    "status": "corrected",
+    "original_sha256": "1542f0f56d79a59be7b64cbed718fa8abb1cda960176b84c7fc8c8a282913d37",
+    "corrected_sha256": "3dd300c58d93dc41c48dd717d062ea35812db1164c49863619ee22acc8b36543",
+    "directions": 8,
+    "failures": 22,
+    "segments": 30,
+    "mean_mm": 3.385566685260244
+  },
+  {
+    "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_cached_readiness_20260911_v3/run_3_entries_0/summary.json",
+    "status": "corrected",
+    "original_sha256": "b75b37ac3025ed07c3239e443b2ac8020d23c69f52926614e121eee5048580ff",
+    "corrected_sha256": "46afe03c6a5b7399fe0457c4a07c5d873c044399890c830cf6d5c3d6193e5f53",
+    "directions": 8,
+    "failures": 22,
+    "segments": 30,
+    "mean_mm": 3.385566685260244
+  },
+  {
+    "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_four_dynamic256_b1_20260911_v1/full/summary.json",
+    "status": "corrected",
+    "original_sha256": "2cf17380dac4f0796c52511348a79a15f635812c80f0744c41be8800b174e5c5",
+    "corrected_sha256": "e168d71e5397dca9cd96ccf2c12faaeb22fe9fcb8f2577e7489146f4f2a696ea",
+    "directions": 8,
+    "failures": 26,
+    "segments": 34,
+    "mean_mm": 2.987264722288451
+  },
+  {
+    "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_four_dynamic256_b2_20260911_v1/full/summary.json",
+    "status": "corrected",
+    "original_sha256": "56c4076d35e7ddbdc414266f9cf11e71a5e3b49b146687d9278926e03bee9c0f",
+    "corrected_sha256": "96d5d7238e32e3ec6a0976d780835513535e6ebf6c07bc07a55e1e0974ede53f",
+    "directions": 8,
+    "failures": 25,
+    "segments": 33,
+    "mean_mm": 3.077787895691131
+  },
+  {
+    "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_four_dynamic256_b4_20260911_v1/full/summary.json",
+    "status": "corrected",
+    "original_sha256": "007bb9509f6468abe81f2e25699e062ebf4dcdd00ebf75a259eb911be3ebc44b",
+    "corrected_sha256": "c35e398d1aa8c995c6ca5de480089cd763df196c3a9319bbcc3ffbed97aeafa5",
+    "directions": 8,
+    "failures": 22,
+    "segments": 30,
+    "mean_mm": 3.385566685260244
+  },
+  {
+    "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_four_dynamic256_b8_20260911_v1/full/summary.json",
+    "status": "corrected",
+    "original_sha256": "e5d28f02952a50dfde3b18488fca47504b339fe9dfd762694fb681e3154a868d",
+    "corrected_sha256": "053fc6a2d552e565076ece0a54dbfafaec823b7bff792c48a7f1a857d74f3a4d",
+    "directions": 8,
+    "failures": 22,
+    "segments": 30,
+    "mean_mm": 3.385566685260244
+  },
+  {
+    "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_four_fresh_tile256_20260911_v1/full/summary.json",
+    "status": "corrected",
+    "original_sha256": "d9a1997d15d816ab73f95ce906b212ac14a01267bfb156488284a31c6d91bd2b",
+    "corrected_sha256": "c23fa5080a7deb560c01e905dc61b5b6607530b0432f25373804e045a9c92121",
+    "directions": 8,
+    "failures": 22,
+    "segments": 30,
+    "mean_mm": 3.3855666852602444
+  },
+  {
+    "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_four_fresh_tile512_20260911_v1/full/summary.json",
+    "status": "corrected",
+    "original_sha256": "78f50dcf3fd8387cfefbc83cec608fc9f898b12d1b5994deebb5f41fb1c712bf",
+    "corrected_sha256": "fd5fcb003bde97fa42a5b1e45ae922230c13b7d463300a28e437a51abc6df8ed",
+    "directions": 8,
+    "failures": 23,
+    "segments": 31,
+    "mean_mm": 3.2763548567034624
+  },
+  {
+    "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_full_dynamic256_b1_20260911_v3_heap/full/summary.json",
+    "status": "corrected",
+    "original_sha256": "c47b086d64db24ae267722e535f624dd2742af4d42932ccd9ddf7a74974354ad",
+    "corrected_sha256": "15ce4df91b1e69ce86bf7e833f2566c92fca6e467c74803c602d6aebd3d25eb8",
+    "directions": 100,
+    "failures": 2011,
+    "segments": 2111,
+    "mean_mm": 3.828307939187497
+  },
+  {
+    "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_full_dynamic256_b8_20260911_v2/full/summary.json",
+    "status": "corrected",
+    "original_sha256": "e39950516ad1cc2bb2ec7eaa1aeb0cdc7e205ea1617c7033910c880b5e70b15a",
+    "corrected_sha256": "32a9dca95f1d9fa8ca5a66da902361399d811436b186af3cba1d4e42096660e2",
+    "directions": 100,
+    "failures": 1990,
+    "segments": 2090,
+    "mean_mm": 3.866774191208041
+  },
+  {
+    "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_full_dynamic256_b8_20260911_v3_heap/full/summary.json",
+    "status": "corrected",
+    "original_sha256": "7ded270d794461c558ee6ca2f4a7ea8091db7a382dec231c130dedc7285c9d3c",
+    "corrected_sha256": "04ca86dadbd21f0b7aaf5cffbf235ced9698bf54d79f4fed763c97e2f78c98a8",
+    "directions": 100,
+    "failures": 1995,
+    "segments": 2095,
+    "mean_mm": 3.8575456131860646
+  },
+  {
+    "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_s1_91500_20260910/pilot/summary.json",
+    "status": "corrected",
+    "original_sha256": "9178f5503528c7a2e3c5f40d8a3fdaf05c5d804993cd91f2cbeb4ee8234b2edc",
+    "corrected_sha256": "75645082f194f87f67c3795120a9d9172e12715bf3bee3cff220a0b7bf01449c",
+    "directions": 2,
+    "failures": 2,
+    "segments": 4,
+    "mean_mm": 3.664325397890066
+  },
+  {
+    "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_s1_91500_20260911_unified_cache_v1/full/summary.json",
+    "status": "corrected",
+    "original_sha256": "51171a3c28c1b3186980d10a59c2deb18a431c5e56b6d49a1aee17b5be389bee",
+    "corrected_sha256": "78feb8445cf00e0e4dbe97958ceebe3f0f1a9e0dc5ca4eba00a328eaeaf17aa8",
+    "directions": 100,
+    "failures": 1769,
+    "segments": 1869,
+    "mean_mm": 4.32400110199294
+  },
+  {
+    "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/collection_182306_best3k_full256_b8_20260911_v1/full/summary.json",
+    "status": "corrected",
+    "original_sha256": "f305da5e3d6a8f09f77d019e66f407f7e09dce5f00a260dca036b0bded96d8d4",
+    "corrected_sha256": "6d64454d3a87994c474a16792653ac2379fd58ec7be273a0b527dfbd2e34f312",
+    "directions": 100,
+    "failures": 2144,
+    "segments": 2244,
+    "mean_mm": 3.6014073349486657
+  },
+  {
+    "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/collection_best17k_full256_b8_20260911_v1/full/summary.json",
+    "status": "corrected",
+    "original_sha256": "2e7c70e7c66273a6ff55a14503db38fe99b44370a52efc14edb957f5bbad977a",
+    "corrected_sha256": "32ef30011b8fab6f77be00b1df738c863e7e0afebebbffe3be541ea4ea35311c",
+    "directions": 100,
+    "failures": 2885,
+    "segments": 2985,
+    "mean_mm": 2.707389634715178
+  }
+]

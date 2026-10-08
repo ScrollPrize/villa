@@ -1,5 +1,9 @@
 # VC3D Line Annotation Fibers
 
+Whole-volume prediction-grid anchor extraction for the later fiberlet pipeline
+is documented separately in [fiberlets.md](fiberlets.md). It reuses the same
+compact direction decoder and Lasagna cache but does not modify line annotations.
+
 ## CP direction annotations
 
 Shift-drag near an existing CP in either strip to edit its forward direction.

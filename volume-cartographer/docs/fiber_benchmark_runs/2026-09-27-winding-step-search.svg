@@ -1,0 +1,139 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1302"><g font-family="sans-serif" font-size="12"><text x="10" y="20">Winding step search: initial accuracy (green), shift score (blue), reference-assisted accuracy if measured (purple), all percent</text>
+<text x="10" y="55">orthogonal-d10-c10-distance-screen</text>
+<rect x="650" y="45" width="23.076923076923077" height="14" fill="#289b65"/><text x="855" y="56">11.54%</text>
+<rect x="950" y="45" width="30.76923076923077" height="14" fill="#3984cf"/><text x="1155" y="56">15.38%</text>
+<text x="10" y="82">orthogonal-d100-c0p1-fixed-distance-screen</text>
+<rect x="650" y="72" width="30.76923076923077" height="14" fill="#289b65"/><text x="855" y="83">15.38%</text>
+<rect x="950" y="72" width="53.846153846153854" height="14" fill="#3984cf"/><text x="1155" y="83">26.92%</text>
+<text x="10" y="109">orthogonal-d100-c1-fixed-distance-screen</text>
+<rect x="650" y="99" width="23.076923076923077" height="14" fill="#289b65"/><text x="855" y="110">11.54%</text>
+<rect x="950" y="99" width="46.153846153846146" height="14" fill="#3984cf"/><text x="1155" y="110">23.08%</text>
+<text x="10" y="136">orthogonal-d100-c10-fixed-distance-screen</text>
+<rect x="650" y="126" width="23.076923076923077" height="14" fill="#289b65"/><text x="855" y="137">11.54%</text>
+<rect x="950" y="126" width="69.23076923076923" height="14" fill="#3984cf"/><text x="1155" y="137">34.62%</text>
+<text x="10" y="163">orthogonal-d100-c100-fixed-distance-screen</text>
+<rect x="650" y="153" width="38.46153846153846" height="14" fill="#289b65"/><text x="855" y="164">19.23%</text>
+<rect x="950" y="153" width="92.3076923076923" height="14" fill="#3984cf"/><text x="1155" y="164">46.15%</text>
+<text x="10" y="190">parallel-d100-c0p1-fixed-distance-screen</text>
+<rect x="650" y="180" width="38.46153846153846" height="14" fill="#289b65"/><text x="855" y="191">19.23%</text>
+<rect x="950" y="180" width="61.53846153846154" height="14" fill="#3984cf"/><text x="1155" y="191">30.77%</text>
+<text x="10" y="217">parallel-d100-c1-fixed-distance-screen</text>
+<rect x="650" y="207" width="46.15384615384615" height="14" fill="#289b65"/><text x="855" y="218">23.08%</text>
+<rect x="950" y="207" width="76.92307692307692" height="14" fill="#3984cf"/><text x="1155" y="218">38.46%</text>
+<text x="10" y="244">parallel-d100-c10-fixed-distance-screen</text>
+<rect x="650" y="234" width="38.46153846153846" height="14" fill="#289b65"/><text x="855" y="245">19.23%</text>
+<rect x="950" y="234" width="61.53846153846154" height="14" fill="#3984cf"/><text x="1155" y="245">30.77%</text>
+<text x="10" y="271">parallel-d100-c100-fixed-distance-screen</text>
+<rect x="650" y="261" width="38.46153846153846" height="14" fill="#289b65"/><text x="855" y="272">19.23%</text>
+<rect x="950" y="261" width="92.3076923076923" height="14" fill="#3984cf"/><text x="1155" y="272">46.15%</text>
+<text x="10" y="298">parallel-d100-chard-fixed-legacy-screen</text>
+<rect x="650" y="288" width="76.92307692307692" height="14" fill="#289b65"/><text x="855" y="299">38.46%</text>
+<rect x="950" y="288" width="146.15384615384616" height="14" fill="#3984cf"/><text x="1155" y="299">73.08%</text>
+<text x="10" y="325">parallel-d1-c0p1-fixed-distance-screen</text>
+<rect x="650" y="315" width="38.46153846153846" height="14" fill="#289b65"/><text x="855" y="326">19.23%</text>
+<rect x="950" y="315" width="46.153846153846146" height="14" fill="#3984cf"/><text x="1155" y="326">23.08%</text>
+<text x="10" y="352">parallel-d1-c1-fixed-distance-screen</text>
+<rect x="650" y="342" width="30.76923076923077" height="14" fill="#289b65"/><text x="855" y="353">15.38%</text>
+<rect x="950" y="342" width="46.153846153846146" height="14" fill="#3984cf"/><text x="1155" y="353">23.08%</text>
+<text x="10" y="379">parallel-d1-c10-fixed-distance-screen</text>
+<rect x="650" y="369" width="38.46153846153846" height="14" fill="#289b65"/><text x="855" y="380">19.23%</text>
+<rect x="950" y="369" width="61.53846153846154" height="14" fill="#3984cf"/><text x="1155" y="380">30.77%</text>
+<text x="10" y="406">parallel-d10-c0p1-fixed-distance-screen</text>
+<rect x="650" y="396" width="38.46153846153846" height="14" fill="#289b65"/><text x="855" y="407">19.23%</text>
+<rect x="950" y="396" width="61.53846153846154" height="14" fill="#3984cf"/><text x="1155" y="407">30.77%</text>
+<text x="10" y="433">parallel-d10-c1-distance-screen</text>
+<rect x="650" y="423" width="46.15384615384615" height="14" fill="#289b65"/><text x="855" y="434">23.08%</text>
+<rect x="950" y="423" width="15.384615384615374" height="14" fill="#3984cf"/><text x="1155" y="434">7.69%</text>
+<text x="10" y="460">parallel-d10-c1-fixed-distance-screen</text>
+<rect x="650" y="450" width="38.46153846153846" height="14" fill="#289b65"/><text x="855" y="461">19.23%</text>
+<rect x="950" y="450" width="76.92307692307692" height="14" fill="#3984cf"/><text x="1155" y="461">38.46%</text>
+<text x="10" y="487">parallel-d10-c10-fixed-distance-screen</text>
+<rect x="650" y="477" width="46.15384615384615" height="14" fill="#289b65"/><text x="855" y="488">23.08%</text>
+<rect x="950" y="477" width="84.61538461538463" height="14" fill="#3984cf"/><text x="1155" y="488">42.31%</text>
+<text x="10" y="514">parallel-d100-c1-distance-screen</text>
+<rect x="650" y="504" width="23.076923076923077" height="14" fill="#289b65"/><text x="855" y="515">11.54%</text>
+<rect x="950" y="504" width="30.76923076923077" height="14" fill="#3984cf"/><text x="1155" y="515">15.38%</text>
+<text x="10" y="541">parallel-d100-c1-fixed-distance-screen-finite-prepass</text>
+<rect x="650" y="531" width="46.15384615384615" height="14" fill="#289b65"/><text x="855" y="542">23.08%</text>
+<rect x="950" y="531" width="76.92307692307692" height="14" fill="#3984cf"/><text x="1155" y="542">38.46%</text>
+<text x="10" y="568">parallel-d100-c1-fixed-distance-screen-mass-ordinary</text>
+<rect x="650" y="558" width="38.46153846153846" height="14" fill="#289b65"/><text x="855" y="569">19.23%</text>
+<rect x="950" y="558" width="23.076923076923084" height="14" fill="#3984cf"/><text x="1155" y="569">11.54%</text>
+<text x="10" y="595">parallel-d100-c1-fixed-distance-screen-mass-prepass-ordinary</text>
+<rect x="650" y="585" width="38.46153846153846" height="14" fill="#289b65"/><text x="855" y="596">19.23%</text>
+<rect x="950" y="585" width="15.384615384615374" height="14" fill="#3984cf"/><text x="1155" y="596">7.69%</text>
+<text x="10" y="622">parallel-d100-c1-fixed-distance-screen-mass-winding-ordinary</text>
+<rect x="650" y="612" width="38.46153846153846" height="14" fill="#289b65"/><text x="855" y="623">19.23%</text>
+<rect x="950" y="612" width="69.23076923076923" height="14" fill="#3984cf"/><text x="1155" y="623">34.62%</text>
+<text x="10" y="649">parallel-d100-c1-fixed-distance-screen-mixed10</text>
+<rect x="650" y="639" width="46.15384615384615" height="14" fill="#289b65"/><text x="855" y="650">23.08%</text>
+<rect x="950" y="639" width="76.92307692307692" height="14" fill="#3984cf"/><text x="1155" y="650">38.46%</text>
+<text x="10" y="676">parallel-d100-c1-fixed-distance-screen-p0</text>
+<rect x="650" y="666" width="38.46153846153846" height="14" fill="#289b65"/><text x="855" y="677">19.23%</text>
+<rect x="950" y="666" width="92.3076923076923" height="14" fill="#3984cf"/><text x="1155" y="677">46.15%</text>
+<text x="10" y="703">parallel-d100-c1-fixed-distance-screen-p1x10</text>
+<rect x="650" y="693" width="46.15384615384615" height="14" fill="#289b65"/><text x="855" y="704">23.08%</text>
+<rect x="950" y="693" width="61.53846153846154" height="14" fill="#3984cf"/><text x="1155" y="704">30.77%</text>
+<text x="10" y="730">parallel-d100-c1-fixed-distance-screen-temp005</text>
+<rect x="650" y="720" width="38.46153846153846" height="14" fill="#289b65"/><text x="855" y="731">19.23%</text>
+<rect x="950" y="720" width="53.846153846153854" height="14" fill="#3984cf"/><text x="1155" y="731">26.92%</text>
+<text x="10" y="757">parallel-d10-c1-distance-screen-repair5</text>
+<rect x="650" y="747" width="23.076923076923077" height="14" fill="#289b65"/><text x="855" y="758">11.54%</text>
+<rect x="950" y="747" width="15.384615384615374" height="14" fill="#3984cf"/><text x="1155" y="758">7.69%</text>
+<text x="10" y="784">parallel-d10-c1-fixed-distance-screen-repair5</text>
+<rect x="650" y="774" width="38.46153846153846" height="14" fill="#289b65"/><text x="855" y="785">19.23%</text>
+<rect x="950" y="774" width="69.23076923076923" height="14" fill="#3984cf"/><text x="1155" y="785">34.62%</text>
+<text x="10" y="811">parallel-d10-c10-distance-screen-repair5</text>
+<rect x="650" y="801" width="46.15384615384615" height="14" fill="#289b65"/><text x="855" y="812">23.08%</text>
+<rect x="950" y="801" width="30.76923076923077" height="14" fill="#3984cf"/><text x="1155" y="812">15.38%</text>
+<text x="10" y="838">parallel-d10-c10-fixed-distance-screen-repair5</text>
+<rect x="650" y="828" width="46.15384615384615" height="14" fill="#289b65"/><text x="855" y="839">23.08%</text>
+<rect x="950" y="828" width="84.61538461538463" height="14" fill="#3984cf"/><text x="1155" y="839">42.31%</text>
+<text x="10" y="865">parallel-d100-c1-distance-screen-repair5</text>
+<rect x="650" y="855" width="23.076923076923077" height="14" fill="#289b65"/><text x="855" y="866">11.54%</text>
+<rect x="950" y="855" width="30.76923076923077" height="14" fill="#3984cf"/><text x="1155" y="866">15.38%</text>
+<text x="10" y="892">parallel-d100-c1-fixed-distance-screen</text>
+<rect x="650" y="882" width="46.15384615384615" height="14" fill="#289b65"/><text x="855" y="893">23.08%</text>
+<rect x="950" y="882" width="76.92307692307692" height="14" fill="#3984cf"/><text x="1155" y="893">38.46%</text>
+<text x="10" y="919">parallel-d100-c1-fixed-distance-screen-repair5</text>
+<rect x="650" y="909" width="46.15384615384615" height="14" fill="#289b65"/><text x="855" y="920">23.08%</text>
+<rect x="950" y="909" width="76.92307692307692" height="14" fill="#3984cf"/><text x="1155" y="920">38.46%</text>
+<text x="10" y="946">parallel-d100-c10-distance-screen-repair5</text>
+<rect x="650" y="936" width="38.46153846153846" height="14" fill="#289b65"/><text x="855" y="947">19.23%</text>
+<rect x="950" y="936" width="30.76923076923077" height="14" fill="#3984cf"/><text x="1155" y="947">15.38%</text>
+<text x="10" y="973">parallel-d100-c10-fixed-distance-screen-repair5</text>
+<rect x="650" y="963" width="38.46153846153846" height="14" fill="#289b65"/><text x="855" y="974">19.23%</text>
+<rect x="950" y="963" width="53.846153846153854" height="14" fill="#3984cf"/><text x="1155" y="974">26.92%</text>
+<text x="10" y="1000">parallel-d100-c1-fixed-distance-screen-slack0p1</text>
+<rect x="650" y="990" width="38.46153846153846" height="14" fill="#289b65"/><text x="855" y="1001">19.23%</text>
+<rect x="950" y="990" width="61.53846153846154" height="14" fill="#3984cf"/><text x="1155" y="1001">30.77%</text>
+<text x="10" y="1027">parallel-d100-c1-fixed-distance-screen-slack1</text>
+<rect x="650" y="1017" width="38.46153846153846" height="14" fill="#289b65"/><text x="855" y="1028">19.23%</text>
+<rect x="950" y="1017" width="46.153846153846146" height="14" fill="#3984cf"/><text x="1155" y="1028">23.08%</text>
+<text x="10" y="1054">parallel-d100-c1-fixed-distance-screen-slack10</text>
+<rect x="650" y="1044" width="46.15384615384615" height="14" fill="#289b65"/><text x="855" y="1055">23.08%</text>
+<rect x="950" y="1044" width="53.846153846153854" height="14" fill="#3984cf"/><text x="1155" y="1055">26.92%</text>
+<text x="10" y="1081">parallel-d100-c1-fixed-distance-screen-span0p01</text>
+<rect x="650" y="1071" width="46.15384615384615" height="14" fill="#289b65"/><text x="855" y="1082">23.08%</text>
+<rect x="950" y="1071" width="76.92307692307692" height="14" fill="#3984cf"/><text x="1155" y="1082">38.46%</text>
+<text x="10" y="1108">parallel-d100-c1-fixed-distance-screen-span0p1</text>
+<rect x="650" y="1098" width="38.46153846153846" height="14" fill="#289b65"/><text x="855" y="1109">19.23%</text>
+<rect x="950" y="1098" width="61.53846153846154" height="14" fill="#3984cf"/><text x="1155" y="1109">30.77%</text>
+<text x="10" y="1135">parallel-d100-c1-fixed-distance-screen-span1</text>
+<rect x="650" y="1125" width="38.46153846153846" height="14" fill="#289b65"/><text x="855" y="1136">19.23%</text>
+<rect x="950" y="1125" width="46.153846153846146" height="14" fill="#3984cf"/><text x="1155" y="1136">23.08%</text>
+<text x="10" y="1162">parallel-d10-c1000-fixed-distance-screen</text>
+<rect x="650" y="1152" width="46.15384615384615" height="14" fill="#289b65"/><text x="855" y="1163">23.08%</text>
+<rect x="950" y="1152" width="84.61538461538463" height="14" fill="#3984cf"/><text x="1155" y="1163">42.31%</text>
+<text x="10" y="1189">parallel-d10-c10000-fixed-distance-screen</text>
+<rect x="650" y="1179" width="46.15384615384615" height="14" fill="#289b65"/><text x="855" y="1190">23.08%</text>
+<rect x="950" y="1179" width="84.61538461538463" height="14" fill="#3984cf"/><text x="1155" y="1190">42.31%</text>
+<text x="10" y="1216">parallel-d100-c1000-fixed-distance-screen</text>
+<rect x="650" y="1206" width="38.46153846153846" height="14" fill="#289b65"/><text x="855" y="1217">19.23%</text>
+<rect x="950" y="1206" width="92.3076923076923" height="14" fill="#3984cf"/><text x="1155" y="1217">46.15%</text>
+<text x="10" y="1243">parallel-d100-c10000-fixed-distance-screen</text>
+<rect x="650" y="1233" width="38.46153846153846" height="14" fill="#289b65"/><text x="855" y="1244">19.23%</text>
+<rect x="950" y="1233" width="92.3076923076923" height="14" fill="#3984cf"/><text x="1155" y="1244">46.15%</text>
+<text x="10" y="1270">parallel-d1000-c1-fixed-distance-screen-cool0p1-baseD100</text>
+<rect x="650" y="1260" width="38.46153846153846" height="14" fill="#289b65"/><text x="855" y="1271">19.23%</text>
+<rect x="950" y="1260" width="61.53846153846154" height="14" fill="#3984cf"/><text x="1155" y="1271">30.77%</text></g></svg>

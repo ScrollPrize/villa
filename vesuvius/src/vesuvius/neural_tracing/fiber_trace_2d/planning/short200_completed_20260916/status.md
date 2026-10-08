@@ -1,0 +1,34 @@
+# Short failure benchmark
+
+- [x] Classic on accepted200pieces (session22549 exit0,153restarts)
+- [x] Independent Classic→fiberlet plan review
+- [x] Shared canonical fiberlet binding and backend override tests
+- [x] Stop initial underutilized run (session70013); retain caches
+- [x] Scroll-local224budget, exact-owner coalescing, empty memoization
+- [x] Approved build and tests:23replay/85trace/11reference;258Pythonpassed8skipped
+- [x] Demand-onlyGPUlease with existing30second idle release
+- [ ] Corrected fiberlet u22000storage128on accepted200pieces
+- [ ] Report graph quality and credited coverage comparison
+
+- [x] Stop fiberlet run, preserve caches
+- [x] Archive preceding task and write plan
+- [x] Independent review
+- [x] Shared cached trials and directed selection
+- [x] Regression tests (244 Python, 23 replay / 84 trace / 11 reference native)
+- [x] Self-proximity prefilter (4 entire fibers excluded)
+- [x] Real shortened-trace pilot and managed missing-inference retry
+- [x] Stop slow sequential extraction, preserve checkpoints/caches
+- [x] Rolling concurrent model jobs, deterministic frontier, cache/device exclusion
+- [x] Parallel scheduler/cancellation review and regression tests
+- [x] Bounded concurrent queue measurement (2719trial audits/180s; not finalcases)
+- [x] Replace per-batch inference lifetime with persistent model-session queue
+- [x] Cache-affinity, overlap eviction, process-safe cancellation, VRAM limits
+- [x] Persistent native replay reuse/error cleanup tests
+- [x] Complete persistent queue extraction (final session60249 exit0)
+- [x] Complete search (v3, current producer snapshots, fill missing inference)
+- [x] Generate/validate200cases (41best/50other/109Classic)
+- [x] Report lengths/provenance (662.089848mm)
+- [x] Independent review of accepted-benchmark evaluation plan
+- [x] Shared replay runner binding validation;2focused tests pass
+- [x] Evaluate best EMA999u22000 on all200pieces (session69464 exit0)
+- [x] Persist overall/per-scroll quality and runtime (62restarts,46.200s)

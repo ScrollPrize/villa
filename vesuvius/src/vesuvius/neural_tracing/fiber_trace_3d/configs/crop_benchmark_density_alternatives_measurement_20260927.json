@@ -1,0 +1,12 @@
+{
+  "output_root": "/ephemeral/hendrik/fiber_crop_bench/20260927_density_alternatives_measurement",
+  "density_alternatives": {
+    "stage": "measurement",
+    "workers": 2,
+    "template": "/home/hendrik/villa2/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/crop_benchmark_defect_density_20260924.json",
+    "best_results": "/home/hendrik/villa2/volume-cartographer/docs/fiber_benchmark_runs/2026-09-24-density-sweep-results.json",
+    "sweep_root": "/ephemeral/hendrik/fiber_crop_bench/20260924_density_sweep",
+    "centered_root": "/ephemeral/hendrik/fiber_crop_bench/20260927_density_alternatives_centered",
+    "steps": "/ephemeral/hendrik/fiber_crop_bench/20260924_cost_audit/beam-crop-new2048-coverage40x80-angle45-reverse-v2_step_costs.csv"
+  }
+}

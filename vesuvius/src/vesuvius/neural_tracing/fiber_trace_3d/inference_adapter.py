@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -90,7 +91,9 @@ def _config_from_checkpoint(
     weight = state.get("net.decoder.final_seg_layer.weight")
     if not isinstance(weight, torch.Tensor):
         return config
-    output_channels = int(weight.shape[0])
+    from .embedding import EmbeddingConfig
+    embedding = EmbeddingConfig.from_mapping(config)
+    output_channels = int(weight.shape[0]) - (embedding.channels if embedding.enabled else 0)
     if output_channels <= 0 or output_channels % 7 != 0:
         return config
     has_conditioned_decoder = any(str(key).startswith("conditioned_decoder.") for key in state)
@@ -180,9 +183,18 @@ class FiberTrace3DPredictAdapter:
         product_prefix: str = "fiber",
         zarr_path_prefix: str | Path | None = None,
         recurrent_steps: int | None = None,
+        emit_embeddings: bool = False,
+        embedding_bank: str | None = None,
+        emit_width: bool = False,
+        emit_normals: bool = False,
     ) -> None:
         self.checkpoint = None if checkpoint is None else Path(checkpoint)
         self.config = _config_from_checkpoint(config, self.checkpoint)
+        self.native_output_stride = int(
+            _model_cfg_from_raw(self.config).get("output_stride", 1)
+        )
+        if self.native_output_stride <= 0:
+            raise ValueError("model_3d.output_stride must be > 0")
         self.recurrent_steps = _recurrent_steps_from_config(
             self.config,
             recurrent_steps,
@@ -207,6 +219,59 @@ class FiberTrace3DPredictAdapter:
             )
             for option_index in range(self.option_count)
         )
+        from .annotations import AnnotationConfig
+        self.annotation_config = AnnotationConfig.from_mapping(self.config)
+        self.emit_normals = bool(emit_normals)
+        if self.emit_normals and ('normal' not in self.annotation_config.names or
+                                  _conditioned_decoder_enabled(self.config)):
+            raise ValueError('normal inference requires an unconditioned normal-head checkpoint')
+        self.emit_width = bool(emit_width)
+        if self.emit_width and ('width' not in self.annotation_config.names or
+                                _conditioned_decoder_enabled(self.config)):
+            raise ValueError('width inference requires an unconditioned width-head checkpoint')
+        from .embedding import EmbeddingConfig
+        embedding = EmbeddingConfig.from_mapping(self.config)
+        self.embedding_slice = slice(0, embedding.channels)
+        if emit_embeddings and embedding.short_range_channels:
+            if embedding_bank == "short":
+                self.embedding_slice = slice(0, embedding.short_range_channels)
+            elif embedding_bank == "long":
+                self.embedding_slice = slice(embedding.short_range_channels, embedding.channels)
+            else:
+                raise ValueError("split-range embedding checkpoint requires embedding_bank='short' or 'long'")
+        elif embedding_bank is not None:
+            raise ValueError("embedding_bank is only valid for split-range embedding checkpoints")
+        self.embedding_channels = ((self.embedding_slice.stop - self.embedding_slice.start)
+                                   if emit_embeddings and embedding.enabled else 0)
+        if emit_embeddings and not self.embedding_channels:
+            raise ValueError("embedding tracing requires an embedding-enabled checkpoint")
+        if self.embedding_channels:
+            self._products += (OutputProductSpec(
+                name=f"{self.product_prefix}_embedding", level=int(level), scaledown=int(scaledown),
+                channels=tuple(OutputChannelSpec(f"embedding_{i:03d}",
+                    relative_path=f"{self.zarr_path_prefix}_embedding_{i:03d}.ome.zarr")
+                    for i in range(self.embedding_channels)),
+                chunk_size=int(chunk_size), dtype=np.float32, value_range=None,
+                pyramid_policy=PYRAMID_POLICY_CUSTOM,
+                accumulator_channel_count=self.embedding_channels,
+                inference_scaledown=int(inference_scaledown)),)
+        if self.emit_width:
+            self._products += (OutputProductSpec(
+                name=f"{self.product_prefix}_width", level=int(level), scaledown=int(scaledown),
+                channels=(OutputChannelSpec('width', relative_path=f"{self.zarr_path_prefix}_width.ome.zarr"),),
+                chunk_size=int(chunk_size), dtype=np.float32, value_range=None,
+                pyramid_policy=PYRAMID_POLICY_CUSTOM, accumulator_channel_count=1,
+                inference_scaledown=int(inference_scaledown)),)
+
+        if self.emit_normals:
+            self._products += (OutputProductSpec(
+                name=f'{self.product_prefix}_sheet_normal', level=int(level), scaledown=int(scaledown),
+                channels=tuple(OutputChannelSpec(f'sheet_{c}',
+                    relative_path=f'{self.zarr_path_prefix}_sheet_{c}.ome.zarr')
+                    for c in ('nx', 'ny', 'grad_mag')),
+                chunk_size=int(chunk_size), dtype=np.uint8, value_range=(0., 255.),
+                pyramid_policy=PYRAMID_POLICY_CUSTOM, accumulator_channel_count=6,
+                inference_scaledown=int(inference_scaledown)),)
 
     @classmethod
     def from_config_file(
@@ -287,6 +352,24 @@ class FiberTrace3DPredictAdapter:
         )
 
     def load_model(self, *, device: torch.device) -> torch.nn.Module:
+        allow_tf32 = self.config.get('inference', {}).get('allow_tf32')
+        if allow_tf32 is not None:
+            if type(allow_tf32) is not bool:
+                raise ValueError('inference.allow_tf32 must be boolean')
+            torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+            torch.backends.cudnn.allow_tf32 = allow_tf32
+        budget = os.environ.get("FIBER_INFERENCE_VRAM_BUDGET_BYTES")
+        if budget is not None and device.type == "cuda":
+            from .cooperative_resources import configure_cuda_memory_budget
+            configure_cuda_memory_budget(int(budget), 2 * 1024**3, device=device)
+        # Demand workers reach this point only after the GPU manager has
+        # authorized their gate. Validate the already resolved cache-identity
+        # precision here rather than touching CUDA in the parent coordinator.
+        from vesuvius.neural_tracing.fiber_trace_3d.train import (
+            _mixed_precision_config_from_training,
+        )
+        _mixed_precision_config_from_training(
+            dict(self.config.get("training", {})), device)
         model = build_fiber_trace_3d_model(self.config).to(device)
         if self.checkpoint is not None:
             from vesuvius.neural_tracing.fiber_trace_3d.train import _load_snapshot
@@ -332,6 +415,17 @@ class FiberTrace3DPredictAdapter:
                     steps=int(self.recurrent_steps),
                 )
             else:
+                if self.embedding_channels or self.emit_width or self.emit_normals:
+                    result = model(tile_device, return_embeddings=True)
+                    parts = [result['prediction'].float().clamp(0, 1)]
+                    if self.embedding_channels:
+                        parts.append(result['embeddings'][:, self.embedding_slice].float())
+                    if self.emit_width:
+                        from .annotations import predicted_width
+                        parts.append(predicted_width(result['annotations'], self.annotation_config))
+                    if self.emit_normals:
+                        parts.append(result['annotations'][:, :6].float().sigmoid())
+                    return torch.cat(parts, dim=1)
                 output = model(tile_device)
         return output.to(dtype=torch.float32).clamp(0.0, 1.0)
 
@@ -348,16 +442,25 @@ class FiberTrace3DPredictAdapter:
         if output.ndim != 5:
             raise ValueError("fiber model output must have shape B,C,D,H,W")
         channels = int(output.shape[1])
-        expected_channels = int(self.option_count) * 7
+        expected_channels = int(self.option_count) * 7 + self.embedding_channels + int(self.emit_width) + 6 * int(self.emit_normals)
         if channels != expected_channels:
             raise ValueError(
                 "fiber model output channel count does not match configured options: "
                 f"got {channels}, expected {expected_channels}"
             )
-        return {
+        products = {
             product.name: output[:, option_index * 7 : option_index * 7 + 7]
-            for option_index, product in enumerate(self.output_products)
+            for option_index, product in enumerate(self.output_products[:self.option_count])
         }
+        if self.embedding_channels:
+            begin = self.option_count * 7
+            products[f'{self.product_prefix}_embedding'] = output[:, begin:begin+self.embedding_channels]
+        if self.emit_width:
+            begin = self.option_count * 7 + self.embedding_channels
+            products[f'{self.product_prefix}_width'] = output[:, begin:begin+1]
+        if self.emit_normals:
+            products[f'{self.product_prefix}_sheet_normal'] = output[:, -6:]
+        return products
 
     def finalize_product_slab(
         self,
@@ -365,6 +468,20 @@ class FiberTrace3DPredictAdapter:
         raw_slab: np.ndarray,
     ) -> ProductTileOutput:
         slab = np.asarray(raw_slab, dtype=np.float32)
+        if self.emit_normals and product.name == f'{self.product_prefix}_sheet_normal':
+            if slab.ndim != 4 or slab.shape[0] != 6 or not np.isfinite(slab).all():
+                raise ValueError('invalid normal product slab')
+            nx, ny = encode_normal_nxny_u8(*slab)
+            return {'sheet_nx': nx, 'sheet_ny': ny,
+                    'sheet_grad_mag': np.full(nx.shape, 255, dtype=np.uint8)}
+        if self.emit_width and product.name == f'{self.product_prefix}_width':
+            if slab.ndim != 4 or slab.shape[0] != 1 or not np.isfinite(slab).all() or (slab < 0).any():
+                raise ValueError('invalid width product slab')
+            return {'width': slab[0]}
+        if self.embedding_channels and product.name == f'{self.product_prefix}_embedding':
+            if slab.ndim != 4 or slab.shape[0] != self.embedding_channels or not np.isfinite(slab).all():
+                raise ValueError("invalid embedding product slab")
+            return {channel.name: slab[i] for i, channel in enumerate(product.channels)}
         if slab.ndim != 4 or int(slab.shape[0]) != len(FIBER_TRACE_3D_INTERNAL_CHANNELS):
             raise ValueError(
                 "fiber raw product slab must have shape 7,D,H,W; "

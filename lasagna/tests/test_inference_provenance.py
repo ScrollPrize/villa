@@ -1,13 +1,26 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
 
 import pytest
 
-from lasagna.inference_provenance import code_commit, base_document, finalize_document, validate_portable_bundle
+from lasagna.inference_provenance import atomic_write, code_commit, base_document, finalize_document, validate_portable_bundle
+
+
+def test_atomic_write_can_skip_durability_barrier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unexpected_fsync(_fd: int) -> None:
+        raise AssertionError("fsync must not run for a regenerable control file")
+
+    monkeypatch.setattr(os, "fsync", unexpected_fsync)
+    destination = tmp_path / "manifest.json"
+    atomic_write(destination, {"ready": True}, durable=False)
+    assert json.loads(destination.read_text()) == {"ready": True}
 
 
 def test_code_commit_is_full_git_hash() -> None:

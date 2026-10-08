@@ -1,0 +1,1245 @@
+[
+  {
+    "chunk": 64,
+    "case": 128,
+    "scroll": "PHercParis4",
+    "fiber": "0071_anon_20260902T214326941_000399_run0.json",
+    "direction": "forward",
+    "baseline_restarts": 1,
+    "candidate_restarts": 2,
+    "first_indices": {
+      "0.001": 247,
+      "0.01": 248,
+      "1.0": 260,
+      "8.0": 752
+    },
+    "regions": [
+      {
+        "index": 247,
+        "xyz_base": [
+          16659.91015625,
+          8288.6904296875,
+          34716.62109375
+        ],
+        "trace_distance_base": 0.007873298582322802,
+        "valid_voxels": 180198,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 180198,
+            "mean": 0.015316485199613759,
+            "p95": 0.0,
+            "max": 2.0,
+            "changed_percent": 1.5272089590339517
+          },
+          "nx": {
+            "n": 180198,
+            "mean": 0.47906747022719454,
+            "p95": 1.0,
+            "max": 254.0,
+            "changed_percent": 10.931308893550428
+          },
+          "ny": {
+            "n": 180198,
+            "mean": 0.3696822384266196,
+            "p95": 1.0,
+            "max": 254.0,
+            "changed_percent": 11.230979256151567
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 29885,
+          "mean": 0.22332433793251535,
+          "p95": 1.6582189872833801,
+          "max": 9.21156638306666
+        },
+        "output_boundary_distance_base": 19.91015625
+      },
+      {
+        "index": 248,
+        "xyz_base": [
+          16666.166015625,
+          8293.6474609375,
+          34717.16015625
+        ],
+        "trace_distance_base": 0.019749754312653012,
+        "valid_voxels": 181608,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 181608,
+            "mean": 0.01813246112506057,
+            "p95": 0.0,
+            "max": 2.0,
+            "changed_percent": 1.8088410202193737
+          },
+          "nx": {
+            "n": 181608,
+            "mean": 0.5639619400026431,
+            "p95": 1.0,
+            "max": 254.0,
+            "changed_percent": 12.106845513413505
+          },
+          "ny": {
+            "n": 181608,
+            "mean": 0.4217985991806528,
+            "p95": 1.0,
+            "max": 254.0,
+            "changed_percent": 12.968591691995949
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 31713,
+          "mean": 0.24213815250196336,
+          "p95": 2.022539034456843,
+          "max": 9.21156638306666
+        },
+        "output_boundary_distance_base": 26.166015625
+      },
+      {
+        "index": 260,
+        "xyz_base": [
+          16753.55859375,
+          8327.7177734375,
+          34720.1875
+        ],
+        "trace_distance_base": 1.2044242680147277,
+        "valid_voxels": 207025,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 207025,
+            "mean": 0.03196232339089482,
+            "p95": 0.0,
+            "max": 2.0,
+            "changed_percent": 3.188986837338486
+          },
+          "nx": {
+            "n": 207025,
+            "mean": 1.152952541963531,
+            "p95": 1.0,
+            "max": 254.0,
+            "changed_percent": 23.137785291631445
+          },
+          "ny": {
+            "n": 207025,
+            "mean": 0.8556261321096486,
+            "p95": 1.0,
+            "max": 254.0,
+            "changed_percent": 24.211568651129088
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 34187,
+          "mean": 0.2823672920056485,
+          "p95": 2.015871014778518,
+          "max": 10.221837840438514
+        },
+        "output_boundary_distance_base": 7.7177734375
+      },
+      {
+        "index": 752,
+        "xyz_base": [
+          20407.296875,
+          9365.2509765625,
+          34917.75
+        ],
+        "trace_distance_base": 9.955589719862257,
+        "valid_voxels": 194350,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 194350,
+            "mean": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+            "changed_percent": 0.0
+          },
+          "nx": {
+            "n": 194350,
+            "mean": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+            "changed_percent": 0.0
+          },
+          "ny": {
+            "n": 194350,
+            "mean": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+            "changed_percent": 0.0
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 66838,
+          "mean": 0.0,
+          "p95": 0.0,
+          "max": 0.0
+        },
+        "output_boundary_distance_base": 21.2509765625
+      }
+    ]
+  },
+  {
+    "chunk": 64,
+    "case": 143,
+    "scroll": "PHercParis4",
+    "fiber": "0079_anon_20260903T214715058_000404_run1.json",
+    "direction": "reverse",
+    "baseline_restarts": 1,
+    "candidate_restarts": 0,
+    "first_indices": {
+      "0.001": 14,
+      "0.01": 14,
+      "1.0": 27,
+      "8.0": 270
+    },
+    "regions": [
+      {
+        "index": 14,
+        "xyz_base": [
+          10422.154296875,
+          13791.169921875,
+          52847.34765625
+        ],
+        "trace_distance_base": 0.0166875073150733,
+        "valid_voxels": 230460,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 230460,
+            "mean": 0.0013581532586999913,
+            "p95": 0.0,
+            "max": 1.0,
+            "changed_percent": 0.13581532586999914
+          },
+          "nx": {
+            "n": 230460,
+            "mean": 0.030235181810292458,
+            "p95": 0.0,
+            "max": 252.0,
+            "changed_percent": 1.1446671873644017
+          },
+          "ny": {
+            "n": 230460,
+            "mean": 0.0320315889959212,
+            "p95": 0.0,
+            "max": 254.0,
+            "changed_percent": 0.8248719951401544
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 55112,
+          "mean": 0.005329412220068691,
+          "p95": 0.0,
+          "max": 26.193780896648736
+        },
+        "output_boundary_distance_base": 16.65234375
+      },
+      {
+        "index": 27,
+        "xyz_base": [
+          10454.7978515625,
+          13881.40625,
+          52812.0625
+        ],
+        "trace_distance_base": 1.382785602889895,
+        "valid_voxels": 201630,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 201630,
+            "mean": 0.00014878738282993602,
+            "p95": 0.0,
+            "max": 1.0,
+            "changed_percent": 0.014878738282993602
+          },
+          "nx": {
+            "n": 201630,
+            "mean": 0.0033278777959629023,
+            "p95": 0.0,
+            "max": 97.0,
+            "changed_percent": 0.14481971928780438
+          },
+          "ny": {
+            "n": 201630,
+            "mean": 0.00362049298219511,
+            "p95": 0.0,
+            "max": 236.0,
+            "changed_percent": 0.09125626146902743
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 51398,
+          "mean": 0.0007216632038779857,
+          "p95": 0.0,
+          "max": 1.635745644426539
+        },
+        "output_boundary_distance_base": 41.2021484375
+      },
+      {
+        "index": 270,
+        "xyz_base": [
+          10907.9208984375,
+          15551.59765625,
+          52051.8203125
+        ],
+        "trace_distance_base": 10.656518837678323,
+        "valid_voxels": 166145,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 166145,
+            "mean": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+            "changed_percent": 0.0
+          },
+          "nx": {
+            "n": 166145,
+            "mean": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+            "changed_percent": 0.0
+          },
+          "ny": {
+            "n": 166145,
+            "mean": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+            "changed_percent": 0.0
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 56653,
+          "mean": 0.0,
+          "p95": 0.0,
+          "max": 0.0
+        },
+        "output_boundary_distance_base": 27.9208984375
+      }
+    ]
+  },
+  {
+    "chunk": 32,
+    "case": 11,
+    "scroll": "PHerc0139",
+    "fiber": "0007_kb_20260908T172232906_000117_run0.json",
+    "direction": "reverse",
+    "baseline_restarts": 1,
+    "candidate_restarts": 0,
+    "first_indices": {
+      "0.001": 4,
+      "0.01": 4,
+      "1.0": 16,
+      "8.0": 179
+    },
+    "regions": [
+      {
+        "index": 4,
+        "xyz_base": [
+          18808.806640625,
+          14414.2451171875,
+          45236.375
+        ],
+        "trace_distance_base": 0.027964494264211628,
+        "valid_voxels": 213335,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 213335,
+            "mean": 0.014863946375418942,
+            "p95": 0.0,
+            "max": 2.0,
+            "changed_percent": 1.4835821595143788
+          },
+          "nx": {
+            "n": 213335,
+            "mean": 0.3680736869243209,
+            "p95": 1.0,
+            "max": 254.0,
+            "changed_percent": 8.360090936789556
+          },
+          "ny": {
+            "n": 213335,
+            "mean": 0.32785525113085057,
+            "p95": 1.0,
+            "max": 254.0,
+            "changed_percent": 7.541659830782573
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 43859,
+          "mean": 0.07092997402205715,
+          "p95": 0.47699347394512054,
+          "max": 83.73704528847931
+        },
+        "output_boundary_distance_base": 7.193359375
+      },
+      {
+        "index": 16,
+        "xyz_base": [
+          18790.712890625,
+          14505.0341796875,
+          45212.109375
+        ],
+        "trace_distance_base": 2.046644124995218,
+        "valid_voxels": 83600,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 83600,
+            "mean": 0.05467703349282297,
+            "p95": 1.0,
+            "max": 2.0,
+            "changed_percent": 5.455741626794258
+          },
+          "nx": {
+            "n": 83600,
+            "mean": 0.8098684210526316,
+            "p95": 1.0,
+            "max": 254.0,
+            "changed_percent": 23.720095693779903
+          },
+          "ny": {
+            "n": 83600,
+            "mean": 0.9828588516746412,
+            "p95": 1.0,
+            "max": 254.0,
+            "changed_percent": 18.898325358851675
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 27953,
+          "mean": 0.2908310665534466,
+          "p95": 1.9520741967342454,
+          "max": 83.73704528847931
+        },
+        "output_boundary_distance_base": 22.9658203125
+      },
+      {
+        "index": 179,
+        "xyz_base": [
+          18433.853515625,
+          15575.1025390625,
+          45326.4140625
+        ],
+        "trace_distance_base": 9.777755941983125,
+        "valid_voxels": 165805,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 165805,
+            "mean": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+            "changed_percent": 0.0
+          },
+          "nx": {
+            "n": 165805,
+            "mean": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+            "changed_percent": 0.0
+          },
+          "ny": {
+            "n": 165805,
+            "mean": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+            "changed_percent": 0.0
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 64625,
+          "mean": 0.0,
+          "p95": 0.0,
+          "max": 0.0
+        },
+        "output_boundary_distance_base": 1.853515625
+      }
+    ]
+  },
+  {
+    "chunk": 32,
+    "case": 170,
+    "scroll": "PHercParis4",
+    "fiber": "0094_kb_20260803T040828806_000224_run0.json",
+    "direction": "forward",
+    "baseline_restarts": 0,
+    "candidate_restarts": 1,
+    "first_indices": {
+      "0.001": 19,
+      "0.01": 22,
+      "1.0": 30,
+      "8.0": 119
+    },
+    "regions": [
+      {
+        "index": 19,
+        "xyz_base": [
+          24209.798828125,
+          17952.44921875,
+          63375.078125
+        ],
+        "trace_distance_base": 0.0078125,
+        "valid_voxels": 125745,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 125745,
+            "mean": 0.003610481530080719,
+            "p95": 0.0,
+            "max": 1.0,
+            "changed_percent": 0.3610481530080719
+          },
+          "nx": {
+            "n": 125745,
+            "mean": 0.07336275796254324,
+            "p95": 0.0,
+            "max": 254.0,
+            "changed_percent": 1.8378464352459343
+          },
+          "ny": {
+            "n": 125745,
+            "mean": 0.055501212771879596,
+            "p95": 0.0,
+            "max": 244.0,
+            "changed_percent": 1.628692989780906
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 43558,
+          "mean": 0.04287815671868548,
+          "p95": 0.0,
+          "max": 9.430901032198433
+        },
+        "output_boundary_distance_base": 15.078125
+      },
+      {
+        "index": 22,
+        "xyz_base": [
+          24222.923828125,
+          17972.37890625,
+          63372.57421875
+        ],
+        "trace_distance_base": 0.01188039556698871,
+        "valid_voxels": 134752,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 134752,
+            "mean": 0.003792151507955355,
+            "p95": 0.0,
+            "max": 1.0,
+            "changed_percent": 0.37921515079553547
+          },
+          "nx": {
+            "n": 134752,
+            "mean": 0.06407326050819283,
+            "p95": 0.0,
+            "max": 254.0,
+            "changed_percent": 1.6393077653763952
+          },
+          "ny": {
+            "n": 134752,
+            "mean": 0.049372180004749466,
+            "p95": 0.0,
+            "max": 244.0,
+            "changed_percent": 1.4960816908097838
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 52140,
+          "mean": 0.03678629905003796,
+          "p95": 0.0,
+          "max": 9.430901032198433
+        },
+        "output_boundary_distance_base": 11.62109375
+      },
+      {
+        "index": 30,
+        "xyz_base": [
+          24266.255859375,
+          18018.013671875,
+          63362.203125
+        ],
+        "trace_distance_base": 2.10357456248677,
+        "valid_voxels": 171540,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 171540,
+            "mean": 0.002098635886673662,
+            "p95": 0.0,
+            "max": 1.0,
+            "changed_percent": 0.2098635886673662
+          },
+          "nx": {
+            "n": 171540,
+            "mean": 0.022344642648944854,
+            "p95": 0.0,
+            "max": 254.0,
+            "changed_percent": 0.7724145971785007
+          },
+          "ny": {
+            "n": 171540,
+            "mean": 0.01603124635653492,
+            "p95": 0.0,
+            "max": 244.0,
+            "changed_percent": 0.6814737087559753
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 56771,
+          "mean": 0.02109004845131031,
+          "p95": 0.0,
+          "max": 6.770848699987869
+        },
+        "output_boundary_distance_base": 2.203125
+      },
+      {
+        "index": 119,
+        "xyz_base": [
+          24604.998046875,
+          18629.640625,
+          63285.96875
+        ],
+        "trace_distance_base": 9.514465962997354,
+        "valid_voxels": 181748,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 181748,
+            "mean": 0.0025364790809252373,
+            "p95": 0.0,
+            "max": 1.0,
+            "changed_percent": 0.25364790809252374
+          },
+          "nx": {
+            "n": 181748,
+            "mean": 0.014943768294561701,
+            "p95": 0.0,
+            "max": 254.0,
+            "changed_percent": 0.9194048902876509
+          },
+          "ny": {
+            "n": 181748,
+            "mean": 0.010553073486365737,
+            "p95": 0.0,
+            "max": 166.0,
+            "changed_percent": 0.7284811937407839
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 58219,
+          "mean": 0.015012425514524199,
+          "p95": 0.0,
+          "max": 6.221313635205868
+        },
+        "output_boundary_distance_base": 5.640625
+      }
+    ]
+  },
+  {
+    "chunk": 32,
+    "case": 4,
+    "scroll": "PHerc0139",
+    "fiber": "0002_kb_20260901T224443942_000068_run0.json",
+    "direction": "forward",
+    "baseline_restarts": 0,
+    "candidate_restarts": 1,
+    "first_indices": {
+      "0.001": 45,
+      "0.01": 45,
+      "1.0": 62,
+      "8.0": 187
+    },
+    "regions": [
+      {
+        "index": 45,
+        "xyz_base": [
+          12178.4375,
+          14636.439453125,
+          31044.1875
+        ],
+        "trace_distance_base": 0.01628255078177057,
+        "valid_voxels": 155658,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 155658,
+            "mean": 0.016433463105012272,
+            "p95": 0.0,
+            "max": 2.0,
+            "changed_percent": 1.639491706176361
+          },
+          "nx": {
+            "n": 155658,
+            "mean": 0.315769186293027,
+            "p95": 1.0,
+            "max": 246.0,
+            "changed_percent": 12.971385987228413
+          },
+          "ny": {
+            "n": 155658,
+            "mean": 0.3204461062071978,
+            "p95": 1.0,
+            "max": 254.0,
+            "changed_percent": 7.493350807539606
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 25544,
+          "mean": 0.16135509822257266,
+          "p95": 1.0054717935263753,
+          "max": 9.85496658714384
+        },
+        "output_boundary_distance_base": 4.1875
+      },
+      {
+        "index": 62,
+        "xyz_base": [
+          12132.7412109375,
+          14759.78125,
+          31029.349609375
+        ],
+        "trace_distance_base": 1.5444591422414589,
+        "valid_voxels": 189685,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 189685,
+            "mean": 0.017276010227482406,
+            "p95": 0.0,
+            "max": 2.0,
+            "changed_percent": 1.7249650736747766
+          },
+          "nx": {
+            "n": 189685,
+            "mean": 0.30208503571710993,
+            "p95": 1.0,
+            "max": 254.0,
+            "changed_percent": 10.061944803226401
+          },
+          "ny": {
+            "n": 189685,
+            "mean": 0.29604871233887764,
+            "p95": 1.0,
+            "max": 254.0,
+            "changed_percent": 6.895642776181564
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 45355,
+          "mean": 0.11906122077253863,
+          "p95": 0.763369353101131,
+          "max": 22.091826397524112
+        },
+        "output_boundary_distance_base": 10.650390625
+      },
+      {
+        "index": 187,
+        "xyz_base": [
+          11725.31640625,
+          15606.779296875,
+          30925.765625
+        ],
+        "trace_distance_base": 8.639356965048455,
+        "valid_voxels": 123125,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 123125,
+            "mean": 0.018265989847715738,
+            "p95": 0.0,
+            "max": 2.0,
+            "changed_percent": 1.8257868020304566
+          },
+          "nx": {
+            "n": 123125,
+            "mean": 0.5684548223350254,
+            "p95": 1.0,
+            "max": 254.0,
+            "changed_percent": 10.966091370558376
+          },
+          "ny": {
+            "n": 123125,
+            "mean": 0.5696081218274112,
+            "p95": 1.0,
+            "max": 254.0,
+            "changed_percent": 8.705786802030458
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 42968,
+          "mean": 0.1745678350527726,
+          "p95": 1.1444493659918364,
+          "max": 33.027576845932565
+        },
+        "output_boundary_distance_base": 9.220703125
+      }
+    ]
+  },
+  {
+    "chunk": 128,
+    "case": 11,
+    "scroll": "PHerc0139",
+    "fiber": "0007_kb_20260908T172232906_000117_run0.json",
+    "direction": "reverse",
+    "baseline_restarts": 1,
+    "candidate_restarts": 0,
+    "first_indices": {
+      "0.001": 49,
+      "0.01": 49,
+      "1.0": 60,
+      "8.0": 179
+    },
+    "regions": [
+      {
+        "index": 49,
+        "xyz_base": [
+          18768.75,
+          14739.0048828125,
+          45131.03515625
+        ],
+        "trace_distance_base": 0.03304477405407936,
+        "valid_voxels": 222488,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 222488,
+            "mean": 0.001784365898385531,
+            "p95": 0.0,
+            "max": 1.0,
+            "changed_percent": 0.1784365898385531
+          },
+          "nx": {
+            "n": 222488,
+            "mean": 0.02742170364244364,
+            "p95": 0.0,
+            "max": 252.0,
+            "changed_percent": 0.6431807558160441
+          },
+          "ny": {
+            "n": 222488,
+            "mean": 0.03324224227823523,
+            "p95": 0.0,
+            "max": 252.0,
+            "changed_percent": 0.6301463449714142
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 71625,
+          "mean": 0.011115221590259391,
+          "p95": 0.0,
+          "max": 9.032266221526536
+        },
+        "output_boundary_distance_base": 75.03515625
+      },
+      {
+        "index": 60,
+        "xyz_base": [
+          18752.53125,
+          14822.578125,
+          45109.9296875
+        ],
+        "trace_distance_base": 2.070791743249111,
+        "valid_voxels": 245440,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 245440,
+            "mean": 0.0014341590612777053,
+            "p95": 0.0,
+            "max": 1.0,
+            "changed_percent": 0.14341590612777053
+          },
+          "nx": {
+            "n": 245440,
+            "mean": 0.024376629726206,
+            "p95": 0.0,
+            "max": 252.0,
+            "changed_percent": 0.7301173402868318
+          },
+          "ny": {
+            "n": 245440,
+            "mean": 0.03782187092568449,
+            "p95": 0.0,
+            "max": 254.0,
+            "changed_percent": 0.516215775749674
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 76917,
+          "mean": 0.010596300354688976,
+          "p95": 0.0,
+          "max": 10.26180264584207
+        },
+        "output_boundary_distance_base": 25.421875
+      },
+      {
+        "index": 179,
+        "xyz_base": [
+          18433.853515625,
+          15575.1025390625,
+          45326.4140625
+        ],
+        "trace_distance_base": 8.98378224946817,
+        "valid_voxels": 212725,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 212725,
+            "mean": 0.063824186155835,
+            "p95": 1.0,
+            "max": 2.0,
+            "changed_percent": 6.376777529674463
+          },
+          "nx": {
+            "n": 212725,
+            "mean": 0.662493830062287,
+            "p95": 1.0,
+            "max": 254.0,
+            "changed_percent": 20.500176283934657
+          },
+          "ny": {
+            "n": 212725,
+            "mean": 0.6243412856974968,
+            "p95": 1.0,
+            "max": 254.0,
+            "changed_percent": 18.801269244329532
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 80533,
+          "mean": 0.13102951629092657,
+          "p95": 0.7818474186096522,
+          "max": 64.46746677960468
+        },
+        "output_boundary_distance_base": 1.853515625
+      }
+    ]
+  },
+  {
+    "chunk": 128,
+    "case": 142,
+    "scroll": "PHercParis4",
+    "fiber": "0079_anon_20260903T214715058_000404_run1.json",
+    "direction": "forward",
+    "baseline_restarts": 0,
+    "candidate_restarts": 1,
+    "first_indices": {
+      "0.001": 1,
+      "0.01": 41,
+      "1.0": 42,
+      "8.0": 261
+    },
+    "regions": [
+      {
+        "index": 1,
+        "xyz_base": [
+          11127.4462890625,
+          17278.5390625,
+          51249.34765625
+        ],
+        "trace_distance_base": 0.00390625,
+        "valid_voxels": 199225,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 199225,
+            "mean": 0.0012950181955075919,
+            "p95": 0.0,
+            "max": 1.0,
+            "changed_percent": 0.12950181955075918
+          },
+          "nx": {
+            "n": 199225,
+            "mean": 0.019400175680762955,
+            "p95": 0.0,
+            "max": 248.0,
+            "changed_percent": 0.614882670347597
+          },
+          "ny": {
+            "n": 199225,
+            "mean": 0.021548500439201906,
+            "p95": 0.0,
+            "max": 240.0,
+            "changed_percent": 0.6796335801229766
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 50005,
+          "mean": 0.005237966400374261,
+          "p95": 0.0,
+          "max": 1.4503050846885162
+        },
+        "output_boundary_distance_base": 49.34765625
+      },
+      {
+        "index": 41,
+        "xyz_base": [
+          11152.771484375,
+          16993.169921875,
+          51386.12890625
+        ],
+        "trace_distance_base": 0.688944599332709,
+        "valid_voxels": 265265,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 265265,
+            "mean": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+            "changed_percent": 0.0
+          },
+          "nx": {
+            "n": 265265,
+            "mean": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+            "changed_percent": 0.0
+          },
+          "ny": {
+            "n": 265265,
+            "mean": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+            "changed_percent": 0.0
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 46084,
+          "mean": 0.0,
+          "p95": 0.0,
+          "max": 0.0
+        },
+        "output_boundary_distance_base": 69.87109375
+      },
+      {
+        "index": 42,
+        "xyz_base": [
+          11152.1806640625,
+          16985.921875,
+          51389.46484375
+        ],
+        "trace_distance_base": 1.3821461251897185,
+        "valid_voxels": 267865,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 267865,
+            "mean": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+            "changed_percent": 0.0
+          },
+          "nx": {
+            "n": 267865,
+            "mean": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+            "changed_percent": 0.0
+          },
+          "ny": {
+            "n": 267865,
+            "mean": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+            "changed_percent": 0.0
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 44133,
+          "mean": 0.0,
+          "p95": 0.0,
+          "max": 0.0
+        },
+        "output_boundary_distance_base": 66.53515625
+      },
+      {
+        "index": 261,
+        "xyz_base": [
+          10878.0751953125,
+          15456.0888671875,
+          52092.640625
+        ],
+        "trace_distance_base": 11.101859038417247,
+        "valid_voxels": 221296,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 221296,
+            "mean": 0.0003479502566697997,
+            "p95": 0.0,
+            "max": 1.0,
+            "changed_percent": 0.03479502566697997
+          },
+          "nx": {
+            "n": 221296,
+            "mean": 0.016362699732484998,
+            "p95": 0.0,
+            "max": 216.0,
+            "changed_percent": 0.5110801821994072
+          },
+          "ny": {
+            "n": 221296,
+            "mean": 0.01620002169040561,
+            "p95": 0.0,
+            "max": 254.0,
+            "changed_percent": 0.4505277998698575
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 58969,
+          "mean": 0.0019315097030809302,
+          "p95": 0.0,
+          "max": 4.775580715938741
+        },
+        "output_boundary_distance_base": 96.0888671875
+      }
+    ]
+  },
+  {
+    "chunk": 128,
+    "case": 33,
+    "scroll": "PHerc0139",
+    "fiber": "0019_lt_20260904T062829219_000052_run3.json",
+    "direction": "reverse",
+    "baseline_restarts": 1,
+    "candidate_restarts": 0,
+    "first_indices": {
+      "0.001": 211,
+      "0.01": 211,
+      "1.0": 212,
+      "8.0": 887
+    },
+    "regions": [
+      {
+        "index": 211,
+        "xyz_base": [
+          17109.6328125,
+          10644.4814453125,
+          11206.9765625
+        ],
+        "trace_distance_base": 0.6980898817718436,
+        "valid_voxels": 170495,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 170495,
+            "mean": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+            "changed_percent": 0.0
+          },
+          "nx": {
+            "n": 170495,
+            "mean": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+            "changed_percent": 0.0
+          },
+          "ny": {
+            "n": 170495,
+            "mean": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+            "changed_percent": 0.0
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 35119,
+          "mean": 0.0,
+          "p95": 0.0,
+          "max": 0.0
+        },
+        "output_boundary_distance_base": 42.3671875
+      },
+      {
+        "index": 212,
+        "xyz_base": [
+          17101.640625,
+          10644.248046875,
+          11206.69140625
+        ],
+        "trace_distance_base": 2.0879098090208466,
+        "valid_voxels": 170495,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 170495,
+            "mean": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+            "changed_percent": 0.0
+          },
+          "nx": {
+            "n": 170495,
+            "mean": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+            "changed_percent": 0.0
+          },
+          "ny": {
+            "n": 170495,
+            "mean": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+            "changed_percent": 0.0
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 37351,
+          "mean": 0.0,
+          "p95": 0.0,
+          "max": 0.0
+        },
+        "output_boundary_distance_base": 50.359375
+      },
+      {
+        "index": 887,
+        "xyz_base": [
+          12851.2607421875,
+          10883.9951171875,
+          11218.197265625
+        ],
+        "trace_distance_base": 9.08371970611934,
+        "valid_voxels": 220440,
+        "total_voxels": 274625,
+        "channels": {
+          "presence": {
+            "n": 220440,
+            "mean": 0.0008528397749954636,
+            "p95": 0.0,
+            "max": 1.0,
+            "changed_percent": 0.08528397749954636
+          },
+          "nx": {
+            "n": 220440,
+            "mean": 0.05552077662856106,
+            "p95": 0.0,
+            "max": 254.0,
+            "changed_percent": 1.0365632371620395
+          },
+          "ny": {
+            "n": 220440,
+            "mean": 0.05041734712393395,
+            "p95": 0.0,
+            "max": 254.0,
+            "changed_percent": 1.2139357648339684
+          }
+        },
+        "axis_angle_deg_presence32": {
+          "n": 87421,
+          "mean": 0.016252148194390855,
+          "p95": 0.0,
+          "max": 9.855076669492936
+        },
+        "output_boundary_distance_base": 45.802734375
+      }
+    ]
+  }
+]

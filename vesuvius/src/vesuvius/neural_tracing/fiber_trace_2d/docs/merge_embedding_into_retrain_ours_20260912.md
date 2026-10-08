@@ -1,0 +1,72 @@
+# Active task history before merging embedding into retrain
+
+Source fiber-training-retrain at b52438d64. Preserved verbatim sections below; historical claims remain scoped to that task.
+
+## task.md
+
+# Latest and best checkpoint full evaluation —2026-09-12
+
+Evaluate the latest current.pt first, then best.pt from collection_20260909_5scroll_128_sd1_16x8_20260911_182306. Each evaluates all50locked fibers/100directions across5actualscrolls, fresh inference and exclusive8GPU manager. Compare quality and runtime against classic and the last best5k run, with full per-scroll metrics and best highlighting. Freeze both before either run; finish and persist both results.
+
+## task_plan.md
+
+# Plan: latest28k then best11k
+
+1. Read workflow, relevant specs and overarching plan; independently review. Archive best5k task log. Starting clean at b32f31a55; native corrected-metric binary SHA7a08b63d9cac8f2afd057af16326decabfd09cd36e1802dca52702d06e89c3a2. Config-only task, no production edits planned.
+2. Freeze both original files with existing live_evaluate.freeze_checkpoint before any GPU work. Captured current28k/3584000samples/dense loss0.38799891914012/SHA114a13003b9a33f78b07cc61a83abd710a2f4bf8408ea16909c249857018817b and best11k/1408000samples/loss0.3603664571877386/SHAca5349cd785b447109bc8be46f211501f1c18d1575e5e7e5c3998f33e0924b34. Both native stride4/base16/depth5/GroupNorm/pixelshuffle. Original and frozen/canonical paths retained; training may advance but snapshots stay fixed.
+3. Clone prior best5k config twice; only checkpoint/hash/output/namespace change. Identical50fibers100directions6collections5scrolls and source/normal mappings; inputL1,totalfactor4,256tile96overlap32border32outchunks,bf16,cap8,float16chunk-major accumulator,128readers256inputslots128resultslots. Same beam8/lookahead2/step4/ellipse thresholds/GT initialization. Prepare and validate-full both with approved runner. Existing successful pilot remains prerequisite; no subset rerun.
+4. Run current28k first via existing approved full command under exclusive manager priority100,224logicalCPU/8GPU, never bypass. Follow to100/100, artifact audit, drained requested queues, immutable hash, warmchunks0, and manager release. Report first iteration vs classic/best5k while preparing second; then run best11k sequentially with distinct inference namespace and same checks. No prediction cache reuse, shared source fetches permitted. Continue until both complete and training resources restored.
+5. Reuse trace_restart_analysis_20260911.py for terminal-inclusive L/(F+C), pooled median/P05/P95, per-scroll/per-collection counts and legacy diagnostics. Record coordinator/native time, tiles,batches,batch mean/median/P95 and peaks; distinguish pre-teardown time from manager lifecycle. Compare all metrics side by side, highlight max distances/min restarts; preserve baseline snapshots/results (no baseline rerun requested).
+6. Persist each config and combined benchmark JSON/MD with commands,source/snapshot/config/binary hashes,code revision,manager evidence; update index,changelog,status/task log. No new training,installs or tracing changes. Note single-trial/correlated directions/asynchronous accumulation caveats.
+
+## Spec update
+
+None. Current complete-reference-partition-v1, snapshot-authoritative native-stride handling and exclusive fresh-inference specs apply unchanged.
+
+## Docs updates
+
+New20260912latest28k/best11k comparison vsclassic/lastbest5k, reproducible commands and metadata; archive prior log, update benchmark index/changelog and current progress log. Existing baselines remain intact.
+
+## task_log.md
+
+# Latest28k and best11k full evaluations —2026-09-12
+
+- User requests latest first versus classic/lastbest5k, then best snapshot. Same full50fibers100directions5scrolls. Both frozen before runs using existing helper, not moving files during execution.
+- Latest current28k:3584000samples,test/loss_total0.38799891914012,SHA114a13003b9a33f78b07cc61a83abd710a2f4bf8408ea16909c249857018817b. Best11k:1408000samples,loss0.3603664571877386,SHAca5349cd785b447109bc8be46f211501f1c18d1575e5e7e5c3998f33e0924b34. Stage/tmp/fiber3d_snapshot_20260912_0552,training runcollection_20260909_5scroll_128_sd1_16x8_20260911_182306. Both modelnative stride4/base16/depth5/GroupNorm/pixelshuffle.
+- Clean starting revisionb32f31a5538a09a5600890ee35b17e256a759e6c; native binarySHA7a08b63d9cac8f2afd057af16326decabfd09cd36e1802dca52702d06e89c3a2. Previous task log archived in docs/best5k_evaluation_task_log_20260912.md. No production changes expected.
+- Independent latest_best_sept12_review approved plan and exact config deltas, independently verified frozen checkpoint/binary hashes. Both prepare/validate-full passed with50fibers100directions,6collections/5actualscrolls and unchanged normals/membership.
+- Latest28k full launched with existing approved runner; training task58fd84af-60cb-47b3-8fa4-c9acdb4bf251 is pausable/applied128CPU/8GPU beforehand. Manager handles exclusive yielding; no manual training mutation.
+- Latest28k manager task2a9f6e3b-29e3-4c46-8d63-9f8b9853ab1a obtained exclusive224CPU/8GPU; training held0CPU/0GPU. Completed100directions,coordinator399.915584s/native350.330659s,33857tiles/4440calls,warmchunks0,98.5557%tiles in full8tile batches. All requested queues drained;100saved artifacts audited. No errors/incomplete outputs.
+- First quality comparison: latest28k2516restarts,mean3.089280604mm,median0.049606265,P05/P95 0.010445060/15.583171481mm,2616segments. Versus lastbest5k2411/3.218461991mm,mean4.0138%shorter; classic1995/3.857545613mm. Per-scroll latest mean/restarts:0139 3.033436813/439;0332 22.439128064/15;1299 2.306722627/250;1451 2.009151919/43;Paris4 3.020126216/1769. First comparison reported while awaiting final cleanup, then best11k follows.
+- Latest command exit0,manager terminal finished with0heldresources; training reapplied128CPU/8GPU before second admission. Saved exact first result/metadata/manager evidence in docs/benchmarks/collection_182306_current28k_full_20260912.json. Best11k launched next using the same approved full runner and separate namespace; no overlap or prediction reuse.
+- Best11k task8243bed6-1a8a-40fc-9ea6-6b13f276f844 obtained exclusive224CPU/8GPU; training again held0CPU/0GPU. At187.4s13303tiles,3939published spatial chunks; recent throughput around100tiles/s,similar to latest. No runner errors. Latest canonical checkpoint rehashed unchanged after execution.
+
+## Both runs completed
+
+- User reiterated per-scroll reporting,including11k; full tables forclassic,lastbest5k,latest28k,best11k include restarts/mean/median/P05/P95,highlighting best per scroll/metric.
+- Best11k:100directions complete,2214restarts,2314segments,mean3.492462429mm,median0.085944463,P05/P95 0.009428696/17.115161633mm,17zero complete-reference segments. Mean8.51%better than lastbest5k,13.05%better than latest28k,9.46%belowclassic. Lower median thanbest5k despite better mean; distribution summaries need not move together.
+- Best11k per-scroll mean/restarts:0139 2.956151799/451;0332 20.487899537/17;1299 2.701567041/212;1451 2.623059450/32;Paris4 3.536370582/1502. All200new saved artifacts validated through existing audit script. No incomplete markers,canonical frozen hashes unchanged,warmchunks0 and all requested queues drained.
+- Best11k coordinator398.683800s/native351.002858s;33939tiles/4511model calls,2686.837685summedworker seconds,98.0819%tiles in8tile batches. Batch secondsmean0.595619/median0.592049/P950.878944;GPUpeakallocated36.676594GiB/reserved46.648438GiB. Both new runtimes~6m40,versuslastbest5k402.933s/classic516.699s. Single trials,not a pure model benchmark.
+- Both commands exit0; manager tasks terminal finished/completed,held0CPU/0GPU. Training restored applied128CPU/8GPU. Manager root-start→lastcontact latest494.511s,best529.976s includes admission/setup/teardown,distinct from coordinator timing.
+- Saved docs/benchmarks/collection_182306_current28k_full_20260912.json,collection_182306_best11k_full_20260912.json and combined collection_182306_latest_best_full_20260912.md/.json. Full exact hashes,source bindings,checkpointmetadata,performance,managerstates and runcommands retained. Updated index/changelog/status. No production changes.
+
+## Commands and validation
+
+Used approved /home/hendrik/.venv_las/bin/python /home/hendrik/villa2/vesuvius/scripts/run_classic_fiber_evaluation.py with prepare,validate-full,full and --config pointing respectively to configs/eval_collection_182306_current28k_full.json then configs/eval_collection_182306_best11k_full.json. Exact absolute commands in combined benchmark MD. Existing successful pilot reused as prerequisite,not substituted for full test.
+
+Ran existing docs/trace_restart_analysis_20260911.py against each complete output/full directory;100raw case artifacts validated per run,corrected terminal-inclusive metrics. Runtime performance audit checked completed counts,warmchunks0,batchhistogram weighted count,requestedqueue drain and recorded summary/config/binding SHA256. Final git diff --check and combined-report consistency validation passed. Prior production tests36passed and binary unchanged; config-only task requires no additional build/test rerun beyond executed preflight/full/artifact checks.
+
+## Limitations/deviations
+
+No omitted collections or deferred requirements. Baselines reused from saved measurements rather than rerun,as requested. Both new snapshots frozen together before evaluations; training may advance afterward. One trial each;forward/reverse correlated,small0332/1451groups,and asynchronousfloat16 accumulation can affect low-order predictions/trajectories. No significance or causal training-regression claim. Metrics represent full reference intervals (including forced advances),not physical successful trace length. No changes to training,initial heading,thresholds,tracer,compression or inference implementation;no installs.
+
+## status.md
+
+# Status
+
+- [x] Read workflow/specs; freeze current28k and best11k before either evaluation.
+- [x] Plan and archive preceding task log.
+- [x] Independent review approved bothconfigs; prepare/validate-full passed50fibers100directions each.
+- [x] Latest28k full run,100artifacts audited,first comparison reported,exit0,manager released.
+- [x] Best11k full run100/100,audit,comparison and release;exit0.
+- [x] Persisted per-run and combined full per-scroll results/provenance/log;training restored128CPU/8GPU.

@@ -30,6 +30,7 @@ inline QString settingsFilePath()
 // on first use; settings changes take effect after VC3D restarts.
 //
 // Priority — first match wins:
+//   0. explicit host override in <VC3D_CONFIG_DIR or ~/.VC3D>/cache.json
 //   1. viewer/remote_cache_dir from the process-wide VC3D settings
 //   2. /volpkgs/remote_cache    (typical EBS mount on EC2 dev hosts)
 //   3. /ephemeral/remote_cache  (NVMe instance store, scripts/ec2_setup.sh)

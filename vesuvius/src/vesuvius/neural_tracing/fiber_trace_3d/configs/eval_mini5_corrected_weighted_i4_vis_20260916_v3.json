@@ -1,0 +1,49 @@
+{
+  "benchmark_manifest": "/home/hendrik/villa2/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/mini5_fiberlet_failures_20260916_v1.json",
+  "benchmark_corrections": [
+    {
+      "piece": "000_08e44ead4019b9400317",
+      "path": "/ephemeral/hendrik/fiber3d_train2/corrected_fibers/evalextract_20260916T154925562_000000.json",
+      "sha256": "b7cd71fb6b444afc3228efbe40f700f1a45f7bb2bbab6175620e9bf07ee2261a"
+    },
+    {
+      "piece": "001_6b300e78b502d4fbf62f",
+      "path": "/ephemeral/hendrik/fiber3d_train2/corrected_fibers/evalextract_20260916T154925562_000001.json",
+      "sha256": "67c8c5688b29631aa7a5cb4a5db134e17f583329bd93ebb0ac755c77f561f3ec"
+    }
+  ],
+  "cached_evaluation": "/ephemeral/hendrik/fiber3d_train2/evaluations/refinement_212757_best_ema999_off_20260916_v1/full",
+  "checkpoint": "/ephemeral/hendrik/fiber3d_train2/evaluations/refinement_212757_best_ema999_off_20260916_v1/frozen/live_inference/_models/67edd3a1bde162c7105ee37d849a0f0b60a9b840dd37fc7ff6e17e0c3a2e9742/snapshot.pt",
+  "checkpoint_sha256": "67edd3a1bde162c7105ee37d849a0f0b60a9b840dd37fc7ff6e17e0c3a2e9742",
+  "output_root": "/ephemeral/hendrik/fiber3d_train2/evaluations/mini5_corrected_weighted_i4_vis_20260916_v3",
+  "native_binary": "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_metric",
+  "devices": "0,1,2,3,4,5,6,7",
+  "benchmark_workers": 224,
+  "gpu_manager": {
+    "enabled": true,
+    "exclusive": true,
+    "priority": 100,
+    "cpu_cores": 224,
+    "vram_bytes_per_gpu": 62277025792,
+    "label": "mini5-corrected"
+  },
+  "backend": "fiberlet",
+  "fiberlet": {
+    "storage_chunk_side_base": 128,
+    "beam_width": 16,
+    "lookahead_base_voxels": 384,
+    "beam_step_base_voxels": 48,
+    "construction_workers": 224,
+    "anchor_fit": {
+      "method": "weighted",
+      "iterations": 4,
+      "presence_exponent": 1,
+      "direction_exponent": 2,
+      "local_sigma": 1.5,
+      "damping": 0.5
+    }
+  },
+  "scroll_sequential": true,
+  "log_construction_chunks": false,
+  "render": true
+}

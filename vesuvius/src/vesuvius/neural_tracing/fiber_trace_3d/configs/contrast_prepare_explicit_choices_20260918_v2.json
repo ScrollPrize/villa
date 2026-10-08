@@ -1,0 +1,21 @@
+{
+  "output_root": "/ephemeral/hendrik/fiber3d_train2/evaluations/explicit_contrast_choice_tests_20260918_v2",
+  "cases": [
+    {
+      "source_benchmark_manifest": "/ephemeral/hendrik/fiber3d_train2/evaluations/short_failures_200_20260916_v3/manifest.json",
+      "source_case": "/ephemeral/hendrik/fiber3d_train2/evaluations/short200_fullres_refinement_213753_best_ema999_vis_20260918_v1/full/cases/31",
+      "piece": "053_5de02b9d2fd3c9919f58",
+      "alternative_trace": "evaltrace-beam_20260918T100728975_053000.json"
+    },
+    {
+      "source_benchmark_manifest": "/ephemeral/hendrik/fiber3d_train2/evaluations/mini5_corrected_weighted_i4_vis_20260916_v3_inputs/manifest.json",
+      "piece": "000_08e44ead4019b9400317",
+      "choices": [
+        {
+          "path": "/ephemeral/hendrik/fiber3d_train2/corrected_fibers/evaltrace-fiberlet_20260916T154925562_000000.json",
+          "role": "companion-fiber-hypothesis"
+        }
+      ]
+    }
+  ]
+}

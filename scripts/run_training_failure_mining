@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if (($#)); then
+    echo 'This runner takes no arguments.' >&2
+    exit 2
+fi
+exec /home/hendrik/.venv_las/bin/python /home/hendrik/villa3/scripts/training_failure_mining.py

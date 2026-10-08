@@ -55,7 +55,17 @@ def json_digest(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def atomic_write(path: str | Path, value: Mapping[str, Any]) -> None:
+def atomic_write(
+    path: str | Path,
+    value: Mapping[str, Any],
+    *,
+    durable: bool = True,
+) -> None:
+    """Atomically replace a JSON file, optionally forcing its data to storage.
+
+    ``durable=False`` retains the temp-file-plus-rename atomicity guarantee but
+    avoids coupling regenerable control files to unrelated filesystem writeback.
+    """
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
@@ -64,7 +74,8 @@ def atomic_write(path: str | Path, value: Mapping[str, Any]) -> None:
             json.dump(value, handle, indent=2, sort_keys=True)
             handle.write("\n")
             handle.flush()
-            os.fsync(handle.fileno())
+            if durable:
+                os.fsync(handle.fileno())
         os.replace(temporary, destination)
     finally:
         try:
@@ -126,17 +137,22 @@ def structural_inventory(manifest_path: str | Path) -> list[dict[str, Any]]:
     return inventory
 
 
-def validate_portable_bundle(bundle_path: str | Path) -> dict[str, Any]:
+def validate_portable_bundle(
+    bundle_path: str | Path, *, provenance_name: str = "inference.json",
+) -> dict[str, Any]:
     """Validate bounded provenance references without enumerating Zarr chunks."""
     bundle = Path(bundle_path).resolve()
-    value = json.loads((bundle / "inference.json").read_text(encoding="utf-8"))
+    provenance_path = Path(provenance_name)
+    if provenance_path.is_absolute() or ".." in provenance_path.parts:
+        raise ValueError("portable provenance name must be a relative path")
+    value = json.loads((bundle / provenance_path).read_text(encoding="utf-8"))
     if not isinstance(value, dict):
-        raise ValueError("inference.json must contain a JSON object")
+        raise ValueError(f"{provenance_path} must contain a JSON object")
     if value.get("status") != "completed":
         raise ValueError(f"inference status must be 'completed', got {value.get('status')!r}")
     artifacts = value.get("artifacts")
     if not isinstance(artifacts, list) or not artifacts:
-        raise ValueError("inference.json must contain a non-empty artifact inventory")
+        raise ValueError(f"{provenance_path} must contain a non-empty artifact inventory")
     for artifact in artifacts:
         if not isinstance(artifact, dict) or not isinstance(artifact.get("path"), str):
             raise ValueError("each artifact must contain a relative path")

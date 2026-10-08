@@ -104,18 +104,28 @@ class Vc3dCoordinateSampler(CoordinateSampler):
         cache_root: str | None,
         cache_budget_bytes: int | None = None,
         io_threads: int | None = None,
+        decode_threads: int | None = None,
+        sample_threads: int | None = None,
+        chunk_locality_fast_path: bool = True,
+        collect_locality_stats: bool = False,
         sampling: str = "trilinear",
         blocking: bool = True,
     ) -> None:
         from vc.volume import (
             Volume,
             set_chunk_cache_budget,
+            set_chunk_cache_decode_threads,
             set_chunk_cache_io_threads,
         )
 
         self.level = int(level)
         self.sampling = str(sampling)
         self.blocking = bool(blocking)
+        self.sample_threads = 0 if sample_threads is None else int(sample_threads)
+        self.chunk_locality_fast_path = bool(chunk_locality_fast_path)
+        self.collect_locality_stats = bool(collect_locality_stats)
+        if self.sample_threads < 0:
+            raise ValueError("sample_threads must be non-negative")
         path = str(volume_path)
         if path.startswith("s3://"):
             # VC3D remote volume loading is HTTP-backed. The public Vesuvius S3
@@ -137,6 +147,11 @@ class Vc3dCoordinateSampler(CoordinateSampler):
             if threads <= 0:
                 raise ValueError("io_threads must be positive when provided")
             set_chunk_cache_io_threads(threads)
+        if decode_threads is not None:
+            threads = int(decode_threads)
+            if threads <= 0:
+                raise ValueError("decode_threads must be positive when provided")
+            set_chunk_cache_decode_threads(threads)
 
     @property
     def store_identity(self) -> str:
@@ -151,6 +166,9 @@ class Vc3dCoordinateSampler(CoordinateSampler):
             self.sampling,
             32,
             self.blocking,
+            self.sample_threads,
+            self.chunk_locality_fast_path,
+            self.collect_locality_stats,
         )
         image_arr = np.asarray(image, dtype=np.float32)
         valid_arr = np.asarray(sampled_valid, dtype=np.uint8)
@@ -190,24 +208,18 @@ class Vc3dCoordinateSampler(CoordinateSampler):
     ) -> CoordinateSampleResult:
         if hasattr(self, "blocking") and not bool(getattr(self, "blocking")):
             raise ValueError("VC3D block sampling requires blocking=True")
-        sample_block = getattr(self.volume, "sample_zyx_block", None)
-        if sample_block is None:
-            raise RuntimeError(
-                "VC3D volume binding does not expose sample_zyx_block; rebuild "
-                "volume-cartographer so native 3D Trace2CP can use strict "
-                "requested-level axis-aligned block reads"
-            )
         start = np.asarray(start_zyx, dtype=np.int64)
         shape = np.asarray(shape_zyx, dtype=np.int64)
         if start.shape != (3,) or shape.shape != (3,):
             raise ValueError("start_zyx and shape_zyx must each have shape (3,)")
         if not bool(np.all(shape > 0)):
             raise ValueError("shape_zyx values must be positive")
-        image, sampled_valid, stats = sample_block(
+        image, sampled_valid, stats = self.volume.read_zyx(
             tuple(int(v) for v in start),
             tuple(int(v) for v in shape),
             self.level,
-            self.blocking,
+            with_mask=True,
+            with_stats=True,
         )
         image_arr = np.asarray(image, dtype=np.float32)
         valid_arr = np.asarray(sampled_valid, dtype=np.uint8)
@@ -439,6 +451,10 @@ def make_coordinate_sampler(
     cache_root: str | None,
     cache_budget_bytes: int | None = None,
     io_threads: int | None = None,
+    decode_threads: int | None = None,
+    sample_threads: int | None = None,
+    chunk_locality_fast_path: bool = True,
+    collect_locality_stats: bool = False,
 ) -> CoordinateSampler:
     del array, level_spacing_base
     return Vc3dCoordinateSampler(
@@ -447,4 +463,8 @@ def make_coordinate_sampler(
         cache_root=cache_root,
         cache_budget_bytes=cache_budget_bytes,
         io_threads=io_threads,
+        decode_threads=decode_threads,
+        sample_threads=sample_threads,
+        chunk_locality_fast_path=chunk_locality_fast_path,
+        collect_locality_stats=collect_locality_stats,
     )

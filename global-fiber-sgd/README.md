@@ -2,6 +2,10 @@
 
 Initial data reconnaissance, 2026-10-08. No optimizer implemented yet.
 
+Follow-up: shared BP code merged from `fiber-exp5`; see
+[Lasagna constraint extraction overview](bp_constraints.md) for the reusable
+pipeline, modes, merge resolution and validation limitations.
+
 ## Working data
 
 `data/Paris4_v1.afv` (ignored by Git), downloaded from

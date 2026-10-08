@@ -1,0 +1,5 @@
+{
+  "build_dir": "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation",
+  "python": "/home/hendrik/.venv_las/bin/python",
+  "suite": "inspection"
+}

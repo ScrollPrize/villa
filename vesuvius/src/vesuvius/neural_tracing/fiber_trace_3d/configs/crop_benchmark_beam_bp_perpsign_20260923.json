@@ -1,0 +1,54 @@
+{
+  "output_root": "/ephemeral/hendrik/fiber_crop_bench/20260923_v1",
+  "reference_dir": "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+  "input_files": [
+    "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd1-7ff0ce6c/artifacts/PHercParis4-20260411134726-las-sd1-7ff0ce6c.lasagna.json",
+    "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json"
+  ],
+  "commands": [
+    {
+      "name": "bp-beam-new-perpsign-p1low",
+      "binary": "vc_fiber_trace_chunk",
+      "args": [
+        "direction-ablation",
+        "/ephemeral/hendrik/fiber_crop_bench/20260923_v1/beam-crop-new.zarr",
+        "--normal-manifest",
+        "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+        "--output",
+        "/ephemeral/hendrik/fiber_crop_bench/20260923_v1/bp-beam-new-perpsign-p1low",
+        "--direction-dominance",
+        "0.9",
+        "--piece-length",
+        "512",
+        "--bp-only",
+        "--bp-inference",
+        "sum-product-mixed",
+        "--winding-fixed-orientation",
+        "--reference-prune-offenders",
+        "--reference-prune-policy",
+        "oracle-inliers",
+        "--reference-oracle-magnitude-weight",
+        "1",
+        "--reference-oracle-accept-message-limit",
+        "--reference-oracle-rounds",
+        "1",
+        "--reference-fiber-dir",
+        "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+        "--reference-fiber-tag",
+        "hendrik_crop1",
+        "--threads",
+        "128",
+        "--winding-weights",
+        "0,0,0,0.1,0",
+        "--winding-sign-weights",
+        "1,0",
+        "--winding-hard-signs",
+        "perpendicular",
+        "--winding-sign-cost",
+        "hard",
+        "--winding-hard-sign-angle",
+        "off"
+      ]
+    }
+  ]
+}

@@ -158,9 +158,43 @@ that service directly before or during use:
 | `configureFetchConcurrency(count, adaptive)` | Change global source-read admission in place |
 
 Python exposes the equivalent module-level functions
-`vc.set_chunk_cache_budget(bytes)` and
-`vc.set_chunk_cache_io_threads(count)`. The latter selects fixed admission.
+`vc.set_chunk_cache_budget(bytes)`,
+`vc.set_chunk_cache_io_threads(count)`, and
+`vc.set_chunk_cache_decode_threads(count)`. The thread controls select fixed
+source-read and decode admission respectively; the process service retains its
+fixed physical worker pools.
 Cache policy is deliberately not configured through a `Volume` instance.
+
+Python `Volume.sample_coords(..., sampler_threads=0,
+chunk_locality_fast_path=True, collect_locality_stats=False)` also accepts a
+per-call coordinate-interpolation worker cap. Zero preserves automatic
+behavior, one uses the calling thread only, and positive values are bounded by
+the existing render-sampler pool. The exact locality fast path reuses adjacent
+dependency footprints and pinned chunk pointers; it can be disabled for a
+matched reference measurement. Locality counters are opt-in because collecting
+them adds inner-loop bookkeeping. These controls do not alter cache I/O or
+decode admission. Returned stats include dependency, chunk-resolution and
+interpolation durations plus per-cache codec counter deltas for profiling.
+
+The `vc.volume` extension also exposes the standalone CPU helper
+`generate_fiber3d_coords(...)`. It generates a contiguous float32
+`(z, y, x, 3)` base-coordinate array and uint8 `(z, y, x)` validity mask in one
+native pass from the Fiber3D affine transform and optional low-resolution
+smooth controls. It evaluates controls directly for each output coordinate,
+does not construct full-resolution meshgrid or displacement intermediates, and
+releases the GIL. The Fiber3D loader selects it through `geometry_backend`
+(`auto`, `native`, or the reference `eager` implementation).
+
+`vc.volume.anisotropic_blur_3d(volume, axis_zyx, sigma_along, sigma_across)`
+provides the corresponding single-threaded Fiber3D CPU augmentation primitive.
+It returns a new contiguous float32 ZYX array, releases the GIL, and applies
+three sequential constant-stencil passes without constructing coordinate
+grids. The input is not modified.
+
+`vc.volume.fiber3d_value_transform(...)` fuses valid-only image normalization,
+contrast, brightness, and gamma into one single-threaded, GIL-free native
+operation. The loader retains its seeded Torch noise draw and applies blurs in
+the original order.
 
 For a newly encountered remote Zarr, `cacheRoot` holds an incomplete native
 mirror: metadata and fetched storage objects keep their source-relative paths

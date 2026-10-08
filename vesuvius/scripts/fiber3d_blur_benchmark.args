@@ -1,0 +1,25 @@
+# One argument per line. The caller remains approval-stable while this file is editable.
+--dtype
+float32
+--patch-size
+128
+--batch-sizes
+1
+2
+4
+8
+--kernel-sizes
+3
+5
+7
+9
+11
+13
+--warmup
+5
+--iterations
+20
+--kernel-samples
+10000
+--strategy-batches
+32

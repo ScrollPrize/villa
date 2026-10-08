@@ -248,23 +248,34 @@ void defaultFetch(const std::string& sourceLocation,
                   bool discoverAwsCredentials)
 {
     const auto endpoint = vc::resolveRemoteUrl(sourceLocation);
-    auto details = makeRemoteClientDetails(
-        endpoint, explicitAuth, discoverAwsCredentials);
     auto anonymousDetails = makeRemoteClientDetails(
         endpoint, vc::HttpAuth{}, false);
-    utils::HttpClient authenticatedClient(std::move(details.config));
     utils::HttpClient anonymousClient(std::move(anonymousDetails.config));
-    vc::S3AuthFallback fallback(details.isS3, details.credentialsLoaded);
+    vc::DeferredAwsAuth deferredAuth(
+        explicitAuth,
+        endpoint.useAwsSigv4 && discoverAwsCredentials,
+        endpoint.awsRegion);
+    std::optional<RemoteClientDetails> authenticatedDetails;
+    std::unique_ptr<utils::HttpClient> authenticatedClient;
+    vc::S3AuthFallback fallback(
+        endpoint.useAwsSigv4, deferredAuth.available());
     auto result = fallback.request([&](bool anonymous) {
-        return anonymous
-            ? anonymousClient.get(endpoint.httpsUrl)
-            : authenticatedClient.get(endpoint.httpsUrl);
+        if (anonymous)
+            return anonymousClient.get(endpoint.httpsUrl);
+        if (!authenticatedClient) {
+            authenticatedDetails = makeRemoteClientDetails(
+                endpoint, deferredAuth.resolve(), false);
+            authenticatedClient = std::make_unique<utils::HttpClient>(
+                std::move(authenticatedDetails->config));
+        }
+        return authenticatedClient->get(endpoint.httpsUrl);
     });
     if (!result.response.ok()) {
+        const auto& failureDetails = result.usedAnonymous || !authenticatedDetails
+            ? anonymousDetails
+            : *authenticatedDetails;
         std::string message = fetchFailureMessage(
-            sourceLocation, endpoint,
-            result.usedAnonymous ? anonymousDetails : details,
-            result.response);
+            sourceLocation, endpoint, failureDetails, result.response);
         if (result.anonymousFailure) {
             message += " anonymous_attempt_http=" +
                 std::to_string(result.anonymousFailure->status_code);

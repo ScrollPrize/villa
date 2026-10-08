@@ -1,9 +1,862 @@
 # 2D Fiber Trace Initial Loader Specs
 
+## Current selected crop baseline (2026-10-04)
+
+- User explicitly promoted tuned presence10/20,f0 deduplication. Same frozen
+  raw40500 beam8/iso20/full-prefix512 source tracing,45degree overlap angle and
+  <=4base midpoint sampling; independent reverse-filter pieces, whole-piece removal.
+- BP near/far magnitudes.2/.2,P1.0375,others0;hard signs,disable100/128,boundary10,
+  min256/median64/blend1/scale.822/phase.5/500messages.1024scores65.3846%accuracy,
+  91.6667%shift,−55.1216%removal,88.4615%oracle. Accuracy-first selection.
+- Supersedes previous no-dedup benchmark designation only; production CLI and
+  reviewed91-fiber replay remain unchanged. Retain former scores as controls.
+- Apply exactly this configuration to2048context without retuning. Reuse validated
+  completed dense tracing; report all scores plus full independent ladder and
+  missingness. Expanded overlapping context is not held-out validation.
+
+## Zero-overlap BP cost retuning (2026-10-03)
+
+- All twelve f0 selections are independently tuned with frozen source pieces,
+  min256/median64/scale.822/phase.5 and500 messages. No new tracing/inference.
+- Bounded two-round frozen-incumbent coordinate sweep: disabling and boundary
+  costs, active magnitude weights and finite/hard sign penalties. Parallel-two
+  magnitude stays zero because cutoff1.5 excludes it. Separate sign terms stay
+  enabled even when magnitude weights are zero.
+- Rank by exact non-oracle accuracy, observed shift, then conditioned removal;
+  only tied finalists need removal solves. Preserve all26 reference denominator,
+  record missing/gauge results and exact-repeat winners. Tuning evidence only.
+- Approved runner action iso20_overlap_costs; full grids/configs/provenance and
+  before/after report in docs/fiber_benchmark_runs/2026-10-03-overlap-costs.
+- Completed576configurations,91removal solves and12paired exact-repeat winners.
+  Best tuning-set candidate: presence10/20,f0,near/far magnitude.2/.2,
+  parallel-one.0375,disable100/128,boundary10,hard signs. Non-oracle65.3846%,
+  shift91.6667%,removal−55.1216%,conditioned accuracy88.4615%.
+  Baseline61.5385%/87.5%/−28.9207%: primary metrics improve but removal worsens.
+  No production/default promotion without further review/held-out validation.
+
+## Optional post-fw/bw independent-piece overlap removal (2026-10-03)
+
+Historical pilot conclusions below precede cost retuning and the explicit
+2026-10-04 benchmark promotion above; production CLI defaults remain unchanged.
+
+- Native `deduplicate` mode processes saved full-length trace artifacts, after
+  reverse-consistency splitting. Each retained piece is independent regardless
+  of shared seed or original trace. Does not alter tracing/seeding defaults.
+- Collision uses sampled arc coverage of the shorter piece against one other
+  piece: midpoint samples at most4base voxels apart, shared sheet-normal ellipse,
+  unoriented45degree tangent gate. Whole-piece selection is global best-first;
+  suppressed pieces never suppress other pieces. No trimming or retracing.
+- Fraction0 is valid and requires strictly positive measured overlap (any matched
+  sample). Disjoint pairs are never edges, even at0. Follow-up tests0/10/20%
+  for ellipses10/20,20/40 and then isotropic10/10,20/20base voxels.
+- Native measured overlap graph stores all positive fractions independently of
+  rank/threshold. Optional cache key includes exact ordered geometry, source
+  fingerprint, immutable normal-manifest identity/contents, normal scale, radii,
+  direction gate, sample spacing and contract version. Reject mismatches/invalid
+  graph structure and publish atomically. No tracing/inference scheduler changes.
+- Higher geometric length, higher arc-weighted sampled presence, or lower saved
+  tracer cost/path length ranks pieces. Ties use length then original ordinal.
+  Presence uses existing prediction sampling, max valid option, and fails on
+  invalid samples. This cached postprocessing never requests inference.
+- Preserve exact survivor geometry and costs, source indices and full original
+  processing metadata. Record suppressor original ID and shorter-side overlap
+  fraction per removed piece. Inherit original trace configuration explicitly.
+- Pilot1024 only: ellipses10/20 and20/40, fractions50%/80%, all three rankings.
+  Compare all existing BP scores plus reference missingness and retained total
+  length. Unique tails can be lost; length is not reference coverage. No default
+  promotion based solely on graph reduction or oracle removal score.
+- Completed12setting pilot: none improves the baseline61.5385% non-oracle.
+  Best filtered53.8462% (cost20/40,f80); keep opt-in only. Full results in
+  volume-cartographer/docs/fiber_benchmark_runs/2026-10-03-post-overlap.md.
+- Follow-up36settings0/10/20% and isotropic10/20: best new non-oracle50%
+  (length,20/40,f0), isotropic maximum34.6154%. Baseline still61.5385%.
+  Best new oracle accuracy88.4615% versus baseline80.7692% is a separate
+  reference-conditioned result, not evidence of improved non-oracle solving.
+  Keep disabled; complete report2026-10-03-post-overlap-low.md/json.
+
+## Optional dense accepted-trace stopping (2026-10-03)
+
+- `--stop-at-covered-traces` is dense-beam-only and off by default. Use a local
+  accepted-segment bucket index, exact projection, shared normal ellipse and
+  unoriented coverage-angle gate. Stop at the first covered committed vertex,
+  including that terminal vertex; this is step-resolution stopping, not an
+  analytically interpolated ellipse-entry point.
+- `--covered-trace-normal` / `--covered-trace-tangential` override only the new
+  stopping ellipse in base voxels. Omission inherits seed-coverage radii.
+  Seed suppression remains unchanged, permitting isolated radius experiments.
+- Parallel workers query an append-only index restricted to their submission
+  watermark. Ordered acceptance rechecks both raw sides against all prior
+  accepted segments before publishing either side. If truncated, re-run the
+  existing reverse verifier including the new terminal endpoint; do not merely
+  clip already-verified intervals. Recovered intervals remain subsets of checked
+  prefixes. Index locks cover local lookup/publication, not normal sampling.
+- Persist effective stopping radii and counters. No-flag artifact semantics
+  remain unchanged. First trials are1024 only, using cached raw40500 inference,
+  iso20 reverse checks and unchanged BP parameters. Larger crop awaits review.
+
+## Previous no-dedup fine-split benchmark baseline (2026-10-03)
+
+- A matched2048 context test is reported separately from the1024 tuning history:
+  preserve the selected snapshot/tracer/BP parameters,26 references and500-message
+  budget; only expand crop bounds. Reuse inference/anchor caches and existing
+  managed coverage fill. Report independent ladder with missing/gauge diagnostics;
+  do not substitute older-model2048 trace artifacts or imply an oracle result.
+
+- Median +/-64 probes/blend1, minimum256, length cost100 per128 base voxels, boundary10,
+  parallel-one magnitude weight0.0375, other magnitude weights0, hard signs both,
+  fixed scale0.822/phase0.5. Raw40500 isotropic20 crop traces, legacy-fine pieces
+  and partition-length cost,500 message iterations.
+  Removal score-28.9207%, oracle80.7692%, independent61.5385%, observed shift87.50%.
+  Selected by user after the iterative sweep as future benchmark baseline;
+  supersedes length150/boundary0/P1=.05. Not a production-default or global dominance
+  claim (historical overlap removal-25.2365%).
+- Cost sweeps keep oracle protocol, geometry,500iterations and probe rules fixed;
+  compare actual removal and independent scores, with unavailable metrics explicit.
+
+## Conservative orthogonal probes (2026-10-02)
+
+- Opt-in `--orthogonal-probe-span`, `--orthogonal-probe-blend` and
+  `--orthogonal-probe-consensus` augment legacy orthogonal targets. Disabled by
+  default, including in explicit reference extraction.
+- Probe +/-span independently along each source against the other center.
+  Require four finite, same-normal-component signed samples. Median includes
+  the original center; consensus requires all signed half-winding bins agree.
+  Otherwise retain original. Preserve all old admission decisions, weights,
+  cut locations, orientation scores, alignments and parallel estimates.
+- When enabled this explicitly relaxes the legacy-fine guarantee of unchanged
+  perpendicular signed target and corresponding absolute winding distance only.
+  It does not enable the newer scorer's geometric rejection rules.
+
+## Legacy constraints with fine ownership (2026-10-02)
+
+- `--legacy-fine-pieces` measures using ordinary overlapping pieces, then
+  transfers each ordinary observation unchanged to source-arc owners on a
+  nonoverlapping orthogonal-midpoint subdivision. `--local-min-piece-length`
+  controls the subdivision minimum, not the measurement support.
+- Legacy overlapping observations remain distinct, with original weights and
+  signed values. No normalization, deduplication or remeasurement is applied.
+  Old continuity is removed and rebuilt once on the new adjacent pieces.
+- Incompatible with local-event/scorer extraction, preserve-input pieces, extra
+  cuts or omitted parallel observations. Explicit reference extraction resets
+  the port flag. Defaults are unchanged.
+- Approved runner action `iso20_legacy_fine` supports initial matrix, bounded
+  `followup:true`, and `report_only:true`; report includes exact input/build
+  provenance through ordinary benchmark run records.
+
+## Opt-in BP constraint isolation (2026-10-02)
+
+- `iso20_constraint_isolation` uses frozen iso20 source traces and the historical
+  overlap512/128 layout. No tracing/model/default changes;500 message iterations.
+- Native extraction exposes independent closest/legacy distance, winding probe
+  certification, local scorer, binary orientation, source-event normalization,
+  refinement, owner replication and one-event-per-owner-pair controls.
+- Reference measurement mode (`auto|old|events`) is independently selectable;
+  explicit old/events modes reset graph-only ablation switches. Readout-only
+  comparisons must preserve exact initial solved piece states.
+- Frozen piece priors identify original source and exact arc endpoints; missing
+  or duplicate identities are errors. Class and actual disabling-mass overrides
+  are separate. Coverage-partitioned physical-length costs count overlap once.
+- Multiple active gauges must not silently become a single reference ladder.
+  Isolation reports retain their summaries and mark aggregate scores unavailable.
+- Approved runner action supports `supplement`, `analyze`, and `report_only`.
+  Full commands, input/binary hashes, logs and results remain in the artifact
+  directory linked by the dated constraint-isolation report.
+
+## Explicit contrast-choice benchmarks (2026-09-18)
+
+- A packaged contrast case binds one directed forward reference, which is the
+  sole evaluation ground truth, and one or more explicit competing choice
+  lines. A choice only defines the allowed traversal scope for a backend: a
+  fiberlet corridor radius or a skeleton crop tube. It never enters evaluation.
+- Every choice carries a role. Current roles are
+  `competing-pre-restart-beam-trace` for a saved beam segment and
+  `companion-fiber-hypothesis` for a user-supplied alternative annotation.
+- `manifest.json` and `manifest_unrestricted.json` are produced together. The
+  unrestricted manifest drops `contrast_choices` from every case and is the
+  control whose scope is the reference alone.
+- Packaging accepts several cases in one manifest. Reference and choice hashes
+  are verified on copy and again at binding; duplicates are rejected.
+- A choice may omit `vc_open_data_coordinate_space` or
+  `vc_open_data_source_original_resolution` when the source annotation has lost
+  its export provenance. The packaging records the absent keys in
+  `unverified_coordinate_bindings`, and the Python runner and native CLI accept
+  exactly those. A stated binding must still agree with the reference.
+- Contrast choices are accepted by the `fiberlet` and `skeleton` backends. A
+  packaged root is immutable evidence; corrections are published as a new
+  versioned package.
+
+## Skeleton-topology least-squares tracing prototype (2026-09-18)
+
+- `backend: "skeleton"` is a diagnostic replay backend. Its crop is scoped to a
+  tube around the benchmark reference and every explicit choice, so its numbers
+  are ground-truth relative and are not comparable to unscoped full-cohort
+  results. It is not a production tracer.
+- Pipeline, in order: threshold the stored presence at one configured
+  `threshold_u8` and drop components below `min_component_voxels`; thin with
+  Lee's algorithm at full resolution, with no downsampling, so neighbouring
+  fibers keep their separation; contract the 26-neighbour voxel graph; merge
+  junctions joined by a bridge shorter than `junction_merge_max_base`, prune
+  terminal spurs shorter than `spur_prune_max_base`, suppress degree-two nodes;
+  cut every edge incident to a junction at `entry_offset_base` to place a
+  port,
+  or place one shared midpoint port when the bridge is shorter than two
+  offsets; give each port its lateral candidates from the section of the
+  prediction; refine each line once per pair of end candidates; then resolve
+  every region over candidates.
+- The threshold is one ordinary configuration parameter, swept through
+  benchmark configs. It is never selected from ground truth at runtime.
+- The skeleton is topology only. The thresholded fibre section is a ribbon,
+  narrow across the sheet and wide along it, and presence does not say where
+  along the sheet the fibre runs, so a port's position along the sheet is left
+  to the tracing. Each port carries sub-ports: the centre of its section and
+  the two extremes along the long axis, an extreme counting only beyond
+  `candidate_min_offset_base` from the centre, each centred by a small
+  presence step in the section plane. The section is measured at the thinning
+  voxel and restricted to the piece of the mask it lies in.
+- Every line variant (one per pair of sub-ports at its ends) and every region
+  connection (one per pair of sub-ports on different ports of the region) is
+  initialised by the cheapest path through the thresholded prediction between
+  its two sub-ports, in a corridor of `search_radius_base` around the skeleton
+  piece, under the tracing metric's presence and direction terms with the
+  smoothness terms off; then refined with Ceres, ends fixed; and kept. It is
+  never the skeleton's own voxels, which run between merged fibres; those are
+  the fallback only when the mask does not connect the sub-ports.
+- Nothing is chosen ahead of tracing. Each sub-port records the cheapest
+  variant into the line from its side and the cheapest connection into the
+  region, so a segment with three entry and three exit sub-ports carries six
+  routes. The tracer walks sub-port to sub-port along those entries; the seed
+  follows the entry route of the sub-port it enters through. The seam centre
+  of a wide section is a routing target only when `route_through_centre` is
+  set; the centre of a narrow section, being its single sub-port, always is.
+- Refinement is Ceres Levenberg-Marquardt over a uniformly resampled polyline
+  with both endpoints fixed and one shared spacing scalar, so a line may grow or
+  shrink while its points stay evenly spread. Presence, direction and the
+  Lasagna normal are trilinear interpolations of the eight grid corners around
+  each vertex, batch-loaded by a `ceres::EvaluationCallback` before every
+  evaluation, so normals are resampled at each solver step and derivatives flow
+  through the interpolation.
+- The objective mirrors the length-scaled shared discrete metric: each residual
+  is the square root of the corresponding discrete term, so squared residuals
+  reproduce its weighting and order. Documented deviations are the
+  invalid-prediction penalty saturating at one per voxel instead of four, the
+  absence of a free angle, a 1e-3 floor inside the alignment square root, and
+  fixed rather than free terminal ends. The beam tracer's unscaled per-step form
+  and its cumulative tangent term are not mirrored.
+- A region's connections follow the region's graph path between two ports,
+  are initialised by the path search between the two sub-ports and refined
+  with both fixed. No matching is enumerated: every connection is kept and
+  each sub-port records its cheapest one. A region with more than `max_ports`
+  items is reported through `port_limit_exceeded` and left unrouted; it is
+  never silently truncated. The fiberlet dynamic program
+  and graph search are not used anywhere in this backend, and neither is the
+  weighted anchor fit.
+- Evaluation reuses the shared reference replay core unchanged: seeding on the
+  reference, forward matching, the threshold ellipse with the tangential factor
+  from the evaluation config, excursion grace, a pending excursion at
+  termination counting as a failure, failure records, and the deterministic
+  reset by `nominal_step_base`. The segment runner emits at `step_base`, so its
+  step budget is scaled by the ratio of the two. Termination reasons are
+  `no_skeleton_seed`, `skeleton_terminal`, `unmatched_port`, `tube_boundary` and
+  `region_unresolved`. A seed outside the acceptance ellipsoid is a counted
+  failure and is never credited as traced coverage.
+- Stored-grid sampling is the offline path, so the backend binds the ungated
+  prediction field and requires a published cache over its crop. Each crop
+  reports its scoped and missing voxel counts; a crop with no published
+  coverage raises rather than producing an empty topology.
+- Artifacts per case: `trace.json` carrying the generic `geometry_backend`
+  label `skeleton`, `skeleton.json` (`vc_skeleton_trace` version 1) with the
+  configuration, stage statistics and timings, reduced graph, ports, lines, and
+  every region's connections and scored matchings, plus `skeleton_graph.obj` and
+  `skeleton_routes.obj` in base XYZ. Rendering is allowed.
+- Determinism: one solver thread, fixed residual insertion order, ordered
+  containers wherever iteration affects output, and lexicographic tie-breaking
+  among matchings. Identical inputs produce identical artifacts.
+- Portability: lookup tables are generated as plain data, with no intrinsics or
+  OS-specific code, and no dependency beyond the Ceres and Eigen already linked
+  into `vc_fiber_tracer`.
+
+## Benchmark documentation
+
+- `docs/benchmark_runbook.md` is the central benchmark index. It must label the
+  scientific authority and selection bias of each workload, current versus
+  superseded/historical status, exact config/mode/output identity, cache reuse
+  semantics and evidence required to call a run complete.
+- Frozen benchmark manifests and completed results are immutable. Annotation
+  audit drafts are not benchmark replacements until promoted under a new
+  versioned manifest, config and result series.
+
+## Short-benchmark review exports
+
+- Optional single-case pair diagnostics freeze a separately hashed auxiliary
+  neighboring-fiber hypothesis outside GT scoring. Native CP-bounded eligibility
+  and existing accelerated polyline projection provide sampled base-XYZ distance
+  profiles without connecting gaps/restarts. Geometry does not establish physical
+  identity or constitute independent ground truth.
+
+- Explicit benchmark corrections create a separately hashed frozen annotation and
+  versioned manifest; preserve historical originals/results. Restore benchmark
+  coordinate/direction metadata without replacing edited CP/line geometry.
+  Native replay-references determines CP-bounded/non-Lasagna eligible length.
+
+- Optional regular inline rendering and per-directed-piece review index; no
+  assumption of paired directions. Sort by reported restart episodes/mm.
+- vc3d-readable derived reference/trace files use author_TIMESTAMP_SEQUENCE.json
+  names (evalextract vs evaltrace-beam/fiberlet), stable persisted export timestamp,
+  original piece IDs, separate files at every restart. Include source annotation,
+  benchmark piece, case/segment and evaluated run provenance. Preserve coordinates.
+- Full original annotation copy retains original basename and bytes. Never overwrite
+  edited exports or silently remove dataset members during manual review.
+
+## Experimental single-anchor weighted fit (2026-09-16)
+
+- Opt-in fiberlet.anchor_fit.method=weighted; legacy extraction remains default.
+  Owned-cell observations only, same validity/presence floor and support threshold,
+  at most one retained direction/location per cell; no cross-cell NMS.
+- Fixed cell-centered sigma2 and moving sigma1.5 prediction-voxel Gaussians.
+  Initialize cell center and principal unoriented tensor weighted by Gcell*p^gamma.
+  Iterate weights Gcell*Glocal*p^gamma*abs(dot(direction,axis))^q; principal tensor
+  direction and damped centroid position (damping0.5). Sigmas remain fixed.
+- Support denominator is sum Gcell over all owned voxels, numerator sum
+  Gcell*p*cos² over usable samples. It is not a local-presence gate at the result.
+  Empty cells remain empty. Degenerate initial tensor uses strongest observed
+  direction with stable-order ties; subsequent degeneracy/zero mass retains state.
+- Experimental settings/schema enter anchor and fiberlet construction identities
+  only when enabled; legacy fingerprints and inference identities unchanged.
+- Coverage direction statistics compare stored fitted axis against GT tangent
+  modulo sign. This comparison also changes multiplicity/NMS, not just refinement.
+
+## Anchor-only placement coverage (2026-09-16)
+
+- Native backend=anchors reuses canonical chunk extraction and caches, but requests
+  only anchor chunks in the GT tube with conservative owner-cell padding. No
+  fiberlet construction/search. Placement is counted once per eligible piece.
+- Canonical positions project to nearest Euclidean GT point; shared acceptance
+  ellipse tests that projection. Flat endpoint caps reject beyond eligible spans.
+  This is not a union-of-ellipses metric at bends. Invalid-normal fallback is
+  the existing isotropic policy and its incidence is reported.
+- Interior gaps are GT arclength differences between unique accepted projections,
+  normalized by actual anchor-cell side. Endpoint gaps and no-anchor pieces are
+  separate. Aggregate quantiles pool gaps, not per-piece quantiles.
+- Arc0-phased bins of one cell side (including final partial bin) describe occupancy
+  and consecutive empty bins; these are not literal crossed 3D grid cells. Never
+  bridge excluded CP/Lasagna spans. Save per-anchor stable IDs, original GT arcs,
+  per-piece distributions and checkpoint/cache provenance.
+
+## Cached fiberlet evaluation (2026-09-16)
+
+- Optional `backend=fiberlet` reuses canonical full-chunk anchor/path generation
+  and on-demand inference; ordinary beam replay remains default.
+- Construction identity includes source/model/normal, grid, algorithms and
+  storage parameters, not replay settings. Split anchor/fiberlet caches under
+  live inference are distinct from whole-volume Combined exports.
+- Graph cases release CPU permits while awaiting construction/readiness;
+  construction has separate bounded anchor/path services and a shared byte budget.
+- Preserve eligible GT, bidirectional evaluation, ellipse/grace and restart
+  episodes. Carry excursion state across edges. Report credited coverage because
+  graph seed absence must not appear as successful tracing.
+- Retain authoritative graph artifacts and explicit graph-geometry adapters for
+  existing inline inspection. See `docs/fiberlet_evaluation.md` for configuration,
+  supported defaults, cache layout and current limitations.
+
+## Opt-in training-feedback refinement (2026-09-15)
+
+- Optional normal/tangent bending weights override isotropic shape_weight;
+  current trial0.1/10.0 vs initial anisotropic0.1/1.0. Use unoriented normal tensors and full block
+  banded solve. Optional direction_weight (current trial1.0) penalizes sign-invariant tangent-axis
+  disagreement, sampled from detached raw predictions with full warp-Jacobian
+  pullback. Lag directions each iteration; no spatial field derivative. Requires
+  one direction branch. Report both bending components and direction separately.
+
+- Test crops are fixed by original GT selection and transforms. Refined local
+  test curves are independent per deterministic crop, never merged into the full
+  test fiber; checkpoint archives preserve them. Old whole-test updates are
+  ignored by the fixed-crop protocol. Training still uses shared whole curves.
+- Raw and EMA tests log the same component metrics, including presence/direction.
+- Independent test pieces have uniform 1/8-ellipse step caps without border taper
+  or endpoint pinning. Training still tapers/pins for stitching. Test labels omit
+  artificial joins to the outside original curve; outside model support contributes
+  no presence force. Baseline tether, fixed crops and per-piece persistence remain.
+
+- `refinement.enabled` defaults false. Current raw model presence, detached from
+  autograd, refines persistent train and test curves; no frozen teacher or extra
+  forward. Subsequent queued loads reuse refined geometry, never mutate input files.
+- Immutable-original GT tether uses 40/80 base-voxel normal/tangent radii;
+  weak resulting-line arclength bending (not displacement smoothing), current tangent-plane updates, per-iteration
+  1/8-ellipse cap tapered over 1/8 patch width, and arclength resampling.
+- Shared native normal sampling/validity and existing fast data queues are reused.
+  Bending uses frozen current arc coefficients and material masses in the native
+  banded solve; no length penalty or cross-piece coupling. Report weighted post-solve
+  presence/bending/localization per committed patch, train batch and test wave;
+  TB test values aggregate patch-weighted across the pass. Remove cumulative TB counters.
+  Invalid normals skip refinement. Already prepared targets stay immutable.
+  Test raw/EMA targets agree within a wave; only raw predictions update geometry.
+- All component geometries and provenance are archived alongside snapshots and
+  restored by checkpoint reference/checksum; supervisor lifetime spans GPU resize.
+- See `docs/training_refinement.md` for configuration, explicit unsupported
+  modes, stale-lookahead semantics, measurements and snapshot inspection.
+
+## Optional Gaussian sideband supervision and test cross-sections (2026-10-01)
+
+- `presence_sideband_weight > 0` is supported only with dense anisotropic-
+  Gaussian presence targets. In each segment's tangent/surface-normal/in-sheet
+  frame, materialization sweeps a rectangular negative region with configurable
+  base-voxel half-width and half-height. The existing Gaussian support is
+  excluded, and the two in-sheet sides are retained as separate target-only
+  masks. Their BCE-to-zero means are normalized independently across the global
+  optimizer batch and each receives half of the configured sideband weight.
+  This supplements, rather than replaces, the ordinary background loss.
+- Sideband target descriptors remain compact in loader workers. Dense masks are
+  materialized only with the other device targets, their normalization counts
+  are included in the pre-forward target pass, and bounded accumulation keeps
+  one backward per physical microbatch.
+- Positive `training.test_cross_section_vis_interval` reuses raw predictions
+  from the complete deterministic configured test pass. It aligns presence to
+  the GT tangent and Lasagna normal, globally reduces bounded sum/count/
+  histogram state, and writes/logs float mean and q0.1-exceedance images. It
+  also fits the central 51x25-pixel mean crop with an axis-aligned 2-D Gaussian
+  and logs RMSE, absolute sigmas, and sigma multiples relative to the supervised
+  normal/width target. This observer does not change losses, refinement,
+  checkpoint selection, crops, or EMA evaluation.
+
+## Reported combined-distance mean (user override 2026-09-14)
+
+- At each aggregation scope (scroll, collection, paired fiber, pooled total),
+  reported mean = combined directed reference distance/(reported restarts+1).
+  Do not add one per fiber or directed run. Single-run formula is unchanged.
+- Actual reliability segment count remains restarts+directed runs. Median/P05/P95
+  continue using those actual segments; the reported mean is not their arithmetic
+  average and may exceed them. Empty coverage has no score.
+- `mean_definition=combined-directed-distance-per-restarts-plus-one-v1` and
+  `mean_denominator` disambiguate this from historical segment-average reports.
+  The restart episode policy itself and stored raw trace events are unchanged.
+
+## Batched fiber inspection pages
+
+- Nondefault evaluation ellipse factors are supported in inspection: use the
+  replay factor for frame radii, metadata and margins, with the long axis vertical.
+  Normal40/factor2 displays40/80; defaultfactor4 behavior is retained.
+
+- Shared reference-plan file identities resolve existing annotation symlinks,
+  matching Python Path.resolve. Different aliases of the same annotation must not
+  fail prefetch/replay parity; content/selection drift and missing targets still fail.
+
+- Evaluation/reference-prefetch/visualization share native cp-bounded-no-lasagna-v1
+  selection: exact control-point bounds, no extrapolated tails, skip actual Lasagna
+  interpolation spans; merge adjacent eligible spans. Each disconnected run is
+  independently bidirectionally seeded, never treated as a skip failure or joined
+  by a fabricated segment. Report selected fibers separately from eligible runs.
+  Mean = combined directed eligible length/(reported restarts + 1); excluded-only fibers
+  have no score. Preserve original arc offsets including reverse run_end−local_arc.
+  Historical unfiltered coverage is not directly ranked against filtered results.
+
+- Inline render combines CT and presence in paired rows for reference/traced
+  top and side views using identical physical coordinates. Target two base voxels
+  per output pixel with render_scale=1, no enlargement; legacy CT-only APIs unchanged.
+  CT labels identify source level, trilinear interpolation and coarse fallback.
+- Inspection top/side strips share a centerline-derived longitudinal sample count
+  per component; offset ribbon edge lengths must not independently stretch views.
+  Own-trace failure markers use trace endpoints, not ambiguous reference-arc inversion.
+- Cross-sections align with both traced views via inverse strip mapping, using
+  actual traced points. Every restart has old endpoint/new start sections in
+  separate lanes if needed. Planes are normal to trace tangent; long axis vertical. Radii
+  come from the actual replay metric, full extents equal twice the radii, and
+  faint ellipses show trace-centered display tolerance, not the GT-centered
+  historical rejection boundary. Singleton segments explicitly record nearest
+  strip-endpoint anchoring and reference-tangent fallback.
+- Restart labels identify native failure indices; JSON retains reference XYZ,
+  directional and original-fiber arc (including reverse mapping), physical mm,
+  section axes/radii and image placements. Coincident IDs remain distinct in
+  galleries/metadata even where strip labels overlap.
+- Per-fiber progress metrics must be available before rendering completes,
+  with terminal segments, direction counts, paired/single-direction formulas
+  and case/image links. Final reporting additionally validates all pages.
+
+## Opt-in embedding reference modes
+
+- LRU `normalized-mean` scores cosine to the equal-anchor sum normalized to
+  unit length; exact cancellation costs1. Cache only changes with bank contents.
+  Ordinary mean/best arithmetic stays unchanged. Existing profile reports
+  candidate-weighted coherence=sum-vector norm/K with decile bins plus1 bucket;
+  no mutation from parallel scoring and no GT information in reference updates.
+
+- LRU anchor touch policy defaults to `nearest` (refresh nearest even for novel
+  observations). Opt-in `hit` refreshes only exact or within-novelty-threshold
+  matches; novel observations evict actual LRU without touching old anchors.
+  Threshold equality is novel. Same cadence, scoring, capacity and copy/reset;
+  hit policy requires anchors-lru. No new state or automatic default change.
+
+- `anchors` uses <=64 arclength-sampled observed embeddings, <=8 representative
+  medoids selected by deterministic greedy reduction of summed nearest cosine
+  distance across the bank. Stable earliest ties, stop on no positive gain.
+  This is approximate coverage-weighted diversity, not global optimality or
+  outlier immunity. Resample/reselect after bank insertions/expiry only.
+  Candidate cost `(1-mix)*nearest_anchor_cost + mix*EMA_cost`, mix in[0,1],
+  before embedding weight. Same per-beam copy/reset and parent-before-update
+  rules. Bank count/spacing/window control memory; no GT/future data access.
+  Anchors score against the parent's bank; expiry is applied after selecting
+  the child. A reference crossing the window boundary can affect one step.
+
+- Default mean preserves history-weighted cosine costs. Best mode uses maximum
+  cosine over bounded references, requiring uniform falloff. EMA modes maintain
+  per-beam normalized references, decay exp2(-step_distance/half_life), score
+  before updating, retain old on exact cancellation. Optional fixed seed cost
+  has equal weight with EMA; optional update gate presence>=.5 and cosine>=.5.
+  Gate only inhibits updates, without accumulated catch-up distance. Every
+  restart resets seed and EMA; no GT access. Half-life is positive finite.
+
+## Trace comparison reporting
+
+- The five-scroll aggregate is Classic's exact arithmetic mean multiplied by
+  the geometric mean of five model/Classic per-scroll mean-distance ratios.
+  Each scroll has equal proportional influence. Label as Classic-normalized
+  score (mm-equivalent), not an observed mean tracing distance.
+- Require one Classic baseline with positive finite means and identical
+  evaluation coverage across models. Retain all per-scroll trace metrics.
+- Snapshot labels identify sample/update count, raw/EMA kind and finetuning;
+  include selection reason and test loss; checkpoint provenance records its
+  exact metric name. This changes reporting only, not
+  training losses or best-checkpoint selection.
+
+## Optional within-scroll sampling groups
+
+- Scroll-balanced arclength sampling may assign every dataset within a scroll
+  a nonempty sampling_group and explicit positive finite sampling_group_weight.
+  Datasets with the same group must agree on weight. Group weight is assigned
+  once to the whole group, not once per file or dataset entry.
+- Scrolls remain uniform; conditional group probabilities are proportional to
+  group weight, and fibers/locations within groups remain arclength-proportional.
+  Ungrouped scrolls retain the previous arithmetic and RNG draws exactly.
+- The combined five-scroll+S1a experiment assigns Paris4 JSON and NML equal group
+  weights, so both JSON directories together10%, NML10%, other scrolls20%each.
+  Held-out test datasets remain ungrouped and otherwise unchanged.
+
+## EMA and historical observation
+
+- Optional training.ema_decays are unique finite values in(0,1). FP32 shadows
+  start from initialized/restored raw weights and update with fixed decay once
+  per successful optimizer update; skipped FP16 updates do not advance them.
+  BF16 model execution and raw optimizer math remain unchanged.
+- Raw snapshots and managed RAM handoffs retain all EMA weights, counters,
+  initialization update and per-track best metrics. Replica checks include EMA.
+  EMA inference exports have explicit kind/decay metadata and no optimizer;
+  ordinary training resume from an EMA export is an error.
+- Each EMA best is selected by its current dense test loss. Additional
+  historical metrics are observational and never select best checkpoints.
+  Existing raw test scalars/checkpoint-selection semantics are unchanged.
+- Optional historical_test_datasets use CP-only control-point tests, batch8,
+  no augmentation, trilinear full-grid predictions and central historical
+  presence loss region. Modern source loading lacks old source-validity masks;
+  report this in startup/config/docs, never promise bit-exact old results.
+- Raw and EMA evaluations share loaded batches and source-tagged queue workers.
+  Historical source leases and resumable rows are distinct. Weight swaps copy
+  existing storage and restore raw parameters/buffers/modes before every yield
+  or exception escape. Additional memory participates in automatic calibration.
+- See docs/training_ema_historical.md for config, tags, snapshot naming and tests.
+
+## Historical Fiber3D evaluation experiments
+
+- Optional training.test_batch_size fixes positive logical test batch size
+  independently of the training batch; test_sampling_strategy independently
+  selects the existing sampler. Defaults preserve existing behavior.
+- Optional test_output_upsample=trilinear|nearest evaluates ordinary low-resolution
+  probability outputs on the full input grid using the same full-resolution target
+  builder and loss. Trilinear uses align_corners=false. Training predictions,
+  targets and gradients are unchanged; conditioned models reject this option.
+- Reproduction runs record old event updates as samples*64 and new events directly
+  on the sample axis. Historical test batch-row means and partial-batch weighting
+  remain fixed. Dense/CP and spatial-sampling differences are different metrics,
+  not convergence regressions until compared on identical evaluation contracts.
+- GPU experiments use existing manager-exclusive ownership and tree/session-aware
+  cleanup. No adaptive/accumulated SyncBN claim and no manager-protocol changes.
+
+## Dynamic per-GPU inference batches (2026-09-11)
+
+- inference.max_batch_size is a positive integer model-batch cap per GPU, default1. Shared tiled worker takes the first descriptor and drains only immediately available descriptors up to the cap. No batch-fill delay, fixed queue partitions, extra staging files or replacement accumulator. Actual capacity is also bounded by ready inputs and available result slots.
+- Per-tile dtype conversion and adapter normalization retain individual sample statistics. Batch tensor is B,1,D,H,W; adapters opting into batching must return B-preserving products. Each result keeps its own original coordinates, requested products and result slot. Input is released after synchronous shared-memory H2D; output readiness still requires complete accumulation/publication. Validate batch/spatial product shape before result descriptors; failures abort the pool, not silently shrink/retry the cap.
+- Batch cap participates in inference cache identity. GPU batch shapes and existing asynchronous float16 accumulation can change low-order values and trajectories; no claim of bit-identical fresh-run results. Precision, blend/filter/finalization rules and tracing parameters stay unchanged.
+- Demand summaries record batch_size_counts, batch_seconds, batches and per-worker CUDA allocation/reservation peaks. Histogram weighted count equals completed tiles after successful drain. Existing worker_seconds and optional per-tile stage timings amortize batch costs across tiles, so aggregate time is not multiplied by batch size. CUDA input-stage events sum separate per-input intervals.
+- Pending inference admission uses per-store lazy priority heaps. The exact ordering remains foreground before background, larger remaining reference length first, then source key and tile coordinates. Only new/promoted pending priorities add heap entries; stale/admitted entries are discarded. Coordinator owns these structures. Cached-only stores expose no pending work. Per-second detailed queue accounting can still scan metadata; this is not a priority-policy change.
+- Successful full-volume progress must refresh finalized output extent after the final asynchronous publication acknowledgement, even if tile count has not changed. This reporting update must not imply publication before flush completion.
+
+## Explicit fresh-inference comparison subsets (2026-09-11)
+
+- Classic runner source.test_fibers optionally selects original filenames only after validating complete locked collection membership, hashes and count. Empty, duplicate, unknown and non-filename entries fail. Default evaluates the entire source.
+- Fresh inference comparisons use distinct unused inference_cache_namespace values; repeated use resumes matching predictions. Fetched source CT/normal caches remain shared. Tile-size comparisons report normalized inferred volume and total wall, retain output chunk size, and disclose changed overlap amplification and possible blended prediction differences.
+
+## Canonical batched tracer (2026-09-11)
+
+- Candidate evaluation always uses the shared batch path, including threads1. Compatible prediction/normal grids use fused corners; incompatible grids use separate batches. Generic sources retain the shared virtual batch fallback and concurrency capability limits. Scalar seed sampling remains, not a second candidate evaluator.
+- User explicitly permits numerical differences when replacing the former single-worker scalar candidate path with existing batch arithmetic. No fast-math or precision compiler flags change. New-path thread-count/repetition/live-offline determinism remains required; old serialized replay comparison is recorded rather than enforced only when profile.allow_original_replay_difference is explicitly true. Default strict old-replay comparison remains unchanged.
+- Live readiness planning uses immutable exact-lattice groups, valid interpolation keys and integer-key dedup before path expansion. Both float and double public sampling footprints stay covered. No fictitious unused single-chunk key slots; no repeated pre-gate planning for incompatible fused attempts. Publication acknowledgement/cancellation stays caller-side before internal candidate workers. Profile readiness_plan counters cover profiled batch calls, excluding scalar seeds.
+
+## Cached-only tracer profiling (2026-09-11)
+
+- The approved classic evaluation runner supports profile.kind=cached-trace under its usual exclusive manager grant. It reuses the authenticated native coordinator; a read-only published-store adapter validates completed provenance and channel completeness. Missing inference is an error, never a request to infer or allocate scratch.
+- Diagnostic readiness_cache_entries=0 disables case-local proofs;4096 is the default. Each mode preserves exact replay geometry/failures, publication-before-read checks and cancellation. Repetitions use identical references/settings; required artifact coverage is validated.
+- The short cached workload selects complete short fibers to preserve forward/reverse start points. Prefix cropping is not guaranteed to stay within published inference coverage. No missing-cache fallback or inference is permitted.
+
+## Native Lasagna decoded-cache ownership (2026-09-11)
+
+- FiberPredictionField and LasagnaNormalSampler use regular process-wide ChunkCacheService for scalar and corner paths. Canonical source handles, coalesced reads, uint8 payloads, LRU and decoded-byte budget are shared; no LasagnaChannelChunkCache or sampler-local budget remains.
+- LocalChunkCache is the existing bounded plane-sampler reference helper, extracted for reuse. Cube/batch references pin shared payloads without copying them; the regular budget accounts and protects these pins until released, so outstanding readers can temporarily exceed its ceiling.
+- Samplers never reconfigure the GUI budget. Standalone tools configure their existing cache option at startup; replay-set defaults to10% physical RAM, or an explicit positive decoded_cache_bytes. The effective capacity is recorded in the result config. cache_bytes_per_channel is rejected.
+- Missing chunks use explicit uint8 fill when present; absent fill remains unavailable for scalar sampling. Stored all-zero chunks without declared fill remain real data. Errors are not silently converted to fill. Requested-level/readiness gates and interpolation math are unchanged.
+- This unifies native-process decoded caching, not caches in separate Python inference processes or algorithm-specific non-voxel caches.
+
+## Native live reference evaluation (standalone first)
+
+- Optional evaluation.embedding_inference selects a second frozen checkpoint,
+  inference settings and namespace for embedding_NNN only; primary owns
+  presence/nx/ny. Sheet normals are unchanged. Composite manifests point to
+  original arrays and record both cache identities; no copied payloads or
+  code-hash cache invalidation. Equal physical source and output lattice are
+  mandatory. Per-array routing gates readiness across all participating stores.
+- Mixed live inference reuses model-specific ordinary worker pools under one
+  manager grant, partitioning GPUs and shared CPU/buffer budgets. Shared-GPU
+  workers divide the inherited VRAM allowance. Existing single-model behavior
+  is unchanged. Single-model cached profiling/extension rejects composites
+  explicitly; mixed cache reuse goes through live_evaluate. See docs/mixed_inference.md.
+
+- Live cases keep thread-confined publication proofs for acknowledged chunks
+  (readiness_cache_entries default4096;0 disables memoization for diagnostics).
+  Local hits avoid shared bridge locks and CPU-permit suspension, but still
+  observe atomic bridge cancellation. Failed acknowledgements never create
+  proofs. Eviction only causes conservative rechecks. This metadata is not a
+  decoded-payload cache and cannot transfer across cases/inference sessions.
+- Optional profile_tracing records per-case readiness counters/timers and
+  existing native trace-stage profiles. Progress callbacks may emit profile
+  lines at10s intervals; these are not stall heartbeats. Completion writes
+  cases/N/profile.json. Timings are inclusive/nested where documented; no
+  tracing decisions, inference parameters or numerical behavior change.
+
+- Classic evaluation uses the exclusive GPU-manager launcher at explicit priority
+  100. Admission precedes model/GPU work; the shared manager may auto-start using
+  logical CPU capacity. Startup/admission failure never falls back unmanaged. Only
+  registered pausable jobs can yield. Fixed non-pausable grants cover the owned
+  non-detaching command process group and an independently reported cleanup
+  watchdog. Release follows verified group cleanup; no manager protocol changes.
+  Calibration and command launchers use the same exact-grant ExclusiveTask lease.
+  Check CPU count and per-device VRAM before gated authorization; reject existing
+  external GPU compute processes. Manager exclusivity is cooperative, not OS-level
+  enforcement against unmanaged processes starting later.
+- Optional inference.input_slots overrides the input-RAM count independently of
+  GPU count; omitted uses devices*slots_per_gpu. Explicit result_slots is
+  recommended when tuning inputs (otherwise result capacity follows input count).
+  Reader futures are bounded by input_workers; remaining unsubmitted tiles stay
+  in the length-priority scheduler. Already admitted reads are non-preemptible.
+  Each pump admits at most16reads and dispatches at most8ready inputs, bounding
+  coordinator work counts, not guaranteeing a wall-clock latency bound.
+- Classic workload uses128tile readers/256input slots/128result slots and
+  chunk-major accumulation; active trace CPU permits are automatic (workers0).
+  Waiting trace threads were already independent of the CPU permit count.
+  Native source-read/decode concurrency is64/8, the process-cache capacities
+  exposed by the current binding. Profile/full share the same reader settings.
+  Live queueJSONL distinguishes pending trace requests, output chunks, queued
+  inference tiles, read futures, GPU submitted, accumulation and publication.
+  Queue counts do not measure hardware utilization. Optional profile.cprofile
+  controls deterministic profiling independently of wall/stage/queue metrics.
+
+- Workload configuration owns collection-to-scroll/scan/CT/normal bindings,
+  checkpoint paths/digests, devices and inference parameters. Executable runners
+  must not contain scroll-specific confirmation arguments or normal-source
+  branches. Original split membership/hashes and prepared config/normal hashes
+  remain validated. Optional isolated profiling reuses shared model/store/worker
+  implementations, reports warmup separately and cannot claim trace completion.
+- `vc_fiber_trace_metric replay-set` evaluates explicit whole fibers in both
+  directions using the same VC3D native beam/greedy search and shared ellipsoid
+  failure/forward-match/reset metrics. Beam checking observes irrevocable common
+  prefixes and selected terminal/fallback paths, not speculative reference-based
+  pruning. Preserve the existing positional CLI and greedy defaults.
+- Optional `--render` on native batch replay and live coordinator (or config
+  `render: true`) renders each completed in-memory replay directly, default off,
+  into `cases/<index>/rendered/`. Share overview/image-writing behavior with the
+  post-hoc API; never reload saved traces for inline rendering. Preflight every
+  source's local concrete uint8 CT metadata before tracing. Rendering failures
+  result in incomplete evaluation; enabling it must not change trace geometry.
+- Visualization-only resume is explicit and validation-first. It validates every
+  immutable saved trace/provenance artifact and every declared gallery page,
+  preserves complete galleries byte-for-byte, and atomically publishes only
+  missing rich inline galleries under their original case IDs. All selected
+  directed cases remain concurrent even when they share one source/cache.
+  Their exact saved reference centerlines are queued through the ordinary
+  low-priority reference-intersection prefetch before higher-priority on-demand
+  strip-margin/cross-section requests. Only a globally complete validated report
+  may clear interruption markers; resume never changes scientific trace output.
+- Persist every completed case's segmented replay/reference JSON/OBJ, failures,
+  reset discontinuities and provenance. `render-replay` consumes saved artifacts
+  and local CT/sheet normals to produce reference/traced top/side strips without
+  inference or retracing. Fiber directions never substitute for sheet normals.
+- Replay strip validation/metadata follows shared LineViewBuilder cross-row
+  constants and its retained LineStripPositionMap; do not assume one ribbon
+  column per input point or historical21-row geometry. Source geometry and
+  generated surface sampling remain unchanged. Overview overlays and failure
+  markers also convert original point positions through the builder's map in
+  both reference and traced strip frames; long-span markers must not shift.
+- `fiber_trace_3d.live_evaluate` coordinates a frozen snapshot and explicit CUDA
+  devices with native replay. Readiness gates precede scalar, batch, corner and
+  prefetch reads. Missing data means waiting, not Zarr fill or geometric failure.
+- First version preserves each case stack in one OS thread (default max256),
+  bounded active CPU permits released while waiting, nested candidate threads1.
+  Control-only authenticated localhost messages bridge Python and C++; no
+  per-voxel Python callback and no copied tracer. Persistent/stackless trace
+  sessions, training hook and live GUI integration are later work.
+- `lasagna.demand_predict3d` is an alternative scheduler/scratch backend around
+  the SAME tiled geometry/model worker/normalization/blend/filter/accumulation/
+  finalization helpers used by sequential inference. Circular-Z/TensorStore/
+  monotone Z-band admission rules below apply to the sequential mode. Demand
+  mode uses native fast-loader sampling and one pool-level chunk-local
+  accumulator arena shared logically across compatible sources. Each incomplete
+  chunk is keyed by `(source/store, chunk origin)` and contains one padded
+  `chunk^3` f32 weight plus all configured f16/f32 raw-product channels.
+- The arena has a fixed process-local anonymous-RAM hot tier partitioned into
+  owner-exclusive ranges (at least one slot per stable accumulator owner).
+  Hot storage is not POSIX shared memory because exactly one owner process ever
+  accesses each range; virtual capacity is reserved up front and physical pages
+  are committed only as records become live. Transport and immutable
+  publication slots remain shared memory.
+  Owner FIFO work messages carry only logical keys and local bounds; the owner
+  resolves its private location map at execution time. New/reused records are
+  completely zeroed before first add. Deterministic LRU eviction copies full
+  records into fixed-size views of one pool-wide regular-file mmap created and
+  immediately unlinked under the configured cache filesystem. A central broker
+  owns the lowest-free-slot heap, serializes logical file growth, and gives
+  owners only prepared slots. Spill contains only previously hot
+  records and has no hard slot cap. Promotion and completed publication return
+  slots globally, so allocation follows concurrent cold-state high-water,
+  which may grow with explored incidental partial chunks.
+- Completed records copy once into generation-leased shared publication slots;
+  owner storage is released only after the snapshot copy completes. Publishers
+  finalize immutable snapshots and atomically replace Zarr chunks. No publisher
+  maps owner spill or hot storage. Normal/crash close releases anonymous spill
+  extents; no named arena files or per-chunk backing files remain. Legacy
+  `.live_tmp/session-*` full-volume scratch is ignored during startup and may be
+  removed only by explicit offline maintenance, never synchronous resume.
+- Legacy `inference.accumulator_layout` and `accumulator_prefault` remain parsed
+  and cache-identified exactly for prepared-cache compatibility, but are
+  superseded by the chunk-local demand arena and no longer control demand scratch.
+  Sequential circular-Z storage and its mmap/prefault behavior remain unchanged.
+  Hot-slot count, spill segment slots and eviction policy are throughput-only and
+  do not enter persistent inference identity.
+- The spill broker extends the anonymous backing file logically once per mmap
+  segment with `ftruncate`. It must not synchronously `posix_fallocate` individual
+  records or segments; mmap page faults and kernel writeback allocate physical
+  storage lazily. Slot assignment/reuse remains centrally serialized, while
+  independent owner writes are not serialized behind filesystem allocation.
+- Native stride, tile/stride/border alignment and numerical precision remain
+  unchanged. Demand accumulation follows GPU result arrival order, explicitly
+  allowing order-dependent f16/f32 rounding; sequential inference retains its
+  canonical order. Results stay in bounded shared RAM, with NO NPZ staging,
+  scratch zero reservation or scratch fsync. Shared accumulator processes own
+  output chunks (hash chunk-grid indices, not voxel coordinates), apply weight
+  and all raw channels together, and acknowledge before releasing result slots.
+  Input slots release independently after H2D. All touched consumers accumulate, but unrequested
+  partial neighbors MUST NOT schedule their missing contributors. Late requests
+  reuse partial accumulation; each contribution is applied once per session.
+- Optional `inference.result_slots` sizes the result-RAM pool independently of
+  input slots (`devices * slots_per_gpu`); unset preserves the existing count.
+  Profile-only `profile.result_slots` can override it without changing production.
+  Profile reports received versus fully accumulated tiles and beginning/ending
+  backlogs, not GPU throughput alone. Optional Linux accumulator OS profiling
+  reads faults/CPU/storage counters and samples main-thread wait states; missing
+  permissions/platform counters are explicitly absent, not presumed zero.
+- Demand is coalesced and prioritized by approximate remaining length, above
+  reference-segment-intersection prefetch. Prefetch is drained before coordinator
+  completion. First-version priorities are monotone promotions without aging.
+- Cache lives under the shared global root's `live_inference/<source>/<model>`.
+  Optional evaluation `inference_cache_namespace` creates or resumes a named
+  `live_inference/_namespaces/<name>/<source>/<model>` prediction tree for timing
+  reruns. It never relocates/clears source CT or normal caches, nor old predictions.
+  Names are1–64ASCII letters/digits/underscore/hyphen, starting alphanumeric;
+  namespace symlinks and resolved symlink escapes are rejected. Fresh-inference
+  timing runs must select an unused namespace. Omitted/null
+  retains normal reusable prediction-cache behavior. It is an operational path
+  choice, not an inference/numerical parameter.
+  Source identity includes locator/revision/metadata/lattice; inference identity
+  includes frozen checkpoint SHA256 and effective inference parameters, not code
+  file hashes or runtime versions. Code/runtime are run provenance only. Legacy
+  code-hashed directories are reusable when all other model/source/geometry
+  settings match (absent embedding_channels means disabled). Original identity
+  metadata is retained. Require an updated revision for mutable input content.
+- Single-writer coordinator dictionaries, sets and deques track tiles, chunks,
+  priorities and pending/applied contributions entirely in RAM. No database,
+  mutable persistent ledger or per-chunk done markers. One static cache identity
+  JSON records provenance; unidentified payloads and legacy database-only roots
+  are refused without adopting or deleting their contents.
+  Bounded background publication uses the shared finalizer after all contributors
+  acknowledge; only the coordinator marks RAM readiness. Explicit zero chunks
+  are stored. Restart lazily checks all sibling files and decodes requested chunks
+  against expected shape/dtype/chunk geometry and rebuilds incomplete work. It
+  does not traverse or delete legacy/new scratch on resume. No whole-volume scan
+  or persistent checksum table.
+  Active ready files are immutable. Before replacing an incomplete sibling group,
+  validate all paths and remove its old siblings so process interruption cannot
+  leave a mixed-generation complete group. This is not a power-loss transactional
+  guarantee; same-size, decodable corruption is not cryptographically detected.
+- Active result, hot-accumulator and publication shared-RAM slots remain bounded;
+  anonymous file-backed spill has no configured total size cap or per-tile
+  filesystem-space polling. Telemetry reports hot/spill occupancy/high-water,
+  capacity, promotion/eviction and bytes copied. Actual filesystem errors
+  propagate rather than being masked. Disk exhaustion
+  can still cause a worker SIGBUS; worker death aborts instead of marking ready.
+  No silent partial-output eviction. Stuck underlying
+  input-read cancellation is explicitly deferred by the user (not an observed
+  stuck condition or current blocker). Global queued-descriptor bounds and
+  stress/performance validation remain future hardening, not guarantees.
+- Large reusable GPU result slots may use one regular-file-backed mmap ring
+  under the hidden cache scratch directory instead of POSIX shared memory.
+  Every slot has a fixed aligned offset and is mapped directly by GPU and
+  accumulator workers; this is shared byte storage, not staged serialization.
+  The ring is created once per pool, performs no explicit fsync, creates no
+  per-tile files, and is unlinked when the pool closes after children have
+  detached. Input slots may remain POSIX shared memory. Transport backing and
+  slot counts are throughput settings outside persistent inference identity.
+- The short inference profiler may opt into isolated native-reader responsiveness
+  controls: idle, no-intersection allocation-only reads, prewarmed native reads
+  and full reader-wrapper calls. A separate Python heartbeat and calling-thread
+  timers/fault counters expose blocking without modifying production inference.
+  Heartbeat gaps include GIL and OS scheduling, not exclusive lock attribution.
+  No-intersection controls must assert zero requested source chunks. Record
+  native module identity and sample counts; disable diagnostic controls by default.
+- Initial inputs are explicit zero-translation isotropic ZYX OME power-of-two
+  lattices. No arbitrary crop/affine mapping or coarser pyramid generation yet.
+  Partial manifests require live readiness awareness; ordinary viewers cannot
+  distinguish uncomputed fill. Native summary alone does not establish inference
+  completion; also require coordinator summary and absence of incomplete markers.
+- Shared global root uses explicit `VC3D_CONFIG_DIR/cache.json` (default
+  `~/.VC3D/cache.json`) before legacy mount/suggestion fallback. `vc_cache_root`
+  prints/sets it with writability checking. GUI/native/Python source share this
+  resolver; no automatic migration/deletion of existing caches.
+- HiGHS is optional via `VC_ENABLE_HIGHS` (ON auto-detect, OFF disabled). Without
+  it, LP/MILP labeling throws an explicit availability error. Other tracing,
+  preprocessing and volume access remain usable. The evaluator is available
+  in the headless `VC_BUILD_FIBERLETS` build as well as the GUI apps build.
+
+## Managed whole-volume Fiberlet inputs
+
+- `las_manager fiberlet run <completed-fiber-run>` resolves the unique regular
+  Lasagna normal representation for the same sample and source volume from the
+  public catalogue. Regular normals require `grad_mag`, `nx`, and `ny` from the
+  exact Atlas model schema; Fiber `presence`/`nx`/`ny` outputs are not normals.
+- Explicit `atlas:<model-id>@L<source-level>` and completed local Lasagna-run
+  overrides remain supported. Fiber and normal source levels may differ. Both
+  must be uncropped, have numeric source-to-base mappings, and identify base
+  shapes differing by at most one voxel per axis.
+- Published normal manifests use the exact VC3D open-data cache contract under
+  `<cache_dir>/open_data/lasagna/<sample>/<volume>/<identity>/`. The VC identity
+  is derived from the canonical remote artifact URL and Atlas coordinate/model
+  metadata, never from the manifest content SHA. Native access is a persistent
+  lazy chunk cache shared with VC3D; manager completion is cache-only and
+  performs no network access. Resume binds the exact manifest URL and SHA-256
+  recorded at initial launch rather than repeating automatic selection.
+- Published dependency identity uses the exact remote artifact/manifest URL,
+  Atlas model, and level. Manifest SHA-256 is an integrity check only; it is not
+  synthesized into a run UUID, source locator, or cache address.
+
 ## Shared 3D Tiled Inference
 
-- `lasagna.tiled_predict3d.run_tiled_inference_3d` is the sole neural tiled
-  inference runner used by both Lasagna predict3d and Fiber 3D inference. It owns:
+- `lasagna.tiled_predict3d.run_tiled_inference_3d` is the authoritative sequential
+  inference runner used by both Lasagna predict3d and Fiber 3D inference; live
+  demand reuses its numerical worker/geometry/finalization helpers. It owns:
   canonical global tile/output-chunk lattices, crop bounds, S3 auto-download
   from `_download` metadata, circular Z scratch, output-chunk-only resume,
   temp cleanup, progress formatting, and atomic Zarr chunk writes.
@@ -39,10 +892,12 @@
   including across inference scales. No live overlap, finalized band, or full
   mmap region is copied to another mmap or a band-sized RAM buffer.
 - Submitted/frozen, completed/written, and released/origin frontiers are
-  distinct. At the next advancing frontier the coordinator waits for the
-  previous combined flush, clears its exact dirty rectangles, releases its
-  generations, and only then submits the next combined interval. User-visible
-  finalized Z advances only after successful output writes.
+  distinct. A combined chunk-aligned, possibly empty, multi-scale flush batch
+  has immutable plans and disjoint queued, inflight, and completed task IDs.
+  The coordinator drains acknowledgements continuously and, immediately after
+  the complete batch succeeds, clears its exact dirty rectangles, releases its
+  generations, and advances user-visible finalized Z. Before submitting the
+  next combined interval it waits only if the preceding batch is still active.
 - The flush worker receives immutable chunk descriptors and reads frozen mmap
   regions one output chunk at a time. Temporary denominator, stacked raw, and
   finalized channel arrays remain bounded by one output chunk. A failed flush
@@ -136,14 +991,21 @@
   persistent spawn-context model worker per selected CUDA device, without DDP
   or GPU collectives.
 - The canonical tile stream materializes only independent Z/Y/X axis lattices
-  (O(Z+Y+X)), never their Cartesian product. Filtering, CPU/Zarr prefetch, GPU
-  execution, result completion, and ordered commit use fixed bounded windows.
+  (O(Z+Y+X)), never their Cartesian product. Multi-device execution owns one
+  explicit Z band at a time and lazily generates that band's Y/X traversal into
+  fixed bounded descriptor/read windows; it never retains a whole band. Reads,
+  GPU execution, and accumulation do not cross the band completion barrier.
 - Input reads happen outside GPU workers. The default local Zarr-v2 backend is
   one asynchronously polled TensorStore driver/context created only after all
   spawned GPU/flush workers start. `python-zarr` is an explicit fallback.
   Resume/skipped work is rejected before read submission. The lazy prefetch
   window is `prefetch_tiles_per_gpu * selected_device_count` (CPU/single-device
   counts as one) and is independent of GPU shared-memory slots.
+- Whole-volume inference ETA extrapolates the observed empty-input tile fraction
+  from processed plus empty candidates. Already-complete output skipped during
+  resume is counted separately and never treated as evidence that unfinished
+  candidates will be empty. ETA accounting adds no eager output scan or source
+  read to the resume path.
 - Every outstanding TensorStore read may own a full padded input tile. Input
   memory is bounded by that window times tile bytes, plus the separately bounded
   TensorStore cache, existing input/result shared memory, and request/cache
@@ -165,10 +1027,25 @@
   service from wall span, and directly reports reader throughput and effective
   outstanding-request concurrency, queue delays, CPU conversion,
   CUDA/transfer/model/output, and commit stages.
-- GPU results may finish out of order, but accumulation remains in canonical
-  tile order. A Z row flushes only after all preceding canonical events,
-  including skips, commit. The coordinator solely owns circular accumulators,
-  resume state, progress, and output writes.
+- GPU results may finish out of order, but accumulator task submission remains
+  in canonical tile order and is nonblocking under worker-queue pressure. Each
+  shared input/result slot has exactly one `(band, sequence, stage)` owner and
+  must be returned before the Z-band transition. A band completes only after
+  all of its lazy events, including skips, commit and all reader/GPU/accumulator
+  work is acknowledged. The coordinator solely owns scheduling, circular-ring
+  frontiers, resume state, and progress; flush workers execute distinct
+  coordinator-planned output chunk writes.
+- GPU admission computes the effective accumulation frontier after its
+  contiguous `done_skip` prefix. While that frontier still needs GPU work, one
+  input/result slot pair is reserved for it; later ready tiles may consume only
+  the remaining pairs. This prevents later out-of-order GPU results from owning
+  every result slot and blocking the canonical tile required to release them,
+  without changing canonical accumulator submission or numerical order.
+- After draining every completion source, unresolved state with no tracked live
+  reader, GPU, accumulator, or flush producer is an immediate invariant error
+  with band/event/slot diagnostics. Legitimate tracked work is waited on at its
+  actual stage; no generic GPU poll or elapsed-time watchdog diagnoses it as a
+  process-limit failure.
 - Output adapters must permit completeness checks for future, disjoint chunks
   while the flush worker writes a frozen chunk. Model adapters must permit
   inference to overlap their stateless raw-product finalization callback.
@@ -192,6 +1069,14 @@
   tile descriptors, and `--download-workers` controls raw chunk transfers.
   This descriptor window is independent of the smaller TensorStore full-tile
   read window and must not materialize a global Cartesian job list.
+- When live fetch is disabled, supported-tile discovery and bounded input-read
+  submission are one atomic scheduler transition. Live fetch adds only the
+  upstream materialization state; completed live descriptors enter the same
+  bounded reader/GPU/accumulator/flush stages and canonical commit order.
+- GPU and accumulator descriptor queues remain bounded. The coordinator tracks
+  the exact sequence/task owner for every queued worker item and the exact
+  owner/stage of every shared input/result slot; mismatched, foreign, duplicate,
+  or dead-worker ownership is a fatal invariant error.
 - Live source support is authoritative per active remote Z-chunk inventory;
   transient local absence and advisory `.noremote` data cannot suppress valid
   inference. Completed output work is rejected before remote materialization.
@@ -289,6 +1174,13 @@
   than the snapshot. Older checkpoints without embedded config may infer a
   minimal legacy free-branch model layout from
   `net.decoder.final_seg_layer.weight` when possible.
+- Fiber inference treats each product's configured inference scaledown as the
+  total requested factor relative to the selected input. The checkpoint model's
+  native output stride is recovered independently, and only the exact residual
+  factor `total / native` is applied after the model. Blend weights are first
+  built on the native output lattice. Whole-volume and native Trace2CP inference
+  reject totals that are not positive multiples of the native stride; neither
+  consumer may silently downsample native-stride output twice.
 - Lasagna 3x2 normal estimation and compact `nx/ny` byte encoding live in the
   package-safe shared `lasagna.normal_encoding` module. Lasagna predict3d,
   fiber whole-volume inference, and live fiber prediction paths must import
@@ -336,10 +1228,192 @@
 
 ## 3D CP-Centered Fiber Model Variant
 
+- The analysis-only embedding_consistency diagnostic uses frozen checkpoints,
+  native live-inference CT reads/preprocessing and shared canonical tile geometry
+  and Gaussian blend ramps. It combines all contributors on the output lattice
+  before interpolation and cosine normalization. GPU admission uses the existing
+  exclusive manager launcher. It does not enable embedding publication or tracer
+  scoring; continuity and off-GT discrimination are reported separately.
+
+- Local metric embeddings are opt-in through top-level `embedding.enabled`.
+  Existing models and forward callers retain the `7*K` direction/presence tensor.
+  Enabled unconditioned U-Nets add a signed embedding head in the same final
+  projection and expose it separately with `return_embeddings=True`. Defaults:
+  16 channels, 65,536 pairs at input patch width 128, overall weight 1. Pair count
+  is `2*max(1,round(pairs_at_128*max(patch_shape_zyx)/128/2))`.
+- In legacy embedding.objective=pairwise mode each patch supplies half GT/GT and half GT/off-fiber pairs with replacement.
+  GT endpoints are independently uniform in arc length over nonzero trace
+  segments clipped to the supported output lattice, independent of presence.
+  Embeddings are interpolated at GT coordinates and L2-normalized for cosine.
+  Positive loss is `1-cos`; negative is `relu(cos)`. The objective adds one half
+  of each globally count-normalized component, times `embedding.weight`.
+- Negative output-grid points are sampled proportional to detached predicted
+  presence (maximum branch presence for multiple direction branches), after
+  exclusion. Zero weights are never sampled. No eligible positive weight means
+  zero negative loss while retaining the configured negative count, without
+  uniform fallback or doubling positive weight. Both budgets are known before
+  forward; other patches' predictions never change normalization weights.
+  Empty nonzero GT support is an error. Sampling uses per-stream seeded RNG,
+  independent of rank and microbatch placement. Default mode has no cross-patch pairs;
+  opt-in paired mode below couples exactly two patches, never separate microbatches.
+- Embedding training requires each dataset's `lasagna_manifest_path` with valid
+  grad_mag/nx/ny data. Input/output scale, annotation transforms, rotation, scale,
+  and nonlinear augmentation use the existing coordinate maps. Output lattice
+  coordinates `k*output_stride` map back into original-volume coordinates. Match
+  the Euclidean-nearest continuous annotated segment point, sample the shared
+  principal-axis normal there, and exclude when `dn^2 + dt^2/16 <= 20^2`.
+  The tangent is the full surface tangent plane, not learned fiber direction.
+  Training replaces the whole sample on invalid required normals, including
+  missing or zero grad_mag, with bounded deterministic draws within the same
+  scroll/sampling group (paired mode retries positions on the same fiber).
+  Configuration and I/O failures remain errors. Normals
+  use vc.volume.NormalSampler, the existing C++ LasagnaNormalSampler with native
+  chunk caching and decoded-corner tensor interpolation; no Python Zarr reads.
+  The NumPy threshold backend implements the native replay
+  formula; it is not a call to the C++ evaluator.
+- Eligibility is prepared in bounded blocks by loader workers and transported
+  in the existing fixed shared-slot bank; IPC carries only its descriptor.
+  Pinned transfer and CUDA stream ownership cover eligibility as well as input.
+  Normals and exclusion do not run in the model forward. Pair loss uses FP32
+  arithmetic on the model's device while model autocast policy remains unchanged.
+- Single-branch embedding losses use fixed configured pair budgets in the
+  target-only prepass and the same combined backward as direction/presence.
+  embedding_negative_pairs reports the normalization budget, not actual draws.
+  Checkpoint configs retain embedding settings.
+  Enabling embeddings invalidates an old cooperative memory calibration.
+  Conditioned-decoder embeddings and embedding Zarr publication are not provided
+  by this training feature; default inference products remain unchanged.
+
+- embedding.objective=local_contrastive instead assigns pairs_at_128 to the
+  negative budget: K=negatives_per_anchor (default32), A=max(1,round(
+  pairs_at_128*max(patch_shape)/128/K)); A positive pairs and A*K negative pairs.
+  For each uniformly arclength-sampled GT anchor, draw one same-fiber positive
+  and K presence-proportional negatives outside the same native-normal ellipse.
+  Loss per anchor is logsumexp([0,(cos_neg-cos_pos+margin)/temperature]); defaults
+  temperature0.1 and margin0.2. Multiply by embedding.weight and divide summed
+  loss by fixed configured anchor count, including patches without eligible
+  negatives (zero numerator there). No separate pairwise cosine loss is added.
+  Default competition is within a patch/anchor only. Paired mode below samples
+  across its two patches, with fixed target-only normalization counts.
+  Single backward and pair-preserving macro-batch partition invariance remain.
+- Optional embedding.paired_patches requires enabled local_contrastive and
+  scroll_balanced_arclength. Consecutive canonical indices2k/2k+1 select the same
+  fiber; second location is independently uniform along its full arclength.
+  Both have independent geometry/smooth transforms but shared value RNG, blur
+  strengths/activation and noise seed. Fiber-oriented blur axes follow each
+  patch's transformed tangent. Normal-invalid retries retain fiber/value seed;
+  exhausting128 retries fails explicitly. No fallback to a different fiber.
+- Each patch supplies its existing anchor/negative budget; positives select
+  own/partner patch with equal probability, then arclength sampling within it.
+  Negatives use combined detached presence mass, with destination-local ellipse
+  eligibility. Both graphs remain attached; one backward per paired microbatch.
+  Thus128 total patches are64 pairs, with unchanged total embedding budgets.
+- Pair ID/member/fiber identity travel in existing shared-slot metadata; invalid
+  or split pairs fail. Cooperative partitions and tests preserve two-patch units;
+  memory calibration starts at2 and grants must fit a pair. Historical metrics
+  have embedding disabled and retain the original unpaired sample population.
+  Full-population paired testing has one pair per original sample slot; explicit
+  test patch counts/offsets must be even. No GPU-manager protocol changes.
+- Regular raw/EMA evaluation reuses sampled pairs to log embedding_similarity/*:
+  positive_mean, positive_patch_p05, negative_mean, negative_patch_p95/p99,
+  negative_above_0p9, hardest_negative_mean and positive_hardest_gap. These are
+  patch-averaged observation metrics, not optimizer losses. Percentiles are
+  means of per-patch quantiles, not pooled quantiles. Undefined negative metrics
+  are omitted for empty-eligible patches; embedding_similarity_count/* records
+  contributing patches and aggregate means are count-weighted across batches.
+
+- `training.bounded_gradient_accumulation` is opt-in and defaults false. The
+  fixed-cohort path rejects batch-dependent normalization. Ordinary single-branch
+  and conditioned training prepare target-derived counts before any forward,
+  SUM-reduces those counts and performs one combined backward per microbatch.
+  The prepass reuses the target voxelizer on the training device with only
+  compact geometry, not image transfers, model forwards or value augmentation.
+  Host copies own at most one local macro-batch of staged inputs plus existing
+  CUDA lookahead, releasing shared queue leases immediately. Gradient SUM and
+  observed-count validation occur at the update boundary; no full-batch graph
+  is retained. FP32 master parameters/gradient reduction and configured autocast
+  remain unchanged. Zero-work ranks join both count and gradient reductions.
+  Ordinary multi-branch losses temporarily raise explicit errors:
+  TODO target-only normalization before re-enabling them. Inference remains
+  supported. Conditioned counts retain two positive queries and two dense
+  negative groups per sample. No component-backward production fallback exists.
+  CUDA equivalence/performance validation is
+  still required before production use. This option alone does not enable
+  dynamic GPU reconfiguration.
+- Fiber3D training defaults to the CPU supervisor with a measured config-matched
+  memory calibration and automatically derived resource request. Training reuses
+  a compatible manager or starts a detached service on absent/refused connection,
+  preserving singleton locking, recovery journals and external-use monitoring.
+  A missing memory profile starts exclusive real-update calibration: configured
+  initial evaluation and real optimizer updates measure conservative capacity
+  while preserving the logical macro-batch. No updates are discarded/replayed.
+  Reports are saved to `<run_path>/.memory-calibrations/<config-fingerprint>.json`;
+  no manager config fields or separate calibration invocation are required.
+  Automatic requests respect visibility, compatible GPU
+  models, measured distributed coverage and CPU inventory. Explicit requests
+  cannot broaden visibility. The shared default prefers
+  `/run/villa-gpu-manager/manager.sock` when its location is writable/searchable
+  or a listener is reachable; otherwise it uses the home path
+  `~/.local/run/villa-gpu-manager/manager.sock`. CLI override takes precedence over
+  the config socket. Only explicit `--unmanaged` permits testing/debug execution
+  without the manager. Missing setup or manager failure never causes fallback.
+  Protocol authority remains `gpu_manager/docs/protocol-v1.md`, unchanged here.
+- Managed updates own exactly the configured effective batch's canonical stream
+  IDs, supporting unequal/partial physical microbatches and zero-work ranks. GPU
+  allocations change only through full cohort exit/join and a fresh process group.
+  RAM handoff preserves model/optimizer/scaler, RNG, run identity, best metric,
+  canonical frontier and pending evaluation progress; it is not a public snapshot.
+- The persistent CPU pool retains current-batch leases until all ranks commit;
+  parked workers do not retain CPU compute allocation. Pending GPU input may be
+  discarded on resize without consuming future canonical samples. Native compute,
+  decode and sampling use one thread per active managed loading worker.
+- Dense evaluation preserves original logical test-group normalization and yields
+  between group waves. Trace evaluation yields between CP segments. Completed
+  test rows and single-writer logging survive reconfiguration without duplicate
+  metrics/snapshots. Initial and periodic train/test visualization share bounded
+  capture/rendering of actual loss-forward inputs and detached predictions.
+  Training selects rank-local samples, up to the configured count across local
+  microbatches; a rank with no samples emits no sheet. No visualization refetch,
+  repeated augmentation, target construction or additional forward is allowed.
+  Only CPU image sheets survive test-wave handoff/reconfiguration.
+- Memory observations must cover the requested GPU count and match model/config,
+  GPU model and software identity. Only measured physical batch sizes are admitted;
+  unexpected OOM/over-budget driver usage fails rather than changing training.
+  Configuration-specific CUDA pause/memory/AMP/performance results are recorded
+  in docs/cooperative_validation.md; broader configurations remain unvalidated.
+
+- Normal 3D training optionally accepts training.profile_enabled (default false).
+  Enabled runs write per-rank iteration/stage wall timings and a bounded CPU/CUDA
+  trace beginning at profile_trace_start (default 21) for profile_trace_steps
+  iterations (default 5; zero disables tracing). Wall scopes do not synchronize
+  CUDA, and must not be described as GPU execution times. Default runs create
+  no profiler artifacts. Existing evaluation/checkpoint policies remain intact.
+- training.compile_mode defaults to off; default and reduce-overhead explicitly
+  compile the DDP-wrapped training model. Evaluation and checkpoint serialization
+  retain the original uncompiled model. Compiler failures propagate. Numerical
+  and throughput differences must be measured before adopting compilation.
+- training.initialization_seed optionally seeds model initialization for paired
+  experiments; omission preserves the historical initialization behavior.
+- training.profile_loader defaults false and requires profile_enabled=true
+  and loader_workers>0. It enables the existing loader stage timers in normal
+  training; sampled tensors, targets and batch order are unchanged. Per-rank
+  timing rows include nested loader_profile with worker ID/PID, sample/item
+  indices and same-clock epoch timestamps bracketing coordinator receipt before
+  H2D. Worker-end-to-receive is combined transport/order/prefetch residence, not
+  an isolated IPC timer. Later batches computed early do not prove queue delivery.
+- training.profile_replay_batch defaults false and requires
+  profile_enabled=true. It captures one normal fully prepared GPU batch per
+  rank, shuts down the training DataLoader, and reuses that GPU-resident batch
+  while executing the unchanged production model/loss/backward/optimizer/loss
+  reduction path. Parameters and BatchNorm state continue to advance; the mode
+  is a compute-throughput diagnostic, not a valid learning run. Profiled runs
+  may set profile_throughput_start_step; throughput artifacts use synchronized
+  window boundaries and the slowest rank's elapsed wall time.
+
 - The 3D CP model lives in a sibling package,
   `vesuvius.neural_tracing.fiber_trace_3d`. It must not replace or reinterpret
   `fiber_trace_2d` configs, strip geometry, Trace2CP tooling, or 2D training.
-- 3D training samples ordinary CP-centered ZYX volume blocks from the selected
+- By default, 3D training samples ordinary CP-centered ZYX volume blocks from the selected
   base-volume Zarr level. It must not build fiber-aligned 3D strips or slices
   for input loading.
 - Dataset entries use `base_volume_path`, `base_volume_scale`, and
@@ -352,10 +1426,36 @@
   `fiber_trace_2d.fiber_json` semantics.
 - `base_volume_scale` selects both the Zarr level read by the 3D loader and the
   voxel scale at which CP-centered patches are sampled.
-- The 3D sample stream is deterministic pseudo-random by configured `seed` and
+- The default `sampling_strategy=control_points` 3D sample stream is deterministic pseudo-random by configured `seed` and
   covers every configured control point once per pass before repeating. Changing
   batch size or step count may truncate/extend the consumed prefix, but must not
   reshuffle earlier samples.
+- Opt-in `sampling_strategy=scroll_balanced_arclength` chooses a scroll with
+  equal probability, then a continuous location uniformly over the total
+  selected fiber polyline length within that scroll. Dataset `scroll_id` is
+  explicit and groups multiple folders; lengths use base-volume coordinates
+  before augmentation and independent of input Zarr level. Positive finite
+  fiber length is required; zero-length individual segments have zero mass.
+  All datasets must provide dense supervision. Draws depend only on seed and
+  data index; augmentation still depends on stream index. Flat CP traversal
+  remains available for CP-based tooling. Continuous samples report CP index
+  -1 rather than pretending to be an original control point.
+- Dataset `dense_supervision: true` enables dense selected-polyline supervision
+  for JSON. False/absent preserves CP-only JSON behavior; NML stays dense.
+  Dense JSON uses every retained selected-component segment intersecting the
+  patch, including distant arc sections that re-enter it; other components
+  and fibers do not become positive.
+  Crop, prefetch, augmentation tangent and targets share the continuous location.
+- File-backed 3D training and its test loaders retain only JSON `cspline` and
+  `trace` spans between exact original control points, with no length cutoff.
+  Exterior line tails and Lasagna/unknown-provenance spans are excluded.
+  Maximal contiguous accepted runs become independent records; no connector
+  crosses an excluded span. Arclength sampling weights retained lengths, not
+  component count. Empty datasets fail clearly rather than changing scroll
+  balance silently. NML explicit edges remain accepted despite their synthetic
+  legacy interpolation metadata. Shared file parsing and the separate tracing
+  evaluator remain unchanged. Internal `_array_records` test fixtures supply
+  already-selected geometry and do not perform file provenance filtering.
 - 3D training uses a strict stream/data index split. `stream_index` is the
   unbounded deterministic stream position; `data_index` is the bounded
   dataset-selection index after applying `training.max_sample_index` /
@@ -406,13 +1506,21 @@
   loudly. The returned sampler `valid_mask` is only geometry/sample coverage;
   it must not be treated as proof that requested-level data was used.
 - V0 3D value augmentations support normalization, brightness, contrast, gamma,
-  noise, and separable isotropic Gaussian blur. Opt-in anisotropic blur is
+  noise, and separable isotropic Gaussian blur. Isotropic sigma is sampled
+  independently and uniformly from zero through `augment_blur_sigma`. Opt-in
+  anisotropic blur is
   configured with `augment_anisotropic_blur_probability`,
   `augment_anisotropic_blur_sigma_along`,
   `augment_anisotropic_blur_sigma_across`,
   `augment_anisotropic_blur_orientation`, and
-  `augment_anisotropic_blur_roll_degrees`. It is a value augmentation after
-  coordinate sampling, not a geometric transform.
+  `augment_anisotropic_blur_roll_degrees`. Along and across sigmas are sampled
+  independently and uniformly from zero through their configured maxima. It is
+  a value augmentation after coordinate sampling, not a geometric transform.
+  Isotropic blur runs first as three separable axis passes; directional blur
+  then runs as one directly evaluated rectangular discrete 3D Gaussian.
+  Directional kernels use deterministic greedy groups capped at 1.25x dense
+  padding inflation, execute serially on the existing CUDA preparation stream,
+  and preserve original sample order.
 - The active 3D multi-direction experiment uses
   `model_3d.conditioned_decoder_enabled: true`. A shared spatial 3D U-Net
   emits a latent feature volume whose width is
@@ -438,8 +1546,8 @@
 - Each seven-channel prediction's six direction channels use Lasagna's double-angle projection layout:
   `dir0_z,dir1_z` for `(tx,ty)`, `dir0_y,dir1_y` for `(tx,tz)`, and
   `dir0_x,dir1_x` for `(ty,tz)`.
-- Direction supervision is computed from the transformed 3D line tangent and is
-  masked to positive fiber-neighborhood voxels. Projection-magnitude weighting
+- Direction supervision is computed from the transformed 3D line tangent only
+  at positive fiber-neighborhood voxels. Projection-magnitude weighting
   may downweight channels whose projection is nearly degenerate.
 - In conditioned mode, sparse positive supervision evaluates two positive
   queries per supervised point with equal weight: the zero/unconditioned query,
@@ -451,7 +1559,7 @@
   and the local sparse point coordinate, not from loader order or global RNG.
 - In conditioned mode, dense negative presence supervision decodes both the
   zero query and one deterministic random direction query per patch over all
-  `presence_mask` locations, including positive pixels by design. The weak
+  output locations, including positive pixels by design. The weak
   dense negative BCE at positive pixels is intentional; under the configured
   positive/negative component weights it is equivalent to a softened positive
   target, not contradictory masked supervision.
@@ -463,7 +1571,17 @@
   positive point by detached
   `argmax(abs(dot(decoded_predicted_axis, target_axis)) * predicted_presence)`.
   Legacy two-branch training keeps the deterministic `2x2x2` anti-collapse
-  repair and legacy global-negative branch BCE semantics for old configs.
+  repair, applied independently per stable stream/sample so routing does not
+  depend on DDP partitioning, and legacy global-negative branch BCE semantics
+  for old configs.
+- Every Fiber3D optimization loss is normalized over the complete optimizer
+  batch, independent of its DDP-rank or logical-microbatch partition. Direction
+  uses the global sparse element count. Positive and negative presence retain
+  their balanced mean-of-nonempty-sample/branch/query-group semantics by
+  globally reducing the sums and counts of those group means separately.
+  Training packs all loss and diagnostic sufficient statistics into one
+  all-reduce per optimizer update. Distributed dense tests remain non-lockstep
+  and use their existing local-row gather instead.
 - 3D training defaults `training.direction_weight` to `10.0` and
   `training.presence_weight` to `1.0`, so direction loss is 10x stronger than
   presence loss unless the config overrides it.
@@ -478,12 +1596,43 @@
   active multi-direction experiment uses the conditioned query loss above.
   Contrastive embedding remains unsupported by default in the 3D V0 path.
 - The 3D fiber model defaults to `BatchNorm3d`; configured `batch_size` is the
-  actual BatchNorm batch because the trainer has no internal micro-batching.
-  `model_3d.normalization: "none"` remains supported for explicit ablations.
+  actual batch of each model forward.
+  `model_3d.normalization` also supports `"group"` and `"none"`. Distributed
+  conversion to SyncBatchNorm is controlled by the JSON boolean
+  `training.sync_batchnorm` (default true), while DDP buffer broadcast is
+  controlled independently by `training.ddp_broadcast_buffers` (default true).
+  GroupNorm is retained in current speed experiments but is not silently
+  substituted into existing configs or checkpoints.
+- `model_3d.output_stride` selects an isotropic encoder-skip lattice for the
+  model head and defaults to 1. Output index `k` aligns to source index
+  `k * output_stride`; each output axis has ceil-divided length. A native
+  lower-resolution model constructs and executes only the decoder prefix needed
+  to reach that lattice. Stride-1 module layout and state keys remain compatible
+  with existing checkpoints.
+- Native lower-resolution targets are constructed directly on the output
+  lattice. Coarse presence is source-cell occupancy, dense-line coordinates are
+  rounded on the source lattice before stable coarse-cell deduplication, and a
+  CP-only target retains its nearest in-bounds coarse cell when its radius
+  contains no integer source sample. A coarse validity cell is valid only if all
+  in-bounds source voxels are valid; negative supervision requires the complete
+  source-cell footprint to lie inside configured edge margins.
 - `batch_size` is the actual CP-patch batch passed through the 3D model in one
-  forward/backward call. The 3D trainer does not support internal
-  micro-batching; any BatchNorm statistics must come from the real configured
-  batch.
+  forward. `training.optimizer_global_batch_size` may accumulate multiple full
+  logical batches before one backward/update; any BatchNorm statistics still
+  come from each real configured forward batch, so virtual-batch emulation
+  requires stateless normalization.
+- TensorBoard scalar/image steps and normal training/evaluation console progress
+  use cumulative globally processed training samples. Console output also
+  reports the optimizer update. Initial evaluation uses zero samples (or the
+  saved count on resume); validation samples do not advance training progress.
+  Warmup, max_steps, logging/evaluation/checkpoint intervals, checkpoint step and
+  filenames, diagnostic traces and profiling JSON remain in optimizer updates.
+  Training checkpoints persist samples_seen and optimizer_global_batch_size.
+  Resuming with a different batch size adds new global batches to the saved
+  sample count. Legacy checkpoints may infer it from a recorded global batch;
+  otherwise training.resume_samples_seen is required, since local batch alone
+  cannot recover the historical world size. Historical TensorBoard files are
+  not rewritten automatically.
 - `training.mixed_precision` controls trainer autocast only and must not
   introduce internal micro-batching. Supported modes are `off`, `bf16`, `fp16`,
   and `auto`. BF16 uses autocast without a scaler; FP16 uses AMP with
@@ -525,8 +1674,8 @@
   direction is closer to the slice normal by `abs(dot(axis, normal))`, the other
   prediction presence, max prediction presence, min prediction presence, and
   average prediction presence. In conditioned mode the first prediction is the
-  zero-query output and the second prediction is the recurrent output
-  conditioned on the first decoded direction; in legacy branch mode these are
+  zero-query output and the second prediction is the random-query output from
+  the same loss forward; in legacy branch mode these are
   branch outputs. The target/context
   presence panel must visualize the carried transformed fiber-line segment
   metadata even for JSON/non-NML CP-only samples where loss supervision remains
@@ -572,11 +1721,16 @@
 - Dense 3D test loaders do not inherit train augmentations by default.
   `training.test_augment_enabled: true` is the explicit opt-in for augmented
   dense tests.
-- Dense 3D tests default to evaluating every configured held-out CP once in the
+- With the default CP sampling strategy, dense 3D tests evaluate every configured held-out CP once in the
   deterministic pseudo-random test stream from sample index zero.
   `training.test_control_points: 0` is the explicit full-test sentinel with
   the same behavior. Positive values keep the fixed deterministic random test
   range beginning at `test_start_sample_index`.
+- Balanced arc-length testing uses the same sampling strategy with a fixed
+  seed and index range on every evaluation. The existing test_control_points
+  count is a continuous-location budget; zero retains the held-out CP count as
+  the budget, not exhaustive CP coverage. Changed supervision/distribution
+  makes collection test metrics incomparable to the earlier CP-only run.
 - `python -m vesuvius.neural_tracing.fiber_trace_3d.train` is the 3D training
   entrypoint. It supports normal training, `--benchmark`, `--load-only`, and
   `--prefetch`.
@@ -606,11 +1760,14 @@
   rank 0, restored to global batch order, and combined with the historical
   unweighted Python per-batch mean so metric and best-snapshot semantics remain
   unchanged. Ranks with no assigned batch still enter the gather.
-- Each rank retains a separate persistent test DataLoader worker pool using the
-  same worker count, prefetch factor, worker device, and multiprocessing context
-  as training. Rank 0 reuses its already evaluated global batch zero for the
-  test sample sheet instead of synchronously loading it again. The train and
-  test pools coexist and are both released before distributed teardown.
+- Train and dense test jobs share the optimized source-tagged parallel sample
+  queue, worker factories and bounded transport, managed or unmanaged. Source and
+  canonical RNG/sample identity are separate from transport ordinal/generation.
+  Train admission stops at the next scheduled test boundary so future training
+  cannot monopolize test credits. The broker preserves ownership/distribution;
+  it does not implement an alternative loader. Evaluation resumes retain completed
+  logical-group rows. Visualization retains bounded CPU sheets, never a batch
+  or autograd graph beyond its lease.
 - Normal 3D training also supports `--resume <snapshot.pt>`. The CLI path
   overrides config resume keys, restores model and optimizer state, writes a
   fresh timestamped run directory, and records the effective resume path in
@@ -620,34 +1777,71 @@
   every optimizer param group while preserving loaded AdamW moment buffers and
   step counters. If finite `training.max_steps` is not greater than the
   checkpoint step, training must fail clearly.
-- 3D training and `--benchmark --load-only` runtime loading use
-  `torch.utils.data.DataLoader` worker processes when
-  `training.loader_workers > 0`. Each DataLoader item is one complete
-  `FiberTrace3DBatch`, not an individual CP patch, and PyTorch default
-  collation is bypassed so the custom dataclass is not nested or reshaped.
-- Each 3D DataLoader worker lazily constructs its own `FiberTrace3DLoader` and
-  VC3D sampler state in the worker process. Worker outputs are CPU
-  `FiberTrace3DBatch` objects; the main training process transfers the whole
-  batch to `training.device` immediately before forward/backward. The old
-  thread-backed `_OrderedBatchLoadPipeline` is not a supported 3D loading path.
+- Production 3D train/test loading uses per-sample queue jobs, not whole-batch
+  DataLoader jobs or synchronous GPU-worker loading. Workers lazily retain each
+  source's loader/sampler state. Existing batch loading helpers may remain for
+  explicit diagnostics and correctness comparisons, not as production fallbacks.
+- The standalone 3D sample-pipeline benchmark uses the shared
+  `OrderedTwoStageSamplePipeline`: free load processes claim deterministic
+  sample indices one at a time, a bounded raw queue feeds free value-
+  augmentation processes, and a bounded result queue feeds ordered batch
+  assembly. Production train/test reuses this same queue engine and sample factories.
+- One global credit window bounds all claimed, executing, queued, and
+  coordinator-reordered samples. Credits are released only at ordered
+  delivery. The coordinator must drain later completions while waiting for an
+  earlier index, so deterministic delivery cannot fill the result queue and
+  deadlock worker progress.
+- Sample-pipeline control and failure reporting must not depend on capacity in
+  either data queue. Worker exceptions and every premature process exit,
+  including exit code zero, are errors. The pipeline uses `spawn` or
+  `forkserver`, limits ordinary native thread pools per process, and owns
+  cleanup of its workers, control pipes, and queue feeder resources.
+- `FiberTrace3DLoader.load_sample` is the composition of the same raw-load and
+  value-augmentation functions used by the benchmark. A split sample must be
+  tensor-for-tensor identical to the synchronous profile-disabled result and
+  retain its deterministic value-augmentation parameters across the queue.
+- `python -m vesuvius.neural_tracing.fiber_trace_3d.pipeline_benchmark`
+  benchmarks the real loader without training. Its JSON records exact command,
+  source/config identity, worker topology, queue/credit capacities, cache-state
+  label, startup and warmup, throughput, stage/queue/reorder/batch-stall
+  distributions, worker CPU use, and a conservative in-flight tensor-memory
+  estimate.
 - In 3D configs, omitted or `null` `volume_cache_memory_mib` means a
   Python-side default of 512 MiB per VC3D sampler/loader/worker, not VC3D's
   internal 8 GiB default. Explicit positive values override this cap. The
   generated 2D Trace2CP geometry loader used by 3D evaluation receives the same
   default when the 3D raw config leaves the key unset or `null`.
+- Positive `volume_io_threads` and `volume_decode_threads` independently limit
+  the process-local VC3D source-read and decoded-chunk work admission. They do
+  not change the separate persistent-cache probe pool.
+- Optional `volume_sample_threads` controls only native VC3D coordinate-
+  interpolation dispatch for each call: omission/zero preserves the automatic
+  pool limit, one executes interpolation serially, and a positive value caps
+  workers without resizing the process pool or changing dependency/decode
+  admission. Sampling values and strict requested-level behavior are unchanged.
+- The standalone sample-pipeline profile distinguishes Python coordinate-map
+  generation, native dependency discovery, blocking chunk resolution, actual
+  codec calls, and native coordinate interpolation. Native-unit rates divide
+  counts/bytes by summed service time; host effective concurrency is reported
+  separately. Equivalent sample rates use exactly 128^3 output coordinates for
+  this reference and codec rates are N/A when no codec work occurs. Successful
+  dense decode output bytes use the decoded byte-vector size; successful opaque
+  payload decodes use `DecodedChunkPayload::residentBytes()` so sparse Fiberlet
+  materialization is not incorrectly reported as zero-byte codec output.
 - 3D DataLoader workers must not materialize full dense direction/presence
-  target tensors. Worker batches carry image/valid tensors plus compact target
+  target tensors. Worker batches carry images plus compact target
   descriptors: CP-only samples carry local CP/tangent metadata plus
-  visualization-only transformed line segments, and NML dense-line samples carry
+  visualization-only transformed line segments, and dense-line samples carry
   transformed output-space line segments with precomputed patch bboxes for
-  supervision. Dense `presence_target` and `presence_mask` are created by
+  supervision. Dense `presence_target` is created by
   `fiber_trace_3d.targets.materialize_targets(...)` in the main training process
-  on the training device. Direction supervision is represented sparsely as
+  on the training device. No dense validity or loss mask is collated, pinned,
+  or transferred with a training batch. Direction supervision is represented sparsely as
   `direction_indices_bzyx`, `direction_target_sparse`, and
   `direction_weight_sparse`; normal training must gather predictions at those
   supervised line/CP voxels instead of creating full-patch dense six-channel
   direction targets.
-- For JSON/non-NML 3D samples, `target_segment_*` metadata is visualization
+- For JSON/non-NML 3D samples without dense_supervision, `target_segment_*` metadata is visualization
   context only. The materializer must filter dense line rasterization by
   `_TARGET_MODE_DENSE_LINE`, so CP-only JSON segments do not create dense
   presence or direction supervision. Their direction target is the transformed
@@ -655,12 +1849,12 @@
   draw those visualization-only segments in the target/context presence panel,
   but that display-only raster must not be fed back into loss materialization.
 - The GPU target materializer must preserve the existing label semantics:
-  NML sources supervise direction/presence by drawing the overlapping clipped
+  NML and opted-in dense JSON sources supervise direction/presence by drawing the overlapping clipped
   fiber centerline voxels only, without a radius-expanded distance-to-segment
-  tube. Non-NML sources supervise only the sampled CP neighborhood using
-  `presence_radius_voxels`; that radius does not apply to NML centerline
-  targets. Presence edge masking applies only to CP-only samples; NML dense-line
-  samples supervise presence over the full valid patch. Lasagna 3x2 direction
+  tube. Other JSON sources supervise only the sampled CP neighborhood using
+  `presence_radius_voxels`; that radius does not apply to dense centerline
+  targets. Every output voxel not covered by a positive target is a presence
+  negative; there is no edge or validity loss mask. Lasagna 3x2 direction
   encoding uses the shared NumPy/torch-compatible helper semantics.
 - `training.loader_workers` controls 3D DataLoader worker process count.
   Under DDP this count is per rank. `0` is the explicit serial/debug path.
@@ -677,7 +1871,7 @@
   generation, batch stacking, worker wall time, and worker CPU time. Dense
   target work is reported separately as main-process GPU target materialization
   timings (`target_ms`, `gpu_ms`, `line_idx`, `cp_idx`, `scatter`, `dir_enc`,
-  `gpu_mask`, `linePts`, `dirPts`, and `posK`). With worker processes, the
+  `linePts`, `dirPts`, and `posK`). With worker processes, the
   first `loader_workers` benchmark rows can include worker-local loader
   construction and should not be used as steady-state throughput.
 - 3D prefetch computes chunk dependencies from a CP-centered selected-level
@@ -908,9 +2102,24 @@
   be read by direct zarr/raw block slicing in Python. The block sampler must use
   strict requested-level VC3D blocking semantics, report
   `requested_level_only=true` and `fallback_levels=0`, reject chunk errors, and
-  mark out-of-volume voxels invalid/zero. Known-missing requested-level chunks
-  follow the existing strict VC3D rendering semantics: black covered pixels and
-  a non-zero `missing_chunks` stat.
+  mark out-of-volume voxels invalid with the declared Zarr fill value. Known-missing
+  requested-level chunks use that same fill value, remain valid in-volume and
+  contribute to `missing_chunks` when statistics are requested. The training block
+  adapter calls the unified `Volume.read_zyx(..., with_mask=True, with_stats=True)`;
+  its float image interface is retained for training. Standalone demand inference
+  calls `Volume.read_zyx` directly, returning native integer arrays without masks,
+  statistics or intermediate float conversion. It reads full bboxes, including
+  declared-fill boundaries, not the previous partial-tile reflect padding.
+- Native bbox Python APIs `read_zyx`/`read_xyz` require the exact scale group even
+  for empty/outside requests. No missing-level fallback argument. `read_xyz` and
+  slicing delegate to the same implementation; the duplicate `sample_zyx_block`
+  API is removed, not aliased. Default return is a C-order uint8/uint16 array.
+  Keyword-only `with_mask`/`with_stats` default false; if either is requested,
+  return `(array, mask-or-None, stats-or-None)`. Auxiliaries incur no large allocation
+  or per-voxel work when disabled. Buffer allocation/fill, dependency/prefetch and
+  copying release the GIL; Python object creation retains it. Logical volume edges
+  bound coverage even when storage chunks are padded. Fetch/decode errors,
+  unresolved blocking results, null data and malformed payload sizes throw.
 - Generic `CoordinateSampler.sample_coords(...)` and
   `sample_coord_batch(...)` remain the correct boundary for arbitrary
   coordinate surfaces such as side/top strips, TTA surfaces, and strip
@@ -1706,8 +2915,8 @@
 - Any future training target derived from the fiber line must use the same transformed output pixel coordinates as the sampled image, so labels and image pixels remain aligned exactly.
 - Image/value augmentations after Zarr loading run as torch tensor operations on the configured device.
 - Value augmentations after VC3D image loading should run as batched tensor
-  operations where possible. Variable per-patch Gaussian blur uses grouped
-  batched convolutions instead of one CUDA convolution loop per patch.
+  operations where possible. Independently randomized isotropic and directional
+  per-patch Gaussian blur uses deterministic grouped batched convolutions.
   Per-patch operations remain acceptable only when required to preserve behavior,
   such as deterministic per-patch noise streams.
 - VC3D coordinate sampling remains the explicit image I/O boundary unless the
@@ -2517,8 +3726,10 @@
 - Global configuration lives at
   `${XDG_CONFIG_HOME:-~/.config}/las_manager/config.toml`, with
   `LAS_MANAGER_CONFIG` as an automation override. It contains the catalog URL,
-  public bucket, snapshot directory list, cache/output/venv/Atlas directories,
-  staging S3 origin, and catalog maximum age. It never contains AWS
+  public bucket, snapshot directory list, persistent manager model directory,
+  cache/output/venv/Atlas directories, staging S3 origin, and catalog maximum
+  age. The model directory defaults to
+  `~/.local/share/las_manager/models`. It never contains AWS
   credentials. Relative paths resolve from the config file.
 - Global `params` is a string-token array passed to both inference backends.
   Initialized configs default to `--tile-size 512 --border 32 --overlap 96
@@ -2555,6 +3766,19 @@
   selector is backend/run/checkpoint. Records include hash, step/test metric,
   patch/architecture/output options, precision, task/process/code revision,
   and optional Atlas model identity; absent legacy metadata remains explicit.
+- `snapshot import CHECKPOINT --model-identifier OWNER/REPOSITORY` copies the
+  checkpoint without changing its bytes into
+  `<model_dir>/<run>/snapshots/<checkpoint>`. The run is inferred from a
+  `RUN/snapshots/CHECKPOINT` source or supplied explicitly. An adjacent atomic
+  sidecar binds the required external model identifier to the exact checkpoint
+  SHA-256. Identical re-import is idempotent; destination-byte and identity
+  conflicts fail. Manager, embedded-checkpoint, and Atlas identities are
+  projected by exact SHA on every index pass and conflicting non-null values
+  fail.
+- Inference requires a non-empty trusted `model_identifier` before reserving a
+  run or creating artifacts. A checkpoint with no identifier must first be
+  imported; inference must not create anonymous model provenance that later
+  needs manual Atlas-bundle correction.
 - Shell completion is generated by the same command registry and may use only
   valid local catalog/checkpoint caches. It must not refresh the network, open
   an uncached checkpoint, download data, or mutate state.
@@ -2714,10 +3938,4120 @@
 - Positive `flush_workers` use persistent spawn processes with bounded
   descriptor-only queues. Workers read frozen mmap regions directly and own
   distinct scale/chunk writes; ndarray payloads never cross IPC.
-- Exactly one frozen batch may overlap the following inference band. Ring reuse
-  and `final_z` advancement require successful completion of the entire batch.
-- Each worker limits native CPU libraries to one thread and allocates at most
-  one chunk's denominator/raw/finalized arrays.
+- Exactly one immutable combined flush batch may overlap the following
+  inference band. Zero-task and fully acknowledged batches finalize immediately
+  through the same release/accounting routine as synchronous flush. Ring reuse
+  and `final_z` advancement require successful completion of the entire batch;
+  failed batches never clear or release frozen generations.
+- Each worker limits native CPU libraries and its Zarr executor to one thread
+  and allocates at most one chunk's denominator/raw/finalized arrays. This
+  prevents the process pool from multiplying into CPU-count-sized nested teams.
 - `flush_workers=0` is the synchronous baseline and uses immediate ring release;
   both inference CLIs default to the available CPU count capped at 64 process
   workers.
+
+# Requested-level coordinate-sampling locality
+
+- VC3D blocking dependency discovery and pinned scalar sampling share compact
+  chunk-run and dependency-resolution primitives with the renderer's corner
+  visitor. Normal callers enable exact locality fast paths by default;
+  diagnostic counters are opt-in and benchmark-only.
+- Dependency discovery may reuse only the immediately preceding point's exact
+  compact chunk footprint. Chunk coordinates use exact integer division for
+  arbitrary positive chunk shapes; power-of-two assumptions and approximate
+  scale conversions are forbidden.
+- Interior trilinear cells whose eight samples belong to one present pinned
+  chunk use direct contiguous gathers. Boundary, out-of-bounds and missing-data
+  cases retain the pre-optimization scalar policy and ordered `std::fma`
+  interpolation. Pointer caches are worker-local and cache immutable pinned-map
+  results only.
+- Reference and optimized modes must return identical dependency sets, bytes,
+  coverage and missing/error counts for transformed levels, non-power-of-two
+  chunks, boundary and non-finite coordinates.
+
+# Native Fiber3D coordinate generation
+
+- The Fiber3D loader supports `geometry_backend = auto|native|eager`. `auto`
+  uses the native backend for eligible CPU/base-volume generation and retains
+  the eager Torch implementation as a compatibility fallback. Explicit
+  `native` fails clearly when the installed VC3D binding is stale or the input
+  contract is ineligible; explicit `eager` is the reference/debug path.
+- Native generation is one standalone, GIL-releasing CPU primitive. It accepts
+  output ZYX shape, local and volume centers, the output-to-source affine,
+  smooth mode/control arrays with origin and spacing, selected-to-base scale,
+  and base-volume shape. It returns contiguous float32 `(Z,Y,X,3)` base
+  coordinates and uint8 `(Z,Y,X)` validity.
+- Each output coordinate is evaluated directly from its integer index. Affine
+  mapping and optional 1D/2D/3D low-resolution smooth-control interpolation
+  happen in registers/cache in one traversal; full-resolution meshgrid,
+  affine, displacement, scale, and validity intermediates are forbidden.
+  Sampling remains in the existing shared VC3D coordinate sampler.
+- Agreement with the eager reference must have maximum coordinate error at
+  most `1e-3` base voxel and mean absolute error at most `1e-5`; validity must
+  match exactly for finite and boundary fixtures. On representative sampled
+  patches, mismatched valid voxels must be at most `1e-4` and maximum uint8
+  difference at most one. No fast-math flags are permitted, and scalar portable
+  behavior remains available on supported Ubuntu/macOS amd64/arm64 builds.
+
+# Fiber3D native value-transform boundary
+
+- `value_augmentation_backend = auto|native|torch` controls only the CPU
+  normalization/contrast/brightness/gamma prefix. `auto` uses the native
+  implementation for contiguous gradient-free float32 CPU tensors and falls
+  back when the binding or tensor contract is unavailable. Explicit `native`
+  fails clearly; `torch` is the reference path.
+- Invalid source coordinates are zero-filled by coordinate sampling. Training
+  then normalizes and transforms the complete sampled patch; source validity is
+  discarded and must not cross the shared sample transport. Until the native
+  binding exposes an unmasked entry point, each worker may reuse one immutable
+  all-valid compatibility array local to that worker.
+- Seeded noise remains in Torch. Both CPU and deferred CUDA blur use the shared
+  sequential isotropic/direct-rectangular convolution implementation described
+  above; the old native interpolated directional-blur primitive is not used by
+  Fiber3D training.
+
+# Bounded Fiber3D sample transport
+
+- The reusable ordered two-stage sample pipeline may transport large Fiber3D
+  tensors through a fixed shared-slot bank. Slot identity is derived from the
+  deterministic stream index and protected by a monotonically increasing
+  generation; stale or mismatched descriptors fail rather than reading
+  overwritten data.
+- Claimed-item credits bound every worker, queue, reorder-map and consumer-held
+  sample. For shared slots the coordinator must retain each credit until the
+  consumer explicitly releases the sample. Duplicate releases fail.
+- Queue payloads contain only compact metadata. Consecutive, non-wrapping slots
+  may form a zero-copy batch tensor view; noncontiguous, wrapping, or stale
+  batches fail. Slot storage size is fixed at startup from patch shape and the
+  maximum in-flight count.
+- Shared transport must preserve deterministic ordered delivery, sample values,
+  and metadata. It stores no dense validity mask. Worker native compute remains single-threaded and
+  GIL-free; transport optimization may not alter augmentation draws or math.
+- Split Fiber3D loading and value augmentation may use one shared process pool.
+  Workers claim only runnable work: load indices are monotonically admitted and
+  augmentation consumes only completed raw samples. Soft stage affinity keeps
+  loader/cache and augmentation working sets hot; a loader may augment its own
+  completed sample when the bounded raw queue is full and may help drain after
+  all loads are dispatched. No parent Python dispatcher relays sample payloads.
+- Shared-pool admission uses an explicit target frontier separate from the hard
+  credit limit. It starts at `initial_in_flight`, advances by exactly two for
+  each completed load, and is capped by the stream end. Outstanding work and
+  shared-slot ownership remain capped by `max_in_flight` until ordered delivery
+  or explicit release. A future index cannot reuse a modulo slot still owned by
+  an earlier leased sample.
+- Training and evaluation use the reusable per-sample pool controlled by
+  `training.sample_pipeline_workers`. Worker, shared-slot, load-affinity, and
+  initial-admission settings are global host budgets partitioned
+  deterministically across DDP ranks. Each rank maps consecutive local
+  pipeline indices onto the canonical interleaved DDP sample stream.
+- Shared batch slots remain leased until the rank's H2D copy has synchronized.
+  Training closes the pipeline explicitly on normal or exceptional exit. An
+  omitted/zero sample worker setting derives a positive worker budget from the
+  legacy loader worker setting; it does not select a synchronous loading path.
+- Training may additionally set `training.sample_pipeline_cuda_prefetch_depth`
+  when the shared sample pipeline and CUDA are active. Zero is the compatibility
+  default; the profiled setting is two future batches. One coordinator thread
+  performs ordered collation, allocator-owned pinned staging, nonblocking H2D,
+  and target materialization on a dedicated CUDA stream.
+- The current batch plus admitted future batches bound live host and device
+  staging to `depth + 1` batches per rank. Device tensors are not explicitly
+  reused and are recorded on the consuming training stream. Shared sample slots
+  are released after their contents enter pinned staging. The consumer waits
+  only for its selected preparation event and receives preparation failures in
+  order. Evaluation pauses and synchronizes preparation before starting.
+  Replay modes and non-CUDA training reject asynchronous preparation.
+
+# Fiber3D CUDA value-augmentation suffix
+
+- `training.sample_pipeline_cuda_value_augmentation` is optional and accepts
+  `blur` or `all`. It requires the shared sample pipeline, CUDA
+  training, and positive `sample_pipeline_cuda_prefetch_depth`; omission keeps
+  the established all-CPU value-augmentation path.
+- Value augmentation retains its canonical order: full-patch normalization,
+  contrast, brightness, gamma, canonical-stream-seeded noise, isotropic blur,
+  and directional blur. Deferral creates
+  one contiguous CPU-prefix/CUDA-suffix cut; data crosses pinned H2D staging
+  once and never returns to CPU.
+- Deferred samples retain their immutable augmentation parameters through the
+  ordered shared-slot pipeline. Slot leases remain live through pinned copying.
+  Parameter draws remain keyed by canonical stream index and independent of
+  worker, queue, rank, batching, and timing.
+- `blur` moves both blur stages to the CUDA preparation stream. Source validity
+  is consumed and discarded before batch collation; there is no final image or
+  loss masking operation.
+- `all` keeps the sampled volume as native `uint8` through shared-memory slots,
+  pinned staging, and H2D transfer. The preparation stream then converts it to
+  FP32 and applies normalization, contrast, brightness, gamma, noise, isotropic
+  blur, and directional blur before target construction. The CPU worker only
+  generates transformed coordinates and performs the native VC3D volume sample.
+- Coordinate generation remains on CPU while VC3D sampling consumes a dense
+  coordinate field on CPU. Generating that field on CUDA would add a roughly
+  24 MiB device-to-host transfer per 128-cubed sample and is therefore not a
+  valid optimization without also moving or fusing the sampler.
+- Batched isotropic CUDA blur uses grouped separable convolution with a common
+  maximum radius, independently sampled per-sample normalized kernels,
+  replicate borders, and delta kernels for zero sigma. Batched directional blur
+  uses directly evaluated rectangular 3D kernels and deterministic greedy
+  grouping with a 1.25x padding-inflation ceiling. Groups execute serially on
+  the existing preparation stream and scatter back to original sample order.
+- CUDA augmentation operates in FP32 outside autocast. Its convolution
+  temporaries belong only to the one batch actively executing on the preparation
+  stream and are not retained in queued prepared batches. The preparation event
+  orders augmentation before target construction and ordinary batch delivery.
+- Same-backend repeated execution with a fixed environment must be deterministic.
+  CPU/CUDA results are tolerance-equivalent rather than promised bitwise equal.
+  CUDA noise is seeded from the canonical sample stream index, so results do not
+  depend on batch partitioning or worker scheduling.
+  CUDA failures propagate through the existing preparation failure channel;
+  pause and close synchronize in-flight augmentation with the preparation stream.
+
+# Fiber3D training batch-size benchmarks
+
+- Batch size is reported per GPU rank; global batch is per-GPU batch multiplied
+  by DDP world size. One sample is one 128-cubed CP training patch.
+- End-to-end throughput uses the synchronized measurement window and the
+  slowest-rank elapsed time. Iteration distributions use the per-step maximum
+  across ranks, which is the DDP critical path.
+- Benchmark batch overrides must not silently change production configuration
+  defaults. A larger global optimizer batch requires separate convergence
+  validation before adoption.
+
+# Fiber3D training scalar metrics
+
+- Training loss/metric tensors are globally averaged and materialized as Python
+  scalars only when a rank-consistent consumer is due. Console and TensorBoard
+  retain distinct emission schedules; their union determines whether every DDP
+  rank enters the packed metric all-reduce.
+- `training.initial_scalar_log_steps` is a nonnegative integer and defaults to
+  100, preserving verbose startup output. `training.scalar_log_interval` remains
+  positive and controls periodic console and TensorBoard scalars.
+- Profiling rows omit `loss_total` on steps where metrics are not consumed. They
+  must not call `.item()` merely to keep a dense profiling schema.
+# Fiberlet anchor extraction
+
+- The initial C++ fiberlet stage consumes exactly the canonical 3D `uint8`
+  `presence/nx/ny` triplet from a Fiber Lasagna manifest. Each prediction-grid
+  voxel supplies one presence and one compact unoriented 3D direction. Extra
+  groups are not alternative observations. The channels must share shape and
+  effective spacing but may use different chunk layouts.
+- The manifest must contain an explicit positive numeric `source_to_base`.
+  Anchor extraction uses the existing local/remote Lasagna opener, compact-axis
+  decoder, persistent remote cache, and decoded chunk cache. It must not create
+  a reference direction merely to use the trace sampling API.
+- Stored prediction indices are voxel centres. Cubic cells of integer side 2
+  through 8 are anchored at prediction-grid origin zero and own half-open,
+  globally fixed ZYX index ranges. CLI spatial coordinates are always in base
+  voxels. The half-open `--crop` base box maps its two boundaries to point
+  indices with scale-aware `ceil(base/prediction_to_base_scale)`, then selects
+  intersecting complete global cells without recentering or truncating them.
+  A non-empty box containing no prediction sample and any selection outside the
+  global prediction volume are errors; there is no implicit clipping.
+- Every non-empty cell attempts two independent, unoriented, potentially
+  non-orthogonal direction components. Exclusive assignment maximizes squared
+  alignment, and each fixed-assignment update is the principal eigenvector of
+  `sum g_i p_i d_i d_i^T` for that component. Deterministic multistart
+  assignment/PCA supplies only initial directions. A single covariance's first
+  two orthogonal eigenvectors are not a valid replacement. Initial component
+  positions are the centre of the clipped owned-cell voxel range.
+- Direction and a provisional position are then refined from a bounded halo. For
+  anchor `(p_k,u_k)`, the transverse Gaussian is recentered at `p_k`, uses the
+  distance to the line through `p_k` along `u_k`, and is truncated at three
+  sigma. Evidence is also restricted to a symmetric axial slab about the plane
+  through the fixed cell pivot normal to `u_k`. Invalid axes and presence below
+  the inclusive floor contribute no numerator. Direction-mode assignment uses
+  `g_ik p_i abs(d_i dot u_k)^2`; stable component index breaks exact ties and
+  zero-evidence sites remain unassigned.
+- Within each assigned component, projective residual
+  `1-abs(d_i dot u_k)^2` is summarized with a deterministic 256-bin weighted
+  median/MAD histogram using `g_ik p_i` mass. The cutoff is the larger of
+  median plus the configured MAD multiplier and the configured angular-noise
+  floor expressed as `sin(angle)^2`. It may trim no more than the configured
+  evidence-mass fraction, at most 0.20; coherent data retains all observations
+  and complete cutoff bins are retained. The defaults are 0.20 maximum trim,
+  multiplier 3, and 5 degrees.
+- Each component direction update is installed directly as the principal axis
+  of retained `g_ik p_i d_i d_i^T`. There is no angular interpolation or
+  angular line search. A retained tensor without the existing unique principal
+  axis removes only that component while preserving stable diagnostic ancestry.
+  Supported close components are not merged before refinement.
+- Production compact cutoff materialization also records retained logical
+  indices per component in the same order. The immediately following centroid
+  traverses those sparse indices rather than rescanning the complete support;
+  expanded/public fitting retains the full defensive scan. Worst-case index
+  storage is included in worker memory admission.
+- Production compact observations cache the complete configured direction and
+  presence eligibility predicate once per unique sampled voxel. All compact
+  fitting consumers reuse that bit; arbitrary expanded/public observations
+  continue to validate direction, presence, and validity on each use. The bit
+  occupies existing trailing record padding and does not enlarge the compact
+  observation.
+- Its position target is the retained assigned
+  `g_ik p_i (d_i dot u_k)^2` centroid projected onto the plane through the cell
+  pivot normal to the updated direction. Deterministic position-only
+  backtracking evaluates `1, 1/2, ...` through the first
+  displacement at or below the peak-grid step and accepts the first strict
+  objective improvement. Direction remains installed when position does not
+  improve. Transverse displacement is clamped to the local window and
+  prediction grid.
+- The spatial objective and final aligned support use retained evidence in the
+  numerator and `sum g_ik` over every sampled lattice site for each active
+  component in the denominator. The denominator is independent of site
+  presence, direction, assignment, and trim state, so rejected positive sites
+  cannot create normalization holes that attract or repel the fit. Coherence
+  divides by retained assigned `sum g_ik p_i`. Empty, degenerate, and
+  below-threshold components are discarded independently.
+- Fixed-direction spatial objectives are implemented in a separate private
+  objective module. Production indexed compact observations remain float32
+  through Gaussian, alignment, numerator, denominator, and final ratio
+  arithmetic; their directions are already normalized by compact-observation
+  construction. Logical assignment/membership indices address the per-cell
+  index stream, while observations address the indexed tile storage. The
+  direct public fitter uses the same float32 observation, component, and
+  accumulator representation. Persistent component state, acceptance
+  tolerances, final aligned-support evaluation, diagnostics, and serialized
+  numeric values are float32; direct and indexed fitting differ only in storage
+  and indexing.
+- Robust assignment, trimming, direct direction update, and position update run
+  for at most `maximum_iterations`, default 1. This is a bounded alternating
+  refinement budget, not convergence to exact equality of hard assignment or
+  histogram membership sets. An earlier exit is allowed when projective
+  direction change is within tolerance and accepted position movement is no
+  larger than the peak-grid step. The later peak stage owns finer positioning.
+- After direction refinement, final position is selected independently for each
+  surviving direction by deterministic steepest ascent on a narrower
+  direction-conditioned response in the final normal plane. The response is
+  `sum(G_peak p_i abs(d_i dot u_k)^2) / sum(G_peak)`, where `G_peak` is an
+  anisotropic Gaussian about the candidate line. Its default transverse sigma
+  is `1.5` prediction voxels and its default along-direction sigma is
+  `1.5 * cell_size` (`6` prediction voxels for default cells). Consequently a
+  straight fiber one cell from the pivot retains about `0.80` axial weight and
+  the ends of a centered three-cell span retain about `0.61`.
+- When `peak_gradient_weight > 0`, every outer cell job samples one additional
+  lattice voxel around that peak support and computes presence-only gradients
+  with separable 3D Sobel correlation. For example,
+  `grad_x=(P[x+1]-P[x-1])/2` after unit-sum `[1,2,1]/4` smoothing on Y and Z.
+  All 27 stencil presences must be finite and decoded; compact-direction
+  validity and the presence floor do not affect gradient validity. Global-edge
+  or otherwise incomplete stencils provide no gradient vote. Weight zero skips
+  both gradient construction and the extra halo exactly.
+- For candidate `a` and observation `x`, the presence gradient and `a-x` are
+  projected into the fitted anchor's normal plane. Zero projected vectors are
+  skipped. Their cosine is positive for an inward-pointing gradient and
+  negative for outward. Inward/outward vote mass is the anisotropic Gaussian
+  times squared fiber-direction alignment, transverse gradient magnitude,
+  `peak_sigma`, and squared radial cosine. Thus it is dimensionless in
+  prediction-grid units and weakly radial gradients contribute less.
+- The signed term is `(inward-outward)/(inward+outward+epsilon)`. It is gated by
+  valid-gradient Gaussian/alignment coverage and by
+  `R/(R+peak_gradient_reliability_scale)`, where `R` is normalized radial vote
+  magnitude. The default reliability scale is `0.05`; flat, tangential,
+  incomplete, or otherwise unsupported gradient neighborhoods fall back to the
+  presence response. The gated signed value is added with default weight
+  `1.0`. `--gradient-weight` changes or disables it.
+- Peak support is the intersection of independent three-sigma transverse and
+  axial bounds. Positive peak signal is restricted to the final retained
+  assignment for that component; trimmed or competing observations cannot
+  re-enter. Its denominator includes every sampled in-volume site inside both
+  bounds independent of presence, direction, assignment, or trim state. The
+  broad direction fit
+  continues to use its separate fixed axial half-width.
+- After the exact transverse and axial support cutoffs, peak search evaluates
+  Gaussian weights with the standard exponential, matching robust-direction
+  and final-support calculations.
+- The peak grid is anchored at the fixed cell pivot and uses canonical
+  transverse basis construction, configured prediction-voxel step, a circular
+  local window, and continuous voxel-Voronoi ownership
+  `[cell_begin-0.5,cell_end-0.5)` clipped to `[0,shape-1]` at global edges.
+  Search starts at the grid node nearest the provisional position and repeatedly
+  chooses the highest strictly improving 8-neighbor, with canonical integer-grid
+  tie breaking. It stops on a plateau and cannot cross a response valley to a
+  stronger distant fiber. The grid radius is limited to 128 steps so malformed
+  parameters cannot create unbounded enumeration.
+- Production subpixel placement uses `separable_1d`: each normal-plane
+  coordinate independently fits the center and its two axial neighbors.
+  Missing neighbors, non-finite curvature, or non-negative curvature leave only
+  that coordinate at zero. Each finite stationary offset is clamped to
+  `[-0.5,0.5]`; the combined point passes one owner/window and directly
+  evaluated non-decreasing-response guard or falls back wholly to discrete.
+  Broad-kernel support and coherence are reevaluated at this production point
+  for ordinary filtering and NMS ranking. A cell emits zero, one, or two
+  anchors.
+- For matched benchmarking, when the complete feasible 3x3 neighborhood exists,
+  all nine response samples
+  are fit by deterministic least squares to
+  `a + bx + cy + dx^2 + exy + fy^2` in grid-step coordinates. The stationary
+  point is usable only when all samples and coefficients are finite, the
+  symmetric Hessian's largest eigenvalue is strictly below
+  `-1e-12 * max(1,max(abs(samples)))`, its determinant exceeds the square of
+  that tolerance, and both offsets lie in the closed interval `[-0.5,0.5]`.
+  An exterior point is rejected rather than clamped. The fitted 3D point is
+  retained only when it remains in the owner/window domain and its directly
+  evaluated normalized response does not decrease within the existing
+  scale-aware response tolerance. Missing neighbors, unsuitable curvature, or
+  either final guard leave the joint comparison equal to the discrete maximum.
+- Refined-only benchmark extraction retains the converged grid maximum as
+  transient diagnostic provenance paired with two independently accepted
+  normal-plane candidates. `separable_1d` reproduces the previous estimator:
+  each coordinate uses its center and two axial neighbors; missing neighbors,
+  non-finite curvature, or non-negative curvature leave that coordinate at
+  zero; finite stationary offsets are clamped independently to `[-0.5,0.5]`;
+  the combined point passes one owner/window and real-response guard or falls
+  back wholly to discrete. `joint_2d` uses the complete quadratic rule above
+  and is benchmark-only.
+  All three stored transient positions are final estimator outputs, so a
+  rejected estimator equals the discrete point exactly. These values are not
+  serialized in either final or any diagnostic-stage version-1 anchor artifact.
+  Both estimators optimize two normal-plane coordinates from a response that
+  integrates 3D volumetric evidence; neither permits axial motion.
+- There is no pre-refinement same-direction merge. Supported close components
+  remain independently fitted; the ordinary cross-cell NMS below handles true
+  duplicates. Merge fields remain readable and serializable for compatibility
+  but are inert for newly fitted cells. Robust anchor artifacts use schema
+  version 2; the loader accepts strict legacy version 1 artifacts with their
+  original parameter set.
+- After all local fits, deterministic local-maximum NMS removes cross-cell
+  duplicates with compatible unoriented directions. Two anchors interact only
+  when they come from different cells and
+  within the configured angular, transverse, and longitudinal limits measured
+  around their sign-aligned average axis. Transverse and longitudinal defaults
+  are independent of the refinement window and cell size: 2 and 1 stored
+  prediction voxels respectively. Ranking is aligned support, coherence, then
+  cell/component identity. Every decision compares against the original
+  candidate set, not only surviving candidates. Crossing directions and
+  sequential anchors along a fiber therefore remain distinct. Cropped runs fit
+  the exact external pivot cells that can directly compete with a selected
+  anchor, conservatively including the full refinement displacement of both
+  anchors before the NMS reach, but serialize and count only selected cells.
+- Reductions, seeds, assignment ties, convergence, component ordering, and
+  serialization sign are deterministic. Parallel work cannot change a
+  within-cell reduction. After serial cell selection, extraction forms the
+  selected cells plus every conservative direct-NMS-context cell, partitions
+  them into deterministic six-cell-per-axis spatial tiles, and samples one
+  dense ZYX box per tile with the complete fitting/peak/gradient halo. Cell
+  fits traverse indexed tile storage in the same canonical ZYX order as an
+  independent halo. Each physical tile voxel has one compact float32 position,
+  pre-normalized direction, presence, and gradient record. A cell owns only
+  32-bit tile indices and cell-local gradient-validity bytes, avoiding expanded
+  observation copies across overlapping support regions. The public expanded
+  observation API and production indexed path share one templated fitter. Tile
+  halos may overlap, but the decoded chunk cache avoids repeated source-chunk
+  reads. Complete cells with a full volume halo expand one immutable ordered
+  `(z, y, xBegin, xEnd)` owned-or-radius support stencil through their tile's
+  actual strides. This preserves canonical ZYX order and logical observation/
+  gradient populations. Crop and tile boundaries do not affect eligibility;
+  partial cells or cells clipped by a volume boundary retain the scalar sample-
+  cube construction. When gradients are enabled, the extra halo voxel makes
+  every retained stencil site gradient-eligible, while sampled tile-gradient
+  validity remains authoritative. Deterministic tile splitting and the worker
+  count keep coordinate vectors, decoded samples, and cell scratch under the
+  aggregate sample-memory budget; lower-level sampling uses one thread. Tiles
+  are paired for overlap reuse only when the staged pair fits that budget. Once
+  a tile's sampling, gradient, and compact-observation construction finish, its
+  cells enter one cooperative worker queue. Any extraction worker may fit a
+  ready cell, but the tile owner retains the immutable observations and waits
+  for every dependent cell before releasing them or advancing overlap reuse.
+  Sampling groups therefore remain the deterministic memory-ownership unit
+  while cell fitting is work-balanced independently.
+  Results and worker failures are stored by canonical cell index, retain
+  predicates and diagnostic aggregation run serially, and progress callbacks
+  are serialized. The lowest-index cell failure is reported after all workers
+  join.
+  Initial seed fitting uses a separate exact owned-cell view over the same
+  dense tile. Its constant-time layout validation requires monotonic cell
+  bounds, containment by the tile sample box, matching tile observation
+  cardinality, and matching clipped owned cardinality. It then visits dense
+  rows in canonical Z/Y/X order without an owned-index allocation. Robust
+  refinement continues to use the larger support-index range. The public
+  expanded-observation API retains stable input-order filtering and its
+  historical count-only owned-coverage check; it does not sort, deduplicate,
+  or require lattice coordinates.
+  Production compact observations also keep robust-proposal positions,
+  directions, component state, Gaussian/alignment values, masses, residual
+  histograms, and retained direction tensors in float32 throughout the repeated
+  per-observation loop. Fixed residual histograms, retained tensors, robust
+  cutoff selection, the shared float principal-axis solver, persistent
+  component state, diagnostics, and serialized output remain float32. The
+  public direct-observation fitter uses this same precision path.
+  Machine output and OBJ store spatial positions only in base-volume XYZ
+  coordinates. Prediction shape/scale, cell indices, cell size, direction
+  falloff, transverse/axial peak sigmas, peak grid step, cutoff, local window,
+  broad axial slab, convergence, and independent NMS limits remain explicit lattice
+  metadata and parameters. The orientation-independent sampling halo covers the
+  larger of the broad direction kernel and anisotropic peak kernel, including
+  the local-window displacement. Runtime timing and worker count are not
+  scientific output, so artifacts remain byte-identical across worker counts.
+- The anchor command itself does not connect anchors. Its strict version-1
+  JSON is the authoritative input to the separate integer-DP path stage. It
+  requires the refinement/NMS and merge parameters, aggregate diagnostics,
+  per-anchor refinement fields, and auditable per-cell merge evaluations where
+  applicable. Positions are validated against the prediction grid, continuous
+  owner cell, rotating pivot plane, and local window. Older experimental
+  artifacts must be
+  regenerated. `anchors.obj` contains all retained anchors, while
+  `anchors_0.obj` and `anchors_1.obj` contain deterministic post-sort
+  per-cell component slots. These slots are not global H/V classes.
+  Strict final and diagnostic-stage parameters include
+  `peak_gradient_weight`, `peak_gradient_reliability_scale`, and
+  `nms_transverse_radius_prediction_voxels`; missing fields are rejected
+  without repair.
+
+# Refined-anchor localization benchmark
+
+- `vc_fiberlets anchor-benchmark <fiber-manifest> <fiber.json>` measures the
+  geometric anchor positions immediately after direction/position refinement.
+  It reads the strict fiber's dense `line_points` in base-volume XYZ
+  coordinates and never substitutes control points or later retained anchors.
+- Benchmark cells are the canonical prediction-grid anchor cells whose closed
+  continuous ownership boxes intersect an exact reference-polyline segment.
+  A segment on a shared cell face therefore selects both cells. Selection is
+  unique, sorted, grid-clipped, and uses radius zero; no sampled-vertex
+  approximation is permitted.
+- Extraction stops after the `refined` diagnostic stage. Support rejection,
+  retain predicates, external NMS context, NMS ranking, and final artifact
+  population cannot affect the benchmark. Refined prediction-coordinate
+  positions are converted to base coordinates before exact point-to-polyline-
+  segment distances are computed. The command reports `discrete`,
+  `separable_1d`, and `joint_2d` from the stored matched positions. All three
+  reports use the exact same geometric refined records and therefore have equal
+  populations.
+- The fixed inclusive thresholds are 4 and 8 base voxels. For each threshold,
+  the command reports anchor hits over all geometric refined anchors and cell
+  hits over all reference cells. A cell hits when at least one of its refined
+  anchors is within threshold; a cell with no refined anchor is a miss.
+- Distance output contains count, minimum, mean, median, p95, and maximum in
+  base voxels. Quantiles use linear interpolation at zero-based rank
+  `q*(n-1)`. Empty anchor populations report `n/a` rates/statistics rather than
+  changing denominators, and an empty reference-cell selection is an error.
+  Population, distance, and threshold output records carry
+  `stage=discrete|separable_1d|joint_2d`; extraction timing is shared. No
+  artifacts are written.
+
+# Curved-domain DP fiberlet paths
+
+- `vc_fiberlets paths` consumes a strict `vc_fiberlet_anchors` version-1 JSON,
+  its matching canonical fiber manifest, and a separate regular Lasagna normal
+  manifest. Format/version, retained component structure, finite unit axes,
+  cell ownership/order, grid shape, prediction-to-base scale, and materialized
+  fiber-manifest content hash must match. Malformed artifacts are rejected
+  without repair. The stored source locator is informational, so identical
+  manifest content may be relocated. Fiber prediction `nx/ny` must never be
+  used as Lasagna surface normals.
+- Candidate target cells lie in the deterministic filled integer neighborhood
+  `0 < norm(offset) < radius+margin`, initially radius four and margin 0.5.
+  Offsets are symmetric and lexicographically ordered. All shorter distances
+  through the outer half-open bound are therefore searched, including
+  non-integer radial shells. All retained component pairs are considered once
+  under canonical `source_id < target_id` ordering. Both unoriented endpoint
+  axes must align to the chord within the configured bound, initially 45
+  degrees. This stage does not impose degree, mutual-best, or overlap limits.
+- Candidate generation completes before scoring. A fixed worker pool prepares
+  each searchable candidate exactly once into its canonical slot: one Hermite
+  domain, one corridor enumeration, checked packed local keys, and mapped
+  positions. DP reuses this representation and never reconstructs the domain,
+  corridor, or local nodes. Local corridor admission uses float32 continuous
+  point-to-segment distance against only the two centerline segments incident
+  to the node's curved-domain layer. Points strictly inside the layer center's
+  transverse-radius circle are admitted directly. This is a layer-local tube,
+  not a union over distant candidate segments, so separate bends cannot admit
+  shortcut nodes into one another's layers.
+- Preparation accumulates positive-weight native corners in worker-local sets.
+  The authoritative interpolation-cell decomposition is shared with weighted
+  interpolation. When all eight positive-weight corners occupy one `16^3`
+  bitmap page, preparation resolves that page once and sets the eight local
+  bits directly; lower-cardinality and page-crossing cells use the general
+  per-corner insertion path. Sorted worker vectors are reduced by deterministic
+  pairwise unique merges to
+  one complete stored-ZYX ordered global union. Its exact contents and size are
+  invariant under worker count and `--batch`, including shared corners and
+  selection-boundary corners.
+- `--batch`, initially 65536, limits consecutive global unique coordinates per
+  sampler call. All prediction ranges complete before any normal range. After
+  all reads, prepared scoring voxels and their immutable paged index are
+  retained through parallel DP. Exact endpoints are interpolated eagerly;
+  interior-node corners and weights are re-derived from canonical stored
+  positions only on a candidate-local lazy-cache miss. Prediction
+  and normal samplers each receive every global coordinate exactly once; only
+  their call count changes with `--batch`.
+- Every parallel stage writes canonical slots. Workers continue after
+  independent candidate errors and the lowest candidate-index error is rethrown
+  after the stage. A deterministic serial pass derives aggregate diagnostics.
+  Batch size, worker count, sampled-corner counts, and phase timings are absent
+  from artifacts; changing them preserves path and graph artifact bytes.
+  Benchmark timing separates candidate generation, parallel preparation,
+  corner merge, prediction reads, normal reads, score materialization, and DP.
+  Every phase reports wall time, process CPU seconds, and effective cores
+  (`CPU/wall`), plus unique requests, calls, and checked owned-payload estimates.
+- The optional core progress callback emits phase-labelled initial, periodic,
+  and terminal states under a serialization mutex. `vc_fiberlets` writes
+  completed/total, percentage, elapsed time, rate, and ETA to stderr. Empty
+  stages report `0/0`. Progress is operational and cannot affect artifacts.
+- Every candidate has a deterministic curved local coordinate domain. A cubic
+  Hermite centerline uses exact anchor positions, chord-oriented fitted axes,
+  and endpoint-distance derivative magnitudes. It is tabulated with
+  `max(64,ceil(16*endpoint_distance))` segments and deterministically inverted
+  by linear interpolation of cumulative arclength. Planes are placed every 2
+  prediction voxels of centerline arclength with the exact target inserted once.
+  A nonfinite or degenerate curve/tangent/frame rejects the candidate.
+- Each plane normal is the normalized Hermite derivative. The initial
+  transverse axis is the projection of the least-aligned canonical world axis;
+  deterministic ties use axis order. Later frames use minimal-rotation parallel
+  transport followed by re-orthogonalization. A local key `(layer,u,v)` maps to
+  `center + 0.5*u*U + 0.5*v*V` in prediction XYZ. Finite transverse bounds are
+  derived from corridor radius, then mapped points are filtered by inclusive
+  volume bounds, corridor membership, and any replay tube predicate. An
+  interior mapped point is narrowed once to three `float32` coordinates before
+  any of those admission tests; that stored position is authoritative for
+  sampling, DP geometry, and output. Exact endpoint anchors use the same
+  float32 representation as interior nodes.
+  `(layer,u,v)` is checked row-major packed into one `uint32_t` using the
+  per-candidate transverse width; non-finite or overflowing lattices fail.
+- The exact start `(s=0,u=v=0)` and target `(s=L,u=v=0)` are source and sink.
+  Interior edges advance exactly one layer and change each transverse index by
+  at most one. Their actual mapped XYZ vectors and Euclidean lengths drive all
+  feasibility and scoring. The final interval may be shorter than 2 prediction
+  voxels; exact multiples and curves shorter than 2 do not create duplicate
+  planes. States 0 through 8 encode the incoming `(du,dv)` transition; state 9
+  is source-only. The predecessor node is derived from the checked packed key
+  as `(layer-1,u-du,v-dv)`. Reconstruction retains the predecessor state index
+  and the exact five-component float32 transition cost selected by each
+  relaxation; it must replay those stored costs rather than recomputing them
+  from reconstructed geometry. Cumulative costs exist only for the current and
+  next interior layers. One predecessor-state byte and one
+  `FiberletPathCost` per global node/state remain until reconstruction. The
+  exact source and sink stay outside this rolling interior representation.
+  Strict cost ties retain the first canonical predecessor.
+- Arbitrary-position presence is the trilinear weighted sum of all positive-weight
+  native corners. Unoriented prediction axes are normalized and combined as
+  `T=sum(w*d*d^T)` without presence weighting; the deterministic shared
+  symmetric eigensolver supplies the unique principal axis. Every positive-
+  weight corner must have finite valid prediction data and the tensor must have
+  a unique principal eigenvalue. Antipodal axes therefore interpolate without
+  cancellation, while an equal orthogonal mixture is invalid. Normals use the
+  same sign-invariant interpolation, but an invalid corner or ambiguous tensor
+  produces an invalid normal and retains isotropic curvature fallback.
+  Materialized interior prediction and normal axes are re-encoded in the
+  Lasagna +Z compact `nx/ny` byte convention; presence is a clamped rounded
+  byte and validity uses independent bits. This intentional second
+  quantization is part of the experimental DP objective. The persistent
+  16-byte geometry node stores only key and float position; compact scoring is
+  converted immediately into the candidate-local prepared cache and no normal
+  reason or interpolation stencil is retained. The
+  global sparse union includes all required native corners even when a corner
+  lies outside the floating-node tube predicate. Evaluated nodes retain integer
+  candidate and local keys rather than floating-point hash identity. Each
+  candidate owns a direct node-to-cache map and append-only prepared scoring
+  cache. First access interpolates, compact-quantizes, decodes, and normalizes
+  that node; later accesses reuse its cache index. Mutable page lookup state is
+  candidate-local, while the underlying prepared scoring voxels and page index
+  are shared read-only. Both local structures are released after that candidate
+  and are not added to persistent prepared geometry.
+- Every nonzero DP edge must have an unoriented angle strictly below 25 degrees
+  to the interpolated dense fiber-prediction axis. Equivalently, for normalized step
+  `d` and fiber axis `f`, `abs(d dot f) > cos(25 degrees)` without a boundary
+  epsilon. Interior moves use the interpolated prediction at their mapped
+  destination. Exact source/sink transitions are exempt from this sampled gate
+  and remain constrained by the fitted endpoint-axis rule. A missing, invalid,
+  nonfinite, or degenerate required interior prediction rejects that edge before
+  scoring. The independent Lasagna surface normal does not participate in this
+  hard gate. A reached node resolves at most nine outgoing neighbor lookups,
+  mapped directions/lengths, and hard-gate results once and reuses those edge
+  descriptors across every reached incoming state. Unreached nodes do not
+  pre-generate edges.
+- Valid-data scoring shares the regular native tracer's exact ordered float
+  multiplicative alignment loss. For incoming step `a`, outgoing step `b`,
+  current prediction `c` sign-aligned to `a`, candidate prediction `d` sign-
+  aligned to `b`, and candidate presence `p`, `score` is `clamp01(p)` times the
+  six positive-clamped dots `a.b`, `a.c`, `a.d`, `c.b`, `c.d`, and `b.d` in
+  that order. Alignment cost is `(1-score)*actual_edge_length`; edge-length weighting
+  keeps differently directed local transitions comparable. The former lattice
+  direction floor and independent presence/direction weights do not exist.
+  Fiberlet DP calls the shared prepared-input scoring path with cached unit
+  vectors; the regular validating scoring API normalizes and delegates to the
+  same arithmetic. Interior DP may evaluate the four pair-dependent alignment
+  dots for its valid outgoing slots as one compact structure-of-arrays batch.
+  Valid lanes remain in ascending transition-slot order. Smoothness, complete
+  cost assembly, accumulated-state addition, strict-less relaxation decisions,
+  and backpointer writes remain scalar in the existing order.
+- The source transition uses the fitted start axis as both `a` and `c`, its
+  actual mapped direction as `b`, and the dense destination prediction as `d`.
+  The sink transition uses the current dense prediction and incoming step, its
+  actual mapped direction as `b`, and the fitted target axis at presence one as
+  `d`. The first and last transition directions must satisfy the configured
+  endpoint-axis bound. Interior destinations alone use the strict sampled-
+  prediction gate.
+- Invalid fiber samples cannot be destinations of nonzero DP edges under the
+  hard sampled-direction gate. The pre-existing invalid-prediction cost remains
+  serialized as part of the experimental objective configuration, but it does
+  not turn an invalid destination into a traversable bridge.
+- Direct local curvature shares the native 3D tracer's exact float
+  normal-aware equations. With a valid normal it emits tangent-plane and
+  normal-tilt costs; otherwise it emits only the isotropic fallback. Fiberlet
+  defaults are isotropic/normal/tangent weights `2/0.1/10` and a zero-degree
+  free angle, matching greedy tracing. The per-turn value is divided by
+  `max(1,(previous_edge_length+candidate_edge_length)/2)`. Cumulative history
+  smoothness is not part of this DP.
+- `fiberlets.json` stores explicit source paths/hashes, base-volume coordinates,
+  parameters, diagnostics, every considered endpoint pair and reason, component
+  cost totals, and successful base-coordinate paths. Every successful scored
+  path also stores its base-voxel arc length, total loss divided by prediction-
+  voxel arc length, and report-relative visual quality.
+  Smoothness terms remain included in the density even though their existing
+  per-turn integration differs from the edge-integrated data terms. These are
+  reporting values only and cannot change path selection or acceptance.
+  Parameters include nominal longitudinal and transverse spacing in prediction
+  voxels and their derived base-voxel values. Successful candidates retain the
+  exact interpolated endpoint prediction and normal samples needed for graph
+  joins. All path positions remain base XYZ.
+- Relative visual quality is computed over exactly the successful scored paths
+  in canonical report order as inverse min-max normalized loss density: the
+  lowest density is one and the highest is zero. Equal densities all map to one;
+  an empty population has null bounds. This is an artifact-relative display
+  value, not absolute confidence. Display color is napari runtime state.
+- `fiberlets.obj` contains only successful base-coordinate line groups and
+  report comments declare the density population, unit, bounds, and formula;
+  each group records total loss, loss density, and relative quality. Path MTL,
+  materials, and serialized RGB do not exist, and publication removes a stale
+  `fiberlets.mtl`. JSON and OBJ use individual atomic replacements; the pair is
+  not transactionally atomic. Timing and worker count are not serialized, so
+  repeated identical runs are byte-identical.
+- A candidate has independent searched, score-valid, and accepted state. A
+  score becomes valid only when DP finds a sink path with a finite total;
+  feasibility failures never serialize a zero placeholder cost. `paths
+  --stats` reports retained anchors, candidate/search/unscored/accepted counts,
+  min/mean/max integrated total loss for all scored paths and the accepted
+  subset, and min/mean/max accepted loss density, using `n/a` for an empty
+  population. Until quality filtering exists, every scored path is accepted
+  and the two total-loss ranges match.
+- OBJ output uses one group per accepted fiberlet and one explicit two-index
+  line element per adjacent path edge. Napari is the supported path viewer. It
+  strictly validates OBJ report/group metrics, rejects obsolete material
+  records, crop-filters geometry and properties together, and exposes total
+  loss, density, and relative quality as Shapes features. Quality is mapped
+  over fixed `[0,1]`; a dock selector defaults to a custom red-yellow-green map
+  and offers napari's available colormaps in deterministic order. Selection is
+  display-only. Anchor OBJ parsing remains unchanged.
+- By default, `paths` writes separate `fiber_presence_{xy,xz,yz}` OBJ/MTL/PNG
+  bundles. Each OBJ is one base-coordinate textured quad on the lower central
+  prediction voxel of the whole-cell-expanded selected region and can be loaded
+  independently. Quad bounds extend half a stored prediction voxel beyond the
+  first and last sample centers on each varying axis. Four UVs map the
+  minimum/minimum corner to `(0,1)`, maximum/minimum to `(1,1)`,
+  maximum/maximum to `(1,0)`, and minimum/maximum to `(0,0)`.
+- Each grayscale PNG samples the canonical stored presence channel directly,
+  one pixel per prediction voxel, with `round(255*clamp(p,0,1))`; missing
+  presence is black and direction validity is irrelevant. Total texture pixels
+  are overflow-checked and capped at one million. Per-file replacement is
+  atomic and each OBJ is published after its PNG and MTL, but the nine-file
+  collection is not transactionally atomic. `--no-slices` skips sampling and
+  removes all bundles without changing path or JSON results.
+- `fiberlet_graph.json` is generated from every successful scored fiberlet.
+  Anchor identity, base-coordinate position, exact interpolated dense
+  prediction, and exact interpolated Lasagna normal define a node; repeated
+  candidate references must agree. Each canonical
+  fiberlet is one edge with deterministic array-index ID, exact dense polyline,
+  candidate ID, additive loss, and prediction-grid length, and supplies two
+  directed arc IDs: `2*edge` forward and `2*edge+1` exact reverse. Endpoint
+  tangents use the first/last distinct dense point in traversal direction.
+  At a shared anchor an incoming arc may transition to another outgoing arc
+  only when the angle between its tangent pointing into the anchor and the
+  outgoing tangent pointing away is strictly below 45 degrees and the anchor
+  prediction is valid. Every transition stores the shared local metric's
+  alignment/isotropic/tangent/normal components. It uses the same anchor sample
+  as current and candidate prediction, outgoing segment length for alignment,
+  and `max(1,(incoming_length+outgoing_length)/2)` for smoothness. Invalid
+  normals use isotropic fallback. Join cost is additive to the two fiberlet
+  endpoint-proxy costs and adds no route length. Transitions and adjacency are
+  canonically ordered. Graph source metadata binds the exact manifest and
+  anchor hashes used for `fiberlets.json`.
+- Learned path-quality rejection, overlap
+  deduplication, extension, H/V and winding labels, CUDA batching, and
+  production radius selection remain out of scope.
+
+# C++ dense-fiber failure replay
+
+- `vc_fiberlets fiberlet-replay` consumes a fiber-prediction Lasagna manifest,
+  strict VC3D fiber JSON, required regular-normal Lasagna manifest, and output
+  directory. All spatial arguments and artifacts use base-volume XYZ/base
+  voxels. Defaults are `--fail 20`, `--radius 64`, `--match-refine 1`,
+  `--beam 16`, `--lookahead-distance 384`, and `--batch 65536` native
+  coordinates. The independent beam-front step defaults to 48 base voxels and
+  is overridden by `--beam-step-distance`.
+- The evaluated interval begins at the first control point's dense-line arc and
+  ends at the final dense reference point by default. Replay-only `--length N`
+  selects at most `N` positive finite base voxels from that point and clamps an
+  oversized request at the reference end. One shared effective begin/end pair
+  bounds anchor/path extraction, both evaluators, failure fractions, artifacts,
+  and visualizations. Anchor extraction is local to cells intersecting the
+  exact radius tube around that selected interval. The normal replay path
+  exposes one logical graph through sparse anchor and fiberlet chunks; it must
+  not materialize the whole corridor graph before evaluation. `--eager-graph`
+  retains the complete graph path only as a diagnostic equivalence
+  implementation. Spatially close but arclength-distant candidates remain
+  eligible in either path.
+- Eager replay uses the same global staged path extraction contract:
+  prepare every curve once in parallel, merge one global unique corner union,
+  batch only consecutive coordinate ranges, materialize all scores, then solve
+  all curves in parallel. Required corners remain present outside the tube
+  predicate. Batch and worker counts cannot change serialized path/graph
+  results or the unique request population.
+- Lazy replay stores anchors and fiberlets in separate local Zarr-v2-layout
+  roots. Their arrays contain explicitly identified custom version-2 object
+  payloads rather than tensor samples. Prefix and route arrays are separate so
+  adjacency and beam ranking do not retain unused route geometry. A fiberlet
+  owner chunk blocks only on the complete bounded halo of anchor chunks needed
+  by its endpoint search.
+- Lazy replay schedules the exact reference tube at storage-chunk resolution;
+  it must not enumerate the complete corridor's anchor-cell population before
+  cache workers start. Each requested anchor chunk enumerates its owned cells
+  in canonical Z/Y/X order and uses the canonical exact segment-to-cell test.
+  The post-refinement anchor-position predicate, fiberlet-interior point
+  predicate, and cross-chunk NMS dependency context remain mandatory. Cache
+  identity binds the complete clipped reference geometry, radius, source and
+  algorithm metadata, and corridor-selector version, not a serialized cell
+  list.
+- Generated anchor and fiberlet payloads use separate `ChunkCache` scheduler
+  lanes and one shared decoded-byte budget. Stable coordinate-plus-variant
+  anchor IDs and canonical endpoint-pair edge IDs are the only graph state held
+  by beam/frontier records. Serialized chunks are decoded exactly once when
+  entering the existing `ChunkCache` LRU; there is no graph-private LRU and no
+  resident serialized duplicate. Anchor and fiberlet caches remain separate
+  participants in the shared budget. A decoded prefix payload builds and
+  charges a deterministic two-endpoint incident index once. Incident queries
+  batch-prefetch every possible owner chunk, lease those indexed payloads, and
+  release the leases after the query. Float-cache anchors persist the exact
+  endpoint prediction direction, presence, validity flags, Lasagna normal, and
+  normal validity produced by canonical DP interpolation. Float-cache prefixes
+  persist all five additive path-cost components, authoritative float path
+  length, and exact base-space first/final nonzero steps. Beam ranking and
+  transition scoring consume those records directly; replay must not resample
+  source volumes or reconstruct endpoint scoring geometry.
+  Lookahead requests route payloads for decoded segment densities and
+  route-lattice segment lengths, but retains only stable IDs and scalar scores
+  after each query. The current provisional best is additionally reconstructed
+  for reference-error evaluation and final output. Cache eviction and reload
+  cannot invalidate graph identity or alter tie order.
+  Committed route reconstruction applies the same adjacent-point epsilon
+  suppression as eager DP finalization. For the same extracted graph, cold and
+  warm float-cache replay artifacts must be byte-identical to eager replay.
+  Compact storage is intentionally quantized and excluded from this identity
+  contract.
+  Active payload leases may temporarily exceed the nominal cache budget, but
+  unleased connectivity and geometry remain LRU-bound.
+- Sparse payloads are strict and unpublished: no version repair or compatibility
+  reader exists. Each payload binds kind, profile, chunk coordinate, dataset
+  fingerprint, scalar widths, source scale, field directory, and checksum.
+  Fields are deterministic little-endian structure-of-arrays blocks compressed
+  independently with Zstd when smaller. Local publication uses a same-directory
+  temporary file, file `fsync`, atomic rename, and parent-directory `fsync`.
+  Prefix and route members are immutable and become readable only when both
+  payload files are present, decode against the expected dataset/chunk codec,
+  and have matching record counts. There are no per-chunk completion markers.
+  A partial pair is incomplete and resumable; empty complete pairs are explicit
+  valid payloads.
+- Greedy replay uses the regular native one-way candidate generation,
+  prediction loss, Lasagna-normal curvature, and validity rules. Graph replay
+  uses a deterministic persistent beam over the complete immutable graph with
+  the shared edge/join objective.
+  The greedy evaluator and on-demand graph evaluator run concurrently;
+  neither evaluator changes the other one's state.
+- Graph replay has separate finite positive checkpoint-step, lookahead, and
+  intermediate-prune distances in base voxels. It keeps up to the configured
+  positive beam width of complete route
+  histories and a shared logical checkpoint `C` that is no greater than the
+  shortest retained history. Exact cost-bounded lookahead is the default, with
+  a 384-base-voxel lookahead and 48-base-voxel checkpoint step. It expands
+  without an intermediate width approximation, then retains at most the final
+  configured beam width, which defaults to 16 and has no fixed upper policy
+  limit. The existing exact cycle rules and one-million-state per-decision bound
+  remain mandatory. Positive `--search-width N` explicitly selects
+  approximate intermediate pruning at the configured `--prune-distance`,
+  which defaults to 48 base voxels and is ignored in exact mode.
+- Every successful fiberlet route stores one quantized total-cost density per
+  emitted geometry segment. Route geometry and cost samples use independent
+  offsets. Densities are per prediction voxel and use the fixed global
+  `sqrt(density / 256)` uint16 codec; this unpublished route schema has no
+  repair or compatibility reader. Forward/reverse arcs reverse geometry
+  lengths and density samples together. Anchor cache identity is unchanged;
+  the route-cost schema is part of fiberlet cache identity.
+- Replay defaults to aggregate `fiberlet` cost mode. It ranks from the segment
+  seed through the common horizon with the stored whole-edge and join costs,
+  prorating only the horizon-crossing edge by length. The checkpoint is a
+  commitment boundary, not a scoring boundary; an entering join is charged in
+  full whenever any of its following edge lies before the horizon. Aggregate
+  mode does not request route cost profiles. Its exact relaxed cost-to-go and
+  intermediate-pruned search use the same aggregate objective.
+- Explicit `stepped` cost mode integrates fiberlet cost profiles on one regular distance grid rooted
+  at the current checkpoint. Its finite positive integration spacing is in
+  base voxels. Arbitrary edge/grid/horizon boundaries linearly interpolate the
+  piecewise-linear cumulative cost implied by piecewise-constant segment
+  densities. Before geometric weighting, replay linearly blends each decoded
+  subsegment density with the decoded-profile average of its complete
+  fiberlet: `effective = (1-A)*average + A*subsegment`, where finite
+  `0 <= A <= 1`. The average is
+  `sum(decoded_density * segment_length) / fiberlet_length`; it is not derived
+  from or normalized to the separately stored whole-edge cost. `A=0` is a
+  constant density within each fiberlet, `A=1` is the stored profile, and the
+  stepped-mode default is 1. The blend is replay-only and does not participate in anchor or
+  fiberlet cache identity. Each interval cost is multiplied by `W^s`, where `0 < W <= 1`
+  is the configured per-base-voxel weight and `s` is the interval midpoint's
+  base distance from the checkpoint after the configured finite nonnegative
+  delay `L`: the exponent is `max(0, s-L)`, so weight remains one through the
+  delay. Delay defaults to zero, preserving immediate decay; half the
+  lookahead is the initial opt-in experiment. `W=1` exactly conserves the decoded
+  profile total. Joins before the checkpoint are excluded, a join exactly at
+  it is included with weight one, and a join exactly at the horizon is
+  excluded. Weighted ranking remains a scalar separate from unweighted
+  five-component committed diagnostics.
+- Stepped-only weight, delay, integration-step, and profile-blend options are
+  rejected unless stepped mode is selected. Replay artifacts always store
+  `cost_mode`; aggregate artifacts omit inactive stepped fields. Cost mode and
+  stepped replay controls do not participate in cache identity.
+- Exact search seeds one cost-ordered frontier from every retained live route
+  and maintains one global set of the best configured-beam-width completions at
+  `C+H`. Completion
+  order is checkpoint-relative weighted exact-horizon loss followed by canonical persistent
+  logical-route order; loss per voxel is diagnostic only. Completions are
+  deduplicated only by seed plus their complete logical route, so any number of
+  winning routes may share the same route through `C+D` and diverge later.
+  Distinct physical expansion states are not merged merely because they have
+  the same logical identity.
+- The exact cutoff does not exist until the configured beam width of distinct
+  full-route completions is available. Thereafter the worst retained weighted total
+  is the one shared cutoff
+  for every source route. A pending state is pruned only when its admissible
+  lower bound is strictly greater than the cutoff; equal bounds remain eligible
+  for canonical tie ordering. Fixed-size expansion batches are independent of
+  worker count. All entries admitted under the batch-start cutoff count as
+  expanded, workers publish ordered successor arrays, and the coordinator
+  merges/account them in popped-route and successor order. Only that canonical
+  merge mutates the decision-wide state budget.
+- Exact winners remain live through their complete `C+H` lookahead routes when
+  `C` advances by `D`. At the next decision, a retained terminal fiberlet that
+  already covers the new horizon is immediately rescored by integrating its
+  segment profile through the horizon; otherwise expansion resumes only at the retained
+  physical endpoint. The globally best winner's prefix through the complete
+  fiberlet containing `C+D` is the only route reference-evaluated and committed
+  at that decision. Its future suffix is not reference-evaluated early.
+- Bounded search first advances to the next checkpoint `C+D`, then to fronts at
+  most `P` apart until the exact `C+H` horizon. All fronts are clamped at the
+  selected route end; a final nondivisible interval is shorter. The final
+  fiberlet stays whole in graph state and may overshoot a front.
+- Between fronts, search is a deterministic uniform-cost label search. A label
+  state is `(logical incoming directed fiberlet, absolute front-offset bin)`;
+  front-offset bins are 0.5 prediction voxels. When histories reconverge at the
+  same state, only the lowest accumulated-cost history remains, with ordered
+  logical arc IDs breaking exact-cost ties. Its visited-node state becomes the
+  state's cycle state; alternatives with different visited histories are
+  intentionally discarded. Crossing labels integrate the exact segment
+  profile through the terminal edge. Once `K` exact completions exist, expansion stops only when the
+  next accumulated-cost lower bound is strictly greater than the `K`th exact
+  completion, so equal-cost ties remain eligible. Queue exhaustion returns all
+  available completions when fewer than `K` exist.
+- A route's ranking score is the sum of two terms. The prefix from the segment
+  seed through the current checkpoint uses the authoritative unweighted
+  whole-edge and transition costs. The forward interval from the checkpoint to
+  the exact logical front integrates the decoded segment-density profile with
+  the configured checkpoint-local delay and geometric weights. Decoded profile
+  values are used directly: they are never normalized or rescaled to force
+  agreement with the separately stored whole-edge cost. The same integration
+  algorithm is used at every weight, including `W=1`; changing the integration
+  spacing can therefore retain small interpolation and accumulation-rounding
+  effects.
+- Edge intervals are half open for score ownership. An edge portion before the
+  checkpoint belongs to the authoritative prefix, while the portion beginning
+  at the checkpoint belongs to the weighted forward term. An entering join
+  before the checkpoint belongs to the prefix, a join exactly at the checkpoint
+  belongs to the forward term with weight one, and a join exactly at the horizon
+  is excluded. When the front lies inside the terminal fiberlet, only the
+  traversed profile interval contributes. When the front is exactly an anchor,
+  the edge ending there and its entering join contribute, but no outgoing edge
+  or join does. The complete terminal geometry and visited-node state remain
+  attached to the candidate.
+- At an intermediate front, identical complete logical routes are deduplicated
+  and ranked by exact-front loss and stable logical IDs. The best continuation
+  for every represented stable prefix is retained first, up to working width;
+  remaining slots are filled by the globally best unselected routes. The
+  stable prefix is the segment seed plus ordered logical arc IDs through
+  `C+D`, never a history pointer. At the final front, only the best
+  continuation for each actual next-checkpoint prefix is eligible for the
+  globally best 16. Pruning a prefix that would become better by `C+H` is the
+  explicit approximation boundary.
+- Each expansion worker retains bounded local global candidates and stable-
+  prefix representatives. Dominated labels and stale queued labels are counted
+  separately from exact front completions and cost-bound pruning. Worker
+  candidate limits are the sufficient local bound: one representative for the
+  worker's stable prefix plus only the number of globally unoccupied fill
+  slots. The first `C+D` front uses the full target width because its stable
+  prefixes do not exist until that front is reached. Worker results merge in
+  canonical input order and are reranked by deterministic
+  logical IDs, so 1-thread and multi-thread executions produce identical
+  output. One generated-state limit covers the complete decision and aborts it
+  without retaining partial worker output.
+- In bounded search, after pruning `C` advances by `D` and each winner is
+  retained through the complete fiberlet containing the new checkpoint.
+  Depending on its existing overshoot, a beam may add no fiberlet, one
+  fiberlet, or several fiberlets in that step. Exact search instead retains the
+  full lookahead route described above. Both preserve
+  `C <= min(retained_history_length)`.
+- Compact-cost replay consumes the decoded authoritative segment-density
+  profile and join costs. Logical-front scoring integrates the profile through
+  the terminal edge;
+  final reference-end or failure materialization may additionally clip output
+  geometry without altering persistent graph state. Exceeding the deterministic
+  per-decision one-million-state bound is an explicit error. A route that
+  exhausts before the common horizon is excluded; if all routes do, normal
+  graph exhaustion applies.
+- Persistent histories use shared immutable parent records and retain IDs,
+  cumulative costs, path length, incoming transition, and visited-node state,
+  not duplicate route geometry. A reference failure closes the chosen history,
+  resets the segment origin, and reseeds the full population. The reference
+  never removes graph candidates during ranking.
+- Persistent search bookkeeping must not scale with the already committed
+  prefix. Logical routes use exact canonical parent/arc identity plus exact
+  ancestor/first-divergence ordering; physical candidates remain separate.
+  Decision-score initialization starts from cumulative scalar edge and join
+  cost at the history immediately before the checkpoint and visits only the
+  checkpoint-to-horizon suffix. Logical-route interning cleanup advances a
+  bounded stable cursor through the ordered registry; it never performs a
+  whole-registry sweep at every checkpoint.
+  Exact queue ordering, completion deduplication, and cutoff maintenance use
+  scalar cumulative state and those persistent identities only; they never
+  materialize logical arc or route-point vectors.
+  Cycle membership uses an immutable exact-key Patricia trie and is never
+  compacted by copying the accumulated prefix. Selected-route reference
+  matching resumes from the nearest evaluated physical-history ancestor and
+  evaluates each newly selected suffix once. Diagnostic indices are allocated
+  from that same newly selected suffix in their historical order. Full route
+  vectors, matches, steps, and consumed-node output are assembled once when a
+  segment terminates. Explicit decision diagnostics may additionally build the
+  complete route payloads they serialize. These are implementation constraints
+  only and must not change ranking, costs, failure locations, cache identity,
+  or replay JSON.
+- The `fiberlet-replay` CLI runs the classic greedy and graph evaluators at the
+  same time. Its positive `--threads N` setting is one trace-evaluator worker
+  budget split deterministically between those two nested searches, not `N`
+  workers assigned independently to each evaluator. This scheduling rule does
+  not change graph ordering or numerical accumulation.
+- Ordinary graph-arc queries expose connectivity and aggregate edge metadata
+  only. Decoded cost profiles are requested explicitly by the scorer and kept
+  in a bounded decision-local cache, so queue expansion does not reconstruct or
+  copy route payloads on every adjacency lookup. Exact-search relaxed
+  cost-to-go memoization is decision-local, scalar, and conservative; its state
+  count, cache hits, and zero-bound fallbacks are diagnostic output and do not
+  affect ordering.
+- Beam-step, lookahead, prune distance, search width, geometric cost weight,
+  geometric cost delay, and cost integration spacing are replay-only
+  metadata. They must not affect anchor or fiberlet cache identity, corridor
+  selection, generation settings, chunk payloads, or prefetch scheduling.
+  On-demand traversal may populate a missing chunk, but repeating against a hot
+  cache must not rewrite cache files.
+- Default cached replay progress exposes independent `cache/prep` and `trace`
+  terminal bars while preprocessing and tracing overlap. Cache progress is
+  `(resolvedAnchors + 16*resolvedPrefixes) /
+  (expectedAnchors + 16*expectedPrefixes)` over deterministic scheduled
+  prefetch keys. Trace progress is exactly
+  `min(greedy_reference_fraction, fiberlet_reference_fraction)`, with no
+  weighted combination between the two. Resolution counts generated and
+  persisted chunks identically and deduplicates reloads. Eager replay exposes
+  only trace progress. Cache progress excludes data-dependent neighbor-prefix
+  and committed-route reads, which occur during tracing. All fractions are
+  monotone. Non-finite tracer values are
+  ignored and stale or restart-local callbacks cannot move either tracer
+  fraction backward. A 250-millisecond ticker refreshes elapsed time even
+  without worker callbacks. The compact line contains only one elapsed field;
+  cache and trace retain independent ETAs while overlapping, and completed
+  scheduled cache progress is removed from the line. Trace additionally shows
+  a current-speed ETA over a rolling ten-second fraction window, reporting
+  `n/a` when that window has no positive progress. Requested visualization and durable publication use a separate
+  output phase after tracing, terminate their line before result/error output,
+  and never alter or masquerade as reference progress.
+- Each completed bounded fiberlet decision publishes search diagnostics with
+  its progress callback. The rollout expansion count is the total number of
+  states whose successors were enumerated across all intermediate fronts. For
+  each maximum-lookahead-front input where the existing strict cutoff actually
+  stops expansion, the diagnostic subtracts that input route's loss at the
+  front start from the cumulative cutoff and divides by the front length in
+  prediction voxels; it publishes the minimum such local loss density. This
+  normalization is diagnostic only: search continues to compare the unchanged
+  cumulative raw-loss cutoff against queued lower bounds. The CLI retains the
+  last published values until the next completed fiberlet decision. Exact mode
+  omits both diagnostics, and a bounded decision omits the cutoff if it never
+  binds.
+- `--stats` replaces the concise bar with detailed machine-readable stage,
+  chunk, restart, evaluator, cache, visualization, and publication diagnostics.
+  It does not change scheduling, generated payloads, tracing, or artifacts.
+- Repeated `--decision-window BEGIN,END` options require `--stats` and retain
+  complete decision records only when the selected matched reference arc is in
+  an inclusive window. They alter diagnostic materialization only, not search,
+  matching, restart history, cache identity, or generated chunks. Serialized
+  route geometry begins at the checkpoint and ends at the lookahead; it must
+  not rebuild the already committed prefix.
+- `fiberlet-replay --arc BEGIN` selects an absolute base-voxel reference start
+  for both greedy and graph replay; `--length` then limits that focused
+  interval. Greedy starts from the sampled point and tangent at `BEGIN`, and
+  graph replay seeds at the same reference arc. A focused run retains the full
+  first-control-point corridor's cache identity and containment predicate but
+  schedules only the focused interval. Missing chunks therefore have the same
+  complete contents as full replay chunks; focused geometry must never be
+  persisted under a full-corridor identity.
+- On-demand chunk diagnostics bind every generated anchor/fiberlet chunk to a
+  stable full-interval schedule index and nearest reference arc. Generated
+  counts are monotone, while spatial chunks may complete out of schedule order.
+  Fiberlet generation exposes candidate generation, preparation, sampling,
+  materialization, and search phases with their own completed/total counts.
+- Anchor ready-cell completion and its condition predicate are synchronized by
+  the same mutex. Cache dependency waits do not poll, emit heartbeats, or use
+  timeout recovery. A failed generated dependency preserves the exact dataset
+  stage, chunk key, cache status, and underlying error.
+- Fiberlet candidates may be generated concurrently by canonical source
+  anchor. Per-source output is merged in source order, and completed prepared
+  geometry may be released by its owning search worker. Neither operation may
+  change candidate order, per-candidate arithmetic, graph identity, or encoded
+  payload bytes.
+- Anchor and Fiberlet metadata include one shared producer-generation contract
+  in their algorithm identity. Any implementation change that can alter an
+  authoritative anchor, prefix, or route record for otherwise identical
+  effective inputs must increment that contract before writing payloads. The
+  current unpublished contract is version 3. Compiler identity/version and
+  build configuration are diagnostic metadata only; they are excluded from
+  algorithm and dataset fingerprints and do not make otherwise equivalent
+  caches incompatible. Default cache discovery may reuse an earlier version-3
+  toolchain-specific namespace after comparing the remaining structured
+  identity. Version-2 directories are not migrated, repaired, or read through;
+  explicitly selecting any scientifically incompatible root is an error.
+- Cached anchor prediction, presence, and Lasagna-normal fields are not a
+  generation consistency boundary. Fiberlet generation uses freshly sampled
+  endpoint and interior evidence for every metric and decision and does not
+  compare it with those cached fields. Replay transition scoring likewise uses
+  a single-flight derived anchor view which resamples that evidence at each
+  effective anchor position. Cached stable IDs, fitted geometry, and positions
+  remain authoritative. A scheduled failure preserves the owner key, terminal
+  cache status, and original nested generator message.
+
+## Staged Fiberlet replay filtering
+
+- Cache-backed `vc_fiberlets fiberlet-replay` accepts the ordered repeatable
+  `--stage SIDE,OFFSET_X,OFFSET_Y,OFFSET_Z`, `--join-angle`, `--cost-profile`,
+  and `--max-states` reduction options. No stage preserves ordinary replay
+  behavior. Filtered replay is incompatible with eager graph extraction.
+- Replay filter stages are cubic lattices in global base-volume XYZ. Each
+  offset is normalized modulo its positive side. Selected boxes are complete,
+  half-open boxes within the prediction volume and execute in deterministic
+  Z/Y/X order. They are never re-anchored to a replay interval, storage chunk,
+  generation cell, or processing-cache chunk.
+- The last stage includes every complete global box whose corridor-expanded
+  extent intersects the selected reference polyline. Planning proceeds
+  backward: every preceding stage includes all complete boxes intersecting a
+  required later box expanded by the dataset's declared maximum endpoint reach.
+  Base anchor/Fiberlet generation covers the union of required boxes expanded
+  by that reach and clipped to the volume.
+- Stage boxes, anchor-generation cells, and persistent Fiberlet storage chunks
+  are independent globally anchored layouts and may have different sizes and
+  boundaries. Coverage crosses layouts only through half-open base-space
+  extents and the canonical storage-owner halo calculation.
+- Filtering reuses the canonical staged analysis, simplification, overlay, and
+  write-back implementation. Derived layers are invocation-local and are never
+  published as a persistent filtered cache. Canonical unfiltered on-demand
+  chunks retain their normal persistent cache behavior.
+- Expanded support exists only to make every selected final-stage box complete.
+  Replay seed and traversal predicates remain the original selected reference
+  corridor, so support expansion cannot make out-of-corridor graph nodes
+  eligible. Replay result metadata records the ordered stage and filter policy.
+
+## Chunk-local optimal Fiberlet-route diagnostic
+
+- `vc_fiberlets chunk-route-stats` is a read-only graph diagnostic using the
+  regular on-demand anchor and fiberlet cache infrastructure. Its analysis
+  chunk is an axis-aligned, half-open base-coordinate box `[minimum, maximum)`
+  selected by a base-XYZ minimum and a base-voxel side. The analysis box is
+  independent of persistent cache chunk ownership and replay lookahead; route
+  traversal continues until first exit even when it exceeds either side or the
+  regular replay horizon.
+- An anchor belongs to the analysis chunk according to its stored base-space
+  position. The analyzed physical-fiberlet population contains every fiberlet
+  with at least one endpoint inside. A directed outside-to-inside arc is an
+  entry and an inside-to-outside arc is an exit. A route starts with its entry
+  arc and terminates at its first exit; an outside/outside fiberlet is not an
+  internal graph decision and is excluded.
+- Routes are simple. Entry initialization marks both the outside source and
+  inside target visited, and every later target is rejected when that anchor
+  already occurs in the route. Consequently neither an anchor nor a physical
+  fiberlet can be revisited. A route may curve back spatially and leave through
+  any face only through a sequence of ordinary valid joins; this never permits
+  a cycle or an unconstrained turn.
+- Every transition uses the same strict maximum anchor-join angle, prediction
+  validity check, and normal/tangent-aware local join objective as regular
+  cached replay. Entry, internal, and first-exit edge costs and intervening
+  joins are each charged exactly once. The selected stored-float or fixed
+  sqrt-`uint16` edge-cost view is explicit; join costs remain float.
+- Each entry is solved independently by exact nonnegative additive-cost search.
+  All exactly equal minimum-loss completions contribute to the retained union.
+  The diagnostic reports reachable entries, tied optima, route length/loss
+  distributions, and the union of inside anchors and physical fiberlets used
+  by any optimum. Internal-Fiberlet before/after counts and reduction are
+  reported independently of boundary-crossing entry/exit Fiberlets. Exceeding
+  the per-entry state bound, which defaults to 5,000,000 generated states,
+  fails the complete diagnostic rather than publishing partial pruning
+  statistics.
+- Missing anchor or fiberlet chunks are generated and persisted through the
+  same `FiberletOnDemandPreprocessor`, separate cache participants, dependency
+  halo, serialization, and shared decoded-byte LRU used by tracing. Generated
+  payloads are canonical full storage chunks whose identity does not depend on
+  the analysis box. Existing compatible chunks are reused; a hot pass does not
+  rewrite them. Incompatible metadata, generation/decode failure, invalid
+  costs, or invalid geometry fail the complete diagnostic. The command never
+  rewrites or prunes existing graph payloads and never marks a partial cache
+  complete.
+- Staged regional mode accepts an ordered, repeatable sequence of cubic
+  analysis sides and global base-XYZ offsets plus a selected half-open bbox.
+  Offsets are normalized modulo their side. Each stage enumerates every
+  complete global-lattice box contained by the selected bbox in canonical
+  Z/Y/X order. Analysis boxes need not align with anchor cells or storage
+  chunks. Every derived stage uses separate temporary anchor and Fiberlet
+  overlays with exactly the initial datasets' storage layout and encoding; the
+  initial persistent caches are never rewritten.
+- Invocation-local stage overlays use one shared, bounded write-back LRU of
+  canonical serialized chunk bytes. Dirty anchor chunks and atomic
+  prefix/route owner pairs remain in memory and are read there by later boxes
+  and stages. They are not written merely to move between stages. When the
+  shared `--cache-gib` allowance is exhausted, deterministic LRU victims spill
+  through bounded asynchronous atomic writes; resident and queued/writing
+  bytes remain charged until their storage is released, and the ordinary
+  decoded-chunk allowance is reduced by the same amount. A prefix/route pair is
+  one eviction, visibility, and failure unit. Unspilled temporary bytes are
+  discarded only after all caches stop and outstanding spills drain.
+- Detailed stage payload hashes cover the logical union of metadata, spilled
+  files, and current memory/pending chunks without forcing a flush. Newer
+  in-memory bytes shadow an older spilled file at the same relative path. This
+  logical hash must equal the hash of fully durable identical payloads.
+- A missing upper chunk falls through unchanged to the preceding layer. An
+  explicit empty payload shadows lower data through arbitrary layer depth.
+  Fiberlet fallback requires both prefix and route members to be absent;
+  partial pairs, corrupt upper payloads, and incompatible coordinate/layout,
+  storage, quantization, source, or processing contracts are errors.
+- Boxes within a stage execute serially, and an overlapping later box reads
+  earlier writes from that same stage. Only a Fiberlet whose canonical first
+  endpoint position is inside the current box is eligible for removal. Every
+  affected initial-layout owner chunk is rewritten from its effective current
+  payload, including a canonical owner outside the geometrically intersected
+  chunks. Publication must be a strict record subset: retained anchor,
+  prefix, and route fields remain exactly unchanged, and removed IDs can never
+  be restored by a later box or stage. Explicit empty touched chunks are
+  persisted in the temporary layer.
+- An inside anchor is removed only if the effective graph after the proposed
+  Fiberlet update contains no incident surviving Fiberlet. Outside-owned and
+  lower-layer incident Fiberlets therefore retain it. Derived stage layers are
+  invocation-local and removed after final reporting; persistent/completed
+  reduction layers require a later publication protocol.
+- Each stage reports only geometry in the union of its complete analysis
+  boxes: inside anchors, the canonical union of all incident Fiberlets, and the
+  canonical union of Fiberlets with both endpoints inside one complete stage
+  box. A Fiberlet crossing between adjacent stage boxes is therefore `all`,
+  not `interior`. Original, inherited input, and output populations use that
+  identical stage-local domain, so offset stages never count untouched
+  selected-bbox geometry. The joint report separately compares original and
+  final anchors, all incident Fiberlets, and interior Fiberlets over the
+  complete selected bbox. Sequential local pruning is deterministic and
+  monotone but does not prove preservation of a globally optimal replay route
+  for arbitrary later boundaries.
+- Exact analysis and simplification consume the same immutable materialized
+  local graph for a box. Materialization loads every required anchor, prefix,
+  and route owner once, applies the configured anchor view once, and constructs
+  arcs and transitions without point cache queries. Transition construction,
+  entry searches, serialization, and independent owner-chunk writes may
+  execute through reusable worker pools and canonical index slots, with
+  deterministic lowest-index failure selection. Exact entry-search workers
+  read the immutable local graph through fixed, disjoint index partitions and
+  own all queue, ancestry, metric, and terminal scratch; their hot search loops
+  perform no scheduling or synchronization. Every replacement is prepared from
+  the old graph before Fiberlet prefix/route pairs are published; anchor chunks
+  publish only after all Fiberlet pairs. Box and stage order remains serial and
+  canonical.
+- Each processed box additionally produces an exact in-memory simplification
+  report. A directed state is proven dead only when it is absent
+  from either entry-forward or exit-backward reachability. The analysis is
+  conservative under the simple-route no-revisit constraint: an uncertain
+  state may remain, but a valid route must not be removed. A physical Fiberlet
+  remains when either direction is live, and every later adjacency and macro
+  operation must retain the explicit per-direction live mask.
+- Every anchor unreferenced by the live physical graph is removed. Surviving
+  outside endpoints are explicit boundary portals with their original stable
+  anchor identity. Macro application must validate all hidden target anchors
+  against route history atomically before adding any of them.
+- A physical macro may cross only an interior anchor with exactly two live
+  incident physical Fiberlets and admissible mutual joins in both directions.
+  It stores the ordered original directed Fiberlet IDs, full anchor sequence,
+  edge losses, join losses, and lengths. Authoritative scoring replays those
+  scalars in the original order and association. Branches, portals, one-way
+  continuations, and cycles stop physical contraction.
+- Directed one-successor states are reported separately. Disjoint directed
+  contraction additionally requires a unique predecessor; maximal forced
+  continuation descriptors may overlap at convergence so arbitrary reached
+  states can use them without changing graph choices. Cycles remain explicit.
+- A physical Fiberlet ID is already the canonical exact endpoint-key pair.
+  Exact same-endpoint duplicates are invalid input. Distinct endpoint variants
+  must not be removed as cost-dominated because doing so changes the valid route
+  set under path-dependent visited-anchor histories. Macro representations are
+  in-memory references to original Fiberlets and must not be serialized as an
+  ordinary single-Fiberlet lattice route.
+
+- Dense-reference matching is monotone and local. Greedy supplies its nominal
+  step and graph replay each actual dense fiberlet edge length. Failure is the
+  first Lasagna-oriented threshold error strictly above `--fail T`; equality is
+  accepted. The already selected Euclidean reference match is not changed.
+  At that matched reference point, the evaluator samples and normalizes the
+  local Lasagna surface normal in the sampler's declared working scale, then
+  decomposes the base-coordinate error into normal magnitude `dn` and full 2D
+  tangent-plane magnitude `dt`. The threshold error is
+  `sqrt(dn^2 + (dt/4)^2)`, giving ellipsoid radii `T` normal and `4T`
+  tangential. Tangential means the plane orthogonal to the Lasagna surface
+  normal, not the learned fiber tangent. A missing, invalid, non-finite, or
+  zero-length normal conservatively uses the old Euclidean error with no
+  relaxation. At `T=0`, exact zero is accepted and every nonzero error fails.
+  Native
+  termination, graph exhaustion, and lack of an admissible graph seed are typed
+  failures rather than successful termination.
+- Fiberlet seed selection first rejects Euclidean distances above `4T`, then
+  applies the exact same Lasagna-oriented evaluator inclusively and orders
+  usable seeds by reference arc, threshold error ratio, and node ID. The seed's
+  first stored match contains the same complete measurement as later route
+  points.
+- Each failure terminates only the current evaluator segment. Reset advances by
+  at least its nominal step, samples the exact authoritative reference point and
+  fitted forward nonzero-edge tangent, clears graph incoming-join history, and
+  starts the next segment. Reset count is bounded by reference length. Graph
+  replay finishes a failure-containing fiberlet before reseeding, while the
+  immutable first failing dense point remains the event location. At the
+  selected end, threshold failure takes precedence over completion and later
+  samples are not evaluated. An end inside a fiberlet retains the selected
+  edge's full identity/cost accounting but only route samples through the bound;
+  it has no stop anchor and is marked `terminal_partial_edge`. Reset jumps are
+  distinct segments and must never be emitted as connecting line geometry.
+- Every evaluated match stores explicit Euclidean, optional normal, optional
+  tangential, threshold-equivalent, ratio, and local-normal-valid fields. A
+  distance failure copies the exact terminal match measurement. Graph exhaustion
+  retains the existing last-match diagnostics; failures without an evaluated
+  point use null diagnostics. Strict publication validates finiteness,
+  non-negativity, component reconstruction, the ellipsoid formula, ratio,
+  invalid-normal fallback, geometry distance, and failure/match identity.
+  Failure records also contain tracer-local index, typed reason, matched reference
+  arc and evaluated-interval fraction, optional evaluator point/index,
+  segment index, and segment-local point index. Missing-seed or termination
+  events still carry an exact reference reset point. Each callback prints the
+  current independent greedy/fiberlet counters. Callback arrival order is only
+  diagnostic; persisted visualization order is canonical by reference arc,
+  tracer enum, and tracer-local index. Both async evaluations are joined before
+  either exception is propagated.
+- The authoritative strict version-2 root stores source/scale/config bindings,
+  requested/effective interval metadata, exact selected reference geometry,
+  complete segmented evaluator results and
+  matches, failure arrays/counts, trace OBJ/JSON descriptors, and an ordered
+  visualization index. Runs publish an immutable `runs/<content-hash>`
+  generation before atomically replacing `fiber_replay.json`. Each visualization
+  also has an atomically replaced stable top-level alias named
+  `fiber_replay_visualization.<tracer>.<failure-index>.json`; its artifact paths
+  reference the current immutable generation. Strict version-1
+  single-visualization artifacts remain readable and normalize their trace and
+  optional graph route into the current segmented display representation.
+  One authoritative threshold descriptor records the ellipsoid shape, normal
+  radius, fixed tangential factor/radius, strict comparison, and invalid-normal
+  policy; nested greedy and fiberlet descriptors are generated from the same
+  values. The unpublished ambiguous `error_base_voxels` and `error_ratio` replay
+  keys are not emitted and have no repair path.
+- Visualization is disabled by default. `--vis` creates one diagnostic tube per
+  failure using exact reference bounds `[failure_arc-along,
+  failure_arc+along]` clipped to the evaluated interval and the configured
+  radius. These local anchors, stages, paths, and graph are diagnostics only;
+  the evaluators are not rerun. The local manifest also references cropped
+  full-run reference and both segmented evaluator traces plus its failure
+  marker. `--along` is visualization-only and does not limit evaluation.
+- Every newly generated failure visualization also contains exactly three
+  self-contained sheet-aligned OBJ/MTL/TIFF triples for the reference, greedy,
+  and fiberlet traces. `--vis` requires `--volume` to name one concrete local
+  uint8 OME-Zarr dataset array/group, not the pyramid root. The group must be
+  advertised by its parent `multiscales` metadata. The producer maps
+  base-volume trace coordinates into that group with the declared dataset/base
+  transforms before calling the shared renderer.
+  Geometry is produced directly by `buildLineViewSurfaces()` with the unchanged
+  default `LineViewConfig`: the exact trace points are the longitudinal samples,
+  the normal-aligned surface has 21 cross samples, and its existing inferred
+  width and transported frame are retained. Each surface is rendered through
+  the same extracted helper used by `vc_lasagna_line_probe`, including blocking
+  dependency prefetch and `sampleCoordsFineToCoarse()`. Before that unchanged
+  renderer is called at scale one, each component's coordinate grid is
+  endpoint-preservingly resampled from its maximum row/column arc extent in the
+  selected group's voxel coordinates. The resulting grid has at least two
+  samples per axis and no more than one group voxel of arc per texel. Replay has
+  no independent render-scale option.
+  No replay-specific surface builder, mask renderer, uint16 path, or PNG path
+  exists. Evaluator resets and clipped trace boundaries remain disconnected
+  surface components. Their standard VC3D textured meshes are packed into one
+  grayscale atlas per trace type with a replicated one-pixel border and an
+  affine transform of their existing UVs. Empty trace types use an empty OBJ,
+  valid MTL, and 1x1 TIFF. The manifest records the selected group path, its
+  actual base-to-group scale/offset transform and shape, native-grid contract, and
+  artifact hashes.
+- The many-fiber `replay-set --render` entrypoint additionally renders inferred
+  presence beside the CT modality as separate image sets. It uses the same
+  overview geometry, stored matches, overlays, component gaps and pagination.
+  Presence uses the canonical prediction lattice and maximum presence across
+  options from complete presence/nx/ny products; sampling invokes the case-local
+  readiness gate before reading interpolation corners. Inference and render-lock
+  waits release CPU permits, and rendering finishes before case completion.
+  Legacy concrete local CT group validation is unchanged. This batch entrypoint
+  also accepts `ct_base_volume=true` for a local/remote uint8 CT pyramid whose
+  level-zero shape matches prediction base geometry; its transform is identity.
+  The live runner supplies its input pyramid automatically when no explicit CT
+  binding is present. Remote selected-array transforms are not inferred.
+  Rendering remains off by default and uses the completed in-memory replay.
+- Independently of the failure-local artifacts, every replay run with `--vis`
+  publishes indexed full-selected-interval direct-inspection JPEGs. It builds
+  the reference `LineModel` and one line model per at-least-two-point fiberlet
+  replay segment through one shared batched normal-sampling/default-
+  `buildLineViewSurfaces()` helper. Both the reference- and fiberlet-centered
+  top surfaces and side slices use the same shared fine-to-coarse CT renderer
+  as the failure strips. The renderer first constructs
+  the native selected-group coordinate grid and passes render scale `8` to that
+  shared renderer, producing eight samples per native-grid interval without a
+  post-render resize. The per-failure OBJ/MTL/TIFF strips retain their existing
+  native selected-group sampling. Every wrapped block contains reference top,
+  reference side, fiberlet top, and fiberlet side in that order. The reference
+  centerline, greedy trace, and fiberlet trace are overlaid in yellow, red, and
+  cyan respectively. Greedy and fiberlet
+  points project through their strict stored matched absolute reference arcs;
+  the selected interval begin is subtracted before mapping into the returned
+  surfaces' authoritative raw coordinate grids. Every non-seed greedy point
+  and every fiberlet point must have contiguous, monotonic, in-range match
+  metadata, and reset segments remain disconnected polylines. In fiberlet-
+  centered strips, stored matched reference points are projected at their
+  corresponding route-point columns, greedy points are interpolated only
+  through the component's stored monotonic match arcs, and the cyan fiberlet is
+  the actual surface centerline. Samples outside a component's covered arc are
+  omitted; samples covered by overlapping reset-component intervals appear in
+  each component. Rendered components are concatenated in source-segment order
+  with eight black columns between them. The root records source segment,
+  matched arc interval, top/side row and column ranges, and separator semantics.
+  No nearest-point rematching or alternate frame construction is permitted.
+  Every failure is
+  marked at its stored pre-reset error arc by a three-pixel full-strip-height
+  vertical band: red for greedy and cyan for fiberlet. Coincident marker pixels
+  are magenta. The later reset seed is not marked.
+- The overview vertically stacks complete four-strip blocks and left-aligns
+  unequal widths on black. When any 8x strip exceeds `32000` columns, all four
+  are partitioned into the same minimum number of equal-progress-fraction
+  blocks. Each strip independently maps those fractions to exact half-open
+  column ranges; every rasterized column is copied exactly once without
+  resizing. As many complete blocks as fit are stacked in one JPEG. A block is
+  never split across files; remaining blocks continue in the next indexed JPEG.
+  Every output dimension must be at most `65000` pixels, and one complete block
+  that cannot fit is rejected before allocation. It
+  covers exactly the selected replay geometry, so `--length` also bounds this image. It is written before
+  generation hashing as `replay/full_strip.NNNNNN.jpg`, described by the version-2
+  root with selected arcs/reference-point count, source group transform and
+  shape, full unwrapped top/side dimensions, render scale, marker semantics,
+  exact page/block ranges, component placements, colors, paths, and content
+  hashes, and copied to stable top-level `fiber_replay.NNNNNN.jpg` aliases. A
+  successful shorter or non-visual run removes stale indexed aliases and the
+  unpublished singular alias. This root overview is
+  separate from the per-failure OBJ/MTL/TIFF napari artifacts and is not a
+  direct visualization manifest.
+- The napari viewer takes one direct visualization manifest through `--replay`;
+  there is no index argument. An aggregate root is discovery/reporting data and
+  is rejected with either a directly usable manifest path or a request to rerun
+  with `--vis`. The viewer rejects manual crop/anchor/path arguments, path
+  escapes, hash/geometry mismatches, and malformed strict state. Reload rereads
+  the same stable direct alias and does not reload the external presence Zarr.
+- Replay strip artifacts are an optional all-three-or-none part of a
+  visualization. When present, the viewer strictly resolves each OBJ's local
+  MTL and each MTL's local hashed TIFF, validates the standard textured-mesh
+  topology, atlas padding and transformed UVs, reads the
+  stored finite grayscale texels, bilinearly tessellates the validated coarse
+  OBJ surface to one displayed vertex per native-grid texel, derives
+  one shared p1/p99 display range, and creates independent hidden grayscale
+  napari Surface layers. It neither accepts a CT-volume argument nor opens the
+  recorded provenance path. Empty meshes remain valid empty layers. Reload
+  reparses geometry, faces, UVs, materials, and values from the nine artifacts and updates the
+  existing Surface layers without changing their display state. There is no
+  reader or repair path for the discarded replay-specific strip formats.
+- `vc_fiberlets benchmark` runs the exact shared local tube anchor/path
+  extraction without artifacts. Its interval starts at the first control point
+  and, when `--along` is omitted, extends through the reference end. An explicit
+  positive `--along` limits the interval to that many base voxels and remains
+  clamped at the reference end. Replay's separate visualization `--along`
+  remains a 128-base-voxel arclength half-window around each failure. The final
+  row reports
+  exact interval/radius, populations and rates, coordinate-call/unique-voxel/
+  owned-memory counts, DP nodes/rate, and per-stage wall/CPU/effective-core
+  timings.
+  Benchmark comparisons must retain identical inputs, parameters, build type,
+  and interval.
+- Benchmark and full replay extraction emit the same versioned
+  `fiberlet_extraction_profile version=26` key/value schema. The profile exposes
+  deterministic workload counters and finer anchor/fiberlet phase timings.
+  Enclosing phase fields are wall time, `_work_seconds` fields are summed
+  worker/candidate time, and CPU fields are process CPU time. Corner insertion
+  attempts count every positive-weight attempt; the existing sampled-voxel
+  count remains the deterministic globally unique union. Profiled phase sums
+  and residual elapsed time make uncovered overhead visible. Progress callback
+  cost remains in its enclosing phase. Diagnostics must not change sampling,
+  fitting, candidate generation, DP math, ordering, serialized artifacts, or
+  determinism.
+- Version 22 retains the version-21 split of robust direction proposals into
+  axis-producing and final membership-only calls. For each kind, logical visits count the complete
+  candidate range considered by the first pass, eligible visits count entries
+  passing the immutable validity/presence/direction predicate, indexed visits
+  count entries physically traversed by proposal scoring, and cutoff visits
+  count entries physically traversed while materializing retained membership.
+  The legacy local-tensor visit count remains two times complete logical
+  cardinality per proposal for comparison across implementations.
+- Proposal-buffer counters report complete-cardinality assignment/retained
+  storage initializations plus actual bytes initialized and copied into
+  returned evaluation state. They are diagnostics and do not change fitting
+  behavior.
+- Version 25 materializes compact robust-proposal evidence once per cell in
+  increasing logical-observation order. Each record stores float position,
+  already-normalized direction, presence, and its original logical destination;
+  both axis proposals and final membership reuse the same immutable records.
+  Invalid positions remain represented and naturally contribute zero Gaussian
+  mass. Full-support centroid, objective, peak, and final-support scans retain
+  their shared indexed observation ranges. The profile reports prepared record
+  count/size and summed preparation work, and bounded worker admission replaces
+  the former eligible-index scratch with the full record bytes.
+- Version 20 replaces pair-local tile sampling groups with bounded exact-union
+  partitions. Tiles remain in canonical order. Each partition merges exact X
+  intervals for structured `(z,y)` rows, samples every union coordinate once
+  in deterministic bounded batches, and joins sampling. Version 24 then builds
+  one compact observation and one presence gradient per partition-union voxel.
+  Tiles retain only dense uint32 local-to-union maps. Cell support and owned-
+  observation traversal remain in canonical tile-local Z/Y/X order, and a
+  shared gradient remains usable only where it was interior to that tile's
+  original sample bounds. Large extractions stream through multiple partitions
+  rather than requiring the whole union to remain resident.
+  Sampling and fitting worker counts are admitted independently against
+  `maximumConcurrentSampleBytes`; shared samples, row metadata, sampler scratch,
+  batch/error control, ready-cell queue storage, timing storage, tile buffers,
+  gradients, compact observations, and per-cell scratch are included in the
+  reported maximum live-byte ceiling. Every sampler call receives one lower-
+  level thread. A failed batch is selected by batch order and assigned to its
+  partition cells so final failure propagation remains canonical by cell.
+  Partition owners retain immutable compact observations until all published
+  cells finish. Version 20 reports partition count and duration quantiles, shared
+  batch count/maximum size, shared-sampling wall/CPU, shared/accounted bytes,
+  while version 24 separately reports shared-observation construction and tile
+  index-map worker time. Submitted voxels and shared-observation voxels count
+  partition unions; reused
+  voxels count tile occurrences not submitted. The exact whole-extraction tile
+  union remains a diagnostic and may be lower than submissions when bounded
+  partition boundaries repeat overlap.
+- Version 2 divides anchor fitting into exclusive summed-worker setup, seed
+  generation, seed-pair refinement, initialized-component finalization, local
+  direction/position refinement including backtracking, direction-conditioned
+  peak search, and final-evaluation phases. Their explicit profiled sum and
+  residual reconcile against total fitting work. It separately counts fitter
+  invocations/nonempty cells, seeds/pairs/pair iterations, local attempts and
+  accepted steps, backtracking evaluations, peak components, and observation
+  visits for every repeated assignment, tensor, objective, centroid,
+  refined-state, peak-response, and final-evaluation scan. Peak response
+  requests include grid-cache hits; computed-grid responses are cache misses;
+  acceptance responses are uncached subpixel evaluations. Seed-pair iterations
+  exclude their final reassignment/objective pass, and local attempts exclude
+  the initial refined-state evaluation. The legacy `anchor_fit_iterations`
+  field counts accepted cell-level refinement once per output component;
+  `anchor_fit_local_refinement_accepted_steps` is the canonical cell-level
+  value.
+- Version-2 observation-visit fields are logical operation counts. Exact broad
+  phases may avoid detailed kernel calculations while retaining these counts,
+  so before/after workloads and fitting decisions remain directly comparable.
+- Version 3 partitions local-refinement worker time into tensor proposals,
+  centroid proposals, and refined-state evaluations. The remaining parent time
+  is reported as local control work and includes setup, state interpolation,
+  acceptance/convergence decisions, and profiling overhead. These four values
+  reconcile to total local-refinement work. Refined-state evaluation includes
+  the initial state and every backtracking candidate and computes spatial
+  Gaussian support, directional evidence, assignments, and the normalized
+  objective.
+- Version 4 adds robust no-outlier/trimmed/non-unique/iteration-limit component
+  counts, candidate/actual trimmed and retained evidence mass, and spatial
+  candidate counts by halving depth. Tensor proposal time includes competitive
+  assignment, weighted histogram cutoff selection, and retained sampled-axis
+  aggregation. State-evaluation time contains fixed-direction spatial
+  objectives. Robust component and mass counters accumulate proposals across
+  bounded passes and are not final-population counts.
+- Version 6 separately reports logical gradient attempts and physical
+  tile-gradient computations. Tile gradients are constructed once and reused
+  by overlapping cell halos. Robust histogram/tensor accumulation, paired
+  spatial objectives, and transverse peak evaluation may regroup otherwise
+  equivalent floating-point operations; small numeric differences from
+  version 4 are accepted for this anchor fitter.
+- Version 13 adds solve-local prepared-node/index/state byte maxima, prepared
+  node count, reached-node and generated/valid/reused-edge counts, and separate
+  node-preparation worker time. DP visit/lookup counters exclude outgoing work
+  from the final interior layer because that layer transitions directly to the
+  sink. State-memory accounting is the global predecessor-state bytes, exact
+  retained transition-cost bytes, and the two largest adjacent rolling cost
+  layers; adjacent-layer populations are counted during parallel node
+  generation rather than by a separate serial pass.
+- Version 14 changes `interpolatedScoringPoints` to actual endpoint plus unique
+  lazy-node interpolations. It separately reports endpoint interpolations, lazy
+  requests, unique materializations, cache hits, maximum node-to-cache index
+  bytes, and shared prepared-scoring/page-index bytes retained during search.
+  Sparse interpolation timing samples use a fixed hash of canonical candidate
+  index and packed node key; exact resolution/materialization counts remain
+  complete and deterministic.
+- Version 15 adds `anchor_support_stencil_cells` and
+  `anchor_clipped_support_cells`. Their sum equals `anchor_work_cells`.
+  `anchor_candidate_observations` retains the represented sample-cube count,
+  while retained-observation and gradient counters retain their logical
+  populations when the support stencil avoids rejected-site tests.
+- Version 16 adds `anchor_fit_owned_discovery_observation_visits`,
+  `anchor_fit_owned_initialization_observation_visits`, and
+  `anchor_fit_avoided_owned_support_observation_visits`. Public fitting reports
+  coordinate-discovery and stable-filter visits. Production reports direct
+  owned visits and the visits avoided relative to its former two complete
+  support-range scans; existing logical observation populations are unchanged.
+- Version 17 splits direction-conditioned peak data into 16-byte float32 hot
+  response records, parallel 32-bit evidence indices, and 16-byte retained
+  evidence records. Invalid-gradient retained observations remain evidence
+  because their aligned weight contributes to gradient coverage. Prepared
+  response/evidence counters report populations; response-observation visits
+  count every hot scan, while evidence-observation visits count indexed records
+  actually loaded after radial rejection. Record sizes and maximum temporary
+  peak-observation storage are reported explicitly.
+- Version 23 moves peak signal into sparse evidence. Hot response records are
+  12-byte float32 geometry records; sparse evidence records are 20 bytes and
+  contain signal plus direction/gradient evidence. Every radial survivor still
+  contributes to the denominator. Numerator and gradient terms are evaluated
+  only for indexed evidence; nonzero numerator contribution order and all peak
+  equations remain unchanged. Nonzero signal implies evidence, but valid
+  positive-alignment evidence may contain zero signal.
+- Version 29 removes the parallel dense peak-evidence index. Dense 12-byte
+  response records are traversed only for the denominator; self-contained
+  32-byte sparse evidence records carry transverse/axial geometry, signal, and
+  gradient state for a second traversal. Denominator and evidence accumulator
+  orders remain the original observation order. The obsolete evidence-index
+  record-size profile field is removed.
+- Peak response implementations may regroup equivalent accumulation work;
+  exact floating-point identity and fixed accumulation order are not required.
+  Deterministic repeatability, anchor axis/position distributions, populations,
+  replay metrics, failures, and visual quality remain the acceptance gates.
+- Direction-conditioned peak observations, transverse response math,
+  persistent anchor state, accepted positions, diagnostics, and serialized
+  output use float32. Peak ties and downstream DP counts need not be
+  numerically identical, but retained populations and replay quality must be
+  checked on the canonical workload.
+- Stored-prediction samplers may retain their shared double-valued interface,
+  but anchor extraction must normalize and range-check each returned sample
+  once into a float32 tile. Reused tile halos, gradients, compact observations,
+  and fitting must never retain the shared double sample. Float convergence,
+  matrix, geometry, and response-comparison tolerances must be representable
+  and effective at the magnitude where they are applied.
+- Float32 anchor/fiberlet grids must have nonzero extents no larger than
+  `2^24` on every axis, preserving exact integer voxel identity. Base-space
+  serialization and OBJ output must fail instead of emitting coordinates that
+  overflow float32.
+- The existing double principal-axis API retains its historical names. The
+  float32 API uses explicit `*F` names so brace-initialized double callers do
+  not become ambiguous.
+- Final refined-anchor support evaluation uses one float32 reduction for both
+  compact production observations and direct public observations. All fields
+  are consumed directly and public directions are normalized safely in
+  float32. All finite-position sites contribute to the Gaussian
+  denominator independently of direction/presence usability or robust
+  membership. Aligned support, directional coherence, and combined objective
+  remain float32 in persistent anchor state. Exact numeric identity is not
+  required; deterministic support
+  classification and canonical replay quality are the contract.
+- The bounded direction-conditioned peak grid uses a checked row-major layout.
+  Physical grid points and feasibility are constructed once in canonical
+  first/second-index order; computed response values use direct cache slots
+  with a separate computed-state byte. Hill-climb traversal, lexicographic
+  tie-breaking, response arithmetic, separate float response coordinates, the
+  no-feasible-slot center fallback, and uncached subpixel acceptance semantics
+  remain unchanged. Existing profile request, computed-grid, and acceptance
+  response counters retain their definitions.
+- The hot replay-tube filter snapshots authoritative clipped source segments in
+  prediction coordinates as float32 and uses a packed Boost.Geometry R-tree of
+  radius-expanded segment AABBs. A point is inside when any candidate's
+  continuous float32 point-to-segment distance is within the float32 radius.
+  Candidate order and the linear projection function's `1e-12` tie behavior are
+  intentionally irrelevant to this boolean geometric-union predicate. The
+  snapshot owns its tree and segment storage, is immutable after construction,
+  and supports concurrent const queries. Public replay-tube distance methods
+  retain the existing double-precision linear projection for diagnostics.
+- Fiberlet performance changes are measurement-first. Exact legacy numeric
+  identity is not required for the robust anchor fitter or the float32
+  replay-tube/local-corridor filters. Robust fitting is accepted through
+  deterministic repeatability, matched anchor axis/position distributions,
+  anchor/fiberlet/graph populations, downstream replay metrics, and visual
+  inspection. Float32 containment comparisons still quantify boundary changes.
+  A comparison records
+  the command, input identities, commit, build
+  type and flags, host, thread count, decoded/disk/OS cache state, warmup policy,
+  repeated-run distribution, and exact output hashes or bytes in addition to
+  aggregate correctness metrics.
+
+# Anchor pipeline stage diagnostics
+
+- Anchor extraction assigns stable per-cell diagnostic IDs to the two fitted
+  attempts before robust component removal, compaction, or component sorting.
+  Both attempts are emitted for every selected cell; unavailable or robustly
+  degenerate directions use null geometry. No merge successor is created.
+- Five strict `vc_fiberlet_anchor_stage` version-1 JSON files capture the real
+  boundaries `initialized`, `refined`, `support`, `selection`, and `nms`.
+  External NMS-context cells may be referenced as suppressors but never enter
+  the selected stage populations.
+- Per-record transitions distinguish empty/degenerate initialization or robust
+  direction removal, refined empty or below-support rejection,
+  outside-selection rejection, and
+  NMS suppression. Threshold decisions store their tested value and threshold;
+  NMS rejection stores the actual higher-ranked suppressor used by the existing
+  pass, its ranking fields, and whether it is external context.
+- Stage files emitted by one extraction bind the same source hash, grid/scale,
+  complete selected-cell set, extraction parameters, and glyph length. The
+  napari visualization reader treats extraction parameters as opaque optional
+  producer metadata: parameter additions, removals, value changes, or absence
+  cannot reject otherwise compatible geometry. Cross-stage visualization
+  checks bind only the source, coordinates, selection, and glyph length. They
+  still validate canonical identities/order, merge lineage, survivor subsets,
+  unchanged geometry/metrics across filter-only stages, and equality between
+  final NMS geometry and `anchors.obj`.
+- Stage capture copies existing computations and must not change fitting,
+  filtering, NMS ranking, final `anchors.json`/OBJ bytes, or fiberlet paths.
+  `anchors.json` remains the only authoritative path-stage input.
+- Napari displays all five anchor diagnostic stages by default, with one Shapes
+  layer per nonempty stage using stable colors, transition/metric features,
+  common clipping, and width controls. Only NMS is initially visible while the
+  duplicate final-anchor OBJ layer starts hidden. `--no-anchor-stages` is the
+  explicit fast-start opt-out and displays only final centre/direction glyphs.
+- Failed-replay viewing provides an independent `Anchor radius` in base voxels.
+  Each final/stage glyph uses its symmetric center, each cell-center point uses
+  itself, and each refinement offset uses its anchor target. Exact Euclidean
+  point-to-segment distance is measured against the union of the reference
+  fiber and complete failed trace; a glyph remains rendered when its distance
+  is at most the radius. Anchor radius defaults to 32 base voxels independently
+  of the extraction-tube radius. The presence EDT display mask is independently
+  controlled and also defaults to 32 base voxels.
+- Anchor distance filtering physically subsets each final/stage glyph Shapes
+  layer, the cell-center Points layer, and the refinement-offset Shapes layer.
+  Out-of-radius geometry must be absent from the displayed layer rather than
+  transparent or merely recolored, because hidden geometry must not participate
+  in depth rendering. The controller retains defensive full-population copies
+  of geometry, every aligned stage-feature column, exact distances, and source
+  order, then reconstructs the visible subset on each radius change. Filtering
+  preserves layer identity/order, widths/sizes, colors, clipping, layer
+  visibility, and full artifact counts in layer names; item selections are
+  cleared when displayed indices change. It does not affect the independently
+  controlled fiberlet-path or presence-EDT filters.
+- Failed-replay viewing provides an independent `Fiberlet radius`, defaulting
+  to 16 base voxels. Each fiberlet's distance is the exact minimum 3D
+  segment-to-segment distance between its complete rendered polyline and the
+  union of the reference fiber and failed trace. Degenerate segments are valid.
+  A path is retained inclusively when that distance is at most the radius, so
+  only fiberlets completely outside the threshold are physically absent from
+  the Shapes layer. The controller retains full geometry and aligned quality
+  features so widening restores source order, coloring, and widths.
+- Failed-replay mode creates stable typed layers for final anchors, cell
+  centers, refinement offsets, and fiberlets even when an artifact population
+  is empty, plus all five anchor stages unless diagnostic loading was explicitly
+  disabled. The
+  `Reload artifacts` command always rereads the original direct visualization
+  manifest, follows its newly published immutable hashed generation, and passes
+  it through the startup strict loaders. Version-1 inputs reread their original
+  single-visualization path.
+- In-process artifact reload requires the same failed-replay artifact contract,
+  fiber-prediction manifest content hash, prediction shape/scale, displayed
+  Zarr level transform, base crop, extraction-tube radius, and the same optional
+  stage-layer topology.
+  Counts may cross zero; geometry, metrics, reference/trace/failure data, and
+  generation paths may change. An incompatible replacement leaves the current
+  display unchanged and reports that restart is required.
+- Reload never resolves or opens the presence Zarr and retains the exact lazy
+  source crop object. It recomputes only the derived reference/trace EDT, exact
+  anchor distances, and exact fiberlet-polyline distances; creates a new lazy
+  mask graph over that same source; and reapplies the current independent
+  presence, anchor, and fiberlet radius values.
+- Reload preparation completes strict parsing, compatibility, features, names,
+  and distance calculations before layer mutation. Commit updates existing
+  layers under blocked events, clears stale item selections, and preserves
+  layer identity/order, visibility, clipping, widths/sizes, path colormap,
+  volume rendering, crop controls, and radius controls. A commit error rolls all
+  artifact layers, full-population filter sources, and derived controller state
+  back before it is reported. Reload reapplies the current anchor and fiberlet
+  radii to their replacement full sources, including transitions between empty
+  and nonempty displayed populations; later widening uses replacement full
+  sources rather than subsets visible during reload.
+
+# Fiberlet storage quantization experiment
+
+- `vc_fiberlets quantization-benchmark` runs one float baseline and one selected
+  quantized scenario through persistent, fingerprinted on-demand caches. It
+  never materializes the complete corridor graph.
+  The default scenario is `combined_q4_axis_cost_u8`; the command requires an
+  output directory so interrupted and warm runs reuse complete chunks.
+  The standard matrix has 19 entries: one baseline and 18 non-baseline rows in
+  deterministic order. The unpublished `combined_q1_axis_cost_u8` row is
+  replaced by `position_q1_8_compact_axis_cost_sqrt_u16_max256`; no alias is
+  retained.
+- One canonical float anchor dataset belongs to each exact source, extraction,
+  corridor, grid, and chunk-layout identity. Baseline and every geometry or cost
+  scenario reuse that dataset. Quantization never changes serialized anchors or
+  reruns anchor extraction.
+- Evaluation position quantum is a finite positive spacing in base voxels;
+  zero selects exact float positions. Fractional values are permitted and must
+  survive scenario state, cache fingerprints, JSON, and CLI output without
+  integer truncation. Chunk side divided by the quantum must be an integral,
+  representable bin count. This evaluation type does not change the unrelated
+  compact physical storage header's integer quantum.
+- Quantized endpoints are globally nearest-rounded in base coordinates before
+  conversion back to prediction coordinates and DP. Positive half steps round
+  upward. The regular DP
+  constructs the resulting Hermite domain and chooses a new interior route; a
+  baseline `(u,v)` route must not be transplanted onto changed endpoint planes.
+- Stable anchor IDs remain source cell coordinate plus component `0/1`.
+  Rounded positions are geometry, not identity: anchors from adjacent cells may
+  legitimately round to the same base coordinate and must not be merged.
+- Duplicate/unresolvable source-cell keys, out-of-volume endpoints, or
+  unsupported local-position/delta widths invalidate the complete scenario.
+  Ordinary candidate rejection or no-path after otherwise valid quantization is
+  a measured result and remains visible in the scenario graph population.
+- Raw-total cost offset and scale are float32 per first-endpoint spatial chunk. Encoding
+  nearest-rounds onto the complete unsigned range with an exact-maximum case;
+  decoding evaluates float32 `offset + scale * code`. Raw-total scenarios use
+  the decoded scalar as the authoritative edge total. Fixed nonlinear density
+  scenario instead uses the fixed constant `Cmax=256` and encodes
+  `round(65535 * sqrt(clamp((total / path_length) / 256, 0, 1)))`. Decoding uses
+  `256 * (code / 65535)^2 * path_length`. No chunk contents or observed values
+  influence this mapping. The same geometry's stored positive float32 path
+  length is used throughout. Entering join costs remain unquantized float
+  components and are added exactly once.
+- Each geometry scenario derives a chunk-local endpoint view from canonical
+  anchors and runs fresh candidate generation, Hermite construction, dense
+  sampling, and DP. Compact direction changes only the fitted axis and retains
+  canonical scoring. Position quantization also resamples prediction direction,
+  presence, validity, and Lasagna normal fields at every rounded endpoint.
+  It reuses no float candidate, interior route, endpoint step, path length, or
+  cost. Source cell/component IDs address evaluation-cache data and define
+  canonical graph ordering; quantized positions affect geometry only.
+- Derived anchor chunks use single-flight construction and a bounded LRU. The
+  same derived chunk view supplies candidate DP, replay seeds, individual
+  endpoint lookup, arcs, route reconstruction, transitions, and compact-cost
+  ownership; no consumer may mix canonical and transformed endpoint geometry.
+- Reports include explicit scalar settings, logical-key collisions, failure
+  counts, completed fractions, bounded decoded residency, wall/CPU time,
+  symmetric Euclidean/normal/tangential line-distance distributions, and both
+  replay-to-reference distributions. Anchor/candidate and point-index identity
+  are not tracing-quality metrics.
+- Batch replay teardown cancels and drains only its own speculative cache task
+  groups. Fiberlet work drains before anchor work because an active fiberlet
+  producer may synchronously request anchor dependencies. Issued persistent
+  writes finish before the replay context is released, and each completed
+  machine-readable result row is flushed immediately.
+- Geometry-cache identity separates generated fiberlets from the replay cost
+  view. Its generation settings contain only endpoint position quantum and
+  fitted-direction encoding. Float, raw `uint8`, raw `uint16`, and fixed-sqrt
+  `uint16` cost view for one
+  geometry share the same fiberlet prefixes, routes, path lengths, endpoint
+  steps, and float component costs. All of them share the one canonical anchor
+  cache; cost-only views also reuse baseline fiberlets.
+- `compact_axis`, `compact_axis_cost_u8`, `compact_axis_cost_u16`, and
+  `compact_axis_cost_sqrt_u16_max256` all use float positions and the
+  identical compact-direction geometry cache. Their selected graph costs are
+  respectively float, raw-total `uint8`, raw-total `uint16`, and fixed-sqrt
+  density `uint16`; the
+  geometry namespace's opaque historical u8 compatibility tag does not select
+  graph cost precision and never changes persisted prefixes or routes.
+- Cache-backed fiberlet replay defaults to
+  `compact_axis_cost_sqrt_u16_max256`: exact float positions, compact fitted
+  directions, fixed sqrt-density `uint16` edge costs with ceiling 256, float
+  path lengths, and float join costs. The same profile must select both the
+  compact-direction fiberlet cache namespace and the graph cost view. Canonical
+  anchors remain exact float. The all-float correctness oracle is selected
+  explicitly and cannot inherit this production default.
+- Replay bundles record the selected evaluation profile. Eager graph replay is
+  the explicit exact-float oracle and must identify itself as such; it is not a
+  compact-cache parity mode.
+- This default does not change the unpublished `CompactQuantized` payload
+  schema. On-demand evaluation cache payloads remain `Float32Cache`; the
+  accepted profile is the baseline for subsequent compact resident/persistent
+  representation work.
+- Compact costs use one affine range per first-endpoint storage chunk. Building
+  that stable range may complete missing on-demand chunks in the shared
+  geometry cache, but it must not create a cost-specific cache namespace or
+  rewrite existing geometry payloads.
+- Fixed-sqrt density cost has no spatial owner or adaptive range. Its domain and
+  ceiling are replay-view state only: they are absent from geometry
+  fingerprints, cache roots, dataset metadata, and persisted payloads. A warm
+  fixed-sqrt replay reads the existing float total and path length and performs
+  no range scan, anchor extraction, DP/fiberlet generation, or payload rewrite.
+- For compatibility with already completed experiments, every non-float
+  geometry cache uses the historical internal `cost_bits=8` namespace tag.
+  This tag is opaque cache identity data and cannot reach preprocessing. The
+  replay graph alone receives the selected cost precision. Cache chunk side is
+  still shared physical layout metadata and remains part of cache identity.
+- `--scenario NAME` selects one exact matrix scenario plus the baseline. The
+  focused `combined_q4_axis_cost_u8` scenario means a 4-base-voxel endpoint
+  position quantum, the existing compact two-byte fitted-direction encoding,
+  and per-chunk 8-bit total cost. An unknown scenario name is an error.
+- `position_q1_8_compact_axis_cost_sqrt_u16_max256` means a 0.125-base-voxel
+  endpoint quantum, compact fitted directions, and fixed-sqrt density `uint16`
+  cost with ceiling 256. At prediction-to-base scale 8 this is 0.015625
+  prediction voxel, not 0.125 prediction voxel. All endpoint scoring fields are
+  resampled at the rounded position, fresh fiberlet geometry and DP are built,
+  and float join costs are added exactly once. It shares canonical float
+  anchors but owns a distinct position-plus-direction fiberlet cache; all cost
+  views with the same geometry reopen that cache.
+- `--scenario all` runs the baseline once, then emits 18 comparison rows for
+  every non-baseline standard scenario in deterministic matrix order. Each
+  geometry group is generated at most once and later cost views reopen it.
+- Maximum line distance treats replay restart segments as disconnected. It
+  samples both directions at no more than one base voxel spacing and projects
+  onto the other replay's actual segments. Normal/tangential components use the
+  existing replay measurement with the Lasagna normal at the projected point.
+- Baseline and scenario noise-floor summaries are directed from each replay to
+  the annotated reference. Replay segments are sampled at no more than one base
+  voxel spacing and projected onto actual reference segments. Euclidean,
+  Lasagna-normal, and Lasagna-tangential summaries contain count, minimum, mean,
+  median, and maximum in base voxels. Invalid reference normals are counted and
+  excluded only from the component summaries. Long extraction, DP, line-to-line,
+  and reference-distance stages report initial, periodic, and terminal progress.
+- Every quantization comparison atomically writes its complete baseline and
+  scenario `vc_fiberlet_graph_replay` JSON files and prints a deterministic
+  failure-window row. The window begins at the owning segment's reset-search
+  arc, extends through the complete failure-containing edge, and carries the
+  segment's graph seed key. `--arc` and `--length` select that base-voxel
+  interval; `--seed-key` forces the original first seed so prior consumed-node
+  state cannot change the focused replay. Focused diagnostics retain the full
+  corridor cache identity, disable prefetch, and request only chunks touched by
+  seed selection and beam traversal. They persist every final ranked beam
+  frontier with logical routes, geometry, decomposed edge/join costs, length,
+  and density, plus a comparison artifact containing the first selected-route
+  difference, cross-ranks, and maximum paired-route distance.
+- Every full or focused comparison also records one lightweight cost entry for
+  each actually committed fiberlet; lookahead alternatives are not counted.
+  `route-cost-statistics-<scenario>.json` reports complete-route and
+  failure-excluded min/mean/median/max/sum distributions for combined, edge,
+  transition, and decomposed objective loss per prediction voxel. Every value
+  in these distributions is the committed occurrence's component cost divided
+  by its edge path length; raw per-fiberlet cost distributions are not exposed
+  because replay does not compare them across unequal lengths. Aggregate raw
+  loss and aggregate path length remain only to verify the length-weighted
+  whole-route density. Failure exclusion uses
+  the baseline replay's failure arcs for both baseline and scenario statistics
+  so they describe the same reference neighborhoods. An occurrence is excluded
+  exactly when its matched-reference interval intersects a closed
+  `[failure_arc-margin, failure_arc+margin]` interval.
+  `--route-stats-failure-margin` controls this distance in base voxels and
+  defaults to 128. Repeated commitments of one logical fiberlet remain separate
+  observations. Each observation owns the selected edge's stored component
+  costs and the incoming join from the immediately preceding committed edge in
+  the same segment; the first edge after every reset owns no transition.
+
+## Whole-volume fiberlet preprocessing
+
+- `vc_fiberlets preprocess-volume FIBER_MANIFEST OUTPUT_ZARR
+  --normal-manifest NORMAL_MANIFEST` materializes an entire prediction volume
+  without a reference-fiber corridor.
+- The command has two durable outputs: a float intermediate anchor cache and a
+  combined final Zarr containing anchors, edge prefixes, and routes. The anchor
+  cache defaults beside the final output and is not deleted after completion.
+- Sparse eligibility is based only on canonical stored presence chunks. Missing
+  and decoded-all-zero chunks are inactive; every final output chunk that
+  overlaps a decoded-nonzero presence chunk is active. Direction channels never
+  participate in sparse eligibility.
+- The sorted candidate output-chunk set is reconstructed from a fresh canonical
+  presence scan on every preprocessing invocation and kept only in memory. It
+  schedules work and resume checks; it is not part of the stored data contract.
+  No active index, per-chunk marker, or whole-dataset completion marker is
+  persisted.
+- A present combined chunk is valid only when its anchor, prefix, and route
+  files all exist, decode against their expected codecs/fingerprint, and have a
+  matching prefix/route record count. A wholly absent tuple is an empty sparse
+  chunk under ordinary Zarr semantics; corrupt, partial, or conflicting
+  present tuples fail validation.
+- Stored graph readers consume the combined dataset directly. They synthesize
+  canonical empty anchor/prefix/route payloads for absent tuples and never
+  require the original Fiber prediction manifest or a reconstructed expected
+  set.
+- Crop graph materialization may inspect the complete prefix/route owner halo,
+  but it must restrict that population to fiberlets with at least one actual
+  in-crop endpoint before requesting endpoint anchor chunks. Partial tuples
+  needed by a retained fiberlet remain errors; unrelated partial tuples beyond
+  the crop cannot invalidate an otherwise materializable crop.
+- Preprocessing does not publish intermediate anchor chunks with no retained
+  anchors or final combined tuples with no generated Fiberlets. Missing and
+  decoded-all-zero input presence chunks are never scheduled in the first
+  place. Canonical decoded empty results remain available to the current
+  process, while both durable Zarr datasets stay sparse.
+- Intermediate anchors include the exact dependency halo required by each
+  active fiberlet owner. Halo-only chunks remain in the intermediate cache and
+  are absent from the final active set.
+- Every required intermediate anchor is checked directly: a present payload
+  must decode against its expected codec/fingerprint, a missing payload is
+  generated, and a conflicting payload fails. Extra cached halo chunks remain
+  reusable.
+- Final payloads use float positions, compact directions, and fixed sqrt-density
+  `uint16` costs with ceiling 256. The intermediate cache remains float.
+- Resume rescans source presence, anchor dependencies, and final tuples. One
+  global `--threads` chunk-worker budget dispatches all ready current-Z
+  fiberlets before filling remaining capacity with anchor dependencies ordered
+  by their earliest dependent output. Anchor work may look ahead; final-output
+  dispatch cannot cross the current Z slab. Each whole-volume chunk extraction
+  is single-threaded so nested teams cannot exceed that global budget.
+- The pipeline exposes one live progress line refreshed about once per second,
+  with a persistent newline every minute and at completion. It reports the Z
+  frontier plus separate anchor/output completed counts, rates, ETAs, and
+  current/projected compressed payload bytes. The projection is the visited
+  expected-chunk mean and excludes Zarr metadata.
+- Every payload file uses same-directory temporary publication, file `fsync`,
+  atomic rename, and parent-directory `fsync`. The final three-file tuple is a
+  logical completeness unit, not one filesystem transaction. Preprocessing
+  exclusively locks both roots, removes exact abandoned atomic-write temporary
+  files before resume and after workers stop, and removes legacy activity and
+  completion bookkeeping.
+- `--presence-floor` is an inclusive owned-observation gate. Cells with no
+  usable owned observation at or above it return before seed generation and
+  refinement. `--minimum-support` remains a post-fit threshold.
+
+## Managed Fiberlet preprocessing and publication
+
+- `las_manager fiberlet run FIBER_RUN NORMAL_RUN` launches native whole-volume
+  processing through the shared managed-job runner. Both inputs must be
+  completed, uncropped runs for the same volume and base coordinate frame;
+  roles and required products are strict.
+- `fiberlet_threads` is a positive global config value (portable default 32)
+  passed as `--threads`. Per-run `--threads` may override it. The manager owns
+  all input/output/context/cache arguments.
+- The durable float anchor cache is stored below the run's private `cache/`.
+  Only `artifacts/fiberlets.json` and the final combined
+  `artifacts/fiberlets.zarr` form the portable bundle.
+- Fiberlet metadata schema version 2 is self-describing and path-independent.
+  Algorithm identity contains all scientific processing/coordinate/layout/
+  storage/codec settings; dataset identity adds stable source/model/level/run
+  identities and manifest hashes. Runtime paths and executable/host audit data
+  do not participate.
+- Fiberlet upload uses the common marker/lifecycle path but streams its sparse
+  tree through rclone under `fiberlets/<run_uuid>` without materializing a full
+  file list.
+- Atlas stores Fiberlets as a `fiberlets` volume data entry depending on
+  existing Fiber and normal Lasagna model/level entries. Publication is copy
+  only: one canonical copy and one CC-licensed public copy under the volume's
+  `representations/fiberlets/` directory; it creates no model and no derive
+  action.
+
+## Anchor-seeded Fiberlet crop tracing
+
+- `vc_fiber_trace_chunk` consumes one combined Fiberlet Zarr and a structurally
+  compatible regular Lasagna normal manifest. Manifest path and byte identity
+  are provenance only. Compatibility requires the Fiberlet whole-volume base
+  frame, ceil-downsampled base shape, consistent prediction-to-base scale,
+  valid `nx`, `ny`, and `grad_mag` channels, matching normal-component shape
+  and base spacing, and base-shape coverage with at most the established
+  one-chunk array padding. It does not require or read the original dense Fiber
+  prediction manifest. Missing sparse tuples are empty; partially present
+  tuples are invalid.
+- The public crop is a half-open base-volume XYZ box. Every stored anchor
+  variant in intersecting cells is a deterministic seed candidate, ordered by
+  descending prediction presence and then storage key.
+- Each uncovered seed traces both signs of its fitted axial direction. The
+  initial pair must use distinct physical Fiberlets and pass the ordinary join
+  constraint at the seed. Later joins use the stored Fiberlet transition
+  metric, cycles are rejected, and the first crop exit clips and terminates a
+  side.
+- Seed attempts may be capped independently from accepted output fibers.
+  Covered seeds do not consume attempts; selecting an active seed does,
+  including when it has no usable initial edge. Zero means unlimited for both
+  limits, and neither limit changes descending-presence/storage-key ordering.
+- Before crop tracing, the stored chunk graph is bulk-materialized into an
+  immutable replay graph over an internal search box. That box expands every
+  face of the requested crop by exactly the configured base-voxel lookahead
+  distance. The preparation loads anchors, physical Fiberlets, complete route
+  and cost-profile data, outside endpoints needed by crossing routes, and
+  ordinary stored join transitions for that expanded box. One lookahead
+  distance is sufficient: every physical Fiberlet incident to an anchor in the
+  search box is retained in full, including a final horizon-crossing edge whose
+  endpoint lies outside the box. No additional maximum-Fiberlet-length padding
+  is used. Chunk requests are batched through the existing cache workers, and
+  each retained route is reconstructed once.
+- Canonical starting seeds remain only the anchors in the requested half-open
+  crop. Speculative lookahead clips and terminates at the expanded search-box
+  boundary; committed trace geometry still clips and terminates at the
+  requested crop boundary. The requested crop remains authoritative for seed
+  ownership, anisotropic coverage, stored artifact bounds, CT faces, and all
+  downstream output. The halo may change a near-boundary route choice by
+  exposing its full lookahead evidence, but it must not create halo starts or
+  emit halo geometry.
+- Seed workers query only the immutable materialized graph. They perform no
+  cache I/O, waits, or shared graph mutation. Crop tracing assigns dense
+  strongest-first tickets continuously and commits completed candidates only
+  at the ordered ticket frontier. The submitted-but-uncommitted window is
+  bounded to the worker count plus one eighth (at least one) as queue headroom.
+  Integration rechecks seed activity; a speculative result whose seed was
+  covered by an earlier accepted line is discarded and consumes no attempt.
+  Attempt/fiber limits and errors take effect only when their canonical ticket
+  reaches the frontier, so later speculative results and failures are ignored
+  after the equivalent serial stop point. Counters, output order, geometry,
+  and the first propagated error are identical to one-thread execution.
+- The immutable graph stores sorted contiguous anchors, physical edges, joins,
+  and flat directed adjacency. Crop traversal consumes forward/reverse views of
+  adjacency and route geometry and materializes clipped points only for the
+  selected edge. Immutable views borrow stable storage without ownership
+  traffic. Other graph sources may return one shared owner per complete query
+  result; compact cached routes use one reconstructed owned buffer rather than
+  reference-counting individual elements or retaining leases in search state.
+- Crop lookahead keeps the committed trace's visited-anchor set immutable and
+  represents only rollout-local ancestry as parent-linked route nodes. Cycle
+  rejection checks both sets and includes the current rollout node. Complete
+  arc sequences are materialized only at the existing intermediate
+  lexicographic-pruning boundary. Terminal candidates retain route-node
+  indices; the selected minimum uses the same cost-density and full
+  lexicographic route ordering as the former sorted completion vectors. This
+  representation must not change arithmetic, generated-state cutoff behavior,
+  traversal order, or selected Fiberlets.
+- `--threads` defaults to the host CPU count and controls both batched graph
+  preparation and immutable seed tracing. There is no separate low trace-worker
+  cap.
+- Accepted lines suppress later anchor seeds. Coverage uses the shared
+  replay threshold measurement with a default 20-base-voxel normal radius and
+  four-times-wider Lasagna tangent-plane radius. The threshold comparison is
+  strict, and invalid normals use the existing Euclidean fallback.
+- Coverage additionally requires inclusive unoriented fitted-axis agreement
+  with the projected line tangent within 25 degrees. Crossing directions are
+  retained. This version performs no line-to-line Fiber deduplication.
+- Crop tracing may opt into covered-endpoint stopping. Workers still compute
+  complete candidates against the immutable graph, and lookahead neither
+  excludes nor penalizes covered anchors or Fiberlets. At canonical ordered
+  integration, each side uses only coverage produced by earlier accepted
+  lines and stops immediately after the first selected Fiberlet whose endpoint
+  anchor is covered. The reaching Fiberlet and endpoint remain in the output;
+  its edge cost, preceding join cost, and prediction length remain included,
+  while later geometry and costs are discarded. Crossing covered space within
+  a Fiberlet does not stop it. The retained line alone produces new coverage.
+- Covered-by-accepted-line state is distinct from seed eligibility. An anchor
+  made inactive by an unsuccessful attempt is not a stop barrier; an accepted
+  seed and every anchor satisfying accepted-line coverage are barriers for
+  later canonical candidates. Both sides consult the same state from before
+  the current line, so the current seed or first integrated side cannot stop
+  the other side. Parallel and serial output remains identical.
+- The authoritative crop output is a sparse Fiberlet Zarr dataset of kind
+  `traces`, not an OBJ. It uses a trace-only `float64_traces` profile and
+  crop-local base-coordinate chunks aligned to the source Fiberlet spatial
+  chunk side. Each accepted line is owned by its seed chunk and stores its
+  deterministic result ordinal, seed base position and presence, total metric
+  cost, prediction-space traced length, and exact float64 base-XYZ polyline.
+  Complete crop traces are not encoded as short transverse-lattice Fiberlets.
+- Stored total metric cost includes every committed selected edge and internal
+  join once. A crop-clipped edge's cost and prediction length use its retained
+  fraction. A bidirectional line includes the central join once when that
+  transition exists; the existing independent-side fallback has no central
+  transition to add. Speculative lookahead cost is never stored.
+- Trace publication writes and strictly reopens a unique sibling temporary
+  root before atomically renaming it to a previously absent output path.
+  Metadata inventories every populated chunk and the global record count.
+  Loading rejects missing or unexpected chunks, wrong seed ownership,
+  malformed records, and duplicate or incomplete ordinals.
+- Line visualization is derived only from a reopened trace dataset. `trace`
+  mode writes the dataset and may also write line OBJ artifacts; `visualize`
+  mode regenerates them without source Fiberlets, normals, or CT data.
+  Optional crop faces remain trace-time artifacts and use one concrete uint8
+  CT OME-Zarr group with the existing VC3D fine-to-coarse coordinate renderer.
+- After tracing, every nonzero consecutive accepted-line step contributes its
+  normalized unoriented axis and base-voxel length to a deterministic
+  two-direction fit. The axial PCA tensor is initialization only. The fitted
+  directions independently maximize
+  `sum(length*max((step dot d1)^2,(step dot d2)^2))` and are not constrained to
+  be orthogonal. Seed pairs, equal-alignment assignment, fit ties, axis signs,
+  and final direction labels have fixed canonical ordering.
+- For line grouping, let `q=(d1 dot d2)^2`. Each unit local step `u` contributes
+  `step_length*clamp(((u dot di)^2-q)/(1-q),0,1)` support to direction `i`.
+  These are independent affinities and must not be normalized by their sum;
+  with non-orthogonal axes their sum can exceed the step length. Axis dots are
+  clamped before squaring. When `1-q <= 1e-8`, direction 1 instead receives
+  ordinary squared-alignment support and direction 2 receives zero.
+- A line is direction-1- or direction-2-dominant when the larger accumulated
+  support divided by the line's actual valid arc length reaches the selected
+  dominance fraction; an exact support tie prefers direction 1. Otherwise it
+  is mixed. Hard fit assignments remain only for the existing deterministic
+  axis ordering and do not classify lines. The default is 0.75.
+  `--direction-dominance F` is accepted only by `trace`, `visualize`,
+  `direction-diagnostic`, and `direction-ablation`, must be finite in
+  `(0.5,1]`, and is inclusive at `F`; constraint and consensus modes reject it.
+  A line without a nonzero step
+  is mixed. Only accepted lines
+  contribute, and analysis uses a fixed serial reduction order. The selected
+  fraction is reported with the classification.
+- Direction dominance changes only the direction-group line and anchor
+  partition. It cannot change tracing, coverage, stored trace data, fitted
+  axes, per-direction supports, or quality classification. `visualize` rewrites
+  the complete all/direction/anchor/quality family for its output basename.
+- The requested line OBJ remains the complete accepted set. Sibling `_dir1`,
+  `_dir2`, and `_mixed` OBJs partition those polylines without changing names,
+  geometry, or order. Matching `_anchors`, `_dir1_anchors`, `_dir2_anchors`,
+  and `_mixed_anchors` OBJs contain one point primitive at each trace's actual
+  seed anchor. Empty groups still produce valid OBJ artifacts.
+- Trace quality is total metric cost divided by prediction-space traced length;
+  lower is better. Visualization stably orders by quality then stored ordinal
+  and partitions rank `r` among `N` with `min(9,floor(10*r/N))`. Ten sibling
+  `_quality_00_10` through `_quality_90_100` OBJs partition every trace exactly
+  once. A `_quality_histogram.csv` and console table report count and
+  min/mean/max total cost and cost density per bin; empty bins retain valid
+  empty OBJ files and blank numeric CSV fields.
+- Stored-artifact consumers accept `--quality-fraction F` for finite
+  `0 < F <= 1`. Rank by the exact visualization quality and stored ordinal,
+  retain `ceil(F*N)` entries (at least one for nonempty input), then restore
+  stored-ordinal order before visualization, direction fitting, splitting,
+  constraints, consensus, or BP. The full artifact is still read and strictly
+  validated; the option reduces downstream work, not artifact I/O. Crop bounds
+  and metadata remain unchanged, and diagnostic original-trace IDs must compose
+  through the retained ordinal map. Report input/retained counts, effective
+  fraction, and the worst retained density. The cutoff is diagnostic because
+  ordinal tie-breaking may split equal-density traces. Trace generation rejects
+  this artifact-input option.
+- The same consumers alternatively accept `--quality-threshold D` for finite
+  `D >= 0`. After strictly validating every input line, retain exactly those
+  traces whose `total_metric_cost / path_length_prediction_voxels <= D` and
+  preserve their original stored ordinals and order. Equal-density traces at
+  the inclusive boundary are all retained. A nonempty input for which no trace
+  qualifies is rejected rather than entering downstream processing with an
+  empty cohort. The fraction and threshold selectors are mutually exclusive.
+  `trace` accepts the threshold and applies it after candidate finalization and
+  covered-endpoint truncation but before accepted-line coverage. An
+  over-threshold candidate counts as attempted but creates no output or
+  coverage, leaving other anchors in its region eligible. Trace metadata
+  records the optional threshold and the summary reports quality rejections.
+  `trace` rejects the fraction selector and `reference-replay-benchmark` rejects
+  both. Stored-artifact consumers report the selector,
+  requested threshold, input/retained counts, effective fraction, and maximum
+  observed retained density. The density is comparable only for a fixed tracer
+  and cost configuration; it is not a universal confidence value.
+- Crop tracing optionally accepts an ambiguity relative-cost margin and a
+  positive normal-radius threshold. The option is disabled by default and must
+  not alter ordinary completion generation, pruning, density ranking, or
+  deterministic ties. At each side checkpoint, the selected completion is
+  compared only with the cheapest completion for each different first
+  Fiberlet that reaches the exact lookahead horizon and whose density `a`
+  satisfies `a <= b*(1+margin)` for selected density `b`;
+  when `b == 0`, `a` must also equal zero. Search-box exits, graph-exhausted
+  paths, and state-limit frontier paths cannot trigger ambiguity. Completions
+  sharing the selected first Fiberlet cannot change the current commit and are
+  reconsidered at the next anchor before their first divergent Fiberlet.
+- Ambiguity geometry contains exactly the route prefix charged by lookahead,
+  including fractional final Fiberlets. It is sampled at all stored vertices
+  and fixed 16-base-voxel arc intervals. Each route is projected exactly onto
+  the complete other polyline in both directions. A comparison is distinct if
+  either direction exceeds the shared replay ellipsoid, using the configured
+  normal radius, four-times-larger tangential radius, Lasagna normals sampled
+  at the matched route, and isotropic fallback for invalid normals.
+- A qualifying distinct completion stops the side before its next selected
+  Fiberlet is committed and reports `ambiguous_route`. At the seed, the
+  bidirectional initial-pair winner stays fixed while compatible alternative
+  first edges are evaluated separately; an alternative must preserve the
+  central join to the selected opposite side. Later checkpoints use the normal
+  shared rollout. Ambiguity never excludes graph data or biases the winner.
+  Candidate parallelism additionally requires concurrent normal sampling when
+  ambiguity is enabled. Runtime diagnostics distinguish all computed ambiguity
+  decisions from accepted-line ambiguity terminations and persist settings and
+  aggregate counts in trace metadata.
+
+## Stored crop-trace H/V constraint diagnostics
+
+- `vc_fiber_trace_chunk constraints TRACE.zarr --normal-manifest MANIFEST`
+  operates on durable `float64_traces` crop output and emits statistics plus
+  diagnostic connector OBJs, solves five-state piece labels, and emits one OBJ
+  for each label. Structured constraint persistence remains outside this
+  stage.
+- `vc_fiber_trace_chunk direction-diagnostic TRACE.zarr --normal-manifest
+  MANIFEST` first applies the same gradual direction grouping as stored-trace
+  visualization to every source trace. It writes the unfiltered direction
+  family beneath `<base>_initial.obj`, then removes all mixed traces before
+  piece splitting, spatial constraint extraction, optional strength pruning,
+  and optimization. Retained traces preserve an explicit mapping to their
+  original stored-trace indices.
+- Direction diagnostics always use the ordinary discrete H/V-plus-broken
+  HiGHS MILP with parity disabled. They reject explicit `--hv-only`, LP
+  relaxation/backend controls, exact-perpendicular MILP, and labeling-only
+  link exclusion. Extraction settings, finite winding cutoff or
+  `--no-winding-cutoff`, `--constraints-per-fiber`, broken cost, MIP gap,
+  threads, and cache size retain their canonical meanings.
+- Optimized H/V labels are compared to initial direction groups only after
+  resolving the arbitrary H/V gauge independently in every connected
+  component of active pieces. Components use the exact post-pruning constraint
+  graph passed to the solver, including hard same-trace continuity, with edges
+  incident to a final Broken piece omitted. Each component is flipped only
+  when that strictly reduces disagreement; a tie keeps direction 1 mapped to
+  H. Broken pieces are errors independently of orientation.
+- The diagnostic prints raw H/V/broken totals, the number of active and flipped
+  components, a gauge-aligned confusion table, orientation and broken errors,
+  piece and represented-source-trace error rates, and a stable per-error table
+  carrying filtered and original trace IDs plus the trace-local arc interval.
+  The piece denominator is every retained extracted piece. The trace
+  denominator is every retained source trace represented by at least one
+  piece. An all-mixed input succeeds and writes valid empty constraint and
+  label families in addition to the complete initial direction family.
+- `vc_fiber_trace_chunk direction-ablation TRACE.zarr --normal-manifest
+  MANIFEST` classifies once, preserves above-threshold direction-1/direction-2
+  traces as a trusted cohort, and ranks Mixed traces by descending
+  `max(direction_support)/valid_arc_length` followed by original trace index.
+  Confidence controls admission order only. Every Mixed trace is a Defect
+  reference and is expected to optimize to Broken; it never receives a
+  tentative H/V reference. Zero-valid-length traces rank last.
+- Ablation checkpoint zero contains only trusted traces. Each later checkpoint
+  cumulatively admits `--ablation-step N` ranked Mixed traces, default 5; the
+  optional `--ablation-limit N` restricts admission to the first N ranked
+  Mixed traces for repeatable parameter sweeps, while omission admits all; the
+  final remainder is always included. Ranking selects membership only:
+  the retained input vector is reconstructed in original stored-trace order at
+  every checkpoint. Pieces, constraints, configured pruning, and the ordinary
+  discrete H/V-only-plus-broken MILP are recomputed independently without a
+  solution warm start. Solver status and gap remain explicit.
+- Every checkpoint also solves the matching H/V-only LP relaxation. Continuous
+  activity and H/V values are independently thresholded at 0.5; inactive maps
+  to Broken and active maps to H or V. MILP and thresholded-LP errors and solve
+  times are reported separately, and their final label OBJ basenames remain
+  distinct.
+- Ablation gauge selection uses only trusted active pieces in each exact
+  post-pruning active constraint component. A strict reduction in trusted
+  disagreement is required to flip; a tie or component without a trusted
+  active piece keeps direction 1 mapped to H. That one gauge evaluates trusted,
+  admitted, and combined cohorts. A trusted H/V mismatch is an orientation
+  error, a trusted Broken piece is a broken error, and an active admitted
+  Defect piece is a defect-active error; Broken is correct for a Defect.
+  Each cohort reports piece errors and their union per represented source trace
+  with its own denominators. Raw H/V/Broken totals remain global.
+- Ablation writes the complete `<base>_initial` direction family once and the
+  existing constraint and label OBJ families only for the final selected
+  checkpoint. Intermediate checkpoints emit statistics only. The default base
+  is sibling `<trace-stem>_direction_ablation`. With no Mixed traces,
+  checkpoint zero is final; all-Mixed checkpoint zero is a valid empty solve.
+- `--perpendicular-only` is an opt-in labeling filter accepted by constraints,
+  direction diagnostic, and direction ablation. It retains measured links only
+  when `perpendicular_score > 0.5`; the exact ambiguous boundary is excluded.
+  Hard same-trace continuity links remain unchanged as their existing strong
+  evidence but do not become equality constraints. Filtering precedes degree,
+  adjacency, gauge, triangle, row, and objective construction and applies
+  identically to MILP and LP. The extracted constraint OBJ family remains
+  complete, while solver reports include retained and excluded counts. The
+  option conflicts with the redundant parallel-separate-winding exclusion.
+- Direction ablation optionally accepts `--post-iterations N` with
+  `--post-influence I`, where `N>0` requires `--perpendicular-only` and
+  finite `I` lies in `(0,1]`. The final selected checkpoint must contain
+  exactly one MILP piece for each represented trace, with unique contiguous
+  trace indices; split, missing, duplicate, and non-represented traces are not
+  repaired or synthesized. H initializes to 1, V to 0, and Broken to 0.5.
+- Post-filter adjacency is the unique source-trace graph induced by the exact
+  retained solver-link indices. Hard same-source links are ignored and every
+  cross-source link must have `perpendicular_score > 0.5`; a neighbor therefore
+  contributes `1-v`. Its confidence weight is
+  `clamp((abs(v-0.5)-0.5*(1-I))/(0.5*I),0,1)`. Each iteration synchronously
+  replaces a value by the weighted neighbor mean; zero total weight preserves
+  the previous value. This never changes MILP labels, costs, or errors.
+- Final values own ten complete-trace OBJ layers `<base>_p0.obj` through
+  `<base>_p9.obj`. Bands are fixed value intervals `[0,0.1)`, ..., `[0.8,0.9)`,
+  `[0.9,1]`; exact internal boundaries use the higher band and equal values
+  remain together. Only represented checkpoint traces occur, every trace
+  occurs exactly once, and empty bands are valid files. The accompanying table
+  stratifies the existing gauge-aligned comparison errors into trusted H,
+  trusted V, and admitted Mixed cohorts; it defines no new error threshold.
+- Every distance and arc value is in base voxels. Defaults are a 32-vx common
+  sample pitch, 512-vx target piece length, 128-vx overlap, 128-vx neighbor
+  radius, 32-vx centered tangent window, and 8-vx winding integration step.
+- A nondegenerate trace is divided into the minimum number of equal overlapping
+  arc intervals whose span is no greater than the target. Each interval stores
+  exact endpoints in addition to regular samples. Wholly degenerate traces are
+  skipped and counted; zero-length internal steps do not contribute arclength.
+- A point R-tree supplies a cubic broad phase for distinct-trace piece pairs.
+  Candidates must also pass the exact Euclidean radius. Only the minimum pair
+  of sampled points for each unordered piece pair is measured, with stable
+  sample-order tie breaking. Same-trace pieces never enter this search.
+- Consecutive pieces of one trace receive a hard link at their overlap midpoint
+  with parallel score 1, perpendicular score 0, winding distance 0, and closest
+  distance 0. Nonconsecutive pieces receive no implicit same-trace link.
+- A measured pair is oriented by the signed dot of centered secants at its
+  closest samples. The closest sampled pair remains the unchanged walk seed,
+  reported closest connector, and first parallel-winding sample. The default
+  `distance` correspondence walks both pieces forward and backward at the
+  common pitch and retains a strictly closer anti-correlated phase shift of one
+  twentieth pitch, bounded to that magnitude. The optional
+  `perpendicular-grid` correspondence instead walks incrementally from the last
+  accepted pair. At each step, an independent deterministic 2D grid varies each
+  advance in increments of one twentieth pitch, bounded to one quarter pitch.
+  Grid candidates minimize configurable nonnegative weights of both squared
+  target-step-normalized advance residuals and the squared dot of the unit
+  connector with each centered tangent. Optional nonnegative terms penalize
+  connector-direction change and squared target-step-normalized connector-
+  length change from the previous accepted pair; both default to zero.
+  Zero-length connectors are invalid; absolute connector length is not part of
+  the objective. Ties
+  prefer smaller step residual, smaller total absolute offset, then
+  lexicographic offsets. The grid limit must remain below one pitch so every
+  accepted step advances. The raw parallel score is the clamped `[0,1]` mean
+  of consistently oriented tangent dots. Raw perpendicular score is
+  `1 - abs(initial tangent dot)`. Division by their sum produces complementary
+  normalized scores.
+- Grid step, range, and all four objective weights are explicit CLI controls.
+  The distance default ignores them. Each measured link records diagnostic-only
+  sample count, advance residual, connector/tangent residual, connector-length
+  change, connector-direction change, and limit-hit fraction; winding-factor
+  CSV output exposes those values when explicitly enabled. Collection defaults
+  off and does not change BP inputs.
+- Normal-aligned winding uses the existing Lasagna connector integral and
+  trapezoidal sampling. Each endpoint winding-density sample is multiplied by
+  `abs(dot(unit connector, decoded unit normal))`. Missing required normal or
+  density samples reject the measured link. The ordinary winding API retains
+  its previous unmodulated behavior.
+- A finite measured aligned winding distance must be strictly less than `1.5`.
+  Values greater than or equal to `1.5` are discarded and counted separately
+  from invalid/non-finite winding samples. Hard same-trace continuity links
+  remain at zero and do not pass through measured-link rejection.
+  `--winding-cutoff N` selects another finite positive exclusive cutoff.
+- `--no-winding-cutoff` disables only that finite `1.5` rejection for
+  H/V-only constraint diagnostics. Every finite winding measurement is
+  retained; invalid and non-finite measurements remain rejected. The flag
+  requires `--hv-only`; joint parity labeling retains the finite `<1.5`
+  invariant. Default cutoff behavior is unchanged.
+- The normal dataset is opened in base-coordinate working space, must have the
+  valid 3D `nx`, `ny`, and `grad_mag` structure used by Fiberlets, and its
+  declared base shape must cover the complete trace crop. Manifest path, bytes,
+  and parsed identity are not compatibility gates; parsed equality with stored
+  provenance is diagnostic only.
+- Candidate scoring may run in parallel, defaulting to host CPU count, but uses
+  deterministic candidate slots and stable final ordering. The report includes
+  configuration, population and rejection counts, phase timing, and deciles
+  for closest distance, both normalized orientation scores, and aligned
+  winding distance.
+- Accepted measured connectors use bounded float-coordinate grouped corner
+  sampling for aligned winding. Each batch lays out and fetches `grad_mag`,
+  `nx`, and `ny` dependencies collectively, materializes samples in parallel,
+  and integrates connectors independently; it performs no per-point channel
+  cache queries. A distinct compatible density grid is sampled separately from
+  the jointly sampled `nx`/`ny` grid. Orientation, winding, and total score
+  timing are reported separately.
+- Constraints mode writes four connector-line OBJ diagnostics. `--output PATH`
+  is a basename whose final extension is removed; when omitted for `TRACE.zarr`,
+  the basename is sibling `TRACE_constraints`. Literal suffixes are
+  `_perpendicular_same_winding.obj`,
+  `_perpendicular_separate_winding.obj`, `_parallel_same_winding.obj`, and
+  `_parallel_separate_winding.obj`.
+- An OBJ connector joins the measured closest points and is named
+  `constraint_piece_A_B` from ascending global piece IDs. Hard continuity
+  links are excluded. Perpendicular requires score `>0.5`; winding `<0.5`
+  selects same-winding and winding `>=0.5` selects separate-winding. Parallel
+  uses the same split after requiring score `>0.5`. All four outputs are
+  disjoint and exact threshold values have defined ownership.
+- Every piece receives exactly one state: H/even, H/odd, V/even, V/odd, or
+  broken. The HiGHS MILP uses active, H/V, and parity binaries per piece, with
+  H/V and parity constrained to zero while inactive, and pair-active plus gated
+  H/V-XOR and parity-XOR bounded auxiliaries per retained link. Their linear
+  envelopes force binary values from binary endpoints without declaring the
+  link-local columns integer.
+- For parallel score `p`, an active link costs `1-p` for matching H/V and `p`
+  for differing H/V. For winding `d`, matching parity costs `d` and differing
+  parity costs `abs(1-d)`. The terms are additive. A broken endpoint disables
+  both terms. Each broken piece costs `broken_cost_per_link * degree`, where
+  the default coefficient is `0.5`, degree includes hard and measured retained
+  links, and the coefficient must be finite and nonnegative.
+- HiGHS must return an optimal MIP solution before label artifacts are written.
+  Default relative and absolute gaps are `1e-4` and `1e-6`; `--mip-gap` changes
+  the finite nonnegative relative tolerance, including zero for an exact proof,
+  and reports the achieved gap. The solver seed and model ordering are fixed. Each active connected
+  component is canonicalized through objective-preserving global flips so its
+  lowest piece ID is H/even; zero-degree pieces are canonically broken.
+- Label OBJ suffixes are `_h_even.obj`, `_h_odd.obj`, `_v_even.obj`,
+  `_v_odd.obj`, and `_broken.obj`. Each object is the sampled piece polyline and
+  carries stable piece, source-trace, and trace-local piece IDs. Reports include
+  objective, orientation/winding/broken decomposition, model dimensions, MIP
+  nodes and gap, solve time, and all five label counts.
+- `--lp-relaxation` makes the three piece columns continuous on `[0,1]` and
+  writes raw active, H/V, and parity values to
+  `<output-stem>_values.csv`; it must not threshold, repair, or emit the
+  five MILP label OBJs. It additionally emits diagnostic threshold layers with
+  five ordinary label suffixes: V and odd own exact `0.5`, and
+  active owns values at or above the mean activity. Values below the mean are
+  shown as broken. These layers must be identified as visualization rather
+  than an integer solution. Every link-local H/V and parity difference has one
+  stable meaning: zero for an inactive link, otherwise zero for matching
+  endpoint labels and one for differing endpoint labels. Its full gated XOR
+  hull remains exact whenever piece values are binary, including signed direct
+  objective coefficients.
+- The lowest piece in each input graph component has only its H/V and parity
+  upper bounds fixed to zero; its active value remains free. This removes the
+  global flip when the root is active without changing solutions in which it
+  is broken. LP mode enumerates every graph triangle and adds four gated
+  cut-polytope inequalities separately for H/V and parity. All-active triangles
+  obey ordinary XOR consistency; with a broken vertex, the opposite active
+  edge remains free to differ. Reports include gauge-root, triangle, and
+  triangle-row counts. Materializing every triangle is a diagnostic and may
+  become impractical on dense crops; no silent subset or cap is permitted.
+- LP backend selection is explicit and diagnostic-only. `--lp-parallel`
+  requests HiGHS parallel LP execution and `--lp-solver` accepts `choose`,
+  `simplex`, `hipo`, or `ipm`; both require `--lp-relaxation`. The default
+  remains HiGHS automatic solver and parallel selection (`choose`). Reports
+  identify the requested solver, requested parallel mode, and thread count,
+  not the backend HiGHS ultimately selected. These options do not alter the
+  integer labeling path or the LP formulation.
+  A requested backend that is unavailable in the linked HiGHS build must fail
+  explicitly; it must not silently substitute a different solver.
+- `--exclude-parallel-separate-winding` is an opt-in labeling-only ablation.
+  It removes exactly non-hard links with `parallel_score > 0.5` and
+  `winding_distance >= 0.5` before degree, adjacency, gauge, triangle, row, and
+  objective construction. Hard continuity links are retained regardless of
+  scores, the complete extracted report remains the input to constraint OBJ
+  visualization, and retained/excluded counts are reported. Default-off model
+  behavior is unchanged.
+- `--perpendicular-only` removes every non-hard measured link with
+  `perpendicular_score <= 0.5` before the same model construction stages.
+  Hard continuity remains retained with its existing objective semantics.
+  It conflicts with `--exclude-parallel-separate-winding`, reports its own
+  exclusion count, and leaves default-off behavior unchanged.
+- `--hv-only` is an independent opt-in labeling ablation. It retains the same
+  filtered graph, degrees, broken penalties, active variables, H/V variables,
+  pair-active variables, H/V gated-XOR variables, H/V gauges, and H/V triangle
+  cuts, while constructing no parity variables, parity gated-XOR variables,
+  parity gauges, parity triangle cuts, or winding objective terms. With `N`
+  pieces, `E` retained links, and `T` relaxation triangles, the model has
+  exactly `2N + 2E` columns, `N + 8E + 4T` rows, `2N` MILP integer columns, and
+  `4T` reported triangle rows. Winding cost is exactly zero.
+- H/V-only LP and MILP reports must contain exactly `N` parity values equal to
+  zero. Active MILP pieces decode only to H/even or V/even. The stable values
+  CSV and five label OBJ paths do not change; H/odd and V/odd are valid empty
+  OBJ files. Solver-objective validation uses only broken plus orientation
+  cost in this mode. The default joint model and its output are unchanged.
+- `--exact-perpendicular-milp` is an H/V-only diagnostic and is mutually
+  exclusive with `--lp-relaxation` and LP backend controls. Piece activity is
+  binary, piece H/V is continuous on `[0,1]`, and parity is absent/fixed zero.
+  Pair activity and H/V difference remain bounded continuous auxiliaries.
+- For parallel score `p`, every active edge pays
+  `(1-p) + (2*p-1)*abs(h_a-h_b)`. Edges with `p <= 0.5` receive one binary
+  endpoint-order variable and pair-gated big-M-2 upper bounds so their
+  difference equals the actual absolute endpoint difference. Edges with
+  `p > 0.5` obtain the same equality through the positive difference objective
+  coefficient and the existing lower envelope. Inactive edges have zero
+  difference and must not constrain the active endpoint.
+- Exact-perpendicular mode must not enumerate or add triangle cuts: all edge
+  relations derive from shared scalar piece values. With `N` pieces, `E`
+  retained links, and `P` links having `p <= 0.5`, it has exactly
+  `2N + 2E + P` columns, `N + P` integer columns, `N + 8E + 2P` rows, and zero
+  triangle rows. It emits continuous-value CSV and threshold OBJ diagnostics,
+  with binary activity and continuous H/V, rather than discrete label OBJs.
+- `vc_fiber_trace_chunk consensus` is a separate non-HiGHS H/V diagnostic that
+  reuses canonical constraint extraction and its exclusive winding cutoff. It
+  groups pieces by original trace index, discards same-trace links, and counts
+  each retained cross-trace piece-pair constraint once. Accumulation order is
+  stable by neighbor trace and piece IDs.
+- `--constraints-per-fiber K` is an opt-in shared constraint-pruning stage for
+  `constraints` and `consensus`; omission preserves the extracted graph
+  exactly. It runs after canonical extraction and winding-cutoff rejection but
+  before constraint OBJ output, consensus, or HiGHS labeling. The later
+  labeling-only `--exclude-parallel-separate-winding` ablation, when requested,
+  therefore runs after strength pruning and reports its additional exclusions
+  separately.
+- Every non-hard cross-trace piece-pair link has strength
+  `abs(2*p-1) * max(0, 1-d/D)`, where `p` is normalized parallel score, `d` is
+  closest distance in base voxels, and `D` is the exact positive extraction
+  maximum distance. Zero-strength links are excluded. Each source trace ranks
+  its incident positive-strength links by descending strength, ascending
+  distance, then normalized ascending piece IDs. A link survives only if both
+  endpoint traces rank that individual piece-pair link in their top `K`.
+  Multiple piece-pair links to the same neighboring source trace consume
+  multiple slots. This mutual graph is only the initial sparse proposal.
+- Connectivity recovery considers every discarded link with exact positive
+  strength and adds only links whose endpoint source traces occupy different
+  current components. A strength-ordered first pass accepts bridges only while
+  both post-add degrees remain at most `K`. A fallback dynamically minimizes
+  post-add overflow
+  `max(0,degree_a+1-K)+max(0,degree_b+1-K)`, then prefers greater strength,
+  smaller distance, and normalized piece IDs. Zero-strength links never bridge.
+  Canonical DSU roots use the minimum source-trace index, and final constraint
+  order is canonical and independent of input order.
+- For each original positive-strength component containing `c` mutual
+  components, recovery adds exactly `c-1` links and no cycle edge. Globally,
+  accepted recovery links equal mutual components minus original positive-
+  graph components, and the final partition exactly matches the original.
+  Therefore `K` is a target rather than a guaranteed cap. Reported fallback
+  overflow is a result of the greedy policy, not proof that another
+  degree-bounded spanning forest cannot exist.
+- Hard continuity links must connect pieces of the same source trace, remain
+  unchanged, and do not consume top-K slots or contribute to cross-trace graph
+  degree. Soft same-trace links, hard cross-trace links, duplicate canonical
+  piece pairs, invalid references, non-finite/out-of-range evidence, and a
+  nonpositive `D` or `K` fail explicitly.
+- Pruning diagnostics are separate from extraction diagnostics. Input/mutual/final
+  graph statistics count source traces represented by at least one extracted
+  piece, individual retained cross-trace constraints as degree, and connected
+  components in the cross-trace graph; every isolated valid trace is one
+  component. They report total/cross-link counts, min/mean/median/max degree,
+  isolates, and components, with mean degree equal to `2E/V`. They also report
+  recovery candidates, expected/actual bridges, cap-respecting versus fallback
+  bridges, and final traces above `K`. Constraint OBJ, consensus, and HiGHS
+  receive the same recovered constraint report. A later labeling-only ablation
+  may independently fragment the HiGHS model and is outside this guarantee.
+- Crop bounds for consensus are the stored trace-artifact bounds and must be
+  finite with positive XYZ extents. The nominal crop side is
+  `min(maximum_base_xyz - minimum_base_xyz)` and its center is the arithmetic
+  XYZ midpoint. The primary H seed must have finite positive arc length
+  strictly greater than half the nominal side. Eligible traces are ranked by
+  descending endpoint-chord/arc-length straightness, ascending exact minimum
+  3D Euclidean crop-center-to-polyline-segment distance in base voxels,
+  descending arc length, then ascending trace index. These comparisons use no
+  tolerance. If no valid trace passes the strict primary cutoff, consensus
+  fails explicitly. Lines without two distinct points are immediately broken
+  and do not count as assignments.
+  When active assigned evidence exists, the next trace maximizes
+  `constraint_count / mean_closest_distance_base_voxels`; zero distance is
+  infinite, then ties prefer greater count, smaller mean distance, and lower
+  trace index. Links to broken traces do not provide evidence. Exhausting
+  active evidence starts another H seed using the same geometric ranking but
+  without the primary length cutoff.
+- A candidate H/V assignment sums `1-p` on equal labels and `p` on differing
+  labels for every current active evidence link with parallel score `p`.
+  Broken costs `broken_cost_per_link * current_active_evidence_count`. Strict
+  minimum wins with H, V, broken tie order. Costs are irreversible incremental
+  choices: later links to a broken trace remain disabled and do not
+  retroactively alter its cost. Winding and orientation confidence do not
+  affect candidate priority.
+- Consensus output contains final full-trace `_h.obj`, `_v.obj`, and
+  `_broken.obj` layers plus `_step_N_h.obj`, `_step_N_v.obj`, and
+  `_step_N_broken.obj` snapshots for every ten total valid assignments through
+  100 and every 100 thereafter. A snapshot includes the decision at assignment
+  `N`. Seeds and broken choices count toward `N`; degenerate traces do not and
+  occur in none of the layers. Each triplet partitions the assigned valid
+  traces, so its counts sum to `N`; every file is written even when empty.
+  Final paths never alias milestone paths, and an explicit output basename
+  owns and overwrites all of these consensus layers. HiGHS-only flags are
+  invalid in consensus mode. Console output
+  includes detailed rows for the first 100 assignments and ends with the full
+  assignment, label-count, and objective summary.
+
+### Binary BP constraint-consistency diagnostic
+
+- `direction-ablation --bp-only` processes only the final admitted cohort and
+  must not call the HiGHS MILP or LP solvers. Every extracted constraint piece
+  is one BP node. Optional strength pruning precedes the shared
+  labeling constraint selector; BP receives the selector's retained constraints
+  in their original order. `--perpendicular-only` optionally restricts the
+  graph; without it, complementary parallel and perpendicular evidence in
+  `[0,1]` is accepted. Canonical same-source continuity is exact and edge-local
+  by default: two active endpoints must share H/V, while either endpoint may be
+  Mixed/Defect and neutralize that edge. Explicit finite compatibility mode
+  restores its parallel-score-1 same-label evidence. Missing, duplicate,
+  nonconsecutive, malformed, or cross-source hard continuity; soft same-source
+  links; hard/soft piece-pair collisions; invalid ownership; and
+  non-complementary evidence fail.
+- Admitted dense source traces remain the input to the established
+  central-straight seed selection. The selected source's exact dense clipped
+  piece with minimum Euclidean crop-center distance becomes the sole hard-H
+  seed; exact ties use ascending global piece ID. A selected source without a
+  valid piece fails. Optional balance weights are piece arc spans, including
+  overlap once for every piece.
+- BP merges soft measurements by unordered represented-piece pair. A merged
+  factor's same cost is `sum(1-p_k)`, different cost is `sum(p_k)`, strength is
+  `abs(same-different)`, and the lower-cost relation may be same or different.
+  Before inference, subtract `min(same,different)` from both oriented costs, so
+  only decisiveness remains. An exact tie is omitted from the effective graph,
+  degree, components, and mismatch accounting; neutral merged-factor and raw-
+  measurement counts are reported separately. Near-ties retain their exact
+  sign and nonzero strength without an epsilon. Degree counts effective unique
+  factors while incident-measurement count retains effective raw measurements.
+- Consistency diagnostics resolve `h<=0.25` as V and `h>=0.75` as H, inclusively.
+  Hard mismatch count is the number of resolved incident factors whose observed
+  equal/different relation disagrees with the factor's lower-cost relation. Its
+  unweighted denominator is resolved degree and its weighted denominator is
+  resolved strength. Incident factors with either endpoint unresolved
+  contribute instead to unresolved degree and strength. Zero denominators are
+  undefined, written as `NA`, and excluded from summaries.
+- The binary soft mismatch proxy is the strength-weighted independent-endpoint
+  probability of violating the preferred relation: `1-q_same` for a
+  same-preferring factor and `q_same` for a different-preferring factor, where
+  `q_same=h_i*h_j+(1-h_i)*(1-h_j)`. It is not a calibrated pair marginal.
+  Neighbor support maps the neighbor H/V evidence through the preferred same
+  or different relation. Neighbor support balance is
+  `2*min(sum(w*(1-h_j)),sum(w*h_j))/sum(w)` and must be interpreted with the
+  separately reported mean neighbor certainty
+  `sum(w*abs(2*h_j-1))/sum(w)`.
+- `<base>_consistency.csv` has stable global piece, original source
+  trace, source-local piece, and begin/end base-arc identities, initial
+  reference group, BP status and thresholds, horizontalness,
+  degree/measurement/strength partitions, hard mismatch fields, and the three
+  smooth diagnostics. It is replaced on each successful run. Console summaries
+  are equal-per-piece count/min/mean/median/p90/max by Direction1, Direction2,
+  and Mixed, excluding undefined values. Tie-aware AUROC compares Mixed against
+  both trusted groups, with the printed direction defining whether higher or
+  lower values predict Mixed.
+- `--bp-inference sum-product` is valid only with `--bp-only` and selects
+  binary sum-product on exactly the same merged factor graph and central
+  straight hard-H seed. Omission retains min-sum. For factor costs
+  `E_same,E_diff` and positive temperature `T`, the log potentials are
+  `-E_same/T,-E_diff/T`; subtracting a common per-factor offset is allowed
+  because it must not alter any message ratio.
+- A directed sum-product message is
+  `ell_i->j=log m_i->j(H_j)-log m_i->j(V_j)`. Given cavity log odds `r`, its
+  raw update is
+  `logsumexp(-E_diff/T,r-E_same/T)-logsumexp(-E_same/T,r-E_diff/T)`.
+  The hard-H seed emits `(E_diff-E_same)/T`. All messages start at zero and
+  update synchronously as `old+damping*(raw-old)`, including seed messages;
+  convergence uses the maximum post-damping change.
+- Sum-product horizontalness is the normalized node marginal
+  `P(H)=sigmoid(sum incoming log messages)`, with the seed exactly one.
+  Unseeded components retain H/V gauge symmetry and therefore report `0.5`.
+  Marginals are exact on trees and approximate loopy-BP/Bethe marginals on
+  cyclic components after convergence. `message_limit` publishes the last
+  finite iterate with an explicitly nonconverged status.
+- Sum-product rejects all population-balance modes and balance-only target,
+  strength, iteration, and tolerance controls. Temperature scales factor
+  energies in sum-product; it remains only a post-hoc min-marginal display
+  scale in min-sum. BP owns `<base>_orientation_p0.obj` through `_p9.obj` and
+  `<base>_consistency.csv`, which records its inference name, temperature, and
+  status. A later run replaces the current-result artifacts. The soft mismatch
+  value remains an endpoint-independence proxy rather than a pairwise marginal.
+- `--bp-inference sum-product-mixed` is a separate experimental categorical
+  V/Mixed/H solver over the same merged orientation graph. Mixed denotes an
+  orientation defect, not a third direction. Oriented pairs use the normalized
+  `E_same`/`E_diff`; every pairwise energy with at least one Mixed endpoint is
+  zero. Normalization ensures at least one oriented relation also has zero
+  energy, so a common raw factor offset cannot favor Mixed. Each non-seed node
+  instead has unary energies `U(V)=U(H)=0` and
+  `U(Mixed)=bp_mixed_cost * incident_measurements`. Incidence sums the raw
+  measurement count of each retained non-neutral merged factor at that node;
+  measurements in omitted neutral factors count zero. The scaled unary is
+  still applied once at the node, so Mixed cannot propagate transitively.
+  `--bp-mixed-cost` defaults to `1`, must be finite and nonnegative, and is
+  invalid outside this inference mode.
+- Ternary directed messages contain V/Mixed/H log values. Raw and post-damping
+  messages subtract their log-sum-exp gauge, and convergence uses the maximum
+  normalized post-damping change. The 3x3 update is
+  `m_i->j(t)=logsumexp_s(-U_i(s)/T + sum_{k!=j}m_k->i(s)
+  -E(s,t)/T)` followed by normalization. The final marginal uses the same
+  unary plus all incoming messages. A cavity clamped to Mixed sends a uniform
+  factor message; a soft cavity may still transmit evidence from its residual
+  V/H mass. Merged oriented energies subtract their common minimum before the
+  3x3 potential is formed; Mixed entries remain zero.
+- The central seed is exactly H. An isolated unseeded node has uniform
+  marginals only when `bp_mixed_cost=0`; otherwise its V/Mixed/H probabilities
+  are proportional to `(1,exp(-bp_mixed_cost/T),1)`. Any unseeded connected
+  component retains exact V/H gauge symmetry but can have nonuniform Mixed
+  probability. Exact argmax ties are reported separately rather than assigned
+  to Mixed.
+- Ternary reports normalized `p_v,p_mixed,p_h`. Its legacy scalar orientation
+  projection is `p_h+0.5*p_mixed`; it may drive orientation bands and
+  explicitly named heuristic consistency output but must not be called `P(H)`
+  or treated as a calibrated binary marginal. Mixed discrimination uses the
+  gauge-invariant `p_mixed` directly.
+- Ternary soft mismatch uses explicit state marginals. For a same-preferring
+  factor its violation probability is `pV_i*pH_j+pH_i*pV_j`; for a different-
+  preferring factor it is `pV_i*pV_j+pH_i*pH_j`. Terms involving Mixed are zero.
+  Neighbor support similarly maps only explicit neighbor V/H mass through the
+  preferred relation, and ternary neighbor certainty is `abs(pH-pV)`.
+- Ternary owns `<base>_orientation_p0..p9.obj` projection bands,
+  `<base>_error_probability_p0..p9.obj` Mixed/error-probability bands, and
+  `<base>_consistency.csv` containing the three
+  probabilities, projection, inference temperature, Mixed unary cost, and
+  status.
+  It additionally owns the mutually exclusive argmax layers `<base>_v.obj`,
+  `<base>_err.obj`, `<base>_h.obj`, and `<base>_tie.obj`; every
+  represented fiber occurs in exactly one layer and exact ties are never
+  silently assigned to Mixed.
+
+## BP-aligned Lasagna normal samples
+
+- Normal sign alignment consumes only regular manifest-backed Lasagna
+  `grad_mag`/`nx`/`ny` samples. It must validate the normal dataset structure,
+  open base-coordinate callers with `workingToBaseScale=1`, and must not use
+  `NormalGridVolume` or rewrite the source Lasagna Zarr.
+- Binary pairwise sum-product is one shared core implementation for fiber BP
+  and normal alignment. Extracting or extending it must preserve fiber factor
+  and message order, central-H seed semantics, disconnected unseeded
+  probability `0.5`, probabilities, log odds, iteration count, residual, and
+  convergence status.
+- For normalized ambiguous normal axes with signed dot `d` clamped to
+  `[-1,1]`, normal-alignment costs are exactly `E_same=(1-d)/2` and
+  `E_different=(1+d)/2`. Exact neutral factors are omitted. Temperature is
+  applied only by BP. Every normal-alignment connected component fixes its
+  lowest retained node to unflipped state zero; this per-component gauge rule
+  does not apply to fiber BP.
+- Standalone sampling uses finite half-open base-voxel XYZ bounds and a
+  globally anchored isotropic lattice. Axis indices run from
+  `ceil(min/spacing)` up to but excluding `ceil(max/spacing)`. Invalid samples
+  are compacted in stable Z/Y/X order while retaining lattice identity.
+- The standalone graph connects each retained pair within a positive
+  Chebyshev lattice radius once, with no distance weight; radius one is the
+  default 26-neighborhood. This topology is diagnostic and must not silently
+  become the future H/V graph because it can couple nearby parallel sheets and
+  has no `grad_mag` confidence weighting.
+- A posterior flip probability strictly greater than `0.5` flips the sampled
+  axis; ties remain unflipped. A finite message-limit iterate remains usable
+  and explicitly nonconverged. Invalid data/configuration is a hard failure.
+- Paired standalone OBJ diagnostics use the exact same retained centers and
+  sample order. Each normal emits two crossed undirected base strokes and one
+  directed normal stroke in distinct OBJ groups. The aligned normal set is a
+  reusable core result for later H/V optimization; OBJ is diagnostic output,
+  not its persistence format.
+- Binary BP parallelism is explicit and defaults to one worker for reusable
+  core callers. Parallel node totals use contiguous CSR incoming-message slots
+  in original factor order, factor updates write disjoint slots, and every
+  totals/update/swap/stop phase is synchronized. Worker count may change only
+  execution time, effective-worker and timing diagnostics; it must not change
+  factors, synchronous Jacobi semantics, convergence, probabilities, or log
+  odds. GCC uses OpenMP while the supported Clang/MSVC configurations fall
+  back to one worker through the project shim.
+- Binary BP and crop normal alignment expose optional observational progress.
+  Binary BP emits one serialized event after each complete synchronous message
+  sweep and one success-only terminal event. Callback time is excluded from BP
+  phase timings; callback exceptions leave the OpenMP region before being
+  rethrown. Normal alignment reports sampling candidates at opaque batch
+  boundaries, lattice sites scanned while building factors, the sum of normal
+  normalization items plus factor-adjacency items plus component-visited nodes,
+  complete message sweeps, and retained nodes finalized. Preparation/finalize
+  callbacks are bounded to phase boundaries plus one per 65,536 work items.
+  Progress must not reorder factor or component traversal or change any
+  numerical report field.
+
+## Interleaved-lattice signed crop winding BP
+
+- Crop BP must construct one globally anchored aligned-normal lattice over the
+  half-open crop plus one effective normal-channel spacing on every available
+  side. Sampling uses the already open manifest sampler/cache. A nearest
+  aligned lookup is usable only when A, midpoint, and B are present within
+  `sqrt(3)/2 * spacing` and share one normal-alignment component.
+- The finite nonnegative `windingDistance` is the closest-connector observation
+  for the perpendicular hypothesis. For ordered pieces `A -> B`, its optional
+  sign is `sign(dot(B-A, aligned_normal_midpoint))` and its meaning is exactly
+  `winding(B)-winding(A)`. Canonical endpoint reversal negates this target.
+- Parallel constraints have an independent `parallelWindingDistance`. Reuse
+  exactly the matched connector pairs that contributed tangent-valid samples
+  to the parallel score in both walk directions, with the closest pair included
+  exactly once. Integrate all connectors in one existing batched Lasagna read.
+  The closest value is mandatory; omit nonfinite additional values. For an
+  unoriented report, use the sorted unsigned median, averaging the middle pair
+  for an even count.
+- For an oriented report, sign each parallel sample from its connector and
+  aligned midpoint normal. Its endpoint and midpoint normal samples must all
+  belong to the closest connector's normal-alignment component; omit samples
+  from another independently gauged component. The signed median is the
+  authoritative parallel target and its magnitude is
+  `parallelWindingDistance`. If the closest connector cannot be signed, expose
+  no signed parallel target. Missing aligned sign removes a nonzero parallel
+  winding term, not its H/V factor; exact zero distance remains sign-free.
+- The raw extraction cutoff is exclusive and applies to both the closest
+  perpendicular distance and final parallel median magnitude. Either reaching
+  the cutoff rejects the complete measured link as one winding-cutoff
+  rejection. Invalid additional walk samples do not reject the link.
+- H/V-aware interleaved winding BP converts every admitted nonnegative raw
+  `parallelWindingDistance` to the nearest signed integer target for its
+  parallel component:
+  `[0,0.5) -> 0`, `[0.5,1.5) -> 1`, and so on. Its loss is
+  `parallel_weight*abs(latent_delta-signed_integer_target)`, independent of
+  measurement gain/scale. It separately converts each
+  available raw signed observation to a signed half-integer interval center
+  for its perpendicular component: `(0,1] -> 0.5`, `(1,2] -> 1.5`, and so on.
+  Exact signed zero and hard continuity stay zero. The raw exclusive cutoff
+  runs before conversion and is not re-applied to either effective value. The independent
+  integer-only winding diagnostic remains raw because it has no H/V half
+  ladder. Alternating and joint-grid inference consume the same converted
+  target. Fixed phase `0.5` and scale `1.0` define the exact-step experiment;
+  adaptive calibration remains an explicit comparison mode.
+- H/V diagnostic and winding-BP CLI paths default to the exclusive raw winding
+  cutoff `4.0`; the shared extraction config and legacy parity-labeling path
+  retain their `<1.5` default. Independently multiply each component by
+  `2^-floor(abs(effective_target))`: parallel distances `0`, `1`, `2`, and `3`
+  and perpendicular targets `0.5`, `1.5`, `2.5`, and `3.5` each use
+  `1`, `0.5`, `0.25`, and `0.125`, respectively. Each measured
+  constraint retains only its dominant hypothesis: parallel dominance uses the
+  integer-distance term and perpendicular dominance uses the signed-offset
+  term. The selected term and decay apply consistently in continuous
+  initialization, calibration, and discrete inference. Hard continuity remains
+  a parallel zero-distance factor. The formula continues safely for larger bins
+  admitted by explicit cutoff overrides.
+- `--parallel-winding-cutoff N` is a finite positive exclusive cutoff on the
+  quantized integer parallel distance in H/V-aware winding solves. `0.5` keeps
+  only same-winding distance zero. Filtering zeros the winding weight of a
+  parallel-dominant factor while retaining its H/V orientation score,
+  extracted/stored constraint, and reference diagnostic. Perpendicular-dominant
+  factors are unaffected. Filtered orientation-only factors do not join winding
+  gauge components.
+  The default is no additional parallel cutoff.
+- In `sum-product-mixed`, orientation and winding are one joint state per split
+  piece. Every piece remains a distinct variable. By default, a same-trace
+  continuation edge accepts either state when at least one endpoint is Defect;
+  if both endpoints are active, their H/V class and integer winding must be
+  identical. Defect therefore splits a source into independent active runs.
+  Enforce this in the orientation prepass, winding pair potentials, and
+  deterministic final decoding. A finite compatibility mode may restore the previous
+  parallel-score-1, zero-distance pair factor. Other BP modes retain the
+  independent integer-winding diagnostic.
+- Each factor/message component has one local class A/B gauge, while each
+  disconnected subgraph with effective winding evidence has its own integer
+  offset gauge. The crop-central class gauge is fixed to `(A,0)`. Additional
+  integer gauges fix `k=0` while retaining A/B choice, so filtering a winding
+  component never removes the same factor's orientation evidence. A has latent coordinate `k`; B has
+  `k+sign_c*phase`, where `k` is integer, shared phase magnitude is in
+  `[0,0.5]`, and deterministic component sign `sign_c` accounts for otherwise
+  incomparable class swaps. Absolute `k` values across components are not
+  physically comparable.
+- Before a BP-only cohort enters its final winding solve, retain only the
+  largest component of the exact effective-winding graph. Component formation
+  must reuse the solver's hard-continuity, merged-measurement, signed-target,
+  quantized multiplier, parallel-cutoff, and fixed-Mixed rules. For fixed
+  orientation, run the orientation prepass, remove every smaller winding
+  component, remap source traces/pieces/constraints, rebuild topology, and
+  repeat monotonically until one component remains; reuse the stable final
+  prepass. A removed interior piece splits the retained pieces of that source
+  trace into separate contiguous represented runs; an arc gap must not be
+  relabeled as hard continuity. Equal-size components prefer the crop-central piece, then the lowest
+  original piece index. Reference fibers never affect this selection. Print
+  one cumulative before/after trace, piece, and constraint summary per solve.
+- `sum-product-mixed` exposes `joint-grid` and `alternating` winding solvers.
+  `joint-grid` is the default. `alternating` is the established comparison
+  implementation described below and retains its orientation pre-pass,
+  multi-start calibration, numerical defaults, and output conventions.
+- Both winding solvers optionally support fixed-prepass orientation. The
+  ordinary Mixed-state BP runs once, and each piece's unique H/Mixed/V MAP is
+  retained as its pre-pass class; an exact MAP tie becomes Mixed. The
+  prepass uses `--bp-mixed-cost`. Its exact fixed assignment is written as
+  `<base>_prepass_h.obj`, `<base>_prepass_v.obj`,
+  `<base>_prepass_err.obj`, and the shared empty
+  `<base>_prepass_tie.obj` artifact. The
+  subsequent solver cannot switch H to V or V to H, but may declare either
+  directional piece Mixed/Defect when winding evidence is incompatible. A
+  pre-pass H/V piece has one fixed-direction state per candidate integer plus
+  one winding-free Defect state. A pre-pass Defect piece has only that single
+  Defect state. Constraints incident to a pre-pass Defect are removed before
+  continuous initialization, component/gauge construction, and discrete BP.
+  A late Defect assignment makes every incident pair factor neutral.
+- Hard split continuity is enabled by default. An active/Defect or
+  Defect/Defect continuation edge is neutral. A continuation edge with two
+  active endpoints requires identical H/V and winding state. The orientation
+  prepass and final winding decode must apply the same edge invariant because
+  independent nodewise marginal MAP values do not guarantee pairwise
+  feasibility. Deterministic projection preserves the seed or winding gauge,
+  otherwise disables the lower-confidence endpoint, and uses the larger node
+  index as the exact tie-break. In explicit finite compatibility mode, the nonnegative
+  `--piece-break-cost` defaults to `0` and is charged exactly once when exactly
+  one continuity endpoint is active. Do not charge active/active,
+  Defect/Defect, or measured cross-trace pairs. Multiple measurements merged
+  into one prepared edge must not multiply the cost. Divide it by orientation
+  temperature and preserve it in summary and CSV output.
+- Experimental `--winding-gap-boundary-cost` explicitly enables that same
+  active/Defect boundary penalty in hard-continuity joint-grid mixed BP.
+  Active/active equality remains hard; Defect/Defect remains free. An interior
+  disabled run costs two boundaries, an endpoint run one, and a wholly disabled
+  source zero boundaries. Default behavior is unchanged; explicit zero must
+  reproduce baseline states. This prior does not change the orientation prepass
+  or the final hard-sign projection; projection-created defects are reported
+  separately because that feasibility repair does not optimize gap costs.
+- Experimental local-event-only `--winding-defect-length-unit U` (finite U>0)
+  replaces incidence mass with nonoverlapping piece arc length/U using the
+  shared native length-measure model, blend1. Disabling cost is then per U base
+  voxels, with unchanged multiplier and prepass. It requires direction-ablation
+  joint-grid mixed BP and rejects legacy multiplier files. Unset preserves
+  incidence-based costs. The experiment verifies identical rebuilt zero-cost
+  controls and retains full input length/evidence.
+- Optional `--winding-defect-length-blend alpha` (0..1, requires length-unit)
+  interpolates incidence and length measures using the existing native model.
+  For `(1-alpha)*100*M + alpha*cL*L/128`, set defect cost100 and length unit12800/cL.
+  `--winding-damping` overrides only winding message updates, not the prepass;
+  it is the new-message fraction in (0,1]. Both require joint-grid mixed BP.
+- Opt-in `--winding-best-feasible` uses the shared normalized negative-log
+  objective, including temperature-scaled unaries and pair factors, to retain
+  a hard-feasible decoded report at fixed checkpoints and the actual terminal
+  decode. It never uses references/GT. The retained state includes physical
+  winding labels, phase/gain and component signs, not support indices.
+  Report selected iteration, terminal objective, selected objective and overhead.
+  The experimental runners are capped at500 iterations by explicit user request;
+  do not resume higher-budget sweeps without a new request.
+- Opt-in local-event `--winding-run-opening lambda` charges once per maximal
+  disabled source run, including wholly disabled traces. Start unary plus binary
+  active-to-disabled factors follow nonoverlapping source arc order, without
+  bridging source identities or geometry gaps. Fixed prepass Defects participate
+  as one-state variables, preserving their costs even when ordinary factors
+  have been pruned. These factors do not change winding gauges or orientation
+  prepass. Cost uses orientation temperature, identically in messages and decode
+  objective; lambda0 adds no factors.
+- Opt-in local-event `--winding-gap-repair N` performs bounded deterministic
+  native interval moves after feasible decoding: restore a whole gap or a single
+  gap endpoint; disable an active bridge no longer than256basevoxels. Preserve
+  fixed prepass Defects and gauges; evaluate all affected external factors.
+  Consider at most8 supported common winding labels (neighbors first, then
+  unary-cost rank),50000 proposals/sweep. Report cap hits, unvisited pieces,
+  accepted moves, changed lengths, objective and runtime. Only strictly improving
+  hard-feasible moves are accepted; this is not global optimization. Unset/zero
+  retains existing behavior. No experimental option is enabled by default.
+- Experimental local-event fixed-prepass `--winding-source-window V` adds
+  source-memory factors (0 off, positive window length, -1 whole compatible
+  source chain). `--winding-source-overlap O` uses midpoint membership in
+  half-open windows of stride V-O. Fine measured factors and disabling unaries
+  are not duplicated. Sequences stop at source/geometric gaps or incompatible
+  active integer gauges; fixed Defects cannot establish a gauge bridge.
+  A deterministic memory remembers the last retained class/winding through
+  disabled pieces. A different next retained label costs
+  `--winding-source-break C` (infinite by default), and each disabled run costs
+  `--winding-source-opening C` (default0), both temperature-scaled. There is
+  exactly one memory trajectory per fine assignment, no hidden-label entropy.
+  Existing hard adjacent continuity remains, so changes require disabled gaps.
+  Native forward/backward computes exact conditional factor messages, in
+  parallel per factor, but global BP remains approximate. Messages remap with
+  integer support; normalized decode objective includes these factors.
+  Hard-window final projection preserves fixed states/gauges and only disables
+  conflicting retained labels; report its count separately. Overlap may couple
+  spans longer than the nominal window. Cannot combine with interval repair,
+  decode repair or the separate run-edge prior. No default promotion: the
+  initial bounded matrix worsened scores; report2026-10-02-iso20-source-memory.
+- A newly available late-Defect state has log unary
+  `-winding_defect_cost * incident_measurements / orientation_temperature`.
+  In fixed-prepass mode, incidence counts only retained measurements with an
+  active winding term or hard-sign restriction after filtering. The finite
+  nonnegative `--winding-defect-cost` defaults independently to `1`; changing it must not
+  change the prepass unary. Fixed-prepass winding factors
+  do not repeat the H/V same/different orientation energy; they use only
+  winding evidence, so the completed orientation pre-pass is not counted
+  twice. Alternating calibration and component-sign updates exclude pair mass
+  whenever either final endpoint state is Defect.
+  Calibration, component sign, integer support, and winding potentials retain
+  the selected solver's existing behavior. Reports preserve the soft pre-pass
+  marginals and separately record `fixed-prepass`, the pre-pass class, and the
+  final H/Defect/V posterior per piece. Winding diagnostics record the separate
+  winding Defect cost. Final OBJ layers use the final class.
+  Joint orientation inference remains the default when the option is absent.
+- `joint-grid` has no H/V/Mixed pre-pass. Each piece has `(A,k)` and `(B,k)`
+  states plus one winding-free Defect state, with the crop-central piece of each connected constraint
+  component fixed to `(A,0)`. Each component has a binary ladder-order sign,
+  while one explicit calibration variable over `(log gain, phase)` is shared
+  by every component. Aligned-normal sign resolution remains separate and is
+  never inferred by this variable.
+- Without fixed orientation, joint-grid uses `--winding-defect-cost` as its
+  sole Defect unary. Non-fixed alternating uses the orientation prepass
+  posterior as its orientation prior and does not charge this unary again.
+- A joint non-Mixed factor charges orientation and winding evidence once.
+  Same classes cost the perpendicular score, different classes cost the
+  parallel score, and every measurement additionally contributes
+  `parallel*abs(delta-signed_integer_target)` plus
+  `perpendicular*abs(gain*delta-signed_target)` when its signed target exists.
+  Orientation and the Mixed unary retain `--bp-temperature`; winding retains
+  its established temperature `0.25`. A Defect endpoint makes the complete
+  pair factor neutral, so it transmits neither orientation nor winding
+  evidence and cannot couple winding ladders through a crossing fiber.
+- Each admitted enabled nonzero dominant sign is hard when global sign mode is
+  hard or its raw absolute connector alignment with the aligned Lasagna normal
+  reaches the configured inclusive threshold. The default threshold is
+  `cos(30 degrees)`. Perpendicular uses the closest connector alignment;
+  parallel uses the deterministic median over admitted signed connector
+  samples. This gate runs after dominant-hypothesis, sign-enable, nonzero-target,
+  and parallel-cutoff admission and before confidence transforms. Missing
+  alignment is not promoted; disabling the gate leaves finite-sign behavior.
+  For a hard sign, an active-active state is admissible only when
+  `signed_target*predicted_delta > 0`; zero and reversed deltas have exactly zero
+  probability. A Defect endpoint remains neutral. Solver preparation,
+  diagnostics, reference inference, and final feasibility decoding must use the
+  identical promotion rule.
+- Exact zero-probability messages use finite-log sums plus negative-infinity
+  counts for cavity construction. Damping changes finite/impossible support
+  explicitly and must never evaluate `-inf - -inf` or replace the exclusion
+  with a finite sentinel penalty.
+- Joint gain uses an absolute lattice in `log(gain)` centered initially on
+  gain 1; phase uses a fixed absolute lattice spanning `[0,0.5]`. Support
+  changes are considered only after both message and calibration posteriors
+  settle. One-sided boundary pressure shifts the gain window by one physical
+  cell only when the leaving boundary is negligible. Otherwise the window
+  grows within the explicit resource guard. Retained physical cells preserve
+  their messages and newly exposed cells receive neutral incoming messages.
+  Integer support similarly expands from settled orientation-marginalized
+  boundary pressure without restarting BP.
+- Joint convergence requires message residual convergence, calibration
+  posterior stability, resolved support pressure, and consecutive stable
+  iterations. Reports include solver mode, calibration MAP and posterior
+  means, entropy, absolute gain bounds, boundary masses, grid shifts,
+  component-sign posterior/MAP, state count, and convergence. No cost-based
+  post-fit or automatic fallback to `alternating` is permitted. A final
+  deterministic feasibility decode may remove hard-sign violations by changing
+  active pieces to Defect. It then resolves each mismatched active-active hard
+  continuation edge by changing one endpoint to Defect; existing Defects split
+  the chain. It repeats sign/continuity projection once. It never changes phase, scale, or component
+  sign. The authoritative published state must contain neither a hard-sign
+  violation nor a hard-continuity mismatch.
+- Joint-grid may instead use fixed calibration when both a phase in `[0,0.5]`
+  and a finite positive measurement scale are supplied. Fixed calibration is
+  a distinct reported mode, not a one-cell latent calibration posterior: pair
+  factors consume scalar phase and reciprocal gain directly, no calibration
+  messages or marginals exist, gain support cannot move, and calibration does
+  not enter resource accounting or convergence. Piece, component-sign, and
+  adaptive integer-support inference remain unchanged. Integer support changes
+  are gated only by settled piece/sign messages. Fixed mode reports the exact
+  supplied phase and scale as both MAP and mean, one reporting cell, zero
+  calibration entropy/residual/boundary mass/shifts/iterations, and calibration
+  convergence equal to message convergence. Supplying only one fixed value or
+  combining fixed values with explicit adaptive-grid controls is invalid.
+- In `alternating`, the established Mixed-state orientation BP runs first. Its
+  normalized A/Mixed/B posterior is the alternating winding stage's soft node
+  prior. The
+  winding stage must not repeat the same/different factor or the Mixed unary.
+- For positive measurement scale `s`, raw perpendicular and parallel winding
+  observations are first transformed by `s`. Perpendicular targets are then
+  signed-half-integer quantized and parallel targets are coherently signed- or
+  unsigned-integer quantized. Canonical class, power-of-two distance decay,
+  parallel cutoff, and sign activation are derived only after that transform.
+  For latent coordinate difference `delta`, a parallel-dominant measurement
+  contributes `p*abs(delta-integer(raw_parallel*s))`; a
+  perpendicular-dominant measurement contributes
+  `q*abs(delta-half_integer(raw_perpendicular*s))`. `p` and `q` are its
+  parallel and perpendicular scores, but the losing hypothesis contributes
+  zero winding energy. The H/V relation potential continues to use the two
+  scores as alternative same/different assignment costs, preserving confidence
+  through their difference rather than treating both as winding evidence.
+  The residual is expressed in latent winding units. Repeated
+  endpoint pairs sum complete measurement energies. A component may consume
+  signed evidence from only one aligned-normal component.
+- Mixed remains a piece-local error state with one unary cost and no integer
+  winding coordinate. If either endpoint is Mixed, the complete pairwise
+  potential is neutral. It therefore disables parallel, perpendicular,
+  orientation, calibration, and component-sign evidence for that assignment.
+- For fixed phase and positive scale, run stable synchronous damped sum-product
+  over `(A,k)`, `(B,k)`, and one Defect state. Sum boundary probability over
+  active classes and normalize by total active mass before adaptive integer
+  support expansion; zero active mass cannot request expansion. The single
+  Defect message slot is remapped by identity while active slots are remapped
+  by integer coordinate. Gauges contain only `(A,0)` in ordinary joint mode.
+  Expansion continues until resolved or the explicit total-state guard throws.
+- Alternating calibration computes full pair beliefs. Oriented pair mass forms
+  an expected squared-residual proposal in inverse-scale coordinates
+  `g=1/scale` and `h=g*phase`. The bounded fit uses the exact wedge induced by
+  phase `[0,0.5]` and scale `[0.5,2]`; a rank-deficient normal matrix retains the
+  previous unidentifiable values. Backtracking accepts the proposal only when
+  the authoritative scale-first, re-quantized fixed-belief expected L1 winding
+  energy does not increase.
+  Both component-sign selection and phase/scale backtracking reject candidates
+  that reverse any contributing nonzero signed perpendicular observation.
+  Mixed pair mass does not calibrate phase or scale.
+- Use deterministic phase/scale initializations. Rank converged starts before
+  nonconverged starts, then select the lowest complete energy of the per-node
+  joint-marginal argmax assignment; this is a decoded loopy-BP assignment, not
+  an exact MAP claim. Stable ties use initialization order. A message-limit
+  result stops that start's calibration and remains a labeled finite candidate.
+- Reports expose joint A/Mixed/B marginals and explicit winding validity.
+  Integer MAP/posterior values are authoritative only for active pieces;
+  Defect rows use `NA` in CSV winding fields and are excluded from `w_N` OBJ
+  layers. Reports additionally expose
+  latent coordinate, phase, scale, component sign, calibration rank/status,
+  initialization, decoded energy, hard-sign projected-Defect count, support,
+  convergence, and timings. Published
+  `w_N` layers group integer `k` after a nonnegative display offset. The CSV
+  retains relative `k` and component identity. Finite iteration-limit results
+  remain usable but must be labeled nonconverged.
+- Winding reports also expose the authoritative post-projection MAP
+  H/V/Defect class, finite MAP latent coordinate for active pieces, and the
+  independently gauged effective-winding subgraph ID for every piece. A
+  hard-sign-projected Defect has no latent coordinate. Consumers must use these
+  fields rather than reconstructing MAP state from node marginals or the
+  broader H/V factor-component ID.
+- Winding factor diagnostics preserve raw original-order and raw
+  canonical-order signed observations, separately expose the effective
+  half-integer canonical target, its winding-weight multiplier, and its
+  effective parallel/perpendicular winding weights, and derive any calibrated
+  latent target from that effective value.
+- Every completed winding solve must report final agreement as separate items:
+  continuity; perpendicular H/V, signed winding value `0.5`/`1.5+`, and extra
+  sign hardness; parallel H/V, signed winding value `0`/`1`/`2+`, and extra
+  sign hardness; plus their sum. Structural extraction determines which items
+  are listed even when a tested solver weight is zero. Factors with a Defect
+  endpoint neutralize every applicable item independently. Active winding-value
+  items compare the signed canonical target, while sign items independently
+  check ordering. The reported percentage is `infringed/evaluated`; a zero
+  denominator is `NA`.
+- The reusable interleaved solver exposes an optional synchronous progress
+  callback. Events identify preparation, the one-based multi-start
+  initialization, calibration iteration, adaptive-support round, BP message
+  iteration and residual, candidate-state count, current phase/scale, elapsed
+  time, and terminal completion. Events are emitted only after synchronized
+  message updates and are observational: enabling them must not change solver
+  ordering, arithmetic, convergence, or results. The CLI throttles repeated
+  message events but forces stage transitions. It must not print a global
+  percentage because convergence, support expansion, and per-state work leave
+  no valid fixed denominator. After one calibration completes, the CLI may
+  report `eta_est` using mean calibration duration and all remaining maximum
+  calibration slots, labeled `eta_basis=calibration_max`. After one full
+  initialization completes it switches to mean initialization duration,
+  labeled `eta_basis=initialization`. Both estimates subtract elapsed work in
+  the active unit, are empirical rather than conservative, and are recomputed
+  after each matching completion.
+
+## Winding fiber Napari visualization
+
+- `vc_fiber_trace_chunk direction-ablation` optionally accepts the paired
+  `--reference-fiber-dir DIR --reference-fiber-tag TAG` diagnostic options.
+  It scans regular `.json` files immediately inside `DIR` in lexicographic
+  path order, selects an exact case-sensitive tag match, and strictly parses
+  each selected document with the shared VC3D fiber parser. Missing `tags`
+  skip a document; present tags must be an array of strings. Malformed JSON,
+  malformed selected fibers, selected fibers with fewer than two dense line
+  points, or zero matches are errors. The reference data never changes
+  splitting, constraints, BP, or published winding labels.
+- A successful tagged selection writes `<base>_reference.obj` with the exact
+  preamble `VC3D tagged reference fibers` and one uniquely named ordered
+  polyline per retained in-crop run. The authoritative bounds are the input
+  trace artifact's finite, positive-extent, half-open base-XYZ crop; they are
+  not derived from its storage grid. Point membership is `minimum <= p <
+  maximum`. A computed entry/exit intersection may equal a maximum face only
+  as the closure endpoint of a retained segment. Maximum-face-only and
+  point/tangential contacts are discarded. Exit/re-entry produces separate
+  source-ordered runs with stable source and run ordinals. Matching fibers
+  with no nondegenerate crop intersection are an error. The CLI owns this
+  sibling: a successful
+  `direction-ablation` run without reference options removes an older sibling,
+  and any unsuccessful selection, validation, or clipping does not leave a
+  stale artifact.
+- When tagged reference fibers are loaded, the CLI must reuse those exact
+  cropped runs and invoke the canonical `extractFiberTraceConstraints` path
+  exactly once, outside any ablation checkpoint loop. It must use the active
+  resampling, piece length/overlap, distance, tangent-window, winding-step,
+  winding-cutoff, thread, and batched normal-aligned Lasagna sampling settings.
+  Downstream pruning, constraints-per-fiber limits, perpendicular-only
+  selection, and labeling filters must not alter this raw diagnostic set.
+  Generated hard continuity links and measured links whose runs came from the
+  same selected source fiber must be excluded. Lexicographic selected-source
+  path order assigns virtual winding `W_i = 0.5*i` before crop retention; an
+  empty source retains its slot and all its runs share that value. Each
+  remaining measured link is presentation-oriented from `min(i,j)` to
+  `max(i,j)` and is emitted exactly once under the lower source. Extractor
+  order is preserved within each output group. The report is retained until a
+  matching reference-to-BP benchmark has fitted its global sign. Each BP
+  execution formats its own copy of these tables with that sign; no
+  uncalibrated duplicate is emitted.
+- With `--reference-constraint-details`, reference constraint output has one
+  source section in source order, with the
+  source name and virtual winding only in its header. Each section prints a
+  perpendicular table followed by a parallel table; an exact orientation-score
+  tie belongs to perpendicular. Both tables have exactly `target_winding`,
+  `raw_step`, `calibrated_step`, `canonical_step`, `gt_step`, and
+  `calibrated_minus_gt` columns, or `(none)` when empty. `raw_step` is the
+  source-oriented signed measurement before global-sign calibration. When a
+  signed measurement exists, `calibrated_step` is
+  `global_sign*raw_step`; an unsigned fallback remains a nonnegative magnitude
+  because calibration cannot manufacture its direction. `canonical_step`
+  quantizes `calibrated_step`, using the signed half-integer winding-solver rule
+  in perpendicular tables and signed nearest-integer rule in parallel tables.
+  `calibrated_minus_gt` is `calibrated_step` minus
+  `0.5*(target_source-owner_source)`. The additive per-gauge calibration offset
+  is not applied to a difference because it cancels between endpoints. Run, piece,
+  distance, score, and extractor-index metadata are not printed. After all
+  source tables, print one `reference constraint canonical summary` with
+  `correct`, `false`, and `total`. Increment it while emitting each displayed
+  measured piece-pair row; do not deduplicate repeated rows for the same source
+  pair. A row is correct exactly when its calibrated, table-specific canonical step equals
+  its virtual GT step. Empty diagnostics print `0 0 0`, and always satisfy
+  `correct + false = total = displayed row count`. This output is diagnostic
+  only and must not change main constraints, BP, or published labels. Without
+  that flag the per-source tables are omitted, but the canonical summary and
+  compact conflict summaries remain present. The flag requires the paired
+  reference-fiber options.
+- Each calibrated reference/reference table set must be preceded by a separate
+  unweighted `reference raw signed step distributions` table. Every signed row
+  is grouped by its dominant perpendicular/parallel hypothesis, source and
+  target H/V class under the selected reference phase gauge, and virtual
+  separation. Opposite-parity bands are `0.5`, `1.5`, and `2.5+`; same-parity
+  bands are `1`, `2`, and `3+`. Each nonempty group reports count, raw signed
+  minimum, mean, median, and maximum. This table must not use solver admission
+  or effective weights and must not canonicalize the measurements.
+- The raw distribution must be followed by `reference constraint phase
+  calibration`. It uses every signed, dominant perpendicular, opposite-parity
+  reference row with unit weight and enumerates winding direction plus the
+  even-reference H/V assignment. For source index `i`, parity `p=i mod 2`,
+  direction `d`, and phase `phi`, the two gauges are
+  `d*(floor(i/2)+p*phi)` and `d*(ceil(i/2)-p*phi)`. At the run's fixed positive
+  measurement scale it minimizes
+  `sum(abs(predicted_delta/scale-raw_signed_delta))` exactly over `[0,0.5]` by
+  testing all L1 breakpoints and both bounds. Sign penalties and all production
+  factor weights are excluded. Same-parity perpendicular and both parallel
+  parity classes are counted but do not identify phase. This diagnostic must
+  not change solver calibration, state, or artifacts.
+- Each calibrated reference/reference table set must be preceded by a separate
+  `reference constraint measurement-scale calibration` table. It must use the
+  matching BP benchmark global sign and the exact effective magnitude weights
+  produced by the shared winding-factor preparation path: dominant hypothesis,
+  canonical target, parallel-cutoff admission, class multiplier,
+  power-of-two distance decay, decision confidence, and normal confidence.
+  It must not duplicate those rules in the CLI. Its magnitude objective is
+  `sum(w*abs(gt/scale-target))`; it must be evaluated separately for the
+  globally signed continuous raw measurement and for the canonical quantized
+  target using identical effective weights. The raw result estimates
+  integration bias before target snapping. The canonical result describes the
+  target consumed by current inference and may be pinned exactly at one by
+  quantized target/GT ratios without implying exact physical calibration.
+  Scale-independent hard and finite sign costs
+  are excluded, while negative calibrated targets remain signed in the L1
+  residual. Over the fixed diagnostic interval `[0.5,2.0]`, reciprocal scale
+  `g=1/scale` is the deterministic bounded weighted median of locations
+  `target/gt` with weights `w*abs(gt)`. If the weighted median has an interval
+  of minimizers, prefer reciprocal scale one when it lies in that interval,
+  otherwise the closest endpoint; then clamp to the diagnostic interval.
+  Rows with zero GT add constant loss but do not identify scale.
+- The scale table must report raw and canonical rows for `perpendicular_all`,
+  `parallel_all`, `all_constraints`, and all five canonical groups
+  (`perp_0.5`, `perp_1.5+`, `parallel_0`, `parallel_1`, `parallel_2+`) with total,
+  admitted, and informative counts, `sum(w)`, `sum(w*abs(gt))`, scale-one loss,
+  fitted scale/loss, reduction percentage, and bound status. The combined
+  perpendicular row is solver-compatible. Perpendicular group rows are
+  per-class diagnostics. The parallel and all-constraint aggregates and all
+  parallel group rows are labeled counterfactual because the current solver's
+  integer parallel magnitude bypasses measurement scale.
+  Scale below one means the selected raw or canonical targets exceed known
+  latent separation; scale above one means they are smaller. The existing detailed constraint tables retain
+  exactly their specified six columns and computing the scale fit must not
+  alter solver state or output artifacts.
+- `vc_fiber_trace_chunk direction-ablation` defaults joint-grid winding
+  calibration to fixed phase `0.5` and measurement scale `0.822`, derived from
+  the combined continuous reference/reference fit. Explicit fixed phase and
+  scale flags override both defaults together. `--winding-adaptive-calibration`
+  restores latent phase/scale inference and may be combined with adaptive-grid
+  controls, but not explicit fixed calibration.
+- For each represented `sum-product-mixed` BP cohort, tagged references enable
+  a second diagnostic extraction between canonical reference pieces and the
+  exact BP piece lines. Reference runs reuse the pieces already produced by the
+  reference/reference extractor; the cross extractor preserves each supplied
+  line as one piece and filters distinct-trace candidates to reference/BP pairs
+  before scoring. It runs against the final retained component for each
+  balance/solver execution. Reference/reference,
+  BP/BP, and hard-continuity links are absent. Accepted repeated piece-pair
+  measurements are not deduplicated by source fiber.
+- Cross constraints are evaluated only after BP and never enter its graph.
+  Exact parallel/perpendicular score ties are perpendicular. For signed
+  perpendicular raw target `d`, measurement scale `s`, and BP MAP latent `z`,
+  first compute the signed half-integer target `q=half_integer(s*d)`. A
+  reference at endpoint A of `A -> B` is inferred as `z-q`; at endpoint B it
+  is `z+q`. A parallel constraint similarly scales before integer
+  canonicalization; a canonical nonnegative integer distance `n` infers
+  the endpoint-ordered signed candidate; an unsigned fallback retains both
+  `z-n` and `z+n`. `n=0` is `parallel_same`, otherwise it is
+  `parallel_other`. A Defect/invalid BP endpoint or unsigned perpendicular
+  observation has no inferred candidate. Constraints whose BP endpoint is
+  final Defect/Mixed or otherwise winding-invalid are excluded from both
+  calibration and all benchmark totals. An unsigned perpendicular observation
+  from an otherwise active endpoint remains a non-candidate and is likewise
+  excluded.
+- Reference source `i` retains virtual winding `0.5*i`. Before calibration,
+  infer one raw half-integer winding per `(reference source, effective-winding
+  gauge)` using the same dominant-factor scorer as the final `all` row, with an
+  identity gauge mapping. Raw inference uses admitted evidence but must not read
+  the virtual reference winding, reporting tolerance, or calibration state.
+  Every raw estimate is one calibration vote regardless of constraint degree.
+  Fit one global sign and one half-integer offset per gauge from candidate
+  offsets `raw - sign*virtual`. For each sign and gauge, maximize literal exact
+  estimate matches, then minimize summed absolute estimate residual; remaining
+  offset ties prefer smaller absolute offset and then smaller signed offset.
+  Across signs maximize total exact matches, then minimize total residual, then
+  prefer sign `+1`. Gauge-offset magnitude must not choose global sign. Gauges
+  with no admitted raw estimate are absent. The later inclusive `0.5` tolerance
+  applies only to constraint accuracy and estimated-winding support; it cannot
+  affect calibration. Candidate-bearing observations from calibrated gauges
+  remain in those final accuracy totals even when their coefficient was
+  suppressed, preserving the broader diagnostic population.
+  Print balance mode, solver/status, per-gauge
+  offset/exact-match/estimate-vote rows, then one
+  row-oriented `reference constraint groups finite weighted L1` diagnostic per
+  original reference source and evidence group. Groups are selected from the
+  same dominant-hypothesis projection as the reference accuracy benchmark:
+  canonical perpendicular distance `0.5`, canonical perpendicular distance
+  `1.5+`, canonical parallel distance `0`, canonical parallel distance `1`,
+  and canonical parallel distance `2+`. Canonical distances are absolute and
+  are assigned only after half-integer or integer target quantization.
+  Each group row reports valid observation count, raw finite-L1 coefficient,
+  coefficient admitted after the active parallel-distance cutoff, total and
+  admitted-coefficient-normalized loss at the calibrated true winding, the
+  half-integer winding preferred by that group alone, and its total and
+  normalized loss. Each categorized constraint contributes exactly its
+  dominant BP winding term: the winning hypothesis score times its
+  `2^-floor(abs(canonical_step))` distance multiplier. Perpendicular and
+  parallel loss both use latent-coordinate error directly against their
+  scale-first canonical target. Parallel cutoff
+  suppression matches factor preparation. Inferred candidates are mapped from each independent gauge
+  with `globalSign * (candidate - gaugeOffset)`, allowing one reference source
+  to combine evidence from multiple gauges without another calibration.
+  Preferred winding first minimizes violated hard perpendicular signed-order
+  constraints and then minimizes admitted weighted L1 on the half-integer lattice;
+  exact ties prefer lower signed winding.
+  Empty and zero-admitted-coefficient groups print `NA` loss/inference values.
+  Print hard-violation counts at truth and at the preferred winding. Add an
+  `all` row containing every categorized constraint for that reference, and
+  use exactly its preferred winding as the following compact row's `est_w`.
+  This replaces support-count/squared-residual reference inference. BP makes a
+  hard-sign-violating active state impossible and may select Defect; because
+  the reference diagnostic is forced active, contradictory signs instead use
+  the minimum-violation lexicographic fallback before finite factor energy.
+  The internal per-`(source,gauge)` raw estimates above are calibration votes;
+  they are not the compact table's displayed `raw_w`. Displayed `raw_w` must
+  use the exact selected `est_w`, inverse-map it with the fitted global sign and
+  the one gauge shared by all candidate-bearing evidence used for that source,
+  subtract the reference class offset determined by source H/V parity, the
+  unique contributing orientation component's phase sign, and the selected
+  phase, then add the same output offset used by published integer winding OBJ
+  layers. An integral result names that output winding slot. No estimate,
+  multiple contributing gauges, incompatible orientation components, or a
+  valid half-step candidate that maps to the opposite H/V integer output
+  ladder prints `NA`. A selected candidate outside the half-step lattice is an
+  invariant error. This display mapping must never run another candidate
+  selection.
+  Then print one compact row per original selected reference source in source order, identified
+  only by its virtual winding `0.5*i`. Each source row
+  contains `right`, `wrong`, and `right_fraction` for perpendicular winding,
+  perpendicular sign hardness, parallel-same winding, parallel-other winding,
+  parallel sign hardness, and sum; zero-total fractions are `NA`.
+  Follow this with aggregate `right`, `wrong`, `total`, and
+  `right_percent` rows for
+  those same five classes and `sum`. Empty classes
+  print `NA` percent, and right plus wrong always equals total. Per-source rows
+  reuse the single global gauge calibration, aggregate all runs and pieces of
+  one source, include explicit zero-observation sources, and sum exactly to the
+  aggregate `sum` row.
+- Before the compact reference benchmark, print two factor-conflict summaries
+  with identical columns and semantics. The reference/reference summary fixes
+  both endpoints to `global_sign * (W_b-W_a)` in the prepared factor's
+  canonical endpoint order and excludes hard-continuity and same-source links.
+  The reference/BP summary fixes only the reference endpoint and retains the
+  ordinary BP state. Both consume the exact materialized targets and effective
+  coefficients and split rows into `perp_winding_0.5`,
+  `perp_winding_1.5+`, `perp_sign`, `parallel_winding_0`,
+  `parallel_winding_1`, `parallel_winding_2+`, and `parallel_sign`, plus a
+  `sum`. Magnitude and sign factors are counted independently. Omit
+  zero-effective-weight magnitude factors and sign factors that are neither
+  hard nor assigned a positive finite penalty. Signed magnitude residual is
+  `abs(predicted_delta-target)`; unsigned parallel magnitude residual is
+  `abs(abs(predicted_delta)-target)`; sign violation is
+  `target*predicted_delta <= 0`.
+- The compact reference winding table must include `parity_ok` beside `est_w`.
+  For source `i`, normalize the modulo-two parity of integer half-step index
+  `round(2*est_w)` and compare it with `i mod 2`. Missing estimates print `NA`;
+  a finite estimate outside the half-step lattice is an invariant error. No H/V
+  naming gauge is applied. Whole-winding errors preserve parity, while
+  half-step errors change it.
+- Before the compact winding table, benchmark solved H/V endpoint consistency.
+  Carry final endpoint active state, published H/V class, and BP component in
+  every reference cross observation independently of winding-target admission.
+  Exclude only final Mixed/Defect or otherwise inactive endpoints; unsigned,
+  cutoff-suppressed, zero-weight, and candidate-free winding observations still
+  count when their endpoint is active. Reference source parity is `i mod 2`.
+  Parallel-dominant constraints expect the same class and perpendicular-
+  dominant constraints expect the opposite class; exact score ties are
+  perpendicular. Fit the binary mapping from even/odd reference parity to H/V
+  independently per BP component by maximizing correct observations, choosing
+  even-to-H on an exact tie. Print component mapping vote totals plus per-source
+  and aggregate perpendicular, parallel, and sum right/wrong/fraction rows.
+  Repeated cross measurements count separately, zero-observation source rows
+  remain present, and source sums must equal aggregates. This measures
+  consistency between solved class and dominant geometry; it does not identify
+  which one caused a mismatch.
+- Before each reference-to-BP benchmark, print a final-state cohort table for
+  the BP execution. Capture the central cohort before component filtering as
+  pieces whose original local `pieceIndex` is one; carry that bit through all
+  subset remapping. The other row contains every remaining retained piece.
+  Count post-projection winding-valid H and V separately and as active; final
+  Mixed/Defect and any winding-invalid piece count as Defect. Include total
+  pieces and Defect percentage, using `NA` for an empty cohort. Central plus
+  non-central must exactly equal the total row. Without reference input, emit
+  the same table with the deferred BP diagnostics.
+- Immediately after that state table, print admitted winding evidence for the
+  same central, non-central, and total cohorts. Use the winding solver's
+  authoritative factor diagnostics after fixed-orientation exclusion,
+  quantization, distance-cutoff suppression, and coefficient downweighting.
+  Report a unique admitted-measurement row followed by continuity,
+  perpendicular-winding, perpendicular-sign, parallel-same-winding,
+  parallel-other-winding, and parallel-sign term rows. Winding rows report the
+  ordinary signed-value coefficient. Sign rows report the additional finite or
+  hard ordering rule separately.
+  A measured constraint contributes to exactly one perpendicular or parallel
+  row according to its dominant hypothesis, matching the solver. Each endpoint is one incidence: an internal
+  constraint contributes twice to one cohort and a cross-cohort constraint
+  once to each. The measurement row counts admitted winding measurements; it
+  can be smaller than the Defect-unary degree when the parallel cutoff suppresses
+  a parallel-dominant winding term. Report incidence and coefficient totals, incidence and
+  coefficient per final active and Defect piece. For the sign row, report hard
+  signed-order incidence and incidence per final active and Defect piece.
+  Active and Defect numerators are endpoint-stratified before division. A
+  Defect endpoint neutralizes its realized pair energy, so its reported
+  coefficient is admitted evidence that selecting Defect evades, not realized
+  final energy. The table is descriptive association, not proof of causality.
+- Buffer the reference/reference tables and every reference-to-BP benchmark
+  generated across checkpoints and balance modes. Emit them in execution order
+  after all ordinary `direction-ablation` summaries and immediately before the
+  command returns.
+- The winding viewer consumes current published state artifacts matching
+  `<base>_w_N_{h,v,err,tie,broken,disabled}.obj`. Aggregate `<base>_w_N.obj`, CSV reports, and
+  unrelated siblings are not state layers. At least one matching artifact is
+  required, but state files and whole winding labels may be absent. Every file
+  that is present still receives strict header and geometry validation.
+- OBJ input follows the shared strict ordered-polyline contract. Container
+  names are unique, indices are global and one-based but must reference only
+  vertices owned by the current container, and every nonempty container owns
+  exactly one ordered nonbranching path. Orphan/cross-container vertices,
+  branching, cycles, disconnected chains, unsupported records, and singleton
+  winding fibers are errors. The existing fiber-presence reader uses the same
+  parser while retaining its own header, metadata, and crop validation.
+- Every H/V/error/tie/conditioned-broken/final-disabled slot at every integer winding from the lowest through the
+  highest observed artifact label becomes an independent managed 3D Napari
+  path layer. Present nonempty artifacts supply geometry; empty or absent
+  artifacts and completely absent intermediate windings become empty layers.
+  H and V at one winding `N` have exactly the same bright opaque color derived
+  from `N`; error, tie, conditioned-broken, and final-disabled remain distinct
+  from H/V and each other. Viewer category `All broken` contains Mixed/error
+  argmax (`err`), exact argmax ties (`tie`), conditioned offenders (`broken`),
+  and final-solve Defects (`disabled`). H, V, conditioned-broken,
+  final-disabled, All broken, All, and None presets act across every
+  winding. Full-size Previous/Next buttons snapshot and circularly rotate the
+  complete managed state visibility mask over that contiguous winding
+  range. Next moves source slot `i` to `(i+1) mod N`; Previous moves it to
+  `(i-1) mod N`, preserving state. Hidden bits move exactly like visible bits,
+  so arbitrary sparse selections and missing/empty windings rotate bijectively
+  without being replaced by a preset. One observed winding is a no-op.
+  Unmanaged Napari layers remain unchanged. The displayed winding label
+  summarizes all currently visible managed winding labels and follows presets,
+  rotations, and manual layer-visibility changes.
+- A run with tagged reference fibers publishes both aggregate
+  `<base>_reference.obj` and one indexed
+  `<base>_reference_hs_<i>.obj` per filename-ordered source. Indexed file `i`
+  contains exactly the nonempty `reference_<i>_...` polyline and represents
+  virtual winding `i/2`. The complete artifact family is staged before the old
+  generation is replaced; a fewer-source or reference-free run removes stale
+  indexed members without matching unrelated files.
+- The viewer validates the aggregate and indexed reference artifacts under the
+  dedicated reference header and strict ordered-polyline contract. Indexed
+  filenames matching the family prefix must be well formed, and their single
+  object ordinal must match the file index. It materializes two logical
+  half-step reference slots per integer winding across the contiguous union of
+  solver and reference winding slots; absent files remain empty logical slots.
+  Reference modes are mutually exclusive: `Aggregate` shows only the aggregate
+  layer, `Selected` shows only the persistent indexed mask, and `Hidden` shows
+  neither. Aggregate is the initial mode. Previous, Next, and animation rotate
+  every indexed bit by one integer winding, preserving half-step parity,
+  hidden bits, missing slots, and wraparound even while Aggregate or Hidden is
+  displayed. This grouping is a navigation convention only and does not imply
+  physical gauge equivalence between independently gauged components.
+- Published `N` is the solver's nonnegative display-offset integer label.
+  Absolute winding and physical H/V identity are not comparable across
+  independently gauged components; visualization must not imply otherwise.
+- Winding BP accepts one finite nonnegative multiplier for each canonical
+  dominant factor class in tuple order `perp_0.5`, `perp_1.5+`, `parallel_0`,
+  `parallel_1`, `parallel_2+`. The multiplier composes with the existing
+  canonical-distance decay. Signed parallel targets are authoritative for
+  integer class selection. These multipliers affect ordinary signed
+  winding-value loss and
+  its diagnostics only; they never scale orientation loss, hard perpendicular
+  order, hard continuity, Defect unary cost, or piece-break cost.
+- `--winding-hard-signs none|perpendicular|parallel|both` independently enables
+  signed ordering for the dominant perpendicular and parallel hypotheses. The
+  default enables both. A zero winding-value weight removes that ordinary
+  signed-value term. If that dominant observation has an enabled nonzero sign,
+  its separately weighted extra sign rule may remain in winding connectivity,
+  Defect incidence, BP, projection, and reference inference. Zero/same-
+  winding and unsigned observations never impose hard signs, and parallel
+  signs obey the parallel winding cutoff. Canonical class weights do not alter
+  same-trace hard continuity.
+- `--winding-decision-confidence legacy|linear|cosine` scales only the selected
+  dominant winding factor. For selected normalized score `s` in `[0.5,1]`,
+  `legacy` uses `s`, `linear` uses `2s-1`, and `cosine` uses
+  `(1-cos(pi*(2s-1)))/2`. The default is `cosine`.
+- `--winding-normal-confidence none|linear|cosine` additionally scales that
+  factor from the connector's absolute alignment with the aligned normal.
+  `none` uses one; `linear` uses `1-2*acos(abs_dot)/pi`; `cosine` uses
+  `abs_dot`. Perpendicular evidence uses the closest connector alignment.
+  Parallel evidence uses the deterministic median over every admitted signed
+  connector sample, averaging the central pair for an even count. Missing,
+  invalid, or component-incompatible alignment is neutral under `none` and
+  zero under weighted modes. The default is `linear`.
+- `--winding-sign-weights PERP,PARALLEL` supplies finite nonnegative multipliers
+  for the additional perpendicular and parallel sign-hardness rules, default
+  `1,0.5`. Zero disables that relation's extra finite penalty and aligned hard
+  promotion but does not remove the ordinary signed winding-value residual.
+- `--winding-sign-cost` defaults to finite cost `44`. A wrong-sign or exactly
+  zero predicted delta adds
+  `sign_cost * relation_sign_weight * decision_confidence *
+  normal_confidence` per measurement. Winding class weights and distance decay
+  do not scale this term. Zero cost
+  or zero confidence removes the sign factor from energy, connectivity, and
+  Defect incidence. The literal value `hard` restores strict rejection
+  regardless of confidence. Independently, `--winding-hard-sign-angle` defaults
+  to 30 degrees and promotes admitted signs whose raw absolute normal alignment
+  reaches `cos(30 degrees)` to strict rejection; `off` disables promotion.
+  Solver, decoded energy, factor diagnostics, and reference inference must use
+  identical coefficients and promotion. These controls never alter H/V
+  orientation evidence, same-trace hard continuity, or the discrete Defect
+  unary.
+- Standard fixed-orientation crop evaluation defaults to orientation BP
+  temperature `1.25` and winding-stage Defect cost `100`. The underlying
+  winding factor temperature remains `0.25`. The default sign multipliers are
+  perpendicular one and parallel one-half; finite sign cost remains `44`, decision
+  confidence `cosine`, and normal confidence `linear`.
+- Shared and CLI H/V-aware winding defaults are `0,0,0.5,4,1`. An explicit
+  `1,1,1,1,1` tuple restores neutral class weighting. The standalone
+  raw-integer solver retains unscaled measurements because it does not
+  quantize the H/V ladder targets used for canonical class selection.
+- `--winding-weights` runs one explicit five-value winding tuple and
+  `--winding-sign-weights` runs one explicit two-value sign tuple.
+  `--winding-weight-search` takes one deduplicated positive value list and runs
+  its complete seven-dimensional Cartesian product, capped at 100,000
+  scenarios. Search requires reference fibers and mixed BP, conflicts with a
+  fixed tuple, reuses all pre-winding geometry/orientation work, isolates failed
+  scenarios, and uses the selected tuple for every final artifact and
+  diagnostic. Converged scenarios rank before nonconverged scenarios, followed
+  by exact calibrated source estimates on the fixed reference-source
+  denominator, fewer missing and incorrect estimates, more right and evaluated
+  constraints, fewer wrong constraints, residual, and lexicographic tuple.
+- `--winding-weight-search-local` requires an explicit `--winding-weights`
+  start and is mutually exclusive with exhaustive search. It searches all five
+  winding plus two sign coordinates. Each coordinate has
+  a canonical tagged state: zero or an integer power-of-two exponent relative
+  to its immutable positive starting base; an initially zero coordinate uses
+  base one. In dimension order `0..6`, a positive coordinate proposes zero,
+  `/2`, and `*2`, while zero proposes `base/2`, `base`, and `base*2`. The search
+  deduplicates these at most 21 tuples, caches successes and failures by exact
+  tagged tuple, moves only on a strict benchmark-quality improvement, and
+  repeats to a local optimum. Residual and lexicographic tuple ordering may
+  select deterministically among improving neighbors but cannot turn a quality
+  tie into a move. Positive exponents remain in `[-16,16]`; out-of-range
+  candidates are omitted, zero remains available at either bound, and the
+  printed progress denominator is the deduplicated in-range candidate count.
+  An iteration-limit exit is an error rather than a local optimum.
+- A cutoff-based seven-coordinate experiment was rejected because a `0.5`
+  parallel cutoff excluded parallel-other and parallel-sign benchmark items.
+  The corrected no-cutoff 1024 refinement evaluated 58 scenarios from winding
+  `0.5,2,1,2,1`, sign `0,1` and selected winding `0.5,0,1,2,1`, sign `0.5,1`.
+  It converged with `8/8` exact reference windings and `4835/5446` correct
+  fixed-denominator reference items (88.781%). All five reference classes must
+  be populated during this tuning protocol. No parallel cutoff is enabled by
+  default. A zero selected winding-class weight suppresses that energy term but
+  does not remove its structural diagnostic or benchmark item.
+- The subsequent zero-aware 1024 refinement against the complete 26-fiber
+  `2026-09-01_fiber_stack2` reference set evaluated 129 scenarios. It moved
+  from winding `0.5,0,1,2,1`, sign `0.5,1`, with 13 exact, 12 wrong, and 1
+  missing inferred winding to winding `0,0,0.5,4,1`, sign `1,0.5`, with 16
+  exact, 9 wrong, and 1 missing. The selected tuple is the shared and CLI
+  default.
+- Tagged VC3D reference fibers are diagnostic inputs independent of the traced
+  crop. Reference OBJ export, reference-to-reference extraction, and
+  reference-to-BP benchmarking must use each selected JSON fiber's complete
+  dense line exactly once in deterministic filename order; they must not clip
+  or split that line at the stored trace artifact bounds.
+- Joint-grid winding inference may receive an optional exact state for any
+  represented piece. An exact state fixes H/V, integer winding, and the
+  component phase-direction sign; it exposes one discrete state, cannot become
+  Defect, and requires fixed phase and measurement scale. Mixed exact states,
+  inconsistent exact states, and incompatible fixed/fixed hard continuity or
+  hard sign are errors. Post-decode hard projections may disable an unfixed
+  endpoint but must never disable or alter a fixed endpoint.
+- Exact states anchor the H/V gauge in their all-factor component and the
+  integer gauge in their effective-winding component. Unanchored H/V and
+  integer components retain the production gauges independently. Continuous
+  initialization uses the exact latent coordinates as Dirichlet anchors.
+- With tagged references, a fixed joint grid, and an explicit conditioning
+  diagnostic request, diagnostics run an additional
+  conditioned solve. It preserves every ordinary factor once, adds each
+  selected reference/BP cross factor once, preserves reference split
+  continuity, and fixes every reference piece to its filename-order annotated
+  H/V and winding in the baseline raw gauge. Output must distinguish direct
+  responses on cross-connected ordinary pieces from responses propagated
+  through the ordinary graph, and must report cross-factor agreement before
+  and after conditioning. The original reference-free solve and benchmark
+  remain the authoritative output artifacts.
+- A conditioned-to-ordinary continuation may initialize the reference-free
+  fixed-orientation joint grid from the conditioned MAP. The initialization
+  must normalize each ordinary integer component independently, validate hard
+  continuation and hard sign compatibility, and may only expand integer
+  support and initialize factor messages. It must not retain reference nodes,
+  cross factors, fixed states, or seed unaries in the ordinary objective.
+- The continuation diagnostic must also run neutral messages over the identical
+  expanded support. It reports support-only drift separately from initialized
+  drift and labels the basin outcome `unresolved` unless the cold, conditioned,
+  neutral-expanded, and initialized solves all satisfy their residual criteria.
+  This fixed-prepass diagnostic tests Defect, winding, and component-sign state;
+  H/V remains fixed by the production orientation prepass.
+- `--reference-prune-offenders` is a separate opt-in joint-grid diagnostic. It
+  runs the exact fixed-reference conditioned solve, defines every ordinary
+  post-projection Defect as an offender, removes those pieces and every incident
+  factor, removes all reference pieces and cross-factors, and solves the induced
+  ordinary graph from scratch. The second solve receives the retained fixed H/V
+  prepass labels but no reference state, fixed winding, conditioned warm start,
+  or newly synthesized continuity across a removed piece gap.
+- Offender selection is explicit and reproducible. `conditioned-defect` is the
+  compatibility default, `union-defect` uses the union of baseline and
+  conditioned post-projection MAP Defects, and `conditioned-posterior` uses the
+  strict conditioned pre-hard-projection marginal test `p > threshold`. The
+  posterior policy requires a finite threshold in `[0,1]` and never implicitly
+  adds MAP Defects. The fixed-reference prefix is excluded from every policy.
+- Nondefault policies publish policy/threshold-qualified diagnostic bases and
+  selected-piece reporting partitions MAP membership without overlapping
+  counts.
+- The diagnostic preserves `mapWinding` as invalid for a Defect. For artifact
+  placement only, joint-grid reports retain the rounded continuous winding that
+  seeded discrete support before hard projection. Final connected components
+  are independently aligned to the conditioned gauge by maximum exact agreement
+  on common active pieces, followed by minimum squared error and deterministic
+  ties. One shared nonnegative suffix offset is applied after alignment.
+- Component alignment transforms the complete compact second-inference report,
+  not only displayed integers. For `x' = s*x+b`, integer and latent winding
+  coordinates use the same transform and component phase sign becomes
+  `s*phaseSign`. The `_pruned` OBJ publisher and the second reference benchmark
+  consume that same aligned report and shared output offset, so a non-NA
+  benchmark `raw_w` names its corresponding `_pruned_w_N_*` layer.
+- The original and second-inference reference tables are explicitly headed
+  `reference original result benchmark` and
+  `reference offender-pruned result benchmark`. The second table uses the exact
+  induced subset of the original reference cross report: all reference-prefix
+  pieces and only retained ordinary pieces are kept, and no geometry is
+  re-extracted.
+- The experiment publishes a separate `<base>_pruned` family. Active retained
+  pieces use `_w_N_h.obj` and `_w_N_v.obj`; conditioned offenders use
+  `_w_N_broken.obj`; pieces disabled only by the final reference-free solve use
+  `_w_N_disabled.obj`; unsupported diagnostics use `_unresolved.obj`. It reports
+  pre-existing versus newly conditioned Defects separately and never replaces
+  the ordinary production artifact family. Absent option means unchanged solve
+  and artifact behavior.
+- `--reference-prune-policy conditioned-inliers` is the explicit
+  reference-conditioned working-set diagnostic. Fixed reference pieces are
+  protected. Conditioned ordinary Defects and direct reference sign conflicts
+  are removed first; a deterministic weighted vertex cover then removes an
+  endpoint of every remaining admitted sign conflict; finally, pieces without
+  satisfied-sign or hard-continuation connectivity to a reference are removed.
+- Sign admission and direction use the prepared factor diagnostics exactly:
+  the dominant relation supplies the signed target, and the sign exists only
+  when hard or assigned a finite positive penalty. Sign consistency is an
+  inlier invariant. Magnitude agreement may rank competing removals but is not
+  an admission gate and has zero default weight.
+- Selection is per piece. Hard continuation relates retained active neighbors
+  and contributes connectivity, but an active/Defect boundary remains legal.
+  Direct conditioned labels publish as `_inliers`; removal reasons publish as
+  `_input_defect`, `_ref_conflict`, `_sign_cover`, and `_disconnected` layers.
+  The reference-free second solve publishes separately as `_inliers_fresh` and
+  is not the authoritative diagnostic result.
+- `--reference-prune-policy oracle-inliers` is a supervised extension. It
+  rebuilds and re-solves original-ID induced subsets, accepts only converged
+  non-regressive reference tuples, and permits neutral peeling to expose
+  collective offenders. After exact-count maximization, an explicit missing
+  reference is preferable to preserving a known wrong winding. Direct and
+  fresh artifacts use `_oracle` and `_oracle_fresh`.
+- Direct conditioned-inlier diagnostics must group final active H/V pieces by
+  their assigned half-winding in the inclusive annotated reference interval
+  `0..0.5*(reference_count-1)`, using the final result's benchmark global sign
+  and integer-gauge offsets. The piece benchmark compares every removed
+  original piece with final active in-range pieces, reporting both
+  `100*removed/(removed+in_range)` and `100*removed/in_range`. It must not
+  aggregate piece-level removal into source-fiber counts. Active final pieces
+  without a calibrated gauge are reported separately.
+- The companion constraint benchmark counts every original graph constraint
+  once, independently of how many orientation, magnitude, or sign terms it
+  emits. A constraint is problematic if either endpoint was removed, a retained
+  endpoint is final Defect, or any evaluated term is infringed by the
+  authoritative conditioned result. All other retained constraints are
+  fulfilled. Report both `100*problematic/(problematic+fulfilled)` and
+  `100*problematic/fulfilled`.
+
+## Experimental sign-only ordered winding cuts
+
+- `vc_fiber_trace_chunk direction-ablation --winding-solver ordered-cuts`
+  requires fixed-prepass orientation. Prepass-Mixed pieces are excluded;
+  active H/V pieces retain their exact orientation and use phase `0`/`0.5`.
+- The backend consumes `prepareFiberTraceWindingModel`. An admitted dominant
+  sign requires a structurally present prepared sign, finite nonzero signed
+  target, and positive shared decision/normal confidence. It intentionally
+  does not consume the five magnitude-class weights or the old finite/hard
+  sign-energy multipliers.
+- For prepared endpoints `A,B`, let
+  `d=(u_B+phase_B)-(u_A+phase_A)` and `s` be the prepared target sign. The
+  perpendicular margin is `0.5`; the parallel margin is `1.0`. The two Ceres
+  residuals are `sqrt(sign_weight*confidence)*max(0,margin-s*d)` and
+  `sqrt(confidence)*(s*d-margin)`. Hard continuation contributes
+  `sqrt(continuation_weight)*(u_B-u_A)`. Defaults are `16` for both exposed
+  weights, fixed measurement scale `0.822`, and 100 Ceres iterations.
+- Hard-continuation components are indivisible during cuts. Their arithmetic
+  mean fitted offset defines a deterministic order, with minimum piece index
+  as the tie-break. Candidate thresholds exist only between unequal means.
+  Starting from one winding, a candidate increments the complete suffix by
+  one. An edge is infringed exactly when `target_sign*predicted_delta <= 0`.
+  Each iteration accepts the unused threshold with the lowest infringement
+  count only when it strictly improves the current count; ties choose the
+  lowest threshold. `--ordered-max-splits 0` means no explicit cut limit.
+- Every zero/accepted-cut checkpoint independently reruns reference
+  calibration. A separate diagnostic fixes ordinary fitted offsets and fits
+  reference offsets with the identical sign-only model, then reports pairwise
+  filename-order agreement after resolving the global order sign. Neither
+  reference diagnostic changes the ordinary solve.
+- `--ordered-prune-offenders` is an opt-in diagnostic. On each fitted active
+  cohort, a sign factor is infringed when its signed continuous interleaved
+  separation is nonpositive. A cross-source factor contributes once to each
+  endpoint trace and a within-source factor once. Source traces are ordered by
+  the exact rational fraction `infringed / incident`, then by larger infringed
+  count and lower trace index. Zero-degree and zero-infringement traces are not
+  candidates.
+- One pruning iteration removes every split piece of the selected source trace
+  through a separate active mask, preserves fixed H/V orientation metadata,
+  and reruns the same continuous fit. It reports full old-cohort violations,
+  surviving-factor violations before the refit, and the same population after
+  the refit. Iteration ends only when no active sign factor is infringed; a
+  fully exhausted cohort is a valid empty solve. The final retained cohort is
+  passed to the ordinary ordered-cut scan, and removed pieces remain inactive.
+
+# Reference endpoint replay benchmark
+
+- Optional replay reverse checks accept `--replay-reverse-normal-base` and
+  `--replay-reverse-tangential-base`, positive finite base-voxel radii with
+  unchanged defaults20/40. They affect only shared reverse-path acceptance,
+  not forward GT thresholds or restart-seed search. Equal radii give isotropic
+  distance in the existing monotone projection test. Effective radii are
+  serialized. Interval0 still disables reverse checking.
+
+- `vc_fiber_trace_chunk reference-replay-benchmark` evaluates tagged VC3D
+  reference fibers with `fiberlet` (default), `greedy`, or `lasagna` tracing in
+  a half-open base-XYZ crop. It clips each reference into every contiguous
+  in-crop run and evaluates both directions of every nondegenerate run. Replay
+  backend selection does not apply to crop tracing, direction inference, or
+  oracle pruning.
+- The graph support is the requested crop padded on every face by the configured
+  lookahead. The first replay seed must occur in the ordinary initial seed
+  window and pass the shared Lasagna-normal ellipsoid threshold. A missing
+  endpoint seed is a zero-length failure.
+- After any failure, benchmark replay uses the ordinary deterministic reset and
+  seed scan to continue through the remainder of the directional reference run.
+  It retains every failure in stable arc order. This mode does not alter the
+  ordinary replay implementation or defaults.
+- Direct greedy replay requires `--fiber-manifest`, constructs a two-control-
+  point fiber from each directed clipped run, starts at the exact endpoint, and
+  forces beam width and lookahead to one. Its prediction/trace scales and all
+  effective trace settings are serialized.
+- Lasagna replay is a reference-tangent-initialized normal-transport control.
+  At each fixed base-voxel step it predicts along the current tangent, samples
+  the sheet normal, resolves antipodal normal sign against the prior normal,
+  transports the tangent into the new normal plane, and advances. An invalid
+  normal retains the previous direction. It starts exactly at the reference
+  endpoint and does not perform global line optimization. Normals alone are not
+  treated as a fiber-direction prediction.
+- All backends share forward reference matching and the anisotropic threshold.
+  Fiberlet retains its seed-window/reset policy; direct backends reset by their
+  native evaluation step. Backend initialization, evaluation spacing, reset
+  advance, and invalid-data policy are explicit JSON fields because these can
+  affect comparative failure counts.
+- Credited length is the interval union of every seeded replay segment from its
+  first match search-begin arc through its segment end. Missing-seed gaps and
+  unseeded tails receive no credit. Length-weighted success remains
+  `100 * sum(credited directed length) / sum(full directed length)`, where the
+  denominator is twice the sum of all undirected in-crop run lengths.
+- Evaluation completion, failure-free direction status, total failures,
+  failures per directed millimeter, mean seeded-span length, and mean span to a
+  failure are separate metrics. A successful terminal suffix contributes to
+  mean seeded-span length but not mean failed-span length; an unseeded failure
+  contributes a zero failed span. Millimeter conversion requires an explicit
+  positive base voxel size.
+- The primary mean segment length is `sum(full directed reference length) /
+  (total_failures + directed_cases)`. Each independent directed reference is
+  partitioned at its directional failure arcs, from 0 through its full length.
+  Successful terminal spans count, including a zero terminal at an endpoint
+  failure. Repeated failure positions give zero segments. Forced reset advance
+  is included in reference-distance accounting, not claimed as successfully
+  traced length. The partition sum must equal full directed reference length.
+  A 10mm direction with one restart has two segments and mean5mm. Pool segments
+  across cases; never average case means. All failure reasons count; reject
+  incomplete evaluation. Empty summaries use zero count and numeric zero means.
+- Median/P05/P95 use the same complete partition with linear interpolation at
+  `(n-1)*q`. Failure-only, credited seeded-span and physical-path statistics
+  remain explicitly separate diagnostics, never headline quality metrics.
+- Version5 supersedes version4's incorrect whole-corpus `F+1` accounting with
+  `reliability_segments=total_failures+directed_cases` and metric definition
+  `complete-reference-partition-v1`. Replay-set summaries use version2.
+  `mean_segment_length_percent` remains mean divided by total directed length,
+  equivalently `100/(F+C)`: this is not per-fiber success percentage.
+  Saved summaries may be migrated without rerunning traces, retaining original
+  summary bytes/hash and raw failure/geometry data unchanged.
+- Results use JSON schema version5 and include tracer identity, common and
+  backend configuration, and every failure's reason, stable
+  indices, directional and source-oriented reference arc/fraction, reference
+  and optional evaluator position, and optional anisotropic threshold
+  measurement. They also include threshold geometry, effective search/reset
+  settings, seed window, inputs, worker count, and summary metrics. External-
+  data runs are manual scientific benchmarks, not CI performance gates.
+
+# Fiber benchmark progress plots
+
+Local constraint-event segmentation uses only midpoints between consecutive
+orthogonal events; parallel measurements may share a piece and never introduce
+transition cuts. `--local-min-piece-length` is a finite nonnegative base-voxel
+minimum (default0): accept ascending candidate cuts only if the previous piece
+and final tail meet the minimum. Whole source lines shorter than it remain
+intact. No padding, discarded geometry, or altered certification/evidence
+weights. Accepted-cut counts exclude filtered proposals. This segmentation
+option does not change solver costs, calibration policy, or replay metrics.
+
+- The benchmark progress data records historical `algorithm_date` and
+  `algorithm_revision` separately from `measurement_date`,
+  `measurement_revision`, and the reproducible run record. Plot dates are
+  algorithm milestones; benchmark table dates remain execution dates.
+- Historical reference replay plots using `100/(failures+1)` retain their
+  explicitly legacy metric; they are not comparable to current complete-segment
+  reports, which use `100/(failures+directed_cases)`. New replay plots must use
+  the current definition and retain directed-case counts. Crop plots preserve the
+  existing problematic-to-retained error ratio but negate it as
+  `-100*problematic/retained_fulfilled`; zero is ideal and higher is better.
+  Pre-pruning reference-accuracy plots derive
+  `100*exact/(exact+wrong+missing)` from the raw round-zero counts before
+  supervised oracle removal. These three percentages are not comparable
+  metrics.
+- A crop point with `measurement_status=assumed_floor` is not a measurement.
+  It must carry an explicit rationale, no measurement revision or run record,
+  and must be visually distinguishable by marker and line style. This permits
+  direct tracers without a candidate-piece graph to appear at the requested
+  a plotting floor without being represented as executed crop benchmarks or
+  being assigned a fabricated numeric metric.
+- Plot scores are computed from raw counts. Each measured point must retain the
+  fixed cohort identity, full algorithm and measurement revisions, and an
+  existing run record. Deterministic SVG output uses fixed metadata and IDs and
+  includes an accessible title and description.
+- Every measured result remains visible at its actual score. The progress line
+  for each metric is the cumulative best-so-far envelope, so a later regression
+  cannot lower the historical line.
+- Plot points use consecutive integer experiment steps after a stable sort by
+  algorithm completion date; same-date records retain source order. Every step
+  number is shown, with representative dates on spaced steps. Strict measured
+  score improvements form the historical Pareto frontier and are the only
+  annotated points. Every non-frontier result uses its own marker and named
+  legend entry. Unmeasured floor assumptions are individually named and marked,
+  never establish or advance the measured envelope, and leave it absent before
+  the first measured point. The legend is placed below the axes.
+- Every algorithm variant carries a stable `method_id` and base
+  `method_label`. All occurrences of one method must use the same base label.
+  Benchmark-stage suffixes are appended without reordering or rewriting that
+  base label; unmeasured floor assumptions do not claim an unexecuted stage.
+# Managed calibration and priority
+
+- Memory calibration must acquire an exact exclusive, non-pausable/non-adaptable
+  manager grant before GPU initialization. No unmanaged/shared bypass. Confirm
+  worker ownership before authorization; release only after workers stop.
+- Optional `training.cooperative.priority` overrides request.priority, default 0.
+  Calibration defaults to training priority +100; its CLI --priority overrides
+  that value. Exclusivity has no implicit scheduler priority boost.
+# Manager communication grace (2026-09-11)
+
+- Fiber adaptive execution tolerates60s continuous manager communication loss
+  while advancing only already-authorized work; failures print exception details.
+- Retry every5s after failure. After60s stop admission, pause at safe boundary,
+  join workers/free GPU memory and retain RAM state. Reconnect reconciles existing
+  ownership before release/regrant and automatic resume. Hello alone is not recovery.
+- Exclusive non-pausable startup may finish its authorized cohort offline, but
+  no new cohort/size is initialized or authorized without manager confirmation.
+- Explicit stop, known release and observed epoch change override grace.
+- No wire fields change; EOF/timeout never frees server-side reservations.
+# Experimental LRU embedding anchors
+
+Opt-in fixed-route EMA calibration exports native candidate/base scores and
+normalized embedding observations using the existing scoring/state transitions.
+Offline fitting uses frozen paths and checkpoints, shared finite causal history,
+GPU backpropagation and whole-fiber grouping. It is a surrogate for beam search;
+actual tracing is required to judge quality, and calibration-heldout data is
+reported separately. Missing cached samples reject routes, never become zeros.
+
+Optional embedding distance threshold/temperature maps cosine distance using a
+zero-anchored softplus. Temperature0/threshold0 retains the exact linear default.
+Parameters are finite/nonnegative, threshold at most2. The scoring mapping is
+recorded in effective native provenance and leaves EMA admission/updates unchanged.
+
+Whole-path `appearance` mode uses bounded spherical summaries (FP64 sums and
+support) rather than window expiry. Merge minimum incremental spherical error
+when over capacity; deterministic ties and cancellation fallback. Nearest
+normalized centroid cost by default, optional EMA mix. An explicit support-softmin
+aggregation uses normalized cluster support and positive temperature; minimum-
+shift exp/log (expm1/log1p for large temperature) preserves numerical stability. This
+retains all admitted mass approximately, not every distinct mode independently.
+
+
+Opt-in anchors-lru has fixed capacity1–8 and no age expiry. Admission spacing
+applies to selected path observations, not all candidates. Admission touches the
+closest existing anchor, evicts least-recently-used (stable insertion ties), and
+inserts the new observation. Exact duplicates only touch/advance cadence.
+Nearest/mean cosine distance and optional convex EMA mixture score parent state;
+per-beam copies and seed resets prevent sibling/future leakage. Defaults unchanged.
+Optional LRU novelty distance in[0,2] suppresses insertion of familiar observations
+after touching nearest/advancing admission cadence. Zero retains original LRU.
+
+Opt-in delayed EMA retains a bounded per-beam FIFO of selected observations,
+applying ordered updates after an arclength delay with original step distances.
+Seed active immediately; zero delay must reproduce ordinary EMA exactly.
+No GT gating or future information; parent scoring precedes child admission.
+Maximum4096 pending vectors with preflight delay/step check and loud runtime
+overflow. Default delay0 and all existing method defaults remain unchanged.
+Opt-in seed-only scoring retains the initial embedding unchanged until a new
+trace; no history expiry/admission. It is distinct from the EMA+seed mixture.
+# Traced-strip restart label correction
+
+Inspection labels both reference and traced top/side strips. Traced `Rn-` and
+`Rn+` identify the old committed endpoint and actual next-segment start, matching
+cross-section IDs, in both modalities. No fabricated strip for singleton traces;
+no changes to sampling, trace geometry or evaluation metrics.
+# Reported restart episodes
+
+Targeted short-failure benchmark opt-in annotations may set evaluation_direction
+to forward or reverse; omitted/both preserves ordinary bidirectional replay.
+Exported directed GT pieces preserve original CP/non-Lasagna boundaries and link
+original fiber, eligible span, arcs, model and trial artifacts. Search first-failure
+reproduction within±100basevoxels on a100-voxel start grid, confirm100farther
+upstream, retain at most100beyond target. Audit actual outside travel to reject
+failures manufactured by truncating the160-voxel grace. Trials reuse published
+inference; misses use the shared demand pipeline/original snapshot with managed
+GPU grants, not exclusion or fill zeros. This targeted set is not an unbiased
+replacement for full evaluation. Default evaluation metrics remain unchanged.
+Extraction owns one GPU grant across its work queue. Spawned lane coordinators
+retain bounded producer sessions/readers/mmap accumulators and GPU worker pools
+between replay batches. Canonical shared-cache owners are co-located; conflicting
+retained sessions are evicted before opening another writer. One CUDAmodel perlane
+uses its GPU budget; extra CPU/mmap sessions may stay retained. Per-batch control
+state remains fresh, and queued work favors the resident model until drained.
+Drain before reuse, close pools before stores on eviction/error/final shutdown,
+and keep deterministic original-order candidate selection independent of execution.
+
+Default metric restart-episodes-80-base-voxels-v1 partitions reference distance
+at the first event of each episode. First event always counts; a later event
+counts only if its gap from the preceding actual event is >=80 base voxels.
+Reset grouping per directed eligible run. Include terminal span. Report only
+filtered restart counts and corresponding mean/median/P05/P95. Preserve all
+trace events and visual R IDs; IDs need not match the reported count. Episode
+metadata records first/last event indices and reference span. Means describe
+episode-separated reference distance, not uninterrupted successful tracing.
+CPU-only cached-full uses shared PublishedStore/coordinator, no inference or
+rendering, and fails on missing dependencies. Existing saved reports can be
+recomputed using report-metrics without mutating their trace artifacts.
+# Evaluation thickness-only tolerance and return window (2026-09-14)
+
+- Replay evaluation can specify `tangential_threshold_factor` (default4) and
+  `excursion_grace_base_voxels` (default0). Existing defaults remain immediate
+  failure with normal20/tangent80 when threshold20 is used.
+- Current comparison uses threshold40/factor2: thickness tolerance doubled,
+  width remains80. Grace160 measures committed traced travel after first
+  outside point, resets on reentry, and fails if still outside after that travel.
+  Pending outside excursions at termination/reference end count as failure.
+- Native and Lasagna replay share this policy. JSON stores the ellipse factor;
+  restoration validates geometry consistency. Rendering supports nondefault
+  factors through the shared ellipse frame and metadata (including40/80).
+- Reported restart episodes remain separated by80 base voxels; include terminal
+  segments. No change to CP-bounded/non-Lasagna eligibility or model inputs.
+- Evaluator development uses the no-argument workspace build runner documented
+  in vesuvius/scripts/native-build-deps/README.md; historical configs preserved.
+
+# Opt-in embedding integration experiments (2026-09-15)
+
+- Existing plain EMA defaults retain exact arithmetic; new families opt in via
+  embedding-integration and physical update-spacing flags.
+- Always score each candidate before updating independent child state. Admission
+  clocks follow actual traced base-voxel distance, not GT/reference progression.
+- Support cadenced normalized EMA, finite uniform observation window, learned
+  presence/disagreement gate, angular-limited update and adaptive dual EMA.
+  All state resets at restart. No anchors and no extra inference inputs.
+- Gates consume the admission clock even if update weight vanishes. Finite-window
+  expiry is evaluated at candidate position. Validate capacity instead of silently
+  truncating the desired window. Angular exact antipodes retain old reference.
+- GPU fixed-path fitting uses shared native exports, split/loss helpers and a
+  grouped whole-fiber fit/selection/test partition. Selection chooses finalists;
+  heldout never drives optimization. Require native/Torch parity and full native
+  tracing before promoting any experimental setting.
+
+# Demand-scoped sweep GPU lifecycle (2026-09-14)
+
+- Embedding sweeps use pausable/adaptable manager ownership only for tile GPU
+  work. CPU tracing/read/accumulation may continue while GPU allocation is zero;
+  those CPU activities are explicitly outside paused GPU lease accounting.
+- GPU dispatch stops on release; submitted tiles drain, GPU children join,
+  then release is acknowledged. CPU queues/results/trace state survive.
+- Before first ready input, do not bootstrap/register/request GPUs. Closing
+  without input demand never registers. CPU reads continue independently.
+- After30s without GPU tile activity self-pause/release; request again when a
+  read is ready for GPU dispatch. Never clear administrative pause on demand.
+- Native coordinator heartbeats allow live scheduling waits beyond request
+  timeout; they never mark chunks ready. EOF/errors/missing heartbeat fail.
+- Locked manager protocol remains unchanged; existing Supervisor coordinates
+  reconnect/release. Numerical inference and cached output conventions stay
+  unchanged; any cache compatibility must be exact and explicitly audited.
+- The ordinary `pilot` and `full` live-evaluation entry points use this same
+  demand-scoped lifecycle. Their parent process may resolve checkpoint policy
+  and cache identity on CPU, but must not call CUDA, construct a model worker,
+  register with the manager, or acquire GPUs before a missing tile input is
+  ready. Device precision is validated inside the authorized gated worker.
+  Fully warm tracing/rendering therefore performs no manager bootstrap or GPU
+  acquisition. Explicit unmanaged operation strips any stale adaptive setting.
+  Direct unmanaged execution retains device-capability validation. For an
+  exclusive demand grant, spawned workers remain blocked and CUDA-free while
+  the coordinator rejects unmanaged external CUDA processes on the granted
+  devices; only then may the worker gates be authorized.
+  Bounded profile/fit/audit modes and short-failure extraction retain their
+  separately specified fixed outer grants.
+# Iterative BP tuning (2026-10-03)
+
+For the current iterative sweep, rank non-oracle accuracy first, observed shift
+score second, constraint-disable score third. This supersedes the preceding
+cost-only sweep's fixed-geometry restriction: minimum piece length, median
+probe span/blend and end-to-end measurement scale may be varied explicitly.
+Keep source traces, reference labels, solver iteration budget and oracle protocol
+fixed. Report missing coverage and unsuccessful solves; do not treat missing
+oracle results as zero removal. No production-default change is implied.
+
+# Full hard-region failure union (2026-09-21)
+
+The full hard-region extractor consumes completed model evaluations as evidence
+only. It unions all filtered restart episodes from the configured evaluations,
+clips each interval to its already CP-bounded/non-Lasagna reference run, adds
+the configured reference context, and merges nearby intervals on the same
+piece. Public output annotations are reference-only and must not depend on
+which model caused a failure. Model-specific provenance may remain in the
+top-level audit manifest. Cache coverage is a read-only audit against the
+full-resolution OME-Zarr channels; missing chunks are reported explicitly.
+
+The inspection channel export includes inference.lasagna.json and its
+inference.json provenance per physical scroll. Channel paths are relative to
+the exported manifest so copying the directory preserves bindings. Exact
+source base dimensions and scale must be preserved, including for subsets.
+# Training-integrated reviewed-failure regression
+
+- The version-1 reviewed failure test contains exactly 32 CP-bounded truncated
+  pieces selected as the union of pieces with a restart in either direction in
+  the canonical `lowres`, `fullres`, `gaussian`, `halfsigma_raw`, and
+  `halfsigma_ema99` reviewed evaluations.
+- Its immutable membership is 11 PHerc0139, 6 PHerc1299, and 15 PHercParis4
+  pieces. Membership and annotation SHA-256 values must be validated before
+  use. It is a failure-enriched regression set, not an unbiased scientific
+  evaluation cohort.
+- Configured training runs derive their ordinary deterministic test metrics
+  from this same 32-piece set and run the shared optimized live-inference/native
+  tracer over exactly 64 directions at the configured trace interval.
+- Trace tests inherit the enclosing managed training allocation. They must not
+  create a nested manager task or silently use an unallocated GPU.
+- A trace test is valid only with all 64 directed cases complete and zero
+  infrastructure failures. Forward, reverse, and combined restart episodes and
+  implied mean lengths are retained. Implied mean length is total directed
+  reference millimetres divided by `(restart episodes + 1)`.
+- Workload, bindings, native summary, inference summary, logs, and compact
+  metrics are retained per training step. Missing inputs, changed membership,
+  incomplete output, or runner failure abort rather than falling back.
+- A reviewed-trace boundary is published synchronously into supervisor-owned
+  pending state and survives cohort drain/replacement. Replacement cohorts may
+  not admit another optimizer unit while that request is pending. Identical
+  `(kind, step, samples_seen)` publication is idempotent; conflicts fail.
+- Each attempt is bound to the exact applied manager epoch, generation, GPU
+  UUID set, and per-GPU VRAM grant. Release, epoch change, or expired transport
+  grace stops and verifies the complete attempt process group before release is
+  acknowledged; the request retries after regrant. Genuine runner failure is
+  fatal. Explicit shutdown cancels without retry.
+- Attempts write staged output. Only a complete validated attempt is atomically
+  promoted to the canonical step directory, which is never overwritten.
+- Every attempt freezes and hashes the exact raw checkpoint before tracing.
+  Completion is durable only after the trace metrics validate and transient
+  inference cleanup succeeds. Startup reconciliation may finish checkpoint
+  selection and canonical promotion for such a completed attempt, but must
+  ignore incomplete or revoked attempts.
+- In addition to the dense-loss-selected raw `best.pt`, training maintains the
+  independent raw `snapshots/best_reviewed_trace.pt`. Startup and periodic
+  reviewed traces are eligible. Strictly fewer integer
+  `restarts_combined` wins; ties retain the earlier checkpoint. The evaluated
+  raw checkpoint, step, sample count, complete trace metrics, and benchmark
+  identity are retained in the selected checkpoint. Existing raw dense-loss
+  and EMA selection rules are unchanged.
+- Restart comparisons are valid only within one benchmark identity. That
+  identity covers the effective workload and the locked split manifest,
+  native tracer, template, and runner content; a changed identity requires a
+  new training run rather than silently replacing the prior trace best.
+
+## Experimental tiled crop tracing
+
+Trace1024base-voxel cores with64base-voxel halos on both sides, and deduplicate
+each expanded tile independently. Clip to half-open cores and preserve multiple
+boundary continuation candidates with source-line/arc provenance. Do not build a
+global overlap graph. Artificial cuts are distinct from true reverse-filter gaps.
+Unique continuations have no artificial BP gap penalty; unresolved alternatives
+or unmatched internal cuts must not silently become hard equalities or real gaps.
+This is experimental and does not replace the historical benchmark baseline.

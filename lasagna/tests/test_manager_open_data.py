@@ -234,6 +234,71 @@ def _completed_run(
     return config, run
 
 
+def _completed_fiberlet_run(tmp_path: Path) -> tuple[ManagerConfig, Path]:
+    output = tmp_path / "outputs"
+    run = output / "fiberlet-run"
+    bundle = run / "artifacts"
+    dataset = bundle / "fiberlets.zarr"
+    for relative in ("anchors/.zarray", "prefix/.zarray", "routes/.zarray"):
+        path = dataset / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+    (dataset / ".zgroup").write_text("{}", encoding="utf-8")
+    (dataset / ".zattrs").write_text(json.dumps({
+        "vc_format": "fiberlet_dataset",
+        "dataset_kind": "combined",
+    }), encoding="utf-8")
+    atomic_json(bundle / "fiberlets.json", {
+        "schema_version": 1,
+        "artifact_kind": "fiberlets",
+        "status": "completed",
+        "run_uuid": "fiberlet-uuid",
+        "source": {
+            "sample_id": "PHerc0001", "volume_id": "20260101000001",
+            "license": {"name": "CC BY-NC 4.0"},
+        },
+        "dependencies": {},
+        "artifacts": [{"kind": "fiberlet-zarr", "path": "fiberlets.zarr"}],
+    })
+    atomic_json(run / "metadata.json", {
+        "run_uuid": "fiberlet-uuid", "run_name": "fiberlet-run",
+        "job_kind": "fiberlet", "active_lifecycle_phase": "fiberlet_preprocess",
+        "artifact_kind": "fiberlets", "status": "completed",
+        "artifacts": {
+            "root": "artifacts", "provenance": "artifacts/fiberlets.json",
+        },
+        "lifecycle": {
+            "fiberlet_preprocess": "completed", "staging_upload": "not_started",
+            "atlas_ingest": "not_started", "atlas_publication": "not_started",
+        },
+    })
+    return ManagerConfig(
+        output_dir=str(output), cache_dir=str(tmp_path / "cache"),
+        atlas_dir=str(tmp_path / "atlas"), upload_staging_s3="s3://stage/prefix",
+    ), run
+
+
+def test_fiberlet_upload_streams_tree_in_distinct_namespace(tmp_path: Path) -> None:
+    config, _run = _completed_fiberlet_run(tmp_path)
+    plan = validate_inference(config, "fiberlet-run")
+    assert plan.prefix == "prefix/fiberlets/fiberlet-uuid"
+    assert plan.model_id is None
+    assert plan.files is None
+
+    class TreeStore(FakeStore):
+        def put_tree(self, prefix: str, bundle: Path) -> None:
+            self.events.append(("tree", f"{prefix}:{bundle.name}"))
+
+        def put_file(self, _key: str, _path: Path) -> None:
+            raise AssertionError("streamed Fiberlet upload must not enumerate files")
+
+    store = TreeStore()
+    assert stage_upload(plan, store) == "s3://stage/prefix/fiberlets/fiberlet-uuid/"
+    assert store.events[0] == ("bytes", f"{plan.prefix}/{INCOMPLETE_MARKER}")
+    assert store.events[1] == ("tree", f"{plan.prefix}:artifacts")
+    assert store.events[-1] == ("delete", f"{plan.prefix}/{INCOMPLETE_MARKER}")
+
+
 def test_validate_requires_completed_cc_bundle_and_model(tmp_path: Path) -> None:
     config, _run = _completed_run(tmp_path)
     assert not (Path(config.cache_dir) / "snapshots" / "index.json").exists()

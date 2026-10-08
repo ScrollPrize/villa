@@ -256,6 +256,9 @@ def apply_fiber_transform(
         return transformed.astype(np.float32)
 
     metadata = dict(fiber.metadata)
+    if 'baked_annotations' in metadata:
+        from vesuvius.neural_tracing.fiber_trace_3d.annotations import transform_baked_metadata
+        metadata = transform_baked_metadata(fiber, matrix)
     metadata["fiber_transform_applied"] = True
     if transform_identity:
         metadata["fiber_transform_identity"] = str(transform_identity)

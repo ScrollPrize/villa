@@ -1,0 +1,1991 @@
+{
+  "baselines": {
+    "bf16": {
+      "batch_sizes": [
+        4
+      ],
+      "model_output_dtypes": [
+        "torch.bfloat16"
+      ]
+    },
+    "fp16": {
+      "batch_sizes": [
+        4
+      ],
+      "model_output_dtypes": [
+        "torch.float16"
+      ]
+    },
+    "off": {
+      "batch_sizes": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "model_output_dtypes": [
+        "torch.float32"
+      ]
+    }
+  },
+  "checkpoint": "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/halfsigma_current_raw_v3/frozen/live_inference/_models/ffd7aff24441e82e53b5f3fef69ab19d24a7b632e1dee4dac6487401694d244d/snapshot.pt",
+  "checkpoint_sha256": "ffd7aff24441e82e53b5f3fef69ab19d24a7b632e1dee4dac6487401694d244d",
+  "completed": true,
+  "cuda_version": "12.8",
+  "flags": {
+    "cudnn_allow_tf32": true,
+    "cudnn_benchmark": false,
+    "cudnn_deterministic": false,
+    "deterministic_algorithms": false,
+    "matmul_allow_tf32": false
+  },
+  "gpu": "NVIDIA H100 80GB HBM3",
+  "inputs": [
+    {
+      "input_dtype": "uint8",
+      "input_sha256": "5160f370b9fdf60ffb04a53e3362bec54505bf68e629f68bc9703fc245907ff3",
+      "input_shape": [
+        256,
+        256,
+        256
+      ],
+      "input_start_zyx": [
+        17248,
+        3968,
+        8128
+      ],
+      "normalized_sha256": "e4b0964c47f3a2d42700542c25dae75ef3921c67625812385af6fcb1970ed254",
+      "probe_base_xyz": [
+        16659.91015625,
+        8288.6904296875,
+        34716.62109375
+      ],
+      "source": "PHercParis4",
+      "tile_zyx": [
+        17280,
+        4000,
+        8160
+      ]
+    },
+    {
+      "input_dtype": "uint8",
+      "input_sha256": "93528f780897565b61acf78a517e1b698873e8fcdb8f31d0b791a01cb4e51ec5",
+      "input_shape": [
+        256,
+        256,
+        256
+      ],
+      "input_start_zyx": [
+        26368,
+        6688,
+        5088
+      ],
+      "normalized_sha256": "6a0b174d6b2341401f460935cf9fd071175643b53a36070489e6611e09422d31",
+      "probe_base_xyz": [
+        10422.154296875,
+        13791.169921875,
+        52847.34765625
+      ],
+      "source": "PHercParis4",
+      "tile_zyx": [
+        26400,
+        6720,
+        5120
+      ]
+    },
+    {
+      "input_dtype": "uint8",
+      "input_sha256": "fbcdf4b6bd542012c06ca3ac702eaf3ff2c667ce3e92d15beb04549c316ec2cb",
+      "input_shape": [
+        256,
+        256,
+        256
+      ],
+      "input_start_zyx": [
+        22528,
+        7008,
+        9248
+      ],
+      "normalized_sha256": "76bb5f969fd7600b68471e1d0285aa0c47ba05cb5185a5447bac434388c6fed5",
+      "probe_base_xyz": [
+        18808.806640625,
+        14414.2451171875,
+        45236.375
+      ],
+      "source": "PHerc0139",
+      "tile_zyx": [
+        22560,
+        7040,
+        9280
+      ]
+    },
+    {
+      "input_dtype": "uint8",
+      "input_sha256": "576e6f03db761687a2d2489efd8f348a1c57efeca784f17232b7d3d7ef7385ff",
+      "input_shape": [
+        256,
+        256,
+        256
+      ],
+      "input_start_zyx": [
+        5408,
+        5248,
+        8448
+      ],
+      "normalized_sha256": "0c64193c0fa05400f35e884d82953ac4c36219bbe371740fd9a9530ac69f1011",
+      "probe_base_xyz": [
+        17109.6328125,
+        10644.4814453125,
+        11206.9765625
+      ],
+      "source": "PHerc0139",
+      "tile_zyx": [
+        5440,
+        5280,
+        8480
+      ]
+    }
+  ],
+  "note": "No blending/accumulation. Same GPU/process/model/input tensors; four selected tiles, full output including borders. nx/ny comparisons include nonlinear direction reconstruction, not just rounding.",
+  "rows": [
+    {
+      "batch_sizes": [
+        4
+      ],
+      "kind": "same_precision",
+      "mode": "bf16",
+      "model_output_dtypes": [
+        "torch.bfloat16"
+      ],
+      "name": "repeat1",
+      "presence_rounding": {
+        "changed_values": 0,
+        "mean_distance_to_rounding_boundary_bytes": 0,
+        "mean_raw_delta_at_changed_bytes": 0,
+        "raw_equal_but_byte_changed": 0
+      },
+      "raw": {
+        "0": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "1": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "2": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "3": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "4": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "5": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "6": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "rounded": {
+        "nx": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "ny": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "presence": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "wall_seconds": 15.884214097983204
+    },
+    {
+      "batch_sizes": [
+        4
+      ],
+      "kind": "same_precision",
+      "mode": "bf16",
+      "model_output_dtypes": [
+        "torch.bfloat16"
+      ],
+      "name": "repeat2",
+      "presence_rounding": {
+        "changed_values": 0,
+        "mean_distance_to_rounding_boundary_bytes": 0,
+        "mean_raw_delta_at_changed_bytes": 0,
+        "raw_equal_but_byte_changed": 0
+      },
+      "raw": {
+        "0": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "1": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "2": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "3": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "4": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "5": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "6": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "rounded": {
+        "nx": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "ny": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "presence": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "wall_seconds": 17.081665713019902
+    },
+    {
+      "batch_sizes": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "kind": "same_precision",
+      "mode": "bf16",
+      "model_output_dtypes": [
+        "torch.bfloat16"
+      ],
+      "name": "batch1",
+      "presence_rounding": {
+        "changed_values": 2197216,
+        "mean_distance_to_rounding_boundary_bytes": 0.18421228229999542,
+        "mean_raw_delta_at_changed_bytes": 0.0020584375597536564,
+        "raw_equal_but_byte_changed": 0
+      },
+      "raw": {
+        "0": {
+          "changed_percent": 32.0620134472847,
+          "mae": 0.0009379668599365232,
+          "max": 0.01953125,
+          "nonfinite": 0,
+          "rmse": 0.0018929814658081624,
+          "values": 67108864
+        },
+        "1": {
+          "changed_percent": 40.705351531505585,
+          "mae": 0.001137349061423265,
+          "max": 0.025390625,
+          "nonfinite": 0,
+          "rmse": 0.0020548852480654876,
+          "values": 67108864
+        },
+        "2": {
+          "changed_percent": 30.37336617708206,
+          "mae": 0.0011774393692576268,
+          "max": 0.03125,
+          "nonfinite": 0,
+          "rmse": 0.0025089443509890086,
+          "values": 67108864
+        },
+        "3": {
+          "changed_percent": 39.82120156288147,
+          "mae": 0.0013864297134205117,
+          "max": 0.029296875,
+          "nonfinite": 0,
+          "rmse": 0.0024904766687630646,
+          "values": 67108864
+        },
+        "4": {
+          "changed_percent": 26.669856905937195,
+          "mae": 0.0009019399249154958,
+          "max": 0.01953125,
+          "nonfinite": 0,
+          "rmse": 0.0019643479716615095,
+          "values": 67108864
+        },
+        "5": {
+          "changed_percent": 28.330160677433014,
+          "mae": 0.0009446913959436642,
+          "max": 0.01953125,
+          "nonfinite": 0,
+          "rmse": 0.0019641973736212377,
+          "values": 67108864
+        },
+        "6": {
+          "changed_percent": 18.65454614162445,
+          "mae": 0.00012872124893380281,
+          "max": 0.0078125,
+          "nonfinite": 0,
+          "rmse": 0.0005151200494610964,
+          "values": 67108864
+        }
+      },
+      "rounded": {
+        "nx": {
+          "changed_percent": 25.565512478351593,
+          "mae": 0.9692008346319199,
+          "max": 254,
+          "nonfinite": 0,
+          "rmse": 10.990966359640982,
+          "values": 67108864
+        },
+        "ny": {
+          "changed_percent": 19.7494238615036,
+          "mae": 0.7995738238096237,
+          "max": 254,
+          "nonfinite": 0,
+          "rmse": 9.957671632373396,
+          "values": 67108864
+        },
+        "presence": {
+          "changed_percent": 3.274106979370117,
+          "mae": 0.03280921280384064,
+          "max": 2,
+          "nonfinite": 0,
+          "rmse": 0.1815089497080504,
+          "values": 67108864
+        }
+      },
+      "wall_seconds": 16.742606154992245
+    },
+    {
+      "batch_sizes": [
+        2,
+        2
+      ],
+      "kind": "same_precision",
+      "mode": "bf16",
+      "model_output_dtypes": [
+        "torch.bfloat16"
+      ],
+      "name": "batch2",
+      "presence_rounding": {
+        "changed_values": 2197216,
+        "mean_distance_to_rounding_boundary_bytes": 0.18421228229999542,
+        "mean_raw_delta_at_changed_bytes": 0.0020584375597536564,
+        "raw_equal_but_byte_changed": 0
+      },
+      "raw": {
+        "0": {
+          "changed_percent": 32.0620134472847,
+          "mae": 0.0009379668599365232,
+          "max": 0.01953125,
+          "nonfinite": 0,
+          "rmse": 0.0018929814658081624,
+          "values": 67108864
+        },
+        "1": {
+          "changed_percent": 40.705351531505585,
+          "mae": 0.001137349061423265,
+          "max": 0.025390625,
+          "nonfinite": 0,
+          "rmse": 0.0020548852480654876,
+          "values": 67108864
+        },
+        "2": {
+          "changed_percent": 30.37336617708206,
+          "mae": 0.0011774393692576268,
+          "max": 0.03125,
+          "nonfinite": 0,
+          "rmse": 0.0025089443509890086,
+          "values": 67108864
+        },
+        "3": {
+          "changed_percent": 39.82120156288147,
+          "mae": 0.0013864297134205117,
+          "max": 0.029296875,
+          "nonfinite": 0,
+          "rmse": 0.0024904766687630646,
+          "values": 67108864
+        },
+        "4": {
+          "changed_percent": 26.669856905937195,
+          "mae": 0.0009019399249154958,
+          "max": 0.01953125,
+          "nonfinite": 0,
+          "rmse": 0.0019643479716615095,
+          "values": 67108864
+        },
+        "5": {
+          "changed_percent": 28.330160677433014,
+          "mae": 0.0009446913959436642,
+          "max": 0.01953125,
+          "nonfinite": 0,
+          "rmse": 0.0019641973736212377,
+          "values": 67108864
+        },
+        "6": {
+          "changed_percent": 18.65454614162445,
+          "mae": 0.00012872124893380281,
+          "max": 0.0078125,
+          "nonfinite": 0,
+          "rmse": 0.0005151200494610964,
+          "values": 67108864
+        }
+      },
+      "rounded": {
+        "nx": {
+          "changed_percent": 25.565512478351593,
+          "mae": 0.9692008346319199,
+          "max": 254,
+          "nonfinite": 0,
+          "rmse": 10.990966359640982,
+          "values": 67108864
+        },
+        "ny": {
+          "changed_percent": 19.7494238615036,
+          "mae": 0.7995738238096237,
+          "max": 254,
+          "nonfinite": 0,
+          "rmse": 9.957671632373396,
+          "values": 67108864
+        },
+        "presence": {
+          "changed_percent": 3.274106979370117,
+          "mae": 0.03280921280384064,
+          "max": 2,
+          "nonfinite": 0,
+          "rmse": 0.1815089497080504,
+          "values": 67108864
+        }
+      },
+      "wall_seconds": 16.030690218001837
+    },
+    {
+      "batch_sizes": [
+        3,
+        1
+      ],
+      "kind": "same_precision",
+      "mode": "bf16",
+      "model_output_dtypes": [
+        "torch.bfloat16"
+      ],
+      "name": "batch3",
+      "presence_rounding": {
+        "changed_values": 727620,
+        "mean_distance_to_rounding_boundary_bytes": 0.18512152135372162,
+        "mean_raw_delta_at_changed_bytes": 0.002044172491878271,
+        "raw_equal_but_byte_changed": 0
+      },
+      "raw": {
+        "0": {
+          "changed_percent": 10.217341780662537,
+          "mae": 0.0002980981614086886,
+          "max": 0.017578125,
+          "nonfinite": 0,
+          "rmse": 0.001062383641983051,
+          "values": 67108864
+        },
+        "1": {
+          "changed_percent": 13.241639733314514,
+          "mae": 0.00036906758350596647,
+          "max": 0.025390625,
+          "nonfinite": 0,
+          "rmse": 0.0011632347558626255,
+          "values": 67108864
+        },
+        "2": {
+          "changed_percent": 9.155519306659698,
+          "mae": 0.00034993477811440243,
+          "max": 0.029296875,
+          "nonfinite": 0,
+          "rmse": 0.001377577996571236,
+          "values": 67108864
+        },
+        "3": {
+          "changed_percent": 12.51889020204544,
+          "mae": 0.0004316042140999343,
+          "max": 0.025390625,
+          "nonfinite": 0,
+          "rmse": 0.0013853088104426369,
+          "values": 67108864
+        },
+        "4": {
+          "changed_percent": 8.40972512960434,
+          "mae": 0.0002746735408436507,
+          "max": 0.015625,
+          "nonfinite": 0,
+          "rmse": 0.0010749121967107964,
+          "values": 67108864
+        },
+        "5": {
+          "changed_percent": 9.21633243560791,
+          "mae": 0.00030268590489868075,
+          "max": 0.017578125,
+          "nonfinite": 0,
+          "rmse": 0.001099822828819787,
+          "values": 67108864
+        },
+        "6": {
+          "changed_percent": 5.752688646316528,
+          "mae": 0.00004260658232348733,
+          "max": 0.0078125,
+          "nonfinite": 0,
+          "rmse": 0.00029522087783377736,
+          "values": 67108864
+        }
+      },
+      "rounded": {
+        "nx": {
+          "changed_percent": 7.785011827945709,
+          "mae": 0.31164707243442535,
+          "max": 254,
+          "nonfinite": 0,
+          "rmse": 6.516158373702764,
+          "values": 67108864
+        },
+        "ny": {
+          "changed_percent": 6.463682651519775,
+          "mae": 0.24515333771705627,
+          "max": 254,
+          "nonfinite": 0,
+          "rmse": 5.331983100757554,
+          "values": 67108864
+        },
+        "presence": {
+          "changed_percent": 1.0842382907867432,
+          "mae": 0.010862231254577637,
+          "max": 2,
+          "nonfinite": 0,
+          "rmse": 0.10441229787720432,
+          "values": 67108864
+        }
+      },
+      "wall_seconds": 16.25011420500232
+    },
+    {
+      "batch_sizes": [
+        4
+      ],
+      "kind": "same_precision",
+      "mode": "bf16",
+      "model_output_dtypes": [
+        "torch.bfloat16"
+      ],
+      "name": "reverse_batch4",
+      "presence_rounding": {
+        "changed_values": 0,
+        "mean_distance_to_rounding_boundary_bytes": 0,
+        "mean_raw_delta_at_changed_bytes": 0,
+        "raw_equal_but_byte_changed": 0
+      },
+      "raw": {
+        "0": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "1": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "2": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "3": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "4": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "5": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "6": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "rounded": {
+        "nx": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "ny": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "presence": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "wall_seconds": 16.129070907016285
+    },
+    {
+      "batch_sizes": [
+        4
+      ],
+      "kind": "same_precision",
+      "mode": "bf16",
+      "model_output_dtypes": [
+        "torch.bfloat16"
+      ],
+      "name": "repeat_after_shapes",
+      "presence_rounding": {
+        "changed_values": 0,
+        "mean_distance_to_rounding_boundary_bytes": 0,
+        "mean_raw_delta_at_changed_bytes": 0,
+        "raw_equal_but_byte_changed": 0
+      },
+      "raw": {
+        "0": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "1": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "2": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "3": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "4": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "5": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "6": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "rounded": {
+        "nx": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "ny": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "presence": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "wall_seconds": 15.963549868989503
+    },
+    {
+      "batch_sizes": [
+        4
+      ],
+      "kind": "same_precision",
+      "mode": "fp16",
+      "model_output_dtypes": [
+        "torch.float16"
+      ],
+      "name": "repeat1",
+      "presence_rounding": {
+        "changed_values": 0,
+        "mean_distance_to_rounding_boundary_bytes": 0,
+        "mean_raw_delta_at_changed_bytes": 0,
+        "raw_equal_but_byte_changed": 0
+      },
+      "raw": {
+        "0": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "1": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "2": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "3": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "4": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "5": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "6": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "rounded": {
+        "nx": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "ny": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "presence": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "wall_seconds": 15.82356804801384
+    },
+    {
+      "batch_sizes": [
+        4
+      ],
+      "kind": "same_precision",
+      "mode": "fp16",
+      "model_output_dtypes": [
+        "torch.float16"
+      ],
+      "name": "repeat2",
+      "presence_rounding": {
+        "changed_values": 0,
+        "mean_distance_to_rounding_boundary_bytes": 0,
+        "mean_raw_delta_at_changed_bytes": 0,
+        "raw_equal_but_byte_changed": 0
+      },
+      "raw": {
+        "0": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "1": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "2": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "3": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "4": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "5": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "6": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "rounded": {
+        "nx": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "ny": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "presence": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "wall_seconds": 15.985184519988252
+    },
+    {
+      "batch_sizes": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "kind": "same_precision",
+      "mode": "fp16",
+      "model_output_dtypes": [
+        "torch.float16"
+      ],
+      "name": "batch1",
+      "presence_rounding": {
+        "changed_values": 279745,
+        "mean_distance_to_rounding_boundary_bytes": 0.0319451242685318,
+        "mean_raw_delta_at_changed_bytes": 0.000250662793405354,
+        "raw_equal_but_byte_changed": 0
+      },
+      "raw": {
+        "0": {
+          "changed_percent": 35.16090512275696,
+          "mae": 0.0001188382229848628,
+          "max": 0.00244140625,
+          "nonfinite": 0,
+          "rmse": 0.00023544443301390223,
+          "values": 67108864
+        },
+        "1": {
+          "changed_percent": 39.715927839279175,
+          "mae": 0.0001424373327978401,
+          "max": 0.00341796875,
+          "nonfinite": 0,
+          "rmse": 0.000258194057670374,
+          "values": 67108864
+        },
+        "2": {
+          "changed_percent": 30.52254021167755,
+          "mae": 0.00014973105589888291,
+          "max": 0.00439453125,
+          "nonfinite": 0,
+          "rmse": 0.00031821960575971253,
+          "values": 67108864
+        },
+        "3": {
+          "changed_percent": 39.4585981965065,
+          "mae": 0.00017756542024471855,
+          "max": 0.00390625,
+          "nonfinite": 0,
+          "rmse": 0.00032305452112729244,
+          "values": 67108864
+        },
+        "4": {
+          "changed_percent": 26.70949399471283,
+          "mae": 0.00011328505917163056,
+          "max": 0.001953125,
+          "nonfinite": 0,
+          "rmse": 0.0002463653676698781,
+          "values": 67108864
+        },
+        "5": {
+          "changed_percent": 28.2905712723732,
+          "mae": 0.00011836610843829476,
+          "max": 0.00244140625,
+          "nonfinite": 0,
+          "rmse": 0.00024586269366968876,
+          "values": 67108864
+        },
+        "6": {
+          "changed_percent": 20.54675817489624,
+          "mae": 0.000016306257240472632,
+          "max": 0.001220703125,
+          "nonfinite": 0,
+          "rmse": 0.0000637979754924032,
+          "values": 67108864
+        }
+      },
+      "rounded": {
+        "nx": {
+          "changed_percent": 4.136322438716888,
+          "mae": 0.13259021937847137,
+          "max": 254,
+          "nonfinite": 0,
+          "rmse": 4.053272255742365,
+          "values": 67108864
+        },
+        "ny": {
+          "changed_percent": 3.1313419342041016,
+          "mae": 0.1116836816072464,
+          "max": 254,
+          "nonfinite": 0,
+          "rmse": 3.777910943431747,
+          "values": 67108864
+        },
+        "presence": {
+          "changed_percent": 0.41685253381729126,
+          "mae": 0.004168525338172913,
+          "max": 1,
+          "nonfinite": 0,
+          "rmse": 0.06456411803914704,
+          "values": 67108864
+        }
+      },
+      "wall_seconds": 16.731575607991545
+    },
+    {
+      "batch_sizes": [
+        2,
+        2
+      ],
+      "kind": "same_precision",
+      "mode": "fp16",
+      "model_output_dtypes": [
+        "torch.float16"
+      ],
+      "name": "batch2",
+      "presence_rounding": {
+        "changed_values": 279745,
+        "mean_distance_to_rounding_boundary_bytes": 0.0319451242685318,
+        "mean_raw_delta_at_changed_bytes": 0.000250662793405354,
+        "raw_equal_but_byte_changed": 0
+      },
+      "raw": {
+        "0": {
+          "changed_percent": 35.16090512275696,
+          "mae": 0.0001188382229848628,
+          "max": 0.00244140625,
+          "nonfinite": 0,
+          "rmse": 0.00023544443301390223,
+          "values": 67108864
+        },
+        "1": {
+          "changed_percent": 39.715927839279175,
+          "mae": 0.0001424373327978401,
+          "max": 0.00341796875,
+          "nonfinite": 0,
+          "rmse": 0.000258194057670374,
+          "values": 67108864
+        },
+        "2": {
+          "changed_percent": 30.52254021167755,
+          "mae": 0.00014973105589888291,
+          "max": 0.00439453125,
+          "nonfinite": 0,
+          "rmse": 0.00031821960575971253,
+          "values": 67108864
+        },
+        "3": {
+          "changed_percent": 39.4585981965065,
+          "mae": 0.00017756542024471855,
+          "max": 0.00390625,
+          "nonfinite": 0,
+          "rmse": 0.00032305452112729244,
+          "values": 67108864
+        },
+        "4": {
+          "changed_percent": 26.70949399471283,
+          "mae": 0.00011328505917163056,
+          "max": 0.001953125,
+          "nonfinite": 0,
+          "rmse": 0.0002463653676698781,
+          "values": 67108864
+        },
+        "5": {
+          "changed_percent": 28.2905712723732,
+          "mae": 0.00011836610843829476,
+          "max": 0.00244140625,
+          "nonfinite": 0,
+          "rmse": 0.00024586269366968876,
+          "values": 67108864
+        },
+        "6": {
+          "changed_percent": 20.54675817489624,
+          "mae": 0.000016306257240472632,
+          "max": 0.001220703125,
+          "nonfinite": 0,
+          "rmse": 0.0000637979754924032,
+          "values": 67108864
+        }
+      },
+      "rounded": {
+        "nx": {
+          "changed_percent": 4.136322438716888,
+          "mae": 0.13259021937847137,
+          "max": 254,
+          "nonfinite": 0,
+          "rmse": 4.053272255742365,
+          "values": 67108864
+        },
+        "ny": {
+          "changed_percent": 3.1313419342041016,
+          "mae": 0.1116836816072464,
+          "max": 254,
+          "nonfinite": 0,
+          "rmse": 3.777910943431747,
+          "values": 67108864
+        },
+        "presence": {
+          "changed_percent": 0.41685253381729126,
+          "mae": 0.004168525338172913,
+          "max": 1,
+          "nonfinite": 0,
+          "rmse": 0.06456411803914704,
+          "values": 67108864
+        }
+      },
+      "wall_seconds": 16.06199883299996
+    },
+    {
+      "batch_sizes": [
+        3,
+        1
+      ],
+      "kind": "same_precision",
+      "mode": "fp16",
+      "model_output_dtypes": [
+        "torch.float16"
+      ],
+      "name": "batch3",
+      "presence_rounding": {
+        "changed_values": 156253,
+        "mean_distance_to_rounding_boundary_bytes": 0.032609354704618454,
+        "mean_raw_delta_at_changed_bytes": 0.0002562416484579444,
+        "raw_equal_but_byte_changed": 0
+      },
+      "raw": {
+        "0": {
+          "changed_percent": 17.041634023189545,
+          "mae": 0.00005734582960315038,
+          "max": 0.00244140625,
+          "nonfinite": 0,
+          "rmse": 0.00016334318847637704,
+          "values": 67108864
+        },
+        "1": {
+          "changed_percent": 19.877737760543823,
+          "mae": 0.00007129362165869679,
+          "max": 0.0029296875,
+          "nonfinite": 0,
+          "rmse": 0.00018245743163878785,
+          "values": 67108864
+        },
+        "2": {
+          "changed_percent": 14.792953431606293,
+          "mae": 0.00007316788060052204,
+          "max": 0.003662109375,
+          "nonfinite": 0,
+          "rmse": 0.0002233071729686079,
+          "values": 67108864
+        },
+        "3": {
+          "changed_percent": 19.293300807476044,
+          "mae": 0.00008722843244868272,
+          "max": 0.00390625,
+          "nonfinite": 0,
+          "rmse": 0.00022667919680152107,
+          "values": 67108864
+        },
+        "4": {
+          "changed_percent": 13.218219578266144,
+          "mae": 0.00005570708378854761,
+          "max": 0.001953125,
+          "nonfinite": 0,
+          "rmse": 0.00017200171605330245,
+          "values": 67108864
+        },
+        "5": {
+          "changed_percent": 14.028362929821014,
+          "mae": 0.000059079580978504964,
+          "max": 0.00244140625,
+          "nonfinite": 0,
+          "rmse": 0.00017337106568334292,
+          "values": 67108864
+        },
+        "6": {
+          "changed_percent": 10.275836288928986,
+          "mae": 0.000009100233160808102,
+          "max": 0.0009765625,
+          "nonfinite": 0,
+          "rmse": 0.00004811633337388427,
+          "values": 67108864
+        }
+      },
+      "rounded": {
+        "nx": {
+          "changed_percent": 1.9400104880332947,
+          "mae": 0.06392323970794678,
+          "max": 254,
+          "nonfinite": 0,
+          "rmse": 2.858632085000478,
+          "values": 67108864
+        },
+        "ny": {
+          "changed_percent": 1.5065893530845642,
+          "mae": 0.05389957129955292,
+          "max": 254,
+          "nonfinite": 0,
+          "rmse": 2.6231495346465277,
+          "values": 67108864
+        },
+        "presence": {
+          "changed_percent": 0.23283511400222778,
+          "mae": 0.002328351140022278,
+          "max": 1,
+          "nonfinite": 0,
+          "rmse": 0.04825299099560853,
+          "values": 67108864
+        }
+      },
+      "wall_seconds": 16.312562698993133
+    },
+    {
+      "batch_sizes": [
+        4
+      ],
+      "kind": "same_precision",
+      "mode": "fp16",
+      "model_output_dtypes": [
+        "torch.float16"
+      ],
+      "name": "reverse_batch4",
+      "presence_rounding": {
+        "changed_values": 0,
+        "mean_distance_to_rounding_boundary_bytes": 0,
+        "mean_raw_delta_at_changed_bytes": 0,
+        "raw_equal_but_byte_changed": 0
+      },
+      "raw": {
+        "0": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "1": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "2": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "3": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "4": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "5": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "6": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "rounded": {
+        "nx": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "ny": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "presence": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "wall_seconds": 16.04209869398619
+    },
+    {
+      "batch_sizes": [
+        4
+      ],
+      "kind": "same_precision",
+      "mode": "fp16",
+      "model_output_dtypes": [
+        "torch.float16"
+      ],
+      "name": "repeat_after_shapes",
+      "presence_rounding": {
+        "changed_values": 0,
+        "mean_distance_to_rounding_boundary_bytes": 0,
+        "mean_raw_delta_at_changed_bytes": 0,
+        "raw_equal_but_byte_changed": 0
+      },
+      "raw": {
+        "0": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "1": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "2": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "3": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "4": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "5": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "6": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "rounded": {
+        "nx": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "ny": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "presence": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "wall_seconds": 16.011649157007923
+    },
+    {
+      "batch_sizes": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "kind": "same_precision",
+      "mode": "off",
+      "model_output_dtypes": [
+        "torch.float32"
+      ],
+      "name": "repeat1",
+      "presence_rounding": {
+        "changed_values": 0,
+        "mean_distance_to_rounding_boundary_bytes": 0,
+        "mean_raw_delta_at_changed_bytes": 0,
+        "raw_equal_but_byte_changed": 0
+      },
+      "raw": {
+        "0": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "1": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "2": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "3": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "4": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "5": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "6": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "rounded": {
+        "nx": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "ny": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "presence": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "wall_seconds": 16.55514861899428
+    },
+    {
+      "batch_sizes": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "kind": "same_precision",
+      "mode": "off",
+      "model_output_dtypes": [
+        "torch.float32"
+      ],
+      "name": "repeat2",
+      "presence_rounding": {
+        "changed_values": 0,
+        "mean_distance_to_rounding_boundary_bytes": 0,
+        "mean_raw_delta_at_changed_bytes": 0,
+        "raw_equal_but_byte_changed": 0
+      },
+      "raw": {
+        "0": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "1": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "2": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "3": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "4": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "5": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "6": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "rounded": {
+        "nx": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "ny": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "presence": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "wall_seconds": 16.900082965003094
+    },
+    {
+      "kind": "cross_precision",
+      "mode": "fp16",
+      "name": "versus_bf16_baseline",
+      "presence_rounding": {
+        "changed_values": 5993076,
+        "mean_distance_to_rounding_boundary_bytes": 0.16838201880455017,
+        "mean_raw_delta_at_changed_bytes": 0.0017105182632803917,
+        "raw_equal_but_byte_changed": 0
+      },
+      "raw": {
+        "0": {
+          "changed_percent": 95.13377249240875,
+          "mae": 0.0017850320738581615,
+          "max": 0.0224609375,
+          "nonfinite": 0,
+          "rmse": 0.0023696338575652123,
+          "values": 67108864
+        },
+        "1": {
+          "changed_percent": 95.79136520624161,
+          "mae": 0.002085431884822242,
+          "max": 0.0234375,
+          "nonfinite": 0,
+          "rmse": 0.002720985744330122,
+          "values": 67108864
+        },
+        "2": {
+          "changed_percent": 95.27916759252548,
+          "mae": 0.0025136125070730486,
+          "max": 0.02587890625,
+          "nonfinite": 0,
+          "rmse": 0.0034207653437064254,
+          "values": 67108864
+        },
+        "3": {
+          "changed_percent": 95.27206867933273,
+          "mae": 0.002382840266363928,
+          "max": 0.03076171875,
+          "nonfinite": 0,
+          "rmse": 0.0031203456340051076,
+          "values": 67108864
+        },
+        "4": {
+          "changed_percent": 95.70745676755905,
+          "mae": 0.0027180177462469146,
+          "max": 0.02587890625,
+          "nonfinite": 0,
+          "rmse": 0.003537780133847385,
+          "values": 67108864
+        },
+        "5": {
+          "changed_percent": 93.27679872512817,
+          "mae": 0.001947958926677984,
+          "max": 0.0244140625,
+          "nonfinite": 0,
+          "rmse": 0.0025810047156890528,
+          "values": 67108864
+        },
+        "6": {
+          "changed_percent": 97.97791540622711,
+          "mae": 0.00035202364181964954,
+          "max": 0.02099609375,
+          "nonfinite": 0,
+          "rmse": 0.0007876568402860178,
+          "values": 67108864
+        }
+      },
+      "rounded": {
+        "nx": {
+          "changed_percent": 37.65057027339935,
+          "mae": 1.5156667828559875,
+          "max": 254,
+          "nonfinite": 0,
+          "rmse": 14.1091253885894,
+          "values": 67108864
+        },
+        "ny": {
+          "changed_percent": 31.869228184223175,
+          "mae": 1.2190635800361633,
+          "max": 254,
+          "nonfinite": 0,
+          "rmse": 11.971852184384442,
+          "values": 67108864
+        },
+        "presence": {
+          "changed_percent": 8.930379152297974,
+          "mae": 0.09111607074737549,
+          "max": 5,
+          "nonfinite": 0,
+          "rmse": 0.30795400436146525,
+          "values": 67108864
+        }
+      }
+    },
+    {
+      "kind": "cross_precision",
+      "mode": "off",
+      "name": "versus_bf16_baseline",
+      "presence_rounding": {
+        "changed_values": 5883863,
+        "mean_distance_to_rounding_boundary_bytes": 0.1655099093914032,
+        "mean_raw_delta_at_changed_bytes": 0.0016707262257114053,
+        "raw_equal_but_byte_changed": 0
+      },
+      "raw": {
+        "0": {
+          "changed_percent": 99.99944716691971,
+          "mae": 0.0017775025389085344,
+          "max": 0.023385167121887207,
+          "nonfinite": 0,
+          "rmse": 0.002357164142510369,
+          "values": 67108864
+        },
+        "1": {
+          "changed_percent": 99.99947994947433,
+          "mae": 0.002064528771907133,
+          "max": 0.024342864751815796,
+          "nonfinite": 0,
+          "rmse": 0.002689855292873254,
+          "values": 67108864
+        },
+        "2": {
+          "changed_percent": 99.99947845935822,
+          "mae": 0.0025071877494726447,
+          "max": 0.027035117149353027,
+          "nonfinite": 0,
+          "rmse": 0.0034080574551659313,
+          "values": 67108864
+        },
+        "3": {
+          "changed_percent": 99.99941736459732,
+          "mae": 0.0023845539845508135,
+          "max": 0.0314335823059082,
+          "nonfinite": 0,
+          "rmse": 0.0031197969415127126,
+          "values": 67108864
+        },
+        "4": {
+          "changed_percent": 99.99949038028717,
+          "mae": 0.002711020147167807,
+          "max": 0.02482450008392334,
+          "nonfinite": 0,
+          "rmse": 0.0035182233897642686,
+          "values": 67108864
+        },
+        "5": {
+          "changed_percent": 99.99927282333374,
+          "mae": 0.0019305965395253685,
+          "max": 0.023621022701263428,
+          "nonfinite": 0,
+          "rmse": 0.0025507954208803074,
+          "values": 67108864
+        },
+        "6": {
+          "changed_percent": 99.99976754188538,
+          "mae": 0.0003431872904538858,
+          "max": 0.019403457641601562,
+          "nonfinite": 0,
+          "rmse": 0.0007678604481001964,
+          "values": 67108864
+        }
+      },
+      "rounded": {
+        "nx": {
+          "changed_percent": 37.35814690589905,
+          "mae": 1.5018458366394043,
+          "max": 254,
+          "nonfinite": 0,
+          "rmse": 14.07115142562218,
+          "values": 67108864
+        },
+        "ny": {
+          "changed_percent": 31.631125509738922,
+          "mae": 1.2036874890327454,
+          "max": 254,
+          "nonfinite": 0,
+          "rmse": 11.887779626004397,
+          "values": 67108864
+        },
+        "presence": {
+          "changed_percent": 8.767639100551605,
+          "mae": 0.0893368124961853,
+          "max": 5,
+          "nonfinite": 0,
+          "rmse": 0.3045259683306595,
+          "values": 67108864
+        }
+      }
+    }
+  ],
+  "torch_version": "2.11.0+cu128"
+}

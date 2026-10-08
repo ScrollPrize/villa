@@ -1,5 +1,16 @@
 # Global fiber SGD: data reconnaissance
 
+## Follow-up: shared BP integration (2026-10-08)
+
+User requests merging existing BP code and explaining its Lasagna constraint
+extraction. Preserve AFV setup in a commit; merge latest shared implementation
+from fiber-exp5, resolve conflicts by retaining both branches' features, attempt
+native build and run available benchmark-support tests. Document extraction
+versus solver behavior in bp_constraints.md. No AFV-to-BP adapter or SGD solver
+is requested yet. Independent review covers merge resolution and the overview.
+Spec update: no extraction semantics change. Docs/log update: merge provenance,
+conflict resolution, validation limitations and shared entry points.
+
 ## Task
 
 Set aside threshold/skeleton experiments. Start `global-fiber-sgd` from current

@@ -2,6 +2,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/lasagna/Dataset.hpp"
+#include "vc/lasagna/ChannelSampler.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "vc/atlas/Atlas.hpp"
@@ -13,6 +14,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <future>
+#include <barrier>
 #include <random>
 #include <string>
 #include <vector>
@@ -35,7 +38,7 @@ void createU8Zarr(
     std::vector<size_t> shape,
     std::vector<size_t> chunks,
     const std::vector<uint8_t>* payload,
-    double fillValue = 0.0)
+    std::optional<double> fillValue = 0.0)
 {
     utils::ZarrMetadata meta;
     meta.version = utils::ZarrVersion::v2;
@@ -206,7 +209,7 @@ TEST_CASE("LasagnaNormalSampler integrates decoded grad_mag as winding distance"
 {
     const auto dir = tmpDir("winding_distance");
     std::vector<uint8_t> gradMag(2 * 2 * 2, 100);
-    std::vector<uint8_t> nx(2 * 2 * 2, 128);
+    std::vector<uint8_t> nx(2 * 2 * 2, 255);
     std::vector<uint8_t> ny(2 * 2 * 2, 128);
     createU8Zarr(dir / "grad_mag.zarr", {2, 2, 2}, {2, 2, 2}, &gradMag);
     createU8Zarr(dir / "nx.zarr", {2, 2, 2}, {2, 2, 2}, &nx);
@@ -231,6 +234,31 @@ TEST_CASE("LasagnaNormalSampler integrates decoded grad_mag as winding distance"
     CHECK(*density == doctest::Approx(1.0));
     CHECK(sampler.windingDistance({0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0.25) ==
           doctest::Approx(1.0));
+    CHECK(sampler.normalAlignedWindingDistance(
+              {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0.25) ==
+          doctest::Approx(1.0));
+    CHECK(sampler.windingDistance(
+              {0.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, 0.25) ==
+          doctest::Approx(1.0));
+    CHECK(sampler.normalAlignedWindingDistance(
+              {0.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, 0.25) ==
+          doctest::Approx(0.0).epsilon(1.0e-9));
+    const std::vector<std::pair<cv::Vec3d, cv::Vec3d>> connectors{
+        {{0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}},
+        {{0.0, 0.0, 0.0}, {0.0, 1.0, 0.0}},
+        {{0.5, 0.5, 0.5}, {0.5, 0.5, 0.5}},
+    };
+    const auto batchOne = sampler.normalAlignedWindingDistancesBatch(
+        connectors, 0.25, 1);
+    const auto batchFour = sampler.normalAlignedWindingDistancesBatch(
+        connectors, 0.25, 4);
+    REQUIRE(batchOne.size() == connectors.size());
+    REQUIRE(batchFour.size() == batchOne.size());
+    CHECK(batchOne[0] == doctest::Approx(1.0).epsilon(1.0e-6));
+    CHECK(batchOne[1] == doctest::Approx(0.0).epsilon(1.0e-6));
+    CHECK(batchOne[2] == doctest::Approx(0.0));
+    for (std::size_t index = 0; index < batchOne.size(); ++index)
+        CHECK(batchFour[index] == batchOne[index]);
     fs::remove_all(dir);
 }
 
@@ -269,6 +297,54 @@ TEST_CASE("LasagnaNormalSampler interpolates unoriented normal tensors")
     CHECK(std::abs(sample.normal[0]) == doctest::Approx(1.0).epsilon(1.0e-9));
     CHECK(sample.normal[1] == doctest::Approx(0.0).epsilon(1.0e-9));
     CHECK(sample.normal[2] == doctest::Approx(0.0).epsilon(1.0e-9));
+    fs::remove_all(dir);
+}
+
+TEST_CASE("Batched aligned winding tracks scalar sampling on varying fields")
+{
+    const auto dir = tmpDir("winding_batch_varying");
+    std::vector<uint8_t> gradMag(4 * 4 * 4);
+    std::vector<uint8_t> nx(4 * 4 * 4);
+    std::vector<uint8_t> ny(4 * 4 * 4);
+    for (size_t index = 0; index < gradMag.size(); ++index) {
+        gradMag[index] = static_cast<uint8_t>(40 + index * 3 % 180);
+        nx[index] = static_cast<uint8_t>(80 + index * 5 % 150);
+        ny[index] = static_cast<uint8_t>(50 + index * 7 % 180);
+    }
+    createU8Zarr(dir / "grad_mag.zarr", {4, 4, 4}, {4, 4, 4}, &gradMag);
+    createU8Zarr(dir / "nx.zarr", {4, 4, 4}, {4, 4, 4}, &nx);
+    createU8Zarr(dir / "ny.zarr", {4, 4, 4}, {4, 4, 4}, &ny);
+    const auto manifestPath = dir / "dataset.lasagna.json";
+    writeText(manifestPath, R"({
+        "version": 2,
+        "grad_mag_encode_scale": 100.0,
+        "grad_mag_factor": 1.0,
+        "groups": {
+            "grad_mag_group": {"zarr": "grad_mag.zarr", "scaledown": 0, "channels": ["grad_mag"]},
+            "nx_group": {"zarr": "nx.zarr", "scaledown": 0, "channels": ["nx"]},
+            "ny_group": {"zarr": "ny.zarr", "scaledown": 0, "channels": ["ny"]}
+        }
+    })");
+
+    const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+    vc::lasagna::LasagnaNormalSampler sampler(dataset);
+    const std::vector<std::pair<cv::Vec3d, cv::Vec3d>> connectors{
+        {{0.17, 0.31, 0.44}, {2.73, 1.82, 2.19}},
+        {{2.61, 0.23, 1.11}, {0.29, 2.54, 2.77}},
+        {{0.41, 2.49, 0.38}, {2.45, 0.52, 2.63}},
+    };
+    const auto batchOne = sampler.normalAlignedWindingDistancesBatch(
+        connectors, 0.37, 1);
+    const auto batchFour = sampler.normalAlignedWindingDistancesBatch(
+        connectors, 0.37, 4);
+    REQUIRE(batchOne.size() == connectors.size());
+    REQUIRE(batchFour.size() == connectors.size());
+    for (size_t index = 0; index < connectors.size(); ++index) {
+        const double scalar = sampler.normalAlignedWindingDistance(
+            connectors[index].first, connectors[index].second, 0.37);
+        CHECK(batchOne[index] == doctest::Approx(scalar).epsilon(2.0e-5));
+        CHECK(batchFour[index] == batchOne[index]);
+    }
     fs::remove_all(dir);
 }
 
@@ -458,4 +534,116 @@ TEST_CASE("LasagnaNormalSampler integrates with LineOptimizer")
     CHECK(result.line.points[1].sampledNormal.valid);
     CHECK(result.line.points[1].sampledNormal.normal[2] == doctest::Approx(1.0));
     fs::remove_all(dir);
+}
+
+
+TEST_CASE("Lasagna scalar and corner paths share regular decoded chunks in both warm orders")
+{
+    using namespace vc::lasagna;
+    const auto dir = tmpDir("shared_cache");
+    const auto manifest = dir / "dataset.lasagna.json";
+    writeText(manifest, R"({"version":2,"groups":{
+        "v":{"zarr":"values.zarr","scaledown":0,"channels":["nx"]}}})");
+    createConstantChunkedU8Zarr(dir / "values.zarr", {8,8,8}, {4,4,4}, 42);
+    const auto dataset = LasagnaDataset::open(manifest);
+    const auto a = bindLasagnaChannel(dataset.manifest(), "nx");
+    const auto b = bindLasagnaChannel(dataset.manifest(), "nx");
+    CHECK(a.chunkSource->sourceId() == b.chunkSource->sourceId());
+    LasagnaChannelCornerSampler corners(b);
+    auto request = prepareLasagnaCubeRequest(a, cv::Vec3d{1,1,1});
+    LasagnaLocalChunkResolver resolver(a);
+    resolver.resolve(request);
+    const auto pin = request.chunks[0].bytes;
+    REQUIRE(pin);
+    CHECK(pin == b.chunkSource->getChunkIfCached(0,0,0,0).bytes);
+    const auto scalarFirstStats = a.chunkSource->stats();
+    std::vector<LasagnaCornerSample> samples;
+    (void)corners.sampleBatch({{1,1,1}}, samples);
+    REQUIRE(samples.size() == 1);
+    CHECK(samples[0].valid);
+    CHECK(samples[0].values[0] == 42);
+    CHECK(b.chunkSource->getChunkIfCached(0,0,0,0).bytes == pin);
+    CHECK(a.chunkSource->stats().decodeAttempts == scalarFirstStats.decodeAttempts);
+
+    (void)corners.sampleBatch({{4,4,4}}, samples);
+    const auto cornerPin = b.chunkSource->getChunkIfCached(0,1,1,1).bytes;
+    REQUIRE(cornerPin);
+    const auto cornerFirstStats = b.chunkSource->stats();
+    const auto value = sampleLasagnaChannel(a, cv::Vec3d{4,4,4});
+    REQUIRE(value);
+    CHECK(*value == 42);
+    CHECK(a.chunkSource->getChunkIfCached(0,1,1,1).bytes == cornerPin);
+    CHECK(a.chunkSource->stats().decodeAttempts == cornerFirstStats.decodeAttempts);
+    fs::remove_all(dir);
+}
+
+TEST_CASE("Lasagna regular cache coalesces concurrent cold readers and preserves pins on eviction")
+{
+    using namespace vc::lasagna;
+    const auto dir = tmpDir("coalesced_cache");
+    createConstantChunkedU8Zarr(dir / "values.zarr", {4,4,4}, {2,2,2}, 43);
+    const auto manifest = dir / "dataset.lasagna.json";
+    writeText(manifest, R"({"version":2,"groups":{
+        "v":{"zarr":"values.zarr","scaledown":0,"channels":["nx"]}}})");
+    const auto dataset = LasagnaDataset::open(manifest);
+    const auto binding = bindLasagnaChannel(dataset.manifest(), "nx");
+    std::barrier start(8);
+    std::vector<std::future<vc::render::ChunkResult>> readers;
+    for (int i=0; i<8; ++i)
+        readers.push_back(std::async(std::launch::async, [&] {
+            start.arrive_and_wait();
+            return binding.chunkSource->getChunkBlocking(0,0,0,0);
+        }));
+    auto pin = readers.front().get();
+    REQUIRE(pin.bytes);
+    for (size_t i=1; i<readers.size(); ++i)
+        CHECK(readers[i].get().bytes == pin.bytes);
+    const auto budget = vc::render::processChunkCacheService()->decodedByteBudget();
+    struct RestoreBudget {
+        std::shared_ptr<vc::render::DecodedChunkCacheBudget> budget;
+        size_t bytes;
+        ~RestoreBudget() { budget->setMaximumBytes(bytes); }
+    } restore{budget, budget->maximumBytes()};
+    budget->setMaximumBytes(1);
+    (void)binding.chunkSource->getChunkBlocking(0,1,1,1);
+    // The regular budget protects caller-held pins and continues accounting them.
+    CHECK(binding.chunkSource->getChunkIfCached(0,0,0,0).bytes == pin.bytes);
+    CHECK(pin.bytes->at(0) == std::byte{43});
+    pin = {};
+    budget->setMaximumBytes(1);
+    CHECK(binding.chunkSource->getChunkIfCached(0,0,0,0).status == vc::render::ChunkStatus::MissQueued);
+    fs::remove_all(dir);
+}
+
+TEST_CASE("Lasagna shared cache distinguishes absent fill from stored zero and rejects corrupt chunks")
+{
+    using namespace vc::lasagna;
+    for (const bool stored : {false, true}) {
+        const auto dir = tmpDir(stored ? "stored_zero" : "no_fill");
+        const std::vector<uint8_t> zero(8, 0);
+        createU8Zarr(dir / "values.zarr", {2,2,2}, {2,2,2}, stored ? &zero : nullptr, std::nullopt);
+        const auto manifest = dir / "dataset.lasagna.json";
+        writeText(manifest, R"({"version":2,"groups":{
+            "v":{"zarr":"values.zarr","scaledown":0,"channels":["nx"]}}})");
+        const auto dataset = LasagnaDataset::open(manifest);
+        const auto binding = bindLasagnaChannel(dataset.manifest(), "nx");
+        const auto value = sampleLasagnaChannel(binding, cv::Vec3d{0,0,0});
+        CHECK(value.has_value() == stored);
+        if (value) CHECK(*value == 0);
+        fs::remove_all(dir);
+    }
+    for (const bool corrupt : {false, true}) {
+        const auto dir = tmpDir(corrupt ? "corrupt" : "bad_fill");
+        createU8Zarr(dir / "values.zarr", {2,2,2}, {2,2,2}, nullptr, corrupt ? 0 : 300);
+        if (corrupt) writeText(dir / "values.zarr" / "0.0.0", "x");
+        const auto manifest = dir / "dataset.lasagna.json";
+        writeText(manifest, R"({"version":2,"groups":{
+            "v":{"zarr":"values.zarr","scaledown":0,"channels":["nx"]}}})");
+        const auto dataset = LasagnaDataset::open(manifest);
+        CHECK_THROWS([&] {
+            const auto binding = bindLasagnaChannel(dataset.manifest(), "nx");
+            (void)sampleLasagnaChannel(binding, cv::Vec3d{0,0,0});
+        }());
+        fs::remove_all(dir);
+    }
 }

@@ -1,0 +1,27 @@
+{
+  "pilot": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_reference_20260913_v1",
+  "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_seed_delay_touch_20260914_v1",
+  "fill_missing": true,
+  "gpu_manager": {
+    "exclusive": false,
+    "priority": 0,
+    "cpu_cores": 16,
+    "vram_bytes_per_gpu": 21474836480,
+    "label": "embedding-method-comparison"
+  },
+  "native_binary": "/home/hendrik/villa/volume-cartographer/build/dev-quickbuild-gcc/bin/vc_fiber_trace_metric",
+  "candidates": [
+    {"mode":"ema", "weight":0.25, "half_life":512, "spacing":128, "window":1024, "count":8, "falloff":"gaussian"},
+    {"mode":"ema-delayed", "weight":0.25, "half_life":512, "delay":0, "spacing":128, "window":1024, "count":8, "falloff":"gaussian"},
+    {"mode":"anchors-lru", "aggregation":"mean", "weight":0.1, "anchors":2, "novelty":0.1, "ema_mix":0, "spacing":512, "window":1024, "count":8, "falloff":"uniform"},
+    {"mode":"anchors-lru", "aggregation":"mean", "weight":0.1, "anchors":2, "novelty":0.1, "touch":"hit", "ema_mix":0, "spacing":512, "window":1024, "count":8, "falloff":"uniform"},
+    {"mode":"anchors-lru", "aggregation":"best", "weight":0.1, "anchors":2, "novelty":0.1, "touch":"hit", "ema_mix":0, "spacing":512, "window":1024, "count":8, "falloff":"uniform"},
+    {"mode":"seed", "weight":0.1, "spacing":128, "window":1024, "count":8, "falloff":"uniform"},
+    {"mode":"seed", "weight":0.25, "spacing":128, "window":1024, "count":8, "falloff":"uniform"},
+    {"mode":"seed", "weight":0.5, "spacing":128, "window":1024, "count":8, "falloff":"uniform"},
+    {"mode":"ema-delayed", "weight":0.25, "half_life":512, "delay":32, "spacing":128, "window":1024, "count":8, "falloff":"gaussian"},
+    {"mode":"ema-delayed", "weight":0.25, "half_life":512, "delay":64, "spacing":128, "window":1024, "count":8, "falloff":"gaussian"},
+    {"mode":"ema-delayed", "weight":0.25, "half_life":512, "delay":128, "spacing":128, "window":1024, "count":8, "falloff":"gaussian"},
+    {"mode":"ema-delayed", "weight":0.25, "half_life":512, "delay":256, "spacing":128, "window":1024, "count":8, "falloff":"gaussian"}
+  ]
+}

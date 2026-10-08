@@ -1,0 +1,287 @@
+{
+  "default": {
+    "path": "/ephemeral/hendrik/fiber3d_train2/profile_2gpu_default_20260907_075845_244734",
+    "elapsed_seconds": 294.966374874115,
+    "ranks": {
+      "timings_rank0": {
+        "count": 120,
+        "first_loss": 2.4906229972839355,
+        "first_compute_seconds": 44.68945004604757,
+        "peak_allocated_gib": 14.364097118377686,
+        "stats": {
+          "iteration_wall_ms": {
+            "count": 89,
+            "mean": 1560.0617698739084,
+            "median": 531.2144160270691,
+            "p95": 5872.04799875617,
+            "min": 520.747147500515,
+            "max": 11522.649569436908
+          },
+          "fw_bw_step_ms": {
+            "count": 89,
+            "mean": 835.9250497031078,
+            "median": 494.88591961562634,
+            "p95": 3025.352233275764,
+            "min": 489.67801593244076,
+            "max": 9540.899289771914
+          },
+          "wait_ms": {
+            "count": 89,
+            "mean": 695.0795586649956,
+            "median": 0.3058798611164093,
+            "p95": 4685.742559283971,
+            "min": 0.06269104778766632,
+            "max": 6576.64199359715
+          },
+          "to_device_ms": {
+            "count": 89,
+            "mean": 23.518076082796192,
+            "median": 23.41911941766739,
+            "p95": 25.02119354903698,
+            "min": 20.52527107298374,
+            "max": 26.020387187600136
+          }
+        }
+      },
+      "timings_rank1": {
+        "count": 120,
+        "first_loss": 2.4906229972839355,
+        "first_compute_seconds": 50.997303538024426,
+        "peak_allocated_gib": 14.364023208618164,
+        "stats": {
+          "iteration_wall_ms": {
+            "count": 89,
+            "mean": 1559.9404652759936,
+            "median": 531.1667751520872,
+            "p95": 5871.914865449071,
+            "min": 520.7598861306906,
+            "max": 11522.563762962818
+          },
+          "fw_bw_step_ms": {
+            "count": 89,
+            "mean": 1070.2322144689185,
+            "median": 495.6795796751976,
+            "p95": 5177.84330099821,
+            "min": 488.8034239411354,
+            "max": 7060.3704154491425
+          },
+          "wait_ms": {
+            "count": 89,
+            "mean": 458.3960786629259,
+            "median": 0.20672380924224854,
+            "p95": 3476.241226494308,
+            "min": 0.05999952554702759,
+            "max": 10986.26503534615
+          },
+          "to_device_ms": {
+            "count": 89,
+            "mean": 25.959238096067075,
+            "median": 24.974772706627846,
+            "p95": 31.576898694038388,
+            "min": 20.481573417782784,
+            "max": 34.17784720659256
+          }
+        }
+      }
+    },
+    "test_lines": [
+      "test step=0 loss_total=2.138115 loss_direction=0.073185 loss_presence=1.406269 angle_mean_deg=46.40 branch0=1.000 branch1=0.000 selected_score=0.335",
+      "test step=100 loss_total=2.148344 loss_direction=0.075443 loss_presence=1.393919 angle_mean_deg=37.24 branch0=1.000 branch1=0.000 selected_score=0.577"
+    ],
+    "test_timing": [
+      "test_timing step=0 total_seconds=13.095",
+      "test_timing step=100 total_seconds=6.117"
+    ],
+    "recompile_limit_warnings": 2
+  },
+  "off": {
+    "path": "/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_20260907_075222_618584",
+    "elapsed_seconds": 264.80555844306946,
+    "ranks": {
+      "timings_rank0": {
+        "count": 120,
+        "first_loss": 2.49044132232666,
+        "first_compute_seconds": 0.8514762874692678,
+        "peak_allocated_gib": 13.834403991699219,
+        "stats": {
+          "iteration_wall_ms": {
+            "count": 89,
+            "mean": 1595.3236652559108,
+            "median": 483.2577519118786,
+            "p95": 8554.151679202914,
+            "min": 476.585041731596,
+            "max": 10072.124660015106
+          },
+          "fw_bw_step_ms": {
+            "count": 89,
+            "mean": 450.24298259130353,
+            "median": 449.20836575329304,
+            "p95": 456.6383209079504,
+            "min": 446.5696010738611,
+            "max": 467.5174169242382
+          },
+          "wait_ms": {
+            "count": 89,
+            "mean": 1113.9009017706587,
+            "median": 0.16357004642486572,
+            "p95": 8076.1264346539965,
+            "min": 0.09763240814208984,
+            "max": 9593.365959823132
+          },
+          "to_device_ms": {
+            "count": 89,
+            "mean": 25.084038066227784,
+            "median": 23.89593794941902,
+            "p95": 30.43833039700985,
+            "min": 20.36307379603386,
+            "max": 36.34964860975742
+          }
+        }
+      },
+      "timings_rank1": {
+        "count": 120,
+        "first_loss": 2.49044132232666,
+        "first_compute_seconds": 8.280488392338157,
+        "peak_allocated_gib": 13.834407806396484,
+        "stats": {
+          "iteration_wall_ms": {
+            "count": 89,
+            "mean": 1595.3689436271284,
+            "median": 483.3218064159155,
+            "p95": 8554.165142402053,
+            "min": 476.68752633035183,
+            "max": 10071.963302791119
+          },
+          "fw_bw_step_ms": {
+            "count": 89,
+            "mean": 1479.7455255737466,
+            "median": 451.6237210482359,
+            "p95": 8467.879206314683,
+            "min": 445.5323535948992,
+            "max": 10038.844922557473
+          },
+          "wait_ms": {
+            "count": 89,
+            "mean": 86.77699132246917,
+            "median": 0.23049674928188324,
+            "p95": 12.426993623375878,
+            "min": 0.09411200881004333,
+            "max": 5787.091925740242
+          },
+          "to_device_ms": {
+            "count": 89,
+            "mean": 23.724082334155447,
+            "median": 23.054655641317368,
+            "p95": 28.937544301152226,
+            "min": 21.91798947751522,
+            "max": 32.84585103392601
+          }
+        }
+      }
+    },
+    "test_lines": [
+      "test step=0 loss_total=2.138115 loss_direction=0.073185 loss_presence=1.406269 angle_mean_deg=46.40 branch0=1.000 branch1=0.000 selected_score=0.335",
+      "test step=100 loss_total=2.276050 loss_direction=0.075538 loss_presence=1.520672 angle_mean_deg=32.97 branch0=1.000 branch1=0.000 selected_score=0.637"
+    ],
+    "test_timing": [
+      "test_timing step=0 total_seconds=13.020",
+      "test_timing step=100 total_seconds=6.302"
+    ],
+    "recompile_limit_warnings": 0
+  },
+  "reduce-overhead": {
+    "path": "/ephemeral/hendrik/fiber3d_train2/profile_2gpu_reduce-overhead_20260907_080540_236012",
+    "elapsed_seconds": 284.55482244491577,
+    "ranks": {
+      "timings_rank0": {
+        "count": 120,
+        "first_loss": 2.4906229972839355,
+        "first_compute_seconds": 29.6753298509866,
+        "peak_allocated_gib": 18.123876571655273,
+        "stats": {
+          "iteration_wall_ms": {
+            "count": 89,
+            "mean": 1596.8200762996848,
+            "median": 535.9723996371031,
+            "p95": 8835.680498182764,
+            "min": 525.0339899212122,
+            "max": 13104.78163510561
+          },
+          "fw_bw_step_ms": {
+            "count": 89,
+            "mean": 909.6439027258854,
+            "median": 502.76600383222103,
+            "p95": 2852.5537628680454,
+            "min": 496.9242084771395,
+            "max": 11116.916447877884
+          },
+          "wait_ms": {
+            "count": 89,
+            "mean": 656.6324351836791,
+            "median": 0.13823248445987701,
+            "p95": 6147.759699076407,
+            "min": 0.059407204389572144,
+            "max": 9230.759071186185
+          },
+          "to_device_ms": {
+            "count": 89,
+            "mean": 25.200328193186373,
+            "median": 24.005431681871414,
+            "p95": 30.03765195608139,
+            "min": 18.817458301782608,
+            "max": 48.17000590264797
+          }
+        }
+      },
+      "timings_rank1": {
+        "count": 120,
+        "first_loss": 2.4906229972839355,
+        "first_compute_seconds": 36.59836768358946,
+        "peak_allocated_gib": 18.1241774559021,
+        "stats": {
+          "iteration_wall_ms": {
+            "count": 89,
+            "mean": 1596.7452307597976,
+            "median": 535.9821021556854,
+            "p95": 8835.477777197948,
+            "min": 524.9963346868753,
+            "max": 13104.699324816465
+          },
+          "fw_bw_step_ms": {
+            "count": 89,
+            "mean": 1068.0595854234496,
+            "median": 503.4935548901558,
+            "p95": 6456.20892085134,
+            "min": 494.9870053678751,
+            "max": 9728.618677705526
+          },
+          "wait_ms": {
+            "count": 89,
+            "mean": 498.862609309092,
+            "median": 0.23714080452919006,
+            "p95": 2627.9603730887156,
+            "min": 0.056331977248191833,
+            "max": 12571.155793964863
+          },
+          "to_device_ms": {
+            "count": 89,
+            "mean": 24.705271058705417,
+            "median": 24.129031226038933,
+            "p95": 29.41700927913189,
+            "min": 22.07719348371029,
+            "max": 30.53365647792816
+          }
+        }
+      }
+    },
+    "test_lines": [
+      "test step=0 loss_total=2.138115 loss_direction=0.073185 loss_presence=1.406269 angle_mean_deg=46.40 branch0=1.000 branch1=0.000 selected_score=0.335",
+      "test step=100 loss_total=2.311375 loss_direction=0.076782 loss_presence=1.543559 angle_mean_deg=33.35 branch0=1.000 branch1=0.000 selected_score=0.666"
+    ],
+    "test_timing": [
+      "test_timing step=0 total_seconds=12.417",
+      "test_timing step=100 total_seconds=6.256"
+    ],
+    "recompile_limit_warnings": 2
+  }
+}

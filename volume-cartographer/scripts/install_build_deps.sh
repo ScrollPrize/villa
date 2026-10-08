@@ -13,7 +13,7 @@ apt-get install -y --no-install-recommends \
     build-essential clang lld llvm flang-21 libclang-rt-21-dev mold git cmake ninja-build ccache pkg-config \
     qt6-base-dev \
     libboost-system-dev libboost-program-options-dev \
-    libceres-dev libsuitesparse-dev \
+    libceres-dev libsuitesparse-dev libhighs-dev \
     libopencv-dev libopencv-contrib-dev \
     libcgal-dev libmpfr-dev libgmp-dev \
     libblosc-dev libzstd-dev libcurl4-openssl-dev \

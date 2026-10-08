@@ -1,0 +1,203 @@
+# Cooperative training validation — 2026-09-10
+
+Status: implementation/reference validation complete under the user's revised
+short-test scope; protocol v1 locked. Extended timing repetitions were deliberately
+stopped, not passed. No further long benchmark is required or started.
+
+## Reproduction and scope
+
+All tests use the approved no-argument launcher:
+
+```bash
+/home/hendrik/villa/vesuvius/scripts/run_fiber3d_cooperative_tests
+```
+
+Its adjacent `fiber3d_cooperative_tests.json` selects named suites and reference
+phases. Each output directory retains the exact control, command, source revision,
+logs and results. Python is `/home/hendrik/.venv_las/bin/python`. Artifacts below
+are relative to `/ephemeral/hendrik/fiber3d_train2/cooperative-tests/`.
+
+Reference data/test selection: archived `training_baseline_s1a_20260729.json`,
+S1A NML annotations; current GroupNorm, quarter-resolution output, patch 128,
+effective batch 128, seed 0, compilation off. Only GPUs 0/1 (H100 80 GB) are used.
+The test requests eight CPU cores (six loading workers with two GPU workers),
+microbatch 2/GPU normally and 1/GPU under reduced VRAM. CUDA model computation
+uses BF16 unless an explicitly labelled FP32 oracle is selected. Native code is
+QuickBuild `-O3`, without LTO or fast-math, loaded from the isolated build rather
+than installed over the user's venv.
+
+A 16 GiB/GPU test allowance includes a 4 GiB non-allocator reserve; the outer
+process-tree monitor aborts above 20 GiB/GPU. Observed reference lifecycle peak
+was 8.23 GiB/GPU. Calibration covers these two devices and measured microbatches
+1/2, **not** arbitrary configurations or an eight-GPU run. Permission to share
+devices is not evidence that concurrent GPU contention actually occurred.
+
+## Correctness evidence
+
+| Check | Result | Artifact directory |
+| --- | --- | --- |
+| CPU regression | 344 passed, 18 GPU skips; 71.31 s | `20260910_100827_372654` |
+| Manager policy/protocol/recovery/failure cleanup | 61 passed; 12.29 s | `20260910_100827_372654` |
+| Reference harness assertions | 6 passed; 1.61 s | `20260910_093209_505125` |
+| Native prerequisites | 3/3 passed; 2.51 s | `20260910_090759_469557` |
+| CUDA FP32/FP16/BF16 numerical checks | 12 passed | `20260910_083405_608714` |
+| CUDA two-to-one cohort restart | 1 passed | `20260910_083405_608714` |
+| Actual S1A FP32 same-allocation restart | byte-exact model/optimizer/test metric | `20260910_083025_287860` |
+| Actual S1A BF16 same-allocation restart | byte-exact model/optimizer/test metric | `20260910_083716_992318` |
+| Actual S1A frozen FP32 gradient sums | 612 component/layer checks pass | `20260910_082534_937046` |
+| Two-update reference profile | passed; 161.41 s including initialization/export | `20260910_100958_644509` |
+
+Same-allocation tests run six B128 updates and include a GPU-free pause during
+testing. The frozen-gradient oracle observes the actual FP32 bank contributions:
+one- and two-GPU FP64 shadow sums match, sample IDs/counts match exactly, and all
+FP32 sums satisfy their computed summation-error bound. Maximum bound fractions
+are 0.059152 (one GPU) and 0.032104 (two GPUs). FP64 is test-only. This isolates
+accumulation roundoff, not every BF16 batch-shape-dependent kernel effect.
+
+Changing physical batch/rank partition is not bitwise-identical. The original
+pointwise trajectory criterion failed for a small subset of weights; it was
+**not widened**. Six-update fixed/dynamic relative model L2 differences are
+1.39e-5 (FP32) and 5.90e-5 (BF16). Final test losses are
+2.242254823/2.242277861 (FP32) and 2.239006564/2.239104435 (BF16).
+These are trajectory diagnostics, separate from the gradient semantic checks.
+
+The first 110-update BF16 repetition shows amplified trajectory drift: fixed
+test loss 1.582692 versus dynamic 1.606135; model relative L2 difference 0.010365,
+optimizer moment relative L2 difference 0.114254. This is **not** a long-run
+numerical-equivalence pass. Fixed versus unmanaged remains byte-exact. Frozen
+gradient checks establish the objective/accumulation semantics but cannot prove
+equal convergence after repeated batch-shape-dependent BF16 rounding.
+
+## Throughput method
+
+Artifacts: `20260910_093209_505125`, explicitly reusing the two completed first
+baseline cases in `20260910_085311_079168`. The latter's dynamic case failed due
+to a stale test-only pause timer and was rerun from initialization after the fix.
+Ten warmup plus 100 measured updates per case. One full unmanaged/managed-fixed/
+dynamic comparison completed. The user stopped the second repetition and cancelled
+the remaining repetitions in favor of tests that finish in minutes.
+Cases run sequentially. The **unmanaged comparator is the same bounded
+production trainer/cohort without manager admission/RPC**, not the previous
+graph-retaining trainer or its larger microbatch performance ceiling.
+
+Dynamic cases include GPU-free pauses, two-GPU partial VRAM, one-GPU shrink and
+expansion. Saved grants plus completed updates must prove each transition was
+applied. Report active-update time separately from wall time including handoff.
+The separate `profile` phase measures operator/stage costs without contaminating
+the throughput sample; host stage durations are not CUDA kernel durations.
+
+| Completed case | Wall update mean / p50 / p95 (s) | Min / max (s) | Global samples/s | Per GPU samples/s |
+| --- | --- | --- | --- | --- |
+| Same bounded trainer, unmanaged admission | 8.010 / 7.974 / 8.093 | 7.719 / 12.183 | 15.980 | 7.990 (2 GPUs) |
+| Managed, fixed allocation | 7.945 / 7.903 / 8.074 | 7.434 / 12.325 | 16.111 | 8.056 (2 GPUs) |
+| Managed, changing allocation incl. handoffs | 11.030 / 8.078 / 16.317 | 7.766 / 36.613 | 11.605 | not a fixed GPU count |
+
+These single-comparison results do not establish a statistical speedup. Mean
+active dynamic update time is 10.219s; mean wall overhead above active time is
+0.811s/update across the deliberately frequent handoffs. By active grant:
+two GPUs at microbatch 2 average 8.058 s/update (15.885 global samples/s), two GPUs
+at microbatch 1 average 10.610 s (12.065 global), one GPU at microbatch 1 average
+16.310 s (7.848 samples/s). Two recorded repeated pause latencies were 5.50/6.75 s
+from the boundary request to driver-confirmed zero owned GPU processes.
+
+## Short profile
+
+Two B128 updates, one traced update, same two-GPU configuration. Artifact
+`20260910_100958_644509` includes host stage JSON, CUDA traces and operator tables.
+The full profile invocation took 161.41 s, including initial testing and trace
+export; this is not a training-step time. Owned driver peaks were 8.03/7.78 GiB.
+
+For the traced update, rank 0/rank 1 host stage totals respectively:
+
+- forward/loss: 1.235/1.331 s;
+- component backward: 4.864/4.950 s;
+- final statistics/gradient reduction: 2.634/0.038 s;
+- input wait: 0.004/2.407 s.
+
+The reduction imbalance coincides with rank 1 waiting for inputs. Do not label
+rank 0's entire 2.6 s as communication bandwidth cost. On GPU 0 the operator table
+records convolution backward 1.518 s CUDA total, GroupNorm backward 0.942 s and
+GroupNorm forward 0.628 s. Nested/custom ranges overlap: do not sum all profiler
+rows. BF16 convolution kernels remain in the trace; production model compute
+was not switched to FP32. This short trace is diagnostic, not a warmed throughput
+benchmark or proof of the optimal configuration.
+
+## Limits
+
+No one-hour convergence claim follows from this validation. Only two H100 GPUs
+were calibrated/tested; other configurations need calibration. Multi-user OS
+credential tests use fake identities rather than provisioning extra local users.
+Host queues/parking are structurally tested; the planned extended pause-RAM
+settling study was omitted when the user requested short tests. The venv was not
+reinstalled. Default CPU/manager tests take about 84 s here, and every normal
+launcher invocation is capped at 300 s total. Long sweeps are explicitly rejected.
+
+## Deferred reviewed-trace maintenance
+
+Periodic reviewed-trace tests are supervisor-owned pending work, not state
+owned by a replaceable GPU cohort. The completed training boundary publishes an
+exact `(kind, step, samples_seen)` request synchronously. Any replacement cohort
+starts held until that request completes, so pause/reallocation cannot lose the
+test or admit the next optimizer unit first.
+
+The test starts only with an applied manager epoch/generation and exact GPU UUID
+and VRAM grant. Its output remains in an attempt directory until validation and
+is then atomically promoted to `reviewed_trace_test/step_NNNNNNNN`. If ownership
+is revoked, inference admission stops, resident GPU work finishes and its transient cache
+is cleaned before the normal cohort drain/release; the same request retries after regrant. A real benchmark
+failure remains fatal rather than being mistaken for a manager retry.
+
+Before launch, the supervisor freezes the exact raw checkpoint into the
+attempt and records its SHA-256. After a complete trace and successful cache
+cleanup, the raw checkpoint with the fewest combined restart episodes is
+atomically retained as `snapshots/best_reviewed_trace.pt`. Ties keep the
+earlier checkpoint. This selection is independent of dense `best.pt` and all
+EMA best snapshots. Its metadata records the trace metric, full trace summary,
+training step/sample count, evaluated checkpoint digest, and benchmark
+identity. The `best_trace` experiment snapshot variant resolves this file.
+
+On supervisor startup, completed staged attempts are reconciled idempotently.
+This recovers interruption between successful tracing, checkpoint selection,
+and result-directory promotion without ever admitting incomplete or revoked
+work. Results from a changed locked split, tracer binary, template, runner, or
+effective workload are rejected as a different benchmark rather than compared.
+
+### Resident execution
+
+Training calls `training_trace_benchmark.run_job`, which uses shared
+`evaluation_workload.prepare`, `audit_prepared` and `run_prepared` functions.
+The command-line evaluator uses the same preparation and audit implementation.
+No Python benchmark interpreter or replacement model is launched per test.
+The CPU coordinator runs on a supervisor thread so manager polling continues.
+The existing native C++ tracer executable and parallel CPU data/accumulator
+workers remain; this is not a serial Python replacement for those workers.
+
+At a trace boundary, training CUDA prefetch is paused and the raw model,
+optimizer and EMA stay resident. `resident_trace` forwards shared-slot tile
+descriptors to those GPU replicas. `DemandWorkerPool` borrows this executor;
+it does not own or terminate training processes. Both paths use the same
+tiled inference preprocessing, precision, product conversion and blending.
+Per-module modes, RNG and TF32 flags are restored before training resumes.
+Only unused CUDA scratch is released. If necessary inference batches split
+on OOM without changing tile geometry; a single tile that cannot fit alongside
+training state fails explicitly rather than evacuating the optimizer silently.
+
+The borrowed executor acknowledges shutdown before shared buffers are freed.
+Large descriptors are sent only after a small command wakes the replicas,
+avoiding pipe-capacity startup deadlocks. Native and CPU workers are registered
+with the training stop guard and joined by the shared evaluator's cleanup.
+Only a real manager allocation change or training shutdown reconstructs workers.
+An explicitly unmanaged debug run must disable `reviewed_trace_test`: it has
+no resident managed executor and no longer falls back to a second model process.
+Mixed-checkpoint embedding inference is likewise not a resident raw-model test.
+
+Validation uses the fixed approved command (edit its adjacent JSON suite list):
+
+```bash
+/home/hendrik/villa/vesuvius/scripts/run_fiber3d_cooperative_tests
+```
+
+Suites `resident-trace`, `cuda-resident-state`, and `cuda-resident-trace` cover
+buffer delivery, cancellation, model/optimizer/RNG preservation, actual
+two-rank training → resident inference → training, and reallocation to one rank.
+CUDA suites obtain a manager grant only for the selected test GPU UUIDs.

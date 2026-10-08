@@ -1,0 +1,23 @@
+{
+  "output_root": "/ephemeral/hendrik/fiber_crop_bench/20260923_v1",
+  "reference_dir": "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+  "input_files": [
+    "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd1-7ff0ce6c/artifacts/PHercParis4-20260411134726-las-sd1-7ff0ce6c.lasagna.json",
+    "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json"
+  ],
+  "commands": [{
+    "name": "fiberlet-7ff0ce6c",
+    "binary": "vc_fiber_trace_chunk",
+    "args": [
+      "reference-replay-benchmark", "-",
+      "--fiber-manifest", "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd1-7ff0ce6c/artifacts/PHercParis4-20260411134726-las-sd1-7ff0ce6c.lasagna.json",
+      "--fiberlet-cache-root", "/ephemeral/hendrik/fiber_crop_bench/fiberlet_cache",
+      "--normal-manifest", "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+      "--bbox", "10240", "22016", "6144", "11264", "23040", "7168",
+      "--reference-fiber-dir", "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+      "--reference-fiber-tag", "hendrik_crop1",
+      "--base-voxel-size-um", "2.4", "--threads", "128",
+      "--output", "/ephemeral/hendrik/fiber_crop_bench/20260923_v1/fiberlet-7ff0ce6c.json"
+    ]
+  }]
+}

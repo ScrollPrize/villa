@@ -1,0 +1,610 @@
+{
+  "pilot": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_reference_20260913_v1",
+  "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_anchor_boundaries_20260914_v1",
+  "fill_missing": true,
+  "gpu_manager": {
+    "exclusive": false,
+    "priority": 0,
+    "cpu_cores": 16,
+    "vram_bytes_per_gpu": 21474836480,
+    "label": "embedding-method-comparison"
+  },
+  "native_binary": "/home/hendrik/villa/volume-cartographer/build/dev-quickbuild-gcc/bin/vc_fiber_trace_metric",
+  "controls_only": true,
+  "refine": [
+    {
+      "label": "anchors-lru-mean-novel-boundary",
+      "seed": {
+        "aggregation": "mean",
+        "anchors": 2,
+        "count": 8,
+        "ema_mix": 0,
+        "falloff": "uniform",
+        "half_life": 512,
+        "mode": "anchors-lru",
+        "novelty": 0.1,
+        "spacing": 512,
+        "weight": 0.1,
+        "window": 4096
+      },
+      "axes": {
+        "spacing": [
+          192,
+          256,
+          384,
+          512,
+          768,
+          1024,
+          1536,
+          2048
+        ],
+        "anchors": [
+          1,
+          2,
+          4,
+          8
+        ],
+        "weight": [
+          0.1,
+          0.25,
+          0.5
+        ]
+      },
+      "neighbor_weight": true
+    },
+    {
+      "label": "anchors-lru-best-novel-boundary",
+      "seed": {
+        "aggregation": "best",
+        "anchors": 4,
+        "count": 8,
+        "ema_mix": 0,
+        "falloff": "uniform",
+        "half_life": 512,
+        "mode": "anchors-lru",
+        "novelty": 0.1,
+        "spacing": 512,
+        "weight": 0.25,
+        "window": 4096
+      },
+      "axes": {
+        "spacing": [
+          192,
+          256,
+          384,
+          512,
+          768,
+          1024,
+          1536,
+          2048
+        ],
+        "anchors": [
+          1,
+          2,
+          4,
+          8
+        ],
+        "weight": [
+          0.1,
+          0.25,
+          0.5
+        ]
+      },
+      "neighbor_weight": true
+    },
+    {
+      "label": "anchors-lru-best-novel-transfer",
+      "seed": {
+        "aggregation": "best",
+        "anchors": 2,
+        "count": 8,
+        "ema_mix": 0,
+        "falloff": "uniform",
+        "half_life": 512,
+        "mode": "anchors-lru",
+        "novelty": 0.1,
+        "spacing": 512,
+        "weight": 0.1,
+        "window": 4096
+      },
+      "axes": {
+        "spacing": [
+          192,
+          256,
+          384,
+          512,
+          768,
+          1024,
+          1536,
+          2048
+        ],
+        "anchors": [
+          1,
+          2,
+          4,
+          8
+        ],
+        "weight": [
+          0.1,
+          0.25,
+          0.5
+        ]
+      },
+      "neighbor_weight": true
+    },
+    {
+      "label": "appearance-best-boundary",
+      "seed": {
+        "anchors": 2,
+        "count": 8,
+        "ema_mix": 0,
+        "falloff": "uniform",
+        "half_life": 512,
+        "mode": "appearance",
+        "spacing": 512,
+        "weight": 0.25,
+        "window": 4096
+      },
+      "axes": {
+        "spacing": [
+          192,
+          256,
+          384,
+          512,
+          768,
+          1024,
+          1536,
+          2048
+        ],
+        "anchors": [
+          1,
+          2,
+          4,
+          8
+        ],
+        "weight": [
+          0.1,
+          0.25,
+          0.5
+        ]
+      },
+      "neighbor_weight": true
+    },
+    {
+      "label": "appearance-best-transfer",
+      "seed": {
+        "anchors": 2,
+        "count": 8,
+        "ema_mix": 0,
+        "falloff": "uniform",
+        "half_life": 512,
+        "mode": "appearance",
+        "spacing": 512,
+        "weight": 0.1,
+        "window": 4096
+      },
+      "axes": {
+        "spacing": [
+          192,
+          256,
+          384,
+          512,
+          768,
+          1024,
+          1536,
+          2048
+        ],
+        "anchors": [
+          1,
+          2,
+          4,
+          8
+        ],
+        "weight": [
+          0.1,
+          0.25,
+          0.5
+        ]
+      },
+      "neighbor_weight": true
+    },
+    {
+      "label": "appearance-support-softmin-boundary",
+      "seed": {
+        "aggregation": "support-softmin",
+        "anchors": 2,
+        "count": 8,
+        "ema_mix": 0,
+        "falloff": "uniform",
+        "half_life": 512,
+        "mode": "appearance",
+        "spacing": 512,
+        "temperature": 0.03,
+        "weight": 0.25,
+        "window": 4096
+      },
+      "axes": {
+        "spacing": [
+          192,
+          256,
+          384,
+          512,
+          768,
+          1024,
+          1536,
+          2048
+        ],
+        "anchors": [
+          1,
+          2,
+          4,
+          8
+        ],
+        "weight": [
+          0.1,
+          0.25,
+          0.5
+        ]
+      },
+      "neighbor_weight": true
+    },
+    {
+      "label": "appearance-support-softmin-transfer",
+      "seed": {
+        "aggregation": "support-softmin",
+        "anchors": 2,
+        "count": 8,
+        "ema_mix": 0,
+        "falloff": "uniform",
+        "half_life": 512,
+        "mode": "appearance",
+        "spacing": 512,
+        "temperature": 0.03,
+        "weight": 0.1,
+        "window": 4096
+      },
+      "axes": {
+        "spacing": [
+          192,
+          256,
+          384,
+          512,
+          768,
+          1024,
+          1536,
+          2048
+        ],
+        "anchors": [
+          1,
+          2,
+          4,
+          8
+        ],
+        "weight": [
+          0.1,
+          0.25,
+          0.5
+        ]
+      },
+      "neighbor_weight": true
+    },
+    {
+      "label": "anchors-lru-best-plain-boundary",
+      "seed": {
+        "aggregation": "best",
+        "anchors": 2,
+        "count": 8,
+        "ema_mix": 0,
+        "falloff": "uniform",
+        "half_life": 512,
+        "mode": "anchors-lru",
+        "spacing": 512,
+        "weight": 0.1,
+        "window": 4096
+      },
+      "axes": {
+        "spacing": [
+          192,
+          256,
+          384,
+          512,
+          768,
+          1024,
+          1536,
+          2048
+        ],
+        "anchors": [
+          1,
+          2,
+          4,
+          8
+        ],
+        "weight": [
+          0.1,
+          0.25,
+          0.5
+        ]
+      },
+      "neighbor_weight": true
+    },
+    {
+      "label": "anchors-lru-mean-plain-boundary",
+      "seed": {
+        "aggregation": "mean",
+        "anchors": 4,
+        "count": 8,
+        "ema_mix": 0,
+        "falloff": "uniform",
+        "half_life": 512,
+        "mode": "anchors-lru",
+        "spacing": 512,
+        "weight": 0.3,
+        "window": 4096
+      },
+      "axes": {
+        "spacing": [
+          192,
+          256,
+          384,
+          512,
+          768,
+          1024,
+          1536,
+          2048
+        ],
+        "anchors": [
+          1,
+          2,
+          4,
+          8
+        ],
+        "weight": [
+          0.1,
+          0.25,
+          0.5
+        ]
+      },
+      "neighbor_weight": true
+    },
+    {
+      "label": "anchors-lru-mean-plain-transfer",
+      "seed": {
+        "aggregation": "mean",
+        "anchors": 2,
+        "count": 8,
+        "ema_mix": 0,
+        "falloff": "uniform",
+        "half_life": 512,
+        "mode": "anchors-lru",
+        "spacing": 512,
+        "weight": 0.1,
+        "window": 4096
+      },
+      "axes": {
+        "spacing": [
+          192,
+          256,
+          384,
+          512,
+          768,
+          1024,
+          1536,
+          2048
+        ],
+        "anchors": [
+          1,
+          2,
+          4,
+          8
+        ],
+        "weight": [
+          0.1,
+          0.25,
+          0.5
+        ]
+      },
+      "neighbor_weight": true
+    },
+    {
+      "label": "anchors-boundary",
+      "seed": {
+        "anchors": 8,
+        "count": 64,
+        "ema_mix": 0.9,
+        "falloff": "uniform",
+        "half_life": 128,
+        "mode": "anchors",
+        "spacing": 256,
+        "weight": 0.25,
+        "window": 1024
+      },
+      "axes": {
+        "spacing": [
+          192,
+          256,
+          384,
+          512,
+          768,
+          1024
+        ],
+        "anchors": [
+          1,
+          2,
+          4,
+          8
+        ],
+        "weight": [
+          0.1,
+          0.25,
+          0.5
+        ]
+      },
+      "neighbor_weight": true
+    },
+    {
+      "label": "anchors-transfer",
+      "seed": {
+        "anchors": 2,
+        "count": 64,
+        "ema_mix": 0.9,
+        "falloff": "uniform",
+        "half_life": 128,
+        "mode": "anchors",
+        "spacing": 256,
+        "weight": 0.1,
+        "window": 1024
+      },
+      "axes": {
+        "spacing": [
+          192,
+          256,
+          384,
+          512,
+          768,
+          1024
+        ],
+        "anchors": [
+          1,
+          2,
+          4,
+          8
+        ],
+        "weight": [
+          0.1,
+          0.25,
+          0.5
+        ]
+      },
+      "neighbor_weight": true
+    },
+    {
+      "label": "normalized-mean-novel",
+      "seed": {
+        "mode": "anchors-lru",
+        "aggregation": "normalized-mean",
+        "anchors": 2,
+        "weight": 0.1,
+        "novelty": 0.1,
+        "touch": "nearest",
+        "spacing": 512,
+        "window": 4096,
+        "count": 8,
+        "falloff": "uniform",
+        "ema_mix": 0
+      },
+      "axes": {
+        "weight": [
+          0.05,
+          0.1,
+          0.25,
+          0.5
+        ],
+        "spacing": [
+          32,
+          128,
+          512,
+          1024,
+          2048
+        ],
+        "anchors": [
+          1,
+          2,
+          4,
+          8
+        ],
+        "novelty": [
+          0,
+          0.1,
+          0.2
+        ]
+      },
+      "neighbor_weight": true
+    },
+    {
+      "label": "normalized-mean-plain",
+      "seed": {
+        "mode": "anchors-lru",
+        "aggregation": "normalized-mean",
+        "anchors": 4,
+        "weight": 0.3,
+        "novelty": 0,
+        "touch": "nearest",
+        "spacing": 512,
+        "window": 4096,
+        "count": 8,
+        "falloff": "uniform",
+        "ema_mix": 0
+      },
+      "axes": {
+        "weight": [
+          0.05,
+          0.1,
+          0.25,
+          0.5
+        ],
+        "spacing": [
+          32,
+          128,
+          512,
+          1024,
+          2048
+        ],
+        "anchors": [
+          1,
+          2,
+          4,
+          8
+        ],
+        "novelty": [
+          0,
+          0.1,
+          0.2
+        ]
+      },
+      "neighbor_weight": true
+    },
+    {
+      "label": "normalized-mean-hit",
+      "seed": {
+        "mode": "anchors-lru",
+        "aggregation": "normalized-mean",
+        "anchors": 2,
+        "weight": 0.1,
+        "novelty": 0.1,
+        "touch": "hit",
+        "spacing": 512,
+        "window": 4096,
+        "count": 8,
+        "falloff": "uniform",
+        "ema_mix": 0
+      },
+      "axes": {
+        "weight": [
+          0.05,
+          0.1,
+          0.25,
+          0.5
+        ],
+        "spacing": [
+          32,
+          128,
+          512,
+          1024,
+          2048
+        ],
+        "anchors": [
+          1,
+          2,
+          4,
+          8
+        ],
+        "novelty": [
+          0,
+          0.1,
+          0.2
+        ]
+      },
+      "neighbor_weight": true
+    }
+  ]
+}

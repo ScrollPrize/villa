@@ -1,0 +1,21 @@
+{
+  "benchmark_manifest": "/home/hendrik/villa2/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/best_u22000_failed59_20260916_v1.json",
+  "cached_evaluation": "/ephemeral/hendrik/fiber3d_train2/evaluations/refinement_212757_best_ema999_off_20260916_v1/full",
+  "checkpoint": "/ephemeral/hendrik/fiber3d_train2/evaluations/refinement_212757_best_ema999_off_20260916_v1/frozen/live_inference/_models/67edd3a1bde162c7105ee37d849a0f0b60a9b840dd37fc7ff6e17e0c3a2e9742/snapshot.pt",
+  "checkpoint_sha256": "67edd3a1bde162c7105ee37d849a0f0b60a9b840dd37fc7ff6e17e0c3a2e9742",
+  "output_root": "/ephemeral/hendrik/fiber3d_train2/evaluations/short200_best_failed59_vis_20260916_v1",
+  "native_binary": "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_metric",
+  "devices": "0,1,2,3,4,5,6,7",
+  "benchmark_workers": 128,
+  "gpu_manager": {
+    "enabled": true,
+    "exclusive": true,
+    "priority": 100,
+    "cpu_cores": 128,
+    "vram_bytes_per_gpu": 62277025792,
+    "label": "best-failures-vis"
+  },
+  "render": true,
+  "backend": "beam",
+  "scroll_sequential": true
+}

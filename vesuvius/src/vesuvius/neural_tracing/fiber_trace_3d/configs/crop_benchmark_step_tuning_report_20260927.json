@@ -1,0 +1,16 @@
+{
+  "output_root": "/ephemeral/hendrik/fiber_crop_bench/20260927_step_tuning_screen_v1",
+  "local_cost_sweep": {
+    "report_only": true,
+    "screen_report": true,
+    "report_destination": "volume-cartographer/docs/fiber_benchmark_runs/2026-09-27-winding-step-search",
+    "supplemental_roots": [
+      "/ephemeral/hendrik/fiber_crop_bench/20260927_step_tuning_refine_v1",
+      "/ephemeral/hendrik/fiber_crop_bench/20260927_step_tuning_repair_v1",
+      "/ephemeral/hendrik/fiber_crop_bench/20260927_step_tuning_compact_v1",
+      "/ephemeral/hendrik/fiber_crop_bench/20260927_step_tuning_strong_v1",
+      "/ephemeral/hendrik/fiber_crop_bench/20260927_step_tuning_cold_v1",
+      "/ephemeral/hendrik/fiber_crop_bench/20260927_step_tuning_full_v1"
+    ]
+  }
+}

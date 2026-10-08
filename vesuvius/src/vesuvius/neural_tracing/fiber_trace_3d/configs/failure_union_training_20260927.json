@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "output_root": "/ephemeral/hendrik/fiber3d_train2/evaluations/train_failure_union_20260927_v1",
+  "failure_union": {
+    "trace_cpu_cores": 192,
+    "run_reproduction_search": true,
+    "reproduction_base_config": "/home/hendrik/villa3/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_train_mining_lowres_20260927.json",
+    "reproduction_manifest": "/ephemeral/hendrik/fiber3d_train2/evaluations/train_failure_union_20260927_v1/reproduction_search/manifest.json",
+    "baseline_name": "lowres",
+    "best_name": "lowres",
+    "context_base_voxels": 500,
+    "corridor_radius_base_voxels": 64,
+    "merge_distance_base_voxels": 200,
+    "fullres_inference_summary": "/ephemeral/hendrik/fiber3d_train2/evaluations/fullres_refinement_213753_best_ema999_vis_20260917_v1/full/inference_summary.json",
+    "fill_missing_inference": {
+      "evaluation_name": "fullres",
+      "devices": "0,1,2,3,4,5",
+      "workers": 128,
+      "summary": "/ephemeral/hendrik/fiber3d_train2/evaluations/fullres_refinement_213753_best_ema999_vis_20260917_v1/full/summary.json",
+      "inference_overrides": {
+        "accumulator_dtype": "float16",
+        "border": 32,
+        "chunk_size": 64,
+        "compressor": "blosc-zstd",
+        "input_workers": 128,
+        "input_slots": 96,
+        "input_io_threads": 64,
+        "input_decode_threads": 8,
+        "result_slots": 32,
+        "accumulator_workers": 128,
+        "accumulator_hot_slots": 114688,
+        "accumulator_spill_segment_slots": 2048,
+        "max_batch_size": 4,
+        "request_timeout_seconds": 3600,
+        "accumulator_layout": "chunk-major",
+        "overlap": 96,
+        "precision": "bf16",
+        "scaledown_power": 0,
+        "slots_per_gpu": 1,
+        "tile_size": 256,
+        "flush_workers": 128,
+        "emit_embeddings": false
+      }
+    },
+    "export_chunk_subsets": {
+      "chunk_mode": "symlink"
+    },
+    "evaluations": [
+      {
+        "name": "lowres",
+        "summary": "/ephemeral/hendrik/fiber3d_train2/evaluations/train_failure_union_20260927_v1/evaluations/lowres/full/summary.json"
+      }
+    ],
+    "devices": "0,1,2,3,4,5"
+  }
+}

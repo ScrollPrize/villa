@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="462" viewBox="0 0 1100 462">
+<rect width="1100" height="462" fill="white"/>
+<g font-family="DejaVu Sans, sans-serif" fill="#17202a">
+<text x="20" y="30" font-size="20">BP removal score — frozen Paris4 2048 crop</text>
+<text x="20" y="54" font-size="13">Same metric throughout: −100 × problematic / retained fulfilled constraints. Closer to zero is better.</text>
+<path d="M494 75 V397" stroke="#dde3e8"/><text x="494" y="418" text-anchor="middle" font-size="12">-140%</text>
+<path d="M562 75 V397" stroke="#dde3e8"/><text x="562" y="418" text-anchor="middle" font-size="12">-120%</text>
+<path d="M630 75 V397" stroke="#dde3e8"/><text x="630" y="418" text-anchor="middle" font-size="12">-100%</text>
+<path d="M698 75 V397" stroke="#dde3e8"/><text x="698" y="418" text-anchor="middle" font-size="12">-80%</text>
+<path d="M766 75 V397" stroke="#dde3e8"/><text x="766" y="418" text-anchor="middle" font-size="12">-60%</text>
+<path d="M834 75 V397" stroke="#dde3e8"/><text x="834" y="418" text-anchor="middle" font-size="12">-40%</text>
+<path d="M902 75 V397" stroke="#dde3e8"/><text x="902" y="418" text-anchor="middle" font-size="12">-20%</text>
+<path d="M970 75 V397" stroke="#dde3e8"/><text x="970" y="418" text-anchor="middle" font-size="12">0%</text>
+<text x="20" y="99" font-size="14">Unmodulated control</text><rect x="593.70" y="81" width="376.30" height="25" fill="#7b8794"/><text x="585.70" y="99" text-anchor="end" font-size="13">-110.68%</text>
+<text x="20" y="145" font-size="14">Previous tuned density best</text><rect x="600.55" y="127" width="369.45" height="25" fill="#7b8794"/><text x="592.55" y="145" text-anchor="end" font-size="13">-108.66%</text>
+<text x="20" y="191" font-size="14">Best centered quality</text><rect x="600.41" y="173" width="369.59" height="25" fill="#397aaa"/><text x="592.41" y="191" text-anchor="end" font-size="13">-108.70%</text>
+<text x="20" y="237" font-size="14">Best length-based variant</text><rect x="578.37" y="219" width="391.63" height="25" fill="#397aaa"/><text x="570.37" y="237" text-anchor="end" font-size="13">-115.19%</text>
+<text x="20" y="283" font-size="14">Best targeted splitting</text><rect x="594.45" y="265" width="375.55" height="25" fill="#397aaa"/><text x="586.45" y="283" text-anchor="end" font-size="13">-110.45%</text>
+<text x="20" y="329" font-size="14">Measurement off: cost 10</text><rect x="703.73" y="311" width="266.27" height="25" fill="#13856a"/><text x="695.73" y="329" text-anchor="end" font-size="13">-78.31%</text>
+<text x="20" y="375" font-size="14">Measurement off: cost 100</text><rect x="689.34" y="357" width="280.66" height="25" fill="#397aaa"/><text x="681.34" y="375" text-anchor="end" font-size="13">-82.55%</text>
+<text x="20" y="449" font-size="12">Reference-assisted removal metric, not initial winding accuracy. Cost 100 has 25/26 conditioned readouts correct.</text></g></svg>

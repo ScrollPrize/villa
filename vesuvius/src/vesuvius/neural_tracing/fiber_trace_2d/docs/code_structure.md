@@ -11,6 +11,23 @@ loading.
 
 ## 3D CP Model Package
 
+`fiber_trace_3d/cooperative_training.py` (experimental opt-in)
+
+- CPU supervisor connecting the standalone root `gpu_manager/` service to the
+  shared `train.training_units` iterator; ordinary training exhausts that same
+  iterator. `cooperative_cohort.py` and `cooperative_worker.py` adapt gated spawned
+  processes, full release/join, and restored fixed-effective-batch training.
+- `sample_broker.py` owns canonical CPU sample leases across GPU cohorts, reusing
+  the elastic worker limit in `ordered_sample_pipeline.py`. `cooperative_logging.py`
+  keeps one parent-owned TensorBoard writer. `training_state.py` shares durable
+  snapshot payloads with RAM-only handoff, including partially completed tests.
+- `loss_statistics.py` and `gradient_accumulation.py` share the original loss
+  statistics and bounded component-gradient reductions. `cooperative_resources.py`
+  partitions the fixed effective batch using measured physical-batch allowances;
+  `memory_calibration.py` probes the shared trainer explicitly on reserved GPUs.
+- See [cooperative training](cooperative_training.md) for commands, constraints
+  and pending reference CUDA validation. The protocol is not yet locked.
+
 `fiber_trace_3d/direction.py`
 
 - Implements Lasagna's 3D direction target layout as three ambiguous 2D
@@ -46,10 +63,10 @@ loading.
 - Config derives `features_per_stage`, `unet_base_channels`, `unet_depth`,
   `strides`, and `decoder_upsample_mode` the same way as the existing 3D fiber
   model helpers.
-- The fiber 3D wrapper defaults to `BatchNorm3d` normalization. The trainer has
-  no internal micro-batching, so the configured `batch_size` is the real batch
-  used for BatchNorm statistics. Set `model_3d.normalization: "none"` to disable
-  normalization explicitly.
+- The fiber 3D wrapper defaults to `BatchNorm3d` normalization. Configured
+  `batch_size` is the real batch used for each forward's BatchNorm statistics;
+  optional optimizer-global-batch emulation accumulates full logical forwards.
+  Set `model_3d.normalization: "none"` to disable normalization explicitly.
 
 `fiber_trace_3d/inference_adapter.py`
 
@@ -139,18 +156,21 @@ scale relative to the selected input array for runner geometry only; it is not
 serialized into `.lasagna.json`. `scaledown` remains the persisted
 base-relative manifest scale.
 
-For multi-GPU execution, the runner lazily advances the same nested Z/Y/X
-lattice and never creates its Cartesian job list. By default one shared
+For multi-GPU execution, the runner owns one explicit Z band at a time and
+lazily advances that band's Y/X lattice through bounded windows; it never
+creates a Cartesian job list or retains a whole band. By default one shared
 TensorStore Zarr driver asynchronously reads bounding boxes into an independent
 bounded prefetch window. A ready tile is copied into reusable shared memory only
 when an input slot, result slot, and GPU queue are available. One persistent
 spawned process per GPU performs normalization, model inference, weighting, and
 filtered scaledown. Weighted results use separate fixed shared-memory slots;
-process queues carry descriptors only. Results may complete out of order, but the
-coordinator commits them in canonical order and flushes a Z row only after all
-of that row's inference and skip events commit. Consequently the coordinator
-remains the sole owner of the circular rings, resume checks, progress, and Zarr
-write scheduling. `--slots-per-gpu` controls GPU shared-memory depth;
+process queues carry descriptors only. Results may complete out of order, but
+accumulator submission and commit remain canonical. Every input/result slot has
+one explicit band/sequence/stage owner, and the band advances only when every
+event and accumulator acknowledgement has completed and every slot is free.
+Reads, GPU assignment, and accumulation do not cross that barrier. Consequently
+the coordinator remains the sole owner of the circular rings, resume checks,
+progress, and Zarr write scheduling. `--slots-per-gpu` controls GPU shared-memory depth;
 `--prefetch-tiles-per-gpu` independently controls outstanding/ready reads.
 TensorStore cache/file-I/O/copy concurrency are explicit. The `python-zarr`
 fallback uses `--prefetch-workers`. Single-device inference submits the same
@@ -213,14 +233,17 @@ A logical Z plane maps to
 plane from being overwritten. Ring depth is planned from actual canonical tile
 positions and chunk-aligned flush frontiers. Planning mirrors runtime order:
 each Z row writes before its post-row flush. One runner-wide flush batch handled
-by persistent spawn-process workers may retain the preceding finalized
+by persistent spawn-process workers may retain the preceding frozen
 interval while the next row accumulates.
 The planner simulates that exact write, join/release, submit, next-write order,
 so the enlarged ring has disjoint physical slots without copying live overlap
-or finalized bands. At the following advancing frontier the coordinator waits
-if necessary, then clears/releases the completed interval before submitting
-another; storage slowdown creates bounded backpressure rather than additional
-queued bands. Workers receive only mmap-path/chunk descriptors, reopen mappings
+or finalized bands. The coordinator continuously drains flush acknowledgements
+and clears/releases the interval immediately when the whole combined batch
+succeeds. At the following advancing frontier it waits only if that batch is
+still active before submitting another; storage slowdown creates bounded
+backpressure rather than additional queued bands. Zero-task and synchronous
+batches use the same finalization path. Workers receive only mmap-path/chunk
+descriptors, reopen mappings
 read-only, and allocate one chunk of temporary arrays each. The CLI default is
 the available CPU count capped at 64 workers; zero is the synchronous
 immediate-release baseline. Backing size is
@@ -240,6 +263,29 @@ does not advance `final_z`; completion does. Jobs contain immutable chunk
 descriptors rather than decoded arrays, and shutdown waits for an active mmap
 reader before closing scratch files.
 
+The coordinator pumps reader, GPU, accumulator, and flush completions on every
+cycle. Accumulator queue submission is incremental, so a full stable-owner FIFO
+cannot block the other stages. If unresolved state has no tracked producer it
+fails immediately with Z-band, event-frontier, slot-owner, read, accumulator,
+flush, and worker diagnostics; it does not infer a process-limit failure from an
+elapsed timeout.
+
+For an ordinary local selected level, source-support discovery and bounded read
+submission are one atomic coordinator transition, matching the scheduler used
+before rolling live fetch was added. With `--live-fetch`, only remote
+materialization is additional: a bounded descriptor ledger completes first and
+then hands the tile to that same reader/GPU/accumulator/flush pipeline. Worker
+queues remain descriptor-only; explicit per-worker sequence/task ownership and
+shared-slot ownership are checked throughout the band.
+
+Reads and GPU results may complete out of order, while accumulation stays in
+canonical order. The coordinator therefore skips the canonical sparse/no-op
+prefix to find the effective accumulation frontier and reserves one shared
+input/result pair until that tile enters GPU processing. Later ready tiles can
+use every other pair but cannot occupy the capacity needed to advance the
+frontier. This is an admission invariant, not completion retry logic; worker
+tasks and terminal results remain single fire-and-forget queue messages.
+
 While a flush runs, output completeness checks can inspect future disjoint
 chunks and model inference can overlap product finalization. The shipped
 adapters keep these operations stateless or filesystem-disjoint; custom shared
@@ -252,10 +298,11 @@ Pyramid levels use multiprocessing across output chunks. With the default
 `--pyramid-workers 0`, the existing automatic CPU-count process selection is
 retained. Each process is constrained to one BLAS/OpenMP thread, including
 OpenBLAS, MKL, BLIS, Apple vecLib, and NumExpr runtimes, so native libraries do
-not multiply the process count by another CPU-count-sized thread pool. Parent
-environment and native thread limits are restored when a level finishes or a
-worker fails. `--pyramid-workers` remains available to tune I/O and memory
-bandwidth performance.
+not multiply the process count by another CPU-count-sized thread pool. Its Zarr
+executor and Blosc codec are likewise capped at one thread. Parent environment
+and native thread limits are restored when a level finishes or a worker fails.
+`--pyramid-workers` remains available to tune I/O and memory bandwidth
+performance.
 
 Lasagna's optional `pred_dt` is an external-source stage after neural
 inference. It is independently resumable and never schedules model tiles.
@@ -557,6 +604,8 @@ Ownership changed as follows:
   lengths, full-precision `native_trace2cp_fiber_restarts_per_kvx`, optional
   full-precision `native_trace2cp_fiber_restarts_per_meter`, and the old
   segment fraction only as `restart_fraction_per_segment`.
+- Durable end-to-end native Python Trace2CP measurements and their metric/unit
+  conventions are recorded in `docs/native_trace2cp_benchmarks.md`.
 - The shared C++ CP-pair tracer fuses forward and reverse traces in trace-grid
   3D ZYX coordinates without sorting by straight-axis progress. It repeatedly
   moves a local tangent plane along each resampled path and intersects the
@@ -599,11 +648,11 @@ Ownership changed as follows:
 - Supports `--prefetch`, `--prefetch-steps`, `--benchmark`, `--load-only`,
   `--resume`, `--trace2cp-vis`, and the normal-training-only
   `--test-hang-diagnostics` flag.
-- Multi-GPU training uses the standard `torchrun` launch environment and does
-  not require config changes:
+- Production multi-GPU training uses one cooperative supervisor and a configured
+  resource request/memory calibration (see [managed launch](cooperative_training.md#managed-launch)):
 
   ```bash
-  torchrun --standalone --nproc_per_node=2 -m vesuvius.neural_tracing.fiber_trace_3d.train <config.json>
+  python -m vesuvius.neural_tracing.fiber_trace_3d.train <config.json>
   ```
 
   The configured `batch_size` is local to each rank, so the effective
@@ -731,8 +780,9 @@ Ownership changed as follows:
   `training.test_control_points: 0` is the explicit full-test sentinel, and
   positive values cap tests to a deterministic random held-out range for
   debugging.
-- `batch_size` is the actual CP-patch batch passed through the 3D U-Net. The
-  trainer does not internally micro-batch.
+- `batch_size` is the actual CP-patch batch passed through each 3D U-Net
+  forward. Optimizer-global-batch emulation may retain multiple full logical
+  forward graphs until one globally normalized backward/update.
 - Normal training, distributed dense tests, and `--benchmark --load-only` use
   `torch.utils.data.DataLoader` process workers when
   `training.loader_workers > 0`. Each worker lazily constructs its own
@@ -748,6 +798,11 @@ Ownership changed as follows:
 - For 3D loading, omitted or `null` `volume_cache_memory_mib` resolves in
   Python to a 512 MiB VC3D decoded/hot-cache cap per loader/worker. Explicit
   positive values override this default.
+- `volume_io_threads` and `volume_decode_threads` optionally set positive
+  process-local VC3D source-read and chunk-decode admission limits. Persistent-
+  cache probing remains on its separate fixed pool. `volume_sample_threads`
+  independently caps the native per-call coordinate interpolation dispatch;
+  one makes that computation serial. Omission preserves normal defaults.
 - Worker batches are returned on CPU. The main process transfers the complete
   batch to the configured training device before model execution. Console
   `load_ms` includes DataLoader wait plus this main-process transfer;
@@ -1171,8 +1226,11 @@ The important behavior is:
   - opens remote paths with `Volume.open_url`;
   - calls `Volume.sample_coords(..., blocking=True)` so requested-level chunks
     are fetched/decoded and pinned before sampling starts;
-  - calls `Volume.sample_zyx_block(..., blocking=True)` for regular
-    axis-aligned block reads used by native 3D Trace2CP;
+  - calls `Volume.read_zyx(..., with_mask=True, with_stats=True)` for regular
+    axis-aligned block reads used by native 3D Trace2CP; the duplicate native
+    block-sampling API is removed. Native values remain uint8/uint16; only the
+    training-facing adapter converts to its float image interface. Standalone
+    demand inference bypasses that conversion and reads integer bboxes directly;
   - rejects blocking results that do not report strict requested-level sampling
     (`requested_level_only=true`, `fallback_levels=0`);
   - uses `Volume.collect_coords_dependencies(...)` for prefetch dependency
@@ -1878,6 +1936,35 @@ Training keys:
   the unbounded `stream_index`, so the subset is deterministic but its
   augmentations and branch-grid offsets keep changing across repeats.
 - `learning_rate`: AdamW learning rate.
+- `learning_rate_warmup_steps`: optional number of one-indexed linear warmup
+  updates. Step 1 uses `learning_rate / learning_rate_warmup_steps`, the last
+  warmup update reaches `learning_rate`, and later updates retain it.
+- `optimizer_global_batch_size`: optional exact number of samples represented
+  by one optimizer update. It defaults to `batch_size * DDP world size`. When
+  larger, it must be an integer multiple of `batch_size`. The trainer models
+  that many full logical rank-local batches, assigns them cyclically to the
+  physical ranks, suppresses automatic DDP reductions, and manually averages
+  the accumulated gradients once per update. Loss numerators and denominators
+  are accumulated over every local logical batch and packed into one all-reduce.
+  A detached-value/differentiable-local surrogate compensates for DDP's later
+  physical-world gradient average, giving the same objective and gradients
+  regardless of sparse-target placement. This supports exact batch-size
+  experiments on fewer physical ranks, but ranks assigned multiple logical
+  batches retain multiple forward graphs and therefore use more peak activation
+  memory. Because ranks may execute different
+  numbers of forwards, this mode requires the shared sample pipeline, stateless
+  normalization such as GroupNorm, and `ddp_broadcast_buffers: false`.
+- `gradient_norm_log_interval`: optional interval for measuring the global L2
+  norm after DDP has averaged gradients and before clipping. Zero disables
+  measurement unless clipping is enabled. FP16 gradients are unscaled once
+  before measurement; BF16 uses no gradient scaler.
+- `gradient_clip_max_norm`: optional global L2 clipping threshold. Missing or
+  zero disables clipping. The logged norm is always the pre-clip norm.
+- `lr_range_test`: opt-in fresh-initialization diagnostic object containing
+  `warmup_steps`, `range_steps`, `start_lr`, and `end_lr`. It linearly warms to
+  `start_lr`, then exponentially spans both exact endpoints. Its required
+  `max_steps` is `warmup_steps + range_steps`; it cannot be resumed or combined
+  with `learning_rate_warmup_steps`.
 - `scalar_log_interval`: TensorBoard scalar/console interval.
 - `tensorboard_image_interval`: TensorBoard batch-image interval.
 - `checkpoint_interval`: interval for writing `snapshots/current.pt`.
@@ -2486,7 +2573,7 @@ The tests are expected to use fake/local data and not require network access.
 
 ## Shared 3D accumulator pipeline
 
-`lasagna/tiled_predict3d.py` owns accumulation for both Lasagna and Fiber 3D
+`lasagna/tiled_predict3d.py` owns accumulation scheduling for both Lasagna and Fiber 3D
 inference. Multi-device runs send chunk-bounded descriptors to persistent
 spawned processes; result tensors stay in the existing shared-memory slots and
 accumulators stay in the rolling mmap. No tile-sized arrays are serialized
@@ -2494,7 +2581,9 @@ through multiprocessing queues.
 
 `--accumulator-workers` controls process count (default `min(CPU count, 32)`;
 zero selects the synchronous diagnostic baseline). Each spatial output chunk
-has a deterministic worker owner and FIFO ordering. Startup and completion
+has a deterministic worker owner and FIFO ordering. Submission is canonical,
+bounded, and nonblocking so the coordinator can continue draining all stages.
+Startup and completion
 logs report backend, task rate, summed work, queue wait, and wall time.
 
 Product accumulators default to float16 and weights remain float32. The
@@ -2518,3 +2607,358 @@ threads.
   with `python -m pip install -e volume-cartographer --no-deps --break-system-packages`.
 - Production remote sampling should use the VC3D blocking sampler, not the
   fallback NumPy sampler.
+# Two-GPU training experiments
+
+Add --profile-loader --trace-steps 0 to profile_experiment for CPU-worker stage
+timing in the real two-rank training loop, without a CUDA trace. This sets
+training.profile_loader=true (requires profile_enabled=true and positive
+loader_workers). timings_rankN.jsonl carries nested loader_profile copied from
+the existing loader's profile_timings_ms, plus worker ID/sample index and
+coordinator epoch wait-start/received timestamps. Receipt is recorded before
+H2D/target creation. Fields ending _ns are epoch timestamps, not durations;
+CPU/wall durations and summed stage times have separate meanings. Sampling and
+worker scheduling are unchanged. Worker construction belongs to startup.
+
+fiber_trace_3d.training_profile provides optional stage wall timers and bounded
+CPU/CUDA traces inside the normal train.py loop. training.profile_enabled is
+false by default; profile_trace_start=21 and profile_trace_steps=5 select the
+window (zero trace steps retains wall timing only). Trace export occurs outside
+the iteration timer. Wall scopes include asynchronous submission and waits;
+use the Chrome trace for actual GPU operators/collectives.
+
+training.compile_mode is off/default/reduce-overhead. Compilation wraps the
+DDP training model; evaluation and snapshots use the raw model. An optional
+training.initialization_seed gives paired experiments the same initialization.
+No training sampling, loss, precision, or checkpoint policy is changed.
+
+fiber_trace_3d.profile_experiment launches an isolated torchrun using its
+current Python interpreter. Required --reference is the saved audit JSON
+containing config, and --output is a new experiments root. `--devices` selects
+physical GPUs, while batch size and optional optimizer-global-batch emulation
+are explicit. It records generated config, launch metadata, run.log and
+per-rank artifacts. Defaults: --steps 120, --compile-mode off, --trace-steps 5.
+Native thread pools are limited before launching processes. Shared input cache
+remains unchanged in config; logs/output/compiler caches live under --output.
+
+The opt-in `--tuning-suite` mode orchestrates a complete fresh-initialization
+LR/clipping study. It first runs the configured exponential range, derives
+fixed candidates from the reference LR, EMA minimum, and divergence point,
+runs matched held-out trials, then runs one rounded-p99 clip comparison at the
+best unclipped LR. All children use the same initialization and deterministic
+sample stream. The suite writes `tuning_report.json` and `tuning_report.md`; it
+records which unclipped result selected the clipping comparison but leaves the
+final configuration decision manual.
+
+## Bounded per-sample load/augmentation benchmark
+
+`vesuvius.neural_tracing.ordered_sample_pipeline` is a reusable two-process-
+stage scheduler. Load workers claim monotonically assigned sample indices;
+augmentation workers take whichever raw sample is ready. Two bounded data
+queues connect the stages. A single bounded credit pool covers work in workers,
+both queues, and the coordinator's reorder map, and is released only after
+deterministic ordered delivery. The coordinator continuously drains later
+completions while waiting for an earlier sample. Separate one-way control pipes
+carry startup, failure, and lifecycle messages, so a full data queue cannot
+hide an exception.
+
+`FiberTrace3DLoader.load_raw_sample` stops immediately before value
+augmentation and carries the already sampled deterministic augmentation
+parameters. `augment_raw_sample` completes the sample, while `load_sample`
+composes those same two operations. This keeps the normal synchronous loader
+and benchmark on one implementation.
+
+Run the real S1a benchmark with:
+
+```bash
+/home/hendrik/villa/vesuvius/scripts/run_fiber3d_pipeline_benchmark
+```
+
+The launcher fixes the current reference, venv, CPU-only environment and
+output root. Benchmark arguments live one-per-line in
+`vesuvius/scripts/fiber3d_pipeline_benchmark.args`; changing that file does not
+change the executable command, so one approval covers subsequent benchmark
+configurations. Override machine paths with `FIBER3D_BENCH_REFERENCE`,
+`FIBER3D_BENCH_PYTHON`, or `FIBER3D_BENCH_OUTPUT` when invoking manually.
+
+The command creates a unique `sample_pipeline_*` directory with the resolved
+config and `result.json`. `samples_per_second` is measured from completion
+events after discarding the configured number of completion events as warmup;
+ordered-delivery throughput is reported separately. Queue residence and reorder
+wait are not worker service time. The benchmark is host-global and is not yet
+wired into DDP training. See `docs/training_sample_pipeline_benchmark.md` for
+the initial result and interpretation.
+
+With profiling enabled, `stage_profile_rates` separates `_build_geometry_maps`
+coordinate generation, native dependency discovery, chunk resolution/pinning,
+actual cache codec calls, and native trilinear interpolation. Counts divided by
+summed worker service time are per-service rates; effective host concurrency is
+reported independently. Direct uncompressed chunks have a near-no-op codec, so
+chunk-resolution time—not codec time—captures their filesystem/cache cost.
+
+The VC3D sampler exposes `chunk_locality_fast_path` and
+`collect_locality_stats` through `make_coordinate_sampler`, the Fiber3D loader,
+and the pipeline benchmark. The optimized native path reuses exact adjacent
+dependency footprints and performs direct single-pinned-chunk trilinear
+gathers; the reference path remains selectable for matched measurements.
+
+`pipeline_benchmark --raw-only` runs the same bounded stage-one worker and
+coordinator machinery without creating augmentation workers. Complete raw
+samples still cross the output queue, so the mode measures materialization and
+IPC but excludes value augmentation and batch stacking.
+## C++ fiberlet extraction
+
+`volume-cartographer/core/src/fiber_tracer/FiberAnchors.cpp` extracts the
+versioned cell-anchor artifact. `FiberPaths.cpp` strictly reloads that artifact,
+enumerates filled-radius cell-neighborhood pairs, and solves integer prediction-voxel
+paths. `FiberLocalScoring.cpp` owns the local isotropic and Lasagna-normal split
+smoothness equations shared by the native greedy tracer and fiberlet DP.
+
+Anchor direction fitting retains the broader cell/halo Gaussian and the
+existing deterministic non-orthogonal two-mode PCA updates. Final spatial
+placement is a separate cached hill climb on an anisotropically integrated
+`presence * abs(direction dot axis)^2` response sampled in the final rotating
+normal plane. The transverse peak sigma defaults to `1.5` prediction voxels;
+the along-direction sigma defaults to `1.5` cell sides so straight-fiber
+evidence remains substantial across several cells. The climb starts near the
+provisional broad-fit position and stops at the first discrete local maximum.
+Production placement then applies independent three-sample parabolic fits in
+the two normal-plane coordinates. Each finite offset is clamped to half a grid
+step; the combined point must remain in the cell's continuous voxel-Voronoi
+ownership box without decreasing the directly evaluated response. Every failed
+combined guard keeps the discrete peak. A full 3x3 joint quadratic is retained
+only as transient benchmark provenance.
+`vc_fiberlets anchors` and `fiber-replay` expose base-voxel controls as
+`--peak-sigma`, `--axial-sigma`, and `--peak-step`; strict artifacts store the
+transverse and axial sigmas in prediction-grid units. The extraction halo
+conservatively encloses both the broad direction-fit kernel and every rotated
+peak kernel.
+
+The peak objective also uses signed local presence-gradient evidence. Each cell
+job computes deterministic separable 3D Sobel gradients from presence-only
+stencils before discarding its dense halo. Normal-plane gradients pointing from
+a sample toward the candidate vote inward; the reverse sign votes outward.
+Votes retain direction-alignment and anisotropic Gaussian weighting and are
+reliability-gated by valid stencil coverage and radial gradient magnitude, so
+flat or incomplete neighborhoods preserve the presence-only result.
+`--gradient-weight` controls the dimensionless contribution, defaults to
+`1.0`, and `0` exactly disables gradient construction and its extra halo.
+Both weight and reliability scale are strict scientific artifact parameters.
+
+`FiberAnchors.cpp::fiberAnchorCellsNearPolyline` provides exact, canonical
+dense-polyline-to-cell selection for replay tubes and localization benchmarks.
+`benchmarkRefinedFiberAnchors` consumes only geometric records from the
+`Refined` diagnostic stage and evaluates exact base-coordinate distances to the
+stored dense fiber line. `vc_fiberlets anchor-benchmark` uses a refined-only
+extraction path that deliberately stops before support filtering and NMS. The
+production anchor uses `separable_1d`; `joint_2d` remains a matched comparison.
+The benchmark labels its three equal-population stages
+`discrete`, `separable_1d`, and `joint_2d`; none of the comparison coordinates
+are serialized. It prints distance statistics plus inclusive 4- and
+8-base-voxel anchor and cell hit rates and does not require a normal manifest or
+write artifacts. Both subpixel variants move only in the fitted anchor's normal
+plane. Their response already integrates an anisotropic 3D support volume, so
+calling the distinction 2D versus 3D would be incorrect; a true 3D positional
+fit would introduce forbidden forward/backward motion along the fiber.
+
+Anchor extraction performs reference/crop selection serially, expands it by a
+conservative direct-NMS context that includes possible displacement of both
+anchors, and partitions the union into deterministic spatial cell tiles. Each
+tile samples one dense ZYX box with the complete fit/peak/gradient halo and
+fits its owned cells through shared strides while preserving each cell's prior
+ZYX observation order. Deterministic splitting and worker selection cap
+coordinate, decoded-sample, and scratch storage under the aggregate byte
+budget. Tile halos may overlap, but shared decoded Zarr chunks avoid repeated
+source reads. Lower-level sampling remains single-threaded per tile.
+
+Anchor duplicate suppression uses radii independent of peak refinement:
+2 stored prediction voxels transverse to the sign-aligned average anchor axis
+and 1 prediction voxel longitudinally. `FiberAnchorConfig` stores both fields,
+both strict anchor JSON writers serialize them, and `FiberPaths.cpp` requires
+them when loading anchors. Crop context preserves the full refinement-window
+displacement before adding this narrower NMS reach.
+
+The napari replay viewer loads the final anchor centre/direction glyphs and all
+five anchor diagnostic Shapes layers by default. `--no-anchor-stages` is an
+explicit fast-start opt-out that skips parsing and hashing the stage artifacts;
+replay reload preserves the selected stage-layer topology.
+The viewer interprets the versioned base-coordinate geometry, not the anchor
+extractor configuration. Its stage reader therefore ignores optional
+`parameters` metadata and future top-level metadata, and parameter differences
+do not enter cross-stage binding checks. Coordinate conventions, finite unit
+axes, identities, lineage, and final geometry consistency remain validated
+because those affect interpretation of the displayed diagnostic stages.
+Its independent anchor-radius control retains defensive full-population
+geometry/features in controller state but assigns only in-radius final anchors,
+stage anchors, cell centers, and refinement offsets to their Napari layers.
+This physical subsetting prevents cutoff-hidden geometry from writing depth and
+causing black occlusion artifacts. Slider widening and artifact rollback rebuild
+the displayed layers from the retained full source in original order.
+Presence and anchor display radii both initialize to 32 base voxels. A separate
+fiberlet-radius control initializes to 16 base voxels and retains a fiberlet if
+its rendered polyline has any point within that exact segment-to-segment
+distance of either the reference or failed trace. The generalized replay
+geometry filter keeps full path geometry, aligned quality features, colormap
+property, and explicit display width while physically removing complete
+out-of-radius paths. Reload recomputes distances and reapplies all three current
+radii without using the extraction-tube radius as a display default.
+
+`FiberPaths.cpp` first generates all candidates in canonical order from every
+nonzero integer cell offset inside the configured outer radius plus margin, so
+shorter anchor pairs and the old outer-radius pairs are searched together. It unions
+their positive-weight native interpolation corners into one deterministic
+global sparse union, samples predictions and normals in coordinate ranges, and
+materializes compact nodes before DP. An interior node stores a checked 32-bit
+row-major local key, authoritative `float32` position, compact two-byte fiber
+and normal axes, byte presence, and validity flags: 24 bytes total. Corner
+addresses and weights are derived from positions during collection and
+materialization rather than retained. Exact endpoint anchors remain doubles.
+A fixed worker pool solves canonical candidate slots; a final serial pass
+derives diagnostics and preserves deterministic artifact order.
+Each nonzero DP transition is first gated against the destination-side dense
+fiber prediction and must have an unoriented angle strictly below 25 degrees to
+that axis. Lasagna normals remain separate and affect only the existing local
+curvature split; an invalid Lasagna normal uses isotropic curvature fallback.
+
+`FiberGraph.cpp` converts every accepted fiberlet to one undirected graph edge
+and two directed arcs. Dense endpoint tangents define canonical strict
+45-degree joins. Its receding-horizon beam router ranks variable-length routes
+by accumulated loss density, prevents node cycles, commits one edge, and uses
+the shared variable-step forward polyline matcher to stop at the first
+reference-distance failure. It retains that first crossing as diagnostic
+metadata, completes the selected fiberlet, then continues through complete
+edges until routed base-voxel postroll reaches the requested distance at an
+anchor or the graph is exhausted. Candidate/arc identities and loss totals
+therefore always describe whole published fiberlets.
+
+Completed tasks update an atomic counter. A separately locked, rate-limited
+progress callback suppresses stale concurrent observations; the coordinator
+emits the terminal update after joining workers and before rethrowing a task or
+callback exception. `vc_fiberlets` formats this callback on stderr with rate
+and ETA, while the core remains independent of console output.
+
+`volume-cartographer/apps/src/vc_fiberlets.cpp` exposes `anchors`, `paths`,
+`anchor-benchmark`, `fiber-replay`, and `fiberlet-replay`.
+The latter requires the matching fiber manifest plus a separate regular
+Lasagna normal manifest and writes machine-readable `fiberlets.json` together
+with base-coordinate `fiberlets.obj` lines. All spatial CLI and JSON/OBJ
+coordinates are base-volume coordinates; prediction coordinates are private to
+the anchor fit and DP implementations.
+
+`PolylineGeometry.cpp` owns dense-polyline arclength sampling, slicing, bounded
+exact projection, and the shared expected-advance forward matcher used by both
+greedy and graph replay. `FiberTrace.cpp::traceFiberReplay` adds a committed-
+step stop observer to the existing one-way core; ordinary callers omit it and
+retain their prior behavior. `FiberReplay.cpp` constructs exact base-coordinate
+tubes and atomically publishes content-addressed replay generations. The replay
+CLI uses `--along` as the sole longitudinal comparison extent: it derives the
+greedy postroll count from the effective base-coordinate step and slices the
+displayed greedy trace by exact arclength around failure. Full greedy points,
+losses, and matching indices remain separate authoritative diagnostics in the
+bundle. A shared core helper reduces the requested extent to the symmetric
+arclength available on every reference/greedy side; the reference, greedy
+display, and graph search then share those persisted, strictly checked bounds.
+
+Replay opens separate prediction and normal bindings for native trace space and
+the canonical stored prediction grid. Explicit sparse anchor cells flow through
+the same block fit and NMS implementation as rectangular crops. `FiberPaths.cpp`
+uses its dense preload for standalone paths and a sorted sparse tube preload
+when a replay point predicate is present. The Python viewer keeps the presence
+Zarr external and strictly loads the replay bundle plus its relative artifacts.
+Graph replay adds a strict graph JSON, strict route JSON/OBJ agreement, and an
+independent napari route layer that participates in reload topology but not the
+fiberlet distance filter.
+
+## Crop Fiber Constraints
+
+`FiberTraceConstraints.cpp` splits stored crop traces into overlapping pieces,
+finds nearby piece pairs, and scores parallel versus perpendicular geometry.
+The perpendicular winding observation is the normal-aligned Lasagna integral
+on the closest connector. A parallel-dominant constraint additionally reuses
+every tangent-valid matched pair from its bidirectional parallel-score walk.
+All of those connectors are submitted in the same batched Lasagna sampling
+call; no per-pair volume reads are introduced.
+
+With a crop-aligned normal field, each walk integral is signed by its connector
+direction and aligned midpoint normal. Only samples in the closest connector's
+normal-alignment component enter the deterministic median. The published
+constraint therefore carries distinct closest/perpendicular and
+median/parallel distances plus their signed forms. Winding BP quantizes the
+parallel median onto the signed integer ladder and the perpendicular closest
+measurement onto the signed half-integer ladder. Parallel-dominant OBJ,
+labeling, CLI, and reference diagnostics use the median target.
+
+Before constraint extraction, `LasagnaNormalAlignment.cpp` builds the aligned
+normal lattice in sampling, factor, component, message, and finalize phases.
+`vc_fiber_trace_chunk direction-ablation` prints rate-limited progress for
+those phases. Its preparation ETAs are local to the current phase; message
+progress deliberately reports `eta_to_limit`, the projected time to the
+configured BP iteration limit, because convergence may terminate earlier and
+cannot be predicted from the current residual.
+
+## Skeleton least-squares tracing backend
+
+The `skeleton` replay backend turns thresholded presence into an explicit
+routable network before tracing. Its design, cost mapping and deviations are in
+[skeleton least-squares tracing](skeleton_lsq_tracing.md); this section records
+where each part lives.
+
+All sources are in `volume-cartographer/core/src/fiber_tracer/`, with headers
+under `core/include/vc/fiber_tracer/`, and all are part of `vc_fiber_tracer`:
+
+- `FiberReferenceReplayCore.{hpp,cpp}` holds `traceReferenceReplayCore`, the one
+  directed-reference driver shared by beam, Lasagna and skeleton replay. It
+  owns seeding on the reference, forward matching, the anisotropic threshold
+  ellipse, excursion grace, failure records and the deterministic reset. It was
+  moved out of `FiberTrace.cpp` without behaviour change; a backend supplies
+  only a `ReplaySegmentRunner`.
+- `FiberSkeletonThinning.cpp` implements the (26,6) simple-point test, Lee
+  thinning with six directional subiterations and sequential re-verification,
+  26-connected labeling, and thresholding with small-component rejection. The
+  simple-point test is used in both thinning passes, which is stricter than
+  scikit-image's second pass and is the correct criterion.
+- `FiberSkeletonGraph.cpp` contracts the thinned mask into a node/edge graph and
+  applies junction merging, spur pruning and degree-two suppression. It mirrors
+  the Python diagnostic `fiber_pair_connectivity.skeleton_topology`.
+- `FiberSkeletonRegions.cpp` measures the thresholded section in the plane
+  normal to a tangent (`fiberSkeletonSectionAt`), splits the reduced graph into
+  ambiguous regions and unambiguous lines, places ports at the entry offset
+  (or one shared midpoint port on a bridge too short for two) with sub-ports
+  from the section (centre and extremes, each centred by
+  `refineFiberSkeletonPointInPlane`), finds the cheapest path through the
+  thresholded prediction between two sub-ports inside a corridor under the
+  tracing metric (`fiberSkeletonSearchPath`), and refines every line once per
+  pair of end sub-ports, recording each sub-port's cheapest variant.
+- `FiberSkeletonRefine.cpp` is the Ceres objective. A `ceres::EvaluationCallback`
+  batch-loads the eight grid corners of presence, direction and normal for every
+  vertex before each evaluation; the residual functors interpolate those
+  constants trilinearly on Jets, so derivatives flow through the interpolation
+  and normals are resampled at every solver step.
+- `FiberSkeletonChoice.cpp` connects every pair of sub-ports on different
+  ports of a region through the region's graph path, initialised by the path
+  search and refined with Ceres, keeps every connection, and records each
+  sub-port's cheapest one. Nothing is chosen ahead of tracing.
+- `FiberSkeletonReplay.cpp` builds the model, walks the network sub-port to
+  sub-port along each sub-port's own entries as a
+  segment runner for the shared core, and writes `skeleton.json`,
+  `skeleton_graph.obj` and `skeleton_routes.obj`.
+- `FiberSkeletonSource.cpp` builds the scoped crop from a stored prediction
+  volume and serves corner blocks and grid-aligned samples through the existing
+  samplers, memoized by grid index.
+- `FiberSkeletonFields.{hpp,cpp}` defines the corner block, the provider
+  interface both real and synthetic implementations satisfy, and scalar
+  interpolation.
+
+`apps/src/FiberTraceEvaluationCli.cpp` parses the `skeleton` config block with
+an allowed-key set, builds one model per case, and writes its artifacts beside
+`trace.json`. `FiberReplay.cpp` carries the generic `geometry_backend` label.
+On the Python side `short_benchmark_evaluate.bind_benchmark` accepts the
+backend without requiring a fiberlet cache, and
+`contrast_choice_benchmark.package_contrast_choice` packages several contrast
+cases at once.
+
+`core/test/test_fiber_skeleton_trace.cpp` covers the simple-point test, the
+three thinning shape invariants, graph reduction, the polyline helpers, matching
+enumeration counts, refinement convergence on a synthetic tube, end-to-end
+routing of a crossing, replay determinism, the unusable-seed path and artifact
+round-tripping. It is built by `run_fiber3d_native_build` and executed by
+`run_fiber3d_native_replay_tests`.

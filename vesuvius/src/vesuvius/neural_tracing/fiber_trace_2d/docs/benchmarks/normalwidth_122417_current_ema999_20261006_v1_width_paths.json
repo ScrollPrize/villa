@@ -1,0 +1,796 @@
+{
+  "baseline": "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse",
+  "cases": 182,
+  "checkpoint_sha256": "fd9dc4bac7a04bbdbf98d773629b264b902c9c25228482a9adbdbc08e78ef05a",
+  "coverage": {
+    "PHerc0139": {
+      "requested": 44900,
+      "valid": 44900
+    },
+    "PHerc0332": {
+      "requested": 1903,
+      "valid": 1903
+    },
+    "PHerc1299": {
+      "requested": 23014,
+      "valid": 23014
+    },
+    "PHerc1451": {
+      "requested": 1645,
+      "valid": 1645
+    },
+    "PHercParis4": {
+      "requested": 145836,
+      "valid": 145836
+    }
+  },
+  "failing_cases": 31,
+  "failing_fibers": 23,
+  "failures": 50,
+  "fibers": 91,
+  "manifest_sha256": {
+    "/ephemeral/hendrik/vc3d_cache/live_inference/_namespaces/normalwidth_122417_current_ema999_20261006_v1/5353a107b5d394f37ebf9e543817d693e39be28d7500a3991820dee7d9e5c823/59077099d2a225771cc676799ae576ffa4acfda45f71f3fea23250c99ee24abc/inference.lasagna.json": "3ef98d8d3ff0e78de825c7fbb64c06d15568f67dae5d68148f6960a04af3e50b",
+    "/ephemeral/hendrik/vc3d_cache/live_inference/_namespaces/normalwidth_122417_current_ema999_20261006_v1/6f3ddc1490019e865be779f53e09db0264bfe76004a035b97498ed852f55b3cc/59077099d2a225771cc676799ae576ffa4acfda45f71f3fea23250c99ee24abc/inference.lasagna.json": "3243d74f467d7536a7b2aa346120750bebe2dffab4ceb1c74d93c5ed1b8271a2",
+    "/ephemeral/hendrik/vc3d_cache/live_inference/_namespaces/normalwidth_122417_current_ema999_20261006_v1/891c28cce8edbbee74ce9cd7317bd0e9bb29b7b8ef797dc62dd7fac9b2d2bc08/59077099d2a225771cc676799ae576ffa4acfda45f71f3fea23250c99ee24abc/inference.lasagna.json": "59d7669de734cdf21703811aa0e4518d6738b259572776ae53bc7422120d89f2",
+    "/ephemeral/hendrik/vc3d_cache/live_inference/_namespaces/normalwidth_122417_current_ema999_20261006_v1/a94d5ea349549975e372f8d5e9fb68a2fb5474c3dd06f00950b7d1cbe33ade20/59077099d2a225771cc676799ae576ffa4acfda45f71f3fea23250c99ee24abc/inference.lasagna.json": "755657ffef44b88554db2b68c80af2ff82c2d7b868784c7682e67e8b1c8f1b45",
+    "/ephemeral/hendrik/vc3d_cache/live_inference/_namespaces/normalwidth_122417_current_ema999_20261006_v1/f87eef23d15f7f99edf8a4ffa452785e2eb024b9a2890b962d737770e6374487/59077099d2a225771cc676799ae576ffa4acfda45f71f3fea23250c99ee24abc/inference.lasagna.json": "4cc30b6fe4da125fc4b6826ea5923ae85c2afc31f39554486a9d48ba8dc69c1c"
+  },
+  "native_sha256": "a14e7364ade75ba2f53af1c1000a71e0c5b1b576bdad795462f294c58aea43f2",
+  "point_groups": {
+    "failure_free_segment": {
+      "above_10_percent": 10.04423494047924,
+      "above_20_percent": 3.588324708373896,
+      "above_40_percent": 1.053782172806613,
+      "above_80_percent": 0.0,
+      "max": 64.78538531454929,
+      "mean": 4.964510599907768,
+      "median": 3.0655859978356403,
+      "n": 58551,
+      "p05": 0.2668461944645373,
+      "p95": 15.175775232913807
+    },
+    "inside": {
+      "above_10_percent": 14.334088937396805,
+      "above_20_percent": 5.895110961855988,
+      "above_40_percent": 1.0284610863907313,
+      "above_80_percent": 0.0,
+      "max": 78.48504199870716,
+      "mean": 5.808250610818176,
+      "median": 3.362153248863675,
+      "n": 71466,
+      "p05": 0.2864994040977953,
+      "p95": 22.460138635355523
+    },
+    "near_reference": {
+      "above_10_percent": 10.692257115125708,
+      "above_20_percent": 3.387707818028116,
+      "above_40_percent": 0.433639124581233,
+      "above_80_percent": 0.0,
+      "max": 78.48504199870716,
+      "mean": 4.88713540687051,
+      "median": 3.0878514602113327,
+      "n": 63878,
+      "p05": 0.26631737027177194,
+      "p95": 15.375781878953266
+    },
+    "outside": {
+      "above_10_percent": 57.70097670924117,
+      "above_20_percent": 35.83771600300526,
+      "above_40_percent": 3.9068369646882046,
+      "above_80_percent": 0.0,
+      "max": 48.351665367834244,
+      "mean": 15.9717157581182,
+      "median": 13.226877302928774,
+      "n": 1331,
+      "p05": 0.972428426778077,
+      "p95": 39.032446807990006
+    }
+  },
+  "reference_by_presence": {
+    "presence_ge_05": {
+      "max": 49.321978817899705,
+      "mean": 3.9111747460297517,
+      "median": 2.777750252679584,
+      "n": 30742,
+      "p05": 0.2402405531187524,
+      "p95": 10.645155058269417
+    },
+    "presence_lt_05": {
+      "max": 53.94725531410016,
+      "mean": 10.539096696180279,
+      "median": 8.606816959244924,
+      "n": 5405,
+      "p05": 0.7463430538413496,
+      "p95": 27.338177345154197
+    }
+  },
+  "reference_fiber_cv_percent": {
+    "max": 19.985360861440086,
+    "mean": 5.698413815231608,
+    "median": 4.5073871365283775,
+    "n": 91,
+    "p05": 2.7923885345346164,
+    "p95": 14.80757631235549
+  },
+  "reference_p95_median_deviation_percent": {
+    "max": 46.107616502317704,
+    "mean": 11.492273113367604,
+    "median": 8.967164298397496,
+    "n": 91,
+    "p05": 5.368499304804191,
+    "p95": 28.235134476184463
+  },
+  "reference_prior_deviation_percent": {
+    "max": 53.94725531410016,
+    "mean": 4.902236746764629,
+    "median": 3.149025183212617,
+    "n": 36147,
+    "p05": 0.2647959144071133,
+    "p95": 16.584860963101832
+  },
+  "reference_seed_deviation_percent": {
+    "max": 77.5367485665086,
+    "mean": 7.260547702455439,
+    "median": 4.43507143625379,
+    "n": 36147,
+    "p05": 0.39264841212599544,
+    "p95": 25.094912557525877
+  },
+  "scrolls": {
+    "PHerc0139": {
+      "cv": {
+        "max": 19.985360861440086,
+        "mean": 7.886779867899964,
+        "median": 4.8556447569785846,
+        "n": 22,
+        "p05": 3.2734092040578786,
+        "p95": 17.694769933545206
+      },
+      "events": 19,
+      "failure_width_advantage": {
+        "max": 30.26195394594194,
+        "mean": 6.273705209592941,
+        "median": 5.4901183922608565,
+        "n": 19,
+        "p05": -15.525455029626887,
+        "p95": 24.25225516322311
+      },
+      "fibers": 22,
+      "width": {
+        "max": 55.82654571533203,
+        "mean": 49.57993663441051,
+        "median": 51.94769859313965,
+        "n": 22,
+        "p05": 34.548883056640626,
+        "p95": 55.60297966003418
+      }
+    },
+    "PHerc0332": {
+      "cv": {
+        "max": 10.258554330705271,
+        "mean": 10.258554330705271,
+        "median": 10.258554330705271,
+        "n": 1,
+        "p05": 10.258554330705271,
+        "p95": 10.258554330705271
+      },
+      "events": 6,
+      "failure_width_advantage": {
+        "max": 5.404656951232136,
+        "mean": -0.8131022523502279,
+        "median": 0.25582973279269616,
+        "n": 6,
+        "p05": -9.18898627901616,
+        "p95": 5.3989444306024685
+      },
+      "fibers": 1,
+      "width": {
+        "max": 41.99941635131836,
+        "mean": 41.99941635131836,
+        "median": 41.99941635131836,
+        "n": 1,
+        "p05": 41.99941635131836,
+        "p95": 41.99941635131836
+      }
+    },
+    "PHerc1299": {
+      "cv": {
+        "max": 5.5149082122144,
+        "mean": 4.0680066584458245,
+        "median": 4.5073871365283775,
+        "n": 11,
+        "p05": 2.4861533063423558,
+        "p95": 5.507647809979128
+      },
+      "events": 2,
+      "failure_width_advantage": {
+        "max": 4.062248558435755,
+        "mean": 2.0251736918644903,
+        "median": 2.0251736918644903,
+        "n": 2,
+        "p05": 0.19180631195035214,
+        "p95": 3.858541071778628
+      },
+      "fibers": 11,
+      "width": {
+        "max": 50.64455032348633,
+        "mean": 46.265492872758344,
+        "median": 46.654476165771484,
+        "n": 11,
+        "p05": 41.61086940765381,
+        "p95": 50.02977180480957
+      }
+    },
+    "PHerc1451": {
+      "cv": {
+        "max": 7.591716031342776,
+        "mean": 7.591716031342776,
+        "median": 7.591716031342776,
+        "n": 1,
+        "p05": 7.591716031342776,
+        "p95": 7.591716031342776
+      },
+      "events": 0,
+      "failure_width_advantage": {
+        "n": 0
+      },
+      "fibers": 1,
+      "width": {
+        "max": 53.40772247314453,
+        "mean": 53.40772247314453,
+        "median": 53.40772247314453,
+        "n": 1,
+        "p05": 53.40772247314453,
+        "p95": 53.40772247314453
+      }
+    },
+    "PHercParis4": {
+      "cv": {
+        "max": 14.600519964443164,
+        "mean": 5.043717080130802,
+        "median": 4.3109481391066,
+        "n": 56,
+        "p05": 2.798800068730697,
+        "p95": 10.076441715066844
+      },
+      "events": 23,
+      "failure_width_advantage": {
+        "max": 36.310945651253164,
+        "mean": 8.536043140987129,
+        "median": 9.643920315363308,
+        "n": 23,
+        "p05": -10.7561216239094,
+        "p95": 30.918181205047187
+      },
+      "fibers": 56,
+      "width": {
+        "max": 60.61573791503906,
+        "mean": 52.02459669113159,
+        "median": 51.96709060668945,
+        "n": 56,
+        "p05": 42.60516119003296,
+        "p95": 58.32258749008179
+      }
+    }
+  },
+  "trace_prior_deviation_percent": {
+    "max": 78.48504199870716,
+    "mean": 5.99407656670999,
+    "median": 3.418206447831551,
+    "n": 72797,
+    "p05": 0.28938652345147586,
+    "p95": 23.687279106800517
+  },
+  "trace_seed_deviation_percent": {
+    "max": 103.86926679413455,
+    "mean": 9.917035980156129,
+    "median": 4.877722903905446,
+    "n": 72797,
+    "p05": 0.4266460908423797,
+    "p95": 44.615964786227735
+  },
+  "trace_sha256": {
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/0/trace.json": "02d26a2204fad080e74b6ee4cdeca79da6b7009824568c4014e3cad005b3b828",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/1/trace.json": "31b18a9d79a59eadb8868b827a34ed1d32c3f4f7d7b0717c79f3e753e08bd68c",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/10/trace.json": "a97f3b8199d41a262a3d5015da7f0d161520e0671dbf6f79837a5ba354850c4e",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/100/trace.json": "f5c6b8d9af528e668e4bca09f7e6f71a12fd5540acba81f78437048d35810079",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/101/trace.json": "1373582ff1ac7a4df06cca0873fbfe63d7515f930732fc3a63092479a2caf203",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/102/trace.json": "b572d921830d64cd7a73c16058f0be49379fc6e1fb57a48eafc9e58f54fa5798",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/103/trace.json": "5d71508e9a5a34c7bccc5c6f08649b7633e20b120980dd02d85424a6a66a51f1",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/104/trace.json": "fa3ab14aa0e15c96d3cc4b86225cc0f303aa1523e8dc1a6cf21a043a92728e32",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/105/trace.json": "4399c9faf4492a5d519b9fefaa5b755c5815c2c96ee28b5b77387d6416c1a1b9",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/106/trace.json": "f32125e5ed2e9ba5df5fe5531c26aeed38403e732d51d902ae5ea2f28475e1f0",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/107/trace.json": "c0497d82f1a4bd2925f7b159e0d20e0cd862816fa5c0fa0bf16099feb9b7be6e",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/108/trace.json": "507b13b94b0a7644d0481bfdad716fdbc7fe71c438eb849fe6c74c2a77f72cef",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/109/trace.json": "ea0d832ef63d1cf7f1503df9aaab3a1c9b436361650c00f496fb245e55a8818c",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/11/trace.json": "94f7f73cad807dcfb65e0a735c769e52da0fb6c77d3e51fabd95ffce61f16c8e",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/110/trace.json": "eaec9bd0ace13440799221258a43e70a096cd5c6e7cd78c67c960115bcc957ab",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/111/trace.json": "9004446330f18dd58dce5a45ebf6dc2646935a4779ae897fe8b371d98738fca7",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/112/trace.json": "5c5c78d48aff5ef129c9d7c7dc0756de70ef7a283c55b671ba4144b42c01af70",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/113/trace.json": "090b81370f9b2ccb5838c0644ef928eaed0b63480d8130fcba863d6a02f0ca87",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/114/trace.json": "b41ecc9be75e445b1b9500e7c6cd3b27d6b052b6385efce5d7743d82c71a964a",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/115/trace.json": "607c80f8fe0340c22a9483d2492d7a5dacfc218574c5049e89d1b9adb7607069",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/116/trace.json": "d1e19536f407b071bc601df9537f86e48a876ed06810638866d01818a451094a",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/117/trace.json": "7c72a29a1407ef90602120d17da640fd1846bea1edb02b2429bd37a9df59b51b",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/118/trace.json": "f6c8d654f1c408e97eac2b2c057c7a3156392181170f96eb45f38661e79ecd3a",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/119/trace.json": "bc4cfcb2fd6791bbcb3f917182995ccdadba93ecbf7611c6865667402b5a48a3",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/12/trace.json": "22306133f3b4d16dd023dfd307cbcb50ec106cc3466dd80ebaa785aa78d7270a",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/120/trace.json": "a62fef84dceedaf8758d711e1a5d8c7043b1b790814db115d6fbf83ccce4f35b",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/121/trace.json": "32bd26f92dc9f4b80f2330988d43dba4de3ae26b201abcbf35bd803aa7b59c46",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/122/trace.json": "ba880d14a1ee4a731a53b4b04d8073a7d38b0e122945cb026278cf2836fdca7d",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/123/trace.json": "f664dd1c8bf3e130877c9419a585a9a84cbd155fcea27764fb5f4da176d9daff",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/124/trace.json": "462bb511589b7d58a635b90bca8069136a4b73c3f1271a3b5923a171bd503ac5",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/125/trace.json": "0b9aa94df6233d52a441e9644a5ea0850feae6d0aca08c11aad3f003b2db3778",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/126/trace.json": "e28c6300489228d8d2f0ae142609b009de172729913f382de4a667eef9ce5994",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/127/trace.json": "1fb1d11c972a6805e18cfb91c91b051c74b49cbb8191b03bbafd0c10d6689092",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/128/trace.json": "cb5ce1a60e0d13c47902466f1fda3d6a0ad59d8063fdd53fb71bda0cc47ef042",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/129/trace.json": "838ad3d33cadfdfdab33f9b95763f5646903dd36c46a09cf6243d6cc17f54968",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/13/trace.json": "58edc83ee8565b749cee3d5c8d013a3d3ff9c5f1db686c225b0592d7c419c7cc",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/130/trace.json": "d4cfd0295662d0fac585e495a465d42b78e3f1764867d5ecff0af58310671c16",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/131/trace.json": "018c99dde1732dbe0ee5f7e0b9570c8f79d3b3466b47e6623b90aedf11b7f197",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/132/trace.json": "f15726143eea3acc02cf578c0e549e1904cb0028ebe8d6ee9d39a39e2c959d43",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/133/trace.json": "5366797bcf3639e1080699a1bfa10e1d4eb23ef1cc1f8e505829ef2c489801bf",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/134/trace.json": "29fb555c2bcf53cadeb2f94f3589c9fd76453dfe2f7469b05bf15f0aac0d32f4",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/135/trace.json": "8b921deca3f163193ca48d101954f86a1d3b2427c6563002e0fb596fda48fdcd",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/136/trace.json": "7b57be44bdb1d9aecc33cff90b8ec440277cd41444cbf80792dfb9353cda23f7",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/137/trace.json": "ed9f81fc4a41bc67b308cf7acce581a2b3126878bf72a8c59b6b4aa978ae0d30",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/138/trace.json": "70e5a5a352f60e6178cc0f5290e4f824fae87e3b1ddcba1a9e1e8d48a6da9931",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/139/trace.json": "4f5a47c6e67dbff49a0add3d1e0142d2bc17f23e7d1d719c074483caa28c152a",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/14/trace.json": "35d0999cdc846eaef8dc529dfe3f293a0ec06aaab403f7d31898417775f219ea",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/140/trace.json": "db0ad2d017620121426012d1533e9627e9bb617c197708f2d97e906f2f563e45",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/141/trace.json": "eefc54292a0e9a60fda881878a99b98880887e45702ecc07451258dd55f36d03",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/142/trace.json": "524852255033dd6e4854951c7541b7999375c9900318615124e17e88a667de42",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/143/trace.json": "15cd7c4825621f9b45ba2b510d54fd0999ad568c2820b5411c8694d70f03330e",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/144/trace.json": "fd8b7dde11c449aa4f85582830149ec00130967caf573cff13f6d6c35e79f3e2",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/145/trace.json": "f1cef0cc2938fd2f8f295b5f09babfcd4d4acc68169afaaa427182c3d7646f6c",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/146/trace.json": "f3058b7a8af618c372856c5bc62a7ecaf658cf0b010651972ff268df19d2886c",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/147/trace.json": "33ff837bec55d758ceb997cbf573c64c1e9100920967bcf9a52ebd6aad874442",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/148/trace.json": "44ddc7ba92f9b607cd074e812ddebf1e15527f527c74203c0140c76e3f5e2946",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/149/trace.json": "1a3ad2938712138a33c18db83cfbdce05e0cb7dc2aeb1a0ffb4e36f539d123e0",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/15/trace.json": "9182bdf1d06032d82405df2afb22c89a7e0c8015565a244e22f389167a831950",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/150/trace.json": "7151f1fe90c4b4d9a0efbcce9bca7ad4414e207f3e4ef58126de0b98c33cb48e",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/151/trace.json": "99856c790f7d93cf65bac127d84214dbad24120c27c989d64067319d463d758b",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/152/trace.json": "8d8a3ca80644ebc42d4014d90b236fd2abb079218aad954cb2e392e748f9fd99",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/153/trace.json": "07467f9074de496205d06ef807876c57190170b9404c06df2612a660c725b2c6",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/154/trace.json": "3899856abd900f63e9f1455ff1b0a38d5cf3dc85996248db653bb2d9b1949719",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/155/trace.json": "0bb6f45b612bdf499cca2699f0e4359888bac46f6ee0f5186044f4430f87e6db",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/156/trace.json": "da18f8b4308bc4d8d7a4e049d54af136811c22f6986d47f15f8eab549d1edf07",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/157/trace.json": "2f1268e2c561b86d4fa7327f46b2c241976b470a266b384158b16ecf5d041fb8",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/158/trace.json": "32e9916c128f0eef8d0c9ab8f7a1f50862f9b31dd27307a955548da77e217f90",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/159/trace.json": "5c3dee7a23165c9f76639c66394ef72968b8320197136275a198b05c9729a14d",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/16/trace.json": "cba2e306d96d4bf0820c324960b5a066fd57c932d71c558c3eaf43a9fb975fc3",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/160/trace.json": "ddd123f6a455ece774eaf7e563b31b22067d6356d8b6934bce029acb3cdab6c4",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/161/trace.json": "a1da0c2b5de5dada83ae279434d0d426779299d787ce542f111c3ccab0b68e6e",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/162/trace.json": "947f10e43ddfa546f45764d88046bfc5edeb0d5e8aa11ced4f26b225678ce56b",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/163/trace.json": "6a5e9c893fcb42e2610e879b3d0a4d114036e2d7576ea6ad229616ac08740a9b",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/164/trace.json": "3ca81b8ef0a020f94aca4ac98755f9a83d6b4709a17eb52add41f7d13bd8ef43",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/165/trace.json": "9d71fdd8d07feec6171330072cae714711e892872cfab0c9f7a62e3d4c17caf6",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/166/trace.json": "3802c95880130f7647c8e0b19bab8dca4368cea7241f2bdc5bac3e200e00e3ba",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/167/trace.json": "6cc1563f30225437fa9eff568851d2f90e7474da30515c15c6ced0603002c498",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/168/trace.json": "61860b464e07c5eb2fd6fe4890edbd24a78dc2c8820a365131b6583722fe614e",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/169/trace.json": "e8517ba4970e2e51b53be29bbd8c16df6494de2755bfbfba795d164a077882d6",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/17/trace.json": "d4dd5fbd817bd3fbaa2902c68cf3acaae956c5f02737241d431bce4bc1fa3e0e",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/170/trace.json": "05075ccbd5becf3f95cbc35bf4576d9ffbaf70e8d2ca139a8b239cb8b441aa95",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/171/trace.json": "612441e88731993d2979fdc8428eb0123c000e32d7d5fb1da5e3a4a2d1f182f7",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/172/trace.json": "193cb86d46a4aea74feb85b4bb266b6de3240fd55c9214b0fbe39d54b4168187",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/173/trace.json": "90f9fa9160e231f5c1ef24f53037ada48ef22b29b8fd0f76236fb94a79a35a6f",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/174/trace.json": "d58ab9a0b78fcfd8daf9b0e14ea9ccda2810004460188ee09756c5446c8231b0",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/175/trace.json": "84bbb298984b9a5d92d73db5d1ad846fca6e5d658b1ee24cb34d87e979964f12",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/176/trace.json": "02ee3d3571ac9d9a77ec31f59d8d96098325c4db00aebd673fa9bb4a7fd6656b",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/177/trace.json": "43dcbedd681fd183aa8bbed33042fb8fd82dceb9e2b1d4a259217600af009d42",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/178/trace.json": "4f884971745dc1c00837d7af2f629ae985222003ca86deadce25f19c4cf469ef",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/179/trace.json": "8d1bad7a3d2313f3c079da3fc1f8162d71a0f71bce5965ceefe3c739144f082f",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/18/trace.json": "041ac20112f8ed66c8522770e64bf37214fb4ae5ecb3103dd870f905b3c50600",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/180/trace.json": "a8eccddfa24fcbb4cb10cec88f581647a3ba336bb1eb6ec59b95557dd62b301d",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/181/trace.json": "c343aaa318c2516be8d50a1d24f6b2a473904c2ed89151105c043a58c54e7b1d",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/19/trace.json": "8e42c7d71616f1d23140fa6429e300a9c9a07e4f4ce355ab49bf3f38a289a333",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/2/trace.json": "cab1dffe31da917b05d93b13b576998da759ea129de7584805e3e775a9312dd3",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/20/trace.json": "f39effb2ef28171e5f4f02c52e2c990ac0756b57bf9267f9758021ff9dcbd054",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/21/trace.json": "1824234e843726699a4a64f7b5c753ccd262c98a7ef1abdbe64965ac8e692f5a",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/22/trace.json": "02c040bb5b5982347156ed3921a2ea34b2eb6e8f702119cadc33649e210a6703",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/23/trace.json": "f54c800a6c5474f55e59463c3804a1a3b31cdc0a9881b2a05348d6e5ca710ce6",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/24/trace.json": "a808667ae77cb979d1594bb6e2cc901c0b1fe7462850fd65f3f86edd1bb7fc11",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/25/trace.json": "bc7194c0c18039a1322dc759e12aa6615638ab2ad573fc3ce95cd2fb83b23c3e",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/26/trace.json": "9f0213076c8a6e87a9fe8147a717f5a1d4c631e657369cb35529fdbd60839b23",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/27/trace.json": "e6d424f7fac28058d38a6ada294178c12ad527f5e13efdb3d99c7113e9dd277d",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/28/trace.json": "b91995035364ead064e19f951d2360a44c7c79f0e54df60c109f1415c53c17fd",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/29/trace.json": "cc9e271ea74c47bc7bf7945a4e676b88678d7b6d8d38ea363a7d78b4621f4dd2",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/3/trace.json": "2851621bc4dceacacad7176fdb1443d0d417a75cbb7a22e18900c3676dc96e8f",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/30/trace.json": "43541372d698336c9854861e3681388204597742076a8398765aa4f9185ab5ce",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/31/trace.json": "e638de212e79c6760fbc7365eb616aacf06ba2266b8ef5dd72baba28db28942b",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/32/trace.json": "4de47eda562a7b90186617cbefc42d96a160735eb596c6192aa0b858aff4ddc1",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/33/trace.json": "c048cadf424d93d8e8409782f5d39fbd691f613aefce68f34966fd24fe574e1b",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/34/trace.json": "47642003f023491d5724070d4356997df2617c14ef071b02d344af3d805caca6",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/35/trace.json": "d0e97f3ad01123ffc68e6cb33187985ed8bb2c8b68df571ae7524255f1c6f6fa",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/36/trace.json": "59a3d8e6e29e3f0792cee1fdbb417180c44b46dfbf80ca51854e8d415c15796b",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/37/trace.json": "76cf8b4bd13cf6144cefe670100a56345d1214354aa57946bc76fdbc85737f90",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/38/trace.json": "318620cda5ccf22ef33d02d04b47c877b9edd0dbf00508d962918fc48909f2b9",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/39/trace.json": "684341dd0d6ce8752ad566825c0ea54df41ceaf3da859dcfbbec891caa2b2215",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/4/trace.json": "9b8943cde833cddb83aa80d832ed46d4ce1bf7bf3d313551ec322c8020c3833a",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/40/trace.json": "c3013d3a0a332499530cdb9ce5663452e3fa939755705a40395c2bf2db25207d",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/41/trace.json": "e2315a07f975e1aab5d629b3ae6100cc07c9aa7265d9f223fb73d2f305760530",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/42/trace.json": "9c3dbd03206f491c4b01264aed2a4bfd1966611a192c4026830189980e0b3ac4",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/43/trace.json": "78a591bb566ad230ba981fac7891ea130a70a72065dd506b4396b6dba2dfac1e",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/44/trace.json": "7101679ed1fb6af51e5adc331d36d5c62cf7ef472696b00631500ee38a3d402a",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/45/trace.json": "d1c8886c0d6b2e5a69e8d0658e5189c81a3d669b7f850ac083f734ea5b607cea",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/46/trace.json": "4f56a7d6a944badfdf4a456e13d730d7aa70592d6c6035d1bfd83e35631be25e",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/47/trace.json": "f7d5d9eabd8dda28ef5ebb851d2d82e8614aecc37d69e483d0ce2ba8c5401b1d",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/48/trace.json": "33da57495d75d960e2070cfef556183e228436cce6f79aaf4ce3f513a2f9b485",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/49/trace.json": "c8f291a003720087176d69c42a0ce59e25038a06090e81c11c04e296d3262bd5",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/5/trace.json": "ccc10ee05cd886c58f67434e82a1adf756ad0a3ff68101d18cd0ccbb44dbbe9f",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/50/trace.json": "6fe1a4820f19a4144ea8f98b065b8bead47078ee91e98a39c4c08f5545d4f36d",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/51/trace.json": "e0d539553d52fdfcd105d2f883e09a9940b432be58c865e210b800ae5dfbe554",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/52/trace.json": "e879e244717e0849a02ce361c7f3e0b2db22541bd0a2c425985ec28569573f1f",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/53/trace.json": "985a73dd7336e13008a5c1102631b8c61a90cacded5919f8d56ee190e0f4d172",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/54/trace.json": "105415c7aec21a89c1fddf31184de8279666efb239576eaccdca9ab2788988bc",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/55/trace.json": "67435ec3f365b8bc62dbd6c14ef245bc03251442f47a1f5ac83b7a939289eaf9",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/56/trace.json": "356dd16c0f1bebf1147b30063a3ea1c866a387c398ebac4eee755c497ef763ed",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/57/trace.json": "8f6649a2910b6aa650dd003e37ca8c1e548a702b3d5fb47f6ae647268673d40f",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/58/trace.json": "96f90580e7b945cd2ca13abe3e8f6ab049c5c7bb4d464a4b8b1485895c46dd38",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/59/trace.json": "fbc7cc2dc9784704e9657fcc9dda622e01a42b52c3faf18c67e8e218f9389bd1",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/6/trace.json": "6b9e492e93900ef89b7cb0b14e76ce78aac40746f9774752908dc7d0a8851f71",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/60/trace.json": "2130611c0a3a9b20e8fe2b40dae39ed7962e383f33bb311996f920df8e4c3241",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/61/trace.json": "206f2cfe6b5d2415ee5a7fdd635b600fac5f33cdab9e53557cbf15e3f3efb5a5",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/62/trace.json": "e7a28584bda0cbfdb2c58f993143e4387807b8f97506df384506c060269641fd",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/63/trace.json": "e0efbf200f576607ad334e78cdac0c38b72f0a6d8fb36b3c565490e31afc9c40",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/64/trace.json": "3ce079deaa4fdf8e6bd7bc5b0c9b2c2edefa0d0749445ebe855465e8f419aee2",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/65/trace.json": "570830f38da40ea8008bae65fcee5fede5af7771c796bb8b20d186bb6843255d",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/66/trace.json": "c3346857cc3b62a4b1f47ab7526f21b80671ba21c67ff68cb5984ac3e1ad1c8f",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/67/trace.json": "f9e735f2cb359557bbe5823a9494e206094b0d6e87c5c7ab1e96f08109ec138d",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/68/trace.json": "a59b84569a93028740cd5473183d8f2dc65907c75fba77a22ecf376f44f5842c",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/69/trace.json": "06520741a3b08ef16a3406d4f4405317d84fb44dafde91d2973e926a34bc4b5e",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/7/trace.json": "445c8656f3af90e70d5704f5f126e94ec592651e524d6a451008d2c0c81490d1",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/70/trace.json": "eaa9720fdc50f66e9f84e1f6f5a424f7618413b29d38869f7491a47dcc4bc85e",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/71/trace.json": "e2f3a477fbd3a2627a00c4afb7f1d2dd864a248ff6e99063d6933dd90f97c502",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/72/trace.json": "541d65a9fca5a387b943d77abfd52c427826f65facd1737aaf34eea4266bb8dd",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/73/trace.json": "59aab5fe0ca9aa47ad9bab2bb559a3d687e58da494d93fe5a7419ce6f9781951",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/74/trace.json": "8d741da8a4b0a4a71edad9a47a8ea831d0a723133ab985ce182f08b1366726a8",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/75/trace.json": "2fde2eab65124805a1df7f9258487194fde917c7e302b3cb3877792d427e127c",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/76/trace.json": "392769562bbcc5de69a262ecaec16398d3f0017e0e4eac11fba5133eda8eb916",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/77/trace.json": "cf229c5a36ecc9b583dbde21b6aeaba5b92524a0f18dd57afe3c6597c3f8a70d",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/78/trace.json": "5cbd3ddba3795cc0a184ed04df1dd258d8070363a8ef18304ca7e7cafc7d8548",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/79/trace.json": "bc31092d1d29dd3b313fd56a68d4f7cf80b0b7e988f9919f5234dca6cc584d77",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/8/trace.json": "a1e137364f8bd94a647f2952b76df2dcf6fec3f9c1318fd4ad3d060e8e3b660a",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/80/trace.json": "495965a72a4db5994dce3b1e170bb9e33df7f89398c5ae760a5c4eb6afcd8eb7",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/81/trace.json": "061bfdc36a41fe45cb4cf48b49d36223e94e94f62c6365d283d99a9ef2686f3d",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/82/trace.json": "4f30ede59c4e16097fad5f59bbe2000715e627b3b5d0dae6e8df76e8f61b7430",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/83/trace.json": "237eb1e1c152ea3fa098d19374f04f59302111e5c435b6be87f2e686c920555b",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/84/trace.json": "10dd298fc6b46aae8ea96a5149494e0bcb2863726d66cd41e5f7ff1ed4ae346d",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/85/trace.json": "0a188f32ff95abb073274d96fa8e57f510522442c4a138d84c9ff02aed1b2f15",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/86/trace.json": "135d66999ea47ec57d52db3d322a9e0bc3058d17002b08f5a1b61c7b252f6cac",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/87/trace.json": "6eb5013b913f23ca9185e384be9b570af5f6c9f88e5695d9dc7520204ad27c0b",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/88/trace.json": "2e6ac921bff4a8e33e382ed480f304f42fbb9423995251c38e8f5aa2d40e7802",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/89/trace.json": "9a098520039b9f3ded9f88409718266936d7b6d44b1a1bb9abd6f5846b4f8c98",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/9/trace.json": "c420d9a189e5533c2376dda3d77450dc4655831b4a0a6a14f2308aa1305db2db",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/90/trace.json": "ac3be003d3ee2437de4ba5704e04c8b363a769bf10f585f78d8a9bd23cb744e5",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/91/trace.json": "1d2c653a062e6900a838e010d754cf527f9f4203108360489901e649ed5f439b",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/92/trace.json": "745e9eec27b69a6c9bf772361a52a200a9975f887e566f6ff0c206c4ad3b8657",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/93/trace.json": "aaf0c98bbb7b698b5727f90a6f80d0d20a1aa1bdbd9b93263ac600f65de2be04",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/94/trace.json": "0bd6bf4ce9bec56071f79fb3b7935a6d5331481a292dbf77e93213dcd2415f2b",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/95/trace.json": "e8302fefd3a86fbe2fb71559b0671467c7b219ad033d1481793cc7250bec0511",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/96/trace.json": "6f82fdeabf964817fca7ffdbc3ed7785544e4d6528e0cd8f33fc7e65e0fe43f9",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/97/trace.json": "8ccfb02f994a7911f3cb16359bff28d6937294641f9dce186b20ae582b6be09c",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/98/trace.json": "59454afd70c62e1cee9fd074fb7460ea4af998a70edaefe72559da9cfdf72d3b",
+    "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/normalwidth_122417_current_ema999_20261006_v1_off_no_reverse/full/cases/99/trace.json": "d45802ea743dffada01c8d20723959b88fd0d915052cb1c380e4e12a16549249"
+  },
+  "units": {
+    "distance": "base voxels",
+    "width": "network-input voxels (not base voxels)"
+  },
+  "wall_seconds": 18.945052295923233,
+  "windows": {
+    "-128": {
+      "advantage": {
+        "max": 34.36457407750929,
+        "mean": 6.3640302771761466,
+        "median": 3.264165364617883,
+        "n": 44,
+        "p05": -12.669931931088797,
+        "p95": 30.194855986167628
+      },
+      "paired": 44,
+      "reference_deviation": {
+        "max": 38.61738274533302,
+        "mean": 10.290421728643526,
+        "median": 7.81380750433196,
+        "n": 44,
+        "p05": 1.0223889519735796,
+        "p95": 32.212076473144464
+      },
+      "reference_preferred_percent": 68.18181818181817,
+      "requested_available": 44,
+      "threshold_10": {
+        "reference_only_rejected": 4,
+        "wrong_only_rejected": 12
+      },
+      "threshold_20": {
+        "reference_only_rejected": 3,
+        "wrong_only_rejected": 14
+      },
+      "threshold_40": {
+        "reference_only_rejected": 0,
+        "wrong_only_rejected": 1
+      },
+      "trace_deviation": {
+        "max": 40.29264404315717,
+        "mean": 16.654452005819675,
+        "median": 14.396290807059724,
+        "n": 44,
+        "p05": 0.5240140745475734,
+        "p95": 35.65377668399538
+      }
+    },
+    "-256": {
+      "advantage": {
+        "max": 28.658233399236966,
+        "mean": 2.850587423907281,
+        "median": 0.912386417431954,
+        "n": 42,
+        "p05": -14.604833017308767,
+        "p95": 24.984964712518522
+      },
+      "paired": 42,
+      "reference_deviation": {
+        "max": 39.7102175971757,
+        "mean": 10.049565816762213,
+        "median": 6.8976936774809205,
+        "n": 42,
+        "p05": 0.516916215696597,
+        "p95": 29.939725472771148
+      },
+      "reference_preferred_percent": 61.904761904761905,
+      "requested_available": 42,
+      "threshold_10": {
+        "reference_only_rejected": 4,
+        "wrong_only_rejected": 12
+      },
+      "threshold_20": {
+        "reference_only_rejected": 2,
+        "wrong_only_rejected": 7
+      },
+      "threshold_40": {
+        "reference_only_rejected": 0,
+        "wrong_only_rejected": 0
+      },
+      "trace_deviation": {
+        "max": 36.62707951144186,
+        "mean": 12.900153240669495,
+        "median": 9.842522482804007,
+        "n": 42,
+        "p05": 0.776479087967611,
+        "p95": 28.405080926419018
+      }
+    },
+    "-64": {
+      "advantage": {
+        "max": 41.23491160834411,
+        "mean": 4.7169476610897965,
+        "median": 1.5164861274478927,
+        "n": 49,
+        "p05": -15.913637120874203,
+        "p95": 25.741861700561145
+      },
+      "paired": 49,
+      "reference_deviation": {
+        "max": 30.82149599459525,
+        "mean": 12.087841888172694,
+        "median": 10.767040300125352,
+        "n": 49,
+        "p05": 0.8264131203308357,
+        "p95": 28.171755922864527
+      },
+      "reference_preferred_percent": 63.26530612244898,
+      "requested_available": 49,
+      "threshold_10": {
+        "reference_only_rejected": 4,
+        "wrong_only_rejected": 9
+      },
+      "threshold_20": {
+        "reference_only_rejected": 8,
+        "wrong_only_rejected": 14
+      },
+      "threshold_40": {
+        "reference_only_rejected": 0,
+        "wrong_only_rejected": 2
+      },
+      "trace_deviation": {
+        "max": 57.641784654773986,
+        "mean": 16.80478954926249,
+        "median": 15.88929779571393,
+        "n": 49,
+        "p05": 1.1977673164912095,
+        "p95": 38.019025986994606
+      }
+    },
+    "0": {
+      "advantage": {
+        "max": 38.057117813617864,
+        "mean": 2.0395229083883146,
+        "median": -0.09232490148684569,
+        "n": 50,
+        "p05": -23.059907775960593,
+        "p95": 21.941289124176087
+      },
+      "paired": 50,
+      "reference_deviation": {
+        "max": 46.86199686320931,
+        "mean": 13.297681885164376,
+        "median": 10.735224770895357,
+        "n": 50,
+        "p05": 1.081775092040126,
+        "p95": 33.189945474320346
+      },
+      "reference_preferred_percent": 48.0,
+      "requested_available": 50,
+      "threshold_10": {
+        "reference_only_rejected": 9,
+        "wrong_only_rejected": 13
+      },
+      "threshold_20": {
+        "reference_only_rejected": 8,
+        "wrong_only_rejected": 12
+      },
+      "threshold_40": {
+        "reference_only_rejected": 1,
+        "wrong_only_rejected": 2
+      },
+      "trace_deviation": {
+        "max": 41.532337708513076,
+        "mean": 15.337204793552692,
+        "median": 14.068725435801998,
+        "n": 50,
+        "p05": 0.7967344498470635,
+        "p95": 37.066714848507196
+      }
+    },
+    "128": {
+      "advantage": {
+        "max": 38.84165469287163,
+        "mean": 4.340031690561753,
+        "median": 3.2541404185479905,
+        "n": 49,
+        "p05": -19.291579140847368,
+        "p95": 33.61025917297666
+      },
+      "paired": 49,
+      "reference_deviation": {
+        "max": 50.911366544168814,
+        "mean": 14.344169222109977,
+        "median": 11.911376324386458,
+        "n": 49,
+        "p05": 2.278470563327204,
+        "p95": 31.80439176233783
+      },
+      "reference_preferred_percent": 57.14285714285714,
+      "requested_available": 49,
+      "threshold_10": {
+        "reference_only_rejected": 5,
+        "wrong_only_rejected": 15
+      },
+      "threshold_20": {
+        "reference_only_rejected": 7,
+        "wrong_only_rejected": 13
+      },
+      "threshold_40": {
+        "reference_only_rejected": 2,
+        "wrong_only_rejected": 3
+      },
+      "trace_deviation": {
+        "max": 43.35438620410215,
+        "mean": 18.68420091267173,
+        "median": 16.401004599994216,
+        "n": 49,
+        "p05": 2.7740295579454832,
+        "p95": 39.86543839405354
+      }
+    },
+    "256": {
+      "advantage": {
+        "n": 0
+      },
+      "paired": 0,
+      "reference_deviation": {
+        "n": 0
+      },
+      "reference_preferred_percent": null,
+      "requested_available": 0,
+      "threshold_10": {
+        "reference_only_rejected": 0,
+        "wrong_only_rejected": 0
+      },
+      "threshold_20": {
+        "reference_only_rejected": 0,
+        "wrong_only_rejected": 0
+      },
+      "threshold_40": {
+        "reference_only_rejected": 0,
+        "wrong_only_rejected": 0
+      },
+      "trace_deviation": {
+        "n": 0
+      }
+    },
+    "64": {
+      "advantage": {
+        "max": 44.36824671137634,
+        "mean": 8.004185377158423,
+        "median": 6.456956225127161,
+        "n": 49,
+        "p05": -12.555608433288272,
+        "p95": 35.40052800831344
+      },
+      "paired": 49,
+      "reference_deviation": {
+        "max": 35.60683662029388,
+        "mean": 11.891602435315113,
+        "median": 9.294339027147448,
+        "n": 49,
+        "p05": 1.229737218045197,
+        "p95": 29.01842057375277
+      },
+      "reference_preferred_percent": 67.3469387755102,
+      "requested_available": 49,
+      "threshold_10": {
+        "reference_only_rejected": 2,
+        "wrong_only_rejected": 16
+      },
+      "threshold_20": {
+        "reference_only_rejected": 5,
+        "wrong_only_rejected": 17
+      },
+      "threshold_40": {
+        "reference_only_rejected": 0,
+        "wrong_only_rejected": 4
+      },
+      "trace_deviation": {
+        "max": 46.382429200630696,
+        "mean": 19.895787812473536,
+        "median": 18.5198520987645,
+        "n": 49,
+        "p05": 1.0414592665114668,
+        "p95": 41.83807220112851
+      }
+    },
+    "failure": {
+      "advantage": {
+        "max": 36.310945651253164,
+        "mean": 6.29402250189195,
+        "median": 5.393231909972801,
+        "n": 50,
+        "p05": -13.01603078933616,
+        "p95": 28.07093044371044
+      },
+      "paired": 50,
+      "reference_deviation": {
+        "max": 36.79432958296346,
+        "mean": 13.542235423972972,
+        "median": 10.178658488388104,
+        "n": 50,
+        "p05": 1.335231572608875,
+        "p95": 34.013435576524806
+      },
+      "reference_preferred_percent": 64.0,
+      "requested_available": 50,
+      "threshold_10": {
+        "reference_only_rejected": 4,
+        "wrong_only_rejected": 14
+      },
+      "threshold_20": {
+        "reference_only_rejected": 5,
+        "wrong_only_rejected": 17
+      },
+      "threshold_40": {
+        "reference_only_rejected": 0,
+        "wrong_only_rejected": 2
+      },
+      "trace_deviation": {
+        "max": 42.36836541980517,
+        "mean": 19.836257925864924,
+        "median": 20.85940349991192,
+        "n": 50,
+        "p05": 3.0050468647005792,
+        "p95": 39.195549033583156
+      }
+    }
+  }
+}

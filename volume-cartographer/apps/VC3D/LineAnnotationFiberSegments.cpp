@@ -478,7 +478,7 @@ int replaceOpenTailsWithNative(
                 direction,
                 extrapolationTrace,
                 request.traceConfig,
-                request.traceNormalSampler, {}, annotated.has_value());
+                request.traceNormalSampler, {}, {}, {}, annotated.has_value());
         };
         std::optional<vc::fiber_tracer::FiberTraceOneWayResult> left;
         std::string leftException;

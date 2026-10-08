@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+export AGENTS_AGENT_MODE=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+export PYTHONPATH="${root}/gpu_manager/src:${root}/vesuvius/src:${root}/vesuvius:${root}${PYTHONPATH:+:${PYTHONPATH}}"
+exec /home/hendrik/.venv_las/bin/python "${root}/vesuvius/scripts/fiber3d_experiment.py" "$@"

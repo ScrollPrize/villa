@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Checkout-neutral launcher.  The Python entrypoint resolves the repository
+# root from its own location, so this remains reusable from any working dir.
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+python_bin=${PYTHON_BIN:-/home/hendrik/.venv_las/bin/python}
+config_file=${FIBER_EVAL_CONFIG:-$repo_root/.fiber_eval_active.json}
+
+if (($# != 0)); then
+    echo "run_fiber_evaluation takes no arguments; edit $config_file instead" >&2
+    exit 2
+fi
+
+runner=("$python_bin" "$repo_root/vesuvius/scripts/run_classic_fiber_evaluation.py")
+"${runner[@]}" prepare --config "$config_file"
+"${runner[@]}" validate-full --config "$config_file"
+exec "${runner[@]}" full --config "$config_file"

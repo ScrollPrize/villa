@@ -1,0 +1,42 @@
+{
+  "version": 2,
+  "source_to_base": 1,
+  "grad_mag_encode_scale": 1000,
+  "grad_mag_factor": 0.25,
+  "umbilicus_json": "",
+  "groups": {
+    "cos": {
+      "zarr": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc1451/representations/predictions/lasagna/20260319101107-lasagna-20260419180421-L2/PHerc1451-20260319101107-lasagna-20260724_cos.ome.zarr/3",
+      "scaledown": 3,
+      "channels": [
+        "cos"
+      ]
+    },
+    "grad_mag": {
+      "zarr": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc1451/representations/predictions/lasagna/20260319101107-lasagna-20260419180421-L2/PHerc1451-20260319101107-lasagna-20260724_grad_mag.ome.zarr/4",
+      "scaledown": 4,
+      "channels": [
+        "grad_mag"
+      ]
+    },
+    "nx": {
+      "zarr": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc1451/representations/predictions/lasagna/20260319101107-lasagna-20260419180421-L2/PHerc1451-20260319101107-lasagna-20260724_nx.ome.zarr/4",
+      "scaledown": 4,
+      "channels": [
+        "nx"
+      ]
+    },
+    "ny": {
+      "zarr": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc1451/representations/predictions/lasagna/20260319101107-lasagna-20260419180421-L2/PHerc1451-20260319101107-lasagna-20260724_ny.ome.zarr/4",
+      "scaledown": 4,
+      "channels": [
+        "ny"
+      ]
+    }
+  },
+  "base_shape_zyx": [
+    59944,
+    20811,
+    20811
+  ]
+}

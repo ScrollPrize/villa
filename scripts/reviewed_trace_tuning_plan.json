@@ -1,0 +1,13 @@
+{
+  "seeds": {
+    "p40_cos40_norev": {
+      "folder": "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/reviewed_postmod_presence_ema999_20261006_v1/ema999_12100_p40_cos40_norev",
+      "changes": ["tangent5", "tangent20", "normal005", "normal02", "cumulative0", "cumulative4", "step2", "step6", "step5", "step8"],
+      "combinations": {"step6_normal005": {"step-voxels": 6, "smoothness-normal-weight": 0.05}}
+    },
+    "p60_cos40_norev": {
+      "folder": "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/reviewed_postmod_presence_ema999_20261006_v1/ema999_12100_p60_cos40_norev",
+      "changes": ["tangent5", "tangent20", "normal005", "normal02", "cumulative0", "cumulative4", "step2", "step6"]
+    }
+  }
+}
