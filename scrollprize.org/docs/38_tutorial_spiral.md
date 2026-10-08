@@ -37,6 +37,8 @@ sidebar_label: "Spiral Fitting"
 </head>
 
 import ChatCallout from '@site/src/components/ChatWidget/ChatCallout';
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
 
 
 *Last updated: September 16, 2026*
@@ -47,7 +49,7 @@ Most of our segmentation tools work bottom-up. [GrowPatch](2026_open_problems#no
 
 That is what the spiral fit does. It takes the whole pile of partial evidence — surface patches, traced lines, winding annotations, volumetric predictions — and fits a single, globally coherent surface for the entire scroll that agrees with as much of that evidence as possible. Where the evidence is dense, the fitted surface follows it closely; where there are gaps, the spiral bridges them smoothly instead of stopping or leaving a gap.
 
-<div className="mb-4">
+<div className="mb-4 max-w-[720px] mx-auto">
   <img src="/img/tutorials/spiral-fit-paris4.webp" className="w-[100%]"/>
   <figcaption className="mt-[-6px]">The result of fitting a spiral to PHerc. Paris 4 (Scroll 1): the 130 fitted windings, overlaid on a horizontal slice through the scan.</figcaption>
 </div>
@@ -104,6 +106,15 @@ Everything the fit needs is declared in the project's own [`pyproject.toml`](htt
 
 On Windows, `uv sync` also installs `triton-windows`, a community build of Triton, because PyTorch publishes no `triton` wheel there and the fit's fused kernels need one. The first run compiles those kernels once.
 
+:::warning
+
+If you do not install through the pyproject.toml, ensure your torch version is `<2.13` versions `>= 2.13` will require _significantly_ more vram due to internal torch changes
+
+:::
+
+
+
+
 #### Get the dataset
 
 Ready-made inputs are published in the [`spiral-input` dataset](data_datasets#spiral-input-2026-07), which lives on the dl.ash2txt.org data server : [Spiral Datasets](https://dl.ash2txt.org/datasets/spiral_datasets/PHercParis4/) (~90 GB):
@@ -136,6 +147,147 @@ You also need to provide a **`spiral-scroll.json`** in the dataset root, recordi
 ```
 
 `name` is free-form and is what appears in the generated run-folder name. `spiral_outward_sense` (`"CW"` or `"ACW"`) says which way the spiral turns as it winds outward. No automated method determines it: it is read off the CT data by a person in VC3D, or taken from an already-fitted spiral. The file can also carry a `paths` object naming individual inputs whose filenames don't match the conventional ones (`"tracks_dbm"` is the usual one), and `normal_zarr_group` / `lasagna_scale`, which choose the OME-Zarr pyramid level the lasagna normal stores are read at — these are easy to get wrong silently, so read the scale off the store's own `.zattrs` rather than copying another scroll's values. The [spiral-fitting README](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/README.md) documents the full schema.
+
+
+#### Running the fit
+
+There are two ways to run the spiral fitting, either through the CLI or through an interactive fit session in the VC3D spiral workspace. Both run the same fit_spiral.py script. They differ in two ways: 
+- The VC3D workspace can be configured to render a flatten view at an interval or on the fits completion
+- The VC3D workspace supports adding inputs to "live" fits, interactively
+
+<div className="spiral-fit-tabs" style={{border: '1px solid var(--ifm-color-emphasis-300)', borderRadius: '8px', padding: '1.25rem', margin: '1.5rem 0', backgroundColor: 'var(--ifm-background-surface-color)'}}>
+
+<Tabs block>
+<TabItem value="vc3d-workspace" label="VC3D Workspace" className="spiral-workspace-tutorial" default>
+
+##### Starting a fit session
+
+Open VC3D, select the scroll's volume package in [VC3D](tutorial_VC3D), then select the **Spiral** workspace tab. It uses the same scan as the main workspace, with a flattened preview and CT slice views beside it. If you are planning on running the spiral service on the machine you're opening VC3D with , ensure you have the venv activated in the terminal before opening VC3D. 
+
+The spiral workspace runs through a service whether you're using it on the machine you're viewing VC3D through or over a network connection (internet or local LAN). 
+
+
+##### Navigating the UI 
+
+The spiral workspace is composed of two "windows": the configuration dock, on the left-side of the UI, and the flattened spiral view, which occupies the majority of the view. When no fit has returned a "preview", the flattened view is just a black rectangle. 
+
+The configuration dock for the most part should be used top-to-bottom, and all fits begin with a session "connection"
+
+<div className="mb-4 max-w-[900px] mx-auto">
+  <img src="/img/tutorials/spiral-workspace/workspace-overview.webp" alt="VC3D Spiral workspace with the configuration dock on the left, flattened preview in the center, and CT views on the right." className="w-[100%]" />
+  <figcaption className="mt-[-6px]">The Spiral workspace: configuration dock, flattened preview, and CT views.</figcaption>
+</div>
+
+###### Connecting to a session
+
+In **Spiral Service**, choose a connection:
+
+<div className="mb-4 max-w-[720px] mx-auto">
+  <img src="/img/tutorials/spiral-workspace/spiral-service-section.webp" alt="Spiral Service panel showing connection profiles, endpoint, SSH host, dataset, output, and cache fields." className="w-[100%]" />
+  <figcaption className="mt-[-6px]">Connection profiles and service paths in the Spiral Service panel.</figcaption>
+</div>
+
+- **Local:** set **Dataset** and **Output**, then **Connect**. VC3D launches the service locally; its Python environment must have the spiral-fitting dependencies installed. Keep Output outside the dataset directory.
+- **Remote (SSH):** start the service on the GPU machine using the command below, then click **+SSH** in VC3D. Enter `[user@]host` (an SSH-config alias also works) and port `8765`, then **Connect**. Use SSH keys or an agent; if the host is new, connect once with `ssh user@host` in a terminal to accept its host key. VC3D creates the tunnel and retrieves the API key automatically.
+- **Remote (LAN):** start the same service with `--bind 0.0.0.0`, then click **+LAN**. Set **Endpoint** to `http://HOST:8765` and paste the API key printed by the service. Direct HTTP is unencrypted; use it on a trusted network, or use SSH.
+
+For either remote connection, run this on the GPU host from `villa/spiral-fitting` with dependencies installed (add `--bind 0.0.0.0` for LAN):
+
+```bash
+uv run python spiral_service.py --port 8765 \
+    --dataset /data/scrolls/s1 --output /data/spiral-output/s1 \
+    --gpus 0 --session-name my-fit
+```
+
+Keep this process running in a persistent terminal such as `tmux`. Remote fits continue when VC3D disconnects. Previews and checkpoints transfer automatically; a shared filesystem is unnecessary. If you mount the remote dataset locally, set **Local dataset path** to its matching root to enable verified patch overlays.
+
+###### Configuring and running the initial fit 
+
+The default parameters used by fit_spiral.py also apply to fit sessions run through the workspace. The only fields necessary for you to fill in are **Output Directory**, **z begin** and **z end**. If you'd like to override the defaults, click **Open Spiral Configuration...** and edit the fields. Hovering the mouse over the text for each field will show a brief description of what it does. 
+
+<div className="mb-4 max-w-[900px] mx-auto">
+  <img src="/img/tutorials/spiral-workspace/spiral-configuration-panel.webp" alt="Spiral configuration dialog with sampling, loss, patch, and model settings." className="w-[100%]" />
+  <figcaption className="mt-[-6px]">The Spiral configuration dialog exposes the fit settings and their descriptions.</figcaption>
+</div>
+
+Set **z begin / z end** in **Fit and output**; start with a small range. Click **Initialize Fit**, choose **Iterations**, then **Run**. **Stop after iteration** pauses at the next completed step; another Run continues the fit. Initialization becomes **Rebuild Fit** once a fit exists. To resume a saved model, select it under **Checkpoint** and click **Load**.
+
+Once the configured number of steps completes, or on the interval set by **Background preview every..** spinbox when enabled, a flattened spiral surface will display in the viewer. 
+
+Navigation in the spiral preview surface and the volume views is similar to the rest of VC3D
+- `right-click + drag` to pan, 
+- mouse-wheel to zoom, 
+- shift+wheel to move through slices on the flattened view,
+- `R` and `ctrl+c` over a point to show that area in all views, 
+- `X` recenters the views on that focus if you have panned away 
+
+The spiral surface also contains a "minimap". Click the winding minimap below the flattened view to jump along the scroll. Use **Min winding / Max winding** limit the displayed windings (`-1` means through the last).
+
+Within the display section of the configuration dock is the **Volume** combobox, which allows you to select the primary displayed volume (Overlays are managed like regular VC3D, via the **Overlay** toolbar item). The spiral preview surface also has many additional overlays available. Use **Display →** to toggle output, input patches, fibers and point collections, surface intersections, winding boundaries, patch overlap, and run differences. Loss overlays require **Compute loss overlays with the next preview**, which roughly doubles preview cost. The fixed status area shows fit progress and preview age; **Logs** opens service messages.
+
+<div className="mb-4 max-w-[378px] mx-auto">
+  <img src="/img/tutorials/spiral-workspace/spiral-display-panel.webp" alt="Display dialog with controls for point collections, patch overlap, winding transitions, loss overlays, and input visibility." className="w-[100%]" />
+  <figcaption className="mt-[-6px]">Display controls for the preview and its overlays.</figcaption>
+</div>
+
+##### Annotate and apply changes
+
+When fitting a spiral using the spiral workspace, you can add constraints to a running fit. 
+
+| Key or gesture | Action |
+| --- | --- |
+| Tap Ctrl | Toggle patch painting; left-drag paints, right-drag erases |
+| Ctrl+wheel | Change brush size |
+| Shift+right-drag | Draw a freehand control-point line |
+| Ctrl + right-click -> 2d line annotation | place control points to use in the fiber annotation, press `E` to optimize and display the line annotation window | 
+| Hold V + left-clicks | Draw a control-point line through chosen points; release V to finish |
+| Q, then left-clicks | Place points belonging to the same winding |
+| E, then left-clicks | Place relative-winding points numbered 0, 1, 2, …; click successive windings in order |
+| F | Reverse the active point collection and its relative-winding ordering |
+| Escape | Exit the current drawing/point-placement mode |
+| Shift+E | Prepare drawing drafts for submission |
+
+<div className="mb-4 max-w-[720px] mx-auto">
+  <img src="/img/tutorials/spiral-workspace/surface-annotation-types.webp" alt="Flattened spiral surface with a purple painted patch and cyan point annotations." className="w-[100%]" />
+  <figcaption className="mt-[-6px]">A flattened spiral preview with a painted patch and point annotations.</figcaption>
+</div>
+
+Use **Add/Apply changes** to submit ready drafts to the fit, including while it is running. **Commit** persists the selected changes into the dataset; applying alone does not. For existing inputs, enable **Show original dataset inputs**, then right-click an entry and choose **Edit**. Patch and fiber editors save working copies; use Add/Apply afterward. **Remove** stages a removal, **Restore** reverses it before Commit, and committing the removal deletes the managed dataset entry.
+
+<div className="mb-4 max-w-[720px] mx-auto">
+  <img src="/img/tutorials/spiral-workspace/pending-and-committed-inputs.webp" alt="Input list showing drawing changes and the Add/Apply changes, Commit, and Remove buttons." className="w-[100%]" />
+  <figcaption className="mt-[-6px]">Drawing changes in the input list: Apply updates the fit; Commit writes them into the dataset.</figcaption>
+</div>
+
+##### Preview intervals and rendering
+
+Enable **Background preview every** and choose an interval in **iterations** before clicking Run (default interval: 100). The service captures the fit at an iteration boundary, exports its surface, and flattens it through Lasagna; fitting resumes while flattening continues. VC3D downloads the finished geometry and displays the scan on that surface. This is a geometry preview; ink strips are produced separately by [Rendering ink](#rendering-ink).
+
+A preview is also requested when a connected run finishes or is stopped. Exporting and flattening can take minutes, so the displayed preview may trail the fit; check its iteration and lag in the status area. Until a new preview succeeds, the previous one stays visible.
+
+##### Where files live
+
+Generated files live on the **service machine**, under its Output root; the example above uses `/data/spiral-output/s1/my-fit/`. This holds fit run directories, previews, uploads, and checkpoints, including `checkpoint_autosave.ckpt`. For local services, an empty Output field uses a per-dataset directory in VC3D's application-data folder; set it explicitly for an easy-to-find location. The derived cache defaults to `~/.cache/vc3d/spiral`.
+
+**Checkpoint → Save on Service** saves remotely; **Download…** copies a checkpoint to your computer. VC3D also caches downloaded display artifacts locally. Only **Commit** writes your annotation changes back into the dataset. See the [service README](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/README.md#internet-flow-ssh-attach) for connection and storage details.
+
+##### Improving the fit "interactively" 
+
+Once the spiral surface is shown in VC3D you can inspect it for mistakes. Mistakes can be grouped into a few types, and the "fixes" for these mistakes can come from many different kinds of constraints.
+
+**Sheet Switches** are areas where the spiral fit has started on one winding, lets call it winding `A`, and departs from it and continues along an adjacent winding `B`. You can fix these by either telling the spiral fit "this point continues this way" (patches, fibers), or "these two points are not the same winding" (relative winding annotations). For the most part unless relative winding annotations fall on patches (and produce links), you get more "bang for your buck" with patches or fibers in resolving these types of errors
+
+**Wandering** is when the spiral fit shifts back and forth along the normal of the surface, never adhering quite to the proper sheet and occasionally (but only briefly) falling onto an adjacent winding. These are best resolved with patches, but fibers could suffice if there is simply just a complete lack of annotation in this area. 
+
+When you identify one of these areas, and you've added your fix (in the form of some new constraint, see the keybinds above) to the live fit, it's typically good pratice to disable the "DT" losses temporarily. These losses have a tendency to make the spiral "stick" to an annotation, making it hard for it to adjust to your new annotations. The VC3D spiral workspace makes this easy, by checking the box **Restrict DT losses to final...** and entering a percentage. In this example, the fit will run for 2000 additional iterations (extending its polynomial LR decay to account for the longer horizon), with the first 75% of those iterations having its "DT" losses disabled.
+
+<div className="mb-4 max-w-[810px] mx-auto">
+  <img src="/img/tutorials/spiral-workspace/restrict-dt-losses.webp" alt="Run controls with Iterations set to 2000 and the Restrict DT losses to final checkbox enabled at 25%." className="w-[100%]" />
+  <figcaption className="mt-[-6px]">2000 more iterations, with the DT losses only active for the final 25%.</figcaption>
+</div>
+
+</TabItem>
+<TabItem value="cli" label="CLI">
 
 ##### The fit configuration
 
@@ -197,6 +349,55 @@ out/2026-07-08_s1_slice-10500-11500_27399-patch_<run-name>/
 
 The overlay PNGs are only written when `output_save_png_visualizations` is on; it defaults to off, since rendering them means reading scan slices back at the end of the fit.
 
+</TabItem>
+</Tabs>
+
+</div>
+
+### Tips for getting better spiral fits
+The goal of any spiral fit is to do _as little annotation as possible_ . This is, of course, a hard question to answer until you have a perfect fit and work backwards. However, we can get a rough guess if we consider how the spiral interpolates. The easiest way to think of this is to imagine the scroll as a set of local shapes glued together, perhaps one section of the scroll looks like a `C` or one a `J` or god forbid a `Z`. In each of these shaped sections, we need _something_ to inform the spiral how the local area should be deformed. 
+
+<div className="mb-4 flex flex-wrap items-center justify-between sm:w-[108%] sm:ml-[-4%]">
+  <figure className="w-[100%] sm:w-[71%] m-0">
+    <img src="/img/tutorials/spiral-workspace/annotation-density-combined.webp" alt="A slab of scroll split into colored local shape sections, shown assembled on the left and exploded apart on the right, each marked with a green, yellow, or red annotation-density badge." className="w-[100%]" />
+    <figcaption className="mt-0">The scroll as a set of local shapes glued together. Badges indicate roughly how much annotation each section needs, from low (green) to high (red).</figcaption>
+  </figure>
+  <figure className="w-[60%] my-0 mx-auto sm:mx-0 sm:w-[26%]">
+    <img src="/img/tutorials/spiral-workspace/annotation-density-stack.webp" alt="Three stacked slabs of the scroll at different z heights, each divided into colored shape sections with annotation-density badges." className="w-[100%]" />
+    <figcaption className="mt-0">The same scroll at three heights: density follows local shape complexity, so it changes along z.</figcaption>
+  </figure>
+</div>
+
+These "descriptions" typically come in the form of constraints like patches, fibers, or relative winding annotations. The "density" of these shape descriptors required in a given area depends greatly on how uniform the deformation is. If a large number of windings all make mostly the same shape, it could be very few. However if an area makes something more `3C` than `C` (bear with me), you'll need a fair bit more annotation. The "complexity" of the local shape is the primary multiplier of annotation density, rather than the number of windings or the curvature alone. Once you've got a constraint that describes the neighborhood, there is little benefit in adding "more". You would not, for example, want to annotate multiple windings in a row radially if they are mostly the same shape and have somewhat regular spacing.
+
+The other instance which typically requires more-than-usual amounts of annotation is the case of shears. In this context, a shear of the scroll is a location where the papyrus has not only _broken apart_ but also _shifted_ along an axis. These situations are particularly hard for a smooth field to interpolate (they are by nature unsmooth). In these types of areas it is best to try and find some portion of the scroll which you can follow through, and apply a fair bit of annotation on either side of the shear, as near as you can get to the actual missing papyrus. 
+
+<div className="mb-4 flex flex-wrap items-start justify-between sm:w-[80%] sm:mx-auto">
+  <figure className="w-[100%] sm:w-[53%] m-0">
+    <video autoPlay playsInline loop muted className="w-[100%]" poster="/img/tutorials/spiral-workspace/shear-xy-poster.webp">
+      <source src="/img/tutorials/spiral-workspace/shear-xy.webm" type="video/webm"/>
+    </video>
+    <figcaption className="mt-0">Scrolling through z 9680–9990 across a shear, where the papyrus breaks and shifts along an axis.</figcaption>
+  </figure>
+  <figure className="w-[100%] sm:w-[45%] m-0">
+    <img src="/img/tutorials/spiral-workspace/shear-section-normal.webp" alt="Vertical CT section cut across the papyrus layers through the shear, showing a dark void at about z 9813 where the layers above and below are offset from each other." className="w-[100%]" />
+    <figcaption className="mt-0">The same shear in a vertical section cut across the layers. The crosshair marks z 9813, where the layers break apart and shift.</figcaption>
+  </figure>
+</div>
+
+Now that we've described the _bad_ areas, there are some shapes within a scroll which are "easier" (or at least as easy as unrolling an ancient carbonized scroll can reasonably be): 
+
+- Because the gap expander prefers to push outwards from its initial gap, and due to it being a cumulative sum of the gaps _along_ the radial , the spiral will (for the most part) perform quite well in areas with regular spacing and curvature which happens smoothly over a large area. This _reduces_ the amount of annotation we need in these areas
+- Areas which have large gaps between windings that are sustained for long runs reduce the amount of "uncertainty" in the fit, and are typically fit well very early
+- Areas with minimal curvature (even highly compressed ones)
+
+<div className="mb-4 max-w-[560px] mx-auto">
+  <img src="/img/tutorials/spiral-workspace/annotation-density-easy-piece.webp" alt="A single green 3D piece of the scroll, its top face showing evenly spaced windings that curve smoothly, with one white annotation line." className="w-[100%]" />
+  <figcaption className="mt-[-6px]">One of the easiest pieces from the slab above: regular spacing and smooth, gradual curvature mean a single annotation describes the whole neighborhood.</figcaption>
+</div>
+
+
+
 #### Rendering ink
 
 To get from per-winding meshes to readable images, use `render_ink.py`. It groups the `_spliced` winding meshes into winding-range chunks, concatenates each chunk into a single mesh (written to a `concat/` folder — useful for loading the geometry behind each strip as one mesh), SLIM-flattens it, renders it through an ink-prediction volume with `vc_render_tifxyz`, and composites the result into one JPEG strip per chunk:
@@ -216,6 +417,7 @@ The script `get_ink_metrics.py` computes some metrics based on the amount of let
 The ink-coverage model was only trained on PHerc. Paris 4, so it may not give accurate results for other scrolls with significantly different writing styles.
 
 :::
+
 
 ### How it works
 

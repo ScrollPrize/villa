@@ -75,8 +75,8 @@ _SCALE_WITH_Z_FIELDS = {
 }
 
 
-# z_begin/z_end are deliberately heavyweight settings; their metadata records
-# every effect so nothing treats them as cheap run-boundary knobs:
+# z_begin/z_end are deliberately heavyweight settings, always classified as
+# new-fit settings so nothing treats them as cheap run-boundary knobs:
 #   - host input filtering: patches, PCLs, unattached strips, and tracks are
 #     loaded/kept only where they intersect [z_begin, z_end);
 #   - dense-store coverage: the Lasagna normal/grad-mag brick pools are
@@ -88,167 +88,64 @@ _SCALE_WITH_Z_FIELDS = {
 #   - model/checkpoint-domain compatibility: the flow-field parameter shapes
 #     cover the range (plus margin), so resuming a checkpoint requires the
 #     optimisation range to lie within the checkpoint's stored model z-range.
-_Z_RANGE_DESCRIPTIONS = {
-    "z_begin": "First z slice (inclusive) of the fit. Affects host input "
-               "filtering, dense-store coverage, per-step count scaling, "
-               "rendering, and model/checkpoint z-domain compatibility.",
-    "z_end": "One past the last z slice of the fit. Affects host input "
-             "filtering, dense-store coverage, per-step count scaling, "
-             "rendering, and model/checkpoint z-domain compatibility.",
-}
+_Z_RANGE_KEYS = frozenset({"z_begin", "z_end"})
 
-_INPUT_TOGGLE_DESCRIPTIONS = {
-    "input_use_verified_patches":
-        "Load verified patches and allow their radius/DT supervision.",
-    "input_use_tracks":
-        "Load tracks and allow track sampling and losses.",
-    "input_use_fibers":
-        "Load fiber annotations into the point-collection supervision pools.",
-    "input_use_fiber_directions":
-        "Load packed fiber-direction samples and allow their orientation loss.",
-    "input_use_pcl_absolute":
-        "Load absolute-winding point-collection inputs.",
-    "input_use_pcl_relative":
-        "Load relative-winding point-collection inputs. Applies at a Run "
-        "boundary: enabling loads the dataset's relative_windings.json (and "
-        "any relative document the session named) into the resident fit, "
-        "disabling drops every resident relative collection.",
-    "input_use_pcl_same_winding":
-        "Load same-winding point-collection inputs. Applies at a Run "
-        "boundary: enabling loads the dataset's same_windings.json (and any "
-        "same-winding document the session named) into the resident fit, "
-        "disabling drops every resident same-winding collection.",
-    "input_use_pcl_drawn_control_points":
-        "Load drawn-control-point point-collection inputs.",
-    "input_use_normals":
-        "Allow dense normal stores, sampling, and normal-dependent losses.",
-    "input_use_gradient_magnitude":
-        "Allow gradient-magnitude dense-spacing supervision.",
-    "input_use_winding_inference":
-        "Allow compact winding-inference supervision.",
-    "input_use_outer_shell":
-        "Allow outer-shell losses, lookup maps, and shell-based track filtering.",
-}
+# Participation toggles: whether a supervision source is loaded at all.
+_INPUT_TOGGLE_KEYS = frozenset({
+    "input_use_verified_patches",
+    "input_use_tracks",
+    "input_use_fibers",
+    "input_use_fiber_directions",
+    "input_use_pcl_absolute",
+    "input_use_pcl_relative",
+    "input_use_pcl_same_winding",
+    "input_use_pcl_drawn_control_points",
+    "input_use_normals",
+    "input_use_gradient_magnitude",
+    "input_use_winding_inference",
+    "input_use_outer_shell",
+})
 
-_PCL_LINK_DESCRIPTIONS = {
-    "pcl_link_distance_tolerance": (
-        "Scroll voxels within which a point collection point attaches to a "
-        "patch surface at load (and on live patch/PCL incorporation). "
-        "General collections take the largest-area patch within tolerance, "
-        "then the nearest; between-patch collections the nearest of their "
-        "named pair. Changing it at a Run boundary relinks every resident "
-        "point collection and rebuilds their views."),
-    "pcl_link_window_points": (
-        "Consecutive points (id order, centred on the point, the point "
-        "included) whose hits on a candidate patch are counted for "
-        "pcl_link_window_min_points. Even counts round up to the next odd "
-        "count; 1 disables the window."),
-    "pcl_link_window_min_points": (
-        "A candidate patch (one the point itself lies within tolerance of) is "
-        "eligible only when at least this many of the window's points lie "
-        "within tolerance of it; eligible candidates are then ranked as usual "
-        "(largest area, then nearest). 1 keeps the single-point choice; the "
-        "requirement is clipped to the window members available at a "
-        "collection's ends. Must not exceed pcl_link_window_points. Changing "
-        "either window setting at a Run boundary relinks every resident "
-        "point collection."),
-    "pcl_fiber_link_side_filter": (
-        "Restrict fibers to patches on the correct side of the sheet: a "
-        "vertical fiber (on the sheet's back) only attaches to a patch whose "
-        "surface lies in front of it (inward: toward the umbilicus / the "
-        "lower-winding neighbour), a horizontal fiber (on the sheet's front) "
-        "only to one behind it. Until "
-        "pcl_fiber_link_model_direction_step steps have run the inward "
-        "direction is the line to the umbilicus; from then on (also when a "
-        "checkpoint that far along is loaded) every fiber is relinked once "
-        "along the fitted spiral's decreasing-winding direction. Changing "
-        "it at a Run boundary relinks every resident fiber."),
-    "pcl_fiber_link_side_margin_voxels": (
-        "Scroll voxels a patch surface may sit on the wrong side of a fiber "
-        "point before the side filter rejects the hit; absorbs points lying "
-        "on the traced surface itself."),
-    "pcl_fiber_link_model_direction_step": (
-        "Completed step from which the fiber side filter takes its inward "
-        "direction from the fitted winding instead of the umbilicus, "
-        "relinking every fiber once at the switch."),
-}
+# Human-readable descriptions of the configuration keys (and of VC3D's Spiral
+# panel controls) live in descriptions.json beside this module, so the text
+# can be edited without touching code; see config_descriptions().
+DESCRIPTIONS_PATH = Path(__file__).with_name("descriptions.json")
 
-_GAP_EXPANDER_DESCRIPTIONS = {
-    "model_gap_expander_num_windings": (
-        "Legacy/fallback physical winding-count estimate used by exporters; "
-        "it does not allocate the gap lattice."),
-    "model_gap_expander_capacity_windings": (
-        "Allocated gap-lattice capacity, not a claim about the physical "
-        "winding count. Must be at least shell_outer_winding_idx + 3."),
-    "model_gap_expander_min_gap": (
-        "Hard numerical inter-winding gap floor in working voxels. The "
-        "minimum-spacing loss remains the separate geological preference."),
-    "model_gap_expander_softplus_bias": (
-        "Bias of the stable lower-bounded softplus gap parameterisation."),
-}
 
-_OPTIMIZER_DESCRIPTIONS = {
-    # See README.md, "Flow-gradient conditioning", for literature precedents
-    # and the limitations of these custom combinations.
-    "optimizer_flow_grad_smoothing": (
-        "Gaussian-smooth flow gradients before the optimizer step. The loss "
-        "is unchanged, but Adam scaling and masks mean the resulting update "
-        "need not retain the kernel profile. Cylindrical smoothing runs "
-        "along z and around rings, with optional separate across-ring smoothing."),
-    "optimizer_flow_grad_smoothing_sigma_voxels": (
-        "Standard deviation in scroll-voxel units of the flow frame: along "
-        "z and around cylindrical rings, or isotropically for Cartesian "
-        "lattices. These lattice directions approximate sheet directions. "
-        "Used for both lattices unless the low-resolution override is set. "
-        "Divide by model_flow_voxel_resolution for fine-cell units; coarse "
-        "cells are six times wider. Very small widths become identity kernels. "
-        "Effective widths are logged at startup when smoothing is enabled."),
-    "optimizer_flow_grad_smoothing_across_sigma_voxels": (
-        "Standard deviation in scroll-voxel units for smoothing across "
-        "cylindrical rings at matching angles. This approximates coupling "
-        "across windings; it does not identify sheet boundaries. 0 disables "
-        "across-ring smoothing. Ignored for Cartesian lattices."),
-    "optimizer_flow_grad_smoothing_low_res_sigma_voxels": (
-        "Along-sheet smoothing width for the coarse lattice alone; 0 uses "
-        "the fine lattice's width in scroll-voxel units. For example, at the "
-        "default 16-voxel fine spacing, 32 voxels is 2 fine cells but about "
-        "0.33 coarse cells. The across-ring width is not affected."),
-    "optimizer_flow_shared_second_moment": (
-        "Use one Adam denominator across cells and components of each "
-        "lattice slab, separately for each flow stage and coarse/fine lattice. "
-        "Preserves relative first-moment magnitudes before lazy masking and "
-        "weight decay, rather than normalizing each entry independently. "
-        "The denominator uses a winsorised mean of positive stored second "
-        "moments. Full per-entry state is retained; the flag can change "
-        "between runs."),
-    "optimizer_flow_shared_second_moment_clip_quantile": (
-        "Quantile of positive second-moment entries, estimated from a "
-        "fixed-stride sample, used to cap values before averaging the full "
-        "slab for the shared denominator. Limits outliers' effect on the "
-        "common scale. 1 disables the cap; an empty positive sample also "
-        "leaves values uncapped."),
-    "model_flow_field_low_res_lr_scale": (
-        "Coarse flow learning-rate multiplier relative to the scheduled "
-        "base rate, independent of the fine flow multiplier. Shared second "
-        "moments can change update sizes; use the logged increments to assess "
-        "the scale. 0 freezes coarse values, including weight decay, but "
-        "moments may still update. Read every step by the fitter; currently "
-        "classified as a model-rebuild setting by the configuration catalog."),
-    "optimizer_flow_grad_clip_median_multiple": (
-        "Clip individual gradient components at this multiple of the median "
-        "nonzero absolute component value, per lattice slab, estimated from "
-        "a fixed-stride sample. Runs after DDP averaging and nonfinite "
-        "sanitization, before smoothing and optimizer moments. Limits spike "
-        "propagation but can suppress valid corrections and change vector "
-        "direction. 0 disables clipping. Logs the bound and clipped fraction."),
-    "optimizer_flow_lazy_moments": (
-        "Use SparseAdam-style masked updates on dense flow gradients: "
-        "entries with zero gradient after conditioning "
-        "retain their moments and receive no gradient update. Smoothing can "
-        "activate entries without direct samples. Preserves history through "
-        "quiet steps, including stale momentum, and does not correct first "
-        "touch scaling. Configured weight decay still applies everywhere."),
-}
+def config_descriptions(path=DESCRIPTIONS_PATH, *, warn=print):
+    """Return {config key: description} from the descriptions file.
+
+    The file is read on every call, so edited text reaches a client on its
+    next catalog fetch without restarting the service. Descriptions are
+    presentation only: a missing or malformed file leaves the catalog
+    undescribed instead of failing it.
+    """
+    try:
+        section = json.loads(Path(path).read_text(encoding="utf-8"))["config"]
+        items = section.items()
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        warn(f"Spiral configuration descriptions unavailable ({path}): {error}")
+        return {}
+    return {key: text.strip() for key, text in items
+            if isinstance(text, str) and text.strip()}
+
+
+def describe_catalog(catalog, descriptions=None):
+    """Return a copy of catalog whose field specs carry current descriptions."""
+    if descriptions is None:
+        descriptions = config_descriptions()
+    schema = dict(catalog["schema"])
+    for section in ("fields", "run_fields"):
+        described = {}
+        for key, spec in schema[section].items():
+            spec = {name: value for name, value in spec.items()
+                    if name != "description"}
+            if key in descriptions:
+                spec["description"] = descriptions[key]
+            described[key] = spec
+        schema[section] = described
+    return {**catalog, "schema": schema}
+
 
 # Configuration keys that shape the model's parameter tensors. A checkpoint
 # whose stored value for any of them differs describes a different model, and
@@ -346,8 +243,7 @@ _RUN_MUTABLE_INPUT_KEYS = frozenset({
 
 # input_ keys: hard participation gates deciding what host preparation loads
 # and which dense stores open. Always a rebuild.
-_INPUT_GATE_KEYS = (frozenset(_INPUT_TOGGLE_DESCRIPTIONS)
-                    - _RUN_MUTABLE_INPUT_KEYS) | {
+_INPUT_GATE_KEYS = (_INPUT_TOGGLE_KEYS - _RUN_MUTABLE_INPUT_KEYS) | {
     "input_disable_patches",
 }
 
@@ -376,7 +272,7 @@ _RUN_MUTABLE_PCL_KEYS = frozenset({
 })
 
 NEW_FIT_KEYS = frozenset(
-    set(_Z_RANGE_DESCRIPTIONS)
+    set(_Z_RANGE_KEYS)
     | _MODEL_STRUCTURE_KEYS
     | _INPUT_GATE_KEYS
     | _PREPARED_INPUT_FIELDS
@@ -489,28 +385,18 @@ def _field_spec(key, default):
         spec["length"] = 3 if key == "track_length_bin_weights" else len(default)
     if key in _SCALE_WITH_Z_FIELDS:
         spec["scale_with_z"] = True
-    if key in _Z_RANGE_DESCRIPTIONS:
-        spec["description"] = _Z_RANGE_DESCRIPTIONS[key]
+    if key in _Z_RANGE_KEYS:
         # These values remain part of the resolved/checkpoint configuration,
         # but interactive clients edit them through the run-level z controls,
         # not as independent advanced-JSON settings.
         spec["ui_owner"] = "run"
-    elif key in _INPUT_TOGGLE_DESCRIPTIONS:
-        spec["description"] = _INPUT_TOGGLE_DESCRIPTIONS[key]
-    elif key in _GAP_EXPANDER_DESCRIPTIONS:
-        spec["description"] = _GAP_EXPANDER_DESCRIPTIONS[key]
-    elif key in _PCL_LINK_DESCRIPTIONS:
-        spec["description"] = _PCL_LINK_DESCRIPTIONS[key]
-
-    elif key in _OPTIMIZER_DESCRIPTIONS:
-        spec["description"] = _OPTIMIZER_DESCRIPTIONS[key]
     return spec
 
 
 class Config:
     def __init__(self, overrides=None):
-        # The optimisation z window (see _Z_RANGE_DESCRIPTIONS for the full
-        # effect list). Defaults match the historical fit_spiral module
+        # The optimisation z window (see _Z_RANGE_KEYS for the full effect
+        # list). Defaults match the historical fit_spiral module
         # globals for the production PHercParis4 dataset.
         self.z_begin = 4000
         self.z_end = 17000
@@ -520,7 +406,8 @@ class Config:
         self.optimizer_exp_lr_schedule = True
         self.optimizer_lr_final_factor = 0.3
         self.optimizer_num_training_steps = 30000
-        # Flow-lattice gradient conditioning (see _OPTIMIZER_DESCRIPTIONS).
+        # Flow-lattice gradient conditioning (see descriptions.json and
+        # README.md, "Flow-gradient conditioning").
         # All are read live every step, so they apply at a run boundary
         # without a rebuild. Off by default.
         self.optimizer_flow_grad_smoothing = False
@@ -622,7 +509,7 @@ class Config:
         self.pcl_fiber_min_point_spacing = 40.0
         self.pcl_unattached_pcl_min_point_spacing = 16.0
         # Point-to-patch linking (point_collection.link_points_to_patches;
-        # see _PCL_LINK_DESCRIPTIONS). Every point attaches to a patch surface
+        # see descriptions.json). Every point attaches to a patch surface
         # within this many scroll voxels; window_min_points > 1 additionally
         # requires that many of a centred window of window_points consecutive
         # points to lie within tolerance of a candidate before it is eligible.
@@ -820,7 +707,7 @@ class Config:
             }
             for path in (Path(__file__).parent / "configs").glob("*.json")
         }
-        return {
+        return describe_catalog({
             "defaults": defaults,
             "schema": {
                 # No input path can be taken by a resident session: every path
@@ -845,7 +732,7 @@ class Config:
                 "run_fields": run_fields,
             },
             "presets": presets,
-        }
+        })
 
 
 class FitConfig:

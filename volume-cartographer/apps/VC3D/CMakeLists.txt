@@ -246,6 +246,8 @@ set(srcs
     SpiralSessionSync.hpp
     SpiralSshTunnel.cpp
     SpiralSshTunnel.hpp
+    SpiralDescriptions.cpp
+    SpiralDescriptions.hpp
     SpiralPanel.cpp
     SpiralPanel.hpp
     SpiralMinimap.cpp

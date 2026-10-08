@@ -75,7 +75,7 @@ from fit_session import (API_VERSION, EDITABLE_PCL_ROLES, FIT_INPUT_CATALOG,
                          parse_session_request, resolve_dataset_root,
                          validate_session_request)
 from checkpoint_migrations import tolerate_config
-from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config,
+from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config, describe_catalog,
                     filter_known_config_keys, rebuild_stage)
 from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
                           is_safe_relative_name)
@@ -832,7 +832,9 @@ class ServiceState:
         return response
 
     def configuration_catalog(self):
-        return {**self._base(), **self.config_catalog}
+        # Descriptions are re-read per request, so edited text reaches a
+        # client when it reconnects, without restarting the service.
+        return {**self._base(), **describe_catalog(self.config_catalog)}
 
     def dataset(self):
         return {**self._base(), **self.dataset_resolution.to_dict(),

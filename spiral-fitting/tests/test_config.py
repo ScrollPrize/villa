@@ -4,8 +4,8 @@ import json
 import pytest
 
 from config import (
-    Config, FitConfig, MODEL_STAGE_KEYS, NEW_FIT_KEYS, SHELL_ATLAS_KEYS,
-    rebuild_stage,
+    DESCRIPTIONS_PATH, Config, FitConfig, MODEL_STAGE_KEYS, NEW_FIT_KEYS,
+    SHELL_ATLAS_KEYS, config_descriptions, describe_catalog, rebuild_stage,
     unaudited_prefixed_keys)
 from fit_session import run_mutable_config
 
@@ -270,3 +270,45 @@ def test_dt_loss_schedule_is_not_advanced_or_durable_configuration():
     assert "influence_disable_dt_frac" not in catalog["schema"]["fields"]
     with pytest.raises(ValueError, match="Unknown"):
         Config({"influence_disable_dt_frac": 0.75})
+
+
+def test_every_configuration_key_has_a_description_and_none_is_stale():
+    document = json.loads(DESCRIPTIONS_PATH.read_text(encoding="utf-8"))
+    assert set(document) >= {"panel", "config"}
+    known = set(Config().as_dict())
+    described = set(document["config"])
+    assert known - described == set(), "describe new keys in descriptions.json"
+    assert described - known == set(), "remove stale keys from descriptions.json"
+    for section in ("panel", "config"):
+        for key, text in document[section].items():
+            assert isinstance(text, str) and text.strip(), (section, key)
+    catalog = Config.catalog()
+    for section in ("fields", "run_fields"):
+        for key, spec in catalog["schema"][section].items():
+            assert spec["description"] == document["config"][key].strip()
+
+
+def test_catalog_descriptions_are_reread_and_never_required(tmp_path):
+    path = tmp_path / "descriptions.json"
+    path.write_text(json.dumps({"config": {"z_begin": " First slice. ",
+                                           "loss_weight_umbilicus": ""}}))
+    assert config_descriptions(path) == {"z_begin": "First slice."}
+
+    warnings = []
+    path.write_text("{ not json")
+    assert config_descriptions(path, warn=warnings.append) == {}
+    assert config_descriptions(tmp_path / "absent.json",
+                               warn=warnings.append) == {}
+    assert len(warnings) == 2
+
+    # A described catalog is re-described from scratch: removed text does not
+    # linger, and the input catalog is left untouched.
+    catalog = Config.catalog()
+    before = json.dumps(catalog, sort_keys=True)
+    redescribed = describe_catalog(catalog, {"z_begin": "Edited."})
+    assert redescribed["schema"]["run_fields"]["z_begin"]["description"] == "Edited."
+    assert "description" not in redescribed["schema"]["run_fields"]["z_end"]
+    assert all("description" not in spec
+               for spec in redescribed["schema"]["fields"].values())
+    assert redescribed["defaults"] == catalog["defaults"]
+    assert json.dumps(catalog, sort_keys=True) == before
