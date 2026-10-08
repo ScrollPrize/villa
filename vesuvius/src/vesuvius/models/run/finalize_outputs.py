@@ -1,5 +1,6 @@
 import numpy as np
 import os
+import sys
 from dataclasses import dataclass
 from typing import Optional
 from tqdm.auto import tqdm
@@ -216,6 +217,58 @@ def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_clas
     return {'chunk_idx': chunk_idx, 'processed_voxels': np.prod(output_np.shape)}
 
 
+def _drop_absent_chunks(chunk_infos, *, input_path, input_shape, input_chunks, output_chunks, verbose):
+    """Keep only output chunks whose footprint overlaps an existing input chunk.
+
+    Uses the on-disk/S3 chunk-occupancy bitmap of the input array (no data is
+    read). Falls back to the full list when the layout cannot be indexed, so a
+    store with an unexpected key format is still processed correctly.
+    """
+    import contextlib
+    import io
+
+    from vesuvius.data.zarr_chunk_index import build_chunk_occupancy, compute_patch_non_empty_mask
+
+    try:
+        # use_cache=False: the occupancy cache is keyed on .zarray metadata,
+        # which chunk writes never touch, so a cached bitmap would silently
+        # hide chunks added after it was built (a late blend part, a second
+        # bbox blended into the same store). A fresh listing costs seconds
+        # against a run of minutes, and it also keeps this read step from
+        # writing a sidecar into the input store. The helper prints its
+        # progress unconditionally; keep --quiet quiet.
+        with contextlib.redirect_stdout(sys.stdout if verbose else io.StringIO()):
+            occupancy = build_chunk_occupancy(
+                str(input_path),
+                tuple(int(c) for c in input_chunks),
+                tuple(int(s) for s in input_shape),
+                verbose=verbose,
+                use_cache=False,
+                anon=False,
+            )
+    except Exception as exc:  # listing failures must not break finalisation
+        if verbose:
+            print(f"Chunk occupancy unavailable ({exc}); processing every chunk")
+        return chunk_infos
+    if occupancy is None:
+        if verbose:
+            print("Chunk occupancy unavailable; processing every chunk")
+        return chunk_infos
+
+    spatial_out = tuple(int(c) for c in output_chunks[1:])
+    positions = [tuple(int(i) * c for i, c in zip(info['indices'], spatial_out)) for info in chunk_infos]
+    keep = compute_patch_non_empty_mask(
+        occupancy, positions, spatial_out, tuple(int(c) for c in input_chunks[1:])
+    )
+    kept = [info for info, k in zip(chunk_infos, keep) if k]
+    if verbose:
+        print(
+            f"Chunk occupancy: {int(occupancy.sum())} of {occupancy.size} input chunks exist; "
+            f"processing {len(kept)} of {len(chunk_infos)} output chunks"
+        )
+    return kept
+
+
 def finalize_logits(
     input_path: str,
     output_path: str,
@@ -276,6 +329,7 @@ def finalize_logits(
     )
     
     input_shape = input_store.shape
+    input_chunks = input_store.chunks
     num_classes = input_shape[0]
     spatial_shape = input_shape[1:]  # (Z, Y, X)
     
@@ -407,8 +461,23 @@ def finalize_logits(
         
         return chunks_info
 
-    # --- Calculate Z-range for this part ---
+    # --- Skip output chunks that map to nothing in the input ---
+    # A merged logits store is shaped like the whole scroll volume but only
+    # holds chunks where inference ran; a --bbox run leaves the rest absent.
+    # Iterating every chunk position of the full volume (827,640 for a
+    # PHerc1447 volume at 128^3) makes finalising 27 real chunks take hours.
+    # The chunk-occupancy bitmap that vesuvius.predict already uses answers
+    # "does any input chunk exist under this output chunk" without reading
+    # data, so restrict the work to those positions.
     all_chunk_infos = get_chunk_indices(input_shape, output_chunks)
+    all_chunk_infos = _drop_absent_chunks(
+        all_chunk_infos,
+        input_path=input_path,
+        input_shape=input_shape,
+        input_chunks=input_chunks,
+        output_chunks=output_chunks,
+        verbose=verbose,
+    )
 
     if num_parts > 1:
         total_z = spatial_shape[0]  # Z dimension
@@ -474,7 +543,8 @@ def finalize_logits(
                 print(f"Error processing chunk: {e}")
                 raise e
     
-    print(f"\nOutput processing complete. Processed {total_chunks - empty_chunks} chunks, skipped {empty_chunks} empty chunks ({empty_chunks/total_chunks:.2%}).")
+    empty_pct = (empty_chunks / total_chunks) if total_chunks > 0 else 0.0
+    print(f"\nOutput processing complete. Processed {total_chunks - empty_chunks} chunks, skipped {empty_chunks} empty chunks ({empty_pct:.2%}).")
 
     # Only part 0 updates metadata to avoid conflicts
     if part_id == 0:
