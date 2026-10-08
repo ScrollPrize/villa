@@ -7,6 +7,7 @@ tasks (prepare, reduce) to run without loading torch.
 import os
 os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", "0")
 
+import hashlib
 import logging
 import shutil
 import math
@@ -69,8 +70,14 @@ def get_cached_zarr_store(path: str):
         # Create base S3 store using zarr3's FsspecStore
         base_store = FsspecStore(fs=fs, path=s3_path, read_only=True)
 
-        # Configure cache settings from environment variables
-        cache_dir = os.environ.get("ZARR_CACHE_DIR", "./zarr_cache")
+        # Configure cache settings from environment variables.
+        # Cached keys are store-relative (".zarray", "0/0/0/1"), so every source volume
+        # gets its own subdirectory; in a shared directory a second volume would be
+        # served the first volume's metadata and chunks.
+        cache_dir = os.path.join(
+            os.environ.get("ZARR_CACHE_DIR", "./zarr_cache"),
+            hashlib.sha1(path.rstrip("/").encode()).hexdigest()[:12],
+        )
         cache_size_gb = float(os.environ.get("ZARR_CACHE_SIZE_GB", "100"))
         cache_max_age = os.environ.get("ZARR_CACHE_MAX_AGE", "infinity")
 
