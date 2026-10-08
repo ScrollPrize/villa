@@ -105,6 +105,10 @@ def _read_flat_surface(volume, *, y0: int, y1: int, x0: int, x1: int):
     return patch[0]
 
 
+# Distinct patches to try before declaring a native sample impossible (#1482).
+MAX_NATIVE_RESAMPLE_ATTEMPTS = 64
+
+
 class InkDataset(Dataset):
     """Assemble samples using resolved data settings and an optional patch list."""
 
@@ -623,6 +627,14 @@ class InkDataset(Dataset):
         if self.mode == "flat":
             return self._flat_sample(self.patches[requested_index])
         current_index = requested_index
+        # The replacement for an inadmissible patch is a deterministic function
+        # of the current index, so the retry relation is a fixed directed graph
+        # over patch indices. Without a visited set it can walk a cycle of
+        # inadmissible patches forever (n=2: 0 -> 1 -> 0 -> ...) and hang the
+        # DataLoader worker (#1482). Track what was tried, never revisit, and
+        # give up with a clear error after a bounded number of distinct patches.
+        visited = {current_index}
+        max_distinct = min(len(self.patches), MAX_NATIVE_RESAMPLE_ATTEMPTS)
         while True:
             patch = self.patches[current_index]
             sample = self._native_sample(patch)
@@ -633,10 +645,22 @@ class InkDataset(Dataset):
                     "Cannot resample an inadmissible native patch from a dataset "
                     "with one patch"
                 )
+            if len(visited) >= max_distinct:
+                raise RuntimeError(
+                    f"No admissible native crop after trying {len(visited)} distinct "
+                    f"patches for requested idx {requested_index} "
+                    f"(tried {sorted(visited)[:16]}{'...' if len(visited) > 16 else ''}); "
+                    "the dataset's native patches do not fit the volume/mask at this scale"
+                )
             rng = random.Random(self.config.seed + current_index * 7919)
             replacement = current_index
-            while replacement == current_index:
+            for _ in range(32):  # same draws as before, skipping what was tried
                 replacement = rng.randrange(len(self.patches))
+                if replacement not in visited:
+                    break
+            else:
+                remaining = [i for i in range(len(self.patches)) if i not in visited]
+                replacement = remaining[rng.randrange(len(remaining))]
             warnings.warn(
                 "Native patch could not produce an admissible crop for "
                 f"requested idx {requested_index}, patch idx {current_index}; "
@@ -644,4 +668,5 @@ class InkDataset(Dataset):
                 RuntimeWarning,
                 stacklevel=2,
             )
+            visited.add(replacement)
             current_index = replacement
