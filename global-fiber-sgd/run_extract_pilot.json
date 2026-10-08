@@ -1,0 +1,22 @@
+{
+  "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/constraints_v1/runner",
+  "reference_dir": "/home/hendrik/villa2/global-fiber-sgd/data",
+  "input_files": [
+    "/home/hendrik/villa2/global-fiber-sgd/data/Paris4_v1.afv",
+    "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+    "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/inference.json",
+    "/home/hendrik/villa2/global-fiber-sgd/extract_pilot.json",
+    "/home/hendrik/villa2/volume-cartographer/apps/src/FiberConstraintDatabase.cpp",
+    "/home/hendrik/villa2/volume-cartographer/apps/src/FiberAfvConstraintBenchmark.cpp"
+  ],
+  "commands": [
+    {
+      "name": "pilot",
+      "binary": "vc_fiber_trace_chunk",
+      "args": [
+        "afv-constraints",
+        "/home/hendrik/villa2/global-fiber-sgd/extract_pilot.json"
+      ]
+    }
+  ]
+}

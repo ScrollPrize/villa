@@ -22,6 +22,7 @@
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "FiberTraceCli.hpp"
+#include "FiberAfvConstraintBenchmark.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -586,6 +587,7 @@ void usage(const char* executable)
               << "  --partition-length-cost partition overlapping length-based unaries\n"
               << "  --local-no-parallel       omit parallel factors after common event segmentation\n"
               << "  --local-event-spacing N   repeated local event spacing [64]\n"
+              << "  --local-constraint-events-unsplit local certification without cuts or endpoint relaxation\n"
               << "  --local-min-piece-length N minimum clean piece length in base voxels [0]\n"
               << "  --local-parallel-span N   per-side correspondence support [64]\n"
               << "  --max-distance N           closest-pair threshold [128]\n"
@@ -1779,6 +1781,9 @@ Options parse(int argc, char** argv)
             options.partitionLengthCost=true;
         } else if (argument == "--local-constraint-events") {
             options.constraints.localEvents = true;
+        } else if (argument == "--local-constraint-events-unsplit") {
+            options.constraints.localEvents = true;
+            options.constraints.localKeepWholeFibers = true;
         } else if (argument == "--local-no-parallel") {
             options.constraints.localIncludeParallel = false;
         } else if (argument == "--local-event-spacing") {
@@ -5121,6 +5126,9 @@ WindingWeightTuple windingWeights(const Options& options)
 vc::fiber_tracer::FiberTraceConstraintConfig referenceExtractionConfig(const Options& options)
 {
     auto config=options.constraints;
+    // Reference extraction sets preserveInputLinesAsPieces separately, retaining
+    // its established endpoint policy rather than ordinary unsplit certification.
+    config.localKeepWholeFibers=false;
     if(options.referenceMeasurementMode=="auto")return config;
     config.localEvents=options.referenceMeasurementMode=="events";
     config.legacyFinePieces=false;
@@ -8465,6 +8473,8 @@ std::string formatGraphMemoryProfile(
 int main(int argc, char** argv)
 {
     try {
+        if(argc>1 && std::string(argv[1])=="afv-constraints")
+            return runFiberAfvConstraintBenchmark(argc,argv);
         const auto options = parse(argc, argv);
         vc::render::processChunkCacheService()->configureDecodedByteCapacity(options.cacheBytes);
         if(options.mode==Mode::AssembleTiles){

@@ -1,0 +1,22 @@
+{
+  "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/relation_audit_v1/runner",
+  "reference_dir": "/home/hendrik/villa2/global-fiber-sgd/data",
+  "input_files": [
+    "/home/hendrik/villa2/global-fiber-sgd/audit_relations.json"
+  ],
+  "commands": [
+    {
+      "name": "tests",
+      "binary": "test_fiber_trace_winding_bp",
+      "args": []
+    },
+    {
+      "name": "full",
+      "binary": "vc_fiber_trace_chunk",
+      "args": [
+        "afv-constraints",
+        "/home/hendrik/villa2/global-fiber-sgd/audit_relations.json"
+      ]
+    }
+  ]
+}

@@ -1,4 +1,5 @@
 #pragma once
+#include <map>
 
 #include "vc/fiber_tracer/FiberletCropTrace.hpp"
 
@@ -45,6 +46,9 @@ struct FiberTraceConstraintConfig {
     bool enforceMaximumWindingDistance = true;
     bool preserveInputLinesAsPieces = false;
     bool localEvents = false;
+    // Keep certified local events on whole source curves. Unlike
+    // preserveInputLinesAsPieces, this does not relax endpoint certification.
+    bool localKeepWholeFibers = false;
     // Measure on old overlapping pieces, then transfer unchanged observations
     // to nonoverlapping orthogonal-midpoint pieces.
     bool legacyFinePieces = false;
@@ -66,6 +70,11 @@ struct FiberTraceConstraintConfig {
     double localTangentSpanBaseVoxels = 16.0;
     double localParallelSpanBaseVoxels = 64.0;
     double localReciprocalToleranceBaseVoxels = 8.0;
+    bool localParallelReciprocal = false;
+    // Recenter each perpendicular projection window on the current arc point.
+    // False reproduces historical seed-fixed refinement for saved benchmarks.
+    bool localMovingProjectionWindows = true;
+    std::size_t localPerpendicularProjectionIterations = 16;
     double localAngularToleranceDegrees = 30.0;
     double localDistanceTolerance = 0.25;
     std::size_t localRefinementRounds = 2;
@@ -122,6 +131,17 @@ struct FiberTraceConstraint {
 };
 
 struct FiberTraceConstraintReport {
+    // Mutually exclusive first failure; winding overlap counts are conditional
+    // on reaching certification, not independent ablations of all candidates.
+    std::map<std::string,std::size_t> localFailureChecks;
+    // Initial certified relation; seed failures remain unclassified.
+    std::map<std::string,std::map<std::string,std::size_t>> localOutcomesByRelation;
+    std::map<std::string,std::size_t> localWindingFailureOverlap;
+    std::size_t localWindingChecksEvaluated = 0;
+    std::size_t localDeduplicatedCandidates = 0;
+    std::size_t localPerpendicularReciprocalEvaluated = 0;
+    std::size_t localPerpendicularReciprocalWindowFailures = 0;
+    std::size_t localPerpendicularReciprocalEndpointFailures = 0;
     std::size_t localRejectedConsistency = 0;
     std::size_t localRejectedSupport = 0;
     // Extraction-stage counts, before optional external/component owner filtering.

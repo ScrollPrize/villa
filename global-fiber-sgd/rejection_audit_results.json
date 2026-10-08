@@ -1,0 +1,97 @@
+{
+  "attempts": 31940445,
+  "initial_candidates": 30412865,
+  "refinement_candidates": 1527580,
+  "first_failure_checks": [
+    {
+      "check": "central_reciprocal",
+      "count": 8159623,
+      "percent_all_attempts": 25.546366057204274
+    },
+    {
+      "check": "probe_distance",
+      "count": 17589,
+      "percent_all_attempts": 0.0550681119189166
+    },
+    {
+      "check": "probe_endpoint_support",
+      "count": 1043266,
+      "percent_all_attempts": 3.2662851128091672
+    },
+    {
+      "check": "probe_orientation",
+      "count": 257769,
+      "percent_all_attempts": 0.8070300836447332
+    },
+    {
+      "check": "probe_reciprocal",
+      "count": 1973367,
+      "percent_all_attempts": 6.178270215083102
+    },
+    {
+      "check": "probe_tangent_support",
+      "count": 3358,
+      "percent_all_attempts": 0.010513316267196654
+    },
+    {
+      "check": "refined_orientation",
+      "count": 288808,
+      "percent_all_attempts": 0.9042078155141545
+    },
+    {
+      "check": "refined_tangent_support",
+      "count": 1044350,
+      "percent_all_attempts": 3.2696789290193045
+    },
+    {
+      "check": "seed_orientation",
+      "count": 835249,
+      "percent_all_attempts": 2.615019922233394
+    },
+    {
+      "check": "seed_tangent_support",
+      "count": 6367038,
+      "percent_all_attempts": 19.934092965830626
+    },
+    {
+      "check": "winding_category",
+      "count": 874065,
+      "percent_all_attempts": 2.736546093831817
+    },
+    {
+      "check": "winding_cutoff",
+      "count": 958707,
+      "percent_all_attempts": 3.0015455326311202
+    },
+    {
+      "check": "winding_tolerance",
+      "count": 199269,
+      "percent_all_attempts": 0.6238767180607534
+    }
+  ],
+  "overlapping_winding_checks": [
+    {
+      "check": "distance_tolerance",
+      "count": 239700,
+      "percent_all_attempts": 0.7504591748799994,
+      "percent_reaching_winding_check": 4.615397057005642
+    },
+    {
+      "check": "rounded_category",
+      "count": 944847,
+      "percent_all_attempts": 2.9581522737081465,
+      "percent_reaching_winding_check": 18.192924752276216
+    }
+  ],
+  "winding_checks_evaluated": 5193486,
+  "accepted": {
+    "count": 2334188,
+    "percent": 7.307938258217755
+  },
+  "deduplicated": {
+    "count": 7583799,
+    "percent": 23.743560867733684
+  },
+  "all_saved_measurements_unchanged": true,
+  "note": "First-failure geometry attribution, not independent filter ablation. Denominator is candidate attempts, not unique fiber pairs. Winding overlaps count evaluable candidates once per predicate; percentages do not add. Signed checks are not applied."
+}

@@ -358,6 +358,216 @@ TEST_CASE("Certified event support and parallel evidence survive dense crossing 
     }
 }
 
+TEST_CASE("Unsplit local events preserve measurements and strict certification without continuation")
+{
+    using namespace vc::fiber_tracer;
+    std::vector<FiberletCropTraceLine> lines(4);
+    lines[0].pointsBaseXYZ={{0,0,0},{1024,0,0}};
+    lines[1].pointsBaseXYZ={{0,0,20},{1024,0,20}};
+    lines[2].pointsBaseXYZ={{256,-256,10},{256,256,10}};
+    lines[3].pointsBaseXYZ={{512,-256,10},{512,256,10}};
+    FiberTraceConstraintConfig cfg; cfg.localEvents=true; cfg.parallelThreads=2;
+    const auto sample=[](const cv::Vec3d& a,const cv::Vec3d& b,double) {
+        return std::abs(a[2]-b[2])/20.;
+    };
+    const auto split=extractFiberTraceConstraints(lines,cfg,sample);
+    REQUIRE(split.localMidpointCuts>0);
+    cfg.localKeepWholeFibers=true;
+    const auto whole=extractFiberTraceConstraints(lines,cfg,sample);
+    CHECK(whole.pieces.size()==lines.size());
+    CHECK(whole.localMidpointCuts==0);
+    CHECK(whole.hardConstraints==0);
+    CHECK(whole.localRejectedConsistency==split.localRejectedConsistency);
+    CHECK(whole.localRejectedSupport==split.localRejectedSupport);
+    CHECK(whole.localCertifiedEvents==split.localCertifiedEvents);
+    std::vector<const FiberTraceConstraint*> measurements;
+    for(const auto& c:split.constraints)if(!c.hardContinuity)measurements.push_back(&c);
+    REQUIRE(measurements.size()==whole.constraints.size());
+    std::vector<const FiberTraceConstraint*> wholeMeasurements;
+    for(const auto& c:whole.constraints)wholeMeasurements.push_back(&c);
+    const auto order=[](auto& values,const auto& report) {
+        const auto key=[&](const auto* c) {
+            return std::tuple{report.pieces[c->pieceA].traceIndex,report.pieces[c->pieceB].traceIndex,
+                c->arcABaseVoxels,c->arcBBaseVoxels};
+        };
+        std::sort(values.begin(),values.end(),[&](const auto* a,const auto* b){return key(a)<key(b);});
+    };
+    // Piece IDs alter output sorting; compare by stable source/event identity.
+    order(measurements,split);order(wholeMeasurements,whole);
+    for(std::size_t i=0;i<measurements.size();++i) {
+        const auto& a=*measurements[i]; const auto& b=*wholeMeasurements[i];
+        CHECK_FALSE(b.hardContinuity);
+        CHECK(split.pieces[a.pieceA].traceIndex==whole.pieces[b.pieceA].traceIndex);
+        CHECK(split.pieces[a.pieceB].traceIndex==whole.pieces[b.pieceB].traceIndex);
+        CHECK(a.arcABaseVoxels==b.arcABaseVoxels);
+        CHECK(a.arcBBaseVoxels==b.arcBBaseVoxels);
+        CHECK(a.supportABegin==b.supportABegin); CHECK(a.supportAEnd==b.supportAEnd);
+        CHECK(a.supportBBegin==b.supportBBegin); CHECK(a.supportBEnd==b.supportBEnd);
+        CHECK(a.evidenceWeight==b.evidenceWeight);
+        CHECK(a.windingDistance==b.windingDistance);
+        CHECK(a.parallelWindingDistance==b.parallelWindingDistance);
+        CHECK(a.signedWindingDelta==b.signedWindingDelta);
+        CHECK(a.parallelScore==b.parallelScore);
+    }
+    cfg.preserveInputLinesAsPieces=true;
+    CHECK_THROWS_AS(extractFiberTraceConstraints(lines,cfg,sample),std::invalid_argument);
+    cfg.preserveInputLinesAsPieces=false; cfg.localEvents=false;
+    CHECK_THROWS_AS(extractFiberTraceConstraints(lines,cfg,sample),std::invalid_argument);
+}
+
+TEST_CASE("Unsplit local events do not relax insufficient endpoint support")
+{
+    using namespace vc::fiber_tracer;
+    std::vector<FiberletCropTraceLine> lines(2);
+    lines[0].pointsBaseXYZ={{0,0,0},{256,0,0}};
+    lines[1].pointsBaseXYZ={{8,-256,10},{8,256,10}};
+    FiberTraceConstraintConfig cfg; cfg.localEvents=true;
+    cfg.localKeepWholeFibers=true; cfg.parallelThreads=2;
+    const auto result=extractFiberTraceConstraints(lines,cfg,
+        [](const cv::Vec3d&,const cv::Vec3d&,double){return .5;});
+    CHECK(result.pieces.size()==2);
+    CHECK(result.constraints.empty());
+    CHECK(result.localRejectedConsistency>0);
+    std::size_t audited=0;
+    for(const auto& [reason,count]:result.localFailureChecks)audited+=count;
+    CHECK(audited==result.localRejectedConsistency);
+    CHECK(audited+result.localDeduplicatedCandidates==result.measuredCandidates+result.localRefinedCandidates);
+}
+
+TEST_CASE("Parallel local events no longer require reciprocal projections")
+{
+    using namespace vc::fiber_tracer;
+    std::vector<FiberletCropTraceLine> lines(2);
+    lines[0].pointsBaseXYZ={{0,0,0},{1024,0,0}};
+    lines[1].pointsBaseXYZ={{0,20,0},{1024,250,0}};
+    FiberTraceConstraintConfig cfg;cfg.localEvents=true;cfg.localKeepWholeFibers=true;
+    const auto sampler=[](const cv::Vec3d&,const cv::Vec3d&,double){return .1;};
+    const auto current=extractFiberTraceConstraints(lines,cfg,sampler);
+    CHECK(current.localFailureChecks.count("central_reciprocal")==0);
+    CHECK(current.localFailureChecks.count("probe_reciprocal")==0);
+    CHECK(current.localPerpendicularReciprocalEvaluated==0);
+    cfg.localMovingProjectionWindows=false;
+    const auto fixed=extractFiberTraceConstraints(lines,cfg,sampler);
+    REQUIRE(fixed.constraints.size()==current.constraints.size());
+    for(std::size_t i=0;i<current.constraints.size();++i) {
+        CHECK(fixed.constraints[i].arcABaseVoxels==current.constraints[i].arcABaseVoxels);
+        CHECK(fixed.constraints[i].arcBBaseVoxels==current.constraints[i].arcBBaseVoxels);
+        CHECK(fixed.constraints[i].windingDistance==current.constraints[i].windingDistance);
+    }
+    cfg.localParallelReciprocal=true;
+    const auto legacy=extractFiberTraceConstraints(lines,cfg,sampler);
+    CHECK(legacy.localFailureChecks.count("central_reciprocal")>0);
+    cfg.localPerpendicularProjectionIterations=0;
+    CHECK_THROWS_AS(extractFiberTraceConstraints(lines,cfg,sampler),std::invalid_argument);
+}
+
+TEST_CASE("Perpendicular refinement follows current windows past seed limits")
+{
+    using namespace vc::fiber_tracer;
+    std::vector<FiberletCropTraceLine> lines(2);
+    lines[0].pointsBaseXYZ={{0,0,0},{1024,0,0}};
+    // Offset crossing from the64-voxel sample grid: seed384 is116voxels away,
+    // inside the128radius but outside its64projection window.
+    lines[1].pointsBaseXYZ={{500,-500,10},{500,524,10}};
+    FiberTraceConstraintConfig cfg;cfg.localEvents=true;cfg.localKeepWholeFibers=true;
+    cfg.localRefinementRounds=0;
+    const auto sampler=[](const cv::Vec3d&,const cv::Vec3d&,double){return .5;};
+    const auto failures=[](const auto& r) {
+        auto it=r.localFailureChecks.find("central_reciprocal");
+        return it==r.localFailureChecks.end()?std::size_t{0}:it->second;
+    };
+    cfg.localMovingProjectionWindows=false;
+    const auto fixed=extractFiberTraceConstraints(lines,cfg,sampler);
+    REQUIRE(failures(fixed)>0);
+    cfg.localMovingProjectionWindows=true;
+    cfg.localPerpendicularProjectionIterations=1;
+    const auto one=extractFiberTraceConstraints(lines,cfg,sampler);
+    REQUIRE(failures(one)>0);
+    cfg.localPerpendicularProjectionIterations=16;
+    for(int order=0;order<2;++order) {
+        const auto moving=extractFiberTraceConstraints(lines,cfg,sampler);
+        REQUIRE_FALSE(moving.constraints.empty());
+        CHECK(failures(moving)==0);
+        for(const auto& c:moving.constraints) {
+            CHECK(std::abs(c.pointABaseXYZ[0]-500.)<1e-6);
+            CHECK(std::abs(c.pointBBaseXYZ[0]-500.)<1e-6);
+            CHECK(std::abs(c.pointABaseXYZ[1])<1e-6);
+            CHECK(std::abs(c.pointBBaseXYZ[1])<1e-6);
+        }
+        std::swap(lines[0],lines[1]);
+    }
+}
+
+TEST_CASE("Raw local extraction keeps continuous high and variable winding measurements")
+{
+    using namespace vc::fiber_tracer;
+    for(bool parallel:{false,true}) {
+        std::vector<FiberletCropTraceLine> lines(2);
+        lines[0].pointsBaseXYZ={{0,0,0},{1024,0,0}};
+        lines[1].pointsBaseXYZ=parallel ? std::vector<cv::Vec3d>{{0,0,20},{1024,0,20}}
+            : std::vector<cv::Vec3d>{{512,-512,20},{512,512,20}};
+        FiberTraceConstraintConfig cfg;cfg.localEvents=true;cfg.localKeepWholeFibers=true;
+        cfg.certifyWinding=false;cfg.enforceMaximumWindingDistance=false;
+        cfg.closestParallelEstimator=false;
+        const auto sampler=[](const cv::Vec3d& a,const cv::Vec3d& b,double) {
+            return std::abs(a[0]-512.)<1e-6 && std::abs(a[1])<1e-6 &&
+                std::abs(b[0]-512.)<1e-6 && std::abs(b[1])<1e-6 ? .125 : 2.125;
+        };
+        const auto raw=extractFiberTraceConstraints(lines,cfg,sampler);
+        REQUIRE_FALSE(raw.constraints.empty());
+        bool found=false;
+        for(const auto& c:raw.constraints)if(c.windingDistance==.125) {
+            found=true;CHECK(c.parallelWindingDistance==2.125);
+        }
+        CHECK(found);
+        CHECK(raw.localWindingChecksEvaluated==0);
+        std::size_t ledger=0,accepted=0,deduplicated=0;
+        for(const auto& [type,outcomes]:raw.localOutcomesByRelation) {
+            for(const auto& [outcome,count]:outcomes) {
+                ledger+=count;
+                if(outcome=="accepted")accepted+=count;
+                if(outcome=="deduplicated")deduplicated+=count;
+                if(type=="unclassified")CHECK((outcome=="seed_tangent_support" || outcome=="seed_orientation"));
+            }
+        }
+        CHECK(ledger==raw.measuredCandidates+raw.localRefinedCandidates);
+        CHECK(accepted==raw.constraints.size());
+        CHECK(deduplicated==raw.localDeduplicatedCandidates);
+        CHECK(raw.localOutcomesByRelation.at(parallel?"parallel":"perpendicular").at("accepted")==raw.constraints.size());
+        CHECK(raw.localFailureChecks.count("winding_category")==0);
+        CHECK(raw.localFailureChecks.count("winding_tolerance")==0);
+        CHECK(raw.localFailureChecks.count("winding_cutoff")==0);
+        const auto huge=extractFiberTraceConstraints(lines,cfg,
+            [](const cv::Vec3d&,const cv::Vec3d&,double){return 1e30;});
+        REQUIRE_FALSE(huge.constraints.empty());
+        for(const auto& c:huge.constraints)CHECK(c.parallelWindingDistance==1e30);
+        const auto invalid=extractFiberTraceConstraints(lines,cfg,
+            [&](const cv::Vec3d& a,const cv::Vec3d& b,double h){
+                return sampler(a,b,h)==.125 ? .125 : std::numeric_limits<double>::quiet_NaN();
+            });
+        CHECK(invalid.constraints.empty());
+        CHECK(invalid.localFailureChecks.count("winding_invalid_probe")>0);
+        cfg.certifyWinding=true;
+        const auto filtered=extractFiberTraceConstraints(lines,cfg,sampler);
+        CHECK(filtered.localFailureChecks.count("winding_tolerance")>0);
+    }
+}
+
+TEST_CASE("Rejection diagnostics do not round huge tolerance-rejected probe values")
+{
+    using namespace vc::fiber_tracer;
+    std::vector<FiberletCropTraceLine> lines(2);
+    lines[0].pointsBaseXYZ={{-256,0,0},{256,0,0}};
+    lines[1].pointsBaseXYZ={{0,-256,10},{0,256,10}};
+    FiberTraceConstraintConfig cfg;cfg.localEvents=true;cfg.localKeepWholeFibers=true;
+    const auto result=extractFiberTraceConstraints(lines,cfg,
+        [](const cv::Vec3d& a,const cv::Vec3d& b,double) {
+            return std::abs(a[0]-b[0])+std::abs(a[1]-b[1])<1e-6 ? .5 : 1e30;
+        });
+    CHECK(result.constraints.empty());
+    CHECK(result.localWindingFailureOverlap.count("category_not_evaluable")>0);
+}
+
 TEST_CASE("Reference event ownership remaps full-source evidence without recertifying short pieces")
 {
     using namespace vc::fiber_tracer;

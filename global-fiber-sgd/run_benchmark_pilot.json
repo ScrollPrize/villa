@@ -1,0 +1,26 @@
+{
+  "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/benchmark_v1/runner",
+  "reference_dir": "/home/hendrik/villa2/global-fiber-sgd/data",
+  "input_files": [
+    "/home/hendrik/villa2/global-fiber-sgd/data/Paris4_v1.afv",
+    "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+    "/home/hendrik/villa2/global-fiber-sgd/benchmark_pilot.json"
+  ],
+  "commands": [
+    {
+      "name": "unsplit_tests",
+      "binary": "test_fiber_trace_winding_bp",
+      "args": [
+        "--test-case=*Unsplit*,*Certified event*,*Local parallel*,*Local events*"
+      ]
+    },
+    {
+      "name": "pilot256",
+      "binary": "vc_fiber_trace_chunk",
+      "args": [
+        "afv-constraints",
+        "/home/hendrik/villa2/global-fiber-sgd/benchmark_pilot.json"
+      ]
+    }
+  ]
+}

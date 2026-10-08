@@ -13,7 +13,8 @@ distance callbacks, optional pair filtering, and an aligned normal field. It
 returns piece geometry plus explicit pair observations (`FiberTraceConstraintReport`).
 The extractor does not require the fibers to have been produced by the fiberlet
 tracer, or to carry known H/V labels. The AFV reader can therefore feed it via a
-small adapter; that adapter is not implemented by this merge.
+small adapter. The subsequent `vc_fiber_trace_chunk afv-constraints CONFIG.json`
+benchmark adapter now uses this interface directly.
 
 The Lasagna inputs are **sheet normals** (`nx`, `ny`) and `grad_mag` winding
 density, not the fiber-tangent `nx`/`ny` channels in the AFV's inference provenance.
@@ -32,6 +33,12 @@ There are two deliberately retained extraction modes, not two separate copies:
 | --- | --- | --- |
 | Legacy (default) | Closest sampled encounter per piece pair, soft parallel/orthogonal scores | Nominal 512-base-voxel pieces, 128 overlap |
 | Local events (opt-in) | Repeated localized encounters, side-consistency certification | Clean cuts between consecutive orthogonal events; no overlap by default |
+| Unsplit local events (opt-in) | Same strict localized measurements and certification | One whole piece per source; no cuts or continuation links |
+
+The new mode is `localKeepWholeFibers` in the shared config, or
+`--local-constraint-events-unsplit` in the chunk CLI. It must not be confused
+with `preserveInputLinesAsPieces`, which also permits weaker endpoint support.
+Existing defaults are unchanged. The AFV benchmark uses unsplit local events.
 
 Header defaults (individual benchmark configs can override): resampling32,
 candidate distance128, tangent window32 and integration step8 base voxels;
@@ -50,13 +57,33 @@ orthogonal distance uses the encounter connector.
 Local mode compares before/after tangents independently on each source curve.
 All available side combinations must agree: parallel within30degrees or
 orthogonal within30degrees of90. Ambiguous encounters are rejected. Bounded
-closest-point refinement and reciprocal projection checks improve localization.
+closest-point refinement improves localization. Current local defaults disable
+reciprocal checks for parallel encounters (central and probes); perpendicular
+encounters retain the central reciprocal check. `localParallelReciprocal=true`
+restores parallel reciprocal checks. `localPerpendicularProjectionIterations`
+controls the alternating-projection count (default16). Perpendicular windows now
+move with the current points: project A onto B around current B, then updated B
+onto A around current A. `localMovingProjectionWindows=false` restores original
+seed-fixed windows. Parallel correspondence remains seed-fixed. Endpoint bounds
+and support checks still apply. Finite iterations/local projection do not promise
+a global closest pair; the final reciprocal check currently checks A only.
+The AFV adapter exposes `moving_projection_windows`, recorded in output settings.
 Parallel events walk correspondence in both directions; orthogonal events probe
-each trace independently around the crossing. The probes must agree on distance
+each trace independently around the crossing. In historical certified processing,
+the probes must agree on distance
 within0.25windings, its rounded category (integer grid for parallel, half grid for
 orthogonal), and signed order where applicable. Ordinary extraction requires
 full side support; preserve-input/reference paths explicitly permit available
-one-sided endpoint support. Repeated parallel evidence is normalized by the
+one-sided endpoint support. The AFV extraction adapter now defaults to continuous
+measurement mode: `certify_winding=false`, `enforce_maximum_winding=false`,
+`closest_parallel_estimator=false`. It skips variation/category/sign certification
+and the1.5winding cutoff, retains central `windingDistance` and median
+`parallelWindingDistance` separately, and does not round categories even for
+adaptive candidate refinement (geometry validity/type transitions only).
+Invalid central/probe samples still reject the observation. Geometric probe
+distance/support/orientation guards remain. These adapter defaults do not change
+the shared BP solver's processing defaults; historical AFV configs explicitly
+enable their original processing flags. Repeated parallel evidence is normalized by the
 represented arc interval, so denser sampling does not simply multiply its weight.
 In local mode the default closest-distance estimator uses the base encounter's
 distance for the final parallel measurement; the other probes certify consistency
@@ -137,3 +164,7 @@ requires separate approval, and later build requirements remain unverified.
 Benchmark-support tests:
 `/home/hendrik/.venv_las/bin/python -m pytest -q volume-cartographer/scripts/tests/test_plot_fiber_benchmarks.py volume-cartographer/scripts/tests/test_crop_fiber_jsons.py`
 —12passed. This does not replace the blocked native BP/constraint tests.
+
+Follow-up after the user installed SQLite development files: native rebuild
+succeeded (RelWithDebInfo/GCC13), and the native suite passed 137 cases,
+including unchanged measurement/support/weight checks for the unsplit mode.

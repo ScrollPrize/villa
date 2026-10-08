@@ -1,0 +1,25 @@
+{
+  "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/rejection_audit_v1/runner/guard_validation",
+  "reference_dir": "/home/hendrik/villa2/global-fiber-sgd/data",
+  "input_files": [
+    "/home/hendrik/villa2/global-fiber-sgd/audit_pilot.json",
+    "/home/hendrik/villa2/global-fiber-sgd/audit_full.json",
+    "/home/hendrik/villa2/volume-cartographer/apps/src/FiberAfvConstraintBenchmark.cpp",
+    "/home/hendrik/villa2/volume-cartographer/apps/src/FiberConstraintDatabase.cpp"
+  ],
+  "commands": [
+    {
+      "name": "tests",
+      "binary": "test_fiber_trace_winding_bp",
+      "args": []
+    },
+    {
+      "name": "pilot",
+      "binary": "vc_fiber_trace_chunk",
+      "args": [
+        "afv-constraints",
+        "/home/hendrik/villa2/global-fiber-sgd/audit_pilot.json"
+      ]
+    }
+  ]
+}

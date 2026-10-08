@@ -75,7 +75,17 @@ struct ScoredCandidate {
     RejectReason rejection = RejectReason::None;
     PairCandidate candidate;
     std::size_t legacyConnectorCount = 0;
+    const char* failureCheck = nullptr;
+    bool perpendicularReciprocalEvaluated = false;
+    bool perpendicularReciprocalWindowFailure = false;
+    bool perpendicularReciprocalEndpointFailure = false;
+    int initialLocalRelation = 0;
 };
+
+const char* localRelationName(int kind)
+{
+    return kind==1 ? "parallel" : kind==2 ? "perpendicular" : "unclassified";
+}
 
 struct SignedWindingSample {
     double value = 0.0;
@@ -199,6 +209,11 @@ void validateConfig(const FiberTraceConstraintConfig& config)
         config.maximumWindingDistance > 0.0;
     if (!valid)
         throw std::invalid_argument("Fiber trace constraint configuration is invalid");
+    if (config.localKeepWholeFibers && (!config.localEvents ||
+        config.preserveInputLinesAsPieces || config.localOverlapPieces ||
+        config.localOnePerPair || config.localReplicateOverlap ||
+        !config.extraPieceCutsBaseVoxels.empty()))
+        throw std::invalid_argument("Unsplit local events require ordinary local certification and no ownership overrides");
     if(!std::isfinite(config.orthogonalProbeSpan) || config.orthogonalProbeSpan<0. ||
        !std::isfinite(config.orthogonalProbeBlend) || config.orthogonalProbeBlend<0. || config.orthogonalProbeBlend>1. ||
        (config.orthogonalProbeSpan>0. && (config.localEvents || config.localScorerOnly)))
@@ -220,7 +235,8 @@ void validateConfig(const FiberTraceConstraintConfig& config)
          !(config.localReciprocalToleranceBaseVoxels > 0.) || !std::isfinite(config.localReciprocalToleranceBaseVoxels) ||
          !(config.localAngularToleranceDegrees > 0. && config.localAngularToleranceDegrees < 45.) ||
          !(config.localDistanceTolerance > 0.) || !std::isfinite(config.localDistanceTolerance) ||
-         config.localRefinementRounds > 4 || !config.extraPieceCutsBaseVoxels.empty()))
+         config.localRefinementRounds > 4 || config.localPerpendicularProjectionIterations<1 ||
+         config.localPerpendicularProjectionIterations>256 || !config.extraPieceCutsBaseVoxels.empty()))
         throw std::invalid_argument("Invalid local constraint event configuration");
 }
 
@@ -520,12 +536,19 @@ ScoredCandidate scoreLocalCandidate(
     const double reach = config.localParallelSpanBaseVoxels;
     const double cosine = std::cos(config.localAngularToleranceDegrees * std::acos(-1.) / 180.);
     const double sine = std::sin(config.localAngularToleranceDegrees * std::acos(-1.) / 180.);
-    auto failure = [&]() {
+    bool perpendicularReciprocalEvaluated=false,perpendicularReciprocalWindowFailure=false,perpendicularReciprocalEndpointFailure=false;
+    int kind=0;
+    auto failure = [&](const char* check) {
         ScoredCandidate result;
         result.rejection = RejectReason::Consistency;
         result.candidate = candidate;
         result.candidate.arcA = a;
         result.candidate.arcB = b;
+        result.failureCheck = check;
+        result.initialLocalRelation=kind;
+        result.perpendicularReciprocalEvaluated=perpendicularReciprocalEvaluated;
+        result.perpendicularReciprocalWindowFailure=perpendicularReciprocalWindowFailure;
+        result.perpendicularReciprocalEndpointFailure=perpendicularReciprocalEndpointFailure;
         return result;
     };
     const auto tangent = [&](const auto& g, double arc, int side) -> std::optional<cv::Vec3d> {
@@ -535,12 +558,15 @@ ScoredCandidate scoreLocalCandidate(
         if (length(t) <= kEpsilon) return std::nullopt;
         return t;
     };
+    bool missingTangent=false;
     const auto relation = [&](double aa, double bb) {
+        missingTangent=false;
         bool parallel = true, orthogonal = true;
         int valid=0;
         for (int sa : {-1,1}) for (int sb : {-1,1}) {
             const auto ta = tangent(ga, aa, sa), tb = tangent(gb, bb, sb);
             if (!ta || !tb) {
+                missingTangent=true;
                 if(config.preserveInputLinesAsPieces) continue;
                 return 0;
             }
@@ -551,26 +577,41 @@ ScoredCandidate scoreLocalCandidate(
         }
         return valid==0 ? 0 : parallel ? 1 : orthogonal ? 2 : 0;
     };
-    int kind = relation(a,b);
-    if (kind == 0) return failure();
+    kind = relation(a,b);
+    if (kind == 0) return failure(missingTangent?"seed_tangent_support":"seed_orientation");
     const double seedA = a, seedB = b;
+    double windowA = seedA, windowB = seedB;
     // Alternating bounded projection refines orthogonal encounters. Parallel
     // events keep their A arc: sliding both points would erase repeated samples.
-    for (int i=0; i<4; ++i) {
+    const auto iterations=kind==2 ? config.localPerpendicularProjectionIterations : 4;
+    for (std::size_t i=0; i<iterations; ++i) {
+        if (kind == 2 && config.localMovingProjectionWindows) {
+            windowA = a;
+            windowB = b;
+        }
         b = projectPointToPolylineArc(gb, samplePolylineArc(ga,a).point,
-            std::max(0.,seedB-reach), std::min(gb.length(),seedB+reach)).arc;
+            std::max(0.,windowB-reach), std::min(gb.length(),windowB+reach)).arc;
         if (kind == 2)
             a = projectPointToPolylineArc(ga, samplePolylineArc(gb,b).point,
-                std::max(0.,seedA-reach), std::min(ga.length(),seedA+reach)).arc;
+                std::max(0.,windowA-reach), std::min(ga.length(),windowA+reach)).arc;
     }
-    if (relation(a,b) != kind) return failure();
+    if (relation(a,b) != kind) return failure(missingTangent?"refined_tangent_support":"refined_orientation");
     if(config.localScorerOnly && (a<pa.beginArcBaseVoxels || a>pa.endArcBaseVoxels ||
-                                 b<pb.beginArcBaseVoxels || b>pb.endArcBaseVoxels))return failure();
+                                 b<pb.beginArcBaseVoxels || b>pb.endArcBaseVoxels))return failure("piece_bounds");
     const auto pointA=samplePolylineArc(ga,a).point, pointB=samplePolylineArc(gb,b).point;
-    if (length(pointB-pointA) > config.maximumDistanceBaseVoxels) return failure();
-    const auto reciprocal = projectPointToPolylineArc(ga, pointB,
-        std::max(0.,a-reach), std::min(ga.length(),a+reach));
-    if (std::abs(reciprocal.arc-a) > config.localReciprocalToleranceBaseVoxels) return failure();
+    if (length(pointB-pointA) > config.maximumDistanceBaseVoxels) return failure("central_distance");
+    if(kind==2 || config.localParallelReciprocal) {
+        perpendicularReciprocalEvaluated=kind==2;
+        const auto reciprocal = projectPointToPolylineArc(ga, pointB,
+            std::max(0.,a-reach), std::min(ga.length(),a+reach));
+        if (std::abs(reciprocal.arc-a) > config.localReciprocalToleranceBaseVoxels) {
+            const auto atBound=[](double x,double low,double high){return std::min(std::abs(x-low),std::abs(x-high))<1e-6;};
+            perpendicularReciprocalWindowFailure=kind==2 &&
+                (atBound(a,windowA-reach,windowA+reach) || atBound(b,windowB-reach,windowB+reach));
+            perpendicularReciprocalEndpointFailure=kind==2 && (atBound(a,0.,ga.length()) || atBound(b,0.,gb.length()));
+            return failure("central_reciprocal");
+        }
+    }
     const auto ta=tangent(ga,a,1).has_value()?tangent(ga,a,1):tangent(ga,a,-1);
     const auto tb=tangent(gb,b,1).has_value()?tangent(gb,b,1):tangent(gb,b,-1);
     const int orientation = ta->dot(*tb) < 0. ? -1 : 1;
@@ -584,6 +625,8 @@ ScoredCandidate scoreLocalCandidate(
     c.supportABegin=std::max(0.,a-h); c.supportAEnd=std::min(ga.length(),a+h);
     c.supportBBegin=std::max(0.,b-h); c.supportBEnd=std::min(gb.length(),b+h);
     ScoredCandidate result;
+    result.perpendicularReciprocalEvaluated=perpendicularReciprocalEvaluated;
+    result.initialLocalRelation=kind;
     result.parallelConnectors.emplace_back(pointA,pointB);
     // Both halves independently certify the same base-point relationship.
     // Orthogonal connectors use shorter probes, parallel connectors longer walks.
@@ -593,7 +636,7 @@ ScoredCandidate scoreLocalCandidate(
         const bool fitsA=a+side*span-h>=0. && a+side*span+h<=ga.length();
         const bool fitsB=b+orientation*side*span-h>=0. && b+orientation*side*span+h<=gb.length();
         if(!fitsA || !fitsB) {
-            if(!config.preserveInputLinesAsPieces) return failure();
+            if(!config.preserveInputLinesAsPieces) return failure("probe_endpoint_support");
             if(kind==1 || (!fitsA && !fitsB))continue;
         }
         double previousB=b;
@@ -604,34 +647,37 @@ ScoredCandidate scoreLocalCandidate(
             if (kind==1) {
                 bb=projectPointToPolylineArc(gb,samplePolylineArc(ga,aa).point,
                     std::max(0.,nominalB-h),std::min(gb.length(),nominalB+h)).arc;
-                if (orientation*side*(bb-previousB)<=0. || relation(aa,bb)!=1) return failure();
-                const auto back=projectPointToPolylineArc(ga,samplePolylineArc(gb,bb).point,
-                    std::max(0.,aa-h),std::min(ga.length(),aa+h));
-                if (std::abs(back.arc-aa)>config.localReciprocalToleranceBaseVoxels) return failure();
+                if (orientation*side*(bb-previousB)<=0.) return failure("parallel_monotonicity");
+                if (relation(aa,bb)!=1) return failure(missingTangent?"probe_tangent_support":"probe_orientation");
+                if(config.localParallelReciprocal) {
+                    const auto back=projectPointToPolylineArc(ga,samplePolylineArc(gb,bb).point,
+                        std::max(0.,aa-h),std::min(ga.length(),aa+h));
+                    if (std::abs(back.arc-aa)>config.localReciprocalToleranceBaseVoxels) return failure("probe_reciprocal");
+                }
                 previousB=bb;
             } else {
                 // Probe each trace independently around a localized crossing;
                 // moving both does not define parallel correspondence here.
                 bb=b;
-                if ((fitsA && relation(aa,b)!=2) || (fitsB && relation(a,nominalB)!=2)) return failure();
+                if ((fitsA && relation(aa,b)!=2) || (fitsB && relation(a,nominalB)!=2)) return failure(missingTangent?"probe_tangent_support":"probe_orientation");
             }
             if(fitsA) {
                 const auto qa=samplePolylineArc(ga,aa).point, qb=samplePolylineArc(gb,bb).point;
-                if (length(qb-qa)>config.maximumDistanceBaseVoxels) return failure();
+                if (length(qb-qa)>config.maximumDistanceBaseVoxels) return failure("probe_distance");
                 result.parallelConnectors.emplace_back(qa,qb);
                 c.supportABegin=std::min(c.supportABegin,aa-h); c.supportAEnd=std::max(c.supportAEnd,aa+h);
                 c.supportBBegin=std::min(c.supportBBegin,std::max(0.,bb-h)); c.supportBEnd=std::max(c.supportBEnd,std::min(gb.length(),bb+h));
             }
             if(kind==2 && fitsB) {
                 const auto probe=orthogonalProbeConnector(ga,gb,a,nominalB);
-                if(length(probe.second-probe.first)>config.maximumDistanceBaseVoxels) return failure();
+                if(length(probe.second-probe.first)>config.maximumDistanceBaseVoxels) return failure("probe_distance");
                 result.parallelConnectors.push_back(probe);
                 c.supportBBegin=std::min(c.supportBBegin,nominalB-h); c.supportBEnd=std::max(c.supportBEnd,nominalB+h);
             }
         }
         certifiedA+=fitsA; certifiedB+=fitsB;
     }
-    if(!certifiedA || !certifiedB)return failure();
+    if(!certifiedA || !certifiedB)return failure("probe_endpoint_support");
     c.parallelCorrespondenceSamples=result.parallelConnectors.size();
     result.constraint=c;
     result.candidate=candidate; result.candidate.arcA=a; result.candidate.arcB=b;
@@ -901,7 +947,7 @@ ScoredCandidate scoreCandidate(
     };
 }
 
-void deduplicateLocalEvents(std::vector<ScoredCandidate>& scored)
+void deduplicateLocalEvents(std::vector<ScoredCandidate>& scored, FiberTraceConstraintReport& report)
 {
     // Projection can discover the same encounter from several nearby seeds.
     // Quantization is ONLY an index: test actual arc distances in adjacent bins.
@@ -925,7 +971,10 @@ void deduplicateLocalEvents(std::vector<ScoredCandidate>& scored)
                    std::abs(c.arcBBaseVoxels-other.arcBBaseVoxels)<=tolerance) duplicate=true;
             }
         }
-        if(duplicate) continue;
+        if(duplicate) {
+            ++report.localOutcomesByRelation[localRelationName(s.initialLocalRelation)]["deduplicated"];
+            continue;
+        }
         cells[{c.pieceA,c.pieceB,a,b}].push_back(unique.size());
         unique.push_back(std::move(s));
     }
@@ -967,7 +1016,8 @@ void measureCandidates(
     std::vector<ScoredCandidate>& scored, const FiberTraceConstraintConfig& config,
     const FiberTraceWindingDistance& windingDistance,
     const FiberTraceWindingDistanceBatch& windingDistanceBatch,
-    const LasagnaNormalAlignmentField* alignedNormals, int workers)
+    const LasagnaNormalAlignmentField* alignedNormals, int workers,
+    FiberTraceConstraintReport* audit)
 {
     std::vector<std::size_t> acceptedIndices;
     std::vector<std::size_t> connectorOffsets;
@@ -1030,6 +1080,7 @@ void measureCandidates(
         const std::size_t end = result.legacyConnectorCount ? begin+result.legacyConnectorCount : allEnd;
         const double closestWinding = windings[begin];
         if (!std::isfinite(closestWinding)) {
+            result.failureCheck="invalid_central_winding";
             result.constraint.reset();
             result.rejection = RejectReason::Winding;
             continue;
@@ -1041,7 +1092,15 @@ void measureCandidates(
             if (std::isfinite(windings[sample]))
                 parallelWindings.push_back(windings[sample]);
         }
+        if (config.certifyWinding==false && (config.localEvents || config.localScorerOnly) &&
+            parallelWindings.size()!=end-begin) {
+            result.failureCheck="winding_invalid_probe";
+            result.constraint.reset();
+            result.rejection=RejectReason::Winding;
+            continue;
+        }
         if (parallelWindings.empty()) {
+            result.failureCheck="invalid_all_windings";
             result.constraint.reset();
             result.rejection = RejectReason::Winding;
             continue;
@@ -1087,20 +1146,41 @@ void measureCandidates(
             const auto& c = *result.constraint;
             const double step = c.parallelScore > c.perpendicularScore ? 1.0 : 0.5;
             bool consistent = true;
+            unsigned failures=0;
+            if(audit)++audit->localWindingChecksEvaluated;
             for (std::size_t sample = begin; sample < end; ++sample) {
-                if (!std::isfinite(windings[sample]) ||
-                    std::abs(windings[sample] - closestWinding) > config.localDistanceTolerance ||
-                    std::llround(windings[sample] / step) != std::llround(closestWinding / step)) {
+                const bool invalid=!std::isfinite(windings[sample]);
+                const bool tolerance=!invalid && std::abs(windings[sample]-closestWinding)>config.localDistanceTolerance;
+                const auto roundable=[](double value) {
+                    return value>static_cast<double>(std::numeric_limits<long long>::lowest()) &&
+                        value<static_cast<double>(std::numeric_limits<long long>::max());
+                };
+                const bool categoryEvaluable=!invalid && roundable(windings[sample]/step) && roundable(closestWinding/step);
+                // Diagnostics examine probes which the original tolerance test
+                // short-circuited. Never round out-of-range callback values.
+                if(!invalid && !categoryEvaluable && !tolerance)
+                    throw std::invalid_argument("Winding category exceeds integer range");
+                const bool category=categoryEvaluable && std::llround(windings[sample]/step)!=std::llround(closestWinding/step);
+                failures|=(!invalid && !categoryEvaluable)?16:0;
+                failures|=invalid?1:0; failures|=tolerance?2:0; failures|=category?4:0;
+                if (invalid || tolerance || category) {
+                    if(consistent)result.failureCheck=invalid?"winding_invalid_probe":tolerance?"winding_tolerance":"winding_category";
                     consistent = false;
-                    break;
                 }
-                if (alignedNormals != nullptr && closestWinding > config.localDistanceTolerance) {
+                if (!invalid && alignedNormals != nullptr && closestWinding > config.localDistanceTolerance) {
                     const auto value = signedWindingSample(connectors[sample], windings[sample], *alignedNormals);
                     if (!value || !c.signedWindingDelta ||
                         value->component != c.windingNormalComponent ||
-                        std::signbit(value->value) != std::signbit(*c.signedWindingDelta))
+                        std::signbit(value->value) != std::signbit(*c.signedWindingDelta)) {
+                        failures|=8;
+                        if(consistent)result.failureCheck="winding_sign";
                         consistent = false;
+                    }
                 }
+            }
+            if(audit) {
+                const char* names[]={"invalid_probe","distance_tolerance","rounded_category","sign","category_not_evaluable"};
+                for(unsigned bit=0;bit<5;++bit)if(failures&(1u<<bit))++audit->localWindingFailureOverlap[names[bit]];
             }
             if (!consistent) {
                 result.constraint.reset();
@@ -1121,6 +1201,7 @@ void measureCandidates(
                config.maximumWindingDistance))) {
             result.constraint.reset();
             result.rejection = RejectReason::WindingCutoff;
+            result.failureCheck="winding_cutoff";
         }
         // Adapt only after old acceptance and all old parallel estimators.
         // Complete two-sided support is required; missing/invalid probes keep
@@ -1209,7 +1290,7 @@ void splitLocalEvents(FiberTraceConstraintReport& report,
         }
     }
     std::vector<std::vector<std::size_t>> piecesByTrace(geometries.size());
-    if(!config.preserveInputLinesAsPieces) {
+    if(!config.preserveInputLinesAsPieces && !config.localKeepWholeFibers) {
         report.pieces.clear(); report.resampledPoints=0;
         for(std::size_t t=0;t<geometries.size();++t) {
             if(!geometries[t]) continue;
@@ -1539,6 +1620,11 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
         if (failure)
             std::rethrow_exception(failure);
     }
+    for(const auto& s:scored) {
+        report.localPerpendicularReciprocalEvaluated+=s.perpendicularReciprocalEvaluated;
+        report.localPerpendicularReciprocalWindowFailures+=s.perpendicularReciprocalWindowFailure;
+        report.localPerpendicularReciprocalEndpointFailures+=s.perpendicularReciprocalEndpointFailure;
+    }
     if(config.binaryOrientationScore)for(auto& s:scored)if(s.constraint) {
         const bool parallel=s.constraint->parallelScore>s.constraint->perpendicularScore;
         s.constraint->parallelScore=parallel?1.:0.;
@@ -1560,8 +1646,11 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
         std::chrono::steady_clock::now() - scoreStarted).count();
 
     const auto windingStarted = std::chrono::steady_clock::now();
-    if(config.localEvents) deduplicateLocalEvents(scored);
-    measureCandidates(scored, config, windingDistance, windingDistanceBatch, alignedNormals, workers);
+    if(config.localEvents) {
+        const auto before=scored.size();deduplicateLocalEvents(scored,report);
+        report.localDeduplicatedCandidates+=before-scored.size();
+    }
+    measureCandidates(scored, config, windingDistance, windingDistanceBatch, alignedNormals, workers, &report);
     if(config.localEvents) {
         for(std::size_t round=0;round<config.localRefinementRounds;++round) {
             std::map<PiecePair,std::vector<std::size_t>> groups;
@@ -1572,9 +1661,13 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
                     return std::tie(scored[i].candidate.arcA,scored[i].candidate.arcB) <
                         std::tie(scored[j].candidate.arcA,scored[j].candidate.arcB);
                 });
-                const auto state=[](const ScoredCandidate& s) {
+                const auto state=[&](const ScoredCandidate& s) {
                     if(!s.constraint) return std::tuple{0,0LL,0};
                     const auto& c=*s.constraint;
+                    // Raw extraction must not quantize winding evidence even
+                    // indirectly through adaptive candidate generation.
+                    if(!config.certifyWinding.value_or(config.localEvents || config.localScorerOnly))
+                        return std::tuple{c.parallelScore>.5?1:2,0LL,0};
                     return std::tuple{c.parallelScore>.5?1:2,
                         std::llround(c.windingDistance/(c.parallelScore>.5?1.:.5)),
                         c.signedWindingDelta?(*c.signedWindingDelta<0.?-1:1):0};
@@ -1602,16 +1695,26 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
                 catch(...) { errors[i]=std::current_exception(); }
             }
             for(const auto& e:errors)if(e)std::rethrow_exception(e);
-            measureCandidates(refined,config,windingDistance,windingDistanceBatch,alignedNormals,workers);
+            for(const auto& s:refined) {
+                report.localPerpendicularReciprocalEvaluated+=s.perpendicularReciprocalEvaluated;
+                report.localPerpendicularReciprocalWindowFailures+=s.perpendicularReciprocalWindowFailure;
+                report.localPerpendicularReciprocalEndpointFailures+=s.perpendicularReciprocalEndpointFailure;
+            }
+            measureCandidates(refined,config,windingDistance,windingDistanceBatch,alignedNormals,workers,&report);
             report.localRefinedCandidates+=refined.size();
             scored.insert(scored.end(),std::make_move_iterator(refined.begin()),std::make_move_iterator(refined.end()));
-            deduplicateLocalEvents(scored);
+            const auto before=scored.size();deduplicateLocalEvents(scored,report);
+            report.localDeduplicatedCandidates+=before-scored.size();
         }
     }
     report.windingScoreSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - windingStarted).count();
 
     for (auto& result : scored) {
+        if(config.localEvents)
+            ++report.localOutcomesByRelation[localRelationName(result.initialLocalRelation)]
+                [result.constraint ? "accepted" : result.failureCheck ? result.failureCheck : "unattributed"];
+        if(!result.constraint && result.failureCheck)++report.localFailureChecks[result.failureCheck];
         if (result.constraint.has_value()) {
             if (alignedNormals != nullptr) {
                 if (result.constraint->signedWindingDelta &&

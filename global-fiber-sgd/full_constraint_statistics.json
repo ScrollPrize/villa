@@ -1,0 +1,81 @@
+{
+  "database": "/home/hendrik/villa2/global-fiber-sgd/data/constraints_v1/full.afc.sqlite",
+  "database_bytes": 4249571328,
+  "fibers": 512698,
+  "events": 2334188,
+  "event_statistics": {
+    "constraints": 2334188,
+    "endpoint_normal_sampling_seconds": 14.233565217000002,
+    "fibers": 512698,
+    "invalid_endpoint_normals": 0,
+    "isolated_fibers": 95025,
+    "max_degree": 537.0,
+    "mean_degree": 9.10550850598208,
+    "median_degree": 5.0,
+    "orthogonal": 1153778,
+    "p95_degree": 33.0,
+    "parallel": 1180410
+  },
+  "unique_fiber_pairs": 756560,
+  "neighbor_degree": {
+    "mean": 2.9512890629571404,
+    "median": 2.0,
+    "p95": 9,
+    "maximum": 49
+  },
+  "fibers_with_constraints": 417673,
+  "coverage_percent": 81.46569715505034,
+  "parallel_percent": 50.570476756799366,
+  "orthogonal_percent": 49.429523243200634,
+  "winding_distance_bins": [
+    {
+      "kind": "parallel",
+      "nearest_half_winding": 0.0,
+      "events": 605461,
+      "mean_distance": 0.10707920958963255
+    },
+    {
+      "kind": "parallel",
+      "nearest_half_winding": 0.5,
+      "events": 238469,
+      "mean_distance": 0.43110585546752245
+    },
+    {
+      "kind": "parallel",
+      "nearest_half_winding": 1.0,
+      "events": 265051,
+      "mean_distance": 1.005868098830597
+    },
+    {
+      "kind": "parallel",
+      "nearest_half_winding": 1.5,
+      "events": 71429,
+      "mean_distance": 1.3394618256506767
+    },
+    {
+      "kind": "orthogonal",
+      "nearest_half_winding": 0.0,
+      "events": 20635,
+      "mean_distance": 0.16022803382559897
+    },
+    {
+      "kind": "orthogonal",
+      "nearest_half_winding": 0.5,
+      "events": 456930,
+      "mean_distance": 0.5296781421360822
+    },
+    {
+      "kind": "orthogonal",
+      "nearest_half_winding": 1.0,
+      "events": 503455,
+      "mean_distance": 0.9838180253519846
+    },
+    {
+      "kind": "orthogonal",
+      "nearest_half_winding": 1.5,
+      "events": 172758,
+      "mean_distance": 1.3975027342647055
+    }
+  ],
+  "note": "Degree counts both endpoints; local events repeat between pairs. Bins are nearest half-winding measurements, not ground-truth winding labels."
+}

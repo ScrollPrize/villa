@@ -6,6 +6,57 @@ Follow-up: shared BP code merged from `fiber-exp5`; see
 [Lasagna constraint extraction overview](bp_constraints.md) for the reusable
 pipeline, modes, merge resolution and validation limitations.
 
+Full-volume reusable constraint export: see [database schema and commands](constraint_database.md).
+This stores unsigned local events and both endpoint sheet-normal axes; source
+geometry remains in the original AFV.
+
+Reciprocal-filter follow-up: [parallel removal and perpendicular iteration
+comparison](parallel_reciprocal_results.md). The existing exported database is
+the historical reciprocal-on baseline; these comparison runs do not overwrite it.
+
+Follow-up correction: [moving-window perpendicular refinement](moving_projection_results.md)
+removes the original seed-window restriction while retaining local support checks.
+
+Current extraction semantics: [continuous winding measurements](raw_winding_results.md),
+with median parallel estimates and winding-value processing filters disabled.
+See [parallel/perpendicular rejection tables](relation_rejection_results.md)
+for the current per-type outcome audit and separately unclassified seed failures.
+
+## Local-event extraction benchmark (no fiber cutting)
+
+The adapter selects source IDs by exact intersection with a spatial box, then
+loads each selected fiber in full. It calls the shared native local-event
+extractor with `localKeepWholeFibers=true`; endpoint certification is not relaxed.
+It performs three unsigned extraction repetitions. **No normal alignment, dense
+normal lattice, tracing, inference, winding assignment solve or PyTorch SGD runs.**
+The sampler's `normalAlignedWindingDistance` name refers to integrating the
+absolute normal projection, not to an additional sign-alignment operation.
+
+Reusable build/test/benchmark commands, from this checkout:
+
+```bash
+bash /home/hendrik/villa2/vesuvius/scripts/run_fiber3d_native_build
+/home/hendrik/.venv_las/bin/python /home/hendrik/villa2/vesuvius/scripts/run_classic_fiber_evaluation.py crop-benchmark --config /home/hendrik/villa2/global-fiber-sgd/run_benchmark_unsigned.json
+/home/hendrik/.venv_las/bin/python /home/hendrik/villa2/vesuvius/scripts/run_classic_fiber_evaluation.py crop-benchmark --config /home/hendrik/villa2/global-fiber-sgd/run_benchmark_unsigned_scaling.json
+```
+
+The first command includes the regression suite and a 256-base-voxel full-XY
+Z slab; the second measures thicker slabs. JSON summaries are under
+`data/unsigned_z_slab_v1/`; command logs, binary/input hashes and peak RSS are under
+`data/unsigned_z_slab_v1/runner/`. Configs are versionable and data outputs ignored.
+Whole selected curves extend beyond the selecting slab. Scaling estimates use
+their actual arc length, not total volume height divided by slab thickness.
+The older `benchmark_v1` alignment experiment was stopped and is not this benchmark.
+
+Recreate the compact aggregate after running the benchmarks:
+
+```bash
+/home/hendrik/.venv_las/bin/python global-fiber-sgd/summarize_benchmark.py --output global-fiber-sgd/benchmark_results.json
+```
+
+The extrapolation fields are explicitly conditional estimates, not measured
+whole-volume runtimes. Missing cross-boundary neighbors can underestimate work.
+
 ## Working data
 
 `data/Paris4_v1.afv` (ignored by Git), downloaded from

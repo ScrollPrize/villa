@@ -1,0 +1,9 @@
+{
+  "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/moving_projection_v1/final_validation",
+  "reference_dir": "/home/hendrik/villa2/global-fiber-sgd/data",
+  "input_files": ["/home/hendrik/villa2/global-fiber-sgd/audit_pilot.json"],
+  "commands": [
+    {"name": "tests", "binary": "test_fiber_trace_winding_bp", "args": []},
+    {"name": "legacy_pilot", "binary": "vc_fiber_trace_chunk", "args": ["afv-constraints", "/home/hendrik/villa2/global-fiber-sgd/audit_pilot.json"]}
+  ]
+}

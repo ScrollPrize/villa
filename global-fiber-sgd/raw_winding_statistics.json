@@ -1,0 +1,64 @@
+{
+  "attempts": 32697203,
+  "initial_candidates": 30412865,
+  "refinement_candidates": 2284338,
+  "first_failure_checks": [
+    {
+      "check": "central_distance",
+      "count": 161,
+      "percent_all_attempts": 0.0004923968573091711
+    },
+    {
+      "check": "probe_distance",
+      "count": 508671,
+      "percent_all_attempts": 1.5557018745609525
+    },
+    {
+      "check": "probe_endpoint_support",
+      "count": 2380851,
+      "percent_all_attempts": 7.281512733673274
+    },
+    {
+      "check": "probe_orientation",
+      "count": 819583,
+      "percent_all_attempts": 2.5065844317020023
+    },
+    {
+      "check": "probe_tangent_support",
+      "count": 28755,
+      "percent_all_attempts": 0.08794330206164729
+    },
+    {
+      "check": "refined_orientation",
+      "count": 295791,
+      "percent_all_attempts": 0.9046370113064411
+    },
+    {
+      "check": "refined_tangent_support",
+      "count": 1130784,
+      "percent_all_attempts": 3.4583508564937495
+    },
+    {
+      "check": "seed_orientation",
+      "count": 861553,
+      "percent_all_attempts": 2.634944034815455
+    },
+    {
+      "check": "seed_tangent_support",
+      "count": 6367038,
+      "percent_all_attempts": 19.472729823404162
+    }
+  ],
+  "overlapping_winding_checks": [],
+  "winding_checks_evaluated": 0,
+  "accepted": {
+    "count": 7368335,
+    "percent": 22.535062096901683
+  },
+  "deduplicated": {
+    "count": 12935681,
+    "percent": 39.562041438223325
+  },
+  "all_saved_measurements_unchanged": null,
+  "note": "First-failure geometry attribution, not independent filter ablation. Denominator is candidate attempts, not unique fiber pairs. Winding overlaps count evaluable candidates once per predicate; percentages do not add. Signed checks are not applied."
+}

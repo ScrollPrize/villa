@@ -1,0 +1,48 @@
+{
+  "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/parallel_reciprocal_v1/runner",
+  "reference_dir": "/home/hendrik/villa2/global-fiber-sgd/data",
+  "input_files": [
+    "/home/hendrik/villa2/global-fiber-sgd/reciprocal_full_i4.json",
+    "/home/hendrik/villa2/global-fiber-sgd/reciprocal_full_i16.json",
+    "/home/hendrik/villa2/global-fiber-sgd/reciprocal_full_i64.json"
+  ],
+  "commands": [
+    {
+      "name": "tests",
+      "binary": "test_fiber_trace_winding_bp",
+      "args": []
+    },
+    {
+      "name": "legacy_pilot",
+      "binary": "vc_fiber_trace_chunk",
+      "args": [
+        "afv-constraints",
+        "/home/hendrik/villa2/global-fiber-sgd/audit_pilot.json"
+      ]
+    },
+    {
+      "name": "full_i4",
+      "binary": "vc_fiber_trace_chunk",
+      "args": [
+        "afv-constraints",
+        "/home/hendrik/villa2/global-fiber-sgd/reciprocal_full_i4.json"
+      ]
+    },
+    {
+      "name": "full_i16",
+      "binary": "vc_fiber_trace_chunk",
+      "args": [
+        "afv-constraints",
+        "/home/hendrik/villa2/global-fiber-sgd/reciprocal_full_i16.json"
+      ]
+    },
+    {
+      "name": "full_i64",
+      "binary": "vc_fiber_trace_chunk",
+      "args": [
+        "afv-constraints",
+        "/home/hendrik/villa2/global-fiber-sgd/reciprocal_full_i64.json"
+      ]
+    }
+  ]
+}

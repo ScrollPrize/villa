@@ -1,0 +1,139 @@
+{
+  "full_fibers": 512698,
+  "full_arc_base": 719131536.7963765,
+  "results": [
+    {
+      "name": "z1024",
+      "selected_fibers": 12389,
+      "arc_base": 20962495.666100275,
+      "query_seconds": 0.099010461,
+      "load_seconds": 0.659689463,
+      "initial_extraction_s": 3.046037992,
+      "warm_mean_s": 2.4704567765,
+      "extraction_mean_s": 2.6623171816666664,
+      "extraction_median_s": 2.47096146,
+      "extraction_min_s": 2.469952093,
+      "extraction_max_s": 3.046037992,
+      "repetitions": 3,
+      "counts_repeat_identically": true,
+      "counts": {
+        "candidates": 612538,
+        "events": 45806,
+        "orthogonal": 20175,
+        "parallel": 25631,
+        "refined_candidates": 29425,
+        "rejected_consistency": 424902,
+        "rejected_support": 0,
+        "rejected_winding": 0,
+        "rejected_winding_cutoff": 20857,
+        "resampled_points": 345849,
+        "signed": 0,
+        "unsigned_events": 45806
+      },
+      "mean_phases": {
+        "prepare_seconds": 0.019382231,
+        "search_seconds": 0.7169685496666667,
+        "orientation_seconds": 0.159455029,
+        "winding_seconds": 1.651780403
+      },
+      "resources": {
+        "wall_s": 8.93,
+        "user_s": 84.87,
+        "sys_s": 18.06,
+        "max_rss_kib": 1767248.0
+      },
+      "conditional_full_arc_extraction_s": 91.33245758459441,
+      "conditional_full_arc_initial_s": 104.49624020051691,
+      "conditional_full_arc_warm_s": 84.7505662766332
+    },
+    {
+      "name": "z256",
+      "selected_fibers": 6612,
+      "arc_base": 12521019.937861,
+      "query_seconds": 0.057175976,
+      "load_seconds": 0.35293441,
+      "initial_extraction_s": 1.608621975,
+      "warm_mean_s": 1.0014237415,
+      "extraction_mean_s": 1.2038231526666667,
+      "extraction_median_s": 1.004307136,
+      "extraction_min_s": 0.998540347,
+      "extraction_max_s": 1.608621975,
+      "repetitions": 3,
+      "counts_repeat_identically": true,
+      "counts": {
+        "candidates": 248943,
+        "events": 19889,
+        "orthogonal": 7445,
+        "parallel": 12444,
+        "refined_candidates": 12335,
+        "rejected_consistency": 173951,
+        "rejected_support": 0,
+        "rejected_winding": 0,
+        "rejected_winding_cutoff": 8134,
+        "resampled_points": 205444,
+        "signed": 0,
+        "unsigned_events": 19889
+      },
+      "mean_phases": {
+        "prepare_seconds": 0.011453771666666666,
+        "search_seconds": 0.31927924533333335,
+        "orientation_seconds": 0.067563817,
+        "winding_seconds": 0.7594922756666667
+      },
+      "resources": {
+        "wall_s": 4.17,
+        "user_s": 38.43,
+        "sys_s": 12.34,
+        "max_rss_kib": 1218656.0
+      },
+      "conditional_full_arc_extraction_s": 69.14030950390213,
+      "conditional_full_arc_initial_s": 92.38950171369133,
+      "conditional_full_arc_warm_s": 57.515713399007524
+    },
+    {
+      "name": "z4096",
+      "selected_fibers": 36389,
+      "arc_base": 55454320.7744022,
+      "query_seconds": 0.2781269,
+      "load_seconds": 1.951164601,
+      "initial_extraction_s": 10.060409547,
+      "warm_mean_s": 8.604245051,
+      "extraction_mean_s": 9.089633216333334,
+      "extraction_median_s": 8.615348509,
+      "extraction_min_s": 8.593141593,
+      "extraction_max_s": 10.060409547,
+      "repetitions": 3,
+      "counts_repeat_identically": true,
+      "counts": {
+        "candidates": 2052212,
+        "events": 147927,
+        "orthogonal": 71593,
+        "parallel": 76334,
+        "refined_candidates": 96914,
+        "rejected_consistency": 1424598,
+        "rejected_support": 0,
+        "rejected_winding": 0,
+        "rejected_winding_cutoff": 69435,
+        "resampled_points": 920108,
+        "signed": 0,
+        "unsigned_events": 147927
+      },
+      "mean_phases": {
+        "prepare_seconds": 0.049921658,
+        "search_seconds": 2.115750717,
+        "orientation_seconds": 0.5488080653333334,
+        "winding_seconds": 5.9433946576666665
+      },
+      "resources": {
+        "wall_s": 29.84,
+        "user_s": 245.8,
+        "sys_s": 50.3,
+        "max_rss_kib": 4832148.0
+      },
+      "conditional_full_arc_extraction_s": 117.87434797676765,
+      "conditional_full_arc_initial_s": 130.4633737696887,
+      "conditional_full_arc_warm_s": 111.5798350803071
+    }
+  ],
+  "caveat": "Conditional linear extrapolations, not measured global runtimes. Subsets omit neighbors; candidate density, memory and I/O can change scaling. No normal alignment. First extraction has a fresh process cache; filesystem cache is uncontrolled. Later repetitions reuse process and filesystem caches."
+}

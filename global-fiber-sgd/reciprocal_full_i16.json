@@ -1,0 +1,17 @@
+{
+  "certify_winding": true,
+  "enforce_maximum_winding": true,
+  "closest_parallel_estimator": true,
+  "moving_projection_windows": false,
+  "afv": "/home/hendrik/villa2/global-fiber-sgd/data/Paris4_v1.afv",
+  "parallel_reciprocal": false,
+  "coordinate_space": "PHercParis4/20260411134726",
+  "normal_manifest": "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+  "normal_provenance": "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/inference.json",
+  "remote_cache": "/home/hendrik/villa2/global-fiber-sgd/data/normal_cache",
+  "threads": 128,
+  "repetitions": 1,
+  "output": "/home/hendrik/villa2/global-fiber-sgd/data/parallel_reciprocal_v1/full_i16.json",
+  "full_volume": true,
+  "perpendicular_iterations": 16
+}
