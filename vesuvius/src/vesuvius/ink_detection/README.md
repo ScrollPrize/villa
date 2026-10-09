@@ -146,6 +146,13 @@ The native tifxyz directory must contain `x.tif`, `y.tif`, `z.tif`, and
 `volume_source.txt`. Use `--plan-only` to inspect occupied-chunk and patch
 counts without creating output.
 
+Score predictions inside a segment's validation mask and, separately, on the
+rest of its supervision mask:
+
+```bash
+uv run --extra models python -m vesuvius.ink_detection.inference.evaluate   /data/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc0139-w016   /data/predictions/pherc0139-w016.tif
+```
+
 ## Checkpoints and metrics
 
 Training embeds the resolved JSON config in each checkpoint. Inference
