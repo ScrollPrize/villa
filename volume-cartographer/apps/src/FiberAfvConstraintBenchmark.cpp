@@ -1,5 +1,6 @@
 #include "FiberAfvConstraintBenchmark.hpp"
 #include "FiberConstraintDatabase.hpp"
+#include "vc/fiber_tracer/FiberAxialAlignment.hpp"
 #include "vc/core/types/FiberCollection.hpp"
 #include "vc/core/util/AtomicFile.hpp"
 #include "vc/core/util/ScrollUmbilicus.hpp"
@@ -152,20 +153,56 @@ int runFiberAfvConstraintBenchmark(int argc, char** argv)
         {"normal_spacing_base",spacing},{"runs",Json::array()}};
     const auto output=std::filesystem::path(cfg.at("output").get<std::string>());
     std::filesystem::create_directories(output.parent_path());
+    const auto loadAxis=[&]() {
+        const auto& shape=root.at("coordinate_base_shape_zyx");
+        auto loaded=vc::core::util::loadUmbilicusWithFrameCheck(cfg.at("umbilicus").get<std::string>(),
+            {shape[2].get<double>(),shape[1].get<double>(),shape[0].get<double>()},
+            {shape[0].get<int>(),shape[1].get<int>(),shape[2].get<int>()},
+            vc::core::util::UmbilicusTargetGridAuthority::Authoritative,root.at("voxel_size_mm").get<double>()*1000.);
+        if(!loaded.umbilicus || !loaded.warning.empty() || loaded.scaleDescription.empty())
+            throw std::runtime_error("Umbilicus frame not verified: "+loaded.error+loaded.warning);
+        result["umbilicus_frame"]=loaded.scaleDescription;
+        return std::move(*loaded.umbilicus);
+    };
+    if(cfg.contains("axial_prior_output")) {
+        const auto target=std::filesystem::path(cfg.at("axial_prior_output").get<std::string>());
+        if(std::filesystem::exists(target))throw std::runtime_error("Axial output already exists");
+        const auto axis=loadAxis();const auto& centers=axis.centers();
+        const double step=cfg.value("axial_sample_spacing",16.);
+        const auto axisAt=[&](const cv::Vec3d& p) {
+            const int z=std::clamp(int(std::lround(p[2])),0,int(centers.size())-1);
+            const int lo=std::max(0,z-8),hi=std::min(int(centers.size())-1,z+8);
+            return cv::Vec3d(centers[hi]-centers[lo]);
+        };
+        std::vector<double> agreement(lines.size());
+        const auto begin=Clock::now();
+        // Fixed per-fiber accumulation order; independent fibers run in parallel.
+        cv::parallel_for_(cv::Range(0,int(lines.size())),[&](const cv::Range& range) {
+            for(int i=range.start;i<range.end;++i)
+                agreement[i]=fiberAxialAlignment(lines[i].pointsBaseXYZ,axisAt,step);
+        });
+        Json features={{"format","fiber-axial-priors"},{"version",1},{"afv_uuid",result["afv_uuid"]},
+            {"source_ids",ids},{"agreement",agreement},{"umbilicus",cfg.at("umbilicus")},
+            {"afv_sha256",cfg.at("afv_sha256")},{"umbilicus_sha256",cfg.at("umbilicus_sha256")},
+            {"sample_spacing_base",step},{"axis_secant_halfspan_z",8},
+            {"semantics","arc mean 2*(fiber tangent dot axis tangent)^2-1; V positive, H negative"},
+            {"seconds",seconds(begin)},{"umbilicus_frame",result["umbilicus_frame"]}};
+        std::filesystem::create_directories(target.parent_path());
+        vc::core::util::ephemeralWriteString(target,features.dump()+"\n");
+        result["axial_seconds"]=seconds(begin);
+        if(cfg.value("axial_prior_only",false)) {
+            result["wall_seconds"]=seconds(started);
+            vc::core::util::ephemeralWriteString(output,result.dump(2)+"\n");
+            std::cout<<"axial features complete fibers="<<lines.size()<<" seconds="<<seconds(started)<<std::endl;
+            return 0;
+        }
+    }
     if(cfg.contains("orient_database")) {
         if(repetitions!=1 || cfg.contains("compare_database"))
             throw std::invalid_argument("Orientation is one second pass, not extraction/comparison");
         std::optional<vc::core::util::Umbilicus> umbilicus;
         if(cfg.contains("normal_prior_output")) {
-            const auto& shape=root.at("coordinate_base_shape_zyx");
-            auto loaded=vc::core::util::loadUmbilicusWithFrameCheck(cfg.at("umbilicus").get<std::string>(),
-                {shape[2].get<double>(),shape[1].get<double>(),shape[0].get<double>()},
-                {shape[0].get<int>(),shape[1].get<int>(),shape[2].get<int>()},
-                vc::core::util::UmbilicusTargetGridAuthority::Authoritative,root.at("voxel_size_mm").get<double>()*1000.);
-            if(!loaded.umbilicus || !loaded.warning.empty() || loaded.scaleDescription.empty())
-                throw std::runtime_error("Umbilicus frame not verified: "+loaded.error+loaded.warning);
-            result["umbilicus_frame"]=loaded.scaleDescription;
-            umbilicus=std::move(loaded.umbilicus);
+            umbilicus=loadAxis();
         }
         result["orientation"]=orientFiberConstraintDatabase(
             cfg.at("orient_database").get<std::string>(),cfg.at(umbilicus?"normal_prior_output":"database").get<std::string>(),

@@ -8,6 +8,17 @@
 #include "vc/fiber_tracer/FiberTraceWindingOrderedCuts.hpp"
 #include "vc/fiber_tracer/LasagnaNormalAlignment.hpp"
 #include "vc/fiber_tracer/FiberNormalOrientation.hpp"
+#include "vc/fiber_tracer/FiberAxialAlignment.hpp"
+
+TEST_CASE("Axial fiber agreement is arc weighted and unoriented") {
+    using vc::fiber_tracer::fiberAxialAlignment;
+    const auto axis=[](const cv::Vec3d&){return cv::Vec3d{0,0,1};};
+    CHECK(fiberAxialAlignment({{0,0,0},{0,0,30}},axis)==doctest::Approx(1));
+    CHECK(fiberAxialAlignment({{0,0,0},{30,0,0}},axis)==doctest::Approx(-1));
+    CHECK(fiberAxialAlignment({{0,0,0},{0,0,30},{10,0,30}},axis)==doctest::Approx(.5));
+    CHECK(fiberAxialAlignment({{10,0,30},{0,0,30},{0,0,0}},axis)==doctest::Approx(.5));
+    CHECK_THROWS(fiberAxialAlignment({{0,0,0},{0,0,0}},axis));
+}
 
 #include <algorithm>
 #include <cmath>
