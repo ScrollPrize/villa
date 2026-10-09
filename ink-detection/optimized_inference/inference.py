@@ -117,6 +117,11 @@ class InferenceConfig:
     # Compression settings
     use_zarr_compression: bool = True
 
+    # Zero-pad the final partial batch up to batch_size so torch.compile (dynamic=False)
+    # and cudnn.benchmark see a single input shape. Off by default: tiles in that batch
+    # then run through the full-batch kernels, which can change their values at fp16 noise level.
+    pad_last_batch: bool = os.environ.get("PAD_LAST_BATCH", "false").lower() == "true"
+
 CFG = InferenceConfig()
 
 # --------------------- Disk-backed / Array-backed layers ---------------------
@@ -435,11 +440,14 @@ def predict_fn(
                 tile_count += raw_batch_size
                 with scoped_timer(profiler, "host_to_device_seconds", cuda_sync=detailed_sync):
                     images = images.to(device, non_blocking=True)
+                if CFG.pad_last_batch and raw_batch_size < CFG.batch_size:
+                    pad = images.new_zeros((CFG.batch_size - raw_batch_size, *images.shape[1:]))
+                    images = torch.cat([images, pad])
 
                 amp_device = amp_device_type(device)
                 with scoped_timer(profiler, "forward_seconds", cuda_sync=detailed_sync):
                     with torch.autocast(device_type=amp_device, enabled=True):
-                        y_preds = model.forward(images)  # Model-specific forward
+                        y_preds = model.forward(images)[:raw_batch_size]  # Model-specific forward
                     y_preds = torch.sigmoid(y_preds)
                     y_preds_resized = F.interpolate(
                         y_preds.float(),
