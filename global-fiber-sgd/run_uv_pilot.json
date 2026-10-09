@@ -1,0 +1,23 @@
+{
+  "fiber_uv_layout": {
+    "database": "/home/hendrik/villa2/global-fiber-sgd/data/oriented_normals_v1/full.afc.sqlite",
+    "features": "/home/hendrik/villa2/global-fiber-sgd/data/hv_stage_v1/axial_features.json",
+    "stage1": "/home/hendrik/villa2/global-fiber-sgd/data/sign_resolution_v2/adam_sweep/solution_0.1_inward.npz",
+    "hv_solution": "/home/hendrik/villa2/global-fiber-sgd/data/hv_stage_v1/adam_sweep/solution_degree_mix_b0.1_e0.01.npz",
+    "afv": "/home/hendrik/villa2/global-fiber-sgd/data/Paris4_v1.afv",
+    "umbilicus": "/home/hendrik/villa2/global-fiber-sgd/data/Paris4_umbilicus.json",
+    "tensor_cache": "/home/hendrik/villa2/global-fiber-sgd/data/uv_pilot_v1/tensors.npz",
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_pilot_v1/solve_rejection01",
+    "pilot_fibers": 10000,
+    "minimum_length_mm": 10,
+    "steps": 1000,
+    "batch_size": 1024,
+    "log_every": 250,
+    "distance_sigma": 0.5,
+    "lr": 0.03,
+    "rejection_cost": 10,
+    "devices": "0",
+    "gpu_manager": {"exclusive": false, "priority": 100, "cpu_cores": 8,
+      "vram_bytes_per_gpu": 12884901888, "label": "global-fiber-uv-pilot"}
+  }
+}

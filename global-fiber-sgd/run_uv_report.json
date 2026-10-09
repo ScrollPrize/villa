@@ -1,0 +1,7 @@
+{
+  "fiber_uv_report": {
+    "runs": ["/home/hendrik/villa2/global-fiber-sgd/data/uv_global_v1/solve_sigma05",
+      "/home/hendrik/villa2/global-fiber-sgd/data/uv_global_v1/solve_sigma1_sign100"],
+    "report": "/home/hendrik/villa2/global-fiber-sgd/uv_layout_results.md"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "fiber_h_direction_report": {
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/h_direction_v1/solve",
+    "report": "/home/hendrik/villa2/global-fiber-sgd/h_direction_results.md"
+  }
+}

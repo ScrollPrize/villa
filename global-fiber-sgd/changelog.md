@@ -2,6 +2,24 @@
 
 ## 2026-10-09
 
+- Added optional stage3 whole-H breakage with fixed evidence normalization and
+  joint direction/broken entropy. Full confidence-preserving sweep .1/.07/.05/.03;
+  selected.05rejects184H(0.073115%), eliminates all1721direction conflicts,
+  retains99.912734%Harc and99.767440%parallel events. Earlier exclusions fixed;
+  U/V paused. Initial softened-confidence trials archived as diagnostic only.
+ 25tests; independent audit confirms none of the184can individually be restored
+  in either direction without conflict. Existing renderer reused for survivor
+  normal/curve views, with new all-disabled and same-subset tangent-arrow OBJ.
+
+- Added third-stage whole-H tangent-direction alignment after frozen normal/HV
+  stages.251658Hfibers/3603373parallel events; weighted disagreement0.698138%
+  (umbilicus-only) to0.047735%, no new rejections,25.796smanagedH100. ExactCW/CCW
+  opposite outputs, shared tangent/sign-loss helpers,22tests and independent
+  full-event/raw-geometry audit. h_direction.md/results/configs. Global U/V paused.
+- Preserved preliminary U/V implementation and two completed full trials in
+  data/uv_global_v1; notes uv_layout_task_log.md. Not promoted: substantial
+  ambiguity/rejection and continuation issues. Awaiting new global constraints.
+
 - Committed H/V stage and recommended params(3f579c7c2,6949e82fc). Added classified
   visualization layers from recommended result:400H/400V/200broken,24319arrows,
   orange umbilicus. Broken sample66stage1/134stage2;44.419MiB. Shared exporter,

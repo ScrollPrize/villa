@@ -109,7 +109,8 @@ def tube_mesh(points, radius=80., sides=12):
     return np.concatenate(vertices),np.asarray(faces,dtype=np.int32)
 
 
-def export_umbilicus(root, path, afv_root, radius):
+def load_umbilicus_frame(path, afv_root):
+    """Shared native-L0 frame validation for geometry export and layout priors."""
     document=json.loads(Path(path).read_text());metadata=document['metadata']
     expected=afv_root['coordinate_base_shape_zyx']
     shape=[metadata['volume_slices'],metadata['volume_height'],metadata['volume_width']]
@@ -121,6 +122,11 @@ def export_umbilicus(root, path, afv_root, radius):
     points=np.array([[p[k] for k in ('x','y','z')] for p in document['control_points']],dtype=float)
     if np.any(points<0) or np.any(points>=np.asarray(shape[::-1])):
         raise ValueError('Umbilicus coordinates outside native volume')
+    return points
+
+
+def export_umbilicus(root, path, afv_root, radius):
+    points=load_umbilicus_frame(path,afv_root)
     vv,ff=tube_mesh(points,radius)
     write_ply(root/'umbilicus.ply',vv,ff,np.tile([255,145,20],(len(vv),1)))
     (root/'umbilicus.obj').write_text('# Native L0 umbilicus centerline\nmtllib fibers.mtl\n'+obj_fiber('umbilicus',points,1,False))

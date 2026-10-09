@@ -12,13 +12,19 @@ import numpy as np
 from lasagna.inference_provenance import atomic_write, sha256_file
 
 
+def sign_alignment_terms(sign_logits, prior, i, j, dot, keep=None):
+    """Shared binary vector-sign agreement with fixed evidence normalization."""
+    s = 2 * sign_logits.sigmoid() - 1
+    weight = 1 if keep is None else keep[i]*keep[j]
+    pair = (weight*(dot.abs()-dot*s[i]*s[j])*.5).sum() / dot.abs().sum().clamp_min(1e-12)
+    prior_loss = ((1-prior*s)*.5).mean()
+    return pair,prior_loss
+
+
 def losses(sign_logits, broken_logits, prior, i, j, dot, prior_weight, broken_penalty):
     """Fixed denominator; disabling everything never removes the broken penalty."""
-    import torch
-    s = 2 * sign_logits.sigmoid() - 1
     b = broken_logits.sigmoid()
-    pair = ((1-b[i])*(1-b[j])*(dot.abs()-dot*s[i]*s[j])*.5).sum() / dot.abs().sum().clamp_min(1e-12)
-    outward = ((1-prior*s)*.5).mean()
+    pair,outward = sign_alignment_terms(sign_logits,prior,i,j,dot,1-b)
     broken = b.mean()
     return pair + prior_weight*outward + broken_penalty*broken, pair, outward, broken
 

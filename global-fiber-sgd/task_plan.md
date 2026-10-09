@@ -2,6 +2,17 @@
 
 ## Current task
 
+H-fiber direction breakage and visualization: task.md and
+[h_direction_breakage_plan.md](h_direction_breakage_plan.md), independently reviewed.
+Global U/V remains paused. Reuse existing source/tangent cache and rendering.
+
+## Earlier task plans
+
+H-fiber circulation alignment: task.md and h_direction_plan.md. Global U/V is
+PAUSED by user request; results/notes preserved in uv_layout_task_log.md.
+
+Global probabilistic U/V layout: task.md and uv_layout_plan.md.
+
 Commit recommended H/V parameters and visualize separate H/V/broken layers;
 current detailed plan [hv_vis_plan.md](hv_vis_plan.md).
 

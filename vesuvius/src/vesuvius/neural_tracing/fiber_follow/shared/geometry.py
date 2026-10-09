@@ -102,9 +102,15 @@ def traversal_curve(fiber, reverse):
 
 
 def tangent_at(p: np.ndarray, s: np.ndarray, t: float, half: float = 3.0) -> np.ndarray:
-    a = interp_at(p, s, np.array([max(t - half, 0.0)]))[0]
-    b = interp_at(p, s, np.array([min(t + half, s[-1])]))[0]
-    return normalize(b - a)
+    return tangents_at(p, s, np.asarray([t]), half)[0]
+
+
+def tangents_at(p: np.ndarray, s: np.ndarray, t: np.ndarray, half: float = 3.0) -> np.ndarray:
+    """Batched version of tangent_at; same clipped secants and normalization."""
+    t = np.asarray(t)
+    a = interp_at(p, s, np.maximum(t-half, 0.0))
+    b = interp_at(p, s, np.minimum(t+half, s[-1]))
+    return normalize(b-a)
 
 
 def dense_line(points, step):

@@ -1,6 +1,17 @@
 # Global fiber assignment with PyTorch SGD
 
-Initial data reconnaissance, 2026-10-08. No optimizer implemented yet.
+Current stage3: [H-fiber direction alignment with breakage](h_direction.md), following
+normal signs and baked H/V. [Breakage sweep](h_direction_breakage_results.md)
+replaces the [sign-only baseline](h_direction_results.md), which had0.047735%
+weighted parallel disagreement with no additional rejections. Global U/V is PAUSED
+pending further constraints; this direction stage has not yet been wired into it.
+
+Paused experimental stage: [probabilistic global U/V layout](uv_layout.md),
+following accepted inward normal and baked H/V solutions.100winding hypotheses
+plus rejection; immutable constraint events, eligible1cmcuts and continuation.
+See [global results](uv_layout_results.md) for full-graph diagnostics and limitations.
+
+Initial data reconnaissance:2026-10-08 (historical details below).
 
 Follow-up: shared BP code merged from `fiber-exp5`; see
 [Lasagna constraint extraction overview](bp_constraints.md) for the reusable
