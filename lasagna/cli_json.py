@@ -2,16 +2,51 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 
-def split_cfg_argv(argv: list[str] | None) -> tuple[list[str], list[str] | None]:
+def _option_value_count(action: argparse.Action) -> int:
+	"""How many following argv tokens an option consumes as its value(s)."""
+	nargs = action.nargs
+	if nargs is None or nargs == "?":
+		return 1
+	if isinstance(nargs, int):
+		return nargs  # 0 for flags such as store_true
+	if nargs in ("*", "+", argparse.REMAINDER):
+		return sys.maxsize
+	return 0
+
+
+def split_cfg_argv(
+	argv: list[str] | None,
+	parser: argparse.ArgumentParser | None = None,
+) -> tuple[list[str], list[str] | None]:
+	"""Separate config ``*.json`` paths from the remaining CLI tokens.
+
+	With ``parser``, a ``.json`` token that is the value of a preceding option
+	(for example ``--input vol.lasagna.json``) stays with that option instead of
+	being taken as a config file.
+	"""
 	if argv is None:
 		return [], None
 	paths: list[str] = []
 	rest: list[str] = []
+	pending_values = 0
 	for a in argv:
-		if not a.startswith("-") and str(a).endswith(".json"):
+		if pending_values > 0 and not a.startswith("-"):
+			rest.append(a)
+			pending_values -= 1
+			continue
+		pending_values = 0
+		if a.startswith("-"):
+			rest.append(a)
+			if parser is not None and "=" not in a:
+				action = parser._option_string_actions.get(a)
+				if action is not None:
+					pending_values = _option_value_count(action)
+			continue
+		if str(a).endswith(".json"):
 			paths.append(a)
 			continue
 		rest.append(a)
@@ -101,7 +136,7 @@ def apply_defaults_from_cfg_args(p: argparse.ArgumentParser, cfg: dict) -> None:
 
 
 def parse_args(p: argparse.ArgumentParser, argv: list[str] | None) -> argparse.Namespace:
-	cfg_paths, argv_rest = split_cfg_argv(argv)
+	cfg_paths, argv_rest = split_cfg_argv(argv, p)
 	cfg_paths = [str(x) for x in cfg_paths]
 	cfg = merge_cfgs(cfg_paths) if cfg_paths else {}
 	apply_defaults_from_cfg_args(p, cfg)
