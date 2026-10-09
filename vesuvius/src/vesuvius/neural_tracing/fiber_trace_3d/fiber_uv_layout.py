@@ -63,6 +63,45 @@ def _ro(path):
     return sqlite3.connect(Path(path).resolve().as_uri()+'?mode=ro',uri=True)
 
 
+def anchored(config):
+    return config.get('layout_mode', 'legacy') == 'shared_anchor'
+
+
+def aligned_geometry(points,family,umbilicus,direction,h_convention):
+    if direction not in (-1,1) or h_convention not in ('ccw','cw'):
+        raise ValueError('Invalid aligned geometry convention')
+    arc,_,angle,radius=fiber_geometry(points,family,umbilicus)
+    return arc,arc*direction,angle*(1 if h_convention=='ccw' else -1),radius
+
+
+def direction_inputs(config, signature, ids, labels):
+    """Validate immutable previous stages, including V's inherited H solution."""
+    outputs=[]
+    for key in ('h_direction_solution','v_direction_solution'):
+        path=Path(config[key])
+        meta=json.loads((path.parent/'summary.json').read_text())['input']['signature']
+        for source in ('database','afv','features','stage1','hv_solution','umbilicus'):
+            if meta[source]!=signature[source]:raise ValueError('Direction provenance mismatch: '+source)
+        with np.load(path) as src:outputs.append({k:src[k] for k in src.files})
+    h,v=outputs
+    for solution in outputs:
+        if not np.array_equal(ids,solution['ids']):raise ValueError('Direction IDs mismatch')
+    if np.any((h['labels']!=labels)&~((labels==0)&(h['labels']==2))):
+        raise ValueError('H direction changed frozen labels')
+    if np.any((v['labels']!=h['labels'])&~((h['labels']==1)&(v['labels']==2))):
+        raise ValueError('V direction changed frozen labels')
+    for name in ('ccw','cw'):
+        if not np.array_equal(v['inherited_h_direction_sign_'+name],h['direction_sign_'+name]):
+            raise ValueError('Inherited H signs mismatch')
+    vmeta=json.loads((Path(config['v_direction_solution']).parent/'summary.json').read_text())['input']['signature']
+    if vmeta['inherited_h_solution']!=signature['h_direction_solution']:raise ValueError('Inherited H hash mismatch')
+    convention=config.get('h_convention','ccw')
+    if convention not in ('ccw','cw'):raise ValueError('Invalid H convention')
+    result=np.where(v['labels']==0,h['direction_sign_'+convention],v['direction_sign_up'])
+    if not np.isin(result[v['labels']!=2],[-1,1]).all():raise ValueError('Missing retained direction')
+    return v['labels'].copy(),result
+
+
 def prepare(config):
     from .fiber_hv_stage import verify_feature_source
     from .fiber_normal_sign_visualization import load_umbilicus_frame
@@ -71,6 +110,9 @@ def prepare(config):
     signature={key:sha256_file(config[key]) for key in ('database','features','stage1','hv_solution','afv','umbilicus')}
     signature.update(version=2,minimum_length_mm=config.get('minimum_length_mm',10.),
                      sign_cosine_min=config.get('sign_cosine_min',.1),pilot_fibers=config.get('pilot_fibers',0))
+    if anchored(config):
+        signature.update(version=3,layout_mode='shared_anchor',h_convention=config.get('h_convention','ccw'))
+        signature.update({key:sha256_file(config[key]) for key in ('h_direction_solution','v_direction_solution')})
     if cache.exists() and stamp.exists() and json.loads(stamp.read_text())['signature']==signature:return
     feature=json.loads(Path(config['features']).read_text());verify_feature_source(config['database'],feature)
     hv_summary=json.loads((Path(config['hv_solution']).parent/'summary.json').read_text())
@@ -81,6 +123,7 @@ def prepare(config):
     if not np.array_equal(ids,normal['ids']):raise ValueError('Normal/HV IDs mismatch')
     if not np.all(np.diff(ids)>0) or not np.isin(labels,[0,1,2]).all():raise ValueError('Invalid IDs/labels')
     if np.any(normal['broken']&(labels!=2)):raise ValueError('Stage1 exclusions not preserved')
+    if anchored(config):labels,directions=direction_inputs(config,signature,ids,labels)
     if signature['afv']!=feature['afv_sha256'] or signature['umbilicus']!=feature['umbilicus_sha256']:
         raise ValueError('Geometry/axial input mismatch')
     with _ro(config['afv']) as db:meta={k:json.loads(v) for k,v in db.execute('SELECT key,value FROM metadata')}
@@ -129,17 +172,20 @@ def prepare(config):
     geometry=read_afv_polylines(config['afv'],ids[kept]);print('UV prepare: events loaded; deriving pieces',flush=True)
     for fi,(row,xyz) in enumerate(geometry):
         idx=np.searchsorted(ids,row['id']);family=labels[idx]
-        arc,travel,angle,radius=fiber_geometry(xyz,family,axis)
+        if anchored(config):
+            arc,travel,angle,radius=aligned_geometry(xyz,family,axis,directions[idx],config.get('h_convention','ccw'))
+        else:arc,travel,angle,radius=fiber_geometry(xyz,family,axis)
         ep=order[positions[idx]:last[idx]];ea=endpoint_arcs[ep]
         if not np.isfinite(ea).all() or np.any(ea<0) or np.any(ea>arc[-1]+1e-5):
             raise ValueError(f'Constraint arc outside original fiber {row["id"]}')
         perp=ea[events[ep%ecount,11]==0]
         bounds=split_bounds(arc[-1],perp,minimum);first=len(pieces)
         middle=(bounds[:-1]+bounds[1:])/2
-        tr=np.interp(middle,arc,travel);ph=np.interp(middle,arc,angle)
+        anchors=bounds[:-1] if anchored(config) else middle
+        tr=np.interp(anchors,arc,travel);ph=np.interp(anchors,arc,angle)
         for p in range(len(middle)):
             a,b=bounds[p:p+2];m=middle[p]
-            pieces.append((idx,row['id'],a,b,family,tr[p],ph[p],np.interp(m,arc,xyz[:,2]),np.interp(m,arc,radius)))
+            pieces.append((idx,row['id'],a,b,family,tr[p],ph[p],np.interp(anchors[p],arc,xyz[:,2]),np.interp(m,arc,radius)))
             # Uniform piece regularizer evaluates both ends and midpoint.
             nodes.append((np.interp([a,m,b],arc,travel)-tr[p],np.interp([a,m,b],arc,angle),np.interp([a,m,b],arc,xyz[:,2])))
             if p:
@@ -193,9 +239,37 @@ def u_to_q(u, widths, boundaries):
     return bucket+(u-boundaries[bucket])/widths[bucket]
 
 
+def q_to_u(q, widths, boundaries):
+    """Continuous cumulative-width map; extrapolate end widths, never wrap."""
+    bucket=q.detach().floor().long().clamp(0,len(widths)-1)
+    return boundaries[bucket]+(q-bucket)*widths[bucket]
+
+
+def anchor_offsets(state,k):
+    du=state[:,k+3:2*k+3];dv=state[:,2*k+3:3*k+3]
+    return du-du.mean(1,keepdim=True),dv-dv.mean(1,keepdim=True)
+
+
+def offset_regularization(state,k,config):
+    import torch
+    du,dv=anchor_offsets(state,k)
+    return (config.get('offset_soft_weight',.001)*(du.square().mean()+dv.square().mean())+
+            config.get('offset_limit_weight',10000.)*torch.relu(du.abs()-.25).square().mean())
+
+
 def coordinates(state, phase, z, family, ds, widths, boundaries):
     """Only piece state has parameters. All base points are derived here."""
-    k=len(widths);frac=phase[:,None]+.25*state[:,k+1:2*k+1].tanh()
+    k=len(widths)
+    if state.shape[1]==3*k+3:
+        import torch
+        du,dv=anchor_offsets(state,k)
+        shared_phase=phase+state[:,k+1]
+        q=torch.arange(k,device=state.device)[None,:]+shared_phase[:,None]
+        # Offsets in local turn units; mapping remains continuous at every seam.
+        u=q_to_u(q+du,widths,boundaries)+(family==0)[:,None]*ds[:,None]
+        v=z[:,None]+1000*(state[:,k+2,None]+dv)+(family==1)[:,None]*ds[:,None]
+        return u,v,u_to_q(u,widths,boundaries)
+    frac=phase[:,None]+.25*state[:,k+1:2*k+1].tanh()
     u=boundaries[:-1]+widths*frac+(family==0)[:,None]*ds[:,None]
     v=z[:,None]+1000*state[:,2*k+1:]+(family==1)[:,None]*ds[:,None]
     return u,v,u_to_q(u,widths,boundaries)
@@ -228,8 +302,32 @@ def table_cost(delta, mu, table, step=.0625):
     return low*(1-mf[:,None,None])+high*mf[:,None,None]
 
 
-def pair_objective(pa,pb,qa,qb,va,vb,phase_delta,family_delta,sign,mu,target_v,table,config):
-    """Exact joint posterior expectation over all K*K assignments in this batch."""
+def calibrated_sign_charge(degree_a,degree_b,mean_degree,event_count,piece_count,rejection_cost,multiplier):
+    """Cheaper-endpoint dominance under the actual event/node normalization."""
+    import torch
+    ca=.5+.5*degree_a/mean_degree.clamp_min(1.)
+    cb=.5+.5*degree_b/mean_degree.clamp_min(1.)
+    return multiplier*(event_count/piece_count)*rejection_cost*torch.minimum(ca,cb)
+
+
+def fixed_sign_terms(pa,pb,ordered,charge,selected_ordered=None):
+    """A diffuse posterior must not hide a wrong selected retained assignment.
+
+    Exact indicators have no coordinate derivative; the separate magnitude
+    hinge supplies that gradient. No stale audited edge is forced wrong.
+    """
+    import torch
+    mass=pa[:,:,None]*pb[:,None,:]
+    expected=(mass*(ordered<0)).sum((1,2))
+    if selected_ordered is None:
+        row=torch.arange(len(pa),device=pa.device)
+        selected_ordered=ordered[row,pa.argmax(1),pb.argmax(1)]
+    selected=pa.sum(1)*pb.sum(1)*(selected_ordered<0)
+    return charge*torch.maximum(expected,selected)
+
+
+def pair_cost_components(qa,qb,va,vb,phase_delta,family_delta,sign,mu,target_v,table,config):
+    """Shared K*K geometric costs, independent of assignment probabilities."""
     import torch
     delta=qb[:,None,:]-qa[:,:,None]-phase_delta[:,None,None]+.5*family_delta[:,None,None]
     # Finite optimization surrogate for truncated support: never reflect a known
@@ -244,8 +342,70 @@ def pair_objective(pa,pb,qa,qb,va,vb,phase_delta,family_delta,sign,mu,target_v,t
     vertical=((vb[:,None,:]-va[:,:,None]-target_v[:,None,None])/config.get('metric_scale',128.)).square().clamp(max=100.)
     cost=config.get('sign_weight',10.)*wrong+config.get('distance_weight',1.)*soft
     cost=cost+config.get('metric_weight',.01)*(phase_error.square()+vertical)
+    soft_cost=config.get('distance_weight',1.)*soft+config.get('metric_weight',.01)*(phase_error.square()+vertical)
+    return cost,ordered,soft_cost,wrong
+
+
+def pair_objective(pa,pb,qa,qb,va,vb,phase_delta,family_delta,sign,mu,target_v,table,config,
+                   charge=None,event_weights=None,selected_ordered=None):
+    """Legacy posterior objective, optionally with selected-sign safeguard."""
+    cost,ordered,soft_cost,wrong=pair_cost_components(qa,qb,va,vb,phase_delta,family_delta,
+                                                   sign,mu,target_v,table,config)
     mass=pa[:,:,None]*pb[:,None,:]
-    return (mass*cost).sum((1,2)).mean()
+    if anchored(config) and config.get('pair_mode','likelihood')=='likelihood':
+        # Likelihood only soft evidence; expected sign cost cannot hide behind
+        # one compatible pair. Retention gating is outside conditional mixture.
+        terms=compatibility_terms(pa,pb,soft_cost,config.get('temperature',1.))+(
+            mass*config.get('sign_weight',10.)*wrong).sum((1,2))
+    else:terms=(mass*cost).sum((1,2))
+    if charge is not None:terms=terms+fixed_sign_terms(pa,pb,ordered,charge,selected_ordered)
+    if event_weights is not None:terms=terms*event_weights
+    return terms.mean()
+
+
+def compatibility_terms(pa,pb,cost,temperature=1.):
+    import torch
+    if temperature<=0:raise ValueError('Temperature must be positive')
+    ma=pa.sum(1);mb=pb.sum(1)
+    a=pa/ma[:,None].clamp_min(1e-30);b=pb/mb[:,None].clamp_min(1e-30)
+    logmass=a.clamp_min(1e-30).log()[:,:,None]+b.clamp_min(1e-30).log()[:,None,:]
+    return ma*mb*(-temperature*torch.logsumexp((logmass-cost/temperature).flatten(1),1))
+
+
+def compatibility_loss(pa,pb,cost,temperature=1.):
+    return compatibility_terms(pa,pb,cost,temperature).mean()
+
+
+def proposal_weights(in_active,event_count,active_count,fraction):
+    if not 0<=fraction<1:raise ValueError('Active fraction must preserve uniform support')
+    if active_count==0:return in_active.float()*0+1
+    return 1/((1-fraction)+fraction*(event_count/active_count)*in_active)
+
+
+def draw_events(event_count,batch,active,mask,fraction,device):
+    import torch
+    edges=torch.randint(event_count,(batch,),device=device)
+    if len(active) and fraction:
+        choose=torch.rand(batch,device=device)<fraction
+        candidates=active[torch.randint(len(active),(batch,),device=device)]
+        edges=torch.where(choose,candidates,edges)
+    return edges,proposal_weights(mask[edges],event_count,len(active),fraction)
+
+
+def selected_ordering(sa,sb,phase_a,phase_b,z_a,z_b,family_a,family_b,ds_a,ds_b,widths,phase_delta,sign):
+    """Fresh double-precision selected coordinates; no stale violation forcing."""
+    import torch
+    w=widths.double();bounds=torch.cat((w.new_zeros(1),w.cumsum(0)))
+    qa=coordinates(sa.double(),phase_a.double(),z_a.double(),family_a,ds_a.double(),w,bounds)[2]
+    qb=coordinates(sb.double(),phase_b.double(),z_b.double(),family_b,ds_b.double(),w,bounds)[2]
+    a=qa.gather(1,sa[:,:len(w)].argmax(1,keepdim=True)).squeeze(1)
+    b=qb.gather(1,sb[:,:len(w)].argmax(1,keepdim=True)).squeeze(1)
+    return sign.double()*(b-a-phase_delta.double()+.5*(family_b-family_a))
+
+
+def continuation_likelihood(pa,pb,ua,ub,va,vb,scale,temperature=1.):
+    cost=((ua[:,:,None]-ub[:,None,:])/scale).square()+((va[:,:,None]-vb[:,None,:])/scale).square()
+    return compatibility_loss(pa,pb,cost,temperature)
 
 
 def continuation_cost(pa,pb,ua,ub,va,vb,scale):
@@ -267,25 +427,88 @@ def _tensor_data(d,device):
     return {k:torch.as_tensor(d[k],device=device,dtype=(torch.long if k in ('family','i','j') else torch.float32)) for k in keys}
 
 
-def audit(d, state, widths, config, indices=None):
-    """Vectorized CPU hard readout, full graph at final; no GPU needed."""
+def hard_geometry(d,state,widths,config):
+    """Shared canonical readout for full audits and active-set selection."""
     from scipy.special import softmax
+    if config.get('broken_threshold') is not None:state=state.astype(np.float64,copy=False)
     k=len(widths);p=softmax(state[:,:k+1],axis=1);labels=p.argmax(1);keep=labels<k
-    pick=np.minimum(labels,k-1);frac=d['phase']+.25*np.tanh(state[np.arange(len(state)),k+1+pick])
+    if config.get('broken_threshold') is not None:
+        threshold=config['broken_threshold']
+        if not 0<threshold<1:raise ValueError('Invalid broken threshold')
+        keep=p[:,k]<=threshold
+        labels=np.where(keep,state[:,:k].argmax(1),k)
+    pick=np.minimum(labels,k-1)
+    if config.get('broken_threshold') is not None:pick=state[:,:k].argmax(1)
+    frac=d['phase']+.25*np.tanh(state[np.arange(len(state)),k+1+pick])
     b=np.r_[0,np.cumsum(widths,dtype=np.float64)]
     u=b[pick]+widths[pick]*frac;v=d['z']+1000*state[np.arange(len(state)),2*k+1+pick]
-    def point(ids,ds):
-        val=u[ids]+(d['family'][ids]==0)*ds
-        bucket=np.clip(np.searchsorted(b,val,side='right')-1,0,k-1)
-        return bucket+(val-b[bucket])/widths[bucket],v[ids]+(d['family'][ids]==1)*ds
+    if anchored(config):
+        du=state[:,k+3:2*k+3];du=du-du.mean(1,keepdims=True)
+        dv=state[:,2*k+3:];dv=dv-dv.mean(1,keepdims=True)
+        phase=d['phase']+state[:,k+1]
+        q=pick+phase+du[np.arange(len(state)),pick]
+        bucket=np.floor(q).astype(int).clip(0,k-1)
+        u=b[bucket]+widths[bucket]*(q-bucket)
+        v=d['z']+1000*(state[:,k+2]+dv[np.arange(len(state)),pick])
+    return p,labels,keep,pick,u,v,b
+
+
+def geometry_points(d,u,v,b,widths,ids,ds):
+    val=u[ids]+(d['family'][ids]==0)*ds
+    bucket=np.clip(np.searchsorted(b,val,side='right')-1,0,len(widths)-1)
+    return bucket+(val-b[bucket])/widths[bucket],v[ids]+(d['family'][ids]==1)*ds
+
+
+def edge_readout(d,geometry,widths,e):
+    _,_,keep,_,u,v,b=geometry;i=d['i'][e];j=d['j'][e]
+    qa,_=geometry_points(d,u,v,b,widths,i,d['ds_a'][e])
+    qb,_=geometry_points(d,u,v,b,widths,j,d['ds_b'][e])
+    delta=qb-qa-d['phase_delta'][e]+.5*(d['family'][j]-d['family'][i])
+    return qa,qb,delta,keep[i]&keep[j]
+
+
+def violation_indices(d,state,widths,config):
+    geometry=hard_geometry(d,state,widths,config);found=[]
+    for start in range(0,len(d['i']),131072):
+        e=np.arange(start,min(start+131072,len(d['i'])))
+        _,_,delta,active=edge_readout(d,geometry,widths,e)
+        wrong=active&(d['sign'][e]!=0)&(delta*d['sign'][e]<-config.get('sign_tolerance',1e-4))
+        found.append(e[wrong])
+    return np.concatenate(found)
+
+
+def audit(d, state, widths, config, indices=None):
+    """Vectorized CPU hard readout, full graph at final; no GPU needed."""
+    geometry=hard_geometry(d,state,widths,config)
+    p,labels,keep,pick,u,v,b=geometry;k=len(widths)
+    if config.get('broken_threshold') is not None:state=state.astype(np.float64,copy=False)
+    extra={}
+    if anchored(config):
+        du=state[:,k+3:2*k+3];du=du-du.mean(1,keepdims=True)
+        dv=state[:,2*k+3:];dv=dv-dv.mean(1,keepdims=True)
+        phase=d['phase']+state[:,k+1]
+        q=pick+phase+du[np.arange(len(state)),pick]
+        separation=1+np.diff(du,axis=1)
+        extra=dict(offset_over_quarter_percent=float(100*np.mean(abs(du)>.25)),
+            chosen_retained_offset_over_quarter_percent=float(100*np.mean(
+                abs(du[np.arange(len(state)),pick][keep])>.25)) if keep.any() else None,
+            probability_mass_offset_over_quarter_percent=float(100*np.sum(p[:,:k]*(abs(du)>.25))/max(float(p[:,:k].sum()),1e-30)),
+            chosen_retained_abs_offset_quantiles=np.quantile(abs(du[np.arange(len(state)),pick][keep]),[.5,.95,.99,1]).tolist() if keep.any() else None,
+            abs_offset_turn_quantiles=np.quantile(abs(du),[.5,.95,.99,1]).tolist(),
+            min_bucket_separation_turns=float(separation.min()),
+            nonpositive_bucket_separation_percent=float(100*np.mean(separation<=0)),
+            shared_phase_range=[float(phase.min()),float(phase.max())],
+            retained_anchor_q_quantiles=np.quantile(q[keep],[0,.5,1]).tolist() if keep.any() else None,
+            occupied_anchor_windings=np.unique(np.floor(q[keep]).astype(int)).tolist(),
+            bucket_indices_are_relative_to_unwrapped_anchor=True)
     sel=np.arange(len(d['i'])) if indices is None else indices
     total=known=bad=retained=0;errors=[];bytype={};minq=np.inf;maxq=-np.inf
     for a in range(0,len(sel),131072):
         e=sel[a:a+131072];i=d['i'][e];j=d['j'][e]
-        qa,_=point(i,d['ds_a'][e]);qb,_=point(j,d['ds_b'][e]);minq=min(minq,qa.min(),qb.min());maxq=max(maxq,qa.max(),qb.max())
-        delta=qb-qa-d['phase_delta'][e]+.5*(d['family'][j]-d['family'][i])
-        active=keep[i]&keep[j];ks=(d['sign'][e]!=0)&active
-        wrong=(delta*d['sign'][e]<-1e-4)&ks
+        qa,qb,delta,active=edge_readout(d,geometry,widths,e)
+        minq=min(minq,qa.min(),qb.min());maxq=max(maxq,qa.max(),qb.max())
+        ks=(d['sign'][e]!=0)&active
+        wrong=(delta*d['sign'][e]<-config.get('sign_tolerance',1e-4))&ks
         total+=len(e);retained+=int(active.sum());known+=int(ks.sum());bad+=int(wrong.sum())
         errors.append(abs(abs(delta[active])-d['distance'][e][active]))
         for name,mask in [('parallel',d['parallel'][e]),('perpendicular',~d['parallel'][e])]:
@@ -303,16 +526,43 @@ def audit(d, state, widths, config, indices=None):
     return dict(pieces=len(state),rejected_pieces=int((~keep).sum()),rejected_percent=float(100*(~keep).mean()),
         retained_arc_percent=float(100*d['lengths'][keep].sum()/d['lengths'].sum()),events_evaluated=total,
         retained_events=retained,retained_events_percent=100*retained/total,known_sign_events=known,sign_violations=bad,
+        sign_feasible=bool(bad==0 and known>0),broken_threshold=config.get('broken_threshold'),
+        sign_tolerance=config.get('sign_tolerance',1e-4),
         sign_violation_percent=100*bad/known if known else None,distance_error_quantiles=quantiles(error),
         distance_mean_error=float(error.mean()) if len(error) else None,continuation_error_base_quantiles=quantiles(continuity),
         continuation_links=len(links),retained_continuation_links=retained_links,
         ambiguous_percent=float(100*(p.max(1)<.9).mean()),zero_probability_percent=float(100*(p==0).mean()),
         mean_rejection_probability=float(p[:,-1].mean()),occupied_windings=np.unique(labels[keep]).tolist(),
         boundary_hypothesis_percent=float(100*((labels[keep]==0)|(labels[keep]==k-1)).mean()) if keep.any() else None,
-        endpoint_q_range=[float(minq),float(maxq)],by_type=bytype)
+        endpoint_q_range=[float(minq),float(maxq)],by_type=bytype,**extra)
+
+
+def load_warm_start(config,d,shape):
+    path=Path(config['warm_start'])
+    if sha256_file(path)!=config['warm_start_sha256']:raise ValueError('Changed warm start')
+    summary=json.loads((path.parent/'summary.json').read_text())
+    expected=json.loads(Path(config['tensor_cache']).with_suffix('.json').read_text())['signature']
+    if summary['input']['signature']!=expected:raise ValueError('Warm-start evidence mismatch')
+    with np.load(path) as src:
+        for key in ('source_id','start','end','family'):
+            if not np.array_equal(src[key],d[key]):raise ValueError('Warm-start piece mismatch: '+key)
+        state=src['state'].copy();widths=src['widths'].copy()
+    if state.shape!=shape or widths.shape!=(100,) or not np.isfinite(state).all() or not np.isfinite(widths).all() or np.any(widths<=100):
+        raise ValueError('Invalid warm-start state/widths')
+    return state,widths
+
+
+def inverse_widths(widths):
+    import torch
+    x=widths-100
+    if bool((x<=0).any()):raise ValueError('Widths must exceed100')
+    return x+torch.log(-torch.expm1(-x))
 
 
 def solve(config):
+    if config.get('assignment_update')=='cost_target':
+        from .fiber_uv_categorical import solve_categorical
+        return solve_categorical(config)
     import torch
     if not torch.cuda.is_available():raise RuntimeError('Production U/V solve requires CUDA')
     torch.set_num_threads(4);torch.manual_seed(config.get('seed',0))
@@ -325,48 +575,79 @@ def solve(config):
     diagnostic=np.sort(rng.choice(len(d['i']),min(100000,len(d['i'])),replace=False))
     # Shared table lookup makes broad Gaussian hypotheses cheap without K*K*R tensors.
     table=torch.from_numpy(make_distance_table(float(d['distance'].max()),config.get('distance_sigma',.5))).to(device)
-    state=np.zeros((n,3*k+1),np.float32)
+    state=np.zeros((n,3*k+(3 if anchored(config) else 1)),np.float32)
     state[:,:k]=np.maximum(-14.,-.5*((np.arange(k)[None,:]-d['initial_k'][:,None])/config.get('initial_sigma',3.))**2)
     from scipy.special import logsumexp
     # Give rejection a real trainable gradient; -20 would be below Adam epsilon
     # after averaging a minibatch and would effectively disable this alternative.
     state[:,k]=logsumexp(state[:,:k],axis=1)+np.log(.01/.99)
+    start_width=d['width_initial']
+    if config.get('warm_start'):state,start_width=load_warm_start(config,d,state.shape)
     embedding=torch.nn.Embedding.from_pretrained(torch.from_numpy(state).to(device),freeze=False,sparse=True)
     initial_width=torch.as_tensor(d['width_initial'],device=device)
-    raw=torch.nn.Parameter((initial_width-100).clamp_min(1.))
+    raw=torch.nn.Parameter(inverse_widths(torch.as_tensor(start_width,device=device)))
     opt=torch.optim.SparseAdam(embedding.parameters(),lr=config.get('lr',.03))
     widthopt=torch.optim.Adam([raw],lr=config.get('width_lr',2.))
     steps=int(config.get('steps',1000));batch=int(config.get('batch_size',1024));every=int(config.get('log_every',100))
     history=[];started=time.monotonic();torch.cuda.reset_peak_memory_stats()
-    baseline=audit(d,state,d['width_initial'],config)
+    baseline=audit(d,state,start_width,config)
+    charged=config.get('sign_charge_multiplier',0.)>0
+    fraction=float(config.get('active_fraction',0.))
+    if not 0<=fraction<1:raise ValueError('Active fraction must preserve uniform support')
+    active=torch.empty(0,device=device,dtype=torch.long)
+    active_mask=torch.zeros(len(d['i']),device=device,dtype=torch.bool)
+    if charged:
+        phase64=torch.as_tensor(d['phase'],device=device,dtype=torch.float64)
+        z64=torch.as_tensor(d['z'],device=device,dtype=torch.float64)
+        precise={key:torch.as_tensor(d[key],device=device,dtype=torch.float64)
+                 for key in ('ds_a','ds_b','phase_delta')}
+    active_every=int(config.get('active_refresh',every))
+    if active_every<1:raise ValueError('Invalid active refresh')
     def coords(ids,ds,widths,bounds):
         s=embedding(ids);p=s[:,:k+1].softmax(-1)
         u,v,q=coordinates(s,data['phase'][ids],data['z'][ids],data['family'][ids],ds,widths,bounds)
         return p,u,v,q
     for step in range(steps+1):
         widths,bounds=width_boundaries(raw)
-        if step%every==0 or step==steps:
+        refreshed=False
+        if fraction and (step%active_every==0 or step==steps):
+            snapshot=embedding.weight.detach().cpu().numpy();w=widths.detach().cpu().numpy()
+            bad_indices=violation_indices(d,snapshot,w,config)
+            active=torch.as_tensor(bad_indices,device=device,dtype=torch.long)
+            active_mask.zero_();active_mask[active]=True;refreshed=True
+            print(f'UV active step={step} strict_violations={len(active)}',flush=True)
+        feasible_check=refreshed and not len(active) and step>=config.get('minimum_steps',100) and config.get('stop_when_feasible',False)
+        if step%every==0 or step==steps or feasible_check:
             torch.cuda.synchronize();snapshot=embedding.weight.detach().cpu().numpy()
-            w=widths.detach().cpu().numpy();metrics=audit(d,snapshot,w,config,None if step==steps else diagnostic)
+            w=widths.detach().cpu().numpy();metrics=audit(d,snapshot,w,config,None if step==steps or feasible_check or charged else diagnostic)
             record=dict(step=step,seconds=time.monotonic()-started,event_samples=step*batch,
-                equivalent_event_epochs=step*batch/len(d['i']),width_range=[float(w.min()),float(w.max())],**metrics)
+                equivalent_event_epochs=step*batch/len(d['i']),importance_sampled=bool(fraction),
+                active_violations=len(active) if fraction else None,width_range=[float(w.min()),float(w.max())],**metrics)
             if step:record.update(loss=float(loss.detach()),pair_loss=float(pair.detach()),regularization=float(reg.detach()))
             history.append(record);atomic_write(root/'history.json',history,durable=False)
             print('UV '+json.dumps(record),flush=True)
-            if step==steps:break
-        edges=torch.randint(len(d['i']),(batch,),device=device)
+            if step==steps or (feasible_check and metrics['sign_feasible']):break
+        edges,event_weights=draw_events(len(d['i']),batch,active,active_mask,fraction,device)
         i=data['i'][edges];j=data['j'][edges]
         pa,ua,va,qa=coords(i,data['ds_a'][edges],widths,bounds)
         pb,ub,vb,qb=coords(j,data['ds_b'][edges],widths,bounds)
+        charge=selected=None
+        if charged:
+            charge=calibrated_sign_charge(data['degree'][i],data['degree'][j],data['degree'].mean(),
+                len(d['i']),n,config.get('rejection_cost',10.),config['sign_charge_multiplier'])
+            selected=selected_ordering(embedding(i),embedding(j),phase64[i],phase64[j],z64[i],z64[j],
+                data['family'][i],data['family'][j],precise['ds_a'][edges],precise['ds_b'][edges],widths,
+                precise['phase_delta'][edges],data['sign'][edges])
         pair=pair_objective(pa[:,:k],pb[:,:k],qa,qb,va,vb,data['phase_delta'][edges],data['family'][j]-data['family'][i],
-            data['sign'][edges],data['distance'][edges],data['target_v'][edges],table,config)
+            data['sign'][edges],data['distance'][edges],data['target_v'][edges],table,config,charge,event_weights,selected)
         for pp,qq,phase_key in ((pa,qa,'phase_a'),(pb,qb,'phase_b')):
             angle=qq-data[phase_key][edges,None];angle=angle-angle.detach().round()
-            pair=pair+config.get('prior_weight',.01)*.5*(pp[:,:k]*angle.square()).sum(-1).mean()
+            pair=pair+config.get('prior_weight',.01)*.5*(event_weights*(pp[:,:k]*angle.square()).sum(-1)).mean()
         # Uniform node sample prevents degree-biased rejection/prior normalization.
         ni=torch.randint(n,(batch,),device=device);ns=embedding(ni);npb=ns[:,:k+1].softmax(-1)
         degree=data['degree'];cost=.5+.5*degree[ni]/degree.mean().clamp_min(1.)
         reg=config.get('rejection_cost',10.)*(npb[:,k]*cost).mean()
+        if anchored(config):reg=reg+offset_regularization(ns,k,config)
         ramp=min(1.,max(0.,(step/steps-.5)/.3))
         reg=reg+config.get('entropy_weight',.05)*ramp*(-npb*npb.clamp_min(1e-20).log()).sum(-1).mean()
         for point in range(3):
@@ -381,7 +662,10 @@ def solve(config):
             links=data['links'][torch.randint(len(data['links']),(min(batch,len(data['links'])),),device=device)]
             ca,cu,cv,_=coords(links[:,0].long(),links[:,2],widths,bounds)
             cb,du,dv,_=coords(links[:,1].long(),links[:,3],widths,bounds)
-            reg=reg+config.get('continuation_weight',10.)*continuation_cost(ca[:,:k],cb[:,:k],cu,du,cv,dv,initial_width.mean())
+            continuation=continuation_likelihood if anchored(config) else continuation_cost
+            link_normalization=len(data['links'])/len(d['i']) if anchored(config) else 1.
+            reg=reg+config.get('continuation_weight',10.)*link_normalization*continuation(
+                ca[:,:k],cb[:,:k],cu,du,cv,dv,config.get('continuation_scale',128.) if anchored(config) else initial_width.mean())
         loss=pair+reg
         opt.zero_grad(set_to_none=True);widthopt.zero_grad(set_to_none=True);loss.backward()
         # Initial assignment settling before opening the rejection alternative.
@@ -392,13 +676,18 @@ def solve(config):
     np.savez(root/'solution.npz',state=snapshot,widths=w,source_id=d['source_id'],start=d['start'],end=d['end'],family=d['family'])
     summary=dict(config=config,input=json.loads(Path(config['tensor_cache']).with_suffix('.json').read_text()),
         baseline=baseline,final=history[-1],gpu=torch.cuda.get_device_name(),peak_allocated_bytes=torch.cuda.max_memory_allocated(),
-        state_layout='logits[101],fraction_adjustment[100],v_adjustment[100]',
+        state_layout=('logits[101],shared_phase,shared_v,centered_u_turn_offsets[100],centered_v_offsets[100]'
+                      if anchored(config) else 'logits[101],fraction_adjustment[100],v_adjustment[100]'),
         interpretation='Model consistency only, finite sign penalty; fixed arc maps, sampled Adam; no anatomical GT')
     atomic_write(root/'summary.json',summary,durable=False)
 
 
 def run(config):
     prepare(config)
+    if config.get('warm_start'):
+        digest=sha256_file(config['warm_start'])
+        if config.get('warm_start_sha256',digest)!=digest:raise ValueError('Changed warm start')
+        config=dict(config,warm_start_sha256=digest)
     return launch_tensor_solve(config,__name__,Path(__file__))
 
 
@@ -413,10 +702,16 @@ def report(config):
             if not np.array_equal(d[key],s[key]):raise ValueError('Saved piece identity mismatch: '+key)
         if not np.isfinite(s['state']).all() or not np.isfinite(s['widths']).all() or np.any(s['widths']<=0):
             raise ValueError('Invalid solution state')
-        if s['state'].shape!=(len(d['family']),301) or s['widths'].shape!=(100,):raise ValueError('State shape')
+        if s['state'].shape!=(len(d['family']),303 if anchored(cfg) else 301) or s['widths'].shape!=(100,):raise ValueError('State shape')
         signature=summary['input']['signature']
         for key in ('database','features','stage1','hv_solution','afv','umbilicus'):
             if sha256_file(cfg[key])!=signature[key]:raise ValueError('Changed input: '+key)
+        if anchored(cfg):
+            for key in ('h_direction_solution','v_direction_solution'):
+                if sha256_file(cfg[key])!=signature[key]:raise ValueError('Changed input: '+key)
+            with np.load(cfg['hv_solution']) as prior:
+                frozen,_=direction_inputs(cfg,signature,d['ids'],prior['labels'])
+            if not np.array_equal(frozen,d['earlier_labels']):raise ValueError('Frozen labels changed')
         if np.any(d['earlier_labels'][d['source_index']]==2):raise ValueError('Earlier rejection reintroduced')
         with _ro(cfg['database']) as db:
             lengths=dict(db.execute('SELECT id,length_base FROM fibers'))
@@ -442,20 +737,62 @@ def report(config):
                 expected_links.extend((i,i+1) for i in range(a,b-1))
         if not np.array_equal(np.asarray(expected_links).reshape(-1,2),d['links'][:,:2]):raise ValueError('Invalid continuation graph')
         metrics=audit(d,s['state'],s['widths'],cfg)
+        if cfg.get('assignment_update')=='cost_target':
+            warm,ww=load_warm_start(cfg,d,s['state'].shape)
+            if not np.array_equal(warm[:,101:],s['state'][:,101:]) or not np.array_equal(ww,s['widths']):
+                raise ValueError('Categorical run changed frozen geometry/widths')
         for key in ('rejected_pieces','retained_events','sign_violations'):
             if metrics[key]!=summary['final'][key]:raise ValueError('Recomputed readout mismatch: '+key)
         from scipy.special import softmax
         probs=softmax(s['state'][:,:101],axis=1)
         if not np.allclose(probs.sum(1),1,atol=1e-6):raise ValueError('Unnormalized probabilities')
         row=dict(run=str(root),solution_sha256=sha256_file(root/'solution.npz'),tensor_cache_sha256=sha256_file(cfg['tensor_cache']),
+            assignment_update=cfg.get('assignment_update','sampled_adam'),
+            geometry_frozen=cfg.get('assignment_update')=='cost_target',
             partition_audit=dict(fibers=len(included),pieces=len(d['family']),split_fibers=split_fibers,events=len(events),
                                  continuations=len(expected_links),no_observations_removed_by_splitting=True),
             baseline=summary['baseline'],final=metrics,seconds=summary['final']['seconds'],
             equivalent_epochs=summary['final']['equivalent_event_epochs'],peak_gpu_gib=summary['peak_allocated_bytes']/1024**3)
+        if cfg.get('sign_charge_multiplier',0)>0:
+            initial,initial_width=load_warm_start(cfg,d,s['state'].shape)
+            before=violation_indices(d,initial,initial_width,cfg)
+            after=violation_indices(d,s['state'],s['widths'],cfg)
+            geometry=hard_geometry(d,s['state'],s['widths'],cfg)
+            p,_,keep,*_=geometry
+            stats=dict(multiplier=cfg['sign_charge_multiplier'],broken_threshold=cfg['broken_threshold'],
+                       sign_tolerance=cfg.get('sign_tolerance',1e-4),
+                       original_violations=len(before),remaining_violations=len(after),
+                       newly_violating_events=len(np.setdiff1d(after,before)))
+            i=d['i'][before];j=d['j'][before]
+            disabled=~(keep[i]&keep[j]);stats['original_violations_disabled']=int(disabled.sum())
+            stats['original_violations_corrected_while_retained']=int((~disabled).sum()-len(np.intersect1d(before,after)))
+            if len(after):
+                _,_,delta,_=edge_readout(d,geometry,s['widths'],after)
+                stats['remaining_violation_magnitude_quantiles']=np.quantile(-delta*d['sign'][after],[0,.5,.95,1]).tolist()
+                stats['remaining_max_endpoint_broken_probability_quantiles']=np.quantile(
+                    np.maximum(p[d['i'][after],-1],p[d['j'][after],-1]),[0,.5,.95,1]).tolist()
+                ids=np.unique(np.r_[d['i'][after],d['j'][after]])
+                probs=p[ids,-1]
+                stats['remaining_unique_endpoint_pieces']=len(ids)
+                stats['remaining_unique_source_fibers']=len(np.unique(d['source_id'][ids]))
+                stats['remaining_endpoint_broken_probability_quantile_levels']=[0,.05,.25,.5,.75,.95,1]
+                stats['remaining_endpoint_broken_probability_quantiles']=np.quantile(probs,[0,.05,.25,.5,.75,.95,1]).tolist()
+                stats['remaining_endpoint_broken_probability_mean']=float(probs.mean())
+                bins=np.array([0,.01,.05,.1,.25,.4,.5,1.000001])
+                stats['remaining_endpoint_broken_probability_bin_edges']=bins.tolist()
+                stats['remaining_endpoint_broken_probability_bin_counts']=np.histogram(probs,bins)[0].tolist()
+                pair_max=np.maximum(p[d['i'][after],-1],p[d['j'][after],-1])
+                pair_min=np.minimum(p[d['i'][after],-1],p[d['j'][after],-1])
+                stats['remaining_max_endpoint_broken_probability_mean']=float(pair_max.mean())
+                stats['remaining_min_endpoint_broken_probability_quantiles']=np.quantile(pair_min,[0,.5,.95,1]).tolist()
+                stats['remaining_pairs_both_below_probability']={str(t):int((pair_max<t).sum()) for t in (.01,.05,.1,.25,.4)}
+                stats['all_retained_piece_broken_probability_quantiles']=np.quantile(p[keep,-1],[0,.5,.95,1]).tolist()
+                stats['all_retained_piece_broken_probability_mean']=float(p[keep,-1].mean())
+            row['fixed_charge_audit']=stats
         reports.append(row);atomic_write(root/'audit.json',row,durable=False)
     destination=Path(config['report']);lines=['# Global U/V layout: first experiments','',
         'All earlier rejections fixed; baked H/V. Full-graph readout, no ground-truth layout labels.',
-        'Ordering errors use retained known-sign events (tolerance1e-4winding); finite penalty, not hard feasibility.',
+        'Ordering errors use retained known-sign events; each run records its tolerance and broken readout below. Finite penalty is not a hard feasibility guarantee.',
         'Rejection and arc retention use input pieces/arc after earlier stages. Distance errors are winding units.','',
         '| Run | Rejected pieces | Retained arc | Retained events | Sign errors | Mean distance error | Ambiguous (<90%) | Seconds |',
         '|---|---:|---:|---:|---:|---:|---:|---:|']
@@ -466,8 +803,15 @@ def report(config):
                 f"{m['retained_events_percent']:.4f}%|{m['sign_violation_percent']:.4f}%|{m['distance_mean_error']:.4f}|"
                 f"{m['ambiguous_percent']:.4f}%|{r['seconds']:.2f}|" )
         details+=['',f"{Path(r['run']).name}: {r['partition_audit']}; sampled epochs={r['equivalent_epochs']:.3f}, peakGPU={r['peak_gpu_gib']:.3f}GiB.",
+            f"Readout: broken threshold={r['final']['broken_threshold']} (None=joint argmax), sign tolerance={r['final']['sign_tolerance']}; feasible={r['final']['sign_feasible']}.",
             f"Final per-type: {r['final']['by_type']}",f"Continuation links retained: {r['final']['retained_continuation_links']}/{r['final']['continuation_links']}; median/p95/p99(basevx): {r['final']['continuation_error_base_quantiles']}",
             f"Numerically zero probabilities: {r['final']['zero_probability_percent']:.6f}%; boundary hypotheses: {r['final']['boundary_hypothesis_percent']}%."]
+        if 'fixed_charge_audit' in r:details.append(f"Fixed-charge audit: {r['fixed_charge_audit']}")
+        if 'offset_over_quarter_percent' in r['final']:
+            m=r['final']
+            details += [f"Quarter-turn exceedance: all buckets {m['offset_over_quarter_percent']:.4f}%; chosen retained {m['chosen_retained_offset_over_quarter_percent']:.4f}%; probability mass {m['probability_mass_offset_over_quarter_percent']:.4f}%.",
+                f"Chosen retained |offset| median/p95/p99/max: {m['chosen_retained_abs_offset_quantiles']}; minimum bucket separation {m['min_bucket_separation_turns']:.6f} turns.",
+                f"Shared phase range {m['shared_phase_range']}; actual retained anchor-q min/median/max {m['retained_anchor_q_quantiles']}. Bucket IDs are relative to the unwrapped anchor."]
     lines+=details
     destination.write_text('\n'.join(lines)+'\n');atomic_write(destination.with_suffix('.json'),reports,durable=False)
     print('\n'.join(lines),flush=True);return dict(report=str(destination),runs=len(reports))

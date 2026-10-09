@@ -1,38 +1,38 @@
-# V direction task log
+# Categorical task log
 
-- H state committed3f5b443e8, including hash-pinned selected H solution manifest.
-  Large outputs remain ignored data/.36tests passed before commit.
-- User requests same direction/breakage pass for V, consistently up.
-- Plan v_direction_plan.md: share H pipeline, axis prior, freeze H solution,
-  V sign baseline and breakage sweep, audit and analogous visualization.
-- Global U/V remains paused. No source/training/inference changes or installations.
-- Independent plan/code review approved. Mechanical rename to shared
-  fiber_direction.py/review.py first,25regressiontests passed before family changes.
-- Added V local axial prior, V–V filter, explicit up/down and family-neutral
-  direction aliases, hash-bound frozen H outputs and combined labels.
--30tests pass4.62s; tests corrected to tolerance1e-14 for quadrature support
-  1+/-2e-16 (no production precision/math change). H prior/loss unchanged.
-- Full V input preparation:237800Vfibers,1842020parallel events. Approved
-  run_v_direction.json; sign-only baseline then4breakageweights in one GPU grant.
-- Preparation72.24s,117091components including86312isolatedV; no degenerate or
-  zero-dot events. Signed baseline528conflicts(0.028664%);16sGPU10ksteps.
-- First two penalties .1/.07 converge77rejections/0conflicts,99.953354%Varc
-  retained,1838768retainedevents. Independent full-data audit passes, including
-  frozen H arrays/labels and up/down gauges. None of77is individually restorable
-  in either sign without conflict; none isolated or unrelated to baseline conflicts.
-- Full sweep done; all4penalties converge same hard labels/signs(77newly broken,
-  zero conflicts). Choose strongest tested penalty.1. Baseline15.88s; four10kstep
-  solves29.99/39.21/40.66/40.07s on sharedH100. These are not isolated speed tests.
--41tests pass7.01s including paused U/V regression; git diff --check clean.
-  CPU-only run_v_direction_review.json generating full audit, recommendation and
-  all-disabled +1000survivingV normal/curve/up-tangent views.
-- Export completed:77full disabled curves,1000survivingV curves,3960outward-normal
-  arrows and4000UPtangent arrows. Hash-pinned v_direction_recommended.json,
-  visualization data/v_direction_v1/visualization_1000. Report in v_direction_results.md.
-- Independent rawAFV resampling128events/256tangents: maximum difference2.97e-8
-  versus cachedfloat32tangents. H signs/labels unchanged; up/down aliases verified.
-- Independent final OBJ audit passed:77disabled curves1120vertices/1043edges;
-  1000survivors25828vertices/24828edges; direction overlay101828vertices/72000faces.
-  All4000arrows independently recomputed from rawAFV (maxdirectionerror2.22e-16),
-  endpoints+256basevx in savedUPdirection, all hashes/indices/survivor masks valid.
-  No remaining blockers. Global U/V still paused.
+- Previous log archived in uv_sign_charge_task_log.md.
+- Completed previous full multiplier16:CCW28760violations,64.4886%arc;
+  CW27968,64.2597%arc. Pilot16settle:9violations,63.5233%arc.
+- New mode:full incident-event aggregation, detached targets, SGD p-target logits.
+- Explicit limitation:first trial freezes geometry/widths to isolate categorical
+  update; expected soft energy replaces mixture likelihood. Not joint refinement.
+- Independent plan/code review passed. Hoisted mean degree; added expected-energy
+  telemetry and full conditional-energy derivative regression including priors
+  and continuation.65tests passed8.39s, legacy paths included.
+- Aggressive8updates*step4 oscillates between widespread rejection and recovery.
+  T=.25:final3288violations/93.6321%arc;T=1:2867/87.5463%arc. Not promoted.
+- Revised1update*step1, T=.25. From original anchor state reaches0violations but
+  ~51%arc at sweep60. From pilot4 state227violations/69.4125%arc reaches0 and
+  71.8092%arc at sweep60. Shows initialization dependence, not a global guarantee.
+- Full CCW/CW repair configs queued through manager,10full sweeps,starting from
+  previous full fixed-charge16 results. No early stopping at first zero.
+- Target temperature replaces previous positive entropy sharpening; no hidden
+  duplicate entropy term. The full conditional energy is not previous mixture
+  likelihood, so this is not a pure optimizer-only controlled comparison.
+- Final pilot repair:0violations,71.9722%arc,16.6517%pieces rejected,120.13s.
+  Original227:137corrected retained,90disabled; total rejected1890→1666.
+  All last10sweeps0violations. Original-anchor damped52.7570%arc at0violations.
+- Independent saved-array audit agrees. Frozen geometry exact.0/5continuations
+  retained and max target discrepancy.936 remain limitations, clearly reported.
+- First pilot new-module hash omission documented. Full execution now captures
+  both module hashes. No retroactive guessed provenance.
+- Future full categorical launches: CCW GPU0, CW GPU1, shared12GiB reservation
+  each (down from24GiB). Observed combined GPU memory was14.4GiB for both jobs;
+  12GiB/job keeps headroom above roughly7.2GiB average, not a measured per-job peak.
+  Batch4096 unchanged. Current frozen configs and manager grants untouched;
+  no restarts or new launches. JSON/device/budget validation and diff check pass.
+- Full10sweeps completed:CCW28760→110sign errors(0.0048921%),arc64.4886→62.4748%,
+  rejected21.1274→22.7383%,755.14s;CW27968→104(0.0046532%),arc64.2597→62.3828%,
+  rejected21.2675→22.7887%,754.85s. Peak Torch6.1316GiB/job. Retainedlinks1/466
+  and0/466 respectively. Final solver audits saved; independent full artifact
+  report not yet rerun. No posthoc filtering or further solve launched.

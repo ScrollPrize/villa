@@ -1,0 +1,11 @@
+{
+  "fiber_uv_report": {
+    "runs": [
+      "/home/hendrik/villa2/global-fiber-sgd/data/uv_categorical_v1/pilot_t0.25",
+      "/home/hendrik/villa2/global-fiber-sgd/data/uv_categorical_v1/pilot_t1",
+      "/home/hendrik/villa2/global-fiber-sgd/data/uv_categorical_v1/pilot_damped",
+      "/home/hendrik/villa2/global-fiber-sgd/data/uv_categorical_v1/pilot_repair"
+    ],
+    "report": "/home/hendrik/villa2/global-fiber-sgd/uv_categorical_pilot_results.md"
+  }
+}

@@ -1,12 +1,8 @@
-# V direction status
+# Categorical status
 
-- [x] Commit H state and record V task/plan
-- [x] Independent plan review
-- [x] Shared family-specific preparation/solver/export and41tests
-- [x] Full V baseline and breakage sweep
-- [x] Independent saved-result audit
-- [x] Independent visualization audit
-- [x] Results, recommendation and docs
-
-Selected V penalty0.1:77newly disabled V, zero conflicts,
-99.953354%Vfiber arc retained. H solution unchanged; global U/V paused.
+- [x] Task and plan.
+- [x] Independent review.
+- [x] Implementation and tests (65 passed).
+- [x] Pilot matrix and full H comparisons (both10sweeps completed).
+- [x] Pilot independent audit, full final solver audits, results/docs; grants released.
+- [ ] Separate full persisted-artifact audit report (not yet rerun).

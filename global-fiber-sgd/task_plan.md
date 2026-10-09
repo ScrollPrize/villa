@@ -1,5 +1,14 @@
 # Global fiber SGD: data reconnaissance
 
+Current task: [aggregated categorical targets](uv_categorical_plan.md).
+The task references below describe previous experiments.
+
+Current task: [fixed sign charge](uv_sign_charge_plan.md), superseding the
+completed shared-anchor integration below. Target zero retained sign violations.
+
+Current task: uv_anchor_plan.md; user has resumed global layout after completed
+direction stages. This supersedes the historical paused-layout notes below.
+
 ## Current task
 
 V-fiber consistent up-direction alignment and breakage: task.md and

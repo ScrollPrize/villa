@@ -1,0 +1,9 @@
+{
+  "fiber_uv_report": {
+    "runs": [
+      "/home/hendrik/villa2/global-fiber-sgd/data/uv_sign_charge_v1/pilot4",
+      "/home/hendrik/villa2/global-fiber-sgd/data/uv_sign_charge_v1/pilot16"
+    ],
+    "report": "/home/hendrik/villa2/global-fiber-sgd/uv_sign_charge_pilot_results.md"
+  }
+}

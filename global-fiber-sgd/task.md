@@ -1,7 +1,5 @@
-# V-fiber up-direction alignment
+# Cost-target categorical optimization
 
-Commit the current H solution/state, then apply the same whole-fiber sign and
-breakage optimization to V fibers so surviving fibers share a consistent up
-direction. Use V–V parallel constraints and a weak positive-Z local umbilicus
-axis prior. Preserve earlier exclusions and the accepted H solution. Include
-analogous disabled/surviving/tangent-arrow visualization. Global U/V stays paused.
+Implement and test aggregated conditional-cost targets and cross-entropy logit
+updates so tiny compatible/broken probabilities can recover. Preserve existing
+solver/results. Plan: uv_categorical_plan.md.

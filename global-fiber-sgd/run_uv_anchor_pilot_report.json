@@ -1,0 +1,9 @@
+{
+  "fiber_uv_report": {
+    "runs": [
+      "/home/hendrik/villa2/global-fiber-sgd/data/uv_anchor_v1/pilot_ccw_v2",
+      "/home/hendrik/villa2/global-fiber-sgd/data/uv_anchor_v1/pilot_expected"
+    ],
+    "report": "/home/hendrik/villa2/global-fiber-sgd/uv_anchor_pilot_results.md"
+  }
+}

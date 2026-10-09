@@ -2,6 +2,23 @@
 
 ## 2026-10-09
 
+- Added full-neighborhood categorical cost targets with unsuppressed p-target
+  logit updates; shared geometry/costs and frozen-input auditing. Damped pilot
+  repair227→0sign violations,69.4125→71.9722%arc retained; aggressive updates
+  oscillate. Continuous geometry is fixed and continuation failures remain;
+  no claim of completed global layout.65regression tests pass.
+
+- Resumed opt-in global layout with all accepted direction/exclusion outputs:
+  unwrapped shared anchors, centered per-bucket offsets and strong quarter-turn
+  hinge, all-pair compatibility likelihood with separate sign/rejection penalties.
+  Both H conventions configured; legacy results/mode preserved.49tests pass.
+  Initial pilot revealed weak offset scaling and disproportionate continuation
+  normalization; revised pilot and full trials use stronger offsets and per-event
+  normalization. Results are experimental, not promoted anatomical assignments.
+  Full6.6061Mevent/489663piece trials:CCW6.4448%sign violations/91.4355%arc,
+  CW6.4855%/91.3679%; ~17min/sharedH100each.54%ambiguous and poor continuation;
+  both saved-state audits pass, findings in uv_anchor_results.md. No promoted default.
+
 - Committed H/current state as3f5b443e8 with hash-pinned selected solution.
   Generalized H pipeline to shared family-specific direction preparation,
   sign/broken optimization and visualization; no duplicated V implementation.

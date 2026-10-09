@@ -1,18 +1,30 @@
 # Global fiber assignment with PyTorch SGD
 
+Current experiment: [categorical cost targets](uv_categorical_plan.md), repairing
+winding/broken probabilities with frozen continuous geometry. See
+[pilot results](uv_categorical_pilot_results.md). This is not yet a complete
+validated global layout; historical stage notes below remain for provenance.
+
+Current task: [shared-anchor global U/V integration](uv_anchor_plan.md), now
+resumed after all four accepted normal/HV/H/V-direction stages. New opt-in
+solver and both H-convention trials documented in [uv_layout.md](uv_layout.md).
+Results: [shared-anchor full comparison](uv_anchor_results.md); neither direction
+is promoted as a reliable layout yet.
+Historical paused-stage notes below describe earlier experiments only.
+
 Current direction passes: [H](h_direction.md) and [V consistent up](v_direction.md),
 with whole-fiber breakage. H checkpoint`3f5b443e8`; V keeps that solution frozen.
 [V results](v_direction_results.md):77newly disabled V, zero remaining parallel
-direction conflicts,99.953354%Vfiber arc retained. Full H/global state preserved;
-global U/V assignment remains PAUSED pending further constraints.
+direction conflicts,99.953354%Vfiber arc retained. These accepted outputs now
+feed the optional shared-anchor global layout revision.
 
 Current stage3: [H-fiber direction alignment with breakage](h_direction.md), following
 normal signs and baked H/V. [Breakage sweep](h_direction_breakage_results.md)
 replaces the [sign-only baseline](h_direction_results.md), which had0.047735%
-weighted parallel disagreement with no additional rejections. Global U/V is PAUSED
-pending further constraints; this direction stage has not yet been wired into it.
+weighted parallel disagreement with no additional rejections. H circulation is
+tested in both conventions by the current global layout stage.
 
-Paused experimental stage: [probabilistic global U/V layout](uv_layout.md),
+Earlier experimental stage: [probabilistic global U/V layout](uv_layout.md),
 following accepted inward normal and baked H/V solutions.100winding hypotheses
 plus rejection; immutable constraint events, eligible1cmcuts and continuation.
 See [global results](uv_layout_results.md) for full-graph diagnostics and limitations.

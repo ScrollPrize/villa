@@ -1,5 +1,129 @@
 # Probabilistic global U/V layout
 
+## Cost-target assignment experiment (2026-10-09)
+
+`assignment_update=cost_target` selects `fiber_uv_categorical.py`. It reuses the
+shared coordinates, pair costs, provenance, manager and strict readout. Requires
+a shared-anchor warm start; **continuous offsets/phases/widths are frozen**.
+This is assignment/rejection repair, not joint geometry optimization.
+
+For each candidate winding, aggregate costs of ALL incident constraints against
+each neighbor's unnormalized winding distribution. Broken neighbors contribute
+zero. Multiply incident sums by N/E; broken's cost is R*(.5+.5*degree/mean_degree).
+Fixed sign charges distinguish each individual winding pair, alongside the
+original magnitude and soft geometric costs. No selected-pair blanket charge.
+Continuations, per-event angle and node geometric priors are included.
+
+Targets are detached `softmax(-conditional_cost/temperature)`. Direct per-row
+cross-entropy SGD updates logits by `-step*(p-target)`, avoiding both the tiny
+current-probability factor and accidental1/N shrink. All targets use the same
+previous state. Small updates reduce synchronous reject/restore oscillation.
+The temperature replaces old positive entropy sharpening; expected soft energy
+replaces mixture likelihood. Thus this is not an optimizer-only ablation.
+
+Run with the existing command, substituting the desired config:
+
+```bash
+/home/hendrik/.venv_las/bin/python /home/hendrik/villa2/vesuvius/scripts/run_classic_fiber_evaluation.py crop-benchmark --config /home/hendrik/villa2/global-fiber-sgd/run_uv_categorical_repair.json
+```
+
+Other configs: `run_uv_categorical_damped.json` (earlier diffuse initialization),
+`run_uv_categorical_pilot_t0.25.json` / `_t1.json` (aggressive oscillating controls),
+`run_uv_categorical_ccw.json` / `_cw.json` (full repair),
+`run_uv_categorical_pilot_report.json` (read-only evidence audit plus report files).
+Completed output roots refuse overwrite; change output_root for repetition.
+Future full configs request shared12GiB per job on separate GPUs (CCW0, CW1),
+released on completion. The initial full trials retain their frozen24GiB grants
+on GPU0; changing launch configs does not alter running jobs. Batch4096 unchanged.
+Pilot configs retain their historical reservations. No dependencies
+or builds added. Reproducibility uses fixed full-graph order and deterministic
+Torch operations; CPU audits test strict negative signs and q_broken>0.5.
+
+The first repair pilot reaches0violations and71.9722%arc versus227and69.4125%.
+This does not solve the existing continuation failures (0/5links survive) or
+establish anatomical correctness. Probabilities remain uncalibrated; zero selected
+sign violations does not imply a converged posterior.
+
+## Current shared-anchor revision (2026-10-09)
+
+Opt in with `layout_mode=shared_anchor`; the legacy formulation below remains
+available for old results/configurations. Use run_uv_anchor_ccw.json and
+run_uv_anchor_cw.json through the same approved crop-benchmark runner.
+
+The accepted normal, H/V, H-direction and V-direction solutions are hash-bound.
+All previous rejections are excluded (23,501 original fibers). Final V labels
+must preserve H outputs and its embedded H sign arrays must match exactly.
+Whole-fiber direction sign times original arc length replaces local geometric
+sign guesses, even through folds. H CCW/CW alternatives flip H travel and angular
+phase together; V remains UP and outward normal ordering does not flip.
+
+Each piece now has303float parameters:101winding/reject logits, shared phase and
+V adjustments,100U offsets and100V offsets. The anchor is the first point of the
+piece. Effective offsets are arithmetic-mean centered across buckets (not
+probability-weighted), removing shared-anchor/offset redundancy. With continuous
+cumulative-width interpolation U(q):
+
+```
+phase_i = observed_first_phase_i + shared_phase_adjustment_i
+q_ik = k + phase_i + centered_u_offset_ik
+u_ik = U(q_ik)
+v_ik = observed_first_z_i + 1000*(shared_v_adjustment_i + centered_v_offset_ik)
+```
+
+Shared phase is unbounded and never wrapped/clipped. U extrapolates first/last
+width outside the finite100bucket range. U offsets are turn units, not raw voxel
+distances; within a width interval their physical effect is width*offset. Weak
+quadratic centering (.001) applies to U/V offsets; a strong squared hinge
+(10000) applies to |Uoffset|>.25. The numeric threshold .25turns means90degrees,
+not45degrees. This is a soft penalty, not a hard no-overlap guarantee. Report
+offset quantiles/exceedance and minimum adjacent-bucket separation explicitly.
+Shared phase can change integer turns; bucket IDs are relative hypotheses, not
+absolute winding numbers. Report actual derived anchor q as well.
+
+Constraint coordinates derive solely from these anchors and signed arc offsets.
+For conditional retained probabilities pi, compatibility cost C:
+
+```
+L_match = keep_i*keep_j * -T*logsumexp(log(pi_ik)+log(pi_jl)-C_kl/T)
+```
+
+All100x100pairs participate; T=1. C includes the existing broad winding-distance
+mixture and weak metric terms. Signed-order hinge remains a separate posterior
+expectation so a small compatible mode cannot hide wrong-sign mass. Rejection
+gates events but has an explicit degree-mixed cost. Late entropy sharpening and
+width/angle/axial priors remain. Expected-cost mode is available as a control via
+`pair_mode=expectation`; only the ordinary event aggregation changes in that
+control, not the new coordinate model or continuation likelihood.
+
+Continuation uses the same all-pair likelihood for derived endpoint U/V squared
+distance (128base-vx scale), with link-sum/event-count normalization. This avoids
+making each of a few continuation links thousands of times more influential
+than an ordinary observation simply because there are few links. Its configurable
+weight is10. The initial pilot retained historical per-link normalization and
+weaker offset penalty; it is archived separately, not the final protocol.
+
+Validation:49tests across layout and previous stages; synthetic seam/gradient,
+likelihood reinforcement, rejection gating, frozen provenance, direction reversal,
+whole-fiber folds and CPU audit equivalence. Production uses CUDA only, existing
+GPU manager and runner, no new dependencies. Runs preserve original geometry,
+event IDs and non-overlapping piece partitions. Results are model consistency,
+not ground-truth winding accuracy.
+
+### Exact shared-anchor commands
+
+```
+/home/hendrik/.venv_las/bin/python /home/hendrik/villa2/vesuvius/scripts/run_classic_fiber_evaluation.py crop-benchmark --config /home/hendrik/villa2/global-fiber-sgd/run_uv_anchor_ccw.json
+/home/hendrik/.venv_las/bin/python /home/hendrik/villa2/vesuvius/scripts/run_classic_fiber_evaluation.py crop-benchmark --config /home/hendrik/villa2/global-fiber-sgd/run_uv_anchor_cw.json
+/home/hendrik/.venv_las/bin/python /home/hendrik/villa2/vesuvius/scripts/run_classic_fiber_evaluation.py crop-benchmark --config /home/hendrik/villa2/global-fiber-sgd/run_uv_anchor_full_report.json
+```
+
+Completed output roots are protected. To repeat optimization, copy a config with
+a fresh output_root; its verified prepared tensor cache can be reused. Reports
+can be rerun without optimization. Pilot configs use the same runner, named
+run_uv_anchor_pilot_ccw.json and run_uv_anchor_pilot_expected.json.
+
+## Legacy formulation and historical runs
+
 Experimental opt-in stage following accepted normal-sign and H/V stages. Original
 AFV geometry, constraint DB and earlier solutions are immutable. This is a
 constraint-consistency experiment, not a validated flattened scroll.
