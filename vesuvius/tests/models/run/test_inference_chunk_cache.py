@@ -126,8 +126,13 @@ def test_vcdataset_chunk_cache_survives_pickling_and_reads_identically(tmp_path:
 
     worker_copy = pickle.loads(pickle.dumps(cached))
     assert len(worker_copy) == len(plain) > 1
-    for index in range(len(plain)):
-        assert torch.equal(worker_copy[index]["data"], plain[index]["data"])
+    # With the cache on, the default patch order is the chunk order, so index i is
+    # a different patch in the two datasets: match patches by position.
+    assert worker_copy.effective_patch_order == "chunk" and plain.effective_patch_order == "zyx"
+    plain_by_pos = {plain.all_positions[i]: plain[i]["data"] for i in range(len(plain))}
+    for index in range(len(worker_copy)):
+        item = worker_copy[index]
+        assert torch.equal(item["data"], plain_by_pos[item["pos"]])
 
     store = worker_copy.volume.data.store
     assert store.cache_stats()["hits"] > 0
