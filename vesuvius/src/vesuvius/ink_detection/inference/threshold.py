@@ -1,10 +1,13 @@
 """Choose the threshold for binarizing a flat ink prediction of an unlabelled scroll.
 
-``calibrate`` takes predictions that the same checkpoint made on labelled segments, finds the
-F1-optimal threshold of each, and stores their median. With segments from two or more scrolls
-it also scores each scroll with the threshold taken from the other scrolls only, next to the
-score at 128, so you can see what each choice costs for this checkpoint before reading a scroll
-that has no labels. ``apply`` binarizes a prediction at the stored threshold.
+``calibrate`` takes predictions that the same checkpoint made on labelled segments and finds the
+F1-optimal threshold of each. It stores two things: the median of those thresholds (the ``value``
+rule) and the median fraction of the sheet (non-zero prediction pixels) that each threshold marks
+(the ``quantile`` rule). With segments from two or more scrolls it also scores each scroll with
+both rules taken from the other scrolls only, next to the score at 128, so you can see what each
+choice costs for this checkpoint before reading a scroll that has no labels. ``apply`` binarizes a
+prediction with either rule: ``value`` cuts at the stored threshold, ``quantile`` cuts where this
+prediction marks the stored fraction of its sheet.
 
 Calibrate on segments of scrolls the checkpoint never saw: that is the case this was measured
 on, and a threshold taken from pixels the checkpoint trained on is not expected to carry over.
@@ -25,6 +28,7 @@ from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
 DEFAULT_THRESHOLD_U8 = 128
+RULES = ("value", "quantile")
 SUPPORTED_IMAGE_SUFFIXES = {".tif", ".tiff", ".png"}
 
 
@@ -33,10 +37,15 @@ class CalibrationCell:
     scroll: str
     prediction: str
     f1_curve: np.ndarray
+    sheet_histogram: np.ndarray
 
     @property
     def best_threshold(self) -> int:
         return int(np.argmax(self.f1_curve))
+
+    @property
+    def sheet_fraction_at_best(self) -> float:
+        return float(fraction_at_or_above(self.sheet_histogram)[self.best_threshold])
 
 
 def read_prediction(path: Path) -> np.ndarray:
@@ -89,9 +98,30 @@ def f1_curve(prediction: np.ndarray, ink: np.ndarray, scored: np.ndarray) -> np.
         return np.where(precision + recall > 0, 2 * precision * recall / (precision + recall), 0.0)
 
 
+def sheet_histogram(prediction: np.ndarray) -> np.ndarray:
+    """Histogram of the sheet: every pixel the prediction covers (``prediction > 0``)."""
+    return np.bincount(prediction[prediction > 0], minlength=256)
+
+
+def fraction_at_or_above(histogram: np.ndarray) -> np.ndarray:
+    """Fraction of the histogram's pixels at or above each threshold t in 0..255."""
+    return histogram[::-1].cumsum()[::-1] / max(float(histogram.sum()), 1.0)
+
+
 def median_threshold(cells: Sequence[CalibrationCell]) -> int:
     """Median of the per-cell optima, rounded half up."""
     return int(np.floor(np.median([cell.best_threshold for cell in cells]) + 0.5))
+
+
+def median_fraction(cells: Sequence[CalibrationCell]) -> float:
+    """Median of the sheet fraction each cell's optimum marks."""
+    return float(np.median([cell.sheet_fraction_at_best for cell in cells]))
+
+
+def quantile_threshold(histogram: np.ndarray, fraction: float) -> int:
+    """Lowest threshold at which at most ``fraction`` of the sheet is marked."""
+    marked = fraction_at_or_above(histogram)
+    return int(np.argmax(marked <= fraction)) if (marked <= fraction).any() else 255
 
 
 def score_cell(scroll: str, prediction_path: Path, ink_path: Path, mask_path: Path | None) -> CalibrationCell:
@@ -103,23 +133,31 @@ def score_cell(scroll: str, prediction_path: Path, ink_path: Path, mask_path: Pa
             raise ValueError(f"{name} has shape {plane.shape}, the prediction has {prediction.shape}")
     if not (ink & scored).any():
         raise ValueError(f"{prediction_path}: no ink pixels inside the scored mask")
-    return CalibrationCell(scroll=scroll, prediction=str(prediction_path), f1_curve=f1_curve(prediction, ink, scored))
+    return CalibrationCell(scroll=scroll, prediction=str(prediction_path),
+                           f1_curve=f1_curve(prediction, ink, scored), sheet_histogram=sheet_histogram(prediction))
 
 
 def borrowing_check(cells: Sequence[CalibrationCell]) -> dict[str, dict[str, float | int]]:
-    """Score each scroll at the median threshold of the other scrolls, and at 128."""
+    """Score each scroll with both rules taken from the other scrolls only, and at 128."""
     report: dict[str, dict[str, float | int]] = {}
     for scroll in sorted({cell.scroll for cell in cells}):
         own = [cell for cell in cells if cell.scroll == scroll]
-        borrowed = median_threshold([cell for cell in cells if cell.scroll != scroll])
+        donors = [cell for cell in cells if cell.scroll != scroll]
+        borrowed = median_threshold(donors)
+        fraction = median_fraction(donors)
+
+        def loss(cell: CalibrationCell, threshold: int) -> float:
+            return float(cell.f1_curve.max() - cell.f1_curve[threshold])
+
         report[scroll] = {
             "cells": len(own),
             "threshold_from_other_scrolls": borrowed,
+            "sheet_fraction_from_other_scrolls": fraction,
             "mean_f1_best": float(np.mean([cell.f1_curve.max() for cell in own])),
-            "mean_f1_loss_borrowed": float(np.mean([cell.f1_curve.max() - cell.f1_curve[borrowed] for cell in own])),
-            "mean_f1_loss_128": float(
-                np.mean([cell.f1_curve.max() - cell.f1_curve[DEFAULT_THRESHOLD_U8] for cell in own])
-            ),
+            "mean_f1_loss_value": float(np.mean([loss(cell, borrowed) for cell in own])),
+            "mean_f1_loss_quantile": float(np.mean(
+                [loss(cell, quantile_threshold(cell.sheet_histogram, fraction)) for cell in own])),
+            "mean_f1_loss_128": float(np.mean([loss(cell, DEFAULT_THRESHOLD_U8) for cell in own])),
         }
     return report
 
@@ -133,7 +171,8 @@ def calibrate(cell_specs: Sequence[Sequence[str]], output_path: Path, *, checkpo
         cells.append(cell)
         print(
             f"{cell.scroll}  {Path(cell.prediction).name}: best threshold {cell.best_threshold} "
-            f"(F1 {cell.f1_curve.max():.3f}; at {DEFAULT_THRESHOLD_U8}: {cell.f1_curve[DEFAULT_THRESHOLD_U8]:.3f})",
+            f"(F1 {cell.f1_curve.max():.3f}; at {DEFAULT_THRESHOLD_U8}: {cell.f1_curve[DEFAULT_THRESHOLD_U8]:.3f}; "
+            f"marks {cell.sheet_fraction_at_best:.1%} of the sheet)",
             flush=True,
         )
     if not cells:
@@ -142,11 +181,13 @@ def calibrate(cell_specs: Sequence[Sequence[str]], output_path: Path, *, checkpo
     result: dict = {
         "checkpoint": checkpoint,
         "threshold": median_threshold(cells),
+        "sheet_fraction": median_fraction(cells),
         "cells": [
             {
                 "scroll": cell.scroll,
                 "prediction": cell.prediction,
                 "best_threshold": cell.best_threshold,
+                "sheet_fraction_at_best": cell.sheet_fraction_at_best,
                 "f1_best": float(cell.f1_curve.max()),
                 f"f1_at_{DEFAULT_THRESHOLD_U8}": float(cell.f1_curve[DEFAULT_THRESHOLD_U8]),
             }
@@ -157,30 +198,39 @@ def calibrate(cell_specs: Sequence[Sequence[str]], output_path: Path, *, checkpo
     if len({cell.scroll for cell in cells}) >= 2:
         check = borrowing_check(cells)
         result["check_against_other_scrolls"] = check
-        print("\neach scroll scored at the threshold of the other scrolls, and at 128 (mean F1 lost):")
+        print("\neach scroll scored with each rule taken from the other scrolls, and at 128 (mean F1 lost):")
         for scroll, row in check.items():
             print(
-                f"  {scroll}: threshold {row['threshold_from_other_scrolls']} loses "
-                f"{row['mean_f1_loss_borrowed']:.3f}, 128 loses {row['mean_f1_loss_128']:.3f} "
+                f"  {scroll}: value {row['threshold_from_other_scrolls']} loses {row['mean_f1_loss_value']:.3f}, "
+                f"quantile {row['sheet_fraction_from_other_scrolls']:.1%} loses {row['mean_f1_loss_quantile']:.3f}, "
+                f"128 loses {row['mean_f1_loss_128']:.3f} "
                 f"({row['cells']} cell{'' if row['cells'] == 1 else 's'}, best F1 {row['mean_f1_best']:.3f})"
             )
     else:
-        print("\nnote: all cells come from one scroll; add a second scroll to see what the threshold costs on a scroll it was not taken from.")
+        print("\nnote: all cells come from one scroll; add a second scroll to see what each rule costs on a scroll it was not taken from.")
 
     output_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
-    print(f"\nthreshold {result['threshold']} -> {output_path}")
+    print(f"\nvalue threshold {result['threshold']}, quantile {result['sheet_fraction']:.2%} of the sheet -> {output_path}")
     return result
 
 
-def apply(prediction_path: Path, calibration_path: Path, output_path: Path) -> dict:
-    threshold = int(json.loads(calibration_path.read_text(encoding="utf-8"))["threshold"])
+def apply(prediction_path: Path, calibration_path: Path, output_path: Path, *, rule: str = "value") -> dict:
+    if rule not in RULES:
+        raise ValueError(f"--rule must be one of {RULES}")
+    calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
     prediction = read_prediction(prediction_path)
+    sheet = sheet_histogram(prediction)
+    if rule == "value":
+        threshold = int(calibration["threshold"])
+    else:
+        threshold = quantile_threshold(sheet, float(calibration["sheet_fraction"]))
     mask = np.where(prediction >= threshold, 255, 0).astype(np.uint8)
     tifffile.imwrite(output_path, mask, compression="lzw")
     report = {
         "prediction": str(prediction_path),
+        "rule": rule,
         "threshold": threshold,
-        "fraction_of_nonzero_marked": float((prediction >= threshold).sum() / max(int((prediction > 0).sum()), 1)),
+        "fraction_of_sheet_marked": float(fraction_at_or_above(sheet)[threshold]),
         "output": str(output_path),
     }
     print(json.dumps(report, indent=1))
@@ -190,7 +240,7 @@ def apply(prediction_path: Path, calibration_path: Path, output_path: Path) -> d
 def parse_args(argv: Sequence[str] | None = None):
     parser = HyphenUnderscoreParser(description=__doc__.split("\n\n")[0])
     commands = parser.add_subparsers(dest="command", required=True)
-    calibrate_parser = commands.add_parser("calibrate", help="best threshold per labelled prediction, and their median")
+    calibrate_parser = commands.add_parser("calibrate", help="best threshold per labelled prediction, and both rules")
     calibrate_parser.add_argument(
         "--cell",
         nargs="+",
@@ -204,9 +254,15 @@ def parse_args(argv: Sequence[str] | None = None):
     )
     calibrate_parser.add_argument("--checkpoint", default="", help="Note of the checkpoint, stored in the output.")
     calibrate_parser.add_argument("--out", type=Path, required=True, help="Calibration JSON to write.")
-    apply_parser = commands.add_parser("apply", help="binarize a prediction at the calibrated threshold")
+    apply_parser = commands.add_parser("apply", help="binarize a prediction with a calibrated rule")
     apply_parser.add_argument("prediction", type=Path)
     apply_parser.add_argument("--calibration", type=Path, required=True)
+    apply_parser.add_argument(
+        "--rule",
+        choices=RULES,
+        default="value",
+        help="value: cut at the calibrated threshold. quantile: cut where this prediction marks the calibrated fraction of its sheet.",
+    )
     apply_parser.add_argument("--out", type=Path, required=True, help="0/255 uint8 TIFF to write.")
     return parser.parse_args(argv)
 
@@ -216,7 +272,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "calibrate":
         calibrate(args.cell, args.out, checkpoint=args.checkpoint)
     else:
-        apply(args.prediction, args.calibration, args.out)
+        apply(args.prediction, args.calibration, args.out, rule=args.rule)
     return 0
 
 

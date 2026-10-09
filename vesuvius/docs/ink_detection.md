@@ -528,17 +528,22 @@ segments you have labels for and applies it to a scroll you do not:
 
 ```bash
 uv run --extra models python -m vesuvius.ink_detection.inference.threshold calibrate   --cell PHerc0841 preds/pherc0841-w00.tif          labels/pherc0841-w00/pherc0841-w00_inklabels.zarr          labels/pherc0841-w00/pherc0841-w00_supervision_mask.zarr   --cell PHerc0009B preds/pherc0009b-ag055.tif          labels/pherc0009b-ag055/pherc0009b-ag055_inklabels.zarr          labels/pherc0009b-ag055/pherc0009b-ag055_supervision_mask.zarr   --out calibration.json
-uv run --extra models python -m vesuvius.ink_detection.inference.threshold apply   preds/unlabelled.tif --calibration calibration.json --out unlabelled_ink.tif
+uv run --extra models python -m vesuvius.ink_detection.inference.threshold apply   preds/unlabelled.tif --calibration calibration.json --rule quantile --out unlabelled_ink.tif
 ```
 
 Every prediction must come from the checkpoint you will run on the new scroll,
 and from scrolls that checkpoint did not train on. `calibrate` finds each
-prediction's F1-optimal threshold and stores their median. With predictions
-from two or more scrolls it also scores each scroll at the median of the other
-scrolls, next to the score at 128, so the output shows what each choice costs
-for this checkpoint on a scroll it was not taken from. Label Zarrs are read at
-level 0, middle Z plane; label TIFF/PNG images also work, and any non-zero
-pixel counts. Re-calibrate after further training.
+prediction's F1-optimal threshold and stores two rules: `value`, the median of
+those thresholds, and `quantile`, the median fraction of the sheet (non-zero
+prediction pixels) that they mark. With predictions from two or more scrolls it
+also scores each scroll with both rules taken from the other scrolls only, next
+to the score at 128, so the output shows what each choice costs for this
+checkpoint on a scroll it was not taken from. `apply --rule quantile` cuts the
+new prediction where it marks the same fraction of its own sheet, which follows
+a checkpoint whose scale shifts between scrolls; `--rule value` (the default)
+uses the threshold as is. Label Zarrs are read at level 0, middle Z plane;
+label TIFF/PNG images also work, and any non-zero pixel counts. Re-calibrate
+after further training.
 
 ## Labeling loop
 

@@ -151,7 +151,7 @@ predictions made by the same checkpoint (see `docs/ink_detection.md`):
 
 ```bash
 uv run --extra models python -m vesuvius.ink_detection.inference.threshold calibrate   --cell SCROLL PREDICTION.tif INKLABELS.zarr SUPERVISION_MASK.zarr --out calibration.json
-uv run --extra models python -m vesuvius.ink_detection.inference.threshold apply   UNLABELLED.tif --calibration calibration.json --out ink.tif
+uv run --extra models python -m vesuvius.ink_detection.inference.threshold apply   UNLABELLED.tif --calibration calibration.json --rule quantile --out ink.tif
 ```
 
 ## Checkpoints and metrics

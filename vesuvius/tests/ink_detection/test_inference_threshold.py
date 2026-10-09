@@ -66,7 +66,7 @@ def test_calibrate_takes_median_and_scores_each_scroll_at_the_others(tmp_path):
     check = result["check_against_other_scrolls"]
     assert check["A"]["threshold_from_other_scrolls"] == 120
     assert check["B"]["threshold_from_other_scrolls"] == 91
-    assert check["A"]["mean_f1_loss_borrowed"] > 0
+    assert check["A"]["mean_f1_loss_value"] > 0
     assert check["B"]["mean_f1_loss_128"] > 0
     assert json.loads(out.read_text(encoding="utf-8")) == result
 
@@ -87,6 +87,35 @@ def test_calibrate_mask_limits_scoring(tmp_path):
     assert unmasked["cells"][0]["f1_best"] < 1.0
     assert masked["cells"][0]["f1_best"] == pytest.approx(1.0)
     assert masked["check_against_other_scrolls"] is None
+
+
+def test_quantile_rule_follows_each_predictions_own_scale(tmp_path):
+    # Two scrolls whose optima differ by 30 grey levels but mark the same share of the sheet.
+    cells = [["A", *_segment(tmp_path, "a1", 90, 1)], ["B", *_segment(tmp_path, "b1", 120, 2)]]
+    result = threshold.calibrate(cells, tmp_path / "c.json")
+
+    fractions = [cell["sheet_fraction_at_best"] for cell in result["cells"]]
+    assert fractions[0] == pytest.approx(fractions[1], abs=0.02)
+    check = result["check_against_other_scrolls"]
+    assert check["A"]["mean_f1_loss_value"] > 0.1
+    assert check["A"]["mean_f1_loss_quantile"] < 0.05
+    assert check["B"]["mean_f1_loss_quantile"] < 0.05
+
+
+def test_apply_quantile_marks_the_calibrated_fraction(tmp_path):
+    prediction = np.arange(1, 257, dtype=np.int32).clip(1, 255).astype(np.uint8).reshape(16, 16)
+    pred_path = tmp_path / "unlabelled.tif"
+    tifffile.imwrite(pred_path, prediction)
+    calibration = tmp_path / "calibration.json"
+    calibration.write_text(json.dumps({"threshold": 100, "sheet_fraction": 0.25}), encoding="utf-8")
+
+    report = threshold.apply(pred_path, calibration, tmp_path / "mask.tif", rule="quantile")
+
+    assert report["rule"] == "quantile"
+    assert report["fraction_of_sheet_marked"] <= 0.25
+    assert report["fraction_of_sheet_marked"] > 0.24
+    mask = tifffile.imread(tmp_path / "mask.tif")
+    assert np.array_equal(mask, np.where(prediction >= report["threshold"], 255, 0))
 
 
 def test_apply_binarizes_at_the_calibrated_threshold(tmp_path):
@@ -126,4 +155,7 @@ def test_cli_round_trip(tmp_path):
         ["calibrate", "--cell", "A", pred_a, label_a, "--cell", "B", pred_b, label_b, "--out", str(out)]
     ) == 0
     assert threshold.main(["apply", pred_a, "--calibration", str(out), "--out", str(tmp_path / "m.tif")]) == 0
+    assert threshold.main(
+        ["apply", pred_a, "--calibration", str(out), "--rule", "quantile", "--out", str(tmp_path / "q.tif")]
+    ) == 0
     assert json.loads(out.read_text(encoding="utf-8"))["threshold"] == 100
