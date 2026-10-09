@@ -226,6 +226,27 @@ def _tracks_db_signature(path):
     return sorted(result)
 
 
+def _db_signatures_match(stored, expected):
+    """Compare a stored DBM signature with the current one.
+
+    Signatures are ``(name, size, mtime_ns)`` per backing file. Downloads and
+    copies routinely lose the sub-second part of mtime (HTTP Last-Modified has
+    one-second resolution), which made every cache shipped alongside a dataset
+    look stale after download even though name and size matched. Name and size
+    must match exactly; mtime must match at whole-second resolution.
+    """
+    if not isinstance(stored, list) or len(stored) != len(expected):
+        return False
+    for item, want in zip(stored, expected):
+        if not isinstance(item, (list, tuple)) or len(item) != 3:
+            return False
+        if item[0] != want[0] or int(item[1]) != int(want[1]):
+            return False
+        if int(item[2]) != int(want[2]) and int(item[2]) // 1_000_000_000 != int(want[2]) // 1_000_000_000:
+            return False
+    return True
+
+
 def track_store_path(path):
     """Return the conventional packed-store directory beside a tracks DBM."""
     return Path(normalize_tracks_dbm_path(path) + TRACK_STORE_SUFFIX)
@@ -384,7 +405,7 @@ def _load_packed_track_collection(path, z_lo=None, z_hi=None, warn=True):
         if metadata.get('version') != TRACK_STORE_VERSION:
             raise ValueError('unsupported packed track-store version')
         expected = [list(item) for item in _tracks_db_signature(path)]
-        if metadata.get('source_db_signature') != expected:
+        if not _db_signatures_match(metadata.get('source_db_signature'), expected):
             raise ValueError('source DBM changed after the packed store was written')
         result = native.load(
             os.fspath(store),
@@ -1636,7 +1657,7 @@ def load_track_crossing_cache(path, warn=True, expected_z_range=None):
                 raise ValueError(
                     f"unsupported version {metadata.get('version')!r}")
             expected_signature = [list(item) for item in _tracks_db_signature(path)]
-            if metadata.get('db_signature') != expected_signature:
+            if not _db_signatures_match(metadata.get('db_signature'), expected_signature):
                 raise ValueError('tracks DBM has changed since the cache was built')
             if (expected_z_range is not None
                     and metadata.get('z_range', [None, None])
