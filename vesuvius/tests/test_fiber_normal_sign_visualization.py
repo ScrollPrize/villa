@@ -19,6 +19,26 @@ from vesuvius.neural_tracing.fiber_trace_3d.fiber_normal_sign_visualization impo
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_normal_sign_visualization import spatial_subset
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_normal_sign_visualization import arrow_mesh, write_ply
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_normal_sign_visualization import tube_mesh, export_umbilicus
+from vesuvius.neural_tracing.fiber_trace_3d.fiber_normal_sign_visualization import subset_mesh, export_classified_layers
+
+
+def test_classified_layers_have_independent_indices(tmp_path):
+    import pytest
+    raw=[];records=[];vertices=[];faces=[];colors=[]
+    for label in range(3):
+        p=np.array([label*100.,0,0]);vv,ff=arrow_mesh(p,[0,0,1])
+        offset=len(vv)*label;vertices.append(vv);faces.append(ff+offset);colors.append(np.tile([label*100,0,0],(len(vv),1)))
+        raw.append((dict(id=label),np.array([p,p+[10,0,0]])))
+        records.append(dict(fiber_id=label,hv_label=label,broken=label==2,rejection_stage=2 if label==2 else 0,
+                            arrows=[dict(ply_first_vertex=offset,ply_vertex_count=len(vv))]))
+    vv,ff,cc=map(np.concatenate,(vertices,faces,colors))
+    layers=export_classified_layers(tmp_path,records,raw,vv,ff,cc)
+    for name in ('h','v','broken'):
+        assert layers[name]['fibers']==1 and layers[name]['obj_edges']==1
+        assert (tmp_path/f'{name}_fibers.obj').read_text().endswith('l 1 2\n')
+    assert layers['broken']['stage2_rejected']==1
+    assert all(r['arrows'][0]['layer_ply_first_vertex']==0 for r in records)
+    with pytest.raises(ValueError,match='crosses label'):subset_mesh(vv,ff,cc,[0])
 
 
 def test_umbilicus_tube_and_frame(tmp_path):

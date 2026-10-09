@@ -1,5 +1,31 @@
 # Whole-fiber H/V stage
 
+## Recommended config and inspection
+
+`run_hv_recommended.json` runs only degree_mix/penalty0.1/entropy0.01, with the same
+10000steps/lr0.05/seed0/prior0.001 and frozen stage1 input as the sweep winner.
+It writes to a separate output root; the existing winner has not been rerun.
+
+Visualization: `data/hv_stage_v1/visualization_1000/` (44.4MiB).
+Import these separate layers, with `fibers.mtl` beside the OBJ files:
+
+- `h_fibers.obj` + `h_normals.ply`:400long H fibers, blue.
+- `v_fibers.obj` + `v_normals.ply`:400long V fibers, green.
+- `broken_fibers.obj` + `broken_normals.ply`:200long rejected fibers, red.
+- `umbilicus.ply`:thick orange axis.
+
+The broken sample includes66normal-stage and134new H/V-stage rejections. This is
+deliberately stratified and length-biased, not population proportions. Whole curves
+are retained. `index.json` maps each original ID, final H/V/broken probabilities,
+rejection stage, normal-stage probabilities, and independent layer vertex ranges.
+Arrows point outward; stored normals inward, length640/radius20basevoxels. Normal
+directions on rejected fibers remain the model output and are not validated.
+The combined `fibers.obj`/`signed_normals.ply` is optional; do not import both it
+and all separate layers unless you want duplicate geometry.
+
+Reproduce with the approved crop-benchmark runner and `run_hv_visualization.json`.
+16Python tests pass; all separate OBJ edges and PLY indices validated programmatically.
+
 Completed comparison: [hv_stage_results.md](hv_stage_results.md).
 Recommended candidate for inspection: degree_mix, penalty0.1, entropy0.01.
 It rejects20838additional fibers (4.0835%of stage1retained),23240total (4.5329%of

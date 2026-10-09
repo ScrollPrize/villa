@@ -2,6 +2,11 @@
 
 ## 2026-10-09
 
+- Committed H/V stage and recommended params(3f579c7c2,6949e82fc). Added classified
+  visualization layers from recommended result:400H/400V/200broken,24319arrows,
+  orange umbilicus. Broken sample66stage1/134stage2;44.419MiB. Shared exporter,
+  source binding and independent layer indices;16Python tests and artifact audit.
+
 - Added cached native per-fiber axial alignment at extraction/backfill, then
   whole-fiber H/V+rejection stage using fixed normal-stage exclusions. Shared
   manager launcher, degree-aware penalties and late ternary entropy;8full-data

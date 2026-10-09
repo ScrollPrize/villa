@@ -30,8 +30,8 @@ def obj_edges(first_vertex, count):
     return ''.join(f'l {i} {i+1}\n' for i in range(first_vertex,first_vertex+count-1))
 
 
-def obj_fiber(fid, points, first_vertex, broken):
-    return (f'o fiber_{fid}\nusemtl {"broken" if broken else "retained"}\n'
+def obj_fiber(fid, points, first_vertex, broken, material=None):
+    return (f'o fiber_{fid}\nusemtl {material or ("broken" if broken else "retained")}\n'
             + ''.join('v '+' '.join(f'{x:.9f}' for x in p)+'\n' for p in points)
             + obj_edges(first_vertex,len(points)))
 
@@ -158,6 +158,37 @@ def write_ply(path, vertices, faces, colors):
         stream.write(header.encode());stream.write(v.tobytes());stream.write(f.tobytes())
 
 
+def subset_mesh(vertices,faces,colors,indices):
+    indices=np.asarray(indices,dtype=np.int64)
+    if len(np.unique(indices))!=len(indices):raise ValueError('Repeated mesh vertices')
+    remap=np.full(len(vertices),-1,np.int64);remap[indices]=np.arange(len(indices))
+    mapped=remap[faces];chosen=(mapped>=0).all(axis=1)
+    if np.any((mapped>=0).any(axis=1)&~chosen):raise ValueError('Mesh face crosses label groups')
+    return vertices[indices],mapped[chosen].astype(np.int32),colors[indices]
+
+
+def export_classified_layers(root,records,raw,vertices,faces,colors):
+    geometry={int(row['id']):points for row,points in raw};layers={}
+    for label,name in enumerate(('h','v','broken')):
+        chosen=[r for r in records if r['hv_label']==label];first=1;indices=[];arrow_offset=0
+        with (root/f'{name}_fibers.obj').open('w') as stream:
+            stream.write('mtllib fibers.mtl\n')
+            for record in chosen:
+                points=geometry[record['fiber_id']]
+                stream.write(obj_fiber(record['fiber_id'],points,first,record['broken'],name))
+                record['layer_obj_first_vertex']=first;first+=len(points)
+                for arrow in record['arrows']:
+                    indices.extend(range(arrow['ply_first_vertex'],arrow['ply_first_vertex']+arrow['ply_vertex_count']))
+                    arrow['layer_ply_first_vertex']=arrow_offset;arrow_offset+=arrow['ply_vertex_count']
+        vv,ff,cc=subset_mesh(vertices,faces,colors,indices)
+        write_ply(root/f'{name}_normals.ply',vv,ff,cc)
+        layers[name]=dict(fiber_ids=[r['fiber_id'] for r in chosen],fibers=len(chosen),obj_vertices=first-1,
+                          obj_edges=first-1-len(chosen),arrow_vertices=len(vv),arrow_faces=len(ff),
+                          stage1_rejected=sum(r['rejection_stage']==1 for r in chosen),
+                          stage2_rejected=sum(r['rejection_stage']==2 for r in chosen))
+    return layers
+
+
 def update_arrows(config):
     """Update existing preview only; reuse indexed positions, not the database scan."""
     root=Path(config['output_root']);document=json.loads((root/'index.json').read_text())
@@ -214,6 +245,16 @@ def export(config):
     summary=json.loads((solution_path.parent/'summary.json').read_text())
     if sha256_file(dbpath)!=summary['input']['signature']['database_sha256']:
         raise ValueError('Solution and normal database do not match')
+    hv=None
+    if config.get('hv_solution'):
+        hv_path=Path(config['hv_solution']);hv=np.load(hv_path,allow_pickle=False)
+        hv_summary=json.loads((hv_path.parent/'summary.json').read_text())
+        signature=hv_summary['input']['signature']
+        if signature['stage1']!=sha256_file(solution_path) or signature['database']!=summary['input']['signature']['database_sha256']:
+            raise ValueError('H/V and normal-stage evidence mismatch')
+        if not np.array_equal(hv['ids'],ids) or not np.isin(hv['labels'],[0,1,2]).all():raise ValueError('Invalid H/V IDs or labels')
+        if not np.array_equal(hv['inherited_broken'],solution['broken']) or np.any(hv['labels'][solution['broken']]!=2):
+            raise ValueError('H/V changed inherited exclusions')
     db=sqlite3.connect(dbpath.resolve().as_uri()+'?mode=ro',uri=True)
     afvpath=Path(config['afv'])
     afv=sqlite3.connect(afvpath.resolve().as_uri()+'?mode=ro',uri=True)
@@ -224,6 +265,19 @@ def export(config):
     bounds=config.get('bounds_xyz')
     focus=None
     selection_semantics='AFV block-AABB intersection candidates; full source curves retained, NOT clipped'
+    if config.get('hv_sample_counts') is not None:
+        if hv is None or selected is not None or bounds is not None or config.get('sample_count') is not None or config.get('exclude_broken',False):
+            raise ValueError('H/V stratification requires H/V solution, no other selection, and includes broken')
+        counts=config['hv_sample_counts']
+        if len(counts)!=3 or any(int(c)!=c or c<0 for c in counts):raise ValueError('Expected H,V,broken counts')
+        selected=[];remaining=list(counts)
+        for fid, in afv.execute('SELECT id FROM fibers ORDER BY length DESC,id'):
+            if fid not in lookup:continue
+            label=int(hv['labels'][lookup[fid]])
+            if remaining[label]>0:selected.append(fid);remaining[label]-=1
+            if not any(remaining):break
+        if any(remaining):raise ValueError(f'Insufficient H/V/broken fibers: shortfall {remaining}')
+        selection_semantics='Longest per H/V/broken group, stable ID ties; deliberately stratified and length-biased, not population proportions; whole original curves'
     if config.get('sample_count') is not None:
         if selected is not None or bounds is not None:raise ValueError('Use sample_count OR explicit IDs/bounds')
         rows=afv.execute('SELECT id,(min_x+max_x)/2.,(min_y+max_y)/2.,(min_z+max_z)/2.,length FROM fibers ORDER BY id').fetchall()
@@ -262,7 +316,7 @@ def export(config):
     if sum(len(points) for _,points in raw)>config.get('max_points',1000000):
         raise ValueError('Selection exceeds point limit; use fewer fibers')
     root.mkdir(parents=True)
-    (root/'fibers.mtl').write_text('newmtl retained\nKd 0.55 0.65 0.75\nnewmtl broken\nKd 1.0 0.1 0.1\n')
+    (root/'fibers.mtl').write_text('newmtl retained\nKd 0.55 0.65 0.75\nnewmtl broken\nKd 1.0 0.1 0.1\nnewmtl h\nKd 0.12 0.65 1.0\nnewmtl v\nKd 0.15 0.9 0.35\n')
     verts=[];triangles=[];colors=[];records=[];offset=0;line_vertex=1
     with (root/'fibers.obj').open('w') as obj, (root/'broken_fibers.obj').open('w') as broken_obj:
         broken_vertex=1
@@ -270,13 +324,21 @@ def export(config):
         obj.write('# Original full AFV curves; native L0 XYZ/base voxels\nmtllib fibers.mtl\n')
         for row,points in raw:
             fid=int(row['id']);k=lookup[fid];broken=bool(solution['broken'][k]);sign=int(solution['normal_sign'][k])
-            obj.write(obj_fiber(fid,points,line_vertex,broken))
+            label=int(hv['labels'][k]) if hv is not None else None
+            if hv is not None:broken=label==2
+            obj.write(obj_fiber(fid,points,line_vertex,broken,('h','v','broken')[label] if label is not None else None))
             if broken:
                 broken_obj.write(obj_fiber(fid,points,broken_vertex,True))
                 broken_vertex+=len(points)
             rec=dict(fiber_id=fid,broken=broken,normal_sign=sign,
                 sign_probability=float(solution['sign_probability'][k]),broken_probability=float(solution['broken_probability'][k]),
                 obj_first_vertex=line_vertex,obj_vertex_count=len(points),arrows=[])
+            if hv is not None:
+                rec.update(hv_label=label,hv_probabilities=hv['probabilities'][k].tolist(),
+                           normal_stage_broken=bool(solution['broken'][k]),
+                           normal_stage_broken_probability=float(solution['broken_probability'][k]),
+                           broken_probability=float(hv['probabilities'][k,2]),
+                           rejection_stage=1 if solution['broken'][k] else (2 if broken else 0))
             line_vertex+=len(points)
             rows=db.execute('SELECT id,arc_a,ax,ay,az,normal_a FROM constraints WHERE fiber_a=? '
                 'UNION ALL SELECT id,arc_b,bx,by,bz,normal_b FROM constraints WHERE fiber_b=? ORDER BY 2,1',(fid,fid))
@@ -288,6 +350,7 @@ def export(config):
                 if len(verts)>=config.get('max_arrows',50000):raise ValueError('Too many arrows; increase spacing or reduce selection')
                 vv,ff=arrow_mesh(p,-n,length,float(config.get('arrow_radius',2)))
                 color=np.array([255,30,30] if broken else [30,190,245],dtype=np.uint8)
+                if label==1:color=np.array([40,230,90],dtype=np.uint8)
                 rec['arrows'].append(dict(event_id=event,arc=arc,point=p.tolist(),normal=n.tolist(),display_normal=(-n).tolist(),
                     ply_first_vertex=offset,ply_vertex_count=len(vv)))
                 verts.append(vv);triangles.append(ff+offset);colors.append(np.tile(color,(len(vv),1)));offset+=len(vv)
@@ -303,6 +366,9 @@ def export(config):
         arrows=sum(len(r['arrows']) for r in records),mesh_vertices=len(vertices),mesh_faces=len(faces),records=records)
     if config.get('umbilicus'):
         report['umbilicus']=export_umbilicus(root,config['umbilicus'],get_meta(afv,'root'),float(config.get('umbilicus_radius',80)))
+    if hv is not None:
+        report['hv_solution_sha256']=sha256_file(config['hv_solution'])
+        report['layers']=export_classified_layers(root,records,raw,vertices,faces,color)
     atomic_write(root/'index.json',report,durable=False)
     (root/'README.txt').write_text('Open fibers.obj and signed_normals.ply together in MeshLab. Keep fibers.mtl beside OBJ.\n'
         'Optional broken_fibers.obj overlay isolates broken fibers if your viewer ignores OBJ line material colors.\n'
@@ -313,5 +379,9 @@ def export(config):
     if config.get('umbilicus'):
         with (root/'README.txt').open('a') as stream:
             stream.write('Also import umbilicus.ply: orange thick axis tube, separately toggleable. umbilicus.obj is its optional thin centerline.\n')
-    print(json.dumps({k:v for k,v in report.items() if k not in ('records','config')},indent=2),flush=True)
+    if hv is not None:
+        with (root/'README.txt').open('a') as stream:
+            stream.write('Separate layers: h_fibers.obj/h_normals.ply (blue), v_fibers.obj/v_normals.ply (green), broken_fibers.obj/broken_normals.ply (red).\n'
+                         'Broken includes both stages; index.json records rejection_stage and source probabilities. Length-biased stratified sample, not population proportions.\n')
+    print(json.dumps({k:v for k,v in report.items() if k not in ('records','config','layers')},indent=2),flush=True)
     return report

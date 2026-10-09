@@ -1,5 +1,8 @@
 # Status
 
+- [x] H/V code/recommended params committed; stratified1000fiber H/V/broken
+  preview exported, independent OBJ/PLY audit and16Python tests passed.
+
 ## Stage2 H/V
 
 - [x] Plan and implementation independently reviewed; cached native axial features.

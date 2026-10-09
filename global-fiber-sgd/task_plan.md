@@ -2,6 +2,9 @@
 
 ## Current task
 
+Commit recommended H/V parameters and visualize separate H/V/broken layers;
+current detailed plan [hv_vis_plan.md](hv_vis_plan.md).
+
 Stage2 H/V assignment after normal alignment, with whole-fiber rejection:
 [hv_stage_plan.md](hv_stage_plan.md), reviewed mathematical contract and matrix.
 
