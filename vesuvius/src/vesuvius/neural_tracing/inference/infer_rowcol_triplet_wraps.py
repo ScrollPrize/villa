@@ -135,7 +135,8 @@ def _open_vc_volume_level(volume_path, volume_scale, cache_dir, chunk_cache_gb):
 
     target_level = int(volume_scale)
     if path.startswith(("http://", "https://", "s3://")):
-        volume = vc.Volume.open_url(path, cache_root=str(cache_dir))
+        # Remote chunks are cached under VC3D's remote cache root (viewer/remote_cache_dir).
+        volume = vc.Volume.open_url(path)
     else:
         try:
             volume = vc.Volume.open(path)
