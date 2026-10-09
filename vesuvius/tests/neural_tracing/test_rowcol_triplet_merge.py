@@ -99,3 +99,25 @@ def test_direction_priors_match_dense_reference_bitwise(seed, mask_mode):
     got = _build_triplet_direction_priors_for_crop(**case, mask_mode=mask_mode)
     assert got.dtype == expected.dtype and got.shape == expected.shape
     assert np.array_equal(got.view(np.uint32), expected.view(np.uint32))
+
+
+def test_async_accumulate_matches_inline_bitwise(tmp_path):
+    rng = np.random.default_rng(0)
+    window_shape, crop = (40, 56, 48), (16, 24, 24)
+    corners = [tuple(int(rng.integers(0, w - c + 1)) for w, c in zip(window_shape, crop)) for _ in range(8)]
+    batches = [rng.normal(size=(1, 6, *crop)).astype(np.float32) for _ in corners]
+
+    reads = []
+    for use_async in (False, True):
+        with _WeightedDenseDisplacementMerger((0, 0, 0), window_shape, crop, temp_dir=tmp_path, chunk_size=16) as merger:
+            for disp, corner in zip(batches, corners):
+                items = [{"min_corner": corner}]
+                if use_async:
+                    merger.accumulate_batch_async(disp, items)
+                else:
+                    merger.accumulate_batch(disp, items)
+            reads.append([merger.read_crop(c) for c in corners])
+            assert merger.crop_count == len(corners)
+
+    for inline, overlapped in zip(*reads):
+        assert np.array_equal(inline.view(np.uint32), overlapped.view(np.uint32))

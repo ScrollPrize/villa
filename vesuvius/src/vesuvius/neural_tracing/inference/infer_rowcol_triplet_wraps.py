@@ -1125,6 +1125,8 @@ class _WeightedDenseDisplacementMerger:
         self.crop_weights = _crop_center_distance_weights(self.crop_size)
         self.crop_count = 0
         self.current_bytes = 0
+        self._accumulate_pool = None
+        self._pending_accumulate = None
 
     def _chunk_path(self, kind, chunk_key):
         zz, yy, xx = (int(v) for v in chunk_key)
@@ -1182,6 +1184,10 @@ class _WeightedDenseDisplacementMerger:
         return sum_path, weight_path
 
     def close(self):
+        if self._accumulate_pool is not None:
+            self._accumulate_pool.shutdown(wait=True)
+            self._accumulate_pool = None
+        self._pending_accumulate = None
         self.weighted_sum_chunks.clear()
         self.weight_sum_chunks.clear()
         if self._tmpdir is not None:
@@ -1244,7 +1250,22 @@ class _WeightedDenseDisplacementMerger:
                     self._close_memmap(weight_chunk)
             self.crop_count += 1
 
+    def accumulate_batch_async(self, disp_batch, items):
+        """Run accumulate_batch on one background thread so it overlaps the next batch's
+        GPU work. A single worker and waiting on the previous call keep the per-voxel
+        addition order (and memory use) the same as calling accumulate_batch inline."""
+        self.wait_pending()
+        if self._accumulate_pool is None:
+            self._accumulate_pool = ThreadPoolExecutor(max_workers=1)
+        self._pending_accumulate = self._accumulate_pool.submit(self.accumulate_batch, disp_batch, items)
+
+    def wait_pending(self):
+        pending, self._pending_accumulate = self._pending_accumulate, None
+        if pending is not None:
+            pending.result()
+
     def read_crop(self, min_corner):
+        self.wait_pending()
         start, end = self._relative_crop_bounds(min_corner)
         out = np.zeros((self.channels, *self.crop_size), dtype=np.float32)
         for chunk_key, region in _chunk_slices_for_region(start, end, self.chunks_3d):
@@ -1918,7 +1939,7 @@ def _run_triplet_inference(
             _split_triplet_displacement_channels(disp_pred_np)
             if displacement_scale != 1.0:
                 disp_pred_np[:, :6] *= np.float32(displacement_scale)
-            merger.accumulate_batch(disp_pred_np[:, :6], items)
+            merger.accumulate_batch_async(disp_pred_np[:, :6], items)
 
             del batch_cpu
             del model_inputs
@@ -1927,6 +1948,7 @@ def _run_triplet_inference(
 
             _log(args.verbose, f"batch {batch_idx}/{n_batches}: merged {len(items)} bbox dense outputs")
 
+        merger.wait_pending()
         _log(args.verbose, f"merged bbox crops with points: {kept_bboxes}/{len(records)}")
 
         sample_kwargs = {
