@@ -88,6 +88,9 @@ class BaseAuxTrainer(BaseTrainer):
                 rebuilt[key] = values[0]
         return rebuilt
 
+    def _generated_auxiliary_targets(self) -> set:
+        return set(self._aux_target_configs)
+
     # ------------------------------------------------------------------ helpers
 
     def _inject_aux_targets(self, sample: dict, *, is_training: bool) -> dict:
