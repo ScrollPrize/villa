@@ -520,6 +520,26 @@ volume because those determine the plan. Level 0 is a sparse uint8 Zarr-v2
 array in scroll Z/Y/X coordinates. Five rounded-mean levels are derived from
 it, producing a six-level OME-Zarr pyramid with ceil-halved shapes.
 
+## Binarize a flat prediction
+
+Flat inference writes probabilities; reading a scroll ends with a threshold.
+The best threshold depends on the checkpoint, so `threshold` measures it on
+segments you have labels for and applies it to a scroll you do not:
+
+```bash
+uv run --extra models python -m vesuvius.ink_detection.inference.threshold calibrate   --cell PHerc0841 preds/pherc0841-w00.tif          labels/pherc0841-w00/pherc0841-w00_inklabels.zarr          labels/pherc0841-w00/pherc0841-w00_supervision_mask.zarr   --cell PHerc0009B preds/pherc0009b-ag055.tif          labels/pherc0009b-ag055/pherc0009b-ag055_inklabels.zarr          labels/pherc0009b-ag055/pherc0009b-ag055_supervision_mask.zarr   --out calibration.json
+uv run --extra models python -m vesuvius.ink_detection.inference.threshold apply   preds/unlabelled.tif --calibration calibration.json --out unlabelled_ink.tif
+```
+
+Every prediction must come from the checkpoint you will run on the new scroll,
+and from scrolls that checkpoint did not train on. `calibrate` finds each
+prediction's F1-optimal threshold and stores their median. With predictions
+from two or more scrolls it also scores each scroll at the median of the other
+scrolls, next to the score at 128, so the output shows what each choice costs
+for this checkpoint on a scroll it was not taken from. Label Zarrs are read at
+level 0, middle Z plane; label TIFF/PNG images also work, and any non-zero
+pixel counts. Re-calibrate after further training.
+
 ## Labeling loop
 
 1. Train from Zarr labels and a surface volume.

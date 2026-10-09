@@ -146,6 +146,14 @@ The native tifxyz directory must contain `x.tif`, `y.tif`, `z.tif`, and
 `volume_source.txt`. Use `--plan-only` to inspect occupied-chunk and patch
 counts without creating output.
 
+Pick the binarization threshold for an unlabelled scroll from labelled
+predictions made by the same checkpoint (see `docs/ink_detection.md`):
+
+```bash
+uv run --extra models python -m vesuvius.ink_detection.inference.threshold calibrate   --cell SCROLL PREDICTION.tif INKLABELS.zarr SUPERVISION_MASK.zarr --out calibration.json
+uv run --extra models python -m vesuvius.ink_detection.inference.threshold apply   UNLABELLED.tif --calibration calibration.json --out ink.tif
+```
+
 ## Checkpoints and metrics
 
 Training embeds the resolved JSON config in each checkpoint. Inference
