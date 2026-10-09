@@ -1142,10 +1142,11 @@ class _WeightedDenseDisplacementMerger:
         )
 
     def _close_memmap(self, arr):
+        # No flush: these are scratch files that are only read back through new maps
+        # of the same file, which see the page cache. Flushing wrote every touched
+        # chunk to disk once per crop.
         if arr is None:
             return
-        if hasattr(arr, "flush"):
-            arr.flush()
         mmap_obj = getattr(arr, "_mmap", None)
         if mmap_obj is not None:
             mmap_obj.close()
