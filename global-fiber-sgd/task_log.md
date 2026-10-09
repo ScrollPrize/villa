@@ -15,3 +15,8 @@
   Independent review approved. Five tests pass incl exact tile-vs-full drawing
   across seams, full SVG fiber counts/no titles, TIFF1000px height/LZW metadata.
   TIFFs approximately5.5MiB each. No optimizer/inference changes.
+- Both20-sweep solutions finished and saved. Additional10sweeps took496.09s
+  CCW/523.70sCW. Sign violations110->28CCW and104->22CW; retained arc
+  62.4748->64.8926%CCW and62.3828->64.7460%CW. Rejected pieces
+  22.7383->20.5711%CCW and22.7887->20.6593%CW. Final-state cost not yet
+  evaluated separately: last pre_update_energy belongs to sweep19, not20.

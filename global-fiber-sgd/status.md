@@ -1,8 +1,8 @@
 # Visualization status
 
-Current continuation: both GPU jobs active for +10 sweeps (total20); independent
-review passed, starting metrics match saved final110CCW/104CW. Outputs under
-data/uv_categorical_v1/ccw_sweep20 and cw_sweep20. Completion pending.
+Current continuation: both20-sweep solutions complete; final violations28CCW/22CW.
+Retained arc64.8926%/64.7460%. Outputs under data/uv_categorical_v1/ccw_sweep20
+and cw_sweep20. Additional10sweeps took8m16s/8m44s respectively.
 
 - [x] Prior state committed.
 - [x] Task/plan and independent plan review.
