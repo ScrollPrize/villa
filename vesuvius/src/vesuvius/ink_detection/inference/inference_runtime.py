@@ -185,6 +185,18 @@ class _CompiledWithEagerFallback(nn.Module):
             return self.model(*args, **kwargs)
 
 
+def _has_triton() -> bool:
+    try:
+        from torch.utils._triton import has_triton
+    except ImportError:
+        return True  # cannot tell; let torch.compile decide
+    return bool(has_triton())
+
+
+def _uses_cuda(model: nn.Module) -> bool:
+    return any(parameter.is_cuda for parameter in model.parameters())
+
+
 def maybe_compile_model(
     model: nn.Module,
     *,
@@ -203,6 +215,11 @@ def maybe_compile_model(
     compile_fn = getattr(torch, "compile", None)
     if compile_fn is None:
         LOGGER.warning("torch.compile is unavailable; continuing eagerly")
+        return model, False
+    if _uses_cuda(model) and not _has_triton():
+        # Inductor needs Triton for CUDA kernels. Without it (e.g. native Windows),
+        # compilation only fails at the first forward, after tracing has been paid for.
+        LOGGER.info("Triton is not installed; skipping torch.compile for the CUDA model")
         return model, False
     try:
         compiled_model = compile_fn(model, mode=str(mode), fullgraph=False, dynamic=False)
