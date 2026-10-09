@@ -19,6 +19,11 @@ are adjacent in the sequence. ``WorkerContiguousBatchSampler`` emits batches in
 an order that gives every DataLoader worker one contiguous run of that
 sequence. Neither changes *which* patches are read or what the model sees for
 each one: only the sequence, and which worker reads it.
+
+Without a chunk cache the order changes nothing about what is fetched (every
+chunk is downloaded once per patch that needs it either way), so the ``'auto'``
+order keeps the plain row-major pipeline unless the cache is on; see
+``resolve_patch_order``.
 """
 
 from __future__ import annotations
@@ -28,9 +33,30 @@ from typing import Iterator, List, Sequence, Tuple
 import numpy as np
 from torch.utils.data import Sampler
 
-PATCH_ORDERS = ("chunk", "zyx")
+# 'chunk': Morton order over the input chunk grid and one contiguous run of it
+#          per DataLoader worker.
+# 'zyx':   row-major order and plain batching (the pipeline before this option).
+# 'auto':  'chunk' when the chunk cache is enabled, 'zyx' otherwise.
+PATCH_ORDERS = ("auto", "chunk", "zyx")
 
 _MORTON_BITS = 21  # three 21-bit coordinates interleave into one 63-bit key
+
+
+def resolve_patch_order(patch_order: str, cache_enabled: bool) -> str:
+    """Resolve ``'auto'`` to ``'chunk'`` or ``'zyx'``; return an explicit order unchanged.
+
+    The chunk order only pays off when a chunk cache can serve the patches that
+    share a chunk; with the cache off every chunk is fetched once per patch
+    whatever the sequence. ``'auto'`` is therefore ``'chunk'`` exactly when
+    ``cache_enabled`` (``vesuvius.predict --chunk_cache_mb > 0``) and ``'zyx'``
+    otherwise, so a run without the cache is sequence-for-sequence the plain
+    pipeline.
+    """
+    if patch_order not in PATCH_ORDERS:
+        raise ValueError(f"patch_order must be one of {PATCH_ORDERS}, got {patch_order!r}")
+    if patch_order == "auto":
+        return "chunk" if cache_enabled else "zyx"
+    return patch_order
 
 
 def _spread_bits(values: np.ndarray) -> np.ndarray:
@@ -82,7 +108,7 @@ def chunk_local_order(positions: Sequence[Tuple[int, int, int]], chunk_shape: Se
     keys = morton_keys(pos // np.asarray(chunk, dtype=np.int64))
     # lexsort sorts by the last key first: Morton key, then z, y, x as tie-breakers.
     order = np.lexsort((pos[:, 2], pos[:, 1], pos[:, 0], keys))
-    return [int(i) for i in order]
+    return order.tolist()
 
 
 def interleave_contiguous_blocks(batches: Sequence[Sequence[int]], num_workers: int) -> List[List[int]]:
@@ -112,7 +138,6 @@ def interleave_contiguous_blocks(batches: Sequence[Sequence[int]], num_workers: 
         for block in blocks:
             if r < len(block):
                 out.append(block[r])
-    assert len(out) == total
     return out
 
 

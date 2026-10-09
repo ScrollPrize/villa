@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader
 from vesuvius.utils.models.load_nnunet_model import load_model_for_inference
 from vesuvius.data.vc_dataset import VCDataset
 from vesuvius.data.utils import open_zarr
-from vesuvius.data.patch_order import PATCH_ORDERS, WorkerContiguousBatchSampler
+from vesuvius.data.patch_order import PATCH_ORDERS, WorkerContiguousBatchSampler, resolve_patch_order
 from pathlib import Path
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 from vesuvius.models.run.external_models.load_resnet import try_load_external_resnet34_model
@@ -352,7 +352,7 @@ class Inferer():
                  max_patches: int = None,
                  bbox: [list, tuple] = None,
                  chunk_cache_mb: int = 0,
-                 patch_order: str = 'chunk',
+                 patch_order: str = 'auto',
                  ):
         print(f"Initializing Inferer with output_dir: '{output_dir}'")
         if output_dir and not output_dir.strip():
@@ -424,7 +424,10 @@ class Inferer():
         if self.chunk_cache_mb < 0:
             raise ValueError(f"chunk_cache_mb must be >= 0, got {self.chunk_cache_mb}.")
         if self.patch_order not in PATCH_ORDERS:
-            raise ValueError(f"Invalid patch_order '{self.patch_order}'. Must be one of {PATCH_ORDERS}.")
+            raise ValueError(
+                f"Invalid patch_order '{self.patch_order}'. Must be one of {PATCH_ORDERS} "
+                f"('auto' is 'chunk' when chunk_cache_mb > 0, 'zyx' otherwise)."
+            )
         # Defer patch size validation until after model loading if not explicitly provided
 
         # --- Output Setup ---
@@ -798,6 +801,11 @@ class Inferer():
                 f"(max_patches={self.max_patches})"
             )
 
+    @property
+    def effective_patch_order(self) -> str:
+        """``patch_order`` with ``'auto'`` resolved: ``'chunk'`` iff the chunk cache is on."""
+        return resolve_patch_order(self.patch_order, self.chunk_cache_mb > 0)
+
     def _create_dataset_and_loader(self):
         # Use step_size instead of overlap (step_size is [0-1] representing stride as fraction of patch size)
         # step_size of 0.5 means 50% overlap
@@ -906,16 +914,21 @@ class Inferer():
             collate_fn=VCDataset.collate_fn  # we use custom collate fn here to tag patches that contain only zeros
                                              # so we don't run them through the model
         )
-        if self.num_dataloader_workers > 1:
-            # DataLoader hands batch i to worker i % num_workers, so with plain
-            # batching neighbouring patches land in different processes and each
-            # worker's chunk cache has to fetch what its neighbours already hold.
-            # Give every worker one contiguous run of the (chunk-ordered) patch
-            # list instead: the batches are the same slices, each patch is still
-            # read and written exactly once, only the dispatch order differs.
+        if self.effective_patch_order == 'chunk' and self.num_dataloader_workers > 1:
+            # In the chunk order neighbouring patches are consecutive, but
+            # DataLoader hands batch i to worker i % num_workers, so plain
+            # batching would scatter them across processes and each worker's
+            # chunk cache would fetch what its neighbours already hold. Give
+            # every worker one contiguous run of the patch list instead: the
+            # batches are the same slices, each patch is still read and written
+            # exactly once, only the dispatch order differs. With the zyx order
+            # (the default unless the cache is on) this is the plain loader.
             batch_sampler = WorkerContiguousBatchSampler(
                 self.num_active_patches, self.batch_size, self.num_dataloader_workers)
             self.dataloader = DataLoader(loader_dataset, batch_sampler=batch_sampler, **loader_kwargs)
+            if self.verbose:
+                print(f"DataLoader dispatch: one contiguous run of the patch list per worker "
+                      f"({self.num_dataloader_workers} workers)")
         else:
             self.dataloader = DataLoader(loader_dataset, batch_size=self.batch_size, shuffle=False, **loader_kwargs)
         return self.dataset, self.dataloader
@@ -1332,11 +1345,15 @@ def build_parser():
                            'cache, so overlapping patches reuse chunks instead of downloading '
                            'them again. Each DataLoader worker keeps its own cache. Requires '
                            'zarr 3. Default 0 (off).')
-    parser.add_argument('--patch_order', type=str, default='chunk', choices=list(PATCH_ORDERS),
-                      help='Order in which patches are read. "chunk" (default) follows a Morton '
-                           'curve over the input chunk grid, so patches that share chunks are '
-                           'read back to back and --chunk_cache_mb can serve them; "zyx" is the '
-                           'row-major order. The patches and their outputs are the same either way.')
+    parser.add_argument('--patch_order', type=str, default='auto', choices=list(PATCH_ORDERS),
+                      help='Order in which patches are read. "chunk" follows a Morton curve over '
+                           'the input chunk grid and gives each DataLoader worker one contiguous '
+                           'run of it, so patches that share chunks are read back to back by the '
+                           'same process and --chunk_cache_mb can serve them; "zyx" is the '
+                           'row-major order with plain batching. "auto" (default) is "chunk" when '
+                           '--chunk_cache_mb > 0 and "zyx" otherwise, since without a cache the '
+                           'order changes nothing about what is fetched. The patches, their '
+                           'coordinates and their outputs are the same either way.')
     parser.add_argument('--max_patches', type=int, default=None,
                       help='Optional cap on patch positions processed by this part. '
                            'Intended for smoke tests; production inference leaves this unset.')
