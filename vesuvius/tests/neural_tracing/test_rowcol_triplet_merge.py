@@ -121,3 +121,36 @@ def test_async_accumulate_matches_inline_bitwise(tmp_path):
 
     for inline, overlapped in zip(*reads):
         assert np.array_equal(inline.view(np.uint32), overlapped.view(np.uint32))
+
+
+def test_prefetch_batch_items_matches_inline_gather(monkeypatch):
+    import vesuvius.neural_tracing.inference.infer_rowcol_triplet_wraps as M
+
+    calls = []
+
+    def fake_gather(batch_records, **kwargs):
+        calls.append(tuple(batch_records))
+        return [r * 10 for r in batch_records]
+
+    monkeypatch.setattr(M, "_gather_batch_items", fake_gather)
+    records = list(range(7))
+    batches = list(M._iter_bbox_batches(records, 3))
+    got = list(M._prefetch_batch_items(iter(batches), {"crop_size": (1, 1, 1)}))
+    assert got == [[0, 10, 20], [30, 40, 50], [60]]
+    assert calls == [(0, 1, 2), (3, 4, 5), (6,)]
+    assert list(M._prefetch_batch_items(iter([]), {})) == []
+
+
+def test_prefetch_batch_items_propagates_errors(monkeypatch):
+    import vesuvius.neural_tracing.inference.infer_rowcol_triplet_wraps as M
+
+    def failing_gather(batch_records, **kwargs):
+        if batch_records == [1]:
+            raise RuntimeError("chunk read failed")
+        return list(batch_records)
+
+    monkeypatch.setattr(M, "_gather_batch_items", failing_gather)
+    gen = M._prefetch_batch_items(iter([(0, [0]), (1, [1]), (2, [2])]), {})
+    assert next(gen) == [0]
+    with pytest.raises(RuntimeError, match="chunk read failed"):
+        next(gen)

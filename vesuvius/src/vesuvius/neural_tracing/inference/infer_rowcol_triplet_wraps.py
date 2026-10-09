@@ -1649,6 +1649,21 @@ def _iter_bbox_batches(records, batch_size):
         yield start, records[start:start + batch_size]
 
 
+def _prefetch_batch_items(batch_iter, gather_kwargs):
+    """Yield _gather_batch_items(...) for each batch while the next batch's volume reads and
+    voxelisation run on a background thread, so they overlap the caller's GPU work.
+    Each batch is gathered exactly as before, only earlier."""
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = None
+        for _, batch_records in batch_iter:
+            future = pool.submit(_gather_batch_items, batch_records=batch_records, **gather_kwargs)
+            if pending is not None:
+                yield pending.result()
+            pending = future
+        if pending is not None:
+            yield pending.result()
+
+
 def _voxelize_local_surface_from_uv_points(local_points, uv_points, crop_size):
     crop_size_arr = np.asarray(crop_size, dtype=np.int64)
     vox = np.zeros(tuple(crop_size_arr.tolist()), dtype=np.float32)
@@ -1886,16 +1901,14 @@ def _run_triplet_inference(
         )
         batch_iter = _iter_bbox_batches(records, int(args.batch_size))
         batch_iter = tqdm(batch_iter, total=n_batches, desc="triplet_infer_merge", unit="batch")
-        for batch_idx, (_, batch_records) in enumerate(batch_iter, start=1):
-            items = _gather_batch_items(
-                batch_records=batch_records,
-                crop_size=crop_size,
-                world_points=world_points,
-                uv_points=uv_points,
-                volume_arr=volume_arr,
-                num_workers=int(args.crop_input_workers),
-            )
-
+        gather_kwargs = dict(
+            crop_size=crop_size,
+            world_points=world_points,
+            uv_points=uv_points,
+            volume_arr=volume_arr,
+            num_workers=int(args.crop_input_workers),
+        )
+        for batch_idx, items in enumerate(_prefetch_batch_items(batch_iter, gather_kwargs), start=1):
             if len(items) == 0:
                 _log(args.verbose, f"batch {batch_idx}/{n_batches}: skipped (no points in batch bboxes)")
                 continue
