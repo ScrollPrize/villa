@@ -815,9 +815,11 @@ def run_inference_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = No
             else:
                 model.model = model_compiled
             logger.info(f"Enabled torch.compile (mode={COMPILE_MODE})")
-            # Tiny warmup to trigger compilation before the big loop (hides first-iter cost)
+            # Warmup to trigger compilation before the big loop (hides first-iter cost).
+            # Use the loop's batch size: with dynamic=False a different batch dim compiles
+            # a separate graph, so a batch-1 warmup is discarded and the loop recompiles.
             try:
-                dummy = torch.zeros((1, 1, CFG.in_chans, CFG.size, CFG.size), device=device)
+                dummy = torch.zeros((CFG.batch_size, 1, CFG.in_chans, CFG.size, CFG.size), device=device)
                 with torch.inference_mode():
                     with torch.autocast(device_type=amp_device_type(device), enabled=True):
                         _ = model.forward(dummy)
