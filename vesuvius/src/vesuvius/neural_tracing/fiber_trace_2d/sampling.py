@@ -124,7 +124,7 @@ class Vc3dCoordinateSampler(CoordinateSampler):
             bucket, _, key = without_scheme.partition("/")
             path = f"https://{bucket}.s3.amazonaws.com/{key}"
         if path.startswith(_REMOTE_PREFIXES):
-            self.volume = Volume.open_url(path, "" if cache_root is None else str(cache_root))
+            self.volume = Volume.open_url(path)
         else:
             self.volume = Volume.open(path)
         if cache_budget_bytes is not None:
