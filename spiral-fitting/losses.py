@@ -143,6 +143,9 @@ def _choose_pcl_indices(sampling_strata, num_to_sample, cfg):
 
 
 
+_SHELL_OUTER_NO_VALID_WARNED = False
+
+
 def get_shell_outer_loss(shell_map, slice_to_spiral_transform, dr_per_winding, outer_winding_idx, *, cfg, z_begin, z_end, with_metrics=True):
     # with_metrics=False skips the residual summary block: its data-dependent
     # `valid.any()` branch synchronises the CPU on all queued GPU work, so
@@ -174,6 +177,13 @@ def get_shell_outer_loss(shell_map, slice_to_spiral_transform, dr_per_winding, o
                     'shell_outer_error_p95': torch.quantile(abs_residual, 0.95),
                     'shell_confidence_mean': confidence[valid].mean(),
                 }
+            else:
+                global _SHELL_OUTER_NO_VALID_WARNED
+                if not _SHELL_OUTER_NO_VALID_WARNED:
+                    _SHELL_OUTER_NO_VALID_WARNED = True
+                    print('WARNING: shell_outer loss has no valid samples (every lookup is '
+                          'outside the shell z range or below shell_min_confidence); the '
+                          'loss is 0 and the outer shell is not constraining the fit.')
 
     return shell_outer_loss, metrics
 
