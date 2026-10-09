@@ -2,6 +2,12 @@
 
 ## Current task
 
+V-fiber consistent up-direction alignment and breakage: task.md and
+[v_direction_plan.md](v_direction_plan.md). H state committed3f5b443e8 and frozen.
+Global U/V remains paused.
+
+## Prior H task
+
 H-fiber direction breakage and visualization: task.md and
 [h_direction_breakage_plan.md](h_direction_breakage_plan.md), independently reviewed.
 Global U/V remains paused. Reuse existing source/tangent cache and rendering.

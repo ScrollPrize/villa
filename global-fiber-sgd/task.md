@@ -1,12 +1,7 @@
-# H-fiber direction alignment and breakage
+# V-fiber up-direction alignment
 
-Current request: add/tune whole-H-fiber breakage penalty so contradictory direction
-evidence can disable fibers. Visualize all newly disabled fibers, a long spatial
-subset of surviving H fibers and a separate OBJ with tangent-direction arrows.
-Keep earlier exclusions fixed and global U/V paused.
-
-Pause global assignment. Add a third optimization pass after normal sign and H/V
-alignment: align whole-H-fiber forward/backward directions through parallel
-constraints and an umbilicus circulation prior. Global circulation CW/CCW remains
-an input convention for later full U/V experiments. Earlier rejections fixed;
-no cutting, no V alignment, and no global U/V work until more constraints arrive.
+Commit the current H solution/state, then apply the same whole-fiber sign and
+breakage optimization to V fibers so surviving fibers share a consistent up
+direction. Use V–V parallel constraints and a weak positive-Z local umbilicus
+axis prior. Preserve earlier exclusions and the accepted H solution. Include
+analogous disabled/surviving/tangent-arrow visualization. Global U/V stays paused.

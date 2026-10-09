@@ -1,5 +1,11 @@
 # Global fiber assignment with PyTorch SGD
 
+Current direction passes: [H](h_direction.md) and [V consistent up](v_direction.md),
+with whole-fiber breakage. H checkpoint`3f5b443e8`; V keeps that solution frozen.
+[V results](v_direction_results.md):77newly disabled V, zero remaining parallel
+direction conflicts,99.953354%Vfiber arc retained. Full H/global state preserved;
+global U/V assignment remains PAUSED pending further constraints.
+
 Current stage3: [H-fiber direction alignment with breakage](h_direction.md), following
 normal signs and baked H/V. [Breakage sweep](h_direction_breakage_results.md)
 replaces the [sign-only baseline](h_direction_results.md), which had0.047735%

@@ -2,7 +2,7 @@ import numpy as np
 import torch
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength,tangents_at,tangent_at,interp_at,normalize
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_normal_sign import losses,sign_alignment_terms
-from vesuvius.neural_tracing.fiber_trace_3d.fiber_h_direction import circulation_prior,objective,readout,breakage_objective,breakage_readout
+from vesuvius.neural_tracing.fiber_trace_3d.fiber_direction import circulation_prior,objective,readout,breakage_objective,breakage_readout
 
 
 def test_shared_tangent_batch_matches_original_scalar():

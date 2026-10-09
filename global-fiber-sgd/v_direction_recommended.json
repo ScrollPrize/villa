@@ -1,0 +1,20 @@
+{
+  "breakage_weight": 0.1,
+  "conflicts": 0,
+  "convention": "UP",
+  "family": "V",
+  "inherited_h_sha256": "0a21a4841c47a8796ca9c057734e43416986cfb4e1052a75e0d0551f2e10e833",
+  "inherited_h_solution": "/home/hendrik/villa2/global-fiber-sgd/data/h_direction_breakage_v2/penalty_0.05/solution.npz",
+  "newly_broken": 77,
+  "retained_arc_percent": 99.95335416565065,
+  "retained_events": 1838768,
+  "retained_family": 237723,
+  "solution": "/home/hendrik/villa2/global-fiber-sgd/data/v_direction_v1/solve/penalty_0.1/solution.npz",
+  "solution_sha256": "ad895042befa0279457188c8c3988eb64a5c1b5ce66bb75f48f0c054a9f034c4",
+  "visualization": {
+    "arrows": 4000,
+    "disabled": 77,
+    "root": "/home/hendrik/villa2/global-fiber-sgd/data/v_direction_v1/visualization_1000",
+    "survivors": 1000
+  }
+}

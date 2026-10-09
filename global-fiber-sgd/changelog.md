@@ -2,6 +2,14 @@
 
 ## 2026-10-09
 
+- Committed H/current state as3f5b443e8 with hash-pinned selected solution.
+  Generalized H pipeline to shared family-specific direction preparation,
+  sign/broken optimization and visualization; no duplicated V implementation.
+  V prior follows local positive-Z umbilicus.237800V/1842020events; baseline528
+  conflicts; penalties.1/.07/.05/.03 all77newrejections/0conflicts,99.953354%Varc
+  retained. H arrays/labels frozen.41tests pass and independent all-event/raw
+  tangent audit. V/global layout coupling still paused.
+
 - Added optional stage3 whole-H breakage with fixed evidence normalization and
   joint direction/broken entropy. Full confidence-preserving sweep .1/.07/.05/.03;
   selected.05rejects184H(0.073115%), eliminates all1721direction conflicts,

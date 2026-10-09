@@ -1,5 +1,10 @@
 # H-fiber circulation direction: third optimization pass
 
+The implementation now lives in shared`fiber_direction.py`and
+`fiber_direction_review.py`; existing H runner configurations are unchanged.
+[V-direction alignment](v_direction.md) uses these same modules with an axial prior,
+while retaining the accepted H solution unchanged.
+
 ## Current extension: optional whole-fiber breakage
 
 The original sign-only result below remains available as a baseline. The new
@@ -176,6 +181,6 @@ strong folds. It can therefore contain contradictory observations;1721remain.
 No additional fibers or constraints are silently rejected for that disagreement.
 Disconnected components and isolated fibers rely on the weak umbilicus prior.
 Late entropy produces decisive probabilities, not calibrated confidence.
-Normal signs, H/V labels and geometry remain unchanged. V-direction alignment and
-U/V consumption of this stage are intentionally not implemented while global
-assignment is paused.
+Normal signs, H/V labels and geometry remain unchanged in the original sign-only
+baseline. V-direction alignment is now implemented as the shared sibling pass;
+U/V consumption of either direction stage remains paused.

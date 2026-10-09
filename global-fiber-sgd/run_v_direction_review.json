@@ -1,0 +1,13 @@
+{
+  "fiber_direction_review": {
+    "sweep_root": "/home/hendrik/villa2/global-fiber-sgd/data/v_direction_v1/solve",
+    "report": "/home/hendrik/villa2/global-fiber-sgd/v_direction_results.md",
+    "recommendation": "/home/hendrik/villa2/global-fiber-sgd/v_direction_recommended.json",
+    "visualization_root": "/home/hendrik/villa2/global-fiber-sgd/data/v_direction_v1/visualization_1000",
+    "sample_count": 1000,
+    "longest_candidate_count": 10000,
+    "tangent_spacing": 1024,
+    "tangent_length": 256,
+    "tangent_radius": 8
+  }
+}

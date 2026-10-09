@@ -57,15 +57,15 @@ def run(config):
     if 'fiber_axial_features' in config:
         from .fiber_hv_stage import run_features
         return run_features(config['fiber_axial_features'])
-    if 'fiber_h_direction' in config:
-        from .fiber_h_direction import run as run_direction
-        return run_direction(config['fiber_h_direction'])
+    if 'fiber_direction' in config or 'fiber_h_direction' in config:
+        from .fiber_direction import run as run_direction
+        return run_direction(config.get('fiber_direction',config.get('fiber_h_direction')))
     if 'fiber_h_direction_report' in config:
-        from .fiber_h_direction import report as report_direction
+        from .fiber_direction import report as report_direction
         return report_direction(config['fiber_h_direction_report'])
-    if 'fiber_h_direction_review' in config:
-        from .fiber_h_direction_review import run as review_direction
-        return review_direction(config['fiber_h_direction_review'])
+    if 'fiber_direction_review' in config or 'fiber_h_direction_review' in config:
+        from .fiber_direction_review import run as review_direction
+        return review_direction(config.get('fiber_direction_review',config.get('fiber_h_direction_review')))
     if 'fiber_uv_layout' in config:
         from .fiber_uv_layout import run as run_uv
         return run_uv(config['fiber_uv_layout'])

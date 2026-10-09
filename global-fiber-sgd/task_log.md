@@ -1,72 +1,38 @@
-# Current task: H direction alignment
+# V direction task log
 
-## Active follow-up: breakage penalty and visualization
-
-- Baseline audit: 1,721 conflicting events over 269 pairs/444 fibers; 59 pairs
-  internally contradictory, guaranteeing at least 424 unsatisfied events without
-  rejections. No single fiber flip improves weighted cost.
-- Implement optional whole-H broken state; tune penalties; export newly rejected
-  fibers and surviving H subset with a separate tangent-arrow OBJ. U/V paused.
-- Plan: h_direction_breakage_plan.md; independent review requested.
-- Independent plan review approved: fixed original pair denominator, explicitly
-  gated prior, joint ternary entropy, and isolated/non-conflict rejection audit.
-- Optional sigmoid broken state implemented via shared sign pair loss and shared
-  H/V ternary probability helper; earlier normal/HV formulas unchanged. Warm-start
-  sign-only logits clipped to +/-4; directions remain optimizable, not frozen.
-- Managed full-data sweep launched via approved run_h_direction_breakage.json,
-  single shared 4GiB GPU grant across all four penalties. No global U/V jobs.
--25 regression tests passed (4.72s). .1 finishes176new rejections/8conflicts;
-  .03 finishes185new rejections/0conflicts. Lower penalties still running.
-- Reuse existing normal/curve exporter for surviving H; add all-new-disabled OBJ
-  and separate same-subset CCW tangent-arrow OBJ. Original full curves, not clips.
-- Independent audit found an avoidable rejection at .03 (ID139999, degree1538,
-  no hard conflicts even if restored). Initial clipping of saved logits invented
-  soft pair uncertainty, creating rejection pressure on high-degree fibers.
-  Corrected to preserve saved logits exactly (still trainable). v1 is diagnostic,
-  not promoted. v2 refines sweep to .1/.07/.05/.03 with unchanged confidence;
-  export chosen v2 only. No post-hoc deletion/pruning or hard-mask repair.
-- v2 finished: penalties .1/.07/.05/.03 give176/177/184/184new rejections and
-  8/7/0/0retained conflicts. Chosen .05 retains99.912734319417%Harc and
-  3594993/3603373events(99.767440117912%). .03 has identical hard mask/result.
- 10ksteps each, sharedH10047.97/49.19/51.56/73.83s (not isolated perf measurement).
-- Independent full-event audit passes .05:184new rejects, all earlier labels
-  unchanged, exact CW opposite, ID139999retained. None of the184can individually
-  be restored with EITHER tangent sign without introducing conflicts. This is a
-  local minimality check, not proof of globally minimum rejection/physical error.
-- Final regression25tests passed4.54s, git diff --check clean. CPU-only approved
-  run_h_direction_breakage_review.json now auditing sources and exporting views.
-- Export completed: data/h_direction_breakage_v2/visualization_1000 contains
-  all184disabled full curves (disabled_h.obj + CSV),1000long spatially distributed
-  surviving H curves,4973outward-normal arrows and5075CCW tangent arrows in a
-  separate same-subset OBJ. Whole directory23MiB (includes duplicate standard
-  renderer layers); old empty broken/V layers are NOT the new rejected output.
-- Independent artifact audit passed: exact184disabled IDs,1000retained IDs,
-  5075unit signed tangent arrows; all OBJindices/finite vertices and hashes valid.
-  Disabled2548vertices/2364segments; survivor29599vertices/28599segments;
-  direction-overlay126024vertices/91350trianglefaces. Every tip equals
-  point+length*tangent and signs match the chosen solution. No remaining blockers.
-
-## Earlier phase of this direction task
-
-- U/V explicitly paused. Both previously launched trials are finished; no active
-  global processes (pgrep verified). Prior notes preserved in uv_layout_task_log.md.
-- Plan h_direction_plan.md; independent review before implementation.
-- Direction-only stage: one sign per retained whole H fiber, no new rejections.
-- Independent plan review passed: define zero-weight/degenerate handling, report
-  disconnected gauges, preserve event IDs, CW hard signs by exact negation.
-- Shared tangent_at delegates to batched tangents_at; shared normal-sign pair
-  objective extracted without changing its formula. H pass uses same term with
-  no rejection gates. No U/V code integration or reruns.
-- Minor robustness guards: empty parallel graphs, positive finite sampling spans,
-  isolation on nonzero-weight edges. Production had zero degenerate/zero-dot events.
-- Full prep84.12s:251658Hfibers,3603373parallel events,82250components,
-  58793isolatedH. Managed H10010000steps25.796s,274.65MiBpeak CUDA tensors.
-- Source-forward weighted disagreement12.32525%; umbilicus-only0.698138%;
-  optimized0.047735%(1721events).1612Hdirections changed vs prior(0.640552%).
-  Zero new rejections. Numerically ambiguous(<.9chosenprob)0%;1217components have
-  weak signed circulation evidence, so certainty is not anatomical validation.
--22tests pass. Independent reviewer recomputed all3603373outcomes, unchanged
-  IDs/masks, component labels, exactCWnegation and256raw endpoint tangents(max
-  difference2.98e-8). GPU job finished; no U/V work resumed.
-- Full commands/config and limitations in h_direction.md; generated report and
-  source-hash audit use approved run_h_direction_report.json runner.
+- H state committed3f5b443e8, including hash-pinned selected H solution manifest.
+  Large outputs remain ignored data/.36tests passed before commit.
+- User requests same direction/breakage pass for V, consistently up.
+- Plan v_direction_plan.md: share H pipeline, axis prior, freeze H solution,
+  V sign baseline and breakage sweep, audit and analogous visualization.
+- Global U/V remains paused. No source/training/inference changes or installations.
+- Independent plan/code review approved. Mechanical rename to shared
+  fiber_direction.py/review.py first,25regressiontests passed before family changes.
+- Added V local axial prior, V–V filter, explicit up/down and family-neutral
+  direction aliases, hash-bound frozen H outputs and combined labels.
+-30tests pass4.62s; tests corrected to tolerance1e-14 for quadrature support
+  1+/-2e-16 (no production precision/math change). H prior/loss unchanged.
+- Full V input preparation:237800Vfibers,1842020parallel events. Approved
+  run_v_direction.json; sign-only baseline then4breakageweights in one GPU grant.
+- Preparation72.24s,117091components including86312isolatedV; no degenerate or
+  zero-dot events. Signed baseline528conflicts(0.028664%);16sGPU10ksteps.
+- First two penalties .1/.07 converge77rejections/0conflicts,99.953354%Varc
+  retained,1838768retainedevents. Independent full-data audit passes, including
+  frozen H arrays/labels and up/down gauges. None of77is individually restorable
+  in either sign without conflict; none isolated or unrelated to baseline conflicts.
+- Full sweep done; all4penalties converge same hard labels/signs(77newly broken,
+  zero conflicts). Choose strongest tested penalty.1. Baseline15.88s; four10kstep
+  solves29.99/39.21/40.66/40.07s on sharedH100. These are not isolated speed tests.
+-41tests pass7.01s including paused U/V regression; git diff --check clean.
+  CPU-only run_v_direction_review.json generating full audit, recommendation and
+  all-disabled +1000survivingV normal/curve/up-tangent views.
+- Export completed:77full disabled curves,1000survivingV curves,3960outward-normal
+  arrows and4000UPtangent arrows. Hash-pinned v_direction_recommended.json,
+  visualization data/v_direction_v1/visualization_1000. Report in v_direction_results.md.
+- Independent rawAFV resampling128events/256tangents: maximum difference2.97e-8
+  versus cachedfloat32tangents. H signs/labels unchanged; up/down aliases verified.
+- Independent final OBJ audit passed:77disabled curves1120vertices/1043edges;
+  1000survivors25828vertices/24828edges; direction overlay101828vertices/72000faces.
+  All4000arrows independently recomputed from rawAFV (maxdirectionerror2.22e-16),
+  endpoints+256basevx in savedUPdirection, all hashes/indices/survivor masks valid.
+  No remaining blockers. Global U/V still paused.
