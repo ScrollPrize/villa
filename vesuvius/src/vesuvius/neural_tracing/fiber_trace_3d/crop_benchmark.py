@@ -51,6 +51,15 @@ def bp_metrics(log):
 
 
 def run(config):
+    if 'fiber_hv_report' in config:
+        from .fiber_hv_stage import report
+        return report(config['fiber_hv_report'])
+    if 'fiber_axial_features' in config:
+        from .fiber_hv_stage import run_features
+        return run_features(config['fiber_axial_features'])
+    if 'fiber_hv_stage' in config:
+        from .fiber_hv_stage import run as run_hv
+        return run_hv(config['fiber_hv_stage'])
     if 'fiber_normal_arrow_update' in config:
         from .fiber_normal_sign_visualization import update_arrows
         return update_arrows(config['fiber_normal_arrow_update'])

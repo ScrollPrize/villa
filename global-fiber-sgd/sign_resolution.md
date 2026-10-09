@@ -14,6 +14,14 @@ Measured full-volume results: [comparison table](sign_resolution_results.md).
 
 ## 3D visualization
 
+Larger preview: `data/sign_resolution_v2/whole_scroll_1000_long_retained/`
+(29.4MiB),1000longest retained fibers/25444outward arrows, no broken fibers.
+Import `fibers.obj`, `signed_normals.ply`, and `umbilicus.ply` together in MeshLab.
+Keep `fibers.mtl` alongside OBJ. Umbilicus is orange, radius80basevoxels, a
+separately toggleable mesh. Optional `umbilicus.obj` is its thin centerline.
+Reproduce via approved crop-benchmark runner with `run_1000_sign_visualization.json`.
+Selection is length-biased; the earlier100fiber previews remain unchanged.
+
 Long-fiber whole-scroll overview:
 `data/sign_resolution_v2/whole_scroll_100_long_retained/`.
 Select100 spatially distributed fibers from1000longest retained fibers, excluding

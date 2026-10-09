@@ -1,0 +1,6 @@
+{
+  "fiber_axial_features": {
+    "native_config": "/home/hendrik/villa2/global-fiber-sgd/extract_axial_features.json",
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/hv_stage_v1/feature_runner"
+  }
+}

@@ -171,17 +171,22 @@ def solve(config):
 
 def run(config):
     """Approved benchmark runner entry. Manager owns CUDA child, never this loader."""
-    from .managed_evaluation import launch_managed
     prepare(config)
+    return launch_tensor_solve(config,__name__,Path(__file__))
+
+
+def launch_tensor_solve(config,module,source):
+    """Shared managed CUDA launch for fixed-evidence optimization stages."""
+    from .managed_evaluation import launch_managed
     repo=Path(__file__).resolve().parents[5]
     config=dict(config,code_provenance=dict(
         revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=repo,text=True).strip(),
-        optimizer_sha256=sha256_file(Path(__file__))))
+        optimizer_sha256=sha256_file(source)))
     root=Path(config['output_root']);root.mkdir(parents=True,exist_ok=True)
     frozen=root/'config.json'
     if (root/'summary.json').exists(): raise FileExistsError('Completed output exists')
     atomic_write(frozen,config,durable=False)
-    command=[sys.executable,'-m',__name__,'--config',str(frozen)]
+    command=[sys.executable,'-m',module,'--config',str(frozen)]
     rc=launch_managed(command,devices=config.get('devices','0'),settings=config['gpu_manager'])
     if rc: raise RuntimeError(f'Managed sign solver exited {rc}')
     return json.loads((root/'summary.json').read_text())

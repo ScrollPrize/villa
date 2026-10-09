@@ -1,0 +1,6 @@
+{
+  "fiber_hv_report": {
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/hv_stage_v1/adam_sweep",
+    "report": "/home/hendrik/villa2/global-fiber-sgd/hv_stage_results.md"
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "fiber_hv_stage": {
+    "database": "/home/hendrik/villa2/global-fiber-sgd/data/oriented_normals_v1/full.afc.sqlite",
+    "features": "/home/hendrik/villa2/global-fiber-sgd/data/hv_stage_v1/axial_features.json",
+    "stage1": "/home/hendrik/villa2/global-fiber-sgd/data/sign_resolution_v2/adam_sweep/solution_0.1_inward.npz",
+    "tensor_cache": "/home/hendrik/villa2/global-fiber-sgd/data/hv_stage_v1/tensors.npz",
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/hv_stage_v1/adam_sweep",
+    "steps": 10000,
+    "lr": 0.05,
+    "prior_weight": 0.001,
+    "broken_penalties": [
+      0.1,
+      1
+    ],
+    "entropy_weights": [
+      0,
+      0.01
+    ],
+    "cost_modes": [
+      "uniform",
+      "degree_mix"
+    ],
+    "log_every": 1000,
+    "seed": 0,
+    "devices": "0",
+    "gpu_manager": {
+      "exclusive": false,
+      "priority": 100,
+      "cpu_cores": 4,
+      "vram_bytes_per_gpu": 4294967296,
+      "label": "global-fiber-hv-stage"
+    }
+  }
+}

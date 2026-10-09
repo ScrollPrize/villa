@@ -1,6 +1,21 @@
 # Changelog
 
+## 2026-10-09
+
+- Added cached native per-fiber axial alignment at extraction/backfill, then
+  whole-fiber H/V+rejection stage using fixed normal-stage exclusions. Shared
+  manager launcher, degree-aware penalties and late ternary entropy;8full-data
+  GPU trials. Recommended inspection candidate4.5329%total rejected,
+  0.05826%retained relation contradictions,95.2522%active arc retained.
+  143native/15Python tests and independent all-result audit; see hv_stage.md and
+  hv_stage_results.md. No claim of anatomical error rate; no sourceDB mutation.
+
 ## 2026-10-08
+
+- Committed prior native/solver/visualization state (aa21090c2,64a467462).
+  Added optional frame-checked orange umbilicus tube/centerline; exported1000longest
+  retained fibers,25444outward arrows,0broken to whole_scroll_1000_long_retained/.
+  29.376MiB;11tests and artifact checks passed; previous previews unchanged.
 
 - Canonical saved signs now inward; display arrows outward, with explicit
   conventions and legacy conversion. Long-preview2463arrows overwritten at5x

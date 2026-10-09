@@ -2,6 +2,12 @@
 
 ## Current task
 
+Stage2 H/V assignment after normal alignment, with whole-fiber rejection:
+[hv_stage_plan.md](hv_stage_plan.md), reviewed mathematical contract and matrix.
+
+1000long retained-fiber visualization plus catalogue umbilicus; detailed current
+plan in [vis_1000_plan.md](vis_1000_plan.md). Existing exporter, no new inference.
+
 Signed-normal solution visualization with full plan in
 [sign_visualization_plan.md](sign_visualization_plan.md). CPU-only OBJ/PLY export,
 original whole AFV curves and exact oriented endpoint normals; no new inference.

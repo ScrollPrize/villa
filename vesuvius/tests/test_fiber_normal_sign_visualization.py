@@ -18,6 +18,23 @@ def test_inward_convention_and_outward_display():
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_normal_sign_visualization import obj_edges, repair_obj_lines
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_normal_sign_visualization import spatial_subset
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_normal_sign_visualization import arrow_mesh, write_ply
+from vesuvius.neural_tracing.fiber_trace_3d.fiber_normal_sign_visualization import tube_mesh, export_umbilicus
+
+
+def test_umbilicus_tube_and_frame(tmp_path):
+    import pytest
+    points=np.array([[10,10,10],[10,10,50],[10,10,50],[20,10,80]],dtype=float)
+    v,f=tube_mesh(points,3)
+    assert v.shape==(52,3) and f.shape==(96,3)
+    assert f.min()==0 and f.max()==len(v)-1
+    np.testing.assert_allclose(np.linalg.norm(v[:12]-points[0],axis=1),3)
+    path=tmp_path/'axis.json'
+    path.write_text(json.dumps(dict(metadata=dict(volume_slices=100,volume_height=100,volume_width=100,volume='123-scan.zarr',voxelsize_um=2.4),
+                                   control_points=[dict(zip('xyz',p)) for p in points])))
+    root=dict(coordinate_base_shape_zyx=[100,100,100],vc_open_data_coordinate_space='scroll/123',voxel_size_mm=.0024)
+    assert export_umbilicus(tmp_path,path,root,3)['points']==4
+    root['vc_open_data_coordinate_space']='scroll/456'
+    with pytest.raises(ValueError,match='frame mismatch'):export_umbilicus(tmp_path,path,root,3)
 from vesuvius.neural_tracing.fiber_follow.data.afv import read_afv_polylines
 
 

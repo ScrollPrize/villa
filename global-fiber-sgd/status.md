@@ -1,5 +1,17 @@
 # Status
 
+## Stage2 H/V
+
+- [x] Plan and implementation independently reviewed; cached native axial features.
+- [x]143native/15Python tests; full source identity/length validation.
+- [x] Managed full-data GPU sweep launched, eight variants.
+- [x] All8runs complete; independent saved-array audit/report hv_stage_results.md.
+- [x] Candidate degree_mix_b0.1_e0.01:4.5329%total rejected,0.05826%contradictions,
+  zero ambiguous max-probability<.9. Manager resources released.
+
+- [x] Prior state committed;1000fiber/25444arrow preview plus orange umbilicus
+  exported;0broken,29.376MiB,independent checks and11tests passed.
+
 - [x] Inward normal output / outward display convention; long-preview arrows5x,
   in-place update, all2463tips validated and original OBJ unchanged.
 

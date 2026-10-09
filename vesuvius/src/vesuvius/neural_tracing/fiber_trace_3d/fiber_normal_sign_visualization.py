@@ -80,16 +80,62 @@ def repair_obj_lines(config):
     return result
 
 
+def radial_ring(n, sides):
+    axis=np.eye(3)[np.argmin(abs(n))]
+    u=np.cross(n,axis);u/=np.linalg.norm(u);v=np.cross(n,u)
+    angles=np.arange(sides)*2*np.pi/sides
+    return np.cos(angles)[:,None]*u+np.sin(angles)[:,None]*v
+
+
+def tube_mesh(points, radius=80., sides=12):
+    """Closed per-segment cylinders: robust visible polyline, no direction arrows."""
+    points=np.asarray(points,dtype=float)
+    if points.ndim!=2 or points.shape[1]!=3 or len(points)<2 or not np.isfinite(points).all() or radius<=0:
+        raise ValueError('Invalid tube geometry')
+    vertices=[];faces=[];offset=0
+    for a,b in zip(points,points[1:]):
+        direction=b-a;length=np.linalg.norm(direction)
+        if length==0:continue
+        ring=radial_ring(direction/length,sides)*radius
+        vertices.extend([a+ring,b+ring,a[None,:],b[None,:]])
+        for k in range(sides):
+            t=(k+1)%sides
+            faces.extend([(offset+k,offset+t,offset+sides+k),
+                          (offset+t,offset+sides+t,offset+sides+k),
+                          (offset+2*sides,offset+t,offset+k),
+                          (offset+2*sides+1,offset+sides+k,offset+sides+t)])
+        offset+=2*sides+2
+    if not vertices:raise ValueError('Degenerate tube')
+    return np.concatenate(vertices),np.asarray(faces,dtype=np.int32)
+
+
+def export_umbilicus(root, path, afv_root, radius):
+    document=json.loads(Path(path).read_text());metadata=document['metadata']
+    expected=afv_root['coordinate_base_shape_zyx']
+    shape=[metadata['volume_slices'],metadata['volume_height'],metadata['volume_width']]
+    acquisition=afv_root['vc_open_data_coordinate_space'].split('/')[-1]
+    if (shape!=expected or not metadata['volume'].startswith(acquisition+'-')
+            or not np.isclose(metadata['voxelsize_um'],afv_root['voxel_size_mm']*1000,rtol=0,atol=1e-9)):
+        raise ValueError('Umbilicus/AFV coordinate frame mismatch')
+    # Published control points are native L0 despite source_annotation mentioning L2.
+    points=np.array([[p[k] for k in ('x','y','z')] for p in document['control_points']],dtype=float)
+    if np.any(points<0) or np.any(points>=np.asarray(shape[::-1])):
+        raise ValueError('Umbilicus coordinates outside native volume')
+    vv,ff=tube_mesh(points,radius)
+    write_ply(root/'umbilicus.ply',vv,ff,np.tile([255,145,20],(len(vv),1)))
+    (root/'umbilicus.obj').write_text('# Native L0 umbilicus centerline\nmtllib fibers.mtl\n'+obj_fiber('umbilicus',points,1,False))
+    return dict(source=str(path),sha256=sha256_file(path),points=len(points),radius=radius,
+                color_rgb=[255,145,20],mesh_vertices=len(vv),mesh_faces=len(ff),
+                coordinates='native L0 XYZ, no additional scale')
+
+
 def arrow_mesh(point, normal, length=64., radius=2., sides=6):
     p=np.asarray(point,dtype=float);n=np.asarray(normal,dtype=float)
     norm=np.linalg.norm(n)
     if not np.isfinite(norm) or norm<=0 or length<=0 or radius<=0:
         raise ValueError('Invalid arrow geometry')
     n=n/norm
-    axis=np.eye(3)[np.argmin(abs(n))]
-    u=np.cross(n,axis);u/=np.linalg.norm(u);v=np.cross(n,u)
-    angles=np.arange(sides)*2*np.pi/sides
-    ring=np.cos(angles)[:,None]*u+np.sin(angles)[:,None]*v
+    ring=radial_ring(n,sides)
     shoulder=p+.75*length*n
     vertices=np.concatenate([p+radius*ring,shoulder+radius*ring,
                              shoulder+3*radius*ring,(p+length*n)[None,:]])
@@ -255,6 +301,8 @@ def export(config):
         normal_convention='inward',display_normal_convention='outward',
         units='native L0 XYZ/base voxels',fibers=len(records),broken_fibers=sum(r['broken'] for r in records),
         arrows=sum(len(r['arrows']) for r in records),mesh_vertices=len(vertices),mesh_faces=len(faces),records=records)
+    if config.get('umbilicus'):
+        report['umbilicus']=export_umbilicus(root,config['umbilicus'],get_meta(afv,'root'),float(config.get('umbilicus_radius',80)))
     atomic_write(root/'index.json',report,durable=False)
     (root/'README.txt').write_text('Open fibers.obj and signed_normals.ply together in MeshLab. Keep fibers.mtl beside OBJ.\n'
         'Optional broken_fibers.obj overlay isolates broken fibers if your viewer ignores OBJ line material colors.\n'
@@ -262,5 +310,8 @@ def export(config):
         'Stored normals point inward; displayed arrows point outward (negative stored normal).\n'
         'Arrow length is display-only. Coordinates are native XYZ/base voxels. Full selected curves, no clipping.\n'
         'index.json maps original fiber IDs, probabilities, arcs and mesh/line indices.\n')
+    if config.get('umbilicus'):
+        with (root/'README.txt').open('a') as stream:
+            stream.write('Also import umbilicus.ply: orange thick axis tube, separately toggleable. umbilicus.obj is its optional thin centerline.\n')
     print(json.dumps({k:v for k,v in report.items() if k not in ('records','config')},indent=2),flush=True)
     return report

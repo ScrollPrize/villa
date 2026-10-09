@@ -1,0 +1,16 @@
+{
+  "afv": "/home/hendrik/villa2/global-fiber-sgd/data/Paris4_v1.afv",
+  "coordinate_space": "PHercParis4/20260411134726",
+  "normal_manifest": "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+  "normal_provenance": "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/inference.json",
+  "remote_cache": "/home/hendrik/villa2/global-fiber-sgd/data/normal_cache",
+  "full_volume": true,
+  "threads": 128,
+  "repetitions": 1,
+  "normal_sample_spacing": 16,
+  "umbilicus": "/home/hendrik/villa2/global-fiber-sgd/data/Paris4_umbilicus.json",
+  "output": "/home/hendrik/villa2/global-fiber-sgd/data/hv_stage_v1/feature_run.json",
+  "axial_prior_output": "/home/hendrik/villa2/global-fiber-sgd/data/hv_stage_v1/axial_features.json",
+  "axial_prior_only": true,
+  "axial_sample_spacing": 16
+}
