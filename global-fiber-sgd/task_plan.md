@@ -1,5 +1,8 @@
 # Global fiber SGD: data reconnaissance
 
+Current task: [saved U/V visualization](uv_visualization_plan.md). Optimizer
+state committed c01fb1ecd first; no further optimization in this task.
+
 Current task: [aggregated categorical targets](uv_categorical_plan.md).
 The task references below describe previous experiments.
 

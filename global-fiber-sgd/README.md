@@ -1,5 +1,8 @@
 # Global fiber assignment with PyTorch SGD
 
+Latest: [saved U/V layouts, confidence and sweep-cost plots](uv_visualization_results.md).
+Optimizer/results committed as c01fb1ecd before read-only visualization work.
+
 Current experiment: [categorical cost targets](uv_categorical_plan.md), repairing
 winding/broken probabilities with frozen continuous geometry. See
 [pilot results](uv_categorical_pilot_results.md). This is not yet a complete

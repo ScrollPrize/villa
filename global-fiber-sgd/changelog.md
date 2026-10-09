@@ -2,6 +2,11 @@
 
 ## 2026-10-09
 
+- Exported complete retained CCW/CW U/V layouts as zoomable SVG plus PNG previews,
+  confidence opacity/histograms and source tooltips. Correctly aligned sweep-cost
+  progression, missing final energies evaluated without optimization. Independent
+  artifact audit and39tests pass; see uv_visualization_results.md.
+
 - Added full-neighborhood categorical cost targets with unsuppressed p-target
   logit updates; shared geometry/costs and frozen-input auditing. Damped pilot
   repair227→0sign violations,69.4125→71.9722%arc retained; aggressive updates

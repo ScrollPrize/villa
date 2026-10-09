@@ -1,8 +1,15 @@
-# Categorical status
+# Visualization status
 
-- [x] Task and plan.
-- [x] Independent review.
-- [x] Implementation and tests (65 passed).
-- [x] Pilot matrix and full H comparisons (both10sweeps completed).
-- [x] Pilot independent audit, full final solver audits, results/docs; grants released.
-- [ ] Separate full persisted-artifact audit report (not yet rerun).
+Current continuation: both GPU jobs active for +10 sweeps (total20); independent
+review passed, starting metrics match saved final110CCW/104CW. Outputs under
+data/uv_categorical_v1/ccw_sweep20 and cw_sweep20. Completion pending.
+
+- [x] Prior state committed.
+- [x] Task/plan and independent plan review.
+- [x] Export implementation.
+- [x] Tests and saved-state export.
+- [x] Visual inspection and independent review.
+- [x] Results, docs and resource release.
+- [x] Fitted winding boundaries added to SVG/PNG layouts; CPU rerender validated.
+- [x] Superseded raster previews with1000px-high LZW TIFF, equal U/V scale,
+  no SVG tooltips. Five tests passed; continuing solves unaffected.

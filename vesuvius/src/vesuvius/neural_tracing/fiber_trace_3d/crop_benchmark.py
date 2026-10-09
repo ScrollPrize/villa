@@ -72,6 +72,9 @@ def run(config):
     if 'fiber_uv_report' in config:
         from .fiber_uv_layout import report as report_uv
         return report_uv(config['fiber_uv_report'])
+    if 'fiber_uv_visualization' in config:
+        from .fiber_uv_visualization import run as visualize_uv
+        return visualize_uv(config['fiber_uv_visualization'])
     if 'fiber_hv_stage' in config:
         from .fiber_hv_stage import run as run_hv
         return run_hv(config['fiber_hv_stage'])

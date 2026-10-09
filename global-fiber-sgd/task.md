@@ -1,5 +1,9 @@
-# Cost-target categorical optimization
+# Saved U/V solution visualization
 
-Implement and test aggregated conditional-cost targets and cross-entropy logit
-updates so tiny compatible/broken probabilities can recover. Preserve existing
-solver/results. Plan: uv_categorical_plan.md.
+Current task: continue both saved solutions another 10 sweeps; uv_continue_plan.md.
+
+First committed current optimizer/results as c01fb1ecd. Produce complete sweep
+violation/global-cost history and two vector U/V layouts with confidence opacity
+and histograms below. No optimization rerun. Plan:uv_visualization_plan.md.
+
+Follow-up: draw fitted winding boundaries on both existing layouts and previews.
