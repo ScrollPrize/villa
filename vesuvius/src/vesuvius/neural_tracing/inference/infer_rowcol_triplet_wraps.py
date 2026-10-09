@@ -1336,9 +1336,16 @@ def _build_triplet_direction_priors_for_crop(
     if cond.shape != crop_size:
         raise RuntimeError(f"cond_vox shape must match crop_size {crop_size}, got {tuple(cond.shape)}")
 
-    priors_zyx = np.zeros(crop_size + (3,), dtype=np.float32)
-    counts = np.zeros(crop_size, dtype=np.uint32)
+    mode = str(mask_mode).lower()
+    if mode not in {"cond", "full"}:
+        raise RuntimeError(f"Unknown triplet direction prior mask mode: {mask_mode!r}")
 
+    # Normals are scattered into only a few thousand voxels of the crop, so accumulate
+    # them per occupied voxel instead of over dense (D, H, W, 3) arrays. np.add.at
+    # applies the float32 additions per voxel in the same order as the dense version.
+    occupied = np.zeros((0,), dtype=np.int64)
+    prior_sum = np.zeros((0, 3), dtype=np.float32)
+    prior_count = np.zeros((0,), dtype=np.uint32)
     local_arr = np.asarray(local_zyx, dtype=np.float32)
     normals_arr = np.asarray(local_normals, dtype=np.float32)
     normals_valid = np.asarray(local_normals_valid, dtype=bool)
@@ -1361,28 +1368,37 @@ def _build_triplet_direction_priors_for_crop(
             if bool(in_bounds.any()):
                 ijk = ijk[in_bounds]
                 n = normals_arr[finite][in_bounds]
-                np.add.at(priors_zyx[..., 0], (ijk[:, 0], ijk[:, 1], ijk[:, 2]), n[:, 0])
-                np.add.at(priors_zyx[..., 1], (ijk[:, 0], ijk[:, 1], ijk[:, 2]), n[:, 1])
-                np.add.at(priors_zyx[..., 2], (ijk[:, 0], ijk[:, 1], ijk[:, 2]), n[:, 2])
-                np.add.at(counts, (ijk[:, 0], ijk[:, 1], ijk[:, 2]), 1)
+                flat = np.ravel_multi_index((ijk[:, 0], ijk[:, 1], ijk[:, 2]), crop_size)
+                occupied, slot = np.unique(flat, return_inverse=True)
+                prior_sum = np.zeros((occupied.size, 3), dtype=np.float32)
+                for axis in range(3):
+                    column = np.zeros(occupied.size, dtype=np.float32)
+                    np.add.at(column, slot, n[:, axis])
+                    prior_sum[:, axis] = column
+                prior_count = np.zeros(occupied.size, dtype=np.uint32)
+                np.add.at(prior_count, slot, 1)
 
-    have_prior = counts > 0
-    if bool(have_prior.any()):
-        priors_zyx[have_prior] /= counts[have_prior, None].astype(np.float32, copy=False)
-        norms = np.linalg.norm(priors_zyx, axis=3)
-        finite = np.isfinite(priors_zyx).all(axis=3) & np.isfinite(norms) & (norms > 1e-6)
-        have_prior &= finite
-        priors_zyx[have_prior] /= norms[have_prior, None].astype(np.float32, copy=False)
+    # Same float32 steps as the dense version: mean, then normalise where well defined.
+    prior_mean = prior_sum / prior_count[:, None].astype(np.float32, copy=False)
+    norms = np.linalg.norm(prior_mean, axis=1)
+    good = np.isfinite(prior_mean).all(axis=1) & np.isfinite(norms) & (norms > 1e-6)
+    prior_unit = prior_mean.copy()
+    prior_unit[good] /= norms[good, None].astype(np.float32, copy=False)
 
     fallback = np.asarray(fallback_unit_normal, dtype=np.float32).reshape(3)
-    fill_mask = (cond > 0.5) & (~have_prior)
-    if bool(fill_mask.any()):
-        priors_zyx[fill_mask] = fallback
-        have_prior[fill_mask] = True
+    cond_flat = cond.reshape(-1)
+    fill_mask = cond > 0.5
 
-    if str(mask_mode).lower() == "full":
-        if bool(have_prior.any()):
-            n = np.mean(priors_zyx[have_prior], axis=0, dtype=np.float64).astype(np.float32, copy=False)
+    if mode == "full":
+        # Mean over every voxel holding a prior, in C order (as boolean indexing of the
+        # dense array visits them), so the float64 sum matches the dense version.
+        fill_flat = np.flatnonzero(fill_mask)
+        fill_only = fill_flat[~np.isin(fill_flat, occupied[good], assume_unique=True)]
+        idx = np.concatenate([occupied[good], fill_only])
+        vals = np.concatenate([prior_unit[good], np.broadcast_to(fallback, (fill_only.size, 3))])
+        order = np.argsort(idx, kind="stable")
+        if idx.size:
+            n = np.mean(vals[order], axis=0, dtype=np.float64).astype(np.float32, copy=False)
             norm = float(np.linalg.norm(n))
             if np.isfinite(norm) and norm > 1e-6:
                 n /= norm
@@ -1390,16 +1406,26 @@ def _build_triplet_direction_priors_for_crop(
                 n = fallback
         else:
             n = fallback
-        priors_zyx[:, :, :] = n
-    elif str(mask_mode).lower() == "cond":
-        priors_zyx[cond <= 0.5] = 0.0
-    else:
-        raise RuntimeError(f"Unknown triplet direction prior mask mode: {mask_mode!r}")
+        priors = np.empty((6, *crop_size), dtype=np.float32)
+        for axis in range(3):
+            priors[axis].fill(n[axis])
+            priors[axis + 3].fill(-n[axis])
+        return priors
+
+    # "cond": voxels with cond > 0.5 take their normalised prior, else the fallback;
+    # cond <= 0.5 is zeroed. A NaN cond voxel keeps whatever the dense array held there.
+    cond_at = cond_flat[occupied]
+    cond_set = (cond_at > 0.5) & good
+    nan_set = np.isnan(cond_at)
+    set_idx = occupied[cond_set | nan_set]
+    set_vals = np.where(good[:, None], prior_unit, prior_mean)[cond_set | nan_set]
 
     priors = np.zeros((6, *crop_size), dtype=np.float32)
     for axis in range(3):
-        priors[axis, ...] = priors_zyx[..., axis]
-        priors[axis + 3, ...] = -priors_zyx[..., axis]
+        channel = priors[axis]
+        channel[fill_mask] = fallback[axis]
+        channel.reshape(-1)[set_idx] = set_vals[:, axis]
+        np.negative(channel, out=priors[axis + 3])
     return priors
 
 
