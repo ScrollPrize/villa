@@ -20,6 +20,7 @@ from vesuvius.ink_detection.data.augmentations import (
 from vesuvius.ink_detection.config import InkDataConfig
 from vesuvius.ink_detection.data.geometry import (
     SURFACE_MASK_MAX_DISTANCE_LEVEL0_VOXELS,
+    StoredResolutionIndex,
     compute_native_crop_bbox,
     filter_support_components,
     native_tifxyz_pyramid_params,
@@ -131,6 +132,9 @@ class InkDataset(Dataset):
         self._zarr_cache: dict[tuple, object] = {}
         self._tifxyz_cache: dict[str, object] = {}
         self._stored_resolution_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self._stored_resolution_index_cache: dict[
+            tuple[str, float], StoredResolutionIndex
+        ] = {}
         self.augmentations = None
         if self.do_augmentations and not config.augmentation.disabled:
             self.augmentations = build_augmentations(
@@ -257,6 +261,17 @@ class InkDataset(Dataset):
             self._stored_resolution_cache[key] = value
         return value
 
+    def _coarse_index(self, segment: Segment, patch_tifxyz, coordinate_scale: float):
+        key = str(segment.segment_dir), float(coordinate_scale)
+        value = self._stored_resolution_index_cache.get(key)
+        if value is None:
+            positions, valid = self._coarse_positions(segment, patch_tifxyz)
+            value = StoredResolutionIndex(
+                positions, valid, native_coordinate_scale=coordinate_scale
+            )
+            self._stored_resolution_index_cache[key] = value
+        return value
+
     def __len__(self) -> int:
         return len(self.patches)
 
@@ -361,6 +376,9 @@ class InkDataset(Dataset):
                 coarse_valid=coarse_valid,
                 native_coordinate_scale=coordinate_scale,
                 flat_grid_stride=stride,
+                coarse_index=self._coarse_index(
+                    patch.segment, patch_tifxyz, coordinate_scale
+                ),
             )
         )
         support_y0, support_y1, support_x0, support_x1 = support_bbox
@@ -485,6 +503,9 @@ class InkDataset(Dataset):
                 native_coordinate_scale=coordinate_scale,
                 flat_grid_stride=stride,
                 required=False,
+                coarse_index=self._coarse_index(
+                    segment, patch_tifxyz, coordinate_scale
+                ),
             )
             if selection is None:
                 continue

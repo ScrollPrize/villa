@@ -122,6 +122,83 @@ def maybe_select_flat_pixels(
     )
 
 
+class StoredResolutionIndex:
+    """Per-tile bounds of a stored-resolution tifxyz grid, for crop window queries.
+
+    `maybe_select_flat_pixels` over the whole stored grid costs O(grid) for
+    every crop. This index is built once per segment and keeps, for each
+    `tile` x `tile` block of the grid, the min and max of its valid scaled
+    positions. A query then tests only the blocks whose bounds can reach the
+    crop, with the same comparisons, so it returns exactly the window the full
+    scan returns.
+    """
+
+    def __init__(
+        self,
+        coarse_positions_zyx: np.ndarray,
+        coarse_valid: np.ndarray,
+        *,
+        native_coordinate_scale: float = 1.0,
+        tile: int = 32,
+    ) -> None:
+        self.scale = float(native_coordinate_scale)
+        if self.scale <= 0.0:
+            raise ValueError("native coordinate scale must be positive")
+        self.tile = int(tile)
+        self.positions = np.asarray(coarse_positions_zyx, dtype=np.float32)
+        self.valid = np.asarray(coarse_valid, dtype=bool)
+        height, width = self.positions.shape[:2]
+        rows = -(-height // self.tile)
+        columns = -(-width // self.tile)
+        self.shape = (height, width)
+        self.lower = np.empty((rows, columns, 3), dtype=np.float32)
+        self.upper = np.empty((rows, columns, 3), dtype=np.float32)
+        pad = ((0, 0), (0, columns * self.tile - width), (0, 0))
+        for row in range(rows):
+            y0, y1 = row * self.tile, min(height, (row + 1) * self.tile)
+            scaled = self._scaled(y0, y1, 0, width)
+            usable = self.valid[y0:y1] & np.isfinite(scaled).all(axis=-1)
+            band = (y1 - y0, columns, self.tile, 3)
+            # Tiles without usable points keep +inf / -inf and are never reached.
+            for bound, fill, reduce in (
+                (self.lower, np.inf, np.min),
+                (self.upper, -np.inf, np.max),
+            ):
+                values = np.where(usable[..., None], scaled, np.float32(fill))
+                values = np.pad(values, pad, constant_values=fill)
+                bound[row] = reduce(values.reshape(band), axis=(0, 2))
+
+    def _scaled(self, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
+        block = self.positions[y0:y1, x0:x1]
+        # Same float32 product the full-grid path computes for these points.
+        return block * self.scale if self.scale != 1.0 else block
+
+    def window(self, crop_bbox_zyx) -> tuple[int, int, int, int] | None:
+        """Return `(y0, y1, x0, x1)` as `maybe_select_flat_pixels` would, or None."""
+
+        crop_start = np.asarray(crop_bbox_zyx[:3], dtype=np.int64)
+        crop_stop = np.asarray(crop_bbox_zyx[3:], dtype=np.int64)
+        reachable = (self.upper >= crop_start).all(axis=-1)
+        reachable &= (self.lower < crop_stop).all(axis=-1)
+        rows, columns = [], []
+        for row, column in zip(*np.nonzero(reachable)):
+            y0, x0 = int(row) * self.tile, int(column) * self.tile
+            y1 = min(self.shape[0], y0 + self.tile)
+            x1 = min(self.shape[1], x0 + self.tile)
+            positions = self._scaled(y0, y1, x0, x1)
+            within = self.valid[y0:y1, x0:x1] & np.isfinite(positions).all(axis=-1)
+            within &= (positions >= crop_start).all(axis=-1)
+            within &= (positions < crop_stop).all(axis=-1)
+            if np.any(within):
+                hit_rows = y0 + np.flatnonzero(np.any(within, axis=1))
+                hit_columns = x0 + np.flatnonzero(np.any(within, axis=0))
+                rows += (int(hit_rows[0]), int(hit_rows[-1]))
+                columns += (int(hit_columns[0]), int(hit_columns[-1]))
+        if not rows:
+            return None
+        return min(rows), max(rows) + 1, min(columns), max(columns) + 1
+
+
 def _stored_resolution_window(
     patch_tifxyz,
     crop_bbox_zyx,
@@ -131,25 +208,38 @@ def _stored_resolution_window(
     coarse_valid: np.ndarray,
     native_coordinate_scale: float,
     flat_grid_stride: int,
+    coarse_index: StoredResolutionIndex | None = None,
 ):
     scale = float(native_coordinate_scale)
     stride = int(flat_grid_stride)
     if scale <= 0.0 or stride <= 0:
         raise ValueError("native coordinate scale and flat grid stride must be positive")
-    coarse_positions_zyx = np.asarray(coarse_positions_zyx, dtype=np.float32)
-    if scale != 1.0:
-        coarse_positions_zyx = coarse_positions_zyx * scale
     coarse_bbox = tuple(
         int(value) + (-coarse_native_pad if index < 3 else coarse_native_pad)
         for index, value in enumerate(crop_bbox_zyx)
     )
-    selection = maybe_select_flat_pixels(
-        coarse_positions_zyx, coarse_valid, coarse_bbox
-    )
-    if selection is None:
-        return None
-    (coarse_y0, coarse_y1, coarse_x0, coarse_x1), _, _ = selection
-    stored_h, stored_w = (int(value) for value in coarse_positions_zyx.shape[:2])
+    if coarse_index is not None:
+        if coarse_index.scale != scale:
+            raise ValueError(
+                f"coarse index was built for scale {coarse_index.scale!r}, "
+                f"not {scale!r}"
+            )
+        coarse_window = coarse_index.window(coarse_bbox)
+        if coarse_window is None:
+            return None
+        coarse_y0, coarse_y1, coarse_x0, coarse_x1 = coarse_window
+        stored_h, stored_w = coarse_index.shape
+    else:
+        coarse_positions_zyx = np.asarray(coarse_positions_zyx, dtype=np.float32)
+        if scale != 1.0:
+            coarse_positions_zyx = coarse_positions_zyx * scale
+        selection = maybe_select_flat_pixels(
+            coarse_positions_zyx, coarse_valid, coarse_bbox
+        )
+        if selection is None:
+            return None
+        (coarse_y0, coarse_y1, coarse_x0, coarse_x1), _, _ = selection
+        stored_h, stored_w = (int(value) for value in coarse_positions_zyx.shape[:2])
     full_h, full_w = (int(value) for value in patch_tifxyz.full_resolution_shape)
     if stored_h <= 0 or stored_w <= 0:
         raise ValueError(
@@ -190,8 +280,14 @@ def select_flat_pixels_via_stored_resolution(
     native_coordinate_scale: float = 1.0,
     flat_grid_stride: int = 1,
     required: bool = True,
+    coarse_index: StoredResolutionIndex | None = None,
 ):
-    """Refine a coarse tifxyz intersection to an exact full-grid support window."""
+    """Refine a coarse tifxyz intersection to an exact full-grid support window.
+
+    Pass a `StoredResolutionIndex` built from the same coarse positions, valid
+    mask and scale to avoid scanning the whole stored grid for every crop; the
+    result is the same.
+    """
     window = _stored_resolution_window(
         patch_tifxyz,
         crop_bbox_zyx,
@@ -200,6 +296,7 @@ def select_flat_pixels_via_stored_resolution(
         coarse_valid=coarse_valid,
         native_coordinate_scale=native_coordinate_scale,
         flat_grid_stride=flat_grid_stride,
+        coarse_index=coarse_index,
     )
     if window is None:
         if required:
@@ -252,6 +349,51 @@ def project_flat_patch(
     return output
 
 
+_UNREACHED = np.iinfo(np.int32).max
+_OFFSETS_WITHIN: dict[float, np.ndarray] = {}
+
+
+def _offsets_within(max_distance: float) -> np.ndarray:
+    """Integer `(dz, dy, dx, squared norm)` rows with norm below `max_distance`."""
+
+    offsets = _OFFSETS_WITHIN.get(max_distance)
+    if offsets is None:
+        radius = int(np.ceil(max_distance))
+        steps = np.arange(-radius, radius + 1, dtype=np.int32)
+        dz, dy, dx = np.meshgrid(steps, steps, steps, indexing="ij")
+        squared = dz * dz + dy * dy + dx * dx
+        keep = squared < max_distance * max_distance
+        offsets = np.stack([dz[keep], dy[keep], dx[keep], squared[keep]], axis=1)
+        _OFFSETS_WITHIN[max_distance] = offsets
+    return offsets
+
+
+@njit(cache=True)
+def _local_squared_distance(occupancy, offsets, unreached):
+    depth, height, width = occupancy.shape
+    squared = np.full((depth, height, width), unreached, dtype=np.int32)
+    for z in range(depth):
+        for y in range(height):
+            for x in range(width):
+                if not occupancy[z, y, x]:
+                    continue
+                for index in range(offsets.shape[0]):
+                    zz = z + offsets[index, 0]
+                    yy = y + offsets[index, 1]
+                    xx = x + offsets[index, 2]
+                    if (
+                        zz >= 0
+                        and zz < depth
+                        and yy >= 0
+                        and yy < height
+                        and xx >= 0
+                        and xx < width
+                        and offsets[index, 3] < squared[zz, yy, xx]
+                    ):
+                        squared[zz, yy, xx] = offsets[index, 3]
+    return squared
+
+
 def project_surface_distance(
     positions_zyx: np.ndarray,
     valid_mask: np.ndarray,
@@ -269,7 +411,19 @@ def project_surface_distance(
         return occupancy.astype(np.float32)
     if max_distance_voxels <= 0.0:
         return occupancy.astype(np.float32, copy=False)
-    distance = distance_transform_edt(~occupancy)
+    offsets = _offsets_within(float(max_distance_voxels))
+    # Only distances below max_distance_voxels survive the clip, and each of those
+    # is the norm of an integer offset in `offsets`, so searching those offsets
+    # around the occupied voxels gives the same values as the full transform.
+    # It costs one update per occupied voxel and offset, so keep the full
+    # transform for large radii on dense crops.
+    if np.count_nonzero(occupancy) * len(offsets) <= 16 * occupancy.size:
+        squared = _local_squared_distance(occupancy, offsets, _UNREACHED)
+        distance = np.full(occupancy.shape, np.inf)
+        reached = squared != _UNREACHED
+        distance[reached] = np.sqrt(squared[reached].astype(np.float64))
+    else:
+        distance = distance_transform_edt(~occupancy)
     return np.clip(1.0 - distance / max_distance_voxels, 0.0, 1.0).astype(
         np.float32, copy=False
     )
