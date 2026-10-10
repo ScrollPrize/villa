@@ -389,6 +389,8 @@ Coordinates of the input ply mesh must already be in millimetres. Stage each val
 
 The general rule is `<input>/<scroll-number>/<scroll-number>-scaled.ply`.
 
+By default the case axis is the axis of the smallest enclosing cylinder. For a squashed scroll this can run across the flattened cross-section instead of along the umbilicus. To set the axis, add `<input>/<scroll-number>/<scroll-number>-axis.txt` holding either a direction (3 numbers) or two points on the umbilicus (6 numbers, e.g. picked in MeshLab), in the PLY's coordinates. Record the file with the run.
+
 Run the generator:
 
 ```bash

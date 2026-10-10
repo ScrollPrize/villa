@@ -154,6 +154,9 @@ class ScrollMesh:
         smoothing_callback: Smoothing callback that accepts a mesh and returns a mesh
         smoothing_unite_with_original: Unite with the original after smoothing to ensure
         mesh does not get smaller.
+        cylinder_axis: Cylinder axis direction in input mesh coordinates, e.g. along
+        the umbilicus. Defaults to None, which fits the axis giving the smallest
+        enclosing cylinder.
 
     """
 
@@ -170,6 +173,7 @@ class ScrollMesh:
     smoothing_callback: Optional[Callable[[mm.Mesh], mm.Mesh]] = None
     smoothing_unite_with_original: bool = True
     vertical_offset: Optional[float] = None
+    cylinder_axis: Optional[tuple[float, float, float]] = None
 
 
 def assert_one_component(mesh: mm.Mesh):
@@ -246,7 +250,10 @@ def build_lining(
     logger.info("Aligning mesh")
     points = np.array([(point.x, point.y, point.z) for point in mesh_scroll.points])
     rotation_mat, translation_mat, radius, height = alignment.fit_cylinder(
-        points, mesh_params.cylinder_axis_tol, _debug=_debug
+        points,
+        mesh_params.cylinder_axis_tol,
+        _debug=_debug,
+        axis=mesh_params.cylinder_axis,
     )
 
     A = mm.Matrix3f(*[mm.Vector3f(*d) for d in rotation_mat])
