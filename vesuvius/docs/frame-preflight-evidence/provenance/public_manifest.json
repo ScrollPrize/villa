@@ -1,0 +1,158 @@
+{
+  "schema_version": 1,
+  "package_id": "C02-EVIDENCE-001C",
+  "project": "Vesuvius metadata-only frame provenance preflight",
+  "package_status": "LOCAL_STAGING_ONLY_NOT_PUBLISHED",
+  "generated_date": "2026-10-10",
+  "repository": "https://github.com/ScrollPrize/villa",
+  "pull_request": "https://github.com/ScrollPrize/villa/pull/1944",
+  "git_commit": "917de185c102c045af1b6523ea11e68736a905e2",
+  "github_read_only_check": {
+    "checked_date": "2026-10-10",
+    "pull_request_state": "OPEN",
+    "pull_request_head": "917de185c102c045af1b6523ea11e68736a905e2",
+    "fork_branch_head": "917de185c102c045af1b6523ea11e68736a905e2",
+    "upstream_main": "a329895ea5e9bde78752e60dbc0a4878dd2ab909"
+  },
+  "relevant_files": [
+    {
+      "path": "vesuvius/src/vesuvius/frame_preflight.py",
+      "sha256": "8efe961629d5ff73978a28e22290ea7adadfd665f979a7054ce52013e53b04c9"
+    },
+    {
+      "path": "vesuvius/tests/test_frame_preflight.py",
+      "sha256": "e2de2bd673a4ee8b55847fa8a72931476c6d354706d719212dfde1eb89a45061"
+    },
+    {
+      "path": "vesuvius/tests/test_surface_preflight.py",
+      "sha256": "cbc4c4ab397f53cd845d3e1218ab746be1f7b160a3d4e1fedf02a3ba68de3f37"
+    }
+  ],
+  "environment": {
+    "python": "3.14.8",
+    "pytest": "9.1.1",
+    "operating_system": "Windows"
+  },
+  "catalog": {
+    "source_url": "https://vesuvius-challenge-open-data.s3.amazonaws.com/metadata.json",
+    "snapshot_name": "official_metadata_2026-10-09.json",
+    "size_bytes": 17537378,
+    "sha256": "40517076dc5f2128599868b337e25a17922ebe70a22b238b990e109b6f82af0f",
+    "included_in_package": false
+  },
+  "validation": {
+    "frame_preflight": {
+      "passed": 20,
+      "failed": 0,
+      "skipped": 0
+    },
+    "surface_preflight": {
+      "passed": 30,
+      "failed": 0,
+      "skipped": 0
+    },
+    "total": {
+      "passed": 50,
+      "failed": 0,
+      "skipped": 0
+    },
+    "compileall": "PASS",
+    "git_diff_check": "PASS",
+    "case_pairs_byte_identical": true,
+    "outputs_byte_identical_to_limit003": true
+  },
+  "real_data_cases": [
+    {
+      "case_id": "P1",
+      "sample_id": "PHerc0139",
+      "segment_id": "20250108000004-w029_2025010827",
+      "selected_entry_id": "PHerc0139/segments/20250108000004-w029_2025010827/mesh/20250108000004-on-20250728140407-9.362um.tifxyz/",
+      "requested_target_volume_id": "20260102150214",
+      "original_artifact": "c02_evidence_001b/real_data/p1_run1.json",
+      "original_sha256": "f61f0c17fa4970b233260adc26949b0e622cb37acf3a395fbb22283c913b102b",
+      "sanitized_derivative": "examples/p1_example.json",
+      "sanitized_sha256": "1de1112caf993d02d5c073b9aa0157c9566fb7299f0724155e48b1036268db74",
+      "frame_relation": "TRANSFORM_REQUIRED",
+      "frame_reason": "EXPLICIT_DIFFERENT_TARGET_AND_DIRECTED_VOLUME_TRANSFORM",
+      "alternative_relation": "SAME_FRAME_ALTERNATIVE_AVAILABLE",
+      "alternative_reason": "EXPLICIT_CATALOG_ENTRY_TARGETS_REQUESTED_VOLUME",
+      "transform": {
+        "application_direction": "FORWARD",
+        "catalog_from_volume_id": "20250728140407",
+        "catalog_to_volume_id": "20260102150214",
+        "inverse_required": false
+      },
+      "original_artifact_scope": "local_only",
+      "original_artifact_included_in_public_package": false,
+      "sanitized_derivative_scope": "public_package"
+    },
+    {
+      "case_id": "N1",
+      "sample_id": "PHerc1447",
+      "segment_id": "20250703034159-auto_grown_20250703034159599",
+      "selected_entry_id": "PHerc1447/segments/20250703034159-auto_grown_20250703034159599/mesh/20250703034159-on-20250521151220-8.64um.tifxyz/",
+      "requested_target_volume_id": "20250521151220",
+      "original_artifact": "c02_evidence_001b/real_data/n1_run1.json",
+      "original_sha256": "2feba879b9df1cd258abb5f8cb03ec845f1312b8c7268814eba61bd491f42cbc",
+      "sanitized_derivative": "examples/n1_example.json",
+      "sanitized_sha256": "64c98728887642543930615fc0b085dceac159c8102bb68798be625652623241",
+      "frame_relation": "SAME_FRAME",
+      "frame_reason": "EXPLICIT_ENTRY_TARGET_MATCHES_REQUESTED_VOLUME",
+      "alternative_relation": "NONE_CONFIRMED",
+      "alternative_reason": "COMPLETE_SEGMENT_ENUMERATION_WITHOUT_STRONG_MATCH",
+      "transform": null,
+      "original_artifact_scope": "local_only",
+      "original_artifact_included_in_public_package": false,
+      "sanitized_derivative_scope": "public_package"
+    },
+    {
+      "case_id": "U1",
+      "sample_id": "PHerc1447",
+      "segment_id": "20250502183138-auto_grown_20250502162038685",
+      "selected_entry_id": "PHerc1447/segments/20250502183138-auto_grown_20250502162038685/mesh/intermediate/tifxyz_original/",
+      "requested_target_volume_id": "20250521151220",
+      "original_artifact": "c02_evidence_001b/real_data/u1_run1.json",
+      "original_sha256": "80fdd5d47357a69fcb210e88d5fb0fc1fdf2538eb77ab91dd24d501c1e060845",
+      "sanitized_derivative": "examples/u1_example.json",
+      "sanitized_sha256": "52fecf2bdc6ef2829f2dd688a34835d3456544f3ea9f6689c34f615178333a30",
+      "frame_relation": "UNKNOWN",
+      "frame_reason": "MISSING_EFFECTIVE_ENTRY_FRAME_ID",
+      "alternative_relation": "SAME_FRAME_ALTERNATIVE_AVAILABLE",
+      "alternative_reason": "EXPLICIT_CATALOG_ENTRY_TARGETS_REQUESTED_VOLUME",
+      "transform": null,
+      "original_artifact_scope": "local_only",
+      "original_artifact_included_in_public_package": false,
+      "sanitized_derivative_scope": "public_package"
+    }
+  ],
+  "resources": {
+    "measured_case": "N1",
+    "peak_working_set_bytes": 90927104,
+    "peak_working_set_mib": 86.715,
+    "method": "System.Diagnostics.Process WorkingSet64 sampled every 5 ms, combined with PeakWorkingSet64",
+    "general_memory_upper_bound": null
+  },
+  "sanitization": {
+    "derivative_marker": "_sanitized_derivative",
+    "neutralized_field": "catalog_fingerprint.source",
+    "replacement": "official_metadata_2026-10-09.json",
+    "scientific_fields_changed": false,
+    "original_evidence_location": "Locally archived C02-EVIDENCE-001B primary evidence; not included in this staging package.",
+    "original_evidence_scope": "local_only",
+    "original_evidence_included_in_public_package": false
+  },
+  "known_limits": [
+    "No independent external reproduction.",
+    "No demonstrated community use.",
+    "No automatic renderer integration.",
+    "No CT, TIFXYZ raster, or Zarr chunk validation.",
+    "Evidence comprises three deliberately selected real-data catalog cases.",
+    "The catalog snapshot is identified by size and SHA-256 but is not bundled.",
+    "Metadata evidence does not establish mesh quality or render quality."
+  ],
+  "artifact_path_policy": {
+    "relative_to": "public_package_root",
+    "public_package_root": "vesuvius/docs/frame-preflight-evidence/",
+    "interpretation": "All relative artifact paths in this manifest are relative to the root of the public evidence package."
+  }
+}
