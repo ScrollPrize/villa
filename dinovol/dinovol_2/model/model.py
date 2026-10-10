@@ -46,6 +46,8 @@ _BACKBONE_DEFAULTS = {
     "use_abs_pos_emb": False,
     "use_rot_pos_emb": True,
     "num_reg_tokens": 4,
+    "untie_cls_and_patch_norms": False,
+    "untie_global_and_local_cls_norm": False,
     "grad_checkpointing": False,
     "block_chunks": 0,
 }
@@ -75,8 +77,15 @@ _BACKBONE_DEFAULTS_V2 = {
     "use_abs_pos_emb": False,
     "use_rot_pos_emb": True,
     "num_reg_tokens": 4,
+    "untie_cls_and_patch_norms": False,
+    "untie_global_and_local_cls_norm": False,
     "grad_checkpointing": False,
     "block_chunks": 0,
+}
+
+_BACKBONE_DEFAULTS_V3 = {
+    **_BACKBONE_DEFAULTS_V2,
+    "untie_global_and_local_cls_norm": True,
 }
 
 _ROPE_KWARG_CONFIG_KEYS = {
@@ -139,6 +148,8 @@ _HEAD_OUT_DIM_DEFAULTS = {
 
 def _resolve_backbone_defaults(config: Mapping[str, Any]) -> Mapping[str, Any]:
     model_type = config.get("model_type")
+    if isinstance(model_type, str) and model_type.strip().lower() == "v3":
+        return _BACKBONE_DEFAULTS_V3
     if isinstance(model_type, str) and model_type.strip().lower() == "v2":
         return _BACKBONE_DEFAULTS_V2
     return _BACKBONE_DEFAULTS

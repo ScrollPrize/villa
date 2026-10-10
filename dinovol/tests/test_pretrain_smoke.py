@@ -166,6 +166,13 @@ class PretrainSmokeTests(unittest.TestCase):
         self.assertGreater(report["forward"]["losses"]["gram"], 0.0)
         self.assertIsNotNone(report["forward"]["batch"]["gram_teacher_crops"])
 
+    def test_axial_separate_norms_constant_lr_smoke_step(self) -> None:
+        config = self._base_config(output_name="axial_separate_norms")
+        config["model"]["model_type"] = "v3"
+        report = build_verification_report(config, use_amp=False)
+        self.assertTrue(report["forward"]["checks"]["all_passed"])
+        self.assertTrue(report["train_step"]["checks"]["all_passed"])
+
     def test_hr_mixed_resolution_default_smoke(self) -> None:
         trainer = DinoIBOTPretrainer(self._hr_config(embedding_type="default", output_name="hr_default"))
         dataloader = trainer.build_dataloader()

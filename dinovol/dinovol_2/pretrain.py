@@ -123,8 +123,10 @@ class CosineScheduler:
 class DinoIBOTPretrainer:
     def __init__(self, config: Mapping[str, Any]) -> None:
         self.config = dict(config)
-        self.model_config = _materialize_backbone_config(self.config["model"])
+        # Resolve backbone defaults without discarding head and checkpoint settings.
+        self.model_config = {**self.config["model"], **_materialize_backbone_config(self.config["model"])}
         self.config["model"] = self.model_config
+        modern_defaults = str(self.model_config.get("model_type", "")).strip().lower() == "v3"
         distributed_config = resolve_distributed_config(self.config)
         self.is_distributed = bool(distributed_config["use_ddp"])
         self.rank = int(distributed_config["rank"])
@@ -163,8 +165,11 @@ class DinoIBOTPretrainer:
         self.total_steps = self.max_iterations
         self.base_lr = float(self.config.get("lr", 1e-4))
         self.min_lr = float(self.config.get("min_lr", 1e-6))
+        self.lr_schedule_type = str(self.config.get("lr_schedule", "constant" if modern_defaults else "cosine")).lower()
+        if self.lr_schedule_type not in {"cosine", "constant"}:
+            raise ValueError("lr_schedule must be 'cosine' or 'constant'")
         self.base_weight_decay = float(self.config.get("weight_decay", 0.04))
-        self.final_weight_decay = float(self.config.get("weight_decay_end", 0.4))
+        self.final_weight_decay = float(self.config.get("weight_decay_end", self.base_weight_decay if modern_defaults else 0.4))
         self.betas = tuple(self.config.get("betas", (0.9, 0.999)))
         self.clip_grad = float(self.config.get("clip_grad", 3.0))
         self.layer_decay = float(self.config.get("layer_decay", self.config.get("layerwise_decay", 1.0)))
@@ -183,7 +188,8 @@ class DinoIBOTPretrainer:
         if self.is_distributed:
             ddp_kwargs: dict[str, Any] = {
                 "broadcast_buffers": False,
-                "find_unused_parameters": False,
+                # A local-only norm may be unused when a batch has no local crops.
+                "find_unused_parameters": bool(self.model_config.get("untie_global_and_local_cls_norm", False)),
             }
             if self.device.type == "cuda":
                 ddp_kwargs.update(
@@ -205,7 +211,10 @@ class DinoIBOTPretrainer:
             ibot_out_dim,
             masked_loss_chunk_size=masked_loss_chunk_size,
         ).to(self.device)
-        self.koleo_loss = KoLeoLoss().to(self.device)
+        self.koleo_loss = KoLeoLoss(
+            distributed=bool(self.config.get("koleo_distributed", True)),
+            loss_group_size=self.config.get("koleo_loss_group_size", 16 if modern_defaults else None),
+        ).to(self.device)
         self.gram_config = dict(self.config.get("gram") or {})
         self.do_gram = bool(self.gram_config.get("enabled", False))
         self.gram_loss = (
@@ -264,8 +273,8 @@ class DinoIBOTPretrainer:
         self.warmup_teacher_temp_steps = int(
             self.config.get("warmup_teacher_temp_steps", round(self.total_steps * 0.3))
         )
-        self.momentum_teacher = float(self.config.get("momentum_teacher", 0.992))
-        self.final_momentum_teacher = float(self.config.get("final_momentum_teacher", 1.0))
+        self.momentum_teacher = float(self.config.get("momentum_teacher", 0.994 if modern_defaults else 0.992))
+        self.final_momentum_teacher = float(self.config.get("final_momentum_teacher", self.momentum_teacher if modern_defaults else 1.0))
         (
             self.lr_schedule,
             self.wd_schedule,
@@ -475,9 +484,10 @@ class DinoIBOTPretrainer:
 
     def _build_schedulers(self) -> tuple[
         CosineScheduler, CosineScheduler, CosineScheduler, CosineScheduler, CosineScheduler]:
+        final_lr = self.base_lr if self.lr_schedule_type == "constant" else self.min_lr
         lr_schedule = CosineScheduler(
             base_value=self.base_lr,
-            final_value=self.min_lr,
+            final_value=final_lr,
             total_iters=self.total_steps,
             warmup_iters=self.warmup_steps,
             start_warmup_value=0.0,
@@ -501,7 +511,7 @@ class DinoIBOTPretrainer:
         )
         last_layer_lr_schedule = CosineScheduler(
             base_value=self.base_lr,
-            final_value=self.min_lr,
+            final_value=final_lr,
             total_iters=self.total_steps,
             warmup_iters=self.warmup_steps,
             start_warmup_value=0.0,

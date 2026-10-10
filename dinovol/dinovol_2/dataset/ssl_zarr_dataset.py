@@ -705,7 +705,8 @@ class SSLZarrDataset(Dataset):
 
     def _apply_paired_global_transform(self, transform, global_view, gram_teacher_view):
         if gram_teacher_view is None or self.gram_teacher_no_augmentations:
-            return transform(image=global_view)["image"], gram_teacher_view
+            transformed = transform(image=global_view, paired_spatial_image=gram_teacher_view)
+            return transformed["image"], transformed["paired_spatial_image"]
 
         state_before = self._capture_rng_state()
         augmented_global = transform(image=global_view)["image"]
@@ -728,8 +729,9 @@ class SSLZarrDataset(Dataset):
             "crop_shape": tuple(int(value) for value in self.global_view_size),
         }
         if gram_teacher_view is None or self.gram_teacher_no_augmentations:
+            transform_input["paired_spatial_image"] = gram_teacher_view
             transformed = transform(**transform_input)
-            return transformed["image"], gram_teacher_view, transformed["keypoints"]
+            return transformed["image"], transformed["paired_spatial_image"], transformed["keypoints"]
 
         state_before = self._capture_rng_state()
         transformed = transform(**transform_input)

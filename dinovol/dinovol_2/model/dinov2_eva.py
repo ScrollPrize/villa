@@ -370,6 +370,8 @@ class Eva(nn.Module):
             use_rot_pos_emb: bool = True,
             dynamic_img_size: bool = False,
             num_reg_tokens: int = 0,
+            untie_cls_and_patch_norms: bool = False,
+            untie_global_and_local_cls_norm: bool = False,
             drop_path_scale: bool = True,
             rope_impl=RopePositionEmbedding,
             rope_kwargs=None,
@@ -510,6 +512,8 @@ class Eva(nn.Module):
             for i in range(depth)])
 
         self.norm = norm_layer(embed_dim)
+        self.cls_norm = norm_layer(embed_dim) if untie_cls_and_patch_norms else None
+        self.local_cls_norm = norm_layer(embed_dim) if untie_global_and_local_cls_norm else None
         self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
 
         self._init_weights()
@@ -770,6 +774,42 @@ class Eva(nn.Module):
             output.append(x_out)
         return output
 
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        # Warm-start newly separated norms from the corresponding trained norm.
+        # With both options disabled, checkpoint keys are unchanged.
+        for name in ("cls_norm", "local_cls_norm"):
+            norm = getattr(self, name)
+            if norm is None:
+                continue
+            source = "cls_norm" if name == "local_cls_norm" and self.cls_norm is not None else "norm"
+            for key in norm.state_dict():
+                target_key = f"{prefix}{name}.{key}"
+                source_key = f"{prefix}{source}.{key}"
+                if target_key not in state_dict and source_key in state_dict:
+                    state_dict[target_key] = state_dict[source_key].clone()
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    def _format_features(self, x, masks, *, view_kind: str):
+        if view_kind not in {"global", "local"}:
+            raise ValueError(f"Unknown view_kind={view_kind!r}")
+        if self.cls_norm is None and self.local_cls_norm is None:
+            normalized = self.norm(x)
+            prefix = normalized[:, :self.num_prefix_tokens]
+            patches = normalized[:, self.num_prefix_tokens:]
+        else:
+            prefix_norm = self.cls_norm if self.cls_norm is not None else self.norm
+            if self.training and view_kind == "local" and self.local_cls_norm is not None:
+                prefix_norm = self.local_cls_norm
+            prefix = prefix_norm(x[:, :self.num_prefix_tokens])
+            patches = self.norm(x[:, self.num_prefix_tokens:])
+        return {
+            "x_norm_clstoken": prefix[:, 0] if self.num_class_tokens > 0 else None,
+            "x_norm_regtokens": prefix[:, self.num_class_tokens:],
+            "x_norm_patchtokens": patches,
+            "x_prenorm": x,
+            "masks": masks,
+        }
+
     def forward_features(self, x, masks=None, *, view_kind: str = "global"):
         x, rot_pos_embed, rope_shape = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind)
         rope_coords = self._get_shared_per_block_rope_coords(rope_shape)
@@ -778,15 +818,7 @@ class Eva(nn.Module):
                 x = checkpoint(blk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
             else:
                 x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
-        x = self.norm(x)
-        outputs = {
-            "x_norm_clstoken": x[:, 0] if self.num_class_tokens > 0 else None,
-            "x_norm_regtokens": x[:, self.num_class_tokens:self.num_prefix_tokens],
-            "x_norm_patchtokens": x[:, self.num_prefix_tokens:],
-            "x_prenorm": x,
-            "masks": masks,
-        }
-        return outputs
+        return self._format_features(x, masks, view_kind=view_kind)
 
     def forward(self, x, masks=None, is_training=True, *, view_kind: str = "global"):
         return self.forward_features_list(x, masks, view_kind=view_kind)
@@ -928,15 +960,7 @@ class EvaWithChunking(Eva):
                 else:
                     x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
 
-        x = self.norm(x)
-        outputs = {
-            "x_norm_clstoken": x[:, 0] if self.num_class_tokens > 0 else None,
-            "x_norm_regtokens": x[:, self.num_class_tokens:self.num_prefix_tokens],
-            "x_norm_patchtokens": x[:, self.num_prefix_tokens:],
-            "x_prenorm": x,
-            "masks": masks,
-        }
-        return outputs
+        return self._format_features(x, masks, view_kind=view_kind)
 
     def forward(self, x, masks=None, is_training=True, *, view_kind: str = "global"):
         return self.forward_features_list(x, masks, view_kind=view_kind)

@@ -15,13 +15,17 @@ Run project commands from the monorepository's `dinovol/` directory.
 This implementation is still incomplete. Pretraining works, but finetuning has
 not yet been implemented.
 
-NOTE: a newer `v2` backbone config exists and should generally be preferred for new runs, but the default remains the older config so older checkpoints continue to load without config changes
-To select the newer defaults explicitly, set `model.model_type` to `v2` in the config:
+Use the `v3` preset for new runs, as selected by every example recipe. It uses
+axial 3D RoPE, separate local/global CLS output normalization, constant LR after
+warmup, constant weight decay and teacher momentum, and KoLeo groups of up to 16.
+The `v2` preset and configs without `model_type` retain their older defaults for
+checkpoint compatibility. Explicit config values override preset defaults.
+To select the new defaults, set `model.model_type` to `v3`:
 
 ```json
 {
   "model": {
-    "model_type": "v2",
+    "model_type": "v3",
     "embedding_type": "default",
     "global_crops_size": [96, 96, 96],
     "local_crops_size": [48, 48, 48]
@@ -34,6 +38,65 @@ To select the newer defaults explicitly, set `model.model_type` to `v2` in the c
 Original Dinovol code is available under the [MIT License](LICENSE).
 Third-party code retains its upstream terms; see
 [Third-Party Notices](THIRD_PARTY_NOTICES.md).
+
+## Backbone and learning-rate options
+
+The following settings can be added to a training config:
+
+```json
+{
+  "lr_schedule": "constant",
+  "warmup_steps": 1000,
+  "koleo_distributed": true,
+  "koleo_loss_group_size": 16,
+  "model": {
+    "model_type": "v3",
+    "rope_type": "axial",
+    "untie_cls_and_patch_norms": false,
+    "untie_global_and_local_cls_norm": true
+  }
+}
+```
+
+- `lr_schedule` defaults to `constant` for `v3`, and `cosine` for older presets. `constant` uses the existing linear
+  warmup and then holds the configured `lr`, including beyond `max_iterations`;
+  it ignores `min_lr`. Last-layer freezing and parameter-group LR multipliers
+  still apply. Weight decay, teacher momentum, and temperature retain their
+  own schedules. In `v3`, weight decay defaults to a constant `0.04` and teacher
+  momentum to a constant `0.994`; overriding their initial values also changes
+  their default final values. Set `weight_decay_end` equal to `weight_decay` and
+  `final_momentum_teacher` equal to `momentum_teacher` to hold those constant too.
+  `warmup_steps: 0` disables LR warmup; otherwise the default is 10% of the run.
+- `rope_type` selects the existing 3D `axial` or learnable per-block `mixed`
+  implementation. The default is `axial` for `v3`, `mixed` for `v2`, and `axial`
+  for the original unversioned model. Both support variable crop sizes and coordinate rescaling.
+  The attention head dimension must be divisible by six for 3D RoPE.
+- `untie_cls_and_patch_norms` gives CLS/register tokens their own output norm;
+  patch tokens keep the original `norm`.
+- `untie_global_and_local_cls_norm` adds a separate CLS/register output norm for
+  local crops during student training. Evaluation and the EMA teacher use the
+  global norm. This flag defaults to `true` for `v3` and `false` for older presets;
+  `untie_cls_and_patch_norms` remains `false` in all presets.
+- `koleo_distributed` defaults to `true`: with DDP, KoLeo compares each view's
+  embeddings across ranks, with gradients through gathered embeddings. This
+  expects equal per-rank batch sizes, as supplied by the training loaders.
+  Set it to `false` for local-only comparisons. A comparison batch with fewer
+  than two samples produces zero loss and gradient.
+- `koleo_loss_group_size` defaults to `16` for `v3`, and `null` (the whole
+  comparison batch) for older presets. Groups are contiguous in rank-major order,
+  independently for each global view. If fewer than 16 samples are available,
+  all available samples are used. Larger comparison batches must be divisible
+  by the requested group size; choose a divisor or `null` otherwise. Grouping
+  limits neighbour selection; the current implementation still gathers all ranks.
+
+Model head dimensions and `pretrained_weights` are preserved in the resolved
+training config. When enabling separate norms on an older checkpoint, missing
+norm weights are initialized from its trained shared norm (or its existing CLS
+norm for the new local norm). Use `model.pretrained_weights` to start a new run
+when changing normalization options; resuming optimizer state requires the same
+parameter layout. Keep `rope_type` consistent with the checkpoint: switching
+between learned mixed and axial RoPE is an architecture experiment, not an exact
+checkpoint conversion.
 
 ## Gram Anchoring And HR Adaptation
 
@@ -60,7 +123,7 @@ The new config surface is:
   - `gram_teacher_no_augmentations`
   - `variants`
 
-When `gram.enabled=true`, the trainer builds a frozen Gram teacher backbone, loads it from `gram.teacher_checkpoint` when provided, refreshes it from the live EMA teacher on the configured cadence, and adds an image-level Gram loss on patch features. Gram-teacher crops are paired with each global crop from the exact same sampled 3D region, and default to normalization-only.
+When `gram.enabled=true`, the trainer builds a frozen Gram teacher backbone, loads it from `gram.teacher_checkpoint` when provided, refreshes it from the live EMA teacher on the configured cadence, and adds an image-level Gram loss on patch features. Gram-teacher crops are paired with each global crop from the exact same sampled 3D region. With `gram_teacher_no_augmentations=true`, they receive normalization and the same geometric transforms as the student, but no intensity/noise augmentation. Shared rotations, flips, and transpositions preserve patch correspondence even at different crop resolutions.
 
 Mixed-resolution HR adaptation is enabled by adding `dataset.variants`, where each variant defines its own crop sizes and sampling ratio. The trainer builds one dataloader per variant and samples them with the configured weights. For `embedding_type=deeper`, the dataset automatically derives the needed overscanned `*_view_size` values from the patch halo.
 
@@ -119,8 +182,19 @@ uv run python -m dinovol_2.verify dinovol_2/example_config.json --no-amp
 To run the synthetic smoke suite:
 
 ```bash
-uv run python -m unittest tests.test_pretrain_smoke -v
+uv run python -m unittest discover -s tests -v
 ```
+
+With an existing environment, run without installing or updating dependencies:
+
+```bash
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 .venv/bin/python -m unittest discover -s tests -v
+```
+
+The suite includes synthetic volume smoke tests and regressions for checkpoint
+initialization, output norms, both RoPE implementations, constant LR, paired Gram
+geometry, and two-rank KoLeo gradients. It does not establish downstream quality;
+validate training changes on real held-out volumes before a long run.
 
 ## Point-supervised pretraining
 
