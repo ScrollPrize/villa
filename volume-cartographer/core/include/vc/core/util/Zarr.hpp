@@ -94,10 +94,12 @@ void createPyramidDatasets(const std::filesystem::path& outFile,
 // Split out of writeZarrAttrs so the representation can be tested without a
 // filesystem or a Volume: the rules about units and relative scaling described
 // below are the part that went wrong, and they are pure JSON construction.
+// With includePyramid=false, advertise only level 0; levels 1-5 are not created.
 [[nodiscard]] utils::Json buildMultiscales(double baseVoxelSize,
                                            const std::string& voxelUnit,
                                            double sliceStep,
-                                           double pixelsPerVoxel);
+                                           double pixelsPerVoxel,
+                                           bool includePyramid = true);
 
 // Write OME-Zarr .zattrs multiscales JSON.
 //
@@ -120,6 +122,7 @@ void createPyramidDatasets(const std::filesystem::path& outFile,
 //     Nothing in the document is a physical length, so a reader cannot mistake
 //     the numbers for one -- which is what a bare scale of 1.0 with no unit
 //     allowed.
+// `includePyramid` must match the dataset creation choice, including --pre.
 void writeZarrAttrs(const std::filesystem::path& outFile,
                     const std::filesystem::path& volPath, int groupIdx,
                     size_t baseZ, double sliceStep, double accumStep,
@@ -127,7 +130,9 @@ void writeZarrAttrs(const std::filesystem::path& outFile,
                     const cv::Size& canvasSize, size_t CZ, size_t CH, size_t CW,
                     double baseVoxelSize = 1.0,
                     const std::string& voxelUnit = "",
-                    double pixelsPerVoxel = 1.0);
+                    double pixelsPerVoxel = 1.0,
+                    const utils::Json* extraAttributes = nullptr,
+                    bool includePyramid = true);
 
 // Write a dense uint8 ZYX subregion into a freshly created dataset via
 // writeChunk(). Chunks overlapping the region are materialized; untouched
