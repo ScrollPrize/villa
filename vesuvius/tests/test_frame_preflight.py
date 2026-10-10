@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -94,6 +95,22 @@ def inspect(
         target_volume_id=requested,
         catalog_fingerprint={"source": "fixture", "sha256": "fixture-sha"},
     )
+
+
+def padded_catalog_bytes(size: int) -> bytes:
+    payload = b'{"metadata": {}}'
+    assert len(payload) <= size
+    return payload + b" " * (size - len(payload))
+
+
+class MockHTTPResponse(io.BytesIO):
+    def __init__(self, payload: bytes, *, include_content_length: bool) -> None:
+        super().__init__(payload)
+        self.headers = (
+            {"Content-Length": str(len(payload))}
+            if include_content_length
+            else {}
+        )
 
 
 def test_explicit_entry_target_is_same_frame() -> None:
@@ -390,3 +407,109 @@ def test_ambiguity_incomplete_enumeration_and_cli_output_are_conservative(
     second = outputs[1].read_bytes()
     assert first == second
     assert hashlib.sha256(first).hexdigest() == hashlib.sha256(second).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("offset", "accepted"),
+    [(-1, True), (0, True), (1, False)],
+)
+def test_raw_catalog_limit_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    offset: int,
+    accepted: bool,
+) -> None:
+    limit = 64
+    catalog_path = tmp_path / "catalog.json"
+    catalog_path.write_bytes(padded_catalog_bytes(limit + offset))
+    monkeypatch.setattr(frame_preflight, "MAX_CATALOG_BYTES", limit)
+
+    if accepted:
+        loaded, fingerprint = frame_preflight.load_catalog(str(catalog_path))
+        assert loaded == {"metadata": {}}
+        assert fingerprint["payload_bytes"] == limit + offset
+    else:
+        with pytest.raises(frame_preflight.CatalogError, match="Catalog exceeds"):
+            frame_preflight.load_catalog(str(catalog_path))
+
+
+@pytest.mark.parametrize("include_content_length", [True, False])
+def test_http_catalog_limit_with_and_without_content_length(
+    monkeypatch: pytest.MonkeyPatch,
+    include_content_length: bool,
+) -> None:
+    limit = 64
+    monkeypatch.setattr(frame_preflight, "MAX_CATALOG_BYTES", limit)
+
+    exact_payload = padded_catalog_bytes(limit)
+    monkeypatch.setattr(
+        frame_preflight,
+        "urlopen",
+        lambda *_args, **_kwargs: MockHTTPResponse(
+            exact_payload,
+            include_content_length=include_content_length,
+        ),
+    )
+    loaded, fingerprint = frame_preflight.load_catalog(
+        "https://example.test/catalog.json"
+    )
+    assert loaded == {"metadata": {}}
+    assert fingerprint["payload_bytes"] == limit
+
+    oversized_payload = padded_catalog_bytes(limit + 1)
+    monkeypatch.setattr(
+        frame_preflight,
+        "urlopen",
+        lambda *_args, **_kwargs: MockHTTPResponse(
+            oversized_payload,
+            include_content_length=include_content_length,
+        ),
+    )
+    with pytest.raises(frame_preflight.CatalogError, match="Catalog exceeds"):
+        frame_preflight.load_catalog("https://example.test/catalog.json")
+
+
+def test_malformed_json_maps_to_catalog_unreadable(
+    tmp_path: Path,
+) -> None:
+    catalog_path = tmp_path / "malformed.json"
+    catalog_path.write_bytes(b'{"metadata":')
+    output_path = tmp_path / "report.json"
+
+    exit_code = frame_preflight.main(
+        [
+            "--catalog",
+            str(catalog_path),
+            "--sample-id",
+            "sample-a",
+            "--segment-id",
+            "segment-a",
+            "--entry-origin-path",
+            "selected/",
+            "--target-volume-id",
+            "requested-frame",
+            "--output",
+            str(output_path),
+        ]
+    )
+    report = json.loads(output_path.read_text(encoding="utf-8"))
+
+    assert exit_code == 2
+    assert report["frame_relation"] == "UNKNOWN"
+    assert report["frame_reason"] == "CATALOG_UNREADABLE"
+    assert report["alternative_relation"] == "UNKNOWN"
+    assert report["alternative_reason"] == "CATALOG_UNREADABLE"
+    assert report["contradictions"][0]["code"] == "CATALOG_UNREADABLE"
+
+
+def test_gzip_decoded_limit_remains_independent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog_path = tmp_path / "catalog.json.gz"
+    catalog_path.write_bytes(gzip.compress(padded_catalog_bytes(64)))
+    monkeypatch.setattr(frame_preflight, "MAX_CATALOG_BYTES", 128)
+    monkeypatch.setattr(frame_preflight, "MAX_DECODED_CATALOG_BYTES", 63)
+
+    with pytest.raises(frame_preflight.CatalogError, match="Decoded catalog exceeds"):
+        frame_preflight.load_catalog(str(catalog_path))
