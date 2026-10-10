@@ -132,6 +132,12 @@ def _infer_zyx_scale(arr, array_path: Path) -> tuple[float, float, float]:
     scale = _scale_from_ome_parent(array_path)
     if scale is not None:
         return scale
+    print(
+        f"WARN: no physical scale found for {array_path} (neither preprocess params nor "
+        "parent OME-Zarr metadata carry one); assuming 1.0 per voxel. Physical distances "
+        "derived from this scale will be wrong unless the voxel size is known to be 1.0.",
+        file=sys.stderr,
+    )
     return 1.0, 1.0, 1.0
 
 
