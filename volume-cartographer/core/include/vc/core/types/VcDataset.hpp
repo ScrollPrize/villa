@@ -65,13 +65,26 @@ public:
     bool removeChunk(size_t iz, size_t iy, size_t ix);
 
     // --- Region I/O (replaces z5::multiarray::readSubarray) ---
-    bool readRegion(const std::vector<size_t>& offset,
-                    const std::vector<size_t>& regionShape,
-                    void* output) const;
+    // offset and regionShape have one entry per dataset dimension. The buffer holds the region
+    // in C order: the product of regionShape elements, dtypeSize() bytes each.
+    //
+    // Bounds contract: the region must lie inside the dataset, offset[d] + regionShape[d] <=
+    // shape()[d] for every d. A region that does not, or has the wrong number of dimensions, is
+    // refused: the call returns false and touches neither the buffer nor the dataset. That is
+    // the only way either call returns false, so false means the caller computed a bad region.
+    // Check it and stop: carrying on would use a buffer that was never filled, or count on
+    // data that was never written.
+    // An empty region (a zero extent in any dimension) is accepted before any other check:
+    // it does nothing and returns true.
+    //
+    // readRegion reads chunks missing from the store as the fill value; that is not a failure.
+    [[nodiscard]] bool readRegion(const std::vector<size_t>& offset,
+                                  const std::vector<size_t>& regionShape,
+                                  void* output) const;
 
-    bool writeRegion(const std::vector<size_t>& offset,
-                     const std::vector<size_t>& regionShape,
-                     const void* data);
+    [[nodiscard]] bool writeRegion(const std::vector<size_t>& offset,
+                                   const std::vector<size_t>& regionShape,
+                                   const void* data);
 
     struct Impl;
 private:

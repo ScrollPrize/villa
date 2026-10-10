@@ -157,6 +157,12 @@ jobs:
         timeout-minutes: 2
         with:
           sparse-checkout: volume-cartographer
+      # Keep this until the next published dependency image includes the
+      # libsqlite3-dev entry in scripts/install_build_deps.sh.
+      - name: Install SQLite headers
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends libsqlite3-dev
       - name: Set up shared compiler cache
         uses: mozilla-actions/sccache-action@v0.0.10
         with:
@@ -207,6 +213,12 @@ jobs:
         timeout-minutes: 2
         with:
           sparse-checkout: volume-cartographer
+      # Keep this until the next published dependency image includes the
+      # libsqlite3-dev entry in scripts/install_build_deps.sh.
+      - name: Install SQLite headers
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends libsqlite3-dev
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
@@ -252,6 +264,12 @@ jobs:
         timeout-minutes: 2
         with:
           sparse-checkout: volume-cartographer
+      # Keep this until the next published dependency image includes the
+      # libsqlite3-dev entry in scripts/install_build_deps.sh.
+      - name: Install SQLite headers
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends libsqlite3-dev
       # Keep this until the next published dependency image includes the
       # valgrind entry in scripts/install_build_deps.sh.
       - name: Install Valgrind profiler
@@ -325,6 +343,12 @@ jobs:
         timeout-minutes: 2
         with:
           sparse-checkout: volume-cartographer
+      # Keep this until the next published dependency image includes the
+      # libsqlite3-dev entry in scripts/install_build_deps.sh.
+      - name: Install SQLite headers
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends libsqlite3-dev
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
@@ -374,6 +398,12 @@ jobs:
         timeout-minutes: 2
         with:
           sparse-checkout: volume-cartographer
+      # Keep this until the next published dependency image includes the
+      # libsqlite3-dev entry in scripts/install_build_deps.sh.
+      - name: Install SQLite headers
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends libsqlite3-dev
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
@@ -395,6 +425,14 @@ jobs:
         working-directory: volume-cartographer
         timeout-minutes: 2
         run: python3 core/test/test_render_tifxyz_logging.py build/ci-fast-cli/bin/vc_render_tifxyz
+      - name: Test renderer exit code on remote fetch failure
+        working-directory: volume-cartographer
+        timeout-minutes: 5
+        run: python3 core/test/test_render_fetch_failure.py build/ci-fast-cli/bin/vc_render_tifxyz
+      - name: Test renderer band prefetch reads only sampled chunks
+        working-directory: volume-cartographer
+        timeout-minutes: 2
+        run: python3 core/test/test_render_band_prefetch.py build/ci-fast-cli/bin/vc_render_tifxyz
 
   flatboi-compile:
     name: Linux Flatboi/PaStiX compile coverage (Clang QuickBuild)
@@ -425,6 +463,12 @@ jobs:
         timeout-minutes: 2
         with:
           sparse-checkout: volume-cartographer
+      # Keep this until the next published dependency image includes the
+      # libsqlite3-dev entry in scripts/install_build_deps.sh.
+      - name: Install SQLite headers
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends libsqlite3-dev
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0

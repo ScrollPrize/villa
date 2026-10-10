@@ -195,11 +195,11 @@ This is a big prize, and it breaks into two stages: first **segmentation** (unro
 
 One of the frontiers of Vesuvius Challenge is finding techniques that work across multiple scrolls.
 While we’ve discovered text in some of our scrolls, others have not yet produced legible findings.
-These prizes bridge ink detection on fragments to the much harder problem of reading intact scrolls: we want to prove that ink detection works on scrolls where nothing has been read yet. The review bar is deliberately high — we’d rather be slow than wrong.
+For these prizes, your mission is to prove that ink detection works on scrolls where nothing has been read yet. The review bar is deliberately high — we’d rather be slow than wrong.
 
-**First Letters: <span className="vc-money">\$50,000</span> per scroll, for any of the eligible scroll volumes listed below.** <span className="vc-money">\$50,000</span> to the first team that uncovers 10 letters within a single 4 cm² area of that scroll — and open sources their methods and results (after winning the prize). First Letters prizes will be awarded for a maximum of 10 scrolls — up to <span className="vc-money">\$500,000</span> in total.
+**First Letters: <span className="vc-money">\$50,000</span> per scroll, for any of the eligible scroll volumes listed below.** <span className="vc-money">\$50,000</span> to the first team that uncovers 10 letters within a single 4 cm² area of that scroll — and open sources their code, data, model weights and results (after winning the prize). First Letters prizes will be awarded for a maximum of 10 scrolls — up to <span className="vc-money">\$500,000</span> in total.
 
-Note the eligible set here is larger than the [2027 Grand Prize](#2027-grand-prize) set: it includes every Grand Prize volume plus several additional scrolls where no text has been read yet.
+Note the eligible set here is different than the [2027 Grand Prize](#2027-grand-prize) set: it includes several other scrolls where no text has been read yet, and excludes those where letters have now been found.
 
 <EligibleVolumes prize="first-letters-2027" />
 
@@ -310,7 +310,7 @@ If you are new to the project, this is a great place to start.
 Beyond that, progress prizes will be awarded at a range of levels based on the significance of the contribution, typically <span className="vc-money">\$20,000</span>, <span className="vc-money">\$10,000</span>, <span className="vc-money">\$5,000</span>, <span className="vc-money">\$2,500</span>, <span className="vc-money">\$1,000</span>, <span className="vc-money">\$500</span> or <span className="vc-money">\$250</span>.
 
 We favor submissions that:
-* Are **released or open-sourced early**. Tools released earlier have a higher chance of being used for reading the scrolls than those released the last day of the month.
+* Are **released or open-sourced early**. Tools released earlier have a higher chance of being used for reading the scrolls than those released the last day of the month. This includes releasing model weights and training data where applicable.
 * Actually **get used**. We’ll look for signals from the community: questions, comments, bug reports, feature requests. Our Annotation Team will publicly provide comments on tools they use.
 * Improve results quantitatively and/or qualitatively on **real data**. If you are working on [ink detection](/data_datasets#ink-labels-2026-07) or [surface prediction](/data_datasets#surface-labels-2026-07) your method should be evaluated on our public datasets. If you are working on virtual unwrapping, show visually that papyrus fibers are visible on your output surface, and it doesn't jump across sheets in cross-section.
 * Resolve outstanding **bugs in tools that people are using**, and that you are using yourself, evidenced by before/after screenshots, logs, etc.
@@ -323,7 +323,7 @@ We maintain a [public wishlist](https://github.com/ScrollPrize/villa/issues?q=is
 Some are additionally labeled as [good first issues](https://github.com/ScrollPrize/villa/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22) for newcomers!
 
 {/* progress-prizes:deadline:start */}
-Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, September 30th, 2026!
+Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, October 31st, 2026!
 {/* progress-prizes:deadline:end */}
 
 <details>
@@ -344,7 +344,7 @@ Submissions are evaluated monthly, and multiple submissions/awards per month are
 </details>
 
 {/* progress-prizes:form:start */}
-[Submission Form](https://docs.google.com/forms/d/e/1FAIpQLScNBMj25FMnphngRG1Ciryv_2_Mkdq2YPJOD9WqPfZExII2iQ/viewform)
+[Submission Form](https://docs.google.com/forms/d/e/1FAIpQLSc4flEfgK2nyjoczz2_U_XrIGMlgrnSknWatLqrFPnbtKfZwg/viewform)
 {/* progress-prizes:form:end */}
 
 ***

@@ -589,7 +589,7 @@ def test_short_circuit_local_unchanged():
     remote = make_fiber(BASE_CPS, tags=['new'], generation=4)
     result = merge_fibers(base, copy.deepcopy(base), remote)
     assert result['ok']
-    assert result['merged'] == remote
+    assert result['merged'] == dict(remote, width_gap_fraction=0.2)
     # A wholesale-adopted side is already consistent with its peers
     assert result['peer_files'] == []
 
@@ -598,7 +598,7 @@ def test_noop_stability():
     base = make_fiber(BASE_CPS)
     result = merge_fibers(base, copy.deepcopy(base), copy.deepcopy(base))
     assert result['ok']
-    assert result['merged'] == base
+    assert result['merged'] == dict(base, width_gap_fraction=0.2)
 
 
 def test_tolerance_bounds():
@@ -1279,7 +1279,7 @@ def test_short_circuit_merges_still_report_peers():
     remote = make_fiber(BASE_CPS, branches=[entry], tags=['new'], generation=4)
     result = merge_fibers(base, copy.deepcopy(base), remote)
     assert result['ok']
-    assert result['merged'] == remote
+    assert result['merged'] == dict(remote, width_gap_fraction=0.2)
     assert result['peer_files'] == ['kb_a.json']
 
 
@@ -1659,7 +1659,7 @@ def test_v3_short_circuit_merge_then_refresh(changed_side):
     result = merge_fibers(base_a, local, remote)
     assert result['ok'], result['conflicts']
     assert result['peer_files'] == ['b.json']
-    assert result['merged'] == changed
+    assert result['merged'] == dict(changed, width_gap_fraction=0.2)
 
     out = refresh_pair_links(result['merged'], b, 'a.json', 'b.json',
                              base_doc=base_a)
@@ -1766,6 +1766,104 @@ def test_v3_interior_control_point_tag_survives_a_separated_remote_span_change()
     assert loader_issues({'dj_x_000001.json': merged}) == []
 
 
+def test_display_metadata_merges_independently_of_geometry():
+    base = make_v3_fiber(BASE_CPS)
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    local['width'] = 24
+    local['control_points'][0]['display_normal'] = [0, 1, 0]
+    remote['control_points'][1]['display_normal'] = [0, 0, 1]
+    set_v3_span(remote, 5, goal='lasagna', bend=-2.0)
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['width'] == 24
+    assert result['merged']['control_points'][0]['display_normal'] == [0, 1, 0]
+    assert result['merged']['control_points'][1]['display_normal'] == [0, 0, 1]
+    assert result['merged']['control_points'][5]['segment_to_next']['interp_goal'] == 'lasagna'
+
+
+def test_display_metadata_conflicts_and_reset():
+    base = make_v3_fiber(BASE_CPS)
+    base['control_points'][0]['display_normal'] = [0, 1, 0]
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    del local['control_points'][0]['display_normal']
+    remote['width'] = 12
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert 'display_normal' not in result['merged']['control_points'][0]
+    remote['control_points'][0]['display_normal'] = [0, 0, 1]
+    assert not merge_fibers(base, local, remote)['ok']
+
+
+def test_display_normal_provenance_merges_with_normal():
+    base = make_v3_fiber(BASE_CPS)
+    base['control_points'][0]['display_normal'] = [0, 1, 0]
+    base['control_points'][0]['display_normal_source'] = 'interpolated'
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    local['control_points'][0]['display_normal_source'] = 'manual'
+    remote['width'] = 24
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['control_points'][0]['display_normal_source'] == 'manual'
+    # Provenance must not detach from a concurrently changed vector.
+    remote['control_points'][0]['display_normal'] = [0, 0, 1]
+    assert not merge_fibers(base, local, remote)['ok']
+
+
+def test_display_normal_provenance_legacy_and_validation():
+    base = make_v3_fiber(BASE_CPS)
+    base['control_points'][0]['display_normal'] = [0, 1, 0]
+    result = merge_fibers(base, base, base)
+    assert result['ok']
+    assert result['merged']['control_points'][0]['display_normal_source'] == 'unknown'
+    base['control_points'][0]['display_normal_source'] = 'invalid'
+    assert not merge_fibers(base, base, base)['ok']
+
+
+def test_width_gap_defaults_and_three_way_merge():
+    base = make_v3_fiber(BASE_CPS)
+    assert merge_fibers(base, base, base)['merged']['width_gap_fraction'] == 0.2
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    local['width_gap_fraction'] = 0.3
+    remote['width'] = 15
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['width_gap_fraction'] == 0.3
+    assert result['merged']['width'] == 15
+    assert merge_fibers(base, base, local)['merged']['width_gap_fraction'] == 0.3
+    remote['width_gap_fraction'] = 0.4
+    assert not merge_fibers(base, local, remote)['ok']
+    for bad in [-0.1, 1.1, '20%', None, True]:
+        local['width_gap_fraction'] = bad
+        assert not fiber_merge.is_fiber_doc(local)
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    local['width'], remote['width'] = 10, 20
+    assert not merge_fibers(base, local, remote)['ok']
+
+
+@pytest.mark.parametrize('version', [3, 4])
+def test_cp_directions_merge_validate_and_preserve_sign(version):
+    base = make_v3_fiber(BASE_CPS)
+    base['version'] = version
+    if version == 4:
+        base['control_points'][0]['segment_to_next']['tags'] = ['damaged']
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    local['control_points'][0]['direction'] = [1, 0, 0]
+    remote['control_points'][0]['direction'] = [1, 0, 0]
+    remote['width'] = 20
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['control_points'][0]['direction'] == [1, 0, 0]
+    assert result['merged']['width'] == 20
+    assert result['merged']['version'] == version
+    if version == 4:
+        assert result['merged']['control_points'][0]['segment_to_next']['tags'] == ['damaged']
+    remote['control_points'][0]['direction'] = [-1, 0, 0]
+    assert not merge_fibers(base, local, remote)['ok']
+    for invalid in ([0, 0, 0], [1, 2], [float('nan'), 0, 1]):
+        local['control_points'][0]['direction'] = invalid
+        assert not fiber_merge.is_fiber_doc(local)
+
+
 def test_v3_tagging_and_refitting_the_same_final_span_is_a_manual_conflict():
     base = make_v3_fiber(BASE_CPS)
     local = copy.deepcopy(base)
@@ -1779,3 +1877,147 @@ def test_v3_tagging_and_refitting_the_same_final_span_is_a_manual_conflict():
 
     assert not result['ok']
     assert any('changed differently on both sides' in c for c in result['conflicts'])
+
+
+def test_is_fiber_doc_accepts_the_break_tag():
+    """The break tag is one more string in the per-CP tags array: every loader
+    already accepts it, on any control point, so untouched fibers and older
+    builds see no new field."""
+    doc = make_v3_fiber(BASE_CPS)
+    doc['control_points'][1]['tags'] = ['break']
+    doc['control_points'][2]['tags'] = ['break']
+    assert fiber_merge.is_fiber_doc(doc)
+    assert loader_issues({'dj_x_000001.json': doc}) == []
+
+
+def make_v4_gap(doc, first):
+    """What VC3D writes for a gap between controls first and first+1: both
+    break tags, the span's 'gap' tag and the cubic-spline goal, under format
+    version 4."""
+    doc['version'] = 4
+    doc['control_points'][first]['tags'] = ['break']
+    doc['control_points'][first + 1]['tags'] = ['break']
+    set_v3_span(doc, first, goal='cspline', bend=0.0)
+    doc['control_points'][first]['segment_to_next']['tags'] = ['gap']
+
+
+def test_is_fiber_doc_version_4_span_tags():
+    """Version 4 = version 3 plus optional span tags; a version-3 span may not
+    carry them, and the tags must be a list of strings."""
+    doc = make_v3_fiber(BASE_CPS)
+    make_v4_gap(doc, 1)
+    assert fiber_merge.is_fiber_doc(doc)
+    assert fiber_merge._has_trace_span(doc)
+    v3 = copy.deepcopy(doc)
+    v3['version'] = 3
+    assert not fiber_merge.is_fiber_doc(v3)
+    bad = copy.deepcopy(doc)
+    bad['control_points'][1]['segment_to_next']['tags'] = 'gap'
+    assert not fiber_merge.is_fiber_doc(bad)
+    bad = copy.deepcopy(doc)
+    bad['control_points'][1]['segment_to_next']['tags'] = [1]
+    assert not fiber_merge.is_fiber_doc(bad)
+    bad = copy.deepcopy(doc)
+    bad['control_points'][1]['segment_to_next']['gap'] = True     # unknown field
+    assert not fiber_merge.is_fiber_doc(bad)
+
+
+def test_v4_gap_span_survives_a_separated_remote_span_change():
+    """A gap is two consecutive break tags, the span's own 'gap' tag and the
+    cubic-spline goal; all live in the same span run, so a change elsewhere
+    merges and the gap arrives intact. A v3 base with v4 sides (the normal
+    state right after an upgrade) is not a version conflict; the merge is
+    written as version 4."""
+    base = make_v3_fiber(BASE_CPS)
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    local['generation'] = 2
+    remote['generation'] = 3
+    make_v4_gap(local, 1)
+    remote['version'] = 4
+    set_v3_span(remote, 5, goal='lasagna', bend=-2.0)
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    merged = result['merged']
+    assert merged['version'] == 4
+    assert merged['control_points'][1]['tags'] == ['break']
+    assert merged['control_points'][2]['tags'] == ['break']
+    assert merged['control_points'][1]['segment_to_next']['interp_goal'] == 'cspline'
+    assert merged['control_points'][1]['segment_to_next']['tags'] == ['gap']
+    assert merged['control_points'][5]['segment_to_next']['interp_goal'] == 'lasagna'
+    assert 'tags' not in merged['control_points'][5]['segment_to_next']
+    assert loader_issues({'dj_x_000001.json': merged}) == []
+
+
+def test_v3_remote_still_merges_with_a_v4_local():
+    """One side still on the old build: its version-3 file merges against
+    the v4 side; the result is version 4."""
+    base = make_v3_fiber(BASE_CPS)
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    local['generation'] = 2
+    remote['generation'] = 3
+    local['version'] = 4
+    set_v3_span(local, 1, goal='cspline', bend=1.5)
+    set_v3_span(remote, 5, goal='lasagna', bend=-2.0)
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    assert result['merged']['version'] == 4
+    assert loader_issues({'dj_x_000001.json': result['merged']}) == []
+
+
+def test_v3_side_from_an_old_build_does_not_pull_a_v4_file_back():
+    """A one-sided shortcut result is written at the lineage's highest
+    version: base v4, remote v4 unchanged, local re-saved by an old build as
+    v3 (span tags dropped) still merges to version 4."""
+    base = make_v3_fiber(BASE_CPS)
+    base['version'] = 4
+    remote = copy.deepcopy(base)
+    local = copy.deepcopy(base)
+    local['version'] = 3
+    local['generation'] = 2
+    set_v3_span(local, 1, goal='cspline', bend=1.5)
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    assert result['merged']['version'] == 4
+    assert result['merged']['control_points'][1]['segment_to_next']['interp_goal'] == 'cspline'
+    assert loader_issues({'dj_x_000001.json': result['merged']}) == []
+
+
+def test_v3_save_over_a_v4_base_with_span_tags_is_a_regression_conflict():
+    """An older build re-saving a fiber whose last-synced copy carried span
+    tags cannot have kept them: that is a conflict for manual resolution
+    (before the merge shortcuts and in vc_sync's upload guard), not a silent
+    loss. A v4 base WITHOUT span tags re-saved as v3 is fine."""
+    base = make_v3_fiber(BASE_CPS)
+    make_v4_gap(base, 1)
+    stale = copy.deepcopy(base)
+    stale['version'] = 3
+    for cp in stale['control_points'][:-1]:
+        cp['segment_to_next'].pop('tags', None)
+    stale['generation'] = 2
+    set_v3_span(stale, 5, goal='lasagna', bend=-2.0)
+    assert fiber_merge.legacy_regression(stale, base)
+    # Shortcut path: remote unchanged, local is the stale v3 save.
+    result = merge_fibers(base, stale, copy.deepcopy(base))
+    assert not result['ok']
+    assert any('span tags' in c for c in result['conflicts'])
+    # Content-merge path: remote changed too.
+    remote = copy.deepcopy(base)
+    remote['generation'] = 3
+    set_v3_span(remote, 3, goal='cspline', bend=1.0)
+    result = merge_fibers(base, stale, remote)
+    assert not result['ok']
+    assert any('span tags' in c for c in result['conflicts'])
+    # No span tags in the base: a v3 re-save is no regression.
+    plain = make_v3_fiber(BASE_CPS)
+    plain['version'] = 4
+    downgraded = copy.deepcopy(plain)
+    downgraded['version'] = 3
+    assert fiber_merge.legacy_regression(downgraded, plain) is None

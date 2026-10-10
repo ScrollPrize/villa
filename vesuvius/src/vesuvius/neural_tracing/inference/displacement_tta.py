@@ -275,6 +275,30 @@ def _drop_tta_outlier_variants(disp_stack, thresh, min_keep=4):
     return disp_stack[keep_mask]
 
 
+def _transform_input_vector_channels(
+    inputs, *, vector_channel_starts=(), flip_dims=(), axis_perm=None,
+):
+    """Transform vector components after the input's spatial transform.
+
+    CT and conditioning masks are scalar channels. Copy direction priors
+    contain two ZYX vectors, whose components must follow the spatial map.
+    Empty starts preserve legacy behavior for callers without vector inputs.
+    """
+    if not vector_channel_starts:
+        return inputs
+    output = inputs.clone()
+    for start in vector_channel_starts:
+        start = int(start)
+        if start < 0 or start + 3 > inputs.shape[1]:
+            raise ValueError(f"Invalid input vector channel start: {start}")
+        if axis_perm is not None:
+            channels = [start + int(axis) for axis in axis_perm]
+            output[:, start:start + 3] = inputs[:, channels]
+        for dim in flip_dims:
+            output[:, start + FLIP_DIM_TO_CHANNEL[dim]] *= -1
+    return output
+
+
 def run_model_tta(
     model,
     inputs,
@@ -287,6 +311,7 @@ def run_model_tta(
     outlier_drop_min_keep=4,
     tta_batch_size=2,
     profiler=None,
+    input_vector_channel_starts=(),
 ):
     """Run TTA on a batch, returning merged displacement."""
     if inputs.ndim != 5:
@@ -317,13 +342,20 @@ def run_model_tta(
                     x = inputs
                     for d in flip_dims:
                         x = x.flip(d)
+                    x = _transform_input_vector_channels(
+                        x, vector_channel_starts=input_vector_channel_starts,
+                        flip_dims=flip_dims,
+                    )
                     tta_inputs.append(x)
             else:
                 transform_chunk = TTA_ROTATE3_PERMS[chunk_start:chunk_start + tta_batch_size]
                 for perm in transform_chunk:
-                    tta_inputs.append(
-                        inputs.permute(0, 1, 2 + perm[0], 2 + perm[1], 2 + perm[2])
+                    x = inputs.permute(0, 1, 2 + perm[0], 2 + perm[1], 2 + perm[2])
+                    x = _transform_input_vector_channels(
+                        x, vector_channel_starts=input_vector_channel_starts,
+                        axis_perm=perm,
                     )
+                    tta_inputs.append(x)
             tta_inputs = torch.cat(tta_inputs, dim=0)
         with _profile_section(profiler, "iter_tta_forward_chunk"):
             disp_all = get_displacement_result(model, tta_inputs, amp_enabled, amp_dtype)

@@ -1,4 +1,6 @@
 #include "CWindow.hpp"
+#include "FiberLengthDisplay.hpp"
+#include "VolumeDisplayNames.hpp"
 #include "OpenDataCoordinateIdentity.hpp"
 #include "OpenDataLasagna.hpp"
 
@@ -138,6 +140,7 @@
 #include "CFiberWidget.hpp"
 #include "FiberAnnotationController.hpp"
 #include "overlays/FiberOverlayController.hpp"
+#include "FiberCollectionController.hpp"
 #include "LineAnnotationController.hpp"
 #include "LineAnnotationDialog.hpp"
 #include "SurfaceTreeWidget.hpp"
@@ -589,11 +592,7 @@ private:
 
 std::filesystem::path openDataCatalogManifestCachePath()
 {
-    QString base = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
-    if (base.isEmpty()) {
-        base = QDir::home().filePath(QStringLiteral(".VC3D"));
-    }
-    return std::filesystem::path(base.toStdString()) / "open-data-catalog" / "metadata.json";
+    return vc3d::opendata::cachedOpenDataManifestPath();
 }
 
 QString formatAtlasCoveredSize(const vc::atlas::AtlasCoveredSize& size)
@@ -2489,6 +2488,12 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
 
     _workspaceTabs = new QTabWidget(this);
     _workspaceTabs->setObjectName(QStringLiteral("workspaceTabs"));
+    _projectNameLabel = new QLabel(_workspaceTabs);
+    _projectNameLabel->setObjectName(QStringLiteral("currentProjectName"));
+    _projectNameLabel->setTextFormat(Qt::PlainText);
+    _projectNameLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    _projectNameLabel->setContentsMargins(8, 0, 8, 0);
+    _workspaceTabs->setCornerWidget(_projectNameLabel, Qt::TopRightCorner);
     _workspaceTabs->setTabsClosable(true);
     _workspaceTabs->addTab(_segmentWorkspaceWindow, tr("main"));
     _workspaceTabs->addTab(_lasagnaWorkspaceWindow, tr("Lasagna"));
@@ -2534,6 +2539,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     connect(_workspaceTabs, &QTabWidget::currentChanged, this, [this]() {
         scheduleWindowStateSave();
         updateActiveWorkspaceViewerControls();
+        updateLineAnnotationLengthLabel();
+        QTimer::singleShot(0, this, &CWindow::updateProjectNameLabel);
     });
     connect(_workspaceTabs, &QTabWidget::tabCloseRequested, this, [this](int index) {
         if (!_workspaceTabs) {
@@ -2562,6 +2569,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     vc::render::processChunkCacheService()->configureDecodedByteCapacity(
         _cacheSizeBytes);
     _state = new CState(this, _benchOptions.debugDownloadQueue);
+    connect(_state, &CState::vpkgChanged, this, &CWindow::updateProjectNameLabel);
+    updateProjectNameLabel();
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
     connect(_state, &CState::surfaceWillBeDeleted, this, &CWindow::onSurfaceWillBeDeleted);
     connect(_state, &CState::vpkgChanged, this,
@@ -2599,6 +2608,10 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
 
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
     _viewerManager->setSegmentationCursorMirroring(_mirrorCursorToSegmentation);
+    // Let SurfaceCache tile fills serve the flattened view instead of queueing
+    // behind raw-path chunk demand for frames that never sample it, as Spiral
+    // does.
+    _viewerManager->setPreferSurfaceTileFills(true);
     if (_workspaceTabs && _spiralWorkspaceWindow) {
         const int spiralIndex = _workspaceTabs->indexOf(_spiralWorkspaceWindow);
         auto* shell = _spiralWorkspaceWindow;
@@ -2672,6 +2685,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             _lineAnnotationController.get());
     _lineAnnotationController->setVolumeSelectorFactory(
         [this](QWidget* parent) { return createAnnotationVolumeSelector(parent); });
+    connect(_lineAnnotationController.get(), &LineAnnotationController::volumeOverlayToggleRequested,
+            this, &CWindow::toggleVolumeOverlayVisibility);
     connect(_lineAnnotationController.get(),
             &LineAnnotationController::atlasCreated,
             this,
@@ -2734,13 +2749,15 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             configureChunkedViewerConnections(chunkedViewer);
         }
     });
-    // Fiber annotation gets first refusal on volume clicks before the shared
-    // Ctrl+click-to-focus policy runs.
+    // Fiber annotation gets first refusal on volume clicks, then Automated
+    // Fiber Volume picking, before the shared Ctrl+click-to-focus policy runs.
     _viewerManager->setVolumeClickInterceptor(
         [this](const cv::Vec3f& volLoc, const cv::Vec3f& normal, Surface* surf,
                Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
-            return _fiberController &&
-                   _fiberController->handleVolumeClick(volLoc, normal, surf, button, modifiers);
+            return (_fiberController &&
+                    _fiberController->handleVolumeClick(volLoc, normal, surf, button, modifiers)) ||
+                   (_fiberCollection && !(_segmentationModule && _segmentationModule->editingEnabled()) &&
+                    _fiberCollection->handleVolumeClick(button, modifiers));
         });
     connect(_viewerManager.get(), &ViewerManager::surfaceActivationRequested,
             this, [this](const std::string& surfaceId) {
@@ -2750,6 +2767,18 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             });
     connect(_viewerManager.get(), &ViewerManager::sharedCacheStatsChanged,
             this, &CWindow::onSharedCacheStatsChanged);
+
+    // Left of the cache figures: the length of the fiber being annotated,
+    // while a Line Annotation tab is the active workspace.
+    _lineAnnotationLengthLabel = new QLabel(this);
+    _lineAnnotationLengthLabel->setObjectName(QStringLiteral("lineAnnotationLengthLabel"));
+    _lineAnnotationLengthLabel->setContentsMargins(8, 0, 8, 0);
+    _lineAnnotationLengthLabel->setToolTip(
+        tr("Line length of the fiber open in this Line Annotation tab. "
+           "Centimetres when the annotation frame's voxel size is known, "
+           "otherwise voxels."));
+    _lineAnnotationLengthLabel->hide();
+    statusBar()->addPermanentWidget(_lineAnnotationLengthLabel);
 
     _sharedCacheStatsLabel = new QLabel(this);
     _sharedCacheStatsLabel->setContentsMargins(8, 0, 8, 0);
@@ -2799,6 +2828,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
 
     _fiberOverlay = std::make_unique<FiberOverlayController>(this);
     _fiberOverlay->bindToViewerManager(_viewerManager.get());
+    _fiberCollection = std::make_unique<FiberCollectionController>(_state, _viewerManager.get(), this, _lineAnnotationController.get());
+    updateActiveWorkspaceViewerControls();
     if (_spiralWorkspace && _spiralWorkspace->viewerManager()) {
         _spiralWorkspace->viewerManager()->forEachBaseViewer(
             [this](VolumeViewerBase* viewer) {
@@ -3502,6 +3533,7 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
         auto* fiberMenu = menu->addMenu(tr("Fibers"));
         addDock(fiberMenu, _fiberWidget);
         addDock(fiberMenu, _fiberSliceWidget);
+        if (_fiberCollection) addDock(fiberMenu, _fiberCollection->dock());
     }
 }
 
@@ -4107,12 +4139,36 @@ ViewerManager* CWindow::activeWorkspaceViewerManager() const
 
 void CWindow::updateActiveWorkspaceViewerControls()
 {
+    if (_fiberCollection) {
+        _fiberCollection->setLineAnnotationActive(
+            _workspaceTabs && qobject_cast<LineAnnotationDialog*>(_workspaceTabs->currentWidget()));
+    }
     auto* manager = activeWorkspaceViewerManager();
     if (_viewerControlsPanel) {
         _viewerControlsPanel->setViewerManager(manager);
     }
     // Composite and volume-overlay controls remain bound to both managers.
     // Only navigation and other workspace-local controls follow the active tab.
+}
+
+void CWindow::updateProjectNameLabel()
+{
+    if (!_projectNameLabel || !_workspaceTabs) return;
+    const auto project = _state ? _state->vpkg() : nullptr;
+    if (!project) {
+        _projectNameLabel->clear();
+        _projectNameLabel->setToolTip({});
+        _projectNameLabel->setFixedWidth(0);
+        return;
+    }
+    const QString name = QString::fromStdString(project->name());
+    _projectNameLabel->setToolTip(QString::fromStdString(project->path().string()));
+    const int available = std::max(0, _workspaceTabs->width() -
+        _workspaceTabs->tabBar()->sizeHint().width() - 8);
+    const auto metrics = _projectNameLabel->fontMetrics();
+    _projectNameLabel->setFixedWidth(std::min(available, metrics.horizontalAdvance(name) + 16));
+    _projectNameLabel->setText(metrics.elidedText(
+        name, Qt::ElideMiddle, std::max(0, _projectNameLabel->width() - 16)));
 }
 
 void CWindow::resetSegmentationViews(bool persistLayout)
@@ -7908,7 +7964,7 @@ void CWindow::CreateWidgets(void)
                     fiber.name,
                     fiber.controlPointCount,
                     fiber.linePointCount,
-                    fiber.lengthVx,
+                    fiber.annotatedLengthVx,
                     alignment,
                     spans,
                     fiber.hvZDistance,
@@ -7924,6 +7980,13 @@ void CWindow::CreateWidgets(void)
                     traceState,
                 });
             }
+            _fiberLengthVxById.clear();
+            _fiberLengthVxById.reserve(fibers.size());
+            for (const auto& fiber : fibers) {
+                _fiberLengthVxById[fiber.id] = fiber.annotatedLengthVx;
+            }
+            // Unit first, so the rebuilt rows below are texted once in it.
+            updateFiberLengthUnits();
             if (_fiberWidget) {
                 _fiberWidget->setFibers(entries);
                 _fiberWidget->setKnownTags(_lineAnnotationController->knownFiberTags());
@@ -8117,6 +8180,12 @@ void CWindow::CreateWidgets(void)
         connectFiberWidget(_fiberWidget);
         connectFiberWidget(_fiberSliceWidget);
         updateFiberList(_lineAnnotationController->fiberSummaries());
+        // The annotation frame (and so the cm conversion) follows the
+        // current volume; the lengths themselves do not change.
+        connect(_state, &CState::volumeChanged, this,
+                [this](const std::shared_ptr<Volume>&, const std::string&) {
+                    updateFiberLengthUnits();
+                });
     }
     connect(_fiberController.get(), &FiberAnnotationController::crosshairModeChanged,
             this, &CWindow::onFiberCrosshairModeChanged);
@@ -8610,6 +8679,7 @@ void CWindow::keyReleaseEvent(QKeyEvent* event)
 void CWindow::resizeEvent(QResizeEvent* event)
 {
     QMainWindow::resizeEvent(event);
+    QTimer::singleShot(0, this, &CWindow::updateProjectNameLabel);
     scheduleWindowStateSave();
 }
 
@@ -8820,6 +8890,51 @@ void CWindow::onSharedCacheStatsChanged(const QStringList& items)
     updateSharedStatusLabel();
 }
 
+void CWindow::updateFiberLengthUnits()
+{
+    if (_destroyingWindow) {
+        return;
+    }
+    std::optional<double> voxelSizeUm;
+    if (_lineAnnotationController) {
+        voxelSizeUm = _lineAnnotationController->annotationFrame().voxelSizeUm;
+    }
+    if (_fiberWidget) {
+        _fiberWidget->setAnnotationVoxelSizeUm(voxelSizeUm);
+    }
+    if (_fiberSliceWidget) {
+        _fiberSliceWidget->setAnnotationVoxelSizeUm(voxelSizeUm);
+    }
+    updateLineAnnotationLengthLabel();
+}
+
+void CWindow::updateLineAnnotationLengthLabel()
+{
+    if (_destroyingWindow || !_lineAnnotationLengthLabel) {
+        return;
+    }
+    auto* dialog = _workspaceTabs
+        ? qobject_cast<LineAnnotationDialog*>(_workspaceTabs->currentWidget())
+        : nullptr;
+    const uint64_t fiberId = (dialog && _lineAnnotationController)
+        ? _lineAnnotationController->fiberIdForDialog(dialog)
+        : 0;
+    const auto it = fiberId != 0 ? _fiberLengthVxById.find(fiberId)
+                                 : _fiberLengthVxById.end();
+    if (it == _fiberLengthVxById.end()) {
+        _lineAnnotationLengthLabel->clear();
+        _lineAnnotationLengthLabel->hide();
+        return;
+    }
+    // The same frame the Fibers dock converts with, read from the controller
+    // rather than cached here so the two can never disagree.
+    const std::optional<double> voxelSizeUm =
+        _lineAnnotationController->annotationFrame().voxelSizeUm;
+    _lineAnnotationLengthLabel->setText(
+        tr("Fiber length %1").arg(vc3d::fiber_length::formatLength(it->second, voxelSizeUm)));
+    _lineAnnotationLengthLabel->show();
+}
+
 void CWindow::updateSharedStatusLabel()
 {
     if (!_sharedCacheStatsLabel)
@@ -8976,6 +9091,11 @@ bool CWindow::OpenVolume(const QString& path,
         _fileWatcher->startWatching();
     }
     return true;
+}
+
+void CWindow::openFiberCollection(const QString& path)
+{
+    _fiberCollection->openCollection(path);
 }
 
 bool CWindow::openVolumePackage(const QString& path,
@@ -9354,13 +9474,14 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
     QString bestGrowthVolumeId;
     bool preferredVolumeFound = false;
     const bool hasOpenDataSegments = packageHasOpenDataSegments(*_state->vpkg());
-    const auto volumeIds = _state->vpkg()->volumeIDs();
+    const auto volumeIds = vc3d::orderedDisplayVolumeIds(*_state->vpkg());
     for (const auto& id : volumeIds) {
         try {
             auto vol = _state->vpkg()->volume(id);
             const QString idStr = QString::fromStdString(id);
             const QString nameStr = QString::fromStdString(vol->name());
-            const QString label = nameStr.isEmpty() ? idStr : QStringLiteral("%1 (%2)").arg(nameStr, idStr);
+            const QString label = vc3d::volumeDisplayLabel(*_state->vpkg(), id,
+                nameStr.isEmpty() ? idStr : QStringLiteral("%1 (%2)").arg(nameStr, idStr));
 
             orderedIds.push_back(idStr);
             volumeEntries.append({idStr, label});

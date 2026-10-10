@@ -81,20 +81,20 @@ uint16_t float_to_half_rne(float value) {
     return static_cast<uint16_t>(sign | (new_exp << 10) | rounded);
 }
 
-void add_half_scalar(uint16_t* dst, const float* src, ssize_t count) {
-    for (ssize_t i = 0; i < count; ++i) {
+void add_half_scalar(uint16_t* dst, const float* src, py::ssize_t count) {
+    for (py::ssize_t i = 0; i < count; ++i) {
         dst[i] = float_to_half_rne(half_to_float(dst[i]) + src[i]);
     }
 }
 
-void add_float_scalar(float* dst, const float* src, ssize_t count) {
-    for (ssize_t i = 0; i < count; ++i) dst[i] += src[i];
+void add_float_scalar(float* dst, const float* src, py::ssize_t count) {
+    for (py::ssize_t i = 0; i < count; ++i) dst[i] += src[i];
 }
 
 #if LASAGNA_X86_TARGETS
 __attribute__((target("avx512f,f16c")))
-void add_half_avx512(uint16_t* dst, const float* src, ssize_t count) {
-    ssize_t i = 0;
+void add_half_avx512(uint16_t* dst, const float* src, py::ssize_t count) {
+    py::ssize_t i = 0;
     for (; i + 16 <= count; i += 16) {
         const __m256i half = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dst + i));
         const __m512 current = _mm512_cvtph_ps(half);
@@ -107,8 +107,8 @@ void add_half_avx512(uint16_t* dst, const float* src, ssize_t count) {
 }
 
 __attribute__((target("avx512f")))
-void add_float_avx512(float* dst, const float* src, ssize_t count) {
-    ssize_t i = 0;
+void add_float_avx512(float* dst, const float* src, py::ssize_t count) {
+    py::ssize_t i = 0;
     for (; i + 16 <= count; i += 16) {
         _mm512_storeu_ps(dst + i, _mm512_add_ps(_mm512_loadu_ps(dst + i), _mm512_loadu_ps(src + i)));
     }
@@ -167,8 +167,8 @@ void add_inplace(py::array dst, py::array src, const std::string& requested) {
         throw std::invalid_argument("destination and source must not overlap");
     }
     py::gil_scoped_release release;
-    for (ssize_t z = 0; z < d.shape[0]; ++z) {
-        for (ssize_t y = 0; y < d.shape[1]; ++y) {
+    for (py::ssize_t z = 0; z < d.shape[0]; ++z) {
+        for (py::ssize_t y = 0; y < d.shape[1]; ++y) {
             char* dp = static_cast<char*>(d.ptr) + z*d.strides[0] + y*d.strides[1];
             const char* sp = static_cast<const char*>(s.ptr) + z*s.strides[0] + y*s.strides[1];
             if (dst_half) {

@@ -7,6 +7,7 @@
 #include "elements/DownloadQueueStats.hpp"
 #include "CameraGizmoWidget.hpp"
 #include "VolumetricCompositor.hpp"
+#include "IntersectionLayerItem.hpp"
 #include "elements/ViewerStatsBar.hpp"
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
@@ -53,6 +54,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <queue>
@@ -4095,6 +4097,9 @@ void CChunkedVolumeViewer::setZOffset(float value)
     }
     _zOff = value;
     notifyNormalOffsetChanged();
+    // Overlays filtered by distance to the displayed surface (fibers, points)
+    // depend on the offset.
+    emit overlaysUpdated();
 }
 
 // Plane viewers draw a dashed copy of the segmentation intersection displaced
@@ -4853,23 +4858,26 @@ CChunkedVolumeViewer::surfaceProjectionContext() const
 }
 
 std::optional<SurfaceProjection>
-CChunkedVolumeViewer::projectVolumePoint(const cv::Vec3f& volPoint) const
+CChunkedVolumeViewer::projectVolumePoint(const cv::Vec3f& volPoint,
+                                         float depthTolerance) const
 {
     auto surf = _surfWeak.lock();
     if (!surf)
         return std::nullopt;
+    float depthLo = 0.0f;
+    float depthHi = 0.0f;
+    quadProjectDepthBand(depthLo, depthHi);
     if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
         const cv::Vec3f proj = plane->project(volPoint, 1.0, 1.0);
-        return SurfaceProjection{proj[0], proj[1], 0.0f, false};
+        return SurfaceProjection{
+            proj[0], proj[1], 0.0f, false,
+            depthBandDistance(plane->scalarp(volPoint), depthLo, depthHi)};
     }
     if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
         cv::Vec3f ptr = quad->pointer();
         auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
-        float depthLo = 0.0f;
-        float depthHi = 0.0f;
-        quadProjectDepthBand(depthLo, depthHi);
         const float tolerance =
-            kQuadProjectTolerance + std::max(std::abs(depthLo), std::abs(depthHi));
+            depthTolerance + std::max(std::abs(depthLo), std::abs(depthHi));
         // pointTo() with a patch index signals "no surface point within tolerance" by
         // returning a positive value (~the tolerance) WITHOUT updating ptr, so a bare
         // `< 0.0f` check would silently keep ptr at {0,0,0} and map the point to the
@@ -4880,16 +4888,17 @@ CChunkedVolumeViewer::projectVolumePoint(const cv::Vec3f& volPoint) const
         // Gate on the signed offset along the surface normal so only the
         // depth band the view actually displays accepts the point.
         float w = _zOff;
+        float distance = dist;
         const cv::Vec3f surfCoord = quad->coord(ptr);
         const cv::Vec3f surfNormal = quad->normal(ptr);
         if (validSurfacePoint(surfCoord) && finiteVec3(surfNormal)) {
             w = (volPoint - surfCoord).dot(surfNormal);
-            if (w < depthLo - kQuadProjectTolerance ||
-                w > depthHi + kQuadProjectTolerance)
+            if (w < depthLo - depthTolerance || w > depthHi + depthTolerance)
                 return std::nullopt;
+            distance = depthBandDistance(volPoint, surfCoord, surfNormal, depthLo, depthHi);
         }
         const cv::Vec3f loc = quad->loc(ptr);
-        return SurfaceProjection{loc[0], loc[1], w, true};
+        return SurfaceProjection{loc[0], loc[1], w, true, distance};
     }
     return std::nullopt;
 }
@@ -4913,7 +4922,7 @@ QPointF CChunkedVolumeViewer::surfaceProjectionToScene(
 
 QPointF CChunkedVolumeViewer::volumeToScene(const cv::Vec3f& volPoint)
 {
-    if (const auto projection = projectVolumePoint(volPoint))
+    if (const auto projection = projectVolumePoint(volPoint, kQuadProjectTolerance))
         return surfaceProjectionToScene(*projection);
     // Only on failure is it worth re-establishing why: a surface that is
     // absent, or neither a plane nor a quad, maps to a default-constructed
@@ -6883,19 +6892,50 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         }
     }
 
-    std::size_t itemIndex = 0;
-    _intersectionItems.reserve(std::max(_intersectionItems.size(), groupedPaths.size()));
+    // One layer item per z value. Styles are sorted so the draw order inside a
+    // layer is stable across rebuilds (unordered_map iteration is not).
+    std::vector<IntersectionStyle> styles;
+    styles.reserve(groupedPaths.size());
     for (const auto& [style, path] : groupedPaths) {
-        if (path.isEmpty())
-            continue;
-        QGraphicsPathItem* item = nullptr;
+        if (!path.isEmpty())
+            styles.push_back(style);
+    }
+    std::sort(styles.begin(), styles.end(), [](const IntersectionStyle& a, const IntersectionStyle& b) {
+        return std::tie(a.z, a.color, a.widthQ, a.dashed, a.filled) <
+               std::tie(b.z, b.color, b.widthQ, b.dashed, b.filled);
+    });
+    std::map<int, std::vector<IntersectionLayerItem::Entry>> layers;
+    for (const auto& style : styles) {
+        QPen pen(groupedColors[style]);
+        pen.setWidthF(static_cast<qreal>(style.widthQ) / 1000.0);
+        // Every segment is its own subpath, so a round cap is stroked twice per
+        // segment. Wide non-cosmetic-fast-path round caps dominate repaint cost
+        // on large sessions (~15x slower than flat caps for 200k segments);
+        // keep them only for the active segmentation's few segments.
+        pen.setCapStyle(style.z >= kActiveIntersectionZ ? Qt::RoundCap : Qt::FlatCap);
+        pen.setJoinStyle(Qt::RoundJoin);
+        pen.setCosmetic(true);
+        if (style.dashed) {
+            pen.setStyle(Qt::DotLine);
+            pen.setCapStyle(Qt::FlatCap);
+        }
+        QBrush brush = Qt::NoBrush;
+        if (style.filled) {
+            brush = QBrush(groupedColors[style]);
+            pen = QPen(Qt::NoPen);
+        }
+        layers[style.z].push_back({groupedPaths[style], pen, brush});
+    }
+
+    std::size_t itemIndex = 0;
+    _intersectionItems.reserve(std::max(_intersectionItems.size(), layers.size()));
+    for (auto& [z, entries] : layers) {
+        IntersectionLayerItem* item = nullptr;
         if (itemIndex < _intersectionItems.size()) {
-            item = dynamic_cast<QGraphicsPathItem*>(_intersectionItems[itemIndex]);
+            item = dynamic_cast<IntersectionLayerItem*>(_intersectionItems[itemIndex]);
         }
         if (!item) {
-            item = new QGraphicsPathItem();
-            item->setBrush(Qt::NoBrush);
-            item->setAcceptedMouseButtons(Qt::NoButton);
+            item = new IntersectionLayerItem();
             _scene->addItem(item);
             if (itemIndex < _intersectionItems.size()) {
                 if (_intersectionItems[itemIndex] && _intersectionItems[itemIndex]->scene()) {
@@ -6907,25 +6947,9 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
                 _intersectionItems.push_back(item);
             }
         }
-        QPen pen(groupedColors[style]);
-        pen.setWidthF(static_cast<qreal>(style.widthQ) / 1000.0);
-        pen.setCapStyle(Qt::RoundCap);
-        pen.setJoinStyle(Qt::RoundJoin);
-        pen.setCosmetic(true);
-        if (style.dashed) {
-            pen.setStyle(Qt::DotLine);
-            pen.setCapStyle(Qt::FlatCap);
-        }
-        if (style.filled) {
-            item->setBrush(groupedColors[style]);
-            pen = QPen(Qt::NoPen);
-        } else {
-            item->setBrush(Qt::NoBrush);
-        }
         item->setTransform(QTransform());
-        item->setPath(path);
-        item->setPen(pen);
-        item->setZValue(style.z);
+        item->setEntries(std::move(entries));
+        item->setZValue(z);
         ++itemIndex;
     }
     while (_intersectionItems.size() > itemIndex) {
