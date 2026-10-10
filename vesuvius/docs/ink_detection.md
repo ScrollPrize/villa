@@ -156,6 +156,45 @@ partial path exists.
 | `--level` | Source array key, default `2`. |
 | `--workers` | Tile threads, default `8`. |
 
+### Input contract check
+
+The released `aligned21` checkpoints read a 17-slice window cut from a
+21-slice surface volume: the centred 84 planes of a level-2 render,
+mean-pooled by 4 (see [Prepare a 9 µm aligned input](#prepare-a-9-µm-aligned-input)).
+Any deeper-than-window volume runs without error, so an input in another form
+(for example a 17-slice level-2 CT) produces a confident map that scores at
+chance. Before the first patch is read, inference now compares the input with
+what the checkpoint trained on and reports:
+
+| Code | Level | Meaning |
+|---|---|---|
+| `DEPTH_TOO_SHALLOW`, `DEPTH_NOT_TRAINED_FORM` | error | Fewer slices than the model window, or fewer than the source depth implied by the checkpoint's `flat_z_window_jitter` (window + 2 x `max_offset`, 21 for the released recipe). |
+| `SCALE_MISMATCH`, `Z_POOL_MISMATCH` | error | A `prepare_9um_isotropic_input` output whose recorded `source_level` is not 2 or which pooled other than 84 source planes. |
+| `DTYPE`, `WINDOW_SIZE` | error | `divide` normalisation with a non-uint8 input, or a `--layer-start/--layer-end` selection that does not give the model's window. |
+| `DEPTH_DEEPER_THAN_TRAINED`, `Z_WINDOW_OFF_CENTRE`, `Z_WINDOW_OUTSIDE_TRAINED_RANGE`, `UNKNOWN_FORMAT` | warn | Legal but unusual; the message says what is assumed. |
+| `DIRECTION`, `NO_PROVENANCE` | info (`DIRECTION` warns for `reverse`) | The depth order about to run, and that orientation and unrecorded provenance cannot be verified from the data. |
+
+The default, `--input-contract warn`, logs a `WARNING` naming each violated
+check (for example `[DEPTH_NOT_TRAINED_FORM]`) and runs anyway, so existing
+workflows keep working. `--input-contract error` refuses the run on any
+error-level finding, and `off` skips the check. The check can only flag
+inputs that are provably not the trained form. It does
+not detect a reversed depth order: run `--direction both` or a labelled segment
+you know the answer for. To check without running the model:
+
+```bash
+uv run --extra models python -m vesuvius.ink_detection.inference.input_contract   surface-volume.zarr checkpoint.pth --direction both
+```
+
+The command exits 1 when an error-level finding is reported.
+
+Inference also stops with `FloatingPointError` if the model produces non-finite
+probabilities, instead of writing an all-zero TIFF. This guard is independent
+of `--input-contract` and applies in every mode, including `off`: a silent
+all-zero map is never written. Half precision overflows
+on some GPUs (observed on a GTX 1660 Ti with the released checkpoints); rerun
+with a different `--amp-dtype`.
+
 ## Convert label images
 
 After editing label TIFFs or PNGs, convert them beside their segment:
@@ -446,6 +485,7 @@ the second output.
 | `--amp-dtype` | `auto`, `default`, `fp16`, or `bf16`; `auto` reads checkpoint precision. |
 | `--tta-mirror` | Average valid mirror variants. |
 | `--tta-batch-size` | Maximum mirror variants evaluated together. |
+| `--input-contract` | `warn` (default), `error`, or `off`; see [Input contract check](#input-contract-check). |
 | `--gpus` | Unique comma-separated CUDA IDs, for example `0,1`; omit for automatic CUDA/CPU selection. |
 | `--compile-mode` | `torch.compile` mode, default `reduce-overhead`. |
 | `--no-compile` | Use eager inference. Multiple selected GPUs also disable compilation. |
