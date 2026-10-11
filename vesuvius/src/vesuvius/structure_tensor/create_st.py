@@ -525,6 +525,22 @@ def _compute_eigenvectors(block: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
             return _compute_eigenvectors_fn(block)
         raise
 
+def _should_solve_on_cpu(err: BaseException, device: torch.device) -> bool:
+    """Whether a failed GPU eigen solve should be retried on the CPU.
+
+    cuSOLVER's batched symmetric eigensolver sizes its workspace per matrix
+    (~0.5 MB each for 3x3 float64 with torch 2.12/CUDA 13), so a 128^3 chunk
+    asks for hundreds of GiB and raises OutOfMemoryError on any GPU; smaller
+    batches can raise CUSOLVER_STATUS_INTERNAL_ERROR instead. Both are solved
+    on the CPU, which gives the same float64 LAPACK result.
+    """
+    if device.type != "cuda":
+        return False
+    if isinstance(err, torch.OutOfMemoryError):
+        return True
+    return "cusolver" in str(err).lower()
+
+
 def _finalize_structure_tensor_torch(
     zarr_path,
     chunk_size,
@@ -704,12 +720,9 @@ def _finalize_structure_tensor_torch(
             try:
                 eigvals_block_gpu, eigvecs_block_gpu = _compute_eigenvectors(block)
             except RuntimeError as err:
-                err_msg = str(err).lower()
-                if (
-                    block.device.type == "cuda"
-                    and "cusolver" in err_msg
-                ):
+                if _should_solve_on_cpu(err, block.device):
                     # Fall back to CPU eigen solve for this chunk and move results back to GPU
+                    torch.cuda.empty_cache()
                     eigvals_cpu, eigvecs_cpu = _compute_eigenvectors_impl(block.cpu())
                     eigvals_block_gpu = eigvals_cpu.to(block.device)
                     eigvecs_block_gpu = eigvecs_cpu.to(block.device)
