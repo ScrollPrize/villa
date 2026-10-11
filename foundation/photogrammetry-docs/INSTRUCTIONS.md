@@ -84,6 +84,8 @@ The photographs may remain in a flat list separated by the written annotation im
 
 Regardless of layout, verify the expected photograph count for every acquisition block before leaving the session.
 
+If the annotation photographs or the session log are missing, the blocks can usually be recovered from the camera metadata. Within a turntable turn, frames are about a second apart; turns of one block follow each other after a short pause (roughly 10–20 s); blocks are separated by longer breaks and usually by a zoom change, since each camera height is reframed. [`photogrammetry-tools/find_blocks.py`](../photogrammetry-tools/) groups the photographs on these cues using ExifTool, reports frame-number gaps and byte-identical duplicate files (for example `DSC01234_1.ARW` left by a repeated copy), and writes a proposed block list with a contact sheet of every burst. Timing cannot always separate a long pause inside a block from a short break between two blocks at the same zoom, and it says nothing about when the scroll was reoriented, so confirm the blocks, and which blocks share an orientation, on the contact sheet before naming them and building the directory tree with its `link` command.
+
 ### Masking
 
 Use [`foundation/sam2-photogrammetry`](../sam2-photogrammetry/) from the Villa repository at commit `a60235b67249918953b3d3c367d08d7da54ae459` or later; `scroll-mask.py`, and the `segment.py` change that keeps host memory bounded on full-resolution photographs, were added after that commit. Use Python 3.12 and install ExifTool so that `raw2jpg.py` can transfer metadata from each RAW file to its JPEG.
@@ -292,7 +294,7 @@ If the sparse reconstruction is not acceptable, preserve it and change one param
 
 The scaler detects the printed ArUco markers, triangulates their corners and maps the accepted SfM scene into the physical unit used for `--marker-size`. Scale only the accepted robustified scene, and apply scale before OpenMVS.
 
-The markers are fixed in the turntable frame, whereas a deliberately reoriented or accidentally displaced object is not. Use the acquisition log, annotation images and camera trajectories to create basename-only include lists for blocks in which the object orientation remained fixed. Combine camera heights only when they belong to the same fixed orientation. Do not infer blocks from historical filename counts.
+The markers are fixed in the turntable frame, whereas a deliberately reoriented or accidentally displaced object is not. Use the acquisition log, annotation images (or the metadata-derived blocks described under [After acquisition](#after-acquisition)) and camera trajectories to create basename-only include lists for blocks in which the object orientation remained fixed. Combine camera heights only when they belong to the same fixed orientation. Do not infer blocks from historical filename counts.
 
 If more than one block may be valid, estimate every candidate independently. Run the standalone scaler on the accepted `sfm_data_structured.bin` so that comparing candidates does not repeat feature extraction, matching or SfM:
 

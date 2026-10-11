@@ -3,13 +3,13 @@
 Compare pgs-global-scaler candidates by the geometry of their scaled marker corners.
 
 For each candidate directory under CANDIDATES (one per include list, holding scaler.log and
-landmarks-scaled.ply as written by the handover README's scaler loop), reports the scale,
-detection and triangulation counts, and on the scaled corners: marker side lengths (should
-all be the marker size), off-plane residual (the markers lie on the flat turntable) and the
-radius of the marker ring (the same turntable gives the same radius in every candidate and
-every capture session). A missing or badly triangulated corner shows up as a wide side-length
-spread or a large off-plane residual; prefer candidates whose corners are complete and tight,
-and check that independent good candidates agree.
+landmarks-scaled.ply as written by the scaler loop in photogrammetry-docs/INSTRUCTIONS.md),
+reports the scale, detection and triangulation counts, and on the scaled corners: marker side
+lengths (should all be the marker size), off-plane residual (the markers lie on the flat
+turntable) and the radius of the marker ring (the same turntable gives the same radius in every
+candidate and every capture session). A missing or badly triangulated corner shows up as a wide
+side-length spread or a large off-plane residual; prefer candidates whose corners are complete
+and tight, and check that independent good candidates agree.
 
 Usage:
     python scale_review.py CANDIDATES [--marker-size 31.5]

@@ -12,8 +12,9 @@ Reads from the PGS-Recon SfM output directory (the one containing mvg/):
     its axis; a broken circle suggests the object moved. Export it with
         openMVG_main_ConvertSfM_DataFormat -i sfm_data.bin -o review_sfm_data.json -V -I -E
 
-Blocks are the subdirectories of BLOCKS, named <orientation>_camera_<height> as in the
-handover README; image stems are taken from the RAW/JPEG files in each (or its JPGEnhanced/).
+Blocks are the subdirectories of BLOCKS, named <orientation>_camera_<height> as in
+photogrammetry-docs/INSTRUCTIONS.md; image stems are taken from the RAW/JPEG files in each
+(or its JPGEnhanced/).
 
 Usage:
     python sfm_review.py SFM_DIR BLOCKS

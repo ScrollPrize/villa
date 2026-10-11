@@ -12,6 +12,7 @@ import unittest
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import find_blocks  # noqa: E402
 import mesh_qa  # noqa: E402
 import scale_review  # noqa: E402
 import sfm_review  # noqa: E402
@@ -92,6 +93,30 @@ class SfmReviewTest(unittest.TestCase):
 
     def test_orientation_from_block_name(self):
         self.assertEqual(sfm_review.orientation("orientation2_camera_midlow"), "orientation2")
+
+
+class FindBlocksTest(unittest.TestCase):
+    def test_bursts_and_blocks(self):
+        import datetime
+        t0 = datetime.datetime(2026, 10, 2, 12, 0, 0)
+        rows, t = [], 0
+        # block A: two 48-frame turns 12 s apart; 90 s pause; block B: same zoom, a 6-frame hole (8 s) and
+        # a turn break (15 s); then an immediate zoom change starts block C
+        plan = [(48, 20, 0), (48, 20, 12), (30, 20, 90), (18, 20, 8), (48, 20, 15), (48, 24, 1)]
+        for n, focal, gap in plan:
+            t += gap
+            for _ in range(n):
+                rows.append(dict(SourceFile=f"DSC{len(rows):05d}.ARW", time=t0 + datetime.timedelta(seconds=t),
+                                 settings=(focal, 0.1667, 22, 640, "6048 4024"), FocalLength=focal))
+                t += 1.2
+        bursts, block_of = find_blocks.split(rows, burst_gap=5, block_gap=30)
+        self.assertEqual([len(b) for b in bursts], [48, 48, 30, 18, 48, 48])
+        self.assertEqual(block_of, [0, 0, 1, 1, 1, 2])
+
+    def test_frame_number(self):
+        self.assertEqual(find_blocks.frame_number("DSC05493_1.ARW"), 5493)
+        self.assertEqual(find_blocks.frame_number("IMG_7065.CR3"), 7065)
+        self.assertEqual(find_blocks.frame_number("DSC05493.ARW"), 5493)
 
 
 if __name__ == "__main__":
