@@ -159,6 +159,25 @@ For every acquisition directory, verify that:
 
 `cc-fix.py` and `mask-applier.py` predate this step. They assume the scroll is label 1 (and the ruler label 2), which holds for earlier ruler-calibrated captures but not for turntable captures with ArUco markers, so do not use them on such captures.
 
+#### Preparing the PGS-Recon input
+
+PGS-Recon takes one flat directory of images. OpenMVG reads the mask for `<stem>.jpg` from `<stem>_mask.png` in the same directory, which must be the same size as the image, and ignores features wherever the mask is 0. The OpenMVS export then carries the masks into densification, where `--mask-value 0` ignores the same pixels. The binary `ScrollMasks/` files already follow this convention, so the input directory is every `JPGEnhanced/` image of the scroll with its `ScrollMasks/` mask beside it.
+
+Hard links avoid copying the photographs (the input directory must be on the same filesystem as the masking tree). Image stems must be unique across acquisition directories, which holds for the camera's file numbering:
+
+```bash
+mkdir "$PGS_PHOTOS"
+for d in "$SAM_INPUT_ROOT"/*/; do
+  for jpg in "$d"JPGEnhanced/*.jpg; do
+    stem=$(basename "$jpg" .jpg)
+    ln "$jpg" "$PGS_PHOTOS/$stem.jpg"
+    ln "$d/ScrollMasks/${stem}_mask.png" "$PGS_PHOTOS/${stem}_mask.png"
+  done
+done
+```
+
+Confirm that the directory holds the expected number of JPEGs, one `_mask.png` per JPEG and nothing else. Include every acquisition directory of the scroll, across orientations: scroll-only masks are what allow the orientations to be reconstructed jointly. The scaler's `--include-from` lists later restrict marker detection to selected blocks without removing any images from the scene.
+
 ### PGS-Recon (validated Vesuvius Challenge version with histogram production)
 
 PGS-Recon is an EduceLab wrapper around OpenMVG and OpenMVS, together with a tool that detects ArUco markers and scales an SfM scene to physical units. Giorgio's changes add a weighted-median scale estimator and an SVG histogram of the marker-level scale estimates.
@@ -347,6 +366,8 @@ docker run --rm \
 ```
 
 The resume invocation skips feature extraction, matching, SfM, robustification and scaling. A resume config may display the parser's unused default descriptor preset; use the stopped SfM run's metadata to establish that the executed feature extraction used `HIGH`. Do not rerun into a non-empty result directory.
+
+After the export to OpenMVS, `<output>/mvs/undistorted_images/` must contain one `<stem>.mask.png` for every image. Densification reports a mask that fails to load only at debug log level and then densifies that image unmasked, so check the count rather than relying on the log.
 
 Require finite vertices and valid faces, nonzero extents, one dominant face-connected component, a plausible silhouette and object-aligned dimensions consistent with independent measurements. A case-generation mesh must also be watertight and free of boundary edges, non-manifold edges, orientation conflicts and degenerate faces. Inspect canonical renders for holes, bridges, collapsed regions and disconnected debris.
 
