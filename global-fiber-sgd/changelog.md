@@ -214,6 +214,12 @@ Explicit visualization winding offset supports reference-metric-aligned colors.
 
 Added exhaustive joint event/node traversal and evaluation-only source-fiber
 reference winding L1 / within-two metrics after global median offset correction.
+# 2026-10-11: learning-rate batch scaling
+
+- Document square-root state-LR scaling from B4096/LR0.03, supported by the
+  B16384/LR0.06 trial. Keep width LR2; other batch rates are unvalidated starting
+  points. No automatic scaling or default changes.
+
 # 2026-10-11: quadratic window/batch experiment
 
 - Added opt-in local MAP windows for quadratic distance/V, retaining exact

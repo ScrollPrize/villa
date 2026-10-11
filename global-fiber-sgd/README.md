@@ -270,3 +270,32 @@ prefix-sum sign loss; no placeholders or constraint-proposed windows are used.
 existing approved crop-benchmark runner. One exclusive lease owns independent
 GPU lanes; jobs within each lane run serially. Completed outputs are protected
 against overwrite. Use new output paths for reruns.
+
+## Learning-rate scaling with batch size
+
+For the current full quadratic, fused, minibatch Adam/SparseAdam solver, use
+square-root scaling as a starting rule for the fiber-state learning rate:
+
+`lr(B) = 0.03 * sqrt(B / 4096)`
+
+| Constraint batch size | Starting state LR |
+|---:|---:|
+| 4,096 | 0.0300 |
+| 8,192 | 0.0424 |
+| 16,384 | 0.0600 |
+| 32,768 | 0.0849 |
+
+Keep the separate winding-width optimizer at `width_lr = 2`. This rule does not
+scale loss weights, Adam momentum parameters, or the number of passes. It is a
+tuning heuristic, not an exact mathematical equivalence or automatic config
+behavior: losses are batch-averaged, and larger batches provide fewer updates
+at the same data budget. Compare quality against both elapsed time and sampled
+constraint count, including retained length as well as winding/sign errors.
+
+Evidence: at batch16,384, LR0.06 was the balanced choice among0.03/0.06/0.12;
+linear scaling to0.12 rejected substantially more length and had worse sign
+violations than0.06. Only this4x batch-size scaling point was tested for LR
+selection; the8k/32k recommendations above are extrapolations, not validated
+optima. Single seed, full quadratic objective; do not assume this transfers to
+other objectives or adaptive-window variants. Defaults are not changed or
+automatically scaled. See [the measured comparison](uv_lr16k_results.md).

@@ -1,5 +1,10 @@
 # Larger-batch LR comparison
 
+- User requested documenting the scaling rule and committing. README now states
+  lr(B)=.03*sqrt(B/4096), only for state optimizer; width_lr remains2.
+  Evidence limited to16k trial,8k/32k rates explicitly extrapolated; no automatic
+  config/default changes. Documentation-only follow-up; diff check validation.
+
 - All3completed exit0. LR.03control exactly reproduced prior16kquality.
 - LR.03/.06/.12:L1=11.745175/11.660019/11.571921;retainedlength66.6851/
   65.4857/62.1046%;signerrors3.6633/3.1654/3.3124%;seconds397.86/414.58/435.26.
