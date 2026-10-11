@@ -86,7 +86,7 @@ Regardless of layout, verify the expected photograph count for every acquisition
 
 ### Masking
 
-Use [`foundation/sam2-photogrammetry`](../sam2-photogrammetry/) from the Villa repository at commit `a60235b67249918953b3d3c367d08d7da54ae459`. Use Python 3.12 and install ExifTool so that `raw2jpg.py` can transfer metadata from each RAW file to its JPEG.
+Use [`foundation/sam2-photogrammetry`](../sam2-photogrammetry/) from the Villa repository at commit `a60235b67249918953b3d3c367d08d7da54ae459` or later; `scroll-mask.py`, and the `segment.py` change that keeps host memory bounded on full-resolution photographs, were added after that commit. Use Python 3.12 and install ExifTool so that `raw2jpg.py` can transfer metadata from each RAW file to its JPEG.
 
 The input tree may contain any number of scroll and orientation directories. RAW files belong directly in an acquisition directory; the scripts create or consume these sibling directories:
 
@@ -95,9 +95,13 @@ The input tree may contain any number of scroll and orientation directories. RAW
 ├── <image>.ARW
 ├── JPGEnhanced/
 │   └── <image>.jpg
-└── Masks/
+├── Masks/
+│   └── <image>_mask.png
+└── ScrollMasks/
     └── <image>_mask.png
 ```
+
+`segment.py` treats each `JPGEnhanced/` folder as a video: it segments the first frame and propagates those objects through the rest. Each orientation directory must therefore contain one fixed acquisition block (one scroll orientation and camera height) and no annotation photographs.
 
 Create an isolated environment from the pinned checkout.
 
@@ -136,37 +140,43 @@ SAM_INPUT_ROOT=/path/to/photogrammetry-input
   --model_cfg configs/sam2.1/sam2.1_hiera_t.yaml \
   --photo_t_checkpoint checkpoints/photo2_t_5000.torch \
     --recompute
+
+.venv/bin/python scroll-mask.py "$SAM_INPUT_ROOT"
 ```
 
 The model configuration is a Hydra package key and must remain `configs/sam2.1/sam2.1_hiera_t.yaml`; it is not an absolute path.
+
+`segment.py` labels every object it finds on the first frame (scroll, background, turntable, ArUco markers, dust), ordered darkest first, so the scroll is not necessarily label 1 and markers are included only when they happened to be found on that frame. `scroll-mask.py` identifies the scroll label in each acquisition directory from its behaviour across the rotation (present in every frame, never touching the image border, centroid nearly static while markers orbit the axis) and writes binary `ScrollMasks/<stem>_mask.png` files: 255 for the largest component of the scroll label, 0 elsewhere. It prints the chosen label, area and centroid motion for each directory, and reports and skips directories where the pick is ambiguous or the scroll appears split across labels; inspect those before rerunning with `--force`.
+
+The markers do not need to be in the reconstruction masks. The scaler detects them in the photographs directly, and when a scroll is reoriented between blocks, markers that are fixed to the turntable are inconsistent with the scroll across orientations.
 
 For every acquisition directory, verify that:
 
 1. Every RAW file has one readable JPEG with matching dimensions and transferred EXIF metadata.
 2. Every JPEG has one readable, same-sized `Masks/<stem>_mask.png` file with non-empty foreground.
-3. The palette labels are inspected rather than assumed. `segment.py` assigns object IDs from the initial frame and may segment the scroll and fiducial markers as different nonzero labels; its direct output is not necessarily a binary scroll-only mask.
-4. The masks passed to reconstruction represent the intended foreground under the selected PGS-Recon `--mask-value` semantics.
+3. `scroll-mask.py` reports `ok` with a plausible scroll area, and every JPEG has one same-sized `ScrollMasks/<stem>_mask.png` file with non-empty foreground.
+4. Overlays of the `ScrollMasks/` files on their JPEGs cover the scroll and nothing else, for a sample of frames from every directory.
 
+`cc-fix.py` and `mask-applier.py` predate this step. They assume the scroll is label 1 (and the ruler label 2), which holds for earlier ruler-calibrated captures but not for turntable captures with ArUco markers, so do not use them on such captures.
 
-#### Optional post-processing
-The following commands are optional post-processing operations, not prerequisites for producing the `JPGEnhanced/` and `Masks/` PGS input layout:
+#### Preparing the PGS-Recon input
 
-```bash
-python cc-fix.py "$SAM_INPUT_ROOT" \
-  --workers 12 \
-  --dust-threshold 256
-```
+PGS-Recon takes one flat directory of images. OpenMVG reads the mask for `<stem>.jpg` from `<stem>_mask.png` in the same directory, which must be the same size as the image, and ignores features wherever the mask is 0. The OpenMVS export then carries the masks into densification, where `--mask-value 0` ignores the same pixels. The binary `ScrollMasks/` files already follow this convention, so the input directory is every `JPGEnhanced/` image of the scroll with its `ScrollMasks/` mask beside it.
 
-`cc-fix.py` overwrites masks in place. It retains only the largest label-1 component and removes label-2 components smaller than the dust threshold, so use it only after confirming that those label semantics are correct for the dataset.
+Hard links avoid copying the photographs (the input directory must be on the same filesystem as the masking tree). Image stems must be unique across acquisition directories, which holds for the camera's file numbering:
 
 ```bash
-python mask-applier.py \
-  --root_dir "$SAM_INPUT_ROOT" \
-  --workers 12 \
-  --recompute
+mkdir "$PGS_PHOTOS"
+for d in "$SAM_INPUT_ROOT"/*/; do
+  for jpg in "$d"JPGEnhanced/*.jpg; do
+    stem=$(basename "$jpg" .jpg)
+    ln "$jpg" "$PGS_PHOTOS/$stem.jpg"
+    ln "$d/ScrollMasks/${stem}_mask.png" "$PGS_PHOTOS/${stem}_mask.png"
+  done
+done
 ```
 
-`mask-applier.py` creates a separate `Masked/` dataset containing black-background JPEGs and binary masks derived only from label 1. It is not required for the PGS input preparation above and likewise requires verified label semantics.
+Confirm that the directory holds the expected number of JPEGs, one `_mask.png` per JPEG and nothing else. Include every acquisition directory of the scroll, across orientations: scroll-only masks are what allow the orientations to be reconstructed jointly. The scaler's `--include-from` lists later restrict marker detection to selected blocks without removing any images from the scene.
 
 ### PGS-Recon (validated Vesuvius Challenge version with histogram production)
 
@@ -357,6 +367,8 @@ docker run --rm \
 
 The resume invocation skips feature extraction, matching, SfM, robustification and scaling. A resume config may display the parser's unused default descriptor preset; use the stopped SfM run's metadata to establish that the executed feature extraction used `HIGH`. Do not rerun into a non-empty result directory.
 
+After the export to OpenMVS, `<output>/mvs/undistorted_images/` must contain one `<stem>.mask.png` for every image. Densification reports a mask that fails to load only at debug log level and then densifies that image unmasked, so check the count rather than relying on the log.
+
 Require finite vertices and valid faces, nonzero extents, one dominant face-connected component, a plausible silhouette and object-aligned dimensions consistent with independent measurements. A case-generation mesh must also be watertight and free of boundary edges, non-manifold edges, orientation conflicts and degenerate faces. Inspect canonical renders for holes, bridges, collapsed regions and disconnected debris.
 
 If OpenMVS fails, retain the completed intermediate files and diagnose stages in increasing order of geometric impact:
@@ -397,6 +409,10 @@ Coordinates of the input ply mesh must already be in millimetres. Stage each val
 ```
 
 The general rule is `<input>/<scroll-number>/<scroll-number>-scaled.ply`.
+
+By default the case axis is the axis of the smallest enclosing cylinder. For a squashed scroll this can run across the flattened cross-section instead of along the umbilicus. To set the axis, add `<input>/<scroll-number>/<scroll-number>-axis.txt` holding either a direction (3 numbers) or two points on the umbilicus (6 numbers), in the PLY's coordinates. Only the direction is used: the case is still centred on the smallest circle enclosing the scroll about that axis, so the umbilicus may sit a few millimetres off the case axis. Record the file with the run.
+
+To pick the two points, open the textured PLY in MeshLab (its layering shows the umbilicus best; its coordinates match the untextured mesh), choose `Edit -> Pick Points`, click where the umbilicus emerges on each end face and read the coordinates from the dialog, or save them as a `.pp` file. Check the result by viewing the scroll along the axis: the end-face layering should be concentric about it.
 
 Run the generator:
 

@@ -288,6 +288,30 @@ def drop_already_linked(links: list[PlannedLink], fibers: dict[str, Fiber]) -> l
     return [l for l in links if tuple(sorted((l.vertical, l.horizontal))) not in existing]
 
 
+def line_index_inside_gap_span(fiber: Fiber, line_index: int) -> bool:
+    """True when the line index lies strictly inside a span whose descriptor
+    carries VC3D's `gap` span tag (format version 4: the papyrus is missing
+    there and VC3D refuses to place a control point inside it). Promoting a
+    point there would split the gap into two spans that are gaps no more."""
+    controls = fiber.data.get('control_points') or []
+    if fiber.data.get('version', 1) < 4 or not controls or not isinstance(controls[0], dict):
+        return False
+    indices = fiber.control_line_indices.tolist()
+    for k in range(min(len(indices), len(controls)) - 1):
+        if not (indices[k] < line_index < indices[k + 1]):
+            continue
+        segment = controls[k].get('segment_to_next') or {}
+        return 'gap' in (segment.get('tags') or [])
+    return False
+
+
+def drop_links_inside_gap_spans(links: list[PlannedLink],
+                                fibers: dict[str, Fiber]) -> list[PlannedLink]:
+    return [l for l in links
+            if not line_index_inside_gap_span(fibers[l.vertical], l.vertical_line_index) and
+            not line_index_inside_gap_span(fibers[l.horizontal], l.horizontal_line_index)]
+
+
 # ---------------------------------------------------------------------------
 # Editing
 # ---------------------------------------------------------------------------
@@ -331,7 +355,17 @@ def promote_control_points(data: dict, control_line_indices: np.ndarray,
         if isinstance(prev, dict):
             entry = {'position': position}
             if 'segment_to_next' in prev:
-                entry['segment_to_next'] = copy.deepcopy(prev['segment_to_next'])
+                segment = copy.deepcopy(prev['segment_to_next'])
+                # A span tag `gap` belongs to a span between two break points;
+                # the split halves around an untagged new point are not that
+                # (links inside gap spans are dropped before this anyway).
+                if isinstance(segment, dict) and 'tags' in segment:
+                    tags = [t for t in segment['tags'] if t != 'gap']
+                    if tags:
+                        segment['tags'] = tags
+                    else:
+                        del segment['tags']
+                entry['segment_to_next'] = segment
             new_controls.append(entry)
         else:
             new_controls.append(position)
@@ -576,6 +610,10 @@ def main(fibers_dir, umbilicus_path, coordinate_scale, theta_bin, z_tolerance, m
         kept = drop_already_linked(links, fibers)
         print(f'  already linked (skipped): {len(links) - len(kept)}')
         links = kept
+    kept = drop_links_inside_gap_spans(links, fibers)
+    if len(kept) != len(links):
+        print(f'  inside a gap span (skipped): {len(links) - len(kept)}')
+    links = kept
     # One link per (vertical, horizontal) pair: keep the one with the widest clearance.
     best = {}
     for link in links:

@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import pytest
 import tifffile
 
 from vesuvius import surface_preflight
@@ -29,6 +30,9 @@ def write_surface(
     y: np.ndarray | None = None,
     z: np.ndarray | None = None,
     mask: np.ndarray | None = None,
+    scale: list[float] | None = None,
+    bbox: list[list[float]] | None = None,
+    meta_extra: dict[str, object] | None = None,
 ) -> Path:
     root.mkdir()
     x = np.asarray(x if x is not None else [[1, 2], [1, 2]], dtype=np.float32)
@@ -39,10 +43,15 @@ def write_surface(
     tifffile.imwrite(root / "z.tif", z)
     if mask is not None:
         tifffile.imwrite(root / "mask.tif", np.asarray(mask, dtype=np.uint8))
-    (root / "meta.json").write_text(
-        json.dumps({"uuid": "fixture", "scale": [1.0, 1.0]}),
-        encoding="utf-8",
-    )
+    metadata: dict[str, object] = {
+        "uuid": "fixture",
+        "scale": scale if scale is not None else [1.0, 1.0],
+    }
+    if bbox is not None:
+        metadata["bbox"] = bbox
+    if meta_extra is not None:
+        metadata.update(meta_extra)
+    (root / "meta.json").write_text(json.dumps(metadata), encoding="utf-8")
     return root
 
 
@@ -54,9 +63,227 @@ def test_inspect_pair_passes_valid_pair(tmp_path, monkeypatch) -> None:
     report = surface_preflight.inspect_pair(surface, "volume.zarr", max_samples=4)
 
     assert report["status"] == "PASS"
-    assert report["summary"] == {"passed_required_gates": 9, "required_gate_count": 9}
+    assert report["summary"] == {"passed_required_gates": 10, "required_gate_count": 10}
     assert report["surface"]["valid_quad_count"] == 1
     assert report["volume"]["sampled_signal_support"]["support_fraction"] == 1.0
+
+
+def test_inspect_pair_surface_only_passes_without_volume(tmp_path, monkeypatch) -> None:
+    surface = write_surface(tmp_path / "surface")
+    monkeypatch.setattr(
+        surface_preflight,
+        "_open_volume",
+        lambda *_: (_ for _ in ()).throw(AssertionError("volume must stay closed")),
+    )
+
+    report = surface_preflight.inspect_pair(surface)
+
+    assert report["status"] == "PASS"
+    assert report["volume"] is None
+    assert not {
+        "volume_is_3d",
+        "coordinates_within_volume",
+        "sampled_volume_signal_support",
+    } & {gate["name"] for gate in report["gates"]}
+
+
+def test_spacing_median_handles_single_column_pair(tmp_path) -> None:
+    surface = write_surface(
+        tmp_path / "surface",
+        x=np.asarray([[1000, 1020]], dtype=np.float32),
+        y=np.asarray([[2000, 2000]], dtype=np.float32),
+        z=np.asarray([[3000, 3000]], dtype=np.float32),
+        scale=[0.05, 0.05],
+    )
+
+    report = surface_preflight.inspect_pair(surface)
+    spacing = report["surface"]["grid_spacing_voxels"]["columns"]
+
+    assert spacing["pair_count"] == 1
+    assert spacing["median_spacing_voxels"] == pytest.approx(20, rel=0.02)
+
+
+def test_spacing_accumulates_single_row_blocks(tmp_path) -> None:
+    rows, columns = np.indices((64, 48), dtype=np.float32)
+    surface = write_surface(
+        tmp_path / "surface",
+        x=1000 + columns * 20,
+        y=2000 + rows * 20,
+        z=np.full((64, 48), 3000, dtype=np.float32),
+        scale=[0.05, 0.05],
+    )
+
+    report = surface_preflight.inspect_pair(surface, block_rows=1)
+    spacing = report["surface"]["grid_spacing_voxels"]
+
+    assert spacing["columns"]["pair_count"] == 64 * 47
+    assert spacing["rows"]["pair_count"] == 63 * 48
+    assert spacing["columns"]["median_spacing_voxels"] == pytest.approx(20, rel=0.02)
+    assert spacing["rows"]["median_spacing_voxels"] == pytest.approx(20, rel=0.02)
+
+
+def test_surface_only_fails_all_sentinel_grid(tmp_path) -> None:
+    sentinel = np.full((6, 8), -1.0, dtype=np.float32)
+    surface = write_surface(
+        tmp_path / "surface",
+        x=sentinel,
+        y=sentinel,
+        z=sentinel,
+        scale=[0.05, 0.05],
+    )
+
+    report = surface_preflight.inspect_pair(surface)
+    gates = {gate["name"]: gate for gate in report["gates"]}
+
+    assert report["status"] == "FAIL"
+    assert gates["valid_surface_vertices"]["observed"] == 0
+    assert gates["valid_surface_vertices"]["passed"] is False
+    assert gates["tifxyz_scale_consistency"]["passed"] is False
+    assert gates["tifxyz_scale_consistency"]["observed"]["columns"]["pair_count"] == 0
+
+
+def test_scale_consistency_fails_when_scale_disagrees_with_grid(tmp_path) -> None:
+    rows, columns = np.indices((6, 8), dtype=np.float32)
+    surface = write_surface(
+        tmp_path / "surface",
+        x=1000 + columns * 20,
+        y=2000 + rows * 20,
+        z=np.full((6, 8), 3000, dtype=np.float32),
+        scale=[0.0002886, 0.0002886],
+    )
+
+    report = surface_preflight.inspect_pair(surface)
+    gate = next(gate for gate in report["gates"] if gate["name"] == "tifxyz_scale_consistency")
+
+    assert report["status"] == "FAIL"
+    assert gate["passed"] is False
+    assert gate["observed"]["columns"]["ratio"] == pytest.approx(20 * 0.0002886, rel=0.02)
+    assert "scale disagrees" in gate["message"]
+
+
+def test_scale_consistency_passes_anisotropic_within_tolerance(tmp_path) -> None:
+    rows, columns = np.indices((6, 8), dtype=np.float32)
+    surface = write_surface(
+        tmp_path / "surface",
+        x=1000 + columns * 20,
+        y=2000 + rows * 30,
+        z=np.full((6, 8), 3000, dtype=np.float32),
+        scale=[0.05, 1 / 30],
+    )
+
+    report = surface_preflight.inspect_pair(surface)
+
+    assert report["status"] == "PASS"
+    assert next(
+        gate for gate in report["gates"] if gate["name"] == "tifxyz_scale_consistency"
+    )["passed"] is True
+
+
+def test_scale_consistency_tolerance_is_configurable(tmp_path) -> None:
+    rows, columns = np.indices((6, 8), dtype=np.float32)
+    surface = write_surface(
+        tmp_path / "surface",
+        x=1000 + columns * 20,
+        y=2000 + rows * 20,
+        z=np.full((6, 8), 3000, dtype=np.float32),
+        scale=[0.1, 0.1],
+    )
+
+    strict = surface_preflight.inspect_pair(surface, scale_tolerance=1.5)
+    permissive = surface_preflight.inspect_pair(surface, scale_tolerance=3.0)
+
+    assert strict["status"] == "FAIL"
+    assert permissive["status"] == "PASS"
+
+
+def test_scale_consistency_exact_match_passes_with_unit_tolerance(tmp_path) -> None:
+    rows, columns = np.indices((6, 8), dtype=np.float32)
+    surface = write_surface(
+        tmp_path / "surface",
+        x=1000 + columns * 32,
+        y=2000 + rows * 32,
+        z=np.full((6, 8), 3000, dtype=np.float32),
+        scale=[1 / 32, 1 / 32],
+    )
+
+    report = surface_preflight.inspect_pair(surface, scale_tolerance=1.0)
+    gate = next(gate for gate in report["gates"] if gate["name"] == "tifxyz_scale_consistency")
+
+    assert report["status"] == "PASS"
+    bounds = gate["observed"]["columns"]["median_spacing_bounds_voxels"]
+    assert bounds[0] <= 32.0 <= bounds[1]
+    assert gate["observed"]["columns"]["ratio_range"][0] <= 1.0 <= gate["observed"]["columns"]["ratio_range"][1]
+
+
+def test_scale_consistency_passes_ratio_exactly_at_tolerance(tmp_path) -> None:
+    rows, columns = np.indices((6, 8), dtype=np.float32)
+    surface = write_surface(
+        tmp_path / "surface",
+        x=1000 + columns * 40,
+        y=2000 + rows * 10,
+        z=np.full((6, 8), 3000, dtype=np.float32),
+        scale=[0.05, 0.05],
+    )
+
+    at_tolerance = surface_preflight.inspect_pair(surface, scale_tolerance=2.0)
+    just_inside = surface_preflight.inspect_pair(surface, scale_tolerance=1.95)
+
+    assert at_tolerance["status"] == "PASS"
+    assert just_inside["status"] == "FAIL"
+
+
+def test_bbox_consistency_fails_stale_bbox(tmp_path) -> None:
+    rows, columns = np.indices((6, 8), dtype=np.float32)
+    surface = write_surface(
+        tmp_path / "surface",
+        x=1000 + columns * 20,
+        y=2000 + rows * 20,
+        z=np.full((6, 8), 3000, dtype=np.float32),
+        bbox=[[1000, 2000, 3000], [1020, 2040, 3000]],
+    )
+
+    report = surface_preflight.inspect_pair(surface)
+    gate = next(gate for gate in report["gates"] if gate["name"] == "tifxyz_bbox_consistency")
+
+    assert report["status"] == "FAIL"
+    assert gate["passed"] is False
+    assert gate["observed"]["max_excess_voxels"] > 0
+    assert "bbox is stale" in gate["message"]
+
+
+def test_bbox_consistency_passes_covering_bbox(tmp_path) -> None:
+    rows, columns = np.indices((6, 8), dtype=np.float32)
+    surface = write_surface(
+        tmp_path / "surface",
+        x=1000 + columns * 20,
+        y=2000 + rows * 20,
+        z=np.full((6, 8), 3000, dtype=np.float32),
+        scale=[0.05, 0.05],
+        bbox=[[1000, 2000, 3000], [1140, 2100, 3000]],
+    )
+
+    report = surface_preflight.inspect_pair(surface)
+    gate = next(gate for gate in report["gates"] if gate["name"] == "tifxyz_bbox_consistency")
+
+    assert report["status"] == "PASS"
+    assert gate["passed"] is True
+
+
+def test_bbox_consistency_rejects_malformed_bbox(tmp_path) -> None:
+    surface = write_surface(tmp_path / "surface", meta_extra={"bbox": [1, 2, 3]})
+
+    report = surface_preflight.inspect_pair(surface)
+    gate = next(gate for gate in report["gates"] if gate["name"] == "tifxyz_bbox_consistency")
+
+    assert report["status"] == "FAIL"
+    assert gate["passed"] is False
+    assert "2x3" in gate["observed"]["error"]
+
+
+def test_bbox_gate_absent_when_metadata_has_no_bbox(tmp_path) -> None:
+    report = surface_preflight.inspect_pair(write_surface(tmp_path / "surface"))
+
+    assert "tifxyz_bbox_consistency" not in {gate["name"] for gate in report["gates"]}
 
 
 def test_inspect_pair_fails_out_of_bounds_and_zero_support(tmp_path, monkeypatch) -> None:
@@ -321,7 +548,7 @@ def test_main_writes_report_and_returns_fail_closed(tmp_path, monkeypatch) -> No
     monkeypatch.setattr(
         surface_preflight,
         "inspect_pair",
-        lambda *_args, **_kwargs: {"schema_version": 1, "status": "FAIL"},
+        lambda *_args, **_kwargs: {"schema_version": 2, "status": "FAIL", "gates": []},
     )
 
     returncode = surface_preflight.main(
@@ -337,3 +564,21 @@ def test_main_writes_report_and_returns_fail_closed(tmp_path, monkeypatch) -> No
 
     assert returncode == 2
     assert json.loads(output.read_text(encoding="utf-8"))["status"] == "FAIL"
+
+
+def test_main_surface_only_returns_fail_exit_code_and_prints_gate_summary(
+    tmp_path, capsys
+) -> None:
+    sentinel = np.full((6, 8), -1.0, dtype=np.float32)
+    surface = write_surface(
+        tmp_path / "surface",
+        x=sentinel,
+        y=sentinel,
+        z=sentinel,
+        scale=[0.05, 0.05],
+    )
+
+    returncode = surface_preflight.main(["--surface", str(surface)])
+
+    assert returncode == 2
+    assert "valid_surface_vertices" in capsys.readouterr().err

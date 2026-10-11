@@ -4,6 +4,7 @@
 
 #include <memory>
 #include <string>
+#include <cstdint>
 #include <vector>
 
 class PlaneSurface;
@@ -24,8 +25,9 @@ inline constexpr int kLineViewCrossSampleCount = 7;
 
 struct LineViewConfig {
     // Derived ribbons retain every annotation control point and subdivide the
-    // optimized polyline between adjacent controls as closely as possible to
-    // this spacing. The declared along-strip scale always uses this target, so
+    // chord-arclength domain between adjacent controls as closely as possible to
+    // this spacing. Ordinary QuadSurface interpolation uses this support grid;
+    // there is no render-time curve evaluation. The declared scale uses this target, so
     // a shorter control-point span occupies one full display interval.
     double targetSpacingBaseVoxels = kLineViewAlongSamplingDistanceBaseVoxels;
     // Fractional indices into LineModel::points. Line endpoints are always
@@ -38,6 +40,10 @@ struct LineViewConfig {
     // frame mesh normals AND the display up vectors agree with these on a
     // cosine-weighted majority. Empty/mismatched/all-invalid -> legacy signs.
     std::vector<cv::Vec3f> orientedPointNormals;
+    // Display-only replacements for sampled normals, fed through the ordinary
+    // resampling, alignment and smoothing pipeline. Never use for optimization.
+    // Size-matched input controls both ribbons and the cut-plane up vectors.
+    std::vector<cv::Vec3f> displayPointNormals;
     // Build one PlaneSurface per line point into lineZSlices. VC3D's line
     // annotation only consumes lineUpVectors, so it opts out - a 2000-point
     // fiber otherwise allocates 2000 shared_ptr planes per view rebuild for
@@ -59,6 +65,12 @@ struct LineStripPositionMap {
     // metadata. Exact source mapping uses stripGridArclengths.
     double stripGridSpacingBaseVoxels = 0.0;
     size_t stripGridColumnCount = 0;
+    // Revision of the line this map was built from, stamped by the owner that
+    // tracks revisions (VC3D's line annotation session); 0 when unknown.
+    // Consumers that place controls by arc length require the control's
+    // revision to match, since arc lengths of one line mean nothing on
+    // another.
+    uint64_t lineRevision = 0;
 
     [[nodiscard]] bool valid() const;
     [[nodiscard]] double originalPositionToStripGridColumn(double originalPosition) const;
@@ -99,6 +111,12 @@ struct LineViewFrameDiagnostics {
 
 LineViewSurfaces buildLineViewSurfaces(const LineModel& line,
                                        const LineViewConfig& config = {});
+
+// Display-only frame for an already traced curve without sampled sheet normals.
+// Reuses the ribbon builder's parallel transport; positions are copied exactly.
+// The resulting normals describe a viewing frame, not a measured sheet field,
+// and must not be used as optimization evidence.
+LineModel lineModelForInspection(const std::vector<cv::Vec3d>& points);
 
 LineViewFrameDiagnostics diagnoseLineViewFrames(const LineModel& line,
                                                 const LineViewConfig& config = {});

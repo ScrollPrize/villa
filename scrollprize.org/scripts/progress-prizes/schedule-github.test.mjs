@@ -441,18 +441,9 @@ test('dispatch body is fixed, consecutive, prepared, and numeric', () => {
     'validate',
   );
 
-  assert.equal(
-    buildProductionDispatch({
-      operation: 'sync-responses',
-      sourceCycle: '2026-08',
-      targetCycle: '2026-09',
-      requestId: '20260806',
-    }).inputs.operation,
-    'sync-responses',
-  );
-
   for (const input of [
     { operation: 'none', sourceCycle: '2026-07', targetCycle: '2026-08', requestId: '1' },
+    { operation: 'sync-responses', sourceCycle: '2026-08', targetCycle: '2026-09', requestId: '1' },
     { operation: 'prepare', sourceCycle: '2026-07', targetCycle: '2026-09', requestId: '1' },
     { operation: 'prepare', sourceCycle: '2026-07', targetCycle: '2026-08', requestId: '01' },
     { operation: 'prepare', sourceCycle: '2026-07', targetCycle: '2026-08', requestId: 'not-numeric' },

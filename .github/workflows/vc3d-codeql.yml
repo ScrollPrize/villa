@@ -156,6 +156,14 @@ jobs:
         with:
           fetch-depth: 0  # history-aware queries if needed
 
+      # Keep this until the next published dependency image includes the
+      # libsqlite3-dev entry in scripts/install_build_deps.sh.
+      - name: Install SQLite headers
+        if: needs.changes.outputs.vc == 'true'
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends libsqlite3-dev
+
       - name: Initialize CodeQL
         if: needs.changes.outputs.vc == 'true'
         uses: github/codeql-action/init@v3

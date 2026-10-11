@@ -8,6 +8,7 @@ from flatten_spiral_checkpoint import (
     _checkpoint_config,
     _resolve_lasagna,
     _resolve_umbilicus,
+    _store_surface,
 )
 
 
@@ -54,3 +55,20 @@ def test_resolve_lasagna_requires_service_and_config(tmp_path):
 def test_checkpoint_config_reports_missing_fields():
     with pytest.raises(ValueError, match="missing model configuration"):
         _checkpoint_config({"cfg": {}})
+
+
+
+def test_store_surface_copies_where_symlinks_are_refused(tmp_path, monkeypatch):
+    def refuse(self, target, target_is_directory=False):
+        raise OSError(1314, "A required privilege is not held by the client")
+
+    monkeypatch.setattr(Path, "symlink_to", refuse)
+    surface = tmp_path / "segment-0001"
+    surface.mkdir()
+    (surface / "meta.json").write_text("{}", encoding="utf-8")
+
+    ref = _store_surface(surface, tmp_path / "objects")
+
+    segment = (tmp_path / "objects" / ref["type"] / ref["hash"].removeprefix("md5:")
+               / "segment-0001" / "segment")
+    assert (segment / "meta.json").read_text(encoding="utf-8") == "{}"
