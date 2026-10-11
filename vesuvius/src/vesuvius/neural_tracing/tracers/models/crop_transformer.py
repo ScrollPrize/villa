@@ -2,7 +2,8 @@
 
 The crop (by default 144 deep x 104 x 104 at 0.5 trace voxels, 72 samples behind the head) goes through residual CNN
 stages, by default 32/64/128 channels at strides 2/4/8 with 1/2/2 blocks. Each stride-8 cell becomes one token
-(18 x 13 x 13 = 3042), with no other encoder. One transformer (by default 12 layers, width 256, 8 heads, FFN 2048)
+(18 x 13 x 13 = 3042), with no other encoder (or, with cell_tokens 'grid' / 'polar', each cubic patch, or each center-tube
+disc and ring sector of a slab along the crop axis, of the CNN lattice: models/patch_tokens.py). One transformer (by default 12 layers, width 256, 8 heads, FFN 2048)
 reads, in every layer:
 
   * context tokens: the crop cells, the recent observed path and seed (reference points, with CNN features sampled at
@@ -36,10 +37,12 @@ import torch.nn.functional as F
 from vesuvius.neural_tracing.tracers.models.blocks import CNN_ACTIVATIONS, CropCNN, TransformerLayer
 from vesuvius.neural_tracing.tracers.models.flow import FlowMatching, FlowOptions, time_embedding
 from vesuvius.neural_tracing.tracers.models.follower import (
-    REFERENCE_METADATA, FollowerConfig, path_readout, plane_coordinates, proposal_output, read_path,
+    REFERENCE_METADATA, FollowerConfig, crop_support, path_readout, plane_coordinates, proposal_output, read_path,
     reference_metadata, reference_points, sample_features, select_refinement, token_coordinates)
+from vesuvius.neural_tracing.tracers.models.patch_tokens import CELL_TOKENS, PatchTokens
 from vesuvius.neural_tracing.tracers.models.path_geometry import PathGeometryTokens
 from vesuvius.neural_tracing.tracers.models.survival_confidence import survival_predictions
+from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec
 from vesuvius.neural_tracing.tracers.shared.policy import DEFAULT_CONFIDENCE, commit_prefix
 
 CELL, REFERENCE, GEOMETRY, PATH, SCORED = range(5)  # token kinds
@@ -60,6 +63,28 @@ class CropTransformerArchitecture:
     cnn_strides: tuple | None = (1, 2, 2, 2)  # per stage, 1 or 2 (their product is the token stride); None: 2 each
     cnn_stem: bool = True  # one full-resolution convolution before the first stage
     cnn_activation: str = 'leaky_relu'  # 'relu' or 'leaky_relu' (slope 0.01)
+    # Crop tokens (models/patch_tokens.py): 'cells' = one per CNN cell; 'grid' = cubic patches of patch_size samples;
+    # 'polar' = per slab of patch_size samples along the crop axis, a center tube token and rings of sectors around
+    # it (ring k: polar_sectors*k sectors with equal rings; rings may widen outwards). Patches read patch_points CNN
+    # feature points per axis. Sizes in samples.
+    cell_tokens: str = 'cells'
+    patch_size: int = 8
+    patch_points: int = 2
+    polar_tube_radius: float = 8.
+    polar_ring_width: float = 8.
+    polar_sectors: int = 6
+    polar_ring_growth: float = 1.  # ring k is polar_ring_width * growth**(k-1) wide; 1: equal rings
+    # Explicit widths of the innermost rings (then each further ring is the previous one times the growth); None:
+    # polar_ring_width for the first ring.
+    polar_ring_widths: tuple | None = None
+    polar_pool_spacing: float | None = None  # sector points average their cell's features this far apart; None: centers
+    # Two-level CNN (feature_levels): the CNN runs at full resolution on the central multiscale_fine_width x
+    # multiscale_fine_width samples of the cross-section (full depth), and a second CNN of the same architecture on the
+    # whole crop average-pooled by multiscale_coarse_pool. Patch tokens read the finest level holding them; path
+    # evidence and references read both levels' features. None: one CNN on the whole crop. Needs patch tokens.
+    multiscale_fine_width: int | None = None
+    multiscale_coarse_pool: int = 2
+    multiscale_coarse_channels: tuple | None = None  # the coarse CNN's channels per stage; None: cnn_channels
     # Per-head RMS normalization of attention queries and keys (models/blocks.py). Unbounded, the flow model's adaLN
     # time modulation of the path tokens grew their q/k norms until path attention saturated and training diverged.
     qk_norm: bool = False
@@ -87,6 +112,33 @@ class CropTransformerArchitecture:
         stride = self.token_stride[0]
         if self.fine.depth % stride or self.fine.width % stride:
             raise ValueError(f'Crop transformer crops must be multiples of the token stride ({stride})')
+        if self.cell_tokens not in CELL_TOKENS:
+            raise ValueError(f'Unknown cell tokens {self.cell_tokens!r} ({", ".join(CELL_TOKENS)})')
+        if self.multiscale_fine_width is not None and self.cell_tokens == 'cells':
+            raise ValueError("A multiscale CNN needs patch tokens (cell_tokens 'grid' or 'polar')")
+        if self.cell_tokens != 'cells':
+            if self.patch_size < 1 or self.patch_points < 1 or self.fine.depth % self.patch_size or self.fine.width % self.patch_size:
+                raise ValueError('Patch tokens need a positive patch size dividing the crop depth and width, and points')
+            if self.polar_tube_radius <= 0 or self.polar_ring_width <= 0 or self.polar_sectors < 1 or self.polar_ring_growth < 1:
+                raise ValueError('Polar tokens need a positive tube radius, ring width and sector count, and ring growth >= 1')
+            if self.polar_pool_spacing is not None and not self.polar_pool_spacing > 0:
+                raise ValueError('Polar pooling spacing must be positive (or None)')
+            if self.multiscale_fine_width is not None:
+                k, w, stride = self.multiscale_coarse_pool, int(self.multiscale_fine_width), self.token_stride[0]
+                self.multiscale_fine_width = w
+                if not 0 < w < self.fine.width or (self.fine.width-w) % 2 or w % stride:
+                    raise ValueError('The multiscale fine box must be narrower than the crop, centered on its axis and a '
+                                     'multiple of the token stride')
+                if k < 2 or self.fine.depth % (k*stride) or self.fine.width % (k*stride):
+                    raise ValueError('The multiscale coarse pooling must divide the crop into token-stride multiples')
+                if self.multiscale_coarse_channels is not None:
+                    self.multiscale_coarse_channels = tuple(int(c) for c in self.multiscale_coarse_channels)
+                    if len(self.multiscale_coarse_channels) != len(self.cnn_channels) or min(self.multiscale_coarse_channels) < 1:
+                        raise ValueError('The coarse CNN needs one positive channel count per crop CNN stage')
+            if self.polar_ring_widths is not None:
+                self.polar_ring_widths = tuple(float(w) for w in self.polar_ring_widths)
+                if not self.polar_ring_widths or min(self.polar_ring_widths) <= 0:
+                    raise ValueError('Polar ring widths must be a non-empty list of positive widths (or None)')
 
     @property
     def cnn_stage_strides(self):
@@ -96,6 +148,19 @@ class CropTransformerArchitecture:
     def token_stride(self):
         stride = math.prod(self.cnn_stage_strides)
         return (stride,)*3
+
+
+def feature_levels(cfg):
+    """The CNN feature lattices as (crop, stride) of each lattice's input, finest first: the whole crop, or with a
+    multiscale CNN the central fine box and the pooled whole crop (a pooled sample is the mean of k input samples, so
+    its center lies (k-1)/2 samples on; the axis stays at the cross-section center)."""
+    c, stride = cfg.fine, cfg.token_stride
+    if cfg.multiscale_fine_width is None:
+        return ((c, stride),)
+    k = cfg.multiscale_coarse_pool
+    fine = CropSpec(depth=c.depth, width=cfg.multiscale_fine_width, behind=c.behind, spacing=c.spacing)
+    coarse = CropSpec(depth=c.depth//k, width=c.width//k, behind=(c.behind-(k-1)/2)/k, spacing=c.spacing*k)
+    return ((fine, stride), (coarse, stride))
 
 
 @dataclass
@@ -157,11 +222,21 @@ class CropTransformer(nn.Module):
         super().__init__()
         self.cfg, self.model_type = cfg, cfg.model_type
         h, cells = cfg.hidden, cfg.cnn_channels[-1]
-        self.cnn = CropCNN(cfg.cnn_channels, cfg.cnn_stage_strides, cfg.cnn_blocks, stem=cfg.cnn_stem,
-                           activation=cfg.cnn_activation)
-        self.cell_token = nn.Linear(cells, h)
+        cnn = lambda channels: CropCNN(channels, cfg.cnn_stage_strides, cfg.cnn_blocks, stem=cfg.cnn_stem,
+                                       activation=cfg.cnn_activation)
+        self.cnn = cnn(cfg.cnn_channels)  # the whole crop, or a multiscale CNN's fine box
+        self.levels = feature_levels(cfg)
+        level_channels = (cells,)
+        if len(self.levels) > 1:
+            coarse = cfg.multiscale_coarse_channels or cfg.cnn_channels
+            self.coarse_cnn = cnn(coarse)
+            level_channels = (cells, coarse[-1])
+        self.cell_channels = sum(level_channels)  # CNN features at a point: every level's, concatenated
+        self.cell_token = (nn.Linear(cells, h) if cfg.cell_tokens == 'cells'
+                           else PatchTokens(cfg, level_channels, h, self.levels))
         self.cell_position = nn.Sequential(nn.Linear(3, h), nn.SiLU(), nn.Linear(h, h))
-        self.reference_token = nn.Sequential(nn.Linear(cells+REFERENCE_METADATA, h), nn.SiLU(), nn.Linear(h, h))
+        self.reference_token = nn.Sequential(nn.Linear(self.cell_channels+REFERENCE_METADATA, h), nn.SiLU(),
+                                             nn.Linear(h, h))
         self.path_geometry = PathGeometryTokens(cfg)
         self.kind = nn.Parameter(torch.zeros(5, h))  # CELL, REFERENCE, GEOMETRY, PATH, SCORED
         nn.init.normal_(self.kind, std=.02)
@@ -169,11 +244,25 @@ class CropTransformer(nn.Module):
         self.norm = nn.LayerNorm(h)
         self.register_buffer('planes', plane_coordinates(cfg), persistent=False)
         self.plane_scale = cfg.n_future*cfg.future_step  # forward-distance normalization of path tokens
-        self.register_buffer('cell_xyz', token_coordinates(cfg).reshape(-1, 3), persistent=False)
+        self.register_buffer('cell_xyz', token_coordinates(cfg).reshape(-1, 3) if cfg.cell_tokens == 'cells'
+                             else self.cell_token.centers.clone(), persistent=False)
 
     def sample_cells(self, ctx, points):
-        """CNN cell features (B, M, C) and crop support (B, M) at crop-local points (B, M, 3)."""
-        return sample_features(ctx['cells'].float(), points.float(), self.cfg.fine, self.cfg.token_stride)
+        """CNN cell features (B, M, cell_channels: every level's, zero outside its crop) and crop support (B, M) at
+        crop-local points (B, M, 3)."""
+        if len(self.levels) == 1:
+            return sample_features(ctx['cells'].float(), points.float(), self.cfg.fine, self.cfg.token_stride)
+        values = [sample_features(features.float(), points.float(), crop, stride)[0]
+                  for features, (crop, stride) in zip(ctx['levels'], self.levels)]
+        return torch.cat(values, -1), crop_support(points.float(), self.cfg.fine)
+
+    def encode(self, image):
+        """The CNN feature lattices of a crop (B, 1, D, W, W), finest first (feature_levels)."""
+        if len(self.levels) == 1:
+            return (self.cnn(image),)
+        w = self.cfg.multiscale_fine_width
+        o = (self.cfg.fine.width-w)//2
+        return self.cnn(image[..., o:o+w, o:o+w]), self.coarse_cnn(F.avg_pool3d(image, self.cfg.multiscale_coarse_pool))
 
     def evidence(self, ctx, points):
         values, support = self.sample_cells(ctx, points)
@@ -182,11 +271,12 @@ class CropTransformer(nn.Module):
     def context(self, x, hist, hmask):
         """Every layer's context keys/values for one decision per row, and its CNN cells."""
         cfg = self.cfg
-        cells = self.cnn(x['fine'])
-        tokens = self.cell_token(cells.flatten(2).transpose(1, 2))
+        levels = self.encode(x['fine'])
+        cells = levels[0]
+        tokens = self.cell_token(cells.flatten(2).transpose(1, 2) if self.cfg.cell_tokens == 'cells' else levels)
         dtype = tokens.dtype
         tokens = tokens+self.cell_position(self.cell_xyz/16.).to(dtype)+self.kind[CELL].to(dtype)
-        ctx = dict(cells=cells)
+        ctx = dict(cells=cells, levels=levels)
         references, mask = reference_points(x, hist, hmask, cfg.fine)
         local, _ = self.sample_cells(ctx, references)
         references = self.reference_token(torch.cat((local, reference_metadata(x, hist, references, mask)), -1))
@@ -244,7 +334,7 @@ class RegressionFollower(CropTransformer):
 
     def __init__(self, cfg):
         super().__init__(cfg)
-        h, cells = cfg.hidden, cfg.cnn_channels[-1]
+        h, cells = cfg.hidden, self.cell_channels
         # CNN evidence and support at the centerline, forward distance.
         self.query = nn.Sequential(nn.Linear(cells+2, h), nn.SiLU(), nn.Linear(h, h))
         self.coordinates, self.hazard = path_readout(h)
@@ -309,7 +399,7 @@ class FlowFollower(FlowMatching, CropTransformer):
     def __init__(self, cfg):
         super().__init__(cfg)
         self.init_flow(cfg)
-        h, cells = cfg.hidden, cfg.cnn_channels[-1]
+        h, cells = cfg.hidden, self.cell_channels
         # CNN evidence and support at the noisy path, its residual-scale coordinates, forward distance.
         self.query = nn.Sequential(nn.Linear(cells+1+2+1, h), nn.SiLU(), nn.Linear(h, h))
         self.time = nn.Sequential(nn.Linear(64, h), nn.SiLU(), nn.Linear(h, h))

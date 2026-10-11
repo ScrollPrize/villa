@@ -72,6 +72,77 @@ def test_compiled_training_matches_eager_with_finite_gradients(flow):
         assert module.weight.grad.abs().sum() > 0
 
 
+@pytest.mark.parametrize('cell_tokens, options', [('grid', {}), ('polar', {}),
+                                                   ('polar', dict(polar_ring_growth=1.5, polar_pool_spacing=1.)),
+                                                   ('polar', dict(polar_ring_growth=1.5, polar_pool_spacing=1.,
+                                                                  multiscale_fine_width=8)),
+                                                   ('polar', dict(polar_ring_growth=1.5, polar_pool_spacing=1.,
+                                                                  multiscale_fine_width=8, multiscale_coarse_channels=(2, 4, 8)))])
+def test_patch_tokens_train_compiled_as_eager(cell_tokens, options):
+    # The trainer's channels-last conversion (models/checkpoint.initialize_model_weights) leaves the token layout intact.
+    model = small(cell_tokens=cell_tokens, patch_size=8, polar_tube_radius=2., polar_ring_width=3., **options)
+    model = model.to(memory_format=torch.channels_last_3d)
+    b = coordinate_batch(model.cfg, 2)
+    eager = model.select_prediction(model.training_forward(b['x'], b['hist'], b['hmask'], torch.tensor(2.), b), .5)
+    compiled = prepare_training(copy.deepcopy(model), 2, backend='eager')
+    out = training_prediction(compiled, b['x'], b['hist'], b['hmask'], targets=b, retry_threshold=2.)
+    for key in eager:
+        torch.testing.assert_close(out[key], eager[key], atol=1e-5, rtol=1e-4)
+    terms = loss_terms(out, b, compiled.cfg, refinement_loss='all', policy_threshold=.5)
+    (terms['geometry_per_state']+.5*terms['confidence_per_state']).mean().backward()
+    tokens = compiled.cell_token
+    projections = [getattr(tokens, tokens.projection_name(g, level)) for g in tokens.groups for level in tokens.projections[g]]
+    cnns = [compiled.cnn]+([compiled.coarse_cnn] if hasattr(compiled, 'coarse_cnn') else [])
+    if options.get('multiscale_fine_width'):  # both CNN levels feed tokens: the tube the fine box, rings the coarse level
+        assert len(cnns) == 2 and tokens.projections['tube'] == [0] and 1 in tokens.projections['sector']
+    for module in (*(c.stages[0].blocks[0].conv1.conv for c in cnns), *projections):
+        assert module.weight.grad is not None and torch.isfinite(module.weight.grad).all()
+        assert module.weight.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize('growth, pooling, widths', [(1., None, None), (1.3, 2., None), (1.5, 2., (3., 4., 6.))])
+def test_polar_sectors_read_their_own_radial_frame(growth, pooling, widths):
+    """Features that depend only on the distance from the crop axis give every sector of a ring the same point
+    features in the same order (each sector reads outwards along its own radius; pooled points average their cell),
+    and the tube sees the axis."""
+    from vesuvius.neural_tracing.tracers.models.patch_tokens import PatchTokens, patch_layout, polar_rings
+    cfg = RegressionConfig(**dict(SMALL, fine=CropSpec(depth=32, width=48, behind=8, spacing=.5), cnn_strides=(1, 1, 1),
+                                  cell_tokens='polar', patch_size=8, polar_tube_radius=4., polar_ring_width=4.,
+                                  polar_ring_growth=growth, polar_pool_spacing=pooling, polar_ring_widths=widths))
+    tokens = PatchTokens(cfg, 1, 16)  # 8 points x (feature, support): the projection is made the identity
+    for name in tokens.groups:
+        projection = getattr(tokens, f'{name}_projection')
+        with torch.no_grad():
+            projection.weight.copy_(torch.eye(16, projection.in_features))
+            projection.bias.zero_()
+    w = cfg.fine.width
+    u = (torch.arange(w)-(w-1)/2)*cfg.fine.spacing
+    radius = (u[None, :]**2+u[:, None]**2).sqrt()
+    features = radius[None, None, None].expand(1, 1, cfg.fine.depth, w, w).contiguous()
+    with torch.no_grad():
+        out = tokens(features)[0]
+    points, _, weights = patch_layout(cfg)['sector']  # tokens in layout order, sub-points padded with zero weight
+    sectors = len(points)
+    values, support = out[:sectors, 0::2], out[:sectors, 1::2]
+    weights = weights/weights.sum(-1, keepdim=True)
+    if pooling is not None:
+        assert points.shape[2] > 1  # outer sectors average several sub-points per point
+    expected = (points[..., :2].norm(dim=-1)*weights).sum(-1)  # mean true radius of each point's sub-points
+    inside = (support == 1).all(-1)  # sectors wholly inside the crop
+    assert inside.float().mean() > .4
+    torch.testing.assert_close(values[inside], expected[inside], atol=.06, rtol=0)  # bilinear interpolation
+    first = polar_rings(cfg)[0][2]  # ring 1 of slab 0: its sectors' point radii coincide point by point
+    torch.testing.assert_close(expected[:first], expected[:1].expand(first, -1))
+    if growth > 1:
+        equal = PatchTokens(RegressionConfig(**dict(cfg.to_dict(), polar_ring_growth=1., polar_pool_spacing=None,
+                                                    polar_ring_widths=None)), 1, 16)
+        rings = [width for _, width, _ in polar_rings(cfg)]
+        assert rings[-1] > rings[-2] and len(points) < .7*len(equal.centers)  # wider rings: fewer tokens
+        if widths is not None:  # the innermost rings as given, then growth from the last of them
+            assert rings[:len(widths)] == list(widths) and rings[len(widths)] == widths[-1]*growth
+    assert out[sectors:, 0::2].max() <= cfg.polar_tube_radius*cfg.fine.spacing  # tube points stay inside the tube
+
+
 def test_tracing_runs_the_regression_model(tmp_path):
     from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer
     from vesuvius.neural_tracing.tracers.fibers.tracing.trace import TraceParams

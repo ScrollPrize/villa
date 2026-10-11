@@ -169,15 +169,17 @@ def read_afv_polylines(path):
         pieces = {}
         for fid, first, blob in c.execute('SELECT fiber_id,first_segment,points FROM blocks ORDER BY fiber_id,first_segment'):
             xyz = np.frombuffer(blob, dtype='<f8').reshape(-1, 3)
-            pieces.setdefault(fid, []).append(xyz if fid not in pieces else xyz[1:])
+            seen = fid in pieces  # tested before setdefault adds the key: blocks after the first share their first point
+            pieces.setdefault(fid, []).append(xyz[1:] if seen else xyz)
     return [(rows[fid], np.concatenate(pieces[fid])) for fid in rows]
 
 
-def write_afv(source, destination, fibers, metadata_updates, *, block_points=257):
+def write_afv(source, destination, fibers, metadata_updates, *, block_points=257, keep_metadata=None):
     """A new AFV with ``source``'s schema, pragmas and metadata (updated by ``metadata_updates``, point and fiber
     counts recomputed) holding ``fibers``: (fibers row dict, native xyz polyline) pairs. Each polyline is stored in
     blocks of at most ``block_points`` points sharing their end points, each block with its R-tree bounds; the row's
-    point count, length and bounds are recomputed. ``complete`` is written last."""
+    point count, length and bounds are recomputed. ``complete`` is written last. ``keep_metadata`` (keys) limits the
+    metadata taken from ``source``, e.g. to its coordinate frame for an unrelated collection; default all."""
     destination = Path(destination)
     if destination.exists():
         raise FileExistsError(f'{destination} exists')
@@ -185,7 +187,8 @@ def write_afv(source, destination, fibers, metadata_updates, *, block_points=257
         schema = [sql for (sql,) in src.execute("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND "
                                                   "name NOT LIKE 'block_bounds_%' AND type IN ('table','index')")]
         pragmas = [src.execute(f'PRAGMA {p}').fetchone()[0] for p in ('application_id', 'user_version')]
-        metadata = {k: json.loads(v) for k, v in src.execute('SELECT key,value FROM metadata')}
+        metadata = {k: json.loads(v) for k, v in src.execute('SELECT key,value FROM metadata')
+                    if keep_metadata is None or k in keep_metadata}
         columns = [r[1] for r in src.execute('PRAGMA table_info(fibers)')]
     partial = destination.with_suffix('.partial.afv')
     partial.unlink(missing_ok=True)

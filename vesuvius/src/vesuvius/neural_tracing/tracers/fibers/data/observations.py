@@ -30,6 +30,8 @@ class ObservationBuilder:
     """One crop and only visible observed references, shared by training/tracing."""
     def __init__(self,cfg):
         self.cfg = cfg
+        # Crop backend: CPU crops (image_crop) unless a tracer installs another one with the same values.
+        self.crop_images = image_crop
 
     def prefetch_bounds(self,item,vol):
         """CT footprints covering unresolved roll and normal-estimation context."""
@@ -49,8 +51,7 @@ class ObservationBuilder:
         for item in items:
             reference_layout(item,self.cfg)
         stack = lambda key: torch.from_numpy(np.stack([item[key] for item in items]).astype(np.float32))
-        crop_images = image_crop
-        x = dict(fine=crop_images(items,vol,self.cfg.fine,pool),seed=stack('visible_seed'),
+        x = dict(fine=self.crop_images(items,vol,self.cfg.fine,pool),seed=stack('visible_seed'),
                  seed_mask=stack('visible_seed_mask'),seed_age=stack('visible_seed_age'),
                  seed_tangent=stack('visible_seed_tangent'))
         x.update(path_geometry_inputs(items))

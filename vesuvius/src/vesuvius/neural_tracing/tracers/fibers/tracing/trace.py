@@ -106,8 +106,13 @@ def advance_trace_path(path, frame, points, commit, heading_start, shape, params
     if np.any(new < 0) or np.any(new[:, ::-1] >= np.asarray(shape)):
         return None, 'bounds'
     old = path[loop_start:-params.loop_skip]
-    if len(old) and np.min(np.linalg.norm(old[:, None]-new[None], axis=-1)) < params.loop_radius:
-        return None, 'loop'
+    if len(old):
+        # Only points inside the new points' box grown by the loop radius can lie closer than it: the same decision
+        # as the full distance matrix, without its cost growing with the trace length times the commit.
+        near = np.all((old >= new.min(0)-params.loop_radius) & (old <= new.max(0)+params.loop_radius), 1)
+        old = old[near]
+        if len(old) and np.min(np.linalg.norm(old[:, None]-new[None], axis=-1)) < params.loop_radius:
+            return None, 'loop'
     last_segment = np.concatenate([path[-1][None], new])
     travelled += float(arclength(last_segment)[-1])
     old_size = len(path)
@@ -231,37 +236,51 @@ class ModelTracer:
                 state['travelled'].append(float(at))
 
     @torch.no_grad()
-    def trace(self, seeds_xyz, headings, on_decision=None, initial_states=None, families=None):
+    def trace(self, seeds_xyz, headings, on_decision=None, initial_states=None, families=None, *,
+              feed=None, before_step=None, on_finished=None):
         """Greedy rollout, checking supervised confidence before committing.
 
         on_decision(i, state) observes the exact inference input and proposals,
         before any commit; returning False censors the trace (reason 'oracle'),
         returning a string censors it with that reason. Returned paths always
         start at the seed.
+
+        Streaming (fresh seeds, non-sequence models), all optional:
+        feed(active) is called before every step with the number of running traces and may return
+        (seeds, headings, families) to start; they become the next row indices.
+        before_step(idx, pos, frames) sees the running rows' heads and crop frames before their inputs are built and
+        may return {row: reason} to stop rows there.
+        on_finished(i, path, reason) receives each trace when it ends; its returned path is then released (empty).
         """
         was_training = self.model.training
         self.model.eval()
+        if (feed is not None or on_finished is not None) and initial_states is not None:
+            raise ValueError('Streaming traces start from fresh seeds')
         try:
-            return self._trace(seeds_xyz, headings, on_decision, initial_states, families)
+            return self._trace(seeds_xyz, headings, on_decision, initial_states, families, feed, before_step,
+                               on_finished)
         finally:
             self.model.train(was_training)
 
-    def _trace(self, seeds_xyz, headings, on_decision, initial_states=None, families=None):
+    def _trace(self, seeds_xyz, headings, on_decision, initial_states=None, families=None, feed=None, before_step=None,
+               on_finished=None):
         n = len(seeds_xyz)
+        seeds_xyz = list(seeds_xyz)  # streaming appends rows
         predictor = getattr(self, 'frame_predictor', None)
         if families is None and initial_states is not None and predictor is not None:
             families = [s.get('fiber_family') for s in initial_states]
         if predictor is not None and (families is None or len(families) != n):
             raise ValueError('Learned crop frames require one H/V family per trace')
         families = [fiber_family(f) for f in families] if families is not None else [None]*n
-        paths = [[np.asarray(s, np.float64)] for s in seeds_xyz]
+        # Paths are (N, 3) float64 arrays (list-to-array conversions every step grow with the trace length).
+        paths = [np.asarray(s, np.float64)[None] for s in seeds_xyz]
         if initial_states is not None:
             if len(initial_states) != n:
                 raise ValueError('One initial observed state is required per seed')
             if any(s['frame_policy'] not in FRAME_POLICIES for s in initial_states):
                 raise ValueError('Unsupported crop frame policy; recollect replay')
-            paths = [list(observed_path(dict(s, pos=p,
-                      hist_local=(np.asarray(s['hist'])-p) @ s['frame'])))
+            paths = [np.asarray(observed_path(dict(s, pos=p,
+                      hist_local=(np.asarray(s['hist'])-p) @ s['frame'])), np.float64).reshape(-1, 3)
                      for s,p in zip(initial_states,seeds_xyz)]
             if any(not len(path) or not np.allclose(path[-1], p, atol=1e-5, rtol=0)
                    for path, p in zip(paths, seeds_xyz)):
@@ -292,6 +311,8 @@ class ModelTracer:
                 reference.update({k: state[k] for k in SEED_FIELDS if k in state})
         sequence = ([dict(layers=[[] for _ in range(self.model.cfg.layers)], heads=[], travelled=[]) for _ in range(n)]
                     if getattr(self.model.cfg, 'model_type', '') == 'sequence' else None)
+        if feed is not None and sequence is not None:
+            raise ValueError('Streaming traces need a non-sequence follower')
         active = np.ones(n, bool)
         reasons = ['']*n
         length = np.zeros(n)
@@ -302,8 +323,66 @@ class ModelTracer:
         predicted = np.zeros(n, bool)  # this decision's crop came from the previous prediction
         retried = np.zeros(n, bool)  # this head already had its confidence-stop retry
         pp = self.p
-        while active.any():
+
+        def grow(new_seeds, new_headings, new_families):
+            """Start fresh traces as new rows: the same initial state as the seeds above."""
+            nonlocal heading_start, active, length, decisions, predicted, retried
+            m = len(new_seeds)
+            new_families = ([fiber_family(f) for f in new_families] if new_families is not None else [None]*m)
+            if predictor is not None and any(f is None for f in new_families):
+                raise ValueError('Learned crop frames require one H/V family per trace')
+            new_paths = [np.asarray(q, np.float64)[None] for q in new_seeds]
+            if predictor is not None:
+                new_frames = predict_frames(predictor, self.vol, list(new_seeds), list(new_headings),
+                                            [np.asarray(q) for q in new_paths], new_families, pool=getattr(self, 'pool', None))
+                new_diag = [dict(source=3, energy=0., gap=0.) for _ in range(m)]
+            else:
+                new_diag = [{} for _ in range(m)]
+                new_frames = list(self.map(lambda a: ct_frame(self.vol, a[0], a[1], diagnostics=a[2]),
+                                           zip(new_seeds, new_headings, new_diag)))
+            seeds_xyz.extend(new_seeds)
+            families.extend(new_families)
+            paths.extend(new_paths)
+            hist_start.extend([0]*m)
+            frame_diagnostics.extend(new_diag)
+            frames.extend(new_frames)
+            references.extend(dict(seed_pos=np.asarray(q).copy(), seed_tangent=normalize(np.asarray(h)),
+                                   seed_age=0., seed_valid=True) for q, h in zip(new_seeds, new_headings))
+            reasons.extend(['']*m)
+            last_segment.extend(np.asarray([q[-1]]) for q in new_paths)
+            prediction.extend([None]*m)
+            heading_start = np.concatenate([heading_start, np.zeros(m, np.int64)])
+            active = np.concatenate([active, np.ones(m, bool)])
+            length = np.concatenate([length, np.zeros(m)])
+            decisions = np.concatenate([decisions, np.zeros(m, np.int64)])
+            predicted = np.concatenate([predicted, np.zeros(m, bool)])
+            retried = np.concatenate([retried, np.zeros(m, bool)])
+
+        def finish(rows):
+            for i in rows:
+                on_finished(int(i), np.asarray(paths[i][hist_start[i]:]), reasons[i])
+                paths[i], hist_start[i], last_segment[i], prediction[i] = np.zeros((0, 3)), 0, None, None
+                references[i] = frames[i] = None
+
+        while True:
+            if feed is not None:
+                more = feed(int(active.sum()))
+                if more is not None and len(more[0]):
+                    grow(*more)
+            if not active.any():
+                break
             idx = np.flatnonzero(active)
+            if before_step is not None:
+                stops = before_step(idx, np.stack([paths[i][-1] for i in idx]), np.stack([frames[i] for i in idx]))
+                if stops:
+                    for i, reason in stops.items():
+                        active[i], reasons[i] = False, reason
+                    if on_finished is not None:
+                        finish(list(stops))
+                    idx = np.flatnonzero(active)
+                    if not len(idx):
+                        continue
+            was_active = idx
             pos = np.stack([paths[i][-1] for i in idx])
             fr = np.stack([frames[i] for i in idx])
             H = self.n_history
@@ -354,19 +433,22 @@ class ModelTracer:
                 refit = None
                 if would_stop and pp.refit_retry and not retried[i] and not recovery_blocked:
                     refit = predicted_axis(pos[j]+points[j] @ fr[j].T, pos[j], self.refit_window)
-                state = dict(pos=pos[j].copy(), frame=fr[j].copy(), hist=hist_world[j].copy(), hmask=hm[j].copy(),
-                             points=points[j].copy(), confidence=conf.copy(), n_commit=commit, would_stop=would_stop,
-                             recovery_blocked=bool(recovery_blocked),
-                             travelled=float(length[i]), last_segment=last_segment[i].copy(),
-                             observed_path=np.asarray(paths[i]).copy(),
-                             heading_start=int(heading_start[i]),
-                             frame_policy=(initial_states[i]['frame_policy'] if initial_states is not None and length[i] == 0
-                                           else PREDICTION_FRAME_POLICY if predicted[i]
-                                           else getattr(self, 'frame_policy', FRAME_POLICY)),
-                             fiber_family=families[i], ct_frame_diagnostics=frame_diagnostics[i].copy(),
-                             refit_retry=refit is not None)
-                state.update({**references[i], 'seed_age': references[i]['seed_age']+float(length[i])})
-                verdict = on_decision(int(i), state) if on_decision is not None else None
+                if on_decision is None:
+                    verdict = None
+                else:
+                    state = dict(pos=pos[j].copy(), frame=fr[j].copy(), hist=hist_world[j].copy(), hmask=hm[j].copy(),
+                               points=points[j].copy(), confidence=conf.copy(), n_commit=commit, would_stop=would_stop,
+                               recovery_blocked=bool(recovery_blocked),
+                               travelled=float(length[i]), last_segment=last_segment[i].copy(),
+                               observed_path=np.asarray(paths[i]).copy(),
+                               heading_start=int(heading_start[i]),
+                               frame_policy=(initial_states[i]['frame_policy'] if initial_states is not None and length[i] == 0
+                                             else PREDICTION_FRAME_POLICY if predicted[i]
+                                             else getattr(self, 'frame_policy', FRAME_POLICY)),
+                               fiber_family=families[i], ct_frame_diagnostics=frame_diagnostics[i].copy(),
+                               refit_retry=refit is not None)
+                    state.update({**references[i], 'seed_age': references[i]['seed_age']+float(length[i])})
+                    verdict = on_decision(int(i), state)
                 if verdict is False or isinstance(verdict, str):
                     active[i], reasons[i] = False, verdict if isinstance(verdict, str) else 'oracle'
                     continue
@@ -389,7 +471,7 @@ class ModelTracer:
                     continue
                 if sequence is not None:
                     committed.append((j, i, pos[j].copy(), points[j][:commit].copy(), float(length[i])))
-                paths[i] = list(advanced['path'])
+                paths[i] = advanced['path']
                 last_segment[i] = advanced['last_segment']
                 length[i] = advanced['travelled']
                 heading_start[i] = advanced['heading_start']
@@ -413,14 +495,27 @@ class ModelTracer:
                                             diagnostics=frame_diagnostics[i])
                 for i, frame in zip(reframe, self.map(update, reframe)):
                     frames[i] = frame
+            # Continuations: forward along the previous prediction's axis, roll from the frame just built. Each axis
+            # depends only on its own trace; an optional process pool (axis_pool) computes them in parallel with the
+            # same values. (Threads are avoided here: running predicted_axis in the thread pool crashed CPython 3.14.)
+            rows = [i for i in reframe if self.prediction_window and prediction[i] is not None and len(prediction[i])]
+            pool = getattr(self, 'axis_pool', None)
+            heads_ = [paths[i][-1] for i in rows]
+            futures_ = [prediction[i] for i in rows]
+            if pool is not None and rows:
+                axes = list(pool.map(predicted_axis, futures_, heads_, [self.prediction_window]*len(rows),
+                                     chunksize=max(1, len(rows)//32)))
+            else:
+                axes = [predicted_axis(f, h, self.prediction_window) for f, h in zip(futures_, heads_)]
+            axis_by_row = dict(zip(rows, axes))
             for i in reframe:
-                # Continuations: forward along the previous prediction's axis, roll from the frame just built.
-                axis = (predicted_axis(prediction[i], paths[i][-1], self.prediction_window)
-                        if self.prediction_window and prediction[i] is not None and len(prediction[i]) else None)
+                axis = axis_by_row.get(i)
                 if axis is not None:
                     frames[i] = frame_from_heading(axis, np.asarray(frames[i])[:, 0])
                     frame_diagnostics[i] = dict(frame_diagnostics[i], source=4)
                 predicted[i] = axis is not None
+            if on_finished is not None:
+                finish(was_active[~active[was_active]])
         return [np.asarray(p[h:]) for p, h in zip(paths, hist_start)], reasons
 
 

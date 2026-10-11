@@ -9,7 +9,8 @@
       "lr_restart_step": null,           # with --resume: warmup + cosine to training.steps restart from this update
                                          # (<= the resumed one); AdamW moments are kept. null: the checkpoint's
       "dataset": {...},                  # the dataset configuration (data/datasets.py: version, cache_dir, sources)
-      "model": {"type": "regression"},   # 'regression', 'flow' or 'sequence', plus any model field
+      "model": {"type": "regression"},   # 'regression', 'flow' or 'sequence', plus any model field; frame_checkpoint
+                                         # defaults to the frame model, null: CT structure-tensor crop frames
       "training": {...},                 # optimizer, schedule, losses, sampling, task shares, DAgger, diagnostics
       "runtime": {...}                   # device, workers, threads, CT prefetch: settings of the machine
     }

@@ -158,8 +158,12 @@ def main(argv=None):
     initial = read_checkpoint(args.init_weights, 'cpu') if args.init_weights and resume is None else None
     initialization = resume.get('initialization') if resume else args.init_weights
     cfg = configured_model(run, resume, progress)
-    # The configured frame model; a resumed run records the file it now uses.
-    bind_frame_checkpoint(cfg, args.frame_checkpoint)
+    # The configured frame model; a resumed run records the file it now uses. A null frame_checkpoint trains without a
+    # frame model: crops use the CT structure-tensor frames (frames.ct.FRAME_POLICY) on the configured CT level.
+    if args.frame_checkpoint:
+        bind_frame_checkpoint(cfg, args.frame_checkpoint)
+    else:
+        cfg.frame_checkpoint = cfg.frame_checkpoint_sha256 = None
     frame_predictor(cfg)  # validate once before dataset loading; workers reuse a frozen CPU predictor
     # The recorded configuration holds the model actually trained; fitted flow scales stay with the checkpoint.
     configured_sigma = run['model'].get('flow_sigma')
