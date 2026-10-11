@@ -4,6 +4,7 @@
 #if UTILS_HAS_CURL
 
 #include <curl/curl.h>
+#include <QXmlStreamReader>
 
 #include <array>
 #include <cstring>
@@ -157,16 +158,79 @@ std::size_t write_callback(char* ptr, std::size_t size,
     return total;
 }
 
-// Header callback: capture content-type and content-length
+// A 404 from an S3 origin can describe a failed bucket lookup, not an absent
+// object. Do not infer absence from a substring or a partial XML document.
+bool confirms_missing_s3_key(std::string_view body) {
+    QXmlStreamReader xml(QByteArray(body.data(), static_cast<qsizetype>(body.size())));
+    int depth = 0, roots = 0, codes = 0;
+    QString code;
+    while (!xml.atEnd()) {
+        const auto token = xml.readNext();
+        if (token == QXmlStreamReader::DTD) return false;
+        if (token == QXmlStreamReader::StartElement) {
+            ++depth;
+            if (depth == 1 && (++roots != 1 || xml.name() != u"Error")) return false;
+            if (depth == 2 && xml.name() == u"Code") {
+                ++codes;
+                code = xml.readElementText(QXmlStreamReader::ErrorOnUnexpectedElement).trimmed();
+                --depth; // readElementText consumed this element's end token.
+            }
+        } else if (token == QXmlStreamReader::EndElement) {
+            --depth;
+        }
+    }
+    return !xml.hasError() && depth == 0 && roots == 1 && codes == 1 && code == u"NoSuchKey";
+}
+
+bool is_s3_endpoint(std::string_view url) {
+    if (is_s3_url(url)) return true;
+    // Parse the authority, rather than matching a bucket-looking substring in
+    // a path, query, userinfo, or a lookalike domain.
+    std::unique_ptr<CURLU, decltype(&curl_url_cleanup)> parsed(curl_url(), curl_url_cleanup);
+    if (!parsed || curl_url_set(parsed.get(), CURLUPART_URL, std::string(url).c_str(), 0) != CURLUE_OK)
+        return false;
+    char* rawHost = nullptr;
+    if (curl_url_get(parsed.get(), CURLUPART_HOST, &rawHost, 0) != CURLUE_OK) return false;
+    std::unique_ptr<char, decltype(&curl_free)> hostOwner(rawHost, curl_free);
+    std::string host(rawHost);
+    std::transform(host.begin(), host.end(), host.begin(), [](unsigned char c) {
+        return static_cast<char>(c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c);
+    });
+    if (host.ends_with('.')) host.pop_back();
+    for (std::string_view suffix : {".amazonaws.com", ".amazonaws.com.cn"}) {
+        if (!host.ends_with(suffix)) continue;
+        const auto service = std::string_view(host).substr(0, host.size() - suffix.size());
+        return service == "s3" || service.starts_with("s3.") || service.starts_with("s3-") ||
+            service.ends_with(".s3") || service.find(".s3.") != std::string_view::npos ||
+            service.find(".s3-") != std::string_view::npos;
+    }
+    return false;
+}
+
+struct ResponseHeaders {
+    HttpResponse& response;
+    bool s3 = false;
+};
+
+// Capture object metadata and S3 identity, including S3-compatible origins.
 std::size_t header_callback(char* ptr, std::size_t size,
                             std::size_t nmemb, void* userdata) noexcept {
-    auto& resp = *static_cast<HttpResponse*>(userdata);
+    auto& headers = *static_cast<ResponseHeaders*>(userdata);
+    auto& resp = headers.response;
     auto total = size * nmemb;
     std::string_view line(ptr, total);
 
     // Strip trailing \r\n
     while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
         line.remove_suffix(1);
+
+    if (line.starts_with("HTTP/")) {
+        // Redirects and interim responses must not supply the final headers.
+        headers.s3 = false;
+        resp.content_type.clear();
+        resp.content_length = 0;
+        resp.body.clear();
+    }
 
     constexpr std::string_view ct_prefix = "content-type:";
     constexpr std::string_view cl_prefix = "content-length:";
@@ -180,6 +244,13 @@ std::size_t header_callback(char* ptr, std::size_t size,
         }
         return true;
     };
+
+    if (lower_match("x-amz-request-id:")) headers.s3 = true;
+    if (lower_match("server:")) {
+        auto value = line.substr(7);
+        while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) value.remove_prefix(1);
+        if (value == "AmazonS3") headers.s3 = true;
+    }
 
     if (lower_match(ct_prefix)) {
         auto val = line.substr(ct_prefix.size());
@@ -281,9 +352,12 @@ HttpResponse perform(const HttpClient::Config& config,
                      Method method,
                      std::span<const std::byte> put_data,
                      std::string_view content_type,
-                     std::string range = {}) {
+                     std::string range = {},
+                     bool require_s3 = false,
+                     bool fresh_connection = false) {
     auto resolved = resolve_url(url);
     HttpResponse resp;
+    bool s3_source = require_s3;
 
     for (std::size_t attempt = 0; attempt <= config.max_retries; ++attempt) {
         if (HttpClient::isAborted()) return resp;
@@ -295,6 +369,7 @@ HttpResponse perform(const HttpClient::Config& config,
 
         // URL
         curl_easy_setopt(curl, CURLOPT_URL, resolved.c_str());
+        curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, fresh_connection ? 1L : 0L);
 
 #if defined(_WIN32)
         // MSYS2's libcurl is OpenSSL-backed and its default CA bundle path
@@ -345,7 +420,8 @@ HttpResponse perform(const HttpClient::Config& config,
 
         // Header callback
         curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
-        curl_easy_setopt(curl, CURLOPT_HEADERDATA, &resp);
+        ResponseHeaders response_headers{resp};
+        curl_easy_setopt(curl, CURLOPT_HEADERDATA, &response_headers);
 
         // Auth (local per-request state)
         auto auth_state = apply_auth(curl, config);
@@ -405,8 +481,36 @@ HttpResponse perform(const HttpClient::Config& config,
         if (code == CURLE_OK) {
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &resp.status_code);
 
-            // Retry on 5xx server errors
-            if (resp.status_code >= 500 && attempt < config.max_retries) {
+            char* effective_url = nullptr;
+            curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effective_url);
+            // Retain S3 identity if a retry is answered by a bare proxy error.
+            s3_source = s3_source || response_headers.s3 || is_s3_endpoint(url) ||
+                (effective_url && is_s3_endpoint(effective_url));
+            if (method != Method::PUT && s3_source && resp.status_code == 404) {
+                if (method == Method::HEAD) {
+                    // HEAD has no error body. Confirm using a ranged GET on a
+                    // fresh connection, even when HEAD was the last attempt.
+                    auto proof = perform(config, url, Method::GET_RANGE, {}, {}, "0-0", true, true);
+                    if (proof.not_found()) return resp;
+                    if (!proof.ok()) {
+                        proof.body.clear();
+                        return proof;
+                    }
+                    // The object exists. Repeat HEAD for its full size; the
+                    // successful one-byte probe is not object-size metadata.
+                    resp.unconfirmed_404 = true;
+                    resp.error_message = "Unconfirmed S3 HEAD 404: object exists on ranged GET";
+                } else if (!confirms_missing_s3_key(resp.body_string())) {
+                    resp.unconfirmed_404 = true;
+                    resp.error_message = "Unconfirmed S3 HTTP 404: expected a complete NoSuchKey error";
+                }
+            }
+            const bool unconfirmed404 = resp.status_code == 404 && resp.unconfirmed_404;
+            if (unconfirmed404) fresh_connection = true;
+
+            // Keep the existing retry bound/backoff. Reusing the same poisoned
+            // connection can repeat a false S3 miss indefinitely.
+            if ((resp.status_code >= 500 || unconfirmed404) && attempt < config.max_retries) {
                 thread_local std::mt19937 rng{std::random_device{}()};
                 std::uniform_int_distribution<unsigned> jitter(0, 100);
                 std::this_thread::sleep_for(
@@ -537,7 +641,8 @@ HttpResponse HttpClient::put_file(std::string_view url,
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp.body);
         curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
-        curl_easy_setopt(curl, CURLOPT_HEADERDATA, &resp);
+        ResponseHeaders response_headers{resp};
+        curl_easy_setopt(curl, CURLOPT_HEADERDATA, &response_headers);
         curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
         curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, xferinfo_callback);
 

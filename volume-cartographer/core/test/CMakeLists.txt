@@ -797,6 +797,12 @@ if(VC_BUILD_PYTHON)
     vc_register_ctest(python_sftp_volume test_sftp_fetch)
 endif()
 
+# Deterministic loopback tests; no S3 credentials or public data required.
+find_package(Qt6 REQUIRED COMPONENTS Network)
+vc_add_test(NAME test_http_s3_missing LIBS doctest::doctest utils Qt6::Core Qt6::Network)
+vc_add_test(NAME test_s3_chunk_cache LIBS doctest::doctest vc_core Qt6::Core Qt6::Network)
+set_tests_properties(test_http_s3_missing test_s3_chunk_cache PROPERTIES TIMEOUT 60)
+
 # Live S3: stages PHerc 0172 level 5 to a local zarr dir, then exercises
 # the NormalGridGenerate library API against it. Soft-skips on network.
 vc_add_test(NAME test_normal_grid_live)
