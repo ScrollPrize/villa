@@ -170,6 +170,9 @@ def open_zarr(path, resolution, auth=None, s3_storage_options=None):
 class SSLZarrDataset(Dataset):
     def __init__(self, config, do_augmentations=False, single_crop_only=False):
         self.config = config
+        for key in ("global_view_size", "local_view_size", "gram_teacher_view_size"):
+            if key in config:
+                raise ValueError(f"{key} is no longer supported; configure the corresponding crop_size instead.")
         self.do_augmentations = do_augmentations
         self.single_crop_only = bool(self.config.get("single_crop_only", False) or single_crop_only)
         self.epoch_length = int(self.config["epoch_length"]) if "epoch_length" in self.config else None
@@ -178,17 +181,11 @@ class SSLZarrDataset(Dataset):
         )
         self.num_global_crops = self.config.get("num_global_crops", 2)
         self.local_crop_size = _as_3tuple(self.config["local_crop_size"] if "local_crop_size" in self.config else None)
-        self.global_view_size = _as_3tuple(self.config.get("global_view_size", self.global_crop_size))
-        self.local_view_size = _as_3tuple(self.config.get("local_view_size", self.local_crop_size))
         self.gram_teacher_crop_size = _as_3tuple(self.config.get("gram_teacher_crop_size"))
         if self.gram_teacher_crop_size is not None and self.single_crop_only:
             raise ValueError("gram_teacher_crop_size is not supported with single_crop_only datasets.")
-        self.gram_teacher_view_size = _as_3tuple(
-            self.config.get("gram_teacher_view_size", self.gram_teacher_crop_size)
-        )
         self.gram_teacher_no_augmentations = bool(self.config.get("gram_teacher_no_augmentations", True))
         self.paired_global_crop_size = _max_3tuple(self.global_crop_size, self.gram_teacher_crop_size)
-        self.paired_global_view_size = _max_3tuple(self.global_view_size, self.gram_teacher_view_size)
         double_global = tuple(2 * int(d) for d in self.paired_global_crop_size)
         default_source_sampling_size = _max_3tuple(double_global, self.global_crop_size, self.local_crop_size)
         self.source_sampling_size = _as_3tuple(
@@ -230,10 +227,6 @@ class SSLZarrDataset(Dataset):
         if any(not type_name for type_name in configured_types):
             raise ValueError("Point collection types must be non-empty strings.")
         self.point_type_to_id = {type_name: index for index, type_name in enumerate(configured_types)}
-        self.global_point_crop_offset = tuple(
-            (float(view) - float(crop)) / 2.0
-            for view, crop in zip(self.global_view_size, self.global_crop_size)
-        )
         self._volume_handles: dict[tuple[str, int], ZarrHandle] = {}
         self._handle_pid: int | None = None
         self._atexit_pid: int | None = None
@@ -245,21 +238,6 @@ class SSLZarrDataset(Dataset):
             if self.local_crop_size is not None and self.num_local_crops < 0:
                 raise ValueError(
                     f"SSLZarrDataset expects a non-negative number of local crops, got {self.num_local_crops}")
-        if any(view < crop for view, crop in zip(self.global_view_size, self.global_crop_size)):
-            raise ValueError(
-                f"global_view_size must be at least global_crop_size, got {self.global_view_size} < {self.global_crop_size}"
-            )
-        if self.local_crop_size is not None and self.local_view_size is not None:
-            if any(view < crop for view, crop in zip(self.local_view_size, self.local_crop_size)):
-                raise ValueError(
-                    f"local_view_size must be at least local_crop_size, got {self.local_view_size} < {self.local_crop_size}"
-                )
-        if self.gram_teacher_crop_size is not None and self.gram_teacher_view_size is not None:
-            if any(view < crop for view, crop in zip(self.gram_teacher_view_size, self.gram_teacher_crop_size)):
-                raise ValueError(
-                    "gram_teacher_view_size must be at least gram_teacher_crop_size, "
-                    f"got {self.gram_teacher_view_size} < {self.gram_teacher_crop_size}"
-                )
         required_source_sampling_size = _max_3tuple(
             self.global_crop_size,
             self.local_crop_size,
@@ -272,21 +250,11 @@ class SSLZarrDataset(Dataset):
                 "source_sampling_size must be at least as large as the largest requested crop size, "
                 f"got source_sampling_size={self.source_sampling_size} and required={required_source_sampling_size}"
             )
-        self.source_read_window_size = self._required_read_window_size(self.source_sampling_size)
-        required_read_window_size = _max_3tuple(self.paired_global_view_size, self.local_view_size)
-        if required_read_window_size is not None and any(
-            source < required for source, required in zip(self.source_read_window_size, required_read_window_size)
-        ):
-            raise ValueError(
-                "computed source_read_window_size must be at least as large as the largest requested view size, "
-                f"got source_read_window_size={self.source_read_window_size} and required={required_read_window_size}"
-            )
-
-        self.global_transforms = [create_training_transforms(self.global_view_size) for _ in
+        self.global_transforms = [create_training_transforms(self.global_crop_size) for _ in
                                   range(self.num_global_crops)]
         self.local_transforms = (
-            [create_training_transforms(self.local_view_size) for _ in range(self.num_local_crops)]
-            if self.local_view_size is not None
+            [create_training_transforms(self.local_crop_size) for _ in range(self.num_local_crops)]
+            if self.local_crop_size is not None
             else []
         )
 
@@ -309,7 +277,7 @@ class SSLZarrDataset(Dataset):
                 y1 = (y0 + k_y)
                 x1 = (x0 + k_x)
                 usable_bbox = (z0, y0, x0, z1, y1, x1)
-                crop_z, crop_y, crop_x = self.source_read_window_size
+                crop_z, crop_y, crop_x = self.source_sampling_size
                 valid_z = max(0, (z1 - z0) - crop_z + 1)
                 valid_y = max(0, (y1 - y0) - crop_y + 1)
                 valid_x = max(0, (x1 - x0) - crop_x + 1)
@@ -362,17 +330,8 @@ class SSLZarrDataset(Dataset):
 
             all_coordinates = []
             all_type_ids = []
-            nominal_slices = self._nominal_source_slices(self.source_read_window_size)
-            usable_start = np.asarray([
-                int(bbox_start) + int(nominal_slice.start)
-                for bbox_start, nominal_slice in zip(usable_bbox[:3], nominal_slices)
-            ], dtype=np.float64)
-            usable_stop = np.asarray([
-                int(bbox_stop) - int(read_size) + int(nominal_slice.stop)
-                for bbox_stop, read_size, nominal_slice in zip(
-                    usable_bbox[3:], self.source_read_window_size, nominal_slices
-                )
-            ], dtype=np.float64)
+            usable_start = np.asarray(usable_bbox[:3], dtype=np.float64)
+            usable_stop = np.asarray(usable_bbox[3:], dtype=np.float64)
             for entry_index, entry in enumerate(entries):
                 if not isinstance(entry, dict) or "path" not in entry or "type" not in entry:
                     raise ValueError(
@@ -473,7 +432,7 @@ class SSLZarrDataset(Dataset):
 
     def _read_source_crop_3d(self, d_zarr, usable_bbox):
         z0, y0, x0, z1, y1, x1 = usable_bbox
-        crop_d, crop_h, crop_w = self.source_read_window_size
+        crop_d, crop_h, crop_w = self.source_sampling_size
         z_start = np.random.randint(z0, z1 - crop_d + 1)
         y_start = np.random.randint(y0, y1 - crop_h + 1)
         x_start = np.random.randint(x0, x1 - crop_w + 1)
@@ -487,30 +446,28 @@ class SSLZarrDataset(Dataset):
 
     def _read_point_centered_source_crop_3d(self, d_zarr, usable_bbox, anchor):
         starts = []
-        nominal_slices = self._nominal_source_slices(self.source_read_window_size)
-        for bbox_start, bbox_stop, crop_size, coordinate, nominal_slice in zip(
+        for bbox_start, bbox_stop, crop_size, coordinate in zip(
             usable_bbox[:3],
             usable_bbox[3:],
-            self.source_read_window_size,
+            self.source_sampling_size,
             anchor,
-            nominal_slices,
         ):
             minimum = max(
                 int(bbox_start),
-                int(np.ceil(float(coordinate) - (int(nominal_slice.stop) - 1))),
+                int(np.ceil(float(coordinate) - (int(crop_size) - 1))),
             )
             maximum = min(
                 int(bbox_stop) - int(crop_size),
-                int(np.floor(float(coordinate) - int(nominal_slice.start))),
+                int(np.floor(float(coordinate))),
             )
             if maximum < minimum:
                 raise ValueError(
                     f"Annotated point {tuple(float(value) for value in anchor)} cannot fit in a source window "
-                    f"of size {self.source_read_window_size} inside bounds {usable_bbox}."
+                    f"of size {self.source_sampling_size} inside bounds {usable_bbox}."
                 )
             starts.append(int(np.random.randint(minimum, maximum + 1)))
         z_start, y_start, x_start = starts
-        crop_d, crop_h, crop_w = self.source_read_window_size
+        crop_d, crop_h, crop_w = self.source_sampling_size
         crop = np.asarray(
             d_zarr[
                 z_start:z_start + crop_d,
@@ -520,139 +477,37 @@ class SSLZarrDataset(Dataset):
         )
         return crop, (z_start, y_start, x_start)
 
-    @staticmethod
-    def _expand_crop_shape(crop_shape, target_size, reference_size):
-        return tuple(
-            max(1, int(round(int(size) * int(target) / int(reference))))
-            for size, target, reference in zip(crop_shape, target_size, reference_size)
-        )
-
-    @staticmethod
-    def _centered_slices(outer_size, inner_size):
-        slices = []
-        for outer, inner in zip(outer_size, inner_size):
-            delta = int(outer) - int(inner)
-            if delta < 0:
-                raise ValueError(
-                    f"cannot place centered region of size {inner_size} inside {outer_size}"
-                )
-            start = delta // 2
-            slices.append(slice(start, start + int(inner)))
-        return tuple(slices)
-
-    def _nominal_source_slices(self, source_shape):
-        source_shape = tuple(int(dim) for dim in source_shape)
-        return self._centered_slices(source_shape, self.source_sampling_size)
-
-    def _extract_nominal_source_region(self, source_crop):
-        return source_crop[self._nominal_source_slices(source_crop.shape)]
-
-    def _required_read_window_size(self, source_sampling_size):
-        required_sizes = [tuple(int(size) for size in source_sampling_size)]
-        required_sizes.append(
-            self._expand_crop_shape(source_sampling_size, self.paired_global_view_size, self.paired_global_crop_size)
-        )
-        if self.local_crop_size is not None and self.local_view_size is not None:
-            required_sizes.append(
-                self._expand_crop_shape(source_sampling_size, self.local_view_size, self.local_crop_size)
-            )
-        return _max_3tuple(*required_sizes)
-
     def _sample_random_resized_crop_region(
         self,
         source_shape,
         scale_range,
         target_size,
         *,
-        reference_size=None,
         anchor=None,
         anchor_target_size=None,
-        anchor_output_size=None,
     ):
-        if reference_size is None:
-            reference_size = target_size
-        source_depth, source_height, source_width = source_shape
-        nominal_crop_shape = self._sample_crop_shape(scale_range)
-        # Sample the nominal DINO crop inside source_sampling_size, then expand around it when
-        # a deeper-embed halo is requested.
-        crop_d, crop_h, crop_w = self._expand_crop_shape(
-            nominal_crop_shape,
-            target_size,
-            reference_size,
-        )
-        expanded_crop_shape = (int(crop_d), int(crop_h), int(crop_w))
-        source_shape = (int(source_depth), int(source_height), int(source_width))
-        if any(crop > source for crop, source in zip(expanded_crop_shape, source_shape)):
-            raise ValueError(
-                "expanded crop does not fit inside source_read_window_size; "
-                f"expanded_crop_shape={expanded_crop_shape}, source_shape={source_shape}, "
-                f"source_sampling_size={self.source_sampling_size}, target_size={target_size}, "
-                f"reference_size={reference_size}"
-            )
-
-        nominal_source_slices = self._nominal_source_slices(source_shape)
-        nominal_starts = []
-        for axis, (nominal_slice, nominal_dim, raw_dim) in enumerate(zip(
-            nominal_source_slices,
-            nominal_crop_shape,
-            expanded_crop_shape,
-        )):
-            low = int(nominal_slice.start)
-            high_inclusive = int(nominal_slice.stop) - int(nominal_dim)
+        crop_shape = self._sample_crop_shape(scale_range)
+        starts = []
+        for axis, (source_dim, crop_dim) in enumerate(zip(source_shape, crop_shape)):
+            low = 0
+            high_inclusive = int(source_dim) - int(crop_dim)
             if anchor is not None:
-                if anchor_target_size is None or anchor_output_size is None:
-                    raise ValueError("anchor_target_size and anchor_output_size are required with an anchor.")
-                raw_offset = (int(raw_dim) - int(nominal_dim)) // 2
-                output_offset = (float(anchor_target_size[axis]) - float(anchor_output_size[axis])) / 2.0
-                relative_min = (
-                    (output_offset + 0.5) * int(raw_dim) / float(anchor_target_size[axis]) - 0.5
-                )
-                relative_max = (
-                    (output_offset + float(anchor_output_size[axis]) - 0.5)
-                    * int(raw_dim)
-                    / float(anchor_target_size[axis])
-                    - 0.5
-                )
-                low = max(
-                    low,
-                    int(np.ceil(float(anchor[axis]) - relative_max + raw_offset - 1e-7)),
-                )
+                if anchor_target_size is None:
+                    raise ValueError("anchor_target_size is required with an anchor.")
+                # Keep the point inside the resized crop's voxel-center bounds.
+                target_dim = float(anchor_target_size[axis])
+                relative_min = 0.5 * int(crop_dim) / target_dim - 0.5
+                relative_max = (target_dim - 0.5) * int(crop_dim) / target_dim - 0.5
+                low = max(low, int(np.ceil(float(anchor[axis]) - relative_max - 1e-7)))
                 high_inclusive = min(
-                    high_inclusive,
-                    int(np.floor(float(anchor[axis]) - relative_min + raw_offset + 1e-7)),
+                    high_inclusive, int(np.floor(float(anchor[axis]) - relative_min + 1e-7))
                 )
             if high_inclusive < low:
                 raise ValueError(
-                    "nominal crop cannot contain the requested annotation; "
-                    f"source_sampling_size={self.source_sampling_size}, nominal_crop_shape={nominal_crop_shape}, "
-                    f"anchor={anchor}"
+                    f"Cannot sample crop {crop_shape} inside source {source_shape} with anchor={anchor}"
                 )
-            nominal_starts.append(int(np.random.randint(low, high_inclusive + 1)))
-
-        raw_starts = []
-        for nominal_start, nominal_dim, raw_dim, source_dim in zip(
-            nominal_starts,
-            nominal_crop_shape,
-            expanded_crop_shape,
-            source_shape,
-        ):
-            raw_start = int(nominal_start) - (int(raw_dim) - int(nominal_dim)) // 2
-            raw_stop = raw_start + int(raw_dim)
-            if raw_start < 0 or raw_stop > int(source_dim):
-                raise ValueError(
-                    "expanded crop fell outside source_read_window_size; "
-                    f"raw_start={raw_start}, raw_stop={raw_stop}, source_dim={source_dim}, "
-                    f"nominal_crop_shape={nominal_crop_shape}, expanded_crop_shape={expanded_crop_shape}, "
-                    f"source_sampling_size={self.source_sampling_size}, "
-                    f"source_read_window_size={self.source_read_window_size}"
-                )
-            raw_starts.append(raw_start)
-
-        z_start, y_start, x_start = raw_starts
-        return SampledCropRegion(
-            starts=(int(z_start), int(y_start), int(x_start)),
-            shape=(int(crop_d), int(crop_h), int(crop_w)),
-        )
+            starts.append(int(np.random.randint(low, high_inclusive + 1)))
+        return SampledCropRegion(starts=tuple(starts), shape=tuple(int(size) for size in crop_shape))
 
     def _materialize_crop_from_region(self, source_crop, crop_region, target_size):
         z_start, y_start, x_start = crop_region.starts
@@ -664,24 +519,20 @@ class SSLZarrDataset(Dataset):
         ]
         return self._finalize_crop(crop, target_size)
 
-    def _random_resized_crop_3d_from_array(self, source_crop, scale_range, target_size, *, reference_size=None):
+    def _random_resized_crop_3d_from_array(self, source_crop, scale_range, target_size):
         crop_region = self._sample_random_resized_crop_region(
             source_crop.shape,
             scale_range,
             target_size,
-            reference_size=reference_size,
         )
         return self._materialize_crop_from_region(source_crop, crop_region, target_size)
 
-    def _read_random_resized_crop_3d(self, d_zarr, usable_bbox, scale_range, target_size, *, reference_size=None):
-        if reference_size is None:
-            reference_size = target_size
+    def _read_random_resized_crop_3d(self, d_zarr, usable_bbox, scale_range, target_size):
         source_crop = self._read_source_crop_3d(d_zarr, usable_bbox)
         return self._random_resized_crop_3d_from_array(
             source_crop,
             scale_range,
             target_size,
-            reference_size=reference_size,
         )
 
     @staticmethod
@@ -726,7 +577,7 @@ class SSLZarrDataset(Dataset):
         transform_input = {
             "image": global_view,
             "keypoints": point_coordinates,
-            "crop_shape": tuple(int(value) for value in self.global_view_size),
+            "crop_shape": tuple(int(value) for value in self.global_crop_size),
         }
         if gram_teacher_view is None or self.gram_teacher_no_augmentations:
             transform_input["paired_spatial_image"] = gram_teacher_view
@@ -765,13 +616,11 @@ class SSLZarrDataset(Dataset):
             visible_indices[visible_indices != anchor_index],
         ))
         return (
-            self._map_points_to_view(source_points[ordered_indices], crop_region, self.global_view_size),
+            self._map_points_to_view(source_points[ordered_indices], crop_region, self.global_crop_size),
             torch.from_numpy(volume.point_type_ids[ordered_indices].copy()).long(),
         )
 
     def _filter_and_cap_view_points(self, coordinates, type_ids):
-        offset = coordinates.new_tensor(self.global_point_crop_offset)
-        coordinates = coordinates - offset
         maximum = coordinates.new_tensor(tuple(float(value - 1) for value in self.global_crop_size))
         visible = torch.all((coordinates >= 0.0) & (coordinates <= maximum), dim=1)
         if coordinates.shape[0] and not bool(visible[0]):
@@ -839,16 +688,14 @@ class SSLZarrDataset(Dataset):
                 )
             else:
                 source_crop = self._read_source_crop_3d(d_zarr, vol.usable_bbox)
-            nominal_source = self._extract_nominal_source_region(source_crop)
-            if nominal_source.size > 0 and (np.count_nonzero(nominal_source) / nominal_source.size) >= nonzero_threshold:
+            if source_crop.size > 0 and (np.count_nonzero(source_crop) / source_crop.size) >= nonzero_threshold:
                 break
 
         if self.single_crop_only:
             crop = self._random_resized_crop_3d_from_array(
                 source_crop,
                 self.global_crop_scale,
-                self.global_view_size,
-                reference_size=self.global_crop_size,
+                self.global_crop_size,
             )
             if self.do_augmentations:
                 crop = self.global_transforms[0](image=crop)["image"]
@@ -864,23 +711,21 @@ class SSLZarrDataset(Dataset):
             crop_region = self._sample_random_resized_crop_region(
                 source_crop.shape,
                 self.global_crop_scale,
-                self.paired_global_view_size,
-                reference_size=self.paired_global_crop_size,
+                self.paired_global_crop_size,
                 anchor=(
                     vol.point_coordinates[anchor_index] - np.asarray(source_starts, dtype=np.float64)
                     if anchor_index is not None
                     else None
                 ),
-                anchor_target_size=self.global_view_size if anchor_index is not None else None,
-                anchor_output_size=self.global_crop_size if anchor_index is not None else None,
+                anchor_target_size=self.global_crop_size if anchor_index is not None else None,
             )
-            global_view = self._materialize_crop_from_region(source_crop, crop_region, self.global_view_size)
+            global_view = self._materialize_crop_from_region(source_crop, crop_region, self.global_crop_size)
             gram_teacher_view = None
-            if self.gram_teacher_view_size is not None:
+            if self.gram_teacher_crop_size is not None:
                 gram_teacher_view = self._materialize_crop_from_region(
                     source_crop,
                     crop_region,
-                    self.gram_teacher_view_size,
+                    self.gram_teacher_crop_size,
                 )
             if anchor_index is not None:
                 point_coordinates, point_type_ids = self._visible_points_for_crop(
@@ -923,8 +768,7 @@ class SSLZarrDataset(Dataset):
                 self._random_resized_crop_3d_from_array(
                     source_crop,
                     self.local_crop_scale,
-                    self.local_view_size,
-                    reference_size=self.local_crop_size,
+                    self.local_crop_size,
                 )
                 for _ in range(self.num_local_crops)
             ]
