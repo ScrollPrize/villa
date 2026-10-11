@@ -1,4 +1,29 @@
-# Current: fused pair evaluation
+# Current: split V equality / Z layout prior
+
+- [x] Independent plan review and shared implementation.
+- [x] Removed manufactured target_v from every production consumer/API.
+- [x] Separate weak unary prior, unchanged point/probability normalization.
+- [x] Regression suite:81passed; independent code review approved.
+- No solve rerun requested.
+
+# Previous: remove pairwise wrapped-phase
+
+- [x] Independent plan review; narrow shared-helper edit.
+- [x] Preserved distance phase correction, individual priors and vertical term.
+- [x] Focused regression tests:54passed; docs/log updated.
+- No solve rerun or moment acceleration in this task.
+
+# Previous: four distance objectives
+
+- [x] Independent plan review and CPU tests (44passed).
+- [x] Fused implementations and four matched non-reference configurations.
+- [x] Managed CUDA equivalence validation;49CPU tests passed.
+- [x] Four parallel runs on GPUs0–3,16130random minibatch updates each; all exits0.
+- [x] Full histories and final comparison: uv_distance_objectives_results.md.
+- No large global recovery; Huber gives a modest retention/error improvement.
+  No default changed; final sign error is higher than baseline for all variants.
+
+# Previous: fused pair evaluation
 
 - [x] Plan and independent implementation review.
 - [x] Shared-objective compilation; unchanged 4096 minibatch updates.

@@ -2,6 +2,21 @@
 
 ## 2026-10-11
 
+- Corrected V constraints to equality; removed invented CT-Z endpoint displacement
+  target from cache producer and all consumers. Factored weak per-fiber V≈Z prior
+  into shared independently weighted helper, no local Z monotonicity condition.
+  Historical runs were not rerun with this changed objective.
+
+- Removed redundant pairwise wrapped-phase cost from all UV distance objectives;
+  winding-distance phase correction, individual priors and vertical alignment
+  remain unchanged. Squared selected by user as working candidate. Earlier
+  four-way results predate this objective change; no new solve implied.
+
+- Added opt-in expected squared/Huber and hybrid global-distance objectives,
+  preserving sign and broken-probability losses. Four matched fused random-batch
+  runs with non-reference initialization on GPUs0–3;49tests and real GPU gradient
+  equivalence checks passed. See uv_distance_objectives_results.md.
+
 - Added opt-in fused shared winding-pair objective/backward; real H100 benchmarks
   show2.38× pair and1.82× minibatch-update speedup, with lower intermediate memory.
   Preserved batch size, FP32 and optimizer schedule. Numerical trajectory caveats

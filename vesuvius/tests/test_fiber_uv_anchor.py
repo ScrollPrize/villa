@@ -91,7 +91,7 @@ def test_likelihood_matches_direct_and_continuation_translation():
 def test_separate_sign_penalty_cannot_hide_in_compatible_pair():
     p=torch.tensor([[.5,.5]]);qa=torch.tensor([[0.,1.]]);qb=torch.tensor([[0.,1.]])
     z=torch.zeros_like(qa);zero=torch.zeros(1);table=torch.tensor(make_distance_table(1,.5))
-    args=(p,p,qa,qb,z,z,zero,zero,zero+1,zero,zero,table)
+    args=(p,p,qa,qb,z,z,zero,zero,zero+1,zero,table)
     weak=pair_objective(*args,{'layout_mode':'shared_anchor','sign_weight':0})
     strong=pair_objective(*args,{'layout_mode':'shared_anchor','sign_weight':10})
     torch.testing.assert_close(strong-weak,torch.tensor(10.))

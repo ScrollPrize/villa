@@ -243,7 +243,7 @@ def solve(config):
     torch.set_num_threads(4);torch.use_deterministic_algorithms(True)
     t=torch.tensor(state,device='cuda');w=torch.tensor(widths,device='cuda',dtype=torch.float64)
     keys=('family','phase','z','degree','node_ds','node_phase','node_z','i','j','ds_a','ds_b',
-          'phase_a','phase_b','phase_delta','target_v','distance','sign','links')
+          'phase_a','phase_b','phase_delta','distance','sign','links')
     data={key:torch.as_tensor(d[key],device='cuda',dtype=torch.long if key in ('family','i','j') else torch.float64) for key in keys}
     table=torch.tensor(uv.make_distance_table(float(d['distance'].max()),cfg.get('distance_sigma',.5)),device='cuda')
     with torch.no_grad():

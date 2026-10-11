@@ -49,9 +49,9 @@ def refit_disabled(d, state, widths, cfg, batch=4096):
                     qb=qb.gather(1,chosen[j,None]); vb=vb.gather(1,chosen[j,None]); owner=i
                 else:
                     qa=qa.gather(1,chosen[i,None]); va=va.gather(1,chosen[i,None]); owner=j
-                args=[torch.as_tensor(d[key][ix]) for key in ('phase_delta','sign','distance','target_v')]
+                args=[torch.as_tensor(d[key][ix]) for key in ('phase_delta','sign','distance')]
                 cost,order,_,_=uv.pair_cost_components(qa,qb,va,vb,args[0],fields['family'][j]-fields['family'][i],
-                    args[1],args[2],args[3],table,cfg)
+                    args[1],args[2],table,cfg)
                 charge=uv.calibrated_sign_charge(degree[i],degree[j],mean_degree,max(e,1),n,
                     cfg.get('rejection_cost',10.),cfg.get('sign_charge_multiplier',4.))
                 cost=(cost+charge[:,None,None]*(order<0)).squeeze(2 if side==0 else 1)*scale

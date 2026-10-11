@@ -52,7 +52,7 @@ def conditional_costs(state,widths,data,table,config,with_energy=False):
         _,va,qa=coords(i,data['ds_a'][sl]);_,vb,qb=coords(j,data['ds_b'][sl])
         cost,ordered,_,_=uv.pair_cost_components(qa,qb,va,vb,data['phase_delta'][sl],
             data['family'][j]-data['family'][i],data['sign'][sl],data['distance'][sl],
-            data['target_v'][sl],table,config)
+            table,config)
         charge=uv.calibrated_sign_charge(degree[i],degree[j],mean_degree,e,n,
             config.get('rejection_cost',10.),config.get('sign_charge_multiplier',4.))
         cost=cost+charge[:,None,None]*(ordered<0)
@@ -74,9 +74,10 @@ def conditional_costs(state,widths,data,table,config,with_energy=False):
         for point in range(3):
             _,v,q=coords(ids,data['node_ds'][ids,point])
             angle=q-data['node_phase'][ids,point,None];angle-=angle.round()
-            prior=angle.square()+((v-data['node_z'][ids,point,None])/1000).square()
+            prior=angle.square()
             prior+=torch.relu(-q).square()+torch.relu(q-k).square()
-            unary=(config.get('prior_weight',.01)*prior/3).float()
+            unary=((config.get('prior_weight',.01)*prior+
+                    uv.vertical_layout_prior(v,data['node_z'][ids,point,None],config))/3).float()
             costs[ids,:k]+=unary
             energy+=(unary*probs[ids,:k]).sum()/n
     return (costs,energy) if with_energy else costs
@@ -96,7 +97,7 @@ def solve_categorical(config):
     if (root/'summary.json').exists():raise FileExistsError('Completed categorical output exists')
     tensor=torch.tensor(state,device='cuda');w=torch.tensor(widths,device='cuda',dtype=torch.float64)
     keys=('family','phase','z','degree','node_ds','node_phase','node_z','i','j','ds_a','ds_b',
-          'phase_a','phase_b','phase_delta','target_v','distance','sign','links')
+          'phase_a','phase_b','phase_delta','distance','sign','links')
     data={key:torch.as_tensor(d[key],device='cuda',dtype=torch.long if key in ('family','i','j') else torch.float64) for key in keys}
     table=torch.tensor(uv.make_distance_table(float(d['distance'].max()),config.get('distance_sigma',.5)),device='cuda')
     baseline=uv.audit(d,state,widths,config);history=[];started=time.monotonic()

@@ -65,12 +65,12 @@ def test_pair_expectation_matches_enumeration_and_gradients():
     qa=torch.tensor([[.1,1.1]],dtype=dtype,requires_grad=True);qb=torch.tensor([[.12,1.12]],dtype=dtype,requires_grad=True)
     z=torch.zeros((1,2),dtype=dtype);zero=torch.zeros(1,dtype=dtype)
     def fun(a,b):return pair_objective(pa,pb,a,b,z,z,zero,torch.ones_like(zero),torch.ones_like(zero),
-                                     zero+.5,zero,table,{})
+                                     zero+.5,table,{})
     total=0
     for i in range(2):
         for j in range(2):
             total+=pair_objective(pa[:,i:i+1],pb[:,j:j+1],qa[:,i:i+1],qb[:,j:j+1],z[:,:1],z[:,:1],
-                zero,zero+1,zero+1,zero+.5,zero,table,{})
+                zero,zero+1,zero+1,zero+.5,table,{})
     torch.testing.assert_close(fun(qa,qb),total)
     assert torch.autograd.gradcheck(fun,(qa,qb),atol=1e-5)
 
@@ -90,10 +90,10 @@ def test_continuation_moments_and_seam_identity():
 
 def test_coherent_and_inconsistent_sign_cost():
     table=torch.tensor(make_distance_table(1,.5));p=torch.ones(1,1);z=torch.zeros(1,1);zero=torch.zeros(1)
-    def loss(q):return pair_objective(p,p,z,q,z,z,zero,zero+1,zero+1,zero+.5,zero,table,{})
+    def loss(q):return pair_objective(p,p,z,q,z,z,zero,zero+1,zero+1,zero+.5,table,{})
     assert loss(z)<loss(z-1)
     # Rejected endpoint has no attached pair cost.
-    assert pair_objective(p*0,p,z,z-1,z,z,zero,zero+1,zero+1,zero+.5,zero,table,{})==0
+    assert pair_objective(p*0,p,z,z-1,z,z,zero,zero+1,zero+1,zero+.5,table,{})==0
 
 
 def test_continuation_large_translation():
@@ -112,7 +112,7 @@ def test_all_initial_hypotheses_reachable():
 
 def test_signed_boundary_no_reflection_swap_and_negative_gradient():
     table=torch.tensor(make_distance_table(3,.5));p=torch.ones(1,1);zero=torch.zeros(1);z=zero[:,None]
-    def loss(a,b,sgn):return pair_objective(p,p,a,b,z,z,zero,zero,zero+sgn,zero+2,zero,table,{})
+    def loss(a,b,sgn):return pair_objective(p,p,a,b,z,z,zero,zero,zero+sgn,zero+2,table,{})
     a=z.clone();b=torch.tensor([[-2.]],requires_grad=True)
     value=loss(a,b,1);value.backward()
     assert b.grad.item()<0

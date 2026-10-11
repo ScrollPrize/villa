@@ -42,13 +42,13 @@ def test_exact_outer_boundary_nonzero_origin():
 def constraint_fixture():
     n=4;state=np.zeros((n,9))
     state[:,:3]=[[0,0,8],[8,0,0],[0,0,8],[0,0,8]]
-    d={key:np.zeros(2) for key in ('ds_a','ds_b','phase_a','phase_b','phase_delta','target_v','distance','sign')}
+    d={key:np.zeros(2) for key in ('ds_a','ds_b','phase_a','phase_b','phase_delta','distance','sign')}
     d.update(i=np.array([0,1]),j=np.array([1,2]),family=np.array([0,1,0,0]),
         phase=np.array([.1,.2,.3,.4]),z=np.zeros(n),degree=np.array([1.,2.,1.,0.]),
         node_ds=np.zeros((n,3)),node_phase=np.zeros((n,3)),node_z=np.zeros((n,3)),
         links=np.array([[0.,1.,1.,2.]]))
     d['sign'][:]=1;d['distance'][:]=.5
-    return d,state,np.array([200.,300.]),dict(layout_mode='shared_anchor',prior_weight=0.,batch_size=1)
+    return d,state,np.array([200.,300.]),dict(layout_mode='shared_anchor',prior_weight=0.,v_prior_weight=0.,batch_size=1)
 
 
 def test_conditional_refit_vs_full_cost_oracle():

@@ -1,5 +1,14 @@
 # Saved U/V solution visualization
 
+Current: uv_vertical_split_plan.md. V equality at constraints, separate weak
+individual V≈Z prior allowing local physical-Z reversal.
+
+Current: uv_remove_pair_phase_plan.md. Remove only redundant pairwise wrapped
+phase; keep individual phase priors and vertical alignment. Squared working choice.
+
+Current: uv_distance_objectives_plan.md. Four fused random-minibatch joint runs
+from non-reference initialization on GPUs0–3, compared to reference diagnostics.
+
 Current: uv_pair_fusion_plan.md. Fused loss/backward, unchanged4096 minibatches
 and all hypotheses; measure equivalence, profiling, memory and update speed.
 

@@ -53,7 +53,7 @@ def test_full_conditional_energy_derivative_with_priors_and_links():
     state=torch.zeros(3,9);state[:,:3]=torch.tensor([[1.,2.,-1.],[2.,1.,-.5],[.2,.1,-1.]])
     widths=torch.tensor([200.,300.],dtype=torch.double)
     data={key:torch.zeros(2,dtype=torch.double) for key in
-          ('ds_a','ds_b','phase_a','phase_b','phase_delta','target_v','distance','sign')}
+          ('ds_a','ds_b','phase_a','phase_b','phase_delta','distance','sign')}
     data.update(i=torch.tensor([0,1]),j=torch.tensor([1,2]),family=torch.tensor([0,1,0]),
                 phase=torch.tensor([.1,.2,.3],dtype=torch.double),z=torch.zeros(3,dtype=torch.double),
                 degree=torch.tensor([1.,2.,1.],dtype=torch.double),

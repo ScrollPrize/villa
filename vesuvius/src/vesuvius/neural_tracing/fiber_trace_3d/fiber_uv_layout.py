@@ -5,6 +5,7 @@ immutable. All winding hypotheses participate; constraint points have no state.
 """
 import argparse
 import json
+import math
 from pathlib import Path
 import sqlite3
 import time
@@ -198,8 +199,6 @@ def prepare(config):
     p=np.asarray(pieces);nodes=np.asarray(nodes);i,j=owner.reshape(2,-1)
     ds_a,ds_b=offset.reshape(2,-1);phi_a,phi_b=phase.reshape(2,-1)
     phase_delta=(phi_b-phi_a+.5)%1-.5
-    # V metric target uses actual native axial displacement; cylinder is a weak prior.
-    target_v=events[:,10]-events[:,7]
     degree=np.bincount(owner,minlength=len(p)).astype(np.float32)
     lengths=p[:,3]-p[:,2];r=p[:,8]
     # Geometric initialization only; no winding labels/radii are hard evidence.
@@ -210,7 +209,7 @@ def prepare(config):
         start=p[:,2],end=p[:,3],family=p[:,4].astype(np.int64),phase=p[:,6]%1,z=p[:,7],radius=r,
         lengths=lengths,degree=degree,initial_k=initial_k.astype(np.float32),width_initial=width_initial.astype(np.float32),
         i=i,j=j,ds_a=ds_a,ds_b=ds_b,phase_a=phi_a,phase_b=phi_b,phase_delta=phase_delta,
-        target_v=target_v.astype(np.float32),distance=events[:,12].astype(np.float32),sign=events[:,13].astype(np.float32),
+        distance=events[:,12].astype(np.float32),sign=events[:,13].astype(np.float32),
         parallel=events[:,11].astype(bool),event_ids=events[:,0].astype(np.int64),
         links=np.asarray(links,dtype=np.float64).reshape(-1,4),node_ds=nodes[:,0].astype(np.float32),
         node_phase=nodes[:,1].astype(np.float32),node_z=nodes[:,2].astype(np.float32))
@@ -351,31 +350,75 @@ def fixed_sign_terms(pa,pb,ordered,charge,selected_ordered=None):
     return charge*torch.maximum(expected,selected)
 
 
-def pair_cost_components(qa,qb,va,vb,phase_delta,family_delta,sign,mu,target_v,table,config):
-    """Shared K*K geometric costs, independent of assignment probabilities."""
+def vertical_layout_prior(v,z,config):
+    """Weak unary layout calibration, not a pairwise displacement measurement.
+
+    Returns per-hypothesis costs; callers apply retention probabilities and
+    uniform piece/point averaging. No slope or monotonicity condition.
+    """
+    scale=float(config.get('v_prior_scale',1000.))
+    weight=float(config.get('v_prior_weight',.01))
+    if not math.isfinite(scale) or scale<=0 or not math.isfinite(weight) or weight<0:
+        raise ValueError('Invalid vertical layout prior scale/weight')
+    return weight*((v-z)/scale).square()
+
+
+def pair_geometry(qa,qb,va,vb,phase_delta,family_delta,sign,config):
+    """Shared pair geometry; used by likelihood and expected-distance objectives."""
     import torch
     delta=qb[:,None,:]-qa[:,:,None]-phase_delta[:,None,None]+.5*family_delta[:,None,None]
     # Finite optimization surrogate for truncated support: never reflect a known
     # wrong sign into a good distance. Boundary cost + uncapped corrective hinge.
     ordered=sign[:,None,None]*delta
     wrong=torch.relu(-ordered)*4
+    # Angular anchoring is an individual prior, not another pairwise penalty.
+    # Keep observed phase_delta above: it corrects the winding separation.
+    vertical=((vb[:,None,:]-va[:,:,None])/config.get('metric_scale',128.)).square().clamp(max=100.)
+    metric=config.get('metric_weight',.01)*vertical
+    return delta,ordered,wrong,metric
+
+
+def pair_cost_components(qa,qb,va,vb,phase_delta,family_delta,sign,mu,table,config):
+    """Shared K*K geometric costs, independent of assignment probabilities."""
+    import torch
+    delta,ordered,wrong,metric=pair_geometry(qa,qb,va,vb,phase_delta,family_delta,sign,config)
     distance=torch.where((sign!=0)[:,None,None],ordered.clamp_min(0),delta.abs())
     soft=table_cost(distance,mu,table)
-    # Local tangential displacement is accounted by observed angle difference.
-    phase_error=delta-.5*family_delta[:,None,None]
-    phase_error=phase_error-phase_error.detach().round()
-    vertical=((vb[:,None,:]-va[:,:,None]-target_v[:,None,None])/config.get('metric_scale',128.)).square().clamp(max=100.)
-    cost=config.get('sign_weight',10.)*wrong+config.get('distance_weight',1.)*soft
-    cost=cost+config.get('metric_weight',.01)*(phase_error.square()+vertical)
-    soft_cost=config.get('distance_weight',1.)*soft+config.get('metric_weight',.01)*(phase_error.square()+vertical)
+    soft_cost=config.get('distance_weight',1.)*soft+metric
+    cost=config.get('sign_weight',10.)*wrong+soft_cost
     return cost,ordered,soft_cost,wrong
 
 
-def pair_objective(pa,pb,qa,qb,va,vb,phase_delta,family_delta,sign,mu,target_v,table,config,
+def pair_objective(pa,pb,qa,qb,va,vb,phase_delta,family_delta,sign,mu,table,config,
                    charge=None,event_weights=None,selected_ordered=None):
     """Legacy posterior objective, optionally with selected-sign safeguard."""
+    import torch
+    mode=config.get('distance_objective','likelihood')
+    if mode not in ('likelihood','squared','huber','huber_likelihood'):
+        raise ValueError('Invalid distance_objective')
+    if mode!='likelihood':
+        if not anchored(config) or config.get('pair_mode','likelihood')!='likelihood':
+            raise ValueError('Distance alternatives require shared-anchor likelihood layout')
+        sigma=float(config.get('distance_sigma',.5))
+        if not math.isfinite(sigma) or sigma<=0:raise ValueError('distance_sigma must be finite and positive')
+        delta,ordered,wrong,metric=pair_geometry(qa,qb,va,vb,phase_delta,family_delta,sign,config)
+        distance=torch.where((sign!=0)[:,None,None],ordered,delta.abs())
+        residual=(distance-mu[:,None,None])/sigma
+        penalty=(.5*residual.square() if mode=='squared' else
+                 torch.where(residual.abs()<=1,.5*residual.square(),residual.abs()-.5))
+        mass=pa[:,:,None]*pb[:,None,:]
+        terms=(mass*(config.get('distance_weight',1.)*penalty+
+                     config.get('sign_weight',10.)*wrong)).sum((1,2))
+        if mode=='huber_likelihood':
+            soft=table_cost(torch.where((sign!=0)[:,None,None],ordered.clamp_min(0),delta.abs()),mu,table)
+            terms=terms+compatibility_terms(pa,pb,config.get('distance_weight',1.)*soft+metric,
+                                            config.get('temperature',1.))
+        else:terms=terms+(mass*metric).sum((1,2))
+        if charge is not None:terms=terms+fixed_sign_terms(pa,pb,ordered,charge,selected_ordered)
+        if event_weights is not None:terms=terms*event_weights
+        return terms.mean()
     cost,ordered,soft_cost,wrong=pair_cost_components(qa,qb,va,vb,phase_delta,family_delta,
-                                                   sign,mu,target_v,table,config)
+                                                   sign,mu,table,config)
     mass=pa[:,:,None]*pb[:,None,:]
     if anchored(config) and config.get('pair_mode','likelihood')=='likelihood':
         # Likelihood only soft evidence; expected sign cost cannot hide behind
@@ -457,7 +500,7 @@ def continuation_cost(pa,pb,ua,ub,va,vb,scale):
 def _tensor_data(d,device):
     import torch
     keys=['family','phase','z','degree','node_ds','node_phase','node_z','i','j','ds_a','ds_b',
-          'phase_a','phase_b','phase_delta','target_v','distance','sign','parallel','links']
+          'phase_a','phase_b','phase_delta','distance','sign','parallel','links']
     return {k:torch.as_tensor(d[k],device=device,dtype=(torch.long if k in ('family','i','j') else torch.float32)) for k in keys}
 
 
@@ -797,6 +840,11 @@ def solve(config):
                                           'mean online objective across pass updates, not frozen-state global objective'))
                 if benchmark_updates is not None:record['loss_scope']='mean online objective across short benchmark updates'
                 pass_losses.zero_()
+            elif step:
+                means=(pass_losses/(step%every or every)).cpu().tolist()
+                record.update(loss=means[0],pair_loss=means[1],regularization=means[2],
+                              loss_scope='mean online objective since previous diagnostic; sampled minibatch updates')
+                pass_losses.zero_()
             history.append(record);atomic_write(root/'history.json',history,durable=False)
             print('UV '+json.dumps(record),flush=True)
             if step==steps or (feasible_check and metrics['sign_feasible']):break
@@ -824,7 +872,7 @@ def solve(config):
                 data['family'][i],data['family'][j],precise['ds_a'][edges],precise['ds_b'][edges],widths,
                 precise['phase_delta'][edges],data['sign'][edges])
         pair=evaluate_pair(pa[:,:k],pb[:,:k],qa,qb,va,vb,data['phase_delta'][edges],data['family'][j]-data['family'][i],
-            data['sign'][edges],data['distance'][edges],data['target_v'][edges],table,config,charge,event_weights,selected)
+            data['sign'][edges],data['distance'][edges],table,config,charge,event_weights,selected)
         for pp,qq,phase_key in ((pa,qa,'phase_a'),(pb,qb,'phase_b')):
             angle=qq-data[phase_key][edges,None];angle=angle-angle.detach().round()
             pair=pair+config.get('prior_weight',.01)*.5*(event_weights*(pp[:,:k]*angle.square()).sum(-1)).mean()
@@ -840,9 +888,10 @@ def solve(config):
         for point in range(3):
             nu,nv,nq=coordinates(ns,data['phase'][ni],data['z'][ni],data['family'][ni],data['node_ds'][ni,point],widths,bounds)
             angle=nq-data['node_phase'][ni,point,None];angle=angle-angle.detach().round()
-            prior=angle.square()+((nv-data['node_z'][ni,point,None])/1000).square()
+            prior=angle.square()
             prior=prior+torch.relu(-nq).square()+torch.relu(nq-k).square()
-            reg=reg+config.get('prior_weight',.01)*(npb[:,:k]*prior).sum(-1).mean()/3
+            unary=config.get('prior_weight',.01)*prior+vertical_layout_prior(nv,data['node_z'][ni,point,None],config)
+            reg=reg+(npb[:,:k]*unary).sum(-1).mean()/3
         if full_pass:
             # Balanced partitions can differ by one item; preserve full-objective weights.
             pair=pair*(len(edges)*updates/len(d['i']))
@@ -858,7 +907,7 @@ def solve(config):
             reg=reg+config.get('continuation_weight',10.)*link_normalization*continuation(
                 ca[:,:k],cb[:,:k],cu,du,cv,dv,config.get('continuation_scale',128.) if anchored(config) else initial_width.mean())
         loss=pair+reg
-        if full_pass:pass_losses+=torch.stack((loss.detach(),pair.detach(),reg.detach()))
+        pass_losses+=torch.stack((loss.detach(),pair.detach(),reg.detach()))
         opt.zero_grad(set_to_none=True);widthopt.zero_grad(set_to_none=True)
         (loss/updates if accumulated else loss).backward()
         # Broken is an ordinary jointly optimized category from the first update.

@@ -15,10 +15,11 @@ def benchmark(config):
     if (root/'benchmark.json').exists():raise FileExistsError('Completed benchmark exists')
     with np.load(config['tensor_cache']) as src:d={k:src[k] for k in src.files}
     table=torch.as_tensor(uv.make_distance_table(float(d['distance'].max()),config.get('distance_sigma',.5)),device='cuda')
-    eager=uv.pair_evaluator(dict(config,pair_backend='eager'))
-    compiled=uv.pair_evaluator(dict(config,pair_backend='compiled'))
     result=dict(config=config,torch_version=torch.__version__,gpu=torch.cuda.get_device_name(),cases=[])
     for case in config.get('benchmark_states',[{'label':'initial'}]):
+        case_config=dict(config,**case.get('options',{}))
+        eager=uv.pair_evaluator(dict(case_config,pair_backend='eager'))
+        compiled=uv.pair_evaluator(dict(case_config,pair_backend='compiled'))
         if case.get('path'):
             with np.load(case['path']) as src:state=src['state'];widths=src['widths']
         else:state,widths=uv.fresh_initial_state(d,config)
@@ -34,13 +35,13 @@ def benchmark(config):
         pa,qa,va=endpoint('i','ds_a');pb,qb,vb=endpoint('j','ds_b')
         inputs=[pa,pb,qa,qb,va,vb]
         fixed=[tensor(d['phase_delta'][edges]),tensor(d['family'][d['j'][edges]]-d['family'][d['i'][edges]],torch.long),
-            tensor(d['sign'][edges]),tensor(d['distance'][edges]),tensor(d['target_v'][edges]),table,config]
+            tensor(d['sign'][edges]),tensor(d['distance'][edges]),table,case_config]
         if case.get('boundaries'):
             with torch.no_grad():
                 qa.copy_(torch.arange(k,device='cuda')[None,:]);qb.copy_(qa)
                 va.zero_();vb.fill_(1280.)
                 fixed[0].zero_();fixed[1].zero_();fixed[2].copy_(tensor(np.resize([-1,0,1],count)))
-                fixed[3].fill_(.5);fixed[4].zero_()
+                fixed[3].fill_(.5)
                 # Exact zero/half-turn/bin boundaries and >104 lookup extrapolation.
                 qb[::2].add_(.5)
         def call(fn):

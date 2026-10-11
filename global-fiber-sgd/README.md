@@ -1,5 +1,18 @@
 # Global fiber assignment with PyTorch SGD
 
+V constraints now enforce equal V at their base points, with no CT-Z displacement
+target. Global V≈Z calibration is a separate weak per-piece prior, independently
+configured by v_prior_weight (.01) / v_prior_scale (1000base voxels). It samples
+start/middle/end without a Z monotonicity requirement. See uv_vertical_split_plan.md.
+
+Current working candidate: squared distance, selected by user. Redundant pairwise
+wrapped-phase penalty removed; individual angular priors and vertical alignment
+retained. Earlier four-way benchmark predates removal; no rerun yet.
+
+Current experiment: [four global distance objectives](uv_distance_objectives_results.md),
+fresh radial initialization, fused random-minibatch updates, reference diagnostics
+only. Likelihood baseline versus expected squared, Huber and Huber+likelihood.
+
 Current performance task: [fused pair evaluation results and commands](uv_pair_fusion_results.md).
 Opt-in compiled backend: 2.38× pair loss/backward, 1.82× production minibatch
 updates, unchanged batch size. FP32 rounding changes optimizer trajectories;
