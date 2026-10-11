@@ -125,14 +125,18 @@ def get_principal_components(mesh: mm.Mesh) -> np.ndarray:
 def rotate_about_2nd_principal(mesh: mm.Mesh, rotation_rad: float) -> mm.Mesh:
     """Rotate about second principal.
 
-    Rotate mesh so that 2nd principal component is rotation_rad radians from the
-    second (wide) principal component.
+    Rotate the mesh about the cylinder (Z) axis so that the wide direction of its
+    cross-section, the principal component of the vertices projected onto the XY
+    plane, lies along X (the split between the case halves), then by a further
+    rotation_rad.
     """
-    principal_components = get_principal_components(mesh)
+    vertices_xy = mn.getNumpyVerts(mesh)[:, :2]
+    eigenvalues, eigenvectors = np.linalg.eigh(np.cov(vertices_xy, rowvar=False))
+    wide = eigenvectors[:, np.argmax(eigenvalues)]
     rotated_mesh = _copy_meshlib(mesh)
 
-    p2 = [*principal_components[1][:2], 0]
-    first_rot = np.arccos(np.dot(p2, [1, 0, 0]))
+    # affine_rotation(a) rotates by -a, so this takes the wide direction onto X.
+    first_rot = np.arctan2(wide[1], wide[0])
     rotated_mesh.transform(affine_rotation(first_rot + rotation_rad))
     return rotated_mesh
 
@@ -154,6 +158,9 @@ class ScrollMesh:
         smoothing_callback: Smoothing callback that accepts a mesh and returns a mesh
         smoothing_unite_with_original: Unite with the original after smoothing to ensure
         mesh does not get smaller.
+        cylinder_axis: Cylinder axis direction in input mesh coordinates, e.g. along
+        the umbilicus. Defaults to None, which fits the axis giving the smallest
+        enclosing cylinder.
 
     """
 
@@ -170,6 +177,7 @@ class ScrollMesh:
     smoothing_callback: Optional[Callable[[mm.Mesh], mm.Mesh]] = None
     smoothing_unite_with_original: bool = True
     vertical_offset: Optional[float] = None
+    cylinder_axis: Optional[tuple[float, float, float]] = None
 
 
 def assert_one_component(mesh: mm.Mesh):
@@ -246,7 +254,10 @@ def build_lining(
     logger.info("Aligning mesh")
     points = np.array([(point.x, point.y, point.z) for point in mesh_scroll.points])
     rotation_mat, translation_mat, radius, height = alignment.fit_cylinder(
-        points, mesh_params.cylinder_axis_tol, _debug=_debug
+        points,
+        mesh_params.cylinder_axis_tol,
+        _debug=_debug,
+        axis=mesh_params.cylinder_axis,
     )
 
     A = mm.Matrix3f(*[mm.Vector3f(*d) for d in rotation_mat])
