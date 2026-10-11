@@ -11,6 +11,9 @@
 #include <cmath>
 #include <unordered_map>
 #include <limits>
+#include <fstream>
+#include <array>
+#include <bit>
 
 namespace {
 using Json = nlohmann::json;
@@ -149,7 +152,8 @@ nlohmann::json orientFiberConstraintDatabase(
     const std::vector<int64_t>& sourceIds,
     const std::vector<vc::fiber_tracer::FiberletCropTraceLine>& lines,
     const vc::lasagna::LasagnaNormalSampler& normals, int threads,
-    double sampleSpacing, const Json& provenance, const vc::core::util::Umbilicus* priorUmbilicus)
+    double sampleSpacing, const Json& provenance, const vc::core::util::Umbilicus* priorUmbilicus,
+    bool exportNormalCurves)
 {
     using namespace vc::fiber_tracer;
     using Clock=std::chrono::steady_clock;
@@ -183,9 +187,9 @@ nlohmann::json orientFiberConstraintDatabase(
         if(sqlite3_step(s.get())!=SQLITE_ROW)throw std::runtime_error("Missing source metadata");
         return Json::parse(reinterpret_cast<const char*>(sqlite3_column_text(s.get(),0)));
     };
-    if(metaValue("format")!="fiber-constraints" || metaValue("schema_version")!=(priorUmbilicus?2:1) || metaValue("complete")!=true)
+    if(metaValue("format")!="fiber-constraints" || metaValue("schema_version")!=((priorUmbilicus || exportNormalCurves)?2:1) || metaValue("complete")!=true)
         throw std::runtime_error("Orientation requires schema1; prior extraction requires oriented schema2");
-    if(priorUmbilicus && metaValue("normal_orientation").at("sample_spacing_base")!=sampleSpacing)
+    if((priorUmbilicus || exportNormalCurves) && metaValue("normal_orientation").at("sample_spacing_base")!=sampleSpacing)
         throw std::runtime_error("Prior sweep spacing must match baked orientation");
     const auto original=metaValue("provenance");
     for(const char* key:{"afv_uuid","normal_manifest","normal_provenance"})
@@ -231,6 +235,16 @@ nlohmann::json orientFiberConstraintDatabase(
     size_t samplesTotal=0,flips=0,endpointFlips=0,invalid=0,invalidEndpoints=0,invalidFibers=0;
     double sampleSeconds=0.;
     const auto sweepStarted=Clock::now();
+    std::ofstream curveStream;
+    Json curveIndex=Json::array();size_t curveSamples=0;
+    if(exportNormalCurves) {
+        if(priorUmbilicus)throw std::invalid_argument("Choose curve export OR outward priors");
+        // Portable explicit little-endian float64 payload, regular arc + normal
+        // + validity. Geometry remains in the original AFV, not this cache.
+        std::filesystem::create_directories(partial);
+        curveStream.open(partial/"normals.bin",std::ios::binary);
+        if(!curveStream)throw std::runtime_error("Cannot create normal curve payload");
+    }
     for(size_t begin=0;begin<lines.size();begin+=256) {
         struct Sample { double arc; cv::Vec3d point; size_t slot; double weight=0.; };
         const size_t end=std::min(begin+256,lines.size()), regular=std::numeric_limits<size_t>::max();
@@ -259,6 +273,7 @@ nlohmann::json orientFiberConstraintDatabase(
         if(sampled.size()!=ordered.size())throw std::runtime_error("Normal batch size differs");
         for(size_t f=0;f+1<offsets.size();++f) {
             FiberNormalOrientationSweep sweep;size_t good=0;
+            const auto firstSample=curveSamples;
             for(size_t j=offsets[f];j<offsets[f+1];++j) {
                 auto n=sampled[j].sample.normal;const bool ok=sampled[j].sample.valid;
                 if(ok && (!std::isfinite(n.dot(n)) || std::abs(n.dot(n)-1.)>1e-6))
@@ -278,7 +293,17 @@ nlohmann::json orientFiberConstraintDatabase(
                     const auto slot=ordered[j].slot;baked[slot]=n;valid[slot]=ok;
                     endpointFlips+=flipped;invalidEndpoints+=!ok;
                 }
+                else if(exportNormalCurves) {
+                    std::array<double,5> record{ordered[j].arc,n[0],n[1],n[2],ok?1.:0.};
+                    for(double value:record) {
+                        auto bytes=std::bit_cast<std::array<char,8>>(value);
+                        if constexpr(std::endian::native!=std::endian::little)std::reverse(bytes.begin(),bytes.end());
+                        curveStream.write(bytes.data(),bytes.size());
+                    }
+                    ++curveSamples;
+                }
             }
+            if(exportNormalCurves)curveIndex.push_back({sourceIds[begin+f],firstSample,curveSamples-firstSample});
             invalidFibers+=good==0;
         }
         samplesTotal+=ordered.size();
@@ -286,7 +311,7 @@ nlohmann::json orientFiberConstraintDatabase(
             <<" samples="<<samplesTotal<<" seconds="<<std::chrono::duration<double>(Clock::now()-sweepStarted).count()<<std::endl;
     }
     const double sweepSeconds=std::chrono::duration<double>(Clock::now()-sweepStarted).count();
-    if(priorUmbilicus) {
+    if(priorUmbilicus || exportNormalCurves) {
         // Verify the gauge against ALL stored endpoint normals before exporting priors.
         query=prepare(src.get(),"SELECT normal_a,normal_b FROM constraints ORDER BY id");
         size_t count=0;
@@ -303,6 +328,19 @@ nlohmann::json orientFiberConstraintDatabase(
             ++count;
         }
         check(src.get(),rc);if(count!=events)throw std::runtime_error("Prior endpoint count mismatch");
+        if(exportNormalCurves) {
+            curveStream.close();if(!curveStream)throw std::runtime_error("Normal curve write failed");
+            Json stats={{"fibers",fiberCount},{"checked_endpoints",2*events},{"samples",curveSamples},
+                {"invalid_samples",invalid},{"sample_spacing_base",sampleSpacing},
+                {"sampling_seconds",sampleSeconds},{"sweep_seconds",sweepSeconds},
+                {"total_seconds",std::chrono::duration<double>(Clock::now()-started).count()}};
+            Json doc={{"format","fiber-normal-curves"},{"version",1},{"dtype","<f8"},
+                {"columns",{"arc","nx","ny","nz","valid"}},
+                {"index",curveIndex},{"statistics",stats},{"provenance",provenance},
+                {"normal_convention","fiber-local baked gauge; apply stage1 normal_sign"}};
+            vc::core::util::ephemeralWriteString(partial/"index.json",doc.dump()+"\n");
+            std::filesystem::rename(partial,output);return stats;
+        }
         std::vector<double> agreement(lines.size());
         for(size_t i=0;i<lines.size();++i)agreement[i]=priorWeight[i]>0?priorSum[i]/priorWeight[i]:0.;
         Json stats={{"fibers",fiberCount},{"checked_endpoints",2*events},{"sample_spacing_base",sampleSpacing},

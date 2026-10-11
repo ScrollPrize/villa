@@ -205,9 +205,10 @@ int runFiberAfvConstraintBenchmark(int argc, char** argv)
             umbilicus=loadAxis();
         }
         result["orientation"]=orientFiberConstraintDatabase(
-            cfg.at("orient_database").get<std::string>(),cfg.at(umbilicus?"normal_prior_output":"database").get<std::string>(),
+            cfg.at("orient_database").get<std::string>(),cfg.at(cfg.contains("normal_curves_output")?"normal_curves_output":(umbilicus?"normal_prior_output":"database")).get<std::string>(),
             std::vector<int64_t>(ids.begin(),ids.end()),lines,normals,threads,
-            cfg.value("normal_sample_spacing",spacing),result,umbilicus?&*umbilicus:nullptr);
+            cfg.value("normal_sample_spacing",spacing),result,umbilicus?&*umbilicus:nullptr,
+            cfg.contains("normal_curves_output"));
         result["wall_seconds"]=seconds(started);
         vc::core::util::ephemeralWriteString(output,result.dump(2)+"\n");
         std::cout<<"orientation complete "<<result["orientation"].dump()<<std::endl;

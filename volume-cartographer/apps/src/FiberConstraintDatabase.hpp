@@ -21,4 +21,5 @@ nlohmann::json orientFiberConstraintDatabase(
     const std::vector<vc::fiber_tracer::FiberletCropTraceLine>& lines,
     const vc::lasagna::LasagnaNormalSampler& normals, int threads,
     double sampleSpacing, const nlohmann::json& provenance,
-    const vc::core::util::Umbilicus* priorUmbilicus = nullptr);
+    const vc::core::util::Umbilicus* priorUmbilicus = nullptr,
+    bool exportNormalCurves = false);
