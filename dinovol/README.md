@@ -40,7 +40,8 @@ To select the new defaults, set `model.model_type` to `v3`:
 is a standalone base-pretraining config with 128³ global crops, 64³ local crops,
 and `volume_scale: 0` for every volume. It uses a CNN feeding a width-288 `v3`
 backbone with 8 full-attention transformer blocks, a 2,048-wide SwiGLU FFN, and six attention
-heads, batch size 4 per GPU, gradient checkpointing, two global views, and four local views. Gram and
+heads, batch size 4 per GPU, transformer gradient checkpointing, two global views,
+and two local views. The CNN is not checkpointed. Gram and
 point supervision are disabled for this initial stage.
 The FFN uses `mlp_ratio: 7.111111111111111` (2,048 / 288); its packed input
 projection produces two 2,048-wide branches before gating.
@@ -62,11 +63,14 @@ Full-attention checkpoints keep their existing parameter layout when
 `attention_type` is omitted. Switching to axial adds parameters and requires
 a matching checkpoint or a new training run.
 
-The CNN uses the existing `deeper` embedding with three residual stages of
-32, 64, and 288 channels. Each stage has two basic residual blocks (two
-3×3×3 convolutions per block) and downsamples by two in its first block.
-There is no full-resolution stem or final embedding projection: the last
-stage's 288 channels become EVA tokens directly. Residual skip connections
+The CNN uses the existing `deeper` embedding with a 16-channel full-resolution
+stem: one 3×3×3 stride-1 convolution, normalization, and activation. Four residual
+stages follow, with 16, 32, 64, and 288 channels and strides 1, 2, 2, and 2.
+Each stage has two basic residual blocks (two 3×3×3 convolutions per block).
+The first stage operates entirely at full resolution; subsequent stages
+downsample in the first convolution of their first block. This gives five
+convolutions before the first downsampling. No final embedding projection is
+used: the last stage's 288 channels become EVA tokens directly. Residual skip connections
 retain their channel projections. Total stride is 8, giving 4,096 global
 tokens and 512 local tokens, before CLS/register tokens.
 
@@ -74,7 +78,7 @@ The recipe keeps a 512³ source sampling window, from which augmented crops are
 drawn. CNN convolutions use zero padding, and the model receives exactly the
 128³ global and 64³ local crops. There is no halo expansion, extra context read,
 or cropping of the embedded grid. The output directory is
-`dinovol_pretrain_8_9um_cnn288_8blocks_ffn2048_full_g128_p8/` to avoid automatically resuming
+`dinovol_pretrain_8_9um_cnn288_8blocks_ffn2048_full_g128_p8_stem16/` to avoid automatically resuming
 incompatible checkpoints from earlier architectures.
 
 The configurable CNN options under `model` are:
@@ -85,15 +89,23 @@ The configurable CNN options under `model` are:
   "embed_dim": 288,
   "num_heads": 6,
   "patch_size": [8, 8, 8],
-  "deeper_embed_stage_channels": [32, 64, 288],
-  "deeper_embed_depth_per_level": [2, 2, 2],
-  "deeper_embed_use_stem": false,
+  "deeper_embed_stage_channels": [16, 32, 64, 288],
+  "deeper_embed_stage_strides": [1, 2, 2, 2],
+  "deeper_embed_depth_per_level": [2, 2, 2, 2],
+  "deeper_embed_use_stem": true,
+  "deeper_embed_stem_channels": 16,
+  "deeper_embed_stem_type": "conv",
   "deeper_embed_final_projection": false
 }
 ```
 
 Without a final projection, the last stage must have `embed_dim` channels.
-Stage counts must match the downsampling stages implied by `patch_size`.
+Stage channel/depth counts must match the stride list, whose per-axis product
+must equal `patch_size`. Each stride entry can be a scalar or a per-axis list
+of 1s and 2s. When omitted, strides are derived from `patch_size` as before.
+Stem width defaults to 32, and stem type defaults to the embedding block style
+(a residual stem for the standard deeper embedding); `"conv"` selects a single
+convolution with normalization and activation.
 Omitted CNN architecture options preserve the existing deeper embedding's
 parameter layout. All CNN embeddings now use zero padding; older checkpoints
 can load with matching architecture, but their boundary behavior changes.
