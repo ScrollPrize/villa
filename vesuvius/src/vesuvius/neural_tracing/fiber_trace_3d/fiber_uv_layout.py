@@ -397,6 +397,15 @@ def compatibility_terms(pa,pb,cost,temperature=1.):
     return ma*mb*(-temperature*torch.logsumexp((logmass-cost/temperature).flatten(1),1))
 
 
+def pair_evaluator(config):
+    """Select once per solve; explicit compilation never silently falls back."""
+    backend=config.get('pair_backend','eager')
+    if backend=='eager':return pair_objective
+    if backend!='compiled':raise ValueError('pair_backend must be eager or compiled')
+    import torch
+    return torch.compile(pair_objective,fullgraph=True,dynamic=False)
+
+
 def compatibility_loss(pa,pb,cost,temperature=1.):
     return compatibility_terms(pa,pb,cost,temperature).mean()
 
@@ -686,6 +695,9 @@ class FullPassGradientAccumulator:
 
 
 def solve(config):
+    if config.get('benchmark_pair_fusion'):
+        from .fiber_uv_pair_benchmark import benchmark
+        return benchmark(config)
     if config.get('assignment_update')=='cost_target':
         from .fiber_uv_categorical import solve_categorical
         return solve_categorical(config)
@@ -719,6 +731,14 @@ def solve(config):
         updates=(len(d['i'])+batch-1)//batch
         if updates>n:raise ValueError('Increase batch_size: full-pass node partitions must be nonempty')
         steps=passes*updates;every=updates
+    benchmark_updates=config.get('benchmark_updates')
+    if benchmark_updates is not None:
+        if config.get('update_mode','minibatch')!='minibatch':
+            raise ValueError('Short update benchmark requires minibatch updates')
+        steps=int(benchmark_updates);every=steps
+        if steps<2:raise ValueError('Benchmark requires at least two updates')
+    evaluate_pair=pair_evaluator(config)
+    update_timings=[]
     accumulated=config.get('update_mode','minibatch')=='global_accumulated'
     gradients=FullPassGradientAccumulator(embedding.weight,raw) if accumulated else None
     history=[];started=time.monotonic();torch.cuda.reset_peak_memory_stats()
@@ -762,22 +782,26 @@ def solve(config):
                 equivalent_event_epochs=step*batch/len(d['i']),importance_sampled=bool(fraction),
                 active_violations=len(active) if fraction else None,width_range=[float(w.min()),float(w.max())],**metrics)
             if full_pass:
-                record.update(completed_passes=step//updates,event_samples=(step//updates)*len(d['i']),
-                              equivalent_event_epochs=step//updates,traversal='full_pass')
+                processed=(step//updates)*len(d['i'])+(step%updates)*len(d['i'])//updates
+                record.update(completed_passes=step//updates,event_samples=processed,
+                              equivalent_event_epochs=processed/len(d['i']),traversal='full_pass')
             record.update(update_mode=config.get('update_mode','minibatch'),
                           optimizer_updates=step//updates if accumulated else step)
             if reference_projection is not None:
                 record['reference']=reference_winding_metrics(d,snapshot,w,config,reference_projection)
             if step:record.update(loss=float(loss.detach()),pair_loss=float(pair.detach()),regularization=float(reg.detach()))
             if step and full_pass:
-                means=(pass_losses/updates).cpu().tolist()
+                means=(pass_losses/(step if benchmark_updates is not None else updates)).cpu().tolist()
                 record.update(loss=means[0],pair_loss=means[1],regularization=means[2],
                               loss_scope=('full objective at pre-update state; diagnostics are post-update' if accumulated else
                                           'mean online objective across pass updates, not frozen-state global objective'))
+                if benchmark_updates is not None:record['loss_scope']='mean online objective across short benchmark updates'
                 pass_losses.zero_()
             history.append(record);atomic_write(root/'history.json',history,durable=False)
             print('UV '+json.dumps(record),flush=True)
             if step==steps or (feasible_check and metrics['sign_feasible']):break
+        if benchmark_updates is not None:
+            tick=torch.cuda.Event(enable_timing=True);tock=torch.cuda.Event(enable_timing=True);tick.record()
         if full_pass:
             position=step%updates
             if position==0:
@@ -799,7 +823,7 @@ def solve(config):
             selected=selected_ordering(embedding(i),embedding(j),phase64[i],phase64[j],z64[i],z64[j],
                 data['family'][i],data['family'][j],precise['ds_a'][edges],precise['ds_b'][edges],widths,
                 precise['phase_delta'][edges],data['sign'][edges])
-        pair=pair_objective(pa[:,:k],pb[:,:k],qa,qb,va,vb,data['phase_delta'][edges],data['family'][j]-data['family'][i],
+        pair=evaluate_pair(pa[:,:k],pb[:,:k],qa,qb,va,vb,data['phase_delta'][edges],data['family'][j]-data['family'][i],
             data['sign'][edges],data['distance'][edges],data['target_v'][edges],table,config,charge,event_weights,selected)
         for pp,qq,phase_key in ((pa,qa,'phase_a'),(pb,qb,'phase_b')):
             angle=qq-data[phase_key][edges,None];angle=angle-angle.detach().round()
@@ -846,6 +870,8 @@ def solve(config):
         else:
             embedding.weight.grad=embedding.weight.grad.coalesce()
             opt.step();widthopt.step()
+        if benchmark_updates is not None:
+            tock.record();update_timings.append((tick,tock))
     np.savez(root/'solution.npz',state=snapshot,widths=w,source_id=d['source_id'],start=d['start'],end=d['end'],family=d['family'])
     summary=dict(config=config,input=json.loads(Path(config['tensor_cache']).with_suffix('.json').read_text()),
         baseline=baseline,final=history[-1],gpu=torch.cuda.get_device_name(),peak_allocated_bytes=torch.cuda.max_memory_allocated(),
@@ -856,6 +882,15 @@ def solve(config):
             winding_count=k,initial_sigma=config.get('initial_sigma',3.),
             geometry_trainable=True,widths_trainable=True),
         interpretation='Model consistency only; joint Adam, '+('exhaustive full passes' if full_pass else 'sampled batches'))
+    if benchmark_updates is not None:
+        torch.cuda.synchronize()
+        ms=[a.elapsed_time(b) for a,b in update_timings]
+        warmup=int(config.get('benchmark_warmup',5));steady=ms[warmup:]
+        if not steady:raise ValueError('Benchmark warmup consumed all updates')
+        summary['update_benchmark']=dict(milliseconds=ms,warmup=warmup,mean_ms=float(np.mean(steady)),
+            p50_ms=float(np.quantile(steady,.5)),p95_ms=float(np.quantile(steady,.95)),
+            min_ms=float(min(steady)),max_ms=float(max(steady)),updates=len(ms),
+            note='Production minibatch update excluding initial width-boundary calculation and logging/audit; first updates include compilation')
     atomic_write(root/'summary.json',summary,durable=False)
 
 

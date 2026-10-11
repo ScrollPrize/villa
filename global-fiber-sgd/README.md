@@ -1,5 +1,10 @@
 # Global fiber assignment with PyTorch SGD
 
+Current performance task: [fused pair evaluation results and commands](uv_pair_fusion_results.md).
+Opt-in compiled backend: 2.38× pair loss/backward, 1.82× production minibatch
+updates, unchanged batch size. FP32 rounding changes optimizer trajectories;
+eager remains default. Earlier experiment notes below are historical.
+
 Latest: [H/V-specific rejection profiles and heatmaps](hv_rejection_results.md),
 10kU-profile/3kUVbuckets, plain counts and V/H comparisons, MAP and posterior.
 

@@ -1,5 +1,7 @@
 # Global fiber SGD: data reconnaissance
 
+Current: uv_pair_fusion_plan.md, independently reviewed.
+
 Current: uv_global_accumulation_plan.md, independently reviewed.
 
 Current: reference_init_vis_plan.md, independently reviewed.

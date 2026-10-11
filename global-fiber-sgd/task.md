@@ -1,5 +1,8 @@
 # Saved U/V solution visualization
 
+Current: uv_pair_fusion_plan.md. Fused loss/backward, unchanged4096 minibatches
+and all hypotheses; measure equivalence, profiling, memory and update speed.
+
 Current: uv_global_accumulation_plan.md. Fresh reference initialization,10 full
 gradient accumulated updates, all global variables trainable, no delay/fixing.
 

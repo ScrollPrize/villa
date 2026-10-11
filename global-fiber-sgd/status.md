@@ -1,4 +1,14 @@
-# Visualization status
+# Current: fused pair evaluation
+
+- [x] Plan and independent implementation review.
+- [x] Shared-objective compilation; unchanged 4096 minibatch updates.
+- [x] Managed real-data, tail, boundary and production-update benchmarks.
+- [x] 32 regression tests passed; timing/memory/rounding limitations documented.
+- [x] Results and reproduction: uv_pair_fusion_results.md.
+- Optional charge/expected-cost compiled GPU validation deferred explicitly.
+- No full fused solve launched; compiled backend remains opt-in.
+
+# Historical visualization status
 
 ## Single joint151 strong-order solve (current)
 - [x] Config-only plan independently reviewed; no warm starts/stages.

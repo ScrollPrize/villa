@@ -2,6 +2,11 @@
 
 ## 2026-10-11
 
+- Added opt-in fused shared winding-pair objective/backward; real H100 benchmarks
+  show2.38× pair and1.82× minibatch-update speedup, with lower intermediate memory.
+  Preserved batch size, FP32 and optimizer schedule. Numerical trajectory caveats
+  and reproduction recorded in uv_pair_fusion_results.md; eager remains default.
+
 - Added explicit categorical winding-count expansion, preserving old physical
   geometry and broken probability while enabling additional hypotheses. Both
   directions scheduled for ten151-candidate sweeps; geometry remains frozen.
