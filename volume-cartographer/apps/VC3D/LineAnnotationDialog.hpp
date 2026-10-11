@@ -210,6 +210,8 @@ public:
                       const std::vector<std::string>& activeTags,
                       bool enabled);
     void setCloseAfterFinalizationAllowed(bool allowed);
+    // Menu texts and the Fiber model combo label from the fiber-follow settings.
+    void updateFiberFollowMenu();
     void setWorkspaceEmbedded(bool embedded);
     bool workspaceEmbedded() const { return _workspaceEmbedded; }
     // Programmatic twin of the "current cut follows strip mouse" toggle.
@@ -297,6 +299,8 @@ signals:
     void generatedSideStripIntersectionQueryRequested(const std::string& surfaceName);
     void showAsMeshRequested();
     void fullOptimizationRequested();
+    // The fiber-follow model settings (menu → Fiber follow model) changed.
+    void fiberFollowSettingsChanged();
     void fiberTagChangeRequested(const QString& tag, bool enabled);
     void closeFinalizationRequested(QCloseEvent* event);
     void reoptimizationModeChanged(LineAnnotationDialog::ReoptimizationMode mode);
@@ -535,6 +539,7 @@ private:
     void updateOptimizationOverlayGeometry();
     void updateFiberNameLabel();
     void rebuildDatasetMenus();
+    void chooseFiberFollowCheckpoint();
     void restoreWindowGeometry();
     void saveWindowGeometry() const;
     void restoreGeneratedViewStateSettings();
@@ -545,6 +550,9 @@ private:
     QComboBox* _fiberOptimizationCombo = nullptr;
     QMenu* _lasagnaDatasetMenu = nullptr;
     QMenu* _fiberInferenceDatasetMenu = nullptr;
+    QAction* _fiberFollowEnabledAction = nullptr;
+    QAction* _fiberFollowCheckpointAction = nullptr;
+    QAction* _fiberFollowPythonAction = nullptr;
     std::vector<std::pair<std::string, std::string>> _lasagnaDatasetOptions;
     std::vector<std::pair<std::string, std::string>> _fiberInferenceDatasetOptions;
     std::string _selectedLasagnaDatasetLocation;

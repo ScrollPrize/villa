@@ -19,6 +19,7 @@
 #include "LineAnnotationDialog.hpp"
 #include "SurfacePanelController.hpp"
 #include "VCSettings.hpp"
+#include "FiberFollowService.hpp"
 #include "ViewerManager.hpp"
 #include "overlays/FiberSliceOverlayController.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -139,6 +140,9 @@ struct LineAnnotationController::LineAnnotationSession {
     std::shared_ptr<vc::lasagna::LasagnaDataset> dataset;
     std::shared_ptr<vc::lasagna::LasagnaNormalSampler> normalSampler;
     bool inspectionFrameOnly = false;
+    // Opened by openFiberReadOnly(): view only. The editing signals of its
+    // dialog are not connected, and every save and optimization path skips it.
+    bool readOnly = false;
     std::shared_ptr<vc::lasagna::LasagnaDataset> fiberInferenceDataset;
     std::shared_ptr<vc::fiber_tracer::FiberPredictionField> fiberPredictionField;
     std::string traceNormalDatasetLocation;
@@ -2375,114 +2379,6 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
     publishUmbilicusNotice();
     connect(dialog, &LineAnnotationDialog::volumeOverlayToggleRequested,
             this, &LineAnnotationController::volumeOverlayToggleRequested);
-    connect(dialog, &LineAnnotationDialog::fiberWidthChanged, this, [this, surfaceName](double width) {
-        auto* pane = paneForSurface(surfaceName);
-        if (!pane || !pane->session) return;
-        auto& session = *pane->session;
-        setSessionFiberWidth(session, width);
-        saveFiberDisplayAnnotations(session);
-    });
-    connect(dialog, &LineAnnotationDialog::controlDisplayAngleChanged, this,
-            [this, surfaceName](size_t index, double degrees) {
-        auto* pane = paneForSurface(surfaceName);
-        if (!pane || !pane->session) return;
-        auto& session = *pane->session;
-        if (index >= session.controlPoints.size() || index >= session.displayField.controlBaselines.size()) return;
-        const auto baseline = vc::fiber_tracer::displayUnit(session.displayField.controlBaselines[index]);
-        const auto tangent = vc::fiber_tracer::displayUnit(session.displayField.controlTangents[index]);
-        if (!baseline || !tangent) return;
-        const std::optional<cv::Vec3d> normal = degrees == 0 ? std::nullopt :
-            std::optional<cv::Vec3d>(vc::fiber_tracer::rotateDisplayNormal(*baseline, *tangent, degrees * std::acos(-1.0) / 180.0));
-        const cv::Vec3d position = session.controlPoints[index].volumePoint;
-        for (auto& other : _panes) {
-            if (!other.session || (other.session != pane->session &&
-                (!session.fiberId || other.session->fiberId != session.fiberId))) continue;
-            for (auto& cp : other.session->controlPoints)
-                if (pointsApproximatelyEqual(cp.volumePoint, position)) {
-                    cp.displayNormal = normal;
-                    cp.displayNormalSource = normal ? "manual" : "unknown";
-                }
-            materializeGeneratedViews(*other.session);
-        }
-        saveFiberDisplayAnnotations(session);
-    });
-    const auto clearCorrections = [this, surfaceName](std::optional<size_t> index) {
-        auto* pane=paneForSurface(surfaceName);
-        if (!pane || !pane->session) return;
-        auto& session=*pane->session;
-        if (index && *index >= session.controlPoints.size()) return;
-        const std::optional<cv::Vec3d> point = index
-            ? std::make_optional(session.controlPoints[*index].volumePoint) : std::nullopt;
-        bool directionsChanged=false;
-        std::vector<size_t> dirty;
-        for (size_t i=0; i<session.controlPoints.size(); ++i) {
-            if (index && i != *index) continue;
-            if (!session.controlPoints[i].direction) continue;
-            directionsChanged=true;
-            if (i>0) dirty.push_back(i-1);
-            if (i+1<session.controlPoints.size()) dirty.push_back(i);
-        }
-        std::sort(dirty.begin(), dirty.end());
-        dirty.erase(std::unique(dirty.begin(), dirty.end()), dirty.end());
-        for (auto& other : _panes) {
-            if (!other.session || (other.session!=pane->session &&
-                (!session.fiberId || other.session->fiberId!=session.fiberId))) continue;
-            for (auto& cp : other.session->controlPoints) {
-                if (point && !pointsApproximatelyEqual(cp.volumePoint,*point)) continue;
-                vc3d::line_annotation::clearControlPointCorrections(cp);
-            }
-            ++other.session->lineRevision;
-            materializeGeneratedViews(*other.session);
-        }
-        saveFiberDisplayAnnotations(session);
-        if (directionsChanged) {
-            session.fiberMetricsMatchStoredFiber=false;
-            invalidateFiberAlignmentMetrics(session.fiberId,true);
-            session.stripReviewedTagOnSave=true;
-            setSessionOptimizationState(session,SessionOptimizationState::Unoptimized);
-            session.solveQueue.addPending(dirty,false);
-            scheduleSolveDispatch(session);
-        }
-    };
-    connect(dialog, &LineAnnotationDialog::clearFiberCorrectionsRequested, this,
-            [clearCorrections]() { clearCorrections(std::nullopt); });
-    connect(dialog, &LineAnnotationDialog::clearControlCorrectionsRequested, this,
-            [clearCorrections](size_t index) { clearCorrections(index); });
-    connect(dialog, &LineAnnotationDialog::controlDirectionCreated, this,
-            [this, surfaceName](cv::Vec3f point, double position,
-                                cv::Vec3f anchor, cv::Vec3f direction) {
-        handleGeneratedControlPoint(surfaceName,
-            fiberBasePointFromViewer(surfaceName, point), position,
-            fiberBasePointFromViewer(surfaceName, anchor), std::nullopt,
-            vc::fiber_tracer::displayUnit(cv::Vec3d(direction)));
-    });
-    connect(dialog, &LineAnnotationDialog::controlDirectionChanged, this,
-            [this, surfaceName](size_t index, cv::Vec3f value) {
-        auto* pane = paneForSurface(surfaceName);
-        if (!pane || !pane->session) return;
-        auto& session=*pane->session;
-        const auto axis=vc::fiber_tracer::displayUnit(cv::Vec3d(value));
-        if (!axis || index>=session.controlPoints.size()) return;
-        const auto point=session.controlPoints[index].volumePoint;
-        for (auto& other : _panes) {
-            if (!other.session || (other.session!=pane->session &&
-                (!session.fiberId || other.session->fiberId!=session.fiberId))) continue;
-            for (auto& cp : other.session->controlPoints)
-                if (pointsApproximatelyEqual(cp.volumePoint,point)) cp.direction=*axis;
-            materializeGeneratedViews(*other.session);
-        }
-        ++session.lineRevision;
-        session.fiberMetricsMatchStoredFiber=false;
-        invalidateFiberAlignmentMetrics(session.fiberId, true);
-        session.stripReviewedTagOnSave=true;
-        setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
-        std::vector<size_t> dirty;
-        if (index>0) dirty.push_back(index-1);
-        if (index+1<session.controlPoints.size()) dirty.push_back(index);
-        session.solveQueue.addPending(dirty,false);
-        scheduleSessionAutoSave(session);
-        scheduleSolveDispatch(session);
-    });
     connect(dialog, &LineAnnotationDialog::paneClosed, this, [this](const std::string& name) {
         cleanupSurfaceName(name);
     });
@@ -2492,349 +2388,476 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
             [this, surfaceName](QCloseEvent*) {
                 requestFinalizedClose(surfaceName);
             });
-    connect(dialog,
-            &LineAnnotationDialog::lineSeedRequested,
-            this,
-            [this](const std::string& name, cv::Vec3f volumePoint, QPointF) {
-                handleLineSeed(name,
-                               fiberBasePointFromViewer(name, volumePoint),
-                               InitialDirectionMode::ZInOut);
-            });
-    connect(dialog,
-            &LineAnnotationDialog::fiberTagChangeRequested,
-            this,
-            [this, surfaceName](const QString& tag, bool enabled) {
+    if (session->readOnly) {
+        // View only: none of the editing, linking or optimization requests
+        // below are connected, and the window closes without finalization.
+        dialog->setCloseAfterFinalizationAllowed(true);
+        dialog->setFiberDisplayName(fiberDisplayNameFromFileName(session->fiberFileName) + tr(" · read only"));
+    } else {
+        connect(dialog, &LineAnnotationDialog::fiberFollowSettingsChanged, this, [this, surfaceName]() {
+            for (const auto& pane : _panes) {
+                if (pane.dialog) {
+                    pane.dialog->updateFiberFollowMenu();
+                }
+            }
+            // Load the model now rather than at the first trace.
+            if (fiberFollowEnabled()) {
                 auto* pane = paneForSurface(surfaceName);
-                if (!pane || !pane->session || pane->session->fiberId == 0) {
-                    return;
-                }
-                setFiberTag(pane->session->fiberId, tag, enabled);
-            });
-    connect(dialog,
-            &LineAnnotationDialog::lasagnaDatasetSelectionChanged,
-            this,
-            [this](const std::string& location) {
-                handleLasagnaDatasetSelectionChanged(location);
-            });
-    connect(dialog,
-            &LineAnnotationDialog::fiberInferenceDatasetSelectionChanged,
-            this,
-            [this](const std::string& location) {
-                handleFiberInferenceDatasetSelectionChanged(location);
-            });
-    connect(dialog,
-            &LineAnnotationDialog::crossSectionDragFinished,
-            this,
-            [this](const std::string& name, cv::Vec3f point, double position,
-                   cv::Vec3f anchor, cv::Vec3f normal, bool edge) {
-                handleGeneratedControlPoint(name, fiberBasePointFromViewer(name, point),
-                    position, fiberBasePointFromViewer(name, anchor),
-                    edge ? std::optional<cv::Vec3d>(toVec3d(normal)) : std::nullopt);
-            });
-    connect(dialog,
-            &LineAnnotationDialog::generatedControlPointRequested,
-            this,
-            [this](const std::string& name,
-                   cv::Vec3f volumePoint,
-                   double linePosition,
-                   cv::Vec3f lineAnchor) {
-                handleGeneratedControlPoint(
-                    name,
-                    fiberBasePointFromViewer(name, volumePoint),
-                    linePosition,
-                    fiberBasePointFromViewer(name, lineAnchor));
-            });
-    connect(dialog,
-            &LineAnnotationDialog::generatedControlPointDeleteRequested,
-            this,
-            [this](const std::string& name, double linePosition, cv::Vec3f volumePoint) {
-                handleGeneratedControlPointDelete(
-                    name, linePosition, fiberBasePointFromViewer(name, volumePoint));
-            });
-    connect(dialog,
-            &LineAnnotationDialog::generatedNewLineAnnotationLinkedToCandidateRequested,
-            this,
-            [this](const std::string& name, cv::Vec3f volumePoint, cv::Vec3f linkDirection) {
-                handleGeneratedNewLineAnnotationLinkedToCandidate(name,
-                                                                  fiberBasePointFromViewer(name, volumePoint),
-                                                                  linkDirection);
-            });
-    connect(dialog,
-            &LineAnnotationDialog::generatedControlPointBranchOpenRequested,
-            this,
-            [this](uint64_t branchFiberId, int branchControlPointIndex) {
-                openFiberAtControlPoint(branchFiberId, branchControlPointIndex);
-            });
-    connect(dialog,
-            &LineAnnotationDialog::generatedControlPointLinkCandidateRequested,
-            this,
-            [this](const std::string& name, size_t controlPointIndex, cv::Vec3f volumePoint) {
-                handleGeneratedControlPointLinkCandidate(
-                    name, controlPointIndex, fiberBasePointFromViewer(name, volumePoint));
-            });
-    connect(dialog,
-            &LineAnnotationDialog::generatedControlPointAdjacentLinkCandidateRequested,
-            this,
-            [this](const std::string& name, size_t controlPointIndex, cv::Vec3f volumePoint) {
-                handleGeneratedControlPointLinkCandidate(
-                    name, controlPointIndex, fiberBasePointFromViewer(name, volumePoint),
-                    /*adjacent=*/true);
-            });
-    connect(dialog,
-            &LineAnnotationDialog::generatedControlPointLinkWithCandidateRequested,
-            this,
-            [this](const std::string& name, size_t controlPointIndex, cv::Vec3f volumePoint) {
-                handleGeneratedControlPointLinkWithCandidate(
-                    name, controlPointIndex, fiberBasePointFromViewer(name, volumePoint));
-            });
-    connect(dialog,
-            &LineAnnotationDialog::generatedControlPointMergeWithCandidateRequested,
-            this,
-            [this](const std::string& name, size_t controlPointIndex, cv::Vec3f volumePoint) {
-                handleGeneratedControlPointMergeWithCandidate(
-                    name, controlPointIndex, fiberBasePointFromViewer(name, volumePoint));
-            });
-    connect(dialog,
-            &LineAnnotationDialog::generatedSpanSplitRequested,
-            this,
-            [this](const std::string& name, size_t first, size_t second, bool linkHalves) {
-                handleGeneratedSpanSplit(name, first, second, linkHalves);
-            });
-    connect(dialog,
-            &LineAnnotationDialog::generatedSpanGapChangeRequested,
-            this,
-            [this](const std::string& name, size_t first, size_t second, bool enabled) {
-                handleGeneratedSpanSetGap(name, first, second, enabled);
-            });
-    connect(dialog,
-            &LineAnnotationDialog::generatedSpanDamagedChangeRequested,
-            this,
-            [this](const std::string& name, size_t first, size_t second, bool enabled) {
-                handleGeneratedSpanSetDamaged(name, first, second, enabled);
-            });
-    connect(dialog,
-            &LineAnnotationDialog::generatedNearbyAnnotationOpenRequested,
-            this,
-            [this, surfaceName](uint64_t fiberId, cv::Vec3f volumePoint) {
-                handleGeneratedOpenNearbyAnnotation(
-                    fiberId,
-                    fiberBasePointFromViewer(surfaceName, volumePoint));
-            });
-    connect(dialog,
-            &LineAnnotationDialog::generatedControlPointUnlinkRequested,
-            this,
-            [this](const std::string& name,
-                   size_t controlPointIndex,
-                   uint64_t branchFiberId,
-                   int branchControlPointIndex) {
-                handleGeneratedControlPointUnlink(name,
-                                                  controlPointIndex,
-                                                  branchFiberId,
-                                                  branchControlPointIndex);
-            });
-    connect(dialog,
-            &LineAnnotationDialog::generatedControlPointLinkPendingChangeRequested,
-            this,
-            [this](const std::string& name,
-                   size_t controlPointIndex,
-                   uint64_t branchFiberId,
-                   int branchControlPointIndex,
-                   bool pending) {
-                handleGeneratedControlPointSetLinkPending(name,
-                                                          controlPointIndex,
-                                                          branchFiberId,
-                                                          branchControlPointIndex,
-                                                          pending);
-            });
-    connect(dialog,
-            &LineAnnotationDialog::generatedPredSnapPointRequested,
-            this,
-            [this](const std::string& name, cv::Vec3f volumePoint) {
-                handleGeneratedPredSnapPoint(
-                    name, fiberBasePointFromViewer(name, volumePoint));
-            });
-    connect(dialog,
-            &LineAnnotationDialog::generatedSideStripIntersectionQueryRequested,
-            this,
-            [this](const std::string& name) {
-                handleGeneratedSideStripIntersectionQuery(name);
-            });
-    connect(dialog,
-            &LineAnnotationDialog::generatedSegmentInterpolationGoalRequested,
-            this,
-            [this](const std::string& name,
-                   size_t firstControlPointIndex,
-                   size_t secondControlPointIndex,
-                   const std::string& goal) {
-                handleGeneratedSegmentInterpolationGoal(
-                    name, firstControlPointIndex, secondControlPointIndex, goal);
-            });
-    connect(dialog,
-            &LineAnnotationDialog::generatedControlPointKollesisTerminationChangeRequested,
-            this,
-            [this](const std::string& name, size_t controlPointIndex, bool enabled) {
-                handleGeneratedControlPointSetKollesisTermination(
-                    name, controlPointIndex, enabled);
-            });
-    connect(dialog,
-            &LineAnnotationDialog::generatedControlPointBreakChangeRequested,
-            this,
-            [this](const std::string& name, size_t controlPointIndex, bool enabled) {
-                handleGeneratedControlPointSetBreak(name, controlPointIndex, enabled);
-            });
-    connect(dialog, &LineAnnotationDialog::showAsMeshRequested, this, [this, surfaceName]() {
-        handleShowAsMesh(surfaceName);
-    });
-    connect(dialog, &LineAnnotationDialog::fullOptimizationRequested, this, [this, surfaceName]() {
-        auto* pane = paneForSurface(surfaceName);
-        if (!pane || !pane->session) {
-            return;
-        }
-        auto& session = *pane->session;
-        if (session.taskState == LineAnnotationSession::TaskState::Running) {
-            showError(tr("Line optimization is already running."),
-                      session.suppressErrorDialogs);
-            return;
-        }
-        if (session.optimizedLine.points.empty() || session.controlPoints.empty()) {
-            return;
-        }
-        if (!ensureDatasetForSession(session)) {
-            return;
-        }
-        startFiberModeOptimization(session, true);
-    });
-    connect(dialog,
-            &LineAnnotationDialog::fiberOptimizationModeChanged,
-            this,
-            [this, surfaceName](vc3d::line_annotation::FiberOptimizationMode mode) {
-                auto* pane = paneForSurface(surfaceName);
-                if (!pane || !pane->session) {
-                    return;
-                }
-                auto& session = *pane->session;
-                if (mode == session.fiberOptimizationMode) {
-                    return;
-                }
-                if (session.taskState == LineAnnotationSession::TaskState::Running) {
-                    showError(tr("Line optimization is already running."),
-                              session.suppressErrorDialogs);
-                    if (pane->dialog) {
-                        pane->dialog->setFiberOptimizationMode(
-                            session.fiberOptimizationMode);
+                ensureFiberFollowService(pane && pane->session && pane->session->suppressErrorDialogs);
+            }
+        });
+        connect(dialog, &LineAnnotationDialog::fiberWidthChanged, this, [this, surfaceName](double width) {
+            auto* pane = paneForSurface(surfaceName);
+            if (!pane || !pane->session) return;
+            auto& session = *pane->session;
+            setSessionFiberWidth(session, width);
+            saveFiberDisplayAnnotations(session);
+        });
+        connect(dialog, &LineAnnotationDialog::controlDisplayAngleChanged, this,
+                [this, surfaceName](size_t index, double degrees) {
+            auto* pane = paneForSurface(surfaceName);
+            if (!pane || !pane->session) return;
+            auto& session = *pane->session;
+            if (index >= session.controlPoints.size() || index >= session.displayField.controlBaselines.size()) return;
+            const auto baseline = vc::fiber_tracer::displayUnit(session.displayField.controlBaselines[index]);
+            const auto tangent = vc::fiber_tracer::displayUnit(session.displayField.controlTangents[index]);
+            if (!baseline || !tangent) return;
+            const std::optional<cv::Vec3d> normal = degrees == 0 ? std::nullopt :
+                std::optional<cv::Vec3d>(vc::fiber_tracer::rotateDisplayNormal(*baseline, *tangent, degrees * std::acos(-1.0) / 180.0));
+            const cv::Vec3d position = session.controlPoints[index].volumePoint;
+            for (auto& other : _panes) {
+                if (!other.session || (other.session != pane->session &&
+                    (!session.fiberId || other.session->fiberId != session.fiberId))) continue;
+                for (auto& cp : other.session->controlPoints)
+                    if (pointsApproximatelyEqual(cp.volumePoint, position)) {
+                        cp.displayNormal = normal;
+                        cp.displayNormalSource = normal ? "manual" : "unknown";
                     }
-                    return;
+                materializeGeneratedViews(*other.session);
+            }
+            saveFiberDisplayAnnotations(session);
+        });
+        const auto clearCorrections = [this, surfaceName](std::optional<size_t> index) {
+            auto* pane=paneForSurface(surfaceName);
+            if (!pane || !pane->session) return;
+            auto& session=*pane->session;
+            if (index && *index >= session.controlPoints.size()) return;
+            const std::optional<cv::Vec3d> point = index
+                ? std::make_optional(session.controlPoints[*index].volumePoint) : std::nullopt;
+            bool directionsChanged=false;
+            std::vector<size_t> dirty;
+            for (size_t i=0; i<session.controlPoints.size(); ++i) {
+                if (index && i != *index) continue;
+                if (!session.controlPoints[i].direction) continue;
+                directionsChanged=true;
+                if (i>0) dirty.push_back(i-1);
+                if (i+1<session.controlPoints.size()) dirty.push_back(i);
+            }
+            std::sort(dirty.begin(), dirty.end());
+            dirty.erase(std::unique(dirty.begin(), dirty.end()), dirty.end());
+            for (auto& other : _panes) {
+                if (!other.session || (other.session!=pane->session &&
+                    (!session.fiberId || other.session->fiberId!=session.fiberId))) continue;
+                for (auto& cp : other.session->controlPoints) {
+                    if (point && !pointsApproximatelyEqual(cp.volumePoint,*point)) continue;
+                    vc3d::line_annotation::clearControlPointCorrections(cp);
                 }
-                if (session.optimizedLine.points.size() < 2 ||
-                    session.controlPoints.empty()) {
-                    session.fiberOptimizationMode = mode;
-                    return;
-                }
-                if (!confirmFiberOptimizationModeChange(session, mode)) {
-                    if (pane->dialog) {
-                        pane->dialog->setFiberOptimizationMode(
-                            session.fiberOptimizationMode);
+                ++other.session->lineRevision;
+                materializeGeneratedViews(*other.session);
+            }
+            saveFiberDisplayAnnotations(session);
+            if (directionsChanged) {
+                session.fiberMetricsMatchStoredFiber=false;
+                invalidateFiberAlignmentMetrics(session.fiberId,true);
+                session.stripReviewedTagOnSave=true;
+                setSessionOptimizationState(session,SessionOptimizationState::Unoptimized);
+                session.solveQueue.addPending(dirty,false);
+                scheduleSolveDispatch(session);
+            }
+        };
+        connect(dialog, &LineAnnotationDialog::clearFiberCorrectionsRequested, this,
+                [clearCorrections]() { clearCorrections(std::nullopt); });
+        connect(dialog, &LineAnnotationDialog::clearControlCorrectionsRequested, this,
+                [clearCorrections](size_t index) { clearCorrections(index); });
+        connect(dialog, &LineAnnotationDialog::controlDirectionCreated, this,
+                [this, surfaceName](cv::Vec3f point, double position,
+                                    cv::Vec3f anchor, cv::Vec3f direction) {
+            handleGeneratedControlPoint(surfaceName,
+                fiberBasePointFromViewer(surfaceName, point), position,
+                fiberBasePointFromViewer(surfaceName, anchor), std::nullopt,
+                vc::fiber_tracer::displayUnit(cv::Vec3d(direction)));
+        });
+        connect(dialog, &LineAnnotationDialog::controlDirectionChanged, this,
+                [this, surfaceName](size_t index, cv::Vec3f value) {
+            auto* pane = paneForSurface(surfaceName);
+            if (!pane || !pane->session) return;
+            auto& session=*pane->session;
+            const auto axis=vc::fiber_tracer::displayUnit(cv::Vec3d(value));
+            if (!axis || index>=session.controlPoints.size()) return;
+            const auto point=session.controlPoints[index].volumePoint;
+            for (auto& other : _panes) {
+                if (!other.session || (other.session!=pane->session &&
+                    (!session.fiberId || other.session->fiberId!=session.fiberId))) continue;
+                for (auto& cp : other.session->controlPoints)
+                    if (pointsApproximatelyEqual(cp.volumePoint,point)) cp.direction=*axis;
+                materializeGeneratedViews(*other.session);
+            }
+            ++session.lineRevision;
+            session.fiberMetricsMatchStoredFiber=false;
+            invalidateFiberAlignmentMetrics(session.fiberId, true);
+            session.stripReviewedTagOnSave=true;
+            setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
+            std::vector<size_t> dirty;
+            if (index>0) dirty.push_back(index-1);
+            if (index+1<session.controlPoints.size()) dirty.push_back(index);
+            session.solveQueue.addPending(dirty,false);
+            scheduleSessionAutoSave(session);
+            scheduleSolveDispatch(session);
+        });
+        connect(dialog,
+                &LineAnnotationDialog::lineSeedRequested,
+                this,
+                [this](const std::string& name, cv::Vec3f volumePoint, QPointF) {
+                    handleLineSeed(name,
+                                   fiberBasePointFromViewer(name, volumePoint),
+                                   InitialDirectionMode::ZInOut);
+                });
+        connect(dialog,
+                &LineAnnotationDialog::fiberTagChangeRequested,
+                this,
+                [this, surfaceName](const QString& tag, bool enabled) {
+                    auto* pane = paneForSurface(surfaceName);
+                    if (!pane || !pane->session || pane->session->fiberId == 0) {
+                        return;
                     }
-                    return;
-                }
+                    setFiberTag(pane->session->fiberId, tag, enabled);
+                });
+        connect(dialog,
+                &LineAnnotationDialog::lasagnaDatasetSelectionChanged,
+                this,
+                [this](const std::string& location) {
+                    handleLasagnaDatasetSelectionChanged(location);
+                });
+        connect(dialog,
+                &LineAnnotationDialog::fiberInferenceDatasetSelectionChanged,
+                this,
+                [this](const std::string& location) {
+                    handleFiberInferenceDatasetSelectionChanged(location);
+                });
+        connect(dialog,
+                &LineAnnotationDialog::crossSectionDragFinished,
+                this,
+                [this](const std::string& name, cv::Vec3f point, double position,
+                       cv::Vec3f anchor, cv::Vec3f normal, bool edge) {
+                    handleGeneratedControlPoint(name, fiberBasePointFromViewer(name, point),
+                        position, fiberBasePointFromViewer(name, anchor),
+                        edge ? std::optional<cv::Vec3d>(toVec3d(normal)) : std::nullopt);
+                });
+        connect(dialog,
+                &LineAnnotationDialog::generatedControlPointRequested,
+                this,
+                [this](const std::string& name,
+                       cv::Vec3f volumePoint,
+                       double linePosition,
+                       cv::Vec3f lineAnchor) {
+                    handleGeneratedControlPoint(
+                        name,
+                        fiberBasePointFromViewer(name, volumePoint),
+                        linePosition,
+                        fiberBasePointFromViewer(name, lineAnchor));
+                });
+        connect(dialog,
+                &LineAnnotationDialog::generatedControlPointDeleteRequested,
+                this,
+                [this](const std::string& name, double linePosition, cv::Vec3f volumePoint) {
+                    handleGeneratedControlPointDelete(
+                        name, linePosition, fiberBasePointFromViewer(name, volumePoint));
+                });
+        connect(dialog,
+                &LineAnnotationDialog::generatedNewLineAnnotationLinkedToCandidateRequested,
+                this,
+                [this](const std::string& name, cv::Vec3f volumePoint, cv::Vec3f linkDirection) {
+                    handleGeneratedNewLineAnnotationLinkedToCandidate(name,
+                                                                      fiberBasePointFromViewer(name, volumePoint),
+                                                                      linkDirection);
+                });
+        connect(dialog,
+                &LineAnnotationDialog::generatedControlPointBranchOpenRequested,
+                this,
+                [this](uint64_t branchFiberId, int branchControlPointIndex) {
+                    openFiberAtControlPoint(branchFiberId, branchControlPointIndex);
+                });
+        connect(dialog,
+                &LineAnnotationDialog::generatedControlPointLinkCandidateRequested,
+                this,
+                [this](const std::string& name, size_t controlPointIndex, cv::Vec3f volumePoint) {
+                    handleGeneratedControlPointLinkCandidate(
+                        name, controlPointIndex, fiberBasePointFromViewer(name, volumePoint));
+                });
+        connect(dialog,
+                &LineAnnotationDialog::generatedControlPointAdjacentLinkCandidateRequested,
+                this,
+                [this](const std::string& name, size_t controlPointIndex, cv::Vec3f volumePoint) {
+                    handleGeneratedControlPointLinkCandidate(
+                        name, controlPointIndex, fiberBasePointFromViewer(name, volumePoint),
+                        /*adjacent=*/true);
+                });
+        connect(dialog,
+                &LineAnnotationDialog::generatedControlPointLinkWithCandidateRequested,
+                this,
+                [this](const std::string& name, size_t controlPointIndex, cv::Vec3f volumePoint) {
+                    handleGeneratedControlPointLinkWithCandidate(
+                        name, controlPointIndex, fiberBasePointFromViewer(name, volumePoint));
+                });
+        connect(dialog,
+                &LineAnnotationDialog::generatedControlPointMergeWithCandidateRequested,
+                this,
+                [this](const std::string& name, size_t controlPointIndex, cv::Vec3f volumePoint) {
+                    handleGeneratedControlPointMergeWithCandidate(
+                        name, controlPointIndex, fiberBasePointFromViewer(name, volumePoint));
+                });
+        connect(dialog,
+                &LineAnnotationDialog::generatedSpanSplitRequested,
+                this,
+                [this](const std::string& name, size_t first, size_t second, bool linkHalves) {
+                    handleGeneratedSpanSplit(name, first, second, linkHalves);
+                });
+        connect(dialog,
+                &LineAnnotationDialog::generatedSpanGapChangeRequested,
+                this,
+                [this](const std::string& name, size_t first, size_t second, bool enabled) {
+                    handleGeneratedSpanSetGap(name, first, second, enabled);
+                });
+        connect(dialog,
+                &LineAnnotationDialog::generatedSpanDamagedChangeRequested,
+                this,
+                [this](const std::string& name, size_t first, size_t second, bool enabled) {
+                    handleGeneratedSpanSetDamaged(name, first, second, enabled);
+                });
+        connect(dialog,
+                &LineAnnotationDialog::generatedNearbyAnnotationOpenRequested,
+                this,
+                [this, surfaceName](uint64_t fiberId, cv::Vec3f volumePoint) {
+                    handleGeneratedOpenNearbyAnnotation(
+                        fiberId,
+                        fiberBasePointFromViewer(surfaceName, volumePoint));
+                });
+        connect(dialog,
+                &LineAnnotationDialog::generatedControlPointUnlinkRequested,
+                this,
+                [this](const std::string& name,
+                       size_t controlPointIndex,
+                       uint64_t branchFiberId,
+                       int branchControlPointIndex) {
+                    handleGeneratedControlPointUnlink(name,
+                                                      controlPointIndex,
+                                                      branchFiberId,
+                                                      branchControlPointIndex);
+                });
+        connect(dialog,
+                &LineAnnotationDialog::generatedControlPointLinkPendingChangeRequested,
+                this,
+                [this](const std::string& name,
+                       size_t controlPointIndex,
+                       uint64_t branchFiberId,
+                       int branchControlPointIndex,
+                       bool pending) {
+                    handleGeneratedControlPointSetLinkPending(name,
+                                                              controlPointIndex,
+                                                              branchFiberId,
+                                                              branchControlPointIndex,
+                                                              pending);
+                });
+        connect(dialog,
+                &LineAnnotationDialog::generatedPredSnapPointRequested,
+                this,
+                [this](const std::string& name, cv::Vec3f volumePoint) {
+                    handleGeneratedPredSnapPoint(
+                        name, fiberBasePointFromViewer(name, volumePoint));
+                });
+        connect(dialog,
+                &LineAnnotationDialog::generatedSideStripIntersectionQueryRequested,
+                this,
+                [this](const std::string& name) {
+                    handleGeneratedSideStripIntersectionQuery(name);
+                });
+        connect(dialog,
+                &LineAnnotationDialog::generatedSegmentInterpolationGoalRequested,
+                this,
+                [this](const std::string& name,
+                       size_t firstControlPointIndex,
+                       size_t secondControlPointIndex,
+                       const std::string& goal) {
+                    handleGeneratedSegmentInterpolationGoal(
+                        name, firstControlPointIndex, secondControlPointIndex, goal);
+                });
+        connect(dialog,
+                &LineAnnotationDialog::generatedControlPointKollesisTerminationChangeRequested,
+                this,
+                [this](const std::string& name, size_t controlPointIndex, bool enabled) {
+                    handleGeneratedControlPointSetKollesisTermination(
+                        name, controlPointIndex, enabled);
+                });
+        connect(dialog,
+                &LineAnnotationDialog::generatedControlPointBreakChangeRequested,
+                this,
+                [this](const std::string& name, size_t controlPointIndex, bool enabled) {
+                    handleGeneratedControlPointSetBreak(name, controlPointIndex, enabled);
+                });
+        connect(dialog, &LineAnnotationDialog::showAsMeshRequested, this, [this, surfaceName]() {
+            handleShowAsMesh(surfaceName);
+        });
+        connect(dialog, &LineAnnotationDialog::fullOptimizationRequested, this, [this, surfaceName]() {
+            auto* pane = paneForSurface(surfaceName);
+            if (!pane || !pane->session) {
+                return;
+            }
+            auto& session = *pane->session;
+            if (session.taskState == LineAnnotationSession::TaskState::Running) {
+                showError(tr("Line optimization is already running."),
+                          session.suppressErrorDialogs);
+                return;
+            }
+            if (session.optimizedLine.points.empty() || session.controlPoints.empty()) {
+                return;
+            }
+            if (!ensureDatasetForSession(session)) {
+                return;
+            }
+            startFiberModeOptimization(session, true);
+        });
+        connect(dialog,
+                &LineAnnotationDialog::fiberOptimizationModeChanged,
+                this,
+                [this, surfaceName](vc3d::line_annotation::FiberOptimizationMode mode) {
+                    auto* pane = paneForSurface(surfaceName);
+                    if (!pane || !pane->session) {
+                        return;
+                    }
+                    auto& session = *pane->session;
+                    if (mode == session.fiberOptimizationMode) {
+                        return;
+                    }
+                    if (session.taskState == LineAnnotationSession::TaskState::Running) {
+                        showError(tr("Line optimization is already running."),
+                                  session.suppressErrorDialogs);
+                        if (pane->dialog) {
+                            pane->dialog->setFiberOptimizationMode(
+                                session.fiberOptimizationMode);
+                        }
+                        return;
+                    }
+                    if (session.optimizedLine.points.size() < 2 ||
+                        session.controlPoints.empty()) {
+                        session.fiberOptimizationMode = mode;
+                        return;
+                    }
+                    if (!confirmFiberOptimizationModeChange(session, mode)) {
+                        if (pane->dialog) {
+                            pane->dialog->setFiberOptimizationMode(
+                                session.fiberOptimizationMode);
+                        }
+                        return;
+                    }
 
-                session.fiberOptimizationModeBeforeTask =
-                    session.fiberOptimizationMode;
-                session.restoreFiberOptimizationModeOnFailure = true;
-                session.controlPointsBeforeModeChange = session.controlPoints;
-                session.optimizedLineBeforeModeChange = session.optimizedLine;
-                session.branchesBeforeModeChange = session.branches;
-                session.fiberOptimizationMode = mode;
-                if (ensureDatasetForSession(session))
-                    startFiberModeOptimization(session, true, std::nullopt, true);
-                if (session.taskState != LineAnnotationSession::TaskState::Running) {
-                    session.fiberOptimizationMode =
-                        session.fiberOptimizationModeBeforeTask;
-                    session.restoreFiberOptimizationModeOnFailure = false;
-                    if (session.controlPointsBeforeModeChange) {
-                        session.controlPoints =
-                            std::move(*session.controlPointsBeforeModeChange);
-                        session.controlPointsBeforeModeChange.reset();
+                    session.fiberOptimizationModeBeforeTask =
+                        session.fiberOptimizationMode;
+                    session.restoreFiberOptimizationModeOnFailure = true;
+                    session.controlPointsBeforeModeChange = session.controlPoints;
+                    session.optimizedLineBeforeModeChange = session.optimizedLine;
+                    session.branchesBeforeModeChange = session.branches;
+                    session.fiberOptimizationMode = mode;
+                    if (ensureDatasetForSession(session))
+                        startFiberModeOptimization(session, true, std::nullopt, true);
+                    if (session.taskState != LineAnnotationSession::TaskState::Running) {
+                        session.fiberOptimizationMode =
+                            session.fiberOptimizationModeBeforeTask;
+                        session.restoreFiberOptimizationModeOnFailure = false;
+                        if (session.controlPointsBeforeModeChange) {
+                            session.controlPoints =
+                                std::move(*session.controlPointsBeforeModeChange);
+                            session.controlPointsBeforeModeChange.reset();
+                        }
+                        if (session.optimizedLineBeforeModeChange) {
+                            session.optimizedLine =
+                                std::move(*session.optimizedLineBeforeModeChange);
+                            session.optimizedLineBeforeModeChange.reset();
+                        }
+                        if (session.branchesBeforeModeChange) {
+                            session.branches =
+                                std::move(*session.branchesBeforeModeChange);
+                            session.branchesBeforeModeChange.reset();
+                        }
+                        if (pane->dialog) {
+                            pane->dialog->setFiberOptimizationMode(
+                                session.fiberOptimizationMode);
+                        }
                     }
-                    if (session.optimizedLineBeforeModeChange) {
-                        session.optimizedLine =
-                            std::move(*session.optimizedLineBeforeModeChange);
-                        session.optimizedLineBeforeModeChange.reset();
+                });
+        connect(dialog,
+                &LineAnnotationDialog::extrapolationDistanceChanged,
+                this,
+                [this, surfaceName](int) {
+                    auto* pane = paneForSurface(surfaceName);
+                    if (!pane || !pane->session) {
+                        return;
                     }
-                    if (session.branchesBeforeModeChange) {
-                        session.branches =
-                            std::move(*session.branchesBeforeModeChange);
-                        session.branchesBeforeModeChange.reset();
+                    auto& session = *pane->session;
+                    if (session.optimizedLine.points.size() < 2 ||
+                        session.controlPoints.empty()) {
+                        return;
                     }
-                    if (pane->dialog) {
-                        pane->dialog->setFiberOptimizationMode(
-                            session.fiberOptimizationMode);
+                    setSessionOptimizationState(
+                        session, SessionOptimizationState::Unoptimized);
+                    if (session.taskState == LineAnnotationSession::TaskState::Running) {
+                        // The running solve computes tails with the OLD distance:
+                        // refuse its wholesale publication (the epoch routes its
+                        // landing through the merge, where the config flag keeps
+                        // the current tails) and queue a whole-line pass instead
+                        // of silently dropping the new setting. Dispatch stays
+                        // mode-gated.
+                        session.solveQueue.noteSessionMutated();
+                        session.runningSolveConfigChanged = true;
+                        session.solveQueue.addPending({}, true);
+                        return;
                     }
-                }
-            });
-    connect(dialog,
-            &LineAnnotationDialog::extrapolationDistanceChanged,
-            this,
-            [this, surfaceName](int) {
-                auto* pane = paneForSurface(surfaceName);
-                if (!pane || !pane->session) {
-                    return;
-                }
-                auto& session = *pane->session;
-                if (session.optimizedLine.points.size() < 2 ||
-                    session.controlPoints.empty()) {
-                    return;
-                }
-                setSessionOptimizationState(
-                    session, SessionOptimizationState::Unoptimized);
-                if (session.taskState == LineAnnotationSession::TaskState::Running) {
-                    // The running solve computes tails with the OLD distance:
-                    // refuse its wholesale publication (the epoch routes its
-                    // landing through the merge, where the config flag keeps
-                    // the current tails) and queue a whole-line pass instead
-                    // of silently dropping the new setting. Dispatch stays
-                    // mode-gated.
-                    session.solveQueue.noteSessionMutated();
-                    session.runningSolveConfigChanged = true;
-                    session.solveQueue.addPending({}, true);
-                    return;
-                }
-                if (pane->dialog &&
-                    pane->dialog->reoptimizationMode() !=
-                        LineAnnotationDialog::ReoptimizationMode::AutoReoptimize) {
-                    return;
-                }
-                if (ensureDatasetForSession(session))
+                    if (pane->dialog &&
+                        pane->dialog->reoptimizationMode() !=
+                            LineAnnotationDialog::ReoptimizationMode::AutoReoptimize) {
+                        return;
+                    }
+                    if (ensureDatasetForSession(session))
+                        startFiberModeOptimization(session, false);
+                });
+        connect(dialog,
+                &LineAnnotationDialog::reoptimizationModeChanged,
+                this,
+                [this, surfaceName](LineAnnotationDialog::ReoptimizationMode mode) {
+                    if (mode != LineAnnotationDialog::ReoptimizationMode::AutoReoptimize) {
+                        return;
+                    }
+                    auto* pane = paneForSurface(surfaceName);
+                    if (!pane || !pane->session) {
+                        return;
+                    }
+                    auto& session = *pane->session;
+                    if (session.optimizationState == SessionOptimizationState::Optimized) {
+                        return;
+                    }
+                    if (session.taskState == LineAnnotationSession::TaskState::Running) {
+                        showError(tr("Line optimization is already running."),
+                                  session.suppressErrorDialogs);
+                        return;
+                    }
+                    if (session.optimizedLine.points.empty() || session.controlPoints.empty()) {
+                        return;
+                    }
+                    if (!ensureDatasetForSession(session)) {
+                        return;
+                    }
                     startFiberModeOptimization(session, false);
-            });
-    connect(dialog,
-            &LineAnnotationDialog::reoptimizationModeChanged,
-            this,
-            [this, surfaceName](LineAnnotationDialog::ReoptimizationMode mode) {
-                if (mode != LineAnnotationDialog::ReoptimizationMode::AutoReoptimize) {
-                    return;
-                }
-                auto* pane = paneForSurface(surfaceName);
-                if (!pane || !pane->session) {
-                    return;
-                }
-                auto& session = *pane->session;
-                if (session.optimizationState == SessionOptimizationState::Optimized) {
-                    return;
-                }
-                if (session.taskState == LineAnnotationSession::TaskState::Running) {
-                    showError(tr("Line optimization is already running."),
-                              session.suppressErrorDialogs);
-                    return;
-                }
-                if (session.optimizedLine.points.empty() || session.controlPoints.empty()) {
-                    return;
-                }
-                if (!ensureDatasetForSession(session)) {
-                    return;
-                }
-                startFiberModeOptimization(session, false);
-            });
+                });
+    }
     connect(dialog, &QObject::destroyed, this, [this, surfaceName]() {
         cleanupSurfaceName(surfaceName);
     });
@@ -2876,6 +2899,51 @@ LineAnnotationDialog* LineAnnotationController::openCollectionFiber(uint64_t fib
                 ? tr("Could not open the flattened fiber. The previous annotation may still be busy.")
                 : _lastSuppressedError;
         return nullptr;
+    }
+    return dialog;
+}
+
+LineAnnotationDialog* LineAnnotationController::openFiberReadOnly(const nlohmann::json& root,
+                                                                  const std::string& key,
+                                                                  QString* error)
+{
+    const auto fail = [error](const QString& message) -> LineAnnotationDialog* {
+        if (error) {
+            *error = message;
+        }
+        return nullptr;
+    };
+    for (const auto& pane : _panes) {
+        if (pane.session && pane.session->readOnly && pane.session->fiberFileName == key && pane.dialog) {
+            pane.dialog->raise();
+            pane.dialog->activateWindow();
+            return pane.dialog;
+        }
+    }
+    std::optional<StoredFiber> fiber;
+    try {
+        fiber = loadFiberJson(root, fs::path(key));
+    } catch (const std::exception& ex) {
+        return fail(tr("Could not read the fiber: %1").arg(QString::fromStdString(ex.what())));
+    }
+    if (!fiber) {
+        return fail(tr("Not a VC3D fiber."));
+    }
+    // In memory only, for this view: no file name in the package, no source
+    // root, no links (nothing to resolve them against), never saved.
+    fiber->readOnly = true;
+    fiber->branches.clear();
+    fiber->fileName = key;
+    fiber->sourceRoot.clear();
+    fiber->needsSave = false;
+    fiber->id = nextFiberId();
+    fiber->hvClassification = vc3d::line_annotation::classifyFiberHv(
+        vc3d::line_annotation::storedControlPointPositions(fiber->controlPoints));
+    const uint64_t id = fiber->id;
+    _fibers.push_back(std::move(*fiber));
+    auto* dialog = openCollectionFiber(id, error);
+    if (!dialog) {
+        std::erase_if(_fibers, [id](const StoredFiber& stored) { return stored.id == id && stored.readOnly; });
     }
     return dialog;
 }
@@ -2968,6 +3036,8 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
         controlPointIndex.has_value() || linePointIndex.has_value() ||
         spanControlIndices.has_value();
     session->initialFitWholeLine = collectionInspection;
+    session->readOnly = it->readOnly;
+    session->suppressFiberSave = session->suppressFiberSave || it->readOnly;
 
     if (seedOnlyPoint) {
         const cv::Vec3d seedPoint = *seedOnlyPoint;
@@ -6852,6 +6922,9 @@ std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fi
     std::vector<FiberSummary> summaries;
     summaries.reserve(_fibers.size());
     for (const auto& fiber : _fibers) {
+        if (fiber.readOnly) {
+            continue;  // a read-only view's fiber is not part of the package
+        }
         std::vector<FiberSummary::SpanSummary> spanSummaries;
         const std::vector<ControlSpanRecord>& spans = cachedControlSpansForFiber(fiber);
         spanSummaries.reserve(spans.size());
@@ -7749,7 +7822,16 @@ void LineAnnotationController::handleLineSeed(const std::string& surfaceName,
         const size_t fiberInferenceEntryCount = vpkg
             ? vpkg->fiberInferenceDatasetEntries().size()
             : 0;
-        if (vc3d::line_annotation::shouldRunNativeSeedTrace(
+        if (session.fiberOptimizationMode ==
+                vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d &&
+            fiberFollowEnabled()) {
+            if (!ensureFiberFollowService(session.suppressErrorDialogs)) {
+                return;
+            }
+            session.nativeSeedTracePending = true;
+            Logger()->info("Line annotation new fiber will be traced by the fiber-follow model "
+                           "after seed initialization");
+        } else if (vc3d::line_annotation::shouldRunNativeSeedTrace(
                 session.fiberOptimizationMode,
                 vpkg && !vpkg->selectedFiberInferenceDataset().empty(),
                 fiberInferenceEntryCount)) {
@@ -11952,6 +12034,10 @@ void LineAnnotationController::requestFinalizedClose(const std::string& surfaceN
     }
 
     auto& session = *pane->session;
+    if (session.readOnly) {
+        closeLineAnnotationDialogAfterFinalization(pane->dialog);
+        return;
+    }
     if (session.taskState == LineAnnotationSession::TaskState::Running) {
         showError(tr("Line optimization is already running."),
                   session.suppressErrorDialogs);
@@ -11974,7 +12060,7 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                                                  int activeStart,
                                                  int activeEnd)
 {
-    if (session.controlPoints.empty()) {
+    if (session.readOnly || session.controlPoints.empty()) {
         return;
     }
     if (session.fiberId != 0 && session.fiberMetricsMatchStoredFiber) {
@@ -12193,11 +12279,114 @@ LineAnnotationController::makeFiberModeOptimizationRequest(
     request.lasagnaConfig.maxIterations = 1000;
     request.lasagnaConfig.differentiableNormalSampling = true;
     request.lasagnaConfig.printSolverProgress = false;
+    if (fiberFollowEnabled() && FiberFollowService::instance().isRunning()) {
+        installFiberFollowTracer(request, session.fiberId != 0 ? fiberHvDirectionTag(session.fiberId)
+                                                               : QString::fromStdString(session.fiberManualHvTag));
+    }
     return request;
+}
+
+bool LineAnnotationController::fiberFollowEnabled()
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    return settings.value(vc3d::settings::line_annotation::FIBER_FOLLOW_ENABLED,
+                          vc3d::settings::line_annotation::FIBER_FOLLOW_ENABLED_DEFAULT).toBool() &&
+        !settings.value(vc3d::settings::line_annotation::FIBER_FOLLOW_CHECKPOINT).toString().isEmpty();
+}
+
+bool LineAnnotationController::ensureFiberFollowService(bool headless)
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    QString error;
+    if (FiberFollowService::instance().ensureRunning(
+            settings.value(vc3d::settings::line_annotation::FIBER_FOLLOW_CHECKPOINT).toString(),
+            settings.value(vc3d::settings::line_annotation::FIBER_FOLLOW_PYTHON).toString(),
+            &error)) {
+        return true;
+    }
+    showError(tr("Fiber-follow model: %1").arg(error), headless);
+    return false;
+}
+
+void LineAnnotationController::installFiberFollowTracer(
+    vc3d::line_annotation::FiberModeOptimizationRequest& request,
+    const QString& familyHint) const
+{
+    // The service works in VC3D base voxels with this volume's voxel size;
+    // the solve hands over trace coordinates (base / traceToBaseScale).
+    double baseUm = 0.0;
+    try {
+        if (_state && _state->currentVolume()) {
+            baseUm = _state->currentVolume()->voxelSize();
+        }
+    } catch (...) {
+    }
+    const double toBase = request.traceToBaseScale > 0.0 ? request.traceToBaseScale : 1.0;
+    const nlohmann::json family = familyHint == "H" || familyHint == "V"
+        ? nlohmann::json(familyHint.toStdString()) : nlohmann::json(nullptr);
+    const auto points = [toBase](const std::vector<cv::Vec3d>& trace) {
+        auto out = nlohmann::json::array();
+        for (const auto& p : trace) {
+            out.push_back({p[0] * toBase, p[1] * toBase, p[2] * toBase});
+        }
+        return out;
+    };
+    const auto vector = [](const cv::Vec3d& v) { return nlohmann::json::array({v[0], v[1], v[2]}); };
+    const auto fromBase = [toBase](const nlohmann::json& list) {
+        std::vector<cv::Vec3d> out;
+        out.reserve(list.size());
+        for (const auto& p : list) {
+            out.emplace_back(p.at(0).get<double>() / toBase, p.at(1).get<double>() / toBase,
+                             p.at(2).get<double>() / toBase);
+        }
+        return out;
+    };
+    if (!(baseUm > 0.0) || !std::isfinite(baseUm)) {
+        return;  // no voxel size to map coordinates: keep the native tracer
+    }
+    request.externalExtrapolation = [=](const std::vector<cv::Vec3d>& history, const cv::Vec3d& direction,
+                                        double distance) {
+        const auto reply = FiberFollowService::instance().request({
+            {"op", "extrapolate"}, {"history", points(history)}, {"direction", vector(direction)},
+            {"distance", distance * toBase}, {"base_um", baseUm}, {"family", family}});
+        vc::fiber_tracer::FiberTraceOneWayResult result;
+        result.points = fromBase(reply.at("points"));
+        result.reachedTraceLength = reply.value("reached_length", false);
+        result.reason = "fiber_follow: " + reply.value("reason", std::string());
+        result.steps = reply.value("decisions", 0);
+        return result;
+    };
+    request.externalSegment = [=](const vc::fiber_tracer::FiberTraceSegmentRequest& span) {
+        std::vector<cv::Vec3d> history(span.referenceLine.begin(),
+                                       span.referenceLine.begin() + static_cast<std::ptrdiff_t>(span.startIndex) + 1);
+        nlohmann::json body{{"op", "segment"}, {"history", points(history)},
+                            {"target", vector(span.referenceLine.at(span.targetIndex) * toBase)},
+                            {"base_um", baseUm}, {"family", family}};
+        if (span.startDirection) {
+            body["direction"] = vector(*span.startDirection);
+        }
+        const auto reply = FiberFollowService::instance().request(body);
+        vc::fiber_tracer::FiberTraceSegmentResult result;
+        result.fusedLine = fromBase(reply.at("points"));
+        result.forward.points = result.fusedLine;
+        result.forward.reason = "fiber_follow: " + reply.value("reason", std::string());
+        result.forward.steps = reply.value("decisions", 0);
+        result.accepted = reply.value("accepted", false) && result.fusedLine.size() >= 2;
+        result.meetingErrorBaseVoxels = reply.value("meeting_error", std::numeric_limits<double>::infinity());
+        result.meetingErrorTraceVoxels = result.meetingErrorBaseVoxels / toBase;
+        result.maxEndpointErrorBaseVoxels = result.meetingErrorBaseVoxels;
+        result.maxEndpointErrorTraceVoxels = result.meetingErrorTraceVoxels;
+        result.meetingSource = "fiber_follow";
+        result.reason = "fiber_follow: " + reply.value("reason", std::string());
+        return result;
+    };
 }
 
 void LineAnnotationController::scheduleSolveDispatch(LineAnnotationSession& session)
 {
+    if (session.readOnly) {
+        return;
+    }
     using Queue = vc3d::line_annotation::OptimizationCoalescingQueue;
     syncDialogLineSolveActivity(session);
     if (session.solveQueue.state() != Queue::State::Idle) {
@@ -12292,7 +12481,7 @@ void LineAnnotationController::startFiberModeOptimization(
     std::optional<std::vector<size_t>> dirtySegments,
     bool globalGoalsOnly)
 {
-    if (session.controlPoints.empty() || session.optimizedLine.points.size() < 2) {
+    if (session.readOnly || session.controlPoints.empty() || session.optimizedLine.points.size() < 2) {
         return;
     }
     if (!ensureDatasetForSession(session) || !session.normalSampler) {
@@ -12306,7 +12495,11 @@ void LineAnnotationController::startFiberModeOptimization(
                             control.segmentToNext->interpGoal ==
                                 vc3d::line_annotation::SegmentInterpolationGoal::Trace;
                     });
-    if (needsTrace &&
+    if (needsTrace && fiberFollowEnabled()) {
+        if (!ensureFiberFollowService(session.suppressErrorDialogs)) {
+            return;
+        }
+    } else if (needsTrace &&
         (!ensureFiberInferenceDatasetForSession(session) ||
          !session.traceNormalSampler || !session.fiberPredictionField)) {
         return;
@@ -14141,6 +14334,7 @@ void LineAnnotationController::cleanupSurfaceName(const std::string& surfaceName
     const auto before = _panes.size();
     std::vector<std::string> generatedSurfaceNames;
     std::shared_ptr<LineAnnotationSession> sessionToSave;
+    std::optional<uint64_t> readOnlyFiber;
     for (const auto& pane : _panes) {
         if (pane.surfaceName == surfaceName && pane.session && pane.session->watcher) {
             auto* watcher = pane.session->watcher.data();
@@ -14166,7 +14360,11 @@ void LineAnnotationController::cleanupSurfaceName(const std::string& surfaceName
             // reopened in a fresh session -- a surviving entry could then
             // pass validation while holding the previous session's geometry.
             _sideStripSessionSnapshotCache.erase(pane.session->fiberId);
-            if (!pane.session->suppressFiberSave &&
+            if (pane.session->readOnly) {
+                readOnlyFiber = pane.session->fiberId;
+            }
+            if (!pane.session->readOnly &&
+                !pane.session->suppressFiberSave &&
                 pane.session->taskState == LineAnnotationSession::TaskState::Succeeded &&
                 !pane.session->optimizedLine.points.empty() &&
                 !pane.session->controlPoints.empty()) {
@@ -14205,6 +14403,11 @@ void LineAnnotationController::cleanupSurfaceName(const std::string& surfaceName
 
     if (sessionToSave) {
         saveSessionAsFiber(*sessionToSave);
+    }
+    if (readOnlyFiber) {
+        std::erase_if(_fibers, [id = *readOnlyFiber](const StoredFiber& fiber) {
+            return fiber.id == id && fiber.readOnly;
+        });
     }
 
     if (_state) {
@@ -15508,10 +15711,28 @@ void LineAnnotationController::optimizeAndSaveFiberHeadless(
             }
         }
     }
-    if (!request.inputs.baseNormalSampler || !request.inputs.traceNormalSampler ||
-        !request.inputs.predictions) {
+    // With the fiber-follow model the spans are traced by it and both ends are
+    // extended by the Line Annotation extrapolation distance; otherwise the
+    // native tracer keeps the drawn controls as the fiber's bounds.
+    const bool fiberFollow = fiberFollowEnabled();
+    if (fiberFollow && !ensureFiberFollowService(true)) {
+        fail(tr("The fiber-follow model could not start; see the log."));
+        return;
+    }
+    if (!request.inputs.baseNormalSampler ||
+        (!fiberFollow && (!request.inputs.traceNormalSampler || !request.inputs.predictions))) {
         fail(tr("Fiber optimization inputs are incomplete."));
         return;
+    }
+    vc3d::line_annotation::FiberModeOptimizationRequest tracerTemplate;
+    tracerTemplate.traceToBaseScale = request.inputs.traceToBaseScale;
+    double fiberFollowExtrapolation = 0.0;
+    if (fiberFollow) {
+        installFiberFollowTracer(tracerTemplate, {});
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        fiberFollowExtrapolation = settings.value(
+            vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX,
+            vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX_DEFAULT).toDouble();
     }
     QString sourceError;
     if (!registerExternalFiberSource(request.destinationFiberSource, &sourceError)) {
@@ -15524,8 +15745,9 @@ void LineAnnotationController::optimizeAndSaveFiberHeadless(
     if (ec) destination = fs::absolute(
         request.destinationFiberSource).lexically_normal();
     auto shouldSave = std::move(request.shouldSave);
-    const auto coordinateBaseShapeZYX =
-        request.inputs.fiberDataset->manifest().baseShapeZYX;
+    const auto coordinateBaseShapeZYX = request.inputs.fiberDataset
+        ? request.inputs.fiberDataset->manifest().baseShapeZYX
+        : request.inputs.normalDataset->manifest().baseShapeZYX;
 
     struct HeadlessResult {
         bool ok = false;
@@ -15600,7 +15822,10 @@ void LineAnnotationController::optimizeAndSaveFiberHeadless(
                 }
             });
     watcher->setFuture(QtConcurrent::run(
-        [request = std::move(request)]() mutable {
+        [request = std::move(request),
+         externalExtrapolation = std::move(tracerTemplate.externalExtrapolation),
+         externalSegment = std::move(tracerTemplate.externalSegment),
+         fiberFollowExtrapolation]() mutable {
             HeadlessResult output;
             try {
                 vc::lasagna::LineOptimizationConfig config;
@@ -15657,6 +15882,12 @@ void LineAnnotationController::optimizeAndSaveFiberHeadless(
                     vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d;
                 fiberRequest.retainOpenTails = false;
                 fiberRequest.extrapolationDistanceBaseVoxels = 0.0;
+                if (externalSegment) {
+                    fiberRequest.externalExtrapolation = std::move(externalExtrapolation);
+                    fiberRequest.externalSegment = std::move(externalSegment);
+                    fiberRequest.retainOpenTails = true;
+                    fiberRequest.extrapolationDistanceBaseVoxels = fiberFollowExtrapolation;
+                }
                 auto optimized = vc3d::line_annotation::
                     optimizeFiberWithNativeFallback(std::move(fiberRequest));
                 output.controls = std::move(optimized.controlPoints);
@@ -17900,7 +18131,7 @@ void LineAnnotationController::saveFiberDisplayAnnotations(LineAnnotationSession
 
 void LineAnnotationController::scheduleSessionAutoSave(LineAnnotationSession& session)
 {
-    if (session.autoSaveScheduled) {
+    if (session.readOnly || session.autoSaveScheduled) {
         return;
     }
     session.autoSaveScheduled = true;
@@ -17953,6 +18184,9 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
 {
     // Any direct save supersedes a pending debounced autosave.
     session.autoSaveScheduled = false;
+    if (session.readOnly) {
+        return;
+    }
     // A session whose fiber was deleted underneath it is not saved through
     // here - the close with a final optimization included - or it would
     // recreate the deleted file (or overwrite an import under that name).
@@ -18303,6 +18537,9 @@ nlohmann::json LineAnnotationController::fiberSaveSnapshotToJson(
 
 void LineAnnotationController::saveFiberNow(const StoredFiber& fiber) const
 {
+    if (fiber.readOnly) {
+        return;
+    }
     const fs::path dir = fiber.sourceRoot.empty() ? fibersDir() : fiber.sourceRoot;
     if (dir.empty()) {
         throw std::runtime_error("No volume package is loaded");
@@ -18379,6 +18616,7 @@ void LineAnnotationController::scheduleFiberSaveSnapshots(
     std::vector<FiberSaveSnapshot> snapshots,
     bool showErrors)
 {
+    std::erase_if(snapshots, [](const FiberSaveSnapshot& snapshot) { return snapshot.fiber.readOnly; });
     if (snapshots.empty()) {
         return;
     }

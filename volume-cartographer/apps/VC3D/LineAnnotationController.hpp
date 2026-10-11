@@ -332,6 +332,12 @@ public:
     // line in both strips. A Lasagna dataset is optional. Errors are returned
     // through error instead of dialogs.
     LineAnnotationDialog* openCollectionFiber(uint64_t fiberId, QString* error = nullptr);
+    // Opens a fiber annotation (with line_points) read-only, without adding it
+    // to the package: nothing is written, optimized or edited, and the fiber
+    // is forgotten when its view closes. key identifies the source fiber
+    // (reopening the same key while its view is open reuses that view).
+    LineAnnotationDialog* openFiberReadOnly(const nlohmann::json& fiber, const std::string& key,
+                                            QString* error = nullptr);
     void openFiberAtControlPoint(uint64_t fiberId, int controlPointIndex);
     void openFiberAtLinePointIndex(uint64_t fiberId, int linePointIndex);
     void openFiberSpan(uint64_t fiberId, int firstControlIndex, int secondControlIndex);
@@ -916,6 +922,16 @@ private:
                                          bool retraceAll,
                                          std::optional<std::vector<size_t>> dirtySegments = std::nullopt,
                                          bool globalGoalsOnly = false) const;
+    // Fiber model backend: the neural fiber-follow model when enabled and a
+    // checkpoint is chosen (Line Annotation menu); else the native tracer.
+    [[nodiscard]] static bool fiberFollowEnabled();
+    // GUI thread: starts the fiber-follow service if needed; false (error
+    // shown unless headless) when it cannot run.
+    bool ensureFiberFollowService(bool headless);
+    // Points the request's tail extrapolation and Trace spans at the running
+    // fiber-follow service. familyHint: "H", "V" or empty (from the direction).
+    void installFiberFollowTracer(vc3d::line_annotation::FiberModeOptimizationRequest& request,
+                                  const QString& familyHint) const;
     // Drops the cached scroll umbilicus and everything describing it, so the next
     // use resolves again.
     void invalidateScrollUmbilicus();

@@ -9,6 +9,7 @@
 #include "LineAnnotationGeneratedViews.hpp"
 #include "LineAnnotationShiftScroll.hpp"
 #include "VCSettings.hpp"
+#include "PythonExecutable.hpp"
 #include "ViewerManager.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
@@ -47,6 +48,8 @@
 #include <QScopeGuard>
 #include <QSignalBlocker>
 #include <QSettings>
+#include <QFileDialog>
+#include <QFileInfo>
 #include <QShortcut>
 #include <QSizePolicy>
 #include <QSplitter>
@@ -773,6 +776,59 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _fiberInferenceDatasetMenu->setToolTipsVisible(true);
     _fiberInferenceDatasetMenu->menuAction()->setToolTip(
         tr("Select the fiber inference dataset used for line annotation."));
+    {
+        // Fiber model backend: the neural fiber-follow model (a vesuvius
+        // checkpoint, run by the Python environment VC3D was started from)
+        // instead of the native tracer, for extrapolation and traced spans.
+        auto* fiberFollowMenu = annotationMenu->addMenu(tr("Fiber follow model"));
+        fiberFollowMenu->setToolTipsVisible(true);
+        _fiberFollowEnabledAction = fiberFollowMenu->addAction(tr("Use for the Fiber model"));
+        _fiberFollowEnabledAction->setCheckable(true);
+        _fiberFollowEnabledAction->setToolTip(
+            tr("Trace and extrapolate Fiber model lines with the fiber-follow checkpoint."));
+        connect(_fiberFollowEnabledAction, &QAction::toggled, this, [this](bool checked) {
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            if (checked && settings.value(vc3d::settings::line_annotation::FIBER_FOLLOW_CHECKPOINT)
+                               .toString().isEmpty()) {
+                chooseFiberFollowCheckpoint();
+                settings.sync();
+                if (settings.value(vc3d::settings::line_annotation::FIBER_FOLLOW_CHECKPOINT)
+                        .toString().isEmpty()) {
+                    QSignalBlocker block(_fiberFollowEnabledAction);
+                    _fiberFollowEnabledAction->setChecked(false);
+                    return;
+                }
+            }
+            settings.setValue(vc3d::settings::line_annotation::FIBER_FOLLOW_ENABLED, checked);
+            updateFiberFollowMenu();
+            emit fiberFollowSettingsChanged();
+        });
+        _fiberFollowCheckpointAction = fiberFollowMenu->addAction(tr("Checkpoint…"));
+        connect(_fiberFollowCheckpointAction, &QAction::triggered, this, [this]() {
+            chooseFiberFollowCheckpoint();
+        });
+        _fiberFollowPythonAction = fiberFollowMenu->addAction(tr("Python…"));
+        connect(_fiberFollowPythonAction, &QAction::triggered, this, [this]() {
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            const QString current = vc3d::pythonExecutableForServices(
+                settings.value(vc3d::settings::line_annotation::FIBER_FOLLOW_PYTHON).toString());
+            const QString path = QFileDialog::getOpenFileName(
+                this, tr("Python for the fiber-follow model"), current, tr("All files (*)"));
+            if (path.isEmpty()) {
+                return;
+            }
+            settings.setValue(vc3d::settings::line_annotation::FIBER_FOLLOW_PYTHON, path);
+            updateFiberFollowMenu();
+            emit fiberFollowSettingsChanged();
+        });
+        auto* autoPython = fiberFollowMenu->addAction(tr("Use VC3D's Python environment"));
+        connect(autoPython, &QAction::triggered, this, [this]() {
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            settings.remove(vc3d::settings::line_annotation::FIBER_FOLLOW_PYTHON);
+            updateFiberFollowMenu();
+            emit fiberFollowSettingsChanged();
+        });
+    }
     annotationMenu->addSeparator();
     // Length / Extrapolation live in the menu as embedded label+spinbox rows
     // (QWidgetAction); editing them does not close the menu. Spinbox edits are
@@ -926,6 +982,7 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
             });
 
     rebuildDatasetMenus();
+    updateFiberFollowMenu();
 
     auto* toggleVolumeOverlay = annotationMenu->addAction(tr("Toggle volume overlay"));
     toggleVolumeOverlay->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Space));
@@ -1144,6 +1201,54 @@ void LineAnnotationDialog::setFiberInferenceDatasetOptions(
     _fiberInferenceDatasetOptions = std::move(options);
     _selectedFiberInferenceDatasetLocation = selectedLocation;
     rebuildDatasetMenus();
+}
+
+void LineAnnotationDialog::chooseFiberFollowCheckpoint()
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const QString current = settings.value(vc3d::settings::line_annotation::FIBER_FOLLOW_CHECKPOINT).toString();
+    const QString path = QFileDialog::getOpenFileName(
+        this, tr("Fiber-follow checkpoint"), current.isEmpty() ? QString() : QFileInfo(current).absolutePath(),
+        tr("Checkpoints (*.pt *.pth);;All files (*)"));
+    if (path.isEmpty()) {
+        return;
+    }
+    settings.setValue(vc3d::settings::line_annotation::FIBER_FOLLOW_CHECKPOINT, path);
+    updateFiberFollowMenu();
+    emit fiberFollowSettingsChanged();
+}
+
+void LineAnnotationDialog::updateFiberFollowMenu()
+{
+    if (!_fiberFollowEnabledAction) {
+        return;
+    }
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    namespace keys = vc3d::settings::line_annotation;
+    const QString checkpoint = settings.value(keys::FIBER_FOLLOW_CHECKPOINT).toString();
+    const bool enabled = settings.value(keys::FIBER_FOLLOW_ENABLED, keys::FIBER_FOLLOW_ENABLED_DEFAULT).toBool() &&
+        !checkpoint.isEmpty();
+    {
+        QSignalBlocker block(_fiberFollowEnabledAction);
+        _fiberFollowEnabledAction->setChecked(enabled);
+    }
+    _fiberFollowCheckpointAction->setText(checkpoint.isEmpty()
+        ? tr("Checkpoint…")
+        : tr("Checkpoint: %1…").arg(QFileInfo(checkpoint).fileName()));
+    _fiberFollowCheckpointAction->setToolTip(checkpoint);
+    const QString configured = settings.value(keys::FIBER_FOLLOW_PYTHON).toString();
+    const QString python = vc3d::pythonExecutableForServices(configured);
+    _fiberFollowPythonAction->setText(configured.isEmpty()
+        ? tr("Python: %1 (VC3D's environment)…").arg(python)
+        : tr("Python: %1…").arg(python));
+    if (_fiberOptimizationCombo) {
+        const int index = _fiberOptimizationCombo->findData(
+            static_cast<int>(vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d));
+        if (index >= 0) {
+            _fiberOptimizationCombo->setItemText(
+                index, enabled ? tr("Fiber model (fiber follow)") : tr("Fiber model"));
+        }
+    }
 }
 
 void LineAnnotationDialog::rebuildDatasetMenus()
