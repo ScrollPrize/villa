@@ -2,8 +2,9 @@
 
 - [x] Loss implementation committed as c468354dd (81 regression tests passed).
 - [x] Independent experiment-plan review.
-- [ ] Managed run and per-pass diagnostics.
-- [ ] Final comparison, results and commit.
+- [x] Managed run and per-pass diagnostics; exit0,699.28s solver elapsed.
+- [x] Final comparison in uv_squared_vertical_split_results.md; no meaningful
+  accuracy change versus earlier quadratic,1.9% shorter nonisolated timing.
 
 # Previous: split V equality / Z layout prior
 
