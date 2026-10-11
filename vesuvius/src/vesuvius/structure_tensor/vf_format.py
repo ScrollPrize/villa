@@ -6,6 +6,20 @@ from numcodecs import Blosc
 from vesuvius.data.utils import open_zarr_group, create_zarr_array
 from typing import Optional, Tuple
 
+def downsample_axis(a0: int, a1: int, s: int) -> Tuple[slice, int, int]:
+    """Nearest-neighbour downsampling of the full-resolution range [a0, a1) by ``s``.
+
+    Output voxel k holds input voxel k*s. Returns ``(sl, o0, o1)``: ``sl`` selects the
+    on-grid samples from a block that starts at ``a0``, and ``[o0, o1)`` is where they
+    go in the downsampled array. Block bounds need not be multiples of ``s``.
+    """
+    start = (s - (a0 % s)) % s
+    sl = slice(start, a1 - a0, s)
+    o0 = (a0 + start) // s
+    o1 = (a1 - 1) // s + 1
+    return sl, o0, o1
+
+
 def _default_compressor() -> Blosc:
     return Blosc(cname="zstd", clevel=1, shuffle=Blosc.SHUFFLE)
 
@@ -94,10 +108,6 @@ class OMEU8VectorWriter:
             write_empty_chunks=False,
         )
 
-    def _down_bounds(self, z0, z1, y0, y1, x0, x1):
-        s = self.ds
-        return (z0 // s, z1 // s, y0 // s, y1 // s, x0 // s, x1 // s)
-
     def write_block(
         self,
         *,
@@ -110,13 +120,19 @@ class OMEU8VectorWriter:
         Dz, Dy, Dx, _ = directions_block_zyx.shape
         assert Dz == (z1 - z0) and Dy == (y1 - y0) and Dx == (x1 - x0)
 
-        # nearest-neighbour DS for now (consistent with // indexing)
-        dsub = directions_block_zyx[::self.ds, ::self.ds, ::self.ds, :] if self.ds > 1 else directions_block_zyx
+        # Nearest-neighbour DS consistent with // indexing (same rule as create_st).
+        # Block bounds need not be multiples of ds: the last block of a run is clipped
+        # to the volume edge, and its on-grid samples must still be written.
+        slz, z0d, z1d = downsample_axis(z0, z1, self.ds)
+        sly, y0d, y1d = downsample_axis(y0, y1, self.ds)
+        slx, x0d, x1d = downsample_axis(x0, x1, self.ds)
+        if z1d <= z0d or y1d <= y0d or x1d <= x0d:
+            return  # block contains no voxel on the downsampled grid
+        dsub = directions_block_zyx[slz, sly, slx, :]
         z_u8 = encode_dir_to_u8(dsub[..., 0])
         y_u8 = encode_dir_to_u8(dsub[..., 1])
         x_u8 = encode_dir_to_u8(dsub[..., 2])
 
-        z0d, z1d, y0d, y1d, x0d, x1d = self._down_bounds(z0, z1, y0, y1, x0, x1)
         self.ds_z[z0d:z1d, y0d:y1d, x0d:x1d] = z_u8
         self.ds_y[z0d:z1d, y0d:y1d, x0d:x1d] = y_u8
         self.ds_x[z0d:z1d, y0d:y1d, x0d:x1d] = x_u8
@@ -124,7 +140,7 @@ class OMEU8VectorWriter:
         if self.ds_conf is not None:
             if confidence_block is None:
                 raise ValueError("make_confidence=True but confidence_block=None")
-            csub = confidence_block[::self.ds, ::self.ds, ::self.ds] if self.ds > 1 else confidence_block
+            csub = confidence_block[slz, sly, slx]
             self.ds_conf[z0d:z1d, y0d:y1d, x0d:x1d] = encode_conf_to_u8(csub)
 
     def close(self):

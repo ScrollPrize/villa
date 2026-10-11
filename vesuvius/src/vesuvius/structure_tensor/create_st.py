@@ -21,6 +21,7 @@ from vesuvius.image_proc.geometry.structure_tensor import (
 )
 from numcodecs import Blosc
 from ._compile_utils import _maybe_compile_function
+from .vf_format import downsample_axis
 
 def _ceildiv(a: int, b: int) -> int:
     """Ceiling division for positives."""
@@ -760,15 +761,9 @@ def _finalize_structure_tensor_torch(
         # ---------- Write OME-style outputs (downsampled + quantized) ----------
         if ome_out:
             # Compute aligned downsample slices per axis
-            def _axis_ds(a0, a1, s):
-                start = (s - (a0 % s)) % s
-                sl = slice(start, a1 - a0, s)
-                o0 = (a0 + start) // s
-                o1 = (a1 - 1) // s + 1
-                return sl, o0, o1
-            slz, oz0, oz1 = _axis_ds(z0, z1, ds_factor)
-            sly, oy0, oy1 = _axis_ds(y0, y1, ds_factor)
-            slx, ox0, ox1 = _axis_ds(x0, x1, ds_factor)
+            slz, oz0, oz1 = downsample_axis(z0, z1, ds_factor)
+            sly, oy0, oy1 = downsample_axis(y0, y1, ds_factor)
+            slx, ox0, ox1 = downsample_axis(x0, x1, ds_factor)
 
             # FIRST (vector 0)
             fz[oz0:oz1, oy0:oy1, ox0:ox1] = _quantize_dir_u8(v_np[0, 0, slz, sly, slx])
@@ -997,7 +992,12 @@ def main():
                     compressor=compressor,
                     verbose=args.verbose,
                     swap_eigenvectors=args.swap_eigenvectors,
-                    device=args.device
+                    device=args.device,
+                    ome_out=args.ome_out,
+                    ome_downsample=args.ome_downsample,
+                    ome_scale=args.ome_scale,
+                    confidence_metric=args.confidence_metric,
+                    keep_eigen=args.keep_eigen,
                 )
                 print("\n--- All computations completed successfully ---")
                 print(f"Final output contains:")
