@@ -20,8 +20,9 @@ independent GPU lanes; timing matrix runs sequentially on GPU5 (UUID
 GPU-09395a0d-28a4-4b5a-cc3e-d3e024d05c36).105production updates,first5excluded,
 100CUDAevent timing samples. Compilation,initialization,finalaudit excluded from
 steady timing. Memory is peak PyTorch allocated—not process VRAM/reserved memory.
-Quality solver elapsed includes compilation and diagnostic audits, not manager
-queue/preparation. CPU resources/sharedhost can still affect end-to-end timing.
+Quality recorded solver elapsed includes compilation, prior diagnostics and the
+final hard audit, but excludes final reference-metric calculation and saving;
+also excludes manager queue/preparation. CPU resources/sharedhost can affect it.
 Shared pilots and interrupted separate-exclusive attempts are not used below.
 
 | Window N | Batch | Mean ms | p50 ms | p95 ms | k constraints/s | Peak allocated GiB |
@@ -77,6 +78,8 @@ Lastprofiledupdate excluded from timing statistics; unprofiled matrix supplies
 memorycomparison. Traces: data/uv_update_trace_{full,n2}_exclusive_v1/update_trace.json.
 
 ## Larger batch quality
+
+Reference L1 units are windings; within2 means within +/-2, inclusive.
 
 Completed exit0; full B8192/16384/32768 and N2B32768 with unchanged LR.
 8k matches eventbudget exactly;16/32k process8,192fewer constraints (.0124%).
