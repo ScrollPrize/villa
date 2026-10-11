@@ -256,7 +256,7 @@ class GramAlignmentTests(unittest.TestCase):
     def test_geometry_is_shared_at_different_resolutions_with_points(self):
         dataset = object.__new__(SSLZarrDataset)
         dataset.gram_teacher_no_augmentations = True
-        dataset.global_view_size = (3, 3, 3)
+        dataset.global_crop_size = (3, 3, 3)
         pipeline = ComposeTransforms([
             RandomTransform(Rot90Transform(allowed_axes={0, 1, 2}), 1),
             _AddIntensity(),

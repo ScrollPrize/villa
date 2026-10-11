@@ -172,6 +172,8 @@ class PretrainSmokeTests(unittest.TestCase):
         report = build_verification_report(config, use_amp=False)
         self.assertTrue(report["forward"]["checks"]["all_passed"])
         self.assertTrue(report["train_step"]["checks"]["all_passed"])
+        self.assertEqual(report["forward"]["batch"]["global_crops"]["shape"][2:], (32, 32, 32))
+        self.assertEqual(report["forward"]["batch"]["local_crops"]["shape"][2:], (16, 16, 16))
 
     def test_gram_refinement_smoke_step(self) -> None:
         report = build_verification_report(self._gram_config(output_name="gram_smoke"), use_amp=False)

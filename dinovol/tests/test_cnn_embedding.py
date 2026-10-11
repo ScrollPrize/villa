@@ -61,7 +61,9 @@ class CNNEmbeddingTests(unittest.TestCase):
         self.assertIsInstance(encoder.final_proj, nn.Identity)
         self.assertEqual([len(stage.blocks) for stage in encoder.stages], [2] * 4)
         self.assertFalse(any(name.startswith(("stem.", "final_proj.")) for name in encoder.state_dict()))
-        self.assertEqual(len(encoder.patch_halo()), 3)
+        for module in encoder.modules():
+            if isinstance(module, nn.Conv3d):
+                self.assertEqual(module.padding_mode, "zeros")
 
         shapes = []
         handles = [stage.register_forward_hook(lambda module, args, output: shapes.append(tuple(output.shape)))

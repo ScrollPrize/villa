@@ -691,6 +691,7 @@ class PatchEmbedDeeper(nn.Module):
             padding=final_pad,
             padding_mode="zeros",
         ) if final_projection else nn.Identity()
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)
         for stage in self.stages:

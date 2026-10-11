@@ -69,13 +69,11 @@ class VoxelMaskingTests(unittest.TestCase):
                     (8, 8, 8), (2, 2, 2), embedding_type="deeper",
                     deeper_embed_batch_chunk_size=batch_chunk_size,
                 )
-                # Exercise centered masks inside an overscanned view as well.
-                model.global_input_size = (16, 16, 16)
-                x = torch.randn(1, 2, 16, 16, 16)
+                x = torch.randn(2, 2, 8, 8, 8)
                 altered = x.clone()
-                masks = torch.zeros(1, 64, dtype=torch.bool)
-                masks[0, 21] = True  # Output-grid coordinate (1, 1, 1).
-                altered[:, :, 6:8, 6:8, 6:8] += 100
+                masks = torch.zeros(2, 64, dtype=torch.bool)
+                masks[:, 21] = True  # Output-grid coordinate (1, 1, 1).
+                altered[:, :, 2:4, 2:4, 2:4] += 100
                 captured = []
                 handle = model.down_projection.stem.register_forward_pre_hook(
                     lambda module, args: captured.append(args[0].detach().clone())
@@ -88,9 +86,8 @@ class VoxelMaskingTests(unittest.TestCase):
                     handle.remove()
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                 masked_input = x.clone()
-                masked_input[:, :, 6:8, 6:8, 6:8] = 0
-                for stem_input in captured:
-                    torch.testing.assert_close(stem_input, masked_input, rtol=0, atol=0)
+                masked_input[:, :, 2:4, 2:4, 2:4] = 0
+                torch.testing.assert_close(torch.cat(captured), masked_input.repeat(2, 1, 1, 1, 1), rtol=0, atol=0)
                 # The same change must remain visible to an unmasked teacher.
                 with torch.no_grad():
                     teacher = model.forward_features(x)["x_norm_patchtokens"]

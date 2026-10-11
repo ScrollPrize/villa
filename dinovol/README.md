@@ -51,11 +51,10 @@ stage's 288 channels become EVA tokens directly. Residual skip connections
 retain their channel projections. Total stride is 16, giving 4,096 global
 tokens and 512 local tokens, before CLS/register tokens.
 
-The recipe explicitly keeps the 512³ source sampling window. The existing CNN
-context calculation adds an 80-voxel halo per side, producing 416³ global and
-288³ local model inputs before cropping the embedded grids. Source reads also
-expand to provide that context, so this needs more input memory and I/O than
-the single-convolution embedding. The output directory is
+The recipe keeps a 512³ source sampling window, from which augmented crops are
+drawn. CNN convolutions use zero padding, and the model receives exactly the
+256³ global and 128³ local crops. There is no halo expansion, extra context read,
+or cropping of the embedded grid. The output directory is
 `dinovol_pretrain_8_9um_cnn288/` to avoid automatically resuming incompatible
 checkpoints from the earlier width-864 recipe.
 
@@ -76,8 +75,12 @@ The configurable CNN options under `model` are:
 
 Without a final projection, the last stage must have `embed_dim` channels.
 Stage counts must match the downsampling stages implied by `patch_size`.
-Omitted options preserve the existing deeper embedding architecture and its
-checkpoint layout. The CNN regression tests check the recipe's architecture
+Omitted CNN architecture options preserve the existing deeper embedding's
+parameter layout. All CNN embeddings now use zero padding; older checkpoints
+can load with matching architecture, but their boundary behavior changes.
+Spatial CNN chunking and the separate `*_view_size` dataset settings have been
+removed; use `*_crop_size` and optionally `deeper_embed_batch_chunk_size`.
+The CNN regression tests check the recipe's architecture
 on a 32³ synthetic crop, gradients, masking, and checkpoint reconstruction;
 the pretraining smoke suite also exercises the projection-free path with a
 smaller CNN and synthetic volume.
@@ -192,8 +195,7 @@ checkpoint conversion.
 Masked student views always zero the selected voxel regions before patch
 embedding, then replace the selected embeddings with the learned mask token.
 Each loss-mask position covers one `patch_size` region on the output grid.
-Masking happens on the prepared model input, before convolution or tiling;
-overscanned inputs place the mask in the centered output region. The original
+Masking happens on the prepared model input, before convolution. The original
 crop remains unchanged for the unmasked teacher.
 
 For `embedding_type: "default"`, this is mathematically equivalent to the former
@@ -231,7 +233,7 @@ The new config surface is:
 
 When `gram.enabled=true`, the trainer builds a frozen Gram teacher backbone, loads it from `gram.teacher_checkpoint` when provided, refreshes it from the live EMA teacher on the configured cadence, and adds an image-level Gram loss on patch features. Gram-teacher crops are paired with each global crop from the exact same sampled 3D region. With `gram_teacher_no_augmentations=true`, they receive normalization and the same geometric transforms as the student, but no intensity/noise augmentation. Shared rotations, flips, and transpositions preserve patch correspondence even at different crop resolutions.
 
-Mixed-resolution HR adaptation is enabled by adding `dataset.variants`, where each variant defines its own crop sizes and sampling ratio. The trainer builds one dataloader per variant and samples them with the configured weights. For `embedding_type=deeper`, the dataset automatically derives the needed overscanned `*_view_size` values from the patch halo.
+Mixed-resolution HR adaptation is enabled by adding `dataset.variants`, where each variant defines its own crop sizes and sampling ratio. The trainer builds one dataloader per variant and samples them with the configured weights. All embedding types consume the configured crop sizes directly.
 
 `dinovol_2/example_config.json` remains runnable as a base-pretraining config and also includes a `recipes` object with three complete examples:
 
