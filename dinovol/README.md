@@ -46,6 +46,31 @@ point supervision are disabled for this initial stage.
 The FFN uses `mlp_ratio: 7.111111111111111` (2,048 / 288); its packed input
 projection produces two 2,048-wide branches before gating.
 
+Compilation is enabled for this recipe with the top-level setting:
+
+```json
+"compile": {"enabled": true, "backend": "inductor", "mode": "default"}
+```
+
+The trainer compiles the student and teacher backbones (CNN plus transformer)
+and DINO/iBOT projection heads in place using `nn.Module.compile`. A Gram teacher
+backbone is also compiled if present. Losses, token selection, optimizer/EMA
+updates, and data loading remain eager. Parameter names and optimizer references
+are unchanged, so checkpoints can be resumed with compilation enabled or disabled.
+Compilation does not add CNN checkpointing or change precision settings.
+Compiled backward graphs are captured with autocast disabled for backward,
+matching the trainer's existing AMP forward / non-autocast backward sequence.
+
+Other configs default to compilation disabled; `"compile": false` disables it.
+Optional settings are `backend`, `mode`, `dynamic` (default `null`, automatic
+dynamic-shape handling), and `fullgraph` (default `false`, allowing graph breaks).
+Initial calls compile lazily; global/local shapes and training/evaluation paths
+can each require warmup. Compilation failures are not silently suppressed.
+The default mode avoids explicitly enabling CUDA-graph modes that reserve extra
+workspace memory. Measure throughput and peak VRAM after warmup on the target GPU;
+compiled execution can change floating-point rounding and random-number streams.
+For compiler diagnostics, run with `TORCH_LOGS=graph_breaks,recompiles`.
+
 The model option `attention_type` accepts `"full"` (the default, used in this recipe)
 or `"axial"`. Each axial block has three sequential attention
 sublayers along D, H, and W, each with its own normalization, projections, and

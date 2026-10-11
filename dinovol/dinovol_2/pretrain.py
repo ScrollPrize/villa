@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 from copy import deepcopy
 import json
 from pathlib import Path
@@ -18,6 +19,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch._functorch import config as functorch_config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
@@ -315,6 +317,41 @@ class DinoIBOTPretrainer:
             if self.task_eval_every > 0
             else None
         )
+        self._configure_model_compilation()
+
+    def _configure_model_compilation(self) -> None:
+        settings = self.config.get("compile", False)
+        if isinstance(settings, bool):
+            settings = {"enabled": settings}
+        elif isinstance(settings, Mapping):
+            settings = dict(settings)
+        else:
+            raise ValueError("compile must be a boolean or a settings mapping")
+        unknown = set(settings) - {"enabled", "backend", "mode", "dynamic", "fullgraph"}
+        if unknown:
+            raise ValueError(f"Unknown compile settings: {sorted(unknown)}")
+        enabled = settings.pop("enabled", False)
+        if not isinstance(enabled, bool):
+            raise ValueError("compile.enabled must be a boolean")
+        self.compile_enabled = enabled
+        if not enabled:
+            return
+        options = {"backend": "inductor", "mode": "default", "dynamic": None, "fullgraph": False, **settings}
+        if options["dynamic"] is not None and not isinstance(options["dynamic"], bool):
+            raise ValueError("compile.dynamic must be a boolean or null")
+        if not isinstance(options["fullgraph"], bool):
+            raise ValueError("compile.fullgraph must be a boolean")
+        if not isinstance(options["backend"], str) or not isinstance(options["mode"], str):
+            raise ValueError("compile.backend and compile.mode must be strings")
+        # Compile inner modules rather than DDP or the variable masked-token selection.
+        # In-place compilation preserves parameter identities and state_dict keys for
+        # optimizer groups, EMA updates, checkpoint loading, and downstream inference.
+        for branch in (self.model_module.student, self.model_module.teacher):
+            for module in branch.values():
+                module.compile(**options)
+        if self.gram_teacher_backbone is not None:
+            self.gram_teacher_backbone.compile(**options)
+
     @property
     def is_main_process(self) -> bool:
         return self.rank == 0
@@ -1059,15 +1096,19 @@ class DinoIBOTPretrainer:
         n_masked: int,
         return_teacher: bool,
     ) -> Mapping[str, Any]:
-        return self.model(
-            student_input=global_crops,
-            teacher_input=global_crops if return_teacher else None,
-            student_masks=masks,
-            local_student_input=local_crops,
-            mask_indices_list=mask_indices,
-            n_masked_patches=n_masked,
-            return_teacher=return_teacher,
-        )
+        # Backward runs outside autocast. AOTAutograd must use that same
+        # assumption when it captures backward graphs during these forwards.
+        context = functorch_config.patch(backward_pass_autocast="off") if self.compile_enabled else nullcontext()
+        with context:
+            return self.model(
+                student_input=global_crops,
+                teacher_input=global_crops if return_teacher else None,
+                student_masks=masks,
+                local_student_input=local_crops,
+                mask_indices_list=mask_indices,
+                n_masked_patches=n_masked,
+                return_teacher=return_teacher,
+            )
 
     def verify_batch_pipeline(self, batch: Mapping[str, Any], step: int = 0) -> dict[str, Any]:
         teacher_temp = self._teacher_temp(step)

@@ -333,10 +333,10 @@ class EvaBlock(nn.Module):
                 if rope_shape is None:
                     raise ValueError("rope_shape must be provided when using per-block RoPE")
                 rope = self.rope_embed.get_embed(rope_shape)
-        norms = [self.norm1, *self.axial_norms]
-        attentions = [self.attn, *self.axial_attns]
-        gammas = [self.gamma_1, *self.axial_gammas] if self.gamma_1 is not None else [None] * len(attentions)
-        for norm, attention, gamma in zip(norms, attentions, gammas):
+        update = self.attn(self.norm1(x), rope=rope, attn_mask=attn_mask, rope_shape=rope_shape)
+        x = x + self.drop_path1(update if self.gamma_1 is None else self.gamma_1 * update)
+        for index, (norm, attention) in enumerate(zip(self.axial_norms, self.axial_attns)):
+            gamma = self.axial_gammas[index] if self.gamma_1 is not None else None
             update = attention(norm(x), rope=rope, attn_mask=attn_mask, rope_shape=rope_shape)
             x = x + self.drop_path1(update if gamma is None else gamma * update)
         update = self.mlp(self.norm2(x))

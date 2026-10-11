@@ -17,6 +17,11 @@
   "ibot_masked_loss_chunk_size": 4096,
   "max_iterations": 1000000,
   "batch_size": 4,
+  "compile": {
+    "enabled": true,
+    "backend": "inductor",
+    "mode": "default"
+  },
   "model": {
     "model_type": "v3",
     "attention_type": "full",
