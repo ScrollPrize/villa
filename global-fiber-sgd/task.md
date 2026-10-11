@@ -1,5 +1,8 @@
 # Saved U/V solution visualization
 
+Current: uv_squared_vertical_split_plan.md. Run corrected quadratic fused solve
+and report speed/reference accuracy; commit current implementation first.
+
 Current: uv_vertical_split_plan.md. V equality at constraints, separate weak
 individual V≈Z prior allowing local physical-Z reversal.
 

@@ -1,4 +1,11 @@
-# Current: split V equality / Z layout prior
+# Current: corrected quadratic fused run
+
+- [x] Loss implementation committed as c468354dd (81 regression tests passed).
+- [x] Independent experiment-plan review.
+- [ ] Managed run and per-pass diagnostics.
+- [ ] Final comparison, results and commit.
+
+# Previous: split V equality / Z layout prior
 
 - [x] Independent plan review and shared implementation.
 - [x] Removed manufactured target_v from every production consumer/API.

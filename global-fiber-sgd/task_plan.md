@@ -1,5 +1,7 @@
 # Global fiber SGD: data reconnaissance
 
+Current: uv_squared_vertical_split_plan.md.
+
 Current: uv_vertical_split_plan.md, independently approved.
 
 Current: uv_remove_pair_phase_plan.md, independently approved.
