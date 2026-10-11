@@ -51,15 +51,17 @@ class CNNEmbeddingTests(unittest.TestCase):
         self.assertEqual(config["local_crops_size"], [64] * 3)
         self.assertEqual(recipe_config["dataset"]["global_crop_size"], config["global_crops_size"])
         self.assertEqual(recipe_config["dataset"]["local_crop_size"], config["local_crops_size"])
+        self.assertEqual(recipe_config["dataset"]["num_local_crops"], 2)
         resolved = _materialize_backbone_config(config)
         self.assertEqual(resolved["embed_dim"], 288)
         self.assertEqual(resolved["num_heads"], 6)
         self.assertEqual(resolved["depth"], 8)
         self.assertEqual(resolved["attention_type"], "full")
         self.assertEqual(resolved["patch_size"], (8, 8, 8))
-        self.assertEqual(resolved["deeper_embed_stage_channels"], [32, 64, 288])
-        self.assertEqual(resolved["deeper_embed_depth_per_level"], [2, 2, 2])
-        self.assertFalse(resolved["deeper_embed_use_stem"])
+        self.assertEqual(resolved["deeper_embed_stage_channels"], [16, 32, 64, 288])
+        self.assertEqual(resolved["deeper_embed_stage_strides"], [1, 2, 2, 2])
+        self.assertEqual(resolved["deeper_embed_depth_per_level"], [2, 2, 2, 2])
+        self.assertTrue(resolved["deeper_embed_use_stem"])
         self.assertFalse(resolved["deeper_embed_final_projection"])
         # Keep the recipe's architecture, but use a small crop for CPU validation.
         config.update(global_crops_size=[32] * 3, local_crops_size=[32] * 3)
@@ -74,17 +76,21 @@ class CNNEmbeddingTests(unittest.TestCase):
             self.assertEqual(block.mlp.fc2.in_features, 2048)
             self.assertEqual(block.mlp.fc2.out_features, 288)
         encoder = backbone.down_projection
-        self.assertIsInstance(encoder.stem, nn.Identity)
+        stem_convs = [module for module in encoder.stem.modules() if isinstance(module, nn.Conv3d)]
+        self.assertEqual(len(stem_convs), 1)
+        self.assertEqual((stem_convs[0].in_channels, stem_convs[0].out_channels), (1, 16))
+        self.assertEqual(stem_convs[0].kernel_size, (3, 3, 3))
+        self.assertEqual(stem_convs[0].stride, (1, 1, 1))
         self.assertIsInstance(encoder.final_proj, nn.Identity)
-        self.assertEqual([len(stage.blocks) for stage in encoder.stages], [2] * 3)
-        self.assertFalse(any(name.startswith(("stem.", "final_proj.")) for name in encoder.state_dict()))
+        self.assertEqual([len(stage.blocks) for stage in encoder.stages], [2] * 4)
+        self.assertFalse(any(name.startswith("final_proj.") for name in encoder.state_dict()))
         for module in encoder.modules():
             if isinstance(module, nn.Conv3d):
                 self.assertEqual(module.padding_mode, "zeros")
 
         shapes = []
         handles = [stage.register_forward_hook(lambda module, args, output: shapes.append(tuple(output.shape)))
-                   for stage in encoder.stages]
+                   for stage in [encoder.stem, *encoder.stages]]
         try:
             x = torch.randn(1, 1, 32, 32, 32, requires_grad=True)
             masks = torch.zeros(1, 64, dtype=torch.bool)
@@ -93,12 +99,16 @@ class CNNEmbeddingTests(unittest.TestCase):
         finally:
             for handle in handles:
                 handle.remove()
-        self.assertEqual(shapes, [(1, 32, 16, 16, 16), (1, 64, 8, 8, 8),
+        self.assertEqual(shapes, [(1, 16, 32, 32, 32), (1, 16, 32, 32, 32),
+                                  (1, 32, 16, 16, 16), (1, 64, 8, 8, 8),
                                   (1, 288, 4, 4, 4)])
         tokens = features["x_norm_patchtokens"]
         self.assertEqual(tuple(tokens.shape), (1, 64, 288))
         self.assertEqual(tuple(features["x_norm_clstoken"].shape), (1, 288))
         (tokens * torch.randn_like(tokens)).sum().backward()
+        self.assertIsNotNone(stem_convs[0].weight.grad)
+        self.assertTrue(torch.isfinite(stem_convs[0].weight.grad).all())
+        self.assertGreater(stem_convs[0].weight.grad.abs().sum().item(), 0)
         for stage in encoder.stages:
             gradient = stage.blocks[0].conv1.conv.weight.grad
             self.assertIsNotNone(gradient)
@@ -115,8 +125,30 @@ class CNNEmbeddingTests(unittest.TestCase):
             restored_features = restored(x.detach(), masks=masks)
         torch.testing.assert_close(restored_features["x_norm_patchtokens"], tokens.detach())
 
+    def test_explicit_strides_preserve_legacy_layout_and_support_anisotropic_grids(self):
+        kwargs = dict(patch_size=(4, 4, 4), input_channels=1, embed_dim=24, base_features=4)
+        legacy = PatchEmbedDeeper(**kwargs).eval()
+        explicit = PatchEmbedDeeper(**kwargs, stage_strides=(2, 2), stem_channels=4,
+                                   stem_type="residual").eval()
+        explicit.load_state_dict(legacy.state_dict(), strict=True)
+        x = torch.randn(1, 1, 8, 8, 8)
+        with torch.no_grad():
+            torch.testing.assert_close(legacy(x), explicit(x), rtol=0, atol=0)
+            anisotropic = PatchEmbedDeeper(
+                patch_size=(2, 4, 8), input_channels=1, embed_dim=24,
+                stage_channels=(4, 8, 16, 24),
+                stage_strides=((1, 1, 1), (1, 2, 2), (2, 2, 2), (1, 1, 2)),
+                stem_channels=4, stem_type="conv", final_projection=False,
+            ).eval()
+            self.assertEqual(tuple(anisotropic(torch.randn(1, 1, 8, 8, 16)).shape), (1, 24, 4, 2, 2))
+
     def test_projection_free_configuration_validation(self):
         for kwargs, message in (
+            ({"stage_strides": (1, 2)}, "product must equal patch_size"),
+            ({"stage_strides": ((2, 2), 2)}, "each spatial axis"),
+            ({"stage_strides": (0, 2)}, "each spatial axis"),
+            ({"stem_channels": 0}, "positive integer"),
+            ({"stem_type": "unknown"}, "stem_type"),
             ({"stage_channels": (8, 16), "final_projection": False}, "must equal embed_dim"),
             ({"stage_channels": (8,)}, "positive channel counts"),
             ({"stage_channels": (8, 0)}, "positive channel counts"),

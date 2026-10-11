@@ -166,9 +166,12 @@ class PretrainSmokeTests(unittest.TestCase):
             "attention_type": "axial",
             "grad_checkpointing": True,
             "patch_size": [4, 4, 4],
-            "deeper_embed_stage_channels": [8, 72],
-            "deeper_embed_depth_per_level": [2, 2],
-            "deeper_embed_use_stem": False,
+            "deeper_embed_stage_channels": [4, 8, 72],
+            "deeper_embed_stage_strides": [1, 2, 2],
+            "deeper_embed_depth_per_level": [2, 2, 2],
+            "deeper_embed_use_stem": True,
+            "deeper_embed_stem_channels": 4,
+            "deeper_embed_stem_type": "conv",
             "deeper_embed_final_projection": False,
         })
         report = build_verification_report(config, use_amp=False)
