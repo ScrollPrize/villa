@@ -59,7 +59,7 @@
     "enabled": false
   },
   "dataset": {
-    "source_sampling_size": [512, 512, 512],
+    "source_sampling_size": [192, 192, 192],
     "global_crop_size": [
       128,
       128,
@@ -288,11 +288,6 @@
         "volume_path": "https://data.aws.ash2txt.org/samples/PHercParis4/volumes/20230205180739-7.910um-54keV-masked.zarr/",
         "volume_scale": 0
       }
-    ],
-    "source_sampling_size": [
-      512,
-      512,
-      512
     ],
     "num_global_crops": 2,
     "num_local_crops": 2,
