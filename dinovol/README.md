@@ -16,6 +16,7 @@ This implementation is still incomplete. Pretraining works, but finetuning has
 not yet been implemented.
 
 Use the `v3` preset for new runs, as selected by every example recipe. It uses
+plain SwiGLU with a 2x hidden width and no query/key/value projection biases,
 axial 3D RoPE, separate local/global CLS output normalization, constant LR after
 warmup, constant weight decay and teacher momentum, and KoLeo groups of up to 16.
 The `v2` preset and configs without `model_type` retain their older defaults for
@@ -32,6 +33,82 @@ To select the new defaults, set `model.model_type` to `v3`:
   }
 }
 ```
+
+## Pretraining on 8–9 µm scroll volumes
+
+[`dinovol_2/configs/pretrain_8_9um.json`](dinovol_2/configs/pretrain_8_9um.json)
+is a standalone base-pretraining config with 256³ global crops, 128³ local crops,
+and `volume_scale: 0` for every volume. It uses a CNN feeding a width-288 `v3`
+backbone with 24 transformer blocks and six attention heads, batch size 4 per
+GPU, gradient checkpointing, two global views, and eight local views. Gram and
+point supervision are disabled for this initial stage.
+
+The CNN uses the existing `deeper` embedding with four residual stages of
+32, 64, 128, and 288 channels. Each stage has two basic residual blocks (two
+3×3×3 convolutions per block) and downsamples by two in its first block.
+There is no full-resolution stem or final embedding projection: the last
+stage's 288 channels become EVA tokens directly. Residual skip connections
+retain their channel projections. Total stride is 16, giving 4,096 global
+tokens and 512 local tokens, before CLS/register tokens.
+
+The recipe explicitly keeps the 512³ source sampling window. The existing CNN
+context calculation adds an 80-voxel halo per side, producing 416³ global and
+288³ local model inputs before cropping the embedded grids. Source reads also
+expand to provide that context, so this needs more input memory and I/O than
+the single-convolution embedding. The output directory is
+`dinovol_pretrain_8_9um_cnn288/` to avoid automatically resuming incompatible
+checkpoints from the earlier width-864 recipe.
+
+The configurable CNN options under `model` are:
+
+```json
+{
+  "embedding_type": "deeper",
+  "embed_dim": 288,
+  "num_heads": 6,
+  "patch_size": [16, 16, 16],
+  "deeper_embed_stage_channels": [32, 64, 128, 288],
+  "deeper_embed_depth_per_level": [2, 2, 2, 2],
+  "deeper_embed_use_stem": false,
+  "deeper_embed_final_projection": false
+}
+```
+
+Without a final projection, the last stage must have `embed_dim` channels.
+Stage counts must match the downsampling stages implied by `patch_size`.
+Omitted options preserve the existing deeper embedding architecture and its
+checkpoint layout. The CNN regression tests check the recipe's architecture
+on a 32³ synthetic crop, gradients, masking, and checkpoint reconstruction;
+the pretraining smoke suite also exercises the projection-free path with a
+smaller CNN and synthetic volume.
+
+The volume list is pinned from the public
+[scan metadata](https://vesuvius-challenge-open-data.s3.amazonaws.com/metadata.json),
+retrieved on 2026-10-10. It contains one masked intensity OME-Zarr per eligible
+scroll sample: 27 ESRF volumes at 8.640–9.366 µm, plus four Diamond volumes at
+7.910 µm (treated as approximately 8 µm). ESRF is preferred within that resolution
+range; higher-resolution ESRF scans are not substituted at another pyramid level.
+`sample_id`, `pixel_size_um`, and `scan_location` in each entry document the
+selection; the loader uses `volume_path` and `volume_scale`. Sampling retains the
+existing weighting by valid crop starts, rather than equal weight per scroll.
+
+The Diamond fallbacks are PHerc0172, PHerc0332, PHerc1667, and PHercParis4.
+PHerc1299, PHercMAN5, PHercMANB, and PHercParis3 are excluded because the catalog
+has no intensity volume near the requested resolution at scale 0. For duplicate
+candidates, PHerc0139 uses `20250728140407` (the standard reconstruction; the
+pag0/pag50 alternatives have documented masking problems), PHerc0172 uses the
+newer cropped export `20241024131839`, and PHercParis4 uses `20230205180739`
+for its larger axial coverage.
+
+Run from `dinovol/` with the existing environment:
+
+```bash
+AGENTS_AGENT_MODE=1 .venv/bin/python -m dinovol_2.pretrain dinovol_2/configs/pretrain_8_9um.json
+```
+
+The URLs are public and require no credentials file. Volume selection and
+scale-0 array metadata were checked; GPU memory requirements and training quality
+have not been measured for this recipe. Adjust `batch_size` for the available GPU.
 
 ## License
 
@@ -52,6 +129,9 @@ The following settings can be added to a training config:
   "model": {
     "model_type": "v3",
     "rope_type": "axial",
+    "scale_mlp": false,
+    "mlp_ratio": 2.0,
+    "qkv_bias": false,
     "untie_cls_and_patch_norms": false,
     "untie_global_and_local_cls_norm": true
   }
@@ -67,6 +147,15 @@ The following settings can be added to a training config:
   their default final values. Set `weight_decay_end` equal to `weight_decay` and
   `final_momentum_teacher` equal to `momentum_teacher` to hold those constant too.
   `warmup_steps: 0` disables LR warmup; otherwise the default is 10% of the run.
+- `scale_mlp`, `mlp_ratio`, and `qkv_bias` default to `false`, `2.0`, and
+  `false` in `v3`, following the DINOv3 7B pretraining block. `scale_mlp: false`
+  removes the extra normalization inside SwiGLU; the usual pre-attention and
+  pre-MLP norms remain. Our ratio specifies the effective hidden width directly:
+  DINOv3's `ffn_ratio: 3` applies an internal two-thirds adjustment. Older presets
+  retain `true`, `8/3`, and `true`. To load checkpoints from the earlier `v3`
+  architecture, preserve their saved model configuration or explicitly set all
+  three old values (`mlp_ratio: 2.6666666666666665` in JSON); changing these
+  settings changes parameter shapes and state-dict keys.
 - `rope_type` selects the existing 3D `axial` or learnable per-block `mixed`
   implementation. The default is `axial` for `v3`, `mixed` for `v2`, and `axial`
   for the original unversioned model. Both support variable crop sizes and coordinate rescaling.
@@ -97,6 +186,23 @@ when changing normalization options; resuming optimizer state requires the same
 parameter layout. Keep `rope_type` consistent with the checkpoint: switching
 between learned mixed and axial RoPE is an architecture experiment, not an exact
 checkpoint conversion.
+
+## Masking
+
+Masked student views always zero the selected voxel regions before patch
+embedding, then replace the selected embeddings with the learned mask token.
+Each loss-mask position covers one `patch_size` region on the output grid.
+Masking happens on the prepared model input, before convolution or tiling;
+overscanned inputs place the mask in the centered output region. The original
+crop remains unchanged for the unmasked teacher.
+
+For `embedding_type: "default"`, this is mathematically equivalent to the former
+token-only masking, including parameter gradients. For `"deeper"`, it prevents
+neighboring embeddings from observing the hidden voxel values and changes
+training behavior, including when resuming an older checkpoint. There is no
+legacy masking mode or configuration switch; checkpoint parameter shapes stay
+unchanged. Output/gradient equivalence and hidden-voxel isolation are covered by
+`tests/test_voxel_masking.py` in the standard test suite.
 
 ## Gram Anchoring And HR Adaptation
 

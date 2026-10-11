@@ -159,6 +159,20 @@ class PretrainSmokeTests(unittest.TestCase):
         self.assertTrue(report["train_step"]["checks"]["all_passed"])
         self.assertEqual(report["forward"]["losses"]["gram"], 0.0)
 
+    def test_cnn_tokens_without_final_projection_smoke_step(self) -> None:
+        config = self._base_config(embedding_type="deeper", output_name="cnn_tokens")
+        config["model"].update({
+            "model_type": "v3",
+            "patch_size": [4, 4, 4],
+            "deeper_embed_stage_channels": [8, 72],
+            "deeper_embed_depth_per_level": [2, 2],
+            "deeper_embed_use_stem": False,
+            "deeper_embed_final_projection": False,
+        })
+        report = build_verification_report(config, use_amp=False)
+        self.assertTrue(report["forward"]["checks"]["all_passed"])
+        self.assertTrue(report["train_step"]["checks"]["all_passed"])
+
     def test_gram_refinement_smoke_step(self) -> None:
         report = build_verification_report(self._gram_config(output_name="gram_smoke"), use_amp=False)
         self.assertTrue(report["forward"]["checks"]["all_passed"])

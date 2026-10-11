@@ -307,26 +307,6 @@ class Eva(nn.Module):
             )
 
     @staticmethod
-    def _normalize_optional_chunk_shape(
-            value: Optional[int | Tuple[int, ...]],
-            *,
-            ndim: int,
-            name: str,
-    ) -> Optional[Tuple[int, ...]]:
-        if value is None:
-            return None
-        if isinstance(value, int):
-            if value <= 0:
-                raise ValueError(f"{name} must be positive, got {value}")
-            return tuple([int(value)] * ndim)
-        result = tuple(int(v) for v in value)
-        if len(result) != ndim:
-            raise ValueError(f"{name} must provide {ndim} values, got {result}")
-        if any(v <= 0 for v in result):
-            raise ValueError(f"{name} must be positive, got {result}")
-        return result
-
-    @staticmethod
     def _normalize_optional_positive_int(
             value: Optional[int],
             *,
@@ -376,8 +356,11 @@ class Eva(nn.Module):
             rope_impl=RopePositionEmbedding,
             rope_kwargs=None,
             grad_checkpointing=False,
-            deeper_embed_patch_chunk_size: Optional[int | Tuple[int, ...]] = None,
             deeper_embed_batch_chunk_size: Optional[int] = None,
+            deeper_embed_stage_channels: Optional[Tuple[int, ...]] = None,
+            deeper_embed_depth_per_level: Optional[Tuple[int, ...]] = None,
+            deeper_embed_use_stem: bool = True,
+            deeper_embed_final_projection: bool = True,
     ):
         """
         Diff to timm implementation
@@ -397,14 +380,6 @@ class Eva(nn.Module):
         self.embedding_type = str(embedding_type).lower()
         self.global_crops_size = [global_crops_size] * 3 if isinstance(global_crops_size, int) else global_crops_size
         self.local_crops_size = [local_crops_size] * 3 if isinstance(local_crops_size, int) else local_crops_size
-        self.global_input_size = tuple(int(size) for size in self.global_crops_size)
-        self.local_input_size = tuple(int(size) for size in self.local_crops_size)
-        self.deeper_embed_patch_halo = tuple(0 for _ in range(self.ndim))
-        self.deeper_embed_patch_chunk_size = self._normalize_optional_chunk_shape(
-            deeper_embed_patch_chunk_size,
-            ndim=self.ndim,
-            name="deeper_embed_patch_chunk_size",
-        )
         self.deeper_embed_batch_chunk_size = self._normalize_optional_positive_int(
             deeper_embed_batch_chunk_size,
             name="deeper_embed_batch_chunk_size",
@@ -436,6 +411,10 @@ class Eva(nn.Module):
                 patch_size=tuple(self.patch_size),
                 input_channels=input_channels,
                 embed_dim=embed_dim,
+                stage_channels=deeper_embed_stage_channels,
+                depth_per_level=deeper_embed_depth_per_level,
+                use_stem=deeper_embed_use_stem,
+                final_projection=deeper_embed_final_projection,
             )
         else:
             raise ValueError(
@@ -681,87 +660,40 @@ class Eva(nn.Module):
 
         return pos_embed
 
-    def resolve_output_spatial_shape(self, spatial: tuple[int, ...], *, view_kind: str) -> tuple[int, ...]:
-        spatial = tuple(int(dim) for dim in spatial)
-        if self.embedding_type != "deeper":
-            return spatial
-        if view_kind == "global":
-            target = tuple(int(dim) for dim in self.global_crops_size)
-            input_size = tuple(int(dim) for dim in self.global_input_size)
-        elif view_kind == "local":
-            target = tuple(int(dim) for dim in self.local_crops_size)
-            input_size = tuple(int(dim) for dim in self.local_input_size)
-        else:
-            raise ValueError(f"unknown view_kind={view_kind!r}")
+    def _mask_input_voxels(self, x, masks):
+        """Hide masked voxel regions before any overlapping convolution."""
+        patch_shape = tuple(size // patch for size, patch in zip(x.shape[2:], self.patch_size))
+        expected_shape = (x.shape[0], math.prod(patch_shape))
+        if masks.dtype != torch.bool or tuple(masks.shape) != expected_shape:
+            raise ValueError(f"masks must be boolean with shape {expected_shape}, got {masks.dtype} {tuple(masks.shape)}")
+        voxel_mask = masks.reshape(x.shape[0], 1, *patch_shape)
+        for axis, patch in enumerate(self.patch_size, start=2):
+            voxel_mask = voxel_mask.repeat_interleave(patch, dim=axis)
 
-        if spatial == input_size or spatial == target:
-            return target
-        if self.embedding_type == "deeper":
-            halo_voxels = tuple(int(tokens) * int(size) for tokens, size in zip(self.deeper_embed_patch_halo, self.patch_size))
-            dynamic_target = tuple(int(dim) - 2 * int(halo) for dim, halo in zip(spatial, halo_voxels))
-            if (
-                any(halo_voxels)
-                and all(dim > 0 for dim in dynamic_target)
-                and all(dim % patch == 0 for dim, patch in zip(dynamic_target, self.patch_size))
-            ):
-                return dynamic_target
-        raise ValueError(
-            f"unexpected input shape {spatial} for embedding_type={self.embedding_type!r} and view_kind={view_kind!r}; "
-            f"expected {input_size} or {target}"
-        )
-
-    def _resolve_target_spatial_shape(self, spatial: tuple[int, ...], *, view_kind: str) -> tuple[int, ...]:
-        return self.resolve_output_spatial_shape(spatial, view_kind=view_kind)
-
-    def _crop_embedded_grid(self, x: torch.Tensor, target_spatial: tuple[int, ...]) -> torch.Tensor:
-        target_patch_shape = tuple(int(size) // int(patch) for size, patch in zip(target_spatial, self.patch_size))
-        current_patch_shape = tuple(int(dim) for dim in x.shape[2:])
-        if current_patch_shape == target_patch_shape:
-            return x
-
-        starts = []
-        for current, target in zip(current_patch_shape, target_patch_shape):
-            delta = current - target
-            if delta < 0 or delta % 2 != 0:
-                raise ValueError(
-                    f"cannot center-crop embedded grid from {current_patch_shape} to {target_patch_shape}"
-                )
-            starts.append(delta // 2)
-        slices = tuple(slice(start, start + size) for start, size in zip(starts, target_patch_shape))
-        return x[(slice(None), slice(None), *slices)]
+        # Never modify the shared crop in place: the teacher needs its original values.
+        return x.masked_fill(voxel_mask, 0)
 
     def prepare_tokens_with_masks(self, x, masks=None, *, view_kind: str = "global"):
         spatial = tuple(x.shape[2:])
         self._assert_patch_aligned(spatial, tuple(self.patch_size), context="input shape")
-        if self.embedding_type == "deeper":
-            target_spatial = self._resolve_target_spatial_shape(spatial, view_kind=view_kind)
-            target_patch_shape = tuple(int(size) // int(patch) for size, patch in zip(target_spatial, self.patch_size))
-            if (
-                    self.deeper_embed_patch_chunk_size is not None
-                    or self.deeper_embed_batch_chunk_size is not None
-            ):
-                x = self.down_projection.forward_tiled(
-                    x,
-                    target_patch_shape=target_patch_shape,
-                    patch_chunk_size=self.deeper_embed_patch_chunk_size,
-                    batch_chunk_size=self.deeper_embed_batch_chunk_size,
-                )
-            else:
-                x = self.down_projection(x)
-                x = self._crop_embedded_grid(x, target_spatial)
+        if masks is not None:
+            x = self._mask_input_voxels(x, masks)
+        batch_chunk_size = self.deeper_embed_batch_chunk_size
+        if self.embedding_type == "deeper" and batch_chunk_size is not None and x.shape[0] > batch_chunk_size:
+            x = torch.cat([self.down_projection(chunk) for chunk in x.split(batch_chunk_size)], dim=0)
         else:
             x = self.down_projection(x)
-            target_spatial = spatial
         if self.ndim == 2:
             x = rearrange(x, 'b c h w -> b (h w) c').contiguous()
         else:
             x = rearrange(x, 'b c d h w -> b (d h w) c').contiguous()
 
         if masks is not None:
+            # Keep an explicit learned marker after hiding the underlying voxels.
             x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype), x)
 
-        target_patch_shape = tuple(dim // patch for dim, patch in zip(target_spatial, self.patch_size))
-        x, rot_pos_embed = self._pos_embed(x, *target_spatial)
+        target_patch_shape = tuple(dim // patch for dim, patch in zip(spatial, self.patch_size))
+        x, rot_pos_embed = self._pos_embed(x, *spatial)
 
         return x, rot_pos_embed, target_patch_shape
 
@@ -815,7 +747,8 @@ class Eva(nn.Module):
         rope_coords = self._get_shared_per_block_rope_coords(rope_shape)
         for blk in self.blocks:
             if self.grad_checkpointing and not torch.jit.is_scripting():
-                x = checkpoint(blk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
+                x = checkpoint(blk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords,
+                               use_reentrant=False)
             else:
                 x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
         return self._format_features(x, masks, view_kind=view_kind)
@@ -950,13 +883,15 @@ class EvaWithChunking(Eva):
         if self.chunked_blocks:
             for chunk in self.blocks:
                 if self.grad_checkpointing and not torch.jit.is_scripting():
-                    x = checkpoint(chunk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
+                    x = checkpoint(chunk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords,
+                                   use_reentrant=False)
                 else:
                     x = chunk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
         else:
             for blk in self.blocks:
                 if self.grad_checkpointing and not torch.jit.is_scripting():
-                    x = checkpoint(blk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
+                    x = checkpoint(blk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords,
+                                   use_reentrant=False)
                 else:
                     x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
 

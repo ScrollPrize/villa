@@ -85,6 +85,9 @@ class TrainingConfigTests(unittest.TestCase):
                       "max_iterations": 10, "warmup_steps": 2,
                       "model": tiny_model_config(model_type="v3")}
             modern = DinoIBOTPretrainer(config)
+            self.assertFalse(modern.model_config["scale_mlp"])
+            self.assertEqual(modern.model_config["mlp_ratio"], 2.0)
+            self.assertFalse(modern.model_config["qkv_bias"])
             self.assertEqual(modern.model_config["rope_type"], "axial")
             self.assertFalse(modern.model_config["untie_cls_and_patch_norms"])
             self.assertTrue(modern.model_config["untie_global_and_local_cls_norm"])
@@ -96,6 +99,9 @@ class TrainingConfigTests(unittest.TestCase):
             self.assertEqual(modern.final_momentum_teacher, modern.momentum_teacher)
             config["model"]["model_type"] = "v2"
             legacy = DinoIBOTPretrainer(config)
+            self.assertTrue(legacy.model_config["scale_mlp"])
+            self.assertEqual(legacy.model_config["mlp_ratio"], 8.0 / 3.0)
+            self.assertTrue(legacy.model_config["qkv_bias"])
             self.assertEqual(legacy.model_config["rope_type"], "mixed")
             self.assertFalse(legacy.model_config["untie_global_and_local_cls_norm"])
             self.assertEqual(legacy.lr_schedule_type, "cosine")
@@ -104,8 +110,12 @@ class TrainingConfigTests(unittest.TestCase):
             self.assertIsNone(legacy.koleo_loss.loss_group_size)
             config.update(lr_schedule="cosine", final_momentum_teacher=.999,
                           weight_decay_end=.2, koleo_loss_group_size=None)
-            config["model"].update(model_type="v3", rope_type="mixed", untie_global_and_local_cls_norm=False)
+            config["model"].update(model_type="v3", rope_type="mixed", untie_global_and_local_cls_norm=False,
+                                   scale_mlp=True, mlp_ratio=8.0 / 3.0, qkv_bias=True)
             overridden = DinoIBOTPretrainer(config)
+            self.assertTrue(overridden.model_config["scale_mlp"])
+            self.assertEqual(overridden.model_config["mlp_ratio"], 8.0 / 3.0)
+            self.assertTrue(overridden.model_config["qkv_bias"])
             self.assertEqual(overridden.model_config["rope_type"], "mixed")
             self.assertFalse(overridden.model_config["untie_global_and_local_cls_norm"])
             self.assertEqual(overridden.lr_schedule_type, "cosine")
@@ -159,6 +169,27 @@ class TrainingConfigTests(unittest.TestCase):
 
 
 class BackboneOptionsTests(unittest.TestCase):
+    def test_v3_plain_swiglu_forward_backward(self):
+        torch.manual_seed(17)
+        model = DinoVitStudentTeacher._build_backbone(tiny_model_config(model_type="v3"))
+        for block in model.blocks:
+            self.assertIsInstance(block.mlp.norm, torch.nn.Identity)
+            self.assertEqual(block.mlp.fc2.in_features, 2 * model.embed_dim)
+            self.assertIsNone(block.attn.qkv.bias)
+            self.assertIsNone(block.attn.q_bias)
+            self.assertIsNone(block.attn.v_bias)
+        loss = 0
+        for size, view in ((16, "global"), (8, "local")):
+            output = model.forward_features(torch.randn(2, 1, size, size, size), view_kind=view)
+            for key in ("x_norm_clstoken", "x_norm_patchtokens"):
+                self.assertTrue(torch.isfinite(output[key]).all())
+                loss = loss + (output[key] * torch.randn_like(output[key])).sum()
+        loss.backward()
+        for block in model.blocks:
+            for weight in (block.attn.qkv.weight, block.mlp.fc1.weight, block.mlp.fc2.weight):
+                self.assertTrue(torch.isfinite(weight.grad).all())
+                self.assertGreater(float(weight.grad.abs().sum()), 0)
+
     def test_norm_routing_and_legacy_checkpoint_initialization(self):
         base = DinoVitStudentTeacher._build_backbone(tiny_model_config())
         with torch.no_grad():

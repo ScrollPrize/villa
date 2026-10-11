@@ -28,8 +28,11 @@ _BACKBONE_DEFAULTS = {
     "embed_dim": 864,
     "patch_size": (16, 16, 16),
     "embedding_type": "default",
-    "deeper_embed_patch_chunk_size": None,
     "deeper_embed_batch_chunk_size": 1,
+    "deeper_embed_stage_channels": None,
+    "deeper_embed_depth_per_level": None,
+    "deeper_embed_use_stem": True,
+    "deeper_embed_final_projection": True,
     "depth": 24,
     "num_heads": 16,
     "qkv_bias": True,
@@ -59,8 +62,11 @@ _BACKBONE_DEFAULTS_V2 = {
     "embed_dim": 864,
     "patch_size": (16, 16, 16),
     "embedding_type": "default",
-    "deeper_embed_patch_chunk_size": None,
     "deeper_embed_batch_chunk_size": 1,
+    "deeper_embed_stage_channels": None,
+    "deeper_embed_depth_per_level": None,
+    "deeper_embed_use_stem": True,
+    "deeper_embed_final_projection": True,
     "depth": 24,
     "num_heads": 16,
     "qkv_bias": True,
@@ -85,6 +91,10 @@ _BACKBONE_DEFAULTS_V2 = {
 
 _BACKBONE_DEFAULTS_V3 = {
     **_BACKBONE_DEFAULTS_V2,
+    "qkv_bias": False,
+    # Effective SwiGLU width: DINOv3's ffn_ratio=3 includes a 2/3 adjustment.
+    "mlp_ratio": 2.0,
+    "scale_mlp": False,
     "untie_global_and_local_cls_norm": True,
 }
 
@@ -237,6 +247,8 @@ def _resolve_rope_impl(
 
 
 def _materialize_backbone_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    if config.get("deeper_embed_patch_chunk_size") is not None:
+        raise ValueError("Spatial CNN chunking is no longer supported; use deeper_embed_batch_chunk_size instead.")
     backbone_defaults = _resolve_backbone_defaults(config)
     backbone_config = {key: config.get(key, default) for key, default in backbone_defaults.items()}
     if "num_reg_tokens" not in config and "num_register_tokens" in config:
