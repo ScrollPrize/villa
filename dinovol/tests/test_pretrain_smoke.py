@@ -163,6 +163,8 @@ class PretrainSmokeTests(unittest.TestCase):
         config = self._base_config(embedding_type="deeper", output_name="cnn_tokens")
         config["model"].update({
             "model_type": "v3",
+            "attention_type": "axial",
+            "grad_checkpointing": True,
             "patch_size": [4, 4, 4],
             "deeper_embed_stage_channels": [8, 72],
             "deeper_embed_depth_per_level": [2, 2],

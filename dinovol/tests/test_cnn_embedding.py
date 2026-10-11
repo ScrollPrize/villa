@@ -8,6 +8,7 @@ import unittest
 import torch
 from torch import nn
 
+from dinovol_2.model.dinov2_eva import EvaBlock
 from dinovol_2.model.model import DinoVitStudentTeacher, _materialize_backbone_config
 from dinovol_2.model.patch_encode_decode import PatchEmbedDeeper
 
@@ -44,22 +45,38 @@ class CNNEmbeddingTests(unittest.TestCase):
     def test_recipe_architecture_forward_backward_and_reload(self):
         torch.manual_seed(23)
         recipe = Path(__file__).resolve().parents[1] / "dinovol_2/configs/pretrain_8_9um.json"
-        config = json.loads(recipe.read_text())["model"]
+        recipe_config = json.loads(recipe.read_text())
+        config = recipe_config["model"]
+        self.assertEqual(config["global_crops_size"], [128] * 3)
+        self.assertEqual(config["local_crops_size"], [64] * 3)
+        self.assertEqual(recipe_config["dataset"]["global_crop_size"], config["global_crops_size"])
+        self.assertEqual(recipe_config["dataset"]["local_crop_size"], config["local_crops_size"])
         resolved = _materialize_backbone_config(config)
         self.assertEqual(resolved["embed_dim"], 288)
         self.assertEqual(resolved["num_heads"], 6)
-        self.assertEqual(resolved["depth"], 24)
-        self.assertEqual(resolved["deeper_embed_stage_channels"], [32, 64, 128, 288])
-        self.assertEqual(resolved["deeper_embed_depth_per_level"], [2, 2, 2, 2])
+        self.assertEqual(resolved["depth"], 8)
+        self.assertEqual(resolved["attention_type"], "full")
+        self.assertEqual(resolved["patch_size"], (8, 8, 8))
+        self.assertEqual(resolved["deeper_embed_stage_channels"], [32, 64, 288])
+        self.assertEqual(resolved["deeper_embed_depth_per_level"], [2, 2, 2])
         self.assertFalse(resolved["deeper_embed_use_stem"])
         self.assertFalse(resolved["deeper_embed_final_projection"])
         # Keep the recipe's architecture, but use a small crop for CPU validation.
         config.update(global_crops_size=[32] * 3, local_crops_size=[32] * 3)
         backbone = DinoVitStudentTeacher._build_backbone(config).eval()
+        blocks = [module for module in backbone.modules() if isinstance(module, EvaBlock)]
+        self.assertEqual(len(blocks), 8)
+        for block in blocks:
+            self.assertEqual(block.attention_type, "full")
+            self.assertEqual(len(block.axial_attns), 0)
+            self.assertEqual(block.mlp.fc1.in_features, 288)
+            self.assertEqual(block.mlp.fc1.out_features, 4096)  # Two 2048-wide SwiGLU branches.
+            self.assertEqual(block.mlp.fc2.in_features, 2048)
+            self.assertEqual(block.mlp.fc2.out_features, 288)
         encoder = backbone.down_projection
         self.assertIsInstance(encoder.stem, nn.Identity)
         self.assertIsInstance(encoder.final_proj, nn.Identity)
-        self.assertEqual([len(stage.blocks) for stage in encoder.stages], [2] * 4)
+        self.assertEqual([len(stage.blocks) for stage in encoder.stages], [2] * 3)
         self.assertFalse(any(name.startswith(("stem.", "final_proj.")) for name in encoder.state_dict()))
         for module in encoder.modules():
             if isinstance(module, nn.Conv3d):
@@ -70,15 +87,16 @@ class CNNEmbeddingTests(unittest.TestCase):
                    for stage in encoder.stages]
         try:
             x = torch.randn(1, 1, 32, 32, 32, requires_grad=True)
-            masks = torch.tensor([[True, False, False, True, False, True, False, False]])
+            masks = torch.zeros(1, 64, dtype=torch.bool)
+            masks[:, ::3] = True
             features = backbone(x, masks=masks)
         finally:
             for handle in handles:
                 handle.remove()
         self.assertEqual(shapes, [(1, 32, 16, 16, 16), (1, 64, 8, 8, 8),
-                                  (1, 128, 4, 4, 4), (1, 288, 2, 2, 2)])
+                                  (1, 288, 4, 4, 4)])
         tokens = features["x_norm_patchtokens"]
-        self.assertEqual(tuple(tokens.shape), (1, 8, 288))
+        self.assertEqual(tuple(tokens.shape), (1, 64, 288))
         self.assertEqual(tuple(features["x_norm_clstoken"].shape), (1, 288))
         (tokens * torch.randn_like(tokens)).sum().backward()
         for stage in encoder.stages:
@@ -86,7 +104,7 @@ class CNNEmbeddingTests(unittest.TestCase):
             self.assertIsNotNone(gradient)
             self.assertTrue(torch.isfinite(gradient).all())
             self.assertGreater(gradient.abs().sum().item(), 0)
-        self.assertEqual(x.grad[:, :, :16, :16, :16].count_nonzero().item(), 0)
+        self.assertEqual(x.grad[:, :, :8, :8, :8].count_nonzero().item(), 0)
         self.assertGreater(x.grad.abs().sum().item(), 0)
 
         # Rebuild through the same serialized configuration used by checkpoints.

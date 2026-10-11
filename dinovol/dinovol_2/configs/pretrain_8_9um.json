@@ -1,5 +1,5 @@
 {
-  "output_dir": "./dinovol_pretrain_8_9um_cnn288/",
+  "output_dir": "./dinovol_pretrain_8_9um_cnn288_8blocks_ffn2048_full_g128_p8_stem16/",
   "resume": true,
   "auto_resume": true,
   "lr": 2.5e-05,
@@ -19,29 +19,34 @@
   "batch_size": 4,
   "model": {
     "model_type": "v3",
+    "attention_type": "full",
     "embedding_type": "deeper",
     "embed_dim": 288,
+    "depth": 8,
     "num_heads": 6,
-    "patch_size": [16, 16, 16],
-    "deeper_embed_stage_channels": [32, 64, 128, 288],
+    "patch_size": [8, 8, 8],
+    "deeper_embed_stage_channels": [16, 32, 64, 288],
+    "deeper_embed_stage_strides": [1, 2, 2, 2],
     "deeper_embed_depth_per_level": [2, 2, 2, 2],
-    "deeper_embed_use_stem": false,
+    "deeper_embed_use_stem": true,
+    "deeper_embed_stem_channels": 16,
+    "deeper_embed_stem_type": "conv",
     "deeper_embed_final_projection": false,
     "global_crops_size": [
-      256,
-      256,
-      256
-    ],
-    "local_crops_size": [
       128,
       128,
       128
+    ],
+    "local_crops_size": [
+      64,
+      64,
+      64
     ],
     "rope_type": "axial",
     "untie_cls_and_patch_norms": false,
     "untie_global_and_local_cls_norm": true,
     "scale_mlp": false,
-    "mlp_ratio": 2.0,
+    "mlp_ratio": 7.111111111111111,
     "qkv_bias": false,
     "grad_checkpointing": true
   },
@@ -51,14 +56,14 @@
   "dataset": {
     "source_sampling_size": [512, 512, 512],
     "global_crop_size": [
-      256,
-      256,
-      256
-    ],
-    "local_crop_size": [
       128,
       128,
       128
+    ],
+    "local_crop_size": [
+      64,
+      64,
+      64
     ],
     "datasets": [
       {
@@ -285,7 +290,7 @@
       512
     ],
     "num_global_crops": 2,
-    "num_local_crops": 8,
+    "num_local_crops": 2,
     "s3_storage_options": {
       "anon": true
     }

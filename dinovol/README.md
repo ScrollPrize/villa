@@ -37,26 +37,45 @@ To select the new defaults, set `model.model_type` to `v3`:
 ## Pretraining on 8–9 µm scroll volumes
 
 [`dinovol_2/configs/pretrain_8_9um.json`](dinovol_2/configs/pretrain_8_9um.json)
-is a standalone base-pretraining config with 256³ global crops, 128³ local crops,
+is a standalone base-pretraining config with 128³ global crops, 64³ local crops,
 and `volume_scale: 0` for every volume. It uses a CNN feeding a width-288 `v3`
-backbone with 24 transformer blocks and six attention heads, batch size 4 per
-GPU, gradient checkpointing, two global views, and eight local views. Gram and
+backbone with 8 full-attention transformer blocks, a 2,048-wide SwiGLU FFN, and six attention
+heads, batch size 4 per GPU, gradient checkpointing, two global views, and four local views. Gram and
 point supervision are disabled for this initial stage.
+The FFN uses `mlp_ratio: 7.111111111111111` (2,048 / 288); its packed input
+projection produces two 2,048-wide branches before gating.
 
-The CNN uses the existing `deeper` embedding with four residual stages of
-32, 64, 128, and 288 channels. Each stage has two basic residual blocks (two
+The model option `attention_type` accepts `"full"` (the default, used in this recipe)
+or `"axial"`. Each axial block has three sequential attention
+sublayers along D, H, and W, each with its own normalization, projections, and
+residual update, followed by one FFN. Patch queries attend to their spatial
+line plus CLS/register tokens; CLS/register queries attend to all tokens on
+each pass. Thus global crop representations remain available for DINO, and
+spatial outputs remain available for iBOT. RoPE is applied using the original
+grid coordinates before grouping lines. `rope_type` independently selects the
+positional encoding and does not select the attention pattern.
+
+Axial attention supports variable crop grids and gradient checkpointing. It
+reduces attention interactions but adds two sets of attention projections per
+3D block; runtime and training quality should be measured on the target GPU.
+Full-attention checkpoints keep their existing parameter layout when
+`attention_type` is omitted. Switching to axial adds parameters and requires
+a matching checkpoint or a new training run.
+
+The CNN uses the existing `deeper` embedding with three residual stages of
+32, 64, and 288 channels. Each stage has two basic residual blocks (two
 3×3×3 convolutions per block) and downsamples by two in its first block.
 There is no full-resolution stem or final embedding projection: the last
 stage's 288 channels become EVA tokens directly. Residual skip connections
-retain their channel projections. Total stride is 16, giving 4,096 global
+retain their channel projections. Total stride is 8, giving 4,096 global
 tokens and 512 local tokens, before CLS/register tokens.
 
 The recipe keeps a 512³ source sampling window, from which augmented crops are
 drawn. CNN convolutions use zero padding, and the model receives exactly the
-256³ global and 128³ local crops. There is no halo expansion, extra context read,
+128³ global and 64³ local crops. There is no halo expansion, extra context read,
 or cropping of the embedded grid. The output directory is
-`dinovol_pretrain_8_9um_cnn288/` to avoid automatically resuming incompatible
-checkpoints from the earlier width-864 recipe.
+`dinovol_pretrain_8_9um_cnn288_8blocks_ffn2048_full_g128_p8/` to avoid automatically resuming
+incompatible checkpoints from earlier architectures.
 
 The configurable CNN options under `model` are:
 
@@ -65,9 +84,9 @@ The configurable CNN options under `model` are:
   "embedding_type": "deeper",
   "embed_dim": 288,
   "num_heads": 6,
-  "patch_size": [16, 16, 16],
-  "deeper_embed_stage_channels": [32, 64, 128, 288],
-  "deeper_embed_depth_per_level": [2, 2, 2, 2],
+  "patch_size": [8, 8, 8],
+  "deeper_embed_stage_channels": [32, 64, 288],
+  "deeper_embed_depth_per_level": [2, 2, 2],
   "deeper_embed_use_stem": false,
   "deeper_embed_final_projection": false
 }

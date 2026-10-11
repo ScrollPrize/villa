@@ -22,6 +22,7 @@ from dinovol_2.model.rope import MixedRopePositionEmbedding, RopePositionEmbeddi
 
 
 _BACKBONE_DEFAULTS = {
+    "attention_type": "full",
     "input_channels": 1,
     "global_crops_size": (256, 256, 256),
     "local_crops_size": None,
@@ -30,6 +31,9 @@ _BACKBONE_DEFAULTS = {
     "embedding_type": "default",
     "deeper_embed_batch_chunk_size": 1,
     "deeper_embed_stage_channels": None,
+    "deeper_embed_stage_strides": None,
+    "deeper_embed_stem_channels": None,
+    "deeper_embed_stem_type": None,
     "deeper_embed_depth_per_level": None,
     "deeper_embed_use_stem": True,
     "deeper_embed_final_projection": True,
@@ -56,6 +60,7 @@ _BACKBONE_DEFAULTS = {
 }
 
 _BACKBONE_DEFAULTS_V2 = {
+    "attention_type": "full",
     "input_channels": 1,
     "global_crops_size": (256, 256, 256),
     "local_crops_size": None,
@@ -64,6 +69,9 @@ _BACKBONE_DEFAULTS_V2 = {
     "embedding_type": "default",
     "deeper_embed_batch_chunk_size": 1,
     "deeper_embed_stage_channels": None,
+    "deeper_embed_stage_strides": None,
+    "deeper_embed_stem_channels": None,
+    "deeper_embed_stem_type": None,
     "deeper_embed_depth_per_level": None,
     "deeper_embed_use_stem": True,
     "deeper_embed_final_projection": True,

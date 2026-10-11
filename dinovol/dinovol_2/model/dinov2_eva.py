@@ -102,6 +102,7 @@ class EvaAttention(nn.Module):
             x,
             rope: Optional[RopeEmbedding] = None,
             attn_mask: Optional[torch.Tensor] = None,
+            rope_shape: Optional[Tuple[int, ...]] = None,
     ):
         B, N, C = x.shape
 
@@ -126,30 +127,72 @@ class EvaAttention(nn.Module):
             q = apply_rotary_embedding(q, rope, prefix_tokens=self.num_prefix_tokens).type_as(v)
             k = apply_rotary_embedding(k, rope, prefix_tokens=self.num_prefix_tokens).type_as(v)
 
-        if self.fused_attn:
-            x = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_mask,
-                dropout_p=self.attn_drop.p if self.training else 0.,
-            )
-        else:
-            raise RuntimeError("Fused attention should be used.")
-            q = q * self.scale
-            attn = (q @ k.transpose(-2, -1))
-
-            if attn_mask is not None:
-                attn_mask = attn_mask.to(torch.bool)
-                attn = attn.masked_fill(~attn_mask[:, None, None, :], float("-inf"))
-            attn = attn.softmax(dim=-1)
-
-            attn = self.attn_drop(attn)
-            x = attn @ v
-
-        x = x.transpose(1, 2).reshape(B, N, C)
+        x = self._attention(q, k, v, attn_mask=attn_mask, spatial_shape=rope_shape)
+        x = x.transpose(1, 2).reshape(B, N, -1)
         x = self.norm(x)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
+
+    def _attention(self, q, k, v, *, attn_mask=None, spatial_shape=None):
+        if not self.fused_attn:
+            raise RuntimeError("Fused attention should be used.")
+        return F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask,
+            dropout_p=self.attn_drop.p if self.training else 0.,
+        )
+
+
+class EvaAxialAttention(EvaAttention):
+    """One axis pass, with global prefix queries and prefix keys in each line.
+
+    Project and rotate tokens once before grouping spatial lines. Prefix attention
+    uses P x N interactions; patch attention uses N x (axis_length + P), never N x N.
+    """
+
+    def __init__(self, *args, axis: int, ndim: int, **kwargs):
+        super().__init__(*args, **kwargs)
+        if ndim not in (2, 3) or not 0 <= axis < ndim:
+            raise ValueError("axial attention requires a valid axis in a 2D or 3D grid")
+        self.axis = axis
+        self.ndim = ndim
+
+    def _attention(self, q, k, v, *, attn_mask=None, spatial_shape=None):
+        if attn_mask is not None:
+            raise ValueError("axial attention does not support an explicit attention mask; use voxel masking")
+        if (spatial_shape is None or len(spatial_shape) != self.ndim
+                or any(size <= 0 for size in spatial_shape)
+                or math.prod(spatial_shape) != q.shape[-2] - self.num_prefix_tokens):
+            raise ValueError("axial attention requires spatial_shape matching the patch token grid")
+        B, H, _, C = q.shape
+        P = self.num_prefix_tokens
+        line_length = spatial_shape[self.axis]
+        other_axes = [axis for axis in range(self.ndim) if axis != self.axis]
+        other_shape = [spatial_shape[axis] for axis in other_axes]
+        line_count = math.prod(other_shape)
+        # [B, H, spatial..., C] -> [B, other spatial..., H, axis, C].
+        order = [0, *[axis + 2 for axis in other_axes], 1, self.axis + 2, self.ndim + 2]
+        inverse = [order.index(index) for index in range(len(order))]
+
+        def lines(tensor):
+            return tensor[:, :, P:].reshape(B, H, *spatial_shape, C).permute(order).reshape(
+                B * line_count, H, line_length, C
+            )
+
+        def line_keys(tensor):
+            patches = lines(tensor)
+            if not P:
+                return patches
+            prefix = tensor[:, :, :P].unsqueeze(1).expand(B, line_count, H, P, C)
+            return torch.cat((prefix.reshape(B * line_count, H, P, C), patches), dim=-2)
+
+        patches = super()._attention(lines(q), line_keys(k), line_keys(v))
+        patches = patches.reshape(B, *other_shape, H, line_length, C).permute(inverse)
+        patches = patches.reshape(B, H, math.prod(spatial_shape), C)
+        if not P:
+            return patches
+        prefix = super()._attention(q[:, :, :P], k, v)
+        return torch.cat((prefix, patches), dim=-2)
 
 
 class EvaBlock(nn.Module):
@@ -176,6 +219,7 @@ class EvaBlock(nn.Module):
             rope_impl=None,
             rope_kwargs=None,
             ndim: Optional[int] = None,
+            attention_type: str = "full",
     ):
         """
 
@@ -199,9 +243,14 @@ class EvaBlock(nn.Module):
         super().__init__()
         if rope_kwargs is None:
             rope_kwargs = {}
+        if attention_type not in {"full", "axial"}:
+            raise ValueError(f"Unknown attention_type={attention_type!r}; expected 'full' or 'axial'")
+        if attention_type == "axial" and ndim not in (2, 3):
+            raise ValueError("axial attention requires ndim=2 or ndim=3")
+        self.attention_type = attention_type
         self.norm1 = norm_layer(dim)
-        self.attn = EvaAttention(
-            dim,
+        attention_kwargs = dict(
+            dim=dim,
             num_heads=num_heads,
             qkv_bias=qkv_bias,
             qkv_fused=qkv_fused,
@@ -211,6 +260,17 @@ class EvaBlock(nn.Module):
             attn_head_dim=attn_head_dim,
             norm_layer=norm_layer if scale_attn_inner else None,
         )
+        self.attn = (EvaAxialAttention(**attention_kwargs, axis=0, ndim=ndim)
+                     if attention_type == "axial" else EvaAttention(**attention_kwargs))
+        self.axial_norms = nn.ModuleList()
+        self.axial_attns = nn.ModuleList()
+        self.axial_gammas = nn.ParameterList()
+        if attention_type == "axial":
+            for axis in range(1, ndim):
+                self.axial_norms.append(norm_layer(dim))
+                self.axial_attns.append(EvaAxialAttention(**attention_kwargs, axis=axis, ndim=ndim))
+                if init_values is not None:
+                    self.axial_gammas.append(nn.Parameter(init_values * torch.ones(dim)))
         self.rope_embed = None
         if rope_impl is not None:
             if attn_head_dim is None and dim % num_heads != 0:
@@ -273,12 +333,14 @@ class EvaBlock(nn.Module):
                 if rope_shape is None:
                     raise ValueError("rope_shape must be provided when using per-block RoPE")
                 rope = self.rope_embed.get_embed(rope_shape)
-        if self.gamma_1 is None:
-            x = x + self.drop_path1(self.attn(self.norm1(x), rope=rope, attn_mask=attn_mask))
-            x = x + self.drop_path2(self.mlp(self.norm2(x)))
-        else:
-            x = x + self.drop_path1(self.gamma_1 * self.attn(self.norm1(x), rope=rope, attn_mask=attn_mask))
-            x = x + self.drop_path2(self.gamma_2 * self.mlp(self.norm2(x)))
+        norms = [self.norm1, *self.axial_norms]
+        attentions = [self.attn, *self.axial_attns]
+        gammas = [self.gamma_1, *self.axial_gammas] if self.gamma_1 is not None else [None] * len(attentions)
+        for norm, attention, gamma in zip(norms, attentions, gammas):
+            update = attention(norm(x), rope=rope, attn_mask=attn_mask, rope_shape=rope_shape)
+            x = x + self.drop_path1(update if gamma is None else gamma * update)
+        update = self.mlp(self.norm2(x))
+        x = x + self.drop_path2(update if self.gamma_2 is None else self.gamma_2 * update)
         return x
 
 
@@ -361,6 +423,10 @@ class Eva(nn.Module):
             deeper_embed_depth_per_level: Optional[Tuple[int, ...]] = None,
             deeper_embed_use_stem: bool = True,
             deeper_embed_final_projection: bool = True,
+            deeper_embed_stage_strides=None,
+            deeper_embed_stem_channels: Optional[int] = None,
+            deeper_embed_stem_type: Optional[str] = None,
+            attention_type: str = "full",
     ):
         """
         Diff to timm implementation
@@ -415,6 +481,9 @@ class Eva(nn.Module):
                 depth_per_level=deeper_embed_depth_per_level,
                 use_stem=deeper_embed_use_stem,
                 final_projection=deeper_embed_final_projection,
+                stage_strides=deeper_embed_stage_strides,
+                stem_channels=deeper_embed_stem_channels,
+                stem_type=deeper_embed_stem_type,
             )
         else:
             raise ValueError(
@@ -487,6 +556,7 @@ class Eva(nn.Module):
                 rope_impl=rope_impl if self.use_per_block_rope else None,
                 rope_kwargs=rope_kwargs if self.use_per_block_rope else None,
                 ndim=self.ndim,
+                attention_type=attention_type,
             )
             for i in range(depth)])
 

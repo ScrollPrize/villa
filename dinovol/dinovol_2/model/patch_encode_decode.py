@@ -534,7 +534,7 @@ class PatchEmbed(nn.Module):
 
 
 class PatchEmbedDeeper(nn.Module):
-    """Dynamic-network-architectures-style patch embed with patch-size-derived stage strides."""
+    """CNN embedding whose stage strides multiply to the token patch size."""
 
     def __init__(
         self,
@@ -549,6 +549,9 @@ class PatchEmbedDeeper(nn.Module):
         stage_channels: Optional[Tuple[int, ...]] = None,
         use_stem: bool = True,
         final_projection: bool = True,
+        stage_strides: Optional[Tuple[Union[int, Tuple[int, ...]], ...]] = None,
+        stem_channels: Optional[int] = None,
+        stem_type: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.patch_size = tuple(int(p) for p in patch_size)
@@ -560,13 +563,41 @@ class PatchEmbedDeeper(nn.Module):
                 f"PatchEmbedDeeper requires power-of-two patch sizes, got patch_size={self.patch_size}"
             )
 
-        max_patch = max(self.patch_size)
-        num_stages = int(np.log2(max_patch)) if max_patch > 1 else 0
+        if stage_strides is None:
+            max_patch = max(self.patch_size)
+            num_stages = int(np.log2(max_patch)) if max_patch > 1 else 0
+            stage_strides = [
+                tuple(2 if (patch / (2 ** stage_index)) % 2 == 0 else 1 for patch in self.patch_size)
+                for stage_index in range(num_stages)
+            ]
+        else:
+            normalized_strides = []
+            for stride in stage_strides:
+                stride = (stride,) * self.ndim if isinstance(stride, (int, np.integer)) else tuple(stride)
+                if len(stride) != self.ndim or any(
+                    not isinstance(value, (int, np.integer)) or value not in (1, 2) for value in stride
+                ):
+                    raise ValueError("stage_strides entries must contain 1 or 2 for each spatial axis")
+                normalized_strides.append(tuple(int(value) for value in stride))
+            stage_strides = normalized_strides
+            num_stages = len(stage_strides)
+            total_stride = tuple(
+                int(np.prod([stride[axis] for stride in stage_strides])) for axis in range(self.ndim)
+            )
+            if total_stride != self.patch_size:
+                raise ValueError(f"stage_strides product must equal patch_size, got {total_stride} and {self.patch_size}")
+        self.stage_strides = tuple(stage_strides)
+        stem_channels = base_features if stem_channels is None else stem_channels
+        if not isinstance(stem_channels, (int, np.integer)) or stem_channels <= 0:
+            raise ValueError("stem_channels must be a positive integer")
+        stem_type = embed_block_style if stem_type is None else stem_type
+        if stem_type not in ("residual", "conv"):
+            raise ValueError("stem_type must be 'residual' or 'conv'")
         if depth_per_level is None:
             depth_per_level = (1,) * num_stages
         if len(depth_per_level) != num_stages:
             raise ValueError(
-                f"depth_per_level must match the number of downsampling stages ({num_stages}), got {depth_per_level}"
+                f"depth_per_level must match the number of stages ({num_stages}), got {depth_per_level}"
             )
         if any(depth < 1 for depth in depth_per_level):
             raise ValueError("depth_per_level entries must be positive")
@@ -574,7 +605,7 @@ class PatchEmbedDeeper(nn.Module):
             stage_channels = tuple(base_features * (2 ** index) for index in range(num_stages))
         if len(stage_channels) != num_stages or any(channels < 1 for channels in stage_channels):
             raise ValueError(f"stage_channels must contain {num_stages} positive channel counts, got {stage_channels}")
-        final_channels = stage_channels[-1] if num_stages else (base_features if use_stem else input_channels)
+        final_channels = stage_channels[-1] if num_stages else (stem_channels if use_stem else input_channels)
         if not final_projection and final_channels != embed_dim:
             raise ValueError("without final_projection, the final stage channels must equal embed_dim")
         if not final_projection and embed_proj_3x3x3:
@@ -592,12 +623,12 @@ class PatchEmbedDeeper(nn.Module):
 
         if not use_stem:
             self.stem = nn.Identity()
-        elif embed_block_style == "residual":
+        elif stem_type == "residual":
             self.stem = StackedResidualBlocks(
                 1,
                 conv_op,
                 input_channels,
-                base_features,
+                stem_channels,
                 kernel_size,
                 1,
                 padding_mode="zeros",
@@ -610,12 +641,12 @@ class PatchEmbedDeeper(nn.Module):
                 nonlin_kwargs=nonlin_kwargs,
                 block=block,
             )
-        elif embed_block_style == "conv":
+        elif stem_type == "conv":
             self.stem = StackedConvBlocks(
                 1,
                 conv_op,
                 input_channels,
-                base_features,
+                stem_channels,
                 kernel_size,
                 1,
                 padding_mode="zeros",
@@ -632,13 +663,8 @@ class PatchEmbedDeeper(nn.Module):
                 f"Unknown embed_block_style: {embed_block_style}. Must be 'residual' or 'conv'."
             )
 
-        stage_strides = [
-            tuple(2 if (patch / (2 ** stage_index)) % 2 == 0 else 1 for patch in self.patch_size)
-            for stage_index in range(num_stages)
-        ]
-
         self.stages = nn.ModuleList()
-        stage_in_channels = base_features if use_stem else input_channels
+        stage_in_channels = stem_channels if use_stem else input_channels
         for stage_index, (depth, stride) in enumerate(zip(depth_per_level, stage_strides)):
             stage_out_channels = stage_channels[stage_index]
             bottleneck_channels = stage_out_channels // 4 if embed_block_type == "bottleneck" else None
