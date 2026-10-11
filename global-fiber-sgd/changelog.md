@@ -214,3 +214,11 @@ Explicit visualization winding offset supports reference-metric-aligned colors.
 
 Added exhaustive joint event/node traversal and evaluation-only source-fiber
 reference winding L1 / within-two metrics after global median offset correction.
+# 2026-10-11: quadratic window/batch experiment
+
+- Added opt-in local MAP windows for quadratic distance/V, retaining exact
+  full-distribution sign hinge with sorted prefix sums and unchanged broken gate.
+- Added complete-update CUDA phase timings and optional Torch profiler trace.
+- Added exclusive multi-GPU experiment lanes under one manager lease; reused
+  solver subprocesses, cancellation and per-lane logs. Shared pilot results
+  are excluded from final comparisons. Defaults unchanged.

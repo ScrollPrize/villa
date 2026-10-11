@@ -1,4 +1,16 @@
-# Current: corrected quadratic fused run
+# Current: profile and local-window trial
+
+- [x] Independent plan review and matrix review.
+- [x] Exclusive baseline quadratic pair and production phase profile.
+- [x] Exact prefix sign and local windows implementation;90-test suite plus
+  child-command regression pass. CUDA compiled/eager tests all4radii passed.
+- [x] Matched radius trials, results and documentation; defaults unchanged.
+- [x] Exclusive batch timing/memory matrix B4096/8192/16384/32768, full/N2.
+- [x] Larger-batch quality trials and detailed complete-update profiler.
+- [x] Both exclusive suites finished exit0;91tests passed. Results and complete
+  progress in uv_local_window_results.md and uv_local_window_progress.md.
+
+# Previous: corrected quadratic fused run
 
 - [x] Loss implementation committed as c468354dd (81 regression tests passed).
 - [x] Independent experiment-plan review.

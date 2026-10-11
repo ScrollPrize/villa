@@ -260,3 +260,13 @@ curve positions yield the fitted median discrete winding; retained pieces of a
 source are combined. Missing/rejected fibers are excluded from accuracy and
 counted separately. This is an approximate reference-surface association, not an
 anatomical truth guarantee. Saved reference-render summaries include it too.
+# Local winding-window and batch experiments
+
+See `uv_local_window_results.md` for exclusive-GPU timing, memory, quality and
+profiling of the opt-in `local_window_radius` quadratic approximation. Full
+all-to-all remains default. Windows preserve retained mass and use exact global
+prefix-sum sign loss; no placeholders or constraint-proposed windows are used.
+`run_uv_exclusive_matrix.json` and `run_uv_batch_quality_matrix.json` use the
+existing approved crop-benchmark runner. One exclusive lease owns independent
+GPU lanes; jobs within each lane run serially. Completed outputs are protected
+against overwrite. Use new output paths for reruns.

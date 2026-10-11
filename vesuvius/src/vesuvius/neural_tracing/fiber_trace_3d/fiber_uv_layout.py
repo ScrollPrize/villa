@@ -389,11 +389,51 @@ def pair_cost_components(qa,qb,va,vb,phase_delta,family_delta,sign,mu,table,conf
     return cost,ordered,soft_cost,wrong
 
 
+def prefix_sign_terms(pa,pb,qa,qb,phase_delta,family_delta,sign):
+    """Exact expected sign hinge without a K*K tensor (piecewise gradients)."""
+    import torch
+    origin=qb[:,:1]
+    x=sign[:,None]*(qa-origin+phase_delta[:,None]-.5*family_delta[:,None])
+    y=sign[:,None]*(qb-origin)
+    y,order=y.sort(dim=1);b=pb.gather(1,order)
+    mass=torch.cat((b.new_zeros((len(b),1)),b.cumsum(1)),1)
+    moment=torch.cat((b.new_zeros((len(b),1)),(b*y).cumsum(1)),1)
+    count=torch.searchsorted(y.contiguous(),x.contiguous(),right=False)
+    return 4*(pa*(x*mass.gather(1,count)-moment.gather(1,count))).sum(1)
+
+
+def local_winding_window(p,q,v,radius):
+    """Conditional local distribution, preserving unconditional retained mass."""
+    import torch
+    k=p.shape[1]
+    ids=p.argmax(1)[:,None]+torch.arange(-radius,radius+1,device=p.device)[None,:]
+    valid=(ids>=0)&(ids<k);ids=ids.clamp(0,k-1)
+    local=p.gather(1,ids)*valid
+    total=p.sum(1,keepdim=True);selected=local.sum(1,keepdim=True)
+    local=local/selected.clamp_min(1e-30)*total
+    return local,q.gather(1,ids),v.gather(1,ids),selected/total.clamp_min(1e-30)
+
+
 def pair_objective(pa,pb,qa,qb,va,vb,phase_delta,family_delta,sign,mu,table,config,
                    charge=None,event_weights=None,selected_ordered=None):
     """Legacy posterior objective, optionally with selected-sign safeguard."""
     import torch
     mode=config.get('distance_objective','likelihood')
+    radius=config.get('local_window_radius')
+    if radius is not None:
+        if not isinstance(radius,int) or radius<0:raise ValueError('Invalid local_window_radius')
+        if mode!='squared' or charge is not None:
+            raise ValueError('Local windows require squared objective without fixed sign charge')
+        if radius<pa.shape[1]-1:
+            sign_terms=prefix_sign_terms(pa,pb,qa,qb,phase_delta,family_delta,sign)
+            a,x,u,_=local_winding_window(pa,qa,va,radius)
+            b,y,v,_=local_winding_window(pb,qb,vb,radius)
+            local_config=dict(config);local_config.pop('local_window_radius');local_config['sign_weight']=0.
+            # Evaluate shared squared/V formula; exact global hinge is separate.
+            soft=pair_objective(a,b,x,y,u,v,phase_delta,family_delta,sign,mu,table,
+                                local_config,event_weights=event_weights)
+            if event_weights is not None:sign_terms=sign_terms*event_weights
+            return soft+config.get('sign_weight',10.)*sign_terms.mean()
     if mode not in ('likelihood','squared','huber','huber_likelihood'):
         raise ValueError('Invalid distance_objective')
     if mode!='likelihood':
@@ -560,13 +600,24 @@ def audit(d, state, widths, config, indices=None):
     p,labels,keep,pick,u,v,b=geometry;k=len(widths)
     if config.get('broken_threshold') is not None:state=state.astype(np.float64,copy=False)
     extra={}
+    if config.get('local_window_radius') is not None:
+        radius=config['local_window_radius'];center=p[:,:k].argmax(1)
+        mass=p[:,:k].sum(1);selected=np.zeros(len(p),dtype=np.float64)
+        rows=np.arange(len(p))
+        for offset in range(-radius,radius+1):
+            index=center+offset;valid=(index>=0)&(index<k)
+            selected[valid]+=p[rows[valid],index[valid]]
+        coverage=selected/np.maximum(mass,1e-30)
+        extra.update(window_retained_mass_mean=float(mass.mean()),
+            window_captured_conditional_mean_percent=float(100*coverage.mean()),
+            window_captured_conditional_q10_q50_q90_percent=(100*np.quantile(coverage,[.1,.5,.9])).tolist())
     if anchored(config):
         du=state[:,k+3:2*k+3];du=du-du.mean(1,keepdims=True)
         dv=state[:,2*k+3:];dv=dv-dv.mean(1,keepdims=True)
         phase=d['phase']+state[:,k+1]
         q=pick+phase+du[np.arange(len(state)),pick]
         separation=1+np.diff(du,axis=1)
-        extra=dict(offset_over_quarter_percent=float(100*np.mean(abs(du)>.25)),
+        extra.update(dict(offset_over_quarter_percent=float(100*np.mean(abs(du)>.25)),
             chosen_retained_offset_over_quarter_percent=float(100*np.mean(
                 abs(du[np.arange(len(state)),pick][keep])>.25)) if keep.any() else None,
             probability_mass_offset_over_quarter_percent=float(100*np.sum(p[:,:k]*(abs(du)>.25))/max(float(p[:,:k].sum()),1e-30)),
@@ -577,7 +628,7 @@ def audit(d, state, widths, config, indices=None):
             shared_phase_range=[float(phase.min()),float(phase.max())],
             retained_anchor_q_quantiles=np.quantile(q[keep],[0,.5,1]).tolist() if keep.any() else None,
             occupied_anchor_windings=np.unique(np.floor(q[keep]).astype(int)).tolist(),
-            bucket_indices_are_relative_to_unwrapped_anchor=True)
+            bucket_indices_are_relative_to_unwrapped_anchor=True))
     sel=np.arange(len(d['i'])) if indices is None else indices
     total=known=bad=retained=0;errors=[];bytype={};minq=np.inf;maxq=-np.inf
     for a in range(0,len(sel),131072):
@@ -738,6 +789,9 @@ class FullPassGradientAccumulator:
 
 
 def solve(config):
+    if config.get('experiment_matrix'):
+        from .fiber_normal_sign import solve_tensor_matrix
+        return solve_tensor_matrix(config,'vesuvius.neural_tracing.fiber_trace_3d.fiber_uv_layout')
     if config.get('benchmark_pair_fusion'):
         from .fiber_uv_pair_benchmark import benchmark
         return benchmark(config)
@@ -782,6 +836,10 @@ def solve(config):
         if steps<2:raise ValueError('Benchmark requires at least two updates')
     evaluate_pair=pair_evaluator(config)
     update_timings=[]
+    segment_timings=[]
+    update_profile=None;profile_rows=None
+    def timing_marker():
+        event=torch.cuda.Event(enable_timing=True);event.record();return event
     accumulated=config.get('update_mode','minibatch')=='global_accumulated'
     gradients=FullPassGradientAccumulator(embedding.weight,raw) if accumulated else None
     history=[];started=time.monotonic();torch.cuda.reset_peak_memory_stats()
@@ -849,6 +907,11 @@ def solve(config):
             print('UV '+json.dumps(record),flush=True)
             if step==steps or (feasible_check and metrics['sign_feasible']):break
         if benchmark_updates is not None:
+            if config.get('benchmark_torch_profile') and step==steps-1:
+                torch.cuda.synchronize()
+                update_profile=torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                                     torch.profiler.ProfilerActivity.CUDA])
+                update_profile.__enter__()
             tick=torch.cuda.Event(enable_timing=True);tock=torch.cuda.Event(enable_timing=True);tick.record()
         if full_pass:
             position=step%updates
@@ -871,8 +934,10 @@ def solve(config):
             selected=selected_ordering(embedding(i),embedding(j),phase64[i],phase64[j],z64[i],z64[j],
                 data['family'][i],data['family'][j],precise['ds_a'][edges],precise['ds_b'][edges],widths,
                 precise['phase_delta'][edges],data['sign'][edges])
+        if benchmark_updates is not None:pair_start=timing_marker()
         pair=evaluate_pair(pa[:,:k],pb[:,:k],qa,qb,va,vb,data['phase_delta'][edges],data['family'][j]-data['family'][i],
             data['sign'][edges],data['distance'][edges],table,config,charge,event_weights,selected)
+        if benchmark_updates is not None:pair_end=timing_marker()
         for pp,qq,phase_key in ((pa,qa,'phase_a'),(pb,qb,'phase_b')):
             angle=qq-data[phase_key][edges,None];angle=angle-angle.detach().round()
             pair=pair+config.get('prior_weight',.01)*.5*(event_weights*(pp[:,:k]*angle.square()).sum(-1)).mean()
@@ -909,7 +974,9 @@ def solve(config):
         loss=pair+reg
         pass_losses+=torch.stack((loss.detach(),pair.detach(),reg.detach()))
         opt.zero_grad(set_to_none=True);widthopt.zero_grad(set_to_none=True)
+        if benchmark_updates is not None:backward_start=timing_marker()
         (loss/updates if accumulated else loss).backward()
+        if benchmark_updates is not None:backward_end=timing_marker()
         # Broken is an ordinary jointly optimized category from the first update.
         if accumulated:
             gradients.add(embedding.weight.grad,raw.grad)
@@ -921,6 +988,14 @@ def solve(config):
             opt.step();widthopt.step()
         if benchmark_updates is not None:
             tock.record();update_timings.append((tick,tock))
+            segment_timings.append((tick,pair_start,pair_end,backward_start,backward_end,tock))
+            if update_profile is not None:
+                torch.cuda.synchronize();update_profile.__exit__(None,None,None)
+                top=sorted(update_profile.key_averages(),key=lambda e:e.self_device_time_total,reverse=True)[:30]
+                profile_rows=[dict(name=e.key,self_cuda_us=e.self_device_time_total,
+                                   self_cpu_us=e.self_cpu_time_total,count=e.count) for e in top]
+                update_profile.export_chrome_trace(str(root/'update_trace.json'))
+                update_profile=None
     np.savez(root/'solution.npz',state=snapshot,widths=w,source_id=d['source_id'],start=d['start'],end=d['end'],family=d['family'])
     summary=dict(config=config,input=json.loads(Path(config['tensor_cache']).with_suffix('.json').read_text()),
         baseline=baseline,final=history[-1],gpu=torch.cuda.get_device_name(),peak_allocated_bytes=torch.cuda.max_memory_allocated(),
@@ -934,12 +1009,21 @@ def solve(config):
     if benchmark_updates is not None:
         torch.cuda.synchronize()
         ms=[a.elapsed_time(b) for a,b in update_timings]
-        warmup=int(config.get('benchmark_warmup',5));steady=ms[warmup:]
+        warmup=int(config.get('benchmark_warmup',5))
+        end=-1 if profile_rows is not None else None
+        steady=ms[warmup:end]
         if not steady:raise ValueError('Benchmark warmup consumed all updates')
         summary['update_benchmark']=dict(milliseconds=ms,warmup=warmup,mean_ms=float(np.mean(steady)),
             p50_ms=float(np.quantile(steady,.5)),p95_ms=float(np.quantile(steady,.95)),
             min_ms=float(min(steady)),max_ms=float(max(steady)),updates=len(ms),
             note='Production minibatch update excluding initial width-boundary calculation and logging/audit; first updates include compilation')
+        names=('sampling_coordinates','pair_forward','other_losses_forward','all_backward','coalescing_optimizer')
+        summary['update_benchmark']['segments']={name:dict(
+            mean_ms=float(np.mean(values)),p50_ms=float(np.quantile(values,.5)),
+            p95_ms=float(np.quantile(values,.95))) for index,name in enumerate(names)
+            for values in [[row[index].elapsed_time(row[index+1]) for row in segment_timings[warmup:end]]]}
+        summary['update_benchmark']['profile']=profile_rows
+        summary['update_benchmark']['profiled_last_update_excluded']=profile_rows is not None
     atomic_write(root/'summary.json',summary,durable=False)
 
 

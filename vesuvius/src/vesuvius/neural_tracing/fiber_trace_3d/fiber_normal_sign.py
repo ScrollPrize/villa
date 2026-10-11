@@ -181,6 +181,73 @@ def run(config):
     return launch_tensor_solve(config,__name__,Path(__file__))
 
 
+def tensor_matrix_jobs(config,visible):
+    """Validate isolated lanes before starting any CUDA child."""
+    lanes=config['experiment_matrix']
+    if not config['gpu_manager'].get('exclusive'):
+        raise ValueError('Experiment matrix requires exclusive parent lease')
+    if len(lanes)>len(visible) or not lanes:raise ValueError('Insufficient matrix GPUs')
+    jobs=[];outputs=set()
+    for lane,items in enumerate(lanes):
+        if not items:raise ValueError('Empty experiment lane')
+        for item in items:
+            child=json.loads(Path(item).read_text())['fiber_uv_layout']
+            if 'experiment_matrix' in child:raise ValueError('Nested experiment matrix')
+            root=Path(child['output_root']).resolve()
+            if str(root) in outputs:raise ValueError('Duplicate matrix output')
+            if (root/'summary.json').exists():raise FileExistsError('Completed matrix child exists')
+            outputs.add(str(root));jobs.append((lane,visible[lane],child))
+    return jobs
+
+
+def solve_tensor_matrix(config,module):
+    """One exclusive manager lease, independent solver processes per GPU lane."""
+    from concurrent.futures import ThreadPoolExecutor,as_completed
+    import threading
+    visible=[v for v in os.environ.get('CUDA_VISIBLE_DEVICES','').split(',') if v]
+    jobs=tensor_matrix_jobs(config,visible)
+    active=[];lock=threading.Lock();stop=threading.Event();results=[]
+    def lane_run(lane):
+        completed=[]
+        for _,gpu,child in [j for j in jobs if j[0]==lane]:
+            root=Path(child['output_root']);root.mkdir(parents=True,exist_ok=True)
+            child=dict(child,code_provenance=config.get('code_provenance'),matrix_gpu=gpu,
+                       matrix_lane=lane,matrix_parent=config['output_root'],
+                       matrix_launcher_sha256=sha256_file(Path(__file__)))
+            frozen=root/'config.json';atomic_write(frozen,child,durable=False)
+            env=dict(os.environ,CUDA_VISIBLE_DEVICES=gpu)
+            with (root/'runner.log').open('w') as log:
+                with lock:
+                    if stop.is_set():return completed
+                    process=subprocess.Popen([sys.executable,'-m',module,'--config',str(frozen),'--unmanaged','--devices','0'],
+                        env=env,stdout=log,stderr=subprocess.STDOUT)
+                    active.append(process)
+                rc=process.wait()
+                with lock:active.remove(process)
+            record=dict(output_root=str(root),gpu=gpu,exit_code=rc)
+            atomic_write(root/'matrix_job.json',record,durable=False)
+            print('MATRIX '+json.dumps(record),flush=True)
+            if rc:raise RuntimeError(f'Matrix child failed: {root}, exit {rc}')
+            completed.append(record)
+        return completed
+    pool=ThreadPoolExecutor(max_workers=len(config['experiment_matrix']))
+    try:
+        futures=[pool.submit(lane_run,lane) for lane in range(len(config['experiment_matrix']))]
+        for future in as_completed(futures):results.extend(future.result())
+    finally:
+        with lock:
+            stop.set();running=list(active)
+            for process in running:
+                if process.poll() is None:process.terminate()
+        for process in running:
+            try:process.wait(timeout=10)
+            except subprocess.TimeoutExpired:process.kill();process.wait()
+        pool.shutdown(wait=True,cancel_futures=True)
+    summary=dict(config=config,jobs=results)
+    atomic_write(Path(config['output_root'])/'summary.json',summary,durable=False)
+    return summary
+
+
 def launch_tensor_solve(config,module,source):
     """Shared managed CUDA launch for fixed-evidence optimization stages."""
     from .managed_evaluation import launch_managed

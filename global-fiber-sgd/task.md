@@ -1,5 +1,8 @@
 # Saved U/V solution visualization
 
+Current: uv_local_window_plan.md. Profile quadratic and trial local +/-N windows
+without placeholders, preserve exact all-hypothesis sign penalty efficiently.
+
 Current: uv_squared_vertical_split_plan.md. Run corrected quadratic fused solve
 and report speed/reference accuracy; commit current implementation first.
 
