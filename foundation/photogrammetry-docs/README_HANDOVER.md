@@ -389,7 +389,9 @@ Coordinates of the input ply mesh must already be in millimetres. Stage each val
 
 The general rule is `<input>/<scroll-number>/<scroll-number>-scaled.ply`.
 
-By default the case axis is the axis of the smallest enclosing cylinder. For a squashed scroll this can run across the flattened cross-section instead of along the umbilicus. To set the axis, add `<input>/<scroll-number>/<scroll-number>-axis.txt` holding either a direction (3 numbers) or two points on the umbilicus (6 numbers, e.g. picked in MeshLab), in the PLY's coordinates. Record the file with the run.
+By default the case axis is the axis of the smallest enclosing cylinder. For a squashed scroll this can run across the flattened cross-section instead of along the umbilicus. To set the axis, add `<input>/<scroll-number>/<scroll-number>-axis.txt` holding either a direction (3 numbers) or two points on the umbilicus (6 numbers), in the PLY's coordinates. Only the direction is used: the case is still centred on the smallest circle enclosing the scroll about that axis, so the umbilicus may sit a few millimetres off the case axis. Record the file with the run.
+
+To pick the two points, open the textured PLY in MeshLab (its layering shows the umbilicus best; its coordinates match the untextured mesh), choose `Edit -> Pick Points`, click where the umbilicus emerges on each end face and read the coordinates from the dialog, or save them as a `.pp` file. Check the result by viewing the scroll along the axis: the end-face layering should be concentric about it.
 
 Run the generator:
 
