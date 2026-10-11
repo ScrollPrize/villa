@@ -51,9 +51,9 @@ def direct_lr_enabled(default=False):
     # upsampling it to HR resolution every step. Same function except within
     # HR cells that straddle an LR grid plane (the upsample linearises there);
     # kills the F.interpolate forward+backward and its full-resolution
-    # transient. Off by default because it slightly changes the effective
-    # interpolant. Normally set via the model_flow_field_direct_lr config key
-    # (threaded through as `default`); FIT_SPIRAL_DIRECT_LR, when set,
+    # transient. It slightly changes the effective interpolant and exists only
+    # in the fused kernel. Normally set via the model_flow_field_direct_lr config
+    # key (shipped True, threaded through as `default`); FIT_SPIRAL_DIRECT_LR, when set,
     # overrides the config.
     value = os.environ.get('FIT_SPIRAL_DIRECT_LR')
     if value is None:

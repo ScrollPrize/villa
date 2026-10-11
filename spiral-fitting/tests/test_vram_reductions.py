@@ -147,6 +147,7 @@ class CylindricalFlowGradientTests(unittest.TestCase):
 def _make_small_spiral_model(seed, flow_field_type, device='cpu'):
     cfg = Config().as_dict()
     cfg['model_flow_field_type'] = flow_field_type
+    cfg['model_flow_field_direct_lr'] = False  # the CPU has no direct low-resolution kernel
     cfg['model_gap_expander_num_windings'] = 10
     cfg['model_gap_expander_capacity_windings'] = 10
     z_span = 16 * 12  # 12 flow lattice voxels per axis at the default resolution

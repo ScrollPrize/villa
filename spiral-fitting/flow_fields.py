@@ -463,8 +463,12 @@ class CartesianFlowField(nn.Module):
         whole walk is one autograd node (see flow_triton); the eager fallback
         composes one _RK4SparseFlowIntegrate node per slab.
         """
-        if (flow_triton.direct_lr_enabled(self.direct_lr)
-                and flow_triton.rk4_triton_available(self.flows[0], self.flows[1])):
+        if flow_triton.direct_lr_enabled(self.direct_lr):
+            if not flow_triton.rk4_triton_available(self.flows[0], self.flows[1]):
+                raise RuntimeError(
+                    'model_flow_field_direct_lr is on, but direct low-resolution sampling exists only in the '
+                    f'fused Triton kernel (CUDA float32 lattices; here {self.flows[0].device}, {self.flows[0].dtype}). '
+                    'Set model_flow_field_direct_lr=False (or FIT_SPIRAL_DIRECT_LR=0) for the upsampled field.')
             return self._get_direct_integrator()
         low_field, high_field, acc = self._prepare_upsampled_fields()
 

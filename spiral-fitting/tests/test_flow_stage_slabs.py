@@ -123,6 +123,15 @@ def test_reverse_walk_inverts_forward_walk_approximately():
     assert (wrong_order - points).abs().max() > 1e-2
 
 
+def test_cartesian_direct_lr_is_refused_where_its_kernel_is_absent(monkeypatch):
+    # Direct-LR sampling is another interpolant and only the fused kernel has it; on a CPU field
+    # get_integrator used to build the upsampled field instead, under the same configuration.
+    monkeypatch.delenv('FIT_SPIRAL_DIRECT_LR', raising=False)
+    with pytest.raises(RuntimeError, match='model_flow_field_direct_lr=False'):
+        _make_field('cartesian', 1, direct_lr=True).get_integrator()
+    assert _make_field('cartesian', 1, direct_lr=False).get_integrator() is not None
+
+
 def test_model_forward_and_inverse_use_one_diffeomorphism():
     config = {
         'model_initial_dr_per_winding': 16.,
