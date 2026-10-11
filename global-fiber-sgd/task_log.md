@@ -1,22 +1,16 @@
-# Continuation to sweep 20
+# Global accumulated joint optimization
 
-- Independent review approved uv_continue_plan.md; no solver changes.
-- Submitted approved runner with run_uv_categorical_ccw_continue.json and
-  run_uv_categorical_cw_continue.json. New roots data/uv_categorical_v1/{ccw,cw}_sweep20.
-- Ten additional updates, unchanged parameters; local0..10=global10..20.
-- Shared 12GiB GPU0/1. Initial manager status waiting_for_release.
-- Existing warm-start checks hashes, evidence, IDs and shapes; old outputs intact.
-- Both grants acquired and local sweep0 verified: CCW110/CW104 violations and
-  retained arc62.4747946%/62.3828339%, exactly matching previous final states.
-  Jobs actively computing additional sweeps; previous duration ~13min per10.
-- Visualization follow-up (saved10-sweep states): equal U/V scale, no tooltips;
-  LZW tiled BigTIFF replaces PNG. User reduced requested height4000 to1000px
-  total including annotations/histograms. CPU-only rerender via approved runner.
-  Independent review approved. Five tests pass incl exact tile-vs-full drawing
-  across seams, full SVG fiber counts/no titles, TIFF1000px height/LZW metadata.
-  TIFFs approximately5.5MiB each. No optimizer/inference changes.
-- Both20-sweep solutions finished and saved. Additional10sweeps took496.09s
-  CCW/523.70sCW. Sign violations110->28CCW and104->22CW; retained arc
-  62.4748->64.8926%CCW and62.3828->64.7460%CW. Rejected pieces
-  22.7383->20.5711%CCW and22.7887->20.6593%CW. Final-state cost not yet
-  evaluated separately: last pre_update_energy belongs to sweep19, not20.
+- User requests10 global updates freshly initialized from reference, not warm start.
+- uv_global_accumulation_plan.md independently approved. Implemented bounded
+  dense gradient buffers, sparse minibatch accumulation and one optimizer step
+  per exhaustive pass. Existing minibatch mode unchanged.
+- Same LR/loss/reference initialization as previous run. Objective pre-update,
+  full hard metrics post-update. All parameters trainable immediately.
+- 27focused tests passed; monolithic sparse Adam equivalence validated for two
+  updates with repeated IDs, uneven partitions, zero row and shared penalties.
+- Config run_uv_reference_global_accumulated151_ccw.json launched through approved
+  runner with shared24GiB manager grant. Latest completed iteration8/10:
+  objective39.833248,sign11.174915%,retained100%,L1.450171,within2 99.999739%,
+  fit/reference q10/q90=42/124. One optimizer update per pass verified in history.
+- User requests current-state commit and report-only speed analysis; no additional
+  solver changes or performance experiments authorized in this turn.

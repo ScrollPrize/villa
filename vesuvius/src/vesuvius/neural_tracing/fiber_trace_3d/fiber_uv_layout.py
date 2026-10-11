@@ -302,11 +302,36 @@ def table_cost(delta, mu, table, step=.0625):
     return low*(1-mf[:,None,None])+high*mf[:,None,None]
 
 
-def calibrated_sign_charge(degree_a,degree_b,mean_degree,event_count,piece_count,rejection_cost,multiplier):
+def rejection_weights(degree,mean_degree,mode='fixed'):
+    import torch
+    if mode=='fixed':return torch.ones_like(degree)
+    if mode=='degree':return .5+.5*degree/mean_degree.clamp_min(1.)
+    raise ValueError('rejection_weighting must be fixed or degree')
+
+
+def validate_joint_rejection(config):
+    if float(config.get('rejection_warmup',0))!=0:
+        raise ValueError('Joint optimization no longer permits rejection_warmup; broken logits train from update0')
+    if config.get('rejection_weighting','fixed') not in ('fixed','degree'):
+        raise ValueError('rejection_weighting must be fixed or degree')
+    if config.get('reference_initialization') and config.get('warm_start'):
+        raise ValueError('Reference initialization and checkpoint warm start are mutually exclusive')
+    mode=config.get('update_mode','minibatch')
+    if mode not in ('minibatch','global_accumulated'):
+        raise ValueError('Unknown update_mode')
+    if mode=='global_accumulated':
+        if config.get('traversal','full_pass')!='full_pass':
+            raise ValueError('Global accumulation requires full_pass traversal')
+        if config.get('entropy_ramp',True):
+            raise ValueError('Global accumulation requires entropy_ramp=false for a fixed pass objective')
+
+
+def calibrated_sign_charge(degree_a,degree_b,mean_degree,event_count,piece_count,rejection_cost,multiplier,
+                           rejection_weighting='degree'):
     """Cheaper-endpoint dominance under the actual event/node normalization."""
     import torch
-    ca=.5+.5*degree_a/mean_degree.clamp_min(1.)
-    cb=.5+.5*degree_b/mean_degree.clamp_min(1.)
+    ca=rejection_weights(degree_a,mean_degree,rejection_weighting)
+    cb=rejection_weights(degree_b,mean_degree,rejection_weighting)
     return multiplier*(event_count/piece_count)*rejection_cost*torch.minimum(ca,cb)
 
 
@@ -537,6 +562,25 @@ def audit(d, state, widths, config, indices=None):
         endpoint_q_range=[float(minq),float(maxq)],by_type=bytype,**extra)
 
 
+def expand_winding_state(state,widths,count):
+    """Expand shared-anchor hypotheses without changing old physical geometry."""
+    from scipy.special import logsumexp
+    old=len(widths)
+    if count<old or state.shape[1]!=3*old+3:raise ValueError('Invalid shared-anchor expansion')
+    if count==old:return state,widths
+    out=np.zeros((len(state),3*count+3),dtype=state.dtype)
+    logits=state[:,:old+1].astype(np.float64)
+    logp=logits-logsumexp(logits,axis=1,keepdims=True)
+    out[:,:old]=logp[:,:old]+np.log(old/count)
+    out[:,old:count]=(logsumexp(logp[:,:old],axis=1)-np.log(count))[:,None]
+    out[:,count]=logp[:,old]
+    out[:,count+1:count+3]=state[:,old+1:old+3]
+    for a,b in ((old+3,count+3),(2*old+3,2*count+3)):
+        offsets=state[:,a:a+old]
+        out[:,b:b+old]=offsets-offsets.mean(1,keepdims=True)
+    return out,np.r_[widths,np.full(count-old,widths[-1],dtype=widths.dtype)]
+
+
 def load_warm_start(config,d,shape):
     path=Path(config['warm_start'])
     if sha256_file(path)!=config['warm_start_sha256']:raise ValueError('Changed warm start')
@@ -547,8 +591,14 @@ def load_warm_start(config,d,shape):
         for key in ('source_id','start','end','family'):
             if not np.array_equal(src[key],d[key]):raise ValueError('Warm-start piece mismatch: '+key)
         state=src['state'].copy();widths=src['widths'].copy()
-    if state.shape!=shape or widths.shape!=(100,) or not np.isfinite(state).all() or not np.isfinite(widths).all() or np.any(widths<=100):
+    old=len(widths);expected_columns=3*old+(3 if anchored(config) else 1)
+    if state.shape!=(shape[0],expected_columns) or not np.isfinite(state).all() or not np.isfinite(widths).all() or np.any(widths<=100):
         raise ValueError('Invalid warm-start state/widths')
+    count=int(config.get('winding_count',100))
+    if old!=count:
+        if not config.get('expand_windings') or not anchored(config):raise ValueError('Explicit shared-anchor expansion required')
+        state,widths=expand_winding_state(state,widths,count)
+    if state.shape!=shape:raise ValueError('Warm-start target shape mismatch')
     return state,widths
 
 
@@ -559,40 +609,128 @@ def inverse_widths(widths):
     return x+torch.log(-torch.expm1(-x))
 
 
+def reference_initial_centers(d,widths,reference,radial_centers):
+    """Place each piece midpoint at its source's reference winding, no GT loss."""
+    reference=np.asarray(reference);centers=np.asarray(radial_centers).copy()
+    valid=np.isfinite(reference)
+    if np.any((reference[valid]<0)|(reference[valid]>=len(widths))):
+        raise ValueError('Reference winding outside configured hypotheses')
+    ix=reference[valid].astype(int)
+    phase=d['phase'][valid]+(d['family'][valid]==0)*d['node_ds'][valid,1]/widths[ix]
+    centers[valid]=reference[valid]-np.floor(phase+.5)
+    if np.any((centers[valid]<0)|(centers[valid]>=len(widths))):
+        raise ValueError('Reference anchor-corrected winding outside configured hypotheses')
+    return centers
+
+
+def fresh_initial_state(d,config):
+    """Geometric initialization only; never consumes a previous U/V solution.
+
+    Physical evidence caches predate configurable K. Their radius observations
+    remain reusable; regenerate the radial prior across the requested range.
+    Preserve the historical 100-candidate initialization byte-for-byte.
+    """
+    from scipy.special import logsumexp
+    k=int(config.get('winding_count',100))
+    sigma=float(config.get('initial_sigma',3.))
+    if k<2 or not np.isfinite(sigma) or sigma<=0:
+        raise ValueError('Require at least two windings and positive finite initial_sigma')
+    if k==100:
+        centers=np.asarray(d['initial_k'])
+        widths=np.asarray(d['width_initial']).copy()
+    else:
+        r=np.asarray(d['radius']);lo,hi=np.quantile(r,[.001,.999]);scale=(k-1)/99
+        centers=np.clip(scale*(5+85*(r-lo)/max(hi-lo,1)),0,k-1).astype(np.float32)
+        radii=np.interp(np.arange(k),np.linspace(5*scale,90*scale,k),np.linspace(lo,hi,k))
+        widths=np.maximum(2*np.pi*radii,100.).astype(np.float32)
+    if config.get('reference_initialization'):
+        if not anchored(config):raise ValueError('Reference initialization requires shared_anchor layout')
+        from .fiber_reference_comparison import load_metric_projection
+        projection=load_metric_projection(config['reference_initialization'],d,config)
+        centers=reference_initial_centers(d,widths,projection['chosen_winding'],centers)
+    state=np.zeros((len(d['family']),3*k+(3 if anchored(config) else 1)),np.float32)
+    state[:,:k]=np.maximum(-14.,-.5*((np.arange(k)[None,:]-centers[:,None])/sigma)**2)
+    state[:,k]=logsumexp(state[:,:k],axis=1)+np.log(.01/.99)
+    return state,widths
+
+
+def pass_partition(count, updates, index):
+    """Balanced disjoint partition; every item appears exactly once per pass."""
+    return slice(count*index//updates, count*(index+1)//updates)
+
+
+class FullPassGradientAccumulator:
+    """Bounded storage for repeated sparse rows; all nodes occur in each pass."""
+    def __init__(self,weight,width):
+        import torch
+        self.weight=torch.zeros_like(weight,requires_grad=False)
+        self.width=torch.zeros_like(width,requires_grad=False)
+        self.rows=torch.arange(len(weight),device=weight.device)[None,:]
+
+    def reset(self):
+        self.weight.zero_();self.width.zero_()
+
+    def add(self,weight_grad,width_grad):
+        import torch
+        with torch.no_grad():
+            grad=weight_grad.detach().coalesce();rows=grad.indices()[0]
+            # Coalescing guarantees unique rows; no duplicate-index writes.
+            self.weight.index_copy_(0,rows,self.weight.index_select(0,rows)+grad.values())
+            self.width.add_(width_grad.detach())
+
+    def install(self,weight,width):
+        import torch
+        weight.grad=torch.sparse_coo_tensor(self.rows,self.weight,size=weight.shape,
+            device=weight.device,dtype=weight.dtype,is_coalesced=True,check_invariants=True)
+        width.grad=self.width
+
+
 def solve(config):
     if config.get('assignment_update')=='cost_target':
         from .fiber_uv_categorical import solve_categorical
         return solve_categorical(config)
+    validate_joint_rejection(config)
     import torch
     if not torch.cuda.is_available():raise RuntimeError('Production U/V solve requires CUDA')
     torch.set_num_threads(4);torch.manual_seed(config.get('seed',0))
     torch.use_deterministic_algorithms(True)
     with np.load(config['tensor_cache']) as archive:d={key:archive[key] for key in archive.files}
     device='cuda:0';data=_tensor_data(d,device)
-    n=len(d['family']);k=100;root=Path(config['output_root']);root.mkdir(parents=True,exist_ok=True)
+    n=len(d['family']);k=int(config.get('winding_count',100));root=Path(config['output_root']);root.mkdir(parents=True,exist_ok=True)
     if (root/'summary.json').exists():raise FileExistsError('Completed U/V output exists')
     rng=np.random.default_rng(config.get('seed',0))
     diagnostic=np.sort(rng.choice(len(d['i']),min(100000,len(d['i'])),replace=False))
     # Shared table lookup makes broad Gaussian hypotheses cheap without K*K*R tensors.
     table=torch.from_numpy(make_distance_table(float(d['distance'].max()),config.get('distance_sigma',.5))).to(device)
-    state=np.zeros((n,3*k+(3 if anchored(config) else 1)),np.float32)
-    state[:,:k]=np.maximum(-14.,-.5*((np.arange(k)[None,:]-d['initial_k'][:,None])/config.get('initial_sigma',3.))**2)
-    from scipy.special import logsumexp
-    # Give rejection a real trainable gradient; -20 would be below Adam epsilon
-    # after averaging a minibatch and would effectively disable this alternative.
-    state[:,k]=logsumexp(state[:,:k],axis=1)+np.log(.01/.99)
-    start_width=d['width_initial']
+    state,start_width=fresh_initial_state(d,config)
+    initial_width=torch.as_tensor(start_width,device=device)
     if config.get('warm_start'):state,start_width=load_warm_start(config,d,state.shape)
     embedding=torch.nn.Embedding.from_pretrained(torch.from_numpy(state).to(device),freeze=False,sparse=True)
-    initial_width=torch.as_tensor(d['width_initial'],device=device)
     raw=torch.nn.Parameter(inverse_widths(torch.as_tensor(start_width,device=device)))
     opt=torch.optim.SparseAdam(embedding.parameters(),lr=config.get('lr',.03))
     widthopt=torch.optim.Adam([raw],lr=config.get('width_lr',2.))
     steps=int(config.get('steps',1000));batch=int(config.get('batch_size',1024));every=int(config.get('log_every',100))
+    full_pass=config.get('traversal','full_pass')=='full_pass'
+    if config.get('traversal','full_pass') not in ('full_pass','sampled'):
+        raise ValueError('Unknown joint traversal')
+    if full_pass:
+        passes=int(config.get('passes',10))
+        if passes<1 or batch<1 or not len(d['i']):raise ValueError('Invalid full-pass budget')
+        updates=(len(d['i'])+batch-1)//batch
+        if updates>n:raise ValueError('Increase batch_size: full-pass node partitions must be nonempty')
+        steps=passes*updates;every=updates
+    accumulated=config.get('update_mode','minibatch')=='global_accumulated'
+    gradients=FullPassGradientAccumulator(embedding.weight,raw) if accumulated else None
     history=[];started=time.monotonic();torch.cuda.reset_peak_memory_stats()
     baseline=audit(d,state,start_width,config)
+    reference_projection=None
+    if config.get('reference_projection'):
+        from .fiber_reference_comparison import load_metric_projection,reference_winding_metrics
+        reference_projection=load_metric_projection(config['reference_projection'],d,config)
+    pass_losses=torch.zeros(3,device=device)
     charged=config.get('sign_charge_multiplier',0.)>0
     fraction=float(config.get('active_fraction',0.))
+    if full_pass and fraction:raise ValueError('Full passes forbid active oversampling; set active_fraction=0')
     if not 0<=fraction<1:raise ValueError('Active fraction must preserve uniform support')
     active=torch.empty(0,device=device,dtype=torch.long)
     active_mask=torch.zeros(len(d['i']),device=device,dtype=torch.bool)
@@ -619,22 +757,45 @@ def solve(config):
         feasible_check=refreshed and not len(active) and step>=config.get('minimum_steps',100) and config.get('stop_when_feasible',False)
         if step%every==0 or step==steps or feasible_check:
             torch.cuda.synchronize();snapshot=embedding.weight.detach().cpu().numpy()
-            w=widths.detach().cpu().numpy();metrics=audit(d,snapshot,w,config,None if step==steps or feasible_check or charged else diagnostic)
+            w=widths.detach().cpu().numpy();metrics=audit(d,snapshot,w,config,None if accumulated or step==steps or feasible_check or charged else diagnostic)
             record=dict(step=step,seconds=time.monotonic()-started,event_samples=step*batch,
                 equivalent_event_epochs=step*batch/len(d['i']),importance_sampled=bool(fraction),
                 active_violations=len(active) if fraction else None,width_range=[float(w.min()),float(w.max())],**metrics)
+            if full_pass:
+                record.update(completed_passes=step//updates,event_samples=(step//updates)*len(d['i']),
+                              equivalent_event_epochs=step//updates,traversal='full_pass')
+            record.update(update_mode=config.get('update_mode','minibatch'),
+                          optimizer_updates=step//updates if accumulated else step)
+            if reference_projection is not None:
+                record['reference']=reference_winding_metrics(d,snapshot,w,config,reference_projection)
             if step:record.update(loss=float(loss.detach()),pair_loss=float(pair.detach()),regularization=float(reg.detach()))
+            if step and full_pass:
+                means=(pass_losses/updates).cpu().tolist()
+                record.update(loss=means[0],pair_loss=means[1],regularization=means[2],
+                              loss_scope=('full objective at pre-update state; diagnostics are post-update' if accumulated else
+                                          'mean online objective across pass updates, not frozen-state global objective'))
+                pass_losses.zero_()
             history.append(record);atomic_write(root/'history.json',history,durable=False)
             print('UV '+json.dumps(record),flush=True)
             if step==steps or (feasible_check and metrics['sign_feasible']):break
-        edges,event_weights=draw_events(len(d['i']),batch,active,active_mask,fraction,device)
+        if full_pass:
+            position=step%updates
+            if position==0:
+                if accumulated:gradients.reset()
+                event_order=torch.randperm(len(d['i']),device=device)
+                node_order=torch.randperm(n,device=device)
+            edges=event_order[pass_partition(len(d['i']),updates,position)]
+            event_weights=torch.ones(len(edges),device=device)
+        else:
+            edges,event_weights=draw_events(len(d['i']),batch,active,active_mask,fraction,device)
         i=data['i'][edges];j=data['j'][edges]
         pa,ua,va,qa=coords(i,data['ds_a'][edges],widths,bounds)
         pb,ub,vb,qb=coords(j,data['ds_b'][edges],widths,bounds)
         charge=selected=None
         if charged:
             charge=calibrated_sign_charge(data['degree'][i],data['degree'][j],data['degree'].mean(),
-                len(d['i']),n,config.get('rejection_cost',10.),config['sign_charge_multiplier'])
+                len(d['i']),n,config.get('rejection_cost',10.),config['sign_charge_multiplier'],
+                config.get('rejection_weighting','fixed'))
             selected=selected_ordering(embedding(i),embedding(j),phase64[i],phase64[j],z64[i],z64[j],
                 data['family'][i],data['family'][j],precise['ds_a'][edges],precise['ds_b'][edges],widths,
                 precise['phase_delta'][edges],data['sign'][edges])
@@ -644,22 +805,28 @@ def solve(config):
             angle=qq-data[phase_key][edges,None];angle=angle-angle.detach().round()
             pair=pair+config.get('prior_weight',.01)*.5*(event_weights*(pp[:,:k]*angle.square()).sum(-1)).mean()
         # Uniform node sample prevents degree-biased rejection/prior normalization.
-        ni=torch.randint(n,(batch,),device=device);ns=embedding(ni);npb=ns[:,:k+1].softmax(-1)
-        degree=data['degree'];cost=.5+.5*degree[ni]/degree.mean().clamp_min(1.)
+        ni=(node_order[pass_partition(n,updates,position)] if full_pass else
+            torch.randint(n,(batch,),device=device))
+        ns=embedding(ni);npb=ns[:,:k+1].softmax(-1)
+        degree=data['degree'];cost=rejection_weights(degree[ni],degree.mean(),config.get('rejection_weighting','fixed'))
         reg=config.get('rejection_cost',10.)*(npb[:,k]*cost).mean()
         if anchored(config):reg=reg+offset_regularization(ns,k,config)
-        ramp=min(1.,max(0.,(step/steps-.5)/.3))
+        ramp=min(1.,max(0.,(step/steps-.5)/.3)) if config.get('entropy_ramp',True) else 1.
         reg=reg+config.get('entropy_weight',.05)*ramp*(-npb*npb.clamp_min(1e-20).log()).sum(-1).mean()
         for point in range(3):
             nu,nv,nq=coordinates(ns,data['phase'][ni],data['z'][ni],data['family'][ni],data['node_ds'][ni,point],widths,bounds)
             angle=nq-data['node_phase'][ni,point,None];angle=angle-angle.detach().round()
             prior=angle.square()+((nv-data['node_z'][ni,point,None])/1000).square()
-            prior=prior+torch.relu(-nq).square()+torch.relu(nq-100).square()
+            prior=prior+torch.relu(-nq).square()+torch.relu(nq-k).square()
             reg=reg+config.get('prior_weight',.01)*(npb[:,:k]*prior).sum(-1).mean()/3
+        if full_pass:
+            # Balanced partitions can differ by one item; preserve full-objective weights.
+            pair=pair*(len(edges)*updates/len(d['i']))
+            reg=reg*(len(ni)*updates/n)
         reg=reg+config.get('width_prior',.1)*((widths/initial_width-1).square().mean())
         reg=reg+config.get('width_smooth',.01)*torch.diff(widths/initial_width).square().mean()
         if len(data['links']):
-            links=data['links'][torch.randint(len(data['links']),(min(batch,len(data['links'])),),device=device)]
+            links=(data['links'] if full_pass else data['links'][torch.randint(len(data['links']),(min(batch,len(data['links'])),),device=device)])
             ca,cu,cv,_=coords(links[:,0].long(),links[:,2],widths,bounds)
             cb,du,dv,_=coords(links[:,1].long(),links[:,3],widths,bounds)
             continuation=continuation_likelihood if anchored(config) else continuation_cost
@@ -667,22 +834,35 @@ def solve(config):
             reg=reg+config.get('continuation_weight',10.)*link_normalization*continuation(
                 ca[:,:k],cb[:,:k],cu,du,cv,dv,config.get('continuation_scale',128.) if anchored(config) else initial_width.mean())
         loss=pair+reg
-        opt.zero_grad(set_to_none=True);widthopt.zero_grad(set_to_none=True);loss.backward()
-        # Initial assignment settling before opening the rejection alternative.
-        grad=embedding.weight.grad.coalesce()
-        if step<steps*config.get('rejection_warmup',.5):grad.values()[:,k]=0
-        embedding.weight.grad=grad
-        opt.step();widthopt.step()
+        if full_pass:pass_losses+=torch.stack((loss.detach(),pair.detach(),reg.detach()))
+        opt.zero_grad(set_to_none=True);widthopt.zero_grad(set_to_none=True)
+        (loss/updates if accumulated else loss).backward()
+        # Broken is an ordinary jointly optimized category from the first update.
+        if accumulated:
+            gradients.add(embedding.weight.grad,raw.grad)
+            if position==updates-1:
+                gradients.install(embedding.weight,raw)
+                opt.step();widthopt.step()
+        else:
+            embedding.weight.grad=embedding.weight.grad.coalesce()
+            opt.step();widthopt.step()
     np.savez(root/'solution.npz',state=snapshot,widths=w,source_id=d['source_id'],start=d['start'],end=d['end'],family=d['family'])
     summary=dict(config=config,input=json.loads(Path(config['tensor_cache']).with_suffix('.json').read_text()),
         baseline=baseline,final=history[-1],gpu=torch.cuda.get_device_name(),peak_allocated_bytes=torch.cuda.max_memory_allocated(),
-        state_layout=('logits[101],shared_phase,shared_v,centered_u_turn_offsets[100],centered_v_offsets[100]'
-                      if anchored(config) else 'logits[101],fraction_adjustment[100],v_adjustment[100]'),
-        interpretation='Model consistency only, finite sign penalty; fixed arc maps, sampled Adam; no anatomical GT')
+        state_layout=(f'logits[{k+1}],shared_phase,shared_v,centered_u_turn_offsets[{k}],centered_v_offsets[{k}]'
+                      if anchored(config) else f'logits[{k+1}],fraction_adjustment[{k}],v_adjustment[{k}]'),
+        initialization=dict(kind=('checkpoint' if config.get('warm_start') else
+                                 'reference_winding' if config.get('reference_initialization') else 'fresh_radial'),
+            winding_count=k,initial_sigma=config.get('initial_sigma',3.),
+            geometry_trainable=True,widths_trainable=True),
+        interpretation='Model consistency only; joint Adam, '+('exhaustive full passes' if full_pass else 'sampled batches'))
     atomic_write(root/'summary.json',summary,durable=False)
 
 
 def run(config):
+    if config.get('assignment_update')!='cost_target':
+        validate_joint_rejection(config)
+        config=dict(config,rejection_warmup=0,rejection_weighting=config.get('rejection_weighting','fixed'))
     prepare(config)
     if config.get('warm_start'):
         digest=sha256_file(config['warm_start'])
@@ -702,7 +882,8 @@ def report(config):
             if not np.array_equal(d[key],s[key]):raise ValueError('Saved piece identity mismatch: '+key)
         if not np.isfinite(s['state']).all() or not np.isfinite(s['widths']).all() or np.any(s['widths']<=0):
             raise ValueError('Invalid solution state')
-        if s['state'].shape!=(len(d['family']),303 if anchored(cfg) else 301) or s['widths'].shape!=(100,):raise ValueError('State shape')
+        k=int(cfg.get('winding_count',100))
+        if s['state'].shape!=(len(d['family']),3*k+(3 if anchored(cfg) else 1)) or s['widths'].shape!=(k,):raise ValueError('State shape')
         signature=summary['input']['signature']
         for key in ('database','features','stage1','hv_solution','afv','umbilicus'):
             if sha256_file(cfg[key])!=signature[key]:raise ValueError('Changed input: '+key)
@@ -739,12 +920,12 @@ def report(config):
         metrics=audit(d,s['state'],s['widths'],cfg)
         if cfg.get('assignment_update')=='cost_target':
             warm,ww=load_warm_start(cfg,d,s['state'].shape)
-            if not np.array_equal(warm[:,101:],s['state'][:,101:]) or not np.array_equal(ww,s['widths']):
+            if not np.array_equal(warm[:,k+1:],s['state'][:,k+1:]) or not np.array_equal(ww,s['widths']):
                 raise ValueError('Categorical run changed frozen geometry/widths')
         for key in ('rejected_pieces','retained_events','sign_violations'):
             if metrics[key]!=summary['final'][key]:raise ValueError('Recomputed readout mismatch: '+key)
         from scipy.special import softmax
-        probs=softmax(s['state'][:,:101],axis=1)
+        probs=softmax(s['state'][:,:k+1],axis=1)
         if not np.allclose(probs.sum(1),1,atol=1e-6):raise ValueError('Unnormalized probabilities')
         row=dict(run=str(root),solution_sha256=sha256_file(root/'solution.npz'),tensor_cache_sha256=sha256_file(cfg['tensor_cache']),
             assignment_update=cfg.get('assignment_update','sampled_adam'),
@@ -754,7 +935,8 @@ def report(config):
             baseline=summary['baseline'],final=metrics,seconds=summary['final']['seconds'],
             equivalent_epochs=summary['final']['equivalent_event_epochs'],peak_gpu_gib=summary['peak_allocated_bytes']/1024**3)
         if cfg.get('sign_charge_multiplier',0)>0:
-            initial,initial_width=load_warm_start(cfg,d,s['state'].shape)
+            initial,initial_width=(load_warm_start(cfg,d,s['state'].shape)
+                                   if cfg.get('warm_start') else fresh_initial_state(d,cfg))
             before=violation_indices(d,initial,initial_width,cfg)
             after=violation_indices(d,s['state'],s['widths'],cfg)
             geometry=hard_geometry(d,s['state'],s['widths'],cfg)

@@ -94,3 +94,42 @@ def test_tiled_raster_preserves_order_and_cross_tile_geometry(tmp_path):
         draw.text((25,49),'cross tile',fill=(30,30,30,255))
     path=tmp_path/'tiled.tif';tiled.save(path)
     np.testing.assert_array_equal(tifffile.imread(path),np.asarray(expected))
+
+
+def test_map_only_and_vector_pdf(tmp_path):
+    import tifffile
+    d,s,w,c=fixture();c.update(render_height=2000,raster_map_only=True,vector_pdf=True)
+    result=render_layout(tmp_path/'layout.svg','test',d,s,w,c)
+    assert result['raster_map_only']
+    xmin,xmax,ymin,ymax=result['bounds']
+    scale=result['raster_pixels_per_base_voxel']
+    assert scale==pytest.approx(1999/(ymax-ymin))
+    assert result['raster_size']==[int(np.ceil((xmax-xmin)*scale))+1,2000]
+    with tifffile.TiffFile(tmp_path/'layout.tif') as tif:
+        assert tif.pages[0].shape==(2000,result['raster_size'][0],3)
+        assert tif.pages[0].compression.name=='LZW'
+    assert tifffile.imread(tmp_path/'histograms.tif').shape==(350,1600,3)
+    ET.parse(tmp_path/'histograms.svg')
+    pdf=(tmp_path/'layout.pdf').read_bytes()
+    assert pdf.startswith(b'%PDF-')
+    assert b'/Subtype /Image' not in pdf
+    assert b'/Type /Page' in pdf
+
+
+def test_fresh_layout_only_without_gpu(tmp_path,monkeypatch):
+    import json
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_uv_visualization as vis
+    d,s,w,c=fixture();root=tmp_path/'input';root.mkdir()
+    cache=root/'tensor.npz';np.savez(cache,**d)
+    c['tensor_cache']=str(cache)
+    (root/'summary.json').write_text(json.dumps({'config':c}))
+    np.savez(root/'solution.npz',state=s,widths=w,**{k:d[k] for k in ('source_id','start','end','family')})
+    def forbidden(*args,**kwargs):raise AssertionError('Layout must not request GPU')
+    monkeypatch.setattr(vis.uv,'launch_tensor_solve',forbidden)
+    reports=vis.run(dict(output_root=str(tmp_path/'output'),layout_only=True,
+        render_height=900,raster_map_only=True,solutions=[dict(label='test',run_root=str(root))]))
+    assert reports[0]['confidence']['raster_size'][1]==900
+    assert reports[0]['confidence']['retained_pieces']==2
+    np.savez(root/'solution.npz',state=s,widths=w,**dict({k:d[k] for k in ('start','end','family')},source_id=d['source_id']+1))
+    with pytest.raises(ValueError,match='identity mismatch'):
+        vis.run(dict(output_root=str(tmp_path/'bad'),layout_only=True,solutions=[dict(label='test',run_root=str(root))]))

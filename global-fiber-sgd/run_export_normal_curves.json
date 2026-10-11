@@ -1,0 +1,17 @@
+{
+  "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/normal_curves_runner",
+  "reference_dir": "/home/hendrik/villa2/global-fiber-sgd/data",
+  "input_files": [
+    "/home/hendrik/villa2/global-fiber-sgd/export_normal_curves.json"
+  ],
+  "commands": [
+    {
+      "name": "normals",
+      "binary": "vc_fiber_trace_chunk",
+      "args": [
+        "afv-constraints",
+        "/home/hendrik/villa2/global-fiber-sgd/export_normal_curves.json"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "fiber_reference_surface": {
+    "source": "s3://philodemos/sean/paris4_full_100226/mesh/",
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/reference/parent_listing",
+    "list_only": true
+  }
+}

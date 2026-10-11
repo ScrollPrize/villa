@@ -1,0 +1,7 @@
+{
+  "fiber_reference_surface": {
+    "source": "s3://philodemos/sean/paris4_full_100226/mesh/spiral-output-generation-19-lasagna.tifxyz/",
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/reference/spiral-output-generation-19-lasagna.tifxyz",
+    "workers": 4
+  }
+}

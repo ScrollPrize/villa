@@ -1,0 +1,14 @@
+{
+  "fiber_uv_density": {
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/density100_v1",
+    "inspection_previews": "/tmp/fiber_density100_inspection",
+    "heatmap_step": 3000,
+    "profile_step": 10000,
+    "heatmap_panels": 8,
+    "placement_batch": 4096,
+    "solutions": [
+      {"label": "CCW", "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_categorical_v1/ccw_sweep100"},
+      {"label": "CW", "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_categorical_v1/cw_sweep100"}
+    ]
+  }
+}

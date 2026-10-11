@@ -1,0 +1,11 @@
+{
+  "fiber_reference_comparison": {
+    "metrics_only": true,
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_fullpass151_v1/reference_metrics",
+    "projection_cache": "/home/hendrik/villa2/global-fiber-sgd/data/reference_comparison100_v1/projection.npz",
+    "solutions": [
+      {"label": "CCW", "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_fullpass151_v1/ccw_joint"},
+      {"label": "CW", "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_fullpass151_v1/cw_joint"}
+    ]
+  }
+}

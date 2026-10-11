@@ -1,0 +1,17 @@
+{
+  "fiber_uv_hv_rejection": {
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/hv_rejection20_v1",
+    "inspection_previews": "/tmp/fiber_hv_rejection_inspection",
+    "heatmap_step": 3000,
+    "profile_step": 10000,
+    "minimum_count": 5,
+    "minimum_length": 1000,
+    "ratio_minimum_h_fraction": 0.01,
+    "ratio_minimum_h_count": 3,
+    "heatmap_panels": 8,
+    "solutions": [
+      {"label": "CCW", "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_categorical_v1/ccw_sweep20"},
+      {"label": "CW", "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_categorical_v1/cw_sweep20"}
+    ]
+  }
+}

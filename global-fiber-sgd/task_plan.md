@@ -1,5 +1,43 @@
 # Global fiber SGD: data reconnaissance
 
+Current: uv_global_accumulation_plan.md, independently reviewed.
+
+Current: reference_init_vis_plan.md, independently reviewed.
+
+Current: uv_reference_init_plan.md and reference_affine_v_plan.md, independently
+reviewed. These supersede the pointwise physical-Z visualization below.
+
+Current: reference_physical_z_plan.md, independently reviewed.
+
+Current: uv_broken_joint_plan.md, independently reviewed.
+
+Current: uv_fullpass151_vis_plan.md, independently reviewed.
+
+Current plan: uv_full_pass_plan.md (independently reviewed). Historical plans below
+are not the current execution specification.
+
+Current task: uv_joint151_strong_plan.md. One joint solve, no stages.
+
+Current task: uv_fresh151_plan.md (fresh joint solve and within-run stages).
+
+Current task: uv_151_palette_plan.md.
+
+Current correction: reference_comparison_plan.md TIFF-only section, reviewed.
+
+Current task: [reference comparison](reference_comparison_plan.md), independently
+reviewed. Original AFV fibers share one median assignment across solved pieces.
+
+Current task: [reference acquisition/proposal](reference_surface_plan.md).
+
+Current task: [100-sweep density](fiber_density100_plan.md).
+
+Current task: [100-sweep maps](uv_visualization100_plan.md).
+
+Current task: [H/V rejection diagnostics](hv_rejection_plan.md).
+
+Current task: [kollesis candidate diagnostic maps](kollesis_plan.md). Four
+non-endpoint metrics over U and U/V, read-only saved20solutions, CPU-only.
+
 Current task: [saved U/V visualization](uv_visualization_plan.md). Optimizer
 state committed c01fb1ecd first; no further optimization in this task.
 

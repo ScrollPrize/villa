@@ -1,0 +1,24 @@
+{
+  "fiber_uv_visualization": {
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_categorical_v1/visualization20",
+    "gpu_manager": {
+      "exclusive": false,
+      "priority": 100,
+      "cpu_cores": 8,
+      "vram_bytes_per_gpu": 12884901888,
+      "label": "uv-saved-solution-vis"
+    },
+    "solutions": [
+      {
+        "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_categorical_v1/ccw_sweep20",
+        "label": "CCW",
+        "devices": "0"
+      },
+      {
+        "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_categorical_v1/cw_sweep20",
+        "label": "CW",
+        "devices": "1"
+      }
+    ]
+  }
+}

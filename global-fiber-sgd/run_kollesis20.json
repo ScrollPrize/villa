@@ -1,0 +1,19 @@
+{
+  "fiber_uv_kollesis": {
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/kollesis20_v1",
+    "bucket_size": 1000,
+    "sample_step": 250,
+    "event_batch": 2048,
+    "event_workers": 8,
+    "normal_bands": [0, 8, 16, 32, 64, 128],
+    "normal_agreement": 0.9,
+    "transverse_max": 32,
+    "min_length_support": 1000,
+    "min_event_support": 5,
+    "heatmap_panels": 8,
+    "solutions": [
+      {"label": "CCW", "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_categorical_v1/ccw_sweep20"},
+      {"label": "CW", "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_categorical_v1/cw_sweep20"}
+    ]
+  }
+}

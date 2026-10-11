@@ -51,6 +51,27 @@ def bp_metrics(log):
 
 
 def run(config):
+    if 'fiber_reference_comparison' in config:
+        from .fiber_reference_comparison import run as reference_comparison
+        return reference_comparison(config['fiber_reference_comparison'])
+    if 'fiber_reference_surface' in config:
+        from .fiber_reference_surface import run as reference_surface
+        return reference_surface(config['fiber_reference_surface'])
+    if 'fiber_uv_density' in config:
+        from .fiber_uv_density import run as density_maps
+        return density_maps(config['fiber_uv_density'])
+    if 'fiber_uv_hv_rejection' in config:
+        from .fiber_uv_hv_rejection import run as hv_rejection
+        return hv_rejection(config['fiber_uv_hv_rejection'])
+    if 'fiber_uv_kollesis' in config:
+        from .fiber_uv_kollesis import run as kollesis_maps
+        return kollesis_maps(config['fiber_uv_kollesis'])
+    if 'fiber_uv_surface_audit' in config:
+        from .fiber_uv_surface import audit as surface_audit
+        return surface_audit(config['fiber_uv_surface_audit'])
+    if 'fiber_uv_surface' in config:
+        from .fiber_uv_surface import run as surface_uv
+        return surface_uv(config['fiber_uv_surface'])
     if 'fiber_hv_report' in config:
         from .fiber_hv_stage import report
         return report(config['fiber_hv_report'])

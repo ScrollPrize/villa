@@ -1,0 +1,6 @@
+{
+  "fiber_reference_comparison": {
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/reference_comparison100_v1",
+    "convert_detail_pngs_only": true
+  }
+}

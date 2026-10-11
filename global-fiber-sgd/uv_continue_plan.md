@@ -1,5 +1,13 @@
 # Continue categorical solutions to sweep 20
 
+## Next continuation: total100
+User requests80additional sweeps from saved20-sweep solutions. Reuse identical
+validated warm-start mechanism and numerical parameters, GPU0/1 shared12GiB.
+New configs *_continue100.json and output roots ccw_sweep100/cw_sweep100 preserve
+all previous results. Local0..80 corresponds to cumulative20..100. Confirm
+starting violations28CCW/22CW; leave jobs running for surface-construction work.
+This remains assignment-only refinement with frozen geometry and winding widths.
+
 Load each saved 10-sweep solution via existing validated warm_start path and run
 10 more cost-target sweeps. Preserve all numerical parameters, geometry, widths,
 and tensor caches. This solver has no optimizer momentum/scheduler state: the

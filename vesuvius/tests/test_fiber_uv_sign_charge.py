@@ -23,7 +23,7 @@ def test_warm_start_checks_hash_and_piece_identity(tmp_path):
     (tmp_path/'summary.json').write_text(json.dumps({'input':{'signature':signature}}))
     cache.with_suffix('.json').write_text(json.dumps({'signature':signature}))
     np.savez(path,state=np.zeros((1,303)),widths=np.ones(100)*101,**d)
-    cfg=dict(warm_start=str(path),warm_start_sha256=sha256_file(path),tensor_cache=str(cache))
+    cfg=dict(warm_start=str(path),warm_start_sha256=sha256_file(path),tensor_cache=str(cache),layout_mode='shared_anchor')
     assert load_warm_start(cfg,d,(1,303))[0].shape==(1,303)
     with pytest.raises(ValueError,match='piece'):load_warm_start(cfg,dict(d,source_id=np.array([2])),(1,303))
     with pytest.raises(ValueError,match='Changed'):load_warm_start(dict(cfg,warm_start_sha256='wrong'),d,(1,303))

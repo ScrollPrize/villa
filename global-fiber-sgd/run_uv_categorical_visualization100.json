@@ -1,0 +1,13 @@
+{
+  "fiber_uv_visualization": {
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_categorical_v1/visualization100",
+    "layout_only": true,
+    "render_height": 2000,
+    "raster_map_only": true,
+    "vector_pdf": true,
+    "solutions": [
+      {"run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_categorical_v1/ccw_sweep100", "label": "CCW"},
+      {"run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_categorical_v1/cw_sweep100", "label": "CW"}
+    ]
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "fiber_reference_comparison": {
+    "metrics_only": true,
+    "reference": "/home/hendrik/villa2/global-fiber-sgd/data/reference/spiral-output-generation-19-lasagna.tifxyz",
+    "umbilicus": "/home/hendrik/villa2/global-fiber-sgd/data/Paris4_umbilicus.json",
+    "xyz_scale": 4,
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_fullpass151_v1/reference_direction"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "fiber_reference_comparison": {
+    "projection_coverage_only": true,
+    "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_fullpass151_v1/ccw_joint",
+    "reference": "/home/hendrik/villa2/global-fiber-sgd/data/reference/spiral-output-generation-19-lasagna.tifxyz",
+    "projection_cache": "/home/hendrik/villa2/global-fiber-sgd/data/reference_comparison100_v1/projection.npz",
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_fullpass151_v1/projection_coverage",
+    "xyz_scale": 4,
+    "max_distance_base": 200
+  }
+}

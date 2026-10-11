@@ -1,5 +1,11 @@
 # Global fiber assignment with PyTorch SGD
 
+Latest: [H/V-specific rejection profiles and heatmaps](hv_rejection_results.md),
+10kU-profile/3kUVbuckets, plain counts and V/H comparisons, MAP and posterior.
+
+Latest diagnostic: [kollesis candidate profiles and U/V heatmaps](kollesis_results.md),
+with [definitions and reproduction](kollesis_metrics.md). Saved20CCW/CW; no new solve.
+
 Latest: [saved U/V layouts, confidence and sweep-cost plots](uv_visualization_results.md).
 Optimizer/results committed as c01fb1ecd before read-only visualization work.
 
@@ -192,3 +198,47 @@ Previous uncommitted work from `fiber-skeleton-experiments` is preserved in stas
 It includes tracked changes and 91 untracked files. The unrelated untracked
 `.pytest_tmp_private_hot/` remains untouched. Do not apply that stash onto this
 new branch; restore it on the old experimental branch if needed.
+# H-anchored surface prototype
+
+Saved20-sweep tifxyz surfaces, format details, measurements and limitations:
+[surface_results.md](surface_results.md). Plan:[surface_plan.md](surface_plan.md).
+# 100-sweep H/V density diagnostics
+
+[Density definitions and runner](fiber_density100_metrics.md),
+[results](fiber_density100_results.md). Primary source-length per inferred UV
+surface area; enabled-only, all saved placements and disabled-only conditional
+replacement against enabled neighbors. Both100-sweep conventions,3kheatmaps and
+10kUprofiles. Source solutions unchanged; conditional replacement is diagnostic.
+
+## Reference winding maps
+
+Read-only cross-color comparison of both100-sweep solutions against Sean's
+reference: [method and command](reference_comparison.md). Uses rectangle overlap
+landmarks and original-source median winding assignment, not correspondence
+optimization or the missing exact winding sidecar.
+Completed maps, coverage and winding discrepancy statistics:
+[results](reference_comparison_results.md).
+# Joint full-pass solver (2026-10-11)
+
+Correction: joint broken logits now train from update0. Nonzero rejection_warmup
+is rejected. Default rejection_weighting=fixed gives rejection_cost * mean(p_broken),
+with rejection_cost=10 by default. Explicit degree mode is legacy comparison only.
+This changes future solves, not archived results. Final broken-versus-winding
+argmax readout is unchanged; rejection is not an irreversible optimization filter.
+
+Use `traversal: "full_pass"`, `passes: 10`, `active_fraction: 0` in the
+`fiber_uv_layout` config. `batch_size` controls only the internal Adam update
+size; progress/history is recorded after each exhaustive pass. All probabilities,
+anchors, offsets and winding widths remain trainable. Nodes are also traversed
+once per pass; all continuation links contribute every update. `steps` and
+`log_every` apply only to explicit `traversal: "sampled"` historical replay.
+
+Set `reference_projection` to the existing
+`global-fiber-sgd/data/reference_comparison100_v1/projection.npz` (absolute path
+in production configs). This is evaluation-only and must match piece identities.
+History `reference` reports equal-original-fiber mean absolute winding error and
+percentage within ±2 after subtracting the median global discrepancy. Actual
+curve positions yield the fitted median discrete winding; retained pieces of a
+source are combined. Missing/rejected fibers are excluded from accuracy and
+counted separately. This is an approximate reference-surface association, not an
+anatomical truth guarantee. Saved reference-render summaries include it too.

@@ -56,6 +56,7 @@ class TiledRaster:
 
     def text(self,coords,value,**kwargs):
         from PIL import ImageFont
+        kwargs.pop('size',None)  # Raster labels retain the established bitmap font.
         b=ImageFont.load_default().getbbox(value);x,y=coords
         self.add('text',coords,dict(kwargs,text=value),(x+b[0],y+b[1],x+b[2],y+b[3]))
 
@@ -76,6 +77,44 @@ class TiledRaster:
                          maxworkers=8,metadata=None)
 
 
+class VectorPDF:
+    """Shared drawing sink: actual PDF paths/text, never a rasterized map."""
+    def __init__(self,width,height):
+        self.width=width;self.height=height;self.lines=[];self.colors=[];self.widths=[]
+        self.rects=[];self.texts=[]
+
+    def line(self,coords,fill,width=1):
+        self.lines.append(np.asarray(coords).reshape(2,2));self.colors.append(np.array(fill)/255)
+        self.widths.append(width)
+
+    def rectangle(self,coords,fill):self.rects.append((coords,np.array(fill)/255))
+    def text(self,coords,value,**kwargs):self.texts.append((coords,value,kwargs))
+
+    def save(self,path):
+        from matplotlib.figure import Figure
+        from matplotlib.collections import LineCollection
+        from matplotlib.patches import Rectangle
+        # Below the traditional PDF 200-inch page limit, with equal axis scale.
+        scale=min(.75,12960/max(self.width,self.height))
+        fig=Figure(figsize=(self.width*scale/72,self.height*scale/72))
+        ax=fig.add_axes([0,0,1,1]);ax.set_xlim(0,self.width);ax.set_ylim(self.height,0);ax.set_axis_off()
+        ax.add_collection(LineCollection(self.lines,colors=self.colors,
+            linewidths=np.asarray(self.widths)*scale,capstyle='round',rasterized=False))
+        for (x0,y0,x1,y1),color in self.rects:
+            ax.add_patch(Rectangle((x0,y0),x1-x0,y1-y0,facecolor=color,edgecolor='none'))
+        for (x,y),value,kwargs in self.texts:
+            ax.text(x,y,value,fontsize=kwargs.get('size',12)*scale,va='top',color='#222')
+        fig.savefig(path,format='pdf');fig.clear()
+
+
+class DrawingSinks:
+    def __init__(self,*sinks):self.sinks=sinks
+    def __getattr__(self,name):
+        def forward(*args,**kwargs):
+            for sink in self.sinks:getattr(sink,name)(*args,**kwargs)
+        return forward
+
+
 def render_layout(destination,label,d,state,widths,config):
     ids,x,y,joint,conditional,p=segments(d,state,widths,config)
     if not len(ids):raise ValueError('No retained pieces to draw')
@@ -87,13 +126,19 @@ def render_layout(destination,label,d,state,widths,config):
     box=(90,115,90+(xmax-xmin)*sx,115+plot_height)
     width=max(1600,int(np.ceil(box[2]+70)))
     px=box[0]+(x-xmin)*sx;py=box[3]-(y-ymin)*sy
-    draw=TiledRaster(width,height)
+    raster=TiledRaster(width,height)
+    pdf=VectorPDF(width,height) if config.get('vector_pdf',False) else None
+    draw=DrawingSinks(raster,pdf) if pdf else raster
+    map_only=config.get('raster_map_only',False)
+    map_scale=(height-1)/max(ymax-ymin,1)
+    map_width=max(1,int(np.ceil((xmax-xmin)*map_scale))+1)
+    map_draw=TiledRaster(map_width,height) if map_only else None
     lines=[f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
            '<rect width="100%" height="100%" fill="white"/>',
            '<style>text{font-family:sans-serif;fill:#222} .fiber{vector-effect:non-scaling-stroke;stroke-width:.65;stroke-linecap:round}</style>']
     def text(x,y,t,size=16):
         lines.append(f'<text x="{x}" y="{y}" font-size="{size}">{html.escape(t)}</text>')
-        draw.text((x,y-size),t,fill=(30,30,30,255))
+        draw.text((x,y-size),t,fill=(30,30,30,255),size=size)
     text(90,30,label+' - global U/V assignment',24)
     text(90,56,f'{len(ids):,} retained pieces / {len(state):,}; broken >50% omitted; no subsampling')
     text(90,80,'H blue; V orange. Opacity = joint P(best winding). Equal U/V scale; base-voxel units.')
@@ -101,6 +146,9 @@ def render_layout(destination,label,d,state,widths,config):
     for t in np.linspace(0,1,6):
         gx=box[0]+t*(box[2]-box[0]);gy=box[3]-t*(box[3]-box[1])
         lines.append(f'<path d="M{gx} {box[1]}V{box[3]} M{box[0]} {gy}H{box[2]}" stroke="#eee" fill="none"/>')
+        if pdf:
+            pdf.line((gx,box[1],gx,box[3]),fill=(238,238,238,255))
+            pdf.line((box[0],gy,box[2],gy),fill=(238,238,238,255))
         text(gx-20,box[3]+22,f'{xmin+t*(xmax-xmin):.0f}',12)
         text(5,gy+4,f'{ymin+t*(ymax-ymin):.0f}',12)
     lines.append('<g id="retained-fiber-pieces">')
@@ -108,7 +156,12 @@ def render_layout(destination,label,d,state,widths,config):
         rgb=(27,108,168) if d['family'][idx]==0 else (208,105,22)
         color='#%02x%02x%02x'%rgb
         lines.append(f'<line class="fiber" id="piece-{idx}" x1="{px[n,0]:.3f}" y1="{py[n,0]:.3f}" x2="{px[n,1]:.3f}" y2="{py[n,1]:.3f}" stroke="{color}" opacity="{joint[n]:.9f}"/>')
-        draw.line((px[n,0],py[n,0],px[n,1],py[n,1]),fill=(*rgb,int(round(255*joint[n]))),width=1)
+        raster.line((px[n,0],py[n,0],px[n,1],py[n,1]),fill=(*rgb,int(round(255*joint[n]))),width=1)
+        if pdf:pdf.line((px[n,0],py[n,0],px[n,1],py[n,1]),fill=(*rgb,255*joint[n]),width=.65)
+        if map_draw:
+            map_draw.line(((x[n,0]-xmin)*map_scale,(ymax-y[n,0])*map_scale,
+                           (x[n,1]-xmin)*map_scale,(ymax-y[n,1])*map_scale),
+                          fill=(*rgb,int(round(255*joint[n]))),width=1)
     lines.append('</g>')
     # Same cumulative fitted widths as hard_geometry; these are global bucket
     # boundaries, not per-piece anchor phases or an equal-width approximation.
@@ -121,12 +174,26 @@ def render_layout(destination,label,d,state,widths,config):
         lines.append(f'<line class="winding-boundary" data-boundary="{index}" data-u="{u_boundary:.12g}" x1="{bx:.8f}" x2="{bx:.8f}" y1="{box[1]}" y2="{box[3]}" stroke="#555" stroke-opacity=".6" stroke-width=".8" stroke-dasharray="4 4" vector-effect="non-scaling-stroke"/>')
         for by in range(box[1],box[3],8):
             draw.line((bx,by,bx,min(by+4,box[3])),fill=(85,85,85,153),width=1)
+        if map_draw:
+            mx=(u_boundary-xmin)*map_scale
+            for my in range(0,height,8):map_draw.line((mx,my,mx,min(my+4,height-1)),fill=(85,85,85,153),width=1)
         if bx-last_label>=55:
             text(bx+2,box[1]-5,f'W{index}',10);last_label=bx
     lines.append('</g>')
     text(770,height-340,'U (base voxels)')
     text(90,height-340,'Dashed: fitted winding boundaries (W index)',12)
     bins=np.linspace(0,1,21);cj,_=np.histogram(joint,bins);cc,_=np.histogram(conditional,bins)
+    histogram_start=len(lines)
+    hist_draw=TiledRaster(1600,350)
+    # Share histogram drawing with the vector figure, translated to its own TIFF.
+    class HistogramSink:
+        def __getattr__(self,name):
+            def forward(coords,*args,**kwargs):
+                shifted=tuple(v-(height-350 if i%2 else 0) for i,v in enumerate(coords))
+                getattr(hist_draw,name)(shifted,*args,**kwargs)
+            return forward
+    original_draw=draw
+    draw=DrawingSinks(draw,HistogramSink())
     for col,(title,counts) in enumerate([('Joint best-bucket probability (also opacity)',cj),('Best winding probability conditional on not broken',cc)]):
         left=90+col*760;top=height-280;bottom=height-70;plotw=670
         text(left,height-305,title,16)
@@ -138,13 +205,21 @@ def render_layout(destination,label,d,state,widths,config):
         for t in np.linspace(0,1,6):text(left+t*plotw-10,bottom+20,f'{100*t:.0f}%',12)
         text(left,top-5,f'Y: % of retained pieces; top={maxpct:.2f}%',12)
     text(90,height-10,'Confidence is model probability, not calibrated correctness.',14)
+    draw=original_draw
+    histogram_svg='<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="350" viewBox="0 0 1600 350"><rect width="100%" height="100%" fill="white"/><g transform="translate(0 '+str(350-height)+')">'+ '\n'.join(lines[histogram_start:])+'</g></svg>\n'
     lines.append('</svg>');destination.write_text('\n'.join(lines)+'\n')
-    draw.save(destination.with_suffix('.tif'))
+    (map_draw if map_draw else raster).save(destination.with_suffix('.tif'))
+    if map_only:
+        hist_draw.save(destination.with_name('histograms.tif'))
+        destination.with_name('histograms.svg').write_text(histogram_svg)
+    if pdf:pdf.save(destination.with_suffix('.pdf'))
     # The TIFF replaces the old independently scaled PNG; don't leave a stale
     # preview next to the current layout under the same basename.
     destination.with_suffix('.png').unlink(missing_ok=True)
     return dict(retained_pieces=len(ids),broken_pieces=len(state)-len(ids),bounds=[xmin,xmax,ymin,ymax],
-        raster_size=[width,height],pixels_per_base_voxel=sx,raster_compression='LZW',
+        raster_size=[map_width if map_only else width,height],pixels_per_base_voxel=sx,
+        raster_pixels_per_base_voxel=map_scale if map_only else sx,raster_map_only=map_only,
+        vector_size=[width,height],raster_compression='LZW',
         joint_quantiles=np.quantile(joint,[0,.05,.25,.5,.75,.95,1]).tolist(),
         conditional_quantiles=np.quantile(conditional,[0,.05,.25,.5,.75,.95,1]).tolist(),
         joint_mean=float(joint.mean()),conditional_mean=float(conditional.mean()),
@@ -212,6 +287,22 @@ def render_progress(destination,reports):
 
 def run(config):
     out=Path(config['output_root']);out.mkdir(parents=True,exist_ok=True);reports=[]
+    if config.get('layout_only',False):
+        for item in config['solutions']:
+            root=Path(item['run_root']);destination=out/item['label'].lower();destination.mkdir(parents=True,exist_ok=True)
+            cfg=json.loads((root/'summary.json').read_text())['config']
+            with np.load(cfg['tensor_cache']) as src:d={key:src[key] for key in ('phase','z','family','node_ds','source_id','start','end')}
+            with np.load(root/'solution.npz') as src:
+                for key in ('source_id','start','end','family'):
+                    if not np.array_equal(d[key],src[key]):raise ValueError('Piece identity mismatch')
+                vis=render_layout(destination/'layout.svg',item['label'],d,src['state'],src['widths'],
+                    dict(cfg,**{key:config[key] for key in ('render_height','raster_map_only','vector_pdf') if key in config}))
+            result=dict(run_root=str(root),confidence=vis,solution_sha256=uv.sha256_file(root/'solution.npz'),
+                tensor_cache_sha256=uv.sha256_file(cfg['tensor_cache']),render_source_sha256=uv.sha256_file(__file__))
+            uv.atomic_write(destination/'summary.json',result,durable=False);reports.append(result)
+            print(json.dumps(dict(label=item['label'],confidence=vis)),flush=True)
+        uv.atomic_write(out/'results.json',reports,durable=False)
+        return reports
     for item in config['solutions']:
         task=dict(item,output_root=str(out/item['label'].lower()),gpu_manager=config['gpu_manager'])
         if config.get('render_only',False):

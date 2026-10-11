@@ -1,6 +1,42 @@
 # Changelog
 
+## 2026-10-11
+
+- Added explicit categorical winding-count expansion, preserving old physical
+  geometry and broken probability while enabling additional hypotheses. Both
+  directions scheduled for ten151-candidate sweeps; geometry remains frozen.
+- Reference maps now use saturated golden-angle colors interpolated in OKLab,
+  opaque2px stable overdraw and1000px raster height (LZW TIFF).
+- Both151-candidate continuations completed and audited: retained length fell
+  to25.52%/25.44% with zero sign violations through rejection; added hypotheses
+  did not win. Not promoted. Both old/new comparison sets rendered;35tests pass.
+
+- Corrected reference detail crops to LZW TIFF, including migration of existing
+  PNG crops after exact pixel verification. Full maps and projections unchanged.
+
+- Added reference winding comparison: rectangle-overlap half-winding landmarks,
+  continuous shared random palette, original-source weighted median discrete
+  reference assignment and chosen-winding curve projection. Read-only saved100
+  CCW/CW maps, TIFF/SVG, match metadata and input-hashed projection cache.
+  No correspondence optimization or solver changes. See reference_comparison.md.
+
 ## 2026-10-09
+
+- Added100-sweep H/V density diagnostics (length/UV area plus counts), enabled
+  versus all saved/conditionally re-placed disabled fibers. CPU O(events*K)
+  placement reuses canonical costs against fixed enabled MAP neighbors; no
+  global solve or inference. Common-area heatmaps/profiles and full numeric
+  exports, provenance and unsupported/conflicted-placement diagnostics.
+
+- Added H/V-separated rejection diagnostics: hard disabled length/counts and soft
+  probabilities, V-H and V/H,10kUprofiles/3kUVheatmaps. Exact piece/cell counting,
+  MAP integer and posterior-weighted variants. Both20-sweep solutions complete;
+  globally V less rejected than H. Results:hv_rejection_results.md.
+
+- Added saved-solution kollesis diagnostics: posterior-weighted crowding, Lasagna
+  discrepancy, rejection and winding entropy, full-height U profiles and U/V
+  heatmaps/support maps. Both20-sweep conventions completed; no clear common
+  full-height joint bands established. Results/commands:kollesis_results.md.
 
 - Exported complete retained CCW/CW U/V layouts as zoomable SVG plus PNG previews,
   confidence opacity/histograms and source tooltips. Correctly aligned sweep-cost
@@ -141,3 +177,20 @@
   measurements, endpoint sheet normals, identity/provenance and validation.
 - Completed full Paris4_v1 extraction:512,698fibers,2,334,188events,5m12s total,
   reusable3.96GiB database. See full_constraint_results.md.
+# H-anchored surface prototype
+
+Added full20-sweep CCW/CW tifxyz construction at100base-vx spacing, strict joint
+confidence>50%, bounded1000vxH/V brackets and V normal-curvature transfer. Shared
+native normal export validates existing baked gauge. Updated20-sweep fiber plots.
+Initial surfaces are fragmented with large jumps; see surface_results.md.
+# 2026-10-11 Joint full passes
+
+Added optional common physical-Z mapping for reference/fitted comparison images,
+including remapped reference coverage and matching cached-triangle projected Z.
+
+Follow-up: remove broken-gradient warmup from joint optimization; use fixed
+per-piece expected rejection cost by default, with matching sign calibration.
+Explicit visualization winding offset supports reference-metric-aligned colors.
+
+Added exhaustive joint event/node traversal and evaluation-only source-fiber
+reference winding L1 / within-two metrics after global median offset correction.

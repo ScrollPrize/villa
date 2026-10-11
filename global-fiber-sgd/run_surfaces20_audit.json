@@ -1,0 +1,19 @@
+{
+  "fiber_uv_surface_audit": {
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/surfaces20_v1",
+    "normal_curves": "/home/hendrik/villa2/global-fiber-sgd/data/normal_curves_v1",
+    "joint_threshold": 0.5,
+    "grid_step": 100,
+    "max_search": 1000,
+    "solutions": [
+      {
+        "label": "CCW",
+        "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_categorical_v1/ccw_sweep20"
+      },
+      {
+        "label": "CW",
+        "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_categorical_v1/cw_sweep20"
+      }
+    ]
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "fiber_uv_report": {
+    "runs": [
+      "/home/hendrik/villa2/global-fiber-sgd/data/uv_joint151_strong_v1/ccw",
+      "/home/hendrik/villa2/global-fiber-sgd/data/uv_joint151_strong_v1/cw"
+    ],
+    "report": "/home/hendrik/villa2/global-fiber-sgd/uv_joint151_strong_audit.md"
+  }
+}

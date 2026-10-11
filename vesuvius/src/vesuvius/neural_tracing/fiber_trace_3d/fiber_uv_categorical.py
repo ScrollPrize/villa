@@ -75,7 +75,7 @@ def conditional_costs(state,widths,data,table,config,with_energy=False):
             _,v,q=coords(ids,data['node_ds'][ids,point])
             angle=q-data['node_phase'][ids,point,None];angle-=angle.round()
             prior=angle.square()+((v-data['node_z'][ids,point,None])/1000).square()
-            prior+=torch.relu(-q).square()+torch.relu(q-100).square()
+            prior+=torch.relu(-q).square()+torch.relu(q-k).square()
             unary=(config.get('prior_weight',.01)*prior/3).float()
             costs[ids,:k]+=unary
             energy+=(unary*probs[ids,:k]).sum()/n
@@ -89,7 +89,9 @@ def solve_categorical(config):
     if not uv.anchored(config) or not config.get('warm_start'):raise ValueError('Requires shared-anchor warm start')
     torch.set_num_threads(4);torch.manual_seed(config.get('seed',0));torch.use_deterministic_algorithms(True)
     with np.load(config['tensor_cache']) as src:d={key:src[key] for key in src.files}
-    state,widths=uv.load_warm_start(config,d,(len(d['family']),303))
+    k=int(config.get('winding_count',100))
+    if k<1:raise ValueError('winding_count must be positive')
+    state,widths=uv.load_warm_start(config,d,(len(d['family']),3*k+3))
     root=Path(config['output_root']);root.mkdir(parents=True,exist_ok=True)
     if (root/'summary.json').exists():raise FileExistsError('Completed categorical output exists')
     tensor=torch.tensor(state,device='cuda');w=torch.tensor(widths,device='cuda',dtype=torch.float64)
@@ -105,7 +107,7 @@ def solve_categorical(config):
         record=dict(step=sweep,seconds=time.monotonic()-started,equivalent_event_epochs=sweep,
                     geometry_frozen=True,**metrics)
         if sweep:record.update(target_broken_mean=float(target[:,-1].mean()),
-            target_max_residual=float((tensor[:,:101].softmax(1)-target).abs().max()),
+            target_max_residual=float((tensor[:,:k+1].softmax(1)-target).abs().max()),
             aggregation_seconds=aggregation_seconds,pre_update_energy=float(energy))
         history.append(record);uv.atomic_write(root/'history.json',history,durable=False)
         print('UV categorical '+json.dumps(record),flush=True)
@@ -113,11 +115,11 @@ def solve_categorical(config):
         tick=time.monotonic();cost,energy=conditional_costs(tensor,w,data,table,config,with_energy=True)
         target=categorical_target(cost,config.get('target_temperature',.25))
         for _ in range(config.get('categorical_inner_steps',8)):
-            tensor[:,:101]=ce_logit_step(tensor[:,:101],target,config.get('categorical_step',4.))
+            tensor[:,:k+1]=ce_logit_step(tensor[:,:k+1],target,config.get('categorical_step',4.))
         torch.cuda.synchronize();aggregation_seconds=time.monotonic()-tick
     np.savez(root/'solution.npz',state=snapshot,widths=widths,
         **{key:d[key] for key in ('source_id','start','end','family')})
-    if not np.array_equal(snapshot[:,101:],state[:,101:]):raise RuntimeError('Frozen geometry changed')
+    if not np.array_equal(snapshot[:,k+1:],state[:,k+1:]):raise RuntimeError('Frozen geometry changed')
     summary=dict(config=config,input=json.loads(Path(config['tensor_cache']).with_suffix('.json').read_text()),
         baseline=baseline,final=history[-1],gpu=torch.cuda.get_device_name(),peak_allocated_bytes=torch.cuda.max_memory_allocated(),
         interpretation='Assignment-only full-neighborhood categorical targets; frozen geometry; expected pair energy, not mixture likelihood; no posthoc rejection')
