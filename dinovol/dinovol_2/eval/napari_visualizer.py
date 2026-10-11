@@ -372,8 +372,6 @@ def _configure_backbone_for_spatial_shape(backbone: torch.nn.Module, spatial_sha
     spatial_shape = tuple(int(v) for v in spatial_shape)
     backbone.global_crops_size = spatial_shape
     backbone.local_crops_size = spatial_shape
-    backbone.global_input_size = spatial_shape
-    backbone.local_input_size = spatial_shape
     backbone.global_ref_feat_shape = tuple(
         int(size) // int(patch) for size, patch in zip(spatial_shape, backbone.patch_size)
     )

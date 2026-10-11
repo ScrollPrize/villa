@@ -53,13 +53,6 @@ def _as_3tuple(value: Any) -> tuple[int, int, int] | None:
     return result
 
 
-def _max_3tuple(*values: tuple[int, int, int] | None) -> tuple[int, int, int] | None:
-    filtered = [value for value in values if value is not None]
-    if not filtered:
-        return None
-    return tuple(max(int(value[axis]) for value in filtered) for axis in range(3))
-
-
 def _config_get(config: Mapping[str, Any], *keys: str, default: Any = None) -> Any:
     for key in keys:
         if key in config:
@@ -183,7 +176,6 @@ class DinoIBOTPretrainer:
         self.freeze_last_layer_steps = self._resolve_freeze_last_layer_steps()
 
         self.model = DinoVitStudentTeacher(self.model_config).to(self.device)
-        self._configure_deeper_embed_overscan()
         self.optimizer = self._build_optimizer()
         if self.is_distributed:
             ddp_kwargs: dict[str, Any] = {
@@ -575,9 +567,6 @@ class DinoIBOTPretrainer:
             resolved_config["point_supervision"] = dict(self.point_config)
         else:
             resolved_config.pop("point_supervision", None)
-        deeper_overrides = self._deeper_embed_dataset_overrides(resolved_config)
-        if deeper_overrides:
-            resolved_config.update(deeper_overrides)
         return resolved_config
 
     def _resolved_dataset_configs(
@@ -623,70 +612,6 @@ class DinoIBOTPretrainer:
         if resolved_configs is None:
             return None
         return dict(resolved_configs[0])
-
-    def _configure_deeper_embed_overscan(self) -> None:
-        if str(self.model_config.get("embedding_type", "default")).lower() != "deeper":
-            return
-
-        student_backbone = self.model.student.backbone
-        teacher_backbone = self.model.teacher.backbone
-        patch_halo = tuple(int(value) for value in student_backbone.down_projection.patch_halo())
-        voxel_halo = tuple(int(tokens) * int(size) for tokens, size in zip(patch_halo, student_backbone.patch_size))
-        global_input_size = tuple(
-            int(size) + 2 * int(halo) for size, halo in zip(student_backbone.global_crops_size, voxel_halo)
-        )
-        local_input_size = tuple(
-            int(size) + 2 * int(halo) for size, halo in zip(student_backbone.local_crops_size, voxel_halo)
-        )
-
-        for backbone in (student_backbone, teacher_backbone):
-            backbone.deeper_embed_patch_halo = patch_halo
-            backbone.global_input_size = global_input_size
-            backbone.local_input_size = local_input_size
-
-        self.model_config["deeper_embed_patch_halo"] = list(patch_halo)
-        self.model_config["deeper_embed_halo_voxels"] = list(voxel_halo)
-        self.model_config["global_input_size"] = list(global_input_size)
-        self.model_config["local_input_size"] = list(local_input_size)
-
-    def _deeper_embed_dataset_overrides(self, dataset_config: Mapping[str, Any]) -> dict[str, Any]:
-        if str(self.model_config.get("embedding_type", "default")).lower() != "deeper":
-            return {}
-
-        backbone = self.model_module.student.backbone
-        halo_voxels = tuple(int(tokens) * int(size) for tokens, size in zip(backbone.deeper_embed_patch_halo, backbone.patch_size))
-
-        def _view_size(crop_size: tuple[int, int, int] | None) -> tuple[int, int, int] | None:
-            if crop_size is None:
-                return None
-            return tuple(int(dim) + 2 * int(halo) for dim, halo in zip(crop_size, halo_voxels))
-
-        global_crop_size = _as_3tuple(dataset_config.get("global_crop_size", dataset_config.get("crop_size")))
-        global_view_size = _view_size(global_crop_size)
-        local_crop_size = _as_3tuple(dataset_config.get("local_crop_size"))
-        local_view_size = _view_size(local_crop_size)
-        gram_teacher_crop_size = _as_3tuple(dataset_config.get("gram_teacher_crop_size"))
-        gram_teacher_view_size = _view_size(gram_teacher_crop_size)
-
-        overrides: dict[str, Any] = {
-            "global_view_size": global_view_size,
-        }
-        if local_view_size is not None:
-            overrides["local_view_size"] = local_view_size
-        if gram_teacher_view_size is not None:
-            overrides["gram_teacher_view_size"] = gram_teacher_view_size
-        source_sampling_size = _as_3tuple(
-            dataset_config.get("source_sampling_size", dataset_config.get("source_crop_size"))
-        )
-        required_source_sampling_size = _max_3tuple(
-            global_crop_size,
-            local_crop_size,
-            gram_teacher_crop_size,
-            source_sampling_size,
-        )
-        if required_source_sampling_size is not None:
-            overrides["source_sampling_size"] = required_source_sampling_size
-        return overrides
 
     def _build_ssl_dataloader(self, dataset_config: Mapping[str, Any], *, shuffle: bool) -> DataLoader:
         dataset = SSLZarrDataset(dataset_config, do_augmentations=True)
@@ -971,18 +896,6 @@ class DinoIBOTPretrainer:
             self.ibot_patch_loss.update_center(teacher_patch_batched)
         return targets
 
-    def _backbone_output_spatial_shape(
-        self,
-        backbone: Any,
-        input_spatial_shape: tuple[int, int, int],
-        *,
-        view_kind: str,
-    ) -> tuple[int, int, int]:
-        resolve_output_shape = getattr(backbone, "resolve_output_spatial_shape", None)
-        if callable(resolve_output_shape):
-            return tuple(int(dim) for dim in resolve_output_shape(input_spatial_shape, view_kind=view_kind))
-        return tuple(int(dim) for dim in input_spatial_shape)
-
     def _feature_map_shape(
         self,
         backbone: Any,
@@ -990,9 +903,8 @@ class DinoIBOTPretrainer:
         *,
         view_kind: str,
     ) -> tuple[int, int, int]:
-        output_spatial_shape = self._backbone_output_spatial_shape(backbone, input_spatial_shape, view_kind=view_kind)
         patch_size = tuple(int(size) for size in backbone.patch_size)
-        return tuple(int(size) // int(patch) for size, patch in zip(output_spatial_shape, patch_size))
+        return tuple(int(size) // int(patch) for size, patch in zip(input_spatial_shape, patch_size))
 
     @staticmethod
     def _patch_tokens_to_grid(
