@@ -1,5 +1,7 @@
 # Saved U/V solution visualization
 
+Current: uv_lr16k_plan.md. Test larger-batch LR scaling on3exclusiveGPUs.
+
 Current: uv_local_window_plan.md. Profile quadratic and trial local +/-N windows
 without placeholders, preserve exact all-hypothesis sign penalty efficiently.
 

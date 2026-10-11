@@ -1,5 +1,7 @@
 # Global fiber SGD: data reconnaissance
 
+Current: uv_lr16k_plan.md.
+
 Current: uv_local_window_plan.md.
 
 Current: uv_squared_vertical_split_plan.md.

@@ -1,4 +1,10 @@
-# Current: profile and local-window trial
+# Current:16k LR scaling
+
+- [x] Independent configuration review; no solver code change.
+- [x] Three exclusiveGPU trials .03/.06/.12 completed exit0.
+- [x] Progress and final comparison logged:uv_lr16k_results.md.
+
+# Previous: profile and local-window trial
 
 - [x] Independent plan review and matrix review.
 - [x] Exclusive baseline quadratic pair and production phase profile.
