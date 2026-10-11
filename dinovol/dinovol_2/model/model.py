@@ -37,6 +37,7 @@ _BACKBONE_DEFAULTS = {
     "deeper_embed_depth_per_level": None,
     "deeper_embed_use_stem": True,
     "deeper_embed_final_projection": True,
+    "deeper_embed_channels_last": False,
     "depth": 24,
     "num_heads": 16,
     "qkv_bias": True,
@@ -75,6 +76,7 @@ _BACKBONE_DEFAULTS_V2 = {
     "deeper_embed_depth_per_level": None,
     "deeper_embed_use_stem": True,
     "deeper_embed_final_projection": True,
+    "deeper_embed_channels_last": False,
     "depth": 24,
     "num_heads": 16,
     "qkv_bias": True,
@@ -395,10 +397,12 @@ class DINOHead(nn.Module):
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, apply_last_layer: bool = True) -> torch.Tensor:
         x = self.mlp(x)
         eps = 1e-6 if x.dtype == torch.float16 else 1e-12
         x = F.normalize(x, dim=-1, p=2, eps=eps)
+        if not apply_last_layer:
+            return x
         return self.last_layer(x)
 
 
@@ -578,8 +582,10 @@ class DinoVitStudentTeacher(nn.Module):
     def update_teacher(self, momentum: float) -> None:
         if not 0.0 <= momentum <= 1.0:
             raise ValueError(f"EMA momentum must be in [0, 1], got {momentum}")
-        for student_param, teacher_param in zip(self.student.parameters(), self.teacher.parameters()):
-            teacher_param.data.mul_(momentum).add_(student_param.data, alpha=1.0 - momentum)
+        teacher_params = [parameter.data for parameter in self.teacher.parameters()]
+        student_params = [parameter.data for parameter in self.student.parameters()]
+        torch._foreach_mul_(teacher_params, momentum)
+        torch._foreach_add_(teacher_params, student_params, alpha=1.0 - momentum)
 
     @staticmethod
     def _apply_head(head: nn.Module, tokens: torch.Tensor) -> torch.Tensor:
@@ -653,6 +659,35 @@ class DinoVitStudentTeacher(nn.Module):
         )
         return cls_projections, patch_projections
 
+    def _structured_global_outputs(
+        self,
+        branch: nn.ModuleDict,
+        global_outputs: Mapping[str, torch.Tensor],
+        mask_indices_list: torch.Tensor,
+        n_masked_patches: Optional[int],
+        masked_patch_features: bool,
+    ) -> dict[str, Mapping[str, torch.Tensor] | torch.Tensor]:
+        global_outputs = dict(global_outputs)
+        cls_projections = self.project_cls_tokens(branch, global_outputs["cls_tokens"])
+        outputs: dict[str, Mapping[str, torch.Tensor] | torch.Tensor] = {
+            "global": global_outputs,
+            "global_cls_projections": cls_projections,
+        }
+        masked_tokens = self.select_masked_patch_tokens(
+            global_outputs["patch_tokens"],
+            mask_indices_list=mask_indices_list,
+            n_masked_patches=n_masked_patches,
+        )
+        if masked_patch_features:
+            # Normalized iBOT bottleneck features and the last-layer weight; the loss
+            # forms the [n_masked, out_dim] logits chunk by chunk. Reading the weight
+            # here keeps its parameters inside the (DDP) forward pass.
+            outputs["global_masked_patch_features"] = branch.ibot_head(masked_tokens, apply_last_layer=False)
+            outputs["ibot_last_layer_weight"] = branch.ibot_head.last_layer.weight
+        else:
+            outputs["global_masked_patch_projections"] = self.project_patch_tokens(branch, masked_tokens)
+        return outputs
+
     def _format_branch_outputs(
         self,
         branch: nn.ModuleDict,
@@ -715,8 +750,33 @@ class DinoVitStudentTeacher(nn.Module):
         return_teacher: bool = True,
         project_student_patch_tokens: bool = False,
         project_teacher_patch_tokens: bool = False,
+        masked_patch_features: bool = False,
     ) -> dict[str, Mapping[str, torch.Tensor] | dict[str, Mapping[str, torch.Tensor] | torch.Tensor]]:
         project_cls_tokens = mask_indices_list is None
+        # The teacher runs first: its no-grad intermediates are then freed before the
+        # student's saved activations accumulate, which lowers peak memory.
+        teacher_result = None
+        if return_teacher:
+            teacher_source = student_input if teacher_input is None else teacher_input
+            with torch.no_grad():
+                teacher_outputs = self._forward_branch(
+                    self.teacher,
+                    teacher_source,
+                    masks=teacher_masks,
+                    project_cls_tokens=project_cls_tokens,
+                    project_patch_tokens=project_teacher_patch_tokens and mask_indices_list is None,
+                    view_kind="global",
+                )
+                if mask_indices_list is None:
+                    teacher_result = teacher_outputs
+                else:
+                    teacher_result = self._structured_global_outputs(
+                        self.teacher,
+                        teacher_outputs,
+                        mask_indices_list,
+                        n_masked_patches,
+                        masked_patch_features,
+                    )
         student_outputs = self._forward_branch(
             self.student,
             student_input,
@@ -730,19 +790,13 @@ class DinoVitStudentTeacher(nn.Module):
                 "student": student_outputs
             }
         else:
-            student_global = dict(student_outputs)
-            student_global_cls, student_patch = self.project_global_cls_and_masked_patch_tokens(
+            structured_student_outputs = self._structured_global_outputs(
                 self.student,
-                student_global["cls_tokens"],
-                student_global["patch_tokens"],
+                student_outputs,
                 mask_indices_list,
-                n_masked_patches=n_masked_patches,
+                n_masked_patches,
+                masked_patch_features,
             )
-            structured_student_outputs: dict[str, Mapping[str, torch.Tensor] | torch.Tensor] = {
-                "global": student_global,
-                "global_cls_projections": student_global_cls,
-                "global_masked_patch_projections": student_patch,
-            }
             if local_student_input is not None:
                 structured_student_outputs["local"] = self._forward_branch(
                     self.student,
@@ -753,32 +807,6 @@ class DinoVitStudentTeacher(nn.Module):
                 )
             outputs = {"student": structured_student_outputs}
 
-        if return_teacher:
-            teacher_source = student_input if teacher_input is None else teacher_input
-            with torch.no_grad():
-                teacher_outputs = self._forward_branch(
-                    self.teacher,
-                    teacher_source,
-                    masks=teacher_masks,
-                    project_cls_tokens=project_cls_tokens,
-                    project_patch_tokens=project_teacher_patch_tokens and mask_indices_list is None,
-                    view_kind="global",
-                )
-                if mask_indices_list is None:
-                    outputs["teacher"] = teacher_outputs
-                else:
-                    teacher_global = dict(teacher_outputs)
-                    teacher_global_cls, teacher_patch = self.project_global_cls_and_masked_patch_tokens(
-                        self.teacher,
-                        teacher_global["cls_tokens"],
-                        teacher_global["patch_tokens"],
-                        mask_indices_list,
-                        n_masked_patches=n_masked_patches,
-                    )
-                    teacher_structured_outputs: dict[str, Mapping[str, torch.Tensor] | torch.Tensor] = {
-                        "global": teacher_global,
-                        "global_cls_projections": teacher_global_cls,
-                        "global_masked_patch_projections": teacher_patch,
-                    }
-                    outputs["teacher"] = teacher_structured_outputs
+        if teacher_result is not None:
+            outputs["teacher"] = teacher_result
         return outputs

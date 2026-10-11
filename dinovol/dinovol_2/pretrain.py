@@ -155,7 +155,12 @@ class DinoIBOTPretrainer:
             self.rank = dist.get_rank()
             self.world_size = dist.get_world_size()
 
+        if self.device.type == "cuda" and bool(self.config.get("cuda_expandable_segments", False)):
+            # Expandable segments avoid fragmentation-driven cache flushes near full
+            # memory. They apply to allocations made after this call.
+            torch.cuda.memory._set_allocator_settings("expandable_segments:True")
         self.use_amp = bool(self.config.get("use_amp", self.device.type == "cuda"))
+        self.fused_optimizer = bool(self.config.get("fused_optimizer", False)) and self.device.type == "cuda"
         self.max_iterations = int(self.config.get("max_iterations", self.config.get("num_iterations", 1000000)))
         self.total_steps = self.max_iterations
         self.base_lr = float(self.config.get("lr", 1e-4))
@@ -198,6 +203,9 @@ class DinoIBOTPretrainer:
         dino_out_dim = int(self.model_config.get("dino_out_dim", 131072))
         ibot_out_dim = int(self.model_config.get("ibot_out_dim", dino_out_dim))
         self.dino_loss = DINOLoss(dino_out_dim).to(self.device)
+        # Form iBOT logits, Sinkhorn-Knopp targets, and loss gradients chunk by chunk from
+        # the head bottleneck instead of materializing [n_masked, ibot_out_dim] tensors.
+        self.ibot_fused_last_layer = bool(self.config.get("ibot_fused_last_layer", False))
         masked_loss_chunk_size = self.config.get("ibot_masked_loss_chunk_size")
         if masked_loss_chunk_size is not None:
             masked_loss_chunk_size = int(masked_loss_chunk_size)
@@ -279,6 +287,8 @@ class DinoIBOTPretrainer:
 
         self.log_every = int(self.config.get("log_every", 20))
         self.val_every_n = int(self.config.get("val_every_n", 0))
+        # Save a monitor image from the current training batch every N steps (0 disables).
+        self.train_monitor_every_n = int(self.config.get("train_monitor_every_n", 0))
         self.save_every_n = int(self.config.get("save_every_n", self.config.get("save_every", 0)))
         self.monitor_batch_size = max(5, int(self.config.get("monitor_batch_size", 5)))
         self.monitor_pool_size = max(1, int(self.config.get("monitor_pool_size", 5000)))
@@ -337,20 +347,40 @@ class DinoIBOTPretrainer:
         if not enabled:
             return
         options = {"backend": "inductor", "mode": "default", "dynamic": None, "fullgraph": False, **settings}
-        if options["dynamic"] is not None and not isinstance(options["dynamic"], bool):
-            raise ValueError("compile.dynamic must be a boolean or null")
+        # dynamic may also map module names (backbone, dino_head, ibot_head) to settings;
+        # unlisted modules use null. Backbones see fixed global/local crop shapes, while
+        # the iBOT head sees a different number of masked tokens every step.
+        dynamic = options.pop("dynamic")
+        module_names = ("backbone", "dino_head", "ibot_head")
+        if isinstance(dynamic, Mapping):
+            unknown_modules = set(dynamic) - set(module_names)
+            if unknown_modules:
+                raise ValueError(f"Unknown compile.dynamic modules: {sorted(unknown_modules)}")
+            dynamic_by_module = {name: dynamic.get(name) for name in module_names}
+        else:
+            dynamic_by_module = {name: dynamic for name in module_names}
+        if any(value is not None and not isinstance(value, bool) for value in dynamic_by_module.values()):
+            raise ValueError("compile.dynamic must be a boolean, null, or a mapping of module names to those")
         if not isinstance(options["fullgraph"], bool):
             raise ValueError("compile.fullgraph must be a boolean")
         if not isinstance(options["backend"], str) or not isinstance(options["mode"], str):
             raise ValueError("compile.backend and compile.mode must be strings")
+        if options["backend"] == "inductor":
+            # Inductor's mix-order reduction (torch 2.10) fuses the mask-token gradient with
+            # LayerNormNd parameter gradients in the CNN backward and then returns it as [C]
+            # instead of [1, 1, C] (seen with 8+ masked 128^3 crops). Disabling it cost no
+            # measurable CNN throughput.
+            import torch._inductor.config as inductor_config
+            inductor_config.triton.mix_order_reduction = False
         # Compile inner modules rather than DDP or the variable masked-token selection.
         # In-place compilation preserves parameter identities and state_dict keys for
         # optimizer groups, EMA updates, checkpoint loading, and downstream inference.
         for branch in (self.model_module.student, self.model_module.teacher):
-            for module in branch.values():
-                module.compile(**options)
+            for name, module in branch.items():
+                module.compile(**options, dynamic=dynamic_by_module[name])
         if self.gram_teacher_backbone is not None:
-            self.gram_teacher_backbone.compile(**options)
+            self.gram_teacher_backbone.compile(**options, dynamic=dynamic_by_module["backbone"])
+        self.ibot_patch_loss.compile_kernels(**options)
 
     @property
     def is_main_process(self) -> bool:
@@ -509,6 +539,7 @@ class DinoIBOTPretrainer:
             param_groups,
             lr=self.base_lr,
             betas=self.betas,
+            fused=True if self.fused_optimizer else None,
         )
 
     def _build_schedulers(self) -> tuple[
@@ -1095,6 +1126,7 @@ class DinoIBOTPretrainer:
         mask_indices: torch.Tensor,
         n_masked: int,
         return_teacher: bool,
+        masked_patch_features: bool = False,
     ) -> Mapping[str, Any]:
         # Backward runs outside autocast. AOTAutograd must use that same
         # assumption when it captures backward graphs during these forwards.
@@ -1108,7 +1140,13 @@ class DinoIBOTPretrainer:
                 mask_indices_list=mask_indices,
                 n_masked_patches=n_masked,
                 return_teacher=return_teacher,
+                masked_patch_features=masked_patch_features,
             )
+
+    def _logit_dtype(self) -> torch.dtype:
+        if torch.is_autocast_enabled(self.device.type):
+            return torch.get_autocast_dtype(self.device.type)
+        return torch.float32
 
     def verify_batch_pipeline(self, batch: Mapping[str, Any], step: int = 0) -> dict[str, Any]:
         teacher_temp = self._teacher_temp(step)
@@ -1478,6 +1516,7 @@ class DinoIBOTPretrainer:
 
         self.optimizer.zero_grad(set_to_none=True)
 
+        fused_ibot = self.ibot_fused_last_layer and self.do_ibot and self.centering == "sinkhorn_knopp"
         with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
             model_outputs = self._forward_model(
                 global_crops=global_crops,
@@ -1486,6 +1525,7 @@ class DinoIBOTPretrainer:
                 mask_indices=mask_indices,
                 n_masked=n_masked,
                 return_teacher=self.do_dino or self.do_ibot,
+                masked_patch_features=fused_ibot,
             )
             teacher_branch = model_outputs.get("teacher")
             if self.do_dino and teacher_branch is not None:
@@ -1495,18 +1535,28 @@ class DinoIBOTPretrainer:
                 )
             else:
                 teacher_cls_0 = teacher_cls_1 = None
-            if self.do_ibot and teacher_branch is not None:
+            teacher_patch_targets = None
+            if fused_ibot and teacher_branch is not None and n_masked > 0:
+                logit_dtype = self._logit_dtype()
+                teacher_patch_features = teacher_branch["global_masked_patch_features"].to(logit_dtype)
+                teacher_last_layer_weight = teacher_branch["ibot_last_layer_weight"].to(logit_dtype)
+                log_prototype_scales = self.ibot_patch_loss.sinkhorn_knopp_prototype_scales(
+                    teacher_patch_features,
+                    teacher_last_layer_weight,
+                    teacher_temp,
+                    torch.tensor([n_masked], device=self.device, dtype=torch.long),
+                )
+            elif self.do_ibot and teacher_branch is not None:
+                # Release the half-precision teacher logits once their targets exist.
                 teacher_patch_targets = self._center_teacher_patch(
-                    teacher_branch["global_masked_patch_projections"],
+                    teacher_branch.pop("global_masked_patch_projections"),
                     teacher_temp,
                 )
-            else:
-                teacher_patch_targets = None
 
             student_branch = model_outputs["student"]
             student_global = student_branch["global"]
             student_global_cls = student_branch["global_cls_projections"]
-            student_patch = student_branch["global_masked_patch_projections"]
+            student_patch = student_branch.get("global_masked_patch_projections")
             global_cls_0, global_cls_1 = student_global_cls.chunk(n_global_views)
 
             total_terms = dino_loss_term_count(n_local_views, n_global_views=n_global_views)
@@ -1526,7 +1576,18 @@ class DinoIBOTPretrainer:
                 dino_global_loss = global_crops.new_zeros(())
                 dino_local_loss = global_crops.new_zeros(())
 
-            if self.do_ibot and n_masked > 0:
+            if fused_ibot and n_masked > 0:
+                ibot_loss = self.ibot_patch_loss.forward_masked_from_features(
+                    student_branch["global_masked_patch_features"].to(logit_dtype),
+                    student_branch["ibot_last_layer_weight"].to(logit_dtype),
+                    teacher_patch_features,
+                    teacher_last_layer_weight,
+                    log_prototype_scales,
+                    teacher_temp,
+                    student_masks_flat=masks,
+                    masks_weight=masks_weight[:n_masked],
+                )
+            elif self.do_ibot and n_masked > 0:
                 ibot_loss = self.ibot_patch_loss.forward_masked(
                     student_patch,
                     teacher_patch_targets,
@@ -1568,17 +1629,21 @@ class DinoIBOTPretrainer:
         self.model_module.update_teacher(teacher_momentum)
         self._maybe_refresh_gram_teacher(step)
 
+        # One device-to-host transfer for all logged losses.
+        loss_names = (
+            "loss", "dino_global_loss", "dino_local_loss", "ibot_loss", "koleo_loss", "gram_loss",
+            "point_loss", "point_same_type_loss", "point_different_type_loss",
+        )
+        loss_values = torch.stack([
+            value.detach().float().reshape(())
+            for value in (
+                loss, dino_global_loss, dino_local_loss, ibot_loss, koleo_loss, gram_loss,
+                point_result.loss, point_result.same_type, point_result.different_type,
+            )
+        ]).tolist()
         return {
-            "loss": float(loss.detach()),
-            "dino_global_loss": float(dino_global_loss.detach()),
-            "dino_local_loss": float(dino_local_loss.detach()),
-            "ibot_loss": float(ibot_loss.detach()),
-            "koleo_loss": float(koleo_loss.detach()),
-            "gram_loss": float(gram_loss.detach()),
+            **dict(zip(loss_names, loss_values)),
             "gram_loss_weight": float(self.gram_loss_weight),
-            "point_loss": float(point_result.loss.detach()),
-            "point_same_type_loss": float(point_result.same_type.detach()),
-            "point_different_type_loss": float(point_result.different_type.detach()),
             "point_loss_weight": float(self.point_loss_weight),
             "point_count": float(point_result.point_count),
             "point_same_pair_count": float(point_result.same_pair_count),
@@ -1729,6 +1794,18 @@ class DinoIBOTPretrainer:
             align_corners=False,
         )
         return resized[0].permute(1, 2, 0).numpy().astype(np.uint8)
+
+    def _monitor_subset(self, batch: Mapping[str, Any]) -> dict[str, Any]:
+        """The first monitor_batch_size samples of a collated batch, for save_monitor_image."""
+        batch_size = int(batch["batch_size"])
+        n_global_views = int(batch["n_global_views"])
+        sample_count = min(batch_size, self.monitor_batch_size)
+        index = torch.tensor([view * batch_size + sample for view in range(n_global_views) for sample in range(sample_count)])
+        return {
+            "collated_global_crops": batch["collated_global_crops"].index_select(0, index),
+            "n_global_views": n_global_views,
+            "batch_size": sample_count,
+        }
 
     def save_monitor_image(self, monitor_batch: Mapping[str, Any], step: int, metrics: Mapping[str, float]) -> Path:
         self.model.eval()
@@ -1998,6 +2075,20 @@ class DinoIBOTPretrainer:
                                 step=step,
                                 extra={"val/monitor_image": self._wandb.Image(str(image_path))} if self._wandb_enabled() else None,
                             )
+                if (
+                    self.is_main_process
+                    and self.train_monitor_every_n
+                    and step > 0
+                    and step % self.train_monitor_every_n == 0
+                ):
+                    image_path = self.save_monitor_image(self._monitor_subset(batch), step, metrics)
+                    if self._wandb_enabled():
+                        self._log_wandb_metrics(
+                            "train",
+                            {},
+                            step=step,
+                            extra={"train/monitor_image": self._wandb.Image(str(image_path))},
+                        )
                 if self.task_eval_every and step > 0 and step % self.task_eval_every == 0:
                     self._run_task_evals(step)
                 if self.is_main_process and self.save_every_n and step > 0 and step % self.save_every_n == 0:

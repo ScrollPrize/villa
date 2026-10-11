@@ -1,9 +1,15 @@
+import asyncio
 import atexit
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import json
+import math
 import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
+import sys
+import time
 from typing import Any
 
 import aiohttp
@@ -13,6 +19,7 @@ import torch
 import torch.nn.functional as F
 import zarr
 from fsspec.asyn import sync
+from scipy.ndimage import binary_dilation
 from torch.utils.data import Dataset
 
 from dinovol_2.augmentation.pipelines import create_training_transforms
@@ -24,6 +31,29 @@ from dinovol_2.dataset.point_annotations import (
 )
 
 
+# Dropped connections, truncated bodies, timeouts and throttling from remote stores.
+# Missing chunks surface as FileNotFoundError inside zarr and never reach this.
+TRANSIENT_READ_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError)
+
+
+def read_with_retries(read, retries, backoff=1.0):
+    """Call read(), retrying transient network errors with exponential backoff."""
+    for attempt in range(retries + 1):
+        try:
+            return read()
+        except TRANSIENT_READ_ERRORS as exc:
+            if attempt == retries:
+                raise
+            delay = backoff * 2 ** attempt
+            print(
+                f"ssl_zarr_dataset: transient read error ({type(exc).__name__}: {exc}); "
+                f"retry {attempt + 1}/{retries} in {delay:g}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
+
+
 @dataclass
 class Volume:
     usable_bbox: tuple  # (z0, y0, x0, z1, y1, x1)
@@ -33,6 +63,19 @@ class Volume:
     weight: float = 0.0
     point_coordinates: np.ndarray | None = None
     point_type_ids: np.ndarray | None = None
+    # Dilated nonzero mask of a coarse pyramid level over the usable bbox; cell
+    # occupancy_origin + (i, j, k) covers occupancy_factor**3 selected-scale voxels.
+    occupancy: np.ndarray | None = None
+    occupancy_origin: tuple[int, int, int] | None = None
+    occupancy_factor: int = 1
+
+
+@dataclass(frozen=True)
+class SourcePlan:
+    volume: Volume
+    array: Any
+    starts: tuple[int, int, int]
+    anchor_index: int | None
 
 
 @dataclass
@@ -227,9 +270,25 @@ class SSLZarrDataset(Dataset):
         if any(not type_name for type_name in configured_types):
             raise ValueError("Point collection types must be non-empty strings.")
         self.point_type_to_id = {type_name: index for index, type_name in enumerate(configured_types)}
+        # occupancy_level: pyramid level whose nonzero voxels mark where source crops can
+        # reach nonzero_threshold, so crops below it are rejected before any read.
+        self.occupancy_level = self.config.get("occupancy_level")
+        # read_ahead: source crops each process reads in background threads while it
+        # augments the current sample. Their locations are drawn in the calling thread.
+        self.read_ahead = int(self.config.get("read_ahead", 0))
+        if self.read_ahead < 0:
+            raise ValueError(f"read_ahead must be non-negative, got {self.read_ahead}")
+        # read_retries: transient network errors are retried this many times with
+        # backoff doubling from read_retry_backoff seconds; the same window is re-read.
+        self.read_retries = int(self.config.get("read_retries", 5))
+        self.read_retry_backoff = float(self.config.get("read_retry_backoff", 1.0))
+        if self.read_retries < 0:
+            raise ValueError(f"read_retries must be non-negative, got {self.read_retries}")
         self._volume_handles: dict[tuple[str, int], ZarrHandle] = {}
         self._handle_pid: int | None = None
         self._atexit_pid: int | None = None
+        self._read_executor: ThreadPoolExecutor | None = None
+        self._pending_reads: deque = deque()
 
         if not self.single_crop_only:
             if self.num_global_crops != 2:
@@ -250,10 +309,13 @@ class SSLZarrDataset(Dataset):
                 "source_sampling_size must be at least as large as the largest requested crop size, "
                 f"got source_sampling_size={self.source_sampling_size} and required={required_source_sampling_size}"
             )
-        self.global_transforms = [create_training_transforms(self.global_crop_size) for _ in
-                                  range(self.num_global_crops)]
+        # gaussian_blur: false removes blur, which erases one-voxel structures.
+        gaussian_blur = bool(self.config.get("gaussian_blur", True))
+        self.global_transforms = [create_training_transforms(self.global_crop_size, gaussian_blur=gaussian_blur)
+                                  for _ in range(self.num_global_crops)]
         self.local_transforms = (
-            [create_training_transforms(self.local_crop_size) for _ in range(self.num_local_crops)]
+            [create_training_transforms(self.local_crop_size, gaussian_blur=gaussian_blur)
+             for _ in range(self.num_local_crops)]
             if self.local_crop_size is not None
             else []
         )
@@ -298,6 +360,10 @@ class SSLZarrDataset(Dataset):
                 ))
             finally:
                 handle.close()
+
+        if self.occupancy_level is not None:
+            with ThreadPoolExecutor(max_workers=min(8, len(self.volumes))) as executor:
+                list(executor.map(self._load_occupancy, self.volumes))
 
         self.total_valid_crop_starts = sum(vol.valid_crop_starts for vol in self.volumes)
         if self.total_valid_crop_starts <= 0:
@@ -361,11 +427,55 @@ class SSLZarrDataset(Dataset):
             if scale0_handle is not None:
                 scale0_handle.close()
 
+    def _load_occupancy(self, volume: Volume) -> None:
+        level = int(self.occupancy_level)
+        factor = 2 ** (level - int(volume.scale))
+        if factor < 1:
+            raise ValueError(f"occupancy_level {level} must not be finer than volume_scale {volume.scale}")
+        bbox_lo = np.asarray(volume.usable_bbox[:3]) // factor
+        bbox_hi = -(-np.asarray(volume.usable_bbox[3:]) // factor)
+        handle = open_zarr_handle(volume.path, level, self.volume_auth, self.s3_storage_options)
+        try:
+            array = handle.array
+            # Read one extra cell on each side for the dilation below.
+            read_lo = np.maximum(bbox_lo - 1, 0)
+            read_hi = np.minimum(bbox_hi + 1, array.shape)
+            coarse = np.zeros(tuple(bbox_hi - bbox_lo + 2), dtype=bool)
+            selection = tuple(slice(int(a), int(b)) for a, b in zip(read_lo, read_hi))
+            values = read_with_retries(
+                lambda: np.asarray(array[selection]), self.read_retries, self.read_retry_backoff
+            )
+            offset = read_lo - (bbox_lo - 1)
+            coarse[tuple(slice(int(o), int(o) + n) for o, n in zip(offset, values.shape))] = values > 0
+        finally:
+            handle.close()
+        # Downsampling can round sparse cells to zero; one cell of dilation keeps every
+        # nonzero selected-scale voxel inside an occupied cell.
+        coarse = binary_dilation(coarse, structure=np.ones((3, 3, 3), dtype=bool))
+        volume.occupancy = np.ascontiguousarray(coarse[1:-1, 1:-1, 1:-1])
+        volume.occupancy_origin = tuple(int(v) for v in bbox_lo)
+        volume.occupancy_factor = factor
+
+    def _occupied_fraction(self, volume: Volume, starts) -> float:
+        """Fraction of the source window inside occupied cells, an upper bound on its nonzero fraction."""
+        factor = volume.occupancy_factor
+        slices, weights = [], []
+        for start, size, origin in zip(starts, self.source_sampling_size, volume.occupancy_origin):
+            stop = int(start) + int(size)
+            first, last = int(start) // factor, (stop - 1) // factor
+            edges = np.arange(first, last + 2) * factor
+            weights.append((np.minimum(edges[1:], stop) - np.maximum(edges[:-1], int(start))).astype(np.float64))
+            slices.append(slice(first - origin, last + 1 - origin))
+        block = volume.occupancy[tuple(slices)].astype(np.float64)
+        return float(np.einsum("ijk,i,j,k->", block, *weights)) / math.prod(self.source_sampling_size)
+
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_volume_handles"] = {}
         state["_handle_pid"] = None
         state["_atexit_pid"] = None
+        state["_read_executor"] = None
+        state["_pending_reads"] = deque()
         return state
 
     def _register_close_hook(self) -> None:
@@ -380,6 +490,8 @@ class SSLZarrDataset(Dataset):
         if self._handle_pid == pid:
             return
         self.close()
+        self._read_executor = None
+        self._pending_reads = deque()
         self._volume_handles = {}
         self._handle_pid = pid
         self._register_close_hook()
@@ -394,6 +506,11 @@ class SSLZarrDataset(Dataset):
         return handle.array
 
     def close(self) -> None:
+        executor = getattr(self, "_read_executor", None)
+        if executor is not None and self._handle_pid == os.getpid():
+            executor.shutdown(wait=True, cancel_futures=True)
+            self._read_executor = None
+            self._pending_reads.clear()
         for handle in self._volume_handles.values():
             handle.close()
         self._volume_handles.clear()
@@ -430,21 +547,32 @@ class SSLZarrDataset(Dataset):
         )
         return resized.squeeze(0)
 
-    def _read_source_crop_3d(self, d_zarr, usable_bbox):
+    def _sample_source_start(self, usable_bbox):
         z0, y0, x0, z1, y1, x1 = usable_bbox
         crop_d, crop_h, crop_w = self.source_sampling_size
         z_start = np.random.randint(z0, z1 - crop_d + 1)
         y_start = np.random.randint(y0, y1 - crop_h + 1)
         x_start = np.random.randint(x0, x1 - crop_w + 1)
-        return np.asarray(
-            d_zarr[
-                z_start:z_start + crop_d,
-                y_start:y_start + crop_h,
-                x_start:x_start + crop_w,
-            ]
+        return z_start, y_start, x_start
+
+    def _read_source_window(self, d_zarr, starts):
+        z_start, y_start, x_start = starts
+        crop_d, crop_h, crop_w = self.source_sampling_size
+        selection = (
+            slice(z_start, z_start + crop_d),
+            slice(y_start, y_start + crop_h),
+            slice(x_start, x_start + crop_w),
         )
+        return read_with_retries(lambda: np.asarray(d_zarr[selection]), self.read_retries, self.read_retry_backoff)
+
+    def _read_source_crop_3d(self, d_zarr, usable_bbox):
+        return self._read_source_window(d_zarr, self._sample_source_start(usable_bbox))
 
     def _read_point_centered_source_crop_3d(self, d_zarr, usable_bbox, anchor):
+        starts = self._sample_point_centered_source_start(usable_bbox, anchor)
+        return self._read_source_window(d_zarr, starts), starts
+
+    def _sample_point_centered_source_start(self, usable_bbox, anchor):
         starts = []
         for bbox_start, bbox_stop, crop_size, coordinate in zip(
             usable_bbox[:3],
@@ -466,16 +594,7 @@ class SSLZarrDataset(Dataset):
                     f"of size {self.source_sampling_size} inside bounds {usable_bbox}."
                 )
             starts.append(int(np.random.randint(minimum, maximum + 1)))
-        z_start, y_start, x_start = starts
-        crop_d, crop_h, crop_w = self.source_sampling_size
-        crop = np.asarray(
-            d_zarr[
-                z_start:z_start + crop_d,
-                y_start:y_start + crop_h,
-                x_start:x_start + crop_w,
-            ]
-        )
-        return crop, (z_start, y_start, x_start)
+        return tuple(starts)
 
     def _sample_random_resized_crop_region(
         self,
@@ -664,16 +783,12 @@ class SSLZarrDataset(Dataset):
         candidates = np.flatnonzero(volume.point_type_ids == selected_type)
         return int(np.random.choice(candidates))
 
-    def __getitem__(self, idx):
+    def _draw_source_plan(self, nonzero_threshold):
         vol_weights = [vol.weight for vol in self.volumes]
-        nonzero_threshold = float(self.config.get("nonzero_threshold", 0.30))
-
         while True:
             vol_idx = np.random.choice(len(self.volumes), p=vol_weights)
             vol = self.volumes[vol_idx]
-            d_zarr = self._get_volume_array(vol)
             anchor_index = None
-            source_starts = None
             if (
                 self.point_supervision_enabled
                 and vol.point_coordinates is not None
@@ -681,15 +796,44 @@ class SSLZarrDataset(Dataset):
                 and np.random.random() < self.point_sampling_probability
             ):
                 anchor_index = self._sample_volume_anchor(vol)
-                source_crop, source_starts = self._read_point_centered_source_crop_3d(
-                    d_zarr,
+                starts = self._sample_point_centered_source_start(
                     vol.usable_bbox,
                     vol.point_coordinates[anchor_index],
                 )
             else:
-                source_crop = self._read_source_crop_3d(d_zarr, vol.usable_bbox)
+                starts = self._sample_source_start(vol.usable_bbox)
+            # The occupied fraction bounds the nonzero fraction from above, so this
+            # skips only windows the check after reading would reject.
+            if vol.occupancy is not None and self._occupied_fraction(vol, starts) < nonzero_threshold:
+                continue
+            return SourcePlan(vol, self._get_volume_array(vol), tuple(starts), anchor_index)
+
+    def _next_source_crop(self, nonzero_threshold):
+        while True:
+            if self._pending_reads:
+                plan, future = self._pending_reads.popleft()
+                source_crop = future.result()
+            else:
+                plan = self._draw_source_plan(nonzero_threshold)
+                source_crop = self._read_source_window(plan.array, plan.starts)
             if source_crop.size > 0 and (np.count_nonzero(source_crop) / source_crop.size) >= nonzero_threshold:
                 break
+        if self.read_ahead:
+            if self._read_executor is None:
+                self._read_executor = ThreadPoolExecutor(max_workers=self.read_ahead, thread_name_prefix="source-read")
+            while len(self._pending_reads) < self.read_ahead:
+                next_plan = self._draw_source_plan(nonzero_threshold)
+                self._pending_reads.append(
+                    (next_plan, self._read_executor.submit(self._read_source_window, next_plan.array, next_plan.starts))
+                )
+        return plan, source_crop
+
+    def __getitem__(self, idx):
+        nonzero_threshold = float(self.config.get("nonzero_threshold", 0.30))
+        plan, source_crop = self._next_source_crop(nonzero_threshold)
+        vol = plan.volume
+        anchor_index = plan.anchor_index
+        source_starts = plan.starts if anchor_index is not None else None
 
         if self.single_crop_only:
             crop = self._random_resized_crop_3d_from_array(

@@ -423,6 +423,7 @@ class Eva(nn.Module):
             deeper_embed_depth_per_level: Optional[Tuple[int, ...]] = None,
             deeper_embed_use_stem: bool = True,
             deeper_embed_final_projection: bool = True,
+            deeper_embed_channels_last: bool = False,
             deeper_embed_stage_strides=None,
             deeper_embed_stem_channels: Optional[int] = None,
             deeper_embed_stem_type: Optional[str] = None,
@@ -484,6 +485,7 @@ class Eva(nn.Module):
                 stage_strides=deeper_embed_stage_strides,
                 stem_channels=deeper_embed_stem_channels,
                 stem_type=deeper_embed_stem_type,
+                channels_last=deeper_embed_channels_last,
             )
         else:
             raise ValueError(
@@ -566,6 +568,9 @@ class Eva(nn.Module):
         self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
 
         self._init_weights()
+        if self.embedding_type == "deeper" and deeper_embed_channels_last:
+            # Convert after initialization so initial values do not depend on the layout.
+            self.down_projection.to(memory_format=self.down_projection.memory_format)
 
     def _init_weights(self):
         def init_fn(m):

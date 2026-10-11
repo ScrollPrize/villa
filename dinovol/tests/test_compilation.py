@@ -118,7 +118,9 @@ class CompilationTests(unittest.TestCase):
         self.assertFalse(trainer.compile_enabled)
         self.assertIsNone(trainer.model_module.student.backbone._compiled_call_impl)
         for setting in ("yes", {"enabled": "yes"}, {"enabled": True, "dynamic": "yes"},
-                        {"enabled": True, "fullgraph": "yes"}, {"enabled": True, "typo": 1}):
+                        {"enabled": True, "fullgraph": "yes"}, {"enabled": True, "typo": 1},
+                        {"enabled": True, "dynamic": {"typo": False}},
+                        {"enabled": True, "dynamic": {"backbone": "yes"}}):
             with self.subTest(setting=setting), self.assertRaises(ValueError):
                 trainer.config["compile"] = setting
                 trainer._configure_model_compilation()

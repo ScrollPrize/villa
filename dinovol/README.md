@@ -39,9 +39,9 @@ To select the new defaults, set `model.model_type` to `v3`:
 [`dinovol_2/configs/pretrain_8_9um.json`](dinovol_2/configs/pretrain_8_9um.json)
 is a standalone base-pretraining config with 128³ global crops, 64³ local crops,
 and `volume_scale: 0` for every volume. It uses a CNN feeding a width-288 `v3`
-backbone with 8 full-attention transformer blocks, a 2,048-wide SwiGLU FFN, and six attention
-heads, batch size 4 per GPU, transformer gradient checkpointing, two global views,
-and two local views. The CNN is not checkpointed. Gram and
+backbone with 10 full-attention transformer blocks, a 2,048-wide SwiGLU FFN, and six attention
+heads, batch size 16 per GPU without gradient checkpointing, two global views,
+and two local views. Gram and
 point supervision are disabled for this initial stage.
 The FFN uses `mlp_ratio: 7.111111111111111` (2,048 / 288); its packed input
 projection produces two 2,048-wide branches before gating.
@@ -49,7 +49,7 @@ projection produces two 2,048-wide branches before gating.
 Compilation is enabled for this recipe with the top-level setting:
 
 ```json
-"compile": {"enabled": true, "backend": "inductor", "mode": "default"}
+"compile": {"enabled": true, "backend": "inductor", "mode": "default", "dynamic": {"backbone": false}}
 ```
 
 The trainer compiles the student and teacher backbones (CNN plus transformer)
@@ -64,12 +64,65 @@ matching the trainer's existing AMP forward / non-autocast backward sequence.
 Other configs default to compilation disabled; `"compile": false` disables it.
 Optional settings are `backend`, `mode`, `dynamic` (default `null`, automatic
 dynamic-shape handling), and `fullgraph` (default `false`, allowing graph breaks).
+`dynamic` may also map `backbone`, `dino_head`, and `ibot_head` to `true`,
+`false`, or `null`; unlisted modules use `null`. This recipe compiles backbones
+statically, giving one graph per global/local crop shape instead of a slower
+dynamic-shape recompile, while the iBOT head keeps automatic handling for its
+varying number of masked tokens. With the inductor backend the trainer disables
+Inductor's mix-order reduction, which in torch 2.10 returns the mask-token
+gradient with the wrong shape in channels-last CNN backward graphs (8+ masked
+128³ crops); disabling it had no measurable throughput cost.
 Initial calls compile lazily; global/local shapes and training/evaluation paths
 can each require warmup. Compilation failures are not silently suppressed.
 The default mode avoids explicitly enabling CUDA-graph modes that reserve extra
 workspace memory. Measure throughput and peak VRAM after warmup on the target GPU;
 compiled execution can change floating-point rounding and random-number streams.
 For compiler diagnostics, run with `TORCH_LOGS=graph_breaks,recompiles`.
+
+The recipe also enables these throughput and memory settings. Each is off unless
+a config sets it:
+
+- `ibot_fused_last_layer` (top level): the heads return the iBOT bottleneck
+  features and last-layer weight, and the loss forms the
+  `[n_masked, ibot_out_dim]` logits, Sinkhorn-Knopp targets, and gradients one
+  chunk of `ibot_masked_loss_chunk_size` rows at a time. Sinkhorn-Knopp reduces to
+  per-prototype scales `b` with targets `softmax(teacher_logits / T + log b)`, so
+  three passes over recomputed teacher logits replace the stored matrices. The
+  math is unchanged; only floating-point rounding differs.
+- `model.deeper_embed_channels_last`: CNN activations and weights use the
+  channels-last 3D layout, which cuDNN's tensor-core convolutions use natively.
+  Weights are converted after initialization; checkpoints are layout-independent.
+- `model.deeper_embed_batch_chunk_size: null`: the CNN embeds the whole batch at
+  once instead of one sample at a time (the default of 1).
+- `fused_optimizer`: fused CUDA AdamW.
+- `cuda_expandable_segments`: the CUDA caching allocator uses expandable
+  segments, avoiding fragmentation-driven cache flushes near full memory.
+- `dataset.occupancy_level`: the pyramid level (5 here, 32× coarser) whose
+  nonzero voxels, dilated by one cell, bound each source window's nonzero
+  fraction. Windows that cannot reach `nonzero_threshold` are rejected before any
+  read, so the accepted windows and their distribution are unchanged. Masked-out
+  chunks are absent from the S3 stores, so these reads were otherwise wasted.
+  The coarse masks are read once at startup and only cover the usable bounding box.
+- `dataset.read_ahead`: each loader process reads this many future source
+  windows in background threads while it augments the current sample. Window
+  locations are still drawn in the loader process, so sampling stays
+  deterministic, but enabling it changes the order of random draws.
+- `dataset.read_retries` (default 5) and `dataset.read_retry_backoff` (default
+  1 s): source-window and occupancy reads retry transient network errors
+  (dropped connections, truncated responses, timeouts) with doubling backoff,
+  re-reading the same window, so a single dropped S3 connection no longer kills
+  a run. Each retry is printed to stderr.
+- `dataset.gaussian_blur: false` and `dataset.global_crop_scale: [0.18, 0.45]` /
+  `dataset.local_crop_scale: [0.023, 0.057]`: views are resampled only 0.87–1.18×
+  from the 192³ source window (global 108–147 → 128 voxels, local 55–74 → 64)
+  and are never blurred, so one-voxel structures survive augmentation. The zoom
+  range still covers the 7.9–9.4 µm spread in voxel size between scans.
+- `num_workers: 24`, `prefetch_factor: 2`, `persistent_workers: true`: with
+  read-ahead, one worker produces about 1.8 samples/s (augmentation-bound), so 24
+  workers comfortably exceed the GPU's ~20 samples/s on an H100.
+
+The teacher forward now runs before the student forward, so its no-grad
+intermediates are freed before student activations accumulate.
 
 The model option `attention_type` accepts `"full"` (the default, used in this recipe)
 or `"axial"`. Each axial block has three sequential attention
@@ -90,20 +143,24 @@ a matching checkpoint or a new training run.
 
 The CNN uses the existing `deeper` embedding with a 16-channel full-resolution
 stem: one 3×3×3 stride-1 convolution, normalization, and activation. Four residual
-stages follow, with 16, 32, 64, and 288 channels and strides 1, 2, 2, and 2.
-Each stage has two basic residual blocks (two 3×3×3 convolutions per block).
+stages follow, with 16, 48, 128, and 192 channels, strides 1, 2, 2, and 2, and
+1, 2, 2, and 1 basic residual blocks (two 3×3×3 convolutions per block).
 The first stage operates entirely at full resolution; subsequent stages
-downsample in the first convolution of their first block. This gives five
-convolutions before the first downsampling. No final embedding projection is
-used: the last stage's 288 channels become EVA tokens directly. Residual skip connections
+downsample in the first convolution of their first block. This gives three
+convolutions before the first downsampling, enough to resolve one-voxel
+structure while keeping full-resolution activations small. Capacity sits in the
+64³ and 32³ stages; a single 192-channel block at token resolution is followed
+by a 1×1×1 projection to the 288-wide EVA tokens. Residual skip connections
 retain their channel projections. Total stride is 8, giving 4,096 global
-tokens and 512 local tokens, before CLS/register tokens.
+tokens and 512 local tokens, before CLS/register tokens. The CNN has 3.5M
+parameters and the backbone 24.5M; the CNN trains at the full learning rate
+(`patch_embed_lr_mult: 1.0`).
 
-The recipe keeps a 512³ source sampling window, from which augmented crops are
+The recipe uses a 192³ source sampling window, from which augmented crops are
 drawn. CNN convolutions use zero padding, and the model receives exactly the
 128³ global and 64³ local crops. There is no halo expansion, extra context read,
 or cropping of the embedded grid. The output directory is
-`dinovol_pretrain_8_9um_cnn288_8blocks_ffn2048_full_g128_p8_stem16/` to avoid automatically resuming
+`dinovol_pretrain_8_9um_cnn192proj_10blocks_ffn2048_full_g128_p8_stem16/` to avoid automatically resuming
 incompatible checkpoints from earlier architectures.
 
 The configurable CNN options under `model` are:
@@ -114,13 +171,13 @@ The configurable CNN options under `model` are:
   "embed_dim": 288,
   "num_heads": 6,
   "patch_size": [8, 8, 8],
-  "deeper_embed_stage_channels": [16, 32, 64, 288],
+  "deeper_embed_stage_channels": [16, 48, 128, 192],
   "deeper_embed_stage_strides": [1, 2, 2, 2],
-  "deeper_embed_depth_per_level": [2, 2, 2, 2],
+  "deeper_embed_depth_per_level": [1, 2, 2, 1],
   "deeper_embed_use_stem": true,
   "deeper_embed_stem_channels": 16,
   "deeper_embed_stem_type": "conv",
-  "deeper_embed_final_projection": false
+  "deeper_embed_final_projection": true
 }
 ```
 

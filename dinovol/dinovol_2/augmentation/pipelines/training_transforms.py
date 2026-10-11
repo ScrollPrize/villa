@@ -62,6 +62,7 @@ def create_training_transforms(
     allowed_rotation_axes: Optional[List[int]] = None,
     skeleton_targets: Optional[List[str]] = None,
     skeleton_ignore_values: Optional[Dict[str, int]] = None,
+    gaussian_blur: bool = True,
 ) -> ComposeTransforms:
     """
     Create the training augmentation pipeline.
@@ -246,7 +247,8 @@ def create_training_transforms(
     # =========================================================================
     common_transforms = []
 
-    if not only_spatial_and_intensity:
+    # gaussian_blur=False omits the blur transform below.
+    if not only_spatial_and_intensity and gaussian_blur:
         # Blur OR Median filter (one of)
         common_transforms.append(
             OneOfTransform([
@@ -270,6 +272,7 @@ def create_training_transforms(
             ])
         )
 
+    if not only_spatial_and_intensity:
         # Gaussian noise
         common_transforms.append(RandomTransform(
             GaussianNoiseTransform(

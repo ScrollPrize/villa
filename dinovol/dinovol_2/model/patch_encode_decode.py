@@ -552,12 +552,19 @@ class PatchEmbedDeeper(nn.Module):
         stage_strides: Optional[Tuple[Union[int, Tuple[int, ...]], ...]] = None,
         stem_channels: Optional[int] = None,
         stem_type: Optional[str] = None,
+        channels_last: bool = False,
     ) -> None:
         super().__init__()
         self.patch_size = tuple(int(p) for p in patch_size)
         self.ndim = len(self.patch_size)
         if self.ndim not in (2, 3):
             raise ValueError(f"PatchEmbedDeeper only supports 2D or 3D, got ndim={self.ndim}")
+        # Channels-last activations let cuDNN use its native NDHWC tensor-core kernels.
+        # Convolution weights should use the same layout: call self.to(memory_format=self.memory_format).
+        self.memory_format = (
+            (torch.channels_last_3d if self.ndim == 3 else torch.channels_last)
+            if channels_last else torch.contiguous_format
+        )
         if any(not _is_power_of_two(size) for size in self.patch_size):
             raise ValueError(
                 f"PatchEmbedDeeper requires power-of-two patch sizes, got patch_size={self.patch_size}"
@@ -719,6 +726,8 @@ class PatchEmbedDeeper(nn.Module):
         ) if final_projection else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.memory_format is not torch.contiguous_format:
+            x = x.contiguous(memory_format=self.memory_format)
         x = self.stem(x)
         for stage in self.stages:
             x = stage(x)
