@@ -157,6 +157,8 @@ For every acquisition directory, verify that:
 3. `scroll-mask.py` reports `ok` with a plausible scroll area, and every JPEG has one same-sized `ScrollMasks/<stem>_mask.png` file with non-empty foreground.
 4. Overlays of the `ScrollMasks/` files on their JPEGs cover the scroll and nothing else, for a sample of frames from every directory.
 
+[`photogrammetry-tools/mask_sheet.py`](../photogrammetry-tools/) checks item 3's mask files and writes the overlay sheet for item 4.
+
 `cc-fix.py` and `mask-applier.py` predate this step. They assume the scroll is label 1 (and the ruler label 2), which holds for earlier ruler-calibrated captures but not for turntable captures with ArUco markers, so do not use them on such captures.
 
 #### Preparing the PGS-Recon input
@@ -274,6 +276,8 @@ The reconstruction directory retains both scenes:
 
 Inspect the robustified scene in the OpenMVG Viewer. Require a coherent sparse cloud, approximately circular camera trajectories at the acquired heights, no unexplained angular gaps and at least 95% of retained views registered. Inspect the match graph, track count, final reprojection residual, intrinsics and sparse-point distribution together. A non-circular trajectory can indicate that the object moved on the turntable, in which case that acquisition block must not be used to estimate scale.
 
+[`photogrammetry-tools/sfm_review.py`](../photogrammetry-tools/) reports registration and residuals per block, the verified image pairs linking orientations (an orientation with none is left out of the reconstruction), and the camera circles and axes.
+
 It's important to use ply as output file type, because many readers downstream that work on other format used to corrupt the input mesh while parsing.
 
 If the sparse reconstruction is not acceptable, preserve it and change one parameter family at a time:
@@ -334,6 +338,8 @@ Before accepting a candidate, inspect:
 - agreement between independent candidates that should represent the same fixed orientation;
 - scaled object dimensions against an independent physical measurement.
 
+[`photogrammetry-tools/scale_review.py`](../photogrammetry-tools/) tabulates the scale, triangulated corners, marker side lengths, planarity and marker ring radius of every candidate.
+
 Detection success or the weighted median alone is not sufficient. Reject false detections, outlier-dominated estimates and candidates assembled from incompatible acquisition blocks. Preserve the include list, scaled scene, histogram, overlays, landmark meshes and log for every candidate that informed the decision.
 
 The integrated `--mvg-autoscale` route can stop after scaling and can write its histogram and overlays through `--autoscale-histogram-out` and `--autoscale-debug-dir`. Use it when one include list is already known to be valid. Prefer the standalone scaler above when candidates must be compared because it reuses the accepted sparse scene.
@@ -369,7 +375,7 @@ The resume invocation skips feature extraction, matching, SfM, robustification a
 
 After the export to OpenMVS, `<output>/mvs/undistorted_images/` must contain one `<stem>.mask.png` for every image. Densification reports a mask that fails to load only at debug log level and then densifies that image unmasked, so check the count rather than relying on the log.
 
-Require finite vertices and valid faces, nonzero extents, one dominant face-connected component, a plausible silhouette and object-aligned dimensions consistent with independent measurements. A case-generation mesh must also be watertight and free of boundary edges, non-manifold edges, orientation conflicts and degenerate faces. Inspect canonical renders for holes, bridges, collapsed regions and disconnected debris.
+Require finite vertices and valid faces, nonzero extents, one dominant face-connected component, a plausible silhouette and object-aligned dimensions consistent with independent measurements. A case-generation mesh must also be watertight and free of boundary edges, non-manifold edges, orientation conflicts and degenerate faces. Inspect canonical renders for holes, bridges, collapsed regions and disconnected debris. [`photogrammetry-tools/mesh_qa.py`](../photogrammetry-tools/) checks the mask count, the topology and the principal-axis extents, and writes the renders.
 
 If OpenMVS fails, retain the completed intermediate files and diagnose stages in increasing order of geometric impact:
 
@@ -442,7 +448,7 @@ The generator expands and smooths the mesh, creates the scroll proxy and combine
 
 Confirm that every input produced three readable, non-empty STLs and one CSV row. Record bounds, connected components, boundary/non-manifold topology, winding consistency, watertightness and visual renders.
 
-The generator uses multiple workers and may finish its parent process even if a worker failed. A zero exit status is therefore insufficient. Require the padded identifier's three expected STLs, a populated `scroll_summary.csv` row, readable finite geometry and sensible assembly renders before accepting the kit.
+The generator uses multiple workers and may finish its parent process even if a worker failed. A zero exit status is therefore insufficient. Require the padded identifier's three expected STLs, a populated `scroll_summary.csv` row, readable finite geometry and sensible assembly renders before accepting the kit. [`photogrammetry-tools/scrollcase_qa.py`](../photogrammetry-tools/) checks these, measures the clearance between the scroll and each half, and writes section and assembly renders.
 
 #### Printing
 

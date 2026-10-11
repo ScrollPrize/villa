@@ -1,0 +1,40 @@
+# Photogrammetry review tools
+
+Scripts for the review points of the [photogrammetry handover](../photogrammetry-docs/README_HANDOVER.md): one per
+stage, each printing the checks the handover asks for and, where useful, writing an image to inspect. Keep their output
+with the run.
+
+| Stage | Script | Checks | Image |
+|---|---|---|---|
+| Masking | `mask_sheet.py ROOT sheet.jpg` | every JPEG has a same-sized, non-empty `ScrollMasks/` mask; mask area range and largest frame-to-frame change per directory | overlay contact sheet |
+| Sparse SfM | `sfm_review.py SFM_DIR BLOCKS` | posed views and residuals per block; verified image pairs between orientations; camera circles and shared axes per orientation (needs `review_sfm_data.json`) | |
+| Scale | `scale_review.py CANDIDATES` | per candidate: scale, triangulated corners, marker side lengths, off-plane residual, marker ring radius | |
+| OpenMVS | `mesh_qa.py MESH.ply [...] --undistorted DIR --render views.png --texture TEXTURED.ply` | masks reached OpenMVS; finite, valid, watertight, manifold, one component; principal-axis extents | shaded and textured views along each principal axis |
+| Case | `scrollcase_qa.py OUTPUT_DIR ID --render kit.png` | three STLs and a CSV row; per-STL topology; split vs cavity direction; scroll-to-case clearance, nothing inside case material | sections and assembly views |
+
+`ROOT` and `BLOCKS` are the acquisition tree (one `<orientation>_camera_<height>/` directory per block, as in the
+handover); `SFM_DIR` is the PGS-Recon `--stop-after sfm` output (it contains `mvg/`); `CANDIDATES` holds one directory
+per scale candidate from the handover's scaler loop. For the trajectory review, export the poses first, in the PGS-Recon
+container:
+
+```bash
+openMVG_main_ConvertSfM_DataFormat -i <SFM_DIR>/mvg/recon_dir/sfm_data.bin \
+  -o <SFM_DIR>/mvg/recon_dir/review_sfm_data.json -V -I -E
+```
+
+## Environment
+
+All scripts run in the [scrollcase](../scrollcase/) virtual environment, which has numpy, Pillow, trimesh and meshlib:
+
+```bash
+../scrollcase/.venv/bin/python mesh_qa.py ...
+```
+
+Rendering samples a few million surface points; cap memory on shared machines, e.g.
+`systemd-run --user --scope -p MemoryMax=16G -p MemorySwapMax=0 ...`.
+
+## Tests
+
+```bash
+../scrollcase/.venv/bin/python -m unittest discover -s tests
+```
