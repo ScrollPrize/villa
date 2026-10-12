@@ -340,8 +340,9 @@ if(VC_RUN_E2E)
 endif()
 
 # End-to-end test that spawns the built vc_obj2tifxyz_legacy on two synthetic
-# plane meshes (clean, and with 3% stretched triangles) and checks that the
-# output grid keeps the 4 voxel cell size. Opt-in via VC_RUN_E2E=1.
+# plane meshes (clean, and with 3% stretched triangles) and checks the output
+# cell size under the three scale methods (median, mean, manual). Opt-in via
+# VC_RUN_E2E=1.
 add_executable(test_obj2tifxyz_legacy_scale test_obj2tifxyz_legacy_scale.cpp)
 target_link_libraries(test_obj2tifxyz_legacy_scale PRIVATE doctest::doctest vc_core)
 vc_register_test_target(test_obj2tifxyz_legacy_scale)

@@ -8,8 +8,12 @@
 // one, and one where 1 per cent of the vertices (rows and columns 5 mod 10) are
 // pushed 9.8 * 4 voxels out of the plane, so 3 per cent of the triangles have a
 // Jacobian norm about 6.9 times the median. It rasterizes both with step 4 and
-// requires the median distance between 4-neighbour cells of the output to be
-// within 1 per cent of 4 voxels.
+// each scale method, and checks the median distance between 4-neighbour cells of
+// the output: within 1 per cent of 4 voxels for the median (default) and for a
+// manual --uv-scale=0.2 on both meshes, and for --scale-method=mean on the clean
+// mesh; on the stretched mesh the mean keeps its old bias (under 3.6 voxels).
+// Invalid scale options must be refused with a non-zero exit before the output
+// directory is created.
 //
 // Opt-in: only runs when VC_RUN_E2E is set to "1", like test_merge_e2e_small.
 // POSIX only, like the other CLI tests: the tool is started with posix_spawn and
@@ -38,6 +42,7 @@ TEST_CASE("vc_obj2tifxyz_legacy scale test is POSIX-only") {}
 #include <fcntl.h>
 #include <spawn.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 extern char** environ;
 
@@ -88,30 +93,50 @@ double medianNeighbourStep(const fs::path& dir)
     return d[d.size() / 2];
 }
 
+bool isExecutableFile(const fs::path& p)
+{
+    std::error_code ec;
+    return fs::is_regular_file(p, ec) && ::access(p.c_str(), X_OK) == 0;
+}
+
+// The tool to spawn: VC_OBJ2TIFXYZ_LEGACY_BIN if set, which must be an absolute
+// path to an existing executable regular file (refused otherwise, never run), or
+// the built binary next to the test. Empty if none qualifies.
 fs::path findBinary()
 {
-    if (const char* env = std::getenv("VC_OBJ2TIFXYZ_LEGACY_BIN"))
-        if (fs::is_regular_file(env)) return env;
+    if (const char* env = std::getenv("VC_OBJ2TIFXYZ_LEGACY_BIN")) {
+        const fs::path p(env);
+        if (!p.is_absolute() || !isExecutableFile(p)) {
+            MESSAGE("VC_OBJ2TIFXYZ_LEGACY_BIN refused (not an absolute path to an executable file): " << env);
+            return {};
+        }
+        return p;
+    }
     for (const fs::path& base : {fs::path("build/bin"), fs::path("bin"), fs::path("../bin")})
-        if (fs::is_regular_file(base / "vc_obj2tifxyz_legacy")) return base / "vc_obj2tifxyz_legacy";
+        if (isExecutableFile(base / "vc_obj2tifxyz_legacy")) return fs::absolute(base / "vc_obj2tifxyz_legacy");
     return {};
 }
 
-// Runs bin with the arguments obj, out, "4" and no shell: the path and the
-// arguments go to posix_spawn as an argument vector, stdout and stderr go to log.
-// Returns the exit status, or -1 if the process could not be started or did
+// Runs bin with the arguments obj, out, "4" and extra, and no shell: the path and
+// the arguments go to posix_spawn as an argument vector, stdout and stderr go to
+// log. Returns the exit status, or -1 if the process could not be started or did
 // not exit normally.
-int runTool(const fs::path& bin, const fs::path& obj, const fs::path& out, const fs::path& log)
+int runTool(const fs::path& bin, const fs::path& obj, const fs::path& out, const fs::path& log,
+            std::vector<std::string> extra)
 {
-    std::string a0 = bin.string(), a1 = obj.string(), a2 = out.string(), a3 = "4";
-    std::vector<char*> argv = {a0.data(), a1.data(), a2.data(), a3.data(), nullptr};
+    std::vector<std::string> args = {bin.string(), obj.string(), out.string(), "4"};
+    for (auto& e : extra)
+        if (!e.empty()) args.push_back(e);
+    std::vector<char*> argv;
+    for (auto& a : args) argv.push_back(a.data());
+    argv.push_back(nullptr);
     posix_spawn_file_actions_t actions;
     if (posix_spawn_file_actions_init(&actions) != 0) return -1;
     const std::string logPath = log.string();
     posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, logPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO);
     pid_t pid = 0;
-    const int rc = posix_spawn(&pid, a0.c_str(), &actions, nullptr, argv.data(), environ);
+    const int rc = posix_spawn(&pid, args[0].c_str(), &actions, nullptr, argv.data(), environ);
     posix_spawn_file_actions_destroy(&actions);
     if (rc != 0) return -1;
     int status = 0;
@@ -119,14 +144,17 @@ int runTool(const fs::path& bin, const fs::path& obj, const fs::path& out, const
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
-double rasterizedStep(const fs::path& bin, const fs::path& root, bool stretched)
+// Rasterizes the clean or stretched OBJ (written once into root) with the extra
+// argument (empty: default method) and returns the output step in voxels.
+double rasterizedStep(const fs::path& bin, const fs::path& root, bool stretched,
+                      const std::string& tag, const std::string& extra)
 {
-    const std::string name = stretched ? "stretched" : "clean";
-    const fs::path obj = root / (name + ".obj");
-    const fs::path out = root / name;
-    writePlaneObj(obj, stretched);
-    REQUIRE_MESSAGE(runTool(bin, obj, out, root / (name + ".log")) == 0,
-                    "vc_obj2tifxyz_legacy failed on the " << name << " mesh");
+    const std::string mesh = stretched ? "stretched" : "clean";
+    const fs::path obj = root / (mesh + ".obj");
+    if (!fs::exists(obj)) writePlaneObj(obj, stretched);
+    const fs::path out = root / (mesh + "_" + tag);
+    REQUIRE_MESSAGE(runTool(bin, obj, out, root / (mesh + "_" + tag + ".log"), {extra}) == 0,
+                    "vc_obj2tifxyz_legacy " << extra << " failed on the " << mesh << " mesh");
     return medianNeighbourStep(out);
 }
 
@@ -145,11 +173,35 @@ TEST_CASE("vc_obj2tifxyz_legacy keeps the cell size when a few triangles are str
     const fs::path root = fs::temp_directory_path() / ("vc_obj2tifxyz_legacy_scale_" + std::to_string(rng()));
     fs::create_directories(root);
 
-    const double clean = rasterizedStep(bin, root, false);
-    const double stretched = rasterizedStep(bin, root, true);
-    MESSAGE("output step, clean mesh: " << clean << " voxels; stretched mesh: " << stretched << " voxels (expected 4)");
-    CHECK(std::abs(clean - kStep) <= 0.01 * kStep);
-    CHECK(std::abs(stretched - kStep) <= 0.01 * kStep);
+    // tag, extra argument, whether the stretched mesh must keep the 4 voxel step
+    const struct { const char* tag; const char* extra; bool robust; } methods[] = {
+        {"median", "", true},                     // default
+        {"mean", "--scale-method=mean", false},   // the behaviour before the median
+        {"manual", "--uv-scale=0.2", true},       // vt = cell * 20 on a 4 voxel lattice
+    };
+    for (const auto& m : methods) {
+        const double clean = rasterizedStep(bin, root, false, m.tag, m.extra);
+        const double stretched = rasterizedStep(bin, root, true, m.tag, m.extra);
+        MESSAGE(m.tag << ": output step, clean mesh: " << clean << " voxels; stretched mesh: " << stretched
+                      << " voxels");
+        CHECK(std::abs(clean - kStep) <= 0.01 * kStep);
+        if (m.robust)
+            CHECK(std::abs(stretched - kStep) <= 0.01 * kStep);
+        else
+            CHECK(stretched < 0.9 * kStep);
+    }
+
+    // invalid scale options: refused, and nothing written
+    const std::vector<std::vector<std::string>> refused = {
+        {"--uv-scale=abc"}, {"--uv-scale=0"}, {"--uv-scale=-1"},
+        {"--uv-scale=0.2", "--scale-method=mean"}, {"--scale-method=foo"},
+    };
+    for (size_t i = 0; i < refused.size(); ++i) {
+        const fs::path out = root / ("refused_" + std::to_string(i));
+        const int rc = runTool(bin, root / "clean.obj", out, root / ("refused_" + std::to_string(i) + ".log"), refused[i]);
+        CHECK_MESSAGE(rc > 0, refused[i][0] << " not refused (rc " << rc << ")");
+        CHECK_MESSAGE(!fs::exists(out), refused[i][0] << " created " << out);
+    }
 
     std::error_code ec;
     fs::remove_all(root, ec);
