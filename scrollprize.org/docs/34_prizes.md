@@ -197,7 +197,7 @@ One of the frontiers of Vesuvius Challenge is finding techniques that work acros
 While we’ve discovered text in some of our scrolls, others have not yet produced legible findings.
 For these prizes, your mission is to prove that ink detection works on scrolls where nothing has been read yet. The review bar is deliberately high — we’d rather be slow than wrong.
 
-**First Letters: <span className="vc-money">\$50,000</span> per scroll, for any of the eligible scroll volumes listed below.** <span className="vc-money">\$50,000</span> to the first team that uncovers 10 letters within a single 4 cm² area of that scroll — and open sources their code, data, model weights and results (after winning the prize). First Letters prizes will be awarded for a maximum of 10 scrolls — up to <span className="vc-money">\$500,000</span> in total.
+**First Letters: <span className="vc-money">\$50,000</span> per scroll, for any of the eligible scroll volumes listed below.** <span className="vc-money">\$50,000</span> to the first team that uncovers 10 letters within a single 4 cm² area of that scroll — and open sources their code, data, model weights and results (after winning the prize). First Letters prizes will be awarded for a maximum of 9 more scrolls — up to <span className="vc-money">\$450,000</span> in total.
 
 Note the eligible set here is different than the [2027 Grand Prize](#2027-grand-prize) set: it includes several other scrolls where no text has been read yet, and excludes those where letters have now been found.
 

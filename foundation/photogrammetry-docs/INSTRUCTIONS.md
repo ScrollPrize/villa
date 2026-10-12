@@ -84,6 +84,8 @@ The photographs may remain in a flat list separated by the written annotation im
 
 Regardless of layout, verify the expected photograph count for every acquisition block before leaving the session.
 
+If the annotation photographs or the session log are missing, the blocks can usually be recovered from the camera metadata. Within a turntable turn, frames are about a second apart; turns of one block follow each other after a short pause (roughly 10–20 s); blocks are separated by longer breaks and usually by a zoom change, since each camera height is reframed. [`photogrammetry-tools/find_blocks.py`](../photogrammetry-tools/) groups the photographs on these cues using ExifTool, reports frame-number gaps and byte-identical duplicate files (for example `DSC01234_1.ARW` left by a repeated copy), and writes a proposed block list with a contact sheet of every burst. Timing cannot always separate a long pause inside a block from a short break between two blocks at the same zoom, and it says nothing about when the scroll was reoriented, so confirm the blocks, and which blocks share an orientation, on the contact sheet before naming them and building the directory tree with its `link` command.
+
 ### Masking
 
 Use [`foundation/sam2-photogrammetry`](../sam2-photogrammetry/) from the Villa repository at commit `a60235b67249918953b3d3c367d08d7da54ae459` or later; `scroll-mask.py`, and the `segment.py` change that keeps host memory bounded on full-resolution photographs, were added after that commit. Use Python 3.12 and install ExifTool so that `raw2jpg.py` can transfer metadata from each RAW file to its JPEG.
@@ -156,6 +158,8 @@ For every acquisition directory, verify that:
 2. Every JPEG has one readable, same-sized `Masks/<stem>_mask.png` file with non-empty foreground.
 3. `scroll-mask.py` reports `ok` with a plausible scroll area, and every JPEG has one same-sized `ScrollMasks/<stem>_mask.png` file with non-empty foreground.
 4. Overlays of the `ScrollMasks/` files on their JPEGs cover the scroll and nothing else, for a sample of frames from every directory.
+
+[`photogrammetry-tools/mask_sheet.py`](../photogrammetry-tools/) checks item 3's mask files and writes the overlay sheet for item 4.
 
 `cc-fix.py` and `mask-applier.py` predate this step. They assume the scroll is label 1 (and the ruler label 2), which holds for earlier ruler-calibrated captures but not for turntable captures with ArUco markers, so do not use them on such captures.
 
@@ -274,6 +278,8 @@ The reconstruction directory retains both scenes:
 
 Inspect the robustified scene in the OpenMVG Viewer. Require a coherent sparse cloud, approximately circular camera trajectories at the acquired heights, no unexplained angular gaps and at least 95% of retained views registered. Inspect the match graph, track count, final reprojection residual, intrinsics and sparse-point distribution together. A non-circular trajectory can indicate that the object moved on the turntable, in which case that acquisition block must not be used to estimate scale.
 
+[`photogrammetry-tools/sfm_review.py`](../photogrammetry-tools/) reports registration and residuals per block, the verified image pairs linking orientations (an orientation with none is left out of the reconstruction), and the camera circles and axes.
+
 It's important to use ply as output file type, because many readers downstream that work on other format used to corrupt the input mesh while parsing.
 
 If the sparse reconstruction is not acceptable, preserve it and change one parameter family at a time:
@@ -288,7 +294,7 @@ If the sparse reconstruction is not acceptable, preserve it and change one param
 
 The scaler detects the printed ArUco markers, triangulates their corners and maps the accepted SfM scene into the physical unit used for `--marker-size`. Scale only the accepted robustified scene, and apply scale before OpenMVS.
 
-The markers are fixed in the turntable frame, whereas a deliberately reoriented or accidentally displaced object is not. Use the acquisition log, annotation images and camera trajectories to create basename-only include lists for blocks in which the object orientation remained fixed. Combine camera heights only when they belong to the same fixed orientation. Do not infer blocks from historical filename counts.
+The markers are fixed in the turntable frame, whereas a deliberately reoriented or accidentally displaced object is not. Use the acquisition log, annotation images (or the metadata-derived blocks described under [After acquisition](#after-acquisition)) and camera trajectories to create basename-only include lists for blocks in which the object orientation remained fixed. Combine camera heights only when they belong to the same fixed orientation. Do not infer blocks from historical filename counts.
 
 If more than one block may be valid, estimate every candidate independently. Run the standalone scaler on the accepted `sfm_data_structured.bin` so that comparing candidates does not repeat feature extraction, matching or SfM:
 
@@ -334,6 +340,8 @@ Before accepting a candidate, inspect:
 - agreement between independent candidates that should represent the same fixed orientation;
 - scaled object dimensions against an independent physical measurement.
 
+[`photogrammetry-tools/scale_review.py`](../photogrammetry-tools/) tabulates the scale, triangulated corners, marker side lengths, planarity and marker ring radius of every candidate.
+
 Detection success or the weighted median alone is not sufficient. Reject false detections, outlier-dominated estimates and candidates assembled from incompatible acquisition blocks. Preserve the include list, scaled scene, histogram, overlays, landmark meshes and log for every candidate that informed the decision.
 
 The integrated `--mvg-autoscale` route can stop after scaling and can write its histogram and overlays through `--autoscale-histogram-out` and `--autoscale-debug-dir`. Use it when one include list is already known to be valid. Prefer the standalone scaler above when candidates must be compared because it reuses the accepted sparse scene.
@@ -369,7 +377,7 @@ The resume invocation skips feature extraction, matching, SfM, robustification a
 
 After the export to OpenMVS, `<output>/mvs/undistorted_images/` must contain one `<stem>.mask.png` for every image. Densification reports a mask that fails to load only at debug log level and then densifies that image unmasked, so check the count rather than relying on the log.
 
-Require finite vertices and valid faces, nonzero extents, one dominant face-connected component, a plausible silhouette and object-aligned dimensions consistent with independent measurements. A case-generation mesh must also be watertight and free of boundary edges, non-manifold edges, orientation conflicts and degenerate faces. Inspect canonical renders for holes, bridges, collapsed regions and disconnected debris.
+Require finite vertices and valid faces, nonzero extents, one dominant face-connected component, a plausible silhouette and object-aligned dimensions consistent with independent measurements. A case-generation mesh must also be watertight and free of boundary edges, non-manifold edges, orientation conflicts and degenerate faces. Inspect canonical renders for holes, bridges, collapsed regions and disconnected debris. [`photogrammetry-tools/mesh_qa.py`](../photogrammetry-tools/) checks the mask count, the topology and the principal-axis extents, and writes the renders.
 
 If OpenMVS fails, retain the completed intermediate files and diagnose stages in increasing order of geometric impact:
 
@@ -442,7 +450,7 @@ The generator expands and smooths the mesh, creates the scroll proxy and combine
 
 Confirm that every input produced three readable, non-empty STLs and one CSV row. Record bounds, connected components, boundary/non-manifold topology, winding consistency, watertightness and visual renders.
 
-The generator uses multiple workers and may finish its parent process even if a worker failed. A zero exit status is therefore insufficient. Require the padded identifier's three expected STLs, a populated `scroll_summary.csv` row, readable finite geometry and sensible assembly renders before accepting the kit.
+The generator uses multiple workers and may finish its parent process even if a worker failed. A zero exit status is therefore insufficient. Require the padded identifier's three expected STLs, a populated `scroll_summary.csv` row, readable finite geometry and sensible assembly renders before accepting the kit. [`photogrammetry-tools/scrollcase_qa.py`](../photogrammetry-tools/) checks these, measures the clearance between the scroll and each half, and writes section and assembly renders.
 
 #### Printing
 
