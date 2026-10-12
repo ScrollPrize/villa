@@ -21,10 +21,13 @@ end, in tile order, one tracer call per z row of tiles. A dot is skipped when it
 (|cos| > 0.8) written fiber, and waits while it is within --batch-spread of a running seed. Every step, for all
 running traces at once, a trace stops
 - at the box (beyond a 4 voxel margin),
+- after --outside-decisions decisions with its head outside the scan (CT value 0: Paris4's CT is 0 beyond the scanned
+  and masked region; a scan without zeros never stops this way),
 - after --stop-decisions decisions with its head within --dedupe of a parallel written fiber ('owned') or of the path
   another running trace laid down in an earlier step ('live'; a seed's two directions ignore each other).
 
-Writing: when both directions of a dot have ended, they form one polyline, cut to the box. A run of more than
+Writing: when both directions of a dot have ended, they form one polyline, cut to the box and to the scan (points at
+CT 0 at either end, and interior runs of more than --outside-gap of them, are removed; outside_ct_cut). A run of more than
 --trim-run points within --dedupe of a parallel written fiber is removed, keeping --overlap points at each side;
 shorter contacts (such as the stretch that stopped a trace) stay. Pieces of at least --min-length points, at most half
 on written fibers, are written, each with its stop reasons and the fibers its ends touch ('links': within --dedupe + 1,
@@ -45,6 +48,8 @@ import argparse
 import json
 import os
 import shutil
+import signal
+import sys
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -85,6 +90,22 @@ def runs(mask):
     """(start, stop) of maximal True runs of a boolean array."""
     m = np.diff(np.concatenate([[0], np.asarray(mask, int), [0]]))
     return list(zip(np.flatnonzero(m == 1), np.flatnonzero(m == -1)))
+
+
+def outside_scan(vol, xyz):
+    """Grid xyz points where the CT is 0 (beyond the scanned/masked region, or beyond the array)."""
+    xyz = np.asarray(xyz, np.float64).reshape(-1, 3)
+    return vol.sample_image_nearest(xyz[:, ::-1]) == 0 if len(xyz) else np.zeros(0, bool)
+
+
+def outside_ct_cut(outside, gap):
+    """Points of a polyline cut as outside the scan: ``outside`` runs at either end, and interior runs longer than
+    ``gap`` points (shorter interior runs, a fiber grazing the scan's edge, stay)."""
+    cut = np.zeros(len(outside), bool)
+    for a, b in runs(outside):
+        if a == 0 or b == len(outside) or b-a > gap:
+            cut[a:b] = True
+    return cut
 
 
 # ---------------------------------------------------------------------------------------------------------- seeds
@@ -203,22 +224,67 @@ def tile_dots(presence_array, lo, hi, args):
 
 # ------------------------------------------------------------------------------------------------------- ownership
 
+class KDForest:
+    """Points with tangents and ids in a few KD-trees of falling size: new points join the small trees (merged while a
+    tree is under ``ratio`` times the new points), so adding never rebuilds the large ones. Trees are built when
+    queried. ``nearest`` gives what one KD-tree over all the points would: the k nearest within the radius over
+    every tree, by distance (equal up to exact distance ties)."""
+
+    def __init__(self, ratio=4):
+        self.ratio = ratio
+        self.segments = []  # [(tree, points, tangents, ids)], sizes falling
+        self.pending = []  # [(points, tangents, ids)] not in a tree yet
+        self.n = 0
+
+    def add(self, pts, tan, ids):
+        self.pending.append((pts, tan, ids))
+        self.n += len(pts)
+
+    def _trees(self):
+        if self.pending:
+            new = [np.concatenate([q[c] for q in self.pending]) for c in range(3)]
+            self.pending = []
+            while self.segments and len(self.segments[-1][1]) < self.ratio*len(new[0]):
+                _, p, t, i = self.segments.pop()
+                new = [np.concatenate([p, new[0]]), np.concatenate([t, new[1]]), np.concatenate([i, new[2]])]
+            self.segments.append((cKDTree(new[0]), *new))
+        return self.segments
+
+    def nearest(self, pts, radius, k=16):
+        """(distances, tangents, ids) of the min(k, n) nearest points within ``radius`` per query point, nearest
+        first (distance inf where fewer are within the radius)."""
+        ds, ts, ids = [], [], []
+        for tree, _, tan, fid in self._trees():
+            d, j = tree.query(pts, k=min(k, tree.n), distance_upper_bound=radius)
+            d, j = d.reshape(len(pts), -1), j.reshape(len(pts), -1)
+            jj = np.where(np.isfinite(d), j, 0)
+            ds.append(d)
+            ts.append(tan[jj])
+            ids.append(fid[jj])
+        if len(ds) == 1:
+            return ds[0], ts[0], ids[0]
+        d, t, i = np.concatenate(ds, 1), np.concatenate(ts, 1), np.concatenate(ids, 1)
+        order = np.argsort(d, 1, kind='stable')[:, :min(k, self.n)]
+        rows = np.arange(len(pts))[:, None]
+        return d[rows, order], t[rows, order], i[rows, order]
+
+
 class Owned:
-    """Written fibers: points with tangents and fiber ids. Recent additions sit in one small KD-tree; past --merge
-    points they move into per-bin (--tile) KD-trees, so frequent writes never rebuild the large trees."""
+    """Written fibers: points with tangents and fiber ids. Recent additions sit in a small KD-forest; past --merge
+    points they move into per-bin (--tile) KD-forests, so frequent writes never rebuild the large trees."""
 
     def __init__(self, bin_size, merge=50000):
         self.bin, self.merge = float(bin_size), merge
-        self.parts = defaultdict(list)  # bin -> [(points, tangents, ids)]
-        self.trees = {}
+        self.bins = defaultdict(KDForest)  # bin -> its flushed points
         self.recent = []  # [(points, tangents, ids)]
-        self.recent_tree = None
+        self.recent_forest = KDForest()
         self.recent_n = 0
 
     def add(self, path, fid):
-        self.recent.append((np.asarray(path, np.float64), tangents(path), np.full(len(path), fid)))
+        entry = (np.asarray(path, np.float64), tangents(path), np.full(len(path), fid))
+        self.recent.append(entry)
+        self.recent_forest.add(*entry)
         self.recent_n += len(path)
-        self.recent_tree = None
         if self.recent_n > self.merge:
             self.flush()
 
@@ -228,41 +294,23 @@ class Owned:
             uniq, inverse = np.unique(keys, axis=0, return_inverse=True)
             for k, key in enumerate(map(tuple, uniq)):
                 m = inverse.ravel() == k
-                self.parts[key].append((p[m], t[m], ids[m]))
-                self.trees.pop(key, None)
-        self.recent, self.recent_n, self.recent_tree = [], 0, None
-
-    def _bin_tree(self, key):
-        if key not in self.trees:
-            parts = self.parts.get(key)
-            self.trees[key] = None if not parts else (
-                cKDTree(np.concatenate([q[0] for q in parts])), np.concatenate([q[1] for q in parts]),
-                np.concatenate([q[2] for q in parts]))
-        return self.trees[key]
-
-    def _recent(self):
-        if self.recent_tree is None and self.recent:
-            self.recent_tree = (cKDTree(np.concatenate([q[0] for q in self.recent])),
-                                np.concatenate([q[1] for q in self.recent]), np.concatenate([q[2] for q in self.recent]))
-        return self.recent_tree
+                self.bins[key].add(p[m], t[m], ids[m])
+        self.recent, self.recent_n, self.recent_forest = [], 0, KDForest()
 
     @staticmethod
-    def _nearest(entry, pts, dirs, radius, exclude, best, out, rows=None, k=16):
-        tree, tan, ids = entry
+    def _nearest(forest, pts, dirs, radius, exclude, best, out, rows=None, k=16):
         rows = np.arange(len(pts)) if rows is None else rows
-        d, j = tree.query(pts[rows], k=min(k, tree.n), distance_upper_bound=radius)
-        d, j = d.reshape(len(rows), -1), j.reshape(len(rows), -1)
+        d, tan, ids = forest.nearest(pts[rows], radius, k)
         ok = np.isfinite(d)
-        jj = np.where(ok, j, 0)
-        ok &= np.abs(np.einsum('nkj,nj->nk', tan[jj], dirs[rows])) > PARALLEL
+        ok &= np.abs(np.einsum('nkj,nj->nk', tan, dirs[rows])) > PARALLEL
         if exclude is not None:
-            ok &= ids[jj] != exclude[rows][:, None]
+            ok &= ids != exclude[rows][:, None]
         d = np.where(ok, d, np.inf)
         a = np.argmin(d, 1)
         dm = d[np.arange(len(rows)), a]
         better = dm < best[rows]
         best[rows[better]] = dm[better]
-        out[rows[better]] = ids[jj[np.arange(len(rows)), a]][better]
+        out[rows[better]] = ids[np.arange(len(rows)), a][better]
 
     def owner(self, pts, dirs, radius, exclude=None):
         """Per point: id of the nearest parallel written fiber within ``radius`` (``exclude``: an id per point to
@@ -273,10 +321,9 @@ class Owned:
         out, best = np.full(len(pts), -1), np.full(len(pts), np.inf)
         if not len(pts):
             return out
-        recent = self._recent()
-        if recent is not None:
-            self._nearest(recent, pts, dirs, radius, exclude, best, out)
-        if self.parts:
+        if self.recent_n:
+            self._nearest(self.recent_forest, pts, dirs, radius, exclude, best, out)
+        if self.bins:
             lo = np.floor((pts-radius)/self.bin).astype(int)
             hi = np.floor((pts+radius)/self.bin).astype(int)
             groups = defaultdict(list)
@@ -293,9 +340,9 @@ class Owned:
                             for z in range(a[2], b[2]+1)):
                     groups[key].append(int(i))
             for key, rows in groups.items():
-                entry = self._bin_tree(key)
-                if entry is not None:
-                    self._nearest(entry, pts, dirs, radius, exclude, best, out, np.asarray(rows))
+                forest = self.bins.get(key)
+                if forest is not None:
+                    self._nearest(forest, pts, dirs, radius, exclude, best, out, np.asarray(rows))
         return out
 
 
@@ -424,6 +471,46 @@ def seed_headings(vol, dots, pool):
     return out, keep
 
 
+_TILE_PRESENCE = None
+
+
+def _tile_worker_init(presence_path):
+    global _TILE_PRESENCE
+    _TILE_PRESENCE = zarr.open(presence_path, mode='r')
+
+
+def _tile_dots(task):
+    lo, hi, args = task
+    return tile_dots(_TILE_PRESENCE, lo, hi, args)
+
+
+class TilePrefetch:
+    """tile_dots of the coming tiles in worker processes, up to ``depth`` tiles ahead of the one read (the same
+    function on the same presence: the same dots as in the main process)."""
+
+    def __init__(self, presence_path, args, tiles, workers, depth):
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+        self.pool = ProcessPoolExecutor(workers, mp_context=multiprocessing.get_context('spawn'),
+                                        initializer=_tile_worker_init, initargs=(presence_path,))
+        self.args, self.depth = args, depth
+        self.order = [t for t in tiles if t['weight'] > 0]  # the tiles with presence, in reading order
+        self.index = {t['name']: k for k, t in enumerate(self.order)}
+        self.futures = {}
+        self.submitted = 0
+
+    def get(self, tile):
+        k = self.index[tile['name']]
+        while self.submitted < min(len(self.order), k+1+self.depth):
+            t = self.order[self.submitted]
+            self.futures[t['name']] = self.pool.submit(_tile_dots, (t['lo'], t['hi'], self.args))
+            self.submitted += 1
+        return self.futures.pop(tile['name']).result()
+
+    def close(self):
+        self.pool.shutdown(cancel_futures=True)
+
+
 class Streamer:
     """Feeds tile dots to one streaming tracer call, stops traces each step, writes each dot when both directions end."""
 
@@ -437,6 +524,7 @@ class Streamer:
         self.pairs = {}  # pair -> dict(tile, seed, family, plane, halves, reasons)
         self.prev = {}  # row -> previous head
         self.streak = defaultdict(int)
+        self.outside_streak = defaultdict(int)
         self.live = LivePaths(args.dedupe)
         self.step = 0
         self.row_count = 0
@@ -444,13 +532,19 @@ class Streamer:
         self.finished_tiles = []
         self.read_weight = 0  # presence weight of the tiles read (their dots started or queued)
         self.timing = defaultdict(float)  # seconds in feed (incl. tile reads), per-step checks, writes
+        self.prefetch = None  # TilePrefetch, else tiles are read in the main process
 
     # -- tiles
     def _read_next_tile(self):
         tile = self.tiles[self.cursor]
         self.cursor += 1
         t0 = time.time()
-        dots = tile_dots(self.presence, tile['lo'], tile['hi'], self.args) if tile['weight'] > 0 else None
+        if tile['weight'] <= 0:
+            dots = None
+        elif self.prefetch is not None:
+            dots = self.prefetch.get(tile)
+        else:
+            dots = tile_dots(self.presence, tile['lo'], tile['hi'], self.args)
         tile.update(dots=dots, pending=list(range(len(dots['xyz']))) if dots is not None else [], running=0,
                     pieces=[], stats=defaultdict(int), t0=t0)
         self.read_weight += tile['weight']
@@ -564,15 +658,20 @@ class Streamer:
         dirs = frames[:, :, 2]
         stops = {}
         outside = np.any(pos < self.lo-BOX_MARGIN, 1) | np.any(pos > self.hi+BOX_MARGIN, 1)
+        unscanned = outside_scan(self.vol, pos)
         pair = np.array([self.rows[i][0] for i in idx])
         near = (self.owned.owner(pos, dirs, args.dedupe) >= 0) | self.live.hits(pos, dirs, pair, self.step)
         prev = np.array([self.prev[i] for i in idx])
         self.live.add(prev, pos, pair, self.step)
         for i, p in zip(idx, pos):
             self.prev[i] = p
-        for i, out_, nr in zip(idx, outside, near):
+        for i, out_, nr, un in zip(idx, outside, near, unscanned):
             if out_:
                 stops[int(i)] = 'bounds'
+                continue
+            self.outside_streak[i] = self.outside_streak[i]+1 if un else 0
+            if self.outside_streak[i] >= args.outside_decisions:
+                stops[int(i)] = 'outside_ct'
                 continue
             self.streak[i] = self.streak[i]+1 if nr else 0
             if self.streak[i] >= args.stop_decisions:
@@ -590,6 +689,7 @@ class Streamer:
         pair, half = self.rows.pop(i)
         self.prev.pop(i, None)
         self.streak.pop(i, None)
+        self.outside_streak.pop(i, None)
         info = self.pairs[pair]
         info['halves'][half] = path
         info['reasons'][half] = reason
@@ -607,7 +707,8 @@ class Streamer:
         fw, bw = info['halves'][0], info['halves'][1]
         poly = np.concatenate([bw[::-1], fw[1:]])  # backward reversed, then forward
         info['tile']['stats']['traced_vox'] += int(arclength(poly)[-1]) if len(poly) > 1 else 0
-        inside = np.all((poly >= self.lo) & (poly <= self.hi), 1)
+        inside = np.all((poly >= self.lo) & (poly <= self.hi), 1) & \
+            ~outside_ct_cut(outside_scan(self.vol, poly), args.outside_gap)
         new = []
         for a, b in runs(inside):
             part = poly[a:b]
@@ -715,6 +816,10 @@ def main(argv=None):
     ap.add_argument('--batch-spread', type=float, default=16., help='min distance of a new dot from running seeds')
     ap.add_argument('--dedupe', type=float, default=2., help='same-fiber radius, grid voxels')
     ap.add_argument('--stop-decisions', type=int, default=3)
+    ap.add_argument('--outside-decisions', type=int, default=2,
+                    help='a trace stops after this many decisions with its head at CT 0 (outside the scan)')
+    ap.add_argument('--outside-gap', type=int, default=16,
+                    help='interior runs of more than this many points at CT 0 are cut from written fibers (end runs always)')
     ap.add_argument('--overlap', type=int, default=16, help='points kept on each side of a removed overlap')
     ap.add_argument('--trim-run', type=int, default=24, help='overlaps longer than this many points are removed')
     ap.add_argument('--min-length', type=int, default=48, help='points (grid voxels) per written fiber')
@@ -730,6 +835,9 @@ def main(argv=None):
     ap.add_argument('--forward-chunk', type=int, default=128)
     ap.add_argument('--axis-workers', type=int, default=8,
                     help='worker processes for continuation crop axes and seed headings (at least 1)')
+    ap.add_argument('--tile-workers', type=int, default=3,
+                    help='worker processes reading the coming tiles\' seed dots ahead (0: read in the main process)')
+    ap.add_argument('--tile-ahead', type=int, default=8, help='tiles with presence read ahead by the tile workers')
     ap.add_argument('--sampling-seed', type=int, default=0)
     ap.add_argument('--cache-dir')
     ap.add_argument('--no-json', dest='json', action='store_false')
@@ -743,6 +851,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if args.axis_workers < 1:
         raise SystemExit('--axis-workers must be at least 1 (seed headings run in worker processes)')
+    # SIGTERM exits through the finally below, which shuts down the axis worker processes (else they are orphaned)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     out = Path(args.out)
     (out/'tiles').mkdir(parents=True, exist_ok=True)
     tracer, vol, spec, policy = build_tracer(args)
@@ -764,7 +874,7 @@ def main(argv=None):
         old = json.loads(run_json.read_text())
         # settings that only change speed or reporting may differ on resume
         speed_only = ('device', 'status_every', 'rows', 'min_feed', 'open_tiles', 'max_open', 'forward_chunk', 'gpu_chunks',
-                      'axis_workers', 'afv', 'afv_template')  # speed or the end-of-run export only
+                      'axis_workers', 'tile_workers', 'tile_ahead', 'afv', 'afv_template')  # speed or the end-of-run export only
         changed = [k for k in record if k not in speed_only and old.get(k) != record[k]]
         if changed:
             raise SystemExit(f'{out} holds a run with different settings: {changed}')
@@ -805,11 +915,13 @@ def main(argv=None):
                 traced_total += line.get('traced_vox', 0)
                 fibers_total += line['fibers']
     w_run = w_bands = 0
+    prefetch = TilePrefetch(args.presence, args, todo, args.tile_workers, args.tile_ahead) if args.tile_workers else None
     try:
         for z in sorted({float(t['lo'][2]) for t in todo}):  # one streaming tracer call per z row of tiles
             band = [t for t in todo if float(t['lo'][2]) == z]
             st = Streamer(tracer, vol, owned, lo, hi, args, out, spec, provenance, next_id, band)
             st.presence = presence
+            st.prefetch = prefetch
 
             t_band = time.time()
 
@@ -864,6 +976,8 @@ def main(argv=None):
         tracer.close()
         if getattr(tracer, 'axis_pool', None) is not None:
             tracer.axis_pool.shutdown()
+        if prefetch is not None:
+            prefetch.close()
 
 
 if __name__ == '__main__':
