@@ -4,8 +4,8 @@ Seeds are unchanged base-voxel ``x,y,z`` (the fiber JSON coordinate space).
 CT plus the supplied H/V family initializes each bidirectional trace. Every seed
 gets a status record in ``seeds.json``: exported, seed-only (no committed
 point), CT-unavailable, deduplicated or filtered by an explicit ``--min-length``.
-The checkpoint's operating policy is used unless ``--confidence``/``--n-commit``
-or a calibration ``--policy`` overrides it. ``--refit-retry`` (off by default) lets a decision that would stop on
+The checkpoint's operating policy is used, with confidence 0.5 unless ``--confidence`` (or a calibration
+``--policy``) sets it; ``--n-commit``/``--gate`` override the rest. ``--refit-retry`` (off by default) lets a decision that would stop on
 confidence retry once with its crop refit to its own prediction.
 
   python -m vesuvius.neural_tracing.tracers.fibers.tracing.inference \
@@ -34,6 +34,9 @@ from vesuvius.neural_tracing.tracers.shared.ct_structure import SeedHeadingError
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import trace_family_kwargs
 from vesuvius.neural_tracing.tracers.fibers.tracing.runtime import (
     add_checkpoint_argument, add_volume_arguments, checkpoint_source, configure_volume, resolve_checkpoint, use_gpu_crops)
+
+
+DEFAULT_CONFIDENCE = 0.5  # a3ms 50k (scrollprize/fiber_single_small): usable 0.3-0.5, its confidence collapses above 0.6
 
 
 def make_fiber_json(points_base_xyz: np.ndarray, cp_every: float, meta: dict) -> dict:
@@ -185,7 +188,9 @@ def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=FiberTrac
                     help="skip seeds within this base-voxel distance of an already-written trace")
     ap.add_argument("--cp-every", type=float, default=800.0, help="control-point spacing, base voxels")
     ap.add_argument("--max-len", type=float, default=6000.0, help="per-direction limit, trace-grid voxels")
-    ap.add_argument("--confidence", type=float, help="default: the checkpoint operating policy")
+    ap.add_argument("--confidence", type=float,
+                    help=f"stop threshold (default: --policy's, else {DEFAULT_CONFIDENCE}, the held-out eval's "
+                         "accuracy-first operating point for the default model; volume.py and service.py use the same)")
     ap.add_argument("--n-commit", type=int, help="max points committed per decision (default: checkpoint operating policy)")
     ap.add_argument("--gate", choices=('full', 'prefix'), help="commit gate (default: checkpoint operating policy)")
     ap.add_argument("--policy", help="calibration selection.json with the operating policy to deploy")
@@ -222,6 +227,7 @@ def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=FiberTrac
         confidence = selected['confidence'] if confidence is None else confidence
         n_commit = selected['n_commit'] if n_commit is None else n_commit
         gate = selected.get('gate') if gate is None else gate
+    confidence = DEFAULT_CONFIDENCE if confidence is None else confidence
     policy = checkpoint_policy(ck, model.cfg, confidence=confidence, n_commit=n_commit, gate=gate)
     from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import prepare_normalization
     prepare_normalization(args.out, [spec], known=ck['ct_normalization'])

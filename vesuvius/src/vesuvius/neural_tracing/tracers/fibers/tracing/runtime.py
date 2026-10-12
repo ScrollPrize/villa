@@ -3,7 +3,7 @@ their resolution on this machine, and GPU crops.
 
 Checkpoint (``--checkpoint``): a local file, or a Hugging Face model repo ``ORG/NAME`` (also ``hf://ORG/NAME``, with
 ``@REVISION`` for a branch, tag or commit; default ``DEFAULT_CHECKPOINT``), downloaded into the Hugging Face cache
-(``$HF_HOME``). The repo holds the follower checkpoint (``ckpt_final.pt``, else its only non-frame ``.pt``) and its
+(``$HF_HOME``). The repo holds the follower checkpoint (``ckpt_final.pt``, else its only non-frame ``.pt``, e.g. ``last.pt``) and its
 frame model (``heading_model.pt`` or ``frame_model.pt``) next to it.
 
 A checkpoint records where it was trained: its CT (``vol_spec``: store, level, scales, chunk cache folder) and its
@@ -22,7 +22,7 @@ from pathlib import Path
 
 from vesuvius.neural_tracing.tracers.shared.hub import checkpoint_source, hf_repo, hub_folder  # noqa: F401 (re-exported)
 
-DEFAULT_CHECKPOINT = 'scrollprize/single_fiber_tiny'
+DEFAULT_CHECKPOINT = 'scrollprize/fiber_single_small'
 FOLLOWER_NAME = 'ckpt_final.pt'
 FRAME_NAMES = ('frame_model.pt', 'heading_model.pt')
 

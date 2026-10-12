@@ -96,9 +96,9 @@ Everything a trace needs comes from the follower checkpoint: the model, its oper
 normalization) and its learned frame model. Coordinates are base voxels (the CT's level 0), as in VC3D fiber JSON.
 
 `--checkpoint` is a file or a Hugging Face model repo (`ORG/NAME`, optionally `@REVISION`); by default it is
-[`scrollprize/single_fiber_tiny`](https://huggingface.co/scrollprize/single_fiber_tiny), downloaded with its frame model
-into the Hugging Face cache on first use. A repo holds the follower as `ckpt_final.pt` and its frame model as
-`heading_model.pt`. Runs record the repo commit they used.
+[`scrollprize/fiber_single_small`](https://huggingface.co/scrollprize/fiber_single_small), downloaded with its frame
+model into the Hugging Face cache on first use. A repo holds the follower as `ckpt_final.pt` (else its only other
+`.pt`, e.g. `last.pt`) and its frame model as `heading_model.pt`. Runs record the repo commit they used.
 
 On a machine other than the one that trained it (`tracing/runtime.py`):
 - **Frame model**: for a checkpoint file, put the frame checkpoint next to it, under its recorded file name or as

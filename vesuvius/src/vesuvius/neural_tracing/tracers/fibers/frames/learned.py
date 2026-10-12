@@ -21,7 +21,7 @@ from vesuvius.neural_tracing.tracers.fibers.frames.ct import (
     reframe_item, frame_prefetch_bounds, heading_free_bounds, normal_context)
 from vesuvius.neural_tracing.tracers.shared.reference import observed_path
 
-DEFAULT_FRAME_CHECKPOINT = str(Path(__file__).resolve().parents[1]/'output'/'heading_model_l0_w16_centered_frame'/'ckpt_064000.pt')
+DEFAULT_FRAME_CHECKPOINT = str(Path(__file__).resolve().parents[1]/'output'/'heading_model_l0_w16_centered_frame'/'heading_model.pt')
 
 
 def bind_frame_checkpoint(cfg, path):
