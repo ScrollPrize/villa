@@ -1,5 +1,13 @@
 # Reference-selected regional solve
 
+Current follow-up: stop balanced baseline suite; test10x and0.1xstateLR for
+fresh/reference10k each, widthLR2unchanged, same weighted objective. Report
+every1k includingwidthfactor. Plan uv_class_balance_plan.md.
+
+Current: balanced parallel/perpendicular event costs, total ratio1:10, enable
+fixed sign charge. Implement/test, then matched fresh/reference10k trials.
+See uv_class_balance_plan.md.
+
 Current: userclarified10000totalpasses bothfresh/ref positions5–11,
 reportevery1000passes. PreservecontinuousAdam byreproducingoriginalstarts.
 

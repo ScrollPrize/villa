@@ -1,5 +1,14 @@
 # Reference-selected regional solve
 
+## Balanced classes and fixed sign charge
+- [x] Plan exact graph-wide10:1 aggregate class weighting.
+- [x] Independent plan/code review and implementation;47 focused tests passed.
+- [x] 80 regression tests and charged compiled six-GPU validation.
+- [x] Fresh10k complete; reference stopped by user after2k diagnostic. Logged.
+- [x] Reviewed10x/0.1xstateLR four-trial configs and launched approved suite.
+- [x] All four LR trials complete; finite states, CUDA checks and released lease.
+- [x] Full tables including widths/ranges in uv_class_balance_lr_results.md.
+
 ## Positions5–11,10000totalpasses
 - [x] Derive10080updates and1008updatediagnostics,unchangedsettings.
 - [x] Independent config review approved; launched approved suite.

@@ -2,6 +2,12 @@
 
 ## 2026-10-12
 
+- Added opt-in graph-count-balanced parallel/perpendicular event losses,
+  applying weights to all event terms and preserving old configurations.
+  Trialed aggregate perpendicular:parallel10:1 withfixedsigncharge32, then
+  matched10x/0.1xstateLR fresh/reference10k trials.80CPUtests andchargedcompiled
+  sixGPUgradientpreflights passed. Fullresults:uv_class_balance_lr_results.md.
+
 - Completed fresh/reference regional positions5–11 joint solves to10k total
   sampled passes. Full1k checkpoint tables, timings and exact sign-loss weights:
   uv_reference_5_11_10000_results.md. Both reproduce previous1k metrics exactly;

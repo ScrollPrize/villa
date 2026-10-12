@@ -1,5 +1,7 @@
 # Global fiber SGD: data reconnaissance
 
+Current: uv_class_balance_plan.md; supersedes prior completed regional trials.
+
 Current: uv_reference_subset_plan.md. Older entries below are historical.
 
 Current: uv_diagnostics_100_plan.md (independently approved).

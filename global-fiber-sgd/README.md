@@ -1,5 +1,12 @@
 # Global fiber assignment with PyTorch SGD
 
+Latest: [balanced-objective 10x/0.1x state-LR comparison](uv_class_balance_lr_results.md).
+Four10k trials, full1kcheckpointtables includingwidths/ranges. HighLRhelpsfresh;
+lowLRreference retainsmoreandhaslowerL1. Width-decoupling discussed,notimplemented.
+
+Current experiment: [balanced perpendicular-dominant losses and fixed sign charge](uv_class_balance_results.md).
+Latest completed baseline: [10k-pass regional fresh/reference solves](uv_reference_5_11_10000_results.md).
+
 Latest: [positions5–11,1000-pass results and visualization](uv_reference_5_11_1000_results.md).
 Fresh/ref sixGPU solves, complete100passcheckpointtables and1000px LZW TIFF,
 SVG/PDF maps; unchangedsolver/settings from100passregionalbenchmark.

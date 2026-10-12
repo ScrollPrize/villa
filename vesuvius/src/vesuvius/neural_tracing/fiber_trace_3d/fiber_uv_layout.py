@@ -510,6 +510,28 @@ def proposal_weights(in_active,event_count,active_count,fraction):
     return 1/((1-fraction)+fraction*(event_count/active_count)*in_active)
 
 
+def constraint_class_weights(parallel,config):
+    """Full-graph weights: equal class means, then a relative perpendicular weight.
+
+    Mean weight is one. Never estimate class frequencies from minibatches or
+    individual GPU shards. Absent classes consume no share of the objective.
+    """
+    parallel=np.asarray(parallel,dtype=bool)
+    if parallel.ndim!=1:raise ValueError('Constraint classes must be one-dimensional')
+    if not config.get('constraint_class_balance',False):
+        return np.ones(len(parallel),dtype=np.float32)
+    if config.get('assignment_update')=='cost_target':
+        raise ValueError('Class balancing is not supported by cost_target updates')
+    relative=float(config.get('perpendicular_relative_weight',1.))
+    if not math.isfinite(relative) or relative<=0:
+        raise ValueError('perpendicular_relative_weight must be finite and positive')
+    counts=np.bincount(parallel.astype(np.int64),minlength=2)
+    shares=np.array([relative,1.]);shares[counts==0]=0
+    if not len(parallel):return np.empty(0,dtype=np.float32)
+    weights=len(parallel)*shares/(shares.sum()*np.maximum(counts,1))
+    return weights[parallel.astype(np.int64)].astype(np.float32)
+
+
 def draw_events(event_count,batch,active,mask,fraction,device,generator=None):
     import torch
     edges=torch.randint(event_count,(batch,),device=device,generator=generator)
@@ -835,6 +857,8 @@ def solve(config):
         from .fiber_uv_pair_benchmark import benchmark
         return benchmark(config)
     if config.get('assignment_update')=='cost_target':
+        if config.get('constraint_class_balance',False):
+            raise ValueError('Class balancing is not supported by cost_target updates')
         from .fiber_uv_categorical import solve_categorical
         return solve_categorical(config)
     validate_joint_rejection(config)
@@ -856,6 +880,8 @@ def solve(config):
         torch.manual_seed(config.get('seed',0))
     with np.load(config['tensor_cache']) as archive:d={key:archive[key] for key in archive.files}
     device=f'cuda:{rank}';data=_tensor_data(d,device)
+    class_weights=constraint_class_weights(d['parallel'],config)
+    class_weights_device=torch.as_tensor(class_weights,device=device)
     generator=(torch.Generator(device=device).manual_seed(config.get('seed',0))
                if distributed or config.get('sampling_generator',False) else None)
     n=len(d['family']);k=int(config.get('winding_count',100));root=Path(config['output_root']);root.mkdir(parents=True,exist_ok=True)
@@ -1012,6 +1038,8 @@ def solve(config):
                 if distributed:
                     edges=shard(edges,rank,world);event_weights=shard(event_weights,rank,world)
             i=data['i'][edges];j=data['j'][edges]
+            if config.get('constraint_class_balance',False):
+                event_weights=event_weights*class_weights_device[edges]
             pa,ua,va,qa=coords(i,data['ds_a'][edges],widths,bounds)
             pb,ub,vb,qb=coords(j,data['ds_b'][edges],widths,bounds)
             charge=selected=None
@@ -1116,6 +1144,11 @@ def solve(config):
         measured=np.isfinite(reference_interval_widths(config,np.arange(k)))
         summary['initialization'].update(reference_width_intervals=int(measured.sum()),
             radial_fallback_width_intervals=int((~measured).sum()),width_prior='unchanged radial target')
+    summary['constraint_weighting']={name:dict(count=int(mask.sum()),
+        per_event=float(class_weights[mask][0]) if mask.any() else None,
+        aggregate_share=float(class_weights[mask].sum(dtype=np.float64)/max(len(class_weights),1)))
+        for name,mask in [('parallel',d['parallel'].astype(bool)),
+                          ('perpendicular',~d['parallel'].astype(bool))]}
     if benchmark_updates is not None:
         torch.cuda.synchronize()
         ms=([max(values) for values in zip(*(s['milliseconds'] for s in distributed_stats))]

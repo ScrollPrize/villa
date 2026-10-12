@@ -91,16 +91,30 @@ def validate_joint_gradient(config,rank,world,device=None):
     zeros=torch.zeros(n,device=device)
     table=torch.as_tensor(uv.make_distance_table(2.,config.get('distance_sigma',.5)),device=device)
     cfg=dict(config,distance_objective='squared',coordinate_backend='combined')
-    def loss(emb,r,sel):
+    event_weights=torch.as_tensor(uv.constraint_class_weights(
+        [index%3!=0 for index in range(b)],cfg),device=device)
+    evaluate=uv.pair_evaluator(cfg) if cfg.get('constraint_class_balance') else uv.pair_objective
+    def loss(emb,r,sel,compiled=False):
         widths,bounds=uv.width_boundaries(r)
         ia,ib=i[sel],j[sel]
         sa,sb=emb(ia),emb(ib)
         ua,va,qa=uv.coordinates(sa,phase[ia],zeros[ia],families[ia],zeros[ia]+13,widths,bounds,'combined',config.get('coordinate_division','standard'))
         ub,vb,qb=uv.coordinates(sb,phase[ib],zeros[ib],families[ib],zeros[ib]-17,widths,bounds,'combined',config.get('coordinate_division','standard'))
         pa,pb=sa[:,:k+1].softmax(-1)[:,:k],sb[:,:k+1].softmax(-1)[:,:k]
-        return uv.pair_objective(pa,pb,qa,qb,va,vb,phase[ib]-phase[ia],families[ib]-families[ia],
-            torch.ones_like(phase[ia]),torch.ones_like(phase[ia]),table,cfg)+.01*uv.continuation_likelihood(pa,pb,ua,ub,va,vb,128.)
-    loss(weight,raw,shard(torch.arange(b,device=device),rank,world)).backward()
+        charge=selected=None
+        if cfg.get('sign_charge_multiplier',0)>0:
+            ones=torch.ones_like(phase[ia])
+            charge=uv.calibrated_sign_charge(ones,ones,1.,b,n,
+                cfg.get('rejection_cost',10.),cfg['sign_charge_multiplier'],
+                cfg.get('rejection_weighting','fixed'))
+            selected=uv.selected_ordering(sa,sb,phase[ia],phase[ib],zeros[ia],zeros[ib],
+                families[ia],families[ib],zeros[ia]+13,zeros[ib]-17,widths,
+                phase[ib]-phase[ia],ones)
+        evaluator=evaluate if compiled else uv.pair_objective
+        return evaluator(pa,pb,qa,qb,va,vb,phase[ib]-phase[ia],families[ib]-families[ia],
+            torch.ones_like(phase[ia]),torch.ones_like(phase[ia]),table,cfg,charge,
+            event_weights[sel],selected)+.01*uv.continuation_likelihood(pa,pb,ua,ub,va,vb,128.)
+    loss(weight,raw,shard(torch.arange(b,device=device),rank,world),True).backward()
     reducer.reduce(weight.weight,raw)
     loss(reference,rraw,torch.arange(b,device=device)).backward()
     a,c=weight.weight.grad.coalesce(),reference.weight.grad.coalesce()
