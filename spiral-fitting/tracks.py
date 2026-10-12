@@ -233,17 +233,26 @@ def _db_signatures_match(stored, expected):
     copies routinely lose the sub-second part of mtime (HTTP Last-Modified has
     one-second resolution), which made every cache shipped alongside a dataset
     look stale after download even though name and size matched. Name and size
-    must match exactly; mtime must match at whole-second resolution.
+    must match exactly. mtime must match exactly, except that when one side is
+    a whole second (a copy that dropped the sub-second part) the seconds must
+    match. Two nanosecond mtimes still have to agree, so an edit within the
+    same second on a local file is still detected.
     """
     if not isinstance(stored, list) or len(stored) != len(expected):
         return False
-    for item, want in zip(stored, expected):
-        if not isinstance(item, (list, tuple)) or len(item) != 3:
-            return False
-        if item[0] != want[0] or int(item[1]) != int(want[1]):
-            return False
-        if int(item[2]) != int(want[2]) and int(item[2]) // 1_000_000_000 != int(want[2]) // 1_000_000_000:
-            return False
+    try:
+        for item, want in zip(stored, expected):
+            if not isinstance(item, (list, tuple)) or len(item) != 3:
+                return False
+            if item[0] != want[0] or int(item[1]) != int(want[1]):
+                return False
+            have, need = int(item[2]), int(want[2])
+            if have != need:
+                truncated = have % 1_000_000_000 == 0 or need % 1_000_000_000 == 0
+                if not truncated or have // 1_000_000_000 != need // 1_000_000_000:
+                    return False
+    except (TypeError, ValueError):
+        return False                        # malformed metadata (e.g. null entries): treat as stale
     return True
 
 
@@ -438,7 +447,7 @@ def _packed_store_if_current(path):
         if metadata.get('version') != TRACK_STORE_VERSION:
             return None
         expected = [list(item) for item in _tracks_db_signature(path)]
-        if metadata.get('source_db_signature') != expected:
+        if not _db_signatures_match(metadata.get('source_db_signature'), expected):
             return None
         return store
     except (OSError, ValueError, KeyError, json.JSONDecodeError):
