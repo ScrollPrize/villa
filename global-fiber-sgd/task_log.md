@@ -36,3 +36,9 @@ Matches original saved-event analysis and previous solve exactly (floating
 summation tolerance for L1). First perturbation distance_weight .25->.125
 running; distributed gradient/coordinate validations passed. Search ongoing,
 not converged. Implemented search/scorer commit f1bcf1e2f.
+
+User requested continued iteration. Controller never stopped (PID654446).
+First accepted distance_weight .25->.125: L1 .4981992495, coverage82.9844%,
+retained80.4114%, loss12.175396,widthfactor .979491. Distance .5 and sign20/80
+did not beat incumbent. Continuing automated revisit loop, not a new solve or
+duplicate controller. No convergence claimed.

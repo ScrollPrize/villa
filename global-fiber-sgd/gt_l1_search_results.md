@@ -10,8 +10,11 @@ from objective but reported; changes in coverage can improve L1.
 | Run | Enabled GT L1 | GT event coverage | Retained length | Spiral L1 | Width factor | Online loss | Solve s |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | Corrected fresh baseline | .577787 | 80.4603% | 79.3598% | .946903 | .900953 | 12.386964 | 184.87 |
+| Accept distance_weight .25 → .125 | .498199 | 82.9844% | 80.4114% | .921080 | .979491 | 12.175396 | 167.09 |
 
 Baseline parallel/perpendicular L1 .574301/.607163;5419enabled events, offset-2.
+First acceptance parallel/perpendicular .495481/.521719;5589enabled, offset-2.
+Both higher and lower sign weights failed to improve it. Search remains active.
 Matches original saved solve.39CPUtests pass; distributed6GPU gradient and
 coordinate checks pass. Search active, first change distance_weight .25->.125.
 
