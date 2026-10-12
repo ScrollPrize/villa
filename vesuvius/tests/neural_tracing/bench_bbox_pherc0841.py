@@ -13,10 +13,12 @@ Dependencies: numpy, tifffile, tqdm
 from __future__ import annotations
 
 import argparse
+import cProfile
 import hashlib
 import importlib.util
 import json
 import platform
+import pstats
 import statistics
 import subprocess
 import sys
@@ -151,12 +153,34 @@ def summarize_seconds(samples):
     }
 
 
+def cpu_hotspots(module, points, overlap, crop_size):
+    """One separate cProfile run; do not use its wall time for speedup."""
+    profiler = cProfile.Profile()
+    profiler.enable()
+    module._generate_segment_cover_records(
+        points, crop_size, overlap=overlap, prune_bboxes=True,
+        band_workers=1, show_progress=False,
+    )
+    profiler.disable()
+    stats = pstats.Stats(profiler)
+    records = []
+    for (filename, line, func), (_primitive_calls, calls, self_s, cum_s, _) in stats.stats.items():
+        if filename.endswith("generate_segment_cover_bboxes.py"):
+            records.append({"function": func, "line": line,
+                            "calls": calls, "self_s": round(self_s, 4),
+                            "cumulative_s": round(cum_s, 4)})
+    records.sort(key=lambda item: item["cumulative_s"], reverse=True)
+    return records[:18]
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--repeats", type=int, default=4,
                         help="Even number of paired trials per case (default: 4)")
     parser.add_argument("--window", choices=("A", "B", "both"), default="both")
     parser.add_argument("--overlap", choices=("0.0", "0.5", "both"), default="both")
+    parser.add_argument("--profile", action="store_true",
+                        help="After timing, cProfile old/new generators separately on first selected case")
     parser.add_argument("--crop-size", type=int, nargs=3, default=CROP, metavar=("Z", "Y", "X"),
                         help="3D input crop. Official Copy checkpoint currently specifies 128 384 384")
     parser.add_argument("--baseline", default=DEFAULT_BASELINE,
@@ -248,6 +272,18 @@ def main(argv=None):
             )
             report["cases"].append(record)
             print(json.dumps(record), flush=True)
+
+    if args.profile:
+        profile_label = chosen[0]
+        profile_points = points_from_window(arrays, WINDOWS[profile_label])
+        profile_overlap = 0.0 if args.overlap == "0.0" else 0.5
+        report["cpu_profile"] = {
+            "window": profile_label, "overlap": profile_overlap,
+            "note": "cProfile timings add instrumentation overhead; do not mix with wall-clock benchmark data",
+            "original_hotspots": cpu_hotspots(before, profile_points, profile_overlap, args.crop_size),
+            "patched_hotspots": cpu_hotspots(after, profile_points, profile_overlap, args.crop_size),
+        }
+        print("CPU_PROFILE", json.dumps(report["cpu_profile"]), flush=True)
 
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
