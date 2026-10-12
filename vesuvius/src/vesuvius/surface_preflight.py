@@ -639,8 +639,16 @@ def inspect_pair(
     block_rows: int = 256,
     scale_tolerance: float = 2.0,
     bbox_tolerance: float = 0.01,
+    voxel_size_um: float | None = None,
 ) -> dict[str, Any]:
-    """Inspect one TIFXYZ/volume pair and return a JSON-serializable report."""
+    """Inspect one TIFXYZ/volume pair and return a JSON-serializable report.
+
+    ``report["surface"]["depth_orientation"]`` is advisory, not a gate: it says
+    whether ``vc_render_tifxyz`` needs ``--flip-normals`` for the layer index
+    to grow toward the scroll centre (see :mod:`vesuvius.surface_orientation`).
+    It needs the voxel size, taken from ``voxel_size_um`` or from a published
+    mesh name ending in ``-<size>um.tifxyz``.
+    """
     surface_path = Path(surface)
     gates: list[dict[str, Any]] = []
     report: dict[str, Any] = {
@@ -809,6 +817,9 @@ def inspect_pair(
             block_rows=block_rows,
         )
         report["surface"].update(scan)
+        report["surface"]["depth_orientation"] = _depth_orientation(
+            surface_path, x, y, z, mask, scale, voxel_size_um
+        )
         gates.extend(
             [
                 _gate(
@@ -912,6 +923,50 @@ def inspect_pair(
     return _finalize_report(report)
 
 
+def _depth_orientation(
+    surface_path: Path,
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray,
+    mask: np.ndarray | None,
+    scale: tuple[float, float],
+    voxel_size_um: float | None,
+) -> dict[str, Any]:
+    # Advisory only: whatever goes wrong here, including the import, must not
+    # fail the gates.
+    try:
+        from vesuvius.surface_orientation import depth_orientation, voxel_size_from_name
+
+        if voxel_size_um is None:
+            voxel_size_um = voxel_size_from_name(surface_path)
+        if voxel_size_um is None:
+            return {
+                "status": "skipped",
+                "reason": "voxel size unknown; pass --voxel-size-um",
+            }
+        selected = None if mask is None else np.asarray(mask)
+        if selected is not None and selected.dtype != np.bool_:
+            selected = selected >= 255
+        return depth_orientation(
+            x, y, z, scale=(float(scale[0]), float(scale[1])),
+            voxel_size_um=voxel_size_um, valid=selected,
+        )
+    except Exception as exc:  # includes MemoryError on very large grids
+        return {"status": "error", "error_type": type(exc).__name__, "error": str(exc)}
+
+
+def _orientation_hint(orientation: Mapping[str, Any] | None) -> str | None:
+    if not orientation or orientation.get("status") != "determined":
+        return None
+    flip = orientation["vc_render_flip_normals"]
+    return (
+        f"depth orientation: the grid normal points {orientation['grid_normal']} "
+        f"(inward_fraction={orientation['inward_fraction']:.2f}); render with"
+        f"{'' if flip else 'out'} --flip-normals so the layer index grows toward "
+        "the scroll centre (assumes a wrapped scroll sheet, not a flat fragment)"
+    )
+
+
 def _atomic_write_json(path: Path, report: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -925,6 +980,13 @@ def _atomic_write_json(path: Path, report: Mapping[str, Any]) -> None:
     finally:
         if os.path.exists(temporary_name):
             os.unlink(temporary_name)
+
+
+def _positive_float(text: str) -> float:
+    value = float(text)
+    if not np.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("must be a positive number")
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -980,6 +1042,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.01,
         help="allowed bbox coverage tolerance in voxels",
     )
+    parser.add_argument(
+        "--voxel-size-um",
+        type=_positive_float,
+        help=(
+            "voxel size of the surface's volume, for the depth-orientation report; "
+            "read from a '-<size>um.tifxyz' directory name when omitted"
+        ),
+    )
     parser.add_argument("--block-rows", type=int, default=256, help=argparse.SUPPRESS)
     return parser
 
@@ -997,7 +1067,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         block_rows=args.block_rows,
         scale_tolerance=args.scale_tolerance,
         bbox_tolerance=args.bbox_tolerance,
+        voxel_size_um=args.voxel_size_um,
     )
+    hint = _orientation_hint(report.get("surface", {}).get("depth_orientation"))
+    if hint:
+        print(hint, file=sys.stderr)
     if args.output:
         _atomic_write_json(args.output, report)
         print(f"{report['status']}: {args.output}", file=sys.stderr)

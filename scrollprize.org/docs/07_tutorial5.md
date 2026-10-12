@@ -523,7 +523,7 @@ vc_render_tifxyz \
 ```
 
 * `--remote-url` takes the S3 volume; `--volume` names a local directory where fetched chunks are cached, so only the parts of the scroll your segment touches ever get downloaded. `--voxel-size` and `--voxel-unit` record the physical metadata the remote volume can't provide.
-* `--flip-normals` reproduces the depth orientation of the published renders and the training labels; for your own segment the orientation is unknown, which is what `--direction both` at inference time is for.
+* `--flip-normals` reproduces the depth orientation of the published renders and the training labels. For your own segment, `vesuvius.surface_preflight --surface <segment>.tifxyz --voxel-size-um <voxel size of the volume the mesh was traced on>` gives a geometric hint from the segment's curvature (a segment mirrored with VC3D's *Flip Surface* needs the opposite flag); it is a hint, not a guarantee, so when it is undetermined or the result matters, use `--direction both` at inference time.
 
 For w035 this takes about five minutes and writes a ~900&nbsp;MB Zarr:
 
