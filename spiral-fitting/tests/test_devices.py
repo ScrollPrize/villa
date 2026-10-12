@@ -192,15 +192,12 @@ def test_prefetcher_is_used_only_for_a_cuda_patch_atlas(monkeypatch):
     assert bool(mask.all())
 
 
-@pytest.mark.parametrize('device', ['cpu', 'mps'])
-def test_ink_metric_folds_take_turns_off_cuda(monkeypatch, tmp_path, device):
-    # Off CUDA every fold would share one device, so they must not all start
-    # at once, and the workers get no CUDA_VISIBLE_DEVICES.
+def _run_ink_metrics(monkeypatch, tmp_path, args):
+    # run_main up to the first fold result, with workers that only record
+    # their command and environment.
     import numpy as np
     from PIL import Image
     import get_ink_metrics
-    if device == 'mps':
-        monkeypatch.setattr(torch.backends.mps, 'is_available', lambda: True)
     ink = tmp_path / 'ink'
     ink.mkdir()
     Image.fromarray(np.zeros((8, 16), np.uint8)).save(ink / 'w000-005_flat.jpg')
@@ -228,12 +225,37 @@ def test_ink_metric_folds_take_turns_off_cuda(monkeypatch, tmp_path, device):
     monkeypatch.setattr(get_ink_metrics.subprocess, 'Popen', FakeWorker)
     monkeypatch.setattr(get_ink_metrics, 'load_fold_prob', stop)
     with pytest.raises(Stop):
-        get_ink_metrics.run_main([str(ink), '--model', str(model), '--device', device,
-                                  '--output', str(tmp_path / 'out')])
+        get_ink_metrics.run_main([str(ink), '--model', str(model),
+                                  '--output', str(tmp_path / 'out'), *args])
+    return launched
+
+
+@pytest.mark.parametrize('device', ['cpu', 'mps'])
+def test_ink_metric_folds_take_turns_off_cuda(monkeypatch, tmp_path, device):
+    # Off CUDA every fold would share one device, so they must not all start
+    # at once, and the workers get no CUDA_VISIBLE_DEVICES.
+    if device == 'mps':
+        monkeypatch.setattr(torch.backends.mps, 'is_available', lambda: True)
+    launched = _run_ink_metrics(monkeypatch, tmp_path, ['--device', device])
     assert len(launched) == 3
     for worker in launched:
         assert 'CUDA_VISIBLE_DEVICES' not in worker.env
         assert worker.cmd[worker.cmd.index('--device') + 1] == device
+
+
+def test_ink_metric_device_ignores_the_fitting_variables(monkeypatch, tmp_path, capsys):
+    # A fit's FIT_SPIRAL_DEVICE and FIT_SPIRAL_MAX_PRECISION_FLOAT left in the
+    # shell must neither move the folds nor fail them, and CUDA-only flags
+    # say that they are ignored.
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
+    monkeypatch.setattr(torch.backends.mps, 'is_available', lambda: True)
+    monkeypatch.setenv('FIT_SPIRAL_DEVICE', 'cpu')
+    monkeypatch.setenv('FIT_SPIRAL_MAX_PRECISION_FLOAT', '16')
+    launched = _run_ink_metrics(monkeypatch, tmp_path, ['--gpus', '0,1', '--sequential-folds'])
+    assert [w.cmd[w.cmd.index('--device') + 1] for w in launched] == ['mps'] * 3
+    out = capsys.readouterr().out
+    assert '--gpus 0,1 ignored' in out
+    assert '--sequential-folds has no effect on mps' in out
 
 
 @pytest.mark.parametrize('device', [

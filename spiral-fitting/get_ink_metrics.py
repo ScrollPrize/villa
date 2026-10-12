@@ -372,6 +372,20 @@ def detect_folds(model_dir):
     return sorted(folds)
 
 
+def ink_device(requested=None):
+    """The device the nnU-Net folds run on: ``requested`` (--device), else
+    cuda when available, else mps, else cpu. The fitting variables
+    FIT_SPIRAL_DEVICE and FIT_SPIRAL_MAX_PRECISION_FLOAT play no part."""
+    import torch
+    available = {'cuda': torch.cuda.is_available(),
+                 'mps': torch.backends.mps.is_available(), 'cpu': True}
+    if requested is not None:
+        if not available[requested]:
+            raise RuntimeError(f'--device {requested} was requested but is not available')
+        return requested
+    return next(name for name, ok in available.items() if ok)
+
+
 def detect_gpus():
     """GPU ids to spread folds across. Honour CUDA_VISIBLE_DEVICES if set, else ask torch."""
     env = os.environ.get('CUDA_VISIBLE_DEVICES')
@@ -514,8 +528,7 @@ def run_main(argv):
     folds = [int(x) for x in args.folds.split(',')] if args.folds else detect_folds(model_dir)
     if not folds:
         ap.error(f'no folds found in {model_dir}')
-    from devices import fit_device
-    device = fit_device(args.device).type
+    device = ink_device(args.device)
     if device == 'cuda':
         gpus = [g.strip() for g in args.gpus.split(',')] if args.gpus else detect_gpus()
         slots = [f'GPU {gpu}' for gpu in gpus]
@@ -524,6 +537,11 @@ def run_main(argv):
         # Every fold would share the one device (on a Mac, one unified memory
         # pool), so the folds take turns instead of all loading at once.
         gpus, slots, sequential = [], [device], True
+        if args.gpus:
+            print(f'note    : --gpus {args.gpus} ignored, the folds run on {device}')
+        if args.sequential_folds:
+            print(f'note    : --sequential-folds has no effect on {device}, '
+                  'the folds already run one at a time')
 
     print(f'ink_dir : {ink_dir}')
     print(f'strip   : {name}  ({len(tiles)} tile(s) concatenated)')
