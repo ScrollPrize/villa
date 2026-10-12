@@ -26,6 +26,7 @@
 #include <QPushButton>
 #include <QRandomGenerator>
 #include <QRegularExpression>
+#include <QSignalBlocker>
 #include <QSettings>
 #include <QStandardPaths>
 #include <QUrl>
@@ -169,6 +170,10 @@ SpiralServiceManager::SpiralServiceManager(QObject* parent) : QObject(parent)
 
 SpiralServiceManager::~SpiralServiceManager()
 {
+    // The owner's destructor has already disconnected while its widgets were
+    // alive; by now receivers may hold dangling pointers, so release resources
+    // without notifying anyone.
+    const QSignalBlocker blocker(this);
     disconnectFromService();
 }
 

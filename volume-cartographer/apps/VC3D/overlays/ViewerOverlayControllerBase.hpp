@@ -343,6 +343,8 @@ protected:
     };
 
     virtual bool isOverlayEnabledFor(VolumeViewerBase* viewer) const;
+    // Lets a controller skip the rebuild when its primitives would be unchanged.
+    virtual bool needsOverlayRebuild(VolumeViewerBase*) const { return true; }
     virtual void collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder) = 0;
     FilteredPoints projectPointChainForHitTest(
         VolumeViewerBase* viewer,
@@ -470,6 +472,8 @@ private:
         Surface* surface{nullptr};
         std::uint64_t surfaceGeneration{0};
         float tolerance{0.0f};
+        float depthLo{0.0f};
+        float depthHi{0.0f};
         cv::Vec3f planeOrigin{0.0f, 0.0f, 0.0f};
         cv::Vec3f planeBasisX{0.0f, 0.0f, 0.0f};
         cv::Vec3f planeBasisY{0.0f, 0.0f, 0.0f};

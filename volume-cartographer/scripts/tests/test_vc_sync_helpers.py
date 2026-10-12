@@ -9,6 +9,7 @@ import json
 import os
 import sqlite3
 import sys
+import types
 
 import pytest
 
@@ -1757,14 +1758,249 @@ class TestClassifyFibers:
         assert tagged == []
         assert sorted(name for name, _ in invalid) == ['bad.json', 'empty.json']
 
-    def test_unpublishable_reason_without_fiber_merge(self, monkeypatch):
-        """The fallback path (fiber_merge import failed) must still refuse the
-        shapes that crash the run or mis-tag a fiber."""
+    # --- exclude_tags / tagless publishing -------------------------------
+
+    def test_exclude_tag_withholds_fiber(self, tmp_path):
+        """A fiber carrying an excluded tag is never published, even when it
+        also carries the publish tag."""
+        self.write(tmp_path, 'a.json', self.fiber(['reviewed', 'problems']))
+        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
+            str(tmp_path), 'reviewed', ['problems'])
+        assert tagged == []
+        # untagged, not deferred: 'problems' is a judgement that it should not
+        # be public, so a published copy must come down too.
+        assert untagged == ['a.json']
+        assert (invalid, deferred) == ([], [])
+
+    def test_no_include_tag_publishes_every_loadable_fiber(self, tmp_path):
+        self.write(tmp_path, 'a.json', self.fiber([]))
+        self.write(tmp_path, 'b.json', self.fiber(['anything']))
+        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
+            str(tmp_path), None)
+        assert tagged == ['a.json', 'b.json']
+        assert (untagged, invalid, deferred) == ([], [], [])
+
+    def test_no_include_tag_still_honours_excludes(self, tmp_path):
+        self.write(tmp_path, 'a.json', self.fiber([]))
+        self.write(tmp_path, 'b.json', self.fiber(['problems']))
+        self.write(tmp_path, 'c.json', self.fiber(['possible_duplicate']))
+        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
+            str(tmp_path), None, ['problems', 'possible_duplicate'])
+        assert tagged == ['a.json']
+        assert untagged == ['b.json', 'c.json']
+
+    def test_no_include_tag_still_holds_back_unfitted(self, tmp_path):
+        """Publishing everything must not publish placeholder geometry."""
+        self.write(tmp_path, 'a.json', self.fiber([vc_sync.REOPTIMIZE_TAG]))
+        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
+            str(tmp_path), None)
+        assert (tagged, untagged, invalid) == ([], [], [])
+        assert [name for name, _ in deferred] == ['a.json']
+
+    def test_no_include_tag_still_quarantines_invalid(self, tmp_path):
+        """Publishing everything must not publish unloadable documents."""
+        self.write(tmp_path, 'a.json', self.fiber('problems'))
+        self.write(tmp_path, 'b.json', '[1, 2, 3]')
+        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
+            str(tmp_path), None, ['problems'])
+        assert (tagged, untagged) == ([], [])
+        assert sorted(name for name, _ in invalid) == ['a.json', 'b.json']
+
+    def test_excluded_and_unfitted_is_removable(self, tmp_path):
+        """Exclusion wins over holding back: the fiber is withheld outright."""
+        self.write(tmp_path, 'a.json',
+                   self.fiber(['problems', vc_sync.REOPTIMIZE_TAG]))
+        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
+            str(tmp_path), None, ['problems'])
+        assert (tagged, deferred) == ([], [])
+        assert untagged == ['a.json']
+
+    def test_default_classify_call_is_unchanged(self, tmp_path):
+        """Omitting exclude_tags keeps the pre-existing behaviour."""
+        self.write(tmp_path, 'a.json', self.fiber(['reviewed']))
+        assert vc_sync.classify_fibers(str(tmp_path), 'reviewed')[0] == ['a.json']
+
+
+class TestLegacyConfigGainsDefaultExclusions:
+    """A config written before `exclude_tags` existed now also withholds
+    problem fibers. That is intended -- the withhold list is meant to win over
+    the include tag -- and it retracts an already published fiber, so it is
+    pinned here rather than left to be rediscovered."""
+
+    @staticmethod
+    def write(tmp_path, name, tags):
+        doc = {'type': 'vc3d_fiber', 'version': 1, 'filename': name,
+               'control_points': [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+               'line_points': [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+               'generation': 1, 'branches': [], 'tags': tags}
+        (tmp_path / name).write_text(json.dumps(doc))
+
+    def test_reviewed_and_problems_is_withheld_under_a_legacy_tag_config(
+            self, tmp_path):
+        (tmp_path / vc_sync.HFSYNC_CONFIG_NAME).write_text(json.dumps(
+            {'hf_bucket_path': 'hf://buckets/org/bucket/path',
+             'hf_cli': 'sh', 'tag': 'reviewed'}))
+        config = vc_sync.load_hfsync_config(str(tmp_path))
+        assert config['exclude_tags'] == ['problems', 'possible_duplicate']
+
+        self.write(tmp_path, 'good.json', ['reviewed'])
+        self.write(tmp_path, 'bad.json', ['reviewed', 'problems'])
+        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
+            str(tmp_path), config['tag'], config['exclude_tags'])
+        assert tagged == ['good.json']
+        # untagged, not deferred: the published copy is retracted.
+        assert untagged == ['bad.json']
+        assert (invalid, deferred) == ([], [])
+
+
+class TestLoadHfsyncConfig:
+    """The config decides what leaves the machine, so bad shapes must raise
+    rather than silently widen what gets published."""
+
+    @staticmethod
+    def write(tmp_path, config):
+        (tmp_path / vc_sync.HFSYNC_CONFIG_NAME).write_text(json.dumps(config))
+        return str(tmp_path)
+
+    BASE = {'hf_bucket_path': 'hf://buckets/org/bucket/path', 'hf_cli': 'sh'}
+
+    def test_absent_config_returns_none(self, tmp_path):
+        assert vc_sync.load_hfsync_config(str(tmp_path)) is None
+
+    def test_defaults_publish_all_minus_the_standard_excludes(self, tmp_path):
+        """With nothing configured, publishing is broad but never includes a
+        fiber someone marked bad."""
+        config = vc_sync.load_hfsync_config(self.write(tmp_path, dict(self.BASE)))
+        assert config['tag'] is None
+        assert config['exclude_tags'] == ['problems', 'possible_duplicate']
+
+    def test_config_can_narrow_to_a_tag(self, tmp_path):
+        """An existing config pinning a tag keeps its behaviour."""
+        config = vc_sync.load_hfsync_config(
+            self.write(tmp_path, dict(self.BASE, tag='reviewed')))
+        assert config['tag'] == 'reviewed'
+
+    def test_empty_exclude_list_is_honoured(self, tmp_path):
+        """[] must mean "exclude nothing", not "use the defaults"."""
+        config = vc_sync.load_hfsync_config(
+            self.write(tmp_path, dict(self.BASE, exclude_tags=[])))
+        assert config['exclude_tags'] == []
+
+    def test_null_tag_means_publish_all(self, tmp_path):
+        config = vc_sync.load_hfsync_config(
+            self.write(tmp_path, dict(self.BASE, tag=None,
+                                      exclude_tags=['problems'])))
+        assert config['tag'] is None
+        assert config['exclude_tags'] == ['problems']
+
+    def test_reviewed_only_overrides_the_configured_tag(self, tmp_path, monkeypatch):
+        """The flag must win over the config, and must not disturb the
+        exclusions."""
+        seen = {}
+
+        def fake_classify(local_dir, tag, exclude_tags=()):
+            seen['tag'] = tag
+            seen['exclude_tags'] = list(exclude_tags)
+            return [], [], [], []
+
+        monkeypatch.setattr(vc_sync, 'classify_fibers', fake_classify)
+        monkeypatch.setattr(vc_sync.subprocess, 'run',
+                            lambda *a, **k: types.SimpleNamespace(
+                                returncode=0, stdout='', stderr=''))
+        # A configured tag the flag must override, and custom exclusions it
+        # must leave alone.
+        directory = self.write(tmp_path, dict(self.BASE, tag='approved',
+                                              exclude_tags=['private']))
+        vc_sync.hf_sync(directory, dry_run=True, reviewed_only=True)
+        assert seen['tag'] == vc_sync.REVIEWED_TAG
+        assert seen['exclude_tags'] == ['private']
+
+    def test_without_the_flag_no_include_filter_is_applied(self, tmp_path, monkeypatch):
+        seen = {}
+
+        def fake_classify(local_dir, tag, exclude_tags=()):
+            seen['tag'] = tag
+            return [], [], [], []
+
+        monkeypatch.setattr(vc_sync, 'classify_fibers', fake_classify)
+        monkeypatch.setattr(vc_sync.subprocess, 'run',
+                            lambda *a, **k: types.SimpleNamespace(
+                                returncode=0, stdout='', stderr=''))
+        vc_sync.hf_sync(self.write(tmp_path, dict(self.BASE)), dry_run=True)
+        assert seen['tag'] is None
+
+    def test_empty_tag_is_refused(self, tmp_path):
+        """"" could mean "no filter" or "a tag nothing carries"; those differ
+        by the whole bucket, so it must not be guessed."""
+        with pytest.raises(ValueError, match="'tag' is empty"):
+            vc_sync.load_hfsync_config(
+                self.write(tmp_path, dict(self.BASE, tag='', exclude_tags=['x'])))
+
+    def test_whitespace_tag_is_refused(self, tmp_path):
+        with pytest.raises(ValueError, match="'tag' is empty"):
+            vc_sync.load_hfsync_config(
+                self.write(tmp_path, dict(self.BASE, tag='   ')))
+
+    def test_non_string_tag_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="'tag' must be"):
+            vc_sync.load_hfsync_config(
+                self.write(tmp_path, dict(self.BASE, tag=['reviewed'])))
+
+    def test_non_list_exclude_tags_raises(self, tmp_path):
+        """A bare string would make the intersection a per-character test."""
+        with pytest.raises(ValueError, match="'exclude_tags' must be"):
+            vc_sync.load_hfsync_config(
+                self.write(tmp_path, dict(self.BASE, exclude_tags='problems')))
+
+    def test_non_string_exclude_entry_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="'exclude_tags' must be"):
+            vc_sync.load_hfsync_config(
+                self.write(tmp_path, dict(self.BASE, exclude_tags=[1])))
+
+    def test_bad_bucket_scheme_still_raises(self, tmp_path):
+        with pytest.raises(ValueError, match='hf://buckets/'):
+            vc_sync.load_hfsync_config(
+                self.write(tmp_path, dict(self.BASE, hf_bucket_path='s3://x/y')))
+
+
+    def test_without_fiber_merge_nothing_is_publishable(self, monkeypatch):
+        """is_fiber_doc is the contract, and a hand-rolled subset of it would
+        publish documents the loader rejects. With it unavailable every doc is
+        unpublishable, which uploads nothing and removes nothing."""
         monkeypatch.setattr(vc_sync, 'fiber_merge', None)
-        assert vc_sync.unpublishable_reason({'tags': ['reviewed']}) is None
-        assert vc_sync.unpublishable_reason({'tags': None})
-        assert vc_sync.unpublishable_reason({'tags': 'unreviewed'})
+        fiber = {'type': 'vc3d_fiber', 'version': 1,
+                 'control_points': [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+                 'line_points': [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+                 'tags': ['reviewed']}
+        assert vc_sync.unpublishable_reason(fiber)
+        # version 2 is the case a partial validator would have let through
+        assert vc_sync.unpublishable_reason(dict(fiber, version=2))
         assert vc_sync.unpublishable_reason([1, 2, 3])
+
+    def test_without_fiber_merge_classification_removes_nothing(
+            self, tmp_path, monkeypatch):
+        """Invalid is not the same as withheld: a file we refused to validate
+        must not take its published copy down."""
+        monkeypatch.setattr(vc_sync, 'fiber_merge', None)
+        doc = {'type': 'vc3d_fiber', 'version': 1, 'filename': 'a.json',
+               'control_points': [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+               'line_points': [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+               'generation': 1, 'branches': [], 'tags': ['reviewed']}
+        (tmp_path / 'a.json').write_text(json.dumps(doc))
+        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
+            str(tmp_path), None, ['problems'])
+        assert (tagged, untagged, deferred) == ([], [], [])
+        assert [name for name, _ in invalid] == ['a.json']
+
+    def test_hf_sync_refuses_to_run_without_fiber_merge(
+            self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(vc_sync, 'fiber_merge', None)
+        called = []
+        monkeypatch.setattr(vc_sync, 'classify_fibers',
+                            lambda *a, **k: called.append(1) or ([], [], [], []))
+        vc_sync.hf_sync(self.write(tmp_path, dict(self.BASE)), dry_run=True)
+        assert called == []
+        assert 'fiber_merge' in capsys.readouterr().out
 
 
 # --- SFTP (ash) sync -------------------------------------------------------
@@ -2124,3 +2360,48 @@ class TestSftpAnalyzeIntegration:
                          'is_backup': False}}
         actions = sftp_manager.analyze_changes({path: info}, remote)
         assert actions[path][0] == SyncAction.CONFLICT
+
+
+class TestRemoteRegression:
+    """A changed REMOTE fiber that an older build re-saved as version 3 over a
+    version-4 base with span tags is a manual conflict, not a plain download;
+    a base with nothing to lose never fetches the remote."""
+
+    def _v4_gap_base(self):
+        base = test_fiber_merge.make_v3_fiber(test_fiber_merge.BASE_CPS)
+        test_fiber_merge.make_v4_gap(base, 1)
+        return base
+
+    def test_downgraded_remote_is_a_conflict(self, manager, monkeypatch):
+        base = self._v4_gap_base()
+        stale = copy.deepcopy(base)
+        stale['version'] = 3
+        for cp in stale['control_points'][:-1]:
+            cp['segment_to_next'].pop('tags', None)
+        stale['generation'] = 2
+        monkeypatch.setattr(manager, '_load_base', lambda path, tracked: base)
+        fetched = []
+        monkeypatch.setattr(manager, '_fetch_remote_json',
+                            lambda path: (fetched.append(path) or (stale, None)))
+        message = manager._fiber_remote_regression('dj_x_000001.json', {'s3_etag': 'x'})
+        assert message and 'span tags' in message
+        assert fetched == ['dj_x_000001.json']
+
+    def test_remote_that_kept_the_tags_downloads(self, manager, monkeypatch):
+        base = self._v4_gap_base()
+        remote = copy.deepcopy(base)
+        remote['generation'] = 2
+        monkeypatch.setattr(manager, '_load_base', lambda path, tracked: base)
+        monkeypatch.setattr(manager, '_fetch_remote_json', lambda path: (remote, None))
+        assert manager._fiber_remote_regression('dj_x_000001.json', {'s3_etag': 'x'}) is None
+
+    def test_base_without_regressable_metadata_never_fetches(self, manager, monkeypatch):
+        base = test_fiber_merge.make_v3_fiber(test_fiber_merge.BASE_CPS)
+        base['version'] = 4
+        monkeypatch.setattr(manager, '_load_base', lambda path, tracked: base)
+        def boom(path):
+            raise AssertionError('remote fetched although nothing could be lost')
+        monkeypatch.setattr(manager, '_fetch_remote_json', boom)
+        assert manager._fiber_remote_regression('dj_x_000001.json', {'s3_etag': 'x'}) is None
+        assert not fiber_merge.base_carries_regressable_metadata(base)
+        assert fiber_merge.base_carries_regressable_metadata(self._v4_gap_base())

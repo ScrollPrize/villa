@@ -15,7 +15,7 @@ from vesuvius.neural_tracing.tracers.models.crop_transformer import FlowConfig, 
 from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec, arclength
 from label_fixtures import state_labels
 
-SMALL = dict(hidden=16, heads=2, layers=1, ffn=32, cnn_channels=(4, 8), cnn_blocks=(1, 1), n_future=4, n_history=32,
+SMALL = dict(hidden=16, heads=2, layers=1, ffn=32, cnn_channels=(4, 8), cnn_blocks=(1, 1), cnn_strides=(2, 2), n_future=4, n_history=32,
              gate_plane=None, recurrent_refinement_steps=0)
 
 

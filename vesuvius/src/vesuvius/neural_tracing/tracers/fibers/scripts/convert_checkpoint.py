@@ -20,7 +20,6 @@ from pathlib import Path
 
 import torch
 
-from vesuvius.neural_tracing.tracers.models.weights import upgrade_state
 from vesuvius.neural_tracing.tracers.shared.io import atomic_torch_save
 
 LEGACY_TYPES = dict(unified='regression', unified_flow='flow', sequence='sequence')
@@ -94,9 +93,6 @@ def convert(ck):
         notes.append(f'model fields dropped: {", ".join(dropped)}')
     run = run_config.resolve(run_document(ck, cfg, notes), '/')
     out = {k: v for k, v in ck.items() if k not in DROPPED_KEYS}
-    for key in ('model', 'ema'):  # weights of earlier layouts under their current names (models.weights)
-        if isinstance(out.get(key), dict):
-            out[key] = upgrade_state(out[key])
     out.update(model_type=cfg.model_type, model_cfg=cfg.to_dict(), run_config=run,
                training_options=vars(run_config.namespace(run)))
     sample = dict(ck['sample_cfg'])

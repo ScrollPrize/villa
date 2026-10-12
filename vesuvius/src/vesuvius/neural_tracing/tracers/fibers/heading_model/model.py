@@ -135,14 +135,14 @@ def path_features(path, pos, frame, window):
     return out.ravel()
 
 
-def model_inputs(vol, cfg, positions, frames, paths, pool=None, *, normal_targets=False):
-    """CT patches (tracer sampler and normalization) and path features for each head."""
+def model_inputs(vol, cfg, positions, frames, paths, pool=None, *, normal_targets=False, crops=None):
+    """CT patches (tracer sampler and normalization, or ``crops`` with the same values) and path features per head."""
     items = [dict(pos=np.asarray(p, np.float64), frame=np.asarray(f, np.float64)) for p, f in zip(positions, frames)]
     if normal_targets:
         from vesuvius.neural_tracing.tracers.fibers.heading_model.normals import sample_training_crops
         patch, normals, weights = sample_training_crops(items, vol, cfg, pool)
     else:
-        patch = scalar_crops(items, vol, cfg.patch, pool)
+        patch = (crops or scalar_crops)(items, vol, cfg.patch, pool)
     path = torch.from_numpy(np.stack([path_features(q, p, f, cfg.window) for q, p, f in zip(paths, positions, frames)]))
     return (patch, path, normals, weights) if normal_targets else (patch, path)
 
@@ -165,8 +165,9 @@ def load_heading_model(path, device='cpu'):
 
 class HeadingPredictor:
     """Crop headings for tracer heads from (position, prior heading, observed path)."""
-    def __init__(self, model, device='cpu'):
+    def __init__(self, model, device='cpu', crops=None):
         self.model, self.device = model.to(device).eval(), torch.device(device)
+        self.crops = crops  # optional crop backend with crops.scalar_crops values (e.g. GPUChunkCache.crops)
 
     @classmethod
     def load(cls, path, device='cpu'):
@@ -180,7 +181,7 @@ class HeadingPredictor:
         if not len(positions):
             return [], []
         frames = prior_frames(priors)
-        patch, path = model_inputs(vol, self.model.cfg, positions, frames, paths, pool)
+        patch, path = model_inputs(vol, self.model.cfg, positions, frames, paths, pool, crops=self.crops)
         out = self.model.forward_outputs(patch.to(self.device), path.to(self.device), self._families(families))
         heads, normals = (out[k].double().cpu().numpy() for k in ('heading', 'normal'))
         heads = [f @ h for f, h in zip(frames, heads)]

@@ -14,8 +14,10 @@
 namespace vc::render::prefetch {
 
 // Blocking samplers may submit coarse speculative requests of their own.
-// Use this view only after the CLI's exact prefetch has completed. All real
-// reads still reach the source, including cache misses after RAM eviction.
+// Use this view once the caller has queued its exact prefetch: --prefetch-remote
+// waits for the whole render's plan, TIFF bands queue their own plan without
+// waiting. All real reads still reach the source, including cache misses after
+// RAM eviction, and block on chunks still in flight.
 // The source must outlive the view; no cache or process-wide setting is changed.
 class PrefetchedArrayView final : public IChunkedArray {
 public:

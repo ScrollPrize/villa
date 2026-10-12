@@ -19,30 +19,36 @@ def _group_norm(channels: int, **kwargs) -> nn.GroupNorm:
 
 
 CNN_NORMS = dict(instance=(nn.InstanceNorm3d, dict(eps=1e-5, affine=True)), group=(_group_norm, {}))
-CNN_NONLINS = dict(relu=(nn.ReLU, dict(inplace=True)), gelu=(nn.GELU, {}))
+# Encoder activations: name -> (module, keyword arguments); 'leaky_relu' has nnU-Net's slope.
+CNN_ACTIVATIONS = dict(relu=(nn.ReLU, dict(inplace=True)), leaky_relu=(nn.LeakyReLU, dict(negative_slope=1e-2, inplace=True)),
+                       gelu=(nn.GELU, {}))
 
 
 class CropCNN(nn.Module):
     """Residual CNN stages of ResNet-D basic blocks (channels, initial stride, blocks per stage) over a crop, and
     optionally a head that turns its feature map into tokens of width ``dim``.
 
-    ``norm``: 'instance' (InstanceNorm3d, affine) or 'group' (GroupNorm, 4 groups); ``nonlin``: 'relu' or 'gelu';
-    ``conv_bias``: 'first' (only the first stage's convolutions carry biases) or 'all'. ``head``: None (``forward``
-    returns the feature map), 'cells' (one token per feature-map cell, (B, cells, dim), a Linear of the channels) or
-    'crop' (one token per crop, (B, dim): an optional 1x1 conv to ``bottleneck`` channels with the same norm and
-    nonlinearity, then flatten and a Linear; needs the ``crop`` size, which must divide by 2 per stride-2 stage).
-    ``features`` and ``tokens`` run the two halves separately, for models that read the feature map as well.
-    ``in_channels``: input channels of the crop (default one, e.g. CT)."""
-    def __init__(self, channels, strides, blocks, *, norm='instance', nonlin='relu', conv_bias='first', head=None,
-                 dim=None, crop=None, bottleneck=0, in_channels=1):
+    ``stem``: first one full-resolution convolution (norm, activation) to the first stage's channels, as nnU-Net's
+    residual encoder. ``norm``: 'instance' (InstanceNorm3d, affine) or 'group' (GroupNorm, 4 groups); ``activation``:
+    a CNN_ACTIVATIONS name; ``conv_bias``: 'first' (only the first stage's convolutions carry biases) or 'all'.
+    ``head``: None (``forward`` returns the feature map), 'cells' (one token per feature-map cell, (B, cells, dim), a
+    Linear of the channels) or 'crop' (one token per crop, (B, dim): an optional 1x1 conv to ``bottleneck`` channels
+    with the same norm and activation, then flatten and a Linear; needs the ``crop`` size, which must divide by 2 per
+    stride-2 stage). ``features`` and ``tokens`` run the two halves separately, for models that read the feature map
+    as well. ``in_channels``: input channels of the crop (default one, e.g. CT)."""
+    def __init__(self, channels, strides, blocks, *, stem=False, norm='instance', activation='relu', conv_bias='first',
+                 head=None, dim=None, crop=None, bottleneck=0, in_channels=1):
         super().__init__()
         if conv_bias not in ('first', 'all') or head not in (None, 'cells', 'crop') or (head and not dim):
             raise ValueError(f'CropCNN: conv_bias {conv_bias!r}, head {head!r}, dim {dim!r}')
         norm_op, norm_kwargs = CNN_NORMS[norm]
-        nonlin_op, nonlin_kwargs = CNN_NONLINS[nonlin]
+        nonlin_op, nonlin_kwargs = CNN_ACTIVATIONS[activation]
         options = dict(conv_op=nn.Conv3d, kernel_size=3, norm_op=norm_op, norm_op_kwargs=norm_kwargs, nonlin=nonlin_op,
                        nonlin_kwargs=nonlin_kwargs, block=BasicBlockD)
-        inputs = (in_channels, *channels[:-1])
+        if stem:
+            self.stem = nn.Sequential(nn.Conv3d(in_channels, channels[0], 3, padding=1),
+                                      norm_op(channels[0], **norm_kwargs), nonlin_op(**nonlin_kwargs))
+        inputs = (channels[0] if stem else in_channels, *channels[:-1])
         self.stages = nn.ModuleList(
             StackedResidualBlocks(n_blocks=n, input_channels=i, output_channels=c, initial_stride=s,
                                   conv_bias=conv_bias == 'all' or not index, **options)
@@ -60,8 +66,8 @@ class CropCNN(nn.Module):
             self.head = nn.Linear(width*math.prod(shape), dim)
 
     def features(self, image):
-        """The feature map (B, C, D', H', W') of crops (B, 1, D, H, W)."""
-        x = image
+        """The feature map (B, C, D', H', W') of crops (B, in_channels, D, H, W)."""
+        x = self.stem(image) if hasattr(self, 'stem') else image
         for stage in self.stages:
             x = stage(x)
         return x

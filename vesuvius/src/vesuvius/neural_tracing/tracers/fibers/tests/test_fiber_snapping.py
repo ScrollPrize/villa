@@ -6,16 +6,7 @@ import numpy as np
 import pytest
 
 from vesuvius.neural_tracing.tracers.fibers.data.fiber_snapping import SnapConfig, resample, snap_polylines
-
-AFV_SCHEMA = (
-    'CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)',
-    '''CREATE TABLE fibers(id INTEGER PRIMARY KEY, name TEXT NOT NULL, family TEXT NOT NULL,
-       point_count INTEGER NOT NULL CHECK(point_count >= 2), length REAL NOT NULL,
-       min_x REAL NOT NULL, max_x REAL NOT NULL, min_y REAL NOT NULL, max_y REAL NOT NULL,
-       min_z REAL NOT NULL, max_z REAL NOT NULL, annotation TEXT NOT NULL)''',
-    '''CREATE TABLE blocks(id INTEGER PRIMARY KEY, fiber_id INTEGER NOT NULL REFERENCES fibers(id),
-       first_segment INTEGER NOT NULL, points BLOB NOT NULL, UNIQUE(fiber_id, first_segment))''',
-    'CREATE VIRTUAL TABLE block_bounds USING rtree(id, min_x, max_x, min_y, max_y, min_z, max_z)')
+from vesuvius.neural_tracing.tracers.shared.annotations.afv import AFV_SCHEMA
 
 
 class ArrayVolume:

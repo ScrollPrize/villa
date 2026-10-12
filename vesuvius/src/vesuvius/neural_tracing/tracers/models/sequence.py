@@ -23,7 +23,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from vesuvius.neural_tracing.tracers.models.blocks import MLP, CropCNN, TransformerLayer
+from vesuvius.neural_tracing.tracers.models.blocks import CNN_ACTIVATIONS, MLP, CropCNN, TransformerLayer
 from vesuvius.neural_tracing.tracers.models.follower import FollowerConfig, path_readout, plane_coordinates, proposal_output, read_path, sample_features, select_refinement, token_coordinates
 from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec
 from vesuvius.neural_tracing.tracers.shared.policy import DEFAULT_CONFIDENCE
@@ -42,20 +42,29 @@ class SequenceConfig(FollowerConfig):
     layers: int = 12
     heads: int = 8
     ffn: int = 2048
+    # The crop CNN (models/blocks.CropCNN), the crop transformer's: a full-resolution stem and stage, then stages at
+    # strides 2, 4, 8 growing deeper. (2, 2, 2, 1) strides drop the full-resolution stage (same weight shapes and
+    # stride-8 cells, much cheaper). Before 2026-10-08: blocks (1, n, n, n), recorded as the number n, no stem, ReLU.
     cnn_channels: tuple = (16, 32, 64, 128)
-    # Per-stage strides: a full-resolution block, then stages at strides 2, 4, 8; (2, 2, 2, 1) drops the full-resolution
-    # stage (same weight shapes and stride-8 cells, ~6x cheaper).
-    cnn_strides: tuple = (2, 2, 2, 1)
-    cnn_blocks: int = 2
+    cnn_strides: tuple = (1, 2, 2, 2)
+    cnn_blocks: tuple = (1, 3, 4, 6)  # per stage; a number n: (1, n, n, n)
+    cnn_stem: bool = True  # one full-resolution convolution before the first stage
+    cnn_activation: str = 'leaky_relu'  # 'relu' or 'leaky_relu' (slope 0.01)
     history_limit: int = 512  # most recent history tokens a decision reads
 
     def __post_init__(self):
         super().__post_init__()
         self.cnn_channels = tuple(int(c) for c in self.cnn_channels)
         self.cnn_strides = tuple(int(s) for s in self.cnn_strides)
+        blocks = self.cnn_blocks
+        self.cnn_blocks = (1,)+(int(blocks),)*3 if isinstance(blocks, (int, float)) else tuple(int(b) for b in blocks)
+        if len(self.cnn_blocks) != 4 or min(self.cnn_blocks) < 1:
+            raise ValueError('The CNN needs four positive block counts')
+        if self.cnn_activation not in CNN_ACTIVATIONS:
+            raise ValueError(f'Unknown crop CNN activation {self.cnn_activation!r} ({", ".join(CNN_ACTIVATIONS)})')
         if len(self.cnn_strides) != 4 or any(s not in (1, 2) for s in self.cnn_strides) or math.prod(self.cnn_strides) != 8:
             raise ValueError('The CNN needs four stage strides of 1 or 2 whose product is the token stride (8)')
-        if len(self.cnn_channels) != 4 or min(self.cnn_channels) < 1 or self.cnn_blocks < 1 or self.ffn < 1:
+        if len(self.cnn_channels) != 4 or min(self.cnn_channels) < 1 or self.ffn < 1:
             raise ValueError('The CNN needs four positive channel widths and positive blocks; the FFN a positive width')
         if self.recurrent_refinement_steps:
             raise ValueError('The sequence follower has no refinement')
@@ -66,6 +75,10 @@ class SequenceConfig(FollowerConfig):
         c = self.fine
         if c.depth % 8 or c.width % 8:
             raise ValueError('Sequence crops must be multiples of eight (stride-8 tokens)')
+
+    @property
+    def cnn_stage_strides(self):
+        return self.cnn_strides
 
     @property
     def token_stride(self):
@@ -114,8 +127,9 @@ class SequenceFollower(nn.Module):
         super().__init__()
         self.cfg, self.model_type = cfg, cfg.model_type
         h, cells = cfg.hidden, cfg.cnn_channels[-1]
-        # A full-resolution block, then stages at strides 2, 4, 8.
-        self.cnn = CropCNN(cfg.cnn_channels, cfg.cnn_strides, (1,)+(cfg.cnn_blocks,)*3, head='cells', dim=h)
+        self.cnn = CropCNN(cfg.cnn_channels, cfg.cnn_strides, cfg.cnn_blocks, stem=cfg.cnn_stem,
+                           activation=cfg.cnn_activation)
+        self.cell_token = nn.Linear(cells, h)
         self.cell_position = MLP(3, h)
         width = 2*cells+4+2*POSITION_FREQUENCIES
         self.history_token = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, h), nn.SiLU(), nn.Linear(h, h))
@@ -132,10 +146,10 @@ class SequenceFollower(nn.Module):
     # ------------------------------------------------------------------ tokens
     def encode(self, image):
         """Stride-8 CNN cells (B, C, D/8, W/8, W/8) of head crops (B, 1, D, W, W)."""
-        return self.cnn.features(image)
+        return self.cnn(image)
 
     def crop_tokens(self, cells):
-        tokens = self.cnn.tokens(cells)
+        tokens = self.cell_token(cells.flatten(2).transpose(1, 2))
         return tokens+self.cell_position(self.cell_xyz/16.).to(tokens.dtype)+self.kind[1].to(tokens.dtype)
 
     def query_tokens(self, count, like):

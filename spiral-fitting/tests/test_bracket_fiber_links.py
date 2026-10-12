@@ -217,3 +217,36 @@ def test_pending_flag(dataset):
     _run(dataset, '--apply', '--pending', '--backup-dir', str(dataset / 'bak'))
     v = json.load(open(dataset / 'fibers' / 'test_20260101T000000000_000007.json'))
     assert [b for b in v['branches'] if b['branch_file'] == 'horizontal.json'][0]['pending'] is True
+
+
+def test_links_inside_a_gap_span_are_dropped_before_promotion():
+    """VC3D refuses control points inside a gap span (format v4: the span
+    descriptor carries the `gap` tag); the bracket tool must not promote a
+    line point there either, or the gap splits into two non-gap spans."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        'bracket_fiber_links', os.path.join(ROOT, 'bracket_fiber_links.py'))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    controls = [{'position': [0.0, 0.0, float(i)], 'segment_to_next': {}} for i in (0, 10, 20)]
+    controls[-1] = {'position': [0.0, 0.0, 20.0]}
+    controls[0]['segment_to_next'] = {'tags': ['gap']}
+    controls[0]['tags'] = ['break']
+    controls[1]['tags'] = ['break']
+    data = {'version': 4, 'control_points': controls}
+    fiber = mod.Fiber(path='v.json', data=data, line_xyz=np.zeros((21, 3)), zyx=np.zeros((21, 3)),
+                      control_line_indices=np.array([0, 10, 20]), tag='V', span=(0, 20))
+    assert mod.line_index_inside_gap_span(fiber, 5)
+    assert not mod.line_index_inside_gap_span(fiber, 15)
+    assert not mod.line_index_inside_gap_span(fiber, 10)
+    other = mod.Fiber(path='h.json', data={'version': 4, 'control_points': [
+        {'position': [0.0, 0.0, 0.0], 'segment_to_next': {}}, {'position': [0.0, 0.0, 20.0]}]},
+        line_xyz=np.zeros((21, 3)), zyx=np.zeros((21, 3)),
+        control_line_indices=np.array([0, 20]), tag='H', span=(0, 20))
+    fibers = {'v.json': fiber, 'h.json': other}
+    inside = mod.PlannedLink('v.json', 'h.json', 5, 3, 0, 1.0, 1.0, 1.0, 5.0)
+    outside = mod.PlannedLink('v.json', 'h.json', 15, 3, 0, 1.0, 1.0, 1.0, 15.0)
+    assert mod.drop_links_inside_gap_spans([inside, outside], fibers) == [outside]
+    # A version-3 document has no span tags: nothing is dropped.
+    data['version'] = 3
+    assert mod.drop_links_inside_gap_spans([inside], fibers) == [inside]

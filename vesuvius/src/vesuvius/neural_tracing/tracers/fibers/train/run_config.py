@@ -9,7 +9,8 @@
       "lr_restart_step": null,           # with --resume: warmup + cosine to training.steps restart from this update
                                          # (<= the resumed one); AdamW moments are kept. null: the checkpoint's
       "dataset": {...},                  # the dataset configuration (data/datasets.py: version, cache_dir, sources)
-      "model": {"type": "regression"},   # 'regression', 'flow' or 'sequence', plus any model field
+      "model": {"type": "regression"},   # 'regression', 'flow' or 'sequence', plus any model field; frame_checkpoint
+                                         # defaults to the frame model, null: CT structure-tensor crop frames
       "training": {...},                 # optimizer, schedule, losses, sampling, task shares, DAgger, diagnostics
       "runtime": {...}                   # device, workers, threads, CT prefetch: settings of the machine
     }
@@ -190,7 +191,7 @@ def model_config(run):
     from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec
     values = {k: v for k, v in run['model'].items() if k != 'type'}
     values['fine'] = CropSpec(**values['fine'])
-    for key in ('cnn_channels', 'cnn_blocks', 'flow_sigma'):
+    for key in ('cnn_channels', 'cnn_blocks', 'cnn_strides', 'flow_sigma'):
         if isinstance(values.get(key), list):
             values[key] = tuple(tuple(v) if isinstance(v, list) else v for v in values[key])
     return config_class(run['model']['type'])(**values)

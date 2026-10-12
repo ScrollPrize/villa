@@ -320,6 +320,14 @@ namespace line_annotation {
     constexpr auto CURRENT_CUT_ZOOM = "lineAnnotation/current_cut_zoom";
     constexpr auto SIDE_CUT_ZOOM = "lineAnnotation/side_cut_zoom";
     constexpr auto STRIP_ZOOMS = "lineAnnotation/strip_zooms";
+    // Fiber model backend: the neural fiber-follow model (a vesuvius
+    // checkpoint, served by FiberFollowService) instead of the native
+    // prediction-field tracer, for open-tail extrapolation and Trace spans.
+    constexpr auto FIBER_FOLLOW_ENABLED = "lineAnnotation/fiber_follow_enabled";
+    constexpr bool FIBER_FOLLOW_ENABLED_DEFAULT = false;
+    constexpr auto FIBER_FOLLOW_CHECKPOINT = "lineAnnotation/fiber_follow_checkpoint";
+    // Empty: the Python environment VC3D was started from.
+    constexpr auto FIBER_FOLLOW_PYTHON = "lineAnnotation/fiber_follow_python";
 }
 
 // -----------------------------------------------------------------------------

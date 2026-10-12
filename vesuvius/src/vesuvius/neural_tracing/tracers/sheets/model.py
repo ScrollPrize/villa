@@ -32,7 +32,7 @@ def crop_encoder(crop, channels, strides, dim: int, bottleneck: int = 0, in_chan
     """One token per crop: a ResNet-D basic block per stage (two 3x3x3 convs, GroupNorm(4), GELU, a pooled/projected
     skip), optionally a 1x1 conv to ``bottleneck`` channels, then flatten and Linear to ``dim``. Every crop size
     must be divisible by 2 per stride-2 stage."""
-    return CropCNN(channels, strides, (1,)*len(channels), norm='group', nonlin='gelu', conv_bias='all', head='crop',
+    return CropCNN(channels, strides, (1,)*len(channels), norm='group', activation='gelu', conv_bias='all', head='crop',
                    dim=dim, crop=crop, bottleneck=bottleneck, in_channels=in_channels)
 
 

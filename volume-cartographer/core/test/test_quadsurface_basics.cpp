@@ -34,6 +34,37 @@ cv::Mat_<cv::Vec3f> makeSparseGrid(int rows, int cols, int patchH, int patchW)
 
 } // namespace
 
+TEST_CASE("pointTo supports two- and three-support ribbons on either axis")
+{
+    for (const int narrow : {2, 3}) {
+        for (const bool transpose : {false, true}) {
+            const auto points = makePlanarGrid(transpose ? narrow : 7,
+                                              transpose ? 7 : narrow);
+            QuadSurface surface(points, {1, 1});
+            surface.shiftSurfaceOrigin({123, -17});
+            const cv::Vec2d grid = transpose ? cv::Vec2d(3, 0.5) : cv::Vec2d(0.5, 3);
+            const auto uv = surface.gridToSurface(grid);
+            const cv::Vec3f target(float(grid[0]), float(grid[1]), 50);
+            cv::Vec3f ptr(float(uv[0]), float(uv[1]), 0);
+            const float distance = surface.pointTo(ptr, target, 0.01f, 10);
+            CHECK(distance >= 0);
+            CHECK(distance < 0.01f);
+            CHECK(cv::norm(surface.coord(ptr) - target) < 0.01f);
+            // Force restart sampling rather than returning from the initial hint.
+            CHECK(surface.pointTo(ptr, target + cv::Vec3f(0, 0, 10), 0.01f, 10) >= 9.99f);
+            cv::Vec2f loc;
+            const float floatDistance = pointTo(loc, points, target, 0.01f, 10, 1);
+            CHECK(floatDistance >= 0);
+            CHECK(floatDistance < 0.01f);
+            cv::Mat_<cv::Vec3d> doublePoints;
+            points.convertTo(doublePoints, CV_64FC3);
+            const float doubleDistance = pointTo(loc, doublePoints, target, 0.01f, 10, 1);
+            CHECK(doubleDistance >= 0);
+            CHECK(doubleDistance < 0.01f);
+        }
+    }
+}
+
 TEST_CASE("Rect3D default-construction is zero box")
 {
     Rect3D r;

@@ -211,7 +211,18 @@ if __name__ == "__main__":
     parser.add_argument("--output_folder", required=True, help="Output folder path.")
     parser.add_argument("--radius", type=int, default=2, help="Radius for expansion")
     parser.add_argument("--workers", type=int, default=None, help="Num of workers.")
+    parser.add_argument("--token_path", default="token.txt",
+                        help="Path to a file containing the WebKnossos token.")
     args = parser.parse_args()
+
+    # Read the token before any expensive work: the volume download needs it, and
+    # failing after the voxelization has already run wastes minutes and leaves a
+    # half-finished output folder behind.
+    try:
+        with open(args.token_path, "r") as file:
+            TOKEN = file.read().strip()
+    except OSError as e:
+        parser.error(f"Failed to read token from {args.token_path}: {e}")
 
     assert 1 <= args.radius <= 4, "Radius should be between 1 and 4."
     # Create folder structure if needed
@@ -270,9 +281,6 @@ if __name__ == "__main__":
     print(f"Writing image chunk to {images_filename}...")# and {images_filename_std}...")
 
     WK_URL = "http://dl.ash2txt.org:8080"
-    with open("token.txt", "r") as file:
-        TOKEN = file.read().strip()
-    print(f"Loaded TOKEN: {TOKEN}")
 
     ORGANIZATION_ID = "Scroll_Prize"
     bb = wk.NDBoundingBox(

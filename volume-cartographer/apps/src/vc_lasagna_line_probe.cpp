@@ -246,7 +246,8 @@ void saveFiberOutput(const FiberInput& fiber,
             throw std::runtime_error("optimized output is missing control-point indices");
         const auto metrics = lasagnaSpanMetrics(outputLinePoints, fixedIndices, sampler);
         root["type"] = "vc3d_fiber";
-        root["version"] = 3;
+        // Version 4 = version 3 plus optional span tags, carried over below.
+        root["version"] = 4;
         root["optimization_mode"] = fiber.parsed.optimizationMode;
         root["control_points"] = nlohmann::json::array();
         const nlohmann::json originalControls =
@@ -254,25 +255,37 @@ void saveFiberOutput(const FiberInput& fiber,
         for (size_t index = 0; index < fiber.controlPoints.size(); ++index) {
             nlohmann::json control{{"position", pointToJson(fiber.controlPoints[index])}};
             // Per-point tags belong to the point, not the re-fit span: carry
-            // them over from the version-3 input entry.
+            // them over from the version-3/4 input entry.
             if (index < originalControls.size() && originalControls[index].is_object() &&
                 originalControls[index].contains("tags")) {
                 control["tags"] = originalControls[index].at("tags");
             }
             if (index + 1 < fiber.controlPoints.size()) {
-                const std::string goal = fiber.parsed.version == 3
+                const std::string goal = fiber.parsed.version >= 3
                     ? fiber.parsed.segmentMetadata[index].at("interp_goal").get<std::string>()
                     : std::string{"global"};
-                const nlohmann::json config = fiber.parsed.version == 3
+                const nlohmann::json config = fiber.parsed.version >= 3
                     ? fiber.parsed.segmentMetadata[index].at("config")
                     : fiberTraceConfigJson(workingToBaseScale);
                 control["segment_to_next"] =
                     vc::fiber_tracer::makeLasagnaSegmentMetadataJson(
                         goal, normalManifest, workingToBaseScale, config,
                         metrics.at(index));
+                // Span tags (version 4, e.g. "gap") describe the span, not
+                // the fit: they survive the re-optimization like the goal.
+                if (fiber.parsed.version >= 4 &&
+                    fiber.parsed.segmentMetadata[index].contains("tags")) {
+                    control["segment_to_next"]["tags"] =
+                        fiber.parsed.segmentMetadata[index].at("tags");
+                }
             }
             root["control_points"].push_back(std::move(control));
         }
+        // The span tags follow VC3D's rule (gap iff both ends are breaks,
+        // never damaged on a gap), so a version-3 input with two consecutive
+        // breaks comes out as a consistent version-4 file rather than one
+        // VC3D has to heal on load.
+        vc::fiber_tracer::normalizeGapSpanTagsJson(root["control_points"]);
         root["line_points"] = nlohmann::json::array();
         for (const auto& point : outputLinePoints)
             root["line_points"].push_back(pointToJson(point));

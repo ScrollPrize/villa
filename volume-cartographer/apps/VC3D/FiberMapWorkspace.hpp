@@ -11,24 +11,26 @@
 #include <QPointF>
 #include <QRectF>
 #include <QString>
+#include <QStringList>
 
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "vc/core/util/ScrollUmbilicus.hpp"
 
 #include "AnnotationFrame.hpp"
 #include "FiberMapGapField.hpp"
+#include "FiberMapKollesis.hpp"
 #include "FiberMapRebuildQueue.hpp"
+#include "FiberMapRuler.hpp"
 #include "FiberMapStaleness.hpp"
 #include "FiberNetworkLayout.hpp"
+#include "OpenDataVolumeOrientation.hpp"
 
-class FiberMapRuler;
-struct FiberMapRulerModel;
-struct FiberMapRulerStyle;
 class LineAnnotationController;
 class QCheckBox;
 class QDockWidget;
@@ -147,6 +149,10 @@ private:
         int networkId = -1;
         QGraphicsPathItem* tracedItem = nullptr;
         QGraphicsPathItem* interpolatedItem = nullptr;
+        // Gap spans (both endpoint controls tagged break): dotted amber.
+        QGraphicsPathItem* gapItem = nullptr;
+        // Damaged spans: the gap's dots in the pastel pink.
+        QGraphicsPathItem* damagedItem = nullptr;
         // The network emphasis: a soft semi-transparent halo behind the
         // fiber's whole geometry, created only while its network is
         // selected.
@@ -162,10 +168,25 @@ private:
     // controller is GUI-only), everything from input conversion through the
     // solve runs on a dedicated worker, and the result is validated against
     // the world it was started in before it may publish. Requests while a
-    // build is in flight coalesce through FiberMapRebuildQueue.
-    void requestRebuild(bool fullRebuild = false);
+    // build is in flight coalesce through FiberMapRebuildQueue. automatic
+    // = armed by a staleness gate rather than asked for: such a request,
+    // pending behind a build, is dropped when the volume moved on
+    // meanwhile (finishRebuild), where an asked-for one is honoured.
+    void requestRebuild(bool fullRebuild = false, bool automatic = false);
     void rebuildScene(const QString& emptyMessage);
     void rebuildTree();
+    // The dock tree's columns, in order; the len column's header names the
+    // unit its cells are in (cm with a voxel size, else vx).
+    enum TreeColumn {
+        kTreeFiberColumn = 0,
+        kTreeHvColumn,
+        kTreeWindingColumn,
+        kTreeLengthColumn,
+        kTreeAnchorColumn,
+        kTreeAnnotationColumn,
+        kTreeColumnCount,
+    };
+    [[nodiscard]] QStringList treeHeaderLabels() const;
     // Hides every fiber row the search box does not match, and every group
     // (error, network) left without a visible row; an empty box shows all.
     void applyTreeFilter();
@@ -194,6 +215,9 @@ private:
     using StaleVerdict = vc3d::fiber_map::StaleVerdict;
     [[nodiscard]] vc3d::fiber_map::FiberMapDependencies currentDependencies() const;
     [[nodiscard]] vc3d::fiber_map::FiberMapDependencies layoutDependencies() const;
+    // The cached catalog manifest's version for a coordinate space
+    // (FiberMapDependencies::catalogManifestToken): a stat, no parse.
+    [[nodiscard]] QString catalogManifestTokenFor(const std::string& coordinateSpace) const;
     // Cheap enough to guard interaction — integer compares, a few volume metadata
     // reads, and stats of the umbilicus candidates. Mutates nothing.
     [[nodiscard]] StaleVerdict evaluateDependencies() const;
@@ -216,7 +240,7 @@ private:
     // RebuildJobResult above) carries the snapshot, params, and the
     // memoization cache - moved out of the workspace at start, moved back
     // only on a validated publish.
-    void startRebuild(bool fullRebuild);
+    void startRebuild(bool fullRebuild, bool automatic);
     // Watcher-delivered completion: validate against the current world,
     // publish or discard, then run the one epilogue.
     void applyRebuild(const std::shared_ptr<RebuildJobResult>& job);
@@ -243,10 +267,35 @@ private:
     // scene; it is never allowed to produce displayed text, because when the
     // voxel size is unknown it is a guess.
     [[nodiscard]] double sceneVxPerCm() const;
+    // Scene x for a layout x: the layout's x is arclength at one reference
+    // radius (winding-linear); the scene stretches it by the fitted sheet
+    // model so that a centimetre of sheet is the same width on every winding
+    // and the distance ruler reads scene x directly. Every placed coordinate
+    // goes through it, and nothing converts back: clicks resolve against the
+    // placed entries.
+    [[nodiscard]] double sceneXOf(double layoutXVx) const;
     // A layout length (voxels) as display text: centimetres when the voxel size
     // is known, otherwise the voxel count itself, which is the one figure still
     // true when the package cannot say how big a voxel is.
     [[nodiscard]] QString formatMapLength(double valueVx) const;
+    // The dock's total: every fiber of the published snapshot summed, in the
+    // same unit as the tree's len column; a dash without a layout.
+    void updateTotalLengthLabel();
+    // The kollesis seams (FiberMapKollesis.hpp) read off the published
+    // layout's H fibers with the toolbar's grouping gap: the terminations,
+    // in map x for grouping and scene x for fitting, over the scroll's z
+    // extent.
+    [[nodiscard]] vc3d::fiber_map::kollesis::Model buildKollesisModel() const;
+    // Redraws the seams - the translucent overlap bands, their bound lines
+    // and midlines in the scene, and the ruler's kollesis marks - from the
+    // layout as it stands. Cheap (no solve), so the toolbar's kollesis
+    // controls call it directly; rebuildScene() calls it as part of every
+    // scene build.
+    void rebuildKollesisOverlay();
+    // The content rect plus whatever the kollesis overlay reaches beyond it:
+    // what the first-build fit frames and the scene rect wraps.
+    [[nodiscard]] QRectF framedRect() const;
+    void applySceneRect();
     void setHighlightedFiber(uint64_t fiberId);
     // The gap heat map (FiberMapGapField.hpp). The field is a pure function of
     // the published layout and the toolbar's settings: it is built on the
@@ -336,6 +385,14 @@ private:
     // fiber row's label and annotation name, re-applied after every tree
     // rebuild.
     QLineEdit* _searchEdit = nullptr;
+    // Above the search box: the summed line length of every fiber the
+    // published layout was built from, placed or not.
+    QLabel* _totalLengthLabel = nullptr;
+    // Line length in annotation-frame voxels by runtime fiber id, for every
+    // fiber of the published layout's snapshot (the layout itself keeps only
+    // the smoothed, unrolled geometry, which is not what a length is read
+    // from). Cleared with the layout.
+    std::unordered_map<uint64_t, double> _fiberLengthVx;
     QLabel* _statusLabel = nullptr;
     QCheckBox* _gapsCheck = nullptr;
     // The colour scale reads "0 [ramp] [saturation]": the spinbox IS the
@@ -345,6 +402,18 @@ private:
     QDoubleSpinBox* _gapSaturationSpin = nullptr;
     QCheckBox* _gapFadeCheck = nullptr;
     QSpinBox* _gapFadeWindingsSpin = nullptr;
+    // The kollesis seams: on/off (the whole feature, scene and bar), the
+    // grouping gap in windings, and how many seams to predict ahead.
+    QCheckBox* _kollesisCheck = nullptr;
+    QDoubleSpinBox* _kollesisGapSpin = nullptr;
+    QSpinBox* _kollesisAheadSpin = nullptr;
+    // Scene-owned seam items (bands, bounds, midlines); cleared with the
+    // scene, or removed and deleted by rebuildKollesisOverlay().
+    std::vector<QGraphicsItem*> _kollesisItems;
+    vc3d::fiber_map::kollesis::Model _kollesisModel;
+    // What the view's axes read, as last handed over: the layout's extent
+    // and windings, plus the kollesis marks the overlay rebuild fills in.
+    FiberMapRulerModel _rulerModel;
     // The published layout's gap field (null before a build that carried
     // one) and the settings it was built with, so a toggle can tell a field
     // it may show from one that needs a rebuild.
@@ -369,6 +438,11 @@ private:
     // rebuild's check.
     vc3d::fiber_map::GlobalLayoutCache _layoutCache;
     bool _memoizationDisabled = false;
+    // The catalog's say on the scroll's winding sense, consulted by the
+    // worker of every rebuild (the lookup memoizes its one manifest parse
+    // and locks internally; the job holds it by shared pointer so a
+    // workspace torn down mid-flight cannot pull it from under the worker).
+    std::shared_ptr<vc3d::opendata::CatalogVolumeOrientationLookup> _catalogOrientation;
     bool _haveLastDigests = false;
     vc3d::fiber_map::ContentDigest _lastInputsDigest;
     vc3d::fiber_map::ContentDigest _lastOutputDigest;
@@ -389,6 +463,9 @@ private:
     // past the outer panels; this is the tight rect around the content, which
     // is what the first-build fit frames.
     QRectF _contentRect;
+    // The x range the kollesis seams and predictions cover beyond the content
+    // rect (same y as the content rect); null while they stay inside it.
+    QRectF _kollesisReach;
     // What the empty scene last said, so a theme change can rebuild the scene as
     // it stands rather than take a fresh snapshot to work out the message again.
     QString _emptyMessage;
@@ -426,6 +503,8 @@ private:
     uint64_t _layoutGeneration = 0;
     vc3d::annotation::AnnotationFrame _layoutFrame;
     QString _layoutUmbilicusFingerprint;
+    QString _layoutCatalogVolume;
+    QString _layoutCatalogManifestToken;
     // Controller counters as of the build. Compared rather than observed, so that
     // this workspace existing costs annotation work nothing.
     uint64_t _layoutPackageGeneration = 0;
