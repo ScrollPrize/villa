@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass, field
 
 from surface_orientation import METADATA_KEY as ORIENTATION_METADATA_KEY, GridLayout, export_metadata
+from tifxyz_spacing import grid_spacing_and_area
 
 
 @dataclass
@@ -436,8 +437,7 @@ def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source, *, layout_me
     Image.fromarray(np.asarray(zyxs[..., 1], dtype=np.float32)).save(f'{path}/y.tif')
     Image.fromarray(np.asarray(zyxs[..., 0], dtype=np.float32)).save(f'{path}/z.tif')
     valid_vertex = np.any(zyxs != -1, axis=-1)
-    valid_quad = valid_vertex[:-1, :-1] & valid_vertex[1:, :-1] & valid_vertex[:-1, 1:] & valid_vertex[1:, 1:]
-    area_vx2 = int(valid_quad.sum()) * step_size ** 2
+    spacing_cols, spacing_rows, area_vx2 = grid_spacing_and_area(zyxs, valid_vertex, step_size)
     valid_zyxs = zyxs[valid_vertex]
     bbox = (
         [valid_zyxs.min(axis=0)[::-1].tolist(), valid_zyxs.max(axis=0)[::-1].tolist()]
@@ -445,7 +445,7 @@ def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source, *, layout_me
         else [[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]]
     )
     metadata = {
-        'scale': [1 / step_size, 1 / step_size],
+        'scale': [1 / spacing_cols, 1 / spacing_rows],
         'bbox': bbox,
         'area_vx2': area_vx2,
         'area_cm2': area_vx2 * voxel_size_um ** 2 / 1.e8,
@@ -574,13 +574,7 @@ def save_combined_tifxyz(
         Image.fromarray(combined[..., 0]).save(os.path.join(surface_dir, "z.tif"))
 
         valid_vertex = np.any(combined != -1, axis=-1)
-        valid_quad = (
-            valid_vertex[:-1, :-1]
-            & valid_vertex[1:, :-1]
-            & valid_vertex[:-1, 1:]
-            & valid_vertex[1:, 1:]
-        )
-        area_vx2 = int(valid_quad.sum()) * step_size ** 2
+        spacing_cols, spacing_rows, area_vx2 = grid_spacing_and_area(combined, valid_vertex, step_size)
         valid_zyxs = combined[valid_vertex]
         bbox = (
             [valid_zyxs.min(axis=0)[::-1].tolist(), valid_zyxs.max(axis=0)[::-1].tolist()]
@@ -588,7 +582,7 @@ def save_combined_tifxyz(
             else [[-1.0] * 3, [-1.0] * 3]
         )
         metadata = {
-            "scale": [1 / step_size, 1 / step_size],
+            "scale": [1 / spacing_cols, 1 / spacing_rows],
             "bbox": bbox,
             "area_vx2": area_vx2,
             "area_cm2": area_vx2 * voxel_size_um ** 2 / 1.e8,
