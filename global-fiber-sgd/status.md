@@ -1,5 +1,11 @@
 # Reference-selected regional solve
 
+## Adaptive loss-weight tuning
+- [x] Previous results committed at 102d25a55.
+- [x] Plan independently reviewed; controller and 12 CPU tests passing.
+- [ ] Implementation review and managed search.
+- [ ] Complete no-improvement neighborhood and document accepted settings.
+
 ## Fresh LR follow-up
 - [x] Plan and stateLR10x config.
 - [x] Independentreview and stateLR10x trial; worseL1andloss.

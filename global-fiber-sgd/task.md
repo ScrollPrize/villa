@@ -1,5 +1,9 @@
 # Reference-selected regional solve
 
+Current: iterative loss-weight tuning from fresh initialization, accept by final
+reference L1, revisit other weights after each acceptance. Only report accepted
+improvements, not 1k progress. See uv_loss_search_plan.md.
+
 Current: fresh0.5position run withanother10xstateLR, thenwidthLR20/.2 on
 stateLR selectedbyfinalreferenceL1; full1kprogress tables.
 

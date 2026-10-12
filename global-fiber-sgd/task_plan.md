@@ -1,5 +1,7 @@
 # Global fiber SGD: data reconnaissance
 
+Current: uv_loss_search_plan.md, adaptive finite-grid final-L1 weight search.
+
 Current: uv_bucket_lr_plan.md, fresh state10x thenselectedbasewidthLR20/.2.
 
 Current: uv_bucket_split_plan.md.

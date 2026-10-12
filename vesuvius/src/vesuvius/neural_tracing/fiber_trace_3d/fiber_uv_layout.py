@@ -888,6 +888,9 @@ class FullPassGradientAccumulator:
 
 
 def solve(config):
+    if config.get('loss_weight_search'):
+        from .fiber_uv_weight_search import run as search_weights
+        return search_weights(config)
     if config.get('bucket_position_split',False) and config.get('assignment_update')=='cost_target':
         raise ValueError('Bucket position split is not supported by cost_target updates')
     if config.get('distributed_suite'):
