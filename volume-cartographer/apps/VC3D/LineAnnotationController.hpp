@@ -339,7 +339,8 @@ public:
     // Opens a fiber annotation (with line_points) read-only, without adding it
     // to the package: nothing is written, optimized or edited, and the fiber
     // is forgotten when its view closes. key identifies the source fiber
-    // (reopening the same key while its view is open reuses that view).
+    // (reopening the same key while its view is open reuses that view). The
+    // viewer's Edit a copy action explicitly imports a separate editable fiber.
     LineAnnotationDialog* openFiberReadOnly(const nlohmann::json& fiber, const std::string& key,
                                             QString* error = nullptr);
     void openFiberAtControlPoint(uint64_t fiberId, int controlPointIndex);

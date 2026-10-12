@@ -2965,7 +2965,29 @@ LineAnnotationDialog* LineAnnotationController::openFiberReadOnly(const nlohmann
     auto* dialog = openCollectionFiber(id, error);
     if (!dialog) {
         std::erase_if(_fibers, [id](const StoredFiber& stored) { return stored.id == id && stored.readOnly; });
+        return nullptr;
     }
+    dialog->setEditCopyAvailable(true);
+    connect(dialog, &LineAnnotationDialog::editCopyRequested, this,
+            [this, root, key, preview = QPointer<LineAnnotationDialog>(dialog), copyId = uint64_t{0}]() mutable {
+        // Opening the editable session closes the preview and can destroy this
+        // connection. Keep everything needed after that call on the stack.
+        const QPointer<LineAnnotationDialog> sourceDialog = preview;
+        QString copyError;
+        if (!copyId) {
+            const auto filename = "editable_" + fs::path(key).filename().string();
+            copyId = importFiberJson(root, filename, &copyError);
+        }
+        // If opening fails after a successful import, retry the same copy.
+        const uint64_t editableId = copyId;
+        if (editableId && openCollectionFiber(editableId, &copyError)) {
+            return;
+        }
+        if (sourceDialog) {
+            sourceDialog->setEditCopyAvailable(true);
+        }
+        showError(copyError.isEmpty() ? tr("Could not open an editable copy of this fiber.") : copyError);
+    });
     return dialog;
 }
 
