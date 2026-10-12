@@ -342,6 +342,100 @@ struct TriangleIdx {
     int i2;
 };
 
+struct CandidateTriangle {
+    TriangleIdx tri;
+    bool usable;  // passed the edge-length / quality filter
+};
+
+/**
+ * @brief Re-admit low-quality triangles whose removal would punch a hole
+ *        inside the mesh.
+ *
+ * ABF++ only constrains interior vertices (angle sum = 2*pi, sine/wheel
+ * consistency); nothing forces the angles around an interior hole to close
+ * up. When the quality filter cuts a cluster of long-edge or sliver triangles
+ * out of the middle of a surface, ABF++ is free to return angles that no
+ * planar layout can satisfy, and the least-squares LSCM step spreads that
+ * error as a scale drift along the whole mesh: long strips come out as fans
+ * whose far end is several times smaller than the near end.
+ *
+ * Rejected triangles are grouped into edge-connected clusters. A cluster
+ * that does not reach the border of the candidate mesh would leave an
+ * interior hole, so its triangles are kept (they only failed the soft
+ * quality test; hard-degenerate triangles never get here). Clusters that
+ * touch the border are still dropped, as before.
+ *
+ * @return number of triangles switched back to usable
+ */
+static int readmitEnclosedLowQualityTriangles(std::vector<CandidateTriangle>& candidates)
+{
+    const auto edgesOf = [](const TriangleIdx& t) {
+        return std::array<EdgeKey, 3>{
+            EdgeKey{std::min(t.i0, t.i1), std::max(t.i0, t.i1)},
+            EdgeKey{std::min(t.i1, t.i2), std::max(t.i1, t.i2)},
+            EdgeKey{std::min(t.i2, t.i0), std::max(t.i2, t.i0)}};
+    };
+
+    std::vector<int> rejected;
+    for (int i = 0; i < static_cast<int>(candidates.size()); ++i) {
+        if (!candidates[i].usable) {
+            rejected.push_back(i);
+        }
+    }
+    if (rejected.empty()) {
+        return 0;
+    }
+
+    // Edge use counts over all candidates: an edge used once lies on the border.
+    std::unordered_map<EdgeKey, int, EdgeKeyHash> edgeUse;
+    edgeUse.reserve(candidates.size() * 2);
+    for (const auto& c : candidates) {
+        for (const auto& e : edgesOf(c.tri)) {
+            ++edgeUse[e];
+        }
+    }
+
+    // Union-find over rejected triangles sharing an edge.
+    std::vector<int> parent(rejected.size());
+    for (std::size_t i = 0; i < parent.size(); ++i) {
+        parent[i] = static_cast<int>(i);
+    }
+    const auto root = [&](int x) {
+        while (parent[x] != x) {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        return x;
+    };
+    std::unordered_map<EdgeKey, int, EdgeKeyHash> firstRejectedOnEdge;
+    for (int r = 0; r < static_cast<int>(rejected.size()); ++r) {
+        for (const auto& e : edgesOf(candidates[rejected[r]].tri)) {
+            auto [it, inserted] = firstRejectedOnEdge.emplace(e, r);
+            if (!inserted) {
+                parent[root(r)] = root(it->second);
+            }
+        }
+    }
+
+    std::vector<char> touchesBorder(rejected.size(), 0);
+    for (int r = 0; r < static_cast<int>(rejected.size()); ++r) {
+        for (const auto& e : edgesOf(candidates[rejected[r]].tri)) {
+            if (edgeUse[e] == 1) {
+                touchesBorder[root(r)] = 1;
+            }
+        }
+    }
+
+    int readmitted = 0;
+    for (int r = 0; r < static_cast<int>(rejected.size()); ++r) {
+        if (!touchesBorder[root(r)]) {
+            candidates[rejected[r]].usable = true;
+            ++readmitted;
+        }
+    }
+    return readmitted;
+}
+
 /**
  * @brief Compute 3D surface area using triangulation of valid quads (parallelized)
  */
@@ -960,6 +1054,8 @@ static cv::Mat_<cv::Vec2f> abfFlattenInternal(const QuadSurface& surface,
     // Step 1: Build candidate triangle list from valid quads.
     std::vector<TriangleIdx> triangles;
     triangles.reserve(static_cast<std::size_t>((points->rows - 1) * (points->cols - 1) * 2));
+    std::vector<CandidateTriangle> candidates;
+    candidates.reserve(triangles.capacity());
     int skippedHardDegenerate = 0;
     int skippedLowQuality = 0;
 
@@ -1000,29 +1096,32 @@ static cv::Mat_<cv::Vec2f> abfFlattenInternal(const QuadSurface& surface,
             const bool tri1HardValid = isUsableTriangle(p10, p00, p01);
             const bool tri1Usable = tri1HardValid &&
                                     isUsableTriangle(p10, p00, p01, minUsableEdgeSq, maxUsableEdgeSq, minTriangleQuality);
-            if (tri1Usable) {
-                triangles.push_back({idx10, idx00, idx01});
+            if (tri1HardValid) {
+                candidates.push_back({{idx10, idx00, idx01}, tri1Usable});
             } else {
-                if (tri1HardValid) {
-                    skippedLowQuality++;
-                } else {
-                    skippedHardDegenerate++;
-                }
+                skippedHardDegenerate++;
             }
 
             // Triangle 2: p10, p01, p11
             const bool tri2HardValid = isUsableTriangle(p10, p01, p11);
             const bool tri2Usable = tri2HardValid &&
                                     isUsableTriangle(p10, p01, p11, minUsableEdgeSq, maxUsableEdgeSq, minTriangleQuality);
-            if (tri2Usable) {
-                triangles.push_back({idx10, idx01, idx11});
+            if (tri2HardValid) {
+                candidates.push_back({{idx10, idx01, idx11}, tri2Usable});
             } else {
-                if (tri2HardValid) {
-                    skippedLowQuality++;
-                } else {
-                    skippedHardDegenerate++;
-                }
+                skippedHardDegenerate++;
             }
+        }
+    }
+
+    // Keep low-quality triangles that the filter would cut out of the middle
+    // of the mesh (see readmitEnclosedLowQualityTriangles).
+    const int readmittedLowQuality = readmitEnclosedLowQualityTriangles(candidates);
+    for (const auto& c : candidates) {
+        if (c.usable) {
+            triangles.push_back(c.tri);
+        } else {
+            skippedLowQuality++;
         }
     }
 
@@ -1417,6 +1516,11 @@ static cv::Mat_<cv::Vec2f> abfFlattenInternal(const QuadSurface& surface,
     if (skippedLowQuality > 0) {
         std::cout << "ABF++: Skipped " << skippedLowQuality
                   << " low-quality triangles" << std::endl;
+    }
+    if (readmittedLowQuality > 0) {
+        std::cout << "ABF++: Kept " << readmittedLowQuality
+                  << " low-quality triangles enclosed by the mesh (dropping them would leave interior holes)"
+                  << std::endl;
     }
     if (skippedDegenerateOut) {
         *skippedDegenerateOut = skippedHardDegenerate;
