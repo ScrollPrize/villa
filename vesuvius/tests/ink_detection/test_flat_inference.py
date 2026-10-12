@@ -495,3 +495,65 @@ def test_flat_inference_ignores_embedded_io_paths_and_keeps_reference_defaults(
     assert "stride=8 requested_overlap=0.500 blend_mode=hann" in caplog.text
     assert np.all(tifffile.imread(output) == 127)
     assert not any(path.name.startswith("ink_flat_infer_") for path in tmp_path.iterdir())
+
+
+def test_cache_flags_reach_every_worker_reader(tmp_path, monkeypatch):
+    """--cache-dir / --cache-max-gb parse, survive pickling, and reach open_volume."""
+
+    import pickle
+
+    from vesuvius.ink_detection.inference import infer as infer_module
+
+    args = parse_args(["--cache-dir", str(tmp_path / "cache"), "--cache-max-gb", "2.5"])
+    assert args.cache_dir == tmp_path / "cache"
+    assert args.cache_max_gb == 2.5
+    defaults = parse_args([])
+    assert defaults.cache_dir is None and defaults.cache_max_gb is None
+
+    volume_path = tmp_path / "volume.zarr"
+    values_ZYX = np.arange(3 * 5 * 7, dtype=np.uint8).reshape(3, 5, 7)
+    array = zarr.open(
+        volume_path,
+        mode="w",
+        shape=values_ZYX.shape,
+        chunks=values_ZYX.shape,
+        dtype="u1",
+        zarr_format=2,
+    )
+    array[:] = values_ZYX
+    layers = select_layer_indices(
+        3, layer_start=None, layer_end=None, output_depth=3, direction="forward"
+    )
+    reader = FlatPatchReader(
+        input_path=volume_path,
+        resolution="0",
+        depth_axis_first=True,
+        height=5,
+        width=7,
+        layer_indices=layers,
+        output_depth=3,
+        preprocessing="divide_255",
+        cache_dir=tmp_path / "cache",
+        cache_max_gb=2.5,
+    )
+    # DataLoader workers receive the reader by pickling; the cache settings must
+    # travel with it, because that is where the volume is actually opened.
+    worker_reader = pickle.loads(pickle.dumps(reader))
+    assert worker_reader._array is None
+    assert worker_reader.cache_dir == tmp_path / "cache"
+    assert worker_reader.cache_max_gb == 2.5
+
+    seen = {}
+    real_open_volume = infer_module.open_volume
+
+    def spy(path, resolution, *extra, **kwargs):
+        seen.update(kwargs)
+        return real_open_volume(path, resolution, *extra, **kwargs)
+
+    monkeypatch.setattr(infer_module, "open_volume", spy)
+    patch = worker_reader.read(0, 0, 5, 7)
+    assert seen == {"cache_dir": tmp_path / "cache", "cache_max_gb": 2.5}
+    np.testing.assert_array_equal(patch, np.moveaxis(values_ZYX, 0, -1))
+    if int(zarr.__version__.split(".", 1)[0]) >= 3:
+        cached = [p for p in (tmp_path / "cache").rglob("*") if p.is_file()]
+        assert cached, "the chunk read should have populated the on-disk cache"

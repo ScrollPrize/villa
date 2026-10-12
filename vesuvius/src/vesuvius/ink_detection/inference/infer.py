@@ -397,9 +397,15 @@ class FlatPatchReader:
         layer_indices: np.ndarray,
         output_depth: int,
         preprocessing: str,
+        cache_dir: str | Path | None = None,
+        cache_max_gb: float | None = None,
     ) -> None:
         self.input_path = input_path
         self.resolution = str(resolution)
+        # Carried into DataLoader workers through pickling, so every process
+        # re-opens the volume through the same on-disk chunk cache.
+        self.cache_dir = cache_dir
+        self.cache_max_gb = cache_max_gb
         self.depth_axis_first = bool(depth_axis_first)
         self.height = int(height)
         self.width = int(width)
@@ -434,7 +440,12 @@ class FlatPatchReader:
 
     def _ensure_array(self):
         if self._array is None:
-            self._array = open_volume(self.input_path, self.resolution)
+            self._array = open_volume(
+                self.input_path,
+                self.resolution,
+                cache_dir=self.cache_dir,
+                cache_max_gb=self.cache_max_gb,
+            )
         return self._array
 
     def _read_raw(self, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
@@ -963,7 +974,11 @@ def infer_single_zarr(
 ) -> None:
     """Run one direction over one surface-volume input and replace a TIFF."""
 
-    root = open_volume_root(input_zarr)
+    root = open_volume_root(
+        input_zarr,
+        cache_dir=getattr(args, "cache_dir", None),
+        cache_max_gb=getattr(args, "cache_max_gb", None),
+    )
     resolution = "0" if hasattr(root, "shape") else str(args.resolution)
     volume = select_volume_level(root, resolution, source=str(input_zarr))
     depth_first, depth, height, width, chunk_h, chunk_w = _volume_axes(volume)
@@ -1012,6 +1027,8 @@ def infer_single_zarr(
         layer_indices=layer_indices,
         output_depth=configured_model.input_depth,
         preprocessing=configured_model.preprocessing,
+        cache_dir=getattr(args, "cache_dir", None),
+        cache_max_gb=getattr(args, "cache_max_gb", None),
     )
     mask = (
         None
@@ -1306,6 +1323,23 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--output-prefix", default="")
     parser.add_argument("--mask-path", type=Path)
     parser.add_argument("--resolution", default="0")
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional Zarr-3 compressed-chunk disk cache root for the input "
+            "volume, as in the native-3D runner. Remote chunks are fetched once "
+            "and re-read locally; a second run on the same input reads only the "
+            "cache."
+        ),
+    )
+    parser.add_argument(
+        "--cache-max-gb",
+        type=float,
+        default=None,
+        help="Per-volume decimal-GB budget for --cache-dir (evicts oldest first).",
+    )
     parser.add_argument(
         "--num-workers", "--workers", dest="num_workers", type=int, default=4
     )
