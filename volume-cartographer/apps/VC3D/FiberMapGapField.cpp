@@ -17,6 +17,28 @@ namespace
 constexpr double kTwoPi = 2.0 * M_PI;
 constexpr float kOutside = std::numeric_limits<float>::quiet_NaN();
 
+// Whether re-gridding by `model` would move nothing: no pitch with the
+// modelled radius equal to the reference one, or a degenerate model, both
+// of which sheetDistanceMonotoneVx maps as the identity.
+bool sheetMappingIsIdentity(const SheetModel& model)
+{
+    if (!(model.rRefVx > 0.0) || !(model.radius0Vx > 0.0)) {
+        return true;
+    }
+    return model.pitchVx == 0.0 && model.radius0Vx == model.rRefVx;
+}
+
+// Columns of cell `cell` covering the sheet distance between map x0 and x1
+// (as a double, so a budget can be judged before anything is narrowed).
+// The one formula for buildGapField's budget and resampledToSheetDistance's
+// grid, so the built field re-grids within the budget by construction.
+double sheetDistanceColumnCount(const SheetModel& model, double x0, double x1, double cell)
+{
+    const double u0 = sheetDistanceMonotoneVx(model, x0);
+    const double u1 = sheetDistanceMonotoneVx(model, x1);
+    return std::max(1.0, std::ceil((u1 - u0) / cell));
+}
+
 // One rasterised polyline segment in (u, z) voxels.
 struct Segment {
     double uA = 0.0;
@@ -235,10 +257,13 @@ GapField buildGapField(const GlobalResult& layout, const GapFieldParams& params)
     }
     const bool haveSeeds = !segments.empty();
 
-    // Grid dimensions under the cell budget. The seed raster spans the seeds'
-    // u-extent grown by a halo of saturation + 2 cells (clamped to the model
-    // domain), so a query landing outside it is more than the saturation from
-    // every seed in u alone and can be skipped exactly.
+    // Grid dimensions under the cell budget: the output grid, the seed raster,
+    // and the output re-gridded in sheet distance (resampledToSheetDistance,
+    // which has about mean-radius/rRef times the columns) must each fit. The
+    // seed raster spans the seeds' u-extent grown by a halo of saturation + 2
+    // cells (clamped to the model domain), so a query landing outside it is
+    // more than the saturation from every seed in u alone and can be skipped
+    // exactly.
     double cell = params.cellVx;
     int cols = 0;
     int rows = 0;
@@ -262,6 +287,14 @@ GapField buildGapField(const GlobalResult& layout, const GapFieldParams& params)
         };
         const double colsD = count(layout.x1Vx - layout.x0Vx, cell);
         const double rowsD = count(layout.yMaxVx - layout.yMinVx, cell);
+        // The re-gridded columns are counted over the grid's own right edge
+        // (x0 + cols * cell), which is what resampledToSheetDistance sees.
+        // An identity mapping re-grids nothing (resampledToSheetDistance
+        // returns the field), so its term is the grid itself: the shared
+        // formula's ceil of a rounded quotient must not cost a doubling.
+        const double sheetColsD = sheetMappingIsIdentity(model)
+            ? colsD
+            : sheetDistanceColumnCount(model, layout.x0Vx, layout.x0Vx + colsD * cell, cell);
         double rasterColsD = 1.0;
         if (haveSeeds) {
             const double halo = params.saturationVx + 2.0 * cell;
@@ -269,7 +302,8 @@ GapField buildGapField(const GlobalResult& layout, const GapFieldParams& params)
             rasterColsD = count((uHi + halo) - uRaster0, cell);
         }
         const double budget = static_cast<double>(params.maxCells);
-        if (colsD * rowsD <= budget && rasterColsD * rowsD <= budget) {
+        if (colsD * rowsD <= budget && rasterColsD * rowsD <= budget &&
+            sheetColsD * rowsD <= budget) {
             cols = static_cast<int>(colsD);
             rows = static_cast<int>(rowsD);
             rasterCols = static_cast<int>(rasterColsD);
@@ -489,6 +523,82 @@ std::vector<GapFieldTile> gapFieldTiles(const GapField& field, int maxTileCols)
         tiles.push_back(tile);
     }
     return tiles;
+}
+
+GapField resampledToSheetDistance(const GapField& field, const SheetModel& model)
+{
+    if (field.empty() || field.cols <= 0 || field.rows <= 0 || !(field.cellVx > 0.0) ||
+        sheetMappingIsIdentity(model)) {
+        return field;
+    }
+    const double cell = field.cellVx;
+    const double xEnd = field.x0Vx + static_cast<double>(field.cols) * cell;
+    const double colsD = sheetDistanceColumnCount(model, field.x0Vx, xEnd, cell);
+    if (!std::isfinite(colsD) || colsD > static_cast<double>(std::numeric_limits<int>::max())) {
+        throw std::invalid_argument("gap field: sheet-distance extent is not gridable");
+    }
+    const int cols = static_cast<int>(colsD);
+    // Everything but the grid carries over; the cells are written below, so
+    // the source's are not copied first.
+    GapField out;
+    out.x0Vx = sheetDistanceMonotoneVx(model, field.x0Vx);
+    out.y0Vx = field.y0Vx;
+    out.cellVx = cell;
+    out.cols = cols;
+    out.rows = field.rows;
+    out.saturationVx = field.saturationVx;
+    out.folded = field.folded;
+    out.faded = field.faded;
+    out.foldTruncated = field.foldTruncated;
+    out.cellCoarsened = field.cellCoarsened;
+    out.seedFiberCount = field.seedFiberCount;
+    out.skippedUnresolvedCount = field.skippedUnresolvedCount;
+    out.distanceVx.assign(static_cast<std::size_t>(cols) * static_cast<std::size_t>(field.rows),
+                          kOutside);
+    const double u0 = out.x0Vx;
+    // Source column s is centred at x0 + (s + 0.5) * cell; the first with its
+    // centre at or beyond map x.
+    const auto firstCentreFrom = [&field, cell](double x) {
+        return static_cast<int>(std::ceil((x - field.x0Vx) / cell - 0.5));
+    };
+    const auto clampColumn = [&field](int s) { return std::clamp(s, 0, field.cols - 1); };
+    for (int j = 0; j < cols; ++j) {
+        // The output cell's footprint on the map: the source columns whose
+        // centres fall in [xa, xb). Where the inner windings compress the
+        // map, several do, and the cell takes their smallest value so a
+        // fiber's zero line (a minimum one source column wide) is never
+        // skipped. Where the outer windings stretch it, none does, and the
+        // cell reads the source column its own centre falls in. The last
+        // output column can reach a hair past the source (the ceiling in
+        // the column count); it reads the source's edge column.
+        const double xa = sheetXForDistanceMonotoneVx(model, u0 + static_cast<double>(j) * cell);
+        const double xb =
+            sheetXForDistanceMonotoneVx(model, u0 + (static_cast<double>(j) + 1.0) * cell);
+        const double xCentre =
+            sheetXForDistanceMonotoneVx(model, u0 + (static_cast<double>(j) + 0.5) * cell);
+        if (!std::isfinite(xa) || !std::isfinite(xb) || !std::isfinite(xCentre)) {
+            continue;
+        }
+        int sLo = firstCentreFrom(xa);
+        int sHi = firstCentreFrom(xb) - 1;
+        if (sLo > sHi) {
+            sLo = sHi = static_cast<int>(std::floor((xCentre - field.x0Vx) / cell));
+        }
+        sLo = clampColumn(sLo);
+        sHi = clampColumn(sHi);
+        for (int i = 0; i < field.rows; ++i) {
+            // fmin ignores a NaN operand, so an out-of-domain source column
+            // in the footprint yields to a measured neighbour, and only an
+            // all-NaN footprint stays NaN.
+            float value = kOutside;
+            for (int s = sLo; s <= sHi; ++s) {
+                value = std::fmin(value, field.at(i, s));
+            }
+            out.distanceVx[static_cast<std::size_t>(i) * static_cast<std::size_t>(cols) +
+                           static_cast<std::size_t>(j)] = value;
+        }
+    }
+    return out;
 }
 
 }  // namespace vc3d::fiber_map::gaps

@@ -148,6 +148,12 @@ struct LineControlPoint : vc::lasagna::LineControlPoint {
     // non-empty; they belong to the point itself and travel with it through
     // every edit, unlike segmentToNext which belongs to the span.
     std::vector<std::string> tags;
+    // Session-lifetime identity of this control, assigned by the controller
+    // the first time the control is published (0 until then) and carried
+    // through every edit with the struct, so views can tell "the same
+    // control" across publishes without comparing points or indices.
+    // Mutable: assigned lazily from the const publish path. Not persisted.
+    mutable uint64_t identity = 0;
 
     LineControlPoint() = default;
     LineControlPoint(double linePositionValue, cv::Vec3d volumePointValue, bool isSeedValue, int optimizedIndexValue)

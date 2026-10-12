@@ -19,6 +19,7 @@ from contextlib import suppress
 
 import numpy as np
 import torch
+from device_utils import amp_device_type, empty_cache
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -435,7 +436,7 @@ def predict_fn(
                 with scoped_timer(profiler, "host_to_device_seconds", cuda_sync=detailed_sync):
                     images = images.to(device, non_blocking=True)
 
-                amp_device = "cuda" if device.type == "cuda" else "cpu"
+                amp_device = amp_device_type(device)
                 with scoped_timer(profiler, "forward_seconds", cuda_sync=detailed_sync):
                     with torch.autocast(device_type=amp_device, enabled=True):
                         y_preds = model.forward(images)  # Model-specific forward
@@ -605,6 +606,5 @@ def run_inference(
             del test_loader
         except Exception:
             pass
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        empty_cache(device)
         gc.collect()
