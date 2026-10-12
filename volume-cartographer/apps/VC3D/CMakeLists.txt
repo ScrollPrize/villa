@@ -39,8 +39,11 @@ set(srcs
     FiberMapRuler.cpp
     FiberMapRuler.hpp
     FiberMapRulerMath.hpp
+    FiberLengthDisplay.hpp
     FiberMapGapField.cpp
     FiberMapGapField.hpp
+    FiberMapKollesis.cpp
+    FiberMapKollesis.hpp
     FiberNetworkLayout.cpp
     FiberNetworkLayout.hpp
     FiberWindingSolver.cpp
@@ -222,6 +225,12 @@ set(srcs
     segmentation/SegmentationUndoHistory.hpp
     NeuralTraceServiceManager.cpp
     NeuralTraceServiceManager.hpp
+    FiberFollowService.cpp
+    FiberFollowService.hpp
+    PythonExecutable.cpp
+    PythonExecutable.hpp
+    SocketRequest.cpp
+    SocketRequest.hpp
     LasagnaServiceManager.cpp
     LasagnaServiceManager.hpp
     SpiralArtifactCache.cpp

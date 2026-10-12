@@ -13,7 +13,7 @@ To set up a new experiment, work with the user to:
    - `point_collection.py` — helper for loading sets of annotated points, and linking them to nearby patches.
    - `losses.py`, `spiral_helpers.py`, `geom_utils.py`, `transforms.py`, `flow_fields.py` — fitting-side helper modules on the fit path (`flow_fields.py` is used via `transforms.py`) and NOT used by the metric/render pipeline. These are also fair game to edit (see scope below).
    - `tifxyz.py` — helper for loading/saving grid-topo quad-mesh patches. Read it for context, but it is **frozen** (see scope): it is shared with `render_ink.py`, so editing it changes the metric.
-   - `run_single.py` — the pipeline runner you launch (fit → render ink → score ink). You do NOT edit this or the scoring scripts; just understand what it does.
+   - `runners/run_single.py` — the pipeline runner you launch (fit → render ink → score ink). You do NOT edit this or the scoring scripts; just understand what it does.
 4. **Initialize results.tsv**: Create `results_jul9.tsv` with just the header row (see "Logging results"). The baseline will be recorded after the first run. Change `jul9` to whatever branch tag is chosen.
 5. **Confirm and go**: Confirm setup looks good.
 
@@ -59,15 +59,16 @@ Each experiment is one full pipeline run, driven by `run_single.py`, which chain
 2. `render_ink.py <meshes_dir>` — renders ink strips into `<meshes_dir>/ink`.
 3. `get_ink_metrics.py <meshes_dir>/ink` — scores ink coverage into `<meshes_dir>/ink_metric`.
 
-`run_single.py` reads three things from the environment, which the caller sets:
+`runners/run_single.py` takes these flags (see its `--help`):
 
-- `CUDA_VISIBLE_DEVICES` — the GPU subset for this run. `run_single.py` honours it: `--nproc_per_node` is set to the number of visible GPUs, and the pin is passed straight through to every step.
-- `FIT_SPIRAL_RUN_TAG` — the run tag (names the output dir and the fitted-mesh folder).
-- `FIT_SPIRAL_OUT_DIR` — the base output dir.
+- `--gpus 0,1,2,3` — the GPU subset for this run: one fit rank per GPU, and the pin is passed straight through to every step. `CUDA_VISIBLE_DEVICES` alone is not enough: without `--gpus` the fit runs as a single process.
+- `--output <out_dir>/<tag>` — this run's output dir, which must be new or empty. The runner sets `FIT_SPIRAL_OUT_DIR` from it.
+- `--config <file>` — a JSON object of config overrides. The runner sets `FIT_SPIRAL_CONFIG_OVERRIDES` from it and drops that variable from its own environment.
+- `--dataset` and `--ink-volume` (required), and `--no-wandb`: the runner sets `WANDB_MODE` itself, so exporting `WANDB_MODE=disabled` does not turn W&B off.
 
-**Run two experiments at a time, each on four GPUs.** On an 8-GPU box that means one run pinned to `CUDA_VISIBLE_DEVICES=0,1,2,3` and one to `4,5,6,7`, launched concurrently. Each run is fully self-contained on its four GPUs (fit, render, and score all stay within the pin), so the two never collide.
+**Run two experiments at a time, each on four GPUs.** On an 8-GPU box that means one run with `--gpus 0,1,2,3` and one with `--gpus 4,5,6,7`, launched concurrently. Each run is fully self-contained on its four GPUs (fit, render, and score all stay within the pin), so the two never collide.
 
-Per-step logs go to `<out_dir>/logs/<tag>.{fit,ink,coverage}.log`, and the ink metric is written to `<out_dir>/<datedir>_<tag>/meshes/fitted_<tag>/ink_metric/metrics.json`.
+The runner writes no log files of its own: redirect each run's output to `<out_dir>/logs/<tag>.log`, and read the fit, render and scoring logs this document mentions from that file. The ink metric is written to `<out_dir>/<tag>/<run dir>/meshes/fitted/ink_metric/metrics.json` (`fitted_<name>` if `FIT_SPIRAL_RUN_TAG=<name>` is set in the environment).
 
 ## Output format — reading the metric
 
@@ -142,9 +143,9 @@ The experiment runs on a dedicated branch (e.g. `autoresearch/jul9`).
 LOOP FOREVER (two experiments in flight at a time):
 
 1. Look at the git state: the current branch/commit we're on.
-2. Tune the fitting code (`fit_spiral.py` and/or its helper modules) with an experimental idea by directly hacking the code, or by setting environment variables. You can put two variants (or one variant under two seeds) into the two concurrent slots.
+2. Tune the fitting code (`fit_spiral.py` and/or its helper modules) with an experimental idea by directly hacking the code, or with config overrides passed as `--config` (see above). You can put two variants (or one variant under two seeds) into the two concurrent slots.
 3. git commit the change(s).
-4. Launch the batch: two `run_single.py` runs, one on GPUs `0,1,2,3` and one on `4,5,6,7`, each with its own `FIT_SPIRAL_RUN_TAG`. Redirect all output to files — do NOT tee or let output flood your context.
+4. Launch the batch: two `run_single.py` runs, one on GPUs `0,1,2,3` and one on `4,5,6,7`, each with its own `--output`. Redirect all output to files — do NOT tee or let output flood your context.
 5. Read out each result: load `summary.total_fg_pixels` and `summary.overall_fg_fraction` from each run's `metrics.json` (see Output format).
 6. If a run's `metrics.json` is absent, it crashed. Read the tail of its per-step logs to find the stack trace and attempt a fix. If you can't get it working after a few attempts, give up on that idea.
 7. Record each result in the tsv (do NOT commit the tsv; leave it untracked).
@@ -157,7 +158,7 @@ You are a completely autonomous researcher. If an idea works, keep; if not, disc
 - DO NOT type any command containing shell substitution (`$(...)`, backticks), process substitution (`<(...)`), or ANSI C-strings (`$'...'`). These always prompt. This includes inside `run_in_background` commands and inside `&&`/`;` chains. (Operators like `&&`, `|`, `>` themselves are fine; it is *substitution* that prompts.)
 - DO NOT type ad-hoc inspection one-liners (`for d in ...; do grep ... $(...); done`, `cat .../metrics.json | ...`, `python -c "import json; ..."`, etc.). Every new variant is a new prompt, and JSON-parsing one-liners are especially tempting here — resist them.
 - INSTEAD, keep everything down to **two fixed-form helper scripts plus one fixed git command**, and invoke each with an *identical command string* every time. All the logic that needs substitution/loops/pipes/JSON-parsing lives *inside* the script file (substitution inside a committed `.sh`/`.py` is fine — only the command string you submit is matched):
-  - `launch.sh` — reads a `batch.txt` manifest (`<gpus> <tag>` per line, e.g. `0,1,2,3 jul9a` / `4,5,6,7 jul9b`); for each line it exports `CUDA_VISIBLE_DEVICES`, `FIT_SPIRAL_RUN_TAG`, `FIT_SPIRAL_OUT_DIR` (and `WANDB_MODE=disabled`) and runs `python run_single.py` in the background with all output redirected to the per-step logs, then `wait`s for both. One `bash launch.sh` launches the whole batch; one completion notification covers it.
+  - `launch.sh` — reads a `batch.txt` manifest (`<gpus> <tag>` per line, e.g. `0,1,2,3 jul9a` / `4,5,6,7 jul9b`); for each line it runs `python runners/run_single.py --gpus <gpus> --output <out_dir>/<tag> --dataset ... --ink-volume ... --no-wandb` in the background with all output redirected to `<out_dir>/logs/<tag>.log`, then `wait`s for both. One `bash launch.sh` launches the whole batch; one completion notification covers it.
   - `summarize.sh` — scan each run's `metrics.json` and fit logs and print a TSV row (total_fg_px, fraction, num_strips, sat_patches, sat_pcls). Use this instead of ad-hoc `grep`/`cat`/`python -c` over the JSON.
   - Commit with the fixed string `git add -A && git commit -F COMMIT_MSG.txt` — no wrapper script needed, because the *command* is already identical every time (only `COMMIT_MSG.txt`'s contents change). A raw `git commit -m "..."` with a unique message would be a new string and prompt, so always route the message through the file.
 - CREATE AND EDIT ALL DATA FILES WITH THE Write/Edit TOOLS, never with `printf >`/`echo >`/`mkdir` in Bash. This includes **appending each result row to `results_<tag>.tsv`** — do it with Edit, not a shell script. The Write/Edit tools never trigger a Bash approval prompt and avoid minting a unique command string per file. Same for `batch.txt`, `COMMIT_MSG.txt`, any config-override files, and the two helper scripts themselves.

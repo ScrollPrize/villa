@@ -30,6 +30,7 @@ class QGraphicsPathItem;
 class QGraphicsRectItem;
 class QGraphicsSimpleTextItem;
 class QLabel;
+class QPlainTextEdit;
 class QMdiArea;
 class QMdiSubWindow;
 class QPoint;
@@ -141,7 +142,9 @@ public:
         QuadSurface* newLineSurface,
         QuadSurface* newLineSideSlice,
         const vc::lasagna::LineStripPositionMap& newPositionMap,
-        const std::vector<cv::Vec3f>& newLinePoints) const;
+        const std::vector<cv::Vec3f>& newLinePoints,
+        const std::vector<GeneratedOverlay::ControlPointMarker>& newControls,
+        uint64_t newLineRevision) const;
     GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         const std::string& surfaceName,
         CChunkedVolumeViewer* viewer,
@@ -191,6 +194,10 @@ public:
     // re-optimization runs (edits coalesce in the controller).
     void setOptimizationBusy(bool busy, bool blockInput = true);
     void setOptimizationStatus(bool optimized);
+    void setFiberTraceStatus(const QString& summary, const QString& details,
+                            bool running, bool warning = false);
+    void appendFiberTraceDetail(const QString& detail);
+    void setFiberTraceProgress(const QString& summary);
     // Whether a line solve is running and whether edits are queued for one:
     // the overview bar keeps its settled dot layout while either holds (in
     // auto mode; manual mode never dispatches the queue) and adopts the live
@@ -208,6 +215,9 @@ public:
                       const std::vector<std::string>& activeTags,
                       bool enabled);
     void setCloseAfterFinalizationAllowed(bool allowed);
+    // Menu texts and the Fiber model combo label from the fiber-follow settings.
+    void updateFiberFollowMenu();
+    void setModelOnlySession(bool enabled);
     void setWorkspaceEmbedded(bool embedded);
     bool workspaceEmbedded() const { return _workspaceEmbedded; }
     // Programmatic twin of the "current cut follows strip mouse" toggle.
@@ -295,6 +305,9 @@ signals:
     void generatedSideStripIntersectionQueryRequested(const std::string& surfaceName);
     void showAsMeshRequested();
     void fullOptimizationRequested();
+    // The fiber-follow model settings (menu → Fiber follow model) changed.
+    void fiberFollowSettingsChanged();
+    void fiberFollowConfidenceChanged();
     void fiberTagChangeRequested(const QString& tag, bool enabled);
     void closeFinalizationRequested(QCloseEvent* event);
     void reoptimizationModeChanged(LineAnnotationDialog::ReoptimizationMode mode);
@@ -468,6 +481,20 @@ private:
     void rebaseProvisionalControlArcLengths();
     bool publishedControlsIndexDisplayedLine() const;
     void noteDisplayedLineControls();
+    // Carry a position on the displayed line (its line-space controls, plus
+    // the controls placed since it was published, from the resolved
+    // placement entries recorded for its revision) to a newly published
+    // line: see carriedGeneratedLinePosition. Controls whose revision does
+    // not name their line are not used as anchors.
+    double carriedLinePosition(
+        const std::vector<cv::Vec3f>& oldLinePoints,
+        const std::vector<GeneratedOverlay::ControlPointMarker>& oldControls,
+        const std::vector<vc3d::line_annotation::GeneratedPendingPlacement>& oldResolvedPlacements,
+        uint64_t oldLineRevision,
+        const std::vector<cv::Vec3f>& newLinePoints,
+        const std::vector<GeneratedOverlay::ControlPointMarker>& newControls,
+        uint64_t newLineRevision,
+        double oldPosition) const;
     GeneratedOverlay staticStripOverlay() const;
     GeneratedOverlay zSliceOverlay(const GeneratedViews& views,
                                    const vc3d::line_annotation::GeneratedControlPointLinePositionIndex& controlIndex,
@@ -519,6 +546,7 @@ private:
     void updateOptimizationOverlayGeometry();
     void updateFiberNameLabel();
     void rebuildDatasetMenus();
+    void chooseFiberFollowCheckpoint();
     void restoreWindowGeometry();
     void saveWindowGeometry() const;
     void restoreGeneratedViewStateSettings();
@@ -529,6 +557,11 @@ private:
     QComboBox* _fiberOptimizationCombo = nullptr;
     QMenu* _lasagnaDatasetMenu = nullptr;
     QMenu* _fiberInferenceDatasetMenu = nullptr;
+    bool _modelOnlySession = false;
+    QDoubleSpinBox* _fiberFollowConfidenceSpin = nullptr;
+    QAction* _fiberFollowEnabledAction = nullptr;
+    QAction* _fiberFollowCheckpointAction = nullptr;
+    QAction* _fiberFollowPythonAction = nullptr;
     std::vector<std::pair<std::string, std::string>> _lasagnaDatasetOptions;
     std::vector<std::pair<std::string, std::string>> _fiberInferenceDatasetOptions;
     std::string _selectedLasagnaDatasetLocation;
@@ -596,6 +629,14 @@ private:
     QLabel* _fiberNameLabel = nullptr;
     QPointer<QLabel> _optimizationStatusLabel;
     bool _optimizationStatusOptimized = false;
+    QWidget* _fiberTraceStatus = nullptr;
+    QLabel* _fiberTraceStatusText = nullptr;
+    QProgressBar* _fiberTraceProgress = nullptr;
+    QPlainTextEdit* _fiberTraceDetails = nullptr;
+    QTimer* _fiberTraceTimer = nullptr;
+    QElapsedTimer _fiberTraceElapsed;
+    QString _fiberTraceSummary;
+    bool _fiberTraceRunning = false;
     bool _lineSolveRunning = false;
     bool _lineSolvePending = false;
     // Set by every geometry/controls publish, cleared by the controller's
