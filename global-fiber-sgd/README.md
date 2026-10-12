@@ -1,5 +1,9 @@
 # Global fiber assignment with PyTorch SGD
 
+Latest: [positions5–11,1000-pass results and visualization](uv_reference_5_11_1000_results.md).
+Fresh/ref sixGPU solves, complete100passcheckpointtables and1000px LZW TIFF,
+SVG/PDF maps; unchangedsolver/settings from100passregionalbenchmark.
+
 Latest: [shifted seven-winding windows](uv_reference_windows_results.md),
 positions4–10/5–11/6–12 from leftmostID10,100passes fresh/ref on6GPUs.
 Includes actual XYZ validation of reference winding bounds and all checkpoint

@@ -1,5 +1,28 @@
 # Current task: reference-selected regional solve
 
+Current follow-up: user selected positions5–11 (IDs14–20),requested fresh/ref
+1000passes reportingevery100. Sameauditedsubset24771events,same6GPUs andLRs.
+1008updates,101updatediagnostics; original initialization,no warmresume.
+Output configs run_uv_window1000_{fresh,reference,suite}.json.
+
+User additionally requested visualization ofboth1000passsolves; use existing
+layout-only CPUrenderer with1000px LZW TIFFs,SVG/PDF,windingboundaries and
+separatehistograms. No new referenceprojection needed for these layoutmaps.
+
+Independent1000pass config review approved; launched75bef0a9-5c9f-43a2-9805-466f39106f91
+through approvedrun_uv_window1000_suite.json. Fresh completed1000.0649passes,
+L1=1.5227166,within2=80.9368%,sign1.5486%,retained95.2269%,loss2.53229.
+First101update reference metrics exactly reproduce earlier100passfinal;
+online loss differs because diagnostic averaging window is now100passes.
+
+Both1000runs finishedexit0. Fresh17.558s,reference18.184s solvewalls; suite95.933s
+includingmanagerwait/setup. Ref finalL1=.580748,within2=98.1752%,sign.944902%,
+retained100%,loss1.593159. First101updatemetrics exact forboth previous100runs.
+Finalstatesfinite,all6GPUpreflightspassed,leasefinished/releasedallresources.
+Fulltwo tables and timings:uv_reference_5_11_1000_results.md.
+CPUviscompletedexit0: data/uv_window1000_vis_v1/{fresh,reference}/layout.tif,
+9918×1000and5770×1000,LZWverified;SVG/PDF+separatehistograms complete,noPNG.
+
 Follow-up: user confirms positions from leftmost reference surface. Metadata
 ID10 begins atcolumn1; selected IDs13–19,14–20,15–21 correspond topositions
 4–10,5–11,6–12. Same Z30k–50k, sixGPUs,100sampledpasses both initializations.

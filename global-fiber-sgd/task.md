@@ -1,5 +1,8 @@
 # Reference-selected regional solve
 
+Current: positions5–11 (IDs14–20) fresh/reference initialized1000passes,
+report separate complete tables every100passes. Same6GPU settings and Z slab.
+
 Current follow-up: positions4–10,5–11,6–12 (IDs13–19,14–20,15–21), both
 fresh/reference initialization, sixGPUs,100passes each. Same Z30k–50k.
 

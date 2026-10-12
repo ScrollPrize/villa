@@ -1,0 +1,19 @@
+{
+  "fiber_uv_visualization": {
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_window1000_vis_v1",
+    "layout_only": true,
+    "render_height": 1000,
+    "raster_map_only": true,
+    "vector_pdf": true,
+    "solutions": [
+      {
+        "label": "fresh",
+        "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_window1000_w14_20_fresh_v1"
+      },
+      {
+        "label": "reference",
+        "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_window1000_w14_20_reference_v1"
+      }
+    ]
+  }
+}

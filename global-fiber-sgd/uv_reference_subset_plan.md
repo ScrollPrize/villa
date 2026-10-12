@@ -1,5 +1,24 @@
 # Reference-selected ten-winding regional solve
 
+## Current follow-up: positions5–11 for1000passes
+Use the audited IDs14–20 Z30k–50k subset (2192sources,2199pieces,24771events).
+Run fresh and reference/width initialized from their original starts, not warm
+resume (retain complete comparable trajectories). Same sixGPUs,global24576,
+stateLR0.007348469228,widthLR2,seed0,151hypotheses,all variables joint.
+Only change budgets toceil(1000*24771/24576)=1008updates and reporting101updates
+(~100.205passes). Finalactual1000.065passes. Report two complete checkpoint
+tables inclobjective,referenceL1/within2,retention,signviolations,widthfactor,
+fit/referenceq10/q90 and globaloffset; timing and peakmemory.
+No code/spec/loss changes. Independent config review; reuse approved suite
+runner with new output roots. Record in uv_reference_5_11_1000_results.md,
+currenttasklog/status,README/changelog. Validate CUDApreflights,finite final
+states,exactsubset identities,lease release,first100pass comparability.
+
+User added visualization of both1000passsolves. Reuse existing CPU layout-only
+renderer,1000pxhigh LZW map-onlyTIFF,equalU/V physicalscale,windingboundaries,
+separateconfidencehistograms,SVG/vectorPDF. No new projection or solve. Verify
+bothfiles/headers/sourcehashes and noPNGs. Recordpaths and dimensions.
+
 ## Follow-up: shifted seven-winding windows
 User confirmed positions counted from leftmost reference winding. Metadata
 leftmost column_begin1 belongs toID10. Test positions4–10,5–11,6–12, i.e.

@@ -263,3 +263,7 @@ Optional regional width diagnostics leave reference initialization/losses unchan
 Follow-up: six100pass solves on shifted reference windows13–19/14–20/15–21,
 sameZ30k–50k,fullcheckpoint reports in uv_reference_windows_results.md.
 ActualXYZ validpoints are completely covered by winding_bounds; none precedeID10.
+
+Positions5–11 extendedto1000passes frombothoriginalinitializations;sixGPUsolve
+17.56/18.18s,referenceL1fresh1.523/reference.581;fulltablesevery100passes and
+TIFF/SVG/PDFmaps inuv_reference_5_11_1000_results.md. Noalgorithmchanges.

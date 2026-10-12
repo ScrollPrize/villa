@@ -1,5 +1,12 @@
 # Reference-selected regional solve
 
+## Positions5–11 longer solve
+- [x] Plan and derive1008update budget,101update diagnostics.
+- [x] Independent config review.
+- [x] Complete fresh/reference1000passes on6GPUs.
+- [x] Validate/report two complete100pass metric tables and timings.
+- [x] Render/verify both1000passlayout maps,TIFF+SVG/PDF+histograms.
+
 ## Shifted window follow-up
 - [x] Confirm reference position1=ID10 from metadata.
 - [x] Extract/audit13–19,14–20,15–21.
