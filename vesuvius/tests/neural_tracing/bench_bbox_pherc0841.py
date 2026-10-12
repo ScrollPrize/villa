@@ -6,7 +6,7 @@ Runs the unmodified generator from the pinned upstream Git revision and the patc
 generator in the checkout. No checkpoint/GPU/network volume needed.
 
 From the villa checkout:
-    python vesuvius/tests/neural_tracing/bench_bbox_pherc0841.py --repeats 2
+    python vesuvius/tests/neural_tracing/bench_bbox_pherc0841.py --repeats 5
 Dependencies: numpy, tifffile, tqdm
 """
 from __future__ import annotations
@@ -140,10 +140,22 @@ def timed(module, points, overlap):
     return result, time.perf_counter() - start
 
 
+def summarize_seconds(samples):
+    """Calculate summary statistics from unrounded individual timings."""
+    return {
+        "mean": round(statistics.mean(samples), 4),
+        "min": round(min(samples), 4),
+        "median": round(statistics.median(samples), 4),
+        "max": round(max(samples), 4),
+    }
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--repeats", type=int, default=2)
+    parser.add_argument("--repeats", type=int, default=5,
+                        help="Per-implementation trials per case (default: 5)")
     parser.add_argument("--window", choices=("A", "B", "both"), default="both")
+    parser.add_argument("--overlap", choices=("0.0", "0.5", "both"), default="both")
     parser.add_argument("--baseline", default=DEFAULT_BASELINE,
                         help="Git ref with unmodified generator (default: pinned base commit)")
     parser.add_argument("--output", type=Path, default=None,
@@ -171,6 +183,11 @@ def main(argv=None):
         "python": platform.python_version(),
         "numpy": np.__version__,
         "platform": platform.platform(),
+        "python_implementation": platform.python_implementation(),
+        "python_build": list(platform.python_build()),
+        "machine_arch": platform.machine(),
+        "execution": "Python source, NumPy/tifffile wheels; no villa native build",
+        "measurement": "perf_counter wall time; background CPU tasks may affect samples",
         "crop_size": list(CROP),
         "prune_bboxes": True,
         "band_workers": 1,
@@ -184,7 +201,8 @@ def main(argv=None):
         points = points_from_window(arrays, WINDOWS[label])
         if len(points) != 1748:
             raise AssertionError("Unexpected real mesh point count")
-        for overlap in (0.0, 0.5):
+        overlap_values = (0.0, 0.5) if args.overlap == "both" else (float(args.overlap),)
+        for overlap in overlap_values:
             before_times, after_times = [], []
             for i in range(args.repeats):
                 # Alternate run order to reduce systematic warm-cache bias.
@@ -198,8 +216,9 @@ def main(argv=None):
                 new_sig = record_signature(new)
                 if old_sig != new_sig:
                     raise AssertionError(f"Output differs: {label}, overlap {overlap}")
-                before_times.append(round(t_old, 4))
-                after_times.append(round(t_new, 4))
+                # Store full-resolution measurements; round only for reporting.
+                before_times.append(t_old)
+                after_times.append(t_new)
 
             record = {
                 "window": label,
@@ -211,13 +230,15 @@ def main(argv=None):
                 "bbox_record_sha256": hashlib.sha256(
                     json.dumps(old_sig, sort_keys=True).encode()
                 ).hexdigest(),
-                "before_seconds": before_times,
-                "after_seconds": after_times,
+                "before_seconds": [round(value, 4) for value in before_times],
+                "after_seconds": [round(value, 4) for value in after_times],
+                "original_stats_seconds": summarize_seconds(before_times),
+                "patched_stats_seconds": summarize_seconds(after_times),
                 "median_before_seconds": round(statistics.median(before_times), 4),
                 "median_after_seconds": round(statistics.median(after_times), 4),
             }
             record["median_speedup"] = round(
-                record["median_before_seconds"] / record["median_after_seconds"], 3
+                statistics.median(before_times) / statistics.median(after_times), 3
             )
             report["cases"].append(record)
             print(json.dumps(record), flush=True)
