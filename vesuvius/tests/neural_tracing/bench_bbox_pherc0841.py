@@ -8,6 +8,7 @@ generator in the checkout. No checkpoint/GPU/network volume needed.
 From the villa checkout:
     python vesuvius/tests/neural_tracing/bench_bbox_pherc0841.py --repeats 4
     python vesuvius/tests/neural_tracing/bench_bbox_pherc0841.py --repeats 4 --crop-size 128 384 384
+    python vesuvius/tests/neural_tracing/bench_bbox_pherc0841.py --window full --repeats 2 --overlap 0.5 --crop-size 128 384 384
 Dependencies: numpy, tifffile, tqdm
 """
 from __future__ import annotations
@@ -48,6 +49,8 @@ FILE_HASHES = {
 WINDOWS = {
     "A": (36, 74, 40, 86),
     "B": (106, 144, 120, 166),
+    # All coordinates in the official PHerc0841 s022814 mesh (188x245).
+    "full": (0, 188, 0, 245),
 }
 CROP = (128, 128, 128)
 # Exact upstream commit used for the published before/after measurements.
@@ -177,7 +180,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--repeats", type=int, default=4,
                         help="Even number of paired trials per case (default: 4)")
-    parser.add_argument("--window", choices=("A", "B", "both"), default="both")
+    parser.add_argument("--window", choices=("A", "B", "full", "both"), default="both",
+                        help="Select mesh subset; full covers all 34,875 valid points and may be slow")
     parser.add_argument("--overlap", choices=("0.0", "0.5", "both"), default="both")
     parser.add_argument("--profile", action="store_true",
                         help="After timing, cProfile old/new generators separately on first selected case")
@@ -228,7 +232,8 @@ def main(argv=None):
     }
     for label in chosen:
         points = points_from_window(arrays, WINDOWS[label])
-        if len(points) != 1748:
+        expected_points = 34875 if label == "full" else 1748
+        if len(points) != expected_points:
             raise AssertionError("Unexpected real mesh point count")
         overlap_values = (0.0, 0.5) if args.overlap == "both" else (float(args.overlap),)
         for overlap in overlap_values:
