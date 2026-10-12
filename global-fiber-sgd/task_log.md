@@ -1,5 +1,12 @@
 # Diagnostic optimization and two100-pass-equivalent joint solves
 
+- LowLR100complete: fresh loss1.91248,referenceL1 11.59110,within2 13.25945%,
+  widthfactor .866755,retained68.5867%. Referencewidth-start loss .873643,
+  L1 1.060589,within2 89.64818%,widthfactor1.025152,retained91.6016%.
+  Full10pass history committed2cf3fdc48. Both100passlayout and referencecomparison
+  visualization commands completed; TIFF LZW1000px,SVG/PDF, separatehistograms,
+  all threecolorviews perrun. Under data/uv_joint100_vis_width_v2/{layout,reference}.
+
 - User stopped high-LR experiments after observing loss jumps. Freshhigh100 had
   justfinished (loss7.3176 overlast10passes,L1 10.9919,within2 13.2196%). Mixed
   suite interrupted with SIGINT/exit130 before furtherhighLRruns. Replacement
