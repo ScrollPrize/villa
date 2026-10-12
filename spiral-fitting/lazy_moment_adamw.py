@@ -14,7 +14,7 @@ import math
 
 import torch
 
-from devices import float_hi
+from devices import count_dtype, float_hi
 
 
 # Elements per chunk of the masked update, bounding its temporaries to a
@@ -77,10 +77,10 @@ def robust_clip_(grad, multiple):
         magnitude = torch.where(sub != 0, sub.abs(), torch.full_like(sub, math.nan))
         threshold = _nan_to_inf(torch.nanmedian(magnitude).to(hi) * float(multiple))
         bound = threshold.to(plane.dtype)
-        clipped = torch.zeros((), dtype=hi, device=grad.device)
+        clipped = torch.zeros((), dtype=count_dtype(grad.device), device=grad.device)
         for start in range(0, plane.numel(), _CHUNK_ELEMENTS):
             chunk = plane[start:start + _CHUNK_ELEMENTS]
-            clipped += (chunk.abs() > bound).sum(dtype=hi)
+            clipped += (chunk.abs() > bound).sum(dtype=clipped.dtype)
             chunk.clamp_(min=-bound, max=bound)
         thresholds[index] = threshold
         fractions[index] = clipped / plane.numel()
@@ -202,13 +202,13 @@ class LazyMomentAdamW(torch.optim.AdamW):
                 touched_sub = torch.where(sub > 0, sub, torch.full_like(sub, math.nan))
                 cap = _nan_to_inf(torch.nanquantile(touched_sub, float(quantile))).to(row.dtype)
             total = torch.zeros((), dtype=hi, device=planes.device)
-            count = torch.zeros_like(total)
+            count = torch.zeros_like(total, dtype=count_dtype(planes.device))
             for start in range(0, row.numel(), _CHUNK_ELEMENTS):
                 chunk = row[start:start + _CHUNK_ELEMENTS]
                 # Exclude zero moments from the scale estimate. This is a
                 # positivity test, not a stored activity mask; previously
                 # active moments can also become zero through underflow.
-                count += (chunk > 0).sum(dtype=hi)
+                count += (chunk > 0).sum(dtype=count.dtype)
                 if cap is not None:
                     chunk = torch.minimum(chunk, cap)
                 total += chunk.sum(dtype=hi)
@@ -266,7 +266,7 @@ class LazyMomentAdamW(torch.optim.AdamW):
 
         hi = float_hi(param.device)
         update_sumsq = torch.zeros(stages, components, dtype=hi, device=param.device)
-        update_count = torch.zeros_like(update_sumsq)
+        update_count = torch.zeros_like(update_sumsq, dtype=count_dtype(param.device))
         for stage in range(stages):
             denom_scalar = None if shared_denom is None else shared_denom[stage]
             for component in range(components):
@@ -290,7 +290,7 @@ class LazyMomentAdamW(torch.optim.AdamW):
                         update.masked_fill_(g == 0, 0.0)
                     update_sumsq[stage, component] += torch.linalg.vector_norm(
                         update, dtype=hi) ** 2
-                    update_count[stage, component] += (update != 0).sum(dtype=hi)
+                    update_count[stage, component] += (update != 0).sum(dtype=update_count.dtype)
                     flat_param[start:stop].sub_(update)
 
         self.conditioning_stats[param] = {

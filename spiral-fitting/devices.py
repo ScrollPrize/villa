@@ -13,6 +13,10 @@ input loads. This is the switch
 lasagna/dtypes.py has (villa PR #1639), except that the default here keeps
 float64 wherever the device supports it.
 
+Counts are kept in count_dtype(): float64 where float_hi() is float64, as
+before, and int64 where it is float32, whose integers are exact only up to
+2**24.
+
 scatter_reduce_() stands in for the int64 amax/amin scatter MPS also lacks.
 """
 
@@ -72,6 +76,13 @@ def float_hi(device=None):
     if max_precision_bits() == 32 or (device is not None and torch.device(device).type == 'mps'):
         return torch.float32
     return torch.float64
+
+
+def count_dtype(device=None):
+    """The dtype counts on ``device`` add up in: float64 where float_hi() is
+    float64 (exact to 2**53), else int64, since float32 is exact only to
+    2**24."""
+    return torch.float64 if float_hi(device) == torch.float64 else torch.int64
 
 
 def scatter_reduce_(target, index, source, reduce):

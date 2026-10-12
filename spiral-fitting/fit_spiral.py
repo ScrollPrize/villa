@@ -3535,6 +3535,8 @@ class FitContext:
         # replacements rather than peaking at twice the model.
         gc.collect()
         torch.cuda.empty_cache()
+        if self.device.type == 'mps':
+            torch.mps.empty_cache()
         self._build_model_state()
 
     # ==========================================================================
@@ -4208,6 +4210,15 @@ class FitContext:
         amount is printed because it is the only way to know whether the
         contention this avoids was worth avoiding.
         """
+        if self.device.type == 'mps':
+            driver_before = torch.mps.driver_allocated_memory()
+            gc.collect()
+            torch.mps.empty_cache()
+            print(
+                f'preview export: released '
+                f'{(driver_before - torch.mps.driver_allocated_memory()) / 1024 ** 3:.2f} GiB '
+                f'of cached MPS memory before publication', flush=True)
+            return
         if not torch.cuda.is_available():
             return
         reserved_before = torch.cuda.memory_reserved()

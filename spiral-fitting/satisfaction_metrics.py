@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from devices import float_hi, scatter_reduce_
+from devices import scatter_reduce_
 from sample_spiral import (
     get_radial_normal_stretch,
     get_theta_and_radii,
@@ -265,14 +265,20 @@ def evaluate_patch_satisfaction_packed(
                 0, patch_indices, boundary.to(torch.int64))
             satisfied_boundary_counts.scatter_add_(
                 0, patch_indices, (satisfied & boundary).to(torch.int64))
-        roi_counts_dev = roi_counts.to(device=device)
-        hi = float_hi(device)
-        satisfied_patches = (satisfied_counts.to(hi)
+        compare_on = device
+        if torch.device(device).type == 'mps':
+            # MPS has no float64: compare on the CPU, where the results go next.
+            compare_on = 'cpu'
+            satisfied_counts = satisfied_counts.cpu()
+            boundary_counts = boundary_counts.cpu()
+            satisfied_boundary_counts = satisfied_boundary_counts.cpu()
+        roi_counts_dev = roi_counts.to(device=compare_on)
+        satisfied_patches = (satisfied_counts.to(torch.float64)
             >= thresholds['satisfied_patch_quad_fraction']
-               * roi_counts_dev.to(hi))
-        boundary_satisfied = (satisfied_boundary_counts.to(hi)
+               * roi_counts_dev.to(torch.float64))
+        boundary_satisfied = (satisfied_boundary_counts.to(torch.float64)
             >= thresholds['boundary_satisfied_patch_quad_fraction']
-               * boundary_counts.to(hi))
+               * boundary_counts.to(torch.float64))
         satisfied_areas = (patch_areas
             * satisfied_counts.cpu().to(torch.float64)
             / full_valid_counts.clamp_min(1))

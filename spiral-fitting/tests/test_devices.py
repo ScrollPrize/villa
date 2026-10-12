@@ -337,3 +337,36 @@ def test_distributed_fit_on_mps_stops_before_joining(monkeypatch):
             ddp_helpers.maybe_init_distributed(ddp_helpers.DistributedContext(rank=0, world_size=2))
     finally:
         ddp_helpers.set_process_context(ddp_helpers.SINGLE_PROCESS)
+
+
+def test_mps_cache_is_released_on_rebuild_and_preview_export(monkeypatch):
+    # Both paths called only torch.cuda.empty_cache(), which does nothing on MPS.
+    import types
+    from fit_spiral import FitContext
+    released = []
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
+    monkeypatch.setattr(torch.mps, 'empty_cache', lambda: released.append('mps'))
+    monkeypatch.setattr(torch.mps, 'driver_allocated_memory', lambda: 0)
+    session = types.SimpleNamespace(
+        device=torch.device('mps'), profiler=None, _MODEL_STAGE_ATTRIBUTES=(),
+        _build_model_state=lambda: None)
+    FitContext._release_export_arena(session)
+    FitContext.rebuild_model_state(session)
+    assert released == ['mps', 'mps']
+
+
+@pytest.mark.parametrize('device,bits', [
+    ('cpu', '32'), pytest.param('mps', '64', marks=pytest.mark.skipif(
+        not torch.backends.mps.is_available(), reason='needs MPS'))])
+def test_update_count_is_exact_past_float32_integers(monkeypatch, device, bits):
+    # 2**24 + 1 cells all update. float32 has no such integer, so a float32
+    # count comes back as 2**24.
+    from lazy_moment_adamw import LazyMomentAdamW
+    monkeypatch.setenv('FIT_SPIRAL_MAX_PRECISION_FLOAT', bits)
+    cells = (1 << 24) + 1
+    param = torch.zeros(1, 1, 1, 1, cells, device=device, requires_grad=True)
+    param.grad = torch.ones_like(param)
+    optimiser = LazyMomentAdamW(
+        [{'params': [param], 'lazy_moments': True, 'weight_decay': 0.0}], lr=1e-2)
+    optimiser.step()
+    assert int(optimiser.conditioning_stats[param]['update_count'].sum()) == cells
