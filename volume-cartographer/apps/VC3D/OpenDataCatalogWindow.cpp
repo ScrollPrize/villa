@@ -348,6 +348,17 @@ QString predictionType(const OpenDataArtifact& artifact)
         ? parts[index + 1] : QStringLiteral("—");
 }
 
+bool canAttachRepresentation(const OpenDataArtifact& artifact)
+{
+    if (!artifact.hasResolvedUrl()) return false;
+    const auto kind = classifyDerivedRepresentation(artifact);
+    if (!kind) return false;
+    if (*kind != OpenDataRepresentationKind::Prediction) return true;
+    // Prediction artifacts are not necessarily volumes (e.g. meshes).
+    const auto type = qstr(artifact.type).toLower().replace('_', '-');
+    return type.endsWith("-zarr");
+}
+
 QString representationCoordinates(const OpenDataArtifact& artifact,
                                   OpenDataRepresentationKind kind)
 {
@@ -793,6 +804,7 @@ void OpenDataCatalogWindow::buildUi()
         representationsPage);
     representationsHelp->setWordWrap(true);
     _representationsTable = new QTableWidget(representationsPage);
+    _representationsTable->setObjectName("catalogRepresentations");
     _representationsTable->setColumnCount(9);
     _representationsTable->setHorizontalHeaderLabels({
         tr("Parent volume"),
@@ -923,9 +935,22 @@ void OpenDataCatalogWindow::buildUi()
     });
     connect(_attachRepresentationButton, &QPushButton::clicked, this, [this]() {
         const auto* artifact = selectedRepresentationArtifact();
-        if (artifact && artifact->type == "lasagna" && artifact->hasResolvedUrl())
+        if (_manifestRefreshPending || !artifact || !canAttachRepresentation(*artifact)) return;
+        const auto kind = *classifyDerivedRepresentation(*artifact);
+        if (kind == OpenDataRepresentationKind::Lasagna) {
             emit attachLasagnaRequested(artifactUrl(*artifact), predictionType(*artifact) == QStringLiteral("fibers"));
+        } else if (kind == OpenDataRepresentationKind::NormalGrids) {
+            const auto* sample = selectedSample();
+            const auto* item = _representationsTable->item(_representationsTable->currentRow(), 0);
+            const auto volumeIndex = item->data(kRepresentationVolumeIndexRole).toULongLong();
+            emit attachNormalGridsRequested(qstr(sample->id), qstr(sample->volumes.at(volumeIndex).id),
+                artifactUrl(*artifact), artifact->sourceCoordinateLevel.value_or(0),
+                artifact->sourceCoordinateLevel.has_value());
+        } else {
+            emit attachVolumeRequested(artifactUrl(*artifact));
+        }
     });
+    _attachRepresentationButton->setObjectName("attachCatalogRepresentation");
     connect(_openVolumeUrlButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::openSelectedVolumeUrl);
     connect(_copyRepresentationUrlButton,
             &QPushButton::clicked,
@@ -1518,7 +1543,7 @@ void OpenDataCatalogWindow::updateActionButtons()
     const auto* representation = selectedRepresentationArtifact();
     if (_attachRepresentationButton) {
         _attachRepresentationButton->setEnabled(manifestReady && representation &&
-            representation->type == "lasagna" && representation->hasResolvedUrl());
+            canAttachRepresentation(*representation));
     }
     const bool hasSegmentUrl = !selectedSegmentUrl().isEmpty();
     const auto* sample = selectedSample();

@@ -5,6 +5,7 @@
 #include "UnifiedBrowserDialog.hpp"
 #include "OpenDataCatalogWindow.hpp"
 #include "OpenDataLasagna.hpp"
+#include "OpenDataNormalGrids.hpp"
 #include "OpenDataSampleProject.hpp"
 #include "ProjectFiberPaths.hpp"
 #include "ProjectCreationDefaults.hpp"
@@ -518,6 +519,26 @@ void MenuActionController::showOpenDataCatalog()
             this, &MenuActionController::showAttachRemoteZarrDialog);
     connect(dialog, &vc3d::opendata::OpenDataCatalogWindow::attachLasagnaRequested,
             this, &MenuActionController::attachCatalogLasagna);
+    connect(dialog, &vc3d::opendata::OpenDataCatalogWindow::attachNormalGridsRequested,
+            this, [this](const QString& sample, const QString& volume, const QString& url,
+                         int level, bool explicitLevel) {
+        if (!_window || !_window->_state || !_window->_state->vpkg()) {
+            QMessageBox::information(_window, tr("No project"), tr("Open or create a project first."));
+            return;
+        }
+        try {
+            const vc3d::opendata::OpenDataNormalGridsInfo info{
+                sample.toStdString(), volume.toStdString(), url.toStdString(), level, explicitLevel};
+            if (!vc3d::opendata::attachStreamingNormalGridsEntry(
+                    *_window->_state->vpkg(), info, vc3d::remoteCachePathFs())) {
+                QMessageBox::warning(_window, tr("Attach failed"), tr("Could not attach normal grids."));
+                return;
+            }
+            _window->refreshCurrentVolumePackageUi(QString(), true);
+        } catch (const std::exception& e) {
+            QMessageBox::warning(_window, tr("Attach failed"), QString::fromUtf8(e.what()));
+        }
+    });
     dialog->setOpenSampleHandler([this](const vc3d::opendata::OpenDataSample& sample) {
         return openOpenDataSample(sample);
     });

@@ -21,6 +21,58 @@ class CatalogProjectDialogTest : public QObject
 {
     Q_OBJECT
 private slots:
+    void attachRepresentations()
+    {
+        OpenDataManifest manifest;
+        OpenDataSample sample;
+        sample.id = "test";
+        OpenDataVolume volume;
+        volume.id = "scan";
+        const QStringList types{"ink-detection-3d-zarr", "ink_detection_3d_zarr",
+            "surface-prediction-zarr", "lasagna", "normal-grids", "surface-prediction-mesh"};
+        for (const auto& type : types) {
+            OpenDataArtifact artifact;
+            artifact.type = type.toStdString();
+            artifact.resolvedUrl = "https://example.invalid/" + artifact.type;
+            artifact.sourcePath = "predictions/fibers/" + artifact.type;
+            artifact.sourceCoordinateLevel = 2;
+            volume.artifacts.push_back(artifact);
+        }
+        auto unresolved = volume.artifacts.front();
+        unresolved.resolvedUrl.clear();
+        volume.artifacts.push_back(unresolved);
+        sample.volumes.push_back(volume);
+        manifest.samples.push_back(sample);
+        OpenDataCatalogWindow catalog(manifest);
+        for (auto* table : catalog.findChildren<QTableWidget*>()) {
+            if (table->horizontalHeaderItem(0)->text() == "Sample ID")
+                table->setCurrentCell(0, 0);
+        }
+        auto* table = catalog.findChild<QTableWidget*>("catalogRepresentations");
+        auto* button = catalog.findChild<QPushButton*>("attachCatalogRepresentation");
+        QVERIFY(table);
+        QVERIFY(button);
+        QCOMPARE(table->rowCount(), 7);
+        QSignalSpy volumes(&catalog, &OpenDataCatalogWindow::attachVolumeRequested);
+        QSignalSpy lasagna(&catalog, &OpenDataCatalogWindow::attachLasagnaRequested);
+        QSignalSpy normals(&catalog, &OpenDataCatalogWindow::attachNormalGridsRequested);
+        for (int row = 0; row < table->rowCount(); ++row) {
+            table->setCurrentCell(row, 0);
+            QCOMPARE(button->isEnabled(), row < 5);
+            button->click();
+        }
+        QCOMPARE(volumes.count(), 3);
+        for (int i = 0; i < 3; ++i)
+            QCOMPARE(volumes.at(i).at(0).toString(), "https://example.invalid/" + types[i]);
+        QCOMPARE(lasagna.count(), 1);
+        QCOMPARE(lasagna.at(0).at(1).toBool(), true);
+        QCOMPARE(normals.count(), 1);
+        QCOMPARE(normals.at(0).at(0).toString(), QString("test"));
+        QCOMPARE(normals.at(0).at(1).toString(), QString("scan"));
+        QCOMPARE(normals.at(0).at(3).toInt(), 2);
+        QCOMPARE(normals.at(0).at(4).toBool(), true);
+    }
+
     void openAndCancel()
     {
         QTemporaryDir temp(QDir::current().filePath("catalog-dialog-XXXXXX"));

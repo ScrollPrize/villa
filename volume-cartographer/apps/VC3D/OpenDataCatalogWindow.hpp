@@ -39,6 +39,8 @@ public:
 signals:
     void attachVolumeRequested(const QString& url);
     void attachLasagnaRequested(const QString& url, bool fiber);
+    void attachNormalGridsRequested(const QString& sampleId, const QString& volumeId,
+                                   const QString& url, int level, bool explicitLevel);
 
 private slots:
     void reloadManifest();
