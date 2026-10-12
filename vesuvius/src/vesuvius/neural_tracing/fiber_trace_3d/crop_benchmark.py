@@ -51,6 +51,9 @@ def bp_metrics(log):
 
 
 def run(config):
+    if 'fiber_uv_reference_subset' in config:
+        from .fiber_uv_reference_subset import run as reference_subset
+        return reference_subset(config['fiber_uv_reference_subset'])
     if 'fiber_reference_comparison' in config:
         from .fiber_reference_comparison import run as reference_comparison
         return reference_comparison(config['fiber_reference_comparison'])

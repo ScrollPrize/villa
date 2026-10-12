@@ -104,6 +104,10 @@ def direction_inputs(config, signature, ids, labels):
 
 
 def prepare(config):
+    if config.get('reference_subset'):
+        from .fiber_uv_reference_subset import validate_cache
+        validate_cache(config)
+        return
     from .fiber_hv_stage import verify_feature_source
     from .fiber_normal_sign_visualization import load_umbilicus_frame
     from vesuvius.neural_tracing.fiber_follow.data.afv import read_afv_polylines
@@ -744,6 +748,14 @@ def radial_initial_geometry(d,config):
     sigma=float(config.get('initial_sigma',3.))
     if k<2 or not np.isfinite(sigma) or sigma<=0:
         raise ValueError('Require at least two windings and positive finite initial_sigma')
+    if 'radial_initial_centers' in d:
+        centers=np.asarray(d['radial_initial_centers'])
+        widths=np.asarray(d['radial_initial_widths'])
+        if centers.shape!=d['radius'].shape or widths.shape!=(k,):
+            raise ValueError('Subset radial initialization count mismatch')
+        if not np.isfinite(centers).all() or not np.isfinite(widths).all() or np.any(widths<100):
+            raise ValueError('Invalid subset radial initialization')
+        return centers.copy(),widths.copy()
     if k==100:
         centers=np.asarray(d['initial_k'])
         widths=np.asarray(d['width_initial']).copy()

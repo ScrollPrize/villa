@@ -1,0 +1,14 @@
+{
+  "fiber_uv_reference_subset": {
+    "source_config": "/home/hendrik/villa2/global-fiber-sgd/run_uv_joint100_fresh_low_width_v2.json",
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_reference_w13_19_z30k50k_v1",
+    "winding_range": [
+      13,
+      19
+    ],
+    "z_range": [
+      30000,
+      50000
+    ]
+  }
+}

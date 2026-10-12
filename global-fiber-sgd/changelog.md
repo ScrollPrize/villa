@@ -251,3 +251,15 @@ reference winding L1 / within-two metrics after global median offset correction.
   ten-pass walltime152.74s→34.85s; all12 checkpoint metrics and final arrays exact.
   CPU/GPUgradient preflights and97 targeted tests pass. Full results/commands in
   uv_coordinate_results.md,uv_distributed_results.md,uv_diagnostics_results.md.
+
+# 2026-10-12: reference-selected regional experiment
+
+Added exact Z-clipped reference-selected induced graphs with provenance and
+geometry/constraint audits. Reused existing6GPU joint solver on windings10–19,
+Z30k–50k;100pass fresh/reference results recorded in uv_reference_subset_results.md.
+Optional regional width diagnostics leave reference initialization/losses unchanged.
+50targeted tests passed plus production CUDA/distributed preflights.
+
+Follow-up: six100pass solves on shifted reference windows13–19/14–20/15–21,
+sameZ30k–50k,fullcheckpoint reports in uv_reference_windows_results.md.
+ActualXYZ validpoints are completely covered by winding_bounds; none precedeID10.

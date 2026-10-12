@@ -1,5 +1,14 @@
 # Global fiber assignment with PyTorch SGD
 
+Latest: [shifted seven-winding windows](uv_reference_windows_results.md),
+positions4–10/5–11/6–12 from leftmostID10,100passes fresh/ref on6GPUs.
+Includes actual XYZ validation of reference winding bounds and all checkpoint
+tables; fewer reference-order violations do not yet establish kollesis.
+
+Latest: [reference-selected ten-winding regional solves](uv_reference_subset_results.md).
+Exact Z30k–50k clipped induced graph,2651fibers,100sampledpasses fresh/ref;
+reusable approved extraction/solve configs and full checkpoint tables recorded.
+
 Latest: [100/1000-pass low-LR results and every10-pass metrics](uv_joint_lr_width_results.md).
 Reference-started solves now initialize reference widths too, with unchanged radial
 prior; mean fitted/reference width factor is reported after global-offset alignment.

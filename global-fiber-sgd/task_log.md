@@ -1,56 +1,62 @@
-# Diagnostic optimization and two100-pass-equivalent joint solves
+# Current task: reference-selected regional solve
 
-- BothlowLR1000runscompleted: fresh1718.93s,loss1.468878,L1 10.585124,
-  within2 14.26355%,widthfactor .882224,retained72.52136%; reference1716.47s,
-  loss .670348,L1 2.216075,within2 70.36694%,widthfactor1.092490,
-  retained92.48525%. All5savedstates finite,widths>100. Reference metadata SHA256
-  e586740ccd35d9e4ad532f100164a62f785355c42710ed17b1acc158447e4c75.
-  All10passrecords persisted; offset changes explicitlyincluded.1000layoutTIFFs
-  verified1000px,LZW,2vectorPDFs,noPNG. Referencecrosscolor rendercompletedexit0;
-  all6maincomparisonTIFFs verified1000px,LZW,noPNG. ManagedGPUlease finished,
-  noCPU/GPUheld. Commands are the approved runner with100/1000layout/reference
-  configfiles. No further solves pending. HighLR1000/referencehigh experiments
-  cancelled peruser; completedfreshhigh100kept ascomparison. Unrelated untracked
-  .pytest_tmp_private_hot/left untouched.
+Follow-up: user confirms positions from leftmost reference surface. Metadata
+ID10 begins atcolumn1; selected IDs13–19,14–20,15–21 correspond topositions
+4–10,5–11,6–12. Same Z30k–50k, sixGPUs,100sampledpasses both initializations.
+No objective changes; derive budgets per extracted event count. New results
+will be in uv_reference_windows_results.md, preserving prior tables.
 
-- LowLR100complete: fresh loss1.91248,referenceL1 11.59110,within2 13.25945%,
-  widthfactor .866755,retained68.5867%. Referencewidth-start loss .873643,
-  L1 1.060589,within2 89.64818%,widthfactor1.025152,retained91.6016%.
-  Full10pass history committed2cf3fdc48. Both100passlayout and referencecomparison
-  visualization commands completed; TIFF LZW1000px,SVG/PDF, separatehistograms,
-  all threecolorviews perrun. Under data/uv_joint100_vis_width_v2/{layout,reference}.
+All3extracts completed ~15s each concurrently,auto-audits passed; sources
+2018/2192/2262,events22186/24771/26429. Independent config review approved;
+20subset/reference tests passed. Six-run suite started via approved command,
+manager task ae3cf4a9-bbf4-498a-9d28-f5ceab2511b4,exclusive6GPUs.
+User asked whether undeclared surface predatesID10: checked entire actual XYZ
+TIFF validity mask47,026,606vertices. Minvalidcolumn1 and0vertices outside all
+declared rectangles, so leftmost reference surface does belong toID10.
 
-- User stopped high-LR experiments after observing loss jumps. Freshhigh100 had
-  justfinished (loss7.3176 overlast10passes,L1 10.9919,within2 13.2196%). Mixed
-  suite interrupted with SIGINT/exit130 before furtherhighLRruns. Replacement
-  run_uv_joint_low_width_suite.json runs only fresh/reference lowLR100 then1000.
-  Reference widths included;10passmetrics. Oldcompleteddata preserved.
+Six-run suite completedexit0 in119.889s including managerwait/setup; solvewalls
+2.906–3.618s. All6CUDAgrad/coordinatepreflights passed; finalarrays finite.
+Finalfresh L1=2.6239/2.7427/2.9010; finalreferenceL1=.4876/.4831/.4881.
+Reference within2=100%,signviolations4.6955/4.5390/4.8024%; allrunsretained100%.
+Fulltables every~10passes and prior1–10baseline persisted in
+uv_reference_windows_results.md. No convergence or kollesis identification claim.
+Manager ae3cf4a9-bbf4-498a-9d28-f5ceab2511b4 finished/releasedallresources.
 
-- User authorizes diagnostic optimization then fresh/reference-initialized100
-  iterations and visualizations. Plan:uv_diagnostics_100_plan.md, independently
-  approved. Currentmode sampledminibatch,32k/GPU,6GPUs,3360updates~100passes.
-- Follow-up: both LR levels and both initializations for100 and1000 sampled passes.
-  Reference widths initialize from the reference map; radial width prior unchanged.
-  Mean fitted/reference width ratio uses equal supported intervals after the same
-  global winding-offset correction. Added relative absolute error too. New suite
-  logs every336updates (~10passes), not34, per requested10pass reporting. Earlier
-  worker benchmarks retain per-pass cadence.27targeted tests passed; plan reviewed.
-  Width LR remains2; state LR .207846/.0207846. Old controls preserved.
-- Previousdistributedwork archived uv_distributed_task_log.md. Normalreporting
-  10pass6GPUwall152.743s:132.999sdiagnostics,18.020supdateCUDAevents. Olderhistory
-  endpoint144.831s versus414.581oldbaseline;fullwall includes finalreference+save.
-- Implemented exact groupedconstantmedian fastpath, canonicalfallback mixedgroups,
-  staticgeometrycache and shared hard_geometry.24tests pass. Real initial/final
-  per-source exactequality and3repeattimings in progress viaapprovedrunner,
-  run_uv_diagnostic_benchmark.json. No optimization or metricdefinition changes.
-- Realdata benchmark passed all489197source medians exact oninitial/final states,
-  entiremetricdicts exact. Reference~11.5s vsoptimized4.8–5.1s fullauditCPU.
-- Added bounded ordered CPUasync snapshots, noCUDAinworkers, prewarmedimmutable
-  cache,mainthreadpublication,finaldrain/errorcleanup. Independentreviewapproved.
-- SixGPU10pass optimizedasync2 run34.847s vs152.743s; all12checkpointdicts and
-  allfinalsolutionarrays exactlyequal.97tests pass (2CUDAexcluded;actualpreflight
-  includedinrun). No metricdrop; timestamp scopes explicitlytagged.
-- Fresh/reference100pass suite launched using2workers before user's follow-up
-  requestingworker-countoptimization. Preserve these as2workercontrols ifalready
-  completed; benchmarkcounts then rerunfinal100passeswithwinner ifdifferent.
-  No optimizercheckpoint available midrun, so don'tdiscard completedcontrolwork.
+2026-10-12: User requested first ten reference windings, Z=30000–50000 base
+voxels, 100-iteration fresh/reference solves with metrics and time. Plan:
+uv_reference_subset_plan.md. Prior completed results remain in
+uv_joint_lr_width_results.md and changelog.md.
+
+Reference assignments span IDs10–135; use10–19 inclusive. Existing projection
+has2652pieces/2651sources with at least one sampled point in this ROI (final
+exact clipping may differ). Reuse earlier stages, no normal/HV/direction solve.
+Independent review agrees with plan; preserve global radial gauge, clip metrics
+to retained geometry and document batch/LR and boundary constraint losses.
+
+User explicitly requested multi-GPU for speed, overriding the proposed1GPU
+subset run. Use6GPUs,4096/GPU,global24576,stateLR0.0073484692,widthLR2 unchanged.
+
+Extraction completed15.2396s:7218reference-selected sources before Z clipping,
+2651retained sources,2662pieces,30048events,1continuation,4027780.258base-vx arc.
+Exact output Z bounds30000/50000; reference IDs10–19. Production audit passed:
+finite arrays,correct identities/owners/degrees/arcs,91191clipped metric samples.
+Reference subset projection is a metric/initialization cache, not a surface
+render projection (no nearest_rc/placed_rc); exact inspectable clipped curves
+are separately saved. No visualization was requested this task.
+
+Independent plan/implementation/config reviews approved.48tests passed,
+2CUDA-only tests deselected; production launch includes6GPU gradient preflight.
+Width diagnostics optionally filter reference intervals10–19 after offset;
+initialization/prior unaffected. Started approved run_uv_subset100_suite.json
+under exclusive6GPU manager task c01de29e-1070-4e4c-921d-10eb305820f6.
+123updates give100.6006sampledpass equivalents,12update reporting (~9.81passes).
+
+Completed both runs, suiteexit0, leasefinished/released. Fresh solve5.821s:
+loss43.2843,referenceL1=2.3063,within2=62.1652%,retained100%,sign22.5004%.
+Reference solve3.792s:loss32.3750,L1=.4885,within2=100%,retained100%,sign9.8259%.
+Suite49.889s including startup/manager, excluding prior extraction. No convergence
+claim: smaller dataset gives only123updates, versus3360in full100pass run.
+Full checkpoint tables/timing/commands in uv_reference_subset_results.md.
+Final regression50passed,2CUDA-only deselected; production6rankgradient and
+coordinategradient/bitwisepreflights passed. Boundary-link hardening produces
+exactly the same stored link; production audit passed, no regeneration needed.

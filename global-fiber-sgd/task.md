@@ -1,4 +1,13 @@
-# Saved U/V solution visualization
+# Reference-selected regional solve
+
+Current follow-up: positions4–10,5–11,6–12 (IDs13–19,14–20,15–21), both
+fresh/reference initialization, sixGPUs,100passes each. Same Z30k–50k.
+
+Current: extract reference-matched fibers in winding IDs10–19 and base
+Z30000–50000, run100 sampled pass equivalents fresh and reference-initialized,
+report metrics and timing. See uv_reference_subset_plan.md.
+
+Historical tasks below are completed/superseded.
 
 Completed current follow-up: lowLR100/1000 fresh/reference-width-initialized
 joint solves, every10pass metrics, normalizedwidth comparison, TIFF/vectorvis.

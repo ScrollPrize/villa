@@ -63,13 +63,21 @@ def reference_interval_widths(config, winding_starts):
 
 def reference_width_metrics(widths,config,global_offset):
     if global_offset is None:return dict(compared_windings=0,mean_normalized_factor=None)
-    reference=reference_interval_widths(config,np.arange(len(widths))+global_offset)
+    starts=np.arange(len(widths))+global_offset
+    reference=reference_interval_widths(config,starts)
     valid=np.isfinite(reference)&(reference>0)
+    selected=config['reference_widths'].get('metric_winding_range')
+    if selected is not None:
+        lo,hi=map(float,selected)
+        if not np.isfinite([lo,hi]).all() or lo>hi:raise ValueError('Invalid width metric winding range')
+        valid&=(starts>=lo)&(starts<=hi)
     ratio=np.asarray(widths)[valid]/reference[valid]
-    return dict(compared_windings=int(valid.sum()),global_offset=float(global_offset),
+    result=dict(compared_windings=int(valid.sum()),global_offset=float(global_offset),
         mean_normalized_factor=float(ratio.mean()) if len(ratio) else None,
         mean_absolute_relative_error_percent=float(100*np.abs(ratio-1).mean()) if len(ratio) else None,
         weighting='equal fully reference-supported winding intervals; fitted/reference')
+    if selected is not None:result['metric_winding_range']=list(selected)
+    return result
 
 
 def palette(q, seed=20261011):

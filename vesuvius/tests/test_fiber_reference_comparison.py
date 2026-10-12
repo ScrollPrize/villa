@@ -19,6 +19,12 @@ def test_reference_width_units_offsets_and_coverage(tmp_path):
     assert m['compared_windings']==2 and m['mean_normalized_factor']==1
     assert m['mean_absolute_relative_error_percent']==0
     assert reference_width_metrics([800],cfg,None)['compared_windings']==0
+    cfg['reference_widths']['metric_winding_range']=[1,2]
+    m=reference_width_metrics([8000,1600,999],cfg,.5)
+    assert m['compared_windings']==1 and m['mean_normalized_factor']==1
+    assert m['metric_winding_range']==[1,2]
+    # Diagnostic range does not alter the initialization widths.
+    np.testing.assert_allclose(reference_interval_widths(cfg,[.5,1.5]),[800,1600])
 
 
 def test_reference_width_initialization_preserves_radial_prior(tmp_path,monkeypatch):

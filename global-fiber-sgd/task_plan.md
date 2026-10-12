@@ -1,5 +1,7 @@
 # Global fiber SGD: data reconnaissance
 
+Current: uv_reference_subset_plan.md. Older entries below are historical.
+
 Current: uv_diagnostics_100_plan.md (independently approved).
 
 Current: uv_distributed_plan.md, larger batches then true multi-GPU solve.
