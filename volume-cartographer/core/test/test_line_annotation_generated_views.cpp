@@ -6607,3 +6607,115 @@ TEST_CASE("Strip control column: revision-gated arc lengths agree with the build
               doctest::Approx(scaledMap.originalPositionToStripGridColumn(position)).epsilon(1e-6));
     }
 }
+
+TEST_CASE("model-only fiber seed and edits need no Lasagna dataset")
+{
+    using namespace vc3d::line_annotation;
+    FiberModeOptimizationRequest request;
+    request.controlPoints = {{1.0, {10.0, 20.0, 30.0}, true, 1}};
+    request.linePointsBase = {{9.0, 20.0, 30.0}, {10.0, 20.0, 30.0}, {11.0, 20.0, 30.0}};
+    request.extrapolationDistanceBaseVoxels = 8.0;
+    int normalBuilds = 0;
+    request.modelLineBuilder = [&](const auto& points) {
+        ++normalBuilds;
+        vc::lasagna::LineModel line;
+        for (const auto& p : points) {
+            vc::lasagna::LinePoint point;
+            point.position = p;
+            point.sampledNormal.normal = {0.0, 1.0, 0.0};
+            point.sampledNormal.valid = point.valid = true;
+            line.points.push_back(point);
+        }
+        line.displayFrameAnchorIndex = int(points.size() / 2);
+        return line;
+    };
+    request.externalExtrapolation = [](const auto& history, const auto& direction, double distance) {
+        vc::fiber_tracer::FiberTraceOneWayResult result;
+        result.points = {history.back(), history.back() + direction / cv::norm(direction) * distance};
+        result.reason = "fiber_follow: max_len";
+        result.reachedTraceLength = true;
+        return result;
+    };
+    request.externalSegment = [](const auto& span) {
+        vc::fiber_tracer::FiberTraceSegmentResult result;
+        result.accepted = true;
+        const auto start = span.referenceLine.at(span.startIndex);
+        const auto end = span.referenceLine.at(span.targetIndex);
+        result.fusedLine = {start, (start + end) * 0.5, end};
+        result.reason = "fiber_follow: target_plane";
+        return result;
+    };
+    SUBCASE("seed grows both directions and retains measured normals") {
+        const auto result = optimizeFiberWithNativeFallback(request);
+        CHECK(normalBuilds == 1);
+        CHECK(result.lasagnaFallbackExtrapolations == 0);
+        REQUIRE(result.optimization.line.points.size() == 3);
+        CHECK(result.optimization.line.points.front().position == cv::Vec3d(2, 20, 30));
+        CHECK(result.optimization.line.points.back().position == cv::Vec3d(18, 20, 30));
+        CHECK(result.controlPoints.front().optimizedIndex == 1);
+        CHECK(result.optimization.line.points[1].sampledNormal.normal == cv::Vec3d(0, 1, 0));
+    }
+    SUBCASE("no progress is an error, not a fabricated seed line") {
+        request.externalExtrapolation = [](const auto& history, const auto&, double) {
+            vc::fiber_tracer::FiberTraceOneWayResult result;
+            result.points = {history.back()};
+            result.reason = "fiber_follow: confidence";
+            return result;
+        };
+        CHECK_THROWS_WITH_AS(optimizeFiberWithNativeFallback(request),
+            doctest::Contains("Fiber follow made no progress from the seed; try another seed or lower confidence."), std::runtime_error);
+        CHECK(normalBuilds == 0);
+    }
+    SUBCASE("model errors propagate without Lasagna fallback") {
+        request.externalExtrapolation = [](const auto&, const auto&, double) -> vc::fiber_tracer::FiberTraceOneWayResult {
+            throw std::runtime_error("model socket failed");
+        };
+        CHECK_THROWS_WITH_AS(optimizeFiberWithNativeFallback(request), doctest::Contains("model socket failed"), std::runtime_error);
+    }
+    SUBCASE("one confident tail is enough and the empty tail is removed") {
+        auto trace = request.externalExtrapolation;
+        request.externalExtrapolation = [trace](const auto& history, const auto& direction, double distance) {
+            auto result = trace(history, direction, distance);
+            if (direction[0] < 0) {
+                result.points.resize(1);
+                result.reachedTraceLength = false;
+                result.reason = "fiber_follow: confidence";
+            }
+            return result;
+        };
+        const auto result = optimizeFiberWithNativeFallback(request);
+        REQUIRE(result.optimization.line.points.size() == 2);
+        CHECK(result.optimization.line.points.front().position == cv::Vec3d(10, 20, 30));
+        CHECK(result.controlPoints.front().optimizedIndex == 0);
+    }
+    SUBCASE("control edits trace and preserve exact control indices") {
+        request.controlPoints.push_back({2.0, {11.0, 20.0, 30.0}, false, 2});
+        request.controlPoints.front().segmentToNext.emplace();
+        request.controlPoints.front().segmentToNext->interpGoal = SegmentInterpolationGoal::Trace;
+        SUBCASE("accepted span") {
+            const auto result = optimizeFiberWithNativeFallback(request);
+            CHECK(result.nativeSegments == 1);
+            CHECK(normalBuilds == 1);
+            CHECK(result.lasagnaFallbackSegments == 0);
+            for (const auto& control : result.controlPoints)
+                CHECK(result.optimization.line.points.at(control.optimizedIndex).position == control.volumePoint);
+        }
+        SUBCASE("missed control is reported") {
+            request.externalSegment = [](const auto&) {
+                vc::fiber_tracer::FiberTraceSegmentResult result;
+                result.reason = "fiber_follow: missed target";
+                return result;
+            };
+            CHECK_THROWS_WITH_AS(optimizeFiberWithNativeFallback(request),
+                doctest::Contains("Fiber follow could not connect the controls: fiber_follow: missed target"), std::runtime_error);
+        }
+        SUBCASE("bounded spline still uses model normals") {
+            request.controlPoints.front().segmentToNext->interpGoal = SegmentInterpolationGoal::Cspline;
+            request.retainOpenTails = false;
+            const auto result = optimizeFiberWithNativeFallback(request);
+            CHECK(normalBuilds == 1);
+            CHECK(result.optimization.line.points.front().position == request.controlPoints.front().volumePoint);
+            CHECK(result.optimization.line.points.back().position == request.controlPoints.back().volumePoint);
+        }
+    }
+}

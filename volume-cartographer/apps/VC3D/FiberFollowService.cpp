@@ -14,6 +14,7 @@
 #include <QUuid>
 
 #include <stdexcept>
+#include <cmath>
 
 namespace {
 constexpr int kStartTimeoutMs = 10 * 60 * 1000;  // first start compiles kernels
@@ -180,4 +181,32 @@ nlohmann::json FiberFollowService::request(const nlohmann::json& request) const
         throw std::runtime_error("fiber-follow: " + reply.value("error", std::string("request failed")));
     }
     return reply;
+}
+
+vc::lasagna::LineModel FiberFollowService::lineModel(
+    const std::vector<cv::Vec3d>& points, double baseUm) const
+{
+    if (points.size() < 2 || !std::isfinite(baseUm) || baseUm <= 0)
+        throw std::runtime_error("Model normals need a line and a valid volume voxel size.");
+    auto positions = nlohmann::json::array();
+    for (const auto& p : points) positions.push_back({p[0], p[1], p[2]});
+    const auto reply = request({{"op", "normals"}, {"points", positions}, {"base_um", baseUm}});
+    const auto& normals = reply.at("normals");
+    if (normals.size() != points.size())
+        throw std::runtime_error("Fiber follow returned the wrong number of normals.");
+    vc::lasagna::LineModel line;
+    for (size_t i = 0; i < points.size(); ++i) {
+        const auto& n = normals.at(i);
+        cv::Vec3d normal{n.at(0).get<double>(), n.at(1).get<double>(), n.at(2).get<double>()};
+        const double length = cv::norm(normal);
+        if (!std::isfinite(length) || length < 1e-8)
+            throw std::runtime_error("Fiber follow returned an invalid sheet normal.");
+        vc::lasagna::LinePoint point;
+        point.position = points[i];
+        point.sampledNormal.normal = normal / length;
+        point.sampledNormal.valid = point.valid = true;
+        line.points.push_back(point);
+    }
+    line.displayFrameAnchorIndex = static_cast<int>(points.size() / 2);
+    return line;
 }

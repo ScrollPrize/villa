@@ -794,6 +794,26 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
             updateFiberFollowMenu();
             emit fiberFollowSettingsChanged();
         });
+        auto* confidenceRow = new QWidget(fiberFollowMenu);
+        auto* confidenceLayout = new QHBoxLayout(confidenceRow);
+        confidenceLayout->setContentsMargins(12, 4, 12, 4);
+        confidenceLayout->addWidget(new QLabel(tr("Confidence"), confidenceRow));
+        _fiberFollowConfidenceSpin = new QDoubleSpinBox(confidenceRow);
+        _fiberFollowConfidenceSpin->setObjectName(QStringLiteral("fiberFollowConfidenceSpin"));
+        _fiberFollowConfidenceSpin->setRange(0.0, 1.0);
+        _fiberFollowConfidenceSpin->setDecimals(2);
+        _fiberFollowConfidenceSpin->setSingleStep(0.05);
+        _fiberFollowConfidenceSpin->setKeyboardTracking(false);
+        _fiberFollowConfidenceSpin->setToolTip(tr("Minimum confidence for subsequent model traces. Lower values allow longer, less certain traces."));
+        confidenceLayout->addWidget(_fiberFollowConfidenceSpin);
+        auto* confidenceAction = new QWidgetAction(fiberFollowMenu);
+        confidenceAction->setDefaultWidget(confidenceRow);
+        fiberFollowMenu->addAction(confidenceAction);
+        connect(_fiberFollowConfidenceSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            settings.setValue(vc3d::settings::line_annotation::FIBER_FOLLOW_CONFIDENCE, value);
+            emit fiberFollowConfidenceChanged();
+        });
         _fiberFollowCheckpointAction = fiberFollowMenu->addAction(tr("Checkpoint…"));
         connect(_fiberFollowCheckpointAction, &QAction::triggered, this, [this]() {
             chooseFiberFollowCheckpoint();
@@ -1250,6 +1270,12 @@ void LineAnnotationDialog::chooseFiberFollowCheckpoint()
     emit fiberFollowSettingsChanged();
 }
 
+void LineAnnotationDialog::setModelOnlySession(bool enabled)
+{
+    _modelOnlySession = enabled;
+    updateFiberFollowMenu();
+}
+
 void LineAnnotationDialog::updateFiberFollowMenu()
 {
     if (!_fiberFollowEnabledAction) {
@@ -1258,7 +1284,15 @@ void LineAnnotationDialog::updateFiberFollowMenu()
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     namespace keys = vc3d::settings::line_annotation;
     const QString checkpoint = settings.value(keys::FIBER_FOLLOW_CHECKPOINT).toString();
-    const bool enabled = settings.value(keys::FIBER_FOLLOW_ENABLED, keys::FIBER_FOLLOW_ENABLED_DEFAULT).toBool();
+    const bool enabled = _modelOnlySession || settings.value(keys::FIBER_FOLLOW_ENABLED, keys::FIBER_FOLLOW_ENABLED_DEFAULT).toBool();
+    _fiberFollowEnabledAction->setEnabled(!_modelOnlySession);
+    _fiberFollowEnabledAction->setText(_modelOnlySession
+        ? tr("Enabled for this model annotation session") : tr("Use for the Fiber model"));
+    if (_fiberFollowConfidenceSpin) {
+        QSignalBlocker block(_fiberFollowConfidenceSpin);
+        _fiberFollowConfidenceSpin->setValue(settings.value(keys::FIBER_FOLLOW_CONFIDENCE,
+            keys::FIBER_FOLLOW_CONFIDENCE_DEFAULT).toDouble());
+    }
     {
         QSignalBlocker block(_fiberFollowEnabledAction);
         _fiberFollowEnabledAction->setChecked(enabled);

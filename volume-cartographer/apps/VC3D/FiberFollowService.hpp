@@ -5,6 +5,7 @@
 #include <QString>
 
 #include <nlohmann/json.hpp>
+#include "vc/lasagna/LineModel.hpp"
 
 #include <memory>
 #include <mutex>
@@ -38,6 +39,8 @@ public:
     // std::runtime_error on transport failure or an {"ok": false} reply.
     [[nodiscard]] nlohmann::json request(const nlohmann::json& request) const;
     [[nodiscard]] std::string socketPath() const;
+    [[nodiscard]] vc::lasagna::LineModel lineModel(
+        const std::vector<cv::Vec3d>& points, double baseUm) const;
 
 signals:
     void statusMessage(const QString& message);

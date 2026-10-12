@@ -7,12 +7,15 @@ the service maps them to the checkpoint's base grid (``--base-um``; by default p
 
 Requests:
 - {"op": "hello"} -> model, grid scale, operating policy.
+- {"op": "normals", "points": [[x,y,z], ...], "base_um": u} -> sheet normals for a line,
+  using the checkpoint's learned frame predictor (or its CT frame policy).
+Trace requests optionally accept "confidence" in [0, 1]; omitted uses the startup default.
 - {"op": "extrapolate", "history": [[x,y,z], ...], "direction": [dx,dy,dz], "distance": d, "base_um": u,
    "family": "H"|"V"|null}: continue the line ``history`` (travel order, ending at the start point) outward along
-   ``direction`` for up to ``distance`` base voxels. With at least 12 trace voxels of history the trace resumes as
-   the tracer would at that head (the whole history as its observed path, heading fit, learned frame); otherwise
-   it starts fresh from the CT seed heading of its family, signed along ``direction`` (``direction`` itself where
-   the CT shows no clear sheet).
+   ``direction`` for up to ``distance`` base voxels. Any nonstationary history resumes the trace, with a signed
+   heading fitted to its last up-to-12 trace voxels and the whole history as its observed path. History determines
+   travel direction; the supplied direction and target chord cannot reverse it. Only a single-point seed starts
+   from the CT seed heading of its family, signed along ``direction`` (``direction`` itself where CT is unclear).
    -> {"points": [...], "reason": stop reason, "reached_length": bool, "decisions": n}
 - {"op": "segment", "history": [...], "target": [x,y,z], "direction": [...] (optional), "base_um": u,
    "family": ...}: trace from the end of ``history`` towards ``target``; the trace ends where it passes the
@@ -44,7 +47,7 @@ from vesuvius.neural_tracing.tracers.fibers.frames.learned import predict_frames
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import ct_frame
 from vesuvius.neural_tracing.tracers.fibers.tracing.runtime import add_checkpoint_argument, add_volume_arguments, checkpoint_source
 from vesuvius.neural_tracing.tracers.fibers.tracing.volume import build_tracer
-from vesuvius.neural_tracing.tracers.shared.geometry import arclength, normalize, resample_polyline
+from vesuvius.neural_tracing.tracers.shared.geometry import arclength, normalize, resample_polyline, interp_at
 from vesuvius.neural_tracing.tracers.shared.ct_structure import SeedHeadingError
 from vesuvius.neural_tracing.tracers.shared.reference import trace_history
 
@@ -58,6 +61,25 @@ def model_base_um(spec, given=None):
     if not match:
         raise SystemExit('Cannot infer the checkpoint CT base voxel size; pass --base-um')
     return float(match.group(1))
+
+
+def continuation_heading(path, fallback):
+    """Signed tangent in observed travel order, including histories shorter than the normal fit window."""
+    if len(path) < 2:
+        return np.asarray(fallback, np.float64)
+    arc = arclength(path)
+    if arc[-1] <= 1e-8:
+        return np.asarray(fallback, np.float64)
+    if arc[-1] >= HEADING_FIT:
+        return trace_heading(path, 0, fallback)
+    times = np.linspace(0., arc[-1], 13)
+    samples = interp_at(path, arc, times)
+    slope = (times-times.mean()) @ samples
+    if np.linalg.norm(slope) > 1e-8:
+        return normalize(slope)
+    # A degenerate fitted loop still has a directed final nonstationary edge.
+    edges = np.diff(path, axis=0)
+    return normalize(edges[np.linalg.norm(edges, axis=1) > 1e-8][-1])
 
 
 class FiberFollow:
@@ -91,11 +113,15 @@ class FiberFollow:
     def start_state(self, path, direction, family):
         """(head, heading, initial state or None) of a trace continuing ``path`` (trace grid, travel order)."""
         pos = path[-1]
-        if len(path) > 1 and arclength(path)[-1] >= HEADING_FIT:
+        if len(path) > 1 and arclength(path)[-1] > 1e-8:
+            heading = continuation_heading(path, direction)
             path = resample_polyline(path, 1.)
-            path[-1] = pos
-            heading = trace_heading(path, 0, direction)
-            heading = heading if heading @ direction >= 0 else -heading
+            # resample_polyline omits a fractional endpoint. Append the true
+            # head instead of replacing the last observed sample with it.
+            if np.linalg.norm(path[-1]-pos) > 1e-8:
+                path = np.vstack([path, pos])
+            else:
+                path[-1] = pos
             predictor = self.tracer.frame_predictor
             if predictor is not None:
                 frame = predict_frames(predictor, self.vol, [pos], [heading], [path], [family])[0]
@@ -137,7 +163,7 @@ class FiberFollow:
     def extrapolate(self, request):
         u = request['base_um']
         history = self.to_grid(request['history'], u)
-        direction = normalize(np.asarray(request['direction'], np.float64))
+        direction = continuation_heading(history, normalize(np.asarray(request['direction'], np.float64)))
         family = self.family(request, direction)
         distance = float(request['distance'])*(float(u)/self.base_um)/self.g
         path, reason, n = self.run(history, direction, family, distance)
@@ -159,8 +185,11 @@ class FiberFollow:
                         reason='degenerate span')
         axis = chord/length
         direction = normalize(np.asarray(request.get('direction') or axis, np.float64))
-        direction = direction if direction @ axis > 0 else axis
-        family = self.family(request, axis)
+        if len(history) > 1 and arclength(history)[-1] > 1e-8:
+            direction = continuation_heading(history, direction)
+        else:
+            direction = direction if direction @ axis > 0 else axis
+        family = self.family(request, direction)
         tolerance = float(request.get('tolerance', 3.*self.g*self.base_um/float(u)))*(float(u)/self.base_um)/self.g
 
         def past_target(state):
@@ -178,11 +207,47 @@ class FiberFollow:
                     reason=reason if accepted else f'missed the target by {meeting:.1f} base voxels ({reason})',
                     decisions=n, family=family)
 
+    def normals(self, request):
+        path = self.to_grid(request['points'], request['base_um'])
+        if len(path) < 2 or not np.isfinite(path).all():
+            raise ValueError('normals requires at least two finite line points')
+        arc = arclength(path)
+        priors, histories, families = [], [], []
+        for i, pos in enumerate(path):
+            # Use a short local observed path, not quadratic copies of the line.
+            first = int(np.searchsorted(arc, arc[i]-HEADING_FIT))
+            history = path[first:i+1]
+            heading = path[min(i+1, len(path)-1)]-path[max(i-1, 0)]
+            if np.linalg.norm(heading) < 1e-8:
+                raise ValueError('line contains a degenerate tangent')
+            heading = normalize(heading)
+            priors.append(heading)
+            histories.append(history)
+            families.append(self.family(request, heading))
+        predictor = self.tracer.frame_predictor
+        if predictor is not None:
+            frames = predict_frames(predictor, self.vol, path, priors, histories, families)
+        else:
+            frames = [ct_frame(self.vol, pos, heading) for pos, heading in zip(path, priors)]
+        normals = np.asarray(frames, np.float64)[:, :, 0].copy()
+        if not np.isfinite(normals).all() or np.any(np.linalg.norm(normals, axis=1) < 1e-8):
+            raise ValueError('frame predictor returned invalid sheet normals')
+        normals /= np.linalg.norm(normals, axis=1)[:, None]
+        for i in range(1, len(normals)):
+            if normals[i] @ normals[i-1] < 0:
+                normals[i] *= -1
+        return dict(normals=normals.tolist())
+
     def handle(self, request):
         op = request.get('op')
-        if op not in ('hello', 'extrapolate', 'segment'):
+        if op not in ('hello', 'extrapolate', 'segment', 'normals'):
             raise ValueError(f'unknown op {op!r}')
         with self.lock:
+            if op in ('extrapolate', 'segment'):
+                confidence = float(request.get('confidence', self.policy.confidence))
+                if not np.isfinite(confidence) or not 0 <= confidence <= 1:
+                    raise ValueError('confidence must be between 0 and 1')
+                self.tracer.p.confidence = confidence
             return getattr(self, op)(request)
 
 

@@ -329,7 +329,8 @@ public:
     bool canLaunchFromViewer(const CChunkedVolumeViewer* viewer) const;
     void launchFromViewerAtPoint(CChunkedVolumeViewer* viewer,
                                  const QPointF& scenePoint,
-                                 bool replaceOwningAnnotation = true);
+                                 bool replaceOwningAnnotation = true,
+                                 bool modelOnly = false);
     void openFiber(uint64_t fiberId);
     // Opens a fiber imported from an Automated Fiber Volume, fitting the whole
     // line in both strips. A Lasagna dataset is optional. Errors are returned

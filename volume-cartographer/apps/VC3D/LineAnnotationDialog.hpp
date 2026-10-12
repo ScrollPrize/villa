@@ -217,6 +217,7 @@ public:
     void setCloseAfterFinalizationAllowed(bool allowed);
     // Menu texts and the Fiber model combo label from the fiber-follow settings.
     void updateFiberFollowMenu();
+    void setModelOnlySession(bool enabled);
     void setWorkspaceEmbedded(bool embedded);
     bool workspaceEmbedded() const { return _workspaceEmbedded; }
     // Programmatic twin of the "current cut follows strip mouse" toggle.
@@ -306,6 +307,7 @@ signals:
     void fullOptimizationRequested();
     // The fiber-follow model settings (menu → Fiber follow model) changed.
     void fiberFollowSettingsChanged();
+    void fiberFollowConfidenceChanged();
     void fiberTagChangeRequested(const QString& tag, bool enabled);
     void closeFinalizationRequested(QCloseEvent* event);
     void reoptimizationModeChanged(LineAnnotationDialog::ReoptimizationMode mode);
@@ -555,6 +557,8 @@ private:
     QComboBox* _fiberOptimizationCombo = nullptr;
     QMenu* _lasagnaDatasetMenu = nullptr;
     QMenu* _fiberInferenceDatasetMenu = nullptr;
+    bool _modelOnlySession = false;
+    QDoubleSpinBox* _fiberFollowConfidenceSpin = nullptr;
     QAction* _fiberFollowEnabledAction = nullptr;
     QAction* _fiberFollowCheckpointAction = nullptr;
     QAction* _fiberFollowPythonAction = nullptr;
