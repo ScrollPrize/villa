@@ -6,7 +6,7 @@ Runs the unmodified generator from the pinned upstream Git revision and the patc
 generator in the checkout. No checkpoint/GPU/network volume needed.
 
 From the villa checkout:
-    python vesuvius/tests/neural_tracing/bench_bbox_pherc0841.py --repeats 5
+    python vesuvius/tests/neural_tracing/bench_bbox_pherc0841.py --repeats 4
 Dependencies: numpy, tifffile, tqdm
 """
 from __future__ import annotations
@@ -152,8 +152,8 @@ def summarize_seconds(samples):
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--repeats", type=int, default=5,
-                        help="Per-implementation trials per case (default: 5)")
+    parser.add_argument("--repeats", type=int, default=4,
+                        help="Even number of paired trials per case (default: 4)")
     parser.add_argument("--window", choices=("A", "B", "both"), default="both")
     parser.add_argument("--overlap", choices=("0.0", "0.5", "both"), default="both")
     parser.add_argument("--baseline", default=DEFAULT_BASELINE,
@@ -161,8 +161,8 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, default=None,
                         help="Optional JSON output path outside the repo")
     args = parser.parse_args(argv)
-    if not 1 <= args.repeats <= 10:
-        parser.error("--repeats must be 1 to 10")
+    if not 2 <= args.repeats <= 10 or args.repeats % 2:
+        parser.error("--repeats must be even and between 2 and 10 to counterbalance run order")
     baseline = subprocess.run(
         ["git", "show", f"{args.baseline}:{GENERATOR_PATH}"],
         cwd=REPO_ROOT, capture_output=True, text=True, check=True,
@@ -205,7 +205,8 @@ def main(argv=None):
         for overlap in overlap_values:
             before_times, after_times = [], []
             for i in range(args.repeats):
-                # Alternate run order to reduce systematic warm-cache bias.
+                # Alternate run order with an EVEN trial count so each
+                # implementation runs first equally often.
                 if i % 2 == 0:
                     old, t_old = timed(before, points, overlap)
                     new, t_new = timed(after, points, overlap)
