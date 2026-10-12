@@ -1,5 +1,8 @@
 # Reference-selected regional solve
 
+Current: userclarified10000totalpasses bothfresh/ref positions5–11,
+reportevery1000passes. PreservecontinuousAdam byreproducingoriginalstarts.
+
 Current: positions5–11 (IDs14–20) fresh/reference initialized1000passes,
 report separate complete tables every100passes. Same6GPU settings and Z slab.
 

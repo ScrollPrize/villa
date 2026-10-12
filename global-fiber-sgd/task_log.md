@@ -1,5 +1,10 @@
 # Current task: reference-selected regional solve
 
+Currentfollowup:userclarified10000totalpasses,reportevery1000 forbothfresh/ref
+positions5–11.10080updates,1008updatediagnostics,unchangedsettings.
+Originalstarts reproduced because savedsolutions lackAdamstate; no warmreset.
+Newconfigs run_uv_window10000_{fresh,reference,suite}.json.
+
 Current follow-up: user selected positions5–11 (IDs14–20),requested fresh/ref
 1000passes reportingevery100. Sameauditedsubset24771events,same6GPUs andLRs.
 1008updates,101updatediagnostics; original initialization,no warmresume.
@@ -83,3 +88,20 @@ Full checkpoint tables/timing/commands in uv_reference_subset_results.md.
 Final regression50passed,2CUDA-only deselected; production6rankgradient and
 coordinategradient/bitwisepreflights passed. Boundary-link hardening produces
 exactly the same stored link; production audit passed, no regeneration needed.
+
+# Completed 10k total passes, positions 5–11
+
+Approved config review; executed run_uv_window10000_suite.json through the
+approved crop-benchmark runner. Both 10080-update runs completed, original
+initializations, unchanged losses/LRs. Six-GPU preflights passed; finite states;
+1k checkpoint reference metrics exactly match prior runs. Manager lease released.
+Fresh: 158.358s, final loss .213888, L1 .845161, within2 94.9309%, retained
+97.8660%, sign .648619%, width factor .921489. Reference: 172.771s, loss
+.119017, L1 .580292, within2 98.6770%, retained100%, sign .681710%, width
+factor .849580. Reference width drift and L1 worsening after3k despite falling
+loss documented. Full tables/commands/timings: uv_reference_5_11_10000_results.md.
+No solver changes or new visualization; prior 1k renders preserved.
+Audited current sign loss on user request: parallel/perpendicular equal weight
+per event; probability-weighted linear hinge slope40, no fixed violation charge
+(sign_charge_multiplier absent/default0). Documented formulas and differing
+event/node normalization in results. No loss changes made in this task.

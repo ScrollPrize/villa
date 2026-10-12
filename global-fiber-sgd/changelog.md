@@ -2,6 +2,11 @@
 
 ## 2026-10-12
 
+- Completed fresh/reference regional positions5–11 joint solves to10k total
+  sampled passes. Full1k checkpoint tables, timings and exact sign-loss weights:
+  uv_reference_5_11_10000_results.md. Both reproduce previous1k metrics exactly;
+  reference width shrinkage persists despite falling objective. No solver changes.
+
 - Exact diagnostics acceleration with bounded ordered CPU snapshots; worker-count
   sweep selected4. Added reference-width initialization (radial prior unchanged)
   and offset-aligned mean width factors. Completed low-LR100/1000pass fresh and

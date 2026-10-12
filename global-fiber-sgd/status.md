@@ -1,5 +1,11 @@
 # Reference-selected regional solve
 
+## Positions5–11,10000totalpasses
+- [x] Derive10080updates and1008updatediagnostics,unchangedsettings.
+- [x] Independent config review approved; launched approved suite.
+- [x] Both six-GPU runs complete; exact 1k metric reproduction and finite states.
+- [x] Full 1k checkpoint tables saved in uv_reference_5_11_10000_results.md; lease released.
+
 ## Positions5–11 longer solve
 - [x] Plan and derive1008update budget,101update diagnostics.
 - [x] Independent config review.

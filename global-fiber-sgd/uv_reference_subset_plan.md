@@ -1,5 +1,17 @@
 # Reference-selected ten-winding regional solve
 
+## Current follow-up:10000totalpasses,reportevery1000
+User clarified total10000 forbothpositions5–11 runs. Same subset,LRs,losses,
+151hypotheses,sixGPUs.10080updates=10000.649146passes;logevery1008updates=
+1000.064915passes. Restart fromoriginal fresh/referenceinitializations to
+preserve continuousAdamstate: existingcheckpoints storeweights,notoptimizer.
+This repeats first1000passes ratherthan appending10000 or resettingAdam.
+Verify first1008update reference metrics exactlymatch prior1000passfinal.
+Independentconfigreview,productionCUDApreflight,finitefinalstate andlease
+release. Reporttwocomplete1000passcheckpointtables pluselapsedtimes in
+uv_reference_5_11_10000_results.md. No code/spec/objectivechanges. Keep previous
+visualizations untouched; no new rendering requested for thisfollowup.
+
 ## Current follow-up: positions5–11 for1000passes
 Use the audited IDs14–20 Z30k–50k subset (2192sources,2199pieces,24771events).
 Run fresh and reference/width initialized from their original starts, not warm
