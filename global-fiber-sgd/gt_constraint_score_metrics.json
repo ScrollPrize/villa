@@ -1,0 +1,180 @@
+{
+  "inputs": {
+    "afv": "05fa4606d6403d5e3b417afd1d6c1def17cb4c42b598f6b18b17fe58ce347504",
+    "configs": {
+      "/home/hendrik/villa2/global-fiber-sgd/run_uv_gt_phase_fresh.json": "68694c507f2890b6329a6d649f873db21a8e774707ef4440f2778a40c183d529",
+      "/home/hendrik/villa2/global-fiber-sgd/run_uv_gt_phase_reference.json": "3f0b00fbdd009fad8501590d28c673c1116583ad2ded2daaeb40e3810f6e1656"
+    },
+    "extract_template": "5b1f86ddb3826a9ddc27019885b4935a50a317c7ea815b8b74c12938a6023967",
+    "gt_afv": "ae60658dd8bf63da085255055b3e765397a758ed433816d189462fe4a2b533fb",
+    "gt_normal": "f02b58c54ccda4e255596e54b39d512e534f3c430446b30b5f225d93a15411ab",
+    "gt_solution": "aa7d8883129014367c57c364b5ebe58921b2acafcbabdf2b001f75aaddf8ab0d",
+    "gt_tensors": "6d5f3168740d42852e67989f4ad009d15717e8a0b30f58b99d14efdf585554b0",
+    "orient_template": "99678c4fdaf1a6e903210488e87d3166789433e14662faa699b1adf933707d53",
+    "tensors": "1caf4f59c6b0486bd67cc205677008544423d8f33dc7bc7bc6a231c5ab357a28",
+    "umbilicus": "5759e460773d23f582b9ce9dfdad1f96e0adfa2cb684101881d50c732f1e474e",
+    "version": 1
+  },
+  "results": [
+    {
+      "additive_global_offset": -2,
+      "by_gt": {
+        "1": {
+          "constraints": 1425,
+          "correct": 766,
+          "score_percent": 53.754385964912274
+        },
+        "2": {
+          "constraints": 1063,
+          "correct": 443,
+          "score_percent": 41.67450611476952
+        },
+        "3": {
+          "constraints": 853,
+          "correct": 360,
+          "score_percent": 42.20398593200469
+        },
+        "4": {
+          "constraints": 1075,
+          "correct": 776,
+          "score_percent": 72.18604651162791
+        },
+        "5": {
+          "constraints": 941,
+          "correct": 351,
+          "score_percent": 37.30074388947928
+        },
+        "6": {
+          "constraints": 839,
+          "correct": 442,
+          "score_percent": 52.68176400476759
+        },
+        "7": {
+          "constraints": 539,
+          "correct": 204,
+          "score_percent": 37.84786641929499
+        }
+      },
+      "class_disagreements": 0,
+      "combined_sweep_gauge_corrections": 0,
+      "constraints": 6735,
+      "correct": 3342,
+      "disabled": {
+        "constraints": 1316,
+        "correct": 177,
+        "score_percent": 13.449848024316111
+      },
+      "disabled_policy": "include best nonbroken hypothesis; retain disabled status",
+      "enabled": {
+        "constraints": 5419,
+        "correct": 3165,
+        "score_percent": 58.405609891123824
+      },
+      "excluded": {
+        "invalid_gt_normal": 0,
+        "non_cross": 25923,
+        "outside_test_piece": 7,
+        "tangent_connector": 1119
+      },
+      "frozen_gt_normal_index_sha256": "77d63478edc51923e52208d386bd2cd7d86ca2bf914247eb78b080395f349423",
+      "gt_config_sha256": "c7c15a1de0a3b3f162fe15010df29d94a12ff0b2f97f87c4261f696dd29737dc",
+      "mean_absolute_residual": 0.9569130863758569,
+      "metric": "equal event votes; nearest integer, ties toward +infinity; one additive test offset",
+      "name": "uv_gt_phase_fresh_v1",
+      "parallel": {
+        "constraints": 5970,
+        "correct": 2989,
+        "score_percent": 50.06700167504188
+      },
+      "perpendicular": {
+        "constraints": 765,
+        "correct": 353,
+        "score_percent": 46.1437908496732
+      },
+      "score_percent": 49.62138084632517,
+      "signing": "GT endpoint inward normal only; abs cosine>=0.1",
+      "solution": "/home/hendrik/villa2/global-fiber-sgd/data/uv_gt_phase_fresh_v1/solution.npz",
+      "solution_sha256": "c3f39b7f8accacd42a5a9e057e82b951c6da5ab21732948043b596dd3c612b36"
+    },
+    {
+      "additive_global_offset": -2,
+      "by_gt": {
+        "1": {
+          "constraints": 1425,
+          "correct": 807,
+          "score_percent": 56.631578947368425
+        },
+        "2": {
+          "constraints": 1063,
+          "correct": 573,
+          "score_percent": 53.90404515522107
+        },
+        "3": {
+          "constraints": 853,
+          "correct": 464,
+          "score_percent": 54.396248534583826
+        },
+        "4": {
+          "constraints": 1075,
+          "correct": 548,
+          "score_percent": 50.97674418604651
+        },
+        "5": {
+          "constraints": 941,
+          "correct": 485,
+          "score_percent": 51.54091392136026
+        },
+        "6": {
+          "constraints": 839,
+          "correct": 560,
+          "score_percent": 66.746126340882
+        },
+        "7": {
+          "constraints": 539,
+          "correct": 272,
+          "score_percent": 50.46382189239333
+        }
+      },
+      "class_disagreements": 0,
+      "combined_sweep_gauge_corrections": 0,
+      "constraints": 6735,
+      "correct": 3709,
+      "disabled": {
+        "constraints": 351,
+        "correct": 136,
+        "score_percent": 38.74643874643874
+      },
+      "disabled_policy": "include best nonbroken hypothesis; retain disabled status",
+      "enabled": {
+        "constraints": 6384,
+        "correct": 3573,
+        "score_percent": 55.96804511278195
+      },
+      "excluded": {
+        "invalid_gt_normal": 0,
+        "non_cross": 25923,
+        "outside_test_piece": 7,
+        "tangent_connector": 1119
+      },
+      "frozen_gt_normal_index_sha256": "77d63478edc51923e52208d386bd2cd7d86ca2bf914247eb78b080395f349423",
+      "gt_config_sha256": "c7c15a1de0a3b3f162fe15010df29d94a12ff0b2f97f87c4261f696dd29737dc",
+      "mean_absolute_residual": 0.5389269557383922,
+      "metric": "equal event votes; nearest integer, ties toward +infinity; one additive test offset",
+      "name": "uv_gt_phase_reference_v1",
+      "parallel": {
+        "constraints": 5970,
+        "correct": 3295,
+        "score_percent": 55.1926298157454
+      },
+      "perpendicular": {
+        "constraints": 765,
+        "correct": 414,
+        "score_percent": 54.11764705882353
+      },
+      "score_percent": 55.070527097253155,
+      "signing": "GT endpoint inward normal only; abs cosine>=0.1",
+      "solution": "/home/hendrik/villa2/global-fiber-sgd/data/uv_gt_phase_reference_v1/solution.npz",
+      "solution_sha256": "f80effd54e64cc63e59b9887174cb79c04c8b6ee50e9e910abdcd4fbcb690002"
+    }
+  ]
+}

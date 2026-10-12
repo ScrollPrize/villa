@@ -51,6 +51,9 @@ def bp_metrics(log):
 
 
 def run(config):
+    if 'fiber_gt_constraint_score' in config:
+        from .fiber_gt_constraint_score import run as score_gt
+        return score_gt(config['fiber_gt_constraint_score'])
     if 'fiber_json_solve' in config:
         from .fiber_json_solve import run as json_solve
         return json_solve(config['fiber_json_solve'])

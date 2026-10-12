@@ -111,10 +111,12 @@ def validate_joint_gradient(config,rank,world,device=None):
                 families[ia],families[ib],zeros[ia]+13,zeros[ib]-17,widths,
                 phase[ib]-phase[ia],ones)
         evaluator=evaluate if compiled else uv.pair_objective
+        coarse_shift=((ia%3)-1).float() if cfg.get('bucket_position_split',False) else None
+        if cfg.get('bucket_shared_phase',False):coarse_shift=coarse_shift+sb[:,k+1]-sa[:,k+1]
         return evaluator(pa,pb,qa,qb,va,vb,phase[ib]-phase[ia],families[ib]-families[ia],
             torch.ones_like(phase[ia]),torch.ones_like(phase[ia]),table,cfg,charge,
             event_weights[sel],selected,
-            ((ia%3)-1).float() if cfg.get('bucket_position_split',False) else None)+.01*uv.continuation_likelihood(pa,pb,ua,ub,va,vb,128.)
+            coarse_shift)+.01*uv.continuation_likelihood(pa,pb,ua,ub,va,vb,128.)
     loss(weight,raw,shard(torch.arange(b,device=device),rank,world),True).backward()
     reducer.reduce(weight.weight,raw)
     loss(reference,rraw,torch.arange(b,device=device)).backward()

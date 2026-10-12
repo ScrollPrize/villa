@@ -629,18 +629,25 @@ def _tensor_data(d,device):
     return {k:torch.as_tensor(d[k],device=device,dtype=(torch.long if k in ('family','i','j') else torch.float32)) for k in keys}
 
 
-def hard_geometry(d,state,widths,config):
-    """Shared canonical readout for full audits and active-set selection."""
+def hard_assignment(state,k,config,*,best_nonbroken=False):
+    """Read class/retention separately from optional nonbroken placement."""
     from scipy.special import softmax
     if config.get('broken_threshold') is not None:state=state.astype(np.float64,copy=False)
-    k=len(widths);p=softmax(state[:,:k+1],axis=1);labels=p.argmax(1);keep=labels<k
+    p=softmax(state[:,:k+1],axis=1);labels=p.argmax(1);keep=labels<k
     if config.get('broken_threshold') is not None:
         threshold=config['broken_threshold']
         if not 0<threshold<1:raise ValueError('Invalid broken threshold')
         keep=p[:,k]<=threshold
         labels=np.where(keep,state[:,:k].argmax(1),k)
     pick=np.minimum(labels,k-1)
-    if config.get('broken_threshold') is not None:pick=state[:,:k].argmax(1)
+    if config.get('broken_threshold') is not None or best_nonbroken:pick=state[:,:k].argmax(1)
+    return p,labels,keep,pick
+
+
+def hard_geometry(d,state,widths,config):
+    """Shared canonical readout for full audits and active-set selection."""
+    if config.get('broken_threshold') is not None:state=state.astype(np.float64,copy=False)
+    k=len(widths);p,labels,keep,pick=hard_assignment(state,k,config)
     frac=d['phase']+.25*np.tanh(state[np.arange(len(state)),k+1+pick])
     b=np.r_[0,np.cumsum(widths,dtype=np.float64)]
     u=b[pick]+widths[pick]*frac;v=d['z']+1000*state[np.arange(len(state)),2*k+1+pick]

@@ -1,13 +1,21 @@
 # Reference-selected regional solve
 
+## Corrected fresh/reference GT evaluation
+- [x] Commit shared-phase correction and GT results (e2ba3415a).
+- [x] Reviewed matched configs; both sixGPU solves completed (~173/174s).
+- [x] Native cross extraction and frozen original GT normal sweep.
+- [x] Include disabled best-nonbroken placements;30tests and independent review.
+- [x] Score6735events: fresh49.6214%, reference55.0705%; exact repeat hash verified.
+- [x] Persist full metrics, per-GT breakdown and event-level vote artifacts.
+
 ## Expanded GT / evaluation
 - [x] Inspect seven input files and preserve previous four-fiber outputs.
 - [x] Write plan and versioned runner configuration.
 - [x] Independent review and intact seven-fiber solve.
 - [x] Shared-phase correction resolves five coarse violations: v3 zero in both readouts.
 - [x] 25 focused tests, independent review, matched v3 solve and documented comparison.
-- [ ] Confirm comparison artifacts and vote convention; implement/test scoring.
-- [ ] Report GT audit and comparison percentages with support counts.
+- [x] Confirm comparison artifacts and vote convention; implement/test scoring.
+- [x] Report GT audit and comparison percentages with support counts.
 
 ## Four reviewed JSON fibers
 - [x] Inspect inputs, plan and independent review.

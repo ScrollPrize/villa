@@ -1,0 +1,14 @@
+{
+  "fiber_gt_constraint_score": {
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/gt_constraint_score_v1",
+    "gt_root": "/home/hendrik/villa2/global-fiber-sgd/data/bbox_gt_solve_v3",
+    "configs": [
+      "/home/hendrik/villa2/global-fiber-sgd/run_uv_gt_phase_fresh.json",
+      "/home/hendrik/villa2/global-fiber-sgd/run_uv_gt_phase_reference.json"
+    ],
+    "extract_template": "/home/hendrik/villa2/global-fiber-sgd/extract_raw_winding.json",
+    "orient_template": "/home/hendrik/villa2/global-fiber-sgd/orient_normals_full.json",
+    "threads": 128,
+    "prepare_only": false
+  }
+}

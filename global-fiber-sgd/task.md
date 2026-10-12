@@ -1,5 +1,9 @@
 # Reference-selected regional solve
 
+Current: commit corrected GT solve, run corrected canonical test subset fresh
+and reference initialized, evaluate equal-weight constraint votes against v3 GT.
+See gt_constraint_score_plan.md. Includes disabled pieces at best nonbroken state.
+
 Current: expanded seven-fiber intact trusted solve, then constraint-vote GT
 evaluation of two saved solutions. See bbox_gt_eval_plan.md; comparison artifact
 identity and disabled-piece vote convention awaiting user clarification.

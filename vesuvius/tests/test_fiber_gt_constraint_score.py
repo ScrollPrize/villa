@@ -1,0 +1,48 @@
+import numpy as np
+from vesuvius.neural_tracing.fiber_trace_3d.fiber_gt_constraint_score import offset_votes,piece_at,coarse_at
+from vesuvius.neural_tracing.fiber_trace_3d.fiber_uv_layout import hard_assignment
+from vesuvius.neural_tracing.fiber_trace_3d import fiber_uv_layout as uv
+
+
+def test_offset_votes_and_integer_gauge():
+    values=np.array([3.1,2.8,3.2,4.1,-2.])
+    offset,ok,votes=offset_votes(values)
+    assert offset==3 and ok.tolist()==[True,True,True,False,False]
+    off2,ok2,_=offset_votes(values+12)
+    assert off2==15
+    np.testing.assert_array_equal(ok,ok2)
+
+
+def test_piece_boundary_and_gap():
+    d=dict(source_id=np.array([4,4,4]),start=np.array([0.,10.,25.]),end=np.array([10.,20.,30.]))
+    assert piece_at(d,4,10)==1
+    assert piece_at(d,4,22) is None
+    assert piece_at(d,5,5) is None
+
+
+def test_disabled_placement_not_last_bucket():
+    state=np.array([[1.,7.,2.,20.],[0.,0.,8.,1.]])
+    _,labels,keep,pick=hard_assignment(state,3,{},best_nonbroken=True)
+    assert labels.tolist()==[3,2] and keep.tolist()==[False,True]
+    assert pick.tolist()==[1,2]
+
+
+def test_coarse_phase_and_family_vote():
+    d=dict(node_phase=np.array([[2.9]]),phase=np.array([.9]))
+    state=np.zeros((1,8));state[0,5]=.3
+    q=coarse_at(d,state,np.array([1]),0,3.1,4)
+    assert abs(q-2.4)<1e-8
+    # test H and GT V, same coarse position: outward layer separation +.5.
+    difference=q-q+.5
+    assert offset_votes([difference-.5])[0]==0
+
+
+def test_cross_coarse_matches_training_correction():
+    d=dict(node_phase=np.array([[2.95],[.05]]),phase=np.array([.95,.05]),
+           i=np.array([0]),j=np.array([1]),phase_a=np.array([3.1]),
+           phase_b=np.array([.1]),phase_delta=np.array([0.]))
+    state=np.zeros((2,8));state[:,5]=[.4,-.2];pick=np.array([2,5])
+    qa=coarse_at(d,state,pick,0,3.1,4);qb=coarse_at(d,state,pick,1,.1,4)
+    actual=qb-qa-d['phase_delta'][0]+.5
+    expected=pick[1]-pick[0]+uv.bucket_event_shift(d)[0]+state[1,5]-state[0,5]+.5
+    assert abs(actual-expected)<1e-12

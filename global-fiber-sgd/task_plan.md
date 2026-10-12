@@ -1,5 +1,7 @@
 # Global fiber SGD: data reconnaissance
 
+Current: gt_constraint_score_plan.md, independently reviewed.
+
 Current: bbox_gt_phase_fix_plan.md; independent review approved.
 
 Current: bbox_gt_eval_plan.md (expanded trusted GT and cross-constraint scoring).
