@@ -318,11 +318,11 @@ class VaryingLinearTransform(pyro.distributions.transforms.Transform):
             logits = logits.view(*input_zyx.shape[:-1], 2, 2)
         else:
             normalised_zs = (zs.view(-1) - self.min_z) / (self.max_z - self.min_z) * 2 - 1
-            logits = F.grid_sample(
+            # grid_sample_border is F.grid_sample everywhere but MPS, which
+            # has no grid_sample backward.
+            logits = grid_sample_border(
                 rearrange(self.logits, 'z r c -> 1 (r c) z 1'),
                 torch.stack([torch.zeros_like(normalised_zs), normalised_zs], dim=-1)[None, None],
-                padding_mode='border',
-                align_corners=True
             ).squeeze(2).squeeze(0).T.view(*input_zyx.shape[:-1], 2, 2)
         if inverse:
             logits = -logits

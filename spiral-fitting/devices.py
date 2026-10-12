@@ -25,28 +25,35 @@ DEVICE_TYPES = ('cuda', 'mps', 'cpu')
 
 
 def fit_device(requested=None):
-    """Return ``requested``, else $FIT_SPIRAL_DEVICE, else the first of
-    CUDA, MPS and CPU that is available, as a torch.device.
+    """Return ``requested`` (a torch.device or a name such as 'cuda:1'),
+    else $FIT_SPIRAL_DEVICE, else the first of CUDA, MPS and CPU that is
+    available, as a torch.device.
 
     CUDA comes back as the bare 'cuda' device, so the current device a
     distributed driver selected still applies.
     """
     max_precision_bits()
-    name = str(requested or os.environ.get('FIT_SPIRAL_DEVICE') or '').strip().lower()
+    name = requested if isinstance(requested, torch.device) else str(
+        requested or os.environ.get('FIT_SPIRAL_DEVICE') or '').strip().lower()
     if not name:
         if torch.cuda.is_available():
             return torch.device('cuda')
         if torch.backends.mps.is_available():
             return torch.device('mps')
         return torch.device('cpu')
-    if name not in DEVICE_TYPES:
+    try:
+        device = torch.device(name)
+    except RuntimeError:
+        device = None
+    if device is None or device.type not in DEVICE_TYPES:
         raise ValueError(
-            f'unsupported device {name!r}: expected one of {", ".join(DEVICE_TYPES)}')
-    if name == 'cuda' and not torch.cuda.is_available():
+            f'unsupported device {str(name)!r}: expected one of '
+            f'{", ".join(DEVICE_TYPES)}, optionally with an index (cuda:1)')
+    if device.type == 'cuda' and not torch.cuda.is_available():
         raise RuntimeError('device cuda was requested but CUDA is not available')
-    if name == 'mps' and not torch.backends.mps.is_available():
+    if device.type == 'mps' and not torch.backends.mps.is_available():
         raise RuntimeError('device mps was requested but MPS is not available')
-    return torch.device(name)
+    return device
 
 
 @functools.cache

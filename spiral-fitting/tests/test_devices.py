@@ -273,3 +273,67 @@ def test_smoothing_kernel_is_built_on_its_device_except_mps(monkeypatch, device,
     kernel = flow_grad_smoothing.gaussian_kernel(2.0, torch.device(device))
     assert seen == [built_on]
     assert kernel is not None and kernel.dtype == torch.float32
+
+
+@pytest.mark.parametrize('device', [
+    'cpu', pytest.param('mps', marks=pytest.mark.skipif(
+        not torch.backends.mps.is_available(), reason='needs MPS'))])
+def test_step_timer_off_cuda(monkeypatch, capsys, device):
+    # FIT_SPIRAL_PROFILE_STEPS=1 with the fit on the CPU or MPS.
+    from ddp_helpers import StepTimer
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
+    monkeypatch.setenv('FIT_SPIRAL_DEVICE', device)
+    timer = StepTimer(enabled=True, report=True, window=1)
+    x = torch.randn(64, 64, device=device)
+    timer.start('fwd')
+    (x @ x).sum()
+    timer.stop('fwd')
+    # Nothing queued in between, as for 'comm' in a single-process fit.
+    timer.start('comm')
+    timer.stop('comm')
+    timer.tick()
+    timer.maybe_report(1)
+    out = capsys.readouterr().out
+    assert '[profile step 1] avg/step over 1: fwd=' in out and 'comm=' in out
+
+
+def test_get_spiral_points_off_cuda(monkeypatch):
+    # get_spiral_points leaves the device to get_spiral_yxs, whose default
+    # was 'cuda'.
+    import numpy as np
+    from sample_spiral import get_spiral_points, get_spiral_yxs
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
+    monkeypatch.setenv('FIT_SPIRAL_DEVICE', 'cpu')
+    yxs = get_spiral_points(np.zeros((64, 64)), np.array([32., 32.]))
+    assert len(yxs) and ((yxs >= 0) & (yxs < 64)).all()
+    assert get_spiral_yxs(3, 10, 4).device == torch.device('cpu')
+
+
+def test_fit_device_takes_a_torch_device_or_an_index(monkeypatch):
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
+    assert devices.fit_device(torch.device('cuda', 0)) == torch.device('cuda', 0)
+    assert devices.fit_device('cuda:1') == torch.device('cuda', 1)
+    assert devices.fit_device(torch.device('cpu')) == torch.device('cpu')
+    monkeypatch.setenv('FIT_SPIRAL_DEVICE', 'CUDA:0')
+    assert devices.fit_device() == torch.device('cuda', 0)
+    with pytest.raises(ValueError, match='unsupported device'):
+        devices.fit_device('xla')
+
+
+def test_distributed_fit_on_mps_stops_before_joining(monkeypatch):
+    # torch.distributed has no MPS backend: gloo raises NotImplementedError at
+    # the first all_reduce of an MPS gradient, after the inputs have loaded.
+    import ddp_helpers
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
+    monkeypatch.setattr(torch.backends.mps, 'is_available', lambda: True)
+    monkeypatch.setenv('FIT_SPIRAL_DEVICE', 'mps')
+
+    def no_join(**kwargs):
+        raise AssertionError('joined a process group for an MPS fit')
+    monkeypatch.setattr(ddp_helpers.dist, 'init_process_group', no_join)
+    monkeypatch.setattr(ddp_helpers.dist, 'barrier', lambda **kwargs: None)
+    try:
+        with pytest.raises(RuntimeError, match='cannot run on MPS'):
+            ddp_helpers.maybe_init_distributed(ddp_helpers.DistributedContext(rank=0, world_size=2))
+    finally:
+        ddp_helpers.set_process_context(ddp_helpers.SINGLE_PROCESS)

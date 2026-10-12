@@ -124,3 +124,22 @@ def test_mps_without_autograd_matches_cpu_grid_sample(spatial, points, needs_gra
     with torch.no_grad():
         actual = grid_sample_border(input.to('mps').requires_grad_(needs_grad), grid.to('mps'))
     torch.testing.assert_close(actual.cpu(), expected, rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason='needs MPS')
+def test_varying_linear_transform_without_fast_linear_on_mps(monkeypatch):
+    # FIT_SPIRAL_FAST_LINEAR=0 takes the grid_sample branch, whose backward
+    # MPS does not have.
+    from transforms import VaryingLinearTransform
+    monkeypatch.setenv('FIT_SPIRAL_FAST_LINEAR', '0')
+    generator = torch.Generator().manual_seed(0)
+    logits = torch.randn(7, 2, 2, generator=generator) * 0.1
+    points = torch.rand(500, 3, generator=generator) * 100
+    results = []
+    for device in ('cpu', 'mps'):
+        leaf = logits.detach().to(device).requires_grad_()
+        out = VaryingLinearTransform(leaf, 0.0, 100.0)(points.to(device))
+        out.square().sum().backward()
+        results.append((out.detach().cpu(), leaf.grad.cpu()))
+    torch.testing.assert_close(results[1][0], results[0][0], rtol=1e-5, atol=1e-4)
+    torch.testing.assert_close(results[1][1], results[0][1], rtol=1e-4, atol=1e-2)
