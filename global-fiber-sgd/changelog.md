@@ -2,6 +2,10 @@
 
 ## 2026-10-12
 
+- Completed fresh0.5position-loss trial withanother10xstateLR, thenwidthLR20/.2
+  onthebettercurrentstateLR. Full1k tables, losses/reference/width metrics,
+  commandsandtimings in uv_bucket_lr_results.md. No defaults changed.
+
 - Completed matched10k fresh/ref position-weight0.5 trials, preserving other
   settings. Full checkpoints, losses, reference metrics and timings recorded
   in uv_bucket_half_results.md; mixed result, no default objective change.

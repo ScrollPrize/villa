@@ -1,5 +1,7 @@
 # Global fiber SGD: data reconnaissance
 
+Current: uv_bucket_lr_plan.md, fresh state10x thenselectedbasewidthLR20/.2.
+
 Current: uv_bucket_split_plan.md.
 
 Current: uv_lr_default_plan.md, adopt measured high LR then discuss disentanglement.

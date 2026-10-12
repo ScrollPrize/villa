@@ -1,5 +1,8 @@
 # Reference-selected regional solve
 
+Current: fresh0.5position run withanother10xstateLR, thenwidthLR20/.2 on
+stateLR selectedbyfinalreferenceL1; full1kprogress tables.
+
 Current: increase metric position term from0.1 to0.5 of bucket term, matched
 fresh/reference10k trials at current high LR; all other settings unchanged.
 

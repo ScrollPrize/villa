@@ -1,5 +1,12 @@
 # Reference-selected regional solve
 
+## Fresh LR follow-up
+- [x] Plan and stateLR10x config.
+- [x] Independentreview and stateLR10x trial; worseL1andloss.
+- [x] SelectcurrentbaseLR; reviewedwidthLR20/.2 configs.
+- [x] CompletewidthLR20/.2 trials; finite states and released leases.
+- [x] Fulltables,validatedresults in uv_bucket_lr_results.md.
+
 ## Position weight0.5 follow-up
 - [x] Create matched fresh/ref configs and suite; plan.
 - [x] Independent review, tests and sixGPU fresh/ref10k runs complete.

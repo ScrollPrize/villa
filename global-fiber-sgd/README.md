@@ -1,5 +1,8 @@
 # Global fiber assignment with PyTorch SGD
 
+Latest: [fresh state/width LR trials](uv_bucket_lr_results.md). Another10xstateLR
+is worse; widthLR20/.2 has minimal effect. CurrentLRdefaults unchanged.
+
 Latest: [position weight0.5 versus0.1](uv_bucket_half_results.md), matched fresh
 and reference10k. Better fresh reference accuracy but not retention; reference
 drifts later despite falling loss. Remains opt-in, no objective default change.
