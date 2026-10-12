@@ -1,5 +1,18 @@
 # Global fiber assignment with PyTorch SGD
 
+Validated performance work: [distributed scaling](uv_distributed_results.md) and
+[exact diagnostics acceleration](uv_diagnostics_results.md). At32768/GPU across
+sixGPUs, the ten-pass-equivalent solve with reporting takes34.85s versus152.74s
+before diagnostic optimization, with identical checkpoint metrics/final arrays.
+Current follow-up: diagnostic worker-count sweep, then fresh/reference100-pass
+joint evaluations and TIFF/vector visualizations (uv_diagnostics_100_plan.md).
+
+Latest performance experiment: [combined coordinate mapping](uv_coordinate_results.md).
+Opt-in `coordinate_backend=combined` removes generic shared-width scatter
+backward using explicit derivatives and deterministic tiled CUDA reductions.
+Objective/width training unchanged; baseline stays available/default. See the
+linked derivation, tests, reproducible managed benchmark configs and results.
+
 V constraints now enforce equal V at their base points, with no CT-Z displacement
 target. Global V≈Z calibration is a separate weak per-piece prior, independently
 configured by v_prior_weight (.01) / v_prior_scale (1000base voxels). It samples

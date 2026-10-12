@@ -1,4 +1,25 @@
-# Current:16k LR scaling
+# Current: diagnostics and100-pass solves
+
+- [x] Independent plan review.
+- [x] Exact median fastpath and shared geometry; unit tests.
+- [ ] Real-state metric equality/profile/performance.
+- [ ] Fresh and reference-initialized100-pass-equivalent solves.
+- [ ] Reports and comparison visualizations.
+
+# Previous: larger batches and distributed joint solve
+
+- [x] Independent plan review.
+- [x] Larger-batch measurements and quality comparison.
+- [x] Shared multi-GPU solver, correctness tests, exclusive scaling/quality runs.
+- [x] Documentation/results and handoff.
+
+# Previous: coordinate-gradient reformulation
+
+- [x] Independent plan/code review, implementation, gradient validation.
+- [x] Exclusive speed/profile comparison and matched standard/precise quality trials.
+- [x] Results, derivation and limitations documented; standard division selected.
+
+# Previous:16k LR scaling
 
 - [x] Independent configuration review; no solver code change.
 - [x] Three exclusiveGPU trials .03/.06/.12 completed exit0.

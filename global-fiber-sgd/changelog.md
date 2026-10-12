@@ -2,6 +2,12 @@
 
 ## 2026-10-11
 
+- Added opt-in combined winding-coordinate mapping with explicit deterministic
+  tiled width-gradient reduction. H100 exclusive updates1.63x/2.80x faster at
+  batches4096/16384; matched4032-update quality remains comparable. Validated
+  ordinary/precise division; ordinary selected for new path per user, reference
+  backend still default. Derivation/reproduction:uv_coordinate_results.md.
+
 - Corrected V constraints to equality; removed invented CT-Z endpoint displacement
   target from cache producer and all consumers. Factored weak per-fiber V≈Z prior
   into shared independently weighted helper, no local Z monotonicity condition.
@@ -228,3 +234,13 @@ reference winding L1 / within-two metrics after global median offset correction.
 - Added exclusive multi-GPU experiment lanes under one manager lease; reused
   solver subprocesses, cancellation and per-lane logs. Shared pilot results
   are excluded from final comparisons. Defaults unchanged.
+# 2026-10-12
+
+- Validated combined-coordinate gradients and larger batches; true1/2/3/6GPU
+  joint solver with SparseAdam touched-row semantics,32768/GPU chosen. GPU
+  throughput3.95Mconstraints/s on6GPUs vs0.879M onone.
+- Exact median fastpath/shared readout and bounded asynchronous diagnostics cut
+  ten-pass walltime152.74s→34.85s; all12 checkpoint metrics and final arrays exact.
+  CPU/GPUgradient preflights and97 targeted tests pass. Full results/commands in
+  uv_coordinate_results.md,uv_distributed_results.md,uv_diagnostics_results.md.
+

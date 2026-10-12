@@ -256,7 +256,7 @@ def offset_regularization(state,k,config):
             config.get('offset_limit_weight',10000.)*torch.relu(du.abs()-.25).square().mean())
 
 
-def coordinates(state, phase, z, family, ds, widths, boundaries):
+def coordinates(state, phase, z, family, ds, widths, boundaries, backend='reference', division='standard'):
     """Only piece state has parameters. All base points are derived here."""
     k=len(widths)
     if state.shape[1]==3*k+3:
@@ -265,9 +265,16 @@ def coordinates(state, phase, z, family, ds, widths, boundaries):
         shared_phase=phase+state[:,k+1]
         q=torch.arange(k,device=state.device)[None,:]+shared_phase[:,None]
         # Offsets in local turn units; mapping remains continuous at every seam.
-        u=q_to_u(q+du,widths,boundaries)+(family==0)[:,None]*ds[:,None]
+        distance=(family==0)[:,None]*ds[:,None]
+        if backend == 'combined':
+            from .fiber_uv_coordinates import combined_coordinates
+            u,endpoint_q=combined_coordinates(q+du,distance,widths,boundaries,division)
+        elif backend == 'reference':
+            u=q_to_u(q+du,widths,boundaries)+distance
+            endpoint_q=u_to_q(u,widths,boundaries)
+        else:raise ValueError('Unknown coordinate backend: '+str(backend))
         v=z[:,None]+1000*(state[:,k+2,None]+dv)+(family==1)[:,None]*ds[:,None]
-        return u,v,u_to_q(u,widths,boundaries)
+        return u,v,endpoint_q
     frac=phase[:,None]+.25*state[:,k+1:2*k+1].tanh()
     u=boundaries[:-1]+widths*frac+(family==0)[:,None]*ds[:,None]
     v=z[:,None]+1000*state[:,2*k+1:]+(family==1)[:,None]*ds[:,None]
@@ -499,12 +506,12 @@ def proposal_weights(in_active,event_count,active_count,fraction):
     return 1/((1-fraction)+fraction*(event_count/active_count)*in_active)
 
 
-def draw_events(event_count,batch,active,mask,fraction,device):
+def draw_events(event_count,batch,active,mask,fraction,device,generator=None):
     import torch
-    edges=torch.randint(event_count,(batch,),device=device)
+    edges=torch.randint(event_count,(batch,),device=device,generator=generator)
     if len(active) and fraction:
-        choose=torch.rand(batch,device=device)<fraction
-        candidates=active[torch.randint(len(active),(batch,),device=device)]
+        choose=torch.rand(batch,device=device,generator=generator)<fraction
+        candidates=active[torch.randint(len(active),(batch,),device=device,generator=generator)]
         edges=torch.where(choose,candidates,edges)
     return edges,proposal_weights(mask[edges],event_count,len(active),fraction)
 
@@ -594,9 +601,9 @@ def violation_indices(d,state,widths,config):
     return np.concatenate(found)
 
 
-def audit(d, state, widths, config, indices=None):
+def audit(d, state, widths, config, indices=None, geometry=None):
     """Vectorized CPU hard readout, full graph at final; no GPU needed."""
-    geometry=hard_geometry(d,state,widths,config)
+    if geometry is None:geometry=hard_geometry(d,state,widths,config)
     p,labels,keep,pick,u,v,b=geometry;k=len(widths)
     if config.get('broken_threshold') is not None:state=state.astype(np.float64,copy=False)
     extra={}
@@ -789,9 +796,15 @@ class FullPassGradientAccumulator:
 
 
 def solve(config):
+    if config.get('distributed_suite'):
+        from .fiber_uv_distributed import launch_suite
+        return launch_suite(config)
     if config.get('experiment_matrix'):
         from .fiber_normal_sign import solve_tensor_matrix
         return solve_tensor_matrix(config,'vesuvius.neural_tracing.fiber_trace_3d.fiber_uv_layout')
+    if int(config.get('distributed_world_size',1))>1 and '_distributed_rank' not in config:
+        from .fiber_uv_distributed import launch
+        return launch(config)
     if config.get('benchmark_pair_fusion'):
         from .fiber_uv_pair_benchmark import benchmark
         return benchmark(config)
@@ -800,11 +813,25 @@ def solve(config):
         return solve_categorical(config)
     validate_joint_rejection(config)
     import torch
+    from .fiber_uv_distributed import validate_config, SparseGradientReducer, shard
+    world=validate_config(config);rank=int(config.get('_distributed_rank',0))
+    distributed=world>1
+    if distributed:
+        import torch.distributed as dist
     if not torch.cuda.is_available():raise RuntimeError('Production U/V solve requires CUDA')
     torch.set_num_threads(4);torch.manual_seed(config.get('seed',0))
     torch.use_deterministic_algorithms(True)
+    if config.get('coordinate_backend','reference') not in ('reference','combined'):
+        raise ValueError('Unknown coordinate backend')
+    if config.get('coordinate_backend') == 'combined':
+        if not anchored(config):raise ValueError('Combined coordinates require shared_anchor layout')
+        from .fiber_uv_coordinates import validate_cuda
+        print('UV coordinate validation '+json.dumps(validate_cuda(config.get('coordinate_division','standard'))),flush=True)
+        torch.manual_seed(config.get('seed',0))
     with np.load(config['tensor_cache']) as archive:d={key:archive[key] for key in archive.files}
-    device='cuda:0';data=_tensor_data(d,device)
+    device=f'cuda:{rank}';data=_tensor_data(d,device)
+    generator=(torch.Generator(device=device).manual_seed(config.get('seed',0))
+               if distributed or config.get('sampling_generator',False) else None)
     n=len(d['family']);k=int(config.get('winding_count',100));root=Path(config['output_root']);root.mkdir(parents=True,exist_ok=True)
     if (root/'summary.json').exists():raise FileExistsError('Completed U/V output exists')
     rng=np.random.default_rng(config.get('seed',0))
@@ -818,6 +845,7 @@ def solve(config):
     raw=torch.nn.Parameter(inverse_widths(torch.as_tensor(start_width,device=device)))
     opt=torch.optim.SparseAdam(embedding.parameters(),lr=config.get('lr',.03))
     widthopt=torch.optim.Adam([raw],lr=config.get('width_lr',2.))
+    reducer=SparseGradientReducer(embedding.weight) if distributed else None
     steps=int(config.get('steps',1000));batch=int(config.get('batch_size',1024));every=int(config.get('log_every',100))
     full_pass=config.get('traversal','full_pass')=='full_pass'
     if config.get('traversal','full_pass') not in ('full_pass','sampled'):
@@ -832,22 +860,28 @@ def solve(config):
     if benchmark_updates is not None:
         if config.get('update_mode','minibatch')!='minibatch':
             raise ValueError('Short update benchmark requires minibatch updates')
-        steps=int(benchmark_updates);every=steps
+        steps=int(benchmark_updates);every=int(config.get('benchmark_log_every',steps))
         if steps<2:raise ValueError('Benchmark requires at least two updates')
+    if every<1:raise ValueError('Diagnostic interval must be positive')
     evaluate_pair=pair_evaluator(config)
     update_timings=[]
     segment_timings=[]
+    communication_timings=[]
     update_profile=None;profile_rows=None
     def timing_marker():
         event=torch.cuda.Event(enable_timing=True);event.record();return event
     accumulated=config.get('update_mode','minibatch')=='global_accumulated'
     gradients=FullPassGradientAccumulator(embedding.weight,raw) if accumulated else None
     history=[];started=time.monotonic();torch.cuda.reset_peak_memory_stats()
-    baseline=audit(d,state,start_width,config)
+    diagnostic_times=[]
+    diagnostic_started=time.monotonic()
+    baseline=audit(d,state,start_width,config) if rank==0 else None
+    baseline_seconds=time.monotonic()-diagnostic_started
     reference_projection=None
-    if config.get('reference_projection'):
-        from .fiber_reference_comparison import load_metric_projection,reference_winding_metrics
+    if config.get('reference_projection') and rank==0:
+        from .fiber_reference_comparison import load_metric_projection,prepare_metric_cache
         reference_projection=load_metric_projection(config['reference_projection'],d,config)
+        prepare_metric_cache(d,reference_projection)
     pass_losses=torch.zeros(3,device=device)
     charged=config.get('sign_charge_multiplier',0.)>0
     fraction=float(config.get('active_fraction',0.))
@@ -862,140 +896,184 @@ def solve(config):
                  for key in ('ds_a','ds_b','phase_delta')}
     active_every=int(config.get('active_refresh',every))
     if active_every<1:raise ValueError('Invalid active refresh')
+    from .fiber_uv_diagnostics import OrderedDiagnostics,evaluate_snapshot
+    diagnostic_workers=int(config.get('diagnostic_workers',0))
+    if diagnostic_workers<0 or (diagnostic_workers and (fraction or config.get('stop_when_feasible',False))):
+        raise ValueError('Async diagnostics require no active sampling/early stopping')
+    def publish_diagnostic(result):
+        record,timing=result;before=time.monotonic()
+        history.append(record);atomic_write(root/'history.json',history,durable=False)
+        print('UV '+json.dumps(record),flush=True)
+        timing['logging_seconds']=time.monotonic()-before
+        timing['total_seconds']+=timing['logging_seconds'];diagnostic_times.append(timing)
+    diagnostic_queue=OrderedDiagnostics(diagnostic_workers,publish_diagnostic) if rank==0 and diagnostic_workers else None
     def coords(ids,ds,widths,bounds):
         s=embedding(ids);p=s[:,:k+1].softmax(-1)
-        u,v,q=coordinates(s,data['phase'][ids],data['z'][ids],data['family'][ids],ds,widths,bounds)
+        u,v,q=coordinates(s,data['phase'][ids],data['z'][ids],data['family'][ids],ds,widths,bounds,config.get('coordinate_backend','reference'),config.get('coordinate_division','standard'))
         return p,u,v,q
-    for step in range(steps+1):
-        widths,bounds=width_boundaries(raw)
-        refreshed=False
-        if fraction and (step%active_every==0 or step==steps):
-            snapshot=embedding.weight.detach().cpu().numpy();w=widths.detach().cpu().numpy()
-            bad_indices=violation_indices(d,snapshot,w,config)
-            active=torch.as_tensor(bad_indices,device=device,dtype=torch.long)
-            active_mask.zero_();active_mask[active]=True;refreshed=True
-            print(f'UV active step={step} strict_violations={len(active)}',flush=True)
-        feasible_check=refreshed and not len(active) and step>=config.get('minimum_steps',100) and config.get('stop_when_feasible',False)
-        if step%every==0 or step==steps or feasible_check:
-            torch.cuda.synchronize();snapshot=embedding.weight.detach().cpu().numpy()
-            w=widths.detach().cpu().numpy();metrics=audit(d,snapshot,w,config,None if accumulated or step==steps or feasible_check or charged else diagnostic)
-            record=dict(step=step,seconds=time.monotonic()-started,event_samples=step*batch,
-                equivalent_event_epochs=step*batch/len(d['i']),importance_sampled=bool(fraction),
-                active_violations=len(active) if fraction else None,width_range=[float(w.min()),float(w.max())],**metrics)
+    try:
+        for step in range(steps+1):
+            widths,bounds=width_boundaries(raw)
+            refreshed=False
+            if fraction and (step%active_every==0 or step==steps):
+                snapshot=embedding.weight.detach().cpu().numpy();w=widths.detach().cpu().numpy()
+                bad_indices=violation_indices(d,snapshot,w,config)
+                active=torch.as_tensor(bad_indices,device=device,dtype=torch.long)
+                active_mask.zero_();active_mask[active]=True;refreshed=True
+                print(f'UV active step={step} strict_violations={len(active)}',flush=True)
+            feasible_check=refreshed and not len(active) and step>=config.get('minimum_steps',100) and config.get('stop_when_feasible',False)
+            if step%every==0 or step==steps or feasible_check:
+                if distributed:
+                    dist.all_reduce(pass_losses);pass_losses.div_(world)
+                if rank==0:
+                    if diagnostic_queue is not None:diagnostic_queue.reserve()
+                    diagnostic_started=time.monotonic()
+                    torch.cuda.synchronize();snapshot=embedding.weight.detach().cpu().numpy()
+                    w=widths.detach().cpu().numpy()
+                    copied=time.monotonic()
+                    record=dict(step=step,seconds=time.monotonic()-started,event_samples=step*batch,
+                        equivalent_event_epochs=step*batch/len(d['i']),importance_sampled=bool(fraction),
+                        active_violations=len(active) if fraction else None,width_range=[float(w.min()),float(w.max())],
+                        seconds_scope='snapshot captured; diagnostics may finish later')
+                    if full_pass:
+                        processed=(step//updates)*len(d['i'])+(step%updates)*len(d['i'])//updates
+                        record.update(completed_passes=step//updates,event_samples=processed,
+                                      equivalent_event_epochs=processed/len(d['i']),traversal='full_pass')
+                    record.update(update_mode=config.get('update_mode','minibatch'),
+                                  optimizer_updates=step//updates if accumulated else step)
+                    if step:record.update(loss=float(loss.detach()),pair_loss=float(pair.detach()),regularization=float(reg.detach()))
+                    if step and full_pass:
+                        means=(pass_losses/(step if benchmark_updates is not None else updates)).cpu().tolist()
+                        record.update(loss=means[0],pair_loss=means[1],regularization=means[2],
+                                      loss_scope=('full objective at pre-update state; diagnostics are post-update' if accumulated else
+                                                  'mean online objective across pass updates, not frozen-state global objective'))
+                        if benchmark_updates is not None:record['loss_scope']='mean online objective across short benchmark updates'
+                        pass_losses.zero_()
+                    elif step:
+                        means=(pass_losses/(step%every or every)).cpu().tolist()
+                        record.update(loss=means[0],pair_loss=means[1],regularization=means[2],
+                                      loss_scope='mean online objective since previous diagnostic; sampled minibatch updates')
+                        pass_losses.zero_()
+                    snapshot.flags.writeable=False;w.flags.writeable=False
+                    args=(d,snapshot,w,config,None if accumulated or step==steps or feasible_check or charged else diagnostic,
+                          reference_projection,record,copied-diagnostic_started,
+                          root/f'diagnostic_{step}.prof' if config.get('profile_diagnostics') else None)
+                    if diagnostic_queue is not None:
+                        diagnostic_queue.submit(evaluate_snapshot,*args)
+                    else:
+                        result=evaluate_snapshot(*args);metrics=result[0];publish_diagnostic(result)
+                if distributed:
+                    pass_losses.zero_();dist.barrier()
+                if step==steps or (feasible_check and metrics['sign_feasible']):break
+            if benchmark_updates is not None:
+                if config.get('benchmark_torch_profile') and step==steps-1 and rank==0:
+                    torch.cuda.synchronize()
+                    update_profile=torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                                         torch.profiler.ProfilerActivity.CUDA])
+                    update_profile.__enter__()
+                tick=torch.cuda.Event(enable_timing=True);tock=torch.cuda.Event(enable_timing=True);tick.record()
             if full_pass:
-                processed=(step//updates)*len(d['i'])+(step%updates)*len(d['i'])//updates
-                record.update(completed_passes=step//updates,event_samples=processed,
-                              equivalent_event_epochs=processed/len(d['i']),traversal='full_pass')
-            record.update(update_mode=config.get('update_mode','minibatch'),
-                          optimizer_updates=step//updates if accumulated else step)
-            if reference_projection is not None:
-                record['reference']=reference_winding_metrics(d,snapshot,w,config,reference_projection)
-            if step:record.update(loss=float(loss.detach()),pair_loss=float(pair.detach()),regularization=float(reg.detach()))
-            if step and full_pass:
-                means=(pass_losses/(step if benchmark_updates is not None else updates)).cpu().tolist()
-                record.update(loss=means[0],pair_loss=means[1],regularization=means[2],
-                              loss_scope=('full objective at pre-update state; diagnostics are post-update' if accumulated else
-                                          'mean online objective across pass updates, not frozen-state global objective'))
-                if benchmark_updates is not None:record['loss_scope']='mean online objective across short benchmark updates'
-                pass_losses.zero_()
-            elif step:
-                means=(pass_losses/(step%every or every)).cpu().tolist()
-                record.update(loss=means[0],pair_loss=means[1],regularization=means[2],
-                              loss_scope='mean online objective since previous diagnostic; sampled minibatch updates')
-                pass_losses.zero_()
-            history.append(record);atomic_write(root/'history.json',history,durable=False)
-            print('UV '+json.dumps(record),flush=True)
-            if step==steps or (feasible_check and metrics['sign_feasible']):break
-        if benchmark_updates is not None:
-            if config.get('benchmark_torch_profile') and step==steps-1:
-                torch.cuda.synchronize()
-                update_profile=torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
-                                                     torch.profiler.ProfilerActivity.CUDA])
-                update_profile.__enter__()
-            tick=torch.cuda.Event(enable_timing=True);tock=torch.cuda.Event(enable_timing=True);tick.record()
-        if full_pass:
-            position=step%updates
-            if position==0:
-                if accumulated:gradients.reset()
-                event_order=torch.randperm(len(d['i']),device=device)
-                node_order=torch.randperm(n,device=device)
-            edges=event_order[pass_partition(len(d['i']),updates,position)]
-            event_weights=torch.ones(len(edges),device=device)
-        else:
-            edges,event_weights=draw_events(len(d['i']),batch,active,active_mask,fraction,device)
-        i=data['i'][edges];j=data['j'][edges]
-        pa,ua,va,qa=coords(i,data['ds_a'][edges],widths,bounds)
-        pb,ub,vb,qb=coords(j,data['ds_b'][edges],widths,bounds)
-        charge=selected=None
-        if charged:
-            charge=calibrated_sign_charge(data['degree'][i],data['degree'][j],data['degree'].mean(),
-                len(d['i']),n,config.get('rejection_cost',10.),config['sign_charge_multiplier'],
-                config.get('rejection_weighting','fixed'))
-            selected=selected_ordering(embedding(i),embedding(j),phase64[i],phase64[j],z64[i],z64[j],
-                data['family'][i],data['family'][j],precise['ds_a'][edges],precise['ds_b'][edges],widths,
-                precise['phase_delta'][edges],data['sign'][edges])
-        if benchmark_updates is not None:pair_start=timing_marker()
-        pair=evaluate_pair(pa[:,:k],pb[:,:k],qa,qb,va,vb,data['phase_delta'][edges],data['family'][j]-data['family'][i],
-            data['sign'][edges],data['distance'][edges],table,config,charge,event_weights,selected)
-        if benchmark_updates is not None:pair_end=timing_marker()
-        for pp,qq,phase_key in ((pa,qa,'phase_a'),(pb,qb,'phase_b')):
-            angle=qq-data[phase_key][edges,None];angle=angle-angle.detach().round()
-            pair=pair+config.get('prior_weight',.01)*.5*(event_weights*(pp[:,:k]*angle.square()).sum(-1)).mean()
-        # Uniform node sample prevents degree-biased rejection/prior normalization.
-        ni=(node_order[pass_partition(n,updates,position)] if full_pass else
-            torch.randint(n,(batch,),device=device))
-        ns=embedding(ni);npb=ns[:,:k+1].softmax(-1)
-        degree=data['degree'];cost=rejection_weights(degree[ni],degree.mean(),config.get('rejection_weighting','fixed'))
-        reg=config.get('rejection_cost',10.)*(npb[:,k]*cost).mean()
-        if anchored(config):reg=reg+offset_regularization(ns,k,config)
-        ramp=min(1.,max(0.,(step/steps-.5)/.3)) if config.get('entropy_ramp',True) else 1.
-        reg=reg+config.get('entropy_weight',.05)*ramp*(-npb*npb.clamp_min(1e-20).log()).sum(-1).mean()
-        for point in range(3):
-            nu,nv,nq=coordinates(ns,data['phase'][ni],data['z'][ni],data['family'][ni],data['node_ds'][ni,point],widths,bounds)
-            angle=nq-data['node_phase'][ni,point,None];angle=angle-angle.detach().round()
-            prior=angle.square()
-            prior=prior+torch.relu(-nq).square()+torch.relu(nq-k).square()
-            unary=config.get('prior_weight',.01)*prior+vertical_layout_prior(nv,data['node_z'][ni,point,None],config)
-            reg=reg+(npb[:,:k]*unary).sum(-1).mean()/3
-        if full_pass:
-            # Balanced partitions can differ by one item; preserve full-objective weights.
-            pair=pair*(len(edges)*updates/len(d['i']))
-            reg=reg*(len(ni)*updates/n)
-        reg=reg+config.get('width_prior',.1)*((widths/initial_width-1).square().mean())
-        reg=reg+config.get('width_smooth',.01)*torch.diff(widths/initial_width).square().mean()
-        if len(data['links']):
-            links=(data['links'] if full_pass else data['links'][torch.randint(len(data['links']),(min(batch,len(data['links'])),),device=device)])
-            ca,cu,cv,_=coords(links[:,0].long(),links[:,2],widths,bounds)
-            cb,du,dv,_=coords(links[:,1].long(),links[:,3],widths,bounds)
-            continuation=continuation_likelihood if anchored(config) else continuation_cost
-            link_normalization=len(data['links'])/len(d['i']) if anchored(config) else 1.
-            reg=reg+config.get('continuation_weight',10.)*link_normalization*continuation(
-                ca[:,:k],cb[:,:k],cu,du,cv,dv,config.get('continuation_scale',128.) if anchored(config) else initial_width.mean())
-        loss=pair+reg
-        pass_losses+=torch.stack((loss.detach(),pair.detach(),reg.detach()))
-        opt.zero_grad(set_to_none=True);widthopt.zero_grad(set_to_none=True)
-        if benchmark_updates is not None:backward_start=timing_marker()
-        (loss/updates if accumulated else loss).backward()
-        if benchmark_updates is not None:backward_end=timing_marker()
-        # Broken is an ordinary jointly optimized category from the first update.
-        if accumulated:
-            gradients.add(embedding.weight.grad,raw.grad)
-            if position==updates-1:
-                gradients.install(embedding.weight,raw)
+                position=step%updates
+                if position==0:
+                    if accumulated:gradients.reset()
+                    event_order=torch.randperm(len(d['i']),device=device)
+                    node_order=torch.randperm(n,device=device)
+                edges=event_order[pass_partition(len(d['i']),updates,position)]
+                event_weights=torch.ones(len(edges),device=device)
+            else:
+                edges,event_weights=draw_events(len(d['i']),batch,active,active_mask,fraction,device,generator)
+                if distributed:
+                    edges=shard(edges,rank,world);event_weights=shard(event_weights,rank,world)
+            i=data['i'][edges];j=data['j'][edges]
+            pa,ua,va,qa=coords(i,data['ds_a'][edges],widths,bounds)
+            pb,ub,vb,qb=coords(j,data['ds_b'][edges],widths,bounds)
+            charge=selected=None
+            if charged:
+                charge=calibrated_sign_charge(data['degree'][i],data['degree'][j],data['degree'].mean(),
+                    len(d['i']),n,config.get('rejection_cost',10.),config['sign_charge_multiplier'],
+                    config.get('rejection_weighting','fixed'))
+                selected=selected_ordering(embedding(i),embedding(j),phase64[i],phase64[j],z64[i],z64[j],
+                    data['family'][i],data['family'][j],precise['ds_a'][edges],precise['ds_b'][edges],widths,
+                    precise['phase_delta'][edges],data['sign'][edges])
+            if benchmark_updates is not None:pair_start=timing_marker()
+            pair=evaluate_pair(pa[:,:k],pb[:,:k],qa,qb,va,vb,data['phase_delta'][edges],data['family'][j]-data['family'][i],
+                data['sign'][edges],data['distance'][edges],table,config,charge,event_weights,selected)
+            if benchmark_updates is not None:pair_end=timing_marker()
+            for pp,qq,phase_key in ((pa,qa,'phase_a'),(pb,qb,'phase_b')):
+                angle=qq-data[phase_key][edges,None];angle=angle-angle.detach().round()
+                pair=pair+config.get('prior_weight',.01)*.5*(event_weights*(pp[:,:k]*angle.square()).sum(-1)).mean()
+            # Uniform node sample prevents degree-biased rejection/prior normalization.
+            ni=(node_order[pass_partition(n,updates,position)] if full_pass else
+                torch.randint(n,(batch,),device=device,generator=generator))
+            if distributed:ni=shard(ni,rank,world)
+            ns=embedding(ni);npb=ns[:,:k+1].softmax(-1)
+            degree=data['degree'];cost=rejection_weights(degree[ni],degree.mean(),config.get('rejection_weighting','fixed'))
+            reg=config.get('rejection_cost',10.)*(npb[:,k]*cost).mean()
+            if anchored(config):reg=reg+offset_regularization(ns,k,config)
+            ramp=min(1.,max(0.,(step/steps-.5)/.3)) if config.get('entropy_ramp',True) else 1.
+            reg=reg+config.get('entropy_weight',.05)*ramp*(-npb*npb.clamp_min(1e-20).log()).sum(-1).mean()
+            for point in range(3):
+                nu,nv,nq=coordinates(ns,data['phase'][ni],data['z'][ni],data['family'][ni],data['node_ds'][ni,point],widths,bounds,config.get('coordinate_backend','reference'),config.get('coordinate_division','standard'))
+                angle=nq-data['node_phase'][ni,point,None];angle=angle-angle.detach().round()
+                prior=angle.square()
+                prior=prior+torch.relu(-nq).square()+torch.relu(nq-k).square()
+                unary=config.get('prior_weight',.01)*prior+vertical_layout_prior(nv,data['node_z'][ni,point,None],config)
+                reg=reg+(npb[:,:k]*unary).sum(-1).mean()/3
+            if full_pass:
+                # Balanced partitions can differ by one item; preserve full-objective weights.
+                pair=pair*(len(edges)*updates/len(d['i']))
+                reg=reg*(len(ni)*updates/n)
+            reg=reg+config.get('width_prior',.1)*((widths/initial_width-1).square().mean())
+            reg=reg+config.get('width_smooth',.01)*torch.diff(widths/initial_width).square().mean()
+            if len(data['links']):
+                links=(data['links'] if full_pass else data['links'][torch.randint(len(data['links']),(min(batch,len(data['links'])),),device=device,generator=generator)])
+                ca,cu,cv,_=coords(links[:,0].long(),links[:,2],widths,bounds)
+                cb,du,dv,_=coords(links[:,1].long(),links[:,3],widths,bounds)
+                continuation=continuation_likelihood if anchored(config) else continuation_cost
+                link_normalization=len(data['links'])/len(d['i']) if anchored(config) else 1.
+                reg=reg+config.get('continuation_weight',10.)*link_normalization*continuation(
+                    ca[:,:k],cb[:,:k],cu,du,cv,dv,config.get('continuation_scale',128.) if anchored(config) else initial_width.mean())
+            loss=pair+reg
+            pass_losses+=torch.stack((loss.detach(),pair.detach(),reg.detach()))
+            opt.zero_grad(set_to_none=True);widthopt.zero_grad(set_to_none=True)
+            if benchmark_updates is not None:backward_start=timing_marker()
+            (loss/updates if accumulated else loss).backward()
+            if benchmark_updates is not None:backward_end=timing_marker()
+            # Broken is an ordinary jointly optimized category from the first update.
+            if accumulated:
+                gradients.add(embedding.weight.grad,raw.grad)
+                if position==updates-1:
+                    gradients.install(embedding.weight,raw)
+                    opt.step();widthopt.step()
+            else:
+                if distributed:
+                    if benchmark_updates is not None:communication_start=timing_marker()
+                    reducer.reduce(embedding.weight,raw)
+                    if benchmark_updates is not None:communication_timings.append((communication_start,timing_marker()))
+                else:embedding.weight.grad=embedding.weight.grad.coalesce()
                 opt.step();widthopt.step()
-        else:
-            embedding.weight.grad=embedding.weight.grad.coalesce()
-            opt.step();widthopt.step()
-        if benchmark_updates is not None:
-            tock.record();update_timings.append((tick,tock))
-            segment_timings.append((tick,pair_start,pair_end,backward_start,backward_end,tock))
-            if update_profile is not None:
-                torch.cuda.synchronize();update_profile.__exit__(None,None,None)
-                top=sorted(update_profile.key_averages(),key=lambda e:e.self_device_time_total,reverse=True)[:30]
-                profile_rows=[dict(name=e.key,self_cuda_us=e.self_device_time_total,
-                                   self_cpu_us=e.self_cpu_time_total,count=e.count) for e in top]
-                update_profile.export_chrome_trace(str(root/'update_trace.json'))
-                update_profile=None
+            if benchmark_updates is not None:
+                tock.record();update_timings.append((tick,tock))
+                segment_timings.append((tick,pair_start,pair_end,backward_start,backward_end,tock))
+                if update_profile is not None:
+                    torch.cuda.synchronize();update_profile.__exit__(None,None,None)
+                    top=sorted(update_profile.key_averages(),key=lambda e:e.self_device_time_total,reverse=True)[:30]
+                    profile_rows=[dict(name=e.key,self_cuda_us=e.self_device_time_total,
+                                       self_cpu_us=e.self_cpu_time_total,count=e.count) for e in top]
+                    update_profile.export_chrome_trace(str(root/'update_trace.json'))
+                    update_profile=None
+        if diagnostic_queue is not None:diagnostic_queue.close()
+    finally:
+        if diagnostic_queue is not None:diagnostic_queue.shutdown()
+    distributed_stats=None
+    if distributed:
+        torch.cuda.synchronize()
+        local_stats=dict(rank=rank,peak_allocated_bytes=torch.cuda.max_memory_allocated(),
+            milliseconds=[a.elapsed_time(b) for a,b in update_timings],
+            communication_ms=[a.elapsed_time(b) for a,b in communication_timings])
+        distributed_stats=[None]*world
+        dist.all_gather_object(distributed_stats,local_stats)
+        if rank!=0:return
     np.savez(root/'solution.npz',state=snapshot,widths=w,source_id=d['source_id'],start=d['start'],end=d['end'],family=d['family'])
     summary=dict(config=config,input=json.loads(Path(config['tensor_cache']).with_suffix('.json').read_text()),
         baseline=baseline,final=history[-1],gpu=torch.cuda.get_device_name(),peak_allocated_bytes=torch.cuda.max_memory_allocated(),
@@ -1008,7 +1086,8 @@ def solve(config):
         interpretation='Model consistency only; joint Adam, '+('exhaustive full passes' if full_pass else 'sampled batches'))
     if benchmark_updates is not None:
         torch.cuda.synchronize()
-        ms=[a.elapsed_time(b) for a,b in update_timings]
+        ms=([max(values) for values in zip(*(s['milliseconds'] for s in distributed_stats))]
+            if distributed else [a.elapsed_time(b) for a,b in update_timings])
         warmup=int(config.get('benchmark_warmup',5))
         end=-1 if profile_rows is not None else None
         steady=ms[warmup:end]
@@ -1024,10 +1103,27 @@ def solve(config):
             for values in [[row[index].elapsed_time(row[index+1]) for row in segment_timings[warmup:end]]]}
         summary['update_benchmark']['profile']=profile_rows
         summary['update_benchmark']['profiled_last_update_excluded']=profile_rows is not None
+    if distributed:
+        summary['config']={key:value for key,value in config.items() if key!='_distributed_rank'}
+        summary['distributed']=dict(world_size=world,global_batch=batch,local_batch=batch//world,
+            gradient_reduction='dense mean plus touched-row union, SparseAdam',ranks=distributed_stats)
+        summary['peak_allocated_bytes']=max(s['peak_allocated_bytes'] for s in distributed_stats)
+        if benchmark_updates is not None:
+            cm=[max(values) for values in zip(*(s['communication_ms'] for s in distributed_stats))][warmup:end]
+            summary['update_benchmark']['communication']=dict(mean_ms=float(np.mean(cm)),p50_ms=float(np.quantile(cm,.5)),p95_ms=float(np.quantile(cm,.95)))
+            summary['update_benchmark']['note']+='; distributed timing is per-update maximum across ranks, segments are rank0; coalescing_optimizer includes communication'
+    summary['diagnostic_timing']=dict(baseline_seconds=baseline_seconds,records=diagnostic_times,
+        total_seconds=baseline_seconds+sum(row['total_seconds'] for row in diagnostic_times),
+        workers=diagnostic_workers,wait_seconds=diagnostic_queue.wait_seconds if diagnostic_queue else None,
+        note='Aggregate work; async CPU diagnostics overlap each other and optimization, not additive walltime')
+    summary['solve_wall_seconds']=time.monotonic()-started
     atomic_write(root/'summary.json',summary,durable=False)
 
 
 def run(config):
+    if config.get('diagnostic_benchmark'):
+        from .fiber_uv_diagnostic_benchmark import run
+        return run(config)
     if config.get('assignment_update')!='cost_target':
         validate_joint_rejection(config)
         config=dict(config,rejection_warmup=0,rejection_weighting=config.get('rejection_weighting','fixed'))

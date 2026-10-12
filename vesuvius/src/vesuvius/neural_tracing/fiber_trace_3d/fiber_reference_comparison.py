@@ -84,6 +84,32 @@ def weighted_median(values, weights):
     return a[np.searchsorted(np.cumsum(w), w.sum()/2, side='left')]
 
 
+def grouped_weighted_median(values, weights, offsets):
+    """Exact constant-group fast path; mixed groups use the canonical routine.
+
+    No cross-group cumulative sums (which can perturb half-weight ties).
+    Empty groups and groups without positive finite weights return NaN.
+    """
+    values=np.asarray(values);weights=np.asarray(weights);offsets=np.asarray(offsets)
+    if (values.ndim!=1 or weights.shape!=values.shape or offsets.ndim!=1 or
+            len(offsets)<1 or offsets[0]!=0 or offsets[-1]!=len(values) or
+            np.any(np.diff(offsets)<0)):
+        raise ValueError('Invalid grouped median arrays/offsets')
+    result=np.full(len(offsets)-1,np.nan)
+    groups=np.flatnonzero(np.diff(offsets)>0)
+    if not len(groups):return result
+    valid=np.isfinite(values)&np.isfinite(weights)&(weights>0)
+    starts=offsets[groups]
+    low=np.minimum.reduceat(np.where(valid,values,np.inf),starts)
+    high=np.maximum.reduceat(np.where(valid,values,-np.inf),starts)
+    same=np.isfinite(low)&(low==high)
+    result[groups[same]]=low[same]
+    for group in groups[(low<high)&np.isfinite(low)]:
+        a,b=offsets[group:group+2]
+        result[group]=weighted_median(values[a:b],weights[a:b])
+    return result
+
+
 def discrete_winding(q, limits=None):
     labels=np.floor(np.asarray(q)+.5)
     return labels if limits is None else np.clip(labels,*limits)
@@ -125,22 +151,46 @@ def load_metric_projection(path,d,config=None):
         return {key:src[key] for key in ('owner','arc','weight','offset','chosen_winding')}
 
 
-def reference_winding_metrics(d,state,widths,config,projection):
-    """Original-source median winding, aggregating retained actual-curve samples."""
-    _,_,keep,_,u,_,_=uv.hard_geometry(d,state,widths,config)
+def prepare_metric_cache(d,projection):
+    """Build once before parallel readouts; arrays must remain immutable."""
     owner=projection['owner']
-    direction=(d['node_ds'][:,2]-d['node_ds'][:,0])/d['lengths']
-    ds=(projection['arc']-d['start'][owner])*direction[owner]
-    fitted=discrete_winding(inverse_u(u[owner]+(d['family'][owner]==0)*ds,widths))
+    identity=tuple(id(d[key]) for key in ('node_ds','lengths','start','source_id','family'))+tuple(
+        id(projection[key]) for key in ('owner','arc','offset'))
+    cache=projection.get('_metric_cache')
+    if cache is None or cache['identity']!=identity:
+        direction=(d['node_ds'][:,2]-d['node_ds'][:,0])/d['lengths']
+        ds=(projection['arc']-d['start'][owner])*direction[owner]
+        starts=np.r_[0,np.flatnonzero(np.diff(d['source_id']))+1,len(d['family'])]
+        cache=projection['_metric_cache']=dict(starts=starts,identity=identity,
+            displacement=(d['family'][owner]==0)*ds,offsets=projection['offset'][starts])
+    return cache
+
+
+def reference_metric_inputs(d,state,widths,config,projection,geometry=None):
+    """Shared sample readout; projection and source geometry are immutable."""
+    _,_,keep,_,u,_,_=(uv.hard_geometry(d,state,widths,config) if geometry is None else geometry)
+    owner=projection['owner'];cache=prepare_metric_cache(d,projection);starts=cache['starts']
+    fitted=discrete_winding(inverse_u(u[owner]+cache['displacement'],widths))
     weights=projection['weight']*keep[owner]
-    starts=np.r_[0,np.flatnonzero(np.diff(d['source_id']))+1,len(keep)]
-    predictions=[];references=[];retained=0
-    for a,b in zip(starts[:-1],starts[1:]):
-        if not keep[a:b].any():continue
-        retained+=1
-        lo,hi=projection['offset'][[a,b]]
-        predictions.append(weighted_median(fitted[lo:hi],weights[lo:hi]))
-        references.append(projection['chosen_winding'][a])
+    return keep,fitted,weights,starts,cache['offsets']
+
+
+def reference_winding_metrics(d,state,widths,config,projection,geometry=None):
+    """Original-source median winding, aggregating retained actual-curve samples."""
+    keep,fitted,weights,starts,offsets=reference_metric_inputs(d,state,widths,config,projection,geometry)
+    if config.get('diagnostic_backend','optimized')=='reference':
+        predictions=[];references=[];retained=0
+        for a,b in zip(starts[:-1],starts[1:]):
+            if not keep[a:b].any():continue
+            retained+=1
+            lo,hi=projection['offset'][[a,b]]
+            predictions.append(weighted_median(fitted[lo:hi],weights[lo:hi]))
+            references.append(projection['chosen_winding'][a])
+    else:
+        retained_sources=np.logical_or.reduceat(keep,starts[:-1])
+        retained=int(retained_sources.sum())
+        predictions=grouped_weighted_median(fitted,weights,offsets)[retained_sources]
+        references=projection['chosen_winding'][starts[:-1]][retained_sources]
     result=winding_error_metrics(predictions,references)
     result.update(total_source_fibers=len(starts)-1,retained_source_fibers=retained,
                   unmatched_retained_fibers=retained-result['matched_fibers'],

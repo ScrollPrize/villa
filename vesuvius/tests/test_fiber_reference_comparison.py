@@ -54,6 +54,34 @@ def test_inverse_actual_u_not_bucket():
     np.testing.assert_allclose(inverse_u(np.array([-5,0,10,20,30,40]),np.array([10,20])),[-.5,0,1,1.5,2,2.5])
 
 
+def test_grouped_median_exact_empty_invalid_ties():
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_reference_comparison import grouped_weighted_median
+    rng=np.random.default_rng(13)
+    lengths=rng.integers(0,40,1000);offsets=np.r_[0,lengths.cumsum()]
+    values=rng.integers(-4,8,int(offsets[-1])).astype(float)
+    weights=rng.random(len(values));weights[::7]=0;weights[::9]=-1
+    weights[::11]=np.nan;values[::13]=np.nan;values[::17]=np.inf
+    expected=[weighted_median(values[a:b],weights[a:b]) for a,b in zip(offsets[:-1],offsets[1:])]
+    np.testing.assert_array_equal(grouped_weighted_median(values,weights,offsets),expected)
+    np.testing.assert_array_equal(grouped_weighted_median([4,4,1,2,9,7],[1,3,1,1,0,np.inf],
+        [0,0,2,4,4,6,6]),[np.nan,4,1,np.nan,np.nan,np.nan])
+
+
+def test_reference_metric_fast_and_shared_geometry():
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_reference_comparison as module
+    d=dict(source_id=np.array([1,1,2,3]),start=np.zeros(4),family=np.array([0,0,1,1]),
+           node_ds=np.array([[0,1,2]]*4),lengths=np.full(4,2.),phase=np.full(4,.1),z=np.zeros(4))
+    state=np.zeros((4,12));state[:,:4]=[4,0,0,-2];state[1,:4]=[0,0,0,5]
+    widths=np.full(3,10.)
+    projection=dict(owner=np.repeat(np.arange(4),2),arc=np.tile([0,2],4),weight=np.ones(8),
+                    offset=np.arange(0,9,2),chosen_winding=np.array([0,0,0,np.nan]))
+    cfg=dict(layout_mode='shared_anchor')
+    geo=module.uv.hard_geometry(d,state,widths,cfg)
+    old=module.reference_winding_metrics(d,state,widths,dict(cfg,diagnostic_backend='reference'),projection)
+    new=module.reference_winding_metrics(d,state,widths,cfg,projection,geometry=geo)
+    assert old==new
+
+
 def test_surface_gap_and_endpoint_windings():
     from types import SimpleNamespace
     surface=SimpleNamespace(stride=1,valid_cells=np.ones((4,6),bool))

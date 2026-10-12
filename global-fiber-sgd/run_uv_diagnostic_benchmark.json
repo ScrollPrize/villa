@@ -1,0 +1,7 @@
+{
+  "fiber_uv_layout": {
+    "diagnostic_benchmark": "/home/hendrik/villa2/global-fiber-sgd/data/uv_distributed_32k_6gpu_v1",
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_diagnostic_benchmark_v1",
+    "repeats": 3
+  }
+}

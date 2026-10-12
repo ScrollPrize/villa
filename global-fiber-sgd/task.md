@@ -1,5 +1,16 @@
 # Saved U/V solution visualization
 
+Current: optimize diagnostics, then fresh and reference-initialized100iteration
+joint solves, report and visualize both. uv_diagnostics_100_plan.md.
+
+Current: uv_coordinate_plan.md. Implement and measure combined coordinate
+mapping with deterministic width-gradient reduction; document thoroughly.
+
+Next authorized: after coordinate validation, benchmark larger batches on the
+improved path, then implement one distributed joint solve on GPUs0–5 (not
+independent runs). Document effective global batch/LR, validate gradients and
+measure exclusive-GPU speed/memory/quality. Plan follows coordinate completion.
+
 Current: uv_lr16k_plan.md. Test larger-batch LR scaling on3exclusiveGPUs.
 
 Current: uv_local_window_plan.md. Profile quadratic and trial local +/-N windows
