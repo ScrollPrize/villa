@@ -69,7 +69,7 @@ Same336update run,12snapshots,exclusive6GPUs: workers1/2/4/8/16/128 took
 55.62/34.28/31.15/31.27/31.03/31.32 seconds respectively. All checkpoint
 metric/loss dictionaries (excluding timing) and all final arrays exactly equal.
 Peak active diagnostic workers were1/2/3/3/3/3. Choose4 at the plateau;
-repeat4and8 in the next suite. Increasing128does not create128independent jobs.
+repeat4and8 took31.32/31.44s, confirming4. Increasing128does not create128independent jobs.
 
 Reference width initialization supports123 intervals (indices11..133), widths
 5360..66320basevx. Remaining28intervals retain radial widths. Widths are derived
@@ -77,4 +77,19 @@ from reference layout landmarks, not independent physical circumference truth.
 The width prior remains radial. Comparison evaluates U(k+offset+1)-U(k+offset),
 not rounded-offset indexing; equal supported intervals yield the mean fitted/
 reference factor and mean absolute relative error.53targeted tests passed.
+Expanded regression suite:99passed,2CUDAcases deselected (actual6GPU preflight
+validates distributed gradients and coordinate kernels during every run).
+
+Approved execution command:
+```
+/home/hendrik/.venv_las/bin/python /home/hendrik/villa2/vesuvius/scripts/run_classic_fiber_evaluation.py crop-benchmark --config /home/hendrik/villa2/global-fiber-sgd/run_uv_joint_lr_width_suite.json
+```
+Suite includes4/8worker repeats, four100-pass runs then four1000-pass runs.
+For eachbudget: fresh highLR, fresh lowLR, reference highLR, reference lowLR.
+Bothreference runs initialize winding labels and measuredwidths; allparameters
+train fromfirstupdate. StateLR .2078460969/.02078460969; widthLR2 inboth.
+100/1000sampledpasses=3360/33600updates,196608globalbatch,6GPUs,32768/GPU.
+Diagnostics at336updates (~10passes). Loss is mean onlineobjective overpreceding
+interval, not a frozenfull-dataobjective. RefL1 is globaloffsetcorrected;within2
+uses retainedmatchedfibers. Changes in retainedpopulation affect comparability.
 

@@ -1,0 +1,27 @@
+{
+  "fiber_uv_visualization": {
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_joint1000_vis_width_v2/layout",
+    "layout_only": true,
+    "render_height": 1000,
+    "raster_map_only": true,
+    "vector_pdf": true,
+    "solutions": [
+      {
+        "label": "fresh_high",
+        "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_joint1000_fresh_high_width_v2"
+      },
+      {
+        "label": "fresh_low",
+        "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_joint1000_fresh_low_width_v2"
+      },
+      {
+        "label": "reference_high",
+        "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_joint1000_reference_high_width_v2"
+      },
+      {
+        "label": "reference_low",
+        "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_joint1000_reference_low_width_v2"
+      }
+    ]
+  }
+}

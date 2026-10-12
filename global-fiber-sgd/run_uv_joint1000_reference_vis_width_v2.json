@@ -1,0 +1,36 @@
+{
+  "fiber_reference_comparison": {
+    "reference": "/home/hendrik/villa2/global-fiber-sgd/data/reference/spiral-output-generation-19-lasagna.tifxyz",
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_joint1000_vis_width_v2/reference",
+    "xyz_scale": 4,
+    "surface_stride": 2,
+    "sample_spacing_base": 200,
+    "max_distance_base": 200,
+    "candidates": 4,
+    "workers": 32,
+    "render_height": 1000,
+    "solutions": [
+      {
+        "label": "fresh_high",
+        "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_joint1000_fresh_high_width_v2"
+      },
+      {
+        "label": "fresh_low",
+        "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_joint1000_fresh_low_width_v2"
+      },
+      {
+        "label": "reference_high",
+        "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_joint1000_reference_high_width_v2"
+      },
+      {
+        "label": "reference_low",
+        "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_joint1000_reference_low_width_v2"
+      }
+    ],
+    "projection_cache_root": "/home/hendrik/villa2/global-fiber-sgd/data/reference_comparison100_v1",
+    "physical_z_range_base": [
+      0,
+      80000
+    ]
+  }
+}
