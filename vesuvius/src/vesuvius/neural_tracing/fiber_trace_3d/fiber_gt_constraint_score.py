@@ -34,6 +34,77 @@ def coarse_at(d,state,pick,piece,angle,k):
     return float(pick[piece]+angle-anchor_turn+state[piece,k+1])
 
 
+def event_residuals(events,d,state,pick,k,gd,gs,gpick):
+    """Required additive test winding correction, shared by both GT metrics."""
+    return np.asarray([
+        coarse_at(gd,gs['state'],gpick,e['gt_piece'],e['gt_angle'],len(gs['widths']))
+        -coarse_at(d,state,pick,e['test_piece'],e['test_angle'],k)
+        -e['phase_delta']+.5*e['family_delta']-e['signed_distance']
+        for e in events],dtype=float)
+
+
+def enabled_l1(required,enabled,parallel):
+    """Equal enabled-event L1, with a single L1-optimal integer gauge."""
+    required=np.asarray(required,dtype=float)
+    enabled=np.asarray(enabled,dtype=bool);parallel=np.asarray(parallel,dtype=bool)
+    if required.shape!=enabled.shape or parallel.shape!=enabled.shape:
+        raise ValueError('Event masks must match residuals')
+    values=np.sort(required[enabled])
+    if not len(values) or not np.isfinite(required).all():
+        raise ValueError('No finite enabled GT constraints')
+    # Every real point in the median interval minimizes L1. If it contains
+    # integers, choose the one closest to zero; otherwise test its neighbors.
+    lo,hi=values[(len(values)-1)//2],values[len(values)//2]
+    first,last=int(np.ceil(lo)),int(np.floor(hi))
+    if first<=last:
+        offset=min(max(0,first),last)
+    else:
+        offset=min((int(np.floor(lo)),int(np.ceil(hi))),
+                   key=lambda x:(float(np.abs(values-x).mean()),abs(x),x))
+    error=np.abs(required-offset)
+    def part(mask):
+        return dict(events=int(mask.sum()),l1=float(error[mask].mean()) if mask.any() else None)
+    return dict(gt_enabled_l1=float(error[enabled].mean()),gt_global_offset=offset,
+        gt_enabled_events=int(enabled.sum()),gt_total_events=len(required),
+        gt_enabled_percent=float(100*enabled.mean()),gt_parallel=part(enabled&parallel),
+        gt_perpendicular=part(enabled&~parallel),gt_disabled=part(~enabled))
+
+
+class FrozenGTScorer:
+    """Replay cached cross events without extracting geometry for each trial."""
+    def __init__(self,spec,config):
+        root=Path(spec['root']);gtroot=Path(spec['gt_root'])
+        self.paths=[root/'inputs.json',root/spec['events'],gtroot/'uv_whole/config.json',
+                    gtroot/'uv_whole/solution.npz',Path(config['tensor_cache'])]
+        provenance=json.loads(self.paths[0].read_text())
+        self.gcfg=json.loads(self.paths[2].read_text())
+        self.paths.append(Path(self.gcfg['tensor_cache']))
+        for key,path in [('tensors',self.paths[4]),('gt_tensors',self.paths[5]),
+                         ('gt_solution',self.paths[3])]:
+            if sha256_file(path)!=provenance[key]:raise ValueError('Changed GT scoring '+key)
+        if not config.get('bucket_shared_phase') or not self.gcfg.get('bucket_shared_phase') or config['h_convention']!=self.gcfg['h_convention']:
+            raise ValueError('GT scoring requires matching corrected coarse convention')
+        self.d=arrays(self.paths[4]);self.gd=arrays(self.paths[5]);self.gs=arrays(self.paths[3])
+        self.events=json.loads(self.paths[1].read_text())
+        _,_,keep,self.gpick=uv.hard_assignment(self.gs['state'],len(self.gs['widths']),self.gcfg,best_nonbroken=True)
+        if not keep.all():raise ValueError('Trusted GT must remain enabled')
+        for e in self.events:
+            if int(self.d['source_id'][e['test_piece']])!=e['test_source']:
+                raise ValueError('Cached event piece identity mismatch')
+            if int(self.gd['source_id'][e['gt_piece']])!=e['gt_source']:
+                raise ValueError('Cached GT event piece identity mismatch')
+        self.hashes={str(p):sha256_file(p) for p in self.paths}
+
+    def score(self,solution,config):
+        s=arrays(solution);k=len(s['widths'])
+        for field in ('source_id','start','end','family'):
+            if not np.array_equal(s[field],self.d[field]):raise ValueError('Changed scored solution '+field)
+        _,_,keep,pick=uv.hard_assignment(s['state'],k,config,best_nonbroken=True)
+        required=event_residuals(self.events,self.d,s['state'],pick,k,self.gd,self.gs,self.gpick)
+        return enabled_l1(required,[keep[e['test_piece']] for e in self.events],
+                          [e['parallel'] for e in self.events])
+
+
 def run(settings):
     from .crop_benchmark import run as dispatch
     from .fiber_normal_convention import inward_solution
@@ -148,11 +219,7 @@ def run(settings):
             raise ValueError('Nonfinite saved solution')
         _,_,keep,pick=uv.hard_assignment(s['state'],k,c,best_nonbroken=True)
         if len(pick)!=len(d['source_id']):raise ValueError('Solution piece count mismatch')
-        required=[]
-        for e in events:
-            qt=coarse_at(d,s['state'],pick,e['test_piece'],e['test_angle'],k)
-            qg=coarse_at(gd,gs['state'],gpick,e['gt_piece'],e['gt_angle'],len(gs['widths']))
-            required.append(qg-qt-e['phase_delta']+.5*e['family_delta']-e['signed_distance'])
+        required=event_residuals(events,d,s['state'],pick,k,gd,gs,gpick)
         offset,correct,votes=offset_votes(required);required=np.asarray(required)
         enabled=np.asarray([keep[e['test_piece']] for e in events]);parallel=np.asarray([e['parallel'] for e in events])
         def stats(mask):

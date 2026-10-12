@@ -9,7 +9,7 @@ def configuration_key(values):
     return hashlib.sha256(json.dumps(values, sort_keys=True, allow_nan=False).encode()).hexdigest()[:20]
 
 
-def coordinate_search(baseline, evaluate, grids, tolerance=1e-4, accepted=None):
+def coordinate_search(baseline, evaluate, grids, tolerance=1e-4, accepted=None, metric='ref_l1'):
     """Restart every coordinate after improvement; finish at a grid-local minimum.
 
     evaluate must cache complete configurations. Resuming by replay is deliberate:
@@ -26,7 +26,8 @@ def coordinate_search(baseline, evaluate, grids, tolerance=1e-4, accepted=None):
                         continue
                     candidate = dict(current, **{name: value})
                     result = evaluate(candidate)
-                    if result['ref_l1'] < best['ref_l1'] - tolerance:
+                    value=result.get(metric)
+                    if value is not None and math.isfinite(value) and value < best[metric] - tolerance:
                         old = best
                         current, best = candidate, result
                         if accepted:
@@ -78,7 +79,14 @@ def run(config):
     if not all(math.isfinite(v) and v > 0 for v in initial.values()):
         raise ValueError('Search baseline weights must be finite and positive')
     grids = [{name: [initial[name] * factor for factor in factors] for name in names}
-             for factors in ([.25, 1., 4.], [.25, .5, 1., 2., 4.])]
+             for factors in spec.get('factor_grids',([.25, 1., 4.], [.25, .5, 1., 2., 4.]))]
+    objective=spec.get('objective','ref_l1')
+    scorer=None
+    if objective=='gt_enabled_l1':
+        from .fiber_gt_constraint_score import FrozenGTScorer
+        scorer=FrozenGTScorer(spec['gt_score'],base)
+    elif objective!='ref_l1':
+        raise ValueError('Unknown search objective: '+objective)
     paths = [Path(base['tensor_cache']), Path(base['tensor_cache']).with_suffix('.json'),
              Path(base['reference_projection']), Path(base['reference_widths']['meta'])]
     paths += sorted(Path(__file__).parent.glob('fiber_uv*.py'))
@@ -89,6 +97,10 @@ def run(config):
         paths.append(signature)
     manifest = dict(base=base, grids=grids, tolerance=1e-4,
                     hashes={str(p): sha256_file(p) for p in paths})
+    if scorer:
+        manifest.update(objective=objective,gt_score_hashes=scorer.hashes)
+        path=Path(__file__).with_name('fiber_gt_constraint_score.py')
+        manifest['hashes'][str(path)]=sha256_file(path)
     manifest_path = root / 'search_manifest.json'
     if manifest_path.exists() and json.loads(manifest_path.read_text()) != manifest:
         raise ValueError('Search configuration changed; use a new output root')
@@ -125,13 +137,26 @@ def run(config):
                     if not np.array_equal(solution[field], data[field]):
                         raise ValueError('Changed solution identity: ' + field)
         result = dict(metrics(summary), key=key, weights=values, output_root=str(trial_root))
+        if scorer:
+            try:
+                result.update(scorer.score(trial_root/'solution.npz',child))
+            except ValueError as exc:
+                if str(exc)!='No finite enabled GT constraints':raise
+                result.update(gt_enabled_l1=None,invalid_reason=str(exc))
+            result.update(objective_name=objective,objective_value=result[objective])
+        if not results and result.get(objective) is None:
+            raise ValueError('Baseline has no valid objective')
         if not any(row['key'] == key for row in results):
             results.append(result)
             atomic_write(root / 'results.json', results, durable=False)
+            print('WEIGHT SEARCH RESULT '+json.dumps(result),flush=True)
+        if len(results)==1:
+            atomic_write(root / 'best.json',result,durable=False)
         return result
 
     def accept(name, values, best, old):
         row = dict(best, changed_weight=name, previous_ref_l1=old['ref_l1'])
+        if scorer:row.update(previous_objective=old[objective])
         acceptances.append(row)
         atomic_write(root / 'acceptances.json', acceptances, durable=False)
         atomic_write(root / 'best.json', best, durable=False)
@@ -140,7 +165,7 @@ def run(config):
             announced.add(best['key'])
             atomic_write(announced_path, sorted(announced), durable=False)
 
-    values, best = coordinate_search(initial, evaluate, grids, accepted=accept)
+    values, best = coordinate_search(initial, evaluate, grids, accepted=accept,metric=objective)
     final = dict(best=best, weights=values, trials=len(results), acceptances=acceptances,
         termination='Every alternative grid value of every coordinate tested at final incumbent; no L1 improvement >1e-4',
         caveat='Reference is tuning data; retained cohort can change. Finite-grid coordinate optimum only.')

@@ -2,6 +2,29 @@ import numpy as np
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_gt_constraint_score import offset_votes,piece_at,coarse_at
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_uv_layout import hard_assignment
 from vesuvius.neural_tracing.fiber_trace_3d import fiber_uv_layout as uv
+from vesuvius.neural_tracing.fiber_trace_3d.fiber_gt_constraint_score import enabled_l1
+import pytest
+
+
+def test_enabled_l1_mask_and_integer_gauge():
+    score=enabled_l1([2.1,2.3,100],[True,True,False],[True,False,True])
+    assert score['gt_global_offset']==2
+    assert score['gt_enabled_l1']==pytest.approx(.2)
+    assert score['gt_enabled_events']==2
+    assert score['gt_parallel']['l1']==pytest.approx(.1)
+    shifted=enabled_l1([12.1,12.3,-100],[True,True,False],[True,False,True])
+    assert shifted['gt_global_offset']==12
+    assert shifted['gt_enabled_l1']==pytest.approx(.2)
+
+
+@pytest.mark.parametrize('values,offset', [([1,10],1),([-10,10],0),([-10,-1],-1),([.6,.8],1),([.1,.3],0)])
+def test_l1_median_interval(values,offset):
+    assert enabled_l1(values,[True,True],[True,True])['gt_global_offset']==offset
+
+
+def test_l1_empty_enabled_invalid():
+    with pytest.raises(ValueError,match='No finite enabled'):
+        enabled_l1([0],[False],[True])
 
 
 def test_offset_votes_and_integer_gauge():

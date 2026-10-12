@@ -1,5 +1,12 @@
 # Reference-selected regional solve
 
+## Enabled GT L1 search
+- [x] Commit previous state/results:016cdf185.
+- [x] Independent plan/code review, enabled-only L1, shared cached evaluator.
+- [x] Configurable objective in resumable coordinate search;39tests.
+- [ ] Start sixGPU search and verify baseline/initial trials.
+- [ ] Complete iterative grid refinement and record final incumbent.
+
 ## Corrected fresh/reference GT evaluation
 - [x] Commit shared-phase correction and GT results (e2ba3415a).
 - [x] Reviewed matched configs; both sixGPU solves completed (~173/174s).

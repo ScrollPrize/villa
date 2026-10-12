@@ -33,6 +33,13 @@ def test_key_independent_of_order():
     assert configuration_key(dict(a=1., b=2.)) == configuration_key(dict(b=2., a=1.))
 
 
+def test_gt_objective_not_spiral_and_invalid_trial():
+    def evaluate(v):
+        return dict(ref_l1=-v['a'],gt_enabled_l1={1:2.,2:None,3:1.,4:3.}[v['a']])
+    values,best=coordinate_search(dict(a=1),evaluate,[dict(a=[1,2,3,4])],metric='gt_enabled_l1')
+    assert values==dict(a=3) and best['gt_enabled_l1']==1.
+
+
 def test_disk_resume_and_manifest_guard(tmp_path, monkeypatch):
     import json
     import numpy as np

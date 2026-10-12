@@ -1,5 +1,7 @@
 # Global fiber SGD: data reconnaissance
 
+Current: gt_l1_search_plan.md; independent review requested.
+
 Current: gt_constraint_score_plan.md, independently reviewed.
 
 Current: bbox_gt_phase_fix_plan.md; independent review approved.

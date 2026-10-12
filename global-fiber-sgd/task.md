@@ -1,5 +1,8 @@
 # Reference-selected regional solve
 
+Current: enabled-only GT constraint L1 iterative parameter search; see
+gt_l1_search_plan.md. Commit previous results, implement metric, start refinement.
+
 Current: commit corrected GT solve, run corrected canonical test subset fresh
 and reference initialized, evaluate equal-weight constraint votes against v3 GT.
 See gt_constraint_score_plan.md. Includes disabled pieces at best nonbroken state.
