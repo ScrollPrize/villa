@@ -39,6 +39,7 @@ from vesuvius.ink_detection.models.model import make_model
 from vesuvius.ink_detection.volume_io import (
     ZARR_V3,
     open_volume,
+    close_volume_root,
     open_volume_root,
     select_volume_level,
 )
@@ -1139,6 +1140,7 @@ def infer_single_zarr(
         )
     finally:
         shutil.rmtree(temporary, ignore_errors=True)
+        close_volume_root(root)
 
 
 def resolve_run_directions(direction: str) -> tuple[str, ...]:
