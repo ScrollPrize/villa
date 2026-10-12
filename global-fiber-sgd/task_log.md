@@ -1,5 +1,11 @@
 # Diagnostic optimization and two100-pass-equivalent joint solves
 
+- User stopped high-LR experiments after observing loss jumps. Freshhigh100 had
+  justfinished (loss7.3176 overlast10passes,L1 10.9919,within2 13.2196%). Mixed
+  suite interrupted with SIGINT/exit130 before furtherhighLRruns. Replacement
+  run_uv_joint_low_width_suite.json runs only fresh/reference lowLR100 then1000.
+  Reference widths included;10passmetrics. Oldcompleteddata preserved.
+
 - User authorizes diagnostic optimization then fresh/reference-initialized100
   iterations and visualizations. Plan:uv_diagnostics_100_plan.md, independently
   approved. Currentmode sampledminibatch,32k/GPU,6GPUs,3360updates~100passes.

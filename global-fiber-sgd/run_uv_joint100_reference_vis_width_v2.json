@@ -19,10 +19,6 @@
         "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_joint100_fresh_low_width_v2"
       },
       {
-        "label": "reference_high",
-        "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_joint100_reference_high_width_v2"
-      },
-      {
         "label": "reference_low",
         "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_joint100_reference_low_width_v2"
       }
