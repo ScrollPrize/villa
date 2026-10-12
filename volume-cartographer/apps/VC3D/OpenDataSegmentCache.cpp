@@ -1816,6 +1816,58 @@ OpenDataSegmentCacheState cacheStateForSegment(
     return OpenDataSegmentCacheState::Current;
 }
 
+static std::vector<std::string> representationEntryTags(
+    const OpenDataSegmentRepresentation& representation)
+{
+    std::string kindTag;
+    switch (representation.kind) {
+        case OpenDataSegmentRepresentationKind::Authored:
+            kindTag = "authored";
+            break;
+        case OpenDataSegmentRepresentationKind::DerivedNative:
+            kindTag = "derived-native";
+            break;
+        case OpenDataSegmentRepresentationKind::PublishedTransformed:
+            kindTag = "published-transformed";
+            break;
+    }
+    std::vector<std::string> tags{
+        "open-data",
+        "immutable",
+        "vc-open-data-segment-representation:" + kindTag,
+        "vc-open-data-source-coordinate-level:" +
+            std::to_string(representation.sourceCoordinateLevel),
+        "vc-open-data-coordinate-space:" + representation.coordinateSpace,
+    };
+    if (representation.kind == OpenDataSegmentRepresentationKind::PublishedTransformed)
+        tags.push_back("vc-open-data-target-volume-id:" +
+                       representation.coordinateVolumeId);
+    else
+        tags.push_back("vc-open-data-source-volume-id:" +
+                       representation.coordinateVolumeId);
+    if (representation.canonicalSource) {
+        tags.push_back("vc-open-data-canonical-source");
+        if (representation.kind ==
+            OpenDataSegmentRepresentationKind::PublishedTransformed) {
+            tags.push_back("vc-open-data-source-volume-id:" +
+                           representation.coordinateVolumeId);
+        }
+    }
+    return tags;
+}
+
+static std::vector<std::string> generatedEntryTags(
+    const std::string& sampleId, const std::string& sourceVolumeId,
+    const std::string& targetVolumeId)
+{
+    return {"open-data", "immutable", "open-data-transformed",
+            "vc-open-data-segment-representation:generated-native-transform",
+            "vc-open-data-source-volume-id:" + sourceVolumeId,
+            "vc-open-data-target-volume-id:" + targetVolumeId,
+            "vc-open-data-source-coordinate-level:0",
+            "vc-open-data-coordinate-space:" + sampleId + "/" + targetVolumeId + "@L0"};
+}
+
 OpenDataSegmentCacheReconcileResult attachExistingOpenDataSegmentCaches(
     VolumePkg& pkg,
     const OpenDataSample& sample,
@@ -1892,40 +1944,7 @@ OpenDataSegmentCacheReconcileResult attachExistingOpenDataSegmentCaches(
         }
     }
     for (const auto& [root, representation] : cachedRepresentationRoots) {
-        std::string kindTag;
-        switch (representation.kind) {
-            case OpenDataSegmentRepresentationKind::Authored:
-                kindTag = "authored";
-                break;
-            case OpenDataSegmentRepresentationKind::DerivedNative:
-                kindTag = "derived-native";
-                break;
-            case OpenDataSegmentRepresentationKind::PublishedTransformed:
-                kindTag = "published-transformed";
-                break;
-        }
-        std::vector<std::string> tags{
-            "open-data",
-            "immutable",
-            "vc-open-data-segment-representation:" + kindTag,
-            "vc-open-data-source-coordinate-level:" +
-                std::to_string(representation.sourceCoordinateLevel),
-            "vc-open-data-coordinate-space:" + representation.coordinateSpace,
-        };
-        if (representation.kind == OpenDataSegmentRepresentationKind::PublishedTransformed)
-            tags.push_back("vc-open-data-target-volume-id:" +
-                           representation.coordinateVolumeId);
-        else
-            tags.push_back("vc-open-data-source-volume-id:" +
-                           representation.coordinateVolumeId);
-        if (representation.canonicalSource) {
-            tags.push_back("vc-open-data-canonical-source");
-            if (representation.kind ==
-                OpenDataSegmentRepresentationKind::PublishedTransformed) {
-                tags.push_back("vc-open-data-source-volume-id:" +
-                               representation.coordinateVolumeId);
-            }
-        }
+        auto tags = representationEntryTags(representation);
         attachEntry(root.string(), std::move(tags), representation.coordinateSpace,
                     "coordinate-specific tifxyz representation",
                     result.failedTifxyzSegments);
@@ -1986,15 +2005,7 @@ OpenDataSegmentCacheReconcileResult attachExistingOpenDataSegmentCaches(
         const auto& targetVolumeId = route.second;
         attachEntry(openDataTransformedSegmentCacheRoot(
                         remoteCacheRoot, sample, sourceVolumeId, targetVolumeId).string(),
-                    {"open-data",
-                     "immutable",
-                     "open-data-transformed",
-                     "vc-open-data-segment-representation:generated-native-transform",
-                     "vc-open-data-source-volume-id:" + sourceVolumeId,
-                     "vc-open-data-target-volume-id:" + targetVolumeId,
-                     "vc-open-data-source-coordinate-level:0",
-                     "vc-open-data-coordinate-space:" + sample.id + "/" +
-                         targetVolumeId + "@L0"},
+                    generatedEntryTags(sample.id, sourceVolumeId, targetVolumeId),
                     sourceVolumeId + " to " + targetVolumeId,
                     "transformed tifxyz segment directory",
                     result.failedTransformedTifxyzSegments);
@@ -2295,7 +2306,8 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
     const OpenDataSample& sample,
     const std::filesystem::path& remoteCacheRoot,
     const OpenDataSampleProgressCallback& progressCallback,
-    bool forceRefresh)
+    bool forceRefresh,
+    bool individualEntries)
 {
     OpenDataSegmentCacheReconcileResult result;
     if (sample.tifxyzSegmentCount() == 0) {
@@ -2365,6 +2377,9 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
             forceRefresh, &error);
         if (prepared) {
             representationSucceeded[i] = 1;
+            if (individualEntries && pkg.addSegmentsEntry(
+                    segmentDir.string(), representationEntryTags(representation)))
+                ++result.attachedSegmentEntries;
             if (representation.canonicalSource &&
                 requiredFilesPresent(segmentDir)) {
                 ++result.cachedTifxyzSegments;
@@ -2386,6 +2401,7 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
         reportProgress(progressCallback, progress);
     }
     for (const auto& [sourceVolumeId, expectedDirNames] : expectedDirNamesBySource) {
+        if (individualEntries) continue;
         markOrphanedEntries(
             openDataSegmentCacheRoot(remoteCacheRoot, sample, sourceVolumeId),
             expectedDirNames);
@@ -2415,6 +2431,7 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
     }
     std::set<std::string> expectedSegmentEntryLocations;
     for (const auto& volumeId : aggregateVolumeIds) {
+        if (individualEntries) continue;
         const auto root = openDataSegmentCacheRoot(
             remoteCacheRoot, sample, volumeId);
         std::error_code ec;
@@ -2498,6 +2515,11 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
         if (prepareGeneratedPlaceholder(
                 sample, *task.segment, sourceSegmentDir, targetSegmentDir,
                 task.targetVolumeId, forceRefresh, &error)) {
+            if (individualEntries) {
+                if (pkg.addSegmentsEntry(targetSegmentDir.string(), generatedEntryTags(
+                        sample.id, sourceVolumeIdForSegment(*task.segment), task.targetVolumeId)))
+                    ++result.attachedSegmentEntries;
+            }
             if (requiredFilesPresent(targetSegmentDir)) {
                 ++result.transformedTifxyzSegments;
             }
@@ -2529,6 +2551,7 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
         std::string(1, std::filesystem::path::preferred_separator);
     const auto existingEntries = pkg.segmentEntries();
     for (const auto& entry : existingEntries) {
+        if (individualEntries) continue;
         const bool immutable =
             std::find(entry.tags.begin(), entry.tags.end(), "immutable") !=
             entry.tags.end();

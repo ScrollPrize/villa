@@ -200,7 +200,12 @@ def is_fiber_doc(doc):
     if not (isinstance(doc, dict) and doc.get('type') == 'vc3d_fiber'):
         return False
     version = doc.get('version', 1)
-    # Version 4 = version 3 plus optional span tags; one lineage for merging.
+    width = doc.get('width', 0)
+    if isinstance(width, bool) or not isinstance(width, (int, float)) or not math.isfinite(width) or width < 0:
+        return False
+    gap = doc.get('width_gap_fraction', 0.2)
+    if isinstance(gap, bool) or not isinstance(gap, (int, float)) or not math.isfinite(gap) or not 0 <= gap <= 1:
+        return False
     if version not in (1, 3, 4):
         return False
     if version >= 3 and 'optimization_mode' not in doc:
@@ -223,8 +228,16 @@ def is_fiber_doc(doc):
     else:
         for index, cp in enumerate(control_points):
             if (not isinstance(cp, dict) or
-                    not set(cp) <= {'position', 'segment_to_next', 'tags'} or
+                    not set(cp) <= {'position', 'segment_to_next', 'tags', 'display_normal', 'display_normal_source', 'direction'} or
                     not _finite_point(cp.get('position'))):
+                return False
+            if 'display_normal' in cp and _normalized(cp['display_normal']) is None:
+                return False
+            if 'direction' in cp and _normalized(cp['direction']) is None:
+                return False
+            if 'display_normal_source' in cp and (
+                    'display_normal' not in cp or cp['display_normal_source'] not in
+                    ('manual', 'interpolated', 'unknown')):
                 return False
             # Optional per-CP tags (e.g. 'kollesis_termination'): the loader
             # takes an array of strings and nothing else.
@@ -1046,6 +1059,81 @@ def _merge_manual_hv_tag(base, local, remote, merged, notes):
     return None
 
 
+def _merge_display_annotations(base, local, remote, merged):
+    def choose(b, l, r, label):
+        if l == r or r == b:
+            return l
+        if l == b:
+            return r
+        raise ValueError(f"conflicting {label}")
+
+    width = choose(base.get('width', 0), local.get('width', 0), remote.get('width', 0), 'fiber widths')
+    merged['width_gap_fraction'] = choose(
+        *(doc.get('width_gap_fraction', 0.2) for doc in (base, local, remote)),
+        'fiber width gaps')
+    if width:
+        merged['width'] = width
+    else:
+        merged.pop('width', None)
+
+    def normal_at(doc, cp):
+        for p in doc['control_points']:
+            if pos_eq(_cp_position(p), _cp_position(cp)):
+                if isinstance(p, dict) and 'display_normal' in p:
+                    return (p['display_normal'], p.get('display_normal_source', 'unknown'))
+                return None
+        return None
+
+    for cp in merged['control_points']:
+        if not isinstance(cp, dict):
+            continue
+        normal = choose(*(normal_at(doc, cp) for doc in (base, local, remote)), 'CP display normals')
+        if normal is None:
+            cp.pop('display_normal', None)
+            cp.pop('display_normal_source', None)
+        else:
+            cp['display_normal'] = copy.deepcopy(normal[0])
+            cp['display_normal_source'] = normal[1]
+    for doc in (local, remote):
+        for cp in doc['control_points']:
+            if normal_at(doc, cp) != normal_at(base, cp) and not any(
+                    pos_eq(_cp_position(p), _cp_position(cp)) for p in merged['control_points']):
+                raise ValueError('display normal edited on a removed or moved CP')
+
+    def direction_at(doc, cp):
+        for p in doc['control_points']:
+            if pos_eq(_cp_position(p), _cp_position(cp)) and isinstance(p, dict):
+                v = _normalized(p.get('direction'))
+                if v is not None:
+                    return v
+        return None
+
+    for cp in merged['control_points']:
+        if not isinstance(cp, dict):
+            continue
+        direction = choose(*(direction_at(doc, cp) for doc in (base, local, remote)),
+                           'CP directions')
+        if direction is None:
+            cp.pop('direction', None)
+        else:
+            cp['direction'] = direction
+    for doc in (local, remote):
+        for cp in doc['control_points']:
+            if direction_at(doc, cp) != direction_at(base, cp) and not any(
+                    pos_eq(_cp_position(p), _cp_position(cp)) for p in merged['control_points']):
+                raise ValueError('direction edited on a removed or moved CP')
+
+
+def _without_display_normals(doc):
+    doc = copy.deepcopy(doc)
+    for cp in doc['control_points']:
+        if isinstance(cp, dict):
+            cp.pop('display_normal', None)
+            cp.pop('display_normal_source', None)
+            cp.pop('direction', None)
+    return doc
+
+
 def merge_fibers(base, local, remote):
     """Three-way merge. Returns
     {'ok': bool, 'merged': dict|None, 'conflicts': [str], 'notes': [str],
@@ -1083,6 +1171,11 @@ def merge_fibers(base, local, remote):
         return sorted({_branch_target(entry) for entry in links_to_any(doc)} |
                       {_branch_target(entry) for entry in links_to_any(base)})
 
+    def normal_defaults(doc):
+        for cp in doc['control_points']:
+            if isinstance(cp, dict) and 'display_normal' in cp:
+                cp.setdefault('display_normal_source', 'unknown')
+
     stripped = _stripped_array_conflicts(base, local, remote)
     if stripped:
         result['conflicts'] = stripped
@@ -1099,6 +1192,8 @@ def merge_fibers(base, local, remote):
 
     if local == remote or remote == base:
         merged = lineage_version(copy.deepcopy(local))
+        merged.setdefault('width_gap_fraction', 0.2)
+        normal_defaults(merged)
         result.update(ok=True, merged=merged,
                       peer_files=short_circuit_peers(local),
                       notes=(["remote side unchanged; kept local"]
@@ -1107,6 +1202,8 @@ def merge_fibers(base, local, remote):
         return result
     if local == base:
         merged = lineage_version(copy.deepcopy(remote))
+        merged.setdefault('width_gap_fraction', 0.2)
+        normal_defaults(merged)
         result.update(ok=True, merged=merged,
                       peer_files=short_circuit_peers(remote),
                       notes=["local side unchanged; took remote"])
@@ -1159,7 +1256,7 @@ def merge_fibers(base, local, remote):
 
     if base.get('version', 1) >= 3:
         span_geometry, span_conflicts = merge_v3_span_geometry(
-            base, local, remote)
+            *(_without_display_normals(doc) for doc in (base, local, remote)))
         if span_conflicts:
             result['conflicts'] = span_conflicts
             return result
@@ -1265,6 +1362,30 @@ def merge_fibers(base, local, remote):
     merged = copy.deepcopy(newer)
     merged['control_points'] = copy.deepcopy(carrier['control_points'])
     merged['line_points'] = copy.deepcopy(carrier['line_points'])
+    try:
+        _merge_display_annotations(base, local, remote, merged)
+        def same_direction(a, b):
+            if a is None or b is None:
+                return a is b
+            a, b = _normalized(a), _normalized(b)
+            return a is not None and b is not None and sum(x*y for x, y in zip(a, b)) > 1-1e-12
+
+        def directions_match(doc):
+            for cp in merged['control_points']:
+                if not isinstance(cp, dict):
+                    continue
+                match = next((p for p in doc['control_points']
+                              if pos_eq(_cp_position(p), _cp_position(cp))), None)
+                if not same_direction(cp.get('direction'),
+                                      match.get('direction') if isinstance(match, dict) else None):
+                    return False
+            return True
+
+        if not (directions_match(local) and directions_match(remote)):
+            reoptimize = True
+    except ValueError as exc:
+        result['conflicts'] = [str(exc)]
+        return result
     if base.get('version', 1) >= 3:
         merged['optimization_mode'] = mode
         # Any version-4 side makes the merge version 4 (a v4 side may carry
