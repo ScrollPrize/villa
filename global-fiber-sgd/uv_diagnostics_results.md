@@ -63,3 +63,18 @@ ties,multiplepieces,orderedboundedpublication and workerfailure propagation.
 GPU coordinate backend remains opt-in. CPU diagnostic backend defaults optimized;
 `diagnostic_backend=reference` retains the canonical median loop for validation.
 `diagnostic_workers=0` remains the synchronous default; these experiments opt into2.
+# Worker-count sweep and width follow-up
+
+Same336update run,12snapshots,exclusive6GPUs: workers1/2/4/8/16/128 took
+55.62/34.28/31.15/31.27/31.03/31.32 seconds respectively. All checkpoint
+metric/loss dictionaries (excluding timing) and all final arrays exactly equal.
+Peak active diagnostic workers were1/2/3/3/3/3. Choose4 at the plateau;
+repeat4and8 in the next suite. Increasing128does not create128independent jobs.
+
+Reference width initialization supports123 intervals (indices11..133), widths
+5360..66320basevx. Remaining28intervals retain radial widths. Widths are derived
+from reference layout landmarks, not independent physical circumference truth.
+The width prior remains radial. Comparison evaluates U(k+offset+1)-U(k+offset),
+not rounded-offset indexing; equal supported intervals yield the mean fitted/
+reference factor and mean absolute relative error.53targeted tests passed.
+

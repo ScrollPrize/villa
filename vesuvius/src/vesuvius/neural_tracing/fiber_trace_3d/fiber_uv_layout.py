@@ -733,14 +733,13 @@ def reference_initial_centers(d,widths,reference,radial_centers):
     return centers
 
 
-def fresh_initial_state(d,config):
+def radial_initial_geometry(d,config):
     """Geometric initialization only; never consumes a previous U/V solution.
 
     Physical evidence caches predate configurable K. Their radius observations
     remain reusable; regenerate the radial prior across the requested range.
     Preserve the historical 100-candidate initialization byte-for-byte.
     """
-    from scipy.special import logsumexp
     k=int(config.get('winding_count',100))
     sigma=float(config.get('initial_sigma',3.))
     if k<2 or not np.isfinite(sigma) or sigma<=0:
@@ -753,6 +752,21 @@ def fresh_initial_state(d,config):
         centers=np.clip(scale*(5+85*(r-lo)/max(hi-lo,1)),0,k-1).astype(np.float32)
         radii=np.interp(np.arange(k),np.linspace(5*scale,90*scale,k),np.linspace(lo,hi,k))
         widths=np.maximum(2*np.pi*radii,100.).astype(np.float32)
+    return centers,widths
+
+
+def fresh_initial_state(d,config):
+    from scipy.special import logsumexp
+    k=int(config.get('winding_count',100));sigma=float(config.get('initial_sigma',3.))
+    centers,widths=radial_initial_geometry(d,config)
+    if config.get('reference_width_initialization'):
+        if not config.get('reference_initialization'):
+            raise ValueError('Reference widths require reference winding initialization')
+        from .fiber_reference_comparison import reference_interval_widths
+        ref=reference_interval_widths(config,np.arange(k))
+        valid=np.isfinite(ref)
+        if not valid.any() or np.any(ref[valid]<=100):raise ValueError('Invalid reference widths')
+        widths[valid]=ref[valid]
     if config.get('reference_initialization'):
         if not anchored(config):raise ValueError('Reference initialization requires shared_anchor layout')
         from .fiber_reference_comparison import load_metric_projection
@@ -839,7 +853,8 @@ def solve(config):
     # Shared table lookup makes broad Gaussian hypotheses cheap without K*K*R tensors.
     table=torch.from_numpy(make_distance_table(float(d['distance'].max()),config.get('distance_sigma',.5))).to(device)
     state,start_width=fresh_initial_state(d,config)
-    initial_width=torch.as_tensor(start_width,device=device)
+    # Reference widths are initialization only, not an added reference prior.
+    initial_width=torch.as_tensor(radial_initial_geometry(d,config)[1],device=device)
     if config.get('warm_start'):state,start_width=load_warm_start(config,d,state.shape)
     embedding=torch.nn.Embedding.from_pretrained(torch.from_numpy(state).to(device),freeze=False,sparse=True)
     raw=torch.nn.Parameter(inverse_widths(torch.as_tensor(start_width,device=device)))
@@ -1084,6 +1099,11 @@ def solve(config):
             winding_count=k,initial_sigma=config.get('initial_sigma',3.),
             geometry_trainable=True,widths_trainable=True),
         interpretation='Model consistency only; joint Adam, '+('exhaustive full passes' if full_pass else 'sampled batches'))
+    if config.get('reference_width_initialization'):
+        from .fiber_reference_comparison import reference_interval_widths
+        measured=np.isfinite(reference_interval_widths(config,np.arange(k)))
+        summary['initialization'].update(reference_width_intervals=int(measured.sum()),
+            radial_fallback_width_intervals=int((~measured).sum()),width_prior='unchanged radial target')
     if benchmark_updates is not None:
         torch.cuda.synchronize()
         ms=([max(values) for values in zip(*(s['milliseconds'] for s in distributed_stats))]

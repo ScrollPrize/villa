@@ -1,7 +1,39 @@
 import numpy as np
+import json
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_reference_comparison import (
     landmarks,winding_at,palette,weighted_median,triangle_projection,assign_sources,inverse_u,
     surface_edges,discrete_winding)
+
+
+def test_reference_width_units_offsets_and_coverage(tmp_path):
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_reference_comparison import reference_interval_widths,reference_width_metrics
+    meta=tmp_path/'meta.json'
+    meta.write_text(json.dumps(dict(output_step_vx=20,winding_bounds=[
+        dict(winding=i,column_begin=a,column_end=b)
+        for i,a,b in ((0,0,12),(1,8,22),(2,18,42),(3,38,62))])))
+    cfg=dict(reference_widths=dict(meta=str(meta),xyz_scale=4))
+    # Landmarks .5,1.5,2.5 correspond to columns 10,20,40.
+    np.testing.assert_allclose(reference_interval_widths(cfg,[0,.5,1,1.5,2]),
+                               [np.nan,800,1200,1600,np.nan])
+    m=reference_width_metrics([800,1600,999],cfg,.5)
+    assert m['compared_windings']==2 and m['mean_normalized_factor']==1
+    assert m['mean_absolute_relative_error_percent']==0
+    assert reference_width_metrics([800],cfg,None)['compared_windings']==0
+
+
+def test_reference_width_initialization_preserves_radial_prior(tmp_path,monkeypatch):
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_uv_layout as uv
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_reference_comparison as ref
+    d=dict(radius=np.array([200.,300.]),family=np.array([0,1]),phase=np.zeros(2),node_ds=np.zeros((2,3)))
+    cfg=dict(winding_count=4,layout_mode='shared_anchor',reference_initialization='dummy',reference_width_initialization=True)
+    monkeypatch.setattr(ref,'reference_interval_widths',lambda c,k:np.array([np.nan,1200.,1600.,np.nan]))
+    monkeypatch.setattr(ref,'load_metric_projection',lambda *a:dict(chosen_winding=np.array([1.,2.])))
+    radial=uv.radial_initial_geometry(d,cfg)[1].copy()
+    state,widths=uv.fresh_initial_state(d,cfg)
+    np.testing.assert_allclose(widths[1:3],[1200,1600])
+    np.testing.assert_array_equal(widths[[0,3]],radial[[0,3]])
+    np.testing.assert_array_equal(uv.radial_initial_geometry(d,cfg)[1],radial)
+    np.testing.assert_array_equal(state[:,:4].argmax(1),[1,2])
 
 
 def test_landmarks_and_colors():

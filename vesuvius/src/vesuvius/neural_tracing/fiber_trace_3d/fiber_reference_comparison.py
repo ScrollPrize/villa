@@ -7,6 +7,7 @@ are approximated by triangles; this is deliberately a rough diagnostic.
 import csv
 import json
 import time
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -39,6 +40,36 @@ def winding_at(columns, x, q):
         raise ValueError('Need two landmarks to extrapolate')
     i = np.searchsorted(x, columns, side='right').clip(1, len(x)-1)-1
     return q[i] + (columns-x[i])*(q[i+1]-q[i])/(x[i+1]-x[i])
+
+
+@lru_cache(maxsize=8)
+def reference_width_map(meta_path, xyz_scale=4.):
+    """Reference U in base voxels, using the established winding landmarks."""
+    meta=json.loads(Path(meta_path).read_text())
+    x,q=landmarks(meta['winding_bounds'])
+    pitch=float(meta['output_step_vx'])*float(xyz_scale)
+    if not np.isfinite(pitch) or pitch<=0:raise ValueError('Invalid reference pitch')
+    return q,x*pitch
+
+
+def reference_interval_widths(config, winding_starts):
+    settings=config['reference_widths']
+    q,u=reference_width_map(str(settings['meta']),float(settings.get('xyz_scale',4.)))
+    starts=np.asarray(winding_starts,dtype=float)
+    valid=np.isfinite(starts)&(starts>=q[0])&(starts+1<=q[-1])
+    widths=winding_at(starts+1,q,u)-winding_at(starts,q,u)
+    return np.where(valid,widths,np.nan)
+
+
+def reference_width_metrics(widths,config,global_offset):
+    if global_offset is None:return dict(compared_windings=0,mean_normalized_factor=None)
+    reference=reference_interval_widths(config,np.arange(len(widths))+global_offset)
+    valid=np.isfinite(reference)&(reference>0)
+    ratio=np.asarray(widths)[valid]/reference[valid]
+    return dict(compared_windings=int(valid.sum()),global_offset=float(global_offset),
+        mean_normalized_factor=float(ratio.mean()) if len(ratio) else None,
+        mean_absolute_relative_error_percent=float(100*np.abs(ratio-1).mean()) if len(ratio) else None,
+        weighting='equal fully reference-supported winding intervals; fitted/reference')
 
 
 def palette(q, seed=20261011):
@@ -196,6 +227,8 @@ def reference_winding_metrics(d,state,widths,config,projection,geometry=None):
                   unmatched_retained_fibers=retained-result['matched_fibers'],
                   matched_source_percent=100*result['matched_fibers']/max(len(starts)-1,1),
                   weighting='equal original fibers; retained sample length median within each fiber')
+    if config.get('reference_widths'):
+        result['widths']=reference_width_metrics(widths,config,result['global_offset'])
     return result
 
 

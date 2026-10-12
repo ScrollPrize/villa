@@ -40,6 +40,17 @@ Both runs use same LR/globalbatch, only initialization differs.
 
 ## Spec/docs/validation
 
+Follow-up: add 0.1x state-LR runs (width LR remains2), report every10 passes.
+Reference-started runs also initialize widths from the reference winding-to-U
+map: invert the existing half-winding landmarks, then difference U(k+1)-U(k)
+in base voxels. Only fully supported intervals are measured; unmeasured widths
+retain radial initialization. Keep the width regularization target radial so
+this changes initialization, not the objective. Add mean fitted/reference width
+factor after the same global winding offset, using fully supported intervals;
+also mean absolute relative error to expose cancellation. No reference loss.
+Tests cover units, interval indexing, offset alignment, missing coverage and
+initialization versus unchanged prior. Independent review before runs.
+
 Metrics are unchanged; optimized backend can be compared to reference for audit.
 Independent plan/code review, unit tests + real-data equality and timings.
 Update README/status/changelog/tasklog and durable results with exactcommands.
