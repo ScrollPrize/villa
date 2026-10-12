@@ -5,7 +5,9 @@ import json
 import hashlib
 import os
 from pathlib import Path
+import re
 import sqlite3
+from urllib.parse import urlsplit
 
 import numpy as np
 
@@ -13,6 +15,49 @@ from vesuvius.neural_tracing.tracers.shared.annotations.repair import ANNOTATION
 from vesuvius.neural_tracing.tracers.shared.annotations.traced import TracedFiber
 from vesuvius.neural_tracing.tracers.shared.annotations.splits import heldout_ids
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at, dense_line
+
+
+AFV_APPLICATION_ID, AFV_USER_VERSION = 0x56434643, 1
+AFV_SCHEMA = (  # VC3D's Automated Fiber Volume format, version 1
+    'CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)',
+    '''CREATE TABLE fibers(id INTEGER PRIMARY KEY, name TEXT NOT NULL, family TEXT NOT NULL,
+ point_count INTEGER NOT NULL CHECK(point_count >= 2), length REAL NOT NULL,
+ min_x REAL NOT NULL, max_x REAL NOT NULL, min_y REAL NOT NULL, max_y REAL NOT NULL,
+ min_z REAL NOT NULL, max_z REAL NOT NULL, annotation TEXT NOT NULL)''',
+    '''CREATE TABLE blocks(id INTEGER PRIMARY KEY, fiber_id INTEGER NOT NULL REFERENCES fibers(id),
+ first_segment INTEGER NOT NULL, points BLOB NOT NULL, UNIQUE(fiber_id, first_segment))''',
+    'CREATE INDEX fibers_length ON fibers(length DESC, id)',
+    'CREATE VIRTUAL TABLE block_bounds USING rtree(id, min_x, max_x, min_y, max_y, min_z, max_z)')
+OPEN_DATA_BUCKET = 'vesuvius-challenge-open-data'
+OPEN_DATA_HTTPS = f'https://{OPEN_DATA_BUCKET}.s3.us-east-1.amazonaws.com'
+
+
+def open_data_volume(url):
+    """(sample, volume id, base voxel um, https path) of a Vesuvius open-data CT store
+    (``s3://vesuvius-challenge-open-data/SAMPLE/volumes/ID-2.400um-....zarr`` or its https form), else None."""
+    source = urlsplit(str(url).rstrip('/'))
+    if (source.scheme, source.netloc) not in (('s3', OPEN_DATA_BUCKET), ('https', urlsplit(OPEN_DATA_HTTPS).netloc)):
+        return None
+    parts = source.path.strip('/').split('/')
+    match = re.match(r'(\d+)-(\d+(?:\.\d+)?)um', parts[-1])
+    if len(parts) != 3 or parts[1] != 'volumes' or not match:
+        return None
+    return parts[0], match[1], float(match[2]), f'{OPEN_DATA_HTTPS}/{"/".join(parts)}'
+
+
+def open_data_frame(url, base_shape_zyx):
+    """AFV 'frame' and 'root' metadata of native L0 XYZ coordinates of an open-data CT store (``open_data_volume``),
+    as VC3D's fiber collection dock reads them; None for another store."""
+    volume = open_data_volume(url)
+    if volume is None:
+        return None
+    sample, volume_id, um, https = volume
+    tags = dict(vc_open_data_coordinate_space=f'{sample}/{volume_id}', vc_open_data_source_coordinate_level=0,
+                vc_open_data_source_coordinate_scale_factor=1)
+    root = dict(type='vc3d_fiber_collection', version=1, scale=1, **tags, coordinate_order='XYZ',
+                coordinate_units='voxel', voxel_size_mm=um/1000, vc_open_data_source_original_resolution=um,
+                coordinate_base_shape_zyx=[int(v) for v in base_shape_zyx], vc_open_data_source_path=https)
+    return dict(frame=tags, root=root)
 
 
 def file_sha256(path):
@@ -179,17 +224,21 @@ def write_afv(source, destination, fibers, metadata_updates, *, block_points=257
     counts recomputed) holding ``fibers``: (fibers row dict, native xyz polyline) pairs. Each polyline is stored in
     blocks of at most ``block_points`` points sharing their end points, each block with its R-tree bounds; the row's
     point count, length and bounds are recomputed. ``complete`` is written last. ``keep_metadata`` (keys) limits the
-    metadata taken from ``source``, e.g. to its coordinate frame for an unrelated collection; default all."""
+    metadata taken from ``source``, e.g. to its coordinate frame for an unrelated collection; default all. Without a
+    ``source`` (None), the format is AFV_SCHEMA and the metadata only ``metadata_updates`` (which then must give the
+    coordinate 'frame' and 'root', e.g. open_data_frame)."""
     destination = Path(destination)
     if destination.exists():
         raise FileExistsError(f'{destination} exists')
-    with sqlite3.connect(f'file:{Path(source).resolve()}?mode=ro', uri=True) as src:
-        schema = [sql for (sql,) in src.execute("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND "
-                                                  "name NOT LIKE 'block_bounds_%' AND type IN ('table','index')")]
-        pragmas = [src.execute(f'PRAGMA {p}').fetchone()[0] for p in ('application_id', 'user_version')]
-        metadata = {k: json.loads(v) for k, v in src.execute('SELECT key,value FROM metadata')
-                    if keep_metadata is None or k in keep_metadata}
-        columns = [r[1] for r in src.execute('PRAGMA table_info(fibers)')]
+    if source is None:
+        schema, pragmas, metadata = list(AFV_SCHEMA), [AFV_APPLICATION_ID, AFV_USER_VERSION], {}
+    else:
+        with sqlite3.connect(f'file:{Path(source).resolve()}?mode=ro', uri=True) as src:
+            schema = [sql for (sql,) in src.execute("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND "
+                                                      "name NOT LIKE 'block_bounds_%' AND type IN ('table','index')")]
+            pragmas = [src.execute(f'PRAGMA {p}').fetchone()[0] for p in ('application_id', 'user_version')]
+            metadata = {k: json.loads(v) for k, v in src.execute('SELECT key,value FROM metadata')
+                        if keep_metadata is None or k in keep_metadata}
     partial = destination.with_suffix('.partial.afv')
     partial.unlink(missing_ok=True)
     dst = sqlite3.connect(partial)
@@ -199,6 +248,7 @@ def write_afv(source, destination, fibers, metadata_updates, *, block_points=257
     dst.execute(f'PRAGMA user_version = {int(pragmas[1])}')
     for sql in schema:
         dst.execute(sql)
+    columns = [r[1] for r in dst.execute('PRAGMA table_info(fibers)')]
     fiber_rows, block_rows, bound_rows, points_total, block_id = [], [], [], 0, 0
     for row, xyz in fibers:
         xyz = np.ascontiguousarray(xyz, dtype='<f8')

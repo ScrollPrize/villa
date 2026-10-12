@@ -42,6 +42,7 @@ import numpy as np
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import ct_seed_heading, trace_heading
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import predict_frames, trace_family_kwargs
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import ct_frame
+from vesuvius.neural_tracing.tracers.fibers.tracing.runtime import add_volume_arguments
 from vesuvius.neural_tracing.tracers.fibers.tracing.volume import build_tracer
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength, normalize, resample_polyline
 from vesuvius.neural_tracing.tracers.shared.ct_structure import SeedHeadingError
@@ -63,9 +64,10 @@ class FiberFollow:
     def __init__(self, args):
         options = SimpleNamespace(
             checkpoint=args.checkpoint, device=args.device, precision=args.precision, confidence=args.confidence,
-            n_commit=None, gate=None, cache_dir=args.cache_dir, out=args.state_dir, max_len=8000.,
+            n_commit=None, gate=None, out=args.state_dir, max_len=8000.,
             forward_chunk=64, sampling_seed=0, crops='gpu' if args.device.startswith('cuda') else 'cpu',
-            gpu_chunks=args.gpu_chunks, axis_workers=0)
+            gpu_chunks=args.gpu_chunks, axis_workers=0,
+            **{k: getattr(args, k) for k in ('ct', 'ct_level', 'ct_grid_scale', 'grid_scale', 'cache_dir', 'frame_checkpoint')})
         Path(args.state_dir).mkdir(parents=True, exist_ok=True)
         self.tracer, self.vol, self.spec, self.policy = build_tracer(options)
         self.base_um = model_base_um(self.spec, args.base_um)
@@ -221,7 +223,7 @@ def main(argv=None):
     ap.add_argument('--confidence', type=float, default=0.5)
     ap.add_argument('--base-um', type=float, help='base voxel size of the checkpoint CT (default: from its location)')
     ap.add_argument('--gpu-chunks', type=int, default=512)
-    ap.add_argument('--cache-dir', help="CT chunk cache (default: the checkpoint's)")
+    add_volume_arguments(ap)
     ap.add_argument('--state-dir', default=str(Path.home()/'.cache'/'fiber_follow_service'),
                     help='CT normalization record')
     ARGS = ap.parse_args(argv)

@@ -36,11 +36,15 @@ parallel), so overlapping pieces of one fiber can be joined later.
 Outputs (OUT): tiles/TILE.npz (the pieces of the tile's dots in grid xyz, ids, seeds, families, stop reasons, links;
 written last, it marks the tile done), fibers/TILE/*.json (VC3D fibers in base coordinates; --no-json skips them),
 tiles.jsonl (one line per finished tile), progress.json, run.json; status lines on stdout; at the end fibers.afv,
-an Automated Fiber Volume of every fiber for VC3D (volume_afv.py; native L0 xyz, the frame of --afv-template). Rerunning with the same
-OUT resumes: finished tiles are kept (their fibers own their space), the rest are redone.
+an Automated Fiber Volume of every fiber for VC3D (volume_afv.py; native L0 xyz in the frame of the open-data CT, or
+of --afv-template). Rerunning with the same OUT resumes: finished tiles are kept (their fibers own their space), the
+rest are redone; settings that change the fibers must be the same.
 
   python -m vesuvius.neural_tracing.tracers.fibers.tracing.volume --checkpoint CKPT --presence PRESENCE_LEVEL \\
       --out OUT --ct-z 7000,17000 [--box x0,y0,z0,x1,y1,z1]
+
+CT, chunk cache and frame model: the checkpoint's, on this machine (tracing/runtime.py; --ct, --cache-dir,
+--frame-checkpoint).
 """
 from __future__ import annotations
 
@@ -63,10 +67,10 @@ from scipy.spatial import cKDTree
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import SEED_HEADING_POLICY, ct_seed_heading
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import trace_family_kwargs
 from vesuvius.neural_tracing.tracers.fibers.tracing.inference import make_fiber_json
+from vesuvius.neural_tracing.tracers.fibers.tracing.runtime import add_volume_arguments, configure_volume, use_gpu_crops
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer, TraceParams
-from vesuvius.neural_tracing.tracers.fibers.tracing.volume_afv import PARIS4_TEMPLATE, export_afv
+from vesuvius.neural_tracing.tracers.fibers.tracing.volume_afv import export_afv
 from vesuvius.neural_tracing.tracers.models.checkpoint import load_checkpoint
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.gpu import GPUChunkCache
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import prepare_normalization
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 from vesuvius.neural_tracing.tracers.shared.ct_structure import SeedHeadingError
@@ -412,8 +416,7 @@ def build_tracer(args):
     if args.precision == 'fp32':
         torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
     policy = checkpoint_policy(ck, model.cfg, confidence=args.confidence, n_commit=args.n_commit, gate=args.gate)
-    if args.cache_dir:
-        spec.cache_dir = args.cache_dir
+    configure_volume(args, spec, model.cfg)
     prepare_normalization(args.out, [spec], known=ck['ct_normalization'])
     vol = CTVolume(spec, cache_bytes=8 << 30)
     params = TraceParams.from_policy(policy, max_len=args.max_len, precision=args.precision,
@@ -426,15 +429,7 @@ def build_tracer(args):
         tracer.axis_pool = ProcessPoolExecutor(args.axis_workers, mp_context=multiprocessing.get_context('spawn'),
                                                initializer=_worker_init, initargs=(spec.to_dict(),))
     if args.crops == 'gpu':
-        cache = GPUChunkCache(vol, args.device, slots=args.gpu_chunks)
-        tracer.chunk_cache = cache
-        crops = lambda items, vol_, crop_, pool=None: cache.crops(items, vol_, crop_, pool)
-        tracer.observations.crop_images = crops
-        if tracer.frame_predictor is not None:
-            # The frame model on the GPU with GPU crops: a copy, the shared CPU predictor (data workers) is unchanged.
-            import copy
-            from vesuvius.neural_tracing.tracers.fibers.heading_model.model import HeadingPredictor
-            tracer.frame_predictor = HeadingPredictor(copy.deepcopy(tracer.frame_predictor.model), args.device, crops)
+        use_gpu_crops(tracer, vol, args.device, args.gpu_chunks)
     return tracer, vol, spec, policy
 
 
@@ -839,11 +834,12 @@ def main(argv=None):
                     help='worker processes reading the coming tiles\' seed dots ahead (0: read in the main process)')
     ap.add_argument('--tile-ahead', type=int, default=8, help='tiles with presence read ahead by the tile workers')
     ap.add_argument('--sampling-seed', type=int, default=0)
-    ap.add_argument('--cache-dir')
+    add_volume_arguments(ap)
     ap.add_argument('--no-json', dest='json', action='store_false')
-    ap.add_argument('--afv-template', default=str(PARIS4_TEMPLATE),
-                    help='.afv of the same scan: format and coordinate frame of OUT/fibers.afv, written at the end '
-                         '(volume_afv.py writes it any time from the finished tiles)')
+    ap.add_argument('--afv-template',
+                    help='.afv of the same scan: the coordinate frame of OUT/fibers.afv, written at the end (default: '
+                         "the frame of the CT, when a Vesuvius open-data store; volume_afv.py writes it any time from "
+                         'the finished tiles)')
     ap.add_argument('--no-afv', dest='afv', action='store_false')
     ap.add_argument('--status-every', type=float, default=60., help='seconds between status lines')
     ap.add_argument('--base-um', type=float, default=2.4, help='base voxel size for reported lengths (Paris4 2.4)')
@@ -868,14 +864,17 @@ def main(argv=None):
             z0, z1 = (float(v)*spec.ct_grid_scale/spec.grid_scale for v in args.ct_z.split(','))
             lo[2], hi[2] = z0, z1
     record = dict(vars(args), box=dict(lo=lo.tolist(), hi=hi.tolist()), operating_policy=policy.to_dict(),
-                  seed_heading_policy=SEED_HEADING_POLICY, grid_scale=spec.grid_scale)
+                  seed_heading_policy=SEED_HEADING_POLICY, grid_scale=spec.grid_scale, ct_zarr=spec.ct_zarr)
     run_json = out/'run.json'
     if run_json.exists():
         old = json.loads(run_json.read_text())
         # settings that only change speed or reporting may differ on resume
         speed_only = ('device', 'status_every', 'rows', 'min_feed', 'open_tiles', 'max_open', 'forward_chunk', 'gpu_chunks',
-                      'axis_workers', 'tile_workers', 'tile_ahead', 'afv', 'afv_template')  # speed or the end-of-run export only
-        changed = [k for k in record if k not in speed_only and old.get(k) != record[k]]
+                      'axis_workers', 'tile_workers', 'tile_ahead', 'afv', 'afv_template',  # speed or the end-of-run export
+                      'cache_dir', 'frame_checkpoint')  # locations (the frame model is pinned by its sha256)
+        derived = ('ct_zarr',)  # from the checkpoint and --ct (compared); absent from runs started before it was recorded
+        changed = [k for k in record if k not in speed_only and old.get(k) != record[k]
+                   and not (k in derived and k not in old)]
         if changed:
             raise SystemExit(f'{out} holds a run with different settings: {changed}')
     else:
