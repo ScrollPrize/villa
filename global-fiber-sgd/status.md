@@ -1,5 +1,12 @@
 # Reference-selected regional solve
 
+## Bucket topology / weaker position
+- [x] Plan, independent review and fixed integer seam correction.
+- [x] Implementation;56 focused and33 additional regression tests passed.
+- [x] Launch approved sixGPU fresh/ref10k suite (manager7b42a4cb).
+- [x] Both solves complete; compiled gradient checks and finite saved states.
+- [x] Full tables in uv_bucket_split_results.md; manager lease released.
+
 ## Recommended LR
 - [x] Record and independently review10x state LR default; explicit configs preserved.
 - [x] Validate14 class-balance/default tests. Width LR remains2.

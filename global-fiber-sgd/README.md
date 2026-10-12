@@ -1,5 +1,13 @@
 # Global fiber assignment with PyTorch SGD
 
+Current experiment: bucket-only topology (sign and squared winding separation)
+plus0.1x prior positional distance. Opt-in `bucket_position_split`, documented
+in [the plan](uv_bucket_split_plan.md). Fixed integer seam correction comes
+only from recorded geometry; learned phases/offsets/widths cannot alter sign.
+All existing phase/V/continuation priors and joint updates remain in place.
+Both10k runs completed: [full results](uv_bucket_split_results.md). Fresh is
+worse; reference accuracy similar with lower retention. Keep opt-in, not default.
+
 Latest: [balanced-objective 10x/0.1x state-LR comparison](uv_class_balance_lr_results.md).
 Four10k trials, full1kcheckpointtables includingwidths/ranges. The recommended
 default for future tests is state LR **0.07348469228349533** (10x), with width

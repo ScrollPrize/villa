@@ -1,5 +1,8 @@
 # Reference-selected regional solve
 
+Current: implement bucket-only sign/distance with0.1x old positional distance;
+run scratch/ref-init10k at high LR. See uv_bucket_split_plan.md.
+
 Current: adopt measured10x state LR as future default and discuss separate
 width-independent winding-index and weaker (0.1x) position losses.
 

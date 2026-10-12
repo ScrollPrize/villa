@@ -2,6 +2,11 @@
 
 ## 2026-10-12
 
+- Implemented opt-in bucket-only sign/distance with0.1x metric position loss,
+  immutable integer anchor/endpoint seam correction, consistent sign audits,
+  regression tests and sixGPU compiled-gradient validation. New experiments
+  preserve prior configurations and shared-phase/offset/V/continuation terms.
+
 - Adopt state LR0.07348469228349533 (measured10x) for future UV tests and
   omitted-LR solver configs; width LR2 unchanged, historical configs preserved.
   High LR achieves substantially lower objective loss for both initializations;

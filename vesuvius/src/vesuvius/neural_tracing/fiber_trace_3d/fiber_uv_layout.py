@@ -428,12 +428,49 @@ def local_winding_window(p,q,v,radius):
     return local,q.gather(1,ids),v.gather(1,ids),selected/total.clamp_min(1e-30)
 
 
+def bucket_event_shift(d):
+    """Fixed integer seam/endpoint correction for anchor-relative buckets.
+
+    node_phase at the start is the original unwrapped anchor angle. Stored
+    phase is its fractional part. No fitted coordinates or widths enter.
+    """
+    anchor_turn=np.rint(d['node_phase'][:,0].astype(np.float64)-d['phase'])
+    a=d['phase_a'].astype(np.float64)-anchor_turn[d['i']]
+    b=d['phase_b'].astype(np.float64)-anchor_turn[d['j']]
+    return np.rint(b-a-d['phase_delta']).astype(np.float32)
+
+
 def pair_objective(pa,pb,qa,qb,va,vb,phase_delta,family_delta,sign,mu,table,config,
-                   charge=None,event_weights=None,selected_ordered=None):
+                   charge=None,event_weights=None,selected_ordered=None,bucket_shift=None):
     """Legacy posterior objective, optionally with selected-sign safeguard."""
     import torch
     mode=config.get('distance_objective','likelihood')
     radius=config.get('local_window_radius')
+    if config.get('bucket_position_split',False):
+        if mode!='squared' or not anchored(config) or radius is not None:
+            raise ValueError('Bucket position split requires squared shared-anchor full hypotheses')
+        weight=float(config.get('position_distance_weight',.1))
+        if not math.isfinite(weight) or weight<0:
+            raise ValueError('position_distance_weight must be finite and nonnegative')
+        sigma=float(config.get('distance_sigma',.5))
+        if not math.isfinite(sigma) or sigma<=0:raise ValueError('distance_sigma must be finite and positive')
+        ka=torch.arange(pa.shape[1],device=pa.device,dtype=qa.dtype)
+        kb=torch.arange(pb.shape[1],device=pb.device,dtype=qb.dtype)
+        delta=kb[None,None,:]-ka[None,:,None]+.5*family_delta[:,None,None]
+        if bucket_shift is not None:delta=delta+bucket_shift[:,None,None]
+        ordered=sign[:,None,None]*delta
+        distance=torch.where((sign!=0)[:,None,None],ordered,delta.abs())
+        topology=.5*((distance-mu[:,None,None])/sigma).square()
+        pos_delta,pos_ordered,_,metric=pair_geometry(qa,qb,va,vb,phase_delta,family_delta,sign,config)
+        pos_distance=torch.where((sign!=0)[:,None,None],pos_ordered,pos_delta.abs())
+        position=.5*((pos_distance-mu[:,None,None])/sigma).square()
+        mass=pa[:,:,None]*pb[:,None,:]
+        terms=(mass*(config.get('distance_weight',1.)*(topology+weight*position)+
+                     config.get('sign_weight',10.)*4*torch.relu(-ordered)+metric)).sum((1,2))
+        # Select from this same bucket matrix; coordinate-selected signs are irrelevant.
+        if charge is not None:terms=terms+fixed_sign_terms(pa,pb,ordered,charge)
+        if event_weights is not None:terms=terms*event_weights
+        return terms.mean()
     if radius is not None:
         if not isinstance(radius,int) or radius<0:raise ValueError('Invalid local_window_radius')
         if mode!='squared' or charge is not None:
@@ -612,11 +649,15 @@ def geometry_points(d,u,v,b,widths,ids,ds):
     return bucket+(val-b[bucket])/widths[bucket],v[ids]+(d['family'][ids]==1)*ds
 
 
-def edge_readout(d,geometry,widths,e):
-    _,_,keep,_,u,v,b=geometry;i=d['i'][e];j=d['j'][e]
+def edge_readout(d,geometry,widths,e,config=None):
+    _,_,keep,pick,u,v,b=geometry;i=d['i'][e];j=d['j'][e]
     qa,_=geometry_points(d,u,v,b,widths,i,d['ds_a'][e])
     qb,_=geometry_points(d,u,v,b,widths,j,d['ds_b'][e])
     delta=qb-qa-d['phase_delta'][e]+.5*(d['family'][j]-d['family'][i])
+    if config is not None and config.get('bucket_position_split',False):
+        shift=d.get('bucket_shift')
+        if shift is None:shift=bucket_event_shift(d)
+        delta=pick[j]-pick[i]+shift[e]+.5*(d['family'][j]-d['family'][i])
     return qa,qb,delta,keep[i]&keep[j]
 
 
@@ -624,7 +665,7 @@ def violation_indices(d,state,widths,config):
     geometry=hard_geometry(d,state,widths,config);found=[]
     for start in range(0,len(d['i']),131072):
         e=np.arange(start,min(start+131072,len(d['i'])))
-        _,_,delta,active=edge_readout(d,geometry,widths,e)
+        _,_,delta,active=edge_readout(d,geometry,widths,e,config)
         wrong=active&(d['sign'][e]!=0)&(delta*d['sign'][e]<-config.get('sign_tolerance',1e-4))
         found.append(e[wrong])
     return np.concatenate(found)
@@ -635,7 +676,7 @@ def audit(d, state, widths, config, indices=None, geometry=None):
     if geometry is None:geometry=hard_geometry(d,state,widths,config)
     p,labels,keep,pick,u,v,b=geometry;k=len(widths)
     if config.get('broken_threshold') is not None:state=state.astype(np.float64,copy=False)
-    extra={}
+    extra={'sign_geometry': 'bucket' if config.get('bucket_position_split',False) else 'position'}
     if config.get('local_window_radius') is not None:
         radius=config['local_window_radius'];center=p[:,:k].argmax(1)
         mass=p[:,:k].sum(1);selected=np.zeros(len(p),dtype=np.float64)
@@ -669,7 +710,7 @@ def audit(d, state, widths, config, indices=None, geometry=None):
     total=known=bad=retained=0;errors=[];bytype={};minq=np.inf;maxq=-np.inf
     for a in range(0,len(sel),131072):
         e=sel[a:a+131072];i=d['i'][e];j=d['j'][e]
-        qa,qb,delta,active=edge_readout(d,geometry,widths,e)
+        qa,qb,delta,active=edge_readout(d,geometry,widths,e,config)
         minq=min(minq,qa.min(),qb.min());maxq=max(maxq,qa.max(),qb.max())
         ks=(d['sign'][e]!=0)&active
         wrong=(delta*d['sign'][e]<-config.get('sign_tolerance',1e-4))&ks
@@ -847,6 +888,8 @@ class FullPassGradientAccumulator:
 
 
 def solve(config):
+    if config.get('bucket_position_split',False) and config.get('assignment_update')=='cost_target':
+        raise ValueError('Bucket position split is not supported by cost_target updates')
     if config.get('distributed_suite'):
         from .fiber_uv_distributed import launch_suite
         return launch_suite(config)
@@ -883,6 +926,9 @@ def solve(config):
         torch.manual_seed(config.get('seed',0))
     with np.load(config['tensor_cache']) as archive:d={key:archive[key] for key in archive.files}
     device=f'cuda:{rank}';data=_tensor_data(d,device)
+    if config.get('bucket_position_split',False):
+        d['bucket_shift']=bucket_event_shift(d)
+        data['bucket_shift']=torch.as_tensor(d['bucket_shift'],device=device)
     class_weights=constraint_class_weights(d['parallel'],config)
     class_weights_device=torch.as_tensor(class_weights,device=device)
     generator=(torch.Generator(device=device).manual_seed(config.get('seed',0))
@@ -1050,12 +1096,14 @@ def solve(config):
                 charge=calibrated_sign_charge(data['degree'][i],data['degree'][j],data['degree'].mean(),
                     len(d['i']),n,config.get('rejection_cost',10.),config['sign_charge_multiplier'],
                     config.get('rejection_weighting','fixed'))
-                selected=selected_ordering(embedding(i),embedding(j),phase64[i],phase64[j],z64[i],z64[j],
-                    data['family'][i],data['family'][j],precise['ds_a'][edges],precise['ds_b'][edges],widths,
-                    precise['phase_delta'][edges],data['sign'][edges])
+                if not config.get('bucket_position_split',False):
+                    selected=selected_ordering(embedding(i),embedding(j),phase64[i],phase64[j],z64[i],z64[j],
+                        data['family'][i],data['family'][j],precise['ds_a'][edges],precise['ds_b'][edges],widths,
+                        precise['phase_delta'][edges],data['sign'][edges])
             if benchmark_updates is not None:pair_start=timing_marker()
             pair=evaluate_pair(pa[:,:k],pb[:,:k],qa,qb,va,vb,data['phase_delta'][edges],data['family'][j]-data['family'][i],
-                data['sign'][edges],data['distance'][edges],table,config,charge,event_weights,selected)
+                data['sign'][edges],data['distance'][edges],table,config,charge,event_weights,selected,
+                data['bucket_shift'][edges] if config.get('bucket_position_split',False) else None)
             if benchmark_updates is not None:pair_end=timing_marker()
             for pp,qq,phase_key in ((pa,qa,'phase_a'),(pb,qb,'phase_b')):
                 angle=qq-data[phase_key][edges,None];angle=angle-angle.detach().round()
@@ -1283,7 +1331,7 @@ def report(config):
             disabled=~(keep[i]&keep[j]);stats['original_violations_disabled']=int(disabled.sum())
             stats['original_violations_corrected_while_retained']=int((~disabled).sum()-len(np.intersect1d(before,after)))
             if len(after):
-                _,_,delta,_=edge_readout(d,geometry,s['widths'],after)
+                _,_,delta,_=edge_readout(d,geometry,s['widths'],after,cfg)
                 stats['remaining_violation_magnitude_quantiles']=np.quantile(-delta*d['sign'][after],[0,.5,.95,1]).tolist()
                 stats['remaining_max_endpoint_broken_probability_quantiles']=np.quantile(
                     np.maximum(p[d['i'][after],-1],p[d['j'][after],-1]),[0,.5,.95,1]).tolist()

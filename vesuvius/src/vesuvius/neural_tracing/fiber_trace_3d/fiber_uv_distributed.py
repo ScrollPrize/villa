@@ -113,7 +113,8 @@ def validate_joint_gradient(config,rank,world,device=None):
         evaluator=evaluate if compiled else uv.pair_objective
         return evaluator(pa,pb,qa,qb,va,vb,phase[ib]-phase[ia],families[ib]-families[ia],
             torch.ones_like(phase[ia]),torch.ones_like(phase[ia]),table,cfg,charge,
-            event_weights[sel],selected)+.01*uv.continuation_likelihood(pa,pb,ua,ub,va,vb,128.)
+            event_weights[sel],selected,
+            ((ia%3)-1).float() if cfg.get('bucket_position_split',False) else None)+.01*uv.continuation_likelihood(pa,pb,ua,ub,va,vb,128.)
     loss(weight,raw,shard(torch.arange(b,device=device),rank,world),True).backward()
     reducer.reduce(weight.weight,raw)
     loss(reference,rraw,torch.arange(b,device=device)).backward()
