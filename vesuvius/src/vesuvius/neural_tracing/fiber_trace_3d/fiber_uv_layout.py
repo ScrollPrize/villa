@@ -1115,6 +1115,8 @@ def solve(config):
     summary['diagnostic_timing']=dict(baseline_seconds=baseline_seconds,records=diagnostic_times,
         total_seconds=baseline_seconds+sum(row['total_seconds'] for row in diagnostic_times),
         workers=diagnostic_workers,wait_seconds=diagnostic_queue.wait_seconds if diagnostic_queue else None,
+        peak_running=diagnostic_queue.peak_running if diagnostic_queue else 1,
+        max_pending=diagnostic_queue.max_pending if diagnostic_queue else 0,
         note='Aggregate work; async CPU diagnostics overlap each other and optimization, not additive walltime')
     summary['solve_wall_seconds']=time.monotonic()-started
     atomic_write(root/'summary.json',summary,durable=False)

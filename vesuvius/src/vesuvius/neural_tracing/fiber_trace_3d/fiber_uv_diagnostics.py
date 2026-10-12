@@ -1,6 +1,7 @@
 """Bounded, ordered CPU diagnostics over immutable optimizer snapshots."""
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 import time
 
 
@@ -10,6 +11,14 @@ class OrderedDiagnostics:
         self.executor=ThreadPoolExecutor(max_workers=workers,thread_name_prefix='uv-audit')
         self.pending=deque();self.limit=workers;self.publish=publish
         self.wait_seconds=0.
+        self.lock=Lock();self.running=0;self.peak_running=0;self.max_pending=0
+
+    def _execute(self,fn,args):
+        with self.lock:
+            self.running+=1;self.peak_running=max(self.peak_running,self.running)
+        try:return fn(*args)
+        finally:
+            with self.lock:self.running-=1
 
     def _drain_one(self):
         started=time.monotonic()
@@ -23,7 +32,8 @@ class OrderedDiagnostics:
 
     def submit(self, fn, *args):
         self.reserve()
-        self.pending.append(self.executor.submit(fn,*args))
+        self.pending.append(self.executor.submit(self._execute,fn,args))
+        self.max_pending=max(self.max_pending,len(self.pending))
 
     def shutdown(self):
         self.executor.shutdown(wait=True,cancel_futures=True)

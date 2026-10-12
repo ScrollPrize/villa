@@ -243,4 +243,3 @@ reference winding L1 / within-two metrics after global median offset correction.
   ten-pass walltime152.74s→34.85s; all12 checkpoint metrics and final arrays exact.
   CPU/GPUgradient preflights and97 targeted tests pass. Full results/commands in
   uv_coordinate_results.md,uv_distributed_results.md,uv_diagnostics_results.md.
-

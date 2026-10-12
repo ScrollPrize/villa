@@ -23,6 +23,8 @@ def test_ordered_bounded_publication():
         queue.close()
     finally:queue.shutdown()
     assert published==[0,1,2]
+    assert queue.peak_running==2
+    assert queue.max_pending<=2
 
 
 def test_worker_error_propagates():
