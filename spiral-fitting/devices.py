@@ -7,13 +7,16 @@ FIT_SPIRAL_DEVICE=cuda|mps|cpu overrides the choice.
 MPS has no float64. Code that wants a float64 device tensor asks float_hi()
 for the dtype instead: float64 on CUDA and the CPU, float32 on MPS.
 FIT_SPIRAL_MAX_PRECISION_FLOAT=32 caps it at float32 on every device, so a
-CPU run can use the same precision as an MPS one. This is the switch
+CPU run can use the same precision as an MPS one. It is read and checked
+once, when fit_device() picks the device, so a bad value fails before any
+input loads. This is the switch
 lasagna/dtypes.py has (villa PR #1639), except that the default here keeps
 float64 wherever the device supports it.
 
 scatter_reduce_() stands in for the int64 amax/amin scatter MPS also lacks.
 """
 
+import functools
 import os
 
 import torch
@@ -28,6 +31,7 @@ def fit_device(requested=None):
     CUDA comes back as the bare 'cuda' device, so the current device a
     distributed driver selected still applies.
     """
+    max_precision_bits()
     name = str(requested or os.environ.get('FIT_SPIRAL_DEVICE') or '').strip().lower()
     if not name:
         if torch.cuda.is_available():
@@ -45,14 +49,20 @@ def fit_device(requested=None):
     return torch.device(name)
 
 
-def float_hi(device=None):
-    """The high-precision float dtype for tensors on ``device`` (None is
-    torch's default device, the CPU)."""
+@functools.cache
+def max_precision_bits():
+    """$FIT_SPIRAL_MAX_PRECISION_FLOAT as 32 or 64, read once per process."""
     bits = os.environ.get('FIT_SPIRAL_MAX_PRECISION_FLOAT', '64').strip()
     if bits not in ('32', '64'):
         raise ValueError(
             f'FIT_SPIRAL_MAX_PRECISION_FLOAT must be 32 or 64, got {bits!r}')
-    if bits == '32' or (device is not None and torch.device(device).type == 'mps'):
+    return int(bits)
+
+
+def float_hi(device=None):
+    """The high-precision float dtype for tensors on ``device`` (None is
+    torch's default device, the CPU)."""
+    if max_precision_bits() == 32 or (device is not None and torch.device(device).type == 'mps'):
         return torch.float32
     return torch.float64
 

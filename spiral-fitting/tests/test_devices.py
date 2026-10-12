@@ -5,6 +5,14 @@ import devices
 from spiral_helpers import _segmented_median_per_strip
 
 
+@pytest.fixture(autouse=True)
+def _fresh_precision_setting():
+    # max_precision_bits() reads its environment variable once per process.
+    devices.max_precision_bits.cache_clear()
+    yield
+    devices.max_precision_bits.cache_clear()
+
+
 def test_device_order_is_cuda_then_mps_then_cpu(monkeypatch):
     monkeypatch.delenv('FIT_SPIRAL_DEVICE', raising=False)
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
@@ -35,10 +43,26 @@ def test_float_hi_is_float64_except_on_mps(monkeypatch):
     assert devices.float_hi() == torch.float64
     assert devices.float_hi('mps') == torch.float32
     monkeypatch.setenv('FIT_SPIRAL_MAX_PRECISION_FLOAT', '32')
+    devices.max_precision_bits.cache_clear()
     assert devices.float_hi('cuda') == torch.float32
     monkeypatch.setenv('FIT_SPIRAL_MAX_PRECISION_FLOAT', '16')
+    devices.max_precision_bits.cache_clear()
     with pytest.raises(ValueError):
         devices.float_hi('cpu')
+
+
+def test_precision_setting_is_checked_when_the_device_is_chosen(monkeypatch):
+    # A bad value fails at startup, where the fit picks its device, not at
+    # the first optimizer step after the inputs have loaded.
+    monkeypatch.setenv('FIT_SPIRAL_MAX_PRECISION_FLOAT', '16')
+    with pytest.raises(ValueError, match='must be 32 or 64'):
+        devices.fit_device('cpu')
+    # Read once: later changes to the variable do not reach a running fit.
+    monkeypatch.setenv('FIT_SPIRAL_MAX_PRECISION_FLOAT', '32')
+    devices.max_precision_bits.cache_clear()
+    assert devices.float_hi('cpu') == torch.float32
+    monkeypatch.setenv('FIT_SPIRAL_MAX_PRECISION_FLOAT', '64')
+    assert devices.float_hi('cpu') == torch.float32
 
 
 def _strip_context(device):
@@ -65,12 +89,15 @@ def _reference_medians(ctx):
     return torch.stack(medians)
 
 
-def test_segmented_median_without_float64_matches_per_strip_sort(monkeypatch):
+def test_both_segmented_median_sorts_match_per_strip_sort(monkeypatch):
+    # The float64 composite key (CPU, CUDA) and the two-pass sort (MPS, or
+    # FIT_SPIRAL_MAX_PRECISION_FLOAT=32) on the same strips.
     ctx = _strip_context('cpu')
     expected = _reference_medians(ctx)
     monkeypatch.delenv('FIT_SPIRAL_MAX_PRECISION_FLOAT', raising=False)
     assert torch.equal(_segmented_median_per_strip(ctx), expected)
     monkeypatch.setenv('FIT_SPIRAL_MAX_PRECISION_FLOAT', '32')
+    devices.max_precision_bits.cache_clear()
     assert torch.equal(_segmented_median_per_strip(ctx), expected)
 
 
@@ -108,3 +135,120 @@ def test_patch_atlas_upload_on_mps_survives_freed_staging(monkeypatch):
         atlas = fit_spiral.PatchAtlas(patches, device='mps').materialize()
         torch.mps.synchronize()
         assert torch.equal(atlas.zyxs_flat.cpu(), expected)
+
+
+@pytest.mark.parametrize('override,backend', [(None, 'nccl'), ('cpu', 'gloo')])
+def test_ddp_backend_follows_the_fit_device(monkeypatch, override, backend):
+    import ddp_helpers
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
+    if override is None:
+        monkeypatch.delenv('FIT_SPIRAL_DEVICE', raising=False)
+    else:
+        monkeypatch.setenv('FIT_SPIRAL_DEVICE', override)
+    calls = {}
+    monkeypatch.setattr(torch.cuda, 'set_device', lambda rank: calls.setdefault('set_device', rank))
+    monkeypatch.setattr(ddp_helpers.dist, 'init_process_group',
+                        lambda **kwargs: calls.setdefault('backend', kwargs['backend']))
+    monkeypatch.setattr(ddp_helpers.dist, 'barrier', lambda **kwargs: None)
+    try:
+        ddp_helpers.maybe_init_distributed(ddp_helpers.DistributedContext(rank=0, world_size=2))
+    finally:
+        ddp_helpers.set_process_context(ddp_helpers.SINGLE_PROCESS)
+    assert calls['backend'] == backend
+    assert ('set_device' in calls) == (backend == 'nccl')
+
+
+def test_prefetcher_is_used_only_for_a_cuda_patch_atlas(monkeypatch):
+    # FIT_SPIRAL_PREFETCH=1 with FIT_SPIRAL_DEVICE=cpu on a CUDA machine: the
+    # prefetcher's CUDA streams must not be built for CPU tensors.
+    import types
+    import numpy as np
+    import losses
+    import prefetch
+    from fit_spiral import PatchAtlas
+    from theta_crossing_map import ThetaCrossingMap
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
+    monkeypatch.setenv('FIT_SPIRAL_PREFETCH', '1')
+
+    def no_prefetcher():
+        raise AssertionError('prefetcher used for a non-CUDA patch atlas')
+    monkeypatch.setattr(prefetch, 'get_prefetcher', no_prefetcher)
+
+    def fake_patch(seed):
+        generator = torch.Generator().manual_seed(seed)
+        return types.SimpleNamespace(
+            zyxs=torch.rand(8, 8, 3, generator=generator) * 100.,
+            _sampling_valid_quad_mask_np=np.ones((7, 7), dtype=bool),
+            _sampling_2d_path=None)
+    patches = {f'p{n}': fake_patch(30 + n) for n in range(3)}
+    atlas = PatchAtlas(patches, device='cpu').materialize()
+    crossing_map = ThetaCrossingMap('cpu')
+    atlas.register_theta_topology(crossing_map)
+    crossing_map.force_refresh(lambda value: value)
+    _, _, zyxs, _, mask = losses._sample_patch_batch(
+        'cpu_atlas', list(patches.values()), np.full(3, 1 / 3), num_to_sample=4,
+        point_cap=6, cfg={}, patch_atlas=atlas, crossing_map=crossing_map)
+    assert tuple(zyxs.shape) == (4, 6, 3) and zyxs.device.type == 'cpu'
+    assert bool(mask.all())
+
+
+@pytest.mark.parametrize('device', ['cpu', 'mps'])
+def test_ink_metric_folds_take_turns_off_cuda(monkeypatch, tmp_path, device):
+    # Off CUDA every fold would share one device, so they must not all start
+    # at once, and the workers get no CUDA_VISIBLE_DEVICES.
+    import numpy as np
+    from PIL import Image
+    import get_ink_metrics
+    if device == 'mps':
+        monkeypatch.setattr(torch.backends.mps, 'is_available', lambda: True)
+    ink = tmp_path / 'ink'
+    ink.mkdir()
+    Image.fromarray(np.zeros((8, 16), np.uint8)).save(ink / 'w000-005_flat.jpg')
+    model = tmp_path / 'model'
+    for fold in range(3):
+        (model / f'fold_{fold}').mkdir(parents=True)
+    monkeypatch.delenv('CUDA_VISIBLE_DEVICES', raising=False)
+    launched = []
+
+    class FakeWorker:
+        def __init__(self, cmd, env, **kwargs):
+            assert all(worker.done for worker in launched), 'two folds ran at once'
+            launched.append(self)
+            self.cmd, self.env, self.done = cmd, env, False
+
+        def wait(self):
+            self.done = True
+            return 0
+
+    class Stop(Exception):
+        pass
+
+    def stop(*args):
+        raise Stop
+    monkeypatch.setattr(get_ink_metrics.subprocess, 'Popen', FakeWorker)
+    monkeypatch.setattr(get_ink_metrics, 'load_fold_prob', stop)
+    with pytest.raises(Stop):
+        get_ink_metrics.run_main([str(ink), '--model', str(model), '--device', device,
+                                  '--output', str(tmp_path / 'out')])
+    assert len(launched) == 3
+    for worker in launched:
+        assert 'CUDA_VISIBLE_DEVICES' not in worker.env
+        assert worker.cmd[worker.cmd.index('--device') + 1] == device
+
+
+@pytest.mark.parametrize('device', [
+    'cpu', pytest.param('mps', marks=pytest.mark.skipif(
+        not torch.backends.mps.is_available(), reason='needs MPS'))])
+def test_smoothing_kernel_agrees_with_the_startup_report(monkeypatch, device):
+    # Near sigma ~ 0.17 the kernel's centre weight crosses the 1 - 1e-7
+    # "is it a delta" test; a float32 build of the kernel decides some of
+    # these sigmas differently from the float64 startup report.
+    from flow_grad_smoothing import gaussian_kernel
+    monkeypatch.setenv('FIT_SPIRAL_MAX_PRECISION_FLOAT', '32')
+    devices.max_precision_bits.cache_clear()
+    for sigma in torch.linspace(0.170, 0.176, 601, dtype=torch.float64).tolist():
+        report = gaussian_kernel(sigma, dtype=torch.float64)
+        fit = gaussian_kernel(sigma, torch.device(device), torch.float32)
+        assert (report is None) == (fit is None), sigma
+        if fit is not None:
+            assert torch.equal(fit.cpu(), report.float())

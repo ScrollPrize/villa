@@ -1970,7 +1970,7 @@ class FitContext:
 
     def check_cuda_ready(self):
         """Create the CUDA context before input reads increase host cache pressure."""
-        if getattr(self, 'device', torch.device('cuda')).type != 'cuda':
+        if self.device.type != 'cuda':
             return
         progress_or_null(self.progress).begin('loading', 'Checking CUDA availability')
         try:

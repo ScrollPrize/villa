@@ -20,6 +20,8 @@ import os
 import torch
 import torch.distributed as dist
 
+from devices import fit_device
+
 
 # Bounded process-group timeout for collectives. The first collective
 # (broadcast_model_params) runs after slow, per-rank startup work, so the
@@ -145,7 +147,9 @@ def maybe_init_distributed(context=None, *, rendezvous=None,
     if not context.is_distributed:
         return context
     if backend is None:
-        backend = 'nccl' if torch.cuda.is_available() else 'gloo'
+        # The fit device, not CUDA's presence: FIT_SPIRAL_DEVICE=cpu on a CUDA
+        # machine keeps every tensor on the CPU, which NCCL cannot reduce.
+        backend = 'nccl' if fit_device().type == 'cuda' else 'gloo'
     if backend == 'nccl':
         torch.cuda.set_device(context.local_rank)
     if timeout_minutes is None:

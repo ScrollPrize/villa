@@ -25,7 +25,6 @@ import torch
 import torch.nn.functional as F
 
 import flow_triton
-from devices import float_hi
 
 # Truncation radius of the Gaussian, in standard deviations.
 KERNEL_TRUNCATE = 3.0
@@ -175,12 +174,14 @@ def gaussian_kernel(sigma_cells, device=None, dtype=torch.float32):
     radius = int(math.ceil(KERNEL_TRUNCATE * sigma))
     if radius < 1:
         return None
-    offsets = torch.arange(-radius, radius + 1, dtype=float_hi(device), device=device)
+    # Built in float64 on the CPU (MPS has no float64), so the identity test
+    # below agrees exactly with the startup report on every device.
+    offsets = torch.arange(-radius, radius + 1, dtype=torch.float64)
     kernel = torch.exp(-0.5 * (offsets / sigma) ** 2)
     kernel = kernel / kernel.sum()
     if float(kernel[radius]) >= 1.0 - 1e-7:
         return None
-    return kernel.to(dtype)
+    return kernel.to(device=device, dtype=dtype)
 
 
 def _border_norm(length, kernel, device, dtype):

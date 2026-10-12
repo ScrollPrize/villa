@@ -514,14 +514,22 @@ def run_main(argv):
     folds = [int(x) for x in args.folds.split(',')] if args.folds else detect_folds(model_dir)
     if not folds:
         ap.error(f'no folds found in {model_dir}')
-    gpus = [g.strip() for g in args.gpus.split(',')] if args.gpus else detect_gpus()
     from devices import fit_device
     device = fit_device(args.device).type
+    if device == 'cuda':
+        gpus = [g.strip() for g in args.gpus.split(',')] if args.gpus else detect_gpus()
+        slots = [f'GPU {gpu}' for gpu in gpus]
+        sequential = args.sequential_folds
+    else:
+        # Every fold would share the one device (on a Mac, one unified memory
+        # pool), so the folds take turns instead of all loading at once.
+        gpus, slots, sequential = [], [device], True
 
     print(f'ink_dir : {ink_dir}')
     print(f'strip   : {name}  ({len(tiles)} tile(s) concatenated)')
     print(f'model   : {args.model}' + (f' ({model_dir})' if model_dir != args.model else ''))
-    print(f'folds   : {folds}   gpus: {gpus}   checkpoint: {args.checkpoint}')
+    on = f'gpus: {gpus}' if device == 'cuda' else f'device: {device}, one fold at a time'
+    print(f'folds   : {folds}   {on}   checkpoint: {args.checkpoint}')
     print(f'output  : {out_dir}')
 
     # 1. Stage the strip as the nnU-Net input: concatenate its tiles into one wide
@@ -539,11 +547,12 @@ def run_main(argv):
     log_dir = os.path.join(work_dir, 'logs')
     os.makedirs(log_dir, exist_ok=True)
     for i, fold in enumerate(folds):
-        gpu = gpus[i % len(gpus)]
+        slot = slots[i % len(slots)]
         fold_out[fold] = os.path.join(work_dir, f'pred_fold_{fold}')
         os.makedirs(fold_out[fold], exist_ok=True)
         env = os.environ.copy()
-        env['CUDA_VISIBLE_DEVICES'] = str(gpu)
+        if device == 'cuda':
+            env['CUDA_VISIBLE_DEVICES'] = str(gpus[i % len(gpus)])
         set_nnunet_env()
         for k in ('nnUNet_raw', 'nnUNet_preprocessed', 'nnUNet_results'):
             env[k] = os.environ[k]
@@ -554,17 +563,17 @@ def run_main(argv):
         if args.no_tta:
             cmd.append('--no-tta')
         logf = open(os.path.join(log_dir, f'fold_{fold}.log'), 'w')
-        print(f'  launching fold {fold} on GPU {gpu} -> {os.path.basename(fold_out[fold])}')
-        procs.append((fold, gpu, subprocess.Popen(cmd, env=env, stdout=logf, stderr=subprocess.STDOUT), logf))
-        if args.sequential_folds:
+        print(f'  launching fold {fold} on {slot} -> {os.path.basename(fold_out[fold])}')
+        procs.append((fold, slot, subprocess.Popen(cmd, env=env, stdout=logf, stderr=subprocess.STDOUT), logf))
+        if sequential:
             procs[-1][2].wait()
 
     failed = []
-    for fold, gpu, proc, logf in procs:
+    for fold, slot, proc, logf in procs:
         rc = proc.wait()
         logf.close()
         status = 'ok' if rc == 0 else f'FAILED (rc={rc})'
-        print(f'  fold {fold} (GPU {gpu}) {status}')
+        print(f'  fold {fold} ({slot}) {status}')
         if rc != 0:
             failed.append(fold)
         if rc == -9:
