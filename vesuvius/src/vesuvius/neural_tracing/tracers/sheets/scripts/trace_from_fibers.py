@@ -9,7 +9,9 @@ point lies in the sheet, perpendicular to the fiber: sheet normal (2/8 CT struct
 the fiber tracer estimates normals) x fiber tangent, oriented ``--direction`` (up = +z, down, or both). Seeds whose
 points lie outside the volume or on empty CT are skipped. Each trace runs ``--steps`` steps without early stop (like
 the trace benchmark), and is written as ``OUT/fiber_FILESTEM_cpK_up|down`` tifxyz (kept points only; ``trace.json``
-provenance, ``confidence.npy``, area in meta.json). With ``--follow`` each trace also writes the fiber it extends
+provenance, ``confidence.npy``, area in meta.json); with ``--direction both`` the two are one tifxyz
+``OUT/fiber_FILESTEM_cpK`` (``tracing.inference.write_two_way_trace``: the down rows reversed, the seed row, the up
+rows). With ``--follow`` each trace also writes the fiber it extends
 as a VC3D fiber JSON to ``OUT/fibers/`` (``extended_fiber``).
 
   python scripts/trace_from_fibers.py --fibers ~/Desktop/spiral_dataset/fibers --checkpoint CKPT --out TRACES \\
@@ -33,7 +35,8 @@ from vesuvius.neural_tracing.tracers.shared.ct_structure import CT_CONTEXT_RADIU
 from vesuvius.neural_tracing.tracers.sheets import config as C
 from vesuvius.neural_tracing.tracers.sheets.checkpoint import load_checkpoint
 from vesuvius.neural_tracing.tracers.sheets.data.fibers import episode_fibers, fiber_pool
-from vesuvius.neural_tracing.tracers.sheets.tracing.inference import connected_keep, resample, trace, write_trace
+from vesuvius.neural_tracing.tracers.sheets.tracing.inference import (
+    connected_keep, resample, trace, write_trace, write_two_way_trace)
 
 
 def seed_from_fiber(fiber: dict, scale: float, length: float, rng) -> tuple[np.ndarray, int] | None:
@@ -239,7 +242,7 @@ def main(argv=None):
         idx = np.floor((points[:, ::-1]+.5)/(1 << d.volume_level)-.5).astype(int)
         if np.mean([volume.read(i, (1, 1, 1))[0, 0, 0] > 0 for i in idx]) < .9:  # off the scan or on masked CT
             continue
-        traced = False
+        traced = {}
         for sign in signs:
             direction = advance_directions(points, sign, level0)
             if direction is None:
@@ -247,18 +250,28 @@ def main(argv=None):
             seed = resample(points, d.point_spacing)
             dirs = np.stack([np.interp(np.linspace(0, len(points)-1, len(seed)), np.arange(len(points)), direction[:, k])
                              for k in range(3)], 1)
-            rows, confs = trace(model, cfg, seed, dirs, args.steps, args.device, fibers=around(path, seed))
-            # the file name, not the fiber's ``sequence``: sequence numbers repeat across annotators' files
-            name = f"fiber_{path.stem}_cp{cp:02d}_{'up' if sign > 0 else 'down'}{args.suffix}"
+            traced[sign] = trace(model, cfg, seed, dirs, args.steps, args.device, fibers=around(path, seed))
+        if not traced:
+            continue
+        # the file name, not the fiber's ``sequence``: sequence numbers repeat across annotators' files
+        base = f'fiber_{path.stem}_cp{cp:02d}'
+        provenance = dict(fiber=str(path), control_point=cp, points=len(seed), steps=args.steps, checkpoint=args.checkpoint,
+                          coord_scale=args.coord_scale, threshold=args.threshold)
+        if len(traced) == 2:  # one surface: the down trace reversed, the seed row, the up trace
+            name = base+args.suffix
+            write_two_way_trace(args.out/name, traced[1.], traced[-1.], cfg, args.threshold,
+                                dict(provenance, direction='both', steps_traced_up=len(traced[1.][0])-1,
+                                     steps_traced_down=len(traced[-1.][0])-1), overwrite=True)
+            steps = f"{len(traced[1.][0])-1} up + {len(traced[-1.][0])-1} down steps"
+        else:
+            (sign, (rows, confs)), = traced.items()
+            name = f"{base}_{'up' if sign > 0 else 'down'}{args.suffix}"
             write_trace(args.out/name, rows, confs, cfg, args.threshold,
-                        dict(fiber=str(path), control_point=cp, direction='+z' if sign > 0 else '-z',
-                             points=len(seed), steps=args.steps, steps_traced=len(rows)-1,
-                             checkpoint=args.checkpoint,
-                             coord_scale=args.coord_scale, threshold=args.threshold), overwrite=True)
-            meta = json.loads((args.out/name/'meta.json').read_text())
-            print(f"{name}: {len(seed)} points, {len(rows)-1} steps, {meta.get('area_cm2', 0):.3f} cm^2", flush=True)
-            traced = True
-        done += traced
+                        dict(provenance, direction='+z' if sign > 0 else '-z', steps_traced=len(rows)-1), overwrite=True)
+            steps = f'{len(rows)-1} steps'
+        meta = json.loads((args.out/name/'meta.json').read_text())
+        print(f"{name}: {len(seed)} points, {steps}, {meta.get('area_cm2', 0):.3f} cm^2", flush=True)
+        done += 1
 
 
 if __name__ == '__main__':

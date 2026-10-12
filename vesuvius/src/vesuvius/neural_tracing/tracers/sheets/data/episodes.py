@@ -458,6 +458,43 @@ class MixedFrontStream(torch.utils.data.IterableDataset):
                        front_points=kind)
 
 
+class NeighborStream(torch.utils.data.IterableDataset):
+    """Endless collated batches (load with ``batch_size=None``) for neighbour continuations
+    (``data.neighbor_fraction``): ``plain`` episodes from ``plain_sampler``, then ``wide`` episodes from
+    ``wide_sampler``, whose window spans two fronts sharing the middle point (``2 * front_points - 1`` points).
+
+    A wide episode's ``gt``/``valid`` are the half the model traces (so every episode of the batch has the same GT
+    window); the whole window is kept as ``wide_gt``/``wide_valid`` (for the shared seed rows and the neighbour
+    half). ``neighbor_side`` (one per batch, alternating): +1 the neighbour is the second half (the episode's last
+    point is the shared one), -1 the first half (its first point is). ``offset``: GT-grid columns between the two
+    halves' first points."""
+
+    def __init__(self, plain_sampler: EpisodeSampler, wide_sampler: EpisodeSampler, plain: int, wide: int, offset: int,
+                 seed: int):
+        self.plain_sampler, self.wide_sampler, self.plain, self.wide = plain_sampler, wide_sampler, plain, wide
+        self.offset, self.seed = offset, seed
+
+    def __iter__(self):
+        info = torch.utils.data.get_worker_info()
+        rng = np.random.default_rng([self.seed, 0 if info is None else info.id])
+        width = self.plain_sampler.spec.Gv
+        side = 1
+        while True:
+            side = -side
+            episodes = [fresh_episode(self.plain_sampler, rng) for _ in range(self.plain)]
+            wide = [fresh_episode(self.wide_sampler, rng) for _ in range(self.wide)]
+            start = 0 if side > 0 else self.offset  # the traced half's first column
+            halves = [dict(e, gt=e['gt'][:, start:start+width], valid=e['valid'][:, start:start+width]) for e in wide]
+            batch = collate(episodes+halves)
+            batch.update(wide_gt=torch.from_numpy(np.stack([e['gt'] for e in wide])),
+                         wide_valid=torch.from_numpy(np.stack([e['valid'] for e in wide])),
+                         neighbor_side=side)
+            yield batch
+
+
+NEIGHBOR_KEYS = ('wide_gt', 'wide_valid')
+
+
 def keep_batch(batch):
     """``collate_fn`` for streams that yield whole batches."""
     return batch

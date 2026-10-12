@@ -403,6 +403,8 @@ def main(argv=None):
                                             max_per_patch=args.max_per_patch, seed_split=args.held_out_scoring,
                                             fiber_runs=args.fiber_seeds or '', fiber_pool=args.fiber_pool or '')
     print(f'{len(seeds)} held-out seeds', flush=True)
+    if not seeds:
+        raise SystemExit('No seed fits these settings (front length, split, validity): nothing to benchmark')
     out = Path(args.out) if args.out else C.OUTPUT/'trace_bench'/args.tag
     (out/'tifxyz').mkdir(parents=True, exist_ok=True)
     report = dict(checkpoints=dict(zip(names, args.checkpoints)), steps=args.steps, front=args.front,

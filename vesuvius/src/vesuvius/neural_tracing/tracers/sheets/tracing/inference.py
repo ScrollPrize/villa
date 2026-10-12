@@ -193,6 +193,25 @@ def write_trace(out: Path, rows: np.ndarray, confs: np.ndarray, cfg, threshold: 
     np.save(out/'confidence.npy', confs.astype(np.float32))
 
 
+def two_way_trace(up: tuple, down: tuple) -> tuple:
+    """Two traces from the same seed row in opposite directions as one surface: ``up``/``down`` are (rows (T+1, C, 3),
+    keep (T+1, C), confs (T+1, C)), each with the seed as row 0. Returns rows, keep and confs of the ``down`` rows
+    reversed, the seed row (``up``'s), then the ``up`` rows; the seed row's index is ``len(down rows) - 1``."""
+    return tuple(np.concatenate([d[:0:-1], u]) for u, d in zip(up, down))
+
+
+def write_two_way_trace(out: Path, up: tuple, down: tuple, cfg, threshold: float, provenance: dict,
+                        overwrite: bool = False):
+    """``up`` and ``down`` (rows, confs) traced from the same seed row in opposite directions, written as one tifxyz
+    (``two_way_trace``); each half keeps the points connected to the seed (``connected_keep``)."""
+    halves = [(rows, connected_keep(confs, threshold), confs) for rows, confs in (up, down)]
+    rows, keep, confs = two_way_trace(*halves)
+    column = cfg.data.point_spacing/cfg.trace.spline_samples
+    write_surface(out, rows, keep, cfg.data.step, column, dict(provenance, seed_row=len(down[0])-1),
+                  overwrite=overwrite, voxel_size_um=cfg.data.voxel_size_um)
+    np.save(out/'confidence.npy', confs.astype(np.float32))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--checkpoint', required=True)

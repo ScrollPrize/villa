@@ -38,8 +38,9 @@ def view_radius(model) -> float:
 
 
 def sample_crops(block, origin: torch.Tensor, level: int, pos: torch.Tensor, frames: torch.Tensor,
-                 offsets: torch.Tensor) -> torch.Tensor:
-    """CT crops (B, N, 1, Sn, St, Sa), z-scored per crop, for front points at ``pos`` (B, N, 3) with sheet frames
-    (B, N, 3, 3) of columns (t, a, n); ``block`` as in ``sample_block``."""
-    crops = gpu.oriented_crops(block, origin, level, pos, frames[..., [0, 2, 1]], offsets)  # u = t, v = n, f = a
+                 offsets: torch.Tensor, zscore: bool = True) -> torch.Tensor:
+    """CT crops (B, N, 1, Sn, St, Sa), z-scored per crop (raw values with ``zscore=False``, e.g. the neighbour
+    channel), for front points at ``pos`` (B, N, 3) with sheet frames (B, N, 3, 3) of columns (t, a, n); ``block`` as
+    in ``sample_block``."""
+    crops = gpu.oriented_crops(block, origin, level, pos, frames[..., [0, 2, 1]], offsets, zscore)  # u = t, v = n, f = a
     return crops.permute(0, 1, 2, 4, 5, 3)  # (advance, normal, tangent) -> the encoders' (normal, tangent, advance)

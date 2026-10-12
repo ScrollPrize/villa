@@ -923,3 +923,129 @@ def test_extended_fiber_json_is_a_valid_vc3d_fiber():
     assert fib['control_points'] == [fib['line_points'][0], fib['line_points'][-1]]
     back = mod.extended_fiber(dict(), line, 20., -1., rows*np.array([-1., 1., 1.])+np.array([400., 0., 0.]), confs, .4, .25, 'y')
     assert np.allclose(np.asarray(back['line_points'][-1])*.25, line[-1])  # the extension comes first
+
+
+def test_neighbor_channel_starts_as_the_one_channel_checkpoint():
+    """model.neighbor_channel: a one-channel checkpoint loads with the new channel's weights at zero, so the model
+    computes what the checkpoint did, whatever the neighbour channel holds."""
+    from vesuvius.neural_tracing.tracers.sheets.model import init_model_state
+    torch.manual_seed(0)
+    plain = build_model(C.load(None, SMALL))
+    cfg = C.load(None, SMALL+['model.neighbor_channel=true'])
+    model = build_model(cfg)
+    init_model_state(model, plain.state_dict())
+    assert model.encoder.stages[0].blocks[0].conv1.conv.weight.shape[1] == 2
+    spec = GridSpec.for_episode(cfg.data, cfg.data.steps)
+    gt, valid = cylinder_grid(spec)
+    seeds = seed_rows(gt, valid, cfg, spec, noise=False)
+    block, origin = torch.rand(1, 1, 224, 360, 360, generator=torch.Generator().manual_seed(1))*255, torch.zeros(1, 3, dtype=torch.long)
+    torch.nn.init.normal_(plain.head.weight, std=1e-2)
+    with torch.no_grad():
+        model.head.weight.copy_(plain.head.weight)
+        want = Tracer(plain, C.load(None, SMALL), 'cpu').step(Tracer(plain, C.load(None, SMALL), 'cpu').initial(seeds), block, origin).pred
+        tracer = Tracer(model, cfg, 'cpu')
+        front = tracer.initial(seeds)
+        edge = front.pos[0, :1].expand(13, -1)+torch.arange(13.)[:, None]*torch.tensor([0., 0., 20.])
+        side = neighbors_input([edge], cfg)
+        for neighbor in (None, side):
+            assert torch.allclose(tracer.step(front, block, origin, neighbor=neighbor).pred, want, atol=1e-5)
+
+
+def neighbors_input(edges, cfg):
+    from vesuvius.neural_tracing.tracers.sheets.tracing import neighbor as Nb
+    return Nb.volumes([Nb.render(e, torch.ones(len(e), dtype=torch.bool), cfg.data.step) for e in edges], 'cpu')
+
+
+def test_neighbor_edge_is_a_gaussian_tube():
+    """tracing.neighbor: the neighbour's edge column as a Gaussian tube (sigma 2 vx) reading 1 on the line, 0 beyond
+    its kept rows."""
+    from vesuvius.neural_tracing.tracers.sheets.tracing import neighbor as Nb
+    from vesuvius.neural_tracing.tracers.shared.crop_sampling.gpu import sample_block
+    z = torch.arange(13.)*20
+    edge = torch.stack([torch.full_like(z, 100.5), torch.full_like(z, 200.5), 50+z], -1)
+    kept = torch.ones(13, dtype=torch.bool)
+    kept[10:] = False  # rows past 10 were not kept: no tube there
+    vol, lo = Nb.render(edge, kept, 20.)
+    pts = torch.tensor([[100.5, 200.5, 150.], [102.5, 200.5, 150.], [104.5, 200.5, 150.], [100.5, 200.5, 270.]])
+    got = sample_block([vol], lo[None], Nb.LEVEL, pts[None, None, None]).flatten()
+    assert torch.allclose(got[:3], torch.exp(-.5*torch.tensor([0., 1., 4.])), atol=.02) and got[3] < .01
+    assert Nb.render(edge, torch.zeros(13, dtype=torch.bool), 20.) is None
+
+
+def test_neighbor_stream_halves_share_the_middle_point(tmp_path):
+    """data.neighbor_fraction batches: plain episodes, then wide windows whose traced half (gt) is the side opposite
+    the neighbour; the side alternates between batches."""
+    from vesuvius.neural_tracing.tracers.sheets.data.episodes import EpisodeSampler, NeighborStream
+    from vesuvius.neural_tracing.tracers.sheets.data.patches import build_index
+    _write_plane_patch(tmp_path/'patches'/'p0', 150, 150)
+    _write_volume(tmp_path/'vol.zarr', shape=(256, 256, 64))
+    base = [f'data.patches_dir="{tmp_path/"patches"}"', f'data.volume="{tmp_path/"vol.zarr"}"', 'data.volume_level=1',
+            'data.point_spacing=20', 'data.step=10', 'data.steps=2', 'data.gt_margin=10', 'data.gt_resolution=2',
+            'data.roi=512', 'data.val_fraction=0', 'data.min_valid_fraction=.5']
+    cfg, wide_cfg = C.load(None, base+['data.front_points=3']), C.load(None, base+['data.front_points=5'])
+    index = build_index(cfg.data.patches_dir, tmp_path/'cache')
+    plain = EpisodeSampler(cfg.data, index, 'train', 2, 512, 10.)
+    wide = EpisodeSampler(wide_cfg.data, index, 'train', 2, 512, 10.)
+    offset = int(round(2*20/2))
+    assert offset+plain.spec.Gv == wide.spec.Gv
+    stream = iter(NeighborStream(plain, wide, 2, 3, offset, 0))
+    for want in (-1, 1):
+        b = next(stream)
+        assert b['neighbor_side'] == want and b['gt'].shape[0] == 5 and b['wide_gt'].shape[0] == 3
+        start = 0 if want > 0 else offset
+        assert torch.equal(b['gt'][2:], b['wide_gt'][:, :, start:start+plain.spec.Gv])
+
+
+def test_training_rollout_continues_from_a_traced_neighbor():
+    """train_rollout with neighbour batches: the neighbour half is traced first; the traced half starts on the shared
+    middle point (the same noisy seed) and sees the neighbour's edge."""
+    from vesuvius.neural_tracing.tracers.sheets.train.train import neighbor_inputs, train_rollout
+    quiet = ['data.seed_noise_normal=0', 'data.seed_noise_tangent=0']  # an untrained model's straight advance stays on
+    cfg = C.load(None, SMALL+quiet+['model.neighbor_channel=true', 'data.neighbor_fraction=.5', 'data.steps=2',
+                                    'trace.confidence_threshold=.4', 'train.jump_probability=0'])
+    wide_cfg = C.load(None, SMALL+quiet+['model.neighbor_channel=true', 'data.front_points=9', 'data.steps=2'])
+    spec, wide_spec = GridSpec.for_episode(cfg.data, 2), GridSpec.for_episode(wide_cfg.data, 2)
+    offset = int(round(4*cfg.data.point_spacing/cfg.data.gt_resolution))
+    wide_gt, wide_valid = cylinder_grid(wide_spec)
+    plain_gt, plain_valid = cylinder_grid(spec)
+    model = build_model(cfg)
+    tracer = Tracer(model, cfg, 'cpu')
+    block = torch.rand(1, 1, 224, 360, 360, generator=torch.Generator().manual_seed(3))*255
+    for side in (1, -1):
+        start = 0 if side > 0 else offset
+        b = dict(gt=torch.cat([plain_gt, wide_gt[:, :, start:start+spec.Gv]]),
+                 valid=torch.cat([plain_valid, wide_valid[:, :, start:start+spec.Gv]]),
+                 block=[block[0], block[0]], origin=torch.zeros(2, 3, dtype=torch.long), wide_gt=wide_gt,
+                 wide_valid=wide_valid, neighbor_side=side)
+        neighbor = dict(tracer=tracer, cfg=wide_cfg, spec=wide_spec, offset=offset)
+        own, side_input, stats = neighbor_inputs(b, cfg, neighbor, torch.Generator().manual_seed(0))
+        whole = seed_rows(wide_gt, wide_valid, wide_cfg, wide_spec, torch.Generator().manual_seed(0), noise=True)
+        shared = whole[:, -1, 4]  # the middle point: the traced half's last (side 1) or first (side -1) point
+        assert torch.equal(own[:, -1, -1 if side > 0 else 0], shared)
+        assert stats['neighbor_ok'] == 1 and len(side_input['volumes']) == 2 and side_input['volumes'][0].abs().sum() == 0
+        loss, st, _, _ = train_rollout(tracer, b, cfg, spec, torch.Generator().manual_seed(0), neighbor=neighbor)
+        assert torch.isfinite(loss) and st['neighbor'] == .5
+
+
+def test_two_way_fiber_traces_are_written_as_one_surface(tmp_path):
+    """trace_from_fibers --direction both: the down trace reversed, the shared seed row, the up trace, as one tifxyz
+    whose area is the two halves'; each half keeps only the points connected to the seed."""
+    from vesuvius.neural_tracing.tracers.sheets.tracing.inference import write_trace, write_two_way_trace
+    cfg = C.load(None, ['data.point_spacing=60', 'data.step=20'])
+    cols = np.arange(13.)*10
+    up = np.stack([np.stack([np.full(13, 5.), cols, np.full(13, 100.+20*t)], -1) for t in range(4)])
+    down = up.copy()
+    down[..., 2] = 200.-up[..., 2]  # the seed row (z = 100) and rows going down
+    conf_up, conf_down = np.ones((4, 13)), np.ones((3+1, 13))
+    conf_up[2, 6] = 0.  # one masked point
+    conf_down[3] = 0.  # the last down row is not kept
+    write_two_way_trace(tmp_path/'both', (up, conf_up), (down, conf_down), cfg, .5, dict(direction='both'))
+    x, z = (tifffile.imread(tmp_path/'both'/f'{c}.tif') for c in 'xz')
+    assert x.shape == (7, 13) and json.loads((tmp_path/'both'/'trace.json').read_text())['seed_row'] == 3
+    assert np.allclose(z[1:, 0], [60., 80., 100., 120., 140., 160.]) and (x[0] == -1).all()  # down reversed, then up
+    assert x[5, 6] == -1 and (x[1:] != -1).sum() == 6*13-1
+    write_trace(tmp_path/'up', up, conf_up, cfg, .5, {})
+    write_trace(tmp_path/'down', down, conf_down, cfg, .5, {})
+    area = lambda name: json.loads((tmp_path/name/'meta.json').read_text())['area_vx2']
+    assert area('both') == pytest.approx(area('up')+area('down'))
+

@@ -29,7 +29,7 @@ import torch
 
 from vesuvius.neural_tracing.tracers.sheets import config as C
 from vesuvius.neural_tracing.tracers.sheets.data.episodes import (
-    FIBER_KEYS, EpisodeSampler, batches, episode_pad, fixed_episodes, unpack_blocks)
+    FIBER_KEYS, NEIGHBOR_KEYS, EpisodeSampler, batches, episode_pad, fixed_episodes, unpack_blocks)
 from vesuvius.neural_tracing.tracers.sheets.data.patches import build_index
 from vesuvius.neural_tracing.tracers.sheets.geometry import grid_eval, project, surface_frame
 from vesuvius.neural_tracing.tracers.sheets.losses import front_metrics, gap_mask, landing
@@ -46,9 +46,11 @@ def to_device(batch, device, pad_blocks: bool = True):
     return dict(gt=batch['gt'].to(device, non_blocking=True), valid=batch['valid'].to(device, non_blocking=True),
                 block=unpack_blocks(batch['block'], device, pad=pad_blocks),
                 origin=batch['origin'].to(device, non_blocking=True), meta=batch['meta'],
-                # live-chain continuation batches; the front size of data.front_points_range batches
-                **{k: batch[k] for k in ('chains', 'front_points') if k in batch},
-                **{k: batch[k].to(device, non_blocking=True) for k in ('seed', 'seed_mask')+FIBER_KEYS if k in batch})
+                # live-chain continuation batches; the front size of data.front_points_range batches; the neighbour
+                # side of data.neighbor_fraction batches
+                **{k: batch[k] for k in ('chains', 'front_points', 'neighbor_side') if k in batch},
+                **{k: batch[k].to(device, non_blocking=True) for k in ('seed', 'seed_mask')+FIBER_KEYS+NEIGHBOR_KEYS
+                   if k in batch})
 
 
 @torch.no_grad()

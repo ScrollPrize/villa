@@ -107,7 +107,18 @@ class Tracer:
         S = self.cfg.trace.spline_samples
         return respace(hermite_dense(front.pos, chord_tangents(front.pos), S), self.columns)
 
-    def _grid(self, front: Front, frames, block, origin):
+    def _crops(self, block, origin, pos, frames, offsets, neighbor):
+        """CT crops at ``pos``, plus the neighbour channel with ``model.neighbor_channel``: the ``neighbor`` volumes
+        (``tracing.neighbor.volumes``) sampled raw at the same points, or zeros without them."""
+        crops = sample_crops(block, origin, self.level, pos, frames, offsets)
+        if not self.cfg.model.neighbor_channel:
+            return crops
+        if neighbor is None:
+            return torch.cat([crops, torch.zeros_like(crops)], 2)
+        side = sample_crops(neighbor['volumes'], neighbor['origins'], neighbor['level'], pos, frames, offsets, zscore=False)
+        return torch.cat([crops, side.to(crops.dtype)], 2)
+
+    def _grid(self, front: Front, frames, block, origin, neighbor=None):
         """Model inputs for the token grid, and the current row's (curve, frames, conf)."""
         B = front.pos.shape[0]
         curve = self._curve(front)
@@ -116,7 +127,7 @@ class Tracer:
         a = normalize(a-(a*t).sum(-1, keepdim=True)*t)
         col_frames = torch.stack([t, a, normalize(torch.cross(t, a, dim=-1))], -1)
         col_conf = self._interp_front_points(front.conf)
-        crops = sample_crops(block, origin, self.level, curve, col_frames, self.token_offsets)
+        crops = self._crops(block, origin, curve, col_frames, self.token_offsets, neighbor)
         center, basis = front_frame(front.pos, front.prev)
         R = max(self.cfg.model.memory_rows, 1)
         rows = front.grid[-self.cfg.model.memory_rows:] if self.cfg.model.memory_rows else []  # oldest first
@@ -165,13 +176,15 @@ class Tracer:
                           (instance == 0).to(local.dtype)[..., None], codes], -1)
         return dict(feat=torch.where(pad[..., None], torch.zeros_like(feat), feat), pad=pad)
 
-    def step(self, front: Front, block, origin: torch.Tensor, fibers=None) -> StepOutput:
+    def step(self, front: Front, block, origin: torch.Tensor, fibers=None, neighbor=None) -> StepOutput:
         """``block``: the episodes' CT blocks (``shared.crop_sampling.gpu.sample_block``) with their level-voxel origins (B, 3).
-        ``fibers``: the batch's ``fiber_*`` tensors (fiber-started episodes), for ``model.fiber_tokens``."""
+        ``fibers``: the batch's ``fiber_*`` tensors (fiber-started episodes), for ``model.fiber_tokens``.
+        ``neighbor``: the episodes' neighbouring traced surfaces (``tracing.neighbor.volumes``), for
+        ``model.neighbor_channel`` (none: an empty channel)."""
         frames = point_frames(front.pos, front.prev)
-        crops = sample_crops(block, origin, self.level, front.pos, frames, self.offsets)
+        crops = self._crops(block, origin, front.pos, frames, self.offsets, neighbor)
         point = self._features(front, frames)
-        grid, row_geometry = self._grid(front, frames, block, origin)
+        grid, row_geometry = self._grid(front, frames, block, origin, neighbor)
         amp = self.cfg.train.amp == 'bf16' and crops.is_cuda
         with torch.autocast('cuda', torch.bfloat16, enabled=amp):
             mode = (torch.full((crops.shape[0],), self.mode, dtype=torch.long, device=crops.device)

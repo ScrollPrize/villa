@@ -58,13 +58,15 @@ def sample_block(volume, origin: torch.Tensor, level: int, points: torch.Tensor)
 
 
 def oriented_crops(block, origin: torch.Tensor, level: int, pos: torch.Tensor, frames: torch.Tensor,
-                   offsets: torch.Tensor) -> torch.Tensor:
-    """Crops (B, N, 1, D, H, W), z-scored per crop (``zscore_crops``), at ``pos`` (B, N, 3) with frames (B, N, 3, 3)
-    of columns ``u, v, f``; ``offsets`` from ``crop_offsets``, ``block`` as in ``sample_block``."""
+                   offsets: torch.Tensor, zscore: bool = True) -> torch.Tensor:
+    """Crops (B, N, 1, D, H, W), z-scored per crop (``zscore_crops``; raw values with ``zscore=False``), at ``pos``
+    (B, N, 3) with frames (B, N, 3, 3) of columns ``u, v, f``; ``offsets`` from ``crop_offsets``, ``block`` as in
+    ``sample_block``."""
     B, N = pos.shape[:2]
     d, h, w = offsets.shape[:3]
     world = (pos[:, :, None, None, None]+torch.einsum('bnij,dhwj->bndhwi', frames, offsets)).reshape(B, N*d, h, w, 3)
-    return zscore_crops(sample_block(block, origin, level, world).reshape(B, 1, N, d, h, w).transpose(1, 2))
+    crops = sample_block(block, origin, level, world).reshape(B, 1, N, d, h, w).transpose(1, 2)
+    return zscore_crops(crops) if zscore else crops
 
 
 def sample_plane(block: torch.Tensor, origin: torch.Tensor, level: int, center: torch.Tensor, axes: torch.Tensor,

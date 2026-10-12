@@ -23,17 +23,18 @@ CNN_NONLINS = dict(relu=(nn.ReLU, dict(inplace=True)), gelu=(nn.GELU, {}))
 
 
 class CropCNN(nn.Module):
-    """Residual CNN stages of ResNet-D basic blocks (channels, initial stride, blocks per stage) over a one-channel
-    crop, and optionally a head that turns its feature map into tokens of width ``dim``.
+    """Residual CNN stages of ResNet-D basic blocks (channels, initial stride, blocks per stage) over a crop, and
+    optionally a head that turns its feature map into tokens of width ``dim``.
 
     ``norm``: 'instance' (InstanceNorm3d, affine) or 'group' (GroupNorm, 4 groups); ``nonlin``: 'relu' or 'gelu';
     ``conv_bias``: 'first' (only the first stage's convolutions carry biases) or 'all'. ``head``: None (``forward``
     returns the feature map), 'cells' (one token per feature-map cell, (B, cells, dim), a Linear of the channels) or
     'crop' (one token per crop, (B, dim): an optional 1x1 conv to ``bottleneck`` channels with the same norm and
     nonlinearity, then flatten and a Linear; needs the ``crop`` size, which must divide by 2 per stride-2 stage).
-    ``features`` and ``tokens`` run the two halves separately, for models that read the feature map as well."""
+    ``features`` and ``tokens`` run the two halves separately, for models that read the feature map as well.
+    ``in_channels``: input channels of the crop (default one, e.g. CT)."""
     def __init__(self, channels, strides, blocks, *, norm='instance', nonlin='relu', conv_bias='first', head=None,
-                 dim=None, crop=None, bottleneck=0):
+                 dim=None, crop=None, bottleneck=0, in_channels=1):
         super().__init__()
         if conv_bias not in ('first', 'all') or head not in (None, 'cells', 'crop') or (head and not dim):
             raise ValueError(f'CropCNN: conv_bias {conv_bias!r}, head {head!r}, dim {dim!r}')
@@ -41,7 +42,7 @@ class CropCNN(nn.Module):
         nonlin_op, nonlin_kwargs = CNN_NONLINS[nonlin]
         options = dict(conv_op=nn.Conv3d, kernel_size=3, norm_op=norm_op, norm_op_kwargs=norm_kwargs, nonlin=nonlin_op,
                        nonlin_kwargs=nonlin_kwargs, block=BasicBlockD)
-        inputs = (1, *channels[:-1])
+        inputs = (in_channels, *channels[:-1])
         self.stages = nn.ModuleList(
             StackedResidualBlocks(n_blocks=n, input_channels=i, output_channels=c, initial_stride=s,
                                   conv_bias=conv_bias == 'all' or not index, **options)

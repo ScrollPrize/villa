@@ -33,10 +33,12 @@ from vesuvius.neural_tracing.tracers.sheets import config as C
 from vesuvius.neural_tracing.tracers.sheets.checkpoint import load_checkpoint
 from vesuvius.neural_tracing.tracers.sheets.evaluation import rollouts as E
 from vesuvius.neural_tracing.tracers.sheets.data.episodes import (
-    FIBER_KEYS, EpisodeSampler, EpisodeStream, MixedFrontStream, collate, episode_pad, fixed_episodes, keep_batch)
+    FIBER_KEYS, NEIGHBOR_KEYS, EpisodeSampler, EpisodeStream, MixedFrontStream, NeighborStream, collate, episode_pad,
+    fixed_episodes, keep_batch)
 from vesuvius.neural_tracing.tracers.sheets.data.patches import build_index
 from vesuvius.neural_tracing.tracers.sheets.train.live import LiveChains
-from vesuvius.neural_tracing.tracers.sheets.losses import step_losses
+from vesuvius.neural_tracing.tracers.sheets.losses import landing, step_losses
+from vesuvius.neural_tracing.tracers.sheets.tracing import neighbor as neighbors
 from vesuvius.neural_tracing.tracers.models.blocks import LOGIT_SCALE_LR_SCALE
 from vesuvius.neural_tracing.tracers.sheets.model import build_model, compile_model, init_model_state, legacy_state, load_model_state
 from vesuvius.neural_tracing.tracers.sheets.tracing.rollout import Tracer
@@ -53,7 +55,53 @@ def learning_rate(it: int, tc, minutes: float = 0.) -> float:
     return lr_at(it+1, tc.lr, tc.warmup, tc.iterations, minutes/tc.max_minutes if tc.max_minutes else None)
 
 
-def train_rollout(tracer: Tracer, b: dict, cfg, spec, generator, front=None):
+@torch.no_grad()
+def neighbor_inputs(b: dict, cfg, neighbor: dict, generator):
+    """``data.neighbor_fraction`` batches: seed rows of the traced half of every wide episode (the batch's last ones)
+    and every episode's neighbour edge for ``Tracer.step``.
+
+    The whole window's seed rows are drawn once (GT with seed noise), so both halves share the middle point. The
+    EMA model (``neighbor['tracer']``) traces the neighbour half for ``data.steps`` steps like inference (no noise,
+    no resets, no neighbour input). It counts when none of its kept dense points (column confidence above the
+    threshold) lies off the seed's sheet and at least half of all its points are kept and supervised; its column at
+    the shared point is then the episode's edge (``tracing.neighbor``). Plain episodes and failed neighbours get
+    none. Returns the seed rows (k, history+1, N, 3), the ``neighbor`` input and stats."""
+    d = cfg.data
+    tracer, wide_cfg, wide_spec, offset = neighbor['tracer'], neighbor['cfg'], neighbor['spec'], neighbor['offset']
+    side, B, k, N = b['neighbor_side'], b['gt'].shape[0], b['wide_gt'].shape[0], d.front_points
+    seeds = seed_rows(b['wide_gt'], b['wide_valid'], wide_cfg, wide_spec, generator, noise=True)
+    first, second = seeds[:, :, :N], seeds[:, :, N-1:]
+    own, other = (first, second) if side > 0 else (second, first)
+    width, start = b['gt'].shape[2], offset if side > 0 else 0  # the neighbour half's columns
+    gt, valid = b['wide_gt'][:, :, start:start+width], b['wide_valid'][:, :, start:start+width]
+    blocks = b['block'][B-k:]
+    origins = b['origin'][B-k:]
+    front = tracer.initial(other)
+    dense, conf = tracer.output_columns(front.pos, front.conf)
+    rows, confs = [dense], [conf]
+    wrong = torch.zeros(k, dtype=torch.bool, device=gt.device)
+    supervised = torch.zeros(k, device=gt.device)
+    threshold = cfg.trace.confidence_threshold
+    for _ in range(d.steps):
+        out = tracer.step(front, blocks, origins)
+        front = tracer.advance(front, out)
+        dense, conf = tracer.output_columns(front.pos, front.conf, out.dense)
+        _, _, same, ok = landing(dense, gt, valid, cfg.loss.sheet_tolerance)
+        kept = conf > threshold
+        wrong |= (kept & ok & ~same).any(1)
+        supervised += (kept & ok).float().sum(1)
+        rows.append(dense)
+        confs.append(conf)
+    rows, confs = torch.stack(rows, 1), torch.stack(confs, 1)  # (k, steps+1, Q, ...)
+    good = ~wrong & (supervised >= .5*d.steps*rows.shape[2])
+    column = 0 if side > 0 else -1  # the neighbour's column at the shared point
+    edges = [None]*(B-k)+[neighbors.render(rows[i, :, column], confs[i, :, column] > threshold, d.step) if good[i]
+                          else None for i in range(k)]
+    stats = dict(neighbor=good.float().sum()/B, neighbor_ok=good.float().mean())
+    return own, neighbors.volumes(edges, gt.device), stats
+
+
+def train_rollout(tracer: Tracer, b: dict, cfg, spec, generator, front=None, neighbor=None):
     """Loss averaged over the rollout steps, per-step stats averaged likewise, the final front, and the point
     confidences (B, N) of every step. ``front``: continue these fronts (live chains) instead of seeding from GT.
     Steps are detached from each other, and each step's loss is backpropagated right after the step (the same
@@ -62,14 +110,20 @@ def train_rollout(tracer: Tracer, b: dict, cfg, spec, generator, front=None):
     A ``free_fraction`` of episodes are never snapped back; in ``jump_probability`` of episodes a run of front_points
     is pushed onto a neighbouring sheet before one random step (not the last). With ``train.history_rows`` (``cfg``
     then has that many more ``data.history`` rows), the front first traces 0..history_rows GT rows up to the seed
-    without loss, put back on GT after each step, to fill the grid memory.
+    without loss, put back on GT after each step, to fill the grid memory. ``neighbor`` (``data.neighbor_fraction``
+    batches): the EMA tracer and the wide window's config, spec and offset for ``neighbor_inputs``; the episodes
+    with a neighbour then see its edge in their crops at every step.
     """
     tc = cfg.train
     B, steps, device = b['gt'].shape[0], cfg.data.steps, b['gt'].device
+    side_input, side_stats = None, {}
     if front is None:
         seeds = seed_rows(b['gt'], b['valid'], cfg, spec, generator, noise=True)
         if 'seed_mask' in b:  # fiber-seeded episodes start from their own seed rows
             seeds = torch.where(b['seed_mask'][:, None, None, None], b['seed'].to(seeds.dtype), seeds)
+        if 'wide_gt' in b:  # neighbour continuations: the traced halves' shared seed rows, and the neighbour edges
+            own, side_input, side_stats = neighbor_inputs(b, cfg, neighbor, generator)
+            seeds = torch.cat([seeds[:B-own.shape[0]], own.to(seeds.dtype)])
         warm = int(torch.randint(0, tc.history_rows+1, (1,), device=device, generator=generator)) if tc.history_rows else 0
         H = seeds.shape[1]
         front = tracer.initial(seeds[:, :H-warm])
@@ -88,7 +142,7 @@ def train_rollout(tracer: Tracer, b: dict, cfg, spec, generator, front=None):
                                   b['block'], b['origin'])
             tracer.move(front, pos)
             jumped += run.float().mean()
-        out = tracer.step(front, b['block'], b['origin'], fibers)
+        out = tracer.step(front, b['block'], b['origin'], fibers, side_input)
         loss, st = step_losses(out, front, b['gt'], b['valid'], cfg)
         confs.append(torch.sigmoid(out.conf_logit.detach()))
         (loss/steps).backward()
@@ -102,6 +156,7 @@ def train_rollout(tracer: Tracer, b: dict, cfg, spec, generator, front=None):
         resets += far.float().mean()/steps
     stats['reset'] = resets
     stats['jumped'] = torch.as_tensor(jumped)
+    stats.update(side_stats)
     return total, stats, front, confs
 
 
@@ -159,7 +214,7 @@ def device_batches(batches, device, pinned_ahead: int = 2, timings: dict | None 
         pending = load()
         main.wait_event(ready)
         blocks = b['block'] if isinstance(b['block'], list) else [b['block']]
-        seeds = [b[k] for k in ('seed', 'seed_mask')+FIBER_KEYS if k in b]
+        seeds = [b[k] for k in ('seed', 'seed_mask')+FIBER_KEYS+NEIGHBOR_KEYS if k in b]
         for x in [b['gt'], b['valid'], b['origin']]+blocks+seeds:
             x.record_stream(main)  # used on the main stream: not reusable before that work is done
         yield b
@@ -207,14 +262,14 @@ def front_variants(train_cfg, index, pad: float) -> dict:
     return out
 
 
-def optimize_step(tracer: Tracer, opt, ema, b: dict, cfg, spec, generator, front=None, parallel=None):
+def optimize_step(tracer: Tracer, opt, ema, b: dict, cfg, spec, generator, front=None, parallel=None, neighbor=None):
     """One training iteration on batch ``b``: rollout, backward, gradient clipping, optimizer and EMA update.
     Returns ``train_rollout``'s loss, stats (plus the gradient norm ``grad``), final front and confidences.
     With ``parallel`` (shared/distributed.DataParallel) the gradients of every process's batch are averaged (each
     batch weighted equally) before clipping, so all processes apply the same update."""
     model, tc = tracer.model, cfg.train
     opt.zero_grad(set_to_none=True)
-    loss, stats, front, confs = train_rollout(tracer, b, cfg, spec, generator, front)
+    loss, stats, front, confs = train_rollout(tracer, b, cfg, spec, generator, front, neighbor)
     if parallel is not None:
         _, finite, _ = parallel.average_gradients(model, 1, math.isfinite(float(loss)))
         if not finite:
@@ -312,12 +367,28 @@ def main(argv=None):
         jobs.cancel_join_thread()  # never block exit on unread jobs
     variants = front_variants(train_cfg, index, pad) if d.front_points_range else None
     seed = tc.seed+(checkpoint['iteration'] if checkpoint else 0)+rank_seed
-    if variants:
+    neighbor = None
+    if d.neighbor_fraction:  # wide windows: a neighbour half traced first, the other half continued from it
+        wide_cfg = copy.deepcopy(train_cfg)
+        wide_cfg.data.front_points = 2*d.front_points-1
+        wide_cfg.data.fiber_fraction = 0.  # neighbour windows start from GT rows
+        unit = 64 << d.volume_level
+        wide_cfg.data.roi = max(d.roi, -(-int((wide_cfg.data.front_points-1)*d.point_spacing+2*pad+2*d.gt_margin)
+                                         // unit)*unit)
+        wide_sampler = EpisodeSampler(wide_cfg.data, index, 'train', d.steps, wide_cfg.data.roi, pad)
+        wide = max(1, round(tc.batch*d.neighbor_fraction))
+        offset = int(round((d.front_points-1)*d.point_spacing/d.gt_resolution))
+        neighbor = dict(cfg=wide_cfg, spec=wide_sampler.spec, offset=offset)
+        print(f'neighbour continuations: {wide} of {tc.batch} episodes per batch from {len(wide_sampler.index)} patches '
+              f'fitting a {wide_cfg.data.front_points}-point window, roi {wide_cfg.data.roi}', flush=True)
+    if neighbor:
+        stream = NeighborStream(train_sampler, wide_sampler, tc.batch-wide, wide, offset, seed)
+    elif variants:
         stream = MixedFrontStream({k: v[1] for k, v in variants.items()}, {k: v[2] for k, v in variants.items()}, seed,
                                   {k: v[3] for k, v in variants.items()})
     else:
         stream = EpisodeStream(train_sampler, seed, batch=tc.batch if jobs else 0, jobs=jobs)
-    batched = jobs is not None or variants is not None  # the stream yields whole batches
+    batched = jobs is not None or variants is not None or neighbor is not None  # the stream yields whole batches
     loader = torch.utils.data.DataLoader(
         stream, batch_size=None if batched else tc.batch, num_workers=tc.workers,
         collate_fn=keep_batch if batched else collate,
@@ -359,6 +430,8 @@ def main(argv=None):
     tracer = Tracer(model, cfg, device)
     tracers = {n: Tracer(model, v[0], device) for n, v in variants.items()} if variants else {}
     eval_tracer = Tracer(ema.model, cfg, device) if ema else tracer  # validation uses the averaged weights
+    if neighbor:
+        neighbor['tracer'] = eval_tracer  # neighbours are traced by the averaged weights too
     generator = torch.Generator(device=device)
     generator.manual_seed(tc.seed+start+rank_seed)
     chains = LiveChains(train_cfg, train_spec, tracer, jobs, generator) if jobs else None
@@ -425,7 +498,8 @@ def main(argv=None):
             stats['follow'] = torch.tensor(float(vcfg.data.fiber_follow))
         else:
             loss, stats, front, confs = optimize_step(tracer, opt, ema, b, train_cfg, train_spec, generator,
-                                                      chain['front'] if chain else None, parallel=parallel)
+                                                      chain['front'] if chain else None, parallel=parallel,
+                                                      neighbor=neighbor)
         if chains:
             chains.finish(b, chain, front, confs, it)
             stats.update(chains.stats)

@@ -82,6 +82,13 @@ class DataConfig:
     fiber_cut_at_start: float = .5
     fiber_max_instances: int = 32
     fiber_max_points: int = 4096
+    # Neighbour continuations (needs model.neighbor_channel; one front size, no front_points_range or live chains):
+    # this fraction of each training batch is drawn as a window of 2 * front_points - 1 points. The EMA model first
+    # traces one half (the neighbour, without gradients, from the noisy GT seed); if every kept point of it stays on
+    # the seed's sheet, its traced surface is the second input channel of the other half, whose first or last point
+    # starts on the neighbour's end point (the side alternates between batches). The other episodes, and failed
+    # neighbours, get an empty channel.
+    neighbor_fraction: float = 0.
 
 
 @dataclass
@@ -116,6 +123,10 @@ class ModelConfig:
     # transformer: position and direction in the front frame, family, seed-fiber flag and the fiber's instance code
     # (random per episode, the same for all points of one fiber, different between fibers). 0: none.
     fiber_tokens: int = 0
+    # A second input channel of every crop: an already traced neighbouring surface (data.neighbor_fraction), rendered
+    # into a volume and sampled like the CT (0 off it, about 1 on it); empty when there is none. Its first
+    # convolutions start at zero, so a checkpoint without it loads unchanged (``init_model_state``).
+    neighbor_channel: bool = False
 
 
 @dataclass
@@ -351,6 +362,10 @@ def validate(config: Config) -> None:
         raise ValueError('train.history_rows must be >= 0')
     if type(tc.gpus) is not int or tc.gpus < 1:
         raise ValueError('train.gpus must be a positive integer')
+    if d.neighbor_fraction and (not 0 < d.neighbor_fraction < 1 or not m.neighbor_channel or d.front_points_range
+                                or tc.live_chains or tc.history_rows):
+        raise ValueError('data.neighbor_fraction must be in (0, 1) and needs model.neighbor_channel, one front size '
+                         '(no data.front_points_range), and no train.live_chains or train.history_rows')
     if tc.live_chains and (tc.history_rows or len(tc.chain_steps) != 2 or m.memory_rows > d.steps
                            or not d.steps <= int(tc.chain_steps[0]) <= int(tc.chain_steps[1])):
         # Continued chains of different depths share batches, so every continued front must hold the same memory:

@@ -28,12 +28,12 @@ TOKEN_FEATURES = 17
 FIBER_FEATURES = 3+3+2+1+FIBER_CODE_DIM
 
 
-def crop_encoder(crop, channels, strides, dim: int, bottleneck: int = 0) -> CropCNN:
+def crop_encoder(crop, channels, strides, dim: int, bottleneck: int = 0, in_channels: int = 1) -> CropCNN:
     """One token per crop: a ResNet-D basic block per stage (two 3x3x3 convs, GroupNorm(4), GELU, a pooled/projected
     skip), optionally a 1x1 conv to ``bottleneck`` channels, then flatten and Linear to ``dim``. Every crop size
     must be divisible by 2 per stride-2 stage."""
     return CropCNN(channels, strides, (1,)*len(channels), norm='group', nonlin='gelu', conv_bias='all', head='crop',
-                   dim=dim, crop=crop, bottleneck=bottleneck)
+                   dim=dim, crop=crop, bottleneck=bottleneck, in_channels=in_channels)
 
 
 class SheetTracer(nn.Module):
@@ -41,12 +41,13 @@ class SheetTracer(nn.Module):
         super().__init__()
         self.cfg = cfg
         dim = cfg.dim
-        self.encoder = crop_encoder(cfg.crop, cfg.channels, cfg.strides, dim, cfg.point_bottleneck)
+        inputs = 2 if cfg.neighbor_channel else 1  # CT, and the neighbouring surface (model.neighbor_channel)
+        self.encoder = crop_encoder(cfg.crop, cfg.channels, cfg.strides, dim, cfg.point_bottleneck, inputs)
         self.point_geometry = MLP(POINT_FEATURES, dim, nn.GELU)
         self.blocks = nn.ModuleList(SelfAttentionLayer(dim, cfg.heads, int(dim*cfg.mlp_ratio), cfg.qk_norm, cfg.qk_logit_scale)
                                     for _ in range(cfg.layers))
         self.token_type = nn.Parameter(torch.randn(2, dim)*.02)  # point / grid tokens
-        self.token_encoder = crop_encoder(cfg.token_crop, cfg.token_channels, cfg.token_strides, dim)
+        self.token_encoder = crop_encoder(cfg.token_crop, cfg.token_channels, cfg.token_strides, dim, in_channels=inputs)
         self.token_geometry = MLP(TOKEN_FEATURES, dim, nn.GELU)
         if cfg.fiber_tokens:  # fiber points near the front as a third kind of token
             self.fiber_geometry = MLP(FIBER_FEATURES, dim, nn.GELU)
@@ -97,8 +98,17 @@ def compile_model(model: SheetTracer) -> None:
     """``train.compile_model``: torch.compile the model in place (parameter names, and so checkpoints, are
     unchanged). Inductor fuses the norm, activation and dtype-cast passes around the convolutions and the small
     transformer ops, which cuts both GPU time and kernel launches; same math, different rounding. One graph per
-    grid-memory depth (and per grad mode for validation). Compiler options: ``shared.compile.compile_options``."""
+    input shape: grid-memory depth, fiber tokens or none, batch size (training, neighbour rollouts, validation) and
+    grad mode; with one front size these stay a few dozen, so the recompile limit is raised to ``RECOMPILE_LIMIT``
+    (past the limit, new shapes would quietly run eager). Compiler options: ``shared.compile.compile_options``."""
+    import torch._dynamo
+    for name in ('recompile_limit', 'cache_size_limit'):
+        if hasattr(torch._dynamo.config, name):
+            setattr(torch._dynamo.config, name, max(getattr(torch._dynamo.config, name), RECOMPILE_LIMIT))
     model.compile(**compile_options())
+
+
+RECOMPILE_LIMIT = 64
 
 
 def build_model(cfg) -> SheetTracer:
@@ -153,10 +163,24 @@ def upgrade_state(saved: dict) -> dict:
 OPTIONAL_MODULES = ('mode_', 'fiber_')  # modules a checkpoint without them starts fresh (``init_model_state``)
 
 
+def add_input_channels(model: SheetTracer, saved: dict) -> dict:
+    """``saved`` with the weights over a crop's input channels (the encoders' first convolutions and skip
+    projections) widened by zeros to the model's, e.g. a one-channel checkpoint for ``model.neighbor_channel``: the
+    added channels start without influence, so the model computes what the checkpoint did."""
+    own, out = model.state_dict(), dict(saved)
+    for key, value in saved.items():
+        target = own.get(key)
+        if (target is not None and value.ndim == 5 and target.ndim == 5 and value.shape[1] < target.shape[1]
+                and value.shape[:1]+value.shape[2:] == target.shape[:1]+target.shape[2:]):
+            out[key] = torch.cat([value, value.new_zeros(value.shape[0], target.shape[1]-value.shape[1], *value.shape[2:])], 1)
+    return out
+
+
 def init_model_state(model: SheetTracer, saved: dict) -> None:
     """``--init``: like ``load_model_state``, but the optional modules the checkpoint predates (``mode_embed``,
-    ``fiber_*``) keep their fresh initialisation; any other missing or unexpected weight is still an error."""
-    saved = upgrade_state(saved)
+    ``fiber_*``) keep their fresh initialisation, and input channels it lacks start at zero
+    (``add_input_channels``); any other missing or unexpected weight is still an error."""
+    saved = add_input_channels(model, upgrade_state(saved))
     report = load_matching_weights(model, saved)  # models.weights, as the fiber tracer's --init
     if report['unexpected'] or report['mismatched'] or any(not k.startswith(OPTIONAL_MODULES) for k in report['fresh']):
         load_model_state(model, saved)  # the usual informative mismatch error
