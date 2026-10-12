@@ -1,5 +1,22 @@
 # Reference-selected regional solve
 
+## Expanded GT / evaluation
+- [x] Inspect seven input files and preserve previous four-fiber outputs.
+- [x] Write plan and versioned runner configuration.
+- [x] Independent review and intact seven-fiber solve.
+- [x] Shared-phase correction resolves five coarse violations: v3 zero in both readouts.
+- [x] 25 focused tests, independent review, matched v3 solve and documented comparison.
+- [ ] Confirm comparison artifacts and vote convention; implement/test scoring.
+- [ ] Report GT audit and comparison percentages with support counts.
+
+## Four reviewed JSON fibers
+- [x] Inspect inputs, plan and independent review.
+- [x] AFV adapter and exact geometry roundtrip, 10 CPU tests pass.
+- [x] Native extraction, orientation and features complete.
+- [x] Complete normal/HV/direction and whole-fiber UV solve; report layout.
+- [x] User clarification:4intact trusted fibers, rejection disabled,16/16signs satisfied.
+- [x] TIFF/SVG/PDF and per-fiber/event JSON; bbox_gt_results.md;12tests pass.
+
 ## Adaptive loss-weight tuning
 - [x] Previous results committed at 102d25a55.
 - [x] Plan independently reviewed; controller and 13 CPU tests passing.

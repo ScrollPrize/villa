@@ -1,0 +1,10 @@
+{
+  "fiber_json_solve": {
+    "trusted_gt": true,
+    "source_dir": "/home/hendrik/villa2/global-fiber-sgd/data/bbox_gt",
+    "afv_template": "/home/hendrik/villa2/global-fiber-sgd/data/Paris4_v1.afv",
+    "templates": "/home/hendrik/villa2/global-fiber-sgd",
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/bbox_gt_solve_v1",
+    "devices": "0"
+  }
+}

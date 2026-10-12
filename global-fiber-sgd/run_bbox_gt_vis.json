@@ -1,0 +1,10 @@
+{
+  "fiber_uv_visualization": {
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/bbox_gt_solve_v1/vis",
+    "layout_only": true,
+    "render_height": 1000,
+    "raster_map_only": true,
+    "vector_pdf": true,
+    "solutions": [{"label": "four_fibers", "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/bbox_gt_solve_v1/uv_whole"}]
+  }
+}

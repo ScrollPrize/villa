@@ -118,6 +118,11 @@ def prepare(config):
     signature={key:sha256_file(config[key]) for key in ('database','features','stage1','hv_solution','afv','umbilicus')}
     signature.update(version=2,minimum_length_mm=config.get('minimum_length_mm',10.),
                      sign_cosine_min=config.get('sign_cosine_min',.1),pilot_fibers=config.get('pilot_fibers',0))
+    signature['keep_whole_fibers']=bool(config.get('keep_whole_fibers',False))
+    if config.get('initialization_geometry_cache'):
+        signature['initialization_geometry_cache']=sha256_file(config['initialization_geometry_cache'])
+        signature['initialization_geometry_version']=2
+        signature['initialization_winding_count']=config.get('winding_count',100)
     if anchored(config):
         signature.update(version=3,layout_mode='shared_anchor',h_convention=config.get('h_convention','ccw'))
         signature.update({key:sha256_file(config[key]) for key in ('h_direction_solution','v_direction_solution')})
@@ -137,6 +142,8 @@ def prepare(config):
     with _ro(config['afv']) as db:meta={k:json.loads(v) for k,v in db.execute('SELECT key,value FROM metadata')}
     axis=load_umbilicus_frame(config['umbilicus'],meta['root'])
     kept=labels!=2
+    if config.get('force_keep_fibers',False) and not kept.all():
+        raise ValueError('Trusted GT cannot inherit rejected fibers')
     pilot=int(config.get('pilot_fibers',0))
     if pilot:
         # Deterministic central-z induced subgraph, used ONLY for timing pilot.
@@ -187,7 +194,8 @@ def prepare(config):
         if not np.isfinite(ea).all() or np.any(ea<0) or np.any(ea>arc[-1]+1e-5):
             raise ValueError(f'Constraint arc outside original fiber {row["id"]}')
         perp=ea[events[ep%ecount,11]==0]
-        bounds=split_bounds(arc[-1],perp,minimum);first=len(pieces)
+        bounds=(np.array([0.,arc[-1]]) if config.get('keep_whole_fibers',False)
+                else split_bounds(arc[-1],perp,minimum));first=len(pieces)
         middle=(bounds[:-1]+bounds[1:])/2
         anchors=bounds[:-1] if anchored(config) else middle
         tr=np.interp(anchors,arc,travel);ph=np.interp(anchors,arc,angle)
@@ -220,6 +228,10 @@ def prepare(config):
         parallel=events[:,11].astype(bool),event_ids=events[:,0].astype(np.int64),
         links=np.asarray(links,dtype=np.float64).reshape(-1,4),node_ds=nodes[:,0].astype(np.float32),
         node_phase=nodes[:,1].astype(np.float32),node_z=nodes[:,2].astype(np.float32))
+    if config.get('initialization_geometry_cache'):
+        with np.load(config['initialization_geometry_cache']) as prior:
+            centers,widths=transfer_radial_initial_geometry(prior,r,config)
+        arrays.update(radial_initial_centers=centers,radial_initial_widths=widths)
     cache.parent.mkdir(parents=True,exist_ok=True);temporary=cache.with_suffix('.partial.npz')
     np.savez(temporary,**arrays);temporary.replace(cache)
     stats=dict(signature=signature,original_fibers=len(ids),earlier_rejected=int((labels==2).sum()),
@@ -649,7 +661,7 @@ def geometry_points(d,u,v,b,widths,ids,ds):
     return bucket+(val-b[bucket])/widths[bucket],v[ids]+(d['family'][ids]==1)*ds
 
 
-def edge_readout(d,geometry,widths,e,config=None):
+def edge_readout(d,geometry,widths,e,config=None,state=None):
     _,_,keep,pick,u,v,b=geometry;i=d['i'][e];j=d['j'][e]
     qa,_=geometry_points(d,u,v,b,widths,i,d['ds_a'][e])
     qb,_=geometry_points(d,u,v,b,widths,j,d['ds_b'][e])
@@ -658,6 +670,9 @@ def edge_readout(d,geometry,widths,e,config=None):
         shift=d.get('bucket_shift')
         if shift is None:shift=bucket_event_shift(d)
         delta=pick[j]-pick[i]+shift[e]+.5*(d['family'][j]-d['family'][i])
+        if config.get('bucket_shared_phase',False):
+            if state is None:raise ValueError('Shared-phase readout requires state')
+            delta=delta+state[j,len(widths)+1]-state[i,len(widths)+1]
     return qa,qb,delta,keep[i]&keep[j]
 
 
@@ -665,7 +680,7 @@ def violation_indices(d,state,widths,config):
     geometry=hard_geometry(d,state,widths,config);found=[]
     for start in range(0,len(d['i']),131072):
         e=np.arange(start,min(start+131072,len(d['i'])))
-        _,_,delta,active=edge_readout(d,geometry,widths,e,config)
+        _,_,delta,active=edge_readout(d,geometry,widths,e,config,state)
         wrong=active&(d['sign'][e]!=0)&(delta*d['sign'][e]<-config.get('sign_tolerance',1e-4))
         found.append(e[wrong])
     return np.concatenate(found)
@@ -677,6 +692,7 @@ def audit(d, state, widths, config, indices=None, geometry=None):
     p,labels,keep,pick,u,v,b=geometry;k=len(widths)
     if config.get('broken_threshold') is not None:state=state.astype(np.float64,copy=False)
     extra={'sign_geometry': 'bucket' if config.get('bucket_position_split',False) else 'position'}
+    if config.get('bucket_shared_phase',False):extra['sign_geometry']='bucket_plus_shared_phase'
     if config.get('local_window_radius') is not None:
         radius=config['local_window_radius'];center=p[:,:k].argmax(1)
         mass=p[:,:k].sum(1);selected=np.zeros(len(p),dtype=np.float64)
@@ -710,7 +726,7 @@ def audit(d, state, widths, config, indices=None, geometry=None):
     total=known=bad=retained=0;errors=[];bytype={};minq=np.inf;maxq=-np.inf
     for a in range(0,len(sel),131072):
         e=sel[a:a+131072];i=d['i'][e];j=d['j'][e]
-        qa,qb,delta,active=edge_readout(d,geometry,widths,e,config)
+        qa,qb,delta,active=edge_readout(d,geometry,widths,e,config,state)
         minq=min(minq,qa.min(),qb.min());maxq=max(maxq,qa.max(),qb.max())
         ks=(d['sign'][e]!=0)&active
         wrong=(delta*d['sign'][e]<-config.get('sign_tolerance',1e-4))&ks
@@ -803,6 +819,15 @@ def reference_initial_centers(d,widths,reference,radial_centers):
     return centers
 
 
+def transfer_radial_initial_geometry(prior,radius,config):
+    """Reuse full-corpus geometric calibration for a new small collection."""
+    if 'radial_initial_centers' in prior:
+        raise ValueError('Use full-corpus calibration, not phase-reanchored subset centers')
+    centers,widths=radial_initial_geometry(prior,config)
+    order=np.argsort(prior['radius'],kind='stable')
+    return np.interp(radius,prior['radius'][order],centers[order]),widths
+
+
 def radial_initial_geometry(d,config):
     """Geometric initialization only; never consumes a previous U/V solution.
 
@@ -853,6 +878,8 @@ def fresh_initial_state(d,config):
     state=np.zeros((len(d['family']),3*k+(3 if anchored(config) else 1)),np.float32)
     state[:,:k]=np.maximum(-14.,-.5*((np.arange(k)[None,:]-centers[:,None])/sigma)**2)
     state[:,k]=logsumexp(state[:,:k],axis=1)+np.log(.01/.99)
+    if config.get('force_keep_fibers',False):
+        state[:,k]=-1e30  # Finite structural mask: exactly zero softmax mass/gradient in FP32.
     return state,widths
 
 
@@ -888,6 +915,8 @@ class FullPassGradientAccumulator:
 
 
 def solve(config):
+    if config.get('bucket_shared_phase',False) and (not anchored(config) or not config.get('bucket_position_split',False)):
+        raise ValueError('Shared-phase topology requires shared-anchor bucket position split')
     if config.get('loss_weight_search'):
         from .fiber_uv_weight_search import run as search_weights
         return search_weights(config)
@@ -946,6 +975,10 @@ def solve(config):
     # Reference widths are initialization only, not an added reference prior.
     initial_width=torch.as_tensor(radial_initial_geometry(d,config)[1],device=device)
     if config.get('warm_start'):state,start_width=load_warm_start(config,d,state.shape)
+    if config.get('force_keep_fibers',False):
+        if np.any(d['earlier_labels']==2):
+            raise ValueError('Trusted GT cannot inherit rejected fibers')
+        state[:,k]=-1e30
     embedding=torch.nn.Embedding.from_pretrained(torch.from_numpy(state).to(device),freeze=False,sparse=True)
     raw=torch.nn.Parameter(inverse_widths(torch.as_tensor(start_width,device=device)))
     opt=torch.optim.SparseAdam(embedding.parameters(),lr=config.get('lr',DEFAULT_STATE_LR))
@@ -1048,7 +1081,7 @@ def solve(config):
                                   optimizer_updates=step//updates if accumulated else step)
                     if step:record.update(loss=float(loss.detach()),pair_loss=float(pair.detach()),regularization=float(reg.detach()))
                     if step and full_pass:
-                        means=(pass_losses/(step if benchmark_updates is not None else updates)).cpu().tolist()
+                        means=(pass_losses/((step%every or every) if benchmark_updates is not None else updates)).cpu().tolist()
                         record.update(loss=means[0],pair_loss=means[1],regularization=means[2],
                                       loss_scope=('full objective at pre-update state; diagnostics are post-update' if accumulated else
                                                   'mean online objective across pass updates, not frozen-state global objective'))
@@ -1104,9 +1137,15 @@ def solve(config):
                         data['family'][i],data['family'][j],precise['ds_a'][edges],precise['ds_b'][edges],widths,
                         precise['phase_delta'][edges],data['sign'][edges])
             if benchmark_updates is not None:pair_start=timing_marker()
+            coarse_shift=data['bucket_shift'][edges] if config.get('bucket_position_split',False) else None
+            if config.get('bucket_shared_phase',False):
+                if coarse_shift is None:raise ValueError('Shared-phase topology requires bucket position split')
+                # Fixed shift already contains original anchor fractions and
+                # along-fiber turns. Add only learned shared phase increments.
+                coarse_shift=coarse_shift+embedding(j)[:,k+1]-embedding(i)[:,k+1]
             pair=evaluate_pair(pa[:,:k],pb[:,:k],qa,qb,va,vb,data['phase_delta'][edges],data['family'][j]-data['family'][i],
                 data['sign'][edges],data['distance'][edges],table,config,charge,event_weights,selected,
-                data['bucket_shift'][edges] if config.get('bucket_position_split',False) else None)
+                coarse_shift)
             if benchmark_updates is not None:pair_end=timing_marker()
             for pp,qq,phase_key in ((pa,qa,'phase_a'),(pb,qb,'phase_b')):
                 angle=qq-data[phase_key][edges,None];angle=angle-angle.detach().round()
@@ -1334,7 +1373,7 @@ def report(config):
             disabled=~(keep[i]&keep[j]);stats['original_violations_disabled']=int(disabled.sum())
             stats['original_violations_corrected_while_retained']=int((~disabled).sum()-len(np.intersect1d(before,after)))
             if len(after):
-                _,_,delta,_=edge_readout(d,geometry,s['widths'],after,cfg)
+                _,_,delta,_=edge_readout(d,geometry,s['widths'],after,cfg,s['state'])
                 stats['remaining_violation_magnitude_quantiles']=np.quantile(-delta*d['sign'][after],[0,.5,.95,1]).tolist()
                 stats['remaining_max_endpoint_broken_probability_quantiles']=np.quantile(
                     np.maximum(p[d['i'][after],-1],p[d['j'][after],-1]),[0,.5,.95,1]).tolist()

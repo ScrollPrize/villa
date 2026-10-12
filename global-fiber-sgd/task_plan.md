@@ -1,5 +1,11 @@
 # Global fiber SGD: data reconnaissance
 
+Current: bbox_gt_phase_fix_plan.md; independent review approved.
+
+Current: bbox_gt_eval_plan.md (expanded trusted GT and cross-constraint scoring).
+
+Current: bbox_gt_plan.md, independently reviewed.
+
 Current: uv_loss_search_plan.md, adaptive finite-grid final-L1 weight search.
 
 Current: uv_bucket_lr_plan.md, fresh state10x thenselectedbasewidthLR20/.2.

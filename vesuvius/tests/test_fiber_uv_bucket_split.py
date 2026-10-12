@@ -65,6 +65,42 @@ def test_float32_anchor_rounded_up_at_seam():
     np.testing.assert_array_equal(uv.bucket_event_shift(d),[-1])
 
 
+def test_shared_phase_changes_topology_and_has_gradient():
+    phase=torch.tensor([0.,-2.],requires_grad=True)
+    value=objective(torch.zeros(1,2),torch.zeros(1,2),
+                    config={'position_distance_weight':0.},
+                    bucket_shift=(phase[1]-phase[0]).reshape(1))
+    assert value.item()==48.
+    value.backward()
+    torch.testing.assert_close(phase.grad,torch.tensor([48.,-48.]))
+
+
+def test_shared_phase_original_fraction_not_double_counted():
+    d=dict(i=np.array([0]),j=np.array([1]),phase=np.array([.95,.05]),
+           node_phase=np.array([[.95],[.05]]),phase_a=np.array([1.1]),
+           phase_b=np.array([.1]),phase_delta=np.array([0.]))
+    # Original endpoint difference -1, plus learned delta +.3 => -.7.
+    correction=uv.bucket_event_shift(d)+.3
+    np.testing.assert_allclose(correction,[-.7])
+    with pytest.raises(ValueError,match='shared-anchor'):
+        uv.solve(dict(bucket_shared_phase=True,bucket_position_split=True))
+
+
+def test_shared_phase_readout_and_global_shift_invariance():
+    d=dict(i=np.array([0]),j=np.array([1]),family=np.array([0,1]),
+           ds_a=np.array([0.]),ds_b=np.array([0.]),phase_delta=np.array([.1]),
+           bucket_shift=np.array([-1.]))
+    geometry=(None,None,np.ones(2,dtype=bool),np.array([10,11]),
+              np.array([100.,-100.]),np.zeros(2),np.array([0.,200.]))
+    state=np.zeros((2,4));state[:,2]=[.2,1.2]
+    cfg=dict(CFG,bucket_shared_phase=True)
+    assert uv.edge_readout(d,geometry,np.array([200.]),np.array([0]),cfg,state)[2][0]==1.5
+    state[:,2]+=10
+    np.testing.assert_allclose(uv.edge_readout(d,geometry,np.array([200.]),np.array([0]),cfg,state)[2],[1.5])
+    with pytest.raises(ValueError,match='requires state'):
+        uv.edge_readout(d,geometry,np.array([200.]),np.array([0]),cfg)
+
+
 def test_readout_uses_bucket_not_width():
     d=dict(i=np.array([0]),j=np.array([1]),family=np.array([0,1]),
            ds_a=np.array([0.]),ds_b=np.array([0.]),phase_delta=np.array([.1]),

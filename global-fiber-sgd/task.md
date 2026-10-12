@@ -1,5 +1,11 @@
 # Reference-selected regional solve
 
+Current: expanded seven-fiber intact trusted solve, then constraint-vote GT
+evaluation of two saved solutions. See bbox_gt_eval_plan.md; comparison artifact
+identity and disabled-piece vote convention awaiting user clarification.
+
+Current: four bbox_gt JSON fibers, independent solve; bbox_gt_plan.md.
+
 Current: stop adaptive search now and commit the best completed result as new
 benchmark baseline. Preserve all completed trials; no further solves authorized.
 

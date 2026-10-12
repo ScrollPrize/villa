@@ -51,6 +51,9 @@ def bp_metrics(log):
 
 
 def run(config):
+    if 'fiber_json_solve' in config:
+        from .fiber_json_solve import run as json_solve
+        return json_solve(config['fiber_json_solve'])
     if 'fiber_uv_reference_subset' in config:
         from .fiber_uv_reference_subset import run as reference_subset
         return reference_subset(config['fiber_uv_reference_subset'])
