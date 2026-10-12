@@ -13,6 +13,13 @@ MOVES = ((('neural_tracing', 'fiber_follow'), ('neural_tracing', 'tracers', 'fib
          (('neural_tracing', 'sheet_tracing'), ('neural_tracing', 'tracers', 'sheets')))
 
 
+def canonical_ct_url(url):
+    """Identity shared by the public CT store's S3 and HTTPS spellings."""
+    return str(url).rstrip('/').replace('https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/',
+        's3://vesuvius-challenge-open-data/').replace('https://vesuvius-challenge-open-data.s3.amazonaws.com/',
+        's3://vesuvius-challenge-open-data/')
+
+
 def moved_path(path):
     """``path`` with a tracer package's former location replaced by its current one."""
     parts = PurePosixPath(str(path)).parts

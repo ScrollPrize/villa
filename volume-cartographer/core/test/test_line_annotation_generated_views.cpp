@@ -5497,19 +5497,32 @@ TEST_CASE("fiber follow span history retains interior points and excludes the op
     for (size_t i = 0; i < 2; ++i) {
         request.controlPoints[i].segmentToNext.emplace();
         request.controlPoints[i].segmentToNext->interpGoal = vc3d::line_annotation::SegmentInterpolationGoal::Trace;
+        request.controlPoints[i].direction = cv::Vec3d{1.0, 0.0, 0.0};
     }
     request.baseNormalSampler = &normals;
     request.extrapolationDistanceBaseVoxels = 0.0;
     request.lasagnaConfig.segmentLength = 4.0;
     request.lasagnaConfig.maxIterations = 20;
     request.lasagnaConfig.printSolverProgress = false;
+    bool singleSpan = false;
+    SUBCASE("continue outward using the interior span as history") {}
+    SUBCASE("first new control before the seed") {
+        singleSpan = true;
+        request.controlPoints.resize(2);
+        request.controlPoints[0].isSeed = false;
+        request.controlPoints[1].isSeed = true;
+    }
     int calls = 0;
     request.externalSegment = [&](const auto& span) {
-        CHECK(span.referenceLine.front()[0] == doctest::Approx(0.0));
-        CHECK(span.startIndex == size_t(calls * 4));
-        CHECK(span.targetIndex == size_t((calls + 1) * 4));
+        const bool reverse = calls == 0;
+        const double end = singleSpan ? 16.0 : 32.0;
+        CHECK(span.referenceLine.front()[0] == doctest::Approx(reverse ? end : 0.0));
+        CHECK(span.startIndex == (singleSpan ? 0 : 4));
+        CHECK(span.targetIndex == (singleSpan ? 4 : 8));
+        REQUIRE(span.startDirection);
+        CHECK((*span.startDirection)[0] == doctest::Approx(reverse ? -1.0 : 1.0));
         for (size_t i = 0; i <= span.startIndex; ++i)
-            CHECK(span.referenceLine[i][0] == doctest::Approx(double(i * 4)));
+            CHECK(span.referenceLine[i][0] == doctest::Approx(reverse ? end - double(i * 4) : double(i * 4)));
         ++calls;
         vc::fiber_tracer::FiberTraceSegmentResult result;
         result.accepted = true;
@@ -5518,8 +5531,12 @@ TEST_CASE("fiber follow span history retains interior points and excludes the op
         return result;
     };
     const auto result = vc3d::line_annotation::optimizeFiberWithNativeFallback(std::move(request));
-    CHECK(calls == 2);
-    CHECK(result.nativeSegments == 2);
+    CHECK(calls == (singleSpan ? 1 : 2));
+    CHECK(result.nativeSegments == (singleSpan ? 1 : 2));
+    CHECK(result.optimization.line.points.front().position[0] == doctest::Approx(0.0));
+    CHECK(result.optimization.line.points.back().position[0] == doctest::Approx(singleSpan ? 16.0 : 32.0));
+    for (size_t i = 1; i < result.optimization.line.points.size(); ++i)
+        CHECK(result.optimization.line.points[i].position[0] > result.optimization.line.points[i-1].position[0]);
 }
 
 TEST_CASE("fiber mode reports no-progress extrapolation fallback reasons")

@@ -12304,11 +12304,16 @@ bool LineAnnotationController::ensureFiberFollowService(bool headless, LineAnnot
                            dialog, &LineAnnotationDialog::appendFiberTraceDetail);
     }
     const auto disconnectProgress = qScopeGuard([&]() { disconnect(progress); });
+    const auto volume = _state ? _state->currentVolume() : nullptr;
+    const QString volumeSource = volume && volume->isRemote()
+        ? QString::fromStdString(volume->remoteUrl()) : QString();
+    const QString volumeLocator = volume && volume->isRemote()
+        ? QString::fromStdString(volume->remoteLocator()) : QString();
     QString error;
     if (FiberFollowService::instance().ensureRunning(
             settings.value(vc3d::settings::line_annotation::FIBER_FOLLOW_CHECKPOINT).toString(),
             settings.value(vc3d::settings::line_annotation::FIBER_FOLLOW_PYTHON).toString(),
-            &error)) {
+            &error, volumeSource, volumeLocator)) {
         if (dialog)
             dialog->setFiberTraceStatus(tr("Fiber follow: model ready"), {}, false);
         return true;

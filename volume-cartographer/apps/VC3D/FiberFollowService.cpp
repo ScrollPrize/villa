@@ -2,12 +2,14 @@
 
 #include "PythonExecutable.hpp"
 #include "SocketRequest.hpp"
+#include "VCSettings.hpp"
 
 #include <QCoreApplication>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFileInfo>
 #include <QStandardPaths>
+#include <QProcessEnvironment>
 #include <QThread>
 #include <QUuid>
 
@@ -64,7 +66,8 @@ void FiberFollowService::stop()
     }
 }
 
-bool FiberFollowService::ensureRunning(const QString& checkpoint, const QString& python, QString* error)
+bool FiberFollowService::ensureRunning(const QString& checkpoint, const QString& python, QString* error,
+                                      const QString& volumeSource, const QString& volumeLocator)
 {
     const auto fail = [error](const QString& message) {
         if (error) {
@@ -80,7 +83,8 @@ bool FiberFollowService::ensureRunning(const QString& checkpoint, const QString&
                         .arg(checkpointPath));
     }
     const QString interpreter = vc3d::pythonExecutableForServices(python);
-    if (isRunning() && _checkpoint == checkpointPath && _python == interpreter) {
+    if (isRunning() && _checkpoint == checkpointPath && _python == interpreter &&
+        _volumeSource == volumeSource && _volumeLocator == volumeLocator) {
         return true;
     }
     stop();
@@ -89,6 +93,23 @@ bool FiberFollowService::ensureRunning(const QString& checkpoint, const QString&
         .filePath(QStringLiteral("vc3d_fiber_follow_%1.sock")
                       .arg(QUuid::createUuid().toString(QUuid::WithoutBraces).left(8)));
     _process = std::make_unique<QProcess>();
+    auto environment = QProcessEnvironment::systemEnvironment();
+    // The native Python chunk reader uses the same configuration, codecs and
+    // persistent cache as the viewer. Keep this opt-in scoped to the service.
+    environment.insert(QStringLiteral("VC3D_CONFIG_DIR"), QFileInfo(vc3d::settingsFilePath()).absolutePath());
+    environment.insert(QStringLiteral("VESUVIUS_CT_READER"), QStringLiteral("vc3d"));
+    environment.insert(QStringLiteral("VESUVIUS_VC3D_VOLUME_SOURCE"), volumeSource);
+    environment.insert(QStringLiteral("VESUVIUS_VC3D_VOLUME_LOCATOR"), volumeLocator);
+    // Source builds ship matching bindings next to bin/. Prefer them over an
+    // older copy installed in the selected Python environment.
+    const QString bindings = QDir(QCoreApplication::applicationDirPath()).absoluteFilePath(QStringLiteral("../python"));
+    if (QFileInfo::exists(QDir(bindings).filePath(QStringLiteral("vc/__init__.py")))) {
+        const QString existing = environment.value(QStringLiteral("PYTHONPATH"));
+        environment.insert(QStringLiteral("PYTHONPATH"), existing.isEmpty()
+            ? bindings : bindings + QDir::listSeparator() + existing);
+    }
+    environment.insert(QStringLiteral("PYTHONUNBUFFERED"), QStringLiteral("1"));
+    _process->setProcessEnvironment(environment);
     _process->setProcessChannelMode(QProcess::MergedChannels);
     _output.clear();
     connect(_process.get(), &QProcess::readyReadStandardOutput, this, [this]() {
@@ -136,6 +157,8 @@ bool FiberFollowService::ensureRunning(const QString& checkpoint, const QString&
     });
     _checkpoint = checkpointPath;
     _python = interpreter;
+    _volumeSource = volumeSource;
+    _volumeLocator = volumeLocator;
     {
         std::lock_guard lock(_mutex);
         _socketPath = socket.toStdString();

@@ -792,14 +792,33 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
         std::string traceException;
         try {
             if (request.externalSegment) {
-                // Do not resume from the unconfirmed tail before the first
-                // control. The first span starts with a fresh seed heading.
+                // At the first span, resume from the inner (right) control
+                // and trace OUT toward the first control. This matters when
+                // growing by adding a new control before the old first one:
+                // its valid history lies to the right, in reverse order.
                 const size_t historyBegin = originalControlIndices.front();
-                traceRequest.referenceLine.erase(traceRequest.referenceLine.begin(),
-                    traceRequest.referenceLine.begin() + static_cast<std::ptrdiff_t>(historyBegin));
-                traceRequest.startIndex -= historyBegin;
-                traceRequest.targetIndex -= historyBegin;
+                const size_t historyEnd = originalControlIndices.back();
+                const bool reverse = spanIndex == 0 &&
+                    (last < historyEnd || (!owner.isSeed && request.controlPoints[spanIndex+1].isSeed));
+                traceRequest.referenceLine.assign(referenceTrace.begin() + historyBegin,
+                                                   referenceTrace.begin() + historyEnd + 1);
+                if (reverse) {
+                    std::reverse(traceRequest.referenceLine.begin(), traceRequest.referenceLine.end());
+                    traceRequest.startIndex = historyEnd - last;
+                    traceRequest.targetIndex = historyEnd - first;
+                    traceRequest.startDirection = request.controlPoints[spanIndex+1].direction;
+                    traceRequest.targetDirection = owner.direction;
+                    if (traceRequest.startDirection)
+                        traceRequest.startDirection = -*traceRequest.startDirection;
+                    if (traceRequest.targetDirection)
+                        traceRequest.targetDirection = -*traceRequest.targetDirection;
+                } else {
+                    traceRequest.startIndex -= historyBegin;
+                    traceRequest.targetIndex -= historyBegin;
+                }
                 traced = request.externalSegment(traceRequest);
+                if (reverse)
+                    std::reverse(traced->fusedLine.begin(), traced->fusedLine.end());
             } else {
                 if (!request.predictions || !request.traceNormalSampler) {
                     throw std::runtime_error(

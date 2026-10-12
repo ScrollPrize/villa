@@ -104,7 +104,7 @@ def configure_volume(args, spec, model_cfg, checkpoint):
         spec.ct_zarr = get('ct')
     if get('cache_dir'):
         spec.cache_dir = get('cache_dir')
-    elif str(spec.ct_zarr).startswith(('s3://', 'http://', 'https://')) and not (
+    elif os.environ.get('VESUVIUS_CT_READER') != 'vc3d' and str(spec.ct_zarr).startswith(('s3://', 'http://', 'https://')) and not (
             spec.cache_dir and Path(spec.cache_dir).is_dir()):
         spec.cache_dir = default_cache_dir()
         print(f'CT chunk cache: {spec.cache_dir} (pass --cache-dir to choose another)', flush=True)
