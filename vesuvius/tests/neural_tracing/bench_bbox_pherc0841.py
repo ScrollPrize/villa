@@ -7,6 +7,7 @@ generator in the checkout. No checkpoint/GPU/network volume needed.
 
 From the villa checkout:
     python vesuvius/tests/neural_tracing/bench_bbox_pherc0841.py --repeats 4
+    python vesuvius/tests/neural_tracing/bench_bbox_pherc0841.py --repeats 4 --crop-size 128 384 384
 Dependencies: numpy, tifffile, tqdm
 """
 from __future__ import annotations
@@ -131,10 +132,10 @@ def record_signature(result):
     ]
 
 
-def timed(module, points, overlap):
+def timed(module, points, overlap, crop_size):
     start = time.perf_counter()
     result = module._generate_segment_cover_records(
-        points, CROP, overlap=overlap, prune_bboxes=True, band_workers=1,
+        points, crop_size, overlap=overlap, prune_bboxes=True, band_workers=1,
         show_progress=False,
     )
     return result, time.perf_counter() - start
@@ -156,6 +157,8 @@ def main(argv=None):
                         help="Even number of paired trials per case (default: 4)")
     parser.add_argument("--window", choices=("A", "B", "both"), default="both")
     parser.add_argument("--overlap", choices=("0.0", "0.5", "both"), default="both")
+    parser.add_argument("--crop-size", type=int, nargs=3, default=CROP, metavar=("Z", "Y", "X"),
+                        help="3D input crop. Official Copy checkpoint currently specifies 128 384 384")
     parser.add_argument("--baseline", default=DEFAULT_BASELINE,
                         help="Git ref with unmodified generator (default: pinned base commit)")
     parser.add_argument("--output", type=Path, default=None,
@@ -163,6 +166,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not 2 <= args.repeats <= 10 or args.repeats % 2:
         parser.error("--repeats must be even and between 2 and 10 to counterbalance run order")
+    if any(int(d) <= 0 for d in args.crop_size):
+        parser.error("--crop-size needs three positive integers")
     baseline = subprocess.run(
         ["git", "show", f"{args.baseline}:{GENERATOR_PATH}"],
         cwd=REPO_ROOT, capture_output=True, text=True, check=True,
@@ -188,7 +193,7 @@ def main(argv=None):
         "machine_arch": platform.machine(),
         "execution": "Python source, NumPy/tifffile wheels; no villa native build",
         "measurement": "perf_counter wall time; background CPU tasks may affect samples",
-        "crop_size": list(CROP),
+        "crop_size": list(args.crop_size),
         "prune_bboxes": True,
         "band_workers": 1,
         "baseline_ref": args.baseline,
@@ -208,11 +213,11 @@ def main(argv=None):
                 # Alternate run order with an EVEN trial count so each
                 # implementation runs first equally often.
                 if i % 2 == 0:
-                    old, t_old = timed(before, points, overlap)
-                    new, t_new = timed(after, points, overlap)
+                    old, t_old = timed(before, points, overlap, args.crop_size)
+                    new, t_new = timed(after, points, overlap, args.crop_size)
                 else:
-                    new, t_new = timed(after, points, overlap)
-                    old, t_old = timed(before, points, overlap)
+                    new, t_new = timed(after, points, overlap, args.crop_size)
+                    old, t_old = timed(before, points, overlap, args.crop_size)
                 old_sig = record_signature(old)
                 new_sig = record_signature(new)
                 if old_sig != new_sig:
