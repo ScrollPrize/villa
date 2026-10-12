@@ -125,7 +125,8 @@ def test_compile_fallback_returns_eager_model_when_compiler_is_unavailable(monke
     )
 
     assert prepared is source
-    assert device.type in {"cpu", "cuda"}
+    # get_accelerator() picks MPS on Apple Silicon.
+    assert device.type in {"cpu", "cuda", "mps"}
 
 
 class _BackendThatFailsWhenItRuns(nn.Module):
