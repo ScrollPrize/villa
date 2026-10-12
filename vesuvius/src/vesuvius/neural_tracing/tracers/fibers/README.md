@@ -200,7 +200,7 @@ The fiber tracer lives in `tracers/fibers/`; the parts other tracers can reuse s
 | `frames` | Crop frames: CT structure-tensor headings and frames (`ct.py`), the frozen learned frame model (`learned.py`) |
 | `tracing` | The tracer and rollout (`trace.py`), the tracing CLI (`inference.py`) |
 | `train` | Entry point and run configuration, the training update (`step.py`), objectives, logging, live continuation, DAgger collection (`dagger/`) |
-| `evaluation` | Trace scoring (`scoring.py`), the offline calibrate/run/compare protocol (`protocol.py`), training-time monitoring (`monitor/`), long-trace audits (`audit/`) |
+| `evaluation` | Trace scoring (`scoring.py`), the offline calibrate/run/compare protocol (`protocol.py`), training-time monitoring (`monitor/`) |
 | `heading_model` | Heading/normal trainer and the frame predictor network used by `frames/learned.py` |
 | `legacy` | Inference for pre-cleanup checkpoints |
 | `scripts` | Launch/stop, label snapping, checkpoint conversion, the pre-launch sampler check |
@@ -220,36 +220,3 @@ OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 MPLCONFIGDIR=/tmp/fiber-mpl \
 Tests cover the three model types, compiled graph capture, weight initialization/resume, gradient paths, supervision
 masks, deterministic flow tracing, observation parity, collection and the standalone heading model. CUDA tests skip when CUDA is unavailable. Small-fixture checks
 establish implementation correctness; they do not establish trained tracing accuracy or production GPU throughput.
-
-Long held-out failure audits can reuse the shared tracer and scorers while recording every
-policy decision and scoring the same path at 400, 1,000, and 2,000 voxels:
-
-```bash
-../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.fibers.evaluation.audit.long_trace_audit \
-  --checkpoint output/RUN/ckpt_079000.pt --out output/RUN/long_audit/primary --count 64 --batch 8
-```
-
-This evaluates the fixed monitor seeds plus distinct calibration fibers sampled without
-replacement with probability proportional to annotated length. New seeds use CT headings,
-random directions, and the first 20% of a fiber (at least 32 voxels from its starting end)
-to favor long annotated continuations. Final-test fibers are excluded. The resulting
-`seeds.json` is frozen before rollout and can be reused with `--seed-manifest` for paired
-checkpoint or policy comparisons (`--confidence`, `--n-commit`, `--sources`, `--cohorts`).
-Results describe this length-biased diagnostic population, not uniform fiber performance.
-Saved NPZ files contain paths, annotations and decision inputs; JSON rows retain strict
-first-failure, local geometric agreement, annotation censoring and policy-audit outcomes.
-Local agreement is not independent confirmation of fiber identity.
-
-Render CT sections around selected departures and stops, plus aggregate diagnostics:
-
-```bash
-../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.fibers.evaluation.audit.summarize_long_audit \
-  output/RUN/long_audit --render
-../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.fibers.evaluation.audit.annotation_audit \
-  output/RUN/long_audit
-```
-
-The report expects the main evaluation in `long_audit/primary`. Optional paired runs
-in `confidence_030`, `confidence_080`, `commit_04`, and `checkpoint_055000` are compared on identical
-seed keys with fiber-resampled 95% intervals. Annotation proximity is a review aid,
-not a certified switch detector; the annotation audit uses the local Paris catalog.

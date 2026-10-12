@@ -8,9 +8,8 @@ from pathlib import Path
 
 import numpy as np
 
-from vesuvius.neural_tracing.tracers.fibers.data.location_weights import CELL, STRIDE, VERSION
-from vesuvius.neural_tracing.tracers.fibers.evaluation.audit import failure_scoring as fs
-from vesuvius.neural_tracing.tracers.fibers.evaluation.audit.failure_scoring import smoothed
+from vesuvius.neural_tracing.tracers.fibers.data.location_weights import (
+    CELL, STRIDE, VERSION, compression, init_volumes, smoothed, volume)
 
 
 def bend_profile(points, s, stride=STRIDE):
@@ -28,7 +27,7 @@ def bend_profile(points, s, stride=STRIDE):
 
 def _compression_task(task):
     name, point = task
-    m = fs.compression(fs.volume(name), np.asarray(point))
+    m = compression(volume(name), np.asarray(point))
     return m['sheetness'], m['sheet_modulation']
 
 
@@ -47,7 +46,7 @@ def build(source, document_path, fibers, out, workers=16):
     cells = np.floor(positions/CELL).astype(np.int64)
     _, first, cell_of = np.unique(cells, axis=0, return_index=True, return_inverse=True)
     print(f"{source['name']}: {len(names)} fibers, {len(arcs)} locations, {len(first)} occupied {CELL:g}-vox cells", flush=True)
-    with ProcessPoolExecutor(workers, initializer=fs._init, initargs=(str(document_path),)) as pool:
+    with ProcessPoolExecutor(workers, initializer=init_volumes, initargs=(str(document_path),)) as pool:
         measured = np.asarray(list(pool.map(_compression_task, [(source['name'], positions[i]) for i in first], chunksize=16)))
     sheetness, modulation = measured[cell_of.ravel(), 0], measured[cell_of.ravel(), 1]
     pct = lambda v: np.searchsorted(np.sort(v), v)/len(v)
