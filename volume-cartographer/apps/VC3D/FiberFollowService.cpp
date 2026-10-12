@@ -72,9 +72,12 @@ bool FiberFollowService::ensureRunning(const QString& checkpoint, const QString&
         }
         return false;
     };
-    const QString checkpointPath = QFileInfo(checkpoint).absoluteFilePath();
-    if (checkpoint.trimmed().isEmpty() || !QFileInfo(checkpointPath).isFile()) {
-        return fail(tr("Choose a fiber-follow checkpoint first (Line Annotation menu → Fiber follow model)."));
+    const QString checkpointPath = checkpoint.trimmed().isEmpty()
+        ? QString() : QFileInfo(checkpoint).absoluteFilePath();
+    if (!checkpointPath.isEmpty() && !QFileInfo(checkpointPath).isFile()) {
+        return fail(tr("The fiber-follow checkpoint does not exist: %1. Choose a checkpoint or use the default "
+                       "Hugging Face model (Line Annotation menu → Fiber follow model).")
+                        .arg(checkpointPath));
     }
     const QString interpreter = vc3d::pythonExecutableForServices(python);
     if (isRunning() && _checkpoint == checkpointPath && _python == interpreter) {
@@ -95,11 +98,13 @@ bool FiberFollowService::ensureRunning(const QString& checkpoint, const QString&
             emit statusMessage(line.trimmed());
         }
     });
-    const QStringList arguments{
+    QStringList arguments{
         QStringLiteral("-m"), QStringLiteral("vesuvius.neural_tracing.tracers.fibers.tracing.service"),
-        QStringLiteral("--checkpoint"), checkpointPath,
         QStringLiteral("--socket"), socket,
         QStringLiteral("--parent-pid"), QString::number(QCoreApplication::applicationPid())};
+    if (!checkpointPath.isEmpty()) {
+        arguments << QStringLiteral("--checkpoint") << checkpointPath;
+    }
     emit statusMessage(tr("Starting the fiber-follow model with %1…").arg(interpreter));
     _process->start(interpreter, arguments);
     if (!_process->waitForStarted(30000)) {
@@ -135,7 +140,8 @@ bool FiberFollowService::ensureRunning(const QString& checkpoint, const QString&
         std::lock_guard lock(_mutex);
         _socketPath = socket.toStdString();
     }
-    emit statusMessage(tr("Fiber-follow model ready: %1").arg(QFileInfo(checkpointPath).fileName()));
+    emit statusMessage(tr("Fiber-follow model ready: %1").arg(checkpointPath.isEmpty()
+        ? tr("default (Hugging Face)") : QFileInfo(checkpointPath).fileName()));
     return true;
 }
 

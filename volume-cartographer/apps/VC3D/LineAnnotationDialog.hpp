@@ -30,6 +30,7 @@ class QGraphicsPathItem;
 class QGraphicsRectItem;
 class QGraphicsSimpleTextItem;
 class QLabel;
+class QPlainTextEdit;
 class QMdiArea;
 class QMdiSubWindow;
 class QPoint;
@@ -193,6 +194,10 @@ public:
     // re-optimization runs (edits coalesce in the controller).
     void setOptimizationBusy(bool busy, bool blockInput = true);
     void setOptimizationStatus(bool optimized);
+    void setFiberTraceStatus(const QString& summary, const QString& details,
+                            bool running, bool warning = false);
+    void appendFiberTraceDetail(const QString& detail);
+    void setFiberTraceProgress(const QString& summary);
     // Whether a line solve is running and whether edits are queued for one:
     // the overview bar keeps its settled dot layout while either holds (in
     // auto mode; manual mode never dispatches the queue) and adopts the live
@@ -620,6 +625,14 @@ private:
     QLabel* _fiberNameLabel = nullptr;
     QPointer<QLabel> _optimizationStatusLabel;
     bool _optimizationStatusOptimized = false;
+    QWidget* _fiberTraceStatus = nullptr;
+    QLabel* _fiberTraceStatusText = nullptr;
+    QProgressBar* _fiberTraceProgress = nullptr;
+    QPlainTextEdit* _fiberTraceDetails = nullptr;
+    QTimer* _fiberTraceTimer = nullptr;
+    QElapsedTimer _fiberTraceElapsed;
+    QString _fiberTraceSummary;
+    bool _fiberTraceRunning = false;
     bool _lineSolveRunning = false;
     bool _lineSolvePending = false;
     // Set by every geometry/controls publish, cleared by the controller's

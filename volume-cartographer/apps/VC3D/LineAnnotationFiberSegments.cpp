@@ -470,20 +470,19 @@ int replaceOpenTailsWithNative(
         }
         const double extrapolationTrace = coordinates.baseDistanceToTrace(
             request.extrapolationDistanceBaseVoxels);
-        const auto traceTail = [&](int endpoint, int inner) {
+        const auto traceTail = [&](int endpoint, int inner, bool left) {
             auto direction=finalPoints[size_t(endpoint)]-finalPoints[size_t(inner)];
-            const auto& annotated=endpoint==firstControl ?
+            const auto& annotated=left ?
                 request.controlPoints.front().direction : request.controlPoints.back().direction;
-            if (annotated) direction=endpoint==firstControl ? -*annotated : *annotated;
+            if (annotated) direction=left ? -*annotated : *annotated;
             if (request.externalExtrapolation) {
-                // The line leading into the endpoint, in travel order.
-                std::vector<cv::Vec3d> history;
-                if (endpoint == firstControl) {
-                    history.assign(finalPoints.rbegin(),
-                                   finalPoints.rend() - static_cast<std::ptrdiff_t>(firstControl));
-                } else {
-                    history.assign(finalPoints.begin(), finalPoints.begin() + lastControl + 1);
-                }
+                // Only the annotated interval is observed history. Opposite
+                // extrapolated tails are predictions, not evidence for the
+                // heading. A single control is a fresh seed on BOTH sides.
+                std::vector<cv::Vec3d> history(finalPoints.begin() + firstControl,
+                                              finalPoints.begin() + lastControl + 1);
+                if (left)
+                    std::reverse(history.begin(), history.end());
                 return request.externalExtrapolation(
                     coordinates.baseToTrace(history), direction, extrapolationTrace);
             }
@@ -498,7 +497,7 @@ int replaceOpenTailsWithNative(
         std::optional<vc::fiber_tracer::FiberTraceOneWayResult> left;
         std::string leftException;
         try {
-            left = traceTail(firstControl, firstControl + 1);
+            left = traceTail(firstControl, firstControl + 1, true);
         } catch (const std::exception& ex) {
             leftException = ex.what();
             left.reset();
@@ -529,7 +528,7 @@ int replaceOpenTailsWithNative(
         std::optional<vc::fiber_tracer::FiberTraceOneWayResult> right;
         std::string rightException;
         try {
-            right = traceTail(lastControl, lastControl - 1);
+            right = traceTail(lastControl, lastControl - 1, false);
         } catch (const std::exception& ex) {
             rightException = ex.what();
             right.reset();
@@ -793,6 +792,13 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
         std::string traceException;
         try {
             if (request.externalSegment) {
+                // Do not resume from the unconfirmed tail before the first
+                // control. The first span starts with a fresh seed heading.
+                const size_t historyBegin = originalControlIndices.front();
+                traceRequest.referenceLine.erase(traceRequest.referenceLine.begin(),
+                    traceRequest.referenceLine.begin() + static_cast<std::ptrdiff_t>(historyBegin));
+                traceRequest.startIndex -= historyBegin;
+                traceRequest.targetIndex -= historyBegin;
                 traced = request.externalSegment(traceRequest);
             } else {
                 if (!request.predictions || !request.traceNormalSampler) {

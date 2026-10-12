@@ -325,6 +325,7 @@ namespace line_annotation {
     // prediction-field tracer, for open-tail extrapolation and Trace spans.
     constexpr auto FIBER_FOLLOW_ENABLED = "lineAnnotation/fiber_follow_enabled";
     constexpr bool FIBER_FOLLOW_ENABLED_DEFAULT = false;
+    // Empty: the service's default Hugging Face model; otherwise a local checkpoint override.
     constexpr auto FIBER_FOLLOW_CHECKPOINT = "lineAnnotation/fiber_follow_checkpoint";
     // Empty: the Python environment VC3D was started from.
     constexpr auto FIBER_FOLLOW_PYTHON = "lineAnnotation/fiber_follow_python";

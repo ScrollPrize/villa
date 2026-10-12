@@ -25,6 +25,7 @@ public:
 
     // GUI thread. Starts (or restarts, for another checkpoint or interpreter)
     // the service and waits until it listens, keeping the UI responsive.
+    // An empty checkpoint uses the service's default Hugging Face model.
     // Returns false with *error set on failure.
     bool ensureRunning(const QString& checkpoint, const QString& python, QString* error = nullptr);
     void stop();

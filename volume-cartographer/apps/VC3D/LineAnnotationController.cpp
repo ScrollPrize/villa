@@ -2403,7 +2403,8 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
             // Load the model now rather than at the first trace.
             if (fiberFollowEnabled()) {
                 auto* pane = paneForSurface(surfaceName);
-                ensureFiberFollowService(pane && pane->session && pane->session->suppressErrorDialogs);
+                ensureFiberFollowService(pane && pane->session && pane->session->suppressErrorDialogs,
+                                         pane ? pane->dialog.data() : nullptr);
             }
         });
         connect(dialog, &LineAnnotationDialog::fiberWidthChanged, this, [this, surfaceName](double width) {
@@ -7825,7 +7826,7 @@ void LineAnnotationController::handleLineSeed(const std::string& surfaceName,
         if (session.fiberOptimizationMode ==
                 vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d &&
             fiberFollowEnabled()) {
-            if (!ensureFiberFollowService(session.suppressErrorDialogs)) {
+            if (!ensureFiberFollowService(session.suppressErrorDialogs, pane->dialog)) {
                 return;
             }
             session.nativeSeedTracePending = true;
@@ -12290,20 +12291,30 @@ bool LineAnnotationController::fiberFollowEnabled()
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     return settings.value(vc3d::settings::line_annotation::FIBER_FOLLOW_ENABLED,
-                          vc3d::settings::line_annotation::FIBER_FOLLOW_ENABLED_DEFAULT).toBool() &&
-        !settings.value(vc3d::settings::line_annotation::FIBER_FOLLOW_CHECKPOINT).toString().isEmpty();
+                          vc3d::settings::line_annotation::FIBER_FOLLOW_ENABLED_DEFAULT).toBool();
 }
 
-bool LineAnnotationController::ensureFiberFollowService(bool headless)
+bool LineAnnotationController::ensureFiberFollowService(bool headless, LineAnnotationDialog* dialog)
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    QMetaObject::Connection progress;
+    if (dialog) {
+        dialog->setFiberTraceStatus(tr("Fiber follow: preparing model…"), QStringLiteral(""), true);
+        progress = connect(&FiberFollowService::instance(), &FiberFollowService::statusMessage,
+                           dialog, &LineAnnotationDialog::appendFiberTraceDetail);
+    }
+    const auto disconnectProgress = qScopeGuard([&]() { disconnect(progress); });
     QString error;
     if (FiberFollowService::instance().ensureRunning(
             settings.value(vc3d::settings::line_annotation::FIBER_FOLLOW_CHECKPOINT).toString(),
             settings.value(vc3d::settings::line_annotation::FIBER_FOLLOW_PYTHON).toString(),
             &error)) {
+        if (dialog)
+            dialog->setFiberTraceStatus(tr("Fiber follow: model ready"), {}, false);
         return true;
     }
+    if (dialog)
+        dialog->setFiberTraceStatus(tr("Fiber follow: model could not start — %1").arg(error), error, false, true);
     showError(tr("Fiber-follow model: %1").arg(error), headless);
     return false;
 }
@@ -12341,11 +12352,13 @@ void LineAnnotationController::installFiberFollowTracer(
         }
         return out;
     };
-    if (!(baseUm > 0.0) || !std::isfinite(baseUm)) {
-        return;  // no voxel size to map coordinates: keep the native tracer
-    }
+    const auto checkVoxelSize = [baseUm]() {
+        if (!(baseUm > 0.0) || !std::isfinite(baseUm))
+            throw std::runtime_error("Fiber follow needs a valid volume voxel size to map coordinates.");
+    };
     request.externalExtrapolation = [=](const std::vector<cv::Vec3d>& history, const cv::Vec3d& direction,
                                         double distance) {
+        checkVoxelSize();
         const auto reply = FiberFollowService::instance().request({
             {"op", "extrapolate"}, {"history", points(history)}, {"direction", vector(direction)},
             {"distance", distance * toBase}, {"base_um", baseUm}, {"family", family}});
@@ -12357,6 +12370,7 @@ void LineAnnotationController::installFiberFollowTracer(
         return result;
     };
     request.externalSegment = [=](const vc::fiber_tracer::FiberTraceSegmentRequest& span) {
+        checkVoxelSize();
         std::vector<cv::Vec3d> history(span.referenceLine.begin(),
                                        span.referenceLine.begin() + static_cast<std::ptrdiff_t>(span.startIndex) + 1);
         nlohmann::json body{{"op", "segment"}, {"history", points(history)},
@@ -12496,7 +12510,9 @@ void LineAnnotationController::startFiberModeOptimization(
                                 vc3d::line_annotation::SegmentInterpolationGoal::Trace;
                     });
     if (needsTrace && fiberFollowEnabled()) {
-        if (!ensureFiberFollowService(session.suppressErrorDialogs)) {
+        auto* tracePane = paneForSurface(session.surfaceName);
+        if (!ensureFiberFollowService(session.suppressErrorDialogs,
+                                      tracePane ? tracePane->dialog.data() : nullptr)) {
             return;
         }
     } else if (needsTrace &&
@@ -12584,6 +12600,18 @@ void LineAnnotationController::startFiberModeOptimization(
     auto request = makeFiberModeOptimizationRequest(
         session, retraceAll, std::move(dirtySegments), globalGoalsOnly);
     request.cancelFlag = session.runningSolveCancel.get();
+    const bool usingFiberFollow = bool(request.externalExtrapolation);
+    if (usingFiberFollow && pane && pane->dialog)
+        pane->dialog->setFiberTraceStatus(tr("Fiber follow: tracing…"), QStringLiteral(""), true);
+    const auto traceProgress = [this, surfaceName, watcher](const QString& message) {
+        QMetaObject::invokeMethod(this, [this, surfaceName, watcher, message]() {
+            auto* current = paneForSurface(surfaceName);
+            if (current && current->session && current->session->watcher == watcher && current->dialog) {
+                current->dialog->setFiberTraceProgress(message);
+                current->dialog->appendFiberTraceDetail(message);
+            }
+        }, Qt::QueuedConnection);
+    };
 
     const fs::path manifestPath = session.selectedManifestPath;
     auto predictionField = session.fiberPredictionField;
@@ -12602,11 +12630,73 @@ void LineAnnotationController::startFiberModeOptimization(
          normalSampler,
          traceNormalSampler,
          focusBoundsBase,
+         usingFiberFollow,
+         traceProgress,
          cancelToken = session.runningSolveCancel]() mutable {
             OptimizationTaskResult task;
             task.manifestPath = manifestPath;
             task.eventName = "native_fiber_trace3d_fiber_mode";
             task.focusBoundsBase = focusBoundsBase;
+            QStringList traceDetails;
+            QStringList traceWarnings;
+            int traceCalls = 0;
+            int tailCalls = 0;
+            QElapsedTimer traceElapsed;
+            traceElapsed.start();
+            if (usingFiberFollow) {
+                auto extrapolate = request.externalExtrapolation;
+                request.externalExtrapolation = [&, extrapolate](const auto& history, const auto& direction,
+                                                                double distance) {
+                    ++traceCalls;
+                    const QString end = ++tailCalls == 1 ? QObject::tr("first") : QObject::tr("last");
+                    const QString operation = QObject::tr("Fiber follow: extending outward from %1 control…").arg(end);
+                    traceProgress(operation);
+                    try {
+                        auto result = extrapolate(history, direction, distance);
+                        const QString reason = QString::fromStdString(result.reason);
+                        const QString detail = QObject::tr("%1 end: %2 points; %3")
+                            .arg(end).arg(result.points.size()).arg(reason);
+                        traceDetails << detail;
+                        traceProgress(detail);
+                        if (!result.reachedTraceLength) {
+                            traceWarnings << (result.points.size() >= 2
+                                ? QObject::tr("%1 end stopped early; kept the traced tail: %2").arg(end, reason)
+                                : QObject::tr("%1 end made no progress; using Lasagna fallback: %2").arg(end, reason));
+                        }
+                        return result;
+                    } catch (const std::exception& error) {
+                        const QString detail = QObject::tr("Model extension failed; using Lasagna fallback: %1")
+                            .arg(QString::fromUtf8(error.what()));
+                        traceWarnings << detail;
+                        traceDetails << detail;
+                        traceProgress(detail);
+                        throw;
+                    }
+                };
+                auto segment = request.externalSegment;
+                request.externalSegment = [&, segment](const auto& span) {
+                    ++traceCalls;
+                    traceProgress(QObject::tr("Fiber follow: tracing between control points…"));
+                    try {
+                        auto result = segment(span);
+                        const QString detail = QObject::tr("Span: %1; %2")
+                            .arg(result.accepted ? QObject::tr("accepted") : QObject::tr("fallback"))
+                            .arg(QString::fromStdString(result.reason));
+                        traceDetails << detail;
+                        traceProgress(detail);
+                        if (!result.accepted)
+                            traceWarnings << detail;
+                        return result;
+                    } catch (const std::exception& error) {
+                        const QString detail = QObject::tr("Model span failed; using fallback: %1")
+                            .arg(QString::fromUtf8(error.what()));
+                        traceWarnings << detail;
+                        traceDetails << detail;
+                        traceProgress(detail);
+                        throw;
+                    }
+                };
+            }
             try {
                 (void)predictionField;
                 (void)normalSampler;
@@ -12630,6 +12720,23 @@ void LineAnnotationController::startFiberModeOptimization(
             } catch (...) {
                 task.error = "Unknown fiber-mode optimization error.";
             }
+            if (usingFiberFollow) {
+                task.fiberTraceWarning = !task.ok || !traceWarnings.empty();
+                task.fiberTraceSummary = !task.ok
+                    ? QObject::tr("Fiber follow failed: %1").arg(QString::fromStdString(task.error))
+                    : traceWarnings.empty()
+                        ? (traceCalls ? QObject::tr("Fiber follow: tracing complete (%1 s)")
+                                           .arg(traceElapsed.elapsed() / 1000.0, 0, 'f', 1)
+                                      : QObject::tr("Fiber follow: no model trace needed for these spans"))
+                        : QObject::tr("Fiber follow: %1").arg(traceWarnings.first());
+                for (const auto& warning : traceWarnings) {
+                    if (!traceDetails.contains(warning))
+                        traceDetails << warning;
+                }
+                if (!task.ok)
+                    traceDetails << QString::fromStdString(task.error);
+                task.fiberTraceDetails = traceDetails.join('\n');
+            }
             return task;
         }));
 }
@@ -12651,6 +12758,24 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
     session.watcher = nullptr;
     session.runningSolveCancel.reset();
     applyFocusBoundsToOptimizationTask(task);
+
+    // Keep the outcome visible after the busy badge disappears, but never
+    // overwrite a successor solve's progress with the previous result.
+    const QString traceSummary = task.fiberTraceSummary;
+    const QString traceDetails = task.fiberTraceDetails;
+    const bool traceWarning = task.fiberTraceWarning;
+    const bool traceSuperseded = !session.solveQueue.mayPublish(session.runningSolveEpoch);
+    const auto showTraceOutcome = qScopeGuard([&]() {
+        if (traceSummary.isEmpty() || !pane->dialog ||
+            session.taskState == LineAnnotationSession::TaskState::Running)
+            return;
+        const bool failed = session.taskState == LineAnnotationSession::TaskState::Failed;
+        pane->dialog->setFiberTraceStatus(failed
+            ? tr("Fiber follow failed: %1").arg(QString::fromStdString(session.error))
+            : traceSuperseded ? tr("Fiber follow: edits changed during tracing; reoptimization pending")
+                              : traceSummary,
+            traceDetails, false, failed || traceWarning);
+    });
 
     if (!session.solveQueue.mayPublish(session.runningSolveEpoch)) {
         // The session was mutated (or began shutdown) while this solve ran:
