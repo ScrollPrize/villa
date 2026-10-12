@@ -4,8 +4,8 @@
 - [x] Exact median fastpath and shared geometry; unit tests.
 - [x] Real-state metric equality/profile/performance;4workers selected.
 - [x] Reference width initialization and normalized width metrics;99tests pass.
-- [ ] Low-LR100/1000 fresh and reference runs (remaininghighLRcancelled byuser).
-- [ ] Fresh and reference-initialized100-pass-equivalent solves.
+- [x] Low-LR100/1000 fresh and reference runs (remaininghighLRcancelled byuser).
+- [x] Fresh and reference-initialized100-pass-equivalent solves.
 - [ ] Reports and comparison visualizations.
 
 # Previous: larger batches and distributed joint solve

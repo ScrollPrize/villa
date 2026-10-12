@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-10-12
+
+- Exact diagnostics acceleration with bounded ordered CPU snapshots; worker-count
+  sweep selected4. Added reference-width initialization (radial prior unchanged)
+  and offset-aligned mean width factors. Completed low-LR100/1000pass fresh and
+  reference-width-started joint solves, retained all10pass histories and TIFF/
+  vector comparison configurations. Results:uv_joint_lr_width_results.md.
+
 ## 2026-10-11
 
 - Added opt-in combined winding-coordinate mapping with explicit deterministic

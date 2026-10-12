@@ -1,11 +1,17 @@
 # Global fiber assignment with PyTorch SGD
 
+Latest: [100/1000-pass low-LR results and every10-pass metrics](uv_joint_lr_width_results.md).
+Reference-started solves now initialize reference widths too, with unchanged radial
+prior; mean fitted/reference width factor is reported after global-offset alignment.
+Low LR smooths optimization, but reference-started winding accuracy drifts downward.
+Both1000-pass solves completed in28.6minutes on6GPUs; visualization outputs and
+reusable approved commands are linked in the results document.
+
 Validated performance work: [distributed scaling](uv_distributed_results.md) and
 [exact diagnostics acceleration](uv_diagnostics_results.md). At32768/GPU across
 sixGPUs, the ten-pass-equivalent solve with reporting takes34.85s versus152.74s
 before diagnostic optimization, with identical checkpoint metrics/final arrays.
-Current follow-up: diagnostic worker-count sweep, then fresh/reference100-pass
-joint evaluations and TIFF/vector visualizations (uv_diagnostics_100_plan.md).
+Worker-count sweep selected4at the measured plateau; allcounts gave exactresults.
 
 Latest performance experiment: [combined coordinate mapping](uv_coordinate_results.md).
 Opt-in `coordinate_backend=combined` removes generic shared-width scatter
