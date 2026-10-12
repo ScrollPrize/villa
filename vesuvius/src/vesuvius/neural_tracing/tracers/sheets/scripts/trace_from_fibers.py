@@ -14,8 +14,8 @@ provenance, ``confidence.npy``, area in meta.json); with ``--direction both`` th
 rows). With ``--follow`` each trace also writes the fiber it extends
 as a VC3D fiber JSON to ``OUT/fibers/`` (``extended_fiber``).
 
-  python scripts/trace_from_fibers.py --fibers ~/Desktop/spiral_dataset/fibers --checkpoint CKPT --out TRACES \\
-      --count 50 --points 9 --steps 60 --path-map /remote/data/s1_ds2.zarr=/local/s1_ds2.zarr
+  python scripts/trace_from_fibers.py --fibers ~/Desktop/spiral_dataset/fibers --volume /local/s1_ds2.zarr \\
+      --out TRACES --count 50 --points 7 --steps 60 --direction both --threshold 0.3
 """
 from __future__ import annotations
 
@@ -35,8 +35,9 @@ from vesuvius.neural_tracing.tracers.shared.ct_structure import CT_CONTEXT_RADIU
 from vesuvius.neural_tracing.tracers.sheets import config as C
 from vesuvius.neural_tracing.tracers.sheets.checkpoint import load_checkpoint
 from vesuvius.neural_tracing.tracers.sheets.data.fibers import episode_fibers, fiber_pool
+from vesuvius.neural_tracing.tracers.shared.hub import checkpoint_source
 from vesuvius.neural_tracing.tracers.sheets.tracing.inference import (
-    connected_keep, resample, trace, write_trace, write_two_way_trace)
+    DEFAULT_CHECKPOINT, connected_keep, resample, resolve_checkpoint, trace, write_trace, write_two_way_trace)
 
 
 def seed_from_fiber(fiber: dict, scale: float, length: float, rng) -> tuple[np.ndarray, int] | None:
@@ -145,7 +146,11 @@ def extended_fiber(fiber: dict, line: np.ndarray, at: float, sign: float, rows: 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--fibers', required=True, type=Path)
-    ap.add_argument('--checkpoint', required=True)
+    ap.add_argument('--checkpoint', default=DEFAULT_CHECKPOINT,
+                    help=f'a checkpoint file, or a Hugging Face repo ORG/NAME[@REVISION] holding it (default: '
+                         f'{DEFAULT_CHECKPOINT})')
+    ap.add_argument('--volume', help="CT volume (OME-Zarr pyramid) to trace in, read at the checkpoint's level "
+                                     "(default: the checkpoint's); sheet normals are estimated on its level 0")
     ap.add_argument('--out', required=True, type=Path)
     ap.add_argument('--tag', default='H')
     ap.add_argument('--count', type=int, default=50)
@@ -167,8 +172,12 @@ def main(argv=None):
     ap.add_argument('--path-map', action='append', default=[], metavar='OLD=NEW')
     ap.add_argument('--device', default='cuda')
     args = ap.parse_args(argv)
-    model, cfg, _ = load_checkpoint(args.checkpoint, args.device)
+    path = resolve_checkpoint(args.checkpoint)
+    model, cfg, _ = load_checkpoint(path, args.device)
     C.path_mapper(args.path_map)(cfg)
+    if args.volume:
+        cfg.data.volume = args.volume
+    source = checkpoint_source(args.checkpoint, path)
     cfg.trace.confidence_threshold = args.threshold
     d = cfg.data
     volume = ChunkedArray(f'{d.volume}/{d.volume_level}', 1 << 28)
@@ -220,7 +229,7 @@ def main(argv=None):
                     (args.out/'fibers'/extended['filename']).write_text(json.dumps(extended))
                 write_trace(args.out/name, rows, confs, cfg, args.threshold,
                             dict(fiber=str(path), end=end, from_end=args.from_end, follow=True, steps=args.steps,
-                                 steps_traced=len(rows)-1, checkpoint=args.checkpoint, coord_scale=args.coord_scale,
+                                 steps_traced=len(rows)-1, checkpoint=source, coord_scale=args.coord_scale,
                                  threshold=args.threshold, fiber_pool=args.fiber_pool), overwrite=True)
                 meta = json.loads((args.out/name/'meta.json').read_text())
                 grown = extended['extension_points'] if extended else 0
@@ -255,7 +264,7 @@ def main(argv=None):
             continue
         # the file name, not the fiber's ``sequence``: sequence numbers repeat across annotators' files
         base = f'fiber_{path.stem}_cp{cp:02d}'
-        provenance = dict(fiber=str(path), control_point=cp, points=len(seed), steps=args.steps, checkpoint=args.checkpoint,
+        provenance = dict(fiber=str(path), control_point=cp, points=len(seed), steps=args.steps, checkpoint=source,
                           coord_scale=args.coord_scale, threshold=args.threshold)
         if len(traced) == 2:  # one surface: the down trace reversed, the seed row, the up trace
             name = base+args.suffix

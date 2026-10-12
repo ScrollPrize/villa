@@ -18,8 +18,9 @@ learned frame model (an absolute path pinned by sha256). On another machine:
 from __future__ import annotations
 
 import os
-import re
 from pathlib import Path
+
+from vesuvius.neural_tracing.tracers.shared.hub import checkpoint_source, hf_repo, hub_folder  # noqa: F401 (re-exported)
 
 DEFAULT_CHECKPOINT = 'scrollprize/single_fiber_tiny'
 FOLLOWER_NAME = 'ckpt_final.pt'
@@ -32,19 +33,6 @@ def add_checkpoint_argument(ap):
                          f'frame model (default: {DEFAULT_CHECKPOINT})')
 
 
-def hf_repo(checkpoint):
-    """(repo id, revision or None) when ``checkpoint`` names a Hugging Face repo rather than a local file, else None."""
-    text = str(checkpoint)
-    if text.startswith('hf://'):
-        text = text[len('hf://'):]
-    elif Path(text).expanduser().exists():
-        return None
-    match = re.fullmatch(r'([\w.-]+/[\w.-]+)(?:@(\S+))?', text)
-    if not match or match[1].endswith('.pt'):
-        return None
-    return match[1], match[2]
-
-
 def resolve_checkpoint(checkpoint):
     """The local file of ``checkpoint`` (a file, or a Hugging Face repo, downloaded with its frame model)."""
     repo = hf_repo(checkpoint)
@@ -53,9 +41,8 @@ def resolve_checkpoint(checkpoint):
         if not path.is_file():
             raise SystemExit(f'Checkpoint not found: {checkpoint}')
         return str(path)
-    from huggingface_hub import snapshot_download
-    repo_id, revision = repo
-    folder = Path(snapshot_download(repo_id, revision=revision, allow_patterns=['*.pt']))
+    repo_id = repo[0]
+    folder = hub_folder(repo)
     if (folder/FOLLOWER_NAME).is_file():
         return str(folder/FOLLOWER_NAME)
     followers = [f for f in sorted(folder.glob('*.pt')) if f.name not in FRAME_NAMES]
@@ -63,14 +50,6 @@ def resolve_checkpoint(checkpoint):
         raise SystemExit(f'Hugging Face repo {repo_id} needs {FOLLOWER_NAME}, or exactly one checkpoint besides its '
                          f'frame model ({", ".join(FRAME_NAMES)}); it has {[f.name for f in followers]}')
     return str(followers[0])
-
-
-def checkpoint_source(checkpoint, path):
-    """What a run records as its checkpoint: hf://REPO@COMMIT/FILE for a Hugging Face repo, else the absolute path."""
-    repo = hf_repo(checkpoint)
-    if repo is None:
-        return os.path.abspath(path)
-    return f'hf://{repo[0]}@{Path(path).parent.name}/{Path(path).name}'  # the snapshot folder is the commit
 
 
 def add_volume_arguments(ap):

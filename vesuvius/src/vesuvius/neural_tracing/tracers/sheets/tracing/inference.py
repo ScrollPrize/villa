@@ -10,8 +10,12 @@ point are written as invalid (-1); the points keep riding the curve, so they rea
 again. Tracing stops after ``--steps``, at the first row with no confident point connected to the surface traced
 so far, or when the front leaves the volume.
 
-  python -m vesuvius.neural_tracing.tracers.sheets.tracing.inference --checkpoint output/remote_l0_points_ft/last.pt \\
-      --seed-patch /path/to/patch --line row:40 --range 100:160 --direction + --steps 40 --out output/remote_l0_points_ft/traces/t0
+``--checkpoint``: a local file, or a Hugging Face model repo ``ORG/NAME[@REVISION]`` holding it (``shared/hub.py``:
+``last.pt``, else its only ``.pt``); default ``DEFAULT_CHECKPOINT``. A checkpoint records the CT volume it was trained
+on; ``--volume`` reads another (e.g. a local copy of that scan), ``--path-map`` rewrites recorded path prefixes.
+
+  python -m vesuvius.neural_tracing.tracers.sheets.tracing.inference --volume /path/to/s1_ds2.zarr \\
+      --seed-patch /path/to/patch --line row:40 --range 100:118 --direction + --steps 60 --threshold 0.3 --out traces/t0
 """
 from __future__ import annotations
 
@@ -26,6 +30,7 @@ import tifffile
 import torch
 
 from vesuvius.neural_tracing.tracers.shared.geometry import resample_polyline
+from vesuvius.neural_tracing.tracers.shared.hub import checkpoint_source, hf_repo, hub_folder
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import ChunkedArray
 from vesuvius.neural_tracing.tracers.sheets import config as C
 from vesuvius.neural_tracing.tracers.sheets.data.episodes import collate_fibers
@@ -212,9 +217,37 @@ def write_two_way_trace(out: Path, up: tuple, down: tuple, cfg, threshold: float
     np.save(out/'confidence.npy', confs.astype(np.float32))
 
 
+# The 7-point sheet tracer (remote_l0_neighbor: 7-point fronts, points 60 vx apart; best near --threshold 0.3).
+DEFAULT_CHECKPOINT = 'scrollprize/sheet_tracer_7pt_gap60'
+CHECKPOINT_NAME = 'last.pt'
+
+
+def resolve_checkpoint(checkpoint) -> str:
+    """The local file of ``checkpoint``: a file, or a Hugging Face repo (``shared/hub.py``) holding ``CHECKPOINT_NAME``
+    or exactly one ``.pt``."""
+    repo = hf_repo(checkpoint)
+    if repo is None:
+        path = Path(checkpoint).expanduser()
+        if not path.is_file():
+            raise SystemExit(f'Checkpoint not found: {checkpoint}')
+        return str(path)
+    folder = hub_folder(repo)
+    if (folder/CHECKPOINT_NAME).is_file():
+        return str(folder/CHECKPOINT_NAME)
+    found = sorted(folder.glob('*.pt'))
+    if len(found) != 1:
+        raise SystemExit(f'Hugging Face repo {repo[0]} needs {CHECKPOINT_NAME} or exactly one .pt; it has '
+                         f'{[f.name for f in found]}')
+    return str(found[0])
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--checkpoint', required=True)
+    ap.add_argument('--checkpoint', default=DEFAULT_CHECKPOINT,
+                    help=f'a checkpoint file, or a Hugging Face repo ORG/NAME[@REVISION] holding it (default: '
+                         f'{DEFAULT_CHECKPOINT})')
+    ap.add_argument('--volume', help="CT volume (OME-Zarr pyramid) to trace in, read at the checkpoint's level "
+                                     "(default: the checkpoint's)")
     ap.add_argument('--seed-patch')
     ap.add_argument('--line', help='row:N or col:N of --seed-patch')
     ap.add_argument('--range', help='lo:hi along the seed line')
@@ -228,8 +261,11 @@ def main(argv=None):
                          'directories), e.g. for a checkpoint trained on another machine; repeatable')
     ap.add_argument('--device', default='cuda')
     args = ap.parse_args(argv)
-    model, cfg, _ = load_checkpoint(args.checkpoint, args.device)
+    path = resolve_checkpoint(args.checkpoint)
+    model, cfg, _ = load_checkpoint(path, args.device)
     C.path_mapper(args.path_map)(cfg)
+    if args.volume:
+        cfg.data.volume = args.volume
     if args.threshold is not None:
         cfg.trace.confidence_threshold = args.threshold
     if args.seed_json:
@@ -241,8 +277,9 @@ def main(argv=None):
                           for i in range(3)], 1)
     rows, confs = trace(model, cfg, seed, direction, args.steps, args.device)
     out = Path(args.out)
-    write_trace(out, rows, confs, cfg, cfg.trace.confidence_threshold, dict(vars(args), front_points=len(seed),
-                                                                            steps_traced=len(rows)-1))
+    write_trace(out, rows, confs, cfg, cfg.trace.confidence_threshold,
+                dict(vars(args), checkpoint=checkpoint_source(args.checkpoint, path), volume=cfg.data.volume,
+                     front_points=len(seed), steps_traced=len(rows)-1))
     kept = connected_keep(confs, cfg.trace.confidence_threshold)[1:].mean() if len(rows) > 1 else 0.
     print(f'{len(rows)-1} steps x {len(seed)} front points ({rows.shape[1]} columns), {kept:.0%} kept -> {out}')
 
