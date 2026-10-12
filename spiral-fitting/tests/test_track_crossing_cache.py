@@ -1,4 +1,5 @@
 import dbm
+import os
 import pickle
 from pathlib import Path
 import tempfile
@@ -17,8 +18,11 @@ from tracks import (
     load_track_crossing_cache,
     load_tracks_from_dbm,
     prepare_main_phase_tracks,
+    _packed_store_if_current,
     _sample_prepared_track_points,
+    _tracks_db_signature,
     track_crossing_cache_path,
+    track_store_path,
     write_packed_track_store,
 )
 
@@ -222,6 +226,29 @@ class TrackCrossingCacheTests(unittest.TestCase):
                 database[b'h:new'] = pickle.dumps([line_track(4)])
 
             self.assertIsNone(load_track_crossing_cache(path, warn=False))
+
+    def test_sidecars_survive_dbm_mtime_change(self):
+        # Downloading or copying a DBM gives its backing files new modification
+        # times; sidecars published beside it must still validate.
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self.make_db(temporary)
+            build_cache(path, show_progress=False)
+            write_packed_track_store(path, show_progress=False)
+            for name, _size, _mtime in _tracks_db_signature(path):
+                os.utime(Path(temporary) / name, ns=(10**18, 10**18))
+
+            self.assertIsNotNone(load_track_crossing_cache(path, warn=False))
+            self.assertEqual(
+                _packed_store_if_current(path), track_store_path(path))
+
+    def test_changed_dbm_invalidates_packed_store(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self.make_db(temporary)
+            write_packed_track_store(path, show_progress=False)
+            with dbm.open(str(path), 'w') as database:
+                database[b'h:new'] = pickle.dumps([line_track(4)])
+
+            self.assertIsNone(_packed_store_if_current(path))
 
     def test_parallel_crossing_scan_matches_single_worker(self):
         horizontal = line_track(20, z=10, y=10, axis=2)
