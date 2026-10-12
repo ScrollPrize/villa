@@ -35,6 +35,37 @@ distribution must provide CMake 3.28 or newer; Ubuntu 24.04+ and Debian 13+
 meet that requirement. Set `JOBS`, `BUILD_DIR`, or `PREFIX` to override the
 corresponding defaults.
 
+#### Python source builds
+
+`uv sync` in this directory builds the Python bindings from C++ source. The
+monorepo's `vesuvius` environment also builds this local package when selecting
+the `models` or `all` extra (including `uv sync --all-extras`). Install the native
+build prerequisites first: `uv` manages Python packages, not system C++ libraries.
+The [Python CI workflow](../.github/workflows/test-vesuvius.yml) lists the native
+packages used for the Python-only build on Ubuntu.
+
+**Qt6 Core development files are required even with GUI targets disabled.** The
+shared SFTP implementation uses Qt Core for subprocess and URL handling. This
+does not require a display server, Qt Widgets, or Python Qt bindings. Installing
+`pyqt6` is not a substitute for the native development package.
+
+To add Qt to an otherwise prepared build environment:
+
+```bash
+# Ubuntu / Debian
+sudo apt-get install qt6-base-dev
+
+# macOS (Homebrew)
+brew install qt
+```
+
+These commands install Qt, not the complete native dependency set. The existing
+Linux dependency setup and macOS build helper already include Qt. If CMake cannot
+find `Qt6Config.cmake` after installation, add the Qt installation prefix to
+`CMAKE_PREFIX_PATH` before running `uv sync`. Keep the Qt Core runtime libraries
+installed when using the compiled bindings. See [SFTP access](docs/sftp_remote_access.md)
+for the OpenSSH runtime and authentication requirements.
+
 #### Windows
 
 A self-contained Windows 10/11 installer (`VC3D-<version>-win64.exe`, with all dependencies bundled) is attached to each [GitHub release](https://github.com/ScrollPrize/villa/releases) — download, run, and launch VC3D from the Start menu. A portable `.zip` of the same tree is published alongside it.
