@@ -25,3 +25,14 @@ Approved reusable command:
 Output data/uv_gt_l1_search_v1: results.json, best.json, acceptances.json,
 active_trial.json, per-trial config/summary/solution. Root summary.json only
 exists once finite-grid refinement completes; no global-optimum claim.
+
+Started approved runner, PID654446, manager task
+0aa106fa-2af6-4c58-bddb-0b922e262d7d, GPUs0–5 exclusively allocated.
+Baseline finished: GT enabled L1 .5777874823241785, offset -2,
+5419/6735 events (80.4603%), parallel L1 .5743005468 (4844), perpendicular
+L1 .6071626398 (575). Retained length79.3598%, spiralL1 .946903,
+widthfactor .900953, mean online loss12.386964, solve184.87s.
+Matches original saved-event analysis and previous solve exactly (floating
+summation tolerance for L1). First perturbation distance_weight .25->.125
+running; distributed gradient/coordinate validations passed. Search ongoing,
+not converged. Implemented search/scorer commit f1bcf1e2f.

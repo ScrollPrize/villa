@@ -4,7 +4,8 @@
 - [x] Commit previous state/results:016cdf185.
 - [x] Independent plan/code review, enabled-only L1, shared cached evaluator.
 - [x] Configurable objective in resumable coordinate search;39tests.
-- [ ] Start sixGPU search and verify baseline/initial trials.
+- [x] Start sixGPU search; baseline exactly reproduces prior metrics and first
+  changed-weight trial started successfully.
 - [ ] Complete iterative grid refinement and record final incumbent.
 
 ## Corrected fresh/reference GT evaluation
