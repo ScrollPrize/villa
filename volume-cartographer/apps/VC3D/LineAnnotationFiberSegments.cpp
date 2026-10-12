@@ -399,9 +399,12 @@ void appendFiberModeReport(FiberModeOptimizationResult& output)
 bool usableNativeExtrapolation(
     const vc::fiber_tracer::FiberTraceOneWayResult& traced)
 {
+    // An external tracer's tail is kept wherever it stopped (its confident
+    // part); the native tracer's only when it ran out of length or candidates.
     return traced.points.size() >= 2 &&
         (traced.reachedTraceLength ||
-         traced.reason.starts_with("no_valid_candidates"));
+         traced.reason.starts_with("no_valid_candidates") ||
+         traced.reason.starts_with("fiber_follow"));
 }
 
 void reportExtrapolationFallback(
@@ -472,6 +475,18 @@ int replaceOpenTailsWithNative(
             const auto& annotated=endpoint==firstControl ?
                 request.controlPoints.front().direction : request.controlPoints.back().direction;
             if (annotated) direction=endpoint==firstControl ? -*annotated : *annotated;
+            if (request.externalExtrapolation) {
+                // The line leading into the endpoint, in travel order.
+                std::vector<cv::Vec3d> history;
+                if (endpoint == firstControl) {
+                    history.assign(finalPoints.rbegin(),
+                                   finalPoints.rend() - static_cast<std::ptrdiff_t>(firstControl));
+                } else {
+                    history.assign(finalPoints.begin(), finalPoints.begin() + lastControl + 1);
+                }
+                return request.externalExtrapolation(
+                    coordinates.baseToTrace(history), direction, extrapolationTrace);
+            }
             return vc::fiber_tracer::traceFiberExtrapolation(
                 *request.predictions,
                 coordinates.baseToTrace(finalPoints[static_cast<size_t>(endpoint)]),
@@ -777,14 +792,18 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
         std::optional<vc::fiber_tracer::FiberTraceSegmentResult> traced;
         std::string traceException;
         try {
-            if (!request.predictions || !request.traceNormalSampler) {
-                throw std::runtime_error(
-                    "fiber prediction or trace-normal sampler is unavailable");
+            if (request.externalSegment) {
+                traced = request.externalSegment(traceRequest);
+            } else {
+                if (!request.predictions || !request.traceNormalSampler) {
+                    throw std::runtime_error(
+                        "fiber prediction or trace-normal sampler is unavailable");
+                }
+                traced = vc::fiber_tracer::traceFiberSegment(
+                    *request.predictions,
+                    traceRequest,
+                    request.traceNormalSampler);
             }
-            traced = vc::fiber_tracer::traceFiberSegment(
-                *request.predictions,
-                traceRequest,
-                request.traceNormalSampler);
         } catch (const std::exception& ex) {
             traceException = ex.what();
             traced.reset();

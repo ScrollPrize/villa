@@ -97,6 +97,10 @@ struct StoredFiber {
     // holds them. Structural edits consult this before trusting the record
     // as the on-disk truth.
     bool linkEntriesDroppedAtLoad = false;
+    // Shown read-only from an Automated Fiber Volume: held in memory only for
+    // its view (never written, listed, linked or optimized) and dropped when
+    // that view closes.
+    bool readOnly = false;
 };
 
 }  // namespace vc3d::line_annotation

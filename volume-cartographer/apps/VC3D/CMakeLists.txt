@@ -225,6 +225,12 @@ set(srcs
     segmentation/SegmentationUndoHistory.hpp
     NeuralTraceServiceManager.cpp
     NeuralTraceServiceManager.hpp
+    FiberFollowService.cpp
+    FiberFollowService.hpp
+    PythonExecutable.cpp
+    PythonExecutable.hpp
+    SocketRequest.cpp
+    SocketRequest.hpp
     LasagnaServiceManager.cpp
     LasagnaServiceManager.hpp
     SpiralArtifactCache.cpp
