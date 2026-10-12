@@ -26,22 +26,29 @@ def softmax_mse_loss(input_logits, target_logits):
     return mse_loss
 
 
-def prob_mse_loss(student_logits, target_probs):
-    """MSE loss between student softmax and target probabilities.
+def logits_to_probabilities(logits):
+    """Convert logits to probabilities for binary or categorical heads."""
+    if logits.shape[1] == 1:
+        return torch.sigmoid(logits)
+    return F.softmax(logits, dim=1)
 
-    Use this when the target is already softmax probabilities (e.g., from
-    ensemble aggregation) rather than raw logits.
+
+def prob_mse_loss(student_logits, target_probs):
+    """MSE loss between student and teacher probabilities.
+
+    Use this when the target is already probabilities (e.g., from ensemble
+    aggregation) rather than raw logits.
 
     Args:
         student_logits: Raw logits from student model [B, C, ...]
-        target_probs: Softmax probabilities from teacher [B, C, ...]
+        target_probs: Probabilities from teacher [B, C, ...]
 
     Returns:
         Element-wise squared differences [B, C, ...]
     """
     assert student_logits.size() == target_probs.size()
-    student_softmax = F.softmax(student_logits, dim=1)
-    return (student_softmax - target_probs) ** 2
+    student_probs = logits_to_probabilities(student_logits)
+    return (student_probs - target_probs) ** 2
 
 
 class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
@@ -198,7 +205,7 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         highest max-class probability (i.e., most confident prediction).
 
         Args:
-            all_preds: [num_passes, B, num_classes, ...] tensor of softmax predictions
+            all_preds: [num_passes, B, num_classes, ...] probability tensor
 
         Returns:
             [B, num_classes, ...] tensor where each voxel has the prediction from
@@ -207,7 +214,13 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         # all_preds: [T, B, C, D, H, W] or [T, B, C, H, W]
 
         # Get max probability per voxel per model: [T, B, 1, ...]
-        max_probs, _ = all_preds.max(dim=2, keepdim=True)  # max across classes
+        if all_preds.shape[2] == 1:
+            # A single channel stores Bernoulli foreground probability. Both
+            # confident background (p near 0) and foreground (p near 1) must
+            # rank above an ambiguous prediction near 0.5.
+            max_probs = torch.maximum(all_preds, 1.0 - all_preds)
+        else:
+            max_probs, _ = all_preds.max(dim=2, keepdim=True)
 
         # Find which model has highest confidence at each voxel: [1, B, 1, ...]
         _, best_model_idx = max_probs.max(dim=0, keepdim=True)  # max across models
@@ -413,7 +426,9 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
                 with autocast_ctx:
                     ensemble_outputs = ensemble_model(unlabeled_inputs)
                     first_task = self._get_first_task_key(ensemble_outputs)
-                    ensemble_pred = F.softmax(ensemble_outputs[first_task], dim=1)
+                    ensemble_pred = logits_to_probabilities(
+                        ensemble_outputs[first_task]
+                    )
                     all_preds.append(ensemble_pred)
 
             # 2. EMA teacher passes with noise (fills remaining T - num_ensemble passes)
@@ -426,7 +441,7 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
                 with autocast_ctx:
                     ema_outputs = self.ema_model(ema_inputs)
                     first_task = self._get_first_task_key(ema_outputs)
-                    ema_pred = F.softmax(ema_outputs[first_task], dim=1)
+                    ema_pred = logits_to_probabilities(ema_outputs[first_task])
                     all_preds.append(ema_pred)
 
         # Stack all predictions: [num_passes, B, num_classes, ...]
@@ -439,8 +454,20 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
             # Backward compatible: average predictions
             mean_pred = torch.mean(all_preds, dim=0)
 
-        # Compute entropy as uncertainty measure
-        uncertainty = -1.0 * torch.sum(mean_pred * torch.log(mean_pred + 1e-6), dim=1, keepdim=True)
+        # Compute entropy as uncertainty measure. A one-channel head stores a
+        # Bernoulli foreground probability, so include both p and (1 - p).
+        if mean_pred.shape[1] == 1:
+            safe_pred = mean_pred.clamp(min=1e-6, max=1.0 - 1e-6)
+            uncertainty = -(
+                safe_pred * torch.log(safe_pred)
+                + (1.0 - safe_pred) * torch.log1p(-safe_pred)
+            )
+        else:
+            uncertainty = -1.0 * torch.sum(
+                mean_pred * torch.log(mean_pred + 1e-6),
+                dim=1,
+                keepdim=True,
+            )
 
         return uncertainty, mean_pred
     
