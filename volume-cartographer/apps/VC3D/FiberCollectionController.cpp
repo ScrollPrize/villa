@@ -1078,7 +1078,7 @@ void FiberCollectionController::startPendingAnnotation()
     const auto token = annotationRevision_;
     const auto digest = QCryptographicHash::hash(QByteArray::fromStdString(uuid_), QCryptographicHash::Sha256).toHex().left(32);
     const auto filename = QString("collection_%1_%2.json").arg(QString::fromLatin1(digest)).arg(id);
-    const auto existing = annotations_->fiberIdForFileName(filename.toStdString());
+    const auto existing = forSpiral ? annotations_->fiberIdForFileName(filename.toStdString()) : 0;
     annotationBusy_ = true;
     const auto path = path_.toStdString();
     const auto rev = revision_;
@@ -1133,20 +1133,20 @@ void FiberCollectionController::startPendingAnnotation()
             annotationStatus_->setText(tr("Fiber #%1: %2").arg(id).arg(result.error));
             return;
         }
-        uint64_t nativeId = existing;
-        if (!nativeId) {
-            // Only the requested fiber enters the native editable store.
-            QString error;
-            nativeId = annotations_->importFiberJson(result.value, filename.toStdString(), &error);
-            if (!nativeId) {
-                annotationStatus_->setText(error.isEmpty() ? tr("Could not open fiber #%1.").arg(id) : error);
-                return;
-            }
-        }
         if (forSpiral) {
             if (!spiralFitAvailable_) {
                 annotationStatus_->setText(tr("Spiral session unavailable. Fiber #%1 was not sent.").arg(id));
                 return;
+            }
+            uint64_t nativeId = existing;
+            if (!nativeId) {
+                // Only an explicit send to Spiral imports a saved, editable copy.
+                QString error;
+                nativeId = annotations_->importFiberJson(result.value, filename.toStdString(), &error);
+                if (!nativeId) {
+                    annotationStatus_->setText(error.isEmpty() ? tr("Could not open fiber #%1.").arg(id) : error);
+                    return;
+                }
             }
             const auto filePath = annotations_->fiberFilePath(nativeId);
             if (filePath.empty()) {
@@ -1159,11 +1159,14 @@ void FiberCollectionController::startPendingAnnotation()
         }
         annotationStatus_->setText(tr("Building flattened views for fiber #%1…").arg(id));
         QString error;
-        auto* dialog = annotations_->openCollectionFiber(nativeId, &error);
+        // Keep preview keys separate from saved filenames: opening a read-only
+        // view must not make a later Spiral send reuse an unsaved preview.
+        const auto viewKey = QString("read_only_%1").arg(filename);
+        auto* dialog = annotations_->openFiberReadOnly(result.value, viewKey.toStdString(), &error);
         if (rev != revision_ || token != annotationRevision_)
             return;
         if (!dialog) {
-            annotationStatus_->setText(tr("Fiber #%1: %2").arg(id).arg(error));
+            annotationStatus_->setText(tr("Fiber #%1: %2").arg(id).arg(error.isEmpty() ? tr("could not open it") : error));
             return;
         }
         watchAnnotationRender(dialog, id, token);

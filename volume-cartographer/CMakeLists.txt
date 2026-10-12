@@ -756,6 +756,7 @@ include_directories(core/include)
 
 add_subdirectory(libs/OpenABF)
 add_subdirectory(libs/c3d)
+add_subdirectory(libs/volcomp)
 # igl::core is needed by flatboi (SLIM) and by apps/vc_obj_uv_lift; fetch it
 # here — before the sanitizer flags below — so both consumers see the target
 # even when flatboi is off (Windows).
@@ -791,7 +792,7 @@ endif()
 # (static/interface/PCH helper targets are skipped — they aren't needed at
 # runtime). The vc_runtime component keeps this isolated from unrelated
 # dependency install rules (e.g. libigl's CMake config exports).
-set(_vc_install_dirs core utils libs/c3d)
+set(_vc_install_dirs core utils libs/c3d libs/volcomp)
 if(VC_BUILD_APPS)
     list(APPEND _vc_install_dirs apps apps/VC3D)
 endif()

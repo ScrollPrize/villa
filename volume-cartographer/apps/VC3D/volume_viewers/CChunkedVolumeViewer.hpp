@@ -235,7 +235,7 @@ public:
     }
 
     std::optional<SurfaceProjection> projectVolumePoint(
-        const cv::Vec3f& volPoint) const override;
+        const cv::Vec3f& volPoint, float depthTolerance) const override;
     QPointF surfaceProjectionToScene(const SurfaceProjection& projection) const override;
     SurfaceProjectionContext surfaceProjectionContext() const override;
     QPointF volumeToScene(const cv::Vec3f& volPoint) override;

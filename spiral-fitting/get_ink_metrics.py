@@ -483,6 +483,9 @@ def run_main(argv):
                          'strip pixel size (micrometres per pixel edge)')
     ap.add_argument('--keep-work', action='store_true',
                     help='keep the intermediate per-fold prediction folders')
+    ap.add_argument('--sequential-folds', action='store_true',
+                    help='predict one fold at a time; each fold holds the whole strip, so '
+                         'this bounds CPU RAM on long strips at the cost of parallelism')
     args = ap.parse_args(argv)
 
     ink_dir = os.path.abspath(args.ink_dir)
@@ -545,6 +548,8 @@ def run_main(argv):
         logf = open(os.path.join(log_dir, f'fold_{fold}.log'), 'w')
         print(f'  launching fold {fold} on GPU {gpu} -> {os.path.basename(fold_out[fold])}')
         procs.append((fold, gpu, subprocess.Popen(cmd, env=env, stdout=logf, stderr=subprocess.STDOUT), logf))
+        if args.sequential_folds:
+            procs[-1][2].wait()
 
     failed = []
     for fold, gpu, proc, logf in procs:
@@ -554,6 +559,8 @@ def run_main(argv):
         print(f'  fold {fold} (GPU {gpu}) {status}')
         if rc != 0:
             failed.append(fold)
+        if rc == -9:
+            print('  (killed by SIGKILL, usually the OOM killer: try --sequential-folds)')
     if failed:
         for fold in failed:
             print(f'\n----- fold {fold} log tail -----')
@@ -572,8 +579,12 @@ def run_main(argv):
     if len(line_band) != 2 or line_band[0] >= line_band[1]:
         ap.error(f'--line-pitch-px must be "min,max", got {args.line_pitch_px!r}')
 
-    probs = [load_fold_prob(os.path.join(fold_out[f], f'{name}.npz')) for f in folds]
-    avg = np.mean(probs, axis=0)          # (num_classes, H, W)
+    # Accumulate in place: the same result as np.mean over the stacked folds,
+    # without holding every fold's probabilities at once.
+    avg = load_fold_prob(os.path.join(fold_out[folds[0]], f'{name}.npz'))
+    for f in folds[1:]:
+        avg += load_fold_prob(os.path.join(fold_out[f], f'{name}.npz'))
+    avg /= len(folds)                      # (num_classes, H, W)
     fg_prob = avg[1]                       # class 1 == ink
     mask = fg_prob >= args.fg_threshold
     col_metrics, col_detail = score_columns(fg_prob, args.col_width_px, args.col_width_tol)

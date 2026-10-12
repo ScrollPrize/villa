@@ -2145,10 +2145,9 @@ void Volume::writeChunk(int level,
         return;
     }
 
-    if (array.is_sharded())
-        array.write_inner_chunk_to_shard(chunkZYX, data);
-    else
-        array.write_chunk(chunkZYX, data);
+    // write_chunk encodes with the array's codecs and, for a sharded array,
+    // stores the result as an inner chunk of its shard (either index location).
+    array.write_chunk(chunkZYX, data);
     invalidateCache();
 }
 

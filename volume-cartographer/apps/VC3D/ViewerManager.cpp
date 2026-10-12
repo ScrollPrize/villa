@@ -1,4 +1,5 @@
 #include "ViewerManager.hpp"
+#include "OpenDataCoordinateIdentity.hpp"
 #include "OpenDataSegmentCache.hpp"
 
 #include "AxisAlignedSliceController.hpp"
@@ -50,16 +51,6 @@ Q_LOGGING_CATEGORY(lcViewerManager, "vc.viewer.manager")
 #define VC3D_DEBUG_QCINFO(category) if (!DebugLoggingEnabled()) {} else qCInfo(category)
 
 namespace {
-
-std::string coordinateSpaceTag(const VolumePkg& pkg, const std::string& volumeId)
-{
-    constexpr std::string_view prefix = "vc-open-data-coordinate-space:";
-    for (const auto& tag : pkg.volumeTags(volumeId)) {
-        if (tag.rfind(prefix, 0) == 0)
-            return tag.substr(prefix.size());
-    }
-    return {};
-}
 
 QString compactViewerLabel(const std::string& surfaceName, const QString& title)
 {
@@ -1130,11 +1121,8 @@ void ViewerManager::setHighlightedSurfaceIds(const std::vector<std::string>& ids
 void ViewerManager::setOverlayVolume(std::shared_ptr<Volume> volume, const std::string& volumeId)
 {
     if (volume && _state && _state->vpkg()) {
-        const auto baseSpace = coordinateSpaceTag(
-            *_state->vpkg(), _state->currentVolumeId());
-        const auto overlaySpace = coordinateSpaceTag(*_state->vpkg(), volumeId);
-        if ((!baseSpace.empty() || !overlaySpace.empty()) &&
-            (baseSpace.empty() || baseSpace != overlaySpace)) {
+        if (!vc3d::opendata::overlayCoordinatesCompatible(
+                *_state->vpkg(), _state->currentVolumeId(), volumeId)) {
             Logger()->warn(
                 "Rejected volume overlay '{}' because its explicit coordinate space does not match '{}'.",
                 volumeId, _state->currentVolumeId());

@@ -336,6 +336,93 @@ void createPyramidDatasets(const std::filesystem::path& outDir,
 }
 
 // ============================================================
+// buildMultiscales
+// ============================================================
+
+// The OME-NGFF "multiscales" attribute value.
+//
+// Always written: it is the discovery metadata for the image -- axes, the
+// ordered list of resolution levels, and each level's
+// coordinateTransformations. A reader that cannot find it does not recognise the
+// output as a multiscale image at all.
+//
+// The physical size and the level-to-level scaling are separate concerns and are
+// encoded separately:
+//
+//   * `axes[*].unit` carries the physical unit. It is written only when the
+//     physical size is known -- a unit without a measurement is the thing we must
+//     never invent.
+//   * each dataset's `scale` is a coordinate transformation. With a known size it
+//     is that size in physical units per axis. Without one it is the *relative*
+//     factor between that level and level 0, which is exactly what OME-NGFF 0.4
+//     asks for when a physical scale is unavailable:
+//
+//       "If scaling information is not available or applicable for one of the
+//        axes, the value MUST express the scaling factor between the current
+//        resolution and the first resolution for the given axis, defaulting to
+//        1.0 if there is no downsampling along the axis."
+//       -- https://ngff.openmicroscopy.org/0.4/#multiscale-md
+//
+//     So level 0 is [1, 1, 1] and is the reference; there is no absolute length
+//     anywhere in the document. A reader can still place the levels relative to
+//     each other, and cannot mistake the numbers for micrometres.
+Json buildMultiscales(double baseVoxelSize, const std::string& voxelUnit,
+                      double sliceStep, double pixelsPerVoxel)
+{
+    const bool physicalSizeKnown = std::isfinite(baseVoxelSize) && baseVoxelSize > 0.0;
+
+    Json ms;
+    ms["version"] = "0.4"; ms["name"] = "render";
+    auto makeAxis = [&](const char* name) -> Json {
+        Json ax = Json{{"name", name}, {"type", "space"}};
+        // Only a known physical size may carry a unit: see above.
+        if (physicalSizeKnown && !voxelUnit.empty()) ax["unit"] = voxelUnit;
+        return ax;
+    };
+    Json axes = Json::array();
+    axes.push_back(makeAxis("z"));
+    axes.push_back(makeAxis("y"));
+    axes.push_back(makeAxis("x"));
+    ms["axes"] = std::move(axes);
+    ms["datasets"] = Json::array();
+    // When the size is known the two axes scale independently of each other:
+    // in-plane, one output pixel spans 1/pixelsPerVoxel base voxels;
+    // through-plane, adjacent output layers sit sliceStep base voxels apart.
+    // Pyramid levels halve only YX (see createPyramidDatasets).
+    const double px = (std::isfinite(pixelsPerVoxel) && pixelsPerVoxel > 0.0)
+        ? pixelsPerVoxel : 1.0;
+    const double step = (std::isfinite(sliceStep) && sliceStep > 0.0)
+        ? sliceStep : 1.0;
+    for (int l = 0; l <= 5; l++) {
+        // Relative pyramid factor: levels are built by halving Y/X each step and
+        // keeping Z unchanged, so Y/X double relative to level 0 while Z stays at
+        // its level-0 spacing.
+        const double relativeYX = std::pow(2.0, l);
+        const double sYX = physicalSizeKnown ? baseVoxelSize / px * relativeYX
+                                             : relativeYX;
+        const double sZ = physicalSizeKnown ? baseVoxelSize * step : 1.0;
+        Json scale_arr = Json::array();
+        scale_arr.push_back(sZ); scale_arr.push_back(sYX); scale_arr.push_back(sYX);
+        Json trans_arr = Json::array();
+        trans_arr.push_back(0.0); trans_arr.push_back(0.0); trans_arr.push_back(0.0);
+        Json transforms = Json::array();
+        transforms.push_back(Json{{"type","scale"},{"scale",std::move(scale_arr)}});
+        transforms.push_back(Json{{"type","translation"},{"translation",std::move(trans_arr)}});
+        ms["datasets"].push_back(Json{
+            {"path", std::to_string(l)},
+            {"coordinateTransformations", std::move(transforms)}
+        });
+    }
+    ms["metadata"] = Json{{"downsampling_method","mean"}};
+    if (!physicalSizeKnown) {
+        // Say why the scales are unitless, in the document itself, so a reader
+        // (or a person) does not have to infer it from the missing "unit".
+        ms["metadata"]["physical_size"] = "unknown";
+    }
+    return ms;
+}
+
+// ============================================================
 // writeZarrAttrs
 // ============================================================
 
@@ -367,44 +454,8 @@ void writeZarrAttrs(const std::filesystem::path& outDir,
     }
     attrs["note_axes_order"] = "ZYX (slice, row, col)";
 
-    Json ms;
-    ms["version"] = "0.4"; ms["name"] = "render";
-    auto makeAxis = [&](const char* name) -> Json {
-        Json ax = Json{{"name", name}, {"type", "space"}};
-        if (!voxelUnit.empty()) ax["unit"] = voxelUnit;
-        return ax;
-    };
-    Json axes = Json::array();
-    axes.push_back(makeAxis("z"));
-    axes.push_back(makeAxis("y"));
-    axes.push_back(makeAxis("x"));
-    ms["axes"] = std::move(axes);
-    ms["datasets"] = Json::array();
-    // The two axes scale independently of each other: in-plane, one output
-    // pixel spans 1/pixelsPerVoxel base voxels; through-plane, adjacent output
-    // layers sit sliceStep base voxels apart. Pyramid levels halve only YX.
-    const double px = (std::isfinite(pixelsPerVoxel) && pixelsPerVoxel > 0.0)
-        ? pixelsPerVoxel : 1.0;
-    const double step = (std::isfinite(sliceStep) && sliceStep > 0.0)
-        ? sliceStep : 1.0;
-    for (int l = 0; l <= 5; l++) {
-        const double sYX = baseVoxelSize / px * std::pow(2.0, l);
-        const double sZ = baseVoxelSize * step;
-        Json scale_arr = Json::array();
-        scale_arr.push_back(sZ); scale_arr.push_back(sYX); scale_arr.push_back(sYX);
-        Json trans_arr = Json::array();
-        trans_arr.push_back(0.0); trans_arr.push_back(0.0); trans_arr.push_back(0.0);
-        Json transforms = Json::array();
-        transforms.push_back(Json{{"type","scale"},{"scale",std::move(scale_arr)}});
-        transforms.push_back(Json{{"type","translation"},{"translation",std::move(trans_arr)}});
-        ms["datasets"].push_back(Json{
-            {"path", std::to_string(l)},
-            {"coordinateTransformations", std::move(transforms)}
-        });
-    }
-    ms["metadata"] = Json{{"downsampling_method","mean"}};
     Json multiscales = Json::array();
-    multiscales.push_back(std::move(ms));
+    multiscales.push_back(buildMultiscales(baseVoxelSize, voxelUnit, sliceStep, pixelsPerVoxel));
     attrs["multiscales"] = std::move(multiscales);
 
     vc::writeZarrAttributes(outDir, attrs);
