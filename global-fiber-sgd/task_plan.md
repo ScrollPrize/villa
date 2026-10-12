@@ -1,5 +1,7 @@
 # Global fiber SGD: data reconnaissance
 
+Current: uv_lr_default_plan.md, adopt measured high LR then discuss disentanglement.
+
 Current: uv_class_balance_plan.md; supersedes prior completed regional trials.
 
 Current: uv_reference_subset_plan.md. Older entries below are historical.

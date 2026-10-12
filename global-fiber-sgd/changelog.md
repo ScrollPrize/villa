@@ -2,6 +2,11 @@
 
 ## 2026-10-12
 
+- Adopt state LR0.07348469228349533 (measured10x) for future UV tests and
+  omitted-LR solver configs; width LR2 unchanged, historical configs preserved.
+  High LR achieves substantially lower objective loss for both initializations;
+  lower reference L1 alone must not be interpreted as better convergence.
+
 - Added opt-in graph-count-balanced parallel/perpendicular event losses,
   applying weights to all event terms and preserving old configurations.
   Trialed aggregate perpendicular:parallel10:1 withfixedsigncharge32, then

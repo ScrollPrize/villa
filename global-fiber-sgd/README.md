@@ -1,8 +1,13 @@
 # Global fiber assignment with PyTorch SGD
 
 Latest: [balanced-objective 10x/0.1x state-LR comparison](uv_class_balance_lr_results.md).
-Four10k trials, full1kcheckpointtables includingwidths/ranges. HighLRhelpsfresh;
-lowLRreference retainsmoreandhaslowerL1. Width-decoupling discussed,notimplemented.
+Four10k trials, full1kcheckpointtables includingwidths/ranges. The recommended
+default for future tests is state LR **0.07348469228349533** (10x), with width
+LR **2** unchanged, at global batch24576. Use the high-fresh/high-reference
+configs as templates; historical configs remain unchanged for reproducibility.
+High LR reaches much lower objective loss for both initializations. Lower
+reference L1 at low LR is not evidence of better optimization: it can reflect
+slower departure from initialization. Width-decoupling is not implemented yet.
 
 Current experiment: [balanced perpendicular-dominant losses and fixed sign charge](uv_class_balance_results.md).
 Latest completed baseline: [10k-pass regional fresh/reference solves](uv_reference_5_11_10000_results.md).

@@ -1,5 +1,8 @@
 # Reference-selected regional solve
 
+Current: adopt measured10x state LR as future default and discuss separate
+width-independent winding-index and weaker (0.1x) position losses.
+
 Current follow-up: stop balanced baseline suite; test10x and0.1xstateLR for
 fresh/reference10k each, widthLR2unchanged, same weighted objective. Report
 every1k includingwidthfactor. Plan uv_class_balance_plan.md.

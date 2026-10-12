@@ -7,6 +7,10 @@ from vesuvius.neural_tracing.fiber_trace_3d import fiber_uv_layout as uv
 CFG=dict(constraint_class_balance=True,perpendicular_relative_weight=10)
 
 
+def test_recommended_state_lr_default():
+    assert uv.DEFAULT_STATE_LR == pytest.approx(0.007348469228349533 * 10)
+
+
 def test_full_graph_class_totals_and_default_identity():
     parallel=np.r_[np.ones(19222,bool),np.zeros(5549,bool)]
     w=uv.constraint_class_weights(parallel,CFG)

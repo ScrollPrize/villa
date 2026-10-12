@@ -1,5 +1,13 @@
 # Balanced classes and fixed sign charge
 
+Follow-up: user selects10xLR as default. Set omitted state LR to
+0.07348469228349533, preserving explicit historical configs and width LR2.
+High configs are documented future templates (globalbatch24576). Independent
+default-only review approved. test_fiber_uv_class_balance.py:14passed (2.43s),
+including default constant; explicit override verified by code inspection.
+No GPU rerun required. New winding-index/position split is a proposal only in
+this commit, not silently applied to existing experiments.
+
 User requests fixed sign cost enabled, class balancing of all constraint terms,
 and aggregate perpendicular:parallel weight10:1. Prior task/results committed
 866b13494; historical result tables remain in dedicated results documents.

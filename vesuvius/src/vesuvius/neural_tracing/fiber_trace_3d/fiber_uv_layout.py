@@ -16,6 +16,9 @@ from .fiber_normal_sign import launch_tensor_solve
 from .fiber_normal_convention import inward_solution
 
 
+DEFAULT_STATE_LR = 0.07348469228349533
+
+
 def split_bounds(length, perpendicular_arcs, minimum, min_events=3):
     """Greedy earliest eligible midpoint, keeping an eligible remainder.
 
@@ -896,7 +899,7 @@ def solve(config):
     if config.get('warm_start'):state,start_width=load_warm_start(config,d,state.shape)
     embedding=torch.nn.Embedding.from_pretrained(torch.from_numpy(state).to(device),freeze=False,sparse=True)
     raw=torch.nn.Parameter(inverse_widths(torch.as_tensor(start_width,device=device)))
-    opt=torch.optim.SparseAdam(embedding.parameters(),lr=config.get('lr',.03))
+    opt=torch.optim.SparseAdam(embedding.parameters(),lr=config.get('lr',DEFAULT_STATE_LR))
     widthopt=torch.optim.Adam([raw],lr=config.get('width_lr',2.))
     reducer=SparseGradientReducer(embedding.weight) if distributed else None
     steps=int(config.get('steps',1000));batch=int(config.get('batch_size',1024));every=int(config.get('log_every',100))

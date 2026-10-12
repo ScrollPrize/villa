@@ -1,5 +1,10 @@
 # Reference-selected regional solve
 
+## Recommended LR
+- [x] Record and independently review10x state LR default; explicit configs preserved.
+- [x] Validate14 class-balance/default tests. Width LR remains2.
+- [ ] Proposed winding-index/position loss separation: not implemented in default commit.
+
 ## Balanced classes and fixed sign charge
 - [x] Plan exact graph-wide10:1 aggregate class weighting.
 - [x] Independent plan/code review and implementation;47 focused tests passed.
