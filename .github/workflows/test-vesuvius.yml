@@ -5,6 +5,10 @@ on:
     paths:
       - 'vesuvius/**'
       - 'lasagna/**'
+      # Local source dependencies installed by uv sync --extra all.
+      - 'volume-cartographer/**'
+      - 'segmentation/models/batchgeneratorsv2/**'
+      - 'segmentation/models/arch/nnunet/**'
       - '.github/workflows/test-vesuvius.yml'
 
 jobs:
