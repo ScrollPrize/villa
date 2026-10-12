@@ -95,11 +95,12 @@
          //
          // An entry count is the wrong unit here. A cached GridStore costs the
          // .grid file it maps -- whose size varies by an order of magnitude
-         // between slices -- plus up to 2 MiB of decoded seglists, so any
-         // entry cap is simultaneously too loose (a worst case of entries x
-         // 2 MiB) and too tight (it evicts small stores that cost almost
-         // nothing to keep). A byte budget bounds the cache directly and does
-         // not need retuning when the grids change.
+         // between slices -- plus up to 2 MiB of decoded seglists and the
+         // bucket indices it has decoded, so any entry cap is simultaneously
+         // too loose (a worst case of entries x 2 MiB and more) and too tight
+         // (it evicts small stores that cost almost nothing to keep). A byte
+         // budget bounds the cache directly and does not need retuning when
+         // the grids change.
          //
          // The old cap of 512 entries was far below a real tracing working
          // set. Measured on one resume round of a large patch, whose grid
@@ -124,24 +125,33 @@
          // byte-identical output -- the cache is transparent, so a store that
          // is evicted is simply reloaded from the same immutable file.
          //
-         // The accounting charges each store its whole mapped file size while
-         // only touched pages are actually resident, so the real RSS cost is
-         // well under the budget (1.8 GB at a 4 GiB budget in that run).
-         // The budget over-charges rather than under-charges, which is the
-         // safe direction. Mappings are file-backed, so concurrent tracers
-         // working the same grids share those pages through the page cache.
+         // The accounting charges each store its whole mapped file plus what
+         // it has put on the heap: the polylines and the bucket indices it has
+         // decoded, each counted as it is allocated (GridStore::residentBytes).
+         // The file is charged in full although only touched pages are
+         // resident, and on the stores measured it is nearly all of the charge
+         // (PHerc1447 at eight threads: 95.6 % at the end of a 1 cm^2 trace,
+         // against 3.5 % for the polylines and 0.9 % for the bucket indices,
+         // and 96-100 % through a 47 cm^2 trace held at the default budget), so
+         // the RSS cost stays well under the budget there (1.8 GB at a 4 GiB
+         // budget in the sweep above). That is a property of those stores,
+         // not of the accounting: a store keeps about 110 bytes of heap for
+         // every bucket it was asked for, a pass over all buckets of a sparse
+         // slice can hold many times its file, and the charge then follows
+         // the heap. Mappings are file-backed, so concurrent tracers working
+         // the same grids share those pages through the page cache.
          //
          // The default of 2 GiB keeps the resident cost near the ~1 GiB the
-         // 512-entry cap was sized for (the accounting over-charges about 2x,
-         // see above) and holds the working set of a seeded trace of up to
-         // about 1 cm^2 on an 8.64 um store; larger traces evict, as before
-         // (a 200-generation patch, VC3D's default, stops gaining at about
-         // 8 GiB at eight threads).
+         // 512-entry cap was sized for (on that store the charge is about 2x
+         // what is resident, see above) and holds the working set of a seeded
+         // trace of up to about 1 cm^2 on an 8.64 um store; larger traces
+         // evict, as before (a 200-generation patch, VC3D's default, stops
+         // gaining at about 8 GiB at eight threads).
          // It is kept small and fixed because batch runs start one tracer per
-         // core. On a store of large slices the accounting over-charges far
-         // more (about 9x on PHercParis4 at 2.4 um, where a trace reads a
-         // small window of slices of up to 5 MiB), so such a store wants a
-         // larger VC_GRID_CACHE_BYTES.
+         // core. On a store of large slices the charge is much further above
+         // what is resident (about 9x on PHercParis4 at 2.4 um, where a trace
+         // reads a small window of slices of up to 5 MiB), so such a store
+         // wants a larger VC_GRID_CACHE_BYTES.
          static constexpr size_t kDefaultCacheBytes = size_t{2} << 30;
          // The entry cap the cache had before the byte budget.
          static constexpr size_t kLegacyCacheEntries = 512;
@@ -160,11 +170,12 @@
          size_t max_cache_entries =
              env_size("VC_GRID_CACHE_ENTRIES", byte_budget ? 65536 : kLegacyCacheEntries);
          mutable size_t cache_bytes = 0;
-         // A store's decoded-polyline cache keeps growing AFTER it is inserted
-         // (on hits), so the running total drifts low. It is therefore
-         // re-summed from the stores themselves, both every kResyncEveryInserts
-         // insertions and every kResyncEveryHits hits, so a working set that is
-         // fully resident (no more insertions) is still held to the budget.
+         // A store's caches (decoded polylines, bucket indices) keep growing
+         // AFTER it is inserted (on hits), so the running total drifts low. It
+         // is therefore re-summed from the stores themselves, both every
+         // kResyncEveryInserts insertions and every kResyncEveryHits hits, so a
+         // working set that is fully resident (no more insertions) is still
+         // held to the budget.
          static constexpr uint64_t kResyncEveryInserts = 1024;
          static constexpr uint64_t kResyncEveryHits = 1ull << 16;
          mutable uint64_t inserts_since_resync = 0;
@@ -582,8 +593,9 @@
         }
 
         // Caller must hold the exclusive lock. Recompute every entry's charge
-        // from the store itself (its decoded-polyline cache grows after
-        // insertion). O(entries), so it is called rarely.
+        // from the store itself (its decoded-polyline and bucket-index caches
+        // grow after insertion; each store keeps running counts, so this is
+        // one sum over the entries). O(entries), so it is called rarely.
         void resync_bytes_locked() const
         {
             inserts_since_resync = 0;
@@ -674,6 +686,8 @@
                 stats.decodedPathEvictions += grid_stats.decodedPathEvictions;
                 stats.decodedPathEntries += grid_stats.decodedPathEntries;
                 stats.decodedPathBytes += grid_stats.decodedPathBytes;
+                stats.bucketIndexEntries += grid_stats.bucketIndexEntries;
+                stats.bucketIndexBytes += grid_stats.bucketIndexBytes;
             }
             return stats;
         }

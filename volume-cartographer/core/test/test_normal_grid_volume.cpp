@@ -22,6 +22,11 @@
 #include <thread>
 #include <vector>
 
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 33))
+#include <malloc.h>   // mallinfo2: what the bucket indices really took from the heap
+#define VC_TEST_HAVE_MALLINFO2 1
+#endif
+
 namespace fs = std::filesystem;
 using vc::core::util::NormalGridVolume;
 
@@ -525,5 +530,138 @@ TEST_CASE("Byte budget: concurrent readers get the slice they asked for while th
     const auto st = v.cacheStats();
     CHECK(st.gridMisses > static_cast<uint64_t>(kSlices));   // the budget did evict
     CHECK(st.liveGridEntries <= 250);
+    fs::remove_all(d);
+}
+
+// Writes `n` xy slices of side x side buckets (cell size 8) that hold one short
+// path in their first bucket and nothing else: almost all of the file is the
+// bucket index, and a query away from the first bucket decodes no polyline.
+static fs::path makeBucketSlices(const std::string& tag, int n, int side)
+{
+    auto d = makeEmptyNgvDir(tag, /*sparseVolume=*/1);
+    for (int i = 0; i < n; ++i) {
+        vc::core::util::GridStore gs(cv::Rect(0, 0, side * 8, side * 8), 8);
+        gs.add({cv::Point(0, 0), cv::Point(3, 3)});
+        char name[64];
+        snprintf(name, sizeof(name), "%06d.grid", i);
+        gs.save((d / "xy" / name).string());
+    }
+    return d;
+}
+
+TEST_CASE("Byte budget: the bucket indices a store decodes are charged, "
+          "and not below what they take from the heap")
+{
+    // A mapped store keeps the index list of every bucket it was ever asked
+    // for, until it is destroyed. With many buckets that is far more than the
+    // file: here a 1 MiB file whose buckets, once all visited, hold about
+    // 27 MB of heap. The charge has to follow.
+    const int kSide = 512;                                  // 262,144 buckets
+    auto d = makeBucketSlices("bucket_charge", 1, kSide);
+    const size_t file = fs::file_size(d / "xy" / "000000.grid");
+
+    NormalGridVolume v(d.string());
+    auto g = v.get_grid(0, 0);
+    REQUIRE(g != nullptr);
+    const size_t before = g->residentBytes();
+    CHECK(before == file);                                  // nothing decoded yet
+    CHECK(g->cacheStats().bucketIndexEntries == 0);
+
+    // Every bucket except the first row, through the query the tracer uses.
+    // The only path lies in the first row, so no polyline is decoded.
+    vc::core::util::GridStore::QueryScratch scratch;
+    size_t seen = 0;
+#ifdef VC_TEST_HAVE_MALLINFO2
+    const auto mi_before = mallinfo2();
+    const size_t heap_before = mi_before.uordblks + mi_before.hblkhd;   // in use, small and mmapped
+#endif
+    g->forEach(cv::Rect(0, 8, kSide * 8, (kSide - 1) * 8), scratch,
+               [&](const std::shared_ptr<std::vector<cv::Point>>&) { ++seen; });
+#ifdef VC_TEST_HAVE_MALLINFO2
+    const auto mi_after = mallinfo2();
+    const size_t heap_after = mi_after.uordblks + mi_after.hblkhd;
+#endif
+    CHECK(seen == 0);
+
+    const auto st = g->cacheStats();
+    const size_t visited = static_cast<size_t>(kSide) * (kSide - 1);
+    CHECK(st.bucketIndexEntries == visited);
+    CHECK(st.decodedPathBytes == 0);
+    const size_t after = g->residentBytes();
+    CHECK(after - before == st.bucketIndexBytes);           // exactly the bucket indices
+    CHECK(st.bucketIndexBytes > 20 * file);                 // and they dwarf the file
+
+#ifdef VC_TEST_HAVE_MALLINFO2
+    // What the pass really allocated (the scratch vectors stay empty: no
+    // bucket of the query holds an index). The charge must not be below it,
+    // and should not be far above it either. Skipped when glibc's counters do
+    // not see the allocations (a sanitizer or a preloaded allocator).
+    const size_t heap = heap_after > heap_before ? heap_after - heap_before : 0;
+    MESSAGE("bucket indices of a " << file << "-byte file: " << visited << " entries, charged "
+            << st.bucketIndexBytes << " bytes, heap grew by " << heap << " bytes ("
+            << static_cast<double>(heap) / visited << " per entry)");
+    if (heap >= visited * 32) {
+        CHECK(st.bucketIndexBytes >= heap);
+        CHECK(st.bucketIndexBytes <= heap + heap / 4);
+    }
+#endif
+
+    // A second pass over the same buckets allocates and charges nothing more.
+    g->forEach(cv::Rect(0, 8, kSide * 8, (kSide - 1) * 8), scratch,
+               [&](const std::shared_ptr<std::vector<cv::Point>>&) { ++seen; });
+    CHECK(g->residentBytes() == after);
+    fs::remove_all(d);
+}
+
+TEST_CASE("Byte budget: growth of the stores' bucket indices is re-counted and evicts")
+{
+    // The same drift as the decoded polylines above, from the other cache: the
+    // stores are charged their files at insertion and grow only by bucket
+    // indices afterwards. Before they were counted, this working set stayed
+    // resident at any budget.
+    const int kSlices = 60;
+    const int kSide = 128;                                  // 16,384 buckets: 1.7 MB once visited
+    auto d = makeBucketSlices("bucket_drift", kSlices, kSide);
+    const cv::Rect away(0, 8, kSide * 8, (kSide - 1) * 8);  // every bucket but the first row
+
+    size_t before = 0, after = 0;
+    {
+        NormalGridVolume probe(d.string());
+        auto g = probe.get_grid(0, 0);
+        REQUIRE(g != nullptr);
+        before = g->residentBytes();
+        vc::core::util::GridStore::QueryScratch scratch;
+        g->forEach(away, scratch, [](const std::shared_ptr<std::vector<cv::Point>>&) {});
+        after = g->residentBytes();
+        CHECK(g->cacheStats().decodedPathBytes == 0);       // the growth is bucket indices only
+    }
+    REQUIRE(after > 10 * before);
+
+    // Fits every store as inserted, but not once their buckets were visited.
+    const size_t budget = kSlices * before + (kSlices * (after - before)) / 2;
+    ScopedEnv b("VC_GRID_CACHE_BYTES", std::to_string(budget));
+    NormalGridVolume v(d.string());
+    std::vector<std::shared_ptr<const vc::core::util::GridStore>> held;
+    for (int i = 0; i < kSlices; ++i) {
+        auto g = v.get_grid(0, i);
+        REQUIRE(g != nullptr);
+        held.push_back(g);
+    }
+    CHECK(v.cacheStats().liveGridEntries == kSlices);       // fits, for now
+    v.resetCacheStats();
+
+    vc::core::util::GridStore::QueryScratch scratch;
+    for (auto& g : held) {
+        g->forEach(away, scratch, [](const std::shared_ptr<std::vector<cv::Point>>&) {});
+    }
+    const auto grown = v.cacheStats();
+    CHECK(grown.decodedPathBytes == 0);
+    CHECK(grown.bucketIndexBytes == kSlices * (after - before));
+    CHECK(grown.bucketIndexEntries == static_cast<size_t>(kSlices) * kSide * (kSide - 1));
+
+    // Reads only, as in the polyline test: 3 x 65536 hits make the periodic
+    // re-count fire at least twice, and only an eviction can cause a miss.
+    for (int i = 0; i < 3 * 65536; ++i) REQUIRE(v.get_grid(0, i % kSlices) != nullptr);
+    CHECK(v.cacheStats().gridMisses > 0);
     fs::remove_all(d);
 }
