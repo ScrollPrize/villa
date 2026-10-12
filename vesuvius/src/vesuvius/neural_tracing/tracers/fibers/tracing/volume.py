@@ -40,8 +40,8 @@ an Automated Fiber Volume of every fiber for VC3D (volume_afv.py; native L0 xyz 
 of --afv-template). Rerunning with the same OUT resumes: finished tiles are kept (their fibers own their space), the
 rest are redone; settings that change the fibers must be the same.
 
-  python -m vesuvius.neural_tracing.tracers.fibers.tracing.volume --checkpoint CKPT --presence PRESENCE_LEVEL \\
-      --out OUT --ct-z 7000,17000 [--box x0,y0,z0,x1,y1,z1]
+  python -m vesuvius.neural_tracing.tracers.fibers.tracing.volume --presence PRESENCE_LEVEL \\
+      --out OUT --ct-z 7000,17000 [--box x0,y0,z0,x1,y1,z1] [--checkpoint CKPT | ORG/NAME]
 
 CT, chunk cache and frame model: the checkpoint's, on this machine (tracing/runtime.py; --ct, --cache-dir,
 --frame-checkpoint).
@@ -67,7 +67,9 @@ from scipy.spatial import cKDTree
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import SEED_HEADING_POLICY, ct_seed_heading
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import trace_family_kwargs
 from vesuvius.neural_tracing.tracers.fibers.tracing.inference import make_fiber_json
-from vesuvius.neural_tracing.tracers.fibers.tracing.runtime import add_volume_arguments, configure_volume, use_gpu_crops
+from vesuvius.neural_tracing.tracers.fibers.tracing.runtime import (
+    add_checkpoint_argument, add_volume_arguments, checkpoint_source, configure_volume, resolve_checkpoint, use_gpu_crops)
+from vesuvius.neural_tracing.tracers.shared.annotations.afv import file_sha256
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer, TraceParams
 from vesuvius.neural_tracing.tracers.fibers.tracing.volume_afv import export_afv
 from vesuvius.neural_tracing.tracers.models.checkpoint import load_checkpoint
@@ -412,16 +414,18 @@ class LivePaths:
 # --------------------------------------------------------------------------------------------------------- tracing
 
 def build_tracer(args):
-    model, crop, n_hist, spec, ck = load_checkpoint(args.checkpoint, args.device)
+    path = resolve_checkpoint(args.checkpoint)
+    model, crop, n_hist, spec, ck = load_checkpoint(path, args.device)
     if args.precision == 'fp32':
         torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
     policy = checkpoint_policy(ck, model.cfg, confidence=args.confidence, n_commit=args.n_commit, gate=args.gate)
-    configure_volume(args, spec, model.cfg)
+    configure_volume(args, spec, model.cfg, path)
     prepare_normalization(args.out, [spec], known=ck['ct_normalization'])
     vol = CTVolume(spec, cache_bytes=8 << 30)
     params = TraceParams.from_policy(policy, max_len=args.max_len, precision=args.precision,
                                      forward_chunk=args.forward_chunk, seed=args.sampling_seed)
     tracer = FiberTracer(model, vol, crop, n_hist, params, device=args.device)
+    tracer.checkpoint_path = path
     if args.axis_workers:
         # Continuation crop axes in worker processes (spawned: the parent holds CUDA); same values as in-process.
         import multiprocessing
@@ -791,7 +795,7 @@ def tile_weights(presence_path, threshold, tiles, shape):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
-    ap.add_argument('--checkpoint', required=True)
+    add_checkpoint_argument(ap)
     ap.add_argument('--presence', required=True, help='presence zarr array on the trace grid (uint8 level directory)')
     ap.add_argument('--out', required=True)
     ap.add_argument('--box', help='grid xyz x0,y0,z0,x1,y1,z1 (default: the whole volume, z from --ct-z)')
@@ -864,7 +868,8 @@ def main(argv=None):
             z0, z1 = (float(v)*spec.ct_grid_scale/spec.grid_scale for v in args.ct_z.split(','))
             lo[2], hi[2] = z0, z1
     record = dict(vars(args), box=dict(lo=lo.tolist(), hi=hi.tolist()), operating_policy=policy.to_dict(),
-                  seed_heading_policy=SEED_HEADING_POLICY, grid_scale=spec.grid_scale, ct_zarr=spec.ct_zarr)
+                  seed_heading_policy=SEED_HEADING_POLICY, grid_scale=spec.grid_scale, ct_zarr=spec.ct_zarr,
+                  checkpoint_sha256=file_sha256(tracer.checkpoint_path))
     run_json = out/'run.json'
     if run_json.exists():
         old = json.loads(run_json.read_text())
@@ -872,7 +877,8 @@ def main(argv=None):
         speed_only = ('device', 'status_every', 'rows', 'min_feed', 'open_tiles', 'max_open', 'forward_chunk', 'gpu_chunks',
                       'axis_workers', 'tile_workers', 'tile_ahead', 'afv', 'afv_template',  # speed or the end-of-run export
                       'cache_dir', 'frame_checkpoint')  # locations (the frame model is pinned by its sha256)
-        derived = ('ct_zarr',)  # from the checkpoint and --ct (compared); absent from runs started before it was recorded
+        # derived from the (compared) checkpoint and --ct; absent from runs started before they were recorded
+        derived = ('ct_zarr', 'checkpoint_sha256')
         changed = [k for k in record if k not in speed_only and old.get(k) != record[k]
                    and not (k in derived and k not in old)]
         if changed:
@@ -898,8 +904,9 @@ def main(argv=None):
     print(f'box {lo.tolist()} -> {hi.tolist()}: {len(tiles)} tiles ({sum(t["weight"] > 0 for t in tiles)} with '
           f'presence; weights in {time.time()-t_w:.0f}s), {len(done)} done ({done_w/max(total_w, 1):.1%} of presence)',
           flush=True)
-    provenance = dict(prefix=args.prefix, trace=dict(checkpoint=os.path.abspath(args.checkpoint),
-                                                     operating_policy=policy.to_dict(), run=str(out.resolve())))
+    provenance = dict(prefix=args.prefix, trace=dict(
+        checkpoint=checkpoint_source(args.checkpoint, tracer.checkpoint_path), operating_policy=policy.to_dict(),
+        run=str(out.resolve())))
     mm = spec.grid_scale*args.base_um/1000
     t_start, last = time.time(), time.time()
     kept_total = traced_total = fibers_total = 0

@@ -8,8 +8,8 @@ The checkpoint's operating policy is used unless ``--confidence``/``--n-commit``
 or a calibration ``--policy`` overrides it. ``--refit-retry`` (off by default) lets a decision that would stop on
 confidence retry once with its crop refit to its own prediction.
 
-  python -m vesuvius.neural_tracing.tracers.fibers.tracing.inference --checkpoint last.pt \
-      --seed 18529.9,13044.9,51234.1 --family H --out traced/
+  python -m vesuvius.neural_tracing.tracers.fibers.tracing.inference \
+      --seed 18529.9,13044.9,51234.1 --family H --out traced/      [--checkpoint last.pt | ORG/NAME]
 """
 
 from __future__ import annotations
@@ -32,7 +32,8 @@ from vesuvius.neural_tracing.tracers.fibers.frames.ct import (
     ct_seed_heading, SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY)
 from vesuvius.neural_tracing.tracers.shared.ct_structure import SeedHeadingError
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import trace_family_kwargs
-from vesuvius.neural_tracing.tracers.fibers.tracing.runtime import add_volume_arguments, configure_volume, use_gpu_crops
+from vesuvius.neural_tracing.tracers.fibers.tracing.runtime import (
+    add_checkpoint_argument, add_volume_arguments, checkpoint_source, configure_volume, resolve_checkpoint, use_gpu_crops)
 
 
 def make_fiber_json(points_base_xyz: np.ndarray, cp_every: float, meta: dict) -> dict:
@@ -172,7 +173,7 @@ def export_seeds(tracer, vol, seeds, families, out, *, grid_scale, batch, min_le
 
 def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=FiberTracer):
     ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint", required=True)
+    add_checkpoint_argument(ap)
     add_volume_arguments(ap)
     ap.add_argument("--seed", action="append", default=[], help="base-voxel x,y,z (repeatable)")
     ap.add_argument("--family", action="append", choices=('H', 'V'), required=True,
@@ -204,8 +205,9 @@ def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=FiberTrac
                     help="model arithmetic; fp32 (TF32 off) makes traces independent of batch composition")
     args = ap.parse_args(argv)
 
-    model, crop, n_hist, spec, ck = checkpoint_loader(args.checkpoint, args.device)
-    configure_volume(args, spec, model.cfg)
+    checkpoint = resolve_checkpoint(args.checkpoint)
+    model, crop, n_hist, spec, ck = checkpoint_loader(checkpoint, args.device)
+    configure_volume(args, spec, model.cfg, checkpoint)
     for key in ('flow_samples', 'flow_sample_scale'):
         if getattr(args, key) is not None:
             if model.cfg.model_type != 'flow':
@@ -244,7 +246,7 @@ def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=FiberTrac
     t0 = time.time()
     provenance = {"operating_policy": policy.to_dict(), "sampling_seed": args.sampling_seed,
                   "sampler_mode": getattr(model.cfg, 'sampler_mode', 'zero'),
-                  "checkpoint": os.path.abspath(args.checkpoint)}
+                  "checkpoint": checkpoint_source(args.checkpoint, checkpoint)}
     try:
         written, statuses = export_seeds(tracer, vol, seeds, families, args.out, grid_scale=g, batch=args.batch,
                                          min_length=args.min_length, dedupe=args.dedupe, cp_every=args.cp_every,

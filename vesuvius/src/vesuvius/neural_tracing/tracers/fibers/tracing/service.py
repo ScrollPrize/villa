@@ -21,7 +21,7 @@ Requests:
    that approach, then the target. -> {"points": [...], "accepted": bool, "meeting_error": base voxels, "reason"}
 Family, when not given: V when |direction_z| >= cos 45 degrees, else H.
 
-  python -m vesuvius.neural_tracing.tracers.fibers.tracing.service --checkpoint CKPT --socket PATH [--parent-pid P]
+  python -m vesuvius.neural_tracing.tracers.fibers.tracing.service --socket PATH [--checkpoint CKPT | ORG/NAME] [--parent-pid P]
 """
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ import numpy as np
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import ct_seed_heading, trace_heading
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import predict_frames, trace_family_kwargs
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import ct_frame
-from vesuvius.neural_tracing.tracers.fibers.tracing.runtime import add_volume_arguments
+from vesuvius.neural_tracing.tracers.fibers.tracing.runtime import add_checkpoint_argument, add_volume_arguments, checkpoint_source
 from vesuvius.neural_tracing.tracers.fibers.tracing.volume import build_tracer
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength, normalize, resample_polyline
 from vesuvius.neural_tracing.tracers.shared.ct_structure import SeedHeadingError
@@ -129,7 +129,8 @@ class FiberFollow:
 
     # -- requests
     def hello(self, request):
-        return dict(checkpoint=os.path.abspath(ARGS.checkpoint), grid_scale=self.g, base_um=self.base_um,
+        return dict(checkpoint=checkpoint_source(ARGS.checkpoint, self.tracer.checkpoint_path), grid_scale=self.g,
+                    base_um=self.base_um,
                     ct=str(self.spec.ct_zarr),
                     operating_policy=self.policy.to_dict())
 
@@ -215,7 +216,7 @@ def watch_parent(pid, server):
 def main(argv=None):
     global SERVICE, ARGS
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
-    ap.add_argument('--checkpoint', required=True)
+    add_checkpoint_argument(ap)
     ap.add_argument('--socket', required=True)
     ap.add_argument('--parent-pid', type=int, help='exit when this process ends (VC3D)')
     ap.add_argument('--device', default='cuda')

@@ -34,7 +34,8 @@ def run_ct(record, ct=None):
     if ct or record.get('ct_zarr') or record.get('ct'):
         return ct or record.get('ct_zarr') or record['ct']
     import torch
-    return torch.load(record['checkpoint'], map_location='cpu', weights_only=False)['vol_spec']['ct_zarr']
+    from vesuvius.neural_tracing.tracers.fibers.tracing.runtime import resolve_checkpoint
+    return torch.load(resolve_checkpoint(record['checkpoint']), map_location='cpu', weights_only=False)['vol_spec']['ct_zarr']
 
 
 def ct_frame_metadata(ct):

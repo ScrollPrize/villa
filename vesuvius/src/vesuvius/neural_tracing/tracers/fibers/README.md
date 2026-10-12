@@ -95,9 +95,14 @@ live and synthetic task shares (which sequence training does not support) move t
 Everything a trace needs comes from the follower checkpoint: the model, its operating policy, its CT (store, level,
 normalization) and its learned frame model. Coordinates are base voxels (the CT's level 0), as in VC3D fiber JSON.
 
+`--checkpoint` is a file or a Hugging Face model repo (`ORG/NAME`, optionally `@REVISION`); by default it is
+[`scrollprize/single_fiber_tiny`](https://huggingface.co/scrollprize/single_fiber_tiny), downloaded with its frame model
+into the Hugging Face cache on first use. A repo holds the follower as `ckpt_final.pt` and its frame model as
+`heading_model.pt`. Runs record the repo commit they used.
+
 On a machine other than the one that trained it (`tracing/runtime.py`):
-- **Frame model**: put the frame checkpoint next to the follower checkpoint, under its recorded file name or as
-  `frame_model.pt`, or pass `--frame-checkpoint`. It must match the sha256 the follower recorded.
+- **Frame model**: for a checkpoint file, put the frame checkpoint next to it, under its recorded file name or as
+  `frame_model.pt` / `heading_model.pt`, or pass `--frame-checkpoint`. It must match the sha256 the follower recorded.
 - **CT**: a remote store (`s3://`) is read through a local chunk cache: `--cache-dir`, else the recorded folder if it
   exists, else `~/.cache/vesuvius/volume_cache` (`$XDG_CACHE_HOME`). `--ct`, `--ct-level`, `--ct-grid-scale` and
   `--grid-scale` point a checkpoint at another copy or level of its CT.
@@ -107,10 +112,11 @@ Trace from seed points (one H/V family for all seeds, or one per seed); each fib
 with every seed's outcome in `OUT/seeds.json`:
 
 ```bash
-python -m vesuvius.neural_tracing.tracers.fibers.tracing.inference --checkpoint fiber_follow.pt \
-  --seed 12624,9936,46080 --family V --out traced/
-python -m vesuvius.neural_tracing.tracers.fibers.tracing.inference --checkpoint fiber_follow.pt \
-  --seeds-file seeds.json --family H --out traced/          # seeds.json: [[x, y, z], ...]
+python -m vesuvius.neural_tracing.tracers.fibers.tracing.inference --seed 12624,9936,46080 --family V --out traced/
+python -m vesuvius.neural_tracing.tracers.fibers.tracing.inference --seeds-file seeds.json --family H \
+  --out traced/                                             # seeds.json: [[x, y, z], ...]
+python -m vesuvius.neural_tracing.tracers.fibers.tracing.inference --checkpoint my_run/ckpt_050000.pt \
+  --seed 12624,9936,46080 --family V --out traced/         # another checkpoint
 ```
 
 Trace every fiber of a volume (or a box) from a fiber presence prediction on the trace grid (the presence zarr level
@@ -120,8 +126,8 @@ per-tile results that make a rerun resume. `--ct-z` is a z range in CT voxels of
 a trace-grid box `x0,y0,z0,x1,y1,z1`:
 
 ```bash
-python -m vesuvius.neural_tracing.tracers.fibers.tracing.volume --checkpoint fiber_follow.pt \
-  --presence presence.ome.zarr/3 --ct-z 7000,17000 --out paris4_fibers/ | tee -a paris4_fibers.log
+python -m vesuvius.neural_tracing.tracers.fibers.tracing.volume --presence presence.ome.zarr/3 \
+  --ct-z 7000,17000 --out paris4_fibers/ | tee -a paris4_fibers.log
 python -m vesuvius.neural_tracing.tracers.fibers.tracing.volume_afv paris4_fibers/   # fibers.afv from the tiles so far
 ```
 
@@ -131,8 +137,9 @@ for any other CT, pass an `.afv` of the same scan as `--afv-template` (`volume_a
 `--gpu-chunks 1024 --forward-chunk 64` and 27 GB with `--gpu-chunks 3072` (each chunk slot is 2 MiB; more slots
 load fewer CT chunks).
 
-VC3D's Line Annotation can trace with a checkpoint (hamburger menu, "Fiber follow model") through
-`tracing/service.py`, which VC3D starts with the Python environment it was launched from.
+VC3D's Line Annotation can trace its Fiber model lines with this model (hamburger menu, "Fiber follow model" → "Use
+for the Fiber model"; off by default) through `tracing/service.py`, which VC3D starts with the Python environment it
+was launched from: the default checkpoint unless one is chosen there.
 
 ## Evaluation
 

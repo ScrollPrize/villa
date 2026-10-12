@@ -1,5 +1,10 @@
-"""What the tracing CLIs (inference.py, volume.py, service.py) share: the CT and frame-model options and their
-resolution on this machine, and GPU crops.
+"""What the tracing CLIs (inference.py, volume.py, service.py) share: the checkpoint, CT and frame-model options and
+their resolution on this machine, and GPU crops.
+
+Checkpoint (``--checkpoint``): a local file, or a Hugging Face model repo ``ORG/NAME`` (also ``hf://ORG/NAME``, with
+``@REVISION`` for a branch, tag or commit; default ``DEFAULT_CHECKPOINT``), downloaded into the Hugging Face cache
+(``$HF_HOME``). The repo holds the follower checkpoint (``ckpt_final.pt``, else its only non-frame ``.pt``) and its
+frame model (``heading_model.pt`` or ``frame_model.pt``) next to it.
 
 A checkpoint records where it was trained: its CT (``vol_spec``: store, level, scales, chunk cache folder) and its
 learned frame model (an absolute path pinned by sha256). On another machine:
@@ -7,15 +12,65 @@ learned frame model (an absolute path pinned by sha256). On another machine:
   store (s3://, https://) needs a persistent chunk cache: ``--cache-dir``, else the recorded folder when it exists here,
   else ``$XDG_CACHE_HOME/vesuvius/volume_cache`` (``~/.cache/...``).
 - Frame model: ``--frame-checkpoint``, else the recorded path (relocated by ``TRACERS_PATH_MAP``) when it exists, else
-  a file next to the follower checkpoint: the recorded file name, then ``frame_model.pt``. A found file must have the
-  recorded sha256.
+  a file next to the follower checkpoint: the recorded file name, then ``frame_model.pt``, ``heading_model.pt``. A found
+  file must have the recorded sha256.
 """
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
-DEFAULT_FRAME_NAME = 'frame_model.pt'
+DEFAULT_CHECKPOINT = 'scrollprize/single_fiber_tiny'
+FOLLOWER_NAME = 'ckpt_final.pt'
+FRAME_NAMES = ('frame_model.pt', 'heading_model.pt')
+
+
+def add_checkpoint_argument(ap):
+    ap.add_argument('--checkpoint', default=DEFAULT_CHECKPOINT,
+                    help=f'follower checkpoint: a file, or a Hugging Face repo ORG/NAME[@REVISION] holding it and its '
+                         f'frame model (default: {DEFAULT_CHECKPOINT})')
+
+
+def hf_repo(checkpoint):
+    """(repo id, revision or None) when ``checkpoint`` names a Hugging Face repo rather than a local file, else None."""
+    text = str(checkpoint)
+    if text.startswith('hf://'):
+        text = text[len('hf://'):]
+    elif Path(text).expanduser().exists():
+        return None
+    match = re.fullmatch(r'([\w.-]+/[\w.-]+)(?:@(\S+))?', text)
+    if not match or match[1].endswith('.pt'):
+        return None
+    return match[1], match[2]
+
+
+def resolve_checkpoint(checkpoint):
+    """The local file of ``checkpoint`` (a file, or a Hugging Face repo, downloaded with its frame model)."""
+    repo = hf_repo(checkpoint)
+    if repo is None:
+        path = Path(checkpoint).expanduser()
+        if not path.is_file():
+            raise SystemExit(f'Checkpoint not found: {checkpoint}')
+        return str(path)
+    from huggingface_hub import snapshot_download
+    repo_id, revision = repo
+    folder = Path(snapshot_download(repo_id, revision=revision, allow_patterns=['*.pt']))
+    if (folder/FOLLOWER_NAME).is_file():
+        return str(folder/FOLLOWER_NAME)
+    followers = [f for f in sorted(folder.glob('*.pt')) if f.name not in FRAME_NAMES]
+    if len(followers) != 1:
+        raise SystemExit(f'Hugging Face repo {repo_id} needs {FOLLOWER_NAME}, or exactly one checkpoint besides its '
+                         f'frame model ({", ".join(FRAME_NAMES)}); it has {[f.name for f in followers]}')
+    return str(followers[0])
+
+
+def checkpoint_source(checkpoint, path):
+    """What a run records as its checkpoint: hf://REPO@COMMIT/FILE for a Hugging Face repo, else the absolute path."""
+    repo = hf_repo(checkpoint)
+    if repo is None:
+        return os.path.abspath(path)
+    return f'hf://{repo[0]}@{Path(path).parent.name}/{Path(path).name}'  # the snapshot folder is the commit
 
 
 def add_volume_arguments(ap):
@@ -26,7 +81,7 @@ def add_volume_arguments(ap):
     ap.add_argument('--cache-dir', help='local cache for remote CT chunks (default: the recorded folder when it exists, '
                                         'else $XDG_CACHE_HOME/vesuvius/volume_cache)')
     ap.add_argument('--frame-checkpoint', help='learned frame model (default: the recorded path, else the recorded '
-                                               f'file name or {DEFAULT_FRAME_NAME} next to --checkpoint)')
+                                               f'file name, {" or ".join(FRAME_NAMES)} next to the checkpoint)')
 
 
 def default_cache_dir():
@@ -47,22 +102,22 @@ def resolve_frame_checkpoint(cfg, checkpoint, given=None):
     if Path(recorded_path(recorded)).expanduser().exists():
         return
     digest = getattr(cfg, 'frame_checkpoint_sha256', None)
-    here = Path(checkpoint).expanduser().resolve().parent
-    for candidate in (here/Path(recorded).name, here/DEFAULT_FRAME_NAME):
+    here = Path(checkpoint).expanduser().absolute().parent  # not resolved: Hugging Face cache files are symlinks
+    for candidate in (here/Path(recorded).name, *(here/name for name in FRAME_NAMES)):
         if candidate.is_file() and candidate.resolve() != Path(checkpoint).expanduser().resolve() and (
                 digest is None or file_sha256(candidate) == digest):
             bind_frame_checkpoint(cfg, candidate)
             return
     raise SystemExit(f'The checkpoint uses the learned frame model {recorded}, which is not on this machine: pass '
                      f'--frame-checkpoint, or put it next to the checkpoint as {Path(recorded).name} or '
-                     f'{DEFAULT_FRAME_NAME} (sha256 {digest})')
+                     f'{" or ".join(FRAME_NAMES)} (sha256 {digest})')
 
 
-def configure_volume(args, spec, model_cfg):
-    """Apply the CT and frame-model options (``args`` may lack any of them) to the checkpoint's volume spec and
-    model configuration, in place."""
+def configure_volume(args, spec, model_cfg, checkpoint):
+    """Apply the CT and frame-model options (``args`` may lack any of them) to the volume spec and model configuration
+    of the checkpoint file ``checkpoint``, in place."""
     get = lambda key: getattr(args, key, None)
-    resolve_frame_checkpoint(model_cfg, args.checkpoint, get('frame_checkpoint'))
+    resolve_frame_checkpoint(model_cfg, checkpoint, get('frame_checkpoint'))
     for key in ('ct_level', 'ct_grid_scale', 'grid_scale'):
         if get(key) is not None:
             setattr(spec, key, get(key))
