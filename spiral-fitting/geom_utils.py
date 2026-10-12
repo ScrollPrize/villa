@@ -132,17 +132,26 @@ def grid_sample_border(input, grid):
 
 
 def gather_grid_sample_border(input, grid):
-    """grid_sample_border's interpolation from gathers, on any device."""
+    """grid_sample_border's interpolation from gathers, on any device.
+
+    A NaN coordinate is handled as CUDA's grid sampler handles it: the
+    forward pass samples index 0 along that axis, and the point adds nothing
+    to either gradient.
+    """
     n, channels = input.shape[:2]
     spatial = input.shape[2:]
     # grid's last axis is (x, y[, z]); spatial is ([z,] y, x).
     coords = grid.reshape(n, -1, len(spatial)).flip(-1)
     corners = []
+    nan = None
     stride = 1
     for axis in reversed(range(len(spatial))):
         size = spatial[axis]
-        position = ((coords[..., axis] + 1) * 0.5 * (size - 1)).clamp(0, size - 1)
-        low = torch.nan_to_num(position, nan=0.0).floor()
+        position = (coords[..., axis] + 1) * 0.5 * (size - 1)
+        is_nan = torch.isnan(position)
+        nan = is_nan if nan is None else nan | is_nan
+        position = position.nan_to_num(nan=0.0).clamp(0, size - 1)
+        low = position.floor()
         high_weight = position - low
         low = low.to(torch.int64)
         high = (low + 1).clamp(max=size - 1)
@@ -159,4 +168,5 @@ def gather_grid_sample_border(input, grid):
         values = flat.gather(2, index[:, None, :].expand(n, channels, -1))
         term = values * weight[:, None, :]
         out = term if out is None else out + term
+    out = torch.where(nan[:, None, :], out.detach(), out)
     return out.reshape(n, channels, *grid.shape[1:-1])
