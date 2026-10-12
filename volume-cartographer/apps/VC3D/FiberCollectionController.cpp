@@ -1047,13 +1047,12 @@ void FiberCollectionController::startPendingAnnotation()
     const auto id = std::exchange(pendingAnnotation_, 0);
     const auto token = annotationRevision_;
     const auto digest = QCryptographicHash::hash(QByteArray::fromStdString(uuid_), QCryptographicHash::Sha256).toHex().left(32);
-    const auto filename = QString("collection_%1_%2.json").arg(QString::fromLatin1(digest)).arg(id);
-    const auto existing = annotations_->fiberIdForFileName(filename.toStdString());
+    // Identifies the source fiber for its read-only view (reopening it reuses the open view).
+    const auto key = QString("collection_%1_%2.json").arg(QString::fromLatin1(digest)).arg(id);
     annotationBusy_ = true;
     const auto path = path_.toStdString();
     const auto rev = revision_;
-    background<Json>(this, [path, id, existing]() {
-        if (existing) return Json{};
+    background<Json>(this, [path, id]() {
         FiberCollection collection(path);
         auto entry = Json::parse(collection.annotation(id));
         const auto summary = collection.summary(id);
@@ -1093,7 +1092,7 @@ void FiberCollectionController::startPendingAnnotation()
         if (!entry.contains("control_points"))
             entry["control_points"] = Json::array({entry["line_points"].front(), entry["line_points"].back()});
         return entry;
-    }, [this, rev, token, filename, id, existing](const Outcome<Json>& result) {
+    }, [this, rev, token, key, id](const Outcome<Json>& result) {
         // Keep the guard through native open too: saving an old annotation can
         // run a nested event loop. New clicks replace pending work, never recurse.
         const auto finish = qScopeGuard([this]() { finishAnnotationRequest(); });
@@ -1103,23 +1102,15 @@ void FiberCollectionController::startPendingAnnotation()
             annotationStatus_->setText(tr("Fiber #%1: %2").arg(id).arg(result.error));
             return;
         }
-        uint64_t nativeId = existing;
-        if (!nativeId) {
-            // Only the requested fiber enters the native editable store.
-            QString error;
-            nativeId = annotations_->importFiberJson(result.value, filename.toStdString(), &error);
-            if (!nativeId) {
-                annotationStatus_->setText(error.isEmpty() ? tr("Could not open fiber #%1.").arg(id) : error);
-                return;
-            }
-        }
         annotationStatus_->setText(tr("Building flattened views for fiber #%1…").arg(id));
+        // Read-only: the fiber is shown without entering the package's
+        // editable annotations; nothing is written or optimized.
         QString error;
-        auto* dialog = annotations_->openCollectionFiber(nativeId, &error);
+        auto* dialog = annotations_->openFiberReadOnly(result.value, key.toStdString(), &error);
         if (rev != revision_ || token != annotationRevision_)
             return;
         if (!dialog) {
-            annotationStatus_->setText(tr("Fiber #%1: %2").arg(id).arg(error));
+            annotationStatus_->setText(tr("Fiber #%1: %2").arg(id).arg(error.isEmpty() ? tr("could not open it") : error));
             return;
         }
         watchAnnotationRender(dialog, id, token);

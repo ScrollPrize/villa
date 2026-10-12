@@ -3733,6 +3733,10 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                             _lineAnnotationController->canLaunchFromViewer(viewer) &&
                             viewer->sampleSceneVolume(scenePoint).has_value());
 
+                        QAction* modelLineAnnotationAction = menu.addAction(tr("New 2D line annotation (model)"));
+                        modelLineAnnotationAction->setObjectName(QStringLiteral("model2dLineAnnotationAction"));
+                        modelLineAnnotationAction->setEnabled(newLineAnnotationAction->isEnabled());
+
                         QAction* createGrowPatchAction = menu.addAction(tr("Create Segment (GrowPatch)"));
                         createGrowPatchAction->setEnabled(validVolumePoint &&
                                                           _segmentationCommandHandler &&
@@ -3942,6 +3946,9 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                             newLineAnnotationAction->isEnabled() &&
                             _lineAnnotationController) {
                             _lineAnnotationController->launchFromViewerAtPoint(viewer, scenePoint);
+                        } else if (selected == modelLineAnnotationAction &&
+                                   modelLineAnnotationAction->isEnabled() && _lineAnnotationController) {
+                            _lineAnnotationController->launchFromViewerAtPoint(viewer, scenePoint, true, true);
                         }
                     });
             viewer->setProperty("vc_annotation_context_bound", true);

@@ -72,6 +72,7 @@ struct StoredFiber {
     std::string manualHvTag;
     std::vector<std::string> tags;
     FiberOptimizationMode optimizationMode = FiberOptimizationMode::Lasagna;
+    bool modelOnly = false;
     // Coordinate domain in which control_points and line_points are
     // stored. New Spiral-created fibers record the fiber manifest's L0
     // shape so a downsampled active volume can display them correctly.
@@ -97,6 +98,10 @@ struct StoredFiber {
     // holds them. Structural edits consult this before trusting the record
     // as the on-disk truth.
     bool linkEntriesDroppedAtLoad = false;
+    // Shown read-only from an Automated Fiber Volume: held in memory only for
+    // its view (never written, listed, linked or optimized) and dropped when
+    // that view closes.
+    bool readOnly = false;
 };
 
 }  // namespace vc3d::line_annotation
