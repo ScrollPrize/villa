@@ -1,5 +1,9 @@
 # Global fiber assignment with PyTorch SGD
 
+Latest: [position weight0.5 versus0.1](uv_bucket_half_results.md), matched fresh
+and reference10k. Better fresh reference accuracy but not retention; reference
+drifts later despite falling loss. Remains opt-in, no objective default change.
+
 Current experiment: bucket-only topology (sign and squared winding separation)
 plus0.1x prior positional distance. Opt-in `bucket_position_split`, documented
 in [the plan](uv_bucket_split_plan.md). Fixed integer seam correction comes

@@ -1,5 +1,8 @@
 # Reference-selected regional solve
 
+Current: increase metric position term from0.1 to0.5 of bucket term, matched
+fresh/reference10k trials at current high LR; all other settings unchanged.
+
 Current: implement bucket-only sign/distance with0.1x old positional distance;
 run scratch/ref-init10k at high LR. See uv_bucket_split_plan.md.
 

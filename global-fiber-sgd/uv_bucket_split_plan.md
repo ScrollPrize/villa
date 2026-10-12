@@ -1,5 +1,16 @@
 # Bucket topology plus weaker metric position
 
+## Follow-up: position weight0.5
+User requests half-weight position loss instead of0.1. Run identical fresh/ref
+10k suites with position_distance_weight0.5; only weight, output roots and
+labels change. Same high LR, six exclusive GPUs, dataset, initialization,
+bucket sign penalties and all other terms. Independent config review, existing
+tests and production compiled preflights; compare loss trends, referenceL1,
+within2, retention, width factor, bucket signs and ranges at each1kcheckpoint.
+Old/new scalar losses differ in definition; do not rank them directly.
+Spec: no code/default change, experimental configs only. Docs: persist full
+tables and commands in uv_bucket_half_results.md, update task/log/status.
+
 Task: implement agreed split objective and run fresh/ref-init10k sampled-pass
 solves with high default LR on the same positions5–11 subset, six GPUs.
 

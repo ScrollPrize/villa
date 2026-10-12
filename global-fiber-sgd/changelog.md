@@ -2,6 +2,10 @@
 
 ## 2026-10-12
 
+- Completed matched10k fresh/ref position-weight0.5 trials, preserving other
+  settings. Full checkpoints, losses, reference metrics and timings recorded
+  in uv_bucket_half_results.md; mixed result, no default objective change.
+
 - Implemented opt-in bucket-only sign/distance with0.1x metric position loss,
   immutable integer anchor/endpoint seam correction, consistent sign audits,
   regression tests and sixGPU compiled-gradient validation. New experiments

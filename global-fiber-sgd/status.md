@@ -1,5 +1,10 @@
 # Reference-selected regional solve
 
+## Position weight0.5 follow-up
+- [x] Create matched fresh/ref configs and suite; plan.
+- [x] Independent review, tests and sixGPU fresh/ref10k runs complete.
+- [x] Full checkpoint comparison saved in uv_bucket_half_results.md.
+
 ## Bucket topology / weaker position
 - [x] Plan, independent review and fixed integer seam correction.
 - [x] Implementation;56 focused and33 additional regression tests passed.

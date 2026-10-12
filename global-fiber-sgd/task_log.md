@@ -1,33 +1,21 @@
-# Bucket topology / metric position split
+# Position weight0.5 follow-up
 
-User requests bucket-only sign and distance, old positional distance at0.1,
-joint scratch/ref-init runs at newly adopted high LR. Interpreted10 as10k
-passes matching prior comparison; told user. Prior results preserved in
-uv_class_balance_lr_results.md; commit18b5cce30 adopts default LR.
+User requests metric position loss half of bucket loss instead of0.1.
+Config-only matched fresh/ref10k trials: stateLR0.07348469228349533,widthLR2,
+151hypotheses,same subset/initializations/seed/globalbatch24576,sixGPUs0–5.
+No production code, sign, regularizer or continuation changes. Prior result
+and full logs committed27a8a5eb8; tables in uv_bucket_split_results.md.
+Plan: uv_bucket_split_plan.md follow-up. New configs run_uv_bucket_half_*.json.
+Independent config review approved;9 split-objective tests passed2.52s.
+Approved suite launched, session3822, manager task
+81363a56-ed6c-4634-86a7-3f50e6637e2e. Cooperative release completed and sixGPU
+exclusive grant acquired. Fresh production compiled/eager sixGPU gradient and
+coordinate checks passed. At3k loss4.8949,L1=2.0661,retained38.8721%, versus
+0.1weightL1=2.2833 withsimilarretention; preliminary improvement only.
 
-Plan uv_bucket_split_plan.md. Independent review flagged anchor-relative
-seams. Added fixed integer correction from recorded unwrapped endpoint and
-anchor angles, explicitly disclosed. No learned phase, offset or width enters
-topology. Existing priors, continuation, vertical loss and broken updates stay.
-Implemented opt-in squared/full-hypothesis split and matching bucket audits.
-Fixed charge uses selected buckets.55 focused tests passed9.20s. Review approved
-core implementation; added mixed-shift distributed preflight and robust anchor
-integer recovery rint(raw_anchor-fractional_anchor), including seam test.
-
-Final added seam test plus layout/anchor/localwindow/distributed regressions:
-41passed9.73s (total89 across focused/new and broader suites). Approved runner
-launched run_uv_bucket_split_suite.json, session3087, manager task
-7b42a4cb-46be-4e0e-af0e-a0d4a98d13e8. Cooperative training release completed;
-sixGPU compiled/eager gradient validation passed, coordinate value/gradient
-and bitwise repeat checks passed. Fresh started,1k retained32.94%,2k36.57%,
-zero bucket signs but poor retention explicitly reported, no early victory claim.
-
-Both runs finished, suiteexit0. Fresh166.28s/ref169.70s; finite saved state and
-width arrays; managerfinishedheld0. Freshloss3.6809,L1=2.1762,retained50.4106%,
-width.91231. Referenceloss2.5355,L1=.62355,retained73.0708%,width.90879.
-Both zero bucket signs (not a statement of coordinate sign correctness).
-Full checkpoints, old/newcomparison andtimings in uv_bucket_split_results.md.
-Final independent review approved currentrun; added unsupported cost_target
-guard afterruns toprevent silentlyignoring splitflag in thatdifferent solver.
-No production math changes afterruns. New loss remains opt-in, no improvement
-claim basedonzero signs. Historical LR default remains high.
+Both10kcomplete,suiteexit0,finitefinalstates,managerfinishedheld0. Fresh172.01s,
+reference171.21s; sixGPUcompiledchecks passedboth. Freshloss3.70636,L1=1.96746,
+within2=68.74576%,retained50.17743%,width.913733. Referenceloss2.58818,
+L1=.642303,within2=97.89590%,retained72.82328%,width.895079. Bothzerobucket
+violations. Refdriftlatewithoffset0: not anoffsetswitch. No objectivepromotion.
+Full1ktables,oldbaselines,commands,timing inuv_bucket_half_results.md.
