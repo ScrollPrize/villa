@@ -91,6 +91,9 @@ class ChunkedArray:
         if comp is not None and comp.get("id") == "vcz1":
             _register_vcz1()
         self.codec = None if comp is None else numcodecs.get_codec(comp)
+        self._initialize_cache(cache_bytes)
+
+    def _initialize_cache(self, cache_bytes):
         self.cache_bytes = int(cache_bytes)
         self._cache: OrderedDict[tuple[int, int, int], np.ndarray | None] = OrderedDict()
         self._cached = 0
@@ -286,10 +289,67 @@ class RemoteChunkedArray(ChunkedArray):
             return super()._load(key)
 
 
+class Vc3dChunkedArray(ChunkedArray):
+    """Raw chunks through VC3D's reader, sharing its persistent cache and codecs.
+
+    Enabled only by VC3D's fiber-follow launcher (VESUVIUS_CT_READER=vc3d).
+    A matching viewer locator preserves its cache identity and rebased levels;
+    a different CT source keeps its own identity under the same cache root.
+    Sampling, normalization and model-grid coordinates remain unchanged.
+    """
+    def __init__(self, path, level, cache_bytes):
+        from vc.volume import Volume, set_chunk_cache_budget
+        from vesuvius.neural_tracing.tracers.shared.paths import canonical_ct_url
+
+        self.remote_url = str(path).rstrip('/')
+        self.level = int(level)
+        source = os.environ.get('VESUVIUS_VC3D_VOLUME_SOURCE', '')
+        locator = os.environ.get('VESUVIUS_VC3D_VOLUME_LOCATOR', '')
+        self.locator = self.remote_url
+        if source and locator and canonical_ct_url(source) == canonical_ct_url(self.remote_url):
+            # A rebased viewer can reuse only levels it retains. A finer model
+            # level must use the original pyramid, never a coarser substitute.
+            base = int(urlsplit(locator).fragment.removeprefix('vc-base-scale=') or '0')
+            if self.level >= base:
+                self.locator = locator
+        # Native decoded chunks are staging for the Python LRU/GPU cache.
+        set_chunk_cache_budget(min(int(cache_bytes), 256 << 20))
+        self._volume = Volume.open_url(self.locator)
+        self._native_level = self.level - self._volume.base_scale_level
+        if self._native_level < 0 or not self._volume.has_scale_level(self._native_level):
+            raise ValueError(f'VC3D CT reader has no requested level {self.level}: {self.locator}')
+        self.shape = tuple(self._volume.shape_at(self._native_level))
+        self.chunks = tuple(self._volume.chunk_shape(self._native_level))
+        self.dtype = np.dtype(self._volume.dtype)
+        self.fill = self._volume.fill_value
+        self.path = self._volume.remote_cache_path
+        self.codec = None  # native reader returns decoded voxels
+        self._initialize_cache(cache_bytes)
+        print(f'CT chunks via VC3D cache: {self.path} (source level {self.level})', flush=True)
+
+    def __getstate__(self):
+        return {**super().__getstate__(), '_volume': None}
+
+    def _load(self, key):
+        with self._lock:
+            if self._volume is None:
+                from vc.volume import Volume
+                self._volume = Volume.open_url(self.locator)
+            volume = self._volume
+        values = volume.read_chunk(self._native_level, tuple(map(int, key)), blocking=True)
+        if values is None:
+            raise RuntimeError(f'VC3D returned no data for CT chunk {key} at level {self.level}')
+        return np.asarray(values)
+
+
 def open_ct_array(spec, cache_bytes, *, cache_only=False):
     """The CT array a volume spec names: a remote store through the persistent chunk cache, or a local uncompressed
     Zarr level."""
     if str(spec.ct_zarr).startswith(('s3://','http://','https://')):
+        if os.environ.get('VESUVIUS_CT_READER') == 'vc3d':
+            if cache_only:
+                raise ValueError('VC3D CT reader does not support cache-only prefetch mode')
+            return Vc3dChunkedArray(spec.ct_zarr, spec.ct_level, cache_bytes)
         return RemoteChunkedArray(spec.ct_zarr, spec.ct_level, spec.cache_dir, cache_bytes, cache_only=cache_only)
     return ChunkedArray(os.path.join(spec.ct_zarr, str(spec.ct_level)), cache_bytes)
 

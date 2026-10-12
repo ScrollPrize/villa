@@ -11,7 +11,7 @@ from vesuvius.neural_tracing.tracers.shared.annotations.splits import heldout_id
 from vesuvius.neural_tracing.tracers.shared.annotations.traced import fiber_manifest
 from vesuvius.neural_tracing.tracers.shared.annotations.vc3d import load_fibers
 from vesuvius.neural_tracing.tracers.fibers.data.follow_dataset import FollowDataset
-from vesuvius.neural_tracing.tracers.shared.paths import moved_path
+from vesuvius.neural_tracing.tracers.shared.paths import moved_path, canonical_ct_url
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec, CTVolume
 from vesuvius.neural_tracing.tracers.fibers.data.observations import IdentityObservationBuilder
 from vesuvius.neural_tracing.tracers.fibers.data.afv_neighbors import AFVBank
@@ -175,12 +175,8 @@ def open_afv_source(source, cache_dir, normalization=None):
     root = fibers.metadata['root']
     native_url = root.get('vc_open_data_source_path', '').rstrip('/')
     # The configured source must refer to the same recorded CT store.
-    def canonical(url):
-        return str(url).rstrip('/').replace('https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/',
-            's3://vesuvius-challenge-open-data/').replace('https://vesuvius-challenge-open-data.s3.amazonaws.com/',
-            's3://vesuvius-challenge-open-data/')
     # A local copy of the CT (same coordinate frame, read at ct_grid_scale) names the store it mirrors.
-    if canonical(source.get('ct_mirror_of', source['ct'])) != canonical(native_url):
+    if canonical_ct_url(source.get('ct_mirror_of', source['ct'])) != canonical_ct_url(native_url):
         raise ValueError('AFV source CT differs from its embedded metadata')
     spec = ct_source_spec(source, cache_dir)
     if normalization is not None:

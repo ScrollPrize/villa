@@ -5,6 +5,7 @@
 #include <QString>
 
 #include <nlohmann/json.hpp>
+#include "vc/lasagna/LineModel.hpp"
 
 #include <memory>
 #include <mutex>
@@ -25,8 +26,10 @@ public:
 
     // GUI thread. Starts (or restarts, for another checkpoint or interpreter)
     // the service and waits until it listens, keeping the UI responsive.
+    // An empty checkpoint uses the service's default Hugging Face model.
     // Returns false with *error set on failure.
-    bool ensureRunning(const QString& checkpoint, const QString& python, QString* error = nullptr);
+    bool ensureRunning(const QString& checkpoint, const QString& python, QString* error = nullptr,
+                       const QString& volumeSource = {}, const QString& volumeLocator = {});
     void stop();
     [[nodiscard]] bool isRunning() const;
     [[nodiscard]] QString checkpoint() const { return _checkpoint; }
@@ -36,6 +39,8 @@ public:
     // std::runtime_error on transport failure or an {"ok": false} reply.
     [[nodiscard]] nlohmann::json request(const nlohmann::json& request) const;
     [[nodiscard]] std::string socketPath() const;
+    [[nodiscard]] vc::lasagna::LineModel lineModel(
+        const std::vector<cv::Vec3d>& points, double baseUm) const;
 
 signals:
     void statusMessage(const QString& message);
@@ -47,6 +52,8 @@ private:
     std::unique_ptr<QProcess> _process;
     QString _checkpoint;
     QString _python;
+    QString _volumeSource;
+    QString _volumeLocator;
     QString _output;
     mutable std::mutex _mutex;  // guards _socketPath for solver threads
     std::string _socketPath;

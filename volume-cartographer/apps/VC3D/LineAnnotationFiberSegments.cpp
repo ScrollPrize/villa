@@ -470,20 +470,19 @@ int replaceOpenTailsWithNative(
         }
         const double extrapolationTrace = coordinates.baseDistanceToTrace(
             request.extrapolationDistanceBaseVoxels);
-        const auto traceTail = [&](int endpoint, int inner) {
+        const auto traceTail = [&](int endpoint, int inner, bool left) {
             auto direction=finalPoints[size_t(endpoint)]-finalPoints[size_t(inner)];
-            const auto& annotated=endpoint==firstControl ?
+            const auto& annotated=left ?
                 request.controlPoints.front().direction : request.controlPoints.back().direction;
-            if (annotated) direction=endpoint==firstControl ? -*annotated : *annotated;
+            if (annotated) direction=left ? -*annotated : *annotated;
             if (request.externalExtrapolation) {
-                // The line leading into the endpoint, in travel order.
-                std::vector<cv::Vec3d> history;
-                if (endpoint == firstControl) {
-                    history.assign(finalPoints.rbegin(),
-                                   finalPoints.rend() - static_cast<std::ptrdiff_t>(firstControl));
-                } else {
-                    history.assign(finalPoints.begin(), finalPoints.begin() + lastControl + 1);
-                }
+                // Only the annotated interval is observed history. Opposite
+                // extrapolated tails are predictions, not evidence for the
+                // heading. A single control is a fresh seed on BOTH sides.
+                std::vector<cv::Vec3d> history(finalPoints.begin() + firstControl,
+                                              finalPoints.begin() + lastControl + 1);
+                if (left)
+                    std::reverse(history.begin(), history.end());
                 return request.externalExtrapolation(
                     coordinates.baseToTrace(history), direction, extrapolationTrace);
             }
@@ -498,7 +497,7 @@ int replaceOpenTailsWithNative(
         std::optional<vc::fiber_tracer::FiberTraceOneWayResult> left;
         std::string leftException;
         try {
-            left = traceTail(firstControl, firstControl + 1);
+            left = traceTail(firstControl, firstControl + 1, true);
         } catch (const std::exception& ex) {
             leftException = ex.what();
             left.reset();
@@ -517,7 +516,12 @@ int replaceOpenTailsWithNative(
                 FiberExtrapolationFallbackDiagnostic::Side::Left,
                 left,
                 leftException);
-            ++output.lasagnaFallbackExtrapolations;
+            if (request.modelLineBuilder) {
+                if (!leftException.empty()) throw std::runtime_error(leftException);
+                leftTail = {finalPoints[static_cast<size_t>(firstControl)]};
+            } else {
+                ++output.lasagnaFallbackExtrapolations;
+            }
         }
         // Re-check between the two traces: each can be a long prediction
         // walk, and a solve superseded during the left one should not still
@@ -529,7 +533,7 @@ int replaceOpenTailsWithNative(
         std::optional<vc::fiber_tracer::FiberTraceOneWayResult> right;
         std::string rightException;
         try {
-            right = traceTail(lastControl, lastControl - 1);
+            right = traceTail(lastControl, lastControl - 1, false);
         } catch (const std::exception& ex) {
             rightException = ex.what();
             right.reset();
@@ -547,7 +551,12 @@ int replaceOpenTailsWithNative(
                 FiberExtrapolationFallbackDiagnostic::Side::Right,
                 right,
                 rightException);
-            ++output.lasagnaFallbackExtrapolations;
+            if (request.modelLineBuilder) {
+                if (!rightException.empty()) throw std::runtime_error(rightException);
+                rightTail = {finalPoints[static_cast<size_t>(lastControl)]};
+            } else {
+                ++output.lasagnaFallbackExtrapolations;
+            }
         }
     }
 
@@ -571,7 +580,8 @@ int replaceOpenTailsWithNative(
     for (const auto& point : combined) {
         vc::lasagna::LinePoint linePoint;
         linePoint.position = point;
-        linePoint.sampledNormal = request.baseNormalSampler->sampleNormal(point);
+        if (request.baseNormalSampler)
+            linePoint.sampledNormal = request.baseNormalSampler->sampleNormal(point);
         output.optimization.line.points.push_back(std::move(linePoint));
     }
     return static_cast<int>(leftTail.size()) - 1 - firstControl;
@@ -582,10 +592,20 @@ int replaceOpenTailsWithNative(
 FiberModeOptimizationResult optimizeFiberWithNativeFallback(
     FiberModeOptimizationRequest request)
 {
-    if (!request.baseNormalSampler) {
+    if (!request.baseNormalSampler && !request.modelLineBuilder) {
         throw std::invalid_argument(
             "fiber-mode optimization requires a base normal sampler");
     }
+    if (request.modelLineBuilder && (!request.externalExtrapolation || !request.externalSegment))
+        throw std::invalid_argument("model-only optimization requires the model tracing backend");
+    const auto finishModelLine = [&request](FiberModeOptimizationResult& result) {
+        if (!request.modelLineBuilder) return;
+        std::vector<cv::Vec3d> points;
+        for (const auto& p : result.optimization.line.points) points.push_back(p.position);
+        if (points.size() < 2)
+            throw std::runtime_error("Fiber follow made no progress from the seed; try another seed or lower confidence.");
+        result.optimization.line = request.modelLineBuilder(points);
+    };
     if (request.controlPoints.empty() || request.linePointsBase.size() < 2) {
         throw std::invalid_argument(
             "fiber-mode optimization requires a control point and at least two line points");
@@ -642,9 +662,20 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
             config.useInitialTangent = true;
         }
 
-        vc::lasagna::LineOptimizer optimizer(*request.baseNormalSampler);
-        output.optimization = optimizer.optimizeFromControlPoints(
-            optimizerControlPoints(request.controlPoints), config);
+        if (request.modelLineBuilder) {
+            // These three points only provide the two seed directions. Both
+            // provisional tails are replaced (or removed) by model tracing.
+            const auto seed = request.controlPoints.front().volumePoint;
+            for (const auto& p : {seed - tangent, seed, seed + tangent}) {
+                vc::lasagna::LinePoint point;
+                point.position = p;
+                output.optimization.line.points.push_back(point);
+            }
+        } else {
+            vc::lasagna::LineOptimizer optimizer(*request.baseNormalSampler);
+            output.optimization = optimizer.optimizeFromControlPoints(
+                optimizerControlPoints(request.controlPoints), config);
+        }
         std::vector<cv::Vec3d> baselinePoints;
         baselinePoints.reserve(output.optimization.line.points.size());
         for (const auto& point : output.optimization.line.points) {
@@ -663,6 +694,7 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
             request.controlPoints.front().linePosition +=
                 static_cast<double>(shift);
         }
+        finishModelLine(output);
         appendFiberModeReport(output);
         output.controlPoints = std::move(request.controlPoints);
         return output;
@@ -764,6 +796,8 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
             metadata.fiberManifestLocation = request.fiberManifestLocation;
             continue;
         }
+        if (request.modelLineBuilder && requestedMode == SegmentInterpolationMode::Lasagna)
+            throw std::runtime_error("Lasagna interpolation requires a normal dataset; use Fiber model or cubic spline in this session.");
         const bool wantsTrace = requestedMode == SegmentInterpolationMode::Trace;
         if (!wantsTrace) {
             modes[spanIndex] = SegmentInterpolationMode::Lasagna;
@@ -793,7 +827,33 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
         std::string traceException;
         try {
             if (request.externalSegment) {
+                // At the first span, resume from the inner (right) control
+                // and trace OUT toward the first control. This matters when
+                // growing by adding a new control before the old first one:
+                // its valid history lies to the right, in reverse order.
+                const size_t historyBegin = originalControlIndices.front();
+                const size_t historyEnd = originalControlIndices.back();
+                const bool reverse = spanIndex == 0 &&
+                    (last < historyEnd || (!owner.isSeed && request.controlPoints[spanIndex+1].isSeed));
+                traceRequest.referenceLine.assign(referenceTrace.begin() + historyBegin,
+                                                   referenceTrace.begin() + historyEnd + 1);
+                if (reverse) {
+                    std::reverse(traceRequest.referenceLine.begin(), traceRequest.referenceLine.end());
+                    traceRequest.startIndex = historyEnd - last;
+                    traceRequest.targetIndex = historyEnd - first;
+                    traceRequest.startDirection = request.controlPoints[spanIndex+1].direction;
+                    traceRequest.targetDirection = owner.direction;
+                    if (traceRequest.startDirection)
+                        traceRequest.startDirection = -*traceRequest.startDirection;
+                    if (traceRequest.targetDirection)
+                        traceRequest.targetDirection = -*traceRequest.targetDirection;
+                } else {
+                    traceRequest.startIndex -= historyBegin;
+                    traceRequest.targetIndex -= historyBegin;
+                }
                 traced = request.externalSegment(traceRequest);
+                if (reverse)
+                    std::reverse(traced->fusedLine.begin(), traced->fusedLine.end());
             } else {
                 if (!request.predictions || !request.traceNormalSampler) {
                     throw std::runtime_error(
@@ -812,6 +872,9 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
             traced.reset();
         }
         if (!traced || !traced->accepted || traced->fusedLine.size() < 2) {
+            if (request.modelLineBuilder)
+                throw std::runtime_error("Fiber follow could not connect the controls: " +
+                    (traced ? traced->reason : traceException));
             spans[spanIndex] = inclusiveLineSpan(request.linePointsBase, first, last);
             owner.segmentToNext = traced
                 ? fiberTraceSegmentMetadataForResult(
@@ -939,7 +1002,6 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
         return value;
     };
 
-    vc::lasagna::LineOptimizer optimizer(*request.baseNormalSampler);
     vc::lasagna::LineReinitializationOptimizationResult reinitialized;
     std::vector<int> controlIndices;
     while (true) {
@@ -952,6 +1014,15 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
             request.controlPoints[index].linePosition = controlIndices[index];
         }
 
+        if (request.modelLineBuilder) {
+            reinitialized.fixedPointIndices = controlIndices;
+            for (const auto& p : stitched) {
+                vc::lasagna::LinePoint point;
+                point.position = p;
+                reinitialized.optimization.line.points.push_back(point);
+            }
+            break;
+        }
         std::vector<std::pair<int, int>> protectedSpans;
         std::vector<vc::lasagna::LineControlPointHardDirectionConstraint> hardDirections;
         std::vector<bool> protectedMode(modes.size(), false);
@@ -997,6 +1068,7 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
                 hardDirections.push_back({int(i),which,axis});
             }
         }
+        vc::lasagna::LineOptimizer optimizer(*request.baseNormalSampler);
         reinitialized = optimizer.reinitializeAndOptimizeExistingLine(
             std::move(stitched), optimizerControlPoints(request.controlPoints),
             controlIndices, controlIndices[controlIndices.size() / 2],
@@ -1110,12 +1182,13 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
                 "bounded fiber optimization returned an empty line");
         }
         line.points.front().position = request.controlPoints.front().volumePoint;
-        line.points.front().sampledNormal =
-            request.baseNormalSampler->sampleNormal(line.points.front().position);
+        if (request.baseNormalSampler)
+            line.points.front().sampledNormal = request.baseNormalSampler->sampleNormal(line.points.front().position);
         line.points.back().position = request.controlPoints.back().volumePoint;
-        line.points.back().sampledNormal =
-            request.baseNormalSampler->sampleNormal(line.points.back().position);
+        if (request.baseNormalSampler)
+            line.points.back().sampledNormal = request.baseNormalSampler->sampleNormal(line.points.back().position);
     }
+    finishModelLine(output);
     appendFiberModeReport(output);
     output.controlPoints = std::move(request.controlPoints);
     return output;

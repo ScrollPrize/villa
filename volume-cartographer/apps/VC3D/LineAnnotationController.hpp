@@ -82,6 +82,9 @@ public:
         bool focusBoundsApplied = false;
         std::string error;
         std::string eventName;
+        QString fiberTraceSummary;
+        QString fiberTraceDetails;
+        bool fiberTraceWarning = false;
     };
 
     // One fiber's polyline as the side-strip intersection query consumes
@@ -326,7 +329,8 @@ public:
     bool canLaunchFromViewer(const CChunkedVolumeViewer* viewer) const;
     void launchFromViewerAtPoint(CChunkedVolumeViewer* viewer,
                                  const QPointF& scenePoint,
-                                 bool replaceOwningAnnotation = true);
+                                 bool replaceOwningAnnotation = true,
+                                 bool modelOnly = false);
     void openFiber(uint64_t fiberId);
     // Opens a fiber imported from an Automated Fiber Volume, fitting the whole
     // line in both strips. A Lasagna dataset is optional. Errors are returned
@@ -922,12 +926,12 @@ private:
                                          bool retraceAll,
                                          std::optional<std::vector<size_t>> dirtySegments = std::nullopt,
                                          bool globalGoalsOnly = false) const;
-    // Fiber model backend: the neural fiber-follow model when enabled and a
-    // checkpoint is chosen (Line Annotation menu); else the native tracer.
+    // Fiber model backend: the neural fiber-follow model when enabled
+    // (Line Annotation menu); else the native tracer.
     [[nodiscard]] static bool fiberFollowEnabled();
     // GUI thread: starts the fiber-follow service if needed; false (error
     // shown unless headless) when it cannot run.
-    bool ensureFiberFollowService(bool headless);
+    bool ensureFiberFollowService(bool headless, LineAnnotationDialog* dialog = nullptr);
     // Points the request's tail extrapolation and Trace spans at the running
     // fiber-follow service. familyHint: "H", "V" or empty (from the direction).
     void installFiberFollowTracer(vc3d::line_annotation::FiberModeOptimizationRequest& request,
