@@ -2,6 +2,12 @@
 
 ## 2026-10-12
 
+- Adaptive final-L1 loss-weight search:96 completed fresh10k trials,16 accepted
+  improvements; user stopped before exhaustive neighborhood completion. Adopted
+  run_uv_current_baseline.json: L1 1.03824, within2 88.4118%, retained65.7749%,
+  zero signs, widthfactor .978573. Full compact trial records and accepted chain
+  persisted; released GPUs. Historical configs preserved.
+
 - Completed fresh0.5position-loss trial withanother10xstateLR, thenwidthLR20/.2
   onthebettercurrentstateLR. Full1k tables, losses/reference/width metrics,
   commandsandtimings in uv_bucket_lr_results.md. No defaults changed.

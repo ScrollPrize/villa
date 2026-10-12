@@ -1,5 +1,8 @@
 # Reference-selected regional solve
 
+Current: stop adaptive search now and commit the best completed result as new
+benchmark baseline. Preserve all completed trials; no further solves authorized.
+
 Current: iterative loss-weight tuning from fresh initialization, accept by final
 reference L1, revisit other weights after each acceptance. Only report accepted
 improvements, not 1k progress. See uv_loss_search_plan.md.

@@ -1,5 +1,18 @@
 # Global fiber assignment with PyTorch SGD
 
+## Current benchmark baseline (2026-10-12)
+
+Use [run_uv_current_baseline.json](run_uv_current_baseline.json) for future
+comparative experiments. [Loss-weight search results](uv_loss_search_results.md):
+fresh10k, reference L1 **1.038235**, within2 **88.4118%**, retained length
+**65.7749%**, bucket-sign violations **0%**, mean fitted/reference width **0.978573**.
+Search stopped by user after96 completed trials; no local-optimum claim.
+The reference was used for tuning, not held-out evaluation. Full selected
+configuration/provenance: [baseline record](uv_current_baseline_result.json).
+Historical configs and solver fallback defaults are preserved.
+
+## Earlier experiments (historical, not current defaults)
+
 Latest: [fresh state/width LR trials](uv_bucket_lr_results.md). Another10xstateLR
 is worse; widthLR20/.2 has minimal effect. CurrentLRdefaults unchanged.
 

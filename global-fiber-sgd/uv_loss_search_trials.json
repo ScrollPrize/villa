@@ -1,0 +1,4182 @@
+{
+  "trials": [
+    {
+      "fit_range": [
+        13,
+        22
+      ],
+      "key": "6f30299627be48eac73b",
+      "loss": 11.470309257507324,
+      "matched_fibers": 1475,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/6f30299627be48eac73b",
+      "ref_l1": 1.9674576271186441,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 50.177425651890594,
+      "sign_percent": 0,
+      "solve_seconds": 164.60366707690991,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 1,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.01,
+        "rejection_cost": 10,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9137330292782073,
+      "within_two_percent": 68.74576271186442
+    },
+    {
+      "fit_range": [
+        12,
+        22
+      ],
+      "key": "596bc8eec9b6d8ff6ee4",
+      "loss": 11.381975173950195,
+      "matched_fibers": 1474,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/596bc8eec9b6d8ff6ee4",
+      "ref_l1": 2.1221166892808685,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 50.42797025684277,
+      "sign_percent": 0,
+      "solve_seconds": 173.19438846618868,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 1,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.125,
+        "prior_weight": 0.01,
+        "rejection_cost": 10,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.982862989330288,
+      "within_two_percent": 68.11397557666214
+    },
+    {
+      "fit_range": [
+        13,
+        22
+      ],
+      "key": "a95eb5573d8cdc70f29f",
+      "loss": 11.784600257873535,
+      "matched_fibers": 1462,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/a95eb5573d8cdc70f29f",
+      "ref_l1": 1.9363885088919288,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 49.65643756061623,
+      "sign_percent": 0,
+      "solve_seconds": 165.55905245803297,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 1,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 10,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9151688902872263,
+      "within_two_percent": 70.38303693570451
+    },
+    {
+      "fit_range": [
+        13,
+        22
+      ],
+      "key": "d48b77101043aec1bed5",
+      "loss": 11.323551177978516,
+      "matched_fibers": 1455,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/d48b77101043aec1bed5",
+      "ref_l1": 1.8701030927835052,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 49.21425895214235,
+      "sign_percent": 0,
+      "solve_seconds": 164.46931605390273,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 1,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 10,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9165867008165028,
+      "within_two_percent": 72.98969072164948
+    },
+    {
+      "fit_range": [
+        13,
+        22
+      ],
+      "key": "87eb6a9804c891c1e6ce",
+      "loss": 10.933704376220703,
+      "matched_fibers": 1467,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/87eb6a9804c891c1e6ce",
+      "ref_l1": 2.112474437627812,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 49.94628939624402,
+      "sign_percent": 0,
+      "solve_seconds": 163.20312775298953,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 1,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 0.125,
+        "prior_weight": 0.01,
+        "rejection_cost": 10,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.913703468332857,
+      "within_two_percent": 68.50715746421268
+    },
+    {
+      "fit_range": [
+        13,
+        22
+      ],
+      "key": "43836cec7fbc1cee1857",
+      "loss": 11.044281959533691,
+      "matched_fibers": 1465,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/43836cec7fbc1cee1857",
+      "ref_l1": 2.063481228668942,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 49.85794214118881,
+      "sign_percent": 0,
+      "solve_seconds": 163.72062719310634,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 1,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.01,
+        "rejection_cost": 10,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.915384067570457,
+      "within_two_percent": 67.91808873720136
+    },
+    {
+      "fit_range": [
+        13,
+        22
+      ],
+      "key": "495a8d646e1a91a61497",
+      "loss": 11.802133560180664,
+      "matched_fibers": 1469,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/495a8d646e1a91a61497",
+      "ref_l1": 1.918992511912866,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 50.174299612141276,
+      "sign_percent": 0.01934610176049526,
+      "solve_seconds": 168.01062482595444,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 1,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 10,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9125271540009336,
+      "within_two_percent": 70.11572498298162
+    },
+    {
+      "fit_range": [
+        13,
+        22
+      ],
+      "key": "71a467784626ad0a9049",
+      "loss": 3.43410062789917,
+      "matched_fibers": 1334,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/71a467784626ad0a9049",
+      "ref_l1": 1.6889055472263867,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 43.50195078016814,
+      "sign_percent": 0,
+      "solve_seconds": 159.41629529185593,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 1,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9116692773656329,
+      "within_two_percent": 77.13643178410796
+    },
+    {
+      "fit_range": [
+        13,
+        22
+      ],
+      "key": "805bd0cfbaec29423aea",
+      "loss": 3.1358225345611572,
+      "matched_fibers": 1370,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/805bd0cfbaec29423aea",
+      "ref_l1": 1.9474452554744526,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 45.39698193772667,
+      "sign_percent": 0,
+      "solve_seconds": 163.94818284292705,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 1,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 0.125,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9130900764234182,
+      "within_two_percent": 71.0948905109489
+    },
+    {
+      "fit_range": [
+        13,
+        22
+      ],
+      "key": "e4faf24abac7331676e6",
+      "loss": 3.2063663005828857,
+      "matched_fibers": 1350,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/e4faf24abac7331676e6",
+      "ref_l1": 1.8718518518518519,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 44.193594423433375,
+      "sign_percent": 0,
+      "solve_seconds": 163.38554878998548,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 1,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9137276438795844,
+      "within_two_percent": 71.62962962962963
+    },
+    {
+      "fit_range": [
+        13,
+        22
+      ],
+      "key": "dec68a18660505ee6173",
+      "loss": 3.541414499282837,
+      "matched_fibers": 1377,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/dec68a18660505ee6173",
+      "ref_l1": 1.7342047930283224,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 45.30370889260472,
+      "sign_percent": 0,
+      "solve_seconds": 163.03329211100936,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 1,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9135942457638951,
+      "within_two_percent": 74.7276688453159
+    },
+    {
+      "fit_range": [
+        12,
+        21
+      ],
+      "key": "8bf7ec1f3686daf90ab5",
+      "loss": 3.5546534061431885,
+      "matched_fibers": 1366,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/8bf7ec1f3686daf90ab5",
+      "ref_l1": 1.7562225475841875,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 44.76380703839497,
+      "sign_percent": 0,
+      "solve_seconds": 168.68547089002095,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 1,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9828775459228797,
+      "within_two_percent": 77.37920937042459
+    },
+    {
+      "fit_range": [
+        13,
+        22
+      ],
+      "key": "5b6791fb57b69474ec45",
+      "loss": 41.909393310546875,
+      "matched_fibers": 1523,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/5b6791fb57b69474ec45",
+      "ref_l1": 1.9093893630991465,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 53.49099621659312,
+      "sign_percent": 0,
+      "solve_seconds": 164.07643531402573,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 1,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9044370289487692,
+      "within_two_percent": 69.73079448456993
+    },
+    {
+      "fit_range": [
+        13,
+        22
+      ],
+      "key": "6fabe20c6f7545772bbd",
+      "loss": 2.953441858291626,
+      "matched_fibers": 1460,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/6fabe20c6f7545772bbd",
+      "ref_l1": 1.8527397260273972,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 49.56744346076075,
+      "sign_percent": 0,
+      "solve_seconds": 165.87623652396724,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9133151861649927,
+      "within_two_percent": 71.7123287671233
+    },
+    {
+      "fit_range": [
+        14,
+        22
+      ],
+      "key": "334afa8fa05c4e284ec9",
+      "loss": 4.677017688751221,
+      "matched_fibers": 1150,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/334afa8fa05c4e284ec9",
+      "ref_l1": 1.5921739130434782,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 35.30436395034504,
+      "sign_percent": 0,
+      "solve_seconds": 176.40053349896334,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.912237315516629,
+      "within_two_percent": 79.47826086956522
+    },
+    {
+      "fit_range": [
+        13,
+        22
+      ],
+      "key": "00c6707c5c9a857adb0a",
+      "loss": 3.775196075439453,
+      "matched_fibers": 1248,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/00c6707c5c9a857adb0a",
+      "ref_l1": 1.751602564102564,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 39.74419689518333,
+      "sign_percent": 0,
+      "solve_seconds": 174.58486968302168,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 0.125,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9130868981497453,
+      "within_two_percent": 75
+    },
+    {
+      "fit_range": [
+        13,
+        22
+      ],
+      "key": "786a472b046f77bea31c",
+      "loss": 3.9705543518066406,
+      "matched_fibers": 1229,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/786a472b046f77bea31c",
+      "ref_l1": 1.6924328722538649,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 38.73414471835682,
+      "sign_percent": 0,
+      "solve_seconds": 166.42486609704792,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9122050023520499,
+      "within_two_percent": 76.56631407648494
+    },
+    {
+      "fit_range": [
+        14,
+        22
+      ],
+      "key": "6b6a2755a9ed0308457b",
+      "loss": 4.836932182312012,
+      "matched_fibers": 1207,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/6b6a2755a9ed0308457b",
+      "ref_l1": 1.591549295774648,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 38.1802084896698,
+      "sign_percent": 0,
+      "solve_seconds": 162.8398291110061,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.912836092002537,
+      "within_two_percent": 80.28169014084507
+    },
+    {
+      "fit_range": [
+        13,
+        22
+      ],
+      "key": "474feeb7e82633939305",
+      "loss": 3.9182183742523193,
+      "matched_fibers": 1274,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/474feeb7e82633939305",
+      "ref_l1": 1.8116169544740974,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 40.9678804244394,
+      "sign_percent": 0,
+      "solve_seconds": 161.0193989011459,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.125,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9131023227944075,
+      "within_two_percent": 73.861852433281
+    },
+    {
+      "fit_range": [
+        13,
+        22
+      ],
+      "key": "e74b78584adae7b46039",
+      "loss": 4.111933708190918,
+      "matched_fibers": 1262,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/e74b78584adae7b46039",
+      "ref_l1": 1.7091917591125199,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 40.45106685956853,
+      "sign_percent": 0,
+      "solve_seconds": 161.2484473490622,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9108279621578027,
+      "within_two_percent": 76.38668779714739
+    },
+    {
+      "fit_range": [
+        13,
+        21
+      ],
+      "key": "d845ee331ce5829dc9a5",
+      "loss": 4.84403657913208,
+      "matched_fibers": 1257,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/d845ee331ce5829dc9a5",
+      "ref_l1": 1.568019093078759,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 40.56073048789964,
+      "sign_percent": 0,
+      "solve_seconds": 166.18519339105114,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9851411132684609,
+      "within_two_percent": 79.87271280827368
+    },
+    {
+      "fit_range": [
+        12,
+        21
+      ],
+      "key": "a00343986bdd6f3c8700",
+      "loss": 3.9105284214019775,
+      "matched_fibers": 1324,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/a00343986bdd6f3c8700",
+      "ref_l1": 1.7877643504531722,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 43.10705771399231,
+      "sign_percent": 0,
+      "solve_seconds": 162.01978576090187,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 0.125,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9837884333106383,
+      "within_two_percent": 76.35951661631421
+    },
+    {
+      "fit_range": [
+        12,
+        21
+      ],
+      "key": "293270688a821a0474f1",
+      "loss": 4.106480121612549,
+      "matched_fibers": 1307,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/293270688a821a0474f1",
+      "ref_l1": 1.6893649579188983,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 42.077629907404244,
+      "sign_percent": 0,
+      "solve_seconds": 163.5949155720882,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9842277244290099,
+      "within_two_percent": 78.57689364957919
+    },
+    {
+      "fit_range": [
+        13,
+        22
+      ],
+      "key": "edcd322794eb1f2d5a97",
+      "loss": 13.708230972290039,
+      "matched_fibers": 1373,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/edcd322794eb1f2d5a97",
+      "ref_l1": 1.7159504734158777,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 45.99001958386032,
+      "sign_percent": 0.023872045834328,
+      "solve_seconds": 165.8490071669221,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 10,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9100544095581646,
+      "within_two_percent": 76.40203932993444
+    },
+    {
+      "fit_range": [
+        13,
+        22
+      ],
+      "key": "81d6a39ac174639a4e17",
+      "loss": 46.83990478515625,
+      "matched_fibers": 1447,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/81d6a39ac174639a4e17",
+      "ref_l1": 1.8023496890117485,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 49.503349728860165,
+      "sign_percent": 0,
+      "solve_seconds": 165.14663766301237,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9162453271260143,
+      "within_two_percent": 73.53144436765722
+    },
+    {
+      "fit_range": [
+        12,
+        21
+      ],
+      "key": "ee93c005d4a6e4cf0e91",
+      "loss": 3.095775604248047,
+      "matched_fibers": 1467,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/ee93c005d4a6e4cf0e91",
+      "ref_l1": 1.8929788684389912,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 50.38747815608375,
+      "sign_percent": 0.03842459173871278,
+      "solve_seconds": 165.71253964304924,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9822780566269284,
+      "within_two_percent": 73.89229720518064
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "8755c35ef03165eae9df",
+      "loss": 3.2170920372009277,
+      "matched_fibers": 1307,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/8755c35ef03165eae9df",
+      "ref_l1": 1.4299923488905892,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 42.2990609609169,
+      "sign_percent": 0.12610340479192939,
+      "solve_seconds": 167.88275721110404,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.985852060552843,
+      "within_two_percent": 82.47895944912013
+    },
+    {
+      "fit_range": [
+        13,
+        21
+      ],
+      "key": "e46bf34bd7731a0cebf7",
+      "loss": 2.353879690170288,
+      "matched_fibers": 1397,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/e46bf34bd7731a0cebf7",
+      "ref_l1": 1.5110952040085899,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 46.22606148872301,
+      "sign_percent": 0.02103491796381994,
+      "solve_seconds": 162.54638095689006,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 0.125,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9839573429273802,
+      "within_two_percent": 81.17394416607016
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "49297f00af2a21c5062e",
+      "loss": 2.5391182899475098,
+      "matched_fibers": 1376,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/49297f00af2a21c5062e",
+      "ref_l1": 1.5007267441860466,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 45.57058060983646,
+      "sign_percent": 0.02247696111485727,
+      "solve_seconds": 168.91319923195988,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9857293144330568,
+      "within_two_percent": 82.12209302325581
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "87dc98decd2b520d8c03",
+      "loss": 3.19586443901062,
+      "matched_fibers": 1215,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/87dc98decd2b520d8c03",
+      "ref_l1": 1.4452674897119342,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 37.86836402622533,
+      "sign_percent": 0,
+      "solve_seconds": 168.53882890800014,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9834178975559225,
+      "within_two_percent": 82.79835390946502
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "d5a97de4af98b489eb59",
+      "loss": 3.2533273696899414,
+      "matched_fibers": 1255,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/d5a97de4af98b489eb59",
+      "ref_l1": 1.4422310756972112,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 39.2266369505023,
+      "sign_percent": 0,
+      "solve_seconds": 164.8763531409204,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9840846354347128,
+      "within_two_percent": 82.07171314741036
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "797798896fdc5acad2d3",
+      "loss": 7.485560894012451,
+      "matched_fibers": 1477,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/797798896fdc5acad2d3",
+      "ref_l1": 1.4705484089370344,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 50.706825263945056,
+      "sign_percent": 0.3327495621716287,
+      "solve_seconds": 172.13664733688347,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 10,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9924994082217257,
+      "within_two_percent": 83.54773188896412
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "2715c9b8405869033477",
+      "loss": 22.844144821166992,
+      "matched_fibers": 1603,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/2715c9b8405869033477",
+      "ref_l1": 1.4354335620711167,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 56.92935277988143,
+      "sign_percent": 0.583570252880443,
+      "solve_seconds": 160.48267096211202,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 1.0018302191606383,
+      "within_two_percent": 80.72364316905801
+    },
+    {
+      "fit_range": [
+        13,
+        21
+      ],
+      "key": "0fcd4e88758290624866",
+      "loss": 1.5802319049835205,
+      "matched_fibers": 1620,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/0fcd4e88758290624866",
+      "ref_l1": 1.5351851851851852,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 57.503583817069995,
+      "sign_percent": 0.3679717397703856,
+      "solve_seconds": 161.64241358917207,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9811328962802487,
+      "within_two_percent": 80.98765432098766
+    },
+    {
+      "fit_range": [
+        13,
+        21
+      ],
+      "key": "e6fd7bd2a422d5c3c250",
+      "loss": 2.024507522583008,
+      "matched_fibers": 1480,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/e6fd7bd2a422d5c3c250",
+      "ref_l1": 1.4945945945945946,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 50.658903161511624,
+      "sign_percent": 0.12667390517553384,
+      "solve_seconds": 161.55277667799965,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 1,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9836303800164468,
+      "within_two_percent": 81.35135135135135
+    },
+    {
+      "fit_range": [
+        13,
+        22
+      ],
+      "key": "cfda6b4a521ae0962990",
+      "loss": 10.511528968811035,
+      "matched_fibers": 1146,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/cfda6b4a521ae0962990",
+      "ref_l1": 1.8219895287958114,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 35.694520914109034,
+      "sign_percent": 0,
+      "solve_seconds": 169.27990741096437,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 128,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9157173409785501,
+      "within_two_percent": 73.38568935427574
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "0177ffbf437b114fe331",
+      "loss": 3.0926740169525146,
+      "matched_fibers": 1309,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/0177ffbf437b114fe331",
+      "ref_l1": 1.4369747899159664,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 42.612506023195834,
+      "sign_percent": 0.11970313622216902,
+      "solve_seconds": 170.53369614109397,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 2.5,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.983995728937887,
+      "within_two_percent": 82.8113063407181
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "ed9eddf5fa644a0125c8",
+      "loss": 3.740762948989868,
+      "matched_fibers": 1291,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/ed9eddf5fa644a0125c8",
+      "ref_l1": 1.4740511231603408,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 42.04585190410424,
+      "sign_percent": 0.027240533914464723,
+      "solve_seconds": 169.5149447149597,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9870228176930373,
+      "within_two_percent": 82.18435321456235
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "00afdc04c6cdceb60424",
+      "loss": 3.216204881668091,
+      "matched_fibers": 1309,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/00afdc04c6cdceb60424",
+      "ref_l1": 1.4163483575248281,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 42.42448273405524,
+      "sign_percent": 0.12478163214374845,
+      "solve_seconds": 161.83707322506234,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 2,
+        "prior_weight": 0.0025,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9861256434624314,
+      "within_two_percent": 82.8113063407181
+    },
+    {
+      "fit_range": [
+        13,
+        21
+      ],
+      "key": "a1cb99b31a54cb3ad725",
+      "loss": 2.3533008098602295,
+      "matched_fibers": 1397,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/a1cb99b31a54cb3ad725",
+      "ref_l1": 1.5010737294201861,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 46.22606148872301,
+      "sign_percent": 0.02103491796381994,
+      "solve_seconds": 167.13174199708737,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 0.125,
+        "prior_weight": 0.0025,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9839479625923924,
+      "within_two_percent": 81.53185397279886
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "91ba80cd5d74415e9b27",
+      "loss": 2.5383546352386475,
+      "matched_fibers": 1376,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/91ba80cd5d74415e9b27",
+      "ref_l1": 1.4811046511627908,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 45.596807736078986,
+      "sign_percent": 0.022487069934787496,
+      "solve_seconds": 167.65897075505927,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9843834036221111,
+      "within_two_percent": 82.19476744186046
+    },
+    {
+      "fit_range": [
+        14,
+        21
+      ],
+      "key": "131f419d76262ecea419",
+      "loss": 3.1950111389160156,
+      "matched_fibers": 1218,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/131f419d76262ecea419",
+      "ref_l1": 1.4252873563218391,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 37.971291732114075,
+      "sign_percent": 0,
+      "solve_seconds": 167.83941068593413,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 2,
+        "prior_weight": 0.0025,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9115919574567553,
+      "within_two_percent": 83.2512315270936
+    },
+    {
+      "fit_range": [
+        13.5,
+        20.5
+      ],
+      "key": "8e360570be3757f2d4d4",
+      "loss": 3.251175880432129,
+      "matched_fibers": 1258,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/8e360570be3757f2d4d4",
+      "ref_l1": 1.4395866454689985,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 39.28307100262928,
+      "sign_percent": 0,
+      "solve_seconds": 161.0200046878308,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 2,
+        "prior_weight": 0.0025,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9490407079698779,
+      "within_two_percent": 77.90143084260731
+    },
+    {
+      "fit_range": [
+        14,
+        21
+      ],
+      "key": "bf06f5254b9824f1758b",
+      "loss": 7.4835309982299805,
+      "matched_fibers": 1480,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/bf06f5254b9824f1758b",
+      "ref_l1": 1.4641891891891892,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 50.87033834139575,
+      "sign_percent": 0.36256906077348067,
+      "solve_seconds": 162.12080114800483,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 2,
+        "prior_weight": 0.0025,
+        "rejection_cost": 10,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9152512725137237,
+      "within_two_percent": 82.0945945945946
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "09529206fb2a5fa8c650",
+      "loss": 22.845359802246094,
+      "matched_fibers": 1603,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/09529206fb2a5fa8c650",
+      "ref_l1": 1.4029943855271365,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 56.88778288289296,
+      "sign_percent": 0.5825242718446602,
+      "solve_seconds": 165.25997387315147,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 2,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 1.0047320400094746,
+      "within_two_percent": 81.6593886462882
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "6ac6e685d1d6f696bc0b",
+      "loss": 21.476457595825195,
+      "matched_fibers": 1608,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/6ac6e685d1d6f696bc0b",
+      "ref_l1": 1.5932835820895523,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 57.23044569977303,
+      "sign_percent": 0.5136727602356852,
+      "solve_seconds": 163.57253764895722,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 0.125,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9857166065414588,
+      "within_two_percent": 78.9179104477612
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "3040ef9f2ad39898955d",
+      "loss": 21.78448486328125,
+      "matched_fibers": 1601,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/3040ef9f2ad39898955d",
+      "ref_l1": 1.5808869456589631,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 56.8593550597554,
+      "sign_percent": 0.4510599909788002,
+      "solve_seconds": 168.29466221714392,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.989306295991069,
+      "within_two_percent": 77.51405371642723
+    },
+    {
+      "fit_range": [
+        14,
+        21
+      ],
+      "key": "a991aef6f9a0cd0a5571",
+      "loss": 22.321531295776367,
+      "matched_fibers": 1580,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/a991aef6f9a0cd0a5571",
+      "ref_l1": 1.3746835443037975,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 56.39101379432336,
+      "sign_percent": 0,
+      "solve_seconds": 164.18933651200496,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 2,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.8792297951476905,
+      "within_two_percent": 83.10126582278481
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "0f9181e1b48b1a5f211e",
+      "loss": 20.986064910888672,
+      "matched_fibers": 1602,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/0f9181e1b48b1a5f211e",
+      "ref_l1": 1.5280898876404494,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 57.495513398959545,
+      "sign_percent": 0,
+      "solve_seconds": 166.72831175592728,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 0.125,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9837804213425747,
+      "within_two_percent": 80.89887640449437
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "6cd748159752835d5b84",
+      "loss": 21.263973236083984,
+      "matched_fibers": 1598,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/6cd748159752835d5b84",
+      "ref_l1": 1.464956195244055,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 57.27036177668256,
+      "sign_percent": 0,
+      "solve_seconds": 171.79068614402786,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9885806998140871,
+      "within_two_percent": 81.78973717146432
+    },
+    {
+      "fit_range": [
+        14,
+        21
+      ],
+      "key": "a7bc5bbeb61845f5f826",
+      "loss": 22.98330307006836,
+      "matched_fibers": 1574,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/a7bc5bbeb61845f5f826",
+      "ref_l1": 1.542566709021601,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 55.38617208651327,
+      "sign_percent": 0.01584534938995405,
+      "solve_seconds": 164.65151558606885,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 2,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9316389979451137,
+      "within_two_percent": 79.73316391359594
+    },
+    {
+      "fit_range": [
+        14,
+        21
+      ],
+      "key": "20f88ceb40b1220e69f8",
+      "loss": 7.436847686767578,
+      "matched_fibers": 1462,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/20f88ceb40b1220e69f8",
+      "ref_l1": 1.4274965800273598,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 48.6880803696946,
+      "sign_percent": 0,
+      "solve_seconds": 168.43306859885342,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 2,
+        "prior_weight": 0.0025,
+        "rejection_cost": 10,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9074087606278357,
+      "within_two_percent": 82.0109439124487
+    },
+    {
+      "fit_range": [
+        14,
+        21
+      ],
+      "key": "33a441d933fa11ca633f",
+      "loss": 17.88251495361328,
+      "matched_fibers": 1659,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/33a441d933fa11ca633f",
+      "ref_l1": 1.2597950572634118,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 63.333446008034414,
+      "sign_percent": 0,
+      "solve_seconds": 170.3907259090338,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 2,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9091521525358042,
+      "within_two_percent": 85.05123568414707
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "b8557abcd6229d1109c0",
+      "loss": 17.802663803100586,
+      "matched_fibers": 1662,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/b8557abcd6229d1109c0",
+      "ref_l1": 1.3694344163658243,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 63.32608563266615,
+      "sign_percent": 0,
+      "solve_seconds": 165.87637267587706,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 0.125,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9842467928870902,
+      "within_two_percent": 84.17569193742479
+    },
+    {
+      "fit_range": [
+        14,
+        21
+      ],
+      "key": "f8a08e24a3541125fd41",
+      "loss": 17.773496627807617,
+      "matched_fibers": 1664,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/f8a08e24a3541125fd41",
+      "ref_l1": 1.3605769230769231,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 63.841988730737874,
+      "sign_percent": 0,
+      "solve_seconds": 170.1108133769594,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.91096730596003,
+      "within_two_percent": 84.4951923076923
+    },
+    {
+      "fit_range": [
+        14,
+        21
+      ],
+      "key": "9bae8e308badc49ac84d",
+      "loss": 18.607730865478516,
+      "matched_fibers": 1663,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/9bae8e308badc49ac84d",
+      "ref_l1": 1.1972339146121467,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 63.29744439351881,
+      "sign_percent": 0.04942542938341777,
+      "solve_seconds": 164.44391704211012,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 2,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.900014302746457,
+      "within_two_percent": 87.61274804570054
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "7b55fb57962f3e5dfa68",
+      "loss": 18.436908721923828,
+      "matched_fibers": 1663,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/7b55fb57962f3e5dfa68",
+      "ref_l1": 1.353577871316897,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 62.9360338888739,
+      "sign_percent": 0.012550200803212851,
+      "solve_seconds": 159.98913107602857,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.125,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9818042795297075,
+      "within_two_percent": 84.24533974744438
+    },
+    {
+      "fit_range": [
+        14,
+        21
+      ],
+      "key": "6aa4a6d3f85c50f97869",
+      "loss": 18.501129150390625,
+      "matched_fibers": 1662,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/6aa4a6d3f85c50f97869",
+      "ref_l1": 1.2773766546329723,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 63.16460077778451,
+      "sign_percent": 0.012447099825740602,
+      "solve_seconds": 168.21044754912145,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.909798628980804,
+      "within_two_percent": 86.10108303249098
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "9a40cc4739a4a17cae9c",
+      "loss": 18.62483787536621,
+      "matched_fibers": 1673,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/9a40cc4739a4a17cae9c",
+      "ref_l1": 1.2946802151823071,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 64.0986926203546,
+      "sign_percent": 0.6652957542034595,
+      "solve_seconds": 168.4482764119748,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 2,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9726509617766845,
+      "within_two_percent": 84.27973699940226
+    },
+    {
+      "fit_range": [
+        13,
+        21
+      ],
+      "key": "38e3bc0409ad4bfb6111",
+      "loss": 1.5822432041168213,
+      "matched_fibers": 1612,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/38e3bc0409ad4bfb6111",
+      "ref_l1": 1.4869727047146402,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 57.3506590599604,
+      "sign_percent": 0,
+      "solve_seconds": 169.4909005460795,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 2,
+        "prior_weight": 0.0025,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9819626756039396,
+      "within_two_percent": 80.08684863523573
+    },
+    {
+      "fit_range": [
+        14,
+        21
+      ],
+      "key": "a0a89367084266d61137",
+      "loss": 5.054580211639404,
+      "matched_fibers": 1668,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/a0a89367084266d61137",
+      "ref_l1": 1.275179856115108,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 62.14215852721588,
+      "sign_percent": 0,
+      "solve_seconds": 163.52611148613505,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 2,
+        "prior_weight": 0.0025,
+        "rejection_cost": 10,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9042335294565953,
+      "within_two_percent": 84.05275779376498
+    },
+    {
+      "fit_range": [
+        14,
+        21
+      ],
+      "key": "fd7bdf37c4a070b9f2fa",
+      "loss": 19.98592758178711,
+      "matched_fibers": 1646,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/fd7bdf37c4a070b9f2fa",
+      "ref_l1": 1.3973268529769138,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 61.02999919352914,
+      "sign_percent": 0.051833614098743035,
+      "solve_seconds": 165.48142297100276,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 1,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 2,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.8937739375348034,
+      "within_two_percent": 82.80680437424058
+    },
+    {
+      "fit_range": [
+        13,
+        22
+      ],
+      "key": "e3550945a443bd436bf1",
+      "loss": 42.42715835571289,
+      "matched_fibers": 1560,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/e3550945a443bd436bf1",
+      "ref_l1": 1.817948717948718,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 56.78073676186178,
+      "sign_percent": 0,
+      "solve_seconds": 171.24146633292548,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 2,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9134796845857662,
+      "within_two_percent": 74.2948717948718
+    },
+    {
+      "fit_range": [
+        13,
+        23
+      ],
+      "key": "f3f824f0608d63ba8d35",
+      "loss": 125.41471099853516,
+      "matched_fibers": 1354,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/f3f824f0608d63ba8d35",
+      "ref_l1": 2.2895125553914326,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 45.43842573075144,
+      "sign_percent": 0,
+      "solve_seconds": 166.46039429306984,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 2,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 128,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9132297685681152,
+      "within_two_percent": 62.481536189069416
+    },
+    {
+      "fit_range": [
+        14,
+        21
+      ],
+      "key": "d53466eaca9044b3f3f0",
+      "loss": 19.292476654052734,
+      "matched_fibers": 1610,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/d53466eaca9044b3f3f0",
+      "ref_l1": 1.3751552795031057,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 61.28868304334283,
+      "sign_percent": 0.013192612137203167,
+      "solve_seconds": 167.84834020095877,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 2,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 2.5,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9084519329959688,
+      "within_two_percent": 84.59627329192546
+    },
+    {
+      "fit_range": [
+        14,
+        21
+      ],
+      "key": "eb8f8708ae0e07b1f87c",
+      "loss": 18.527332305908203,
+      "matched_fibers": 1695,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/eb8f8708ae0e07b1f87c",
+      "ref_l1": 1.1563421828908556,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 65.3013460184066,
+      "sign_percent": 0.011460004584001834,
+      "solve_seconds": 167.69650427694432,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 2,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.8996806499598334,
+      "within_two_percent": 87.84660766961652
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "2b4dc68d290d0fb1d7de",
+      "loss": 18.431346893310547,
+      "matched_fibers": 1699,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/2b4dc68d290d0fb1d7de",
+      "ref_l1": 1.1236021188934668,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 65.90410504508323,
+      "sign_percent": 0,
+      "solve_seconds": 174.99681080807932,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.125,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9817456790517974,
+      "within_two_percent": 87.051206592113
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "e797d5320045a490ff3b",
+      "loss": 18.451374053955078,
+      "matched_fibers": 1700,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/e797d5320045a490ff3b",
+      "ref_l1": 1.0488235294117647,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 65.77485366332414,
+      "sign_percent": 0,
+      "solve_seconds": 167.72991105681285,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9783180305132542,
+      "within_two_percent": 88.3529411764706
+    },
+    {
+      "fit_range": [
+        14,
+        21
+      ],
+      "key": "c3b0dac41e2bafe9ea5f",
+      "loss": 17.468849182128906,
+      "matched_fibers": 1713,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/c3b0dac41e2bafe9ea5f",
+      "ref_l1": 1.117338003502627,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 66.3699298064542,
+      "sign_percent": 0,
+      "solve_seconds": 165.28874047705904,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9114383955492477,
+      "within_two_percent": 88.32457676590776
+    },
+    {
+      "fit_range": [
+        14,
+        21
+      ],
+      "key": "c9348cee76d08f557156",
+      "loss": 18.368078231811523,
+      "matched_fibers": 1720,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/c9348cee76d08f557156",
+      "ref_l1": 1.0709302325581396,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 66.80375943697723,
+      "sign_percent": 0.6148686416992734,
+      "solve_seconds": 169.1247136669699,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9055179145229715,
+      "within_two_percent": 89.70930232558139
+    },
+    {
+      "fit_range": [
+        13,
+        21
+      ],
+      "key": "a2edb1ececcfd8a72cdd",
+      "loss": 2.065568685531616,
+      "matched_fibers": 1605,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/a2edb1ececcfd8a72cdd",
+      "ref_l1": 1.4710280373831777,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 56.30757412268233,
+      "sign_percent": 0,
+      "solve_seconds": 164.44990363600664,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9823663593698102,
+      "within_two_percent": 81.30841121495327
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "f9ff7b0f80a6e1e98ff5",
+      "loss": 5.3282623291015625,
+      "matched_fibers": 1723,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/f9ff7b0f80a6e1e98ff5",
+      "ref_l1": 1.1114335461404528,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 65.35455022160738,
+      "sign_percent": 0,
+      "solve_seconds": 166.33026410383172,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 10,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9790459912753576,
+      "within_two_percent": 89.95937318630295
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "62a7773c2f61ccea6a56",
+      "loss": 19.76106834411621,
+      "matched_fibers": 1679,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/62a7773c2f61ccea6a56",
+      "ref_l1": 1.3245979749851102,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 62.65945429611098,
+      "sign_percent": 0,
+      "solve_seconds": 173.93478571390733,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 1,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9669270920740699,
+      "within_two_percent": 83.97855866587254
+    },
+    {
+      "fit_range": [
+        13,
+        21
+      ],
+      "key": "eb77d6c235997f6d570d",
+      "loss": 22.0815486907959,
+      "matched_fibers": 1610,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/eb77d6c235997f6d570d",
+      "ref_l1": 1.5124223602484472,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 57.483307533404506,
+      "sign_percent": 0,
+      "solve_seconds": 163.81890635797754,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.979919899778551,
+      "within_two_percent": 80.4968944099379
+    },
+    {
+      "fit_range": [
+        13,
+        21
+      ],
+      "key": "ed0a4c9fb8b95c7f9d4c",
+      "loss": 41.84915542602539,
+      "matched_fibers": 1609,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/ed0a4c9fb8b95c7f9d4c",
+      "ref_l1": 1.7656929770043506,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 58.51626902516083,
+      "sign_percent": 0,
+      "solve_seconds": 167.59414582699537,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9122794653799264,
+      "within_two_percent": 75.63704164077066
+    },
+    {
+      "fit_range": [
+        12,
+        23
+      ],
+      "key": "2bc15bd31cfdf51a04d0",
+      "loss": 125.84041595458984,
+      "matched_fibers": 1353,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/2bc15bd31cfdf51a04d0",
+      "ref_l1": 2.5713229859571323,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 45.4098568295382,
+      "sign_percent": 0,
+      "solve_seconds": 169.97636796487495,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 128,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9129918712681843,
+      "within_two_percent": 58.684405025868436
+    },
+    {
+      "fit_range": [
+        14,
+        21
+      ],
+      "key": "163c56f6c073cc6f6672",
+      "loss": 19.369422912597656,
+      "matched_fibers": 1604,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/163c56f6c073cc6f6672",
+      "ref_l1": 1.495635910224439,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 60.828768863700724,
+      "sign_percent": 0.013144058885383806,
+      "solve_seconds": 167.07733211293817,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 2.5,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9113675476155025,
+      "within_two_percent": 80.9850374064838
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "97f399be82fd7db7fa29",
+      "loss": 18.454429626464844,
+      "matched_fibers": 1700,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/97f399be82fd7db7fa29",
+      "ref_l1": 1.1452941176470588,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 65.77485366332414,
+      "sign_percent": 0,
+      "solve_seconds": 167.8197124840226,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.01,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9835454603349343,
+      "within_two_percent": 87.23529411764706
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "396decdfd962892eee99",
+      "loss": 18.45948028564453,
+      "matched_fibers": 1699,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/396decdfd962892eee99",
+      "ref_l1": 1.3543260741612713,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 65.71570286661073,
+      "sign_percent": 0,
+      "solve_seconds": 166.18228254513815,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.04,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9930955270265789,
+      "within_two_percent": 84.87345497351383
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "ee7a5dbcf07c58f7b4d3",
+      "loss": 18.449583053588867,
+      "matched_fibers": 1700,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/ee7a5dbcf07c58f7b4d3",
+      "ref_l1": 1.1005882352941176,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 65.77485366332414,
+      "sign_percent": 0,
+      "solve_seconds": 172.16311516007408,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.0025,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.977544498184354,
+      "within_two_percent": 88.47058823529412
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "0263738677bd85ca1d40",
+      "loss": 18.458194732666016,
+      "matched_fibers": 1700,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/0263738677bd85ca1d40",
+      "ref_l1": 1.07,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 65.77485366332414,
+      "sign_percent": 0,
+      "solve_seconds": 170.90812495583668,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.04,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9770849501745077,
+      "within_two_percent": 88.6470588235294
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "44d4122ad37c0f4370af",
+      "loss": 18.440122604370117,
+      "matched_fibers": 1699,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/44d4122ad37c0f4370af",
+      "ref_l1": 1.094173042966451,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 65.70143535964463,
+      "sign_percent": 0,
+      "solve_seconds": 167.22368704201654,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.0125,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9768670865907183,
+      "within_two_percent": 87.93407886992348
+    },
+    {
+      "fit_range": [
+        14,
+        21
+      ],
+      "key": "6fedaf93ef6517a51159",
+      "loss": 18.51729393005371,
+      "matched_fibers": 1701,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/6fedaf93ef6517a51159",
+      "ref_l1": 1.128747795414462,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 65.90916346456731,
+      "sign_percent": 0.022870211549456832,
+      "solve_seconds": 163.78886817907915,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.2,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9075000684953026,
+      "within_two_percent": 88.35978835978835
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "1f4d18cf3d36336de551",
+      "loss": 18.451210021972656,
+      "matched_fibers": 1700,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/1f4d18cf3d36336de551",
+      "ref_l1": 1.066470588235294,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 65.77485366332414,
+      "sign_percent": 0,
+      "solve_seconds": 169.55849691294134,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.0025,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.977327227039828,
+      "within_two_percent": 88.58823529411765
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "674d1f7d57d25559ebaa",
+      "loss": 18.452028274536133,
+      "matched_fibers": 1700,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/674d1f7d57d25559ebaa",
+      "ref_l1": 1.0494117647058823,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 65.77485366332414,
+      "sign_percent": 0,
+      "solve_seconds": 162.1774054239504,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.04,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9773967118199168,
+      "within_two_percent": 88.6470588235294
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "eb142efc153b00cd9e83",
+      "loss": 18.451618194580078,
+      "matched_fibers": 1700,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/eb142efc153b00cd9e83",
+      "ref_l1": 1.0382352941176471,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 65.77485366332414,
+      "sign_percent": 0,
+      "solve_seconds": 170.43154703592882,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.00025,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9785728219485073,
+      "within_two_percent": 88.41176470588236
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "0b61ee006cb1e0e198a8",
+      "loss": 18.431591033935547,
+      "matched_fibers": 1699,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/0b61ee006cb1e0e198a8",
+      "ref_l1": 1.1318422601530311,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 65.90410504508323,
+      "sign_percent": 0,
+      "solve_seconds": 168.28081317897886,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.00025,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.125,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9816843623098421,
+      "within_two_percent": 86.69805768098881
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "549489c499a1d2f704dd",
+      "loss": 18.53588104248047,
+      "matched_fibers": 1694,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/549489c499a1d2f704dd",
+      "ref_l1": 1.1599763872491144,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 65.27165393049437,
+      "sign_percent": 0.011483693155718878,
+      "solve_seconds": 164.22781193512492,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.00025,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 2,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.963596261087085,
+      "within_two_percent": 87.83943329397876
+    },
+    {
+      "fit_range": [
+        14,
+        21
+      ],
+      "key": "cb6736359d783b72b099",
+      "loss": 17.469419479370117,
+      "matched_fibers": 1713,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/cb6736359d783b72b099",
+      "ref_l1": 1.1196730881494454,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 66.3699298064542,
+      "sign_percent": 0,
+      "solve_seconds": 167.9826159691438,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.00025,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.911358945565466,
+      "within_two_percent": 88.2661996497373
+    },
+    {
+      "fit_range": [
+        14,
+        21
+      ],
+      "key": "5e870ebfb756ca9a655d",
+      "loss": 18.369829177856445,
+      "matched_fibers": 1721,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/5e870ebfb756ca9a655d",
+      "ref_l1": 1.05287623474724,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 66.85183462761327,
+      "sign_percent": 0.6145938093641747,
+      "solve_seconds": 163.35540849994868,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.00025,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9053110497654805,
+      "within_two_percent": 89.77338756536896
+    },
+    {
+      "fit_range": [
+        13,
+        21
+      ],
+      "key": "53bc099627abbd31a289",
+      "loss": 2.066157579421997,
+      "matched_fibers": 1605,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/53bc099627abbd31a289",
+      "ref_l1": 1.485981308411215,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 56.298325046976814,
+      "sign_percent": 0,
+      "solve_seconds": 162.66765751503408,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.00025,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9821799382686126,
+      "within_two_percent": 81.49532710280374
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "ce77387154d48f49d9da",
+      "loss": 5.327809810638428,
+      "matched_fibers": 1723,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/ce77387154d48f49d9da",
+      "ref_l1": 1.105629715612304,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 65.3380456690189,
+      "sign_percent": 0,
+      "solve_seconds": 164.24041622597724,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.00025,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 10,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.978918253395131,
+      "within_two_percent": 90.24956471271038
+    },
+    {
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "08c27c0b6b9836191ae7",
+      "loss": 19.76223373413086,
+      "matched_fibers": 1680,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/08c27c0b6b9836191ae7",
+      "ref_l1": 1.3107142857142857,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 62.75956015626233,
+      "sign_percent": 0,
+      "solve_seconds": 164.12868087505922,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 1,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.00025,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9663607884596708,
+      "within_two_percent": 83.92857142857143
+    },
+    {
+      "fit_range": [
+        13,
+        21
+      ],
+      "key": "3686ce15319dff1572c2",
+      "loss": 22.08230209350586,
+      "matched_fibers": 1608,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/3686ce15319dff1572c2",
+      "ref_l1": 1.51181592039801,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 57.34857095744547,
+      "sign_percent": 0,
+      "solve_seconds": 164.65755870006979,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.00025,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9803790653885222,
+      "within_two_percent": 80.2860696517413
+    },
+    {
+      "fit_range": [
+        13,
+        21
+      ],
+      "key": "314b798e7e68b72b2703",
+      "loss": 41.849090576171875,
+      "matched_fibers": 1609,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/314b798e7e68b72b2703",
+      "ref_l1": 1.7700435052827843,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 58.51626902516083,
+      "sign_percent": 0,
+      "solve_seconds": 155.51400387613103,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.00025,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.91230842571668,
+      "within_two_percent": 75.38844002486016
+    },
+    {
+      "fit_range": [
+        12,
+        23
+      ],
+      "key": "29d950ba982df29298df",
+      "loss": 125.8405990600586,
+      "matched_fibers": 1353,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/29d950ba982df29298df",
+      "ref_l1": 2.55580192165558,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 45.4098568295382,
+      "sign_percent": 0,
+      "solve_seconds": 154.66910089901648,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.00025,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 128,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9129454770122345,
+      "within_two_percent": 59.12786400591279
+    }
+  ],
+  "acceptances": [
+    {
+      "changed_weight": "position_distance_weight",
+      "fit_range": [
+        13,
+        22
+      ],
+      "key": "a95eb5573d8cdc70f29f",
+      "loss": 11.784600257873535,
+      "matched_fibers": 1462,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/a95eb5573d8cdc70f29f",
+      "previous_ref_l1": 1.9674576271186441,
+      "ref_l1": 1.9363885088919288,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 49.65643756061623,
+      "sign_percent": 0,
+      "solve_seconds": 165.55905245803297,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 1,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 10,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9151688902872263,
+      "within_two_percent": 70.38303693570451
+    },
+    {
+      "changed_weight": "perpendicular_relative_weight",
+      "fit_range": [
+        13,
+        22
+      ],
+      "key": "d48b77101043aec1bed5",
+      "loss": 11.323551177978516,
+      "matched_fibers": 1455,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/d48b77101043aec1bed5",
+      "previous_ref_l1": 1.9363885088919288,
+      "ref_l1": 1.8701030927835052,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 49.21425895214235,
+      "sign_percent": 0,
+      "solve_seconds": 164.46931605390273,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 1,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 10,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9165867008165028,
+      "within_two_percent": 72.98969072164948
+    },
+    {
+      "changed_weight": "rejection_cost",
+      "fit_range": [
+        13,
+        22
+      ],
+      "key": "71a467784626ad0a9049",
+      "loss": 3.43410062789917,
+      "matched_fibers": 1334,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/71a467784626ad0a9049",
+      "previous_ref_l1": 1.8701030927835052,
+      "ref_l1": 1.6889055472263867,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 43.50195078016814,
+      "sign_percent": 0,
+      "solve_seconds": 159.41629529185593,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 1,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9116692773656329,
+      "within_two_percent": 77.13643178410796
+    },
+    {
+      "changed_weight": "distance_weight",
+      "fit_range": [
+        14,
+        22
+      ],
+      "key": "334afa8fa05c4e284ec9",
+      "loss": 4.677017688751221,
+      "matched_fibers": 1150,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/334afa8fa05c4e284ec9",
+      "previous_ref_l1": 1.6889055472263867,
+      "ref_l1": 1.5921739130434782,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 35.30436395034504,
+      "sign_percent": 0,
+      "solve_seconds": 176.40053349896334,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.912237315516629,
+      "within_two_percent": 79.47826086956522
+    },
+    {
+      "changed_weight": "perpendicular_relative_weight",
+      "fit_range": [
+        14,
+        22
+      ],
+      "key": "6b6a2755a9ed0308457b",
+      "loss": 4.836932182312012,
+      "matched_fibers": 1207,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/6b6a2755a9ed0308457b",
+      "previous_ref_l1": 1.5921739130434782,
+      "ref_l1": 1.591549295774648,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 38.1802084896698,
+      "sign_percent": 0,
+      "solve_seconds": 162.8398291110061,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.912836092002537,
+      "within_two_percent": 80.28169014084507
+    },
+    {
+      "changed_weight": "perpendicular_relative_weight",
+      "fit_range": [
+        13,
+        21
+      ],
+      "key": "d845ee331ce5829dc9a5",
+      "loss": 4.84403657913208,
+      "matched_fibers": 1257,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/d845ee331ce5829dc9a5",
+      "previous_ref_l1": 1.591549295774648,
+      "ref_l1": 1.568019093078759,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 40.56073048789964,
+      "sign_percent": 0,
+      "solve_seconds": 166.18519339105114,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 32,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9851411132684609,
+      "within_two_percent": 79.87271280827368
+    },
+    {
+      "changed_weight": "sign_charge_multiplier",
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "8755c35ef03165eae9df",
+      "loss": 3.2170920372009277,
+      "matched_fibers": 1307,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/8755c35ef03165eae9df",
+      "previous_ref_l1": 1.568019093078759,
+      "ref_l1": 1.4299923488905892,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 42.2990609609169,
+      "sign_percent": 0.12610340479192939,
+      "solve_seconds": 167.88275721110404,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 2,
+        "prior_weight": 0.01,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.985852060552843,
+      "within_two_percent": 82.47895944912013
+    },
+    {
+      "changed_weight": "prior_weight",
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "00afdc04c6cdceb60424",
+      "loss": 3.216204881668091,
+      "matched_fibers": 1309,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/00afdc04c6cdceb60424",
+      "previous_ref_l1": 1.4299923488905892,
+      "ref_l1": 1.4163483575248281,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 42.42448273405524,
+      "sign_percent": 0.12478163214374845,
+      "solve_seconds": 161.83707322506234,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 2,
+        "prior_weight": 0.0025,
+        "rejection_cost": 2.5,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9861256434624314,
+      "within_two_percent": 82.8113063407181
+    },
+    {
+      "changed_weight": "rejection_cost",
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "09529206fb2a5fa8c650",
+      "loss": 22.845359802246094,
+      "matched_fibers": 1603,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/09529206fb2a5fa8c650",
+      "previous_ref_l1": 1.4163483575248281,
+      "ref_l1": 1.4029943855271365,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 56.88778288289296,
+      "sign_percent": 0.5825242718446602,
+      "solve_seconds": 165.25997387315147,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 40,
+        "position_distance_weight": 2,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 1.0047320400094746,
+      "within_two_percent": 81.6593886462882
+    },
+    {
+      "changed_weight": "perpendicular_relative_weight",
+      "fit_range": [
+        14,
+        21
+      ],
+      "key": "a991aef6f9a0cd0a5571",
+      "loss": 22.321531295776367,
+      "matched_fibers": 1580,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/a991aef6f9a0cd0a5571",
+      "previous_ref_l1": 1.4029943855271365,
+      "ref_l1": 1.3746835443037975,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 56.39101379432336,
+      "sign_percent": 0,
+      "solve_seconds": 164.18933651200496,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 4,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 2,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.8792297951476905,
+      "within_two_percent": 83.10126582278481
+    },
+    {
+      "changed_weight": "distance_weight",
+      "fit_range": [
+        14,
+        21
+      ],
+      "key": "33a441d933fa11ca633f",
+      "loss": 17.88251495361328,
+      "matched_fibers": 1659,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/33a441d933fa11ca633f",
+      "previous_ref_l1": 1.3746835443037975,
+      "ref_l1": 1.2597950572634118,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 63.333446008034414,
+      "sign_percent": 0,
+      "solve_seconds": 170.3907259090338,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 2.5,
+        "position_distance_weight": 2,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9091521525358042,
+      "within_two_percent": 85.05123568414707
+    },
+    {
+      "changed_weight": "perpendicular_relative_weight",
+      "fit_range": [
+        14,
+        21
+      ],
+      "key": "9bae8e308badc49ac84d",
+      "loss": 18.607730865478516,
+      "matched_fibers": 1663,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/9bae8e308badc49ac84d",
+      "previous_ref_l1": 1.2597950572634118,
+      "ref_l1": 1.1972339146121467,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 63.29744439351881,
+      "sign_percent": 0.04942542938341777,
+      "solve_seconds": 164.44391704211012,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 2,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 10,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.900014302746457,
+      "within_two_percent": 87.61274804570054
+    },
+    {
+      "changed_weight": "sign_weight",
+      "fit_range": [
+        14,
+        21
+      ],
+      "key": "eb8f8708ae0e07b1f87c",
+      "loss": 18.527332305908203,
+      "matched_fibers": 1695,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/eb8f8708ae0e07b1f87c",
+      "previous_ref_l1": 1.1972339146121467,
+      "ref_l1": 1.1563421828908556,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 65.3013460184066,
+      "sign_percent": 0.011460004584001834,
+      "solve_seconds": 167.69650427694432,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 2,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.8996806499598334,
+      "within_two_percent": 87.84660766961652
+    },
+    {
+      "changed_weight": "position_distance_weight",
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "2b4dc68d290d0fb1d7de",
+      "loss": 18.431346893310547,
+      "matched_fibers": 1699,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/2b4dc68d290d0fb1d7de",
+      "previous_ref_l1": 1.1563421828908556,
+      "ref_l1": 1.1236021188934668,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 65.90410504508323,
+      "sign_percent": 0,
+      "solve_seconds": 174.99681080807932,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.125,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9817456790517974,
+      "within_two_percent": 87.051206592113
+    },
+    {
+      "changed_weight": "position_distance_weight",
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "e797d5320045a490ff3b",
+      "loss": 18.451374053955078,
+      "matched_fibers": 1700,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/e797d5320045a490ff3b",
+      "previous_ref_l1": 1.1236021188934668,
+      "ref_l1": 1.0488235294117647,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 65.77485366332414,
+      "sign_percent": 0,
+      "solve_seconds": 167.72991105681285,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.001,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9783180305132542,
+      "within_two_percent": 88.3529411764706
+    },
+    {
+      "changed_weight": "offset_soft_weight",
+      "fit_range": [
+        13,
+        20
+      ],
+      "key": "eb142efc153b00cd9e83",
+      "loss": 18.451618194580078,
+      "matched_fibers": 1700,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_loss_search_v1/trials/eb142efc153b00cd9e83",
+      "previous_ref_l1": 1.0488235294117647,
+      "ref_l1": 1.0382352941176471,
+      "reference_range": [
+        14,
+        20
+      ],
+      "retained_length_percent": 65.77485366332414,
+      "sign_percent": 0,
+      "solve_seconds": 170.43154703592882,
+      "weights": {
+        "continuation_weight": 10,
+        "distance_weight": 0.25,
+        "entropy_weight": 0.05,
+        "metric_weight": 0.01,
+        "offset_limit_weight": 10000,
+        "offset_soft_weight": 0.00025,
+        "perpendicular_relative_weight": 10,
+        "position_distance_weight": 0.5,
+        "prior_weight": 0.0025,
+        "rejection_cost": 40,
+        "sign_charge_multiplier": 8,
+        "sign_weight": 40,
+        "v_prior_weight": 0.01,
+        "width_prior": 0.1,
+        "width_smooth": 0.01
+      },
+      "width_factor": 0.9785728219485073,
+      "within_two_percent": 88.41176470588236
+    }
+  ]
+}

@@ -2,9 +2,13 @@
 
 ## Adaptive loss-weight tuning
 - [x] Previous results committed at 102d25a55.
-- [x] Plan independently reviewed; controller and 12 CPU tests passing.
-- [ ] Implementation review and managed search.
-- [ ] Complete no-improvement neighborhood and document accepted settings.
+- [x] Plan independently reviewed; controller and 13 CPU tests passing.
+- [x] Implementation review and managed search launched (dba4ffa6d).
+- [x] User stopped search after96 completed trials /16 accepted improvements.
+- [x] GPU lease released; interrupted trial excluded, all completed trials kept.
+- [x] Canonical baseline config and full compact trial records documented.
+- [x] Final verification, independent baseline review and commit preparation.
+- No-improvement neighborhood was NOT completed; do not claim a local optimum.
 
 ## Fresh LR follow-up
 - [x] Plan and stateLR10x config.
