@@ -1,5 +1,18 @@
 # Diagnostic optimization and two100-pass-equivalent joint solves
 
+- BothlowLR1000runscompleted: fresh1718.93s,loss1.468878,L1 10.585124,
+  within2 14.26355%,widthfactor .882224,retained72.52136%; reference1716.47s,
+  loss .670348,L1 2.216075,within2 70.36694%,widthfactor1.092490,
+  retained92.48525%. All5savedstates finite,widths>100. Reference metadata SHA256
+  e586740ccd35d9e4ad532f100164a62f785355c42710ed17b1acc158447e4c75.
+  All10passrecords persisted; offset changes explicitlyincluded.1000layoutTIFFs
+  verified1000px,LZW,2vectorPDFs,noPNG. Referencecrosscolor rendercompletedexit0;
+  all6maincomparisonTIFFs verified1000px,LZW,noPNG. ManagedGPUlease finished,
+  noCPU/GPUheld. Commands are the approved runner with100/1000layout/reference
+  configfiles. No further solves pending. HighLR1000/referencehigh experiments
+  cancelled peruser; completedfreshhigh100kept ascomparison. Unrelated untracked
+  .pytest_tmp_private_hot/left untouched.
+
 - LowLR100complete: fresh loss1.91248,referenceL1 11.59110,within2 13.25945%,
   widthfactor .866755,retained68.5867%. Referencewidth-start loss .873643,
   L1 1.060589,within2 89.64818%,widthfactor1.025152,retained91.6016%.

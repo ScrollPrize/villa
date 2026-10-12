@@ -6,7 +6,8 @@
 - [x] Reference width initialization and normalized width metrics;99tests pass.
 - [x] Low-LR100/1000 fresh and reference runs (remaininghighLRcancelled byuser).
 - [x] Fresh and reference-initialized100-pass-equivalent solves.
-- [ ] Reports and comparison visualizations.
+- [x] Reports and comparison visualizations:100and1000TIFF/SVG/PDF complete,
+      both referencecolortransfers,10passmetrics in uv_joint_lr_width_results.md.
 
 # Previous: larger batches and distributed joint solve
 

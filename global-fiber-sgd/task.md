@@ -1,5 +1,9 @@
 # Saved U/V solution visualization
 
+Completed current follow-up: lowLR100/1000 fresh/reference-width-initialized
+joint solves, every10pass metrics, normalizedwidth comparison, TIFF/vectorvis.
+HighLRfuturejobs stopped peruser. Results:uv_joint_lr_width_results.md.
+
 Current: optimize diagnostics, then fresh and reference-initialized100iteration
 joint solves, report and visualize both. uv_diagnostics_100_plan.md.
 
