@@ -481,7 +481,6 @@ def _optimize_band_bboxes(
                     continue
 
                 _, _, base_center = _axis_min_and_size(init_bbox, axis)
-                axis_idx = 1 if axis == "y" else 2
                 median_pt = point_medians[idx][0 if axis == "y" else 1]
                 ideal_shift = median_pt - base_center
                 cur_shift_for_axis = int(current["shift"]) if axis == current["axis"] else 0
