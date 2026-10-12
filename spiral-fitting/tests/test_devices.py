@@ -252,3 +252,24 @@ def test_smoothing_kernel_agrees_with_the_startup_report(monkeypatch, device):
         assert (report is None) == (fit is None), sigma
         if fit is not None:
             assert torch.equal(fit.cpu(), report.float())
+
+
+@pytest.mark.parametrize('device,built_on', [
+    ('cuda', 'cuda'), ('cpu', 'cpu'),
+    pytest.param('mps', 'cpu', marks=pytest.mark.skipif(
+        not torch.backends.mps.is_available(), reason='needs MPS'))])
+def test_smoothing_kernel_is_built_on_its_device_except_mps(monkeypatch, device, built_on):
+    # CUDA keeps building the float64 kernel on the GPU; only MPS, which has
+    # no float64, builds it on the CPU. The recorder makes every tensor on
+    # the CPU, so the CUDA case runs without CUDA.
+    import flow_grad_smoothing
+    seen = []
+    arange = torch.arange
+
+    def recording_arange(*args, device=None, **kwargs):
+        seen.append(None if device is None else torch.device(device).type)
+        return arange(*args, **kwargs)
+    monkeypatch.setattr(flow_grad_smoothing.torch, 'arange', recording_arange)
+    kernel = flow_grad_smoothing.gaussian_kernel(2.0, torch.device(device))
+    assert seen == [built_on]
+    assert kernel is not None and kernel.dtype == torch.float32

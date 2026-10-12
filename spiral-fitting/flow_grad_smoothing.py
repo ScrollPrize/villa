@@ -174,14 +174,17 @@ def gaussian_kernel(sigma_cells, device=None, dtype=torch.float32):
     radius = int(math.ceil(KERNEL_TRUNCATE * sigma))
     if radius < 1:
         return None
-    # Built in float64 on the CPU (MPS has no float64), so the identity test
-    # below agrees exactly with the startup report on every device.
-    offsets = torch.arange(-radius, radius + 1, dtype=torch.float64)
+    # Built in float64 on the device, except on MPS, which has no float64:
+    # there it is built on the CPU and moved, so the identity test below
+    # agrees exactly with the startup report.
+    on_mps = device is not None and torch.device(device).type == 'mps'
+    offsets = torch.arange(-radius, radius + 1, dtype=torch.float64,
+                           device='cpu' if on_mps else device)
     kernel = torch.exp(-0.5 * (offsets / sigma) ** 2)
     kernel = kernel / kernel.sum()
     if float(kernel[radius]) >= 1.0 - 1e-7:
         return None
-    return kernel.to(device=device, dtype=dtype)
+    return kernel.to(device=device, dtype=dtype) if on_mps else kernel.to(dtype)
 
 
 def _border_norm(length, kernel, device, dtype):
