@@ -2228,7 +2228,8 @@ void copyCatalogSegmentToEditableDirectory(
         std::filesystem::create_directories(editableSegmentDir);
     }
 
-    if (std::filesystem::is_empty(editableSegmentDir, ec)) {
+    const bool newCopy = std::filesystem::is_empty(editableSegmentDir, ec);
+    if (newCopy) {
         for (const auto& entry : std::filesystem::directory_iterator(catalogSegmentDir)) {
             if (!entry.is_regular_file()) {
                 continue;
@@ -2241,12 +2242,16 @@ void copyCatalogSegmentToEditableDirectory(
                 editableSegmentDir / entry.path().filename(),
                 std::filesystem::copy_options::overwrite_existing);
         }
-        auto copy = Segmentation::New(editableSegmentDir);
-        copy->resetIdentityForCopy();
-        copy->saveMetadata();
     }
     if (!requiredFilesPresent(editableSegmentDir)) {
         throw std::runtime_error("editable destination is missing required tifxyz files");
+    }
+    auto copy = Segmentation::New(editableSegmentDir);
+    // Older editable copies retained the catalog identity and lookup marker.
+    // Migrate those once, without replacing their edited geometry or metadata.
+    if (newCopy || copy->metadata().contains("vc_open_data_representation")) {
+        copy->resetIdentityForCopy();
+        copy->saveMetadata();
     }
 }
 

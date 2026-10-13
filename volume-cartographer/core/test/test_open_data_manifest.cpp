@@ -1908,8 +1908,23 @@ TEST_CASE("OpenDataSegmentCache editable copy inherits routing from an aggregate
             doctest::Contains("immutable catalog"),
             std::runtime_error);
     }
+    SUBCASE("new editable copy") {}
+    SUBCASE("existing editable copy from before UUID separation") {
+        std::filesystem::copy(sourceSegment, editableSegment,
+                              std::filesystem::copy_options::recursive);
+        std::filesystem::remove(editableSegment / "catalog-origin.json");
+        QuadSurface edited(editableSegment);
+        edited.meta["user_edit"] = "keep me";
+        edited.save_meta();
+        writeFile(editableSegment / "user-notes.txt", "keep me");
+    }
+    const auto originalX = std::filesystem::last_write_time(sourceSegment / "x.tif");
     copyCatalogSegmentToEditableDirectory(
         *pkg, sourceSegment, editableSegment);
+    if (std::filesystem::exists(editableSegment / "user-notes.txt")) {
+        CHECK(QuadSurface(editableSegment).meta["user_edit"].get_string() == "keep me");
+    }
+    CHECK(std::filesystem::last_write_time(sourceSegment / "x.tif") == originalX);
 
     attachEditableOpenDataSegmentRoot(
         *pkg, sourceSegment, editableRoot, true);

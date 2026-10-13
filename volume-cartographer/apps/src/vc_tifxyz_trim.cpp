@@ -176,13 +176,14 @@ int main(int argc, char* argv[])
     // place keeps the surface's uuid, but a trim written to a different
     // directory is a new object and must not duplicate the source's
     // identity (or its name).
+    std::error_code eq_ec;
+    const bool in_place = dst == src ||
+        (fs::exists(dst) && fs::equivalent(src, dst, eq_ec) && !eq_ec);
     {
-        std::error_code eq_ec;
-        const bool in_place = dst == src ||
-            (fs::exists(dst) && fs::equivalent(src, dst, eq_ec) && !eq_ec);
         if (!in_place) {
             meta["uuid"] = vc::util::newUuid();
             meta["name"] = dst.filename().string();
+            meta.erase("vc_open_data_representation");
         }
     }
     // Recompute rather than erase. Trimming drops rows/columns, so the input's
@@ -206,6 +207,7 @@ int main(int argc, char* argv[])
         const fs::path& p = entry.path();
         if (p.extension() == ".tif") continue;
         if (p.filename() == "meta.json") continue;
+        if (!in_place && p.filename() == "catalog-origin.json") continue;
         fs::copy_file(p, stage / p.filename(),
                       fs::copy_options::overwrite_existing, ec);
         if (ec) {
