@@ -2373,7 +2373,12 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     const QJsonObject metrics = status.value("latest_metrics").toObject();
     _metrics->setText(metrics.contains("total_loss") ? tr("Loss: %1").arg(metrics.value("total_loss").toDouble()) : QString());
     updateWarnings(status);
-    const bool runnable = idle;
+    // Live input changes are prepared on the fitter thread while the session
+    // stays Idle; a Run sent now would only queue behind the preparation.
+    const bool preparingInputs =
+        progress.value(QStringLiteral("operation")).toString()
+        == QStringLiteral("loading");
+    const bool runnable = idle && !preparingInputs;
     _sessionRunnable = runnable;
     // Initialize is available without a session. Rebuild otherwise needs an
     // idle or failed session.

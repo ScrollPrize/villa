@@ -1305,7 +1305,8 @@ class FitContext:
                  progress=None, resume_path=None,
                  out_base_dir=None, run_dir=None, run_tag=None, run_name=None,
                  cache_dir=None, storage_backend='sparse_cuda',
-                 render_volume_scale=16, dist_context=None):
+                 render_volume_scale=16, dist_context=None,
+                 input_bindings=None):
         # config is the explicit FitConfig (or any dict-style mapping of
         # fully resolved values) this fit reads; there is no module-global
         # fallback. The optimisation z window is Config's z_begin/z_end.
@@ -1354,6 +1355,9 @@ class FitContext:
         # explicitly configured sources for subsequent enables.
         self._configured_pcl_sources = tuple(paths.pcls)
         self.interactive_driver = interactive_driver
+        # Editing-workspace records a resident build binds before its first
+        # derivation (see _bind_input_records). None outside a workspace.
+        self.input_bindings = tuple(input_bindings or ())
         self.progress = progress
         self.resume_path = resume_path or None
         self.out_base_dir = out_base_dir if out_base_dir is not None else './out'
@@ -2160,6 +2164,19 @@ class FitContext:
                 pid: catalog_copy_of_pcl(pcl) for pid, pcl in point_collections.items()
             }
             self._source_verified_patches = dict(verified_patches)
+            if self.input_bindings:
+                # Bind the editing workspace's identities before the one
+                # derivation, so the service need not replay the unchanged
+                # baseline through a second full relink after the build.
+                self._workspace_membership = {}
+                self.next_id = next_id
+                self._bind_input_records(self.input_bindings)
+                next_id = self.next_id
+                verified_patches = {
+                    pid: patch for pid, patch in verified_patches.items()
+                    if pid in self._source_verified_patches}
+                point_collections, fiber_point_collections = \
+                    self._enabled_point_inputs()
         self._derive_point_inputs(
             verified_patches, point_collections, fiber_point_collections)
         unattached_pcl_strips = self.unattached_pcl_strips
@@ -3116,6 +3133,10 @@ class FitContext:
             print(f'WARNING: {warning}')
             warnings.append(warning)
             del self.verified_patches[patch_id]
+            # Live input batches rebuild their patch set from the resident
+            # sources. Dropping the patch there too keeps every later batch
+            # from linking against it only to reject it again and relink.
+            getattr(self, '_source_verified_patches', {}).pop(patch_id, None)
 
         # Preserve list identities where possible because resident-session
         # loss closures may already hold them.
@@ -4206,6 +4227,139 @@ class FitContext:
             f'{reserved_after / gib:.2f} GiB still reserved)',
             flush=True)
 
+    def _bind_input_records(self, records):
+        """Apply workspace revision records to this context's resident sources.
+
+        Mutates ``_source_verified_patches``, ``_source_point_collections``,
+        ``_workspace_membership`` and ``next_id`` only; nothing is derived.
+        A baseline adoption (``adopt``) binds a workspace identity to the
+        geometry the initial loader already selected. Live batches call this
+        on a candidate copy; a resident build calls it on itself with the
+        workspace's adoption records before its one derivation.
+        """
+        seen = set()
+        for record in records:
+            logical_id = str(record['id'])
+            if logical_id in seen:
+                raise ValueError('A batch cannot contain two revisions of one input')
+            seen.add(logical_id)
+            kind = record['kind']
+            deleted = bool(record.get('deleted'))
+            adopt = bool(record.get('adopt'))
+            path = record.get('path')
+            source_id = str(record.get('source_id', logical_id))
+            if kind == 'patch':
+                source = self._source_verified_patches
+                if source_id != logical_id and source_id in source:
+                    # Preserve the dataset patch name for between-patch
+                    # annotations; catalog UUID is independent of that name.
+                    patch_id = source_id
+                else:
+                    patch_id = self._workspace_membership.get(logical_id, {}).get(
+                        'resident_id', source_id)
+                if deleted:
+                    source.pop(patch_id, None)
+                elif not adopt:
+                    # Baseline adoption only binds workspace identities.
+                    # The initial loader already selected usable geometry
+                    # (z range, erosion, name filter, and input toggles).
+                    # An absent baseline must stay excluded, not be read
+                    # again through the stricter live-revision loader.
+                    patch = load_tifxyz(path)
+                    patch._source_path = os.path.abspath(path)
+                    cells = patch.erosion_cells(self.config['patch_erode_patches'])
+                    valid = cells <= 0 or erode_patch_valid_region(patch, cells)
+                    intersects = patch_intersects_z_roi(patch, self.z_begin, self.z_end)
+                    if not valid or not intersects:
+                        reason = 'has no valid quads' if not valid else 'is outside the fitted z range'
+                        raise ValueError(f'Patch {logical_id} {reason}')
+                    source[patch_id] = patch
+                resident_id = patch_id
+            elif kind in {'pcl', 'fiber'}:
+                source = self._source_point_collections
+                previous = self._workspace_membership.get(logical_id, {})
+                resident_id = previous.get('resident_id')
+                if resident_id is None:
+                    for cid, pcl in source.items():
+                        metadata = pcl.get('metadata', {})
+                        same_source = os.path.realpath(pcl.get('source_file', '')) == os.path.realpath(
+                            record.get('source_path') or path or '')
+                        if kind == 'fiber':
+                            match = metadata.get('logical_input_kind') == 'fiber' and (
+                                str(metadata.get('logical_input_id')) == source_id or same_source)
+                        else:
+                            match = (same_source and str(pcl.get('id')) == source_id
+                                     and metadata.get('input_role') == record.get('role'))
+                        if match:
+                            resident_id = cid
+                            break
+                if resident_id is None:
+                    resident_id = self.next_id
+                    self.next_id += 1
+                if deleted:
+                    source.pop(resident_id, None)
+                elif adopt and kind == 'fiber' and resident_id not in source:
+                    # Preserve startup exclusions (including disabled or
+                    # malformed fibers) while retaining workspace identity.
+                    pass
+                else:
+                    if adopt and resident_id in source:
+                        pcl = source[resident_id]
+                        if kind == 'fiber':
+                            pcl['source_file'] = path
+                    elif kind == 'fiber':
+                        pcl = load_fiber_point_collection(
+                            path, resident_id,
+                            min_point_spacing=self.config['pcl_fiber_min_point_spacing'],
+                            base_shape_zyx=getattr(self, 'base_shape_zyx', None))
+                        if pcl is None:
+                            raise ValueError(f'Fiber {logical_id} has no usable control points')
+                        pcl['sampling_group'] = 'fibers'
+                        pcl['file_basename'] = f'{source_id}.json'
+                        pcl['source_file'] = path
+                        pcl.setdefault('metadata', {}).update(
+                            input_role='fiber', winding_is_absolute=False)
+                    else:
+                        loaded = load_point_collection(path) or {}
+                        if len(loaded) != 1:
+                            raise ValueError('A logical PCL input contains exactly one collection')
+                        pcl = next(iter(loaded.values()))
+                        stamp_loaded_pcl_metadata(
+                            pcl, record.get('source_path') or path, record.get('role'), resident_id)
+                    pcl.setdefault('metadata', {}).update({
+                        'workspace_input_id': logical_id,
+                        'logical_input_kind': kind,
+                        'logical_input_id': logical_id,
+                        'logical_input_revision': record.get('revision'),
+                    })
+                    source[resident_id] = pcl
+            else:
+                raise ValueError(f'Unknown input kind {kind!r}')
+            self._workspace_membership[logical_id] = {
+                'kind': kind, 'revision': record.get('revision'),
+                'resident_id': resident_id, 'deleted': deleted,
+            }
+
+    def _enabled_point_inputs(self):
+        """Private copies of the enabled resident point sources.
+
+        Returns ``(points, fibers)``: every enabled collection keyed by resident
+        id, and the fiber subset of the same objects.
+        """
+        points, fibers = {}, {}
+        for cid, pcl in self._source_point_collections.items():
+            metadata = pcl.get('metadata', {})
+            role = ('fiber' if metadata.get('logical_input_kind') == 'fiber'
+                    else metadata.get('input_role'))
+            enabled = (input_source_enabled(self.config, 'fibers') if role == 'fiber'
+                       else pcl_input_enabled(self.config, None if role == 'legacy' else role,
+                                              pcl.get('source_file', '')))
+            if enabled:
+                points[cid] = catalog_copy_of_pcl(pcl)
+                if role == 'fiber':
+                    fibers[cid] = points[cid]
+        return points, fibers
+
     def prepare_input_changes(self, records, *,
                               current_iteration=0, target_iteration=0):
         """Prepare a complete revision batch without changing active state.
@@ -4231,108 +4385,7 @@ class FitContext:
             }
             candidate._workspace_membership = dict(getattr(self, '_workspace_membership', {}))
             candidate.next_id = self.next_id
-            seen = set()
-            for record in records:
-                logical_id = str(record['id'])
-                if logical_id in seen:
-                    raise ValueError('A batch cannot contain two revisions of one input')
-                seen.add(logical_id)
-                kind = record['kind']
-                deleted = bool(record.get('deleted'))
-                adopt = bool(record.get('adopt'))
-                path = record.get('path')
-                source_id = str(record.get('source_id', logical_id))
-                if kind == 'patch':
-                    source = candidate._source_verified_patches
-                    if source_id != logical_id and source_id in source:
-                        # Preserve the dataset patch name for between-patch
-                        # annotations; catalog UUID is independent of that name.
-                        patch_id = source_id
-                    else:
-                        patch_id = candidate._workspace_membership.get(logical_id, {}).get(
-                            'resident_id', source_id)
-                    if deleted:
-                        source.pop(patch_id, None)
-                    elif not adopt:
-                        # Baseline adoption only binds workspace identities.
-                        # The initial loader already selected usable geometry
-                        # (z range, erosion, name filter, and input toggles).
-                        # An absent baseline must stay excluded, not be read
-                        # again through the stricter live-revision loader.
-                        patch = load_tifxyz(path)
-                        patch._source_path = os.path.abspath(path)
-                        cells = patch.erosion_cells(self.config['patch_erode_patches'])
-                        valid = cells <= 0 or erode_patch_valid_region(patch, cells)
-                        intersects = patch_intersects_z_roi(patch, self.z_begin, self.z_end)
-                        if not valid or not intersects:
-                            reason = 'has no valid quads' if not valid else 'is outside the fitted z range'
-                            raise ValueError(f'Patch {logical_id} {reason}')
-                        source[patch_id] = patch
-                    resident_id = patch_id
-                elif kind in {'pcl', 'fiber'}:
-                    source = candidate._source_point_collections
-                    previous = candidate._workspace_membership.get(logical_id, {})
-                    resident_id = previous.get('resident_id')
-                    if resident_id is None:
-                        for cid, pcl in source.items():
-                            metadata = pcl.get('metadata', {})
-                            same_source = os.path.realpath(pcl.get('source_file', '')) == os.path.realpath(
-                                record.get('source_path') or path or '')
-                            if kind == 'fiber':
-                                match = metadata.get('logical_input_kind') == 'fiber' and (
-                                    str(metadata.get('logical_input_id')) == source_id or same_source)
-                            else:
-                                match = (same_source and str(pcl.get('id')) == source_id
-                                         and metadata.get('input_role') == record.get('role'))
-                            if match:
-                                resident_id = cid
-                                break
-                    if resident_id is None:
-                        resident_id = candidate.next_id
-                        candidate.next_id += 1
-                    if deleted:
-                        source.pop(resident_id, None)
-                    elif adopt and kind == 'fiber' and resident_id not in source:
-                        # Preserve startup exclusions (including disabled or
-                        # malformed fibers) while retaining workspace identity.
-                        pass
-                    else:
-                        if adopt and resident_id in source:
-                            pcl = source[resident_id]
-                            if kind == 'fiber':
-                                pcl['source_file'] = path
-                        elif kind == 'fiber':
-                            pcl = load_fiber_point_collection(
-                                path, resident_id,
-                                min_point_spacing=self.config['pcl_fiber_min_point_spacing'],
-                                base_shape_zyx=getattr(self, 'base_shape_zyx', None))
-                            if pcl is None:
-                                raise ValueError(f'Fiber {logical_id} has no usable control points')
-                            pcl['sampling_group'] = 'fibers'
-                            pcl['file_basename'] = f'{source_id}.json'
-                            pcl['source_file'] = path
-                            pcl.setdefault('metadata', {}).update(
-                                input_role='fiber', winding_is_absolute=False)
-                        else:
-                            loaded = load_point_collection(path) or {}
-                            if len(loaded) != 1:
-                                raise ValueError('A logical PCL input contains exactly one collection')
-                            pcl = next(iter(loaded.values()))
-                            stamp_loaded_pcl_metadata(
-                                pcl, record.get('source_path') or path, record.get('role'), resident_id)
-                        pcl.setdefault('metadata', {}).update({
-                            'workspace_input_id': logical_id,
-                            'logical_input_kind': kind,
-                            'logical_input_id': logical_id,
-                            'logical_input_revision': record.get('revision'),
-                        })
-                        source[resident_id] = pcl
-                else:
-                    raise ValueError(f'Unknown input kind {kind!r}')
-                candidate._workspace_membership[logical_id] = {
-                    'kind': kind, 'revision': record.get('revision'),
-                    'resident_id': resident_id, 'deleted': deleted,
-                }
+            candidate._bind_input_records(records)
 
             candidate.verified_patches = {
                 pid: copy.copy(patch) for pid, patch in candidate._source_verified_patches.items()
@@ -4344,18 +4397,7 @@ class FitContext:
             candidate.patch_atlas = self.patch_atlas.replaced(candidate.verified_patches)
             candidate._input_warnings = []
             while True:
-                points, fibers = {}, {}
-                for cid, pcl in candidate._source_point_collections.items():
-                    metadata = pcl.get('metadata', {})
-                    role = ('fiber' if metadata.get('logical_input_kind') == 'fiber'
-                            else metadata.get('input_role'))
-                    enabled = (input_source_enabled(self.config, 'fibers') if role == 'fiber'
-                               else pcl_input_enabled(self.config, None if role == 'legacy' else role,
-                                                      pcl.get('source_file', '')))
-                    if enabled:
-                        points[cid] = catalog_copy_of_pcl(pcl)
-                        if role == 'fiber':
-                            fibers[cid] = points[cid]
+                points, fibers = candidate._enabled_point_inputs()
                 candidate._derive_point_inputs(
                     candidate.verified_patches, points, fibers,
                     direction_source=candidate._desired_fiber_link_direction_source(current_iteration))

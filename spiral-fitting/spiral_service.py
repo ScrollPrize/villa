@@ -1197,6 +1197,10 @@ class ServiceState:
 
     def _begin_build(self, paths, run, preview, scroll):
         """Publish ``Loading`` and construct the runtime off the HTTP thread."""
+        # The build binds the workspace's unchanged baseline identities while
+        # it loads, so the replay after it does not relink the whole fit.
+        workspace = self.editing_workspace
+        bindings = workspace.build_bindings() if workspace is not None else []
         with self.lock:
             if self._building:
                 raise ApiError(HTTPStatus.CONFLICT,
@@ -1221,17 +1225,19 @@ class ServiceState:
             self._session_error = None
             self.status_generation += 1
             session_id = self.session_id
+            if workspace is not None:
+                workspace.note_build_bindings(self.session_generation, bindings)
         self._start_background(
             target=self._build,
             args=(session_id, previous, paths, run,
-                  preview, scroll),
+                  preview, scroll, bindings),
             name="spiral-session-build", daemon=True)
         self._start_background(
             target=self._refresh_pcl_artifacts,
             name="spiral-pcl-artifact-publish", daemon=True)
 
     def _build(self, session_id, previous, paths, run,
-               preview, scroll):
+               preview, scroll, bindings=()):
         """Close the old resident session, then construct the new one.
 
         A rebuild is an all-rank teardown and reconstruction: the previous
@@ -1248,7 +1254,8 @@ class ServiceState:
             from spiral_runtime import create_session
             session = create_session(
                 paths, run, preview, scroll, self._status_changed,
-                gpu_ids=self.gpu_ids, event_callback=self._session_event)
+                gpu_ids=self.gpu_ids, event_callback=self._session_event,
+                input_bindings=bindings)
         except BaseException as exc:
             self._fail_session(session_id, _cause(exc))
             return
