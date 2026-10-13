@@ -8,6 +8,7 @@
 #include "vc/core/util/RemoteAuth.hpp"
 
 class QButtonGroup;
+class QCheckBox;
 class QLabel;
 class QLineEdit;
 class QListWidget;
@@ -46,6 +47,7 @@ private slots:
     void onOpenClicked();
 
 private:
+    bool eventFilter(QObject* watched, QEvent* event) override;
     void navigateLocal(const QString& absDir);
     void navigateRemote(const QString& urlPrefix);
     bool ensureRemoteAuth(const QString& probeUrl);
@@ -79,6 +81,7 @@ private:
     QListWidget* _list{nullptr};
     QLabel* _status{nullptr};
     QPushButton* _openButton{nullptr};
+    QCheckBox* _showHidden{nullptr};
 
     std::uint64_t _listSeq{0};
 };

@@ -368,14 +368,15 @@ const SponsorAvatar = ({ sponsor }) => {
   );
 };
 
-const SponsorRow = ({ sponsor, dense }) => (
+const SponsorRow = ({ sponsor, hidden }) => (
   <a
     href={sponsor.href}
-    className={`vc-sponsor${dense ? " vc-sponsor--dense" : ""}`}
+    className="vc-sponsor"
     target="_blank"
     rel="nofollow sponsored noopener noreferrer"
+    hidden={hidden}
   >
-    {!dense && <SponsorAvatar sponsor={sponsor} />}
+    <SponsorAvatar sponsor={sponsor} />
     <span className="vc-sponsor__name">{sponsor.name}</span>
     <span className="vc-sponsor__amount vc-nums">
       {usd.format(sponsor.amount)}
@@ -389,37 +390,34 @@ const sponsorOrder = (a, b) =>
   (a.name === "Anonymous") - (b.name === "Anonymous") ||
   a.name.localeCompare(b.name);
 
-const SponsorTier = ({ label, title, list, dense, collapsible }) => {
-  const grid = (
-    <div className={`vc-tier__grid${dense ? " vc-tier__grid--dense" : ""}`}>
-      {list.map((s, i) => (
-        <SponsorRow sponsor={s} dense={dense} key={i} />
-      ))}
-    </div>
-  );
-  if (collapsible) {
-    return (
-      <details className="vc-tier vc-collapse">
-        <summary className="vc-collapse__summary">
-          <span className="vc-collapse__heading">
-            <span className="vc-label vc-tier__label">{label}</span>
-            <span className="vc-tier__title vc-collapse__title">
-              {title}
-              <span className="vc-collapse__count"> ({list.length})</span>
-            </span>
-          </span>
-          <span className="vc-collapse__arrow" aria-hidden="true">▾</span>
-        </summary>
-        <div className="vc-collapse__body">{grid}</div>
-      </details>
-    );
-  }
+/* Every sponsor in one list; gifts below the fold amount stay in the markup
+   but hidden until "Show more" is clicked. */
+const SPONSOR_FOLD_AMOUNT = 50000;
+
+const SponsorList = ({ list }) => {
+  const [expanded, setExpanded] = useState(false);
+  const folded = list.filter((s) => s.amount < SPONSOR_FOLD_AMOUNT).length;
   return (
-    <div className="vc-tier">
-      <p className="vc-label vc-tier__label">{label}</p>
-      <h3 className="vc-tier__title">{title}</h3>
-      {grid}
-    </div>
+    <>
+      <div className="vc-sponsors__grid">
+        {list.map((s, i) => (
+          <SponsorRow
+            sponsor={s}
+            hidden={!expanded && s.amount < SPONSOR_FOLD_AMOUNT}
+            key={i}
+          />
+        ))}
+      </div>
+      {!expanded && folded > 0 && (
+        <button
+          type="button"
+          className="vc-btn-outline vc-sponsors__more"
+          onClick={() => setExpanded(true)}
+        >
+          Show more ({folded})
+        </button>
+      )}
+    </>
   );
 };
 
@@ -1045,7 +1043,7 @@ export function Landing() {
         </section>
 
         {/* ------------------------------------------------------------------
-            Sponsors — every donor, neutral tier headings, dense rows.
+            Sponsors — every donor in one list, smaller gifts behind "Show more".
         ------------------------------------------------------------------ */}
         <section className="vc-section" aria-labelledby="sponsors">
           <div className="container mx-auto">
@@ -1060,34 +1058,7 @@ export function Landing() {
                 Donate
               </a>
             </div>
-            <SponsorTier
-              label="$200,000 and above"
-              title="Caesars"
-              list={sponsors
-                .filter((s) => s.amount >= 200000)
-                .sort(sponsorOrder)}
-            />
-            {/* Senators + Citizens expanders sit side by side on desktop
-                (vertical-space save); they stack on phones. */}
-            <div className="vc-tier-row">
-              <SponsorTier
-                label="$50,000 – $200,000"
-                title="Senators"
-                list={sponsors
-                  .filter((s) => s.amount >= 50000 && s.amount < 200000)
-                  .sort(sponsorOrder)}
-                collapsible
-              />
-              <SponsorTier
-                label="Up to $50,000"
-                title="Citizens"
-                list={sponsors
-                  .filter((s) => s.amount < 50000)
-                  .sort(sponsorOrder)}
-                dense
-                collapsible
-              />
-            </div>
+            <SponsorList list={[...sponsors].sort(sponsorOrder)} />
           </div>
         </section>
 

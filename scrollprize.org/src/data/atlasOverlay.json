@@ -1,12 +1,12 @@
 {
-  "_general": "Carbonized by the eruption of Mount Vesuvius in AD 79 and buried in the Villa of the Papyri at Herculaneum — the only library to survive from classical antiquity. Recovered in excavations begun in 1752; too fragile to open physically, it is read non-invasively via X-ray tomography and virtual unwrapping.",
+  "_general": "Carbonized by the eruption of Mount Vesuvius in AD 79 and buried in the Villa of the Papyri at Herculaneum \u2014 the only library to survive from classical antiquity. Recovered in excavations begun in 1752; too fragile to open physically, it is read non-invasively via X-ray tomography and virtual unwrapping.",
   "dashboard": {
     "updated": "2026-06-15",
     "tiles": [
       {
         "big": "45",
         "label": "scrolls & fragments scanned",
-        "sub": "27 scrolls · 18 fragments",
+        "sub": "27 scrolls \u00b7 18 fragments",
         "derive": "all"
       },
       {
@@ -60,7 +60,7 @@
       "id": "PHercParis4",
       "display": "Scroll 1",
       "src": "readings/paris4_ink.jpg",
-      "cap": "Ink detection on the 2.4µm scan"
+      "cap": "Ink detection on the 2.4\u00b5m scan"
     }
   },
   "timeline": [
@@ -75,19 +75,19 @@
       "date": "2026-04",
       "scroll": "PHercParis4",
       "title": "Scroll 1 ink predictions refreshed",
-      "blurb": "New ink-detection passes on the 2.4µm Paris 4 data."
+      "blurb": "New ink-detection passes on the 2.4\u00b5m Paris 4 data."
     },
     {
       "date": "2026-03",
       "scroll": "PHerc0139",
       "title": "PHerc 0139 title recovered",
-      "blurb": "Identified as Philodemus, On Gods, Book 8. ~20% unrolled; 1µm slabs give real legibility gains."
+      "blurb": "Identified as Philodemus, On Gods, Book 8. ~20% unrolled; 1\u00b5m slabs give real legibility gains."
     },
     {
       "date": "2026-01",
       "scroll": "PHerc1667",
       "title": "Scroll 4 banner read",
-      "blurb": "Full-scroll ink banner read end to end — the first scroll read essentially in its entirety."
+      "blurb": "Full-scroll ink banner read end to end \u2014 the first scroll read essentially in its entirety."
     },
     {
       "date": "2025-11",
@@ -99,13 +99,13 @@
       "date": "2024-02",
       "scroll": "PHercParis4",
       "title": "2023 Grand Prize",
-      "blurb": "First substantial passages of Scroll 1 read — 15+ columns of Greek Epicurean prose."
+      "blurb": "First substantial passages of Scroll 1 read \u2014 15+ columns of Greek Epicurean prose."
     },
     {
       "date": "2023-10",
       "scroll": "PHercParis4",
       "title": "First Letters",
-      "blurb": "First ink letters detected inside an unopened scroll (Scroll 1) — proof the method works."
+      "blurb": "First ink letters detected inside an unopened scroll (Scroll 1) \u2014 proof the method works."
     }
   ],
   "scrolls": {
@@ -113,7 +113,7 @@
       "display": "Scroll 1",
       "repository": "Institut de France, Paris",
       "licenseScope": {
-        "EduceLab Data License": "the 7.91 µm DLS scans",
+        "EduceLab Data License": "the 7.91 \u00b5m DLS scans",
         "CC BY-NC 4.0": "all other data"
       },
       "legalNotice": {
@@ -133,7 +133,7 @@
       "content": {
         "work": "Epicurean prose, attributed to Philodemus (title not yet identified)",
         "lang": "Greek",
-        "summary": "Scroll 1 — the flagship. Substantial continuous Greek text recovered from the banner and body; site of the 2023 First Letters and Grand Prize.",
+        "summary": "Scroll 1 \u2014 the flagship. Substantial continuous Greek text recovered from the banner and body; site of the 2023 First Letters and Grand Prize.",
         "caveat": "The title region shows no detectable ink (possibly a different ink; the top rows are physically missing)."
       },
       "progress": {
@@ -142,7 +142,28 @@
         "textRank": 4,
         "unrolledPct": "To Be Estimated",
         "score": 4227.6,
-        "wkUrl": "https://wk.aws.ash2txt.org/datasets/67a53a6c01000001019dbc46/view"
+        "wk": [
+          {
+            "name": "scroll1-new",
+            "url": "https://wk.aws.ash2txt.org/datasets/67a53a6c01000001019dbc46/view"
+          },
+          {
+            "name": "scroll1a",
+            "url": "https://wk.aws.ash2txt.org/datasets/6742cecc010000c300564082/view"
+          },
+          {
+            "name": "s1a-with-surfaces",
+            "url": "https://wk.aws.ash2txt.org/datasets/685cb5b101000057025292db/view"
+          },
+          {
+            "name": "s1a-with-fibers",
+            "url": "https://wk.aws.ash2txt.org/datasets/67923382010000bf00c7660e/view"
+          },
+          {
+            "name": "s1a-with-fibers-hzvt-05032025",
+            "url": "https://wk.aws.ash2txt.org/datasets/67c8b710010000130592a777/view"
+          }
+        ]
       },
       "stages": {
         "scanned": true,
@@ -154,23 +175,23 @@
         "unrolledPct": "To Be Estimated"
       },
       "readings": {
-        "status": "Substantial continuous Greek text recovered; ink clearly legible at 2.4µm.",
+        "status": "Substantial continuous Greek text recovered; ink clearly legible at 2.4\u00b5m.",
         "images": [
           {
             "src": "/img/data_browser/readings/paris4_ink.jpg",
-            "cap": "2.4µm ink detection (segment 20231210121321)"
+            "cap": "2.4\u00b5m ink detection (segment 20231210121321)"
           },
           {
             "src": "/img/data_browser/readings/paris4_banner.jpg",
-            "cap": "Ink detection across windings 28–37 (2.4µm)"
+            "cap": "Ink detection across windings 28\u201337 (2.4\u00b5m)"
           },
           {
             "src": "/img/data_browser/readings/paris4_surface.jpg",
-            "cap": "Ink prediction overlaid on the 3D papyrus surface (2.4µm)"
+            "cap": "Ink prediction overlaid on the 3D papyrus surface (2.4\u00b5m)"
           }
         ]
       },
-      "desc": "PHerc. Paris 4 is a rolled Herculaneum papyrus from the [Institut de France](https://www.institutdefrance.fr/en/home/), carbonized during the eruption of Mount Vesuvius in 79 AD. It was first scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK (2023, at 7.91 µm), and rescanned in 2026 at the [ESRF](https://www.esrf.fr) in Grenoble, France (2.4 µm, plus 45.5 µm overview scans).\n\nIt is the scroll with by far the most segments, and the first from which substantial continuous Greek text — Epicurean philosophy attributed to Philodemus — was recovered: the [first letters](https://scrollprize.org/firstletters) were discovered here, and the [2023 Grand Prize](https://scrollprize.org/grandprize) was claimed on it."
+      "desc": "PHerc. Paris 4 is a rolled Herculaneum papyrus from the [Institut de France](https://www.institutdefrance.fr/en/home/), carbonized during the eruption of Mount Vesuvius in 79 AD. It was first scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK (2023, at 7.91 \u00b5m), and rescanned in 2026 at the [ESRF](https://www.esrf.fr) in Grenoble, France (2.4 \u00b5m, plus 45.5 \u00b5m overview scans).\n\nIt is the scroll with by far the most segments, and the first from which substantial continuous Greek text \u2014 Epicurean philosophy attributed to Philodemus \u2014 was recovered: the [first letters](https://scrollprize.org/firstletters) were discovered here, and the [2023 Grand Prize](https://scrollprize.org/grandprize) was claimed on it."
     },
     "PHercParis3": {
       "display": "Scroll 2",
@@ -188,7 +209,20 @@
         "textRank": 0,
         "unrolledPct": 0,
         "score": 7.6,
-        "wkUrl": "https://wk.aws.ash2txt.org/datasets/67927bc30100003c00c76700/view"
+        "wk": [
+          {
+            "name": "scroll2a-standardized",
+            "url": "https://wk.aws.ash2txt.org/datasets/67927bc30100003c00c76700/view"
+          },
+          {
+            "name": "scroll2b-standardized",
+            "url": "https://wk.aws.ash2txt.org/datasets/67949f83010000b200a222ef/view"
+          },
+          {
+            "name": "scroll2c-standardized",
+            "url": "https://wk.aws.ash2txt.org/datasets/6794a050010000b000a222f2/view"
+          }
+        ]
       },
       "stages": {
         "scanned": true,
@@ -200,17 +234,17 @@
         "unrolledPct": 0
       },
       "readings": null,
-      "desc": "PHerc. Paris 3 is a rolled Herculaneum papyrus from the [Institut de France](https://www.institutdefrance.fr/en/home/), carbonized during the eruption of Mount Vesuvius in 79 AD. It was first scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK, and rescanned at 2.4 µm at the [ESRF](https://www.esrf.fr) in Grenoble, France (2026)."
+      "desc": "PHerc. Paris 3 is a rolled Herculaneum papyrus from the [Institut de France](https://www.institutdefrance.fr/en/home/), carbonized during the eruption of Mount Vesuvius in 79 AD. It was first scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK, and rescanned at 2.4 \u00b5m at the [ESRF](https://www.esrf.fr) in Grenoble, France (2026)."
     },
     "PHerc0332": {
       "display": "Scroll 3",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "licenseScope": {
-        "EduceLab Data License": "the 3.24 µm and 7.91 µm DLS scans",
+        "EduceLab Data License": "the 3.24 \u00b5m and 7.91 \u00b5m DLS scans",
         "CC BY-NC 4.0": "all other data"
       },
-      "desc": "PHerc. 332 is a rolled Herculaneum papyrus from the [Biblioteca Nazionale di Napoli](https://www.bnnonline.it/it/121/officina-dei-papiri-ercolanesi), carbonized during the eruption of Mount Vesuvius in 79 AD. It was first scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK (2023, at 3.24 µm and 7.91 µm), and rescanned at 2.4 µm at the [ESRF](https://www.esrf.fr) in Grenoble, France (2025).\n\nIt is the innermost part of a scroll, known as a *midollo* (marrow), a remnant from physical unwrapping of the larger original.",
+      "desc": "PHerc. 332 is a rolled Herculaneum papyrus from the [Biblioteca Nazionale di Napoli](https://www.bnnonline.it/it/121/officina-dei-papiri-ercolanesi), carbonized during the eruption of Mount Vesuvius in 79 AD. It was first scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK (2023, at 3.24 \u00b5m and 7.91 \u00b5m), and rescanned at 2.4 \u00b5m at the [ESRF](https://www.esrf.fr) in Grenoble, France (2025).\n\nIt is the innermost part of a scroll, known as a *midollo* (marrow), a remnant from physical unwrapping of the larger original.",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0332/photos/PHerc0332_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0332/",
       "volume": "s3://vesuvius-challenge/PHerc0332/representations/predictions/surfaces/20251211183505-surface-20260413222639-surface-m7-L2-th0.2.zarr",
@@ -226,7 +260,24 @@
         "textRank": 1,
         "unrolledPct": 0,
         "score": 1017.6,
-        "wkUrl": "https://wk.aws.ash2txt.org/datasets/67927b3f010000dd00c766fc/view"
+        "wk": [
+          {
+            "name": "scroll3-standardized",
+            "url": "https://wk.aws.ash2txt.org/datasets/67927b3f010000dd00c766fc/view"
+          },
+          {
+            "name": "s3-53kev-3.24um",
+            "url": "https://wk.aws.ash2txt.org/datasets/67d42183010000eb00fc9e28/view"
+          },
+          {
+            "name": "s3-with-fibers",
+            "url": "https://wk.aws.ash2txt.org/datasets/67949438010000fe02a222e7/view"
+          },
+          {
+            "name": "s3-with-hzvt-highres",
+            "url": "https://wk.aws.ash2txt.org/datasets/67d421e8010000eb00fc9e2b/view"
+          }
+        ]
       },
       "stages": {
         "scanned": true,
@@ -241,20 +292,20 @@
     },
     "PHerc1667": {
       "display": "Scroll 4",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "licenseScope": {
-        "EduceLab Data License": "the 3.24 µm and 7.91 µm DLS scans",
+        "EduceLab Data License": "the 3.24 \u00b5m and 7.91 \u00b5m DLS scans",
         "CC BY-NC 4.0": "all other data"
       },
       "note": "",
-      "desc": "PHerc. 1667 is a rolled Herculaneum papyrus from the [Biblioteca Nazionale di Napoli](https://www.bnnonline.it/it/121/officina-dei-papiri-ercolanesi), carbonized during the eruption of Mount Vesuvius in 79 AD. It was first scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK (2023, at 3.24 µm and 7.91 µm), and rescanned at 2.4 µm at the [ESRF](https://www.esrf.fr) in Grenoble, France (2025). From that scan it became the first Herculaneum scroll ever virtually unwrapped and read in full, end to end, without being physically opened.\n\nIt is similar in size to PHerc. 332 (Scroll 3).",
+      "desc": "PHerc. 1667 is a rolled Herculaneum papyrus from the [Biblioteca Nazionale di Napoli](https://www.bnnonline.it/it/121/officina-dei-papiri-ercolanesi), carbonized during the eruption of Mount Vesuvius in 79 AD. It was first scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK (2023, at 3.24 \u00b5m and 7.91 \u00b5m), and rescanned at 2.4 \u00b5m at the [ESRF](https://www.esrf.fr) in Grenoble, France (2025). From that scan it became the first Herculaneum scroll ever virtually unwrapped and read in full, end to end, without being physically opened.\n\nIt is similar in size to PHerc. 332 (Scroll 3).",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc1667/photos/PHerc1667_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc1667/",
       "content": {
         "work": "Greek ethical treatise (likely Stoic)",
         "lang": "Greek",
-        "summary": "Read end to end — the lower parts of about twenty-two columns across roughly 1.4 m of papyrus, transcribed and reviewed by papyrologists. A philosophical treatise on ethics; the evidence points to a Stoic work, and its final preserved column names Aristocreon, nephew and disciple of the Stoic Chrysippus, placing it in the 2nd century BC.",
-        "caveat": "Only the compact inner core survives — about 8 cm of an original 19–24 cm height — after earlier attempts to open the scroll by hand destroyed its outer layers, so only the lower parts of the columns remain."
+        "summary": "Read end to end \u2014 the lower parts of about twenty-two columns across roughly 1.4 m of papyrus, transcribed and reviewed by papyrologists. A philosophical treatise on ethics; the evidence points to a Stoic work, and its final preserved column names Aristocreon, nephew and disciple of the Stoic Chrysippus, placing it in the 2nd century BC.",
+        "caveat": "Only the compact inner core survives \u2014 about 8 cm of an original 19\u201324 cm height \u2014 after earlier attempts to open the scroll by hand destroyed its outer layers, so only the lower parts of the columns remain."
       },
       "progress": {
         "patches": null,
@@ -262,7 +313,28 @@
         "textRank": 3,
         "unrolledPct": 100,
         "score": 3477.8,
-        "wkUrl": "https://wk.aws.ash2txt.org/datasets/67a6261a010000ad009dbd0a/view"
+        "wk": [
+          {
+            "name": "scroll4-highres",
+            "url": "https://wk.aws.ash2txt.org/datasets/67a6261a010000ad009dbd0a/view"
+          },
+          {
+            "name": "scroll4-standardized",
+            "url": "https://wk.aws.ash2txt.org/datasets/67927b8a010000f503c766fe/view"
+          },
+          {
+            "name": "s4-with-surfaces",
+            "url": "https://wk.aws.ash2txt.org/datasets/67b5eadd0100003d001961be/view"
+          },
+          {
+            "name": "s4-with-rectoverso-13032025",
+            "url": "https://wk.aws.ash2txt.org/datasets/67d43b9f010000944dfc9e66/view"
+          },
+          {
+            "name": "s4-with-hzvt-13032025",
+            "url": "https://wk.aws.ash2txt.org/datasets/67d43e9b010000944dfc9e6f/view"
+          }
+        ]
       },
       "stages": {
         "scanned": true,
@@ -282,9 +354,9 @@
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0172/photos/PHerc0172_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0172/",
       "content": {
-        "work": "Philodemus, On Vices (Περὶ κακιῶν), Book 1",
+        "work": "Philodemus, On Vices (\u03a0\u03b5\u03c1\u1f76 \u03ba\u03b1\u03ba\u03b9\u1ff6\u03bd), Book 1",
         "lang": "Greek",
-        "summary": "Title recovered — Philodemus, On Vices, Book 1.",
+        "summary": "Title recovered \u2014 Philodemus, On Vices, Book 1.",
         "caveat": null
       },
       "progress": {
@@ -293,7 +365,20 @@
         "textRank": 2,
         "unrolledPct": 70,
         "score": 2352.1,
-        "wkUrl": "https://wk.aws.ash2txt.org/datasets/67448b8e010000260a5640ce/view"
+        "wk": [
+          {
+            "name": "scroll5-full",
+            "url": "https://wk.aws.ash2txt.org/datasets/67448b8e010000260a5640ce/view"
+          },
+          {
+            "name": "s5-with-fibers",
+            "url": "https://wk.aws.ash2txt.org/datasets/6793feba010000a8009180f4/view"
+          },
+          {
+            "name": "s5-with-hzvt-11032025",
+            "url": "https://wk.aws.ash2txt.org/datasets/67d08d1a010000c000fc8909/view"
+          }
+        ]
       },
       "stages": {
         "scanned": true,
@@ -305,22 +390,22 @@
         "unrolledPct": 70
       },
       "readings": {
-        "status": "~70% geometrically unrolled (Nov 2025); title recovered from the unrolled surface (7.9µm).",
+        "status": "~70% geometrically unrolled (Nov 2025); title recovered from the unrolled surface (7.9\u00b5m).",
         "images": [
           {
             "src": "/img/data_browser/readings/0172_banner_full.jpg",
-            "cap": "Ink detection across five consecutive windings (71–75) of the unrolled surface (7.9µm)"
+            "cap": "Ink detection across five consecutive windings (71\u201375) of the unrolled surface (7.9\u00b5m)"
           },
           {
             "src": "/img/data_browser/readings/0172_ink.jpg",
-            "cap": "Ink detection on a single unrolled winding (w087, 7.9µm)"
+            "cap": "Ink detection on a single unrolled winding (w087, 7.9\u00b5m)"
           }
         ]
       }
     },
     "PHerc0009B": {
       "display": "PHerc0009B",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0009B/photos/PHerc0009B_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0009B/",
@@ -331,7 +416,12 @@
         "textRank": 0,
         "unrolledPct": 0,
         "score": 7.6,
-        "wkUrl": "https://wk.aws.ash2txt.org/datasets/6867f181010000e800d2f8c7/view"
+        "wk": [
+          {
+            "name": "PHerc0009B-9um",
+            "url": "https://wk.aws.ash2txt.org/datasets/6867f181010000e800d2f8c7/view"
+          }
+        ]
       },
       "stages": {
         "scanned": true,
@@ -346,7 +436,7 @@
     },
     "PHerc0125": {
       "display": "PHerc0125",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0125/photos/PHerc0125_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0125/",
@@ -356,8 +446,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0.6,
-        "wkUrl": null
+        "score": 0.6
       },
       "stages": {
         "scanned": true,
@@ -372,12 +461,12 @@
     },
     "PHerc0139": {
       "display": "PHerc0139",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
-      "note": "Title and author recovered — On Gods, Book 8, by the Epicurean philosopher Philodemus. About 20% virtually unrolled.",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
+      "note": "Title and author recovered \u2014 On Gods, Book 8, by the Epicurean philosopher Philodemus. About 20% virtually unrolled.",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0139/photos/PHerc0139_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0139/",
       "content": {
-        "work": "Philodemus, On Gods (Περὶ θεῶν), Book 8",
+        "work": "Philodemus, On Gods (\u03a0\u03b5\u03c1\u1f76 \u03b8\u03b5\u1ff6\u03bd), Book 8",
         "lang": "Greek",
         "summary": "The scroll's title and author were recovered, identifying it as a work by the Epicurean philosopher Philodemus, specifically On Gods, Book 8. Reading the title of a still-rolled scroll reveals what it contains before any of its body columns are studied.",
         "caveat": "About 20% is virtually unrolled; the title and author are secure, but the body text is still being recovered."
@@ -388,7 +477,12 @@
         "textRank": 2,
         "unrolledPct": 20,
         "score": 2131.9,
-        "wkUrl": "https://wk.aws.ash2txt.org/datasets/68936bbf01000002015bf075/view"
+        "wk": [
+          {
+            "name": "PHerc0139",
+            "url": "https://wk.aws.ash2txt.org/datasets/68936bbf01000002015bf075/view"
+          }
+        ]
       },
       "stages": {
         "scanned": true,
@@ -403,7 +497,7 @@
     },
     "PHerc0175A": {
       "display": "PHerc0175A",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0175A/photos/PHerc0175A_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0175A/",
@@ -413,8 +507,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 1.4,
-        "wkUrl": null
+        "score": 1.4
       },
       "stages": {
         "scanned": true,
@@ -429,7 +522,7 @@
     },
     "PHerc0175B": {
       "display": "PHerc0175B",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0175B/photos/PHerc0175B_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0175B/",
@@ -439,8 +532,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 1.4,
-        "wkUrl": null
+        "score": 1.4
       },
       "stages": {
         "scanned": true,
@@ -455,7 +547,7 @@
     },
     "PHerc0191": {
       "display": "PHerc0191",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0191/photos/PHerc0191_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0191/",
@@ -465,8 +557,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0.6,
-        "wkUrl": null
+        "score": 0.6
       },
       "stages": {
         "scanned": true,
@@ -481,7 +572,7 @@
     },
     "PHerc0211": {
       "display": "PHerc0211",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0211/photos/PHerc0211_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0211/",
@@ -491,8 +582,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0.6,
-        "wkUrl": null
+        "score": 0.6
       },
       "stages": {
         "scanned": true,
@@ -507,7 +597,7 @@
     },
     "PHerc0257": {
       "display": "PHerc0257",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0257/photos/PHerc0257_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0257/",
@@ -517,8 +607,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0.6,
-        "wkUrl": null
+        "score": 0.6
       },
       "stages": {
         "scanned": true,
@@ -533,7 +622,7 @@
     },
     "PHerc0268": {
       "display": "PHerc0268",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0268/photos/PHerc0268_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0268/",
@@ -543,8 +632,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 1.4,
-        "wkUrl": null
+        "score": 1.4
       },
       "stages": {
         "scanned": true,
@@ -559,7 +647,7 @@
     },
     "PHerc0306B": {
       "display": "PHerc0306B",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0306B/photos/PHerc0306B_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0306B/",
@@ -569,8 +657,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 1.4,
-        "wkUrl": null
+        "score": 1.4
       },
       "stages": {
         "scanned": true,
@@ -585,7 +672,7 @@
     },
     "PHerc0343": {
       "display": "PHerc0343",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0343/photos/PHerc0343_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0343/",
@@ -595,8 +682,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 1.4,
-        "wkUrl": "https://wk.aws.ash2txt.org/datasets/6867f0ff010000e305d2f8c2/view"
+        "score": 1.4
       },
       "stages": {
         "scanned": true,
@@ -611,7 +697,7 @@
     },
     "PHerc0343P": {
       "display": "PHerc0343P",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0343P/photos/PHerc0343P_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0343P/",
@@ -622,7 +708,16 @@
         "textRank": 0,
         "unrolledPct": 0,
         "score": 7.8,
-        "wkUrl": "https://wk.aws.ash2txt.org/datasets/6867f0ff010000e305d2f8c2/view"
+        "wk": [
+          {
+            "name": "PHerc0343P-2um",
+            "url": "https://wk.aws.ash2txt.org/datasets/6867f0de0100000806d2f8bf/view"
+          },
+          {
+            "name": "PHerc0343P-4um",
+            "url": "https://wk.aws.ash2txt.org/datasets/6867f0ff010000e305d2f8c2/view"
+          }
+        ]
       },
       "stages": {
         "scanned": true,
@@ -637,7 +732,7 @@
     },
     "PHerc0358": {
       "display": "PHerc0358",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0358/photos/PHerc0358_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0358/",
@@ -647,8 +742,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0.6,
-        "wkUrl": null
+        "score": 0.6
       },
       "stages": {
         "scanned": true,
@@ -663,7 +757,7 @@
     },
     "PHerc0483A": {
       "display": "PHerc0483A",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0483A/photos/PHerc0483A_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0483A/",
@@ -673,8 +767,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 1.4,
-        "wkUrl": null
+        "score": 1.4
       },
       "stages": {
         "scanned": true,
@@ -689,7 +782,7 @@
     },
     "PHerc0483B": {
       "display": "PHerc0483B",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0483B/photos/PHerc0483B_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0483B/",
@@ -699,8 +792,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 1.4,
-        "wkUrl": null
+        "score": 1.4
       },
       "stages": {
         "scanned": true,
@@ -715,7 +807,7 @@
     },
     "PHerc0490A": {
       "display": "PHerc0490A",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0490A/photos/PHerc0490A_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0490A/",
@@ -725,8 +817,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 1.4,
-        "wkUrl": null
+        "score": 1.4
       },
       "stages": {
         "scanned": true,
@@ -741,7 +832,7 @@
     },
     "PHerc0490B": {
       "display": "PHerc0490B",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0490B/photos/PHerc0490B_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0490B/",
@@ -751,8 +842,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 1.4,
-        "wkUrl": null
+        "score": 1.4
       },
       "stages": {
         "scanned": true,
@@ -768,7 +858,7 @@
     "PHerc0500P2": {
       "type": "fragment",
       "display": "PHerc0500P2",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0500P2/photos/PHerc0500P2_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0500P2/",
@@ -779,7 +869,16 @@
         "textRank": 0,
         "unrolledPct": 0,
         "score": 7.8,
-        "wkUrl": "https://wk.aws.ash2txt.org/datasets/6867f042010000b000d2f8b6/view"
+        "wk": [
+          {
+            "name": "PHerc0500P2-2um",
+            "url": "https://wk.aws.ash2txt.org/datasets/6867f042010000b000d2f8b6/view"
+          },
+          {
+            "name": "PHerc0500P2-4um",
+            "url": "https://wk.aws.ash2txt.org/datasets/6867f07a010000ac00d2f8b9/view"
+          }
+        ]
       },
       "stages": {
         "scanned": true,
@@ -794,7 +893,7 @@
     },
     "PHerc0800": {
       "display": "PHerc0800",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0800/photos/PHerc0800_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0800/",
@@ -804,8 +903,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 1.4,
-        "wkUrl": null
+        "score": 1.4
       },
       "stages": {
         "scanned": true,
@@ -820,7 +918,7 @@
     },
     "PHerc0813": {
       "display": "PHerc0813",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0813/photos/PHerc0813_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0813/",
@@ -830,8 +928,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0.6,
-        "wkUrl": null
+        "score": 0.6
       },
       "stages": {
         "scanned": true,
@@ -846,7 +943,7 @@
     },
     "PHerc0814": {
       "display": "PHerc0814",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0814/photos/PHerc0814_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0814/",
@@ -857,8 +954,7 @@
         "textFound": "Ink detected",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 8.9,
-        "wkUrl": null
+        "score": 8.9
       },
       "stages": {
         "scanned": true,
@@ -873,7 +969,7 @@
     },
     "PHerc0826": {
       "display": "PHerc0826",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0826/photos/PHerc0826_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0826/",
@@ -883,8 +979,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0.6,
-        "wkUrl": null
+        "score": 0.6
       },
       "stages": {
         "scanned": true,
@@ -899,7 +994,7 @@
     },
     "PHerc0841": {
       "display": "PHerc0841",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0841/photos/PHerc0841_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0841/",
@@ -909,8 +1004,7 @@
         "textFound": "Ink detected",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 7.6,
-        "wkUrl": null
+        "score": 7.6
       },
       "stages": {
         "scanned": true,
@@ -925,7 +1019,7 @@
     },
     "PHerc0846A": {
       "display": "PHerc0846A",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0846A/photos/PHerc0846A_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0846A/",
@@ -935,8 +1029,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 7.6,
-        "wkUrl": null
+        "score": 7.6
       },
       "stages": {
         "scanned": true,
@@ -951,7 +1044,7 @@
     },
     "PHerc0846B": {
       "display": "PHerc0846B",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0846B/photos/PHerc0846B_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0846B/",
@@ -961,8 +1054,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0.6,
-        "wkUrl": null
+        "score": 0.6
       },
       "stages": {
         "scanned": true,
@@ -977,7 +1069,7 @@
     },
     "PHerc1203": {
       "display": "PHerc1203",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc1203/photos/PHerc1203_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc1203/",
@@ -987,8 +1079,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 7.6,
-        "wkUrl": null
+        "score": 7.6
       },
       "stages": {
         "scanned": true,
@@ -1003,7 +1094,7 @@
     },
     "PHerc1218": {
       "display": "PHerc1218",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc1218/photos/PHerc1218_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc1218/",
@@ -1013,8 +1104,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 1.4,
-        "wkUrl": null
+        "score": 1.4
       },
       "stages": {
         "scanned": true,
@@ -1029,7 +1119,7 @@
     },
     "PHerc1299": {
       "display": "PHerc1299",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc1299/photos/PHerc1299_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc1299/",
@@ -1039,8 +1129,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 7.6,
-        "wkUrl": null
+        "score": 7.6
       },
       "stages": {
         "scanned": true,
@@ -1055,7 +1144,7 @@
     },
     "PHerc1447": {
       "display": "PHerc1447",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc1447/photos/PHerc1447_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc1447/",
@@ -1065,8 +1154,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 1.4,
-        "wkUrl": null
+        "score": 1.4
       },
       "stages": {
         "scanned": true,
@@ -1081,7 +1169,7 @@
     },
     "PHerc1451": {
       "display": "PHerc1451",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc1451/photos/PHerc1451_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc1451/",
@@ -1096,8 +1184,7 @@
         "textFound": "Segmenting",
         "textRank": 1,
         "unrolledPct": 0,
-        "score": 1016.6,
-        "wkUrl": null
+        "score": 1016.6
       },
       "stages": {
         "scanned": true,
@@ -1112,7 +1199,7 @@
     },
     "PHerc1545": {
       "display": "PHerc1545",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc1545/photos/PHerc1545_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc1545/",
@@ -1122,8 +1209,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0.6,
-        "wkUrl": null
+        "score": 0.6
       },
       "stages": {
         "scanned": true,
@@ -1145,9 +1231,9 @@
         }
       ],
       "licenseScope": {
-        "EduceLab Data License": "all data — the DLS scans"
+        "EduceLab Data License": "all data \u2014 the DLS scans"
       },
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc1667Cr1Fr3/photos/PHerc1667Cr1Fr3_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc1667Cr1Fr3/",
@@ -1157,8 +1243,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0,
-        "wkUrl": null
+        "score": 0
       },
       "stages": {
         "scanned": true,
@@ -1180,9 +1265,9 @@
         }
       ],
       "licenseScope": {
-        "EduceLab Data License": "all data — the DLS scans"
+        "EduceLab Data License": "all data \u2014 the DLS scans"
       },
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Biblioteca Nazionale di Napoli \u2018Vittorio Emanuele III\u2019 (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc51Cr4Fr8/photos/PHerc51Cr4Fr8_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc51Cr4Fr8/",
@@ -1192,8 +1277,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0,
-        "wkUrl": null
+        "score": 0
       },
       "stages": {
         "scanned": true,
@@ -1218,8 +1302,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 7.6,
-        "wkUrl": null
+        "score": 7.6
       },
       "stages": {
         "scanned": true,
@@ -1244,8 +1327,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 7.6,
-        "wkUrl": null
+        "score": 7.6
       },
       "stages": {
         "scanned": true,
@@ -1270,8 +1352,7 @@
         "textFound": "Segmenting",
         "textRank": 1,
         "unrolledPct": 0,
-        "score": 8.9,
-        "wkUrl": null
+        "score": 8.9
       },
       "stages": {
         "scanned": true,
@@ -1293,7 +1374,7 @@
         }
       ],
       "licenseScope": {
-        "EduceLab Data License": "all data — the DLS scans"
+        "EduceLab Data License": "all data \u2014 the DLS scans"
       },
       "repository": "Institut de France, Paris",
       "note": "",
@@ -1305,8 +1386,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0,
-        "wkUrl": null
+        "score": 0
       },
       "stages": {
         "scanned": true,
@@ -1328,7 +1408,7 @@
         }
       ],
       "licenseScope": {
-        "EduceLab Data License": "all data — the DLS scans"
+        "EduceLab Data License": "all data \u2014 the DLS scans"
       },
       "repository": "Institut de France, Paris",
       "note": "",
@@ -1340,8 +1420,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0,
-        "wkUrl": null
+        "score": 0
       },
       "stages": {
         "scanned": true,
@@ -1363,7 +1442,7 @@
         }
       ],
       "licenseScope": {
-        "EduceLab Data License": "all data — the DLS scans"
+        "EduceLab Data License": "all data \u2014 the DLS scans"
       },
       "repository": "Institut de France, Paris",
       "note": "",
@@ -1375,8 +1454,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0,
-        "wkUrl": null
+        "score": 0
       },
       "stages": {
         "scanned": true,
@@ -1398,7 +1476,7 @@
         }
       ],
       "licenseScope": {
-        "EduceLab Data License": "all data — the DLS scans"
+        "EduceLab Data License": "all data \u2014 the DLS scans"
       },
       "repository": "Institut de France, Paris",
       "note": "",
@@ -1410,8 +1488,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0,
-        "wkUrl": null
+        "score": 0
       },
       "stages": {
         "scanned": true,

@@ -1,0 +1,222 @@
+# Fiber following
+
+Three model types share one trainer, data pipeline, labels, replay, live continuation, tracer and commit policy:
+
+- `regression` (../models/crop_transformer.py): a residual CNN tokenizes the crop and one transformer (the crop
+  transformer) reads the crop cells, observed-path references and path-geometry tokens; path tokens read out each
+  plane's lateral position and hazard logit, with recurrent refinement passes.
+- `flow` (../models/crop_transformer.py, ../models/flow.py): flow matching on the same backbone; path tokens carry a
+  noisy path and the flow time (adaLN-Zero) and read out the velocity; a scoring set reads out the hazards.
+- `sequence` (../models/sequence.py, train/sequence.py): one transformer reads the whole trace, one history token per
+  committed step, and predicts the path and its confidence; training runs whole episodes.
+
+Each type's defaults are the settings of the run it was established with (`mixed_ct_afv_unified_v1`,
+`unified_flow_v6_adalnzero`, `sequence_v1`). CT uses per-crop z-score normalization only (all values, float32
+statistics, epsilon 1e-6; no clipping).
+
+## Run configuration
+
+A training run is described by one JSON file (train/run_config.py) and launched with it only:
+
+```bash
+../../../../../.venv/bin/python train/train.py --config configs/runs/regression.json
+../../../../../.venv/bin/python train/train.py --config output/RUN/run.json --resume output/RUN/last.pt
+bash scripts/launch_train.sh configs/runs/flow.json            # detached, log in output/logs/NAME.log
+bash scripts/stop.sh NAME                                      # the trainer and its DAgger collectors
+```
+
+```json
+{
+  "name": "my_run",
+  "out_root": "output",
+  "init_weights": null,
+  "init_exclude": [],
+  "reset_optimizer": false,
+  "dataset": {"version": 1, "cache_dir": "...", "sources": [...]},
+  "model": {"type": "regression"},
+  "training": {"steps": 30000, "lr": 1e-4},
+  "runtime": {"workers": 10, "device": "cuda"}
+}
+```
+
+- `dataset` is the dataset configuration (data/datasets.py): exactly one `paris4` source (fibers, CT,
+  seed manifest, `val_z`) and any number of `afv` sources, each with a weight and validation split. Neighboring
+  annotations of AFV sources supply foreign-path masks, synthetic wrong continuations and switch detection; Paris 4
+  has no neighbor paths.
+- `model` takes `type` plus any field of that type's configuration class (`RegressionConfig`, `FlowConfig`,
+  `SequenceConfig`), including `fine` (the crop) and `frame_checkpoint` (the frozen heading/normal model; its path
+  and SHA-256 are recorded with the model).
+- `training` holds the optimizer and schedule, losses, label tolerance, operating policy (`n_commit`,
+  `trace_confidence`, `gate`), sampling, task shares (`task_shares`: a full `{task: share}` dict; absent tasks get 0),
+  DAgger collection and diagnostics; `runtime` the machine settings (device, workers, threads, CT prefetch).
+- Omitted fields take the model type's defaults (`run_config.DEFAULTS` and the configuration classes); unknown keys
+  are errors, except removed settings (`run_config.RETIRED`), which are dropped when they hold a value that matches
+  the current code and refused otherwise; relative paths resolve against the configuration file's folder.
+- The trainer writes the complete resolved configuration to `output/RUN/run.json` and into every checkpoint
+  (`run_config`); `configs/runs/{regression,flow,sequence}.json` reproduce the three runs on this machine.
+
+`batch` is decisions per forward pass (episodes for `sequence`); `grad_steps` accumulates those batches. Training
+operations are compiled. Flow residual scales are fitted once from `flow_calibration_states` training states and saved
+in the model configuration.
+
+## Resume and initialization
+
+- `--resume CHECKPOINT` continues a run: the model configuration comes from the checkpoint (a differing configured
+  model section is reported and ignored); model, EMA, optimizer, RNG and step are restored. Everything else (data,
+  weights, task shares, policy, schedule, workers) follows the run configuration, so it may change between resumes.
+  A replay cache that no longer matches the data is skipped with a warning; a monitor recovery fixture that no
+  longer matches is rebuilt (the old one is kept as `monitor_recovery.previous.npz`); CT normalization and frame
+  checkpoint differences are reported, not refused. `reset_optimizer` restarts AdamW and the LR schedule.
+- `init_weights` starts a new run from a checkpoint's model and EMA tensors, matched by name and shape
+  (`init_exclude` prefixes keep their initialization); the trainer reports tensors left fresh, unused and mismatched.
+
+Resumes may change `training.steps` (the total update endpoint) while preserving AdamW state. Increasing it changes
+the cosine schedule and can raise the effective LR. For a continuous extension after warmup, use
+`lr = saved_lr / lr_at(saved_step - origin, 1, warmup, new_total - origin)`, where `saved_lr` is the checkpoint
+optimizer group's LR and `origin` is its `lr_restart_step`.
+
+### Converting checkpoints from before the model cleanup
+
+Checkpoints of the earlier model types `unified`, `unified_flow` and `sequence` are converted once (the model,
+EMA and optimizer state are unchanged; dead configuration fields are dropped; the run configuration is rebuilt):
+
+```bash
+../../../../../.venv/bin/python scripts/convert_checkpoint.py output/RUN/last.pt output/RUN/last.converted.pt \
+  --run-config output/RUN/run.converted.json
+bash scripts/convert_running_runs.sh     # the three runs trained before the cleanup, latest checkpoint of each
+../../../../../.venv/bin/python train/train.py --config output/RUN/run.converted.json --resume output/RUN/last.converted.pt
+```
+
+The converted run configuration keeps the paths of the machine that wrote the checkpoint. For `sequence_v1`, the
+live and synthetic task shares (which sequence training does not support) move to `fresh`.
+
+## Tracing
+
+Everything a trace needs comes from the follower checkpoint: the model, its operating policy, its CT (store, level,
+normalization) and its learned frame model. Coordinates are base voxels (the CT's level 0), as in VC3D fiber JSON.
+
+`--checkpoint` is a file or a Hugging Face model repo (`ORG/NAME`, optionally `@REVISION`); by default it is
+[`scrollprize/fiber_single_small`](https://huggingface.co/scrollprize/fiber_single_small), downloaded with its frame
+model into the Hugging Face cache on first use. A repo holds the follower as `ckpt_final.pt` (else its only other
+`.pt`, e.g. `last.pt`) and its frame model as `heading_model.pt`. Runs record the repo commit they used.
+
+On a machine other than the one that trained it (`tracing/runtime.py`):
+- **Frame model**: for a checkpoint file, put the frame checkpoint next to it, under its recorded file name or as
+  `frame_model.pt` / `heading_model.pt`, or pass `--frame-checkpoint`. It must match the sha256 the follower recorded.
+- **CT**: a remote store (`s3://`) is read through a local chunk cache: `--cache-dir`, else the recorded folder if it
+  exists, else `~/.cache/vesuvius/volume_cache` (`$XDG_CACHE_HOME`). `--ct`, `--ct-level`, `--ct-grid-scale` and
+  `--grid-scale` point a checkpoint at another copy or level of its CT.
+- Crops are sampled on the GPU (`--crops gpu`, the default on CUDA; `--crops cpu` for the CPU sampler).
+
+Trace from seed points (one H/V family for all seeds, or one per seed); each fiber is a VC3D fiber JSON in `OUT`,
+with every seed's outcome in `OUT/seeds.json`:
+
+```bash
+python -m vesuvius.neural_tracing.tracers.fibers.tracing.inference --seed 12624,9936,46080 --family V --out traced/
+python -m vesuvius.neural_tracing.tracers.fibers.tracing.inference --seeds-file seeds.json --family H \
+  --out traced/                                             # seeds.json: [[x, y, z], ...]
+python -m vesuvius.neural_tracing.tracers.fibers.tracing.inference --checkpoint my_run/ckpt_050000.pt \
+  --seed 12624,9936,46080 --family V --out traced/         # another checkpoint
+```
+
+Trace every fiber of a volume (or a box) from a fiber presence prediction on the trace grid (the presence zarr level
+whose voxel is `grid_scale` base voxels; the next, coarser level is used for progress if present). Each fiber is
+written once; the output is `OUT/fibers.afv` (an Automated Fiber Volume for VC3D's fiber collection dock), plus
+per-tile results that make a rerun resume. `--ct-z` is a z range in CT voxels of the checkpoint's CT level, `--box`
+a trace-grid box `x0,y0,z0,x1,y1,z1`:
+
+```bash
+python -m vesuvius.neural_tracing.tracers.fibers.tracing.volume --presence presence.ome.zarr/3 \
+  --ct-z 7000,17000 --out paris4_fibers/ | tee -a paris4_fibers.log
+python -m vesuvius.neural_tracing.tracers.fibers.tracing.volume_afv paris4_fibers/   # fibers.afv from the tiles so far
+```
+
+The AFV's coordinate frame is the CT's when it is a Vesuvius open-data store (`s3://vesuvius-challenge-open-data/...`);
+for any other CT, pass an `.afv` of the same scan as `--afv-template` (`volume_afv.py --template`). Status lines
+(progress, decisions/s, ETA) print every minute. One process uses one GPU; the Paris4 run held about 23 GB with
+`--gpu-chunks 1024 --forward-chunk 64` and 27 GB with `--gpu-chunks 3072` (each chunk slot is 2 MiB; more slots
+load fewer CT chunks).
+
+VC3D's Line Annotation can trace its Fiber model lines with this model (hamburger menu, "Fiber follow model" → "Use
+for the Fiber model"; off by default) through `tracing/service.py`, which VC3D starts with the Python environment it
+was launched from: the default checkpoint unless one is chosen there.
+
+## Evaluation
+
+```bash
+../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.fibers.train.dagger.collect --help
+../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.fibers.evaluation.protocol --help
+```
+
+New runs use the frozen `heading_model_l0_w16_centered_frame/ckpt_064000.pt` for current-crop heading and roll. CT
+initializes seed headings with derivative sigma 2 and integration sigma 8, using a 77³ native CT context. H/V family
+comes from the seed or fiber metadata; only CT and observed paths enter the frame model. The model runs in batches on
+CPU, once per worker/process, with no training gradients. `TRACERS_PATH_MAP='OLD=NEW;...'` (formerly `FIBER_FOLLOW_PATH_MAP`) relocates absolute
+paths recorded on another machine when a checkpoint is loaded for inference. Paths recorded under the package's former
+location `neural_tracing/fiber_follow/` (checkpoints, run and dataset configurations) resolve to `neural_tracing/tracers/fibers/`.
+
+DAgger subprocesses receive `runtime.dagger_threads` (default 4), independently of the trainer's `runtime.threads`.
+
+### Pre-cleanup checkpoints (inference only)
+
+The `flow_matching` checkpoints of the v4-extension and v5 runs and the `coordinate_regression` checkpoints of
+`mixed_ct_afv_forward35_v1` and `mixed_ct_afv_v3init_nomem_b8` (patch encoder, decoder, segment scorer; no memory or
+identity heads) trace through `legacy/`, a frozen copy of those models kept apart from `tracers/models/`. It takes the same
+arguments as `tracing.inference` and refuses checkpoints with features it does not implement (decision memory, identity
+heads, whole-crop planes); there is no training support.
+
+```bash
+../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.fibers.legacy.infer --checkpoint CKPT.pt \
+  --seed X,Y,Z --family H --out traced/
+```
+
+## Snapping fiber labels to the presence prediction
+
+`scripts/snap_fibers.py` (`data/fiber_snapping.py`) moves fiber labels onto the centre of a fiber presence prediction:
+at every point, the centroid of the upper half of the presence on a perpendicular disk (radius 2.5 voxels, averaged over
++-1 voxel along the fiber), smoothed along the fiber (sigma 2), two passes. It reads an AFV (writing a new AFV with the
+same ids, names, families and annotations and a `snapping` metadata record) or VC3D fiber JSONs (writing snapped
+`line_points`, controls moved onto the line, and `snapping.json`). The work is tiled over the presence volume and
+batched on the GPU. On Paris4 AFV it brought labels from a median 1.46 to 0.68 trace voxels from the manual annotations
+(`output/paris4_annotation_audit_20261006/`).
+
+```bash
+../../../../../.venv/bin/python scripts/snap_fibers.py datasets/automated_fiber_volumes/IN.afv OUT.afv \
+  --presence /path/PHercParis4-..._presence.ome.zarr/3 --native-per-voxel 8   # level 3 = 8 native voxels per voxel
+```
+
+## Organization
+
+The fiber tracer lives in `tracers/fibers/`; the parts other tracers can reuse sit beside it in `tracers/`
+(`tracers/README.md`). Nothing in `tracers/models` or `tracers/shared` imports `tracers/fibers`.
+
+| Package | Responsibility |
+| --- | --- |
+| `tracers/models` | The follower contract (`follower.py`), the model registry (`model.py`), checkpoints (`checkpoint.py`), the crop transformer (`regression`, `flow`), flow matching, the sequence model, the supervised-path contract (`targets.py`) |
+| `tracers/shared` | Geometry, observed-path references, the commit policy, recorded-path relocation, retired settings, JSON/atomic output, batch tensors, the CT structure tensor (`ct_structure.py`), training-run pieces (`training.py`: run dirs, log, LR schedule, EMA) and compile options |
+| `tracers/shared/annotations` | Fiber annotations: AFV collections, VC3D fiber JSON, the annotated-fiber type, kink repair, whole-fiber splits |
+| `tracers/shared/crop_sampling` | CT crop loading: volumes (local and remote chunked readers, chunk-store decoding), intensity normalization, oriented crop sampling (CPU kernel for data workers, GPU sampler for in-step crops), remote prefetch |
+| `data` | The z-band split, seeds, simulated traces and episodes, targets and state labels, the task budget, replay, the training dataset, observations, AFV sources and neighbors |
+| `frames` | Crop frames: CT structure-tensor headings and frames (`ct.py`), the frozen learned frame model (`learned.py`) |
+| `tracing` | The tracer and rollout (`trace.py`), the tracing CLI (`inference.py`) |
+| `train` | Entry point and run configuration, the training update (`step.py`), objectives, logging, live continuation, DAgger collection (`dagger/`) |
+| `evaluation` | Trace scoring (`scoring.py`), the offline calibrate/run/compare protocol (`protocol.py`), training-time monitoring (`monitor/`) |
+| `heading_model` | Heading/normal trainer and the frame predictor network used by `frames/learned.py` |
+| `legacy` | Inference for pre-cleanup checkpoints |
+| `scripts` | Launch/stop, label snapping, checkpoint conversion, the pre-launch sampler check |
+| `configs` | Run (`runs/`), dataset (`datasets/`) and heading-model (`heading/`) configurations |
+
+Run artifacts are in `output/` and AFV datasets in `datasets/` (both untracked). Three files in `output/` are inputs of
+current runs: the Paris 4 seed manifest `single_path_v11_preparation/seeds.json`, the frame model
+`heading_model_l0_w16_centered_frame/ckpt_064000.pt` and `heading_model_l0_w16_centered_normals/ct_normalization.json`.
+
+## Verification
+
+```bash
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 MPLCONFIGDIR=/tmp/fiber-mpl \
+  ../../../../../.venv/bin/python -m pytest tests -q -o cache_dir=/tmp/fiber-pytest
+```
+
+Tests cover the three model types, compiled graph capture, weight initialization/resume, gradient paths, supervision
+masks, deterministic flow tracing, observation parity, collection and the standalone heading model. CUDA tests skip when CUDA is unavailable. Small-fixture checks
+establish implementation correctness; they do not establish trained tracing accuracy or production GPU throughput.

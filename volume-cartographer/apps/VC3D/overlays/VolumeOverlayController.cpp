@@ -1,4 +1,6 @@
 #include "VolumeOverlayController.hpp"
+#include "../OpenDataCoordinateIdentity.hpp"
+#include "../VolumeDisplayNames.hpp"
 
 #include "../ViewerManager.hpp"
 #include "../VolumeViewerCmaps.hpp"
@@ -126,38 +128,6 @@ std::string defaultOverlayColormap()
     return entries.empty() ? std::string{} : entries.front().id;
 }
 
-std::string coordinateSpaceTag(const VolumePkg& pkg, const std::string& volumeId)
-{
-    constexpr std::string_view prefix = "vc-open-data-coordinate-space:";
-    for (const auto& tag : pkg.volumeTags(volumeId)) {
-        if (tag.rfind(prefix, 0) == 0)
-            return tag.substr(prefix.size());
-    }
-    return {};
-}
-
-constexpr bool coordinateSpaceTagsCompatible(std::string_view base,
-                                            std::string_view overlay)
-{
-    // Missing tags retain the untagged overlay convention: shared base coordinates.
-    return base.empty() || overlay.empty() || base == overlay;
-}
-
-static_assert(coordinateSpaceTagsCompatible("", ""));
-static_assert(coordinateSpaceTagsCompatible("scan@L0", ""));
-static_assert(coordinateSpaceTagsCompatible("", "scan@L0"));
-static_assert(coordinateSpaceTagsCompatible("scan@L0", "scan@L0"));
-static_assert(!coordinateSpaceTagsCompatible("scan@L0", "scan@L1"));
-static_assert(!coordinateSpaceTagsCompatible("scan-a@L0", "scan-b@L0"));
-
-bool overlayCoordinatesCompatible(const VolumePkg& pkg,
-                                  const std::string& baseId,
-                                  const std::string& overlayId)
-{
-    const auto base = coordinateSpaceTag(pkg, baseId);
-    const auto overlay = coordinateSpaceTag(pkg, overlayId);
-    return coordinateSpaceTagsCompatible(base, overlay);
-}
 } // namespace
 
 VolumeOverlayController::VolumeOverlayController(ViewerManager* manager, QObject* parent)
@@ -424,9 +394,9 @@ void VolumeOverlayController::refreshVolumeOptions()
         const std::string baseVolumeId = primary
             ? primary->currentVolumeId()
             : std::string{};
-        for (const auto& id : _volumePkg->volumeIDs()) {
+        for (const auto& id : vc3d::orderedDisplayVolumeIds(*_volumePkg)) {
             if (!baseVolumeId.empty() &&
-                !overlayCoordinatesCompatible(*_volumePkg, baseVolumeId, id))
+                !vc3d::opendata::overlayCoordinatesCompatible(*_volumePkg, baseVolumeId, id))
                 continue;
             std::shared_ptr<Volume> volume;
             try {
@@ -436,7 +406,7 @@ void VolumeOverlayController::refreshVolumeOptions()
             }
 
             const QString idStr = QString::fromStdString(id);
-            const QString label = overlayVolumeLabel(volume, idStr);
+            const QString label = vc3d::volumeDisplayLabel(*_volumePkg, id, overlayVolumeLabel(volume, idStr));
             const int row = _ui.volumeSelect->count();
             _ui.volumeSelect->addItem(label, QVariant(idStr));
             if (!_overlayVolumeId.empty() && _overlayVolumeId == id) {
@@ -691,7 +661,7 @@ void VolumeOverlayController::applyOverlayVolume()
             ? primary->currentVolumeId()
             : std::string{};
         if (!baseVolumeId.empty() &&
-            !overlayCoordinatesCompatible(*_volumePkg, baseVolumeId, _overlayVolumeId)) {
+            !vc3d::opendata::overlayCoordinatesCompatible(*_volumePkg, baseVolumeId, _overlayVolumeId)) {
             emit requestStatusMessage(
                 tr("Overlay rejected: volume coordinate spaces do not match."), 5000);
             _overlayVolumeId.clear();

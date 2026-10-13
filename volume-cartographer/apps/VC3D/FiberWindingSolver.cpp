@@ -1078,6 +1078,170 @@ PairCrossings classifyPairCrossings(const PairDetections& detections,
     const bool trusted = hTrace.trusted && vTrace.trusted;
     const std::vector<double>& hPsi = hTrace.psi;
     const std::vector<double>& hZ = hTrace.z;
+
+    // Runs of V branches (see the note on runs at CrossingGroup). The
+    // branches' shared endpoints are the height extrema of the polyline, in
+    // polyline order; an extremum is a fold apex only when the polyline then
+    // reverses by at least the apex prominence before extending again, read
+    // with hysteresis: the current run keeps extending while the height
+    // moves its way (or stays), a counter-move shorter than the prominence
+    // is a back-step and ignored, one at least as long ends the run at the
+    // run's own extreme. Until the polyline has moved a prominence from its
+    // start in either direction, the direction is open: the running lowest
+    // and highest extrema are kept, and the first pair a prominence apart
+    // fixes the direction as that of the later one (everything before it is
+    // jitter by definition). Genuine limbs therefore stay apart however much
+    // jitter sits at their apices (a jitter branch never joins two limbs of
+    // opposite direction by itself), and a back-step inside one climb joins
+    // its neighbours. Where the run's extreme height is reached more than
+    // once (jitter at an apex revisiting its height), the stretch between
+    // the first and the last visit is a run of its own, so it attaches to
+    // neither limb and the runs read the same in either sample order.
+    // Detection (branches, samples, vertices) is untouched: the runs only
+    // key the groups and their gates.
+    struct BranchRun {
+        std::size_t first = 0;
+        std::size_t last = 0;
+        double psiMin = 0.0;
+        double psiMax = 0.0;
+        double zLo = 0.0;
+        double zHi = 0.0;
+        // The direction the run's limbs are read against: +1 when the
+        // polyline ascends along the run, -1 when it descends. A run of
+        // several limbs whose direction the hysteresis never fixed (the
+        // polyline within the prominence throughout) or a tie plateau
+        // (equal end heights) has no intrinsic direction, and any reference
+        // covers its repeated heights (see bands); the value is chosen
+        // sample-order independent.
+        int referenceDirection = 1;
+        // Height ranges of the run's counter-direction limbs: the
+        // back-steps' bands. A height the polyline leaves and first returns
+        // to along a non-constant stretch is left along one limb and
+        // returned to along a limb of the opposite direction, and both
+        // limbs' closed height ranges contain it; so, for either reference
+        // direction, the counter-direction limbs' ranges cover every height
+        // an excursion repeats, and outside them the run is one limb whose
+        // curtain a traversal meets once (see backStepKeys). Nested jitter
+        // is covered whole. Every counter-direction limb is sub-prominence
+        // (a longer counter-move would have ended the run); forward limbs,
+        // however short, need no bands of their own - whatever heights they
+        // repeat, a counter limb already spans. A height
+        // repeated along a constant-height stretch is not an excursion:
+        // identical samples are one vertex (vertexOf), a level segment or
+        // a radial step at one (psi, z) is read by detection's contact and
+        // unresolved gates.
+        std::vector<std::pair<double, double>> bands;
+    };
+    // Branches of a run of several running against the run's reference
+    // direction: the back-steps themselves (see backStepKeys). A run of one
+    // branch has no back-step, however short.
+    std::vector<bool> counterLimb(vTrace.branches.size(), false);
+    std::vector<std::size_t> runOfBranch(vTrace.branches.size(), 0);
+    std::vector<BranchRun> runs;
+    if (!vTrace.branches.empty()) {
+        // Extremum i is the start of branch i in polyline order; extremum
+        // B is the end of the last branch.
+        const std::size_t branchCount = vTrace.branches.size();
+        const auto extremum = [&](std::size_t i) {
+            if (i < branchCount) {
+                const Branch& branch = vTrace.branches[i];
+                return branch.forwardAscending ? branch.z.front() : branch.z.back();
+            }
+            const Branch& branch = vTrace.branches.back();
+            return branch.forwardAscending ? branch.z.back() : branch.z.front();
+        };
+        std::vector<std::size_t> reversals;
+        // Per reversal, the direction of the run ending there (before the
+        // flip); both indices of a tie plateau carry the same one.
+        std::vector<int> reversalDirections;
+        int direction = 0;
+        // The run's extreme: first and last extremum index at its height.
+        std::size_t firstAtExtreme = 0;
+        std::size_t candidate = 0;
+        std::size_t lowest = 0;
+        std::size_t highest = 0;
+        for (std::size_t i = 1; i <= branchCount; ++i) {
+            if (direction == 0) {
+                if (extremum(i) < extremum(lowest)) {
+                    lowest = i;
+                }
+                if (extremum(i) > extremum(highest)) {
+                    highest = i;
+                }
+                if (extremum(highest) - extremum(lowest) >= params.apexProminenceVx) {
+                    direction = highest > lowest ? 1 : -1;
+                    candidate = std::max(lowest, highest);
+                    firstAtExtreme = candidate;
+                }
+                continue;
+            }
+            const double move = extremum(i) - extremum(candidate);
+            if (move == 0.0) {
+                candidate = i;
+            } else if ((move > 0.0) == (direction > 0)) {
+                candidate = i;
+                firstAtExtreme = i;
+            } else if (std::abs(move) >= params.apexProminenceVx) {
+                if (firstAtExtreme != candidate) {
+                    reversals.push_back(firstAtExtreme);
+                    reversalDirections.push_back(direction);
+                }
+                reversals.push_back(candidate);
+                reversalDirections.push_back(direction);
+                direction = -direction;
+                candidate = i;
+                firstAtExtreme = i;
+            }
+        }
+        // A never-determined direction: the polyline's end height against
+        // its start (equal: +1). Reversing the samples negates it along with
+        // every limb's direction, so unequal ends select the same limbs; with
+        // equal ends the ascending and the descending limbs' ranges each
+        // cover the run's whole height, so either selection gives the same
+        // bands.
+        if (direction == 0) {
+            const double rise = extremum(branchCount) - extremum(0);
+            direction = rise < 0.0 ? -1 : 1;
+        }
+        std::size_t run = 0;
+        std::size_t nextReversal = 0;
+        for (std::size_t b = 0; b < branchCount; ++b) {
+            while (nextReversal < reversals.size() && reversals[nextReversal] <= b) {
+                ++run;
+                ++nextReversal;
+            }
+            runOfBranch[b] = run;
+            const Branch& branch = vTrace.branches[b];
+            if (run == runs.size()) {
+                BranchRun started;
+                started.first = b;
+                started.last = b;
+                started.psiMin = branch.psiMin;
+                started.psiMax = branch.psiMax;
+                started.zLo = branch.z.front();
+                started.zHi = branch.z.back();
+                started.referenceDirection =
+                    run < reversalDirections.size() ? reversalDirections[run] : direction;
+                runs.push_back(started);
+            } else {
+                BranchRun& current = runs.back();
+                current.last = b;
+                current.psiMin = std::min(current.psiMin, branch.psiMin);
+                current.psiMax = std::max(current.psiMax, branch.psiMax);
+                current.zLo = std::min(current.zLo, branch.z.front());
+                current.zHi = std::max(current.zHi, branch.z.back());
+            }
+        }
+        for (std::size_t b = 0; b < branchCount; ++b) {
+            BranchRun& run = runs[runOfBranch[b]];
+            const Branch& branch = vTrace.branches[b];
+            const int limbDirection = branch.forwardAscending ? 1 : -1;
+            counterLimb[b] = run.first != run.last && limbDirection != run.referenceDirection;
+            if (counterLimb[b]) {
+                run.bands.emplace_back(branch.z.front(), branch.z.back());
+            }
+        }
+    }
     std::vector<Crossing> raw = detections.raw;
     std::vector<Crossing> shallow = detections.shallow;
     const std::size_t detectionCount = detections.detectionCount;
@@ -1448,7 +1612,7 @@ PairCrossings classifyPairCrossings(const PairDetections& detections,
     std::vector<Crossing> events;
     // Per detection id: the event it is part of.
     std::vector<std::size_t> eventOfDetection(detectionCount, 0);
-    // (translate, branch) keys of both limbs at every apex crossing.
+    // (translate, run) keys of both limbs at every apex crossing.
     std::set<std::pair<long long, std::size_t>> apexKeys;
     {
         std::vector<Crossing> all;
@@ -1483,8 +1647,8 @@ PairCrossings classifyPairCrossings(const PairDetections& detections,
                 if (a.vBranch != b.vBranch) {
                     a.apex = true;
                     b.apex = true;
-                    apexKeys.insert({a.n, a.vBranch});
-                    apexKeys.insert({b.n, b.vBranch});
+                    apexKeys.insert({a.n, runOfBranch[a.vBranch]});
+                    apexKeys.insert({b.n, runOfBranch[b.vBranch]});
                 }
                 if (representativeOf[a.detection] != representativeOf[b.detection]) {
                     // Two representatives: two events.
@@ -1593,29 +1757,73 @@ PairCrossings classifyPairCrossings(const PairDetections& detections,
         }
     }
 
-    // Traversal groups: every (translate, V branch) with at least two
-    // counted events, counted over the events themselves.
+    // Traversal groups: every (translate, run of V branches) with at least
+    // two counted events, counted over the events themselves.
     std::map<std::pair<long long, std::size_t>, std::vector<std::size_t>> eventsByKey;
-    // Translates and branches with a seam encounter: their counts are of an
+    // Translates and runs with a seam encounter: their counts are of an
     // incomplete traversal (see CrossingGroup::seamed).
     std::set<std::pair<long long, std::size_t>> seamedKeys;
     // Keys with an event exactly at the V fiber's radius - on the curtain
     // itself - counted or not (a touch there is a contact all the same).
     std::set<std::pair<long long, std::size_t>> curtainKeys;
+    // Keys with an event inside a back-step's height band of the run, on
+    // any of its limbs, counted or not. Outside the bands the run's curve is
+    // the curve of one smoothed limb (no excursion of the polyline repeats a
+    // height there; see BranchRun::bands), so every crossing there is a
+    // crossing of both and the run's count is the smoothed limb's. Inside a band the curtain is
+    // met more than once for one traversal - the limb before, the back-step,
+    // the limb after, or the limb after twice where it wobbles in angle
+    // around the back-step - and the extra crossings cancel in the inside
+    // count only when they are of one kind, which the geometry does not
+    // guarantee (the V fiber's radius or angle may step across the
+    // back-step). Any event in a band therefore says the count is not one
+    // smoothed traversal's: no verdict. A counter limb lies within its own
+    // band; it is named as well so a rounding of its ends cannot let an
+    // event on it slip out. Traversals clear of the bands (kb-159 x lt-165,
+    // whose five events all lie far from the one-voxel back-step) count as
+    // on one limb.
+    std::set<std::pair<long long, std::size_t>> backStepKeys;
     for (std::size_t e = 0; e < events.size(); ++e) {
+        const std::pair<long long, std::size_t> key{events[e].n,
+                                                     runOfBranch[events[e].vBranch]};
         if (events[e].deltaR == 0.0) {
-            curtainKeys.insert({events[e].n, events[e].vBranch});
+            curtainKeys.insert(key);
+        }
+        {
+            // The event's height is interpolated along its H segment from an
+            // intersection parameter whose rounding error is unbounded near
+            // parallel segments, so the height itself cannot be compared
+            // with a band edge. What is certain is that the crossing lies on
+            // its H segment: its true height is within the segment's height
+            // interval, and a band the interval meets may hold the event.
+            // Traced H segments span a few voxels of height, so the
+            // enclosure is tight where it matters; a segment without a
+            // successor (the trace's last sample) is read at its height.
+            const Crossing& event = events[e];
+            double heightLo = event.zVx;
+            double heightHi = event.zVx;
+            if (event.hSegment + 1 < hZ.size()) {
+                heightLo = std::min(hZ[event.hSegment], hZ[event.hSegment + 1]);
+                heightHi = std::max(hZ[event.hSegment], hZ[event.hSegment + 1]);
+            }
+            bool inBand = counterLimb[event.vBranch];
+            for (const auto& [bandLo, bandHi] : runs[key.second].bands) {
+                inBand = inBand || (heightHi >= bandLo && heightLo <= bandHi);
+            }
+            if (inBand) {
+                backStepKeys.insert(key);
+            }
         }
         // Touches cross nothing; seam encounters are annotation-classified,
         // not radial evidence. Neither counts.
         if (events[e].kollesis) {
-            seamedKeys.insert({events[e].n, events[e].vBranch});
+            seamedKeys.insert(key);
             continue;
         }
         if (events[e].touch || events[e].apex) {
             continue;
         }
-        eventsByKey[{events[e].n, events[e].vBranch}].push_back(e);
+        eventsByKey[key].push_back(e);
     }
     // Which side of the branch's angular locus an H endpoint lies on, for
     // translate n: +1 / -1 when the endpoint clears the locus by the
@@ -1623,7 +1831,7 @@ PairCrossings classifyPairCrossings(const PairDetections& detections,
     // not span that height, in which case the traversal's completeness is
     // unknown and the group takes no verdict.
     const double clearance = params.endpointClearanceTurns * kTwoPi;
-    const auto endpointSide = [&](std::size_t sample, long long n, const Branch& branch,
+    const auto sideOnBranch = [&](std::size_t sample, long long n, const Branch& branch,
                                   bool& covered) {
         const double z = hZ[sample];
         const double psi = hPsi[sample] + kTwoPi * static_cast<double>(n);
@@ -1647,15 +1855,41 @@ PairCrossings classifyPairCrossings(const PairDetections& detections,
         }
         return d > 0.0 ? 1 : -1;
     };
+    // The same against a run: every limb of the run spanning the endpoint's
+    // height must clear it, all on one side. A run's limbs are read one by
+    // one, never joined into one polyline - a back-step where the angle
+    // also steps would otherwise fabricate a locus between the limbs.
+    const auto endpointSide = [&](std::size_t sample, long long n, const BranchRun& run,
+                                  bool& covered) {
+        covered = false;
+        int side = 0;
+        for (std::size_t b = run.first; b <= run.last; ++b) {
+            bool spans = false;
+            const int limbSide = sideOnBranch(sample, n, vTrace.branches[b], spans);
+            if (!spans) {
+                continue;
+            }
+            if (!covered) {
+                covered = true;
+                side = limbSide;
+            } else if (limbSide != side) {
+                side = 0;
+            }
+            if (side == 0) {
+                return 0;
+            }
+        }
+        return side;
+    };
     for (const auto& [key, members] : eventsByKey) {
         if (members.size() < 2) {
             continue;
         }
         const long long n = key.first;
-        const Branch& branch = vTrace.branches[key.second];
+        const BranchRun& run = runs[key.second];
         CrossingGroup group;
         group.n = n;
-        group.vBranch = key.second;
+        group.vBranch = run.first;
         group.members = members;
         group.multiplicity = static_cast<int>(members.size());
         group.minAbsDeltaR = std::numeric_limits<double>::infinity();
@@ -1683,28 +1917,28 @@ PairCrossings classifyPairCrossings(const PairDetections& detections,
         group.coverageGap = gapTranslates.count(n) != 0;
         group.unresolved = unresolvedTranslates.count(n) != 0;
         // Completeness of the count is decided where the curtain is: the
-        // stretch of the H trace whose lifted angle lies within the branch's
-        // angular window (its psi range plus the clearance) at this
-        // translate. Every sample of that stretch must stay within the
-        // branch's height range - an excursion above or below it, at the V
-        // fiber's angle, could cross the fiber's untraced continuation unseen
-        // and come back with the count off by two - and the stretch must be
+        // stretch of the H trace whose lifted angle lies within the run's
+        // angular window (its limbs' psi range plus the clearance) at this
+        // translate. Every sample of that stretch must stay within the run's
+        // height range - an excursion above or below it, at the V fiber's
+        // angle, could cross the fiber's untraced continuation unseen and
+        // come back with the count off by two - and the stretch must be
         // entered from one side of the window and left to the other. A
         // stretch that begins or ends at the trace's own end is judged there
-        // by the local side test against the V fiber's angle at that height.
-        // A multi-turn H fiber therefore passes on each turn that crosses the
-        // V fiber cleanly, whatever it does elsewhere.
+        // by the local side test against the V fiber's angle at that height,
+        // limb by limb. A multi-turn H fiber therefore passes on each turn
+        // that crosses the V fiber cleanly, whatever it does elsewhere.
         // The stretch is taken segment by segment, each clipped to the window,
         // so a single long segment jumping across the V fiber's angle is seen
         // whether or not a sample lands inside; the clipped ends' heights
         // bound the segment's heights inside the window (it is straight).
         {
-            const double windowLo = branch.psiMin - clearance;
-            const double windowHi = branch.psiMax + clearance;
-            const double windowMid = 0.5 * (branch.psiMin + branch.psiMax);
+            const double windowLo = run.psiMin - clearance;
+            const double windowHi = run.psiMax + clearance;
+            const double windowMid = 0.5 * (run.psiMin + run.psiMax);
             const double lift = kTwoPi * static_cast<double>(n);
-            const double zLoBranch = branch.z.front();
-            const double zHiBranch = branch.z.back();
+            const double zLoBranch = run.zLo;
+            const double zHiBranch = run.zHi;
             bool excursion = false;
             bool any = false;
             int sideA = 0;
@@ -1739,7 +1973,7 @@ PairCrossings classifyPairCrossings(const PairDetections& detections,
                         sideA = a > windowMid ? 1 : -1;
                     } else {
                         bool covered = false;
-                        sideA = endpointSide(0, n, branch, covered);
+                        sideA = endpointSide(0, n, run, covered);
                         sideA = covered ? sideA : 0;
                     }
                 }
@@ -1751,7 +1985,7 @@ PairCrossings classifyPairCrossings(const PairDetections& detections,
                     sideB = b > windowMid ? 1 : -1;
                 } else if (i + 2 == hPsi.size()) {
                     bool covered = false;
-                    sideB = endpointSide(hPsi.size() - 1, n, branch, covered);
+                    sideB = endpointSide(hPsi.size() - 1, n, run, covered);
                     sideB = covered ? sideB : 0;
                 } else {
                     sideB = 0;
@@ -1760,9 +1994,9 @@ PairCrossings classifyPairCrossings(const PairDetections& detections,
             group.traversalCovered =
                 any && !excursion && sideA != 0 && sideB != 0 && sideA != sideB;
         }
-        group.seamed = seamedKeys.count({group.n, group.vBranch}) > 0;
-        if (apexKeys.count({group.n, group.vBranch}) > 0 ||
-            curtainKeys.count({group.n, group.vBranch}) > 0) {
+        group.seamed = seamedKeys.count(key) > 0;
+        if (apexKeys.count(key) > 0 || curtainKeys.count(key) > 0 ||
+            backStepKeys.count(key) > 0) {
             group.onCurtain = true;
         }
         group.hasVerdict = group.multiplicity >= 3 && group.mixedSigns &&

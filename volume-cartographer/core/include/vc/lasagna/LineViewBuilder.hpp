@@ -4,6 +4,7 @@
 
 #include <memory>
 #include <string>
+#include <cstdint>
 #include <vector>
 
 class PlaneSurface;
@@ -64,6 +65,12 @@ struct LineStripPositionMap {
     // metadata. Exact source mapping uses stripGridArclengths.
     double stripGridSpacingBaseVoxels = 0.0;
     size_t stripGridColumnCount = 0;
+    // Revision of the line this map was built from, stamped by the owner that
+    // tracks revisions (VC3D's line annotation session); 0 when unknown.
+    // Consumers that place controls by arc length require the control's
+    // revision to match, since arc lengths of one line mean nothing on
+    // another.
+    uint64_t lineRevision = 0;
 
     [[nodiscard]] bool valid() const;
     [[nodiscard]] double originalPositionToStripGridColumn(double originalPosition) const;
@@ -104,6 +111,12 @@ struct LineViewFrameDiagnostics {
 
 LineViewSurfaces buildLineViewSurfaces(const LineModel& line,
                                        const LineViewConfig& config = {});
+
+// Display-only frame for an already traced curve without sampled sheet normals.
+// Reuses the ribbon builder's parallel transport; positions are copied exactly.
+// The resulting normals describe a viewing frame, not a measured sheet field,
+// and must not be used as optimization evidence.
+LineModel lineModelForInspection(const std::vector<cv::Vec3d>& points);
 
 LineViewFrameDiagnostics diagnoseLineViewFrames(const LineModel& line,
                                                 const LineViewConfig& config = {});

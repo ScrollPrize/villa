@@ -83,6 +83,7 @@ fi
     libopencv-dev \
     libscotch-dev \
     libscotchmetis-dev \
+    libsqlite3-dev \
     libsuitesparse-dev \
     libtiff-dev \
     libzstd-dev \

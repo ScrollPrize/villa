@@ -15,6 +15,8 @@ set(srcs
     Keybinds.cpp
     Keybinds.hpp
     CWindow.cpp
+    FiberCollectionController.cpp
+    FiberCollectionController.hpp
     CWindowContextMenu.cpp
     StatusDockPanelHost.cpp
     StatusDockPanelHost.hpp
@@ -37,8 +39,11 @@ set(srcs
     FiberMapRuler.cpp
     FiberMapRuler.hpp
     FiberMapRulerMath.hpp
+    FiberLengthDisplay.hpp
     FiberMapGapField.cpp
     FiberMapGapField.hpp
+    FiberMapKollesis.cpp
+    FiberMapKollesis.hpp
     FiberNetworkLayout.cpp
     FiberNetworkLayout.hpp
     FiberWindingSolver.cpp
@@ -50,6 +55,7 @@ set(srcs
     LineAnnotationController.cpp
     LineAnnotationController.hpp
     LineAnnotationFiberSegments.cpp
+    LineAnnotationStructuralEdits.cpp
     LineAnnotationFiberSegments.hpp
     LineAnnotationDialog.cpp
     LineAnnotationDialog.hpp
@@ -219,6 +225,12 @@ set(srcs
     segmentation/SegmentationUndoHistory.hpp
     NeuralTraceServiceManager.cpp
     NeuralTraceServiceManager.hpp
+    FiberFollowService.cpp
+    FiberFollowService.hpp
+    PythonExecutable.cpp
+    PythonExecutable.hpp
+    SocketRequest.cpp
+    SocketRequest.hpp
     LasagnaServiceManager.cpp
     LasagnaServiceManager.hpp
     SpiralArtifactCache.cpp
@@ -240,6 +252,8 @@ set(srcs
     SpiralSessionSync.hpp
     SpiralSshTunnel.cpp
     SpiralSshTunnel.hpp
+    SpiralDescriptions.cpp
+    SpiralDescriptions.hpp
     SpiralPanel.cpp
     SpiralPanel.hpp
     SpiralMinimap.cpp
@@ -372,6 +386,7 @@ target_link_libraries(VC3D
     # mimalloc first so its symbols win malloc/free resolution.
     $<$<BOOL:${mimalloc_FOUND}>:mimalloc>
     vc_core
+    vc_fiber_collection
     vc_atlas
     vc_lasagna
     vc_fiber_tracer
