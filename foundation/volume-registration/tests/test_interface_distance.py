@@ -133,12 +133,18 @@ def test_read_points_depth_anchors(tmp_path):
     f = tmp_path / "anchors.csv"
     f.write_text(csv_text)
     pts = idist.read_points(str(f))
-    assert [p["id"] for p in pts] == ["3_4"]  # block_median dropped, zero normal dropped
+    assert [p["id"] for p in pts] == ["3_4", "4_4"]  # block_median dropped, zero normal kept
     assert np.allclose(pts[0]["zyx"], [301.5, 200.0, 100.0])  # base + 1.5 * unit normal
     assert np.allclose(pts[0]["normal_zyx"], [1.0, 0.0, 0.0])
     assert pts[0]["region"] == "15"
+    assert pts[1]["normal_zyx"] is None and np.allclose(pts[1]["zyx"], [30.0, 20.0, 10.0])
+    write_transform(tmp_path / "id.json", np.c_[np.eye(3), np.zeros(3)])
+    chain, _ = idist.load_chain([str(tmp_path / "id.json")])
+    vol = np.full((48, 48, 48), 100.0, np.float32)
+    rec = idist.analyze_point(pts[1], vol, chain, default_args(normal="points"))
+    assert not rec["evaluable"] and rec["non_evaluable_reasons"] == ["no_normal_supplied"]
     pts_all = idist.read_points(str(f), include_block_median=True)
-    assert [p["id"] for p in pts_all] == ["3_4", "3_5"]
+    assert [p["id"] for p in pts_all] == ["3_4", "3_5", "4_4"]
 
 
 def test_read_points_xyz(tmp_path):
@@ -161,3 +167,61 @@ def test_summary_and_wilson():
     lo, hi = s["wilson95_fraction_within"]
     assert lo < 0.6 < hi
     assert s["non_evaluable_reasons"] == {"no_qualifying_interface": 1}
+
+
+def test_wilson_known_values():
+    assert idist.wilson(123, 164) == pytest.approx([0.6785, 0.8100], abs=5e-4)
+    assert idist.wilson(97, 163) == pytest.approx([0.518, 0.667], abs=5e-4)
+    assert idist.wilson(0, 0) is None
+
+
+def test_anisotropic_chain_keeps_axes_apart(tmp_path):
+    # p_ref = (3x, 2y, 1z): a z<->x mix-up in the window or the chain reads the
+    # profile along (3,2,1) instead of (1,2,3) and moves D off the analytic 4
+    write_transform(tmp_path / "a.json", np.c_[np.diag([3.0, 2.0, 1.0]), np.zeros(3)])
+    chain, _ = idist.load_chain([str(tmp_path / "a.json")])
+    A = np.diag([1.0, 2.0, 3.0])  # the same map in z,y,x
+    n_ref = np.ones(3) / np.sqrt(3)
+    stretch = np.linalg.norm(A @ n_ref)  # reference voxels per point voxel along the normal
+    vol, n_ref, centre = slab_volume((60, 100, 140), n_ref, 4.0 * stretch)
+    pt = {"id": "p", "zyx": centre / np.diag(A), "normal_zyx": A @ n_ref / stretch}
+    rec = idist.analyze_point(pt, vol, chain, default_args(normal="points"))
+    assert rec["evaluable"], rec["non_evaluable_reasons"]
+    assert abs(rec["D_voxels"] - 4.0) <= 0.5
+
+
+def test_partial_masking_uses_raw_profile_in_points_mode(tmp_path):
+    write_transform(tmp_path / "id.json", np.c_[np.eye(3), np.zeros(3)])
+    chain, _ = idist.load_chain([str(tmp_path / "id.json")])
+    vol, n, c = slab_volume((64, 64, 64), (0.0, 0.0, 1.0), 2.0)
+    vol[:, 32:, 40:] = 0  # masked corner: x beyond s = 8 for points with y >= 32
+    args = default_args(normal="points", max_zero_fraction=0.1)
+    hit = idist.analyze_point({"id": "hit", "zyx": c + [0, 5, 0], "normal_zyx": n},
+                              vol, chain, args)
+    assert "masked_zero_fraction_exceeds_cap" in hit["non_evaluable_reasons"]
+    assert 0.1 < hit["masked_zero_fraction"] < 1.0
+    # this point's window also overlaps the masked corner; its profile does not
+    miss = idist.analyze_point({"id": "miss", "zyx": c - [0, 5, 0], "normal_zyx": n},
+                               vol, chain, args)
+    assert miss["evaluable"], miss["non_evaluable_reasons"]
+    assert abs(miss["D_voxels"] - 2.0) <= 0.5
+
+
+def test_main_end_to_end(tmp_path, monkeypatch):
+    write_transform(tmp_path / "id.json", np.c_[np.eye(3), np.zeros(3)])
+    vol, _, _ = slab_volume((64, 64, 64), (0.0, 0.0, 1.0), 2.0)
+    monkeypatch.setattr(idist, "open_reference", lambda path, level: vol)
+    (tmp_path / "pts.csv").write_text(
+        "id,x,y,z,nx,ny,nz\na,31.5,31.5,31.5,1,0,0\nb,31.5,31.5,31.5,,,\n")
+    out, out_csv = tmp_path / "out.json", tmp_path / "out.csv"
+    idist.main(["--points", str(tmp_path / "pts.csv"), "--step", str(tmp_path / "id.json"),
+                "--reference", "phantom", "--normal", "points", "--window", "20",
+                "--profile-half", "12", "--smooth-sigma", "1",
+                "--output", str(out), "--csv", str(out_csv)])
+    s = json.loads(out.read_text())["summary"]
+    assert set(s) == {"n_points", "n_evaluable", "threshold_voxels", "n_within_threshold",
+                      "fraction_within_threshold", "wilson95_fraction_within",
+                      "median_D_voxels", "non_evaluable_reasons"}
+    assert (s["n_points"], s["n_evaluable"], s["n_within_threshold"]) == (2, 1, 1)
+    assert s["non_evaluable_reasons"] == {"no_normal_supplied": 1}
+    assert len(out_csv.read_text().splitlines()) == 1 + 2  # header + one row per point

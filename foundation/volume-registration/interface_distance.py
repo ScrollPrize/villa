@@ -28,9 +28,12 @@ through the chain, smoothed, and a profile is read along the normal. The normal
 is either the one supplied with the point (``--normal points``) or the dominant
 structure-tensor direction of the window (``--normal volume``). ``|d/ds|`` of
 the profile is scanned for peaks with prominence at least ``--prominence`` of
-the maximum; ``D`` is the smallest ``|s|`` among them. A point is evaluable
-when enough of its window lies inside the reference, the normal is defined,
-and at least one qualifying peak exists.
+the maximum; ``D`` is the smallest ``|s|`` among them. A point is not
+evaluable when its window maps wholly outside the reference, when the masked
+(zero) fraction exceeds ``--max-zero-fraction`` (measured on the window with
+``--normal volume``, on the raw profile with ``--normal points``), when the
+normal is undefined, or when no qualifying peak exists. Voxels outside the
+reference read as zero, so a window partly outside is caught only by that cap.
 """
 from __future__ import annotations
 
@@ -47,7 +50,9 @@ from scipy.signal import find_peaks
 
 try:  # reuse the schema-validating reader when its dependencies are present
     from transform_utils import read_transform_json
-except ImportError:  # pragma: no cover - exercised only without SimpleITK
+# transform_utils imports SimpleITK, zarr and fsspec at load time and can fail
+# with errors other than ImportError (e.g. AttributeError in its fsspec fallback)
+except Exception:  # pragma: no cover - exercised only without its dependencies
     def read_transform_json(input_path, invert=False):
         with open(input_path) as f:
             data = json.load(f)
@@ -114,9 +119,9 @@ def read_points(path, fmt="auto", include_block_median=False):
             base = np.array([float(r["base_x"]), float(r["base_y"]), float(r["base_z"])])
             n = _unit(np.array([float(r["normal_x"]), float(r["normal_y"]),
                                 float(r["normal_z"])]))
-            if n is None:
-                continue
-            xyz = base + float(r.get("offset_from_plane", 0.0)) * n
+            # a zero-length or NaN normal keeps the row (scored as
+            # no_normal_supplied under --normal points); no offset can be applied
+            xyz = base if n is None else base + float(r.get("offset_from_plane", 0.0)) * n
             pid = f"{r.get('cell_row', i)}_{r.get('cell_col', '')}".rstrip("_")
             extra = {k: r[k] for k in ("region", "sampled_from", "center_layer",
                                        "half_width_layers") if k in r}
@@ -209,7 +214,7 @@ def analyze_point(pt, arr, chain, args):
                                     for dy in (-win, win) for dx in (-win, win)])
     qc = map_points_zyx(corners, chain, args.moving_offset_zyx)
     if np.any(qc.max(axis=0) < 0) or np.any(qc.min(axis=0) > np.array(arr.shape) - 1):
-        rec.update({"window_inside_reference": 0.0, "masked_zero_fraction": 1.0,
+        rec.update({"read_box_inside_reference": 0.0, "masked_zero_fraction": 1.0,
                     "D_voxels": None, "evaluable": False,
                     "non_evaluable_reasons": ["outside_reference"]})
         return rec
@@ -219,7 +224,7 @@ def analyze_point(pt, arr, chain, args):
     hi = np.ceil(qc.max(axis=0)).astype(int) + 3
     block, inside = read_block(arr, lo, hi)
     if not block.any():  # masked or empty region: nothing to resample
-        rec.update({"window_inside_reference": round(inside, 4),
+        rec.update({"read_box_inside_reference": round(inside, 4),
                     "masked_zero_fraction": 1.0, "D_voxels": None,
                     "evaluable": False,
                     "non_evaluable_reasons": ["masked_zero_fraction_exceeds_cap"]})
@@ -231,7 +236,7 @@ def analyze_point(pt, arr, chain, args):
     window = map_coordinates(block, (q - lo).T, order=1, mode="constant",
                              cval=0.0).reshape(n, n, n)
     smoothed = gaussian_filter(window, args.smooth_sigma)
-    rec["window_inside_reference"] = round(inside, 4)
+    rec["read_box_inside_reference"] = round(inside, 4)
     reasons = []
 
     if args.normal == "points":
@@ -363,7 +368,7 @@ def main(argv=None):
     Path(args.output).write_text(json.dumps(result, indent=1))
     if args.csv:
         keys = ["id", "evaluable", "D_voxels", "normal_source", "masked_zero_fraction",
-                "window_inside_reference", "region", "sampled_from"]
+                "read_box_inside_reference", "region", "sampled_from"]
         with open(args.csv, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(keys + ["point_z", "point_y", "point_x", "reasons"])
