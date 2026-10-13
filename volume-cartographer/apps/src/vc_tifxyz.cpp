@@ -198,7 +198,7 @@ int main(int argc, char* argv[]) {
     }
     surf->meta["area"] = area;
 
-    surf->save(output_path, true);
+    surf->saveAsNew(output_path, true);
     std::cout << "Saved transformed surface to: " << output_path << std::endl;
 
     return EXIT_SUCCESS;

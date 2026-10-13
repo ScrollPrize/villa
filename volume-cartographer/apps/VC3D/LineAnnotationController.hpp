@@ -42,6 +42,7 @@
 #include "vc/atlas/FiberIntersections.hpp"
 #include "vc/core/util/Umbilicus.hpp"
 #include "vc/core/util/ScrollUmbilicus.hpp"
+#include "vc/core/util/Uuid.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 

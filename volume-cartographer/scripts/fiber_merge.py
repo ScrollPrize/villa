@@ -59,6 +59,7 @@ overlapping edits. Callers keep pre-merge copies of every input.
 import copy
 import json
 import math
+import re
 
 POS_TOL = 1.0e-6
 LINE_POS_TOL = 1.0e-8
@@ -75,6 +76,16 @@ REVIEWED_TAG = 'reviewed'
 # ^ the human review verdict and vc_sync.py hfsync's default publish gate;
 #   keep the literal in sync with kReviewedTag in
 #   apps/VC3D/LineAnnotationFiberSegments.hpp.
+
+
+# Canonical 8-4-4-4-12 hex UUID text; mirrors vc::util::isUuid, which
+# parseVc3dFiberJson applies to a present top-level `uuid`.
+_UUID_RE = re.compile(
+    r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
+
+
+def is_canonical_uuid(value):
+    return isinstance(value, str) and _UUID_RE.fullmatch(value) is not None
 
 
 def _cp_position(value):
@@ -209,6 +220,10 @@ def is_fiber_doc(doc):
     if version not in (1, 3, 4):
         return False
     if version >= 3 and 'optimization_mode' not in doc:
+        return False
+    # The fiber's persistent identity is optional (legacy files lack it),
+    # but a present non-canonical value makes the file unloadable.
+    if 'uuid' in doc and not is_canonical_uuid(doc['uuid']):
         return False
     if 'optimization_mode' in doc:
         mode = doc['optimization_mode']
@@ -1160,6 +1175,20 @@ def merge_fibers(base, local, remote):
             result['conflicts'].append(
                 f"'{field}' differs between versions: {sorted(values)}")
             return result
+    # uuid is the fiber's persistent identity: two sides carrying different
+    # uuids are different fibers, never a newer/older pair to pick between.
+    # A side without one (legacy) adopts the other side's.
+    side_uuids = {doc['uuid'] for doc in (local, remote) if 'uuid' in doc}
+    if len(side_uuids) > 1:
+        result['conflicts'].append(
+            f"'uuid' differs between versions: {sorted(side_uuids)}")
+        return result
+    fiber_uuid = next(iter(side_uuids), None)
+
+    def keep_uuid(merged):
+        if fiber_uuid is not None:
+            merged['uuid'] = fiber_uuid
+        return merged
 
     # Short circuits: only one side truly changed, or both converged. The
     # winning content is a file VC3D itself wrote — normally consistent
@@ -1191,7 +1220,7 @@ def merge_fibers(base, local, remote):
         return doc
 
     if local == remote or remote == base:
-        merged = lineage_version(copy.deepcopy(local))
+        merged = keep_uuid(lineage_version(copy.deepcopy(local)))
         merged.setdefault('width_gap_fraction', 0.2)
         normal_defaults(merged)
         result.update(ok=True, merged=merged,
@@ -1201,7 +1230,7 @@ def merge_fibers(base, local, remote):
                              ["both sides identical"]))
         return result
     if local == base:
-        merged = lineage_version(copy.deepcopy(remote))
+        merged = keep_uuid(lineage_version(copy.deepcopy(remote)))
         merged.setdefault('width_gap_fraction', 0.2)
         normal_defaults(merged)
         result.update(ok=True, merged=merged,
@@ -1359,7 +1388,7 @@ def merge_fibers(base, local, remote):
         stats['cp_regions_remote'] = sum(1 for r in regions if r['owner'] == 'remote')
         stats['geometry_merged'] = bool(owners)
 
-    merged = copy.deepcopy(newer)
+    merged = keep_uuid(copy.deepcopy(newer))
     merged['control_points'] = copy.deepcopy(carrier['control_points'])
     merged['line_points'] = copy.deepcopy(carrier['line_points'])
     try:

@@ -9,6 +9,8 @@
 static const std::filesystem::path METADATA_FILE = "meta.json";
 static constexpr const char* OPEN_DATA_LAZY_PLACEHOLDER_KEY =
     "vc_open_data_lazy_placeholder";
+static constexpr const char* OPEN_DATA_REPRESENTATION_KEY =
+    "vc_open_data_representation";
 
 Segmentation::Segmentation(std::filesystem::path path)
     : path_(std::move(path))
@@ -38,12 +40,24 @@ void Segmentation::loadMetadata()
 
 std::string Segmentation::id() const
 {
+    // Open Data catalog caches name directories after upstream segment ids,
+    // which repeat across representations and volumes; those segments are
+    // keyed by their catalog representation id, kept in "uuid".
+    if (metadata_.contains(OPEN_DATA_REPRESENTATION_KEY)) {
+        return uuid();
+    }
+    const auto name = path_.filename();
+    return (name.empty() ? path_.parent_path().filename() : name).string();
+}
+
+std::string Segmentation::uuid() const
+{
     return metadata_["uuid"].get_string();
 }
 
-void Segmentation::setId(const std::string& newId)
+void Segmentation::setUuid(const std::string& newUuid)
 {
-    metadata_["uuid"] = newId;
+    metadata_["uuid"] = newUuid;
 }
 
 std::string Segmentation::name() const
@@ -149,6 +163,8 @@ std::shared_ptr<QuadSurface> Segmentation::loadSurface()
         // Create surface with metadata only; TIFF point data loads lazily
         // on first access (ensureLoaded). This avoids reading all TIFFs at startup.
         surface_ = std::make_shared<QuadSurface>(path_);
+        // Viewers look a surface up by its segment key.
+        surface_->id = id();
 
         // Load overlapping info (separate JSON, no TIFF I/O)
         surface_->readOverlappingJson();

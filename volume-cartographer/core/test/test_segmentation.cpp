@@ -44,7 +44,8 @@ TEST_CASE("Segmentation: New(path, uuid, name) writes a valid meta.json")
 {
     TmpSeg t;
     auto seg = Segmentation::New(t.dir, "abc-uuid", "myseg");
-    CHECK(seg->id() == "abc-uuid");
+    CHECK(seg->id() == t.dir.filename().string());
+    CHECK(seg->uuid() == "abc-uuid");
     CHECK(seg->name() == "myseg");
     CHECK(seg->path() == t.dir);
     CHECK(fs::exists(t.dir / "meta.json"));
@@ -75,20 +76,22 @@ TEST_CASE("Segmentation: load existing valid meta")
     TmpSeg t;
     writeMeta(t.dir, R"({"type":"seg","uuid":"u1","name":"n1","volume":""})");
     Segmentation seg(t.dir);
-    CHECK(seg.id() == "u1");
+    CHECK(seg.id() == t.dir.filename().string());
+    CHECK(seg.uuid() == "u1");
     CHECK(seg.name() == "n1");
 }
 
-TEST_CASE("Segmentation: setId / setName persist via saveMetadata")
+TEST_CASE("Segmentation: setUuid / setName persist via saveMetadata")
 {
     TmpSeg t;
     auto seg = Segmentation::New(t.dir, "u-original", "n-original");
-    seg->setId("u-new");
+    seg->setUuid("u-new");
     seg->setName("n-new");
     seg->saveMetadata();
 
     Segmentation reloaded(t.dir);
-    CHECK(reloaded.id() == "u-new");
+    CHECK(reloaded.id() == t.dir.filename().string());
+    CHECK(reloaded.uuid() == "u-new");
     CHECK(reloaded.name() == "n-new");
 }
 
@@ -114,7 +117,7 @@ TEST_CASE("Segmentation::ensureScrollSource sets missing fields and persists")
     // We can't easily inspect the raw json from outside; just verify no crash
     // and that a re-load works.
     Segmentation reloaded2(t.dir);
-    CHECK(reloaded2.id() == "u");
+    CHECK(reloaded2.uuid() == "u");
 }
 
 TEST_CASE("Segmentation: surface not loaded by default")
@@ -210,4 +213,38 @@ TEST_CASE("Segmentation: unloadSurface clears surface_")
     auto seg = Segmentation::New(t.dir, "u", "n");
     seg->unloadSurface();
     CHECK(seg->getSurface() == nullptr);
+}
+
+TEST_CASE("Segmentation: id is the directory name even when uuid differs")
+{
+    TmpSeg t;
+    writeMeta(t.dir, R"({"type":"seg","uuid":"0f8fad5b-d9cb-469f-a165-70867728950e","format":"tifxyz"})");
+    Segmentation seg(t.dir);
+    CHECK(seg.id() == t.dir.filename().string());
+    CHECK(seg.uuid() == "0f8fad5b-d9cb-469f-a165-70867728950e");
+    // A trailing separator still names the same directory.
+    Segmentation trailing(t.dir / "");
+    CHECK(trailing.id() == t.dir.filename().string());
+}
+
+TEST_CASE("Segmentation: Open Data catalog segments keep the representation id key")
+{
+    TmpSeg t;
+    writeMeta(t.dir, R"({"type":"seg","uuid":"representation-1","format":"tifxyz",
+                        "vc_open_data_representation":"published-transformed"})");
+    Segmentation seg(t.dir);
+    CHECK(seg.id() == "representation-1");
+}
+
+TEST_CASE("Segmentation: loaded surface carries the segment key")
+{
+    TmpSeg t;
+    writeMeta(t.dir, R"({"type":"seg","uuid":"representation-2","format":"tifxyz",
+                        "scale":[1.0,1.0],"tiff_dimensions":[16,8],
+                        "vc_open_data_lazy_placeholder":true,
+                        "vc_open_data_representation":"published-transformed"})");
+    Segmentation seg(t.dir);
+    auto surface = seg.loadSurface();
+    REQUIRE(surface);
+    CHECK(surface->id == "representation-2");
 }

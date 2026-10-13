@@ -496,7 +496,8 @@ void applyOriginalVolumeDownscale(const std::filesystem::path& segmentDir,
     vc::core::util::transformSurfacePoints(surface.get(), downscale, std::nullopt, 1.0);
     vc::core::util::refreshTransformedSurfaceState(surface.get());
     surface->meta["vc_open_data_coordinates_scaled_to_original_volume"] = downscale;
-    surface->save(segmentDir.string(), representationId, true);
+    surface->meta["uuid"] = representationId;
+    surface->save(segmentDir, true);
 }
 
 bool cachedMetadataNeedsNormalization(const std::filesystem::path& metaPath,
@@ -1296,9 +1297,7 @@ OpenDataSegmentMaterializationResult materializeOne(
             surface->meta["vc_open_data_source_coordinate_level"] = 0;
             surface->meta["vc_open_data_coordinate_space"] =
                 recipe.value("coordinate_space", std::string{});
-            surface->save(
-                tempDir.string(),
-                recipe.value("representation_id", std::string{}), true);
+            surface->save(tempDir, true);
         } else {
             throw std::runtime_error("unknown materialization recipe kind");
         }

@@ -7,7 +7,9 @@
 
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/types/Segmentation.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -936,5 +938,37 @@ TEST_CASE("VolumePkg canonicalizes virtual locators and deduplicates explicit ba
     CHECK(pkg->volumeEntries()[0].location == "s3://bucket/source.zarr");
     CHECK(pkg->volumeEntries()[1].location ==
           "https://bucket.s3.us-east-1.amazonaws.com/source.zarr#vc-base-scale=2");
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg: segments are keyed by directory name, not meta uuid")
+{
+    // A converted dataset gives each patch a random object uuid that differs
+    // from its directory; a copy may even share one. Neither may hide a
+    // segment or break directory-based lookups.
+    auto d = tmpDir("seg_uuid_keys");
+    auto writeSegMeta = [](const fs::path& segDir, const std::string& uuid) {
+        fs::create_directories(segDir);
+        std::ofstream f(segDir / "meta.json");
+        f << R"({"type":"seg","uuid":")" << uuid << R"(","format":"tifxyz"})";
+    };
+    const std::string shared = "0f8fad5b-d9cb-469f-a165-70867728950e";
+    writeSegMeta(d / "seg_a", shared);
+    writeSegMeta(d / "seg_b", shared);
+
+    auto p = VolumePkg::newEmpty();
+    REQUIRE(p->addSegmentsEntry(d.string()));
+    auto ids = p->segmentationIDs();
+    std::sort(ids.begin(), ids.end());
+    CHECK(ids == std::vector<std::string>{"seg_a", "seg_b"});
+    REQUIRE(p->segmentation("seg_a"));
+    CHECK(p->segmentation("seg_a")->uuid() == shared);
+
+    writeSegMeta(d / "seg_c", "a3bb189e-8bf9-4888-9912-ace4e6543002");
+    CHECK(p->addSingleSegmentation("seg_c"));
+    CHECK(p->segmentation("seg_c"));
+    CHECK(p->reloadSingleSegmentation("seg_c"));
+    CHECK(p->removeSingleSegmentation("seg_c"));
+
     fs::remove_all(d);
 }
