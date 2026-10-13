@@ -127,6 +127,132 @@ rclone copy :http: ./spiral_datasets/phercparis4 \
 
 Note that re-running rclone resumes interrupted downloads. For PHerc Paris 4, the dataset contains verified and unverified patches, tracks, fibers, the outer shell, winding annotation JSONs, the umbilicus, and the volume inputs — see the [dataset README](pathname:///data/datasets/spiral-input-PHercParis4-README.md) for the exact layout.
 
+#### Generating missing inputs
+
+The published dataset ships ready-made inputs, but for a new scroll — or a new region of one — some of them may not exist yet. This section covers the four machine-generated inputs that most often need to be built from scratch: **tracks**, **graph patches**, **fiber directions**, and **winding inference**. Build them in roughly that order: graph patches are grown from tracks, and winding inference needs an existing spiral fit to seed from.
+
+Unless noted, commands run from `villa/spiral-fitting` inside its `uv` environment. Every input has to be in the fit's own voxel frame (the same frame as the umbilicus, patches and `z_begin`/`z_end`), and should cover at least the z range you plan to fit — inputs outside the fit window are dropped at load.
+
+##### Tracks
+
+Tracks are skeletonized 2D curves through a binarized surface prediction, cut on regularly spaced horizontal (`h:`) and vertical (`vy:`/`vx:`) slabs. They live in a stdlib `dbm` database under `tracks/`.
+
+**1. Get a surface prediction.** Published surface predictions for each scroll are listed in the [data browser](data_browser) (look for `surface-prediction`), e.g. the thresholded [`surface_m7`](https://huggingface.co/scrollprize/surface_m7_nnunet) predictions under `s3://vesuvius-challenge-open-data/<scroll>/representations/predictions/surfaces/`. To make your own, run `vesuvius.predict` → `vesuvius.blend_logits` → `vesuvius.finalize_outputs --mode binary --threshold` (see the [vesuvius inference docs](https://github.com/ScrollPrize/villa/blob/main/vesuvius/docs/inference.md)). The extractor treats any value `> 0` as surface, so the prediction **must be thresholded**, and it expects a 3D `(Z, Y, X)` array.
+
+**2. Extract the tracks:**
+
+```bash
+.venv/bin/python extract_surface_tracks.py \
+    --predictions /path/to/surface-prediction.zarr/0 \
+    --out /path/to/dataset/tracks/<name>.dbm \
+    --z-min 4000 --z-max 17000
+```
+
+With a supported NVIDIA GPU (Linux x86-64, compute capability ≥ 8.0) this uses a fast GPU backend — a 4000-slice range takes seconds on a few H100s — and otherwise falls back to a much slower CPU skeletonizer (`--backend`, `--gpus` to choose). It also writes the packed `<name>.dbm.vctracks/` store the fit loads fastest. Runs resume: slabs already in the database are skipped.
+
+**3. Optionally, cache the track crossings** (the fit otherwise computes them in memory):
+
+```bash
+.venv/bin/python build_track_crossings.py /path/to/dataset/tracks/<name>.dbm
+```
+
+If the database isn't named `tracks/2um_ds2_ps256_surf_v2.dbm`, or there is more than one in `tracks/`, set `"paths": {"tracks_dbm": "tracks/<name>.dbm"}` in `spiral-scroll.json`. Tracks are off by default; enable them with `input_use_tracks` (see [the fit configuration](#the-fit-configuration)). The [spiral-fitting README](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/README.md#extracting-surface-tracks) has GPU requirements and timings.
+
+##### Graph patches
+
+Graph patches are `tifxyz` patches grown automatically from the tracks by [`grow_track_graph.py`](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/grow_track_graph.py): starting from a seed track, it grows a sheet across track crossings, accepting a step only where enough crossing tracks agree. They need both track sidecars from above — the `.vctracks` store and the `.crossings.npz` cache — built from the same database:
+
+```bash
+.venv/bin/python grow_track_graph.py \
+    /path/to/dataset/tracks/<name>.dbm.vctracks \
+    /path/to/dataset/tracks/<name>.dbm.crossings.npz \
+    /path/to/dataset/graph_patches \
+    --random-count 1000 --workers 16
+```
+
+`--random-count N` grows `N` patches from random long seed tracks (or pass explicit track rows with `--seeds`). Re-running into the same folder adds new patches and skips seeds already used. The same tool is available in VC3D under **Actions → Grow Track Patches...**, which runs the script for you and loads the results.
+
+Graph patches are machine-generated, not human-checked, but the fit has no separate input for them: they are read through the patches input, exactly like verified patches. Point the **Verified patches** path (`paths.verified_patches`) at the `graph_patches/` folder, or at a folder containing both sets.
+
+##### Fiber directions
+
+`fiber_directions.npz` holds sampled fiber orientations from a 3D fiber prediction. The loss only asks that the fitted sheet lie along the local fiber direction; it doesn't tie samples to a particular winding.
+
+**From an existing fiber prediction.** Fiber predictions for several scrolls are already published on the open-data bucket, under `<scroll>/representations/predictions/fibers/` (listed in the [data browser](data_browser)). Each prediction folder contains a `.lasagna.json` manifest, which is all the extractor needs. For PHerc. Paris 4:
+
+```bash
+aws s3 ls --no-sign-request \
+    s3://vesuvius-challenge-open-data/PHercParis4/representations/predictions/fibers/20260411134726-fibers-20260801084232-L1/
+```
+
+Pass the manifest's HTTPS URL to `fiber_direction_samples.py`, from `villa/spiral-fitting`. It downloads only the chunks that intersect the z range and writes the samples into the dataset:
+
+```bash
+.venv/bin/python fiber_direction_samples.py \
+    https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/representations/predictions/fibers/20260411134726-fibers-20260801084232-L1/PHercParis4-20260411134726-las-sd1-d74cca79.lasagna.json \
+    /path/to/dataset/fiber_directions.npz \
+    --z-roi 4000,17000 --output-scale 4 \
+    --presence-threshold 160 --cell-size 2
+```
+
+The manifest must be reachable over **HTTP(S)**; a local path won't work. `--z-roi` is half-open and in fit coordinates, and `--output-scale` is the number of full-resolution scan voxels per fit voxel (`4` for a fit at pyramid level `/2`, as for PHerc. Paris 4). Getting either wrong silently misplaces the samples, or leaves none inside the fit window. The fiber loss is off by default: set `input_use_fiber_directions` to `true` **and** `loss_weight_fiber_directions` above `0`.
+
+**If no fiber prediction exists**, run inference with the [`scrollprize/lasagna-fiber`](https://huggingface.co/scrollprize/lasagna-fiber) model. It writes `presence`, `nx` and `ny` channels plus a `.lasagna.json` manifest, and runs from the [lasagna](https://github.com/ScrollPrize/villa/tree/main/lasagna) environment:
+
+```bash
+cd villa/lasagna
+python3 scripts/bootstrap_venv.py --venv .venv --backend cu128
+source .venv/bin/activate
+
+hf download scrollprize/lasagna-fiber \
+    s1a_128_1_single_8x8_20260801_084232_best91_5k.pt --local-dir models/lasagna-fiber
+
+python -m vesuvius.neural_tracing.fiber_trace_3d.infer \
+    --input /path/to/volume.zarr/1 \
+    --output /path/to/predictions/fiber.lasagna.json \
+    --checkpoint models/lasagna-fiber/s1a_128_1_single_8x8_20260801_084232_best91_5k.pt \
+    --devices all --tile-size 512 --overlap 96 --border 32 \
+    --inference-scaledown-power 2
+```
+
+The repository holds two variants, and each must be paired with the input pyramid level it was trained on: the SD1 checkpoint above takes group `1` of a 2.4 µm scan, while the SD2 checkpoint (`s1a_128_2_single_..._best_25_9k.pt`) takes group `2`. On a ~9 µm scan, use the SD2 checkpoint on group `0`. The [model card](https://huggingface.co/scrollprize/lasagna-fiber) has the details, including how to fetch input volumes with `lasagna-download`.
+
+Then serve the prediction folder over HTTP (e.g. `python3 -m http.server` in `/path/to/predictions`, or upload it to a bucket) and run `fiber_direction_samples.py` on its manifest URL exactly as above.
+
+##### Winding inference
+
+`winding_inference/` is a compact store of winding crossings predicted by a neural winding model along rays through the scroll. It drives the default dense-spacing mode (`dense_spacing_mode: "winding_model"`), so **a dataset without it fails validation under the default settings**. To fit without it, set `"dense_spacing_mode": "grad_mag"` (which uses the gradient-magnitude volume instead) or `"input_use_winding_inference": false`.
+
+Generating it takes a winding model and an existing spiral fit, since the rays are seeded on that fit's windings — so a first fit in `grad_mag` mode is the usual starting point. A trained model is published as [`scrollprize/winding_model_9um`](https://huggingface.co/scrollprize/winding_model_9um):
+
+```bash
+hf download scrollprize/winding_model_9um ckpt_final.pth config.json --local-dir models/winding_model_9um
+```
+
+It was trained on ~9.6 µm volumes (2.4 µm scans at pyramid level `2`) from PHerc. 0139, PHerc. 1667 and PHerc. Paris 4, so run it on a volume at roughly that resolution. The tools live in [`vesuvius/src/vesuvius/neural_tracing/winding_models`](https://github.com/ScrollPrize/villa/tree/main/vesuvius/src/vesuvius/neural_tracing/winding_models) and run from a vesuvius environment.
+
+**1. Run the winding model along the fit**, writing a native phase cache:
+
+```bash
+python infer_winding_volume.py \
+    /path/to/run/checkpoint_fitted.ckpt winding_native_phase.zarr \
+    --model-ckpt models/winding_model_9um/ckpt_final.pth \
+    --reference-zarr /path/to/volume.zarr --volume-scale 0 \
+    --z-range 4000 17000 --winding-step 3 --seed-spacing 60 \
+    --gpus 0,1 --native-phase-only
+```
+
+The reference zarr's scale-0 grid defines the output coordinates, so use the volume the fit runs on. `--z-range` and `--winding-range` default to the fitted checkpoint's ranges. It also needs the scroll's `umbilicus.json` (`--umbilicus`, or found from the checkpoint's dataset). The cache is large — about 150 GB for all of PHerc. Paris 4.
+
+**2. Export the compact store** into the dataset:
+
+```bash
+python export_spiral_supervision.py winding_native_phase.zarr \
+    /path/to/dataset/winding_inference --workers 32
+```
+
+The export is restartable, refuses to overwrite an existing store, and `--validate /path/to/dataset/winding_inference` checks a finished one. [`NATIVE_PHASE_CACHE.md`](https://github.com/ScrollPrize/villa/blob/main/vesuvius/src/vesuvius/neural_tracing/winding_models/NATIVE_PHASE_CACHE.md) documents both steps and the store format. To train your own winding model, run `train_winding_model.py <config.json>` on volumes paired with existing segments or spiral fits; the published model's `config.json` is a working example.
+
 #### Configure
 
 Two separate things configure a run: **where the data is** — given on the command line, plus one file inside the dataset — and **how to fit it**, a flat set of named settings.
