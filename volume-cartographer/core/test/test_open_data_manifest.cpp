@@ -1920,6 +1920,10 @@ TEST_CASE("OpenDataSegmentCache editable copy inherits routing from an aggregate
         edited.meta["user_edit"] = "keep me";
         edited.save_meta();
         writeFile(editableSegment / "user-notes.txt", "keep me");
+        // Simulate a copy already visited before selecting its catalog source.
+        pkg->attachSegmentsEntry(editableRoot.string(), {}, true);
+        REQUIRE(pkg->segmentation("catalog-representation-id"));
+        pkg->attachSegmentsEntry(sourceRoot.string(), {}, true);
     }
     const auto originalX = std::filesystem::last_write_time(
         (legacyCopy ? editableSegment : sourceSegment) / "x.tif");
@@ -1950,6 +1954,7 @@ TEST_CASE("OpenDataSegmentCache editable copy inherits routing from an aggregate
     REQUIRE(surface);
     CHECK(surface->path == editableSegment);
     CHECK(surface->objectUuid() != "catalog-representation-id");
+    CHECK_FALSE(pkg->segmentation("catalog-representation-id"));
     CHECK_FALSE(surface->meta.contains("vc_open_data_representation"));
     CHECK(surface->meta["vc_open_data_coordinate_space"].get_string() == "sample/vol1@L0");
     const auto copiedUuid = surface->objectUuid();

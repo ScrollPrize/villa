@@ -2283,6 +2283,22 @@ void attachEditableOpenDataSegmentRoot(
     }
 
     pkg.attachSegmentsEntry(editableSegmentsRoot.string(), tags, select);
+    // A previously visited editable folder can still have Segmentation objects
+    // cached under their pre-migration catalog keys. Refresh only those copies.
+    if (select) {
+        for (const auto& id : pkg.segmentationIDs()) {
+            const auto segment = pkg.segmentation(id);
+            if (!segment || !segment->metadata().contains("vc_open_data_representation") ||
+                isOpenDataCatalogSegmentDirectory(segment->path())) {
+                continue;
+            }
+            const auto current = Segmentation::New(segment->path());
+            if (!current->metadata().contains("vc_open_data_representation")) {
+                pkg.removeSingleSegmentation(id);
+                pkg.addSingleSegmentation(current->id());
+            }
+        }
+    }
     std::string persistedLocation = editableSegmentsRoot.string();
     for (const auto& entry : pkg.segmentEntries()) {
         if (vc::project::isLocationRemote(entry.location)) {
