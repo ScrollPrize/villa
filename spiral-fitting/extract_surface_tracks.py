@@ -128,7 +128,9 @@ def skeletonize_kwargs():
     return dict(
         teasar_params={'scale': 1., 'const': 2.},
         anisotropy=(downsample_factor, downsample_factor, downsample_factor),  # skeletons therefore have not-downsampled coordinates
-        dust_threshold=dust_threshold,
+        # the skeletonizer counts voxels of the downsampled labels; dust_threshold is in full-res voxels
+        # (the same conversion prepare_cc_labels and the GPU backend's component filter use)
+        dust_threshold=max(1, dust_threshold // downsample_factor ** 3),
         fix_branching=True,
         fix_borders=True,
         fill_holes=False,
