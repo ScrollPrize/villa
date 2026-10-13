@@ -27,6 +27,8 @@ When opening a pull request, please follow the [pull request template](.github/p
 
 When reporting a problem or making a request, please follow the [issue template](.github/ISSUE_TEMPLATE/issue.md). It asks what you were trying to do, what happened, and the shortest evidence or reproduction needed to understand it.
 
+If possible, categorize the pull request/issue with a relevant label.
+
 ## AI Guidelines
 We support the use of LLMs as coding assistants, and we make broad use of them ourselves. However, because reviewing PRs takes a significant amount of time away from the goal of unrolling the scrolls, we have a few rules regarding llm assisted PRs:
 - PRs for bugfixes or improvements must come as a result of a human interacting with the codebase in an attempt to work on the scroll data. 
@@ -41,8 +43,13 @@ The codebase is constantly changing, and the python focused portions have comple
 tried to settle on using `uv` lockfiles with `pyproject.toml` in the primary subprojects (`ink-detection`, `volume-cartographer`, `vesuvius`, and `spiral-fitting`).
 it is highly recommended to use `uv`. 
 
-For these projects, moving into the dir with the `pyproject.toml` and using `uv sync` should get you up and running with a proper venv. in the case of `vesuvius` you
-may have to use `uv sync --all-extras`.
+After installing the target subproject's native prerequisites, run `uv sync` in
+the directory containing its `pyproject.toml` to create the Python environment.
+For `vesuvius`, select the extras you need, or use `uv sync --all-extras`.
+The `models` and `all` extras build the local `volume-cartographer` bindings from
+source, so they require its [native build dependencies](volume-cartographer/README.md#python-source-builds),
+including Qt6 Core development files even for headless use. `uv` does not install
+system C++ libraries.
 
 for VC3D `build_from_src_debian.sh` should handle the build, otherwise once you have the deps installed you can use cmake/Ninja to install from source
 

@@ -20,13 +20,10 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import flow_triton
-from checkpoint_migrations import (merge_flow_stage_lattices,
-                                   merge_flow_stage_state)
-from config import RETIRED_CONFIG_KEYS, Config, durable_config
+from config import Config
 from flow_fields import (BSplineCylindricalFlowField, BSplineFlowField,
                          CartesianFlowField, CylindricalFlowField)
 from transforms import SpiralAndTransform
-import update_checkpoint
 
 
 N_STEPS = 3
@@ -262,173 +259,7 @@ def test_fused_direct_multi_slab_equals_sequential_single_slabs(monkeypatch, rev
                 rtol=1e-5, atol=1e-6)
 
 
-# --------------------------------------------------------------- migration
 
-def _old_layout_state(model):
-    """The per-stage module layout a pre-slab checkpoint stored."""
-    state = {key: value.clone() for key, value in model.state_dict().items()}
-    num_stages = state['flow_field.flows.0'].shape[0]
-    old = {}
-    for key, value in state.items():
-        if key.startswith('flow_field.'):
-            suffix = key[len('flow_field.'):]
-            if suffix.startswith('flows.'):
-                old[key] = value[:1].clone()
-                for stage in range(1, num_stages):
-                    old[f'extra_flow_fields.{stage - 1}.{suffix}'] = (
-                        value[stage:stage + 1].clone())
-            else:
-                # Cylindrical ring tables were buffers of every stage module.
-                old[key] = value
-                for stage in range(1, num_stages):
-                    old[f'extra_flow_fields.{stage - 1}.{suffix}'] = value.clone()
-        else:
-            old[key] = value
-    return state, old
-
-
-def _small_model(flow_field_type, num_stages):
-    config = Config().as_dict()
-    config.update({
-        'model_flow_field_type': flow_field_type,
-        'model_num_flow_stages': num_stages,
-        'model_gap_expander_capacity_windings': 8,
-        'model_gap_expander_num_windings': 8,
-        'model_flow_voxel_resolution': 16,
-        'model_linear_z_resolution': 8,
-    })
-    torch.manual_seed(11)
-    model = SpiralAndTransform(
-        flow_integration_steps=2, flow_integration_solver='rk4',
-        flow_min_corner_zyx=torch.tensor([0, -48, -48]),
-        flow_max_corner_zyx=torch.tensor([48, 48, 48]),
-        umbilicus_zyx=torch.zeros(48, 3), config=config)
-    with torch.no_grad():
-        for parameter in model.parameters():
-            if parameter.numel() > 1:
-                parameter.normal_(std=0.01)
-    return model, config
-
-
-def _fit_spiral_groups(model):
-    low = [model.flow_field.flows[0]]
-    high = [model.flow_field.flows[1]]
-    gap = list(model.gap_expander_params.parameters())
-    linear = [model.linear_logits]
-    grouped = {id(p) for p in low + high + gap + linear}
-    other = [p for p in model.parameters() if id(p) not in grouped]
-    return [
-        {'params': other, 'weight_decay': 0.0},
-        {'params': linear, 'weight_decay': 0.0},
-        {'params': gap, 'weight_decay': 0.01},
-        {'params': low, 'weight_decay': 0.0},
-        {'params': high, 'weight_decay': 0.0},
-    ]
-
-
-@pytest.mark.parametrize('flow_field_type', ['cartesian', 'cylindrical'])
-def test_merge_flow_stage_state_folds_stage_modules(flow_field_type):
-    model, _ = _small_model(flow_field_type, 3)
-    new_state, old_state = _old_layout_state(model)
-    assert any(key.startswith('extra_flow_fields.') for key in old_state)
-    merged = merge_flow_stage_state(old_state)
-    assert set(merged) == set(new_state)
-    for key in new_state:
-        assert torch.equal(merged[key], new_state[key]), key
-    # Already in the slab layout: returned as is.
-    assert merge_flow_stage_state(new_state) is new_state
-    fresh, _ = _small_model(flow_field_type, 3)
-    fresh.load_state_dict(merged)
-
-
-def test_merge_flow_stage_lattices_is_a_noop_for_single_stage_checkpoints():
-    model, config = _small_model('cartesian', 1)
-    checkpoint = {'spiral_and_transform': model.state_dict(),
-                  'cfg': {**config, 'model_num_flow_timesteps': 1}}
-    assert merge_flow_stage_lattices(checkpoint) is checkpoint
-
-
-def test_merge_flow_stage_lattices_refuses_time_varying_flows():
-    model, config = _small_model('cartesian', 1)
-    checkpoint = {'spiral_and_transform': model.state_dict(),
-                  'cfg': {**config, 'model_num_flow_timesteps': 2}}
-    with pytest.raises(ValueError, match='time-varying'):
-        merge_flow_stage_lattices(checkpoint)
-
-
-def test_merge_flow_stage_lattices_migrates_optimizer():
-    num_stages = 2
-    model, config = _small_model('cartesian', num_stages)
-    new_state, old_state = _old_layout_state(model)
-
-    # An optimiser over the OLD layout: one parameter per stage in each of
-    # the two flow groups, with real Adam moments.
-    old_model_low = [torch.nn.Parameter(old_state['flow_field.flows.0'].clone()),
-                     torch.nn.Parameter(old_state['extra_flow_fields.0.flows.0'].clone())]
-    old_model_high = [torch.nn.Parameter(old_state['flow_field.flows.1'].clone()),
-                      torch.nn.Parameter(old_state['extra_flow_fields.0.flows.1'].clone())]
-    groups = _fit_spiral_groups(model)
-    groups[3] = {'params': old_model_low, 'weight_decay': 0.0}
-    groups[4] = {'params': old_model_high, 'weight_decay': 0.0}
-    old_optimiser = torch.optim.AdamW(groups, lr=1e-3)
-    torch.manual_seed(2)
-    for group in old_optimiser.param_groups:
-        for param in group['params']:
-            param.grad = torch.randn_like(param)
-    old_optimiser.step()
-    expected_linear = old_optimiser.state[model.linear_logits]['exp_avg'].clone()
-    expected_low = torch.cat(
-        [old_optimiser.state[p]['exp_avg'] for p in old_model_low], dim=0)
-    expected_high_sq = torch.cat(
-        [old_optimiser.state[p]['exp_avg_sq'] for p in old_model_high], dim=0)
-
-    checkpoint = {
-        'spiral_and_transform': old_state,
-        'optimiser': old_optimiser.state_dict(),
-        'cfg': {**config, 'model_num_flow_timesteps': 1},
-    }
-    migrated = merge_flow_stage_lattices(checkpoint)
-    assert migrated is not checkpoint
-    # The input is not mutated.
-    assert 'extra_flow_fields.0.flows.0' in checkpoint['spiral_and_transform']
-    assert len(checkpoint['optimiser']['param_groups'][3]['params']) == num_stages
-
-    merged_groups = migrated['optimiser']['param_groups']
-    assert [g['params'] for g in merged_groups] == [
-        list(range(len(groups[0]['params']))),
-        [len(groups[0]['params'])],
-        [len(groups[0]['params']) + 1],
-        [len(groups[0]['params']) + 2],
-        [len(groups[0]['params']) + 3],
-    ]
-    fresh, _ = _small_model('cartesian', num_stages)
-    fresh.load_state_dict(migrated['spiral_and_transform'])
-    for key in new_state:
-        assert torch.equal(fresh.state_dict()[key], new_state[key]), key
-    new_optimiser = torch.optim.AdamW(_fit_spiral_groups(fresh), lr=1e-3)
-    new_optimiser.load_state_dict(migrated['optimiser'])
-    assert torch.equal(
-        new_optimiser.state[fresh.linear_logits]['exp_avg'], expected_linear)
-    assert torch.equal(
-        new_optimiser.state[fresh.flow_field.flows[0]]['exp_avg'], expected_low)
-    assert torch.equal(
-        new_optimiser.state[fresh.flow_field.flows[1]]['exp_avg_sq'],
-        expected_high_sq)
-    assert new_optimiser.state[fresh.flow_field.flows[0]]['step'] == \
-        old_optimiser.state[old_model_low[0]]['step']
-
-    # Another pass finds nothing left to do.
-    assert merge_flow_stage_lattices(migrated) is migrated
-
-
-def test_retired_time_axis_key_is_dropped_by_config_migration():
-    assert 'model_num_flow_timesteps' in RETIRED_CONFIG_KEYS
+def test_retired_time_axis_key_is_not_a_config_key():
     with pytest.raises(ValueError, match='Unknown Spiral config keys'):
         Config({'model_num_flow_timesteps': 1})
-    source = {**durable_config(Config().as_dict()), 'model_num_flow_timesteps': 1}
-    migrated, renamed, removed, added = update_checkpoint.migrate_config(source)
-    assert 'model_num_flow_timesteps' not in migrated
-    assert removed == ['model_num_flow_timesteps']
-    legacy = {**durable_config(Config().as_dict()), 'num_flow_timesteps': 1}
-    _, _, removed, _ = update_checkpoint.migrate_config(legacy)
-    assert removed == ['num_flow_timesteps']

@@ -512,8 +512,7 @@ Render the geometry against the scroll's native 9.362&nbsp;µm volume with `vc_r
 
 ```bash
 vc_render_tifxyz \
-  --volume volume-cache/20250728140407.zarr \
-  --remote-url s3://vesuvius-challenge-open-data/PHerc0139/volumes/20250728140407-9.362um-1.2m-113keV-masked.zarr/ \
+  --volume s3://vesuvius-challenge-open-data/PHerc0139/volumes/20250728140407-9.362um-1.2m-113keV-masked.zarr/ \
   --segmentation ink-dataset/pherc0139/w035/w035.tifxyz \
   --zarr-output ink-dataset/pherc0139/w035/w035_9um.zarr \
   --scale 1 --group-idx 0 --num-slices 28 \
@@ -522,7 +521,7 @@ vc_render_tifxyz \
   --flip-normals
 ```
 
-* `--remote-url` takes the S3 volume; `--volume` names a local directory where fetched chunks are cached, so only the parts of the scroll your segment touches ever get downloaded. `--voxel-size` and `--voxel-unit` record the physical metadata the remote volume can't provide.
+* `--volume` takes the S3 volume directly and streams it; fetched chunks persist in VC3D's shared remote cache (`~/.VC3D/remote_cache` by default), so only the parts of the scroll your segment touches ever get downloaded, and a second render of the same area reuses them. `--voxel-size` and `--voxel-unit` record the physical metadata the remote volume can't provide.
 * `--flip-normals` reproduces the depth orientation of the published renders and the training labels; for your own segment the orientation is unknown, which is what `--direction both` at inference time is for.
 
 For w035 this takes about five minutes and writes a ~900&nbsp;MB Zarr:

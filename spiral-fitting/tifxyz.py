@@ -11,6 +11,8 @@ from einops import rearrange
 import torch.nn.functional as F
 from dataclasses import dataclass, field
 
+from surface_orientation import METADATA_KEY as ORIENTATION_METADATA_KEY, GridLayout, export_metadata
+
 
 def interpolate_quad_triangles(tl, tr, bl, br, di, dj):
     """Interpolate the two triangles used by Patch.project (di/dj end in 1)."""
@@ -449,11 +451,12 @@ def load_tifxyz(path, *, z_range=None, skip_empty=False):
                  erosion_cells_override)
 
 
-def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source):
+def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source, *, layout_metadata=None):
     """Write a NEW tifxyz surface to ``path/uuid``.
 
     ``uuid`` names the directory only; meta.json gets a fresh random
-    identity, never one derived from the name.
+    identity, never one derived from the name. ``layout_metadata`` describes
+    the export layout of the supplied grid.
     """
     path = f'{path}/{uuid}'
     os.makedirs(path, exist_ok=True)
@@ -469,17 +472,20 @@ def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source):
         if valid_vertex.any()
         else [[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]]
     )
+    metadata = {
+        'scale': [1 / step_size, 1 / step_size],
+        'bbox': bbox,
+        'area_vx2': area_vx2,
+        'area_cm2': area_vx2 * voxel_size_um ** 2 / 1.e8,
+        'format': 'tifxyz',
+        'type': 'seg',
+        'uuid': str(uuid4()),
+        'source': source,
+    }
+    if layout_metadata is not None:
+        metadata[ORIENTATION_METADATA_KEY] = layout_metadata
     with open(f'{path}/meta.json', 'w') as f:
-        json.dump({
-            'scale': [1 / step_size, 1 / step_size],
-            'bbox': bbox,
-            'area_vx2': area_vx2,
-            'area_cm2': area_vx2 * voxel_size_um ** 2 / 1.e8,
-            'format': 'tifxyz',
-            'type': 'seg',
-            'uuid': str(uuid4()),
-            'source': source,
-        }, f, indent=4)
+        json.dump(metadata, f, indent=4)
     return True
 
 
@@ -491,6 +497,7 @@ def save_combined_tifxyz(
     voxel_size_um,
     source,
     *,
+    z_direction_is_top_to_bottom,
     first_winding=10,
     cleanup_erosion_cells=None,
     base_shape_zyx=None,
@@ -498,9 +505,14 @@ def save_combined_tifxyz(
     """Atomically write consecutive winding grids as one QuadSurface.
 
     ``winding_zyxs`` is a mapping from integer winding id to equally tall
-    ``[z, theta, 3]`` ZYX float arrays. Winding ranges use half-open column
-    bounds for display filtering, but they are not QuadSurface components:
-    adjacent windings remain joined by quads across their shared seam.
+    ``[z, theta, 3]`` ZYX float arrays in spiral order. They are laid side by
+    side innermost first and the whole grid is then put in the export layout
+    (surface_orientation) for ``z_direction_is_top_to_bottom``, so the
+    outermost winding comes first. Winding ranges use
+    half-open column bounds, in the written grid, for display filtering, but
+    they are not QuadSurface components: adjacent windings remain joined by
+    quads across their shared seam. ``winding_column_ranges`` pairs with
+    ``component_winding_ids`` and runs left to right.
     """
     import os
     import shutil
@@ -573,6 +585,11 @@ def save_combined_tifxyz(
             "component_connectivity": 4,
             "components_after_erosion": int(component_count),
         }
+    width = combined.shape[1]
+    combined = GridLayout.export(z_direction_is_top_to_bottom).apply(combined)
+    # Reversing the columns puts the windings outermost first.
+    components = [[width - end, width - begin] for begin, end in reversed(components)]
+    component_ids = ids[::-1]
     destination = os.path.abspath(os.fspath(path))
     parent = os.path.dirname(destination)
     os.makedirs(parent, exist_ok=True)
@@ -611,9 +628,10 @@ def save_combined_tifxyz(
             "uuid": str(uuid4()),
             "source": source,
             "winding_column_ranges": components,
-            "component_winding_ids": ids,
+            "component_winding_ids": component_ids,
             "output_first_winding": ids[0],
             "output_last_winding": ids[-1],
+            ORIENTATION_METADATA_KEY: export_metadata(z_direction_is_top_to_bottom),
         }
         if base_shape_zyx is not None:
             metadata["base_shape_zyx"] = base_shape_zyx
@@ -633,8 +651,9 @@ def save_combined_tifxyz(
             "first_winding": ids[0],
             "last_winding": ids[-1],
             "winding_column_ranges": components,
-            "winding_ids": ids,
+            "winding_ids": component_ids,
             "voxel_size_um": float(voxel_size_um),
+            ORIENTATION_METADATA_KEY: export_metadata(z_direction_is_top_to_bottom),
             "manifest_path": os.path.join(destination, "manifest.json"),
         }
         if base_shape_zyx is not None:

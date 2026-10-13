@@ -40,6 +40,137 @@ import AwardedTotal from '@site/src/components/AwardedTotal';
 
 Vesuvius Challenge has awarded **<AwardedTotal />** in prizes since the competition started in 2023! This page lists all the prizes awarded so far.
 
+### \$50,000 First Letters: PHerc. 343 (October, 2026)
+
+**Goal:** Find 10 letters within a 4 cm² area of a scroll where nothing has been read yet.
+
+<div className="flex flex-row flex-wrap">
+  <PrizeCard
+    href="https://github.com/Nieuwlaar/pherc343-first-letters"
+    prizeAmount="$50,000"
+    title="Winner"
+    description="Erwin Nieuwlaar found the text πᾶν τὸ γινόμε[νον, “everything that happens / is generated” deep inside PHerc. 343"
+    mediaSrc="/img/firstletters/pherc0343-nieuwlaar.webp"
+    mediaAlt="Ink detected in PHerc. 343 by Erwin Nieuwlaar, shown in yellow over the dimmed CT"
+    wide
+  />
+</div>
+
+### \$40,500 Progress Prizes (September 2026)
+
+**Goal:** Improve the tools and training methods needed to read the scrolls.
+
+<div className="flex flex-row flex-wrap">
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pull/1930">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$20,000</div><span className="font-semibold">Automated fiber extraction</span>: Samir Lerognon / @qualzz</div>
+    <div className="text-sm text-dim">Fine-tunes existing fiber models on data from more scrolls, fits splines to the predicted fibers, and integrates the results with VC3D and the spiral fitter.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/Hob3rMallow/scrollfiesta_public">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$5,000</div><span className="font-semibold">ScrollFiesta pipeline</span>: Ben Kyles / @hari_seldon and team</div>
+    <div className="text-sm text-dim">The ScrollFiesta pipeline now produces very clean surfaces over reasonably large areas of scrolls.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/DomRusso2/reader-v2">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$5,000</div><span className="font-semibold">reader-v2 ink model</span>: Domenico Russo / @klavis223</div>
+    <div className="text-sm text-dim">An ink model distilled onto native 9.6 µm volumes, now seeing wide use in the community.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/huanghoujing/PLatS">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">PLatS</span>: Houjing Huang</div>
+    <div className="text-sm text-dim">An interesting segmentation approach that trains a model to learn an instance embedding of papyrus sheets.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/tf-kelly/scrolls">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">Assigning patches to windings</span>: Thomas Kelly / @thomas_35601</div>
+    <div className="text-sm text-dim">A promising approach to assigning surface patches to global windings.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/SuperOptimizer/volume-compressor">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">volcomp</span>: Forrest McDonald / @forrest</div>
+    <div className="text-sm text-dim">A chunked compressor for scroll CT and model predictions, now supported in VC3D.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://dl.ash2txt.org/community-uploads/yupeng/">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$500</div><span className="font-semibold">Full-scroll inferences</span>: Yupeng Tang / @ytang454</div>
+    <div className="text-sm text-dim">Ran full-scroll inferences with several team and community surface models.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/AlexeyDrobkovStrikesBack/herculaneum-umbilici">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$500</div><span className="font-semibold">Scroll umbilici</span>: Aleksei Drobkov / @alyalya1404</div>
+    <div className="text-sm text-dim">Produced umbilici for several prize scrolls.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/khj1222/vesuvius-challenge">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$500</div><span className="font-semibold">Ink detection experiments</span>: Hyojun Kwon</div>
+    <div className="text-sm text-dim">Various ink detection experiments with manual and pseudo labels, measuring cross-scroll generalisation and more.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/sergeievland/windaudit">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$500</div><span className="font-semibold">Winding consistency checks</span>: Sergei Evland</div>
+    <div className="text-sm text-dim">Spotted a non-trivial issue in find-inconsistent-windings, and built a tool that makes checking winding constraint consistency easier.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/slchicoineau-creator/probeguide">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$500</div><span className="font-semibold">ProbeGuide</span>: Sebastien Chicoineau</div>
+    <div className="text-sm text-dim">An experiment on the benefit of filtering ink pseudo-labels by DINO feature similarity.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pull/1905">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$500</div><span className="font-semibold">Renderer memory fix</span>: Christopher William Scheirer / @Chris Scheirer</div>
+    <div className="text-sm text-dim">Makes the renderer load only the chunks actually needed along the surface, greatly reducing memory use.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ArcheyChen/vesuvius-eligible-scouting">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$500</div><span className="font-semibold">Faster Hecate inference</span>: Junfeng Lu / @Ausar</div>
+    <div className="text-sm text-dim">Faster Hecate inference, plus fine-tuning ink models and detailed comparisons.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pull/1821">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$500</div><span className="font-semibold">Lighter ink training tutorial</span>: Marcel Gwerder / @mg02346</div>
+    <div className="text-sm text-dim">Makes the ink training tutorial download just the data needed to train (2.4 GB instead of 92 GB), plus other fixes.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/Jashann/vesuvius-scrolling">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$500</div><span className="font-semibold">Winding annotation tool</span>: Jashanjot Singh Gill and Nhat Nam Tran</div>
+    <div className="text-sm text-dim">A tool generating winding annotations for the spiral fitter.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pulls?q=is%3Apr+is%3Amerged+author%3ACVasilopoulos+created%3A2026-09-01..2026-09-30">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Assorted villa PRs</span>: Christos Vasilopoulos / @chrisvas_12645</div>
+    <div className="text-sm text-dim">Several useful merged villa PRs.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pulls?q=is%3Apr+is%3Amerged+author%3Akadenpool+created%3A2026-09-01..2026-09-30">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Assorted villa PRs</span>: Kaden Pool / @thatguybrodie</div>
+    <div className="text-sm text-dim">Five merged villa PRs, including correcting the ink model's input layer selection.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pulls?q=is%3Apr+is%3Amerged+author%3Aspelufo+created%3A2026-09-01..2026-09-30">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Assorted villa PRs</span>: Santiago Pelufo / @spelufo</div>
+    <div className="text-sm text-dim">Several useful merged villa PRs.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/Alex55288/inkbench">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Ink ensembling</span>: Alex Clark</div>
+    <div className="text-sm text-dim">Small quantitative improvements to ink detection via ensembling.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pulls?q=is%3Apr+is%3Amerged+author%3Anerln+created%3A2026-09-01..2026-09-30">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Assorted villa PRs</span>: Eugenio Giuseppe Nerelli / @nerln</div>
+    <div className="text-sm text-dim">Five merged villa PRs.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pulls?q=is%3Apr+is%3Amerged+author%3Ajonmarrs+created%3A2026-09-01..2026-09-30">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Assorted villa PRs</span>: Jonathan Marrs / @martian87</div>
+    <div className="text-sm text-dim">Assorted useful merged villa PRs.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pull/1570">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Horizontal flip in VC3D</span>: Sebastien Andersson</div>
+    <div className="text-sm text-dim">Adds horizontal flip to VC3D's rotation preview.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pull/1873">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Lasagna on Windows</span>: Armando Gaona de Stefani / @Armando_Gaona</div>
+    <div className="text-sm text-dim">Windows support fixes for Lasagna.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pull/1696">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Spiral fitting & ink on Windows</span>: Shuhan Yang / @qizhiran</div>
+    <div className="text-sm text-dim">Windows support for the spiral fitting, flattening and ink workflows.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/Mickey123123/vesuvius-native-supervision-isolation">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Ink training leakage fix</span>: Miika Kestilä</div>
+    <div className="text-sm text-dim">Fixes a data-leakage bug in 3D ink training.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/bnleft/first-light-pherc0211">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Spiralising PHerc. 0211</span>: Bryant Le</div>
+    <div className="text-sm text-dim">Spiralised and released a significant length of PHerc. 0211, plus a merged PR.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://huggingface.co/scrollprize/hecate/discussions/1">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Single-pass Hecate</span>: Ryan Gurganious / @DarthCeltic85 and Daine Ball / @Clexious</div>
+    <div className="text-sm text-dim">Makes Hecate predict in a single pass, for a ~35% speedup.</div>
+  </a>
+</div>
+
 ### \$31,000 Progress Prizes (August 2026)
 
 **Goal:** Improve the tools and training methods needed to read the scrolls.

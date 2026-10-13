@@ -65,12 +65,12 @@ def test_legacy_checkpoint_preserves_transform_and_strict_loading(capsys):
     state = model.state_dict()
     state['shell_outer_winding_param'] = torch.tensor(130.)
     saved_cfg = dict(cfg, optimizer_reset_interval=0)
-    saved_cfg.pop('loss_weight_anchor')
+    saved_cfg.pop('loss_weight_patch_radius')
     checkpoint = dict(cfg=saved_cfg, spiral_and_transform=state, z_begin=0, z_end=64)
     fit_cfg, scroll, _, lo, hi = build_fit_inputs(
         checkpoint, '/unused/patches', [], 8, 56, '/unused/umbilicus.json')
     assert 'optimizer_reset_interval' not in fit_cfg
-    assert fit_cfg['loss_weight_anchor'] == cfg['loss_weight_anchor']
+    assert fit_cfg['loss_weight_patch_radius'] == cfg['loss_weight_patch_radius']
     assert 'optimizer_reset_interval' in capsys.readouterr().out
     assert (lo, hi) == (0, 64)
     context = SimpleNamespace(

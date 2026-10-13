@@ -26,6 +26,7 @@
 #include <QPushButton>
 #include <QRandomGenerator>
 #include <QRegularExpression>
+#include <QSignalBlocker>
 #include <QSettings>
 #include <QStandardPaths>
 #include <QUrl>
@@ -169,6 +170,10 @@ SpiralServiceManager::SpiralServiceManager(QObject* parent) : QObject(parent)
 
 SpiralServiceManager::~SpiralServiceManager()
 {
+    // The owner's destructor has already disconnected while its widgets were
+    // alive; by now receivers may hold dangling pointers, so release resources
+    // without notifying anyone.
+    const QSignalBlocker blocker(this);
     disconnectFromService();
 }
 
@@ -790,7 +795,6 @@ void SpiralServiceManager::uploadCheckpointForResume(
 }
 
 void SpiralServiceManager::runIterations(int iterations,
-                                         const QJsonObject& influenceConfig,
                                          const QJsonObject& runConfig,
                                          const QJsonObject& dtLossSchedule,
                                          const QJsonObject& previewSchedule)
@@ -803,7 +807,7 @@ void SpiralServiceManager::runIterations(int iterations,
     // necessarily partial path view here can only create a false mismatch
     // (for example, winding_inference has no editable panel row).
     QJsonObject body = vc3d::spiralRunRequest(
-        configuration, iterations, influenceConfig, dtLossSchedule,
+        configuration, iterations, dtLossSchedule,
         _sessionRevision, previewSchedule);
     body[QStringLiteral("command_id")] = commandId();
     postWithRetry(

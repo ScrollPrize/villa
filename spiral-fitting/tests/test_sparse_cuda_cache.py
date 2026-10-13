@@ -12,8 +12,7 @@ import zarr
 import lasagna_data
 from pack_resident_pools import _make_chunk_reader, pack_arrays, sidecar_path
 from lasagna_data import ensure_fit_sparse_stores
-from sdt_losses import sample_sdt_trilinear
-from sparse_cuda_cache import ResidentBrickPool, SparseScalarStore
+from sparse_cuda_cache import ResidentBrickPool
 
 
 def write_array(path, data):
@@ -104,22 +103,17 @@ def test_fit_builds_missing_sparse_stores_and_reports_progress(tmp_path):
     nx = tmp_path / 'nx.ome.zarr'
     ny = tmp_path / 'ny.ome.zarr'
     grad = tmp_path / 'grad.ome.zarr'
-    sdt = tmp_path / 'sdt.ome.zarr'
     for root in (nx, ny, grad):
         write_raw_pack_source(root / '4', data)
-    write_raw_pack_source(sdt / '1', data)
 
     progress = RecordingProgress()
     kwargs = dict(
         use_normals=True,
         use_spacing=True,
-        use_sdt=True,
         normal_nx_zarr_path=str(nx),
         normal_ny_zarr_path=str(ny),
         grad_mag_zarr_path=str(grad),
         normal_zarr_group='4',
-        sdt_zarr_path=str(sdt),
-        sdt_zarr_group='1',
         progress=progress,
     )
     ensure_fit_sparse_stores(**kwargs)
@@ -127,15 +121,13 @@ def test_fit_builds_missing_sparse_stores_and_reports_progress(tmp_path):
     expected = [
         sidecar_path(str(nx), '4', pair=True),
         sidecar_path(str(grad), '4'),
-        sidecar_path(str(sdt), '1'),
     ]
     assert all((Path(path) / 'meta.json').is_file() for path in expected)
     assert [stage for _, stage, _ in progress.begins] == [
         'Building Lasagna normal sparse store',
         'Building Lasagna gradient sparse store',
-        'Building surface-distance sparse store',
     ]
-    assert len(progress.finishes) == 3
+    assert len(progress.finishes) == 2
     assert progress.updates
     assert all(update[1]['total_steps'] > 0 for update in progress.updates)
 
@@ -260,7 +252,7 @@ def test_pack_ct_mask_zeroes_and_drops_bricks(tmp_path):
 
     rng = np.random.default_rng(3)
     data = rng.integers(1, 255, size=(32, 32, 32), dtype=np.uint8)
-    store = write_array(tmp_path / 'sdt', data)
+    store = write_array(tmp_path / 'scalar', data)
     # CT at half resolution (ratio 2): zero except one occupied corner region,
     # so only target voxels [0:16, 0:16, 0:16] survive the mask.
     ct = np.zeros((16, 16, 16), dtype=np.uint8)
@@ -286,46 +278,3 @@ def test_pack_ct_mask_zeroes_and_drops_bricks(tmp_path):
     assert int(inside[0, 0]) == int(data[3, 3, 3])
     assert outside[:, 0].tolist() == [0, 0]
 
-
-def test_sparse_sdt_sampling_matches_dense(tmp_path):
-    x = np.arange(70, dtype=np.float32)
-    encoded = (
-        np.clip(np.rint(np.abs(x - 35.0) - 2.0), -127, 127) + 128
-    ).astype(np.uint8)
-    data = np.broadcast_to(encoded, (6, 6, 70)).copy()
-    pool = make_pool(tmp_path, [data], 'sdt')
-    dense = {
-        "backend": "dense_test",
-        "kind": "sdt",
-        "volume": torch.from_numpy(data),
-        "z_origin": 0,
-        "scale_zyx": (1.0, 1.0, 1.0),
-        "unit": 1.0,
-        "offset": 128,
-        "cap": 127.0,
-        "shape": data.shape,
-        "fingerprint": {},
-    }
-    sparse = {
-        **dense,
-        "backend": "sparse_cuda",
-        "store": SparseScalarStore(pool),
-    }
-    sparse.pop("volume")
-    points_dense = (
-        torch.rand([256, 3]) * torch.tensor([4.0, 4.0, 68.0]) + 0.5
-    ).requires_grad_(True)
-    points_sparse = points_dense.detach().clone().requires_grad_(True)
-    dense_value, dense_valid, dense_corners = sample_sdt_trilinear(
-        dense, points_dense
-    )
-    sparse_value, sparse_valid, sparse_corners = sample_sdt_trilinear(
-        sparse, points_sparse
-    )
-    torch.testing.assert_close(sparse_value, dense_value)
-    torch.testing.assert_close(sparse_valid, dense_valid)
-    torch.testing.assert_close(sparse_corners, dense_corners)
-
-    dense_value.sum().backward()
-    sparse_value.sum().backward()
-    torch.testing.assert_close(points_sparse.grad, points_dense.grad)

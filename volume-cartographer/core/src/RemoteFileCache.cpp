@@ -2,6 +2,7 @@
 #include "vc/core/util/S3AuthFallback.hpp"
 
 #include "utils/http_fetch.hpp"
+#include "utils/sftp_fetch.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -49,7 +50,11 @@ std::filesystem::path checkedDestination(const RemoteFileCacheOptions& options)
     if (relative.empty() || *relative.begin() == "..")
         throw std::invalid_argument("remote file cache destination escapes cache root");
 
-    const auto root = std::filesystem::absolute(options.cacheRoot).lexically_normal();
+    auto root = std::filesystem::absolute(options.cacheRoot).lexically_normal();
+    // A root written with a trailing separator ("/cache/") ends in an empty
+    // element that no payload path contains; compare against the directory.
+    if (!root.has_filename() && root.has_relative_path())
+        root = root.parent_path();
     const auto payload = (root / relative).lexically_normal();
     auto mismatch = std::mismatch(root.begin(), root.end(), payload.begin(), payload.end());
     if (mismatch.first != root.end())
@@ -310,6 +315,7 @@ std::string remoteFileCacheSource(std::string_view sourceLocation)
 {
     const auto suffix = sourceLocation.find_first_of("?#");
     auto source = std::string(sourceLocation.substr(0, suffix));
+    if (utils::is_sftp_url(source)) source = utils::canonical_sftp_url(source);
     while (!source.empty() && source.back() == '/')
         source.pop_back();
     if (source.empty())
@@ -344,12 +350,14 @@ std::filesystem::path remoteFileCachePath(std::string_view sourceLocation)
     const auto authority = std::string_view(source).substr(
         authorityStart,
         pathStart == std::string::npos ? std::string::npos : pathStart - authorityStart);
-    if (!validComponent(authority))
+    const auto cacheAuthority = utils::is_sftp_url(source)
+        ? utils::sftp_cache_authority(source) : std::string(authority);
+    if (!validComponent(cacheAuthority))
         throw std::invalid_argument("remote file cache source has an invalid authority");
 
     std::filesystem::path result = "remote_sources";
     result /= scheme;
-    result /= authority;
+    result /= cacheAuthority;
     if (pathStart == std::string::npos || pathStart + 1 == source.size())
         throw std::invalid_argument("remote file cache source requires an object path");
     std::string_view remaining(source.data() + pathStart + 1,

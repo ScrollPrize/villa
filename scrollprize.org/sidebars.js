@@ -41,6 +41,11 @@ const sidebars = {
         { type: 'doc', id: 'tutorial_spiral' },
         { type: 'doc', id: 'winding_annotations' },
         { type: 'doc', id: 'tutorial5' },
+        {
+          type: 'link',
+          label: 'Scroll Anatomy',
+          href: 'https://github.com/ScrollPrize/villa/blob/main/SCROLL_ANATOMY.md',
+        },
       ],
     },
     {

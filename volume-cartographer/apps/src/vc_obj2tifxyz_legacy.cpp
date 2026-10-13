@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <limits>
 #include <cmath>
+#include <cstdlib>
 
 
 
@@ -18,6 +19,9 @@ struct Vertex {
 struct UV {
     cv::Vec2f coord;
 };
+
+// How determineGridDimensions gets the UV-to-3D scale (voxels per UV unit) that sizes the grid
+enum class ScaleMethod { Median, Mean, Manual };
 
 struct Face {
     int v[3];  // vertex indices
@@ -100,7 +104,8 @@ public:
         return !vertices.empty() && !faces.empty() && !uvs.empty();
     }
     
-    void determineGridDimensions(float step = 20.0f) {
+    void determineGridDimensions(float step = 20.0f, ScaleMethod method = ScaleMethod::Median,
+                                 cv::Vec2d manual_scale = cv::Vec2d(1.0, 1.0)) {
         step_size = step;
 
         // Find UV bounds from all UVs used in faces
@@ -111,6 +116,8 @@ public:
         // For each triangle, compute the Jacobian of the mapping to get stretch in U and V
         double sum_scale_u = 0.0, sum_scale_v = 0.0;
         double sum_weight = 0.0;
+        // per triangle norms and UV areas, for an area weighted median (robust to a few stretched triangles)
+        std::vector<std::pair<double, double>> norms_u, norms_v;
 
         for (const auto& face : faces) {
             // Check valid indices
@@ -170,17 +177,42 @@ public:
             sum_scale_u += scale_u * uv_area;
             sum_scale_v += scale_v * uv_area;
             sum_weight += uv_area;
+            norms_u.emplace_back(scale_u, uv_area);
+            norms_v.emplace_back(scale_v, uv_area);
         }
 
-        // Average scale factors
-        double avg_scale_u = (sum_weight > 0) ? sum_scale_u / sum_weight : 1.0;
-        double avg_scale_v = (sum_weight > 0) ? sum_scale_v / sum_weight : 1.0;
+        // Scale factors: area weighted median (default), area weighted mean (the behaviour before
+        // the median), or the value given on the command line
+        auto weighted_median = [](std::vector<std::pair<double, double>>& v, double fallback) {
+            if (v.empty()) return fallback;
+            std::sort(v.begin(), v.end());
+            double total = 0.0;
+            for (const auto& e : v) total += e.second;
+            double acc = 0.0;
+            for (const auto& e : v) {
+                acc += e.second;
+                if (acc >= 0.5 * total) return e.first;
+            }
+            return v.back().first;
+        };
+        const double mean_scale_u = (sum_weight > 0) ? sum_scale_u / sum_weight : 1.0;
+        const double mean_scale_v = (sum_weight > 0) ? sum_scale_v / sum_weight : 1.0;
+        double avg_scale_u = mean_scale_u, avg_scale_v = mean_scale_v;
+        if (method == ScaleMethod::Median) {
+            avg_scale_u = weighted_median(norms_u, mean_scale_u);
+            avg_scale_v = weighted_median(norms_v, mean_scale_v);
+        } else if (method == ScaleMethod::Manual) {
+            avg_scale_u = manual_scale[0];
+            avg_scale_v = manual_scale[1];
+        }
 
         cv::Vec2f uv_range = uv_max - uv_min;
 
         std::cout << "UV bounds: [" << uv_min[0] << ", " << uv_min[1] << "] to ["
                   << uv_max[0] << ", " << uv_max[1] << "]" << std::endl;
-        std::cout << "Directional scales: U=" << avg_scale_u << ", V=" << avg_scale_v << std::endl;
+        std::cout << "Directional scales ("
+                  << (method == ScaleMethod::Median ? "median" : method == ScaleMethod::Mean ? "mean" : "manual")
+                  << "): U=" << avg_scale_u << ", V=" << avg_scale_v << std::endl;
 
         // Compute full voxel resolution
         double full_res_u = uv_range[0] * avg_scale_u;
@@ -306,16 +338,24 @@ private:
 int main(int argc, char *argv[])
 {
     if (argc < 3) {
-        std::cout << "usage: " << argv[0] << " <input.obj> <output_directory> [step_size] [--uuid=<id>]" << std::endl;
+        std::cout << "usage: " << argv[0] << " <input.obj> <output_directory> [step_size] [--uuid=<id>]"
+                  << " [--scale-method=median|mean | --uv-scale=<s>[,<sv>]]" << std::endl;
         std::cout << "Converts an OBJ file to tifxyz format" << std::endl;
         std::cout << std::endl;
         std::cout << "Parameters:" << std::endl;
         std::cout << "  step_size: UV units per grid cell (default: 20)" << std::endl;
         std::cout << "             Scale will be 1/step_size (default: 0.05)" << std::endl;
         std::cout << "  --uuid=<id>: Metadata UUID. Defaults to a fresh random UUID." << std::endl;
+        std::cout << "  --scale-method=median|mean: how the UV-to-3D scale (voxels per UV unit) that sizes" << std::endl;
+        std::cout << "             the grid is estimated from the mesh: area weighted median of the per" << std::endl;
+        std::cout << "             triangle Jacobian norms (default, robust to a few stretched triangles)" << std::endl;
+        std::cout << "             or area weighted mean (the behaviour before the median)" << std::endl;
+        std::cout << "  --uv-scale=<s> or <su>,<sv>: give the UV-to-3D scale instead of estimating it" << std::endl;
+        std::cout << "             (manual method; for U and V, or one value for both)" << std::endl;
         std::cout << std::endl;
         std::cout << "Example: " << argv[0] << " mesh.obj output_dir" << std::endl;
         std::cout << "Example: " << argv[0] << " mesh.obj output_dir 10" << std::endl;
+        std::cout << "Example: " << argv[0] << " mesh.obj output_dir 4 --uv-scale=0.2" << std::endl;
         return EXIT_SUCCESS;
     }
 
@@ -323,6 +363,9 @@ int main(int argc, char *argv[])
     std::filesystem::path output_dir = argv[2];
     float step_size = 20.0f;
     std::string uuid_override;
+    ScaleMethod scale_method = ScaleMethod::Median;
+    bool method_given = false, uv_scale_given = false;
+    cv::Vec2d manual_scale(1.0, 1.0);
 
     bool consumed_step_size = false;
     for (int i = 3; i < argc; ++i) {
@@ -333,6 +376,35 @@ int main(int argc, char *argv[])
                 std::cerr << "Invalid value for --uuid (must be non-empty)" << std::endl;
                 return EXIT_FAILURE;
             }
+            continue;
+        }
+        if (arg.rfind("--scale-method=", 0) == 0) {
+            const std::string m = arg.substr(std::string("--scale-method=").size());
+            if (m == "median") scale_method = ScaleMethod::Median;
+            else if (m == "mean") scale_method = ScaleMethod::Mean;
+            else {
+                std::cerr << "Invalid value for --scale-method (median or mean): " << m << std::endl;
+                return EXIT_FAILURE;
+            }
+            method_given = true;
+            continue;
+        }
+        if (arg.rfind("--uv-scale=", 0) == 0) {
+            const std::string v = arg.substr(std::string("--uv-scale=").size());
+            const auto comma = v.find(',');
+            char* end_u = nullptr;
+            char* end_v = nullptr;
+            const std::string su = v.substr(0, comma);
+            const std::string sv = (comma == std::string::npos) ? su : v.substr(comma + 1);
+            manual_scale[0] = std::strtod(su.c_str(), &end_u);
+            manual_scale[1] = std::strtod(sv.c_str(), &end_v);
+            if (su.empty() || sv.empty() || *end_u != '\0' || *end_v != '\0' ||
+                !(manual_scale[0] > 0) || !(manual_scale[1] > 0) ||
+                !std::isfinite(manual_scale[0]) || !std::isfinite(manual_scale[1])) {
+                std::cerr << "Invalid value for --uv-scale (one or two positive numbers): " << v << std::endl;
+                return EXIT_FAILURE;
+            }
+            uv_scale_given = true;
             continue;
         }
         if (consumed_step_size) {
@@ -346,6 +418,12 @@ int main(int argc, char *argv[])
         }
         consumed_step_size = true;
     }
+
+    if (method_given && uv_scale_given) {
+        std::cerr << "--scale-method and --uv-scale are exclusive" << std::endl;
+        return EXIT_FAILURE;
+    }
+    if (uv_scale_given) scale_method = ScaleMethod::Manual;
 
     if (!std::filesystem::exists(obj_path)) {
         std::cerr << "Input file does not exist: " << obj_path << std::endl;
@@ -366,7 +444,7 @@ int main(int argc, char *argv[])
     }
 
     // Determine grid dimensions from UV coordinates
-    converter.determineGridDimensions(step_size);
+    converter.determineGridDimensions(step_size, scale_method, manual_scale);
 
     // Create quad surface
     QuadSurface* surf = converter.createQuadSurface();

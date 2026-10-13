@@ -71,7 +71,12 @@ counts reflect real branch transport (and whole windings on multi-winding patche
 instead of being thrown off by the wild theta swings of invalid regions. The
 endpoints (annotated point / seed) are spliced onto the path's ends so the delta
 is between the true points. The residual unwrapped shifted-radius gap is retained
-as a diagnostic, but propagation uses the integer seam-crossing delta.
+as a diagnostic, but propagation uses the integer seam-crossing delta. A strip
+starts and ends at an annotated point's *attachment* on the patch (its on_patch
+ij), which can lie across theta=0 from the point itself, so the branch transport
+of that short step is counted on the pcl side: relative edges are expressed
+between the two points' attachments, and absolute anchors carry it as
+attachment_branch_delta.
 
 Before constructing graph edges, same-winding fiber attachments are checked
 against the first contact with each patch. Transport follows the complete fiber
@@ -356,9 +361,7 @@ def build_fit_inputs(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_
     # This analysis needs no scroll volume, track store, or outer shell:
     # leaving those paths empty keeps load_host_inputs() from touching the
     # training-only inputs. Legacy role-less PCL specs (role=None) retain the
-    # historical abs_winding.json basename inference. Attachment is over the
-    # verified patch set only, so the (slow, unrelated) unverified patches
-    # are skipped; they don't change the cross-patch / attached pcl set.
+    # historical abs_winding.json basename inference.
     # Fibers are same-winding annotations: when loaded they classify as 'neither'
     # pcls (delta-0 cross-patch edges), exactly like same_windings.json. Off
     # unless a fibers dir is passed.
@@ -398,8 +401,7 @@ def build_transform(checkpoint, cfg, context, model_z_begin, model_z_end, *, dev
         spiral_outward_sense=context.spiral_outward_sense,
     )
     model.to(device)
-    model_state = dict(fs.merge_flow_stage_lattices(
-        checkpoint)['spiral_and_transform'])
+    model_state = dict(checkpoint['spiral_and_transform'])
     # Older fits learned a shell-loss winding index. It is not part of the
     # slice->spiral transform and is no longer a model parameter. Keep strict
     # loading for every other key so missing/incompatible geometry still fails.
@@ -942,8 +944,9 @@ def build_rel_adjacency(cross_patch_pcls, patches, transform, dr, attachment_del
     departure point (`from_ij`) on this patch, the arrival point (`to_ij`) on
     the neighbour, and the edge's winding delta = wind_a(arrival) -
     wind_a(departure), corrected for any theta=0 seam crossings accumulated
-    along the chain between the two points (through unattached points and, for
-    merged components, fiber-hopping junctions). Only consecutive pairs are
+    along the chain between the two points' attachments (through unattached
+    points and, for merged components, fiber-hopping junctions), so the delta
+    is expressed where the within-patch strips end. Only consecutive pairs are
     used, so the edge set stays a chain through the pcl's points; more distant
     patches are reached transitively by BFS."""
     adjacency = {}

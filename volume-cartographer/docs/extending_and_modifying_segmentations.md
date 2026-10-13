@@ -15,6 +15,7 @@ The captures below were made with an earlier build using sample `PHerc0800`, seg
 **prerequisites** 
 - you must have computed normal grids in the volpkg directory stored as `/path/to/example.volpkg/normal_grids/`
   - to compute these, run `/path/to/build/bin/vc_compute_normal_grids` , use the help option to see the options (or just enter it without any arguments)
+  - a store published under a URL can be streamed instead of copied: create the local directory you pass as the grid path and write `normal-grids-remote.json` into it, containing `{"url": "https://.../....normal-grids"}`; the loader then fetches each slice it needs on demand and caches it there. VC3D writes that file when you pick a remote store in its Open Data dialog; on the command line there is no flag for it, so write it by hand.
 - you must have the latest branch of volume-cartographer checked out (as this contains major changes that are required for this to work)
 - you must have an existing patch or sgementation, or create one using the seeding widget
 

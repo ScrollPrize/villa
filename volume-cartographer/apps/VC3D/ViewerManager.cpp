@@ -1,4 +1,5 @@
 #include "ViewerManager.hpp"
+#include "OpenDataCoordinateIdentity.hpp"
 #include "OpenDataSegmentCache.hpp"
 
 #include "AxisAlignedSliceController.hpp"
@@ -50,16 +51,6 @@ Q_LOGGING_CATEGORY(lcViewerManager, "vc.viewer.manager")
 #define VC3D_DEBUG_QCINFO(category) if (!DebugLoggingEnabled()) {} else qCInfo(category)
 
 namespace {
-
-std::string coordinateSpaceTag(const VolumePkg& pkg, const std::string& volumeId)
-{
-    constexpr std::string_view prefix = "vc-open-data-coordinate-space:";
-    for (const auto& tag : pkg.volumeTags(volumeId)) {
-        if (tag.rfind(prefix, 0) == 0)
-            return tag.substr(prefix.size());
-    }
-    return {};
-}
 
 QString compactViewerLabel(const std::string& surfaceName, const QString& title)
 {
@@ -466,6 +457,9 @@ void ViewerManager::unregisterViewer(VolumeViewerBase* viewer)
         return;
     }
 
+    if (_pendingLinkedCursorSource == viewer) {
+        _pendingLinkedCursorSource = nullptr;
+    }
     emit baseViewerClosing(viewer);
     if (_segmentationModule) {
         _segmentationModule->detachViewer(viewer);
@@ -1127,11 +1121,8 @@ void ViewerManager::setHighlightedSurfaceIds(const std::vector<std::string>& ids
 void ViewerManager::setOverlayVolume(std::shared_ptr<Volume> volume, const std::string& volumeId)
 {
     if (volume && _state && _state->vpkg()) {
-        const auto baseSpace = coordinateSpaceTag(
-            *_state->vpkg(), _state->currentVolumeId());
-        const auto overlaySpace = coordinateSpaceTag(*_state->vpkg(), volumeId);
-        if ((!baseSpace.empty() || !overlaySpace.empty()) &&
-            (baseSpace.empty() || baseSpace != overlaySpace)) {
+        if (!vc3d::opendata::overlayCoordinatesCompatible(
+                *_state->vpkg(), _state->currentVolumeId(), volumeId)) {
             Logger()->warn(
                 "Rejected volume overlay '{}' because its explicit coordinate space does not match '{}'.",
                 volumeId, _state->currentVolumeId());
@@ -1995,6 +1986,32 @@ void ViewerManager::broadcastLinkedCursor(VolumeViewerBase* source,
     if (!_mirrorCursorToSegmentation && point.has_value()) {
         return;
     }
+    _pendingLinkedCursorSource = source;
+    _pendingLinkedCursorPoint = point;
+    if (!point.has_value()) {
+        // Clears (cursor left a viewer, mirroring turned off) apply at once and
+        // supersede any point still waiting for the timer.
+        flushLinkedCursor();
+        return;
+    }
+    if (!_linkedCursorTimer) {
+        _linkedCursorTimer = new QTimer(this);
+        _linkedCursorTimer->setSingleShot(true);
+        _linkedCursorTimer->setInterval(16);  // ~one global render tick
+        connect(_linkedCursorTimer, &QTimer::timeout, this, [this]() { flushLinkedCursor(); });
+    }
+    if (!_linkedCursorTimer->isActive()) {
+        _linkedCursorTimer->start();
+    }
+}
+
+void ViewerManager::flushLinkedCursor()
+{
+    if (_linkedCursorTimer) {
+        _linkedCursorTimer->stop();
+    }
+    auto* source = _pendingLinkedCursorSource;
+    const auto point = _pendingLinkedCursorPoint;
     forEachBaseViewer([source, &point](VolumeViewerBase* viewer) {
         if (viewer != source) {
             viewer->setLinkedCursorVolumePoint(point);

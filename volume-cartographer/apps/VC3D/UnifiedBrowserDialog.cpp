@@ -1,4 +1,7 @@
 #include "UnifiedBrowserDialog.hpp"
+#include "utils/sftp_fetch.hpp"
+#include <QCheckBox>
+#include <QKeyEvent>
 
 #include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
@@ -48,6 +51,8 @@ bool isValidRemoteUri(const QString& uri)
     return scheme == QLatin1String("s3")
         || scheme.startsWith(QLatin1String("s3+"))
         || scheme == QLatin1String("http")
+        || scheme == QLatin1String("sftp")
+        || scheme == QLatin1String("ssh")
         || scheme == QLatin1String("https");
 }
 
@@ -59,7 +64,13 @@ bool remoteUriLooksLikeDirectory(const QString& uri)
 
 QString withTrailingSlash(QString s)
 {
-    if (!s.endsWith('/')) s += '/';
+    // A directory slash belongs to the path, not a signed query or selector.
+    auto end = s.size();
+    for (const auto delimiter : {'?', '#'}) {
+        const auto pos = s.indexOf(delimiter);
+        if (pos >= 0) end = std::min(end, pos);
+    }
+    if (end == 0 || s[end - 1] != '/') s.insert(end, '/');
     return s;
 }
 
@@ -69,23 +80,30 @@ QString stripTrailingSlash(QString s)
     return s;
 }
 
-// Convert local absolute path -> file:// URI.
+// Convert local absolute path -> a standards-compliant file: URI.
+// QUrl owns the platform details here: notably, UNC paths keep their server
+// authority instead of being flattened into an ordinary slash-prefixed path.
 QString pathToFileUri(const QString& absPath, bool isDir)
 {
-    QString out = QStringLiteral("file://") + absPath;
+    const QString normalized = QDir::fromNativeSeparators(absPath);
+    QString out = QUrl::fromLocalFile(normalized).toString();
     if (isDir) out = withTrailingSlash(out);
     return out;
 }
 
-// Convert any incoming URI/path to a normalized form for the given mode.
-//   Local mode: returns absolute path (no scheme).
-//   Remote mode: returns URL with trailing slash.
+// Convert any incoming URI/path to the normalized local-path form used by
+// QFileInfo/QDir.  QUrl::toLocalFile preserves a file://server/share UNC
+// authority as //server/share, while fromNativeSeparators accepts paths pasted
+// with Windows backslashes (including \\wsl.localhost\...).
 QString fileUriToPath(QString uri)
 {
-    if (uri.startsWith(QLatin1String("file://"), Qt::CaseInsensitive)) {
-        return uri.mid(7);
+    if (uri.startsWith(QLatin1String("file:"), Qt::CaseInsensitive)) {
+        const QUrl parsed(uri);
+        if (parsed.isLocalFile()) {
+            return QDir::fromNativeSeparators(parsed.toLocalFile());
+        }
     }
-    return uri;
+    return QDir::fromNativeSeparators(uri);
 }
 
 struct S3Location {
@@ -330,6 +348,7 @@ UnifiedBrowserDialog::UnifiedBrowserDialog(QWidget* parent)
     connect(_upButton, &QPushButton::clicked,
             this, &UnifiedBrowserDialog::onUpClicked);
     _pathBar = new QLineEdit();
+    _pathBar->installEventFilter(this);
     _pathBar->setPlaceholderText(tr("Path or URL — paste anything"));
     connect(_pathBar, &QLineEdit::textEdited, this, [this]() {
         _pathBarEdited = true;
@@ -351,6 +370,11 @@ UnifiedBrowserDialog::UnifiedBrowserDialog(QWidget* parent)
     connect(_list, &QListWidget::itemSelectionChanged,
             this, &UnifiedBrowserDialog::onItemSelectionChanged);
     layout->addWidget(_list);
+    _showHidden = new QCheckBox(tr("Show hidden files"), this);
+    layout->addWidget(_showHidden);
+    connect(_showHidden, &QCheckBox::toggled, this, [this]() {
+        if (_mode == Mode::Local) navigateLocal(_currentLocalDir);
+    });
 
     // Status
     _status = new QLabel();
@@ -385,14 +409,20 @@ void UnifiedBrowserDialog::setHint(const QString& text)
     }
 }
 
-void UnifiedBrowserDialog::setStartUri(const QString& uri)
+void UnifiedBrowserDialog::setStartUri(const QString& uri, bool isFile)
 {
     if (uri.isEmpty()) return;
     const QString trimmed = uri.trimmed();
     const Mode m = detectModeFromUri(trimmed);
     if (m == Mode::Remote) {
         _remoteRadio->setChecked(true);
-        navigateRemote(withTrailingSlash(trimmed));
+        if (isFile && _acceptsFiles) {
+            navigateRemote(trimmed.left(trimmed.lastIndexOf('/') + 1));
+            _pathBar->setText(trimmed);
+            _pathBarEdited = true;
+        } else {
+            navigateRemote(withTrailingSlash(trimmed));
+        }
     } else {
         _localRadio->setChecked(true);
         QString p = fileUriToPath(trimmed);
@@ -404,7 +434,7 @@ void UnifiedBrowserDialog::setStartUri(const QString& uri)
 
 UnifiedBrowserDialog::Mode UnifiedBrowserDialog::detectModeFromUri(const QString& uri)
 {
-    if (stringStartsWithAny(uri, {"s3://", "s3+", "http://", "https://"})) return Mode::Remote;
+    if (stringStartsWithAny(uri, {"s3://", "s3+", "http://", "https://", "sftp://", "ssh://"})) return Mode::Remote;
     return Mode::Local;
 }
 
@@ -430,6 +460,18 @@ void UnifiedBrowserDialog::onPathBarReturn()
     handleTypedPath(text, false);
 }
 
+bool UnifiedBrowserDialog::eventFilter(QObject* watched, QEvent* event)
+{
+    if (watched == _pathBar && event->type() == QEvent::KeyPress) {
+        const auto* key = static_cast<QKeyEvent*>(event);
+        if (key->key() == Qt::Key_Return || key->key() == Qt::Key_Enter) {
+            onPathBarReturn();
+            return true; // Do not also activate the dialog's default Open button.
+        }
+    }
+    return QDialog::eventFilter(watched, event);
+}
+
 void UnifiedBrowserDialog::onUpClicked()
 {
     if (_mode == Mode::Local) {
@@ -451,18 +493,22 @@ void UnifiedBrowserDialog::onUpClicked()
 
 void UnifiedBrowserDialog::navigateLocal(const QString& absDir)
 {
-    _currentLocalDir = absDir;
-    _pathBar->setText(absDir);
+    const QString normalizedDir = QDir::fromNativeSeparators(absDir);
+    _currentLocalDir = normalizedDir;
+    _pathBar->setText(normalizedDir);
     _pathBarEdited = false;
     _list->clear();
 
-    QDir d(absDir);
+    QDir d(normalizedDir);
     if (!d.exists()) {
         _status->setText(tr("No such directory"));
         return;
     }
 
     QDir::Filters filters = QDir::AllEntries | QDir::NoDotAndDotDot;
+    // Let Qt honor native hidden-file semantics, including Windows attributes;
+    // a dot-prefixed filename alone is not hidden on Windows.
+    if (_showHidden->isChecked()) filters |= QDir::Hidden;
     auto entries = d.entryInfoList(filters, QDir::Name | QDir::DirsFirst);
 
     QRegularExpression filterRe;
@@ -498,6 +544,7 @@ void UnifiedBrowserDialog::navigateLocal(const QString& absDir)
 
 bool UnifiedBrowserDialog::ensureRemoteAuth(const QString& probeUrl)
 {
+    if (utils::is_sftp_url(probeUrl.toStdString())) return true;
     if (_authResolved && probeUrl == _authProbeUrl) return true;
     if (!_authResolver) {
         // No resolver — proceed with empty auth (works for fully public buckets).
@@ -528,6 +575,7 @@ void UnifiedBrowserDialog::navigateRemote(const QString& urlPrefix)
     _status->setText(tr("Loading..."));
 
     const bool hasScheme =
+        utils::is_sftp_url(_currentRemoteUrl.toStdString()) ||
         _currentRemoteUrl.startsWith(QLatin1String("s3://"), Qt::CaseInsensitive)
         || _currentRemoteUrl.startsWith(QLatin1String("s3+"), Qt::CaseInsensitive)
         || _currentRemoteUrl.startsWith(QLatin1String("http://"), Qt::CaseInsensitive)
@@ -537,8 +585,8 @@ void UnifiedBrowserDialog::navigateRemote(const QString& urlPrefix)
         return;
     }
 
-    if (!parseS3Url(_currentRemoteUrl)) {
-        _status->setText(tr("Browsing is available for s3:// buckets. Paste a full URL and click Open to attach it directly."));
+    if (!parseS3Url(_currentRemoteUrl) && !utils::is_sftp_url(_currentRemoteUrl.toStdString())) {
+        _status->setText(tr("Browsing is available for s3:// buckets and sftp:// hosts. Paste a full URL and click Open to attach it directly."));
         return;
     }
 
@@ -587,6 +635,13 @@ void UnifiedBrowserDialog::navigateRemote(const QString& urlPrefix)
             : tr("%1 items; more available").arg(shown));
     });
     watcher->setFuture(QtConcurrent::run([url = _currentRemoteUrl, auth = _auth]() {
+        if (utils::is_sftp_url(url.toStdString())) {
+            RemoteListResult result;
+            for (const auto& entry : utils::list_sftp_directory(url.toStdString()))
+                result.entries.push_back({QString::fromStdString(entry.name),
+                    QString::fromStdString(entry.url), entry.directory});
+            return result;
+        }
         return listS3Prefix(url, auth);
     }));
 }

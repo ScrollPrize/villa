@@ -13,6 +13,33 @@
 
 namespace vc3d::opendata {
 
+inline std::string coordinateSpaceTag(const std::vector<std::string>& tags)
+{
+    constexpr std::string_view prefix = "vc-open-data-coordinate-space:";
+    for (const auto& tag : tags) {
+        if (tag.rfind(prefix, 0) == 0)
+            return tag.substr(prefix.size());
+    }
+    return {};
+}
+
+constexpr bool coordinateSpaceTagsCompatible(std::string_view base,
+                                             std::string_view overlay)
+{
+    // Missing tags use the ordinary local-volume overlay convention. Reject
+    // only explicit conflicts; this predicate does not alter sampling scales.
+    return base.empty() || overlay.empty() || base == overlay;
+}
+
+inline bool overlayCoordinatesCompatible(const VolumePkg& pkg,
+                                         const std::string& baseId,
+                                         const std::string& overlayId)
+{
+    return coordinateSpaceTagsCompatible(
+        coordinateSpaceTag(pkg.volumeTags(baseId)),
+        coordinateSpaceTag(pkg.volumeTags(overlayId)));
+}
+
 struct CoordinateIdentity {
     std::string coordinateSpace;
     std::string sourcePath;

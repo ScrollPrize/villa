@@ -293,7 +293,7 @@ private:
     };
     QHash<QString, PendingBrushPatch> _pendingBrushPatches;
     QHash<QString, QString> _brushProvisionalPaths;
-    QSet<QString> _unverifiedBrushIds;
+    QSet<QString> _uncommittedBrushPatchIds;
     QHash<QString, QString> _pendingPointCollectionPaths;
     QHash<QString, QString> _pointCollectionProvisionalPaths;
     QSet<QString> _uncommittedPointCollectionIds;

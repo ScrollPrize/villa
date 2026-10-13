@@ -7,13 +7,11 @@ Loading it is a single sequential read per channel instead of tens of
 thousands of demand-fills through tensorstore, and a fully resident pool never
 evicts, so the per-step LRU thrash disappears entirely.
 
-CT masking: the surf-SDT builder zeroes the *surface prediction* where the CT
-volume reads 0, but the EDT then fills those voxels with capped far-field
-distances, so the giant outside-the-scroll mask region is byte-occupied in the
-store. Passing ``--ct`` zeroes every voxel whose (ratio-mapped) CT voxel is 0
-while packing; combined with a sub-chunk brick size this drops the mask skin
-from the pool, and the zeros read back as no-data through the existing
-sampling contract.
+CT masking: the giant outside-the-scroll mask region (CT volume reads 0) can
+be byte-occupied in a source store. Passing ``--ct`` zeroes every voxel whose
+(ratio-mapped) CT voxel is 0 while packing; combined with a sub-chunk brick
+size this drops the mask skin from the pool, and the zeros read back as
+no-data through the existing sampling contract.
 
 Sidecar layout (``<zarr>.respool_g<group>[_pair]/``):
   meta.json         format/version, shapes, brick grid, sources, ct_mask info
@@ -121,9 +119,8 @@ def _read_zarray_meta(array_dir: Path, *, typed=False) -> dict:
 class CtMasker:
     """Voxel-level ``CT == 0`` mask, ratio-mapped onto a target array grid.
 
-    ``ratio`` is target voxels per CT voxel, per axis (integer, e.g. 2 for the
-    surf-SDT group 1 against s1_ds2 group 2, 1 for the group-4 lasagna
-    stores). Decoded CT chunks are kept in a small LRU because consecutive
+    ``ratio`` is target voxels per CT voxel, per axis (integer, e.g. 1 for the
+    group-4 lasagna stores against s1_ds2 group 2). Decoded CT chunks are kept in a small LRU because consecutive
     target chunks in key order revisit the same CT chunks.
     """
 
@@ -636,23 +633,18 @@ def main(argv=None):
         description='Pack Lasagna or signed patch-normal Zarr stores into sparse brick pools.')
     parser.add_argument('folder', help='Lasagna input directory, or a completed '
                         'patch-normal export directory for --what signed_normals')
-    parser.add_argument('--what', default='sdt,normals,grad_mag',
-                        help='comma list of sdt,normals,grad_mag (default all), or signed_normals')
+    parser.add_argument('--what', default='normals,grad_mag',
+                        help='comma list of normals,grad_mag (default all), or signed_normals')
     parser.add_argument('--signed-brick', type=int, default=16,
                         help='signed-normal brick edge in output cells (default 16)')
     parser.add_argument('--signed-output', type=Path,
                         help='signed uint8 pool directory (default FOLDER/signed_normals_u8.respool)')
-    parser.add_argument('--sdt-group', default='1')
     parser.add_argument('--normal-group', default='4',
                         help='group for both normals and grad_mag')
     parser.add_argument('--ct', default=None, metavar='ZARR',
                         help='CT zarr whose zero voxels are masked out of every '
                              'packed store (e.g. .../s1_ds2.zarr)')
     parser.add_argument('--ct-group', default='2')
-    parser.add_argument('--sdt-brick', type=int, default=None,
-                        help='SDT pool brick edge; defaults to 32 when --ct is '
-                             'given (so masked bricks are actually dropped), '
-                             'else the source chunk size')
     parser.add_argument('--io-threads', type=int,
                         help='bounded chunk workers (default 2 for signed normals, 16 otherwise)')
     parser.add_argument('--force', action='store_true',
@@ -663,7 +655,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     what = {w.strip() for w in args.what.split(',') if w.strip()}
-    unknown = what - {'sdt', 'normals', 'grad_mag', 'signed_normals'}
+    unknown = what - {'normals', 'grad_mag', 'signed_normals'}
     if unknown:
         parser.error(f'unknown --what entries: {sorted(unknown)}')
     if args.verify < 0 or (args.io_threads is not None and args.io_threads < 1):
@@ -686,19 +678,6 @@ def main(argv=None):
         return CtMasker(args.ct, args.ct_group, shape)
 
     built = []
-    if 'sdt' in what:
-        sdt = _find_one(args.folder, '*_surf_sdt.ome.zarr')
-        if sdt is None:
-            print('no *_surf_sdt.ome.zarr found, skipping sdt')
-        else:
-            array = os.path.join(sdt, args.sdt_group)
-            edge = args.sdt_brick or (32 if args.ct else None)
-            pack_arrays([array], sidecar_path(sdt, args.sdt_group),
-                        label='surf_sdt',
-                        brick_shape=(edge,) * 3 if edge else None,
-                        ct_masker=masker_for(array),
-                        io_threads=args.io_threads, force=args.force)
-            built.append(sidecar_path(sdt, args.sdt_group))
     if 'normals' in what:
         nx = _find_one(args.folder, '*_nx.ome.zarr')
         ny = _find_one(args.folder, '*_ny.ome.zarr')

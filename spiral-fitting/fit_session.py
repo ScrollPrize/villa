@@ -19,6 +19,7 @@ from typing import Any, Callable, Iterable, Mapping
 import zipfile
 
 from config import Config
+from surface_orientation import spiral_outward_sense_for
 
 
 # Version 17 binds dataset/output/cache to the service connection: --dataset
@@ -185,12 +186,10 @@ RUN_MUTABLE_PCL_ROLES: tuple[PclRole, ...] = EDITABLE_PCL_ROLES
 
 _INPUT_TOGGLE_KEYS = {
     "verified_patches": "input_use_verified_patches",
-    "unverified_patches": "input_use_unverified_patches",
     "tracks_dbm": "input_use_tracks",
     "fibers": "input_use_fibers",
     "fiber_directions": "input_use_fiber_directions",
     "normals": "input_use_normals",
-    "surf_sdt": "input_use_surf_sdt",
     "gradient_magnitude": "input_use_gradient_magnitude",
     "winding_inference": "input_use_winding_inference",
     "outer_shell": "input_use_outer_shell",
@@ -212,7 +211,7 @@ def pcl_role_toggle_key(role: PclRole | str) -> str:
 def input_source_enabled(config: Mapping[str, Any], source: str) -> bool:
     """Whether a rebuild may include one optional supervision source."""
     enabled = bool(config.get(_INPUT_TOGGLE_KEYS[source], True))
-    if source in {"verified_patches", "unverified_patches"}:
+    if source == "verified_patches":
         enabled = enabled and not bool(config.get("input_disable_patches", False))
     return enabled
 
@@ -270,10 +269,6 @@ def _verified_patches_enabled(config: Mapping[str, Any]) -> bool:
     return input_source_enabled(config, "verified_patches")
 
 
-def _unverified_patches_enabled(config: Mapping[str, Any]) -> bool:
-    return input_source_enabled(config, "unverified_patches")
-
-
 def _fibers_enabled(config: Mapping[str, Any]) -> bool:
     return input_source_enabled(config, "fibers")
 
@@ -287,10 +282,8 @@ def _pcls_enabled(config: Mapping[str, Any]) -> bool:
 
 
 def _shell_losses_enabled(config: Mapping[str, Any]) -> bool:
-    return input_source_enabled(config, "outer_shell") and (
-        float(config.get("loss_weight_shell_outer", 1.0)) > 0
-        or float(config.get("loss_weight_shell_patch_radius", 0)) > 0
-    )
+    return (input_source_enabled(config, "outer_shell")
+            and float(config.get("loss_weight_shell_outer", 1.0)) > 0)
 
 
 def _dense_spacing_mode(config: Mapping[str, Any]) -> str | None:
@@ -300,25 +293,12 @@ def _dense_spacing_mode(config: Mapping[str, Any]) -> str | None:
     # Partial requests must select the same inputs as the fitter, which fills
     # omitted fields from Config before constructing its context.
     mode = str(config.get("dense_spacing_mode", Config().dense_spacing_mode))
-    return mode if mode in ("phase", "grad_mag", "winding_model") else None
-
-
-def _phase_bundle_enabled(config: Mapping[str, Any]) -> bool:
-    return (
-        _dense_spacing_mode(config) == "phase"
-        and input_source_enabled(config, "normals")
-        and input_source_enabled(config, "surf_sdt")
-    )
+    return mode if mode in ("grad_mag", "winding_model") else None
 
 
 def _normals_required(config: Mapping[str, Any]) -> bool:
-    # The phase bundle requires both normal channels (band incidence
-    # handling) even when individual sub-weights are zero, so run-mutable
-    # weights can be raised at run boundaries.
-    return input_source_enabled(config, "normals") and (
-        float(config.get("loss_weight_dense_normals", 100.0)) > 0
-        or _phase_bundle_enabled(config)
-    )
+    return (input_source_enabled(config, "normals")
+            and float(config.get("loss_weight_dense_normals", 100.0)) > 0)
 
 
 def _fiber_directions_enabled(config: Mapping[str, Any]) -> bool:
@@ -342,10 +322,6 @@ def _winding_model_enabled(config: Mapping[str, Any]) -> bool:
 
 def _outer_shell_required(config: Mapping[str, Any]) -> bool:
     return _shell_losses_enabled(config) or _winding_model_enabled(config)
-
-
-def phase_bundle_enabled(config: Mapping[str, Any]) -> bool:
-    return _phase_bundle_enabled(config)
 
 
 def winding_inference_enabled(config: Mapping[str, Any]) -> bool:
@@ -391,8 +367,6 @@ FIT_INPUT_CATALOG: tuple[FitInputSpec, ...] = (
                  conventional_relative="verified_patches",
                  enabled=_verified_patches_enabled,
                  required=_verified_patches_enabled),
-    FitInputSpec("unverified_patches", "directory",
-                 enabled=_unverified_patches_enabled),
     FitInputSpec("fibers", "directory", conventional_relative="fibers",
                  enabled=_fibers_enabled),
     FitInputSpec("fiber_directions", "file",
@@ -421,10 +395,6 @@ FIT_INPUT_CATALOG: tuple[FitInputSpec, ...] = (
                  enabled=lambda config: input_source_enabled(
                      config, "gradient_magnitude"),
                  required=_grad_mag_required),
-    FitInputSpec("surf_sdt", "zarr-group",
-                 conventional_relative="lasagna_inputs/las_008_surf_sdt.ome.zarr",
-                 enabled=_phase_bundle_enabled,
-                 required=_phase_bundle_enabled),
     FitInputSpec("winding_inference", "directory",
                  conventional_relative="winding_inference",
                  enabled=_winding_model_enabled,
@@ -479,12 +449,10 @@ class SpiralInputPaths:
     fiber_directions: str = ""
     tracks_dbm: str = ""
     verified_patches: str = ""
-    unverified_patches: str = ""
     outer_shell: str = ""
     normal_x: str = ""
     normal_y: str = ""
     gradient_magnitude: str = ""
-    surf_sdt: str = ""
     winding_inference: str = ""
     scroll_zarr: str = ""
     checkpoint: str = ""
@@ -540,7 +508,6 @@ class SpiralRunConfig:
     z_begin: int
     z_end: int
     storage_backend: str = "sparse_cuda"
-    legacy_checkpoint_step: int = 0
     run_tag: str = ""
     render_volume_scale: int = 16
     config: Mapping[str, Any] = field(default_factory=dict)
@@ -551,7 +518,6 @@ class SpiralRunConfig:
             z_begin=int(value.get("z_begin", 0)),
             z_end=int(value.get("z_end", 0)),
             storage_backend=str(value.get("storage_backend", "sparse_cuda")).lower(),
-            legacy_checkpoint_step=int(value.get("legacy_checkpoint_step", 0)),
             run_tag=str(value.get("run_tag", "")),
             render_volume_scale=int(value.get("render_volume_scale", 16)),
             config=dict(value.get("config", {})),
@@ -654,12 +620,17 @@ class ScrollSpec:
     name: str
     voxel_size_um: float
     spiral_outward_sense: str
+    # The following are in the open-data catalog metadata; together they
+    # fix spiral_outward_sense (surface_orientation.spiral_outward_sense_for);
+    # the z direction also decides whether exported grids are flipped so row 0 is
+    # the scroll top. None when the spec leaves them out.
+    z_direction_is_top_to_bottom: bool | None = None
+    left_handed_coordinates: bool | None = None
     # Shape of the volume coordinate domain used by Spiral surfaces. This is
     # independent of physical voxel size and may be absent in legacy specs.
     base_shape_zyx: tuple[int, int, int] | None = None
     umbilicus_coordinate_scale: float = 1.0
     normal_zarr_group: str = "4"
-    surf_sdt_zarr_group: str = "1"
     lasagna_scale: int = 4
     # Allow-listed absolute-path overrides, (key, resolved path) pairs.
     path_overrides: tuple[tuple[str, str], ...] = ()
@@ -689,9 +660,19 @@ def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
         raise ScrollSpecError(
             f"{source}: unsupported schema_version {document['schema_version']!r} "
             f"(this build supports {SCROLL_SPEC_SCHEMA_VERSION})")
-    missing = sorted(
-        key for key in ("name", "voxel_size_um", "spiral_outward_sense")
-        if key not in document)
+    catalog = {}
+    for key in ("z_direction_is_top_to_bottom", "left_handed_coordinates"):
+        value = document.get(key)
+        if value is not None and type(value) is not bool:
+            raise ScrollSpecError(f"{source}: {key} must be true or false")
+        catalog[key] = value
+    catalog_sense = (
+        spiral_outward_sense_for(**catalog)
+        if None not in catalog.values() else None)
+    required = ["name", "voxel_size_um"]
+    if catalog_sense is None:
+        required.append("spiral_outward_sense")
+    missing = sorted(key for key in required if key not in document)
     if missing:
         raise ScrollSpecError(f"{source}: missing required keys: {missing}")
 
@@ -714,9 +695,17 @@ def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
             raise ScrollSpecError(
                 f"{source}: base_shape_zyx must be a ZYX list of three positive integers")
         base_shape_zyx = tuple(base_shape_raw)
-    sense = str(document["spiral_outward_sense"]).upper()
+    sense = str(document.get("spiral_outward_sense", catalog_sense)).upper()
     if sense not in ("CW", "ACW"):
         raise ScrollSpecError(f"{source}: spiral_outward_sense must be CW or ACW")
+    if catalog_sense is not None and sense != catalog_sense:
+        raise ScrollSpecError(
+            f"{source}: spiral_outward_sense {sense} contradicts the catalog "
+            f"properties (z_direction_is_top_to_bottom="
+            f"{str(catalog['z_direction_is_top_to_bottom']).lower()}, "
+            f"left_handed_coordinates="
+            f"{str(catalog['left_handed_coordinates']).lower()} give "
+            f"{catalog_sense})")
 
     umbilicus = document.get("umbilicus", {})
     if not isinstance(umbilicus, Mapping):
@@ -753,10 +742,11 @@ def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
         name=name,
         voxel_size_um=voxel_size_um,
         spiral_outward_sense=sense,
+        z_direction_is_top_to_bottom=catalog["z_direction_is_top_to_bottom"],
+        left_handed_coordinates=catalog["left_handed_coordinates"],
         base_shape_zyx=base_shape_zyx,
         umbilicus_coordinate_scale=coordinate_scale,
         normal_zarr_group=str(document.get("normal_zarr_group", "4")),
-        surf_sdt_zarr_group=str(document.get("surf_sdt_zarr_group", "1")),
         lasagna_scale=lasagna_scale,
         path_overrides=tuple(overrides),
     )
@@ -783,7 +773,9 @@ def load_scroll_spec(dataset_root: str | os.PathLike[str],
         raise ScrollSpecError(
             f"No scroll specification found at {path}. Create {SCROLL_SPEC_FILENAME} "
             "in the dataset root with schema_version, name, voxel_size_um, and "
-            "spiral_outward_sense (plus any non-conventional path overrides).")
+            "either the volume's catalog properties z_direction_is_top_to_bottom "
+            "and left_handed_coordinates or spiral_outward_sense (plus any "
+            "non-conventional path overrides).")
     try:
         with path.open("r", encoding="utf-8") as stream:
             document = json.load(stream)
@@ -827,12 +819,10 @@ def conventional_input_paths(
         fiber_directions=resolve("fiber_directions"),
         tracks_dbm=resolve("tracks_dbm"),
         verified_patches=resolve("verified_patches"),
-        unverified_patches=spec.path_override("unverified_patches"),
         outer_shell=resolve("outer_shell"),
         normal_x=resolve("normal_x"),
         normal_y=resolve("normal_y"),
         gradient_magnitude=resolve("gradient_magnitude"),
-        surf_sdt=resolve("surf_sdt"),
         winding_inference=resolve("winding_inference"),
         checkpoint=_normalise_path(checkpoint) if checkpoint else "",
         output_directory=_normalise_path(output_directory) if output_directory else "",
@@ -1270,18 +1260,16 @@ def validate_session_request(
                     else:
                         _validate_json_file(path, f"pcls[{index}]", errors)
 
-    # The Lasagna store requirements (see the catalog's predicates: the
-    # phase bundle needs SDT and both normal channels even at zero
-    # sub-weights; grad_mag never needs the SDT) are checked after the
-    # dense-spacing mode below, so an invalid mode errors as itself rather
-    # than as missing-file errors.
+    # The Lasagna store requirements (see the catalog's predicates) are
+    # checked after the dense-spacing mode below, so an invalid mode errors
+    # as itself rather than as missing-file errors.
     for spec in FIT_INPUT_CATALOG:
         if spec.kind != "zarr-group":
             check_catalog_input(spec)
 
     if _dense_spacing_mode(run.config) is None:
         errors.append({"field": "dense_spacing_mode",
-                       "message": "Must be phase, grad_mag, or winding_model"})
+                       "message": "Must be grad_mag or winding_model"})
 
     for spec in FIT_INPUT_CATALOG:
         if spec.kind == "zarr-group":

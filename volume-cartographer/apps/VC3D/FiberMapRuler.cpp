@@ -1,5 +1,6 @@
 #include "FiberMapRuler.hpp"
 
+#include "FiberLengthDisplay.hpp"
 #include "FiberMapRulerMath.hpp"
 
 #include <QCoreApplication>
@@ -78,23 +79,10 @@ DistanceTicks chooseDistanceTicks(double minStepVx, const std::optional<double>&
     return ticks;
 }
 
-// The inclusive range of tick indices k (tick at k * step) covering
-// [low, high] with one spare on each side, or nullopt when the range is not
-// finite or would exceed kMaxTicksPerPaint - decided in floating point, before
-// anything is narrowed to an integer.
 std::optional<std::pair<long long, long long>> tickIndexRange(double low, double high,
                                                               double step)
 {
-    if (!(step > 0.0) || !std::isfinite(low) || !std::isfinite(high) || !(high >= low)) {
-        return std::nullopt;
-    }
-    const double first = std::ceil(low / step) - 1.0;
-    const double last = std::floor(high / step) + 1.0;
-    if (!std::isfinite(first) || !std::isfinite(last) || last - first > kMaxTicksPerPaint ||
-        std::abs(first) > 1e15 || std::abs(last) > 1e15) {
-        return std::nullopt;
-    }
-    return std::make_pair(static_cast<long long>(first), static_cast<long long>(last));
+    return vc3d::fiber_map::ruler::tickIndexRange(low, high, step, kMaxTicksPerPaint);
 }
 
 // A label rect shifted, not shrunk, to lie within the band: a label at the
@@ -126,12 +114,26 @@ int FiberMapRuler::thicknessFor(Edge edge)
     return edge == Edge::Left ? kVerticalBandPx : kHorizontalBandPx;
 }
 
-FiberMapRuler::FiberMapRuler(QGraphicsView* view, Edge edge, Mode mode)
+FiberMapRuler::FiberMapRuler(QGraphicsView* view, Edge edge, Mode mode, int stackLevel)
     : _view(view)
     , _edge(edge)
     , _mode(mode)
+    , _stackLevel(std::max(0, stackLevel))
 {
     _font.setPointSizeF(8.0);
+}
+
+void FiberMapRuler::setStackDepth(int depth)
+{
+    _stackDepth = std::max(0, depth);
+}
+
+bool FiberMapRuler::hasContent() const
+{
+    if (!_model.hasLayout) {
+        return false;
+    }
+    return _mode != Mode::Kollesis || !_model.kollesis.empty();
 }
 
 void FiberMapRuler::setModel(FiberMapRulerModel model)
@@ -160,6 +162,17 @@ QString FiberMapRuler::toolTipText() const
             ? tr("Height above the volume floor.")
             : tr("Height above the volume floor, in voxels (the package has no "
                  "voxel size).");
+    case Mode::Kollesis: {
+        QString text = tr("Kollesis seams: one tick per seam, read from the kollesis "
+                          "termination tags on H fibers; between neighbouring ticks, "
+                          "the length of that sheet along the scroll. Amber ticks are "
+                          "seams the sheet-length statistics predict, inside gaps "
+                          "that measure several sheets and past the last tagged seam.");
+        if (!_model.voxelSizeUm) {
+            text += QLatin1Char('\n') + tr("In voxels: the package has no voxel size.");
+        }
+        return text;
+    }
     case Mode::SheetDistance: {
         QString text = tr("Estimated distance along the sheet from winding 0.");
         if (_model.hasLayout && _model.sheet.pitchVx > 0.0) {
@@ -169,8 +182,8 @@ QString FiberMapRuler::toolTipText() const
                 : tr("%1 vx").arg(_model.sheet.pitchVx, 0, 'f', 0);
             text += QLatin1Char('\n') +
                     tr("The radius is modelled as growing linearly with the winding "
-                       "(fitted pitch %1 per winding), so outer windings measure "
-                       "longer than inner ones.")
+                       "(fitted pitch %1 per winding), so outer windings measure, "
+                       "and are drawn, longer than inner ones.")
                         .arg(pitch);
         } else if (_model.hasLayout) {
             text += QLatin1Char('\n') +
@@ -188,12 +201,17 @@ QString FiberMapRuler::toolTipText() const
 
 QRect FiberMapRuler::bandRect(const QRect& viewport) const
 {
-    if (!_view || !_model.hasLayout || viewport.isEmpty()) {
+    if (!_view || !hasContent() || viewport.isEmpty()) {
         return QRect();
     }
     const int thickness = thicknessFor(_edge);
-    // A viewport thinner than the band has no room for it.
-    if ((_edge == Edge::Left ? viewport.width() : viewport.height()) < thickness) {
+    // The band's own offset from the extent edge (the bands inside it) and
+    // the room kept beyond it once the stack clamps to the viewport.
+    const int inset = _stackLevel * thickness;
+    const int reserve = _stackDepth * thickness;
+    // A viewport thinner than the whole stack has no room for it.
+    if ((_edge == Edge::Left ? viewport.width() : viewport.height()) <
+        thickness + inset + reserve) {
         return QRect();
     }
     // The extent's four edges in viewport pixels, kept floating-point until
@@ -228,21 +246,27 @@ QRect FiberMapRuler::bandRect(const QRect& viewport) const
         if (runRight <= runLeft) {
             return QRect();
         }
-        const int bottom = clipped(ceilingF, viewport.top() + thickness, farBottom);
+        // Both clamps keep the band's place in the stack: the inner bands'
+        // room (reserve) when the ceiling is above the viewport, this band's
+        // own offset (inset) when it is below.
+        const int bottom = clipped(ceilingF - inset,
+                                   viewport.top() + thickness + reserve, farBottom - inset);
         return QRect(runLeft, bottom - thickness, runRight - runLeft, thickness);
     }
     case Edge::Bottom: {
         if (runRight <= runLeft) {
             return QRect();
         }
-        const int top = clipped(floorF, viewport.top(), farBottom - thickness);
+        const int top = clipped(floorF + inset, viewport.top() + inset,
+                                farBottom - thickness - reserve);
         return QRect(runLeft, top, runRight - runLeft, thickness);
     }
     case Edge::Left: {
         if (runBottom <= runTop) {
             return QRect();
         }
-        const int right = clipped(leftF, viewport.left() + thickness, farRight);
+        const int right = clipped(leftF - inset,
+                                  viewport.left() + thickness + reserve, farRight - inset);
         return QRect(right - thickness, runTop, thickness, runBottom - runTop);
     }
     }
@@ -274,7 +298,11 @@ void FiberMapRuler::paint(QPainter& painter, const QRect& viewport)
     switch (_edge) {
     case Edge::Top:
         painter.drawLine(band.left(), band.bottom(), band.right(), band.bottom());
-        paintWindings(painter, band);
+        if (_mode == Mode::Kollesis) {
+            paintKollesis(painter, band);
+        } else {
+            paintWindings(painter, band);
+        }
         break;
     case Edge::Bottom:
         painter.drawLine(band.left(), band.top(), band.right(), band.top());
@@ -327,7 +355,17 @@ void FiberMapRuler::paintWindings(QPainter& painter, const QRect& band)
         return;
     }
     const QRect caption = paintCaption(painter, band, tr("winding"));
-    const double pxPerWinding = scale * kTwoPi * _model.sheet.rRefVx;
+    // The scene is scaled by sheet distance, so windings are not equally
+    // wide: the label step is chosen at the tightest place on screen. One
+    // winding at the reference radius stands in when the layout has fewer
+    // than two marks.
+    const double sceneLeft = _view->mapToScene(QPoint(band.left(), 0)).x();
+    const double sceneRight = _view->mapToScene(QPoint(band.right() + 1, 0)).x();
+    const double windingVx = narrowestNeighbourGap(
+        _model.windings.begin(), _model.windings.end(),
+        [](const vc3d::fiber_map::WindingMark& mark) { return mark.xVx; }, sceneLeft,
+        sceneRight, kTwoPi * _model.sheet.rRefVx);
+    const double pxPerWinding = scale * windingVx;
     const int labelStep = niceIntegerStepAtLeast(kMinWindingLabelSpacingPx / pxPerWinding);
     const bool minorTicks = pxPerWinding >= kMinWindingTickSpacingPx;
     const QFontMetrics metrics(_font);
@@ -366,77 +404,120 @@ void FiberMapRuler::paintWindings(QPainter& painter, const QRect& band)
     }
 }
 
+void FiberMapRuler::paintKollesis(QPainter& painter, const QRect& band)
+{
+    if (_model.kollesis.empty()) {
+        return;
+    }
+    const QRect caption = paintCaption(painter, band, tr("kollesis"));
+    const QFontMetrics metrics(_font);
+    const QTransform toViewport = _view->viewportTransform();
+    // Each seam's tick spans the band; the sheet length sits centred between
+    // neighbouring ticks when it fits, in the length unit the map uses.
+    QPen tickPen(_style.accent);
+    tickPen.setWidth(2);
+    QPen predictedTickPen(_style.accentPredicted);
+    predictedTickPen.setWidth(2);
+    predictedTickPen.setStyle(Qt::DotLine);
+    std::optional<double> previousX;
+    std::optional<double> previousToNext;
+    bool previousPredicted = false;
+    for (const FiberMapRulerModel::KollesisMark& mark : _model.kollesis) {
+        const double xF = toViewport.map(QPointF(mark.xVx, 0.0)).x();
+        if (!std::isfinite(xF)) {
+            previousX.reset();
+            previousToNext.reset();
+            continue;
+        }
+        if (xF >= band.left() - 1.0 && xF <= band.right() + 1.0) {
+            const int x = static_cast<int>(std::lround(xF));
+            painter.setPen(mark.predicted ? predictedTickPen : tickPen);
+            painter.drawLine(x, band.top() + 2, x, band.bottom());
+        }
+        // A length touching a predicted seam is itself a prediction.
+        const QColor labelInk =
+            (mark.predicted || previousPredicted) ? _style.accentPredicted : _style.ink;
+        if (previousX && previousToNext && std::isfinite(*previousToNext)) {
+            const double gapLeft = *previousX;
+            const double gapRight = xF;
+            // The label lives in the gap, and the gap is on screen somewhere.
+            if (gapRight > gapLeft && gapRight >= band.left() && gapLeft <= band.right()) {
+                const QString text = vc3d::fiber_length::formatLength(
+                    *previousToNext, _model.voxelSizeUm, /*vxDecimals=*/0);
+                const int textWidth = metrics.horizontalAdvance(text) + 4;
+                if (textWidth + 6 <= gapRight - gapLeft) {
+                    const double centreF = 0.5 * (gapLeft + gapRight);
+                    const int centre = static_cast<int>(std::lround(
+                        std::clamp<double>(centreF, band.left() - textWidth, band.right() + textWidth)));
+                    const QRect textRect = keptInside(
+                        QRect(centre - textWidth / 2, band.top(), textWidth, band.height() - 2),
+                        band);
+                    if (!(caption.isValid() && textRect.intersects(caption))) {
+                        painter.setPen(labelInk);
+                        painter.drawText(textRect, Qt::AlignHCenter | Qt::AlignVCenter, text);
+                    }
+                }
+            }
+        }
+        previousX = xF;
+        previousToNext = mark.toNextVx;
+        previousPredicted = mark.predicted;
+    }
+}
+
 void FiberMapRuler::paintSheetDistance(QPainter& painter, const QRect& band)
 {
     const double scale = std::abs(_view->transform().m11());
-    const vc3d::fiber_map::SheetModel& sheet = _model.sheet;
-    if (!(scale > 0.0) || !(sheet.rRefVx > 0.0) || !(sheet.radius0Vx > 0.0)) {
+    if (!(scale > 0.0)) {
         return;
     }
-    // The visible scene x range, cut to where the modelled radius is positive;
-    // the distance function is monotonic only there.
+    // Scene x is the sheet distance from winding 0 (the scene is scaled by
+    // it, see sheetDistanceMonotoneVx), so the visible scene x range is the
+    // visible distance range and a tick sits at its own distance. Below the
+    // model's domain floor the scene continues at the map's own scale but
+    // no sheet distance exists, so no tick is labelled there.
     double sceneLeft = _view->mapToScene(QPoint(band.left(), 0)).x();
     const double sceneRight = _view->mapToScene(QPoint(band.right() + 1, 0)).x();
-    if (sheet.pitchVx > 0.0) {
-        const double xFloor = -(sheet.radius0Vx / sheet.pitchVx) * kTwoPi * sheet.rRefVx;
-        sceneLeft = std::max(sceneLeft, xFloor);
-    }
+    const double xFloor = vc3d::fiber_map::sheetDomainFloorXVx(_model.sheet);
+    const double distanceFloor = std::isfinite(xFloor)
+        ? vc3d::fiber_map::sheetDistanceMonotoneVx(_model.sheet, xFloor)
+        : -std::numeric_limits<double>::infinity();
+    sceneLeft = std::max(sceneLeft, distanceFloor);
     if (!(sceneRight > sceneLeft)) {
         return;
     }
-    // Ticks a fixed distance apart are closest on screen where the radius is
-    // largest (the right end, the pitch being non-negative), so the step is
-    // chosen against that worst case.
-    const double windingRight = sceneRight / (kTwoPi * sheet.rRefVx);
-    const double radiusRight = sheet.radius0Vx + sheet.pitchVx * windingRight;
-    const double distanceVxPerPx = std::max(radiusRight, sheet.radius0Vx) /
-                                   (sheet.rRefVx * scale);
     const DistanceTicks ticks =
-        chooseDistanceTicks(kMinDistanceTickSpacingPx * distanceVxPerPx, _model.voxelSizeUm);
+        chooseDistanceTicks(kMinDistanceTickSpacingPx / scale, _model.voxelSizeUm);
     if (!(ticks.stepVx > 0.0)) {
         return;
     }
     const QRect caption = paintCaption(painter, band, ticks.caption);
 
-    const double distanceLeft = vc3d::fiber_map::sheetDistanceVx(sheet, sceneLeft);
-    const double distanceRight = vc3d::fiber_map::sheetDistanceVx(sheet, sceneRight);
-    const auto range = tickIndexRange(distanceLeft, distanceRight, ticks.stepVx);
-    if (!range) {
-        return;
-    }
     const QFontMetrics metrics(_font);
     const int textTop = band.top() + kMajorTickPx + 1;
     const QTransform toViewport = _view->viewportTransform();
-    for (long long k = range->first; k <= range->second; ++k) {
-        for (int half = 0; half < 2; ++half) {
-            const double distance = (static_cast<double>(k) + 0.5 * half) * ticks.stepVx;
-            const double sceneX = vc3d::fiber_map::sheetXForDistanceVx(sheet, distance);
-            if (!std::isfinite(sceneX)) {
-                continue;
-            }
-            const double xF = toViewport.map(QPointF(sceneX, 0.0)).x();
-            if (!std::isfinite(xF) || xF < band.left() - 1.0 || xF > band.right() + 1.0) {
-                continue;
-            }
-            const int x = static_cast<int>(std::lround(xF));
-            const bool major = half == 0;
-            painter.setPen(_style.tick);
-            painter.drawLine(x, band.top() + 1, x,
-                             band.top() + 1 + (major ? kMajorTickPx : kMinorTickPx));
-            if (!major) {
-                continue;
-            }
-            const QString text = ticks.label(distance);
-            const int textWidth = metrics.horizontalAdvance(text) + 4;
-            const QRect textRect = keptInside(
-                QRect(x - textWidth / 2, textTop, textWidth, band.bottom() + 1 - textTop),
-                band);
-            if (caption.isValid() && textRect.intersects(caption)) {
-                continue;
-            }
-            painter.setPen(_style.ink);
-            painter.drawText(textRect, Qt::AlignHCenter | Qt::AlignVCenter, text);
+    for (const DistanceTick& tick : distanceTickCandidates(sceneLeft, sceneRight, ticks.stepVx,
+                                                           distanceFloor, kMaxTicksPerPaint)) {
+        const double xF = toViewport.map(QPointF(tick.distance, 0.0)).x();
+        if (!std::isfinite(xF) || xF < band.left() - 1.0 || xF > band.right() + 1.0) {
+            continue;
         }
+        const int x = static_cast<int>(std::lround(xF));
+        painter.setPen(_style.tick);
+        painter.drawLine(x, band.top() + 1, x,
+                         band.top() + 1 + (tick.major ? kMajorTickPx : kMinorTickPx));
+        if (!tick.major) {
+            continue;
+        }
+        const QString text = ticks.label(tick.distance);
+        const int textWidth = metrics.horizontalAdvance(text) + 4;
+        const QRect textRect = keptInside(
+            QRect(x - textWidth / 2, textTop, textWidth, band.bottom() + 1 - textTop), band);
+        if (caption.isValid() && textRect.intersects(caption)) {
+            continue;
+        }
+        painter.setPen(_style.ink);
+        painter.drawText(textRect, Qt::AlignHCenter | Qt::AlignVCenter, text);
     }
 }
 

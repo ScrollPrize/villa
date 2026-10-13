@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -302,4 +303,77 @@ TEST_CASE("samplePlane: produces non-zero values where coords are inside the chu
                 /*width=*/4, /*height=*/4,
                 vc::Sampling::Nearest);
     CHECK(out(0, 0) == 77);
+}
+
+namespace {
+
+// Every chunk request fails the way a remote fetch does once its retries are
+// exhausted: getChunkBlocking() reports ChunkStatus::Error with the transport
+// message.
+class FailingChunkArray : public vc::render::IChunkedArray {
+public:
+    int numLevels() const override { return 1; }
+    std::array<int, 3> shape(int) const override { return {8, 8, 8}; }
+    std::array<int, 3> chunkShape(int) const override { return {8, 8, 8}; }
+    vc::render::ChunkDtype dtype() const override { return vc::render::ChunkDtype::UInt8; }
+    double fillValue() const override { return 0.0; }
+    LevelTransform levelTransform(int) const override { return {}; }
+
+    vc::render::ChunkResult tryGetChunk(int, int, int, int) override
+    {
+        vc::render::ChunkResult r;
+        r.dtype = vc::render::ChunkDtype::UInt8;
+        r.status = vc::render::ChunkStatus::Error;
+        r.error = "HTTP 0 fetching 0/0/0/0: simulated transport failure";
+        return r;
+    }
+    vc::render::ChunkResult getChunkBlocking(int level, int iz, int iy, int ix) override
+    {
+        return tryGetChunk(level, iz, iy, ix);
+    }
+    void prefetchChunks(const std::vector<vc::render::ChunkKey>&, bool, int) override {}
+    ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback) override { return 0; }
+    void removeChunkReadyListener(ChunkReadyCallbackId) override {}
+};
+
+} // namespace
+
+// The samplers run their rows inside OpenMP regions, where a throw used to end
+// in std::terminate instead of reaching the caller. Enough rows to keep several
+// threads busy, so more than one row fails at the same time.
+TEST_CASE("chunk fetch errors reach the caller from every sampling entry point")
+{
+    FailingChunkArray a;
+    const auto coords = coordsGrid(64, 8);
+    const doctest::Contains message("simulated transport failure");
+
+    cv::Mat_<uint8_t> out;
+    CHECK_THROWS_WITH_AS(readInterpolated3D(out, &a, /*level=*/0, coords),
+                         message, std::runtime_error);
+
+    cv::Mat_<uint8_t> plane(64, 8, uint8_t{0});
+    CHECK_THROWS_WITH_AS(samplePlane(plane, &a, /*level=*/0,
+                                     /*origin=*/cv::Vec3f(0, 0, 0),
+                                     /*vx_step=*/cv::Vec3f(1, 0, 0),
+                                     /*vy_step=*/cv::Vec3f(0, 1, 0),
+                                     /*width=*/8, /*height=*/64,
+                                     vc::Sampling::Nearest),
+                         message, std::runtime_error);
+
+    cv::Mat_<cv::Vec3f> normals(64, 8, cv::Vec3f(0.f, 0.f, 1.f));
+    cv::Mat_<uint8_t> composite(64, 8, uint8_t{0});
+    CompositeParams params;
+    params.method = "mean";
+    CHECK_THROWS_WITH_AS(readCompositeFast(composite, &a, /*level=*/0, coords, normals,
+                                           /*zStep=*/1.0f, /*zStart=*/0, /*zEnd=*/3, params),
+                         message, std::runtime_error);
+
+    cv::Mat_<cv::Vec3f> steps(64, 8, cv::Vec3f(0.f, 0.f, 1.f));
+    const std::vector<float> offsets = {0.f, 1.f};
+    std::vector<cv::Mat_<uint8_t>> slices;
+    CHECK_THROWS_WITH_AS(readMultiSlice(slices, &a, /*level=*/0, coords, steps, offsets),
+                         message, std::runtime_error);
+    slices.clear();
+    CHECK_THROWS_WITH_AS(sampleTileSlices(slices, &a, /*level=*/0, coords, steps, offsets),
+                         message, std::runtime_error);
 }

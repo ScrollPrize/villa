@@ -5,6 +5,7 @@
 #include "vc/core/util/RemoteUrl.hpp"
 
 #include <utils/http_fetch.hpp>
+#include <utils/sftp_fetch.hpp>
 #include <utils/zarr.hpp>
 
 #include <algorithm>
@@ -114,7 +115,7 @@ public:
             return true;
         if (response.not_found())
             return false;
-        if (isOptionalRemoteMetadataMiss(
+        if (!utils::is_sftp_url(baseUrl_) && isOptionalRemoteMetadataMiss(
                 response.status_code, key, response.body_string())) {
             sawForbiddenMetadataMiss_.store(true, std::memory_order_relaxed);
             return false;
@@ -140,7 +141,7 @@ public:
         }
         if (response.not_found())
             return std::nullopt;
-        if (isOptionalRemoteMetadataMiss(
+        if (!utils::is_sftp_url(baseUrl_) && isOptionalRemoteMetadataMiss(
                 response.status_code, key, response.body_string())) {
             sawForbiddenMetadataMiss_.store(true, std::memory_order_relaxed);
             return std::nullopt;
@@ -159,6 +160,18 @@ public:
             return std::nullopt;
         throw HttpStatusError(
             response.status_code, key, responseErrorDetail(response));
+    }
+
+    std::optional<std::size_t> size_of(const std::string& key) const override
+    {
+        auto response = client_.head(makeUrl(key));
+        if (response.ok() && response.content_length > 0)
+            return response.content_length;
+        if (response.not_found())
+            return std::nullopt;
+        if (!response.ok())
+            throw HttpStatusError(response.status_code, key);
+        return std::nullopt;
     }
 
     void set(const std::string&, std::span<const std::byte>) override
@@ -245,6 +258,8 @@ public:
         // avoiding a decode+re-encode round trip on the cache writer.
         if (array_->stores_chunks_with_codec("c3d"))
             persistEncodedExtension_ = ".c3d";
+        else if (array_->stores_chunks_with_codec("volcomp"))
+            persistEncodedExtension_ = ".volcomp";
         else if (array_->stores_chunks_with_codec(vc::kDelta3dCodecName) ||
                  array_->stores_chunks_with_codec(vc::kVcz1CodecName))
             persistEncodedExtension_ = vc::kCompressedCacheExtension;

@@ -82,8 +82,7 @@ public:
     // Rebuild from the service's own launch defaults, ignoring any autosave.
     // This is how a service stuck in Error recovers.
     void rebuildWithDefaults();
-    void runIterations(int iterations, const QJsonObject& influenceConfig,
-                       const QJsonObject& runConfig,
+    void runIterations(int iterations, const QJsonObject& runConfig,
                        const QJsonObject& dtLossSchedule,
                        const QJsonObject& previewSchedule = {});
     void stopAfterIteration();

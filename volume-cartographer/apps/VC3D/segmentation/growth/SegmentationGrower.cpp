@@ -44,7 +44,7 @@
 
 #include "utils/Json.hpp"
 
-#include "vc/core/util/UnixSocket.hpp"
+#include "../../SocketRequest.hpp"
 
 Q_DECLARE_LOGGING_CATEGORY(lcSegGrowth);
 
@@ -897,49 +897,8 @@ bool uiPatchIndexMatchesSourceFolder(CState* state,
 
 utils::Json sendSocketJsonRequest(const QString& socketPath, const utils::Json& request)
 {
-    const std::string socketStd = socketPath.toStdString();
-    vc::unixsocket::Socket sock = vc::unixsocket::connectStream(socketStd);
-    if (!vc::unixsocket::isValid(sock)) {
-        throw std::runtime_error("Failed to connect to neural trace socket.");
-    }
-
-    const std::string requestPayload = request.dump() + "\n";
-    const char* ptr = requestPayload.c_str();
-    size_t remaining = requestPayload.size();
-    while (remaining > 0) {
-        auto sent = ::send(sock, ptr, remaining, 0);
-        if (sent < 0) {
-            vc::unixsocket::closeSocket(sock);
-            throw std::runtime_error("Failed to send dense displacement request.");
-        }
-        ptr += sent;
-        remaining -= static_cast<size_t>(sent);
-    }
-
-    vc::unixsocket::setRecvTimeoutSeconds(sock, 300);  // 5 minute timeout
-
-    std::string responsePayload;
-    char buf[4096];
-    long long n;
-    while ((n = ::recv(sock, buf, sizeof(buf), 0)) > 0) {
-        for (long long i = 0; i < n; ++i) {
-            if (buf[i] == '\n') {
-                vc::unixsocket::closeSocket(sock);
-                if (responsePayload.empty()) {
-                    throw std::runtime_error("Dense displacement service returned an empty response.");
-                }
-                return utils::Json::parse(responsePayload);
-            }
-            responsePayload.push_back(buf[i]);
-        }
-    }
-    vc::unixsocket::closeSocket(sock);
-
-    if (responsePayload.empty()) {
-        throw std::runtime_error("Dense displacement service returned an empty response.");
-    }
-
-    return utils::Json::parse(responsePayload);
+    return utils::Json::parse(vc3d::socketRequestLine(
+        socketPath.toStdString(), request.dump(), 300, "dense displacement"));  // 5 minute timeout
 }
 
 std::string sanitizeSegmentId(const std::string& value)
