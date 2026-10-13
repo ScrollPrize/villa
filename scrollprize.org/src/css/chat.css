@@ -11,7 +11,6 @@
    §6 Streaming dots + interrupted marker + error note
    §7 Input row + disclaimer
    §8 Visually-hidden live region
-   §9 Coexistence with the landing prize sticker (.vc-gp2027)
    ========================================================================== */
 
 /* ==========================================================================
@@ -486,24 +485,6 @@
   clip: rect(0 0 0 0);
   clip-path: inset(50%);
   white-space: nowrap;
-}
-
-/* ==========================================================================
-   §9 Coexistence with the landing prize sticker (.vc-gp2027)
-   Below 997px the sticker owns the same bottom edge (full-width bar <561px,
-   corner card 561–768px, centered pill 769–996px). While it is on screen the
-   trigger steps above it. Progressive: without :has() they overlap, which is
-   survivable — the trigger stays clickable at z 170.
-   ========================================================================== */
-@media (max-width: 768px) {
-  body:has(.vc-gp2027--in:not(.vc-gp2027--yield)) .vc-chat-trigger {
-    bottom: calc(148px + env(safe-area-inset-bottom));
-  }
-}
-@media (min-width: 769px) and (max-width: 996px) {
-  body:has(.vc-gp2027--in:not(.vc-gp2027--yield)) .vc-chat-trigger {
-    bottom: calc(84px + env(safe-area-inset-bottom));
-  }
 }
 
 /* ==========================================================================

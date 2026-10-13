@@ -171,130 +171,6 @@ const Story = ({ story, index }) => (
   </article>
 );
 
-/* --------------------------------------------------------------------------
-   2027 Grand Prize sticker — $1,000,000 announcement, landing page only.
-   Advertises the TOTAL open prize pool (bigger number than any single
-   prize), computed from the prizes-page frontmatter; the whole card links
-   to /prizes. Enters after a small scroll (or a short delay on desktop,
-   where the bottom-center pill can't collide with the hero CTAs); steps
-   aside while the footer or the Open problems section is on screen; dismissible
-   with a 44px close button, persisted in localStorage (SSR-safe: window
-   access only inside effects). Toggle with SHOW_PRIZE_STICKER.
--------------------------------------------------------------------------- */
-const SHOW_PRIZE_STICKER = true;
-const PRIZE_STICKER_DISMISS_KEY = "vcPrizePoolDismissed";
-
-function PrizePoolSticker({ total }) {
-  const [shown, setShown] = useState(false);
-  const [dismissed, setDismissed] = useState(false);
-  const [yielding, setYielding] = useState(false);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return undefined;
-    try {
-      if (window.localStorage.getItem(PRIZE_STICKER_DISMISS_KEY) === "1") {
-        setDismissed(true);
-        return undefined;
-      }
-    } catch (e) {
-      // Storage unavailable (privacy mode) — still show; dismissal just
-      // won't persist across visits.
-    }
-    let revealed = false;
-    let timer = null;
-    const onScroll = () => {
-      if (window.scrollY > 240) reveal();
-    };
-    const reveal = () => {
-      if (revealed) return;
-      revealed = true;
-      window.removeEventListener("scroll", onScroll);
-      if (timer) window.clearTimeout(timer);
-      setShown(true);
-    };
-    window.addEventListener("scroll", onScroll, { passive: true });
-    // Desktop-only delay fallback: on phones the sticker waits for a scroll
-    // so it can never pop over the hero CTAs at the bottom of the first view.
-    if (window.matchMedia("(min-width: 769px)").matches) {
-      timer = window.setTimeout(reveal, 3000);
-    }
-    onScroll(); // already scrolled (deep link / restored position)
-    return () => {
-      window.removeEventListener("scroll", onScroll);
-      if (timer) window.clearTimeout(timer);
-    };
-  }, []);
-
-  // Step aside while a footer is visible (links stay uncovered) or while
-  // the Open problems section is on screen (no point advertising the
-  // prizes the visitor is already looking at — and on phones the bar would
-  // cover them).
-  useEffect(() => {
-    if (
-      typeof window === "undefined" ||
-      typeof IntersectionObserver === "undefined"
-    )
-      return undefined;
-    const watched = Array.from(document.querySelectorAll("footer")).concat(
-      Array.from(
-        document.querySelectorAll('section[aria-labelledby="open-problems"]')
-      )
-    );
-    if (!watched.length) return undefined;
-    const onScreen = new Set();
-    const observer = new IntersectionObserver((entries) => {
-      entries.forEach((entry) => {
-        if (entry.isIntersecting) onScreen.add(entry.target);
-        else onScreen.delete(entry.target);
-      });
-      setYielding(onScreen.size > 0);
-    });
-    watched.forEach((el) => observer.observe(el));
-    return () => observer.disconnect();
-  }, []);
-
-  if (!SHOW_PRIZE_STICKER || dismissed) return null;
-  const interactive = shown && !yielding;
-  return (
-    <div
-      className={`vc-gp2027${shown ? " vc-gp2027--in" : ""}${
-        yielding ? " vc-gp2027--yield" : ""
-      }`}
-      role="complementary"
-      aria-label="Open prize pool announcement"
-      aria-hidden={!interactive}
-    >
-      <a
-        href="/prizes"
-        className="vc-gp2027__card"
-        tabIndex={interactive ? 0 : -1}
-      >
-        <span className="vc-label vc-gp2027__kicker">Open prize pool</span>
-        <span className="vc-gp2027__amount vc-nums">{usd.format(total)}</span>
-        <span className="vc-gp2027__hint">
-          From monthly awards to the $1,000,000 Grand Prize&nbsp;→
-        </span>
-      </a>
-      <button
-        type="button"
-        className="vc-gp2027__close"
-        aria-label="Dismiss the open prize pool announcement"
-        tabIndex={interactive ? 0 : -1}
-        onClick={() => {
-          setDismissed(true);
-          try {
-            window.localStorage.setItem(PRIZE_STICKER_DISMISS_KEY, "1");
-          } catch (e) {
-            // Best effort — session-only dismissal.
-          }
-        }}
-      >
-        ×
-      </button>
-    </div>
-  );
-}
-
 const SponsorAvatar = ({ sponsor }) => {
   if (!sponsor.image) {
     return <span className="vc-sponsor__avatar" aria-hidden="true" />;
@@ -520,7 +396,6 @@ export function Landing() {
   const { prizes: openPrizes = [] } = usePluginData("prizes-data") || {};
   const { awardedTotal = 0 } = usePluginData("winners-data") || {};
   const { counts = {} } = usePluginData("atlas-data") || {};
-  const openPrizeTotal = openPrizes.reduce((sum, p) => sum + p.amount, 0);
   const openById = Object.fromEntries(openPrizes.map((p) => [p.id, p]));
   const grandPrize2027 = openById["grand-prize-2027"];
   const firstLetters = openById["first-letters-2027"];
@@ -913,9 +788,6 @@ export function Landing() {
             </div>
           </div>
         </section>
-
-        {/* $1,000,000 · 2027 Grand Prize floating teaser (landing only). */}
-        <PrizePoolSticker total={openPrizeTotal} />
       </div>
     </>
   );
