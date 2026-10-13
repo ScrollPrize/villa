@@ -186,15 +186,58 @@ def structure_tensor_normal(window, sigma_grad, sigma_tensor, aniso_ratio):
     return v[:, -1], ok, float(lam1), float(lam2)
 
 
-def interface_distance(profile, half, prominence):
-    """Smallest |s| of a qualifying |gradient| peak, or None."""
+def qualifying_peaks(profile, prominence):
+    """Indices of |gradient| peaks with at least prominence * max prominence."""
     g = np.abs(np.gradient(np.asarray(profile, float)))
     if g.max() <= 0:
-        return None
+        return np.array([], dtype=int)
     peaks, _ = find_peaks(g, prominence=prominence * g.max())
+    return peaks
+
+
+def interface_distance(profile, half, prominence):
+    """Smallest |s| of a qualifying |gradient| peak, or None."""
+    peaks = qualifying_peaks(profile, prominence)
     if len(peaks) == 0:
         return None
     return float(np.min(np.abs(peaks - half)))
+
+
+BAND_KEYS = ("d_minus", "d_plus", "band_width", "band_position", "inside_brighter")
+
+
+def interface_band(profile, half, prominence):
+    """The nearest qualifying peak on each side of index half, and the band
+    they bound.
+
+    d_minus / d_plus are the distances to the nearest peak at index <= half /
+    >= half (both 0 for a peak at half). inside_brighter compares the mean of
+    the profile strictly between the two peaks with the mean outside them.
+    min of the non-None sides equals interface_distance() on the same input.
+    """
+    prof = np.asarray(profile, float)
+    peaks = qualifying_peaks(prof, prominence)
+    out = dict.fromkeys(BAND_KEYS)
+    below, above = peaks[peaks <= half], peaks[peaks >= half]
+    a = int(below.max()) if len(below) else None
+    b = int(above.min()) if len(above) else None
+    if a is not None:
+        out["d_minus"] = float(half - a)
+    if b is not None:
+        out["d_plus"] = float(b - half)
+    if a is None or b is None:
+        return out
+    out["band_width"] = float(b - a)
+    if b == a:
+        return out
+    out["band_position"] = round((half - a) / (b - a), 4)
+    inside = prof[a + 1:b]
+    outside = np.concatenate([prof[:a], prof[b + 1:]])
+    # find_peaks never returns the first or last sample, nor two adjacent
+    # samples, so both segments are non-empty; the guard keeps it explicit
+    if len(inside) and len(outside):
+        out["inside_brighter"] = bool(inside.mean() > outside.mean())
+    return out
 
 
 def analyze_point(pt, arr, chain, args):
@@ -215,7 +258,7 @@ def analyze_point(pt, arr, chain, args):
     qc = map_points_zyx(corners, chain, args.moving_offset_zyx)
     if np.any(qc.max(axis=0) < 0) or np.any(qc.min(axis=0) > np.array(arr.shape) - 1):
         rec.update({"read_box_inside_reference": 0.0, "masked_zero_fraction": 1.0,
-                    "D_voxels": None, "evaluable": False,
+                    "D_voxels": None, **dict.fromkeys(BAND_KEYS), "evaluable": False,
                     "non_evaluable_reasons": ["outside_reference"]})
         return rec
 
@@ -226,7 +269,7 @@ def analyze_point(pt, arr, chain, args):
     if not block.any():  # masked or empty region: nothing to resample
         rec.update({"read_box_inside_reference": round(inside, 4),
                     "masked_zero_fraction": 1.0, "D_voxels": None,
-                    "evaluable": False,
+                    **dict.fromkeys(BAND_KEYS), "evaluable": False,
                     "non_evaluable_reasons": ["masked_zero_fraction_exceeds_cap"]})
         return rec
 
@@ -254,6 +297,7 @@ def analyze_point(pt, arr, chain, args):
     # masked (zero) voxels are checked on what the mode actually uses: the
     # whole window when the normal comes from it, the raw profile otherwise
     D = None
+    band = dict.fromkeys(BAND_KEYS)
     if normal is not None:
         rec["normal_zyx"] = [round(float(v), 4) for v in normal]
         s = np.arange(-half, half + 1, dtype=float)
@@ -269,8 +313,10 @@ def analyze_point(pt, arr, chain, args):
         D = interface_distance(prof, half, args.prominence)
         if D is None:
             reasons.append("no_qualifying_interface")
+        band = interface_band(prof, half, args.prominence)
     rec.setdefault("masked_zero_fraction", None)
     rec["D_voxels"] = D
+    rec.update(band)
     rec["evaluable"] = not reasons
     rec["non_evaluable_reasons"] = reasons
     return rec
@@ -296,7 +342,23 @@ def summarize(records, threshold):
             "wilson95_fraction_within": wilson(k, len(ev)),
             "median_D_voxels": float(np.median(d)) if d else None,
             "non_evaluable_reasons": _count([x for r in records
-                                             for x in r["non_evaluable_reasons"]])}
+                                             for x in r["non_evaluable_reasons"]]),
+            **summarize_band(ev)}
+
+
+def summarize_band(ev):
+    """Band entries over evaluable records bracketed by a peak on each side."""
+    br = [r for r in ev if r.get("d_minus") is not None and r.get("d_plus") is not None]
+    widths = [r["band_width"] for r in br]
+    inside = [r["inside_brighter"] for r in br if r.get("inside_brighter") is not None]
+    k, n = sum(inside), len(inside)
+    w = wilson(k, n)
+    return {"bracketed": len(br),
+            "median_band_width_voxels": float(np.median(widths)) if widths else None,
+            "inside_brighter": {"k": k, "n": n,
+                                "fraction": round(k / n, 4) if n else None,
+                                "wilson_low": w[0] if w else None,
+                                "wilson_high": w[1] if w else None}}
 
 
 def _count(items):
@@ -367,8 +429,9 @@ def main(argv=None):
               "summary": summary, "records": records}
     Path(args.output).write_text(json.dumps(result, indent=1))
     if args.csv:
-        keys = ["id", "evaluable", "D_voxels", "normal_source", "masked_zero_fraction",
-                "read_box_inside_reference", "region", "sampled_from"]
+        keys = ["id", "evaluable", "D_voxels", *BAND_KEYS, "normal_source",
+                "masked_zero_fraction", "read_box_inside_reference", "region",
+                "sampled_from"]
         with open(args.csv, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(keys + ["point_z", "point_y", "point_x", "reasons"])

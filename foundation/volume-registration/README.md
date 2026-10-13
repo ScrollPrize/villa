@@ -147,6 +147,24 @@ point is on, and it says nothing about ink. It is a geometric consistency
 check, useful for catching depth that is off by several voxels or that wanders
 between neighbouring points.
 
+Each record also describes the band around the point. `d_minus` and `d_plus`
+are the distances along the normal to the nearest qualifying peak on the minus
+side and on the plus side of the point, and both are 0 when a peak sits exactly
+at the point. `band_width` is their sum and `band_position` is
+`d_minus / band_width`. `inside_brighter` is true when the mean profile strictly
+between the two peaks is higher than the mean profile outside them. These fields
+are computed whenever `D` is computed and are null whenever `D` is null, so on
+every row where `D` is set it equals the smaller of `d_minus` and `d_plus`, or
+the one of them that is set. The band is the pair of nearest qualifying
+interfaces along the normal, which need not be the recto and verso of one
+sheet, and which side counts as minus depends on the orientation of the
+supplied or estimated normal. `inside_brighter` only says that the point sits
+in a band that is denser than its surroundings in the reference scan; it does
+not say that the point is in papyrus or at ink. The summary adds `bracketed`,
+the number of evaluable points with a peak on each side, and their
+`median_band_width_voxels`. It also counts `inside_brighter` over the bracketed
+points whose band has nonzero width, with a Wilson 95% interval.
+
 ```bash
 # points in the canonical 2.4um PHerc. Paris 4 frame, reference is the 1.129um
 # rescan; its transform.json registers 1.129um (moving) to canonical (fixed),

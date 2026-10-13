@@ -1,4 +1,5 @@
 """Phantom and parsing tests for interface_distance.py (no network, no zarr)."""
+import csv
 import json
 import sys
 from pathlib import Path
@@ -221,7 +222,174 @@ def test_main_end_to_end(tmp_path, monkeypatch):
     s = json.loads(out.read_text())["summary"]
     assert set(s) == {"n_points", "n_evaluable", "threshold_voxels", "n_within_threshold",
                       "fraction_within_threshold", "wilson95_fraction_within",
-                      "median_D_voxels", "non_evaluable_reasons"}
+                      "median_D_voxels", "non_evaluable_reasons", "bracketed",
+                      "median_band_width_voxels", "inside_brighter"}
     assert (s["n_points"], s["n_evaluable"], s["n_within_threshold"]) == (2, 1, 1)
     assert s["non_evaluable_reasons"] == {"no_normal_supplied": 1}
     assert len(out_csv.read_text().splitlines()) == 1 + 2  # header + one row per point
+
+
+# ----------------------------------------------------------------- band fields
+BAND_KEYS = ["d_minus", "d_plus", "band_width", "band_position", "inside_brighter"]
+
+
+def assert_d_is_nearest_side(rec):
+    """D_voxels is the nearer side of the band whenever it is set; with no D,
+    every band field is None."""
+    if rec["D_voxels"] is None:
+        assert all(rec[k] is None for k in BAND_KEYS), rec
+        return
+    sides = [x for x in (rec["d_minus"], rec["d_plus"]) if x is not None]
+    assert sides and rec["D_voxels"] == min(sides)
+
+
+def two_slab_volume(shape, normal_zyx, gap, thickness=20.0):
+    """Two bright slabs either side of the volume centre, a dark gap between."""
+    a, n, centre = slab_volume(shape, normal_zyx, -gap / 2 - thickness, thickness)
+    b, _, _ = slab_volume(shape, normal_zyx, gap / 2, thickness)
+    return np.maximum(a, b), n, centre
+
+
+def identity_chain(tmp_path):
+    write_transform(tmp_path / "id.json", np.c_[np.eye(3), np.zeros(3)])
+    return idist.load_chain([str(tmp_path / "id.json")])[0]
+
+
+@pytest.mark.parametrize("mode", ["volume", "points"])
+@pytest.mark.parametrize("thickness", [8.0, 12.0])
+def test_band_point_centred_in_bright_slab(tmp_path, mode, thickness):
+    chain = identity_chain(tmp_path)
+    vol, n, centre = slab_volume((96, 96, 96), (0.3, 0.8, 0.52), -thickness / 2, thickness)
+    rec = idist.analyze_point({"id": "p", "zyx": centre, "normal_zyx": n}, vol, chain,
+                              default_args(normal=mode))
+    assert rec["evaluable"], rec["non_evaluable_reasons"]
+    assert abs(rec["d_minus"] - thickness / 2) <= 1
+    assert abs(rec["d_plus"] - thickness / 2) <= 1
+    assert abs(rec["band_width"] - thickness) <= 1
+    assert rec["band_width"] == rec["d_minus"] + rec["d_plus"]
+    assert abs(rec["band_position"] - 0.5) <= 0.1
+    assert rec["inside_brighter"] is True
+    assert_d_is_nearest_side(rec)
+
+
+@pytest.mark.parametrize("mode", ["volume", "points"])
+def test_band_point_in_dark_gap_between_slabs(tmp_path, mode):
+    chain = identity_chain(tmp_path)
+    gap = 8.0
+    vol, n, centre = two_slab_volume((96, 96, 96), (0.3, 0.8, 0.52), gap)
+    rec = idist.analyze_point({"id": "p", "zyx": centre, "normal_zyx": n}, vol, chain,
+                              default_args(normal=mode))
+    assert rec["evaluable"], rec["non_evaluable_reasons"]
+    assert abs(rec["band_width"] - gap) <= 1
+    assert rec["inside_brighter"] is False
+    assert_d_is_nearest_side(rec)
+
+
+def test_band_single_step_edge_is_one_sided(tmp_path):
+    chain = identity_chain(tmp_path)
+    # the slab is far thicker than the profile, so the profile crosses one face
+    vol, n, centre = slab_volume((96, 96, 96), (0.3, 0.8, 0.52), 3.0, thickness=200.0)
+    args = default_args(normal="points")
+    rec = idist.analyze_point({"id": "p", "zyx": centre, "normal_zyx": n}, vol, chain, args)
+    assert rec["evaluable"], rec["non_evaluable_reasons"]
+    assert rec["d_minus"] is None and abs(rec["d_plus"] - 3.0) <= 1
+    assert rec["band_width"] is None and rec["band_position"] is None
+    assert rec["inside_brighter"] is None
+    assert rec["D_voxels"] == rec["d_plus"]
+    # which side is "minus" follows the orientation of the supplied normal
+    flip = idist.analyze_point({"id": "q", "zyx": centre, "normal_zyx": -n}, vol, chain, args)
+    assert flip["d_plus"] is None and flip["d_minus"] == rec["d_plus"]
+    assert flip["D_voxels"] == rec["D_voxels"]
+
+
+def test_d_voxels_is_nearest_band_side_across_points(tmp_path):
+    chain = identity_chain(tmp_path)
+    vol, n, centre = slab_volume((96, 96, 96), (0.3, 0.8, 0.52), -5.0, 10.0)
+    args = default_args(normal="points")
+    shapes = set()
+    for shift in np.arange(-10.5, 11.0, 1.5):
+        rec = idist.analyze_point({"id": f"{shift}", "zyx": centre + shift * n,
+                                   "normal_zyx": n}, vol, chain, args)
+        assert rec["evaluable"], (shift, rec["non_evaluable_reasons"])
+        assert_d_is_nearest_side(rec)
+        shapes.add((rec["d_minus"] is not None, rec["d_plus"] is not None))
+    # the sweep covered bracketed points and one-sided points
+    assert (True, True) in shapes and len(shapes) >= 2
+
+
+def test_band_fields_follow_d_voxels_on_non_evaluable_points(tmp_path):
+    chain = identity_chain(tmp_path)
+    vol, n, c = slab_volume((64, 64, 64), (0.0, 0.0, 1.0), 2.0)
+    far = idist.analyze_point({"id": "far", "zyx": np.array([500.0, 500.0, 500.0]),
+                               "normal_zyx": n}, vol, chain, default_args(normal="points"))
+    assert far["non_evaluable_reasons"] == ["outside_reference"]
+    assert all(far[k] is None for k in BAND_KEYS)
+    bare = idist.analyze_point({"id": "bare", "zyx": c, "normal_zyx": None}, vol, chain,
+                               default_args(normal="points"))
+    assert bare["non_evaluable_reasons"] == ["no_normal_supplied"]
+    assert all(bare[k] is None for k in BAND_KEYS)
+    # over the masked-fraction cap, D is still measured and so is the band
+    vol[:, 32:, 40:] = 0
+    hit = idist.analyze_point({"id": "hit", "zyx": c + [0, 5, 0], "normal_zyx": n}, vol,
+                              chain, default_args(normal="points", max_zero_fraction=0.1))
+    assert not hit["evaluable"] and hit["D_voxels"] is not None
+    assert_d_is_nearest_side(hit)
+
+
+def test_interface_band_peak_at_point():
+    # a single |gradient| peak exactly at index half: both sides are 0
+    profile = [0.0] * 10 + [0.5] + [1.0] * 10
+    band = idist.interface_band(profile, 10, 0.25)
+    assert band == {"d_minus": 0.0, "d_plus": 0.0, "band_width": 0.0,
+                    "band_position": None, "inside_brighter": None}
+    assert idist.interface_distance(profile, 10, 0.25) == 0.0
+    flat = idist.interface_band([5.0] * 21, 10, 0.25)
+    assert all(v is None for v in flat.values())
+
+
+def test_summary_band_entries():
+    def rec(ev, dm, dp, inside, d=1.0):
+        bw = None if dm is None or dp is None else dm + dp
+        return {"evaluable": ev, "D_voxels": d, "d_minus": dm, "d_plus": dp,
+                "band_width": bw, "inside_brighter": inside,
+                "non_evaluable_reasons": [] if ev else ["masked_zero_fraction_exceeds_cap"]}
+    recs = [rec(True, 2.0, 4.0, True), rec(True, 1.0, 7.0, False),
+            rec(True, 3.0, 7.0, True), rec(True, 0.0, 0.0, None, d=0.0),
+            rec(True, 2.0, None, None), rec(False, 1.0, 9.0, True)]
+    s = idist.summarize(recs, 3.0)
+    assert s["bracketed"] == 4  # the non-evaluable bracketed point is not counted
+    assert s["median_band_width_voxels"] == 7.0  # widths 0, 6, 8, 10
+    lo, hi = idist.wilson(2, 3)
+    assert s["inside_brighter"] == {"k": 2, "n": 3, "fraction": 0.6667,
+                                    "wilson_low": lo, "wilson_high": hi}
+    # the existing entries do not see the band fields
+    assert (s["n_evaluable"], s["n_within_threshold"]) == (5, 5)
+    none = idist.summarize([rec(True, 2.0, None, None)], 3.0)
+    assert none["bracketed"] == 0 and none["median_band_width_voxels"] is None
+    assert none["inside_brighter"] == {"k": 0, "n": 0, "fraction": None,
+                                       "wilson_low": None, "wilson_high": None}
+
+
+def test_main_csv_has_band_columns_after_d(tmp_path, monkeypatch):
+    write_transform(tmp_path / "id.json", np.c_[np.eye(3), np.zeros(3)])
+    vol, _, _ = slab_volume((64, 64, 64), (0.0, 0.0, 1.0), -4.0, 8.0)
+    monkeypatch.setattr(idist, "open_reference", lambda path, level: vol)
+    (tmp_path / "pts.csv").write_text(
+        "id,x,y,z,nx,ny,nz\na,31.5,31.5,31.5,1,0,0\nb,31.5,31.5,31.5,,,\n")
+    out, out_csv = tmp_path / "out.json", tmp_path / "out.csv"
+    idist.main(["--points", str(tmp_path / "pts.csv"), "--step", str(tmp_path / "id.json"),
+                "--reference", "phantom", "--normal", "points", "--window", "20",
+                "--profile-half", "12", "--smooth-sigma", "1",
+                "--output", str(out), "--csv", str(out_csv)])
+    with open(out_csv, newline="") as f:
+        rows = list(csv.reader(f))
+    assert rows[0] == ["id", "evaluable", "D_voxels", *BAND_KEYS, "normal_source",
+                       "masked_zero_fraction", "read_box_inside_reference", "region",
+                       "sampled_from", "point_z", "point_y", "point_x", "reasons"]
+    a, b = (dict(zip(rows[0], r)) for r in rows[1:])
+    assert a["evaluable"] == "True" and a["inside_brighter"] == "True"
+    assert abs(float(a["band_width"]) - 8.0) <= 1
+    assert float(a["D_voxels"]) == min(float(a["d_minus"]), float(a["d_plus"]))
+    assert all(b[k] == "" for k in BAND_KEYS)
+    s = json.loads(out.read_text())["summary"]
+    assert (s["bracketed"], s["inside_brighter"]["k"], s["inside_brighter"]["n"]) == (1, 1, 1)
