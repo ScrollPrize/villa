@@ -192,6 +192,9 @@ signals:
                                     qint64 bytesReceived, qint64 totalBytes);
     void checkpointDownloadFinished(const QString& localPath, const QString& error);
     void checkpointUploadProgress(qint64 sentBytes, qint64 totalBytes);
+    void fiberVolumeUploadProgress(qint64 sentBytes, qint64 totalBytes);
+    void fiberVolumeUploadActive(bool active);
+    void fiberVolumeResolved(const QString& localPath, const QString& hostPath);
     // A checkpoint was loaded into the live session at the given iteration.
     void checkpointLoaded(const QString& hostPath, qint64 restoredIteration);
     // The service refused a checkpoint. ``stage`` is the rebuild that would
@@ -329,6 +332,7 @@ private:
     void sendRebuildRequest(QJsonObject request);
     void sendInitializeRequest(QJsonObject request);
     void prepareSessionRequest(QJsonObject request, bool initialize);
+    void prepareResolvedSessionRequest(QJsonObject request, bool initialize);
     void sendLoadCheckpoint(QJsonObject body, const QString& hostPath,
                             const QString& localPath);
     // Streams a client-local resume checkpoint into the service's
@@ -336,7 +340,8 @@ private:
     void uploadCheckpointForResume(const QString& localPath,
                                    std::function<void(const QString& hostPath,
                                                       const QString& error,
-                                                      bool reused)> done);
+                                                      bool reused)> done,
+                                   const QString& kind = QStringLiteral("checkpoint"));
 
     SpiralServiceProfile _profile;
     QProcess* _process = nullptr;       // owned local service process, if any

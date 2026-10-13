@@ -369,6 +369,7 @@ FIT_INPUT_CATALOG: tuple[FitInputSpec, ...] = (
                  required=_verified_patches_enabled),
     FitInputSpec("fibers", "directory", conventional_relative="fibers",
                  enabled=_fibers_enabled),
+    FitInputSpec("automated_fiber_volume", "file", enabled=_fibers_enabled),
     FitInputSpec("fiber_directions", "file",
                  conventional_relative="fiber_directions.npz",
                  enabled=_fiber_directions_enabled,
@@ -446,6 +447,7 @@ class SpiralInputPaths:
     umbilicus: str = ""
     pcls: tuple[PclInputSpec, ...] = ()
     fibers: str = ""
+    automated_fiber_volume: str = ""
     fiber_directions: str = ""
     tracks_dbm: str = ""
     verified_patches: str = ""
@@ -816,6 +818,7 @@ def conventional_input_paths(
         umbilicus=resolve("umbilicus"),
         pcls=pcls,
         fibers=resolve("fibers"),
+        automated_fiber_volume=resolve("automated_fiber_volume"),
         fiber_directions=resolve("fiber_directions"),
         tracks_dbm=resolve("tracks_dbm"),
         verified_patches=resolve("verified_patches"),
@@ -1236,7 +1239,17 @@ def validate_session_request(
     def check_catalog_input(spec: FitInputSpec) -> None:
         if not spec.enabled(run.config):
             return
-        if spec.kind == "file":
+        if spec.key == "automated_fiber_volume":
+            if not paths.automated_fiber_volume:
+                return
+            try:
+                from afv_input import validate_afv_container
+                if Path(paths.automated_fiber_volume).suffix.lower() != ".afv":
+                    raise ValueError("Expected an Automated Fiber Volume (.afv)")
+                validate_afv_container(paths.automated_fiber_volume)
+            except Exception as exc:
+                errors.append({"field": "automated_fiber_volume", "message": f"Invalid AFV: {exc}"})
+        elif spec.kind == "file":
             require_file(getattr(paths, spec.key), spec.key,
                          json_file=spec.json_content)
         elif spec.kind in ("directory", "zarr-group"):

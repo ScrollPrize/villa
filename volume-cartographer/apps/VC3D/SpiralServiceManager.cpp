@@ -602,8 +602,38 @@ void SpiralServiceManager::rebuildSession(QJsonObject request)
     prepareSessionRequest(std::move(request), false);
 }
 
-void SpiralServiceManager::prepareSessionRequest(QJsonObject request,
-                                                 bool initialize)
+void SpiralServiceManager::prepareSessionRequest(QJsonObject request, bool initialize)
+{
+    const QString fibers = request.value("paths").toObject().value("automated_fiber_volume").toString().trimmed();
+    const QFileInfo file(fibers);
+    const QString output = _advertisedDataset.value("resolved").toObject().value("output_directory").toString();
+    const bool serviceFile = !output.isEmpty()
+        && fibers.startsWith(QDir(output).filePath(QStringLiteral("uploaded-fiber-volumes/")));
+    if (!file.isFile() || file.suffix().compare(QStringLiteral("afv"), Qt::CaseInsensitive) != 0 || serviceFile) {
+        prepareResolvedSessionRequest(std::move(request), initialize);
+        return;
+    }
+    emit fiberVolumeUploadActive(true);
+    emit logMessage(tr("Preparing Automated Fiber Volume %1 for the service…").arg(fibers));
+    uploadCheckpointForResume(fibers,
+        [this, request, initialize, fibers](const QString& hostPath, const QString& error, bool reused) mutable {
+            emit fiberVolumeUploadActive(false);
+            if (hostPath.isEmpty()) {
+                emit errorOccurred(tr("Automated Fiber Volume upload failed: %1").arg(error));
+                return;
+            }
+            emit fiberVolumeResolved(fibers, hostPath);
+            emit logMessage(reused ? tr("Reusing Automated Fiber Volume already on the service")
+                                   : tr("Automated Fiber Volume uploaded"));
+            auto paths = request.value("paths").toObject();
+            paths["automated_fiber_volume"] = hostPath;
+            request["paths"] = paths;
+            prepareResolvedSessionRequest(std::move(request), initialize);
+        }, QStringLiteral("afv"));
+}
+
+void SpiralServiceManager::prepareResolvedSessionRequest(QJsonObject request,
+                                                         bool initialize)
 {
     // The service owns its base inputs (it is launched with --dataset), so a
     // session construction request carries run
@@ -611,6 +641,8 @@ void SpiralServiceManager::prepareSessionRequest(QJsonObject request,
     const QJsonObject requested =
         request.value(QStringLiteral("paths")).toObject();
     QJsonObject selectable;
+    const QString fibers = requested.value(QStringLiteral("automated_fiber_volume")).toString().trimmed();
+    if (!fibers.isEmpty()) selectable[QStringLiteral("automated_fiber_volume")] = fibers;
     const QString tracks = requested.value(QStringLiteral("tracks_dbm")).toString().trimmed();
     if (!tracks.isEmpty()) selectable[QStringLiteral("tracks_dbm")] = tracks;
     const QString checkpoint = requested.value(QStringLiteral("checkpoint")).toString().trimmed();
@@ -686,12 +718,12 @@ void SpiralServiceManager::sendInitializeRequest(QJsonObject request)
 
 void SpiralServiceManager::uploadCheckpointForResume(
     const QString& localPath,
-    std::function<void(const QString&, const QString&, bool)> done)
+    std::function<void(const QString&, const QString&, bool)> done, const QString& kind)
 {
     const quint64 generation = _connectionGeneration;
     auto* watcher = new QFutureWatcher<QJsonObject>(this);
     connect(watcher, &QFutureWatcher<QJsonObject>::finished, this,
-            [this, watcher, localPath, generation, done]() {
+            [this, watcher, localPath, generation, done, kind]() {
                 const QJsonObject digest = watcher->result();
                 watcher->deleteLater();
                 if (generation != _connectionGeneration) return;
@@ -708,7 +740,7 @@ void SpiralServiceManager::uploadCheckpointForResume(
                 if (inputId.isEmpty()) inputId = QStringLiteral("uploaded.ckpt");
                 inputId.truncate(120);
                 const QJsonObject begin{
-                    {QStringLiteral("kind"), QStringLiteral("checkpoint")},
+                    {QStringLiteral("kind"), kind},
                     {QStringLiteral("id"), inputId},
                     {QStringLiteral("files"), QJsonArray{QJsonObject{
                         {QStringLiteral("name"), inputId},
@@ -717,14 +749,14 @@ void SpiralServiceManager::uploadCheckpointForResume(
                     }}},
                 };
                 post(QStringLiteral("/session/inputs"), begin, Timeout::Command,
-                     [this, localPath, inputId, done](const QJsonObject& response) {
+                     [this, localPath, inputId, done, kind](const QJsonObject& response) {
                          if (response.value(QStringLiteral("deduplicated")).toBool()) {
                              const QString hostPath =
                                  response.value(QStringLiteral("input")).toObject()
                                      .value(QStringLiteral("path")).toString();
                              done(hostPath,
                                   hostPath.isEmpty()
-                                      ? tr("The service did not return the cached checkpoint path")
+                                      ? tr("The service did not return the cached input path")
                                       : QString(),
                                   true);
                              return;
@@ -751,8 +783,9 @@ void SpiralServiceManager::uploadCheckpointForResume(
                          auto* reply = _network->put(request, fileRaw);
                          fileRaw->setParent(reply);
                          connect(reply, &QNetworkReply::uploadProgress, this,
-                                 [this](qint64 sent, qint64 total) {
-                                     emit checkpointUploadProgress(sent, total);
+                                 [this, kind](qint64 sent, qint64 total) {
+                                     if (kind == QStringLiteral("afv")) emit fiberVolumeUploadProgress(sent, total);
+                                     else emit checkpointUploadProgress(sent, total);
                                  });
                          const quint64 putGeneration = _connectionGeneration;
                          connect(reply, &QNetworkReply::finished, this,
@@ -767,7 +800,7 @@ void SpiralServiceManager::uploadCheckpointForResume(
                                                                       .value(QStringLiteral("path")).toString();
                                                               done(hostPath,
                                                                    hostPath.isEmpty()
-                                                                       ? QObject::tr("The service did not return the checkpoint path")
+                                                                       ? QObject::tr("The service did not return the input path")
                                                                        : QString(),
                                                                    false);
                                                           },

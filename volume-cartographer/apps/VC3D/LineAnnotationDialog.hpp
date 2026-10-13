@@ -40,6 +40,7 @@ class QHBoxLayout;
 class QMenu;
 class QResizeEvent;
 class QTimer;
+class QToolButton;
 class QVariantAnimation;
 class QVBoxLayout;
 class QSplitter;
@@ -207,6 +208,8 @@ public:
     // Empty retracts the notice; see updateUmbilicusNotice().
     void setUmbilicusNotice(const QString& notice);
     void setFiberDisplayName(const QString& name);
+    // Read-only collection previews can explicitly open an editable copy.
+    void setEditCopyAvailable(bool available);
     // "H"/"V" (or empty) shown next to the fiber name in the top-right label.
     void setFiberHvTag(const QString& tag);
     // Rebuilds the clickable tag buttons in the top bar. enabled=false while the
@@ -225,6 +228,7 @@ public:
     bool cutFollowEnabled() const { return _currentCutFollowsStripMouse; }
 
 signals:
+    void editCopyRequested();
     void volumeOverlayToggleRequested();
     void fiberWidthChanged(double baseVoxels);
     void controlDisplayAngleChanged(size_t controlIndex, double degrees);
@@ -627,6 +631,7 @@ private:
     int _appliedExtrapolationDistanceVx = 0;
     QSpinBox* _maxControlPointExtrapolationDistanceSpin = nullptr;
     QLabel* _fiberNameLabel = nullptr;
+    QToolButton* _editCopyButton = nullptr;
     QPointer<QLabel> _optimizationStatusLabel;
     bool _optimizationStatusOptimized = false;
     QWidget* _fiberTraceStatus = nullptr;

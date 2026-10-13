@@ -1550,11 +1550,17 @@ void SpiralWorkspace::addPatchToCurrentFit(
     _service->applyInputDrafts();
 }
 
+void SpiralWorkspace::setOpenFiberVolume(const QString& path)
+{
+    if (_panel) _panel->setOpenFiberVolume(path);
+}
+
 void SpiralWorkspace::addFiberToCurrentFit(const QString& fiberJsonPath)
 {
     if (!_service) return;
     const auto inputId = vc3d::spiralFiberInputId(fiberJsonPath);
     if (inputId.isEmpty()) return;
+    if (_panel) _panel->keepCurrentFiberSourceForSingleFiber();
     _service->stageJsonInput(QStringLiteral("fiber"), fiberJsonPath, inputId);
     _service->applyInputDrafts();
 }

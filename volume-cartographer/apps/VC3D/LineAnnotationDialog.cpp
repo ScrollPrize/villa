@@ -1138,6 +1138,17 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _fiberNameLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     _fiberNameLabel->installEventFilter(this);
     buttonLayout->addWidget(_fiberNameLabel, 1);
+    _editCopyButton = new QToolButton(buttonRow);
+    _editCopyButton->setObjectName(QStringLiteral("lineAnnotationEditCopyButton"));
+    _editCopyButton->setText(tr("Edit a copy"));
+    _editCopyButton->setToolTip(tr("Save a copy in the project's annotations and open it for editing. "
+                                 "The Automated Fiber Volume stays unchanged."));
+    _editCopyButton->hide();
+    buttonLayout->addWidget(_editCopyButton);
+    connect(_editCopyButton, &QToolButton::clicked, this, [this]() {
+        _editCopyButton->setEnabled(false);
+        emit editCopyRequested();
+    });
     _layout->addWidget(buttonRow, 0);
     _fiberTraceStatus = new QWidget(content);
     _fiberTraceStatus->setObjectName(QStringLiteral("fiberTraceStatus"));
@@ -1994,6 +2005,12 @@ void LineAnnotationDialog::setFiberDisplayName(const QString& name)
 {
     _fiberDisplayName = name;
     updateFiberNameLabel();
+}
+
+void LineAnnotationDialog::setEditCopyAvailable(bool available)
+{
+    _editCopyButton->setVisible(available);
+    _editCopyButton->setEnabled(available);
 }
 
 void LineAnnotationDialog::setFiberHvTag(const QString& tag)

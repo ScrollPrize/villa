@@ -48,7 +48,15 @@ or use **File → Open Automated Fiber Volume…**. The dock is under
   Opening the same fiber again while its window is open brings that window
   back. The `.afv` itself is never modified. If the project has no Lasagna
   dataset, the cuts follow a frame transported along the curve instead of
-  measured sheet normals, and a notice says so.
+  measured sheet normals, and a notice says so. To edit a fiber, click
+  **Edit a copy** in the viewer's top bar. This saves a separate copy in the
+  project's annotations and opens it for editing; the `.afv` stays unchanged.
+  Tracing and optimization still require a suitable dataset or fiber model.
+* **Spiral Fit.** The open `.afv` prefills the Spiral panel's optional Automated
+  Fiber Volume input. **Add to Spiral Fit** sends only the selected fiber to an
+  initialized Spiral session, creating a saved, editable copy in the project's
+  annotations if needed. Opening a read-only preview does not create this copy.
+  The `.afv` itself is never modified.
 * **Limits.** The overlay is drawn on planar CT views, axis-aligned or oblique.
   Each viewport retains at most 8 MiB of visible geometry and shows
   **Partial fiber view** beyond that; zoom in or raise the minimum length.
