@@ -1898,6 +1898,7 @@ def test_is_fiber_doc_rejects_present_but_invalid_uuid():
 
 def test_differing_uuids_are_a_conflict_not_a_generation_pick():
     base = make_fiber(BASE_CPS)
+    base['uuid'] = FIBER_UUID_A
     local = make_fiber(BASE_CPS, tags=['x'], generation=3)
     remote = make_fiber(BASE_CPS, tags=['y'], generation=2)
     local['uuid'] = FIBER_UUID_A
@@ -1905,12 +1906,55 @@ def test_differing_uuids_are_a_conflict_not_a_generation_pick():
     result = merge_fibers(base, local, remote)
     assert not result['ok']
     assert any("'uuid' differs" in c for c in result['conflicts'])
-    # Even when only one side "changed", an identity swap is a conflict.
+    # An established identity mismatch with different content stays a conflict.
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    remote['uuid'] = FIBER_UUID_B
+    remote['tags'] = ['changed']
+    assert not merge_fibers(base, local, remote)['ok']
+
+
+def test_identical_named_content_adopts_remote_uuid_without_mutating_inputs():
+    base = make_fiber(BASE_CPS)
     base['uuid'] = FIBER_UUID_A
     local = copy.deepcopy(base)
     remote = copy.deepcopy(base)
     remote['uuid'] = FIBER_UUID_B
-    assert not merge_fibers(base, local, remote)['ok']
+    before = copy.deepcopy((base, local, remote))
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['uuid'] == FIBER_UUID_B
+    assert result['merged']['generation'] == remote['generation']
+    assert (base, local, remote) == before
+
+
+def test_legacy_base_allows_independent_uuid_migration_and_tag_edits():
+    base = make_fiber(BASE_CPS)
+    local = {**copy.deepcopy(base), 'uuid': FIBER_UUID_A, 'tags': ['local']}
+    remote = {**copy.deepcopy(base), 'uuid': FIBER_UUID_B, 'tags': ['remote']}
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['uuid'] == FIBER_UUID_B
+    assert set(result['merged']['tags']) == {'local', 'remote'}
+
+
+@pytest.mark.parametrize('field,value', [
+    ('filename', 'different.json'), ('generation', 2),
+    ('tags', ['changed']), ('unknown_metadata', {'uuid': FIBER_UUID_B}),
+    ('control_points', [cp(0), cp(1, dz=1)]),
+])
+def test_same_fiber_content_ignores_only_top_level_uuid(field, value):
+    local = make_fiber(BASE_CPS)
+    remote = {**copy.deepcopy(local), 'uuid': FIBER_UUID_B}
+    assert fiber_merge.same_fiber_content(local, remote)
+    remote[field] = value
+    assert not fiber_merge.same_fiber_content(local, remote)
+
+
+@pytest.mark.parametrize('filename', [None, '', 42])
+def test_same_fiber_content_requires_a_filename(filename):
+    doc = {**make_fiber(BASE_CPS), 'filename': filename}
+    assert not fiber_merge.same_fiber_content(doc, doc)
 
 
 def test_uuid_survives_merge_from_either_side():

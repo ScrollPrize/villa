@@ -1149,6 +1149,18 @@ def _without_display_normals(doc):
     return doc
 
 
+def same_fiber_content(local, remote):
+    """Same named fiber and all stored content, ignoring only its UUID.
+
+    Callers validate both documents with is_fiber_doc first. A missing
+    filename is not evidence of identity when no common base exists.
+    """
+    return (isinstance(local.get('filename'), str)
+            and bool(local['filename'])
+            and {k: v for k, v in local.items() if k != 'uuid'}
+            == {k: v for k, v in remote.items() if k != 'uuid'})
+
+
 def merge_fibers(base, local, remote):
     """Three-way merge. Returns
     {'ok': bool, 'merged': dict|None, 'conflicts': [str], 'notes': [str],
@@ -1175,14 +1187,19 @@ def merge_fibers(base, local, remote):
             result['conflicts'].append(
                 f"'{field}' differs between versions: {sorted(values)}")
             return result
-    # uuid is the fiber's persistent identity: two sides carrying different
-    # uuids are different fibers, never a newer/older pair to pick between.
-    # A side without one (legacy) adopts the other side's.
+    # Independent loads of a legacy fiber can mint different UUIDs. Matching
+    # named content, or a common base predating UUIDs, establishes identity;
+    # adopt the remote UUID while leaving actual edit conflicts to the merger.
+    # A side without a UUID adopts the other side's.
     side_uuids = {doc['uuid'] for doc in (local, remote) if 'uuid' in doc}
     if len(side_uuids) > 1:
-        result['conflicts'].append(
-            f"'uuid' differs between versions: {sorted(side_uuids)}")
-        return result
+        if same_fiber_content(local, remote) or 'uuid' not in base:
+            local = {**local, 'uuid': remote['uuid']}
+            side_uuids = {remote['uuid']}
+        else:
+            result['conflicts'].append(
+                f"'uuid' differs between versions: {sorted(side_uuids)}")
+            return result
     fiber_uuid = next(iter(side_uuids), None)
 
     def keep_uuid(merged):
