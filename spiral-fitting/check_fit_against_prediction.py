@@ -6,19 +6,21 @@
 
 Every voxel of the surface prediction in a few z-slices is mapped through the fit's slice-to-spiral transform. In spiral
 space winding k is the curve r = dr * (k + phi / 2pi), so a voxel's fractional winding number is
-w = r / dr - phi / 2pi. Each layer of the prediction is the papyrus of one turn of the roll, and a fit with one
-winding per layer puts every predicted voxel at a whole w. Three numbers
-follow, overall and per 30-degree sector of spiral angle:
+w = r / dr - phi / 2pi. Where the prediction has one layer per turn of the roll, a fit with one winding per turn
+puts every predicted voxel at a whole w. Three numbers follow, overall and per 30-degree sector of spiral angle:
 
   alignment          mean resultant length of exp(2 pi i w) over the predicted voxels: 1 when every layer sits on
                      a winding, about 0 when the windings are unrelated to the layers
   windings_per_layer median step in w between consecutive layers at the same angle (layers found as clusters of
-                     predicted voxels in w): 1 for one winding per layer, above 1 when the fit has more windings
-                     than the roll has turns there (the extra windings lie in the gaps, and a nearest-surface snap
-                     moves them onto a neighbouring winding's papyrus)
+                     predicted voxels in w): 1 for one winding per predicted layer, above 1 when the fit has more
+                     windings than the prediction has layers there. That is either extra windings or layers the
+                     prediction misses; either way a nearest-surface snap onto the prediction puts two windings on
+                     one predicted surface
   empty_windings     share of (winding, angle) cells in the fitted range with no layer within 0.2 of the winding
 
-It runs on CPU in seconds per slice, needs no rendering, and reads only the checkpoint and the prediction.
+The numbers are relative to the prediction and inherit its recall, so where they read above 1, look at the raw CT
+to tell extra windings from missed layers. It runs on CPU in seconds per slice, needs no rendering, and reads only
+the checkpoint and the prediction.
 """
 from __future__ import annotations
 
