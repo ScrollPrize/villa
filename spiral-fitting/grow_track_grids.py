@@ -35,6 +35,7 @@ import random
 import shutil
 import tempfile
 import time
+import uuid
 from typing import Callable, Iterable
 
 import numpy as np
@@ -1314,7 +1315,7 @@ def write_surface(output_root: Path, graph: TrackGraph, surface: Surface,
         metadata = {
             "format": "tifxyz",
             "type": "seg",
-            "uuid": name,
+            "uuid": str(uuid.uuid4()),
             "scale": [1.0, 1.0],
             "bbox": [valid_points.min(axis=0).astype(float).tolist(),
                      valid_points.max(axis=0).astype(float).tolist()],
