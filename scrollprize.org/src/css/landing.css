@@ -226,6 +226,12 @@
   color: var(--vc-text-dim);
   margin: 0 0 20px;
 }
+/* The one emphasised phrase in the intro: full text colour, heavier than
+   the intro's links so it reads first. */
+.vc-landing .vc-hero__intro strong {
+  color: var(--vc-text);
+  font-weight: 650;
+}
 .vc-landing .vc-hero__ctas {
   display: flex;
   flex-wrap: wrap;

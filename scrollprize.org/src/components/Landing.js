@@ -594,12 +594,13 @@ export function Landing() {
                   Resurrecting an ancient library from the ashes of a volcano.
                 </Heading>
                 <p className="vc-hero__tagline">
-                  Buried in 79 AD, now being read. Help us finish.
+                  Buried in 79 AD, now being revealed.
                 </p>
                 <p className="vc-hero__intro">
                   Vesuvius Challenge is an open science research organization{" "}
                   <a href="/firstscroll">reading</a> the carbonized Herculaneum
-                  scrolls without opening them. Anyone can help: we run a{" "}
+                  scrolls without opening them. <strong>Anyone can help</strong>:
+                  we run a{" "}
                   <a href="/prizes">$2M competition</a>, with prizes every
                   month.
                 </p>
@@ -718,6 +719,24 @@ export function Landing() {
         </section>
 
         {/* ------------------------------------------------------------------
+            Our story — 79 AD to 2026 on one timeline strip; the 2026 beat
+            links on to the open prizes.
+        ------------------------------------------------------------------ */}
+        <section className="vc-section" aria-labelledby="our-story">
+          <div className="container mx-auto">
+            <div className="vc-h2-row">
+              <Heading as="h2" id="our-story" className="vc-h2">
+                Our story
+              </Heading>
+              <a href="/winners" className="vc-cta vc-h2-row__action">
+                All milestones
+              </a>
+            </div>
+            <StoryStrip />
+          </div>
+        </section>
+
+        {/* ------------------------------------------------------------------
             Team — one credit line + the plain dense lists (already the target
             aesthetic; heading scale fixed).
         ------------------------------------------------------------------ */}
@@ -766,24 +785,6 @@ export function Landing() {
                 { title: "EduceLab Team (Partners)", list: team.educe },
               ]}
             />
-          </div>
-        </section>
-
-        {/* ------------------------------------------------------------------
-            Our story — 79 AD to 2026 on one timeline strip; the 2026 beat
-            links on to the open prizes.
-        ------------------------------------------------------------------ */}
-        <section className="vc-section" aria-labelledby="our-story">
-          <div className="container mx-auto">
-            <div className="vc-h2-row">
-              <Heading as="h2" id="our-story" className="vc-h2">
-                Our story
-              </Heading>
-              <a href="/winners" className="vc-cta vc-h2-row__action">
-                All milestones
-              </a>
-            </div>
-            <StoryStrip />
           </div>
         </section>
 
