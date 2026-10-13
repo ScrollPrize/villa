@@ -1,0 +1,22 @@
+{
+  "fiber_lasagna_surface": {
+    "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/uv_gt_l1_search_v1/trials/9cac11649421bd1f7352",
+    "output_root": "/home/hendrik/villa4/lasagna/data/fiber_surface_pilot_v2",
+    "device": "cpu",
+    "cpu_threads": 8,
+    "joint_threshold": 0.5,
+    "grid_step": 100,
+    "sample_spacing": 50,
+    "max_extrapolation_slope": 1,
+    "uv_bounds": [60000, 80000, 36000, 44000],
+    "max_vertices": 100000,
+    "stages_config": {
+      "base": {"normal": 0, "fixed_uv": 1, "smooth": 0.05, "step": 0.05, "bend": 0.05},
+      "stages": [
+        {"name": "fiber_surface", "steps": 300, "lr": 0.5,
+         "params": ["mesh_ms"], "min_scaledown": 0,
+         "args": {"fixed_uv_ramp": [1, 20], "status_interval": 50}}
+      ]
+    }
+  }
+}

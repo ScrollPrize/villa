@@ -70,9 +70,9 @@ def brackets(candidates,positions,query,max_distance,lo=None,hi=None,target_lo=N
     return result
 
 
-class CurveBank:
-    """Vectorized exact polyline interpolation and shared native normal samples."""
-    def __init__(self,afv,source_ids,normal_root,normal_solution):
+class PolylineBank:
+    """Shared vectorized exact AFV polyline interpolation without normal I/O."""
+    def __init__(self,afv,source_ids):
         self.ids=np.unique(source_ids)
         curves=read_afv_polylines(afv,self.ids)
         if not np.array_equal([row['id'] for row,_ in curves],self.ids):raise ValueError('AFV source identity mismatch')
@@ -88,6 +88,23 @@ class CurveBank:
         self.xyz=np.concatenate(points)
         self.first=np.r_[0,np.cumsum([len(a) for a in arcs])[:-1]]
         self.last=self.first+np.asarray([len(a) for a in arcs])-1
+
+    def sample_xyz(self,source,arc):
+        source=np.asarray(source);arc=np.asarray(arc)
+        valid=np.isfinite(arc)&(arc>=0)&(arc<=self.lengths[source]+1e-6)
+        if not valid.all():raise ValueError('Curve sampling outside source span')
+        arc=np.minimum(arc,self.lengths[source])
+        q=self.base[source]+arc
+        i=np.searchsorted(self.keys,q,side='right')-1
+        i=np.maximum(self.first[source],np.minimum(i,self.last[source]-1))
+        t=(q-self.keys[i])/(self.keys[i+1]-self.keys[i])
+        return self.xyz[i]*(1-t[:,None])+self.xyz[i+1]*t[:,None]
+
+
+class CurveBank(PolylineBank):
+    """Exact polyline interpolation plus shared native normal samples."""
+    def __init__(self,afv,source_ids,normal_root,normal_solution):
+        super().__init__(afv,source_ids)
         doc=json.loads((Path(normal_root)/'index.json').read_text())
         if doc['format']!='fiber-normal-curves' or doc['columns']!=['arc','nx','ny','nz','valid']:raise ValueError('Normal curve format')
         index=np.asarray(doc['index'],np.int64)
@@ -104,14 +121,8 @@ class CurveBank:
 
     def sample(self,source,arc):
         source=np.asarray(source);arc=np.asarray(arc)
-        valid=np.isfinite(arc)&(arc>=0)&(arc<=self.lengths[source]+1e-6)
-        if not valid.all():raise ValueError('Curve sampling outside source span')
+        xyz=self.sample_xyz(source,arc)
         arc=np.minimum(arc,self.lengths[source])  # endpoint roundoff only
-        q=self.base[source]+arc
-        i=np.searchsorted(self.keys,q,side='right')-1
-        i=np.maximum(self.first[source],np.minimum(i,self.last[source]-1))
-        t=(q-self.keys[i])/(self.keys[i+1]-self.keys[i])
-        xyz=self.xyz[i]*(1-t[:,None])+self.xyz[i+1]*t[:,None]
         j=self.normal_first[source]+np.minimum((arc/self.spacing).astype(np.int64),self.normal_count[source]-2)
         a=self.normals[j];b=self.normals[j+1]
         f=(arc-a[:,0])/(b[:,0]-a[:,0]);raw=a[:,1:4]*(1-f[:,None])+b[:,1:4]*f[:,None]

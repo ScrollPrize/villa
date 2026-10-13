@@ -51,6 +51,9 @@ def bp_metrics(log):
 
 
 def run(config):
+    if 'fiber_lasagna_surface' in config:
+        from .fiber_lasagna_surface import run as surface_fit
+        return surface_fit(config['fiber_lasagna_surface'])
     if 'fiber_gt_constraint_score' in config:
         from .fiber_gt_constraint_score import run as score_gt
         return score_gt(config['fiber_gt_constraint_score'])

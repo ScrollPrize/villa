@@ -18,6 +18,7 @@ import opt_loss_dir
 import opt_loss_pred_dt
 import opt_loss_step
 import opt_loss_smooth
+import opt_loss_fixed_uv
 import opt_loss_winding_density
 import opt_loss_corr
 import opt_loss_winding_volume
@@ -404,6 +405,7 @@ lambda_global: dict[str, float] = {
 	"smooth_step": 0.0,
 	"avg_step": 0.0,
 	"smooth": 0.0,
+	"fixed_uv": 0.0,
 	"winding_density": 0.0,
 	"data": 0.0,
 	"data_plain": 0.0,
@@ -1031,6 +1033,7 @@ def optimize(
 	snap_surf_map_state: dict | None = None,
 	require_snap_surf_map_state: bool = False,
 	snap_surf_boundary: dict | None = None,
+	fixed_uv_targets: opt_loss_fixed_uv.FixedUVTargets | None = None,
 ) -> fit_data.FitData3D:
 	_optimize_t0 = time.perf_counter()
 	opt_loss_corr.reset_state()
@@ -1857,7 +1860,12 @@ def optimize(
 				self.acc[key] = 0.0
 
 	Needs = fit_model.ModelForwardNeeds
+	def _fixed_uv_loss(*, res):
+		if fixed_uv_targets is None:
+			raise ValueError('fixed_uv loss enabled without FixedUVTargets')
+		return fixed_uv_targets.loss(res=res)
 	terms = {
+		"fixed_uv": {"loss": _fixed_uv_loss, "needs": Needs()},
 		"step": {"loss": opt_loss_step.step_loss, "needs": Needs()},
 		"step_regularizer": {
 			"loss": opt_loss_step.step_regularizer_loss,
@@ -2564,6 +2572,11 @@ def optimize(
 			pred_dt_flow_gate_cfg_=pred_dt_flow_gate_cfg,
 			pred_dt_normal_source_=pred_dt_normal_source,
 		)
+		fixed_uv_ramp = (opt_cfg.args or {}).get('fixed_uv_ramp')
+		if fixed_uv_ramp is not None:
+			opt_loss_fixed_uv.ramp_weight(fixed_uv_ramp, 0, opt_cfg.steps)
+			if fixed_uv_targets is None or _need_term('fixed_uv', stage_eff) <= 0:
+				raise ValueError('fixed_uv_ramp requires positive fixed_uv weight and targets')
 		if snap_surf_map_opt_stage is not None:
 			stage_needs = stage_needs.merged(Needs(
 				mesh_normals=True,
@@ -3473,8 +3486,14 @@ def optimize(
 						timing: _OptTimingWindow | None = None,
 						atlas_debug_step: int | None = None):
 			"""Evaluate all loss terms, handling both single and multi-loss returns."""
+			if fixed_uv_ramp is not None:
+				eff_ = dict(eff_)
+				eff_['fixed_uv'] = opt_loss_fixed_uv.ramp_weight(
+					fixed_uv_ramp, atlas_debug_step or 0, opt_cfg.steps)
 			total = torch.zeros((), device=next(model.parameters()).device, dtype=torch.float32)
 			tv: dict[str, float] = {}
+			if _need_term('fixed_uv', eff_) > 0:
+				tv['fixed_uv_weight'] = _need_term('fixed_uv', eff_)
 			if stage_uses_cyl_loss:
 				opt_loss_cyl.reset_candidate_terms()
 			D = res_.xyz_lr.shape[0]
