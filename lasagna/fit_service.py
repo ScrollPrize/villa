@@ -163,14 +163,18 @@ def _normalize_single_tifxyz_output(output_dir: Path, output_name: str) -> Path 
     if meta_path.is_file():
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         if isinstance(meta, dict):
-            # A rename keeps the surface's identity; only a missing or legacy
-            # name-derived uuid is replaced (the output is new to this job).
+            # A rename keeps the surface's identity, whatever form it takes
+            # (a random UUID in any case, or a catalog id assigned by the
+            # producer). Only a missing uuid or a legacy one derived from
+            # the output's own name is replaced: name-derived values repeat
+            # across unrelated outputs, so they are not identities.
             current = meta.get("uuid")
-            try:
-                canonical = isinstance(current, str) and str(uuid.UUID(current)) == current
-            except ValueError:
-                canonical = False
-            if not canonical:
+            if (
+                not isinstance(current, str)
+                or not current
+                or current == child.name
+                or current == meta.get("name")
+            ):
                 meta["uuid"] = str(uuid.uuid4())
             meta["name"] = requested
             meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
