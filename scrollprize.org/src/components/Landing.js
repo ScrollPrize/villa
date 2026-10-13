@@ -317,29 +317,58 @@ const SponsorList = ({ list }) => {
   );
 };
 
-/* Team group — plain by default; `collapsible` folds advisor/alumni lists
-   behind an expander so the lower page stays short (content preserved). */
-const TeamGroup = ({ title, list, collapsible }) => {
-  const people = list.map((t, i) => <PersonLink link={t} key={i} />);
-  if (collapsible) {
-    return (
-      <details className="vc-team__group vc-collapse">
-        <summary className="vc-collapse__summary">
-          <span className="vc-collapse__heading">
-            <span className="vc-collapse__title vc-team__group-title">
-              {title}
-            </span>
-          </span>
-          <span className="vc-collapse__arrow" aria-hidden="true">▾</span>
-        </summary>
-        <div className="vc-collapse__body">{people}</div>
-      </details>
-    );
-  }
+const TeamGroup = ({ title, list }) => (
+  <div className="vc-team__group">
+    <h3>{title}</h3>
+    {list.map((t, i) => (
+      <PersonLink link={t} key={i} />
+    ))}
+  </div>
+);
+
+/* Secondary team lists as tabs: at most one open, its people flowing across
+   the full width below the tab row. All closed by default to keep the page
+   short; clicking the open tab closes it. */
+const TeamTabs = ({ groups }) => {
+  const [active, setActive] = useState(null);
   return (
-    <div className="vc-team__group">
-      <h3>{title}</h3>
-      {people}
+    <div className="vc-team-tabs">
+      <div
+        className={`vc-team-tabs__row${active !== null ? " has-open" : ""}`}
+        role="tablist"
+      >
+        {groups.map((g, i) => (
+          <button
+            type="button"
+            role="tab"
+            id={`team-tab-${i}`}
+            aria-selected={active === i}
+            aria-controls={`team-panel-${i}`}
+            className={`vc-team-tabs__tab${active === i ? " is-active" : ""}`}
+            onClick={() => setActive(active === i ? null : i)}
+            key={g.title}
+          >
+            {g.title}
+            <span className="vc-team-tabs__arrow" aria-hidden="true">
+              ▾
+            </span>
+          </button>
+        ))}
+      </div>
+      {groups.map((g, i) => (
+        <div
+          role="tabpanel"
+          id={`team-panel-${i}`}
+          aria-labelledby={`team-tab-${i}`}
+          className="vc-team-tabs__panel"
+          hidden={active !== i}
+          key={g.title}
+        >
+          {g.list.map((t, k) => (
+            <PersonLink link={t} key={k} />
+          ))}
+        </div>
+      ))}
     </div>
   );
 };
@@ -723,21 +752,15 @@ export function Landing() {
               <TeamGroup title="Papyrology Team" list={team.papyrology} />
               <TeamGroup title="Annotation Team" list={team.annotation} />
             </div>
-            {/* Collapsible groups sit full width below the columns, so opening
-                one never reflows the groups above between columns. */}
-            <div className="vc-team__more">
-              <TeamGroup title="Advisors & Alumni" list={team.alumni} collapsible />
-              <TeamGroup
-                title="Papyrology Advisors"
-                list={team.papyrologyAdvisors}
-                collapsible
-              />
-              <TeamGroup
-                title="EduceLab Team (Partners)"
-                list={team.educe}
-                collapsible
-              />
-            </div>
+            {/* Secondary lists as tabs below the columns; the open one spans
+                the full width. */}
+            <TeamTabs
+              groups={[
+                { title: "Advisors & Alumni", list: team.alumni },
+                { title: "Papyrology Advisors", list: team.papyrologyAdvisors },
+                { title: "EduceLab Team (Partners)", list: team.educe },
+              ]}
+            />
           </div>
         </section>
 
