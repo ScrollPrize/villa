@@ -76,6 +76,12 @@ struct S3Url {
 /// Convert an S3 URL string to HTTPS.
 [[nodiscard]] std::string s3_to_https(std::string_view s3_url);
 
+/// The CA bundle to give libcurl when its built-in one is missing. Returns ""
+/// when `builtin` is empty or exists (keep libcurl's default), otherwise the
+/// first of `candidates` that is a regular file ("" if none is).
+[[nodiscard]] std::string select_ca_bundle(
+    std::string_view builtin, std::span<const std::string_view> candidates);
+
 // ---------------------------------------------------------------------------
 // AwsAuth -- AWS SigV4 credentials
 // ---------------------------------------------------------------------------

@@ -357,3 +357,24 @@ TEST_CASE("HttpClient scoped observer receives response body bytes")
     std::filesystem::remove(path);
     CHECK(observed == payload.size());
 }
+
+TEST_CASE("a missing built-in CA bundle falls back to the host's bundle")
+{
+    const auto dir = std::filesystem::temp_directory_path() / "vc_http_ca_bundle_fixture";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto rhel = (dir / "ca-bundle.crt").string();
+    std::ofstream(rhel) << "certs";
+    const auto missing = (dir / "ca-certificates.crt").string();
+    const std::string_view candidates[] = {missing, rhel};
+
+    // RHEL-family host running a Debian-built libcurl (the Linux AppImage).
+    CHECK(utils::select_ca_bundle(missing, candidates) == rhel);
+    // libcurl's own bundle exists, or it has none: keep its default.
+    CHECK(utils::select_ca_bundle(rhel, candidates).empty());
+    CHECK(utils::select_ca_bundle("", candidates).empty());
+    // Nothing usable on the host either.
+    const std::string_view none[] = {missing};
+    CHECK(utils::select_ca_bundle(missing, none).empty());
+    std::filesystem::remove_all(dir);
+}
