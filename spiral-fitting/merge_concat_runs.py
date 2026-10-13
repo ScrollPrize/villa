@@ -31,6 +31,7 @@ import numpy as np
 import tifffile
 
 from surface_orientation import METADATA_KEY as LAYOUT_METADATA_KEY
+from tifxyz_spacing import grid_spacing_and_area
 
 
 def concat_dir(run_dir):
@@ -109,7 +110,7 @@ def meta_of(winding_dir):
         return json.load(f)
 
 
-def save_tifxyz(pts, out_winding_dir, uuid, step_size, voxel_um, source, layout_metadata):
+def save_tifxyz(pts, out_winding_dir, uuid, step_size, voxel_um, source, layout_metadata=None):
     """Write x/y/z.tif + meta.json, mirroring spiral-fitting/tifxyz.py:save_tifxyz.
     `pts` is (H,W,3) in x,y,z order with -1 for invalid, in the layout
     `layout_metadata` records."""
@@ -118,11 +119,7 @@ def save_tifxyz(pts, out_winding_dir, uuid, step_size, voxel_um, source, layout_
     tifffile.imwrite(os.path.join(out_winding_dir, "y.tif"), pts[..., 1].astype(np.float32))
     tifffile.imwrite(os.path.join(out_winding_dir, "z.tif"), pts[..., 2].astype(np.float32))
     valid_vertex = np.any(pts != -1, axis=-1)
-    vq = (
-        valid_vertex[:-1, :-1] & valid_vertex[1:, :-1]
-        & valid_vertex[:-1, 1:] & valid_vertex[1:, 1:]
-    )
-    area_vx2 = int(vq.sum()) * step_size ** 2
+    spacing_cols, spacing_rows, area_vx2 = grid_spacing_and_area(pts, valid_vertex, step_size)
     # bbox over valid vertices only, [x,y,z] low/high (matches tifxyz.py:save_tifxyz)
     valid_pts = pts[valid_vertex]
     bbox = (
@@ -131,7 +128,7 @@ def save_tifxyz(pts, out_winding_dir, uuid, step_size, voxel_um, source, layout_
         else [[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]]
     )
     meta = {
-        "scale": [1.0 / step_size, 1.0 / step_size],
+        "scale": [1.0 / spacing_cols, 1.0 / spacing_rows],
         "bbox": bbox,
         "area_vx2": area_vx2,
         "area_cm2": area_vx2 * voxel_um ** 2 / 1.0e8 if voxel_um else None,
