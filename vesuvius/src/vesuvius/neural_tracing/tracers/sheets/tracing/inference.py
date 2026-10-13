@@ -260,12 +260,22 @@ def main(argv=None):
                     help='replace the path prefix OLD by NEW in the checkpoint\'s data paths (volumes, patch '
                          'directories), e.g. for a checkpoint trained on another machine; repeatable')
     ap.add_argument('--device', default='cuda')
+    ap.add_argument('--voxel-size', type=float, help="level-0 voxel size (um) of --volume for area_cm2 (default: "
+                                                     "its meta.json voxelsize, else the checkpoint's)")
     args = ap.parse_args(argv)
     path = resolve_checkpoint(args.checkpoint)
     model, cfg, _ = load_checkpoint(path, args.device)
     C.path_mapper(args.path_map)(cfg)
     if args.volume:
         cfg.data.volume = args.volume
+        meta = Path(args.volume)/'meta.json'  # volpkg volume metadata, as neural_tracing/infer.py reads it
+        voxel_size = args.voxel_size or (json.loads(meta.read_text()).get('voxelsize') if meta.is_file() else None)
+        if not voxel_size:
+            print(f'No voxel size for {args.volume} (meta.json voxelsize or --voxel-size): area_cm2 assumes '
+                  f'{cfg.data.voxel_size_um} um')
+        cfg.data.voxel_size_um = voxel_size or cfg.data.voxel_size_um
+    elif args.voxel_size:
+        cfg.data.voxel_size_um = args.voxel_size
     if args.threshold is not None:
         cfg.trace.confidence_threshold = args.threshold
     if args.seed_json:

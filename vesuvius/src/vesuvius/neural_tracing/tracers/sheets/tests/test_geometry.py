@@ -651,6 +651,26 @@ def test_written_tifxyz_records_its_area(tmp_path):
     assert meta['area_vx2'] == pytest.approx(11*200.) and meta['area_cm2'] == pytest.approx(11*200.*100/1e8)
 
 
+def test_trace_area_uses_the_voxel_size_of_the_traced_volume(tmp_path, monkeypatch):
+    """--volume of an 8.64 um scan: area_cm2 at its meta.json voxelsize (or --voxel-size), not the checkpoint's 9.6."""
+    from vesuvius.neural_tracing.tracers.sheets.tracing import inference
+    rows = np.stack([np.stack([np.full(13, 5.), np.arange(13.)*10, np.full(13, 20.*t)], -1) for t in range(4)])
+    monkeypatch.setattr(inference, 'load_checkpoint', lambda path, device: (None, C.load(None, []), None))
+    monkeypatch.setattr(inference, 'trace', lambda *a, **k: (rows, np.ones(rows.shape[:2])))
+    (tmp_path/'m.pt').touch()
+    (tmp_path/'seed.json').write_text(json.dumps(dict(points=[[5, 0, 0], [5, 120, 0]], direction=[0, 0, 1])))
+    cases = (('meta', dict(voxelsize=8.64), [], 8.64), ('flag', {}, ['--voxel-size', '7.91'], 7.91),
+             ('none', None, [], 9.6))  # no voxel size known: the checkpoint's data.voxel_size_um, as before
+    for name, volume_meta, extra, um in cases:
+        (tmp_path/name).mkdir()
+        if volume_meta is not None:
+            (tmp_path/name/'meta.json').write_text(json.dumps(volume_meta))
+        inference.main(['--checkpoint', str(tmp_path/'m.pt'), '--volume', str(tmp_path/name), '--seed-json',
+                        str(tmp_path/'seed.json'), '--out', str(tmp_path/'out'/name), '--device', 'cpu', *extra])
+        meta = json.loads((tmp_path/'out'/name/'meta.json').read_text())
+        assert meta['voxel_size_um'] == um and meta['area_cm2'] == pytest.approx(meta['area_vx2']*um**2/1e8)
+
+
 def test_fiber_seed_directions_follow_the_tensor_normal():
     """trace_from_fibers: the 2/8 structure-tensor normal of a tilted bright sheet, and an advance direction in the
     sheet, perpendicular to the fiber, pointing up."""
