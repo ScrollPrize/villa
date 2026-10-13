@@ -370,14 +370,13 @@ def patch_from_payload(payload):
     return patch
 
 
-def load_tifxyz(path, *, z_range=None, skip_empty=False):
+def load_tifxyz(path, *, z_range=None):
     """Load a patch, optionally rejecting it before x/y TIFF decoding.
 
     The z plane and validity mask are sufficient to prove that a patch cannot
     intersect the half-open fit interval.  Coordinate data is used instead of
     historical metadata bboxes because producers have emitted multiple bbox
-    axis orders. With skip_empty=True, return None for patches without any
-    complete valid quad instead of constructing a Patch that would assert.
+    axis orders.
     """
 
     with open(f'{path}/meta.json', 'r') as meta_json:
@@ -420,12 +419,6 @@ def load_tifxyz(path, *, z_range=None, skip_empty=False):
     zyxs_np = np.stack([z_np, y_np, x_np], axis=-1)
     if mask is not None:
         zyxs_np[mask == 0] = -1.0
-
-    if skip_empty:
-        valid = np.any(zyxs_np != -1, axis=-1)
-        if not (valid[:-1, :-1] & valid[1:, :-1]
-                & valid[:-1, 1:] & valid[1:, 1:]).any():
-            return None
 
     zyxs = torch.from_numpy(zyxs_np).to(torch.float32)
 
