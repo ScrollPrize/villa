@@ -77,6 +77,19 @@ class StlGeneratorTests(unittest.TestCase):
                     [["Scroll ID", "Height (mm)", "Diameter (mm)"]],
                 )
 
+    def test_read_axis_direction_and_two_points(self):
+        module = load_stl_generator()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            axis_file = Path(temp_dir) / "4-axis.txt"
+            axis_file.write_text("# umbilicus direction\n0, 0.5, 1\n")
+            self.assertEqual(module.read_axis(str(axis_file)), (0.0, 0.5, 1.0))
+            axis_file.write_text("1 2 3\n1 2 13  # end point\n")
+            self.assertEqual(module.read_axis(str(axis_file)), (0.0, 0.0, 10.0))
+            for bad in ("1 2", "0 0 0", "1 2 3 1 2 3"):
+                axis_file.write_text(bad)
+                with self.assertRaises(ValueError):
+                    module.read_axis(str(axis_file))
+
 
 if __name__ == "__main__":
     unittest.main()
