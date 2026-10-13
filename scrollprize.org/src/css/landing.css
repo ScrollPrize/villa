@@ -60,35 +60,22 @@
   margin-bottom: 32px;
 }
 
-/* News strip header: tiny ember kicker so the strip reads as news links. */
-.vc-landing a.vc-updates__head {
-  display: inline-block;
-  font-size: 11px;
-  font-weight: 650;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--vc-accent);
-  text-decoration: none;
-  margin: 0 0 7px;
-}
-.vc-landing a.vc-updates__head:hover {
-  color: var(--vc-accent);
-  text-decoration: underline;
+/* News heading row sits closer to its one-row strip than other sections. */
+.vc-landing .vc-h2-row.vc-updates__row {
+  margin-bottom: 16px;
 }
 .vc-landing .vc-section--last {
   padding-bottom: var(--vc-section-pad);
 }
 /* Open problems follows the dense news strip directly — half the gap;
-   the prizes board and story ride the tighter 64px rhythm after it. */
+   the story rides the tighter 64px rhythm after it. */
 .vc-landing section[aria-labelledby="open-problems"] {
   padding-top: 48px;
 }
-.vc-landing section[aria-labelledby="open-prizes"],
 .vc-landing section[aria-labelledby="our-story"] {
   padding-top: 64px;
 }
 @media (max-width: 768px) {
-  .vc-landing section[aria-labelledby="open-prizes"],
   .vc-landing section[aria-labelledby="our-story"] {
     padding-top: 48px;
   }
@@ -113,7 +100,7 @@
 
 /* Landing section heading (spec §2: 2.25rem / 700). Scoped above .markdown h2. */
 .vc-landing .vc-h2 {
-  font-size: 2.25rem;
+  font-size: 1.75rem;
   font-weight: 700;
   letter-spacing: -0.01em;
   line-height: 1.15;
@@ -212,35 +199,12 @@
   max-width: 24ch;
   margin: 0 0 12px;
 }
-.vc-landing .vc-hero__tagline {
-  font-size: clamp(1rem, 1.35vw, 1.25rem);
-  font-weight: 700;
-  letter-spacing: -0.01em;
-  line-height: 1.15;
-  color: var(--vc-accent);
-  margin: 0 0 14px;
-}
 .vc-landing .vc-hero__intro {
   max-width: 56ch;
   font-size: 1.0625rem;
   line-height: 1.6;
   color: var(--vc-text-dim);
   margin: 0 0 20px;
-}
-.vc-landing .vc-hero__stats {
-  margin: 28px 0 0;
-  padding-top: 24px;
-  border-top: 1px solid var(--vc-line);
-  row-gap: 12px;
-}
-/* Desktop: the closing band spans column to column, stats spread across it. */
-@media (min-width: 997px) {
-  .vc-landing .vc-hero__stats {
-    justify-content: space-between;
-  }
-}
-.vc-landing .vc-hero__stats .vc-stat__value {
-  font-family: var(--vc-mono);
 }
 /* Our story: wider frame for media, unchanged 640px reading measure. */
 @media (min-width: 997px) {
@@ -262,6 +226,13 @@
   flex-wrap: wrap;
   align-items: center;
   gap: 12px;
+}
+/* The navbar shows the same two buttons from 997px (Infima hides navbar
+   items below that), so the hero copies are only for the hamburger widths. */
+@media (min-width: 997px) {
+  .vc-landing .vc-hero__ctas {
+    display: none;
+  }
 }
 
 /* Grand Prize countdown — a dramatic day-count lockup over the volcano. */
@@ -297,7 +268,7 @@
 }
 .vc-landing .vc-hero__countdown-value {
   font-family: var(--vc-mono);
-  font-size: clamp(3.5rem, 4.6vw, 5rem);
+  font-size: clamp(2.75rem, 3.6vw, 3.75rem);
   font-weight: 700;
   line-height: 1;
   color: var(--vc-accent);
@@ -316,12 +287,32 @@
   letter-spacing: 0.04em;
   color: var(--vc-text-dim);
 }
+/* Below desktop the card runs full width: label and deadline stack on the
+   left, the day count sits on the right, so the content fills the card. */
 @media (max-width: 996px) {
   .vc-landing a.vc-hero__countdown {
-    padding: 14px 20px 12px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    column-gap: 16px;
+    padding: 14px 20px;
+  }
+  .vc-landing .vc-hero__countdown-label {
+    grid-column: 1;
+    grid-row: 1;
+    align-self: end;
+  }
+  .vc-landing .vc-hero__countdown-date {
+    grid-column: 1;
+    grid-row: 2;
+    align-self: start;
+  }
+  .vc-landing .vc-hero__countdown-row {
+    grid-column: 2;
+    grid-row: 1 / span 2;
   }
   .vc-landing .vc-hero__countdown-value {
-    font-size: 2.75rem;
+    font-size: 2.25rem;
   }
 }
 /* Hero copy and actions sit beside a compact news/countdown column. */
@@ -337,65 +328,7 @@
   gap: 12px;
 }
 
-/* News bar — the scroll reveal owns half; four updates share the other half. */
-.vc-landing .vc-newsbar {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 1px;
-  height: 64px;
-  background: var(--vc-line);
-  border: 1px solid var(--vc-line);
-  border-radius: var(--vc-r-card);
-  overflow: hidden;
-}
-.vc-landing a.vc-newsbar__feature {
-  display: grid;
-  grid-template-columns: minmax(0, 3fr) minmax(150px, 2fr);
-  align-items: stretch;
-  color: var(--vc-text);
-  text-decoration: none;
-  background: var(--vc-bg);
-  overflow: hidden;
-  transition: background-color 0.15s;
-}
-.vc-landing a.vc-newsbar__feature:hover {
-  color: var(--vc-text);
-  text-decoration: none;
-  background: var(--vc-raised);
-}
-/* The <a> background is covered by the opaque media + title span, so also
-   lift the visible title span on hover to match the other news items. */
-.vc-landing a.vc-newsbar__feature:hover .vc-newsbar__feature-title {
-  background: var(--vc-raised);
-}
-.vc-landing .vc-newsbar__media {
-  display: block;
-  width: 100%;
-  height: 100%;
-  min-height: 0;
-  object-fit: cover;
-  background: #000; /* matches the footage's own black */
-}
-.vc-landing .vc-newsbar__feature-title {
-  display: flex;
-  align-items: center;
-  padding: 6px 10px;
-  border-left: 1px solid var(--vc-line);
-  background: var(--vc-surface);
-  transition: background-color 0.15s;
-  font-size: 0.8125rem;
-  font-weight: 650;
-  line-height: 1.3;
-  color: var(--vc-text);
-}
-.vc-landing .vc-newsbar .vc-updates {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  border: 0;
-  border-radius: 0;
-}
-
-/* Below desktop the grid stacks; the reveal card follows the stat band so the
-   money stays high; poster-only (no video attach) at these widths. */
+/* Below desktop the grid stacks. */
 @media (max-width: 996px) {
   .vc-landing .vc-hero__grid {
     grid-template-columns: minmax(0, 1fr);
@@ -403,159 +336,111 @@
   .vc-landing .vc-hero__aside {
     width: min(100%, 420px);
   }
-  .vc-landing .vc-hero__stats {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    padding-top: 20px;
-    margin-top: 24px;
-  }
-  .vc-landing .vc-hero__stats .vc-stat:first-child {
-    grid-column: 1 / -1;
-  }
-}
-
-@media (max-width: 768px) {
-  .vc-landing .vc-newsbar {
-    grid-template-columns: minmax(0, 1fr);
-    height: auto;
-  }
-  .vc-landing .vc-newsbar .vc-updates {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
-
-@media (max-width: 479px) {
-  .vc-landing a.vc-newsbar__feature {
-    grid-template-columns: minmax(0, 1fr);
-  }
-  .vc-landing .vc-newsbar__feature-title {
-    border-top: 1px solid var(--vc-line);
-    border-left: 0;
-  }
-  .vc-landing .vc-newsbar .vc-updates {
-    grid-template-columns: minmax(0, 1fr);
-  }
 }
 
 /* --------------------------------------------------------------------------
-   Open problems — the one card recipe, chips, single .vc-cta grammar.
+   Open problems — two cards side by side, each with its prizes.
    -------------------------------------------------------------------------- */
 .vc-landing .vc-problems {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px;
 }
 .vc-landing .vc-problem {
-  display: grid;
-  grid-template-columns: minmax(0, 5fr) minmax(0, 6fr);
-  gap: 24px;
-  align-items: stretch;
+  display: flex;
+  flex-direction: column;
+}
+/* Slider runs edge to edge across the card top (BeforeAfter root). */
+.vc-landing .vc-problem__slider {
+  display: block;
+  height: 180px;
+  max-width: none;
+  border: 0;
+  border-bottom: 1px solid var(--vc-line);
+  border-radius: 0;
 }
 .vc-landing .vc-problem__text {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
+  flex: 1 1 auto;
   min-width: 0;
+  padding: var(--vc-card-pad);
 }
 .vc-landing .vc-problem__title {
   font-size: 1.375rem;
   font-weight: 650;
   letter-spacing: 0;
+  margin: 0 0 8px;
+}
+.vc-landing .vc-problem__title a {
   color: var(--vc-text);
-  margin: 0 0 12px;
+  text-decoration: none;
+}
+.vc-landing .vc-problem__title a:hover {
+  text-decoration: underline;
 }
 .vc-landing .vc-problem__body {
   font-size: 1rem;
-  line-height: 1.65;
+  line-height: 1.6;
   color: var(--vc-text-dim);
-  flex: 1 1 auto;
-}
-.vc-landing .vc-problem__body p {
-  margin: 0 0 12px;
+  margin: 0 0 16px;
 }
 .vc-landing .vc-problem__body a {
+  color: inherit;
+  text-decoration: none;
+}
+.vc-landing .vc-problem__body a:hover {
   color: var(--vc-text);
-  font-weight: 500;
   text-decoration: underline;
   text-decoration-color: var(--vc-accent-underline);
   text-underline-offset: 2px;
 }
-.vc-landing .vc-problem__body a:hover {
-  color: var(--vc-accent);
-}
-.vc-landing .vc-chips {
+/* Footer: prizes on the left, the start-here link on the right, level with
+   the first prize so both cards line up whatever their prize count. */
+.vc-landing .vc-problem__foot {
   display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
   flex-wrap: wrap;
-  align-items: center;
-  gap: 2px 0;
-  margin: 4px 0 12px;
-}
-/* Base chip pill — still used by the open-prize tier breakdowns
-   (.vc-open-row__tier). The skills list overrides this below. */
-.vc-landing .vc-chip {
-  font-size: 0.75rem;
-  line-height: 1;
-  padding: 5px 8px;
-  border: 1px solid var(--vc-line);
-  border-radius: var(--vc-r-btn);
-  color: var(--vc-text-faint);
-  white-space: nowrap;
-}
-/* Skills list only: strip the pill back to a plain word. */
-.vc-landing .vc-chips .vc-chip {
-  display: inline-flex;
-  align-items: center;
-  padding: 0;
-  border: 0;
-  border-radius: 0;
-}
-/* Skills read as a plain word list, each pair split by a short ember rule
-   set shorter than the cap height so it reads as a divider, not a border. */
-.vc-landing .vc-chips .vc-chip:not(:first-child)::before {
-  content: "";
-  display: inline-block;
-  width: 1px;
-  height: 0.85em;
-  margin: 0 10px;
-  background: var(--vc-line-strong);
-}
-/* Prize tie-in line — "solve this, win that" bridge into /prizes, sourced
-   from the same plugin data as the open-prize board. One compact row. */
-.vc-landing a.vc-problem__bounty {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 10px;
+  gap: 8px 24px;
   width: 100%;
-  min-height: 44px;
-  margin: 0 0 4px;
-  padding: 10px 0 0;
+  padding-top: 14px;
   border-top: 1px solid var(--vc-line);
-  font-size: 0.8125rem;
-  line-height: 1.5;
-  color: var(--vc-text-dim);
+}
+.vc-landing .vc-problem__prizes {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+/* Prize line: one ember link with the same trailing arrow as .vc-cta, but
+   in sentence case so it reads as a prize, not a button. */
+.vc-landing a.vc-problem__prize {
+  font-size: 0.9375rem;
+  font-weight: 600;
+  line-height: 1.6;
+  color: var(--vc-accent);
   text-decoration: none;
 }
-.vc-landing .vc-problem__bounty strong {
-  font-weight: 650;
+.vc-landing a.vc-problem__prize::after {
+  content: " \2192";
+}
+.vc-landing a.vc-problem__prize:hover {
   color: var(--vc-accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
-.vc-landing a.vc-problem__bounty:hover .vc-problem__bounty-text {
-  color: var(--vc-text);
+.vc-landing .vc-problem__prize strong {
+  font-weight: 700;
 }
-.vc-landing a.vc-problem__bounty:focus-visible {
-  outline: 2px solid var(--vc-accent);
-  outline-offset: 2px;
+/* The CTA keeps its 44px tap height; negative margins centre its text on
+   the 24px prize line without pushing the footer taller. */
+.vc-landing .vc-problem__foot .vc-cta {
+  margin: -10px 0;
 }
-
-.vc-landing .vc-problem__media {
-  min-width: 0;
-  align-self: center;
-}
-/* Rein in the slider height (BeforeAfter root; WP2 restyles its internals). */
-.vc-landing .vc-problem__media > div {
-  height: 260px;
-  max-width: none;
+/* Section-level link sits at the right end of the heading row. */
+.vc-landing .vc-h2-row .vc-cta.vc-h2-row__action {
+  margin: 0 0 0 auto;
 }
 
 /* Targets strip — merged "What We're Building Towards", hairline-divided. */
@@ -642,7 +527,7 @@
   margin-bottom: 8px;
 }
 .vc-landing .vc-story__title {
-  font-size: 2rem;
+  font-size: 1.5rem;
   font-weight: 700;
   letter-spacing: -0.01em;
   line-height: 1.15;
@@ -725,93 +610,6 @@
 }
 .vc-landing a.vc-stat:hover .vc-stat__label {
   color: var(--vc-text);
-}
-
-/* 2026 chapter: open-prize board, data-driven from docs/34_prizes.md
-   frontmatter (plugins/prizes-data.js). Dense rows — money is the
-   information architecture: ember amount | title + hook | cadence. */
-.vc-landing .vc-open-board {
-  margin: 24px 0 16px;
-}
-.vc-landing .vc-open-board__head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 12px 20px;
-}
-.vc-landing .vc-open-board__total {
-  font-size: 0.8125rem;
-  font-weight: 650;
-  color: var(--vc-accent);
-  white-space: nowrap;
-}
-.vc-landing a.vc-open-row {
-  display: grid;
-  grid-template-columns: 140px minmax(0, 1fr) auto;
-  gap: 4px 20px;
-  align-items: start;
-  padding: 16px 20px;
-  border-top: 1px solid var(--vc-line);
-  color: var(--vc-text);
-  text-decoration: none;
-  transition: background-color 0.15s;
-}
-.vc-landing a.vc-open-row:hover {
-  background: var(--vc-raised);
-  color: var(--vc-text);
-  text-decoration: none;
-}
-/* Featured row (2027 Grand Prize): top billing via the admonition accent —
-   2px ember left edge + a larger numeral. Same row anatomy as the others. */
-.vc-landing a.vc-open-row--featured {
-  border-left: 2px solid var(--vc-accent);
-  padding-left: 18px;
-}
-.vc-landing a.vc-open-row--featured .vc-open-row__amount {
-  font-size: 1.375rem;
-}
-.vc-landing .vc-open-row__amount {
-  font-family: var(--vc-mono);
-  font-size: 1.25rem;
-  font-weight: 700;
-  line-height: 1.2;
-  color: var(--vc-accent);
-}
-.vc-landing .vc-open-row__unit {
-  display: block;
-  font-size: 0.75rem;
-  font-weight: 500;
-  color: var(--vc-text-faint);
-}
-.vc-landing .vc-open-row__title {
-  display: block;
-  font-size: 0.9375rem;
-  font-weight: 650;
-  line-height: 1.3;
-}
-.vc-landing .vc-open-row__hook {
-  display: block;
-  font-size: 0.8125rem;
-  line-height: 1.5;
-  color: var(--vc-text-faint);
-  margin-top: 2px;
-}
-.vc-landing .vc-open-row__tiers {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 10px;
-}
-.vc-landing .vc-open-row__tier-amt {
-  color: var(--vc-text-dim);
-}
-.vc-landing .vc-open-row__meta {
-  font-size: 0.8125rem;
-  color: var(--vc-text-faint);
-  white-space: nowrap;
-  justify-self: end;
-  padding-top: 4px;
 }
 
 /* --------------------------------------------------------------------------
@@ -1137,7 +935,7 @@
     padding-bottom: 64px;
   }
   .vc-landing .vc-h2 {
-    font-size: 1.75rem;
+    font-size: 1.5rem;
   }
   .vc-landing .vc-hero {
     padding-top: 20px;
@@ -1154,15 +952,9 @@
   .vc-landing .vc-hero__intro {
     font-size: 1rem;
   }
-  /* Problems stack; slider above text. */
-  .vc-landing .vc-problem {
+  /* Problem cards stack. */
+  .vc-landing .vc-problems {
     grid-template-columns: minmax(0, 1fr);
-  }
-  .vc-landing .vc-problem__media {
-    order: -1;
-  }
-  .vc-landing .vc-problem__media > div {
-    height: 220px;
   }
   .vc-landing .vc-targets__grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1180,7 +972,7 @@
     margin-top: 64px;
   }
   .vc-landing .vc-story__title {
-    font-size: 1.5rem;
+    font-size: 1.25rem;
   }
   .vc-landing img.vc-story__media,
   .vc-landing video.vc-story__media,
@@ -1196,23 +988,6 @@
 }
 
 @media (max-width: 560px) {
-  /* Open-prize rows stack: amount, then title/hook/tiers, cadence last. */
-  .vc-landing a.vc-open-row {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 6px;
-  }
-  .vc-landing .vc-open-row__unit {
-    display: inline;
-    margin-left: 6px;
-  }
-  .vc-landing .vc-open-row__meta {
-    justify-self: start;
-    padding-top: 0;
-  }
-  .vc-landing .vc-open-board__head {
-    flex-wrap: wrap;
-    gap: 4px 16px;
-  }
   .vc-landing a.vc-prize-row {
     grid-template-columns: minmax(0, 1fr) auto;
   }
