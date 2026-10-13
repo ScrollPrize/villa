@@ -1527,7 +1527,7 @@ void MenuActionController::surfaceFromSelection()
         std::string newId = _window->_state->activeSurfaceId() + std::string("_sel_") + ts.toStdString() + std::string("_") + std::to_string(idx++);
         std::filesystem::path outDir = parentDir / newId;
         try {
-            filtered->save(outDir.string(), newId);
+            filtered->saveAsNew(outDir);
             created++;
         } catch (const std::exception& e) {
             _window->showStatusBarMessage(QObject::tr("Failed to save selection: ") + e.what(), 5000);

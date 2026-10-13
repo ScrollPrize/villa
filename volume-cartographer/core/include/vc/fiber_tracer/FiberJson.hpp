@@ -9,6 +9,7 @@
 
 #include <nlohmann/json.hpp>
 #include <opencv2/core/types.hpp>
+#include "vc/core/util/Uuid.hpp"
 #include "vc/fiber_tracer/FiberDisplay.hpp"
 
 namespace vc::fiber_tracer
@@ -17,6 +18,7 @@ struct Vc3dFiberJson {
     double width = 0.0;
     double widthGapFraction = kDefaultFiberWidthGapFraction;
     int version = 1;
+    std::string uuid;
     std::string optimizationMode = "lasagna";
     std::vector<cv::Vec3d> linePoints;
     std::vector<cv::Vec3d> controlPoints;
@@ -259,6 +261,13 @@ inline Vc3dFiberJson parseVc3dFiberJson(const nlohmann::json& root,
         throw std::runtime_error(context + " is not a vc3d_fiber JSON object");
 
     Vc3dFiberJson fiber;
+    if (root.contains("uuid")) {
+        if (!root.at("uuid").is_string() ||
+            !vc::util::isUuid(root.at("uuid").get<std::string>())) {
+            throw std::runtime_error(context + " has an invalid uuid");
+        }
+        fiber.uuid = root.at("uuid").get<std::string>();
+    }
     fiber.width = fiberWidthFromJson(root);
     fiber.widthGapFraction = fiberWidthGapFromJson(root);
     fiber.version = root.value("version", 1);

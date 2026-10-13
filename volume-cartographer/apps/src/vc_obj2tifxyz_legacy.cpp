@@ -345,7 +345,7 @@ int main(int argc, char *argv[])
         std::cout << "Parameters:" << std::endl;
         std::cout << "  step_size: UV units per grid cell (default: 20)" << std::endl;
         std::cout << "             Scale will be 1/step_size (default: 0.05)" << std::endl;
-        std::cout << "  --uuid=<id>: Metadata UUID. Defaults to the output-directory basename." << std::endl;
+        std::cout << "  --uuid=<id>: Metadata UUID. Defaults to a fresh random UUID." << std::endl;
         std::cout << "  --scale-method=median|mean: how the UV-to-3D scale (voxels per UV unit) that sizes" << std::endl;
         std::cout << "             the grid is estimated from the mesh: area weighted median of the per" << std::endl;
         std::cout << "             triangle Jacobian norms (default, robust to a few stretched triangles)" << std::endl;
@@ -453,14 +453,13 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
     
-    // Generate a UUID for the surface
-    const std::string uuid =
-        vc::util::resolveTifxyzUuid(output_dir, obj_path, uuid_override);
+    // A converted mesh is a new object: fresh UUID unless --uuid names one.
+    surf->meta["uuid"] = vc::util::resolveTifxyzUuid(uuid_override);
     
     std::cout << "Saving to tifxyz format..." << std::endl;
     
     try {
-        surf->save(output_dir.string(), uuid);
+        surf->save(output_dir);
         std::cout << "Successfully converted to tifxyz format" << std::endl;
     }
     catch (const std::exception& e) {
