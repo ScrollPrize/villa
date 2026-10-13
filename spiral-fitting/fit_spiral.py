@@ -158,7 +158,7 @@ from satisfaction_metrics import (
     save_overlay_and_print_satisfaction,
 )
 from visualization import overlay_patches_on_slices
-from transforms import SpiralAndTransform
+from transforms import SpiralAndTransform, umbilicus_centre_z_to_yx
 from theta_crossing_map import ThetaCrossingMap
 from winding_supervision import (
     get_winding_inference_losses,
@@ -2043,7 +2043,8 @@ class FitContext:
         np.random.seed(self.config['optimizer_random_seed'])
         torch.random.manual_seed(self.config['optimizer_random_seed'])
         progress.begin('loading', 'Loading umbilicus')
-        umbilicus = self.umbilicus_z_to_yx()
+        raw_umbilicus = self.umbilicus_z_to_yx()
+        umbilicus = umbilicus_centre_z_to_yx(raw_umbilicus, self.z_begin, self.z_end)
         if self.scroll_zarr_path:
             progress.begin('loading', 'Opening scroll volume')
             print('loading volume zarr')
@@ -2331,6 +2332,7 @@ class FitContext:
         # unattached_pcl_strips, unattached_strip_sampling_groups, and
         # pcl_sampling_strata were assigned above, before the strata build.
         self.umbilicus = umbilicus
+        self.raw_umbilicus = raw_umbilicus
         self.scroll_zarr = scroll_zarr
         self.fiber_direction_samples = fiber_direction_samples
         self.filter_tracks_by_shell = filter_tracks_by_shell
@@ -3208,6 +3210,9 @@ class FitContext:
         # The full z series is a model input. PNG-only slice grids and raster inputs
         # are prepared lazily at final export, and never in a resident VC3D session.
         all_zs = np.arange(self.z_begin, self.z_end)
+        # The model smooths the raw curve itself; the losses read self.umbilicus, already smoothed.
+        model_umbilicus_zyx = torch.from_numpy(
+            np.concatenate([all_zs[:, None], self.raw_umbilicus(all_zs)], axis=-1).astype(np.float32)).to(self.device)
         self.umbilicus_zyx = torch.from_numpy(
             np.concatenate([all_zs[:, None], self.umbilicus(all_zs)], axis=-1).astype(np.float32)).to(self.device)
         all_zs = torch.from_numpy(all_zs).to(self.device)
@@ -3268,7 +3273,7 @@ class FitContext:
         self.spiral_and_transform = SpiralAndTransform(
             flow_integration_steps=self.config['model_num_flow_integration_steps'],
             flow_integration_solver=self.config['model_flow_integration_solver'],
-            umbilicus_zyx=self.umbilicus_zyx,
+            umbilicus_zyx=model_umbilicus_zyx,
             flow_min_corner_zyx=self.flow_min_corner_spiral_zyx,
             flow_max_corner_zyx=self.flow_max_corner_spiral_zyx,
             config=self.config,

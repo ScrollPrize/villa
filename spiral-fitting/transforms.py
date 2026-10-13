@@ -1,6 +1,7 @@
 import os
 
 import numpy as np
+import scipy.interpolate
 import scipy.ndimage
 import torch
 import torch.nn as nn
@@ -370,6 +371,13 @@ class UmbilicusTransform(pyro.distributions.transforms.Transform):
 
     def _inverse(self, input_zyx):
         return self._call(input_zyx, inverse=True)
+
+
+def umbilicus_centre_z_to_yx(z_to_yx, z_begin, z_end):
+    """z -> yx of the smoothed centre UmbilicusTransform uses for a model over [z_begin, z_end)."""
+    zs = np.arange(z_begin, z_end)
+    yx = UmbilicusTransform(torch.from_numpy(np.concatenate([zs[:, None], z_to_yx(zs)], axis=-1).astype(np.float32)))._yx
+    return scipy.interpolate.interp1d(zs, yx.numpy(), axis=0, fill_value='extrapolate')
 
 
 class SpiralAndTransform(nn.Module):
