@@ -40,11 +40,11 @@ import TOCInline from '@theme/TOCInline';
 
 # Press
 
-For press and media inquiries, please email [press@scrollprize.org](mailto:press@scrollprize.org).
+For general press and media inquiries (e.g. use of images), please email [press@scrollprize.org](mailto:press@scrollprize.org).
+Please direct all other enquiries via the project leads or founders, listed on our [team page](/#team).
+For technical questions about the project, contact [Paul Henderson](mailto:paul@scrollprize.org).
+For papyrological, archaeological, or historical questions, contact [Federica Nicolardi](https://www.docenti.unina.it/federica.nicolardi).
 
-To keep our public messaging accurate and consistent, only Vesuvius Challenge's Project Lead and co-founders are authorized to initiate contact with press and media on the project's behalf. You can find out who currently holds these roles on our [team page](/#team).
-
-We read every message and will do our best to get back to you.
 
 ***
 
