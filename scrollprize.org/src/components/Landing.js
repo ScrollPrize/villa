@@ -16,8 +16,9 @@ import {
 
 /* ==========================================================================
    Landing — "Obsidian Minimal" restyle (WP1).
-   One card recipe (.vc-card), one accent (--vc-accent), no gradient text,
-   no box shadows. Layout/skin lives in src/css/landing.css.
+   No boxed sections: content sits on the page, divided by hairlines; only
+   media and the hero countdown are framed. One accent (--vc-accent), no
+   gradient text, no box shadows. Layout/skin lives in src/css/landing.css.
    ========================================================================== */
 
 const usd = new Intl.NumberFormat("en-US", {
@@ -386,7 +387,7 @@ const PersonLink = ({ link }) => (
   </div>
 );
 
-/* Open problem card: before/after slider, title, short pitch, then the
+/* Open problem column: framed before/after slider, title, short pitch, then the
    prizes that pay for solving it (amounts from docs/34_prizes.md
    frontmatter). */
 const ProblemCard = ({
@@ -399,7 +400,7 @@ const ProblemCard = ({
   linkText,
   href,
 }) => (
-  <div className="vc-card vc-card--flush vc-problem">
+  <div className="vc-problem">
     <BeforeAfter
       beforeImage={beforeImage}
       afterImage={afterImage}

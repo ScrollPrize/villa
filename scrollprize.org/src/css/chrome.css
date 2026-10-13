@@ -1106,52 +1106,70 @@ a.vc-card:hover {
   text-decoration: none;
 }
 
-/* LatestPosts "Updates" strip: hairline-separated compact rows.
-   The 1px grid gap shows the container's line-tinted background through as
-   the separators — works at every column count. */
+/* LatestPosts "Updates" strip: unboxed columns on the page background,
+   divided by vertical hairlines (same grammar as the landing targets strip).
+   4-up >=1280px, 2-up >=480px, stacked with horizontal rules below. */
 .vc-updates {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 1px;
-  background: var(--vc-line);
-  background-clip: padding-box;
-  border: 1px solid var(--vc-line);
-  border-radius: var(--vc-r-card);
-  overflow: hidden;
+  row-gap: 16px;
 }
 @media (min-width: 1280px) {
   .vc-updates {
     grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 }
-@media (max-width: 479px) {
-  .vc-updates {
-    grid-template-columns: minmax(0, 1fr); /* single column on phones */
-  }
-  a.vc-updates__item {
-    min-height: 44px;
-    padding: 10px 14px;
-  }
-}
-/* Each row reads "Title …… date": the title wraps to two lines, then
+/* Each column reads "Title …… date": the title wraps to two lines, then
    truncates; the date sits on the first line, pushed to the right. */
 a.vc-updates__item {
   display: flex;
   justify-content: space-between;
   align-items: baseline;
   gap: 12px;
-  min-height: 48px;
-  padding: 8px 14px;
-  background: var(--vc-surface);
+  padding: 2px 20px;
+  border-left: 1px solid var(--vc-line);
   text-decoration: none;
 }
+/* First column of each row carries no divider. */
+a.vc-updates__item:nth-child(2n + 1) {
+  border-left: 0;
+  padding-left: 0;
+}
+@media (min-width: 1280px) {
+  a.vc-updates__item:nth-child(2n + 1) {
+    border-left: 1px solid var(--vc-line);
+    padding-left: 20px;
+  }
+  a.vc-updates__item:first-child {
+    border-left: 0;
+    padding-left: 0;
+  }
+}
+@media (max-width: 479px) {
+  .vc-updates {
+    grid-template-columns: minmax(0, 1fr); /* single column on phones */
+    row-gap: 0;
+  }
+  a.vc-updates__item,
+  a.vc-updates__item:nth-child(2n + 1) {
+    min-height: 44px;
+    padding: 10px 0;
+    border-left: 0;
+    border-top: 1px solid var(--vc-line);
+  }
+  a.vc-updates__item:first-child {
+    border-top: 0;
+  }
+}
 a.vc-updates__item:hover {
-  background: var(--vc-raised);
   text-decoration: none;
+}
+a.vc-updates__item:hover .vc-updates__title {
+  color: var(--vc-accent);
 }
 a.vc-updates__item:focus-visible {
   outline: 2px solid var(--vc-accent);
-  outline-offset: -2px;
+  outline-offset: 2px;
 }
 .vc-updates__title {
   font-size: 14px;
@@ -1163,6 +1181,7 @@ a.vc-updates__item:focus-visible {
   -webkit-line-clamp: 2;
   overflow: hidden;
   min-width: 0; /* long titles wrap instead of overflowing */
+  transition: color 0.15s;
 }
 .vc-updates__meta {
   flex: none; /* the date never gets squeezed */

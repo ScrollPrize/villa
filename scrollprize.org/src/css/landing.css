@@ -322,25 +322,23 @@
 }
 
 /* --------------------------------------------------------------------------
-   Open problems — two cards side by side, each with its prizes.
+   Open problems — two unboxed columns side by side, each with its prizes.
    -------------------------------------------------------------------------- */
 .vc-landing .vc-problems {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 16px;
+  gap: 40px 48px;
 }
 .vc-landing .vc-problem {
   display: flex;
   flex-direction: column;
 }
-/* Slider runs edge to edge across the card top (BeforeAfter root). */
+/* Only the slider is framed (BeforeAfter keeps its hairline border and
+   card radius, like the story media); the text sits on the page. */
 .vc-landing .vc-problem__slider {
   display: block;
   height: 180px;
   max-width: none;
-  border: 0;
-  border-bottom: 1px solid var(--vc-line);
-  border-radius: 0;
 }
 .vc-landing .vc-problem__text {
   display: flex;
@@ -348,7 +346,7 @@
   align-items: flex-start;
   flex: 1 1 auto;
   min-width: 0;
-  padding: var(--vc-card-pad);
+  padding-top: 20px;
 }
 .vc-landing .vc-problem__title {
   font-size: 1.375rem;
