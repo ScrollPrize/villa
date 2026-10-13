@@ -259,24 +259,12 @@ namespace igl
 
       L = s.AtA;               // Aᵀ W A
       L.makeCompressed();
-      // An input may retain isolated vertices coupled by external constraints.
-      // Sparse diagonal() cannot insert their absent entries. Adding an
-      // identity preserves the proximal term for both supported and isolated
-      // vertices without writing outside the sparse value array.
-      Eigen::SparseMatrix<double> proximal(L.rows(), L.cols());
-      proximal.setIdentity();
-      L += s.proximal_p * proximal;
+      L.diagonal().array() += s.proximal_p; // proximal: add to diagonal in-place
 
       #else
       L = At * s.WGL_M.asDiagonal() * A; // Aᵀ (diag(w)) A
       L.makeCompressed();
-      // An input may retain isolated vertices coupled by external constraints.
-      // Sparse diagonal() cannot insert their absent entries. Adding an
-      // identity preserves the proximal term for both supported and isolated
-      // vertices without writing outside the sparse value array.
-      Eigen::SparseMatrix<double> proximal(L.rows(), L.cols());
-      proximal.setIdentity();
-      L += s.proximal_p * proximal;
+      L.diagonal().array() += s.proximal_p; // proximal: add to diagonal in-place
       #endif
 
       #ifdef SLIM_CACHED
