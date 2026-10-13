@@ -87,6 +87,7 @@ private:
     void registerPointsHandlers();
     void registerSeedingHandlers();
     void registerSurfaceOpsHandlers();
+    void registerGraphHandlers();
     void registerMethod(AgentBridgeMethod method, Handler handler);
 
     // --- Discovery registry file (mirrors LasagnaServiceManager's
@@ -143,6 +144,14 @@ private:
     // (AgentBridgeHandlers_review.cpp); reads meta["tags"] without forcing a
     // heavy surface load.
     QJsonObject handleSegmentsReview(const QJsonValue& params);
+    // Unified graph DB (read-only, opt-in via --graph-db /
+    // graph/db_path; AgentBridgeHandlers_graph.cpp). All throw
+    // -32000 when no graph database is open.
+    QJsonObject handleGraphStatus(const QJsonValue& params);
+    QJsonObject handleGraphObject(const QJsonValue& params);
+    QJsonObject handleGraphNeighbours(const QJsonValue& params);
+    QJsonObject handleGraphEdges(const QJsonValue& params);
+    QJsonObject handleGraphComponent(const QJsonValue& params);
     QJsonObject handleScreenshotCapture(const QJsonValue& params);
     QJsonObject handleCursorVolumePoint(const QJsonValue& params);
     QJsonObject handleCanvasClick(const QJsonValue& params, bool addShift);

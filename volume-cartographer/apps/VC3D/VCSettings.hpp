@@ -189,6 +189,14 @@ namespace atlas {
 }
 
 // -----------------------------------------------------------------------------
+// Graph Database Settings (opt-in unified metadata graph; empty = off)
+// -----------------------------------------------------------------------------
+namespace graph {
+    constexpr auto DB_PATH = "graph/db_path";
+    constexpr auto DB_PATH_DEFAULT = "";
+} // namespace graph
+
+// -----------------------------------------------------------------------------
 // Performance Settings
 // -----------------------------------------------------------------------------
 namespace perf {

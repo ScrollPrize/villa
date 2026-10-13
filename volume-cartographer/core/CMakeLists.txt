@@ -13,6 +13,19 @@ endif()
 target_compile_features(vc_fiber_collection PUBLIC cxx_std_20)
 set_target_properties(vc_fiber_collection PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# Unified metadata graph (SQLite). Standalone like vc_fiber_collection:
+# no Qt / tracing stack, usable from the GUI, CLI tools and tests.
+add_library(vc_graph STATIC src/GraphDb.cpp)
+target_include_directories(vc_graph PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+if(TARGET SQLite3::SQLite3)
+    target_link_libraries(vc_graph PUBLIC SQLite3::SQLite3)
+else()
+    target_link_libraries(vc_graph PUBLIC SQLite::SQLite3)
+endif()
+target_link_libraries(vc_graph PRIVATE nlohmann_json::nlohmann_json)
+target_compile_features(vc_graph PUBLIC cxx_std_20)
+set_target_properties(vc_graph PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_library(vc_core
         src/GridStore.cpp
         src/NormalGridVolume.cpp

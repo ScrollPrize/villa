@@ -124,6 +124,7 @@ class ViewerTransformsPanel;
 class LineAnnotationController;
 class FiberOverlayController;
 class FiberCollectionController;
+class GraphDbController;
 class WrapAnnotationWidget;
 class AtlasControlPointsDock;
 class StatusDockPanelHost;
@@ -144,6 +145,11 @@ class CWindow : public QMainWindow
 
 public:
     void openFiberCollection(const QString& path);
+    // Opens a unified graph database read-only (opt-in; see
+    // GraphDbController). Failures are logged and shown in the status
+    // bar, never fatal: VC3D keeps running without graph access.
+    void openGraphDb(const QString& path);
+    GraphDbController* graphDbController() { return _graphDb.get(); }
     // Starts an atlas fiber-intersection search without opening a dialog.
     // Progress and completion use the atlasSearch signals below.
     // Distinct name (not an overload): the slot is used as a member-function
@@ -510,6 +516,7 @@ private:
     std::unique_ptr<AtlasControlPointsOverlayController> _atlasControlOverlay;
     std::unique_ptr<FiberOverlayController> _fiberOverlay;
     std::unique_ptr<FiberCollectionController> _fiberCollection;
+    std::unique_ptr<GraphDbController> _graphDb;
     std::unique_ptr<SegmentationModule> _segmentationModule;
     std::unique_ptr<SurfacePanelController> _surfacePanel;
     std::unique_ptr<VolumeAttachmentController> _volumeAttachmentController;

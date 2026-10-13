@@ -111,6 +111,25 @@ add_test(NAME vc_settings COMMAND test_vc_settings)
 vc_register_test_target(test_vc_settings)
 vc_register_ctest(vc_settings test_vc_settings)
 
+add_executable(test_graph_db_controller
+    test_graph_db_controller.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/GraphDbController.cpp)
+
+set_target_properties(test_graph_db_controller PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_graph_db_controller PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_graph_db_controller PRIVATE
+    vc_graph
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME graph_db_controller COMMAND test_graph_db_controller)
+vc_register_test_target(test_graph_db_controller)
+vc_register_ctest(graph_db_controller test_graph_db_controller)
+
 add_executable(test_unified_browser_dialog
     test_unified_browser_dialog.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/UnifiedBrowserDialog.cpp
