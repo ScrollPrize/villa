@@ -2,6 +2,7 @@
 #include "OpenDataSegmentCacheIO.hpp"
 
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/types/Segmentation.hpp"
 #include "vc/core/util/AffineTransform.hpp"
 #include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -496,7 +497,8 @@ void applyOriginalVolumeDownscale(const std::filesystem::path& segmentDir,
     vc::core::util::transformSurfacePoints(surface.get(), downscale, std::nullopt, 1.0);
     vc::core::util::refreshTransformedSurfaceState(surface.get());
     surface->meta["vc_open_data_coordinates_scaled_to_original_volume"] = downscale;
-    surface->save(segmentDir.string(), representationId, true);
+    surface->meta["uuid"] = representationId;
+    surface->save(segmentDir, true);
 }
 
 bool cachedMetadataNeedsNormalization(const std::filesystem::path& metaPath,
@@ -1296,9 +1298,7 @@ OpenDataSegmentMaterializationResult materializeOne(
             surface->meta["vc_open_data_source_coordinate_level"] = 0;
             surface->meta["vc_open_data_coordinate_space"] =
                 recipe.value("coordinate_space", std::string{});
-            surface->save(
-                tempDir.string(),
-                recipe.value("representation_id", std::string{}), true);
+            surface->save(tempDir, true);
         } else {
             throw std::runtime_error("unknown materialization recipe kind");
         }
@@ -2228,7 +2228,8 @@ void copyCatalogSegmentToEditableDirectory(
         std::filesystem::create_directories(editableSegmentDir);
     }
 
-    if (std::filesystem::is_empty(editableSegmentDir, ec)) {
+    const bool newCopy = std::filesystem::is_empty(editableSegmentDir, ec);
+    if (newCopy) {
         for (const auto& entry : std::filesystem::directory_iterator(catalogSegmentDir)) {
             if (!entry.is_regular_file()) {
                 continue;
@@ -2244,6 +2245,13 @@ void copyCatalogSegmentToEditableDirectory(
     }
     if (!requiredFilesPresent(editableSegmentDir)) {
         throw std::runtime_error("editable destination is missing required tifxyz files");
+    }
+    auto copy = Segmentation::New(editableSegmentDir);
+    // Older editable copies retained the catalog identity and lookup marker.
+    // Migrate those once, without replacing their edited geometry or metadata.
+    if (newCopy || copy->metadata().contains("vc_open_data_representation")) {
+        copy->resetIdentityForCopy();
+        copy->saveMetadata();
     }
 }
 
@@ -2275,6 +2283,22 @@ void attachEditableOpenDataSegmentRoot(
     }
 
     pkg.attachSegmentsEntry(editableSegmentsRoot.string(), tags, select);
+    // A previously visited editable folder can still have Segmentation objects
+    // cached under their pre-migration catalog keys. Refresh only those copies.
+    if (select) {
+        for (const auto& id : pkg.segmentationIDs()) {
+            const auto segment = pkg.segmentation(id);
+            if (!segment || !segment->metadata().contains("vc_open_data_representation") ||
+                isOpenDataCatalogSegmentDirectory(segment->path())) {
+                continue;
+            }
+            const auto current = Segmentation::New(segment->path());
+            if (!current->metadata().contains("vc_open_data_representation")) {
+                pkg.removeSingleSegmentation(id);
+                pkg.addSingleSegmentation(current->id());
+            }
+        }
+    }
     std::string persistedLocation = editableSegmentsRoot.string();
     for (const auto& entry : pkg.segmentEntries()) {
         if (vc::project::isLocationRemote(entry.location)) {

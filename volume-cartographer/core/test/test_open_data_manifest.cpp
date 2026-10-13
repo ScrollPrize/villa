@@ -1846,6 +1846,13 @@ TEST_CASE("OpenDataSegmentCache editable copy inherits routing from an aggregate
     copyFixtureFile(fixtureSegment / "y.tif", sourceSegment / "y.tif");
     copyFixtureFile(fixtureSegment / "z.tif", sourceSegment / "z.tif");
     writeFile(sourceSegment / "catalog-origin.json", "{}");
+    {
+        QuadSurface source(sourceSegment);
+        source.meta["uuid"] = "catalog-representation-id";
+        source.meta["vc_open_data_representation"] = "published-transformed";
+        source.meta["vc_open_data_coordinate_space"] = "sample/vol1@L0";
+        source.save_meta();
+    }
     const auto otherCatalogRoot = testRoot / "other-catalog-segments";
     const auto otherCatalogSegment =
         otherCatalogRoot / "published-L0" / "other-segment";
@@ -1901,8 +1908,32 @@ TEST_CASE("OpenDataSegmentCache editable copy inherits routing from an aggregate
             doctest::Contains("immutable catalog"),
             std::runtime_error);
     }
+    bool legacyCopy = false;
+    SUBCASE("new editable copy") {}
+    SUBCASE("existing editable copy from before UUID separation") {
+        legacyCopy = true;
+        std::filesystem::create_directories(editableRoot);
+        std::filesystem::copy(sourceSegment, editableSegment,
+                              std::filesystem::copy_options::recursive);
+        std::filesystem::remove(editableSegment / "catalog-origin.json");
+        QuadSurface edited(editableSegment);
+        edited.meta["user_edit"] = "keep me";
+        edited.save_meta();
+        writeFile(editableSegment / "user-notes.txt", "keep me");
+        // Simulate a copy already visited before selecting its catalog source.
+        pkg->attachSegmentsEntry(editableRoot.string(), {}, true);
+        REQUIRE(pkg->segmentation("catalog-representation-id"));
+        pkg->attachSegmentsEntry(sourceRoot.string(), {}, true);
+    }
+    const auto originalX = std::filesystem::last_write_time(
+        (legacyCopy ? editableSegment : sourceSegment) / "x.tif");
     copyCatalogSegmentToEditableDirectory(
         *pkg, sourceSegment, editableSegment);
+    if (legacyCopy) {
+        CHECK(std::filesystem::exists(editableSegment / "user-notes.txt"));
+        CHECK(QuadSurface(editableSegment).meta["user_edit"].get_string() == "keep me");
+        CHECK(std::filesystem::last_write_time(editableSegment / "x.tif") == originalX);
+    }
 
     attachEditableOpenDataSegmentRoot(
         *pkg, sourceSegment, editableRoot, true);
@@ -1922,6 +1953,16 @@ TEST_CASE("OpenDataSegmentCache editable copy inherits routing from an aggregate
     const auto surface = pkg->loadSurface("20241113070770");
     REQUIRE(surface);
     CHECK(surface->path == editableSegment);
+    CHECK(surface->objectUuid() != "catalog-representation-id");
+    CHECK_FALSE(pkg->segmentation("catalog-representation-id"));
+    CHECK_FALSE(surface->meta.contains("vc_open_data_representation"));
+    CHECK(surface->meta["vc_open_data_coordinate_space"].get_string() == "sample/vol1@L0");
+    const auto copiedUuid = surface->objectUuid();
+    copyCatalogSegmentToEditableDirectory(*pkg, sourceSegment, editableSegment);
+    CHECK(QuadSurface(editableSegment).objectUuid() == copiedUuid);
+    REQUIRE(pkg->reloadSingleSegmentation("20241113070770"));
+    REQUIRE(pkg->loadSurface("20241113070770"));
+    CHECK(pkg->loadSurface("20241113070770")->objectUuid() == copiedUuid);
 
     pkg.reset();
     VolumePkg::setAutosaveRoot(previousAutosaveRoot);

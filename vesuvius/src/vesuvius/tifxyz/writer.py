@@ -8,6 +8,7 @@ import shutil
 import tempfile
 from pathlib import Path
 from typing import Optional, Union
+from uuid import uuid4
 
 import numpy as np
 import tifffile
@@ -166,6 +167,13 @@ class TifxyzWriter:
         bbox : Optional[tuple]
             Override bounding box. If None, uses surface.bbox.
         """
+        # The surface's persistent identity is written as-is (callers
+        # creating a new surface pass a fresh uuid4); an unset one is
+        # minted and stored back on the surface, so repeated writes of
+        # the same in-memory surface keep one identity.
+        if not surface.uuid:
+            surface.uuid = str(uuid4())
+
         # Build metadata dict in C++ format
         meta_dict = {
             "uuid": surface.uuid,
