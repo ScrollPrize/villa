@@ -278,7 +278,7 @@ The reconstruction directory retains both scenes:
 
 Inspect the robustified scene in the OpenMVG Viewer. Require a coherent sparse cloud, approximately circular camera trajectories at the acquired heights, no unexplained angular gaps and at least 95% of retained views registered. Inspect the match graph, track count, final reprojection residual, intrinsics and sparse-point distribution together. A non-circular trajectory can indicate that the object moved on the turntable, in which case that acquisition block must not be used to estimate scale.
 
-[`photogrammetry-tools/sfm_review.py`](../photogrammetry-tools/) reports registration and residuals per block, the verified image pairs linking orientations (an orientation with none is left out of the reconstruction), and the camera circles and axes.
+[`photogrammetry-tools/sfm_review.py`](../photogrammetry-tools/) reports registration and residuals per block, the verified image pairs linking orientations (an orientation with none is left out of the reconstruction; see [Orientations that do not link](#orientations-that-do-not-link)), and the camera circles and axes.
 
 It's important to use ply as output file type, because many readers downstream that work on other format used to corrupt the input mesh while parsing.
 
@@ -389,6 +389,28 @@ If OpenMVS fails, retain the completed intermediate files and diagnose stages in
 Case generation does not intrinsically require color texture, but every omitted stage changes the retained artifacts and must be recorded. PLY is the required interchange format for topology QA.
 
 In MeshLab, use `Filters -> Quality Measures and Computations -> Compute Topological Measures`. Alternatively, use a PLY-native topology checker and retain its exact version, command and machine-readable report with the run. Inspect the original PLY indices because some visualization readers duplicate vertices at texture seams and can falsely report disconnected components. Since the world axes are arbitrary, compare physical size with PCA-aligned or otherwise object-aligned extents rather than only the raw axis-aligned bounding box.
+
+
+##### Orientations that do not link
+
+A small or flat object can come out of SfM with only one orientation posed: after flipping, the cameras see mostly the other face, and `sfm_review.py` reports 0 verified pairs between the orientations. First try the remedies listed under step 1. If the orientations still do not link, reconstruct each one on its own and join the two halves on the rim that both saw. For that object, this route branches off after the step 1 review and replaces steps 2 and 3. The method was rehearsed on PHerc. 0525, whose joint reconstruction did link: the split result was within 0.11 mm of it in thickness. It was then used for 1482 and 1585.
+
+1. **Reconstruct each half.** Give each orientation its own PGS-Recon input (hard links to its photographs and masks) and include lists per camera height, then run SfM, one scaler candidate per height and OpenMVS for each: [`photogrammetry-tools/split_recon.sh`](../photogrammetry-tools/split_recon.sh) `WORK ID ...`. Export each scaled scene to JSON (`openMVG_main_ConvertSfM_DataFormat`).
+2. **Measure each half's scale.** pgs-global-scaler triangulates marker corners with a 0.1 px RANSAC threshold (`pgs-recon/dependencies/utilities/src/global_scaler.cpp`). On small objects the lens distortion at the image edges is weakly constrained, so few sightings pass. Its candidates then disagree by several percent, or fail and write the scene at scale 1. [`marker_scale.py`](../photogrammetry-tools/marker_scale.py) re-detects the markers and triangulates them at 1.5 px. Take each half's factor from a block whose corners are complete and whose ring radius matches the turntable (99.4-100.2 mm on the Naples turntable). Blocks that met this agreed to about 0.5%.
+3. **Align the halves on the rim** with [`split_align.py align A.ply B.ply OUT --scale-a KA --scale-b KB`](../photogrammetry-tools/split_align.py) (the two `scene_dense.ply`).
+   - It tries the sign flips of the principal axes, then runs point-to-plane ICP on point pairs with matching normals only, so that one face is never fitted onto the other.
+   - Require one hypothesis to score clearly above the rest and an rms below 0.1 mm.
+   - The reported rim scale (B relative to A, not applied) should be within about 0.5% of 1. It is an independent check on the two marker scales.
+4. **Check the thickness against the photographs.** The rim fixes the object's length and width well, but its thickness only weakly. `split_align.py silhouette OUT A.json B.json MASKS_A MASKS_B` projects the joined cloud into the photographs of both orientations at several offsets of B along the thin axis, and fits the offset at which the outlines best match the masks.
+   - Read only the position of the optimum: the splatted cloud overshoots the masks by a roughly constant 0.3 mm.
+   - Accept the alignment if the optimum is within ±0.2 mm. If it is further out, either merge with `--thin-shift` set to the optimum (which errs towards a looser case) or recapture.
+5. **Merge and reconstruct once.** `split_align.py merge OUT A.json B.json OUT/sfm_data_merged.json [--thin-shift MM]` writes one OpenMVG scene holding both halves at their marker scales. [`merged_openmvs.sh`](../photogrammetry-tools/merged_openmvs.sh) `WORK ID ...` converts it to binary, which validates it, and runs OpenMVS on all photographs. This gives one watertight mesh rather than two halves to stitch.
+6. **Review** with `split_align.py check OUT OUT/sfm_data_merged.json MESH.ply PGS_INPUT --sheet BLOCKS sheet.jpg` and `mesh_qa.py`.
+   - Landmark reprojection must match between the two orientations, about 0.65 px median.
+   - The mesh must reproduce both halves' main faces to within a few hundredths of a millimetre.
+   - The mesh outline must sit equally close to the masks in both orientations (about 0.1 mm inside them).
+
+Keep `alignment.json`, `merge.json`, the logs and every review output with the run.
 
 #### Case generation
 
