@@ -308,10 +308,14 @@ const SponsorList = ({ list }) => {
       {!expanded && folded > 0 && (
         <button
           type="button"
-          className="vc-btn-outline vc-sponsors__more"
+          className="vc-team-tabs__tab vc-sponsors__more"
+          aria-expanded={false}
           onClick={() => setExpanded(true)}
         >
           Show more ({folded})
+          <span className="vc-team-tabs__arrow" aria-hidden="true">
+            ▾
+          </span>
         </button>
       )}
     </>
@@ -586,9 +590,6 @@ export function Landing() {
           <div className="container mx-auto vc-hero__content">
             <div className="vc-hero__grid">
               <div className="vc-hero__main">
-                <p className="vc-kicker vc-hero__kicker">
-                  Buried by Vesuvius · 79 AD
-                </p>
                 <Heading as="h1" id="home-hero-title" className="vc-hero__title">
                   Resurrect an ancient library from the ashes of a volcano.
                 </Heading>

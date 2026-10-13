@@ -107,6 +107,17 @@
   color: var(--vc-text);
   margin: 0 0 24px;
 }
+/* Section headers sit on a rule matching the story timeline's; the story
+   header skips it, since the timeline rule follows directly. */
+.vc-landing .vc-h2-row,
+.vc-landing .container > .vc-h2 {
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--vc-line-strong);
+}
+.vc-landing section[aria-labelledby="our-story"] .vc-h2-row {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
 .vc-landing .vc-section__intro {
   max-width: 640px;
   font-size: 1rem;
@@ -593,8 +604,10 @@
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 2px 24px;
 }
+/* "Show more" reuses the team-tab look (label + ▾); the tab's own 8px
+   padding supplies the rest of the gap. */
 .vc-landing .vc-sponsors__more {
-  margin-top: 16px;
+  margin-top: 8px;
 }
 .vc-landing a.vc-sponsor {
   display: flex;
@@ -898,11 +911,6 @@
 /* --------------------------------------------------------------------------
    Our story — timeline strip: five dates on one rule, one shared panel.
    -------------------------------------------------------------------------- */
-/* Hero kicker: the eruption, above the fold. */
-.vc-landing .vc-hero__kicker {
-  margin: 0 0 12px;
-}
-
 .vc-landing .vc-strip__line a,
 .vc-landing .vc-strip__more a {
   color: var(--vc-text);
