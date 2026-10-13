@@ -11,6 +11,8 @@ useful, writing an image to inspect. Keep their output with the run.
 | Sparse SfM | `sfm_review.py SFM_DIR BLOCKS` | posed views and residuals per block; verified image pairs between orientations; camera circles and shared axes per orientation (needs `review_sfm_data.json`) | |
 | Scale | `scale_review.py CANDIDATES` | per candidate: scale, triangulated corners, marker side lengths, off-plane residual, marker ring radius | |
 | OpenMVS | `mesh_qa.py MESH.ply [...] --undistorted DIR --render views.png --texture TEXTURED.ply` | masks reached OpenMVS; finite, valid, watertight, manifold, one component; principal-axis extents | shaded and textured views along each principal axis |
+| Split orientations: scale | `marker_scale.py SCENE.json IMAGE_DIR keep-*.txt` (needs OpenCV with aruco) | marker corners re-triangulated at 1.5 px per block: scale factor, side lengths, planarity, ring radius | |
+| Split orientations: join | `split_align.py align / silhouette / merge / check` (run scripts `split_recon.sh`, `merged_openmvs.sh`) | rim alignment of two separately reconstructed orientations, hypothesis ranking and rim scale; thickness against the photographs; merged scene for one OpenMVS run; merged reprojection, mesh vs both halves, mesh outline vs masks | outline contact sheet |
 | Case | `scrollcase_qa.py OUTPUT_DIR ID --render kit.png` | three STLs and a CSV row; per-STL topology; split vs cavity direction; scroll-to-case clearance, nothing inside case material | sections and assembly views |
 
 `ROOT` and `BLOCKS` are the acquisition tree (one `<orientation>_camera_<height>/` directory per block, as in the
@@ -25,8 +27,9 @@ openMVG_main_ConvertSfM_DataFormat -i <SFM_DIR>/mvg/recon_dir/sfm_data.bin \
 
 ## Environment
 
-All scripts run in the [scrollcase](../scrollcase/) virtual environment, which has numpy, Pillow, trimesh and meshlib;
-`find_blocks.py` also needs the `exiftool` command, which the masking step already requires:
+All scripts run in the [scrollcase](../scrollcase/) virtual environment, which has numpy, scipy, Pillow, trimesh and
+meshlib; `find_blocks.py` also needs the `exiftool` command, which the masking step already requires, and
+`marker_scale.py` needs OpenCV with the aruco module (`opencv-contrib-python`), which that environment lacks:
 
 ```bash
 ../scrollcase/.venv/bin/python mesh_qa.py ...
