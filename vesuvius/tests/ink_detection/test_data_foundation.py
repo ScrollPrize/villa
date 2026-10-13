@@ -871,3 +871,105 @@ def test_full_3d_merges_intersecting_segment_supervision(tmp_path, monkeypatch):
     expected_labels[1, 2, 2] = 1
     np.testing.assert_array_equal(supervision, expected_supervision)
     np.testing.assert_array_equal(labels, expected_labels)
+
+
+def _build_zero_worker_fixtures(tmp_path: Path) -> InkDataConfig:
+    """Create a tiny real flat segment (image/labels/supervision) on disk."""
+    segment_dir = tmp_path / "segment-a"
+    segment_dir.mkdir(exist_ok=True)
+    image = np.arange(7 * 4 * 4, dtype=np.uint8).reshape(7, 4, 4)
+    labels = np.zeros_like(image)
+    labels[3, 1:3, 1:3] = 1
+    supervision = np.zeros_like(image)
+    supervision[3, 0:3, 0:3] = 1
+    for name, value in (
+        ("image.zarr", image),
+        ("segment-a_inklabels.zarr", labels),
+        ("segment-a_supervision_mask.zarr", supervision),
+    ):
+        _write_pyramid(segment_dir / name, value)
+    return InkDataConfig.from_mapping(
+        {
+            "mode": "flat",
+            "patch_size": [3, 2, 2],
+            "patch_overlap": 0.5,
+            "patch_min_labeled_coverage": 0.0,
+            "image_normalization": "none",
+            "out_dir": str(tmp_path),
+            "dataloader_workers": 0,
+            "datasets": [
+                {
+                    "segments_path": str(tmp_path),
+                    "segments": ["segment-a"],
+                    "surface_volume_paths": {
+                        "segment-a": str(segment_dir / "image.zarr")
+                    },
+                    "volume_scale": 0,
+                }
+            ],
+        }
+    )
+
+
+@pytest.mark.parametrize("workers", [0, 2])
+def test_discovery_worker_count_finds_known_patches_and_reads_sample(
+    tmp_path, workers
+):
+    """Zero workers discovers and reads the same real patches as the thread pool."""
+    config = replace(
+        _build_zero_worker_fixtures(tmp_path),
+        dataloader_workers=workers,
+        patch_cache_filename=tmp_path / f"cache-{workers}.json",
+    )
+    dataset = InkDataset(config, do_augmentations=False)
+
+    assert [patch.bbox for patch in dataset.patches] == [
+        (2, 0, 0, 5, 2, 2),
+        (2, 0, 1, 5, 2, 3),
+        (2, 0, 2, 5, 2, 4),
+        (2, 1, 0, 5, 3, 2),
+        (2, 1, 1, 5, 3, 3),
+        (2, 1, 2, 5, 3, 4),
+        (2, 2, 0, 5, 4, 2),
+        (2, 2, 1, 5, 4, 3),
+        (2, 2, 2, 5, 4, 4),
+    ]
+    assert dataset.training_patches == dataset.patches
+    sample = dataset[0]
+    assert tuple(sample["image"].shape) == (1, 3, 2, 2)
+    # image_normalization "none" keeps the raw uint8 values as float32.
+    expected_image = np.arange(7 * 4 * 4, dtype=np.float32).reshape(7, 4, 4)[
+        2:5, 0:2, 0:2
+    ]
+    np.testing.assert_allclose(sample["image"][0].numpy(), expected_image)
+    # Patch (2, 0, 0) covers one labeled voxel and four supervision voxels.
+    assert int(sample["inklabels"].sum()) == 1
+    assert int(sample["supervision_mask"].sum()) == 4
+
+def test_zero_worker_discovery_failure_keeps_error_context(tmp_path):
+    """A broken segment surfaces the wrapped discovery error, not an executor error."""
+    config = replace(
+        _build_zero_worker_fixtures(tmp_path),
+        patch_cache_filename=tmp_path / "cache-broken.json",
+    )
+    segment = replace(
+        _segment(config, tmp_path),
+        inklabels=tmp_path / "segment-a" / "missing_inklabels.zarr",
+        supervision_mask=tmp_path / "segment-a" / "missing_supervision.zarr",
+    )
+    broken = InkDataset(
+        config, do_augmentations=False, patches=[], segments=[segment]
+    )
+    with pytest.raises(RuntimeError, match="Failed finding patches for"):
+        broken._discover_or_load_patches()
+
+
+def test_negative_worker_discovery_is_still_rejected(tmp_path):
+    """Negative counts keep the pre-fix ThreadPoolExecutor rejection."""
+    config = replace(
+        _build_zero_worker_fixtures(tmp_path),
+        dataloader_workers=-1,
+        patch_cache_filename=tmp_path / "cache-negative.json",
+    )
+    with pytest.raises(ValueError, match="max_workers must be greater than 0"):
+        InkDataset(config, do_augmentations=False)

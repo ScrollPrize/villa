@@ -221,14 +221,20 @@ class InkDataset(Dataset):
 
         training: list[Patch] = []
         validation: list[Patch] = []
-        with ThreadPoolExecutor(
-            max_workers=self.config.dataloader_workers
-        ) as executor:
-            for segment_training, segment_validation in executor.map(
-                process, self.segments
-            ):
+        if self.config.dataloader_workers == 0:
+            results = map(process, self.segments)
+            for segment_training, segment_validation in results:
                 training.extend(segment_training)
                 validation.extend(segment_validation)
+        else:
+            with ThreadPoolExecutor(
+                max_workers=self.config.dataloader_workers
+            ) as executor:
+                for segment_training, segment_validation in executor.map(
+                    process, self.segments
+                ):
+                    training.extend(segment_training)
+                    validation.extend(segment_validation)
         patches = training + validation
         save_patch_cache(path, patches)
         return patches

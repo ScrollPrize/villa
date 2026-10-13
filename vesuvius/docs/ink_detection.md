@@ -361,7 +361,7 @@ Optimization, execution, and artifact controls:
 | `scheduler.max_lr`, `scheduler.total_steps`, `scheduler.pct_start`, `scheduler.final_div_factor` | One-cycle fields. |
 | `grad_acc_steps`, `grad_clip`, `max_steps` | Accumulation, clipping, and the optimizer-step horizon used by the scheduler. |
 | `mixed_precision` | Accelerate precision setting, such as `fp16`, `bf16`, or `no`. |
-| `dataloader_workers`, `pin_memory`, `prefetch_factor` | DataLoader controls. |
+| `dataloader_workers`, `pin_memory`, `prefetch_factor` | DataLoader controls. `dataloader_workers: 0` is the training default and runs fully synchronously: the in-process DataLoader and single-threaded patch discovery. Positive counts use a spawn-based DataLoader and a thread pool for discovery; negative counts are rejected. |
 | `ddp_find_unused_parameters`, `ddp_broadcast_buffers` | DDP controls. |
 | `stitch_factor`, `use_stitched_forward`, `stitched_gradient_checkpointing` | Flat stitched-forward controls; native modes disable stitching. |
 | `enable_deep_supervision` | Enable decoder deep supervision. |
