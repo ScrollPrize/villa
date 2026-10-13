@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import logging
 import math
 import shutil
@@ -48,6 +50,7 @@ from vesuvius.utils.cli import HyphenUnderscoreParser
 LOGGER = logging.getLogger(__name__)
 DEFAULT_OCCUPANCY_SCAN_LEVEL = "3"
 DEFAULT_OVERLAP = 0.5
+FOLDER_RUN_IDENTITY_HEX_LENGTH = 16
 
 
 @dataclass(frozen=True)
@@ -1189,6 +1192,80 @@ def resolve_segment_zarr_path(segment_dir: Path) -> Path:
     )
 
 
+def _file_sha256(path: str | Path) -> str:
+    """Hash one local file without loading it into memory."""
+
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _folder_checkpoint_paths(args: argparse.Namespace) -> list[Path]:
+    """Return every checkpoint that can affect one folder prediction."""
+
+    ensemble = getattr(args, "ensemble_checkpoint", None) or ()
+    return [Path(args.checkpoint), *(Path(path) for path in ensemble)]
+
+
+def folder_run_identity(
+    args: argparse.Namespace,
+    configured_model: ConfiguredModel,
+    *,
+    device: torch.device,
+) -> str:
+    """Return a readable identity for output-affecting folder-run inputs."""
+
+    stride = resolve_patch_stride(
+        patch_size=configured_model.patch_size,
+        overlap=args.overlap,
+        explicit_stride=args.stride,
+    )
+    blend_mode = str(args.blend_mode)
+    if blend_mode == "auto":
+        blend_mode = (
+            "constant" if stride >= configured_model.patch_size else "hann"
+        )
+    effective_amp_dtype = (
+        None
+        if configured_model.amp_dtype is None or device.type != "cuda"
+        else str(configured_model.amp_dtype).replace("torch.", "")
+    )
+    checkpoint_paths = _folder_checkpoint_paths(args)
+    checkpoint_hashes: dict[Path, str] = {}
+    checkpoint_sha256s = []
+    for path in checkpoint_paths:
+        if path not in checkpoint_hashes:
+            checkpoint_hashes[path] = _file_sha256(path)
+        checkpoint_sha256s.append(checkpoint_hashes[path])
+    specification = {
+        "schema": 2,
+        "checkpoint_sha256s": checkpoint_sha256s,
+        "resolution": str(args.resolution),
+        "mask_sha256": (
+            None if args.mask_path is None else _file_sha256(args.mask_path)
+        ),
+        "layer_start": args.layer_start,
+        "layer_end": args.layer_end,
+        "stride": stride,
+        "blend_mode": blend_mode,
+        "tta_mirror": bool(args.tta_mirror),
+        "tta_batch_size": (
+            args.tta_batch_size if args.tta_mirror else None
+        ),
+        "amp_dtype": effective_amp_dtype,
+    }
+    encoded = json.dumps(
+        specification, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    identity = hashlib.sha256(encoded).hexdigest()
+    readable_stem = Path(args.checkpoint).stem
+    if len(checkpoint_paths) > 1:
+        readable_stem = f"{readable_stem}-ens{len(checkpoint_paths)}"
+    return f"{readable_stem}-{identity[:FOLDER_RUN_IDENTITY_HEX_LENGTH]}"
+
+
 def infer_folder(
     args: argparse.Namespace,
     configured_model: ConfiguredModel,
@@ -1208,7 +1285,9 @@ def infer_folder(
             raise FileNotFoundError(f"No segment directories found under {folder}")
     else:
         segment_dirs = [folder]
-    checkpoint_stem = Path(args.checkpoint).stem
+    run_identity = folder_run_identity(
+        args, configured_model, device=device
+    )
     date = datetime.now().strftime("%d%m%y")
     prefix = f"{args.output_prefix}_" if args.output_prefix else ""
     ran_count = 0
@@ -1222,7 +1301,7 @@ def infer_folder(
             continue
         for direction in resolve_run_directions(args.direction):
             name_prefix = (
-                f"{prefix}{segment_dir.name}_{checkpoint_stem}_{direction}_"
+                f"{prefix}{segment_dir.name}_{run_identity}_{direction}_"
             )
             prediction_dir = segment_dir / "preds"
             existing = (
