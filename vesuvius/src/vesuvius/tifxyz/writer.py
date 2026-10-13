@@ -8,6 +8,7 @@ import shutil
 import tempfile
 from pathlib import Path
 from typing import Optional, Union
+from uuid import uuid4
 
 import numpy as np
 import tifffile
@@ -168,7 +169,10 @@ class TifxyzWriter:
         """
         # Build metadata dict in C++ format
         meta_dict = {
-            "uuid": surface.uuid,
+            # The surface's persistent identity is written as-is (callers
+            # creating a new surface pass a fresh uuid4); an unset one gets a
+            # fresh uuid4 rather than an empty string.
+            "uuid": surface.uuid or str(uuid4()),
             # C++ format: scale is [x_scale, y_scale]
             # Our internal format is (scale_y, scale_x)
             "scale": [surface._scale[1], surface._scale[0]],
