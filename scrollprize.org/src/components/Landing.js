@@ -27,149 +27,221 @@ const usd = new Intl.NumberFormat("en-US", {
 });
 
 /* ---------------------------------------------------------------------------
-   Story content (JSX-heavy, so it stays here; pure data lives in
-   landingData.js). One media element per chapter.
+   Our story beats: `line` is the headline sentence, `more` the follow-up,
+   `media` one image or clip per beat.
 --------------------------------------------------------------------------- */
 
 const storyImage = (src, alt) => (
-  <img
-    src={src}
-    alt={alt}
-    loading="lazy"
-    decoding="async"
-    className="vc-media vc-story__media"
-  />
+  <img src={src} alt={alt} loading="lazy" decoding="async" className="vc-media" />
 );
 
-const stories = ({ unrollVideo }) => [
+/* Muted looping clip; plays on mount unless the viewer prefers reduced
+   motion, in which case the poster stays. */
+const StoryVideo = ({ sources, poster, title }) => {
+  const ref = useRef(null);
+  useEffect(() => {
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    autoPlay(ref);
+  }, []);
+  return (
+    <video
+      ref={ref}
+      playsInline
+      loop
+      muted
+      preload="metadata"
+      poster={poster}
+      title={title}
+      aria-label={title}
+      className="vc-media"
+    >
+      {sources.map(([src, type]) => (
+        <source src={src} type={type} key={src} />
+      ))}
+    </video>
+  );
+};
+
+const storyBeats = [
   {
     date: "79 AD",
-    text: "Mount Vesuvius erupts.",
-    anchor: "vesuvius",
-    description: (
+    id: "vesuvius",
+    line: (
       <>
-        <p>
-          In Herculaneum, twenty meters of hot mud and ash bury an enormous
-          villa once owned by the father-in-law of Julius Caesar. Inside, there
-          is a vast library of papyrus scrolls.
-        </p>
-        <p>
-          The scrolls are carbonized by the heat of the volcanic debris. But
-          they are also preserved. For centuries, as virtually every ancient
-          text exposed to the air decays and disappears, the library of the
-          Villa of the Papyri waits underground, intact.
-        </p>
+        Vesuvius erupts, burying a villa and its library of papyrus scrolls
+        under twenty meters of ash.
       </>
+    ),
+    more: (
+      <>
+        The scrolls are carbonized by the heat, but also preserved. For
+        centuries, as almost every other ancient text decays, the library of
+        the Villa of the Papyri waits underground, intact.
+      </>
+    ),
+    media: storyImage("/img/landing/vesuvius.webp", "Mount Vesuvius"),
+  },
+  {
+    date: "1750",
+    line: (
+      <>
+        The villa is rediscovered. Early attempts to open the scrolls destroy
+        many; hundreds remain unopened.
+      </>
+    ),
+    more: (
+      <>
+        A farmworker digging a well strikes a marble pavement. Excavations
+        unearth hundreds of scrolls, too fragile to unroll. More than six
+        hundred remain unread.
+      </>
+    ),
+    media: storyImage("/img/landing/scroll.webp", "Carbonized Herculaneum scroll"),
+    credit: true,
+  },
+  {
+    date: "2015",
+    line: (
+      <>
+        Dr. Brent Seales's team virtually unwraps the En-Gedi scroll with X-ray
+        tomography.
+      </>
+    ),
+    more: (
+      <>
+        Their work goes on to show that the elusive carbon ink of the
+        Herculaneum scrolls can also be detected, laying the foundation for
+        Vesuvius Challenge.
+      </>
+    ),
+    media: (
+      <StoryVideo
+        sources={[["/img/landing/engedi5.webm", "video/webm"]]}
+        poster="/img/landing/engedi5.webp"
+        title="Virtual unwrapping of the En-Gedi scroll"
+      />
+    ),
+    credit: true,
+  },
+  {
+    date: "2023",
+    line: (
+      <>
+        Vesuvius Challenge launches; within a year,{" "}
+        <a href="/grandprize">the Grand Prize is claimed</a>.
+      </>
+    ),
+    more: (
+      <>
+        Teams recover four passages of 140 characters from a sealed scroll,
+        the first text ever read from inside one.
+      </>
+    ),
+    media: (
+      <div className="vc-strip__pan">
+        <img
+          src="/img/landing/scroll-full-min.webp"
+          alt="Herculaneum scroll panorama"
+          loading="lazy"
+          decoding="async"
+        />
+      </div>
     ),
   },
   {
-    date: "1750 AD",
-    text: "A farmer discovers the buried villa.",
-    description: (
+    date: "2026",
+    line: (
       <>
-        <p>
-          While digging a well, an Italian farmworker encounters a marble
-          pavement. Excavations unearth beautiful statues and frescoes – and
-          hundreds of scrolls. Carbonized and ashen, they are extremely
-          fragile. But the temptation to open them is great; if read, they
-          would significantly increase the corpus of literature we have from
-          antiquity.
-        </p>
-        <p>
-          Early attempts to open the scrolls unfortunately destroy many of
-          them. A few are painstakingly unrolled by a monk over several
-          decades, and they are found to contain philosophical texts written in
-          Greek. More than six hundred remain unopened and unreadable.
-        </p>
-        {storyImage("/img/landing/scroll.webp", "Carbonized Herculaneum scroll")}
-        <p className="text-sm opacity-60 mt-2">
-          © EduceLab/University of Kentucky.
-        </p>
+        PHerc. 1667 becomes the first Herculaneum
+        scroll <a href="/firstscroll">read end to end</a>.
       </>
     ),
-  },
-  {
-    date: "2015 AD",
-    text: "Dr. Brent Seales pioneers virtual unwrapping.",
-    description: (
+    more: (
       <>
-        <p>
-          Using X-ray tomography and computer vision, a team led by Dr. Brent
-          Seales at the University of Kentucky reads the En-Gedi scroll without
-          opening it. Discovered in the Dead Sea region of Israel, the scroll
-          is found to contain text from the book of Leviticus.
-        </p>
-        <p>
-          Virtual unwrapping has since emerged as a growing field with multiple
-          successes. Their work went on to show the elusive carbon ink of the
-          Herculaneum scrolls can also be detected using X-ray tomography,
-          laying the foundation for Vesuvius Challenge.
-        </p>
-        <video
-          playsInline
-          loop
-          muted
-          preload="metadata"
-          title="Virtual unwrapping of the En-Gedi scroll"
-          aria-label="Virtual unwrapping of the En-Gedi scroll"
-          className="vc-media vc-story__media"
-          poster="/img/landing/engedi5.webp"
-          ref={unrollVideo}
-        >
-          <source src="/img/landing/engedi5.webm" type="video/webm" />
-        </video>
-        <p className="text-sm opacity-60 mt-2">
-          Virtual unwrapping of the En-Gedi scroll. © EduceLab/University of Kentucky.
-        </p>
+        Hundreds more remain sealed, and reading them needs unwrapping that is
+        faster and more automated. That's the{" "}
+        <a href="/prizes#2027-grand-prize">$1M Grand Prize</a>.
       </>
     ),
-  },
-  {
-    date: "2023 AD",
-    text: "A remarkable breakthrough.",
-    description: (
-      <>
-        <p>
-          Vesuvius Challenge launched in March 2023 with a Grand Prize for
-          the first team to recover four passages of 140 characters from a
-          Herculaneum scroll. Within a year,{" "}
-          <a href="/grandprize">the prize was claimed</a>. The quest was
-          just beginning.
-        </p>
-        <div className="vc-media vc-panorama">
-          <img
-            src="/img/landing/scroll-full-min.webp"
-            alt="Herculaneum scroll panorama"
-            loading="lazy"
-            decoding="async"
-          />
-        </div>
-      </>
+    media: (
+      <StoryVideo
+        sources={[
+          ["/img/firstscroll/hero-reveal.webm", "video/webm"],
+          ["/img/firstscroll/hero-reveal.mp4", "video/mp4"],
+        ]}
+        poster="/img/firstscroll/hero-poster.webp"
+        title="PHerc. 1667 being virtually unwrapped"
+      />
     ),
   },
 ];
 
+const StoryCredit = () => (
+  <p className="vc-strip__credit">
+    © EduceLab/University of Kentucky
+  </p>
+);
+
+/* Timeline strip: dates on one rule, one shared text + media panel.
+   Opens on 79 AD so the eruption is the first thing shown. */
+const StoryStrip = () => {
+  const [active, setActive] = useState(0);
+  const beat = storyBeats[active];
+  return (
+    <div className="vc-strip">
+      <div className="vc-strip__dates" role="tablist" aria-label="Timeline">
+        {storyBeats.map((b, i) => (
+          <button
+            type="button"
+            role="tab"
+            aria-selected={i === active}
+            className={`vc-strip__date vc-nums${
+              i === active ? " is-active" : ""
+            }`}
+            onClick={() => setActive(i)}
+            key={b.date}
+          >
+            {b.date}
+          </button>
+        ))}
+      </div>
+      <div className="vc-strip__stage">
+        <button
+          type="button"
+          className="vc-strip__arrow"
+          aria-label="Previous"
+          disabled={active === 0}
+          onClick={() => setActive(active - 1)}
+        >
+          ‹
+        </button>
+        <div className="vc-strip__panel" role="tabpanel">
+          <div className="vc-strip__text">
+            <p className="vc-strip__line">{beat.line}</p>
+            <p className="vc-strip__more">{beat.more}</p>
+          </div>
+          <div className="vc-strip__media" key={beat.date}>
+            {beat.media}
+            {beat.credit && <StoryCredit />}
+          </div>
+        </div>
+        <button
+          type="button"
+          className="vc-strip__arrow"
+          aria-label="Next"
+          disabled={active === storyBeats.length - 1}
+          onClick={() => setActive(active + 1)}
+        >
+          ›
+        </button>
+      </div>
+    </div>
+  );
+};
+
 /* --------------------------------------------------------------------------
    Small presentational pieces
 -------------------------------------------------------------------------- */
-
-const Story = ({ story, index }) => (
-  <article
-    id={`story-section-${index}`}
-    className="vc-story"
-    aria-labelledby={story.anchor || `story-title-${index}`}
-  >
-    <p className="vc-kicker vc-story__kicker">{story.date}</p>
-    <Heading
-      as="h2"
-      id={story.anchor || `story-title-${index}`}
-      className="vc-story__title"
-    >
-      {story.text}
-    </Heading>
-    <div className="vc-story__body">{story.description}</div>
-  </article>
-);
 
 const SponsorAvatar = ({ sponsor }) => {
   if (!sponsor.image) {
@@ -376,7 +448,6 @@ export function Landing() {
   }, []);
 
   const heroVideo = useRef(null);
-  const unrollVideo = useRef(null);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -395,7 +466,6 @@ export function Landing() {
     if ("requestIdleCallback" in window)
       window.requestIdleCallback(enableVideo, { timeout: 1200 });
     else setTimeout(enableVideo, 600);
-    autoPlay(unrollVideo);
   }, []);
 
   // Open prizes are sourced from docs/34_prizes.md frontmatter at build time
@@ -486,6 +556,9 @@ export function Landing() {
           <div className="container mx-auto vc-hero__content">
             <div className="vc-hero__grid">
               <div className="vc-hero__main">
+                <p className="vc-kicker vc-hero__kicker">
+                  Buried by Vesuvius · 79 AD
+                </p>
                 <Heading as="h1" id="home-hero-title" className="vc-hero__title">
                   Resurrect an ancient library from the ashes of a volcano.
                 </Heading>
@@ -611,111 +684,6 @@ export function Landing() {
         </section>
 
         {/* ------------------------------------------------------------------
-            Our story — five beats on one hairline timeline. The 2026 chapter
-            carries the open prizes (merged per audit §4).
-        ------------------------------------------------------------------ */}
-        <section className="vc-section" aria-labelledby="our-story">
-          <div className="container mx-auto">
-            <Heading as="h2" id="our-story" className="vc-h2">
-              Our story
-            </Heading>
-            <div className="vc-timeline">
-              {(() => {
-                const allStories = stories({ unrollVideo });
-                const EARLY_COUNT = 3; // 79 AD, 1750, 2015 — the pre-Challenge backstory
-                const early = allStories.slice(0, EARLY_COUNT);
-                const recent = allStories.slice(EARLY_COUNT);
-                return (
-                  <>
-                    <details className="vc-collapse vc-story-history">
-                      <summary className="vc-collapse__summary">
-                        <span className="vc-collapse__heading">
-                          <span className="vc-collapse__title">
-                            The backstory
-                          </span>
-                          <span className="vc-collapse__hint">
-                            79 AD – 2015 AD · how we got here
-                          </span>
-                        </span>
-                        <span className="vc-collapse__arrow" aria-hidden="true">
-                          ▾
-                        </span>
-                      </summary>
-                      <div className="vc-collapse__body">
-                        {early.map((s, index) => (
-                          <Story story={s} key={s.date} index={index} />
-                        ))}
-                      </div>
-                    </details>
-                    {recent.map((s, index) => (
-                      <Story
-                        story={s}
-                        key={s.date}
-                        index={index + EARLY_COUNT}
-                      />
-                    ))}
-                  </>
-                );
-              })()}
-
-              <article
-                className="vc-story"
-                aria-labelledby="the-challenge-continues"
-              >
-                <p className="vc-kicker vc-story__kicker">2026 AD</p>
-                <Heading
-                  as="h2"
-                  id="the-challenge-continues"
-                  className="vc-story__title"
-                >
-                  The first scroll is read.
-                </Heading>
-                <div className="vc-story__body">
-                  <p>
-                    In 2026, <a href="/firstscroll">PHerc. 1667</a> became
-                    the first Herculaneum scroll to be virtually unwrapped and
-                    read end to end. The challenge now moves onto its next
-                    stage: reading multiple entire scrolls.
-                  </p>
-                  <div className="vc-media">
-                    <BeforeAfter
-                      beforeImage="/img/firstscroll/hero-reveal-start-960-crop.webp"
-                      afterImage="/img/firstscroll/hero-reveal-end-960-crop.webp"
-                      altBefore="PHerc. 1667 as a sealed CT scan, before virtual unwrapping"
-                      altAfter="The unwrapped writing surface of PHerc. 1667, showing columns of ancient Greek text"
-                      className="aspect-[20/7] h-auto"
-                    />
-                  </div>
-                  <a href="/prizes" className="vc-cta">
-                    See all open prizes
-                  </a>
-                </div>
-              </article>
-            </div>
-          </div>
-        </section>
-
-        {/* ------------------------------------------------------------------
-            Sponsors — every donor in one list, smaller gifts behind "Show more".
-        ------------------------------------------------------------------ */}
-        <section className="vc-section" aria-labelledby="sponsors">
-          <div className="container mx-auto">
-            <div className="vc-h2-row">
-              <Heading as="h2" id="sponsors" className="vc-h2">
-                Sponsors
-              </Heading>
-              <a
-                href="https://donate.stripe.com/aEUg101vt9eN8gM144"
-                className="vc-btn-outline vc-h2-row__action"
-              >
-                Donate
-              </a>
-            </div>
-            <SponsorList list={[...sponsors].sort(sponsorOrder)} />
-          </div>
-        </section>
-
-        {/* ------------------------------------------------------------------
             Team — one credit line + the plain dense lists (already the target
             aesthetic; heading scale fixed).
         ------------------------------------------------------------------ */}
@@ -770,6 +738,44 @@ export function Landing() {
                 collapsible
               />
             </div>
+          </div>
+        </section>
+
+        {/* ------------------------------------------------------------------
+            Our story — 79 AD to 2026 on one timeline strip; the 2026 beat
+            links on to the open prizes.
+        ------------------------------------------------------------------ */}
+        <section className="vc-section" aria-labelledby="our-story">
+          <div className="container mx-auto">
+            <div className="vc-h2-row">
+              <Heading as="h2" id="our-story" className="vc-h2">
+                Our story
+              </Heading>
+              <a href="/winners" className="vc-cta vc-h2-row__action">
+                All milestones
+              </a>
+            </div>
+            <StoryStrip />
+          </div>
+        </section>
+
+        {/* ------------------------------------------------------------------
+            Sponsors — every donor in one list, smaller gifts behind "Show more".
+        ------------------------------------------------------------------ */}
+        <section className="vc-section" aria-labelledby="sponsors">
+          <div className="container mx-auto">
+            <div className="vc-h2-row">
+              <Heading as="h2" id="sponsors" className="vc-h2">
+                Sponsors
+              </Heading>
+              <a
+                href="https://donate.stripe.com/aEUg101vt9eN8gM144"
+                className="vc-cta vc-h2-row__action"
+              >
+                Make a donation
+              </a>
+            </div>
+            <SponsorList list={[...sponsors].sort(sponsorOrder)} />
           </div>
         </section>
 

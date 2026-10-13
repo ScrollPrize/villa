@@ -118,7 +118,6 @@
 /* Body-link grammar inside landing prose (spec §3). */
 .vc-landing .vc-hero__intro a,
 .vc-landing .vc-section__intro a,
-.vc-landing .vc-story__body > p a,
 .vc-landing .vc-credit a {
   color: var(--vc-text);
   font-weight: 500;
@@ -128,7 +127,6 @@
 }
 .vc-landing .vc-hero__intro a:hover,
 .vc-landing .vc-section__intro a:hover,
-.vc-landing .vc-story__body > p a:hover,
 .vc-landing .vc-credit a:hover {
   color: var(--vc-accent);
 }
@@ -205,21 +203,6 @@
   line-height: 1.6;
   color: var(--vc-text-dim);
   margin: 0 0 20px;
-}
-/* Our story: wider frame for media, unchanged 640px reading measure. */
-@media (min-width: 997px) {
-  .vc-landing .vc-timeline {
-    max-width: 960px;
-  }
-  .vc-landing .vc-story__body {
-    max-width: 880px;
-  }
-  .vc-landing .vc-story__body > p {
-    max-width: 640px;
-  }
-  .vc-landing .vc-story__body .vc-media {
-    max-width: 880px;
-  }
 }
 .vc-landing .vc-hero__ctas {
   display: flex;
@@ -488,84 +471,6 @@
   color: var(--vc-text-faint);
 }
 
-/* --------------------------------------------------------------------------
-   Our story — hairline timeline, reading-scale chapters, uniform media.
-   -------------------------------------------------------------------------- */
-.vc-landing .vc-timeline {
-  position: relative;
-  max-width: 768px;
-}
-.vc-landing .vc-timeline::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  top: 8px;
-  bottom: 8px;
-  width: 1px;
-  background: var(--vc-line);
-}
-.vc-landing .vc-story {
-  position: relative;
-  padding-left: 40px;
-}
-.vc-landing .vc-story + .vc-story {
-  margin-top: 64px;
-}
-/* Chapter marker on the rule — neutral, not another ember. */
-.vc-landing .vc-story::before {
-  content: "";
-  position: absolute;
-  left: -3px;
-  top: 5px;
-  width: 7px;
-  height: 7px;
-  border-radius: var(--vc-r-full);
-  background: var(--vc-bg);
-  border: 1px solid var(--vc-line-strong);
-}
-.vc-landing .vc-story__kicker {
-  margin-bottom: 8px;
-}
-.vc-landing .vc-story__title {
-  font-size: 1.5rem;
-  font-weight: 700;
-  letter-spacing: -0.01em;
-  line-height: 1.15;
-  color: var(--vc-text);
-  margin: 0 0 16px;
-}
-.vc-landing .vc-story__body {
-  max-width: 640px;
-  font-size: 1rem;
-  line-height: 1.65;
-  color: var(--vc-text-dim);
-}
-.vc-landing .vc-story__body p {
-  margin: 0 0 16px;
-}
-/* Uniform chapter media: 720px frame, cropped to a calm banner height. */
-.vc-landing .vc-story__body .vc-media {
-  width: 100%;
-  max-width: 720px;
-  margin-top: 8px;
-}
-.vc-landing img.vc-story__media,
-.vc-landing video.vc-story__media {
-  height: 200px;
-  object-fit: cover;
-}
-/* 2023 panorama: static, manually pannable strip (the 40s auto-pan is gone). */
-.vc-landing .vc-panorama {
-  overflow-x: auto;
-  -webkit-overflow-scrolling: touch;
-  background: var(--vc-surface);
-}
-.vc-landing .vc-panorama img {
-  display: block;
-  height: 200px;
-  width: auto;
-  max-width: none;
-}
 /* 2026 banner (PHerc. 1667): fixed crop of the middle-right region of the
    4000×308 strip — object-position picks the visible window; click-through
    to /firstscroll for the full pannable banner. */
@@ -822,22 +727,6 @@
   flex: 0 1 auto;
 }
 
-/* Story backstory expander: aligns with the timeline; its revealed chapters
-   keep their own markers on the rule. */
-.vc-landing .vc-story-history {
-  border-top: 0;
-  margin-bottom: 64px;
-}
-.vc-landing .vc-story-history > summary {
-  padding-left: 40px;
-}
-.vc-landing .vc-story-history .vc-collapse__body {
-  padding-top: 24px;
-}
-.vc-landing .vc-story-history .vc-story:first-child {
-  margin-top: 0;
-}
-
 /* --------------------------------------------------------------------------
    Team — credit line + plain dense lists.
    -------------------------------------------------------------------------- */
@@ -916,6 +805,7 @@
   display: flex;
   flex-wrap: wrap;
   align-items: center;
+  justify-content: space-between;
   gap: 32px 48px;
 }
 .vc-landing .vc-partners__img {
@@ -993,21 +883,6 @@
     border-left: 0;
     padding-left: 0;
   }
-  /* Story timeline tightens. */
-  .vc-landing .vc-story {
-    padding-left: 24px;
-  }
-  .vc-landing .vc-story + .vc-story {
-    margin-top: 64px;
-  }
-  .vc-landing .vc-story__title {
-    font-size: 1.25rem;
-  }
-  .vc-landing img.vc-story__media,
-  .vc-landing video.vc-story__media,
-  .vc-landing .vc-panorama img {
-    height: 200px;
-  }
   .vc-landing .vc-team {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -1052,5 +927,204 @@
   }
   .vc-landing .vc-sponsors__grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Our story — timeline strip: five dates on one rule, one shared panel.
+   -------------------------------------------------------------------------- */
+/* Hero kicker: the eruption, above the fold. */
+.vc-landing .vc-hero__kicker {
+  margin: 0 0 12px;
+}
+
+.vc-landing .vc-strip__line a,
+.vc-landing .vc-strip__more a {
+  color: var(--vc-text);
+  font-weight: 500;
+  text-decoration: underline;
+  text-decoration-color: var(--vc-accent-underline);
+  text-underline-offset: 2px;
+}
+.vc-landing .vc-strip__line a:hover,
+.vc-landing .vc-strip__more a:hover {
+  color: var(--vc-accent);
+}
+/* Credit sits over the bottom-left corner of the beat's image or clip. */
+.vc-landing .vc-strip__media {
+  position: relative;
+}
+.vc-landing .vc-strip__credit {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  margin: 0;
+  padding: 2px 6px;
+  border-radius: var(--vc-r-btn);
+  background: color-mix(in srgb, var(--vc-bg) 70%, transparent);
+  font-size: 0.75rem;
+  color: var(--vc-text-dim);
+  pointer-events: none;
+}
+
+.vc-landing .vc-strip__dates {
+  position: relative;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+.vc-landing .vc-strip__dates::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 5px;
+  border-top: 1px solid var(--vc-line-strong);
+}
+.vc-landing .vc-strip__date {
+  position: relative;
+  padding: 20px 0 6px;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  font-family: var(--vc-mono);
+  font-size: 0.875rem;
+  color: var(--vc-text-dim);
+  transition: color 0.15s;
+}
+.vc-landing .vc-strip__date::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 50%;
+  width: 11px;
+  height: 11px;
+  margin-left: -5.5px;
+  border: 1px solid var(--vc-line-strong);
+  border-radius: var(--vc-r-full);
+  background: var(--vc-bg);
+}
+.vc-landing .vc-strip__date:first-child::before {
+  left: 5.5px;
+}
+.vc-landing .vc-strip__date:last-child::before {
+  left: auto;
+  right: 0;
+}
+.vc-landing .vc-strip__date:hover,
+.vc-landing .vc-strip__date.is-active {
+  color: var(--vc-accent);
+}
+.vc-landing .vc-strip__date.is-active::before {
+  border-color: var(--vc-accent);
+  background: var(--vc-accent);
+}
+.vc-landing .vc-strip__date:focus-visible {
+  outline: 2px solid var(--vc-accent);
+  outline-offset: 2px;
+}
+.vc-landing .vc-strip__panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr);
+  gap: 32px;
+  align-items: start;
+}
+.vc-landing .vc-strip__line {
+  font-size: 1.25rem;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--vc-text);
+  margin: 0 0 12px;
+}
+.vc-landing .vc-strip__more {
+  font-size: 1rem;
+  line-height: 1.6;
+  color: var(--vc-text-dim);
+  margin: 0 0 8px;
+}
+.vc-landing .vc-strip__stage {
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr) 40px;
+  gap: 16px;
+  align-items: center;
+  margin: 24px -56px 0;
+}
+/* Arrows hang into the gutter only where the gutter is wide enough. */
+@media (max-width: 1279px) {
+  .vc-landing .vc-strip__stage {
+    margin: 24px 0 0;
+  }
+}
+.vc-landing .vc-strip__arrow {
+  width: 40px;
+  height: 40px;
+  padding: 0 0 3px;
+  border: 1px solid var(--vc-line-strong);
+  border-radius: var(--vc-r-full);
+  background: var(--vc-bg);
+  color: var(--vc-text);
+  font-family: inherit;
+  font-size: 1.5rem;
+  line-height: 1;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, opacity 0.15s;
+}
+.vc-landing .vc-strip__arrow:hover:not(:disabled) {
+  color: var(--vc-accent);
+  border-color: var(--vc-accent);
+}
+.vc-landing .vc-strip__arrow:disabled {
+  opacity: 0.25;
+  cursor: default;
+}
+.vc-landing .vc-strip__arrow:focus-visible {
+  outline: 2px solid var(--vc-accent);
+  outline-offset: 2px;
+}
+/* Photos and clips crop to a low 5:2 banner; the panorama pans sideways at
+   the banner's height. */
+.vc-landing .vc-strip__media > img,
+.vc-landing .vc-strip__media > video {
+  display: block;
+  width: 100%;
+  aspect-ratio: 5 / 2;
+  object-fit: cover;
+  margin: 0;
+}
+.vc-landing .vc-strip__pan {
+  aspect-ratio: 5 / 2;
+  border: 1px solid var(--vc-line);
+  border-radius: var(--vc-r-card);
+  width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.vc-landing .vc-strip__pan img {
+  display: block;
+  height: 100%;
+  width: auto;
+  max-width: none;
+}
+
+@media (max-width: 768px) {
+  .vc-landing .vc-strip__panel {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+  }
+  .vc-landing .vc-strip__media {
+    order: -1;
+  }
+  .vc-landing .vc-strip__stage {
+    grid-template-columns: 32px minmax(0, 1fr) 32px;
+    gap: 8px;
+    margin: 20px -12px 0;
+  }
+  .vc-landing .vc-strip__arrow {
+    width: 32px;
+    height: 32px;
+    font-size: 1.25rem;
+  }
+  .vc-landing .vc-strip__date {
+    font-size: 0.75rem;
   }
 }
