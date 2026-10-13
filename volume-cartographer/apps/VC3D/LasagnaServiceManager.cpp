@@ -220,7 +220,11 @@ std::shared_ptr<QTemporaryFile> materializeLocalArtifactUpload(
         if (ec) {
             throw std::runtime_error(QStringLiteral("Cannot scan artifact directory: %1").arg(localPath).toStdString());
         }
-        std::sort(files.begin(), files.end());
+        // Order as fit_service._segment_manifest_hash does: path strings, so
+        // "ink-detections.json" sorts before "ink-detections/...".
+        std::sort(files.begin(), files.end(), [](const auto& a, const auto& b) {
+            return a.generic_string() < b.generic_string();
+        });
 
         QByteArray manifest;
         writeUploadBytes(*body, QByteArrayLiteral(",\"files\":{"));
@@ -960,7 +964,10 @@ QJsonObject LasagnaServiceManager::makeTifxyzArtifactUpload(
     if (ec || files.empty()) {
         return {};
     }
-    std::sort(files.begin(), files.end());
+    // Same order as fit_service._segment_manifest_hash (path strings).
+    std::sort(files.begin(), files.end(), [](const auto& a, const auto& b) {
+        return a.generic_string() < b.generic_string();
+    });
 
     QByteArray manifest;
     for (const auto& path : files) {
