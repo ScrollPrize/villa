@@ -187,7 +187,7 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
 
 # Fiber JSON document tag naming a patch the fiber is known to lie on:
 # ``explicit_link:<patch id>`` with the patch's tifxyz folder name. Written by
-# auto_link_fibers.py from VC3D fiber reviews or vc_fiber_auto_link output and
+# auto_link_fibers.py from saved fiber reviews or link documents and
 # consumed under pcl_fiber_explicit_links_only (see PatchLinkOptions).
 EXPLICIT_LINK_TAG_PREFIX = 'explicit_link:'
 

@@ -7,7 +7,7 @@ fit_spiral.py reads a fiber's document-level ``tags`` list and, under
 tags from one of two sources:
 
 * ``--links``: a ``vc_fiber_patch_links`` JSON written by
-  ``vc_fiber_auto_link`` (volume-cartographer). Every entry of a fiber's
+  an external linker or an earlier VC3D fiber review. Every entry of a fiber's
   ``linked`` list names a patch.
 * ``--review``: a ``vc3d_fiber_review`` workspace saved by VC3D's fiber review
   (version 1 or 2). Every decision with ``status == "accepted"`` (version 1:
@@ -265,7 +265,7 @@ def _report(plans: list[FiberPlan], missing: list[str], links: dict[str, set[str
 
 @click.command(help=__doc__)
 @click.option('--links', 'links_path', type=click.Path(exists=True, dir_okay=False), default=None,
-              help='vc_fiber_patch_links JSON (vc_fiber_auto_link output)')
+              help='Existing vc_fiber_patch_links JSON')
 @click.option('--review', 'review_path', type=click.Path(exists=True, dir_okay=False), default=None,
               help='vc3d_fiber_review workspace JSON (VC3D fiber review)')
 @click.option('--fibers', 'fibers_dir', type=click.Path(exists=True, file_okay=False), required=True,
