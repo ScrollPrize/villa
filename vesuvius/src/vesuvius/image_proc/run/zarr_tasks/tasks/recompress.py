@@ -62,10 +62,46 @@ def _recompress_worker(args: Tuple) -> Tuple[Tuple[Tuple[int, int], ...], bool]:
         else:
             raise
 
-    if delete_source_path is not None and chunks is not None:
+    # The source chunk is removed only once its data is in the output. A
+    # corrupt chunk is left in place so a failed run can be retried on it.
+    if delete_source_path is not None and chunks is not None and not corrupted:
         delete_chunk_file(delete_source_path, chunk_coords, chunks)
 
     return (chunk_coords, corrupted)
+
+
+def _chunk_file(zarr_path: str, coords: Tuple[Tuple[int, int], ...], chunks) -> Path:
+    """Path of a chunk file in the nested layout delete_chunk_file removes."""
+    index = (start // size for (start, _), size in zip(coords, chunks))
+    return Path(zarr_path) / "/".join(str(i) for i in index)
+
+
+def _restore_moved_chunks(
+    source_path: str,
+    temp_path: str,
+    stored_coords: List[Tuple[Tuple[int, int], ...]],
+    chunks: Tuple[int, ...],
+) -> int:
+    """Write back the chunks an interrupted in-place run moved to temp_path.
+
+    stored_coords are the chunks that had a file in the source before the run.
+    A worker deletes a source chunk only after writing it to the temp array,
+    so each of them that is now missing has a complete copy there.
+    Returns the number of chunks restored.
+    """
+    missing = [
+        coords
+        for coords in stored_coords
+        if not _chunk_file(source_path, coords, chunks).exists()
+    ]
+    if not missing:
+        return 0
+    source_z = zarr.open(source_path, mode="r+")
+    temp_z = zarr.open(temp_path, mode="r")
+    for coords in missing:
+        slices = tuple(slice(start, stop) for start, stop in coords)
+        source_z[slices] = temp_z[slices]
+    return len(missing)
 
 
 @register_task("recompress")
@@ -184,12 +220,15 @@ class RecompressTask(ZarrTask):
 
     def _run_inplace(self) -> None:
         """Run in-place recompression."""
+        # A trailing slash would put "<array>/_tmp" inside the source array,
+        # and replacing the source would then delete the new copy with it.
+        input_root = os.path.normpath(self.config.input_zarr)
         for level in self._levels_to_process:
             if self._is_ome_zarr:
-                level_path = f"{self.config.input_zarr}/{level}"
+                level_path = f"{input_root}/{level}"
                 print(f"\nProcessing level {level}...")
             else:
-                level_path = self.config.input_zarr
+                level_path = input_root
 
             temp_path = f"{level_path}_tmp"
 
@@ -215,6 +254,11 @@ class RecompressTask(ZarrTask):
             chunk_coords = get_chunk_coords(read_z.shape, read_z.chunks)
             chunks = read_z.chunks
             print(f"  Total chunks to process: {len(chunk_coords)}")
+            stored_coords = [
+                coords
+                for coords in chunk_coords
+                if _chunk_file(level_path, coords, chunks).exists()
+            ]
 
             # Copy chunks to temp and delete from original
             work_items = [
@@ -256,7 +300,20 @@ class RecompressTask(ZarrTask):
                         f"  Warning: {len(level_corrupted)} corrupted chunks filled with zeros"
                     )
             except Exception as e:
-                # Clean up temp on failure
+                # Chunks already copied were deleted from the source; put them
+                # back before the temp array is removed.
+                try:
+                    restored = _restore_moved_chunks(
+                        level_path, temp_path, stored_coords, chunks
+                    )
+                except Exception as restore_error:
+                    raise RuntimeError(
+                        f"Recompression failed for {level_path}: {e}. "
+                        f"Restoring the copied chunks also failed "
+                        f"({restore_error}); they are kept in {temp_path}"
+                    ) from e
+                if restored:
+                    print(f"  Restored {restored} copied chunks to {level_path}")
                 if Path(temp_path).exists():
                     shutil.rmtree(temp_path)
                 raise RuntimeError(f"Recompression failed for {level_path}: {e}") from e
