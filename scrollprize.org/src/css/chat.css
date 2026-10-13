@@ -19,37 +19,40 @@
 .vc-chat-trigger {
   position: fixed;
   z-index: 170; /* above content + the landing prize sticker (150), below the navbar (200) */
+  /* Docked: a tab flush with the bottom edge (open bottom, top corners
+     rounded); the safe-area inset becomes padding so it still reaches the
+     edge on notched phones. */
   right: calc(20px + env(safe-area-inset-right));
-  bottom: calc(20px + env(safe-area-inset-bottom));
+  bottom: 0;
   display: inline-flex;
   align-items: center;
   gap: 8px;
   min-height: 44px;
-  padding: 10px 16px;
+  padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
   background: var(--vc-surface);
   background: color-mix(in srgb, var(--vc-surface) 92%, transparent);
   -webkit-backdrop-filter: blur(8px);
   backdrop-filter: blur(8px);
   border: 1px solid var(--vc-line-strong);
-  border-radius: var(--vc-r-btn);
+  border-bottom: 0;
+  border-radius: var(--vc-r-btn) var(--vc-r-btn) 0 0;
   color: var(--vc-text);
   font-family: var(--vc-font);
   font-size: 0.8125rem;
   font-weight: 650;
   line-height: 1.2;
   cursor: pointer;
-  transition: background-color 0.15s, border-color 0.15s, bottom 0.3s ease;
+  transition: background-color 0.15s, border-color 0.15s;
 }
 /* Desktop: a much more prominent entry point (owner request). Mobile keeps
    the compact pill so it stays clear of thumbs, sticker, and footer. */
 @media (min-width: 997px) {
   .vc-chat-trigger {
     gap: 10px;
-    min-height: 56px;
-    padding: 16px 24px;
+    min-height: 52px;
+    padding: 14px 24px calc(14px + env(safe-area-inset-bottom));
     font-size: 1rem;
     right: calc(28px + env(safe-area-inset-right));
-    bottom: calc(28px + env(safe-area-inset-bottom));
   }
   .vc-chat-trigger svg {
     width: 20px;
@@ -74,8 +77,9 @@
 .vc-chat-panel {
   position: fixed;
   z-index: 240; /* above the navbar's dropdowns and the prize sticker */
-  right: calc(20px + env(safe-area-inset-right));
-  bottom: calc(20px + env(safe-area-inset-bottom));
+  /* Docked to the bottom edge above the trigger tab, like the tab itself. */
+  right: calc(28px + env(safe-area-inset-right));
+  bottom: 0;
   display: flex;
   flex-direction: column;
   width: 380px;
@@ -83,7 +87,8 @@
   height: min(560px, 80vh);
   background: var(--vc-surface);
   border: 1px solid var(--vc-line-strong);
-  border-radius: var(--vc-r-card);
+  border-bottom: 0;
+  border-radius: var(--vc-r-card) var(--vc-r-card) 0 0;
   overflow: hidden;
   /* Closed: invisible, inert, out of the tab order (visibility removes it
      from the a11y tree) — but still mounted, so streaming state survives. */
