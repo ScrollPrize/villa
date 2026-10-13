@@ -8,7 +8,7 @@ import BeforeAfter from "./BeforeAfter";
 import LatestPosts from "./LatestPosts";
 import {
   creators,
-  projectLead,
+  projectLeads,
   sponsors,
   team,
   partners,
@@ -256,7 +256,6 @@ const TeamGroup = ({ title, list, collapsible }) => {
           <span className="vc-collapse__heading">
             <span className="vc-collapse__title vc-team__group-title">
               {title}
-              <span className="vc-collapse__count"> ({list.length})</span>
             </span>
           </span>
           <span className="vc-collapse__arrow" aria-hidden="true">▾</span>
@@ -366,6 +365,14 @@ export function Landing() {
     setGpDaysLeft(
       Math.max(0, Math.ceil((deadline.getTime() - Date.now()) / 86400000)),
     );
+  }, []);
+
+  // The two "Led by" names swap order at random on each page load so
+  // neither is billed first. The server render keeps data order; the coin
+  // flip runs after mount to avoid a hydration mismatch.
+  const [leads, setLeads] = useState(projectLeads);
+  useEffect(() => {
+    if (Math.random() < 0.5) setLeads([...projectLeads].reverse());
   }, []);
 
   const heroVideo = useRef(null);
@@ -719,6 +726,17 @@ export function Landing() {
             </Heading>
             <div className="vc-credits">
               <div className="vc-credits__group">
+                <p className="vc-label vc-credits__label">Led by</p>
+                {leads.map((l) => (
+                  <div className="vc-person" key={l.name}>
+                    <a href={l.href} className="vc-person__name">
+                      {l.name}
+                    </a>
+                    <span className="vc-person__role">{l.title}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="vc-credits__group">
                 <p className="vc-label vc-credits__label">Created by</p>
                 {creators.map((c) => (
                   <div className="vc-person" key={c.name}>
@@ -731,29 +749,24 @@ export function Landing() {
                   </div>
                 ))}
               </div>
-              <div className="vc-credits__group">
-                <p className="vc-label vc-credits__label">Led by</p>
-                <div className="vc-person">
-                  <a href={projectLead.href} className="vc-person__name">
-                    {projectLead.name}
-                  </a>
-                  <span className="vc-person__role">{projectLead.title}</span>
-                </div>
-              </div>
             </div>
             <div className="vc-team">
-              <TeamGroup title="Tech Team" list={team.challenge} />
+              <TeamGroup title="Technical Team" list={team.challenge} />
               <TeamGroup title="Papyrology Team" list={team.papyrology} />
               <TeamGroup title="Annotation Team" list={team.annotation} />
-              <TeamGroup
-                title="EduceLab Team (Partners)"
-                list={team.educe}
-                collapsible
-              />
+            </div>
+            {/* Collapsible groups sit full width below the columns, so opening
+                one never reflows the groups above between columns. */}
+            <div className="vc-team__more">
               <TeamGroup title="Advisors & Alumni" list={team.alumni} collapsible />
               <TeamGroup
                 title="Papyrology Advisors"
                 list={team.papyrologyAdvisors}
+                collapsible
+              />
+              <TeamGroup
+                title="EduceLab Team (Partners)"
+                list={team.educe}
                 collapsible
               />
             </div>

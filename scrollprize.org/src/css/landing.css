@@ -773,10 +773,6 @@
   color: var(--vc-text);
   margin: 0;
 }
-.vc-landing .vc-collapse__count {
-  color: var(--vc-text-faint);
-  font-weight: 400;
-}
 .vc-landing .vc-collapse__hint {
   font-size: 0.8125rem;
   color: var(--vc-text-faint);
@@ -805,11 +801,25 @@
 }
 
 /* Team group as a collapsible: match the group heading scale, stay in-grid. */
+/* Collapsible team groups are secondary: small titles, arrow right
+   after the title, no per-group rules (the stack has one rule above it). */
 .vc-landing .vc-team__group.vc-collapse {
-  border-top: 1px solid var(--vc-line);
+  border-top: 0;
 }
 .vc-landing .vc-team__group-title {
-  font-size: 1.375rem;
+  font-size: 1.125rem;
+  font-weight: 600;
+}
+.vc-landing .vc-team__group > summary {
+  justify-content: flex-start;
+  gap: 8px;
+  padding: 8px 0;
+}
+.vc-landing .vc-team__group > summary .vc-collapse__arrow {
+  font-size: 0.875rem;
+}
+.vc-landing .vc-team__group > summary .vc-collapse__heading {
+  flex: 0 1 auto;
 }
 
 /* Story backstory expander: aligns with the timeline; its revealed chapters
@@ -838,15 +848,34 @@
   color: var(--vc-text-dim);
   margin: -8px 0 40px;
 }
-/* Masonry-style wrap: groups have very different lengths, so CSS columns
-   pack them without the empty cells a rigid grid leaves. */
+/* Always-open groups in a fixed two-column grid (Landing.js order: Tech,
+   Papyrology, Annotation): Tech and Annotation stack on the left, the
+   longer Papyrology list fills the right. */
 .vc-landing .vc-team {
-  columns: 2;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   column-gap: 48px;
+  align-items: start;
 }
 .vc-landing .vc-team > * {
-  break-inside: avoid;
   margin-bottom: 40px;
+}
+.vc-landing .vc-team > :nth-child(2) {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+}
+/* Desktop: the three groups share one row, each opening down its own
+   column, so opening one never moves the others. */
+.vc-landing .vc-team__more {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  column-gap: 48px;
+  align-items: start;
+  padding-top: 12px;
+  border-top: 1px solid var(--vc-line);
+}
+.vc-landing .vc-team__more .vc-person {
+  font-size: 0.875rem;
 }
 .vc-landing .vc-team__group h3 {
   font-size: 1.375rem;
@@ -980,7 +1009,14 @@
     height: 200px;
   }
   .vc-landing .vc-team {
-    columns: 1;
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .vc-landing .vc-team > :nth-child(2) {
+    grid-column: auto;
+    grid-row: auto;
+  }
+  .vc-landing .vc-team__more {
+    grid-template-columns: minmax(0, 1fr);
   }
   .vc-landing .vc-stat {
     padding: 0 16px;
