@@ -5925,7 +5925,7 @@ void SegmentationCommandHandler::onCopySurfaceRequested(const QString& segmentId
     try {
         auto copiedSeg = Segmentation::New(newPath);
         // A copy is a new object.
-        copiedSeg->setUuid(vc::util::newUuid());
+        copiedSeg->resetIdentityForCopy();
         copiedSeg->setName(newId);
         copiedSeg->saveMetadata();
     } catch (const std::exception& e) {

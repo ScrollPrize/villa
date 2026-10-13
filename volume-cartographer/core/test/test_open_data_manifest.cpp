@@ -1846,6 +1846,13 @@ TEST_CASE("OpenDataSegmentCache editable copy inherits routing from an aggregate
     copyFixtureFile(fixtureSegment / "y.tif", sourceSegment / "y.tif");
     copyFixtureFile(fixtureSegment / "z.tif", sourceSegment / "z.tif");
     writeFile(sourceSegment / "catalog-origin.json", "{}");
+    {
+        QuadSurface source(sourceSegment);
+        source.meta["uuid"] = "catalog-representation-id";
+        source.meta["vc_open_data_representation"] = "published-transformed";
+        source.meta["vc_open_data_coordinate_space"] = "sample/vol1@L0";
+        source.save_meta();
+    }
     const auto otherCatalogRoot = testRoot / "other-catalog-segments";
     const auto otherCatalogSegment =
         otherCatalogRoot / "published-L0" / "other-segment";
@@ -1922,6 +1929,15 @@ TEST_CASE("OpenDataSegmentCache editable copy inherits routing from an aggregate
     const auto surface = pkg->loadSurface("20241113070770");
     REQUIRE(surface);
     CHECK(surface->path == editableSegment);
+    CHECK(surface->objectUuid() != "catalog-representation-id");
+    CHECK_FALSE(surface->meta.contains("vc_open_data_representation"));
+    CHECK(surface->meta["vc_open_data_coordinate_space"].get_string() == "sample/vol1@L0");
+    const auto copiedUuid = surface->objectUuid();
+    copyCatalogSegmentToEditableDirectory(*pkg, sourceSegment, editableSegment);
+    CHECK(QuadSurface(editableSegment).objectUuid() == copiedUuid);
+    REQUIRE(pkg->reloadSingleSegmentation("20241113070770"));
+    REQUIRE(pkg->loadSurface("20241113070770"));
+    CHECK(pkg->loadSurface("20241113070770")->objectUuid() == copiedUuid);
 
     pkg.reset();
     VolumePkg::setAutosaveRoot(previousAutosaveRoot);

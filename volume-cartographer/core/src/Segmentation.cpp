@@ -2,6 +2,7 @@
 
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Logging.hpp"
+#include "vc/core/util/Uuid.hpp"
 
 #include <filesystem>
 #include <system_error>
@@ -63,6 +64,12 @@ std::string Segmentation::uuid() const
 void Segmentation::setUuid(const std::string& newUuid)
 {
     metadata_["uuid"] = newUuid;
+}
+
+void Segmentation::resetIdentityForCopy()
+{
+    metadata_["uuid"] = vc::util::newUuid();
+    metadata_.erase(OPEN_DATA_REPRESENTATION_KEY);
 }
 
 std::string Segmentation::name() const

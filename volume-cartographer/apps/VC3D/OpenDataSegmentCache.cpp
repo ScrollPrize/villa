@@ -2,6 +2,7 @@
 #include "OpenDataSegmentCacheIO.hpp"
 
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/types/Segmentation.hpp"
 #include "vc/core/util/AffineTransform.hpp"
 #include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -2240,6 +2241,9 @@ void copyCatalogSegmentToEditableDirectory(
                 editableSegmentDir / entry.path().filename(),
                 std::filesystem::copy_options::overwrite_existing);
         }
+        auto copy = Segmentation::New(editableSegmentDir);
+        copy->resetIdentityForCopy();
+        copy->saveMetadata();
     }
     if (!requiredFilesPresent(editableSegmentDir)) {
         throw std::runtime_error("editable destination is missing required tifxyz files");
