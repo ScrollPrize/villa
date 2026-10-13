@@ -598,6 +598,31 @@ static bool updateVolumeIdentityMetadata(
     return writeJsonObject(metaPath, meta);
 }
 
+static bool updateSegmentCoordinateMetadata(
+    const QString& segmentPath,
+    const QJsonObject& coordinateIdentity = {})
+{
+    // A tifxyz segment's meta "uuid" is its persistent object identity,
+    // assigned by its producer (vc_merge_tifxyz mints a fresh one): only
+    // the Open Data coordinate-identity keys are patched in here, never
+    // uuid/name. Contrast updateVolumeIdentityMetadata above, whose
+    // outputs are volumes identified by directory name.
+    if (coordinateIdentity.isEmpty()) {
+        return true;
+    }
+    const QDir dir(segmentPath);
+    if (!dir.exists()) {
+        return false;
+    }
+    const QString metaPath = dir.filePath(QStringLiteral("meta.json"));
+    QJsonObject meta = readJsonObject(metaPath);
+    if (meta.isEmpty()) {
+        return false;
+    }
+    copyCoordinateIdentity(meta, coordinateIdentity);
+    return writeJsonObject(metaPath, meta);
+}
+
 static bool isRasterizedLabelVolumePath(const QString& volumePath)
 {
     if (volumePath.isEmpty()) {
@@ -4533,7 +4558,7 @@ void SegmentationCommandHandler::onMergeTifxyz(const QStringList& segmentIds)
             if (tool != CommandLineToolRunner::Tool::MergeTifxyz)
                 return;
             disconnect(*connection);
-            if (success && !updateVolumeIdentityMetadata(
+            if (success && !updateSegmentCoordinateMetadata(
                                outputPath, outputCoordinateIdentity)) {
                 emit showWarning(
                     tr("Warning"),

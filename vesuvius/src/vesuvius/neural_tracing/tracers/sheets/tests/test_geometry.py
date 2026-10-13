@@ -651,6 +651,27 @@ def test_written_tifxyz_records_its_area(tmp_path):
     assert meta['area_vx2'] == pytest.approx(11*200.) and meta['area_cm2'] == pytest.approx(11*200.*100/1e8)
 
 
+def test_written_tifxyz_uuid_is_fresh_and_stable_on_overwrite(tmp_path):
+    import uuid as uuid_mod
+
+    from vesuvius.neural_tracing.tracers.sheets.tracing.inference import write_surface
+    r, c = np.meshgrid(np.arange(5), np.arange(4), indexing='ij')
+    rows = np.stack([np.full(r.shape, 7.), 10.*c, 20.*r], -1).astype(np.float32)
+    keep = np.ones(r.shape, bool)
+
+    def meta_uuid(out):
+        return json.loads((out/'meta.json').read_text())['uuid']
+
+    write_surface(tmp_path/'a'/'up', rows, keep, 20., 10.)
+    write_surface(tmp_path/'b'/'up', rows, keep, 20., 10.)
+    first, other = meta_uuid(tmp_path/'a'/'up'), meta_uuid(tmp_path/'b'/'up')
+    # A real identity, not the directory name shared by both roots.
+    assert uuid_mod.UUID(first) and first != 'up' and first != other
+    # Re-tracing into the same directory keeps that identity.
+    write_surface(tmp_path/'a'/'up', rows, keep, 20., 10., overwrite=True)
+    assert meta_uuid(tmp_path/'a'/'up') == first
+
+
 def test_fiber_seed_directions_follow_the_tensor_normal():
     """trace_from_fibers: the 2/8 structure-tensor normal of a tilted bright sheet, and an advance direction in the
     sheet, perpendicular to the fiber, pointing up."""
