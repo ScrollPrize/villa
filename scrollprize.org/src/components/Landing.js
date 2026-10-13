@@ -591,8 +591,11 @@ export function Landing() {
             <div className="vc-hero__grid">
               <div className="vc-hero__main">
                 <Heading as="h1" id="home-hero-title" className="vc-hero__title">
-                  Resurrect an ancient library from the ashes of a volcano.
+                  Resurrecting an ancient library from the ashes of a volcano.
                 </Heading>
+                <p className="vc-hero__tagline">
+                  Buried in 79 AD, now being read. Help us finish.
+                </p>
                 <p className="vc-hero__intro">
                   Vesuvius Challenge is an open science research organization{" "}
                   <a href="/firstscroll">reading</a> the carbonized Herculaneum

@@ -205,8 +205,19 @@
   letter-spacing: -0.015em;
   line-height: 1.05;
   color: var(--vc-text);
-  max-width: 24ch;
+  /* Wide enough for "Resurrecting an ancient library" on one line; balance
+     keeps the two lines even. */
+  max-width: 28ch;
+  text-wrap: balance;
   margin: 0 0 12px;
+}
+.vc-landing .vc-hero__tagline {
+  font-size: clamp(1rem, 1.35vw, 1.25rem);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+  color: var(--vc-accent);
+  margin: 0 0 14px;
 }
 .vc-landing .vc-hero__intro {
   max-width: 56ch;
