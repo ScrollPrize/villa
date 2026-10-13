@@ -4,7 +4,7 @@ import torch
 import geom_utils
 
 
-def get_spiral_yxs(num_windings, dr_per_winding, inter_point_spacing, group_by_winding=False, device='cuda'):
+def get_spiral_yxs(num_windings, dr_per_winding, inter_point_spacing, group_by_winding=False, device=None):
 
     # Note this is not differentiable wrt dr_per_winding nor inter_point_spacing!
 
@@ -14,6 +14,12 @@ def get_spiral_yxs(num_windings, dr_per_winding, inter_point_spacing, group_by_w
     # Kth winding has average radius (K + 0.5) * dr_per_winding => circumference (K + 0.5) * dr_per_winding * 2 * pi
     # ...so should have (K + 0.5) * dr_per_winding * 2 * pi / inter_point_spacing steps
     # can construct these thetas directly, then r's via formula
+
+    if device is None:
+        # Follow the caller's tensor when one is given (a CPU fit stays on
+        # CPU); numeric dr_per_winding keeps the historical CUDA default so
+        # GPU callers that pass only numbers are unchanged.
+        device = dr_per_winding.device if torch.is_tensor(dr_per_winding) else 'cuda'
 
     thetas = [
         winding_idx * 2 * torch.pi + torch.arange(

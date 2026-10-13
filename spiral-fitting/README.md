@@ -30,6 +30,25 @@ AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -c
 
 See [NVIDIA's DGX Spark memory guidance](https://docs.nvidia.com/dgx/dgx-spark/known-issues.html).
 
+## Preview and mesh device
+
+`sample_spiral.get_spiral_yxs` infers its device from `dr_per_winding` when
+the caller passes one as a tensor: a CPU tensor keeps the whole preview and
+mesh-export theta grid on CPU, matching the z grid that
+`save_combined_preview`/`save_mesh` already build on `dr_per_winding.device`.
+Numeric `dr_per_winding` keeps the historical CUDA default, and an explicit
+`device=` argument always wins. Validate with the existing environment, from
+the repository root:
+
+```sh
+AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -m pytest -q   spiral-fitting/tests/test_get_spiral_yxs_device.py
+```
+
+The real-data CPU regression
+(`spiral-fitting/tests/test_cpu_preview_export.py`) runs against the checked-in
+published PHerc0139 umbilicus JSON in `spiral-fitting/tests/data/` (sha256
+pinned in the test); the file is required test data, not an optional fixture.
+
 ## Editing input snapshots
 
 The service snapshots patch directories, fiber JSON files and point collections
