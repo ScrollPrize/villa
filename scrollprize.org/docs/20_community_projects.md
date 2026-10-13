@@ -62,7 +62,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 ### 🛠️ Tools
 
-- [vesuvius-c](https://github.com/ScrollPrize/villa/tree/main/vesuvius-c): C library for accessing Vesuvius Challenge data (deprecated — prefer the [`vesuvius`](https://github.com/scrollprize/vesuvius) Python library or VC3D).
+- [vesuvius-c](https://github.com/ScrollPrize/villa/tree/main/deprecated/vesuvius-c): C library for accessing Vesuvius Challenge data (deprecated — prefer the [`vesuvius`](https://github.com/scrollprize/vesuvius) Python library or VC3D).
 
 - [vesuvius-gui](https://github.com/jrudolph/vesuvius-gui) is a single binary GUI to render volumes and segments on-the-fly. By Johannes Rudolph
 
@@ -73,7 +73,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 - [preprocessed-data](https://github.com/usc-caisplusplus/scroll-data-preprocessing): Data preprocessing code and a fully processed version of the dataset in .zarr format to allow for faster training of ink detection models. 
 - [scroll-data-audit](https://github.com/Bullo27/scroll-data-audit) by Matteo Bulloni. Integrity auditor for the open-data: reconciles the catalog (`metadata.json`) against the actual Zarr arrays, filenames and scan metadata, and verifies multiscale pyramid value-correctness. Reported a Scroll 5 (PHerc0172) catalog shape error ([#1211](https://github.com/ScrollPrize/villa/issues/1211)) and certified the rest of the open-data consistent.
 
-- [vesuvius-repro](https://github.com/TAUIL-Abd-Elilah/vesuvius-repro): Regional reproducibility spot-checks of one selected 256³ region (central 128³ scored) from each of 41 m7 artifacts across 36 scrolls. Forty TTA-off checks match at Dice 0.9983–1.0000; PHerc. Paris 4 matches at 0.9999 with TTA on. The audit exposed previously missing configuration provenance; [#1253](https://github.com/ScrollPrize/villa/pull/1253) now records TTA, and maintainers backfilled existing artifacts. Also resolves each artifact's CT level. By TAUIL Abd Elilah
+- [vesuvius-repro](https://github.com/TAUIL-Abd-Elilah/vesuvius-repro): Regional reproducibility spot-checks of one selected 256³ region (central 128³ scored) from each of 41 m7 artifacts across 36 scrolls. Forty TTA-off checks match at Dice 0.9983–1.0000; PHerc. Paris. 4 matches at 0.9999 with TTA on. The audit exposed previously missing configuration provenance; [#1253](https://github.com/ScrollPrize/villa/pull/1253) now records TTA, and maintainers backfilled existing artifacts. Also resolves each artifact's CT level. By TAUIL Abd Elilah
 
 - [vesuvius-catalog](https://github.com/Schurkai/vesuvius-catalog): scriptable catalog CLI/library for the open-data bucket - answers which samples have segments, ink outputs or surface predictions at which resolutions, resolves S3/HTTPS data URLs (JSON/CSV output for scripting), and includes working openers for the bucket's OME-Zarr v2 stores under zarr-python 3.
 
@@ -158,10 +158,10 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 - [segmata](https://github.com/sgoutteb/segmata) by Stephane Gouttebroze:
     - Improve the segmentation process by sharpening the layers rendering, this is based on optimizing the layer 32, a further objective is to link this optimization on a inference loop (optimizing on the detected ink instead of only layers)
 
-- [Synthetic instance labels and volume generation](https://lcparker/synthetic-pages) by lcparker
+- [Synthetic instance labels and volume generation](https://github.com/lcparker/synthetic-pages) by lcparker
     - Generate artificial 3D volumes with corresponding instance labels for use in pretraining instance segmentation networks
 
-- [Mask3D for instance segmentation on scroll volumes](https://lcparker/Mask3D) by lcparker
+- [Mask3D for instance segmentation on scroll volumes](https://github.com/lcparker/Mask3D) by lcparker
     - SOTA instance segmentation network, configured to work with scroll volumes
     - [Effects of pretraining on synthetically generated data](https://github.com/lcparker/pretraining-advantage), plus pretrained and finetuned weights for the Mask3D network
 - [Affinity Prediction with Unet](https://discordapp.com/channels/1079907749569237093/1407379961417039953) by Ayush Mishra
@@ -192,7 +192,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [TIFXYZ Doctor](https://github.com/aviad12g/tifxyz-doctor) by Aviad Cohen — deterministic QA and triage for TIFXYZ surface grids, with sparse overlays and reproducible corpus/reader checks. v0.2 adds an overlap-component-isolated benchmark on 709 official human-reviewed PHercParis4 `same_wrap` patches; its frozen cue localizes abrupt synthetic normal-offset steps while byte-identical null controls and the reported gradual-transition miss rate bound the claim.
 
-- [spiralcheck](https://github.com/Nicodol/spiralcheck) by Nicolas Dolegieviez. Held-out evaluation for whole-scroll spiral fits: scores a finished run from its output meshes alone (CPU-only, no checkpoint, producer-agnostic) against verified patches withheld from that fit, and measures geometrically how much of the withheld evidence actually sits within touching distance of the fit's real inputs — on PHerc. Paris 4, 54.8% of a naive name-level split leaked that way, which no hash-level check can see. Also ships ground-truth-free winding-order checks around the umbilicus, a planted-defect matrix with computed null-control bounds, and `spiralcheck demo`, which runs the whole pipeline on a synthetic scroll with planted defects and needs no data.
+- [spiralcheck](https://github.com/Nicodol/spiralcheck) by Nicolas Dolegieviez. Held-out evaluation for whole-scroll spiral fits: scores a finished run from its output meshes alone (CPU-only, no checkpoint, producer-agnostic) against verified patches withheld from that fit, and measures geometrically how much of the withheld evidence actually sits within touching distance of the fit's real inputs — on PHerc. Paris. 4, 54.8% of a naive name-level split leaked that way, which no hash-level check can see. Also ships ground-truth-free winding-order checks around the umbilicus, a planted-defect matrix with computed null-control bounds, and `spiralcheck demo`, which runs the whole pipeline on a synthetic scroll with planted defects and needs no data.
 
 - [eligible-spiral-dataset](https://github.com/ttendoscopie-creator/eligible-spiral-dataset) by Thierry Tuszynski surveys what is actually published today for each of the 13 Grand-Prize-eligible scrolls — 9 have tracks, 3 have an umbilicus — and assembles a `fit_spiral` dataset from it. The layout and the `spiral-scroll.json` template are already published in the First Letters workflow post; this adds a survey that stops rather than printing "no" when a host does not answer, and restores the nanosecond `st_mtime_ns` that `_tracks_db_signature` fingerprints, so the published `.crossings.npz` is accepted instead of rebuilt — on PHerc. 0826 that is a whole-scroll cache, `z_range [4500, 16919]`. It writes `normal_zarr_group` and `lasagna_scale`, checked field by field against the published template, and requires `--outward-sense` rather than guessing it. Standard library only; three tests, each checked to be able to fail, one running against the metadata member extracted verbatim from the published sidecar.
 
@@ -264,7 +264,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
  
 - [Neuroglancer Mini](https://github.com/tomhsiao1260/neuroglancer-mini) A trimmed-down version of the Neuroglancer source code. By Yao Hsiao
 
-- [Scroll Viewer](https://github.com/lukeboi/scroll-viewer) by Luke Farritor. A lightweight, extensible tool for viewing volumetric data, which runs in the browser, and is very fast.
+- [Scroll Viewer](https://web.archive.org/web/20241230173950/https://github.com/lukeboi/scroll-viewer) by Luke Farritor. A lightweight, extensible tool for viewing volumetric data, which runs in the browser, and is very fast.
 
 - [Scroll Sleuth](https://github.com/Paul-G2/ScrollSleuth) by Paul Geiger. A web app that supports visual ink-searching in segment volumes via multiple display modes and segmentation tools.
 
@@ -326,7 +326,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 - [Omit](https://onedrive.live.com/?authkey=%21ALfVTOHQOkbecQ0&id=D6F698278C30CB3E%212310&cid=D6F698278C30CB3E) is a pipeline that tries to detect ink with classical approaches (not deep learning) by Timo Meireman
 
 - First Letters winning models, October 2023
-    - [Ink detection model](https://github.com/lukeboi/scroll-first-letters) by Luke Farritor
+    - [Ink detection model](https://web.archive.org/web/20241225210819/https://github.com/lukeboi/scroll-first-letters) by Luke Farritor
     - [Ink detection model, 2nd place but more accurate](https://github.com/younader/Vesuvius-First-Letters) by Youssef Nader
 
 - [Crackle Viewer](https://github.com/schillij95/Crackle-Viewer) is a tool to browse and annotate surface volumes of rendered segments, by Julian Schilliger
