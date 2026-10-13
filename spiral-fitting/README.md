@@ -205,6 +205,24 @@ layouts, pass `--umbilicus /path/to/umbilicus.json`. Use `--lasagna-dir` if
 the Lasagna repository is not in its standard sibling or `~/villa` location.
 An existing output path is never overwritten.
 
+## Hover descriptions (descriptions.json)
+
+The text VC3D shows when hovering a Spiral tab control or a setting in the
+Spiral Configuration window lives in `descriptions.json`, not in code:
+
+- `config` is keyed by configuration key. The service attaches each entry to
+  the `/configuration` catalog as the field's `description`, re-reading the
+  file per request, so an edit shows after VC3D reconnects. A new
+  configuration key needs an entry here; `tests/test_config.py` fails on a
+  missing or stale key.
+- `panel` is keyed by the control ids registered with `describe(...)` in
+  VC3D's `SpiralPanel.cpp`. VC3D reads this section from the copy beside the
+  `spiral_service.py` it would launch (the same lookup, including
+  `SPIRAL_SERVICE_PATH`) and reloads it as soon as the file changes. A panel id
+  without an entry falls back to the `config` entry of the same name.
+
+Plain text only; a newline starts a new line in the tooltip.
+
 ## Flow stages
 
 `model_num_flow_stages` sets how many stationary velocity fields the flow

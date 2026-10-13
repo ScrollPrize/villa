@@ -109,6 +109,66 @@ html.docs-doc-id-data_browser main .container article {
   }
 }
 
+/* Spiral fitting has long commands and configuration tables; use the available
+   desktop width with smaller side gutters and a compact contents column. */
+@media (min-width: 997px) {
+  html.docs-doc-id-tutorial_spiral {
+    --vc-doc-toc-width: 220px;
+  }
+  html.docs-doc-id-tutorial_spiral main > .container {
+    max-width: none;
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+  html.docs-doc-id-tutorial_spiral main .container article,
+  html.docs-doc-id-tutorial_spiral main .container .pagination-nav {
+    max-width: 1024px;
+    margin-left: auto;
+    margin-right: auto;
+  }
+}
+
+/* Make the two fit interfaces visibly selectable within their container. */
+.spiral-fit-tabs .tabs {
+  gap: 8px;
+  border-bottom: 1px solid var(--vc-line-strong);
+}
+.spiral-fit-tabs .tabs__item {
+  background: var(--vc-surface);
+  border: 1px solid var(--vc-line-strong);
+  border-bottom: 3px solid transparent;
+  border-radius: 8px 8px 0 0;
+  color: var(--vc-text-dim);
+  font-weight: 600;
+}
+.spiral-fit-tabs .tabs__item:hover {
+  background: var(--vc-raised);
+  color: var(--vc-text);
+}
+.spiral-fit-tabs .tabs__item--active {
+  background: var(--vc-raised);
+  border-bottom-color: var(--vc-accent);
+  color: var(--vc-accent);
+}
+.spiral-fit-tabs .tabs__item:focus-visible {
+  outline: 2px solid var(--vc-accent);
+  outline-offset: -4px;
+}
+
+.spiral-workspace-tutorial h5 {
+  font-size: 1.125rem;
+  font-weight: 700;
+  border-top: 1px solid var(--vc-line-strong);
+  margin-top: 2rem;
+  padding-top: 1.5rem;
+  margin-bottom: 1rem;
+}
+.spiral-workspace-tutorial h5:first-of-type {
+  border-top: 0;
+  margin-top: 0;
+  padding-top: 0;
+}
+
 /* Anchored headings clear the fixed navbar. */
 h1, h2, h3, h4, h5, h6 {
   scroll-margin-top: 72px;
