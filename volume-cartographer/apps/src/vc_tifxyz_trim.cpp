@@ -179,12 +179,10 @@ int main(int argc, char* argv[])
     std::error_code eq_ec;
     const bool in_place = dst == src ||
         (fs::exists(dst) && fs::equivalent(src, dst, eq_ec) && !eq_ec);
-    {
-        if (!in_place) {
-            meta["uuid"] = vc::util::newUuid();
-            meta["name"] = dst.filename().string();
-            meta.erase("vc_open_data_representation");
-        }
+    if (!in_place) {
+        meta["uuid"] = vc::util::newUuid();
+        meta["name"] = dst.filename().string();
+        meta.erase("vc_open_data_representation");
     }
     // Recompute rather than erase. Trimming drops rows/columns, so the input's
     // bbox is stale — but dropping the key outright makes the segment invisible
