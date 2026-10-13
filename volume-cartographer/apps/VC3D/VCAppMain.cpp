@@ -449,10 +449,6 @@ auto main(int argc, char* argv[]) -> int
         "200");
     parser.addOption(replayTimedProfilePeriodOption);
 
-    QCommandLineOption constraintGraphSessionOption("constraint-graph-session",
-        "Open a saved Constraint Graph workspace session.", "path");
-    parser.addOption(constraintGraphSessionOption);
-
     QCommandLineOption agentBridgeOption(
         "agent-bridge",
         "Enable the agent bridge (JSON-RPC over a local socket) on the default "
@@ -593,8 +589,6 @@ auto main(int argc, char* argv[]) -> int
             }
         }
 
-        if (parser.isSet(constraintGraphSessionOption))
-            aWin.openConstraintGraphSession(parser.value(constraintGraphSessionOption));
         if (parser.isSet(fiberCollectionOption)) {
             aWin.openFiberCollection(parser.value(fiberCollectionOption).trimmed());
         }

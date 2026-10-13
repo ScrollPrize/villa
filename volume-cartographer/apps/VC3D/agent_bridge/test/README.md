@@ -1,10 +1,5 @@
 # Agent bridge tests
 
-`benchmark_constraint_graph_interaction.py` measures zoom request latency on a
-loaded Constraint Graph without modifying its annotations. See
-[Constraint Graph navigation and interaction](../../ConstraintGraph.md#navigation-and-interaction)
-for fixture, readiness, profiling and invocation instructions.
-
 `smoke_offscreen.py` is the hermetic integration test used by CI. It launches
 the compiled VC3D binary with Qt's offscreen platform, checks all method
 descriptors, and exercises transport and headless error paths without local

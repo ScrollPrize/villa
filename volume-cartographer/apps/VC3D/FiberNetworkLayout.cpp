@@ -1,5 +1,4 @@
 #include "FiberNetworkLayout.hpp"
-#include "vc/fiber_tracer/FiberWindingGeometry.hpp"
 
 #include <QDebug>
 
@@ -49,9 +48,51 @@ double median(std::vector<double> values)
     return 0.5 * (values[middle - 1] + values[middle]);
 }
 
-using vc::fiber_tracer::winding_geometry::interpolate;
-using vc::fiber_tracer::winding_geometry::interpolateUmbilicus;
-using vc::fiber_tracer::winding_geometry::UmbilicusInterp;
+// np.interp: linear interpolation with clamped ends.
+double interpolate(double query, const std::vector<double>& xs,
+                   const std::vector<double>& ys)
+{
+    if (xs.empty()) {
+        return 0.0;
+    }
+    if (query <= xs.front()) {
+        return ys.front();
+    }
+    if (query >= xs.back()) {
+        return ys.back();
+    }
+    const auto upper = std::upper_bound(xs.begin(), xs.end(), query);
+    const std::size_t hi = static_cast<std::size_t>(upper - xs.begin());
+    const std::size_t lo = hi - 1;
+    const double span = xs[hi] - xs[lo];
+    if (span <= 0.0) {
+        return ys[lo];
+    }
+    return ys[lo] + (query - xs[lo]) / span * (ys[hi] - ys[lo]);
+}
+
+// np.unwrap: shift each successive delta into (-pi, pi].
+std::vector<double> unwrapAngles(const std::vector<double>& raw)
+{
+    std::vector<double> out(raw.size());
+    if (raw.empty()) {
+        return out;
+    }
+    out[0] = raw[0];
+    for (std::size_t i = 1; i < raw.size(); ++i) {
+        const double delta = raw[i] - raw[i - 1];
+        double wrapped = std::fmod(delta + M_PI, kTwoPi);
+        if (wrapped < 0.0) {
+            wrapped += kTwoPi;
+        }
+        wrapped -= M_PI;
+        if (wrapped == -M_PI && delta > 0.0) {
+            wrapped = M_PI;
+        }
+        out[i] = out[i - 1] + wrapped;
+    }
+    return out;
+}
 
 std::vector<double> arclengths(const std::vector<QPointF>& points)
 {
@@ -171,6 +212,30 @@ std::size_t searchSortedRight(const std::vector<double>& values, double query)
         std::upper_bound(values.begin(), values.end(), query) - values.begin());
 }
 
+// The umbilicus as three z-sorted interpolation tables.
+struct UmbilicusInterp {
+    std::vector<double> z;
+    std::vector<double> x;
+    std::vector<double> y;
+};
+
+UmbilicusInterp interpolateUmbilicus(const std::vector<cv::Vec3f>& umbilicusCenters)
+{
+    std::vector<cv::Vec3f> centers = umbilicusCenters;
+    std::stable_sort(centers.begin(), centers.end(),
+                     [](const cv::Vec3f& a, const cv::Vec3f& b) { return a[2] < b[2]; });
+    UmbilicusInterp interp;
+    interp.z.resize(centers.size());
+    interp.x.resize(centers.size());
+    interp.y.resize(centers.size());
+    for (std::size_t i = 0; i < centers.size(); ++i) {
+        interp.z[i] = centers[i][2];
+        interp.x[i] = centers[i][0];
+        interp.y[i] = centers[i][1];
+    }
+    return interp;
+}
+
 // A fiber unrolled about the umbilicus; angles are fiber-local until the
 // whole-turn offset is applied.
 struct PreparedFiber {
@@ -194,9 +259,16 @@ PreparedFiber prepareFiber(const InputFiber& fiber, const UmbilicusInterp& umbil
 {
     PreparedFiber entry;
     entry.input = &fiber;
-    auto polar = vc::fiber_tracer::winding_geometry::polarTrace(fiber.linePoints, umbilicus);
-    entry.thetaLine = std::move(polar.theta);
-    entry.radius = std::move(polar.radius);
+    std::vector<double> raw(fiber.linePoints.size());
+    entry.radius.resize(fiber.linePoints.size());
+    for (std::size_t i = 0; i < fiber.linePoints.size(); ++i) {
+        const cv::Vec3d& point = fiber.linePoints[i];
+        const double dx = point[0] - interpolate(point[2], umbilicus.z, umbilicus.x);
+        const double dy = point[1] - interpolate(point[2], umbilicus.z, umbilicus.y);
+        raw[i] = std::atan2(dy, dx);
+        entry.radius[i] = std::sqrt(dx * dx + dy * dy);
+    }
+    entry.thetaLine = unwrapAngles(raw);
     entry.controlLineIndex.resize(fiber.controlPoints.size());
     for (std::size_t i = 0; i < fiber.controlPoints.size(); ++i) {
         double best = std::numeric_limits<double>::infinity();

@@ -9,7 +9,6 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-#include <optional>
 
 namespace vc::lasagna {
 
@@ -57,8 +56,6 @@ public:
         return false;
     }
     [[nodiscard]] virtual NormalSample sampleNormal(const cv::Vec3d& volumePoint) const = 0;
-    // Optional sheet score, higher on the papyrus (e.g. the Lasagna pred_dt channel); nullopt when unavailable.
-    [[nodiscard]] virtual std::optional<double> sampleSheetScore(const cv::Vec3d&) const { return std::nullopt; }
     [[nodiscard]] virtual NormalSampleWithDerivative sampleNormalWithDerivative(
         const cv::Vec3d& volumePoint) const
     {

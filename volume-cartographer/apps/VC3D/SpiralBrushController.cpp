@@ -9,7 +9,6 @@
 #include "overlays/PointsOverlayController.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
-#include "volume_viewers/SurfaceSceneTransform.hpp"
 // cv::boundingRect moved from imgproc into the geometry module in OpenCV 5;
 // OpenCvCompat pulls that header in on 5 and is a no-op on 4.
 #include "vc/core/util/OpenCvCompat.hpp"
@@ -90,6 +89,15 @@ std::optional<std::vector<cv::Vec2f>> exactPointCollectionSurfacePositions(
     return result;
 }
 
+QTransform surfaceToSceneTransform(const VolumeViewerBase* viewer)
+{
+    if (!viewer) return {};
+    const QPointF origin = viewer->surfaceCoordsToScene(0.0f, 0.0f);
+    const QPointF xStep = viewer->surfaceCoordsToScene(1.0f, 0.0f) - origin;
+    const QPointF yStep = viewer->surfaceCoordsToScene(0.0f, 1.0f) - origin;
+    return {xStep.x(), xStep.y(), yStep.x(), yStep.y(),
+            origin.x(), origin.y()};
+}
 }
 
 SpiralBrushController::SpiralBrushController(QObject* parent)

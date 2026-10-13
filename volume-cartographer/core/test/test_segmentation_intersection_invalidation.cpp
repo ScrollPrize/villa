@@ -83,11 +83,6 @@ public:
     bool isPlaneCompositeEnabled() const override { return false; }
     void setCompositeRenderSettings(const CompositeRenderSettings& settings) override { compositeSettings_ = settings; }
     void setVolumeWindow(float, float) override {}
-    void setSurfaceComparison(std::shared_ptr<Surface>, std::shared_ptr<Surface>) override {}
-    void setSurfaceComparisonOpacity(float) override {}
-    void setSurfaceLayers(std::shared_ptr<Surface>,
-                          std::vector<std::shared_ptr<Surface>>,
-                          std::vector<float>, std::vector<QColor> = {}) override {}
     void setBaseColormap(const std::string&) override {}
     void setResetViewOnSurfaceChange(bool) override {}
     void setPlaneIntersectionLinesVisible(bool) override {}

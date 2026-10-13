@@ -3,7 +3,6 @@
 #include "vc/lasagna/LineModel.hpp"
 
 #include <memory>
-#include <functional>
 #include <string>
 #include <cstdint>
 #include <vector>
@@ -25,15 +24,6 @@ inline constexpr double kLineViewCrossRowSpacingBaseVoxels = 32.0;
 inline constexpr int kLineViewCrossSampleCount = 7;
 
 struct LineViewConfig {
-    // Supply the field to build the default v7 robust sheet strip on an
-    // internal <=2-voxel grid, resampled to the requested output spacing.
-    // Keeps the fitting grid if coarsening would invalidate its geometry;
-    // consumers must use the returned grid dimensions and position map.
-    // Without a sampler this remains a frame-only builder (e.g. diagnostics).
-    const NormalSampler* normalSampler = nullptr;
-    std::function<void()> checkCancelled;
-    double crossSpacingBaseVoxels = kLineViewCrossRowSpacingBaseVoxels;
-    int crossSampleCount = kLineViewCrossSampleCount;
     // Derived ribbons retain every annotation control point and subdivide the
     // chord-arclength domain between adjacent controls as closely as possible to
     // this spacing. Ordinary QuadSurface interpolation uses this support grid;

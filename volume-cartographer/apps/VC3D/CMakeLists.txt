@@ -34,9 +34,6 @@ set(srcs
     LineAnnotationFiberSaveJob.hpp
     FiberNameDisplay.cpp
     FiberNameDisplay.hpp
-    ConstraintGraphWorkspace.cpp
-    ConstraintGraphFiberReview.cpp
-    ConstraintGraphWorkspace.hpp
     FiberMapWorkspace.cpp
     FiberMapWorkspace.hpp
     FiberMapRuler.cpp
@@ -389,7 +386,6 @@ target_link_libraries(VC3D
     vc_core
     vc_fiber_collection
     vc_atlas
-    vc_constraints
     vc_lasagna
     vc_fiber_tracer
     vc_tracer

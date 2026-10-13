@@ -100,7 +100,6 @@ void OverlayBatchItem::setLineCommands(std::vector<OverlayLineCommand> commands)
     prepareGeometryChange();
     _lines = std::move(commands);
     _points.clear();
-    _uniformPoints.clear();
     recomputeBounds();
     update();
 }
@@ -110,29 +109,7 @@ void OverlayBatchItem::setPointCommands(std::vector<OverlayPointCommand> command
     prepareGeometryChange();
     _points = std::move(commands);
     _lines.clear();
-    _uniformPoints.clear();
     recomputeBounds();
-    update();
-}
-
-void OverlayBatchItem::setUniformPoints(std::vector<QPointF> points, const QPen& pen)
-{
-    prepareGeometryChange();
-    _lines.clear();
-    _points.clear();
-    _uniformPoints = std::move(points);
-    _uniformPen = pen;
-    if (_uniformPoints.empty()) {
-        _bounds = {};
-    } else {
-        qreal left = _uniformPoints.front().x(), right = left;
-        qreal top = _uniformPoints.front().y(), bottom = top;
-        for (const auto& point : _uniformPoints) {
-            left = std::min(left, point.x()); right = std::max(right, point.x());
-            top = std::min(top, point.y()); bottom = std::max(bottom, point.y());
-        }
-        _bounds = paddedBounds(QRectF(QPointF(left,top),QPointF(right,bottom)),pen);
-    }
     update();
 }
 
@@ -161,10 +138,6 @@ void OverlayBatchItem::paint(QPainter* painter,
         painter->setPen(command.pen);
         painter->setBrush(command.brush);
         painter->drawEllipse(command.center, command.radius, command.radius);
-    }
-    if (!_uniformPoints.empty()) {
-        painter->setPen(_uniformPen);
-        painter->drawPoints(_uniformPoints.data(), static_cast<int>(_uniformPoints.size()));
     }
     painter->restore();
 }

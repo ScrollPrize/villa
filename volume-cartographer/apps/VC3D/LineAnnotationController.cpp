@@ -5094,7 +5094,6 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
                     side.fiber->linePoints, side.editSession->normalSampler.get());
             }
             vc::lasagna::LineViewConfig sideConfig;
-            sideConfig.normalSampler=side.editSession->normalSampler.get();
             sideConfig.controlPointLinePositions.reserve(
                 side.editSession->controlPoints.size());
             for (const auto& control : side.editSession->controlPoints) {
@@ -14123,17 +14122,6 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         displayLine = lineModelForVolumeDisplay(
             session.optimizedLine, session.fiberBaseToVolumeScale);
         vc::lasagna::LineViewConfig viewConfig;
-        // Display coordinates can differ from the sampler's fiber-base
-        // coordinates. Normals are unchanged by this uniform scaling.
-        struct DisplayNormals final : vc::lasagna::NormalSampler {
-            const vc::lasagna::NormalSampler* source;
-            double scale;
-            DisplayNormals(const vc::lasagna::NormalSampler* s,double k):source(s),scale(k){}
-            vc::lasagna::NormalSample sampleNormal(const cv::Vec3d& p) const override {
-                return source->sampleNormal(p/scale);
-            }
-        } displayNormals(session.normalSampler.get(),session.fiberBaseToVolumeScale);
-        viewConfig.normalSampler=session.normalSampler?&displayNormals:nullptr;
         viewConfig.controlPointLinePositions.reserve(session.controlPoints.size());
         for (const auto& control : session.controlPoints) {
             viewConfig.controlPointLinePositions.push_back(control.linePosition);
@@ -19879,3 +19867,4 @@ QString LineAnnotationController::takeLastSuppressedError()
     _lastSuppressedError.clear();
     return message;
 }
+
