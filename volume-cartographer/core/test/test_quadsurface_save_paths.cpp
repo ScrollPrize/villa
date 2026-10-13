@@ -6,6 +6,8 @@
 
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Uuid.hpp"
+#include "vc/core/types/Segmentation.hpp"
+#include "vc/core/types/VolumePkg.hpp"
 
 #include <opencv2/core.hpp>
 
@@ -111,6 +113,69 @@ TEST_CASE("in-place edits keep the object UUID; copies get a new one")
         created.save(catalogDir);
     }
     CHECK(QuadSurface(catalogDir).objectUuid() == "catalog-representation-id");
+    fs::remove_all(root);
+}
+
+TEST_CASE("catalog-derived local copies use directory keys across reloads")
+{
+    const auto root = tmpDir("catalog_copy");
+    struct RestoreAutosaveRoot {
+        fs::path previous = VolumePkg::autosaveRoot();
+        ~RestoreAutosaveRoot() { VolumePkg::setAutosaveRoot(previous); }
+    } restoreAutosaveRoot;
+    VolumePkg::setAutosaveRoot(root / "autosave");
+    const auto source = root / "catalog";
+    const auto output = root / "local";
+    fs::create_directories(output);
+    QuadSurface original(grid(), cv::Vec2f(1.f, 1.f));
+    original.meta["uuid"] = "catalog-representation-id";
+    original.meta["vc_open_data_representation"] = "published-transformed";
+    original.meta["vc_open_data_coordinate_space"] = "sample/volume@L0";
+    original.meta["vc_open_data_segment_long_id"] = "source-segment";
+    original.save(source);
+    auto pkg = VolumePkg::newEmpty();
+    REQUIRE(pkg->addSegmentsEntry(output.string()));
+    const auto destination = output / "copy";
+
+    SUBCASE("Copy Surface metadata-only identity reset") {
+        fs::copy(source, destination, fs::copy_options::recursive);
+        auto copy = Segmentation::New(destination);
+        copy->resetIdentityForCopy();
+        copy->setName("copy");
+        copy->saveMetadata();
+        CHECK(copy->id() == "copy");
+    }
+    SUBCASE("Save Transformed and other derived saves") {
+        auto copy = load_quad_from_tifxyz(source.string());
+        copy->saveAsNew(destination);
+        CHECK(copy->id == "copy");
+    }
+    SUBCASE("saveEdited to a different directory") {
+        auto copy = load_quad_from_tifxyz(source.string());
+        copy->saveEdited(source, destination);
+    }
+
+    REQUIRE(pkg->addSingleSegmentation("copy"));
+    REQUIRE(pkg->segmentation("copy"));
+    const auto uuid = pkg->segmentation("copy")->uuid();
+    CHECK(vc::util::isUuid(uuid));
+    CHECK(uuid != "catalog-representation-id");
+    REQUIRE(pkg->loadSurface("copy"));
+    CHECK(pkg->loadSurface("copy")->id == "copy");
+    REQUIRE(pkg->reloadSingleSegmentation("copy"));
+    CHECK(pkg->segmentation("copy")->uuid() == uuid);
+    // A fresh project avoids reusing cached Segmentation objects.
+    pkg = VolumePkg::newEmpty();
+    REQUIRE(pkg->addSegmentsEntry(output.string()));
+    REQUIRE(pkg->segmentation("copy"));
+    const auto& meta = pkg->segmentation("copy")->metadata();
+    CHECK_FALSE(meta.contains("vc_open_data_representation"));
+    CHECK(meta["vc_open_data_coordinate_space"].get_string() == "sample/volume@L0");
+    CHECK(meta["vc_open_data_segment_long_id"].get_string() == "source-segment");
+    // The source remains a catalog surface, including on an in-place save.
+    original.save(source, true);
+    CHECK(Segmentation(source).id() == "catalog-representation-id");
+    CHECK(Segmentation(source).metadata().contains("vc_open_data_representation"));
     fs::remove_all(root);
 }
 

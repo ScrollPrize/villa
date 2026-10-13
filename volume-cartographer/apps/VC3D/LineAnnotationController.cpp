@@ -18689,6 +18689,12 @@ nlohmann::json LineAnnotationController::fiberSaveSnapshotToJson(
 {
     StoredFiber serialized = snapshot.fiber;
     scaleStoredFiber(serialized, scale);
+    // StoredFiber and sessions mint a uuid at construction, so this only
+    // guards a fiber whose identity was somehow cleared: never write a
+    // present-but-empty uuid, which parseVc3dFiberJson rejects on load.
+    if (serialized.uuid.empty()) {
+        serialized.uuid = vc::util::newUuid();
+    }
 
     nlohmann::json root = nlohmann::json::object();
     root["type"] = "vc3d_fiber";

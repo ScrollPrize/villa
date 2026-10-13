@@ -383,6 +383,7 @@ public:
     void save(const std::filesystem::path &path, bool force_overwrite = false);
     // Save as a new object: always assigns a fresh object UUID first. Use for
     // copies and derived outputs whose meta was taken from another surface.
+    // Removes catalog representation lookup metadata from the local copy.
     void saveAsNew(const std::filesystem::path &path, bool force_overwrite = false);
     // Save an edit of the surface read from `source`: writing back over
     // `source` is an in-place edit (save), any other destination is a new

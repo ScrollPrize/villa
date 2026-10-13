@@ -121,6 +121,8 @@ static void saveGrid(const Grid& g, const fs::path& outdir, const fs::path& srcd
     const fs::path sm = srcdir / "meta.json";
     if (fs::exists(sm)) meta = Json::parse_file(sm.string());
     meta["uuid"] = vc::util::newUuid();  // a straightened copy is a new object
+    meta.erase("vc_open_data_representation");
+    meta["name"] = outdir.filename().string();
     meta["format"] = "tifxyz";
     meta["type"] = "seg";
     if (!meta.contains("scale")) {           // preserve the input's scale array

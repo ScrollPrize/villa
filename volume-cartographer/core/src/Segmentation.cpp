@@ -2,6 +2,7 @@
 
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Logging.hpp"
+#include "vc/core/util/Uuid.hpp"
 
 #include <filesystem>
 #include <system_error>
@@ -42,8 +43,13 @@ std::string Segmentation::id() const
 {
     // Open Data catalog caches name directories after upstream segment ids,
     // which repeat across representations and volumes; those segments are
-    // keyed by their catalog representation id, kept in "uuid".
-    if (metadata_.contains(OPEN_DATA_REPRESENTATION_KEY)) {
+    // keyed by their catalog representation id, kept in "uuid". A malformed
+    // cache meta (uuid missing its string form, or an empty representation
+    // id) falls back to the directory name instead of throwing or keying
+    // every such segment under "".
+    if (metadata_.contains(OPEN_DATA_REPRESENTATION_KEY)
+        && metadata_.contains("uuid") && metadata_["uuid"].is_string()
+        && !metadata_["uuid"].get_string().empty()) {
         return uuid();
     }
     const auto name = path_.filename();
@@ -58,6 +64,12 @@ std::string Segmentation::uuid() const
 void Segmentation::setUuid(const std::string& newUuid)
 {
     metadata_["uuid"] = newUuid;
+}
+
+void Segmentation::resetIdentityForCopy()
+{
+    metadata_["uuid"] = vc::util::newUuid();
+    metadata_.erase(OPEN_DATA_REPRESENTATION_KEY);
 }
 
 std::string Segmentation::name() const

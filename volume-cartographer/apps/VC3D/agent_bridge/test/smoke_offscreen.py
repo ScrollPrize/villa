@@ -1536,6 +1536,7 @@ def check_legacy_fiber_uuid(client: BridgeClient, results: Results,
         return json.loads(fiber_file.read_text()).get("uuid")
 
     try:
+        client.call("volume.open", {"path": fiber_volpkg}, timeout=RPC_TIMEOUT)
         first = stored_uuid()
         client.call("fiber.save", {}, timeout=RPC_TIMEOUT)
         after_save = stored_uuid()
@@ -1770,8 +1771,13 @@ def main() -> int:
             "line_points": [],
             "branches": [{}],
         }))
-        # A well-formed fiber written before fibers carried a uuid.
-        legacy_fiber = fiber_dir / "fiber_legacy.json"
+        # Use a separate clean project: broken-link fixtures deliberately
+        # defer all load-time repair writes, including UUID backfills.
+        legacy_fiber_volpkg = tmp_path / "legacy-fiber.volpkg.json"
+        legacy_fiber_volpkg.write_text(json.dumps({"name": "legacy-fiber", "version": 1}))
+        legacy_fiber_dir = tmp_path / "fibers" / legacy_fiber_volpkg.name
+        legacy_fiber_dir.mkdir(parents=True)
+        legacy_fiber = legacy_fiber_dir / "fiber_legacy.json"
         legacy_fiber.write_text(json.dumps({
             "type": "vc3d_fiber",
             "version": 1,
@@ -1806,7 +1812,7 @@ def main() -> int:
             check_segments_attach(client, results, tmp_path, volpkg)
             check_open_data_editable_copy(client, results, tmp_path, volpkg)
             check_c4(client, results, str(volpkg), str(broken_volpkg))
-            check_legacy_fiber_uuid(client, results, str(broken_volpkg),
+            check_legacy_fiber_uuid(client, results, str(legacy_fiber_volpkg),
                                     legacy_fiber)
             check_project_create(client, results, tmp_path)
             check_c2_oversized(sock_path, results)

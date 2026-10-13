@@ -2205,6 +2205,9 @@ void QuadSurface::save(const std::filesystem::path &path_, bool force_overwrite)
 
 void QuadSurface::saveAsNew(const std::filesystem::path &path_, bool force_overwrite)
 {
+    // A derived local surface is not the source's catalog representation.
+    // Keep coordinate/provenance fields, but use its directory as the UI key.
+    if (meta.is_object()) meta.erase("vc_open_data_representation");
     saveWithUuid(path_, vc::util::newUuid(), force_overwrite);
 }
 

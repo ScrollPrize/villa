@@ -353,9 +353,14 @@ void updateTifxyzMetadataIdentity(const QString& tifxyzDir, const QString& name)
         return;
     }
     QJsonObject root = doc.object();
-    // The result keeps an object UUID assigned by its producer; a legacy
-    // name-derived value is replaced, never derived from the final name.
-    if (!vc::util::isUuid(root.value(QStringLiteral("uuid")).toString().toStdString())) {
+    // The result keeps the identity assigned by its producer, whatever form
+    // it takes (a random UUID in any case, or a catalog id). Only a missing
+    // uuid or a legacy one derived from the result's own name is replaced:
+    // name-derived values repeat across unrelated outputs.
+    const QString currentUuid = root.value(QStringLiteral("uuid")).toString();
+    if (currentUuid.isEmpty()
+        || currentUuid == QFileInfo(tifxyzDir).fileName()
+        || currentUuid == root.value(QStringLiteral("name")).toString()) {
         root[QStringLiteral("uuid")] = QString::fromStdString(vc::util::newUuid());
     }
     root[QStringLiteral("name")] = name;

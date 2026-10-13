@@ -236,6 +236,21 @@ TEST_CASE("Segmentation: Open Data catalog segments keep the representation id k
     CHECK(seg.id() == "representation-1");
 }
 
+TEST_CASE("Segmentation: malformed Open Data uuid falls back to the directory name key")
+{
+    // An empty representation id must not key the segment under "", and a
+    // non-string uuid must not make id() throw.
+    TmpSeg empty;
+    writeMeta(empty.dir, R"({"type":"seg","uuid":"","format":"tifxyz",
+                             "vc_open_data_representation":"published-transformed"})");
+    CHECK(Segmentation(empty.dir).id() == empty.dir.filename().string());
+
+    TmpSeg numeric;
+    writeMeta(numeric.dir, R"({"type":"seg","uuid":42,"format":"tifxyz",
+                               "vc_open_data_representation":"published-transformed"})");
+    CHECK(Segmentation(numeric.dir).id() == numeric.dir.filename().string());
+}
+
 TEST_CASE("Segmentation: loaded surface carries the segment key")
 {
     TmpSeg t;
