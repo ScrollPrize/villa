@@ -149,13 +149,13 @@ export const creators = [
     name: "Daniel Gross",
     role: "Founding Sponsor",
     image: "/img/landing/daniel.webp",
-    href: "https://dcgross.com/",
+    href: "https://danielgross.com/",
   },
   {
     name: "Brent Seales",
-    role: "Principal Advisor, PhD",
+    role: "Principal Advisor",
     image: "/img/landing/brent.webp",
-    href: "https://educelab.engr.uky.edu/w-brent-seales",
+    href: "https://educelab.engr.uky.edu/people-6",
   },
 ];
 
@@ -187,7 +187,7 @@ export const sponsors = [
   {
     name: "Daniel Gross",
     amount: 225000,
-    href: "https://dcgross.com/",
+    href: "https://danielgross.com/",
     image: "/img/landing/daniel.webp",
   },
   {
@@ -437,11 +437,18 @@ export const sponsors = [
   },
 ];
 
-export const projectLead = {
-  name: "Giorgio Angelotti",
-  title: "Project & Tech Team Lead, PhD",
-  href: "https://thegiorgio.org/",
-};
+export const projectLeads = [
+  {
+    name: "Paul Henderson",
+    title: "Technical Lead",
+    href: "https://www.pmh47.net/",
+  },
+  {
+    name: "Federica Nicolardi",
+    title: "Papyrology Lead",
+    href: "https://www.docenti.unina.it/federica.nicolardi",
+  },
+];
 
 export const team = {
   challenge: [
@@ -452,13 +459,8 @@ export const team = {
     },
     {
       name: "Hendrik Schilling",
-      title: "Computer Vision & AI Expert, PhD",
+      title: "Computer Vision & AI Expert",
       href: "https://www.linkedin.com/in/dr-hendrik-schilling-a2019418a",
-    },
-    {
-      name: "Paul Henderson",
-      title: "Computer Vision & AI Expert, PhD",
-      href: "https://www.pmh47.net/",
     },
     {
       name: "Elian Rafael Dal Prá",
@@ -474,7 +476,7 @@ export const team = {
   annotation: [
     {
       name: "David Josey",
-      title: "Team Lead, PhD",
+      title: "Team Lead",
       href: "https://www.linkedin.com/in/davidsjosey/",
     },
     {
@@ -492,17 +494,17 @@ export const team = {
     {
       name: "Brent Seales",
       title: "Principal Investigator, Professor of Computer Science",
-      href: "https://educelab.engr.uky.edu/w-brent-seales",
+      href: "https://educelab.engr.uky.edu/people-6",
     },
     {
       name: "Seth Parker",
-      title: "Research Manager",
+      title: "Assistant Research Professor",
       href: "https://www2.cs.uky.edu/dri/seth-parker/",
     },
     {
       name: "Christy Chapman",
       title: "Research & Partnership Manager",
-      href: "https://educelab.engr.uky.edu/christy-chapman",
+      href: "https://educelab.engr.uky.edu/people-6",
     },
     {
       name: "Mami Hayashida",
@@ -517,7 +519,6 @@ export const team = {
     {
       name: "Beth Lutin",
       title: "College Business Analyst",
-      href: "https://www.engr.uky.edu/directory/lutin-elizabeth",
     },
     {
       name: "Roger Macfarlane",
@@ -533,8 +534,13 @@ export const team = {
     },
     {
       name: "Stephen Parsons",
-      title: "Project Lead, PhD",
+      title: "Project Lead",
       href: "https://www2.cs.uky.edu/dri/stephen-parsons/",
+    },
+    {
+      name: "Giorgio Angelotti",
+      title: "Project & Tech Team Lead",
+      href: "https://thegiorgio.org/",
     },
     {
       name: "Youssef Nader",
@@ -630,8 +636,7 @@ export const team = {
   papyrology: [
     {
       name: "Federica Nicolardi",
-      title:
-        "Team Lead and Assistant Professor, University of Naples Federico II",
+      title: "Associate Professor, University of Naples Federico II",
       href: "https://www.docenti.unina.it/federica.nicolardi",
     },
     {
@@ -684,7 +689,7 @@ export const team = {
       name: "Gianluca Del Mastro",
       title:
         "Professor of Papyrology, l'Università della Campania «L. Vanvitelli»",
-      href: "https://www.facebook.com/GianlucaDelMastroSindaco",
+      href: "https://unina2.academia.edu/GianlucaDelMastro/",
     },
     {
       name: "Robert Fowler",
@@ -709,6 +714,11 @@ export const team = {
 
 export const partners = [
   {
+    name: "Biblioteca Nazionale di Napoli",
+    icon: "/img/landing/biblioteca.svg",
+    href: "https://www.bnnonline.it/",
+  },
+  {
     name: "EduceLab",
     icon: "/img/landing/educe.svg",
     href: "https://educelab.engr.uky.edu/",
@@ -718,11 +728,6 @@ export const partners = [
     icon: "/img/landing/institute.svg",
     href: "https://www.institutdefrance.fr/en/home/",
     tall: true,
-  },
-  {
-    name: "Biblioteca Nazionale di Napoli",
-    icon: "/img/landing/biblioteca.svg",
-    href: "https://www.bnnonline.it/",
   },
   {
     name: "Getty",
