@@ -602,7 +602,7 @@ export function Landing() {
                 <p className="vc-hero__intro">
                   Vesuvius Challenge is an open science research organization{" "}
                   <a href="/firstscroll">reading</a> the carbonized Herculaneum
-                  scrolls without opening them. <strong>Anyone can help</strong>:
+                  scrolls without unrolling them. <strong>Anyone can help</strong>:
                   we run a{" "}
                   <a href="/prizes">$2M competition</a>, with prizes every
                   month.
