@@ -191,6 +191,15 @@ h1, h2, h3, h4, h5, h6 {
   color: var(--vc-accent);
 }
 
+/* A touch more air between dropdown labels and their caret (Infima: 0.3em). */
+.dropdown > .navbar__link::after {
+  margin-left: 0.45em;
+}
+/* Same for the external-site icon (Donate); Docusaurus default 0.3rem. */
+.navbar__link > svg[class*="iconExternalLink"] {
+  margin-left: 0.45rem;
+}
+
 /* Dropdown (Community): surface + hairline, flat. */
 .dropdown__menu {
   background: var(--vc-surface);
@@ -436,6 +445,69 @@ h1, h2, h3, h4, h5, h6 {
 }
 .menu__caret:hover {
   background: var(--vc-raised);
+}
+/* Collapsible-category carets match the navbar dropdown caret: a solid
+   triangle pointing down when closed and up when open (Infima's chevron
+   points right when closed). */
+.menu__link--sublist-caret::after,
+.menu__caret::before {
+  background: none;
+  filter: none;
+  min-width: 0;
+  width: 0;
+  height: 0;
+  border-style: solid;
+  border-color: currentColor transparent;
+  border-width: 0.3rem 0.3rem 0;
+  transform: rotate(180deg);
+}
+/* Sits just after the label instead of at the far right edge. */
+.menu__link--sublist-caret::after {
+  margin-left: 0.6em;
+}
+.menu__list-item--collapsed .menu__link--sublist::after,
+.menu__list-item--collapsed .menu__caret::before {
+  transform: none;
+}
+
+/* Sidebars are per-section ("within Tutorials"), so the rail drops its panel
+   edge and reads as a light docs-style list. Non-collapsible top categories
+   are section titles, not links: no hover, no pointer. */
+.theme-doc-sidebar-container {
+  border-right: 0 !important; /* overrides custom.css's hairline */
+}
+@media (min-width: 997px) {
+  .theme-doc-sidebar-menu {
+    padding-top: 24px;
+  }
+}
+.menu__list-item-collapsible:has(> .menu__link:not(.menu__link--sublist)) {
+  pointer-events: none;
+}
+.menu__list-item-collapsible > .menu__link:not(.menu__link--sublist) {
+  color: var(--vc-text-faint);
+  border-left-color: transparent; /* even when it contains the active page */
+  padding-bottom: 8px;
+}
+.theme-doc-sidebar-item-category-level-1:not(:first-child) {
+  margin-top: 16px;
+}
+
+/* Standalone docs (in no sidebar): keep the normal 1080px docs measure
+   centred instead of Docusaurus's widened no-sidebar container, and centre
+   the article itself when there's no TOC beside it. Landing and Get Started
+   run their own full-width layouts. */
+@media (min-width: 997px) {
+  html.docs-doc-page:not(.docs-doc-id-landing):not(.docs-doc-id-get_started)
+    .main-wrapper:not(:has(.theme-doc-sidebar-container))
+    main > .container {
+    max-width: var(--ifm-container-width);
+  }
+  html.docs-doc-page:not(.docs-doc-id-landing):not(.docs-doc-id-get_started)
+    .main-wrapper:not(:has(.theme-doc-sidebar-container))
+    main > .container > .row > .col:only-child article {
+    margin-inline: auto;
+  }
 }
 
 /* ==========================================================================
