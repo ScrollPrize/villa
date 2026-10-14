@@ -19,7 +19,7 @@
   "max_iterations": 1000000,
   "batch_size": 10,
   "grad_accumulation_steps": 1,
-  "train_monitor_every_n": 1000,
+  "train_monitor_every_n": 500,
   "monitor_batch_size": 12,
   "monitor_pca_sets": 4,
   "save_every_n": 5000,

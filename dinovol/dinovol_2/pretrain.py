@@ -1877,6 +1877,7 @@ class DinoIBOTPretrainer:
                 "scaler": self.scaler.state_dict() if self.scaler.is_enabled() else None,
                 "dino_loss": self.dino_loss.state_dict(),
                 "ibot_patch_loss": self.ibot_patch_loss.state_dict(),
+                "object_loss": self.object_loss.state_dict() if self.do_object_losses else None,
                 "gram_teacher_backbone": (
                     self.gram_teacher_backbone.state_dict() if self.gram_teacher_backbone is not None else None
                 ),
@@ -2002,6 +2003,8 @@ class DinoIBOTPretrainer:
             self.dino_loss.load_state_dict(checkpoint["dino_loss"])
         if "ibot_patch_loss" in checkpoint:
             self.ibot_patch_loss.load_state_dict(checkpoint["ibot_patch_loss"])
+        if self.do_object_losses and checkpoint.get("object_loss") is not None:
+            self.object_loss.load_state_dict(checkpoint["object_loss"], strict=False)
         if self.gram_teacher_backbone is not None:
             if checkpoint.get("gram_teacher_backbone") is not None:
                 self.gram_teacher_backbone.load_state_dict(checkpoint["gram_teacher_backbone"])
@@ -2092,6 +2095,29 @@ class DinoIBOTPretrainer:
                     for i in range(components)]
         return [np.stack(channels[i:i + 3], axis=-1) for i in range(0, components, 3)]
 
+    def _ink_rgb(self, features: torch.Tensor) -> np.ndarray:
+        """Map [H, W, C] unit-norm ink embeddings to a 2-color [H, W, 3] RGB image
+        using the running positive/negative ink prototypes in self.object_loss."""
+        h, w, c = features.shape
+        flat = F.normalize(features.float().reshape(h * w, c), dim=-1)
+        pos_n = int(self.object_loss.ink_pos_count.item())
+        neg_n = int(self.object_loss.ink_neg_count.item())
+        if pos_n > 0 and neg_n > 0:
+            pos_proto = F.normalize(self.object_loss.ink_pos_queue[:pos_n].float().mean(dim=0), dim=0)
+            neg_proto = F.normalize(self.object_loss.ink_neg_queue[:neg_n].float().mean(dim=0), dim=0)
+            temp = max(float(self.object_loss.ink_temperature), 1e-3)
+            logits = (flat @ pos_proto - flat @ neg_proto) / temp
+            prob = torch.sigmoid(logits).reshape(h, w).detach().cpu().numpy()
+        else:
+            centered = flat - flat.mean(dim=0, keepdim=True)
+            _, _, V = torch.pca_lowrank(centered, q=1)
+            proj = (centered @ V[:, 0]).reshape(h, w).detach().cpu().numpy()
+            prob = np.clip(0.5 + 0.5 * proj, 0.0, 1.0)
+        c0 = np.array([28.0, 64.0, 150.0], dtype=np.float32)
+        c1 = np.array([250.0, 185.0, 25.0], dtype=np.float32)
+        rgb = c0[None, None, :] + prob[..., None] * (c1 - c0)[None, None, :]
+        return np.clip(np.round(rgb), 0, 255).astype(np.uint8)
+
     @staticmethod
     def _center_slice_points(n_views: int, spatial: tuple[int, int, int], device: torch.device) -> torch.Tensor:
         """[n_views, H * W, 3] voxel coordinates of every voxel on the center z slice."""
@@ -2156,8 +2182,8 @@ class DinoIBOTPretrainer:
                     panels.extend(self._pca_rgb(dense.reshape(*center_slice.shape, dense.shape[-1])))
                     if "ink" in student_outputs["object_points"]:
                         ink_feat = student_outputs["object_points"]["ink"][tensor_index]
-                        panels.extend(
-                            self._pca_rgb(ink_feat.reshape(*center_slice.shape, ink_feat.shape[-1]), sets=1)
+                        panels.append(
+                            self._ink_rgb(ink_feat.reshape(*center_slice.shape, ink_feat.shape[-1]))
                         )
             rows.append(np.concatenate(panels, axis=1))
 
@@ -2420,7 +2446,7 @@ class DinoIBOTPretrainer:
                     self.is_main_process
                     and self.train_monitor_every_n
                     and step > 0
-                    and step % self.train_monitor_every_n == 0
+                    and (step == start_step or step % self.train_monitor_every_n == 0)
                 ):
                     image_path = self.save_monitor_image(self._monitor_subset(batch), step, metrics)
                     if self._wandb_enabled():
