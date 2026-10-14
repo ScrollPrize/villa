@@ -129,6 +129,25 @@ mostly empty.
   read, so the accepted windows and their distribution are unchanged. Masked-out
   chunks are absent from the S3 stores, so these reads were otherwise wasted.
   The coarse masks are read once at startup and only cover the usable bounding box.
+- `dataset.object_mask` (`enabled`, `gap_um` 300, `z_trim_pct` 0.05): source
+  windows lie entirely inside the scanned object, replacing the central
+  `vol_trim_pct` box (which both reached past flattened scrolls and cut off
+  interior of wide ones). The published volumes are SAM2-masked with a dilated
+  margin of air, so at startup the `occupancy_level` cells (32× coarser; the
+  2.4 µm volumes mean-pool their 8× level, streamed in z slabs) are split into
+  tissue and air by an Otsu threshold, closed over `gap_um` so the space between
+  wraps counts as inside, hole-filled per z slice and in 3D, with components
+  under 1% of the largest dropped. A window may start in a cell only if a window
+  starting anywhere in that cell covers only object cells (conservative by up to
+  one cell), and only outside the bottom and top `z_trim_pct` of z slices.
+  Starts are uniform over those cells; volume weights follow their counts. Every
+  crop is cut from inside its window, so no crop reaches outside the object.
+  The occupancy pre-check is skipped (the windows are fully occupied); the
+  post-read `nonzero_threshold` check stays. Needs `pixel_size_um` per dataset.
+  Measured before the change by simulating the old sampler on these masks: on
+  average 9% of global crops were less than half inside the object (up to 23%
+  on PHerc0826). Startup reads ~6.5 GB in total, most of it the five 2.4 µm
+  volumes' 8× levels.
 - `dataset.read_ahead`: each loader process reads this many future source
   windows in background threads while it augments the current sample. Window
   locations are still drawn in the loader process, so sampling stays
@@ -238,7 +257,8 @@ scroll sample (32 in total):
   is needed.
 
 `sample_id`, `pixel_size_um`, and `scan_location` in each entry document the
-selection; the loader uses `volume_path` and `volume_scale`. Sampling retains the
+selection; the loader uses `volume_path`, `volume_scale`, and (with
+`object_mask`) `pixel_size_um`. Sampling retains the
 existing weighting by valid crop starts, rather than equal weight per scroll.
 Occupancy cells cover 2^`occupancy_level` selected-scale voxels on every volume:
 level-2 volumes read the same pyramid level and max-pool it.
