@@ -36,6 +36,11 @@ from vesuvius.ink_detection.inference.inference_runtime import (
     resolve_amp_dtype,
 )
 from vesuvius.ink_detection.models.model import make_model
+from vesuvius.ink_detection.preprocessing.staged_write import (
+    create_staged_output,
+    discard_staged_output,
+    publish_staged_output,
+)
 from vesuvius.ink_detection.volume_io import (
     ZARR_V3,
     open_volume,
@@ -821,17 +826,22 @@ def write_output_tiff(
     """Write one tiled, LZW, BigTIFF-compatible flat probability image."""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    tifffile.imwrite(
-        output_path,
-        iter_probability_tiles(prob_sum_store, weight_sum_store, tile_shape),
-        shape=tuple(int(value) for value in prob_sum_store.shape),
-        dtype=np.uint8,
-        compression="lzw",
-        tile=tuple(int(value) for value in tile_shape),
-        bigtiff=True,
-        metadata=None,
-        software="vesuvius.ink_detection.inference.infer",
-    )
+    staged_output = create_staged_output(output_path)
+    try:
+        tifffile.imwrite(
+            staged_output,
+            iter_probability_tiles(prob_sum_store, weight_sum_store, tile_shape),
+            shape=tuple(int(value) for value in prob_sum_store.shape),
+            dtype=np.uint8,
+            compression="lzw",
+            tile=tuple(int(value) for value in tile_shape),
+            bigtiff=True,
+            metadata=None,
+            software="vesuvius.ink_detection.inference.infer",
+        )
+        publish_staged_output(staged_output, output_path)
+    finally:
+        discard_staged_output(staged_output)
 
 
 def open_temp_zarr_array(
