@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn.init import trunc_normal_
 from torch.nn.utils.parametrizations import weight_norm
+from torch.utils.checkpoint import checkpoint
 
 from dinovol_2.model.dinov2_eva import Eva, EvaWithChunking
 from dinovol_2.ops.point_embeddings import sample_grid_points
@@ -435,14 +436,18 @@ class PointDenseHead(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.out_dim = int(out_dim)
         self.ink_dim = int(ink_dim)
-        resolved_fpn_dim = int(fpn_dim) if fpn_dim is not None else max(16, min(128, self.hidden_dim // 2))
+        resolved_fpn_dim = int(fpn_dim) if fpn_dim is not None else max(16, min(64, self.hidden_dim // 4))
         self.fpn_dim = resolved_fpn_dim
 
-        # Top-down 3D FPN over the coarser CNN skip grids (e.g. 16^3 -> 32^3 -> 64^3).
-        coarser_skips = self.skip_channels[1:] if len(self.skip_channels) > 1 else self.skip_channels
+        # Top-down 3D FPN over the 16^3 -> 32^3 CNN skip grids so 128^3 and 64^3 grids
+        # are only indexed by sample_grid_points and freed before iBOT backward.
+        fpn_skips = self.skip_channels[2:] if len(self.skip_channels) > 2 else self.skip_channels[1:]
+        if not fpn_skips:
+            fpn_skips = self.skip_channels
+        self._fpn_skip_start = max(0, len(self.skip_channels) - len(fpn_skips))
         self.fpn_in = nn.Conv3d(self.token_dim, self.fpn_dim, kernel_size=1)
         self.fpn_laterals = nn.ModuleList(
-            nn.Conv3d(ch, self.fpn_dim, kernel_size=1) for ch in reversed(coarser_skips)
+            nn.Conv3d(ch, self.fpn_dim, kernel_size=1) for ch in reversed(fpn_skips)
         )
         self.fpn_refines = nn.ModuleList(
             nn.Sequential(
@@ -450,7 +455,7 @@ class PointDenseHead(nn.Module):
                 nn.GELU(),
                 nn.Conv3d(self.fpn_dim, self.fpn_dim, kernel_size=1),
             )
-            for _ in coarser_skips
+            for _ in fpn_skips
         )
         self.fpn_norm = nn.LayerNorm(self.fpn_dim)
 
@@ -470,18 +475,55 @@ class PointDenseHead(nn.Module):
         self.obj_proj = nn.Linear(self.hidden_dim, self.out_dim)
         self.ink_proj = nn.Linear(self.hidden_dim, self.ink_dim)
 
-    def _refine_fpn_grid(self, token_grid: torch.Tensor, skips: list[torch.Tensor]) -> torch.Tensor:
-        """Run top-down 3D FPN from [B, D_t, H_t, W_t, C_t] token_grid and CNN skip grids."""
+    def _refine_and_sample_chunk(
+        self,
+        token_grid: torch.Tensor,
+        point_coordinates: torch.Tensor,
+        input_shape: Tuple[int, ...],
+        *coarser_skips: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run top-down 3D FPN on a view chunk and sample only the target point coordinates."""
         dtype = token_grid.dtype
         x = self.fpn_in(token_grid.permute(0, 4, 1, 2, 3).contiguous())
-        coarser = skips[1:] if len(skips) > 1 else skips
-        for skip, lateral, refine in zip(reversed(coarser), self.fpn_laterals, self.fpn_refines):
+        for skip, lateral, refine in zip(reversed(coarser_skips), self.fpn_laterals, self.fpn_refines):
             target_size = skip.shape[2:]
             if x.shape[2:] != target_size:
-                x = F.interpolate(x.float(), size=target_size, mode="trilinear", align_corners=False).to(dtype)
+                x = F.interpolate(x, size=target_size, mode="trilinear", align_corners=False)
             x = x + lateral(skip.to(dtype))
             x = x + refine(x)
-        return x.permute(0, 2, 3, 4, 1).contiguous()
+        fpn_grid = x.permute(0, 2, 3, 4, 1).contiguous()
+        return sample_grid_points(fpn_grid, point_coordinates, input_shape).to(dtype)
+
+    def _sample_fpn_points(
+        self,
+        token_grid: torch.Tensor,
+        skips: list[torch.Tensor],
+        point_coordinates: torch.Tensor,
+        input_shape: Tuple[int, ...],
+        chunk_size: int = 4,
+    ) -> torch.Tensor:
+        coarser = tuple(skips[self._fpn_skip_start:])
+        b = token_grid.shape[0]
+        use_ckpt = self.training and torch.is_grad_enabled()
+        out_chunks: list[torch.Tensor] = []
+        for start in range(0, b, chunk_size):
+            end = min(b, start + chunk_size)
+            tg_c = token_grid[start:end]
+            pc_c = point_coordinates[start:end]
+            sk_c = tuple(s[start:end] for s in coarser)
+            if use_ckpt:
+                pts_c = checkpoint(
+                    self._refine_and_sample_chunk,
+                    tg_c,
+                    pc_c,
+                    input_shape,
+                    *sk_c,
+                    use_reentrant=False,
+                )
+            else:
+                pts_c = self._refine_and_sample_chunk(tg_c, pc_c, input_shape, *sk_c)
+            out_chunks.append(pts_c)
+        return torch.cat(out_chunks, dim=0)
 
     def forward_points(
         self,
@@ -492,8 +534,7 @@ class PointDenseHead(nn.Module):
     ) -> dict[str, torch.Tensor]:
         dtype = token_grid.dtype
         tokens = sample_grid_points(token_grid, point_coordinates, input_shape)
-        fpn_grid = self._refine_fpn_grid(token_grid, skips)
-        fpn_pts = self.fpn_norm(sample_grid_points(fpn_grid, point_coordinates, input_shape).to(dtype))
+        fpn_pts = self.fpn_norm(self._sample_fpn_points(token_grid, skips, point_coordinates, input_shape))
         skip_parts = [
             norm(sample_grid_points(level.permute(0, 2, 3, 4, 1), point_coordinates, input_shape).to(dtype))
             for norm, level in zip(self.skip_norms, skips)
