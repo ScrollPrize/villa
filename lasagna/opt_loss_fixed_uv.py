@@ -167,6 +167,8 @@ class SlidingUVTargets(FixedUVTargets):
 
     def loss(self, *, res):
         loss = sum(self.components(res.xyz_lr))
+        if getattr(self, 'winding_barrier', None) is not None:
+            loss = loss+self.winding_barrier(res.xyz_lr)
         if getattr(self, 'geometry_guard', None) is not None:
             loss = loss+self.geometry_guard(res.xyz_lr)
         lm = loss.reshape(1, 1, 1, 1)
@@ -175,6 +177,8 @@ class SlidingUVTargets(FixedUVTargets):
     @torch.no_grad()
     def statistics(self, xyz):
         result = super().statistics(xyz)
+        if getattr(self, 'winding_barrier', None) is not None:
+            result['winding_barrier'] = self.winding_barrier.statistics(xyz)
         pos, normal = self.sample(xyz, self.current_uv())
         result['normal_rms_base'] = float((((pos-self.xyz)*normal).sum(-1).square()*self.arc_weights).sum().sqrt())
         result['degenerate_attachment_normals'] = int((normal.norm(dim=-1) < .5).sum())

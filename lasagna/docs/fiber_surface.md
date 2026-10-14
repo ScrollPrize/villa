@@ -287,3 +287,51 @@ Full-render presets use these values; existing images and their frozen configs
 are unchanged. The same central view is7351x3188 instead of14701x6376. CT scale,
 UV extent and JPG/LZW TIFF output formats remain unchanged. Old overlay-only
 refresh presets retain widths appropriate to their existing canvas.
+# Other-winding backup barriers (experimental)
+
+`winding_barrier` opts into weak signed-normal half-spaces. Each sampled real
+fiber point is evaluated at its initial phase and V on every other represented
+winding, using the destination winding's own width. Higher winding indices are
+outward; aligned normals point inward. Targets are actual XYZ (including raw V,
+not the offset V attraction target). No extra UV parameters; geometry gradients
+only. The squared clearance hinge is normalized across copies before support
+gating, and participates in the same overall attachment stage ramp.
+
+Trial settings:weight0.01,clearance5basevx,support_inner100,support_outer300.
+The UV-nearest real attachment on the target winding suppresses barriers within
+100baseUVvx, ramping to full weight at300. All correspondence/support remains
+frozen at initialization. This is a backup in unsupported areas, not a collision
+guarantee. Large penetrations can still produce large loss despite the low weight.
+Missing `winding_barrier` preserves the previous solver unchanged.
+
+Matched800step result:wrong-side21.4608%→8.5352%;HpositionalRMS8.28→8.44basevx;
+folds353→621(fullmesh),336→371(inspectioncrop). Keep experimental.
+Detailed metrics and limitations: `../planning/fiber_surface/task_log.md`.
+
+Commands (existing runner; configs request nonexclusive8GiB GPU0):
+
+```bash
+/home/hendrik/.venv_las/bin/python /home/hendrik/villa4/vesuvius/scripts/run_classic_fiber_evaluation.py crop-benchmark --config /home/hendrik/villa4/lasagna/configs/fiber_surface_barrier_control.json
+/home/hendrik/.venv_las/bin/python /home/hendrik/villa4/vesuvius/scripts/run_classic_fiber_evaluation.py crop-benchmark --config /home/hendrik/villa4/lasagna/configs/fiber_surface_barrier_weak.json
+```
+
+Existing outputs are protected from overwrite; choose a fresh output_root to
+repeat. Outputs:`lasagna/data/connected_hv_barrier_{control,weak}_v1`.
+Render configs:`render_connected_hv_barrier_{control,weak}.json` using the same
+runner. Render directories:`lasagna/data/render_connected_hv_barrier_{control,weak}_v1`.
+
+## Fold inspection maps
+
+Future renders also save `folded_quads.tif` (registered0/255pixel mask),
+`folded_quad_grid.tif` (onepixelperquad), `ct_folds.tif` (LZW) and `ct_folds.jpg`
+(quick CT/red overlay), plus `folds.json` with local and original grid cell IDs.
+Red means dot(twoquadtrianglenormals)<=0, exactly the existing reported diagnostic;
+not a proof/test of all bilinear folds or global intersections. Only valid quads
+are counted; CT display excludes unavailable pixels. Crop counts differ from full.
+
+Add maps to existing views without any CT re-read or GPU:
+
+```bash
+/home/hendrik/.venv_las/bin/python /home/hendrik/villa4/vesuvius/scripts/run_classic_fiber_evaluation.py crop-benchmark --config /home/hendrik/villa4/lasagna/configs/render_barrier_control_folds.json
+/home/hendrik/.venv_las/bin/python /home/hendrik/villa4/vesuvius/scripts/run_classic_fiber_evaluation.py crop-benchmark --config /home/hendrik/villa4/lasagna/configs/render_barrier_weak_folds.json
+```

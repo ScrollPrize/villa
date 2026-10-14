@@ -1,5 +1,15 @@
 # Fiber surface status
 
+## Other-winding backup barriers
+
+- [x] Plan and independent code review, no blocking findings.
+- [x] Weak signed half-space loss, own-winding support gate, frozen coordinates.
+- [x] Persistence/restore and37regression tests.
+- [x] Matched control/weak800step runs and logged comparison; fewer ordering
+  violations but more folds, remains opt-in.
+- [x] Half-resolution CT/fiber renders and registered folded-quad maps for both.
+- [x]38tests, independent review, docs and reproducible runner configs.
+
 ## Future half-resolution rendering
 
 - [x] Defaults/presets8baseUV per pixel,4px lines; existing outputs preserved.

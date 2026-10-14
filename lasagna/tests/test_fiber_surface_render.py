@@ -5,6 +5,7 @@ import numpy as np
 from vesuvius.tifxyz_label_transfer.core import Surface
 from fiber_surface_render import canvas, band_geometry, fiber_overlay, inspection_crop
 from fiber_surface_render import DEFAULT_PIXEL_SIZE, DEFAULT_LINE_WIDTH
+from fiber_surface_render import fold_pixels, write_fold_maps
 
 
 def test_half_resolution_defaults_preserve_registration():
@@ -75,3 +76,28 @@ def test_inspection_crop_preserves_attachment_graph():
     overlay,index=fiber_overlay(b,shape,factor,1)
     assert overlay[1,0,3]>0 and index[0]['family']=='V'
     np.testing.assert_array_equal(a['final_grid_uv'],[[1,1],[5,1]])
+
+
+def test_fold_map_registration_and_crop(tmp_path):
+    import json
+    import tifffile
+    from fiber_surface import geometry_stats
+    # Concave final quad with opposing triangle normals, one valid normal quad.
+    x=np.array([[0,100,200],[0,100,50]],dtype=np.float32)
+    y=np.array([[0,0,0],[100,100,50]],dtype=np.float32)
+    s=Surface(x=x,y=y,z=x*0+100,scale_yx=(.01,.01))
+    shape,factors=canvas(s,25)
+    pixels,folds,degenerate=fold_pixels(s,shape,factors)
+    assert folds.tolist()==[[False,True]]
+    assert not pixels[:,:4].any() and pixels[:,4:].all()
+    assert geometry_stats(np.stack([x,y,x*0],-1))['opposing_triangle_quads']==folds.sum()
+    cropped,_=inspection_crop(s,{},[1,3])
+    sh,fa=canvas(cropped,25)
+    info=write_fold_maps(tmp_path,cropped,sh,fa,np.full(sh,100,np.uint8),np.full(sh,255,np.uint8),1)
+    assert info['folded_quads']==1
+    assert json.loads((tmp_path/'folds.json').read_text())['source_quad_row_col']==[[0,1]]
+    assert (tifffile.imread(tmp_path/'folded_quads.tif')==255).all()
+    rgb=tifffile.imread(tmp_path/'ct_folds.tif')
+    assert rgb.shape==(*sh,3) and (rgb[...,0]>rgb[...,1]).all()
+    cropped.valid[0,0]=False
+    assert not fold_pixels(cropped,sh,fa)[0].any()

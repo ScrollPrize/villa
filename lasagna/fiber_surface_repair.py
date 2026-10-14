@@ -40,11 +40,15 @@ def restore_targets(data, attachments, shape, step, device, options=None):
                 raise ValueError('Restored component motion differs from saved final UV')
         else:
             t.delta.copy_(torch.as_tensor(attachments['final_grid_uv']-attachments['initial_grid_uv'], device=device))
+    from fiber_surface_barrier import attach_barrier
+    attach_barrier(t, data)
     return t
 
 
 def crop_winding_domain(initial, data, attachments, prior, bounds):
     """Restrict fitted U to a declared bucket band; never let outliers enlarge it."""
+    if 'barrier_grid_uv' in data:
+        raise ValueError('Legacy cropping cannot rebind saved winding barriers')
     if 'component' in attachments:
         raise ValueError('Connected H/V targets cannot use the legacy per-sample crop; preserve whole components')
     root=Path(prior['settings']['run_root'])

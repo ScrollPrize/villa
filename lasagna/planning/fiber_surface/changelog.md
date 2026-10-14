@@ -66,3 +66,11 @@ improve alignment while increasing folds;0.1 and1 rendered for comparison.
 
 Halved future image dimensions and fiber-line widths through defaults/presets
 (8baseUV/pixel,4px). Existing outputs unchanged; about quarter the pixel count.
+# Other-winding backup barriers and folded-quad inspection
+
+- Added opt-in frozen signed-normal barriers across winding phases, weighted .01
+  and suppressed near target-winding fiber support. Raw V points remain barriers.
+- Matched800step comparison:wrong-side21.4608%→8.5352%,Hposition8.28→8.44vx,
+  but full-surface folds353→621. Experimental, not promoted as default.
+- Half-resolution matched CT/fiber views plus red fold maps and indexed quad masks.
+  Cached map refresh avoids inference/CTfetch/GPU.38regression tests passed.

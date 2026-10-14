@@ -1,0 +1,8 @@
+{
+  "fiber_lasagna_surface": {
+    "render_surface": true,
+    "folds_only": true,
+    "device": "cpu",
+    "output_root": "/home/hendrik/villa4/lasagna/data/render_connected_hv_barrier_control_v1"
+  }
+}

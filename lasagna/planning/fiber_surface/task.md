@@ -1,6 +1,7 @@
 # Task
 
-Active: halve future render dimensions and fiber widths; preserve existing files.
+Active: weak other-winding backup barriers, suppressed near same-winding fibers.
+See winding_barrier_plan.md. Previous: halve render dimensions and fiber widths.
 See render_resolution_plan.md.
 
 Previous: add and trial tangential geometry fitting with100x UV smoothing;

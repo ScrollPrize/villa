@@ -89,9 +89,8 @@ def write_overlays(out, attachments, shape, factors, ct, mask, width):
     return index
 
 
-def refresh_overlays(settings):
+def cached_render(settings):
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_uv_layout import sha256_file
-    start = time.monotonic()
     out = Path(settings['output_root'])
     original = json.loads((out/'config.json').read_text())
     summary = json.loads((out/'summary.json').read_text())
@@ -100,14 +99,71 @@ def refresh_overlays(settings):
             raise ValueError(f'Render input changed: {path}')
     with np.load(original['attachments']) as f:
         attachments = {k: f[k] for k in f.files}
+    surface = load_surface(original['surface'])
     if original.get('column_range') is not None:
-        _, attachments = inspection_crop(load_surface(original['surface']), attachments, original['column_range'])
+        surface, attachments = inspection_crop(surface, attachments, original['column_range'])
     ct = (tifffile.imread(out/'ct.tif') if (out/'ct.tif').exists()
           else np.asarray(Image.open(out/'ct.jpg')))
     mask = tifffile.imread(out/'valid.tif')
     shape = tuple(summary['shape'])
     if ct.shape != shape or mask.shape != shape:
         raise ValueError('Cached CT/mask dimensions do not match render')
+    return out, original, summary, surface, attachments, ct, mask
+
+
+def fold_pixels(surface, shape, factors):
+    """Nearest containing quad, not interpolated vertex labels; CT registration."""
+    from fiber_surface import geometry_masks
+    degenerate, folded = geometry_masks(np.stack([surface.x, surface.y, surface.z], -1))
+    valid = (surface.valid[:-1,:-1] & surface.valid[1:,:-1] &
+             surface.valid[:-1,1:] & surface.valid[1:,1:])
+    folded &= valid
+    degenerate &= valid
+    rows = np.minimum(np.floor(np.arange(shape[0])/factors[0]).astype(int), folded.shape[0]-1)
+    cols = np.minimum(np.floor(np.arange(shape[1])/factors[1]).astype(int), folded.shape[1]-1)
+    return folded[rows[:,None],cols[None,:]], folded, degenerate
+
+
+def write_fold_maps(out, surface, shape, factors, ct, mask, column_offset=0):
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_uv_layout import sha256_file
+    pixels, folded, degenerate = fold_pixels(surface, shape, factors)
+    pixels &= mask != 0
+    tifffile.imwrite(out/'folded_quads.tif', pixels.astype(np.uint8)*255,
+                     compression='lzw', metadata=None)
+    tifffile.imwrite(out/'folded_quad_grid.tif', folded.astype(np.uint8)*255,
+                     compression='lzw', metadata=None)
+    combined = np.repeat(ct[...,None],3,axis=2)
+    # Preserve the CT texture beneath a conspicuous red tint.
+    combined[pixels] = np.rint(.35*combined[pixels]+.65*np.array([255,0,0])).astype(np.uint8)
+    tifffile.imwrite(out/'ct_folds.tif', combined, photometric='rgb', compression='lzw', metadata=None)
+    Image.fromarray(combined).save(out/'ct_folds.jpg', quality=95)
+    cells = np.argwhere(folded)
+    global_cells = cells+np.array([0,column_offset])
+    info = dict(folded_quads=int(folded.sum()), degenerate_quads=int(degenerate.sum()),
+                shape=list(shape), folded_pixels_percent=float(100*pixels.mean()),
+                local_quad_row_col=cells.tolist(), source_quad_row_col=global_cells.tolist(),
+                column_offset=int(column_offset), color='red = quad triangle normal dot <= 0',
+                definition='Existing geometry_masks: dot of the two quad triangle normals <= 0; not global intersections',
+                code_sha256=sha256_file(Path(__file__)))
+    (out/'folds.json').write_text(json.dumps(info,indent=2)+'\n')
+    return {k:v for k,v in info.items() if not k.endswith('row_col')}
+
+
+def refresh_fold_maps(settings):
+    start = time.monotonic()
+    out, original, summary, surface, _, ct, mask = cached_render(settings)
+    info = write_fold_maps(out, surface, tuple(summary['shape']),
+        np.array(summary['grid_to_pixel_xy'])[::-1], ct, mask,
+        (original.get('column_range') or [0])[0])
+    print(json.dumps(dict(**info, reused_ct=True, seconds=time.monotonic()-start)), flush=True)
+    return info
+
+
+def refresh_overlays(settings):
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_uv_layout import sha256_file
+    start = time.monotonic()
+    out, original, summary, surface, attachments, ct, mask = cached_render(settings)
+    shape = tuple(summary['shape'])
     width = int(settings['line_width'])
     if width < 1:
         raise ValueError('Line width must be positive')
@@ -121,6 +177,8 @@ def refresh_overlays(settings):
 
 
 def run(settings):
+    if settings.get('folds_only'):
+        return refresh_fold_maps(settings)
     if settings.get('overlay_only'):
         return refresh_overlays(settings)
     import vc.volume as vc
@@ -176,11 +234,13 @@ def run(settings):
     Image.fromarray(ct).save(out/'ct.jpg', quality=95)
     tifffile.imwrite(out/'valid.tif', mask, compression='lzw', metadata=None)
     index = write_overlays(out, attachments, shape, factors, ct, mask, settings.get('line_width', DEFAULT_LINE_WIDTH))
+    folds = write_fold_maps(out, surface, shape, factors, ct, mask,
+                           (settings.get('column_range') or [0])[0])
     summary = dict(shape=list(shape), pixel_size_uv_base=settings.get('pixel_size', DEFAULT_PIXEL_SIZE),
         grid_to_pixel_xy=factors[::-1].tolist(), origin='pixel (0,0) = surface vertex (0,0)',
         valid_percent=float(np.count_nonzero(mask)/mask.size*100),
         seconds=time.monotonic()-start, pieces=len(index), sources=len(np.unique(attachments['source'])),
-        sha256=hashes, bands=bands, remote_cache_path=str(volume.remote_cache_path),
+        sha256=hashes, bands=bands, remote_cache_path=str(volume.remote_cache_path), folds=folds,
         note='H/V attachment polylines at saved final UV; not nearest projection. V is offset supervision, not on-surface data. Surface folds remain. Zero-offset single CT slice, no slab projection.')
     (out/'fibers.json').write_text(json.dumps(index, indent=2)+'\n')
     (out/'summary.json').write_text(json.dumps(summary, indent=2)+'\n')

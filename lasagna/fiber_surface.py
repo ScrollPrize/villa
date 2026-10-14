@@ -332,11 +332,22 @@ def solve(curves, settings, provenance):
                                    step=step, piece=owners, **extra, **settings.get('sliding_settings', {}))
     else:
         targets = FixedUVTargets(guv, target, weights, initial.shape[:2], device=device)
+    barrier_meta = {}
+    if settings.get('winding_barrier') is not None:
+        if not connected:
+            raise ValueError('Winding barriers require connected H/V aligned-normal metadata')
+        from fiber_surface_barrier import prepare_barriers, attach_barrier
+        with np.load(Path(settings['run_root'])/'solution.npz') as solution:
+            widths = solution['widths']
+        barrier_meta = prepare_barriers(guv, connected_meta['raw_xyz'], connected_meta['normals'],
+            weights, widths, np.array([x[0], y[0]]), step, initial.shape[:2],
+            **settings['winding_barrier'])
+        attach_barrier(targets, barrier_meta)
     out.mkdir(parents=True)
     stages = settings.get('stages_config', default_stages())
     (out/'config.json').write_text(json.dumps(dict(settings=settings, stages=stages, provenance=provenance), indent=2)+'\n')
     np.savez(out/'targets.npz', grid_uv=guv, xyz=target, arc_weight=weights, piece=owners,
-             support_class=support, uv_origin=[x[0], y[0]], grid_step=step, **connected_meta)
+             support_class=support, uv_origin=[x[0], y[0]], grid_step=step, **connected_meta, **barrier_meta)
     def save(name, xyz):
         valid = np.isfinite(xyz).all(-1)
         write_tifxyz(out/(name+'.tifxyz'), Tifxyz(xyz[..., 0], xyz[..., 1], xyz[..., 2],

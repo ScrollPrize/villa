@@ -146,6 +146,8 @@ def run_local(settings):
              repo/'lasagna/opt_loss_smooth.py', repo/'lasagna/opt_loss_step.py', repo/'lasagna/opt_loss_bend.py']
     if settings.get('connected_hv'):
         files.append(repo/'lasagna/fiber_surface_connected.py')
+    if settings.get('winding_barrier') is not None:
+        files.append(repo/'lasagna/fiber_surface_barrier.py')
     provenance['code_sha256'] = {str(p.relative_to(repo)): uv.sha256_file(p) for p in files}
     return solve(curves, settings, provenance)
 
