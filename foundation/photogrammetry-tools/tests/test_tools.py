@@ -14,6 +14,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import find_blocks  # noqa: E402
 import mesh_qa  # noqa: E402
+import scrollcase_qa  # noqa: E402
 import scale_review  # noqa: E402
 import sfm_review  # noqa: E402
 
@@ -61,6 +62,15 @@ class MeshQATest(unittest.TestCase):
         self.assertEqual(T.shape, (len(F), 3, 2))
         r = mesh_qa.mesh_report(V2, F2)
         self.assertEqual((r["boundary_edges"], r["components"]), (3, 2))
+
+
+class ScrollcaseQATest(unittest.TestCase):
+    def test_winding_number_inside_and_outside(self):
+        import trimesh
+        box = trimesh.Trimesh(CUBE_V, CUBE_F)  # 2 x 3 x 5, outward normals
+        self.assertAlmostEqual(scrollcase_qa.winding_number(box, np.array([1.0, 1.5, 2.5])), 1.0, places=9)
+        self.assertAlmostEqual(scrollcase_qa.winding_number(box, np.array([3.0, 1.5, 2.5])), 0.0, places=9)
+        self.assertAlmostEqual(scrollcase_qa.winding_number(box, np.array([-10.0, 20.0, 2.5])), 0.0, places=9)
 
 
 class ScaleReviewTest(unittest.TestCase):
