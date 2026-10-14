@@ -790,7 +790,7 @@ h1, h2, h3, h4, h5, h6 {
    ========================================================================== */
 html:not(.docs-doc-id-landing):not(.docs-doc-id-data_browser)
   .markdown
-  a:not(.vc-card):not(.vc-cta):not(.vc-btn):not(.vc-btn-outline):not(.hash-link):not(.vc-stat):not(:has(img, video)) {
+  a:not(.vc-card):not(.vc-cta):not(.vc-btn):not(.vc-btn-outline):not(.hash-link):not(.vc-stat):not(.vc-submit a):not(:has(img, video)) {
   color: var(--vc-text);
   text-decoration: underline;
   text-decoration-color: var(--vc-accent-underline);
@@ -799,7 +799,7 @@ html:not(.docs-doc-id-landing):not(.docs-doc-id-data_browser)
 }
 html:not(.docs-doc-id-landing):not(.docs-doc-id-data_browser)
   .markdown
-  a:not(.vc-card):not(.vc-cta):not(.vc-btn):not(.vc-btn-outline):not(.hash-link):not(.vc-stat):not(:has(img, video)):hover {
+  a:not(.vc-card):not(.vc-cta):not(.vc-btn):not(.vc-btn-outline):not(.hash-link):not(.vc-stat):not(.vc-submit a):not(:has(img, video)):hover {
   color: var(--vc-accent);
   text-decoration-color: var(--vc-accent);
 }
@@ -887,6 +887,45 @@ details.alert {
 }
 details.alert > summary {
   font-weight: 600;
+}
+
+/* Prizes page: collapsibles read like the landing's team toggles — a bare
+   text label with a trailing ▾ (ember on hover, flips when open); the open
+   body sits in a hairline frame. */
+html.docs-doc-id-prizes details.alert {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  margin: 0 0 10px;
+}
+html.docs-doc-id-prizes details.alert > summary {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 0;
+  color: var(--vc-text);
+}
+html.docs-doc-id-prizes details.alert > summary:hover {
+  color: var(--vc-accent);
+}
+html.docs-doc-id-prizes details.alert > summary::before {
+  display: none;
+}
+html.docs-doc-id-prizes details.alert > summary::after {
+  content: "\25BE"; /* ▾ */
+  font-size: 0.875rem;
+  color: var(--vc-text-dim);
+  transition: transform 0.15s ease;
+}
+html.docs-doc-id-prizes details.alert[data-collapsed="false"] > summary::after,
+html.docs-doc-id-prizes details.alert[open]:not([data-collapsed]) > summary::after {
+  transform: rotate(180deg);
+}
+html.docs-doc-id-prizes details.alert [class*="collapsibleContent"] {
+  margin: 8px 0 12px;
+  padding: 16px 20px;
+  border: 1px solid var(--vc-line);
+  border-radius: var(--vc-r-card);
 }
 
 /* ==========================================================================
