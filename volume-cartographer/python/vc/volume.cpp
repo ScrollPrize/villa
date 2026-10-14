@@ -356,6 +356,14 @@ nb::object readZYXTyped(Volume& volume,
             const int cY1 = readY1 / chunkShape[1];
             const int cX1 = readX1 / chunkShape[2];
             const T fill = typedFill<T>(cache->fillValue());
+            // copyChunkIntersection fetches with a blocking call, one chunk at a time.
+            // Queue the whole region first, as Volume::readZYX does, so fetches overlap.
+            std::vector<vc::render::ChunkKey> keys;
+            for (int cz = cZ0; cz <= cZ1; ++cz)
+                for (int cy = cY0; cy <= cY1; ++cy)
+                    for (int cx = cX0; cx <= cX1; ++cx)
+                        keys.push_back({level, cz, cy, cx});
+            cache->prefetchChunks(keys, false);
             for (int cz = cZ0; cz <= cZ1; ++cz) {
                 for (int cy = cY0; cy <= cY1; ++cy) {
                     for (int cx = cX0; cx <= cX1; ++cx) {
