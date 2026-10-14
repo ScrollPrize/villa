@@ -709,34 +709,36 @@
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   column-gap: 48px;
-  border-bottom: 1px solid transparent;
-}
-.vc-landing .vc-team-tabs__row.has-open {
-  border-bottom-color: var(--vc-line);
 }
 .vc-landing .vc-team-tabs__tab {
+  position: relative;
   display: inline-flex;
   align-items: baseline;
   justify-self: start;
   gap: 8px;
-  margin-bottom: -1px;
   padding: 8px 0;
   border: 0;
-  border-bottom: 2px solid transparent;
   background: none;
   cursor: pointer;
   font-family: inherit;
   font-size: 1.125rem;
   font-weight: 600;
   color: var(--vc-text);
-  transition: color 0.15s, border-color 0.15s;
+  transition: color 0.15s;
 }
 .vc-landing .vc-team-tabs__tab:hover {
   color: var(--vc-accent);
 }
 .vc-landing .vc-team-tabs__tab.is-active {
   color: var(--vc-text);
-  border-bottom-color: var(--vc-accent);
+}
+/* While a list is open the other tabs step back, so the open one reads as
+   the owner of the panel below. */
+.vc-landing .vc-team-tabs__row.has-open .vc-team-tabs__tab:not(.is-active) {
+  color: var(--vc-text-faint);
+}
+.vc-landing .vc-team-tabs__row.has-open .vc-team-tabs__tab:not(.is-active):hover {
+  color: var(--vc-accent);
 }
 .vc-landing .vc-team-tabs__tab:focus-visible {
   outline: 2px solid var(--vc-accent);
@@ -749,12 +751,35 @@
 }
 .vc-landing .vc-team-tabs__tab.is-active .vc-team-tabs__arrow {
   transform: rotate(180deg);
-  color: var(--vc-accent);
 }
+/* The open list sits in a hairline frame (like the page's media frames),
+   inset from the tab grid so its columns don't read as belonging to the
+   tabs above them. */
 .vc-landing .vc-team-tabs__panel {
   columns: 3 220px;
   column-gap: 48px;
-  padding: 16px 0 8px;
+  margin-top: 16px;
+  padding: 16px 20px 12px;
+  border: 1px solid var(--vc-line);
+  border-radius: var(--vc-r-card);
+}
+/* Outlined notch pointing up from the frame at the open tab: a 12px square
+   turned 45deg, page-coloured to hide the frame's edge beneath it, with its
+   two upper sides in the frame's hairline. It hangs off the tab (the
+   multi-column panel would clip it), centred on the frame's top edge 16px
+   below the tab. */
+.vc-landing .vc-team-tabs__tab.is-active::after {
+  content: "";
+  position: absolute;
+  top: calc(100% + 16px - 6px + 0.5px);
+  left: 26px;
+  box-sizing: border-box;
+  width: 12px;
+  height: 12px;
+  border-top: 1px solid var(--vc-line);
+  border-left: 1px solid var(--vc-line);
+  background: var(--vc-bg);
+  transform: rotate(45deg);
 }
 .vc-landing .vc-team-tabs__panel .vc-person {
   break-inside: avoid;
@@ -886,6 +911,10 @@
   }
   .vc-landing .vc-team-tabs__row {
     grid-template-columns: minmax(0, 1fr);
+  }
+  /* Stacked tabs: the notch can't point at one, the dimming does the work. */
+  .vc-landing .vc-team-tabs__tab.is-active::after {
+    content: none;
   }
   .vc-landing .vc-stat {
     padding: 0 16px;

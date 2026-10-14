@@ -312,7 +312,7 @@ const SponsorList = ({ list }) => {
           aria-expanded={false}
           onClick={() => setExpanded(true)}
         >
-          Show more ({folded})
+          Show more
           <span className="vc-team-tabs__arrow" aria-hidden="true">
             ▾
           </span>
