@@ -174,6 +174,7 @@ public:
     std::optional<EdgeRecord> edgeByUuid(const Txn& txn, const std::string& uuid) const;
     void removeEdge(WriteTxn& txn, const std::string& uuid);
     std::vector<EdgeRecord> edgesOf(const Txn& txn, const std::string& objectUuid) const;
+    std::vector<EdgeRecord> edgesByKind(const Txn& txn, const std::string& edgeKind) const;
     // Neighbour object UUIDs, optionally filtered by edge kind and/or
     // neighbour object kind.
     std::vector<std::string> neighbours(const Txn& txn, const std::string& objectUuid,

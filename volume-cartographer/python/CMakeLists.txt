@@ -108,6 +108,17 @@ target_link_libraries(vc_fiber_trace PRIVATE vc_fiber_tracer)
 target_compile_features(vc_fiber_trace PRIVATE cxx_std_23)
 set_target_properties(vc_fiber_tracer PROPERTIES INSTALL_RPATH "$ORIGIN")
 
+nanobind_add_module(vc_graph_bindings
+    vc/graph.cpp
+)
+set_target_properties(vc_graph_bindings PROPERTIES
+    OUTPUT_NAME graph
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc"
+    INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
+)
+target_link_libraries(vc_graph_bindings PRIVATE vc_graph)
+target_compile_features(vc_graph_bindings PRIVATE cxx_std_23)
+
 install(TARGETS vc_lasagna_amgx
     LIBRARY DESTINATION .
     RUNTIME DESTINATION .
@@ -119,7 +130,7 @@ install(TARGETS vc_core vc_lasagna vc_fiber_tracer utils utils_c3d_codec c3d uti
     ARCHIVE DESTINATION .
 )
 
-install(TARGETS vc_volume vc_surface_index vc_grid_raycast vc_fiber_trace
+install(TARGETS vc_volume vc_surface_index vc_grid_raycast vc_fiber_trace vc_graph_bindings
     LIBRARY DESTINATION vc
     RUNTIME DESTINATION vc
 )

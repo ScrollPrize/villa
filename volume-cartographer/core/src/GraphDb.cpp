@@ -989,6 +989,16 @@ std::vector<EdgeRecord> GraphDb::edgesOf(const Txn& txn, const std::string& obje
     return out;
 }
 
+std::vector<EdgeRecord> GraphDb::edgesByKind(const Txn& txn, const std::string& edgeKind) const
+{
+    sqlite3* db = GraphDbImplAccess::conn(txn);
+    Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE kind=? ORDER BY id");
+    s.bind(1, edgeKind);
+    std::vector<EdgeRecord> out;
+    while (s.row()) out.push_back(readEdgeRow(db, s));
+    return out;
+}
+
 std::vector<std::string> GraphDb::neighbours(const Txn& txn, const std::string& objectUuid,
                                              const std::optional<std::string>& edgeKind,
                                              const std::optional<std::string>& neighbourKind) const
