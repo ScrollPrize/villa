@@ -98,8 +98,31 @@ def find_target_images(root: Path) -> list[Path]:
     return matches
 
 
-def _normalize_to_2d(image: np.ndarray, source_path: Path) -> np.ndarray:
-    image = np.squeeze(np.asarray(image))
+def _normalize_to_2d(
+    image: np.ndarray, source_path: Path, axes: str = ""
+) -> np.ndarray:
+    """Read a 2D image without collapsing a length-1 height or width axis.
+
+    ``axes`` carries the TIFF series axes codes when known (e.g. ``'YXS'``).
+    Only singleton axes those codes mark as non-spatial are squeezed, so a
+    single-row or single-column image keeps its spatial axis while a
+    redundant singleton frame or sample axis is folded away; an
+    unconditional ``np.squeeze`` used to reject degenerate images as
+    non-2D. cv2 results have no metadata and are YX (2D) or YXS
+    (``HxWx3``) by construction, so only a trailing sample axis may be
+    dropped for them. Multi-sample images keep the first-sample semantics.
+    """
+
+    image = np.asarray(image)
+    if axes and image.ndim == len(axes):
+        image = np.squeeze(
+            image,
+            axis=tuple(
+                index
+                for index, (size, axis) in enumerate(zip(image.shape, axes))
+                if size == 1 and axis not in "YX"
+            ),
+        )
     if image.ndim == 3:
         image = image[..., 0]
     if image.ndim != 2:
@@ -113,9 +136,10 @@ def _decoded_block_to_2d(decoded: np.ndarray, source_path: Path) -> np.ndarray:
     """Return a decoded tile or strip as 2D without losing a length-1 row axis.
 
     ``page.decode`` returns ``(depth, rows, columns, samples)`` for a strip
-    exactly as it does for a tile. ``_normalize_to_2d`` squeezes, which is
-    right for a whole image but drops the row axis of a one-row strip --
-    ``(1, 1, width, 1)`` becomes ``(width,)`` -- so index the axes explicitly.
+    exactly as it does for a tile. ``_normalize_to_2d`` handles a whole
+    image, but it never collapses a length-1 row axis, so a one-row strip
+    decoded as ``(1, 1, width, 1)`` would keep four axes -- index the axes
+    explicitly instead.
     One-row strips arise when ``rowsperstrip == 1``, or when
     ``height % rowsperstrip == 1`` leaves a single row in the final strip.
     Tiles cannot hit this: TIFF tile heights are multiples of 16.
@@ -127,27 +151,45 @@ def _decoded_block_to_2d(decoded: np.ndarray, source_path: Path) -> np.ndarray:
 
 
 def _normalized_2d_shape(
-    shape: Sequence[int], source_path: Path
+    shape: Sequence[int], axes: str, source_path: Path
 ) -> tuple[int, int]:
-    squeezed = tuple(dimension for dimension in shape if dimension != 1)
-    if len(squeezed) == 3:
-        squeezed = squeezed[:-1]
-    if len(squeezed) != 2:
+    """Get the YX shape without collapsing a length-1 height or width axis.
+
+    A page shape such as ``(1, 5, 3)`` with axes ``'YXS'`` is one row of
+    five RGB pixels: its height is real and must survive. Squeeze only the
+    singleton axes the axes codes mark non-spatial, then drop a trailing
+    sample axis, matching ``_normalize_to_2d``.
+    """
+
+    dimensions = tuple(int(dimension) for dimension in shape)
+    if len(dimensions) == len(axes) and len(axes) > 2:
+        dimensions = tuple(
+            dimension
+            for index, dimension in enumerate(dimensions)
+            if dimension != 1 or axes[index] in "YX"
+        )
+    if len(dimensions) == 3:
+        dimensions = dimensions[:2]
+    if len(dimensions) != 2:
         raise ValueError(
             f"Expected a 2D image at {source_path}, but got shape={tuple(shape)}"
         )
-    return int(squeezed[0]), int(squeezed[1])
+    return int(dimensions[0]), int(dimensions[1])
 
 
 def load_image(path: Path) -> np.ndarray:
     """Read a TIFF or PNG as one contiguous two-dimensional array."""
     if path.suffix.lower() in {".tif", ".tiff"}:
-        image = tifffile.imread(path)
+        with tifffile.TiffFile(path) as tif:
+            series = tif.series[0] if tif.series else None
+            axes = str(series.axes) if series is not None else ""
+            image = np.asarray(tif.asarray())
     else:
+        axes = ""
         image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
     if image is None:
         raise RuntimeError(f"Failed to read image data from {path}")
-    return _normalize_to_2d(image, path)
+    return _normalize_to_2d(image, path, axes=axes)
 
 
 def _embed_label_volume(
@@ -298,7 +340,10 @@ def _get_streamable_tiff_metadata(
             # Tiled input streamed before this change, unconditionally. Leave
             # that exactly as it was: every extra condition here is a tiled
             # file that regresses to the in-memory path it was exempt from.
-            return _normalized_2d_shape(page.shape, path), np.dtype(page.dtype)
+            return (
+                _normalized_2d_shape(page.shape, page.axes, path),
+                np.dtype(page.dtype),
+            )
 
         # Striped input is what this change adds. The two conditions below
         # apply only to it.
@@ -317,7 +362,10 @@ def _get_streamable_tiff_metadata(
             # path rather than decode blocks independently for a codec that
             # does not support it.
             return None
-        return _normalized_2d_shape(page.shape, path), np.dtype(page.dtype)
+        return (
+            _normalized_2d_shape(page.shape, page.axes, path),
+            np.dtype(page.dtype),
+        )
 
 
 # Codecs verified to support independent per-block decode via page.decode():
@@ -344,9 +392,19 @@ def _write_streamed_tiff_level_zero(input_path: Path, dataset: zarr.Array) -> No
                 f"{sorted(_STREAMABLE_COMPRESSIONS)}) for the streaming path: "
                 f"{input_path} has compression {page.compression}"
             )
-        image_height, image_width = _normalized_2d_shape(page.shape, input_path)
-        tile_height, tile_width = page.chunks
-        tiles_down, tiles_across = page.chunked
+        image_height, image_width = _normalized_2d_shape(
+            page.shape, page.axes, input_path
+        )
+        # page.chunks is (rows, cols[, samples]); drop a trailing sample axis
+        # so the Y/X tile geometry unpacks for multi-sample pages too.
+        chunked_shape = tuple(page.chunks)
+        if len(chunked_shape) > 2:
+            chunked_shape = chunked_shape[:2]
+        tile_height, tile_width = chunked_shape
+        grid = tuple(page.chunked)
+        if len(grid) > 2:
+            grid = grid[:2]
+        tiles_down, tiles_across = grid
 
         # Destination blocks, keyed by (block_y, block_x). Each entry holds the
         # partially-filled array and a count of source chunks still to come. A

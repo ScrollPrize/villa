@@ -174,6 +174,9 @@ of a 65-plane volume; XY levels use nearest-neighbor downsampling. A matching
 folder max/composite TIFF is also converted, using rounded mean downsampling.
 Existing outputs are skipped unless `--overwrite` is present. Per-file errors
 are reported and make the command exit nonzero.
+Single-row, single-column and single-pixel labels retain their spatial Y/X
+axes. TIFF singleton frame/sample axes are removed using the recorded axis
+metadata; multisample TIFF and PNG inputs retain first-channel selection.
 
 | Argument | Meaning |
 |---|---|

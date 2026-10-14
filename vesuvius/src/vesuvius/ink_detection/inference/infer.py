@@ -858,13 +858,34 @@ def open_temp_zarr_array(
 
 
 def load_grayscale_mask(path: Path, target_shape: tuple[int, int]) -> np.ndarray:
-    """Read a nonzero foreground TIFF with top-left crop/pad alignment."""
+    """Read a nonzero foreground TIFF with top-left crop/pad alignment.
 
-    image = np.squeeze(np.asarray(tifffile.imread(path)))
+    Singleton non-spatial axes (redundant frames or samples recorded in the
+    TIFF series axes, e.g. a legacy ``(1, 8, 9)`` QYX mask) are folded away,
+    but a length-1 height or width axis is never collapsed, so single-row and
+    single-column grayscale masks keep their 2D interpretation. TIFFs with
+    multiple trailing samples keep the existing first-channel semantics.
+    """
+
+    with tifffile.TiffFile(path) as tif:
+        series = tif.series[0] if tif.series else None
+        axes = str(series.axes) if series is not None else ""
+        image = np.asarray(tif.asarray())
+    if image.ndim == len(axes) and image.ndim >= 3:
+        image = np.squeeze(
+            image,
+            axis=tuple(
+                index
+                for index, (size, axis) in enumerate(zip(image.shape, axes))
+                if size == 1 and axis not in "YX"
+            ),
+        )
     if image.ndim == 3:
         image = image[..., 0]
     if image.ndim != 2:
-        raise ValueError(f"Mask must be 2D, got {image.shape!r} from {path}")
+        raise ValueError(
+            f"Mask must be 2D, got {image.shape!r} from {path}"
+        )
     output = np.zeros(target_shape, dtype=bool)
     height = min(target_shape[0], image.shape[0])
     width = min(target_shape[1], image.shape[1])
