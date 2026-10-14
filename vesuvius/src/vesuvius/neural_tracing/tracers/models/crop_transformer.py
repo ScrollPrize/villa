@@ -223,7 +223,7 @@ class CropTransformer(nn.Module):
         self.cfg, self.model_type = cfg, cfg.model_type
         h, cells = cfg.hidden, cfg.cnn_channels[-1]
         cnn = lambda channels: CropCNN(channels, cfg.cnn_stage_strides, cfg.cnn_blocks, stem=cfg.cnn_stem,
-                                       activation=cfg.cnn_activation)
+                                       activation=cfg.cnn_activation, in_channels=cfg.input_channels)
         self.cnn = cnn(cfg.cnn_channels)  # the whole crop, or a multiscale CNN's fine box
         self.levels = feature_levels(cfg)
         level_channels = (cells,)

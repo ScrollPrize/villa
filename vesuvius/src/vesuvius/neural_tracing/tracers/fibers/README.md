@@ -185,6 +185,62 @@ batched on the GPU. On Paris4 AFV it brought labels from a median 1.46 to 0.68 t
   --presence /path/PHercParis4-..._presence.ome.zarr/3 --native-per-voxel 8   # level 3 = 8 native voxels per voxel
 ```
 
+## Sheet strips: the sheet a fiber lies on
+
+`sheet_strip/` fine-tunes a regression follower (by default the slim 1.26M `polar_tokens_a3_ms_slim_dagger_b32x2_50k`
+checkpoint) to predict the papyrus sheet a fiber lies on, +-60 voxels (9.6 um) across it, over the whole crop depth.
+The model is shown the fiber as a thin Gaussian tube (sigma one sample) in a second input channel and still predicts
+its continuation:
+
+- **Model** (`sheet_strip/model.py`): the crop CNNs take the tube channel (zero weights at initialization, so the
+  model starts as the checkpoint), the crop widens to 128 samples (the path keeps the checkpoint's lateral bound,
+  `path_lateral_limit`) and a set of strip tokens (path tokens of the crop transformer, one per crop slab and strip
+  column, 450 by default) reads out the sheet's height `u` along the frame's sheet normal on a 36 x 25 grid of
+  `(f, v)` (4 x 5 voxels), with one refinement pass that samples the CNN at the predicted sheet.
+- **Targets** (`sheet_strip/targets.py`): the height field of the verified tifxyz patches the fiber lies on, from
+  their triangles within reach of the crop. Points no patch covers, folds, patches disagreeing by more than 2 units
+  (4 voxels), surfaces steeper than 70 degrees against the crop's `(v, f)` plane and heights outside the crop carry
+  no loss.
+- **Data** (`sheet_strip/data.py`): the follower's own fresh decisions (simulated traces, frame model, augmentation)
+  with their heads on the spans where an AFV fiber lies on a patch. Half the decisions are shown the whole fiber
+  (over its matched spans +-8 voxels; its path is then not supervised), half only their simulated trace up to the
+  head.
+
+```bash
+# 1. Fibers on patches (sheets/scripts/match_fibers_to_patches.py), per family, AFV voxels = 4 patch voxels
+python ../sheets/scripts/match_fibers_to_patches.py --afv FIBERS.afv --grid-scale 4 --family H --min-run 40 \
+  --patches-dir /mnt/raid_nvme/spiral_dataset_working/verified_patches \
+  --umbilicus /mnt/raid_nvme/spiral_dataset_working/umbilicus.json --out H_runs.jsonl
+# 2. The run index; runs inside the z band 11250-12125 (patch voxels: the fiber runs' val_z) validate
+python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.build_index --afv FIBERS.afv \
+  --runs H_runs.jsonl V_runs.jsonl --patches-dir /mnt/raid_nvme/spiral_dataset_working/verified_patches --out INDEX
+# 3. Train (detached; log in output/logs/NAME.log)
+TRAINER=sheet_strip/train.py bash scripts/launch_train.sh configs/sheet_strip/paris4_slim50k.json
+```
+
+The run folder holds `log.jsonl`, `curves.png` (strip error against the frame model's plane, per tube mode, losses,
+path error), `figures/` (every `figure_every` updates, validation and training decisions: CT slices along the fiber
+and across it with the patch sheet, the prediction and the tube, and the error map), `best.pt` (lowest validation
+strip error) and `last.pt`; `sheet_strip.train.load_strip_model` loads one. The Paris4 slim-50k AFV gave 617k training
+runs on 155k fibers and 60k validation runs on 17.8k fibers (`output/sheet_strip_data/`).
+
+`sheet_strip/infer.py` walks one AFV fiber and writes the predicted strip as a tifxyz (patch voxels; rows every 4
+voxels along the fiber, 25 columns 5 voxels apart across it). It makes a decision every `--step` trace voxels,
+built as in training without augmentation. The fiber up to the head is the observed trace, and the tube shows the
+whole fiber. Overlapping decisions are averaged per node, weighted towards each decision's head, after each
+decision's in-sheet axis is turned to agree with the previous one's. When the fiber is in the run's index, the
+patch sheet is scored and stitched the same way (`patch_sheet/`). `render.png` shows the CT sampled on the
+predicted strip in bands along the fiber. Under each band, a bar shows the error against the patch sheet where
+there is one. `--render-only` redraws it for an existing output folder.
+
+```bash
+python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer \
+  --checkpoint output/sheet_strip_paris4_slim50k_v1/best.pt --fiber 469373 --out output/sheet_strip_infer/fiber_469373
+```
+
+On validation fiber 469373 (6100 voxels, 758 decisions, 2.5 minutes), the update-16000 checkpoint gave 1.22 voxels
+mean error against 6.89 for the frame plane, with 82% of points within 2 voxels.
+
 ## Organization
 
 The fiber tracer lives in `tracers/fibers/`; the parts other tracers can reuse sit beside it in `tracers/`
@@ -202,6 +258,7 @@ The fiber tracer lives in `tracers/fibers/`; the parts other tracers can reuse s
 | `train` | Entry point and run configuration, the training update (`step.py`), objectives, logging, live continuation, DAgger collection (`dagger/`) |
 | `evaluation` | Trace scoring (`scoring.py`), the offline calibrate/run/compare protocol (`protocol.py`), training-time monitoring (`monitor/`) |
 | `heading_model` | Heading/normal trainer and the frame predictor network used by `frames/learned.py` |
+| `sheet_strip` | The sheet-strip follower: model, patch targets, data, trainer and figures |
 | `legacy` | Inference for pre-cleanup checkpoints |
 | `scripts` | Launch/stop, label snapping, checkpoint conversion, the pre-launch sampler check |
 | `configs` | Run (`runs/`), dataset (`datasets/`) and heading-model (`heading/`) configurations |
