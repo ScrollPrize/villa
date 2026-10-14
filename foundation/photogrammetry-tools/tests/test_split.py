@@ -112,7 +112,12 @@ class MergeTest(unittest.TestCase):
             camsB.append((K, Rc @ R, to_b(C[None])[0]))  # same physical camera, expressed in B's frame
         with tempfile.TemporaryDirectory() as d:
             sa, sb = 2.0, 4.0                # marker scale factors of each scene
-            json.dump(self.scene(camsA, X, ["a0.jpg", "a1.jpg"], sa), open(os.path.join(d, "a.json"), "w"))
+            sceneA = self.scene(camsA, X, ["a0.jpg", "a1.jpg"], sa)
+            # A also lists, unposed, a photograph that B poses (as a capture folder's export does): left out
+            sceneA["views"].append({"key": 2, "value": {"polymorphic_id": 1073741824, "ptr_wrapper": {
+                "id": 2147483651, "data": {"local_path": "", "filename": "b0.jpg", "width": 4000, "height": 3000,
+                                           "id_view": 2, "id_intrinsic": 0, "id_pose": 99}}}})
+            json.dump(sceneA, open(os.path.join(d, "a.json"), "w"))
             json.dump(self.scene(camsB, XB, ["b0.jpg", "b1.jpg"], sb), open(os.path.join(d, "b.json"), "w"))
             T = np.eye(4)
             T[:3, :3], T[:3, 3] = R, t
