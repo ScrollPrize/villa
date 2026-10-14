@@ -183,7 +183,7 @@ const StoryCredit = () => (
   </p>
 );
 
-/* Timeline strip: dates on one rule, one shared text + media panel.
+/* Timeline strip: dates ticked off the header rule, one shared text + media panel.
    Opens on 79 AD so the eruption is the first thing shown. */
 const StoryStrip = () => {
   const [active, setActive] = useState(0);
@@ -412,24 +412,27 @@ const ProblemCard = ({
       hint
     />
     <div className="vc-problem__text">
-      <h3 className="vc-problem__title">
-        <a href={titleHref}>{title}</a>
-      </h3>
-      <p className="vc-problem__body">
-        <a href={titleHref}>{children}</a>
-      </p>
+      <a href={titleHref} className="vc-problem__head">
+        <h3 className="vc-problem__title">{title}</h3>
+        <p className="vc-problem__body">{children}</p>
+      </a>
       <div className="vc-problem__foot">
         <div className="vc-problem__prizes">
           {prizes.map((p) => (
-            <a href={p.href} className="vc-problem__prize" key={p.id}>
-              <strong className="vc-nums">{usd.format(p.amount)}</strong>{" "}
-              {p.title}
-            </a>
+            <p className="vc-problem__line" key={p.id}>
+              <a href={p.href} className="vc-problem__prize">
+                Win the{" "}
+                <strong className="vc-nums">{usd.format(p.amount)}</strong>{" "}
+                {p.title}
+              </a>
+            </p>
           ))}
         </div>
-        <a href={href} className="vc-cta">
-          {linkText}
-        </a>
+        <p className="vc-problem__line">
+          <a href={href} className="vc-problem__link">
+            {linkText}
+          </a>
+        </p>
       </div>
     </div>
   </div>
@@ -691,7 +694,7 @@ export function Landing() {
                 prizes={[
                   grandPrize2027 && { ...grandPrize2027, title: "Grand Prize" },
                 ].filter(Boolean)}
-                linkText="Current Path"
+                linkText="Learn about the current path"
                 href="/tutorial_spiral"
               >
                 We can trace a scroll's surface, but where sheets are crushed
@@ -707,7 +710,7 @@ export function Landing() {
                 prizes={[
                   firstLetters && { ...firstLetters, title: "First Letters Prizes" },
                 ].filter(Boolean)}
-                linkText="Find a Letter"
+                linkText="Learn how to find a letter"
                 href="/tutorial5"
               >
                 We can see ink in some scrolls, but models trained on one
