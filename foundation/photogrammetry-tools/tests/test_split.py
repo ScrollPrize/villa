@@ -168,6 +168,48 @@ class MarkerScaleTest(unittest.TestCase):
         np.testing.assert_allclose(x, X, atol=1e-6)
         self.assertLess(rms, 1e-6)
 
+    def test_distortion_refit_recovers_scale_despite_a_wrong_scene_model(self):
+        # 12 markers of side 31.5 on a ring of radius 100 mm, seen by 24 cameras through k1 -0.12, k2 +0.06; the
+        # scene's own model is far off at the image edges, as SfM leaves it on small objects
+        true_k, wild_k = [-0.12, 0.06, 0.0], [0.3, -20.0, 300.0]
+        corners = {}
+        for m in range(12):
+            a = 2 * np.pi * m / 12
+            c, r, t = 100 * np.array([np.cos(a), np.sin(a), 0]), np.array([np.cos(a), np.sin(a), 0]), np.array([-np.sin(a), np.cos(a), 0])
+            for k, (su, sv) in enumerate(((-1, -1), (1, -1), (1, 1), (-1, 1))):
+                corners[m, k] = c + 15.75 * (su * r + sv * t)
+        cams, obs = {}, {}
+        for v, a in enumerate(np.linspace(0, 2 * np.pi, 24, endpoint=False)):
+            K, R, C = camera(np.array([320 * np.cos(a), 320 * np.sin(a), 160.0]), [0, 0, 0], f=2600.0, k=true_k)
+            fn = f"v{v}.jpg"
+            for key, X in corners.items():
+                px, z = marker_scale.project(X, (K, R, C))
+                if z > 0 and 0 <= px[0] < 4000 and 0 <= px[1] < 3000:
+                    obs.setdefault(key, []).append((fn, px))
+            cams[fn] = (dict(K, disto_k3=wild_k), R, C)
+        wrong = marker_scale.measure(obs, cams, 1.5, 31.5)
+        # the scene's model: only the sightings near the image centre agree, and the scale is off
+        self.assertLessEqual(wrong["inliers_median"], 0.6 * wrong["sightings_median"])
+        self.assertGreater(abs(wrong.get("scale", 0) - 1.0), 2e-3)
+        k = marker_scale.fit_distortion(obs, cams)
+        np.testing.assert_allclose(k, true_k[:2], atol=2e-3)
+        fixed = {fn: (dict(K, disto_k3=[k[0], k[1], 0.0]), R, C) for fn, (K, R, C) in cams.items()}
+        res = marker_scale.measure(obs, fixed, 1.5, 31.5)
+        self.assertEqual(res["markers"], 12)
+        self.assertEqual(res["inliers_median"], res["sightings_median"])
+        self.assertAlmostEqual(res["scale"], 1.0, delta=1e-3)
+        self.assertAlmostEqual(res["ring"], 100.0, delta=0.1)
+
+    def test_choose_takes_the_median_of_blocks_with_a_consistent_ring(self):
+        blocks = [{"list": "low", "markers": 12, "scale": 1.000, "ring": 100.1},
+                  {"list": "mid", "markers": 12, "scale": 1.004, "ring": 100.3},
+                  {"list": "high", "markers": 12, "scale": 1.060, "ring": 104.0},   # outlying ring: dropped
+                  {"list": "few", "markers": 4, "scale": 0.900, "ring": 100.2}]     # too few markers
+        pick = marker_scale.choose(blocks)
+        self.assertEqual(pick["kept"], ["low", "mid"])
+        self.assertAlmostEqual(pick["factor"], 1.002)
+        self.assertIsNone(marker_scale.choose(blocks[3:]))
+
     def test_undistort_inverts_distort(self):
         xn = np.array([[0.1, -0.2], [0.3, 0.25]])
         k = [-0.08, 0.02, 0.001]
