@@ -411,3 +411,38 @@ def test_swap_eigenvectors_flag(tmp_path):
     # eigenvalues channels 0 and 1 swapped
     assert np.allclose(w_sw[0], w_no[1]) and np.allclose(w_sw[1], w_no[0])
     assert np.allclose(w_sw[2], w_no[2])'''
+
+
+@pytest.mark.parametrize("make_exc", [
+    # torch>=2.11 wording: neither "torch._inductor.exc" nor "cl is not found" in str(exc)
+    lambda: __import__("torch._inductor.exc", fromlist=["InvalidCxxCompiler"]).InvalidCxxCompiler(),
+    lambda: RuntimeError("InvalidCxxCompiler: No working C++ compiler found in torch._inductor.config.cpp.cxx: (None, 'g++')"),
+    lambda: RuntimeError("Compiler: cl is not found."),
+])
+def test_compute_eigenvectors_falls_back_to_eager_on_compile_failure(monkeypatch, make_exc):
+    import vesuvius.structure_tensor.create_st as create_st
+
+    def broken_compiled(block):
+        raise make_exc()
+
+    monkeypatch.setattr(create_st, "_compute_eigenvectors_fn", broken_compiled)
+    block = torch.zeros((6, 2, 2, 2), dtype=torch.float32)
+    block[0].fill_(3.0)
+    block[3].fill_(2.0)
+    block[5].fill_(1.0)
+
+    with pytest.warns(RuntimeWarning, match="Falling back to eager"):
+        eigvals, _ = create_st._compute_eigenvectors(block)
+    assert torch.allclose(eigvals[:, 0, 0, 0], torch.tensor([1.0, 2.0, 3.0]))
+    assert create_st._compute_eigenvectors_fn is create_st._compute_eigenvectors_impl
+
+
+def test_compute_eigenvectors_reraises_unrelated_errors(monkeypatch):
+    import vesuvius.structure_tensor.create_st as create_st
+
+    def broken_compiled(block):
+        raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setattr(create_st, "_compute_eigenvectors_fn", broken_compiled)
+    with pytest.raises(RuntimeError, match="out of memory"):
+        create_st._compute_eigenvectors(torch.zeros((6, 1, 1, 1)))
