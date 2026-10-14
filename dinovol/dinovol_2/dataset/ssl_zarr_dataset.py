@@ -913,13 +913,19 @@ class SSLZarrDataset(Dataset):
             presence = self._read_coarse_region(
                 self._get_array(presence_path, volume.fiber_level), absolute_lo, absolute_hi, volume.fiber_factor
             )
-            nx = self._read_coarse_region(
-                self._get_array(nx_path, volume.fiber_level), absolute_lo, absolute_hi, volume.fiber_factor
-            )
-            ny = self._read_coarse_region(
-                self._get_array(ny_path, volume.fiber_level), absolute_lo, absolute_hi, volume.fiber_factor
-            )
-            direction = decode_fiber_directions(nx, ny)
+            if int((presence > self.fiber_presence_threshold).sum()) < self.fiber_min_voxels:
+                presence = None
+            else:
+                nx_arr = self._get_array(nx_path, volume.fiber_level)
+                ny_arr = self._get_array(ny_path, volume.fiber_level)
+                if self._read_executor is None:
+                    self._read_executor = ThreadPoolExecutor(max_workers=max(2, self.read_ahead), thread_name_prefix="source-read")
+                fut_nx = self._read_executor.submit(
+                    self._read_coarse_region, nx_arr, absolute_lo, absolute_hi, volume.fiber_factor
+                )
+                ny = self._read_coarse_region(ny_arr, absolute_lo, absolute_hi, volume.fiber_factor)
+                nx = fut_nx.result()
+                direction = decode_fiber_directions(nx, ny)
 
         if surface is not None or presence is not None:
             labels = slab_objects(
@@ -1294,12 +1300,11 @@ class SSLZarrDataset(Dataset):
         bbox_hi = np.asarray(vol.usable_bbox[3:], dtype=np.float32)
         for _ in range(8):
             seg = candidates[int(np.random.randint(len(candidates)))]
-            mask = (seg.ink_state == 1) if (prefer_ink and seg.has_ink) else seg.valid
-            u, v = np.nonzero(mask)
-            if u.size == 0:
+            seg.ensure_spatial_index()
+            pts = seg.anchor_ink_zyx if (prefer_ink and seg.has_ink and seg.anchor_ink_zyx.shape[0] > 0) else seg.anchor_valid_zyx
+            if pts is None or pts.shape[0] == 0:
                 continue
-            pick = int(np.random.randint(u.size))
-            pt = seg.zyx[u[pick], v[pick]]
+            pt = pts[int(np.random.randint(pts.shape[0]))]
             if not np.all((pt >= bbox_lo) & (pt < bbox_hi)):
                 continue
             try:

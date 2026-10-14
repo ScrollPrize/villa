@@ -19,8 +19,10 @@ from dinovol_2.pretrain import DinoIBOTPretrainer
 
 
 def bench_gpu(config_path: str, batch_sizes: list[int]) -> None:
+    torch._dynamo.config.recompile_limit = 32
     base_cfg = json.load(open(config_path))
     base_cfg["compile"]["enabled"] = True
+    base_cfg["compile"]["mode"] = "default"
     base_cfg["dataset"]["object_mask"]["enabled"] = False
     base_cfg["dataset"]["occupancy_level"] = None
     base_cfg["dataset"]["object_points"]["use_metadata_meshes"] = False
@@ -28,6 +30,8 @@ def bench_gpu(config_path: str, batch_sizes: list[int]) -> None:
     base_cfg["dataset"]["datasets"] = base_cfg["dataset"]["datasets"][:1]
     base_cfg["num_workers"] = 0
     base_cfg["grad_accumulation_steps"] = 1
+    n_global = int(base_cfg["dataset"].get("num_global_crops", 2))
+    n_local = int(base_cfg["dataset"].get("num_local_crops", 2))
 
     for bs in batch_sizes:
         gc.collect()
@@ -39,14 +43,14 @@ def bench_gpu(config_path: str, batch_sizes: list[int]) -> None:
             trainer = DinoIBOTPretrainer(cfg)
             B = bs
             batch = {
-                "collated_global_crops": torch.randn(B * 2, 1, 128, 128, 128),
-                "collated_local_crops": torch.randn(B * 8, 1, 64, 64, 64),
-                "collated_masks": torch.zeros(B * 2, 4096, dtype=torch.bool),
-                "mask_indices_list": torch.arange(B * 2 * 1024, dtype=torch.long),
-                "masks_weight": torch.ones(B * 2 * 1024, dtype=torch.float32) / 1024.0,
-                "n_global_views": 2,
-                "n_local_views": 8,
-                "n_masked_patches": torch.tensor([B * 2 * 1024], dtype=torch.long),
+                "collated_global_crops": torch.randn(B * n_global, 1, 128, 128, 128),
+                "collated_local_crops": torch.randn(B * n_local, 1, 64, 64, 64),
+                "collated_masks": torch.zeros(B * n_global, 4096, dtype=torch.bool),
+                "mask_indices_list": torch.arange(B * n_global * 1024, dtype=torch.long),
+                "masks_weight": torch.ones(B * n_global * 1024, dtype=torch.float32) / 1024.0,
+                "n_global_views": n_global,
+                "n_local_views": n_local,
+                "n_masked_patches": torch.tensor([B * n_global * 1024], dtype=torch.long),
                 "global_token_targets": torch.rand(B * 2, 4096, 3) * 127.0,
                 "object_point_coordinates": torch.rand(B * 2, 384, 3) * 127.0,
                 "object_point_valid": torch.ones(B * 2, 384, dtype=torch.bool),
@@ -83,12 +87,24 @@ def bench_gpu(config_path: str, batch_sizes: list[int]) -> None:
 
 
 def bench_dataset_breakdown(config_path: str) -> None:
+    from dinovol_2.dataset.object_labels import crop_mesh_objects
+
     cfg = json.load(open(config_path))
     ds_cfg = cfg["dataset"]
     ds_cfg["object_mask"]["enabled"] = False
     ds_cfg["occupancy_level"] = None
     ds = SSLZarrDataset(ds_cfg)
-    for i in range(10):
+    for vol in ds.volumes:
+        if vol.meshes:
+            name = Path(vol.path).parent.parent.name
+            starts = ds._sample_mesh_centered_start(vol) or ds._sample_source_start(vol.usable_bbox)
+            lo = np.asarray(starts, dtype=np.float32) + 20.0
+            hi = lo + 128.0
+            t0 = time.perf_counter()
+            sheets, negs = crop_mesh_objects(vol.meshes, lo, hi)
+            dt = (time.perf_counter() - t0) * 1000.0
+            print(f"mesh crop {name} ({len(vol.meshes)} meshes): {dt:.2f}ms -> {len(sheets)} sheets", flush=True)
+    for i in range(6):
         t0 = time.perf_counter()
         plan, source_crop = ds._next_source_crop(0.30)
         t1 = time.perf_counter()

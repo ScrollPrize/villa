@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import io
 import json
+import math
 from pathlib import Path
 import re
 from typing import Any, Mapping
@@ -403,6 +404,44 @@ class MeshSegment:
     bbox_lo: np.ndarray    # [3] float32 (z_min, y_min, x_min)
     bbox_hi: np.ndarray    # [3] float32 (z_max, y_max, x_max)
     has_ink: bool
+    tile_size: int = 64
+    tile_lo: np.ndarray | None = None
+    tile_hi: np.ndarray | None = None
+    tile_valid: np.ndarray | None = None
+    anchor_valid_zyx: np.ndarray | None = None
+    anchor_ink_zyx: np.ndarray | None = None
+
+    def ensure_spatial_index(self) -> None:
+        if self.tile_lo is not None:
+            return
+        h, w = self.valid.shape
+        ts = max(1, int(self.tile_size))
+        u_cuts = np.arange(0, h, ts)
+        v_cuts = np.arange(0, w, ts)
+        with np.errstate(invalid="ignore"):
+            t_lo = np.fmin.reduceat(np.fmin.reduceat(self.zyx, u_cuts, axis=0), v_cuts, axis=1)
+            t_hi = np.fmax.reduceat(np.fmax.reduceat(self.zyx, u_cuts, axis=0), v_cuts, axis=1)
+        self.tile_lo = t_lo.astype(np.float32, copy=False)
+        self.tile_hi = t_hi.astype(np.float32, copy=False)
+        self.tile_valid = np.isfinite(self.tile_lo[..., 0])
+
+        step = max(1, int(math.sqrt((h * w) / 8192.0)))
+        sub_valid = self.valid[::step, ::step]
+        sub_zyx = self.zyx[::step, ::step]
+        valid_pts = sub_zyx[sub_valid]
+        if valid_pts.shape[0] == 0:
+            valid_pts = self.zyx[self.valid]
+        self.anchor_valid_zyx = valid_pts.astype(np.float32, copy=False)
+
+        if self.has_ink:
+            ink_step = max(1, int(math.sqrt((h * w) / 32768.0)))
+            sub_ink = self.ink_state[::ink_step, ::ink_step] == 1
+            ink_pts = self.zyx[::ink_step, ::ink_step][sub_ink]
+            if ink_pts.shape[0] == 0:
+                ink_pts = self.zyx[self.ink_state == 1]
+            self.anchor_ink_zyx = ink_pts.astype(np.float32, copy=False)
+        else:
+            self.anchor_ink_zyx = np.empty((0, 3), dtype=np.float32)
 
 
 @dataclass
@@ -517,7 +556,7 @@ def build_mesh_segment_from_arrays(
     bbox_lo = kept_zyx.min(axis=0).astype(np.float32)
     bbox_hi = kept_zyx.max(axis=0).astype(np.float32)
     has_ink = bool((ink_state == 1).any())
-    return MeshSegment(
+    seg = MeshSegment(
         segment_id=str(segment_id),
         zyx=full_zyx,
         valid=final_valid,
@@ -526,6 +565,8 @@ def build_mesh_segment_from_arrays(
         bbox_hi=bbox_hi,
         has_ink=has_ink,
     )
+    seg.ensure_spatial_index()
+    return seg
 
 
 def save_mesh_segments_cache(cache_path: str | Path, segments: list[MeshSegment]) -> None:
@@ -556,17 +597,17 @@ def load_mesh_segments_cache(cache_path: str | Path) -> list[MeshSegment]:
             ink_state = data[f"seg_{idx}_ink"].astype(np.int8)
             bbox_lo = data[f"seg_{idx}_bbox_lo"].astype(np.float32)
             bbox_hi = data[f"seg_{idx}_bbox_hi"].astype(np.float32)
-            segments.append(
-                MeshSegment(
-                    segment_id=str(data[f"seg_{idx}_id"]),
-                    zyx=zyx,
-                    valid=valid,
-                    ink_state=ink_state,
-                    bbox_lo=bbox_lo,
-                    bbox_hi=bbox_hi,
-                    has_ink=bool((ink_state == 1).any()),
-                )
+            seg = MeshSegment(
+                segment_id=str(data[f"seg_{idx}_id"]),
+                zyx=zyx,
+                valid=valid,
+                ink_state=ink_state,
+                bbox_lo=bbox_lo,
+                bbox_hi=bbox_hi,
+                has_ink=bool((ink_state == 1).any()),
             )
+            seg.ensure_spatial_index()
+            segments.append(seg)
         return segments
 
 
@@ -845,25 +886,42 @@ def crop_mesh_objects(
     for seg in meshes:
         if np.any(seg.bbox_hi < crop_lo) or np.any(seg.bbox_lo >= crop_hi):
             continue
-        inside = seg.valid & np.all((seg.zyx >= crop_lo) & (seg.zyx < crop_hi), axis=-1)
-        if int(inside.sum()) < min_points:
+        seg.ensure_spatial_index()
+        tile_hit = seg.tile_valid & np.all((seg.tile_hi >= crop_lo) & (seg.tile_lo < crop_hi), axis=-1)
+        if not tile_hit.any():
             continue
-        cc_labels, n_cc = ndi.label(inside, structure=EIGHT_CONNECTED_2D)
-        if n_cc == 0:
-            continue
-        for label_id, bounds in enumerate(ndi.find_objects(cc_labels), 1):
-            if bounds is None:
+        h, w = seg.valid.shape
+        ts = max(1, int(seg.tile_size))
+        t_labels, n_tcc = ndi.label(tile_hit, structure=EIGHT_CONNECTED_2D)
+        for t_bounds in ndi.find_objects(t_labels):
+            if t_bounds is None:
                 continue
-            local_mask = cc_labels[bounds] == label_id
-            if int(local_mask.sum()) < min_points:
+            u0 = t_bounds[0].start * ts
+            u1 = min(h, t_bounds[0].stop * ts)
+            v0 = t_bounds[1].start * ts
+            v1 = min(w, t_bounds[1].stop * ts)
+            sub_zyx = seg.zyx[u0:u1, v0:v1]
+            sub_valid = seg.valid[u0:u1, v0:v1]
+            with np.errstate(invalid="ignore"):
+                inside = sub_valid & np.all((sub_zyx >= crop_lo) & (sub_zyx < crop_hi), axis=-1)
+            if int(inside.sum()) < min_points:
                 continue
-            u_local, v_local = np.nonzero(local_mask)
-            u = u_local + bounds[0].start
-            v = v_local + bounds[1].start
-            coords = seg.zyx[u, v] - crop_lo
-            ink = seg.ink_state[u, v]
-            uv = np.stack([u, v], axis=-1).astype(np.int32)
-            candidates.append(CropMeshSheet(coords=coords, ink_state=ink, uv_coords=uv))
+            cc_labels, n_cc = ndi.label(inside, structure=EIGHT_CONNECTED_2D)
+            if n_cc == 0:
+                continue
+            for label_id, bounds in enumerate(ndi.find_objects(cc_labels), 1):
+                if bounds is None:
+                    continue
+                local_mask = cc_labels[bounds] == label_id
+                if int(local_mask.sum()) < min_points:
+                    continue
+                u_local, v_local = np.nonzero(local_mask)
+                u = u_local + (u0 + bounds[0].start)
+                v = v_local + (v0 + bounds[1].start)
+                coords = seg.zyx[u, v] - crop_lo
+                ink = seg.ink_state[u, v]
+                uv = np.stack([u, v], axis=-1).astype(np.int32)
+                candidates.append(CropMeshSheet(coords=coords, ink_state=ink, uv_coords=uv))
 
     if not candidates:
         return [], []
