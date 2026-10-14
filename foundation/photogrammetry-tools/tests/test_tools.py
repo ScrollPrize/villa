@@ -14,6 +14,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import find_blocks  # noqa: E402
 import mesh_qa  # noqa: E402
+import scrollcase_qa  # noqa: E402
 import scale_review  # noqa: E402
 import sfm_review  # noqa: E402
 
@@ -61,6 +62,15 @@ class MeshQATest(unittest.TestCase):
         self.assertEqual(T.shape, (len(F), 3, 2))
         r = mesh_qa.mesh_report(V2, F2)
         self.assertEqual((r["boundary_edges"], r["components"]), (3, 2))
+
+
+class ScrollcaseQATest(unittest.TestCase):
+    def test_winding_number_inside_and_outside(self):
+        import trimesh
+        box = trimesh.Trimesh(CUBE_V, CUBE_F)  # 2 x 3 x 5, outward normals
+        self.assertAlmostEqual(scrollcase_qa.winding_number(box, np.array([1.0, 1.5, 2.5])), 1.0, places=9)
+        self.assertAlmostEqual(scrollcase_qa.winding_number(box, np.array([3.0, 1.5, 2.5])), 0.0, places=9)
+        self.assertAlmostEqual(scrollcase_qa.winding_number(box, np.array([-10.0, 20.0, 2.5])), 0.0, places=9)
 
 
 class ScaleReviewTest(unittest.TestCase):
@@ -112,6 +122,21 @@ class FindBlocksTest(unittest.TestCase):
         bursts, block_of = find_blocks.split(rows, burst_gap=5, block_gap=30)
         self.assertEqual([len(b) for b in bursts], [48, 48, 30, 18, 48, 48])
         self.assertEqual(block_of, [0, 0, 1, 1, 1, 2])
+
+    def test_photographs_and_links_for_raw_and_jpeg_captures(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "capture")
+            os.makedirs(src)
+            for n in ("DSC00001.ARW", "DSC00002.JPG", "._DSC00002.JPG", "notes.txt"):
+                open(os.path.join(src, n), "w").write(n)
+            self.assertEqual(find_blocks.photographs(src), ["DSC00001.ARW", "DSC00002.JPG"])
+            block = os.path.join(d, "tree", "orientation1_camera_low")
+            os.makedirs(block)
+            for n in find_blocks.photographs(src):
+                find_blocks.link_photo(os.path.join(src, n), block)
+            self.assertTrue(os.path.islink(os.path.join(block, "DSC00001.ARW")))
+            jpg = os.path.join(block, "JPGEnhanced", "DSC00002.jpg")
+            self.assertEqual(os.stat(jpg).st_ino, os.stat(os.path.join(src, "DSC00002.JPG")).st_ino)
 
     def test_frame_number(self):
         self.assertEqual(find_blocks.frame_number("DSC05493_1.ARW"), 5493)
