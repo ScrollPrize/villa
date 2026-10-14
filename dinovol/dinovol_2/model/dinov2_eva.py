@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from timm.layers import trunc_normal_, use_fused_attn, DropPath, SwiGLU, GluMlp, Mlp
 from torch import nn
 from torch.nn import LayerNorm
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 from einops import rearrange
 
@@ -35,6 +36,24 @@ class InitWeights_He(object):
                 module.bias = nn.init.constant_(module.bias, 0)
 
 
+_ATTENTION_BACKENDS = {
+    "cudnn": SDPBackend.CUDNN_ATTENTION,
+    "flash": SDPBackend.FLASH_ATTENTION,
+    "efficient": SDPBackend.EFFICIENT_ATTENTION,
+    "math": SDPBackend.MATH,
+}
+
+
+def attention_priority(backend: Optional[str]) -> Optional[list]:
+    """SDPA kernel priority with `backend` first and the others as fallbacks."""
+    if backend is None:
+        return None
+    if backend not in _ATTENTION_BACKENDS:
+        raise ValueError(f"attention_backend must be one of {sorted(_ATTENTION_BACKENDS)}, got {backend!r}")
+    preferred = _ATTENTION_BACKENDS[backend]
+    return [preferred] + [other for other in _ATTENTION_BACKENDS.values() if other != preferred]
+
+
 class EvaAttention(nn.Module):
     fused_attn: torch.jit.Final[bool]
 
@@ -50,6 +69,7 @@ class EvaAttention(nn.Module):
             proj_drop: float = 0.,
             attn_head_dim: Optional[int] = None,
             norm_layer: Optional[Callable] = None,
+            attention_backend: Optional[str] = None,
     ):
         """
 
@@ -62,6 +82,8 @@ class EvaAttention(nn.Module):
             proj_drop:
             attn_head_dim:
             norm_layer:
+            attention_backend: preferred fused SDPA kernel (see attention_priority);
+                None keeps PyTorch's default choice.
         """
         super().__init__()
         self.num_heads = num_heads
@@ -74,6 +96,8 @@ class EvaAttention(nn.Module):
         self.scale = head_dim ** -0.5
         self.num_prefix_tokens = num_prefix_tokens
         self.fused_attn = use_fused_attn()
+        # Applied around each call, so compiled graphs record the choice when traced.
+        self.attention_priority = attention_priority(attention_backend)
         self.qkv_bias_separate = qkv_bias_separate
 
         if qkv_fused:
@@ -137,10 +161,11 @@ class EvaAttention(nn.Module):
     def _attention(self, q, k, v, *, attn_mask=None, spatial_shape=None):
         if not self.fused_attn:
             raise RuntimeError("Fused attention should be used.")
-        return F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask,
-            dropout_p=self.attn_drop.p if self.training else 0.,
-        )
+        dropout_p = self.attn_drop.p if self.training else 0.
+        if self.attention_priority is None:
+            return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
+        with sdpa_kernel(self.attention_priority, set_priority=True):
+            return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
 
 
 class EvaAxialAttention(EvaAttention):
@@ -220,6 +245,7 @@ class EvaBlock(nn.Module):
             rope_kwargs=None,
             ndim: Optional[int] = None,
             attention_type: str = "full",
+            attention_backend: Optional[str] = None,
     ):
         """
 
@@ -259,6 +285,7 @@ class EvaBlock(nn.Module):
             proj_drop=proj_drop,
             attn_head_dim=attn_head_dim,
             norm_layer=norm_layer if scale_attn_inner else None,
+            attention_backend=attention_backend,
         )
         self.attn = (EvaAxialAttention(**attention_kwargs, axis=0, ndim=ndim)
                      if attention_type == "axial" else EvaAttention(**attention_kwargs))
@@ -428,6 +455,7 @@ class Eva(nn.Module):
             deeper_embed_stem_channels: Optional[int] = None,
             deeper_embed_stem_type: Optional[str] = None,
             attention_type: str = "full",
+            attention_backend: Optional[str] = None,
     ):
         """
         Diff to timm implementation
@@ -451,6 +479,9 @@ class Eva(nn.Module):
             deeper_embed_batch_chunk_size,
             name="deeper_embed_batch_chunk_size",
         )
+        # Return the CNN embedding's intermediate stage outputs of global views as
+        # features["embed_skips"] (used by the dense point head).
+        self.return_embed_skips = False
 
         if self.embedding_type == "deeper":
             self._assert_patch_aligned(
@@ -559,6 +590,7 @@ class Eva(nn.Module):
                 rope_kwargs=rope_kwargs if self.use_per_block_rope else None,
                 ndim=self.ndim,
                 attention_type=attention_type,
+                attention_backend=attention_backend,
             )
             for i in range(depth)])
 
@@ -748,13 +780,25 @@ class Eva(nn.Module):
         # Never modify the shared crop in place: the teacher needs its original values.
         return x.masked_fill(voxel_mask, 0)
 
-    def prepare_tokens_with_masks(self, x, masks=None, *, view_kind: str = "global"):
+    def _down_project_with_skips(self, x, skips):
+        batch_chunk_size = self.deeper_embed_batch_chunk_size
+        chunks = x.split(batch_chunk_size) if batch_chunk_size is not None and x.shape[0] > batch_chunk_size else (x,)
+        outputs = [self.down_projection(chunk, return_skips=True) for chunk in chunks]
+        skips.extend(torch.cat(level, dim=0) for level in zip(*(levels for _, levels in outputs)))
+        return torch.cat([tokens for tokens, _ in outputs], dim=0)
+
+    def prepare_tokens_with_masks(self, x, masks=None, *, view_kind: str = "global", skips=None):
+        """skips: optional list that receives the CNN embedding's intermediate stage outputs."""
         spatial = tuple(x.shape[2:])
         self._assert_patch_aligned(spatial, tuple(self.patch_size), context="input shape")
         if masks is not None:
             x = self._mask_input_voxels(x, masks)
         batch_chunk_size = self.deeper_embed_batch_chunk_size
-        if self.embedding_type == "deeper" and batch_chunk_size is not None and x.shape[0] > batch_chunk_size:
+        if skips is not None:
+            if self.embedding_type != "deeper":
+                raise ValueError("embedding skips require the deeper CNN embedding")
+            x = self._down_project_with_skips(x, skips)
+        elif self.embedding_type == "deeper" and batch_chunk_size is not None and x.shape[0] > batch_chunk_size:
             x = torch.cat([self.down_projection(chunk) for chunk in x.split(batch_chunk_size)], dim=0)
         else:
             x = self.down_projection(x)
@@ -818,7 +862,8 @@ class Eva(nn.Module):
         }
 
     def forward_features(self, x, masks=None, *, view_kind: str = "global"):
-        x, rot_pos_embed, rope_shape = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind)
+        skips = [] if self.return_embed_skips and view_kind == "global" else None
+        x, rot_pos_embed, rope_shape = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind, skips=skips)
         rope_coords = self._get_shared_per_block_rope_coords(rope_shape)
         for blk in self.blocks:
             if self.grad_checkpointing and not torch.jit.is_scripting():
@@ -826,7 +871,13 @@ class Eva(nn.Module):
                                use_reentrant=False)
             else:
                 x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
-        return self._format_features(x, masks, view_kind=view_kind)
+        return self._with_skips(self._format_features(x, masks, view_kind=view_kind), skips)
+
+    @staticmethod
+    def _with_skips(features, skips):
+        if skips is not None:
+            features["embed_skips"] = skips
+        return features
 
     def forward(self, x, masks=None, is_training=True, *, view_kind: str = "global"):
         return self.forward_features_list(x, masks, view_kind=view_kind)
@@ -852,8 +903,28 @@ class Eva(nn.Module):
 
         missing_keys = list(load_result.missing_keys)
         unexpected_keys = list(load_result.unexpected_keys)
-        allowed_missing_keys = set()
+        allowed_missing_keys = self.warm_start_missing_rope(missing_keys)
 
+        disallowed_missing = [key for key in missing_keys if key not in allowed_missing_keys]
+        if disallowed_missing or unexpected_keys:
+            details = []
+            if disallowed_missing:
+                details.append(f"missing keys: {disallowed_missing}")
+            if unexpected_keys:
+                details.append(f"unexpected keys: {unexpected_keys}")
+            raise RuntimeError("failed to load pretrained backbone weights cleanly: " + "; ".join(details))
+
+        return load_result
+
+    def warm_start_missing_rope(self, missing_keys) -> set[str]:
+        """RoPE keys a checkpoint may lack (e.g. one written with axial RoPE).
+
+        Missing mixed-RoPE frequencies are reset to the axial layout, which reproduces
+        axial RoPE exactly; `periods` buffers are rebuilt deterministically at init.
+        Returns the keys (relative to this backbone) that may therefore be missing.
+        """
+        missing_keys = set(missing_keys)
+        allowed_missing_keys = set()
         if self.rope_embed is not None and hasattr(self.rope_embed, "reset_mixed_frequencies_to_axial"):
             allowed_missing_keys.add("rope_embed.mix_frequencies")
             if "rope_embed.mix_frequencies" in missing_keys:
@@ -868,17 +939,7 @@ class Eva(nn.Module):
                 if f"{prefix}.mix_frequencies" in missing_keys:
                     module.rope_embed.reset_mixed_frequencies_to_axial()
             allowed_missing_keys.add(f"{prefix}.periods")
-
-        disallowed_missing = [key for key in missing_keys if key not in allowed_missing_keys]
-        if disallowed_missing or unexpected_keys:
-            details = []
-            if disallowed_missing:
-                details.append(f"missing keys: {disallowed_missing}")
-            if unexpected_keys:
-                details.append(f"unexpected keys: {unexpected_keys}")
-            raise RuntimeError("failed to load pretrained backbone weights cleanly: " + "; ".join(details))
-
-        return load_result
+        return allowed_missing_keys
 
     def unchunk_state_dict(self, state_dict):
         """
@@ -952,7 +1013,8 @@ class EvaWithChunking(Eva):
         self.blocks = nn.ModuleList(chunks)
 
     def forward_features(self, x, masks=None, *, view_kind: str = "global"):
-        x, rot_pos_embed, rope_shape = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind)
+        skips = [] if self.return_embed_skips and view_kind == "global" else None
+        x, rot_pos_embed, rope_shape = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind, skips=skips)
         rope_coords = self._get_shared_per_block_rope_coords(rope_shape)
 
         if self.chunked_blocks:
@@ -970,7 +1032,7 @@ class EvaWithChunking(Eva):
                 else:
                     x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
 
-        return self._format_features(x, masks, view_kind=view_kind)
+        return self._with_skips(self._format_features(x, masks, view_kind=view_kind), skips)
 
     def forward(self, x, masks=None, is_training=True, *, view_kind: str = "global"):
         return self.forward_features_list(x, masks, view_kind=view_kind)

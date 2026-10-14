@@ -18,11 +18,13 @@ from torch.nn.init import trunc_normal_
 from torch.nn.utils.parametrizations import weight_norm
 
 from dinovol_2.model.dinov2_eva import Eva, EvaWithChunking
+from dinovol_2.ops.point_embeddings import sample_grid_points
 from dinovol_2.model.rope import MixedRopePositionEmbedding, RopePositionEmbedding
 
 
 _BACKBONE_DEFAULTS = {
     "attention_type": "full",
+    "attention_backend": None,
     "input_channels": 1,
     "global_crops_size": (256, 256, 256),
     "local_crops_size": None,
@@ -62,6 +64,7 @@ _BACKBONE_DEFAULTS = {
 
 _BACKBONE_DEFAULTS_V2 = {
     "attention_type": "full",
+    "attention_backend": None,
     "input_channels": 1,
     "global_crops_size": (256, 256, 256),
     "local_crops_size": None,
@@ -406,6 +409,29 @@ class DINOHead(nn.Module):
         return self.last_layer(x)
 
 
+class PointDenseHead(nn.Module):
+    """Per-point embedding from interpolated ViT tokens and CNN embedding features."""
+
+    def __init__(self, token_dim: int, skip_channels: Tuple[int, ...], hidden_dim: int = 256, out_dim: int = 64):
+        super().__init__()
+        # The CNN stage outputs have different scales; normalize each before mixing.
+        self.skip_norms = nn.ModuleList(nn.LayerNorm(channels) for channels in skip_channels)
+        self.skip_channels = tuple(int(channels) for channels in skip_channels)
+        self.mlp = nn.Sequential(
+            nn.Linear(token_dim + sum(self.skip_channels), hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, out_dim),
+        )
+
+    def forward(self, tokens: torch.Tensor, skips: torch.Tensor) -> torch.Tensor:
+        parts = [tokens] + [
+            norm(level) for norm, level in zip(self.skip_norms, skips.split(self.skip_channels, dim=-1))
+        ]
+        return F.normalize(self.mlp(torch.cat(parts, dim=-1)).float(), dim=-1)
+
+
 class DinoVitStudentTeacher(nn.Module):
     """Minimal 3D DINO-style student/teacher wrapper around the local EVA backbone."""
 
@@ -413,6 +439,11 @@ class DinoVitStudentTeacher(nn.Module):
         super().__init__()
         self.config = dict(config)
         student_backbone = self._build_backbone(self.config)
+        # dense_head: point heads for the object losses (see pretrain.object_losses).
+        self.dense_config = dict(self.config.get("dense_head") or {})
+        self.dense_enabled = bool(self.dense_config.get("enabled", False))
+        if self.dense_enabled:
+            student_backbone.return_embed_skips = True
         teacher_backbone = deepcopy(student_backbone)
 
         student_modules = {
@@ -425,6 +456,9 @@ class DinoVitStudentTeacher(nn.Module):
             "dino_head": self._build_head("dino"),
             "ibot_head": self._build_head("ibot", fallback_prefix="dino"),
         }
+        if self.dense_enabled:
+            for modules in (student_modules, teacher_modules):
+                modules.update(self._build_dense_heads(student_backbone))
 
         self.student = nn.ModuleDict(student_modules)
         self.teacher = nn.ModuleDict(teacher_modules)
@@ -493,6 +527,23 @@ class DinoVitStudentTeacher(nn.Module):
             out_dim=int(out_dim),
             **kwargs,
         )
+
+    def _build_dense_heads(self, backbone: nn.Module) -> dict[str, nn.Module]:
+        token_dim = int(backbone.embed_dim)
+        hidden_dim = int(self.dense_config.get("hidden_dim", 256))
+        return {
+            "dense_head": PointDenseHead(
+                token_dim,
+                backbone.down_projection.skip_channels,
+                hidden_dim=hidden_dim,
+                out_dim=int(self.dense_config.get("out_dim", 64)),
+            ),
+            "region_head": nn.Sequential(
+                nn.Linear(token_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, int(self.dense_config.get("region_dim", 128))),
+            ),
+        }
 
     def _freeze_teacher(self) -> None:
         for parameter in self.teacher.parameters():
@@ -666,7 +717,9 @@ class DinoVitStudentTeacher(nn.Module):
         mask_indices_list: torch.Tensor,
         n_masked_patches: Optional[int],
         masked_patch_features: bool,
+        masked_source_tokens: Optional[torch.Tensor] = None,
     ) -> dict[str, Mapping[str, torch.Tensor] | torch.Tensor]:
+        """masked_source_tokens: tokens to select the masked ones from, if not the patch tokens."""
         global_outputs = dict(global_outputs)
         cls_projections = self.project_cls_tokens(branch, global_outputs["cls_tokens"])
         outputs: dict[str, Mapping[str, torch.Tensor] | torch.Tensor] = {
@@ -674,7 +727,7 @@ class DinoVitStudentTeacher(nn.Module):
             "global_cls_projections": cls_projections,
         }
         masked_tokens = self.select_masked_patch_tokens(
-            global_outputs["patch_tokens"],
+            global_outputs["patch_tokens"] if masked_source_tokens is None else masked_source_tokens,
             mask_indices_list=mask_indices_list,
             n_masked_patches=n_masked_patches,
         )
@@ -703,6 +756,8 @@ class DinoVitStudentTeacher(nn.Module):
             "cls_tokens": cls_tokens,
             "patch_tokens": backbone_outputs["x_norm_patchtokens"],
         }
+        if "embed_skips" in backbone_outputs:
+            outputs["embed_skips"] = backbone_outputs["embed_skips"]
         if project_cls_tokens:
             outputs["cls_projections"] = self.project_cls_tokens(branch, cls_tokens)
         if project_patch_tokens:
@@ -737,6 +792,48 @@ class DinoVitStudentTeacher(nn.Module):
             project_patch_tokens=project_patch_tokens,
         )
 
+    @staticmethod
+    def _cross_view_tokens(
+        branch: nn.ModuleDict,
+        patch_tokens: torch.Tensor,
+        coordinates: torch.Tensor,
+        rows: torch.Tensor,
+        input_shape: Tuple[int, ...],
+    ) -> torch.Tensor:
+        """Patch tokens of view rows[r] interpolated at coordinates[r] (input voxels), [rows, P, C]."""
+        token_shape = tuple(size // patch for size, patch in zip(input_shape, branch.backbone.patch_size))
+        token_grid = patch_tokens.reshape(patch_tokens.shape[0], *token_shape, patch_tokens.shape[-1])
+        # Coordinates outside the view (tokens without a counterpart, left out of the
+        # loss by the trainer) are clamped to the border by the sampler.
+        return sample_grid_points(token_grid[rows], coordinates.float(), input_shape).to(patch_tokens.dtype)
+
+    def _point_features(
+        self,
+        branch: nn.ModuleDict,
+        outputs: dict[str, Any],
+        point_coordinates: torch.Tensor,
+        input_shape: Tuple[int, ...],
+    ) -> dict[str, torch.Tensor]:
+        """Dense embeddings and interpolated tokens at [views*batch, P, 3] view coordinates.
+
+        The embedding skips are dropped from `outputs` afterwards so their memory is
+        released (the teacher's) or left to autograd (the student's).
+        """
+        skips = outputs.pop("embed_skips")
+        patch_tokens = outputs["patch_tokens"]
+        token_shape = tuple(size // patch for size, patch in zip(input_shape, branch.backbone.patch_size))
+        token_grid = patch_tokens.reshape(patch_tokens.shape[0], *token_shape, patch_tokens.shape[-1])
+        tokens = sample_grid_points(token_grid, point_coordinates, input_shape)
+        skip_features = torch.cat(
+            [sample_grid_points(level.permute(0, 2, 3, 4, 1), point_coordinates, input_shape) for level in skips],
+            dim=-1,
+        )
+        dtype = patch_tokens.dtype
+        return {
+            "dense": branch.dense_head(tokens.to(dtype), skip_features.to(dtype)),
+            "tokens": tokens,
+        }
+
     def forward(
         self,
         student_input: torch.Tensor,
@@ -751,8 +848,16 @@ class DinoVitStudentTeacher(nn.Module):
         project_student_patch_tokens: bool = False,
         project_teacher_patch_tokens: bool = False,
         masked_patch_features: bool = False,
+        point_coordinates: Optional[torch.Tensor] = None,
+        teacher_target_coordinates: Optional[torch.Tensor] = None,
+        teacher_target_rows: Optional[torch.Tensor] = None,
     ) -> dict[str, Mapping[str, torch.Tensor] | dict[str, Mapping[str, torch.Tensor] | torch.Tensor]]:
+        """teacher_target_coordinates [rows, tokens, 3] and teacher_target_rows [rows]: when
+        given, the teacher's iBOT features for masked token t of row r are read at
+        teacher_target_coordinates[r, t] in the view of row teacher_target_rows[r]
+        (cross-view targets) instead of at the same token of the same view."""
         project_cls_tokens = mask_indices_list is None
+        input_shape = tuple(int(size) for size in student_input.shape[2:])
         # The teacher runs first: its no-grad intermediates are then freed before the
         # student's saved activations accumulate, which lowers peak memory.
         teacher_result = None
@@ -767,15 +872,26 @@ class DinoVitStudentTeacher(nn.Module):
                     project_patch_tokens=project_teacher_patch_tokens and mask_indices_list is None,
                     view_kind="global",
                 )
+                teacher_points = None
+                if point_coordinates is not None and "embed_skips" in teacher_outputs:
+                    teacher_points = self._point_features(self.teacher, teacher_outputs, point_coordinates, input_shape)
+                teacher_outputs.pop("embed_skips", None)
                 if mask_indices_list is None:
                     teacher_result = teacher_outputs
                 else:
+                    target_tokens = None
+                    if teacher_target_coordinates is not None:
+                        target_tokens = self._cross_view_tokens(
+                            self.teacher, teacher_outputs["patch_tokens"], teacher_target_coordinates,
+                            teacher_target_rows, input_shape,
+                        )
                     teacher_result = self._structured_global_outputs(
                         self.teacher,
                         teacher_outputs,
                         mask_indices_list,
                         n_masked_patches,
                         masked_patch_features,
+                        masked_source_tokens=target_tokens,
                     )
         student_outputs = self._forward_branch(
             self.student,
@@ -785,6 +901,10 @@ class DinoVitStudentTeacher(nn.Module):
             project_patch_tokens=project_student_patch_tokens and mask_indices_list is None,
             view_kind="global",
         )
+        student_points = None
+        if point_coordinates is not None and "embed_skips" in student_outputs:
+            student_points = self._point_features(self.student, student_outputs, point_coordinates, input_shape)
+        student_outputs.pop("embed_skips", None)
         if mask_indices_list is None:
             outputs: dict[str, Mapping[str, torch.Tensor] | dict[str, Mapping[str, torch.Tensor] | torch.Tensor]] = {
                 "student": student_outputs
@@ -809,4 +929,8 @@ class DinoVitStudentTeacher(nn.Module):
 
         if teacher_result is not None:
             outputs["teacher"] = teacher_result
+        if student_points is not None:
+            outputs["student"]["object_points"] = student_points
+        if teacher_result is not None and teacher_points is not None:
+            outputs["teacher"]["object_points"] = teacher_points
         return outputs

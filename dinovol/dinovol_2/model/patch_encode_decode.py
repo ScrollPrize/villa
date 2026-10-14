@@ -612,6 +612,7 @@ class PatchEmbedDeeper(nn.Module):
             stage_channels = tuple(base_features * (2 ** index) for index in range(num_stages))
         if len(stage_channels) != num_stages or any(channels < 1 for channels in stage_channels):
             raise ValueError(f"stage_channels must contain {num_stages} positive channel counts, got {stage_channels}")
+        self.stage_channels = tuple(int(channels) for channels in stage_channels)
         final_channels = stage_channels[-1] if num_stages else (stem_channels if use_stem else input_channels)
         if not final_projection and final_channels != embed_dim:
             raise ValueError("without final_projection, the final stage channels must equal embed_dim")
@@ -725,13 +726,23 @@ class PatchEmbedDeeper(nn.Module):
             padding_mode="zeros",
         ) if final_projection else nn.Identity()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    @property
+    def skip_channels(self) -> Tuple[int, ...]:
+        """Channels of the stage outputs returned with return_skips (all but the last)."""
+        return self.stage_channels[:-1]
+
+    def forward(self, x: torch.Tensor, return_skips: bool = False):
         if self.memory_format is not torch.contiguous_format:
             x = x.contiguous(memory_format=self.memory_format)
         x = self.stem(x)
+        skips = []
         for stage in self.stages:
             x = stage(x)
+            skips.append(x)
         x = self.final_proj(x)
+        if return_skips:
+            # The last stage only feeds the projection to tokens.
+            return x, skips[:-1]
         return x
 
 

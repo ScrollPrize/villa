@@ -134,6 +134,21 @@ def collate_dino_ibot_batch(
     }
     if collated_gram_teacher_crops is not None:
         batch["collated_gram_teacher_crops"] = collated_gram_teacher_crops
+    if "global_token_targets" in samples[0]:
+        # Each token's center in the other global view, rows stacked like the global crops.
+        batch["global_token_targets"] = torch.stack(
+            [sample["global_token_targets"][i] for i in range(n_global_views) for sample in samples]
+        )
+    if "object_point_coordinates" in samples[0]:
+        # Views are stacked like the global crops: row = view_index * batch + sample.
+        batch["object_point_coordinates"] = torch.stack(
+            [sample["object_point_coordinates"][i] for i in range(n_global_views) for sample in samples]
+        )
+        batch["object_point_valid"] = torch.stack(
+            [sample["object_point_valid"][i] for i in range(n_global_views) for sample in samples]
+        )
+        for key in ("object_point_source", "object_point_objects", "object_point_kinds", "object_negatives"):
+            batch[key] = torch.stack([sample[key] for sample in samples])
     return batch
 
 

@@ -9,7 +9,7 @@ from unittest.mock import patch
 import torch
 from torch.nn import functional as F
 
-from dinovol_2.model.dinov2_eva import EvaAttention, EvaAxialAttention, EvaBlock
+from dinovol_2.model.dinov2_eva import EvaAttention, EvaAxialAttention, EvaBlock, attention_priority
 from dinovol_2.model.model import DinoVitStudentTeacher, _materialize_backbone_config
 from dinovol_2.model.rope import RopePositionEmbedding
 
@@ -95,6 +95,29 @@ class AxialAttentionTests(unittest.TestCase):
                         else:
                             self.assertTrue(torch.isfinite(parameter.grad).all())
                             torch.testing.assert_close(parameter.grad, ref_parameter.grad)
+
+    def test_attention_backend_preference_keeps_results_and_fallbacks(self):
+        from torch.nn.attention import SDPBackend
+
+        order = attention_priority("cudnn")
+        self.assertEqual(order[0], SDPBackend.CUDNN_ATTENTION)
+        self.assertEqual(len(set(order)), 4)
+        self.assertIsNone(attention_priority(None))
+        with self.assertRaises(ValueError):
+            attention_priority("fastest")
+        torch.manual_seed(3)
+        default = EvaAttention(dim=24, num_heads=2, num_prefix_tokens=1)
+        preferred = EvaAttention(dim=24, num_heads=2, num_prefix_tokens=1, attention_backend="cudnn")
+        preferred.load_state_dict(default.state_dict())
+        x = torch.randn(2, 9, 24)
+        before = torch._C._get_sdp_priority_order()
+        # On CPU cuDNN is unavailable, so the fallback kernels give the same result.
+        torch.testing.assert_close(preferred(x), default(x))
+        self.assertEqual(torch._C._get_sdp_priority_order(), before)
+        config = {"model_type": "v3", "embed_dim": 48, "depth": 1, "num_heads": 2, "patch_size": [8, 8, 8],
+                  "global_crops_size": [16, 16, 16], "local_crops_size": [8, 8, 8], "attention_backend": "cudnn"}
+        model = DinoVitStudentTeacher({**config, **_materialize_backbone_config(config)})
+        self.assertEqual(model.student.backbone.blocks[0].attn.attention_priority, order)
 
     def test_validation_and_default(self):
         self.assertEqual(_materialize_backbone_config({'model_type': 'v3'})['attention_type'], 'full')

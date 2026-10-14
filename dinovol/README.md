@@ -97,6 +97,32 @@ a config sets it:
 - `fused_optimizer`: fused CUDA AdamW.
 - `cuda_expandable_segments`: the CUDA caching allocator uses expandable
   segments, avoiding fragmentation-driven cache flushes near full memory.
+- `cudnn_benchmark`: cuDNN autotunes each convolution's algorithm for the
+  (fixed) crop shapes on first use. On the H100 this cut the
+  `pretrain_8_9um.json` step from 1.65 s to 1.53 s. Algorithm choice can change
+  floating-point rounding.
+- `compile.mode: "max-autotune-no-cudagraphs"` (used by `pretrain_8_9um.json`)
+  benchmarks Triton matmul and convolution kernels against the library ones at
+  compile time and keeps the fastest. The first launch compiles for about 13
+  minutes; the inductor cache makes later launches fast.
+
+Optimizer-step time of `pretrain_8_9um.json` on one H100 (batch 16, 2 accumulation
+steps, `train_step` on real batches preloaded into memory so there is no data
+wait; median of 10 steps after 6 warmup steps):
+
+| setting | s/step | samples/s |
+| --- | --- | --- |
+| previous config | 1.649 | 19.4 |
+| + `cudnn_benchmark` | 1.527 | 21.0 |
+| + `model.attention_backend: "cudnn"` | 1.389 | 23.0 |
+| + `compile.mode: "max-autotune-no-cudagraphs"` | 1.350 | 23.7 |
+
+The GPU is the bottleneck (97–100% utilization in training; the loaders supply
+about 46 samples/s). The largest remaining cost is the CNN embedding's
+full-resolution layers: with 16 channels, a 16→16 3×3×3 convolution at 128³ runs
+at about 87 TFLOPS, against about 600 TFLOPS for 128→128 at 32³ with the same
+arithmetic, because the narrow channel dimension leaves tensor-core tiles
+mostly empty.
 - `dataset.occupancy_level`: the pyramid level (5 here, 32× coarser) whose
   nonzero voxels, dilated by one cell, bound each source window's nonzero
   fraction. Windows that cannot reach `nonzero_threshold` are rejected before any
@@ -200,21 +226,122 @@ smaller CNN and synthetic volume.
 
 The volume list is pinned from the public
 [scan metadata](https://vesuvius-challenge-open-data.s3.amazonaws.com/metadata.json),
-retrieved on 2026-10-10. It contains one masked intensity OME-Zarr per eligible
-scroll sample: 27 ESRF volumes at 8.640–9.366 µm, plus four Diamond volumes at
-7.910 µm (treated as approximately 8 µm). ESRF is preferred within that resolution
-range; higher-resolution ESRF scans are not substituted at another pyramid level.
+retrieved on 2026-10-11. It contains one masked intensity OME-Zarr per eligible
+scroll sample (32 in total):
+
+- 24 ESRF volumes at 8.640–9.366 µm and two Diamond volumes at 7.910 µm
+  (PHerc0172 and PHerc1667, treated as approximately 8 µm), at scale 0.
+- Five scrolls whose 2.4 µm ESRF scans carry fiber predictions, used at pyramid
+  level 2 (9.6 µm): PHerc0139, PHerc0332, PHerc1451 and PHercParis4 (replacing
+  their 7.9–9.4 µm volumes) and PHerc1299 (no other volume near this resolution).
+  Their fiber and surface predictions are on the same grid, so no registration
+  is needed.
+
 `sample_id`, `pixel_size_um`, and `scan_location` in each entry document the
 selection; the loader uses `volume_path` and `volume_scale`. Sampling retains the
 existing weighting by valid crop starts, rather than equal weight per scroll.
+Occupancy cells cover 2^`occupancy_level` selected-scale voxels on every volume:
+level-2 volumes read the same pyramid level and max-pool it.
 
-The Diamond fallbacks are PHerc0172, PHerc0332, PHerc1667, and PHercParis4.
-PHerc1299, PHercMAN5, PHercMANB, and PHercParis3 are excluded because the catalog
-has no intensity volume near the requested resolution at scale 0. For duplicate
-candidates, PHerc0139 uses `20250728140407` (the standard reconstruction; the
-pag0/pag50 alternatives have documented masking problems), PHerc0172 uses the
-newer cropped export `20241024131839`, and PHercParis4 uses `20230205180739`
-for its larger axial coverage.
+PHerc0172 uses the newer cropped export `20241024131839`. PHercMAN5, PHercMANB,
+and PHercParis3 are excluded because the catalog has no intensity volume near
+the requested resolution.
+
+### Pseudo-object losses
+
+To encourage object-centric features (each papyrus sheet and each fiber a
+distinct object) without full supervision, the recipe adds small point and
+object losses on pseudo-labels derived from published predictions:
+
+- Sheets: the binary `surface-m7` recto surface prediction (29 volumes;
+  `surface_path`, `surface_level`). Connected components are found inside 48³
+  blocks and kept only if they are a single layer: every line along the sheet
+  normal crosses them once (the normal from PCA and, for thin slabs, within the
+  y-x plane). Pieces in adjacent blocks are joined only when the joined piece is
+  still a single layer locally and no block would hold two pieces of the group.
+  A sheet may therefore be split into several objects, but neighbouring wraps,
+  which touch almost everywhere, are never merged into one.
+- Fibers: the `fibers-20260915212757` presence prediction (5 volumes; 19.2 µm, so
+  `fiber_level: 3` and `fiber_factor: 2` relative to the 9.6 µm image),
+  thresholded at 0.5. Neighbouring voxels are joined only if their decoded fiber
+  directions agree (|cos| ≥ 0.85), keeping the crossing fibers of the two papyrus
+  layers apart.
+- Two objects are marked as different only when that is provable: sheets whose
+  union clearly fails the single-layer test near their closest approach (stacked
+  layers), and fibers at a large angle. Other pairs are ignored by the losses.
+
+`dataset.object_points` controls sampling. Both global crop regions are drawn
+first; labels are computed on one `slab_thickness`-voxel (16) z slab inside
+their overlap, so every labeled object is visible in both views. Up to
+`max_labeled_points` (512) points, `points_per_object` (16) per object and
+`max_objects` (64) objects, are taken from the labels, and the rest of the
+`points_per_sample` (1024) are drawn uniformly in the overlap. Points travel into
+each view through the crop/resize mapping and the spatial augmentations like
+keypoints. On real data a sample carries about 110 labeled points on 7 objects,
+68% of samples have at least one provably different pair, and labeling costs
+about 0.3 s per sample in a loader worker.
+
+`object_losses` adds, for each view, a point embedding from a small MLP over the
+trilinearly interpolated ViT tokens and CNN stage outputs (16, 48 and 128
+channels at full, 1/2 and 1/4 resolution), and compares the student with the EMA
+teacher's other view:
+
+- `point_weight`: the embedding at each point should agree (1 − cosine) with the
+  teacher's at the same physical point in the other view. This term needs no
+  labels and has no negatives: an unlabeled point nearby may lie on the same
+  sheet or fiber, so only the object terms push embeddings apart. (A first
+  version contrasted every point against all others; the monitor's dense panel
+  then showed per-voxel fingerprints, even in air.)
+- `object_weight`: points on the same object are positives, points on provably
+  different objects negatives (InfoNCE, `object_temperature` 0.1).
+- `region_weight`: the same at object level on averaged token features with a
+  projection head (DetCon-style).
+
+Student points in iBOT-masked tokens are skipped, since their voxels are hidden.
+Each weight is 0.1 relative to the DINO loss, and all three ramp up linearly over
+`ramp_steps` (2000) from the step the heads were added. A checkpoint without the
+heads can be resumed: the heads are initialized (the teacher's copied from the
+student) and the optimizer state of existing parameters is kept.
+
+`grad_accumulation_steps: 2` runs two batches of 16 per optimizer step
+(effective batch 32); the learning rate follows the DINOv3 square-root rule,
+1e-3 × √(32 / 1024) = 1.768e-4.
+
+`dataset.augmentation` selects the view augmentation applied after the random
+resized crop. `"full"` (the default, used by `pretrain_8_9um.json` together with
+`gaussian_blur: true`) applies simulated scanner artifacts (smear, slice
+illumination), right-angle rotations, flips and axis transposes, local brightness
+gradients and gamma, blur, noise, sharpening, contrast and brightness, low
+resolution, gamma and inversion. `"dino"` keeps only the rotations, flips,
+transposes and the contrast and brightness jitter. Rotations and transposes use
+every pair of axes with equal crop size (all three for cubic crops). The scanner
+artifacts act along fixed tensor axes, so they run before the rotations: they
+follow the volume's axes, as real scan artifacts do, instead of always lying along
+the same axes of the augmented view. Every crop draws its own augmentation (with
+the probabilities above, most intensity transforms change a 1-channel crop in
+10 to 40% of crops, since they also apply per channel with probability 0.5).
+Points, object points and token correspondences follow the spatial transforms.
+
+`ibot_targets: "cross_view"` (used by `pretrain_8_9um.json`; default
+`"same_view"`) takes the teacher's iBOT target for a masked student token from the
+other global view, at the same physical location (the teacher's patch tokens
+interpolated there), instead of from the same token of the same unmasked view.
+With same-view targets, anything in the target that depends on the token's place in
+the crop can be predicted from that place alone, which the network can read from
+the crop borders (zero padding, attention range). This "positional collapse" is a
+known failure of masked-token objectives (CAPI, arXiv:2502.08769). Here it took
+over tokens without tissue: from about 110k steps the teacher's tokens in empty
+regions encoded their distance to the crop faces along y (the horizontal bars),
+grew through the transformer blocks (on a blank input the per-position token
+variance rose from 8.7 at 110k to 85 at 135k, 96% of it along y), and persisted
+after adding rotations; RoPE was not involved (shifting the teacher's RoPE
+coordinates did not move it). Centering the targets per position did not remove
+it, because the code was present only in empty tokens. The two global crops have
+independent offsets, scales and orientations, so a token's place in the student's
+crop says almost nothing about the teacher's position in its own crop. Only masked
+tokens inside the other view get a target (about 58% on average); their weights are
+renormalized per view, and the kept fraction is logged as `ibot_target_fraction`
+(`ibot_tgt` in the progress bar). Validation batches keep same-view targets.
 
 Run from `dinovol/` with the existing environment:
 
@@ -272,10 +399,33 @@ The following settings can be added to a training config:
   architecture, preserve their saved model configuration or explicitly set all
   three old values (`mlp_ratio: 2.6666666666666665` in JSON); changing these
   settings changes parameter shapes and state-dict keys.
+- `attention_backend` (default `null`, PyTorch's choice) names the preferred
+  fused attention kernel: `cudnn`, `flash`, `efficient` or `math`, with the others
+  as fallbacks. Each attention call applies it, so compiled graphs record the
+  choice when traced (a process-wide setting would not reach graphs reloaded from
+  the compile cache). With 4101 tokens and head dimension 48, cuDNN attention
+  takes 7.1 ms forward plus backward per 32 global crops on the H100, against
+  12.4 ms for FlashAttention-2; `pretrain_8_9um.json` uses `cudnn`.
 - `rope_type` selects the existing 3D `axial` or learnable per-block `mixed`
   implementation. The default is `axial` for `v3`, `mixed` for `v2`, and `axial`
   for the original unversioned model. Both support variable crop sizes and coordinate rescaling.
   The attention head dimension must be divisible by six for 3D RoPE.
+- `rope_shift_coords`, `rope_jitter_coords` and `rope_rescale_coords` augment the
+  student's RoPE coordinates during training (the EMA teacher always uses the
+  plain grid): a uniform shift in `[-shift, shift]` per axis (coordinates span
+  `[-1, 1]`), an independent log-uniform stretch in `[1/jitter, jitter]` per axis,
+  and one log-uniform isotropic scale in `[1/rescale, rescale]`. Only rescaling
+  (`2.0`) is on by default. `pretrain_8_9um.json` uses mixed RoPE with shift `1.5`,
+  jitter `1.5` and rescale `2.5`: with axial RoPE that run's teacher drifted, from
+  about 110k steps, to patch tokens that vary along one axis only (horizontal bars
+  in the token PCA, first in crops with little tissue), while iBOT loss dropped
+  sharply. The run was resumed from 110k with these settings. Axial RoPE lets a head attend
+  by the offset along a single axis, which averages whole planes of tokens.
+  Mixed RoPE with these settings did not stop the drift (share of patch-token
+  variance explained by y in low-tissue crops: 0.090 at 110k, 0.107 axial and 0.103
+  mixed at 115k), nor did adding rotations and transposes from 115k. The cause was
+  the same-view iBOT targets (see `ibot_targets`); the run was resumed from 140k with
+  cross-view targets and the full augmentation.
 - `untie_cls_and_patch_norms` gives CLS/register tokens their own output norm;
   patch tokens keep the original `norm`.
 - `untie_global_and_local_cls_norm` adds a separate CLS/register output norm for
@@ -299,9 +449,23 @@ training config. When enabling separate norms on an older checkpoint, missing
 norm weights are initialized from its trained shared norm (or its existing CLS
 norm for the new local norm). Use `model.pretrained_weights` to start a new run
 when changing normalization options; resuming optimizer state requires the same
-parameter layout. Keep `rope_type` consistent with the checkpoint: switching
-between learned mixed and axial RoPE is an architecture experiment, not an exact
-checkpoint conversion.
+parameter layout. A checkpoint written with axial RoPE can be resumed with
+`rope_type: "mixed"`: each block's mixed frequencies start at the axial layout, so
+outputs are unchanged at the resume step, and they then train (without weight
+decay); optimizer state of all existing parameters is kept, matched by name.
+Other switches between mixed and axial RoPE are architecture changes, not exact
+checkpoint conversions.
+
+## Training monitor
+
+Every `train_monitor_every_n` steps the trainer writes
+`monitor/monitor_step_NNNNNN.jpg` from the first `monitor_batch_size` samples of
+the current batch (one row each, at least 5; `pretrain_8_9um.json` uses 12). For
+each global view a row shows the center slice of the input, then
+`monitor_pca_sets` (default 4) RGB images of the student's patch tokens on that
+slice from principal components 1-3, 4-6, 7-9 and 10-12, and, with the object
+losses, the same for the dense point head at every voxel of the slice. PCA is fit
+per panel, so colors are comparable only within one panel.
 
 ## Masking
 

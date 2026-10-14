@@ -55,19 +55,19 @@ class CNNEmbeddingTests(unittest.TestCase):
         resolved = _materialize_backbone_config(config)
         self.assertEqual(resolved["embed_dim"], 288)
         self.assertEqual(resolved["num_heads"], 6)
-        self.assertEqual(resolved["depth"], 8)
+        self.assertEqual(resolved["depth"], 10)
         self.assertEqual(resolved["attention_type"], "full")
         self.assertEqual(resolved["patch_size"], (8, 8, 8))
-        self.assertEqual(resolved["deeper_embed_stage_channels"], [16, 32, 64, 288])
+        self.assertEqual(resolved["deeper_embed_stage_channels"], [16, 48, 128, 192])
         self.assertEqual(resolved["deeper_embed_stage_strides"], [1, 2, 2, 2])
-        self.assertEqual(resolved["deeper_embed_depth_per_level"], [2, 2, 2, 2])
+        self.assertEqual(resolved["deeper_embed_depth_per_level"], [1, 2, 2, 1])
         self.assertTrue(resolved["deeper_embed_use_stem"])
-        self.assertFalse(resolved["deeper_embed_final_projection"])
+        self.assertTrue(resolved["deeper_embed_final_projection"])
         # Keep the recipe's architecture, but use a small crop for CPU validation.
         config.update(global_crops_size=[32] * 3, local_crops_size=[32] * 3)
         backbone = DinoVitStudentTeacher._build_backbone(config).eval()
         blocks = [module for module in backbone.modules() if isinstance(module, EvaBlock)]
-        self.assertEqual(len(blocks), 8)
+        self.assertEqual(len(blocks), 10)
         for block in blocks:
             self.assertEqual(block.attention_type, "full")
             self.assertEqual(len(block.axial_attns), 0)
@@ -81,9 +81,11 @@ class CNNEmbeddingTests(unittest.TestCase):
         self.assertEqual((stem_convs[0].in_channels, stem_convs[0].out_channels), (1, 16))
         self.assertEqual(stem_convs[0].kernel_size, (3, 3, 3))
         self.assertEqual(stem_convs[0].stride, (1, 1, 1))
-        self.assertIsInstance(encoder.final_proj, nn.Identity)
-        self.assertEqual([len(stage.blocks) for stage in encoder.stages], [2] * 4)
-        self.assertFalse(any(name.startswith("final_proj.") for name in encoder.state_dict()))
+        # The last stage is projected to the embedding width by a 1x1x1 convolution.
+        self.assertIsInstance(encoder.final_proj, nn.Conv3d)
+        self.assertEqual((encoder.final_proj.in_channels, encoder.final_proj.out_channels), (192, 288))
+        self.assertEqual(encoder.final_proj.kernel_size, (1, 1, 1))
+        self.assertEqual([len(stage.blocks) for stage in encoder.stages], [1, 2, 2, 1])
         for module in encoder.modules():
             if isinstance(module, nn.Conv3d):
                 self.assertEqual(module.padding_mode, "zeros")
@@ -100,8 +102,8 @@ class CNNEmbeddingTests(unittest.TestCase):
             for handle in handles:
                 handle.remove()
         self.assertEqual(shapes, [(1, 16, 32, 32, 32), (1, 16, 32, 32, 32),
-                                  (1, 32, 16, 16, 16), (1, 64, 8, 8, 8),
-                                  (1, 288, 4, 4, 4)])
+                                  (1, 48, 16, 16, 16), (1, 128, 8, 8, 8),
+                                  (1, 192, 4, 4, 4)])
         tokens = features["x_norm_patchtokens"]
         self.assertEqual(tuple(tokens.shape), (1, 64, 288))
         self.assertEqual(tuple(features["x_norm_clstoken"].shape), (1, 288))

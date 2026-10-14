@@ -13,7 +13,7 @@ from copy import deepcopy
 import json
 from pathlib import Path
 import random
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -33,7 +33,9 @@ from dinovol_2.eval.task_eval import TaskEvalRunner
 from dinovol_2.ops.collate import build_dino_ibot_collate_fn
 from dinovol_2.ops.distributed_utils import build_distributed_sampler, resolve_distributed_config
 from dinovol_2.ops.weighted_loader import WeightedCombinedLoader
-from dinovol_2.loss import DINOLoss, GramLoss, KoLeoLoss, PointCosineLoss, PointLossResult, iBOTPatchLoss
+from dinovol_2.loss import (
+    DINOLoss, GramLoss, KoLeoLoss, ObjectLoss, ObjectLossResult, PointCosineLoss, PointLossResult, iBOTPatchLoss,
+)
 from dinovol_2.model.model import DinoVitStudentTeacher, _materialize_backbone_config, _upgrade_weight_norm_state_dict_keys
 from dinovol_2.ops.point_embeddings import gather_variable_points, sample_normalized_patch_embeddings
 
@@ -159,6 +161,9 @@ class DinoIBOTPretrainer:
             # Expandable segments avoid fragmentation-driven cache flushes near full
             # memory. They apply to allocations made after this call.
             torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+        if self.device.type == "cuda" and bool(self.config.get("cudnn_benchmark", False)):
+            # Autotune convolution algorithms per input shape (crop shapes are fixed).
+            torch.backends.cudnn.benchmark = True
         self.use_amp = bool(self.config.get("use_amp", self.device.type == "cuda"))
         self.fused_optimizer = bool(self.config.get("fused_optimizer", False)) and self.device.type == "cuda"
         self.max_iterations = int(self.config.get("max_iterations", self.config.get("num_iterations", 1000000)))
@@ -181,6 +186,28 @@ class DinoIBOTPretrainer:
             default_warmup_steps = max(1, round(self.total_steps * warmup_ratio))
         self.warmup_steps = int(self.config["warmup_steps"]) if "warmup_steps" in self.config else default_warmup_steps
         self.freeze_last_layer_steps = self._resolve_freeze_last_layer_steps()
+
+        # object_losses: dense point head + point/object/region losses on pseudo-object
+        # points (dataset.object_points). Weights are relative to the DINO loss.
+        self.object_loss_config = dict(self.config.get("object_losses") or {})
+        self.do_object_losses = bool(self.object_loss_config.get("enabled", False))
+        if self.do_object_losses:
+            self.model_config["dense_head"] = {"enabled": True, **dict(self.object_loss_config.get("head") or {})}
+        self.object_point_weight = float(self.object_loss_config.get("point_weight", 0.1))
+        self.object_weight = float(self.object_loss_config.get("object_weight", 0.1))
+        self.object_region_weight = float(self.object_loss_config.get("region_weight", 0.1))
+        # The object-loss weights ramp up linearly over ramp_steps from the step the
+        # heads were added (0 for a new run, the resume step when added to a run).
+        self.object_ramp_steps = int(self.object_loss_config.get("ramp_steps", 0))
+        self.object_heads_start_step = 0
+        self.object_loss = ObjectLoss(
+            object_temperature=float(self.object_loss_config.get("object_temperature", 0.1)),
+            region_temperature=float(self.object_loss_config.get("region_temperature", 0.1)),
+        )
+        # grad_accumulation_steps: micro-batches of batch_size per optimizer step.
+        self.grad_accumulation_steps = int(self.config.get("grad_accumulation_steps", 1))
+        if self.grad_accumulation_steps < 1:
+            raise ValueError("grad_accumulation_steps must be at least 1")
 
         self.model = DinoVitStudentTeacher(self.model_config).to(self.device)
         self.optimizer = self._build_optimizer()
@@ -254,6 +281,15 @@ class DinoIBOTPretrainer:
         ).to(self.device)
         self.do_dino = self.dino_loss_weight > 0.0
         self.do_ibot = self.ibot_loss_weight > 0.0
+        # ibot_targets: "same_view" reads the teacher target of a masked token at the same
+        # token of the same (unmasked) view; "cross_view" reads it at the same physical
+        # location in the other global view. Same-view targets can be predicted from a
+        # token's position in the crop (which the network can infer from the crop borders),
+        # and that position code took over low-content crops; cross-view targets carry
+        # no information about the student's position in its crop.
+        self.ibot_targets = str(self.config.get("ibot_targets", "same_view"))
+        if self.ibot_targets not in ("same_view", "cross_view"):
+            raise ValueError(f"ibot_targets must be 'same_view' or 'cross_view', got {self.ibot_targets!r}")
         self.do_koleo = self.koleo_loss_weight > 0.0 and self.do_dino
         self.centering = str(self.config.get("centering", "sinkhorn_knopp"))
         self.gram_img_level = bool(self.gram_config.get("img_level", True))
@@ -291,6 +327,8 @@ class DinoIBOTPretrainer:
         self.train_monitor_every_n = int(self.config.get("train_monitor_every_n", 0))
         self.save_every_n = int(self.config.get("save_every_n", self.config.get("save_every", 0)))
         self.monitor_batch_size = max(5, int(self.config.get("monitor_batch_size", 5)))
+        # Monitor PCA panels: components 1-3, 4-6, ... as RGB, `monitor_pca_sets` of them.
+        self.monitor_pca_sets = max(1, int(self.config.get("monitor_pca_sets", 4)))
         self.monitor_pool_size = max(1, int(self.config.get("monitor_pool_size", 5000)))
         self.monitor_seed = int(self.config.get("monitor_seed", 0))
         self.output_dir = Path(self.config.get("output_dir", "./dinov2_pretrain_runs"))
@@ -375,9 +413,10 @@ class DinoIBOTPretrainer:
         # Compile inner modules rather than DDP or the variable masked-token selection.
         # In-place compilation preserves parameter identities and state_dict keys for
         # optimizer groups, EMA updates, checkpoint loading, and downstream inference.
+        # The small point heads (object losses) stay eager.
         for branch in (self.model_module.student, self.model_module.teacher):
-            for name, module in branch.items():
-                module.compile(**options, dynamic=dynamic_by_module[name])
+            for name in module_names:
+                branch[name].compile(**options, dynamic=dynamic_by_module[name])
         if self.gram_teacher_backbone is not None:
             self.gram_teacher_backbone.compile(**options, dynamic=dynamic_by_module["backbone"])
         self.ibot_patch_loss.compile_kernels(**options)
@@ -635,6 +674,14 @@ class DinoIBOTPretrainer:
             resolved_config["point_supervision"] = dict(self.point_config)
         else:
             resolved_config.pop("point_supervision", None)
+        # Object points are only sampled for the training loader of an object-loss run.
+        if not (enable_point_supervision and self.do_object_losses):
+            resolved_config.pop("object_points", None)
+        # Token correspondences between the global views, for cross-view iBOT targets.
+        if enable_point_supervision and self.ibot_targets == "cross_view" and self.do_ibot:
+            resolved_config["cross_view_token_patch_size"] = list(self.model_config.get("patch_size", (16, 16, 16)))
+        else:
+            resolved_config.pop("cross_view_token_patch_size", None)
         return resolved_config
 
     def _resolved_dataset_configs(
@@ -1127,6 +1174,9 @@ class DinoIBOTPretrainer:
         n_masked: int,
         return_teacher: bool,
         masked_patch_features: bool = False,
+        point_coordinates: torch.Tensor | None = None,
+        teacher_target_coordinates: torch.Tensor | None = None,
+        teacher_target_rows: torch.Tensor | None = None,
     ) -> Mapping[str, Any]:
         # Backward runs outside autocast. AOTAutograd must use that same
         # assumption when it captures backward graphs during these forwards.
@@ -1141,7 +1191,39 @@ class DinoIBOTPretrainer:
                 n_masked_patches=n_masked,
                 return_teacher=return_teacher,
                 masked_patch_features=masked_patch_features,
+                point_coordinates=point_coordinates,
+                teacher_target_coordinates=teacher_target_coordinates,
+                teacher_target_rows=teacher_target_rows,
             )
+
+    def _cross_view_ibot_selection(
+        self,
+        batch: Mapping[str, Any],
+        global_crops: torch.Tensor,
+        mask_indices: torch.Tensor,
+        n_global_views: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Cross-view iBOT: masked tokens whose location lies in the other global view.
+
+        Returns the kept mask indices, their weights (1 / kept count of their view, as
+        the collate does for all masked tokens), the per-row target coordinates and rows
+        for the teacher, and the kept fraction of masked tokens.
+        """
+        if n_global_views != 2:
+            raise ValueError("cross-view iBOT targets need exactly 2 global views")
+        coordinates = batch["global_token_targets"].to(self.device, non_blocking=True)
+        n_rows, n_tokens = coordinates.shape[:2]
+        size = coordinates.new_tensor(tuple(float(dim) for dim in global_crops.shape[2:]))
+        inside = torch.all((coordinates >= -0.5) & (coordinates <= size - 0.5), dim=-1).flatten()
+        keep = inside[mask_indices]
+        kept = mask_indices[keep]
+        kept_rows = torch.div(kept, n_tokens, rounding_mode="floor")
+        counts = torch.bincount(kept_rows, minlength=n_rows).clamp_min(1).to(torch.float32)
+        weights = (1.0 / counts)[kept_rows]
+        batch_size = n_rows // n_global_views
+        rows = (torch.arange(n_rows, device=self.device) + batch_size) % n_rows
+        fraction = keep.float().mean() if keep.numel() else coordinates.new_zeros(())
+        return kept, weights, coordinates, rows, fraction
 
     def _logit_dtype(self) -> torch.dtype:
         if torch.is_autocast_enabled(self.device.type):
@@ -1498,10 +1580,73 @@ class DinoIBOTPretrainer:
             },
         }
 
-    def train_step(self, batch: Mapping[str, Any], step: int) -> dict[str, float]:
+    _TRAIN_METRICS = (
+        "loss", "dino_global_loss", "dino_local_loss", "ibot_loss", "koleo_loss", "gram_loss",
+        "point_loss", "point_same_type_loss", "point_different_type_loss",
+        "point_count", "point_same_pair_count", "point_different_pair_count",
+        "object_point_loss", "object_loss", "object_region_loss",
+        "object_point_anchors", "object_anchors", "object_region_anchors",
+        "ibot_target_fraction",
+    )
+
+    def train_step(self, batch: Mapping[str, Any] | list[Mapping[str, Any]], step: int) -> dict[str, float]:
+        """One optimizer step over one batch, or a list of micro-batches whose gradients
+        are accumulated (each micro-batch loss is scaled by 1 / len(list))."""
+        micro_batches = list(batch) if isinstance(batch, (list, tuple)) else [batch]
         self.model.train()
         lr, weight_decay, teacher_momentum, teacher_temp = self._apply_optim_scheduler(step)
+        object_ramp = self._object_loss_ramp(step)
+        self.optimizer.zero_grad(set_to_none=True)
+        totals = None
+        for micro_batch in micro_batches:
+            values = self._accumulate_micro_batch(
+                micro_batch, teacher_temp, loss_scale=1.0 / len(micro_batches), object_ramp=object_ramp
+            )
+            totals = values if totals is None else totals + values
 
+        self.scaler.unscale_(self.optimizer)
+        clip_grad_norm_(self.model_module.student.parameters(), self.clip_grad)
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        self.model_module.update_teacher(teacher_momentum)
+        self._maybe_refresh_gram_teacher(step)
+
+        # One device-to-host transfer for all logged values (averaged over micro-batches).
+        metrics = dict(zip(self._TRAIN_METRICS, (totals / len(micro_batches)).tolist()))
+        return {
+            **metrics,
+            "gram_loss_weight": float(self.gram_loss_weight),
+            "point_loss_weight": float(self.point_loss_weight),
+            "lr": lr,
+            "weight_decay": weight_decay,
+            "teacher_temp": teacher_temp,
+            "object_loss_ramp": object_ramp,
+        }
+
+    def _object_loss_ramp(self, step: int) -> float:
+        if self.object_ramp_steps <= 0:
+            return 1.0
+        return float(min(1.0, max(0.0, (step - self.object_heads_start_step + 1) / self.object_ramp_steps)))
+
+    def _object_point_validity(
+        self, batch: Mapping[str, Any], masks: torch.Tensor, global_crops: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Point coordinates, teacher validity (inside the view) and student validity
+        (inside the view and not in an iBOT-masked token, whose voxels are hidden)."""
+        coordinates = batch["object_point_coordinates"].to(self.device, non_blocking=True)
+        teacher_valid = batch["object_point_valid"].to(self.device, non_blocking=True)
+        patch = coordinates.new_tensor(tuple(float(size) for size in self.model_module.student.backbone.patch_size))
+        token_shape = [int(size) // int(p) for size, p in zip(global_crops.shape[2:], patch.tolist())]
+        token = (coordinates / patch).floor().long()
+        for axis, size in enumerate(token_shape):
+            token[..., axis] = token[..., axis].clamp(0, size - 1)
+        flat = (token[..., 0] * token_shape[1] + token[..., 1]) * token_shape[2] + token[..., 2]
+        student_valid = teacher_valid & ~torch.gather(masks, 1, flat)
+        return coordinates, teacher_valid, student_valid
+
+    def _accumulate_micro_batch(
+        self, batch: Mapping[str, Any], teacher_temp: float, *, loss_scale: float, object_ramp: float = 1.0
+    ) -> torch.Tensor:
         global_crops = batch["collated_global_crops"].to(self.device, non_blocking=True)
         local_crops = batch["collated_local_crops"].to(self.device, non_blocking=True)
         gram_teacher_crops = batch.get("collated_gram_teacher_crops")
@@ -1513,8 +1658,20 @@ class DinoIBOTPretrainer:
         n_global_views = int(batch["n_global_views"])
         n_local_views = int(batch["n_local_views"])
         n_masked = int(batch["n_masked_patches"].item())
+        use_objects = self.do_object_losses and "object_point_coordinates" in batch
+        point_coordinates = teacher_point_valid = student_point_valid = None
+        if use_objects:
+            point_coordinates, teacher_point_valid, student_point_valid = self._object_point_validity(
+                batch, masks, global_crops
+            )
 
-        self.optimizer.zero_grad(set_to_none=True)
+        teacher_target_coordinates = teacher_target_rows = None
+        ibot_target_fraction = global_crops.new_ones(())
+        if self.ibot_targets == "cross_view" and "global_token_targets" in batch:
+            mask_indices, masks_weight, teacher_target_coordinates, teacher_target_rows, ibot_target_fraction = (
+                self._cross_view_ibot_selection(batch, global_crops, mask_indices, n_global_views)
+            )
+            n_masked = int(mask_indices.numel())
 
         fused_ibot = self.ibot_fused_last_layer and self.do_ibot and self.centering == "sinkhorn_knopp"
         with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
@@ -1526,6 +1683,9 @@ class DinoIBOTPretrainer:
                 n_masked=n_masked,
                 return_teacher=self.do_dino or self.do_ibot,
                 masked_patch_features=fused_ibot,
+                point_coordinates=point_coordinates,
+                teacher_target_coordinates=teacher_target_coordinates,
+                teacher_target_rows=teacher_target_rows,
             )
             teacher_branch = model_outputs.get("teacher")
             if self.do_dino and teacher_branch is not None:
@@ -1612,46 +1772,51 @@ class DinoIBOTPretrainer:
                 batch=batch,
                 global_crops=global_crops,
             )
+            zero = global_crops.new_zeros(())
+            if use_objects:
+                student_points = student_branch["object_points"]
+                teacher_points = teacher_branch["object_points"]
+                object_result = self.object_loss(
+                    student_dense=student_points["dense"],
+                    teacher_dense=teacher_points["dense"],
+                    student_tokens=student_points["tokens"],
+                    teacher_tokens=teacher_points["tokens"],
+                    student_valid=student_point_valid,
+                    teacher_valid=teacher_point_valid,
+                    objects=batch["object_point_objects"].to(self.device, non_blocking=True),
+                    negatives=batch["object_negatives"].to(self.device, non_blocking=True),
+                    student_region_head=self.model_module.student.region_head,
+                    teacher_region_head=self.model_module.teacher.region_head,
+                    n_views=n_global_views,
+                )
+            else:
+                object_result = ObjectLossResult(zero, zero, zero, zero, zero, zero)
 
             loss = (
                 self.dino_loss_weight * (dino_global_loss + dino_local_loss) +
                 self.ibot_loss_weight * ibot_loss +
                 self.koleo_loss_weight * koleo_loss +
                 self.gram_loss_weight * gram_loss +
-                self.point_loss_weight * point_result.loss
+                self.point_loss_weight * point_result.loss +
+                object_ramp * (
+                    self.object_point_weight * object_result.point +
+                    self.object_weight * object_result.object +
+                    self.object_region_weight * object_result.region
+                )
             )
 
-        self.scaler.scale(loss).backward()
-        self.scaler.unscale_(self.optimizer)
-        clip_grad_norm_(self.model_module.student.parameters(), self.clip_grad)
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
-        self.model_module.update_teacher(teacher_momentum)
-        self._maybe_refresh_gram_teacher(step)
-
-        # One device-to-host transfer for all logged losses.
-        loss_names = (
-            "loss", "dino_global_loss", "dino_local_loss", "ibot_loss", "koleo_loss", "gram_loss",
-            "point_loss", "point_same_type_loss", "point_different_type_loss",
-        )
-        loss_values = torch.stack([
-            value.detach().float().reshape(())
+        self.scaler.scale(loss * loss_scale).backward()
+        return torch.stack([
+            torch.as_tensor(value, device=self.device).detach().float().reshape(())
             for value in (
                 loss, dino_global_loss, dino_local_loss, ibot_loss, koleo_loss, gram_loss,
                 point_result.loss, point_result.same_type, point_result.different_type,
+                point_result.point_count, point_result.same_pair_count, point_result.different_pair_count,
+                object_result.point, object_result.object, object_result.region,
+                object_result.point_anchors, object_result.object_anchors, object_result.region_anchors,
+                ibot_target_fraction,
             )
-        ]).tolist()
-        return {
-            **dict(zip(loss_names, loss_values)),
-            "gram_loss_weight": float(self.gram_loss_weight),
-            "point_loss_weight": float(self.point_loss_weight),
-            "point_count": float(point_result.point_count),
-            "point_same_pair_count": float(point_result.same_pair_count),
-            "point_different_pair_count": float(point_result.different_pair_count),
-            "lr": lr,
-            "weight_decay": weight_decay,
-            "teacher_temp": teacher_temp,
-        }
+        ])
 
     @staticmethod
     def _capture_rng_state() -> dict[str, Any]:
@@ -1698,17 +1863,100 @@ class DinoIBOTPretrainer:
                     self.gram_teacher_backbone.state_dict() if self.gram_teacher_backbone is not None else None
                 ),
                 "rng_state": self._capture_rng_state(),
+                "object_heads_start_step": self.object_heads_start_step,
             },
             path,
         )
         return path
 
+    # Modules that may be added to a run after its checkpoint was written.
+    _ADDABLE_MODULES = ("dense_head.", "region_head.")
+    _GROUP_KEYS = ("lr_multiplier", "wd_multiplier", "is_last_layer")
+
+    def _load_branch(self, branch: torch.nn.Module, state_dict: Mapping[str, Any]) -> list[str]:
+        """Load one branch; returns the keys the checkpoint lacked.
+
+        Besides added heads, a checkpoint written with axial RoPE may be resumed with
+        mixed RoPE: the per-block frequencies start at the axial layout (identical
+        outputs) and the axial-only `rope_embed.periods` buffer is dropped.
+        """
+        state_dict = _upgrade_weight_norm_state_dict_keys(state_dict)
+        backbone = branch.backbone
+        if backbone.rope_embed is None:
+            state_dict = {key: value for key, value in state_dict.items() if not key.startswith("backbone.rope_embed.")}
+        missing, unexpected = branch.load_state_dict(state_dict, strict=False)
+        backbone_missing = [key.removeprefix("backbone.") for key in missing if key.startswith("backbone.")]
+        allowed = {f"backbone.{key}" for key in backbone.warm_start_missing_rope(backbone_missing)}
+        required = [key for key in missing if not key.startswith(self._ADDABLE_MODULES) and key not in allowed]
+        if required or unexpected:
+            raise RuntimeError(f"Checkpoint does not match the model: missing={required} unexpected={list(unexpected)}")
+        return list(missing)
+
+    def _load_optimizer_state(self, state: Mapping[str, Any], added: Sequence[str] = ()) -> None:
+        current = self.optimizer.state_dict()
+        old_groups, new_groups = state["param_groups"], current["param_groups"]
+        if not added:
+            self.optimizer.load_state_dict(state)
+            return
+        # Parameters added since the checkpoint (heads, mixed-RoPE frequencies) may sit
+        # anywhere inside a fused group, so old ids are matched to parameters by name:
+        # within a group, the checkpoint's parameters are the current ones minus the added.
+        names = {id(parameter): name for name, parameter in self.model_module.student.named_parameters()}
+        added = set(added)
+        group_key = lambda group: tuple(group.get(key) for key in self._GROUP_KEYS)
+        old_by_key = {group_key(group): group for group in old_groups}
+        if len(old_by_key) != len(old_groups):
+            raise RuntimeError("Checkpoint optimizer groups are not distinguishable by their multipliers.")
+        remapped, matched = {}, set()
+        for live_group, new_group in zip(self.optimizer.param_groups, new_groups):
+            kept = [new_id for parameter, new_id in zip(live_group["params"], new_group["params"])
+                    if names[id(parameter)] not in added]
+            old = old_by_key.get(group_key(new_group))
+            if old is None:
+                if kept:
+                    raise RuntimeError("Checkpoint optimizer state lacks a group of existing parameters.")
+                continue
+            if len(kept) != len(old["params"]):
+                raise RuntimeError("Checkpoint optimizer state does not match the model's parameter groups.")
+            matched.add(group_key(new_group))
+            remapped.update(
+                {new_id: state["state"][old_id] for old_id, new_id in zip(old["params"], kept) if old_id in state["state"]}
+            )
+        if matched != set(old_by_key):
+            raise RuntimeError("Checkpoint optimizer state has groups the model lacks.")
+        self.optimizer.load_state_dict({"state": remapped, "param_groups": new_groups})
+        for group in self.optimizer.param_groups:
+            for parameter in group["params"]:
+                moments = self.optimizer.state.get(parameter, {}).get("exp_avg")
+                if moments is not None and moments.shape != parameter.shape:
+                    raise RuntimeError("Remapped optimizer state does not match its parameter's shape.")
+
     def load_checkpoint(self, checkpoint_path: str | Path) -> int:
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        self.model_module.student.load_state_dict(_upgrade_weight_norm_state_dict_keys(checkpoint["student"]))
-        self.model_module.teacher.load_state_dict(_upgrade_weight_norm_state_dict_keys(checkpoint["teacher"]))
+        student = self.model_module.student
+        teacher = self.model_module.teacher
+        added = self._load_branch(student, checkpoint["student"])
+        teacher_added = self._load_branch(teacher, checkpoint["teacher"])
+        # Added heads start from the student's initialization in both branches (added
+        # RoPE frequencies were already warm-started identically in each branch).
+        for name in {key.split(".", 1)[0] for key in teacher_added if key.startswith(self._ADDABLE_MODULES)}:
+            getattr(teacher, name).load_state_dict(getattr(student, name).state_dict())
+        added_rope = sorted({key for key in added if key.endswith("rope_embed.mix_frequencies")})
+        if added_rope and self.is_main_process:
+            print(f"Warm-started {len(added_rope)} mixed-RoPE frequency tensors from the axial layout")
+        if any(key.startswith(self._ADDABLE_MODULES) for key in added):
+            # Heads added to an existing run: their loss ramp starts at the next step.
+            self.object_heads_start_step = int(checkpoint.get("step", -1)) + 1
+            if self.is_main_process:
+                print(
+                    f"Initialized modules absent from the checkpoint: "
+                    f"{sorted({key.split('.', 1)[0] for key in added if key.startswith(self._ADDABLE_MODULES)})} "
+                    f"(start step {self.object_heads_start_step})"
+                )
+        else:
+            self.object_heads_start_step = int(checkpoint.get("object_heads_start_step", 0))
         if "optimizer" in checkpoint:
-            self.optimizer.load_state_dict(checkpoint["optimizer"])
+            self._load_optimizer_state(checkpoint["optimizer"], added)
             self._optimizer_to_device()
         if checkpoint.get("scaler") is not None and self.scaler.is_enabled():
             self.scaler.load_state_dict(checkpoint["scaler"])
@@ -1772,7 +2020,7 @@ class DinoIBOTPretrainer:
         sample_index: int,
         target_hw: tuple[int, int],
         input_spatial_shape: tuple[int, int, int],
-    ) -> np.ndarray:
+    ) -> list[np.ndarray]:
         feature_shape = self._feature_map_shape(
             self.model_module.student.backbone,
             input_spatial_shape,
@@ -1780,20 +2028,39 @@ class DinoIBOTPretrainer:
         )
         feature_map = patch_tokens[sample_index].reshape(*feature_shape, patch_tokens.shape[-1])
         depth = feature_map.shape[0] // 2
-        slice_features = feature_map[depth].float()
-        h, w, c = slice_features.shape
-        flat = slice_features.reshape(h * w, c)
+        resized = []
+        for result in self._pca_rgb(feature_map[depth]):
+            image = F.interpolate(
+                torch.from_numpy(result).permute(2, 0, 1).float()[None],
+                size=target_hw,
+                mode="bilinear",
+                align_corners=False,
+            )
+            resized.append(image[0].permute(1, 2, 0).numpy().astype(np.uint8))
+        return resized
+
+    def _pca_rgb(self, features: torch.Tensor) -> list[np.ndarray]:
+        """[H, W, C] features -> one [H, W, 3] uint8 image per set of three principal
+        components (1-3, 4-6, ...), `monitor_pca_sets` images in all."""
+        h, w, c = features.shape
+        flat = features.float().reshape(h * w, c)
         flat = flat - flat.mean(dim=0)
-        _, _, V = torch.pca_lowrank(flat, q=3)
-        projected = (flat @ V[:, :3]).reshape(h, w, 3).detach().cpu().numpy()
-        result = np.stack([self._normalize_image(projected[..., i]) for i in range(3)], axis=-1)
-        resized = F.interpolate(
-            torch.from_numpy(result).permute(2, 0, 1).float()[None],
-            size=target_hw,
-            mode="bilinear",
-            align_corners=False,
-        )
-        return resized[0].permute(1, 2, 0).numpy().astype(np.uint8)
+        components = 3 * self.monitor_pca_sets
+        rank = min(components, h * w, c)
+        _, _, V = torch.pca_lowrank(flat, q=rank)
+        projected = (flat @ V[:, :rank]).reshape(h, w, rank).detach().cpu().numpy()
+        channels = [self._normalize_image(projected[..., i]) if i < rank else np.zeros((h, w), dtype=np.uint8)
+                    for i in range(components)]
+        return [np.stack(channels[i:i + 3], axis=-1) for i in range(0, components, 3)]
+
+    @staticmethod
+    def _center_slice_points(n_views: int, spatial: tuple[int, int, int], device: torch.device) -> torch.Tensor:
+        """[n_views, H * W, 3] voxel coordinates of every voxel on the center z slice."""
+        depth, height, width = spatial
+        y, x = torch.meshgrid(torch.arange(height, device=device), torch.arange(width, device=device), indexing="ij")
+        z = torch.full_like(y, depth // 2)
+        points = torch.stack([z, y, x], dim=-1).reshape(1, height * width, 3).float()
+        return points.expand(n_views, -1, -1).contiguous()
 
     def _monitor_subset(self, batch: Mapping[str, Any]) -> dict[str, Any]:
         """The first monitor_batch_size samples of a collated batch, for save_monitor_image."""
@@ -1809,12 +2076,21 @@ class DinoIBOTPretrainer:
 
     def save_monitor_image(self, monitor_batch: Mapping[str, Any], step: int, metrics: Mapping[str, float]) -> Path:
         self.model.eval()
+        # Per view: the input's center slice, then PCA sets of the patch tokens and, with
+        # the dense point head, of its embedding at every voxel of that slice (colors are
+        # comparable only within one panel).
+        dense_panels = self.model_module.dense_enabled
         with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp):
             global_crops = monitor_batch["collated_global_crops"].to(self.device, non_blocking=True)
             student_outputs = self.model(
                 student_input=global_crops,
                 student_masks=None,
                 return_teacher=False,
+                point_coordinates=(
+                    self._center_slice_points(global_crops.shape[0], tuple(global_crops.shape[2:]), self.device)
+                    if dense_panels
+                    else None
+                ),
             )["student"]
 
         global_views = monitor_batch["collated_global_crops"]
@@ -1828,14 +2104,17 @@ class DinoIBOTPretrainer:
             for view_index in range(n_global_views):
                 tensor_index = view_index * batch_size + sample_index
                 center_slice = self._center_slice(global_views[tensor_index])
-                pca_rgb = self._patch_pca_slice(
+                token_panels = self._patch_pca_slice(
                     student_outputs["patch_tokens"],
                     tensor_index,
                     target_hw=center_slice.shape,
                     input_spatial_shape=tuple(int(dim) for dim in global_views[tensor_index].shape[1:]),
                 )
                 input_rgb = np.stack([self._normalize_image(center_slice)] * 3, axis=-1)
-                panels.extend([input_rgb, pca_rgb])
+                panels.extend([input_rgb, *token_panels])
+                if dense_panels:
+                    dense = student_outputs["object_points"]["dense"][tensor_index]
+                    panels.extend(self._pca_rgb(dense.reshape(*center_slice.shape, dense.shape[-1])))
             rows.append(np.concatenate(panels, axis=1))
 
         canvas = np.concatenate(rows, axis=0) if rows else np.zeros((256, 256, 3), dtype=np.uint8)
@@ -2019,15 +2298,18 @@ class DinoIBOTPretrainer:
         progress = tqdm(total=self.max_iterations, initial=start_step, desc="training", unit="iter") if self.is_main_process else None
         try:
             for step in range(start_step, self.max_iterations):
-                try:
-                    batch = next(dataloader_iter)
-                except StopIteration:
-                    self._train_sampler_epoch += 1
-                    self._set_sampler_epoch(dataloader, self._train_sampler_epoch)
-                    dataloader_iter = iter(dataloader)
-                    batch = next(dataloader_iter)
+                micro_batches = []
+                for _ in range(self.grad_accumulation_steps):
+                    try:
+                        micro_batches.append(next(dataloader_iter))
+                    except StopIteration:
+                        self._train_sampler_epoch += 1
+                        self._set_sampler_epoch(dataloader, self._train_sampler_epoch)
+                        dataloader_iter = iter(dataloader)
+                        micro_batches.append(next(dataloader_iter))
+                batch = micro_batches[-1]
 
-                metrics = self._average_metrics(self.train_step(batch, step))
+                metrics = self._average_metrics(self.train_step(micro_batches, step))
                 if progress is not None:
                     progress.set_postfix(
                         loss=f"{metrics['loss']:.4f}",
@@ -2037,6 +2319,20 @@ class DinoIBOTPretrainer:
                         koleo_loss=f"{metrics['koleo_loss']:.4f}",
                         gram_loss=f"{metrics['gram_loss']:.4f}",
                         point_loss=f"{metrics['point_loss']:.4f}",
+                        **(
+                            {
+                                "obj_pt": f"{metrics['object_point_loss']:.3f}",
+                                "obj": f"{metrics['object_loss']:.3f}",
+                                "obj_reg": f"{metrics['object_region_loss']:.3f}",
+                            }
+                            if self.do_object_losses
+                            else {}
+                        ),
+                        **(
+                            {"ibot_tgt": f"{metrics['ibot_target_fraction']:.2f}"}
+                            if self.ibot_targets == "cross_view"
+                            else {}
+                        ),
                     )
                     progress.update(1)
                 if self.is_main_process:

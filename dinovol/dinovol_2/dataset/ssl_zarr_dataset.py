@@ -19,10 +19,12 @@ import torch
 import torch.nn.functional as F
 import zarr
 from fsspec.asyn import sync
+from scipy import ndimage as ndi
 from scipy.ndimage import binary_dilation
 from torch.utils.data import Dataset
 
 from dinovol_2.augmentation.pipelines import create_training_transforms
+from dinovol_2.dataset.object_labels import FIBER_KIND, SHEET_KIND, decode_fiber_directions, slab_objects
 from dinovol_2.dataset.normalization import get_normalization
 from dinovol_2.dataset.point_annotations import (
     load_point_collection,
@@ -54,6 +56,68 @@ def read_with_retries(read, retries, backoff=1.0):
             time.sleep(delay)
 
 
+def _otsu_threshold(values: np.ndarray, bins: int = 256) -> float:
+    hist, edges = np.histogram(values, bins=bins)
+    centers = (edges[:-1] + edges[1:]) / 2
+    below = np.cumsum(hist)
+    above = below[-1] - below
+    sum_below = np.cumsum(hist * centers)
+    mean_below = sum_below / np.maximum(below, 1)
+    mean_above = (sum_below[-1] - sum_below) / np.maximum(above, 1)
+    return float(centers[np.argmax(below * above * (mean_below - mean_above) ** 2)])
+
+
+def object_mask_cells(means: np.ndarray, nonzero: np.ndarray, closing: int) -> np.ndarray:
+    """Scanned-object mask on coarse cells from their mean intensity and any-nonzero flag.
+
+    Masked volumes are zero outside a dilated object mask; inside it, tissue is separated
+    from the surrounding air by an Otsu threshold, closed over `closing` cells (the gaps
+    between wraps), and holes are filled per z slice and in 3D. Components smaller than 1%
+    of the largest are dropped.
+    """
+    if not nonzero.any():
+        return np.zeros_like(nonzero)
+    tissue = means > _otsu_threshold(means[nonzero])
+    padded = np.pad(tissue, closing)  # closing must not erode the object where it meets the volume edge
+    closed = ndi.binary_closing(padded, structure=ndi.generate_binary_structure(3, 1), iterations=closing)
+    closed = closed[(slice(closing, -closing),) * 3]
+    filled = ndi.binary_fill_holes(np.stack([ndi.binary_fill_holes(plane) for plane in closed]))
+    labels, count = ndi.label(filled)
+    if count > 1:
+        sizes = ndi.sum(filled, labels, range(1, count + 1))
+        filled = np.isin(labels, 1 + np.flatnonzero(sizes >= 0.01 * sizes.max()))
+    return filled & nonzero
+
+
+def window_start_cells(inside: np.ndarray, factor: int, window, lo, hi):
+    """Cells c such that every window start in [c * factor, (c + 1) * factor) gives a window
+    inside `inside` (cells of `factor` voxels at the origin) and within voxels [lo, hi).
+
+    A window starting anywhere in a cell covers up to n = (factor + window - 2) // factor + 1
+    cells along each axis.
+    """
+    window = np.asarray(window)
+    n = (factor + window - 2) // factor + 1
+    shape = np.asarray(inside.shape)
+    out = np.zeros(inside.shape, dtype=bool)
+    span = shape - n + 1
+    if np.any(span <= 0):
+        return out
+    # all(inside[c : c + n]) per axis via a summed-volume table
+    table = np.pad(inside.astype(np.int32), ((1, 0), (1, 0), (1, 0))).cumsum(0).cumsum(1).cumsum(2)
+    a = [slice(0, s) for s in span]
+    b = [slice(k, k + s) for k, s in zip(n, span)]
+    total = (
+        table[b[0], b[1], b[2]] - table[a[0], b[1], b[2]] - table[b[0], a[1], b[2]] - table[b[0], b[1], a[2]]
+        + table[a[0], a[1], b[2]] + table[a[0], b[1], a[2]] + table[b[0], a[1], a[2]] - table[a[0], a[1], a[2]]
+    )
+    full = total == int(np.prod(n))
+    cell = [np.arange(s) for s in span]
+    ok = [(c * factor >= l) & (c * factor + factor - 1 + w <= h) for c, l, h, w in zip(cell, lo, hi, window)]
+    out[tuple(slice(0, s) for s in span)] = full & ok[0][:, None, None] & ok[1][None, :, None] & ok[2][None, None, :]
+    return out
+
+
 @dataclass
 class Volume:
     usable_bbox: tuple  # (z0, y0, x0, z1, y1, x1)
@@ -68,6 +132,29 @@ class Volume:
     occupancy: np.ndarray | None = None
     occupancy_origin: tuple[int, int, int] | None = None
     occupancy_factor: int = 1
+    # Object mask (see object_mask in the config): cells of occupancy_factor**3 voxels where
+    # a source window may start so that it lies entirely inside the scanned object.
+    # Bit-packed along x over a [start_cells_shape] block at absolute cell start_cells_origin.
+    pixel_size_um: float | None = None
+    start_cells: np.ndarray | None = None
+    start_cells_origin: tuple[int, int, int] | None = None
+    start_cells_shape: tuple[int, int, int] | None = None
+    # Pseudo-object label sources aligned with the selected scale (see object_points).
+    surface_path: str | None = None
+    surface_level: int = 0
+    fiber_paths: tuple[str, str, str] | None = None  # presence, nx, ny
+    fiber_level: int = 0
+    fiber_factor: int = 1  # selected-scale voxels per fiber voxel
+
+
+@dataclass
+class ObjectPoints:
+    """Points of one sample in source-window coordinates with their pseudo-objects."""
+
+    source: np.ndarray  # [P, 3] float32 voxel coordinates in the source window
+    objects: np.ndarray  # [P] int64, 0 = unlabeled
+    kinds: np.ndarray  # [P] int8, 0 = unlabeled, SHEET_KIND, FIBER_KIND
+    negatives: np.ndarray  # [M + 1, M + 1] bool, provably different objects
 
 
 @dataclass(frozen=True)
@@ -273,6 +360,20 @@ class SSLZarrDataset(Dataset):
         # occupancy_level: pyramid level whose nonzero voxels mark where source crops can
         # reach nonzero_threshold, so crops below it are rejected before any read.
         self.occupancy_level = self.config.get("occupancy_level")
+        # object_mask: source windows start only where the whole window lies inside the
+        # scanned object (the scroll body, not the object-loss pseudo-objects), found on the
+        # occupancy_level of the (already SAM2-masked) volume: voxels above an Otsu threshold,
+        # closed over gap_um so the space between wraps counts as inside, holes filled. It
+        # replaces vol_trim_pct; only the bottom and top z_trim_pct of z slices are excluded.
+        object_mask = dict(self.config.get("object_mask") or {})
+        self.object_mask_enabled = bool(object_mask.get("enabled", False))
+        self.object_mask_gap_um = float(object_mask.get("gap_um", 300.0))
+        self.object_mask_z_trim_pct = float(object_mask.get("z_trim_pct", 0.05))
+        if self.object_mask_enabled:
+            if self.occupancy_level is None:
+                raise ValueError("object_mask requires occupancy_level (the pyramid level the mask is computed on)")
+            if not 0.0 <= self.object_mask_z_trim_pct < 0.5:
+                raise ValueError(f"object_mask.z_trim_pct must be in [0, 0.5), got {self.object_mask_z_trim_pct}")
         # read_ahead: source crops each process reads in background threads while it
         # augments the current sample. Their locations are drawn in the calling thread.
         self.read_ahead = int(self.config.get("read_ahead", 0))
@@ -289,6 +390,32 @@ class SSLZarrDataset(Dataset):
         self._atexit_pid: int | None = None
         self._read_executor: ThreadPoolExecutor | None = None
         self._pending_reads: deque = deque()
+        # object_points: points with pseudo-object labels (sheets from surface
+        # predictions, fibers from fiber predictions) computed on a thin z slab inside
+        # both global crops, carried into each view like keypoints.
+        object_points = dict(self.config.get("object_points") or {})
+        self.object_points_enabled = bool(object_points.get("enabled", False)) and not self.single_crop_only
+        self.points_per_sample = int(object_points.get("points_per_sample", 1024))
+        self.max_labeled_points = int(object_points.get("max_labeled_points", 512))
+        self.points_per_object = int(object_points.get("points_per_object", 16))
+        self.max_objects = int(object_points.get("max_objects", 64))
+        self.slab_thickness = int(object_points.get("slab_thickness", 16))
+        self.fiber_presence_threshold = float(object_points.get("presence_threshold", 127))
+        if self.object_points_enabled and self.max_labeled_points > self.points_per_sample:
+            raise ValueError("object_points.max_labeled_points must not exceed points_per_sample")
+        # cross_view_token_patch_size: when set, each global view also carries, for every
+        # token, the coordinates of its center in the other global view (cross-view iBOT
+        # targets). Both views' spatial augmentations must map token centers onto token
+        # centers (flips, right-angle rotations, transposes of a cubic crop).
+        token_patch = self.config.get("cross_view_token_patch_size")
+        self.cross_view_token_patch_size = None
+        if token_patch is not None and not self.single_crop_only:
+            token_patch = tuple(int(p) for p in token_patch)
+            if len(token_patch) != 3 or any(c % p for c, p in zip(self.global_crop_size, token_patch)):
+                raise ValueError(
+                    f"cross_view_token_patch_size {token_patch} must divide global_crop_size {self.global_crop_size}"
+                )
+            self.cross_view_token_patch_size = token_patch
 
         if not self.single_crop_only:
             if self.num_global_crops != 2:
@@ -310,11 +437,20 @@ class SSLZarrDataset(Dataset):
                 f"got source_sampling_size={self.source_sampling_size} and required={required_source_sampling_size}"
             )
         # gaussian_blur: false removes blur, which erases one-voxel structures.
-        gaussian_blur = bool(self.config.get("gaussian_blur", True))
-        self.global_transforms = [create_training_transforms(self.global_crop_size, gaussian_blur=gaussian_blur)
+        # augmentation: "dino" keeps only flips, right-angle rotations, transposes and
+        # brightness/contrast jitter on top of the random resized crops; "full"
+        # (default) is the complete pipeline.
+        augmentation = str(self.config.get("augmentation", "full"))
+        if augmentation not in ("full", "dino"):
+            raise ValueError(f"augmentation must be 'full' or 'dino', got {augmentation!r}")
+        transform_options = {
+            "gaussian_blur": bool(self.config.get("gaussian_blur", True)),
+            "dino_only": augmentation == "dino",
+        }
+        self.global_transforms = [create_training_transforms(self.global_crop_size, **transform_options)
                                   for _ in range(self.num_global_crops)]
         self.local_transforms = (
-            [create_training_transforms(self.local_crop_size, gaussian_blur=gaussian_blur)
+            [create_training_transforms(self.local_crop_size, **transform_options)
              for _ in range(self.num_local_crops)]
             if self.local_crop_size is not None
             else []
@@ -329,15 +465,20 @@ class SSLZarrDataset(Dataset):
             try:
                 d_zarr = handle.array
                 z, y, x = d_zarr.shape
-                k_z = max(1, round(z * self.vol_trim_pct))
-                k_y = max(1, round(y * self.vol_trim_pct))
-                k_x = max(1, round(x * self.vol_trim_pct))
-                z0 = (z - k_z) // 2
-                y0 = (y - k_y) // 2
-                x0 = (x - k_x) // 2
-                z1 = (z0 + k_z)
-                y1 = (y0 + k_y)
-                x1 = (x0 + k_x)
+                if self.object_mask_enabled:
+                    z0 = int(math.ceil(z * self.object_mask_z_trim_pct))
+                    z1 = z - z0
+                    y0, y1, x0, x1 = 0, y, 0, x
+                else:
+                    k_z = max(1, round(z * self.vol_trim_pct))
+                    k_y = max(1, round(y * self.vol_trim_pct))
+                    k_x = max(1, round(x * self.vol_trim_pct))
+                    z0 = (z - k_z) // 2
+                    y0 = (y - k_y) // 2
+                    x0 = (x - k_x) // 2
+                    z1 = (z0 + k_z)
+                    y1 = (y0 + k_y)
+                    x1 = (x0 + k_x)
                 usable_bbox = (z0, y0, x0, z1, y1, x1)
                 crop_z, crop_y, crop_x = self.source_sampling_size
                 valid_z = max(0, (z1 - z0) - crop_z + 1)
@@ -350,6 +491,13 @@ class SSLZarrDataset(Dataset):
                     selected_shape=(z, y, x),
                     usable_bbox=usable_bbox,
                 )
+                fiber_paths = None
+                if dataset.get("fiber_presence_path"):
+                    fiber_paths = (
+                        str(dataset["fiber_presence_path"]),
+                        str(dataset["fiber_nx_path"]),
+                        str(dataset["fiber_ny_path"]),
+                    )
                 self.volumes.append(Volume(
                     path=str(volume_path),
                     scale=volume_scale,
@@ -357,13 +505,21 @@ class SSLZarrDataset(Dataset):
                     valid_crop_starts=valid_crop_starts,
                     point_coordinates=point_coordinates,
                     point_type_ids=point_type_ids,
+                    surface_path=dataset.get("surface_path"),
+                    surface_level=int(dataset.get("surface_level", 0)),
+                    fiber_paths=fiber_paths,
+                    fiber_level=int(dataset.get("fiber_level", 0)),
+                    fiber_factor=int(dataset.get("fiber_factor", 1)),
+                    pixel_size_um=dataset.get("pixel_size_um"),
                 ))
             finally:
                 handle.close()
 
         if self.occupancy_level is not None:
+            # Windows inside the object mask are fully occupied: the occupancy check is moot.
+            loader = self._load_object_mask if self.object_mask_enabled else self._load_occupancy
             with ThreadPoolExecutor(max_workers=min(8, len(self.volumes))) as executor:
-                list(executor.map(self._load_occupancy, self.volumes))
+                list(executor.map(loader, self.volumes))
 
         self.total_valid_crop_starts = sum(vol.valid_crop_starts for vol in self.volumes)
         if self.total_valid_crop_starts <= 0:
@@ -429,24 +585,30 @@ class SSLZarrDataset(Dataset):
 
     def _load_occupancy(self, volume: Volume) -> None:
         level = int(self.occupancy_level)
-        factor = 2 ** (level - int(volume.scale))
-        if factor < 1:
+        read_factor = 2 ** (level - int(volume.scale))
+        if read_factor < 1:
             raise ValueError(f"occupancy_level {level} must not be finer than volume_scale {volume.scale}")
+        # Cells cover 2**occupancy_level selected-scale voxels on every volume; a volume
+        # selected below full resolution reads the same level and max-pools it.
+        pool = max(1, 2 ** level // read_factor)
+        factor = read_factor * pool
         bbox_lo = np.asarray(volume.usable_bbox[:3]) // factor
         bbox_hi = -(-np.asarray(volume.usable_bbox[3:]) // factor)
         handle = open_zarr_handle(volume.path, level, self.volume_auth, self.s3_storage_options)
         try:
             array = handle.array
             # Read one extra cell on each side for the dilation below.
-            read_lo = np.maximum(bbox_lo - 1, 0)
-            read_hi = np.minimum(bbox_hi + 1, array.shape)
-            coarse = np.zeros(tuple(bbox_hi - bbox_lo + 2), dtype=bool)
+            read_lo = np.maximum((bbox_lo - 1) * pool, 0)
+            read_hi = np.minimum((bbox_hi + 1) * pool, array.shape)
+            fine = np.zeros(tuple((bbox_hi - bbox_lo + 2) * pool), dtype=bool)
             selection = tuple(slice(int(a), int(b)) for a, b in zip(read_lo, read_hi))
             values = read_with_retries(
                 lambda: np.asarray(array[selection]), self.read_retries, self.read_retry_backoff
             )
-            offset = read_lo - (bbox_lo - 1)
-            coarse[tuple(slice(int(o), int(o) + n) for o, n in zip(offset, values.shape))] = values > 0
+            offset = read_lo - (bbox_lo - 1) * pool
+            fine[tuple(slice(int(o), int(o) + n) for o, n in zip(offset, values.shape))] = values > 0
+            shape = bbox_hi - bbox_lo + 2
+            coarse = fine.reshape(shape[0], pool, shape[1], pool, shape[2], pool).any(axis=(1, 3, 5))
         finally:
             handle.close()
         # Downsampling can round sparse cells to zero; one cell of dilation keeps every
@@ -455,6 +617,75 @@ class SSLZarrDataset(Dataset):
         volume.occupancy = np.ascontiguousarray(coarse[1:-1, 1:-1, 1:-1])
         volume.occupancy_origin = tuple(int(v) for v in bbox_lo)
         volume.occupancy_factor = factor
+
+    def _load_object_mask(self, volume: Volume) -> None:
+        if volume.pixel_size_um is None:
+            raise ValueError(f"object_mask needs pixel_size_um for {volume.path}")
+        level = int(self.occupancy_level)
+        read_factor = 2 ** (level - int(volume.scale))
+        if read_factor < 1:
+            raise ValueError(f"occupancy_level {level} must not be finer than volume_scale {volume.scale}")
+        # Same cells as the occupancy grid: 2**occupancy_level selected-scale voxels.
+        pool = max(1, 2 ** level // read_factor)
+        factor = read_factor * pool
+        handle = open_zarr_handle(volume.path, level, self.volume_auth, self.s3_storage_options)
+        try:
+            array = handle.array
+            cells = -(-np.asarray(array.shape) // pool)
+            means = np.zeros(tuple(cells), dtype=np.float32)
+            nonzero = np.zeros(tuple(cells), dtype=bool)
+            slab = 64 * pool  # z planes per read: the finest levels are too large to hold at once
+            for z in range(0, array.shape[0], slab):
+                values = read_with_retries(
+                    lambda z=z: np.asarray(array[z:z + slab]), self.read_retries, self.read_retry_backoff
+                )
+                padded = np.zeros(tuple(-(-n // pool) * pool for n in values.shape), dtype=values.dtype)
+                padded[tuple(slice(0, n) for n in values.shape)] = values
+                blocks = padded.reshape(
+                    padded.shape[0] // pool, pool, padded.shape[1] // pool, pool, padded.shape[2] // pool, pool
+                )
+                rows = slice(z // pool, z // pool + blocks.shape[0])
+                means[rows] = blocks.mean(axis=(1, 3, 5), dtype=np.float32)
+                nonzero[rows] = (blocks > 0).any(axis=(1, 3, 5))
+        finally:
+            handle.close()
+        closing = max(1, round(self.object_mask_gap_um / (float(volume.pixel_size_um) * factor)))
+        inside = object_mask_cells(means, nonzero, closing)
+        bbox = np.asarray(volume.usable_bbox)
+        starts = window_start_cells(inside, factor, self.source_sampling_size, bbox[:3], bbox[3:])
+        volume.occupancy = None
+        volume.occupancy_factor = factor
+        volume.valid_crop_starts = int(starts.sum()) * factor ** 3
+        if starts.any():
+            nz = np.nonzero(starts)
+            lo = np.array([a.min() for a in nz]); hi = np.array([a.max() for a in nz]) + 1
+            block = starts[tuple(slice(a, b) for a, b in zip(lo, hi))]
+            volume.start_cells = np.packbits(block, axis=2)
+            volume.start_cells_origin = tuple(int(v) for v in lo)
+            volume.start_cells_shape = tuple(int(v) for v in block.shape)
+        else:
+            print(f"object_mask: no source window fits inside the object of {volume.path}; volume skipped", flush=True)
+
+    def _start_allowed(self, volume: Volume, starts) -> bool:
+        """Whether a source window at these starts lies inside the object mask."""
+        cell = np.asarray(starts) // volume.occupancy_factor - np.asarray(volume.start_cells_origin)
+        if np.any(cell < 0) or np.any(cell >= np.asarray(volume.start_cells_shape)):
+            return False
+        z, y, x = (int(v) for v in cell)
+        return bool((volume.start_cells[z, y, x >> 3] >> (7 - (x & 7))) & 1)
+
+    def _sample_object_start(self, volume: Volume):
+        """Uniform over the window starts that keep the whole window inside the object mask."""
+        shape = volume.start_cells_shape
+        factor = volume.occupancy_factor
+        while True:
+            z, y, x = (np.random.randint(n) for n in shape)
+            if (volume.start_cells[z, y, x >> 3] >> (7 - (x & 7))) & 1:
+                break
+        return tuple(
+            int((origin + cell) * factor + np.random.randint(factor))
+            for origin, cell in zip(volume.start_cells_origin, (z, y, x))
+        )
 
     def _occupied_fraction(self, volume: Volume, starts) -> float:
         """Fraction of the source window inside occupied cells, an upper bound on its nonzero fraction."""
@@ -497,13 +728,108 @@ class SSLZarrDataset(Dataset):
         self._register_close_hook()
 
     def _get_volume_array(self, volume: Volume):
+        return self._get_array(volume.path, volume.scale)
+
+    def _get_array(self, path, level):
         self._ensure_process_local_handles()
-        key = (volume.path, volume.scale)
+        key = (str(path), int(level))
         handle = self._volume_handles.get(key)
         if handle is None:
-            handle = open_zarr_handle(volume.path, volume.scale, self.volume_auth, self.s3_storage_options)
+            handle = open_zarr_handle(path, level, self.volume_auth, self.s3_storage_options)
             self._volume_handles[key] = handle
         return handle.array
+
+    def _read_region(self, array, lo, hi):
+        selection = tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))
+        return read_with_retries(lambda: np.asarray(array[selection]), self.read_retries, self.read_retry_backoff)
+
+    def _read_coarse_region(self, array, lo, hi, factor):
+        """Read [lo, hi) of the selected-scale grid from an array `factor` times coarser."""
+        lo, hi = np.asarray(lo), np.asarray(hi)
+        coarse_lo = lo // factor
+        coarse_hi = -(-hi // factor)
+        values = self._read_region(array, coarse_lo, coarse_hi)
+        for axis in range(3):
+            values = values.repeat(factor, axis=axis)
+        offset = lo - coarse_lo * factor
+        return values[tuple(slice(int(o), int(o) + int(n)) for o, n in zip(offset, hi - lo))]
+
+    def _sample_object_points(self, volume: Volume, window_starts, crop_regions) -> ObjectPoints:
+        """Points inside both global crops; labeled ones come from one thin z slab."""
+        overlap_lo = np.max([region.starts for region in crop_regions], axis=0)
+        overlap_hi = np.min([np.add(region.starts, region.shape) for region in crop_regions], axis=0)
+        if np.any(overlap_hi <= overlap_lo):
+            raise RuntimeError("Global crops of one source window must overlap.")
+        thickness = min(self.slab_thickness, int(overlap_hi[0] - overlap_lo[0]))
+        slab_lo = overlap_lo.copy()
+        slab_lo[0] = np.random.randint(overlap_lo[0], overlap_hi[0] - thickness + 1)
+        slab_hi = overlap_hi.copy()
+        slab_hi[0] = slab_lo[0] + thickness
+        absolute_lo = np.asarray(window_starts) + slab_lo
+        absolute_hi = np.asarray(window_starts) + slab_hi
+
+        surface = None
+        if volume.surface_path:
+            surface = self._read_region(self._get_array(volume.surface_path, volume.surface_level), absolute_lo, absolute_hi)
+        presence = direction = None
+        if volume.fiber_paths is not None:
+            presence_path, nx_path, ny_path = volume.fiber_paths
+            presence = self._read_coarse_region(
+                self._get_array(presence_path, volume.fiber_level), absolute_lo, absolute_hi, volume.fiber_factor
+            )
+            nx = self._read_coarse_region(self._get_array(nx_path, volume.fiber_level), absolute_lo, absolute_hi, volume.fiber_factor)
+            ny = self._read_coarse_region(self._get_array(ny_path, volume.fiber_level), absolute_lo, absolute_hi, volume.fiber_factor)
+            direction = decode_fiber_directions(nx, ny)
+
+        sources, objects, kinds = [], [], []
+        negatives = np.zeros((self.max_objects + 1, self.max_objects + 1), dtype=bool)
+        if surface is not None or presence is not None:
+            labels = slab_objects(
+                surface,
+                presence,
+                direction,
+                presence_threshold=self.fiber_presence_threshold,
+                rng=np.random.default_rng(np.random.randint(2**31)),
+            )
+            # Keep up to half the object budget for each kind, the rest for the other.
+            n_sheets = min(labels.n_sheets, max(self.max_objects // 2, self.max_objects - labels.n_fibers))
+            n_fibers = min(labels.n_fibers, self.max_objects - n_sheets)
+            new_id = {}
+            budget = self.max_labeled_points
+            candidates = [(SHEET_KIND, labels.sheet_labels, label, label) for label in range(1, n_sheets + 1)]
+            candidates += [
+                (FIBER_KIND, labels.fiber_labels, label, label + labels.n_sheets) for label in range(1, n_fibers + 1)
+            ]
+            for order in np.random.permutation(len(candidates)):
+                kind, label_volume, label, combined = candidates[order]
+                if budget <= 0:
+                    break
+                voxels = np.argwhere(label_volume == label)
+                take = min(self.points_per_object, len(voxels), budget)
+                chosen = voxels[np.random.choice(len(voxels), take, replace=False)]
+                new_id[combined] = len(new_id) + 1
+                sources.append(chosen.astype(np.float32) + slab_lo)
+                objects.append(np.full(take, new_id[combined], dtype=np.int64))
+                kinds.append(np.full(take, kind, dtype=np.int8))
+                budget -= take
+            for a, b in labels.negative_pairs:
+                if a in new_id and b in new_id:
+                    negatives[new_id[a], new_id[b]] = negatives[new_id[b], new_id[a]] = True
+
+        labeled = sum(len(points) for points in sources)
+        unlabeled = self.points_per_sample - labeled
+        # Unlabeled points anywhere in the crops' overlap (label-free correspondence).
+        sources.append(
+            (np.random.randint(overlap_lo, overlap_hi, size=(unlabeled, 3))).astype(np.float32)
+        )
+        objects.append(np.zeros(unlabeled, dtype=np.int64))
+        kinds.append(np.zeros(unlabeled, dtype=np.int8))
+        return ObjectPoints(
+            source=np.concatenate(sources),
+            objects=np.concatenate(objects),
+            kinds=np.concatenate(kinds),
+            negatives=negatives,
+        )
 
     def close(self) -> None:
         executor = getattr(self, "_read_executor", None)
@@ -800,8 +1126,12 @@ class SSLZarrDataset(Dataset):
                     vol.usable_bbox,
                     vol.point_coordinates[anchor_index],
                 )
+            elif self.object_mask_enabled:
+                starts = self._sample_object_start(vol)
             else:
                 starts = self._sample_source_start(vol.usable_bbox)
+            if self.object_mask_enabled and not self._start_allowed(vol, starts):
+                continue  # point-centered windows that would leave the object
             # The occupied fraction bounds the nonzero fraction from above, so this
             # skips only windows the check after reading would reject.
             if vol.occupancy is not None and self._occupied_fraction(vol, starts) < nonzero_threshold:
@@ -849,20 +1179,31 @@ class SSLZarrDataset(Dataset):
         gram_teacher_views = []
         global_point_coordinates = []
         global_point_type_ids = []
-        for transform in self.global_transforms:
+        object_points = None
+        object_point_views = []
+        crop_regions = [None] * len(self.global_transforms)
+        token_keypoints = []
+        if self.object_points_enabled or self.cross_view_token_patch_size is not None:
+            # Object points and token correspondences need both regions first.
+            crop_regions = [self._sample_global_crop_region(source_crop, vol, anchor_index, source_starts)
+                            for _ in self.global_transforms]
+        if self.object_points_enabled:
+            object_points = self._sample_object_points(vol, plan.starts, crop_regions)
+        for view_index, (transform, crop_region) in enumerate(zip(self.global_transforms, crop_regions)):
             # Sample one shared region so the student and Gram teacher observe the
             # exact same 3D field of view, optionally at different resolutions.
-            crop_region = self._sample_random_resized_crop_region(
-                source_crop.shape,
-                self.global_crop_scale,
-                self.paired_global_crop_size,
-                anchor=(
-                    vol.point_coordinates[anchor_index] - np.asarray(source_starts, dtype=np.float64)
-                    if anchor_index is not None
-                    else None
-                ),
-                anchor_target_size=self.global_crop_size if anchor_index is not None else None,
-            )
+            if crop_region is None:
+                crop_region = self._sample_global_crop_region(source_crop, vol, anchor_index, source_starts)
+            extra_keypoints = None
+            if self.cross_view_token_patch_size is not None:
+                # This view's token centers, then the other view's token centers mapped
+                # into this view (both before augmentation).
+                centers = self._token_centers()
+                other_region = crop_regions[1 - view_index]
+                other_centers = self._map_points_to_view(
+                    self._view_to_source(centers, other_region), crop_region, self.global_crop_size
+                )
+                extra_keypoints = torch.cat([centers, other_centers])
             global_view = self._materialize_crop_from_region(source_crop, crop_region, self.global_crop_size)
             gram_teacher_view = None
             if self.gram_teacher_crop_size is not None:
@@ -871,7 +1212,14 @@ class SSLZarrDataset(Dataset):
                     crop_region,
                     self.gram_teacher_crop_size,
                 )
-            if anchor_index is not None:
+            if object_points is not None:
+                global_view, gram_teacher_view, view_points = self._transform_object_points(
+                    transform, global_view, gram_teacher_view, object_points, crop_region, vol, anchor_index,
+                    source_starts, extra_keypoints=extra_keypoints,
+                )
+                point_coordinates, point_type_ids, object_point_coordinates, extra_keypoints = view_points
+                object_point_views.append(object_point_coordinates)
+            elif anchor_index is not None:
                 point_coordinates, point_type_ids = self._visible_points_for_crop(
                     vol,
                     source_starts,
@@ -879,14 +1227,22 @@ class SSLZarrDataset(Dataset):
                     anchor_index,
                 )
                 if self.do_augmentations:
-                    global_view, gram_teacher_view, point_coordinates = (
+                    n_points = point_coordinates.shape[0]
+                    keypoints = point_coordinates if extra_keypoints is None else torch.cat(
+                        [point_coordinates, extra_keypoints]
+                    )
+                    global_view, gram_teacher_view, keypoints = (
                         self._apply_paired_global_transform_with_points(
                             transform,
                             global_view,
                             gram_teacher_view,
-                            point_coordinates,
+                            keypoints,
                         )
                     )
+                    keypoints = torch.as_tensor(keypoints, dtype=torch.float32)
+                    point_coordinates = keypoints[:n_points]
+                    if extra_keypoints is not None:
+                        extra_keypoints = keypoints[n_points:]
                 point_coordinates, point_type_ids = self._filter_and_cap_view_points(
                     point_coordinates,
                     point_type_ids,
@@ -894,12 +1250,19 @@ class SSLZarrDataset(Dataset):
             else:
                 point_coordinates = torch.empty((0, 3), dtype=torch.float32)
                 point_type_ids = torch.empty((0,), dtype=torch.long)
-                if self.do_augmentations:
+                if self.do_augmentations and extra_keypoints is not None:
+                    global_view, gram_teacher_view, extra_keypoints = self._apply_paired_global_transform_with_points(
+                        transform, global_view, gram_teacher_view, extra_keypoints
+                    )
+                    extra_keypoints = torch.as_tensor(extra_keypoints, dtype=torch.float32)
+                elif self.do_augmentations:
                     global_view, gram_teacher_view = self._apply_paired_global_transform(
                         transform,
                         global_view,
                         gram_teacher_view,
                     )
+            if extra_keypoints is not None:
+                token_keypoints.append(extra_keypoints)
             global_views.append(global_view)
             global_point_coordinates.append(point_coordinates)
             global_point_type_ids.append(point_type_ids)
@@ -930,4 +1293,99 @@ class SSLZarrDataset(Dataset):
         }
         if gram_teacher_views:
             sample["gram_teacher_views"] = gram_teacher_views
+        if token_keypoints:
+            sample["global_token_targets"] = self._cross_view_token_targets(token_keypoints)
+        if object_points is not None:
+            # Valid = inside the view's field of view (voxel edges at -0.5 and size - 0.5).
+            size = torch.tensor(self.global_crop_size, dtype=torch.float32) - 0.5
+            sample["object_point_coordinates"] = object_point_views
+            sample["object_point_valid"] = [
+                torch.all((coordinates >= -0.5) & (coordinates <= size), dim=1) for coordinates in object_point_views
+            ]
+            sample["object_point_source"] = torch.from_numpy(object_points.source)
+            sample["object_point_objects"] = torch.from_numpy(object_points.objects)
+            sample["object_point_kinds"] = torch.from_numpy(object_points.kinds)
+            sample["object_negatives"] = torch.from_numpy(object_points.negatives)
         return sample
+
+    def _sample_global_crop_region(self, source_crop, vol, anchor_index, source_starts):
+        return self._sample_random_resized_crop_region(
+            source_crop.shape,
+            self.global_crop_scale,
+            self.paired_global_crop_size,
+            anchor=(
+                vol.point_coordinates[anchor_index] - np.asarray(source_starts, dtype=np.float64)
+                if anchor_index is not None
+                else None
+            ),
+            anchor_target_size=self.global_crop_size if anchor_index is not None else None,
+        )
+
+    def _transform_object_points(
+        self, transform, global_view, gram_teacher_view, object_points, crop_region, vol, anchor_index, source_starts,
+        extra_keypoints=None,
+    ):
+        """Map object points (and any supervision points and extra keypoints) into one augmented global view."""
+        object_coordinates = self._map_points_to_view(object_points.source, crop_region, self.global_crop_size)
+        if anchor_index is not None:
+            point_coordinates, point_type_ids = self._visible_points_for_crop(
+                vol, source_starts, crop_region, anchor_index
+            )
+        else:
+            point_coordinates = torch.empty((0, 3), dtype=torch.float32)
+            point_type_ids = torch.empty((0,), dtype=torch.long)
+        if self.do_augmentations:
+            parts = [point_coordinates, object_coordinates] + ([extra_keypoints] if extra_keypoints is not None else [])
+            global_view, gram_teacher_view, keypoints = self._apply_paired_global_transform_with_points(
+                transform, global_view, gram_teacher_view, torch.cat(parts)
+            )
+            keypoints = torch.as_tensor(keypoints, dtype=torch.float32)
+            point_coordinates, object_coordinates, *rest = keypoints.split([p.shape[0] for p in parts])
+            extra_keypoints = rest[0] if rest else None
+        if anchor_index is not None:
+            point_coordinates, point_type_ids = self._filter_and_cap_view_points(point_coordinates, point_type_ids)
+        return global_view, gram_teacher_view, (point_coordinates, point_type_ids, object_coordinates, extra_keypoints)
+
+    def _token_centers(self):
+        """Token centers of a global view in voxel coordinates, [tokens, 3] in token order."""
+        axes = [
+            torch.arange(size // patch, dtype=torch.float32) * patch + (patch - 1) / 2
+            for size, patch in zip(self.global_crop_size, self.cross_view_token_patch_size)
+        ]
+        return torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=-1).reshape(-1, 3)
+
+    def _view_to_source(self, coordinates, crop_region):
+        """Inverse of _map_points_to_view (before augmentation)."""
+        starts = np.asarray(crop_region.starts, dtype=np.float64)
+        shape = np.asarray(crop_region.shape, dtype=np.float64)
+        target = np.asarray(self.global_crop_size, dtype=np.float64)
+        return (coordinates.double().numpy() + 0.5) * (shape / target) - 0.5 + starts
+
+    def _cross_view_token_targets(self, token_keypoints):
+        """For each global view, the center of each of its tokens in the other view, [views, tokens, 3].
+
+        token_keypoints[v] holds view v's own token centers and then the other view's
+        token centers mapped into view v, both after view v's augmentation and in the
+        order of the token grid before augmentation. Coordinates outside the other view
+        (beyond -0.5 / size - 0.5) mark tokens without a counterpart.
+        """
+        centers = self._token_centers()
+        n_tokens = centers.shape[0]
+        grid = tuple(size // patch for size, patch in zip(self.global_crop_size, self.cross_view_token_patch_size))
+        patch = torch.tensor(self.cross_view_token_patch_size, dtype=torch.float32)
+        targets = []
+        for view_index in range(2):
+            own = token_keypoints[view_index][:n_tokens]
+            in_other = token_keypoints[1 - view_index][n_tokens:]
+            index = (own - (patch - 1) / 2) / patch
+            rounded = index.round()
+            if (index - rounded).abs().max() > 1e-3:
+                raise ValueError("cross-view token targets need augmentations that map token centers onto token centers")
+            rounded = rounded.long()
+            flat = (rounded[:, 0] * grid[1] + rounded[:, 1]) * grid[2] + rounded[:, 2]
+            if not torch.equal(torch.sort(flat).values, torch.arange(n_tokens)):
+                raise ValueError("cross-view token targets need augmentations that permute the token grid")
+            view_targets = torch.empty_like(in_other)
+            view_targets[flat] = in_other
+            targets.append(view_targets)
+        return torch.stack(targets)
