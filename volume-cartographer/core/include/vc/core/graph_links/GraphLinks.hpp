@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
@@ -67,21 +68,57 @@ DetectorReport commitCandidates(graph::GraphDb& db, const std::string& detectorN
                                 const std::vector<LinkCandidate>& candidates,
                                 bool replaceStalePending = true);
 
-// --- Detectors (placeholders: geometry passes not yet implemented) ---
-// Each currently counts the objects it would consider, writes nothing,
-// and reports "not implemented" in problems. Signatures and parameter
-// structs are the intended final shapes so callers can be wired now.
+// --- Detectors ---
+// linkPatchOverlaps is implemented; the rest are placeholders that
+// count the objects they would consider, write nothing, and report
+// "not implemented". Signatures and parameter structs are final
+// shapes so callers can be wired now.
 
+// Parameters mirror the patch-merging tool this detector is based on
+// (spiral-fitting's patch_merger, merging-patches branch). Distances
+// are in base-volume voxels unless noted.
 struct PatchOverlapParams {
-    double maxDistanceVoxels = 2.0;    // surface-to-surface tolerance
-    int64_t minMatchedPoints = 16;     // evidence threshold for a pair
+    // 3D distance within which two surface points are the same sheet.
+    // Used for correspondence search and (with uvInlierTolerance) the
+    // dense 3D agreement radius.
+    double tolerance = 2.0;
+    // Spacing (voxels) between sampled grid points per patch.
+    double sampleSpacing = 4.0;
+    // One correspondence is kept per seed-UV cell of this size.
+    double thinningSpacing = 2.0;
+    std::size_t maxCorrespondences = 4096;
+    // UV residual (voxels) tolerated by the 2D pose RANSAC/refit.
+    double uvInlierTolerance = 3.0;
+    std::size_t minInliers = 32;
+    // Minimum extents (max-min projection onto the inliers' principal
+    // axes in seed UV space) for the overlap to count as a 2D region
+    // rather than a sliver: major = length, minor = "thickness".
+    double minMajorSpread = 20.0;
+    double minMinorSpread = 5.0;
+    double maxRefitRms = 2.0;
+    // Fraction of dense overlap samples that must agree in 3D within
+    // tolerance + uvInlierTolerance under the fitted pose.
+    double minAgreementRatio = 0.6;
+    // Minimum of the two one-sided overlap fractions (share of each
+    // patch's samples agreeing with the other). 0 disables.
+    double minOverlapFraction = 0.0;
+    double ransacConfidence = 0.999;
+    std::size_t ransacMaxHypotheses = 512;
+    bool allowReflection = true;
     std::string edgeKind = "same-surface";
     bool replaceStalePending = true;
 };
 // Patch <-> patch: surfaces physically connected along the same sheet.
-// Intended implementation: SurfacePatchIndex over tifxyz grids, as in
-// vc_seg_add_overlap, retargeted from overlapping.json to graph edges.
-DetectorReport linkPatchOverlaps(graph::GraphDb& db, const PatchOverlapParams& params = {},
+// Loads every tifxyz segment directory under patchesDir, registers
+// patch objects by their meta.json UUIDs where missing, and for each
+// pair: harvests 3D-proximity correspondences, fits a 2D rigid
+// (optionally reflected) pose between parameterizations by two-point
+// RANSAC gated on 3D tangent-frame agreement, refits with Huber
+// weights, requires the inlier spread gates and dense 3D agreement,
+// and commits accepted pairs as pending edges with fit provenance
+// (inliers, RMS, spreads, agreement) in edge meta.
+DetectorReport linkPatchOverlaps(graph::GraphDb& db, const std::filesystem::path& patchesDir,
+                                 const PatchOverlapParams& params = {},
                                  const std::atomic_bool* cancel = nullptr);
 
 struct FiberPatchParams {

@@ -116,7 +116,7 @@ set_target_properties(vc_graph_bindings PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc"
     INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
 )
-target_link_libraries(vc_graph_bindings PRIVATE vc_graph)
+target_link_libraries(vc_graph_bindings PRIVATE vc_graph_links vc_core)
 target_compile_features(vc_graph_bindings PRIVATE cxx_std_23)
 
 install(TARGETS vc_lasagna_amgx

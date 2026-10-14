@@ -133,15 +133,6 @@ DetectorReport commitCandidates(graph::GraphDb& db, const std::string& detectorN
     return report;
 }
 
-DetectorReport linkPatchOverlaps(graph::GraphDb& db, const PatchOverlapParams& /*params*/,
-                                 const std::atomic_bool* cancel)
-{
-    // TODO: SurfacePatchIndex over patch tifxyz grids (port of
-    // vc_seg_add_overlap's detection), pairs within maxDistanceVoxels
-    // and >= minMatchedPoints evidence -> commitCandidates().
-    return placeholder(db, kPatchOverlapDetector, {"patch"}, cancel);
-}
-
 DetectorReport linkFibersToPatches(graph::GraphDb& db, const FiberPatchParams& /*params*/,
                                    const std::atomic_bool* cancel)
 {

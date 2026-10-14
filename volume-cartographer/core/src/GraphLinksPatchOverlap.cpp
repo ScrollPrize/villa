@@ -1,0 +1,671 @@
+// Patch-overlap detector for vc_graph_links.
+//
+// Pair acceptance follows spiral-fitting's patch_merger (merging-patches
+// branch): correspondences harvested by 3D proximity, a two-point
+// RANSAC over 2D rigid/reflected poses between the patches'
+// parameterizations gated on 3D tangent-frame agreement, Huber-weighted
+// refits, principal-axis spread gates on the inliers (major = overlap
+// length, minor = overlap "thickness"), and a dense 3D agreement check
+// under the fitted pose. Accepted pairs become pending graph edges via
+// commitCandidates(); no merged geometry is produced here.
+
+#include "vc/core/graph_links/GraphLinks.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <limits>
+#include <map>
+#include <unordered_map>
+#include <utility>
+
+#include <nlohmann/json.hpp>
+#include <opencv2/core.hpp>
+
+#include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/core/util/Uuid.hpp"
+
+namespace vc::graph_links {
+namespace {
+
+struct Vec2 {
+    double x = 0.0, y = 0.0;
+    Vec2 operator+(Vec2 o) const { return {x + o.x, y + o.y}; }
+    Vec2 operator-(Vec2 o) const { return {x - o.x, y - o.y}; }
+    Vec2 operator*(double s) const { return {x * s, y * s}; }
+    Vec2 operator/(double s) const { return {x / s, y / s}; }
+};
+double dot(Vec2 a, Vec2 b) { return a.x * b.x + a.y * b.y; }
+double normSq(Vec2 a) { return dot(a, a); }
+
+struct Pose {
+    double r00 = 1, r01 = 0, r10 = 0, r11 = 1, tx = 0, ty = 0;
+    Vec2 apply(Vec2 v) const { return {r00 * v.x + r01 * v.y + tx, r10 * v.x + r11 * v.y + ty}; }
+    Pose inverse() const
+    {
+        Pose inv;
+        inv.r00 = r00; inv.r01 = r10; inv.r10 = r01; inv.r11 = r11;
+        inv.tx = -(inv.r00 * tx + inv.r01 * ty);
+        inv.ty = -(inv.r10 * tx + inv.r11 * ty);
+        return inv;
+    }
+    bool reflected() const { return r00 * r11 - r01 * r10 < 0.0; }
+};
+
+struct SamplePoint {
+    Vec2 uv;  // metric (voxel) parameterization: grid index / scale
+    cv::Vec3f xyz;
+    cv::Vec3f tangentU;  // d(xyz)/d(u), d(xyz)/d(v)
+    cv::Vec3f tangentV;
+};
+
+struct LoadedPatch {
+    std::filesystem::path path;
+    std::string uuid;
+    std::shared_ptr<QuadSurface> surface;
+    cv::Vec2f scale = {1.0f, 1.0f};
+    std::vector<SamplePoint> samples;                  // strided by sampleSpacing
+    cv::Vec3f bboxLow, bboxHigh;
+};
+
+std::uint64_t splitmix64(std::uint64_t value)
+{
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31);
+}
+
+// Tangent frame at a grid vertex, derivatives w.r.t. metric UV.
+std::optional<std::pair<cv::Vec3f, cv::Vec3f>> tangentsAt(
+    const cv::Mat_<cv::Vec3f>& points, int row, int col, const cv::Vec2f& scale)
+{
+    auto valid = [&](int r, int c) { return points(r, c)[0] != -1.0f; };
+    auto derivU = [&]() -> std::optional<cv::Vec3f> {
+        if (col > 0 && col + 1 < points.cols && valid(row, col - 1) && valid(row, col + 1))
+            return (points(row, col + 1) - points(row, col - 1)) * (scale[0] * 0.5f);
+        if (col + 1 < points.cols && valid(row, col + 1))
+            return (points(row, col + 1) - points(row, col)) * scale[0];
+        if (col > 0 && valid(row, col - 1))
+            return (points(row, col) - points(row, col - 1)) * scale[0];
+        return std::nullopt;
+    };
+    auto derivV = [&]() -> std::optional<cv::Vec3f> {
+        if (row > 0 && row + 1 < points.rows && valid(row - 1, col) && valid(row + 1, col))
+            return (points(row + 1, col) - points(row - 1, col)) * (scale[1] * 0.5f);
+        if (row + 1 < points.rows && valid(row + 1, col))
+            return (points(row + 1, col) - points(row, col)) * scale[1];
+        if (row > 0 && valid(row - 1, col))
+            return (points(row, col) - points(row - 1, col)) * scale[1];
+        return std::nullopt;
+    };
+    auto du = derivU();
+    auto dv = derivV();
+    if (!du || !dv) return std::nullopt;
+    return std::pair{*du, *dv};
+}
+
+// Bilinear xyz sample at metric UV; nullopt on invalid quad.
+std::optional<cv::Vec3f> sampleXyz(const LoadedPatch& patch, Vec2 uv)
+{
+    const auto* points = patch.surface->rawPointsPtr();
+    double col = uv.x * patch.scale[0];
+    double row = uv.y * patch.scale[1];
+    const int c0 = int(std::floor(col));
+    const int r0 = int(std::floor(row));
+    if (c0 < 0 || r0 < 0 || c0 + 1 >= points->cols || r0 + 1 >= points->rows) return std::nullopt;
+    const auto& p00 = (*points)(r0, c0);
+    const auto& p10 = (*points)(r0, c0 + 1);
+    const auto& p01 = (*points)(r0 + 1, c0);
+    const auto& p11 = (*points)(r0 + 1, c0 + 1);
+    if (p00[0] == -1.0f || p10[0] == -1.0f || p01[0] == -1.0f || p11[0] == -1.0f) return std::nullopt;
+    const double fx = col - c0, fy = row - r0;
+    auto interp = [&](float a, float b, float c, float d) {
+        return float((1 - fy) * ((1 - fx) * a + fx * b) + fy * ((1 - fx) * c + fx * d));
+    };
+    return cv::Vec3f{interp(p00[0], p10[0], p01[0], p11[0]),
+                     interp(p00[1], p10[1], p01[1], p11[1]),
+                     interp(p00[2], p10[2], p01[2], p11[2])};
+}
+
+std::optional<LoadedPatch> loadPatch(const std::filesystem::path& dir, const PatchOverlapParams& params,
+                                     DetectorReport& report)
+{
+    LoadedPatch patch;
+    patch.path = dir;
+    try {
+        patch.surface = std::make_shared<QuadSurface>(dir);
+        patch.uuid = patch.surface->objectUuid();
+        if (!vc::util::isUuid(patch.uuid)) {
+            report.problems.push_back(dir.filename().string() +
+                                      ": meta.json has no valid uuid, skipped");
+            return std::nullopt;
+        }
+        patch.scale = patch.surface->scale();
+        if (!(patch.scale[0] > 0) || !(patch.scale[1] > 0)) {
+            report.problems.push_back(dir.filename().string() + ": invalid scale, skipped");
+            return std::nullopt;
+        }
+        patch.surface->ensureLoaded();
+    } catch (const std::exception& e) {
+        report.problems.push_back(dir.filename().string() + ": load failed: " + e.what());
+        return std::nullopt;
+    }
+    const auto* points = patch.surface->rawPointsPtr();
+    const int stepR = std::max(1, int(std::llround(params.sampleSpacing * patch.scale[1])));
+    const int stepC = std::max(1, int(std::llround(params.sampleSpacing * patch.scale[0])));
+    patch.bboxLow = {1e30f, 1e30f, 1e30f};
+    patch.bboxHigh = {-1e30f, -1e30f, -1e30f};
+    for (int row = 0; row < points->rows; ++row) {
+        for (int col = 0; col < points->cols; ++col) {
+            const cv::Vec3f p = (*points)(row, col);
+            if (p[0] == -1.0f || !std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) continue;
+            patch.bboxLow = {std::min(patch.bboxLow[0], p[0]), std::min(patch.bboxLow[1], p[1]), std::min(patch.bboxLow[2], p[2])};
+            patch.bboxHigh = {std::max(patch.bboxHigh[0], p[0]), std::max(patch.bboxHigh[1], p[1]), std::max(patch.bboxHigh[2], p[2])};
+            if (row % stepR != 0 || col % stepC != 0) continue;
+            auto tangents = tangentsAt(*points, row, col, patch.scale);
+            if (!tangents) continue;
+            SamplePoint sample;
+            sample.uv = {col / double(patch.scale[0]), row / double(patch.scale[1])};
+            sample.xyz = p;
+            sample.tangentU = tangents->first;
+            sample.tangentV = tangents->second;
+            patch.samples.push_back(std::move(sample));
+        }
+    }
+    if (patch.samples.empty()) {
+        report.problems.push_back(dir.filename().string() + ": no usable samples, skipped");
+        return std::nullopt;
+    }
+    return patch;
+}
+
+struct Correspondence {
+    Vec2 target;  // target metric UV
+    Vec2 seed;    // seed metric UV
+    cv::Vec3f targetTangentU, targetTangentV;
+    cv::Vec3f seedTangentU, seedTangentV;
+    float distance = 0.0f;
+    std::uint64_t cell = 0;
+};
+
+std::vector<Correspondence> harvest(const LoadedPatch& seed, const LoadedPatch& target,
+                                    const SurfacePatchIndex& index, const PatchOverlapParams& params)
+{
+    std::map<std::uint64_t, Correspondence> byCell;
+    const auto* targetPoints = target.surface->rawPointsPtr();
+    for (const auto& sample : seed.samples) {
+        SurfacePatchIndex::PointQuery query;
+        query.worldPoint = sample.xyz;
+        query.tolerance = float(params.tolerance);
+        query.surfaces.only = target.surface;
+        const auto hit = index.locate(query);
+        if (!hit) continue;
+        const cv::Vec2f grid = target.surface->ptrToGrid(hit->ptr);  // (col, row)
+        const Vec2 targetUv{grid[0] / double(target.scale[0]), grid[1] / double(target.scale[1])};
+        const auto targetXyz = sampleXyz(target, targetUv);
+        if (!targetXyz) continue;
+        const cv::Vec3f delta = *targetXyz - sample.xyz;
+        const float distance = std::sqrt(delta.dot(delta));
+        if (distance > params.tolerance) continue;
+        const int row = std::clamp(int(std::lround(grid[1])), 0, targetPoints->rows - 1);
+        const int col = std::clamp(int(std::lround(grid[0])), 0, targetPoints->cols - 1);
+        const auto tangents = tangentsAt(*targetPoints, row, col, target.scale);
+        if (!tangents) continue;
+        Correspondence c;
+        c.seed = sample.uv;
+        c.target = targetUv;
+        c.seedTangentU = sample.tangentU;
+        c.seedTangentV = sample.tangentV;
+        c.targetTangentU = tangents->first;
+        c.targetTangentV = tangents->second;
+        c.distance = distance;
+        const auto cx = std::uint32_t(std::int32_t(std::floor(c.seed.x / params.thinningSpacing)));
+        const auto cy = std::uint32_t(std::int32_t(std::floor(c.seed.y / params.thinningSpacing)));
+        c.cell = (std::uint64_t(cy) << 32) | cx;
+        auto [it, inserted] = byCell.try_emplace(c.cell, c);
+        if (!inserted && c.distance < it->second.distance) it->second = c;
+    }
+    std::vector<Correspondence> out;
+    out.reserve(byCell.size());
+    for (auto& [cell, c] : byCell) out.push_back(c);
+    if (out.size() > params.maxCorrespondences) {
+        std::sort(out.begin(), out.end(),
+                  [](const Correspondence& a, const Correspondence& b) { return splitmix64(a.cell) < splitmix64(b.cell); });
+        out.resize(params.maxCorrespondences);
+        std::sort(out.begin(), out.end(),
+                  [](const Correspondence& a, const Correspondence& b) { return a.cell < b.cell; });
+    }
+    return out;
+}
+
+double tangentMismatchSq(const Pose& pose, const Correspondence& v)
+{
+    auto normDiffSq = [](const cv::Vec3f& a, const cv::Vec3f& b) {
+        const double an = std::sqrt(double(a.dot(a)));
+        const double bn = std::sqrt(double(b.dot(b)));
+        if (!(an > 1e-8) || !(bn > 1e-8)) return 0.0;
+        const cv::Vec3d d = cv::Vec3d(a) / an - cv::Vec3d(b) / bn;
+        return d.dot(d);
+    };
+    // target(t) == seed(R t + tr), hence J_target == J_seed R.
+    const cv::Vec3f predU = float(pose.r00) * v.seedTangentU + float(pose.r10) * v.seedTangentV;
+    const cv::Vec3f predV = float(pose.r01) * v.seedTangentU + float(pose.r11) * v.seedTangentV;
+    return normDiffSq(v.targetTangentU, predU) + normDiffSq(v.targetTangentV, predV);
+}
+
+Pose twoPointPose(const Correspondence& a, const Correspondence& b, bool reflection, bool& valid)
+{
+    const Vec2 sourceDelta = b.target - a.target;
+    const Vec2 targetDelta = b.seed - a.seed;
+    if (normSq(sourceDelta) < 1e-12 || normSq(targetDelta) < 1e-12) {
+        valid = false;
+        return {};
+    }
+    const double angle = reflection
+        ? std::atan2(targetDelta.y, targetDelta.x) + std::atan2(sourceDelta.y, sourceDelta.x)
+        : std::atan2(targetDelta.y, targetDelta.x) - std::atan2(sourceDelta.y, sourceDelta.x);
+    const double c = std::cos(angle), s = std::sin(angle);
+    Pose pose;
+    if (reflection) {
+        pose.r00 = c; pose.r01 = s; pose.r10 = s; pose.r11 = -c;
+    } else {
+        pose.r00 = c; pose.r01 = -s; pose.r10 = s; pose.r11 = c;
+    }
+    const Vec2 rotated = pose.apply((a.target + b.target) * 0.5);
+    const Vec2 mid = (a.seed + b.seed) * 0.5;
+    pose.tx += mid.x - rotated.x;
+    pose.ty += mid.y - rotated.y;
+    valid = true;
+    return pose;
+}
+
+Pose weightedPose(const std::vector<Correspondence>& values, const std::vector<std::uint8_t>& included,
+                  const std::vector<double>& weights, bool reflection)
+{
+    double total = 0;
+    Vec2 sourceMean, targetMean;
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (!included[i]) continue;
+        total += weights[i];
+        sourceMean = sourceMean + values[i].target * weights[i];
+        targetMean = targetMean + values[i].seed * weights[i];
+    }
+    sourceMean = sourceMean / total;
+    targetMean = targetMean / total;
+    double cosineTerm = 0, sineTerm = 0;
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (!included[i]) continue;
+        const Vec2 src = values[i].target - sourceMean;
+        const Vec2 tgt = values[i].seed - targetMean;
+        if (reflection) {
+            cosineTerm += weights[i] * (tgt.x * src.x - tgt.y * src.y);
+            sineTerm += weights[i] * (tgt.x * src.y + tgt.y * src.x);
+        } else {
+            cosineTerm += weights[i] * (tgt.x * src.x + tgt.y * src.y);
+            sineTerm += weights[i] * (tgt.y * src.x - tgt.x * src.y);
+        }
+    }
+    const double angle = std::atan2(sineTerm, cosineTerm);
+    const double c = std::cos(angle), s = std::sin(angle);
+    Pose pose;
+    if (reflection) {
+        pose.r00 = c; pose.r01 = s; pose.r10 = s; pose.r11 = -c;
+    } else {
+        pose.r00 = c; pose.r01 = -s; pose.r10 = s; pose.r11 = c;
+    }
+    const Vec2 rotated = pose.apply(sourceMean);
+    pose.tx += targetMean.x - rotated.x;
+    pose.ty += targetMean.y - rotated.y;
+    return pose;
+}
+
+std::pair<double, double> spreads(const std::vector<Correspondence>& values,
+                                  const std::vector<std::uint8_t>& included)
+{
+    Vec2 mean;
+    size_t count = 0;
+    for (size_t i = 0; i < values.size(); ++i)
+        if (included[i]) {
+            mean = mean + values[i].seed;
+            ++count;
+        }
+    if (count == 0) return {0, 0};
+    mean = mean / double(count);
+    double xx = 0, xy = 0, yy = 0;
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (!included[i]) continue;
+        const Vec2 d = values[i].seed - mean;
+        xx += d.x * d.x; xy += d.x * d.y; yy += d.y * d.y;
+    }
+    const double angle = 0.5 * std::atan2(2 * xy, xx - yy);
+    const Vec2 major{std::cos(angle), std::sin(angle)};
+    const Vec2 minor{-major.y, major.x};
+    double majLo = 1e300, majHi = -1e300, minLo = 1e300, minHi = -1e300;
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (!included[i]) continue;
+        const double a = dot(values[i].seed, major);
+        const double b = dot(values[i].seed, minor);
+        majLo = std::min(majLo, a); majHi = std::max(majHi, a);
+        minLo = std::min(minLo, b); minHi = std::max(minHi, b);
+    }
+    double first = majHi - majLo, second = minHi - minLo;
+    if (second > first) std::swap(first, second);
+    return {first, second};
+}
+
+struct FitResult {
+    bool accepted = false;
+    Pose pose;
+    std::size_t inliers = 0;
+    double rms = std::numeric_limits<double>::infinity();
+    double majorSpread = 0, minorSpread = 0;
+    std::string rejection;
+};
+
+FitResult fitPair(const std::vector<Correspondence>& values, const PatchOverlapParams& params, std::uint64_t seed)
+{
+    FitResult result;
+    if (values.size() < params.minInliers) {
+        result.rejection = "insufficient_correspondences";
+        return result;
+    }
+    const double thresholdSq = params.uvInlierTolerance * params.uvInlierTolerance;
+    constexpr double tangentThresholdSq = 1.0;
+    auto isInlier = [&](const Pose& pose, const Correspondence& v) {
+        return normSq(pose.apply(v.target) - v.seed) <= thresholdSq && tangentMismatchSq(pose, v) <= tangentThresholdSq;
+    };
+    std::size_t bestCount = 0;
+    double bestError = std::numeric_limits<double>::infinity();
+    Pose bestPose;
+    std::size_t limit = params.ransacMaxHypotheses;
+    std::size_t hypotheses = 0;
+    std::uint64_t state = seed;
+    while (hypotheses < limit) {
+        state = splitmix64(state);
+        const std::size_t first = state % values.size();
+        state = splitmix64(state);
+        std::size_t second = state % (values.size() - 1);
+        if (second >= first) ++second;
+        for (int reflected = 0; reflected <= (params.allowReflection ? 1 : 0) && hypotheses < limit;
+             ++reflected, ++hypotheses) {
+            bool valid = false;
+            const Pose pose = twoPointPose(values[first], values[second], reflected != 0, valid);
+            if (!valid) continue;
+            std::size_t count = 0;
+            double error = 0;
+            for (const auto& v : values)
+                if (isInlier(pose, v)) {
+                    ++count;
+                    error += normSq(pose.apply(v.target) - v.seed);
+                }
+            if (count > bestCount || (count == bestCount && error < bestError)) {
+                bestCount = count;
+                bestError = error;
+                bestPose = pose;
+                const double ratio = double(count) / double(values.size());
+                const double success = ratio * ratio;
+                if (success >= 1.0) {
+                    limit = std::min(limit, hypotheses + 1);
+                } else if (success > 0.0) {
+                    const double needed = std::ceil(std::log(1.0 - params.ransacConfidence) / std::log(1.0 - success));
+                    limit = std::min(limit, std::max(hypotheses + 1, std::size_t(needed)));
+                }
+            }
+        }
+    }
+    if (bestCount < params.minInliers) {
+        result.rejection = "insufficient_inliers";
+        result.inliers = bestCount;
+        return result;
+    }
+    const bool reflection = bestPose.reflected();
+    const double huberDelta = std::min(1.0, params.uvInlierTolerance);
+    std::vector<std::uint8_t> included(values.size(), 0);
+    std::vector<double> weights(values.size(), 0.0);
+    Pose refitted = bestPose;
+    auto refitRounds = [&](int rounds) {
+        for (int it = 0; it < rounds; ++it) {
+            for (size_t i = 0; i < values.size(); ++i) {
+                included[i] = isInlier(refitted, values[i]) ? 1 : 0;
+                if (!included[i]) continue;
+                const double residual = std::sqrt(normSq(refitted.apply(values[i].target) - values[i].seed));
+                weights[i] = (residual <= huberDelta || residual == 0.0) ? 1.0 : huberDelta / residual;
+            }
+            refitted = weightedPose(values, included, weights, reflection);
+        }
+    };
+    refitRounds(6);
+    std::size_t finalCount = 0;
+    for (size_t i = 0; i < values.size(); ++i) {
+        included[i] = isInlier(refitted, values[i]) ? 1 : 0;
+        finalCount += included[i] ? 1 : 0;
+    }
+    if (finalCount < params.minInliers) {
+        result.rejection = "insufficient_inliers_after_refit";
+        result.inliers = finalCount;
+        return result;
+    }
+    refitRounds(3);
+    double squaredError = 0;
+    for (size_t i = 0; i < values.size(); ++i)
+        if (included[i]) squaredError += normSq(refitted.apply(values[i].target) - values[i].seed);
+    result.rms = std::sqrt(squaredError / double(finalCount));
+    result.inliers = finalCount;
+    result.pose = refitted;
+    const auto [major, minor] = spreads(values, included);
+    result.majorSpread = major;
+    result.minorSpread = minor;
+    if (major + 1e-9 < params.minMajorSpread) {
+        result.rejection = "insufficient_major_axis_spread";
+        return result;
+    }
+    if (minor + 1e-9 < params.minMinorSpread) {
+        result.rejection = "insufficient_minor_axis_spread";
+        return result;
+    }
+    if (result.rms > params.maxRefitRms) {
+        result.rejection = "refit_rms";
+        return result;
+    }
+    result.accepted = true;
+    return result;
+}
+
+// Dense 3D agreement of one patch against another under a pose mapping
+// target UV -> seed UV: {overlap samples, agreements, total samples}.
+struct Consistency {
+    std::size_t samples = 0, agreements = 0, total = 0;
+};
+
+Consistency overlapConsistency(const LoadedPatch& seed, const LoadedPatch& target, const Pose& targetToSeed,
+                               double agreementRadius)
+{
+    Consistency result;
+    const Pose seedToTarget = targetToSeed.inverse();
+    const double agreementSq = agreementRadius * agreementRadius;
+    for (const auto& sample : seed.samples) {
+        ++result.total;
+        const auto other = sampleXyz(target, seedToTarget.apply(sample.uv));
+        if (!other) continue;
+        ++result.samples;
+        const cv::Vec3f d = *other - sample.xyz;
+        if (double(d.dot(d)) <= agreementSq) ++result.agreements;
+    }
+    return result;
+}
+
+bool bboxOverlap(const LoadedPatch& a, const LoadedPatch& b, double pad)
+{
+    for (int i = 0; i < 3; ++i)
+        if (a.bboxLow[i] - pad > b.bboxHigh[i] || b.bboxLow[i] - pad > a.bboxHigh[i]) return false;
+    return true;
+}
+
+void validateParams(const PatchOverlapParams& params)
+{
+    auto positive = [](double value, const char* name) {
+        if (!(value > 0.0) || !std::isfinite(value))
+            throw std::invalid_argument(std::string("graph links: ") + name + " must be positive and finite");
+    };
+    positive(params.tolerance, "tolerance");
+    positive(params.sampleSpacing, "sampleSpacing");
+    positive(params.thinningSpacing, "thinningSpacing");
+    positive(params.uvInlierTolerance, "uvInlierTolerance");
+    positive(params.minMajorSpread, "minMajorSpread");
+    positive(params.minMinorSpread, "minMinorSpread");
+    positive(params.maxRefitRms, "maxRefitRms");
+    if (params.maxCorrespondences == 0 || params.minInliers < 2 || params.ransacMaxHypotheses == 0)
+        throw std::invalid_argument("graph links: correspondence/inlier/hypothesis counts must be positive");
+    if (!(params.ransacConfidence > 0.0 && params.ransacConfidence < 1.0))
+        throw std::invalid_argument("graph links: ransacConfidence must be between zero and one");
+    if (!(params.minAgreementRatio >= 0.0 && params.minAgreementRatio <= 1.0))
+        throw std::invalid_argument("graph links: minAgreementRatio must be in [0,1]");
+    if (!(params.minOverlapFraction >= 0.0 && params.minOverlapFraction <= 1.0))
+        throw std::invalid_argument("graph links: minOverlapFraction must be in [0,1]");
+    if (params.edgeKind.empty())
+        throw std::invalid_argument("graph links: edgeKind must be non-empty");
+}
+
+}  // namespace
+
+DetectorReport linkPatchOverlaps(graph::GraphDb& db, const std::filesystem::path& patchesDir,
+                                 const PatchOverlapParams& params, const std::atomic_bool* cancel)
+{
+    validateParams(params);
+    DetectorReport report;
+    auto cancelled = [&] { return cancel && cancel->load(); };
+
+    std::vector<std::filesystem::path> dirs;
+    for (const auto& entry : std::filesystem::directory_iterator(patchesDir))
+        if (entry.is_directory() && std::filesystem::exists(entry.path() / "meta.json"))
+            dirs.push_back(entry.path());
+    std::sort(dirs.begin(), dirs.end());
+
+    std::vector<LoadedPatch> patches;
+    for (const auto& dir : dirs) {
+        if (cancelled()) {
+            report.problems.push_back("patch-overlap: cancelled during loading");
+            return report;
+        }
+        if (auto loaded = loadPatch(dir, params, report))
+            patches.push_back(std::move(*loaded));
+    }
+    report.objectsConsidered = int64_t(patches.size());
+
+    // Register any patch objects the DB does not know about yet, so edges
+    // always have endpoints. Existing registrations are left untouched.
+    {
+        auto txn = db.write();
+        const auto dbDir = db.path().parent_path();
+        for (const auto& patch : patches) {
+            if (db.objectByUuid(txn, patch.uuid)) continue;
+            graph::ObjectRecord rec;
+            rec.uuid = patch.uuid;
+            rec.kind = "patch";
+            rec.name = patch.path.filename().string();
+            rec.storageKind = "file";
+            std::error_code ec;
+            const auto rel = std::filesystem::relative(patch.path, dbDir, ec);
+            rec.storageRef = ec ? patch.path.filename().string() : rel.string();
+            rec.dataGeneration = 1;
+            graph::PatchDetail detail;
+            const auto* points = patch.surface->rawPointsPtr();
+            detail.gridWidth = points->cols;
+            detail.gridHeight = points->rows;
+            detail.scale = patch.scale[0];
+            detail.bbox = std::array<double, 6>{patch.bboxLow[0], patch.bboxLow[1], patch.bboxLow[2],
+                                                patch.bboxHigh[0], patch.bboxHigh[1], patch.bboxHigh[2]};
+            rec.patch = detail;
+            db.upsertObject(txn, rec);
+        }
+        txn.commit();
+    }
+
+    // Triangle-accurate spatial index over every loaded patch, as in
+    // vc_seg_add_overlap; correspondences query it per target patch.
+    SurfacePatchIndex index;
+    index.setSamplingStride(1);
+    {
+        std::vector<SurfacePatchIndex::SurfacePtr> surfaces;
+        surfaces.reserve(patches.size());
+        for (const auto& patch : patches) surfaces.push_back(patch.surface);
+        index.rebuild(surfaces, float(params.tolerance));
+    }
+
+    const double agreementRadius = params.tolerance + params.uvInlierTolerance;
+    std::vector<LinkCandidate> candidates;
+    std::map<std::string, std::size_t> rejections;
+    for (std::size_t si = 0; si < patches.size(); ++si) {
+        for (std::size_t ti = si + 1; ti < patches.size(); ++ti) {
+            if (cancelled()) {
+                report.problems.push_back("patch-overlap: cancelled");
+                return report;
+            }
+            const LoadedPatch& seed = patches[si];
+            const LoadedPatch& target = patches[ti];
+            if (!bboxOverlap(seed, target, params.tolerance)) continue;
+
+            const auto correspondences = harvest(seed, target, index, params);
+            if (correspondences.size() < params.minInliers) continue;
+            const std::uint64_t pairSeed = splitmix64(std::uint64_t(si + 1) * 0x9E3779B9ULL ^ std::uint64_t(ti + 1));
+            FitResult fit = fitPair(correspondences, params, pairSeed);
+            if (!fit.accepted) {
+                ++rejections[fit.rejection.empty() ? "rejected" : fit.rejection];
+                continue;
+            }
+            const Consistency consistency = overlapConsistency(seed, target, fit.pose, agreementRadius);
+            if (consistency.samples < params.minInliers) {
+                ++rejections["insufficient_overlap_samples"];
+                continue;
+            }
+            const double agreementRatio = double(consistency.agreements) / double(consistency.samples);
+            if (agreementRatio < params.minAgreementRatio) {
+                ++rejections["overlap_conflict"];
+                continue;
+            }
+            double overlapFraction = 0.0;
+            if (params.minOverlapFraction > 0.0) {
+                const Consistency reverse = overlapConsistency(target, seed, fit.pose.inverse(), agreementRadius);
+                const double seedFraction = consistency.total ? double(consistency.agreements) / double(consistency.total) : 0.0;
+                const double targetFraction = reverse.total ? double(reverse.agreements) / double(reverse.total) : 0.0;
+                overlapFraction = std::min(seedFraction, targetFraction);
+                if (overlapFraction < params.minOverlapFraction) {
+                    ++rejections["insufficient_overlap_fraction"];
+                    continue;
+                }
+            }
+
+            LinkCandidate candidate;
+            candidate.aUuid = seed.uuid;
+            candidate.bUuid = target.uuid;
+            candidate.kind = params.edgeKind;
+            candidate.score = agreementRatio;
+            nlohmann::json fitMeta{{"correspondences", correspondences.size()},
+                                   {"inliers", fit.inliers},
+                                   {"rms", fit.rms},
+                                   {"major_spread", fit.majorSpread},
+                                   {"minor_spread", fit.minorSpread},
+                                   {"agreement_ratio", agreementRatio},
+                                   {"reflected", fit.pose.reflected()},
+                                   {"pose", {fit.pose.r00, fit.pose.r01, fit.pose.tx,
+                                             fit.pose.r10, fit.pose.r11, fit.pose.ty}}};
+            if (params.minOverlapFraction > 0.0) fitMeta["overlap_fraction"] = overlapFraction;
+            candidate.meta = nlohmann::json{{"fit", std::move(fitMeta)}}.dump();
+            candidates.push_back(std::move(candidate));
+        }
+    }
+    for (const auto& [reason, count] : rejections)
+        report.problems.push_back("patch-overlap: " + std::to_string(count) + " pair(s) rejected: " + reason);
+
+    DetectorReport committed = commitCandidates(db, kPatchOverlapDetector, 1, candidates, params.replaceStalePending);
+    report.candidatesFound = committed.candidatesFound;
+    report.edgesCreated = committed.edgesCreated;
+    report.edgesSkippedExisting = committed.edgesSkippedExisting;
+    report.staleRemoved = committed.staleRemoved;
+    return report;
+}
+
+}  // namespace vc::graph_links
+

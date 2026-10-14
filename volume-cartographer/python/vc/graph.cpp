@@ -14,6 +14,7 @@
 #include <nanobind/stl/vector.h>
 
 #include "vc/core/graph/GraphDb.hpp"
+#include "vc/core/graph_links/GraphLinks.hpp"
 
 namespace nb = nanobind;
 namespace vg = vc::graph;
@@ -247,6 +248,20 @@ vg::EdgeRecord edgeFromPy(const nb::dict& d)
     e.tags = getTags(d);
     if (has(d, "meta")) e.meta = jsonDumps(d["meta"]);
     return e;
+}
+
+nb::dict detectorReportToPy(const vc::graph_links::DetectorReport& rep)
+{
+    nb::dict d;
+    d["objects_considered"] = rep.objectsConsidered;
+    d["candidates_found"] = rep.candidatesFound;
+    d["edges_created"] = rep.edgesCreated;
+    d["edges_skipped_existing"] = rep.edgesSkippedExisting;
+    d["stale_removed"] = rep.staleRemoved;
+    nb::list problems;
+    for (const auto& p : rep.problems) problems.append(pyStr(p));
+    d["problems"] = problems;
+    return d;
 }
 
 nb::dict reportToPy(const vg::ImportReport& rep)
@@ -553,6 +568,36 @@ NB_MODULE(graph, m)
                 return reportToPy(rep);
             },
             nb::arg("file"))
+        .def(
+            "link_patch_overlaps",
+            [](PyGraphDb& self, const std::string& dir, const nb::kwargs& kwargs) {
+                vc::graph_links::PatchOverlapParams p;
+                for (auto item : kwargs) {
+                    const std::string key = nb::cast<std::string>(item.first);
+                    const nb::handle val = item.second;
+                    if (key == "tolerance") p.tolerance = nb::cast<double>(val);
+                    else if (key == "sample_spacing") p.sampleSpacing = nb::cast<double>(val);
+                    else if (key == "thinning_spacing") p.thinningSpacing = nb::cast<double>(val);
+                    else if (key == "max_correspondences") p.maxCorrespondences = nb::cast<std::size_t>(val);
+                    else if (key == "uv_inlier_tolerance") p.uvInlierTolerance = nb::cast<double>(val);
+                    else if (key == "min_inliers") p.minInliers = nb::cast<std::size_t>(val);
+                    else if (key == "min_major_spread") p.minMajorSpread = nb::cast<double>(val);
+                    else if (key == "min_minor_spread") p.minMinorSpread = nb::cast<double>(val);
+                    else if (key == "max_refit_rms") p.maxRefitRms = nb::cast<double>(val);
+                    else if (key == "min_agreement_ratio") p.minAgreementRatio = nb::cast<double>(val);
+                    else if (key == "min_overlap_fraction") p.minOverlapFraction = nb::cast<double>(val);
+                    else if (key == "ransac_confidence") p.ransacConfidence = nb::cast<double>(val);
+                    else if (key == "ransac_max_hypotheses") p.ransacMaxHypotheses = nb::cast<std::size_t>(val);
+                    else if (key == "allow_reflection") p.allowReflection = nb::cast<bool>(val);
+                    else if (key == "edge_kind") p.edgeKind = nb::cast<std::string>(val);
+                    else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(val);
+                    else throw std::runtime_error("link_patch_overlaps: unknown parameter '" + key + "'");
+                }
+                auto rep = vc::graph_links::linkPatchOverlaps(self.require(), dir, p);
+                return detectorReportToPy(rep);
+            },
+            "Run the patch-overlap detector over the tifxyz segment dirs in dir; "
+            "kwargs mirror PatchOverlapParams (tolerance, min_minor_spread, ...).")
         .def(
             "write",
             [](PyGraphDb& self) {
