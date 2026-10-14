@@ -181,6 +181,7 @@ class SourcePlan:
     array: Any
     starts: tuple[int, int, int]
     anchor_index: int | None
+    mesh_anchor: np.ndarray | None = None
 
 
 @dataclass
@@ -1288,7 +1289,7 @@ class SSLZarrDataset(Dataset):
         candidates = np.flatnonzero(volume.point_type_ids == selected_type)
         return int(np.random.choice(candidates))
 
-    def _sample_mesh_centered_start(self, vol: Volume) -> tuple[int, int, int] | None:
+    def _sample_mesh_centered_start(self, vol: Volume) -> tuple[tuple[int, int, int], np.ndarray] | None:
         """Sample a source window start centered around a valid mesh or ink point."""
         if not vol.meshes:
             return None
@@ -1313,7 +1314,7 @@ class SSLZarrDataset(Dataset):
                 continue
             if self.object_mask_enabled and not self._start_allowed(vol, starts):
                 continue
-            return starts
+            return starts, pt.astype(np.float64, copy=True)
         return None
 
     def _draw_source_plan(self, nonzero_threshold):
@@ -1322,6 +1323,7 @@ class SSLZarrDataset(Dataset):
             vol_idx = np.random.choice(len(self.volumes), p=vol_weights)
             vol = self.volumes[vol_idx]
             anchor_index = None
+            mesh_anchor = None
             starts = None
             if (
                 self.point_supervision_enabled
@@ -1337,7 +1339,9 @@ class SSLZarrDataset(Dataset):
             elif self.object_points_enabled and vol.meshes:
                 anchor_prob = self.ink_anchor_prob if vol.has_ink_meshes else self.mesh_anchor_prob
                 if np.random.random() < anchor_prob:
-                    starts = self._sample_mesh_centered_start(vol)
+                    centered = self._sample_mesh_centered_start(vol)
+                    if centered is not None:
+                        starts, mesh_anchor = centered
             if starts is None:
                 if self.object_mask_enabled:
                     starts = self._sample_object_start(vol)
@@ -1349,7 +1353,7 @@ class SSLZarrDataset(Dataset):
             # skips only windows the check after reading would reject.
             if vol.occupancy is not None and self._occupied_fraction(vol, starts) < nonzero_threshold:
                 continue
-            return SourcePlan(vol, self._get_volume_array(vol), tuple(starts), anchor_index)
+            return SourcePlan(vol, self._get_volume_array(vol), tuple(starts), anchor_index, mesh_anchor)
 
     def _next_source_crop(self, nonzero_threshold):
         while True:
@@ -1380,7 +1384,8 @@ class SSLZarrDataset(Dataset):
         plan, source_crop = self._next_source_crop(nonzero_threshold)
         vol = plan.volume
         anchor_index = plan.anchor_index
-        source_starts = plan.starts if anchor_index is not None else None
+        mesh_anchor = plan.mesh_anchor
+        source_starts = plan.starts if (anchor_index is not None or mesh_anchor is not None) else None
 
         if self.single_crop_only:
             crop = self._random_resized_crop_3d_from_array(
@@ -1402,15 +1407,19 @@ class SSLZarrDataset(Dataset):
         token_keypoints = []
         if self.object_points_enabled or self.cross_view_token_patch_size is not None:
             # Object points and token correspondences need both regions first.
-            crop_regions = [self._sample_global_crop_region(source_crop, vol, anchor_index, source_starts)
-                            for _ in self.global_transforms]
+            crop_regions = [
+                self._sample_global_crop_region(source_crop, vol, anchor_index, source_starts, mesh_anchor=mesh_anchor)
+                for _ in self.global_transforms
+            ]
         if self.object_points_enabled:
             object_points = self._sample_object_points(vol, plan.starts, crop_regions)
         for view_index, (transform, crop_region) in enumerate(zip(self.global_transforms, crop_regions)):
             # Sample one shared region so the student and Gram teacher observe the
             # exact same 3D field of view, optionally at different resolutions.
             if crop_region is None:
-                crop_region = self._sample_global_crop_region(source_crop, vol, anchor_index, source_starts)
+                crop_region = self._sample_global_crop_region(
+                    source_crop, vol, anchor_index, source_starts, mesh_anchor=mesh_anchor
+                )
             extra_keypoints = None
             if self.cross_view_token_patch_size is not None:
                 # This view's token centers, then the other view's token centers mapped
@@ -1526,17 +1535,20 @@ class SSLZarrDataset(Dataset):
             sample["object_point_ink"] = torch.from_numpy(object_points.ink)
         return sample
 
-    def _sample_global_crop_region(self, source_crop, vol, anchor_index, source_starts):
+    def _sample_global_crop_region(self, source_crop, vol, anchor_index, source_starts, *, mesh_anchor=None):
+        anchor = None
+        if anchor_index is not None:
+            anchor = vol.point_coordinates[anchor_index] - np.asarray(source_starts, dtype=np.float64)
+        elif mesh_anchor is not None and source_starts is not None:
+            raw_anchor = np.asarray(mesh_anchor, dtype=np.float64) - np.asarray(source_starts, dtype=np.float64)
+            hi_bound = np.maximum(1.0, np.asarray(source_crop.shape, dtype=np.float64) - 2.0)
+            anchor = np.clip(raw_anchor, np.minimum(1.0, hi_bound), hi_bound)
         return self._sample_random_resized_crop_region(
             source_crop.shape,
             self.global_crop_scale,
             self.paired_global_crop_size,
-            anchor=(
-                vol.point_coordinates[anchor_index] - np.asarray(source_starts, dtype=np.float64)
-                if anchor_index is not None
-                else None
-            ),
-            anchor_target_size=self.global_crop_size if anchor_index is not None else None,
+            anchor=anchor,
+            anchor_target_size=self.global_crop_size if anchor is not None else None,
         )
 
     def _transform_object_points(

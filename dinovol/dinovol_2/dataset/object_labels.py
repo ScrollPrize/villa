@@ -978,12 +978,15 @@ def crop_mesh_objects(
         take = min(points_per_sheet, len(sheet.coords))
         ink_pos = np.flatnonzero(sheet.ink_state == 1)
         ink_neg = np.flatnonzero(sheet.ink_state == -1)
-        if ink_pos.size > 0 and ink_neg.size > 0:
-            n_pos = min(ink_pos.size, max(1, take // 2))
-            n_neg = min(ink_neg.size, take - n_pos)
+        if ink_pos.size > 0:
+            n_pos = min(ink_pos.size, max(1, take // 2) if ink_neg.size > 0 else take)
             chosen_pos = ink_pos[_sample_spread_indices(sheet.uv_coords[ink_pos], n_pos, rng)]
-            chosen_neg = ink_neg[_sample_spread_indices(sheet.uv_coords[ink_neg], n_neg, rng)]
-            chosen = np.concatenate([chosen_pos, chosen_neg])
+            if ink_neg.size > 0 and take > n_pos:
+                n_neg = min(ink_neg.size, take - n_pos)
+                chosen_neg = ink_neg[_sample_spread_indices(sheet.uv_coords[ink_neg], n_neg, rng)]
+                chosen = np.concatenate([chosen_pos, chosen_neg])
+            else:
+                chosen = chosen_pos
             if chosen.size < take:
                 rem_mask = np.ones(len(sheet.coords), dtype=bool)
                 rem_mask[chosen] = False

@@ -306,6 +306,25 @@ class ObjectLabelTests(unittest.TestCase):
         self.assertGreater(int(loss_fn.ink_pos_count.item()), 0)
         self.assertGreater(int(loss_fn.ink_neg_count.item()), 0)
 
+        # Even when embeddings start nearly collapsed (cosine > pos_margin=0.75), +1 and -1 gradients must oppose.
+        mu = F.normalize(torch.ones(1, 6), dim=-1)
+        s_collapsed = F.normalize(mu + 0.05 * torch.randn(views * batch, points, 6), dim=-1).requires_grad_(True)
+        t_collapsed = F.normalize(mu + 0.05 * torch.randn(views * batch, points, 6), dim=-1)
+        valid_2d = torch.ones(views, batch, points, dtype=torch.bool)
+        ink_loss, _ = loss_fn._ink_loss(s_collapsed, t_collapsed, valid_2d, valid_2d, ink, n_views=views)
+        ink_loss.backward()
+        g_pos = s_collapsed.grad[:, :2].reshape(-1, 6).mean(0)
+        g_neg = s_collapsed.grad[:, 2:4].reshape(-1, 6).mean(0)
+        self.assertLess(float(F.cosine_similarity(g_pos[None], g_neg[None])), -0.5)
+
+        # Batches with only -1 (non-ink) points and no +1 anchors must not pull embeddings together.
+        ink_neg_only = torch.tensor([[-1, -1, -1, 0, 0, 0, 0, 0], [-1, -1, -1, 0, 0, 0, 0, 0]], dtype=torch.long)
+        neg_only_loss, neg_only_anchors = loss_fn._ink_loss(
+            ink_emb, ink_emb.flip(0), valid_2d, valid_2d, ink_neg_only, n_views=views
+        )
+        self.assertEqual(float(neg_only_loss), 0.0)
+        self.assertEqual(int(neg_only_anchors), 0)
+
 
 class ObjectPointDatasetTests(unittest.TestCase):
     def setUp(self):

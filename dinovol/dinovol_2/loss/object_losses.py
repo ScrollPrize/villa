@@ -16,6 +16,7 @@ All terms compare a student view with the teacher's other view:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Callable
 
 import torch
@@ -257,7 +258,8 @@ class ObjectLoss(nn.Module):
             pos_keys = torch.cat([t_flat[t_pos_idx], q_pos], dim=0) if t_pos_idx.numel() else q_pos
             neg_keys = torch.cat([t_flat[t_neg_idx], q_neg], dim=0) if t_neg_idx.numel() else q_neg
 
-            # 1. Confirmed ink anchors (+1) pulled to cross-view & cross-batch ink keys, pushed from non-ink keys.
+            # Require confirmed ink (+1) anchors in the view so non-ink-only crops do not
+            # pull all embeddings toward a single cluster without opposing ink anchors.
             if s_pos_idx.numel() > 0 and pos_keys.shape[0] > 0 and neg_keys.shape[0] > 0:
                 anchors = s_flat[s_pos_idx]
                 sim_pos = anchors @ pos_keys.T
@@ -275,31 +277,31 @@ class ObjectLoss(nn.Module):
                     pos_mask = torch.where(pos_mask.any(-1, keepdim=True), pos_mask, torch.ones_like(pos_mask))
                 else:
                     pos_mask = torch.ones_like(sim_pos, dtype=torch.bool)
-                pos_logits = (
-                    sim_pos.clamp(max=self.pos_margin) if self.pos_margin < 1.0 else sim_pos
-                ) / self.ink_temperature
+                # Do not clamp ink positive similarities with pos_margin: ink is a semantic
+                # class that should converge to high cosine agreement across views/batches,
+                # and clamping above pos_margin zeroes out the attractive gradient.
+                pos_logits = sim_pos / self.ink_temperature
                 neg_logits = (anchors @ neg_keys.T) / self.ink_temperature
-                neg_lse = torch.logsumexp(neg_logits, dim=-1, keepdim=True)
-                per_pos = F.softplus(neg_lse - pos_logits)
+                neg_lme = torch.logsumexp(neg_logits, dim=-1, keepdim=True) - math.log(neg_keys.shape[0])
+                per_pos = F.softplus(neg_lme - pos_logits)
                 anchor_losses = (
                     torch.where(pos_mask, per_pos, torch.zeros_like(per_pos)).sum(-1)
                     / pos_mask.sum(-1).clamp(min=1)
                 )
-                loss_terms.append(anchor_losses)
+                pos_view_loss = anchor_losses.mean()
                 total_anchors = total_anchors + anchor_losses.numel()
 
-            # 2. Confirmed non-ink surface anchors (-1) contrasted against ink keys.
-            if s_neg_idx.numel() > 0 and neg_keys.shape[0] > 0 and pos_keys.shape[0] > 0:
-                neg_anchors = s_flat[s_neg_idx]
-                sim_same = neg_anchors @ neg_keys.T
-                same_logits = (
-                    sim_same.clamp(max=self.pos_margin) if self.pos_margin < 1.0 else sim_same
-                ) / self.ink_temperature
-                opp_logits = (neg_anchors @ pos_keys.T) / self.ink_temperature
-                opp_lse = torch.logsumexp(opp_logits, dim=-1, keepdim=True)
-                neg_anchor_losses = F.softplus(opp_lse - same_logits).mean(-1)
-                loss_terms.append(neg_anchor_losses)
-                total_anchors = total_anchors + neg_anchor_losses.numel()
+                if s_neg_idx.numel() > 0:
+                    neg_anchors = s_flat[s_neg_idx]
+                    same_logits = (neg_anchors @ neg_keys.T) / self.ink_temperature
+                    opp_logits = (neg_anchors @ pos_keys.T) / self.ink_temperature
+                    opp_lme = torch.logsumexp(opp_logits, dim=-1, keepdim=True) - math.log(pos_keys.shape[0])
+                    neg_anchor_losses = F.softplus(opp_lme - same_logits).mean(-1)
+                    neg_view_loss = neg_anchor_losses.mean()
+                    loss_terms.append(0.5 * (pos_view_loss + neg_view_loss))
+                    total_anchors = total_anchors + neg_anchor_losses.numel()
+                else:
+                    loss_terms.append(pos_view_loss)
 
         if self.ink_queue_size > 0 and torch.is_grad_enabled():
             with torch.no_grad():
@@ -323,8 +325,7 @@ class ObjectLoss(nn.Module):
 
         if not loss_terms:
             return zero + zero_touch, zero_count
-        all_losses = torch.cat(loss_terms, dim=0)
-        return all_losses.mean() + zero_touch, total_anchors
+        return torch.stack(loss_terms).mean() + zero_touch, total_anchors
 
     def _region_loss(
         self,
