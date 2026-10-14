@@ -220,6 +220,14 @@ layouts, pass `--umbilicus /path/to/umbilicus.json`. Use `--lasagna-dir` if
 the Lasagna repository is not in its standard sibling or `~/villa` location.
 An existing output path is never overwritten.
 
+New checkpoints store `umbilicus_coordinate_scale` from the scroll
+specification. Checkpoint flattening, winding analysis, and winding-ray
+reconstruction use this scale when loading the external umbilicus curve.
+In-session loading refuses a checkpoint whose stored scale differs from the
+live scroll specification. Older checkpoints without the field retain the
+previous reconstruction scale of `1.0`; their original scale cannot be
+recovered from the model weights.
+
 ## Hover descriptions (descriptions.json)
 
 The text VC3D shows when hovering a Spiral tab control or a setting in the

@@ -146,7 +146,8 @@ def _build_model(
 
     z_values = np.arange(z_begin, z_end)
     centre = json_umbilicus_z_to_yx(
-        str(umbilicus_path), coordinate_scale=1.0)
+        str(umbilicus_path),
+        coordinate_scale=checkpoint.get("umbilicus_coordinate_scale", 1.0))
     umbilicus_zyx = torch.from_numpy(np.concatenate([
         z_values[:, None], centre(z_values),
     ], axis=-1).astype(np.float32)).to(device)

@@ -206,6 +206,7 @@ def build_fit_inputs(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_
         name='analysis',
         voxel_size_um=9.6,
         spiral_outward_sense=checkpoint.get('spiral_outward_sense') or 'CW',
+        umbilicus_coordinate_scale=checkpoint.get('umbilicus_coordinate_scale', 1.0),
     )
     # This analysis needs no scroll volume, track store, or outer shell:
     # leaving those paths empty keeps load_host_inputs() from touching the

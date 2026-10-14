@@ -595,7 +595,8 @@ def build_seed_rays_from_meshes(args):
     z_lo, z_hi = max(z_lo, z_begin), min(z_hi, z_end)
     if z_lo >= z_hi:
         raise ValueError(f"empty z range [{z_lo}, {z_hi})")
-    dr_per_winding = float(cfg.get("initial_dr_per_winding", 16.0))
+    dr_per_winding = float(cfg.get(
+        "model_initial_dr_per_winding", cfg.get("initial_dr_per_winding", 16.0)))
     del checkpoint
 
     if args.meshes_dir:
@@ -614,7 +615,9 @@ def build_seed_rays_from_meshes(args):
     else:
         first = int(cfg.get("output_first_winding", 10))
         last = int(cfg.get("shell_outer_winding_idx")
-                   or int(cfg["gap_expander_num_windings"]) - 1)
+                   or int(cfg["model_gap_expander_num_windings"]
+                          if "model_gap_expander_num_windings" in cfg
+                          else cfg["gap_expander_num_windings"]) - 1)
     wanted = set(range(first, last + 1, args.winding_step))
 
     pattern = re.compile(r"^w(?P<index>\d+)_spliced")
@@ -732,12 +735,13 @@ def build_seed_rays(args, device="cuda:0"):
     checkpoint = _load_checkpoint_cfg(args.fit_checkpoint)
     cfg = dict(checkpoint["cfg"])
     for key in ("num_flow_integration_steps", "flow_integration_solver",
-                "num_flow_timesteps", "num_flow_stages", "flow_bounds_z_margin",
+                "num_flow_stages", "flow_bounds_z_margin",
                 "flow_bounds_radius", "flow_voxel_resolution", "flow_field_type",
                 "gap_expander_logit_resolution", "gap_expander_num_windings",
                 "gap_expander_lr_scale", "linear_z_resolution",
                 "initial_dr_per_winding"):
-        cfg.setdefault(f"model_{key}", cfg[key])
+        if f"model_{key}" not in cfg and key in cfg:
+            cfg[f"model_{key}"] = cfg[key]
 
     z_begin, z_end = int(checkpoint["z_begin"]), int(checkpoint["z_end"])
     z_lo, z_hi = args.z_range if args.z_range else (z_begin, z_end)
@@ -760,7 +764,9 @@ def build_seed_rays(args, device="cuda:0"):
 
     device = torch.device(device)
     z_values = np.arange(z_begin, z_end)
-    centre = json_umbilicus_z_to_yx(umbilicus_path, coordinate_scale=1.0)
+    centre = json_umbilicus_z_to_yx(
+        umbilicus_path,
+        coordinate_scale=checkpoint.get("umbilicus_coordinate_scale", 1.0))
     umbilicus_zyx = torch.from_numpy(np.concatenate(
         [z_values[:, None], centre(z_values)], axis=-1
     ).astype(np.float32)).to(device)

@@ -1,0 +1,2 @@
+# The regression verifies the published fixture byte-level SHA256.
+umbilicus.json -text

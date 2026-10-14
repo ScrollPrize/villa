@@ -44,6 +44,17 @@ Cache creation uses only:
   `--volume-cache-bytes`);
 - execution (`--gpus`, `--compile`, and optional `--max-slabs`).
 
+With `--seed-source spiral`, ray reconstruction accepts current `model_*`
+checkpoint configuration keys and legacy unprefixed keys. Current keys take
+precedence when both are present; the retired `num_flow_timesteps` key is not
+required. A checkpoint without a flow-stage count uses the model's single-stage
+default.
+Ray reconstruction also applies the checkpoint's `umbilicus_coordinate_scale`
+to the external umbilicus curve. Older checkpoints without this field retain
+the previous scale of `1.0`.
+The default mesh seed path likewise accepts current and legacy winding-count
+and initial-spacing keys, with current `model_*` values taking precedence.
+
 The cache contains:
 
 - `phase/shard_*`: losslessly compressed native phase;

@@ -3605,6 +3605,7 @@ class FitContext:
             'z_end': self.model_z_end,
             'spiral_outward_sense': self.spiral_outward_sense,
             'z_direction_is_top_to_bottom': self.z_direction_is_top_to_bottom,
+            'umbilicus_coordinate_scale': float(self.scroll.umbilicus_coordinate_scale),
             'numpy_rng_state': np.random.get_state(),
             'torch_cpu_rng_state': torch.random.get_rng_state(),
             'torch_cuda_rng_states': torch.cuda.get_rng_state_all(),
@@ -3724,6 +3725,14 @@ class FitContext:
                 f'{checkpoint["z_direction_is_top_to_bottom"]!r}) does not '
                 f'match the scroll spec '
                 f'({self.z_direction_is_top_to_bottom!r})')
+        if ('umbilicus_coordinate_scale' in checkpoint
+                and checkpoint['umbilicus_coordinate_scale']
+                != self.scroll.umbilicus_coordinate_scale):
+            reasons.append(
+                f'checkpoint umbilicus_coordinate_scale='
+                f'{checkpoint["umbilicus_coordinate_scale"]!r} does not '
+                f'match the scroll spec '
+                f'({self.scroll.umbilicus_coordinate_scale!r})')
         checkpoint_base_shape = checkpoint.get('base_shape_zyx')
         if checkpoint_base_shape is not None:
             if (not isinstance(checkpoint_base_shape, (list, tuple))
