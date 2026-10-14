@@ -608,10 +608,19 @@ def load_or_build_volume_meshes(
         return load_mesh_segments_cache(cache_file)
 
     if metadata_path is None:
-        default_meta = Path("/tmp/vesuvius_metadata.json")
-        if default_meta.is_file():
-            metadata_path = default_meta
-        else:
+        candidates = []
+        if cache_dir is not None:
+            candidates.append(Path(cache_dir) / "metadata.json")
+        candidates.extend([
+            Path("/ephemeral/sean/dinovol_perf/mesh_cache_8_9um/metadata.json"),
+            Path("/ephemeral/sean/dinovol_perf/tmp/vesuvius_metadata.json"),
+            Path("/tmp/vesuvius_metadata.json"),
+        ])
+        for cand in candidates:
+            if cand.is_file():
+                metadata_path = cand
+                break
+        if metadata_path is None:
             return []
 
     path_str = str(metadata_path)
@@ -652,8 +661,7 @@ def load_or_build_volume_meshes(
         if vt.get("to_volume_id") == volume_id and "matrix" in vt:
             transforms_to_target[str(vt["from_volume_id"])] = np.asarray(vt["matrix"], dtype=np.float64)
 
-    segments: list[MeshSegment] = []
-    for seg in target_sample.get("segments", []):
+    def _build_one_segment(seg: dict[str, Any]) -> MeshSegment | None:
         seg_id = seg.get("id", "unknown")
         orig_vol = str(seg.get("original_volume_id", ""))
         reps = seg.get("representations", [])
@@ -681,7 +689,7 @@ def load_or_build_volume_meshes(
                 transform_matrix = transforms_to_target[orig_vol]
 
         if tif_url is None:
-            continue
+            return None
 
         base_url = str(tif_url).rstrip("/")
         if base_url.startswith("https://vesuvius-challenge-open-data.s3.amazonaws.com/"):
@@ -692,7 +700,7 @@ def load_or_build_volume_meshes(
             y_arr = _read_tiff(f"{base_url}/y.tif", s3_storage_options)
             z_arr = _read_tiff(f"{base_url}/z.tif", s3_storage_options)
         except Exception:
-            continue
+            return None
 
         ink_arr = sup_arr = None
         for rep in reps:
@@ -707,7 +715,7 @@ def load_or_build_volume_meshes(
                     ink_arr = sup_arr = None
                 break
 
-        built = build_mesh_segment_from_arrays(
+        return build_mesh_segment_from_arrays(
             seg_id,
             x_arr,
             y_arr,
@@ -719,10 +727,18 @@ def load_or_build_volume_meshes(
             inklabels=ink_arr,
             supervision=sup_arr,
         )
-        if built is not None:
-            segments.append(built)
 
-    if cache_file is not None and segments:
+    raw_segments = list(target_sample.get("segments", []))
+    segments: list[MeshSegment] = []
+    if raw_segments:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(16, len(raw_segments))) as pool:
+            for built in pool.map(_build_one_segment, raw_segments):
+                if built is not None:
+                    segments.append(built)
+
+    if cache_file is not None:
         try:
             save_mesh_segments_cache(cache_file, segments)
         except OSError:

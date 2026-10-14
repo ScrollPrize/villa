@@ -441,10 +441,10 @@ class ObjectLossTrainingTests(unittest.TestCase):
             self.assertTrue(any(name.startswith("region_head.") for name in changed))
             self.assertTrue(any("down_projection.stages.0" in name for name in changed))
             self.assertFalse(torch.equal(trainer.model_module.teacher.dense_head.mlp[0].weight, teacher_head))
-            # Monitor rows: input, then 4 token PCA sets and 4 dense-head PCA sets, per view.
+            # Monitor rows: input, then 4 token PCA sets, 4 dense-head PCA sets, and 1 ink PCA set, per view.
             from PIL import Image
-            image = Image.open(trainer.save_monitor_image(trainer._monitor_subset(batches[-1]), 1, metrics))
-            self.assertEqual(image.size, (2 * (1 + 2 * 4) * 32, 2 * 32))
+            with Image.open(trainer.save_monitor_image(trainer._monitor_subset(batches[-1]), 1, metrics)) as image:
+                self.assertEqual(image.size, (2 * (1 + 2 * 4 + 1) * 32, 2 * 32))
         finally:
             trainer._close_dataloader(loader)
             trainer._close_auxiliary_datasets()

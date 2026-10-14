@@ -2077,13 +2077,14 @@ class DinoIBOTPretrainer:
             resized.append(image[0].permute(1, 2, 0).numpy().astype(np.uint8))
         return resized
 
-    def _pca_rgb(self, features: torch.Tensor) -> list[np.ndarray]:
+    def _pca_rgb(self, features: torch.Tensor, sets: int | None = None) -> list[np.ndarray]:
         """[H, W, C] features -> one [H, W, 3] uint8 image per set of three principal
-        components (1-3, 4-6, ...), `monitor_pca_sets` images in all."""
+        components (1-3, 4-6, ...), `sets` (default `monitor_pca_sets`) images in all."""
         h, w, c = features.shape
         flat = features.float().reshape(h * w, c)
         flat = flat - flat.mean(dim=0)
-        components = 3 * self.monitor_pca_sets
+        n_sets = self.monitor_pca_sets if sets is None else int(sets)
+        components = 3 * n_sets
         rank = min(components, h * w, c)
         _, _, V = torch.pca_lowrank(flat, q=rank)
         projected = (flat @ V[:, :rank]).reshape(h, w, rank).detach().cpu().numpy()
@@ -2115,8 +2116,8 @@ class DinoIBOTPretrainer:
     def save_monitor_image(self, monitor_batch: Mapping[str, Any], step: int, metrics: Mapping[str, float]) -> Path:
         self.model.eval()
         # Per view: the input's center slice, then PCA sets of the patch tokens and, with
-        # the dense point head, of its embedding at every voxel of that slice (colors are
-        # comparable only within one panel).
+        # the dense point head, of its object embedding and ink embedding at every voxel
+        # of that slice (colors are comparable only within one panel).
         dense_panels = self.model_module.dense_enabled
         with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp):
             global_crops = monitor_batch["collated_global_crops"].to(self.device, non_blocking=True)
@@ -2153,6 +2154,11 @@ class DinoIBOTPretrainer:
                 if dense_panels:
                     dense = student_outputs["object_points"]["dense"][tensor_index]
                     panels.extend(self._pca_rgb(dense.reshape(*center_slice.shape, dense.shape[-1])))
+                    if "ink" in student_outputs["object_points"]:
+                        ink_feat = student_outputs["object_points"]["ink"][tensor_index]
+                        panels.extend(
+                            self._pca_rgb(ink_feat.reshape(*center_slice.shape, ink_feat.shape[-1]), sets=1)
+                        )
             rows.append(np.concatenate(panels, axis=1))
 
         canvas = np.concatenate(rows, axis=0) if rows else np.zeros((256, 256, 3), dtype=np.uint8)
@@ -2362,6 +2368,7 @@ class DinoIBOTPretrainer:
                                 "obj_pt": f"{metrics['object_point_loss']:.3f}",
                                 "obj": f"{metrics['object_loss']:.3f}",
                                 "obj_reg": f"{metrics['object_region_loss']:.3f}",
+                                "obj_ink": f"{metrics['object_ink_loss']:.3f}",
                             }
                             if self.do_object_losses
                             else {}

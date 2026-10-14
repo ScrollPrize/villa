@@ -18,13 +18,12 @@ from dinovol_2.dataset.zarr_io import open_zarr_array
 DEFAULT_METADATA_URL = "https://vesuvius-challenge-open-data.s3.amazonaws.com/metadata.json"
 
 
-def ensure_metadata(metadata_path: Path, url: str = DEFAULT_METADATA_URL) -> dict:
+def ensure_metadata(metadata_path: Path, url: str = DEFAULT_METADATA_URL) -> Path:
     if not metadata_path.is_file():
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
         print(f"Downloading {url} -> {metadata_path} ...")
         urllib.request.urlretrieve(url, metadata_path)
-    with metadata_path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    return metadata_path
 
 
 def main() -> None:
@@ -38,8 +37,8 @@ def main() -> None:
     parser.add_argument(
         "--metadata",
         type=Path,
-        default=Path("/tmp/vesuvius_metadata.json"),
-        help="Local path to cache metadata.json.",
+        default=None,
+        help="Local path to cache metadata.json (defaults to <cache_dir>/metadata.json).",
     )
     parser.add_argument(
         "--cache-dir",
@@ -54,10 +53,10 @@ def main() -> None:
 
     dataset_cfg = dict(config.get("dataset") or {})
     obj_cfg = dict(dataset_cfg.get("object_points") or {})
-    cache_dir = args.cache_dir or Path(obj_cfg.get("mesh_cache_dir", "./mesh_cache_8_9um"))
+    cache_dir = args.cache_dir or Path(obj_cfg.get("mesh_cache_dir", "../mesh_cache_8_9um"))
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    metadata = ensure_metadata(args.metadata)
+    metadata_path = ensure_metadata(args.metadata or (cache_dir / "metadata.json"))
     s3_opts = dict(dataset_cfg.get("s3_storage_options") or {"anon": True})
     datasets = list(dataset_cfg.get("datasets") or [])
 
@@ -66,16 +65,15 @@ def main() -> None:
     volumes_with_meshes = 0
     for idx, entry in enumerate(datasets):
         vol_path = str(entry["volume_path"])
-        vol_scale = str(entry.get("volume_scale", 0))
-        scale0_arr = open_zarr_array(vol_path, "0", storage_options=s3_opts)
-        sel_arr = open_zarr_array(vol_path, vol_scale, storage_options=s3_opts)
-        scale0_shape = tuple(int(d) for d in scale0_arr.shape[:3])
+        vol_scale = int(entry.get("volume_scale", 0))
+        sel_arr = open_zarr_array(vol_path, str(vol_scale), storage_options=s3_opts)
         sel_shape = tuple(int(d) for d in sel_arr.shape[:3])
         meshes = load_or_build_volume_meshes(
             vol_path,
-            scale0_shape,
+            vol_scale,
             sel_shape,
-            metadata=metadata,
+            sample_id=entry.get("sample_id"),
+            metadata_path=metadata_path,
             cache_dir=cache_dir,
             s3_storage_options=s3_opts,
         )
@@ -86,12 +84,14 @@ def main() -> None:
         total_ink_segments += n_ink
         print(
             f"[{idx + 1}/{len(datasets)}] {entry.get('sample_id', vol_path)}: "
-            f"{len(meshes)} meshes ({n_ink} with ink-labels)"
+            f"{len(meshes)} meshes ({n_ink} with ink-labels)",
+            flush=True,
         )
 
     print(
         f"Done: cached {total_segments} meshes ({total_ink_segments} with ink-labels) "
-        f"across {volumes_with_meshes}/{len(datasets)} volumes in {cache_dir}"
+        f"across {volumes_with_meshes}/{len(datasets)} volumes in {cache_dir.resolve()}",
+        flush=True,
     )
 
 

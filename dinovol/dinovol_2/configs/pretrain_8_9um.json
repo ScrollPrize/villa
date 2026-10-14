@@ -116,7 +116,7 @@
       "slab_thickness": 0,
       "presence_threshold": 127,
       "use_metadata_meshes": true,
-      "mesh_cache_dir": "./mesh_cache_8_9um",
+      "mesh_cache_dir": "../mesh_cache_8_9um",
       "mesh_oversample": 2.0,
       "ink_oversample": 3.0,
       "fiber_oversample": 1.5,
