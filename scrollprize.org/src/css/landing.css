@@ -68,22 +68,22 @@
 .vc-landing .vc-section--last {
   padding-bottom: var(--vc-section-pad);
 }
-/* Open problems follows the dense news strip directly — half the gap;
-   the story rides the tighter 64px rhythm after it. */
+/* Open problems follows the dense news strip directly — a shorter gap;
+   the story sits a little further out than the 64px lower-page rhythm. */
 .vc-landing section[aria-labelledby="open-problems"] {
-  padding-top: 48px;
+  padding-top: 64px;
 }
 .vc-landing section[aria-labelledby="our-story"] {
-  padding-top: 64px;
+  padding-top: 80px;
 }
 @media (max-width: 768px) {
   .vc-landing section[aria-labelledby="our-story"] {
-    padding-top: 48px;
+    padding-top: 56px;
   }
 }
 @media (max-width: 768px) {
   .vc-landing section[aria-labelledby="open-problems"] {
-    padding-top: 32px;
+    padding-top: 44px;
   }
 }
 
