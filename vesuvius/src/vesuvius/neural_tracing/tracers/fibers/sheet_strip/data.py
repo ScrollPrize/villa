@@ -10,6 +10,7 @@ patch (sheet_strip/build_index.py). On top of the fiber follower's observation i
     continuation is then not supervised), else the simulated trace up to the head ('observed'). The trainer renders
     the tube channel on the GPU (sheet_strip/model.render_tube). The full fiber is cut to its matched spans
     (+-``span_margin``): beyond them it is unverified and may have left the sheet;
+  * with an umbilicus, the crop's orientation against the scroll (``crop_orientation``);
   * strip targets: the sheet height field over the strip grid (sheet_strip/targets.py) from the patches of every run
     of the fiber within reach of the crop (at most ``max_patches``, those with most samples near the head).
 
@@ -134,12 +135,31 @@ def polyline_points(world, pos, frame, crop, spacing, margin, limit):
     return local.astype(np.float32)
 
 
+def load_umbilicus(path):
+    """Umbilicus control points (K, 3) x, y, z (patch voxels) sorted by z, from an umbilicus.json."""
+    points = np.array([[p['x'], p['y'], p['z']] for p in json.loads(Path(path).read_text())['control_points']], np.float64)
+    return points[np.argsort(points[:, 2])]
+
+
+def crop_orientation(pos, frame, umbilicus, trace_per_patch):
+    """Per crop (positions (B, 3) trace voxels, frames (B, 3, 3) columns u, v, f in world xyz): its axes against the
+    scroll (B, 5): the outward horizontal component of u and of v (away from the umbilicus at the crop's height) and
+    the z components of u, v and f."""
+    pos, frame = np.asarray(pos, np.float64)/trace_per_patch, np.asarray(frame, np.float64)
+    centre = np.stack([np.interp(pos[:, 2], umbilicus[:, 2], umbilicus[:, k]) for k in (0, 1)], 1)
+    radial = pos[:, :2]-centre
+    radial /= np.maximum(np.linalg.norm(radial, axis=1, keepdims=True), 1e-9)
+    outward = np.einsum('bi,bij->bj', radial, frame[:, :2, :2])  # (u, v) . outward
+    return np.concatenate((outward, frame[:, 2, :]), 1).astype(np.float32)
+
+
 class StripBuilder(IdentityObservationBuilder):
     """The fiber follower's observation (augmentation included) plus the tube curve and strip targets (module
     docstring)."""
 
     def __init__(self, cfg, fibers: RunFibers, sampling, *, augment, trace_per_patch, full_tube_share=.5,
-                 max_patches=4, reach=110., fold_tolerance=2., max_slope_deg=70., tube_points=2048, span_margin=8.):
+                 max_patches=4, reach=110., fold_tolerance=2., max_slope_deg=70., tube_points=2048, span_margin=8.,
+                 umbilicus=None):
         super().__init__(cfg, fibers, sampling, augment=augment)
         self.index = fibers.index
         self.trace_per_patch, self.full_tube_share, self.max_patches = trace_per_patch, full_tube_share, max_patches
@@ -148,6 +168,7 @@ class StripBuilder(IdentityObservationBuilder):
         f, v = strip_grid(cfg)
         self.f, self.v = f.numpy().astype(np.float64), v.numpy().astype(np.float64)
         self.patch_store = PatchStore(max_open=64)
+        self.umbilicus = load_umbilicus(umbilicus) if umbilicus else None
 
     def prepare(self, item, fiber, rng):
         item = super().prepare(item, fiber, rng)
@@ -224,4 +245,8 @@ class StripBuilder(IdentityObservationBuilder):
                      strip_target=torch.from_numpy(targets), strip_mask=torch.from_numpy(masks),
                      strip_patches=torch.from_numpy(patches),
                      tube_full=torch.tensor([bool(item['tube_full']) for item in items]))
+        if self.umbilicus is not None:
+            batch['crop_orientation'] = torch.from_numpy(crop_orientation(
+                np.stack([i['pos'] for i in items]), np.stack([i['frame'] for i in items]), self.umbilicus,
+                self.trace_per_patch))
         return batch

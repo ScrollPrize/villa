@@ -23,8 +23,8 @@ def write_tifxyz(
     path: Union[str, Path],
     surface: Tifxyz,
     *,
-    compression: str = "lzw",
-    tile_size: int = 1024,
+    compression: Optional[str] = "lzw",
+    tile_size: Optional[int] = 1024,
     write_mask: bool = True,
     overwrite: bool = False,
 ) -> Path:
@@ -36,10 +36,12 @@ def write_tifxyz(
         Output directory path. Will be created if it doesn't exist.
     surface : Tifxyz
         Surface data to write.
-    compression : str
-        TIFF compression method. Default 'lzw'.
-    tile_size : int
-        TIFF tile size. Default 1024 to match C++ implementation.
+    compression : Optional[str]
+        TIFF compression method. Default 'lzw'; None writes uncompressed.
+    tile_size : Optional[int]
+        TIFF tile size. Default 1024 to match C++ implementation. None writes
+        each image as a single strip: with ``compression=None`` the bands can
+        be memory-mapped as written (VC3D's mmap layout).
     write_mask : bool
         If True, write mask.tif. Default True.
     overwrite : bool
@@ -73,10 +75,10 @@ class TifxyzWriter:
     ----------
     path : Union[str, Path]
         Output directory path.
-    compression : str
-        TIFF compression method. Default 'lzw'.
-    tile_size : int
-        TIFF tile size. Default 1024.
+    compression : Optional[str]
+        TIFF compression method. Default 'lzw'; None writes uncompressed.
+    tile_size : Optional[int]
+        TIFF tile size. Default 1024; None writes a single strip.
     overwrite : bool
         If True, overwrite existing files. Default False.
     """
@@ -85,8 +87,8 @@ class TifxyzWriter:
         self,
         path: Union[str, Path],
         *,
-        compression: str = "lzw",
-        tile_size: int = 1024,
+        compression: Optional[str] = "lzw",
+        tile_size: Optional[int] = 1024,
         overwrite: bool = False,
     ) -> None:
         """Initialize writer."""
@@ -107,6 +109,22 @@ class TifxyzWriter:
         else:
             self.path.mkdir(parents=True, exist_ok=True)
 
+    def _tiles(self, h: int, w: int) -> tuple:
+        """Whether to tile an (h, w) image, and the tile shape."""
+        if self.tile_size is None:
+            return False, 0, 0
+        # Determine tile size (can't be larger than image)
+        # tifffile requires tiles to be multiples of 16
+        tile_h = min(self.tile_size, h)
+        tile_w = min(self.tile_size, w)
+
+        # Round down to multiple of 16, minimum 16
+        tile_h = max(16, (tile_h // 16) * 16)
+        tile_w = max(16, (tile_w // 16) * 16)
+
+        # For small images, use strip-based writing instead of tiles
+        return h >= 16 and w >= 16, tile_h, tile_w
+
     def write_tiff(
         self,
         filename: str,
@@ -124,17 +142,7 @@ class TifxyzWriter:
         output_path = self.path / filename
         h, w = data.shape[:2]
 
-        # Determine tile size (can't be larger than image)
-        # tifffile requires tiles to be multiples of 16
-        tile_h = min(self.tile_size, h)
-        tile_w = min(self.tile_size, w)
-
-        # Round down to multiple of 16, minimum 16
-        tile_h = max(16, (tile_h // 16) * 16)
-        tile_w = max(16, (tile_w // 16) * 16)
-
-        # For small images, use strip-based writing instead of tiles
-        use_tiles = h >= 16 and w >= 16
+        use_tiles, tile_h, tile_w = self._tiles(h, w)
 
         if use_tiles:
             tifffile.imwrite(
@@ -145,12 +153,13 @@ class TifxyzWriter:
                 photometric="minisblack",
             )
         else:
-            # Fall back to strip-based for very small images
+            # Strips: very small images, or untiled output (a single strip)
             tifffile.imwrite(
                 str(output_path),
                 data.astype(np.float32),
                 compression=self.compression,
                 photometric="minisblack",
+                rowsperstrip=h if self.tile_size is None else None,
             )
 
     def write_metadata(
@@ -216,16 +225,10 @@ class TifxyzWriter:
         output_path = self.path / "mask.tif"
         h, w = mask.shape[:2]
 
-        # Determine tile size
-        tile_h = min(self.tile_size, h)
-        tile_w = min(self.tile_size, w)
-        tile_h = max(16, (tile_h // 16) * 16)
-        tile_w = max(16, (tile_w // 16) * 16)
+        use_tiles, tile_h, tile_w = self._tiles(h, w)
 
         # Convert to uint8 (255 = valid, 0 = invalid)
         mask_uint8 = (mask.astype(np.uint8) * 255)
-
-        use_tiles = h >= 16 and w >= 16
 
         if use_tiles:
             tifffile.imwrite(
@@ -241,6 +244,7 @@ class TifxyzWriter:
                 mask_uint8,
                 compression=self.compression,
                 photometric="minisblack",
+                rowsperstrip=h if self.tile_size is None else None,
             )
 
     def write(

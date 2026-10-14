@@ -36,7 +36,8 @@ from vesuvius.neural_tracing.tracers.fibers.data.samples import SampleConfig
 from vesuvius.neural_tracing.tracers.fibers.data.tasks import TASKS, TaskBudget
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import frame_predictor, prediction_window
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.data import RunFibers, StripBuilder, StripDataset, StripIndex
-from vesuvius.neural_tracing.tracers.fibers.sheet_strip.model import SheetStripConfig, SheetStripFollower, render_tube
+from vesuvius.neural_tracing.tracers.fibers.sheet_strip.model import (
+    SheetStripConfig, SheetStripFollower, extend_strip_stages, render_tube)
 from vesuvius.neural_tracing.tracers.fibers.train.supervision import loss_terms
 from vesuvius.neural_tracing.tracers.models.checkpoint import read_checkpoint
 from vesuvius.neural_tracing.tracers.models.model import config_from_checkpoint
@@ -61,6 +62,7 @@ class DataOptions:
     fold_tolerance: float = 2.  # crop units: covering triangles/patches disagreeing more than this mask the point
     max_slope_deg: float = 70.
     span_margin: float = 8.  # patch voxels of fiber shown beyond its matched spans (full tube)
+    umbilicus: str = ''  # umbilicus.json (patch voxels): the batches carry the crops' orientation to the scroll
 
 
 @dataclass
@@ -124,26 +126,40 @@ class RunConfig:
         run = cls(**{k: v for k, v in document.items() if k not in sections},
                   **{k: s(**document.get(k, {})) for k, s in sections.items()})
         run.out_root, run.init_checkpoint = resolve(run.out_root), resolve(run.init_checkpoint)
-        run.data.index, run.data.afv = resolve(run.data.index), resolve(run.data.afv)
+        run.data.index, run.data.afv, run.data.umbilicus = (resolve(run.data.index), resolve(run.data.afv),
+                                                            resolve(run.data.umbilicus))
         return run
 
     def to_dict(self):
         return asdict(self)
 
 
+def load_init_checkpoint(path):
+    """A fiber follower checkpoint, or a sheet-strip run's checkpoint to continue from."""
+    ck = torch.load(path, map_location='cpu', weights_only=False)
+    return ck if ck.get('model_type') == 'sheet_strip' else read_checkpoint(path, 'cpu')
+
+
 def strip_model_config(checkpoint, overrides):
     """The checkpoint's model configuration as a SheetStripConfig with ``overrides``; the path keeps the checkpoint's
     lateral bound unless overridden."""
+    if checkpoint.get('model_type') == 'sheet_strip':
+        return SheetStripConfig(**{**checkpoint['model_cfg'], **overrides})
     base = config_from_checkpoint(checkpoint)
     values = dict(base.to_dict(), model_type='sheet_strip', path_lateral_limit=base.lateral_limit)
     return SheetStripConfig(**{**values, **overrides})
 
 
 def initialize(cfg, checkpoint, device):
-    """Model and EMA from the checkpoint's EMA weights (tube input channels zero, strip modules fresh)."""
+    """Model and EMA from the checkpoint's EMA weights (tube input channels zero, strip modules fresh). From a
+    sheet-strip checkpoint, added refinement stages start as copies of its last one and other strip modules whose
+    shape changed start fresh."""
     model = SheetStripFollower(cfg).to(device, memory_format=conv_memory_format(device))
-    state = add_input_channels(model, checkpoint.get('ema', checkpoint['model']))
-    report = load_matching_weights(model, state)
+    strip = checkpoint.get('model_type') == 'sheet_strip'
+    state = checkpoint.get('ema', checkpoint['model'])
+    report = load_matching_weights(model, extend_strip_stages(state, cfg) if strip else add_input_channels(model, state))
+    if strip:
+        report['mismatched'] = [n for n in report['mismatched'] if not n.startswith('strip_')]
     if report['mismatched'] or report['unexpected']:
         raise ValueError(f'Checkpoint weights do not fit: mismatched {report["mismatched"]}, unused {report["unexpected"]}')
     if any(not name.startswith('strip_') for name in report['fresh']):
@@ -165,6 +181,8 @@ def with_tube(model, batch):
     """The batch's model input with the rendered tube channel appended to the CT crop."""
     cfg = model.cfg
     x = dict(batch['x'])
+    if 'crop_orientation' in batch:
+        x['orientation'] = batch['crop_orientation']
     if cfg.tube_channel:
         tube = render_tube(batch['tube_points'], batch['tube_valid'], cfg.fine, cfg.tube_sigma)
         x['fine'] = torch.cat((x['fine'], tube.to(x['fine'].dtype)), 1).contiguous(
@@ -200,6 +218,14 @@ def forward_losses(model, batch, run):
     strip = strip.sum()/rows
     loss = t.path_weight*(geometry+t.confidence_weight*confidence)+t.strip_weight*strip
     metrics = dict(loss=loss.detach(), strip=strip.detach(), geometry=geometry.detach(), confidence=confidence.detach())
+    if 'strip_log_scale' in output:
+        # Laplace likelihood of the last pass's (fixed) error under the predicted scale, per supervised point.
+        s = output['strip_log_scale'].clamp(-6., 6.)
+        error = (output['strip_heights'][:, -1].detach()-batch['strip_target']).abs()
+        mask = batch['strip_mask'].float()
+        uncertainty = ((error*torch.exp(-s)+s)*mask).sum()/mask.sum().clamp_min(1)
+        loss = loss+uncertainty
+        metrics['uncertainty'] = uncertainty.detach()
     metrics.update(strip_metrics(output['strip_heights'][:, -1].detach(), batch, model.cfg))
     metrics.update(path_error_sum=terms['error_sum'].detach(), path_points=terms['geometry_count'].detach().float())
     return loss, metrics, output
@@ -236,8 +262,9 @@ def summarize(sums):
     return out
 
 
-def build_data(run, cfg, spec, checkpoint, split, *, augment, seed, workers, full_tube_share=None):
-    """The decision loader of one index split (batches of ``training.batch`` decisions)."""
+def build_data(run, cfg, spec, checkpoint, split, *, augment, seed, workers, full_tube_share=None,
+               builder_type=StripBuilder):
+    """The decision loader of one index split (batches of ``training.batch`` decisions, built by ``builder_type``)."""
     d = run.data
     sample_values = dict(checkpoint['sample_cfg'], crop=cfg.fine, prediction_window=prediction_window(cfg))
     sample = SampleConfig(**sample_values)
@@ -248,10 +275,10 @@ def build_data(run, cfg, spec, checkpoint, split, *, augment, seed, workers, ful
     index = StripIndex(d.index, split)
     fibers = RunFibers(d.afv, index, spec.grid_scale, d.length_power)
     trace_per_patch = spec.ct_grid_scale/spec.grid_scale
-    builder = StripBuilder(cfg, fibers, sampling, augment=augment, trace_per_patch=trace_per_patch,
+    builder = builder_type(cfg, fibers, sampling, augment=augment, trace_per_patch=trace_per_patch,
                            full_tube_share=d.full_tube_share if full_tube_share is None else full_tube_share,
                            max_patches=d.max_patches, fold_tolerance=d.fold_tolerance,
-                           max_slope_deg=d.max_slope_deg, span_margin=d.span_margin)
+                           max_slope_deg=d.max_slope_deg, span_margin=d.span_margin, umbilicus=d.umbilicus or None)
     budget = TaskBudget(tuple(1. if name == 'fresh' else 0. for name in TASKS))
     dataset = StripDataset(fibers, spec, sample, chunk=run.training.batch, seed=seed, batch_builder=builder,
                            budget=budget, cache_bytes=int(run.runtime.worker_cache_gb*(1 << 30)),
@@ -277,7 +304,7 @@ def validate(ema, batches, run, device):
         _, metrics, _ = forward_losses(ema, batch, run)
         for key, value in metrics.items():
             sums[key] = sums.get(key, 0.)+float(value)
-    out = {k: sums[k]/len(batches) for k in ('loss', 'strip', 'geometry', 'confidence')}
+    out = {k: sums[k]/len(batches) for k in ('loss', 'strip', 'geometry', 'confidence', 'uncertainty') if k in sums}
     out.update(summarize(sums))
     return out
 
@@ -294,8 +321,10 @@ def main(argv=None):
     torch.manual_seed(t.seed)
     np.random.seed(t.seed)
     device = rt.device
-    checkpoint = read_checkpoint(run.init_checkpoint, 'cpu')
+    checkpoint = load_init_checkpoint(run.init_checkpoint)
     cfg = strip_model_config(checkpoint, run.model)
+    if cfg.strip_orientation and not run.data.umbilicus:
+        raise ValueError('strip_orientation needs data.umbilicus')
     frame_predictor(cfg)  # the frozen frame model loads (and its digest is checked) before workers start
     spec = CTVolumeSpec.from_dict(checkpoint['vol_spec'])
     out = prepare_run_dir(run.out_root, run.name, resume=cli.resume is not None)
@@ -359,7 +388,8 @@ def main(argv=None):
             n = sums.pop('updates')
             values = {k: float(v) for k, v in sums.items()}
             record = dict(step=step, lr=lr, seconds=time.time()-started, data_wait=waited/n,
-                          **{k: values[k]/n for k in ('loss', 'strip', 'geometry', 'confidence', 'grad_norm')},
+                          **{k: values[k]/n for k in ('loss', 'strip', 'geometry', 'confidence', 'uncertainty', 'grad_norm')
+                             if k in values},
                           **summarize(values))
             log.record(dict(kind='train', **record))
             sums, started, waited = {}, time.time(), 0.
@@ -382,7 +412,7 @@ def main(argv=None):
 
 
 def format_line(values):
-    keys = ('loss', 'strip', 'geometry', 'confidence', 'strip_mae_vox', 'plane_mae_vox', 'full_strip_mae_vox',
+    keys = ('loss', 'strip', 'geometry', 'confidence', 'uncertainty', 'strip_mae_vox', 'plane_mae_vox', 'full_strip_mae_vox',
             'observed_strip_mae_vox', 'within2', 'path_error', 'grad_norm', 'data_wait', 'lr')
     shown = ' '.join(f'{k} {values[k]:.4g}' for k in keys if values.get(k) is not None)
     return f'{values["kind"]:5s} {values["step"]:6d} {shown}'

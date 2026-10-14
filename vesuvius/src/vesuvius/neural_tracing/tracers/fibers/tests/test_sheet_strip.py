@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.model import (
-    SheetStripConfig, SheetStripFollower, render_tube, strip_grid)
+    SheetStripConfig, SheetStripFollower, band_layout, render_tube, strip_grid)
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.targets import strip_targets
 from vesuvius.neural_tracing.tracers.models.crop_transformer import RegressionConfig, RegressionFollower
 from vesuvius.neural_tracing.tracers.models.weights import add_input_channels, load_matching_weights
@@ -132,3 +132,155 @@ def test_stitch_joins_decisions_with_opposite_in_sheet_axes():
     np.testing.assert_allclose(rows[keep][:, 2], surface(rows[keep][:, 0], rows[keep][:, 1]), atol=1e-9)
     np.testing.assert_allclose(rows[keep][:, 0].reshape(-1, len(v)), np.broadcast_to(v, (keep.sum()//len(v), len(v))))
     assert spread[keep].max() < 1e-6
+
+
+def test_strip_profiles_read_the_crop_along_u():
+    cfg = SheetStripConfig(**SMALL, **STRIP, strip_profile_reach=1.)
+    model = SheetStripFollower(cfg).eval()
+    c = cfg.fine
+    d, h, w = torch.meshgrid(*(torch.arange(n, dtype=torch.float32) for n in (c.depth, c.width, c.width)), indexing='ij')
+    image = torch.stack((w, h+100*d), 0)[None]  # channel 0: the u sample index; channel 1: v and f
+    points = torch.tensor([[[[1., -2., 3.]]]])  # (B, T, n, 3) crop-local (u, v, f)
+    out = model.strip_profiles(dict(image=image), points).reshape(len(model.strip_profile_offsets), 2)
+    u = (1.+model.strip_profile_offsets)/c.spacing+(c.width-1)/2
+    assert torch.allclose(out[:, 0], u)
+    assert torch.allclose(out[:, 1], torch.full_like(u, -2./c.spacing+(c.width-1)/2+100*(3./c.spacing+c.behind)))
+
+
+def test_strip_options_start_without_influence():
+    torch.manual_seed(0)
+    base = SheetStripFollower(SheetStripConfig(**SMALL, **STRIP)).eval()
+    x, hist, hmask = inputs(base.cfg)
+    x['fine'] = torch.cat((x['fine'], torch.rand_like(x['fine'])), 1)
+    with torch.no_grad():
+        reference = base.forward_strip(x, hist, hmask)
+    for option in (dict(strip_profile_reach=1.), dict(strip_full_fine=True)):
+        model = SheetStripFollower(SheetStripConfig(**SMALL, **STRIP, **option)).eval()
+        report = load_matching_weights(model, base.state_dict())
+        assert all(name.startswith('strip_profile') for name in report['fresh']) and not report['mismatched']
+        with torch.no_grad():
+            out = model.forward_strip(x, hist, hmask)
+        if 'strip_full_fine' in option:  # the fine features change outside the central box only
+            assert out.shape == reference.shape and torch.isfinite(out).all()
+        else:
+            assert torch.allclose(out, reference)
+
+
+def test_band_tokens_tile_the_sheet_band():
+    cfg = SheetStripConfig(**SMALL, **STRIP, strip_full_fine=True, strip_band_half_height=4., strip_band_cell=4)
+    points, centers = band_layout(cfg)
+    c = cfg.fine
+    slabs, rows, columns = c.depth//cfg.patch_size, 2, c.width//4
+    assert points.shape == (slabs*rows*columns, cfg.patch_points**3, 3) and centers.shape == (len(points), 3)
+    assert torch.allclose(points.mean(1), centers, atol=1e-5)
+    assert (points[..., 0].abs() <= 4*c.spacing).all() and (points[..., 1].abs() <= (c.width-1)/2*c.spacing).all()
+    model = SheetStripFollower(cfg)
+    x, hist, hmask = inputs(cfg)
+    x['fine'] = torch.cat((x['fine'], torch.rand_like(x['fine'])), 1)
+    plain = SheetStripFollower(SheetStripConfig(**SMALL, **STRIP, strip_full_fine=True))
+    assert model.context(x, hist, hmask)['padding'].shape[1] == plain.context(x, hist, hmask)['padding'].shape[1]+len(points)
+    model.strip(model.context(x, hist, hmask)).sum().backward()
+    assert model.strip_band.weight.grad.abs().sum() > 0
+
+
+def test_crop_orientation_against_the_scroll():
+    from vesuvius.neural_tracing.tracers.fibers.sheet_strip.data import crop_orientation
+    umbilicus = np.array([[10., 20., 0.], [10., 20., 100.]])
+    # A crop 5 voxels in +x of the axis; u along +x (outward), v along z, f along -y.
+    frame = np.array([[[1., 0., 0.], [0., 0., -1.], [0., 1., 0.]]])
+    out = crop_orientation(np.array([[15., 20., 50.]])*.5, frame, umbilicus, .5)
+    assert np.allclose(out, [[1., 0., 0., 1., 0.]])
+    cfg = SheetStripConfig(**SMALL, **STRIP, strip_orientation=True)
+    model = SheetStripFollower(cfg)
+    x, hist, hmask = inputs(cfg)
+    x['fine'] = torch.cat((x['fine'], torch.rand_like(x['fine'])), 1)
+    x['orientation'] = torch.from_numpy(np.repeat(out, 2, 0))
+    model.strip(model.context(x, hist, hmask)).sum().backward()
+    assert model.strip_orient[0].weight.grad is not None
+
+
+def test_uncertainty_probe_leaves_the_heights_alone():
+    torch.manual_seed(0)
+    cfg = SheetStripConfig(**SMALL, **STRIP, strip_uncertainty=True)
+    model = SheetStripFollower(cfg)
+    x, hist, hmask = inputs(cfg)
+    x['fine'] = torch.cat((x['fine'], torch.rand_like(x['fine'])), 1)
+    out = model.training_forward(x, hist, hmask, torch.tensor(2.))
+    assert out['strip_log_scale'].shape == out['strip_heights'].shape[:1]+out['strip_heights'].shape[2:]
+    out['strip_log_scale'].sum().backward()
+    assert model.strip_log_scale[0].weight.grad.abs().sum() > 0
+    assert model.strip_height.weight.grad is None and model.strip_query[0].weight.grad is None
+
+
+def test_stitch_values_average_decisions_per_node():
+    from vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer import stitch_values
+    f = np.arange(-8., 8.)
+    arcs = np.array([20., 24., 28.])
+    values = np.broadcast_to(np.array([1., 2., 3.])[:, None, None], (3, len(f), 2)).copy()
+    out = stitch_values(values, arcs, f, blend=4.)
+    rows = np.flatnonzero(np.isfinite(out[:, 0]))
+    assert np.allclose(out[rows[0], :], 1.) and np.allclose(out[rows[-1], :], 3.)
+    assert ((out[rows] >= 1.) & (out[rows] <= 3.)).all()
+    # Between two heads the nearer decision weighs more.
+    assert out[int(np.rint(arcs[1]-arcs[0]-f[0]-1)), 0] < 2.
+
+
+def test_remote_seed_heading_is_skipped():
+    from vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer import skip_remote_seed_heading
+    near = dict(seed_heading_family='H', seed_pos=np.zeros(3), pos=np.array([0., 0., 10.]))
+    far = dict(seed_heading_family='V', seed_pos=np.zeros(3), pos=np.array([0., 0., 100.]))
+    skip_remote_seed_heading(near, 60.)
+    skip_remote_seed_heading(far, 60.)
+    assert near['seed_heading_family'] == 'H' and 'fiber_family' not in near
+    assert 'seed_heading_family' not in far and far['fiber_family'] == 'V'
+
+
+def test_seed_heading_is_reused_per_seed(monkeypatch):
+    """reuse_seed_heading leaves an item as data/targets.resolve_trace_seed would, computing each seed's heading once."""
+    from vesuvius.neural_tracing.tracers.fibers.data import targets
+    from vesuvius.neural_tracing.tracers.fibers.sheet_strip import infer
+    calls = []
+
+    def heading(vol, pos, family, direction):
+        calls.append(family)
+        return np.array([0., 0., 1.]) if np.dot([0., 0., 1.], direction) >= 0 else np.array([0., 0., -1.])
+
+    monkeypatch.setattr(infer, 'oriented_seed_heading', heading)
+    monkeypatch.setattr(targets, 'oriented_seed_heading', heading)
+    item = lambda: dict(seed_heading_family='H', seed_pos=np.zeros(3), seed_tangent=np.array([.1, 0., .9]))
+    expected = targets.resolve_trace_seed(item(), None)
+    cache, items = {}, [item() for _ in range(3)]
+    for it in items:
+        infer.reuse_seed_heading(it, None, cache)
+    assert calls == ['H', 'H']  # once for resolve_trace_seed, once for the three reused items
+    for it in items:
+        assert it.keys() == expected.keys() and it['fiber_family'] == 'H'
+        assert np.array_equal(it['seed_tangent'], expected['seed_tangent'])
+        assert targets.resolve_trace_seed(it, None) is it and len(calls) == 2  # nothing left to resolve
+    pending = dict(item(), _pending_seed_heading=('fiber', 0., False, None))
+    infer.reuse_seed_heading(pending, None, cache)
+    assert pending['seed_heading_family'] == 'H'  # a seed decision's crop heading stays with resolve_trace_seed
+
+
+def test_display_grid_puts_higher_z_on_top():
+    """An H strip runs along the columns and a V strip along the rows, row 0 the highest z."""
+    from vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer_all import display_grid
+    R, C = 7, 3
+    f, v = np.meshgrid(np.arange(R, dtype=float), np.arange(C, dtype=float), indexing='ij')
+    keep = np.ones((R, C), bool)
+    keep[0, 0] = False
+    # H fiber along x, its strip's v axis rising in z.
+    h = np.stack([f, np.zeros_like(f), v], -1)
+    rows, kept, expected, layout = display_grid(h, keep, f*10+v, 'H')
+    assert rows.shape == (C, R, 3) and layout == dict(fiber_along='columns', fiber_reversed=False, across_reversed=True)
+    assert (np.diff(rows[..., 2], axis=0) < 0).all() and (np.diff(rows[..., 0], axis=1) > 0).all()
+    assert not kept[-1, 0] and kept.sum() == keep.sum() and expected[-1, 1] == 10.
+    # V fiber rising in z along arclength: reversed so its top end is row 0.
+    vert = np.stack([v, np.zeros_like(f), f], -1)
+    rows, kept, expected, layout = display_grid(vert, keep, None, 'V')
+    assert rows.shape == (R, C, 3) and expected is None
+    assert layout == dict(fiber_along='rows', fiber_reversed=True, across_reversed=False)
+    assert (np.diff(rows[..., 2], axis=0) < 0).all() and not kept[-1, 0]
+    # Already highest at the start: unchanged.
+    rows, kept, _, layout = display_grid(vert[::-1], keep[::-1], None, 'V')
+    assert not layout['fiber_reversed'] and np.array_equal(rows, vert[::-1])

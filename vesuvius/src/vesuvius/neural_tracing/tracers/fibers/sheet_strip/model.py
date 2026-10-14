@@ -19,9 +19,12 @@ import math
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from vesuvius.neural_tracing.tracers.models.blocks import MLP
-from vesuvius.neural_tracing.tracers.models.crop_transformer import RegressionConfig, RegressionFollower
+from vesuvius.neural_tracing.tracers.models.crop_transformer import CELL, RegressionConfig, RegressionFollower
+from vesuvius.neural_tracing.tracers.models.follower import crop_support, sample_features
+from vesuvius.neural_tracing.tracers.models.patch_tokens import _local, slab_depths
 from vesuvius.neural_tracing.tracers.shared.policy import DEFAULT_CONFIDENCE
 
 
@@ -38,6 +41,25 @@ class SheetStripConfig(RegressionConfig):
     strip_f_points: int = 2  # height rows per crop slab (patch_size samples)
     strip_scale: float = 8.  # readout units -> height
     strip_refinement_steps: int = 1
+    # Multiscale models (multiscale_fine_width): the strip's evidence reads the fine CNN run over the whole crop
+    # cross-section, not only its central multiscale_fine_width samples (the context tokens are unchanged). Without it a
+    # strip point beyond the fine box reads only the pooled CNN.
+    strip_full_fine: bool = False
+    # > 0: every refinement pass also reads the crop's raw input channels (CT and tube) along u at every crop sample
+    # within +-strip_profile_reach (crop units) of each strip point, through its own branch (zero at the start).
+    strip_profile_reach: float = 0.
+    # > 0 (needs strip_full_fine): sheet-band context tokens beside the polar ones, read from the full fine lattice:
+    # per crop slab, strip_band_cell x strip_band_cell sample cells tiling |u| <= strip_band_half_height (samples)
+    # across the whole v range, where the sheet near the fiber lies; the polar sectors there are tens of samples wide.
+    strip_band_half_height: float = 0.
+    strip_band_cell: int = 8
+    # The strip tokens also read the crop's orientation against the scroll (sheet_strip/data.crop_orientation: which
+    # crop directions point outward, the axes' z components; input 'orientation'), e.g. which face of its sheet a
+    # fiber of either family lies on.
+    strip_orientation: bool = False
+    # A per-point error scale (log, crop units) of the last pass's heights, read from its tokens with their gradient
+    # stopped (a probe: the heights train as without it); trained by a Laplace likelihood of the heights' error.
+    strip_uncertainty: bool = False
 
     def __post_init__(self):
         super().__post_init__()
@@ -49,6 +71,11 @@ class SheetStripConfig(RegressionConfig):
             raise ValueError('Strip rows, slabs dividing the crop depth, a positive height scale and tube sigma needed')
         if not isinstance(self.strip_refinement_steps, int) or self.strip_refinement_steps < 0:
             raise ValueError('Strip refinement steps must be a nonnegative integer')
+        if self.strip_profile_reach < 0 or (self.strip_profile_reach and not self.strip_refinement_steps):
+            raise ValueError('A strip profile reach must be nonnegative and needs refinement passes')
+        if self.strip_band_half_height and not (self.strip_full_fine and self.multiscale_fine_width is not None
+                                                and self.strip_band_cell > 0 and self.strip_band_half_height > 0):
+            raise ValueError('Sheet-band tokens need strip_full_fine on a multiscale model and positive cell sizes')
         if self.path_lateral_limit is not None and not 0 < self.path_lateral_limit <= (c.width-1)*c.spacing/2:
             raise ValueError('The path lateral limit must lie inside the crop')
 
@@ -61,6 +88,35 @@ class SheetStripConfig(RegressionConfig):
         if self.path_lateral_limit is not None:
             return self.path_lateral_limit
         return (self.fine.width-1)*self.fine.spacing/2-self.patch_radius
+
+
+def extend_strip_stages(state, cfg):
+    """A sheet-strip state dict for ``cfg``: refinement stages beyond the checkpoint's start as copies of its last."""
+    stage = state.get('strip_stage.weight')
+    if stage is None or cfg.strip_refinement_steps <= len(stage):
+        return state
+    extra = stage[-1:].expand(cfg.strip_refinement_steps-len(stage), -1)
+    return dict(state, **{'strip_stage.weight': torch.cat([stage, extra])})
+
+
+def band_layout(cfg):
+    """Sheet-band tokens (strip_band_half_height): per slab (slab-major), cells of strip_band_cell samples across u
+    and v tiling |u| <= strip_band_half_height over the whole v range; each cell's patch_points points per axis.
+    Points (T, patch_points**3, 3) and centers (T, 3), crop-local."""
+    c, n, cell = cfg.fine, cfg.patch_points, cfg.strip_band_cell
+    depth, depth_center = slab_depths(cfg)
+    rows = max(1, int(round(2*cfg.strip_band_half_height/cell)))
+    columns = c.width//cell
+    frac = (torch.arange(n, dtype=torch.float64)+.5)/n*cell
+    u = (c.width-1)/2-rows*cell/2+torch.arange(rows, dtype=torch.float64)[:, None]*cell+frac  # (R, n) samples
+    v = (c.width-columns*cell)/2+torch.arange(columns, dtype=torch.float64)[:, None]*cell+frac  # (V, n)
+    s, shape = len(depth), (len(depth), rows, columns, n, n, n)
+    points = _local(cfg, u[None, :, None, None, :, None].expand(shape), v[None, None, :, None, None, :].expand(shape),
+                    depth[:, None, None, :, None, None].expand(shape)).reshape(-1, n**3, 3)
+    centers = _local(cfg, u.mean(-1)[None, :, None].expand(s, rows, columns),
+                     v.mean(-1)[None, None, :].expand(s, rows, columns),
+                     depth_center[:, None, None].expand(s, rows, columns)).reshape(-1, 3)
+    return points.float(), centers.float()
 
 
 def strip_grid(cfg):
@@ -136,6 +192,63 @@ class SheetStripFollower(RegressionFollower):
             self.strip_refinement = MLP(n*(cells+1)+n, h)
             self.strip_stage = nn.Embedding(cfg.strip_refinement_steps, h)
             nn.init.zeros_(self.strip_stage.weight)
+        if cfg.strip_band_half_height:
+            points, centers = band_layout(cfg)
+            self.register_buffer('band_points', points, persistent=False)
+            self.register_buffer('band_centers', centers, persistent=False)
+            self.strip_band = nn.Linear(points.shape[1]*(cfg.cnn_channels[-1]+1), h)
+            self.strip_band_kind = nn.Parameter(torch.zeros(h))
+        if cfg.strip_orientation:
+            self.strip_orient = MLP(5, h, zero_last=True)
+        if cfg.strip_uncertainty:
+            self.strip_log_scale = MLP(h, n)
+        if cfg.strip_profile_reach:
+            k = int(round(cfg.strip_profile_reach/cfg.fine.spacing))
+            self.register_buffer('strip_profile_offsets', torch.arange(-k, k+1)*cfg.fine.spacing, persistent=False)
+            self.strip_profile = MLP(n*(2*k+1)*cfg.input_channels, h, zero_last=True)
+
+    def extra_cell_tokens(self, ctx, x):
+        """Keeps what the strip reads (the full fine lattice, the input crop) in ``ctx``; the sheet-band tokens."""
+        if self.cfg.strip_full_fine and len(self.levels) > 1:
+            ctx['strip_fine'] = self.cnn(x['fine'])
+        if self.cfg.strip_profile_reach:
+            ctx['image'] = x['fine']
+        if self.cfg.strip_orientation:
+            ctx['orientation'] = x['orientation']
+        if not self.cfg.strip_band_half_height:
+            return None
+        b, (t, p, _) = len(x['fine']), self.band_points.shape
+        points = self.band_points.reshape(1, -1, 3).expand(b, -1, -1)
+        values, support = sample_features(ctx['strip_fine'].float(), points, self.cfg.fine, self.levels[0][1])
+        values = torch.cat((values, support[..., None].to(values.dtype)), -1).reshape(b, t, -1)
+        tokens = self.strip_band(values)
+        return tokens+(self.cell_position(self.band_centers/16.)+self.kind[CELL]+self.strip_band_kind).to(tokens.dtype)
+
+    def strip_profiles(self, ctx, points):
+        """The crop's input channels along u around strip points (B, T, n, 3): (B, T, n*K*C), trilinear."""
+        c = self.cfg.fine
+        b, t, n, _ = points.shape
+        image = ctx['image'].float()
+        depth, height, width = image.shape[2:]
+        p = points.float()[..., None, :].expand(-1, -1, -1, len(self.strip_profile_offsets), -1).clone()
+        p[..., 0] = p[..., 0]+self.strip_profile_offsets
+        grid = torch.stack(((p[..., 0]/c.spacing+(width-1)/2)/(width-1),
+                            (p[..., 1]/c.spacing+(height-1)/2)/(height-1),
+                            (p[..., 2]/c.spacing+c.behind)/(depth-1)), -1)*2-1
+        values = F.grid_sample(image, grid.reshape(b, -1, 1, 1, 3), align_corners=True)  # (B, C, M, 1, 1)
+        return values.reshape(b, -1, t, n*len(self.strip_profile_offsets)).permute(0, 2, 3, 1).reshape(b, t, -1)
+
+    def strip_evidence(self, ctx, points):
+        """The evidence (models/crop_transformer.evidence) of strip points, the fine level over the whole crop with
+        ``strip_full_fine``."""
+        if 'strip_fine' not in ctx:
+            return self.evidence(ctx, points)
+        points = points.float()
+        values = [sample_features(ctx['strip_fine'].float(), points, self.cfg.fine, self.levels[0][1])[0]]
+        values += [sample_features(features.float(), points, crop, stride)[0]
+                   for features, (crop, stride) in zip(ctx['levels'][1:], self.levels[1:])]
+        support = crop_support(points, self.cfg.fine)
+        return torch.cat((*values, support[..., None].to(values[0].dtype)), -1)
 
     def strip_points(self, heights):
         """Crop-local points (B, T, n, 3) of token heights (B, T, n)."""
@@ -151,24 +264,38 @@ class SheetStripFollower(RegressionFollower):
 
     def strip(self, ctx):
         """Strip heights (B, 1+strip_refinement_steps, Nf, Nv): the first pass, then each refinement."""
+        return self.strip_outputs(ctx)[0]
+
+    def strip_outputs(self, ctx):
+        """The strip heights (``strip``) and, with ``strip_uncertainty``, the last pass's log error scale (B, Nf, Nv),
+        else None."""
         cfg, b = self.cfg, len(ctx['cells'])
         anchors = self.strip_anchor[None].expand(b, -1, -1)
-        tokens = self.strip_query(torch.cat((self.evidence(ctx, anchors), anchors[..., 1:]/16.), -1))
+        tokens = self.strip_query(torch.cat((self.strip_evidence(ctx, anchors), anchors[..., 1:]/16.), -1))
+        if cfg.strip_orientation:
+            tokens = tokens+self.strip_orient(ctx['orientation'].to(tokens.dtype))[:, None]
         decoded = self.run_paths(ctx, (tokens+self.strip_kind.to(tokens.dtype))[:, None])[:, 0]
         heights = [cfg.strip_scale*self.strip_height(decoded).float()]
         for stage in range(cfg.strip_refinement_steps):
             last = heights[-1].detach()
             points = self.strip_points(last)
-            evidence = self.evidence(ctx, points.flatten(1, 2)).reshape(b, last.shape[1], -1)
+            evidence = self.strip_evidence(ctx, points.flatten(1, 2)).reshape(b, last.shape[1], -1)
             refreshed = self.strip_refinement(torch.cat((evidence, last/16.), -1))
             tokens = decoded+refreshed.to(decoded.dtype)+self.strip_stage.weight[stage].to(decoded.dtype)
+            if self.cfg.strip_profile_reach:
+                tokens = tokens+self.strip_profile(self.strip_profiles(ctx, points)).to(decoded.dtype)
             decoded = self.run_paths(ctx, tokens[:, None])[:, 0]
             heights.append(cfg.strip_scale*self.strip_height(decoded).float())
-        return torch.stack([self.strip_layout(value) for value in heights], 1)
+        scale = self.strip_layout(self.strip_log_scale(decoded.detach()).float()) if cfg.strip_uncertainty else None
+        return torch.stack([self.strip_layout(value) for value in heights], 1), scale
 
     def training_forward(self, x, hist, hmask, threshold, targets=None):
         ctx = self.context(x, hist, hmask)
-        return dict(self.predict(ctx, threshold), strip_heights=self.strip(ctx))
+        heights, scale = self.strip_outputs(ctx)
+        out = dict(self.predict(ctx, threshold), strip_heights=heights)
+        if scale is not None:
+            out['strip_log_scale'] = scale
+        return out
 
     def forward_strip(self, x, hist, hmask):
         """Strip heights (B, Nf, Nv) of the last pass, without the path."""

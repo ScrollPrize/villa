@@ -18,11 +18,15 @@ points) and ``summary.json``. When the fiber is in a sheet-strip index (``--inde
 the patch sheet it lies on is scored and stitched the same way: ``patch_sheet/`` (the supervised nodes only) and
 per-decision errors. ``render.png``: CT sampled on the predicted strip, every voxel, in bands along the fiber, each
 with a bar of the error against the patch sheet where there is one (``--render-only`` redraws it).
+Models reading the crop orientation (``strip_orientation``) need the scroll's umbilicus (``--umbilicus``, default: the
+checkpoint run's); models with ``strip_uncertainty`` also save their expected error per decision and grid point
+(``expected_error_vox`` in strip.npz, its mean over the stitched rows in summary.json).
 Arclengths and ``--step``/``--blend`` are trace voxels; ``--arc`` patch voxels.
 """
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 from pathlib import Path
@@ -31,11 +35,13 @@ import time
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.tracers.fibers.data.observations import IdentityObservationBuilder, IdentitySampling
+from vesuvius.neural_tracing.tracers.fibers.data.observations import (
+    IdentityObservationBuilder, IdentitySampling, image_crop)
 from vesuvius.neural_tracing.tracers.fibers.data.samples import STARTUP_CATEGORIES, SampleConfig, decision_on_path
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import oriented_seed_heading
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import prediction_window
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.data import (
-    RunFibers, StripBuilder, StripIndex, polyline_points)
+    RunFibers, StripBuilder, StripIndex, crop_orientation, load_umbilicus, polyline_points)
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.model import strip_grid
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.targets import strip_targets
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.train import load_strip_model, with_tube
@@ -59,6 +65,137 @@ def decision_item(fiber, t, sample_cfg, n_history, window):
         item['prev_prediction'] = interp_at(p, s, np.minimum(t+np.arange(1., window+1e-9), s[-1]))
     item['fiber_ref'] = (0, float(t), False)
     return item
+
+
+def skip_remote_seed_heading(item, reach):
+    """Skip the CT seed heading (data/targets.resolve_trace_seed: a structure tensor of the CT at the seed) of a
+    decision whose seed lies farther than ``reach`` from its head: outside the crop it is never read (the seed
+    reference and its tangent are masked, observations.reference_layout), so the model's inputs do not change. The
+    family the heading would set is kept."""
+    if item.get('seed_heading_family') is None or item.get('_pending_seed_heading') is not None:
+        return
+    if np.linalg.norm(np.asarray(item['seed_pos'], np.float64)-np.asarray(item['pos'], np.float64)) > reach:
+        item['fiber_family'] = item.pop('seed_heading_family')
+
+
+
+def reuse_seed_heading(item, vol, cache):
+    """Resolve a decision's CT seed heading as data/targets.resolve_trace_seed does, computing it once per seed:
+    every decision of a fiber has the same seed, family and seed tangent, so ``cache`` (one per fiber) holds it.
+    Decisions starting at the seed (a pending crop heading) are left to resolve_trace_seed."""
+    if item.get('seed_heading_family') is None or item.get('_pending_seed_heading') is not None:
+        return
+    family = item.pop('seed_heading_family')
+    item.pop('_pending_seed_heading', None)
+    seed, tangent = (np.asarray(item[k], np.float64) for k in ('seed_pos', 'seed_tangent'))
+    key = (family, seed.tobytes(), tangent.tobytes())
+    if key not in cache:
+        cache[key] = oriented_seed_heading(vol, item['seed_pos'], family, item['seed_tangent'])
+    item['fiber_family'] = family
+    item['seed_tangent'] = cache[key].copy()
+
+class StripPredictor:
+    """A sheet-strip checkpoint and what its decisions need (frame model and crop builder, CT volume, umbilicus),
+    loaded once; ``predict`` runs one fiber's decisions."""
+
+    def __init__(self, checkpoint, device='cuda', umbilicus=None, batch=16, crop_threads=1):
+        self.model, self.cfg, self.ck = load_strip_model(checkpoint, device)
+        self.device, self.batch = device, batch
+        self.data = self.ck['run_config']['data']
+        self.spec = CTVolumeSpec.from_dict(self.ck['vol_spec'])
+        self.trace_per_patch = self.spec.ct_grid_scale/self.spec.grid_scale
+        self.f, self.v = (a.numpy().astype(np.float64) for a in strip_grid(self.cfg))
+        self.sample_cfg = SampleConfig(**dict(self.ck['sample_cfg'], crop=self.cfg.fine,
+                                              prediction_window=prediction_window(self.cfg)))
+        self.builder = IdentityObservationBuilder(self.cfg, None, IdentitySampling(), augment=False)
+        if crop_threads > 1:
+            # A batch's crops are read and sampled on a thread pool (shared/crop_sampling/crops.scalar_crops: the same
+            # values; the sampler releases the GIL).
+            pool = ThreadPoolExecutor(crop_threads)
+            self.builder.crop_images = lambda items, vol, crop, _=None: image_crop(items, vol, crop, pool)
+        self.umbilicus = None
+        if self.cfg.strip_orientation:
+            path = umbilicus or self.data.get('umbilicus')
+            if not path:
+                raise ValueError('This model reads the crop orientation: an umbilicus is needed')
+            self.umbilicus = load_umbilicus(path)
+        self.vol = CTVolume(self.spec)
+        self.rng = np.random.default_rng(0)
+        c = self.cfg.fine  # the crop's farthest point from its head, plus a sample
+        self.crop_reach = math.sqrt((max(c.behind, c.depth-c.behind)*c.spacing)**2+2*((c.width-1)/2*c.spacing)**2)+c.spacing
+
+    def predict(self, fiber, arcs, on_items=None, log=None):
+        """Strip heights (K, Nf, Nv), log error scales (K, Nf, Nv; None without ``strip_uncertainty``), frames (K, 3, 3)
+        and positions (K, 3) of the decisions at fiber arclengths ``arcs`` (trace voxels). ``on_items`` sees each
+        batch's decision items."""
+        cfg, crop = self.cfg, self.cfg.fine
+        heights, scales, frames, positions = [], [], [], []
+        seed_headings = {}
+        for start in range(0, len(arcs), self.batch):
+            items = [self.builder.prepare(decision_item(fiber, float(t), self.sample_cfg, cfg.n_history,
+                                                        self.sample_cfg.prediction_window), fiber, self.rng)
+                     for t in arcs[start:start+self.batch]]
+            for item in items:
+                skip_remote_seed_heading(item, self.crop_reach)
+                reuse_seed_heading(item, self.vol, seed_headings)
+            batch = self.builder(items, self.vol)  # orients each crop with the frame model, then crops the CT
+            tube = np.zeros((len(items), 2048, 3), np.float32)
+            valid = np.zeros((len(items), 2048), bool)
+            for row, item in enumerate(items):
+                curve = polyline_points(fiber.points, np.asarray(item['pos']), np.asarray(item['frame']), crop,
+                                        crop.spacing/2, 3*cfg.tube_sigma*crop.spacing, len(tube[row]))
+                tube[row, :len(curve)], valid[row, :len(curve)] = curve, True
+            if on_items is not None:
+                on_items(items)
+            inputs = dict(x=batch['x'], hist=batch['hist'], hmask=batch['hmask'], tube_points=torch.from_numpy(tube),
+                          tube_valid=torch.from_numpy(valid))
+            if self.umbilicus is not None:
+                inputs['crop_orientation'] = torch.from_numpy(crop_orientation(
+                    np.stack([i['pos'] for i in items]), np.stack([i['frame'] for i in items]), self.umbilicus,
+                    self.trace_per_patch))
+            device_batch = move_batch(inputs, self.device)
+            with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.device.startswith('cuda')):
+                ctx = self.model.context(with_tube(self.model, device_batch), device_batch['hist'], device_batch['hmask'])
+                out, scale = self.model.strip_outputs(ctx)
+            heights.append(out[:, -1].float().cpu().numpy())
+            if scale is not None:
+                scales.append(scale.float().cpu().numpy())
+            frames.extend(np.asarray(item['frame'], np.float64) for item in items)
+            positions.extend(np.asarray(item['pos'], np.float64) for item in items)
+            if log is not None:
+                log(min(start+self.batch, len(arcs)))
+        return (np.concatenate(heights).astype(np.float64), np.concatenate(scales) if scales else None,
+                np.stack(frames), np.stack(positions))
+
+
+def orient_decisions(heights, frames):
+    """Keep one side of the fiber in every column: each decision's v axis turned to agree with the previous one's.
+    Returns the oriented heights, frames and which decisions flipped (K,)."""
+    flipped = np.zeros(len(frames), bool)
+    for k in range(1, len(frames)):
+        flipped[k] = flipped[k-1] ^ (float(frames[k, :, 1] @ frames[k-1, :, 1]) < 0)
+    oriented = np.where(flipped[:, None, None], heights[:, :, ::-1], heights)
+    oriented_frames = frames.copy()
+    oriented_frames[flipped, :, 1] *= -1  # the v column reversed is v -> -v: the same points
+    oriented_frames[flipped, :, 0] *= -1  # and u -> -u keeps the frame right-handed; heights follow
+    oriented[flipped] *= -1
+    return oriented, oriented_frames, flipped
+
+
+def stitch_values(values, arcs, f, blend, weights=None):
+    """Per strip node (R, Nv): the stitch weights' average of a per-point value (K, Nf, Nv) of the decisions (as
+    ``stitch``, which averages their points), NaN where no decision weighs in."""
+    df = f[1]-f[0]
+    rows = np.rint((arcs[:, None]-arcs[0]+f[None]-f[0])/df).astype(np.int64)
+    window = np.where(np.abs(f) < blend, np.cos(np.pi*f/(2*blend))**2, 0.)
+    w = window[None, :, None]*(np.ones_like(values) if weights is None else weights)
+    shape = (int(rows.max())+1, values.shape[2])
+    total, first = np.zeros(shape), np.zeros(shape)
+    flat_rows = np.broadcast_to(rows[..., None], values.shape).ravel()
+    flat_cols = np.broadcast_to(np.arange(values.shape[2]), values.shape).ravel()
+    np.add.at(total, (flat_rows, flat_cols), w.ravel())
+    np.add.at(first, (flat_rows, flat_cols), (w*values).ravel())
+    return np.where(total > 0, first/np.maximum(total, 1e-12), np.nan)
 
 
 class Scorer:
@@ -204,6 +341,7 @@ def main(argv=None):
     ap.add_argument('--arc', type=float, nargs=2, help='fiber arclength range, patch voxels (default: all of it)')
     ap.add_argument('--step', type=float, default=4., help='trace voxels between decisions (a multiple of the f spacing)')
     ap.add_argument('--blend', type=float, default=16., help='trace voxels: decisions weigh their rows within this of the head')
+    ap.add_argument('--umbilicus', help="umbilicus.json for models reading the crop orientation (default: the checkpoint run's)")
     ap.add_argument('--batch', type=int, default=16)
     ap.add_argument('--device', default='cuda')
     ap.add_argument('--voxel-size-um', type=float, default=None, help='patch voxel size, for area_cm2 in meta.json')
@@ -211,20 +349,22 @@ def main(argv=None):
     ap.add_argument('--render-only', action='store_true', help='redraw render.png of an existing --out, no inference')
     args = ap.parse_args(argv)
     started = time.time()
-    model, cfg, ck = load_strip_model(args.checkpoint, args.device)
-    data = ck['run_config']['data']
-    spec = CTVolumeSpec.from_dict(ck['vol_spec'])
     if args.render_only:
-        render_saved(args.out, CTVolume(spec))
+        ck = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+        render_saved(args.out, CTVolume(CTVolumeSpec.from_dict(ck['vol_spec'])))
         return
-    trace_per_patch = spec.ct_grid_scale/spec.grid_scale
+    try:
+        predictor = StripPredictor(args.checkpoint, args.device, args.umbilicus, args.batch)
+    except ValueError as error:
+        raise SystemExit(f'{error} (--umbilicus)')
+    cfg, ck, data, spec = predictor.cfg, predictor.ck, predictor.data, predictor.spec
+    trace_per_patch, f, v = predictor.trace_per_patch, predictor.f, predictor.v
     afv_path = args.afv or data['afv']
     afv = AFVFibers(afv_path, spec.grid_scale, split='all')
     if args.fiber not in afv.id_to_index:
         raise SystemExit(f'Fiber {args.fiber} is not in {afv_path}')
     catalog_index = afv.id_to_index[args.fiber]
     fiber = afv[catalog_index]
-    f, v = (a.numpy().astype(np.float64) for a in strip_grid(cfg))
     df = f[1]-f[0]
     if abs(args.step/df-round(args.step/df)) > 1e-6 or args.step <= 0:
         raise SystemExit(f'--step must be a positive multiple of the strip row spacing {df:g}')
@@ -233,48 +373,22 @@ def main(argv=None):
     if hi <= lo:
         raise SystemExit('The arclength range holds no decision')
     arcs = np.arange(lo, hi+1e-9, args.step)
-    sample_cfg = SampleConfig(**dict(ck['sample_cfg'], crop=cfg.fine, prediction_window=prediction_window(cfg)))
-    builder = IdentityObservationBuilder(cfg, None, IdentitySampling(), augment=False)
     index_dir = None if args.index == 'none' else (args.index or data.get('index'))
     scorer = Scorer(index_dir, afv_path, catalog_index, cfg, spec, data) if index_dir else None
     scorer = scorer if scorer is not None and scorer.unit is not None else None
-    vol = CTVolume(spec)
-    crop = cfg.fine
-    rng = np.random.default_rng(0)
-    heights, frames, positions, targets, masks = [], [], [], [], []
-    for start in range(0, len(arcs), args.batch):
-        items = [builder.prepare(decision_item(fiber, float(t), sample_cfg, cfg.n_history, sample_cfg.prediction_window),
-                                 fiber, rng) for t in arcs[start:start+args.batch]]
-        batch = builder(items, vol)  # orients each crop with the frame model, then crops the CT
-        tube = np.zeros((len(items), 2048, 3), np.float32)
-        valid = np.zeros((len(items), 2048), bool)
-        for row, item in enumerate(items):
-            curve = polyline_points(fiber.points, np.asarray(item['pos']), np.asarray(item['frame']), crop,
-                                    crop.spacing/2, 3*cfg.tube_sigma*crop.spacing, len(tube[row]))
-            tube[row, :len(curve)], valid[row, :len(curve)] = curve, True
-            if scorer is not None:
-                target, mask = scorer(item)
-                targets.append(target)
-                masks.append(mask)
-        device_batch = move_batch(dict(x=batch['x'], hist=batch['hist'], hmask=batch['hmask'],
-                                       tube_points=torch.from_numpy(tube), tube_valid=torch.from_numpy(valid)),
-                                  args.device)
-        with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.device.startswith('cuda')):
-            out = model.forward_strip(with_tube(model, device_batch), device_batch['hist'], device_batch['hmask'])
-        heights.append(out.float().cpu().numpy())
-        frames.extend(np.asarray(item['frame'], np.float64) for item in items)
-        positions.extend(np.asarray(item['pos'], np.float64) for item in items)
-        print(f'[infer] {min(start+args.batch, len(arcs))}/{len(arcs)} decisions, {time.time()-started:.0f} s', flush=True)
-    heights, frames, positions = np.concatenate(heights).astype(np.float64), np.stack(frames), np.stack(positions)
-    # Keep one side of the fiber in every column: turn each decision's v axis to agree with the previous one.
-    flipped = np.zeros(len(arcs), bool)
-    for k in range(1, len(arcs)):
-        flipped[k] = flipped[k-1] ^ (float(frames[k, :, 1] @ frames[k-1, :, 1]) < 0)
-    oriented = np.where(flipped[:, None, None], heights[:, :, ::-1], heights)
-    oriented_frames = frames.copy()
-    oriented_frames[flipped, :, 1] *= -1  # the v column reversed is v -> -v: the same points
-    oriented_frames[flipped, :, 0] *= -1  # and u -> -u keeps the frame right-handed; heights follow
-    oriented[flipped] *= -1
+    vol = predictor.vol
+    targets, masks = [], []
+
+    def score(items):
+        for item in items:
+            target, mask = scorer(item)
+            targets.append(target)
+            masks.append(mask)
+
+    heights, scales, frames, positions = predictor.predict(
+        fiber, arcs, on_items=score if scorer is not None else None,
+        log=lambda done: print(f'[infer] {done}/{len(arcs)} decisions, {time.time()-started:.0f} s', flush=True))
+    oriented, oriented_frames, flipped = orient_decisions(heights, frames)
     rows, weight, spread = stitch(oriented, oriented_frames, positions, arcs, f, v, args.blend)
     keep = weight > 0
     row_step, column_step = df/trace_per_patch, (v[1]-v[0])/trace_per_patch
@@ -291,6 +405,14 @@ def main(argv=None):
                                    p95=float(np.percentile(spread[keep], 95)/trace_per_patch)))
     saved = dict(arcs=arcs, positions=positions, frames=frames, heights=heights, flipped=flipped, f=f, v=v,
                  spread=spread/trace_per_patch, trace_per_patch=trace_per_patch)
+    if scales is not None:
+        # The model's expected |error| per decision and grid point (voxels; strip_uncertainty), and per decision over
+        # the rows stitching weighs (|f| < blend).
+        expected = np.exp(scales)/trace_per_patch
+        saved['expected_error_vox'] = expected
+        central = np.abs(f) < args.blend
+        per_decision = expected[:, central].mean((1, 2))
+        summary['expected_error_vox'] = dict(mean=float(per_decision.mean()), p95=float(np.percentile(per_decision, 95)))
     errors, gt = None, None
     if scorer is not None:
         targets, masks = np.stack(targets).astype(np.float64), np.stack(masks)

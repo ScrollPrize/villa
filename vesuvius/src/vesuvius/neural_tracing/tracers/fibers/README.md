@@ -241,6 +241,74 @@ python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer \
 On validation fiber 469373 (6100 voxels, 758 decisions, 2.5 minutes), the update-16000 checkpoint gave 1.22 voxels
 mean error against 6.89 for the frame plane, with 82% of points within 2 voxels.
 
+`sheet_strip/infer_all.py` runs the same per-fiber inference over every AFV fiber above a length, without scoring or
+renders, sharded over processes. Each strip is written as a tifxyz in `OUT/strips/BUCKET/fiber_ID`, with
+`expected_error.tif` when the model predicts its error. An H fiber runs along the strip's columns and a V fiber along
+its rows, higher z at the top (row 0); the TIFFs are uncompressed single strips, which VC3D memory-maps as written
+(it rewrites tiled LZW bands in place before mapping them). Finished fibers are listed in `OUT/index/shard_K.jsonl`,
+and a restarted shard skips them:
+
+```bash
+for k in $(seq 0 17); do
+  python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer_all --checkpoint RUN/last.pt --out OUT \
+    --min-length-mm 2.5 --step 8 --batch 4 --threads 1 --shard $k 18 &
+done
+```
+
+Throughput is CPU-bound: building each decision's crops (frame model, CT sampling and normalization) dominates. Each
+process needs about 1.3–1.5 GB of GPU memory, so 18 shards fill a 32 GB card. On the 24-core machine that gives about
+318 decisions/s, about 15 h for Paris4's 238k fibers over 2.5 mm (17M decisions). The sampler forms its frame products
+per crop axis rather than per point, and `normalize_ct` makes fewer passes (both bitwise unchanged): 220 -> 310
+decisions/s. Running the shards as clients of an NVIDIA MPS daemon (`nvidia-cuda-mps-control -d`, with the shards'
+`CUDA_MPS_PIPE_DIRECTORY` set to its pipe directory) lowers GPU use from 92% to 76% at the same rate.
+`--crop-threads 2` (a batch's crops sampled on two threads, same values) gave 326 decisions/s, but shards then
+segfaulted inside CPython (3 of 18 within 50 minutes); keep the default 1.
+
+A decision every 8 trace voxels (`--step 8`) gave the same stitched strips as every 4 on held-out fibers (median node
+distance to the patch sheet within 0.012 voxels); every 16 was 0.01–0.03 worse. Decisions whose seed lies outside the
+crop skip the CT seed heading they would never read (`infer.skip_remote_seed_heading`; 1.7x), and the others compute
+it once per fiber (`infer.reuse_seed_heading`); outputs are unchanged.
+
+Options of `SheetStripConfig` beyond the first run (all off by default; a run continues from a sheet-strip checkpoint
+when `init_checkpoint` is one, its added modules starting fresh):
+
+- `strip_full_fine`: the strip's evidence reads the fine CNN run over the whole crop cross-section, not only its
+  central `multiscale_fine_width` samples (no new weights);
+- `strip_orientation`: the strip tokens read the crop's axes against the scroll (`sheet_strip/data.crop_orientation`;
+  needs `data.umbilicus`, and `infer.py --umbilicus` defaults to the run's);
+- `strip_profile_reach`: each refinement pass also reads the raw CT and tube along `u` around every strip point;
+- `strip_uncertainty`: a probe (gradient stopped) predicting each strip point's error scale, trained by a Laplace
+  likelihood; `infer.py` writes it as `expected_error_vox`;
+- `strip_band_half_height`: sheet-band context tokens on the full fine lattice beside the polar ones;
+- `strip_refinement_steps`: more refinement passes.
+
+`sheet_strip/evaluate.py` scores checkpoints on one fixed, cached set of validation decisions, both tube modes each:
+
+```bash
+python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.evaluate build --checkpoint RUN/last.pt \
+  --out /mnt/raid_nvme/sheet_strip_eval/val6400 --batches 200   # 6400 decisions, 44 GB, 5 minutes
+python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.evaluate run --eval /mnt/raid_nvme/sheet_strip_eval/val6400 \
+  --checkpoint RUN/last.pt   # 1.5 minutes; results/NAME.npz and .json
+```
+
+On that set (October 2026), 4,000-update fine-tunes of the 40k `sheet_strip_paris4_slim50k_v1` against a control gave
+these mean errors in voxels:
+
+| Run | Full tube | Observed tube |
+|---|---|---|
+| control | 1.143 | 1.271 |
+| `strip_full_fine` | 1.091 | 1.218 |
+| `strip_orientation` | 1.117 | 1.229 |
+| `strip_profile_reach=6` | 1.131 | 1.258 |
+| all three | 1.058 | 1.169 |
+| all three for 15k updates (`configs/sheet_strip/paris4_slim50k_v2_ft.json`) | **1.006** | **1.117** |
+
+Two other variants did not help:
+- band tokens on top of `strip_full_fine`: −0.001;
+- a second refinement pass: +0.009.
+
+The failure analysis behind them is in `output/sheet_strip_eval/REPORT.md` (local; `output/` is not tracked).
+
 ## Organization
 
 The fiber tracer lives in `tracers/fibers/`; the parts other tracers can reuse sit beside it in `tracers/`

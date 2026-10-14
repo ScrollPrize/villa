@@ -267,6 +267,11 @@ class CropTransformer(nn.Module):
         values, support = self.sample_cells(ctx, points)
         return torch.cat((values, support[..., None].to(values.dtype)), -1)
 
+    def extra_cell_tokens(self, ctx, x):
+        """Context tokens (B, T, hidden) beside the cell tokens, positions included (``ctx`` holds the CNN lattices);
+        None: none. A hook for subclasses."""
+        return None
+
     def context(self, x, hist, hmask):
         """Every layer's context keys/values for one decision per row, and its CNN cells."""
         cfg = self.cfg
@@ -276,6 +281,9 @@ class CropTransformer(nn.Module):
         dtype = tokens.dtype
         tokens = tokens+self.cell_position(self.cell_xyz/16.).to(dtype)+self.kind[CELL].to(dtype)
         ctx = dict(cells=cells, levels=levels)
+        extra = self.extra_cell_tokens(ctx, x)
+        if extra is not None:
+            tokens = torch.cat((tokens, extra.to(dtype)), 1)
         references, mask = reference_points(x, hist, hmask, cfg.fine)
         local, _ = self.sample_cells(ctx, references)
         references = self.reference_token(torch.cat((local, reference_metadata(x, hist, references, mask)), -1))
