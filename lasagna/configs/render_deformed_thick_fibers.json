@@ -1,0 +1,9 @@
+{
+  "fiber_lasagna_surface": {
+    "render_surface": true,
+    "overlay_only": true,
+    "device": "cpu",
+    "output_root": "/home/hendrik/villa4/lasagna/data/render_deformed_central_v2",
+    "line_width": 8
+  }
+}

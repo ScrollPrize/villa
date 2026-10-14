@@ -1,5 +1,13 @@
 # Fixed-UV H-fiber surface reconstruction
 
+Active task: [render_plan.md](render_plan.md). Untangling is paused, not solved.
+
+Active follow-up: [smoothing_plan.md](smoothing_plan.md), independently reviewed.
+The joint sliding implementation below is complete; tune only existing weights.
+
+This is the completed baseline plan. Current reviewed implementation plan:
+[joint_uv_plan.md](joint_uv_plan.md), superseding fixed-UV-only for the opt-in mode.
+
 ## Task
 Construct an explicitly ruled/extrapolated XYZ surface from retained H curves
 in the solved UV map. Optimize it with existing Lasagna mesh scale-space,

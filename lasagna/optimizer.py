@@ -2624,6 +2624,8 @@ def optimize(
 					lr_last = _lr_last(settings.lr)
 					for p in group:
 						param_groups_.append({"params": [p], "lr": lr_last})
+			if fixed_uv_targets is not None and hasattr(fixed_uv_targets, 'optimizer_groups'):
+				param_groups_.extend(fixed_uv_targets.optimizer_groups())
 			return all_params_, param_groups_
 
 		def _make_optimizer(
@@ -4532,7 +4534,11 @@ def optimize(
 				_flatten_update_before = [p.detach().clone() for p in _flatten_update_params]
 			_apply_optimizer_lr_warmup(opt, step1=step + 1, warmup_steps=lr_warmup_steps)
 			_log_cuda_memory(f"{label}.{step + 1}.opt_step.before")
+			_surface_step_guard = getattr(fixed_uv_targets, 'step_guard', None)
+			_surface_step_saved = _surface_step_guard.before(opt, model) if _surface_step_guard is not None else None
 			opt.step()
+			if _surface_step_guard is not None:
+				_surface_step_guard.after(opt, model, _surface_step_saved)
 			_log_cuda_memory(f"{label}.{step + 1}.opt_step.after")
 			_bump_snap_global_mesh_epoch()
 			if _flatten_update_before is not None:

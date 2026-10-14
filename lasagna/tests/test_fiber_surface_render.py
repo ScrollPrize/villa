@@ -1,0 +1,45 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import numpy as np
+from vesuvius.tifxyz_label_transfer.core import Surface
+from fiber_surface_render import canvas, band_geometry, fiber_overlay
+
+
+def test_registered_affine_surface_and_overlay():
+    y, x = np.mgrid[:5, :7].astype(np.float32)
+    s = Surface(x=100+x*100, y=200+y*100, z=300+x*20+y*30, scale_yx=(.01,.01))
+    shape, factor = canvas(s, 25)
+    assert shape == (17,25)
+    xyz, valid = band_geometry(s, shape, factor, 0, shape[0])
+    np.testing.assert_allclose(xyz[8,12], [400,400,420])
+    assert valid.all()
+    a = dict(piece=np.array([0,0,1,1]), source=np.array([4,4,4,4]),
+             arc=np.array([0,1,4,5]), final_grid_uv=np.array([[1,2],[3,2],[5,2],[6,2]]))
+    overlay, ids = fiber_overlay(a, shape, factor, 1)
+    assert overlay.shape == (*shape,4)
+    assert overlay[8,12,3] > 0
+    assert overlay[8,16,3] == 0  # no line across separate pieces of one source
+    assert len(ids) == 2
+
+
+def test_anisotropic_grid_and_invalid_geometry():
+    y, x = np.mgrid[:5, :7].astype(np.float32)
+    valid = np.ones(x.shape, bool)
+    valid[1,1] = False
+    s = Surface(x=x*50, y=y*100, z=np.ones_like(x),
+                scale_yx=(.01,.02), valid=valid)
+    shape, factor = canvas(s, 25)
+    assert shape == (17,13)
+    xyz, mask = band_geometry(s, shape, factor, 0, shape[0])
+    np.testing.assert_allclose(xyz[8,6], [150,200,1])
+    assert not mask[4,2]
+
+
+def test_four_times_thicker_lines():
+    a = dict(piece=np.array([0,0]), source=np.array([4,4]), arc=np.array([0,1]),
+             final_grid_uv=np.array([[5,10],[25,10]]))
+    thin, _ = fiber_overlay(a, (30,30), np.ones(2), 2)
+    thick, _ = fiber_overlay(a, (30,30), np.ones(2), 8)
+    assert np.count_nonzero(thin[:,15,3]) == 2
+    assert np.count_nonzero(thick[:,15,3]) == 8

@@ -1,0 +1,312 @@
+[
+  {
+    "run": "/home/hendrik/villa4/lasagna/data/joint_uv_original_gpu_v1",
+    "fit": {
+      "samples": 43478,
+      "mean_base": 8.102940559387207,
+      "rms_base": 11.517762184143066,
+      "median_base": 6.413638114929199,
+      "p95_base": 21.379718780517578,
+      "max_base": 931.585205078125,
+      "normal_rms_base": 2.5213687419891357,
+      "degenerate_attachment_normals": 0,
+      "shift_u_p50_p95_max_base": [
+        40.30213165283203,
+        167.18865966796875,
+        875.6275024414062
+      ],
+      "shift_v_p50_p95_max_base": [
+        60.99906921386719,
+        316.2347717285156,
+        769.6995239257812
+      ],
+      "beyond_allowance_percent": 0.0
+    },
+    "solve_seconds": 7.497925275936723,
+    "folds": 301,
+    "degenerate": 0,
+    "folds_with_attachments": 73,
+    "attachment_cells": 13586,
+    "folds_without_attachments": 228,
+    "folds_initially_bracketed": 160
+  },
+  {
+    "run": "/home/hendrik/villa4/lasagna/data/smoothing_original_b15_s0.5_v1",
+    "fit": {
+      "samples": 43478,
+      "mean_base": 8.061511993408203,
+      "rms_base": 11.478209495544434,
+      "median_base": 6.325719833374023,
+      "p95_base": 21.51195526123047,
+      "max_base": 724.9021606445312,
+      "normal_rms_base": 2.2907893657684326,
+      "degenerate_attachment_normals": 0,
+      "shift_u_p50_p95_max_base": [
+        41.73430633544922,
+        168.5899200439453,
+        701.185302734375
+      ],
+      "shift_v_p50_p95_max_base": [
+        61.96393585205078,
+        319.7349853515625,
+        772.1421508789062
+      ],
+      "beyond_allowance_percent": 0.0
+    },
+    "solve_seconds": 8.243309908080846,
+    "folds": 411,
+    "degenerate": 0,
+    "folds_with_attachments": 75,
+    "attachment_cells": 13531,
+    "folds_without_attachments": 336,
+    "folds_initially_bracketed": 188
+  },
+  {
+    "run": "/home/hendrik/villa4/lasagna/data/smoothing_original_b50_s0.5_v1",
+    "fit": {
+      "samples": 43478,
+      "mean_base": 8.595439910888672,
+      "rms_base": 12.023540496826172,
+      "median_base": 6.686715126037598,
+      "p95_base": 23.13617515563965,
+      "max_base": 519.272705078125,
+      "normal_rms_base": 2.742710590362549,
+      "degenerate_attachment_normals": 0,
+      "shift_u_p50_p95_max_base": [
+        43.02812957763672,
+        168.14808654785156,
+        800.4030151367188
+      ],
+      "shift_v_p50_p95_max_base": [
+        60.52998352050781,
+        313.4859924316406,
+        795.53564453125
+      ],
+      "beyond_allowance_percent": 0.0
+    },
+    "solve_seconds": 9.127698959084228,
+    "folds": 550,
+    "degenerate": 0,
+    "folds_with_attachments": 90,
+    "attachment_cells": 13436,
+    "folds_without_attachments": 460,
+    "folds_initially_bracketed": 233
+  },
+  {
+    "run": "/home/hendrik/villa4/lasagna/data/smoothing_original_b5_s1.5_v1",
+    "fit": {
+      "samples": 43478,
+      "mean_base": 7.9308271408081055,
+      "rms_base": 11.585672378540039,
+      "median_base": 6.114535808563232,
+      "p95_base": 21.83866310119629,
+      "max_base": 787.0337524414062,
+      "normal_rms_base": 2.3128981590270996,
+      "degenerate_attachment_normals": 0,
+      "shift_u_p50_p95_max_base": [
+        43.221153259277344,
+        182.45452880859375,
+        797.6475219726562
+      ],
+      "shift_v_p50_p95_max_base": [
+        65.91146087646484,
+        339.9121398925781,
+        790.3965454101562
+      ],
+      "beyond_allowance_percent": 0.0
+    },
+    "solve_seconds": 8.25980563601479,
+    "folds": 225,
+    "degenerate": 0,
+    "folds_with_attachments": 57,
+    "attachment_cells": 13690,
+    "folds_without_attachments": 168,
+    "folds_initially_bracketed": 123
+  },
+  {
+    "run": "/home/hendrik/villa4/lasagna/data/smoothing_original_b5_s5_v1",
+    "fit": {
+      "samples": 43478,
+      "mean_base": 8.168712615966797,
+      "rms_base": 11.872295379638672,
+      "median_base": 6.090367317199707,
+      "p95_base": 23.227527618408203,
+      "max_base": 496.4294738769531,
+      "normal_rms_base": 2.638136863708496,
+      "degenerate_attachment_normals": 0,
+      "shift_u_p50_p95_max_base": [
+        49.58594512939453,
+        213.92381286621094,
+        1015.6318359375
+      ],
+      "shift_v_p50_p95_max_base": [
+        70.09431457519531,
+        372.29412841796875,
+        911.9197998046875
+      ],
+      "beyond_allowance_percent": 0.016100095584988594
+    },
+    "solve_seconds": 8.134272593073547,
+    "folds": 231,
+    "degenerate": 0,
+    "folds_with_attachments": 49,
+    "attachment_cells": 13772,
+    "folds_without_attachments": 182,
+    "folds_initially_bracketed": 131
+  },
+  {
+    "run": "/home/hendrik/villa4/lasagna/data/joint_uv_deformed_gpu_v1",
+    "fit": {
+      "samples": 43496,
+      "mean_base": 7.916469097137451,
+      "rms_base": 11.353405952453613,
+      "median_base": 6.283736705780029,
+      "p95_base": 20.607830047607422,
+      "max_base": 890.8326416015625,
+      "normal_rms_base": 2.506364345550537,
+      "degenerate_attachment_normals": 0,
+      "shift_u_p50_p95_max_base": [
+        30.68511962890625,
+        151.80877685546875,
+        863.8541259765625
+      ],
+      "shift_v_p50_p95_max_base": [
+        63.215545654296875,
+        295.63653564453125,
+        683.3357543945312
+      ],
+      "beyond_allowance_percent": 0.09196247905492783
+    },
+    "solve_seconds": 7.475856503937393,
+    "folds": 369,
+    "degenerate": 0,
+    "folds_with_attachments": 85,
+    "attachment_cells": 13626,
+    "folds_without_attachments": 284,
+    "folds_initially_bracketed": 168
+  },
+  {
+    "run": "/home/hendrik/villa4/lasagna/data/smoothing_deformed_b15_s0.5_v1",
+    "fit": {
+      "samples": 43496,
+      "mean_base": 7.932389736175537,
+      "rms_base": 11.48498249053955,
+      "median_base": 6.286717414855957,
+      "p95_base": 20.929101943969727,
+      "max_base": 778.1051025390625,
+      "normal_rms_base": 2.4027979373931885,
+      "degenerate_attachment_normals": 0,
+      "shift_u_p50_p95_max_base": [
+        31.484886169433594,
+        154.5380859375,
+        969.4866943359375
+      ],
+      "shift_v_p50_p95_max_base": [
+        63.74989318847656,
+        300.2295837402344,
+        690.9312744140625
+      ],
+      "beyond_allowance_percent": 0.04598123952746391
+    },
+    "solve_seconds": 8.795382272917777,
+    "folds": 427,
+    "degenerate": 0,
+    "folds_with_attachments": 75,
+    "attachment_cells": 13579,
+    "folds_without_attachments": 352,
+    "folds_initially_bracketed": 177
+  },
+  {
+    "run": "/home/hendrik/villa4/lasagna/data/smoothing_deformed_b50_s0.5_v1",
+    "fit": {
+      "samples": 43496,
+      "mean_base": 8.192804336547852,
+      "rms_base": 11.594314575195312,
+      "median_base": 6.417581081390381,
+      "p95_base": 22.06969451904297,
+      "max_base": 644.507080078125,
+      "normal_rms_base": 2.3803398609161377,
+      "degenerate_attachment_normals": 0,
+      "shift_u_p50_p95_max_base": [
+        32.515403747558594,
+        152.57516479492188,
+        897.4974365234375
+      ],
+      "shift_v_p50_p95_max_base": [
+        63.73101806640625,
+        287.7334289550781,
+        673.5311279296875
+      ],
+      "beyond_allowance_percent": 0.06897185742855072
+    },
+    "solve_seconds": 9.000084806932136,
+    "folds": 565,
+    "degenerate": 0,
+    "folds_with_attachments": 64,
+    "attachment_cells": 13496,
+    "folds_without_attachments": 501,
+    "folds_initially_bracketed": 191
+  },
+  {
+    "run": "/home/hendrik/villa4/lasagna/data/smoothing_deformed_b5_s1.5_v1",
+    "fit": {
+      "samples": 43496,
+      "mean_base": 7.995400428771973,
+      "rms_base": 11.739892959594727,
+      "median_base": 6.307365417480469,
+      "p95_base": 21.574539184570312,
+      "max_base": 894.6671752929688,
+      "normal_rms_base": 2.687293767929077,
+      "degenerate_attachment_normals": 0,
+      "shift_u_p50_p95_max_base": [
+        32.189212799072266,
+        164.1547393798828,
+        960.603515625
+      ],
+      "shift_v_p50_p95_max_base": [
+        68.42376708984375,
+        314.9772644042969,
+        694.6266479492188
+      ],
+      "beyond_allowance_percent": 0.14713996648788452
+    },
+    "solve_seconds": 8.385401534847915,
+    "folds": 233,
+    "degenerate": 0,
+    "folds_with_attachments": 57,
+    "attachment_cells": 13697,
+    "folds_without_attachments": 176,
+    "folds_initially_bracketed": 127
+  },
+  {
+    "run": "/home/hendrik/villa4/lasagna/data/smoothing_deformed_b5_s5_v1",
+    "fit": {
+      "samples": 43496,
+      "mean_base": 8.249380111694336,
+      "rms_base": 12.341424942016602,
+      "median_base": 6.052294731140137,
+      "p95_base": 23.77013397216797,
+      "max_base": 574.4228515625,
+      "normal_rms_base": 2.6650726795196533,
+      "degenerate_attachment_normals": 0,
+      "shift_u_p50_p95_max_base": [
+        36.078758239746094,
+        193.44229125976562,
+        1120.5157470703125
+      ],
+      "shift_v_p50_p95_max_base": [
+        72.45795440673828,
+        348.2640380859375,
+        780.7696533203125
+      ],
+      "beyond_allowance_percent": 0.17702777683734894
+    },
+    "solve_seconds": 8.009225057903677,
+    "folds": 249,
+    "degenerate": 0,
+    "folds_with_attachments": 47,
+    "attachment_cells": 13762,
+    "folds_without_attachments": 202,
+    "folds_initially_bracketed": 116
+  }
+]

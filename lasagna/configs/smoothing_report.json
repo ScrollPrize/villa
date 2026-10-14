@@ -1,0 +1,18 @@
+{
+  "fiber_lasagna_surface": {
+    "device": "cpu",
+    "summarize_runs": [
+      "/home/hendrik/villa4/lasagna/data/joint_uv_original_gpu_v1",
+      "/home/hendrik/villa4/lasagna/data/smoothing_original_b15_s0.5_v1",
+      "/home/hendrik/villa4/lasagna/data/smoothing_original_b50_s0.5_v1",
+      "/home/hendrik/villa4/lasagna/data/smoothing_original_b5_s1.5_v1",
+      "/home/hendrik/villa4/lasagna/data/smoothing_original_b5_s5_v1",
+      "/home/hendrik/villa4/lasagna/data/joint_uv_deformed_gpu_v1",
+      "/home/hendrik/villa4/lasagna/data/smoothing_deformed_b15_s0.5_v1",
+      "/home/hendrik/villa4/lasagna/data/smoothing_deformed_b50_s0.5_v1",
+      "/home/hendrik/villa4/lasagna/data/smoothing_deformed_b5_s1.5_v1",
+      "/home/hendrik/villa4/lasagna/data/smoothing_deformed_b5_s5_v1"
+    ],
+    "report_path": "/home/hendrik/villa4/lasagna/planning/fiber_surface/smoothing_metrics.json"
+  }
+}

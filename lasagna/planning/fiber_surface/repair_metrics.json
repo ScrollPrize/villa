@@ -1,0 +1,1418 @@
+[
+  {
+    "before": {
+      "fit": {
+        "samples": 43478,
+        "mean_base": 7.9308271408081055,
+        "rms_base": 11.585672378540039,
+        "median_base": 6.114437580108643,
+        "p95_base": 21.83866310119629,
+        "max_base": 787.0337524414062,
+        "normal_rms_base": 2.3128974437713623,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          43.21977233886719,
+          182.45510864257812,
+          797.6473999023438
+        ],
+        "shift_v_p50_p95_max_base": [
+          65.91156005859375,
+          339.9119873046875,
+          790.3967895507812
+        ],
+        "beyond_allowance_percent": 0
+      },
+      "geometry": {
+        "vertices": 397184,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 225,
+        "bbox_min": [
+          5393.41064453125,
+          6881.30517578125,
+          27468.5234375
+        ],
+        "bbox_max": [
+          33137.5390625,
+          20620.09765625,
+          52120.140625
+        ],
+        "near_or_folded": 305,
+        "neighbor_reversals": 964
+      }
+    },
+    "repaired": {
+      "fit": {
+        "samples": 43478,
+        "mean_base": 7.970001220703125,
+        "rms_base": 11.688189506530762,
+        "median_base": 6.123870849609375,
+        "p95_base": 22.064838409423828,
+        "max_base": 787.0337524414062,
+        "normal_rms_base": 2.567448377609253,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          43.21977233886719,
+          182.45510864257812,
+          797.6473999023438
+        ],
+        "shift_v_p50_p95_max_base": [
+          65.91156005859375,
+          339.9119873046875,
+          790.3967895507812
+        ],
+        "beyond_allowance_percent": 0
+      },
+      "geometry": {
+        "vertices": 397184,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 209,
+        "bbox_min": [
+          5393.41064453125,
+          6881.30517578125,
+          27468.5234375
+        ],
+        "bbox_max": [
+          33137.5390625,
+          20620.09765625,
+          52120.140625
+        ],
+        "near_or_folded": 277,
+        "neighbor_reversals": 856
+      }
+    },
+    "repair_seconds": 14.360876365099102,
+    "control": {
+      "fit": {
+        "samples": 43478,
+        "mean_base": 6.908027648925781,
+        "rms_base": 10.634971618652344,
+        "median_base": 5.202376365661621,
+        "p95_base": 19.61724281311035,
+        "max_base": 742.5687866210938,
+        "normal_rms_base": 0.8878920674324036,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          44.773895263671875,
+          184.9861297607422,
+          867.9682006835938
+        ],
+        "shift_v_p50_p95_max_base": [
+          69.99453735351562,
+          350.99835205078125,
+          870.1727905273438
+        ],
+        "beyond_allowance_percent": 0
+      },
+      "geometry": {
+        "vertices": 397184,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 198,
+        "bbox_min": [
+          6525.72998046875,
+          6838.3974609375,
+          28409.8046875
+        ],
+        "bbox_max": [
+          32994.57421875,
+          20291.958984375,
+          52217.69140625
+        ],
+        "near_or_folded": 269,
+        "neighbor_reversals": 807
+      },
+      "seconds": 10.152916303137317
+    },
+    "continued": {
+      "fit": {
+        "samples": 43478,
+        "mean_base": 6.888667106628418,
+        "rms_base": 10.492425918579102,
+        "median_base": 5.206123352050781,
+        "p95_base": 19.576135635375977,
+        "max_base": 742.583984375,
+        "normal_rms_base": 0.9015759229660034,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          44.65556335449219,
+          184.9058380126953,
+          866.7843017578125
+        ],
+        "shift_v_p50_p95_max_base": [
+          70.01971435546875,
+          351.4977111816406,
+          862.2621459960938
+        ],
+        "beyond_allowance_percent": 0
+      },
+      "geometry": {
+        "vertices": 397184,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 195,
+        "bbox_min": [
+          6529.78564453125,
+          6838.39697265625,
+          28409.84765625
+        ],
+        "bbox_max": [
+          32994.57421875,
+          20291.7109375,
+          52216.984375
+        ],
+        "near_or_folded": 246,
+        "neighbor_reversals": 762
+      },
+      "seconds": 8.890498328022659
+    },
+    "total_seconds": 33.484453171957284,
+    "run": "/home/hendrik/villa4/lasagna/data/repair_original_v2",
+    "variant": "repair",
+    "input": "original",
+    "attempt_count": 1398,
+    "selected_count": 44,
+    "new_defect_rejections": 1167,
+    "local_fit_rejections": 331
+  },
+  {
+    "before": {
+      "fit": {
+        "samples": 43496,
+        "mean_base": 7.995399475097656,
+        "rms_base": 11.739892959594727,
+        "median_base": 6.307365417480469,
+        "p95_base": 21.574539184570312,
+        "max_base": 894.6671752929688,
+        "normal_rms_base": 2.687293767929077,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          32.19044494628906,
+          164.1549072265625,
+          960.6036376953125
+        ],
+        "shift_v_p50_p95_max_base": [
+          68.42411804199219,
+          314.97772216796875,
+          694.6279296875
+        ],
+        "beyond_allowance_percent": 0.14713996648788452
+      },
+      "geometry": {
+        "vertices": 416016,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 233,
+        "bbox_min": [
+          6706.68115234375,
+          6809.66943359375,
+          28247.771484375
+        ],
+        "bbox_max": [
+          33161.2734375,
+          22092.68359375,
+          52960.66796875
+        ],
+        "near_or_folded": 311,
+        "neighbor_reversals": 1059
+      }
+    },
+    "repaired": {
+      "fit": {
+        "samples": 43496,
+        "mean_base": 8.057374954223633,
+        "rms_base": 11.853662490844727,
+        "median_base": 6.331596374511719,
+        "p95_base": 21.863313674926758,
+        "max_base": 894.6671752929688,
+        "normal_rms_base": 2.917217493057251,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          32.19044494628906,
+          164.1549072265625,
+          960.6036376953125
+        ],
+        "shift_v_p50_p95_max_base": [
+          68.42411804199219,
+          314.97772216796875,
+          694.6279296875
+        ],
+        "beyond_allowance_percent": 0.14713996648788452
+      },
+      "geometry": {
+        "vertices": 416016,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 206,
+        "bbox_min": [
+          6706.68115234375,
+          6809.66943359375,
+          28247.771484375
+        ],
+        "bbox_max": [
+          33161.2734375,
+          22092.68359375,
+          52960.66796875
+        ],
+        "near_or_folded": 266,
+        "neighbor_reversals": 929
+      }
+    },
+    "repair_seconds": 15.940910967998207,
+    "control": {
+      "fit": {
+        "samples": 43496,
+        "mean_base": 6.754500865936279,
+        "rms_base": 10.628745079040527,
+        "median_base": 5.109862804412842,
+        "p95_base": 19.36652374267578,
+        "max_base": 888.7394409179688,
+        "normal_rms_base": 0.9267337322235107,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          33.624229431152344,
+          168.0789794921875,
+          959.2665405273438
+        ],
+        "shift_v_p50_p95_max_base": [
+          73.54998016357422,
+          331.5767822265625,
+          741.12060546875
+        ],
+        "beyond_allowance_percent": 0.16093434393405914
+      },
+      "geometry": {
+        "vertices": 416016,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 216,
+        "bbox_min": [
+          7715.0595703125,
+          6755.49853515625,
+          28234.5859375
+        ],
+        "bbox_max": [
+          32998.01953125,
+          21628.6171875,
+          53006.99609375
+        ],
+        "near_or_folded": 275,
+        "neighbor_reversals": 929
+      },
+      "seconds": 10.200207241112366
+    },
+    "continued": {
+      "fit": {
+        "samples": 43496,
+        "mean_base": 6.788932800292969,
+        "rms_base": 10.698387145996094,
+        "median_base": 5.109140396118164,
+        "p95_base": 19.53528594970703,
+        "max_base": 892.2780151367188,
+        "normal_rms_base": 0.963748574256897,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          33.52869415283203,
+          168.47950744628906,
+          959.5765380859375
+        ],
+        "shift_v_p50_p95_max_base": [
+          73.64777374267578,
+          332.32525634765625,
+          739.652587890625
+        ],
+        "beyond_allowance_percent": 0.16093434393405914
+      },
+      "geometry": {
+        "vertices": 416016,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 200,
+        "bbox_min": [
+          7715.97412109375,
+          6755.48779296875,
+          28233.71875
+        ],
+        "bbox_max": [
+          32997.9609375,
+          21629.189453125,
+          53014.796875
+        ],
+        "near_or_folded": 269,
+        "neighbor_reversals": 863
+      },
+      "seconds": 9.279009321937338
+    },
+    "total_seconds": 35.50774797098711,
+    "run": "/home/hendrik/villa4/lasagna/data/repair_deformed_v2",
+    "variant": "repair",
+    "input": "deformed",
+    "attempt_count": 1509,
+    "selected_count": 54,
+    "new_defect_rejections": 1276,
+    "local_fit_rejections": 375
+  },
+  {
+    "before": {
+      "fit": {
+        "samples": 43478,
+        "mean_base": 7.9308271408081055,
+        "rms_base": 11.585672378540039,
+        "median_base": 6.114437580108643,
+        "p95_base": 21.83866310119629,
+        "max_base": 787.0337524414062,
+        "normal_rms_base": 2.3128974437713623,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          43.21977233886719,
+          182.45510864257812,
+          797.6473999023438
+        ],
+        "shift_v_p50_p95_max_base": [
+          65.91156005859375,
+          339.9119873046875,
+          790.3967895507812
+        ],
+        "beyond_allowance_percent": 0
+      },
+      "geometry": {
+        "vertices": 397184,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 225,
+        "bbox_min": [
+          5393.41064453125,
+          6881.30517578125,
+          27468.5234375
+        ],
+        "bbox_max": [
+          33137.5390625,
+          20620.09765625,
+          52120.140625
+        ],
+        "near_or_folded": 305,
+        "neighbor_reversals": 964
+      }
+    },
+    "repaired": {
+      "fit": {
+        "samples": 43478,
+        "mean_base": 7.899011611938477,
+        "rms_base": 11.57826042175293,
+        "median_base": 6.063876152038574,
+        "p95_base": 22.038612365722656,
+        "max_base": 787.0337524414062,
+        "normal_rms_base": 2.7007837295532227,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          43.21977233886719,
+          182.45510864257812,
+          797.6473999023438
+        ],
+        "shift_v_p50_p95_max_base": [
+          65.91156005859375,
+          339.9119873046875,
+          790.3967895507812
+        ],
+        "beyond_allowance_percent": 0
+      },
+      "geometry": {
+        "vertices": 397184,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 207,
+        "bbox_min": [
+          5393.41064453125,
+          6881.30517578125,
+          27468.5234375
+        ],
+        "bbox_max": [
+          33137.5390625,
+          20620.09765625,
+          52120.140625
+        ],
+        "near_or_folded": 275,
+        "neighbor_reversals": 857
+      }
+    },
+    "repair_seconds": 18.365090558072552,
+    "control": {
+      "fit": {
+        "samples": 43478,
+        "mean_base": 6.879650592803955,
+        "rms_base": 10.457452774047852,
+        "median_base": 5.203196048736572,
+        "p95_base": 19.643211364746094,
+        "max_base": 742.5934448242188,
+        "normal_rms_base": 0.8767498731613159,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          44.79743194580078,
+          185.20147705078125,
+          855.1083374023438
+        ],
+        "shift_v_p50_p95_max_base": [
+          70.06597900390625,
+          351.2029113769531,
+          869.428466796875
+        ],
+        "beyond_allowance_percent": 0
+      },
+      "geometry": {
+        "vertices": 397184,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 203,
+        "bbox_min": [
+          6533.4287109375,
+          6838.3974609375,
+          28410.130859375
+        ],
+        "bbox_max": [
+          32994.57421875,
+          20290.125,
+          52217.3671875
+        ],
+        "near_or_folded": 263,
+        "neighbor_reversals": 815
+      },
+      "seconds": 9.425964400172234
+    },
+    "continued": {
+      "fit": {
+        "samples": 43478,
+        "mean_base": 6.92738151550293,
+        "rms_base": 10.552474975585938,
+        "median_base": 5.231775760650635,
+        "p95_base": 19.82240867614746,
+        "max_base": 742.6192016601562,
+        "normal_rms_base": 0.8791806101799011,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          44.605430603027344,
+          184.77540588378906,
+          845.3689575195312
+        ],
+        "shift_v_p50_p95_max_base": [
+          70.05735778808594,
+          350.7780456542969,
+          863.9104614257812
+        ],
+        "beyond_allowance_percent": 0
+      },
+      "geometry": {
+        "vertices": 397184,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 189,
+        "bbox_min": [
+          6535.31103515625,
+          6838.39697265625,
+          28410.298828125
+        ],
+        "bbox_max": [
+          32994.58203125,
+          20288.837890625,
+          52217.10546875
+        ],
+        "near_or_folded": 242,
+        "neighbor_reversals": 762
+      },
+      "seconds": 8.521921172039583
+    },
+    "total_seconds": 36.393193216994405,
+    "run": "/home/hendrik/villa4/lasagna/data/repair_large_original_v1",
+    "variant": "repair_large",
+    "input": "original",
+    "attempt_count": 1482,
+    "selected_count": 45,
+    "new_defect_rejections": 1232,
+    "local_fit_rejections": 371
+  },
+  {
+    "before": {
+      "fit": {
+        "samples": 43496,
+        "mean_base": 7.995399475097656,
+        "rms_base": 11.739892959594727,
+        "median_base": 6.307365417480469,
+        "p95_base": 21.574539184570312,
+        "max_base": 894.6671752929688,
+        "normal_rms_base": 2.687293767929077,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          32.19044494628906,
+          164.1549072265625,
+          960.6036376953125
+        ],
+        "shift_v_p50_p95_max_base": [
+          68.42411804199219,
+          314.97772216796875,
+          694.6279296875
+        ],
+        "beyond_allowance_percent": 0.14713996648788452
+      },
+      "geometry": {
+        "vertices": 416016,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 233,
+        "bbox_min": [
+          6706.68115234375,
+          6809.66943359375,
+          28247.771484375
+        ],
+        "bbox_max": [
+          33161.2734375,
+          22092.68359375,
+          52960.66796875
+        ],
+        "near_or_folded": 311,
+        "neighbor_reversals": 1059
+      }
+    },
+    "repaired": {
+      "fit": {
+        "samples": 43496,
+        "mean_base": 8.169393539428711,
+        "rms_base": 11.995705604553223,
+        "median_base": 6.395934581756592,
+        "p95_base": 22.297664642333984,
+        "max_base": 894.6671752929688,
+        "normal_rms_base": 3.5578272342681885,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          32.19044494628906,
+          164.1549072265625,
+          960.6036376953125
+        ],
+        "shift_v_p50_p95_max_base": [
+          68.42411804199219,
+          314.97772216796875,
+          694.6279296875
+        ],
+        "beyond_allowance_percent": 0.14713996648788452
+      },
+      "geometry": {
+        "vertices": 416016,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 205,
+        "bbox_min": [
+          6706.68115234375,
+          6809.66943359375,
+          28247.771484375
+        ],
+        "bbox_max": [
+          33161.2734375,
+          22092.68359375,
+          52960.66796875
+        ],
+        "near_or_folded": 265,
+        "neighbor_reversals": 929
+      }
+    },
+    "repair_seconds": 17.872806072002277,
+    "control": {
+      "fit": {
+        "samples": 43496,
+        "mean_base": 6.7583746910095215,
+        "rms_base": 10.55504035949707,
+        "median_base": 5.098426818847656,
+        "p95_base": 19.481212615966797,
+        "max_base": 873.4850463867188,
+        "normal_rms_base": 0.8881658911705017,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          33.64599609375,
+          168.27767944335938,
+          960.3795776367188
+        ],
+        "shift_v_p50_p95_max_base": [
+          73.65564727783203,
+          331.503173828125,
+          739.680908203125
+        ],
+        "beyond_allowance_percent": 0.16093434393405914
+      },
+      "geometry": {
+        "vertices": 416016,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 214,
+        "bbox_min": [
+          7715.8173828125,
+          6755.498046875,
+          28234.3515625
+        ],
+        "bbox_max": [
+          32997.98046875,
+          21628.1484375,
+          53005.97265625
+        ],
+        "near_or_folded": 282,
+        "neighbor_reversals": 933
+      },
+      "seconds": 9.125484636053443
+    },
+    "continued": {
+      "fit": {
+        "samples": 43496,
+        "mean_base": 6.76566219329834,
+        "rms_base": 10.621306419372559,
+        "median_base": 5.090316295623779,
+        "p95_base": 19.49760627746582,
+        "max_base": 884.0977172851562,
+        "normal_rms_base": 0.9791644215583801,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          33.50328826904297,
+          168.08934020996094,
+          959.8248291015625
+        ],
+        "shift_v_p50_p95_max_base": [
+          73.56224060058594,
+          332.120361328125,
+          741.3878173828125
+        ],
+        "beyond_allowance_percent": 0.16093434393405914
+      },
+      "geometry": {
+        "vertices": 416016,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 200,
+        "bbox_min": [
+          7715.1171875,
+          6755.50732421875,
+          28233.443359375
+        ],
+        "bbox_max": [
+          32997.9921875,
+          21628.5703125,
+          53012.64453125
+        ],
+        "near_or_folded": 262,
+        "neighbor_reversals": 884
+      },
+      "seconds": 8.318808255018666
+    },
+    "total_seconds": 35.40403528721072,
+    "run": "/home/hendrik/villa4/lasagna/data/repair_large_deformed_v1",
+    "variant": "repair_large",
+    "input": "deformed",
+    "attempt_count": 1578,
+    "selected_count": 52,
+    "new_defect_rejections": 1329,
+    "local_fit_rejections": 428
+  },
+  {
+    "before": {
+      "fit": {
+        "samples": 43478,
+        "mean_base": 7.9308271408081055,
+        "rms_base": 11.585672378540039,
+        "median_base": 6.114437580108643,
+        "p95_base": 21.83866310119629,
+        "max_base": 787.0337524414062,
+        "normal_rms_base": 2.3128974437713623,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          43.21977233886719,
+          182.45510864257812,
+          797.6473999023438
+        ],
+        "shift_v_p50_p95_max_base": [
+          65.91156005859375,
+          339.9119873046875,
+          790.3967895507812
+        ],
+        "beyond_allowance_percent": 0
+      },
+      "geometry": {
+        "vertices": 397184,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 225,
+        "bbox_min": [
+          5393.41064453125,
+          6881.30517578125,
+          27468.5234375
+        ],
+        "bbox_max": [
+          33137.5390625,
+          20620.09765625,
+          52120.140625
+        ],
+        "near_or_folded": 305,
+        "neighbor_reversals": 964
+      }
+    },
+    "repaired": {
+      "fit": {
+        "samples": 43478,
+        "mean_base": 8.25367259979248,
+        "rms_base": 12.15345287322998,
+        "median_base": 6.195227146148682,
+        "p95_base": 23.647144317626953,
+        "max_base": 688.642822265625,
+        "normal_rms_base": 3.471203088760376,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          43.21977233886719,
+          182.45510864257812,
+          797.6473999023438
+        ],
+        "shift_v_p50_p95_max_base": [
+          65.91156005859375,
+          339.9119873046875,
+          790.3967895507812
+        ],
+        "beyond_allowance_percent": 0
+      },
+      "geometry": {
+        "vertices": 397184,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 183,
+        "bbox_min": [
+          5393.41064453125,
+          6881.30517578125,
+          27529.0546875
+        ],
+        "bbox_max": [
+          33137.5390625,
+          20620.09765625,
+          52120.140625
+        ],
+        "near_or_folded": 234,
+        "neighbor_reversals": 758
+      }
+    },
+    "repair_seconds": 33.37748414603993,
+    "control": {
+      "fit": {
+        "samples": 43478,
+        "mean_base": 6.908160209655762,
+        "rms_base": 10.608908653259277,
+        "median_base": 5.217886447906494,
+        "p95_base": 19.725786209106445,
+        "max_base": 742.690185546875,
+        "normal_rms_base": 0.8747249841690063,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          44.734405517578125,
+          184.8966064453125,
+          869.0724487304688
+        ],
+        "shift_v_p50_p95_max_base": [
+          69.9031982421875,
+          351.58148193359375,
+          871.4188842773438
+        ],
+        "beyond_allowance_percent": 0
+      },
+      "geometry": {
+        "vertices": 397184,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 200,
+        "bbox_min": [
+          6523.583984375,
+          6838.39697265625,
+          28409.970703125
+        ],
+        "bbox_max": [
+          32994.57421875,
+          20293.3671875,
+          52218.60546875
+        ],
+        "near_or_folded": 258,
+        "neighbor_reversals": 794
+      },
+      "seconds": 9.192726323846728
+    },
+    "continued": {
+      "fit": {
+        "samples": 43478,
+        "mean_base": 6.91900110244751,
+        "rms_base": 10.44528865814209,
+        "median_base": 5.236364364624023,
+        "p95_base": 19.749338150024414,
+        "max_base": 615.9797973632812,
+        "normal_rms_base": 0.8868879079818726,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          44.72528076171875,
+          185.28004455566406,
+          910.53466796875
+        ],
+        "shift_v_p50_p95_max_base": [
+          70.16065979003906,
+          351.42718505859375,
+          870.9708251953125
+        ],
+        "beyond_allowance_percent": 0
+      },
+      "geometry": {
+        "vertices": 397184,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 200,
+        "bbox_min": [
+          6533.98486328125,
+          6838.43701171875,
+          28409.34765625
+        ],
+        "bbox_max": [
+          32994.57421875,
+          20289.556640625,
+          52213.85546875
+        ],
+        "near_or_folded": 255,
+        "neighbor_reversals": 767
+      },
+      "seconds": 8.549387322971597
+    },
+    "total_seconds": 51.20127915008925,
+    "run": "/home/hendrik/villa4/lasagna/data/repair_tangent_original_v1",
+    "variant": "repair_tangent",
+    "input": "original",
+    "attempt_count": 4356,
+    "selected_count": 112,
+    "new_defect_rejections": 2170,
+    "local_fit_rejections": 530
+  },
+  {
+    "before": {
+      "fit": {
+        "samples": 43496,
+        "mean_base": 7.995399475097656,
+        "rms_base": 11.739892959594727,
+        "median_base": 6.307365417480469,
+        "p95_base": 21.574539184570312,
+        "max_base": 894.6671752929688,
+        "normal_rms_base": 2.687293767929077,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          32.19044494628906,
+          164.1549072265625,
+          960.6036376953125
+        ],
+        "shift_v_p50_p95_max_base": [
+          68.42411804199219,
+          314.97772216796875,
+          694.6279296875
+        ],
+        "beyond_allowance_percent": 0.14713996648788452
+      },
+      "geometry": {
+        "vertices": 416016,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 233,
+        "bbox_min": [
+          6706.68115234375,
+          6809.66943359375,
+          28247.771484375
+        ],
+        "bbox_max": [
+          33161.2734375,
+          22092.68359375,
+          52960.66796875
+        ],
+        "near_or_folded": 311,
+        "neighbor_reversals": 1059
+      }
+    },
+    "repaired": {
+      "fit": {
+        "samples": 43496,
+        "mean_base": 8.519410133361816,
+        "rms_base": 12.644705772399902,
+        "median_base": 6.532190799713135,
+        "p95_base": 24.027103424072266,
+        "max_base": 894.6671752929688,
+        "normal_rms_base": 4.40172815322876,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          32.19044494628906,
+          164.1549072265625,
+          960.6036376953125
+        ],
+        "shift_v_p50_p95_max_base": [
+          68.42411804199219,
+          314.97772216796875,
+          694.6279296875
+        ],
+        "beyond_allowance_percent": 0.14713996648788452
+      },
+      "geometry": {
+        "vertices": 416016,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 184,
+        "bbox_min": [
+          6706.68115234375,
+          6809.66943359375,
+          28247.771484375
+        ],
+        "bbox_max": [
+          33161.2734375,
+          22092.68359375,
+          52960.66796875
+        ],
+        "near_or_folded": 230,
+        "neighbor_reversals": 839
+      }
+    },
+    "repair_seconds": 35.58129090280272,
+    "control": {
+      "fit": {
+        "samples": 43496,
+        "mean_base": 6.757327556610107,
+        "rms_base": 10.57967472076416,
+        "median_base": 5.111440658569336,
+        "p95_base": 19.403141021728516,
+        "max_base": 868.7670288085938,
+        "normal_rms_base": 0.9224679470062256,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          33.63731384277344,
+          168.1788330078125,
+          958.9601440429688
+        ],
+        "shift_v_p50_p95_max_base": [
+          73.52167510986328,
+          331.4433288574219,
+          739.7886962890625
+        ],
+        "beyond_allowance_percent": 0.16093434393405914
+      },
+      "geometry": {
+        "vertices": 416016,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 215,
+        "bbox_min": [
+          7717.935546875,
+          6755.4873046875,
+          28234.490234375
+        ],
+        "bbox_max": [
+          32997.953125,
+          21626.916015625,
+          53008.60546875
+        ],
+        "near_or_folded": 281,
+        "neighbor_reversals": 948
+      },
+      "seconds": 10.045848376816139
+    },
+    "continued": {
+      "fit": {
+        "samples": 43496,
+        "mean_base": 6.775084495544434,
+        "rms_base": 10.624835968017578,
+        "median_base": 5.089384078979492,
+        "p95_base": 19.53045654296875,
+        "max_base": 882.6451416015625,
+        "normal_rms_base": 0.9257028102874756,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          33.52339172363281,
+          168.82131958007812,
+          960.0492553710938
+        ],
+        "shift_v_p50_p95_max_base": [
+          73.64976501464844,
+          331.6927185058594,
+          738.3597412109375
+        ],
+        "beyond_allowance_percent": 0.16093434393405914
+      },
+      "geometry": {
+        "vertices": 416016,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 195,
+        "bbox_min": [
+          7704.04736328125,
+          6755.3798828125,
+          28234.03125
+        ],
+        "bbox_max": [
+          32998.02734375,
+          21630.912109375,
+          53010.55078125
+        ],
+        "near_or_folded": 253,
+        "neighbor_reversals": 875
+      },
+      "seconds": 9.361768268048763
+    },
+    "total_seconds": 55.06874514790252,
+    "run": "/home/hendrik/villa4/lasagna/data/repair_tangent_deformed_v1",
+    "variant": "repair_tangent",
+    "input": "deformed",
+    "attempt_count": 4635,
+    "selected_count": 132,
+    "new_defect_rejections": 2347,
+    "local_fit_rejections": 571
+  },
+  {
+    "before": {
+      "fit": {
+        "samples": 43478,
+        "mean_base": 7.9308271408081055,
+        "rms_base": 11.585672378540039,
+        "median_base": 6.114437580108643,
+        "p95_base": 21.83866310119629,
+        "max_base": 787.0337524414062,
+        "normal_rms_base": 2.3128974437713623,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          43.21977233886719,
+          182.45510864257812,
+          797.6473999023438
+        ],
+        "shift_v_p50_p95_max_base": [
+          65.91156005859375,
+          339.9119873046875,
+          790.3967895507812
+        ],
+        "beyond_allowance_percent": 0
+      },
+      "geometry": {
+        "vertices": 397184,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 225,
+        "bbox_min": [
+          5393.41064453125,
+          6881.30517578125,
+          27468.5234375
+        ],
+        "bbox_max": [
+          33137.5390625,
+          20620.09765625,
+          52120.140625
+        ],
+        "near_or_folded": 305,
+        "neighbor_reversals": 964
+      }
+    },
+    "repaired": {
+      "fit": {
+        "samples": 43478,
+        "mean_base": 8.25367259979248,
+        "rms_base": 12.15345287322998,
+        "median_base": 6.195227146148682,
+        "p95_base": 23.647144317626953,
+        "max_base": 688.642822265625,
+        "normal_rms_base": 3.471203088760376,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          43.21977233886719,
+          182.45510864257812,
+          797.6473999023438
+        ],
+        "shift_v_p50_p95_max_base": [
+          65.91156005859375,
+          339.9119873046875,
+          790.3967895507812
+        ],
+        "beyond_allowance_percent": 0
+      },
+      "geometry": {
+        "vertices": 397184,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 183,
+        "bbox_min": [
+          5393.41064453125,
+          6881.30517578125,
+          27529.0546875
+        ],
+        "bbox_max": [
+          33137.5390625,
+          20620.09765625,
+          52120.140625
+        ],
+        "near_or_folded": 234,
+        "neighbor_reversals": 758
+      }
+    },
+    "repair_seconds": 33.358355320990086,
+    "control": {
+      "fit": {
+        "samples": 43478,
+        "mean_base": 7.005652904510498,
+        "rms_base": 10.669290542602539,
+        "median_base": 5.264834880828857,
+        "p95_base": 20.2330322265625,
+        "max_base": 737.9824829101562,
+        "normal_rms_base": 1.0103843212127686,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          44.69938659667969,
+          185.09861755371094,
+          803.3510131835938
+        ],
+        "shift_v_p50_p95_max_base": [
+          69.84394836425781,
+          350.4573059082031,
+          854.7705688476562
+        ],
+        "beyond_allowance_percent": 0
+      },
+      "geometry": {
+        "vertices": 397184,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 228,
+        "bbox_min": [
+          6400.00634765625,
+          6838.13232421875,
+          28413.96875
+        ],
+        "bbox_max": [
+          32994.6953125,
+          20337.439453125,
+          52194.61328125
+        ],
+        "near_or_folded": 298,
+        "neighbor_reversals": 756
+      },
+      "seconds": 9.426056972937658
+    },
+    "continued": {
+      "fit": {
+        "samples": 43478,
+        "mean_base": 6.918957710266113,
+        "rms_base": 10.261351585388184,
+        "median_base": 5.2582221031188965,
+        "p95_base": 19.74268913269043,
+        "max_base": 586.5299072265625,
+        "normal_rms_base": 1.0541131496429443,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          44.807830810546875,
+          185.72775268554688,
+          808.7077026367188
+        ],
+        "shift_v_p50_p95_max_base": [
+          70.04246520996094,
+          350.6268615722656,
+          860.842529296875
+        ],
+        "beyond_allowance_percent": 0
+      },
+      "geometry": {
+        "vertices": 397184,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 208,
+        "bbox_min": [
+          6407.6572265625,
+          6838.30029296875,
+          28415.279296875
+        ],
+        "bbox_max": [
+          32994.66796875,
+          20330.064453125,
+          52188.78515625
+        ],
+        "near_or_folded": 283,
+        "neighbor_reversals": 725
+      },
+      "seconds": 9.025576655054465
+    },
+    "total_seconds": 51.89371362607926,
+    "run": "/home/hendrik/villa4/lasagna/data/repair_guard_original_v1",
+    "variant": "repair_guard",
+    "input": "original",
+    "attempt_count": 4356,
+    "selected_count": 112,
+    "new_defect_rejections": 2170,
+    "local_fit_rejections": 530
+  },
+  {
+    "before": {
+      "fit": {
+        "samples": 43496,
+        "mean_base": 7.995399475097656,
+        "rms_base": 11.739892959594727,
+        "median_base": 6.307365417480469,
+        "p95_base": 21.574539184570312,
+        "max_base": 894.6671752929688,
+        "normal_rms_base": 2.687293767929077,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          32.19044494628906,
+          164.1549072265625,
+          960.6036376953125
+        ],
+        "shift_v_p50_p95_max_base": [
+          68.42411804199219,
+          314.97772216796875,
+          694.6279296875
+        ],
+        "beyond_allowance_percent": 0.14713996648788452
+      },
+      "geometry": {
+        "vertices": 416016,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 233,
+        "bbox_min": [
+          6706.68115234375,
+          6809.66943359375,
+          28247.771484375
+        ],
+        "bbox_max": [
+          33161.2734375,
+          22092.68359375,
+          52960.66796875
+        ],
+        "near_or_folded": 311,
+        "neighbor_reversals": 1059
+      }
+    },
+    "repaired": {
+      "fit": {
+        "samples": 43496,
+        "mean_base": 8.519410133361816,
+        "rms_base": 12.644705772399902,
+        "median_base": 6.532190799713135,
+        "p95_base": 24.027103424072266,
+        "max_base": 894.6671752929688,
+        "normal_rms_base": 4.40172815322876,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          32.19044494628906,
+          164.1549072265625,
+          960.6036376953125
+        ],
+        "shift_v_p50_p95_max_base": [
+          68.42411804199219,
+          314.97772216796875,
+          694.6279296875
+        ],
+        "beyond_allowance_percent": 0.14713996648788452
+      },
+      "geometry": {
+        "vertices": 416016,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 184,
+        "bbox_min": [
+          6706.68115234375,
+          6809.66943359375,
+          28247.771484375
+        ],
+        "bbox_max": [
+          33161.2734375,
+          22092.68359375,
+          52960.66796875
+        ],
+        "near_or_folded": 230,
+        "neighbor_reversals": 839
+      }
+    },
+    "repair_seconds": 35.888266486115754,
+    "control": {
+      "fit": {
+        "samples": 43496,
+        "mean_base": 6.737127304077148,
+        "rms_base": 10.443032264709473,
+        "median_base": 5.10498046875,
+        "p95_base": 19.431570053100586,
+        "max_base": 893.5877685546875,
+        "normal_rms_base": 0.8985324501991272,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          33.64787673950195,
+          168.55210876464844,
+          960.3456420898438
+        ],
+        "shift_v_p50_p95_max_base": [
+          73.32904052734375,
+          331.161376953125,
+          739.2423706054688
+        ],
+        "beyond_allowance_percent": 0.15173809230327606
+      },
+      "geometry": {
+        "vertices": 416016,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 231,
+        "bbox_min": [
+          7463.4794921875,
+          6755.3984375,
+          28237.38671875
+        ],
+        "bbox_max": [
+          32997.421875,
+          21670.01953125,
+          53003.484375
+        ],
+        "near_or_folded": 303,
+        "neighbor_reversals": 857
+      },
+      "seconds": 9.331742310198024
+    },
+    "continued": {
+      "fit": {
+        "samples": 43496,
+        "mean_base": 6.756458282470703,
+        "rms_base": 10.521599769592285,
+        "median_base": 5.1215500831604,
+        "p95_base": 19.457368850708008,
+        "max_base": 916.0292358398438,
+        "normal_rms_base": 1.0270336866378784,
+        "degenerate_attachment_normals": 0,
+        "shift_u_p50_p95_max_base": [
+          33.41752624511719,
+          168.09429931640625,
+          960.271484375
+        ],
+        "shift_v_p50_p95_max_base": [
+          73.3648681640625,
+          331.4320068359375,
+          739.9674072265625
+        ],
+        "beyond_allowance_percent": 0.15173809230327606
+      },
+      "geometry": {
+        "vertices": 416016,
+        "finite": true,
+        "degenerate_quads": 0,
+        "opposing_triangle_quads": 195,
+        "bbox_min": [
+          7482.39404296875,
+          6755.16552734375,
+          28235.908203125
+        ],
+        "bbox_max": [
+          32997.390625,
+          21684.888671875,
+          53005.4921875
+        ],
+        "near_or_folded": 271,
+        "neighbor_reversals": 796
+      },
+      "seconds": 9.414481565123424
+    },
+    "total_seconds": 54.718540493166074,
+    "run": "/home/hendrik/villa4/lasagna/data/repair_guard_deformed_v1",
+    "variant": "repair_guard",
+    "input": "deformed",
+    "attempt_count": 4635,
+    "selected_count": 132,
+    "new_defect_rejections": 2347,
+    "local_fit_rejections": 571
+  }
+]

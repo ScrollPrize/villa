@@ -34,6 +34,34 @@ def test_cpu_never_requests_gpu(monkeypatch):
     assert adapter.run(dict(device='cpu')) == 'cpu-result'
 
 
+def test_implicit_mask_offsets_and_start_arc(tmp_path, monkeypatch):
+    data = dict(source_id=np.array([7, 8]), start=np.array([10., 0.]), end=np.array([30., 20.]),
+                family=np.array([0, 0]), node_ds=np.array([[10., 20., 30.], [0., 10., 20.]]))
+    state = np.array([[1., .25, 50., 1.], [0., 0., 10., 1.]])
+    widths = np.array([100., 200., 300.])
+    np.savez(tmp_path/'tensors.npz', **data)
+    np.savez(tmp_path/'solution.npz', **data, state=state, widths=widths,
+             fixed_winding=[1., 0.], retained=[True, False],
+             v_offset_source=[7, 7], v_offset_arc=[10., 30.],
+             u_offsets=[0., 8.], v_offsets=[2., 6.])
+    (tmp_path/'config.json').write_text(json.dumps(dict(tensor_cache=str(tmp_path/'tensors.npz'), afv='unused')))
+    class Bank:
+        def __init__(self, afv, ids):
+            np.testing.assert_array_equal(ids, [7])
+            self.ids = np.array([7]); self.keys = np.array([0., 20., 40.])
+            self.first = np.array([0]); self.last = np.array([2]); self.base = np.array([0.])
+        def sample_xyz(self, source, arc):
+            return np.column_stack((arc, arc*0, arc*0))
+    monkeypatch.setattr(adapter, 'PolylineBank', Bank)
+    original, _ = adapter.load_h_curves(tmp_path, deformation_root=tmp_path)
+    deformed, _ = adapter.load_h_curves(tmp_path, deformation_root=tmp_path, apply_offsets=True)
+    assert [c['piece'] for c in original] == [c['piece'] for c in deformed] == [0]
+    np.testing.assert_allclose(original[0]['u'], [160., 170., 180.])
+    np.testing.assert_allclose(deformed[0]['u'], [160., 174., 188.])
+    np.testing.assert_allclose(deformed[0]['v'], [52., 54., 56.])
+    np.testing.assert_array_equal(original[0]['xyz'], deformed[0]['xyz'])
+
+
 def test_cuda_requires_manager_and_one_gpu(tmp_path):
     with pytest.raises(ValueError, match='gpu_manager'):
         adapter.run(dict(device='cuda'))

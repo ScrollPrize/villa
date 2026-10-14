@@ -15,6 +15,51 @@ import torch
 from opt_loss_fixed_uv import FixedUVTargets, ramp_weight
 
 
+def prepare_sliding(curves, step=100., sample_spacing=50., **unused):
+    """Sample immutable source-arc locations, including initial UV grid crossings."""
+    if unused.get('uv_bounds') is not None:
+        raise ValueError('Sliding preparation currently requires the full selected input, not uv_bounds')
+    selected, uv, xyz, weights, owners, arcs, scales, sources = [], [], [], [], [], [], [], []
+    for c in curves:
+        points = np.column_stack((c['u'], np.broadcast_to(c['v'], np.shape(c['u']))))
+        arc = np.asarray(c['arc'])
+        fractions, segments = [], []
+        for k, (a, b) in enumerate(zip(points[:-1], points[1:])):
+            length = abs(arc[k+1]-arc[k])
+            if length <= 1e-8:
+                continue
+            ts = [0., 1., *np.linspace(0, 1, max(2, int(np.ceil(length/sample_spacing))+1))]
+            for axis in range(2):
+                if abs(b[axis]-a[axis]) > 1e-8:
+                    edges = np.arange(np.ceil(min(a[axis], b[axis])/step),
+                                      np.floor(max(a[axis], b[axis])/step)+1)*step
+                    ts.extend(((edges-a[axis])/(b[axis]-a[axis])).tolist())
+            ts = np.unique(np.clip(ts, 0, 1))
+            if k < len(points)-2:
+                ts = ts[:-1]
+            fractions.extend(ts); segments.extend([k]*len(ts))
+        t = np.asarray(fractions); k = np.asarray(segments)
+        p = points[k]*(1-t[:, None])+points[k+1]*t[:, None]
+        a = arc[k]*(1-t)+arc[k+1]*t
+        q = c['xyz'][k]*(1-t[:, None])+c['xyz'][k+1]*t[:, None]
+        delta = np.abs(np.diff(a)); weight = (np.r_[0., delta]+np.r_[delta, 0.])*.5
+        valid = weight > 1e-8
+        selected.append(c)
+        uv.append(p[valid]); xyz.append(q[valid]); weights.append(weight[valid]); arcs.append(a[valid])
+        owners.append(np.full(valid.sum(), c['piece'], np.int64))
+        sources.append(np.full(valid.sum(), c['source'], np.int64))
+        scales.append(np.tile([c['winding_width']*.1, 1000.], (valid.sum(), 1)))
+    uv, scales = np.concatenate(uv), np.concatenate(scales)
+    # Padding is larger than the nominal soft displacement allowance.
+    low = np.floor((uv.min(0)-1.5*scales.max(0))/step)*step
+    high = np.ceil((uv.max(0)+1.5*scales.max(0))/step)*step
+    x, y = [np.arange(low[j], high[j]+step*.5, step) for j in range(2)]
+    if len(x)*len(y) > unused.get('max_vertices', 4_000_000):
+        raise ValueError('Sliding mesh exceeds max_vertices')
+    return (selected, x, y, (uv-low)/step, np.concatenate(xyz), np.concatenate(weights),
+            np.concatenate(owners), np.concatenate(arcs), scales, np.concatenate(sources))
+
+
 def curve_xyz(curve, u):
     return np.stack([np.interp(u, curve['u'], curve['xyz'][:, k]) for k in range(3)], axis=-1)
 
@@ -78,8 +123,19 @@ def ruled_init(curves, x, y, *, max_extrapolation_slope=1.):
     support = np.full((len(y), len(x)), 3, np.uint8)
     singles, slopes, filled = {}, {}, []
     for col, u in enumerate(x):
-        active = sorted((c for c in curves if c['u'][0] <= u <= c['u'][-1]),
-                        key=lambda c: (c['v'], c['piece']))
+        active = []
+        for c in curves:
+            if np.ndim(c['v']) == 0:
+                if c['u'][0] <= u <= c['u'][-1]:
+                    active.append(c)
+            else:
+                # All crossings, including locally reversed U in a deformed map.
+                for k in np.flatnonzero((np.minimum(c['u'][:-1], c['u'][1:]) <= u) &
+                                        (np.maximum(c['u'][:-1], c['u'][1:]) > u)):
+                    t = (u-c['u'][k])/(c['u'][k+1]-c['u'][k])
+                    active.append(dict(piece=c['piece'], v=(1-t)*c['v'][k]+t*c['v'][k+1],
+                                       u=np.array([u]), xyz=np.array([(1-t)*c['xyz'][k]+t*c['xyz'][k+1]])))
+        active.sort(key=lambda c: (c['v'], c['piece']))
         if not active:
             continue
         # Same V cannot define a transverse slope; deterministic piece-ID tie break.
@@ -133,15 +189,60 @@ def ruled_init(curves, x, y, *, max_extrapolation_slope=1.):
     return xyz.astype(np.float32), support
 
 
-def geometry_stats(xyz):
-    """Local diagnostics only: not a global self-intersection audit."""
+def geometry_masks(xyz):
+    """Shared local fold/degeneracy definition for solve and post-hoc audits."""
     p, q, r, s = xyz[:-1, :-1], xyz[:-1, 1:], xyz[1:, :-1], xyz[1:, 1:]
     a, b = np.cross(q-p, r-p), np.cross(r-s, q-s)
     area = np.linalg.norm(a, axis=-1)+np.linalg.norm(b, axis=-1)
+    return area < 1e-6, (a*b).sum(-1) <= 0
+
+
+def geometry_stats(xyz):
+    """Local diagnostics only: not a global self-intersection audit."""
+    degenerate, folded = geometry_masks(xyz)
     return dict(vertices=int(np.prod(xyz.shape[:2])), finite=bool(np.isfinite(xyz).all()),
-                degenerate_quads=int((area < 1e-6).sum()),
-                opposing_triangle_quads=int(((a*b).sum(-1) <= 0).sum()),
+                degenerate_quads=int(degenerate.sum()),
+                opposing_triangle_quads=int(folded.sum()),
                 bbox_min=xyz.min(axis=(0, 1)).tolist(), bbox_max=xyz.max(axis=(0, 1)).tolist())
+
+
+def summarize_runs(settings):
+    """Audit completed surfaces without optimizing or allocating a GPU."""
+    import tifffile
+    rows, cohorts = [], []
+    for name in settings['summarize_runs']:
+        root = Path(name)
+        summary = json.loads((root/'summary.json').read_text())
+        xyz = np.stack([tifffile.imread(root/'surface.tifxyz'/f'{axis}.tif') for axis in 'xyz'], -1)
+        degenerate, folded = geometry_masks(xyz)
+        with np.load(root/'attachments.npz') as f:
+            guv = f['final_grid_uv']
+            cohorts.append(np.unique(f['piece']))
+            occupied = np.zeros(folded.shape, bool)
+            col = np.floor(guv[:, 0]).astype(int).clip(0, folded.shape[1]-1)
+            row = np.floor(guv[:, 1]).astype(int).clip(0, folded.shape[0]-1)
+            occupied[row, col] = True
+        with np.load(root/'targets.npz') as f:
+            support = f['support_class']
+            bracketed = ((support[:-1, :-1] == 0) & (support[1:, :-1] == 0) &
+                         (support[:-1, 1:] == 0) & (support[1:, 1:] == 0))
+        assert int(folded.sum()) == summary['after']['geometry']['opposing_triangle_quads']
+        rows.append(dict(run=str(root), fit=summary['after']['fit'],
+                         solve_seconds=summary['solve_seconds'],
+                         folds=int(folded.sum()), degenerate=int(degenerate.sum()),
+                         folds_with_attachments=int((folded & occupied).sum()),
+                         attachment_cells=int(occupied.sum()),
+                         folds_without_attachments=int((folded & ~occupied).sum()),
+                         folds_initially_bracketed=int((folded & bracketed).sum())))
+    if any(not np.array_equal(cohorts[0], c) for c in cohorts[1:]):
+        raise ValueError('Surface comparison cohorts differ')
+    out = Path(settings['report_path'])
+    if out.exists():
+        raise FileExistsError(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(rows, indent=2)+'\n')
+    print(json.dumps(rows, indent=2), flush=True)
+    return rows
 
 
 def default_stages(steps=600, lr=5.):
@@ -196,13 +297,21 @@ def solve(curves, settings, provenance):
     step = float(settings.get('grid_step', 100.))
     if step != int(step):
         raise ValueError('Lasagna mesh_step must be integer base voxels')
-    selected, x, y, guv, target, weights, owners = prepare(
+    sliding = settings.get('sliding_uv', False)
+    prepared = (prepare_sliding if sliding else prepare)(
         curves, step=step, uv_bounds=settings.get('uv_bounds'),
         sample_spacing=settings.get('sample_spacing', step/2),
         max_vertices=settings.get('max_vertices', 4_000_000))
+    selected, x, y, guv, target, weights, owners = prepared[:7]
     initial, support = ruled_init(selected, x, y,
                                  max_extrapolation_slope=settings.get('max_extrapolation_slope', 1.))
-    targets = FixedUVTargets(guv, target, weights, initial.shape[:2], device=device)
+    if sliding:
+        from opt_loss_fixed_uv import SlidingUVTargets
+        targets = SlidingUVTargets(guv, target, weights, initial.shape[:2], device=device,
+                                   arc=prepared[7], scales=prepared[8], source=prepared[9],
+                                   step=step, piece=owners, **settings.get('sliding_settings', {}))
+    else:
+        targets = FixedUVTargets(guv, target, weights, initial.shape[:2], device=device)
     out.mkdir(parents=True)
     stages = settings.get('stages_config', default_stages())
     (out/'config.json').write_text(json.dumps(dict(settings=settings, stages=stages, provenance=provenance), indent=2)+'\n')
@@ -212,7 +321,8 @@ def solve(curves, settings, provenance):
         valid = np.isfinite(xyz).all(-1)
         write_tifxyz(out/(name+'.tifxyz'), Tifxyz(xyz[..., 0], xyz[..., 1], xyz[..., 2],
                       uuid=out.name+'-'+name, _scale=(1/step, 1/step), _mask=valid,
-                      extra=dict(uv_origin=[float(x[0]), float(y[0])], method='H-only fixed UV', provenance=provenance)),
+                      extra=dict(uv_origin=[float(x[0]), float(y[0])],
+                                 method='H-only joint sliding UV' if sliding else 'H-only fixed UV', provenance=provenance)),
                       compression='lzw')
     save('initial', initial)
     before = dict(fit=targets.statistics(torch.as_tensor(initial, device=device)[None]), geometry=geometry_stats(initial))
@@ -224,6 +334,9 @@ def solve(curves, settings, provenance):
     final, final_fit = fit(initial, targets, step=step, stages=stages, progress_fn=progress_fn)
     solve_seconds = time.perf_counter()-solve_start
     save('surface', final)
+    if sliding:
+        np.savez(out/'attachments.npz', initial_grid_uv=guv, final_grid_uv=targets.current_uv().detach().cpu().numpy(),
+                 xyz=target, piece=owners, source=prepared[9], arc=prepared[7], scales=prepared[8])
     report = dict(curves=len(selected), shape=list(initial.shape), before=before,
                   after=dict(fit=final_fit, geometry=geometry_stats(final)),
                   support_percent={str(k): float(100*(support == k).mean()) for k in range(5)},

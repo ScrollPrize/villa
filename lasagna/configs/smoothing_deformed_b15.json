@@ -1,0 +1,48 @@
+{
+  "fiber_lasagna_surface": {
+    "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/exact_fixed_offsets_aligned_v1",
+    "deformation_root": "/home/hendrik/villa2/global-fiber-sgd/data/exact_fixed_offsets_aligned_v1",
+    "apply_offsets": true,
+    "sliding_uv": true,
+    "output_root": "/home/hendrik/villa4/lasagna/data/smoothing_deformed_b15_s0.5_v1",
+    "device": "cuda:0",
+    "devices": "2",
+    "gpu_manager": {
+      "exclusive": false,
+      "vram_bytes_per_gpu": 8589934592,
+      "cpu_cores": 8,
+      "label": "surface-deformed-bend15",
+      "priority": 100
+    },
+    "cpu_threads": 8,
+    "grid_step": 100,
+    "sample_spacing": 50,
+    "stages_config": {
+      "base": {
+        "normal": 0,
+        "fixed_uv": 1,
+        "smooth": 0.5,
+        "step": 0.5,
+        "bend": 15
+      },
+      "stages": [
+        {
+          "name": "fiber_surface",
+          "steps": 600,
+          "lr": 5,
+          "params": [
+            "mesh_ms"
+          ],
+          "min_scaledown": 0,
+          "args": {
+            "fixed_uv_ramp": [
+              1,
+              20
+            ],
+            "status_interval": 100
+          }
+        }
+      ]
+    }
+  }
+}

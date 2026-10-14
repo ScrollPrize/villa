@@ -99,3 +99,99 @@ all self-intersections**. Regularization does not guarantee untangling. Targets
 incompatible with each other at the chosen resolution remain in the fit and can
 leave large errors or folds. Extrapolated regions are guessed geometry. The
 current pilot is an inspection artifact, not a validated production surface.
+# Joint sliding attachments (2026-10-14)
+
+Set `sliding_uv: true` and supply `deformation_root` for the implicit original /
+deformed comparison. The deformed retained H mask is authoritative for both;
+`apply_offsets` chooses whether saved source/arc U/V offsets are added. Actual XYZ
+curves are unchanged. Base states/widths and piece identities must match.
+
+Each attachment has a trainable two-coordinate displacement. Its physical source
+arc stays fixed, including endpoints, original/offset knots and initial U/V grid
+crossings. Sampling is not repeated as UV moves. Nonconstant V and local U reversal
+are supported. This mode currently processes the full selected regional input;
+explicit `uv_bounds` is rejected rather than silently cropping or ignoring it.
+
+The existing Lasagna optimizer updates mesh and attachment variables in the same
+Adam step from iteration one. Normal-distance loss updates geometry only (UV and
+normal detached); tangential-distance loss updates UV only (mesh and normal
+detached). Normals are analytic bilinear-quad normals recomputed every evaluation,
+not Lasagna volume reads. This gradient routing is deliberate, not an alternating
+solve or the full derivative of an ordinary point-to-plane energy.
+
+Regularization penalizes normalized displacement, changes in displacement along
+the fiber, and excessive stretch/collapse relative to the input mapping. Shared
+source endpoints are linked; gaps between pieces are not bridged. Weak mean-shift
+penalty anchors the global translational gauge. Nominal soft allowances are 0.1
+local winding width horizontally and 1000 base voxels vertically; beyond these
+the penalty increases. They are not hard caps. Mesh padding and out-of-domain
+penalties allow sliding without a zero-gradient clamp at the border.
+
+Use the same evaluation runner with `lasagna/configs/fiber_surface_joint_original.json`
+or `fiber_surface_joint_deformed.json`. These reserve non-exclusive 8 GiB grants
+on GPUs 0 and 1 respectively. Each run uses one GPU. Results and limitations:
+[joint_uv_results.md](../planning/fiber_surface/joint_uv_results.md).
+`attachments.npz` saves initial/final grid UV, source IDs, piece IDs, arc positions,
+XYZ targets and nominal movement scales. Grid UV becomes base UV using the
+`targets.npz` grid step and origin. Existing fixed-UV mode is unchanged.
+
+Regularization sweep: [smoothing_results.md](../planning/fiber_surface/smoothing_results.md).
+3×smoothness reduced local folds; increased bending did not. Remaining folds
+require further investigation; no settings were silently promoted to defaults.
+Report-only `summarize_runs` settings reuse the shared geometry-mask calculation
+and split counts by final attachment-cell occupancy without allocating GPUs.
+
+## Local patch repair (opt-in)
+
+Set `repair_from` to a completed joint-sliding surface directory. The existing
+runner dispatches to `fiber_surface_repair.py`; it reads saved mesh and attachments
+without reloading AFV or rerunning winding optimization. `repair_settings` selects
+halos, `largest_first`, guide weights, optional `seam_weight`, and blend fractions.
+Reconstruction freezes boundary vertices and attachment UV, solves a sparse
+least-squares interior, and rejects new local defects or excessive fiber-fit
+damage. `seam_weight` preserves the incoming boundary slope through a penalty
+on changes in the frozen boundary Laplacian. Rejected patches remain unchanged.
+
+The matched continuation control and repaired solve reuse the existing optimizer
+with fresh Adam state; original UV remains the displacement reference. An opt-in
+`SurfaceGuard` adds a soft signed-corner-area penalty. It does not guarantee
+nonfolding, and stronger weights did not reliably cure recurrence in these tests.
+Normals/areas of already defective reference cells are not protected.
+
+Use configs `repair_tangent_original.json` / `repair_tangent_deformed.json` with
+the same runner above. Outputs preserve before/repaired/control/continued tifxyz,
+attachment coordinates, attempts, metrics, configuration and input/code hashes.
+All sizes/errors are base voxels. Results, all variants and exact commands:
+[repair_results.md](../planning/fiber_surface/repair_results.md).
+
+## Matched CT and fiber overlays
+
+Use the existing evaluation entrypoint (no GPU required):
+
+```sh
+/home/hendrik/.venv_las/bin/python /home/hendrik/villa4/vesuvius/scripts/run_classic_fiber_evaluation.py crop-benchmark --config /home/hendrik/villa4/lasagna/configs/render_deformed_surface.json
+```
+
+`fiber_surface_render.py` reuses the TIFXYZ loader/bilinear interpolation and
+native VC blocking trilinear CT sampling, with remote-cache fetching rather than
+interpreting an incomplete local mirror as an empty scan. It does not optimize
+or reproject the surface. The config selects the surface, matching saved final
+attachment NPZ, scan URL/level and UV-layout base voxels per pixel.
+
+Future CT-only renders are `ct.jpg` (JPEG quality95, requested by user).
+Other outputs remain LZW TIFFs: transparent RGBA `fibers.tif`, RGB
+`ct_fibers.tif`, and `valid.tif`. All have identical pixel grids, no decorations
+or independent resizing. Pixel0 maps to surface vertex0; attachment grid UV
+multiplied by grid spacing/pixel size maps to the exact same pixels. U is right,
+V is down. The physical surface scale can vary due to mesh distortion.
+
+Colors identify source fibers. Lines connect saved final attachment UV samples
+in source-arc order, separately for each cropped piece. They show the fitted H
+fibers, not new nearest-XYZ correspondences or V fibers. `fibers.json` maps
+colors/pieces back to source IDs and arc intervals. Lines now use8px (originally
+2px). To refresh only overlays, use the same runner with config
+`lasagna/configs/render_deformed_thick_fibers.json`; it validates input hashes and
+reuses CT/mask without fetching or sampling. The scan is sampled at zero normal offset (no slab projection), level2
+(4x downsample), at4 UV base voxels/pixel. Remaining surface folds and fitting
+errors are visible rather than repaired or concealed. `summary.json` records
+input hashes, mapping, coverage, native sampling statistics and timings.

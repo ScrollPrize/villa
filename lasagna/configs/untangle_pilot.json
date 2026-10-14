@@ -1,0 +1,12 @@
+{
+ "fiber_lasagna_surface": {
+  "repair_from": "/home/hendrik/villa4/lasagna/data/smoothing_original_b5_s1.5_v1",
+  "output_root": "/home/hendrik/villa4/lasagna/data/untangle_pilot_v1",
+  "normal_curves": "/home/hendrik/villa2/global-fiber-sgd/data/normal_curves_v1",
+  "untangle_settings": {"halos": [8,16], "steps": 1000, "max_patches": 3},
+  "device": "cuda:0", "devices": "0", "cpu_threads": 8,
+  "continuation_steps": 100, "continuation_lr": 1,
+  "gpu_manager": {"exclusive": false, "vram_bytes_per_gpu": 8589934592,
+    "cpu_cores": 8, "label": "surface-untangle-pilot", "priority": 100}
+ }
+}
