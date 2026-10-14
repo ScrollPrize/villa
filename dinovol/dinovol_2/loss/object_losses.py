@@ -282,12 +282,12 @@ class ObjectLoss(nn.Module):
                 # and clamping above pos_margin zeroes out the attractive gradient.
                 pos_logits = sim_pos / self.ink_temperature
                 neg_logits = (anchors @ neg_keys.T) / self.ink_temperature
-                neg_lme = torch.logsumexp(neg_logits, dim=-1, keepdim=True) - math.log(neg_keys.shape[0])
-                per_pos = F.softplus(neg_lme - pos_logits)
-                anchor_losses = (
-                    torch.where(pos_mask, per_pos, torch.zeros_like(per_pos)).sum(-1)
-                    / pos_mask.sum(-1).clamp(min=1)
-                )
+                pos_count = pos_mask.sum(-1).clamp(min=1).float()
+                pos_m = torch.where(pos_mask, pos_logits, torch.zeros_like(pos_logits)).sum(-1) / pos_count
+                neg_m = neg_logits.mean(-1)
+                pos_lme = _masked_logsumexp(pos_logits, pos_mask) - pos_count.log()
+                neg_lme = torch.logsumexp(neg_logits, dim=-1) - math.log(neg_keys.shape[0])
+                anchor_losses = 0.5 * (F.softplus(neg_m - pos_m) + F.softplus(neg_lme - pos_lme))
                 pos_view_loss = anchor_losses.mean()
                 total_anchors = total_anchors + anchor_losses.numel()
 
@@ -295,8 +295,11 @@ class ObjectLoss(nn.Module):
                     neg_anchors = s_flat[s_neg_idx]
                     same_logits = (neg_anchors @ neg_keys.T) / self.ink_temperature
                     opp_logits = (neg_anchors @ pos_keys.T) / self.ink_temperature
-                    opp_lme = torch.logsumexp(opp_logits, dim=-1, keepdim=True) - math.log(pos_keys.shape[0])
-                    neg_anchor_losses = F.softplus(opp_lme - same_logits).mean(-1)
+                    same_m = same_logits.mean(-1)
+                    opp_m = opp_logits.mean(-1)
+                    same_lme = torch.logsumexp(same_logits, dim=-1) - math.log(neg_keys.shape[0])
+                    opp_lme = torch.logsumexp(opp_logits, dim=-1) - math.log(pos_keys.shape[0])
+                    neg_anchor_losses = 0.5 * (F.softplus(opp_m - same_m) + F.softplus(opp_lme - same_lme))
                     neg_view_loss = neg_anchor_losses.mean()
                     loss_terms.append(0.5 * (pos_view_loss + neg_view_loss))
                     total_anchors = total_anchors + neg_anchor_losses.numel()
