@@ -11,8 +11,9 @@ import json
 from pathlib import Path
 import urllib.request
 
+import zarr
+
 from dinovol_2.dataset.object_labels import load_or_build_volume_meshes
-from dinovol_2.dataset.zarr_io import open_zarr_array
 
 
 DEFAULT_METADATA_URL = "https://vesuvius-challenge-open-data.s3.amazonaws.com/metadata.json"
@@ -24,6 +25,17 @@ def ensure_metadata(metadata_path: Path, url: str = DEFAULT_METADATA_URL) -> Pat
         print(f"Downloading {url} -> {metadata_path} ...")
         urllib.request.urlretrieve(url, metadata_path)
     return metadata_path
+
+
+def _open_shape(vol_path: str, scale: int, s3_opts: dict) -> tuple[int, int, int]:
+    path_str = str(vol_path).rstrip("/")
+    if path_str.startswith("s3://"):
+        opts = dict(s3_opts)
+        opts.setdefault("anon", True)
+        arr = zarr.open(path_str, path=str(scale), mode="r", storage_options=opts)
+    else:
+        arr = zarr.open(path_str, path=str(scale), mode="r")
+    return tuple(int(d) for d in arr.shape[:3])
 
 
 def main() -> None:
@@ -66,8 +78,7 @@ def main() -> None:
     for idx, entry in enumerate(datasets):
         vol_path = str(entry["volume_path"])
         vol_scale = int(entry.get("volume_scale", 0))
-        sel_arr = open_zarr_array(vol_path, str(vol_scale), storage_options=s3_opts)
-        sel_shape = tuple(int(d) for d in sel_arr.shape[:3])
+        sel_shape = _open_shape(vol_path, vol_scale, s3_opts)
         meshes = load_or_build_volume_meshes(
             vol_path,
             vol_scale,
