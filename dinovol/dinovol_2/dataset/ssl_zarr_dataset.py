@@ -24,7 +24,18 @@ from scipy.ndimage import binary_dilation
 from torch.utils.data import Dataset
 
 from dinovol_2.augmentation.pipelines import create_training_transforms
-from dinovol_2.dataset.object_labels import FIBER_KIND, SHEET_KIND, decode_fiber_directions, slab_objects
+from dinovol_2.dataset.object_labels import (
+    FIBER_KIND,
+    INK_KIND,
+    SHEET_KIND,
+    MeshSegment,
+    crop_mesh_objects,
+    decode_fiber_directions,
+    distinct_fiber_pairs,
+    fiber_objects,
+    load_or_build_volume_meshes,
+    slab_objects,
+)
 from dinovol_2.dataset.normalization import get_normalization
 from dinovol_2.dataset.point_annotations import (
     load_point_collection,
@@ -148,6 +159,9 @@ class Volume:
     fiber_factor: int = 1  # selected-scale voxels per fiber voxel
     object_mask_min_inside: float = 1.0  # fraction of a window that must lie inside the object mask
     object_mask_source: str = "object"  # "object" (tissue envelope) or "sam2" (the published mask as-is)
+    meshes: list[MeshSegment] | None = None
+    has_ink_meshes: bool = False
+    oversample: float = 1.0
 
 
 @dataclass
@@ -158,6 +172,7 @@ class ObjectPoints:
     objects: np.ndarray  # [P] int64, 0 = unlabeled
     kinds: np.ndarray  # [P] int8, 0 = unlabeled, SHEET_KIND, FIBER_KIND
     negatives: np.ndarray  # [M + 1, M + 1] bool, provably different objects
+    ink: np.ndarray  # [P] int8, +1 = confirmed ink, -1 = confirmed non-ink on surface, 0 = unsupervised
 
 
 @dataclass(frozen=True)
@@ -395,17 +410,36 @@ class SSLZarrDataset(Dataset):
         self._atexit_pid: int | None = None
         self._read_executor: ThreadPoolExecutor | None = None
         self._pending_reads: deque = deque()
-        # object_points: points with pseudo-object labels (sheets from surface
-        # predictions, fibers from fiber predictions) computed on a thin z slab inside
-        # both global crops, carried into each view like keypoints.
+        # object_points: points with pseudo-object labels (sheets from surface meshes or
+        # predictions, ink from supervised ink-labels, fibers from fiber predictions)
+        # computed inside the overlap of both global crops and carried into each view.
         object_points = dict(self.config.get("object_points") or {})
         self.object_points_enabled = bool(object_points.get("enabled", False)) and not self.single_crop_only
-        self.points_per_sample = int(object_points.get("points_per_sample", 1024))
-        self.max_labeled_points = int(object_points.get("max_labeled_points", 512))
-        self.points_per_object = int(object_points.get("points_per_object", 16))
-        self.max_objects = int(object_points.get("max_objects", 64))
-        self.slab_thickness = int(object_points.get("slab_thickness", 16))
+        self.points_per_sample = int(object_points.get("points_per_sample", 384))
+        self.max_labeled_points = int(object_points.get("max_labeled_points", self.points_per_sample))
+        self.points_per_object = int(object_points.get("points_per_object", 48))
+        self.points_per_sheet = int(object_points.get("points_per_sheet", self.points_per_object))
+        self.points_per_fiber = int(
+            object_points.get("points_per_fiber", object_points.get("points_per_object", 32))
+        )
+        self.max_objects = int(object_points.get("max_objects", 12))
+        self.max_sheets = int(object_points.get("max_sheets", max(1, self.max_objects // 2)))
+        self.max_fibers = int(object_points.get("max_fibers", max(1, self.max_objects - self.max_sheets)))
+        self.slab_thickness = int(object_points.get("slab_thickness", 0))
         self.fiber_presence_threshold = float(object_points.get("presence_threshold", 127))
+        self.fiber_min_voxels = int(object_points.get("fiber_min_voxels", 30))
+        self.fiber_min_span = float(object_points.get("fiber_min_span", 0.0))
+        self.fiber_dedup_distance = float(object_points.get("fiber_dedup_distance", 1.5))
+        self.mesh_min_points = int(object_points.get("mesh_min_points", 16))
+        self.mesh_dedup_distance = float(object_points.get("mesh_dedup_distance", 1.5))
+        self.mesh_min_separation = float(object_points.get("mesh_min_separation", 3.0))
+        self.metadata_path = object_points.get("metadata_path", self.config.get("metadata_path"))
+        self.mesh_cache_dir = object_points.get("mesh_cache_dir", self.config.get("mesh_cache_dir"))
+        self.mesh_oversample = float(object_points.get("mesh_oversample", 1.5))
+        self.ink_oversample = float(object_points.get("ink_oversample", 2.0))
+        self.fiber_oversample = float(object_points.get("fiber_oversample", 1.25))
+        self.mesh_anchor_prob = float(object_points.get("mesh_anchor_prob", 0.35))
+        self.ink_anchor_prob = float(object_points.get("ink_anchor_prob", 0.50))
         if self.object_points_enabled and self.max_labeled_points > self.points_per_sample:
             raise ValueError("object_points.max_labeled_points must not exceed points_per_sample")
         # cross_view_token_patch_size: when set, each global view also carries, for every
@@ -503,6 +537,34 @@ class SSLZarrDataset(Dataset):
                         str(dataset["fiber_nx_path"]),
                         str(dataset["fiber_ny_path"]),
                     )
+                meshes: list[MeshSegment] = []
+                if self.object_points_enabled:
+                    if dataset.get("meshes") is not None:
+                        meshes = list(dataset["meshes"])
+                    elif (
+                        dataset.get("mesh_cache_path") is not None
+                        or self.metadata_path is not None
+                        or self.mesh_cache_dir is not None
+                        or bool(object_points.get("use_metadata_meshes", False))
+                    ):
+                        meshes = load_or_build_volume_meshes(
+                            str(volume_path),
+                            int(volume_scale),
+                            (z, y, x),
+                            sample_id=dataset.get("sample_id"),
+                            volume_id=dataset.get("volume_id"),
+                            metadata_path=dataset.get("metadata_path", self.metadata_path),
+                            cache_dir=dataset.get("mesh_cache_dir", self.mesh_cache_dir),
+                            mesh_cache_path=dataset.get("mesh_cache_path"),
+                            s3_storage_options=self.s3_storage_options,
+                        )
+                has_ink_meshes = any(m.has_ink for m in meshes)
+                oversample = float(dataset.get("oversample", 1.0))
+                if self.object_points_enabled:
+                    if meshes:
+                        oversample *= self.ink_oversample if has_ink_meshes else self.mesh_oversample
+                    if fiber_paths is not None:
+                        oversample *= self.fiber_oversample
                 self.volumes.append(Volume(
                     path=str(volume_path),
                     scale=volume_scale,
@@ -518,6 +580,9 @@ class SSLZarrDataset(Dataset):
                     pixel_size_um=dataset.get("pixel_size_um"),
                     object_mask_min_inside=float(dataset.get("object_mask_min_inside", 1.0)),
                     object_mask_source=str(dataset.get("object_mask_source", "object")),
+                    meshes=meshes if meshes else None,
+                    has_ink_meshes=has_ink_meshes,
+                    oversample=oversample,
                 ))
             finally:
                 handle.close()
@@ -532,8 +597,9 @@ class SSLZarrDataset(Dataset):
         if self.total_valid_crop_starts <= 0:
             raise ValueError("No valid crop starts found across configured volumes for the selected source crop size.")
 
+        total_weighted = sum(vol.valid_crop_starts * vol.oversample for vol in self.volumes)
         for volume in self.volumes:
-            volume.weight = volume.valid_crop_starts / self.total_valid_crop_starts
+            volume.weight = (volume.valid_crop_starts * volume.oversample) / total_weighted
 
     def _load_volume_points(self, dataset_config, *, selected_shape, usable_bbox):
         entries = dataset_config.get("point_collections", [])
@@ -770,81 +836,164 @@ class SSLZarrDataset(Dataset):
         offset = lo - coarse_lo * factor
         return values[tuple(slice(int(o), int(o) + int(n)) for o, n in zip(offset, hi - lo))]
 
+    @staticmethod
+    def _sample_fiber_voxels(voxels: np.ndarray, count: int, rng: np.random.Generator) -> np.ndarray:
+        """Sample `count` voxels spread along the full length of a 3D fiber component."""
+        n = len(voxels)
+        if count >= n:
+            return voxels
+        centered = voxels.astype(np.float32) - voxels.mean(axis=0, keepdims=True)
+        _, eigvecs = np.linalg.eigh(centered.T @ centered)
+        proj = centered @ eigvecs[:, -1]
+        order = np.argsort(proj, kind="stable")
+        edges = np.linspace(0, n, count + 1, dtype=np.int64)
+        picks = [int(order[rng.integers(edges[i], max(edges[i] + 1, edges[i + 1]))]) for i in range(count)]
+        return voxels[np.asarray(picks, dtype=np.int64)]
+
     def _sample_object_points(self, volume: Volume, window_starts, crop_regions) -> ObjectPoints:
-        """Points inside both global crops; labeled ones come from one thin z slab."""
+        """Points inside both global crops; labeled ones come from meshes/ink and/or slab/volume predictions."""
         overlap_lo = np.max([region.starts for region in crop_regions], axis=0)
         overlap_hi = np.min([np.add(region.starts, region.shape) for region in crop_regions], axis=0)
         if np.any(overlap_hi <= overlap_lo):
             raise RuntimeError("Global crops of one source window must overlap.")
-        thickness = min(self.slab_thickness, int(overlap_hi[0] - overlap_lo[0]))
-        slab_lo = overlap_lo.copy()
-        slab_lo[0] = np.random.randint(overlap_lo[0], overlap_hi[0] - thickness + 1)
-        slab_hi = overlap_hi.copy()
-        slab_hi[0] = slab_lo[0] + thickness
-        absolute_lo = np.asarray(window_starts) + slab_lo
-        absolute_hi = np.asarray(window_starts) + slab_hi
+        if self.slab_thickness > 0:
+            thickness = min(self.slab_thickness, int(overlap_hi[0] - overlap_lo[0]))
+            slab_lo = overlap_lo.copy()
+            slab_lo[0] = np.random.randint(overlap_lo[0], overlap_hi[0] - thickness + 1)
+            slab_hi = overlap_hi.copy()
+            slab_hi[0] = slab_lo[0] + thickness
+        else:
+            slab_lo = overlap_lo.copy()
+            slab_hi = overlap_hi.copy()
+        window_starts_arr = np.asarray(window_starts)
+        absolute_lo = window_starts_arr + slab_lo
+        absolute_hi = window_starts_arr + slab_hi
+        overlap_abs_lo = window_starts_arr + overlap_lo
+        overlap_abs_hi = window_starts_arr + overlap_hi
 
+        rng = np.random.default_rng(np.random.randint(2**31))
+        sources, objects, kinds, inks = [], [], [], []
+        negatives = np.zeros((self.max_objects + 1, self.max_objects + 1), dtype=bool)
+        budget = min(self.max_labeled_points, self.points_per_sample)
+        next_obj_id = 1
+
+        # 1. Surface sheets + ink from pre-cached 3D meshes (when available on this volume).
+        if volume.meshes:
+            max_mesh_sheets = min(self.max_sheets, self.max_objects)
+            sampled_sheets, mesh_neg_pairs = crop_mesh_objects(
+                volume.meshes,
+                overlap_abs_lo,
+                overlap_abs_hi,
+                min_points=self.mesh_min_points,
+                dedup_distance=self.mesh_dedup_distance,
+                min_separation=self.mesh_min_separation,
+                max_sheets=max_mesh_sheets,
+                points_per_sheet=self.points_per_sheet,
+                rng=rng,
+            )
+            mesh_id_map: dict[int, int] = {}
+            for sheet_idx, (coords_in_overlap, ink_state) in enumerate(sampled_sheets, start=1):
+                if budget <= 0 or next_obj_id > self.max_objects:
+                    break
+                take = min(len(coords_in_overlap), budget)
+                if take <= 0:
+                    continue
+                coords_take = coords_in_overlap[:take] + overlap_lo.astype(np.float32)
+                ink_take = ink_state[:take]
+                obj_id = next_obj_id
+                next_obj_id += 1
+                mesh_id_map[sheet_idx] = obj_id
+                sources.append(coords_take.astype(np.float32))
+                objects.append(np.full(take, obj_id, dtype=np.int64))
+                kinds.append(np.full(take, SHEET_KIND, dtype=np.int8))
+                inks.append(ink_take.astype(np.int8))
+                budget -= take
+            for a, b in mesh_neg_pairs:
+                if a in mesh_id_map and b in mesh_id_map:
+                    ia, ib = mesh_id_map[a], mesh_id_map[b]
+                    negatives[ia, ib] = negatives[ib, ia] = True
+
+        # 2. Fallback binary surface predictions (when meshes are absent) and 3D fiber predictions.
         surface = None
-        if volume.surface_path:
-            surface = self._read_region(self._get_array(volume.surface_path, volume.surface_level), absolute_lo, absolute_hi)
+        if not volume.meshes and volume.surface_path:
+            surface = self._read_region(
+                self._get_array(volume.surface_path, volume.surface_level), absolute_lo, absolute_hi
+            )
         presence = direction = None
-        if volume.fiber_paths is not None:
+        if volume.fiber_paths is not None and budget > 0 and next_obj_id <= self.max_objects:
             presence_path, nx_path, ny_path = volume.fiber_paths
             presence = self._read_coarse_region(
                 self._get_array(presence_path, volume.fiber_level), absolute_lo, absolute_hi, volume.fiber_factor
             )
-            nx = self._read_coarse_region(self._get_array(nx_path, volume.fiber_level), absolute_lo, absolute_hi, volume.fiber_factor)
-            ny = self._read_coarse_region(self._get_array(ny_path, volume.fiber_level), absolute_lo, absolute_hi, volume.fiber_factor)
+            nx = self._read_coarse_region(
+                self._get_array(nx_path, volume.fiber_level), absolute_lo, absolute_hi, volume.fiber_factor
+            )
+            ny = self._read_coarse_region(
+                self._get_array(ny_path, volume.fiber_level), absolute_lo, absolute_hi, volume.fiber_factor
+            )
             direction = decode_fiber_directions(nx, ny)
 
-        sources, objects, kinds = [], [], []
-        negatives = np.zeros((self.max_objects + 1, self.max_objects + 1), dtype=bool)
         if surface is not None or presence is not None:
             labels = slab_objects(
                 surface,
                 presence,
                 direction,
                 presence_threshold=self.fiber_presence_threshold,
-                rng=np.random.default_rng(np.random.randint(2**31)),
+                fiber_min_voxels=self.fiber_min_voxels,
+                fiber_min_span=self.fiber_min_span,
+                fiber_dedup_distance=self.fiber_dedup_distance,
+                rng=rng,
             )
-            # Keep up to half the object budget for each kind, the rest for the other.
-            n_sheets = min(labels.n_sheets, max(self.max_objects // 2, self.max_objects - labels.n_fibers))
-            n_fibers = min(labels.n_fibers, self.max_objects - n_sheets)
-            new_id = {}
-            budget = self.max_labeled_points
+            remaining_objects = max(0, self.max_objects - (next_obj_id - 1))
+            if surface is not None:
+                n_sheets = min(labels.n_sheets, max(remaining_objects // 2, remaining_objects - labels.n_fibers))
+            else:
+                n_sheets = 0
+            n_fibers = min(labels.n_fibers, remaining_objects - n_sheets)
+            new_id: dict[int, int] = {}
             candidates = [(SHEET_KIND, labels.sheet_labels, label, label) for label in range(1, n_sheets + 1)]
             candidates += [
                 (FIBER_KIND, labels.fiber_labels, label, label + labels.n_sheets) for label in range(1, n_fibers + 1)
             ]
-            for order in np.random.permutation(len(candidates)):
+            for order in rng.permutation(len(candidates)):
                 kind, label_volume, label, combined = candidates[order]
-                if budget <= 0:
+                if budget <= 0 or next_obj_id > self.max_objects:
                     break
                 voxels = np.argwhere(label_volume == label)
-                take = min(self.points_per_object, len(voxels), budget)
-                chosen = voxels[np.random.choice(len(voxels), take, replace=False)]
-                new_id[combined] = len(new_id) + 1
+                per_obj = self.points_per_sheet if kind == SHEET_KIND else self.points_per_fiber
+                take = min(per_obj, len(voxels), budget)
+                if kind == FIBER_KIND:
+                    chosen = self._sample_fiber_voxels(voxels, take, rng)
+                else:
+                    chosen = voxels[rng.choice(len(voxels), take, replace=False)]
+                obj_id = next_obj_id
+                next_obj_id += 1
+                new_id[combined] = obj_id
                 sources.append(chosen.astype(np.float32) + slab_lo)
-                objects.append(np.full(take, new_id[combined], dtype=np.int64))
+                objects.append(np.full(take, obj_id, dtype=np.int64))
                 kinds.append(np.full(take, kind, dtype=np.int8))
+                inks.append(np.zeros(take, dtype=np.int8))
                 budget -= take
             for a, b in labels.negative_pairs:
                 if a in new_id and b in new_id:
-                    negatives[new_id[a], new_id[b]] = negatives[new_id[b], new_id[a]] = True
+                    ia, ib = new_id[a], new_id[b]
+                    negatives[ia, ib] = negatives[ib, ia] = True
 
         labeled = sum(len(points) for points in sources)
-        unlabeled = self.points_per_sample - labeled
-        # Unlabeled points anywhere in the crops' overlap (label-free correspondence).
-        sources.append(
-            (np.random.randint(overlap_lo, overlap_hi, size=(unlabeled, 3))).astype(np.float32)
-        )
-        objects.append(np.zeros(unlabeled, dtype=np.int64))
-        kinds.append(np.zeros(unlabeled, dtype=np.int8))
+        unlabeled = max(0, self.points_per_sample - labeled)
+        if unlabeled > 0:
+            sources.append(
+                (np.random.randint(overlap_lo, overlap_hi, size=(unlabeled, 3))).astype(np.float32)
+            )
+            objects.append(np.zeros(unlabeled, dtype=np.int64))
+            kinds.append(np.zeros(unlabeled, dtype=np.int8))
+            inks.append(np.zeros(unlabeled, dtype=np.int8))
         return ObjectPoints(
             source=np.concatenate(sources),
             objects=np.concatenate(objects),
             kinds=np.concatenate(kinds),
             negatives=negatives,
+            ink=np.concatenate(inks),
         )
 
     def close(self) -> None:
@@ -1125,12 +1274,42 @@ class SSLZarrDataset(Dataset):
         candidates = np.flatnonzero(volume.point_type_ids == selected_type)
         return int(np.random.choice(candidates))
 
+    def _sample_mesh_centered_start(self, vol: Volume) -> tuple[int, int, int] | None:
+        """Sample a source window start centered around a valid mesh or ink point."""
+        if not vol.meshes:
+            return None
+        prefer_ink = vol.has_ink_meshes and (np.random.random() < 0.7)
+        candidates = [m for m in vol.meshes if m.has_ink] if prefer_ink else vol.meshes
+        if not candidates:
+            candidates = vol.meshes
+        bbox_lo = np.asarray(vol.usable_bbox[:3], dtype=np.float32)
+        bbox_hi = np.asarray(vol.usable_bbox[3:], dtype=np.float32)
+        for _ in range(8):
+            seg = candidates[int(np.random.randint(len(candidates)))]
+            mask = (seg.ink_state == 1) if (prefer_ink and seg.has_ink) else seg.valid
+            u, v = np.nonzero(mask)
+            if u.size == 0:
+                continue
+            pick = int(np.random.randint(u.size))
+            pt = seg.zyx[u[pick], v[pick]]
+            if not np.all((pt >= bbox_lo) & (pt < bbox_hi)):
+                continue
+            try:
+                starts = self._sample_point_centered_source_start(vol.usable_bbox, pt)
+            except ValueError:
+                continue
+            if self.object_mask_enabled and not self._start_allowed(vol, starts):
+                continue
+            return starts
+        return None
+
     def _draw_source_plan(self, nonzero_threshold):
         vol_weights = [vol.weight for vol in self.volumes]
         while True:
             vol_idx = np.random.choice(len(self.volumes), p=vol_weights)
             vol = self.volumes[vol_idx]
             anchor_index = None
+            starts = None
             if (
                 self.point_supervision_enabled
                 and vol.point_coordinates is not None
@@ -1142,10 +1321,15 @@ class SSLZarrDataset(Dataset):
                     vol.usable_bbox,
                     vol.point_coordinates[anchor_index],
                 )
-            elif self.object_mask_enabled:
-                starts = self._sample_object_start(vol)
-            else:
-                starts = self._sample_source_start(vol.usable_bbox)
+            elif self.object_points_enabled and vol.meshes:
+                anchor_prob = self.ink_anchor_prob if vol.has_ink_meshes else self.mesh_anchor_prob
+                if np.random.random() < anchor_prob:
+                    starts = self._sample_mesh_centered_start(vol)
+            if starts is None:
+                if self.object_mask_enabled:
+                    starts = self._sample_object_start(vol)
+                else:
+                    starts = self._sample_source_start(vol.usable_bbox)
             if self.object_mask_enabled and not self._start_allowed(vol, starts):
                 continue  # point-centered windows that would leave the object
             # The occupied fraction bounds the nonzero fraction from above, so this
@@ -1326,6 +1510,7 @@ class SSLZarrDataset(Dataset):
             sample["object_point_objects"] = torch.from_numpy(object_points.objects)
             sample["object_point_kinds"] = torch.from_numpy(object_points.kinds)
             sample["object_negatives"] = torch.from_numpy(object_points.negatives)
+            sample["object_point_ink"] = torch.from_numpy(object_points.ink)
         return sample
 
     def _sample_global_crop_region(self, source_crop, vol, anchor_index, source_starts):

@@ -410,26 +410,115 @@ class DINOHead(nn.Module):
 
 
 class PointDenseHead(nn.Module):
-    """Per-point embedding from interpolated ViT tokens and CNN embedding features."""
+    """Per-point embedding via a 3D top-down FPN refinement neck and factored linear readouts.
 
-    def __init__(self, token_dim: int, skip_channels: Tuple[int, ...], hidden_dim: int = 256, out_dim: int = 64):
+    Coarse ViT patch tokens are progressively upsampled in 3D and fused with CNN skip
+    feature maps using 3x3x3 residual convolutions so high-level semantics spatially gate
+    fine local boundaries before point interpolation. A shared trunk feature h(x) then
+    projects into two separate linear readouts:
+      - `dense`: object instance subspace (sheets and fibers, within-crop)
+      - `ink`: semantic ink subspace (cross-view and cross-batch)
+    """
+
+    def __init__(
+        self,
+        token_dim: int,
+        skip_channels: Tuple[int, ...],
+        hidden_dim: int = 256,
+        out_dim: int = 64,
+        ink_dim: int = 32,
+        fpn_dim: Optional[int] = None,
+    ):
         super().__init__()
-        # The CNN stage outputs have different scales; normalize each before mixing.
-        self.skip_norms = nn.ModuleList(nn.LayerNorm(channels) for channels in skip_channels)
+        self.token_dim = int(token_dim)
         self.skip_channels = tuple(int(channels) for channels in skip_channels)
-        self.mlp = nn.Sequential(
-            nn.Linear(token_dim + sum(self.skip_channels), hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, out_dim),
+        self.hidden_dim = int(hidden_dim)
+        self.out_dim = int(out_dim)
+        self.ink_dim = int(ink_dim)
+        resolved_fpn_dim = int(fpn_dim) if fpn_dim is not None else max(16, min(128, self.hidden_dim // 2))
+        self.fpn_dim = resolved_fpn_dim
+
+        # Top-down 3D FPN over the coarser CNN skip grids (e.g. 16^3 -> 32^3 -> 64^3).
+        coarser_skips = self.skip_channels[1:] if len(self.skip_channels) > 1 else self.skip_channels
+        self.fpn_in = nn.Conv3d(self.token_dim, self.fpn_dim, kernel_size=1)
+        self.fpn_laterals = nn.ModuleList(
+            nn.Conv3d(ch, self.fpn_dim, kernel_size=1) for ch in reversed(coarser_skips)
         )
+        self.fpn_refines = nn.ModuleList(
+            nn.Sequential(
+                nn.Conv3d(self.fpn_dim, self.fpn_dim, kernel_size=3, padding=1, groups=max(1, self.fpn_dim // 8)),
+                nn.GELU(),
+                nn.Conv3d(self.fpn_dim, self.fpn_dim, kernel_size=1),
+            )
+            for _ in coarser_skips
+        )
+        self.fpn_norm = nn.LayerNorm(self.fpn_dim)
+
+        # Point-sampled CNN skips + token + refined 3D FPN feature -> shared trunk h(x).
+        self.skip_norms = nn.ModuleList(nn.LayerNorm(channels) for channels in self.skip_channels)
+        in_features = self.token_dim + sum(self.skip_channels) + self.fpn_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(in_features, self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.GELU(),
+        )
+        self.token_shortcut = nn.Linear(self.token_dim, self.hidden_dim)
+        self.trunk_norm = nn.LayerNorm(self.hidden_dim)
+
+        # Separate linear readouts so sheet identity and ink presence never collide.
+        self.obj_proj = nn.Linear(self.hidden_dim, self.out_dim)
+        self.ink_proj = nn.Linear(self.hidden_dim, self.ink_dim)
+
+    def _refine_fpn_grid(self, token_grid: torch.Tensor, skips: list[torch.Tensor]) -> torch.Tensor:
+        """Run top-down 3D FPN from [B, D_t, H_t, W_t, C_t] token_grid and CNN skip grids."""
+        dtype = token_grid.dtype
+        x = self.fpn_in(token_grid.permute(0, 4, 1, 2, 3).contiguous())
+        coarser = skips[1:] if len(skips) > 1 else skips
+        for skip, lateral, refine in zip(reversed(coarser), self.fpn_laterals, self.fpn_refines):
+            target_size = skip.shape[2:]
+            if x.shape[2:] != target_size:
+                x = F.interpolate(x.float(), size=target_size, mode="trilinear", align_corners=False).to(dtype)
+            x = x + lateral(skip.to(dtype))
+            x = x + refine(x)
+        return x.permute(0, 2, 3, 4, 1).contiguous()
+
+    def forward_points(
+        self,
+        token_grid: torch.Tensor,
+        skips: list[torch.Tensor],
+        point_coordinates: torch.Tensor,
+        input_shape: Tuple[int, ...],
+    ) -> dict[str, torch.Tensor]:
+        dtype = token_grid.dtype
+        tokens = sample_grid_points(token_grid, point_coordinates, input_shape)
+        fpn_grid = self._refine_fpn_grid(token_grid, skips)
+        fpn_pts = self.fpn_norm(sample_grid_points(fpn_grid, point_coordinates, input_shape).to(dtype))
+        skip_parts = [
+            norm(sample_grid_points(level.permute(0, 2, 3, 4, 1), point_coordinates, input_shape).to(dtype))
+            for norm, level in zip(self.skip_norms, skips)
+        ]
+        tokens_cast = tokens.to(dtype)
+        trunk = self.trunk_norm(
+            self.mlp(torch.cat([tokens_cast, *skip_parts, fpn_pts], dim=-1)) + self.token_shortcut(tokens_cast)
+        )
+        return {
+            "dense": F.normalize(self.obj_proj(trunk).float(), dim=-1),
+            "ink": F.normalize(self.ink_proj(trunk).float(), dim=-1),
+            "tokens": tokens,
+        }
 
     def forward(self, tokens: torch.Tensor, skips: torch.Tensor) -> torch.Tensor:
+        """Fallback point-only forward when pre-sampled tokens and skip features are passed."""
+        dtype = tokens.dtype
         parts = [tokens] + [
             norm(level) for norm, level in zip(self.skip_norms, skips.split(self.skip_channels, dim=-1))
         ]
-        return F.normalize(self.mlp(torch.cat(parts, dim=-1)).float(), dim=-1)
+        zeros_fpn = tokens.new_zeros(*tokens.shape[:-1], self.fpn_dim)
+        trunk = self.trunk_norm(
+            self.mlp(torch.cat([*parts, zeros_fpn], dim=-1)) + self.token_shortcut(tokens.to(dtype))
+        )
+        return F.normalize(self.obj_proj(trunk).float(), dim=-1)
 
 
 class DinoVitStudentTeacher(nn.Module):
@@ -531,12 +620,17 @@ class DinoVitStudentTeacher(nn.Module):
     def _build_dense_heads(self, backbone: nn.Module) -> dict[str, nn.Module]:
         token_dim = int(backbone.embed_dim)
         hidden_dim = int(self.dense_config.get("hidden_dim", 256))
+        out_dim = int(self.dense_config.get("out_dim", 64))
+        ink_dim = int(self.dense_config.get("ink_dim", min(32, out_dim)))
+        fpn_dim = self.dense_config.get("fpn_dim")
         return {
             "dense_head": PointDenseHead(
                 token_dim,
                 backbone.down_projection.skip_channels,
                 hidden_dim=hidden_dim,
-                out_dim=int(self.dense_config.get("out_dim", 64)),
+                out_dim=out_dim,
+                ink_dim=ink_dim,
+                fpn_dim=int(fpn_dim) if fpn_dim is not None else None,
             ),
             "region_head": nn.Sequential(
                 nn.Linear(token_dim, hidden_dim),
@@ -814,7 +908,7 @@ class DinoVitStudentTeacher(nn.Module):
         point_coordinates: torch.Tensor,
         input_shape: Tuple[int, ...],
     ) -> dict[str, torch.Tensor]:
-        """Dense embeddings and interpolated tokens at [views*batch, P, 3] view coordinates.
+        """Dense/ink embeddings and interpolated tokens at [views*batch, P, 3] view coordinates.
 
         The embedding skips are dropped from `outputs` afterwards so their memory is
         released (the teacher's) or left to autograd (the student's).
@@ -823,16 +917,7 @@ class DinoVitStudentTeacher(nn.Module):
         patch_tokens = outputs["patch_tokens"]
         token_shape = tuple(size // patch for size, patch in zip(input_shape, branch.backbone.patch_size))
         token_grid = patch_tokens.reshape(patch_tokens.shape[0], *token_shape, patch_tokens.shape[-1])
-        tokens = sample_grid_points(token_grid, point_coordinates, input_shape)
-        skip_features = torch.cat(
-            [sample_grid_points(level.permute(0, 2, 3, 4, 1), point_coordinates, input_shape) for level in skips],
-            dim=-1,
-        )
-        dtype = patch_tokens.dtype
-        return {
-            "dense": branch.dense_head(tokens.to(dtype), skip_features.to(dtype)),
-            "tokens": tokens,
-        }
+        return branch.dense_head.forward_points(token_grid, skips, point_coordinates, input_shape)
 
     def forward(
         self,

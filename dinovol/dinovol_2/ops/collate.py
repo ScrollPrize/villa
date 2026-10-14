@@ -149,6 +149,8 @@ def collate_dino_ibot_batch(
         )
         for key in ("object_point_source", "object_point_objects", "object_point_kinds", "object_negatives"):
             batch[key] = torch.stack([sample[key] for sample in samples])
+        if "object_point_ink" in samples[0]:
+            batch["object_point_ink"] = torch.stack([sample["object_point_ink"] for sample in samples])
     return batch
 
 

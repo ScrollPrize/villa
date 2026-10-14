@@ -15,9 +15,14 @@ from dinovol_2.augmentation.transforms.spatial.rot90 import Rot90Transform
 from dinovol_2.augmentation.transforms.spatial.transpose import TransposeAxesTransform
 from dinovol_2.augmentation.transforms.utils.compose import ComposeTransforms
 from dinovol_2.dataset.object_labels import (
+     build_mesh_segment_from_arrays,
+    crop_mesh_objects,
     crossing_fiber_pairs,
     decode_fiber_directions,
+    distinct_fiber_pairs,
     fiber_objects,
+    load_mesh_segments_cache,
+    save_mesh_segments_cache,
     sheet_objects,
     stacked_sheet_pairs,
 )
@@ -63,11 +68,35 @@ def _make_volume(root: Path) -> dict:
         group = zarr.open_group(str(root / f"{name}.zarr"), mode="w", zarr_format=2)
         group.create_array("1", shape=value.shape, chunks=(16, 16, 16), dtype="uint8")[:] = value
         paths[name] = str(root / f"{name}.zarr")
+    # Cached mesh segments at x=30, 40, 60 with inklabels and supervision masks.
+    u = np.arange(48, dtype=np.float32)[:, None] * 2.0
+    v = np.arange(48, dtype=np.float32)[None, :] * 2.0
+    z_grid = np.broadcast_to(u, (48, 48)).copy()
+    y_grid = np.broadcast_to(v, (48, 48)).copy()
+    inklabels = np.zeros((48, 48), dtype=np.uint8)
+    supervision = np.full((48, 48), 255, dtype=np.uint8)
+    inklabels[:24, :] = 255
+    meshes = [
+        build_mesh_segment_from_arrays(
+            f"sheet_{x}",
+            np.full((48, 48), float(x), dtype=np.float32),
+            y_grid,
+            z_grid,
+            (SIZE, SIZE, SIZE),
+            (SIZE, SIZE, SIZE),
+            inklabels=inklabels,
+            supervision=supervision,
+        )
+        for x in (30, 40, 60)
+    ]
+    mesh_cache_path = root / "meshes_cache.npz"
+    save_mesh_segments_cache(mesh_cache_path, meshes)
     return {
         "volume_path": str(root / "image.zarr"),
         "volume_scale": 0,
         "surface_path": str(root / "surface.zarr"),
         "surface_level": 0,
+        "mesh_cache_path": str(mesh_cache_path),
         "fiber_presence_path": paths["presence"],
         "fiber_nx_path": paths["nx"],
         "fiber_ny_path": paths["ny"],
@@ -170,6 +199,112 @@ class ObjectLabelTests(unittest.TestCase):
             padding_mode="border",
         )[..., 0, 0].transpose(1, 2)
         torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-5)
+
+    def test_fiber_dedup_within_1_5_voxels_and_orientation_agnostic_negatives(self):
+        present = np.zeros((16, 40, 40), bool)
+        direction = np.zeros((16, 40, 40, 3), np.float32)
+        # Fiber A at z=4, x=10 along y (36 voxels).
+        present[4, 2:38, 10] = True
+        direction[4, 2:38, 10] = (0.0, 1.0, 0.0)
+        # Duplicate fiber at z=5, x=11 (diagonal in 3D so not 6-connected; distance = sqrt(2) ~= 1.414 <= 1.5 voxels).
+        present[5, 5:25, 11] = True
+        direction[5, 5:25, 11] = (0.0, 1.0, 0.0)
+        # Distinct parallel Fiber B at z=4, x=25 along y (36 voxels).
+        present[4, 2:38, 25] = True
+        direction[4, 2:38, 25] = (0.0, 1.0, 0.0)
+        labels, directions = fiber_objects(present, direction, min_voxels=5, dedup_distance=1.5)
+        id_a = set(np.unique(labels[4, 2:38, 10])) - {0}
+        id_dup = set(np.unique(labels[5, 5:25, 11])) - {0}
+        id_b = set(np.unique(labels[4, 2:38, 25])) - {0}
+        self.assertEqual(len(id_a), 1)
+        self.assertEqual(len(id_b), 1)
+        # The duplicate fiber within 1.5 voxels average distance is deduplicated (cleared to 0).
+        self.assertEqual(len(id_dup), 0)
+        # Parallel distinct fibers A and B are marked as negative pairs regardless of orientation.
+        pairs = set(distinct_fiber_pairs(directions))
+        a, b = next(iter(id_a)), next(iter(id_b))
+        self.assertIn((min(a, b), max(a, b)), pairs)
+
+    def test_mesh_uv_components_dedup_and_ink_supervision(self):
+        # Create a 2-wrap spiral mesh: two bands in v separated by a middle band that exits the crop.
+        u = np.arange(20, dtype=np.float32)[:, None]
+        v = np.arange(30, dtype=np.float32)[None, :]
+        z = np.broadcast_to(10.0 + u * 1.5, (20, 30)).copy()
+        y = np.broadcast_to(10.0 + (v % 10) * 2.0, (20, 30)).copy()
+        x = np.zeros((20, 30), dtype=np.float32)
+        # Wrap 1 at x=15 (v in 0..9), middle band outside crop at x=200 (v in 10..19), Wrap 2 at x=35 (v in 20..29).
+        x[:, :10] = 15.0
+        x[:, 10:20] = 200.0
+        x[:, 20:] = 35.0
+        inklabels = np.zeros((20, 30), dtype=np.uint8)
+        supervision = np.zeros((20, 30), dtype=np.uint8)
+        supervision[:, :10] = 255
+        inklabels[:10, :10] = 255  # Top half of Wrap 1 is confirmed ink (+1), bottom half is confirmed non-ink (-1).
+        seg_main = build_mesh_segment_from_arrays(
+            "spiral_seg", x, y, z, inklabels=inklabels, supervision=supervision
+        )
+        # Duplicate mesh shifted by 0.8 voxels in x on Wrap 1 (fewer points so seg_main wins).
+        seg_dup = build_mesh_segment_from_arrays(
+            "dup_seg", x[:15, :10] + 0.8, y[:15, :10], z[:15, :10]
+        )
+        sheets, neg_pairs = crop_mesh_objects(
+            [seg_main, seg_dup],
+            np.array([0.0, 0.0, 0.0]),
+            np.array([64.0, 64.0, 64.0]),
+            min_points=10,
+            dedup_distance=1.5,
+            min_separation=3.0,
+            rng=np.random.default_rng(0),
+        )
+        # Wrap 1 and Wrap 2 are split into 2 distinct sheets; seg_dup is deduplicated.
+        self.assertEqual(len(sheets), 2)
+        self.assertEqual(neg_pairs, [(1, 2)])
+        ink_states_0 = set(np.unique(sheets[0][1]).tolist())
+        ink_states_1 = set(np.unique(sheets[1][1]).tolist())
+        self.assertEqual({frozenset(ink_states_0), frozenset(ink_states_1)}, {frozenset({-1, 1}), frozenset({0})})
+
+    def test_supcon_l_out_margin_and_cross_batch_ink_loss(self):
+        from dinovol_2.loss import ObjectLoss
+
+        torch.manual_seed(0)
+        views, batch, points = 2, 2, 8
+        dense = F.normalize(torch.randn(views * batch, points, 8), dim=-1)
+        ink_emb = F.normalize(torch.randn(views * batch, points, 6), dim=-1)
+        tokens = torch.randn(views * batch, points, 6)
+        objects = torch.tensor([
+            [1, 1, 1, 1, 2, 2, 2, 2],
+            [1, 1, 1, 1, 2, 2, 2, 2],
+        ], dtype=torch.long)
+        negatives = torch.zeros(batch, 3, 3, dtype=torch.bool)
+        negatives[:, 1, 2] = negatives[:, 2, 1] = True
+        ink = torch.tensor([
+            [1, 1, -1, -1, 0, 0, 0, 0],
+            [1, 1, -1, -1, 0, 0, 0, 0],
+        ], dtype=torch.long)
+        head = torch.nn.Linear(6, 5)
+        loss_fn = ObjectLoss(pos_margin=0.75, ink_queue_size=16, ink_dim=6)
+        result = loss_fn(
+            student_dense=dense,
+            teacher_dense=dense.flip(0),
+            student_tokens=tokens,
+            teacher_tokens=tokens,
+            student_valid=torch.ones(views * batch, points, dtype=torch.bool),
+            teacher_valid=torch.ones(views * batch, points, dtype=torch.bool),
+            objects=objects,
+            negatives=negatives,
+            student_region_head=head,
+            teacher_region_head=head,
+            student_ink=ink_emb,
+            teacher_ink=ink_emb.flip(0),
+            ink=ink,
+            n_views=views,
+        )
+        self.assertGreater(float(result.object), 0.0)
+        self.assertGreater(float(result.ink), 0.0)
+        # 2 positive (+1) and 2 negative (-1) supervised ink points per sample * 2 samples * 2 views = 16 anchors.
+        self.assertEqual(int(result.ink_anchors), views * batch * 4)
+        self.assertGreater(int(loss_fn.ink_pos_count.item()), 0)
+        self.assertGreater(int(loss_fn.ink_neg_count.item()), 0)
 
 
 class ObjectPointDatasetTests(unittest.TestCase):
@@ -294,12 +429,15 @@ class ObjectLossTrainingTests(unittest.TestCase):
             before = {name: p.detach().clone() for name, p in student.named_parameters()}
             teacher_head = trainer.model_module.teacher.dense_head.mlp[0].weight.detach().clone()
             metrics = trainer.train_step(batches, 0)
-            for key in ("object_point_loss", "object_loss", "object_region_loss", "loss"):
+            for key in ("object_point_loss", "object_loss", "object_region_loss", "object_ink_loss", "loss"):
                 self.assertTrue(np.isfinite(metrics[key]), key)
             self.assertGreater(metrics["object_point_anchors"], 0)
             self.assertGreater(metrics["object_point_loss"], 0)
+            self.assertGreater(metrics["object_ink_anchors"], 0)
+            self.assertGreater(metrics["object_ink_loss"], 0)
             changed = {name for name, p in student.named_parameters() if not torch.equal(p, before[name])}
-            self.assertTrue(any(name.startswith("dense_head.") for name in changed))
+            self.assertTrue(any(name.startswith("dense_head.fpn_refines.") for name in changed))
+            self.assertTrue(any(name.startswith("dense_head.ink_proj.") for name in changed))
             self.assertTrue(any(name.startswith("region_head.") for name in changed))
             self.assertTrue(any("down_projection.stages.0" in name for name in changed))
             self.assertFalse(torch.equal(trainer.model_module.teacher.dense_head.mlp[0].weight, teacher_head))

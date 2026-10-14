@@ -187,23 +187,31 @@ class DinoIBOTPretrainer:
         self.warmup_steps = int(self.config["warmup_steps"]) if "warmup_steps" in self.config else default_warmup_steps
         self.freeze_last_layer_steps = self._resolve_freeze_last_layer_steps()
 
-        # object_losses: dense point head + point/object/region losses on pseudo-object
+        # object_losses: dense point head + object/ink/region losses on pseudo-object
         # points (dataset.object_points). Weights are relative to the DINO loss.
         self.object_loss_config = dict(self.config.get("object_losses") or {})
         self.do_object_losses = bool(self.object_loss_config.get("enabled", False))
         if self.do_object_losses:
             self.model_config["dense_head"] = {"enabled": True, **dict(self.object_loss_config.get("head") or {})}
-        self.object_point_weight = float(self.object_loss_config.get("point_weight", 0.1))
+        self.object_point_weight = float(self.object_loss_config.get("point_weight", 0.0))
         self.object_weight = float(self.object_loss_config.get("object_weight", 0.1))
+        self.object_ink_weight = float(self.object_loss_config.get("ink_weight", 0.1))
         self.object_region_weight = float(self.object_loss_config.get("region_weight", 0.1))
         # The object-loss weights ramp up linearly over ramp_steps from the step the
         # heads were added (0 for a new run, the resume step when added to a run).
         self.object_ramp_steps = int(self.object_loss_config.get("ramp_steps", 0))
         self.object_heads_start_step = 0
+        head_cfg = dict(self.object_loss_config.get("head") or {})
+        out_dim = int(head_cfg.get("out_dim", 64))
+        ink_dim = int(head_cfg.get("ink_dim", min(32, out_dim)))
         self.object_loss = ObjectLoss(
-            object_temperature=float(self.object_loss_config.get("object_temperature", 0.1)),
-            region_temperature=float(self.object_loss_config.get("region_temperature", 0.1)),
-        )
+            object_temperature=float(self.object_loss_config.get("object_temperature", 0.15)),
+            region_temperature=float(self.object_loss_config.get("region_temperature", 0.15)),
+            ink_temperature=float(self.object_loss_config.get("ink_temperature", 0.15)),
+            pos_margin=float(self.object_loss_config.get("pos_margin", 0.75)),
+            ink_queue_size=int(self.object_loss_config.get("ink_queue_size", 512)),
+            ink_dim=ink_dim,
+        ).to(self.device)
         # grad_accumulation_steps: micro-batches of batch_size per optimizer step.
         self.grad_accumulation_steps = int(self.config.get("grad_accumulation_steps", 1))
         if self.grad_accumulation_steps < 1:
@@ -1584,8 +1592,8 @@ class DinoIBOTPretrainer:
         "loss", "dino_global_loss", "dino_local_loss", "ibot_loss", "koleo_loss", "gram_loss",
         "point_loss", "point_same_type_loss", "point_different_type_loss",
         "point_count", "point_same_pair_count", "point_different_pair_count",
-        "object_point_loss", "object_loss", "object_region_loss",
-        "object_point_anchors", "object_anchors", "object_region_anchors",
+        "object_point_loss", "object_loss", "object_region_loss", "object_ink_loss",
+        "object_point_anchors", "object_anchors", "object_region_anchors", "object_ink_anchors",
         "ibot_target_fraction",
     )
 
@@ -1776,6 +1784,11 @@ class DinoIBOTPretrainer:
             if use_objects:
                 student_points = student_branch["object_points"]
                 teacher_points = teacher_branch["object_points"]
+                ink_tensor = (
+                    batch["object_point_ink"].to(self.device, non_blocking=True)
+                    if "object_point_ink" in batch
+                    else None
+                )
                 object_result = self.object_loss(
                     student_dense=student_points["dense"],
                     teacher_dense=teacher_points["dense"],
@@ -1787,10 +1800,13 @@ class DinoIBOTPretrainer:
                     negatives=batch["object_negatives"].to(self.device, non_blocking=True),
                     student_region_head=self.model_module.student.region_head,
                     teacher_region_head=self.model_module.teacher.region_head,
+                    student_ink=student_points.get("ink"),
+                    teacher_ink=teacher_points.get("ink"),
+                    ink=ink_tensor,
                     n_views=n_global_views,
                 )
             else:
-                object_result = ObjectLossResult(zero, zero, zero, zero, zero, zero)
+                object_result = ObjectLossResult(zero, zero, zero, zero, zero, zero, zero, zero)
 
             loss = (
                 self.dino_loss_weight * (dino_global_loss + dino_local_loss) +
@@ -1801,7 +1817,8 @@ class DinoIBOTPretrainer:
                 object_ramp * (
                     self.object_point_weight * object_result.point +
                     self.object_weight * object_result.object +
-                    self.object_region_weight * object_result.region
+                    self.object_region_weight * object_result.region +
+                    self.object_ink_weight * object_result.ink
                 )
             )
 
@@ -1812,8 +1829,9 @@ class DinoIBOTPretrainer:
                 loss, dino_global_loss, dino_local_loss, ibot_loss, koleo_loss, gram_loss,
                 point_result.loss, point_result.same_type, point_result.different_type,
                 point_result.point_count, point_result.same_pair_count, point_result.different_pair_count,
-                object_result.point, object_result.object, object_result.region,
+                object_result.point, object_result.object, object_result.region, object_result.ink,
                 object_result.point_anchors, object_result.object_anchors, object_result.region_anchors,
+                object_result.ink_anchors,
                 ibot_target_fraction,
             )
         ])
@@ -1869,7 +1887,7 @@ class DinoIBOTPretrainer:
         )
         return path
 
-    # Modules that may be added to a run after its checkpoint was written.
+    # Modules that may be added or upgraded after a checkpoint was written.
     _ADDABLE_MODULES = ("dense_head.", "region_head.")
     _GROUP_KEYS = ("lr_multiplier", "wd_multiplier", "is_last_layer")
 
@@ -1879,11 +1897,25 @@ class DinoIBOTPretrainer:
         Besides added heads, a checkpoint written with axial RoPE may be resumed with
         mixed RoPE: the per-block frequencies start at the axial layout (identical
         outputs) and the axial-only `rope_embed.periods` buffer is dropped.
+        If the checkpoint contains addable-module parameters with an older layout or
+        different shapes, those addable modules are re-initialized from scratch.
         """
         state_dict = _upgrade_weight_norm_state_dict_keys(state_dict)
         backbone = branch.backbone
         if backbone.rope_embed is None:
             state_dict = {key: value for key, value in state_dict.items() if not key.startswith("backbone.rope_embed.")}
+        branch_state = branch.state_dict()
+        if any(key.startswith(self._ADDABLE_MODULES) for key in state_dict):
+            branch_addable = {
+                key: val.shape for key, val in branch_state.items() if key.startswith(self._ADDABLE_MODULES)
+            }
+            ckpt_addable = {
+                key: val.shape for key, val in state_dict.items() if key.startswith(self._ADDABLE_MODULES)
+            }
+            if branch_addable != ckpt_addable:
+                state_dict = {
+                    key: val for key, val in state_dict.items() if not key.startswith(self._ADDABLE_MODULES)
+                }
         missing, unexpected = branch.load_state_dict(state_dict, strict=False)
         backbone_missing = [key.removeprefix("backbone.") for key in missing if key.startswith("backbone.")]
         allowed = {f"backbone.{key}" for key in backbone.warm_start_missing_rope(backbone_missing)}
@@ -1902,7 +1934,8 @@ class DinoIBOTPretrainer:
         # anywhere inside a fused group, so old ids are matched to parameters by name:
         # within a group, the checkpoint's parameters are the current ones minus the added.
         names = {id(parameter): name for name, parameter in self.model_module.student.named_parameters()}
-        added = set(added)
+        added_set = set(added)
+        has_replaced_addable = any(name.startswith(self._ADDABLE_MODULES) for name in added_set)
         group_key = lambda group: tuple(group.get(key) for key in self._GROUP_KEYS)
         old_by_key = {group_key(group): group for group in old_groups}
         if len(old_by_key) != len(old_groups):
@@ -1910,17 +1943,22 @@ class DinoIBOTPretrainer:
         remapped, matched = {}, set()
         for live_group, new_group in zip(self.optimizer.param_groups, new_groups):
             kept = [new_id for parameter, new_id in zip(live_group["params"], new_group["params"])
-                    if names[id(parameter)] not in added]
+                    if names[id(parameter)] not in added_set]
             old = old_by_key.get(group_key(new_group))
             if old is None:
                 if kept:
                     raise RuntimeError("Checkpoint optimizer state lacks a group of existing parameters.")
                 continue
             if len(kept) != len(old["params"]):
-                raise RuntimeError("Checkpoint optimizer state does not match the model's parameter groups.")
+                if not (has_replaced_addable and len(kept) <= len(old["params"])):
+                    raise RuntimeError("Checkpoint optimizer state does not match the model's parameter groups.")
             matched.add(group_key(new_group))
             remapped.update(
-                {new_id: state["state"][old_id] for old_id, new_id in zip(old["params"], kept) if old_id in state["state"]}
+                {
+                    new_id: state["state"][old_id]
+                    for old_id, new_id in zip(old["params"][: len(kept)], kept)
+                    if old_id in state["state"]
+                }
             )
         if matched != set(old_by_key):
             raise RuntimeError("Checkpoint optimizer state has groups the model lacks.")
