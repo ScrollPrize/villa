@@ -123,13 +123,17 @@ def test_reverse_walk_inverts_forward_walk_approximately():
     assert (wrong_order - points).abs().max() > 1e-2
 
 
-def test_cartesian_direct_lr_is_refused_where_its_kernel_is_absent(monkeypatch):
-    # Direct-LR sampling is another interpolant and only the fused kernel has it; on a CPU field
-    # get_integrator used to build the upsampled field instead, under the same configuration.
+def test_cartesian_direct_lr_falls_back_where_its_kernel_is_absent(monkeypatch, capsys):
+    # Direct-LR sampling is another interpolant and only the fused kernel has it. The default
+    # (model_flow_field_direct_lr) falls back to the upsampled field and says so once; an explicit
+    # FIT_SPIRAL_DIRECT_LR=1 on such a device is refused.
     monkeypatch.delenv('FIT_SPIRAL_DIRECT_LR', raising=False)
-    with pytest.raises(RuntimeError, match='model_flow_field_direct_lr=False'):
+    field = _make_field('cartesian', 1, direct_lr=True)
+    assert field.get_integrator() is not None and field.get_integrator() is not None
+    assert capsys.readouterr().out.count('using the upsampled field') == 1
+    monkeypatch.setenv('FIT_SPIRAL_DIRECT_LR', '1')
+    with pytest.raises(RuntimeError, match='FIT_SPIRAL_DIRECT_LR=1'):
         _make_field('cartesian', 1, direct_lr=True).get_integrator()
-    assert _make_field('cartesian', 1, direct_lr=False).get_integrator() is not None
 
 
 def test_model_forward_and_inverse_use_one_diffeomorphism():
