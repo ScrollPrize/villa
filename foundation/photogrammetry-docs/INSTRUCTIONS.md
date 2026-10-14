@@ -1,6 +1,6 @@
 # Photogrammetry and case generation
 
-_Notes by Giorgio Angelotti, 26/08/2026_
+_Originally by Giorgio Angelotti, 26/08/2026; updated by Paul Henderson, 10/2026_
 
 This document describes the workflow from photographic acquisition through photogrammetric reconstruction and production of nylon cases.
 
@@ -148,7 +148,9 @@ SAM_INPUT_ROOT=/path/to/photogrammetry-input
 
 The model configuration is a Hydra package key and must remain `configs/sam2.1/sam2.1_hiera_t.yaml`; it is not an absolute path.
 
-`segment.py` labels every object it finds on the first frame (scroll, background, turntable, ArUco markers, dust), ordered darkest first, so the scroll is not necessarily label 1 and markers are included only when they happened to be found on that frame. `scroll-mask.py` identifies the scroll label in each acquisition directory from its behaviour across the rotation (present in every frame, never touching the image border, centroid nearly static while markers orbit the axis) and writes binary `ScrollMasks/<stem>_mask.png` files: 255 for the largest component of the scroll label, 0 elsewhere. It prints the chosen label, area and centroid motion for each directory, and reports and skips directories where the pick is ambiguous or the scroll appears split across labels; inspect those before rerunning with `--force`.
+`segment.py` labels every object it finds on the first frame (scroll, background, turntable, ArUco markers, dust), ordered darkest first, so the scroll is not necessarily label 1 and markers are included only when they happened to be found on that frame. `scroll-mask.py` identifies the scroll label in each acquisition directory from its behaviour across the rotation (present in every frame, never touching the image border, centroid nearly static while markers orbit the axis) and writes binary `ScrollMasks/<stem>_mask.png` files: 255 for the largest component of the scroll label, 0 elsewhere. It prints the chosen label, area and centroid motion for each directory, and reports and skips directories where the pick is ambiguous or the scroll appears split across labels; inspect those before rerunning with `--force`. A small object that fills less than 1% of the frame is rejected as a candidate by the default `--min-area 0.01` ("no candidate label"); rerun with a lower value, e.g. `--min-area 0.003`.
+
+Captures delivered as camera JPEGs, without RAW files, skip `raw2jpg.py`: `find_blocks.py link` hard-links each JPEG to `JPGEnhanced/<stem>.jpg` directly. Such JPEGs can be much brighter than the converted RAWs and may be zero-padded at the end by the card, which is harmless.
 
 The markers do not need to be in the reconstruction masks. The scaler detects them in the photographs directly, and when a scroll is reoriented between blocks, markers that are fixed to the turntable are inconsistent with the scroll across orientations.
 
@@ -167,7 +169,7 @@ For every acquisition directory, verify that:
 
 PGS-Recon takes one flat directory of images. OpenMVG reads the mask for `<stem>.jpg` from `<stem>_mask.png` in the same directory, which must be the same size as the image, and ignores features wherever the mask is 0. The OpenMVS export then carries the masks into densification, where `--mask-value 0` ignores the same pixels. The binary `ScrollMasks/` files already follow this convention, so the input directory is every `JPGEnhanced/` image of the scroll with its `ScrollMasks/` mask beside it.
 
-Hard links avoid copying the photographs (the input directory must be on the same filesystem as the masking tree). Image stems must be unique across acquisition directories, which holds for the camera's file numbering:
+[`photogrammetry-tools/prepare_input.py`](../photogrammetry-tools/prepare_input.py) `WORK ID` builds this directory for `WORK/ID/ID/<blocks>/`, together with the scale include lists and the per-orientation inputs of the split route, and refuses to run if a mask is missing. By hand: hard links avoid copying the photographs (the input directory must be on the same filesystem as the masking tree). Image stems must be unique across acquisition directories, which holds for the camera's file numbering:
 
 ```bash
 mkdir "$PGS_PHOTOS"
@@ -393,7 +395,7 @@ In MeshLab, use `Filters -> Quality Measures and Computations -> Compute Topolog
 
 ##### Orientations that do not link
 
-A small or flat object can come out of SfM with only one orientation posed: after flipping, the cameras see mostly the other face, and `sfm_review.py` reports 0 verified pairs between the orientations. First try the remedies listed under step 1. If the orientations still do not link, reconstruct each one on its own and join the two halves on the rim that both saw. For that object, this route branches off after the step 1 review and replaces steps 2 and 3. The method was rehearsed on PHerc. 0525, whose joint reconstruction did link: the split result was within 0.11 mm of it in thickness. It was then used for 1482 and 1585.
+A small or flat object can come out of SfM with only one orientation posed: after flipping, the cameras see mostly the other face, and `sfm_review.py` reports 0 verified pairs between the orientations. First try the remedies listed under step 1, and check the block grouping: blocks that the joint SfM posed together with the other orientation may belong to it (a block filed under the wrong orientation makes the split halves overlap less and the join ambiguous). If the orientations still do not link, reconstruct each one on its own and join the two halves on the rim that both saw. For that object, this route branches off after the step 1 review and replaces steps 2 and 3. The method was rehearsed on PHerc. 0525, whose joint reconstruction did link: the split result was within 0.11 mm of it in thickness.
 
 1. **Reconstruct each half.** Give each orientation its own PGS-Recon input (hard links to its photographs and masks) and include lists per camera height, then run SfM, one scaler candidate per height and OpenMVS for each: [`photogrammetry-tools/split_recon.sh`](../photogrammetry-tools/split_recon.sh) `WORK ID ...`. Export each scaled scene to JSON (`openMVG_main_ConvertSfM_DataFormat`).
 2. **Measure each half's scale.** pgs-global-scaler triangulates marker corners with a 0.1 px RANSAC threshold (`pgs-recon/dependencies/utilities/src/global_scaler.cpp`). On small objects the lens distortion at the image edges is weakly constrained, so few sightings pass. Its candidates then disagree by several percent, or fail and write the scene at scale 1. [`marker_scale.py`](../photogrammetry-tools/marker_scale.py) re-detects the markers, refits the lens distortion from them (SfM's own radial polynomial is fitted only where the object is, and on small objects it is useless at the image edges, where the markers are) and triangulates them at 1.5 px. It reports every block and picks the median factor of the blocks with complete markers and a consistent ring radius (Naples turntable: 99.5-100.8 mm); blocks of one scene agree to 0.3-0.7%. It applies equally to a joint scene, where its factor can replace the scaler's.
@@ -403,14 +405,21 @@ A small or flat object can come out of SfM with only one orientation posed: afte
    - The reported rim scale (B relative to A, not applied) should be within about 0.5% of 1. It is an independent check on the two marker scales.
 4. **Check the thickness against the photographs.** The rim fixes the object's length and width well, but its thickness only weakly. `split_align.py silhouette OUT A.json B.json MASKS_A MASKS_B` projects the joined cloud into the photographs of both orientations at several offsets of B along the thin axis, and fits the offset at which the outlines best match the masks.
    - Read only the position of the optimum: the splatted cloud overshoots the masks by a roughly constant 0.3 mm.
-   - Accept the alignment if the optimum is within ±0.2 mm. If it is further out, either merge with `--thin-shift` set to the optimum (which errs towards a looser case) or recapture.
+   - Accept the alignment if the optimum is within ±0.2 mm.
+   - A larger positive optimum is partly a bias of the check on bright captures: the soft contact shadow under the object enters the masks along its resting edge, so every orientation looks thicker than it is; on such captures the optimum can reach about +1 mm. Merge and reconstruct both the unshifted and the shifted variant (step 5) and compare them in step 6. If the evidence still disagrees, use the thicker variant, which gives a looser case rather than a tight one.
 5. **Merge and reconstruct once.** `split_align.py merge OUT A.json B.json OUT/sfm_data_merged.json [--thin-shift MM]` writes one OpenMVG scene holding both halves at their marker scales. [`merged_openmvs.sh`](../photogrammetry-tools/merged_openmvs.sh) `WORK ID ...` converts it to binary, which validates it, and runs OpenMVS on all photographs. This gives one watertight mesh rather than two halves to stitch.
 6. **Review** with `split_align.py check OUT OUT/sfm_data_merged.json MESH.ply PGS_INPUT --sheet BLOCKS sheet.jpg` and `mesh_qa.py`.
    - Landmark reprojection must match between the two orientations, about 0.65 px median.
    - The mesh must reproduce both halves' main faces to within a few hundredths of a millimetre.
    - The mesh outline must sit equally close to the masks in both orientations (about 0.1 mm inside them).
+   - Each half sees a little of the other face (A's points on the +thin face, B's on the -thin face). With the right thickness these sit on the mesh; with the halves too far apart they sit inside it by about the excess. This is the most direct measure of the thickness; the rim agreement and the outline fit are weaker and can point the other way.
+   - A joint reconstruction of either side can serve as a reference: `split_align.py reference OUT A.json REF_DENSE.ply REF_SCENE.json [--scene-b B.json]` (`--scene-b` when it shares cameras with B only). Check that it really covers both faces: a joint scene that saw one face only closes the other with a mirrored copy of it.
 
 Keep `alignment.json`, `merge.json`, the logs and every review output with the run.
+
+##### Unattended batch
+
+[`photogrammetry-tools/batch/batch_recon.sh`](../photogrammetry-tools/batch/batch_recon.sh) `WORK ID ...` runs steps 1-3, or the split route above, for several objects in one sudo session, after masking and [`prepare_input.py`](../photogrammetry-tools/prepare_input.py) `WORK ID`. It runs every joint SfM first, then per object either the joint route (marker scale with `marker_scale.py`, the scene multiplied into mm, OpenMVS) or, when an orientation was not posed, `split_recon.sh`, the automatic join `batch/auto_split.sh` and `merged_openmvs.sh`. The join applies the rules of [`batch/split_gate.py`](../photogrammetry-tools/batch/split_gate.py) and stops before the merged OpenMVS run when the flip is ambiguous, the rim fit or rim scale is poor or the silhouette optimum is out of range; an accepted optimum above +0.3 mm is marked for the two-variant review of step 4. Completed steps are skipped on a rerun. Review every object afterwards as for a manual run.
 
 #### Case generation
 
