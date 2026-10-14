@@ -1,0 +1,21 @@
+{
+  "fiber_lasagna_surface": {
+    "run_root": "/home/hendrik/villa2/global-fiber-sgd/data/exact_fixed_offsets_aligned_v1",
+    "deformation_root": "/home/hendrik/villa2/global-fiber-sgd/data/exact_fixed_offsets_aligned_v1",
+    "normal_root": "/home/hendrik/villa2/global-fiber-sgd/data/normal_curves_v1",
+    "apply_offsets": true,
+    "sliding_uv": true,
+    "connected_hv": true,
+    "component_min_fibers": 0,
+    "v_data_weight": 0.1,
+    "output_root": "/home/hendrik/villa4/lasagna/data/connected_hv_smoke_v2",
+    "device": "cpu",
+    "cpu_threads": 8,
+    "grid_step": 100,
+    "sample_spacing": 50,
+    "stages_config": {
+      "base": {"normal": 0, "fixed_uv": 1, "smooth": 0.5, "step": 0.5, "bend": 5},
+      "stages": [{"name": "connected-smoke", "steps": 3, "lr": 0.01, "params": ["mesh_ms"], "min_scaledown": 0, "args": {"fixed_uv_ramp": [1, 2], "status_interval": 1}}]
+    }
+  }
+}

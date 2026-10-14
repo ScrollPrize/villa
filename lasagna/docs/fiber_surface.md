@@ -195,3 +195,95 @@ reuses CT/mask without fetching or sampling. The scan is sampled at zero normal 
 (4x downsample), at4 UV base voxels/pixel. Remaining surface folds and fitting
 errors are visible rather than repaired or concealed. `summary.json` records
 input hashes, mapping, coverage, native sampling statistics and timings.
+# Connected H/V fitting (opt-in)
+
+Use `connected_hv: true`, `sliding_uv: true`, `apply_offsets: true` with the
+deformed `deformation_root`, and `normal_root` pointing to the sampled normal
+curves. `v_data_weight` defaults to **0.1**; H and V data losses are normalized
+separately by their supported arc lengths, so adding V does not dilute H.
+
+At each saved H/V crossing, measure `offset = dot(H_xyz - V_xyz, inward_V_normal)`.
+Linearly interpolate these signed offsets along V source arc; extend endpoints
+constantly. Unconnected V fibers use the global mean of distinct crossings.
+The frozen V target is `V_xyz + offset * inward_V_normal`. H targets stay on H.
+Mesh gradients still use normal error, attachment gradients tangential error.
+The normal sign convention cannot invert the target (flipping both normal and
+signed offset leaves it unchanged). Invalid V normals cause an explicit error.
+
+Each connected source-fiber component has one shared UV translation. Local
+attachment motion is exactly zero at saved crossing nodes, but remains learnable
+between and beyond them. This preserves relative crossing UV layout throughout
+optimization, without another alignment solve. Arc/offset knots and mesh-line
+crossings are included in sampling. Exact crossing UV uses the original signed
+event distances, avoiding roundoff from serialized source arcs.
+
+`targets.npz` and `attachments.npz` include family, component, crossing mask,
+crossing attachment pairs, raw fiber XYZ, shifted target XYZ, normals and offsets;
+attachments additionally save shared/local motion for faithful restoration.
+The existing ruled initializer still uses H only. Existing H-only modes remain
+available. The legacy post-fit sample crop is rejected for connected mode rather
+than silently dropping connected neighbors; whole-component cropping is not yet
+implemented. This change does not resolve the previously reported mesh folds.
+
+CPU real-data smoke (three optimizer steps, **not a converged surface**):
+
+```bash
+/home/hendrik/.venv_las/bin/python /home/hendrik/villa4/vesuvius/scripts/run_classic_fiber_evaluation.py crop-benchmark --config /home/hendrik/villa4/lasagna/configs/fiber_surface_connected_smoke.json
+```
+
+Actual 800-step deformed H/V fit: `configs/fiber_surface_connected_solve.json`.
+Render: `configs/render_connected_hv_deformed.json`; use the same runner above
+with the selected config. Final outputs are in `data/connected_hv_deformed_solve_v1`
+and `data/render_connected_hv_deformed_v1`. The latter contains `ct.jpg`, transparent
+`fibers.tif`, combined `ct_fibers.tif`, and `inspection.tifxyz` for vc3d.
+`column_range` is a half-open inspection crop; it does not alter solve topology.
+The render is the central14..21 winding band, while the fit retained the full graph.
+Normal RMS within this band is1.0124H /6.0967V-offset basevoxels. There are735folded
+quads in that band; this output is not repaired or established as a new best result.
+
+# Connected-component selection
+
+Connected H/V fitting defaults to `component_min_fibers: 3`: retain entire saved
+crossing-graph components containing at least three distinct source fibers and
+both H and V. Multiple pieces of one source count once. This runs before grid
+construction, ruled initialization and offset measurements. It removes isolated
+fibers and H/V pairs, not low-degree members of larger connected groups.
+Use `0` to replay the old unfiltered selection. Upstream solutions are unchanged.
+Counts and retained source IDs are saved under `connected_hv.selection` in the
+summary. Filtered-run config: `lasagna/configs/fiber_surface_connected_min3.json`.
+
+## Stronger offset smoothing trial
+
+`fiber_surface_uvsmooth10.json` and `fiber_surface_uvsmooth100.json` keep the same
+800-step solve but set `sliding_settings.displacement_weight=0.1` (was0.01) and
+`smooth_weight=10/100` (was1). This penalizes changes in the added UV offset along
+source arc, not curvature of the input fiber mapping. Component motion remains
+possible; crossing locks are unchanged. Mesh smoothing weights are unchanged.
+
+Smooth100 reduces local-offset p95 from186.0 to35.3basevx and consecutive offset
+slope-change RMS by88.2%, but H/V normal error rises1.07/5.05→1.89/10.90basevx and
+folds215→279. This is the smoother-offset inspection candidate, not a repaired or
+universally better surface. Baseline configs remain reproducible.
+`audit_uv_offsets.py RUN_DIR ...` verifies matched attachments and reports the
+displacement/slope statistics without modifying results or requiring a GPU.
+
+## Geometry follows the UV attachments
+
+`sliding_settings.geometry_tangent_weight` defaults to0 (normal-only geometry).
+Positive values add tangential squared error to geometry evaluated at detached
+current UV, with detached surface normals. At1 this is full positional fitting.
+The new term never moves UV; the existing UV tangent loss/regularizers remain.
+H uses actual XYZ, V its separately weighted normal-offset target. The weight is
+saved with attachments and restored, including old-checkpoint default0.
+
+Matched smooth100 trials reduce H full-XYZ RMS50.75→8.34/8.21/7.47basevx for
+weights0.1/0.3/1, but folded quads279→358/418/517. Configs
+`fiber_surface_geom01.json`, `fiber_surface_geom03.json`, `fiber_surface_geom1.json`
+reproduce these trials. Inspect0.1 for the conservative alignment/fold tradeoff;
+1 gives the closest positional fit, not a repaired mesh. Existing defaults stay.
+
+Future renders default to8baseUV/pixel with4px fiber lines (previously4/8).
+Full-render presets use these values; existing images and their frozen configs
+are unchanged. The same central view is7351x3188 instead of14701x6376. CT scale,
+UV extent and JPG/LZW TIFF output formats remain unchanged. Old overlay-only
+refresh presets retain widths appropriate to their existing canvas.

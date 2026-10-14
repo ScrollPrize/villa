@@ -67,6 +67,8 @@ def untangle(initial, targets, normal, step, *, halos=(8,16,32), steps=1000, lr=
     h,w = initial.shape[:2]
     # Frozen UV; use shared precomputed bilinear sampling, not a new data loss.
     frozen = FixedUVTargets(targets.current_uv().detach(),targets.xyz,targets.arc_weights,(h,w),device=device)
+    if hasattr(targets, 'data_weights'):
+        frozen.arc_weights = targets.data_weights.detach().clone()
     history=[]
     for halo in halos:
         bad = (signed_areas(x,n,step)<margin).any(0).cpu().numpy()

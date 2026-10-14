@@ -69,6 +69,33 @@ def test_cuda_requires_manager_and_one_gpu(tmp_path):
         adapter.run(dict(device='cuda', devices='0,1', gpu_manager={'exclusive': False}))
 
 
+def test_connected_mapping_uses_v_arc_and_float64_anchor(tmp_path, monkeypatch):
+    data = dict(source_id=np.array([7, 8]), start=np.array([0.,0.]), end=np.array([20.,20.]),
+        family=np.array([0,1]), node_ds=np.array([[0.,10.,20.],[0.,10.,20.]]),
+        i=np.array([0]),j=np.array([1]),ds_a=np.array([10.]),ds_b=np.array([10.]))
+    phase = np.float32(.1234567)
+    state=np.array([[14,phase,50,1],[14,phase,40,1]], dtype=np.float32)
+    np.savez(tmp_path/'tensors.npz', **data)
+    np.savez(tmp_path/'solution.npz', **data,state=state,widths=np.full(20,8400.),
+        fixed_winding=np.array([14,14],dtype=np.float32),retained=[True,True],
+        v_offset_source=[7,8],v_offset_arc=[10.,10.],v_offset_a=[0],v_offset_b=[1],
+        fixed_event_indices=[0],u_offsets=[0.,10.],v_offsets=[0.,0.])
+    (tmp_path/'config.json').write_text(json.dumps(dict(tensor_cache=str(tmp_path/'tensors.npz'),afv='unused')))
+    class Bank:
+        def __init__(self, *_):
+            self.ids=np.array([7,8]); self.keys=np.array([0.,10.,20.,0.,10.,20.])
+            self.first=np.array([0,3]);self.last=np.array([2,5]);self.base=np.array([0.,0.])
+        def sample_xyz(self, source, arc):
+            return np.column_stack([arc,arc*0,arc*0])
+    monkeypatch.setattr(adapter,'PolylineBank',Bank)
+    curves,_=adapter.load_h_curves(tmp_path,deformation_root=tmp_path,apply_offsets=True,include_v=True)
+    h,v=curves
+    np.testing.assert_allclose(h['u'][1],(14+float(phase))*8400+10,rtol=0,atol=1e-9)
+    np.testing.assert_allclose(v['u'],np.full(3,h['u'][1]))
+    np.testing.assert_allclose(v['v'],[40.,50.,60.])
+    assert h['u'][1]==v['u'][1] and h['v'][1]==v['v'][1]
+
+
 def test_managed_launch_uses_module_and_no_local_cuda(tmp_path, monkeypatch):
     from vesuvius.neural_tracing.fiber_trace_3d import managed_evaluation
     out = tmp_path/'surface'

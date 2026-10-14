@@ -8,6 +8,9 @@ import numpy as np
 from PIL import Image, ImageDraw
 import tifffile
 
+DEFAULT_PIXEL_SIZE = 8
+DEFAULT_LINE_WIDTH = 4
+
 from vesuvius.tifxyz_label_transfer.io import load_surface
 from vesuvius.tifxyz_label_transfer.self_render_tifxyz import _sample_grid_field
 
@@ -34,6 +37,21 @@ def band_geometry(surface, shape, factor_yx, start, end):
     return np.ascontiguousarray(np.stack(fields, -1), dtype=np.float32), valid
 
 
+def inspection_crop(surface, attachments, columns):
+    """Crop only the exported view, never the fitted graph or its connectivity."""
+    from vesuvius.tifxyz_label_transfer.core import Surface
+    a, b = map(int, columns)
+    if not 0 <= a < b <= surface.shape[1] or b-a < 2:
+        raise ValueError('Expected valid half-open surface column range')
+    view = Surface(x=surface.x[:, a:b], y=surface.y[:, a:b], z=surface.z[:, a:b],
+                   valid=surface.valid[:, a:b], scale_yx=surface.scale_yx)
+    shifted = dict(attachments)
+    for key in ('initial_grid_uv', 'final_grid_uv'):
+        if key in shifted:
+            shifted[key] = shifted[key]-np.array([a, 0])
+    return view, shifted
+
+
 def fiber_overlay(attachments, shape, factor_yx, width=2):
     image = Image.new('RGBA', (shape[1], shape[0]), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
@@ -51,6 +69,7 @@ def fiber_overlay(attachments, shape, factor_yx, width=2):
         if len(xy) > 1:
             draw.line([tuple(p) for p in xy], fill=color+(220,), width=width)
         index.append(dict(piece=int(piece), source=source, color_rgb=color,
+                          family=('H' if int(attachments['family'][ids[0]]) == 0 else 'V') if 'family' in attachments else 'H',
                           samples=len(ids), arc_range=[float(attachments['arc'][ids].min()),
                                                        float(attachments['arc'][ids].max())]))
     return np.asarray(image).copy(), index
@@ -81,6 +100,8 @@ def refresh_overlays(settings):
             raise ValueError(f'Render input changed: {path}')
     with np.load(original['attachments']) as f:
         attachments = {k: f[k] for k in f.files}
+    if original.get('column_range') is not None:
+        _, attachments = inspection_crop(load_surface(original['surface']), attachments, original['column_range'])
     ct = (tifffile.imread(out/'ct.tif') if (out/'ct.tif').exists()
           else np.asarray(Image.open(out/'ct.jpg')))
     mask = tifffile.imread(out/'valid.tif')
@@ -114,9 +135,17 @@ def run(settings):
     out.mkdir(parents=True, exist_ok=True)
     (out/'config.json').write_text(json.dumps(settings, indent=2)+'\n')
     surface = load_surface(settings['surface'])
-    shape, factors = canvas(surface, settings.get('pixel_size', 4))
     with np.load(settings['attachments']) as f:
         attachments = {k: f[k] for k in f.files}
+    if settings.get('column_range') is not None:
+        surface, attachments = inspection_crop(surface, attachments, settings['column_range'])
+        from vesuvius.tifxyz.types import Tifxyz
+        from vesuvius.tifxyz.writer import write_tifxyz
+        write_tifxyz(out/'inspection.tifxyz', Tifxyz(surface.x, surface.y, surface.z,
+            uuid=out.name+'-inspection', _scale=surface.scale_yx, _mask=surface.valid,
+            extra=dict(inspection_only=True, source_surface=settings['surface'],
+                       source_column_range=settings['column_range'])), compression='lzw')
+    shape, factors = canvas(surface, settings.get('pixel_size', DEFAULT_PIXEL_SIZE))
     vc.initialize_chunk_cache(16*1024**3, 64, 8, 32)
     # Older installed bindings take an explicit cache root; current bindings
     # resolve the shared root internally. Never let the older default use cwd.
@@ -146,13 +175,13 @@ def run(settings):
     ct[mask == 0] = 0
     Image.fromarray(ct).save(out/'ct.jpg', quality=95)
     tifffile.imwrite(out/'valid.tif', mask, compression='lzw', metadata=None)
-    index = write_overlays(out, attachments, shape, factors, ct, mask, settings.get('line_width', 2))
-    summary = dict(shape=list(shape), pixel_size_uv_base=settings.get('pixel_size', 4),
+    index = write_overlays(out, attachments, shape, factors, ct, mask, settings.get('line_width', DEFAULT_LINE_WIDTH))
+    summary = dict(shape=list(shape), pixel_size_uv_base=settings.get('pixel_size', DEFAULT_PIXEL_SIZE),
         grid_to_pixel_xy=factors[::-1].tolist(), origin='pixel (0,0) = surface vertex (0,0)',
         valid_percent=float(np.count_nonzero(mask)/mask.size*100),
         seconds=time.monotonic()-start, pieces=len(index), sources=len(np.unique(attachments['source'])),
         sha256=hashes, bands=bands, remote_cache_path=str(volume.remote_cache_path),
-        note='H attachment polylines at saved final UV; not nearest projection. Surface folds remain. Zero-offset single CT slice, no slab projection.')
+        note='H/V attachment polylines at saved final UV; not nearest projection. V is offset supervision, not on-surface data. Surface folds remain. Zero-offset single CT slice, no slab projection.')
     (out/'fibers.json').write_text(json.dumps(index, indent=2)+'\n')
     (out/'summary.json').write_text(json.dumps(summary, indent=2)+'\n')
     print(json.dumps({k:v for k,v in summary.items() if k not in ('bands','sha256')}), flush=True)

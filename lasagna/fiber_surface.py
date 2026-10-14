@@ -298,31 +298,51 @@ def solve(curves, settings, provenance):
     if step != int(step):
         raise ValueError('Lasagna mesh_step must be integer base voxels')
     sliding = settings.get('sliding_uv', False)
+    connected = settings.get('connected_hv', False)
+    if connected and not sliding:
+        raise ValueError('Connected H/V mode requires sliding_uv')
+    selection_info = {}
+    if connected:
+        from fiber_surface_connected import filter_components
+        with np.load(Path(settings['deformation_root'])/'solution.npz') as saved:
+            curves, selection_info = filter_components(
+                curves, saved, settings.get('component_min_fibers', 3))
     prepared = (prepare_sliding if sliding else prepare)(
         curves, step=step, uv_bounds=settings.get('uv_bounds'),
         sample_spacing=settings.get('sample_spacing', step/2),
         max_vertices=settings.get('max_vertices', 4_000_000))
     selected, x, y, guv, target, weights, owners = prepared[:7]
-    initial, support = ruled_init(selected, x, y,
+    initial, support = ruled_init([c for c in selected if c.get('family', 0) == 0], x, y,
                                  max_extrapolation_slope=settings.get('max_extrapolation_slope', 1.))
+    connected_meta, connected_info = {}, {}
+    if connected:
+        from fiber_surface_connected import prepare_metadata
+        target, connected_meta, connected_info = prepare_metadata(curves, prepared, settings)
+        connected_info['selection'] = selection_info
     if sliding:
         from opt_loss_fixed_uv import SlidingUVTargets
-        targets = SlidingUVTargets(guv, target, weights, initial.shape[:2], device=device,
+        target_class, extra = SlidingUVTargets, {}
+        if connected:
+            from fiber_surface_connected import ConnectedUVTargets
+            target_class = ConnectedUVTargets
+            extra = {k: connected_meta[k] for k in ('component', 'crossing', 'family')}
+            extra['v_weight'] = settings.get('v_data_weight', .1)
+        targets = target_class(guv, target, weights, initial.shape[:2], device=device,
                                    arc=prepared[7], scales=prepared[8], source=prepared[9],
-                                   step=step, piece=owners, **settings.get('sliding_settings', {}))
+                                   step=step, piece=owners, **extra, **settings.get('sliding_settings', {}))
     else:
         targets = FixedUVTargets(guv, target, weights, initial.shape[:2], device=device)
     out.mkdir(parents=True)
     stages = settings.get('stages_config', default_stages())
     (out/'config.json').write_text(json.dumps(dict(settings=settings, stages=stages, provenance=provenance), indent=2)+'\n')
     np.savez(out/'targets.npz', grid_uv=guv, xyz=target, arc_weight=weights, piece=owners,
-             support_class=support, uv_origin=[x[0], y[0]], grid_step=step)
+             support_class=support, uv_origin=[x[0], y[0]], grid_step=step, **connected_meta)
     def save(name, xyz):
         valid = np.isfinite(xyz).all(-1)
         write_tifxyz(out/(name+'.tifxyz'), Tifxyz(xyz[..., 0], xyz[..., 1], xyz[..., 2],
                       uuid=out.name+'-'+name, _scale=(1/step, 1/step), _mask=valid,
                       extra=dict(uv_origin=[float(x[0]), float(y[0])],
-                                 method='H-only joint sliding UV' if sliding else 'H-only fixed UV', provenance=provenance)),
+                                 method='Connected H/V offset sliding UV' if connected else ('H-only joint sliding UV' if sliding else 'H-only fixed UV'), provenance=provenance)),
                       compression='lzw')
     save('initial', initial)
     before = dict(fit=targets.statistics(torch.as_tensor(initial, device=device)[None]), geometry=geometry_stats(initial))
@@ -335,13 +355,17 @@ def solve(curves, settings, provenance):
     solve_seconds = time.perf_counter()-solve_start
     save('surface', final)
     if sliding:
-        np.savez(out/'attachments.npz', initial_grid_uv=guv, final_grid_uv=targets.current_uv().detach().cpu().numpy(),
-                 xyz=target, piece=owners, source=prepared[9], arc=prepared[7], scales=prepared[8])
+        saved_connected = dict(connected_meta)
+        if connected:
+            saved_connected['v_data_weight'] = np.array(settings.get('v_data_weight', .1))
+        np.savez(out/'attachments.npz', initial_grid_uv=guv,
+                 xyz=target, piece=owners, source=prepared[9], arc=prepared[7], scales=prepared[8],
+                 **saved_connected, **targets.attachment_state())
     report = dict(curves=len(selected), shape=list(initial.shape), before=before,
                   after=dict(fit=final_fit, geometry=geometry_stats(final)),
                   support_percent={str(k): float(100*(support == k).mean()) for k in range(5)},
                   initialization_seconds=init_seconds, solve_seconds=solve_seconds,
-                  total_seconds=time.perf_counter()-started, output_root=str(out))
+                  total_seconds=time.perf_counter()-started, output_root=str(out), connected_hv=connected_info)
     (out/'progress.json').write_text(json.dumps(history, indent=2)+'\n')
     (out/'summary.json').write_text(json.dumps(report, indent=2)+'\n')
     print(json.dumps(report, indent=2), flush=True)

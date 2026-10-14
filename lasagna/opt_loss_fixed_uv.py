@@ -71,8 +71,12 @@ class SlidingUVTargets(FixedUVTargets):
     """Joint attachment/mesh optimization with explicitly separated gradients."""
     def __init__(self, grid_uv, xyz, length_weights, shape, *, arc, scales, source,
                  step, piece=None, device='cpu', uv_lr=.1, displacement_weight=.01,
-                 smooth_weight=1., stretch_weight=1., limit_weight=10.):
+                 smooth_weight=1., stretch_weight=1., limit_weight=10.,
+                 geometry_tangent_weight=0.):
         super().__init__(grid_uv, xyz, length_weights, shape, device=device)
+        self.geometry_tangent_weight = float(geometry_tangent_weight)
+        if not math.isfinite(self.geometry_tangent_weight) or self.geometry_tangent_weight < 0:
+            raise ValueError('geometry_tangent_weight must be finite and nonnegative')
         self.initial_uv = torch.as_tensor(grid_uv, dtype=torch.float32, device=device)
         self.delta = torch.nn.Parameter(torch.zeros_like(self.initial_uv))
         self.scales = torch.as_tensor(scales, dtype=torch.float32, device=device)
@@ -100,6 +104,10 @@ class SlidingUVTargets(FixedUVTargets):
     def current_uv(self):
         return self.initial_uv+self.delta
 
+    def attachment_state(self):
+        return dict(final_grid_uv=self.current_uv().detach().cpu().numpy(),
+                    geometry_tangent_weight=self.geometry_tangent_weight)
+
     def sample(self, xyz, uv):
         h, w = self.shape
         # Border-cell extrapolation maintains UV gradients outside the domain;
@@ -123,12 +131,19 @@ class SlidingUVTargets(FixedUVTargets):
         uv = self.current_uv()
         geometry, normal = self.sample(xyz, uv.detach())
         residual = geometry-self.xyz
-        normal_loss = ((residual*normal).sum(-1).square()*self.arc_weights).sum()/self.step**2
+        data_weights = getattr(self, 'data_weights', self.arc_weights)
+        normal_loss = ((residual*normal).sum(-1).square()*data_weights).sum()/self.step**2
+        geometry_loss = normal_loss
+        if self.geometry_tangent_weight:
+            # UV and normal are detached: only surface geometry can correct this
+            # misregistration. Weight1 gives full positional geometry fitting.
+            geometry_tangent = residual-(residual*normal).sum(-1, keepdim=True)*normal
+            geometry_loss = geometry_loss+self.geometry_tangent_weight*(geometry_tangent.square().sum(-1)*data_weights).sum()/self.step**2
         placement, _ = self.sample(xyz.detach(), uv)
         error = placement-self.xyz
         tangent = error-(error*normal).sum(-1, keepdim=True)*normal
-        tangent_loss = (tangent.square().sum(-1)*self.arc_weights).sum()/self.step**2
-        move = self.delta*self.step
+        tangent_loss = (tangent.square().sum(-1)*data_weights).sum()/self.step**2
+        move = (uv-self.initial_uv)*self.step
         normalized = move/self.scales
         weak, smooth, stretch, limit = self.reg_weights
         penalty = weak*(normalized.square().sum(-1)*self.arc_weights).sum()
@@ -148,7 +163,7 @@ class SlidingUVTargets(FixedUVTargets):
         penalty = penalty+limit*(torch.relu(-uv).square()+torch.relu(uv-hi).square()).mean()
         # Global translational gauge remains anchored by the mean displacement.
         penalty = penalty+(normalized*self.arc_weights[:, None]).sum(0).square().sum()
-        return normal_loss, tangent_loss, penalty
+        return geometry_loss, tangent_loss, penalty
 
     def loss(self, *, res):
         loss = sum(self.components(res.xyz_lr))
@@ -163,7 +178,7 @@ class SlidingUVTargets(FixedUVTargets):
         pos, normal = self.sample(xyz, self.current_uv())
         result['normal_rms_base'] = float((((pos-self.xyz)*normal).sum(-1).square()*self.arc_weights).sum().sqrt())
         result['degenerate_attachment_normals'] = int((normal.norm(dim=-1) < .5).sum())
-        move = (self.delta*self.step).abs()
+        move = ((self.current_uv()-self.initial_uv)*self.step).abs()
         result['shift_u_p50_p95_max_base'] = [float(torch.quantile(move[:, 0], q)) for q in (.5, .95, 1.)]
         result['shift_v_p50_p95_max_base'] = [float(torch.quantile(move[:, 1], q)) for q in (.5, .95, 1.)]
         result['beyond_allowance_percent'] = float(100*((move/self.scales)>1).any(-1).float().mean())

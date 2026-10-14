@@ -1,0 +1,19 @@
+{
+  "fiber_lasagna_surface": {
+    "render_surface": true,
+    "device": "cpu",
+    "surface": "/home/hendrik/villa4/lasagna/data/connected_hv_uvsmooth100_geom1_v1/surface.tifxyz",
+    "attachments": "/home/hendrik/villa4/lasagna/data/connected_hv_uvsmooth100_geom1_v1/attachments.npz",
+    "output_root": "/home/hendrik/villa4/lasagna/data/render_connected_hv_geom1_v1",
+    "volume_url": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+    "level": 2,
+    "pixel_size": 8,
+    "threads": 64,
+    "band_rows": 64,
+    "line_width": 4,
+    "column_range": [
+      100,
+      689
+    ]
+  }
+}

@@ -7,9 +7,9 @@
     "output_root": "/home/hendrik/villa4/lasagna/data/render_deformed_central_v2",
     "volume_url": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
     "level": 2,
-    "pixel_size": 4,
+    "pixel_size": 8,
     "threads": 64,
     "band_rows": 64,
-    "line_width": 8
+    "line_width": 4
   }
 }

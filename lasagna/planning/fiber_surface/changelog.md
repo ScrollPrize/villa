@@ -32,3 +32,37 @@ post-hoc support audit and full tables in smoothing_results.md. Defaults unchang
 Added read-only native CT sampling and fitted-H attachment overlays, compressed
 TIFFs with identical vertex-aligned mapping, source/piece metadata and provenance.
 No GPU, solver or surface changes. See render_plan.md and task_log.md.
+# 2026-10-14 — connected H/V surface attachment mode
+
+- Add weaker signed-offset V targets from saved crossings, constant-end/global
+  fallback; shared component UV translations with exact crossing locks and free
+  intermediate attachments. Preserve H-only workflows and restore full motion state.
+- Real three-step smoke completed; 1518 crossing pairs remain exactly coincident.
+  This is implementation validation, not a converged or fold-repaired surface.
+- Follow-up800-step deformed solve completed (22.79s). Central CT/HV overlay and
+  inspection-only tifxyz exported. Central normal RMS:H1.0124,V6.0967basevx;
+  735central folded quads remain. Not promoted as repaired/best surface.
+
+# 2026-10-14: component selection
+
+Connected-HV surface inputs now default to mixed-family connected components of
+at least three distinct source fibers. Whole-component filtering precedes mesh
+initialization; explicit zero threshold preserves unfiltered replay.
+
+## Stronger UV regularization trial
+
+Matched smooth10/100 and anchor0.1 candidates reduce local offset variation;
+smooth100 gives81%lower local-offset p95 and88%lower slope-change RMS, with worse
+normal fit and local folds. Added read-only matched-run UV audit; no solver
+formula/global default change. See task_log.md and uv_regularization_plan.md.
+
+## Tangential geometry fitting
+
+Added optional geometry-only tangential error at detached currentUV,checkpoint
+persistence and per-family full/tangent RMS. Matched smooth100 trials substantially
+improve alignment while increasing folds;0.1 and1 rendered for comparison.
+
+## Future render dimensions
+
+Halved future image dimensions and fiber-line widths through defaults/presets
+(8baseUV/pixel,4px). Existing outputs unchanged; about quarter the pixel count.

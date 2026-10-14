@@ -1,7 +1,25 @@
 # Task
 
-Active: render cropped deformed surface from CT and export matching fiber overlay.
-See render_plan.md. Do not change the fitted surface during rendering.
+Active: halve future render dimensions and fiber widths; preserve existing files.
+See render_resolution_plan.md.
+
+Previous: add and trial tangential geometry fitting with100x UV smoothing;
+the surface should follow the regularized fiber map. See tangential_geometry_plan.md.
+
+Previous: stronger UV-offset anchoring and smoothness, keeping between-crossing
+movement and component crossing locks. See uv_regularization_plan.md.
+
+Previous: filter whole connected components to >=3 distinct source fibers with
+at least one H and one V, before initialization and fitting. See component_filter_plan.md.
+Follow-up: render the completed filtered solve with matched CT/H/V overlays.
+
+Previous: run the connected H/V deformed solve and visualize CT plus fiber overlays.
+See connected_solve_plan.md. Preserve full graph; deliver central inspection view.
+
+Previous: add weaker offset V supervision and preserve the deformed crossing graph.
+Use signed normal offsets measured at saved H/V crossings, linearly interpolated
+along V with constant ends and a global crossing-mean fallback. Each connected
+fiber component has one UV translation; local sliding vanishes at crossings.
 
 Previous: explicit signed-area untangling using aligned fiber normal evidence,
 then feasibility-backtracked joint continuation. Test real patches and both

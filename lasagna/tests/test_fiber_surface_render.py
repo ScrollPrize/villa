@@ -3,7 +3,24 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 from vesuvius.tifxyz_label_transfer.core import Surface
-from fiber_surface_render import canvas, band_geometry, fiber_overlay
+from fiber_surface_render import canvas, band_geometry, fiber_overlay, inspection_crop
+from fiber_surface_render import DEFAULT_PIXEL_SIZE, DEFAULT_LINE_WIDTH
+
+
+def test_half_resolution_defaults_preserve_registration():
+    assert DEFAULT_PIXEL_SIZE == 8 and DEFAULT_LINE_WIDTH == 4
+    y, x = np.mgrid[:5, :7].astype(np.float32)
+    s = Surface(x=x*100, y=y*100, z=x*0, scale_yx=(.01,.01))
+    old_shape, old_factor = canvas(s, 4)
+    shape, factor = canvas(s, DEFAULT_PIXEL_SIZE)
+    assert shape == tuple((n-1)//2+1 for n in old_shape)
+    old_xyz, _ = band_geometry(s, old_shape, old_factor, 0, old_shape[0])
+    xyz, _ = band_geometry(s, shape, factor, 0, shape[0])
+    np.testing.assert_allclose(xyz, old_xyz[::2, ::2])
+    a = dict(piece=np.array([0,0]), source=np.array([1,1]), arc=np.array([0,1]),
+             final_grid_uv=np.array([[1,2],[5,2]]))
+    overlay, _ = fiber_overlay(a, shape, factor, DEFAULT_LINE_WIDTH)
+    assert np.count_nonzero(overlay[:,25,3]) == 4
 
 
 def test_registered_affine_surface_and_overlay():
@@ -43,3 +60,18 @@ def test_four_times_thicker_lines():
     thick, _ = fiber_overlay(a, (30,30), np.ones(2), 8)
     assert np.count_nonzero(thin[:,15,3]) == 2
     assert np.count_nonzero(thick[:,15,3]) == 8
+
+
+def test_inspection_crop_preserves_attachment_graph():
+    y,x=np.mgrid[:4,:8].astype(np.float32)
+    s=Surface(x=x*100,y=y*100,z=x*0,scale_yx=(.01,.01))
+    a=dict(final_grid_uv=np.array([[1.,1.],[5.,1.]]),piece=np.array([0,0]),
+           source=np.array([7,7]),arc=np.array([0.,400.]),family=np.array([1,1]))
+    cropped,b=inspection_crop(s,a,[2,6])
+    shape,factor=canvas(cropped,100)
+    xyz,_=band_geometry(cropped,shape,factor,0,shape[0])
+    np.testing.assert_allclose(xyz[1,0],[200,100,0])
+    np.testing.assert_array_equal(b['final_grid_uv'],[[-1,1],[3,1]])
+    overlay,index=fiber_overlay(b,shape,factor,1)
+    assert overlay[1,0,3]>0 and index[0]['family']=='V'
+    np.testing.assert_array_equal(a['final_grid_uv'],[[1,1],[5,1]])

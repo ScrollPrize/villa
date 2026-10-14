@@ -1,6 +1,6 @@
 # Fixed-UV H-fiber surface reconstruction
 
-Active task: [render_plan.md](render_plan.md). Untangling is paused, not solved.
+Active task: [render_resolution_plan.md](render_resolution_plan.md). Untangling is paused, not solved.
 
 Active follow-up: [smoothing_plan.md](smoothing_plan.md), independently reviewed.
 The joint sliding implementation below is complete; tune only existing weights.

@@ -15,19 +15,38 @@ from opt_loss_surface_guard import SurfaceGuard
 
 
 def restore_targets(data, attachments, shape, step, device, options=None):
+    options = dict(options or {})
+    options.setdefault('geometry_tangent_weight', float(attachments.get('geometry_tangent_weight', 0.)))
     for key, other in [('grid_uv','initial_grid_uv'), ('xyz','xyz'), ('piece','piece')]:
         if not np.array_equal(data[key], attachments[other]):
             raise ValueError(f'Inconsistent saved attachments: {key}')
-    t = SlidingUVTargets(attachments['initial_grid_uv'], data['xyz'], data['arc_weight'], shape,
+    cls, extra = SlidingUVTargets, {}
+    if 'component' in attachments:
+        from fiber_surface_connected import ConnectedUVTargets
+        cls = ConnectedUVTargets
+        for key in ('component', 'crossing', 'family'):
+            if not np.array_equal(data[key], attachments[key]):
+                raise ValueError('Inconsistent saved connected topology: '+key)
+            extra[key] = attachments[key]
+        extra['v_weight'] = float(attachments['v_data_weight'])
+    t = cls(attachments['initial_grid_uv'], data['xyz'], data['arc_weight'], shape,
         arc=attachments['arc'], scales=attachments['scales'], source=attachments['source'],
-        piece=attachments['piece'], step=step, device=device, **(options or {}))
+        piece=attachments['piece'], step=step, device=device, **extra, **options)
     with torch.no_grad():
-        t.delta.copy_(torch.as_tensor(attachments['final_grid_uv']-attachments['initial_grid_uv'], device=device))
+        if 'component' in attachments:
+            t.delta.copy_(torch.as_tensor(attachments['local_delta'], device=device))
+            t.component_delta.copy_(torch.as_tensor(attachments['component_delta'], device=device))
+            if not np.allclose(t.current_uv().cpu().numpy(), attachments['final_grid_uv'], atol=1e-5, rtol=0):
+                raise ValueError('Restored component motion differs from saved final UV')
+        else:
+            t.delta.copy_(torch.as_tensor(attachments['final_grid_uv']-attachments['initial_grid_uv'], device=device))
     return t
 
 
 def crop_winding_domain(initial, data, attachments, prior, bounds):
     """Restrict fitted U to a declared bucket band; never let outliers enlarge it."""
+    if 'component' in attachments:
+        raise ValueError('Connected H/V targets cannot use the legacy per-sample crop; preserve whole components')
     root=Path(prior['settings']['run_root'])
     with np.load(root/'solution.npz') as f: widths=f['widths'].astype(np.float64)
     lo,hi=map(int,bounds)
@@ -44,7 +63,8 @@ def crop_winding_domain(initial, data, attachments, prior, bounds):
     ids=np.flatnonzero(keep); parent=attachments['piece'][keep]
     # Gaps outside the domain must not acquire a fictitious smoothing link.
     pieces=np.cumsum(np.r_[True,(np.diff(ids)!=1)|(np.diff(parent)!=0)])-1
-    reduced={k:v[keep].copy() for k,v in attachments.items()}
+    reduced={k:(v[keep].copy() if np.ndim(v) and len(v) == len(keep) else np.array(v).copy())
+             for k,v in attachments.items()}
     reduced['source_piece']=parent.copy();reduced['piece']=pieces
     for key in ['initial_grid_uv','final_grid_uv']: reduced[key][:,0]-=a
     data=dict(data,grid_uv=reduced['initial_grid_uv'],xyz=reduced['xyz'],piece=pieces,
@@ -233,7 +253,8 @@ def run(settings):
         from fiber_surface_untangle import untangle
         repaired,records=untangle(initial,targets,orientation,step,**settings['untangle_settings'])
     else:
-        repaired, records = repair(initial, attachments['final_grid_uv'], data['xyz'], data['arc_weight'], step,
+        guide_weights = targets.data_weights.detach().cpu().numpy() if hasattr(targets, 'data_weights') else data['arc_weight']
+        repaired, records = repair(initial, attachments['final_grid_uv'], data['xyz'], guide_weights, step,
                                    **settings.get('repair_settings', {}))
     after = save('repaired', repaired, targets)
     repair_seconds = time.perf_counter()-start
@@ -259,7 +280,7 @@ def run(settings):
         output[name] = save(name, final, t)
         if orientation is not None: output[name]['step_guard']=t.step_guard.statistics()
         output[name]['seconds'] = time.perf_counter()-begin
-        np.savez(out/f'{name}_attachments.npz', **{**attachments, 'final_grid_uv': t.current_uv().detach().cpu().numpy()})
+        np.savez(out/f'{name}_attachments.npz', **{**attachments, **t.attachment_state()})
         (out/f'{name}_progress.json').write_text(json.dumps(history, indent=2)+'\n')
     output['total_seconds'] = time.perf_counter()-start
     (out/'summary.json').write_text(json.dumps(output, indent=2)+'\n')

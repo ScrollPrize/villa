@@ -5,10 +5,21 @@
 - Select H pieces with chosen-winding joint probability >0.5.
 - Baseline mode keeps UV fixed and uses full positional XYZ error.
 - Joint sliding mode adds per-attachment UV displacements at immutable source-arc
-  samples. Geometry receives normal error; UV receives tangential error with
+  samples. Geometry receives normal error plus optional geometry_tangent_weight
+  times tangential error (default0;1 gives full positional geometry loss).
+  Geometry evaluation detaches UV and normals. UV receives tangential error with
   appropriate detach routing. Both update together from the first optimizer step.
 - Sliding mode uses the supplied deformed retained mask for both input layouts,
-  rather than applying an additional confidence threshold. H-only remains fixed.
+  rather than applying an additional confidence threshold. H-only remains the default.
+- Connected-HV mode uses the deformed retained H/V graph: all crossing UV positions
+  in a connected source-fiber component share one translation; local corrections
+  vanish exactly at crossings. Intermediate attachments may slide.
+- Before initialization/fitting, connected-HV defaults to whole components with
+  >=3 distinct source fibers and both H/V families. component_min_fibers controls
+  the minimum; zero disables filtering for legacy replay. Never cut graph edges.
+- V data uses weaker, separately normalized normal/tangent loss against immutable
+  signed-normal offset targets measured from H at saved crossings; linear source-arc
+  interpolation, constant ends, global signed crossing mean for unconnected V.
 - Displacements are smooth along source fibers, penalized relative to input UV,
   with nominal limits 0.1 local winding width and 1000 vertical base voxels.
 - Extrapolation creates geometry, not extra supervision; record its extent.
@@ -16,8 +27,10 @@
 - Preserve all existing workflows and output tifxyz base-voxel coordinates.
 - No claim that regularization guarantees a globally nonintersecting surface.
 - CT rendering uses bilinear surface geometry and native blocking trilinear CT
-  sampling. Overlay uses saved final H attachment UVs on the same pixel grid,
+  sampling. Overlay uses saved final H/V attachment UVs on the same pixel grid,
   separating cropped piece spans. TIFF outputs include validity and provenance.
+- Future render default:8baseUV voxels per pixel,4pixel fiber lines (half previous
+  dimensions and linewidth). Existing images/frozen configs remain unchanged.
 - Opt-in repair freezes patch boundaries and saved UV while reconstructing XYZ;
   continuation restores joint updates relative to original UV, with fresh Adam
   state. Failed repairs leave geometry unchanged; save all comparison stages.

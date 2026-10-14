@@ -1,5 +1,37 @@
 # Fiber surface status
 
+## Future half-resolution rendering
+
+- [x] Defaults/presets8baseUV per pixel,4px lines; existing outputs preserved.
+- [x] Independent review and5renderer tests,including half-resolution registration.
+
+## Tangential geometry fitting
+
+- [x] Independent plan/code review and32regression tests.
+- [x] Optional geometry tangent term, detached UV/normals; preserve UV routing.
+- [x] Checkpoint persistence and common per-family positional diagnostics.
+- [x] Matched0.1/0.3/1 solves; large alignment gains,more folded quads.
+- [x] Render0.1 and1 for inspection; both100%coverage,~33s,paths logged.
+
+## Stronger UV-offset regularization
+
+- [x] Plan and independent review; reuse existing losses, preserve locks.
+- [x] Matched smooth10/100,anchor0.1 solves and12regression tests.
+- [x] Audit identical inputs,local offsets,slope variation,fit,folds and crossings.
+- [x] Render smooth100 candidate;100%CT coverage,30.98s,output and limitations logged.
+
+## Connected-component filtering
+
+- [x] Confirm connected components, not cliques; independent plan/code review.
+- [x] Minimum3 distinct sources, mixed H/V; whole graph components preserved.
+- [x] Filter before initialization, metadata selection and legacy replay option.
+- [x] 28 regression tests and real800-step managed solve completed.
+- [x] Log counts, error metrics, exact crossing locks and remaining215folds.
+- [x] Filtered CT/HV render: matched UV band,100%coverage,68.28s;
+  lasagna/data/render_connected_hv_min3_deformed_v1.
+
+Current filtered surface: lasagna/data/connected_hv_min3_deformed_v1/surface.tifxyz.
+
 ## Active matched CT/fiber rendering
 
 - [x] Plan, independent review and registration test.
@@ -55,3 +87,19 @@ large-error outliers mean no production-quality/nonintersection claim.
 Implementation pilot complete; not a production-quality surface claim. See
 results.md: 181/16000 locally folded quads remain. GPU execution and whole-scroll
 solve have not been measured. No upstream winding-solve changes or reruns.
+# Connected H/V solve and visualization complete
+
+- [x] 800-step nonexclusive GPU solve; full graph preserved.
+- [x] Central inspection tifxyz, CT JPG, H/V TIFF overlay and combined view.
+- [x] Report final metrics, exact crossing equality and increased fold count.
+
+## Previous implementation
+
+- [x] Commit prior state: 9fc1bffba.
+- [x] Plan and independent review.
+- [x] Signed V offsets, graph component translations, exact crossing locks.
+- [x] Metadata persistence and restoration; preserve H-only mode.
+- [x] Synthetic regressions and full retained-input three-step smoke.
+- [x] Documentation and findings recorded in task_log.md.
+- The subsequent full solve is now recorded in task_log.md; folds remain.
+- Legacy sample-level crop is deliberately rejected for connected mode.
