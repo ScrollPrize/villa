@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 from typing import Any, Optional, Sequence
+import warnings
 
 import numpy as np
 from PIL import Image
@@ -203,11 +204,19 @@ def inspect_zarr(remote: str, preferred_level: int) -> ZarrLevel:
         item for item in datasets if str(item["path"]) == level
     )
     scale = (1.0, 1.0, 1.0)
+    has_scale = False
     for transform in dataset.get("coordinateTransformations") or []:
         if transform.get("type") == "scale":
             values = tuple(float(value) for value in transform["scale"])
             if len(values) == 3:
                 scale = values
+                has_scale = True
+    if not has_scale:
+        warnings.warn(
+            f"{remote} level {level} declares no 3-element scale; treating one voxel as one unit. "
+            "Physical distances recorded in this evidence are wrong unless the voxel size is 1.",
+            stacklevel=2,
+        )
     return ZarrLevel(
         remote=remote.rstrip("/"),
         level=level,

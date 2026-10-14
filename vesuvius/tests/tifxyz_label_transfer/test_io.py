@@ -150,5 +150,26 @@ class SurfaceIoTests(unittest.TestCase):
         np.testing.assert_array_equal(surface.valid, expected)
 
 
+class MissingScaleWarningTests(unittest.TestCase):
+    def test_missing_scale_key_warns_and_treats_one_cell_as_one_voxel(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "surface.tifxyz"
+            path.mkdir()
+            rows, cols = np.meshgrid(
+                np.arange(2, dtype=np.float32),
+                np.arange(3, dtype=np.float32),
+                indexing="ij",
+            )
+            tifffile.imwrite(path / "x.tif", cols)
+            tifffile.imwrite(path / "y.tif", rows)
+            tifffile.imwrite(path / "z.tif", np.full((2, 3), 10.0, dtype=np.float32))
+            (path / "meta.json").write_text(json.dumps({}), encoding="utf-8")
+
+            with self.assertWarns(UserWarning):
+                surface = load_surface(path)
+
+        self.assertEqual(surface.scale_yx, (1.0, 1.0))
+
+
 if __name__ == "__main__":
     unittest.main()
