@@ -806,7 +806,7 @@ def iter_probability_tiles(
             weight = np.asarray(
                 weight_sum_store[y0:y1, x0:x1], dtype=np.float32
             )
-            np.divide(probability, weight, out=probability, where=weight > 1e-6)
+            np.divide(probability, weight, out=probability, where=weight > 0)
             np.clip(probability, 0, 1, out=probability)
             probability *= 255
             yield probability.astype(np.uint8, copy=False)

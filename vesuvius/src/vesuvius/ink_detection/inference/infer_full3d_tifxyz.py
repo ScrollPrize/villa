@@ -647,7 +647,7 @@ class ChunkAccumulator3D:
     def _flush(self, chunk: ChunkId) -> None:
         probability, weight = self.buffers.pop(chunk)
         self.seen_counts.pop(chunk, None)
-        np.divide(probability, weight, out=probability, where=weight > 1e-6)
+        np.divide(probability, weight, out=probability, where=weight > 0)
         np.clip(probability, 0.0, 1.0, out=probability)
         encoded = np.rint(probability * 255.0).astype(np.uint8)
         starts, stops = self._bounds(chunk)
