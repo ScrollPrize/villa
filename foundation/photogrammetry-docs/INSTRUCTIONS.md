@@ -444,6 +444,8 @@ By default the case axis is the axis of the smallest enclosing cylinder. For a s
 
 To pick the two points, open the textured PLY in MeshLab (its layering shows the umbilicus best; its coordinates match the untextured mesh), choose `Edit -> Pick Points`, click where the umbilicus emerges on each end face and read the coordinates from the dialog, or save them as a `.pp` file. Check the result by viewing the scroll along the axis: the end-face layering should be concentric about it.
 
+The top cap is engraved with `PHerc<padded number>` and `v3` by default. For an object without a number, or to engrave something else, add `<input>/<name>/<name>-label.txt` holding one or two lines (e.g. `PHerc. s.n.` and `cass. 94`); a folder name that is not a number is used unpadded for the output names.
+
 Run the generator:
 
 ```bash
