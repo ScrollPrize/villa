@@ -13,12 +13,18 @@ namespace vc::core::util {
 //   - DistLoss: preserve 4-neighbor grid spacing (target = unit voxels apart)
 //   - StraightLoss: penalize bending along grid rows/columns
 // Boundary-ring cells around the ROI are fixed. The unknowns are the invalid
-// interior cells, seeded by a quick 4-neighbor diffusion pass.
+// interior cells, seeded by a 4-neighbor diffusion pass relaxed to the
+// harmonic fill of the hole from its rim.
+//
+// unit <= 0 (the default) takes the target spacing from the median
+// 4-neighbor distance between the known cells of each ROI, i.e. the grid step
+// of the surface (1 / scale voxels for a tifxyz); a positive unit is used as
+// given.
 //
 // Cells touching the grid border are left untouched (legitimate outer
 // padding). Returns the number of invalid cells that were filled in.
 int inpaintSurfaceHoles(cv::Mat_<cv::Vec3f>& points,
-                        double unit = 1.0,
+                        double unit = 0.0,
                         int max_iters = 2000);
 
 } // namespace vc::core::util
