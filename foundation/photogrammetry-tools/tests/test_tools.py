@@ -113,6 +113,21 @@ class FindBlocksTest(unittest.TestCase):
         self.assertEqual([len(b) for b in bursts], [48, 48, 30, 18, 48, 48])
         self.assertEqual(block_of, [0, 0, 1, 1, 1, 2])
 
+    def test_photographs_and_links_for_raw_and_jpeg_captures(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "capture")
+            os.makedirs(src)
+            for n in ("DSC00001.ARW", "DSC00002.JPG", "._DSC00002.JPG", "notes.txt"):
+                open(os.path.join(src, n), "w").write(n)
+            self.assertEqual(find_blocks.photographs(src), ["DSC00001.ARW", "DSC00002.JPG"])
+            block = os.path.join(d, "tree", "orientation1_camera_low")
+            os.makedirs(block)
+            for n in find_blocks.photographs(src):
+                find_blocks.link_photo(os.path.join(src, n), block)
+            self.assertTrue(os.path.islink(os.path.join(block, "DSC00001.ARW")))
+            jpg = os.path.join(block, "JPGEnhanced", "DSC00002.jpg")
+            self.assertEqual(os.stat(jpg).st_ino, os.stat(os.path.join(src, "DSC00002.JPG")).st_ino)
+
     def test_frame_number(self):
         self.assertEqual(find_blocks.frame_number("DSC05493_1.ARW"), 5493)
         self.assertEqual(find_blocks.frame_number("IMG_7065.CR3"), 7065)
