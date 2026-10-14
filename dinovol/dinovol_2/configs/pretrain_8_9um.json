@@ -17,8 +17,8 @@
   "clip_grad": 3.0,
   "ibot_masked_loss_chunk_size": 4096,
   "max_iterations": 1000000,
-  "batch_size": 16,
-  "grad_accumulation_steps": 2,
+  "batch_size": 10,
+  "grad_accumulation_steps": 1,
   "train_monitor_every_n": 1000,
   "monitor_batch_size": 12,
   "monitor_pca_sets": 4,
@@ -509,7 +509,7 @@
       }
     ],
     "num_global_crops": 2,
-    "num_local_crops": 2,
+    "num_local_crops": 4,
     "s3_storage_options": {
       "anon": true
     }
