@@ -1523,7 +1523,7 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None,
 	_t_fit_total = _stage_start("total")
 	_t = _stage_start("parse_config")
 	parser = _build_parser()
-	cfg_paths, argv_rest = cli_json.split_cfg_argv(argv)
+	cfg_paths, argv_rest = cli_json.split_cfg_argv(argv, parser)
 	cfg_paths = [str(x) for x in cfg_paths]
 	cfg = cli_json.merge_cfgs(cfg_paths)
 	fit_config = copy.deepcopy(cfg)
