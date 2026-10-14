@@ -357,6 +357,14 @@ class SpatialPatchGrid:
 
                         result[part_id].append((patch_idx, z, y, x))
 
+        # Accumulate each part's patches in coordinate order. Float32 summation
+        # depends on the order of its terms, and the order assembled above would
+        # otherwise depend on the --patch_order the prediction ran with and, for
+        # a chunk that straddles a grid cell, on the cell visit order. Sorting
+        # keeps the blended logits the same whichever order the patches were
+        # predicted in.
+        for patches in result.values():
+            patches.sort(key=lambda p: p[1:])
         return dict(result)
 
 def generate_gaussian_map(patch_size: tuple, sigma_scale: float = 8.0, dtype=np.float32) -> np.ndarray:
