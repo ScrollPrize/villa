@@ -89,12 +89,13 @@ def object_mask_cells(means: np.ndarray, nonzero: np.ndarray, closing: int) -> n
     return filled & nonzero
 
 
-def window_start_cells(inside: np.ndarray, factor: int, window, lo, hi):
+def window_start_cells(inside: np.ndarray, factor: int, window, lo, hi, min_fraction: float = 1.0):
     """Cells c such that every window start in [c * factor, (c + 1) * factor) gives a window
     inside `inside` (cells of `factor` voxels at the origin) and within voxels [lo, hi).
 
     A window starting anywhere in a cell covers up to n = (factor + window - 2) // factor + 1
-    cells along each axis.
+    cells along each axis; with min_fraction < 1, at least that fraction of those n**3 cells
+    must be inside instead of all of them.
     """
     window = np.asarray(window)
     n = (factor + window - 2) // factor + 1
@@ -111,7 +112,7 @@ def window_start_cells(inside: np.ndarray, factor: int, window, lo, hi):
         table[b[0], b[1], b[2]] - table[a[0], b[1], b[2]] - table[b[0], a[1], b[2]] - table[b[0], b[1], a[2]]
         + table[a[0], a[1], b[2]] + table[a[0], b[1], a[2]] + table[b[0], a[1], a[2]] - table[a[0], a[1], a[2]]
     )
-    full = total == int(np.prod(n))
+    full = total >= int(math.ceil(min_fraction * int(np.prod(n)) - 1e-9))
     cell = [np.arange(s) for s in span]
     ok = [(c * factor >= l) & (c * factor + factor - 1 + w <= h) for c, l, h, w in zip(cell, lo, hi, window)]
     out[tuple(slice(0, s) for s in span)] = full & ok[0][:, None, None] & ok[1][None, :, None] & ok[2][None, None, :]
@@ -145,6 +146,8 @@ class Volume:
     fiber_paths: tuple[str, str, str] | None = None  # presence, nx, ny
     fiber_level: int = 0
     fiber_factor: int = 1  # selected-scale voxels per fiber voxel
+    object_mask_min_inside: float = 1.0  # fraction of a window that must lie inside the object mask
+    object_mask_source: str = "object"  # "object" (tissue envelope) or "sam2" (the published mask as-is)
 
 
 @dataclass
@@ -363,11 +366,13 @@ class SSLZarrDataset(Dataset):
         # object_mask: source windows start only where the whole window lies inside the
         # scanned object (the scroll body, not the object-loss pseudo-objects), found on the
         # occupancy_level of the (already SAM2-masked) volume: voxels above an Otsu threshold,
-        # closed over gap_um so the space between wraps counts as inside, holes filled. It
-        # replaces vol_trim_pct; only the bottom and top z_trim_pct of z slices are excluded.
+        # closed over gap_um so the space between wraps and interior chambers count as inside,
+        # holes filled. It replaces vol_trim_pct; only the bottom and top z_trim_pct of z
+        # slices are excluded. Per dataset, thin objects can set object_mask_min_inside (< 1)
+        # and object_mask_source: "sam2" uses the published mask (nonzero cells) instead.
         object_mask = dict(self.config.get("object_mask") or {})
         self.object_mask_enabled = bool(object_mask.get("enabled", False))
-        self.object_mask_gap_um = float(object_mask.get("gap_um", 300.0))
+        self.object_mask_gap_um = float(object_mask.get("gap_um", 2000.0))
         self.object_mask_z_trim_pct = float(object_mask.get("z_trim_pct", 0.05))
         if self.object_mask_enabled:
             if self.occupancy_level is None:
@@ -511,6 +516,8 @@ class SSLZarrDataset(Dataset):
                     fiber_level=int(dataset.get("fiber_level", 0)),
                     fiber_factor=int(dataset.get("fiber_factor", 1)),
                     pixel_size_um=dataset.get("pixel_size_um"),
+                    object_mask_min_inside=float(dataset.get("object_mask_min_inside", 1.0)),
+                    object_mask_source=str(dataset.get("object_mask_source", "object")),
                 ))
             finally:
                 handle.close()
@@ -649,10 +656,19 @@ class SSLZarrDataset(Dataset):
                 nonzero[rows] = (blocks > 0).any(axis=(1, 3, 5))
         finally:
             handle.close()
-        closing = max(1, round(self.object_mask_gap_um / (float(volume.pixel_size_um) * factor)))
-        inside = object_mask_cells(means, nonzero, closing)
+        if volume.object_mask_source == "sam2":
+            # The published (SAM2) mask as-is, air margin included. Cells count as nonzero if any
+            # voxel is, so edge cells straddle the mask: erode by one cell to keep windows off it.
+            inside = ndi.binary_erosion(nonzero, structure=np.ones((3, 3, 3), dtype=bool))
+        elif volume.object_mask_source == "object":
+            closing = max(1, round(self.object_mask_gap_um / (float(volume.pixel_size_um) * factor)))
+            inside = object_mask_cells(means, nonzero, closing)
+        else:
+            raise ValueError(f"object_mask_source must be 'object' or 'sam2', got {volume.object_mask_source!r}")
         bbox = np.asarray(volume.usable_bbox)
-        starts = window_start_cells(inside, factor, self.source_sampling_size, bbox[:3], bbox[3:])
+        starts = window_start_cells(
+            inside, factor, self.source_sampling_size, bbox[:3], bbox[3:], volume.object_mask_min_inside
+        )
         volume.occupancy = None
         volume.occupancy_factor = factor
         volume.valid_crop_starts = int(starts.sum()) * factor ** 3
@@ -1146,7 +1162,11 @@ class SSLZarrDataset(Dataset):
             else:
                 plan = self._draw_source_plan(nonzero_threshold)
                 source_crop = self._read_source_window(plan.array, plan.starts)
-            if source_crop.size > 0 and (np.count_nonzero(source_crop) / source_crop.size) >= nonzero_threshold:
+            if source_crop.size == 0:
+                continue
+            # Windows drawn from the object mask are kept as they are; otherwise the
+            # nonzero fraction decides.
+            if self.object_mask_enabled or np.count_nonzero(source_crop) / source_crop.size >= nonzero_threshold:
                 break
         if self.read_ahead:
             if self._read_executor is None:

@@ -96,7 +96,7 @@
   "dataset": {
     "source_sampling_size": [192, 192, 192],
     "occupancy_level": 5,
-    "object_mask": {"enabled": true, "gap_um": 300, "z_trim_pct": 0.05},
+    "object_mask": {"enabled": true, "gap_um": 2000, "z_trim_pct": 0.05},
     "read_ahead": 2,
     "gaussian_blur": true,
     "augmentation": "full",
@@ -435,6 +435,7 @@
         "scan_location": "ESRF Grenoble",
         "volume_path": "s3://vesuvius-challenge-open-data/PHercMAN5/volumes/20260311104824-2.399um-0.2m-78keV-masked.zarr/",
         "volume_scale": 2,
+        "object_mask_source": "sam2",
         "surface_path": "s3://vesuvius-challenge-open-data/PHercMAN5/representations/predictions/surfaces/20260311104824-surface-20260413222639-surface-m7-L2-th0.2.zarr",
         "surface_level": 0
       },
@@ -453,6 +454,7 @@
         "scan_location": "ESRF Grenoble",
         "volume_path": "s3://vesuvius-challenge-open-data/PHercMANBp/volumes/20251216152116-2.399um-0.2m-78keV-masked.zarr/",
         "volume_scale": 2,
+        "object_mask_min_inside": 0.5,
         "surface_path": "s3://vesuvius-challenge-open-data/PHercMANBp/representations/predictions/surfaces/20251216152116-surface-20260413222639-surface-m7-L2-th0.2.zarr",
         "surface_level": 0
       },
@@ -478,6 +480,7 @@
         "scan_location": "ESRF Grenoble",
         "volume_path": "s3://vesuvius-challenge-open-data/PHerc0343P/volumes/20260304131111-2.215um-0.4m-111keV-masked.zarr/",
         "volume_scale": 2,
+        "object_mask_min_inside": 0.5,
         "surface_path": "s3://vesuvius-challenge-open-data/PHerc0343P/representations/predictions/surfaces/20260304131111-surface-20260413222639-surface-m7-L2-th0.2.zarr",
         "surface_level": 0
       },
@@ -487,6 +490,7 @@
         "scan_location": "ESRF Grenoble",
         "volume_path": "s3://vesuvius-challenge-open-data/PHerc0500P2/volumes/20250526151718-2.215um-0.4m-111keV-masked.zarr/",
         "volume_scale": 2,
+        "object_mask_min_inside": 0.5,
         "surface_path": "s3://vesuvius-challenge-open-data/PHerc0500P2/representations/predictions/surfaces/20250526151718-surface-20260413222639-surface-m7-L2-th0.2.zarr",
         "surface_level": 0
       }

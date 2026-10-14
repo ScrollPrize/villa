@@ -128,6 +128,53 @@ class ObjectMaskSamplingTests(unittest.TestCase):
                     break
             self.assertEqual(bool(cells[c]), exact, c)
 
+    def test_object_mask_windows_are_not_rechecked_after_reading(self):
+        dataset = self.dataset(nonzero_threshold=1.01)  # would reject every window if it were applied
+        reads = []
+        read = dataset._read_source_window
+        dataset._read_source_window = lambda array, starts: reads.append(starts) or read(array, starts)
+        np.random.seed(0)
+        for _ in range(10):
+            dataset._next_source_crop(1.01)
+        self.assertEqual(len(reads), 10)
+        dataset.close()
+
+    def test_sam2_source_uses_the_published_mask(self):
+        dataset = self.dataset(datasets=[{"volume_path": str(self.zarr_path), "volume_scale": 0, "pixel_size_um": 8.0,
+                                          "object_mask_source": "sam2"}])
+        volume = dataset.volumes[0]
+        array = dataset._get_volume_array(volume)
+        strict = self.dataset().volumes[0].valid_crop_starts
+        self.assertGreater(volume.valid_crop_starts, strict)  # the air margin (radius 30-36) now counts as inside
+        np.random.seed(1)
+        reached_margin = False
+        for _ in range(300):
+            z0, y0, x0 = dataset._draw_source_plan(0.3).starts
+            dy = max(abs(y0 - 48.0), abs(y0 + 23 - 48.0)); dx = max(abs(x0 - 48.0), abs(x0 + 23 - 48.0))
+            reached_margin |= np.hypot(dy, dx) > 30 + 1  # past the tissue, into the SAM2 air margin
+            self.assertTrue(np.all(dataset._read_source_window(array, (z0, y0, x0)) > 0))  # never the zeros outside
+        self.assertTrue(reached_margin)
+        with self.assertRaises(ValueError):
+            self.dataset(datasets=[{"volume_path": str(self.zarr_path), "volume_scale": 0, "pixel_size_um": 8.0,
+                                    "object_mask_source": "bogus"}])
+        dataset.close()
+
+    def test_min_fraction_relaxes_the_start_cells(self):
+        rng = np.random.default_rng(2)
+        inside = rng.random((12, 12, 12)) < 0.7
+        factor, window = 2, np.array([5, 5, 5])
+        lo, hi = np.zeros(3, int), np.full(3, 24)
+        n = (factor + window - 2) // factor + 1
+        strict = window_start_cells(inside, factor, window, lo, hi)
+        for fraction in (0.9, 0.6, 0.3):
+            relaxed = window_start_cells(inside, factor, window, lo, hi, fraction)
+            self.assertTrue(np.all(relaxed >= strict))  # superset of the strict cells
+            for c in np.ndindex(*inside.shape):
+                box = inside[tuple(slice(a, a + k) for a, k in zip(c, n))]
+                in_bounds = all(a * factor >= l and a * factor + factor - 1 + w <= h for a, l, h, w in zip(c, lo, hi, window))
+                expected = box.shape == tuple(n) and in_bounds and box.sum() >= np.ceil(fraction * np.prod(n))
+                self.assertEqual(bool(relaxed[c]), bool(expected), (fraction, c))
+
 
 class SourceSamplingTests(unittest.TestCase):
     def setUp(self) -> None:

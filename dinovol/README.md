@@ -129,25 +129,34 @@ mostly empty.
   read, so the accepted windows and their distribution are unchanged. Masked-out
   chunks are absent from the S3 stores, so these reads were otherwise wasted.
   The coarse masks are read once at startup and only cover the usable bounding box.
-- `dataset.object_mask` (`enabled`, `gap_um` 300, `z_trim_pct` 0.05): source
+- `dataset.object_mask` (`enabled`, `gap_um` 2000, `z_trim_pct` 0.05): source
   windows lie entirely inside the scanned object, replacing the central
   `vol_trim_pct` box (which both reached past flattened scrolls and cut off
   interior of wide ones). The published volumes are SAM2-masked with a dilated
   margin of air, so at startup the `occupancy_level` cells (32× coarser; the
   2.4 µm volumes mean-pool their 8× level, streamed in z slabs) are split into
   tissue and air by an Otsu threshold, closed over `gap_um` so the space between
-  wraps counts as inside, hole-filled per z slice and in 3D, with components
+  wraps and interior air chambers (open to the outside through gaps narrower than
+  2 mm) count as inside, hole-filled per z slice and in 3D, intersected with the
+  SAM2 mask (so the closing cannot spread into real exterior air), with components
   under 1% of the largest dropped. A window may start in a cell only if a window
   starting anywhere in that cell covers only object cells (conservative by up to
   one cell), and only outside the bottom and top `z_trim_pct` of z slices.
+  Objects thinner than a window (fragments, flattened pieces) set
+  `object_mask_min_inside` (e.g. 0.5) in their dataset entry: at least that
+  fraction of the window's cells must be inside instead of all of them.
+  `object_mask_source: "sam2"` in a dataset entry uses the published SAM2 mask
+  itself (nonzero cells, eroded by one cell so windows stay off its edge, air
+  margin included) instead of the tissue envelope; PHercMAN5, a box of fragments
+  with large air chambers, uses it.
   Starts are uniform over those cells; volume weights follow their counts. Every
   crop is cut from inside its window, so no crop reaches outside the object.
-  The occupancy pre-check is skipped (the windows are fully occupied); the
-  post-read `nonzero_threshold` check stays. Needs `pixel_size_um` per dataset.
+  Both nonzero checks are skipped (the occupancy pre-check and the post-read
+  `nonzero_threshold` check): every drawn window is used. Needs `pixel_size_um` per dataset.
   Measured before the change by simulating the old sampler on these masks: on
   average 9% of global crops were less than half inside the object (up to 23%
-  on PHerc0826). Startup reads ~6.5 GB in total, most of it the five 2.4 µm
-  volumes' 8× levels.
+  on PHerc0826). Startup reads ~13 GB nominal (less in practice: masked-out
+  chunks are absent from S3), most of it the twelve 2.2–2.4 µm volumes' 8× levels.
 - `dataset.read_ahead`: each loader process reads this many future source
   windows in background threads while it augments the current sample. Window
   locations are still drawn in the loader process, so sampling stays
@@ -264,8 +273,11 @@ Occupancy cells cover 2^`occupancy_level` selected-scale voxels on every volume:
 level-2 volumes read the same pyramid level and max-pool it.
 
 PHerc0172 uses the newer cropped export `20241024131839`. PHercMAN5, PHercMANB,
-and PHercParis3 are excluded because the catalog has no intensity volume near
-the requested resolution.
+PHercMANBp, PHercParis3, PHerc0009B, PHerc0343P and PHerc0500P2 (all ESRF BM18) are
+read from their 2.2–2.4 µm masked scans at scale 2 (8.9–9.6 µm), like PHerc0139,
+PHerc0332, PHerc1451, PHerc1299 and PHercParis4. PHercParis3 has no surface or fiber
+predictions in this format and trains without object labels. MANBp, 0343P and 0500P2
+are thinner than a source window and use `object_mask_min_inside: 0.5`.
 
 ### Pseudo-object losses
 
