@@ -241,15 +241,12 @@ h1, h2, h3, h4, h5, h6 {
   color: #fff;
   text-decoration: none;
 }
-/* A CTA pointing at the page you're on is noise: hide it on /get_started
-   itself (Docusaurus marks the current page's navbar item as active). */
-.navbar .vc-navbar-cta.navbar__link--active,
-.menu__link.vc-navbar-cta.menu__link--active {
-  display: none;
-}
 /* Same item inside the mobile drawer menu. */
 .menu__link.vc-navbar-cta,
-.menu__link.vc-navbar-cta:hover {
+.menu__link.vc-navbar-cta:hover,
+.menu__link.vc-navbar-cta.menu__link--active,
+.menu__link.vc-navbar-cta.menu__link--active:hover {
+  border-left-color: transparent;
   background: var(--vc-accent);
   color: #fff;
   justify-content: center;
