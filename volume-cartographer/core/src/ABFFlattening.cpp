@@ -15,6 +15,7 @@
 #include <vector>
 #include <algorithm>
 #include <cstdint>
+#include <sstream>
 
 namespace vc {
 
@@ -26,6 +27,137 @@ using LSCM = OpenABF::AngleBasedLSCM<double, HalfEdgeMesh>;
 static inline bool isValidSurfacePoint(const cv::Vec3f& p)
 {
     return p[0] != -1.f && std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
+}
+
+ABFScaleConsistency checkAbfInputScale(const cv::Mat_<cv::Vec3f>& points,
+                                       const cv::Vec2f& scale,
+                                       float toleranceFactor)
+{
+    ABFScaleConsistency result;
+    if (!std::isfinite(scale[0]) || !std::isfinite(scale[1]) ||
+        scale[0] <= 0.f || scale[1] <= 0.f) {
+        result.checked = true;
+        result.consistent = false;
+        result.failureReason = "tifxyz scale must contain two finite positive cells-per-voxel values";
+        return result;
+    }
+    if (!std::isfinite(toleranceFactor) || toleranceFactor <= 1.f) {
+        result.checked = true;
+        result.consistent = false;
+        result.failureReason = "scale consistency tolerance must be finite and greater than 1";
+        return result;
+    }
+    if (points.empty() || points.rows <= 0 || points.cols <= 0) {
+        return result;
+    }
+
+    constexpr std::size_t kMaxSamplesPerAxis = 65536;
+    constexpr std::size_t kMinSamplesPerAxis = 8;
+
+    auto collectLengths = [&](bool columns) {
+        std::vector<float> lengths;
+        const std::uint64_t candidateCount = columns
+            ? static_cast<std::uint64_t>(points.rows) * static_cast<std::uint64_t>(std::max(0, points.cols - 1))
+            : static_cast<std::uint64_t>(std::max(0, points.rows - 1)) * static_cast<std::uint64_t>(points.cols);
+        if (candidateCount == 0) {
+            return lengths;
+        }
+        const std::uint64_t stride = std::max<std::uint64_t>(
+            1, (candidateCount + kMaxSamplesPerAxis - 1) / kMaxSamplesPerAxis);
+        lengths.reserve(static_cast<std::size_t>(std::min<std::uint64_t>(candidateCount, kMaxSamplesPerAxis)));
+
+        std::uint64_t candidateIndex = 0;
+        if (columns) {
+            for (int row = 0; row < points.rows; ++row) {
+                for (int col = 0; col + 1 < points.cols; ++col, ++candidateIndex) {
+                    if (candidateIndex % stride != 0) {
+                        continue;
+                    }
+                    const cv::Vec3f& a = points(row, col);
+                    const cv::Vec3f& b = points(row, col + 1);
+                    if (!isValidSurfacePoint(a) || !isValidSurfacePoint(b)) {
+                        continue;
+                    }
+                    const cv::Vec3f d = b - a;
+                    const float lenSq = d.dot(d);
+                    if (std::isfinite(lenSq) && lenSq > 0.f) {
+                        lengths.push_back(std::sqrt(lenSq));
+                    }
+                }
+            }
+        } else {
+            for (int row = 0; row + 1 < points.rows; ++row) {
+                for (int col = 0; col < points.cols; ++col, ++candidateIndex) {
+                    if (candidateIndex % stride != 0) {
+                        continue;
+                    }
+                    const cv::Vec3f& a = points(row, col);
+                    const cv::Vec3f& b = points(row + 1, col);
+                    if (!isValidSurfacePoint(a) || !isValidSurfacePoint(b)) {
+                        continue;
+                    }
+                    const cv::Vec3f d = b - a;
+                    const float lenSq = d.dot(d);
+                    if (std::isfinite(lenSq) && lenSq > 0.f) {
+                        lengths.push_back(std::sqrt(lenSq));
+                    }
+                }
+            }
+        }
+        return lengths;
+    };
+
+    auto median = [](std::vector<float>& values) -> float {
+        const std::size_t mid = values.size() / 2;
+        std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(mid), values.end());
+        const float upper = values[mid];
+        if (values.size() % 2 != 0) {
+            return upper;
+        }
+        const float lower = *std::max_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(mid));
+        return 0.5f * (lower + upper);
+    };
+
+    std::vector<float> columnLengths = collectLengths(true);
+    std::vector<float> rowLengths = collectLengths(false);
+
+    const float minRatio = 1.f / toleranceFactor;
+    const float maxRatio = toleranceFactor;
+    auto checkAxis = [&](std::vector<float>& lengths, float axisScale, bool& checkedAxis,
+                         float& medianSpacing, float& ratio) {
+        if (lengths.size() < kMinSamplesPerAxis) {
+            return true;
+        }
+        checkedAxis = true;
+        result.checked = true;
+        medianSpacing = median(lengths);
+        ratio = medianSpacing * axisScale;
+        return std::isfinite(ratio) && ratio >= minRatio && ratio <= maxRatio;
+    };
+
+    const bool columnsOk = checkAxis(columnLengths, scale[0], result.checkedColumns,
+                                     result.columnMedianSpacingVoxels, result.columnScaleRatio);
+    const bool rowsOk = checkAxis(rowLengths, scale[1], result.checkedRows,
+                                  result.rowMedianSpacingVoxels, result.rowScaleRatio);
+
+    result.consistent = columnsOk && rowsOk;
+    if (!result.consistent) {
+        std::ostringstream message;
+        message << "tifxyz scale [" << scale[0] << ", " << scale[1]
+                << "] is inconsistent with measured one-cell spacing";
+        if (result.checkedColumns) {
+            message << " (columns: " << result.columnMedianSpacingVoxels
+                    << " voxels, spacing*scale=" << result.columnScaleRatio << ")";
+        }
+        if (result.checkedRows) {
+            message << " (rows: " << result.rowMedianSpacingVoxels
+                    << " voxels, spacing*scale=" << result.rowScaleRatio << ")";
+        }
+        message << "; expected spacing*scale near 1 within factor " << toleranceFactor
+                << ". Refusing flattened output allocation; verify meta.json scale (cells per voxel).";
+        result.failureReason = message.str();
+    }
+    return result;
 }
 
 static cv::Mat_<cv::Vec3f> resizePointsLinearPreservingInvalids(const cv::Mat_<cv::Vec3f>& points,
@@ -2062,14 +2194,24 @@ static float triangleStretchMax(const cv::Vec3f& p0, const cv::Vec3f& p1, const 
 }
 
 QuadSurface* abfFlattenToNewSurface(const QuadSurface& surface, const ABFConfig& config) {
-    // Step 1: Compute flattened UVs
-    cv::Mat_<cv::Vec2f> uvs = abfFlatten(surface, config);
-    if (uvs.empty()) {
+    const cv::Mat_<cv::Vec3f>* srcPoints = surface.rawPointsPtr();
+    if (!srcPoints || srcPoints->empty()) {
         return nullptr;
     }
 
-    const cv::Mat_<cv::Vec3f>* srcPoints = surface.rawPointsPtr();
-    if (!srcPoints || srcPoints->empty()) {
+    // A malformed tifxyz scale can turn an otherwise ordinary surface into a
+    // terabyte-class raster request (villa#1379).  Validate the documented
+    // cells-per-voxel convention against representative adjacent 3D samples
+    // before spending time on ABF or allocating the output grid.
+    const ABFScaleConsistency scaleCheck = checkAbfInputScale(*srcPoints, surface._scale);
+    if (scaleCheck.checked && !scaleCheck.consistent) {
+        std::cerr << "ABF++: " << scaleCheck.failureReason << std::endl;
+        return nullptr;
+    }
+
+    // Step 1: Compute flattened UVs
+    cv::Mat_<cv::Vec2f> uvs = abfFlatten(surface, config);
+    if (uvs.empty()) {
         return nullptr;
     }
 
@@ -2259,14 +2401,10 @@ QuadSurface* abfFlattenToNewSurface(const QuadSurface& surface, const ABFConfig&
     std::cout << "ABF++: UV bounds: [" << uvMin[0] << ", " << uvMin[1] << "] to ["
               << uvMax[0] << ", " << uvMax[1] << "]" << std::endl;
 
-    // Step 3: Determine output grid size
-    // The stored tifxyz grid is a downsampled representation. The scale factor
-    // indicates how many voxels each grid cell represents (e.g., scale=0.05 means
-    // 1 grid cell = 0.05 voxels, or equivalently, 20 grid cells per voxel).
-    // When rendering, gen() upscales by 1/scale to get full resolution.
-    //
-    // UV coordinates after ABF++ (with scaleToOriginalArea=true) are in voxel units.
-    // To get the output grid size, multiply UV range by input scale.
+    // Step 3: Determine output grid size.
+    // TIFXYZ scale is grid cells per voxel (e.g. scale=0.05 means one grid
+    // cell spans about 20 voxels). UV coordinates after ABF++ are in voxel
+    // units, so multiplying UV range by scale yields output grid cells.
     float inputScaleX = surface._scale[0];
     float inputScaleY = surface._scale[1];
 
