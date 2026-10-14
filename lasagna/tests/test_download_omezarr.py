@@ -368,3 +368,42 @@ def test_remote_chunk_listing_can_be_limited_to_expected_z_prefixes(monkeypatch)
         "3.0.0",
     }
     assert calls == ["root/0/1.", "root/0/3."]
+
+
+def test_parse_multiscales_reports_levels_without_a_scale_transform():
+    zattrs = {
+        "multiscales": [
+            {
+                "datasets": [
+                    {
+                        "path": "0",
+                        "coordinateTransformations": [
+                            {"type": "scale", "scale": [8.64, 8.64, 8.64]}
+                        ],
+                    },
+                    {"path": "1"},
+                    {
+                        "path": "2",
+                        "coordinateTransformations": [
+                            {"type": "translation", "translation": [0.0, 0.0, 0.0]}
+                        ],
+                    },
+                ]
+            }
+        ]
+    }
+    missing: set[int] = set()
+
+    assert dl._parse_multiscales(zattrs, missing) == {
+        0: [8.64, 8.64, 8.64],
+        1: [1.0, 1.0, 1.0],
+        2: [1.0, 1.0, 1.0],
+    }
+    assert missing == {1, 2}
+
+
+def test_parse_multiscales_without_missing_sink_keeps_previous_behaviour():
+    assert dl._parse_multiscales({}) == {}
+    assert dl._parse_multiscales({"multiscales": [{"datasets": [{"path": "0"}]}]}) == {
+        0: [1.0, 1.0, 1.0]
+    }
