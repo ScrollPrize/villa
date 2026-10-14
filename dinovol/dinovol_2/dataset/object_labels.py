@@ -14,7 +14,7 @@ import io
 import json
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Mapping
 
 import fsspec
 import numpy as np
@@ -628,25 +628,36 @@ def load_or_build_volume_meshes(
         return []
 
     metadata = _load_metadata_json(metadata_path)
+    raw_samples = metadata.get("samples", {})
+    samples_iter = raw_samples.values() if isinstance(raw_samples, Mapping) else raw_samples
+
     target_sample = None
-    for s in metadata.get("samples", []):
-        sid = s.get("sample", {}).get("id")
-        if sample_id and sid == sample_id:
-            target_sample = s
-            break
-        for v in s.get("volumes", []):
-            if v.get("id") == volume_id:
+    if isinstance(raw_samples, Mapping) and sample_id and sample_id in raw_samples:
+        target_sample = raw_samples[sample_id]
+    else:
+        for s in samples_iter:
+            if not isinstance(s, Mapping):
+                continue
+            sid = s.get("sample", {}).get("id")
+            if sample_id and sid == sample_id:
                 target_sample = s
                 break
-        if target_sample is not None:
-            break
+            vols = s.get("volumes") or {}
+            vols_iter = vols.values() if isinstance(vols, Mapping) else vols
+            if (isinstance(vols, Mapping) and volume_id in vols) or any(
+                isinstance(v, Mapping) and v.get("id") == volume_id for v in vols_iter
+            ):
+                target_sample = s
+                break
 
     if target_sample is None:
         return []
 
     scale0_shape = None
-    for v in target_sample.get("volumes", []):
-        if v.get("id") == volume_id:
+    vols = target_sample.get("volumes") or {}
+    vols_iter = vols.values() if isinstance(vols, Mapping) else vols
+    for v in vols_iter:
+        if isinstance(v, Mapping) and v.get("id") == volume_id:
             shape = v.get("properties", {}).get("shape")
             if shape and len(shape) == 3:
                 scale0_shape = tuple(int(dim) for dim in shape)
@@ -656,35 +667,67 @@ def load_or_build_volume_meshes(
         scale0_shape = tuple(int(dim) * factor for dim in selected_shape)
 
     transforms_to_target: dict[str, np.ndarray] = {}
-    vol_transforms = target_sample.get("sample", {}).get("properties", {}).get("volume_transforms", [])
+    vol_transforms = target_sample.get("sample", {}).get("properties", {}).get("volume_transforms") or []
     for vt in vol_transforms:
+        if not isinstance(vt, Mapping):
+            continue
+        from_vid = str(vt.get("from_volume_id", ""))
         if vt.get("to_volume_id") == volume_id and "matrix" in vt:
-            transforms_to_target[str(vt["from_volume_id"])] = np.asarray(vt["matrix"], dtype=np.float64)
+            transforms_to_target[from_vid] = np.asarray(vt["matrix"], dtype=np.float64)
+        for sub in vt.get("transforms") or []:
+            if isinstance(sub, Mapping) and sub.get("to_volume_id") == volume_id and "matrix" in sub:
+                transforms_to_target[from_vid] = np.asarray(sub["matrix"], dtype=np.float64)
+
+    def _extract_s3_url(item: Mapping[str, Any]) -> str | None:
+        if item.get("url"):
+            u = str(item["url"]).rstrip("/")
+            if u.startswith("https://vesuvius-challenge-open-data.s3.amazonaws.com/"):
+                return "s3://vesuvius-challenge-open-data/" + u.split("amazonaws.com/", 1)[1]
+            return u
+        for origin in item.get("origins") or []:
+            if not isinstance(origin, Mapping):
+                continue
+            rel_path = str(origin.get("path", "")).strip("/")
+            if not rel_path:
+                continue
+            for root in origin.get("access_roots") or []:
+                if isinstance(root, Mapping) and root.get("type") == "s3" and root.get("url"):
+                    return f"{str(root['url']).rstrip('/')}/{rel_path}"
+            return f"s3://vesuvius-challenge-open-data/{rel_path}"
+        return None
 
     def _build_one_segment(seg: dict[str, Any]) -> MeshSegment | None:
-        seg_id = seg.get("id", "unknown")
+        if not isinstance(seg, Mapping):
+            return None
+        seg_id = str(seg.get("id", "unknown"))
         orig_vol = str(seg.get("original_volume_id", ""))
-        reps = seg.get("representations", [])
+        reps = list(seg.get("data") or seg.get("representations") or [])
 
         tif_url = None
         transform_matrix = None
         coord_scale = 1.0
 
         for rep in reps:
-            if rep.get("type") == "tifxyz-transformed" and rep.get("parameters", {}).get("target_volume") == volume_id:
-                tif_url = rep.get("url")
-                break
+            if not isinstance(rep, Mapping):
+                continue
+            params = rep.get("parameters") or {}
+            if rep.get("type") == "tifxyz-transformed" and params.get("target_volume") == volume_id:
+                tif_url = _extract_s3_url(rep)
+                if tif_url:
+                    break
         if tif_url is None and (orig_vol == volume_id or orig_vol in transforms_to_target):
             for rep in reps:
-                if rep.get("type") == "tifxyz-normalized":
-                    tif_url = rep.get("url")
-                    break
+                if isinstance(rep, Mapping) and rep.get("type") == "tifxyz-normalized":
+                    tif_url = _extract_s3_url(rep)
+                    if tif_url:
+                        break
             if tif_url is None:
                 for rep in reps:
-                    if rep.get("type") == "tifxyz":
-                        tif_url = rep.get("url")
-                        coord_scale = float(seg.get("properties", {}).get("original_volume_downscale", 1.0))
-                        break
+                    if isinstance(rep, Mapping) and rep.get("type") == "tifxyz":
+                        tif_url = _extract_s3_url(rep)
+                        if tif_url:
+                            coord_scale = float((seg.get("properties") or {}).get("original_volume_downscale", 1.0))
+                            break
             if orig_vol != volume_id:
                 transform_matrix = transforms_to_target[orig_vol]
 
@@ -692,9 +735,6 @@ def load_or_build_volume_meshes(
             return None
 
         base_url = str(tif_url).rstrip("/")
-        if base_url.startswith("https://vesuvius-challenge-open-data.s3.amazonaws.com/"):
-            base_url = "s3://vesuvius-challenge-open-data/" + base_url.split("amazonaws.com/", 1)[1]
-
         try:
             x_arr = _read_tiff(f"{base_url}/x.tif", s3_storage_options)
             y_arr = _read_tiff(f"{base_url}/y.tif", s3_storage_options)
@@ -704,16 +744,17 @@ def load_or_build_volume_meshes(
 
         ink_arr = sup_arr = None
         for rep in reps:
-            if rep.get("type") == "ink-labels" and rep.get("url"):
-                ink_base = str(rep["url"]).rstrip("/")
-                if ink_base.startswith("https://vesuvius-challenge-open-data.s3.amazonaws.com/"):
-                    ink_base = "s3://vesuvius-challenge-open-data/" + ink_base.split("amazonaws.com/", 1)[1]
+            if isinstance(rep, Mapping) and rep.get("type") == "ink-labels":
+                ink_base = _extract_s3_url(rep)
+                if not ink_base:
+                    continue
                 try:
                     ink_arr = _open_ink_zarr_level(f"{ink_base}/inklabels.zarr", "4", s3_storage_options)
                     sup_arr = _open_ink_zarr_level(f"{ink_base}/supervision.zarr", "4", s3_storage_options)
                 except Exception:
                     ink_arr = sup_arr = None
-                break
+                if ink_arr is not None and sup_arr is not None:
+                    break
 
         return build_mesh_segment_from_arrays(
             seg_id,
@@ -728,7 +769,8 @@ def load_or_build_volume_meshes(
             supervision=sup_arr,
         )
 
-    raw_segments = list(target_sample.get("segments", []))
+    raw_segs = target_sample.get("segments") or {}
+    raw_segments = list(raw_segs.values()) if isinstance(raw_segs, Mapping) else list(raw_segs)
     segments: list[MeshSegment] = []
     if raw_segments:
         from concurrent.futures import ThreadPoolExecutor
