@@ -475,15 +475,16 @@ class PointDenseHead(nn.Module):
         self.obj_proj = nn.Linear(self.hidden_dim, self.out_dim)
         self.ink_proj = nn.Linear(self.hidden_dim, self.ink_dim)
 
-    def _refine_and_sample_chunk(
+    def _sample_fpn_points(
         self,
         token_grid: torch.Tensor,
+        skips: list[torch.Tensor],
         point_coordinates: torch.Tensor,
         input_shape: Tuple[int, ...],
-        *coarser_skips: torch.Tensor,
     ) -> torch.Tensor:
-        """Run top-down 3D FPN on a view chunk and sample only the target point coordinates."""
+        """Run top-down 3D FPN refinement and sample the target point coordinates (no checkpointing)."""
         dtype = token_grid.dtype
+        coarser_skips = skips[self._fpn_skip_start:]
         x = self.fpn_in(token_grid.permute(0, 4, 1, 2, 3).contiguous())
         for skip, lateral, refine in zip(reversed(coarser_skips), self.fpn_laterals, self.fpn_refines):
             target_size = skip.shape[2:]
@@ -493,37 +494,6 @@ class PointDenseHead(nn.Module):
             x = x + refine(x)
         fpn_grid = x.permute(0, 2, 3, 4, 1).contiguous()
         return sample_grid_points(fpn_grid, point_coordinates, input_shape).to(dtype)
-
-    def _sample_fpn_points(
-        self,
-        token_grid: torch.Tensor,
-        skips: list[torch.Tensor],
-        point_coordinates: torch.Tensor,
-        input_shape: Tuple[int, ...],
-        chunk_size: int = 4,
-    ) -> torch.Tensor:
-        coarser = tuple(skips[self._fpn_skip_start:])
-        b = token_grid.shape[0]
-        use_ckpt = self.training and torch.is_grad_enabled()
-        out_chunks: list[torch.Tensor] = []
-        for start in range(0, b, chunk_size):
-            end = min(b, start + chunk_size)
-            tg_c = token_grid[start:end]
-            pc_c = point_coordinates[start:end]
-            sk_c = tuple(s[start:end] for s in coarser)
-            if use_ckpt:
-                pts_c = checkpoint(
-                    self._refine_and_sample_chunk,
-                    tg_c,
-                    pc_c,
-                    input_shape,
-                    *sk_c,
-                    use_reentrant=False,
-                )
-            else:
-                pts_c = self._refine_and_sample_chunk(tg_c, pc_c, input_shape, *sk_c)
-            out_chunks.append(pts_c)
-        return torch.cat(out_chunks, dim=0)
 
     def forward_points(
         self,

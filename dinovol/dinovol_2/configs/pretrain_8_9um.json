@@ -113,7 +113,6 @@
       "points_per_fiber": 32,
       "points_per_object": 32,
       "max_objects": 12,
-      "slab_thickness": 0,
       "presence_threshold": 127,
       "use_metadata_meshes": true,
       "mesh_cache_dir": "../mesh_cache_8_9um",

@@ -425,7 +425,6 @@ class SSLZarrDataset(Dataset):
         self.max_objects = int(object_points.get("max_objects", 12))
         self.max_sheets = int(object_points.get("max_sheets", max(1, self.max_objects // 2)))
         self.max_fibers = int(object_points.get("max_fibers", max(1, self.max_objects - self.max_sheets)))
-        self.slab_thickness = int(object_points.get("slab_thickness", 0))
         self.fiber_presence_threshold = float(object_points.get("presence_threshold", 127))
         self.fiber_min_voxels = int(object_points.get("fiber_min_voxels", 30))
         self.fiber_min_span = float(object_points.get("fiber_min_span", 0.0))
@@ -856,20 +855,9 @@ class SSLZarrDataset(Dataset):
         overlap_hi = np.min([np.add(region.starts, region.shape) for region in crop_regions], axis=0)
         if np.any(overlap_hi <= overlap_lo):
             raise RuntimeError("Global crops of one source window must overlap.")
-        if self.slab_thickness > 0:
-            thickness = min(self.slab_thickness, int(overlap_hi[0] - overlap_lo[0]))
-            slab_lo = overlap_lo.copy()
-            slab_lo[0] = np.random.randint(overlap_lo[0], overlap_hi[0] - thickness + 1)
-            slab_hi = overlap_hi.copy()
-            slab_hi[0] = slab_lo[0] + thickness
-        else:
-            slab_lo = overlap_lo.copy()
-            slab_hi = overlap_hi.copy()
         window_starts_arr = np.asarray(window_starts)
-        absolute_lo = window_starts_arr + slab_lo
-        absolute_hi = window_starts_arr + slab_hi
-        overlap_abs_lo = window_starts_arr + overlap_lo
-        overlap_abs_hi = window_starts_arr + overlap_hi
+        absolute_lo = window_starts_arr + overlap_lo
+        absolute_hi = window_starts_arr + overlap_hi
 
         rng = np.random.default_rng(np.random.randint(2**31))
         sources, objects, kinds, inks = [], [], [], []
@@ -882,8 +870,8 @@ class SSLZarrDataset(Dataset):
             max_mesh_sheets = min(self.max_sheets, self.max_objects)
             sampled_sheets, mesh_neg_pairs = crop_mesh_objects(
                 volume.meshes,
-                overlap_abs_lo,
-                overlap_abs_hi,
+                absolute_lo,
+                absolute_hi,
                 min_points=self.mesh_min_points,
                 dedup_distance=self.mesh_dedup_distance,
                 min_separation=self.mesh_min_separation,
@@ -950,16 +938,36 @@ class SSLZarrDataset(Dataset):
             else:
                 n_sheets = 0
             n_fibers = min(labels.n_fibers, remaining_objects - n_sheets)
+            def _coords_by_label(vol_labels: np.ndarray, max_lbl: int) -> dict[int, np.ndarray]:
+                if max_lbl <= 0:
+                    return {}
+                flat = np.flatnonzero((vol_labels > 0) & (vol_labels <= max_lbl))
+                if flat.size == 0:
+                    return {}
+                ids = vol_labels.ravel()[flat]
+                order_idx = np.argsort(ids, kind="stable")
+                flat, ids = flat[order_idx], ids[order_idx]
+                bounds = np.searchsorted(ids, np.arange(1, max_lbl + 2))
+                return {
+                    lbl: np.stack(np.unravel_index(flat[bounds[lbl - 1]:bounds[lbl]], vol_labels.shape), axis=-1)
+                    for lbl in range(1, max_lbl + 1)
+                    if bounds[lbl] > bounds[lbl - 1]
+                }
+
+            sheet_coords = _coords_by_label(labels.sheet_labels, n_sheets)
+            fiber_coords = _coords_by_label(labels.fiber_labels, n_fibers)
             new_id: dict[int, int] = {}
-            candidates = [(SHEET_KIND, labels.sheet_labels, label, label) for label in range(1, n_sheets + 1)]
+            candidates = [(SHEET_KIND, sheet_coords, label, label) for label in range(1, n_sheets + 1)]
             candidates += [
-                (FIBER_KIND, labels.fiber_labels, label, label + labels.n_sheets) for label in range(1, n_fibers + 1)
+                (FIBER_KIND, fiber_coords, label, label + labels.n_sheets) for label in range(1, n_fibers + 1)
             ]
             for order in rng.permutation(len(candidates)):
-                kind, label_volume, label, combined = candidates[order]
+                kind, coord_map, label, combined = candidates[order]
                 if budget <= 0 or next_obj_id > self.max_objects:
                     break
-                voxels = np.argwhere(label_volume == label)
+                voxels = coord_map.get(label)
+                if voxels is None or len(voxels) == 0:
+                    continue
                 per_obj = self.points_per_sheet if kind == SHEET_KIND else self.points_per_fiber
                 take = min(per_obj, len(voxels), budget)
                 if kind == FIBER_KIND:
@@ -969,7 +977,7 @@ class SSLZarrDataset(Dataset):
                 obj_id = next_obj_id
                 next_obj_id += 1
                 new_id[combined] = obj_id
-                sources.append(chosen.astype(np.float32) + slab_lo)
+                sources.append(chosen.astype(np.float32) + overlap_lo)
                 objects.append(np.full(take, obj_id, dtype=np.int64))
                 kinds.append(np.full(take, kind, dtype=np.int8))
                 inks.append(np.zeros(take, dtype=np.int8))

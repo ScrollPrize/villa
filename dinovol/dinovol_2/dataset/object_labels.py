@@ -177,6 +177,7 @@ def fiber_objects(
     min_cos: float = 0.85,
     min_span: float = 0.0,
     dedup_distance: float = 1.5,
+    max_fibers: int = 24,
 ) -> tuple[np.ndarray, np.ndarray]:
     """6-connected fiber components joining neighbours only if their directions agree.
 
@@ -222,6 +223,8 @@ def fiber_objects(
     kept_means: list[np.ndarray] = []
 
     for comp_id in candidates:
+        if max_fibers > 0 and len(kept_components) >= max_fibers:
+            break
         idx = comp_order[comp_bounds[comp_id]:comp_bounds[comp_id + 1]]
         pts = voxel_coords[idx]
         v = vectors[idx]
@@ -279,6 +282,7 @@ def stacked_sheet_pairs(
     single_layer: float = 0.05,
     stacked: float = 0.2,
     max_points: int = 1500,
+    max_sheets: int = 24,
     rng: np.random.Generator | None = None,
 ) -> list[tuple[int, int]]:
     """Sheet pairs that are provably different layers.
@@ -289,6 +293,8 @@ def stacked_sheet_pairs(
     """
     rng = np.random.default_rng() if rng is None else rng
     n = int(labels.max())
+    if max_sheets > 0:
+        n = min(n, max_sheets)
     if n < 2:
         return []
     flat = np.flatnonzero(labels)
