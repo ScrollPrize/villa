@@ -481,6 +481,11 @@ checkpoint file exists. A checkpoint saved without a published preview, or one
 whose preview has already been pruned, gets nothing back; request a preview as
 before.
 
+Preview-index updates hold a shared advisory file lock across their whole
+read/modify/write operation, so independent service instances do not erase
+each other's previews or checkpoint pins. Contention waits up to 60 seconds;
+a failed write leaves the prior index intact and removes its unpublished stage.
+
 On first start the service generates a strong API key at
 `~/.config/vc3d/spiral_api_key` (mode `0600`) and prints it to the console.
 For an SSH profile you never copy it: VC3D reads that file over SSH.

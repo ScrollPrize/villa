@@ -22,7 +22,10 @@ in-memory artifact registry. It holds two maps:
 
 Every operation re-reads the file: it is small, it is written rarely, and
 reading fresh is what keeps two service processes on the same output root
-from clobbering each other's view.
+from clobbering each other's view. The read-modify-write itself is
+serialized across threads and processes by an advisory lock file beside
+the index, so one writer's update is never lost to another's, and two
+writers never hold the temporary file that atomic replacement swaps in.
 """
 
 from __future__ import annotations
@@ -30,16 +33,43 @@ from __future__ import annotations
 import json
 import os
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 
+from service_files import ExclusiveFileLock
+
 INDEX_FILE_NAME = "preview-index.json"
+LOCK_FILE_NAME = ".preview-index.lock"
 INDEX_SCHEMA = "spiral-preview-index/1"
+# The index is small and written briefly, so a real wait for it is short.
+# The cap exists only so a holder that is wedged (not crashed: a crashed
+# process releases its lock) surfaces as an error instead of a hang.
+LOCK_TIMEOUT_SECONDS = 60.0
 
 
 class PublishedPreviewIndex:
     def __init__(self, output_directory):
         self.path = Path(output_directory) / ".spiral-published" / INDEX_FILE_NAME
         self._lock = threading.Lock()
+        # Serializes this instance's operations; the file lock below
+        # serializes read-modify-write across every instance and process.
+        self._file_lock = ExclusiveFileLock(
+            self.path.with_name(LOCK_FILE_NAME))
+
+    @contextmanager
+    def _locked(self):
+        """One whole read-modify-write cycle, serialized everywhere.
+
+        The thread lock keeps one instance's threads from interleaving
+        their cycles; the file lock extends the same critical section
+        across every instance and process that shares the index file.
+        """
+        with self._lock:
+            self._file_lock.acquire(timeout=LOCK_TIMEOUT_SECONDS)
+            try:
+                yield
+            finally:
+                self._file_lock.release()
 
     # -- storage ---------------------------------------------------------
 
@@ -60,10 +90,14 @@ class PublishedPreviewIndex:
     def _store(self, document):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_name(f".{self.path.name}.incoming")
-        temporary.write_text(
-            json.dumps(document, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8")
-        os.replace(temporary, self.path)
+        try:
+            temporary.write_text(
+                json.dumps(document, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8")
+            os.replace(temporary, self.path)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
 
     # -- validation ------------------------------------------------------
 
@@ -106,7 +140,7 @@ class PublishedPreviewIndex:
         """Remember that ``manifest_path`` is the published surface of ``digest``."""
         if not digest:
             return
-        with self._lock:
+        with self._locked():
             document = self._load()
             self._drop_dead_entries_locked(document)
             document["previews"][str(digest)] = {
@@ -121,7 +155,7 @@ class PublishedPreviewIndex:
         """Record that the checkpoint at ``checkpoint_path`` has ``digest``."""
         if not checkpoint_path or not digest:
             return
-        with self._lock:
+        with self._locked():
             document = self._load()
             self._drop_dead_entries_locked(document)
             document["pins"][str(checkpoint_path)] = str(digest)
@@ -131,7 +165,7 @@ class PublishedPreviewIndex:
         """The live published entry for ``digest``, or None."""
         if not digest:
             return None
-        with self._lock:
+        with self._locked():
             document = self._load()
             if self._drop_dead_entries_locked(document):
                 self._store(document)
@@ -140,7 +174,7 @@ class PublishedPreviewIndex:
 
     def pinned_roots(self):
         """Published generation directories a live checkpoint still names."""
-        with self._lock:
+        with self._locked():
             document = self._load()
             if self._drop_dead_entries_locked(document):
                 self._store(document)
