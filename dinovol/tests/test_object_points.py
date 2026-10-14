@@ -544,6 +544,55 @@ class ObjectLossTrainingTests(unittest.TestCase):
         resumed._close_auxiliary_datasets()
         base._close_auxiliary_datasets()
 
+    def test_napari_visualizer_dense_and_ink_embeddings(self):
+        from dinovol_2.eval.napari_visualizer import (
+            compute_patch_embedding_grid,
+            load_backbone_from_checkpoint,
+            resolve_z_slab_bounds,
+        )
+
+        self.assertEqual(resolve_z_slab_bounds(14000, z_center=5000.0, z_slab_thickness=128), (4936, 5064))
+        self.assertEqual(resolve_z_slab_bounds(14000, z_center=20.0, z_slab_thickness=128), (0, 128))
+        self.assertEqual(resolve_z_slab_bounds(14000, z_center=13990.0, z_slab_thickness=128), (13872, 14000))
+        self.assertEqual(resolve_z_slab_bounds(14000, z_center=5000.0, z_slab_thickness=0), (0, 14000))
+
+        trainer = DinoIBOTPretrainer(self.config(objects=True, output="napari_dense"))
+        try:
+            checkpoint = trainer.save_checkpoint(0)
+        finally:
+            trainer._close_auxiliary_datasets()
+
+        loaded = load_backbone_from_checkpoint(checkpoint, device="cpu")
+        self.assertIsNotNone(loaded.dense_head)
+
+        volume = np.random.default_rng(0).random((16, 16, 16), dtype=np.float32)
+        patch_grid, src_shape, pad_shape = compute_patch_embedding_grid(
+            volume,
+            loaded,
+            embedding_source="patch",
+        )
+        self.assertEqual(src_shape, (16, 16, 16))
+        self.assertEqual(pad_shape, (16, 16, 16))
+        self.assertEqual(patch_grid.shape[:3], (2, 2, 2))
+
+        dense_grid, _, _ = compute_patch_embedding_grid(
+            volume,
+            loaded,
+            embedding_source="dense",
+            dense_stride=2,
+        )
+        self.assertEqual(dense_grid.shape, (8, 8, 8, 16))
+        self.assertTrue(np.allclose(np.linalg.norm(dense_grid, axis=-1), 1.0, atol=1e-4))
+
+        ink_grid, _, _ = compute_patch_embedding_grid(
+            volume,
+            loaded,
+            embedding_source="ink",
+            dense_stride=2,
+        )
+        self.assertEqual(ink_grid.shape, (8, 8, 8, 16))
+        self.assertTrue(np.allclose(np.linalg.norm(ink_grid, axis=-1), 1.0, atol=1e-4))
+
 
 if __name__ == "__main__":
     unittest.main()
