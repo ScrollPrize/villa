@@ -35,7 +35,8 @@ PX = 520
 
 
 def topology(m):
-    vols = np.array([abs(c.volume) for c in m.split(only_watertight=False)])
+    labels = trimesh.graph.connected_component_labels(m.face_adjacency, node_count=len(m.faces))
+    vols = np.array([abs(m.submesh([labels == i], append=True).volume) for i in np.unique(labels)])
     _, cnt = np.unique(np.sort(m.edges, axis=1), axis=0, return_counts=True)
     return (f"faces {len(m.faces)}, finite {np.isfinite(m.vertices).all()}, winding consistent {m.is_winding_consistent}, "
             f"boundary edges {(cnt == 1).sum()}, non-manifold edges {(cnt > 2).sum()}, components {len(vols)} "
