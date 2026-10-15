@@ -10,6 +10,7 @@
 #include "utils/Json.hpp"
 #include <opencv2/core.hpp>
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -159,6 +160,154 @@ TEST_CASE("writeZarrAttrs derives per-axis scale from slice step and pixel densi
     CHECK(s2[0] == doctest::Approx(24.0));
     CHECK(s2[1] == doctest::Approx(16.0));
     CHECK(s2[2] == doctest::Approx(16.0));
+    fs::remove_all(d);
+}
+
+TEST_CASE("buildMultiscales keeps the multiscales structure when the physical size is unknown")
+{
+    // The review finding: omitting the whole block traded a dubious scale for a
+    // document a reader no longer recognises as a multiscale image. The block is
+    // discovery metadata and has to survive.
+    const auto ms = buildMultiscales(/*baseVoxelSize=*/0.0, /*voxelUnit=*/"",
+                                     /*sliceStep=*/3.0, /*pixelsPerVoxel=*/2.0);
+
+    CHECK(ms.is_object());
+    CHECK(ms["version"] == "0.4");
+    CHECK(ms["name"] == "render");
+
+    // Axes are still described, so the array dimensionality is discoverable.
+    REQUIRE(ms["axes"].is_array());
+    REQUIRE(ms["axes"].size() == 3);
+    CHECK(ms["axes"][size_t(0)]["name"] == "z");
+    CHECK(ms["axes"][size_t(1)]["name"] == "y");
+    CHECK(ms["axes"][size_t(2)]["name"] == "x");
+    for (size_t a = 0; a < 3; ++a) {
+        CHECK(ms["axes"][a]["type"] == "space");
+    }
+
+    // All six levels are still listed in resolution order.
+    REQUIRE(ms["datasets"].is_array());
+    REQUIRE(ms["datasets"].size() == 6);
+    for (size_t l = 0; l < 6; ++l) {
+        CHECK(ms["datasets"][l]["path"] == std::to_string(l));
+    }
+}
+
+TEST_CASE("buildMultiscales declares no physical unit when the size is unknown")
+{
+    const auto ms = buildMultiscales(/*baseVoxelSize=*/0.0,
+                                     /*voxelUnit=*/"micrometer",
+                                     /*sliceStep=*/1.0, /*pixelsPerVoxel=*/1.0);
+    // A unit is the one thing that must never appear without a measurement, and
+    // it must not appear even if a caller passes one alongside a zero size.
+    for (size_t a = 0; a < 3; ++a) {
+        CHECK_FALSE(ms["axes"][a].contains("unit"));
+    }
+    CHECK(ms["metadata"]["physical_size"] == "unknown");
+}
+
+TEST_CASE("buildMultiscales treats a non-positive size as unknown")
+{
+    // The renderer signals "no measurement" with 0; a negative value must not be
+    // mistaken for a physical size either.
+    for (const double bad : {0.0, -1.0, -0.001}) {
+        const auto ms = buildMultiscales(bad, "micrometer", 1.0, 1.0);
+        CHECK_FALSE(ms["axes"][size_t(0)].contains("unit"));
+        CHECK(ms["metadata"]["physical_size"] == "unknown");
+        auto s0 = ms["datasets"][size_t(0)]["coordinateTransformations"][size_t(0)]["scale"]
+                    .get_double_array();
+        REQUIRE(s0.size() == 3);
+        CHECK(s0[0] == doctest::Approx(1.0));
+        CHECK(s0[1] == doctest::Approx(1.0));
+        CHECK(s0[2] == doctest::Approx(1.0));
+    }
+}
+
+TEST_CASE("buildMultiscales writes relative pyramid scaling when the size is unknown")
+{
+    // OME-NGFF 0.4: when a physical scale is unavailable the scale value MUST
+    // express the factor between this level and the first. Level 0 is therefore
+    // the identity, and Y/X double per level because createPyramidDatasets halves
+    // only Y/X while Z is unchanged.
+    const auto ms = buildMultiscales(/*baseVoxelSize=*/-1.0, /*voxelUnit=*/"",
+                                     /*sliceStep=*/3.0, /*pixelsPerVoxel=*/2.0);
+    auto scaleAt = [&](size_t level) {
+        return ms["datasets"][level]["coordinateTransformations"][size_t(0)]["scale"]
+                .get_double_array();
+    };
+    for (size_t l = 0; l < 6; ++l) {
+        auto s = scaleAt(l);
+        REQUIRE(s.size() == 3);
+        const double factor = std::pow(2.0, static_cast<double>(l));
+        CHECK(s[0] == doctest::Approx(1.0));   // Z does not downsample
+        CHECK(s[1] == doctest::Approx(factor));
+        CHECK(s[2] == doctest::Approx(factor));
+    }
+    // The transformation list keeps the order the spec requires: scale first.
+    CHECK(ms["datasets"][size_t(0)]["coordinateTransformations"][size_t(0)]["type"] == "scale");
+    CHECK(ms["datasets"][size_t(0)]["coordinateTransformations"][size_t(1)]["type"] == "translation");
+}
+
+TEST_CASE("buildMultiscales keeps the physical scale and unit when the size is known")
+{
+    // The known-size path must be untouched by the unknown-size fix: same
+    // physical scales, same units, same relative growth per level.
+    const auto ms = buildMultiscales(/*baseVoxelSize=*/8.0,
+                                     /*voxelUnit=*/"micrometer",
+                                     /*sliceStep=*/3.0, /*pixelsPerVoxel=*/2.0);
+    for (size_t a = 0; a < 3; ++a) {
+        REQUIRE(ms["axes"][a].contains("unit"));
+        CHECK(ms["axes"][a]["unit"] == "micrometer");
+    }
+    CHECK_FALSE(ms["metadata"].contains("physical_size"));
+    auto scaleAt = [&](size_t level) {
+        return ms["datasets"][level]["coordinateTransformations"][size_t(0)]["scale"]
+                .get_double_array();
+    };
+    auto s0 = scaleAt(0);
+    REQUIRE(s0.size() == 3);
+    CHECK(s0[0] == doctest::Approx(24.0));  // 8 um * slice step 3
+    CHECK(s0[1] == doctest::Approx(4.0));   // 8 um / 2 pixels-per-voxel
+    CHECK(s0[2] == doctest::Approx(4.0));
+    auto s2 = scaleAt(2);
+    REQUIRE(s2.size() == 3);
+    CHECK(s2[0] == doctest::Approx(24.0));  // Z spacing is per-slice, unchanged
+    CHECK(s2[1] == doctest::Approx(16.0));  // Y/X quadruple at level 2
+    CHECK(s2[2] == doctest::Approx(16.0));
+}
+
+TEST_CASE("writeZarrAttrs keeps multiscales and only relative scaling when the size is unknown")
+{
+    // The end of the same path: whatever buildMultiscales() returns must reach the
+    // .zattrs file, and the rest of the attribute set must be unaffected.
+    auto d = tmpDir("attrs_unknown_size");
+    writeZarrAttrs(/*outDir=*/d, /*volPath=*/d,
+                   /*groupIdx=*/0, /*baseZ=*/64,
+                   /*sliceStep=*/3.0, /*accumStep=*/0.0,
+                   /*accumTypeStr=*/"max", /*accumSamples=*/0,
+                   /*canvasSize=*/cv::Size(64, 64),
+                   /*CZ=*/32, /*CH=*/32, /*CW=*/32,
+                   /*baseVoxelSize=*/0.0, /*voxelUnit=*/"",
+                   /*pixelsPerVoxel=*/2.0);
+    CHECK(fs::exists(d / ".zattrs"));
+    auto j = utils::Json::parse_file(d / ".zattrs");
+    REQUIRE(j.contains("multiscales"));
+    REQUIRE(j["multiscales"].is_array());
+    REQUIRE(j["multiscales"].size() == 1);
+    const auto& ms = j["multiscales"][size_t(0)];
+    REQUIRE(ms["axes"].is_array());
+    REQUIRE(ms["datasets"].is_array());
+    REQUIRE(ms["datasets"].size() == 6);
+    for (size_t a = 0; a < 3; ++a) CHECK_FALSE(ms["axes"][a].contains("unit"));
+    auto s1 = ms["datasets"][size_t(1)]["coordinateTransformations"][size_t(0)]["scale"]
+                .get_double_array();
+    REQUIRE(s1.size() == 3);
+    CHECK(s1[0] == doctest::Approx(1.0));
+    CHECK(s1[1] == doctest::Approx(2.0));
+    CHECK(s1[2] == doctest::Approx(2.0));
+    // The non-multiscales attributes still describe the render.
+    CHECK(j["num_slices"] == 64);
+    CHECK(j["note_axes_order"] == "ZYX (slice, row, col)");
     fs::remove_all(d);
 }
 

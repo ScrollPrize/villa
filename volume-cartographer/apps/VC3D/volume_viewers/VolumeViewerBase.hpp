@@ -69,9 +69,11 @@ public:
     // SurfaceProjection / SurfaceProjectionContext live in
     // volume_viewers/SurfaceProjection.hpp; see it for what the split is for.
 
-    // nullopt when the point does not project onto the displayed surface.
+    // nullopt when the point does not project onto the displayed surface or,
+    // for quad surfaces, lies more than `depthTolerance` outside the
+    // displayed depth band.
     virtual std::optional<SurfaceProjection> projectVolumePoint(
-        const cv::Vec3f& vol_point) const = 0;
+        const cv::Vec3f& vol_point, float depthTolerance) const = 0;
     virtual QPointF surfaceProjectionToScene(const SurfaceProjection& projection) const = 0;
     virtual SurfaceProjectionContext surfaceProjectionContext() const = 0;
 

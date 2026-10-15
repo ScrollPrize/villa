@@ -27,6 +27,16 @@ struct FiberMapDependencies {
     // covering a file changing underneath VC3D, which no counter reports.
     QString umbilicusFingerprint;
     vc3d::annotation::AnnotationFrame frame;
+    // Which catalog volume the current volume is
+    // (catalogVolumeOfCoordinateSpace of its coordinate-space tag: sample
+    // and volume, no pyramid level; empty when untagged): the catalog entry
+    // the winding sense is read from, and an identity the grid comparison
+    // can miss (a same-grid store of another volume). And the version of
+    // the cached catalog manifest a rebuild would read it from
+    // (CatalogVolumeOrientationLookup::manifestToken; empty when the space
+    // is empty, so an untagged volume never depends on the manifest).
+    QString catalogVolume;
+    QString catalogManifestToken;
 };
 
 // What a comparison concluded, separately from acting on it.
@@ -46,10 +56,15 @@ struct StaleVerdict {
         None,
         Package,
         Grid,
+        // Same grid, another catalog volume (or none): like Grid, usually
+        // the user looking at another volume for now, so not auto-updated.
+        Volume,
         VoxelSize,
         Latched,
         Fibers,
         Umbilicus,
+        // The cached catalog manifest the winding sense is read from moved.
+        Catalog,
     };
     Action action = Action::Fresh;
     Cause cause = Cause::None;
@@ -119,6 +134,19 @@ inline StaleVerdict staleVerdictFor(const FiberMapDependencies& built,
         return verdict;
     }
 
+    // Same grid, another catalog volume (a second store of a scan, or an
+    // untagged one): the winding sense is read per catalog volume, so the
+    // map may be laid out in the other's sense. Usually the user is looking
+    // at that volume for now, so it reads like Grid: stale, reverting when
+    // they switch back, never rebuilt into automatically.
+    if (current.catalogVolume != built.catalogVolume) {
+        verdict.action = StaleVerdict::Action::MarkStale;
+        verdict.cause = StaleVerdict::Cause::Volume;
+        verdict.reason = QObject::tr(
+            "viewing another catalog volume — switch back, or press Update");
+        return verdict;
+    }
+
     // Same voxels, different physical scale. Two stores of one scan can disagree
     // here -- PHerc0139_ds2's raw and surf pair are byte-identical in voxel counts
     // and 2.5% apart in recorded voxel size. Not meaningless, so this does not
@@ -152,6 +180,16 @@ inline StaleVerdict staleVerdictFor(const FiberMapDependencies& built,
         verdict.action = StaleVerdict::Action::MarkStale;
         verdict.cause = StaleVerdict::Cause::Umbilicus;
         verdict.reason = QObject::tr("Umbilicus changed — press Update");
+        return verdict;
+    }
+
+    // The catalog manifest the winding sense is read from was replaced
+    // (the catalog window refreshed it): whether the answer moved is only
+    // known by parsing it, which a rebuild does.
+    if (current.catalogManifestToken != built.catalogManifestToken) {
+        verdict.action = StaleVerdict::Action::MarkStale;
+        verdict.cause = StaleVerdict::Cause::Catalog;
+        verdict.reason = QObject::tr("catalog changed — press Update");
         return verdict;
     }
 

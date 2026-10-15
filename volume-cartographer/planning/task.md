@@ -1,5 +1,6 @@
-# Sharded Zarr Double Decode
+# Selective catalog project creation
 
-Fix compressed Zarr inner chunks being decoded twice in the whole-storage-object
-path used by the viewer cache. Branch from current main and present the PR title
-and body for approval before publishing.
+Add Create Project beside Open Sample. Nothing selected initially. Independently
+select source volumes, representations by type, and segments. Choose project name
+and JSON destination, save and immediately open. Reuse existing attachment logic.
+Also create the standard per-project fiber directory even before any fibers exist.

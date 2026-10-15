@@ -1,5 +1,24 @@
 find_package(Qt6 REQUIRED COMPONENTS Concurrent Core Network Test Widgets)
 
+add_executable(test_catalog_project_dialog
+    test_catalog_project_dialog.cpp
+    ../OpenDataCatalogWindow.cpp
+    ../OpenDataManifest.cpp
+    ../OpenDataSampleProject.cpp
+    ../OpenDataLasagna.cpp
+    ../OpenDataNormalGrids.cpp
+    ../OpenDataSegmentCache.cpp
+    ../OpenDataSegmentCacheIO.cpp)
+set_target_properties(test_catalog_project_dialog PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_catalog_project_dialog PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_catalog_project_dialog PRIVATE
+    Qt6::Core Qt6::Widgets Qt6::Test Qt6::Concurrent vc_core vc_lasagna)
+add_test(NAME catalog_project_dialog COMMAND test_catalog_project_dialog)
+vc_register_test_target(test_catalog_project_dialog)
+vc_register_ctest(catalog_project_dialog test_catalog_project_dialog)
+set_tests_properties(catalog_project_dialog PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
+
 add_executable(test_line_annotation_adjacent_links test_line_annotation_adjacent_links.cpp)
 set_target_properties(test_line_annotation_adjacent_links PROPERTIES
     AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
@@ -398,6 +417,28 @@ add_test(NAME annotation_frame COMMAND test_annotation_frame)
 vc_register_test_target(test_annotation_frame)
 vc_register_ctest(annotation_frame test_annotation_frame)
 
+add_executable(test_open_data_volume_orientation
+    test_open_data_volume_orientation.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataVolumeOrientation.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataVolumeOrientation.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.hpp)
+
+set_target_properties(test_open_data_volume_orientation PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_open_data_volume_orientation PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_open_data_volume_orientation PRIVATE
+    vc_core
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME open_data_volume_orientation COMMAND test_open_data_volume_orientation)
+vc_register_test_target(test_open_data_volume_orientation)
+vc_register_ctest(open_data_volume_orientation test_open_data_volume_orientation)
+
 add_executable(test_fiber_map_staleness
     test_fiber_map_staleness.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapStaleness.hpp
@@ -520,6 +561,43 @@ target_link_libraries(test_fiber_map_ruler_math PRIVATE
 add_test(NAME fiber_map_ruler_math COMMAND test_fiber_map_ruler_math)
 vc_register_test_target(test_fiber_map_ruler_math)
 vc_register_ctest(fiber_map_ruler_math test_fiber_map_ruler_math)
+
+add_executable(test_fiber_length_display
+    test_fiber_length_display.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberLengthDisplay.hpp)
+
+set_target_properties(test_fiber_length_display PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_fiber_length_display PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_fiber_length_display PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME fiber_length_display COMMAND test_fiber_length_display)
+vc_register_test_target(test_fiber_length_display)
+vc_register_ctest(fiber_length_display test_fiber_length_display)
+
+add_executable(test_fiber_map_kollesis
+    test_fiber_map_kollesis.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapKollesis.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapKollesis.hpp)
+
+set_target_properties(test_fiber_map_kollesis PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_fiber_map_kollesis PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_fiber_map_kollesis PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME fiber_map_kollesis COMMAND test_fiber_map_kollesis)
+vc_register_test_target(test_fiber_map_kollesis)
+vc_register_ctest(fiber_map_kollesis test_fiber_map_kollesis)
 
 add_executable(test_line_annotation_fiber_deletion
     test_line_annotation_fiber_deletion.cpp

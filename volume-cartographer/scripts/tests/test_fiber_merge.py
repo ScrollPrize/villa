@@ -589,7 +589,7 @@ def test_short_circuit_local_unchanged():
     remote = make_fiber(BASE_CPS, tags=['new'], generation=4)
     result = merge_fibers(base, copy.deepcopy(base), remote)
     assert result['ok']
-    assert result['merged'] == remote
+    assert result['merged'] == dict(remote, width_gap_fraction=0.2)
     # A wholesale-adopted side is already consistent with its peers
     assert result['peer_files'] == []
 
@@ -598,7 +598,7 @@ def test_noop_stability():
     base = make_fiber(BASE_CPS)
     result = merge_fibers(base, copy.deepcopy(base), copy.deepcopy(base))
     assert result['ok']
-    assert result['merged'] == base
+    assert result['merged'] == dict(base, width_gap_fraction=0.2)
 
 
 def test_tolerance_bounds():
@@ -1279,7 +1279,7 @@ def test_short_circuit_merges_still_report_peers():
     remote = make_fiber(BASE_CPS, branches=[entry], tags=['new'], generation=4)
     result = merge_fibers(base, copy.deepcopy(base), remote)
     assert result['ok']
-    assert result['merged'] == remote
+    assert result['merged'] == dict(remote, width_gap_fraction=0.2)
     assert result['peer_files'] == ['kb_a.json']
 
 
@@ -1659,7 +1659,7 @@ def test_v3_short_circuit_merge_then_refresh(changed_side):
     result = merge_fibers(base_a, local, remote)
     assert result['ok'], result['conflicts']
     assert result['peer_files'] == ['b.json']
-    assert result['merged'] == changed
+    assert result['merged'] == dict(changed, width_gap_fraction=0.2)
 
     out = refresh_pair_links(result['merged'], b, 'a.json', 'b.json',
                              base_doc=base_a)
@@ -1766,6 +1766,104 @@ def test_v3_interior_control_point_tag_survives_a_separated_remote_span_change()
     assert loader_issues({'dj_x_000001.json': merged}) == []
 
 
+def test_display_metadata_merges_independently_of_geometry():
+    base = make_v3_fiber(BASE_CPS)
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    local['width'] = 24
+    local['control_points'][0]['display_normal'] = [0, 1, 0]
+    remote['control_points'][1]['display_normal'] = [0, 0, 1]
+    set_v3_span(remote, 5, goal='lasagna', bend=-2.0)
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['width'] == 24
+    assert result['merged']['control_points'][0]['display_normal'] == [0, 1, 0]
+    assert result['merged']['control_points'][1]['display_normal'] == [0, 0, 1]
+    assert result['merged']['control_points'][5]['segment_to_next']['interp_goal'] == 'lasagna'
+
+
+def test_display_metadata_conflicts_and_reset():
+    base = make_v3_fiber(BASE_CPS)
+    base['control_points'][0]['display_normal'] = [0, 1, 0]
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    del local['control_points'][0]['display_normal']
+    remote['width'] = 12
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert 'display_normal' not in result['merged']['control_points'][0]
+    remote['control_points'][0]['display_normal'] = [0, 0, 1]
+    assert not merge_fibers(base, local, remote)['ok']
+
+
+def test_display_normal_provenance_merges_with_normal():
+    base = make_v3_fiber(BASE_CPS)
+    base['control_points'][0]['display_normal'] = [0, 1, 0]
+    base['control_points'][0]['display_normal_source'] = 'interpolated'
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    local['control_points'][0]['display_normal_source'] = 'manual'
+    remote['width'] = 24
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['control_points'][0]['display_normal_source'] == 'manual'
+    # Provenance must not detach from a concurrently changed vector.
+    remote['control_points'][0]['display_normal'] = [0, 0, 1]
+    assert not merge_fibers(base, local, remote)['ok']
+
+
+def test_display_normal_provenance_legacy_and_validation():
+    base = make_v3_fiber(BASE_CPS)
+    base['control_points'][0]['display_normal'] = [0, 1, 0]
+    result = merge_fibers(base, base, base)
+    assert result['ok']
+    assert result['merged']['control_points'][0]['display_normal_source'] == 'unknown'
+    base['control_points'][0]['display_normal_source'] = 'invalid'
+    assert not merge_fibers(base, base, base)['ok']
+
+
+def test_width_gap_defaults_and_three_way_merge():
+    base = make_v3_fiber(BASE_CPS)
+    assert merge_fibers(base, base, base)['merged']['width_gap_fraction'] == 0.2
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    local['width_gap_fraction'] = 0.3
+    remote['width'] = 15
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['width_gap_fraction'] == 0.3
+    assert result['merged']['width'] == 15
+    assert merge_fibers(base, base, local)['merged']['width_gap_fraction'] == 0.3
+    remote['width_gap_fraction'] = 0.4
+    assert not merge_fibers(base, local, remote)['ok']
+    for bad in [-0.1, 1.1, '20%', None, True]:
+        local['width_gap_fraction'] = bad
+        assert not fiber_merge.is_fiber_doc(local)
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    local['width'], remote['width'] = 10, 20
+    assert not merge_fibers(base, local, remote)['ok']
+
+
+@pytest.mark.parametrize('version', [3, 4])
+def test_cp_directions_merge_validate_and_preserve_sign(version):
+    base = make_v3_fiber(BASE_CPS)
+    base['version'] = version
+    if version == 4:
+        base['control_points'][0]['segment_to_next']['tags'] = ['damaged']
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    local['control_points'][0]['direction'] = [1, 0, 0]
+    remote['control_points'][0]['direction'] = [1, 0, 0]
+    remote['width'] = 20
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['control_points'][0]['direction'] == [1, 0, 0]
+    assert result['merged']['width'] == 20
+    assert result['merged']['version'] == version
+    if version == 4:
+        assert result['merged']['control_points'][0]['segment_to_next']['tags'] == ['damaged']
+    remote['control_points'][0]['direction'] = [-1, 0, 0]
+    assert not merge_fibers(base, local, remote)['ok']
+    for invalid in ([0, 0, 0], [1, 2], [float('nan'), 0, 1]):
+        local['control_points'][0]['direction'] = invalid
+        assert not fiber_merge.is_fiber_doc(local)
+
+
 def test_v3_tagging_and_refitting_the_same_final_span_is_a_manual_conflict():
     base = make_v3_fiber(BASE_CPS)
     local = copy.deepcopy(base)
@@ -1779,6 +1877,107 @@ def test_v3_tagging_and_refitting_the_same_final_span_is_a_manual_conflict():
 
     assert not result['ok']
     assert any('changed differently on both sides' in c for c in result['conflicts'])
+
+
+FIBER_UUID_A = '0f8fad5b-d9cb-469f-a165-70867728950e'
+FIBER_UUID_B = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
+
+
+def test_is_fiber_doc_rejects_present_but_invalid_uuid():
+    doc = make_fiber(BASE_CPS)
+    assert fiber_merge.is_fiber_doc(doc)  # legacy: no uuid
+    doc['uuid'] = FIBER_UUID_A
+    assert fiber_merge.is_fiber_doc(doc)
+    doc['uuid'] = FIBER_UUID_A.upper()  # isxdigit accepts either case
+    assert fiber_merge.is_fiber_doc(doc)
+    for bad in ('dj_x_000001', '', None, 7, FIBER_UUID_A + '0',
+                FIBER_UUID_A.replace('-', '')):
+        doc['uuid'] = bad
+        assert not fiber_merge.is_fiber_doc(doc), bad
+
+
+def test_differing_uuids_are_a_conflict_not_a_generation_pick():
+    base = make_fiber(BASE_CPS)
+    base['uuid'] = FIBER_UUID_A
+    local = make_fiber(BASE_CPS, tags=['x'], generation=3)
+    remote = make_fiber(BASE_CPS, tags=['y'], generation=2)
+    local['uuid'] = FIBER_UUID_A
+    remote['uuid'] = FIBER_UUID_B
+    result = merge_fibers(base, local, remote)
+    assert not result['ok']
+    assert any("'uuid' differs" in c for c in result['conflicts'])
+    # An established identity mismatch with different content stays a conflict.
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    remote['uuid'] = FIBER_UUID_B
+    remote['tags'] = ['changed']
+    assert not merge_fibers(base, local, remote)['ok']
+
+
+def test_identical_named_content_adopts_remote_uuid_without_mutating_inputs():
+    base = make_fiber(BASE_CPS)
+    base['uuid'] = FIBER_UUID_A
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    remote['uuid'] = FIBER_UUID_B
+    before = copy.deepcopy((base, local, remote))
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['uuid'] == FIBER_UUID_B
+    assert result['merged']['generation'] == remote['generation']
+    assert (base, local, remote) == before
+
+
+def test_legacy_base_allows_independent_uuid_migration_and_tag_edits():
+    base = make_fiber(BASE_CPS)
+    local = {**copy.deepcopy(base), 'uuid': FIBER_UUID_A, 'tags': ['local']}
+    remote = {**copy.deepcopy(base), 'uuid': FIBER_UUID_B, 'tags': ['remote']}
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['uuid'] == FIBER_UUID_B
+    assert set(result['merged']['tags']) == {'local', 'remote'}
+
+
+@pytest.mark.parametrize('field,value', [
+    ('filename', 'different.json'), ('generation', 2),
+    ('tags', ['changed']), ('unknown_metadata', {'uuid': FIBER_UUID_B}),
+    ('control_points', [cp(0), cp(1, dz=1)]),
+])
+def test_same_fiber_content_ignores_only_top_level_uuid(field, value):
+    local = make_fiber(BASE_CPS)
+    remote = {**copy.deepcopy(local), 'uuid': FIBER_UUID_B}
+    assert fiber_merge.same_fiber_content(local, remote)
+    remote[field] = value
+    assert not fiber_merge.same_fiber_content(local, remote)
+
+
+@pytest.mark.parametrize('filename', [None, '', 42])
+def test_same_fiber_content_requires_a_filename(filename):
+    doc = {**make_fiber(BASE_CPS), 'filename': filename}
+    assert not fiber_merge.same_fiber_content(doc, doc)
+
+
+def test_uuid_survives_merge_from_either_side():
+    base = make_fiber(BASE_CPS)
+    # Newer (remote) side is legacy; local carries the uuid.
+    local = make_fiber(BASE_CPS, tags=['x'], generation=2)
+    remote = make_fiber(BASE_CPS, tags=['y'], generation=5)
+    local['uuid'] = FIBER_UUID_A
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['uuid'] == FIBER_UUID_A
+    # Short circuit: local unchanged, remote (without uuid) taken.
+    base['uuid'] = FIBER_UUID_A
+    local = copy.deepcopy(base)
+    remote = make_fiber(BASE_CPS, tags=['y'], generation=2)
+    result = merge_fibers(base, local, remote)
+    assert result['ok'] and result['merged']['uuid'] == FIBER_UUID_A
+    # Same uuid on both sides is the ordinary case.
+    remote['uuid'] = FIBER_UUID_A
+    local = make_fiber(BASE_CPS, tags=['x'], generation=3)
+    local['uuid'] = FIBER_UUID_A
+    result = merge_fibers(base, local, remote)
+    assert result['ok'] and result['merged']['uuid'] == FIBER_UUID_A
 
 
 def test_is_fiber_doc_accepts_the_break_tag():
