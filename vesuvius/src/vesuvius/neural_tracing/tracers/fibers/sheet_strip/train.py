@@ -333,7 +333,7 @@ def main(argv=None):
     (out/'run.json').write_text(json.dumps(run.to_dict(), indent=1)+'\n')
     (out/'config.json').write_text(json.dumps(cfg.to_dict(), indent=1, default=str)+'\n')
     model, ema, report = initialize(cfg, checkpoint, device)
-    fresh = set(report['fresh'])
+    fresh = set(report['fresh'])|set(checkpoint.get('new_params', ()))  # transfer.py's added modules
     params = dict(model.named_parameters())
     groups = [dict(params=[p for n, p in params.items() if n not in fresh], lr_scale=1.),
               dict(params=[p for n, p in params.items() if n in fresh], lr_scale=t.new_lr_scale)]

@@ -85,6 +85,9 @@ class CropTransformerArchitecture:
     multiscale_fine_width: int | None = None
     multiscale_coarse_pool: int = 2
     multiscale_coarse_channels: tuple | None = None  # the coarse CNN's channels per stage; None: cnn_channels
+    # > 0: the (fine) CNN ends in a stride-2 context block of this many channels, added back to its last map
+    # (models/blocks.CropCNN ``context``; starts without influence). Wide context without a second, coarse CNN.
+    cnn_context_channels: int = 0
     # Per-head RMS normalization of attention queries and keys (models/blocks.py). Unbounded, the flow model's adaLN
     # time modulation of the path tokens grew their q/k norms until path attention saturated and training diverged.
     qk_norm: bool = False
@@ -222,9 +225,10 @@ class CropTransformer(nn.Module):
         super().__init__()
         self.cfg, self.model_type = cfg, cfg.model_type
         h, cells = cfg.hidden, cfg.cnn_channels[-1]
-        cnn = lambda channels: CropCNN(channels, cfg.cnn_stage_strides, cfg.cnn_blocks, stem=cfg.cnn_stem,
-                                       activation=cfg.cnn_activation, in_channels=cfg.input_channels)
-        self.cnn = cnn(cfg.cnn_channels)  # the whole crop, or a multiscale CNN's fine box
+        cnn = lambda channels, context=0: CropCNN(channels, cfg.cnn_stage_strides, cfg.cnn_blocks, stem=cfg.cnn_stem,
+                                                  activation=cfg.cnn_activation, in_channels=cfg.input_channels,
+                                                  context=context)
+        self.cnn = cnn(cfg.cnn_channels, cfg.cnn_context_channels)  # the whole crop, or a multiscale CNN's fine box
         self.levels = feature_levels(cfg)
         level_channels = (cells,)
         if len(self.levels) > 1:

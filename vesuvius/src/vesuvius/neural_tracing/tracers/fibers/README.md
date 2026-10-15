@@ -245,8 +245,10 @@ mean error against 6.89 for the frame plane, with 82% of points within 2 voxels.
 renders, sharded over processes. Each strip is written as a tifxyz in `OUT/strips/BUCKET/fiber_ID`, with
 `expected_error.tif` when the model predicts its error. An H fiber runs along the strip's columns and a V fiber along
 its rows, higher z at the top (row 0); the TIFFs are uncompressed single strips, which VC3D memory-maps as written
-(it rewrites tiled LZW bands in place before mapping them). Finished fibers are listed in `OUT/index/shard_K.jsonl`,
-and a restarted shard skips them:
+(it rewrites tiled LZW bands in place before mapping them). Nodes within `--trim` (default 75) patch voxels of either
+fiber end, or beyond it, are left out (-1): there the strip overhangs the fiber, rests on one or two decisions, and the
+annotated fiber's own ends are least reliable. Finished fibers are listed in `OUT/index/shard_K.jsonl`, and a
+restarted shard skips them:
 
 ```bash
 for k in $(seq 0 17); do

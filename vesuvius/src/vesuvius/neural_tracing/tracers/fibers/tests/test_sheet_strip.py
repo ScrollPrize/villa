@@ -284,3 +284,48 @@ def test_display_grid_puts_higher_z_on_top():
     # Already highest at the start: unchanged.
     rows, kept, _, layout = display_grid(vert[::-1], keep[::-1], None, 'V')
     assert not layout['fiber_reversed'] and np.array_equal(rows, vert[::-1])
+
+
+def test_trim_ends_drops_rows_near_and_beyond_the_fiber_ends():
+    """Rows (arclength -6 + 4 r) within 10 of either end of a 40-long fiber, or beyond it, are dropped; masked nodes
+    stay masked."""
+    from vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer_all import trim_ends
+    keep = np.ones((14, 3), bool)
+    keep[5, 1] = False
+    trimmed = trim_ends(keep, -6., 4., 40., 10.)
+    arc = -6.+4.*np.arange(14)
+    assert np.array_equal(trimmed.any(1), (arc >= 10) & (arc <= 30))
+    assert not trimmed[5, 1] and trimmed[5, 0]
+    assert np.array_equal(trim_ends(keep, -6., 4., 40., 0.).any(1), (arc >= 0) & (arc <= 40))
+
+
+def test_transfer_to_single_lattice_keeps_what_it_can():
+    """transfer.py: the widened fine CNN keeps the source's features (context block off at the start), a point
+    reader gives the source's output when the dropped coarse inputs sit at their mean, and the result runs."""
+    from vesuvius.neural_tracing.tracers.fibers.sheet_strip.transfer import POINT_READERS, map_columns, transfer
+    torch.manual_seed(0)
+    two_level = SheetStripConfig(**SMALL, **STRIP, strip_full_fine=True)
+    source = SheetStripFollower(two_level).eval()
+    cfg = SheetStripConfig(**{**two_level.to_dict(), 'multiscale_fine_width': None, 'strip_full_fine': False,
+                              'cnn_channels': (8, 24), 'cnn_context_channels': 16})
+    fine, coarse = two_level.cnn_channels[-1], two_level.multiscale_coarse_channels[-1]
+    means = {name: torch.randn(getattr(source, name)[0].in_features) for name in POINT_READERS}
+    state, new = transfer(source, cfg, means)
+    target = SheetStripFollower(cfg).eval()
+    target.load_state_dict(state)
+    assert new and all(n.startswith('cnn.context_') for n in new)
+    image = torch.randn(2, cfg.input_channels, cfg.fine.depth, cfg.fine.width, cfg.fine.width)
+    with torch.no_grad():
+        assert torch.allclose(target.cnn(image)[:, :fine], source.cnn(image), atol=1e-5)
+        # strip_query: one point (fine, coarse, support) and two anchor inputs; coarse at its mean.
+        old = source.strip_query[0]
+        x = torch.randn(5, old.in_features)
+        x[:, fine:fine+coarse] = means['strip_query'][fine:fine+coarse]
+        y = torch.cat((x[:, :fine], torch.randn(5, cfg.cnn_channels[-1]-fine), x[:, fine+coarse:]), 1)
+        w, b = map_columns((old.weight, old.bias), (target.strip_query[0].weight, target.strip_query[0].bias), 1,
+                           fine, coarse, True, means['strip_query'])
+        assert torch.allclose(y@w.T+b, old(x), atol=1e-5)
+        x_in, hist, hmask = inputs(cfg)
+        x_in['fine'] = torch.cat((x_in['fine'], torch.zeros_like(x_in['fine'])), 1)
+        heights = target.forward_strip(x_in, hist, hmask)
+    assert torch.isfinite(heights).all() and not hasattr(target, 'coarse_cnn')
