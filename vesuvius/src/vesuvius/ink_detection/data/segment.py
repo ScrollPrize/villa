@@ -128,6 +128,41 @@ def gather_segments(config: InkDataConfig) -> tuple[Segment, ...]:
     native_mode = config.mode in {"full_3d", "full_3d_single_wrap"}
     for dataset_idx, source in enumerate(config.active_datasets):
         allowlist = set(source.segment_names)
+        if allowlist and source.inklabels_paths and source.supervision_mask_paths:
+            # Fully-explicit dataset: every asset is a given path (local or
+            # remote), so there is nothing to discover on disk. segment_dir is
+            # kept as a symbolic value only (never dereferenced outside the
+            # native/tifxyz path, which fully-explicit datasets do not use).
+            for segment_name in sorted(allowlist):
+                if segment_name not in source.surface_volume_paths:
+                    raise KeyError(
+                        f"datasets[{dataset_idx}].surface_volume_paths has no entry "
+                        f"for segment {segment_name!r}"
+                    )
+                if segment_name not in source.inklabels_paths:
+                    raise KeyError(
+                        f"datasets[{dataset_idx}].inklabels_paths has no entry "
+                        f"for segment {segment_name!r}"
+                    )
+                if segment_name not in source.supervision_mask_paths:
+                    raise KeyError(
+                        f"datasets[{dataset_idx}].supervision_mask_paths has no entry "
+                        f"for segment {segment_name!r}"
+                    )
+                segments.append(
+                    Segment(
+                        data_config=config,
+                        source=source,
+                        dataset_idx=dataset_idx,
+                        segment_relpath=segment_name,
+                        segment_dir=Path(source.segments_path) / segment_name,
+                        segment_name=segment_name,
+                        image_volume=source.surface_volume_paths[segment_name],
+                        inklabels=source.inklabels_paths[segment_name],
+                        supervision_mask=source.supervision_mask_paths[segment_name],
+                    )
+                )
+            continue
         for segment_dir in sorted(source.segments_path.iterdir()):
             if not segment_dir.is_dir() or segment_dir.name == "unused":
                 continue

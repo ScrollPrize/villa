@@ -219,11 +219,31 @@ def read_bbox_with_padding(
     *,
     fill_value: int | float = 0,
 ) -> tuple[np.ndarray, tuple[slice, slice, slice] | None]:
-    """Read a positive ZYX bbox, padding only outside the array bounds."""
+    """Read a positive ZYX bbox, padding only outside the array bounds.
+
+    A 2D (Y, X) volume — some publishers ship label/supervision assets as a
+    flat map with no z-stack at all — has no z-extent to bound or pad: the
+    same YX crop is broadcast across the full requested z-depth instead.
+    """
     z0, y0, x0, z1, y1, x1 = (int(value) for value in bbox_zyx)
     expected_shape = z1 - z0, y1 - y0, x1 - x0
     if any(size <= 0 for size in expected_shape):
         raise ValueError(f"bbox must define a positive crop, got {bbox_zyx!r}")
+    if volume.ndim == 2:
+        yx_shape = tuple(int(value) for value in volume.shape[:2])
+        y_start, x_start = max(0, y0), max(0, x0)
+        y_stop, x_stop = min(yx_shape[0], y1), min(yx_shape[1], x1)
+        output = np.full(expected_shape, fill_value, dtype=np.dtype(volume.dtype))
+        if y_stop <= y_start or x_stop <= x_start:
+            return output, None
+        crop = np.asarray(volume[y_start:y_stop, x_start:x_stop])
+        destination = (
+            slice(0, expected_shape[0]),
+            slice(y_start - y0, y_start - y0 + crop.shape[0]),
+            slice(x_start - x0, x_start - x0 + crop.shape[1]),
+        )
+        output[destination] = crop[np.newaxis, :, :]
+        return output, destination
     shape = tuple(int(value) for value in volume.shape[:3])
     starts = max(0, z0), max(0, y0), max(0, x0)
     stops = min(shape[0], z1), min(shape[1], y1), min(shape[2], x1)

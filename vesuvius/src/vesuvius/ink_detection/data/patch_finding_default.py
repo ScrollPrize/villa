@@ -31,6 +31,18 @@ def labeled_patch_coverage(label_patch: np.ndarray) -> float:
     return float(area) / float(patch.size)
 
 
+def _label_surface(array: np.ndarray) -> np.ndarray:
+    """Return the 2D surface slice of a label array.
+
+    Most published label zarrs are a small z-stack mirroring the image
+    volume (index the middle slice); some publishers instead ship a single
+    flat 2D map with no z-stack at all. Both are treated as "the surface".
+    """
+    if array.ndim == 2:
+        return array
+    return array[int(array.shape[0] // 2)]
+
+
 def combined_patch_discovery_support(
     supervision_slice: np.ndarray, validation_slice: np.ndarray | None = None
 ) -> np.ndarray:
@@ -79,13 +91,17 @@ def find_segment_patches(
         if segment.validation_mask is None
         else open_volume(segment.validation_mask, scan_scale)
     )
-    mask_surface = int(supervision.shape[0] // 2)
-    validation_surface = (
-        None if validation is None else int(validation.shape[0] // 2)
+    # Materialize each surface slice exactly once. Some publishers store
+    # these as a single unchunked blob; re-slicing the live store per patch
+    # corner (as the loop below does) would otherwise re-fetch the entire
+    # array from the backing store on every iteration.
+    supervision_surface = np.asarray(_label_surface(supervision))
+    inklabels_surface = np.asarray(_label_surface(inklabels))
+    validation_surface_slice = (
+        None if validation is None else np.asarray(_label_surface(validation))
     )
     support = combined_patch_discovery_support(
-        supervision[mask_surface],
-        None if validation is None else validation[validation_surface],
+        supervision_surface, validation_surface_slice
     )
     ys, xs = np.nonzero(support)
     if len(ys) == 0:
@@ -108,16 +124,14 @@ def find_segment_patches(
     held_out: list[Patch] = []
     for y_scan, x_scan in corners.tolist():
         y_scan, x_scan = int(y_scan), int(x_scan)
-        supervision_patch = supervision[
-            mask_surface, y_scan : y_scan + scan_h, x_scan : x_scan + scan_w
+        supervision_patch = supervision_surface[
+            y_scan : y_scan + scan_h, x_scan : x_scan + scan_w
         ]
         has_training = bool(supervision_patch.size and np.any(supervision_patch))
         has_validation = False
-        if validation is not None:
-            validation_patch = validation[
-                validation_surface,
-                y_scan : y_scan + scan_h,
-                x_scan : x_scan + scan_w,
+        if validation_surface_slice is not None:
+            validation_patch = validation_surface_slice[
+                y_scan : y_scan + scan_h, x_scan : x_scan + scan_w
             ]
             has_validation = bool(validation_patch.size and np.any(validation_patch))
             if has_training and has_validation:
@@ -136,8 +150,8 @@ def find_segment_patches(
                     supervision_mask_override=segment.validation_mask,
                 )
             )
-        label_patch = inklabels[
-            mask_surface, y_scan : y_scan + scan_h, x_scan : x_scan + scan_w
+        label_patch = inklabels_surface[
+            y_scan : y_scan + scan_h, x_scan : x_scan + scan_w
         ]
         if has_training and labeled_patch_coverage(label_patch) >= (
             segment.data_config.patch_finding.min_labeled_coverage
@@ -184,10 +198,14 @@ def find_segment_unlabeled_patches(
     )
     scan_h = max(1, int(round(patch_size[1] / scale_y)))
     scan_w = max(1, int(round(patch_size[2] / scale_x)))
-    sup_surface = (
-        scan_surface if supervision is None else int(supervision.shape[0] // 2)
+    # Materialize once (see find_segment_patches): re-slicing the live store
+    # per patch corner would re-fetch an unchunked backing array every time.
+    supervision_surface = (
+        None if supervision is None else np.asarray(_label_surface(supervision))
     )
-    val_surface = scan_surface if validation is None else int(validation.shape[0] // 2)
+    validation_surface_slice = (
+        None if validation is None else np.asarray(_label_surface(validation))
+    )
     training: list[Patch] = []
     for y_scan, x_scan in corners.tolist():
         y_scan, x_scan = int(y_scan), int(x_scan)
@@ -199,15 +217,15 @@ def find_segment_unlabeled_patches(
         )
         if coverage < 0.25:
             continue
-        if supervision is not None and np.any(
-            supervision[
-                sup_surface, y_scan : y_scan + scan_h, x_scan : x_scan + scan_w
+        if supervision_surface is not None and np.any(
+            supervision_surface[
+                y_scan : y_scan + scan_h, x_scan : x_scan + scan_w
             ]
         ):
             continue
-        if validation is not None and np.any(
-            validation[
-                val_surface, y_scan : y_scan + scan_h, x_scan : x_scan + scan_w
+        if validation_surface_slice is not None and np.any(
+            validation_surface_slice[
+                y_scan : y_scan + scan_h, x_scan : x_scan + scan_w
             ]
         ):
             continue

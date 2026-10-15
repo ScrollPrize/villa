@@ -27,9 +27,9 @@ class Segment:
     segment_dir: Path
     segment_name: str
     image_volume: str | Path
-    inklabels: Path | None = None
-    supervision_mask: Path | None = None
-    validation_mask: Path | None = None
+    inklabels: str | Path | None = None
+    supervision_mask: str | Path | None = None
+    validation_mask: str | Path | None = None
 
     @property
     def scale(self) -> int:
@@ -73,7 +73,7 @@ class Patch:
         )
 
     @property
-    def inklabels(self) -> Path | None:
+    def inklabels(self) -> str | Path | None:
         return self.segment.inklabels
 
     @property
