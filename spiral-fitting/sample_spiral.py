@@ -20,18 +20,22 @@ def get_spiral_yxs(num_windings, dr_per_winding, inter_point_spacing, group_by_w
     # ...so should have (K + 0.5) * dr_per_winding * 2 * pi / inter_point_spacing steps
     # can construct these thetas directly, then r's via formula
 
+    # The angles are built in float64: in float32 the winding offset k * 2 * pi takes the mantissa, and at
+    # winding 250 sin and cos times a radius of 4000 voxels move a node by up to half a voxel.
+    # Only the positions are cast back to the default dtype.
     thetas = [
         winding_idx * 2 * torch.pi + torch.arange(
             0, 2 * np.pi,
             step=inter_point_spacing / (winding_idx + 0.5) / float(dr_per_winding),
-            device=device
+            device=device, dtype=torch.float64,
         )
         for winding_idx in range(num_windings)
     ]
     radii = [dr_per_winding * thetas_for_winding / (2 * torch.pi) for thetas_for_winding in thetas]
 
     yxs = [
-        torch.stack([torch.sin(thetas_for_winding), torch.cos(thetas_for_winding)], dim=-1) * radii_for_winding[:, None]
+        (torch.stack([torch.sin(thetas_for_winding), torch.cos(thetas_for_winding)], dim=-1)
+         * radii_for_winding[:, None]).to(torch.get_default_dtype())
         for thetas_for_winding, radii_for_winding in zip(thetas, radii)
     ]
 
