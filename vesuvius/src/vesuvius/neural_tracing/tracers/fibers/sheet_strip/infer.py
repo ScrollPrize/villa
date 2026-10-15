@@ -1,7 +1,15 @@
 """Predict the sheet an AFV fiber lies on along the fiber and write it as a tifxyz strip.
 
-    python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer --checkpoint RUN/best.pt --fiber 469373 \\
-        --out OUT [--afv FIBERS.afv] [--index INDEX_DIR] [--arc START END] [--step 4] [--blend 16]
+    python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer --afv FIBERS.afv --fiber 469373 --out OUT \\
+        [--checkpoint scrollprize/fiber_strip_small_v1] [--index INDEX_DIR] [--arc START END] [--step 8] [--blend 16] \\
+        [--trim 75]
+
+``--checkpoint``: a sheet-strip checkpoint file, or a Hugging Face model repo ``ORG/NAME[@REVISION]`` holding it
+(``fibers/tracing/runtime.py``: downloaded into the Hugging Face cache, with the frame model next to it); default
+``DEFAULT_CHECKPOINT``. A checkpoint records its CT (read again here; ``--ct``, ``--cache-dir`` and the other volume
+options of runtime.py override it), its frame model, and its run's AFV fibers, umbilicus and sheet-strip index; a
+recorded file that is not on this machine must be given (``--afv``), is looked for next to the checkpoint (the
+umbilicus, ``umbilicus.json``) or is skipped (the index: no scoring).
 
 Decisions are made every ``--step`` trace voxels along the fiber, each built as in training (data/samples.
 decision_on_path; frame model crop, no augmentation): the observed path is the fiber up to the head, the crop axis
@@ -21,7 +29,8 @@ with a bar of the error against the patch sheet where there is one (``--render-o
 Models reading the crop orientation (``strip_orientation``) need the scroll's umbilicus (``--umbilicus``, default: the
 checkpoint run's); models with ``strip_uncertainty`` also save their expected error per decision and grid point
 (``expected_error_vox`` in strip.npz, its mean over the stitched rows in summary.json).
-Arclengths and ``--step``/``--blend`` are trace voxels; ``--arc`` patch voxels.
+Nodes within ``--trim`` patch voxels of either fiber end, or beyond it, are not kept (as infer_all.py).
+Arclengths and ``--step``/``--blend`` are trace voxels; ``--arc`` and ``--trim`` patch voxels.
 """
 from __future__ import annotations
 
@@ -45,13 +54,62 @@ from vesuvius.neural_tracing.tracers.fibers.sheet_strip.data import (
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.model import strip_grid
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.targets import strip_targets
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.train import load_strip_model, with_tube
+from vesuvius.neural_tracing.tracers.fibers.tracing.runtime import (
+    add_volume_arguments, configure_volume, resolve_checkpoint)
 from vesuvius.neural_tracing.tracers.shared.annotations.afv import AFVFibers
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume, CTVolumeSpec
 from vesuvius.neural_tracing.tracers.shared.geometry import interp_at
+from vesuvius.neural_tracing.tracers.shared.hub import checkpoint_source, hf_repo, hub_folder
+from vesuvius.neural_tracing.tracers.shared.paths import recorded_path
 from vesuvius.neural_tracing.tracers.shared.tensors import move_batch
 from vesuvius.neural_tracing.tracers.sheets.tracing.inference import write_surface
 
 MIN_HEAD_ARC = 12.  # trace voxels: a shorter observed path would take its heading from CT (a seed), not the fiber
+DEFAULT_CHECKPOINT = 'scrollprize/fiber_strip_small_v1'  # sheet_strip_paris4_slim50k_v3, update 15000
+UMBILICUS_NAME = 'umbilicus.json'
+# Inference defaults (infer_all.py too): a decision every 8 trace voxels stitched as well as every 4 (README), each
+# weighing its rows within 16 trace voxels of its head, and nodes within 75 patch voxels of a fiber end left out.
+STEP, BLEND, TRIM = 8., 16., 75.
+
+
+def add_checkpoint_arguments(ap):
+    """The checkpoint, CT and frame-model options (fibers/tracing/runtime.py), the umbilicus and the device."""
+    ap.add_argument('--checkpoint', default=DEFAULT_CHECKPOINT,
+                    help='sheet-strip checkpoint: a file, or a Hugging Face repo ORG/NAME[@REVISION] holding it and '
+                         f'its frame model (default: {DEFAULT_CHECKPOINT})')
+    add_volume_arguments(ap)
+    ap.add_argument('--umbilicus', help="umbilicus.json for models reading the crop orientation (default: the "
+                                        f"checkpoint run's, else {UMBILICUS_NAME} next to the checkpoint)")
+    ap.add_argument('--device', default='cuda')
+
+
+def recorded_file(path):
+    """A file the checkpoint's run recorded, relocated to this machine (shared/paths.py); None when it is not here."""
+    if not path:
+        return None
+    path = Path(recorded_path(path)).expanduser()
+    return str(path) if path.exists() else None
+
+
+def find_umbilicus(checkpoint, path, recorded):
+    """The umbilicus of a model reading the crop orientation: ``recorded`` when on this machine, else
+    ``UMBILICUS_NAME`` next to the checkpoint file ``path`` (a Hugging Face repo ``checkpoint``: downloaded from it)."""
+    found = recorded_file(recorded)
+    if found:
+        return found
+    repo = hf_repo(checkpoint)
+    folder = hub_folder(repo, [UMBILICUS_NAME]) if repo is not None else Path(path).expanduser().absolute().parent
+    if (folder/UMBILICUS_NAME).is_file():
+        return str(folder/UMBILICUS_NAME)
+    raise ValueError(f'This model reads the crop orientation: pass --umbilicus (the checkpoint\'s {recorded} is not '
+                     f'on this machine, and there is no {UMBILICUS_NAME} next to it)')
+
+
+def trim_ends(keep, first_arc, row_step, length, margin):
+    """``keep`` (R, C; rows along the fiber, row r at arclength ``first_arc + r*row_step``) without the rows beyond
+    ``margin`` inside either end of a fiber of ``length`` (one unit throughout)."""
+    arc = first_arc+np.arange(len(keep))*row_step
+    return keep & ((arc >= margin) & (arc <= length-margin))[:, None]
 
 
 def decision_item(fiber, t, sample_cfg, n_history, window):
@@ -98,11 +156,17 @@ class StripPredictor:
     """A sheet-strip checkpoint and what its decisions need (frame model and crop builder, CT volume, umbilicus),
     loaded once; ``predict`` runs one fiber's decisions."""
 
-    def __init__(self, checkpoint, device='cuda', umbilicus=None, batch=16, crop_threads=1):
-        self.model, self.cfg, self.ck = load_strip_model(checkpoint, device)
+    def __init__(self, checkpoint=DEFAULT_CHECKPOINT, device='cuda', umbilicus=None, batch=16, crop_threads=1,
+                 volume=None):
+        """``checkpoint``: a file or a Hugging Face repo (module notes); ``volume``: parsed CT and frame-model options
+        (runtime.add_volume_arguments; None: the checkpoint's). ``source`` is what outputs record as the checkpoint."""
+        path = resolve_checkpoint(checkpoint)
+        self.source = checkpoint_source(checkpoint, path)
+        self.model, self.cfg, self.ck = load_strip_model(path, device)
         self.device, self.batch = device, batch
         self.data = self.ck['run_config']['data']
         self.spec = CTVolumeSpec.from_dict(self.ck['vol_spec'])
+        configure_volume(volume or argparse.Namespace(), self.spec, self.cfg, path)
         self.trace_per_patch = self.spec.ct_grid_scale/self.spec.grid_scale
         self.f, self.v = (a.numpy().astype(np.float64) for a in strip_grid(self.cfg))
         self.sample_cfg = SampleConfig(**dict(self.ck['sample_cfg'], crop=self.cfg.fine,
@@ -115,10 +179,7 @@ class StripPredictor:
             self.builder.crop_images = lambda items, vol, crop, _=None: image_crop(items, vol, crop, pool)
         self.umbilicus = None
         if self.cfg.strip_orientation:
-            path = umbilicus or self.data.get('umbilicus')
-            if not path:
-                raise ValueError('This model reads the crop orientation: an umbilicus is needed')
-            self.umbilicus = load_umbilicus(path)
+            self.umbilicus = load_umbilicus(umbilicus or find_umbilicus(checkpoint, path, self.data.get('umbilicus')))
         self.vol = CTVolume(self.spec)
         self.rng = np.random.default_rng(0)
         c = self.cfg.fine  # the crop's farthest point from its head, plus a sample
@@ -333,33 +394,38 @@ def render_saved(out, vol):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--checkpoint', required=True)
+    add_checkpoint_arguments(ap)
     ap.add_argument('--fiber', type=int, required=True, help='AFV fiber id')
     ap.add_argument('--out', required=True, type=Path)
-    ap.add_argument('--afv', help="default: the checkpoint run's")
-    ap.add_argument('--index', help="sheet-strip index for scoring (default: the checkpoint run's; 'none': skip)")
+    ap.add_argument('--afv', help="AFV fibers (default: the checkpoint run's, when on this machine)")
+    ap.add_argument('--index', help="sheet-strip index for scoring (default: the checkpoint run's, when on this "
+                                    "machine; 'none': skip)")
     ap.add_argument('--arc', type=float, nargs=2, help='fiber arclength range, patch voxels (default: all of it)')
-    ap.add_argument('--step', type=float, default=4., help='trace voxels between decisions (a multiple of the f spacing)')
-    ap.add_argument('--blend', type=float, default=16., help='trace voxels: decisions weigh their rows within this of the head')
-    ap.add_argument('--umbilicus', help="umbilicus.json for models reading the crop orientation (default: the checkpoint run's)")
+    ap.add_argument('--step', type=float, default=STEP, help='trace voxels between decisions (a multiple of the f spacing)')
+    ap.add_argument('--blend', type=float, default=BLEND, help='trace voxels: decisions weigh their rows within this of the head')
+    ap.add_argument('--trim', type=float, default=TRIM,
+                    help='patch voxels: strip nodes within this of either fiber end (or beyond it) are not kept')
     ap.add_argument('--batch', type=int, default=16)
-    ap.add_argument('--device', default='cuda')
-    ap.add_argument('--voxel-size-um', type=float, default=None, help='patch voxel size, for area_cm2 in meta.json')
+    ap.add_argument('--voxel-size-um', type=float, default=9.6, help='patch voxel size, for area_cm2 in meta.json')
     ap.add_argument('--no-render', action='store_true')
     ap.add_argument('--render-only', action='store_true', help='redraw render.png of an existing --out, no inference')
     args = ap.parse_args(argv)
     started = time.time()
     if args.render_only:
-        ck = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
-        render_saved(args.out, CTVolume(CTVolumeSpec.from_dict(ck['vol_spec'])))
+        path = resolve_checkpoint(args.checkpoint)
+        spec = CTVolumeSpec.from_dict(torch.load(path, map_location='cpu', weights_only=False)['vol_spec'])
+        configure_volume(args, spec, argparse.Namespace(), path)  # the CT options; no frame model needed
+        render_saved(args.out, CTVolume(spec))
         return
     try:
-        predictor = StripPredictor(args.checkpoint, args.device, args.umbilicus, args.batch)
+        predictor = StripPredictor(args.checkpoint, args.device, args.umbilicus, args.batch, volume=args)
     except ValueError as error:
-        raise SystemExit(f'{error} (--umbilicus)')
+        raise SystemExit(str(error))
     cfg, ck, data, spec = predictor.cfg, predictor.ck, predictor.data, predictor.spec
     trace_per_patch, f, v = predictor.trace_per_patch, predictor.f, predictor.v
-    afv_path = args.afv or data['afv']
+    afv_path = args.afv or recorded_file(data.get('afv'))
+    if not afv_path:
+        raise SystemExit(f"Pass --afv: the checkpoint's AFV fibers {data.get('afv')} are not on this machine")
     afv = AFVFibers(afv_path, spec.grid_scale, split='all')
     if args.fiber not in afv.id_to_index:
         raise SystemExit(f'Fiber {args.fiber} is not in {afv_path}')
@@ -373,7 +439,7 @@ def main(argv=None):
     if hi <= lo:
         raise SystemExit('The arclength range holds no decision')
     arcs = np.arange(lo, hi+1e-9, args.step)
-    index_dir = None if args.index == 'none' else (args.index or data.get('index'))
+    index_dir = None if args.index == 'none' else (args.index or recorded_file(data.get('index')))
     scorer = Scorer(index_dir, afv_path, catalog_index, cfg, spec, data) if index_dir else None
     scorer = scorer if scorer is not None and scorer.unit is not None else None
     vol = predictor.vol
@@ -390,12 +456,13 @@ def main(argv=None):
         log=lambda done: print(f'[infer] {done}/{len(arcs)} decisions, {time.time()-started:.0f} s', flush=True))
     oriented, oriented_frames, flipped = orient_decisions(heights, frames)
     rows, weight, spread = stitch(oriented, oriented_frames, positions, arcs, f, v, args.blend)
-    keep = weight > 0
+    keep = trim_ends(weight > 0, arcs[0]+f[0], df, fiber.length, args.trim*trace_per_patch)
     row_step, column_step = df/trace_per_patch, (v[1]-v[0])/trace_per_patch
     args.out.mkdir(parents=True, exist_ok=True)
-    provenance = dict(checkpoint=str(Path(args.checkpoint).resolve()), step=ck.get('step'), afv=str(afv_path),
+    provenance = dict(checkpoint=predictor.source, step=ck.get('step'), afv=str(afv_path),
                       fiber=args.fiber, arc_trace=[float(arcs[0]), float(arcs[-1])], decision_step=args.step,
-                      blend=args.blend, units='patch voxels', trace_per_patch=trace_per_patch,
+                      blend=args.blend, trim_patch_voxels=args.trim, units='patch voxels',
+                      trace_per_patch=trace_per_patch,
                       first_row_arc_patch_voxels=float((arcs[0]+f[0])/trace_per_patch))
     write_surface(args.out/'strip', rows/trace_per_patch, keep, row_step, column_step, provenance, overwrite=True,
                   voxel_size_um=args.voxel_size_um)

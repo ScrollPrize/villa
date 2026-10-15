@@ -225,17 +225,26 @@ strip error) and `last.pt`; `sheet_strip.train.load_strip_model` loads one. The 
 runs on 155k fibers and 60k validation runs on 17.8k fibers (`output/sheet_strip_data/`).
 
 `sheet_strip/infer.py` walks one AFV fiber and writes the predicted strip as a tifxyz (patch voxels; rows every 4
-voxels along the fiber, 25 columns 5 voxels apart across it). It makes a decision every `--step` trace voxels,
+voxels along the fiber, 25 columns 5 voxels apart across it). The checkpoint defaults to the Hugging Face repo
+`scrollprize/fiber_strip_small_v1` (`sheet_strip_paris4_slim50k_v3`, update 15000), downloaded into the Hugging Face
+cache; `--checkpoint` takes another repo (`ORG/NAME[@REVISION]`) or a local file. It reads the CT recorded in the
+checkpoint (Paris4 on the public S3 bucket; `--ct`, `--cache-dir` and the other volume options of
+`fibers/tracing/runtime.py` override it). The frame model and the umbilicus are taken from their recorded paths when
+those exist on this machine, else from `heading_model.pt` and `umbilicus.json` next to the checkpoint (in its
+Hugging Face repo), else `--frame-checkpoint` and `--umbilicus` must be given; `--afv` is needed off this machine,
+and scoring is skipped when the recorded index is not here. Outputs record the checkpoint as
+`hf://REPO@COMMIT/last.pt`. It makes a decision every `--step` (default 8) trace voxels,
 built as in training without augmentation. The fiber up to the head is the observed trace, and the tube shows the
 whole fiber. Overlapping decisions are averaged per node, weighted towards each decision's head, after each
 decision's in-sheet axis is turned to agree with the previous one's. When the fiber is in the run's index, the
 patch sheet is scored and stitched the same way (`patch_sheet/`). `render.png` shows the CT sampled on the
 predicted strip in bands along the fiber. Under each band, a bar shows the error against the patch sheet where
-there is one. `--render-only` redraws it for an existing output folder.
+there is one. `--render-only` redraws it for an existing output folder. Nodes within `--trim` (default 75) patch
+voxels of either fiber end are left out, as in `infer_all.py`.
 
 ```bash
-python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer \
-  --checkpoint output/sheet_strip_paris4_slim50k_v1/best.pt --fiber 469373 --out output/sheet_strip_infer/fiber_469373
+python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer --afv FIBERS.afv --fiber 469373 \
+  --out output/sheet_strip_infer/fiber_469373
 ```
 
 On validation fiber 469373 (6100 voxels, 758 decisions, 2.5 minutes), the update-16000 checkpoint gave 1.22 voxels
@@ -252,10 +261,15 @@ restarted shard skips them:
 
 ```bash
 for k in $(seq 0 17); do
-  python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer_all --checkpoint RUN/last.pt --out OUT \
-    --min-length-mm 2.5 --step 8 --batch 4 --threads 1 --shard $k 18 &
+  python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer_all --afv FIBERS.afv --out OUT \
+    --batch 4 --threads 1 --shard $k 18 &
 done
 ```
+
+The defaults (`--min-length-mm 2.5 --step 8 --blend 16 --trim 75`, the Hugging Face checkpoint) are the Paris4 bulk
+run's. Its strips are reproduced exactly with `--batch 4 --threads 1`, as above; another batch size or thread count
+(the defaults: 32 and 2) changes nodes by about 0.015 voxels on average and up to about 0.3 (GPU batch numerics and
+the CPU frame model).
 
 Throughput is CPU-bound: building each decision's crops (frame model, CT sampling and normalization) dominates. Each
 process needs about 1.3–1.5 GB of GPU memory, so 18 shards fill a 32 GB card. On the 24-core machine that gives about

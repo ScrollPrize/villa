@@ -1,9 +1,11 @@
 """Predict the sheet strip of every AFV fiber above a length, sharded over processes (sheet_strip/infer.py per fiber,
 without scoring or renders).
 
-    python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer_all --checkpoint RUN/last.pt --out OUT \\
-        [--afv FIBERS.afv] [--min-length-mm 2.5] [--base-voxel-um 2.4] [--step 8] [--blend 16] [--trim 75] \\
-        [--shard K N]
+    python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer_all --afv FIBERS.afv --out OUT \\
+        [--checkpoint scrollprize/fiber_strip_small_v1] [--min-length-mm 2.5] [--base-voxel-um 2.4] [--step 8] \\
+        [--blend 16] [--trim 75] [--shard K N]
+
+``--checkpoint`` and the CT, frame-model and umbilicus options are infer.py's (a Hugging Face repo by default).
 
 The fibers (AFV catalog order) are dealt to ``N`` shards; shard ``K`` predicts every ``N``-th one from the ``K``-th, so
 shards can run as parallel processes. A fiber is a decision every ``--step`` trace voxels from its start (as
@@ -30,7 +32,8 @@ import tifffile
 import torch
 
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer import (
-    MIN_HEAD_ARC, StripPredictor, orient_decisions, stitch, stitch_values)
+    BLEND, MIN_HEAD_ARC, STEP, TRIM, StripPredictor, add_checkpoint_arguments, orient_decisions, recorded_file, stitch,
+    stitch_values, trim_ends)
 from vesuvius.neural_tracing.tracers.shared.annotations.afv import AFVFibers
 from vesuvius.neural_tracing.tracers.shared.io import atomic_write
 from vesuvius.neural_tracing.tracers.sheets.tracing.inference import write_surface
@@ -42,14 +45,7 @@ def selected_fibers(afv, min_length_mm, base_voxel_um):
     return np.flatnonzero(lengths > min_length_mm)
 
 
-def trim_ends(keep, first_arc, row_step, length, margin):
-    """``keep`` (R, C; rows along the fiber, row r at arclength ``first_arc + r*row_step``) without the rows beyond
-    ``margin`` inside either end of a fiber of ``length`` (one unit throughout)."""
-    arc = first_arc+np.arange(len(keep))*row_step
-    return keep & ((arc >= margin) & (arc <= length-margin))[:, None]
-
-
-def strip_of_fiber(predictor, fiber, step, blend, trim=0.):
+def strip_of_fiber(predictor, fiber, step=STEP, blend=BLEND, trim=0.):
     """The stitched strip of a fiber (rows (R, Nv, 3) trace voxels, kept nodes, expected |error| per node in voxels
     or None) and its decision arclengths; nodes within ``trim`` trace voxels of the fiber's ends, or beyond them, are
     not kept."""
@@ -88,32 +84,35 @@ def display_grid(rows, keep, expected, family):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--checkpoint', required=True)
+    add_checkpoint_arguments(ap)
     ap.add_argument('--out', required=True, type=Path)
-    ap.add_argument('--afv', help="default: the checkpoint run's")
+    ap.add_argument('--afv', help="AFV fibers (default: the checkpoint run's, when on this machine)")
     ap.add_argument('--min-length-mm', type=float, default=2.5)
     ap.add_argument('--base-voxel-um', type=float, default=2.4, help='voxel size of the AFV catalog lengths')
-    ap.add_argument('--step', type=float, default=8., help='trace voxels between decisions (a multiple of the f spacing)')
-    ap.add_argument('--blend', type=float, default=16., help='trace voxels: decisions weigh their rows within this of the head')
-    ap.add_argument('--trim', type=float, default=75., help='patch voxels: strip nodes within this of either fiber end '
-                    '(or beyond it) are not kept')
+    ap.add_argument('--step', type=float, default=STEP, help='trace voxels between decisions (a multiple of the f spacing)')
+    ap.add_argument('--blend', type=float, default=BLEND, help='trace voxels: decisions weigh their rows within this of the head')
+    ap.add_argument('--trim', type=float, default=TRIM,
+                    help='patch voxels: strip nodes within this of either fiber end (or beyond it) are not kept')
     ap.add_argument('--shard', type=int, nargs=2, default=(0, 1), metavar=('K', 'N'))
     ap.add_argument('--limit', type=int, help='at most this many fibers of the shard (benchmarks)')
-    ap.add_argument('--umbilicus', help="for models reading the crop orientation (default: the checkpoint run's)")
     ap.add_argument('--batch', type=int, default=32)
     ap.add_argument('--threads', type=int, default=2)
     ap.add_argument('--crop-threads', type=int, default=1, help="threads sampling a batch's CT crops")
-    ap.add_argument('--device', default='cuda')
     ap.add_argument('--voxel-size-um', type=float, default=9.6, help='patch voxel size, for area_cm2 in meta.json')
     args = ap.parse_args(argv)
     torch.set_num_threads(args.threads)
     k, n = args.shard
-    predictor = StripPredictor(args.checkpoint, args.device, args.umbilicus, args.batch, args.crop_threads)
+    try:
+        predictor = StripPredictor(args.checkpoint, args.device, args.umbilicus, args.batch, args.crop_threads, args)
+    except ValueError as error:
+        raise SystemExit(str(error))
     f, v, tpp = predictor.f, predictor.v, predictor.trace_per_patch
     df = f[1]-f[0]
     if abs(args.step/df-round(args.step/df)) > 1e-6 or args.step <= 0:
         raise SystemExit(f'--step must be a positive multiple of the strip row spacing {df:g}')
-    afv_path = args.afv or predictor.data['afv']
+    afv_path = args.afv or recorded_file(predictor.data.get('afv'))
+    if not afv_path:
+        raise SystemExit(f"Pass --afv: the checkpoint's AFV fibers {predictor.data.get('afv')} are not on this machine")
     afv = AFVFibers(afv_path, predictor.spec.grid_scale, split='all')
     chosen = selected_fibers(afv, args.min_length_mm, args.base_voxel_um)[k::n]
     if args.limit:
@@ -123,7 +122,7 @@ def main(argv=None):
     done = set()
     if log_path.exists():
         done = {json.loads(line)['fiber'] for line in log_path.read_text().splitlines() if line.strip()}
-    checkpoint = str(Path(args.checkpoint).resolve())
+    checkpoint = predictor.source
     # A run resumed with another checkpoint keeps the earlier ones (each fiber's index line names its own).
     earlier = json.loads((args.out/'run.json').read_text()) if (args.out/'run.json').exists() else {}
     checkpoints = [c for c in earlier.get('checkpoints', [earlier['checkpoint']] if 'checkpoint' in earlier else [])
@@ -146,7 +145,7 @@ def main(argv=None):
             out = args.out/'strips'/f'{catalog_index//1000:04d}'/f'fiber_{fiber_id}'
             nodes = int(keep.sum())
             rows, keep, expected, layout = display_grid(rows, keep, expected, family)
-            provenance = dict(checkpoint=str(Path(args.checkpoint).resolve()), step=predictor.ck.get('step'),
+            provenance = dict(checkpoint=checkpoint, step=predictor.ck.get('step'),
                               afv=str(afv_path), fiber=int(fiber_id), family=family, decision_step=args.step,
                               blend=args.blend, trim_patch_voxels=args.trim, units='patch voxels', trace_per_patch=tpp,
                               first_row_arc_patch_voxels=float((arcs[0]+f[0])/tpp), **layout)
