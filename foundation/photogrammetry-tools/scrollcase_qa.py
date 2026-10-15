@@ -9,14 +9,13 @@ the angle between the cavity's wide direction and the split plane, and the clear
 scroll surface to each half; no scroll surface may lie inside case material. The wiggle is the gap
 from each scroll surface sample to the nearer half (near the lining offset everywhere for a snug fit).
 Each half must lift off the scroll along its side of the y axis without hitting it, stay within the
-caps' footprint, and not overlap the other; away from the flat divider joint the halves must keep
---sliding-mm apart (where one half protrudes past the divider into the other, their faces slide
-past each other).
+caps' footprint, and not overlap the other; as they part along y, faces of the halves must not slide along each other in
+contact or pass within --sliding-mm sideways.
 
 --render writes cross-sections at five heights (scroll red, left half blue, right half green)
 above shaded views of the halves and the scroll.
 
-Run with the scrollcase venv (needs scrollcase, trimesh and meshlib):
+Run with the scrollcase venv (needs trimesh and meshlib):
     python scrollcase_qa.py OUTPUT_DIR SCROLL_ID [--render kit.png]
 """
 
@@ -28,8 +27,6 @@ import numpy as np
 import trimesh
 from PIL import Image, ImageDraw
 
-# Import scrollcase (build123d/OCP) before meshlib: the reverse order aborts at import.
-from scrollcase.curved_divider_wall import divider_y
 from meshlib import mrmeshpy
 
 PARTS = ("scroll", "left", "right")
@@ -87,20 +84,38 @@ def pull_blocked(scroll, half_path, direction, n=30000):
                for p in P)
 
 
-def half_contact(half, other, other_path, lining_outer_radius, z_range, sliding_mm, n=60000):
-    """Samples of one half's surface inside the other half, and (beside the scroll, away from the flat divider
-    joint) within sliding_mm of it, i.e. faces that must slide past each other with less than the required
-    clearance. Outside z_range the caps slide by design (right_cap_buffer above the base disc). Flush contact
-    along the joint gives distances near 0, so only samples deeper than 0.05 mm are confirmed by winding number."""
-    P, _ = trimesh.sample.sample_surface(half, n, seed=2)
+def half_contact(half, other, other_path, z_range, sliding_mm, n=60000):
+    """Contact between the halves beside the scroll (outside z_range the caps slide by design, right_cap_buffer
+    above the base disc), from samples of one half's surface: those inside the other half; those touching it on
+    a face within 30 degrees of the pull (y) axis, which slides along the other half as they part; and those
+    on such a face within sliding_mm of it with the other half beside them (the nearest point within 60
+    degrees of perpendicular to y), which pass that close as they part, not counting those within 1.5 mm of
+    where the halves touch (beside the joint's edge). Flush contact along the joint gives distances near 0, so only
+    samples deeper than 0.05 mm are confirmed by winding number."""
+    P, faces = trimesh.sample.sample_surface(half, n, seed=2)
+    beside = (P[:, 2] > z_range[0]) & (P[:, 2] < z_range[1])
+    P, normals = P[beside], half.face_normals[faces[beside]]
     mm_mesh = mrmeshpy.loadMesh(other_path)
-    s = np.array([mrmeshpy.findSignedDistance(mrmeshpy.Vector3f(*map(float, p)), mm_mesh).dist for p in P])
+    s, lateral = np.empty(len(P)), np.zeros(len(P), bool)
+    for i, p in enumerate(P):
+        r = mrmeshpy.findSignedDistance(mrmeshpy.Vector3f(*map(float, p)), mm_mesh)
+        q = mm_mesh.triPoint(r.mtp)
+        d = np.array([q.x, q.y, q.z]) - p
+        s[i] = r.dist
+        lateral[i] = abs(d[1]) < 0.5 * np.linalg.norm(d)
     for i in np.flatnonzero(s < -0.05)[:500]:
         if winding_number(other, P[i]) < 0.5:
             s[i] = abs(s[i])
-    off_joint = ((np.abs(P[:, 1] - divider_y(P[:, 0], lining_outer_radius, 2.0)) > 1.5)
-                 & (P[:, 2] > z_range[0]) & (P[:, 2] < z_range[1]))
-    return (s < -0.2).sum(), (off_joint & (s > -0.2) & (s < sliding_mm)).sum(), s[off_joint].min()
+    touching = np.abs(s) < 0.02
+    steep = np.abs(normals[:, 1]) < 0.5
+    steep_contact = touching & steep
+    close = (s >= 0.05) & (s < sliding_mm) & lateral & steep
+    joint = P[touching]
+    for i in np.flatnonzero(close):
+        if len(joint) and (((joint - P[i]) ** 2).sum(1) < 1.5**2).any():
+            close[i] = False
+    nearest = s[close].min() if close.any() else np.inf
+    return (s < -0.2).sum(), steep_contact.sum(), close.sum(), nearest, len(P)
 
 
 def section_tile(parts, z, lo, hi):
@@ -214,10 +229,11 @@ def main():
             beyond = (np.abs(parts[k].vertices[:, 1]) > cap + 0.01).sum()
             print(f"{k:6s} vertices beyond the caps' footprint (|y| > {cap:.2f}) {beyond}")
         for k, other in (("left", "right"), ("right", "left")):
-            inside, close, nearest = half_contact(parts[k], parts[other], paths[other], radius, z_range,
-                                                  args.sliding_mm)
-            print(f"{k:6s} surface samples inside {other} {inside}/60000; off the divider joint and within "
-                  f"{args.sliding_mm} mm of {other} {close}/60000 (nearest {nearest:.2f} mm)")
+            inside, steep, close, nearest, n = half_contact(parts[k], parts[other], paths[other], z_range,
+                                                            args.sliding_mm)
+            print(f"{k:6s} samples beside the scroll {n}: inside {other} {inside}; touching it on a face within 30 deg "
+                  f"of y {steep}; on such a face within {args.sliding_mm} mm of it sideways, off the joint {close}"
+                  + (f" (nearest {nearest:.2f} mm)" if close else ""))
     if args.render:
         render(parts, args.render)
 
