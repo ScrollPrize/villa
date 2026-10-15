@@ -34,7 +34,10 @@ class PartingSurfaceTests(unittest.TestCase):
         # A slab across the divider's middle, which it contains in every column.
         xs, zs, height = parting(box((-2, -6, 0), (2, 6, 20)))
         divider = curved_divider_wall.divider_y(xs, LINING_OUTER_RADIUS, WALL)
-        self.assertLess(np.abs(height - divider[:, None]).max(), 1e-6)
+        # Up to the smoothing of its curve, away from the slab's rounded edges (lined
+        # from x = -4 to 4 and z = -2 to 22), where the surface passes through them.
+        away = (np.abs(xs) < 3)[:, None] & ((zs > 1) & (zs < 19))[None, :]
+        self.assertLess(np.abs(height - divider[:, None])[away].max(), 0.2)
 
     def test_passes_through_a_scroll_off_the_divider(self):
         # Wholly above the divider: the divider rises to y = 6 at x = -15.
@@ -42,9 +45,9 @@ class PartingSurfaceTests(unittest.TestCase):
         xs, zs, height = parting(scroll)
         # Away from its ends, where the surface is free of the slope limit.
         over = (np.abs(xs) < 19)[:, None] & ((zs > 8) & (zs < 12))[None, :]
-        # Through the lined scroll (y from 8 to 16).
-        self.assertGreaterEqual(height[over].min(), 8 - PITCH)
-        self.assertLessEqual(height[over].max(), 16 + PITCH)
+        # Through the lined scroll's inner half (y from 8 to 16).
+        self.assertGreaterEqual(height[over].min(), 10 - PITCH)
+        self.assertLessEqual(height[over].max(), 14 + PITCH)
         # Back on the divider at the region's ends along the axis.
         divider = curved_divider_wall.divider_y(xs, LINING_OUTER_RADIUS, WALL)
         self.assertLess(np.abs(height[:, 0] - divider).max(), 1e-6)

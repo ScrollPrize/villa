@@ -320,13 +320,16 @@ def _parting_surface(
     """Height (y) of the surface parting the case halves over a grid of (x, z).
 
     Across the lining in x, and to z_margin_mm beyond it along the axis, the surface
-    may leave the S-shaped divider: it passes through the lined scroll (between its
-    lowest and highest points) in every column the scroll occupies, but for those
-    within a millimetre of its outline, whose extent is noisy, so each half meets the
-    scroll on its side however the scroll lies; elsewhere it departs from the divider
-    as smoothly as it can. The departure is harmonic, zero at the region's ends along
-    the axis (where the caps, split on the divider, begin) and free at its sides, found
-    by red-black successive over-relaxation. Then it is made no steeper than
+    may leave the S-shaped divider. In every column the lined scroll occupies, it
+    passes through the scroll's inner half (at least a quarter of its extent in from its
+    lowest and highest points), as near the divider as that allows, smoothed over
+    neighbouring columns: so each half meets the scroll on its side however the scroll
+    lies, and where the scroll lies off the divider the surface leaves it at its edge,
+    where the inner half narrows to a line, as a mould's parting line follows an
+    object's outline, rather than folding back along one face of it. Elsewhere it
+    departs from the divider as smoothly as it can: the departure is harmonic, zero at
+    the region's ends along the axis (where the caps, split on the divider, begin) and
+    free at its sides, found by red-black successive over-relaxation. Then it is made no steeper than
     max_slope_deg anywhere, so the halves do not slide along each other as they part:
     where the scroll would need it steeper (mostly towards the ends along the axis), it
     lies wholly in one half for a little way.
@@ -354,16 +357,27 @@ def _parting_surface(
     inside = (ix[:, None] >= 0) & (ix[:, None] < lined.shape[0]) & (iz[None, :] >= 0) & (iz[None, :] < lined.shape[2])
     jx, jz = np.clip(ix, 0, lined.shape[0] - 1), np.clip(iz, 0, lined.shape[2] - 1)
     bound = inside & occupied[jx][:, jz]
-    for _ in range(int(np.ceil(1 / pitch))):
-        bound[1:-1, 1:-1] &= bound[:-2, 1:-1] & bound[2:, 1:-1] & bound[1:-1, :-2] & bound[1:-1, 2:]
-    lo = np.where(bound, lowest[jx][:, jz], -np.inf)
-    hi = np.where(bound, highest[jx][:, jz], np.inf)
     bound[:, [0, -1]] = False
+    lo, hi = lowest[jx][:, jz], highest[jx][:, jz]
 
     divider = curved_divider_wall.divider_y(xs, lining_outer_radius, wall_thickness_mm)[:, None]
-    lo, hi = lo - divider, hi - divider
-    departure = np.clip(np.zeros((len(xs), len(zs))), lo, hi)
-    departure[:, [0, -1]] = 0
+    # Within the scroll's inner half, smoothed over a millimetre or so of neighbouring
+    # columns (its extent at the outline is noisy), and kept within it.
+    quarter = (hi - lo) / 4
+    middle = np.where(bound, np.clip(divider, lo + quarter, hi - quarter), 0)
+    for _ in range(int(np.ceil(1 / pitch)) * 2):
+        total = np.zeros_like(middle)
+        count = np.zeros_like(middle)
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                total += np.roll(np.roll(np.where(bound, middle, 0), di, 0), dj, 1)
+                count += np.roll(np.roll(bound, di, 0), dj, 1)
+        middle = np.where(bound, total / np.maximum(count, 1), 0)
+    middle = np.clip(middle, lo, hi)
+
+    departure = np.where(bound, middle - divider, 0)
+    free = ~bound
+    free[:, [0, -1]] = False
 
     n = max(len(xs), len(zs))
     omega = 2 / (1 + np.sin(np.pi / n))
@@ -374,14 +388,23 @@ def _parting_surface(
         for colour in (0, 1):
             interior = d[1:-1, 1:-1]
             mean = 0.25 * (d[:-2, 1:-1] + d[2:, 1:-1] + d[1:-1, :-2] + d[1:-1, 2:])
-            step = np.where(parity[1:-1, 1:-1] == colour, omega * (mean - interior), 0)
-            updated = np.clip(interior + step, lo[1:-1, 1:-1], hi[1:-1, 1:-1])
-            change = max(change, np.abs(updated - interior).max())
-            d[1:-1, 1:-1] = updated
-            d[0, 1:-1] = np.clip(d[1, 1:-1], lo[0, 1:-1], hi[0, 1:-1])
-            d[-1, 1:-1] = np.clip(d[-2, 1:-1], lo[-1, 1:-1], hi[-1, 1:-1])
+            moving = (parity[1:-1, 1:-1] == colour) & free[1:-1, 1:-1]
+            step = np.where(moving, omega * (mean - interior), 0)
+            change = max(change, np.abs(step).max())
+            d[1:-1, 1:-1] = interior + step
+            d[0, 1:-1] = np.where(free[0, 1:-1], d[1, 1:-1], d[0, 1:-1])
+            d[-1, 1:-1] = np.where(free[-1, 1:-1], d[-2, 1:-1], d[-1, 1:-1])
         if change < 1e-4:
             break
+
+    # Smoothed across the scroll's outline, where the pinned and free parts meet at a
+    # kink, over a millimetre or so, kept within the scroll and on the divider at the
+    # region's ends.
+    for _ in range(int(np.ceil(1 / pitch)) * 2):
+        padded = np.pad(d, 1, mode="edge")
+        d = sum(padded[1 + di : 1 + di + d.shape[0], 1 + dj : 1 + dj + d.shape[1]] for di in (-1, 0, 1) for dj in (-1, 0, 1)) / 9
+        d = np.where(bound, np.clip(d, lo - divider, hi - divider), d)
+        d[:, [0, -1]] = 0
 
     # No steeper than max_slope_deg between neighbours: alternately limit each point's
     # departure to its neighbours' plus the rise that slope allows, along each axis,
@@ -627,24 +650,25 @@ def build_lining(
 
     # Build mesh
     logger.info("Building lining")
-    cavity_mesh_pos_offset = mm.offsetMesh(cavity_mesh_pos, offset=mesh_params.wall_thickness_mm, params=params)  # type: ignore
-    cavity_mesh_neg_offset = mm.offsetMesh(cavity_mesh_neg, offset=mesh_params.wall_thickness_mm, params=params)  # type: ignore
 
-    # The divider wall, each half's side of it wall_thickness_mm thick (normal to it),
-    # follows the parting surface, cut along it with the lining. It replaces the case's
-    # wall on the S-shaped divider and the posts at its ends there, which are removed
-    # with the cavities.
+    # Each half's lining and divider wall are one shell, wall_thickness_mm thick, around
+    # its cavity and a thin sheet on the parting surface, cut along the surface: the
+    # wall follows the surface at the lining's thickness, and meets the lining without a
+    # seam. The wall replaces the case's wall on the S-shaped divider, and the posts at
+    # its ends there, which are removed with the cavities; the sheet stops the wall
+    # thickness short of the lining's outer radius, as those posts did, and reaches a
+    # millimetre beyond the surface's grid along the axis, where the surface is back on
+    # the divider, to fuse with the case's wall beyond.
     w = mesh_params.wall_thickness_mm
-    # A millimetre longer than the parting surface's grid at each end along the axis,
-    # where the surface is back on the divider, to fuse with the case's wall beyond.
-    wall_zs = np.concatenate([[zs[0] - 1], zs, [zs[-1] + 1]])
-    wall_parting = np.concatenate([parting[:, :1], parting, parting[:, -1:]], axis=1)
-    dx, dz = np.gradient(wall_parting, xs, wall_zs)
-    thickness = w * np.sqrt(1 + dx**2 + dz**2)
-    wall_pos = _heightfield_solid(xs, wall_zs, wall_parting - 1, wall_parting + thickness)
-    wall_neg = _heightfield_solid(xs, wall_zs, wall_parting - thickness, wall_parting + 1)
-    cavity_mesh_pos_offset = mm.voxelBooleanUnite(cavity_mesh_pos_offset, wall_pos, voxel_size)
-    cavity_mesh_neg_offset = mm.voxelBooleanUnite(cavity_mesh_neg_offset, wall_neg, voxel_size)
+    sheet_xs = xs[np.abs(xs) <= lining_outer_radius - w]
+    sheet_zs = np.concatenate([[zs[0] - 1], zs, [zs[-1] + 1]])
+    sheet_parting = np.concatenate([parting[:, :1], parting, parting[:, -1:]], axis=1)[np.abs(xs) <= lining_outer_radius - w]
+    half_thickness = max(voxel_size, 0.25)
+    sheet = _heightfield_solid(
+        sheet_xs, sheet_zs, sheet_parting - half_thickness, sheet_parting + half_thickness
+    )
+    cavity_mesh_pos_offset = mm.offsetMesh(mm.voxelBooleanUnite(cavity_mesh_pos, sheet, voxel_size), offset=w, params=params)  # type: ignore
+    cavity_mesh_neg_offset = mm.offsetMesh(mm.voxelBooleanUnite(cavity_mesh_neg, sheet, voxel_size), offset=w, params=params)  # type: ignore
     # Generously: over the lining the case has nothing else near the divider. A
     # millimetre wider than the parting surface's grid, past the end posts' outer edge,
     # and a wall thickness more than the old wall each way, past its swept ends.
