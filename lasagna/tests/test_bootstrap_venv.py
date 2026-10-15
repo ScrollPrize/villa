@@ -1,6 +1,10 @@
 import unittest
 
-from lasagna.scripts.bootstrap_venv import parse_cuda_version, select_backend
+from lasagna.scripts.bootstrap_venv import (
+    environment_check_script,
+    parse_cuda_version,
+    select_backend,
+)
 
 
 class BootstrapVenvTests(unittest.TestCase):
@@ -17,6 +21,13 @@ class BootstrapVenvTests(unittest.TestCase):
     def test_old_driver_is_rejected(self):
         with self.assertRaisesRegex(RuntimeError, "CUDA 12.8 or newer"):
             select_backend((12, 7))
+
+    def test_check_script_runs_gpu_kernel_only_when_checking(self):
+        self.assertIn("device='cuda'", environment_check_script("cu128", False))
+        self.assertNotIn("device='cuda'", environment_check_script("cu128", True))
+        self.assertNotIn("device='cuda'", environment_check_script("cpu", False))
+        for backend, skip in (("cu128", False), ("cu128", True), ("cpu", False)):
+            compile(environment_check_script(backend, skip), "<check>", "exec")
 
 
 if __name__ == "__main__":

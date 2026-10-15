@@ -27,6 +27,10 @@
 class QuadSurface;
 class SurfacePatchIndex;
 
+// Interpolation used by QuadSurface::gen() when resampling the point grid.
+// See QuadSurface::setGenInterpolation() for what each mode does.
+enum class GenInterpolation { Linear, Smooth };
+
 // Reference to a valid point in the grid (for iteration)
 template<typename PointType>
 struct PointRef {
@@ -335,6 +339,23 @@ public:
     void shiftSurfaceOrigin(const cv::Vec2d& delta);
     [[nodiscard]] SurfaceSample sampleAtSurface(const cv::Vec2d& surface) const;
 
+    // How gen() resamples the point grid into the output raster.
+    //
+    // Linear  — bilinear positions, nearest-neighbour normals resampled from
+    //           the per-vertex normal cache. The source grid is typically much
+    //           coarser than the render (scale 0.05 => one cell spans ~20x20
+    //           output pixels), so the normal is piecewise-constant over those
+    //           blocks and any surface offset along it steps at cell edges.
+    // Smooth  — bicubic Hermite positions with the normal differentiated from
+    //           the same basis. Centered derivatives reproduce Catmull-Rom in
+    //           the interior; shared one-sided derivatives keep the surface C1
+    //           next to holes, grid borders and component boundaries.
+    //
+    // Set this before any concurrent gen(); like setStrictQuadRenderValidity it
+    // is not synchronized against in-flight renders.
+    void setGenInterpolation(GenInterpolation m) { _genInterpolation = m; }
+    [[nodiscard]] GenInterpolation genInterpolation() const { return _genInterpolation; }
+
     // The legacy renderer treats native vertex validity as pixel coverage.
     // Spiral's drawn-input view opts into the stricter contract that a rendered
     // location must be backed by a complete bilinear quad. The default remains
@@ -356,9 +377,28 @@ public:
     // ptr-space stores (col - center.x*scale.x, row - center.y*scale.y, 0).
     [[nodiscard]] cv::Vec2f ptrToGrid(const cv::Vec3f& ptr) const;
 
-    void save(const std::filesystem::path &path, const std::string &uuid, bool force_overwrite = false);
+    // Save under this surface's persistent object UUID (meta["uuid"]),
+    // minting one when meta has none. Use for in-place edits, renames and
+    // replicas of the same object. The directory name is never the identity.
     void save(const std::filesystem::path &path, bool force_overwrite = false);
+    // Save as a new object: always assigns a fresh object UUID first. Use for
+    // copies and derived outputs whose meta was taken from another surface.
+    // Removes catalog representation lookup metadata from the local copy.
+    void saveAsNew(const std::filesystem::path &path, bool force_overwrite = false);
+    // Save an edit of the surface read from `source`: writing back over
+    // `source` is an in-place edit (save), any other destination is a new
+    // object (saveAsNew).
+    void saveEdited(const std::filesystem::path &source,
+                    const std::filesystem::path &dest,
+                    bool force_overwrite = false);
+    // The object UUID is never passed alongside a path: set meta["uuid"]
+    // explicitly for a known identity. Deleted so a name argument cannot
+    // silently convert to force_overwrite.
+    void save(const std::filesystem::path&, const char*, bool = false) = delete;
+    void save(const std::filesystem::path&, const std::string&, bool = false) = delete;
     void save_meta();
+    // meta["uuid"], or empty when the surface has no persistent identity yet.
+    [[nodiscard]] std::string objectUuid() const;
     Rect3D bbox();
 
     bool isLoaded() const { return !_needsLoad; }
@@ -378,6 +418,10 @@ public:
     void setComponents(std::vector<std::pair<int, int>> components)
     {
         _components = std::move(components);
+        std::lock_guard<std::mutex> cacheLock(_cacheMutex);
+        _smoothDuCache.release();
+        _smoothDvCache.release();
+        _smoothDuvCache.release();
     }
 
     // Drop _points and all derived caches; ensureLoaded() will re-read from
@@ -433,6 +477,12 @@ public:
     // because gen() can be called from concurrent OMP threads.
     mutable std::atomic<bool> _validMaskAllValid{false};
     mutable cv::Mat_<cv::Vec3f> _normalCache;
+    // Per-vertex derivatives for the Smooth Hermite surface. Adjacent patches
+    // share these values, which makes both position and first derivatives agree
+    // at their common edge. Built lazily and only in Smooth mode.
+    mutable cv::Mat_<cv::Vec3f> _smoothDuCache;
+    mutable cv::Mat_<cv::Vec3f> _smoothDvCache;
+    mutable cv::Mat_<cv::Vec3f> _smoothDuvCache;
     // Guards derived-cache construction, invalidation and snapshot acquisition.
     // Readers retain immutable, reference-counted Mat snapshots after unlocking,
     // so unloadCaches() can evict the cache without freeing in-flight data.
@@ -518,13 +568,21 @@ protected:
     // Each pair is [col_start, col_end). Empty = single contiguous surface.
     std::vector<std::pair<int,int>> _components;
     bool _strictQuadRenderValidity = strictQuadRenderValidityDefault();
+    GenInterpolation _genInterpolation = GenInterpolation::Linear;
     float dpi_ = 0.f;
 
 private:
     cv::Mat_<uint8_t> validMaskSnapshot(bool* allValid) const;
+    // Lazily build and acquire ref-counted snapshots of the Smooth derivative
+    // caches. All three outputs have the same shape as _points.
+    void smoothDerivativeSnapshots(cv::Mat_<cv::Vec3f>& du,
+                                   cv::Mat_<cv::Vec3f>& dv,
+                                   cv::Mat_<cv::Vec3f>& duv) const;
 
     // Write surface data to directory without modifying state. skipChannel can be used to exclude a channel.
     void writeDataToDirectory(const std::filesystem::path& dir, const std::string& skipChannel = "");
+    void saveWithUuid(const std::filesystem::path& path, const std::string& uuid, bool force_overwrite);
+    std::string objectUuidOrNew() const;
     // Write a single ancillary channel as dir/<name>.tif.
     void writeChannelFile(const std::filesystem::path& dir, const std::string& name, const cv::Mat& mat);
     // Flag for lazy loading - true if points need to be loaded from path

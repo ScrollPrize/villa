@@ -23,6 +23,10 @@
       ]
     },
     "nlohmann-json",
+    {
+      "name": "sqlite3",
+      "features": ["rtree"]
+    },
     "curl",
     "tiff",
     "zlib",

@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { neuroglancerUrl } from "./dataAccess";
+import { webknossosDatasets } from "./buildIndex";
 
 // DataCatalog — the "Data & access" panel for a scroll detail page.
 // Ported from the reference renderer (ref/scroll.html ~104-127): a set of
@@ -35,10 +36,11 @@ function PathRow({ label, value }) {
   );
 }
 
-// "CT in Neuroglancer" picker for scrolls with several raw-CT OME-Zarr
-// volumes: a dbtn that opens a menu of per-volume Neuroglancer links, each
-// labeled with the volume id + resolution/energy. Click-away closes it.
-function CtVolumeDropdown({ volumes, display }) {
+// Picker for a quick link that covers several volumes — the raw-CT OME-Zarr
+// volumes in Neuroglancer, the scroll's WEBKNOSSOS datasets: a dbtn that opens
+// a menu of one link per volume, each labeled with its name + resolution (and
+// energy, where the metadata states one). Click-away closes it.
+function VolumeDropdown({ label, items }) {
   const [open, setOpen] = useState(false);
   const ref = useRef(null);
   useEffect(() => {
@@ -59,31 +61,23 @@ function CtVolumeDropdown({ volumes, display }) {
         aria-expanded={open}
         onClick={() => setOpen((o) => !o)}
       >
-        CT in Neuroglancer ({volumes.length}) ▾
+        {label} ({items.length}) ▾
       </button>
       {open ? (
         <div className="dbtn-menu" role="menu">
-          {volumes.map((v) => {
-            const detail = [
-              v.px != null ? `${v.px} µm` : null,
-              v.energy != null ? `${v.energy} keV` : null,
-            ]
-              .filter(Boolean)
-              .join(" · ");
-            return (
-              <a
-                key={v.id}
-                role="menuitem"
-                href={neuroglancerUrl(v.zarr, `${display} ${v.id}`)}
-                target="_blank"
-                rel="noopener noreferrer"
-                onClick={() => setOpen(false)}
-              >
-                {v.id}
-                {detail ? <span className="ddmeta"> {detail}</span> : null} ↗
-              </a>
-            );
-          })}
+          {items.map((it) => (
+            <a
+              key={it.key}
+              role="menuitem"
+              href={it.href}
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick={() => setOpen(false)}
+            >
+              {it.title}
+              {it.detail ? <span className="ddmeta"> {it.detail}</span> : null} ↗
+            </a>
+          ))}
         </div>
       ) : null}
     </span>
@@ -104,38 +98,41 @@ export default function DataCatalog({ scroll }) {
     "s3://vesuvius-challenge-open-data/",
   );
 
-  // Raw-CT OME-Zarr volumes → Neuroglancer. One volume keeps the plain button;
-  // several get a picker (CtVolumeDropdown).
+  // Raw-CT OME-Zarr volumes → Neuroglancer, and the scroll's WEBKNOSSOS
+  // datasets. One volume keeps the plain button; several get a picker
+  // (VolumeDropdown).
   const ctVolumes = (scroll.ctVolumes || []).filter((v) => v.zarr);
-  const ctUrl =
-    ctVolumes.length === 1
-      ? neuroglancerUrl(ctVolumes[0].zarr, `${scroll.display} CT`)
-      : null;
+  const ctItems = ctVolumes.map((v) => ({
+    key: v.id,
+    href: neuroglancerUrl(v.zarr, `${scroll.display} ${v.id}`),
+    title: v.id,
+    detail: [
+      v.px != null ? `${v.px} µm` : null,
+      v.energy != null ? `${v.energy} keV` : null,
+    ]
+      .filter(Boolean)
+      .join(" · "),
+  }));
+  const wkItems = webknossosDatasets(progress).map((d, i) => ({
+    key: d.url || i,
+    href: d.url,
+    title: d.name || "webknossos viewer",
+  }));
   const licenses = scroll.licenses || [];
   // Optional per-license scope annotations curated in atlasOverlay.json
   // (license name -> which of this scroll's data it covers).
   const licenseScope = scroll.licenseScope || null;
 
-  // Volume-level predictions are listed in their own Predictions table; here we
-  // only summarize the count in the metadata list.
-  const preds = scroll.predictions || [];
-  const nSurface = preds.filter((p) => p.purpose === "surface-prediction").length;
-  const nInk3d = preds.filter((p) => p.purpose === "ink-detection-3d").length;
-  const predsTxt = [
-    nSurface ? `${nSurface} surface` : null,
-    nInk3d ? `${nInk3d} 3D-ink` : null,
-  ]
-    .filter(Boolean)
-    .join(" · ");
-
   // Quick-link buttons (ref lines 108-112).
   const links = [];
-  if (progress.wkUrl) {
+  if (wkItems.length > 1) {
+    links.push(<VolumeDropdown key="wk" label="webknossos" items={wkItems} />);
+  } else if (wkItems.length === 1) {
     links.push(
       <a
         key="wk"
         className="dbtn"
-        href={progress.wkUrl}
+        href={wkItems[0].href}
         target="_blank"
         rel="noopener noreferrer"
       >
@@ -143,16 +140,16 @@ export default function DataCatalog({ scroll }) {
       </a>,
     );
   }
-  if (ctVolumes.length > 1) {
+  if (ctItems.length > 1) {
     links.push(
-      <CtVolumeDropdown key="ngct" volumes={ctVolumes} display={scroll.display} />,
+      <VolumeDropdown key="ngct" label="CT in Neuroglancer" items={ctItems} />,
     );
-  } else if (ctUrl) {
+  } else if (ctItems.length === 1) {
     links.push(
       <a
         key="ngct"
         className="dbtn"
-        href={ctUrl}
+        href={ctItems[0].href}
         target="_blank"
         rel="noopener noreferrer"
       >
@@ -187,12 +184,6 @@ export default function DataCatalog({ scroll }) {
     );
   }
 
-  // Metadata rows (ref lines 115-123).
-  const energies = scroll.energies || [];
-  const locations = scroll.locations || [];
-  const segments = scroll.n_segments;
-  const segmentsTxt =
-    segments != null ? Number(segments).toLocaleString() : "—";
 
   return (
     <div className="panel full catalog">
@@ -207,26 +198,8 @@ export default function DataCatalog({ scroll }) {
         )}
       </div>
       <dl className="meta">
-        <dt>Voxel size (min)</dt>
-        <dd>{scroll.min_px ? `${scroll.min_px} µm` : "—"}</dd>
-        <dt>Energies</dt>
-        <dd>{energies.length ? `${energies.join(", ")} keV` : "—"}</dd>
-        <dt>Source / beamline</dt>
-        <dd>{locations.join(", ") || "—"}</dd>
-        <dt>Scans / volumes</dt>
-        <dd>
-          {scroll.n_scans} / {scroll.n_volumes}
-        </dd>
-        <dt>Segments</dt>
-        <dd>{segmentsTxt}</dd>
         <dt>Formats</dt>
         <dd>CT volumes (TIFF stacks · OME-Zarr) · surface segments</dd>
-        {predsTxt ? (
-          <React.Fragment>
-            <dt>Predictions</dt>
-            <dd>{predsTxt}</dd>
-          </React.Fragment>
-        ) : null}
         <dt>License</dt>
         <dd>
           {licenses.length ? (

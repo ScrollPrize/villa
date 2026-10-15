@@ -111,7 +111,7 @@ def test_parse_vc3d_fiber_validates_and_preserves_xyz_order():
                 "control_points": [[1, 2, 3]],
             }
         )
-    with pytest.raises(ValueError, match="versions 1 and 3"):
+    with pytest.raises(ValueError, match="versions 1, 3 and 4"):
         parse_vc3d_fiber(
             {
                 "type": "vc3d_fiber",
