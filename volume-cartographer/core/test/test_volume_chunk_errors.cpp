@@ -156,3 +156,18 @@ TEST_CASE("Volume::readZYX treats missing sparse chunks as fill value")
         return value == 13;
     }));
 }
+
+
+TEST_CASE("Volume::readContiguousZYX propagates chunk errors")
+{
+    auto cache = makeCache(std::make_shared<ThrowingChunkFetcher>());
+    std::vector<uint8_t> out(64);
+    bool threw=false;
+    try {
+        Volume::readContiguousZYX(out,{4,4,4},{0,0,0},*cache);
+    } catch (const std::runtime_error& e) {
+        threw=true;
+        CHECK(std::string(e.what()).find("synthetic downloader exception") != std::string::npos);
+    }
+    CHECK(threw);
+}

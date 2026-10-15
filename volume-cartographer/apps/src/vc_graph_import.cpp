@@ -38,6 +38,16 @@ void usage()
         << "  --overlap-agreement <0..1>        (default 0.6)\n"
         << "  --overlap-min-fraction <0..1>     (default 0 = off)\n"
         << "  --overlap-edge-kind <name>        (default same-surface)\n"
+        << "  --link-fiber-patches <dir>       link fibers in <dir> to --segments patches\n"
+        << "  --ct <path>                     uint8 CT volume for linking (default normal source)\n"
+        << "  --normals-manifest <path>        use Lasagna normals in the same linker instead of CT\n"
+        << "  --ct-level <level>              CT pyramid level (default 0)\n"
+        << "  --ct-to-base-scale <factor>     selected CT voxel size in base units (default 1)\n"
+        << "  --fiber-scale <factor>           fiber XYZ -> working XYZ (default 1)\n"
+        << "  --patch-scale <factor>           patch XYZ -> working XYZ (default 1)\n"
+        << "  --working-to-base-scale <factor> working voxel size in common base units (default 1)\n"
+        << "  --fiber-strip-rows <n>           rows each side (default 1, at 20 vx)\n"
+        << "  --fiber-anchor-contact <vx>      minimum anchor contact (default 75)\n"
         << "  --import-json <path> import a vc_graph_export JSON document\n"
         << "  --export-json <path> write a vc_graph_export JSON document (- for stdout)\n"
         << "Creates the database if it does not exist. Imports run in one write\n"
@@ -57,6 +67,8 @@ void printReport(const char* what, const ImportReport& report)
 int main(int argc, char** argv)
 try {
     fs::path dbPath, fiberDir, segmentsDir, tracksPath, overlapDir, importJsonPath, exportJsonPath;
+    fs::path linkFiberDir, ctVolume;
+    vc::graph_links::FiberPatchParams fiberPatchParams;
     std::string author;
     vc::graph_links::PatchOverlapParams overlapParams;
     for (int i = 1; i < argc; ++i) {
@@ -81,6 +93,16 @@ try {
         else if (arg == "--overlap-agreement") overlapParams.minAgreementRatio = std::stod(next(arg.c_str()));
         else if (arg == "--overlap-min-fraction") overlapParams.minOverlapFraction = std::stod(next(arg.c_str()));
         else if (arg == "--overlap-edge-kind") overlapParams.edgeKind = next(arg.c_str());
+        else if (arg == "--link-fiber-patches") linkFiberDir = next(arg.c_str());
+        else if (arg == "--ct") ctVolume = next(arg.c_str());
+        else if (arg == "--normals-manifest") fiberPatchParams.normalsManifest = next(arg.c_str());
+        else if (arg == "--ct-level") fiberPatchParams.ctLevel = std::stoi(next(arg.c_str()));
+        else if (arg == "--ct-to-base-scale") fiberPatchParams.ctToBaseScale = std::stod(next(arg.c_str()));
+        else if (arg == "--fiber-scale") fiberPatchParams.fiberScale = std::stod(next(arg.c_str()));
+        else if (arg == "--patch-scale") fiberPatchParams.patchScale = std::stod(next(arg.c_str()));
+        else if (arg == "--working-to-base-scale") fiberPatchParams.workingToBaseScale = std::stod(next(arg.c_str()));
+        else if (arg == "--fiber-strip-rows") fiberPatchParams.stripRowsEachSide = std::stoi(next(arg.c_str()));
+        else if (arg == "--fiber-anchor-contact") fiberPatchParams.anchorContact = std::stod(next(arg.c_str()));
         else if (arg == "--import-json") importJsonPath = next("--import-json");
         else if (arg == "--export-json") exportJsonPath = next("--export-json");
         else if (arg == "--help" || arg == "-h") {
@@ -94,6 +116,9 @@ try {
         usage();
         return 2;
     }
+
+    if (!linkFiberDir.empty() && (segmentsDir.empty() || (ctVolume.empty() && fiberPatchParams.normalsManifest.empty())))
+        throw std::runtime_error("--link-fiber-patches requires --segments and either --ct or --normals-manifest");
 
     OpenOptions options;
     options.author = author;
@@ -109,7 +134,7 @@ try {
         w.commit();
         printReport("fibers", report);
     }
-    if (!segmentsDir.empty()) {
+    if (!segmentsDir.empty() && linkFiberDir.empty()) {
         auto w = db.write();
         ImportReport report = importPatches(db, w, segmentsDir);
         w.commit();
@@ -124,6 +149,15 @@ try {
     if (!overlapDir.empty()) {
         const auto report = vc::graph_links::linkPatchOverlaps(db, overlapDir, overlapParams);
         std::cout << "patch-overlaps: " << report.objectsConsidered << " patches, "
+                  << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
+                  << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
+        for (const auto& problem : report.problems)
+            std::cerr << "  ! " << problem << "\n";
+    }
+    if (!linkFiberDir.empty()) {
+        const auto report = vc::graph_links::linkFibersToPatches(
+            db, linkFiberDir, segmentsDir, ctVolume, fiberPatchParams);
+        std::cout << "fiber-patches: " << report.objectsConsidered << " objects, "
                   << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
                   << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
         for (const auto& problem : report.problems)

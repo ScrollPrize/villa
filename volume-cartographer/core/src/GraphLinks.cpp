@@ -68,7 +68,8 @@ DetectorReport placeholder(graph::GraphDb& db, const char* detectorName,
 }  // namespace
 
 DetectorReport commitCandidates(graph::GraphDb& db, const std::string& detectorName, int detectorVersion,
-                                const std::vector<LinkCandidate>& candidates, bool replaceStalePending)
+                                const std::vector<LinkCandidate>& candidates, bool replaceStalePending,
+                                const StaleEdgeScope* staleScope)
 {
     if (detectorName.empty())
         throw std::runtime_error("graph links: detector name must be non-empty");
@@ -79,6 +80,12 @@ DetectorReport commitCandidates(graph::GraphDb& db, const std::string& detectorN
 
     std::set<std::string> kinds;
     for (const auto& c : candidates) kinds.insert(c.kind);
+    std::set<std::string> scopedKinds, scopedObjects;
+    if (staleScope) {
+        scopedKinds.insert(staleScope->edgeKinds.begin(), staleScope->edgeKinds.end());
+        scopedObjects.insert(staleScope->objectUuids.begin(), staleScope->objectUuids.end());
+        kinds.insert(scopedKinds.begin(), scopedKinds.end());
+    }
 
     std::unordered_map<std::string, EdgeRecord> existing;
     for (const auto& kind : kinds)
@@ -91,6 +98,8 @@ DetectorReport commitCandidates(graph::GraphDb& db, const std::string& detectorN
     if (replaceStalePending) {
         std::vector<std::string> staleKeys;
         for (const auto& [key, e] : existing) {
+            if (staleScope && (!scopedKinds.contains(e.kind) || !scopedObjects.contains(e.aUuid) ||
+                               !scopedObjects.contains(e.bUuid))) continue;
             if (candidateKeys.contains(key)) continue;
             if (e.approvalState != "pending") continue;  // reviewed edges are never touched
             if (!isDetectorsOwnEdge(e, detectorName)) continue;
@@ -131,13 +140,6 @@ DetectorReport commitCandidates(graph::GraphDb& db, const std::string& detectorN
 
     txn.commit();
     return report;
-}
-
-DetectorReport linkFibersToPatches(graph::GraphDb& db, const FiberPatchParams& /*params*/,
-                                   const std::atomic_bool* cancel)
-{
-    // TODO: fiber line points vs patch surfaces (distance + coverage).
-    return placeholder(db, kFiberPatchDetector, {"fiber", "patch"}, cancel);
 }
 
 DetectorReport linkFibersToFibers(graph::GraphDb& db, const FiberFiberParams& /*params*/,

@@ -3,18 +3,22 @@
 // vc_graph_export JSON format: kind is a field in the dict, never part
 // of a method name, and arbitrary extra metadata rides in "meta".
 
+#include <algorithm>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/array.h>
+#include <nanobind/stl/filesystem.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
 #include "vc/core/graph/GraphDb.hpp"
 #include "vc/core/graph_links/GraphLinks.hpp"
+#include "vc/core/util/CtSheetNormal.hpp"
 
 namespace nb = nanobind;
 namespace vg = vc::graph;
@@ -369,6 +373,20 @@ struct PyWriteTxn {
 
 NB_MODULE(graph, m)
 {
+    nb::class_<vc::CtSheetNormalSampler>(m, "CtSheetNormalSampler")
+        .def(nb::init<const std::filesystem::path&, int, double>(),
+             nb::arg("ct_volume"), nb::arg("level") = 0, nb::arg("working_to_ct_scale") = 1.0)
+        .def("sample_normal", [](const vc::CtSheetNormalSampler& self, const std::array<double, 3>& xyz) {
+            vc::CtSheetNormal sample;
+            { nb::gil_scoped_release release; sample = self.sampleNormal({xyz[0], xyz[1], xyz[2]}); }
+            nb::dict result;
+            result["normal"] = std::array<double, 3>{sample.normal[0], sample.normal[1], sample.normal[2]};
+            result["valid"] = sample.valid;
+            result["gap"] = sample.gap;
+            result["reason"] = sample.reason;
+            return result;
+        }, nb::arg("point_xyz"));
+
     m.doc() = "Unified metadata graph database (vc_graph). Records are dicts; "
               "'kind' is metadata in the dict, never part of a method name.";
 
@@ -598,6 +616,54 @@ NB_MODULE(graph, m)
             },
             "Run the patch-overlap detector over the tifxyz segment dirs in dir; "
             "kwargs mirror PatchOverlapParams (tolerance, min_minor_spread, ...).")
+        .def(
+            "link_fibers_to_patches",
+            [](PyGraphDb& self, const std::string& fibersDir, const std::string& patchesDir,
+               const std::string& ctVolume, const nb::kwargs& kwargs) {
+                vc::graph_links::FiberPatchParams p;
+                for (auto item : kwargs) {
+                    const std::string key = nb::cast<std::string>(item.first);
+                    const nb::handle val = item.second;
+                    if (key == "fiber_scale") p.fiberScale = nb::cast<double>(val);
+                    else if (key == "patch_scale") p.patchScale = nb::cast<double>(val);
+                    else if (key == "normals_manifest") p.normalsManifest = nb::cast<std::string>(val);
+                    else if (key == "ct_level") p.ctLevel = nb::cast<int>(val);
+                    else if (key == "ct_to_base_scale") p.ctToBaseScale = nb::cast<double>(val);
+                    else if (key == "working_to_base_scale") p.workingToBaseScale = nb::cast<double>(val);
+                    else if (key == "proximity") p.proximity = nb::cast<double>(val);
+                    else if (key == "min_contacts") p.minContacts = nb::cast<std::size_t>(val);
+                    else if (key == "strip_spacing") p.stripSpacing = nb::cast<double>(val);
+                    else if (key == "strip_rows_each_side") p.stripRowsEachSide = nb::cast<int>(val);
+                    else if (key == "strip_march_step") p.stripMarchStep = nb::cast<double>(val);
+                    else if (key == "contact_gap") p.contactGap = nb::cast<double>(val);
+                    else if (key == "anchor_contact") p.anchorContact = nb::cast<double>(val);
+                    else if (key == "same_sheet") p.sameSheet = nb::cast<double>(val);
+                    else if (key == "adjacent_low") p.adjacentLow = nb::cast<double>(val);
+                    else if (key == "adjacent_high") p.adjacentHigh = nb::cast<double>(val);
+                    else if (key == "same_normal") p.sameNormal = nb::cast<double>(val);
+                    else if (key == "adjacent_normal") p.adjacentNormal = nb::cast<double>(val);
+                    else if (key == "grow_same") p.growSame = nb::cast<double>(val);
+                    else if (key == "grow_ratio") p.growRatio = nb::cast<double>(val);
+                    else if (key == "strip_gate_ratio") p.stripGateRatio = nb::cast<double>(val);
+                    else if (key == "strip_gate_margin") p.stripGateMargin = nb::cast<double>(val);
+                    else if (key == "strip_margin") p.stripMargin = nb::cast<double>(val);
+                    else if (key == "max_rounds") p.maxRounds = nb::cast<int>(val);
+                    else if (key == "edge_kind") p.edgeKind = nb::cast<std::string>(val);
+                    else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(val);
+                    else if (key == "strip_weights") {
+                        const auto weights = nb::cast<std::vector<double>>(val);
+                        if (weights.size() != p.stripWeights.size())
+                            throw std::runtime_error("strip_weights requires four values");
+                        std::copy(weights.begin(), weights.end(), p.stripWeights.begin());
+                    } else throw std::runtime_error("link_fibers_to_patches: unknown parameter '" + key + "'");
+                }
+                return detectorReportToPy(vc::graph_links::linkFibersToPatches(
+                    self.require(), fibersDir, patchesDir, ctVolume, p));
+            },
+            nb::arg("fibers_dir"), nb::arg("patches_dir"), nb::arg("ct_volume"), nb::arg("kwargs"),
+            "Link fiber JSONs to tifxyz patches using CT sheet normals; creates pending edges. "
+            "kwargs mirror FiberPatchParams; normals_manifest selects a Lasagna reference source. "
+            "The default strip has one row at 20 voxels on each side.")
         .def(
             "write",
             [](PyGraphDb& self) {

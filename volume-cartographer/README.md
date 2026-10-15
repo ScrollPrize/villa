@@ -406,3 +406,96 @@ _Widget for creating initial segmentations which can be used for traces or later
 - `Expand seeds` : expands the current seed points to the given number of iterations
 - `Clear all paths` : clears any user drawn paths / points (use this over the clear buttons most of the time)
 - `Start label wraps` : this is used for absolute or relative wrap labels, is not used during the seeding step, will detail in another document
+
+### Fiber-to-patch graph links
+
+`vc_graph_import` proposes pending fiber-to-patch links using CT sheet normals:
+
+```sh
+build/bin/vc_graph_import --db graph.vcgr --author "$USER" \
+  --link-fiber-patches /path/to/fibers --segments /path/to/patches \
+  --ct /path/to/ct.zarr --ct-level 0
+```
+
+Inputs are fiber JSON files, tifxyz patch directories with valid UUIDs, and a
+uint8 CT volume. The detector registers missing objects, finds anchors through
+long fiber contact and strip agreement, then grows through same-sheet patch
+overlap. The strip has the centerline plus **one row on each side at 20 working
+voxels**. `--fiber-strip-rows` and `--fiber-anchor-contact` control its width and
+minimum anchor contact (default 75 working voxels).
+
+Normals use the selected CT-only estimator: a 2/24 isotropic seed, followed by
+three 1/24/4 anisotropic tensor refinements with gradient magnitude weighting.
+Widths are selected CT voxels. The current sampler integrates on a global
+three-voxel lattice within radius 48, using full-resolution Gaussian derivatives
+and a complete six-voxel derivative halo. It reuses gradient tiles across nearby
+queries and evaluates weights at the original query position. Flat or ambiguous
+CT has no valid normal. The default CT path needs no Lasagna manifest and does
+not use `pred_dt` snapping. Measured patch-normal errors and workflow timings
+are recorded below. Historical seven-row link accuracy has not been established
+for this variant.
+
+`--fiber-scale` and `--patch-scale` multiply source XYZ into common working
+voxels (defaults 1). `--working-to-base-scale` and `--ct-to-base-scale` specify
+working and **selected-level CT** voxel sizes in common base units (defaults 1).
+CT coordinates are working XYZ times their ratio; the level adds no extra scaling.
+For full-resolution fibers, quarter-resolution patches and quarter-resolution CT:
+`--fiber-scale 0.25 --patch-scale 1 --working-to-base-scale 4 --ct-to-base-scale 4`.
+All link thresholds and strip spacing use working voxels. Scaling is in memory;
+files, anchor positions, and registered geometry retain source coordinates.
+
+For a controlled comparison, `--normals-manifest /path/to/normals.lasagna.json`
+selects Lasagna normals through the **same** strip marching, contact, anchor and
+growth code. `--ct` is then optional. Lasagna uses `--working-to-base-scale`;
+CT level/scaling options apply only to CT. Both sources leave `pred_dt` snapping
+disabled. Python accepts the equivalent `normals_manifest` keyword. This option
+allows measuring normal-source effects without changing strip width or gates.
+
+Edges record measurements, rounds, coordinate scales, the actual normal source,
+estimator ID, and detector version 2. Reruns preserve reviewed/manual edges; stale pending links
+are removed only for successfully processed inputs. Failed inputs are excluded.
+
+C++ exposes `vc::graph_links::linkFibersToPatches`. Python exposes
+`GraphDb.link_fibers_to_patches(fibers_dir, patches_dir, ct_volume, **kwargs)`;
+snake_case keywords match `FiberPatchParams`, including `ct_level` and
+`ct_to_base_scale`. `vc.graph.CtSheetNormalSampler` exposes the same estimator
+for numerical verification and direct normal queries.
+
+### CT normal validation
+
+The default method is **`ct-anisotropic-1-24-4-grid3-r48-v4`**. Its radius-48
+support contains 33³ quadrature samples. A 1024-entry indexed LRU caches
+48-voxel gradient tiles; missing tiles share a bounding CT read. Independent
+strip columns march in reverse order to reuse tiles from the centerline pass.
+Retained sampler storage is about **102 MiB**, excluding the shared CT chunk
+cache. The selected CT level defaults to 0; changing levels does not rescale
+the estimator's widths automatically.
+
+Validation on 535 saved regression probes (508 patch points and 27 fiber
+points) produced valid normals for both CT and Lasagna at every point. Angular
+errors are unsigned normal-axis errors against patch geometry:
+
+| Probe set / method | Mean error | Median error | p95 error | Maximum error |
+| --- | ---: | ---: | ---: | ---: |
+| Patch points, CT | 2.70° | 2.26° | 5.95° | 24.70° |
+| Patch points, Lasagna | 3.38° | 2.92° | 7.15° | 18.00° |
+| Fiber points, CT | 3.20° | 2.71° | 7.29° | 11.21° |
+| Fiber points, Lasagna | 4.24° | 4.01° | 9.41° | 10.37° |
+
+CT has better mean/median/p95 error on these probes, but worse maximum error.
+These reused regression probes are not a new unseen holdout or a measurement
+of link precision.
+
+Small-workflow timing on Linux/aarch64, GCC 13, RelWithDebInfo, using level 0 of
+`s1_ds2.zarr`, separate processes and warm OS caches:
+
+| Workflow | CT total | Lasagna total | CT normal sampling |
+| --- | ---: | ---: | ---: |
+| Two fibers, 849 candidate patches | 4.75 s | 1.16 s | 3.43 s |
+| One fiber, three patches | 0.83 s | 0.12 s | 0.67 s |
+
+The two-fiber input made 5,589 valid normal calls and produced no links. The
+selected positive case made 1,242 valid calls and retained the same three links
+and two anchors with both normal sources. No full-collection workflow was run.
+The standalone benchmark and experiment scripts were removed after this work;
+these numbers record the completed validation, not a bundled benchmark suite.

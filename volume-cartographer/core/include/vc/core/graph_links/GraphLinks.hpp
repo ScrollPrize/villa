@@ -11,6 +11,7 @@
 // lives here (and in vc_core). Detector entry points are placeholders
 // until their geometry passes land; the commit plumbing is final.
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
@@ -52,6 +53,13 @@ struct DetectorReport {
     std::vector<std::string> problems;
 };
 
+// Optional stale-edge scope for a partial detector run. Both endpoints
+// must be in objectUuids; empty sets deliberately remove nothing.
+struct StaleEdgeScope {
+    std::vector<std::string> edgeKinds;
+    std::vector<std::string> objectUuids;
+};
+
 // Commits candidates as edges in one write transaction:
 // - each new edge gets meta.detector = {name, version, score?} merged
 //   over candidate.meta, and starts life 'pending' (vc_graph default);
@@ -64,12 +72,15 @@ struct DetectorReport {
 //   when individual pairs change; an empty batch removes nothing).
 //   Approved, rejected, manually created, and other detectors'
 //   edges are never touched.
+// - with staleScope, stale removal uses its explicit kinds and requires
+//   both endpoints in its object set, including for an empty batch.
 DetectorReport commitCandidates(graph::GraphDb& db, const std::string& detectorName, int detectorVersion,
                                 const std::vector<LinkCandidate>& candidates,
-                                bool replaceStalePending = true);
+                                bool replaceStalePending = true,
+                                const StaleEdgeScope* staleScope = nullptr);
 
 // --- Detectors ---
-// linkPatchOverlaps is implemented; the rest are placeholders that
+// Patch overlap and fiber->patch are implemented; the rest are placeholders that
 // count the objects they would consider, write nothing, and report
 // "not implemented". Signatures and parameter structs are final
 // shapes so callers can be wired now.
@@ -121,14 +132,68 @@ DetectorReport linkPatchOverlaps(graph::GraphDb& db, const std::filesystem::path
                                  const PatchOverlapParams& params = {},
                                  const std::atomic_bool* cancel = nullptr);
 
+// Parameters for the fiber->patch auto-linker, ported from
+// vc::constraints::AutoLink. The historical review results apply to
+// the original ribbon, not this reduced-width variant. Distances are in
+// volume voxels. The strip is deliberately reduced relative to the
+// original 7-row ribbon: stripRowsEachSide rows at stripSpacing on
+// each side of the centerline (default: one row at 20 vx each side).
 struct FiberPatchParams {
-    double maxDistanceVoxels = 3.0;    // fiber line point -> surface distance
-    double minCoverageFraction = 0.5;  // fraction of the fiber within tolerance
+    // Isotropic coordinate multipliers: source XYZ * scale = working XYZ.
+    // All detector distances are working voxels. Working XYZ multiplied by
+    // workingToBaseScale / ctToBaseScale addresses selected CT voxels.
+    // ctToBaseScale includes the selected level; no extra pyramid scaling.
+    double fiberScale = 1.0;
+    double patchScale = 1.0;
+    double workingToBaseScale = 1.0;
+    double ctToBaseScale = 1.0;
+    int ctLevel = 0;
+    // Optional Lasagna reference source for an otherwise identical strip/link
+    // pipeline. Empty selects CT. Lasagna coordinates use workingToBaseScale.
+    std::string normalsManifest;
+    // Discovery: fiber dense-line point -> patch surface distance.
+    double proximity = 1.5;
+    std::size_t minContacts = 2;
+    // Fiber strip (normal-field ribbon around the fiber).
+    double stripSpacing = 20.0;   // column spacing and row spacing (vx)
+    int stripRowsEachSide = 1;    // 1 = centerline +/- one row (3 rows total)
+    double stripMarchStep = 5.0;  // marching step across the sheet (vx)
+    // Anchors and growth (AutoLinkSettings).
+    double contactGap = 40.0;        // arclength gap splitting contact runs
+    double anchorContact = 75.0;     // min merged contact run length (vx)
+    double sameSheet = 3.0;          // vertex-surface distance counted as same sheet
+    double adjacentLow = 4.5, adjacentHigh = 16.0;  // adjacent-sheet distance band
+    double sameNormal = 0.7, adjacentNormal = 0.85; // |cos| normal agreement
+    double growSame = 0.1;           // min same-sheet vertex fraction vs linked set
+    double growRatio = 2.0;          // same fraction must exceed ratio * adjacent
+    std::array<double, 4> stripWeights{1.0, 0.7, 0.4, 0.15};  // trust by row from centerline
+    double stripGateRatio = 1.5;     // anchor: strip same > ratio * adjacent + margin
+    double stripGateMargin = 0.0;
+    double stripMargin = 20.0;       // bbox margin for strip/patch queries
+    int maxRounds = 8;
     std::string edgeKind = "same-surface";
     bool replaceStalePending = true;
 };
-// Fiber -> patch: the fiber lies on the patch's surface.
-DetectorReport linkFibersToPatches(graph::GraphDb& db, const FiberPatchParams& params = {},
+// Fiber -> patch auto-linking, a port of vc::constraints::autoLinkFiber
+// (removed constraint-graph workspace; see ConstraintGraph.md in git
+// history). Loads vc3d_fiber JSON files from fibersDir and tifxyz
+// segment dirs from patchesDir, registers fiber/patch objects by UUID
+// where missing, and per fiber: discovers candidate patches by dense
+// line-point proximity, builds the (reduced) normal-field strip from
+// CT intensities at ctVolume, links long-contact patches
+// that agree with the strip as anchors, then grows the linked set by
+// same-sheet overlap until stable. Linked pairs become pending edges
+// (fiber anchor at the control point nearest the median contact) with
+// the linker measurements as provenance. Source geometry is scaled only
+// in memory; anchor positions and registered object geometry remain in
+// source coordinates. Provenance records the coordinate multipliers.
+// Cancellation returns a problem without committing edges. Failed fibers
+// and unreadable patches are excluded from stale-edge removal, as are
+// objects outside these input directories.
+DetectorReport linkFibersToPatches(graph::GraphDb& db, const std::filesystem::path& fibersDir,
+                                   const std::filesystem::path& patchesDir,
+                                   const std::filesystem::path& ctVolume,
+                                   const FiberPatchParams& params = {},
                                    const std::atomic_bool* cancel = nullptr);
 
 struct FiberFiberParams {

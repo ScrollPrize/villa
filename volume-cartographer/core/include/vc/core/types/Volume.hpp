@@ -193,6 +193,18 @@ public:
                         vc::render::IChunkedArray& array,
                         int level = 0);
 
+    // Same integer read, clipping, fill and errors as readZYX, but write
+    // X-contiguous ZYX storage. out.size() must equal the shape's product.
+    // Requires an existing level; no virtual downsampling.
+    static void readContiguousZYX(std::span<uint8_t> out,
+                                  const std::array<size_t,3>& shapeZYX,
+                                  const std::array<int,3>& offsetZYX,
+                                  vc::render::IChunkedArray& array, int level = 0);
+    static void readContiguousZYX(std::span<uint16_t> out,
+                                  const std::array<size_t,3>& shapeZYX,
+                                  const std::array<int,3>& offsetZYX,
+                                  vc::render::IChunkedArray& array, int level = 0);
+
     // UI/coordinate-order convenience:
     //   offset = [x, y, z], shape = [x, y, z].
     // Returned Array3D is still stored/indexed as [z, y, x].
