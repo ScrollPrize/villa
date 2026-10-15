@@ -165,6 +165,9 @@ class ScrollMesh:
         surface between the halves may leave the S-shaped divider; no more than the
         case's upper and lower margins, where the caps (split on the divider) begin.
         Defaults to 2.5.
+        parting_land_mm: Width of the level land around the scroll's outline, over
+        which the parting surface leaves it across the pull, so the halves meet the
+        cavity's rim square. Defaults to 3.
         parting_max_slope_deg: Steepest the parting surface may be in returning to the
         divider at those ends, so the halves do not slide along each other there.
         Defaults to 50.
@@ -195,6 +198,7 @@ class ScrollMesh:
     cylinder_axis: Optional[tuple[float, float, float]] = None
     parting_z_margin_mm: float = 2.5
     parting_max_slope_deg: float = 50
+    parting_land_mm: float = 3
     rotation_search: bool = True
     rotation_search_depth_tolerance_mm: float = 5
     rotation_search_min_gain: float = 0.01
@@ -314,6 +318,7 @@ def _parting_surface(
     wall_thickness_mm: float,
     z_margin_mm: float,
     max_slope_deg: float,
+    land_mm: float,
     pitch: float,
     iterations: int = 20000,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -326,7 +331,10 @@ def _parting_surface(
     neighbouring columns: so each half meets the scroll on its side however the scroll
     lies, and where the scroll lies off the divider the surface leaves it at its edge,
     where the inner half narrows to a line, as a mould's parting line follows an
-    object's outline, rather than folding back along one face of it. Elsewhere it
+    object's outline, rather than folding back along one face of it. For land_mm
+    around that outline it carries on level from it, as a mould's parting surface
+    leaves an object across the pull, so that each half meets the cavity's rim (whose
+    wall runs along the pull) square rather than in a knife edge. Elsewhere it
     departs from the divider as smoothly as it can: the departure is harmonic, zero at
     the region's ends along the axis (where the caps, split on the divider, begin) and
     free at its sides, found by red-black successive over-relaxation. Then it is made no steeper than
@@ -376,7 +384,34 @@ def _parting_surface(
     middle = np.clip(middle, lo, hi)
 
     departure = np.where(bound, middle - divider, 0)
-    free = ~bound
+
+    # The level land around the outline: grown out a step at a time, each new point
+    # taking the mean height of its neighbours already set.
+    fixed = bound.copy()
+    height = np.where(bound, middle, 0)
+    land = np.zeros_like(bound)
+    for _ in range(int(round(land_mm / pitch))):
+        total = np.zeros_like(height)
+        count = np.zeros_like(height)
+        for di, dj in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            total += np.roll(np.roll(np.where(fixed, height, 0), di, 0), dj, 1)
+            count += np.roll(np.roll(fixed, di, 0), dj, 1)
+        grow = ~fixed & (count > 0)
+        grow[:, [0, -1]] = False
+        height = np.where(grow, total / np.maximum(count, 1), height)
+        fixed |= grow
+        land |= grow
+    departure = np.where(land, height - divider, departure)
+    # Held while smoothing, but for its outer millimetre, to blend into the rest.
+    held_land = land.copy()
+    for _ in range(int(round(1 / pitch))):
+        edge = np.zeros_like(held_land)
+        for di, dj in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            edge |= ~np.roll(np.roll(fixed, di, 0), dj, 1)
+        held_land &= ~edge
+        fixed &= ~edge | bound
+    held = departure.copy()
+    free = ~(bound | land)
     free[:, [0, -1]] = False
 
     n = max(len(xs), len(zs))
@@ -404,6 +439,7 @@ def _parting_surface(
         padded = np.pad(d, 1, mode="edge")
         d = sum(padded[1 + di : 1 + di + d.shape[0], 1 + dj : 1 + dj + d.shape[1]] for di in (-1, 0, 1) for dj in (-1, 0, 1)) / 9
         d = np.where(bound, np.clip(d, lo - divider, hi - divider), d)
+        d = np.where(held_land, held, d)
         d[:, [0, -1]] = 0
 
     # No steeper than max_slope_deg between neighbours: alternately limit each point's
@@ -609,6 +645,7 @@ def build_lining(
         mesh_params.wall_thickness_mm,
         mesh_params.parting_z_margin_mm,
         mesh_params.parting_max_slope_deg,
+        mesh_params.parting_land_mm,
         min(voxel_size, 0.5),
     )
     extent = 112.5  # build_divider_solid's reach for build_lining's case_max_radius

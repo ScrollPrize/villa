@@ -17,7 +17,7 @@ def box(lo, hi):
 
 
 def parting(scroll):
-    return mesh._parting_surface(scroll, 2, LINING_OUTER_RADIUS, WALL, 2.5, 50, PITCH)
+    return mesh._parting_surface(scroll, 2, LINING_OUTER_RADIUS, WALL, 2.5, 50, 3, PITCH)
 
 
 class HeightfieldSolidTests(unittest.TestCase):
@@ -48,6 +48,11 @@ class PartingSurfaceTests(unittest.TestCase):
         # Through the lined scroll's inner half (y from 8 to 16).
         self.assertGreaterEqual(height[over].min(), 10 - PITCH)
         self.assertLessEqual(height[over].max(), 14 + PITCH)
+        # Level across the lined scroll's outline (at x = -22 and 22) for the land.
+        mid = np.argmin(np.abs(zs - 10))
+        for x0, x1 in ((-22, -24), (22, 24)):
+            i0, i1 = np.argmin(np.abs(xs - x0)), np.argmin(np.abs(xs - x1))
+            self.assertLess(abs(height[i1, mid] - height[i0, mid]), 0.3)
         # Back on the divider at the region's ends along the axis.
         divider = curved_divider_wall.divider_y(xs, LINING_OUTER_RADIUS, WALL)
         self.assertLess(np.abs(height[:, 0] - divider).max(), 1e-6)
