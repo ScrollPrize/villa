@@ -166,6 +166,14 @@ class ScrollMesh:
         the scroll. Defaults to 1.
         protrusion_clearance_mm: Clearance between such a protrusion and the lining of
         the half it slides into. Defaults to 1.
+        rotation_search: After rotation_callback, turn the mesh about the cylinder axis
+        to where the split leaves the scroll least room (rotation_minimising_fill), so
+        the protrusions are smallest. Defaults to True.
+        rotation_search_depth_tolerance_mm: Only consider rotations whose pocket depth
+        is within this of the shallowest. Defaults to 5.
+        rotation_search_min_gain: Keep the rotation_callback's split unless the search
+        cuts the room by at least this fraction of the lined scroll's volume. Defaults
+        to 0.01.
 
     """
 
@@ -185,6 +193,9 @@ class ScrollMesh:
     cylinder_axis: Optional[tuple[float, float, float]] = None
     protrusion_min_gap_mm: float = 1
     protrusion_clearance_mm: float = 1
+    rotation_search: bool = True
+    rotation_search_depth_tolerance_mm: float = 5
+    rotation_search_min_gain: float = 0.01
 
 
 def _sweep(mesh: mm.Mesh, toward: mm.Vector3f, voxel_size: float, length: float):
@@ -199,6 +210,112 @@ def _translated(mesh: mm.Mesh, y: float):
     moved = _copy_meshlib(mesh)
     moved.transform(mm.AffineXf3f.translation(mm.Vector3f(0, y, 0)))
     return moved
+
+
+def _lined_grid(
+    mesh: mm.Mesh, lining_offset_mm: float, pitch: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Voxels of a pitch-sized grid within lining_offset_mm of the mesh's interior, as a
+    boolean array indexed [x, y, z], and the position of voxel [0, 0, 0]'s centre."""
+    box = mesh.computeBoundingBox()
+    pad = lining_offset_mm + pitch
+    params = mm.MeshToDistanceVolumeParams()
+    params.vol.origin = mm.Vector3f(box.min.x - pad, box.min.y - pad, box.min.z - pad)
+    params.vol.voxelSize = mm.Vector3f(pitch, pitch, pitch)
+    size = box.size()
+    params.vol.dimensions = mm.Vector3i(
+        *[int(np.ceil((s + 2 * pad) / pitch)) + 1 for s in (size.x, size.y, size.z)]
+    )
+    params.dist.signMode = mm.SignDetectionMode.HoleWindingRule
+    volume = mn.getNumpy3Darray(mm.meshToDistanceVolume(mm.MeshPart(mesh), params))
+    origin = np.array([params.vol.origin.x, params.vol.origin.y, params.vol.origin.z])
+    return volume < lining_offset_mm, origin + pitch / 2
+
+
+def split_fill_and_depth(
+    mesh: mm.Mesh,
+    angle_rad: float,
+    lining_outer_radius: float,
+    lining_offset_mm: float,
+    wall_thickness_mm: float,
+    pitch: float,
+) -> tuple[float, float, float]:
+    """Fill and pocket depth of the case split, with the mesh rotated by angle_rad
+    (anticlockwise) about Z, and the lined mesh's volume, all from a pitch-sized grid.
+
+    Each half's cavity is pullable along Y, so in every (x, z) column it spans from the
+    divider to the lined mesh's farthest voxel on that side. The fill, in mm^3, is the
+    cavity beyond the lined mesh: the room the scroll has to move in, before the
+    protrusions that take it up. The depth is the farthest lined voxel from the divider
+    over both halves.
+    """
+    rotated = _copy_meshlib(mesh)
+    # affine_rotation(a) rotates by -a.
+    rotated.transform(affine_rotation(-angle_rad))
+    lined, centre = _lined_grid(rotated, lining_offset_mm, pitch)
+    x = centre[0] + pitch * np.arange(lined.shape[0])
+    y = centre[1] + pitch * np.arange(lined.shape[1])
+    # Distance of each voxel from the divider, along Y, for each column [x, :, z].
+    beyond = (
+        y[None, :] - curved_divider_wall.divider_y(x, lining_outer_radius, wall_thickness_mm)[:, None]
+    )[:, :, None]
+    fill, depth = 0.0, 0.0
+    for side in (lined & (beyond > 0), lined & (beyond <= 0)):
+        farthest = np.where(side, np.abs(beyond), 0).max(axis=1)
+        count = side.sum(axis=1)
+        fill += ((farthest / pitch + 0.5)[count > 0] - count[count > 0]).clip(min=0).sum() * pitch**3
+        depth = max(depth, farthest.max() + pitch / 2)
+    return fill, depth, lined.sum() * pitch**3
+
+
+def rotation_minimising_fill(
+    mesh: mm.Mesh,
+    lining_outer_radius: float,
+    lining_offset_mm: float,
+    wall_thickness_mm: float,
+    depth_tolerance_mm: float,
+    min_gain: float,
+    pitch: float = 0.5,
+) -> float:
+    """Rotation about Z (radians, anticlockwise) giving the least fill (see
+    split_fill_and_depth) among those whose pocket depth is within depth_tolerance_mm
+    of the shallowest, searched every 10 degrees and then every degree around the best.
+    Zero unless that cuts the fill by at least min_gain times the lined mesh's volume.
+
+    The divider is symmetric under a half turn, so angles in [0, 180) degrees cover it.
+    """
+    evaluated = {}
+
+    def evaluate(degrees):
+        for d in degrees:
+            d %= 180
+            if d not in evaluated:
+                evaluated[d] = split_fill_and_depth(
+                    mesh,
+                    np.radians(d),
+                    lining_outer_radius,
+                    lining_offset_mm,
+                    wall_thickness_mm,
+                    pitch,
+                )
+
+    def best():
+        shallowest = min(depth for _, depth, _ in evaluated.values())
+        ok = [d for d, (_, depth, _) in evaluated.items() if depth <= shallowest + depth_tolerance_mm]
+        return min(ok, key=lambda d: evaluated[d][0])
+
+    evaluate(range(0, 180, 10))
+    evaluate(range(best() - 5, best() + 6))
+    pick = best()
+    fill_0, depth_0, lined_volume = evaluated[0]
+    fill, depth, _ = evaluated[pick]
+    logger.info(
+        f"Split fill {fill_0 / 1000:.2f} cm3 (depth {depth_0:.1f} mm) at the current "
+        f"rotation, {fill / 1000:.2f} cm3 (depth {depth:.1f} mm) at {pick} deg"
+    )
+    if fill_0 - fill < min_gain * lined_volume:
+        return 0.0
+    return float(np.radians(pick))
 
 
 def _exact_boolean(a: mm.Mesh, b: mm.Mesh, op: mm.BooleanOperation, voxel_size: float):
@@ -392,6 +509,21 @@ def build_lining(
     # Optimize Rotation
     if mesh_params.rotation_callback is not None:
         mesh_scroll = mesh_params.rotation_callback(mesh_scroll)
+
+    # Turn the split to where the case leaves the scroll least room
+    if mesh_params.rotation_search:
+        angle = rotation_minimising_fill(
+            mesh_scroll,
+            radius + mesh_params.lining_offset_mm + mesh_params.wall_thickness_mm,
+            mesh_params.lining_offset_mm,
+            mesh_params.wall_thickness_mm,
+            mesh_params.rotation_search_depth_tolerance_mm,
+            mesh_params.rotation_search_min_gain,
+        )
+        if angle:
+            logger.info(f"Rotating mesh by {np.degrees(angle):.0f} deg about the axis")
+            # affine_rotation(a) rotates by -a.
+            mesh_scroll.transform(affine_rotation(-angle))
 
     # Optionally translate mesh
     if mesh_params.vertical_offset is not None:
