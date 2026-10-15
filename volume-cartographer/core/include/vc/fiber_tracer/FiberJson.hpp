@@ -9,11 +9,16 @@
 
 #include <nlohmann/json.hpp>
 #include <opencv2/core/types.hpp>
+#include "vc/core/util/Uuid.hpp"
+#include "vc/fiber_tracer/FiberDisplay.hpp"
 
 namespace vc::fiber_tracer
 {
 struct Vc3dFiberJson {
+    double width = 0.0;
+    double widthGapFraction = kDefaultFiberWidthGapFraction;
     int version = 1;
+    std::string uuid;
     std::string optimizationMode = "lasagna";
     std::vector<cv::Vec3d> linePoints;
     std::vector<cv::Vec3d> controlPoints;
@@ -213,11 +218,14 @@ inline std::vector<cv::Vec3d> vc3dFiberPointArrayFromJson(const nlohmann::json& 
         }
         for (const auto& [field, item] : value.items()) {
             (void)item;
-            if (field != "position" && field != "segment_to_next" && field != "tags") {
+            if (field != "position" && field != "segment_to_next" && field != "tags" && field != "display_normal" && field != "display_normal_source" && field != "direction") {
                 throw std::runtime_error(context + " control point contains unknown field: " + field);
             }
         }
         points.push_back(detail::pointFromJson(value.at("position"), context));
+        (void)displayNormalFromJson(value);
+        (void)displayNormalSourceFromJson(value);
+        (void)controlDirectionFromJson(value);
         // Optional per-control-point tags (e.g. "kollesis_termination"): an
         // array of strings, written by VC3D only when non-empty.
         if (value.contains("tags")) {
@@ -253,6 +261,15 @@ inline Vc3dFiberJson parseVc3dFiberJson(const nlohmann::json& root,
         throw std::runtime_error(context + " is not a vc3d_fiber JSON object");
 
     Vc3dFiberJson fiber;
+    if (root.contains("uuid")) {
+        if (!root.at("uuid").is_string() ||
+            !vc::util::isUuid(root.at("uuid").get<std::string>())) {
+            throw std::runtime_error(context + " has an invalid uuid");
+        }
+        fiber.uuid = root.at("uuid").get<std::string>();
+    }
+    fiber.width = fiberWidthFromJson(root);
+    fiber.widthGapFraction = fiberWidthGapFromJson(root);
     fiber.version = root.value("version", 1);
     // Version 4 = version 3 plus optional span tags (see validateSegmentMetadata).
     if (fiber.version != 1 && fiber.version != 3 && fiber.version != 4)

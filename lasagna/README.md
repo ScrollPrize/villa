@@ -244,7 +244,7 @@ Notes:
 
 - `x/y` are written in **original pixel units** by multiplying by `--downscale` (default 4.0).
 - `--offset x y z` adds a global translation in original pixel/voxel units (for crop & z-start alignment).
-- `meta.json` contains required `uuid` (dirname) and `type="seg"`.
+- `meta.json` contains required `uuid` (a fresh random UUID per output surface, never derived from the dirname) and `type="seg"`.
 
 
 ## Exporting PLY (one per winding)

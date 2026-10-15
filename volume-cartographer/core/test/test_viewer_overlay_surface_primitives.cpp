@@ -51,7 +51,7 @@ public:
     }
 
     std::optional<SurfaceProjection> projectVolumePoint(
-        const cv::Vec3f& point) const override
+        const cv::Vec3f& point, float) const override
     {
         ++projectionCalls_;
         return SurfaceProjection{point[0], point[1], 0.0f, false};
@@ -65,6 +65,8 @@ public:
         SurfaceProjectionContext context;
         context.surface = surface_.get();
         context.patchIndexGeneration = projectionGeneration_;
+        context.depthLo = depthLo_;
+        context.depthHi = depthHi_;
         if (auto* plane = dynamic_cast<PlaneSurface*>(surface_.get())) {
             context.planeOrigin = plane->origin();
             context.planeBasisX = plane->basisX();
@@ -77,6 +79,12 @@ public:
     int projectionCalls() const { return projectionCalls_; }
     void resetProjectionCalls() { projectionCalls_ = 0; }
     void bumpProjectionGeneration() { ++projectionGeneration_; }
+    // Displayed signed-depth band (normal offset / composite slab).
+    void setDepthBand(float lo, float hi)
+    {
+        depthLo_ = lo;
+        depthHi_ = hi;
+    }
     QPointF volumeToScene(const cv::Vec3f& point) override
     {
         return {point[0] * surfaceScale_ + surfaceOffset_.x(),
@@ -248,6 +256,8 @@ private:
     std::optional<uint64_t> selectedCollection_;
     mutable int projectionCalls_{0};
     std::uint64_t projectionGeneration_{0};
+    float depthLo_{0.0f};
+    float depthHi_{0.0f};
 };
 
 // The points overlay batches its dots into one retained item, so per-dot radii
@@ -288,6 +298,7 @@ public:
     using ViewerOverlayControllerBase::renderPointChain;
     using ViewerOverlayControllerBase::filterPointsNearViewerSurface;
     using ViewerOverlayControllerBase::filterPointsNearViewerSurfaceCached;
+    using ViewerOverlayControllerBase::projectedPointChain;
 
 protected:
     void collectPrimitives(VolumeViewerBase*, OverlayBuilder&) override {}
@@ -765,6 +776,67 @@ private slots:
         QVERIFY(hit.has_value());
         QCOMPARE(hit->fiberId, uint64_t{42});
         QCOMPARE(hit->controlPointIndex, 1);
+    }
+
+    void depthBandDistanceIsZeroInsideTheBand()
+    {
+        QCOMPARE(depthBandDistance(20.0f, 15.0f, 25.0f), 0.0f);
+        QCOMPARE(depthBandDistance(27.0f, 15.0f, 25.0f), 2.0f);
+        QCOMPARE(depthBandDistance(10.0f, 15.0f, 25.0f), 5.0f);
+        QCOMPARE(depthBandDistance(-3.0f, 0.0f, 0.0f), 3.0f);
+
+        const cv::Vec3f coord(1.0f, 2.0f, 3.0f);
+        const cv::Vec3f normal(0.0f, 0.0f, 1.0f);
+        QCOMPARE(depthBandDistance(coord + cv::Vec3f(0, 0, 20), coord, normal, 15.0f, 25.0f),
+                 0.0f);
+        // Out-of-band depth and in-surface separation combine.
+        QVERIFY(std::abs(depthBandDistance(coord + cv::Vec3f(4, 0, 28), coord, normal,
+                                           15.0f, 25.0f) - 5.0f) < 1.0e-5f);
+    }
+
+    void pointChainFiltersAgainstTheDisplayedDepthBand()
+    {
+        cv::Mat_<cv::Vec3f> grid(30, 30);
+        for (int row = 0; row < grid.rows; ++row) {
+            for (int col = 0; col < grid.cols; ++col) {
+                grid(row, col) = cv::Vec3f(static_cast<float>(col),
+                                           static_cast<float>(row), 0.0f);
+            }
+        }
+        auto surface = std::make_shared<QuadSurface>(grid, cv::Vec2f(1.0f, 1.0f));
+        ViewerManager manager(nullptr, nullptr);
+        manager.surfacePatchIndex()->rebuild({surface}, 0.0f, false);
+
+        FakeViewer viewer;
+        viewer.graphicsView()->resize(800, 600);
+        viewer.setSurfaceSceneTransform(1.0, QPointF{});
+        viewer.setCurrentSurface(surface);
+        ChainTestController controller;
+        controller.attachViewer(&viewer, &manager);
+
+        const cv::Vec3f normal = surface->normal(surface->pointer());
+        auto at = [&normal](float x, float depth) {
+            return cv::Vec3f(x, 10.0f, 0.0f) + normal * depth;
+        };
+        // Depths: nominal surface, inside the slab, just past its front,
+        // beyond tolerance, and the mirror side.
+        const std::vector<cv::Vec3f> points{
+            at(8, 0), at(10, 20), at(12, 27), at(14, 31), at(16, -20)};
+        constexpr float kTolerance = 5.0f;
+
+        // Normal offset 15 with a 10-layer slab in front.
+        viewer.setDepthBand(15.0f, 25.0f);
+        std::vector<float> opacities;
+        auto filtered = controller.projectedPointChain(&viewer, points, kTolerance, &opacities);
+        QCOMPARE(filtered.sourceIndices, (std::vector<std::size_t>{1, 2}));
+        QCOMPARE(opacities.size(), std::size_t{2});
+        QVERIFY(std::abs(opacities[0] - 1.0f) < 1.0e-4f);
+        QVERIFY(std::abs(opacities[1] - 0.6f) < 1.0e-3f);
+
+        // Back to the nominal surface: the cached projection is rebuilt.
+        viewer.setDepthBand(0.0f, 0.0f);
+        filtered = controller.projectedPointChain(&viewer, points, kTolerance, &opacities);
+        QCOMPARE(filtered.sourceIndices, (std::vector<std::size_t>{0}));
     }
 
     void surfacePrimitivesUseViewerSurfaceTransform()

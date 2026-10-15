@@ -1,36 +1,36 @@
 # Plan
 
-1. Return extract_inner_chunk() directly from the sharded branch of
-   decode_chunk_from_storage_object(): extraction already decompresses and
-   converts byte order. Keep the unsharded path unchanged.
-2. Document the extraction method's decoded/native-byte-order contract.
-3. Extend the existing sharded cache tests to use production compression codecs,
-   verify exact bytes, missing chunks, sibling chunks and disk-mirror reopen.
-   Pass the production codec explicitly to the fixture writer, then reopen with
-   the registry (create(registry) only inspects outer codecs on current main).
-   Add a non-native-endian contract regression with stored-order bytes and an
-   outer bytes codec to activate the existing swap path. Nested-endian support
-   is a separate pre-existing issue, outside this fix.
-4. Demonstrate the regression on unpatched main, build with 32 jobs using existing
-   dependencies, and run focused Zarr/cache tests. Seek real-scroll validation;
-   clearly disclose if only synthetic coverage is available.
-5. Obtain independent plan/code review and preview the PR before publishing.
+1. Add independent raw-volume and segment filters, preserving existing selection semantics.
+2. Add fresh project name/destination options to shared creation: bypass cached full-sample projects.
+3. Create Project beside Open Sample: initially unchecked resources grouped by
+   representation type; checkable individual entries and select all/none, name and destination browser;
+   confirm overwrite, then use existing asynchronous opening and session-save gates.
+4. Test empty selection, independent predictions, segment filtering, saved name/path
+   and isolation from cached projects. Verify immediate opening, cancellation and
+   save failure without closing the active project. Build VC3D and run catalog tests.
+5. Preserve representation coordinate metadata and channel attachments, but do
+   not attach unselected scans or rebased source views in selective creation.
+   Selected segments attach individual directories, not aggregate cache
+   roots, and must not mark unselected cached segments orphaned.
 
-## Specification Updates
+## Spec update
 
-No new behavior contract: restore correct decoding under the existing shared
-cache architecture. No scheduling, mirror format or shard writer changes.
+Follow-up: extract annotation fiber-path naming into one shared helper, use it
+in catalog and ordinary new-project creation, and test empty-directory creation
+and preservation of existing contents.
 
-## Documentation Updates
+Document selective creation, empty defaults, required coordinate dependencies and global cache reuse.
 
-Clarify extract_inner_chunk() in its public header and record validation here.
+## Docs updates
 
-## Testing And Validation
+Add catalog usage documentation and validation log.
 
-Use the production codec registry and storage-object/cache path, not just direct
-chunk reads. Include zstd/gzip and uncompressed data. Compare exact decoded data
-and verify the disk mirror retains encoded shard bytes.
+## Changelog
 
-## Changelog Update
+Record new selective project creation action.
 
-Add one dated entry on completion.
+## Review
+
+Independent review against task, spec and overarching plan before implementation.
+Reviewer identified dependency semantics and cancellation/save-failure coverage;
+these are explicit above. The render efficiency plan remains unchanged.

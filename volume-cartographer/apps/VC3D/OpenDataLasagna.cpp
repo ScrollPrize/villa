@@ -353,6 +353,18 @@ std::optional<ResolvedOpenDataLasagna> resolveForTags(
 
 } // namespace
 
+std::string discoverOpenDataLasagnaManifestUrl(const std::string& artifactUrl)
+{
+    OpenDataLasagnaInfo info;
+    info.artifactUrl = artifactUrl;
+    const auto key = discoverManifestKey(info);
+    std::string origin;
+    std::string prefix;
+    if (!splitPrefixUrl(artifactUrl, origin, prefix))
+        throw std::runtime_error("Invalid Lasagna artifact URL");
+    return joinOpenDataUrl(origin, key);
+}
+
 OpenDataLasagnaDatasetKind validateOpenDataLasagnaManifest(
     const OpenDataLasagnaInfo& info,
     const vc::lasagna::LasagnaDatasetManifest& manifest)
@@ -503,13 +515,8 @@ std::filesystem::path prepareOpenDataLasagna(
             }
         }
 
-        const std::string key = discoverManifestKey(info);
-        std::string origin;
-        std::string prefix;
-        if (!splitPrefixUrl(info.artifactUrl, origin, prefix))
-            throw std::runtime_error("Invalid Lasagna artifact URL");
-        const auto relativeName = key.substr(prefix.size());
-        const auto manifestUrl = joinOpenDataUrl(origin, key);
+        const auto manifestUrl = discoverOpenDataLasagnaManifestUrl(info.artifactUrl);
+        const auto relativeName = manifestUrl.substr(manifestUrl.find_last_of('/') + 1);
         vc::core::util::RemoteFileCacheOptions cacheOptions;
         cacheOptions.cacheRoot = cacheRoot;
         cacheOptions.destination =

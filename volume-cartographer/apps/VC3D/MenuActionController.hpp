@@ -142,14 +142,17 @@ private:
     QStringList loadRecentRemoteUrls() const;
     void saveRecentRemoteUrls(const QStringList& urls);
     void updateRecentRemoteList(const QString& url);
+    void showAttachRemoteZarrDialog(const QString& initialUrl);
     void attachRemoteZarrUrl(const QString& url);
-    void beginLasagnaManifestAttachment(bool remote);
+    void beginLasagnaManifestAttachment(bool remote, const QString& initialUrl = {}, bool fiber = false);
+    void attachCatalogLasagna(const QString& artifactUrl, bool fiber);
     struct LasagnaAttachTaskResult;
     bool openOpenDataSample(const vc3d::opendata::OpenDataSample& sample,
                             bool interactive = true,
                             const vc3d::opendata::OpenDataResourceSelection* selection = nullptr,
                             QString* errorMessage = nullptr,
-                            vc3d::opendata::OpenDataSampleProjectResult* resultOut = nullptr);
+                            vc3d::opendata::OpenDataSampleProjectResult* resultOut = nullptr,
+                            const vc3d::opendata::OpenDataNewProject* newProject = nullptr);
     // .cpp-local payload keeps the QtConcurrent result type out of this header.
     struct OpenDataOpenTaskResult;
     // Launches the QtConcurrent task without a nested event loop. Its watcher is
@@ -159,7 +162,8 @@ private:
         bool interactive,
         const vc3d::opendata::OpenDataResourceSelection* selection,
         std::function<void(const OpenDataSampleOpenOutcome&)> onFinished,
-        std::function<void(const vc3d::opendata::OpenDataSampleDownloadProgress&)> onProgress);
+        std::function<void(const vc3d::opendata::OpenDataSampleDownloadProgress&)> onProgress,
+        const vc3d::opendata::OpenDataNewProject* newProject = nullptr);
     // Epilogue run on the GUI thread once the open task finishes: setVpkg, UI
     // refresh, prefill, status message, and (interactive-only) message boxes.
     void finishOpenDataSampleOpen(OpenDataOpenTaskResult task,
@@ -176,7 +180,8 @@ private:
                            const QString& defaultDir,
                            const QStringList& localFilters,
                            bool acceptFiles,
-                           bool acceptDirs);
+                           bool acceptDirs,
+                           bool startAtFile = false);
 
     CWindow* _window{nullptr};
 

@@ -87,8 +87,16 @@ Hugging Face sync (hfsync):
         {
           "hf_bucket_path": "hf://buckets/<org>/<bucket>/<path>",
           "hf_cli": "/path/to/hf",          # optional, defaults to hf on PATH
-          "tag": "reviewed"                 # optional, defaults to "reviewed"
-        }
+          "exclude_tags": ["problems"],     # optional; defaults to
+                                            #   problems + possible_duplicate,
+                                            #   [] to exclude nothing
+          "tag": "reviewed"                 # optional; absent/null publishes
+        }                                   #   every loadable fiber
+
+    By default every loadable fiber is published except those carrying a tag
+    in `exclude_tags`. Pass --reviewed-only (or set "tag" in the config) to
+    publish only fibers carrying that tag instead; the exclusions still
+    apply on top.
 
     Authentication uses the token stored by `hf auth login`; no credentials
     are read from or written to this script or its config. Upload is additive
@@ -798,9 +806,10 @@ class S3SyncManager:
         {'pending': ..., 'remote_tmp': ..., 'summary': ...} for the caller
         to apply with _apply_pending_merges() AFTER the user confirms the
         sync (or discard with _discard_pending_merges() on cancellation).
-        Returns None when the file is not eligible, no base is available,
-        or the merge has genuine conflicts (all three versions are stashed
-        in that case and the caller falls back to the interactive prompt).
+        Returns None when the file is not eligible, no base is available and
+        the copies differ beyond UUID, or the merge has genuine conflicts
+        (all three versions are stashed in that case and the caller falls
+        back to the interactive prompt).
         In dry-run mode nothing is stashed and the return is a dict:
         {'summary', 'merged_doc', 'base_doc', 'peer_files'} for a clean
         content merge (link consistency is NOT assessed), or {'reason'}.
@@ -826,11 +835,6 @@ class S3SyncManager:
                                (path,)).fetchone()
         tracked = dict(row) if row else {}
         base_doc = self._load_base(path, tracked)
-        if base_doc is None or not fiber_merge.is_fiber_doc(base_doc):
-            if not dry_run:
-                print(f"  (no merge base available for {path})")
-            return fail("no merge base")
-
         remote_doc, remote_tmp = self._fetch_remote_json(path)
         if remote_doc is None or not fiber_merge.is_fiber_doc(remote_doc):
             if remote_tmp:
@@ -842,6 +846,15 @@ class S3SyncManager:
 
         keep_remote_tmp = False
         try:
+            if base_doc is None or not fiber_merge.is_fiber_doc(base_doc):
+                if not fiber_merge.same_fiber_content(local_doc, remote_doc):
+                    if not dry_run:
+                        print(f"  (no merge base available for {path})")
+                    return fail("no merge base")
+                # No edit history is needed for identical named content.
+                # Use that content for the merger and peer-link bookkeeping;
+                # this is not evidence of ancestry for divergent edits.
+                base_doc = remote_doc
             # A merger bug on malformed input must degrade to manual
             # resolution, never abort the whole sync.
             try:
@@ -2996,6 +3009,14 @@ class SftpSyncManager(S3SyncManager):
 
 HFSYNC_CONFIG_NAME = '.hfsync.json'
 
+# Tags that mark a fiber as not fit to publish. Excluded by default so the
+# safe behaviour is the one you get without configuring anything; a config
+# may override the list, including to [] for no exclusions at all.
+DEFAULT_EXCLUDE_TAGS = ('problems', 'possible_duplicate')
+
+# The tag --reviewed-only selects on.
+REVIEWED_TAG = 'reviewed' 
+
 
 def load_hfsync_config(local_dir):
     """Load the per-directory Hugging Face sync opt-in config, or None if absent"""
@@ -3018,7 +3039,25 @@ def load_hfsync_config(local_dir):
             f"(install huggingface_hub>=1.0 or set 'hf_cli' to the binary's path)")
     config['hf_cli'] = hf_cli
 
-    config.setdefault('tag', 'reviewed')
+    # `tag` is an optional include filter. Absent or null means there is
+    # none: every loadable fiber is a candidate, minus the exclusions.
+    config.setdefault('tag', None)
+    if config['tag'] is not None and not isinstance(config['tag'], str):
+        raise ValueError(f"{config_path}: 'tag' must be a string or null")
+    if config['tag'] is not None and not config['tag'].strip():
+        # "" could mean "no filter" or "a tag nothing carries", and those
+        # differ by the whole bucket. Make the author say which.
+        raise ValueError(
+            f"{config_path}: 'tag' is empty; use null to publish every fiber "
+            f"or name a tag to publish only that one")
+
+    exclude = config.setdefault('exclude_tags', list(DEFAULT_EXCLUDE_TAGS))
+    if not (isinstance(exclude, list) and all(isinstance(t, str) for t in exclude)):
+        raise ValueError(f"{config_path}: 'exclude_tags' must be an array of strings")
+    if config['tag'] is None and not exclude:
+        print(f"⚠️  {config_path}: no 'tag' and 'exclude_tags' is empty — "
+              f"every fiber in the directory will be published")
+
     return config
 
 
@@ -3031,29 +3070,33 @@ def unpublishable_reason(doc):
     would otherwise make `tag in tags` a substring test (publishing a
     fiber tagged 'unreviewed' under the tag 'reviewed') or raise.
     """
-    if fiber_merge is not None:
-        if not fiber_merge.is_fiber_doc(doc):
-            return "not a loadable vc3d_fiber document"
-        return None
-    # Without fiber_merge, still refuse the shapes that would crash the
-    # run or silently mis-tag a fiber.
-    if not isinstance(doc, dict):
-        return "not a JSON object"
-    tags = doc.get('tags', [])
-    if not (isinstance(tags, list) and all(isinstance(t, str) for t in tags)):
-        return "'tags' is not an array of strings"
+    if fiber_merge is None:
+        # No partial stand-in: is_fiber_doc also checks version, width and
+        # width_gap_fraction, and a subset of it would publish documents the
+        # loader rejects. Everything is unpublishable, so nothing is uploaded
+        # and nothing already published is removed.
+        return "cannot validate: fiber_merge is unavailable"
+    if not fiber_merge.is_fiber_doc(doc):
+        return "not a loadable vc3d_fiber document"
     return None
 
 
-def classify_fibers(local_dir, tag):
+def classify_fibers(local_dir, tag, exclude_tags=()):
     """Split the directory's fiber JSONs into tagged / untagged / invalid /
     deferred.
 
-    `deferred` holds fibers that carry the publish tag but are not ready to
-    publish (see REOPTIMIZE_TAG below). Like `invalid`, they are neither
-    uploaded nor removed: a previously published good copy must survive a
-    transient local state.
+    `tag` is the publish tag; pass None to publish every loadable fiber.
+    `exclude_tags` withholds a fiber that carries any of them, whatever `tag`
+    says. Exclusion lands in `untagged`, i.e. it also takes a previously
+    published copy down: tagging a fiber 'problems' is a judgement that it
+    should not be public, not a transient state.
+
+    `deferred` holds fibers that would publish but are not ready (see
+    REOPTIMIZE_TAG below). Like `invalid`, they are neither uploaded nor
+    removed: a previously published good copy must survive a transient
+    local state.
     """
+    exclude_tags = frozenset(exclude_tags)
     tagged, untagged, invalid, deferred = [], [], [], []
 
     for name in sorted(os.listdir(local_dir)):
@@ -3082,7 +3125,7 @@ def classify_fibers(local_dir, tag):
             continue
 
         tags = doc.get('tags', [])
-        if tag not in tags:
+        if (tag is not None and tag not in tags) or exclude_tags.intersection(tags):
             untagged.append(name)
         elif REOPTIMIZE_TAG in tags:
             # Sync-merged fibers whose line is still a straight-segment
@@ -3097,8 +3140,13 @@ def classify_fibers(local_dir, tag):
     return tagged, untagged, invalid, deferred
 
 
-def hf_sync(local_dir, dry_run=False):
-    """Sync tagged fibers to the Hugging Face bucket configured in .hfsync.json"""
+def hf_sync(local_dir, dry_run=False, reviewed_only=False):
+    """Publish fibers to the Hugging Face bucket configured in .hfsync.json.
+
+    Publishes every loadable fiber except those carrying an excluded tag.
+    `reviewed_only` narrows that to fibers tagged REVIEWED_TAG, overriding
+    any 'tag' the config sets.
+    """
     local_dir = os.path.abspath(local_dir)
 
     config = load_hfsync_config(local_dir)
@@ -3108,21 +3156,36 @@ def hf_sync(local_dir, dry_run=False):
         print('  {')
         print('    "hf_bucket_path": "hf://buckets/<org>/<bucket>/<path>",')
         print('    "hf_cli": "/path/to/hf",          (optional, defaults to hf on PATH)')
-        print('    "tag": "reviewed"                 (optional)')
+        print('    "tag": "reviewed"                 (optional, null publishes all)')
+        print('    "exclude_tags": ["problems"]      (optional)')
         print('  }')
+        return
+
+    if fiber_merge is None:
+        print("❌ Cannot publish: fiber_merge.py could not be imported, so "
+              "fibers cannot be validated against the loader. Fix that import "
+              "before syncing.")
         return
 
     hf_cli = config['hf_cli']
     bucket_path = config['hf_bucket_path']
-    tag = config['tag']
+    tag = REVIEWED_TAG if reviewed_only else config['tag']
+    exclude_tags = config['exclude_tags']
 
     print(f"Hugging Face sync: {local_dir} → {bucket_path}")
+    selection = f"tagged '{tag}'" if tag else "all loadable fibers"
+    if reviewed_only:
+        selection += " (--reviewed-only)"
+    if exclude_tags:
+        selection += f", excluding {sorted(exclude_tags)}"
+    print(f"Publishing: {selection}")
     if dry_run:
         print("--dry-run mode: No changes will be made")
 
-    tagged, untagged, invalid, deferred = classify_fibers(local_dir, tag)
-    print(f"\nLocal fibers: {len(tagged)} tagged '{tag}', "
-          f"{len(untagged)} without the tag, {len(invalid)} invalid, "
+    tagged, untagged, invalid, deferred = classify_fibers(
+        local_dir, tag, exclude_tags)
+    print(f"\nLocal fibers: {len(tagged)} to publish, "
+          f"{len(untagged)} withheld (removable), {len(invalid)} invalid, "
           f"{len(deferred)} held back")
     for name, problem in invalid:
         print(f"  ⚠️  Skipping {name}: {problem}")
@@ -3163,12 +3226,12 @@ def hf_sync(local_dir, dry_run=False):
     removed = 0
     for name in to_remove:
         if dry_run:
-            print(f"  Would remove from HF (no longer tagged '{tag}'): {name}")
+            print(f"  Would remove from HF (withheld locally): {name}")
             continue
         rm = subprocess.run([hf_cli, 'buckets', 'rm', f"{bucket_path}/{name}", '--yes'],
                             capture_output=True, text=True)
         if rm.returncode == 0:
-            print(f"  ✓ Removed from HF (no longer tagged '{tag}'): {name}")
+            print(f"  ✓ Removed from HF (withheld locally): {name}")
             removed += 1
         else:
             print(f"  ❌ Failed to remove {name}: {(rm.stderr or '').strip()}")
@@ -3230,6 +3293,10 @@ def main():
     hfsync_parser.add_argument('directory', help='Local directory')
     hfsync_parser.add_argument('--dry-run', action='store_true',
                                help='Show what would be synced without doing it')
+    hfsync_parser.add_argument(
+        '--reviewed-only', action='store_true',
+        help=f"Publish only fibers tagged '{REVIEWED_TAG}' (default: publish "
+             f"every loadable fiber). Exclusions apply either way.")
 
     # SFTP (ash) sync commands: same engine, independent tracking state
     ash_init_parser = subparsers.add_parser(
@@ -3325,7 +3392,7 @@ def main():
 
     elif args.command == 'hfsync':
         # Independent of the S3 sync configuration; gated only on .hfsync.json
-        hf_sync(args.directory, args.dry_run)
+        hf_sync(args.directory, args.dry_run, args.reviewed_only)
 
     else:
         # The ash-* commands are the same engine over the SFTP manager,

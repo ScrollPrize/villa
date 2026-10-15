@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -17,6 +18,50 @@ SPEC.loader.exec_module(DRIVER)
 
 
 class RenderValgrindCiTest(unittest.TestCase):
+    def test_capture_retries_start_fresh_and_stop_at_first_valid_evaluation(self):
+        for failure in ("collect", "evaluate"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory(dir=Path.cwd()) as root:
+                args = SimpleNamespace(case_dir=Path(root), valgrind="valgrind",
+                                       benchmark="benchmark", replay="replay",
+                                       model=Path("model.json"), fixture="parallel", scenario="full_res")
+                captures = 0
+                evaluations = 0
+
+                def run(command, **kwargs):
+                    nonlocal captures, evaluations
+                    capture = args.case_dir / "callgrind"
+                    if command[0] == "valgrind":
+                        captures += 1
+                        self.assertFalse((capture / "marker").exists())
+                        self.assertFalse((args.case_dir / "evaluation.json").exists())
+                        (capture / "marker").touch()
+                        self.assertEqual(kwargs["env"]["VC_RENDER_SAMPLER_THREADS"], "4")
+                        return SimpleNamespace(returncode=int(failure == "collect" and captures < 3))
+                    evaluations += 1
+                    self.assertNotIn("--reference", command)
+                    (args.case_dir / "evaluation.json").write_text("{}")
+                    return SimpleNamespace(returncode=int(failure == "evaluate" and captures < 3))
+
+                with patch.object(DRIVER.subprocess, "run", side_effect=run):
+                    DRIVER.collect_evaluate(args)
+                self.assertEqual(captures, 3)
+                self.assertEqual(evaluations, 1 if failure == "collect" else 3)
+                self.assertTrue((args.case_dir / "callgrind/collected.stamp").exists())
+                self.assertTrue((args.case_dir / "failed-attempt-1/marker").exists())
+                self.assertTrue((args.case_dir / "failed-attempt-2/marker").exists())
+
+    def test_capture_failure_stops_after_three_attempts(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as root:
+            args = SimpleNamespace(case_dir=Path(root), valgrind="valgrind",
+                                   benchmark="benchmark", replay="replay",
+                                   model=Path("model.json"), fixture="serial", scenario="full_res")
+            with patch.object(DRIVER.subprocess, "run", return_value=SimpleNamespace(returncode=1)) as run:
+                with self.assertRaisesRegex(RuntimeError, "after 3 attempts"):
+                    DRIVER.collect_evaluate(args)
+            self.assertEqual(run.call_count, 3)
+            self.assertFalse((args.case_dir / "evaluation.json").exists())
+            self.assertFalse((args.case_dir / "callgrind/collected.stamp").exists())
+
     def test_invalid_tolerances_are_rejected(self):
         for tolerance in (-0.01, 1.0, float("inf"), float("nan")):
             with self.subTest(tolerance=tolerance):

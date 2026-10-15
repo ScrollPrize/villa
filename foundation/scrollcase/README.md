@@ -51,7 +51,7 @@ See example `scripts/example_mesh_processing.ipynb`.
 Mesh processing involves the following steps:
 1. Optionally scale mesh to target size (for unscaled meshes)
 2. Simplify (decimate) mesh to a target error
-3. Fit the minimum bounding error
+3. Fit the minimum bounding cylinder, or use the given `cylinder_axis` (e.g. along the umbilicus of a squashed scroll, where the smallest cylinder runs the wrong way)
 4. (Optional) Optimize rotation about the cylinder axis
 5. (Optional) Smooth mesh
 6. Offset by 2mm

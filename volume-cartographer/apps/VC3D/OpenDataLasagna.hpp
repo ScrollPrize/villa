@@ -61,6 +61,9 @@ enum class OpenDataLasagnaDatasetKind {
 [[nodiscard]] std::string lasagnaSourceManifestLocation(
     const vc::project::Entry& entry);
 
+// Resolve the single root manifest in a public catalogue artifact directory.
+[[nodiscard]] std::string discoverOpenDataLasagnaManifestUrl(const std::string& artifactUrl);
+
 [[nodiscard]] std::vector<OpenDataLasagnaInfo> lasagnaArtifacts(
     const std::string& sampleId,
     const OpenDataVolume& volume);
