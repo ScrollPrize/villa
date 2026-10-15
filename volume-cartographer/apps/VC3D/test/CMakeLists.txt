@@ -350,6 +350,8 @@ vc_register_ctest(fiber_runtime_ids test_fiber_runtime_ids)
 
 add_executable(test_fiber_network_layout
     test_fiber_network_layout.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapBentRays.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapBentRays.hpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNetworkLayout.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNetworkLayout.hpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberWindingSolver.cpp
@@ -461,6 +463,8 @@ vc_register_ctest(fiber_map_staleness test_fiber_map_staleness)
 
 add_executable(test_fiber_winding_solver
     test_fiber_winding_solver.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapBentRays.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapBentRays.hpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberWindingSolver.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberWindingSolver.hpp)
 
@@ -468,7 +472,8 @@ set_target_properties(test_fiber_winding_solver PROPERTIES
     AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
 
 target_include_directories(test_fiber_winding_solver PRIVATE
-    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+    ${PROJECT_SOURCE_DIR}/apps/VC3D
+    ${OpenCV_INCLUDE_DIRS})
 
 target_link_libraries(test_fiber_winding_solver PRIVATE
     Qt6::Core
@@ -480,6 +485,8 @@ vc_register_ctest(fiber_winding_solver test_fiber_winding_solver)
 
 add_executable(test_fiber_global_layout
     test_fiber_global_layout.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapBentRays.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapBentRays.hpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNetworkLayout.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNetworkLayout.hpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberWindingSolver.cpp
@@ -493,6 +500,7 @@ target_include_directories(test_fiber_global_layout PRIVATE
     ${OpenCV_INCLUDE_DIRS})
 
 target_link_libraries(test_fiber_global_layout PRIVATE
+    vc_lasagna
     Qt6::Core
     Qt6::Test)
 
@@ -502,6 +510,8 @@ vc_register_ctest(fiber_global_layout test_fiber_global_layout)
 
 add_executable(test_fiber_map_gap_field
     test_fiber_map_gap_field.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapBentRays.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapBentRays.hpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapGapField.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapGapField.hpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNetworkLayout.cpp
@@ -660,3 +670,52 @@ add_test(NAME spiral_brush_patch COMMAND test_spiral_brush_patch)
 vc_register_test_target(test_spiral_brush_patch)
 vc_register_ctest(spiral_brush_patch test_spiral_brush_patch)
 set_tests_properties(spiral_brush_patch PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+add_executable(test_fiber_map_bent_rays
+    test_fiber_map_bent_rays.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapBentRays.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapBentRays.hpp)
+
+set_target_properties(test_fiber_map_bent_rays PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_fiber_map_bent_rays PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D
+    ${OpenCV_INCLUDE_DIRS})
+
+target_link_libraries(test_fiber_map_bent_rays PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME fiber_map_bent_rays COMMAND test_fiber_map_bent_rays)
+vc_register_test_target(test_fiber_map_bent_rays)
+vc_register_ctest(fiber_map_bent_rays test_fiber_map_bent_rays)
+
+add_executable(test_fiber_map_lasagna_field
+    test_fiber_map_lasagna_field.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapBentRays.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapBentRays.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapLasagnaField.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapLasagnaField.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNetworkLayout.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNetworkLayout.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberWindingSolver.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberWindingSolver.hpp)
+
+set_target_properties(test_fiber_map_lasagna_field PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_fiber_map_lasagna_field PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D
+    ${OpenCV_INCLUDE_DIRS})
+
+target_link_libraries(test_fiber_map_lasagna_field PRIVATE
+    Qt6::Core
+    Qt6::Test
+    vc_core
+    vc_lasagna
+    utils)
+
+add_test(NAME fiber_map_lasagna_field COMMAND test_fiber_map_lasagna_field)
+vc_register_test_target(test_fiber_map_lasagna_field)
+vc_register_ctest(fiber_map_lasagna_field test_fiber_map_lasagna_field)

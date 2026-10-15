@@ -14,6 +14,7 @@
 #include <QStringList>
 
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
@@ -108,6 +109,8 @@ private:
 // even when the user is not interacting with the map. Frame and voxel-size
 // staleness never rebuilds automatically: it is commonly a transiently
 // displayed volume, and it heals itself when the volume switches back.
+namespace vc3d::fiber_map::bent { class SheetNormalField; }
+
 class FiberMapWorkspace : public QMainWindow
 {
     Q_OBJECT
@@ -218,6 +221,13 @@ private:
     // The cached catalog manifest's version for a coordinate space
     // (FiberMapDependencies::catalogManifestToken): a stat, no parse.
     [[nodiscard]] QString catalogManifestTokenFor(const std::string& coordinateSpace) const;
+    // The sheet normal field selection token (FiberMapDependencies::
+    // sheetFieldToken): the location, where a local one resolves against the
+    // package directory, and the selection generation; empty for no
+    // selection.
+    [[nodiscard]] static QString sheetFieldTokenFor(const std::string& location,
+                                                    const std::filesystem::path& packageDirectory,
+                                                    uint64_t generation);
     // Cheap enough to guard interaction — integer compares, a few volume metadata
     // reads, and stats of the umbilicus candidates. Mutates nothing.
     [[nodiscard]] StaleVerdict evaluateDependencies() const;
@@ -505,6 +515,13 @@ private:
     QString _layoutUmbilicusFingerprint;
     QString _layoutCatalogVolume;
     QString _layoutCatalogManifestToken;
+    // The sheet normal field selection the layout was built with
+    // (FiberMapDependencies::sheetFieldToken), and the opened field memoized
+    // across jobs under its selection-and-frame key (dropped on Full rebuild
+    // and when the selection changes; the worker opens it when absent).
+    QString _layoutSheetFieldToken;
+    std::shared_ptr<const vc3d::fiber_map::bent::SheetNormalField> _sheetField;
+    std::string _sheetFieldKey;
     // Controller counters as of the build. Compared rather than observed, so that
     // this workspace existing costs annotation work nothing.
     uint64_t _layoutPackageGeneration = 0;

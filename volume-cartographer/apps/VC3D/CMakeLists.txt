@@ -44,6 +44,11 @@ set(srcs
     FiberMapGapField.hpp
     FiberMapKollesis.cpp
     FiberMapKollesis.hpp
+    FiberMapBentRays.cpp
+    FiberMapBentRays.hpp
+    FiberMapBentRayParams.hpp
+    FiberMapLasagnaField.cpp
+    FiberMapLasagnaField.hpp
     FiberNetworkLayout.cpp
     FiberNetworkLayout.hpp
     FiberWindingSolver.cpp

@@ -60,6 +60,7 @@ namespace
         deps.frame = frameAt(9.596);
         deps.catalogVolume = QStringLiteral("PHerc0139/20260102150214");
         deps.catalogManifestToken = QStringLiteral("15642382:1757600000000000000");
+        deps.sheetFieldToken = QStringLiteral("s3://lasagna/PHerc0139.lasagna.json|3");
         return deps;
     }
 
@@ -79,6 +80,27 @@ class TestFiberMapStaleness : public QObject
     Q_OBJECT
 
 private slots:
+    // The sheet-field token names where a local location resolves: the
+    // same relative location against another package directory is another
+    // field; a remote location resolves to itself; no location, no token.
+    void sheetFieldTokenNamesTheResolvedLocation()
+    {
+        using vc3d::fiber_map::sheetFieldToken;
+        QVERIFY(sheetFieldToken("", "", 3).isEmpty());
+        const QString a = sheetFieldToken("normals.lasagna.json", "/scrolls/A/normals.lasagna.json", 3);
+        const QString b = sheetFieldToken("normals.lasagna.json", "/scrolls/B/normals.lasagna.json", 3);
+        QVERIFY(!a.isEmpty());
+        QVERIFY(a != b);
+        QCOMPARE(sheetFieldToken("normals.lasagna.json", "/scrolls/A/normals.lasagna.json", 3), a);
+        QVERIFY(sheetFieldToken("normals.lasagna.json", "/scrolls/A/normals.lasagna.json", 4) != a);
+        vc3d::fiber_map::FiberMapDependencies built;
+        built.sheetFieldToken = a;
+        vc3d::fiber_map::FiberMapDependencies moved = built;
+        moved.sheetFieldToken = b;
+        QVERIFY(vc3d::fiber_map::publicationRefused(built, moved));
+        QVERIFY(!vc3d::fiber_map::publicationRefused(built, built));
+    }
+
     void unchangedDependenciesAreFresh()
     {
         const auto deps = baseline();
@@ -288,6 +310,59 @@ private slots:
         const auto result = verdict(baseline(), current, true, /*latched=*/true);
         QCOMPARE(result.action, StaleVerdict::Action::MarkStale);
         QCOMPARE(result.cause, StaleVerdict::Cause::Grid);
+    }
+
+    // Publication: a build may publish only when nothing a rebuild reads
+    // changed while it ran; a sheet field selection change during the build
+    // refuses it like a fiber edit does, and the same selection publishes.
+    void publicationFollowsEveryDependencyIncludingTheSheetField()
+    {
+        using vc3d::fiber_map::publicationRefused;
+        const FiberMapDependencies job = baseline();
+        QVERIFY(!publicationRefused(job, baseline()));
+        FiberMapDependencies field = baseline();
+        field.sheetFieldToken = QStringLiteral("s3://lasagna/other.lasagna.json|4");
+        QVERIFY(publicationRefused(job, field));
+        field.sheetFieldToken.clear();
+        QVERIFY(publicationRefused(job, field));
+        FiberMapDependencies fibers = baseline();
+        fibers.fiberGeneration += 1;
+        QVERIFY(publicationRefused(job, fibers));
+        FiberMapDependencies umbilicus = baseline();
+        umbilicus.umbilicusFingerprint = QStringLiteral("umb|2048:1");
+        QVERIFY(publicationRefused(job, umbilicus));
+        FiberMapDependencies catalog = baseline();
+        catalog.catalogManifestToken = QStringLiteral("1:1");
+        QVERIFY(publicationRefused(job, catalog));
+        // The frame and the package are judged by the holder, not here.
+        FiberMapDependencies frame = baseline();
+        frame.frame = otherGrid();
+        QVERIFY(!publicationRefused(job, frame));
+    }
+
+    // Another sheet normal field selected (or none): the bent readings and the
+    // set-aside straight readings follow the field, so the layout is out of
+    // date; reverting the selection reads current again; the cause ranks
+    // below every other derived one.
+    void sheetFieldSelectionMarksStale()
+    {
+        FiberMapDependencies current = baseline();
+        current.sheetFieldToken = QStringLiteral("s3://lasagna/other.lasagna.json|4");
+        const StaleVerdict changed = verdict(baseline(), current);
+        QCOMPARE(changed.action, StaleVerdict::Action::MarkStale);
+        QCOMPARE(changed.cause, StaleVerdict::Cause::SheetField);
+        QVERIFY(changed.reason.contains(QStringLiteral("sheet normal field")));
+        current.sheetFieldToken.clear();
+        QCOMPARE(verdict(baseline(), current).cause, StaleVerdict::Cause::SheetField);
+        current.sheetFieldToken = baseline().sheetFieldToken;
+        QCOMPARE(verdict(baseline(), current).action, StaleVerdict::Action::Fresh);
+        // Fibers outrank it.
+        FiberMapDependencies both = baseline();
+        both.sheetFieldToken = QStringLiteral("x|1");
+        both.fiberGeneration += 1;
+        QCOMPARE(verdict(baseline(), both).cause, StaleVerdict::Cause::Fibers);
+        // Nothing built: nothing to compare.
+        QCOMPARE(verdict(baseline(), current, false).action, StaleVerdict::Action::Fresh);
     }
 };
 

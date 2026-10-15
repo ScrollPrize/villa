@@ -60,16 +60,17 @@ void createConstantChunkedU8Zarr(
     const fs::path& path,
     const std::array<size_t, 3>& shape,
     const std::array<size_t, 3>& chunks,
-    uint8_t value)
+    uint8_t value,
+    const std::string& compressor = {})
 {
     utils::ZarrMetadata meta;
     meta.version = utils::ZarrVersion::v2;
     meta.shape = {shape[0], shape[1], shape[2]};
     meta.chunks = {chunks[0], chunks[1], chunks[2]};
     meta.dtype = utils::ZarrDtype::uint8;
-    meta.compressor_id.clear();
+    meta.compressor_id = compressor;
     meta.fill_value = 0.0;
-    auto array = utils::ZarrArray::create(path, meta);
+    auto array = utils::ZarrArray::create(path, meta, vc::buildZarrCodecRegistry(1));
     std::vector<std::byte> bytes(chunks[0] * chunks[1] * chunks[2],
                                  static_cast<std::byte>(value));
     for (size_t z = 0; z < (shape[0] + chunks[0] - 1) / chunks[0]; ++z) {
@@ -301,6 +302,66 @@ TEST_CASE("LasagnaNormalSampler fetches only interpolation source chunks across 
     CHECK(report.prefetch.requestedChunks == 24);
     CHECK(report.prefetch.chunksRead == 24);
     fs::remove_all(dir);
+}
+
+TEST_CASE("LasagnaNormalSampler scalar tensor reads only each channel's source chunks")
+{
+    // The unrelated origin object may be absent remotely (requiring a
+    // network lookup) or corrupt locally. A sample entirely in chunk 1
+    // must not read it. Exercise single-chunk nx/ny independently too.
+    for (int layout = 0; layout < 3; ++layout) {
+        const auto dir = tmpDir("scalar_source_chunks");
+        const size_t nxChunk = layout == 2 ? 3 : 2;
+        const size_t nyChunk = layout == 1 ? 3 : 2;
+        createConstantChunkedU8Zarr(dir / "grad_mag.zarr", {6, 6, 6}, {2, 2, 2}, 255);
+        createConstantChunkedU8Zarr(dir / "nx.zarr", {6, 6, 6}, {nxChunk, nxChunk, nxChunk}, 128, "zstd");
+        createConstantChunkedU8Zarr(dir / "ny.zarr", {6, 6, 6}, {nyChunk, nyChunk, nyChunk}, 128, "zstd");
+        const std::array<size_t, 3> origin{0, 0, 0};
+        if (nxChunk == 2) {
+            writeText(utils::ZarrArray::open(dir / "nx.zarr").chunk_path(origin), "bad");
+        }
+        if (nyChunk == 2) {
+            writeText(utils::ZarrArray::open(dir / "ny.zarr").chunk_path(origin), "bad");
+        }
+        const auto manifestPath = dir / "dataset.lasagna.json";
+        writeText(manifestPath, R"({
+            "version": 2,
+            "grad_mag_encode_scale": 255.0,
+            "grad_mag_factor": 1.0,
+            "groups": {
+                "grad_mag_group": {"zarr": "grad_mag.zarr", "scaledown": 0, "channels": ["grad_mag"]},
+                "nx_group": {"zarr": "nx.zarr", "scaledown": 0, "channels": ["nx"]},
+                "ny_group": {"zarr": "ny.zarr", "scaledown": 0, "channels": ["ny"]}
+            }
+        })");
+        const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+        // A fresh cache matters: unused keys have arrayId zero and a
+        // process-wide cache could hide the bogus read behind an earlier
+        // sampler's placeholder entry.
+        const auto nx = vc::lasagna::bindLasagnaChannel(dataset.manifest(), "nx");
+        const auto ny = vc::lasagna::bindLasagnaChannel(dataset.manifest(), "ny");
+        vc::lasagna::LasagnaChannelChunkCache cache(1024);
+        const auto axis = vc::lasagna::sampleLasagnaCompactAxisTensor(nx, ny, cache, {2.5, 2.5, 2.5});
+        REQUIRE(axis.has_value());
+        vc::lasagna::LasagnaNormalSampler sampler(dataset);
+        const auto prefetch = sampler.prefetchNormalSamples({{2.5, 2.5, 2.5}}, false);
+        CHECK(prefetch.requestedChunks == (layout == 0 ? 3 : 10));
+        const auto scalar = sampler.sampleNormal({2.5, 2.5, 2.5});
+        REQUIRE(scalar.valid);
+        CHECK(scalar.normal[2] == doctest::Approx(1.0));
+        CHECK(scalar.normal == *axis);
+        std::vector<vc::lasagna::NormalSampleWithDerivative> batch;
+        (void)sampler.sampleNormalBatch({{2.5, 2.5, 2.5}}, false, batch);
+        REQUIRE(batch.size() == 1);
+        REQUIRE(batch.front().sample.valid);
+        for (int axis = 0; axis < 3; ++axis) {
+            CHECK(scalar.normal[axis] == batch.front().sample.normal[axis]);
+        }
+        const auto derivative = sampler.sampleNormalWithDerivative({2.5, 2.5, 2.5});
+        REQUIRE(derivative.sample.valid);
+        CHECK(derivative.sample.normal == scalar.normal);
+        fs::remove_all(dir);
+    }
 }
 
 TEST_CASE("LasagnaNormalSampler requires grad_mag channel")

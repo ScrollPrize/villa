@@ -1,4 +1,5 @@
 #include "FiberNetworkLayout.hpp"
+#include "FiberMapBentHits.hpp"
 
 #include <QDebug>
 
@@ -7,13 +8,16 @@
 #include <initializer_list>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <functional>
 #include <limits>
 #include <map>
+#include <optional>
 #include <queue>
 #include <set>
+#include <string>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -706,39 +710,7 @@ PlacedFiber makePlacedFiber(const InputFiber& fiber, const FiberGeometry& geo)
 }
 
 
-// --- Content hashing: two independent FNV-1a lanes over raw bytes (IEEE-754
-// doubles hashed by bit pattern, strings length-prefixed, field order fixed).
-void hashBytes(ContentDigest& digest, const void* data, std::size_t size)
-{
-    const auto* bytes = static_cast<const unsigned char*>(data);
-    constexpr uint64_t kPrimeA = 1099511628211ULL;
-    constexpr uint64_t kPrimeB = 0x100000001b3ULL ^ 0x9e3779b97f4a7c15ULL;
-    uint64_t a = digest.a;
-    uint64_t b = digest.b;
-    for (std::size_t i = 0; i < size; ++i) {
-        a = (a ^ bytes[i]) * kPrimeA;
-        b = (b ^ bytes[i]) * (kPrimeB | 1ULL);
-    }
-    digest.a = a;
-    digest.b = b;
-}
-
-void hashU64(ContentDigest& digest, uint64_t value)
-{
-    hashBytes(digest, &value, sizeof(value));
-}
-
-void hashDouble(ContentDigest& digest, double value)
-{
-    hashBytes(digest, &value, sizeof(value));
-}
-
-void hashString(ContentDigest& digest, const std::string& value)
-{
-    hashU64(digest, value.size());
-    hashBytes(digest, value.data(), value.size());
-}
-
+// --- Content hashing: FiberMapContentDigest.hpp.
 void hashVec3(ContentDigest& digest, const cv::Vec3d& value)
 {
     hashDouble(digest, value[0]);
@@ -746,12 +718,6 @@ void hashVec3(ContentDigest& digest, const cv::Vec3d& value)
     hashDouble(digest, value[2]);
 }
 
-ContentDigest seededDigest(uint64_t seed)
-{
-    ContentDigest digest{14695981039346656037ULL, 0xcbf29ce484222325ULL};
-    hashU64(digest, seed);
-    return digest;
-}
 
 // The geometry-relevant fiber content: what prep and detection consume.
 // Links are deliberately excluded - no cached artifact reads them.
@@ -812,6 +778,234 @@ ContentDigest combineDigests(uint64_t seed,
         hashU64(digest, part.b);
     }
     return digest;
+}
+
+// --- The sheet normal field (see FiberMapBentRays.hpp).
+
+// Every bent-ray parameter the field preparation and the shard consume.
+ContentDigest bentParamsDigest(const bent::BentRayParams& params, double minUmbilicusRadiusVx)
+{
+    ContentDigest digest = seededDigest(0xBE47);
+    hashDouble(digest, params.conditioningGate);
+    hashDouble(digest, params.stepVx);
+    hashDouble(digest, params.maxLengthVx);
+    hashDouble(digest, params.spacingVx);
+    hashDouble(digest, params.creaseTurnDeg);
+    hashDouble(digest, params.creaseConditioning);
+    hashDouble(digest, minUmbilicusRadiusVx);
+    // Field preparation format version.
+    hashU64(digest, 1);
+    return digest;
+}
+
+ContentDigest stringDigest(uint64_t seed, const std::string& text)
+{
+    ContentDigest digest = seededDigest(seed);
+    hashString(digest, text);
+    return digest;
+}
+
+// The umbilicus frame the rays are read in: the radial direction, distance
+// and angle about the interpolated umbilicus at a point's height.
+bent::UmbilicusFrame umbilicusFrameFor(const UmbilicusInterp& umbilicus)
+{
+    bent::UmbilicusFrame frame;
+    const auto offset = [&umbilicus](const cv::Vec3d& p) {
+        return cv::Vec3d(p[0] - interpolate(p[2], umbilicus.z, umbilicus.x),
+                         p[1] - interpolate(p[2], umbilicus.z, umbilicus.y), 0.0);
+    };
+    frame.radialUnit = [offset](const cv::Vec3d& p) {
+        const cv::Vec3d d = offset(p);
+        const double r = std::hypot(d[0], d[1]);
+        return r > 0.0 ? cv::Vec3d(d[0] / r, d[1] / r, 0.0) : cv::Vec3d(1.0, 0.0, 0.0);
+    };
+    frame.radius = [offset](const cv::Vec3d& p) {
+        const cv::Vec3d d = offset(p);
+        return std::hypot(d[0], d[1]);
+    };
+    frame.theta = [offset](const cv::Vec3d& p) {
+        const cv::Vec3d d = offset(p);
+        return std::atan2(d[1], d[0]);
+    };
+    // The exact minimum along a segment: the umbilicus is linear in z
+    // between its knots and the segment is linear in its parameter, so on
+    // every knot interval the horizontal offset is linear and its length
+    // squared a quadratic, minimized in closed form.
+    frame.minRadiusAlong = [offset, &umbilicus](const cv::Vec3d& a, const cv::Vec3d& b) {
+        std::vector<double> ts{0.0, 1.0};
+        if (b[2] != a[2]) {
+            const double zLo = std::min(a[2], b[2]);
+            const double zHi = std::max(a[2], b[2]);
+            // The knots strictly inside the segment's height range (the
+            // umbilicus tables are z-sorted).
+            for (auto it = std::upper_bound(umbilicus.z.begin(), umbilicus.z.end(), zLo);
+                 it != umbilicus.z.end() && *it < zHi; ++it) {
+                ts.push_back((*it - a[2]) / (b[2] - a[2]));
+            }
+            std::sort(ts.begin(), ts.end());
+        }
+        double best = std::numeric_limits<double>::infinity();
+        for (std::size_t i = 0; i + 1 < ts.size(); ++i) {
+            const cv::Vec3d p0 = a + (b - a) * ts[i];
+            const cv::Vec3d p1 = a + (b - a) * ts[i + 1];
+            const cv::Vec3d o0 = offset(p0);
+            const cv::Vec3d o1 = offset(p1);
+            const cv::Vec3d d = o1 - o0;
+            const double dd = d.dot(d);
+            const double s = dd > 0.0 ? std::clamp(-o0.dot(d) / dd, 0.0, 1.0) : 0.0;
+            const cv::Vec3d o = o0 + d * s;
+            best = std::min({best, std::sqrt(o.dot(o)), std::sqrt(o0.dot(o0)), std::sqrt(o1.dot(o1))});
+        }
+        return best;
+    };
+    return frame;
+}
+
+std::size_t curtainSampleCount(const bent::BentCurtain& curtain)
+{
+    std::size_t count = 0;
+    for (const bent::BentStretch& stretch : curtain.stretches) {
+        for (const bent::BentRay& ray : stretch.rays) {
+            count += ray.points.size();
+        }
+    }
+    return count;
+}
+
+// The field read over one fiber's visible domain: profile, mask,
+// provisional orientation, curtain.
+// `thetaLine`: the unwrapped angle of every point about the umbilicus (the
+// prepared fiber's), to tell a fold of the fiber from its next winding
+// where its own polyline crosses its curtain.
+FieldPrep prepareField(const std::vector<cv::Vec3d>& points, const std::vector<double>& thetaLine,
+                       const bent::UmbilicusFrame& frame, const bent::SheetNormalField& field,
+                       const bent::BentRayParams& params, double minUmbilicusRadiusVx)
+{
+    FieldPrep prep;
+    prep.profile = bent::conditioningProfile(field, points, frame);
+    prep.illConditioned = bent::illConditionedSamples(prep.profile, params.conditioningGate);
+    prep.orientation = bent::orientFiber(points, prep.profile, frame, params);
+    prep.curtain = bent::traceCurtain(field, points, prep.orientation, frame, params,
+                                      minUmbilicusRadiusVx);
+    prep.selfCrossing = bent::curtainSelfCrossings(prep.curtain, points, thetaLine);
+    return prep;
+}
+
+// The field's half of a pair's shard: every straight detection judged at
+// its own positions (set aside where the field finds the radial rule ill
+// conditioned there, or an endpoint sample of either segment is), then the
+// raw curtain hits of both owners. Part of the cached shard: fresh and
+// cached builds run this identically.
+void appendFieldReadings(winding::PairDetections& shard, const winding::CanonicalTrace& vTrace,
+                         const std::vector<cv::Vec3d>& hPoints,
+                         const std::vector<cv::Vec3d>& vPoints, const FieldPrep& hField,
+                         const FieldPrep& vField, const bent::SheetNormalField& field,
+                         const bent::UmbilicusFrame& frame, double conditioningGate,
+                         double minUmbilicusRadiusVx, uint64_t& sampleCount)
+{
+    const auto lerp = [](const cv::Vec3d& a, const cv::Vec3d& b, double t) {
+        return a + (b - a) * t;
+    };
+    const auto ill = [](const std::vector<unsigned char>& mask, std::size_t i) {
+        return i < mask.size() && mask[i] != 0;
+    };
+    // Query points: the H position and the V position of every detection.
+    std::vector<cv::Vec3d> queries;
+    std::vector<std::array<std::size_t, 4>> endpoints;
+    for (const std::vector<winding::Crossing>* list : {&shard.raw, &shard.shallow}) {
+        for (const winding::Crossing& c : *list) {
+            cv::Vec3d hPoint(0.0, 0.0, 0.0);
+            cv::Vec3d vPoint(0.0, 0.0, 0.0);
+            std::array<std::size_t, 4> samples{winding::kNoSample, winding::kNoSample,
+                                               winding::kNoSample, winding::kNoSample};
+            if (c.hSegment + 1 < hPoints.size()) {
+                hPoint = lerp(hPoints[c.hSegment], hPoints[c.hSegment + 1], c.hT);
+                samples[0] = c.hSegment;
+                samples[1] = c.hSegment + 1;
+            }
+            if (c.vBranch < vTrace.branches.size() && c.vBranchSegment != winding::kNoSample) {
+                const auto& branch = vTrace.branches[c.vBranch];
+                if (c.vBranchSegment + 1 < branch.sample.size()) {
+                    const std::size_t s0 = branch.sample[c.vBranchSegment];
+                    const std::size_t s1 = branch.sample[c.vBranchSegment + 1];
+                    if (s0 < vPoints.size() && s1 < vPoints.size()) {
+                        vPoint = lerp(vPoints[s0], vPoints[s1], c.vU);
+                        samples[2] = s0;
+                        samples[3] = s1;
+                    }
+                }
+            }
+            queries.push_back(hPoint);
+            queries.push_back(vPoint);
+            endpoints.push_back(samples);
+        }
+    }
+    std::vector<std::optional<cv::Vec3d>> axes;
+    field.axes(queries, axes);
+    sampleCount += queries.size();
+    const auto conditioned = [&](std::size_t query, bool known) {
+        // Unknown position (no provenance): nothing read there.
+        if (!known || query >= axes.size() || !axes[query]) {
+            return true;
+        }
+        const cv::Vec3d axis = *axes[query];
+        const double norm = std::sqrt(axis.dot(axis));
+        if (!(norm > 0.0)) {
+            return true;
+        }
+        return std::abs(axis.dot(frame.radialUnit(queries[query]))) / norm >= conditioningGate;
+    };
+    std::size_t d = 0;
+    for (std::vector<winding::Crossing>* list : {&shard.raw, &shard.shallow}) {
+        std::vector<winding::Crossing> kept;
+        kept.reserve(list->size());
+        for (const winding::Crossing& c : *list) {
+            const std::array<std::size_t, 4>& samples = endpoints[d];
+            const bool hKnown = samples[0] != winding::kNoSample;
+            const bool vKnown = samples[2] != winding::kNoSample;
+            const bool illEndpoint =
+                (hKnown && (ill(hField.illConditioned, samples[0]) ||
+                            ill(hField.illConditioned, samples[1]))) ||
+                (vKnown && (ill(vField.illConditioned, samples[2]) ||
+                            ill(vField.illConditioned, samples[3])));
+            const bool setAside = illEndpoint || !conditioned(2 * d, hKnown) ||
+                                  !conditioned(2 * d + 1, vKnown);
+            ++d;
+            if (setAside) {
+                shard.uncoveredSegments.push_back(c.hSegment);
+                shard.gapTranslates.push_back(c.n);
+                ++shard.setAsideCount;
+            } else {
+                kept.push_back(c);
+            }
+        }
+        *list = std::move(kept);
+    }
+    const auto sortUnique = [](auto& values) {
+        std::sort(values.begin(), values.end());
+        values.erase(std::unique(values.begin(), values.end()), values.end());
+    };
+    sortUnique(shard.uncoveredSegments);
+    sortUnique(shard.gapTranslates);
+    // The raw curtain hits, H curtain against the V polyline first. Each
+    // strip side also carries the arclength at which the owner's own
+    // polyline first crosses it (the owner's sheet folding back through
+    // its curtain): readings beyond it look through the fold.
+    const auto append = [&](const FieldPrep& owner, const std::vector<cv::Vec3d>& other,
+                            bool ownerIsV) {
+        const bent::BentCurtain& curtain = owner.curtain;
+        const auto& selfCrossing = owner.selfCrossing;
+        for (const bent::CurtainHit& hit : bent::intersectCurtain(curtain, other)) {
+            // A hit inside the umbilicus cutoff is angularly ill-conditioned
+            // like any sample there: not recorded.
+            if (frame.radius(hit.point) < minUmbilicusRadiusVx) {
+                continue;
+            }
+            shard.bentHits.push_back(bentHitFromCurtain(curtain, hit, ownerIsV, selfCrossing));
+        }
+    };
+    append(hField, vPoints, false);
+    append(vField, hPoints, true);
 }
 
 } // namespace
@@ -1134,6 +1328,16 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
                                const GlobalLayoutParams& params,
                                GlobalLayoutCache* cache)
 {
+    return buildGlobalLayout(fibers, umbilicusCenters, params, cache, nullptr, std::string());
+}
+
+GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
+                               const std::vector<cv::Vec3f>& umbilicusCenters,
+                               const GlobalLayoutParams& params,
+                               GlobalLayoutCache* cache,
+                               const bent::SheetNormalField* field,
+                               const std::string& effectiveField)
+{
     if (params.solver.chiralityOverride == 0) {
         // No stated sense: decide it on the geometry alone, then build. Both
         // senses are solved with the links left out and compared on their
@@ -1153,12 +1357,12 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         GlobalLayoutParams stated = params;
         stated.solver.chiralityOverride = 1;
         const GlobalResult forward =
-            buildGlobalLayout(unlinked, umbilicusCenters, stated, cache);
+            buildGlobalLayout(unlinked, umbilicusCenters, stated, cache, field, effectiveField);
         const GlobalLayoutCache::Stats forwardStats =
             cache != nullptr ? cache->_stats : GlobalLayoutCache::Stats{};
         stated.solver.chiralityOverride = -1;
         const GlobalResult backward =
-            buildGlobalLayout(unlinked, umbilicusCenters, stated, cache);
+            buildGlobalLayout(unlinked, umbilicusCenters, stated, cache, field, effectiveField);
         const GlobalLayoutCache::Stats backwardStats =
             cache != nullptr ? cache->_stats : GlobalLayoutCache::Stats{};
         // Independent contradictions, not rings: a group conflict rings at
@@ -1173,7 +1377,8 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         const bool keepForward = decisive ? forwardErrors < backwardErrors
                                           : forward.chiralityVote > 0;
         stated.solver.chiralityOverride = keepForward ? 1 : -1;
-        GlobalResult kept = buildGlobalLayout(fibers, umbilicusCenters, stated, cache);
+        GlobalResult kept =
+            buildGlobalLayout(fibers, umbilicusCenters, stated, cache, field, effectiveField);
         kept.chiralityBasis = decisive ? ChiralityBasis::Comparison : ChiralityBasis::Vote;
         kept.comparedChiralityErrors = keepForward ? forwardErrors : backwardErrors;
         kept.rejectedChiralityErrors = keepForward ? backwardErrors : forwardErrors;
@@ -1182,6 +1387,8 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
             kept.detectMs += deciding->detectMs;
             kept.solveMs += deciding->solveMs;
             kept.geometryMs += deciding->geometryMs;
+            kept.fieldMs += deciding->fieldMs;
+            kept.fieldSampleCount += deciding->fieldSampleCount;
         }
         if (cache != nullptr) {
             GlobalLayoutCache::Stats stats = cache->_stats;
@@ -1199,6 +1406,10 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     GlobalResult result;
     result.chirality = params.solver.chiralityOverride;
     result.chiralityBasis = ChiralityBasis::Override;
+    // What the map was built with: the field's own identity when one is
+    // given, else the caller's statement.
+    result.effectiveField =
+        field != nullptr && effectiveField.empty() ? field->identity() : effectiveField;
     // Cache bookkeeping runs for every exit path: stats reset up front (so a
     // duplicate-disabled or early-return build never shows the previous
     // build's counts), the duplicate check over the whole input (fileName is
@@ -1361,6 +1572,56 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         allRadii.insert(allRadii.end(), trace.radius.begin(), trace.radius.end());
     }
 
+    // The field, read over every fiber's visible domain (the trace's
+    // samples): conditioning, provisional orientation, curtain. Memoized per
+    // fiber under its own key beside the unwrap; a field or parameter
+    // change recomputes these and leaves the unwrap alone.
+    const bent::UmbilicusFrame umbilicusFrame = umbilicusFrameFor(umbilicus);
+    std::vector<std::vector<cv::Vec3d>> domainPoints(fiberCount);
+    std::vector<std::shared_ptr<const FieldPrep>> fieldPrep(fiberCount);
+    std::vector<ContentDigest> fieldKeys(fiberCount);
+    // The field's own work, timed apart from everything between its two
+    // phases (links, networks, detection, canonical traces, seams): the
+    // preparations here and the assembly below.
+    double fieldWorkMs = 0.0;
+    const auto fieldPrepBegin = std::chrono::steady_clock::now();
+    if (field != nullptr) {
+        const ContentDigest fieldParams = combineDigests(
+            0xF1E1D5, {stringDigest(0x1DE7, result.effectiveField),
+                       bentParamsDigest(params.bentRays, params.solver.minUmbilicusRadiusVx)});
+        for (std::size_t i = 0; i < fiberCount; ++i) {
+            const std::size_t begin = domainBegin[i];
+            const std::size_t end = begin + traces[i].theta.size();
+            domainPoints[i].assign(ordered[i]->linePoints.begin() + static_cast<std::ptrdiff_t>(begin),
+                                   ordered[i]->linePoints.begin() + static_cast<std::ptrdiff_t>(end));
+            if (cache == nullptr) {
+                fieldPrep[i] = std::make_shared<const FieldPrep>(
+                    prepareField(domainPoints[i], traces[i].theta, umbilicusFrame, *field,
+                                 params.bentRays, params.solver.minUmbilicusRadiusVx));
+                result.fieldSampleCount += domainPoints[i].size() +
+                                           curtainSampleCount(fieldPrep[i]->curtain);
+                continue;
+            }
+            fieldKeys[i] = combineDigests(0xF1E1D6, {prepKeys[i], fieldParams});
+            GlobalLayoutCache::PrepSlot& slot = cache->_prep[ordered[i]->fileName];
+            if (slot.key == prepKeys[i] && slot.fieldKey == fieldKeys[i] && slot.field) {
+                fieldPrep[i] = slot.field;
+            } else {
+                fieldPrep[i] = std::make_shared<const FieldPrep>(
+                    prepareField(domainPoints[i], traces[i].theta, umbilicusFrame, *field,
+                                 params.bentRays, params.solver.minUmbilicusRadiusVx));
+                result.fieldSampleCount += domainPoints[i].size() +
+                                           curtainSampleCount(fieldPrep[i]->curtain);
+                slot.field = fieldPrep[i];
+                slot.fieldKey = fieldKeys[i];
+            }
+        }
+    }
+
+    if (field != nullptr) {
+        fieldWorkMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fieldPrepBegin)
+                           .count();
+    }
     const std::vector<LinkRecord> allLinks = collectValidLinks(ordered, indexById);
 
     // Linked-network membership, for the dock's grouping and the map's
@@ -1568,6 +1829,270 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     for (std::size_t i = 0; i < fiberCount; ++i) {
         canonical[i] = winding::canonicalizeTrace(traces[i], chirality);
     }
+
+    const auto assemblyBegin = std::chrono::steady_clock::now();
+    // The assembly of the bent readings (see winding::BentAssembly): per
+    // fiber and stretch, whether the link witnesses justify the provisional
+    // orientation, correct it or leave it withheld, and the samples whose
+    // final normal contradicts the radial rule. Annotation-dependent,
+    // computed every build, never cached; the link-free chirality builds
+    // see no witnesses and, under LinksOnly, emit no bent constraint.
+    std::vector<winding::BentAssembly> assemblies(fiberCount);
+    if (field != nullptr) {
+        // Links that are kollesis seam anchors witness nothing: a seam is a
+        // same-winding contact across a glued pair of sheets, not a
+        // statement about either sheet's normal.
+        std::vector<char> seamLink(linkInputs.size(), 0);
+        for (std::size_t h = 0; h < fiberCount; ++h) {
+            if (canonical[h].hvTag != 'H') {
+                continue;
+            }
+            for (std::size_t v = 0; v < fiberCount; ++v) {
+                if (canonical[v].hvTag != 'V' || !canonical[v].onKollesis) {
+                    continue;
+                }
+                for (const winding::SeamAnchor& anchor :
+                     winding::seamAnchors(canonical, h, v, linkInputs)) {
+                    for (std::size_t l = 0; l < linkInputs.size(); ++l) {
+                        const winding::LinkInput& link = linkInputs[l];
+                        const bool forward = link.fiberA == h && link.fiberB == v &&
+                                             link.pointA == anchor.hLinkSample &&
+                                             link.pointB == anchor.vSample;
+                        const bool backward = link.fiberB == h && link.fiberA == v &&
+                                              link.pointB == anchor.hLinkSample &&
+                                              link.pointA == anchor.vSample;
+                        if (forward || backward) {
+                            seamLink[l] = 1;
+                        }
+                    }
+                }
+            }
+        }
+        constexpr double kWitnessAlignment = 0.3;
+        const double gate = params.bentRays.conditioningGate;
+        for (std::size_t i = 0; i < fiberCount; ++i) {
+            const FieldPrep& prep = *fieldPrep[i];
+            const std::size_t n = domainPoints[i].size();
+            winding::BentAssembly& assembly = assemblies[i];
+            assembly.conditioningGate = gate;
+            assembly.creaseTurnDeg = params.bentRays.creaseTurnDeg;
+            assembly.creaseConditioning = params.bentRays.creaseConditioning;
+            assembly.radialInverted.assign(n, 0);
+            assembly.votedOrientation.assign(n, 0);
+            for (const bent::OrientedStretch& os : prep.orientation.stretches) {
+                if (os.status != bent::RunStatus::Oriented) {
+                    continue;
+                }
+                for (std::size_t j = os.firstSample; j <= os.lastSample && j < n; ++j) {
+                    assembly.votedOrientation[j] = 1;
+                }
+            }
+            // The final anchored normal per sample (unit; zero where the
+            // sample has none), for the inwardness query below.
+            auto finalNormals = std::make_shared<std::vector<cv::Vec3d>>(n, cv::Vec3d(0.0, 0.0, 0.0));
+            auto hasFinal = std::make_shared<std::vector<unsigned char>>(n, 0);
+            result.unorientedRunCount += prep.curtain.unorientedRunCount;
+            result.unsupportedRunCount += prep.curtain.unsupportedRunCount;
+            // Per vote stretch: the witnesses' verdict.
+            std::vector<winding::BentStretchDecision> byStretch(prep.orientation.stretches.size());
+            std::vector<StretchDecisionRecord> records(prep.orientation.stretches.size());
+            for (std::size_t k = 0; k < prep.orientation.stretches.size(); ++k) {
+                const bent::OrientedStretch& os = prep.orientation.stretches[k];
+                int agree = 0;
+                int disagree = 0;
+                for (std::size_t l = 0; l < linkInputs.size(); ++l) {
+                    const winding::LinkInput& link = linkInputs[l];
+                    if (link.skip || seamLink[l]) {
+                        continue;
+                    }
+                    std::size_t sample = winding::kNoSample;
+                    std::size_t other = winding::kNoSample;
+                    std::size_t otherSample = winding::kNoSample;
+                    if (link.fiberA == i) {
+                        sample = link.pointA;
+                        other = link.fiberB;
+                        otherSample = link.pointB;
+                    } else if (link.fiberB == i) {
+                        sample = link.pointB;
+                        other = link.fiberA;
+                        otherSample = link.pointA;
+                    } else {
+                        continue;
+                    }
+                    if (sample < os.firstSample || sample > os.lastSample || sample >= n ||
+                        other >= fiberCount || otherSample >= domainPoints[other].size() ||
+                        !prep.orientation.normal[sample]) {
+                        continue;
+                    }
+                    const char tagI = traces[i].hvTag;
+                    const char tagO = traces[other].hvTag;
+                    if (!((tagI == 'H' && tagO == 'V') || (tagI == 'V' && tagO == 'H'))) {
+                        continue;
+                    }
+                    // A plain link: the centre lies on the V -> H side, so the
+                    // material outward direction at the link is P_v - P_h; an
+                    // adjacent link puts the V one winding inside: P_h - P_v.
+                    const cv::Vec3d pI = domainPoints[i][sample];
+                    const cv::Vec3d pO = domainPoints[other][otherSample];
+                    const cv::Vec3d pH = tagI == 'H' ? pI : pO;
+                    const cv::Vec3d pV = tagI == 'H' ? pO : pI;
+                    cv::Vec3d w = link.windingOffset != 0 ? pH - pV : pV - pH;
+                    const double wNorm = std::sqrt(w.dot(w));
+                    if (!(wNorm > 0.0)) {
+                        continue;
+                    }
+                    const cv::Vec3d normal = *prep.orientation.normal[sample];
+                    const double nNorm = std::sqrt(normal.dot(normal));
+                    if (!(nNorm > 0.0)) {
+                        continue;
+                    }
+                    const double alignment = normal.dot(w) / (nNorm * wNorm);
+                    if (std::abs(alignment) < kWitnessAlignment) {
+                        continue;
+                    }
+                    if (alignment > 0.0) {
+                        ++agree;
+                    } else {
+                        ++disagree;
+                    }
+                }
+                winding::BentStretchDecision& decision = byStretch[k];
+                decision.firstSample = os.firstSample;
+                decision.lastSample = os.lastSample;
+                decision.orientationFirstSample = os.firstSample;
+                decision.orientationLastSample = os.lastSample;
+                if (agree > 0 && disagree == 0) {
+                    decision.finalSign = 1;
+                    decision.anchor = 2;
+                    decision.withheld = false;
+                    decision.disposition = winding::BentDisposition::Usable;
+                } else if (disagree > 0 && agree == 0) {
+                    decision.finalSign = -1;
+                    decision.anchor = 2;
+                    decision.withheld = false;
+                    decision.corrected = true;
+                    decision.disposition = winding::BentDisposition::Usable;
+                } else if (agree > 0 && disagree > 0) {
+                    decision.withheld = true;
+                    decision.disposition = winding::BentDisposition::Contested;
+                } else if (params.bentRays.anchorPolicy == bent::AnchorPolicy::UmbilicusOrLinks &&
+                           os.status == bent::RunStatus::Oriented) {
+                    decision.finalSign = 1;
+                    decision.anchor = 1;
+                    decision.withheld = false;
+                    decision.disposition = winding::BentDisposition::Usable;
+                } else if (params.bentRays.anchorPolicy == bent::AnchorPolicy::UmbilicusOrLinks) {
+                    decision.withheld = true;
+                    decision.disposition = os.status == bent::RunStatus::Unoriented
+                                               ? winding::BentDisposition::Unoriented
+                                               : winding::BentDisposition::Unsupported;
+                } else {
+                    decision.withheld = true;
+                    decision.disposition = winding::BentDisposition::NoWitness;
+                }
+                if (decision.corrected) {
+                    ++result.anchorCorrectedStretchCount;
+                }
+                {
+                    StretchDecisionRecord& record = records[k];
+                    record.fiberId = ordered[i]->id;
+                    record.firstSample = os.firstSample;
+                    record.lastSample = os.lastSample;
+                    record.voteStatus = os.status == bent::RunStatus::Oriented     ? 0
+                                        : os.status == bent::RunStatus::Unoriented ? 1
+                                                                                   : 2;
+                    record.provisionalSign = os.provisionalSign;
+                    record.agreeWeight = os.agreeWeight;
+                    record.disagreeWeight = os.disagreeWeight;
+                    record.witnessesAgree = agree;
+                    record.witnessesDisagree = disagree;
+                    record.finalSign = decision.finalSign;
+                    record.anchor = decision.anchor;
+                    record.withheld = decision.withheld;
+                    record.reason = static_cast<int>(decision.disposition);
+                    record.corrected = decision.corrected;
+                }
+                // The final normal of an anchored stretch, sample by sample:
+                // where it points at the umbilicus with the radial rule's own
+                // clearance, the sample's straight readings are set aside and
+                // it leaves the ordinal placement.
+                if (!decision.withheld) {
+                    for (std::size_t j = os.firstSample; j <= os.lastSample && j < n; ++j) {
+                        if (!prep.orientation.normal[j]) {
+                            continue;
+                        }
+                        const cv::Vec3d normal =
+                            *prep.orientation.normal[j] * static_cast<double>(decision.finalSign);
+                        const double nNorm = std::sqrt(normal.dot(normal));
+                        if (!(nNorm > 0.0)) {
+                            continue;
+                        }
+                        (*finalNormals)[j] = normal * (1.0 / nNorm);
+                        (*hasFinal)[j] = 1;
+                        const double inward =
+                            (*finalNormals)[j].dot(umbilicusFrame.radialUnit(domainPoints[i][j]));
+                        assembly.radialInverted[j] = inward < -gate ? 1 : 0;
+                    }
+                }
+            }
+            // The inwardness at a straight hit: the final normal interpolated
+            // between the hit's two samples, against the radial direction at
+            // the interpolated POSITION (the umbilicus may curve between
+            // them); NaN where either sample has no final normal.
+            {
+                const std::vector<cv::Vec3d>* points = &domainPoints[i];
+                assembly.inwardnessBetween = [points, finalNormals, hasFinal, umbilicusFrame](
+                                                 std::size_t i0, std::size_t i1, double t) {
+                    if (i0 >= hasFinal->size() || i1 >= hasFinal->size() || !(*hasFinal)[i0] ||
+                        !(*hasFinal)[i1]) {
+                        return std::numeric_limits<double>::quiet_NaN();
+                    }
+                    const cv::Vec3d normal =
+                        (*finalNormals)[i0] + ((*finalNormals)[i1] - (*finalNormals)[i0]) * t;
+                    const double nNorm = std::sqrt(normal.dot(normal));
+                    if (!(nNorm > 0.0)) {
+                        return std::numeric_limits<double>::quiet_NaN();
+                    }
+                    const cv::Vec3d position = (*points)[i0] + ((*points)[i1] - (*points)[i0]) * t;
+                    return normal.dot(umbilicusFrame.radialUnit(position)) / nNorm;
+                };
+            }
+            // Per curtain stretch (an ill-conditioned run): its vote
+            // stretch's decision, with the run's own bounds.
+            for (const bent::BentStretch& stretch : prep.curtain.stretches) {
+                winding::BentStretchDecision decision;
+                decision.firstSample = stretch.firstSample;
+                decision.lastSample = stretch.lastSample;
+                decision.withheld = true;
+                decision.disposition = winding::BentDisposition::NoWitness;
+                for (std::size_t k = 0; k < prep.orientation.stretches.size(); ++k) {
+                    const bent::OrientedStretch& os = prep.orientation.stretches[k];
+                    if (stretch.firstSample >= os.firstSample && stretch.lastSample <= os.lastSample) {
+                        decision = byStretch[k];
+                        decision.firstSample = stretch.firstSample;
+                        decision.lastSample = stretch.lastSample;
+                        ++records[k].runCount;
+                        break;
+                    }
+                }
+                assembly.stretches.push_back(decision);
+            }
+            result.stretchDecisions.insert(result.stretchDecisions.end(), records.begin(),
+                                           records.end());
+            // The ordinal placement reads neither ill-conditioned nor
+            // inverted samples.
+            traces[i].ordinalExcluded.assign(n, 0);
+            for (std::size_t j = 0; j < n; ++j) {
+                const bool illHere = j < prep.illConditioned.size() && prep.illConditioned[j] != 0;
+                traces[i].ordinalExcluded[j] = (illHere || assembly.radialInverted[j] != 0) ? 1 : 0;
+            }
+        }
+    }
+    if (field != nullptr) {
+        fieldWorkMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - assemblyBegin)
+                           .count();
+    }
+    result.fieldMs = fieldWorkMs;
     const ContentDigest detectParams = detectionParamsDigest(solverParams);
     const ContentDigest chiralityDigest = [&]() {
         ContentDigest digest = seededDigest(0xC819);
@@ -1581,9 +2106,28 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     std::deque<winding::PairDetections> freshShards;
     std::deque<winding::PairCrossings> classified;
     std::vector<winding::PairDetection> detections;
-    // Per classified pair: its geometry and fibers, for the second pass.
+    // Per classified pair: its geometry and fibers, for the second pass,
+    // and the bent classification input (null without a field).
     std::vector<const winding::PairDetections*> geometryOf;
+    std::deque<winding::BentClassification> bentInputs;
+    std::vector<const winding::BentClassification*> bentOf;
     std::map<std::pair<std::size_t, std::size_t>, std::size_t> pairIndexOf;
+    double fieldShardMs = 0.0;
+    const auto detectWithField = [&](std::size_t h, std::size_t v) {
+        winding::PairDetections shard =
+            winding::detectPairCrossings(canonical[h], canonical[v], solverParams);
+        if (field != nullptr) {
+            const auto shardBegin = std::chrono::steady_clock::now();
+            appendFieldReadings(shard, canonical[v], domainPoints[h], domainPoints[v],
+                                *fieldPrep[h], *fieldPrep[v], *field, umbilicusFrame,
+                                params.bentRays.conditioningGate,
+                                params.solver.minUmbilicusRadiusVx, result.fieldSampleCount);
+            fieldShardMs += std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - shardBegin)
+                                .count();
+        }
+        return shard;
+    };
     for (std::size_t h = 0; h < fiberCount; ++h) {
         if (canonical[h].hvTag != 'H' || canonical[h].psi.empty()) {
             continue;
@@ -1594,33 +2138,47 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
             }
             const winding::PairDetections* geometry = nullptr;
             if (cache == nullptr) {
-                freshShards.push_back(winding::detectPairCrossings(
-                    canonical[h], canonical[v], solverParams));
+                freshShards.push_back(detectWithField(h, v));
                 geometry = &freshShards.back();
             } else {
-                const ContentDigest pairKey = combineDigests(
-                    0x9A18, {prepKeys[h], prepKeys[v], chiralityDigest, detectParams});
+                // With a field the shard also depends on both fibers' field
+                // preparations (their keys cover the field identity, the
+                // bent parameters and the cutoff); without one the key is
+                // the legacy key.
+                const ContentDigest pairKey =
+                    field != nullptr
+                        ? combineDigests(0x9A19, {prepKeys[h], prepKeys[v], chiralityDigest,
+                                                  detectParams, fieldKeys[h], fieldKeys[v]})
+                        : combineDigests(0x9A18, {prepKeys[h], prepKeys[v], chiralityDigest,
+                                                  detectParams});
                 GlobalLayoutCache::PairSlot& slot = cache->_pairs[std::make_tuple(
                     ordered[h]->fileName, ordered[v]->fileName, chirality)];
                 if (slot.key == pairKey) {
                     ++cache->_stats.pairsReused;
                 } else {
-                    slot.detection = winding::detectPairCrossings(
-                        canonical[h], canonical[v], solverParams);
+                    slot.detection = detectWithField(h, v);
                     slot.key = pairKey;
                     ++cache->_stats.pairsRecomputed;
                 }
                 geometry = &slot.detection;
             }
+            const std::vector<winding::SeamAnchor> seams =
+                winding::seamAnchors(canonical, h, v, linkInputs);
+            const winding::BentClassification* bentInput = nullptr;
+            if (field != nullptr) {
+                bentInputs.push_back(winding::BentClassification{
+                    &assemblies[h], &assemblies[v], chirality, !seams.empty()});
+                bentInput = &bentInputs.back();
+            }
             classified.push_back(winding::classifyPairCrossings(
-                *geometry, canonical[h], canonical[v],
-                winding::seamAnchors(canonical, h, v, linkInputs), {},
-                solverParams));
+                *geometry, canonical[h], canonical[v], seams, {}, solverParams, bentInput));
             detections.push_back(winding::PairDetection{h, v, &classified.back()});
             geometryOf.push_back(geometry);
+            bentOf.push_back(bentInput);
             pairIndexOf[{h, v}] = classified.size() - 1;
         }
     }
+    result.fieldMs += fieldShardMs;
     const double detectLoopMs = std::chrono::duration<double, std::milli>(
                                     std::chrono::steady_clock::now() - detectBegin)
                                     .count();
@@ -1706,7 +2264,8 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
                 classified[index] = winding::classifyPairCrossings(
                     *geometryOf[index], canonical[h], canonical[v],
                     winding::seamAnchors(canonical, h, v, linkInputs),
-                    std::vector<std::size_t>(ids.begin(), ids.end()), solverParams);
+                    std::vector<std::size_t>(ids.begin(), ids.end()), solverParams,
+                    bentOf[index]);
             }
             reclassifyMs += std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - reclassifyBegin)
@@ -1718,8 +2277,9 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         }
     }
     // Every pass's shard assembly, detection loop and reclassification is
-    // detection time; every pass's solve is solve time.
-    solve.detectMs = assemblyMs + detectLoopMs + reclassifyMs;
+    // detection time (the field's share of the loop is reported as field
+    // time); every pass's solve is solve time.
+    solve.detectMs = assemblyMs + detectLoopMs - fieldShardMs + reclassifyMs;
     solve.solveMs = solveMs;
 
     result.chirality = solve.chirality;
@@ -1733,6 +2293,57 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     result.kollesisInferredCount = solve.kollesisInferredCount;
     result.detectMs = solve.detectMs;
     result.solveMs = solve.solveMs;
+    result.bentCrossingCount = solve.bentCrossingCount;
+    result.withheldCount = solve.withheldCount;
+    result.setAsideCount = solve.setAsideCount;
+    result.radialInvertedCount = solve.radialInvertedCount;
+    for (const winding::Crossing& crossing : solve.crossings) {
+        if (!crossing.bent || crossing.withheld || crossing.tangential) {
+            continue;
+        }
+        if (crossing.anchor == 1) {
+            ++result.umbilicusAnchoredCount;
+        } else if (crossing.anchor == 2) {
+            ++result.linkAnchoredCount;
+        }
+    }
+    // Pair coverage: every pair whose straight readings were set aside, and
+    // what stood in for them.
+    for (std::size_t index = 0; index < classified.size(); ++index) {
+        const winding::PairCrossings& pair = classified[index];
+        if (pair.setAsideCount == 0 && pair.radialInvertedCount == 0) {
+            continue;
+        }
+        PairCoverageRecord record;
+        record.hFiberId = ordered[detections[index].hFiber]->id;
+        record.vFiberId = ordered[detections[index].vFiber]->id;
+        record.setAsideCount = pair.setAsideCount;
+        record.radialInvertedCount = pair.radialInvertedCount;
+        record.bentCount = pair.bentUsableCount;
+        record.withheldCount = pair.bentWithheldCount;
+        if (pair.bentUsableCount > 0) {
+            record.reason = "replaced";
+        } else if (pair.bentWithheldCount > 0) {
+            const unsigned reasons = pair.bentWithheldReasons;
+            const auto has = [reasons](winding::BentDisposition d) {
+                return (reasons & (1u << static_cast<unsigned>(d))) != 0;
+            };
+            record.reason = has(winding::BentDisposition::NoWitness)      ? "noWitness"
+                            : has(winding::BentDisposition::Contested)    ? "contested"
+                            : has(winding::BentDisposition::SeamWithheld) ? "seamWithheld"
+                            : has(winding::BentDisposition::Unoriented)   ? "unorientedRun"
+                            : has(winding::BentDisposition::Unsupported)  ? "unsupportedRun"
+                            : has(winding::BentDisposition::Folded)       ? "folded"
+                            : has(winding::BentDisposition::BeyondFold)   ? "beyondFold"
+                            : has(winding::BentDisposition::CreaseCrossed) ? "creaseCrossed"
+                            : has(winding::BentDisposition::StraightDisagrees) ? "straightDisagrees"
+                            : has(winding::BentDisposition::LiftAmbiguous) ? "liftAmbiguous"
+                                                                          : "withheld";
+        } else {
+            record.reason = "noBentReach";
+        }
+        result.pairCoverage.push_back(std::move(record));
+    }
 
     // One reference radius for the whole map. It is a display scale, never
     // evidence, so the median over everything is enough.
@@ -1903,6 +2514,15 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         event.confidence = crossing.confidence;
         event.violationTurns = crossing.violationTurns;
         event.groupId = crossing.groupIndex;
+        event.bent = crossing.bent;
+        event.curtainFromV = crossing.curtainFromV;
+        event.withheld = crossing.withheld;
+        event.anchor = crossing.anchor;
+        event.bentReason = crossing.bentReason;
+        event.hitVx = cv::Vec3d(crossing.hitX, crossing.hitY, crossing.hitZ);
+        event.rayLengthVx = crossing.rayLengthVx;
+        event.turnDeg = crossing.turnDeg;
+        event.minConditioning = crossing.minConditioning;
         result.crossingEvents.push_back(std::move(event));
     }
     result.crossingGroups.reserve(solve.groups.size());
@@ -1955,6 +2575,8 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         mark.eventIndex = eventIndex;
         mark.groupId = groupId;
         mark.kollesis = event.kollesis;
+        mark.bent = event.bent;
+        mark.hitVx = event.hitVx;
         return mark;
     };
     std::vector<char> declaredRepresentative(solve.crossings.size(), 0);
@@ -2158,6 +2780,14 @@ ContentDigest digestGlobalInputs(const std::vector<InputFiber>& fibers,
                                  const std::vector<cv::Vec3f>& umbilicusCenters,
                                  const GlobalLayoutParams& params)
 {
+    return digestGlobalInputs(fibers, umbilicusCenters, params, std::string());
+}
+
+ContentDigest digestGlobalInputs(const std::vector<InputFiber>& fibers,
+                                 const std::vector<cv::Vec3f>& umbilicusCenters,
+                                 const GlobalLayoutParams& params,
+                                 const std::string& effectiveField)
+{
     ContentDigest digest = seededDigest(0x1B9);
     const UmbilicusInterp umbilicus = interpolateUmbilicus(umbilicusCenters);
     const ContentDigest umb = umbilicusDigest(umbilicus);
@@ -2233,6 +2863,19 @@ ContentDigest digestGlobalInputs(const std::vector<InputFiber>& fibers,
     hashDouble(digest, solver.apexProminenceVx);
     hashU64(digest, static_cast<uint64_t>(
                         static_cast<int64_t>(solver.chiralityOverride)));
+    // The field: nothing without one, so the field-less digest is the
+    // legacy digest byte for byte.
+    if (!effectiveField.empty()) {
+        hashString(digest, effectiveField);
+        const bent::BentRayParams& rays = params.bentRays;
+        hashDouble(digest, rays.conditioningGate);
+        hashDouble(digest, rays.stepVx);
+        hashDouble(digest, rays.maxLengthVx);
+        hashDouble(digest, rays.spacingVx);
+        hashDouble(digest, rays.creaseTurnDeg);
+        hashDouble(digest, rays.creaseConditioning);
+        hashU64(digest, static_cast<uint64_t>(rays.anchorPolicy));
+    }
     return digest;
 }
 
@@ -2417,6 +3060,68 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
         hashBytes(digest, fiber.label.constData(),
                   static_cast<std::size_t>(fiber.label.size()) * sizeof(QChar));
         hashU64(digest, static_cast<uint64_t>(fiber.hvTag));
+    }
+    // The field's semantic fields, after the legacy stream and only with a
+    // field, so the field-less digest is unchanged. Telemetry (fieldMs,
+    // fieldSampleCount) stays out.
+    if (!result.effectiveField.empty()) {
+        hashString(digest, result.effectiveField);
+        hashI64(result.bentCrossingCount);
+        hashI64(result.withheldCount);
+        hashI64(result.setAsideCount);
+        hashI64(result.radialInvertedCount);
+        hashI64(result.unorientedRunCount);
+        hashI64(result.unsupportedRunCount);
+        hashI64(result.anchorCorrectedStretchCount);
+        hashI64(result.umbilicusAnchoredCount);
+        hashI64(result.linkAnchoredCount);
+        hashU64(digest, result.stretchDecisions.size());
+        for (const StretchDecisionRecord& record : result.stretchDecisions) {
+            hashU64(digest, record.fiberId);
+            hashU64(digest, record.firstSample);
+            hashU64(digest, record.lastSample);
+            hashI64(record.voteStatus);
+            hashI64(record.provisionalSign);
+            hashDouble(digest, record.agreeWeight);
+            hashDouble(digest, record.disagreeWeight);
+            hashI64(record.witnessesAgree);
+            hashI64(record.witnessesDisagree);
+            hashI64(record.finalSign);
+            hashI64(record.anchor);
+            hashU64(digest, (record.withheld ? 1 : 0) | (record.corrected ? 2 : 0));
+            hashI64(record.reason);
+            hashI64(record.runCount);
+        }
+        hashU64(digest, result.pairCoverage.size());
+        for (const PairCoverageRecord& record : result.pairCoverage) {
+            hashU64(digest, record.hFiberId);
+            hashU64(digest, record.vFiberId);
+            hashI64(record.setAsideCount);
+            hashI64(record.radialInvertedCount);
+            hashI64(record.bentCount);
+            hashI64(record.withheldCount);
+            hashString(digest, record.reason);
+        }
+        // Every event and mark hashes whether it is bent, so a bent payload
+        // moving from one event to another is a different digest.
+        for (const CrossingEvent& event : result.crossingEvents) {
+            hashU64(digest, event.bent ? 1 : 0);
+            if (!event.bent) {
+                continue;
+            }
+            hashU64(digest, (event.curtainFromV ? 1 : 0) | (event.withheld ? 2 : 0));
+            hashI64(event.anchor);
+            hashI64(event.bentReason);
+            hashVec3(digest, event.hitVx);
+            hashDouble(digest, event.rayLengthVx);
+        }
+        for (const CrossingMark& mark : result.suspectCrossings) {
+            hashU64(digest, mark.bent ? 1 : 0);
+            if (!mark.bent) {
+                continue;
+            }
+            hashVec3(digest, mark.hitVx);
+        }
     }
     return digest;
 }
