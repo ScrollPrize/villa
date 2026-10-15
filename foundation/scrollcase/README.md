@@ -57,7 +57,7 @@ Mesh processing involves the following steps:
 6. Offset by 2mm
 7. Split along YZ plane
 8. Remove overhangs
-9. Part the halves on a smooth surface that is the S-shaped divider away from the scroll and bends to pass through it wherever the scroll lies off the divider (a thin, curved fragment); the divider wall follows it at constant thickness. For scrolls crossing the divider everywhere it is the divider itself
+9. Part the halves on a smooth surface that is the S-shaped divider away from the scroll and bends to pass through it wherever the scroll lies off the divider (a thin, curved fragment); the divider wall follows it at constant thickness. Only where parting on the divider would leave the scroll room of at least 2.7% of its lined volume (`parting_min_fill_fraction`); otherwise, as for scrolls, part on the divider
 
 ### Mesh smoothing
 
