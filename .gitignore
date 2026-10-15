@@ -79,3 +79,4 @@ volume-cartographer/AGENTS.md
 # Local Claude Code settings
 **/.claude/settings.local.json
 /vesuvius/src/vesuvius/neural_tracing/tracers/fibers/evaluation/audit
+/spiral-fitting/experiments
