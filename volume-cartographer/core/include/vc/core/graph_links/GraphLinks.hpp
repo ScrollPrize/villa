@@ -80,7 +80,7 @@ DetectorReport commitCandidates(graph::GraphDb& db, const std::string& detectorN
                                 const StaleEdgeScope* staleScope = nullptr);
 
 // --- Detectors ---
-// Patch overlap and fiber->patch are implemented; the rest are placeholders that
+// Patch overlap, fiber->patch and track->track are implemented; the rest are placeholders that
 // count the objects they would consider, write nothing, and report
 // "not implemented". Signatures and parameter structs are final
 // shapes so callers can be wired now.
@@ -217,13 +217,24 @@ DetectorReport linkTracksToFibers(graph::GraphDb& db, const TrackFiberParams& pa
                                   const std::atomic_bool* cancel = nullptr);
 
 struct TrackTrackParams {
-    double maxDistanceVoxels = 2.0;
+    double minAngleDegrees = 30.0;
+    double tangentRadiusVoxels = 12.0; // Euclidean radius, not arclength
+    int clusterIndexRadius = 4;
+    int workers = 1;
+    std::string datasetRef;          // empty: all registered datasets
+    std::vector<std::string> trackUuids; // empty: all registered tracks
     std::string edgeKind = "crossing";
     bool replaceStalePending = true;
 };
 // Track <-> track: opposite-family tracks sharing voxels, mirroring
-// the crossing relation Spiral materialises today as a packed CSR
-// sparse array (.crossings sidecars) next to its track datasets.
+// Spiral's exact-voxel crossing relation. Reads VCTRK01 packed directories
+// named by track.datasetRef (relative to the graph DB, or absolute). externalKey
+// is the decimal source_id, not the row index. Only registered/selected tracks
+// within the same dataset are paired; unknown families are ignored. Point
+// indices are raw local indices; anchor positions/directions are XYZ in dataset
+// voxel units. Selects one crossing per pair by clustered median and greatest
+// endpoint clearance. On load failure or cancellation, no edges are changed.
+// Stale removal is limited to selected endpoints and the requested edge kind.
 DetectorReport linkTracksToTracks(graph::GraphDb& db, const TrackTrackParams& params = {},
                                   const std::atomic_bool* cancel = nullptr);
 

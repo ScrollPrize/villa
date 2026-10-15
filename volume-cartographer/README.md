@@ -499,3 +499,91 @@ selected positive case made 1,242 valid calls and retained the same three links
 and two anchors with both normal sources. No full-collection workflow was run.
 The standalone benchmark and experiment scripts were removed after this work;
 these numbers record the completed validation, not a bundled benchmark suite.
+
+### Track-to-track graph links
+
+`vc::graph_links::linkTracksToTracks` implements Spiral's exact-voxel crossing
+relation in `vc_graph_links`. Tracks must share an integer voxel, belong to
+opposite known families (`horizontal` and `vertical`), and have an unsigned
+local tangent angle of at least 30°. Tangents extend 12 source voxels from the
+crossing in each direction, measured by Euclidean distance. Repeated visits to
+a voxel use the first local point index. Events are clustered when consecutive
+indices differ by at most four on both tracks; each cluster contributes its
+upper median. One crossing per pair survives: greatest minimum arclength to
+the four endpoints, then greatest first/second arclength and point indices.
+Tracks are ordered by source ID to make this tie-breaking deterministic.
+
+Register the desired tracks with the existing JSON interchange importer:
+
+```json
+[
+  {"dataset_ref": "/data/tracks/example.dbm.vctracks", "external_key": "0", "family": "horizontal"},
+  {"dataset_ref": "/data/tracks/example.dbm.vctracks", "external_key": "7189775254956", "family": "vertical"}
+]
+```
+
+`dataset_ref` names a Spiral **VCTRK01 packed directory**, either absolute or
+relative to the graph database. `external_key` is the canonical decimal
+`source_ids.u64` value, not the row number. Only registered tracks are loaded
+for crossing detection; the store's metadata is validated and its coordinates
+are memory mapped. Optional registered family/point-count metadata must match
+the store. Unknown families and empty tracks produce no crossings. The packed
+files must remain immutable during a run. Legacy DBM/pickle geometry is not
+read directly; use Spiral's `convert_track_store.py` to create the packed directory.
+No cached `.crossings.npz` sidecar is required or imported.
+
+```sh
+ninja -C build vc_graph_import vc_graph_bindings test_graph_links
+build/bin/vc_graph_import --db graph.vcgr --author "$USER" \
+  --tracks selected-tracks.json --link-track-tracks --track-workers 4
+```
+
+To restrict a rerun, use `--track-dataset <exact-dataset-ref>` and/or repeated
+`--track-uuid <uuid>` flags. Python offers the same detector:
+
+```python
+from vc.graph import GraphDb
+
+with GraphDb.open("graph.vcgr", author="reviewer") as db:
+    report = db.link_tracks_to_tracks(workers=4, track_uuids=[uuid_a, uuid_b])
+    assert not report["problems"], report["problems"]
+```
+
+Other Python keywords are `dataset_ref`, `min_angle_degrees` (30),
+`tangent_radius_voxels` (12), `cluster_index_radius` (4), `edge_kind`
+(`crossing`), and `replace_stale_pending` (true). Workers default to one.
+Crossings are computed **within each dataset**; separate datasets are not
+assumed to share a coordinate system. Anchors store raw local point indices
+and XYZ positions/directions in **source dataset voxel units**, reversing the
+packed ZYX coordinates. Edge metadata records the parameters, clearance and
+both source IDs/arclengths, keyed by object UUID to survive endpoint ordering.
+
+New edges are pending. Reruns deduplicate existing edges and remove only this
+detector's stale pending edges whose endpoints are both selected. Reviewed and
+manual edges remain. A load/validation failure or cancellation before commit
+leaves all edges unchanged; inspect `report["problems"]`. The CLI exits nonzero
+on detector failure. Invalid parameter values raise an exception.
+
+The independent `vc_track_crossings` kernel is also used by Spiral's native
+Python adapter. Spiral's CMake defaults to the sibling `volume-cartographer`
+checkout; `VC_TRACK_CROSSINGS_ROOT` can point at another checkout. The kernel
+retains the native radix sort, parallel event scan and CSR consolidation, with
+a serial fallback when compiled without OpenMP. No Python dependency is added
+to the C++ graph library.
+
+Validation used 24 real tracks (6,192 points) from
+`2um_ds2_ps256_surf_v2.dbm.vctracks`: all 18 crossings, raw indices,
+arclengths and clearances matched both Spiral's Python fallback and its
+previous native kernel exactly. The graph linker produced the same 18 edges
+and an idempotent rerun. No full-collection crossing test was run.
+
+Regression checks:
+
+```sh
+build/bin/test_graph_links
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PWD/build/python" \
+  python -m pytest python/tests/test_graph.py -q
+```
+
+Use a Python interpreter matching the compiled bindings, with NumPy and pytest
+available; it must load `vc` from `build/python`, not an older installed build.

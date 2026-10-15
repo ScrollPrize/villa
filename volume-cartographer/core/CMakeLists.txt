@@ -26,13 +26,20 @@ target_link_libraries(vc_graph PRIVATE nlohmann_json::nlohmann_json)
 target_compile_features(vc_graph PUBLIC cxx_std_20)
 set_target_properties(vc_graph PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# Shared with Spiral's native Python adapter; independent of geometry/Qt/Python.
+add_library(vc_track_crossings STATIC src/TrackCrossings.cpp)
+target_include_directories(vc_track_crossings PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(vc_track_crossings PRIVATE OpenMP::OpenMP_CXX)
+target_compile_features(vc_track_crossings PUBLIC cxx_std_20)
+set_target_properties(vc_track_crossings PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # Edge detection layer above vc_graph: geometry passes that propose
 # edges (pending approval, provenance in edge meta). Depends on vc_core
 # for geometry (QuadSurface, SurfacePatchIndex, ...); vc_graph itself
 # stays a metadata-only store with no geometry dependencies.
-add_library(vc_graph_links STATIC src/GraphLinks.cpp src/GraphLinksPatchOverlap.cpp src/GraphLinksFiberPatch.cpp)
+add_library(vc_graph_links STATIC src/GraphLinks.cpp src/GraphLinksPatchOverlap.cpp src/GraphLinksFiberPatch.cpp src/GraphLinksTrackTrack.cpp)
 target_include_directories(vc_graph_links PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(vc_graph_links PUBLIC vc_graph PRIVATE vc_core vc_lasagna nlohmann_json::nlohmann_json)
+target_link_libraries(vc_graph_links PUBLIC vc_graph PRIVATE vc_track_crossings vc_core vc_lasagna nlohmann_json::nlohmann_json)
 target_compile_features(vc_graph_links PUBLIC cxx_std_20)
 set_target_properties(vc_graph_links PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -49,6 +56,7 @@ add_library(vc_core
         src/Logging.cpp
         src/CrashHandler.cpp
         src/MemMap.cpp
+        src/PackedTrackStore.cpp
         src/UnixSocket.cpp
         src/VolpkgConvert.cpp
         src/VoxelSizeMetadata.cpp

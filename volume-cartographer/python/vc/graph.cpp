@@ -617,6 +617,34 @@ NB_MODULE(graph, m)
             "Run the patch-overlap detector over the tifxyz segment dirs in dir; "
             "kwargs mirror PatchOverlapParams (tolerance, min_minor_spread, ...).")
         .def(
+            "link_tracks_to_tracks",
+            [](PyGraphDb& self, const nb::kwargs& kwargs) {
+                vc::graph_links::TrackTrackParams p;
+                for (auto item : kwargs) {
+                    const auto key = nb::cast<std::string>(item.first);
+                    const nb::handle value = item.second;
+                    if (key == "min_angle_degrees") p.minAngleDegrees = nb::cast<double>(value);
+                    else if (key == "tangent_radius_voxels") p.tangentRadiusVoxels = nb::cast<double>(value);
+                    else if (key == "cluster_index_radius") p.clusterIndexRadius = nb::cast<int>(value);
+                    else if (key == "workers") p.workers = nb::cast<int>(value);
+                    else if (key == "dataset_ref") p.datasetRef = nb::cast<std::string>(value);
+                    else if (key == "track_uuids") p.trackUuids = nb::cast<std::vector<std::string>>(value);
+                    else if (key == "edge_kind") p.edgeKind = nb::cast<std::string>(value);
+                    else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(value);
+                    else throw std::runtime_error("link_tracks_to_tracks: unknown parameter '" + key + "'");
+                }
+                vc::graph_links::DetectorReport report;
+                auto& db = self.require();
+                {
+                    nb::gil_scoped_release release;
+                    report = vc::graph_links::linkTracksToTracks(db, p);
+                }
+                return detectorReportToPy(report);
+            },
+            "Link registered tracks using Spiral exact-voxel crossings. dataset_ref names a "
+            "packed .vctracks directory; track_uuids optionally restricts the run. "
+            "Anchors are raw point indices and XYZ positions in dataset voxels.")
+        .def(
             "link_fibers_to_patches",
             [](PyGraphDb& self, const std::string& fibersDir, const std::string& patchesDir,
                const std::string& ctVolume, const nb::kwargs& kwargs) {

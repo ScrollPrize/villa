@@ -137,3 +137,151 @@ def test_track_list_registration(db, tmp_path: Path) -> None:
     again = db.import_track_list(str(track_file))
     assert again["objects_imported"] == 0  # stable identity, no-op
     assert db.objects_by_kind("track")[0]["uuid"] == first[0]["uuid"]
+
+
+def _packed_tracks(path, tracks, families, source_ids):
+    """Small VCTRK01 fixtures; no dependency on Spiral or a source DBM."""
+    import struct
+    import numpy as np
+    path.mkdir(exist_ok=True)
+    points = sum(len(track) for track in tracks)
+    (path / "header.bin").write_bytes(struct.pack(
+        "<8sIIQQ4Q", b"VCTRK01\0", 1, 64, len(tracks), points, 0, 0, 0, 0))
+    coords = np.concatenate(tracks) if points else np.empty((0, 3))
+    coords.astype("<i4").tofile(path / "coordinates.i32")
+    np.asarray([0, *np.cumsum([len(t) for t in tracks])], dtype="<i8").tofile(path / "offsets.i64")
+    np.asarray(source_ids, dtype="<u8").tofile(path / "source_ids.u64")
+    np.asarray(families, dtype="i1").tofile(path / "family_codes.i8")
+
+
+def _register_tracks(db, dataset, ids, families):
+    return [db.upsert_object({
+        "kind": "track", "storage_kind": "dataset", "storage_ref": str(dataset),
+        "track": {"dataset_ref": str(dataset), "external_key": str(id), "family": family},
+    }) for id, family in zip(ids, families)]
+
+
+def _crossing_lines():
+    import numpy as np
+    h = np.array([[7, 10, x] for x in range(31)], dtype=np.int32)
+    v = np.array([[7, y, 15] for y in range(31)], dtype=np.int32)
+    return h, v
+
+
+def test_track_linking_exact_voxels_families_angles_and_identity(db, tmp_path):
+    import numpy as np
+    h, v = _crossing_lines()
+    h = np.insert(h, 16, h[15], axis=0)  # repeated voxel uses its first local index
+    near = v + np.array([1, 0, 0])
+    ids = [11, 15, 20, 25, 30, 1 << 40]
+    packed = tmp_path / "tiny.vctracks"
+    _packed_tracks(packed, [h, v, near, h, v, v[10:11]], [0, 1, 1, 1, -1, 1], ids)
+    uuids = _register_tracks(db, packed.name, ids, ["horizontal", "vertical", "vertical", "vertical", "", "vertical"])
+    report = db.link_tracks_to_tracks(workers=3)
+    assert report["problems"] == []
+    assert report["objects_considered"] == 6
+    assert report["edges_created"] == report["candidates_found"] == 1
+    edge = db.edges_of(uuids[0])[0]
+    assert {edge["a"], edge["b"]} == set(uuids[:2])
+    assert edge["kind"] == "crossing" and edge["approval_state"] == "pending"
+    anchors = {edge["a"]: edge["a_anchor"], edge["b"]: edge["b_anchor"]}
+    assert anchors[uuids[0]]["index"] == 15
+    assert anchors[uuids[1]]["index"] == 10
+    assert anchors[uuids[0]]["position"] == (15, 10, 7)  # ZYX -> XYZ
+    assert anchors[uuids[0]]["direction"] == (1, 0, 0)
+    assert anchors[uuids[1]]["direction"] == (0, 1, 0)
+    assert edge["meta"]["track_crossing"]["clearance_voxels"] == 10
+    endpoints = edge["meta"]["track_crossing"]["endpoints"]
+    assert endpoints[uuids[0]] == {"source_id": "11", "arclength_voxels": 15}
+    assert endpoints[uuids[1]] == {"source_id": "15", "arclength_voxels": 10}
+    assert edge["meta"]["detector"]["name"] == "track-track"
+    repeat = db.link_tracks_to_tracks(workers=1)
+    assert repeat["edges_created"] == repeat["stale_removed"] == 0
+    assert repeat["edges_skipped_existing"] == 1
+    assert db.edges_of(uuids[0])[0]["uuid"] == edge["uuid"]
+
+
+def test_track_linking_subset_stale_edges_and_dataset_isolation(db, tmp_path):
+    h, v = _crossing_lines()
+    uuids = []
+    for name in ("a.vctracks", "b.vctracks"):
+        _packed_tracks(tmp_path / name, [h, v], [0, 1], [50, 60])
+        uuids += _register_tracks(db, name, [50, 60], ["horizontal", "vertical"])
+    assert db.link_tracks_to_tracks()["edges_created"] == 2
+    assert db.link_tracks_to_tracks(track_uuids=[uuids[0]])["stale_removed"] == 0
+    # Valid no-crossing rerun replaces only its own pending edge in this dataset.
+    _packed_tracks(tmp_path / "a.vctracks", [h, v + [1, 0, 0]], [0, 1], [50, 60])
+    report = db.link_tracks_to_tracks(track_uuids=uuids[:2])
+    assert report["problems"] == [] and report["stale_removed"] == 1
+    assert db.edges_of(uuids[0]) == []
+    assert len(db.edges_of(uuids[2])) == 1
+    # Reviewed edges survive valid empty reruns.
+    second = db.edges_of(uuids[2])[0]
+    db.set_approval(second["uuid"], "approved")
+    _packed_tracks(tmp_path / "b.vctracks", [h, v + [1, 0, 0]], [0, 1], [50, 60])
+    assert db.link_tracks_to_tracks()["stale_removed"] == 0
+    assert db.edge(second["uuid"])["approval_state"] == "approved"
+
+
+@pytest.mark.parametrize("damage", ["header", "offsets", "coordinates", "ids", "family", "missing_id", "negative_voxel", "large_voxel"])
+def test_track_linking_bad_input_is_atomic(db, tmp_path, damage):
+    import numpy as np
+    h, v = _crossing_lines()
+    packed = tmp_path / "tracks.vctracks"
+    _packed_tracks(packed, [h, v], [0, 1], [50, 60])
+    a, b = _register_tracks(db, packed.name, [50, 60], ["horizontal", "vertical"])
+    assert db.link_tracks_to_tracks()["edges_created"] == 1
+    original = db.edges_of(a)
+    if damage == "header":
+        (packed / "header.bin").write_bytes(b"bad")
+    elif damage == "offsets":
+        np.array([0, -1, 62], dtype="<i8").tofile(packed / "offsets.i64")
+    elif damage == "coordinates":
+        (packed / "coordinates.i32").write_bytes(b"bad")
+    elif damage == "ids":
+        np.array([50, 50], dtype="<u8").tofile(packed / "source_ids.u64")
+    elif damage == "family":
+        np.array([0, 0], dtype="i1").tofile(packed / "family_codes.i8")
+    elif damage == "missing_id":
+        np.array([50, 61], dtype="<u8").tofile(packed / "source_ids.u64")
+    else:
+        h[0, 0] = -1 if damage == "negative_voxel" else (1 << 20)
+        _packed_tracks(packed, [h, v], [0, 1], [50, 60])
+    report = db.link_tracks_to_tracks()
+    assert report["problems"] and report["edges_created"] == report["stale_removed"] == 0
+    assert db.edges_of(a) == original
+
+
+def test_track_linking_empty_and_invalid_selection(db, tmp_path):
+    import numpy as np
+    assert db.link_tracks_to_tracks()["problems"] == []
+    packed = tmp_path / "empty.vctracks"
+    _packed_tracks(packed, [np.empty((0, 3))], [-1], [100])
+    _register_tracks(db, packed.name, [100], [""])
+    assert db.link_tracks_to_tracks()["problems"] == []
+    assert db.link_tracks_to_tracks(track_uuids=["missing"])["problems"]
+    assert db.link_tracks_to_tracks(dataset_ref="missing")["problems"]
+    with pytest.raises((ValueError, RuntimeError)):
+        db.link_tracks_to_tracks(min_angle_degrees=float("nan"))
+    with pytest.raises((ValueError, RuntimeError)):
+        db.link_tracks_to_tracks(workers=0)
+    with pytest.raises(RuntimeError, match="unknown parameter"):
+        db.link_tracks_to_tracks(misspelled=3)
+
+
+def test_track_linking_angle_gate_and_atomic_multiple_datasets(db, tmp_path):
+    import numpy as np
+    h, _ = _crossing_lines()
+    h[:, 1] = 20
+    diagonal = np.array([[7, x + 5, x] for x in range(31)])
+    packed = tmp_path / "angle.vctracks"
+    _packed_tracks(packed, [h, diagonal], [0, 1], [5, 8])
+    a, b = _register_tracks(db, packed.name, [5, 8], ["horizontal", "vertical"])
+    assert db.link_tracks_to_tracks()["edges_created"] == 1
+    stricter = db.link_tracks_to_tracks(min_angle_degrees=60, tangent_radius_voxels=1)
+    assert stricter["candidates_found"] == 0 and stricter["stale_removed"] == 1
+    _register_tracks(db, "z-missing.vctracks", [9], ["vertical"])
+    # The first dataset yields a candidate, but a later load failure aborts all writes.
+    report = db.link_tracks_to_tracks()
+    assert report["problems"] and report["edges_created"] == 0
+    assert db.edges_of(a) == []

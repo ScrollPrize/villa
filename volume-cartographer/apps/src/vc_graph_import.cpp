@@ -25,6 +25,13 @@ void usage()
         << "  --segments <dir>     register segment dirs with meta.json as patch objects\n"
         << "  --tracks <file>      register tracks from a JSON interchange list\n"
         << "                       ([{dataset_ref, external_key, family, point_count, ...}])\n"
+        << "  --link-track-tracks             link registered tracks in packed .vctracks datasets\n"
+        << "  --track-dataset <ref>           restrict to this exact registered dataset_ref\n"
+        << "  --track-uuid <uuid>             restrict to these tracks (repeatable)\n"
+        << "  --track-workers <n>             crossing workers (default 1)\n"
+        << "  --track-min-angle <degrees>     minimum acute tangent angle (default 30)\n"
+        << "  --track-tangent-radius <vx>     tangent radius in dataset voxels (default 12)\n"
+        << "  --track-cluster-radius <n>      event index clustering radius (default 4)\n"
         << "  --link-patch-overlaps <dir>\n"
         << "                       run the patch-overlap detector over the tifxyz\n"
         << "                       segment dirs in <dir>; creates pending edges\n"
@@ -69,6 +76,8 @@ try {
     fs::path dbPath, fiberDir, segmentsDir, tracksPath, overlapDir, importJsonPath, exportJsonPath;
     fs::path linkFiberDir, ctVolume;
     vc::graph_links::FiberPatchParams fiberPatchParams;
+    bool linkTracks = false;
+    vc::graph_links::TrackTrackParams trackParams;
     std::string author;
     vc::graph_links::PatchOverlapParams overlapParams;
     for (int i = 1; i < argc; ++i) {
@@ -82,6 +91,13 @@ try {
         else if (arg == "--fibers") fiberDir = next("--fibers");
         else if (arg == "--segments") segmentsDir = next("--segments");
         else if (arg == "--tracks") tracksPath = next("--tracks");
+        else if (arg == "--link-track-tracks") linkTracks = true;
+        else if (arg == "--track-dataset") trackParams.datasetRef = next(arg.c_str());
+        else if (arg == "--track-uuid") trackParams.trackUuids.push_back(next(arg.c_str()));
+        else if (arg == "--track-workers") trackParams.workers = std::stoi(next(arg.c_str()));
+        else if (arg == "--track-min-angle") trackParams.minAngleDegrees = std::stod(next(arg.c_str()));
+        else if (arg == "--track-tangent-radius") trackParams.tangentRadiusVoxels = std::stod(next(arg.c_str()));
+        else if (arg == "--track-cluster-radius") trackParams.clusterIndexRadius = std::stoi(next(arg.c_str()));
         else if (arg == "--link-patch-overlaps") overlapDir = next("--link-patch-overlaps");
         else if (arg == "--overlap-tolerance") overlapParams.tolerance = std::stod(next(arg.c_str()));
         else if (arg == "--overlap-uv-tolerance") overlapParams.uvInlierTolerance = std::stod(next(arg.c_str()));
@@ -146,6 +162,16 @@ try {
         w.commit();
         printReport("tracks", report);
     }
+    bool trackLinkFailed = false;
+    if (linkTracks) {
+        const auto report = vc::graph_links::linkTracksToTracks(db, trackParams);
+        std::cout << "track-tracks: " << report.objectsConsidered << " tracks, "
+                  << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
+                  << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
+        for (const auto& problem : report.problems)
+            std::cerr << "  ! " << problem << "\n";
+        trackLinkFailed = !report.problems.empty();
+    }
     if (!overlapDir.empty()) {
         const auto report = vc::graph_links::linkPatchOverlaps(db, overlapDir, overlapParams);
         std::cout << "patch-overlaps: " << report.objectsConsidered << " patches, "
@@ -187,7 +213,7 @@ try {
             std::cout << "exported to " << exportJsonPath.string() << "\n";
         }
     }
-    return 0;
+    return trackLinkFailed ? 1 : 0;
 } catch (const std::exception& e) {
     std::cerr << "vc_graph_import: " << e.what() << "\n";
     return 1;

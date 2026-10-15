@@ -157,14 +157,6 @@ DetectorReport linkTracksToFibers(graph::GraphDb& db, const TrackFiberParams& /*
     return placeholder(db, kTrackFiberDetector, {"track", "fiber"}, cancel);
 }
 
-DetectorReport linkTracksToTracks(graph::GraphDb& db, const TrackTrackParams& /*params*/,
-                                  const std::atomic_bool* cancel)
-{
-    // TODO: track/track crossings (shared voxels between opposite
-    // families), mirroring Spiral's packed-CSR crossing sidecars.
-    return placeholder(db, kTrackTrackDetector, {"track"}, cancel);
-}
-
 DetectorReport linkTracksToPatches(graph::GraphDb& db, const TrackPatchParams& /*params*/,
                                    const std::atomic_bool* cancel)
 {
