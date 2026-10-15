@@ -232,6 +232,11 @@ class DinoIBOTPretrainer:
                         "output_device": self.device.index,
                     }
                 )
+            if "region_head" in self.model.student:
+                DDP._set_params_and_buffers_to_ignore_for_model(
+                    self.model,
+                    [f"student.region_head.{k}" for k, _ in self.model.student["region_head"].named_parameters()],
+                )
             self.model = DDP(self.model, **ddp_kwargs)
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp and self.device.type == "cuda")
 
@@ -1613,6 +1618,10 @@ class DinoIBOTPretrainer:
             totals = values if totals is None else totals + values
 
         self.scaler.unscale_(self.optimizer)
+        if self.is_distributed and "region_head" in self.model_module.student:
+            for param in self.model_module.student["region_head"].parameters():
+                if param.grad is not None:
+                    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
         clip_grad_norm_(self.model_module.student.parameters(), self.clip_grad)
         self.scaler.step(self.optimizer)
         self.scaler.update()
