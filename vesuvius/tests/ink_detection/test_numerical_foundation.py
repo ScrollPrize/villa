@@ -150,6 +150,35 @@ def test_native_crop_scatter_surface_and_dense_normal_projection():
     np.testing.assert_array_equal(supervision, expected)
 
 
+@pytest.mark.parametrize("max_distance", [1.25, 2.0, 2.5, 5.0, 10.0])
+@pytest.mark.parametrize("points", [40, 4000])
+def test_surface_distance_matches_full_distance_transform(max_distance, points):
+    # Sparse sheets take the local search, dense ones the full transform; both
+    # must give the bytes the full transform gives.
+    from scipy.ndimage import distance_transform_edt
+
+    rng = np.random.default_rng(points + int(max_distance * 8))
+    crop = (3, 5, 7, 23, 37, 45)
+    origin = np.array(crop[:3], dtype=np.float32)
+    extent = np.array(crop[3:], dtype=np.float32) - origin
+    positions = (origin - 2 + rng.random((points, 1, 3)) * (extent + 4)).astype(
+        np.float32
+    )
+    valid = rng.random((points, 1)) < 0.9
+    occupancy = (
+        project_flat_patch(np.ones(valid.shape, np.float32), positions, valid, crop)
+        > 0
+    )
+    expected = np.clip(
+        1.0 - distance_transform_edt(~occupancy) / max_distance, 0.0, 1.0
+    ).astype(np.float32)
+    actual = project_surface_distance(
+        positions, valid, crop, max_distance_voxels=max_distance
+    )
+    assert actual.dtype == np.float32
+    assert actual.tobytes() == expected.tobytes()
+
+
 def test_line_projection_preserves_reciprocal_multiply_rounding():
     """The unmarked voxel at index 5 is a parity contract, not a target.
 
