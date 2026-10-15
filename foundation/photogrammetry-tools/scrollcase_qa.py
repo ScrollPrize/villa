@@ -37,11 +37,31 @@ def topology(m):
             f"(zero-volume slivers {(vols < 1e-3).sum()}), volume {m.volume / 1000:.1f} cm3, extents {np.round(m.extents, 2).tolist()}")
 
 
-def clearance(scroll, half_path, n=30000):
-    """Signed distances from scroll surface samples to a case half (negative = inside its material)."""
+def winding_number(mesh, x):
+    """Generalized winding number of point x in a triangle mesh (1 inside a closed surface, 0 outside)."""
+    a, b, c = (mesh.triangles - x).transpose(1, 0, 2)
+    la, lb, lc = (np.linalg.norm(v, axis=1) for v in (a, b, c))
+    num = np.einsum("ij,ij->i", a, np.cross(b, c))
+    den = (la * lb * lc + np.einsum("ij,ij->i", a, b) * lc + np.einsum("ij,ij->i", b, c) * la
+           + np.einsum("ij,ij->i", c, a) * lb)
+    return 2 * np.arctan2(num, den).sum() / (4 * np.pi)
+
+
+def clearance(scroll, half, half_path, n=30000, max_confirm=500):
+    """Signed distances from scroll surface samples to a case half (negative = inside its material).
+
+    meshlib's sign comes from the pseudo-normal at the closest feature and is occasionally wrong at a case vertex
+    (1482, 1592, 0608: samples 2-16 mm from any material reported inside). Every negative sample is therefore
+    checked with the exact winding number and made positive when it is outside. Returns the distances and the
+    number of samples meshlib alone reported inside."""
     P, _ = trimesh.sample.sample_surface(scroll, n, seed=0)
     mesh = mrmeshpy.loadMesh(half_path)
-    return np.array([mrmeshpy.findSignedDistance(mrmeshpy.Vector3f(*map(float, p)), mesh).dist for p in P])
+    d = np.array([mrmeshpy.findSignedDistance(mrmeshpy.Vector3f(*map(float, p)), mesh).dist for p in P])
+    flagged = np.flatnonzero(d <= 0)
+    for i in flagged[:max_confirm]:
+        if winding_number(half, P[i]) < 0.5:
+            d[i] = abs(d[i])
+    return d, len(flagged)
 
 
 def section_tile(parts, z, lo, hi):
@@ -126,10 +146,13 @@ def main():
     w, E = np.linalg.eigh(np.cov(xy - xy.mean(0), rowvar=False))
     print(f"cavity wide direction vs split plane (x): {np.degrees(np.arccos(abs(E[0, -1]))):.1f} deg")
     for k in ("left", "right"):
-        s = clearance(parts["scroll"], paths[k])
+        s, flagged = clearance(parts["scroll"], parts[k], paths[k])
         out = s[s > 0]
+        inside = int((s <= 0).sum())
+        note = (f" ({flagged} reported by the signed distance, {flagged - inside} of them outside by winding number)"
+                if flagged > inside else "")
         print(f"{k:6s} clearance min {out.min():.2f}, 1st percentile {np.percentile(out, 1):.2f}, median "
-              f"{np.median(out):.2f} mm; scroll samples inside case material {(s <= 0).sum()}/{len(s)}")
+              f"{np.median(out):.2f} mm; scroll samples inside case material {(s <= 0).sum()}/{len(s)}{note}")
     if args.render:
         render(parts, args.render)
 

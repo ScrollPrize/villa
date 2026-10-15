@@ -31,7 +31,7 @@ cloud and reports, face by face, how far its surface lies from the merged one.
 Usage:
     python split_align.py align A_DENSE.ply B_DENSE.ply OUT_DIR [--scale-a K] [--scale-b K]
     python split_align.py silhouette OUT_DIR A_SCENE.json B_SCENE.json MASK_DIR_A MASK_DIR_B
-    python split_align.py reference OUT_DIR A_SCENE.json REF_DENSE.ply REF_SCENE.json
+    python split_align.py reference OUT_DIR A_SCENE.json REF_DENSE.ply REF_SCENE.json [--scene-b B_SCENE.json]
     python split_align.py merge OUT_DIR A_SCENE.json B_SCENE.json MERGED_SCENE.json [--thin-shift MM]
     python split_align.py check OUT_DIR MERGED_SCENE.json MESH.ply MASK_DIR [--sheet BLOCKS sheet.jpg]
 
@@ -412,10 +412,15 @@ def reference(args):
     side = np.r_[np.zeros(len(c["PA"]), int), np.ones(len(c["PB"]), int)]
     J, JN = read_dense_ply(args.ref_cloud)
     J, JN = clean(J, JN, a.get("voxel_mm", 0.25))
-    camsA, camsJ = load_scene(args.scene_a, a.get("scale_a", 1.0)), load_scene(args.ref_scene)
-    common = sorted(set(camsA) & set(camsJ))
-    S, s = umeyama(np.array([camsJ[f][2] for f in common]), np.array([camsA[f][2] for f in common]))
-    print(f"initial pose from {len(common)} shared A cameras, scale {s:.5f}")
+    camsJ = load_scene(args.ref_scene)
+    if args.scene_b:  # the reference shares cameras with B only: start from those, then B's alignment onto A
+        camsH, side_name, H = load_scene(args.scene_b, a.get("scale_b", 1.0)), "B", T
+    else:
+        camsH, side_name, H = load_scene(args.scene_a, a.get("scale_a", 1.0)), "A", np.eye(4)
+    common = sorted(set(camsH) & set(camsJ))
+    S, s = umeyama(np.array([camsJ[f][2] for f in common]), np.array([camsH[f][2] for f in common]))
+    print(f"initial pose from {len(common)} cameras shared with {side_name}, scale {s:.5f}")
+    S = H @ S
     J, JN = apply(S, J), JN @ (S[:3, :3] / s).T
     Tj, st = icp(J, JN, M, MN, np.eye(4), stages=STAGES[2:])
     print(f"reference registered rigidly onto the merged cloud: {st['pairs']} pairs, rms {st['rms']:.3f} mm")
@@ -458,8 +463,14 @@ def merge(args):
     po = 1 + max([v["value"]["ptr_wrapper"]["data"]["id_pose"] for v in A["views"]])
     io = 1 + max(i["key"] for i in A["intrinsics"])
     lo = 1 + max([l["key"] for l in A["structure"]], default=-1)
-    views = [v for v in A["views"]]
-    for v in B["views"]:
+    def posed(scene):
+        poses = {e["key"] for e in scene["extrinsics"]}
+        return [v for v in scene["views"] if v["value"]["ptr_wrapper"]["data"]["id_pose"] in poses]
+
+    # unposed views are left out: a scene exported from a capture folder lists every photograph of it, including
+    # ones the other half posed (sncass94: o2's extra blocks were unposed views of the o1 scene)
+    views = posed(A)
+    for v in posed(B):
         d = dict(v["value"]["ptr_wrapper"]["data"])
         d["id_view"] += vo
         d["id_pose"] += po
@@ -468,7 +479,7 @@ def merge(args):
                                                       "ptr_wrapper": {"id": 0, "data": d}}})
     names = [v["value"]["ptr_wrapper"]["data"]["filename"] for v in views]
     if len(set(names)) != len(names):
-        raise SystemExit("the two scenes share photographs")
+        raise SystemExit("a photograph is posed in both scenes")
     intr = [i for i in A["intrinsics"]] + [{"key": i["key"] + io, "value": i["value"]} for i in B["intrinsics"]]
     ext = list(A["extrinsics"])
     for e in B["extrinsics"]:
@@ -672,6 +683,7 @@ def main():
     r.add_argument("scene_a")
     r.add_argument("ref_cloud")
     r.add_argument("ref_scene")
+    r.add_argument("--scene-b", help="take the initial pose from the cameras the reference shares with this B scene")
     m = sub.add_parser("merge")
     m.add_argument("out_dir")
     m.add_argument("scene_a")
