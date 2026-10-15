@@ -293,8 +293,44 @@ class FitServiceQueueTest(unittest.TestCase):
 			self.assertFalse(child.exists())
 			self.assertTrue(final.is_dir())
 			meta = fit_service.json.loads((final / "meta.json").read_text(encoding="utf-8"))
-			self.assertEqual(meta["uuid"], "atlas_v003.tifxyz")
+			# Legacy name-derived uuid is replaced by a fresh one, never the new name.
+			self.assertEqual(fit_service.uuid.UUID(meta["uuid"]).version, 4)
 			self.assertEqual(meta["name"], "atlas_v003.tifxyz")
+
+	def test_normalize_single_tifxyz_output_preserves_existing_uuid(self):
+		with tempfile.TemporaryDirectory() as td:
+			out = fit_service.Path(td)
+			child = out / "winding_0000.tifxyz"
+			child.mkdir()
+			surface_uuid = "0f8fad5b-d9cb-469f-a165-70867728950e"
+			(child / "meta.json").write_text(
+				fit_service.json.dumps({"uuid": surface_uuid, "name": "winding_0000.tifxyz"}),
+				encoding="utf-8",
+			)
+			final = fit_service._normalize_single_tifxyz_output(out, "atlas_v003")
+			meta = fit_service.json.loads((final / "meta.json").read_text(encoding="utf-8"))
+			self.assertEqual(meta["uuid"], surface_uuid)
+			self.assertEqual(meta["name"], "atlas_v003.tifxyz")
+
+	def test_normalize_single_tifxyz_output_preserves_noncanonical_identities(self):
+		# An uppercase UUID (accepted by C++ isUuid) and a producer-assigned
+		# catalog id are identities, not name-derived values: a rename must
+		# keep both byte-for-byte.
+		for surface_uuid in (
+			"0F8FAD5B-D9CB-469F-A165-70867728950E",
+			"catalog-representation-1",
+		):
+			with self.subTest(uuid=surface_uuid), tempfile.TemporaryDirectory() as td:
+				out = fit_service.Path(td)
+				child = out / "winding_0000.tifxyz"
+				child.mkdir()
+				(child / "meta.json").write_text(
+					fit_service.json.dumps({"uuid": surface_uuid, "name": "winding_0000.tifxyz"}),
+					encoding="utf-8",
+				)
+				final = fit_service._normalize_single_tifxyz_output(out, "atlas_v003")
+				meta = fit_service.json.loads((final / "meta.json").read_text(encoding="utf-8"))
+				self.assertEqual(meta["uuid"], surface_uuid)
 
 	def test_multi_result_archive_keeps_child_names(self):
 		self.assertEqual(

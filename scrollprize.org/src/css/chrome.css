@@ -109,6 +109,66 @@ html.docs-doc-id-data_browser main .container article {
   }
 }
 
+/* Spiral fitting has long commands and configuration tables; use the available
+   desktop width with smaller side gutters and a compact contents column. */
+@media (min-width: 997px) {
+  html.docs-doc-id-tutorial_spiral {
+    --vc-doc-toc-width: 220px;
+  }
+  html.docs-doc-id-tutorial_spiral main > .container {
+    max-width: none;
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+  html.docs-doc-id-tutorial_spiral main .container article,
+  html.docs-doc-id-tutorial_spiral main .container .pagination-nav {
+    max-width: 1024px;
+    margin-left: auto;
+    margin-right: auto;
+  }
+}
+
+/* Make the two fit interfaces visibly selectable within their container. */
+.spiral-fit-tabs .tabs {
+  gap: 8px;
+  border-bottom: 1px solid var(--vc-line-strong);
+}
+.spiral-fit-tabs .tabs__item {
+  background: var(--vc-surface);
+  border: 1px solid var(--vc-line-strong);
+  border-bottom: 3px solid transparent;
+  border-radius: 8px 8px 0 0;
+  color: var(--vc-text-dim);
+  font-weight: 600;
+}
+.spiral-fit-tabs .tabs__item:hover {
+  background: var(--vc-raised);
+  color: var(--vc-text);
+}
+.spiral-fit-tabs .tabs__item--active {
+  background: var(--vc-raised);
+  border-bottom-color: var(--vc-accent);
+  color: var(--vc-accent);
+}
+.spiral-fit-tabs .tabs__item:focus-visible {
+  outline: 2px solid var(--vc-accent);
+  outline-offset: -4px;
+}
+
+.spiral-workspace-tutorial h5 {
+  font-size: 1.125rem;
+  font-weight: 700;
+  border-top: 1px solid var(--vc-line-strong);
+  margin-top: 2rem;
+  padding-top: 1.5rem;
+  margin-bottom: 1rem;
+}
+.spiral-workspace-tutorial h5:first-of-type {
+  border-top: 0;
+  margin-top: 0;
+  padding-top: 0;
+}
+
 /* Anchored headings clear the fixed navbar. */
 h1, h2, h3, h4, h5, h6 {
   scroll-margin-top: 72px;
@@ -191,6 +251,15 @@ h1, h2, h3, h4, h5, h6 {
   color: var(--vc-accent);
 }
 
+/* A touch more air between dropdown labels and their caret (Infima: 0.3em). */
+.dropdown > .navbar__link::after {
+  margin-left: 0.45em;
+}
+/* Same for the external-site icon (Donate); Docusaurus default 0.3rem. */
+.navbar__link > svg[class*="iconExternalLink"] {
+  margin-left: 0.45rem;
+}
+
 /* Dropdown (Community): surface + hairline, flat. */
 .dropdown__menu {
   background: var(--vc-surface);
@@ -232,15 +301,12 @@ h1, h2, h3, h4, h5, h6 {
   color: #fff;
   text-decoration: none;
 }
-/* A CTA pointing at the page you're on is noise: hide it on /get_started
-   itself (Docusaurus marks the current page's navbar item as active). */
-.navbar .vc-navbar-cta.navbar__link--active,
-.menu__link.vc-navbar-cta.menu__link--active {
-  display: none;
-}
 /* Same item inside the mobile drawer menu. */
 .menu__link.vc-navbar-cta,
-.menu__link.vc-navbar-cta:hover {
+.menu__link.vc-navbar-cta:hover,
+.menu__link.vc-navbar-cta.menu__link--active,
+.menu__link.vc-navbar-cta.menu__link--active:hover {
+  border-left-color: transparent;
   background: var(--vc-accent);
   color: #fff;
   justify-content: center;
@@ -436,6 +502,69 @@ h1, h2, h3, h4, h5, h6 {
 }
 .menu__caret:hover {
   background: var(--vc-raised);
+}
+/* Collapsible-category carets match the navbar dropdown caret: a solid
+   triangle pointing down when closed and up when open (Infima's chevron
+   points right when closed). */
+.menu__link--sublist-caret::after,
+.menu__caret::before {
+  background: none;
+  filter: none;
+  min-width: 0;
+  width: 0;
+  height: 0;
+  border-style: solid;
+  border-color: currentColor transparent;
+  border-width: 0.3rem 0.3rem 0;
+  transform: rotate(180deg);
+}
+/* Sits just after the label instead of at the far right edge. */
+.menu__link--sublist-caret::after {
+  margin-left: 0.6em;
+}
+.menu__list-item--collapsed .menu__link--sublist::after,
+.menu__list-item--collapsed .menu__caret::before {
+  transform: none;
+}
+
+/* Sidebars are per-section ("within Tutorials"), so the rail drops its panel
+   edge and reads as a light docs-style list. Non-collapsible top categories
+   are section titles, not links: no hover, no pointer. */
+.theme-doc-sidebar-container {
+  border-right: 0 !important; /* overrides custom.css's hairline */
+}
+@media (min-width: 997px) {
+  .theme-doc-sidebar-menu {
+    padding-top: 24px;
+  }
+}
+.menu__list-item-collapsible:has(> .menu__link:not(.menu__link--sublist)) {
+  pointer-events: none;
+}
+.menu__list-item-collapsible > .menu__link:not(.menu__link--sublist) {
+  color: var(--vc-text-faint);
+  border-left-color: transparent; /* even when it contains the active page */
+  padding-bottom: 8px;
+}
+.theme-doc-sidebar-item-category-level-1:not(:first-child) {
+  margin-top: 16px;
+}
+
+/* Standalone docs (in no sidebar): keep the normal 1080px docs measure
+   centred instead of Docusaurus's widened no-sidebar container, and centre
+   the article itself when there's no TOC beside it. Landing and Get Started
+   run their own full-width layouts. */
+@media (min-width: 997px) {
+  html.docs-doc-page:not(.docs-doc-id-landing):not(.docs-doc-id-get_started)
+    .main-wrapper:not(:has(.theme-doc-sidebar-container))
+    main > .container {
+    max-width: var(--ifm-container-width);
+  }
+  html.docs-doc-page:not(.docs-doc-id-landing):not(.docs-doc-id-get_started)
+    .main-wrapper:not(:has(.theme-doc-sidebar-container))
+    main > .container > .row > .col:only-child article {
+    margin-inline: auto;
+  }
 }
 
 /* ==========================================================================
@@ -718,7 +847,7 @@ h1, h2, h3, h4, h5, h6 {
    ========================================================================== */
 html:not(.docs-doc-id-landing):not(.docs-doc-id-data_browser)
   .markdown
-  a:not(.vc-card):not(.vc-cta):not(.vc-btn):not(.vc-btn-outline):not(.hash-link):not(.vc-stat):not(:has(img, video)) {
+  a:not(.vc-card):not(.vc-cta):not(.vc-btn):not(.vc-btn-outline):not(.hash-link):not(.vc-stat):not(.vc-submit a):not(:has(img, video)) {
   color: var(--vc-text);
   text-decoration: underline;
   text-decoration-color: var(--vc-accent-underline);
@@ -727,7 +856,7 @@ html:not(.docs-doc-id-landing):not(.docs-doc-id-data_browser)
 }
 html:not(.docs-doc-id-landing):not(.docs-doc-id-data_browser)
   .markdown
-  a:not(.vc-card):not(.vc-cta):not(.vc-btn):not(.vc-btn-outline):not(.hash-link):not(.vc-stat):not(:has(img, video)):hover {
+  a:not(.vc-card):not(.vc-cta):not(.vc-btn):not(.vc-btn-outline):not(.hash-link):not(.vc-stat):not(.vc-submit a):not(:has(img, video)):hover {
   color: var(--vc-accent);
   text-decoration-color: var(--vc-accent);
 }
@@ -815,6 +944,45 @@ details.alert {
 }
 details.alert > summary {
   font-weight: 600;
+}
+
+/* Prizes page: collapsibles read like the landing's team toggles — a bare
+   text label with a trailing ▾ (ember on hover, flips when open); the open
+   body sits in a hairline frame. */
+html.docs-doc-id-prizes details.alert {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  margin: 0 0 10px;
+}
+html.docs-doc-id-prizes details.alert > summary {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 0;
+  color: var(--vc-text);
+}
+html.docs-doc-id-prizes details.alert > summary:hover {
+  color: var(--vc-accent);
+}
+html.docs-doc-id-prizes details.alert > summary::before {
+  display: none;
+}
+html.docs-doc-id-prizes details.alert > summary::after {
+  content: "\25BE"; /* ▾ */
+  font-size: 0.875rem;
+  color: var(--vc-text-dim);
+  transition: transform 0.15s ease;
+}
+html.docs-doc-id-prizes details.alert[data-collapsed="false"] > summary::after,
+html.docs-doc-id-prizes details.alert[open]:not([data-collapsed]) > summary::after {
+  transform: rotate(180deg);
+}
+html.docs-doc-id-prizes details.alert [class*="collapsibleContent"] {
+  margin: 8px 0 12px;
+  padding: 16px 20px;
+  border: 1px solid var(--vc-line);
+  border-radius: var(--vc-r-card);
 }
 
 /* ==========================================================================
@@ -1106,82 +1274,87 @@ a.vc-card:hover {
   text-decoration: none;
 }
 
-/* LatestPosts "Updates" strip: hairline-separated compact rows.
-   The 1px grid gap shows the container's line-tinted background through as
-   the separators — works at every column count. */
+/* LatestPosts "Updates" strip: unboxed columns on the page background,
+   divided by vertical hairlines (same grammar as the landing targets strip).
+   4-up >=1280px, 2-up >=480px, stacked with horizontal rules below. */
 .vc-updates {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 1px;
-  background: var(--vc-line);
-  background-clip: padding-box;
-  border: 1px solid var(--vc-line);
-  border-radius: var(--vc-r-card);
-  overflow: hidden;
+  row-gap: 16px;
 }
 @media (min-width: 1280px) {
   .vc-updates {
     grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 }
+/* Each column reads "Title …… date": the title wraps to two lines, then
+   truncates; the date sits on the first line, pushed to the right. */
+a.vc-updates__item {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  padding: 2px 20px;
+  border-left: 1px solid var(--vc-line);
+  text-decoration: none;
+}
+/* First column of each row carries no divider. */
+a.vc-updates__item:nth-child(2n + 1) {
+  border-left: 0;
+  padding-left: 0;
+}
+@media (min-width: 1280px) {
+  a.vc-updates__item:nth-child(2n + 1) {
+    border-left: 1px solid var(--vc-line);
+    padding-left: 20px;
+  }
+  a.vc-updates__item:first-child {
+    border-left: 0;
+    padding-left: 0;
+  }
+}
 @media (max-width: 479px) {
   .vc-updates {
     grid-template-columns: minmax(0, 1fr); /* single column on phones */
+    row-gap: 0;
   }
-  /* Phones read the strip as a ticker: one "Title …… date" line per row. */
-  a.vc-updates__item {
-    flex-direction: row;
-    justify-content: space-between;
-    align-items: baseline;
-    gap: 12px;
+  a.vc-updates__item,
+  a.vc-updates__item:nth-child(2n + 1) {
     min-height: 44px;
-    padding: 10px 14px;
+    padding: 10px 0;
+    border-left: 0;
+    border-top: 1px solid var(--vc-line);
   }
-  .vc-updates__title {
-    min-width: 0; /* long titles wrap instead of overflowing */
+  a.vc-updates__item:first-child {
+    border-top: 0;
   }
-  .vc-updates__meta {
-    flex: none; /* the date never gets squeezed */
-  }
-}
-a.vc-updates__item {
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: 2px;
-  min-height: 48px;
-  padding: 8px 14px;
-  background: var(--vc-surface);
-  text-decoration: none;
 }
 a.vc-updates__item:hover {
-  background: var(--vc-raised);
   text-decoration: none;
+}
+a.vc-updates__item:hover .vc-updates__title {
+  color: var(--vc-accent);
 }
 a.vc-updates__item:focus-visible {
   outline: 2px solid var(--vc-accent);
-  outline-offset: -2px;
+  outline-offset: 2px;
 }
 .vc-updates__title {
-  font-size: 13px;
-  font-weight: 600;
+  font-size: 14px;
+  font-weight: 400;
   line-height: 1.3;
   color: var(--vc-text);
   display: -webkit-box;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
   overflow: hidden;
-}
-/* Desktop rows: one line per title, dates on one baseline across the strip. */
-@media (min-width: 997px) {
-  .vc-updates__title {
-    display: block;
-    white-space: nowrap;
-    text-overflow: ellipsis;
-  }
+  min-width: 0; /* long titles wrap instead of overflowing */
+  transition: color 0.15s;
 }
 .vc-updates__meta {
-  font-size: 10px;
+  flex: none; /* the date never gets squeezed */
+  white-space: nowrap;
+  font-size: 11px;
   color: var(--vc-text-faint);
   font-variant-numeric: tabular-nums;
 }

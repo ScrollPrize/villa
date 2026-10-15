@@ -2,9 +2,14 @@ import numpy as np
 import torch
 
 import geom_utils
+from devices import fit_device
 
 
-def get_spiral_yxs(num_windings, dr_per_winding, inter_point_spacing, group_by_winding=False, device='cuda'):
+def get_spiral_yxs(num_windings, dr_per_winding, inter_point_spacing, group_by_winding=False, device=None):
+
+    # The device defaults to the fit device: CUDA when it is available, as before.
+    if device is None:
+        device = fit_device()
 
     # Note this is not differentiable wrt dr_per_winding nor inter_point_spacing!
 

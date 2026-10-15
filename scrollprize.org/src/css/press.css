@@ -1,0 +1,124 @@
+/* ==========================================================================
+   Press page (docs/40_press.md, src/components/Press.js): contact list, key
+   facts and media kit. Hairline-divided, no boxes; only media is framed.
+   ========================================================================== */
+
+/* Contacts: one row per need, label left, who right. */
+.vc-press-contacts {
+  margin: 0 0 8px;
+  border-top: 1px solid var(--vc-line);
+}
+.vc-press-contacts__row {
+  display: grid;
+  grid-template-columns: minmax(0, 16rem) minmax(0, 1fr);
+  gap: 4px 24px;
+  align-items: baseline;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--vc-line);
+}
+.vc-press-contacts dt {
+  margin: 0;
+  font-weight: 400;
+}
+.vc-press-contacts dd {
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  font-weight: 500;
+}
+.vc-press-contacts__role {
+  font-size: 0.875rem;
+  font-weight: 400;
+  color: var(--vc-text-faint);
+}
+
+/* Key facts: a row of figures, hairline-separated like the landing stats. */
+.vc-press-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 20px 0;
+  margin: 24px 0 8px;
+}
+.vc-press-facts__item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0 20px;
+  border-left: 1px solid var(--vc-line);
+}
+.vc-press-facts__item:first-child {
+  padding-left: 0;
+  border-left: 0;
+}
+.vc-press-facts__value {
+  font-size: 1.5rem;
+  white-space: nowrap;
+  font-weight: 700;
+  line-height: 1.1;
+  color: var(--vc-text);
+}
+.vc-press-facts__label {
+  font-size: 0.875rem;
+  line-height: 1.4;
+  color: var(--vc-text-dim);
+}
+
+/* Media kit: framed thumbnails, caption and download link beneath. */
+.vc-press-media {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 32px 24px;
+  margin-top: 24px;
+}
+.vc-press-media__item {
+  margin: 0;
+}
+.vc-press-media__thumb {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  object-fit: cover;
+  border: 1px solid var(--vc-line);
+  border-radius: var(--vc-r-card);
+  transition: border-color 0.15s;
+}
+.vc-press-media__item a:hover .vc-press-media__thumb {
+  border-color: var(--vc-line-strong);
+}
+/* The full surface is a 13:1 strip whose ends are blank papyrus; the
+   default centre crop lands on its columns of text. */
+.vc-press-media__item figcaption {
+  margin: 10px 0 0;
+  font-style: normal;
+  font-size: 0.875rem;
+  line-height: 1.5;
+  color: var(--vc-text-dim);
+}
+.vc-press-media__download {
+  display: block;
+  margin-top: 4px;
+  font-weight: 500;
+}
+
+@media (max-width: 996px) {
+  .vc-press-media {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 560px) {
+  .vc-press-contacts__row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .vc-press-media {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .vc-press-facts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .vc-press-facts__item:nth-child(odd) {
+    padding-left: 0;
+    border-left: 0;
+  }
+}
