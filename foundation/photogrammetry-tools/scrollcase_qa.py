@@ -6,12 +6,17 @@ Checks the kit is complete (the three STLs and a row in scroll_summary.csv) and,
 finite geometry, winding consistency, boundary and non-manifold edges, and components, with
 zero-volume slivers (left where the halves meet the divider) counted separately. Then the fit:
 the angle between the cavity's wide direction and the split plane, and the clearance from the
-scroll surface to each half; no scroll surface may lie inside case material.
+scroll surface to each half; no scroll surface may lie inside case material. The wiggle is the gap
+from each scroll surface sample to the nearer half (near the lining offset everywhere for a snug fit).
+Each half must lift off the scroll along its side of the y axis without hitting it, stay within the
+caps' footprint, and not overlap the other; away from the flat divider joint the halves must keep
+--sliding-mm apart (where one half protrudes past the divider into the other, their faces slide
+past each other).
 
 --render writes cross-sections at five heights (scroll red, left half blue, right half green)
 above shaded views of the halves and the scroll.
 
-Run with the scrollcase venv (needs trimesh and meshlib):
+Run with the scrollcase venv (needs scrollcase, trimesh and meshlib):
     python scrollcase_qa.py OUTPUT_DIR SCROLL_ID [--render kit.png]
 """
 
@@ -22,6 +27,9 @@ import os
 import numpy as np
 import trimesh
 from PIL import Image, ImageDraw
+
+# Import scrollcase (build123d/OCP) before meshlib: the reverse order aborts at import.
+from scrollcase.curved_divider_wall import divider_y
 from meshlib import mrmeshpy
 
 PARTS = ("scroll", "left", "right")
@@ -47,7 +55,19 @@ def winding_number(mesh, x):
     return 2 * np.arctan2(num, den).sum() / (4 * np.pi)
 
 
-def clearance(scroll, half, half_path, n=30000, max_confirm=500):
+def signed_distances(P, mesh_path, mesh, max_confirm=500):
+    """Signed distances from points to a case half, negative samples confirmed by winding number (see clearance).
+    Returns the distances and the number of samples meshlib alone reported inside."""
+    mm_mesh = mrmeshpy.loadMesh(mesh_path)
+    d = np.array([mrmeshpy.findSignedDistance(mrmeshpy.Vector3f(*map(float, p)), mm_mesh).dist for p in P])
+    flagged = np.flatnonzero(d <= 0)
+    for i in flagged[:max_confirm]:
+        if winding_number(mesh, P[i]) < 0.5:
+            d[i] = abs(d[i])
+    return d, len(flagged)
+
+
+def clearance(scroll, half, half_path, n=30000):
     """Signed distances from scroll surface samples to a case half (negative = inside its material).
 
     meshlib's sign comes from the pseudo-normal at the closest feature and is occasionally wrong at a case vertex
@@ -55,13 +75,32 @@ def clearance(scroll, half, half_path, n=30000, max_confirm=500):
     checked with the exact winding number and made positive when it is outside. Returns the distances and the
     number of samples meshlib alone reported inside."""
     P, _ = trimesh.sample.sample_surface(scroll, n, seed=0)
-    mesh = mrmeshpy.loadMesh(half_path)
-    d = np.array([mrmeshpy.findSignedDistance(mrmeshpy.Vector3f(*map(float, p)), mesh).dist for p in P])
-    flagged = np.flatnonzero(d <= 0)
-    for i in flagged[:max_confirm]:
-        if winding_number(half, P[i]) < 0.5:
-            d[i] = abs(d[i])
-    return d, len(flagged)
+    return signed_distances(P, half_path, half)
+
+
+def pull_blocked(scroll, half_path, direction, n=30000):
+    """Scroll surface samples from which a ray along `direction` (the way the scroll leaves this half) hits it."""
+    P, _ = trimesh.sample.sample_surface(scroll, n, seed=1)
+    part = mrmeshpy.MeshPart(mrmeshpy.loadMesh(half_path))
+    d = mrmeshpy.Vector3f(*map(float, direction))
+    return sum(bool(mrmeshpy.rayMeshIntersect(part, mrmeshpy.Line3f(mrmeshpy.Vector3f(*map(float, p)), d)))
+               for p in P)
+
+
+def half_contact(half, other, other_path, lining_outer_radius, z_range, sliding_mm, n=60000):
+    """Samples of one half's surface inside the other half, and (beside the scroll, away from the flat divider
+    joint) within sliding_mm of it, i.e. faces that must slide past each other with less than the required
+    clearance. Outside z_range the caps slide by design (right_cap_buffer above the base disc). Flush contact
+    along the joint gives distances near 0, so only samples deeper than 0.05 mm are confirmed by winding number."""
+    P, _ = trimesh.sample.sample_surface(half, n, seed=2)
+    mm_mesh = mrmeshpy.loadMesh(other_path)
+    s = np.array([mrmeshpy.findSignedDistance(mrmeshpy.Vector3f(*map(float, p)), mm_mesh).dist for p in P])
+    for i in np.flatnonzero(s < -0.05)[:500]:
+        if winding_number(other, P[i]) < 0.5:
+            s[i] = abs(s[i])
+    off_joint = ((np.abs(P[:, 1] - divider_y(P[:, 0], lining_outer_radius, 2.0)) > 1.5)
+                 & (P[:, 2] > z_range[0]) & (P[:, 2] < z_range[1]))
+    return (s < -0.2).sum(), (off_joint & (s > -0.2) & (s < sliding_mm)).sum(), s[off_joint].min()
 
 
 def section_tile(parts, z, lo, hi):
@@ -129,6 +168,8 @@ def main():
     parser.add_argument("output_dir", help="stl_generator.py --output directory (holds scroll_summary.csv)")
     parser.add_argument("scroll_id", help="padded scroll identifier, e.g. 0525")
     parser.add_argument("--render", help="write sections and views to this PNG")
+    parser.add_argument("--sliding-mm", type=float, default=1.0,
+                        help="minimum clearance between the halves away from the divider joint (default 1)")
     args = parser.parse_args()
     kit = os.path.join(args.output_dir, args.scroll_id)
     paths = {k: os.path.join(kit, f"{args.scroll_id}_{k}.stl") for k in PARTS}
@@ -145,14 +186,38 @@ def main():
     xy = parts["scroll"].vertices[:, :2]
     w, E = np.linalg.eigh(np.cov(xy - xy.mean(0), rowvar=False))
     print(f"cavity wide direction vs split plane (x): {np.degrees(np.arccos(abs(E[0, -1]))):.1f} deg")
+    sd = {}
     for k in ("left", "right"):
-        s, flagged = clearance(parts["scroll"], parts[k], paths[k])
+        s, flagged = sd[k] = clearance(parts["scroll"], parts[k], paths[k])
         out = s[s > 0]
         inside = int((s <= 0).sum())
         note = (f" ({flagged} reported by the signed distance, {flagged - inside} of them outside by winding number)"
                 if flagged > inside else "")
         print(f"{k:6s} clearance min {out.min():.2f}, 1st percentile {np.percentile(out, 1):.2f}, median "
               f"{np.median(out):.2f} mm; scroll samples inside case material {(s <= 0).sum()}/{len(s)}{note}")
+    gap = np.minimum(sd["left"][0], sd["right"][0])
+    print(f"wiggle (gap to the nearer half) median {np.median(gap):.2f}, 95th percentile {np.percentile(gap, 95):.2f}, "
+          f"99th {np.percentile(gap, 99):.2f}, max {gap.max():.2f} mm; samples over 3 mm {(gap > 3).mean():.1%}")
+
+    # The right half lies on the +y side of the divider and lifts off along +y, the left along -y.
+    up = 1.0 if parts["right"].centroid[1] > parts["left"].centroid[1] else -1.0
+    for k, pull in (("right", up), ("left", -up)):
+        blocked = pull_blocked(parts["scroll"], paths[k], (0, -pull, 0))
+        print(f"{k:6s} lifts off along {'+' if pull > 0 else '-'}y: scroll samples blocked by it {blocked}/30000")
+    radius = float(rows[0]["Diameter (mm)"]) / 2 if rows else None
+    if radius:
+        # The lining (offset 2 + wall 2 by default) around the scroll; the caps start beyond it.
+        z_range = parts["scroll"].bounds[:, 2] + [-4, 4]
+        # Square caps of half-width max(mount disc radius 56.25, lining radius) bound each half in y.
+        cap = max(56.25, radius)
+        for k in ("left", "right"):
+            beyond = (np.abs(parts[k].vertices[:, 1]) > cap + 0.01).sum()
+            print(f"{k:6s} vertices beyond the caps' footprint (|y| > {cap:.2f}) {beyond}")
+        for k, other in (("left", "right"), ("right", "left")):
+            inside, close, nearest = half_contact(parts[k], parts[other], paths[other], radius, z_range,
+                                                  args.sliding_mm)
+            print(f"{k:6s} surface samples inside {other} {inside}/60000; off the divider joint and within "
+                  f"{args.sliding_mm} mm of {other} {close}/60000 (nearest {nearest:.2f} mm)")
     if args.render:
         render(parts, args.render)
 

@@ -57,6 +57,7 @@ Mesh processing involves the following steps:
 6. Offset by 2mm
 7. Split along YZ plane
 8. Remove overhangs
+9. Where the scroll lies wholly on one side of the divider (a thin, curved fragment), let the other half protrude past the divider to meet it, with 1 mm sliding clearance (`protrusion_min_gap_mm`, `protrusion_clearance_mm`); scrolls crossing the divider everywhere are unaffected
 
 ### Mesh smoothing
 

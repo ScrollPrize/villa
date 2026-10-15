@@ -161,6 +161,11 @@ class ScrollMesh:
         cylinder_axis: Cylinder axis direction in input mesh coordinates, e.g. along
         the umbilicus. Defaults to None, which fits the axis giving the smallest
         enclosing cylinder.
+        protrusion_min_gap_mm: Where the scroll lies wholly on one side of the divider
+        with a gap beyond this to it, the other half protrudes past the divider to meet
+        the scroll. Defaults to 1.
+        protrusion_clearance_mm: Clearance between such a protrusion and the lining of
+        the half it slides into. Defaults to 1.
 
     """
 
@@ -178,6 +183,127 @@ class ScrollMesh:
     smoothing_unite_with_original: bool = True
     vertical_offset: Optional[float] = None
     cylinder_axis: Optional[tuple[float, float, float]] = None
+    protrusion_min_gap_mm: float = 1
+    protrusion_clearance_mm: float = 1
+
+
+def _sweep(mesh: mm.Mesh, toward: mm.Vector3f, voxel_size: float, length: float):
+    """Mesh swept along `toward` by `length` beyond its extent: each column along that
+    axis is filled from the mesh's far side onwards."""
+    swept = _copy_meshlib(mesh)
+    mm.fixUndercuts(swept, -toward, voxel_size, length)
+    return swept
+
+
+def _translated(mesh: mm.Mesh, y: float):
+    moved = _copy_meshlib(mesh)
+    moved.transform(mm.AffineXf3f.translation(mm.Vector3f(0, y, 0)))
+    return moved
+
+
+def _exact_boolean(a: mm.Mesh, b: mm.Mesh, op: mm.BooleanOperation, voxel_size: float):
+    """Exact boolean, falling back to a voxel boolean where it fails (as it can on
+    self-intersecting voxel-derived meshes)."""
+    result = mm.boolean(a, b, op)
+    if result.valid():
+        return result.mesh
+    logger.warning(f"Exact boolean failed ({result.errorString}); using voxels")
+    voxel_op = {
+        mm.BooleanOperation.Union: mm.voxelBooleanUnite,
+        mm.BooleanOperation.DifferenceAB: mm.voxelBooleanSubtract,
+    }[op]
+    return voxel_op(a, b, voxel_size)
+
+
+def _protrusion(
+    offset_mesh: mm.Mesh,
+    divider_piece_mesh: mm.Mesh,
+    *,
+    below: bool,
+    lining_outer_radius: float,
+    wall_thickness_mm: float,
+    min_gap_mm: float,
+    clearance_mm: float,
+    voxel_size: float,
+) -> tuple[Optional[mm.Mesh], Optional[mm.Mesh]]:
+    """Protrusion of one case half past the divider, to meet the scroll where it lies
+    wholly on the other side.
+
+    With below=True this is the negative half rising (along +Y) into the region between
+    the divider and the underside of the offset scroll, in the columns (along Y) where
+    that gap exceeds min_gap_mm; with below=False, the positive half descending onto
+    the scroll's top. The protrusion reaches from wall_thickness_mm on its own side of
+    the divider (joining its half's divider wall) to the offset scroll, and is kept
+    clearance_mm (plus a voxel for discretisation) inside the scroll's footprint, so
+    that it slides past the other half's lining around the scroll.
+
+    Returns the protrusion and the region to clear from the other half, or (None, None)
+    where the scroll crosses the divider (within min_gap_mm) in every column.
+    """
+    y = mm.Vector3f(0, 1, 0)
+    reach = offset_mesh.computeBoundingBox().diagonal()
+    down = _sweep(offset_mesh, -y, voxel_size, reach)
+    up = _sweep(offset_mesh, y, voxel_size, reach)
+    # The gap between the scroll and the divider (or beyond it) in each column, and its
+    # part beyond the divider shifted by `shift` towards the scroll.
+    if below:
+        gap = mm.voxelBooleanSubtract(down, up, voxel_size)
+    else:
+        gap = mm.voxelBooleanSubtract(up, down, voxel_size)
+    # Within the lining; the divider piece, cropped to a little beyond that so that it
+    # still covers it when shifted, ends a fixed distance past the divider, which the
+    # sweeps may otherwise reach. Booleans between voxel-derived meshes are voxel based,
+    # being robust to their self-intersections.
+    bounds = offset_mesh.computeBoundingBox()
+    lo = mm.Vector3f(bounds.min.x - 1, -lining_outer_radius, bounds.min.z - 1)
+    size = mm.Vector3f(bounds.size().x + 2, 2 * lining_outer_radius, bounds.size().z + 2)
+    gap = mm.voxelBooleanIntersect(gap, mm.makeCube(size, lo), voxel_size)
+    margin = 2 * (wall_thickness_mm + min_gap_mm)
+    crop = mm.boolean(
+        divider_piece_mesh,
+        mm.makeCube(
+            mm.Vector3f(size.x, size.y + 2 * margin, size.z),
+            mm.Vector3f(lo.x, lo.y - margin, lo.z),
+        ),
+        mm.BooleanOperation.Intersection,
+    )
+    if not crop.valid():
+        raise RuntimeError(f"Cropping the divider failed: {crop.errorString}")
+    combine = mm.voxelBooleanIntersect if below else mm.voxelBooleanSubtract
+    sign = 1 if below else -1
+    inside_far = lambda shift: combine(
+        gap, _translated(crop.mesh, sign * shift), voxel_size
+    )
+
+    # Columns where the gap beyond the divider exceeds min_gap_mm, opened to drop
+    # features narrower than twice the clearance.
+    deep = inside_far(min_gap_mm)
+    if deep.volume() < voxel_size**3:
+        return None, None
+    columns = _sweep(_sweep(deep, y, voxel_size, reach), -y, voxel_size, reach)
+    params = mm.OffsetParameters()
+    params.voxelSize = voxel_size
+    columns = mm.offsetMesh(columns, offset=-clearance_mm, params=params)  # type: ignore
+    if columns.volume() < voxel_size**3:
+        return None, None
+    columns = mm.offsetMesh(columns, offset=clearance_mm, params=params)  # type: ignore
+
+    # The scroll's footprint, shrunk by the sliding clearance.
+    footprint = mm.voxelBooleanUnite(down, up, voxel_size)
+    footprint = mm.offsetMesh(footprint, offset=-(clearance_mm + voxel_size), params=params)  # type: ignore
+
+    mesa = inside_far(-wall_thickness_mm)
+    mesa = mm.voxelBooleanIntersect(mesa, columns, voxel_size)
+    mesa = mm.voxelBooleanIntersect(mesa, footprint, voxel_size)
+    if mesa.volume() < voxel_size**3:
+        return None, None
+
+    # Clear the other half from these columns (its divider wall, any floor under the
+    # scroll), widened by the clearance; it is bounded by the footprint, so the lining
+    # around the scroll stays.
+    widened = mm.offsetMesh(columns, offset=clearance_mm + voxel_size, params=params)  # type: ignore
+    cut = mm.voxelBooleanIntersect(inside_far(0), widened, voxel_size)
+    return mesa, cut
 
 
 def assert_one_component(mesh: mm.Mesh):
@@ -340,6 +466,38 @@ def build_lining(
     cavity_mesh_neg_offset = mm.boolean(
         cavity_mesh_neg_offset, divider_piece_mesh, mm.BooleanOperation.DifferenceAB
     ).mesh
+
+    # Where the scroll lies wholly on one side of the divider, let the other half rise
+    # past the divider to meet it rather than leaving a gap the scroll can move in.
+    for mesa_side, cut_side in (("neg", "pos"), ("pos", "neg")):
+        mesa, cut = _protrusion(
+            offset_mesh,
+            divider_piece_mesh,
+            below=mesa_side == "neg",
+            lining_outer_radius=radius
+            + mesh_params.lining_offset_mm
+            + mesh_params.wall_thickness_mm,
+            wall_thickness_mm=mesh_params.wall_thickness_mm,
+            min_gap_mm=mesh_params.protrusion_min_gap_mm,
+            clearance_mm=mesh_params.protrusion_clearance_mm,
+            voxel_size=voxel_size,
+        )
+        if mesa is None:
+            continue
+        logger.info(f"Adding protrusion of the {mesa_side} half past the divider")
+        # Exact booleans keep the linings' clean cut along the divider.
+        unite = partial(_exact_boolean, op=mm.BooleanOperation.Union, voxel_size=voxel_size)
+        subtract = partial(
+            _exact_boolean, op=mm.BooleanOperation.DifferenceAB, voxel_size=voxel_size
+        )
+        if cut_side == "pos":
+            cavity_mesh_pos = unite(cavity_mesh_pos, cut)
+            cavity_mesh_pos_offset = subtract(cavity_mesh_pos_offset, cut)
+            cavity_mesh_neg_offset = unite(cavity_mesh_neg_offset, mesa)
+        else:
+            cavity_mesh_neg = unite(cavity_mesh_neg, cut)
+            cavity_mesh_neg_offset = subtract(cavity_mesh_neg_offset, cut)
+            cavity_mesh_pos_offset = unite(cavity_mesh_pos_offset, mesa)
 
     fill_hole_params = mm.FillHoleParams()
     edges_pos = mm.std_vector_Id_EdgeTag(hole_edges_pos)
