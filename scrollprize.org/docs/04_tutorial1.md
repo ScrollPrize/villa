@@ -94,7 +94,7 @@ Stephen then _carbonized_ the scroll through a process that is similar to that o
 
 :::tip
 
-We now also have a community-contributed program that is worth trying out: [Scroll Viewer](https://web.archive.org/web/20241230173950/https://github.com/lukeboi/scroll-viewer).
+We now also have a community-contributed program that is worth trying out: [Scroll Viewer](https://github.com/lukeboi/scroll-viewer).
 
 :::
 
