@@ -11,7 +11,7 @@ giving the cylinder axis (e.g. along the umbilicus) in the mesh's coordinates, e
 (3 numbers) or as two points on the axis (6 numbers). Without it, the axis of the smallest enclosing
 cylinder is used. An optional
    <scroll_number>-label.txt
-replaces the two label lines engraved on the top cap (default "PHerc<padded number>" and "v3") with its
+replaces the two label lines engraved on the top cap (default "PHerc<padded number>" and "v4") with its
 first one or two non-empty lines ('#' starts a comment), e.g. for an object without a number. Folder names
 that are not a number (optionally followed by one letter) are used unpadded.
 
@@ -58,14 +58,14 @@ def pad_scroll_name(scroll_number: str) -> str:
 def read_label(label_file: str) -> tuple[str, str]:
     """
     Reads the two label lines from a text file: the first one or two non-empty lines ('#' starts a comment).
-    A missing second line keeps the default "v3".
+    A missing second line keeps the default "v4".
     """
     with open(label_file) as f:
         lines = [line.split("#")[0].strip() for line in f]
     lines = [line for line in lines if line]
     if not lines or len(lines) > 2:
         raise ValueError(f"{label_file}: expected one or two label lines, found {len(lines)}")
-    return lines[0], lines[1] if len(lines) == 2 else "v3"
+    return lines[0], lines[1] if len(lines) == 2 else "v4"
 
 
 def read_axis(axis_file: str) -> tuple[float, float, float]:
@@ -120,7 +120,7 @@ def process_scroll(
         "scroll_height_mm": height,
         "scroll_radius_mm": radius,
         "label_line_1": label[0] if label else f"PHerc{padded_scroll}",
-        "label_line_2": label[1] if label else "v3",
+        "label_line_2": label[1] if label else "v4",
     }
 
     scroll_case = case.ScrollCaseConfig(**scroll_case_defaults)
