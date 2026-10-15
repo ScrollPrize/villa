@@ -52,12 +52,12 @@ Mesh processing involves the following steps:
 1. Optionally scale mesh to target size (for unscaled meshes)
 2. Simplify (decimate) mesh to a target error
 3. Fit the minimum bounding cylinder, or use the given `cylinder_axis` (e.g. along the umbilicus of a squashed scroll, where the smallest cylinder runs the wrong way)
-4. (Optional) Optimize rotation about the cylinder axis, then (`rotation_search`, on by default) turn further to where the S-shaped divider leaves the scroll least room between it and the halves, within 5 mm of the shallowest pockets; scrolls with no clear gain keep their split
+4. (Optional) Optimize rotation about the cylinder axis, then (`rotation_search`, on by default) turn further to where the S-shaped divider leaves the scroll least room between it and the halves (so the parting surface bends least), within 5 mm of the shallowest pockets; scrolls with no clear gain keep their split
 5. (Optional) Smooth mesh
 6. Offset by 2mm
 7. Split along YZ plane
 8. Remove overhangs
-9. Where the scroll lies wholly on one side of the divider (a thin, curved fragment), let the other half protrude past the divider to meet it (a shell of the wall thickness, as if its divider wall were pushed in), with 1 mm sliding clearance (`protrusion_min_gap_mm`, `protrusion_clearance_mm`); scrolls crossing the divider everywhere are unaffected
+9. Part the halves on a smooth surface that is the S-shaped divider away from the scroll and bends to pass through it wherever the scroll lies off the divider (a thin, curved fragment); the divider wall follows it at constant thickness. For scrolls crossing the divider everywhere it is the divider itself
 
 ### Mesh smoothing
 
