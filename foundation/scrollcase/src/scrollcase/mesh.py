@@ -342,7 +342,7 @@ def _protrusion(
     min_gap_mm: float,
     clearance_mm: float,
     voxel_size: float,
-) -> tuple[Optional[mm.Mesh], Optional[mm.Mesh]]:
+) -> tuple[Optional[mm.Mesh], Optional[mm.Mesh], Optional[mm.Mesh]]:
     """Protrusion of one case half past the divider, to meet the scroll where it lies
     wholly on the other side.
 
@@ -354,8 +354,14 @@ def _protrusion(
     clearance_mm (plus a voxel for discretisation) inside the scroll's footprint, so
     that it slides past the other half's lining around the scroll.
 
-    Returns the protrusion and the region to clear from the other half, or (None, None)
-    where the scroll crosses the divider (within min_gap_mm) in every column.
+    The protrusion is a shell like the rest of the case: its core, wall_thickness_mm
+    in from its top and sides, is hollowed out through the divider wall to the outside
+    of its half, as if that half's divider wall were pushed into the gap.
+
+    Returns the protrusion (solid), the hollow to remove from its half (None where the
+    protrusion is too narrow for one), and the region to clear from the other half; or
+    (None, None, None) where the scroll crosses the divider (within min_gap_mm) in every
+    column.
     """
     y = mm.Vector3f(0, 1, 0)
     reach = offset_mesh.computeBoundingBox().diagonal()
@@ -396,13 +402,13 @@ def _protrusion(
     # features narrower than twice the clearance.
     deep = inside_far(min_gap_mm)
     if deep.volume() < voxel_size**3:
-        return None, None
+        return None, None, None
     columns = _sweep(_sweep(deep, y, voxel_size, reach), -y, voxel_size, reach)
     params = mm.OffsetParameters()
     params.voxelSize = voxel_size
     columns = mm.offsetMesh(columns, offset=-clearance_mm, params=params)  # type: ignore
     if columns.volume() < voxel_size**3:
-        return None, None
+        return None, None, None
     columns = mm.offsetMesh(columns, offset=clearance_mm, params=params)  # type: ignore
 
     # The scroll's footprint, shrunk by the sliding clearance.
@@ -413,14 +419,19 @@ def _protrusion(
     mesa = mm.voxelBooleanIntersect(mesa, columns, voxel_size)
     mesa = mm.voxelBooleanIntersect(mesa, footprint, voxel_size)
     if mesa.volume() < voxel_size**3:
-        return None, None
+        return None, None, None
 
     # Clear the other half from these columns (its divider wall, any floor under the
     # scroll), widened by the clearance; it is bounded by the footprint, so the lining
     # around the scroll stays.
     widened = mm.offsetMesh(columns, offset=clearance_mm + voxel_size, params=params)  # type: ignore
     cut = mm.voxelBooleanIntersect(inside_far(0), widened, voxel_size)
-    return mesa, cut
+
+    core = mm.offsetMesh(mesa, offset=-wall_thickness_mm, params=params)  # type: ignore
+    if core.volume() < voxel_size**3:
+        return mesa, None, cut
+    hollow = _sweep(core, -y if below else y, voxel_size, reach)
+    return mesa, hollow, cut
 
 
 def assert_one_component(mesh: mm.Mesh):
@@ -602,7 +613,7 @@ def build_lining(
     # Where the scroll lies wholly on one side of the divider, let the other half rise
     # past the divider to meet it rather than leaving a gap the scroll can move in.
     for mesa_side, cut_side in (("neg", "pos"), ("pos", "neg")):
-        mesa, cut = _protrusion(
+        mesa, hollow, cut = _protrusion(
             offset_mesh,
             divider_piece_mesh,
             below=mesa_side == "neg",
@@ -626,10 +637,14 @@ def build_lining(
             cavity_mesh_pos = unite(cavity_mesh_pos, cut)
             cavity_mesh_pos_offset = subtract(cavity_mesh_pos_offset, cut)
             cavity_mesh_neg_offset = unite(cavity_mesh_neg_offset, mesa)
+            if hollow is not None:
+                cavity_mesh_neg = unite(cavity_mesh_neg, hollow)
         else:
             cavity_mesh_neg = unite(cavity_mesh_neg, cut)
             cavity_mesh_neg_offset = subtract(cavity_mesh_neg_offset, cut)
             cavity_mesh_pos_offset = unite(cavity_mesh_pos_offset, mesa)
+            if hollow is not None:
+                cavity_mesh_pos = unite(cavity_mesh_pos, hollow)
 
     fill_hole_params = mm.FillHoleParams()
     edges_pos = mm.std_vector_Id_EdgeTag(hole_edges_pos)

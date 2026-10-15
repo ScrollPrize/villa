@@ -42,7 +42,7 @@ class ProtrusionTests(unittest.TestCase):
     def test_scroll_wholly_above_divider_gets_mesa_from_below(self):
         # The divider rises to y = 6 at x = -15 and dips to y = -6 at x = 15.
         scroll = box((-20, 10, 0), (20, 14, 20))
-        mesa, cut = protrusion(scroll, below=True)
+        mesa, hollow, cut = protrusion(scroll, below=True)
         self.assertIsNotNone(mesa)
 
         b = mesa.computeBoundingBox()
@@ -58,18 +58,25 @@ class ProtrusionTests(unittest.TestCase):
         overlap = mm.voxelBooleanIntersect(mesa, scroll, VOXEL)
         self.assertLess(overlap.volume(), VOXEL**3)
 
+        # Hollowed to a shell of the wall thickness, open through the divider wall.
+        h = hollow.computeBoundingBox()
+        self.assertAlmostEqual(h.max.y, b.max.y - WALL, delta=2 * VOXEL)
+        self.assertAlmostEqual(h.min.x, b.min.x + WALL, delta=2 * VOXEL)
+        self.assertAlmostEqual(h.max.z, b.max.z - WALL, delta=2 * VOXEL)
+        self.assertLess(h.min.y, b.min.y)
+
         # The positive half is cleared from under the scroll, wider than the mesa.
         c = cut.computeBoundingBox()
         self.assertLess(c.min.x, b.min.x - 1)
         self.assertGreater(c.max.x, b.max.x + 1)
 
         # Nothing descends from above: the scroll's top is on the positive side.
-        self.assertEqual(protrusion(scroll, below=False), (None, None))
+        self.assertEqual(protrusion(scroll, below=False), (None, None, None))
 
     def test_scroll_crossing_divider_is_unchanged(self):
         scroll = box((-4, -3, 0), (4, 3, 20))
-        self.assertEqual(protrusion(scroll, below=True), (None, None))
-        self.assertEqual(protrusion(scroll, below=False), (None, None))
+        self.assertEqual(protrusion(scroll, below=True), (None, None, None))
+        self.assertEqual(protrusion(scroll, below=False), (None, None, None))
 
 
 if __name__ == "__main__":
