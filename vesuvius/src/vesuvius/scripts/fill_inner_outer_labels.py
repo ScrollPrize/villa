@@ -431,6 +431,23 @@ def process_and_write_slice(
     return pixels_filled
 
 
+def process_and_write_slices(group: list) -> int:
+    return sum(process_and_write_slice(args) for args in group)
+
+
+def group_by_output_chunk(items: list, slice_of, chunk_z: int, scale_factor: int = 1) -> list:
+    groups = []
+    last_chunk = None
+    for item in sorted(items, key=slice_of):
+        first = slice_of(item) * scale_factor // chunk_z
+        if groups and first <= last_chunk:
+            groups[-1].append(item)
+        else:
+            groups.append([item])
+        last_chunk = (slice_of(item) * scale_factor + scale_factor - 1) // chunk_z
+    return groups
+
+
 def upscale_mask(
     mask: np.ndarray,
     target_shape: Tuple[int, int],
@@ -544,6 +561,21 @@ def write_slice_with_fill(
         output_arr[out_idx, :, :] = output_slice
 
     return pixels_filled
+
+
+def write_slices_with_fill(
+    group: list,
+    input_arr: zarr.Array,
+    output_arr: zarr.Array,
+    output_level: int,
+    compute_level: int,
+    fill_value: int,
+) -> int:
+    return sum(
+        write_slice_with_fill(slice_idx, input_arr, output_arr, output_level, compute_level,
+                              outer_mask, inner_mask, fill_value)
+        for slice_idx, (outer_mask, inner_mask) in group
+    )
 
 
 def visualize_slice(
@@ -755,12 +787,14 @@ def main() -> None:
             )
             for idx in range(start_slice, end_slice)
         ]
+        chunk_z = zarr.open(str(output_path), mode="r")[str(args.output_level)].chunks[0]
+        slice_groups = group_by_output_chunk(slice_args, lambda a: a[0], chunk_z)
 
         total_filled = 0
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
             results = list(tqdm(
-                executor.map(process_and_write_slice, slice_args),
-                total=len(slice_args),
+                executor.map(process_and_write_slices, slice_groups),
+                total=len(slice_groups),
                 desc="Processing slices",
             ))
         total_filled = sum(results)
@@ -814,22 +848,25 @@ def main() -> None:
         input_arr = input_store[str(args.output_level)]
         output_arr = output_store[str(args.output_level)]
 
+        mask_groups = group_by_output_chunk(
+            list(masks.items()), lambda m: m[0], output_arr.chunks[0],
+            2 ** (args.compute_level - args.output_level),
+        )
+
         total_filled = 0
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            futures = {
+            futures = [
                 executor.submit(
-                    write_slice_with_fill,
-                    slice_idx,
+                    write_slices_with_fill,
+                    group,
                     input_arr,
                     output_arr,
                     args.output_level,
                     args.compute_level,
-                    outer_mask,
-                    inner_mask,
                     args.fill_value,
-                ): slice_idx
-                for slice_idx, (outer_mask, inner_mask) in masks.items()
-            }
+                )
+                for group in mask_groups
+            ]
             for future in tqdm(as_completed(futures), total=len(futures), desc="Writing output"):
                 total_filled += future.result()
 
