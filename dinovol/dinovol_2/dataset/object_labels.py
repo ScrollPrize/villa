@@ -575,7 +575,7 @@ def save_mesh_segments_cache(cache_path: str | Path, segments: list[MeshSegment]
     arrays: dict[str, Any] = {"n_segments": np.asarray(len(segments), dtype=np.int32)}
     for idx, seg in enumerate(segments):
         arrays[f"seg_{idx}_id"] = np.asarray(seg.segment_id)
-        arrays[f"seg_{idx}_zyx"] = seg.zyx.astype(np.float16)
+        arrays[f"seg_{idx}_zyx"] = seg.zyx.astype(np.float32)
         arrays[f"seg_{idx}_valid"] = np.packbits(seg.valid, axis=-1)
         arrays[f"seg_{idx}_shape"] = np.asarray(seg.valid.shape, dtype=np.int32)
         arrays[f"seg_{idx}_ink"] = seg.ink_state.astype(np.int8)

@@ -17,7 +17,7 @@
   "clip_grad": 3.0,
   "ibot_masked_loss_chunk_size": 4096,
   "max_iterations": 1000000,
-  "batch_size": 10,
+  "batch_size": 14,
   "grad_accumulation_steps": 1,
   "train_monitor_every_n": 500,
   "monitor_batch_size": 12,
@@ -516,7 +516,7 @@
   },
   "lr_schedule": "constant",
   "koleo_distributed": true,
-  "koleo_loss_group_size": 16,
+  "koleo_loss_group_size": 28,
   "use_amp": true,
   "point_supervision": {
     "enabled": false
