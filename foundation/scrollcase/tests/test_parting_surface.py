@@ -17,7 +17,7 @@ def box(lo, hi):
 
 
 def parting(scroll):
-    return mesh._parting_surface(scroll, 2, LINING_OUTER_RADIUS, WALL, 2.5, PITCH)
+    return mesh._parting_surface(scroll, 2, LINING_OUTER_RADIUS, WALL, 2.5, 50, PITCH)
 
 
 class HeightfieldSolidTests(unittest.TestCase):
@@ -40,7 +40,8 @@ class PartingSurfaceTests(unittest.TestCase):
         # Wholly above the divider: the divider rises to y = 6 at x = -15.
         scroll = box((-20, 10, 0), (20, 14, 20))
         xs, zs, height = parting(scroll)
-        over = (np.abs(xs) < 19)[:, None] & ((zs > 1) & (zs < 19))[None, :]
+        # Away from its ends, where the surface is free of the slope limit.
+        over = (np.abs(xs) < 19)[:, None] & ((zs > 8) & (zs < 12))[None, :]
         # Through the lined scroll (y from 8 to 16).
         self.assertGreaterEqual(height[over].min(), 8 - PITCH)
         self.assertLessEqual(height[over].max(), 16 + PITCH)
@@ -48,6 +49,9 @@ class PartingSurfaceTests(unittest.TestCase):
         divider = curved_divider_wall.divider_y(xs, LINING_OUTER_RADIUS, WALL)
         self.assertLess(np.abs(height[:, 0] - divider).max(), 1e-6)
         self.assertLess(np.abs(height[:, -1] - divider).max(), 1e-6)
+        # No steeper than 50 degrees towards them.
+        steep = np.degrees(np.arctan(np.abs(np.gradient(height, zs, axis=1))))
+        self.assertLess(steep[:, :12].max(), 50 + 1)
 
 
 if __name__ == "__main__":

@@ -165,6 +165,9 @@ class ScrollMesh:
         surface between the halves may leave the S-shaped divider; no more than the
         case's upper and lower margins, where the caps (split on the divider) begin.
         Defaults to 2.5.
+        parting_max_slope_deg: Steepest the parting surface may be in returning to the
+        divider at those ends, so the halves do not slide along each other there.
+        Defaults to 50.
         rotation_search: After rotation_callback, turn the mesh about the cylinder axis
         to where the split leaves the scroll least room (rotation_minimising_fill), so
         the parting surface bends least. Defaults to True.
@@ -191,6 +194,7 @@ class ScrollMesh:
     vertical_offset: Optional[float] = None
     cylinder_axis: Optional[tuple[float, float, float]] = None
     parting_z_margin_mm: float = 2.5
+    parting_max_slope_deg: float = 50
     rotation_search: bool = True
     rotation_search_depth_tolerance_mm: float = 5
     rotation_search_min_gain: float = 0.01
@@ -309,6 +313,7 @@ def _parting_surface(
     lining_outer_radius: float,
     wall_thickness_mm: float,
     z_margin_mm: float,
+    max_slope_deg: float,
     pitch: float,
     iterations: int = 20000,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -321,7 +326,10 @@ def _parting_surface(
     scroll on its side however the scroll lies; elsewhere it departs from the divider
     as smoothly as it can. The departure is harmonic, zero at the region's ends along
     the axis (where the caps, split on the divider, begin) and free at its sides, found
-    by red-black successive over-relaxation.
+    by red-black successive over-relaxation. Then it is made no steeper than
+    max_slope_deg anywhere, so the halves do not slide along each other as they part:
+    where the scroll would need it steeper (mostly towards the ends along the axis), it
+    lies wholly in one half for a little way.
 
     Returns the grid's x and z coordinates and the heights, indexed [x, z].
     """
@@ -373,6 +381,29 @@ def _parting_surface(
             d[0, 1:-1] = np.clip(d[1, 1:-1], lo[0, 1:-1], hi[0, 1:-1])
             d[-1, 1:-1] = np.clip(d[-2, 1:-1], lo[-1, 1:-1], hi[-1, 1:-1])
         if change < 1e-4:
+            break
+
+    # No steeper than max_slope_deg between neighbours: alternately limit each point's
+    # departure to its neighbours' plus the rise that slope allows, along each axis,
+    # which only ever brings the surface back towards the divider.
+    slope = np.tan(np.radians(max_slope_deg))
+    rise_x = slope * np.diff(xs)[:, None]
+    rise_z = slope * np.diff(zs)[None, :]
+
+    def limit(target, neighbour, rise):
+        return np.sign(target) * np.minimum(np.abs(target), np.abs(neighbour) + rise)
+
+    for _ in range(iterations):
+        before = d.copy()
+        for j in range(1, d.shape[1]):
+            d[:, j] = limit(d[:, j], d[:, j - 1], rise_z[:, j - 1])
+        for j in range(d.shape[1] - 2, -1, -1):
+            d[:, j] = limit(d[:, j], d[:, j + 1], rise_z[:, j])
+        for i in range(1, d.shape[0]):
+            d[i] = limit(d[i], d[i - 1], rise_x[i - 1])
+        for i in range(d.shape[0] - 2, -1, -1):
+            d[i] = limit(d[i], d[i + 1], rise_x[i])
+        if np.abs(d - before).max() < 1e-6:
             break
     return xs, zs, divider + d
 
@@ -554,6 +585,7 @@ def build_lining(
         lining_outer_radius,
         mesh_params.wall_thickness_mm,
         mesh_params.parting_z_margin_mm,
+        mesh_params.parting_max_slope_deg,
         min(voxel_size, 0.5),
     )
     extent = 112.5  # build_divider_solid's reach for build_lining's case_max_radius
