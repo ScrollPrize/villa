@@ -509,13 +509,39 @@ _compute_eigenvectors_fn = _maybe_compile_function(
 )
 
 
+def _fn_is_eager() -> bool:
+    return _compute_eigenvectors_fn is _compute_eigenvectors_impl
+
+
+def _is_compile_toolchain_error(exc: BaseException) -> bool:
+    """True when ``exc`` comes from torch.compile itself (missing C++ compiler,
+    Inductor/Dynamo backend failure) rather than from the eigen computation."""
+    try:
+        from torch._dynamo.exc import TorchDynamoException
+        from torch._inductor.exc import InvalidCxxCompiler
+    except Exception:  # pragma: no cover - very old/new torch layouts
+        compile_errors: tuple = ()
+    else:
+        compile_errors = (TorchDynamoException, InvalidCxxCompiler)
+    if compile_errors and isinstance(exc, compile_errors):
+        return True
+    message = str(exc)
+    return (
+        "Compiler: cl is not found" in message
+        or "torch._inductor.exc" in message
+        or "InvalidCxxCompiler" in message
+        or "No working C++ compiler" in message
+    )
+
+
 def _compute_eigenvectors(block: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     global _compute_eigenvectors_fn
     try:
         return _compute_eigenvectors_fn(block)
     except RuntimeError as exc:
-        message = str(exc)
-        if "Compiler: cl is not found" in message or "torch._inductor.exc" in message:
+        if _fn_is_eager():
+            raise
+        if _is_compile_toolchain_error(exc):
             warnings.warn(
                 "Falling back to eager eigenvector computation because torch.compile "
                 "failed (likely missing required compiler).",
