@@ -87,8 +87,9 @@ def pull_blocked(scroll, half_path, direction, n=30000):
 
 def half_contact(half, other, other_path, z_range, sliding_mm, n=60000):
     """Contact between the halves beside the scroll (outside z_range the caps slide by design, right_cap_buffer
-    above the base disc), from samples of one half's surface: those inside the other half; those touching it on
-    a face within 30 degrees of the pull (y) axis, which slides along the other half as they part; and those
+    above the base disc), from samples of one half's surface: those inside the other half; those pressed against
+    it (touching it on a face facing the other's, within 45 degrees) on a face within 30 degrees of the pull (y)
+    axis, which slides along the other half as they part, rather than meeting it at a seam; and those
     on such a face within sliding_mm of it with the other half beside them (the nearest point within 60
     degrees of perpendicular to y), which pass that close as they part, not counting those within 1.5 mm of
     where the halves touch (beside the joint's edge). Flush contact along the joint gives distances near 0, so only
@@ -97,19 +98,21 @@ def half_contact(half, other, other_path, z_range, sliding_mm, n=60000):
     beside = (P[:, 2] > z_range[0]) & (P[:, 2] < z_range[1])
     P, normals = P[beside], half.face_normals[faces[beside]]
     mm_mesh = mrmeshpy.loadMesh(other_path)
-    s, lateral = np.empty(len(P)), np.zeros(len(P), bool)
+    s, lateral, facing = np.empty(len(P)), np.zeros(len(P), bool), np.zeros(len(P), bool)
     for i, p in enumerate(P):
         r = mrmeshpy.findSignedDistance(mrmeshpy.Vector3f(*map(float, p)), mm_mesh)
         q = mm_mesh.triPoint(r.mtp)
+        n = mm_mesh.normal(r.mtp)
         d = np.array([q.x, q.y, q.z]) - p
         s[i] = r.dist
         lateral[i] = abs(d[1]) < 0.5 * np.linalg.norm(d)
+        facing[i] = np.dot(normals[i], [n.x, n.y, n.z]) < -np.cos(np.radians(45))
     for i in np.flatnonzero(s < -0.05)[:500]:
         if winding_number(other, P[i]) < 0.5:
             s[i] = abs(s[i])
     touching = np.abs(s) < 0.02
     steep = np.abs(normals[:, 1]) < 0.5
-    steep_contact = touching & steep
+    steep_contact = touching & steep & facing
     close = (s >= 0.05) & (s < sliding_mm) & lateral & steep
     joint = P[touching]
     for i in np.flatnonzero(close):
@@ -232,7 +235,7 @@ def main():
         for k, other in (("left", "right"), ("right", "left")):
             inside, steep, close, nearest, n = half_contact(parts[k], parts[other], paths[other], z_range,
                                                             args.sliding_mm)
-            print(f"{k:6s} samples beside the scroll {n}: inside {other} {inside}; touching it on a face within 30 deg "
+            print(f"{k:6s} samples beside the scroll {n}: inside {other} {inside}; pressed against it on a face within 30 deg "
                   f"of y {steep}; on such a face within {args.sliding_mm} mm of it sideways, off the joint {close}"
                   + (f" (nearest {nearest:.2f} mm)" if close else ""))
     if args.render:
