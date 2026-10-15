@@ -604,3 +604,22 @@ TEST_CASE("track crossing kernel rejects invalid array indices")
     const std::vector<uint64_t> oversizedKey{uint64_t{1} << 60};
     CHECK_THROWS(tc::parallel_argsort(oversizedKey, 1));
 }
+
+TEST_CASE("caller-owned candidate transaction rolls registration and edges back together")
+{
+    TempDir tmp("atomic_registration");
+    auto db = makeDb(tmp.dir);
+    {
+        auto write = db.write();
+        ObjectRecord object;
+        object.kind = "track";
+        const auto a = db.upsertObject(write, object);
+        const auto b = db.upsertObject(write, object);
+        const auto report = commitCandidates(db, write, kTrackTrackDetector, 1, {cand(a, b)});
+        CHECK(report.edgesCreated == 1);
+        // Deliberately do not commit the outer transaction.
+    }
+    auto read = db.read();
+    CHECK(db.objectsByKind(read, "track").empty());
+    CHECK(db.edgesByKind(read, "same-surface").empty());
+}

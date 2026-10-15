@@ -6,6 +6,11 @@
 #include "vc/core/util/MemMap.hpp"
 
 namespace vc {
+// Resolve a DBM logical/backing filename to its adjacent packed geometry,
+// checking the packed metadata's source fingerprint. Packed directories can
+// also be supplied directly, independently of the original DBM.
+std::filesystem::path resolvePackedTrackStore(const std::filesystem::path& path);
+
 // Read-only Spiral VCTRK01 store. Geometry stays memory mapped; no Python/DBM
 // runtime is needed. Coordinates are integer ZYX, not graph-anchor XYZ.
 // The source files must remain immutable while this reader is alive.

@@ -513,43 +513,54 @@ upper median. One crossing per pair survives: greatest minimum arclength to
 the four endpoints, then greatest first/second arclength and point indices.
 Tracks are ordered by source ID to make this tie-breaking deterministic.
 
-Register the desired tracks with the existing JSON interchange importer:
-
-```json
-[
-  {"dataset_ref": "/data/tracks/example.dbm.vctracks", "external_key": "0", "family": "horizontal"},
-  {"dataset_ref": "/data/tracks/example.dbm.vctracks", "external_key": "7189775254956", "family": "vertical"}
-]
-```
-
-`dataset_ref` names a Spiral **VCTRK01 packed directory**, either absolute or
-relative to the graph database. `external_key` is the canonical decimal
-`source_ids.u64` value, not the row number. Only registered tracks are loaded
-for crossing detection; the store's metadata is validated and its coordinates
-are memory mapped. Optional registered family/point-count metadata must match
-the store. Unknown families and empty tracks produce no crossings. The packed
-files must remain immutable during a run. Legacy DBM/pickle geometry is not
-read directly; use Spiral's `convert_track_store.py` to create the packed directory.
-No cached `.crossings.npz` sidecar is required or imported.
+Pass the tracks DBM directly. The linker discovers its packed geometry,
+registers the tracks automatically, computes crossings in C++, and writes
+pending edges to SQLite. There is no selected-tracks JSON step and
+`crossings.npz` is neither read nor written.
 
 ```sh
 ninja -C build vc_graph_import vc_graph_bindings test_graph_links
 build/bin/vc_graph_import --db graph.vcgr --author "$USER" \
-  --tracks selected-tracks.json --link-track-tracks --track-workers 4
+  --link-track-tracks /mnt/bigpc/spiral_dataset_working/tracks/2um_ds2_ps256_surf_v2.dbm \
+  --track-workers 4
 ```
 
-To restrict a rerun, use `--track-dataset <exact-dataset-ref>` and/or repeated
-`--track-uuid <uuid>` flags. Python offers the same detector:
+Python uses the same entry point:
 
 ```python
 from vc.graph import GraphDb
 
 with GraphDb.open("graph.vcgr", author="reviewer") as db:
-    report = db.link_tracks_to_tracks(workers=4, track_uuids=[uuid_a, uuid_b])
+    report = db.link_tracks_to_tracks("/data/tracks/example.dbm", workers=4)
     assert not report["problems"], report["problems"]
 ```
 
-Other Python keywords are `dataset_ref`, `min_angle_degrees` (30),
+The DBM logical path and its `.dbm.db` backing filename are both accepted.
+Geometry comes from the adjacent `<dbm>.vctracks` directory; this already exists
+for the example above. `extract_surface_tracks.py` writes the DBM during
+extraction and creates this packed directory when finished by default
+(`--no-packed-store` disables that final step). The linker checks its source
+fingerprint against the DBM backing files before linking. For older DBMs
+without a current packed geometry store, create one using Spiral's
+`convert_track_store.py` (use `--force` to refresh a stale store).
+A `.vctracks` directory can also be passed directly.
+The packed files must remain immutable during a run. Full-dataset runs keep
+coordinates memory mapped rather than copying the entire coordinate array.
+
+All tracks in the input are registered by default, including isolated tracks.
+For a small run, optionally select source IDs with repeated
+`--track-source-id <id>` flags, or `source_ids=[...]` in Python. Source IDs are
+stable `source_ids.u64` values, not row numbers. Registration and edge updates
+commit together; failures leave neither partial registration nor partial edges.
+Reruns reuse existing UUIDs and preserve object approvals and generations.
+
+The advanced already-registered-track API is still available: omit the input
+path and optionally restrict `dataset_ref` / `track_uuids` in Python, or use a
+bare `--link-track-tracks` with `--track-dataset` / repeated `--track-uuid`.
+New registrations use the canonical packed path as `dataset_ref`; an existing
+relative-path identity is reused when it resolves to the same dataset.
+
+Other Python keywords are `min_angle_degrees` (30),
 `tangent_radius_voxels` (12), `cluster_index_radius` (4), `edge_kind`
 (`crossing`), and `replace_stale_pending` (true). Workers default to one.
 Crossings are computed **within each dataset**; separate datasets are not
@@ -575,7 +586,11 @@ Validation used 24 real tracks (6,192 points) from
 `2um_ds2_ps256_surf_v2.dbm.vctracks`: all 18 crossings, raw indices,
 arclengths and clearances matched both Spiral's Python fallback and its
 previous native kernel exactly. The graph linker produced the same 18 edges
-and an idempotent rerun. No full-collection crossing test was run.
+and an idempotent rerun. The DBM CLI entry point also registered those 24 tracks
+from `/mnt/bigpc/spiral_dataset_working/tracks` and reproduced the same 18 edges;
+rerunning with the `.dbm.db` backing filename reused all identities and links.
+Regression tests cover missing and deliberately invalid `crossings.npz` files:
+neither is read, and no sidecar is created. No full-collection crossing test was run.
 
 Regression checks:
 

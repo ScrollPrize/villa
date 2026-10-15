@@ -79,6 +79,14 @@ DetectorReport commitCandidates(graph::GraphDb& db, const std::string& detectorN
                                 bool replaceStalePending = true,
                                 const StaleEdgeScope* staleScope = nullptr);
 
+// Same operation in a caller-owned transaction. The caller commits/rolls back;
+// permits atomic registration of new objects together with their links.
+DetectorReport commitCandidates(graph::GraphDb& db, graph::WriteTxn& txn,
+                                const std::string& detectorName, int detectorVersion,
+                                const std::vector<LinkCandidate>& candidates,
+                                bool replaceStalePending = true,
+                                const StaleEdgeScope* staleScope = nullptr);
+
 // --- Detectors ---
 // Patch overlap, fiber->patch and track->track are implemented; the rest are placeholders that
 // count the objects they would consider, write nothing, and report
@@ -217,6 +225,11 @@ DetectorReport linkTracksToFibers(graph::GraphDb& db, const TrackFiberParams& pa
                                   const std::atomic_bool* cancel = nullptr);
 
 struct TrackTrackParams {
+    // DBM logical path (also accepts .dbm.db) or packed .vctracks directory.
+    // Nonempty: discover/register tracks and compute links, atomically.
+    // Empty: link already registered tracks as before.
+    std::filesystem::path tracksPath;
+    std::vector<uint64_t> sourceIds; // optional subset when tracksPath is supplied
     double minAngleDegrees = 30.0;
     double tangentRadiusVoxels = 12.0; // Euclidean radius, not arclength
     int clusterIndexRadius = 4;
@@ -227,7 +240,9 @@ struct TrackTrackParams {
     bool replaceStalePending = true;
 };
 // Track <-> track: opposite-family tracks sharing voxels, mirroring
-// Spiral's exact-voxel crossing relation. Reads VCTRK01 packed directories
+// Spiral's exact-voxel crossing relation. tracksPath discovers the adjacent
+// .vctracks geometry for a DBM and registers the input tracks automatically.
+// It never reads or writes crossings.npz. Without tracksPath, reads directories
 // named by track.datasetRef (relative to the graph DB, or absolute). externalKey
 // is the decimal source_id, not the row index. Only registered/selected tracks
 // within the same dataset are paired; unknown families are ignored. Point

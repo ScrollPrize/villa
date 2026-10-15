@@ -1,8 +1,12 @@
 #include "vc/core/util/PackedTrackStore.hpp"
 
 #include <array>
+#include <algorithm>
 #include <bit>
 #include <cstring>
+#include <chrono>
+#include <set>
+#include <nlohmann/json.hpp>
 #include <fstream>
 #include <limits>
 #include <stdexcept>
@@ -21,6 +25,37 @@ std::span<const T> mapArray(memmap::MappedFileRO& map, const std::filesystem::pa
     return {static_cast<const T*>(map.data()), static_cast<size_t>(count)};
 }
 }
+std::filesystem::path resolvePackedTrackStore(const std::filesystem::path& input)
+{
+    namespace fs = std::filesystem;
+    if (fs::is_directory(input)) return fs::canonical(input);
+    fs::path logical = fs::absolute(input).lexically_normal();
+    if (logical.extension() == ".db" && logical.stem().extension() == ".dbm")
+        logical.replace_extension();
+    const fs::path packed(logical.string() + ".vctracks");
+    if (!fs::is_directory(packed))
+        throw std::runtime_error("packed track geometry missing: " + packed.string()
+            + "; create it with Spiral's convert_track_store.py for " + logical.string());
+    std::ifstream metadataFile(packed / "metadata.json");
+    const auto metadata = nlohmann::json::parse(metadataFile);
+    nlohmann::json actual = nlohmann::json::array();
+    std::set<fs::path> seen;
+    for (const auto* suffix : {"", ".db", ".dat", ".dir", ".bak", ".pag"}) {
+        const fs::path backing(logical.string() + suffix);
+        if (!fs::is_regular_file(backing) || !seen.insert(fs::canonical(backing)).second) continue;
+        const auto modified = std::chrono::file_clock::to_sys(fs::last_write_time(backing));
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(modified.time_since_epoch()).count();
+        actual.push_back({backing.filename().string(), fs::file_size(backing), ns});
+    }
+    std::sort(actual.begin(), actual.end());
+    if (actual.empty()) throw std::runtime_error("DBM backing files missing: " + logical.string());
+    if (metadata.value("version", 0) != 1 || !metadata.contains("source_db_signature")
+        || metadata.at("source_db_signature") != actual)
+        throw std::runtime_error("packed tracks are stale for " + logical.string()
+            + "; rebuild with Spiral's convert_track_store.py --force");
+    return fs::canonical(packed);
+}
+
 PackedTrackStore::PackedTrackStore(const std::filesystem::path& directory)
 {
     if constexpr (std::endian::native != std::endian::little)

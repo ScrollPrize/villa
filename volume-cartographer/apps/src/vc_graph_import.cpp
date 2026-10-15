@@ -25,7 +25,8 @@ void usage()
         << "  --segments <dir>     register segment dirs with meta.json as patch objects\n"
         << "  --tracks <file>      register tracks from a JSON interchange list\n"
         << "                       ([{dataset_ref, external_key, family, point_count, ...}])\n"
-        << "  --link-track-tracks             link registered tracks in packed .vctracks datasets\n"
+        << "  --link-track-tracks <dbm>       register tracks and compute crossings directly into SQLite\n"
+        << "  --track-source-id <id>         optional subset of source IDs (repeatable)\n"
         << "  --track-dataset <ref>           restrict to this exact registered dataset_ref\n"
         << "  --track-uuid <uuid>             restrict to these tracks (repeatable)\n"
         << "  --track-workers <n>             crossing workers (default 1)\n"
@@ -91,7 +92,20 @@ try {
         else if (arg == "--fibers") fiberDir = next("--fibers");
         else if (arg == "--segments") segmentsDir = next("--segments");
         else if (arg == "--tracks") tracksPath = next("--tracks");
-        else if (arg == "--link-track-tracks") linkTracks = true;
+        else if (arg == "--link-track-tracks") {
+            linkTracks = true;
+            // A bare flag retains the already-registered-track API.
+            if (i + 1 < argc && std::string(argv[i+1]).rfind("--", 0) != 0)
+                trackParams.tracksPath = next(arg.c_str());
+        }
+        else if (arg == "--track-source-id") {
+            const auto text = next(arg.c_str());
+            size_t used = 0;
+            const auto id = std::stoull(text, &used);
+            if (text.empty() || text[0] == '-' || used != text.size())
+                throw std::runtime_error("invalid track source ID: " + text);
+            trackParams.sourceIds.push_back(id);
+        }
         else if (arg == "--track-dataset") trackParams.datasetRef = next(arg.c_str());
         else if (arg == "--track-uuid") trackParams.trackUuids.push_back(next(arg.c_str()));
         else if (arg == "--track-workers") trackParams.workers = std::stoi(next(arg.c_str()));

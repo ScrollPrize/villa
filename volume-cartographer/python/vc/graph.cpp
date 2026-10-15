@@ -618,8 +618,9 @@ NB_MODULE(graph, m)
             "kwargs mirror PatchOverlapParams (tolerance, min_minor_spread, ...).")
         .def(
             "link_tracks_to_tracks",
-            [](PyGraphDb& self, const nb::kwargs& kwargs) {
+            [](PyGraphDb& self, const std::string& tracksPath, const nb::kwargs& kwargs) {
                 vc::graph_links::TrackTrackParams p;
+                p.tracksPath = tracksPath;
                 for (auto item : kwargs) {
                     const auto key = nb::cast<std::string>(item.first);
                     const nb::handle value = item.second;
@@ -627,6 +628,7 @@ NB_MODULE(graph, m)
                     else if (key == "tangent_radius_voxels") p.tangentRadiusVoxels = nb::cast<double>(value);
                     else if (key == "cluster_index_radius") p.clusterIndexRadius = nb::cast<int>(value);
                     else if (key == "workers") p.workers = nb::cast<int>(value);
+                    else if (key == "source_ids") p.sourceIds = nb::cast<std::vector<uint64_t>>(value);
                     else if (key == "dataset_ref") p.datasetRef = nb::cast<std::string>(value);
                     else if (key == "track_uuids") p.trackUuids = nb::cast<std::vector<std::string>>(value);
                     else if (key == "edge_kind") p.edgeKind = nb::cast<std::string>(value);
@@ -641,8 +643,10 @@ NB_MODULE(graph, m)
                 }
                 return detectorReportToPy(report);
             },
-            "Link registered tracks using Spiral exact-voxel crossings. dataset_ref names a "
-            "packed .vctracks directory; track_uuids optionally restricts the run. "
+            nb::arg("tracks_dbm") = "", nb::arg("kwargs"),
+            "Compute track crossings directly into the graph. A DBM path discovers adjacent "
+            "packed geometry and registers tracks automatically; no crossings.npz or JSON list is used. "
+            "source_ids optionally selects a subset. Omit the path to link registered tracks. "
             "Anchors are raw point indices and XYZ positions in dataset voxels.")
         .def(
             "link_fibers_to_patches",

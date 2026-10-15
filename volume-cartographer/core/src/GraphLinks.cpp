@@ -71,12 +71,22 @@ DetectorReport commitCandidates(graph::GraphDb& db, const std::string& detectorN
                                 const std::vector<LinkCandidate>& candidates, bool replaceStalePending,
                                 const StaleEdgeScope* staleScope)
 {
+    auto txn = db.write();
+    auto report = commitCandidates(db, txn, detectorName, detectorVersion, candidates,
+                                   replaceStalePending, staleScope);
+    txn.commit();
+    return report;
+}
+
+DetectorReport commitCandidates(graph::GraphDb& db, graph::WriteTxn& txn,
+                                const std::string& detectorName, int detectorVersion,
+                                const std::vector<LinkCandidate>& candidates, bool replaceStalePending,
+                                const StaleEdgeScope* staleScope)
+{
     if (detectorName.empty())
         throw std::runtime_error("graph links: detector name must be non-empty");
     DetectorReport report;
     report.candidatesFound = int64_t(candidates.size());
-
-    auto txn = db.write();
 
     std::set<std::string> kinds;
     for (const auto& c : candidates) kinds.insert(c.kind);
@@ -138,7 +148,6 @@ DetectorReport commitCandidates(graph::GraphDb& db, const std::string& detectorN
         ++report.edgesCreated;
     }
 
-    txn.commit();
     return report;
 }
 

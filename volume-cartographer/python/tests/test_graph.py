@@ -285,3 +285,89 @@ def test_track_linking_angle_gate_and_atomic_multiple_datasets(db, tmp_path):
     report = db.link_tracks_to_tracks()
     assert report["problems"] and report["edges_created"] == 0
     assert db.edges_of(a) == []
+
+
+def _dbm_track_fixture(tmp_path):
+    import dbm.dumb
+    import pickle
+    h, v = _crossing_lines()
+    path = tmp_path / "tracks.dbm"
+    with dbm.dumb.open(str(path), "n") as source:
+        source[b"h:0"] = pickle.dumps([h])
+        source[b"vy:0"] = pickle.dumps([v])
+    packed = Path(str(path) + ".vctracks")
+    _packed_tracks(packed, [h, v], [0, 1], [0, 1 << 32])
+    signature = sorted([
+        [f.name, f.stat().st_size, f.stat().st_mtime_ns]
+        for suffix in ("", ".db", ".dat", ".dir", ".bak", ".pag")
+        if (f := Path(str(path) + suffix)).is_file()
+    ])
+    (packed / "metadata.json").write_text(json.dumps({
+        "version": 1, "source_db_signature": signature,
+        "track_count": 2, "point_count": len(h) + len(v),
+    }))
+    return path, packed
+
+
+@pytest.mark.parametrize("with_unreadable_crossings", [False, True])
+def test_dbm_entry_registers_and_computes_without_crossings_npz(db, tmp_path, with_unreadable_crossings):
+    path, packed = _dbm_track_fixture(tmp_path)
+    sidecar = Path(str(path) + ".crossings.npz")
+    if with_unreadable_crossings:
+        sidecar.write_bytes(b"deliberately invalid NPZ: must never be read")
+    report = db.link_tracks_to_tracks(str(path), workers=2)
+    assert report["problems"] == []
+    assert report["objects_considered"] == 2 and report["edges_created"] == 1
+    objects = db.objects_by_kind("track")
+    assert {o["track"]["external_key"] for o in objects} == {"0", str(1 << 32)}
+    assert all(o["track"]["dataset_ref"] == str(packed.resolve()) for o in objects)
+    assert all(o["track"]["point_count"] == 31 for o in objects)
+    edge = db.edges_of(objects[0]["uuid"])[0]
+    assert edge["a_anchor"]["position"] == edge["b_anchor"]["position"] == (15, 10, 7)
+    before = db.export_json()
+    # Packed path and DBM path resolve to the same graph identities.
+    repeat = db.link_tracks_to_tracks(str(packed))
+    assert repeat["edges_created"] == 0 and repeat["edges_skipped_existing"] == 1
+    assert db.export_json() == before
+    if with_unreadable_crossings:
+        assert sidecar.read_bytes() == b"deliberately invalid NPZ: must never be read"
+    else:
+        assert not sidecar.exists()
+
+
+def test_dbm_entry_subset_and_existing_relative_identity(db, tmp_path):
+    path, packed = _dbm_track_fixture(tmp_path)
+    a = _register_tracks(db, packed.name, [0], ["horizontal"])[0]
+    first = db.link_tracks_to_tracks(str(path), source_ids=[0])
+    assert first["problems"] == [] and first["candidates_found"] == 0
+    assert len(db.objects_by_kind("track")) == 1
+    assert db.object(a)["generation"] == 1
+    second = db.link_tracks_to_tracks(str(path))
+    assert second["problems"] == [] and second["edges_created"] == 1
+    assert len(db.objects_by_kind("track")) == 2
+    assert db.object(a)["generation"] == 1
+    assert all(o["track"]["dataset_ref"] == packed.name for o in db.objects_by_kind("track"))
+
+
+def test_dbm_entry_validation_does_not_register_partial_inputs(db, tmp_path):
+    import numpy as np
+    path, packed = _dbm_track_fixture(tmp_path)
+    missing = db.link_tracks_to_tracks(str(path), source_ids=[0, 999999])
+    assert missing["problems"] and db.objects_by_kind("track") == []
+    coords = np.fromfile(packed / "coordinates.i32", dtype="<i4")
+    coords[0] = -1
+    coords.tofile(packed / "coordinates.i32")
+    invalid = db.link_tracks_to_tracks(str(path))
+    assert invalid["problems"] and db.objects_by_kind("track") == []
+    # Mutating a backing file invalidates the packed geometry fingerprint.
+    backing = Path(str(path) + ".dat")
+    backing.write_bytes(backing.read_bytes() + b"changed")
+    stale = db.link_tracks_to_tracks(str(path))
+    assert any("stale" in p for p in stale["problems"])
+    assert db.objects_by_kind("track") == []
+
+
+def test_dbm_entry_missing_geometry_is_explicit(db, tmp_path):
+    report = db.link_tracks_to_tracks(str(tmp_path / "missing.dbm"))
+    assert any("convert_track_store.py" in p for p in report["problems"])
+    assert db.objects_by_kind("track") == []
