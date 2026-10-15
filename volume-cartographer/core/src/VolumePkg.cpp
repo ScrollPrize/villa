@@ -36,6 +36,7 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
+#include "utils/sftp_fetch.hpp"
 #include "vc/core/util/NormalGridVolume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
@@ -62,6 +63,7 @@ bool isFiberLasagnaEntry(const Entry& entry)
 
 bool isLocationRemote(const std::string& location)
 {
+    if (utils::is_sftp_url(location)) return true;
     if (location.rfind("s3://", 0) == 0) return true;
     if (location.rfind("s3+", 0) == 0) return true;
     if (location.rfind("http://", 0) == 0) return true;

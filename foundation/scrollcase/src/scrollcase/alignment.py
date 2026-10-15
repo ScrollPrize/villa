@@ -1,6 +1,7 @@
 import numpy as np
 from scipy.spatial import ConvexHull
 import logging
+from typing import Optional
 from . import smallest_circle
 import plotly.graph_objs as go
 import numpy as np
@@ -36,10 +37,19 @@ def _project_points_onto_plane(
 
 
 def fit_cylinder(
-    points: np.ndarray, tol: float = 1e-4, _debug: bool = False
+    points: np.ndarray,
+    tol: float = 1e-4,
+    _debug: bool = False,
+    axis: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, np.ndarray, float, float]:
     """
     Robustly fit a cylinder to the input points.
+
+    Args:
+        points: Input points.
+        tol: Optimizer tolerance for the axis search.
+        axis: Optional cylinder axis direction. If given, the axis search is
+            skipped and only the enclosing circle and height are fitted about it.
 
     Returns:
         rotation_matrix: 3x3 rotation matrix transforming points into cylinder coords.
@@ -50,6 +60,12 @@ def fit_cylinder(
     # Compute convex hull to reduce the number of points
     hull = ConvexHull(points)
     hull_points = points[hull.vertices]
+
+    if axis is not None:
+        best_normal = np.asarray(axis, dtype=float)
+        best_normal = best_normal / np.linalg.norm(best_normal)
+        logger.info(f"Using given cylinder axis: {best_normal}")
+        return _cylinder_about_axis(hull_points, best_normal, _debug)
 
     # --- Step 1: PCA for an initial guess ---
     mean = np.mean(hull_points, axis=0)
@@ -75,6 +91,13 @@ def fit_cylinder(
         f"Robust fit: best direction: {best_normal} with objective value {best_radius}"
     )
 
+    return _cylinder_about_axis(hull_points, best_normal, _debug)
+
+
+def _cylinder_about_axis(
+    hull_points: np.ndarray, best_normal: np.ndarray, _debug: bool = False
+) -> tuple[np.ndarray, np.ndarray, float, float]:
+    """Fit the enclosing circle and height about a fixed axis direction."""
     # --- Step 3: Recompute circle and cylinder parameters ---
     projection_global, projection_local, d, basis = _project_points_onto_plane(
         hull_points, best_normal

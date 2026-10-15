@@ -16,6 +16,7 @@ import json
 import math
 import struct
 import time
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -2301,7 +2302,7 @@ def write_tifxyz(
     meta = {
         "format": "tifxyz",
         "type": "seg",
-        "uuid": out.name,
+        "uuid": str(uuid.uuid4()),
         "scale": [float(scale[0]), float(scale[1])],
         "bbox": [
             points.min(axis=0).astype(float).tolist(),

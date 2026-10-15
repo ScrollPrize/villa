@@ -303,6 +303,52 @@ def test_rebuild_preserves_desired_inputs_uploads_and_failed_preparation(workspa
         (e['id'], e['accepted_revision'], e['persisted_revision']) for e in desired]
 
 
+def test_replay_does_not_resend_the_baseline_the_build_bound(workspace):
+    editing, resident = workspace
+    entries = editing.catalog.entries()
+    bindings = editing.build_bindings()
+    assert {r['id'] for r in bindings} == {e.identity.id for e in entries}
+    assert all(r['adopt'] and not r['deleted'] for r in bindings)
+    editing.note_build_bindings('bound-generation', bindings)
+    calls = len(resident.calls)
+    assert editing.replay_resident('bound-generation')['applied']
+    # Nothing left to adopt: the resident is not asked to relink anything.
+    assert len(resident.calls) == calls
+    assert editing.resident_generation == 'bound-generation'
+    assert all(e.applied == e.accepted for e in editing.catalog.entries())
+
+
+def test_replay_sends_only_revisions_the_build_did_not_bind(workspace):
+    editing, resident = workspace
+    baseline = editing.catalog.entries()[0]
+    new_id = str(uuid4())
+    change(editing, new_id, 0, 'draft', kind='pcl', role='same_winding')
+    bindings = editing.build_bindings()
+    # The uncommitted draft is not baseline geometry the build can load.
+    assert [r['id'] for r in bindings] == [baseline.identity.id]
+    editing.note_build_bindings('mixed-generation', bindings)
+    resident.fail = True
+    assert not editing.replay_resident('mixed-generation')['applied']
+    assert editing.catalog.entry(new_id).status()['errors']
+    assert not editing.catalog.entry(baseline.identity.id).status()['errors']
+    resident.fail = False
+    assert editing.replay_resident('mixed-generation')['applied']
+    records = resident.calls[-1][1]
+    assert [r['id'] for r in records] == [new_id]
+    assert not records[0]['adopt']
+    assert all(e.applied == e.accepted for e in editing.catalog.entries())
+
+
+def test_unclaimed_workspace_binds_nothing(tmp_path):
+    dataset = tmp_path / 'dataset'
+    dataset.mkdir()
+    editing = EditingWorkspace(dataset, tmp_path / 'output', {}, lambda: Resident())
+    try:
+        assert editing.build_bindings() == []
+    finally:
+        editing.close()
+
+
 def test_reconnect_refreshes_clean_targets_and_preserves_dirty_conflicts(workspace):
     editing, resident = workspace
     entry = editing.catalog.entries()[0]

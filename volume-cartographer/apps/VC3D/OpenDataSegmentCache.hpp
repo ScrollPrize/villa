@@ -197,12 +197,15 @@ void attachEditableOpenDataSegmentRoot(
     const std::filesystem::path& editableSegmentsRoot,
     bool select = true);
 
+// individualEntries attaches only the sample's explicit segments, never aggregate
+// cache directories, and leaves orphan bookkeeping for the full catalog alone.
 OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
     VolumePkg& pkg,
     const OpenDataSample& sample,
     const std::filesystem::path& remoteCacheRoot,
     const OpenDataSampleProgressCallback& progressCallback = {},
-    bool forceRefresh = false);
+    bool forceRefresh = false,
+    bool individualEntries = false);
 
 OpenDataSegmentCacheReconcileResult attachExistingOpenDataSegmentCaches(
     VolumePkg& pkg,

@@ -3,6 +3,7 @@
 #include <QComboBox>
 #include <QDialog>
 #include <QDoubleSpinBox>
+#include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -21,6 +22,7 @@
 #undef private
 
 #include "elements/CollapsibleSettingsGroup.hpp"
+#include "SpiralDescriptions.hpp"
 
 #include <cstdlib>
 #include <iostream>
@@ -59,6 +61,8 @@ QJsonObject syntheticCatalog()
     optimizer[QStringLiteral("maximum")] = 10.0;
     optimizer[QStringLiteral("precision")] = 3;
     optimizer[QStringLiteral("step")] = 0.1;
+    optimizer[QStringLiteral("description")] =
+        QStringLiteral("Step size of the <optimizer>.");
     fields[QStringLiteral("optimizer_learning_rate")] = optimizer;
     defaults[QStringLiteral("optimizer_learning_rate")] = 0.5;
 
@@ -135,6 +139,65 @@ void processLayout()
     QTest::qWait(20);
 }
 
+bool writeText(const QString& path, const QByteArray& text)
+{
+    QFile file(path);
+    return file.open(QIODevice::WriteOnly | QIODevice::Truncate)
+        && file.write(text) == text.size();
+}
+
+void checkDescriptionsFile(const QTemporaryDir& dir)
+{
+    const QString path = dir.filePath(QStringLiteral("descriptions.json"));
+    require(writeText(path, R"({
+        "panel": {"run_start": "Run the fit.", "blank": "  "},
+        "config": {"z_begin": "First z slice.", "run_start": "shadowed"}
+    })"), "Failed to write a descriptions file");
+
+    SpiralDescriptions descriptions(path);
+    require(descriptions.describe(QStringLiteral("run_start")) == QStringLiteral("Run the fit."),
+            "A panel id did not take its panel description");
+    require(descriptions.describe(QStringLiteral("z_begin")) == QStringLiteral("First z slice."),
+            "A panel id without a panel entry did not fall back to the config key");
+    require(descriptions.describe(QStringLiteral("blank")).isEmpty()
+                && descriptions.describe(QStringLiteral("unknown")).isEmpty(),
+            "Blank or unknown ids should have no description");
+
+    // Edits are picked up while running, including a malformed save in between
+    // (which keeps the last good text) and an editor's replace-by-rename save.
+    QSignalSpy changed(&descriptions, &SpiralDescriptions::changed);
+    require(writeText(path, "{ not json"), "Failed to write a malformed file");
+    QTest::qWait(300);
+    require(descriptions.describe(QStringLiteral("run_start")) == QStringLiteral("Run the fit."),
+            "A malformed edit discarded the last good descriptions");
+    const QString replacement = dir.filePath(QStringLiteral("descriptions.json.new"));
+    require(writeText(replacement, R"({"panel": {"run_start": "Start fitting."}})")
+                && QFile::remove(path) && QFile::rename(replacement, path),
+            "Failed to replace the descriptions file");
+    require(QTest::qWaitFor([&] {
+                return descriptions.describe(QStringLiteral("run_start"))
+                    == QStringLiteral("Start fitting.");
+            }, 5000),
+            "A replaced descriptions file was not reloaded");
+    require(!changed.isEmpty(), "Reloading did not announce the change");
+    require(descriptions.describe(QStringLiteral("z_begin")).isEmpty(),
+            "A removed description survived the reload");
+
+    SpiralDescriptions missing(dir.filePath(QStringLiteral("absent.json")));
+    require(missing.describe(QStringLiteral("run_start")).isEmpty(),
+            "A missing descriptions file should describe nothing");
+    SpiralDescriptions unset{QString()};
+    require(unset.describe(QStringLiteral("run_start")).isEmpty(),
+            "An unset descriptions path should describe nothing");
+
+    const QString toolTip = vc3d::spiral::descriptionToolTip(
+        QStringLiteral("a < b\nnext"), QStringLiteral("note"));
+    require(toolTip == QStringLiteral("<p>a &lt; b<br>next</p><p>note</p>"),
+            "Tooltip text was not escaped into paragraphs");
+    require(vc3d::spiral::descriptionToolTip({}, {}).isEmpty(),
+            "An empty description and note should give no tooltip");
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -150,8 +213,24 @@ int main(int argc, char** argv)
     if (!QApplication::instance())
         app = std::make_unique<QApplication>(argc, argv);
 
+    checkDescriptionsFile(configDir);
+
     SpiralConfigProfileEditor editor;
     editor.setCatalog(syntheticCatalog());
+
+    const QString describedToolTip = QStringLiteral(
+        "<p>Step size of the &lt;optimizer&gt;.</p><p>optimizer_learning_rate</p>");
+    auto* describedLabel = editor.findChild<QLabel*>(
+        QStringLiteral("spiralConfigLabel_optimizer_learning_rate"));
+    require(describedLabel && describedLabel->toolTip() == describedToolTip
+                && editor._fieldEditors.value(QStringLiteral("optimizer_learning_rate"))
+                       ->toolTip() == describedToolTip,
+            "A catalog description was not shown when hovering its setting");
+    auto* undescribedLabel = editor.findChild<QLabel*>(
+        QStringLiteral("spiralConfigLabel_model_iterations"));
+    require(undescribedLabel
+                && undescribedLabel->toolTip() == QStringLiteral("<p>model_iterations</p>"),
+            "An undescribed setting should still name its key");
 
     const QStringList expectedPrefixes{
         QStringLiteral("sample"), QStringLiteral("loss"),

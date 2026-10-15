@@ -3,6 +3,7 @@ import os
 import cv2
 import json
 import numpy as np
+from uuid import uuid4
 
 
 def get_area(zyxs, step_size, voxel_size_um):
@@ -25,7 +26,16 @@ def get_bbox(zyxs):
     ]
 
 
-def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source, additional_metadata={}):
+def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source, additional_metadata={},
+                surface_uuid=None):
+    """Write a tifxyz surface to ``path/uuid``.
+
+    ``uuid`` names the output directory only. meta.json's ``uuid`` is the
+    surface's persistent identity: pass ``surface_uuid`` to keep an existing
+    identity (in-place rewrite); by default a new surface gets a fresh uuid4.
+    """
+    if surface_uuid is None:
+        surface_uuid = str(uuid4())
     if hasattr(zyxs, "detach"):
         zyxs = zyxs.detach().cpu().numpy()
     else:
@@ -47,7 +57,7 @@ def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source, additional_m
             'area_cm2': area_cm2,
             'format': 'tifxyz',
             'type': 'seg',
-            'uuid': uuid,
+            'uuid': surface_uuid,
             'source': source,
             **additional_metadata
         }, f, indent=4)

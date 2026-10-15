@@ -140,11 +140,20 @@ struct FiberTraceSegmentMetadata {
     std::string detail);
 
 struct LineControlPoint : vc::lasagna::LineControlPoint {
+    std::optional<cv::Vec3d> direction;
+    std::optional<cv::Vec3d> displayNormal;
+    std::string displayNormalSource = "unknown";
     std::optional<FiberTraceSegmentMetadata> segmentToNext;
     // Per-control-point tags (see kKollesisTerminationTag). Sorted, unique,
     // non-empty; they belong to the point itself and travel with it through
     // every edit, unlike segmentToNext which belongs to the span.
     std::vector<std::string> tags;
+    // Session-lifetime identity of this control, assigned by the controller
+    // the first time the control is published (0 until then) and carried
+    // through every edit with the struct, so views can tell "the same
+    // control" across publishes without comparing points or indices.
+    // Mutable: assigned lazily from the const publish path. Not persisted.
+    mutable uint64_t identity = 0;
 
     LineControlPoint() = default;
     LineControlPoint(double linePositionValue, cv::Vec3d volumePointValue, bool isSeedValue, int optimizedIndexValue)
@@ -156,6 +165,13 @@ struct LineControlPoint : vc::lasagna::LineControlPoint {
     }
     explicit LineControlPoint(const vc::lasagna::LineControlPoint& value) : vc::lasagna::LineControlPoint(value) {}
 };
+
+inline void clearControlPointCorrections(LineControlPoint& control)
+{
+    control.direction.reset();
+    control.displayNormal.reset();
+    control.displayNormalSource = "unknown";
+}
 
 struct ControlPointCollapseResult {
     std::vector<LineControlPoint> controlPoints;
@@ -220,6 +236,9 @@ struct PreparedControlPointEdit {
     double linePosition);
 
 struct StoredControlPoint : cv::Vec3d {
+    std::optional<cv::Vec3d> direction;
+    std::optional<cv::Vec3d> displayNormal;
+    std::string displayNormalSource = "unknown";
     std::optional<FiberTraceSegmentMetadata> segmentToNext;
     // Serialized as the control point's optional "tags" array; omitted when
     // empty so untagged fibers are written exactly as before.
@@ -370,8 +389,22 @@ struct FiberModeOptimizationRequest {
     // Ordinary line annotation retains open geometry outside the controls.
     // Spiral 2D annotation uses the controls as inclusive bounds.
     bool retainOpenTails = true;
+    // CT + model session: no Lasagna initialization, normal field or fallback.
+    // The builder supplies measured model/CT normals after geometry is complete.
+    std::function<vc::lasagna::LineModel(const std::vector<cv::Vec3d>&)> modelLineBuilder;
     std::function<void(const FiberExtrapolationFallbackDiagnostic&)>
         extrapolationFallbackCallback;
+    // Optional tracing backend replacing the native prediction-field tracer
+    // (predictions + traceNormalSampler) for open-tail extrapolation and Trace
+    // spans, with the native result types, in trace coordinates. Line
+    // Annotation's fiber-follow model sets both. history: the current line in
+    // travel order, ending at the trace start; direction: outward.
+    std::function<vc::fiber_tracer::FiberTraceOneWayResult(
+        const std::vector<cv::Vec3d>& history, const cv::Vec3d& direction, double distance)>
+        externalExtrapolation;
+    std::function<vc::fiber_tracer::FiberTraceSegmentResult(
+        const vc::fiber_tracer::FiberTraceSegmentRequest& request)>
+        externalSegment;
     // Cooperative cancellation (see LineOptimizationConfig::cancelFlag):
     // when set and it becomes true, optimizeFiberWithNativeFallback throws
     // vc::lasagna::LineOptimizationCancelled at the next checkpoint instead
