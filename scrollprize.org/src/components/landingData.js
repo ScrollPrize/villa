@@ -459,7 +459,7 @@ export const team = {
     },
     {
       name: "Hendrik Schilling",
-      title: "Computer Vision & AI Expert",
+      title: "Research Scientist",
       href: "https://www.linkedin.com/in/dr-hendrik-schilling-a2019418a",
     },
     {
