@@ -282,13 +282,14 @@ def rotation_minimising_fill(
     of the shallowest, searched every 10 degrees and then every degree around the best.
     Zero unless that cuts the fill by at least min_gain times the lined mesh's volume.
 
-    The divider is symmetric under a half turn, so angles in [0, 180) degrees cover it.
+    The divider is symmetric under a half turn, so angles in (-90, 90] degrees cover it;
+    beyond those, a half turn would only swap which half holds which side of the scroll.
     """
     evaluated = {}
 
     def evaluate(degrees):
         for d in degrees:
-            d %= 180
+            d = (d + 89) % 180 - 89
             if d not in evaluated:
                 evaluated[d] = split_fill_and_depth(
                     mesh,
@@ -304,7 +305,7 @@ def rotation_minimising_fill(
         ok = [d for d, (_, depth, _) in evaluated.items() if depth <= shallowest + depth_tolerance_mm]
         return min(ok, key=lambda d: evaluated[d][0])
 
-    evaluate(range(0, 180, 10))
+    evaluate(range(-80, 91, 10))
     evaluate(range(best() - 5, best() + 6))
     pick = best()
     fill_0, depth_0, lined_volume = evaluated[0]
