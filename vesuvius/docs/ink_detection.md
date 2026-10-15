@@ -443,7 +443,7 @@ the second output.
 | `--layer-start`, `--layer-end` | Half-open source-Z selection before centered depth cropping; negative indices count from the end. |
 | `--batch-size` | Batch size per selected device, default `1`. |
 | `--direction` | `forward`, `reverse`, or `both`; default `forward`. |
-| `--amp-dtype` | `auto`, `default`, `fp16`, or `bf16`; `auto` reads checkpoint precision. |
+| `--amp-dtype` | `auto`, `default`, `fp16`, or `bf16`; `auto` follows the checkpoint's `mixed_precision`, `default` runs full precision (no autocast). |
 | `--tta-mirror` | Average valid mirror variants. |
 | `--tta-batch-size` | Maximum mirror variants evaluated together. |
 | `--gpus` | Unique comma-separated CUDA IDs, for example `0,1`; omit for automatic CUDA/CPU selection. |
@@ -504,7 +504,7 @@ uv run --extra models python -m vesuvius.ink_detection.inference.infer_full3d_ti
 | `--blend-mode` | `gaussian` by default, or `constant`. |
 | `--tta` | Average all eight Z/Y/X mirror variants. |
 | `--tta-batch-size` | Maximum variants evaluated together. |
-| `--amp-dtype` | `auto`, `default`, `fp16`, or `bf16`; `auto` reads checkpoint precision. |
+| `--amp-dtype` | `auto`, `default`, `fp16`, or `bf16`; `auto` follows the checkpoint's `mixed_precision`, `default` runs full precision (no autocast). |
 | `--compile-mode` | `torch.compile` mode, default `reduce-overhead`. |
 | `--no-compile` | Use eager inference. Multiple selected GPUs also disable compilation. |
 | `--gpus` | Unique comma-separated CUDA IDs; omit for automatic CUDA/CPU selection. |

@@ -8,7 +8,6 @@ import math
 import shutil
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -31,6 +30,7 @@ from vesuvius.ink_detection.data.geometry import (
 )
 from vesuvius.ink_detection.data.normalization import normalize_image
 from vesuvius.ink_detection.inference.inference_runtime import (
+    inference_autocast,
     TargetModel,
     flip_spatial,
     iter_mirror_axes,
@@ -1027,15 +1027,8 @@ def run_native_inference(
         contribution_counts=plan.contribution_counts,
         chunk_shape_zyx=plan.chunk_shape_zyx,
     )
-    autocast = (
-        torch.autocast(
-            device_type="cuda", enabled=True, dtype=bundle.amp_dtype
-        )
-        if bundle.device.type == "cuda"
-        else nullcontext()
-    )
     variants = tta_variants(bool(args.tta))
-    with torch.inference_mode(), autocast:
+    with torch.inference_mode(), inference_autocast(bundle.device, bundle.amp_dtype):
         for images, metadata in loader:
             images = images.to(bundle.device, non_blocking=True)
             probabilities = predict_batch(
