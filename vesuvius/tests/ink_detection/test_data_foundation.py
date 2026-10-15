@@ -16,7 +16,9 @@ import zarr
 from vesuvius.ink_detection.config import InkDataConfig
 from vesuvius.ink_detection.data.dataset import InkDataset, flat_z_window_bbox
 from vesuvius.ink_detection.data.geometry import (
+    StoredResolutionIndex,
     filter_support_components,
+    maybe_select_flat_pixels,
     read_tifxyz_on_flat_grid,
     select_flat_pixels_via_stored_resolution,
 )
@@ -637,6 +639,55 @@ def test_ragged_tifxyz_pyramid_refines_to_exact_flat_grid():
     np.testing.assert_array_equal(
         support, np.array([[[2.0, 3.0, 3.0]]], dtype=np.float32)
     )
+    indexed = select_flat_pixels_via_stored_resolution(
+        tifxyz,
+        (2, 3, 3, 3, 4, 4),
+        coarse_native_pad=1,
+        coarse_positions_zyx=tifxyz.stored_positions_zyx,
+        coarse_valid=np.ones((4, 4), dtype=bool),
+        native_coordinate_scale=0.25,
+        flat_grid_stride=4,
+        coarse_index=StoredResolutionIndex(
+            tifxyz.stored_positions_zyx,
+            np.ones((4, 4), dtype=bool),
+            native_coordinate_scale=0.25,
+        ),
+    )
+    assert indexed[0] == support_bbox
+    np.testing.assert_array_equal(indexed[1], support)
+    np.testing.assert_array_equal(indexed[2], support_valid)
+
+
+@pytest.mark.parametrize("scale", [1.0, 0.25])
+def test_stored_resolution_index_matches_full_grid_scan(scale):
+    # A wavy sheet with NaN holes and invalid points; the index must return the
+    # exact window a scan of the whole stored grid returns, including misses.
+    rng = np.random.default_rng(7)
+    height, width = 70, 90
+    rows, columns = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
+    positions = np.stack(
+        [
+            40 + 6 * np.sin(columns / 9.0) + rng.normal(0, 0.5, (height, width)),
+            2.0 * rows + rng.normal(0, 0.5, (height, width)),
+            2.0 * columns,
+        ],
+        axis=-1,
+    ).astype(np.float32)
+    positions[rng.random((height, width)) < 0.05] = np.nan
+    positions[rng.random((height, width)) < 0.05] = -1
+    valid = np.isfinite(positions).all(axis=-1) & (positions >= 0).all(axis=-1)
+    scaled = positions * scale if scale != 1.0 else positions
+    extent = np.array([60, 150, 190]) * scale
+    for tile in (1, 16, 32, 128):
+        index = StoredResolutionIndex(
+            positions, valid, native_coordinate_scale=scale, tile=tile
+        )
+        for _ in range(200):
+            start = rng.integers(-10, extent.astype(int))
+            stop = start + rng.integers(1, (extent / 3).astype(int) + 2)
+            bbox = (*start.tolist(), *stop.tolist())
+            expected = maybe_select_flat_pixels(scaled, valid, bbox)
+            assert index.window(bbox) == (None if expected is None else expected[0])
 
 
 def test_patch_bbox_seeds_only_its_connected_support_component():
