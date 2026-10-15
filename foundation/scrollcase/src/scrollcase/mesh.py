@@ -445,7 +445,8 @@ def _parting_surface(
     # No steeper than max_slope_deg between neighbours: alternately limit each point's
     # departure to its neighbours' plus the rise that slope allows, along each axis,
     # which only ever brings the surface back towards the divider.
-    slope = np.tan(np.radians(max_slope_deg))
+    # Each axis's share, so that the two together are no steeper in any direction.
+    slope = np.tan(np.radians(max_slope_deg)) / np.sqrt(2)
     rise_x = slope * np.diff(xs)[:, None]
     rise_z = slope * np.diff(zs)[None, :]
 
@@ -692,20 +693,32 @@ def build_lining(
     # its cavity and a thin sheet on the parting surface, cut along the surface: the
     # wall follows the surface at the lining's thickness, and meets the lining without a
     # seam. The wall replaces the case's wall on the S-shaped divider, and the posts at
-    # its ends there, which are removed with the cavities; the sheet stops the wall
-    # thickness short of the lining's outer radius, as those posts did, and reaches a
-    # millimetre beyond the surface's grid along the axis, where the surface is back on
-    # the divider, to fuse with the case's wall beyond.
+    # its ends there, which are removed with the cavities; both are trimmed at the
+    # lining's outer radius, so the wall ends flush with it, square to the joint. The
+    # sheet reaches a millimetre beyond the surface's grid along the axis, where the
+    # surface is back on the divider, to fuse with the case's wall beyond.
     w = mesh_params.wall_thickness_mm
-    sheet_xs = xs[np.abs(xs) <= lining_outer_radius - w]
     sheet_zs = np.concatenate([[zs[0] - 1], zs, [zs[-1] + 1]])
-    sheet_parting = np.concatenate([parting[:, :1], parting, parting[:, -1:]], axis=1)[np.abs(xs) <= lining_outer_radius - w]
+    sheet_parting = np.concatenate([parting[:, :1], parting, parting[:, -1:]], axis=1)
     half_thickness = max(voxel_size, 0.25)
     sheet = _heightfield_solid(
-        sheet_xs, sheet_zs, sheet_parting - half_thickness, sheet_parting + half_thickness
+        xs, sheet_zs, sheet_parting - half_thickness, sheet_parting + half_thickness
     )
-    cavity_mesh_pos_offset = mm.offsetMesh(mm.voxelBooleanUnite(cavity_mesh_pos, sheet, voxel_size), offset=w, params=params)  # type: ignore
-    cavity_mesh_neg_offset = mm.offsetMesh(mm.voxelBooleanUnite(cavity_mesh_neg, sheet, voxel_size), offset=w, params=params)  # type: ignore
+    length = sheet_zs[-1] - sheet_zs[0] + 4 * w
+    within = mm.makeCylinderAdvanced(
+        lining_outer_radius + 0.1, lining_outer_radius + 0.1, 0, 2 * np.pi, length, 256
+    )
+    within.transform(mm.AffineXf3f.translation(mm.Vector3f(0, 0, sheet_zs[0] - 2 * w)))
+    cavity_mesh_pos_offset = mm.voxelBooleanIntersect(
+        mm.offsetMesh(mm.voxelBooleanUnite(cavity_mesh_pos, sheet, voxel_size), offset=w, params=params),  # type: ignore
+        within,
+        voxel_size,
+    )
+    cavity_mesh_neg_offset = mm.voxelBooleanIntersect(
+        mm.offsetMesh(mm.voxelBooleanUnite(cavity_mesh_neg, sheet, voxel_size), offset=w, params=params),  # type: ignore
+        within,
+        voxel_size,
+    )
     # Generously: over the lining the case has nothing else near the divider. A
     # millimetre wider than the parting surface's grid, past the end posts' outer edge,
     # and a wall thickness more than the old wall each way, past its swept ends.
@@ -717,27 +730,22 @@ def build_lining(
     old_wall_pos = _heightfield_solid(flat_xs, zs, flat - w, flat + flat_thickness)
     old_wall_neg = _heightfield_solid(flat_xs, zs, flat - flat_thickness, flat + w)
 
-    # mm.trimWithPlane(cavity_mesh_pos_offset, cut_plane, outCutEdges=hole_edges_pos)
-    # mm.trimWithPlane(cavity_mesh_neg_offset, -cut_plane, outCutEdges=hole_edges_neg)
-    cavity_mesh_pos_offset = mm.boolean(
-        cavity_mesh_pos_offset, divider_piece_mesh, mm.BooleanOperation.Intersection
-    ).mesh
-    cavity_mesh_neg_offset = mm.boolean(
-        cavity_mesh_neg_offset, divider_piece_mesh, mm.BooleanOperation.DifferenceAB
-    ).mesh
-
-    fill_hole_params = mm.FillHoleParams()
-    edges_pos = mm.std_vector_Id_EdgeTag(hole_edges_pos)
-    edges_neg = mm.std_vector_Id_EdgeTag(hole_edges_neg)
-    mm.fillHoles(cavity_mesh_pos_offset, edges_pos, fill_hole_params)
-    mm.fillHoles(cavity_mesh_neg_offset, edges_neg, fill_hole_params)
-
-    lining_mesh_pos = mm.voxelBooleanSubtract(
-        cavity_mesh_pos_offset, cavity_mesh_pos, voxel_size
+    # Each half's lining is cut along the parting surface against the same distance
+    # field, so the two halves' cut faces coincide, before its cavity is removed (a
+    # voxel boolean fills a closed shell's internal void). The positive half's region
+    # is taken over the case only, to keep the voxel grid small.
+    reach = lining_outer_radius + 2 * w
+    local_xs = np.concatenate([[-reach], xs, [reach]])
+    local_parting = np.concatenate([parting[:1], parting, parting[-1:]], axis=0)
+    local_parting = np.concatenate([local_parting[:, :1], local_parting, local_parting[:, -1:]], axis=1)
+    local_zs = np.concatenate([[zs[0] - 3 * w], zs, [zs[-1] + 3 * w]])
+    positive_side = _heightfield_solid(
+        local_xs, local_zs, local_parting, np.full_like(local_parting, reach)
     )
-    lining_mesh_neg = mm.voxelBooleanSubtract(
-        cavity_mesh_neg_offset, cavity_mesh_neg, voxel_size
-    )
+    lining_mesh_pos = mm.voxelBooleanIntersect(cavity_mesh_pos_offset, positive_side, voxel_size)
+    lining_mesh_neg = mm.voxelBooleanSubtract(cavity_mesh_neg_offset, positive_side, voxel_size)
+    lining_mesh_pos = mm.voxelBooleanSubtract(lining_mesh_pos, cavity_mesh_pos, voxel_size)
+    lining_mesh_neg = mm.voxelBooleanSubtract(lining_mesh_neg, cavity_mesh_neg, voxel_size)
 
     unite = partial(_exact_boolean, op=mm.BooleanOperation.Union, voxel_size=voxel_size)
     cavity_mesh_pos = unite(cavity_mesh_pos, old_wall_pos)
@@ -791,7 +799,11 @@ def combine_case_lining(
     )
 
     combined_mesh = mm.boolean(case_mesh, cavity_mesh, mm.BooleanOperation.DifferenceAB)
+    if not combined_mesh.valid():
+        raise RuntimeError(f"Removing the cavity from the case failed: {combined_mesh.errorString}")
     combined_mesh = mm.boolean(
         combined_mesh.mesh, lining_mesh, mm.BooleanOperation.Union
     )
+    if not combined_mesh.valid():
+        raise RuntimeError(f"Adding the lining to the case failed: {combined_mesh.errorString}")
     return combined_mesh.mesh

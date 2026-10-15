@@ -41,15 +41,15 @@ class PartingSurfaceTests(unittest.TestCase):
 
     def test_passes_through_a_scroll_off_the_divider(self):
         # Wholly above the divider: the divider rises to y = 6 at x = -15.
-        scroll = box((-20, 10, 0), (20, 14, 20))
+        scroll = box((-20, 10, 0), (20, 14, 60))
         xs, zs, height = parting(scroll)
         # Away from its ends, where the surface is free of the slope limit.
-        over = (np.abs(xs) < 19)[:, None] & ((zs > 8) & (zs < 12))[None, :]
+        over = (np.abs(xs) < 19)[:, None] & ((zs > 25) & (zs < 35))[None, :]
         # Through the lined scroll's inner half (y from 8 to 16).
         self.assertGreaterEqual(height[over].min(), 10 - PITCH)
         self.assertLessEqual(height[over].max(), 14 + PITCH)
         # Level across the lined scroll's outline (at x = -22 and 22) for the land.
-        mid = np.argmin(np.abs(zs - 10))
+        mid = np.argmin(np.abs(zs - 30))
         for x0, x1 in ((-22, -24), (22, 24)):
             i0, i1 = np.argmin(np.abs(xs - x0)), np.argmin(np.abs(xs - x1))
             self.assertLess(abs(height[i1, mid] - height[i0, mid]), 0.3)
