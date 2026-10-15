@@ -157,6 +157,9 @@ def test_create_zarr_array_writes_empty_chunks_like_zarr2_by_default(tmp_path):
 def test_voxelize_rechunk_keeps_store_v2(tmp_path):
     """--chunk_size N routes level 0 through a dask rechunk; that must not leave
     a v3 array or a root zarr.json in the v2 label store (issue #1448 follow-up)."""
+    # voxelize_objs imports trimesh at module level; trimesh ships in the
+    # `render` extra, not `models`, so skip rather than error without it.
+    pytest.importorskip("trimesh")
     from vesuvius.image_proc.run.voxelize_objs import _rechunk_with_dask
 
     path = str(tmp_path / "labels.zarr")
