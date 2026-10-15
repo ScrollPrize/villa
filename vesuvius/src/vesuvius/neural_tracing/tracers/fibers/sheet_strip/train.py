@@ -273,6 +273,8 @@ def build_data(run, cfg, spec, checkpoint, split, *, augment, seed, workers, ful
         sampling_values[key] = tuple(sampling_values[key])
     sampling = IdentitySampling(**sampling_values)
     index = StripIndex(d.index, split)
+    if not len(index):
+        raise ValueError(f'No fiber runs in the {split} split of {d.index}')
     fibers = RunFibers(d.afv, index, spec.grid_scale, d.length_power)
     trace_per_patch = spec.ct_grid_scale/spec.grid_scale
     builder = builder_type(cfg, fibers, sampling, augment=augment, trace_per_patch=trace_per_patch,

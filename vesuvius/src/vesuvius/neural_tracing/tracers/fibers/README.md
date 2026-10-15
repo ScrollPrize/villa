@@ -300,6 +300,8 @@ when `init_checkpoint` is one, its added modules starting fresh):
 
 `sheet_strip/evaluate.py` scores checkpoints on one fixed, cached set of validation decisions, both tube modes each:
 
+Building a cache requires a new or empty output directory; use a new directory when changing the batch count.
+
 ```bash
 python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.evaluate build --checkpoint RUN/last.pt \
   --out /mnt/raid_nvme/sheet_strip_eval/val6400 --batches 200   # 6400 decisions, 44 GB, 5 minutes

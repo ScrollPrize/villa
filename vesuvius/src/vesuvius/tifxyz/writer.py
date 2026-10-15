@@ -335,13 +335,13 @@ class TifxyzWriter:
         self._ensure_directory()
         output_path = self.path / f"{name}.tif"
         h, w = data.shape[:2]
-        tile_h = min(self.tile_size, h)
-        tile_w = min(self.tile_size, w)
+        use_tiles, tile_h, tile_w = self._tiles(h, w)
 
         tifffile.imwrite(
             str(output_path),
             data,
-            tile=(tile_h, tile_w),
+            tile=(tile_h, tile_w) if use_tiles else None,
             compression=self.compression,
             photometric="minisblack",
+            rowsperstrip=h if self.tile_size is None else None,
         )

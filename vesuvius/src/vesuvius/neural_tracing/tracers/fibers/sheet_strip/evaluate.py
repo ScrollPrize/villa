@@ -8,7 +8,7 @@
 (no augmentation) and caches them (EVAL/batches/, CT crops as float16), each with the tube curves of both modes
 (observed trace and full fiber), the strip targets and the height field of every patch on its own
 (``patch_heights``, NaN where a patch does not supervise a point), so the label noise between patches can be measured.
-EVAL/meta.npz collects the targets and per-decision metadata.
+EVAL/meta.npz collects the targets and per-decision metadata. The destination must be new or empty.
 
 ``run`` evaluates a checkpoint (``--override``: under a changed model configuration, e.g. more strip refinement
 passes) on every cached decision in both tube modes: EVAL/results/NAME.npz holds the strip
@@ -72,12 +72,14 @@ class EvalBuilder(StripBuilder):
 
 
 def build(args):
+    out = Path(args.out)
+    if out.exists() and (not out.is_dir() or any(out.iterdir())):
+        raise ValueError(f'Evaluation cache destination must be new or empty: {out}')
     ck = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     run = RunConfig(**{k: v for k, v in ck['run_config'].items() if k not in ('data', 'training', 'runtime')},
                     **{k: type(getattr(RunConfig(), k))(**ck['run_config'][k]) for k in ('data', 'training', 'runtime')})
     cfg = SheetStripConfig(**ck['model_cfg'])
     spec = CTVolumeSpec.from_dict(ck['vol_spec'])
-    out = Path(args.out)
     (out/'batches').mkdir(parents=True, exist_ok=True)
     loader, index = build_data(run, cfg, spec, ck, 'validation', augment=False, seed=args.seed, workers=args.workers,
                                builder_type=EvalBuilder)

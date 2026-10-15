@@ -55,7 +55,8 @@ class StripIndex:
         self.rc, self.xyz = load('sample_rc'), load('sample_xyz')
         # Runs are sorted by fiber: each unit's runs are one slice.
         self.units, first = np.unique(self.fiber, return_index=True)
-        self.unit_runs = np.stack((first, np.r_[first[1:], len(self.fiber)]), 1)
+        self.unit_runs = (np.stack((first, np.r_[first[1:], len(self.fiber)]), 1)
+                          if len(first) else np.empty((0, 2), np.int64))
         self.unit_spans = [merged_spans(self.start[a:b], self.end[a:b]) for a, b in self.unit_runs]
         self.unit_length = np.array([float((s[:, 1]-s[:, 0]).sum()) for s in self.unit_spans])
 

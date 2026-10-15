@@ -31,6 +31,8 @@ checkpoint run's); models with ``strip_uncertainty`` also save their expected er
 (``expected_error_vox`` in strip.npz, its mean over the stitched rows in summary.json).
 Nodes within ``--trim`` patch voxels of either fiber end, or beyond it, are not kept (as infer_all.py).
 Arclengths and ``--step``/``--blend`` are trace voxels; ``--arc`` and ``--trim`` patch voxels.
+If trimming leaves no nodes, inference exits before writing. Missing scoring coverage leaves the predictions
+intact: summary.json records coverage counts and omits unavailable error statistics; empty patch sheets are not written.
 """
 from __future__ import annotations
 
@@ -378,7 +380,7 @@ def render_saved(out, vol):
     image = image[filled[0]:filled[-1]+1]
     origin = summary['first_row_arc_patch_voxels']+filled[0]
     error, title = None, f'fiber {summary["fiber"]}: CT on the predicted strip ({Path(summary["checkpoint"]).name}, update {summary["step"]})'
-    if 'decision_error_vox' in saved:
+    if 'strip_mae_vox' in summary.get('patch_score', {}):
         arcs = saved['arcs']/float(saved['trace_per_patch'])  # decision heads, patch voxels
         along = origin+np.arange(len(image))
         nearest = np.clip(np.searchsorted(arcs, along), 1, len(arcs)-1)
@@ -457,6 +459,8 @@ def main(argv=None):
     oriented, oriented_frames, flipped = orient_decisions(heights, frames)
     rows, weight, spread = stitch(oriented, oriented_frames, positions, arcs, f, v, args.blend)
     keep = trim_ends(weight > 0, arcs[0]+f[0], df, fiber.length, args.trim*trace_per_patch)
+    if not keep.any():
+        raise SystemExit('No strip nodes remain after trimming; reduce --trim or choose a different --arc or fiber')
     row_step, column_step = df/trace_per_patch, (v[1]-v[0])/trace_per_patch
     args.out.mkdir(parents=True, exist_ok=True)
     provenance = dict(checkpoint=predictor.source, step=ck.get('step'), afv=str(afv_path),
@@ -490,21 +494,25 @@ def main(argv=None):
         errors = dict(strip=np.where(has, error, np.nan), plane=np.where(has, plane, np.nan))
         diff = np.abs(heights-targets)[masks]/trace_per_patch
         summary['patch_score'] = dict(split=scorer.split, scored_decisions=int(has.sum()),
-                                      supervised_points=int(masks.sum()), strip_mae_vox=float(diff.mean()),
-                                      plane_mae_vox=float((np.abs(targets)[masks]/trace_per_patch).mean()),
-                                      within1=float((diff <= 1).mean()), within2=float((diff <= 2).mean()),
-                                      p95_vox=float(np.percentile(diff, 95)))
+                                      supervised_points=int(masks.sum()))
+        if diff.size:
+            summary['patch_score'].update(strip_mae_vox=float(diff.mean()),
+                                          plane_mae_vox=float((np.abs(targets)[masks]/trace_per_patch).mean()),
+                                          within1=float((diff <= 1).mean()), within2=float((diff <= 2).mean()),
+                                          p95_vox=float(np.percentile(diff, 95)))
         oriented_targets = np.where(flipped[:, None, None], -targets[:, :, ::-1], targets)
         oriented_masks = np.where(flipped[:, None, None], masks[:, :, ::-1], masks)
         gt, gt_weight, _ = stitch(oriented_targets, oriented_frames, positions, arcs, f, v, args.blend,
                                   oriented_masks.astype(np.float64))
         gt_keep = gt_weight > 1e-6
-        write_surface(args.out/'patch_sheet', gt/trace_per_patch, gt_keep, row_step, column_step,
-                      dict(provenance, source='patch sheet targets'), overwrite=True, voxel_size_um=args.voxel_size_um)
+        if gt_keep.any():
+            write_surface(args.out/'patch_sheet', gt/trace_per_patch, gt_keep, row_step, column_step,
+                          dict(provenance, source='patch sheet targets'), overwrite=True, voxel_size_um=args.voxel_size_um)
         both = keep & gt_keep
-        summary['patch_score']['stitched_node_distance_vox'] = dict(
-            median=float(np.median(np.linalg.norm(rows-gt, axis=-1)[both])/trace_per_patch),
-            p95=float(np.percentile(np.linalg.norm(rows-gt, axis=-1)[both], 95)/trace_per_patch))
+        if both.any():
+            summary['patch_score']['stitched_node_distance_vox'] = dict(
+                median=float(np.median(np.linalg.norm(rows-gt, axis=-1)[both])/trace_per_patch),
+                p95=float(np.percentile(np.linalg.norm(rows-gt, axis=-1)[both], 95)/trace_per_patch))
         saved.update(targets=targets, masks=masks, decision_error_vox=errors['strip'], decision_plane_vox=errors['plane'])
     np.savez_compressed(args.out/'strip.npz', **saved)
     summary['seconds'] = time.time()-started
