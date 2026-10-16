@@ -1,0 +1,45 @@
+{
+  "_sanitized_derivative": {
+    "type": "sanitized_derivative",
+    "source_artifact": "c02_evidence_001b/real_data/n1_run1.json",
+    "source_sha256": "2feba879b9df1cd258abb5f8cb03ec845f1312b8c7268814eba61bd491f42cbc",
+    "neutralizations": [
+      {
+        "field": "catalog_fingerprint.source",
+        "original_value_class": "absolute local Windows path",
+        "replacement": "official_metadata_2026-10-09.json"
+      }
+    ],
+    "scientific_fields_added": false
+  },
+  "alternative_entry_ids": [],
+  "alternative_reason": "COMPLETE_SEGMENT_ENUMERATION_WITHOUT_STRONG_MATCH",
+  "alternative_relation": "NONE_CONFIRMED",
+  "catalog_fingerprint": {
+    "decoded_bytes": 17537378,
+    "payload_bytes": 17537378,
+    "sha256": "40517076dc5f2128599868b337e25a17922ebe70a22b238b990e109b6f82af0f",
+    "source": "official_metadata_2026-10-09.json"
+  },
+  "contradictions": [],
+  "evidence": [
+    {
+      "field_path": "segment.original_volume_id",
+      "observed_value": "20250521151220",
+      "source": "catalog"
+    },
+    {
+      "field_path": "selected_entry.parameters.target_volume",
+      "observed_value": "20250521151220",
+      "source": "catalog"
+    }
+  ],
+  "frame_reason": "EXPLICIT_ENTRY_TARGET_MATCHES_REQUESTED_VOLUME",
+  "frame_relation": "SAME_FRAME",
+  "requested_target_volume_id": "20250521151220",
+  "sample_id": "PHerc1447",
+  "schema_version": 1,
+  "segment_id": "20250703034159-auto_grown_20250703034159599",
+  "selected_entry_id": "PHerc1447/segments/20250703034159-auto_grown_20250703034159599/mesh/20250703034159-on-20250521151220-8.64um.tifxyz/",
+  "transform": null
+}

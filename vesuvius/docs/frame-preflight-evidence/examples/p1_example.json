@@ -1,0 +1,107 @@
+{
+  "_sanitized_derivative": {
+    "type": "sanitized_derivative",
+    "source_artifact": "c02_evidence_001b/real_data/p1_run1.json",
+    "source_sha256": "f61f0c17fa4970b233260adc26949b0e622cb37acf3a395fbb22283c913b102b",
+    "neutralizations": [
+      {
+        "field": "catalog_fingerprint.source",
+        "original_value_class": "absolute local Windows path",
+        "replacement": "official_metadata_2026-10-09.json"
+      }
+    ],
+    "scientific_fields_added": false
+  },
+  "alternative_entry_ids": [
+    "PHerc0139/segments/20250108000004-w029_2025010827/mesh/20250108000004-on-20260102150214-2.399um.tifxyz/"
+  ],
+  "alternative_reason": "EXPLICIT_CATALOG_ENTRY_TARGETS_REQUESTED_VOLUME",
+  "alternative_relation": "SAME_FRAME_ALTERNATIVE_AVAILABLE",
+  "catalog_fingerprint": {
+    "decoded_bytes": 17537378,
+    "payload_bytes": 17537378,
+    "sha256": "40517076dc5f2128599868b337e25a17922ebe70a22b238b990e109b6f82af0f",
+    "source": "official_metadata_2026-10-09.json"
+  },
+  "contradictions": [],
+  "evidence": [
+    {
+      "field_path": "segment.original_volume_id",
+      "observed_value": "20260102150214",
+      "source": "catalog"
+    },
+    {
+      "field_path": "segment.data[origin='PHerc0139/segments/20250108000004-w029_2025010827/mesh/20250108000004-on-20260102150214-2.399um.tifxyz/'].parameters.target_volume",
+      "observed_value": "20260102150214",
+      "source": "catalog"
+    },
+    {
+      "field_path": "selected_entry.parameters.target_volume",
+      "observed_value": "20250728140407",
+      "source": "catalog"
+    },
+    {
+      "field_path": "sample.properties.volume_transforms[from_volume_id='20250728140407'].transforms[to_volume_id='20260102150214']",
+      "observed_value": {
+        "from_volume_id": "20250728140407",
+        "to_volume_id": "20260102150214"
+      },
+      "source": "catalog"
+    },
+    {
+      "field_path": "sample.properties.volume_transforms[from_volume_id='20260102150214'].transforms[to_volume_id='20250728140407']",
+      "observed_value": {
+        "from_volume_id": "20260102150214",
+        "to_volume_id": "20250728140407"
+      },
+      "source": "catalog"
+    },
+    {
+      "field_path": "volumes['20260102150214'].properties.transforms[from_volume_id='20260102150214'].transforms[to_volume_id='20250728140407']",
+      "observed_value": {
+        "from_volume_id": "20260102150214",
+        "to_volume_id": "20250728140407"
+      },
+      "source": "catalog"
+    }
+  ],
+  "frame_reason": "EXPLICIT_DIFFERENT_TARGET_AND_DIRECTED_VOLUME_TRANSFORM",
+  "frame_relation": "TRANSFORM_REQUIRED",
+  "requested_target_volume_id": "20260102150214",
+  "sample_id": "PHerc0139",
+  "schema_version": 1,
+  "segment_id": "20250108000004-w029_2025010827",
+  "selected_entry_id": "PHerc0139/segments/20250108000004-w029_2025010827/mesh/20250108000004-on-20250728140407-9.362um.tifxyz/",
+  "transform": {
+    "application_direction": "FORWARD",
+    "catalog_from_volume_id": "20250728140407",
+    "catalog_to_volume_id": "20260102150214",
+    "inverse_required": false,
+    "matrix": [
+      [
+        -3.886394110050942,
+        0.1467834836598507,
+        0.042991272563863626,
+        24942.184825509117
+      ],
+      [
+        -0.14932134398149824,
+        -3.8883143569764504,
+        -0.019874994068077516,
+        27018.881149603334
+      ],
+      [
+        0.04314060832031874,
+        -0.02410903665211957,
+        3.888412560623145,
+        -2553.809373804655
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ]
+  }
+}
