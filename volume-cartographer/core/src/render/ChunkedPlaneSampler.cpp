@@ -789,7 +789,7 @@ uint8_t interpolateTrilinearU8(float fx,
     const float c0 = std::fma(fy, c01 - c00, c00);
     const float c1 = std::fma(fy, c11 - c10, c10);
     return static_cast<uint8_t>(
-        std::clamp(std::fma(fz, c1 - c0, c0), 0.0f, 255.0f));
+        std::clamp(std::fma(fz, c1 - c0, c0), 0.0f, 255.0f) + 0.5f);
 }
 
 bool sampleTrilinear(IChunkedArray& array,
