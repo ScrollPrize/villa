@@ -1,7 +1,7 @@
 #include "vc/core/graph_links/GraphLinks.hpp"
 #include "vc/core/util/PackedTrackStore.hpp"
 #include "vc/core/util/TrackCrossings.hpp"
-#include "vc/core/util/Uuid.hpp"
+#include "GraphLinksTrackInput.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -18,14 +18,7 @@ void checkCancelled(const std::atomic_bool* cancel)
 {
     if (cancel && cancel->load(std::memory_order_relaxed)) throw Cancelled{};
 }
-uint64_t sourceId(const std::string& key)
-{
-    uint64_t id;
-    const auto [end, error] = std::from_chars(key.data(), key.data() + key.size(), id);
-    if (error != std::errc{} || end != key.data() + key.size() || std::to_string(id) != key)
-        throw std::runtime_error("track external_key must be a canonical decimal source ID: " + key);
-    return id;
-}
+
 }
 
 DetectorReport linkTracksToTracks(graph::GraphDb& db, const TrackTrackParams& params,
@@ -51,72 +44,16 @@ DetectorReport linkTracksToTracks(graph::GraphDb& db, const TrackTrackParams& pa
         std::map<std::string, std::vector<graph::ObjectRecord>> datasets;
         std::set<std::string> requested(params.trackUuids.begin(), params.trackUuids.end());
         std::vector<graph::ObjectRecord> registered;
-        {
+        if (params.tracksPath.empty()) {
             auto read = db.read();
             registered = db.objectsByKind(read, "track");
         }
         if (!params.tracksPath.empty()) {
-            const auto packedPath = resolvePackedTrackStore(params.tracksPath);
-            PackedTrackStore store(packedPath);
-            std::string dataset = packedPath.string();
-            // Preserve existing identities when a prior caller used a relative
-            // packed path, or a symlink, for this same geometry.
-            std::set<std::string> matchingRefs;
-            std::map<std::string, bool> sameDataset;
-            for (const auto& object : registered) {
-                if (!object.track) continue;
-                const auto& ref = object.track->datasetRef;
-                if (!sameDataset.contains(ref)) {
-                    const std::filesystem::path path(ref);
-                    std::error_code error;
-                    const auto resolved = std::filesystem::weakly_canonical(
-                        path.is_absolute() ? path : db.path().parent_path() / path, error);
-                    sameDataset[ref] = !error && resolved == packedPath;
-                }
-                if (sameDataset.at(ref)) matchingRefs.insert(ref);
-            }
-            if (matchingRefs.size() > 1)
-                throw std::runtime_error("this packed dataset is registered under multiple dataset_ref aliases");
-            if (!matchingRefs.empty()) dataset = *matchingRefs.begin();
-            std::map<uint64_t, graph::ObjectRecord> existing;
-            for (auto& object : registered)
-                if (object.track && object.track->datasetRef == dataset)
-                    existing.emplace(sourceId(object.track->externalKey), std::move(object));
-            const std::set<uint64_t> selectedIds(params.sourceIds.begin(), params.sourceIds.end());
-            size_t selectedCount = 0;
-            registrationDataset = dataset;
-            auto& objects = datasets[dataset];
-            for (size_t row = 0; row < store.sourceIds().size(); ++row) {
-                checkCancelled(cancel);
-                const auto id = store.sourceIds()[row];
-                if (!selectedIds.empty() && !selectedIds.contains(id)) continue;
-                const auto found = existing.find(id);
-                if (!requested.empty() && (found == existing.end() || !requested.contains(found->second.uuid))) continue;
-                ++selectedCount;
-                if (found != existing.end()) {
-                    objects.push_back(std::move(found->second));
-                    continue;
-                }
-                graph::ObjectRecord object;
-                object.uuid = vc::util::newUuid();
-                object.kind = "track";
-                object.name = std::to_string(id);
-                object.storageKind = "dataset";
-                object.storageRef = dataset;
-                object.dataGeneration = 1;
-                graph::TrackDetail detail;
-                detail.datasetRef = dataset;
-                detail.externalKey = object.name;
-                const auto family = store.families()[row];
-                detail.family = family == 0 ? "horizontal" : family == 1 ? "vertical" : "";
-                detail.pointCount = store.offsets()[row+1] - store.offsets()[row];
-                object.track = std::move(detail);
-                registrations.push_back(objects.size());
-                objects.push_back(std::move(object));
-            }
-            if (!selectedIds.empty() && selectedCount != selectedIds.size())
-                throw std::runtime_error("some requested source IDs are missing or outside the UUID selection");
-            report.objectsConsidered = static_cast<int64_t>(objects.size());
+            auto input = detail::loadTrackInput(db, params.tracksPath, params.sourceIds, params.trackUuids, cancel);
+            registrationDataset = input.datasetRef;
+            registrations = std::move(input.registrations);
+            report.objectsConsidered = static_cast<int64_t>(input.objects.size());
+            datasets[input.datasetRef] = std::move(input.objects);
         } else {
             for (auto& object : registered) {
                 if (!requested.empty() && !requested.contains(object.uuid)) continue;
@@ -139,9 +76,9 @@ DetectorReport linkTracksToTracks(graph::GraphDb& db, const TrackTrackParams& pa
             const std::filesystem::path path(dataset);
             const auto resolved = path.is_absolute() ? path : db.path().parent_path() / path;
             PackedTrackStore store(resolved);
-            std::map<uint64_t, const graph::ObjectRecord*> byId;
-            for (const auto& object : objects) {
-                const auto id = sourceId(object.track->externalKey);
+            std::map<uint64_t, graph::ObjectRecord*> byId;
+            for (auto& object : objects) {
+                const auto id = detail::trackSourceId(object.track->externalKey);
                 if (!byId.emplace(id, &object).second)
                     throw std::runtime_error("duplicate registered track source ID");
             }
@@ -153,17 +90,11 @@ DetectorReport linkTracksToTracks(graph::GraphDb& db, const TrackTrackParams& pa
             std::vector<const graph::ObjectRecord*> rows;
             for (const auto& [id, object] : byId) {
                 checkCancelled(cancel);
-                const auto found = std::lower_bound(store.sourceIds().begin(), store.sourceIds().end(), id);
-                if (found == store.sourceIds().end() || *found != id)
-                    throw std::runtime_error("source ID " + std::to_string(id) + " missing from " + dataset);
-                const auto row = found - store.sourceIds().begin();
+                const auto row = detail::trackRow(store, *object);
+                object->track->length = detail::trackPolylineLength(store, row, cancel);
+                object->track->family = detail::trackFamily(store, row);
                 const int64_t begin = store.offsets()[row], end = store.offsets()[row+1];
                 const int8_t family = store.families()[row];
-                const std::string familyName = family == 0 ? "horizontal" : family == 1 ? "vertical" : "";
-                if (!object->track->family.empty() && object->track->family != familyName)
-                    throw std::runtime_error("registered family differs from packed track " + std::to_string(id));
-                if (object->track->pointCount != 0 && object->track->pointCount != end - begin)
-                    throw std::runtime_error("registered point count differs from packed track " + std::to_string(id));
                 if (end - begin > std::numeric_limits<int32_t>::max()
                     || uint64_t(offsets.back()) + uint64_t(end - begin) > std::numeric_limits<uint32_t>::max())
                     throw std::runtime_error("selected tracks exceed crossing kernel index limits");
@@ -252,6 +183,11 @@ DetectorReport linkTracksToTracks(graph::GraphDb& db, const TrackTrackParams& pa
             checkCancelled(cancel);
             db.upsertObject(transaction, datasets.at(registrationDataset).at(row));
         }
+        for (const auto& [dataset, objects] : datasets)
+            for (const auto& object : objects) {
+                checkCancelled(cancel);
+                db.setTrackLength(transaction, object.uuid, object.track->length, object.track->family);
+            }
         const auto committed = commitCandidates(db, transaction, kTrackTrackDetector, 1, candidates,
                                                  params.replaceStalePending, &scope);
         checkCancelled(cancel);

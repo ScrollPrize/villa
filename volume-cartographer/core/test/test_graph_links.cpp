@@ -166,8 +166,7 @@ TEST_CASE("placeholder detectors write nothing and say so")
     addObject(db, "fiber");
     addObject(db, "track");
 
-    for (const auto& report : {linkFibersToFibers(db), linkTracksToFibers(db),
-                               linkTracksToPatches(db)}) {
+    for (const auto& report : {linkFibersToFibers(db), linkTracksToFibers(db)}) {
         CHECK(report.edgesCreated == 0);
         REQUIRE(report.problems.size() == 1);
         CHECK(report.problems[0].find("not implemented") != std::string::npos);
@@ -311,7 +310,7 @@ TEST_CASE("fiber-patch: anchors, multi-round growth, strip gate and isolated clu
         CHECK(target != isolated);
         const auto meta = nlohmann::json::parse(edge.meta);
         CHECK(meta.at("detector").at("name") == "fiber-patch");
-        CHECK(meta.at("detector").at("version") == 2);
+        CHECK(meta.at("detector").at("version") == 3);
         CHECK(meta.at("normal_method") == "ct-anisotropic-1-24-4-grid3-r48-v4");
         CHECK_FALSE(meta.at("pred_dt_snap").get<bool>());
         CHECK(meta.at("settings").at("strip_rows_each_side") == 1);
@@ -321,7 +320,7 @@ TEST_CASE("fiber-patch: anchors, multi-round growth, strip gate and isolated clu
         CHECK(evidence.at("anchor") == (target == a));
         REQUIRE(anchor.index.has_value());
         if (target == a) {
-            CHECK(*anchor.index == 1);
+            CHECK(*anchor.index == 25);
             CHECK(evidence.at("contact_length").get<double>() >= 100);
         }
         CHECK((target == a || target == b || target == c));
@@ -355,7 +354,7 @@ TEST_CASE("fiber-patch: reviewed and unrelated edges survive scoped reruns")
     const auto edges = fiberEdges(db, fiber);
     REQUIRE(edges.size() == 3);
     const auto& anchor = edges[0].aUuid == fiber ? edges[0].aAnchor : edges[0].bAnchor;
-    CHECK_FALSE(anchor.index.has_value());
+    CHECK(anchor.index.has_value());
     REQUIRE(anchor.position.has_value());
     {
         auto txn = db.write();
@@ -400,8 +399,7 @@ TEST_CASE("fiber-patch: validates parameters and rejects malformed geometry befo
         if (which == 4) p.adjacentLow = p.sameSheet;
         CHECK_THROWS_AS(linkTestFiberPatches(db, fibers, patches, ctVolume, p), std::invalid_argument);
     }
-    // Invalid control points cannot be silently dropped: anchor indices
-    // must continue to refer to the original JSON array.
+    // Invalid controls cannot be silently dropped: they define the eligible span.
     std::ofstream(fibers / "fiber.json") << nlohmann::json{{"uuid", fiber},
         {"line_points", {{100, 128, 128}, {200, 128, 128}}},
         {"control_points", {{100, 128, 128}, {"bad"}, {200, 128, 128}}}}.dump();
@@ -445,7 +443,7 @@ TEST_CASE("fiber-patch: independent coordinate scales preserve links, source anc
     const auto edges = fiberEdges(db, fiber);
     const auto& anchor = edges[0].aUuid == fiber ? edges[0].aAnchor : edges[0].bAnchor;
     REQUIRE(anchor.index.has_value());
-    CHECK(*anchor.index == 1);
+    CHECK(*anchor.index == 25);
     REQUIRE(anchor.position.has_value());
     CHECK(*anchor.position == std::array<double, 3>{600, 512, 512});
     const auto meta = nlohmann::json::parse(edges[0].meta);
@@ -471,6 +469,13 @@ TEST_CASE("fiber-patch: independent coordinate scales preserve links, source anc
     source.ensureLoaded();
     CHECK((*source.rawPointsPtr())(1, 0)[0] == doctest::Approx(50));
     CHECK((*source.rawPointsPtr())(0, 0)[0] == doctest::Approx(-1));
+    // Backfill a legacy registration without resetting its review.
+    { auto write = db.write(); db.setFiberLength(write, fiber, 0);
+      db.setApproval(write, fiber, "approved"); write.commit(); }
+    REQUIRE(linkTestFiberPatches(db, fibers, patches, ctVolume, p).problems.empty());
+    { auto read = db.read(); const auto f = db.objectByUuid(read, fiber);
+      CHECK(f->fiber->length == 960); CHECK(f->generation == 1);
+      CHECK(f->approvalState == "approved"); }
     // An incorrect mapping puts the fiber outside the CT; preserve pending links.
     auto outside = p;
     outside.workingToBaseScale = 1;
@@ -622,4 +627,171 @@ TEST_CASE("caller-owned candidate transaction rolls registration and edges back 
     auto read = db.read();
     CHECK(db.objectsByKind(read, "track").empty());
     CHECK(db.edgesByKind(read, "same-surface").empty());
+}
+
+namespace {
+fs::path writePackedLine(const fs::path& directory, int multiplier = 1)
+{
+    fs::create_directories(directory);
+    std::ofstream header(directory / "header.bin", std::ios::binary);
+    header.write("VCTRK01\0", 8);
+    const uint32_t version = 1, bytes = 64;
+    const uint64_t count = 1, points = 121, reserved = 0;
+    header.write(reinterpret_cast<const char*>(&version), 4);
+    header.write(reinterpret_cast<const char*>(&bytes), 4);
+    header.write(reinterpret_cast<const char*>(&count), 8);
+    header.write(reinterpret_cast<const char*>(&points), 8);
+    for (int i = 0; i < 4; ++i) header.write(reinterpret_cast<const char*>(&reserved), 8);
+    std::ofstream coordinates(directory / "coordinates.i32", std::ios::binary);
+    for (int x = 100; x <= 340; x += 2) {
+        const int32_t zyx[]{128 * multiplier, 128 * multiplier, x * multiplier};
+        coordinates.write(reinterpret_cast<const char*>(zyx), sizeof(zyx));
+    }
+    const int64_t offsets[]{0, 121};
+    std::ofstream(directory / "offsets.i64", std::ios::binary).write(reinterpret_cast<const char*>(offsets), sizeof(offsets));
+    const uint64_t id = uint64_t{1} << 40;
+    std::ofstream(directory / "source_ids.u64", std::ios::binary).write(reinterpret_cast<const char*>(&id), sizeof(id));
+    const int8_t family = 0;
+    std::ofstream(directory / "family_codes.i8", std::ios::binary).write(reinterpret_cast<const char*>(&family), sizeof(family));
+    return directory;
+}
+}
+
+TEST_CASE("track-patch uses fiber strip rules, raw anchors and existing track identities")
+{
+    TempDir tmp("track_patch_parity");
+    auto db = makeDb(tmp.dir);
+    const auto packed = writePackedLine(tmp.dir / "tracks.vctracks", 2);
+    const auto fibers = tmp.dir / "fibers", patches = tmp.dir / "patches";
+    const auto fiber = writeFiber(fibers);
+    const auto ct = writeCt(tmp.dir / "ct");
+    planePatch(patches / "anchor", 100, 100);
+    planePatch(patches / "growth1", 175, 60);
+    planePatch(patches / "growth2", 205, 60);
+    const auto isolated = planePatch(patches / "isolated", 310, 30);
+    writePatch(patches / "wrong", 21, 71, [](int r, int c) {
+        return cv::Vec3f(float(100 + 2*c), float(108 + 2*r), r == 10 ? 128.0f : 136.0f);
+    });
+    // The crossing and patch detectors must reuse the same source identity.
+    TrackTrackParams crossing;
+    crossing.tracksPath = packed;
+    REQUIRE(linkTracksToTracks(db, crossing).problems.empty());
+    std::string track;
+    {
+        auto read = db.read();
+        const auto objects = db.objectsByKind(read, "track");
+        REQUIRE(objects.size() == 1);
+        track = objects[0].uuid;
+        CHECK(objects[0].track->length == 480);
+        CHECK(objects[0].track->family == "horizontal");
+    }
+    // Simulate a legacy registration with no cached length, already reviewed.
+    { auto write = db.write(); auto object = *db.objectByUuid(write, track);
+      object.track->length = 0; object.track->family.clear(); db.upsertObject(write, object);
+      db.setApproval(write, track, "approved"); write.commit(); }
+    REQUIRE(linkTestFiberPatches(db, fibers, patches, ct).edgesCreated == 3);
+    TrackPatchParams p;
+    p.trackScale = 0.5;
+    p.stripMarchStep = 20;
+    const auto report = linkTracksToPatches(db, packed, patches, ct, p);
+    for (const auto& problem : report.problems) INFO(problem);
+    REQUIRE(report.problems.empty());
+    REQUIRE(report.edgesCreated == 3);
+    { auto read = db.read(); const auto object = db.objectByUuid(read, track);
+      CHECK(object->track->length == 480); // source units, despite trackScale=0.5
+      CHECK(object->track->family == "horizontal");
+      CHECK(object->approvalState == "approved"); CHECK(object->generation == 2); }
+    std::map<std::string, nlohmann::json> fiberEvidence;
+    for (const auto& edge : fiberEdges(db, fiber))
+        fiberEvidence[edge.aUuid == fiber ? edge.bUuid : edge.aUuid] = nlohmann::json::parse(edge.meta)["fiber_patch"];
+    for (const auto& edge : fiberEdges(db, track)) {
+        const auto target = edge.aUuid == track ? edge.bUuid : edge.aUuid;
+        const auto& anchor = edge.aUuid == track ? edge.aAnchor : edge.bAnchor;
+        REQUIRE(target != isolated);
+        const auto meta = nlohmann::json::parse(edge.meta);
+        CHECK(meta["track_patch"] == fiberEvidence.at(target));
+        CHECK(meta["detector"]["name"] == "track-patch");
+        CHECK(meta["anchor_index_space"] == "line_points");
+        CHECK(meta["normal_method"] == "ct-anisotropic-1-24-4-grid3-r48-v4");
+        CHECK(meta["settings"]["track_scale"] == 0.5);
+        CHECK(meta["track_source_id"] == std::to_string(uint64_t{1} << 40));
+        REQUIRE(anchor.index.has_value());
+        CHECK(*anchor.index == meta["track_patch"]["median_line_index"].get<int64_t>());
+        REQUIRE(anchor.position.has_value());
+        CHECK((*anchor.position)[0] == 2 * (100 + 2 * *anchor.index));
+        CHECK((*anchor.position)[1] == 256);
+    }
+    CHECK(linkTracksToPatches(db, packed, patches, ct, p).edgesSkippedExisting == 3);
+    // Failed normals and cancellation preserve pending links.
+    const auto flat = writeCt(tmp.dir / "flat", false);
+    CHECK_FALSE(linkTracksToPatches(db, packed, patches, flat, p).problems.empty());
+    CHECK(fiberEdges(db, track).size() == 3);
+    std::atomic_bool cancel{true};
+    CHECK_FALSE(linkTracksToPatches(db, packed, patches, ct, p, &cancel).problems.empty());
+    CHECK(fiberEdges(db, track).size() == 3);
+    auto edges = fiberEdges(db, track);
+    { auto write = db.write(); db.setApproval(write, edges[0].uuid, "approved"); write.commit(); }
+    p.anchorContact = 1000;
+    CHECK(linkTracksToPatches(db, packed, patches, ct, p).staleRemoved == 2);
+    CHECK(fiberEdges(db, track).size() == 1);
+    CHECK(fiberEdges(db, fiber).size() == 3); // independent detector scope
+    { auto read = db.read(); CHECK(db.objectsByKind(read, "track").size() == 1); }
+    // The patch linker also populates length without a prior crossing run.
+    OpenOptions freshOptions;
+    freshOptions.author = "test";
+    auto fresh = GraphDb::create(tmp.dir / "fresh.vcgr", freshOptions);
+    REQUIRE(linkTracksToPatches(fresh, packed, patches, ct, p).problems.empty());
+    { auto read = fresh.read(); const auto object = fresh.objectsByKind(read, "track").at(0);
+      CHECK(object.track->length == 480); CHECK(object.track->family == "horizontal"); }
+}
+
+TEST_CASE("fiber-patch anchors use interior line points and exclude extensions past controls")
+{
+    TempDir tmp("fiber_line_anchors");
+    auto db = makeDb(tmp.dir);
+    const auto fibers = tmp.dir / "fibers", patches = tmp.dir / "patches";
+    const auto fiber = writeFiber(fibers);
+    nlohmann::json root;
+    { std::ifstream input(fibers / "fiber.json"); input >> root; }
+    // Reverse endpoint control order to exercise an arclength interval,
+    // not a monotonic XYZ assumption. There are no controls inside the patch.
+    root["control_points"] = {{300,128,128}, {140,128,128}};
+    std::ofstream(fibers / "fiber.json") << root.dump();
+    const auto inside = planePatch(patches / "inside", 160, 100);
+    planePatch(patches / "before", 100, 30);
+    planePatch(patches / "after", 310, 30);
+    const auto ct = writeCt(tmp.dir / "ct");
+    FiberPatchParams params;
+    params.anchorContact = 20;
+    const auto result = linkTestFiberPatches(db, fibers, patches, ct, params);
+    CHECK(result.problems.empty());
+    REQUIRE(result.edgesCreated == 1);
+    const auto edge = fiberEdges(db, fiber).at(0);
+    CHECK((edge.aUuid == inside || edge.bUuid == inside));
+    const auto& anchor = edge.aUuid == fiber ? edge.aAnchor : edge.bAnchor;
+    CHECK(anchor.index == 55);
+    REQUIRE(anchor.position.has_value());
+    CHECK(*anchor.position == std::array<double,3>{210,128,128});
+    CHECK(nlohmann::json::parse(edge.meta)["anchor_index_space"] == "line_points");
+    { auto read = db.read(); CHECK(db.objectByUuid(read, fiber)->fiber->length == 240); }
+}
+
+TEST_CASE("pending anchors are refreshed when their index convention changes")
+{
+    TempDir tmp("anchor_index_space");
+    auto db = makeDb(tmp.dir);
+    const auto a = addObject(db, "fiber"), b = addObject(db, "patch");
+    auto legacy = cand(a,b);
+    legacy.aAnchor.index = 1;
+    legacy.aAnchor.position = std::array<double,3>{100,0,0};
+    commitCandidates(db, kFiberPatchDetector, 2, {legacy});
+    auto current = legacy;
+    current.aAnchor.position = std::array<double,3>{10,0,0};
+    current.meta = R"({"anchor_index_space":"line_points"})";
+    const auto updated = commitCandidates(db, kFiberPatchDetector, 3, {current});
+    CHECK(updated.staleRemoved == 1);
+    CHECK(updated.edgesCreated == 1);
+    CHECK(updated.edgesSkippedExisting == 0);
+    const auto edge = fiberEdges(db, a).at(0);
+    CHECK(nlohmann::json::parse(edge.meta)["anchor_index_space"] == "line_points");
 }

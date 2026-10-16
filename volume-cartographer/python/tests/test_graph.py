@@ -139,6 +139,48 @@ def test_track_list_registration(db, tmp_path: Path) -> None:
     assert db.objects_by_kind("track")[0]["uuid"] == first[0]["uuid"]
 
 
+@pytest.mark.parametrize("line, expected", [
+    ([[0, 0, 0], [0, 3, 4], [0, 3, 4], [12, 3, 4]], 17),
+    (None, 13), ([], 13), ([[3, 2, 1]], 0),
+])
+def test_fiber_import_lengths_and_legacy_backfill(db, tmp_path, line, expected):
+    import uuid
+    fibers = tmp_path / "fibers"
+    fibers.mkdir()
+    uid = str(uuid.uuid4())
+    root = {"uuid": uid, "control_points": [{"position": [0, 0, 0]}, {"position": [12, 3, 4]}],
+            "hv_classification": {"automatic_tag": "H", "manual_tag": "V"}}
+    if line is not None:
+        root["line_points"] = line
+    (fibers / "fiber.json").write_text(json.dumps(root))
+    report = db.import_fibers(str(fibers))
+    assert report["problems"] == [] and report["objects_imported"] == 1
+    obj = db.object(uid)
+    assert obj["fiber"]["length"] == expected
+    assert obj["fiber"]["family"] == "V" and obj["fiber"]["manual_family"]
+    # Keep the matching file checksum to exercise the old importer no-op path.
+    obj["fiber"]["length"] = 0
+    db.upsert_object(obj)
+    db.set_approval(uid, "approved")
+    before = db.object(uid)
+    assert db.import_fibers(str(fibers))["problems"] == []
+    assert db.object(uid) == dict(before, fiber=dict(before["fiber"], length=expected))
+    snapshot = db.export_json()
+    journal = db.journal_since(0)
+    assert db.import_fibers(str(fibers))["objects_imported"] == 0
+    assert db.export_json() == snapshot and db.journal_since(0) == journal
+
+
+def test_fiber_import_rejects_invalid_dense_geometry(db, tmp_path):
+    import uuid
+    fibers = tmp_path / "fibers"
+    fibers.mkdir()
+    (fibers / "bad.json").write_text(json.dumps({"uuid": str(uuid.uuid4()),
+        "line_points": [[0, 0, 0], [1, 2]], "control_points": [[0, 0, 0], [1, 0, 0]]}))
+    report = db.import_fibers(str(fibers))
+    assert report["problems"] and db.objects_by_kind("fiber") == []
+
+
 def _packed_tracks(path, tracks, families, source_ids):
     """Small VCTRK01 fixtures; no dependency on Spiral or a source DBM."""
     import struct
@@ -322,6 +364,9 @@ def test_dbm_entry_registers_and_computes_without_crossings_npz(db, tmp_path, wi
     assert {o["track"]["external_key"] for o in objects} == {"0", str(1 << 32)}
     assert all(o["track"]["dataset_ref"] == str(packed.resolve()) for o in objects)
     assert all(o["track"]["point_count"] == 31 for o in objects)
+    assert all(o["track"]["length"] == 30 for o in objects)
+    assert {o["track"]["external_key"]: o["track"]["family"] for o in objects} == {
+        "0": "horizontal", str(1 << 32): "vertical"}
     edge = db.edges_of(objects[0]["uuid"])[0]
     assert edge["a_anchor"]["position"] == edge["b_anchor"]["position"] == (15, 10, 7)
     before = db.export_json()
@@ -337,16 +382,47 @@ def test_dbm_entry_registers_and_computes_without_crossings_npz(db, tmp_path, wi
 
 def test_dbm_entry_subset_and_existing_relative_identity(db, tmp_path):
     path, packed = _dbm_track_fixture(tmp_path)
-    a = _register_tracks(db, packed.name, [0], ["horizontal"])[0]
+    a = _register_tracks(db, packed.name, [0], [""])[0]
+    db.set_approval(a, "approved")
+    before = db.object(a)
     first = db.link_tracks_to_tracks(str(path), source_ids=[0])
     assert first["problems"] == [] and first["candidates_found"] == 0
     assert len(db.objects_by_kind("track")) == 1
     assert db.object(a)["generation"] == 1
+    expected = dict(before, track=dict(before["track"], length=30.0, family="horizontal"))
+    assert db.object(a) == expected
     second = db.link_tracks_to_tracks(str(path))
     assert second["problems"] == [] and second["edges_created"] == 1
     assert len(db.objects_by_kind("track")) == 2
     assert db.object(a)["generation"] == 1
     assert all(o["track"]["dataset_ref"] == packed.name for o in db.objects_by_kind("track"))
+
+
+@pytest.mark.parametrize("registered", [False, True])
+def test_track_polyline_lengths_include_bends_repeats_and_degenerate_tracks(db, tmp_path, registered):
+    import numpy as np
+    packed = tmp_path / "lengths.vctracks"
+    # Length 5 + 0 + 12 = 17, although the endpoints are only 13 apart.
+    bent = np.array([[0, 0, 0], [0, 3, 4], [0, 3, 4], [12, 3, 4]])
+    diagonal = np.array([[0, 0, 0], [1, 1, 1]])
+    _packed_tracks(packed, [bent, diagonal, np.array([[3, 2, 1]]), np.empty((0, 3))],
+                   [0, 0, 0, -1], [10, 20, 30, 40])
+    if registered:
+        ids = _register_tracks(db, packed.name, [10, 20, 30, 40], [""] * 4)
+        db.set_approval(ids[0], "approved")
+    report = db.link_tracks_to_tracks("" if registered else str(packed))
+    assert report["problems"] == []
+    objects = db.objects_by_kind("track")
+    lengths = {o["track"]["external_key"]: o["track"]["length"] for o in objects}
+    assert lengths == pytest.approx({"10": 17, "20": 3 ** 0.5, "30": 0, "40": 0})
+    assert {o["track"]["external_key"]: o["track"]["family"] for o in objects} == {
+        "10": "horizontal", "20": "horizontal", "30": "horizontal", "40": ""}
+    if registered:
+        assert db.object(ids[0])["approval_state"] == "approved"
+        assert db.object(ids[0])["generation"] == 1
+    before = db.export_json()
+    assert db.link_tracks_to_tracks(str(packed))["problems"] == []
+    assert db.export_json() == before
 
 
 def test_dbm_entry_validation_does_not_register_partial_inputs(db, tmp_path):
@@ -371,3 +447,19 @@ def test_dbm_entry_missing_geometry_is_explicit(db, tmp_path):
     report = db.link_tracks_to_tracks(str(tmp_path / "missing.dbm"))
     assert any("convert_track_store.py" in p for p in report["problems"])
     assert db.objects_by_kind("track") == []
+
+
+def test_track_patch_binding_validates_parameters_and_preserves_failed_inputs(db, tmp_path):
+    path, _ = _dbm_track_fixture(tmp_path)
+    patches = tmp_path / "patches"
+    patches.mkdir()
+    with pytest.raises((ValueError, RuntimeError)):
+        db.link_tracks_to_patches(str(path), str(patches), "missing-ct", track_scale=0)
+    with pytest.raises((ValueError, RuntimeError)):
+        db.link_tracks_to_patches(str(path), str(patches), "missing-ct", strip_weights=[1, 2])
+    with pytest.raises(RuntimeError, match="unknown parameter"):
+        db.link_tracks_to_patches(str(path), str(patches), "missing-ct", fiber_scale=1)
+    report = db.link_tracks_to_patches(str(path), str(patches), "missing-ct", source_ids=[0])
+    assert report["problems"]
+    assert db.objects_by_kind("track") == []
+    assert db.objects_by_kind("patch") == []

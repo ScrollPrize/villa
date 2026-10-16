@@ -46,6 +46,10 @@ void usage()
         << "  --overlap-agreement <0..1>        (default 0.6)\n"
         << "  --overlap-min-fraction <0..1>     (default 0 = off)\n"
         << "  --overlap-edge-kind <name>        (default same-surface)\n"
+        << "  --link-track-patches <dbm>      link tracks to --segments patches (same strip rules)\n"
+        << "  --track-scale <factor>          track XYZ -> working XYZ (default 1)\n"
+        << "  --strip-rows <n>                shared strip rows each side (default 1)\n"
+        << "  --anchor-contact <vx>           shared minimum anchor contact (default 75)\n"
         << "  --link-fiber-patches <dir>       link fibers in <dir> to --segments patches\n"
         << "  --ct <path>                     uint8 CT volume for linking (default normal source)\n"
         << "  --normals-manifest <path>        use Lasagna normals in the same linker instead of CT\n"
@@ -75,7 +79,8 @@ void printReport(const char* what, const ImportReport& report)
 int main(int argc, char** argv)
 try {
     fs::path dbPath, fiberDir, segmentsDir, tracksPath, overlapDir, importJsonPath, exportJsonPath;
-    fs::path linkFiberDir, ctVolume;
+    fs::path linkFiberDir, linkTrackPath, ctVolume;
+    vc::graph_links::TrackPatchParams trackPatchParams;
     vc::graph_links::FiberPatchParams fiberPatchParams;
     bool linkTracks = false;
     vc::graph_links::TrackTrackParams trackParams;
@@ -123,6 +128,8 @@ try {
         else if (arg == "--overlap-agreement") overlapParams.minAgreementRatio = std::stod(next(arg.c_str()));
         else if (arg == "--overlap-min-fraction") overlapParams.minOverlapFraction = std::stod(next(arg.c_str()));
         else if (arg == "--overlap-edge-kind") overlapParams.edgeKind = next(arg.c_str());
+        else if (arg == "--link-track-patches") linkTrackPath = next(arg.c_str());
+        else if (arg == "--track-scale") trackPatchParams.trackScale = std::stod(next(arg.c_str()));
         else if (arg == "--link-fiber-patches") linkFiberDir = next(arg.c_str());
         else if (arg == "--ct") ctVolume = next(arg.c_str());
         else if (arg == "--normals-manifest") fiberPatchParams.normalsManifest = next(arg.c_str());
@@ -131,8 +138,8 @@ try {
         else if (arg == "--fiber-scale") fiberPatchParams.fiberScale = std::stod(next(arg.c_str()));
         else if (arg == "--patch-scale") fiberPatchParams.patchScale = std::stod(next(arg.c_str()));
         else if (arg == "--working-to-base-scale") fiberPatchParams.workingToBaseScale = std::stod(next(arg.c_str()));
-        else if (arg == "--fiber-strip-rows") fiberPatchParams.stripRowsEachSide = std::stoi(next(arg.c_str()));
-        else if (arg == "--fiber-anchor-contact") fiberPatchParams.anchorContact = std::stod(next(arg.c_str()));
+        else if ((arg == "--fiber-strip-rows" || arg == "--strip-rows")) fiberPatchParams.stripRowsEachSide = std::stoi(next(arg.c_str()));
+        else if ((arg == "--fiber-anchor-contact" || arg == "--anchor-contact")) fiberPatchParams.anchorContact = std::stod(next(arg.c_str()));
         else if (arg == "--import-json") importJsonPath = next("--import-json");
         else if (arg == "--export-json") exportJsonPath = next("--export-json");
         else if (arg == "--help" || arg == "-h") {
@@ -147,8 +154,12 @@ try {
         return 2;
     }
 
-    if (!linkFiberDir.empty() && (segmentsDir.empty() || (ctVolume.empty() && fiberPatchParams.normalsManifest.empty())))
-        throw std::runtime_error("--link-fiber-patches requires --segments and either --ct or --normals-manifest");
+    if ((!linkFiberDir.empty() || !linkTrackPath.empty()) && (segmentsDir.empty() || (ctVolume.empty() && fiberPatchParams.normalsManifest.empty())))
+        throw std::runtime_error("patch linking requires --segments and either --ct or --normals-manifest");
+
+    static_cast<vc::graph_links::LinePatchParams&>(trackPatchParams) = fiberPatchParams;
+    trackPatchParams.sourceIds = trackParams.sourceIds;
+    trackPatchParams.trackUuids = trackParams.trackUuids;
 
     OpenOptions options;
     options.author = author;
@@ -164,7 +175,7 @@ try {
         w.commit();
         printReport("fibers", report);
     }
-    if (!segmentsDir.empty() && linkFiberDir.empty()) {
+    if (!segmentsDir.empty() && linkFiberDir.empty() && linkTrackPath.empty()) {
         auto w = db.write();
         ImportReport report = importPatches(db, w, segmentsDir);
         w.commit();
@@ -193,6 +204,16 @@ try {
                   << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
         for (const auto& problem : report.problems)
             std::cerr << "  ! " << problem << "\n";
+    }
+    if (!linkTrackPath.empty()) {
+        const auto report = vc::graph_links::linkTracksToPatches(
+            db, linkTrackPath, segmentsDir, ctVolume, trackPatchParams);
+        std::cout << "track-patches: " << report.objectsConsidered << " objects, "
+                  << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
+                  << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
+        for (const auto& problem : report.problems)
+            std::cerr << "  ! " << problem << "\n";
+        trackLinkFailed |= !report.problems.empty();
     }
     if (!linkFiberDir.empty()) {
         const auto report = vc::graph_links::linkFibersToPatches(

@@ -424,6 +424,21 @@ overlap. The strip has the centerline plus **one row on each side at 20 working
 voxels**. `--fiber-strip-rows` and `--fiber-anchor-contact` control its width and
 minimum anchor contact (default 75 working voxels).
 
+Fiber contacts and anchors can use every dense line point between the projected
+first and last control points, inclusive; extensions outside that span are
+excluded. Without controls, the full line is eligible. The saved anchor is the
+median contact's original `line_points` index and source XYZ position, without
+snapping to a control point. Edge metadata marks `anchor_index_space` as
+`line_points`. Reviewed legacy anchors are preserved; pending anchors with the
+old index convention are replaced on rerun.
+
+Both fiber import and fiber-to-patch linking populate `fiber.length` from the
+full dense polyline in source voxels, including extensions beyond the control
+points. The importer uses the control-point polyline when there are no dense
+points. Linking scales do not affect the stored length. Existing lengths are
+refreshed on processing, including re-imports of unchanged files, without
+resetting approvals or generations.
+
 Normals use the selected CT-only estimator: a 2/24 isotropic seed, followed by
 three 1/24/4 anisotropic tensor refinements with gradient magnitude weighting.
 Widths are selected CT voxels. The current sampler integrates on a global
@@ -452,7 +467,7 @@ disabled. Python accepts the equivalent `normals_manifest` keyword. This option
 allows measuring normal-source effects without changing strip width or gates.
 
 Edges record measurements, rounds, coordinate scales, the actual normal source,
-estimator ID, and detector version 2. Reruns preserve reviewed/manual edges; stale pending links
+estimator ID, and detector version 3. Reruns preserve reviewed/manual edges; stale pending links
 are removed only for successfully processed inputs. Failed inputs are excluded.
 
 C++ exposes `vc::graph_links::linkFibersToPatches`. Python exposes
@@ -553,6 +568,14 @@ For a small run, optionally select source IDs with repeated
 stable `source_ids.u64` values, not row numbers. Registration and edge updates
 commit together; failures leave neither partial registration nor partial edges.
 Reruns reuse existing UUIDs and preserve object approvals and generations.
+Both track linkers populate `track.length` with polyline arclength: the sum of
+Euclidean distances between consecutive raw points, in source dataset voxels.
+Repeated points contribute zero. Track-to-patch coordinate scaling does not
+change this stored length. Reruns refresh lengths for processed existing tracks
+without resetting their approvals or generations; unchanged lengths are a no-op.
+Track family is read from the packed family code: `horizontal`, `vertical`, or
+empty for unknown. Both linkers fill missing families on existing registrations;
+a conflicting nonempty family is reported as an input error.
 
 The advanced already-registered-track API is still available: omit the input
 path and optionally restrict `dataset_ref` / `track_uuids` in Python, or use a
@@ -602,3 +625,62 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PWD/build/python" \
 
 Use a Python interpreter matching the compiled bindings, with NumPy and pytest
 available; it must load `vc` from `build/python`, not an older installed build.
+
+### Track-to-patch graph links
+
+Track-to-patch linking shares the fiber-to-patch implementation: dense-point
+proximity, CT sheet-normal strips, long-contact anchors, strip agreement, and
+same-sheet growth all use the same rules and defaults.
+
+```sh
+build/bin/vc_graph_import --db graph.vcgr --author "$USER" \
+  --link-track-patches /path/to/tracks.dbm --segments /path/to/patches \
+  --ct /path/to/ct.zarr --track-scale 1 --patch-scale 1
+```
+
+The DBM resolves to its adjacent `.vctracks` geometry, with the same freshness
+checks and object identities as track-to-track linking. A packed directory is
+also accepted. No selected-tracks JSON or `crossings.npz` is needed. By default
+all input tracks are considered; use repeated `--track-source-id <id>` or
+`--track-uuid <uuid>` flags to restrict the run.
+
+`--track-scale` converts source track XYZ to working coordinates. Patch and CT
+scaling follow the fiber-to-patch rules above. For tracks, patches and CT all
+at quarter resolution, use `--track-scale 1 --patch-scale 1
+--working-to-base-scale 4 --ct-to-base-scale 4`. `--strip-rows` and
+`--anchor-contact` control the shared strip width and minimum contact length.
+CT normals are the default; `--normals-manifest` selects the same optional
+Lasagna comparison path.
+
+C++ exposes `vc::graph_links::linkTracksToPatches` and `TrackPatchParams`.
+Python exposes:
+
+```python
+with GraphDb.open("graph.vcgr", author="reviewer") as db:
+    report = db.link_tracks_to_patches(
+        "/path/to/tracks.dbm", "/path/to/patches", "/path/to/ct.zarr",
+        track_scale=1, patch_scale=1,
+        working_to_base_scale=4, ct_to_base_scale=4,
+        source_ids=[6317896897264, 6317896894401],
+    )
+    assert not report["problems"], report["problems"]
+```
+
+Python accepts all shared fiber-link keywords, with `track_scale` replacing
+`fiber_scale`, plus optional `source_ids` and `track_uuids` selections. Every raw
+track point is eligible. Anchors save the median contact's raw local index and
+source XYZ position, with `anchor_index_space: "line_points"`. Edge provenance
+records detector `track-patch` version 1, source identity, normal method, scales,
+and contact/strip/growth measurements.
+
+Registration and edges commit together. Reviewed/manual edges are preserved;
+stale pending links are removed only for successfully processed tracks and
+patches in the current selection. Unreadable geometry is reported and skipped,
+and its existing links remain. Cancellation commits no changes.
+
+Validation used four real tracks (977 points) and three real patches: three
+links matched equivalent fiber inputs exactly, including anchors and all
+contact/strip/growth measurements. Rerunning skipped all three existing links;
+the CLI produced the same result. No full-collection test was run. Synthetic
+regressions also cover coordinate scaling, growth, wrong-sheet rejection,
+fiber control-point bounds, identity reuse, and preservation of reviewed edges.

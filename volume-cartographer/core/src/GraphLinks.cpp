@@ -49,6 +49,12 @@ bool isDetectorsOwnEdge(const EdgeRecord& e, const std::string& detectorName)
     }
 }
 
+std::string anchorIndexSpace(const std::string& meta)
+{
+    try { return nlohmann::json::parse(meta).value("anchor_index_space", ""); }
+    catch (const std::exception&) { return {}; }
+}
+
 DetectorReport placeholder(graph::GraphDb& db, const char* detectorName,
                            const std::vector<std::string>& objectKinds, const std::atomic_bool* cancel)
 {
@@ -103,14 +109,24 @@ DetectorReport commitCandidates(graph::GraphDb& db, graph::WriteTxn& txn,
             existing[candidateKey(e)] = e;
 
     std::set<std::string> candidateKeys;
-    for (const auto& c : candidates) candidateKeys.insert(candidateKey(c));
+    std::unordered_map<std::string, std::string> candidateIndexSpaces;
+    for (const auto& c : candidates) {
+        const auto key = candidateKey(c);
+        candidateKeys.insert(key);
+        candidateIndexSpaces[key] = anchorIndexSpace(c.meta);
+    }
 
     if (replaceStalePending) {
         std::vector<std::string> staleKeys;
         for (const auto& [key, e] : existing) {
             if (staleScope && (!scopedKinds.contains(e.kind) || !scopedObjects.contains(e.aUuid) ||
                                !scopedObjects.contains(e.bUuid))) continue;
-            if (candidateKeys.contains(key)) continue;
+            if (candidateKeys.contains(key)) {
+                const auto& space = candidateIndexSpaces.at(key);
+                // A pending control-point anchor must not masquerade as a
+                // line-point anchor merely because their integer indices match.
+                if (space.empty() || space == anchorIndexSpace(e.meta)) continue;
+            }
             if (e.approvalState != "pending") continue;  // reviewed edges are never touched
             if (!isDetectorsOwnEdge(e, detectorName)) continue;
             staleKeys.push_back(key);
@@ -164,13 +180,6 @@ DetectorReport linkTracksToFibers(graph::GraphDb& db, const TrackFiberParams& /*
 {
     // TODO: external track geometry vs fiber lines (distance + coverage).
     return placeholder(db, kTrackFiberDetector, {"track", "fiber"}, cancel);
-}
-
-DetectorReport linkTracksToPatches(graph::GraphDb& db, const TrackPatchParams& /*params*/,
-                                   const std::atomic_bool* cancel)
-{
-    // TODO: external track geometry vs patch surfaces (distance + coverage).
-    return placeholder(db, kTrackPatchDetector, {"track", "patch"}, cancel);
 }
 
 }  // namespace vc::graph_links

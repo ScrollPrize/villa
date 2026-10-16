@@ -1,10 +1,12 @@
 #include "vc/core/graph/GraphDb.hpp"
+#include "GraphFiberInput.hpp"
 
 #include <sqlite3.h>
 
 #include <algorithm>
 #include <chrono>
 #include <climits>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -898,6 +900,47 @@ std::string GraphDb::upsertObject(WriteTxn& txn, const ObjectRecord& record)
     return upsertObjectImpl(GraphDbImplAccess::conn(txn), impl_->options.author, impl_->hostname, record, false);
 }
 
+namespace {
+void refreshLineMeasurements(sqlite3* db, const std::string& author, const std::string& host,
+    const std::string& table, const std::string& uuid, double length,
+    const std::optional<std::string>& family, const char* journalKind)
+{
+    if (!std::isfinite(length) || length < 0)
+        throw std::invalid_argument("graph db: line length must be finite and nonnegative");
+    const auto key = parseUuid(uuid);
+    Statement current(db, "SELECT o.id,o.generation,t.length,t.family FROM objects o JOIN " + table +
+        " t ON t.object_id=o.id WHERE o.uuid=?");
+    current.bindBlob(1, key);
+    if (!current.row()) throw std::runtime_error("graph db: " + table + " record not found: " + uuid);
+    const auto previousFamily = current.text(3);
+    if (family && !previousFamily.empty() && previousFamily != *family)
+        throw std::runtime_error("graph db: registered family differs from source: " + uuid);
+    const auto newFamily = family.value_or(previousFamily);
+    if (current.f64(2) == length && previousFamily == newFamily) return;
+    Statement update(db, "UPDATE " + table + " SET length=?,family=? WHERE object_id=?");
+    update.bind(1, length);
+    update.bind(2, newFamily);
+    update.bind(3, current.i64(0));
+    update.stepDone();
+    appendJournal(db, author, host, key, current.i64(1), journalKind);
+}
+} // namespace
+
+void GraphDb::setTrackLength(WriteTxn& txn, const std::string& uuid, double length,
+    const std::optional<std::string>& family)
+{
+    if (family && *family != "" && *family != "horizontal" && *family != "vertical")
+        throw std::invalid_argument("graph db: invalid packed track family");
+    refreshLineMeasurements(GraphDbImplAccess::conn(txn), impl_->options.author, impl_->hostname,
+        "tracks", uuid, length, family, family ? "track_measurements" : "track_length");
+}
+
+void GraphDb::setFiberLength(WriteTxn& txn, const std::string& uuid, double length)
+{
+    refreshLineMeasurements(GraphDbImplAccess::conn(txn), impl_->options.author, impl_->hostname,
+        "fibers", uuid, length, std::nullopt, "fiber_length");
+}
+
 std::optional<ObjectRecord> GraphDb::objectByUuid(const Txn& txn, const std::string& uuid) const
 {
     sqlite3* db = GraphDbImplAccess::conn(txn);
@@ -1526,6 +1569,14 @@ ImportReport importFibers(GraphDb& db, WriteTxn& txn, const std::filesystem::pat
             for (const auto& t : root.at("tags"))
                 if (t.is_string()) o.tags.push_back(t.get<std::string>());
         FiberDetail f;
+        try {
+            auto points = detail::fiberPoints(root, "line_points");
+            if (points.empty()) points = detail::fiberPoints(root, "control_points");
+            f.length = detail::fiberPolylineLength(points);
+        } catch (const std::exception& error) {
+            report.problems.push_back(p.fileName + ": invalid fiber geometry: " + error.what());
+            continue;
+        }
         if (root.contains("control_points") && root.at("control_points").is_array())
             f.controlPointCount = int64_t(root.at("control_points").size());
         if (root.contains("line_points") && root.at("line_points").is_array())
@@ -1564,8 +1615,10 @@ ImportReport importFibers(GraphDb& db, WriteTxn& txn, const std::filesystem::pat
     // files (same uuid + content hash) are skipped: re-import is a no-op.
     for (const auto& p : parsed) {
         if (auto existing = db.objectByUuid(txn, p.object.uuid)) {
-            if (existing->dataChecksum && *existing->dataChecksum == p.checksum)
+            if (existing->dataChecksum && *existing->dataChecksum == p.checksum) {
+                db.setFiberLength(txn, p.object.uuid, p.object.fiber->length);
                 continue;
+            }
         }
         db.upsertObject(txn, p.object);
         ++report.objectsImported;

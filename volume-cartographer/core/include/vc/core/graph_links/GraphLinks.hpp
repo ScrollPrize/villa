@@ -74,6 +74,8 @@ struct StaleEdgeScope {
 //   edges are never touched.
 // - with staleScope, stale removal uses its explicit kinds and requires
 //   both endpoints in its object set, including for an empty batch.
+// - a candidate with a changed nonempty meta.anchor_index_space replaces
+//   this detector's matching pending edge when stale replacement is enabled.
 DetectorReport commitCandidates(graph::GraphDb& db, const std::string& detectorName, int detectorVersion,
                                 const std::vector<LinkCandidate>& candidates,
                                 bool replaceStalePending = true,
@@ -88,7 +90,7 @@ DetectorReport commitCandidates(graph::GraphDb& db, graph::WriteTxn& txn,
                                 const StaleEdgeScope* staleScope = nullptr);
 
 // --- Detectors ---
-// Patch overlap, fiber->patch and track->track are implemented; the rest are placeholders that
+// Patch overlap, fiber->patch, track->track and track->patch are implemented; the rest are placeholders that
 // count the objects they would consider, write nothing, and report
 // "not implemented". Signatures and parameter structs are final
 // shapes so callers can be wired now.
@@ -140,18 +142,17 @@ DetectorReport linkPatchOverlaps(graph::GraphDb& db, const std::filesystem::path
                                  const PatchOverlapParams& params = {},
                                  const std::atomic_bool* cancel = nullptr);
 
-// Parameters for the fiber->patch auto-linker, ported from
+// Shared parameters for fiber/track->patch auto-linking, ported from
 // vc::constraints::AutoLink. The historical review results apply to
 // the original ribbon, not this reduced-width variant. Distances are in
 // volume voxels. The strip is deliberately reduced relative to the
 // original 7-row ribbon: stripRowsEachSide rows at stripSpacing on
 // each side of the centerline (default: one row at 20 vx each side).
-struct FiberPatchParams {
+struct LinePatchParams {
     // Isotropic coordinate multipliers: source XYZ * scale = working XYZ.
     // All detector distances are working voxels. Working XYZ multiplied by
     // workingToBaseScale / ctToBaseScale addresses selected CT voxels.
     // ctToBaseScale includes the selected level; no extra pyramid scaling.
-    double fiberScale = 1.0;
     double patchScale = 1.0;
     double workingToBaseScale = 1.0;
     double ctToBaseScale = 1.0;
@@ -159,10 +160,10 @@ struct FiberPatchParams {
     // Optional Lasagna reference source for an otherwise identical strip/link
     // pipeline. Empty selects CT. Lasagna coordinates use workingToBaseScale.
     std::string normalsManifest;
-    // Discovery: fiber dense-line point -> patch surface distance.
+    // Discovery: dense line point -> patch surface distance.
     double proximity = 1.5;
     std::size_t minContacts = 2;
-    // Fiber strip (normal-field ribbon around the fiber).
+    // Normal-field ribbon around the line.
     double stripSpacing = 20.0;   // column spacing and row spacing (vx)
     int stripRowsEachSide = 1;    // 1 = centerline +/- one row (3 rows total)
     double stripMarchStep = 5.0;  // marching step across the sheet (vx)
@@ -182,6 +183,11 @@ struct FiberPatchParams {
     std::string edgeKind = "same-surface";
     bool replaceStalePending = true;
 };
+// The shared rules apply to both fiber and track centerlines.
+struct FiberPatchParams : LinePatchParams {
+    double fiberScale = 1.0;
+};
+
 // Fiber -> patch auto-linking, a port of vc::constraints::autoLinkFiber
 // (removed constraint-graph workspace; see ConstraintGraph.md in git
 // history). Loads vc3d_fiber JSON files from fibersDir and tifxyz
@@ -191,10 +197,13 @@ struct FiberPatchParams {
 // CT intensities at ctVolume, links long-contact patches
 // that agree with the strip as anchors, then grows the linked set by
 // same-sheet overlap until stable. Linked pairs become pending edges
-// (fiber anchor at the control point nearest the median contact) with
+// (fiber anchor at the median contact line point) with
 // the linker measurements as provenance. Source geometry is scaled only
 // in memory; anchor positions and registered object geometry remain in
-// source coordinates. Provenance records the coordinate multipliers.
+// source coordinates. Only line points between the projected first and last
+// control points participate; without controls the full line is eligible.
+// Anchor indices address the original line_points array. Provenance records
+// the coordinate multipliers.
 // Cancellation returns a problem without committing edges. Failed fibers
 // and unreadable patches are excluded from stale-edge removal, as are
 // objects outside these input directories.
@@ -253,14 +262,19 @@ struct TrackTrackParams {
 DetectorReport linkTracksToTracks(graph::GraphDb& db, const TrackTrackParams& params = {},
                                   const std::atomic_bool* cancel = nullptr);
 
-struct TrackPatchParams {
-    double maxDistanceVoxels = 3.0;
-    double minCoverageFraction = 0.5;
-    std::string edgeKind = "same-surface";
-    bool replaceStalePending = true;
+struct TrackPatchParams : LinePatchParams {
+    double trackScale = 1.0; // source track XYZ -> working XYZ
+    std::vector<uint64_t> sourceIds; // optional subset of a packed dataset
+    std::vector<std::string> trackUuids; // optional existing graph-object subset
 };
-// Track -> patch: the track lies on the patch's surface.
-DetectorReport linkTracksToPatches(graph::GraphDb& db, const TrackPatchParams& params = {},
+// Uses the same discovery, CT strip, contact gates and growth as fiber->patch.
+// Accepts a DBM or packed .vctracks directory and registers tracks automatically.
+// Track anchors use raw point indices (median contact), with source XYZ positions.
+// Failed inputs are excluded from stale removal; registration/edges commit together.
+DetectorReport linkTracksToPatches(graph::GraphDb& db, const std::filesystem::path& tracksPath,
+                                   const std::filesystem::path& patchesDir,
+                                   const std::filesystem::path& ctVolume,
+                                   const TrackPatchParams& params = {},
                                    const std::atomic_bool* cancel = nullptr);
 
 }  // namespace vc::graph_links

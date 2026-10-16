@@ -369,6 +369,42 @@ struct PyWriteTxn {
     }
 };
 
+bool setLinePatchParameter(vc::graph_links::LinePatchParams& p, const std::string& key, nb::handle val)
+{
+    if (key == "patch_scale") p.patchScale = nb::cast<double>(val);
+    else if (key == "normals_manifest") p.normalsManifest = nb::cast<std::string>(val);
+    else if (key == "ct_level") p.ctLevel = nb::cast<int>(val);
+    else if (key == "ct_to_base_scale") p.ctToBaseScale = nb::cast<double>(val);
+    else if (key == "working_to_base_scale") p.workingToBaseScale = nb::cast<double>(val);
+    else if (key == "proximity") p.proximity = nb::cast<double>(val);
+    else if (key == "min_contacts") p.minContacts = nb::cast<std::size_t>(val);
+    else if (key == "strip_spacing") p.stripSpacing = nb::cast<double>(val);
+    else if (key == "strip_rows_each_side") p.stripRowsEachSide = nb::cast<int>(val);
+    else if (key == "strip_march_step") p.stripMarchStep = nb::cast<double>(val);
+    else if (key == "contact_gap") p.contactGap = nb::cast<double>(val);
+    else if (key == "anchor_contact") p.anchorContact = nb::cast<double>(val);
+    else if (key == "same_sheet") p.sameSheet = nb::cast<double>(val);
+    else if (key == "adjacent_low") p.adjacentLow = nb::cast<double>(val);
+    else if (key == "adjacent_high") p.adjacentHigh = nb::cast<double>(val);
+    else if (key == "same_normal") p.sameNormal = nb::cast<double>(val);
+    else if (key == "adjacent_normal") p.adjacentNormal = nb::cast<double>(val);
+    else if (key == "grow_same") p.growSame = nb::cast<double>(val);
+    else if (key == "grow_ratio") p.growRatio = nb::cast<double>(val);
+    else if (key == "strip_gate_ratio") p.stripGateRatio = nb::cast<double>(val);
+    else if (key == "strip_gate_margin") p.stripGateMargin = nb::cast<double>(val);
+    else if (key == "strip_margin") p.stripMargin = nb::cast<double>(val);
+    else if (key == "max_rounds") p.maxRounds = nb::cast<int>(val);
+    else if (key == "edge_kind") p.edgeKind = nb::cast<std::string>(val);
+    else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(val);
+    else if (key == "strip_weights") {
+        const auto weights = nb::cast<std::vector<double>>(val);
+        if (weights.size() != p.stripWeights.size())
+            throw std::runtime_error("strip_weights requires four values");
+        std::copy(weights.begin(), weights.end(), p.stripWeights.begin());
+    } else return false;
+    return true;
+}
+
 }  // namespace
 
 NB_MODULE(graph, m)
@@ -649,6 +685,32 @@ NB_MODULE(graph, m)
             "source_ids optionally selects a subset. Omit the path to link registered tracks. "
             "Anchors are raw point indices and XYZ positions in dataset voxels.")
         .def(
+            "link_tracks_to_patches",
+            [](PyGraphDb& self, const std::string& tracksPath, const std::string& patchesDir,
+               const std::string& ctVolume, const nb::kwargs& kwargs) {
+                vc::graph_links::TrackPatchParams p;
+                for (auto item : kwargs) {
+                    const auto key = nb::cast<std::string>(item.first);
+                    const nb::handle val = item.second;
+                    if (key == "track_scale") p.trackScale = nb::cast<double>(val);
+                    else if (key == "source_ids") p.sourceIds = nb::cast<std::vector<uint64_t>>(val);
+                    else if (key == "track_uuids") p.trackUuids = nb::cast<std::vector<std::string>>(val);
+                    else if (!setLinePatchParameter(p, key, val))
+                        throw std::runtime_error("link_tracks_to_patches: unknown parameter '" + key + "'");
+                }
+                vc::graph_links::DetectorReport report;
+                auto& db = self.require();
+                {
+                    nb::gil_scoped_release release;
+                    report = vc::graph_links::linkTracksToPatches(db, tracksPath, patchesDir, ctVolume, p);
+                }
+                return detectorReportToPy(report);
+            },
+            nb::arg("tracks_dbm"), nb::arg("patches_dir"), nb::arg("ct_volume"), nb::arg("kwargs"),
+            "Link DBM/packed tracks to tifxyz patches using the shared fiber/track strip rules. "
+            "CT supplies normals by default; source_ids optionally limits the tracks. "
+            "Anchors use raw point indices and source XYZ coordinates.")
+        .def(
             "link_fibers_to_patches",
             [](PyGraphDb& self, const std::string& fibersDir, const std::string& patchesDir,
                const std::string& ctVolume, const nb::kwargs& kwargs) {
@@ -657,37 +719,8 @@ NB_MODULE(graph, m)
                     const std::string key = nb::cast<std::string>(item.first);
                     const nb::handle val = item.second;
                     if (key == "fiber_scale") p.fiberScale = nb::cast<double>(val);
-                    else if (key == "patch_scale") p.patchScale = nb::cast<double>(val);
-                    else if (key == "normals_manifest") p.normalsManifest = nb::cast<std::string>(val);
-                    else if (key == "ct_level") p.ctLevel = nb::cast<int>(val);
-                    else if (key == "ct_to_base_scale") p.ctToBaseScale = nb::cast<double>(val);
-                    else if (key == "working_to_base_scale") p.workingToBaseScale = nb::cast<double>(val);
-                    else if (key == "proximity") p.proximity = nb::cast<double>(val);
-                    else if (key == "min_contacts") p.minContacts = nb::cast<std::size_t>(val);
-                    else if (key == "strip_spacing") p.stripSpacing = nb::cast<double>(val);
-                    else if (key == "strip_rows_each_side") p.stripRowsEachSide = nb::cast<int>(val);
-                    else if (key == "strip_march_step") p.stripMarchStep = nb::cast<double>(val);
-                    else if (key == "contact_gap") p.contactGap = nb::cast<double>(val);
-                    else if (key == "anchor_contact") p.anchorContact = nb::cast<double>(val);
-                    else if (key == "same_sheet") p.sameSheet = nb::cast<double>(val);
-                    else if (key == "adjacent_low") p.adjacentLow = nb::cast<double>(val);
-                    else if (key == "adjacent_high") p.adjacentHigh = nb::cast<double>(val);
-                    else if (key == "same_normal") p.sameNormal = nb::cast<double>(val);
-                    else if (key == "adjacent_normal") p.adjacentNormal = nb::cast<double>(val);
-                    else if (key == "grow_same") p.growSame = nb::cast<double>(val);
-                    else if (key == "grow_ratio") p.growRatio = nb::cast<double>(val);
-                    else if (key == "strip_gate_ratio") p.stripGateRatio = nb::cast<double>(val);
-                    else if (key == "strip_gate_margin") p.stripGateMargin = nb::cast<double>(val);
-                    else if (key == "strip_margin") p.stripMargin = nb::cast<double>(val);
-                    else if (key == "max_rounds") p.maxRounds = nb::cast<int>(val);
-                    else if (key == "edge_kind") p.edgeKind = nb::cast<std::string>(val);
-                    else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(val);
-                    else if (key == "strip_weights") {
-                        const auto weights = nb::cast<std::vector<double>>(val);
-                        if (weights.size() != p.stripWeights.size())
-                            throw std::runtime_error("strip_weights requires four values");
-                        std::copy(weights.begin(), weights.end(), p.stripWeights.begin());
-                    } else throw std::runtime_error("link_fibers_to_patches: unknown parameter '" + key + "'");
+                    else if (!setLinePatchParameter(p, key, val))
+                        throw std::runtime_error("link_fibers_to_patches: unknown parameter '" + key + "'");
                 }
                 return detectorReportToPy(vc::graph_links::linkFibersToPatches(
                     self.require(), fibersDir, patchesDir, ctVolume, p));

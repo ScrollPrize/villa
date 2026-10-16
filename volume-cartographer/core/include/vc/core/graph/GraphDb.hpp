@@ -23,7 +23,7 @@ struct FiberDetail {
     bool manualFamily = false;
     int64_t controlPointCount = 0;
     int64_t linePointCount = 0;
-    double length = 0.0;
+    double length = 0.0;       // full polyline arclength in source voxels
     double width = 0.0;
     double widthGapFraction = 0.2;
     std::string optimizationMode;
@@ -42,7 +42,7 @@ struct TrackDetail {
     std::string externalKey;   // key within the external dataset
     std::string family;
     int64_t pointCount = 0;
-    double length = 0.0;
+    double length = 0.0;       // polyline arclength in source dataset voxels
     std::optional<std::array<double, 6>> bbox;
 };
 
@@ -162,6 +162,12 @@ public:
     // empty) or updates by UUID; updates bump generation, restamp
     // changed_*, reset approval, and journal. Returns the UUID.
     std::string upsertObject(WriteTxn& txn, const ObjectRecord& record);
+    // Refresh derived geometry metadata without changing the track's geometry,
+    // generation, or approval. Journals a changed value; identical values are a no-op.
+    // An optional packed-store family fills an unset family; conflicts fail.
+    void setTrackLength(WriteTxn& txn, const std::string& uuid, double length,
+                        const std::optional<std::string>& family = std::nullopt);
+    void setFiberLength(WriteTxn& txn, const std::string& uuid, double length);
     std::optional<ObjectRecord> objectByUuid(const Txn& txn, const std::string& uuid) const;
     std::vector<ObjectRecord> objectsByKind(const Txn& txn, const std::string& kind,
                                             const std::optional<std::string>& approvalState = std::nullopt) const;

@@ -6,6 +6,7 @@
 #include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <set>
 #include <string>
 #include <thread>
@@ -118,6 +119,37 @@ TEST_CASE("create, open, and validation")
         CHECK(rodb.objectsByKind(r, "patch").size() == 2);
         CHECK_THROWS(rodb.write());
     }
+}
+
+TEST_CASE("derived track length preserves review, journals changes and rolls back")
+{
+    TempDir tmp("track_length");
+    auto db = GraphDb::create(tmp.dir / "graph.vcgr", testOptions());
+    auto object = makeObject("track");
+    object.track = TrackDetail{"dataset", "1"};
+    std::string uuid;
+    { auto write = db.write(); uuid = db.upsertObject(write, object);
+      db.setApproval(write, uuid, "approved"); write.commit(); }
+    const auto before = getObject(db, uuid);
+    { auto write = db.write(); db.setTrackLength(write, uuid, 17); write.commit(); }
+    const auto after = getObject(db, uuid);
+    CHECK(after.track->length == 17);
+    CHECK(after.generation == before.generation);
+    CHECK(after.changedAt == before.changedAt);
+    CHECK(after.approvedBy == before.approvedBy);
+    CHECK(after.approvedGeneration == before.approvedGeneration);
+    CHECK(after.approvalState == "approved");
+    int64_t seq;
+    { auto read = db.read(); const auto journal = db.journalSince(read, 0);
+      CHECK(journal.back().changeKind == "track_length"); seq = journal.back().seq; }
+    { auto write = db.write(); db.setTrackLength(write, uuid, 17); write.commit(); }
+    { auto write = db.write(); db.setTrackLength(write, uuid, 19); } // rollback
+    { auto read = db.read(); CHECK(db.journalSince(read, seq).empty()); }
+    CHECK(getObject(db, uuid).track->length == 17);
+    { auto write = db.write();
+      CHECK_THROWS(db.setTrackLength(write, uuid, -1));
+      CHECK_THROWS(db.setTrackLength(write, uuid, std::numeric_limits<double>::infinity()));
+      CHECK_THROWS(db.setTrackLength(write, uuid, std::numeric_limits<double>::quiet_NaN())); }
 }
 
 TEST_CASE("object CRUD stamps, generation, journal, kinds as data")
