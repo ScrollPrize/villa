@@ -10,10 +10,57 @@ const BeforeAfter = ({
   beforeLabel,
   afterLabel,
   heightClass = "h-80",
+  hint = false,
 }) => {
   const [sliderPosition, setSliderPosition] = useState(50);
   const containerRef = useRef(null);
   const [isDragging, setIsDragging] = useState(false);
+  const hintFrame = useRef(null);
+  const touched = useRef(false);
+
+  // Optional one-shot "waggle" the first time the slider scrolls into view,
+  // so it reads as draggable. Skipped under prefers-reduced-motion and
+  // abandoned as soon as the visitor grabs the handle.
+  useEffect(() => {
+    if (!hint || typeof window === "undefined") return undefined;
+    if (typeof IntersectionObserver === "undefined") return undefined;
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches)
+      return undefined;
+    const stops = [50, 30, 70, 50];
+    const legMs = 550;
+    const ease = (t) => (t < 0.5 ? 2 * t * t : 1 - 2 * (1 - t) * (1 - t));
+    const run = () => {
+      const start = performance.now();
+      const step = (now) => {
+        if (touched.current) return;
+        const t = (now - start) / legMs;
+        const leg = Math.floor(t);
+        if (leg >= stops.length - 1) {
+          setSliderPosition(50);
+          return;
+        }
+        const a = stops[leg];
+        const b = stops[leg + 1];
+        setSliderPosition(a + (b - a) * ease(t - leg));
+        hintFrame.current = requestAnimationFrame(step);
+      };
+      hintFrame.current = requestAnimationFrame(step);
+    };
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          observer.disconnect();
+          setTimeout(run, 300);
+        }
+      },
+      { threshold: 0.6 }
+    );
+    observer.observe(containerRef.current);
+    return () => {
+      observer.disconnect();
+      cancelAnimationFrame(hintFrame.current);
+    };
+  }, [hint]);
 
   const handleDrag = (event) => {
     if (!isDragging) return;
@@ -25,6 +72,8 @@ const BeforeAfter = ({
   };
 
   const handleMouseDown = () => {
+    touched.current = true;
+    cancelAnimationFrame(hintFrame.current);
     setIsDragging(true);
   };
 

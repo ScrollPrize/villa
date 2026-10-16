@@ -30,6 +30,21 @@ AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -c
 
 See [NVIDIA's DGX Spark memory guidance](https://docs.nvidia.com/dgx/dgx-spark/known-issues.html).
 
+## Running without CUDA
+
+Fits run on CUDA whenever it is available. Without it they run on Apple's MPS
+backend, and without that on the CPU; `FIT_SPIRAL_DEVICE=cuda|mps|cpu` (or `cuda:1`)
+picks one explicitly (`devices.py`). A distributed (torchrun) fit needs CUDA or
+the CPU: torch.distributed has no MPS backend. The Triton kernels are CUDA only, so MPS and the
+CPU use the PyTorch paths, and the CUDA startup check is skipped.
+
+MPS has no float64. Device tensors that are float64 on CUDA take their dtype
+from `devices.float_hi()`, which is float32 on MPS;
+`FIT_SPIRAL_MAX_PRECISION_FLOAT=32` applies the same cap on every device, for
+comparing a CPU run with an MPS one. `get_ink_metrics.py --device` picks the
+nnU-Net device; without it the folds take CUDA, else MPS, else the CPU, whatever
+the fitting variables say.
+
 ## Editing input snapshots
 
 The service snapshots patch directories, fiber JSON files and point collections
@@ -204,6 +219,24 @@ looks for `umbilicus.json` in the checkpoint's ancestors, in
 layouts, pass `--umbilicus /path/to/umbilicus.json`. Use `--lasagna-dir` if
 the Lasagna repository is not in its standard sibling or `~/villa` location.
 An existing output path is never overwritten.
+
+## Hover descriptions (descriptions.json)
+
+The text VC3D shows when hovering a Spiral tab control or a setting in the
+Spiral Configuration window lives in `descriptions.json`, not in code:
+
+- `config` is keyed by configuration key. The service attaches each entry to
+  the `/configuration` catalog as the field's `description`, re-reading the
+  file per request, so an edit shows after VC3D reconnects. A new
+  configuration key needs an entry here; `tests/test_config.py` fails on a
+  missing or stale key.
+- `panel` is keyed by the control ids registered with `describe(...)` in
+  VC3D's `SpiralPanel.cpp`. VC3D reads this section from the copy beside the
+  `spiral_service.py` it would launch (the same lookup, including
+  `SPIRAL_SERVICE_PATH`) and reloads it as soon as the file changes. A panel id
+  without an entry falls back to the `config` entry of the same name.
+
+Plain text only; a newline starts a new line in the tooltip.
 
 ## Flow stages
 

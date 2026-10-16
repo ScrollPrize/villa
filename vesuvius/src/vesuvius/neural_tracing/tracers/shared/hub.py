@@ -21,11 +21,12 @@ def hf_repo(checkpoint):
     return match[1], match[2]
 
 
-def hub_folder(repo) -> Path:
-    """The local snapshot folder of ``repo`` (``hf_repo``'s (repo id, revision)) with its ``.pt`` files."""
+def hub_folder(repo, patterns=('*.pt',)) -> Path:
+    """The local snapshot folder of ``repo`` (``hf_repo``'s (repo id, revision)) with its files matching ``patterns``
+    (default: its ``.pt`` files)."""
     from huggingface_hub import snapshot_download
     repo_id, revision = repo
-    return Path(snapshot_download(repo_id, revision=revision, allow_patterns=['*.pt']))
+    return Path(snapshot_download(repo_id, revision=revision, allow_patterns=list(patterns)))
 
 
 def checkpoint_source(checkpoint, path):

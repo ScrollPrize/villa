@@ -16,9 +16,12 @@ environment read at the point of use.
 import dataclasses
 import datetime
 import os
+import time
 
 import torch
 import torch.distributed as dist
+
+from devices import fit_device
 
 
 # Bounded process-group timeout for collectives. The first collective
@@ -141,11 +144,20 @@ def maybe_init_distributed(context=None, *, rendezvous=None,
     """
     if context is None:
         context = DistributedContext.from_env()
+    if context.is_distributed and fit_device().type == 'mps':
+        # Fail here, not at the first gradient all_reduce after the inputs
+        # load: torch.distributed has no MPS backend, and gloo raises
+        # NotImplementedError for MPS tensors.
+        raise RuntimeError(
+            'a distributed fit cannot run on MPS: torch.distributed has no MPS '
+            'backend. Run one process, or set FIT_SPIRAL_DEVICE=cpu.')
     set_process_context(context)
     if not context.is_distributed:
         return context
     if backend is None:
-        backend = 'nccl' if torch.cuda.is_available() else 'gloo'
+        # The fit device, not CUDA's presence: FIT_SPIRAL_DEVICE=cpu on a CUDA
+        # machine keeps every tensor on the CPU, which NCCL cannot reduce.
+        backend = 'nccl' if fit_device().type == 'cuda' else 'gloo'
     if backend == 'nccl':
         torch.cuda.set_device(context.local_rank)
     if timeout_minutes is None:
@@ -209,34 +221,59 @@ def split_counts_across_ranks(config, count_keys,
     return world_size
 
 
+class _WallClockEvent:
+    # Off CUDA: the wall clock once the device queue has drained. MPS events
+    # refuse an interval with nothing queued in it, such as 'comm' in a
+    # single-process fit.
+    def __init__(self, device_type):
+        self.device_type = device_type
+
+    def record(self):
+        if self.device_type == 'mps':
+            torch.mps.synchronize()
+        self.seconds = time.perf_counter()
+
+    def elapsed_time(self, end):
+        return (end.seconds - self.seconds) * 1e3
+
+
 class StepTimer:
-    # Opt-in CUDA timing for distributed runs: FIT_SPIRAL_PROFILE_STEPS=1.
-    def __init__(self, enabled, report, window=200):
+    # Opt-in step timing: FIT_SPIRAL_PROFILE_STEPS=1. CUDA events on CUDA, as
+    # before; the wall clock elsewhere.
+    def __init__(self, enabled, report, window=200, device=None):
         self.enabled = enabled
         self.report = report
         self.window = window
+        self.device_type = fit_device(device).type if enabled else None
         self.totals = {}
         self.count = 0
         self._events = {}
 
+    def _event(self):
+        if self.device_type == 'cuda':
+            event = torch.cuda.Event(enable_timing=True)
+        else:
+            event = _WallClockEvent(self.device_type)
+        event.record()
+        return event
+
     def start(self, name):
         if not self.enabled:
             return
-        event = torch.cuda.Event(enable_timing=True)
-        event.record()
+        event = self._event()
         self._events.setdefault(name, []).append([event, None])
 
     def stop(self, name):
         if not self.enabled:
             return
-        event = torch.cuda.Event(enable_timing=True)
-        event.record()
+        event = self._event()
         self._events[name][-1][1] = event
 
     def tick(self):
         if not self.enabled:
             return
-        torch.cuda.synchronize()
+        if self.device_type == 'cuda':
+            torch.cuda.synchronize()
         for name, intervals in self._events.items():
             elapsed = sum(start.elapsed_time(stop) for start, stop in intervals)
             self.totals[name] = self.totals.get(name, 0.0) + elapsed

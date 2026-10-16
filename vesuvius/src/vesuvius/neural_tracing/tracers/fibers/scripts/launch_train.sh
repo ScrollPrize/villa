@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # Background training from a run configuration, with a persistent log:
 #   launch_train.sh RUN.json [--resume CHECKPOINT]
+# TRAINER=PATH selects another trainer with the same arguments, e.g. TRAINER=sheet_strip/train.py launch_train.sh
+# configs/sheet_strip/paris4_slim50k.json (single GPU).
 # With runtime.gpus > 1, e.g. CUDA_VISIBLE_DEVICES=4,7 launch_train.sh RUN.json (2 processes, one per visible GPU).
 # The log and PID file are named after the configuration's "name".
 set -euo pipefail
 FF="$(cd "$(dirname "$0")/.." && pwd)"
 VES="$(cd "$FF/../../../../.." && pwd)"
 PYTHON=${PYTHON:-$VES/.venv/bin/python}
+TRAINER="$(cd "$FF" && realpath "${TRAINER:-train/train.py}")"
 export PYTHONPATH="$VES/src${PYTHONPATH:+:$PYTHONPATH}"
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
-    exec "$PYTHON" "$FF/train/train.py" --help
+    exec "$PYTHON" "$TRAINER" --help
 fi
 config=${1:?Usage: launch_train.sh RUN.json [--resume CHECKPOINT]}
 shift
@@ -22,9 +25,9 @@ esac
 # CUDA_VISIBLE_DEVICES; the PID file then names the torchrun agent, which stops every process with it.
 gpus="$("$PYTHON" -c 'import json, sys; print(int((json.load(open(sys.argv[1])).get("runtime") or {}).get("gpus", 1)))' "$config")"
 if (( gpus > 1 )); then
-    command=("$PYTHON" -u -m torch.distributed.run --standalone --nproc_per_node="$gpus" "$FF/train/train.py" --config "$config" "$@")
+    command=("$PYTHON" -u -m torch.distributed.run --standalone --nproc_per_node="$gpus" "$TRAINER" --config "$config" "$@")
 else
-    command=("$PYTHON" -u "$FF/train/train.py" --config "$config" "$@")
+    command=("$PYTHON" -u "$TRAINER" --config "$config" "$@")
 fi
 "$PYTHON" - "$FF/output/logs" "$name" "${command[@]}" <<'PY'
 from pathlib import Path

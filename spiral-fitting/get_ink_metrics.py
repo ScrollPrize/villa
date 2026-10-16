@@ -129,6 +129,7 @@ def run_worker(argv):
     ap.add_argument('--step', type=float, default=0.5, help='tile_step_size')
     ap.add_argument('--no-tta', action='store_true', help='disable mirroring TTA (faster)')
     ap.add_argument('--procs', type=int, default=8)
+    ap.add_argument('--device', choices=('cuda', 'mps', 'cpu'), default='cuda')
     args = ap.parse_args(argv)
 
     # nnU-Net was written assuming the fork start method; Python 3.14 defaults to
@@ -144,12 +145,14 @@ def run_worker(argv):
     import torch
     from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 
+    # CUDA_VISIBLE_DEVICES already narrowed CUDA to one GPU.
+    device = torch.device('cuda', 0) if args.device == 'cuda' else torch.device(args.device)
     predictor = nnUNetPredictor(
         tile_step_size=args.step,
         use_gaussian=True,
         use_mirroring=not args.no_tta,
-        perform_everything_on_device=True,
-        device=torch.device('cuda', 0),  # CUDA_VISIBLE_DEVICES already narrowed to one GPU
+        perform_everything_on_device=device.type == 'cuda',
+        device=device,
         verbose=False,
         verbose_preprocessing=False,
         allow_tqdm=False,
@@ -369,6 +372,20 @@ def detect_folds(model_dir):
     return sorted(folds)
 
 
+def ink_device(requested=None):
+    """The device the nnU-Net folds run on: ``requested`` (--device), else
+    cuda when available, else mps, else cpu. The fitting variables
+    FIT_SPIRAL_DEVICE and FIT_SPIRAL_MAX_PRECISION_FLOAT play no part."""
+    import torch
+    available = {'cuda': torch.cuda.is_available(),
+                 'mps': torch.backends.mps.is_available(), 'cpu': True}
+    if requested is not None:
+        if not available[requested]:
+            raise RuntimeError(f'--device {requested} was requested but is not available')
+        return requested
+    return next(name for name, ok in available.items() if ok)
+
+
 def detect_gpus():
     """GPU ids to spread folds across. Honour CUDA_VISIBLE_DEVICES if set, else ask torch."""
     env = os.environ.get('CUDA_VISIBLE_DEVICES')
@@ -464,6 +481,9 @@ def run_main(argv):
                     help='comma list of folds to ensemble (default: all present)')
     ap.add_argument('--gpus', default=None,
                     help='comma list of GPU ids to spread folds across (default: auto)')
+    ap.add_argument('--device', choices=('cuda', 'mps', 'cpu'), default=None,
+                    help='torch device for the nnU-Net folds (default: cuda if available, '
+                         'else mps, else cpu)')
     ap.add_argument('--fg-threshold', type=float, default=0.5,
                     help='ensemble foreground-probability threshold for the mask '
                          '(0.5 == argmax; lower = more permissive)')
@@ -508,12 +528,26 @@ def run_main(argv):
     folds = [int(x) for x in args.folds.split(',')] if args.folds else detect_folds(model_dir)
     if not folds:
         ap.error(f'no folds found in {model_dir}')
-    gpus = [g.strip() for g in args.gpus.split(',')] if args.gpus else detect_gpus()
+    device = ink_device(args.device)
+    if device == 'cuda':
+        gpus = [g.strip() for g in args.gpus.split(',')] if args.gpus else detect_gpus()
+        slots = [f'GPU {gpu}' for gpu in gpus]
+        sequential = args.sequential_folds
+    else:
+        # Every fold would share the one device (on a Mac, one unified memory
+        # pool), so the folds take turns instead of all loading at once.
+        gpus, slots, sequential = [], [device], True
+        if args.gpus:
+            print(f'note    : --gpus {args.gpus} ignored, the folds run on {device}')
+        if args.sequential_folds:
+            print(f'note    : --sequential-folds has no effect on {device}, '
+                  'the folds already run one at a time')
 
     print(f'ink_dir : {ink_dir}')
     print(f'strip   : {name}  ({len(tiles)} tile(s) concatenated)')
     print(f'model   : {args.model}' + (f' ({model_dir})' if model_dir != args.model else ''))
-    print(f'folds   : {folds}   gpus: {gpus}   checkpoint: {args.checkpoint}')
+    on = f'gpus: {gpus}' if device == 'cuda' else f'device: {device}, one fold at a time'
+    print(f'folds   : {folds}   {on}   checkpoint: {args.checkpoint}')
     print(f'output  : {out_dir}')
 
     # 1. Stage the strip as the nnU-Net input: concatenate its tiles into one wide
@@ -531,32 +565,33 @@ def run_main(argv):
     log_dir = os.path.join(work_dir, 'logs')
     os.makedirs(log_dir, exist_ok=True)
     for i, fold in enumerate(folds):
-        gpu = gpus[i % len(gpus)]
+        slot = slots[i % len(slots)]
         fold_out[fold] = os.path.join(work_dir, f'pred_fold_{fold}')
         os.makedirs(fold_out[fold], exist_ok=True)
         env = os.environ.copy()
-        env['CUDA_VISIBLE_DEVICES'] = str(gpu)
+        if device == 'cuda':
+            env['CUDA_VISIBLE_DEVICES'] = str(gpus[i % len(gpus)])
         set_nnunet_env()
         for k in ('nnUNet_raw', 'nnUNet_preprocessed', 'nnUNet_results'):
             env[k] = os.environ[k]
         cmd = [sys.executable, os.path.abspath(__file__), '__worker__',
                '--fold', str(fold), '--model', model_dir, '--checkpoint', args.checkpoint,
                '--input', in_dir, '--output', fold_out[fold], '--step', str(args.step),
-               '--procs', str(args.procs)]
+               '--procs', str(args.procs), '--device', device]
         if args.no_tta:
             cmd.append('--no-tta')
         logf = open(os.path.join(log_dir, f'fold_{fold}.log'), 'w')
-        print(f'  launching fold {fold} on GPU {gpu} -> {os.path.basename(fold_out[fold])}')
-        procs.append((fold, gpu, subprocess.Popen(cmd, env=env, stdout=logf, stderr=subprocess.STDOUT), logf))
-        if args.sequential_folds:
+        print(f'  launching fold {fold} on {slot} -> {os.path.basename(fold_out[fold])}')
+        procs.append((fold, slot, subprocess.Popen(cmd, env=env, stdout=logf, stderr=subprocess.STDOUT), logf))
+        if sequential:
             procs[-1][2].wait()
 
     failed = []
-    for fold, gpu, proc, logf in procs:
+    for fold, slot, proc, logf in procs:
         rc = proc.wait()
         logf.close()
         status = 'ok' if rc == 0 else f'FAILED (rc={rc})'
-        print(f'  fold {fold} (GPU {gpu}) {status}')
+        print(f'  fold {fold} ({slot}) {status}')
         if rc != 0:
             failed.append(fold)
         if rc == -9:
