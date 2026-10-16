@@ -815,7 +815,7 @@ void readMultiSliceImpl(
                             if (v < 0.f) v = 0.f;
                             float maxV = float(std::numeric_limits<T>::max());
                             if (v > maxV) v = maxV;
-                            val = T(v + (std::is_same_v<T, uint16_t> ? 0.5f : 0.f));
+                            val = T(v + (std::is_integral_v<T> ? 0.5f : 0.f));
                         }
                         out[i].template ptr<T>(y)[x] = val;
                     }
@@ -860,7 +860,7 @@ void sampleTileSlicesImpl(
                     if (v < 0.f) v = 0.f;
                     float maxV = float(std::numeric_limits<T>::max());
                     if (v > maxV) v = maxV;
-                    val = T(v + (std::is_same_v<T, uint16_t> ? 0.5f : 0.f));
+                    val = T(v + (std::is_integral_v<T> ? 0.5f : 0.f));
                 }
                 out[i].template ptr<T>(y)[x] = val;
             }
