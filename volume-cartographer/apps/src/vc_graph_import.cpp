@@ -54,6 +54,8 @@ void usage()
         << "  --strip-rows <n>                shared strip rows each side (default 1)\n"
         << "  --anchor-contact <vx>           shared minimum anchor contact (default 75)\n"
         << "  --link-fiber-patches <dir>       link fibers in <dir> to --segments patches\n"
+        << "                       strips are cached automatically in <dir>/.strip-cache/\n"
+        << "  --rebuild-fiber-strips          refresh strip caches (e.g. after CT voxel edits)\n"
         << "  --ct <path>                     uint8 CT volume for linking (default normal source)\n"
         << "  --normals-manifest <path>        use Lasagna normals in the same linker instead of CT\n"
         << "  --ct-level <level>              CT pyramid level (default 0)\n"
@@ -137,6 +139,7 @@ try {
         else if (arg == "--link-track-patches") linkTrackPath = next(arg.c_str());
         else if (arg == "--track-scale") trackPatchParams.trackScale = std::stod(next(arg.c_str()));
         else if (arg == "--link-fiber-patches") linkFiberDir = next(arg.c_str());
+        else if (arg == "--rebuild-fiber-strips") fiberPatchParams.rebuildStrips = true;
         else if (arg == "--ct") ctVolume = next(arg.c_str());
         else if (arg == "--normals-manifest") fiberPatchParams.normalsManifest = next(arg.c_str());
         else if (arg == "--ct-level") fiberPatchParams.ctLevel = std::stoi(next(arg.c_str()));

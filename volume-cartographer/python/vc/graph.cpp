@@ -720,6 +720,7 @@ NB_MODULE(graph, m)
                     const std::string key = nb::cast<std::string>(item.first);
                     const nb::handle val = item.second;
                     if (key == "fiber_scale") p.fiberScale = nb::cast<double>(val);
+                    else if (key == "rebuild_strips") p.rebuildStrips = nb::cast<bool>(val);
                     else if (!setLinePatchParameter(p, key, val))
                         throw std::runtime_error("link_fibers_to_patches: unknown parameter '" + key + "'");
                 }
@@ -729,7 +730,8 @@ NB_MODULE(graph, m)
             nb::arg("fibers_dir"), nb::arg("patches_dir"), nb::arg("ct_volume"), nb::arg("kwargs"),
             "Link fiber JSONs to tifxyz patches using CT sheet normals; creates pending edges. "
             "kwargs mirror FiberPatchParams; normals_manifest selects a Lasagna reference source. "
-            "The default strip has one row at 20 voxels on each side.")
+            "The default strip has one row at 20 voxels on each side. "
+            "Strips are cached in fibers_dir/.strip-cache; rebuild_strips=True refreshes them.")
         .def(
             "write",
             [](PyGraphDb& self) {

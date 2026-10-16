@@ -575,14 +575,18 @@ public:
 
     int width() const { return width_; }
     int height() const { return height_; }
-    float at(int row, int col) const
+    const float* rowData(int row) const
     {
         const int strip = row / rowsPerStrip_;
         const int rowInStrip = row - strip * rowsPerStrip_;
         const std::uint64_t offset =
             stripOffsets_[static_cast<std::size_t>(strip)] +
-            (static_cast<std::uint64_t>(rowInStrip) * width_ + col) * sizeof(float);
-        return *reinterpret_cast<const float*>(mapping_.bytes(offset, sizeof(float)));
+            static_cast<std::uint64_t>(rowInStrip) * width_ * sizeof(float);
+        return reinterpret_cast<const float*>(mapping_.bytes(offset, std::uint64_t(width_) * sizeof(float)));
+    }
+    float at(int row, int col) const
+    {
+        return rowData(row)[col];
     }
 
 private:
@@ -610,6 +614,14 @@ public:
 
     int rows() const { return x_.height(); }
     int cols() const { return x_.width(); }
+    struct Row {
+        const float *x = nullptr, *y = nullptr, *z = nullptr;
+        cv::Vec3f at(int col) const { return {x[col], y[col], z[col]}; }
+    };
+    Row rowData(int row) const
+    {
+        return {x_.rowData(row), y_.rowData(row), z_.rowData(row)};
+    }
     cv::Vec3f at(int row, int col) const
     {
         return cv::Vec3f(x_.at(row, col), y_.at(row, col), z_.at(row, col));
@@ -1216,23 +1228,62 @@ struct SurfacePatchIndex::Impl {
                                   int tileStride,
                                   int triStride,
                                   const cv::Vec3f& point,
-                                  float earlyOutDistSq = -1.0f) {
+                                  float earlyOutDistSq = -1.0f,
+                                  float maxDistance = std::numeric_limits<float>::infinity()) {
         PatchHit best;
+        if (!rec.surface) return best;
         triStride = std::max(1, triStride);
         tileStride = std::max(triStride, tileStride);
 
-        for (int subJ = 0; subJ < tileStride; subJ += triStride) {
-            for (int subI = 0; subI < tileStride; subI += triStride) {
-                const PatchRecord subRec{rec.surface, rec.mapped, rec.i + subI, rec.j + subJ};
-                std::array<cv::Vec3f, 4> corners;
-                if (!loadPatchCorners(subRec, triStride, corners)) {
-                    continue;
-                }
+        // Resolve lazy mesh access once per tile, not three times per cell.
+        // The caller holds the index's read lock throughout this traversal.
+        const auto* points = rec.mapped ? nullptr : rec.surface->rawPointsPtr();
+        if (!rec.mapped && !points) return best;
+        const int rows = rec.mapped ? rec.mapped->rows() : points->rows;
+        const int cols = rec.mapped ? rec.mapped->cols() : points->cols;
+        if (rec.i < 0 || rec.j < 0) return best;
+        const auto valid = rec.mapped ? isValidMappedSurfacePoint : isValidSurfacePoint;
+        cv::Vec3f low, high;
+        for (int axis = 0; axis < 3; ++axis) {
+            // Round outwards, including slack for the float triangle arithmetic
+            // at large world coordinates. Bounds only reject impossible hits;
+            // the original triangle distance and tie rules still select hits.
+            const float slack = 8 * std::numeric_limits<float>::epsilon() *
+                (std::abs(point[axis]) + maxDistance + 1.0f);
+            low[axis] = point[axis] - maxDistance - slack;
+            high[axis] = point[axis] + maxDistance + slack;
+        }
+        for (int subJ = 0; subJ < std::min(tileStride, rows - 1 - rec.j); subJ += triStride) {
+            const int row = rec.j + subJ;
+            const int nextRow = std::min(row + triStride, rows - 1);
+            // Resolve TIFF strip offsets and validate row bounds once. A tile
+            // otherwise repeats twelve divisions/file checks for every cell.
+            const auto mappedRow = rec.mapped ? rec.mapped->rowData(row) : MappedTifxyzSurface::Row{};
+            const auto mappedNext = rec.mapped ? rec.mapped->rowData(nextRow) : MappedTifxyzSurface::Row{};
+            const auto* pointRow = points ? (*points)[row] : nullptr;
+            const auto* pointNext = points ? (*points)[nextRow] : nullptr;
+            for (int subI = 0; subI < std::min(tileStride, cols - 1 - rec.i); subI += triStride) {
+                const int col = rec.i + subI;
+                const int nextCol = std::min(col + triStride, cols - 1);
+                const auto p00 = rec.mapped ? mappedRow.at(col) : pointRow[col];
+                const auto p10 = rec.mapped ? mappedRow.at(nextCol) : pointRow[nextCol];
+                const auto p11 = rec.mapped ? mappedNext.at(nextCol) : pointNext[nextCol];
+                const auto p01 = rec.mapped ? mappedNext.at(col) : pointNext[col];
 
-                const auto& p00 = corners[0];
-                const auto& p10 = corners[1];
-                const auto& p11 = corners[2];
-                const auto& p01 = corners[3];
+                // An R-tree entry covers up to 8x8 fine cells. Especially on
+                // coarse tifxyz grids, almost all of them are outside the
+                // query radius. Cull their boxes before doing triangle math.
+                bool outside = false;
+                for (int axis = 0; axis < 3; ++axis) {
+                    if ((p00[axis] < low[axis] && p10[axis] < low[axis] &&
+                         p11[axis] < low[axis] && p01[axis] < low[axis]) ||
+                        (p00[axis] > high[axis] && p10[axis] > high[axis] &&
+                         p11[axis] > high[axis] && p01[axis] > high[axis])) {
+                        outside = true;
+                        break;
+                    }
+                }
+                if (outside || !valid(p00) || !valid(p10) || !valid(p11) || !valid(p01)) continue;
 
                 auto recordHit = [&](float subU, float subV, float distSq) {
                     if (distSq >= best.distSq) return;
@@ -2164,7 +2215,7 @@ SurfacePatchIndex::locate(const PointQuery& pointQuery) const
         }
 
         Impl::PatchHit hit = Impl::evaluatePatch(rec, impl_->tileStride,
-                                                  impl_->samplingStride, pointQuery.worldPoint);
+                                                  impl_->samplingStride, pointQuery.worldPoint, -1.0f, tol);
         if (!hit.valid || hit.distSq > bestDistSq) {
             return;
         }
@@ -2275,7 +2326,7 @@ SurfacePatchIndex::locateAny(const PointQuery& pointQuery) const
             Impl::PatchHit hit = Impl::evaluatePatch(rec, impl_->tileStride,
                                                      impl_->samplingStride,
                                                      pointQuery.worldPoint,
-                                                     toleranceSq);
+                                                     toleranceSq, tol);
             if (!hit.valid || hit.distSq > toleranceSq) {
                 continue;
             }
@@ -2381,7 +2432,7 @@ SurfacePatchIndex::locateAllUnlocked(const PointQuery& pointQuery) const
         }
 
         Impl::PatchHit hit = Impl::evaluatePatch(rec, impl_->tileStride,
-                                                  impl_->samplingStride, pointQuery.worldPoint);
+                                                  impl_->samplingStride, pointQuery.worldPoint, -1.0f, tol);
         if (!hit.valid || hit.distSq > toleranceSq) {
             return;
         }
@@ -2464,7 +2515,7 @@ SurfacePatchIndex::locateSurfaces(const PointQuery& pointQuery) const
         }
 
         Impl::PatchHit hit = Impl::evaluatePatch(rec, impl_->tileStride,
-                                                  impl_->samplingStride, pointQuery.worldPoint);
+                                                  impl_->samplingStride, pointQuery.worldPoint, -1.0f, tol);
         if (!hit.valid || hit.distSq > toleranceSq) {
             return;
         }

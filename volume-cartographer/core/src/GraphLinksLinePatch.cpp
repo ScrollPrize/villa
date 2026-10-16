@@ -315,6 +315,127 @@ std::shared_ptr<QuadSurface> buildStrip(const LineData& fiber, const SheetNormal
     return std::make_shared<QuadSurface>(points, cv::Vec2f(1.0f, 1.0f));
 }
 
+// Cache source identity without traversing a potentially enormous chunk tree.
+// Volume chunks are treated as immutable; rebuildStrips explicitly refreshes
+// entries after in-place voxel edits. Read metadata once per detector run.
+nlohmann::json normalSourceIdentity(const std::filesystem::path& ct, const LinePatchParams& p)
+{
+    namespace fs = std::filesystem;
+    const std::string location = p.normalsManifest.empty() ? ct.string() : p.normalsManifest;
+    nlohmann::json identity{{"location", location}};
+    if (location.find("://") != std::string::npos) return identity;
+    std::error_code ec;
+    const auto path = fs::weakly_canonical(location, ec);
+    if (!ec) identity["location"] = path.string();
+    auto metadata = [&](const fs::path& file) {
+        if (!fs::is_regular_file(file)) return;
+        std::ifstream in(file, std::ios::binary);
+        if (!in) throw std::runtime_error("cannot read normal-source metadata: " + file.string());
+        std::ostringstream content;
+        content << in.rdbuf();
+        if (in.bad()) throw std::runtime_error("cannot read normal-source metadata: " + file.string());
+        identity["metadata"][file.string()] = content.str();
+    };
+    if (fs::is_regular_file(path)) metadata(path);
+    else {
+        for (const auto& dir : {path, path / std::to_string(p.ctLevel)})
+            for (const char* name : {".zarray", ".zattrs", ".zgroup", ".zmetadata", "zarr.json", "meta.json"})
+                metadata(dir / name);
+    }
+    return identity;
+}
+
+nlohmann::json stripCacheKey(const LineData& fiber, const LinePatchParams& p,
+                            double sourceScale, const SheetNormalSource& sampler,
+                            const nlohmann::json& source)
+{
+    // Store exact inputs, avoiding hash collisions and ignoring unrelated
+    // fiber JSON edits (names, annotations) and patch-link acceptance gates.
+    // Bump version whenever buildStrip's geometry algorithm changes.
+    nlohmann::json key{{"format", "vc-fiber-strip"}, {"version", 1}, {"uuid", fiber.uuid},
+        {"source", source}, {"normal_method", sampler.method()}, {"source_scale", sourceScale},
+        {"working_to_base_scale", p.workingToBaseScale}, {"ct_to_base_scale", p.ctToBaseScale},
+        {"ct_level", p.ctLevel}, {"spacing", p.stripSpacing}, {"rows_each_side", p.stripRowsEachSide},
+        {"march_step", p.stripMarchStep}, {"first_line", fiber.firstLine}, {"last_line", fiber.lastLine}};
+    for (const auto& point : fiber.line) key["line"].push_back({point[0], point[1], point[2]});
+    for (const auto& point : fiber.controls) key["controls"].push_back({point[0], point[1], point[2]});
+    return key;
+}
+
+std::shared_ptr<QuadSurface> cachedStrip(const LineData& fiber, const SheetNormalSource& sampler,
+    const LinePatchParams& p, double sourceScale, const std::optional<nlohmann::json>& source,
+    DetectorReport& report, const std::atomic_bool* cancel)
+{
+    if (fiber.stripCacheFile.empty() || !source) return buildStrip(fiber, sampler, p, cancel);
+    checkCancelled(cancel);
+    const auto key = stripCacheKey(fiber, p, sourceScale, sampler, *source);
+    if (!fiber.rebuildStrip) {
+        util::reportProgress(p.progress, "checking cached fiber strip");
+        try {
+            std::ifstream in(fiber.stripCacheFile, std::ios::binary);
+            if (in) {
+                const auto cached = nlohmann::json::from_cbor(in);
+                if (cached.at("key") == key) {
+                    const int rows = cached.at("rows").get<int>();
+                    const int cols = cached.at("cols").get<int>();
+                    const auto& xyz = cached.at("points");
+                    const double maxCols = std::ceil((fiber.arclength[fiber.lastLine] -
+                        fiber.arclength[fiber.firstLine]) / p.stripSpacing) + 1;
+                    if (rows != 2 * p.stripRowsEachSide + 1 || cols < 2 || cols > maxCols ||
+                        !xyz.is_array() || xyz.size() != size_t(rows) * size_t(cols))
+                        throw std::runtime_error("invalid strip dimensions");
+                    cv::Mat_<cv::Vec3f> points(rows, cols);
+                    for (size_t i = 0; i < xyz.size(); ++i) {
+                        const auto v = xyz[i].get<std::array<float, 3>>();
+                        for (float value : v)
+                            if (!std::isfinite(value)) throw std::runtime_error("non-finite strip point");
+                        points(int(i / cols), int(i % cols)) = {v[0], v[1], v[2]};
+                    }
+                    checkCancelled(cancel);
+                    util::reportProgress(p.progress, "using cached fiber strip");
+                    return std::make_shared<QuadSurface>(points, cv::Vec2f(1.f, 1.f));
+                }
+            }
+        } catch (const std::exception&) {
+            checkCancelled(cancel);
+            // Truncated, malformed or obsolete caches are disposable. Rebuild
+            // them using the normal path instead of skipping this fiber.
+            util::reportProgress(p.progress, "rebuilding invalid fiber strip cache");
+        }
+    }
+    const auto strip = buildStrip(fiber, sampler, p, cancel);
+    checkCancelled(cancel);
+    // Publish one complete file atomically. Concurrent runs can safely read
+    // the old entry until rename, and failed/cancelled builds never replace it.
+    const auto temporary = std::filesystem::path(fiber.stripCacheFile.string() + "." + vc::util::newUuid() + ".tmp");
+    try {
+        const auto& points = *strip->rawPointsPtr();
+        nlohmann::json cached{{"key", key}, {"rows", points.rows}, {"cols", points.cols},
+                              {"points", nlohmann::json::array()}};
+        for (const auto& point : points) {
+            for (float value : {point[0], point[1], point[2]})
+                if (!std::isfinite(value)) throw std::runtime_error("non-finite strip point");
+            cached["points"].push_back({point[0], point[1], point[2]});
+        }
+        const auto bytes = nlohmann::json::to_cbor(cached);
+        std::filesystem::create_directories(fiber.stripCacheFile.parent_path());
+        std::ofstream out;
+        out.exceptions(std::ios::failbit | std::ios::badbit);
+        out.open(temporary, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        out.close();
+        checkCancelled(cancel);
+        std::filesystem::rename(temporary, fiber.stripCacheFile);
+        util::reportProgress(p.progress, "saved fiber strip cache");
+    } catch (const std::exception& e) {
+        std::error_code ec;
+        std::filesystem::remove(temporary, ec);
+        checkCancelled(cancel);
+        report.problems.push_back(fiber.path.filename().string() + ": could not save strip cache: " + e.what());
+    }
+    return strip;
+}
+
 // Indexed surface and area-weighted vertex normals, using the same
 // diagonal as SurfacePatchIndex: (00,10,01) and (10,11,01).
 struct Surface {
@@ -499,10 +620,11 @@ struct Relation {
 };
 
 void autoLink(const LineData& fiber, std::vector<Proposal>& proposals, const std::vector<Patch>& patches,
-              const SheetNormalSource& sampler, const LinePatchParams& p, const std::atomic_bool* cancel)
+              const SheetNormalSource& sampler, const LinePatchParams& p, double sourceScale,
+              const std::optional<nlohmann::json>& source, DetectorReport& report, const std::atomic_bool* cancel)
 {
     if (proposals.empty()) return;
-    const auto stripGeometry = buildStrip(fiber, sampler, p, cancel);
+    const auto stripGeometry = cachedStrip(fiber, sampler, p, sourceScale, source, report, cancel);
     util::reportProgress(p.progress, "indexing normal strip");
     const Surface strip(stripGeometry);
     std::vector<size_t> fresh;
@@ -608,6 +730,14 @@ DetectorReport linkLinesToPatches(graph::GraphDb& db, size_t lineCount, const Li
         checkCancelled(cancel);
         util::reportProgress(params.progress, "opening normal source");
         const SheetNormalSource sampler(ctVolume, params);
+        std::optional<nlohmann::json> stripSource;
+        if (!tracks) {
+            try {
+                stripSource = normalSourceIdentity(ctVolume, params);
+            } catch (const std::exception& e) {
+                report.problems.push_back(std::string("fiber strip cache unavailable: ") + e.what());
+            }
+        }
         util::reportProgress(params.progress, "scanning patch directory");
         std::vector<std::filesystem::path> dirs;
         for (const auto& e : std::filesystem::directory_iterator(patchesDir))
@@ -711,7 +841,7 @@ DetectorReport linkLinesToPatches(graph::GraphDb& db, size_t lineCount, const Li
                     proposals.push_back(std::move(proposal));
                 }
             try {
-                autoLink(fiber, proposals, patches, sampler, lineParams, cancel);
+                autoLink(fiber, proposals, patches, sampler, lineParams, sourceScale, stripSource, report, cancel);
             } catch (const std::exception& e) {
                 checkCancelled(cancel);
                 report.problems.push_back(fiber.path.filename().string() + ": " + e.what() + ", skipped");

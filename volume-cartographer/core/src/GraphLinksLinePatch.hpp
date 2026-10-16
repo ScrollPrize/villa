@@ -12,6 +12,8 @@ struct LineData {
     std::vector<cv::Vec3d> controls; // fibers only
     size_t firstLine = 0, lastLine = 0; // inclusive eligible span, raw indices
     graph::ObjectRecord object;
+    std::filesystem::path stripCacheFile; // empty for inputs without persistent strip caching
+    bool rebuildStrip = false;
 };
 using LineLoader = std::function<std::optional<LineData>(size_t, DetectorReport&)>;
 void validateLinePatchParams(const LinePatchParams& params, double sourceScale);

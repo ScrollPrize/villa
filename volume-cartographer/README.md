@@ -407,6 +407,25 @@ _Widget for creating initial segmentations which can be used for traces or later
 - `Clear all paths` : clears any user drawn paths / points (use this over the clear buttons most of the time)
 - `Start label wraps` : this is used for absolute or relative wrap labels, is not used during the seeding step, will detail in another document
 
+### Cached fiber strips
+
+`vc_graph_import --link-fiber-patches /path/to/fibers` automatically saves each
+built strip in `/path/to/fibers/.strip-cache/<fiber-uuid>.cbor`. Later runs
+discover matching entries and skip normal sampling and strip marching. No
+additional flag is needed. The cache also applies to Python's
+`GraphDb.link_fibers_to_patches`.
+
+Fiber geometry, controls, coordinate scales, strip settings, normal-source
+location/method, and local CT metadata or Lasagna manifest must match.
+Changing patch-link acceptance thresholds reuses the geometry. Missing,
+stale or malformed caches rebuild automatically. Cache writes are atomic;
+a write failure is reported without discarding computed links.
+
+CT/normal voxel chunks are assumed immutable; caching does not scan the entire
+volume. After editing voxel data in place without changing its metadata, use
+`--rebuild-fiber-strips` (Python: `rebuild_strips=True`) or remove `.strip-cache/`.
+The normal source must still be accessible when rerunning the detector.
+
 ### Patch-to-patch graph linking performance
 
 Patch overlap linking queries all eligible target patches together for each

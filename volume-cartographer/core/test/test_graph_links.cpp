@@ -11,6 +11,7 @@
 #include <cmath>
 #include <functional>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <nlohmann/json.hpp>
 #include "vc/core/util/Uuid.hpp"
@@ -423,6 +424,136 @@ TEST_CASE("fiber-patch: anchors, multi-round growth, strip gate and isolated clu
     CHECK(noAnchor.staleRemoved == 2);
 }
 
+TEST_CASE("fiber-patch: persistent strips reuse exact geometry and rebuild stale or broken caches")
+{
+    TempDir tmp("fiber_strip_cache");
+    const auto fibers = tmp.dir / "fibers", patches = tmp.dir / "patches";
+    const auto ct = writeCt(tmp.dir / "ct");
+    const auto fiber = writeFiber(fibers);
+    planePatch(patches / "anchor", 100, 100);
+    const auto cache = fibers / ".strip-cache" / (fiber + ".cbor");
+    int runNumber = 0;
+    bool usedCache = false, sampled = false, saved = false;
+    auto run = [&](FiberPatchParams p = {}) {
+        usedCache = sampled = saved = false;
+        p.progress = [&](const vc::util::ProgressUpdate& u) {
+            usedCache |= u.detail.find("using cached fiber strip") != std::string_view::npos;
+            sampled |= u.detail.find("sampling centerline normals") != std::string_view::npos;
+            saved |= u.detail.find("saved fiber strip cache") != std::string_view::npos;
+        };
+        OpenOptions options; options.author = "test";
+        auto db = GraphDb::create(tmp.dir / ("run" + std::to_string(runNumber++) + ".vcgr"), options);
+        const auto report = linkFibersToPatches(db, fibers, patches, ct, p);
+        REQUIRE(report.problems.empty());
+        const auto edges = fiberEdges(db, fiber);
+        REQUIRE(edges.size() == 1);
+        return edges.front().meta;
+    };
+    const auto original = run();
+    CHECK(sampled);
+    CHECK(saved);
+    CHECK_FALSE(usedCache);
+    REQUIRE(fs::is_regular_file(cache));
+    CHECK(run() == original); // new database forces evidence to be recomputed
+    CHECK(usedCache);
+    CHECK_FALSE(sampled);
+    CHECK_FALSE(saved);
+
+    FiberPatchParams gates;
+    gates.anchorContact = 80;
+    run(gates);
+    CHECK(usedCache); // acceptance settings are not strip-building inputs
+    for (int change = 0; change < 7; ++change) {
+        run(); // restore identical baseline settings before testing each input
+        FiberPatchParams p;
+        if (change == 0) p.stripSpacing = 24;
+        if (change == 1) p.stripRowsEachSide = 2;
+        if (change == 2) p.stripMarchStep = 10;
+        if (change == 3) p.fiberScale = 1.001;
+        if (change == 4) p.workingToBaseScale = 1.001;
+        if (change == 5) p.ctToBaseScale = 1.001;
+        if (change == 6) p.rebuildStrips = true;
+        run(p);
+        CHECK(sampled);
+        CHECK(saved);
+        CHECK_FALSE(usedCache);
+    }
+    CHECK(run() == original);
+    CHECK(usedCache);
+
+    nlohmann::json input;
+    { std::ifstream in(fibers / "fiber.json"); in >> input; }
+    input["name"] = "renamed fiber";
+    std::ofstream(fibers / "fiber.json") << input.dump();
+    run();
+    CHECK(usedCache);
+    input["line_points"][20][1] = 128.25;
+    std::ofstream(fibers / "fiber.json") << input.dump();
+    run();
+    CHECK(sampled);
+    CHECK_FALSE(usedCache);
+    input["control_points"][0]["position"][0] = 102;
+    std::ofstream(fibers / "fiber.json") << input.dump();
+    run();
+    CHECK(sampled);
+    CHECK_FALSE(usedCache);
+
+    std::ofstream(ct / ".zattrs") << "{\"revision\":2}";
+    run();
+    CHECK(sampled);
+    CHECK_FALSE(usedCache);
+    std::ofstream(cache, std::ios::binary) << "truncated cache";
+    run();
+    CHECK(sampled);
+    CHECK(saved);
+    CHECK_FALSE(usedCache);
+    nlohmann::json cached;
+    { std::ifstream in(cache, std::ios::binary); cached = nlohmann::json::from_cbor(in); }
+    cached["cols"] = -1;
+    const auto bytes = nlohmann::json::to_cbor(cached);
+    std::ofstream(cache, std::ios::binary).write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    run();
+    CHECK(sampled);
+    CHECK(saved);
+    CHECK_FALSE(usedCache);
+    for (const auto& entry : fs::directory_iterator(cache.parent_path()))
+        CHECK(entry.path() == cache); // no temporary files left behind
+}
+
+TEST_CASE("fiber-patch: cache write failures do not discard links and cancellation preserves cache")
+{
+    TempDir tmp("fiber_strip_cache_failure");
+    const auto fibers = tmp.dir / "fibers", patches = tmp.dir / "patches";
+    const auto ct = writeCt(tmp.dir / "ct");
+    const auto fiber = writeFiber(fibers);
+    planePatch(patches / "anchor", 100, 100);
+    auto db = makeDb(tmp.dir);
+    const auto cache = fibers / ".strip-cache" / (fiber + ".cbor");
+    REQUIRE(linkTestFiberPatches(db, fibers, patches, ct).edgesCreated == 1);
+    auto readBytes = [&] {
+        std::ifstream in(cache, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(in), {});
+    };
+    const auto before = readBytes();
+    std::atomic_bool cancel{false};
+    FiberPatchParams p;
+    p.rebuildStrips = true;
+    p.progress = [&](const vc::util::ProgressUpdate& u) {
+        if (u.detail.find("sampling centerline normals") != std::string_view::npos) cancel = true;
+    };
+    CHECK_FALSE(linkTestFiberPatches(db, fibers, patches, ct, p, &cancel).problems.empty());
+    CHECK(readBytes() == before);
+    CHECK(fiberEdges(db, fiber).size() == 1);
+    fs::remove_all(cache.parent_path());
+    std::ofstream(cache.parent_path()) << "block cache directory creation";
+    OpenOptions options; options.author = "test";
+    auto fresh = GraphDb::create(tmp.dir / "fresh.vcgr", options);
+    const auto report = linkTestFiberPatches(fresh, fibers, patches, ct);
+    CHECK(report.edgesCreated == 1);
+    REQUIRE(report.problems.size() == 1);
+    CHECK(report.problems.front().find("could not save strip cache") != std::string::npos);
+}
+
 TEST_CASE("fiber-patch: reviewed and unrelated edges survive scoped reruns")
 {
     TempDir tmp("fiber_review");
@@ -616,6 +747,22 @@ TEST_CASE("fiber-patch: Lasagna reference uses the same linker with explicit sou
     CHECK(meta["settings"]["working_to_base_scale"] == 2);
     CHECK(meta["fiber_patch"]["anchor"] == true);
     CHECK_FALSE(meta["pred_dt_snap"].get<bool>());
+    bool usedCache = false, sampled = false;
+    params.progress = [&](const vc::util::ProgressUpdate& u) {
+        usedCache |= u.detail.find("using cached fiber strip") != std::string_view::npos;
+        sampled |= u.detail.find("sampling centerline normals") != std::string_view::npos;
+    };
+    CHECK(linkTestFiberPatches(db, fibers, patches, tmp.dir / "no-ct", params).problems.empty());
+    CHECK(usedCache);
+    CHECK_FALSE(sampled);
+    nlohmann::json source;
+    { std::ifstream in(manifest); in >> source; }
+    source["grad_mag_factor"] = 1.1;
+    std::ofstream(manifest) << source.dump();
+    usedCache = false;
+    CHECK(linkTestFiberPatches(db, fibers, patches, tmp.dir / "no-ct", params).problems.empty());
+    CHECK_FALSE(usedCache);
+    CHECK(sampled);
 }
 
 TEST_CASE("track crossing kernel: clustered medians, clearance and tie breaking")

@@ -192,6 +192,11 @@ struct LinePatchParams {
 // The shared rules apply to both fiber and track centerlines.
 struct FiberPatchParams : LinePatchParams {
     double fiberScale = 1.0;
+    // Strips are automatically cached in fibersDir/.strip-cache/<uuid>.cbor.
+    // Geometry, strip parameters, normal method, source location and source
+    // metadata invalidate the cache. CT/normal voxel data is assumed immutable;
+    // set this after editing it in place without changing its metadata.
+    bool rebuildStrips = false;
 };
 
 // Fiber -> patch auto-linking, a port of vc::constraints::autoLinkFiber

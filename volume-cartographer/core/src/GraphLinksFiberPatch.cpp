@@ -110,6 +110,8 @@ DetectorReport linkFibersToPatches(graph::GraphDb& db, const std::filesystem::pa
     auto load = [&](size_t index, DetectorReport& report) -> std::optional<detail::LineData> {
         auto fiber = loadFiber(files[index], params.fiberScale, report);
         if (!fiber) return {};
+        fiber->stripCacheFile = fibersDir / ".strip-cache" / (fiber->uuid + ".cbor");
+        fiber->rebuildStrip = params.rebuildStrips;
         auto& object = fiber->object;
         object.uuid = fiber->uuid;
         object.kind = "fiber";

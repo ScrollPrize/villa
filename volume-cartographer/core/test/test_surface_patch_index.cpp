@@ -175,6 +175,91 @@ TEST_CASE("batched nearest hits preserve individual queries and raw filter prece
     index.locateAllBatch(points, 0.5f, filter, [&](size_t, const auto& hits) { CHECK(hits.empty()); });
 }
 
+TEST_CASE("bounded proximity searches agree with exhaustive tile evaluation")
+{
+    // Coarse, warped geometry with holes and partial boundary tiles. A query
+    // enclosing the entire mesh evaluates every cell without radius culling,
+    // providing a reference for the much tighter production search radius.
+    auto grid = makePlanarGrid(19, 23);
+    for (int r = 0; r < grid.rows; ++r)
+        for (int c = 0; c < grid.cols; ++c)
+            grid(r, c) = {10000.f + 20.f*c, 20000.f + 20.f*r,
+                          30000.f + 9.f*std::sin(c*0.7f)*std::cos(r*0.4f)};
+    grid(7, 9) = {-1.f, -1.f, -1.f};
+    grid(12, 13)[1] = std::numeric_limits<float>::quiet_NaN();
+    const auto dir = tmpDir("bounded_proximity");
+    fs::create_directories(dir);
+    QuadSurface(grid, cv::Vec2f(0.05f, 0.05f)).save(dir, true);
+    auto surface = std::make_shared<QuadSurface>(dir);
+    std::mt19937 random(42);
+    std::uniform_real_distribution<float> x(-5.f, 445.f), y(-5.f, 365.f), z(-12.f, 12.f);
+    for (int stride : {1, 3, 10}) {
+        SurfacePatchIndex index;
+        index.setSamplingStride(stride);
+        index.rebuild({surface});
+        SurfacePatchIndex loadedIndex;
+        loadedIndex.setSamplingStride(stride);
+        loadedIndex.rebuild({surface}, 0.f, false);
+        size_t accepted = 0, rejected = 0;
+        for (int i = 0; i < 250; ++i) {
+            SurfacePatchIndex::PointQuery query;
+            query.worldPoint = {10000.f+x(random), 20000.f+y(random), 30000.f+z(random)};
+            query.tolerance = 1000.f;
+            const auto reference = index.locate(query);
+            REQUIRE(reference.has_value());
+            const auto loadedReference = loadedIndex.locate(query);
+            REQUIRE(loadedReference.has_value());
+            CHECK(loadedReference->ptr == reference->ptr);
+            CHECK(loadedReference->distance == reference->distance);
+            query.tolerance = 2.f;
+            const bool expected = reference->distance <= query.tolerance;
+            expected ? ++accepted : ++rejected;
+            const auto nearest = index.locate(query);
+            CHECK(nearest.has_value() == expected);
+            if (nearest) {
+                CHECK(nearest->ptr == reference->ptr);
+                CHECK(nearest->distance == reference->distance);
+            }
+            const auto all = index.locateAll(query);
+            CHECK(all.size() == (expected ? 1 : 0));
+            if (!all.empty()) {
+                CHECK(all.front().ptr == reference->ptr);
+                CHECK(all.front().distance == reference->distance);
+            }
+            CHECK(index.locateAny(query).has_value() == expected);
+            CHECK(index.locateSurfaces(query).size() == (expected ? 1 : 0));
+            const auto loadedNearest = loadedIndex.locate(query);
+            CHECK(loadedNearest.has_value() == expected);
+            if (loadedNearest) {
+                CHECK(loadedNearest->ptr == reference->ptr);
+                CHECK(loadedNearest->distance == reference->distance);
+            }
+        }
+        CHECK(accepted > 0);
+        CHECK(rejected > 0);
+    }
+    fs::remove_all(dir);
+}
+
+TEST_CASE("proximity radius includes exact boundary hits")
+{
+    SurfacePatchIndex index;
+    // Pad the quantized R-tree boxes, as the patch-overlap detector does, so
+    // this tests fine-cell radius culling independently of box quantization.
+    index.rebuild({makeSurface(19, 23, 100.f)}, 2.f);
+    for (const auto& p : {cv::Vec3f{8.f, 8.f, 102.f}, cv::Vec3f{22.f, 18.f, 102.f},
+                          cv::Vec3f{-2.f, 0.f, 100.f}}) {
+        SurfacePatchIndex::PointQuery query;
+        query.worldPoint = p;
+        query.tolerance = 2.f;
+        REQUIRE(index.locate(query).has_value());
+        CHECK(index.locate(query)->distance == 2.f);
+        CHECK(index.locateAll(query).size() == 1);
+        CHECK(index.locateAny(query).has_value());
+        CHECK(index.locateSurfaces(query).size() == 1);
+    }
+}
+
 TEST_CASE("locateSurfaces deduplicates surface results")
 {
     SurfacePatchIndex idx;
