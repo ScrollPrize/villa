@@ -674,20 +674,20 @@ DetectorReport linkLinesToPatches(graph::GraphDb& db, size_t lineCount, const Li
         for (const auto& patch : patches) scope.objectUuids.push_back(patch.uuid);
         auto settings = settingsJson(params);
         settings[tracks ? "track_scale" : "fiber_scale"] = sourceScale;
+        const auto linkingStage = tracks ? "linking tracks" : "linking fibers";
         for (size_t input = 0; input < lineCount; ++input) {
             checkCancelled(cancel);
-            util::reportProgress(params.progress, "loading lines", input, lineCount);
+            util::reportProgress(params.progress, linkingStage, input, lineCount, "loading line");
             auto loaded = load(input, report);
             if (!loaded) continue;
             const auto& fiber = *loaded;
             unique(fiber.uuid);
             ++report.objectsConsidered;
             registrations.push_back(fiber.object);
-            const auto item = std::to_string(input + 1) + "/" + std::to_string(lineCount) + " " + fiber.path.filename().string();
+            const auto item = std::string(tracks ? "track " : "fiber ") +
+                std::to_string(input + 1) + "/" + std::to_string(lineCount);
             auto lineParams = params;
-            if (params.progress) lineParams.progress = [&](const util::ProgressUpdate& event) {
-                util::reportProgress(params.progress, event.stage, event.completed, event.total, item);
-            };
+            lineParams.progress = util::subtaskProgress(params.progress, linkingStage, input, lineCount, item);
             std::map<size_t, std::vector<size_t>> contacts;
             for (size_t i = fiber.firstLine; i <= fiber.lastLine; ++i) {
                 if ((i & 255) == 0 || i == fiber.firstLine) {
@@ -778,6 +778,7 @@ DetectorReport linkLinesToPatches(graph::GraphDb& db, size_t lineCount, const Li
         checkCancelled(cancel);
         // Geometry work is complete before any registration writes. Preserve
         // existing metadata and approval; UUID kind conflicts abort atomically.
+        util::reportProgress(params.progress, linkingStage, lineCount, lineCount);
         util::reportProgress(params.progress, "registering objects");
         auto txn = db.write();
         auto registerObject = [&](graph::ObjectRecord rec) {

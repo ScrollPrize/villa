@@ -203,6 +203,12 @@ TEST_CASE("patch overlap: reflected overlap linked, thin strip and disjoint reje
     std::map<std::string, uint64_t> completed;
     params.progress = [&](const vc::util::ProgressUpdate& update) {
         CHECK((update.total == 0 || update.completed <= update.total));
+        if (update.stage == "checking patch pairs") {
+            CHECK(update.total == 6);
+            CHECK(update.completed >= completed[std::string(update.stage)]);
+        }
+        CHECK(update.stage != "searching");
+        CHECK(update.stage != "fitting overlaps");
         completed[std::string(update.stage)] = update.completed;
     };
     const auto report = linkPatchOverlaps(db, patchesDir, params);
@@ -275,7 +281,8 @@ TEST_CASE("patch overlap: capped correspondences and parallel search are determi
     params.workers = 4;
     std::atomic_bool cancel{false};
     params.progress = [&](const vc::util::ProgressUpdate& update) {
-        if (update.stage == "finding patch correspondences") cancel.store(true);
+        if (update.stage == "checking patch pairs" && update.detail.find("searching") != std::string_view::npos)
+            cancel.store(true);
     };
     CHECK_FALSE(linkPatchOverlaps(db, patches, params, &cancel).problems.empty());
     { auto read = db.read(); CHECK(db.edgesByKind(read, "same-surface").empty()); }
@@ -356,14 +363,22 @@ TEST_CASE("fiber-patch: anchors, multi-round growth, strip gate and isolated clu
         });
     FiberPatchParams params;
     std::map<std::string, uint64_t> completed;
+    bool sawNormals = false, sawStrips = false;
     params.progress = [&](const vc::util::ProgressUpdate& update) {
         CHECK((update.total == 0 || update.completed <= update.total));
+        if (update.stage == "linking fibers") {
+            CHECK(update.total == 1);
+            CHECK(update.completed >= completed[std::string(update.stage)]);
+            sawNormals |= update.detail.find("sampling centerline normals") != std::string_view::npos;
+            sawStrips |= update.detail.find("marching normal strips") != std::string_view::npos;
+        }
         completed[std::string(update.stage)] = update.completed;
     };
     const auto report = linkFibersToPatches(db, fibers, patches, ctVolume, params);
     CHECK(completed.at("loading patches") == 6);
-    CHECK(completed.at("sampling centerline normals") > 0);
-    CHECK(completed.at("marching normal strips") > 0);
+    CHECK(completed.at("linking fibers") == 1);
+    CHECK(sawNormals);
+    CHECK(sawStrips);
     CHECK(completed.contains("committing objects and links"));
     for (const auto& problem : report.problems) INFO(problem);
     CHECK(report.problems.empty());

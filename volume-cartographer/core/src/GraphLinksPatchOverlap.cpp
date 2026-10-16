@@ -295,7 +295,7 @@ void addCorrespondence(const SamplePoint& sample, const LoadedPatch& target,
 std::map<size_t, CorrespondenceCollector> harvestTargets(const LoadedPatch& seed,
     const std::vector<LoadedPatch>& patches, const std::vector<size_t>& targets,
     const SurfacePatchIndex& index, const PatchOverlapParams& params,
-    const std::atomic_bool* cancel, Profile& profile)
+    const std::atomic_bool* cancel, Profile& profile, const util::ProgressCallback& progress)
 {
     std::map<size_t, CorrespondenceCollector> matches;
     if (targets.empty()) return matches;
@@ -335,7 +335,7 @@ std::map<size_t, CorrespondenceCollector> harvestTargets(const LoadedPatch& seed
     const size_t requested = params.workers ? size_t(params.workers)
         : std::min(8u, std::max(1u, std::thread::hardware_concurrency()));
     const size_t workers = std::min(requested, std::max(size_t(1), seed.samples.size() / 16384));
-    util::reportProgress(params.progress, "finding patch correspondences", 0, seed.samples.size(), label);
+    util::reportProgress(progress, "searching", 0, seed.samples.size(), label);
     std::vector<std::future<Matches>> jobs;
     // Even one worker uses an asynchronous range so the caller can keep
     // reporting progress and checking cancellation during a long search.
@@ -346,7 +346,7 @@ std::map<size_t, CorrespondenceCollector> harvestTargets(const LoadedPatch& seed
     }
     for (auto& job : jobs) {
         while (job.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready)
-            util::reportProgress(params.progress, "finding patch correspondences",
+            util::reportProgress(progress, "searching",
                 completed.load(std::memory_order_relaxed), seed.samples.size(), label);
         // Ranges merge in source order, preserving first-sample wins on exact
         // distance ties. A globally retained cell must be in each range's top K
@@ -357,7 +357,7 @@ std::map<size_t, CorrespondenceCollector> harvestTargets(const LoadedPatch& seed
         }
     }
     profile.queries += completed.load();
-    util::reportProgress(params.progress, "finding patch correspondences",
+    util::reportProgress(progress, "searching",
         completed.load(), seed.samples.size(), label);
     return matches;
 }
@@ -738,20 +738,22 @@ DetectorReport linkPatchOverlaps(graph::GraphDb& db, const std::filesystem::path
     util::reportProgress(progress, "checking patch pairs", 0, totalPairs);
     for (std::size_t si = 0; si < patches.size(); ++si) {
         const LoadedPatch& seed = patches[si];
+        const auto item = "patch " + std::to_string(si + 1) + "/" + std::to_string(patches.size());
+        const auto patchProgress = util::subtaskProgress(progress, "checking patch pairs",
+            processedPairs, totalPairs, item);
         std::vector<size_t> targets;
         for (size_t ti = si + 1; ti < patches.size(); ++ti)
             if (bboxOverlap(seed, patches[ti], params.tolerance)) targets.push_back(ti);
         profile.bboxPairs += targets.size();
         auto matches = [&] {
             PhaseTimer timer(profile.enabled ? &profile.harvest : nullptr);
-            return harvestTargets(seed, patches, targets, index, params, cancel, profile);
+            return harvestTargets(seed, patches, targets, index, params, cancel, profile, patchProgress);
         }();
         if (cancelled()) {
             report.problems.push_back("patch-overlap: cancelled");
             return report;
         }
-        processedPairs += patches.size() - si - 1;
-        util::reportProgress(progress, "checking patch pairs", processedPairs, totalPairs);
+        util::reportProgress(patchProgress, "fitting overlaps");
         for (auto& [ti, collector] : matches) {
             if (cancelled()) {
                 report.problems.push_back("patch-overlap: cancelled");
@@ -814,6 +816,8 @@ DetectorReport linkPatchOverlaps(graph::GraphDb& db, const std::filesystem::path
             candidate.meta = nlohmann::json{{"fit", std::move(fitMeta)}}.dump();
             candidates.push_back(std::move(candidate));
         }
+        processedPairs += patches.size() - si - 1;
+        util::reportProgress(progress, "checking patch pairs", processedPairs, totalPairs, item);
     }
     util::reportProgress(progress, "checking patch pairs", totalPairs, totalPairs);
     for (const auto& [reason, count] : rejections)

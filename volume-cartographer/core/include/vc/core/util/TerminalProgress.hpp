@@ -71,13 +71,14 @@ public:
         std::lock_guard lock(mutex_);
         if (stopped_) return;
         const bool changed = stage_ != event.stage || total_ != event.total || event.completed < completed_;
-        const bool completed = event.total && event.completed >= event.total && completed_ < event.total;
         if (changed) stageStart_ = Clock::now();
         stage_ = clean(event.stage);
         detail_ = clean(event.detail);
         completed_ = event.completed;
         total_ = event.total;
-        if (changed || completed || Clock::now() - lastPrint_ >= interval_) render();
+        // Coalesce rapid transitions too. Rendering every stage change or item
+        // completion makes nested work flash and floods redirected logs.
+        if (Clock::now() - lastPrint_ >= interval_) render();
     }
     // Call after the operation returns, before printing its result summary.
     // "finished" means the call returned; the caller's report describes problems.

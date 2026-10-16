@@ -422,6 +422,8 @@ fitting and acceptance thresholds retain the original behavior. Index queries
 borrow immutable raw filter sets, avoid allocations for empty results, and
 share one index lock across each batch of 512 samples. Progress callbacks run
 on the calling thread, including updates during correspondence searches.
+The pair-checking bar keeps one overall counter throughout the search; the
+current patch, search percentage and fitting activity appear only in its detail text.
 
 Measurements on Linux arm64 with GCC 13, `RelWithDebInfo` and LTO, three runs
 per version with a fresh graph each time (seconds, min / median / max):
@@ -473,6 +475,9 @@ when the total is known, elapsed time, and an estimated remaining time once
 progress is available. A heartbeat continues during individual slow loads,
 spatial-index builds, and database commits. Redirected output uses periodic
 plain-text lines; `--no-progress` disables reporting. Final reports stay on stdout.
+Rapid stage transitions are coalesced at the normal refresh interval instead of
+flashing a new bar for every subtask. Fiber/track linking likewise keeps one
+overall line counter, with normal sampling and contact checks shown as details.
 
 C++ callers can provide `vc::util::ProgressCallback` through detector
 `params.progress` or the optional last argument of the metadata import functions.
