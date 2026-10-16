@@ -1,5 +1,6 @@
 // Python bindings for the native read path (module vc_reader._native).
 #include "array.hpp"
+#include "output_pool.hpp"
 
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
@@ -20,6 +21,33 @@ using LayerTuple = std::tuple<std::string, std::string, std::string, std::string
 NB_MODULE(_native, m)
 {
     m.doc() = "Native zarr v2 read path: local and HTTP chunks, disk cache layers, memory cache.";
+    // Engines inherited by a forked process are deliberately kept alive and never
+    // destroyed there (their threads do not exist in the child), so they are
+    // still referenced at exit; that is not a leak worth reporting.
+    nb::set_leak_warnings(false);
+
+    m.def(
+        "empty",
+        [](std::size_t nbytes) {
+            // A buffer from the output pool, as a 1-D uint8 numpy array; it goes back
+            // to the pool when the last array viewing it is freed.
+            const std::size_t n = nbytes ? nbytes : 1;
+            void* p = vcr::OutputPool::instance().acquire(n);
+            nb::capsule owner(p, [](void* q) noexcept { vcr::OutputPool::instance().release(q); });
+            return nb::ndarray<nb::numpy, std::uint8_t, nb::ndim<1>>(p, {nbytes}, owner);
+        },
+        "nbytes"_a, "An uninitialized uint8 array from the recycled output pool.");
+    m.def("set_output_pool_bytes", [](std::size_t n) { vcr::OutputPool::instance().set_max_bytes(n); }, "max_bytes"_a,
+          "How many bytes of freed output buffers to keep for reuse (0 disables).");
+    m.def("output_pool_stats", [] {
+        auto& pool = vcr::OutputPool::instance();
+        nb::dict d;
+        d["max_bytes"] = pool.max_bytes();
+        d["retained_bytes"] = pool.retained();
+        d["hits"] = pool.hits();
+        d["misses"] = pool.misses();
+        return d;
+    });
 
     m.def(
         "http_get",

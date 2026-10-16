@@ -190,6 +190,30 @@ def test_memory_cache(local_array):
         ZarrReader.open(root, memory_cache="lots")
 
 
+def test_output_pool_reuses_buffers_and_overwrites_them(local_array):
+    from vc_reader.reader import output_pool_stats, set_output_pool_bytes
+
+    root, exp = local_array
+    r = ZarrReader.open(root)
+    region = ((30, 40, 40), (16, 16, 16))  # crosses the far edges and touches a missing chunk
+    a = r.read(*region)
+    a[...] = 255  # dirty the buffer, then hand it back to the pool
+    del a
+    hits = output_pool_stats()["hits"]
+    b = r.read(*region)
+    assert output_pool_stats()["hits"] == hits + 1  # the same buffer, reused
+    np.testing.assert_array_equal(b, _ref(exp, *region))  # every byte rewritten: data and fill
+    c = r.read(*region)  # b is alive: a different buffer
+    assert c.ctypes.data != b.ctypes.data
+    try:
+        set_output_pool_bytes(0)
+        del b, c
+        assert output_pool_stats()["retained_bytes"] == 0
+        np.testing.assert_array_equal(r.read(*region), _ref(exp, *region))
+    finally:
+        set_output_pool_bytes(1 << 30)
+
+
 def test_pickle_roundtrip(local_array):
     root, exp = local_array
     r = ZarrReader.open(root, memory_cache=1 << 20)
@@ -620,3 +644,39 @@ def test_vc3d_delta3d_cache(group_server, data, tmp_path):
     assert httpd.requests == []
     err = np.abs(got.astype(int) - exp[:16, :16, 32:45])
     assert 0 < err.max() <= 2
+
+
+def _forked_child(reader, root, q):
+    try:
+        a = reader.read((0, 0, 0), (16, 16, 32))  # rebuilds the native engine in this process
+        reader.flush()
+        reader.close()
+        q.put(("ok", int(a.sum()), os.path.getsize(os.path.join(root, "0/0/1"))))
+    except BaseException as exc:  # pragma: no cover - reported to the parent
+        q.put(("error", repr(exc), None))
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")  # the point of the test
+def test_reader_survives_fork(server, data, tmp_path):
+    import multiprocessing as mp
+
+    _, base = server
+    url = f"{base}/raw.zarr"
+    exp = _expected(data, MISSING, CHUNKS)
+    r = ZarrReader.open(url, cache_dir=tmp_path)
+    r.read((16, 16, 0), (16, 16, 16))  # the parent's threads are running
+    ctx = mp.get_context("fork")
+    q = ctx.Queue()
+    p = ctx.Process(target=_forked_child, args=(r, decoded_cache_path(tmp_path, url), q))
+    p.start()
+    p.join(60)
+    if p.is_alive():
+        p.kill()
+        pytest.fail("the forked reader hung")
+    status, total, size = q.get(timeout=5)
+    assert status == "ok", total
+    assert total == int(exp[:16, :16, :32].sum()) and size == 16**3  # read, and cached by the child
+    # The parent is unaffected.
+    np.testing.assert_array_equal(r.read((0, 0, 0), (16, 16, 16)), exp[:16, :16, :16])
+    r.close()

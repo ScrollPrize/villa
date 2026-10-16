@@ -15,8 +15,9 @@ Scenarios:
 * ``crops128``: random unaligned 128^3 crops, one after another.
 * ``batch128``: the same number of crops requested at once (``read_many``;
   a 32-thread pool of single reads for zarr-python).
-* ``disk-fill`` / ``disk-warm``: vc_reader's disk cache, filled from S3 on
-  the first pass and served from disk afterwards.
+* ``disk-fill`` / ``disk-warm``: vc_reader's disk cache (uncompressed, and
+  with ``compress_cache``), filled from S3 on the first pass and served from
+  disk afterwards. Cache files are written after each read returns.
 
 Results depend heavily on the network path to us-east-1; backends are
 interleaved within each repetition so they see the same conditions.
@@ -73,9 +74,11 @@ def main(argv=None) -> None:
         bench.run("crops128", name, s3, backends, crops)
         bench.run("batch128", name, s3, backends, crops, batch=True)
 
-        cache = args.cache_dir / name
+        cache, packed = args.cache_dir / name, args.cache_dir / (name + "-delta3d")
         shutil.rmtree(cache, ignore_errors=True)
-        disk = [("vc_reader+disk", vc_reader(threads=w, cache_dir=cache))]
+        shutil.rmtree(packed, ignore_errors=True)
+        disk = [("vc_reader+disk", vc_reader(threads=w, cache_dir=cache)),
+                ("vc_reader+disk(delta3d)", vc_reader(threads=w, cache_dir=packed, compress_cache=True))]
         bench.run("disk-fill-batch128", name, s3, [backends[0], *disk], crops, batch=True, reps=1)
         bench.run("disk-warm-batch128", name, s3, [backends[0], *disk], crops, batch=True)
 

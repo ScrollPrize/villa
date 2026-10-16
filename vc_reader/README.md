@@ -113,6 +113,17 @@ ZarrReader.open("s3://vesuvius-challenge-open-data/…/volume.zarr", level=2)
 shared = MemoryCache(16 << 30)                        # one budget for several readers
 ```
 
+> [!NOTE]
+> **Readers work in forked processes**, such as PyTorch `DataLoader` workers
+> on Linux. A reader does its work on background threads, and a forked process
+> inherits the reader but not those threads. So a reader notices when it is
+> used in a process other than the one that opened it, and rebuilds its native
+> engine there from its saved settings. The parent keeps its own engine and
+> finishes its own queued cache writes. In the child, each reader starts with
+> an empty memory cache of the same size: a `MemoryCache` shared by several
+> readers is not shared there. Workers started with `spawn` or `forkserver`
+> receive a pickled reader, which is reopened the same way.
+
 - **Codecs**: uncompressed, blosc and vc-delta3d chunks in C order. Other
   arrays (numcodecs filters, Fortran order, other compressors) raise
   `ValueError` when opened.
@@ -128,10 +139,22 @@ shared = MemoryCache(16 << 30)                        # one budget for several r
 
   VC3D caches are used under VC3D's shared lease, so VC3D never replaces a
   cache vc_reader has open. If none exists, a new decoded cache is created
-  under the first directory. `cache_writes=False` makes all caches read-only.
-  A cache that disagrees with the remote `.zarray` raises instead of mixing
-  data. Quantized (lossy) Delta3D chunks are refetched exactly, and replaced,
-  unless `allow_lossy_cache=True`.
+  under the first directory. `compress_cache=True` makes that new cache store
+  its chunks with lossless Delta3D (3-D uint8/uint16 arrays). It is the same
+  layout, its `.zarray` names `vc-delta3d`, and any reader uses it afterwards.
+  `cache_writes=False` makes all caches read-only. A cache that disagrees with
+  the remote `.zarray` raises instead of mixing data. Quantized (lossy) Delta3D
+  chunks are refetched exactly, and replaced, unless `allow_lossy_cache=True`.
+- **Write-behind**: a fetched chunk is decoded in memory and returned at once.
+  Its cache file is written, and encoded if the cache is compressed, by
+  background writer threads. Until then, rereads are served from the pending
+  write, never refetched. `r.flush()` waits for the queued writes, and
+  `close()` (or dropping the reader) finishes them.
+- **Compressed vs uncompressed caches**: on real CT (PHercParis4 2.4 µm,
+  level 2), Delta3D stores chunks in 68% of the space (1.46× smaller). Reading
+  them costs a decode: a 256 × 128³ batch took 75 ms cold and 59 ms warm,
+  against 70 and 41 ms from an uncompressed cache. A memory cache pays that
+  decode once per chunk.
 - **Memory cache** (`memory_cache=` bytes, or a shared `MemoryCache`): an LRU
   of decoded chunks, keyed by array, so one budget serves many readers.
 - **Local reads** of uncompressed chunks go through persistent memory maps
@@ -142,9 +165,10 @@ shared = MemoryCache(16 << 30)                        # one budget for several r
 - **Remote reads**: anonymous GETs with libcurl, at most `connections=`
   (default 16) in flight, a 10 s stall timeout and retries with backoff. A 404
   means fill. A chunk wanted by several reads at once is fetched once.
-- Readers pickle as their location plus metadata, so DataLoader workers reopen
-  them without a network round trip. `r.stats()` counts memory and disk hits,
-  remote fetches and cache write errors. Values are exactly the stored values.
+- Readers pickle as their location plus metadata, so workers reopen them
+  without a network round trip (see the note above for forked workers).
+  `r.stats()` counts memory and disk hits, remote fetches and cache write
+  errors. Values are exactly the stored values.
 
 Limits:
 

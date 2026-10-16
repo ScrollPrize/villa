@@ -162,12 +162,16 @@ class Bench:
         ops: list[Region],
         *,
         batch: bool = False,
+        batch_size: int | None = None,
         before_rep: Callable[[], None] | None = None,
         reopen_each_rep: bool = True,
         warmup: bool = False,
         reps: int | None = None,
     ) -> None:
         """Run ``ops`` per backend ``reps`` times, interleaving backends; ``batch`` uses read_many.
+
+        With ``batch_size``, the ops are read as consecutive batches of that many
+        (one read_many each, like a data loader); otherwise as one batch.
 
         Every backend's output is compared with the first backend's (outside the
         timed region); a mismatch aborts the run. Cold scenarios must use
@@ -189,10 +193,13 @@ class Bench:
                     before_rep()
                 total, outs = 0.0, []
                 if batch:
-                    t = time.perf_counter()
-                    outs = reader.read_many(ops)
-                    total = time.perf_counter() - t
-                    op_times = [total]
+                    op_times = []
+                    step = batch_size or len(ops)
+                    for i in range(0, len(ops), step):
+                        t = time.perf_counter()
+                        outs.extend(reader.read_many(ops[i:i + step]))
+                        op_times.append(time.perf_counter() - t)
+                    total = sum(op_times)
                 else:
                     op_times = []
                     for start, size in ops:
@@ -222,6 +229,7 @@ class Bench:
             ops_t = sorted(per_op[name])
             self.rows.append(dict(
                 scenario=scenario, array=array, backend=name, reps=len(ts), ops_per_rep=len(ops), batch=batch,
+                batch_size=batch_size,
                 bytes_per_rep=nbytes, seconds_min=min(ts), seconds_median=statistics.median(ts),
                 seconds_max=max(ts), mib_s_median=nbytes / 2**20 / statistics.median(ts),
                 op_ms_p50=1e3 * ops_t[len(ops_t) // 2],

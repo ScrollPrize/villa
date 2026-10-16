@@ -9,6 +9,17 @@ the remote ``.zarray`` and holds VC3D's lease.
 
 Values are exactly the stored values; missing chunks and out-of-bounds regions
 read as ``fill_value``.
+
+Processes and fork: a reader's work runs on background threads (the read pool
+and the disk-cache writers), and a forked process (e.g. a PyTorch DataLoader
+worker on Linux) inherits the reader but not its threads. A reader therefore
+notices when it is used in a different process than it was opened in, and
+rebuilds its native engine there from its saved settings (as unpickling does);
+the inherited engine is left untouched, and the parent still finishes its own
+queued cache writes. Each forked reader starts with an empty memory cache of the
+same size (a MemoryCache shared by several readers is not shared in the child).
+Workers started with ``spawn``/``forkserver`` receive a pickled reader, which is
+reopened the same way.
 """
 
 from __future__ import annotations
@@ -27,6 +38,10 @@ from .zarr_meta import ArrayMeta
 
 MemoryCache = _native.MemoryCache
 READ_MODES = ("mmap", "slab")
+
+# Native engines inherited through fork, kept alive and never touched: their
+# threads do not exist in the child, and their locks may have been held by them.
+_INHERITED: list[Any] = []
 
 
 def http_url(url: str) -> str:
@@ -59,10 +74,14 @@ class ZarrReader:
     """A zarr v2 array opened for reading. Use :meth:`open`.
 
     Indexing is ``[z, y, x]`` like the stored array.
+
+    Safe across fork: used in a forked process (e.g. a DataLoader worker), the
+    reader rebuilds its native engine there (see the module docstring).
     """
 
     def __init__(self, spec: dict[str, Any], cache: MemoryCache | None):
         self.memory_cache = cache
+        self._pid = os.getpid()
         self.location: str = spec["location"]
         self.meta = ArrayMeta.from_zarray(spec["meta"]) if spec["meta"] else _read_zarray(self.location)
         self._spec = dict(spec, meta=dict(self.meta.raw))
@@ -99,7 +118,7 @@ class ZarrReader:
                 layer.close()
             raise
         # Queued cache writes finish even if the reader is dropped without close().
-        self._finalizer = weakref.finalize(self, _shutdown, self._array, self.cache_layers)
+        self._finalizer = weakref.finalize(self, _shutdown, self._array, self.cache_layers, self._pid)
 
     # -- construction -----------------------------------------------------------
 
@@ -140,6 +159,9 @@ class ZarrReader:
         decode; at most ``connections`` HTTP requests are in flight.
         ``read_mode`` is how uncompressed chunk files are read: ``"mmap"``
         (persistent memory maps, the default) or ``"slab"`` (``pread``).
+
+        The reader works on background threads. In a process forked after this
+        call (e.g. a Linux DataLoader worker) it rebuilds them on first use.
         """
         if read_mode not in READ_MODES:
             raise ValueError(f"read_mode must be one of {READ_MODES}")
@@ -183,13 +205,31 @@ class ZarrReader:
     def __repr__(self) -> str:
         return f"ZarrReader({self.location!r}, shape={self.shape}, chunks={self.chunks}, dtype={self.dtype})"
 
+    def _check_process(self) -> None:
+        """After a fork, rebuild the native engine in this process (see the module docstring)."""
+        if self._pid == os.getpid() or self._array is None:
+            return
+        self._abandon_inherited()
+        budget = self.memory_cache.max_bytes if self.memory_cache is not None else 0
+        self.__init__(self._spec, MemoryCache(budget) if budget else None)
+
+    def _abandon_inherited(self) -> None:
+        self._finalizer.detach()  # the parent flushes and closes its own engine
+        _INHERITED.append((self._array, self.cache_layers))
+        self._array, self.cache_layers, self.write_layer = None, [], None
+
     def flush(self) -> None:
         """Wait until every chunk fetched so far is written to the disk cache."""
+        self._check_process()
         if self._array is not None:
             self._array.flush()
 
     def close(self) -> None:
         """Finish queued cache writes, stop the reader's threads and release its cache leases."""
+        if self._pid != os.getpid():
+            if self._array is not None:
+                self._abandon_inherited()
+            return
         self._array = None
         self._finalizer()
 
@@ -223,6 +263,9 @@ class ZarrReader:
 
     def stats(self) -> dict[str, Any]:
         """Counters: memory/disk hits, remote fetches and bytes, cache write errors."""
+        self._check_process()
+        if self._array is None:
+            raise ValueError("reader is closed")
         return self._array.stats()
 
     def chunk_indices(self, start: Sequence[int], size: Sequence[int]) -> list[tuple[int, ...]]:
@@ -247,9 +290,12 @@ class ZarrReader:
         """Several ``(start, size)`` blocks in one call; their chunk reads run in parallel.
 
         A chunk several regions need is read once. ``out`` optionally gives one
-        destination array (or None) per region; reusing destinations between
-        calls avoids first-touch page faults on new memory.
+        destination array (or None) per region. Arrays the reader allocates come
+        from a pool of recycled buffers (see :func:`set_output_pool_bytes`), so
+        a loop that drops its previous outputs gets already-touched memory, as
+        if it passed them back as ``out``.
         """
+        self._check_process()
         if self._array is None:
             raise ValueError("reader is closed")
         nd = self.ndim
@@ -262,7 +308,7 @@ class ZarrReader:
                 raise ValueError(f"start/size must have {nd} non-negative entries")
             given = None if out is None else out[i]
             if given is None:
-                given = np.empty(size, dtype=self.dtype)
+                given = _empty(size, self.dtype)
             elif given.shape != size or given.dtype != self.dtype:
                 raise ValueError(f"out must have shape {size} and dtype {self.dtype}")
             results.append(given)
@@ -280,7 +326,30 @@ class ZarrReader:
         return out[tuple(0 if s else slice(None) for s in squeeze)] if any(squeeze) else out
 
 
-def _shutdown(array, layers: list[CacheLayer]) -> None:
+def _empty(shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
+    """An uninitialized array from the recycled output pool (every byte is overwritten by a read)."""
+    return _native.empty(int(np.prod(shape, dtype=np.int64)) * dtype.itemsize).view(dtype).reshape(shape)
+
+
+def set_output_pool_bytes(max_bytes: int) -> None:
+    """Keep up to ``max_bytes`` (default 1 GiB) of freed output buffers for reuse; 0 disables the pool.
+
+    A freshly allocated output costs a page fault per 4 KiB page when first
+    written, which for data in the page cache is about as long as the read itself.
+    Buffers of arrays the program has dropped are reused by later reads of the
+    same size instead.
+    """
+    _native.set_output_pool_bytes(int(max_bytes))
+
+
+def output_pool_stats() -> dict[str, int]:
+    """The output pool's budget, retained bytes, and allocation hits and misses."""
+    return dict(_native.output_pool_stats())
+
+
+def _shutdown(array, layers: list[CacheLayer], pid: int) -> None:
+    if os.getpid() != pid:  # a forked child exiting: the engine belongs to the parent
+        return
     array.flush()
     for layer in layers:
         layer.close()
@@ -322,4 +391,5 @@ def open_zarr(location: str | os.PathLike[str], **kwargs: Any) -> ZarrReader:
     return ZarrReader.open(location, **kwargs)
 
 
-__all__: Iterable[str] = ["MemoryCache", "ZarrReader", "open_zarr", "http_url"]
+__all__: Iterable[str] = ["MemoryCache", "ZarrReader", "open_zarr", "http_url", "set_output_pool_bytes",
+                          "output_pool_stats"]

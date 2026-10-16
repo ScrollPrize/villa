@@ -54,7 +54,8 @@ The reads go to `s3://vesuvius-challenge-open-data` inside one fully populated
 1024³ region of the same CT level (uncompressed) and of its level-2 surface
 prediction (blosc-zstd, 192³ chunks). The scenarios are a 256×512×512 block,
 12 sequential 128³ crops, the same 12 crops as one batch, and the batch through
-vc_reader's disk cache: first filling it, then served warm from disk.
+vc_reader's disk cache, uncompressed and Delta3D-compressed: first filling it,
+then served warm from disk.
 zarr-python runs with its default async concurrency (10) and with concurrency
 32. Remote numbers are dominated by the network path to us-east-1 and vary a
 lot between runs.
