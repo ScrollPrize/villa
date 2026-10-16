@@ -23,6 +23,8 @@ from .zarr_meta import ArrayMeta
 
 #: Below this many bytes of copying, warm local reads run inline in the caller.
 _INLINE_COPY_BYTES = 1 << 20
+#: Pool reads whose pieces average less than this are dispatched in hinted groups.
+_GROUP_PIECE_BYTES = 1 << 20
 
 
 class ZarrReader:
@@ -44,7 +46,9 @@ class ZarrReader:
         self.inline_bytes = inline_bytes
         self.meta: ArrayMeta = source.meta
         self.memory_cache = memory_cache if memory_cache is not None and memory_cache.max_bytes > 0 else None
-        self.workers = workers or (32 if not isinstance(source, LocalSource) else min(32, os.cpu_count() or 4))
+        # Local reads: 16 threads beat 32 on an NVMe RAID (warm 512^3 blocks 0.060 -> 0.048 s);
+        # remote: requests are capped separately by HttpSource(connections=).
+        self.workers = workers or (32 if not isinstance(source, LocalSource) else min(16, os.cpu_count() or 4))
         self._spec = spec
         self._init_runtime()
 
@@ -333,6 +337,23 @@ class ZarrReader:
         # depth, and a serial hint pass over every piece halved cold throughput
         # (512^3 blocks: 2.6 vs 5.1 GB/s on an NVMe RAID).
         pool = self._executor()
+        if self._local_raw and not self._mapped and self.memory_cache is None and \
+                (copy_bytes or sum(d.nbytes for _, _, d in pieces)) < _GROUP_PIECE_BYTES * len(pieces):
+            # Many small pieces (crop batches): a few contiguous groups per worker, each
+            # hinted by its worker before it reads, so readahead is queued in parallel and
+            # per-piece task overhead disappears (cold 256 x 128^3 batch: 0.200 -> 0.172 s).
+            # Large pieces stay one task each: there grouping cost 20% (warm 512^3 blocks).
+            n = min(len(pieces), self.workers * 2)
+            groups = [pieces[len(pieces) * i // n:len(pieces) * (i + 1) // n] for i in range(n)]
+
+            def work(group):
+                for ok, (_, _, dst) in zip(self.source.read_many_into(group), group):
+                    if not ok:
+                        dst.fill(self.fill_value)
+
+            for f in [pool.submit(work, g) for g in groups]:
+                f.result()
+            return
         for f in [pool.submit(self._copy_piece, *p) for p in pieces]:
             f.result()
 
@@ -342,16 +363,26 @@ class ZarrReader:
         self._run(pieces, out.nbytes)
         return out
 
-    def read_many(self, regions: Iterable[tuple[Sequence[int], Sequence[int]]]) -> list[np.ndarray]:
+    def read_many(
+        self,
+        regions: Iterable[tuple[Sequence[int], Sequence[int]]],
+        out: Sequence[np.ndarray | None] | None = None,
+    ) -> list[np.ndarray]:
         """Several ``(start, size)`` blocks at once: all their chunk reads share the worker pool.
 
         Faster than calling :meth:`read` in a loop when each region is small,
-        because reads of different regions overlap.
+        because reads of different regions overlap. ``out`` optionally gives one
+        destination array (or None) per region; reusing destinations between
+        calls avoids first-touch page faults on new memory (warm 256 x 128^3
+        batches: about 25% faster).
         """
+        regions = list(regions)
+        if out is not None and len(out) != len(regions):
+            raise ValueError(f"out has {len(out)} arrays for {len(regions)} regions")
         outs, pieces = [], []
-        for start, size in regions:
-            out, p = self._plan(start, size, None)
-            outs.append(out)
+        for i, (start, size) in enumerate(regions):
+            o, p = self._plan(start, size, None if out is None else out[i])
+            outs.append(o)
             pieces.extend(p)
         # Several regions always go to the pool, so their reads overlap.
         self._run(pieces, outs[0].nbytes if len(outs) == 1 else None)

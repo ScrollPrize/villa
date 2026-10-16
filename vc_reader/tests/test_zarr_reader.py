@@ -120,6 +120,20 @@ def test_read_many(local_array, read_mode):
         np.testing.assert_array_equal(got, _ref(exp, start, size))
 
 
+def test_read_many_into_given_outputs(local_array):
+    root, exp = local_array
+    r = ZarrReader.open(root, workers=4)
+    regions = REGIONS[:3]
+    outs = [np.empty(size, np.uint8) for _, size in regions]
+    outs[1] = None  # allocated by the reader
+    got = r.read_many(regions, out=outs)
+    assert got[0] is outs[0] and got[2] is outs[2]
+    for (start, size), a in zip(regions, got):
+        np.testing.assert_array_equal(a, _ref(exp, start, size))
+    with pytest.raises(ValueError):
+        r.read_many(regions, out=outs[:2])
+
+
 def test_getitem(local_array):
     root, exp = local_array
     r = ZarrReader.open(root)

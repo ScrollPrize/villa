@@ -46,7 +46,7 @@ def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--array", default=DEFAULT_ARRAY)
     ap.add_argument("--reps", type=int, default=3)
-    ap.add_argument("--workers", type=int, default=32)
+    ap.add_argument("--workers", type=int, help="vc_reader worker threads (default: the reader's own)")
     ap.add_argument("--only", help="comma-separated scenario name filters")
     ap.add_argument("--backends", help="comma-separated backend names to run (default: all)")
     ap.add_argument("--no-cold", action="store_true")
@@ -60,7 +60,7 @@ def main(argv=None) -> None:
 
     w = args.workers
     all_backends = [
-        ("zarr", zarr_python(threads=w)),
+        ("zarr", zarr_python(threads=w or 32)),
         ("vc_reader:slab", vc_reader(workers=w, read_mode="slab")),
         ("vc_reader:pread", vc_reader(workers=w, read_mode="pread")),
         ("vc_reader:mmap", vc_reader(workers=w, read_mode="mmap")),

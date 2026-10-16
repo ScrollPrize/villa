@@ -102,6 +102,7 @@ lvl = cat.sample("Scroll 1").volume(resolution=2.4, energy_kev=78).level(um=9.6)
 r = lvl.open(cache_dir=["/mnt/raid_nvme/volume_cache", "vc3d"], memory_cache=8 << 30)
 crop = r.read((8192, 3584, 3584), (128, 128, 128))   # out-of-bounds parts read as fill_value
 crops = r.read_many([(start, (64, 64, 64)) for start in starts])  # overlapping reads, one pool
+crops = r.read_many(regions, out=crops)               # reuse arrays: no first-touch page faults
 block = r[8192:8704, 3584:4096, 3584:4096]
 
 ZarrReader.open("/data/volume.zarr/2")                # local array
@@ -136,7 +137,11 @@ ZarrReader.open("s3://vesuvius-challenge-open-data/…/volume.zarr", level=2)
   
   Reads under 1 MiB (`inline_bytes=`) run in the caller after queueing
   `POSIX_FADV_WILLNEED` readahead for every piece. Larger reads run on
-  `workers` threads.
+  `workers` threads (16 by default for local arrays). When their pieces are
+  small, as in crop batches, the pieces are split into a few hinted groups per
+  worker. Passing reused arrays as `out=` to `read`/`read_many` avoids the
+  first-touch page faults of new memory (warm 128³ batches: about 25%
+  faster).
 - **Remote reads**: anonymous GETs over a urllib3 pool, with at most
   `connections=` (default 16) in flight and a 10 s stall timeout. Bodies are
   read straight into the chunk buffer, 404 means fill, and other failures are
