@@ -10,7 +10,7 @@ struct Invert { ChannelOptions options; };
 struct GaussianNoise { Scalar std = Uniform{0, .1}; bool shared_noise = false; ChannelOptions options; };
 struct RicianNoise { Scalar std = Uniform{0, .1}; bool shared_noise = false; ChannelOptions options; };
 struct ClipOutliers { Scalar lower = .2, upper = 99.8; double p_retain_std = 1; ChannelOptions options; };
-struct GaussianBlur { Scalar sigma = Uniform{.3, 1.5}; bool shared_axes = true; double truncate = 6; ChannelOptions options; };
+struct GaussianBlur { Scalar sigma = Uniform{.3, 1.5}; bool shared_axes = true, mirror_boundary = true; double truncate = 6; ChannelOptions options; };
 struct MedianFilter { Scalar size = Uniform{3, 7}; ChannelOptions options; };
 struct Sharpen { Scalar strength = Uniform{.1, .5}; double p_clamp = .5; ChannelOptions options; };
 struct LocalOptions { Scalar scale = Uniform{10, 30}, loc = Uniform{-1, 2}; };
@@ -165,7 +165,7 @@ inline void channel_apply(const ClipOutliers&, std::vector<double>& v, const Gri
     for (auto& x : v) x = std::clamp(x, low, high);
     if (p.values[2]) { double m = mean(v), after = deviation(v, m); if (after > 1e-8) for (auto& x : v) x = (x - m) / after * std + m; }
 }
-inline void channel_apply(const GaussianBlur& t, std::vector<double>& v, const Grid& g, const ChannelPlan& p) { gaussian_blur(v, g, p.values, t.truncate); }
+inline void channel_apply(const GaussianBlur& t, std::vector<double>& v, const Grid& g, const ChannelPlan& p) { gaussian_blur(v, g, p.values, t.truncate, t.mirror_boundary, true); }
 inline void channel_apply(const MedianFilter&, std::vector<double>& v, const Grid& g, const ChannelPlan& p) {
     auto k = std::size_t(p.values[0]); Grid kernel(Shape(g.shape.size(), k)); auto src = v;
     std::vector<double> values(kernel.size);
@@ -223,10 +223,12 @@ inline void channel_apply(const SliceIllumination&, std::vector<double>& v, cons
 }
 inline void channel_apply(const Smear& t, std::vector<double>& v, const Grid& g, const ChannelPlan& p) {
     auto axis = std::size_t(p.values[0]);
+    auto plane_shape = g.shape; plane_shape.erase(plane_shape.begin() + axis); Grid plane(plane_shape);
     // Deliberately recursive: previous slices have already been smeared, as in Vesuvius.
     for (std::size_t slice = t.previous; slice < g.shape[axis]; ++slice)
-        for (std::size_t i = 0; i < g.size; ++i) {
-            if (g.coord(i, axis) != slice) continue;
+        for (std::size_t pixel = 0; pixel < plane.size; ++pixel) {
+            std::size_t i = slice * g.stride[axis], pa = 0;
+            for (std::size_t a = 0; a < g.shape.size(); ++a) if (a != axis) i += plane.coord(pixel, pa++) * g.stride[a];
             double sum = 0;
             for (int j = 1; j <= t.previous; ++j) {
                 std::size_t at = (slice - j) * g.stride[axis], shift_axis = 0;

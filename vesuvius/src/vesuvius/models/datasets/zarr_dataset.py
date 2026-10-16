@@ -25,8 +25,8 @@ from torch.utils.data import Dataset
 from vesuvius.utils.utils import pad_or_crop_3d, pad_or_crop_2d
 from .intensity_properties import initialize_intensity_properties
 from ..training.normalization import get_normalization
-from ..augmentation.pipelines import create_training_transforms
 from ..augmentation.transforms.utils.perf import collect_augmentation_names
+from ..augmentation.native import AugmentationIndex, apply_native
 
 
 logger = logging.getLogger(__name__)
@@ -88,10 +88,17 @@ class ZarrDataset(Dataset):
         self,
         mgr,
         is_training: bool = True,
+        *,
+        augmentation=None,
+        augmentation_seed: int = 0,
     ) -> None:
         super().__init__()
         self.mgr = mgr
         self.is_training = is_training
+        # An explicitly supplied native pipeline replaces the default transforms.
+        # It owns target processing too (e.g. medial surfaces), including validation.
+        self._native_augmentation = augmentation
+        self._native_augmentation_seed = int(augmentation_seed)
         self._profile_augmentations = bool(getattr(mgr, 'profile_augmentations', False))
         self._augmentation_names: List[str] = []
 
@@ -792,9 +799,18 @@ class ZarrDataset(Dataset):
 
     def _initialize_transforms(self) -> None:
         """Initialize augmentation transforms."""
+        if self._native_augmentation is not None:
+            from vc_reader.augment import Pipeline
+            if not isinstance(self._native_augmentation, Pipeline):
+                raise TypeError("augmentation must be a vc_reader.augment.Pipeline")
+            self.transforms = None
+            if self._profile_augmentations:
+                self._augmentation_names = [str(i) for i in range(len(self._native_augmentation.transforms))]
+            return
         skeleton_targets, skeleton_ignore_values = self._get_skeleton_targets()
 
         if self.is_training:
+            from ..augmentation.pipelines import create_training_transforms
             no_spatial = getattr(self.mgr, 'no_spatial_augmentation', False)
             no_scaling = getattr(self.mgr, 'no_scaling_augmentation', False)
 
@@ -824,7 +840,10 @@ class ZarrDataset(Dataset):
     def __len__(self) -> int:
         return len(self._patches)
 
-    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, index: int | AugmentationIndex) -> Dict[str, torch.Tensor]:
+        augmentation_index = index
+        if isinstance(index, AugmentationIndex):
+            index = index.index
         patch = self._patches[index]
         vol = self._volumes[patch.volume_index]
         size = patch.patch_size
@@ -894,7 +913,10 @@ class ZarrDataset(Dataset):
 
         result['is_unlabeled'] = is_unlabeled or patch.is_unlabeled_fg
 
-        if self.transforms is not None:
+        if self._native_augmentation is not None:
+            result = apply_native(self._native_augmentation, result, augmentation_index,
+                                  self._native_augmentation_seed, profile=self._profile_augmentations)
+        elif self.transforms is not None:
             if self._profile_augmentations and self._augmentation_names:
                 result['_aug_perf'] = {name: 0.0 for name in self._augmentation_names}
             result = self.transforms(**result)

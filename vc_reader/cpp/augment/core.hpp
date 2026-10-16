@@ -12,6 +12,8 @@
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -111,12 +113,12 @@ struct Array {
     Array(Shape s, char k = 'f', std::size_t b = 4) : shape(std::move(s)), kind(k), bytes(b) {
         require((k == 'f' && (b == 4 || b == 8)) || ((k == 'i' || k == 'u') && (b == 1 || b == 2 || b == 4 || b == 8)) || (k == 'b' && b == 1), "unsupported array dtype");
         require(size() <= (std::numeric_limits<std::size_t>::max() - 7) / b, "array size overflow");
-        storage.resize((size() * b + 7) / 8);
+        storage.resize(std::max<std::size_t>(1, (size() * b + 7) / 8));
     }
     std::size_t size() const { return product(shape); }
     void* data() { return storage.data(); }
     const void* data() const { return storage.data(); }
-    Shape spatial() const { return Shape(shape.begin() + 1, shape.end()); }
+    Shape spatial() const { require(shape.size() >= 2, "expected a channel-first spatial array"); return Shape(shape.begin() + 1, shape.end()); }
     template<class F> decltype(auto) typed(F&& f) const {
         if (kind == 'f') { if (bytes == 4) return f(static_cast<const float*>(data())); return f(static_cast<const double*>(data())); }
         if (kind == 'b' || kind == 'u') {
@@ -131,12 +133,24 @@ struct Array {
         return f(static_cast<const std::int64_t*>(data()));
     }
     double get(std::size_t i) const { return typed([&](const auto* p) { return double(p[i]); }); }
+    void require_exact_values() const {
+        if ((kind != 'i' && kind != 'u') || bytes != 8) return;
+        typed([&](const auto* p) {
+            for (std::size_t i = 0; i < size(); ++i)
+                require(p[i] >= -9007199254740991. && p[i] <= 9007199254740991.,
+                        "value-based label transforms require integer IDs within +/- (2**53 - 1)");
+        });
+    }
     void set(std::size_t i, double v) {
         typed([&](const auto* p) {
             using T = std::remove_cv_t<std::remove_pointer_t<decltype(p)>>;
             if constexpr (std::is_integral_v<T>) {
-                require(std::isfinite(v) && static_cast<long double>(v) >= std::numeric_limits<T>::lowest() &&
-                        static_cast<long double>(v) <= std::numeric_limits<T>::max(), "value is not representable in target dtype");
+                // Use an exclusive power-of-two upper bound: double/long double
+                // can round UINT64_MAX up to 2**64 on some supported platforms.
+                double upper = std::ldexp(1., std::numeric_limits<T>::digits);
+                double lower = std::is_signed_v<T> ? -upper : 0;
+                require(std::isfinite(v) && v >= lower && v < upper && std::trunc(v) == v,
+                        "value is not representable in target dtype");
             }
             const_cast<T*>(p)[i] = static_cast<T>(v);
         });
@@ -146,6 +160,7 @@ struct Array {
         std::memcpy(static_cast<char*>(data()) + to * bytes, static_cast<const char*>(src.data()) + from * bytes, bytes);
     }
     std::vector<double> channel(std::size_t c) const {
+        require_exact_values();
         auto n = product(spatial()); require(c < shape[0], "channel out of bounds");
         std::vector<double> result(n);
         typed([&](const auto* p) { for (std::size_t i = 0; i < n; ++i) result[i] = double(p[c * n + i]); });
@@ -153,7 +168,10 @@ struct Array {
     }
     void channel(std::size_t c, const std::vector<double>& values) {
         auto n = product(spatial()); require(c < shape[0] && values.size() == n, "channel shape mismatch");
-        for (std::size_t i = 0; i < n; ++i) set(c * n + i, values[i]);
+        if (kind == 'f') {
+            if (bytes == 4) { auto* p = static_cast<float*>(data()) + c * n; for (std::size_t i = 0; i < n; ++i) p[i] = static_cast<float>(values[i]); }
+            else std::copy(values.begin(), values.end(), static_cast<double*>(data()) + c * n);
+        } else for (std::size_t i = 0; i < n; ++i) set(c * n + i, values[i]);
     }
 };
 
@@ -175,15 +193,17 @@ inline Shape sample_shape(const Sample& s) {
 }
 inline void validate(const Sample& s) {
     auto shape = sample_shape(s); auto names = axes(shape.size());
+    require(std::all_of(shape.begin(), shape.end(), [](auto extent) { return extent > 0; }), "spatial dimensions must be nonempty");
     for (const auto& [name, f] : s) {
         const auto& a = f.array; const auto& t = f.target;
         if (sparse(t.role)) require(a.shape.size() == 2 && a.shape[1] == shape.size(), name + ": expected (N, D)");
         else require(a.shape.size() >= 3 && a.shape[0] && a.spatial() == shape, name + ": expected channel-first matching spatial shape");
         if (t.role != Role::Label && t.role != Role::Valid) require(a.kind == 'f', name + ": continuous targets require float32 or float64");
         if (sparse(t.role) || directional(t.role) || t.role == Role::CoordinateField) {
-            auto order = t.components; std::sort(order.begin(), order.end()); auto expected = names; std::sort(expected.begin(), expected.end());
+            auto component_dim = t.role == Role::CoordinateField && t.external ? a.shape[0] : shape.size();
+            auto order = t.components; std::sort(order.begin(), order.end()); auto expected = axes(component_dim); std::sort(expected.begin(), expected.end());
             require(order == expected, name + ": invalid component order");
-            if (!sparse(t.role)) require(a.shape[0] == shape.size(), name + ": one channel per spatial component required");
+            if (!sparse(t.role)) require(a.shape[0] == component_dim, name + ": one channel per component required");
         }
         for (std::size_t i = 0; i < a.size(); ++i) {
             auto v = a.get(i); require(std::isfinite(v), name + ": nonfinite input; use a validity mask for missing data");
@@ -200,9 +220,13 @@ inline void restore_valid(Sample& s) {
     for (auto& [name, f] : s) {
         if (f.target.role != Role::Image || !s.count(f.target.valid)) continue;
         const auto& mask = s.at(f.target.valid).array;
+        const bool pseudo = f.source.find('\x1f') != std::string::npos;
+        require(mask.spatial() == f.array.spatial() &&
+                (mask.shape[0] == 1 || mask.shape[0] == f.array.shape[0] ||
+                 (pseudo && f.array.shape[0] % mask.shape[0] == 0)), "validity mask no longer matches image channels");
         auto n = product(f.array.spatial());
         for (std::size_t i = 0; i < f.array.size(); ++i)
-            if (!mask.get(mask.shape[0] == 1 ? i % n : i)) f.array.set(i, f.target.fill);
+            if (!mask.get(mask.shape[0] == 1 ? i % n : i % mask.size())) f.array.set(i, f.target.fill);
     }
 }
 inline double mean(const std::vector<double>& v) { return std::accumulate(v.begin(), v.end(), 0.0) / v.size(); }
@@ -214,18 +238,36 @@ inline std::size_t reflect(std::int64_t i, std::size_t n) {
     auto p = static_cast<std::int64_t>(2 * n); i = (i % p + p) % p;
     return static_cast<std::size_t>(i < static_cast<std::int64_t>(n) ? i : p - 1 - i);
 }
-inline void gaussian_blur(std::vector<double>& data, const Grid& g, const std::vector<double>& sigmas, double truncate = 4) {
+inline double round_even(double v) {
+    double lo = std::floor(v), fraction = v - lo;
+    return lo + (fraction > .5 || (fraction == .5 && std::fmod(lo, 2.) != 0));
+}
+inline std::size_t mirror(std::int64_t i, std::size_t n) {
+    if (n == 1) return 0;
+    auto p = std::int64_t(2 * (n - 1)); i = (i % p + p) % p;
+    return std::size_t(i < std::int64_t(n) ? i : p - i);
+}
+inline void gaussian_blur(std::vector<double>& data, const Grid& g, const std::vector<double>& sigmas, double truncate = 4, bool mirror_boundary = false, bool full_width = false) {
     require(sigmas.size() == g.shape.size() && truncate > 0 && std::isfinite(truncate), "invalid Gaussian parameters");
     std::vector<double> tmp(g.size);
     for (std::size_t a = 0; a < sigmas.size(); ++a) {
         auto sigma = sigmas[a]; require(sigma >= 0 && std::isfinite(sigma) && sigma * truncate < 100000, "invalid Gaussian sigma");
         if (!sigma) continue;
-        int radius = int(sigma * truncate + .5); std::vector<double> kernel(2 * radius + 1); double sum = 0;
+        int radius = int(sigma * truncate + .5);
+        if (full_width) {
+            double extent = sigma * truncate + .5; int size = int(round_even(extent));
+            if (size % 2 == 0) size += extent - size >= 0 ? 1 : -1;
+            radius = std::max(0, (size - 1) / 2);
+        }
+        std::vector<double> kernel(2 * radius + 1); double sum = 0;
         for (int d = -radius; d <= radius; ++d) sum += kernel[d + radius] = std::exp(-.5 * (d / sigma) * (d / sigma));
         for (auto& w : kernel) w /= sum;
         for (std::size_t i = 0; i < g.size; ++i) {
             auto x = g.coord(i, a), base = i - x * g.stride[a]; double v = 0;
-            for (int d = -radius; d <= radius; ++d) v += kernel[d + radius] * data[base + reflect(std::int64_t(x) + d, g.shape[a]) * g.stride[a]];
+            for (int d = -radius; d <= radius; ++d) {
+                auto at = mirror_boundary ? mirror(std::int64_t(x) + d, g.shape[a]) : reflect(std::int64_t(x) + d, g.shape[a]);
+                v += kernel[d + radius] * data[base + at * g.stride[a]];
+            }
             tmp[i] = v;
         }
         data.swap(tmp);

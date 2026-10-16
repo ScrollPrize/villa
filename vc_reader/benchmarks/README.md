@@ -11,6 +11,66 @@ Requirements: the `bench` extra (numpy, zarr>=3, s3fs, tensorstore). With the de
 `.venv/bin/python benchmarks/bench_local.py`. TensorStore is skipped if it is
 not installed.
 
+## Augmentation correctness: `validate_augment.py`
+
+This checks a local Zarr crop through the reader and native augmentation, with
+NumPy geometry references, exact replay, and input ownership checks. It does not
+measure throughput. Labels are optional; provide matching image/label arrays to
+also check target alignment. Inputs are read only.
+
+```sh
+PYTHONPATH=src python benchmarks/validate_augment.py /path/to/image.zarr \
+  --start 1280 2688 3200 --shape 128 128 128 --output /tmp/augmentation-check.npz
+```
+
+The optional NPZ contains before/after arrays and a JSON report. See the
+[augmentation guide](../docs/augmentation.md) for build requirements and tests.
+
+## Augmentation comparison: `bench_augment.py`
+
+Compare the native public API with the actual Python transforms in the Vesuvius
+source tree on a real cached CT crop. Requires Torch, SciPy, scikit-image,
+fft-conv-pytorch, SimpleITK, pandas, and acvl-utils in addition to vc_reader.
+No dependencies are installed by the harness. Run from the repository root:
+
+```sh
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  PYTHONPATH=vc_reader/src:vesuvius/src vc_reader/.venv/bin/python \
+  vc_reader/benchmarks/bench_augment.py --reps 10 --warmup 2 \
+  --profile GaussianNoise,MedianFilter,LowResolution \
+  --output vc_reader/benchmarks/results/augment-128.json
+```
+
+The default is a populated 128³ PHercParis4 crop at ZYX `(1280,2688,3200)`.
+`--array`, `--start`, and `--shape` override it. Inputs have one float32 channel;
+label cases use an int16 threshold of the CT, not ground-truth annotations.
+`--only Flip,Gamma` selects cases. Use `--build-dir` to record the relevant
+CMake build flags and verify the extension matches that build.
+
+Each operation is constructed once. Reads, parameter construction, RNG reset,
+and output comparisons are excluded from timings. Python receives a timed clone
+of its inputs because some transforms mutate them; the native API copies inside
+its call. Both therefore preserve the caller's sample. Sampling and Python/Torch
+adaptation are included. Flip and transpose use explicit fixed parameters in the
+Python `apply` call to prevent random no-ops; this exception is recorded per row.
+Python blur uses direct convolution with autotuning disabled.
+
+Backends alternate order across repetitions, with one Torch/BLAS thread and two
+warm-ups by default. JSON includes every observation, mean, p50, p95, min/max,
+versions, CPU, build flags, extension hash, and per-output numerical differences.
+Independent RNG draws are marked separately from deterministic comparisons;
+timing similar stochastic workloads does not establish identical augmentation
+distributions. A failed comparison remains visible as an error, not a speedup.
+The specialized tracing APIs and probability/composition wrappers are excluded
+from individual-transform coverage; a three-transform intensity pipeline is
+included. A pseudo-2D conversion/restoration pair is also attempted.
+
+To avoid importing unrelated volume/download dependencies, the harness registers
+the Vesuvius source package path without executing its root initializer. All
+augmentation modules and their dependencies execute unchanged. `--profile`
+creates separate cProfile reports after timing (three calls per backend). These
+locate Python-level costs; native calls appear as one opaque extension call.
+
 ## Local reads: `bench_local.py`
 
 ```

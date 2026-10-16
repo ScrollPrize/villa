@@ -485,6 +485,13 @@ without the GIL.
 Benchmarks against zarr-python and TensorStore are in
 [`benchmarks/`](benchmarks/README.md).
 
+## Native augmentation
+
+`vc_reader.augment` provides C++ transforms for channel-first 2D/3D NumPy arrays
+and CPU Torch tensors, with explicit seeds, replay, and shared geometry across
+images and targets. See the [API and dataset integration guide](docs/augmentation.md)
+for examples, transform coverage, numerical conventions, and build/test commands.
+
 ## CLI
 
 ```

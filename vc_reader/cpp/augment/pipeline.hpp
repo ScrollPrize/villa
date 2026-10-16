@@ -1,5 +1,5 @@
 #pragma once
-#include "labels.hpp"
+#include "tracing.hpp"
 #include <bit>
 #include <chrono>
 
@@ -12,7 +12,7 @@ using Op = std::variant<
     SliceIllumination, Smear, Flip, Rotate90, Transpose, CropPad, Affine, Elastic,
     SheetCompression, LowResolution, ThickSlice, Morphology, RandomBinaryOperator,
     RemoveComponents, ReplaceLabel, Regions, OneHot, MaskImage, DeepSupervision,
-    ToPseudo2D, FromPseudo2D, MedialSurface, std::shared_ptr<OneOf>>;
+    ToPseudo2D, FromPseudo2D, MedialSurface, StripGeometry, SurfacePerturb, std::shared_ptr<OneOf>>;
 struct OneOf { std::vector<Op> transforms; std::vector<double> weights; double p = 1; };
 struct Program { std::vector<Op> transforms; std::map<std::string, Target> targets; };
 struct InputSpec {
@@ -82,6 +82,7 @@ public:
         for (const auto& op : program_->transforms) probability(chance(op));
     }
     const auto& targets() const { return program_->targets; }
+    const auto& program() const { return program_; }
     RunResult run(Sample s, std::uint64_t seed, bool record, bool profile) const {
         validate(s); RunResult result; result.plan.program = program_; result.plan.inputs = input_specs(s);
         for (std::size_t i = 0; i < program_->transforms.size(); ++i) {

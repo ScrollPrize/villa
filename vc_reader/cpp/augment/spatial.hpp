@@ -148,7 +148,7 @@ inline void apply_geometry(Sample& sample, const Parameters& p) {
     restore_valid(sample);
 }
 inline Parameters geometry(Shape shape) { Parameters p; p.matrix = identity(shape.size()); p.offset.assign(shape.size(), 0); p.shape = std::move(shape); return p; }
-struct Flip { std::string axes = "zyx"; double p_axis = .5, p = 1; };
+struct Flip { std::string axes; double p_axis = .5, p = 1; };
 struct Rotate90 { std::vector<std::string> planes; Choice turns{{1, 2, 3}}; bool resize = false; double p = 1; };
 struct Transpose { std::string order; double p = 1; };
 struct CropPad { Shape shape; bool random = false; double p = 1; };
@@ -157,11 +157,11 @@ struct Affine {
     std::string rotation_axes = "zyx"; bool shared_scale = true, border = false; Shape shape; double p = 1;
 };
 struct Elastic { Scalar sigma = Uniform{5, 10}, magnitude = Uniform{1, 5}; bool border = false; double p = 1; };
-struct SheetCompression { Scalar strength = Uniform{.1, .3}, intensity_sigma = 1., smoothing = Uniform{3, 8}; std::string axes = "zyx", image = "image"; double threshold = -1, p = 1; };
+struct SheetCompression { Scalar strength = Uniform{.1, .3}, intensity_sigma = 1., smoothing = Uniform{3, 8}; std::string axes, image = "image"; double threshold = -1, p = 1; };
 
 inline Parameters sample(const Flip& t, const Sample& s, Random& r) {
     auto p = geometry(sample_shape(s)); auto d = p.shape.size();
-    for (char c : t.axes) { auto a = std::size_t(axis(c, d)); if (r.chance(t.p_axis)) { p.matrix[a * d + a] *= -1; p.offset[a] = double(p.shape[a] - 1) - p.offset[a]; } }
+    for (char c : t.axes.empty() ? axes(d) : t.axes) { auto a = std::size_t(axis(c, d)); if (r.chance(t.p_axis)) { p.matrix[a * d + a] *= -1; p.offset[a] = double(p.shape[a] - 1) - p.offset[a]; } }
     p.exact = true; return p;
 }
 inline Parameters sample(const Rotate90& t, const Sample& s, Random& r) {
@@ -185,7 +185,10 @@ inline Parameters sample(const Rotate90& t, const Sample& s, Random& r) {
 inline Parameters sample(const Transpose& t, const Sample& s, Random& r) {
     auto shape = sample_shape(s); auto d = shape.size(); auto order = t.order;
     if (order.empty()) {
-        order = axes(d); for (std::size_t i = d; i > 1; --i) { auto j = r.index(i); if (shape[i - 1] == shape[j]) std::swap(order[i - 1], order[j]); }
+        order = axes(d);
+        std::map<std::size_t, std::vector<std::size_t>> groups;
+        for (std::size_t i = 0; i < d; ++i) groups[shape[i]].push_back(i);
+        for (const auto& [size, group] : groups) for (std::size_t i = group.size(); i > 1; --i) std::swap(order[group[i - 1]], order[group[r.index(i)]]);
     }
     auto sorted = order; std::sort(sorted.begin(), sorted.end()); auto expected = axes(d); std::sort(expected.begin(), expected.end()); require(sorted == expected, "transpose order must be a permutation of spatial axes");
     auto p = geometry(shape); p.matrix.assign(d * d, 0);
@@ -224,7 +227,7 @@ inline Parameters sample(const Elastic& t, const Sample& s, Random& r) {
     auto p = geometry(sample_shape(s)); Grid g(p.shape); auto d = p.shape.size(); p.field.resize(g.size * d);
     for (std::size_t a = 0; a < d; ++a) {
         double sigma = draw(t.sigma, r), magnitude = draw(t.magnitude, r); require(magnitude >= 0, "elastic magnitude must be nonnegative");
-        std::vector<double> noise(g.size); for (auto& v : noise) v = r.normal(); gaussian_blur(noise, g, std::vector<double>(d, sigma), 6);
+        std::vector<double> noise(g.size); for (auto& v : noise) v = r.normal(); gaussian_blur(noise, g, std::vector<double>(d, sigma), 6, true, true);
         double maxabs = 0; for (auto v : noise) maxabs = std::max(maxabs, std::abs(v));
         double m = mean(noise); for (std::size_t i = 0; i < g.size; ++i) p.field[i * d + a] = maxabs ? (noise[i] - m) * magnitude / maxabs : 0;
     }
@@ -233,14 +236,15 @@ inline Parameters sample(const Elastic& t, const Sample& s, Random& r) {
 inline Parameters sample(const SheetCompression& t, const Sample& s, Random& r) {
     auto p = geometry(sample_shape(s)); Grid g(p.shape); auto d = p.shape.size();
     require(s.count(t.image) && s.at(t.image).target.role == Role::Image, "sheet compression needs its reference image");
-    auto chosen = std::size_t(axis(t.axes[r.index(t.axes.size())], d));
+    auto allowed = t.axes.empty() ? axes(d) : t.axes;
+    auto chosen = std::size_t(axis(allowed[r.index(allowed.size())], d));
     double strength = draw(t.strength, r), sigma = draw(t.intensity_sigma, r), smooth = draw(t.smoothing, r);
     require(strength >= 0 && strength < 1, "compression strength must be in [0, 1)");
-    auto values = s.at(t.image).array.channel(0); if (sigma > .5) gaussian_blur(values, g, std::vector<double>(d, sigma), 6);
+    auto values = s.at(t.image).array.channel(0); if (sigma > .5) gaussian_blur(values, g, std::vector<double>(d, sigma), 6, true, true);
     auto [lo, hi] = std::minmax_element(values.begin(), values.end()); double low = *lo, span = *hi - low;
     if (span <= 1e-8) return p;
     for (std::size_t i = 0; i < g.size; ++i) { double norm = (values[i] - low) / span; values[i] = (t.threshold >= 0 ? double(norm < t.threshold) : 1 - norm) * strength; if (g.coord(i, chosen)) values[i] += values[i - g.stride[chosen]]; }
-    if (smooth > .5) { std::vector<double> sigmas(d, smooth); sigmas[chosen] = 0; gaussian_blur(values, g, sigmas, 6); }
+    if (smooth > .5) { std::vector<double> sigmas(d, smooth); sigmas[chosen] = 0; gaussian_blur(values, g, sigmas, 6, true, true); }
     p.field.assign(g.size * d, 0);
     for (std::size_t i = 0; i < g.size; ++i) p.field[i * d + chosen] = -values[i] * double(g.shape[chosen] - 1) / g.shape[chosen];
     p.border = true; return p;
@@ -251,7 +255,7 @@ template<Geometric T> void apply(const T&, Sample& s, const Parameters& p) { app
 // Resolution simulation deliberately has its own image/target routing, distinct
 // from a geometric deformation (point coordinates do not move).
 struct LowResolution { Scalar scale = Uniform{.5, 1}; std::string axes = "zyx"; bool shared_axes = true; ChannelOptions options; };
-struct ThickSlice { Scalar scale = Uniform{.25, .6}; std::string axes = "zyx"; bool labels = true; double p = 1; };
+struct ThickSlice { Scalar scale = Uniform{.25, .6}; std::string axes; bool labels = true; double p = 1; };
 inline Array resize_array(const Array& a, const Shape& shape, bool nearest, bool legacy_nearest = false) {
     auto p = geometry(shape); auto d = shape.size(); p.border = true;
     for (std::size_t i = 0; i < d; ++i) {
@@ -275,16 +279,17 @@ inline void apply(const LowResolution&, Sample& s, const Parameters& p) {
     for (const auto& c : p.channels) {
         auto& a = s.at(c.key).array; Shape shape = a.spatial(); auto n = product(shape); Shape one_shape{1}; one_shape.insert(one_shape.end(), shape.begin(), shape.end());
         Array one(one_shape, a.kind, a.bytes); for (std::size_t i = 0; i < n; ++i) one.copy_element(i, a, c.channel * n + i);
-        for (std::size_t j = 0; j < shape.size(); ++j) shape[j] = std::max<std::size_t>(1, std::size_t(std::nearbyint(shape[j] * c.values[j])));
+        for (std::size_t j = 0; j < shape.size(); ++j) shape[j] = std::max<std::size_t>(1, std::size_t(round_even(shape[j] * c.values[j])));
         auto restored = resize_array(resize_array(one, shape, true), a.spatial(), false);
         for (std::size_t i = 0; i < n; ++i) a.copy_element(c.channel * n + i, restored, i);
     }
     restore_valid(s);
 }
 inline Parameters sample(const ThickSlice& t, const Sample& s, Random& r) {
-    auto shape = sample_shape(s); auto a = std::size_t(axis(t.axes[r.index(t.axes.size())], shape.size()));
+    auto shape = sample_shape(s); auto allowed = t.axes.empty() ? axes(shape.size()) : t.axes;
+    auto a = std::size_t(axis(allowed[r.index(allowed.size())], shape.size()));
     double scale = draw(t.scale, r); require(scale > 0 && scale <= 1, "thick-slice scale must be in (0, 1]");
-    shape[a] = std::max<std::size_t>(1, std::size_t(std::nearbyint(shape[a] * scale))); Parameters p; p.shape = shape; return p;
+    shape[a] = std::max<std::size_t>(1, std::size_t(round_even(shape[a] * scale))); Parameters p; p.shape = shape; return p;
 }
 inline void apply(const ThickSlice& t, Sample& s, const Parameters& p) {
     for (auto& [name, f] : s) if (f.target.role == Role::Image || (t.labels && (f.target.role == Role::Label || f.target.role == Role::Scalar))) {
