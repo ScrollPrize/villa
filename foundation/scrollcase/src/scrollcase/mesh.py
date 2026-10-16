@@ -243,8 +243,8 @@ def split_fill_and_depth(
 
     Each half's cavity is pullable along Y, so in every (x, z) column it spans from the
     divider to the lined mesh's farthest voxel on that side. The fill, in mm^3, is the
-    cavity beyond the lined mesh: the room the scroll has to move in, before the
-    protrusions that take it up. The depth is the farthest lined voxel from the divider
+    cavity beyond the lined mesh: the room the scroll would have to move in if the
+    case parted on the divider. The depth is the farthest lined voxel from the divider
     over both halves.
     """
     rotated = _copy_meshlib(mesh)
