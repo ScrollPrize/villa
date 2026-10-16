@@ -275,6 +275,7 @@ Useful options:
 
 * `--gpus 0,1` — run on multiple GPUs.
 * `--tta-mirror` — average predictions over mirrored versions of each patch (slower, slightly better).
+* `--tta-shift 0 4 8 12` — also run the sliding window with its grid shifted by each offset (in pixels, both axes) and blend all grid positions. The 9 µm ink models do not give the same prediction when the tile grid moves by a few pixels, so a single run can land on a good or a bad grid position; blending a few positions removes that luck. Each offset adds one full pass.
 * `--layer-start` / `--layer-end` — restrict which depth layers of the surface volume are used.
 * `--direction both` — also write a depth-reversed prediction (as `<output>_reverse.tif`), useful when you aren't sure which side of the surface volume faces the ink.
 
