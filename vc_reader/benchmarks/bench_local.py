@@ -1,4 +1,4 @@
-"""Local on-disk zarr reads: vc_reader read modes vs zarr-python (and TensorStore if installed).
+"""Local on-disk zarr reads: vc_reader vs zarr-python (and TensorStore if installed).
 
 Default workload: the local copy of PHercParis4 volume 20260411134726
 (2.4 um, 78 keV), pyramid level 2, at
@@ -14,7 +14,7 @@ array is only ever read.
 
     python benchmarks/bench_local.py
     python benchmarks/bench_local.py --array /path/to/array.zarr/0 --reps 5
-    python benchmarks/bench_local.py --only crops64 --backends vc_reader:slab,vc_reader:native
+    python benchmarks/bench_local.py --only crops64 --backends zarr,vc_reader
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from _common import (
     zarr_python,
 )
 
-from vc_reader.reader import MemoryChunkCache, ZarrReader
+from vc_reader.reader import ZarrReader
 
 DEFAULT_ARRAY = ("/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/"
                  "PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/2")
@@ -46,7 +46,7 @@ def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--array", default=DEFAULT_ARRAY)
     ap.add_argument("--reps", type=int, default=3)
-    ap.add_argument("--workers", type=int, help="vc_reader worker threads (default: the reader's own)")
+    ap.add_argument("--threads", type=int, help="vc_reader threads (default: the reader's own)")
     ap.add_argument("--only", help="comma-separated scenario name filters")
     ap.add_argument("--backends", help="comma-separated backend names to run (default: all)")
     ap.add_argument("--no-cold", action="store_true")
@@ -55,15 +55,15 @@ def main(argv=None) -> None:
     root = os.path.abspath(args.array)
     probe = ZarrReader.open(root)
     shape, meta = probe.shape, probe.meta
-    exists = lambda voxel: os.path.exists(probe.source.path(tuple(v // c for v, c in zip(voxel, meta.chunks))))  # noqa: E731
+    exists = lambda voxel: os.path.exists(  # noqa: E731
+        os.path.join(root, meta.chunk_key(tuple(v // c for v, c in zip(voxel, meta.chunks)))))
     print(f"array {root}\n  shape {shape} chunks {meta.chunks} {meta.dtype} compressor={meta.compressor}", flush=True)
 
-    w = args.workers
+    t = args.threads
     all_backends = [
-        ("zarr", zarr_python(threads=w or 32)),
-        ("vc_reader:slab", vc_reader(workers=w, read_mode="slab")),
-        ("vc_reader:native", vc_reader(workers=w, engine="native")),
-        ("vc_reader:native-slab", vc_reader(workers=w, engine="native", read_mode="slab")),
+        ("zarr", zarr_python(threads=32)),
+        ("vc_reader", vc_reader(threads=t)),
+        ("vc_reader:slab", vc_reader(threads=t, read_mode="slab")),
     ]
     if have("tensorstore"):
         all_backends.append(("tensorstore", tensorstore()))
@@ -93,13 +93,11 @@ def main(argv=None) -> None:
         # Hot loop over a small neighbourhood with vc_reader's memory cache.
         centre = random_crops(shape, 512, 1, 5, exists)[0][0]
         ops = random_crops(shape, 64, 500, 6, exists, lo=centre, hi=tuple(c + 512 for c in centre))
-        cache = MemoryChunkCache(4 << 30)
-        mem = [b for b in all_backends if b[0] in ("zarr", "vc_reader:slab", "vc_reader:native")]
-        mem.append(("vc_reader+memory", vc_reader(workers=w, memory_cache=cache)))
-        mem.append(("vc_reader:native+memory", vc_reader(workers=w, engine="native", memory_cache=4 << 30)))
+        mem = [b for b in all_backends if b[0] in ("zarr", "vc_reader")]
+        mem.append(("vc_reader+memory", vc_reader(threads=t, memory_cache=4 << 30)))
         bench.run("crops64-hot", "ct", root, mem, ops, warmup=True, reopen_each_rep=False)
 
-    save("local", dict(array=root, shape=shape, chunks=meta.chunks, workers=w,
+    save("local", dict(array=root, shape=shape, chunks=meta.chunks, threads=t,
                        filesystem=filesystem_type(Path(root))), bench)
 
 

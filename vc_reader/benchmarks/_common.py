@@ -125,7 +125,7 @@ def chunk_files(root: str, regions: Iterable[Region]) -> list[str]:
     """The chunk files of a local zarr v2 array that the regions touch."""
     r = ZarrReader.open(root)
     keys = sorted({k for start, size in regions for k in r.chunk_indices(start, size)})
-    return [r.source.path(k) for k in keys]
+    return [os.path.join(root, r.meta.chunk_key(k)) for k in keys]
 
 
 def filesystem_type(path: Path) -> str | None:
