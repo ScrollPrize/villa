@@ -10,6 +10,23 @@ It runs a local [neuroglancer](https://github.com/google/neuroglancer) instance 
 pip install -r requirements.txt
 ```
 
+## Checking a transform against its landmarks
+
+`check_transform.py` reports how far a transform's matrix is from its own landmarks, next to
+a least-squares affine fit to the same landmarks and that fit's leave-one-out error (all in
+fixed-volume voxels). It exits 1 when the matrix misses its landmarks by more than
+`--tolerance` (default 5) voxels beyond what the least-squares fit achieves, which is what
+happens if the view is moved after the last fit. `find_transform.py` prints the same report
+whenever it writes a transform.
+
+```bash
+python check_transform.py https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc1667/volumes/20260323082859-1.129um-0.2m-59keV-masked.zarr/transform.json
+# 6 landmarks: matrix RMS 51.39 (max 88.57), least-squares RMS 0.93, leave-one-out RMS 2.73 (fixed-volume voxels)
+# WARNING: the transformation matrix does not match its own landmarks; ...
+python check_transform.py transform.json --refit transform_refit.json   # write the least-squares refit
+python -m pytest test_landmark_check.py
+```
+
 ## Usage
 
 ### Example invocation:
