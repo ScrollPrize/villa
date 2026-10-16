@@ -81,6 +81,12 @@ public:
         return outstanding_;
     }
 
+    void wait(const std::string& key)
+    {
+        std::unique_lock lock(mutex_);
+        idle_.wait(lock, [&] { return !visible_.contains(key); });
+    }
+
 private:
     struct Item {
         std::string key;
@@ -111,8 +117,8 @@ private:
                 if (it != visible_.end() && it->second.second == item.generation)
                     visible_.erase(it);
                 queued_bytes_ -= item.bytes;
-                if (--outstanding_ == 0)
-                    idle_.notify_all();
+                --outstanding_;
+                idle_.notify_all();
             }
             room_.notify_all();
         }

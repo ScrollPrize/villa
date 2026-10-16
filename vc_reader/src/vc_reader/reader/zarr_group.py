@@ -30,7 +30,7 @@ from .zarr_reader import MemoryCache, ZarrReader, _make_spec, cache_url, read_no
 
 #: Settings of ZarrGroup.open that its arrays are opened with.
 _READER_OPTIONS = ("cache_dir", "cache_writes", "cache_max_bytes", "compress_cache", "allow_lossy_cache", "threads", "connections",
-                   "read_mode", "offline")
+                   "read_mode", "offline", "prefetcher")
 
 
 class ZarrGroup:
@@ -64,6 +64,7 @@ class ZarrGroup:
         connections: int = 16,
         read_mode: str = "mmap",
         offline: bool = False,
+        prefetcher=None,
     ) -> ZarrGroup:
         """Open the zarr v2 group at ``location`` (a directory, ``http(s)://`` or ``s3://`` URL).
 
@@ -75,7 +76,7 @@ class ZarrGroup:
         options = dict(cache_dir=cache_dir, cache_writes=cache_writes, compress_cache=compress_cache,
                        cache_max_bytes=cache_max_bytes,
                        allow_lossy_cache=allow_lossy_cache, threads=threads, connections=connections,
-                       read_mode=read_mode, offline=offline)
+                       read_mode=read_mode, offline=offline, prefetcher=prefetcher)
         # Validates the options and resolves the credentials once for the whole group.
         spec, cache = _make_spec(loc, auth=auth, memory_cache=memory_cache, **options)
         access: Access = spec["access"]

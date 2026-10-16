@@ -109,7 +109,8 @@ through persistent disk caches and an in-memory chunk cache. The reading is
 done by a C++ extension (`vc_reader._native`, built by the pyproject with
 scikit-build-core and nanobind) on native threads without the GIL. Python only
 finds the caches, checks them against the remote `.zarray` and holds VC3D's
-lease. It needs the `reader` extra (numpy).
+lease; optional prefetch scheduling also runs in Python. It needs the `reader`
+extra (numpy).
 
 ```python
 from vc_reader.reader import ZarrReader, MemoryCache
@@ -161,6 +162,94 @@ ZarrReader.open("s3://bucket/v.zarr/0", auth=S3Credentials(key_id, secret, regio
 > pickled together, as in a dataset. Separate pickle streams create separate
 > caches. Cache contents are process-local, so multiply the budget by the
 > number of workers when planning total memory.
+
+### Prefetching
+
+Use the same `(start, size)` regions as `read_many`. Prefetch loads whole chunks
+through the native reader without allocating crop outputs. Normal remote reads
+join/promote outstanding work automatically; no separate readiness gate is needed.
+
+```python
+request = r.prefetch(regions)
+# Do other work, then read normally.
+crops = r.read_many(regions)
+request.wait(timeout=30)  # optional: raises loading/publication errors
+request.done(), request.exception()
+request.cancel()         # withdraw queued work only this request needs
+
+with r.prefetch_window() as ahead:
+    for current_regions, future_batches in plans:
+        # Ordered nearest first; replaces this window's previous plan.
+        ahead.update([current_regions, *future_batches])
+        crops = r.read_many(current_regions)
+        process(crops)
+```
+
+Windows retain interest even when the work queue is full. Updates drop obsolete
+queued work, preserve overlapping work, and leave other callers' requests alone.
+An unchanged, completed window does not repeatedly reload evicted chunks. Reads
+resolve cache misses normally. Closing a window withdraws its outstanding interest;
+already-running loads may finish. A discarded one-shot request still runs to completion.
+
+Without a service, the reader lazily creates an in-process scheduler, closed with
+the reader. Local prefetch warms file pages and, when configured, `MemoryCache`.
+Remote prefetch needs a disk cache or enough memory cache for a chunk. Offline
+prefetch only uses existing caches and reports cache misses without downloading.
+
+For multiple loader workers, explicitly create one coordinator in the parent:
+
+```python
+from vc_reader.reader import PrefetchService, ZarrReader
+
+def worker(client, source, cache_dir):
+    with ZarrReader.open(source, level=2, cache_dir=cache_dir,
+                         prefetcher=client, threads=4) as reader:
+        with reader.prefetch_window() as ahead:
+            # Plan/update/read here, inside the worker.
+            ahead.update([[((8192, 3584, 3584), (128, 128, 128))]])
+            return reader.read((8192, 3584, 3584), (128, 128, 128))
+
+if __name__ == "__main__":
+    with PrefetchService(connections=48, max_pending_chunks=512,
+                         max_inflight_bytes=256 << 20) as service:
+        # Pass service.client into datasets before starting their DataLoaders.
+        # Stop/join the workers before leaving this context.
+        pass
+```
+
+The picklable client works with spawn, forkserver and fork. Readers can also be
+passed to workers; create requests/windows in the worker itself. `ZarrGroup.open`
+accepts `prefetcher` and passes it to its arrays. The service requires writable disk
+caches for remote arrays and rejects `offline=True`; workers never independently
+download missing chunks. Group discovery and attribute access retain their normal
+synchronous metadata behavior.
+
+Scheduling and cache contracts:
+
+- Foreground chunk misses outrank queued speculation and share its in-flight
+  loads. Compatible readers share one service reader per array/configuration.
+  One connection and one chunk's byte capacity are reserved for demand when the
+  configured limits permit; running transfers are not forcibly interrupted.
+- `connections` limits concurrent chunk loads, `max_pending_chunks` bounds queued
+  plus active jobs, and `max_inflight_bytes` bounds the sum of their decoded chunk
+  sizes. The latter is **not a total RAM cap**: HTTP/IPC buffers, output arrays,
+  memory caches and file pages also consume memory. A chunk exceeding it is rejected.
+- `max_plan_chunks` (default 65,536) bounds total retained plan entries;
+  `max_requests` (default 1,024) bounds live requests/windows. Oversized plans raise
+  instead of silently losing work. Release completed request handles when finished.
+- Cross-process completion waits for publication of cache files or missing-chunk
+  markers. Existing disk limits still apply. A request whose data cannot be
+  published reports an error; foreground reads can receive an owning chunk over
+  IPC, including when the disk budget is smaller than a chunk. Completion does
+  not pin data or promise permanent residency.
+- `r.prefetch_stats()` / `service.stats()` report queued/active work, active
+  decoded bytes, completed loads, errors, promotions and deduplication. Speculative
+  requests retain completion status, not a second unbounded decoded-data cache.
+
+Focused verification uses tiny local arrays and a loopback HTTP fixture:
+`python -m pytest tests/test_prefetch.py`. No external volumes or network are needed.
+
+### Reader options
 
 - **Credentials** (`auth=`): the default `"auto"` signs `s3://` requests to
   buckets without a known public https form with AWS credentials from the

@@ -33,6 +33,7 @@ import itertools
 import json
 import operator
 import os
+import threading
 import weakref
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -95,9 +96,21 @@ class ZarrReader:
 
     def __init__(self, spec: dict[str, Any], cache: MemoryCache | None):
         self.memory_cache = cache
+        self._prefetch_scheduler = self._prefetch_finalizer = None
+        self._prefetch_lock = threading.Lock()
+        self._prefetch_client = spec.get("prefetcher")
+        self._prefetch_target = None
         self._pid = os.getpid()
         self.location: str = spec["location"]
         remote = is_remote(self.location)
+        if self._prefetch_client is not None:
+            from .prefetch import PrefetchClient
+            if not isinstance(self._prefetch_client, PrefetchClient):
+                raise TypeError("prefetcher must be a PrefetchService.client")
+            if remote and (spec["offline"] or not spec["cache_dirs"] or not spec["cache_writes"]):
+                raise ValueError("a prefetch service needs an online array with a writable cache_dir")
+            self._prefetch_target, meta = self._prefetch_client.register(spec)
+            spec = dict(spec, meta=meta)
         self.access: Access = spec["access"]
         self.offline: bool = bool(spec["offline"]) and remote
         key_url = cache_url(self.location, self.access) if remote else self.location
@@ -126,7 +139,8 @@ class ZarrReader:
             if spec["cache_dirs"]:
                 self.cache_layers, self.write_layer = open_layers(
                     spec["cache_dirs"], key_url, self.meta, group_url=group_url, level_key=spec["level_key"],
-                    writable=spec["cache_writes"] and not self.offline, allow_lossy=spec["allow_lossy_cache"],
+                    writable=spec["cache_writes"] and not self.offline and self._prefetch_client is None,
+                    allow_lossy=spec["allow_lossy_cache"],
                     compress=spec["compress_cache"], cache_max_bytes=spec["cache_max_bytes"])
                 layers = [layer.native_spec() for layer in self.cache_layers]
                 if self.write_layer is not None:
@@ -146,7 +160,8 @@ class ZarrReader:
                 list(self.meta.shape), list(self.meta.chunks), self.meta.dtype.itemsize,
                 np.asarray(self.meta.fill_value, dtype=self.meta.dtype).tobytes(), self.meta.separator, identity,
                 layers, write_layer=write_index, remote_url=remote_url, remote_codec=codec if remote_url else "",
-                auth=_native_auth, offline=self.offline, read_mode=spec["read_mode"], threads=threads,
+                auth=_native_auth, offline=self.offline or self._prefetch_client is not None,
+                read_mode=spec["read_mode"], threads=threads,
                 connections=spec["connections"], cache=cache._native if cache is not None else None,
                 disk_cache=budget)
         except BaseException:
@@ -155,6 +170,9 @@ class ZarrReader:
             raise
         # Queued cache writes finish even if the reader is dropped without close().
         self._finalizer = weakref.finalize(self, _shutdown, self._array, self.cache_layers, self._pid)
+        if self._prefetch_client is not None and remote:
+            from functools import partial
+            self._array.set_fetcher(partial(self._prefetch_client.demand, self._prefetch_target))
 
     # -- construction -----------------------------------------------------------
 
@@ -175,6 +193,7 @@ class ZarrReader:
         read_mode: str = "mmap",
         auth: Any = "auto",
         offline: bool = False,
+        prefetcher=None,
     ) -> ZarrReader:
         """Open the zarr v2 array at ``location`` (a directory, ``http(s)://`` or ``s3://`` URL).
 
@@ -219,12 +238,17 @@ class ZarrReader:
 
         The reader works on background threads. In a process forked after this
         call (e.g. a Linux DataLoader worker) it rebuilds them on first use.
+
+        ``prefetcher=service.client`` routes array opening and chunk misses
+        through a shared :class:`PrefetchService`. It requires a writable disk
+        cache and cannot be combined with remote ``offline=True``. Without a
+        service, :meth:`prefetch` lazily starts an in-process scheduler.
         """
         spec, cache = _make_spec(location, level=level, cache_dir=cache_dir, cache_writes=cache_writes,
                                  cache_max_bytes=cache_max_bytes,
                                  compress_cache=compress_cache, allow_lossy_cache=allow_lossy_cache,
                                  memory_cache=memory_cache, threads=threads, connections=connections,
-                                 read_mode=read_mode, auth=auth, offline=offline)
+                                 read_mode=read_mode, auth=auth, offline=offline, prefetcher=prefetcher)
         return cls(spec, cache)
 
     def __getstate__(self):
@@ -245,7 +269,10 @@ class ZarrReader:
 
     def _abandon_inherited(self) -> None:
         self._finalizer.detach()  # the parent flushes and closes its own engine
-        _INHERITED.append((self._array, self.cache_layers))
+        if self._prefetch_finalizer is not None:
+            self._prefetch_finalizer.detach()
+        _INHERITED.append((self._array, self.cache_layers, self._prefetch_scheduler))
+        self._prefetch_scheduler = self._prefetch_finalizer = None
         self._array, self.cache_layers, self.write_layer = None, [], None
 
     def flush(self) -> None:
@@ -260,6 +287,8 @@ class ZarrReader:
             if self._array is not None:
                 self._abandon_inherited()
             return
+        if self._prefetch_finalizer is not None:
+            self._prefetch_finalizer()
         self._array = None
         self._finalizer()
 
@@ -352,6 +381,60 @@ class ZarrReader:
         return list(itertools.product(*(range(l // c, (h - 1) // c + 1) for l, h, c in zip(lo, hi, self.chunks))))
 
     # -- reads ---------------------------------------------------------------------
+
+    def _prefetch_backend(self):
+        self._ready()
+        if self._prefetch_client is not None:
+            return (self._prefetch_client._backend, self._prefetch_target,
+                    self._prefetch_client.max_plan_chunks)
+        with self._prefetch_lock:
+            if self._prefetch_scheduler is None:
+                from .prefetch import _local
+                scheduler, target = _local(self)
+                self._prefetch_scheduler = scheduler
+                self._prefetch_finalizer = weakref.finalize(self, scheduler.close)
+                if is_remote(self.location):
+                    ref = weakref.ref(scheduler)
+
+                    def demand(index):
+                        backend = ref()
+                        if backend is None:
+                            raise RuntimeError("prefetch scheduler is closed")
+                        return backend.demand(target, index)
+
+                    self._array.set_fetcher(demand)
+        return self._prefetch_scheduler, "array", self._prefetch_scheduler.max_plan_chunks
+
+    def prefetch(self, regions):
+        """Schedule ``(start, size)`` regions without allocating output crops.
+
+        Returns a :class:`PrefetchRequest` with ``wait(timeout)``, ``done()``,
+        ``exception()`` and ``cancel()``. Normal reads automatically join/promote
+        outstanding remote requests. Completion does not pin cached chunks.
+        """
+        import uuid
+        from .prefetch import PrefetchRequest, _keys
+        backend, target, limit = self._prefetch_backend()
+        owner = uuid.uuid4().hex
+        backend.update(owner, target, _keys(self, [regions], limit))
+        return PrefetchRequest(backend, owner)
+
+    def prefetch_window(self):
+        """An owned lookahead window; ``update([regions, ...])`` replaces its plan.
+
+        Batches are ordered nearest first. Closing the window withdraws queued
+        work that no other caller needs. Create windows inside loader workers.
+        """
+        from .prefetch import PrefetchWindow
+        backend, target, limit = self._prefetch_backend()
+        return PrefetchWindow(self, backend, target, limit)
+
+    def prefetch_stats(self):
+        """Scheduler counters, or an empty dict if prefetch has not been enabled."""
+        self._ready()
+        if self._prefetch_client is not None:
+            return self._prefetch_client._backend.stats()
+        return self._prefetch_scheduler.stats() if self._prefetch_scheduler else {}
 
     def read(self, start: Sequence[int], size: Sequence[int], out: np.ndarray | None = None) -> np.ndarray:
         """Block ``[start, start+size)``; parts outside the array read as ``fill_value``."""
@@ -549,6 +632,7 @@ def _make_spec(
     read_mode: str = "mmap",
     auth: Any = "auto",
     offline: bool = False,
+    prefetcher=None,
     meta: dict | None = None,
 ) -> tuple[dict[str, Any], MemoryCache | None]:
     """The settings a :class:`ZarrReader` is built (and rebuilt in other processes) from, and its memory cache.
@@ -588,7 +672,8 @@ def _make_spec(
     spec = dict(location=loc, group=group, level_key=level_key, cache_dirs=dirs, cache_writes=cache_writes,
                 cache_max_bytes=cache_max_bytes,
                 compress_cache=compress_cache, allow_lossy_cache=allow_lossy_cache, threads=threads,
-                connections=connections, read_mode=read_mode, meta=meta, access=access, offline=offline)
+                connections=connections, read_mode=read_mode, meta=meta, access=access, offline=offline,
+                prefetcher=prefetcher)
     return spec, _memory_cache(memory_cache)
 
 

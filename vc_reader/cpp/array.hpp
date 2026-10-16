@@ -83,6 +83,12 @@ struct CacheMiss : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// An owning reference for the optional Python prefetch scheduler. No crop
+// output is allocated; nullptr represents a chunk absent from the source.
+struct ChunkHandle {
+    ChunkPtr value;
+};
+
 // Linear chunk index -> dense id, for grouping point reads by chunk (open addressing).
 class ChunkIds {
 public:
@@ -216,6 +222,56 @@ public:
 
     std::size_t pending_writes() { return writes_ ? writes_->outstanding() : 0; }
     std::size_t ndim() const noexcept { return spec_.shape.size(); }
+
+    void set_fetcher(std::function<ChunkHandle(const Index&)> fetcher)
+    {
+        fetcher_.store(std::make_shared<const Fetcher>(std::move(fetcher)));
+    }
+
+    // The scheduler calls this directly, bypassing its own demand callback.
+    // It shares the normal decoder, memory cache, fetch deduplication and writes.
+    ChunkHandle load_chunk(const Index& idx)
+    {
+        validate_chunk(idx);
+        const auto k = key(idx), ck = spec_.identity + "|" + k;
+        if (cache_) {
+            auto [found, chunk] = cache_->get(ck);
+            if (found) return {chunk};
+        }
+        if (writes_) {
+            auto [found, chunk] = writes_->pending(k);
+            if (found) return {chunk};
+        }
+        ChunkPtr chunk;
+        bool found = false;
+        for (std::size_t li = 0; li < spec_.layers.size(); ++li) {
+            if (auto value = read_layer_chunk(li, k)) {
+                chunk = *value;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            if (spec_.offline)
+                throw CacheMiss("chunk " + k + " of " + spec_.identity + " is not in the disk cache (offline)");
+            if (http_) chunk = fetch(k);
+        }
+        if (cache_) cache_->put(ck, chunk);
+        return {chunk};
+    }
+
+    // Cross-process completion requires publication, including missing markers.
+    // A refused/failed cache write returns false; demand still owns its chunk.
+    bool publish_chunk(const Index& idx)
+    {
+        validate_chunk(idx);
+        const auto k = key(idx);
+        if (writes_) writes_->wait(k);
+        for (const auto& layer : spec_.layers)
+            if (layer.kind == "array" || exists(layer.root + "/" + k) || exists(marker_path(layer, k)))
+                return true;
+        return false;
+    }
 
     // Credentials for later fetches (e.g. refreshed temporary keys).
     void set_auth(Auth auth)
@@ -396,6 +452,15 @@ private:
     // Points per run: shorter runs are planned as single points (recomputing a point costs
     // more than reading its planned offset); longer ones are cut, so runs can be shared out.
     static constexpr std::uint64_t kRunMin = 8, kRunMax = std::uint64_t{1} << 12;
+    void validate_chunk(const Index& idx) const
+    {
+        if (idx.size() != grid_.size())
+            throw std::invalid_argument("chunk index rank does not match the array");
+        for (std::size_t i = 0; i < idx.size(); ++i)
+            if (idx[i] < 0 || idx[i] >= grid_[i])
+                throw std::out_of_range("chunk index outside the array");
+    }
+
     // Everything one chunk supplies: boxes (read_many) or single elements (point reads).
     struct Work {
         Index idx;
@@ -1201,6 +1266,14 @@ private:
                 return;
             }
         }
+        if (auto fetcher = fetcher_.load()) {
+            ChunkPtr chunk = (*fetcher)(w.idx).value;
+            if (chunk && chunk->size() != chunk_bytes_)
+                throw std::runtime_error("prefetch coordinator returned an invalid chunk size");
+            if (cache_) cache_->put(ck, chunk);
+            apply(chunk, w, out_strides, op);
+            return;
+        }
         if (spec_.offline)
             throw CacheMiss("chunk " + k + " of " + spec_.identity + " is not in the disk cache (offline)");
         if (!http_) {
@@ -1344,6 +1417,8 @@ private:
     std::size_t chunk_bytes_ = 0;
     Stats stats_;
     std::mutex inflight_mutex_;
+    using Fetcher = std::function<ChunkHandle(const Index&)>;
+    std::atomic<std::shared_ptr<const Fetcher>> fetcher_;
     std::unordered_map<std::string, std::shared_future<ChunkPtr>> inflight_;
     std::atomic<bool> write_disabled_{false};
     std::mutex error_mutex_;

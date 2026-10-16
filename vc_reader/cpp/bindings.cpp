@@ -9,6 +9,7 @@
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/vector.h>
+#include <nanobind/stl/function.h>
 
 #include <functional>
 #include <numeric>
@@ -117,6 +118,18 @@ NB_MODULE(_native, m)
              nb::call_guard<nb::gil_scoped_release>())
         .def("set_max_bytes", &vcr::DiskCache::set_max_bytes, nb::call_guard<nb::gil_scoped_release>());
 
+    nb::class_<vcr::ChunkHandle>(m, "ChunkHandle")
+        .def("to_bytes", [](const vcr::ChunkHandle& h) -> nb::object {
+            if (!h.value) return nb::none();
+            return nb::bytes(reinterpret_cast<const char*>(h.value->data()), h.value->size());
+        })
+        .def_static("from_bytes", [](nb::object data) {
+            if (data.is_none()) return vcr::ChunkHandle{};
+            auto b = nb::cast<nb::bytes>(data);
+            const auto* p = static_cast<const std::uint8_t*>(b.data());
+            return vcr::ChunkHandle{std::make_shared<const vcr::Chunk>(p, p + b.size())};
+        }, "data"_a.none());
+
     nb::class_<vcr::Array>(m, "Array")
         .def(
             "__init__",
@@ -222,6 +235,9 @@ NB_MODULE(_native, m)
             },
             "coords"_a, "out"_a, "kind"_a, "itemsize"_a, "swap"_a, "out64"_a,
             "N-linear interpolation at (n, ndim) float64 points into float32/float64 outputs (the GIL is released).")
+        .def("load_chunk", &vcr::Array::load_chunk, nb::call_guard<nb::gil_scoped_release>())
+        .def("publish_chunk", &vcr::Array::publish_chunk, nb::call_guard<nb::gil_scoped_release>())
+        .def("set_fetcher", &vcr::Array::set_fetcher)
         .def("set_auth", [](vcr::Array& a, const AuthTuple& auth) { a.set_auth(to_auth(auth)); }, "auth"_a,
              "Credentials for later fetches.")
         .def("flush", &vcr::Array::flush, nb::call_guard<nb::gil_scoped_release>(),
