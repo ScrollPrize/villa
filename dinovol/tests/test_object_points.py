@@ -317,6 +317,25 @@ class ObjectLabelTests(unittest.TestCase):
         g_neg = s_collapsed.grad[:, 2:4].reshape(-1, 6).mean(0)
         self.assertLess(float(F.cosine_similarity(g_pos[None], g_neg[None])), -0.5)
 
+        # Once +1 and -1 are separated (e.g. opposite hemispheres) and same-class similarity
+        # exceeds pos_margin=0.75, varying same-class alignment above 0.75 does not change the loss.
+        loss_fn.ink_pos_queue = torch.empty((0, 6))
+        loss_fn.ink_neg_queue = torch.empty((0, 6))
+        e0 = torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        e1 = torch.tensor([0.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+        s_sep = torch.zeros(views, batch, points, 6)
+        s_sep[:, :, :2] = e0
+        s_sep[:, :, 2:4] = -e0
+        t_high1 = s_sep.clone()
+        t_high2 = s_sep.clone()
+        t_high1[:, :, :2] = F.normalize(0.85 * e0 + 0.5268 * e1, dim=-1)  # cos ~= 0.85 > 0.75
+        t_high2[:, :, :2] = F.normalize(0.95 * e0 + 0.3122 * e1, dim=-1)  # cos ~= 0.95 > 0.75
+        l1, _ = loss_fn._ink_loss(s_sep, t_high1, valid_2d, valid_2d, ink, n_views=views)
+        loss_fn.ink_pos_queue = torch.empty((0, 6))
+        loss_fn.ink_neg_queue = torch.empty((0, 6))
+        l2, _ = loss_fn._ink_loss(s_sep, t_high2, valid_2d, valid_2d, ink, n_views=views)
+        torch.testing.assert_close(l1, l2)
+
         # Batches with only -1 (non-ink) points and no +1 anchors must not pull embeddings together.
         ink_neg_only = torch.tensor([[-1, -1, -1, 0, 0, 0, 0, 0], [-1, -1, -1, 0, 0, 0, 0, 0]], dtype=torch.long)
         neg_only_loss, neg_only_anchors = loss_fn._ink_loss(
