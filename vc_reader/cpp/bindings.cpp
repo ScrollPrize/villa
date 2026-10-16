@@ -28,6 +28,17 @@ static vcr::Auth to_auth(const AuthTuple& t)
     return vcr::Auth{kind, user, secret, token, region};
 }
 
+static vcr::ElementType sample_type(const std::string& name, std::size_t itemsize, bool swap)
+{
+    const char kind = name.size() == 1 ? name[0] : '?';
+    const bool ok = (kind == 'u' || kind == 'i') ? (itemsize == 1 || itemsize == 2 || itemsize == 4 || itemsize == 8)
+                    : kind == 'f'             ? (itemsize == 4 || itemsize == 8)
+                                              : (kind == 'b' && itemsize == 1);
+    if (!ok)
+        throw nb::type_error("sample() needs a bool, integer, float32 or float64 array");
+    return {kind, itemsize, swap};
+}
+
 NB_MODULE(_native, m)
 {
     m.doc() = "Native zarr v2 read path: local and HTTP chunks, disk cache layers, memory cache.";
@@ -219,22 +230,66 @@ NB_MODULE(_native, m)
             "sample_linear",
             [](vcr::Array& a, nb::ndarray<double, nb::ndim<2>, nb::c_contig, nb::device::cpu> coords, Bytes out,
                const std::string& kind_name, std::size_t itemsize, bool swap, bool out64) {
-                const char kind = kind_name.size() == 1 ? kind_name[0] : '?';
                 if (static_cast<std::size_t>(out.size()) != coords.shape(0) * (out64 ? 8 : 4))
                     throw nb::value_error("the output buffer does not match the points");
                 if (coords.shape(1) != a.ndim())
                     throw nb::value_error("points must have one coordinate per array dimension");
-                const bool ok = (kind == 'u' || kind == 'i') ? (itemsize == 1 || itemsize == 2 || itemsize == 4 || itemsize == 8)
-                                : kind == 'f'                 ? (itemsize == 4 || itemsize == 8)
-                                                              : (kind == 'b' && itemsize == 1);
-                if (!ok)
-                    throw nb::type_error("sample() needs a bool, integer, float32 or float64 array");
+                const auto type = sample_type(kind_name, itemsize, swap);
                 nb::gil_scoped_release release;
-                a.sample_linear(coords.data(), coords.shape(0), vcr::ElementType{kind, itemsize, swap}, out64,
-                                out.data());
+                a.sample_linear(coords.data(), coords.shape(0), type, out64, out.data());
             },
             "coords"_a, "out"_a, "kind"_a, "itemsize"_a, "swap"_a, "out64"_a,
             "N-linear interpolation at (n, ndim) float64 points into float32/float64 outputs (the GIL is released).")
+        .def(
+            "read_affine_many",
+            [](vcr::Array& a, const std::vector<vcr::Index>& shapes,
+               nb::ndarray<double, nb::ndim<2>, nb::c_contig, nb::device::cpu> origins,
+               nb::ndarray<double, nb::ndim<3>, nb::c_contig, nb::device::cpu> axes,
+               std::vector<Bytes> outs, int order, const std::string& kind, std::size_t itemsize,
+               bool swap, bool out64) {
+                if (a.ndim() != 3 || origins.shape(1) != 3 || axes.shape(1) != 3 || axes.shape(2) != 3)
+                    throw nb::value_error("affine reads require 3-D shapes, origins and axes");
+                if (shapes.size() != outs.size() || shapes.size() != origins.shape(0) || shapes.size() != axes.shape(0))
+                    throw nb::value_error("shapes, origins, axes and outs must have the same length");
+                if (order != 0 && order != 1)
+                    throw nb::value_error("order must be 0 (nearest) or 1 (linear)");
+                if (itemsize != a.itemsize())
+                    throw nb::value_error("itemsize does not match the source array");
+                const auto type = order == 1 ? sample_type(kind, itemsize, swap) : vcr::ElementType{};
+                const std::size_t outsize = order == 0 ? itemsize : (out64 ? 8 : 4);
+                std::vector<vcr::AffineCoordinates> grids(shapes.size());
+                std::vector<std::size_t> counts(shapes.size());
+                // Validate the whole batch before writing any output.
+                for (std::size_t j = 0; j < shapes.size(); ++j) {
+                    if (shapes[j].size() != 3)
+                        throw nb::value_error("shape must have three non-negative integers");
+                    auto& grid = grids[j];
+                    std::size_t n = 1;
+                    for (std::size_t i = 0; i < 3; ++i) {
+                        const auto size = shapes[j][i];
+                        if (size < 0 || (size && n > std::numeric_limits<std::size_t>::max() / size))
+                            throw nb::value_error("invalid or overflowing affine shape");
+                        n *= size;
+                        grid.shape[i] = size;
+                        grid.origin[i] = origins(j, i);
+                        if (!std::isfinite(grid.origin[i]))
+                            throw nb::value_error("origin must be finite");
+                        for (std::size_t k = 0; k < 3; ++k) {
+                            grid.axes[3*i+k] = axes(j, i, k);
+                            if (!std::isfinite(grid.axes[3*i+k]))
+                                throw nb::value_error("axes must be finite");
+                        }
+                    }
+                    if (n > std::numeric_limits<std::size_t>::max() / outsize || outs[j].size() != n * outsize)
+                        throw nb::value_error("an output buffer does not match its affine shape");
+                    counts[j] = n;
+                }
+                nb::gil_scoped_release release;
+                for (std::size_t j = 0; j < grids.size(); ++j)
+                    a.read_affine(grids[j], counts[j], order, type, out64, outs[j].data());
+            },
+            "shapes"_a, "origins"_a, "axes"_a, "outs"_a, "order"_a, "kind"_a, "itemsize"_a, "swap"_a, "out64"_a,
+            "Sample regular affine grids with generated coordinates (the GIL is released).")
         .def("load_chunk", &vcr::Array::load_chunk, nb::call_guard<nb::gil_scoped_release>())
         .def("publish_chunk", &vcr::Array::publish_chunk, nb::call_guard<nb::gil_scoped_release>())
         .def("set_fetcher", &vcr::Array::set_fetcher)

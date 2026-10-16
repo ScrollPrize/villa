@@ -14,6 +14,7 @@
 #include <sys/mman.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cmath>
@@ -34,6 +35,39 @@
 #include <vector>
 
 namespace vcr {
+
+// Coordinate providers let point arrays and procedural grids share the sampler.
+template <class T>
+struct PointCoordinates {
+    using value_type = T;
+    const T* data;
+    std::size_t ndim;
+    const T* operator()(std::size_t p, T*) const { return data + p * ndim; }
+    void prefetch(std::size_t p) const {
+#if defined(__GNUC__) || defined(__clang__)
+        __builtin_prefetch(data + p * ndim);
+#endif
+    }
+};
+
+// A regular 3-D output grid in source-array coordinates. No voxel-sized
+// coordinate buffer: each point is reconstructed independently in float64.
+struct AffineCoordinates {
+    using value_type = double;
+    std::array<std::size_t, 3> shape;
+    std::array<double, 3> origin;
+    std::array<double, 9> axes;  // row major: columns are output-axis steps
+
+    const double* operator()(std::size_t p, double* c) const {
+        const auto x = p % shape[2];
+        p /= shape[2];
+        const auto y = p % shape[1], z = p / shape[1];
+        for (std::size_t i = 0; i < 3; ++i)
+            c[i] = origin[i] + axes[3*i] * z + axes[3*i+1] * y + axes[3*i+2] * x;
+        return c;
+    }
+    void prefetch(std::size_t) const {}
+};
 
 // How sample() reads stored elements as numbers.
 struct ElementType {
@@ -222,6 +256,7 @@ public:
 
     std::size_t pending_writes() { return writes_ ? writes_->outstanding() : 0; }
     std::size_t ndim() const noexcept { return spec_.shape.size(); }
+    std::size_t itemsize() const noexcept { return spec_.itemsize; }
 
     void set_fetcher(std::function<ChunkHandle(const Index&)> fetcher)
     {
@@ -349,9 +384,9 @@ public:
     void read_points(const std::int64_t* coords, std::size_t n, std::uint8_t* out)
     {
         if (ndim() == 3)
-            read_points_as<3>(coords, n, out);
+            read_points_as<3>(PointCoordinates{coords, ndim()}, n, out);
         else
-            read_points_as<0>(coords, n, out);
+            read_points_as<0>(PointCoordinates{coords, ndim()}, n, out);
     }
 
     // Element nearest to each real-valued point (voxel i at coordinate i, ties to even),
@@ -359,9 +394,9 @@ public:
     void sample_nearest(const double* coords, std::size_t n, std::uint8_t* out)
     {
         if (ndim() == 3)
-            read_points_as<3>(coords, n, out);
+            read_points_as<3>(PointCoordinates{coords, ndim()}, n, out);
         else
-            read_points_as<0>(coords, n, out);
+            read_points_as<0>(PointCoordinates{coords, ndim()}, n, out);
     }
 
     // N-linear interpolation at real-valued points (voxel i at coordinate i): the weighted
@@ -369,6 +404,24 @@ public:
     // on the grid. Neighbours outside the array read as fill. Non-finite points give NaN.
     // Computed in double; `out` holds float (out64 false) or double values.
     void sample_linear(const double* coords, std::size_t n, const ElementType& type, bool out64, void* out)
+    {
+        sample_linear_coordinates(PointCoordinates{coords, ndim()}, n, type, out64, out);
+    }
+
+    void read_affine(const AffineCoordinates& grid, std::size_t n, int order,
+                     const ElementType& type, bool out64, std::uint8_t* out)
+    {
+        if (ndim() != 3)
+            throw std::invalid_argument("affine reads require a 3-D source array");
+        if (order == 0)
+            read_points_as<3>(grid, n, out);
+        else
+            sample_linear_coordinates(grid, n, type, out64, out);
+    }
+
+    template <class Coordinates>
+    void sample_linear_coordinates(const Coordinates& coords, std::size_t n, const ElementType& type,
+                                   bool out64, void* out)
     {
         if (spec_.shape.size() > kMaxSampleDims)
             throw std::invalid_argument("sample() supports at most 16 dimensions");
@@ -799,14 +852,16 @@ private:
 
     // Keep the common 3-D loop bounds visible to the compiler, sharing the same
     // planner and bounds/rounding rules with the arbitrary-rank path.
-    template <std::size_t N, class Coord>
-    void read_points_as(const Coord* coords, std::size_t n, std::uint8_t* out)
+    template <std::size_t N, class Coordinates>
+    void read_points_as(const Coordinates& coords, std::size_t n, std::uint8_t* out)
     {
+        using Coord = typename Coordinates::value_type;
         const std::size_t nd = N ? N : ndim();
         for (std::size_t b0 = 0; b0 < n; b0 += kPointBatch) {
             const std::size_t m = std::min(kPointBatch, n - b0);
             gather_points<N>(m, out, [&](std::size_t, std::size_t p, std::int64_t* idx, auto& emit) {
-                const Coord* c = coords + (b0 + p) * nd;
+                Coord scratch[N ? N : kMaxSampleDims];
+                const Coord* c = coords(b0 + p, scratch);
                 const std::int64_t* at;
                 if constexpr (std::is_same_v<Coord, double>) {
                     for (std::size_t i = 0; i < nd; ++i)
@@ -896,8 +951,8 @@ private:
     // is interpolated from that chunk while it is resolved. The other ("split") points read
     // their neighbours into `raw` (neighbour j of a split point at slot first + j of its
     // planning segment) and are interpolated after.
-    template <std::size_t N, class Load>
-    void sample_linear_as(const double* coords, std::size_t n, const ElementType& type, bool out64, void* out,
+    template <std::size_t N, class Load, class Coordinates>
+    void sample_linear_as(const Coordinates& coords, std::size_t n, const ElementType& type, bool out64, void* out,
                           Load load)
     {
         const std::size_t nd = N ? N : spec_.shape.size();
@@ -941,7 +996,8 @@ private:
             const std::size_t m = std::min(kPointBatch, n - b0);
             split.assign(plan_segments(m), Splits{});
             auto work = plan_points<N>(m, points, runs, [&](std::size_t s, std::size_t p, std::int64_t* idx, auto& emit) {
-                const double* c = coords + (b0 + p) * nd;
+                double scratch[N ? N : kMaxSampleDims];
+                const double* c = coords(b0 + p, scratch);
                 bool finite = true, outside = false;
                 for (std::size_t i = 0; i < nd; ++i) {
                     finite &= std::isfinite(c[i]);
@@ -997,6 +1053,7 @@ private:
             op.read = [&](const std::uint8_t* data, std::int64_t origin, const Work& w) {
                 for_points(w.points, [&](std::span<const Point> part) {
                     Cell<N> cell;
+                    double coordinate[N ? N : kMaxSampleDims];
                     for (std::size_t j = 0; j < part.size(); ++j) {
 #if defined(__GNUC__) || defined(__clang__)
                         // Chunk grouping makes the voxel reads local, but random
@@ -1005,7 +1062,7 @@ private:
                             if (j + 8 < part.size()) {
                                 const Point& next = part[j + 8];
                                 if (!(next.tag & kSplit)) {
-                                    __builtin_prefetch(coords + next.tag * nd);
+                                    coords.prefetch(next.tag);
                                     const auto* at = data + (next.src - origin);
                                     __builtin_prefetch(at);
                                     if (next.src + reach <= static_cast<std::int64_t>(chunk_bytes_)) {
@@ -1024,7 +1081,7 @@ private:
                             std::memcpy(raw.data() + slot * isz, at, isz);
                             continue;
                         }
-                        cell_of<N>(coords + pt.tag * nd, nd, cell);
+                        cell_of<N>(coords(pt.tag, coordinate), nd, cell);
                         store(pt.tag, value(cell, at));
                     }
                 });
@@ -1033,33 +1090,36 @@ private:
                 const Index chunk = chunk_base(w);
                 for_runs(w.runs, [&](std::span<const Run> part) {
                     Cell<N> cell;
+                    double coordinate[N ? N : kMaxSampleDims];
                     for (const Run& r : part)
                         for (std::uint64_t p = r.first; p < r.first + r.count; ++p) {
-                            cell_of<N>(coords + p * nd, nd, cell);
+                            cell_of<N>(coords(p, coordinate), nd, cell);
                             store(p, value(cell, data + (offset_in<N>(cell.lo, chunk.data()) - origin)));
                         }
                 });
             };
             op.fill = [&](const Work& w) {
                 Cell<N> cell;
+                double coordinate[N ? N : kMaxSampleDims];
                 for (const Point& pt : w.points) {
                     if (pt.tag & kSplit)
                         continue;  // its raw slot holds fill already
-                    cell_of<N>(coords + pt.tag * nd, nd, cell);
+                    cell_of<N>(coords(pt.tag, coordinate), nd, cell);
                     store(pt.tag, interpolate(cell, [&](std::size_t) { return fill; }));
                 }
                 for (const Run& r : w.runs)
                     for (std::uint64_t p = r.first; p < r.first + r.count; ++p) {
-                        cell_of<N>(coords + p * nd, nd, cell);
+                        cell_of<N>(coords(p, coordinate), nd, cell);
                         store(p, interpolate(cell, [&](std::size_t) { return fill; }));
                     }
             };
             run(work, {}, &op);
             pool_.parallel_for(split.size(), [&](std::size_t s) {
                 Cell<N> cell;
+                double coordinate[N ? N : kMaxSampleDims];
                 for (const Split& sp : split[s].points) {
                     const std::uint8_t* at = raw.data() + (base[s] + sp.first) * isz;
-                    cell_of<N>(coords + sp.p * nd, nd, cell);
+                    cell_of<N>(coords(sp.p, coordinate), nd, cell);
                     store(sp.p, interpolate(cell, [&](std::size_t corner) { return load(at + corner * isz); }));
                 }
             });

@@ -493,6 +493,105 @@ class ZarrReader:
         self._array.read_points(flat, out.view(np.uint8), self.dtype.itemsize)
         return out.reshape(pts.shape[:-1])
 
+    def read_affine(
+        self, shape: Sequence[int], origin: Any, axes: Any, *, order: int = 1,
+        dtype: Any = None, out: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Sample an oriented 3-D crop without constructing a coordinate array.
+
+        ``source_zyx = origin + axes @ [z, y, x]`` maps output voxel indices
+        into this array's voxel coordinates (not level-0 or physical units).
+        Columns of the 3x3 ``axes`` matrix are source-space steps along output
+        z, y, x. ``origin`` is the first sample, not the crop centre. Rotations,
+        anisotropic spacing, reflections, shears and singleton-axis planes
+        are supported. No antialiasing is applied when downsampling.
+
+        Interpolation and boundaries follow :meth:`sample`: order 1 uses
+        float64 arithmetic and returns float32 by default (or float64);
+        order 0 rounds ties to even and returns the stored dtype. Missing
+        chunks and outside neighbours use the source's ``fill_value``.
+        ``dtype`` for order 0 must be None or the stored dtype.
+
+        ``out`` must be writable, aligned, C-contiguous and have the requested
+        shape and dtype. It is returned unchanged as an object. Coordinates
+        are generated natively, with bounded point-planning scratch space.
+        """
+        return self.read_affine_many([(shape, origin, axes)], order=order, dtype=dtype,
+                                     out=None if out is None else [out])[0]
+
+    def read_affine_many(
+        self, grids: Iterable[tuple[Sequence[int], Any, Any]], *, order: int = 1,
+        dtype: Any = None, out: Sequence[np.ndarray | None] | None = None,
+    ) -> list[np.ndarray]:
+        """Sample ``(shape, origin, axes)`` grids using :meth:`read_affine` semantics.
+
+        Grids may have different shapes. The native call processes them in
+        order, parallelizing chunk work within each grid and sharing the
+        reader's caches. Chunk loads are deduplicated within each point batch
+        (up to 2**20 points); reuse across grids depends on the caches.
+        ``out`` optionally supplies one destination (or None) per grid.
+        Output buffers must not overlap. No full source box or coordinate
+        grid is assembled. Statistics/normalization are left to the caller.
+        """
+        self._ready()
+        if self.ndim != 3:
+            raise ValueError("affine reads require a 3-D source array")
+        if order not in (0, 1):
+            raise ValueError("order must be 0 (nearest) or 1 (linear)")
+        out_dtype = np.dtype(dtype) if dtype is not None else (self.dtype if order == 0 else np.dtype(np.float32))
+        if order == 0 and out_dtype != self.dtype:
+            raise ValueError("dtype must match the stored dtype for order=0")
+        if order == 1 and out_dtype not in (np.dtype(np.float32), np.dtype(np.float64)):
+            raise ValueError("dtype must be float32 or float64 for order=1")
+        if order == 1 and not (self.dtype.kind in "biu" or self.dtype.kind == "f" and self.dtype.itemsize in (4, 8)):
+            raise TypeError("affine interpolation needs a bool, integer, float32 or float64 array")
+        grids = list(grids)
+        if out is not None and len(out) != len(grids):
+            raise ValueError("out must have one array per grid")
+        shapes, origins, matrices, results = [], [], [], []
+        for i, (shape, origin, axes) in enumerate(grids):
+            try:
+                shape = tuple(operator.index(n) for n in shape)
+            except TypeError as exc:
+                raise ValueError("shape must have three non-negative integers") from exc
+            if len(shape) != 3 or any(n < 0 for n in shape):
+                raise ValueError("shape must have three non-negative integers")
+            # Python integers avoid overflow before the native allocation.
+            count = 1
+            for n in shape:
+                if n > np.iinfo(np.intp).max:
+                    raise ValueError("affine shape is too large")
+                count *= n
+            if count > np.iinfo(np.intp).max // out_dtype.itemsize:
+                raise ValueError("affine shape is too large")
+            origin = np.asarray(origin, dtype=np.float64)
+            axes = np.asarray(axes, dtype=np.float64)
+            if origin.shape != (3,) or not np.isfinite(origin).all():
+                raise ValueError("origin must have shape (3,) and be finite")
+            if axes.shape != (3, 3) or not np.isfinite(axes).all():
+                raise ValueError("axes must have shape (3, 3) and be finite")
+            given = None if out is None else out[i]
+            if given is None:
+                given = _empty(shape, out_dtype)
+            elif not isinstance(given, np.ndarray) or given.shape != shape or given.dtype != out_dtype:
+                raise ValueError(f"out must have shape {shape} and dtype {out_dtype}")
+            if not (given.flags.writeable and given.flags.c_contiguous and given.flags.aligned):
+                raise ValueError("out must be writable, aligned and C-contiguous")
+            if any(np.shares_memory(given, previous) for previous in results):
+                raise ValueError("output buffers must not overlap")
+            shapes.append(shape)
+            origins.append(origin)
+            matrices.append(axes)
+            results.append(given)
+        dt = self.dtype
+        self._array.read_affine_many(
+            shapes, np.ascontiguousarray(origins, dtype=np.float64).reshape(-1, 3),
+            np.ascontiguousarray(matrices, dtype=np.float64).reshape(-1, 3, 3),
+            [a.reshape(-1).view(np.uint8) for a in results], order, dt.kind, dt.itemsize,
+            not dt.isnative, out_dtype == np.float64,
+        )
+        return results
+
     def sample(self, points: Any, *, order: int = 1, dtype: Any = np.float32) -> np.ndarray:
         """Values at real-valued points: ``points`` of shape ``(..., ndim)`` -> values of shape ``(...)``.
 

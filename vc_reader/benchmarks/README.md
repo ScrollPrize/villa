@@ -99,6 +99,76 @@ app -p hi -o /tmp/reader.er` can precede the Python command. Build with
 match Release optimization) for symbols; inspect with
 `gprofng display text -limit 20 -functions /tmp/reader.er`.
 
+## Oriented crops: `bench_affine.py`
+
+Compare native `read_affine` with explicit NumPy coordinate construction plus
+`sample`, and with sampling a prebuilt grid. `affine-out` additionally reuses
+the destination. This measures raw float32 samples, without normalization;
+it does not compare against the tracers' Numba or GPU implementations.
+
+```bash
+.venv/bin/python benchmarks/run_native.py /tmp/vcr-affine-before/_native*.so \
+  benchmarks/bench_affine.py --reps 7 --cache-state both \
+  --methods points,points-prebuilt --output /tmp/affine-before.json
+.venv/bin/python benchmarks/run_native.py build/cp314-cp314-linux_x86_64/_native*.so \
+  benchmarks/bench_affine.py --reps 7 --cache-state both --output /tmp/affine-after.json
+```
+
+The baseline extension is saved before rebuilding. `--array` selects another
+local array; the fixed source region must be populated (the harness checks
+that every enclosing chunk is present). `--only cube128` selects one workload,
+and `--methods affine` selects one implementation. The JSON records the array,
+origin, axes, output shapes, environment, thread count and every timing.
+Each method has one warm-up and seven measured repetitions by default, with
+method order alternating each repetition. Every output is checked against
+`sample` outside the timer (`rtol=1e-6, atol=1e-5`). Cold runs close mappings and
+evict the enclosing chunk files before each method; this requires Linux and
+does not flush the drive cache. Opening and eviction are excluded from timing.
+
+### Initial affine results, 2026-10-16
+
+PHercParis4 `20260411134726`, 2.4 µm/78 keV volume, level 2, on the default
+NVMe RAID path above. uint8, uncompressed 128³ chunks; grid origin
+`(9300.25, 4000.5, 4000.75)`, rotated axes with step lengths `(0.8, 0.9, 0.73)`.
+Both extensions used GCC 15, Release (`-O3 -DNDEBUG -g`), Python 3.14.4,
+16 reader threads, Linux x86-64 on the 24-CPU host described below.
+No dependencies were installed or source volumes modified.
+
+Times are **mean / min / median / max milliseconds**, seven repetitions.
+The baseline includes constructing the coordinates every call; affine
+allocates its result through the existing output pool in both cache states.
+
+| Crop / cache | Explicit grid + sample, before | Native affine, after | Median speedup |
+|---|---|---|---|
+| 64³ cold | 3.046 / 2.630 / 2.845 / 3.692 | 2.342 / 1.751 / 2.133 / 3.673 | 1.33× |
+| 64³ warm | 2.481 / 2.268 / 2.491 / 2.735 | 1.669 / 1.358 / 1.725 / 1.873 | 1.44× |
+| 128³ cold | 19.032 / 18.059 / 19.087 / 20.000 | 6.770 / 6.612 / 6.728 / 6.969 | 2.84× |
+| 128³ warm | 19.472 / 18.013 / 19.265 / 20.853 | 7.113 / 5.987 / 6.818 / 8.695 | 2.83× |
+| 1×512×512 cold | 3.328 / 3.146 / 3.313 / 3.513 | 2.508 / 2.159 / 2.371 / 3.320 | 1.40× |
+| 1×512×512 warm | 2.481 / 2.299 / 2.526 / 2.601 | 1.436 / 1.123 / 1.426 / 1.726 | 1.77× |
+
+Prebuilt-coordinate sampling is faster than native affine in these runs:
+for warm 128³ crops, the same after-build measured 5.494 ms median with a
+prebuilt grid versus 6.818 ms for affine. The benefit is avoiding grid
+construction and storage (48 MiB of coordinates for 128³), not a universal
+interpolation speedup. Reusing `out` was approximately unchanged for 128³
+(6.839 ms median warm); small-crop timings are noisy. These results do not
+establish performance on macOS/arm64, compressed sources or remote data.
+
+`gprofng collect app -p hi` on a separate loop of 1,000 warm 128³ affine
+reads with output reuse attributed 36.74% of exclusive CPU samples to point
+classification/planning, 25.72% to run interpolation, 19.01% to `cell_of`,
+and 8.72% to coordinate generation. These are CPU samples across threads,
+not wall-time fractions. The profile used the same Release object files
+relinked with symbols retained (without the linker's `-s`); profiling was
+separate from the timings above.
+
+The full suite passed 383 offline tests, including affine grids crossing
+chunk/array boundaries, missing chunks, rotations, shears, reflected axes,
+nearest ties, byte-swapped dtypes, output reuse, HTTP caches, pickle/offline
+reads, and more than 2²⁰ samples per crop. Existing point-sampler numerical
+tests still pass; no fast-math or reduced interpolation precision was added.
+
 ## Remote reads: `bench_remote.py`
 
 ```

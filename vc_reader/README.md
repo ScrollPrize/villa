@@ -134,6 +134,68 @@ vals = r[z_idx, y_idx, x_idx]                         # numpy integer-array inde
 vals = r.sample(zyx_float)                            # trilinear, float32 (order=0: nearest, as stored)
 ```
 
+### Oriented crops and oblique slices
+
+`read_affine` samples a regular 3-D output grid in the opened array's voxel
+coordinates. Native code generates coordinates as needed and samples the
+source chunks directly, without assembling an axis-aligned source block or
+a full coordinate array.
+
+```python
+import numpy as np
+
+angle = np.deg2rad(30)
+c, s = np.cos(angle), np.sin(angle)
+axes = np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+shape = (64, 128, 128)
+center = np.array([9000, 3600, 3600], dtype=np.float64)
+origin = center - axes @ ((np.asarray(shape) - 1) / 2)
+crop = r.read_affine(shape, origin, axes)             # float32, trilinear
+r.read_affine(shape, origin, axes, out=crop)          # reuse final storage
+plane = r.read_affine((1, 128, 128), origin, axes)    # singleton depth is a plane
+crops = r.read_affine_many([
+    (shape, origin, axes),
+    (shape, origin + [32, 0, 0], axes),
+])
+```
+
+The mapping is **`source_zyx = origin + axes @ [output_z, output_y, output_x]`**.
+Each column of `axes` is the source-space step for one output axis, including
+spacing. `origin` is the first sample, not the centre. Reflections, shears and
+anisotropic spacing are supported; axes need not be orthonormal. Coordinates
+are relative to the opened pyramid level, not physical units or level 0.
+There is no antialiasing filter when downsampling.
+
+`order=1` uses float64 interpolation and returns float32 by default, or
+`dtype=np.float64`. `order=0` uses nearest sampling (ties to even) and retains
+the stored dtype; an explicit dtype must match it. Outside neighbours and
+missing chunks use the array's stored `fill_value`. This does **not** imply
+zero padding for arrays with nonzero fill values. Normalization remains the
+caller's responsibility.
+
+`out` must have the requested dtype and shape and be writable, aligned and
+C-contiguous. `read_affine_many` accepts differing shapes and an optional
+sequence of output arrays (or `None` entries); buffers must not overlap.
+It processes crops in order within one native call, using native threads for
+each crop. Chunk loads are shared within each point batch (up to 2²⁰ samples);
+reuse across batches and crops depends on the caches. It does not perform
+joint chunk planning across all crops.
+
+For tracer frames whose columns are `(u, v, forward)` in **XYZ**, and output
+axes `(depth, height, width) = (forward, v, u)`, reorder both rows and columns:
+
+```python
+# pos_xyz/frame_xyz and crop offsets are in trace-grid units;
+# input_scale converts trace-grid voxels to the opened array's voxels.
+axes = input_scale * spacing * frame_xyz[::-1, ::-1]
+first_local = np.array([lateral_start, vertical_start, forward_start])
+origin = input_scale * (pos_xyz + frame_xyz @ first_local)[::-1]
+image = r.read_affine((depth, height, width), origin, axes)
+```
+
+Apply the dataset's intensity scaling and per-crop normalization afterwards.
+Existing tracer implementations are not automatically switched to this API.
+
 Groups open their arrays with shared settings and one memory cache:
 
 ```python
