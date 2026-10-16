@@ -196,6 +196,20 @@ def summary(values):
                 samples_ms=values.tolist())
 
 
+def filter_cases(shape):
+    """Exercise histogram/fallback median paths and several Gaussian widths."""
+    base = {case.name: case for case in cases(shape)}
+    result = [base["GaussianBlur"], base["MedianFilter"]]
+    for sigma in (.5, 2., 4.):
+        result.append(Case(f"GaussianBlurSigma{sigma:g}", [A.GaussianBlur(sigma)],
+                           [("noise.gaussian_blur", "GaussianBlurTransform",
+                             dict(blur_sigma=sigma, synchronize_axes=True, benchmark=False))]))
+    for size in (4, 5, 7):
+        result.append(Case(f"MedianFilterSize{size}", [A.MedianFilter(size)],
+                           [("noise.median_filter", "MedianFilterTransform", dict(filter_size=size))]))
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--array", default=DEFAULT_ARRAY)
@@ -203,6 +217,8 @@ def main():
     parser.add_argument("--shape", type=int, nargs=3, default=(128, 128, 128))
     parser.add_argument("--reps", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--filter-sweep", action="store_true", help="compare only median/blur with several kernel widths")
+    parser.add_argument("--input-noise-std", type=float, default=0., help="fixed Gaussian perturbation of the real CT input; tests continuous-valued filters")
     parser.add_argument("--read-each-call", action="store_true", help="time fresh vc_reader float32 reads, normalization and augmentation together")
     parser.add_argument("--inplace", action="store_true", help="reuse freshly read native buffers; requires --read-each-call")
     parser.add_argument("--only", help="comma-separated case names")
@@ -215,6 +231,8 @@ def main():
 
     if args.inplace and not args.read_each_call:
         parser.error("--inplace requires --read-each-call so each call receives fresh inputs")
+    if not np.isfinite(args.input_noise_std) or args.input_noise_std < 0:
+        parser.error("--input-noise-std must be finite and nonnegative")
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
     # The Vesuvius root initializer imports volume/download dependencies unrelated
@@ -228,6 +246,10 @@ def main():
     with ZarrReader.open(args.array, threads=1) as reader:
         image = reader.read(tuple(args.start), tuple(args.shape)).astype(np.float32)[None] / 255
     assert image.max() > image.min(), "choose a crop containing CT signal"
+    perturbation = None
+    if args.input_noise_std:
+        perturbation = np.random.default_rng(123).normal(0, args.input_noise_std, image.shape).astype(np.float32)
+        image += perturbation
     image = torch.from_numpy(image)
     labels = (image > .5).to(torch.int16)
     ignore = labels.clone()
@@ -240,6 +262,8 @@ def main():
     def fresh_sample(kind):
         patch = fresh_reader.read(tuple(args.start), tuple(args.shape), dtype=np.float32)[None]
         patch /= 255
+        if perturbation is not None:
+            patch += perturbation
         image = torch.from_numpy(patch)
         if kind == "image":
             return {"image": image}
@@ -269,6 +293,8 @@ def main():
                   warmup=args.warmup, reps=args.reps, seed=123, ownership="Python timed input clone; native internal copy",
                   cases=[], excluded=["StripGeometry, SurfacePerturb and translate_crop_box: specialized tracing APIs outside this models benchmark",
                                      "OneOf/probability wrappers: no standalone kernel; not separately timed"])
+    report["input_noise_std"] = args.input_noise_std
+    report["filter_sweep"] = args.filter_sweep
     report["read_each_call"] = args.read_each_call
     report["inplace"] = args.inplace
     if args.read_each_call:
@@ -292,7 +318,7 @@ def main():
     print(f"CPU: {cpu}; Torch {torch.__version__}; one thread; shape={args.shape}; reps={args.reps}", flush=True)
     print(f"{'transform':24} {'Python ms':>11} {'C++ ms':>11} {'Python/C++':>11}  comparison", flush=True)
     with torch.inference_mode():
-        for case in cases(tuple(args.shape)):
+        for case in (filter_cases(tuple(args.shape)) if args.filter_sweep else cases(tuple(args.shape))):
             if selected and case.name not in selected:
                 continue
             row = dict(name=case.name, input=case.inputs, comparison=case.comparison, note=case.note,

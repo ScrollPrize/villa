@@ -302,6 +302,27 @@ inline std::size_t mirror(std::int64_t i, std::size_t n) {
     auto p = std::int64_t(2 * (n - 1)); i = (i % p + p) % p;
     return std::size_t(i < std::int64_t(n) ? i : p - i);
 }
+// Accumulate a few adjacent outputs in registers, then write them once. Tap
+// order is unchanged, including the initial addition to zero.
+inline void convolve_run(const double* source, double* output, std::size_t count,
+                         const std::vector<double>& kernel, const std::size_t* offsets) {
+    constexpr std::size_t lanes = 16;
+    std::size_t i = 0;
+    for (; i + lanes <= count; i += lanes) {
+        std::array<double, lanes> sum{};
+        for (std::size_t tap = 0; tap < kernel.size(); ++tap) {
+            const auto* input = source + offsets[tap] + i;
+            const auto weight = kernel[tap];
+            for (std::size_t j = 0; j < lanes; ++j) sum[j] += weight * input[j];
+        }
+        std::copy(sum.begin(), sum.end(), output + i);
+    }
+    for (; i < count; ++i) {
+        double sum = 0;
+        for (std::size_t tap = 0; tap < kernel.size(); ++tap) sum += kernel[tap] * source[offsets[tap] + i];
+        output[i] = sum;
+    }
+}
 inline void gaussian_blur(std::vector<double>& data, const Grid& g, const std::vector<double>& sigmas, double truncate = 4, bool mirror_boundary = false, bool full_width = false) {
     require(sigmas.size() == g.shape.size() && truncate > 0 && std::isfinite(truncate), "invalid Gaussian parameters");
     std::vector<double> tmp(g.size);
@@ -317,34 +338,29 @@ inline void gaussian_blur(std::vector<double>& data, const Grid& g, const std::v
         std::vector<double> kernel(2 * radius + 1); double sum = 0;
         for (int d = -radius; d <= radius; ++d) sum += kernel[d + radius] = std::exp(-.5 * (d / sigma) * (d / sigma));
         for (auto& w : kernel) w /= sum;
-        // Traverse contiguous runs for each tap. Every output retains the
-        // original tap accumulation order, while the inner loop can vectorize.
         const auto extent = g.shape[a], step = g.stride[a], block = extent * step;
-        std::fill(tmp.begin(), tmp.end(), 0.);
-        for (std::size_t base = 0; base < g.size; base += block)
-            for (int d = -radius; d <= radius; ++d) {
-                const double weight = kernel[d + radius];
-                if (step == 1) {
-                    const auto begin = std::size_t(std::min<std::int64_t>(extent, std::max(0, -d)));
-                    const auto end = std::size_t(std::clamp<std::int64_t>(std::int64_t(extent) - d, begin, extent));
-                    for (std::size_t x = begin; x < end; ++x) tmp[base + x] += weight * data[base + x + d];
-                    for (std::size_t x = 0; x < begin; ++x) {
-                        auto at = mirror_boundary ? mirror(std::int64_t(x) + d, extent) : reflect(std::int64_t(x) + d, extent);
-                        tmp[base + x] += weight * data[base + at];
-                    }
-                    for (std::size_t x = end; x < extent; ++x) {
-                        auto at = mirror_boundary ? mirror(std::int64_t(x) + d, extent) : reflect(std::int64_t(x) + d, extent);
-                        tmp[base + x] += weight * data[base + at];
-                    }
-                    continue;
-                }
-                for (std::size_t x = 0; x < extent; ++x) {
-                    const auto at = mirror_boundary ? mirror(std::int64_t(x) + d, extent) : reflect(std::int64_t(x) + d, extent);
-                    auto* dst = tmp.data() + base + x * step;
-                    const auto* src = data.data() + base + at * step;
-                    for (std::size_t j = 0; j < step; ++j) dst[j] += weight * src[j];
-                }
+        auto boundary = [&](std::int64_t x) { return mirror_boundary ? mirror(x, extent) : reflect(x, extent); };
+        if (step == 1) {
+            // Extend each contiguous row once; even wide kernels and singleton
+            // dimensions then use the same branch-free convolution loop.
+            std::vector<std::size_t> indices(extent + 2 * radius), offsets(kernel.size());
+            for (std::size_t x = 0; x < indices.size(); ++x) indices[x] = boundary(std::int64_t(x) - radius);
+            std::iota(offsets.begin(), offsets.end(), 0);
+            std::vector<double> row(indices.size());
+            for (std::size_t base = 0; base < g.size; base += extent) {
+                for (std::size_t x = 0; x < row.size(); ++x) row[x] = data[base + indices[x]];
+                convolve_run(row.data(), tmp.data() + base, extent, kernel, offsets.data());
             }
+        } else {
+            std::vector<std::size_t> offsets(extent * kernel.size());
+            for (std::size_t x = 0; x < extent; ++x)
+                for (std::size_t tap = 0; tap < kernel.size(); ++tap)
+                    offsets[x * kernel.size() + tap] = boundary(std::int64_t(x + tap) - radius) * step;
+            for (std::size_t base = 0; base < g.size; base += block)
+                for (std::size_t x = 0; x < extent; ++x)
+                    convolve_run(data.data() + base, tmp.data() + base + x * step, step,
+                                 kernel, offsets.data() + x * kernel.size());
+        }
         data.swap(tmp);
     }
 }

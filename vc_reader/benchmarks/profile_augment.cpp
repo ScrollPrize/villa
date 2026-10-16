@@ -6,10 +6,12 @@
 using namespace vcr::augment;
 
 int main(int argc, char** argv) {
-    if (argc != 3) {
-        std::cerr << "usage: profile_augment RAW_CHUNK copy|flip|median|blur\n";
+    if (argc < 3 || argc > 4) {
+        std::cerr << "usage: profile_augment RAW_CHUNK copy|flip|median|blur [iterations=5]\n";
         return 2;
     }
+    const int iterations = argc == 4 ? std::stoi(argv[3]) : 5;
+    if (iterations < 1) return 2;
     Array image({1, 128, 128, 128});
     std::vector<unsigned char> bytes(image.size());
     std::ifstream input(argv[1], std::ios::binary);
@@ -26,8 +28,10 @@ int main(int argc, char** argv) {
     else if (name == "blur") transforms.push_back(GaussianBlur{.sigma = 1.});
     else if (name != "copy") return 2;
     Pipeline pipeline(transforms, {{"image", Target{}}});
-    for (int i = 0; i < 5; ++i) {
+    double checksum = 0;
+    for (int i = 0; i < iterations; ++i) {
         auto result = pipeline.run(sample, 123, false, false);
-        std::cout << result.sample.at("image").array.get(0) << '\n';
+        checksum += result.sample.at("image").array.get(0);
     }
+    std::cout << checksum << '\n';
 }

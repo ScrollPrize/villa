@@ -422,3 +422,48 @@ def test_unaligned_input_is_copied_or_rejected():
     with pytest.raises(ValueError, match="aligned"):
         pipeline({"image": image}, seed=1, inplace=True)
     np.testing.assert_array_equal(image, 2)
+
+
+@pytest.mark.parametrize("shape", [(1, 5), (7, 11), (2, 3, 5), (5, 9, 13)])
+@pytest.mark.parametrize("size", [2, 3, 4, 5, 7])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_median_exact_palette_and_continuous_reference(shape, size, dtype):
+    ndimage = pytest.importorskip("scipy.ndimage")
+    rng = np.random.default_rng(37)
+    # Nonuniform, noninteger values: the histogram must preserve the values,
+    # including adjacent representable numbers, without quantizing them.
+    palette = np.array([-10, -.1, 0, .2, np.nextafter(dtype(.2), dtype(1)), 100], dtype=dtype)
+    for image in (rng.choice(palette, size=(2, *shape)), rng.normal(size=(2, *shape)).astype(dtype)):
+        expected = np.stack([ndimage.median_filter(channel, size=size, mode="reflect") for channel in image])
+        actual = A.Pipeline([A.MedianFilter(size)])({"image": image}, seed=7)["image"]
+        np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("boundary", ["mirror", "reflect"])
+@pytest.mark.parametrize("shape", [(1, 3), (5, 17), (1, 3, 9), (5, 7, 19)])
+@pytest.mark.parametrize("sigma", [0., .3, 1., 3.])
+def test_gaussian_register_blocks_and_wide_boundaries(shape, sigma, boundary):
+    ndimage = pytest.importorskip("scipy.ndimage")
+    image = np.random.default_rng(8).normal(size=(1, *shape))
+    actual = A.Pipeline([A.GaussianBlur(sigma, boundary=boundary)])({"image": image}, seed=3)["image"][0]
+    radius = int((6 * sigma + .5) // 2)
+    expected = ndimage.gaussian_filter(image[0], sigma, mode=boundary, radius=radius)
+    np.testing.assert_allclose(actual, expected, rtol=2e-15, atol=2e-15)
+
+
+@pytest.mark.parametrize("value", [-0., .123456789])
+def test_median_constant_preserves_bits(value):
+    image = np.full((1, 3, 5, 7), value, dtype=np.float64)
+    actual = A.Pipeline([A.MedianFilter(7)])({"image": image}, seed=3)["image"]
+    assert actual.tobytes() == image.tobytes()
+
+
+def test_median_palette_overflow_after_probe():
+    ndimage = pytest.importorskip("scipy.ndimage")
+    image = np.zeros((1, 32, 32, 32), dtype=np.float64)
+    # The evenly spaced probe sees zeros; the full encoding pass must still
+    # detect the large palette and leave the input intact for the fallback.
+    image.ravel()[1::8] = np.arange(image.size // 8) / 10000
+    expected = ndimage.median_filter(image[0], size=3, mode="reflect")
+    actual = A.Pipeline([A.MedianFilter(3)])({"image": image}, seed=3)["image"][0]
+    np.testing.assert_array_equal(actual, expected)

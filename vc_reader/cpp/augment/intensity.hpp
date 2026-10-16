@@ -1,6 +1,7 @@
 #pragma once
 #include "core.hpp"
 #include <span>
+#include <unordered_map>
 
 namespace vcr::augment {
 struct BrightnessMultiply { Scalar factor = Uniform{.75, 1.25}; ChannelOptions options; };
@@ -169,6 +170,69 @@ inline void channel_apply(const ClipOutliers&, std::vector<double>& v, const Gri
     if (p.values[2]) { double m = mean(v), after = deviation(v, m); if (after > 1e-8) for (auto& x : v) x = (x - m) / after * std + m; }
 }
 inline void channel_apply(const GaussianBlur& t, std::vector<double>& v, const Grid& g, const ChannelPlan& p) { gaussian_blur(v, g, p.values, t.truncate, t.mirror_boundary, true); }
+// Exact palette compression, not quantization. This benefits CT patches and
+// pointwise intensity transforms of them; continuous-valued inputs fall back to
+// nth_element. The bounded palette keeps both histogram levels in L1 cache.
+inline bool median_histogram(std::vector<double>& v, const Grid& g, std::size_t k,
+                             const std::vector<std::size_t>& iz, const std::vector<std::size_t>& iy,
+                             const std::vector<std::size_t>& ix) {
+    constexpr std::size_t limit = 256, group_size = 16;
+    std::unordered_map<double, std::uint16_t> palette;
+    palette.reserve(limit + 1);
+    bool positive_zero = false, negative_zero = false;
+    auto encode = [&](double value) -> int {
+        // Preserve the general selector's handling of signed-zero ties.
+        if (value == 0) { if (std::signbit(value)) negative_zero = true; else positive_zero = true; }
+        if (std::isnan(value) || (positive_zero && negative_zero)) return -1;
+        const auto [it, inserted] = palette.try_emplace(value, static_cast<std::uint16_t>(palette.size()));
+        return palette.size() <= limit ? int(it->second) : -1;
+    };
+    // Reject typical high-cardinality inputs before allocating an index volume.
+    const auto probes = std::min<std::size_t>(4096, v.size());
+    for (std::size_t i = 0; i < probes; ++i) if (encode(v[i * (v.size() / probes)]) < 0) return false;
+    std::vector<std::uint16_t> codes(v.size());
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        const auto code = encode(v[i]);
+        if (code < 0) return false;
+        codes[i] = static_cast<std::uint16_t>(code);
+    }
+    if (palette.size() == 1) return true;
+    std::vector<double> values;
+    for (const auto& [value, code] : palette) values.push_back(value);
+    std::sort(values.begin(), values.end());
+    std::array<std::uint16_t, limit> ranks{};
+    for (std::size_t rank = 0; rank < values.size(); ++rank) ranks[palette.at(values[rank])] = static_cast<std::uint16_t>(rank);
+    for (auto& code : codes) code = ranks[code];
+
+    const auto dim = g.shape.size(), nz = dim == 3 ? g.shape[0] : 1;
+    const auto ny = g.shape[dim - 2], nx = g.shape.back(), kz = dim == 3 ? k : 1;
+    const auto middle = kz * k * k / 2;
+    for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y) {
+        std::array<std::uint32_t, limit> counts{};
+        std::array<std::uint32_t, limit / group_size> groups{};
+        for (std::size_t dz = 0; dz < kz; ++dz) for (std::size_t dy = 0; dy < k; ++dy) {
+            const auto* row = codes.data() + iz[z * kz + dz] + iy[y * k + dy];
+            for (std::size_t dx = 0; dx < k; ++dx) { auto code = row[ix[dx]]; ++counts[code]; ++groups[code / group_size]; }
+        }
+        for (std::size_t x = 0; x < nx; ++x) {
+            std::size_t rank = middle, group = 0;
+            while (rank >= groups[group]) rank -= groups[group++];
+            auto code = group * group_size;
+            while (rank >= counts[code]) rank -= counts[code++];
+            v[(z * ny + y) * nx + x] = values[code];
+            if (x + 1 == nx) break;
+            const auto leave = ix[x * k], enter = ix[(x + 1) * k + k - 1];
+            for (std::size_t dz = 0; dz < kz; ++dz) for (std::size_t dy = 0; dy < k; ++dy) {
+                const auto* row = codes.data() + iz[z * kz + dz] + iy[y * k + dy];
+                auto from = row[leave], to = row[enter];
+                if (from == to) continue;
+                --counts[from]; --groups[from / group_size];
+                ++counts[to]; ++groups[to / group_size];
+            }
+        }
+    }
+    return true;
+}
 inline void channel_apply(const MedianFilter&, std::vector<double>& v, const Grid& g, const ChannelPlan& p) {
     auto k = std::size_t(p.values[0]);
     if (k == 1) return;
@@ -184,6 +248,7 @@ inline void channel_apply(const MedianFilter&, std::vector<double>& v, const Gri
         return result;
     };
     auto iz = indices(nz, kz, ny * nx), iy = indices(ny, k, nx), ix = indices(nx, k, 1);
+    if (median_histogram(v, g, k, iz, iy, ix)) return;
     auto src = v;
     std::vector<double> values(kz * k * k);
     for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y)
