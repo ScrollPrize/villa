@@ -40,6 +40,12 @@ TORCH_BUILDS = {
         torchvision="0.28.0",
         index_url="https://download.pytorch.org/whl/cu130",
     ),
+    "rocm": TorchBuild(
+        backend="rocm",
+        torch="2.11.0",
+        torchvision="0.26.0",
+        index_url="https://download.pytorch.org/whl/rocm7.2",
+    ),
 }
 CUDA13_ONLY_PACKAGES = {"cucim-cu13", "cupy-cuda13x", "nvidia-nvimgcodec-cu13"}
 
@@ -98,9 +104,22 @@ def query_compute_caps(nvidia_smi: str) -> list[tuple[int, int]]:
     return parse_compute_caps(result.stdout)
 
 
+def detect_rocm() -> str | None:
+    """Describe the ROCm install found on this machine, or None."""
+    for tool in ("rocminfo", "amd-smi", "rocm-smi"):
+        if shutil.which(tool) is not None:
+            return f"{tool} found"
+    if Path("/opt/rocm").is_dir():
+        return "/opt/rocm exists"
+    return None
+
+
 def detect_backend() -> tuple[str, str]:
     nvidia_smi = shutil.which("nvidia-smi")
     if nvidia_smi is None:
+        rocm = detect_rocm()
+        if rocm is not None:
+            return "rocm", rocm
         return "cpu", "nvidia-smi is not installed"
     result = subprocess.run(
         [nvidia_smi], capture_output=True, text=True, check=False
@@ -109,7 +128,7 @@ def detect_backend() -> tuple[str, str]:
     if result.returncode != 0:
         raise RuntimeError(
             "nvidia-smi exists but cannot communicate with the driver; "
-            "fix the driver or pass --backend cpu/cu128/cu130 explicitly"
+            "fix the driver or pass --backend cpu/cu128/cu130/rocm explicitly"
         )
     cuda_version = parse_cuda_version(output)
     if cuda_version is None:
@@ -161,9 +180,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--python", default="3.14", help="Python version for uv venv")
     parser.add_argument(
         "--backend",
-        choices=("auto", "cpu", "cu128", "cu130"),
+        choices=("auto", "cpu", "cu128", "cu130", "rocm"),
         default="auto",
-        help="PyTorch backend; auto inspects nvidia-smi",
+        help="PyTorch backend; auto inspects nvidia-smi, then ROCm tools",
     )
     parser.add_argument(
         "--project",
@@ -193,7 +212,7 @@ def environment_check_script(backend: str, skip_cuda_check: bool) -> str:
         "import json, torch",
         "import vesuvius.neural_tracing.fiber_trace_3d.infer as fiber_infer",
         "print(json.dumps({'torch': torch.__version__,"
-        " 'torch_cuda': torch.version.cuda,"
+        " 'torch_cuda': torch.version.cuda, 'torch_hip': torch.version.hip,"
         " 'cuda_available': torch.cuda.is_available(),"
         " 'fiber_infer': fiber_infer.__file__}))",
     ]

@@ -1,6 +1,9 @@
 import unittest
+from unittest import mock
 
 from lasagna.scripts.bootstrap_venv import (
+    TORCH_BUILDS,
+    detect_backend,
     environment_check_script,
     parse_cuda_version,
     select_backend,
@@ -21,6 +24,14 @@ class BootstrapVenvTests(unittest.TestCase):
     def test_old_driver_is_rejected(self):
         with self.assertRaisesRegex(RuntimeError, "CUDA 12.8 or newer"):
             select_backend((12, 7))
+
+    def test_rocm_detected_without_nvidia_smi(self):
+        def which(name):
+            return "/usr/bin/rocminfo" if name == "rocminfo" else None
+
+        with mock.patch("shutil.which", which):
+            self.assertEqual(detect_backend()[0], "rocm")
+        self.assertIn("rocm", TORCH_BUILDS["rocm"].index_url)
 
     def test_check_script_runs_gpu_kernel_only_when_checking(self):
         self.assertIn("device='cuda'", environment_check_script("cu128", False))
