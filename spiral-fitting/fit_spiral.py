@@ -284,9 +284,17 @@ class ShellPolarMap:
             smooth_ext = scipy.ndimage.gaussian_filter(smooth_ext, sigma=sigma, mode=('nearest', 'wrap'))
             filled = smooth_ext[:, self.num_theta_bins:2 * self.num_theta_bins]
 
-        confidence = scipy.ndimage.gaussian_filter(valid.astype(np.float32), sigma=sigma, mode=('nearest', 'wrap'))
-        if confidence.max() > 0:
-            confidence = confidence / confidence.max()
+        # Confidence is the proximity to the nearest shell sample, measured in
+        # units of the smoothing sigmas: 1.0 on a sampled bin, exp(-0.5) one
+        # sigma away, ~0 far from any sample. The previous table smoothed the
+        # occupancy and divided by its global max; with a shell sampled every
+        # few slices that max came from the replicated edge row, every interior
+        # value landed below shell_min_confidence, and the shell loss was
+        # silently zero for the whole run.
+        sampling = tuple(1.0 / s if s > 0 else 1.0 for s in sigma)
+        distance_ext = scipy.ndimage.distance_transform_edt(~valid_ext, sampling=sampling)
+        confidence = np.exp(-0.5 * np.square(
+            distance_ext[:, self.num_theta_bins:2 * self.num_theta_bins])).astype(np.float32)
 
         radius_with_wrap = np.concatenate([filled, filled[:, :1]], axis=1).astype(np.float32)
         confidence_with_wrap = np.concatenate([confidence, confidence[:, :1]], axis=1).astype(np.float32)
