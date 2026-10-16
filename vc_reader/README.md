@@ -150,6 +150,44 @@ ZarrReader.open("s3://vesuvius-challenge-open-data/…/volume.zarr", level=2)
 - Readers pickle as their location plus metadata, so DataLoader workers reopen
   them without a network round trip. Values are exactly the stored values.
 
+### Native engine
+
+`engine="native"` reads through a C++ extension (`vc_reader._native`, built by
+the pyproject with scikit-build-core and nanobind). It does the whole read on
+native threads without the GIL:
+
+- local chunks, through persistent memory maps by default (`read_mode="slab"`
+  reads with `pread`);
+- HTTP fetches with libcurl, at most `connections` at once, with stall
+  timeouts and retries;
+- raw, blosc and vc-delta3d decoding;
+- the disk cache layers above, read and appended in their own formats;
+- an in-memory LRU of decoded chunks.
+
+Python still finds the caches, checks them against the remote `.zarray` and
+holds VC3D's lease, so both engines see the same caches and return identical
+values.
+
+```python
+r = lvl.open(engine="native", cache_dir=["/mnt/raid_nvme/volume_cache", "vc3d"], memory_cache=8 << 30)
+from vc_reader._native import MemoryCache
+shared = MemoryCache(16 << 30)                      # one budget for several native readers
+```
+
+Limits:
+
+- Arrays with numcodecs filters, Fortran order or other codecs need
+  `engine="python"`; opening them with the native engine raises `ValueError`.
+- Memory-mapped chunk files must only ever be replaced by rename (vc_reader,
+  vesuvius and VC3D all write that way). Truncating a mapped file in place
+  would crash the process.
+- Each native reader keeps up to 8192 mappings, against Linux's default
+  `vm.max_map_count` of 65530.
+
+Building it needs a C++20 compiler, CMake, libcurl and c-blosc development
+files (`apt install libcurl4-openssl-dev libblosc-dev`; on macOS `brew install
+c-blosc`). VC-Delta3D is fetched at a pinned commit.
+
 Benchmarks against zarr-python and TensorStore are in
 [`benchmarks/`](benchmarks/README.md).
 
@@ -169,7 +207,8 @@ Without installing: `PYTHONPATH=src python -m vc_reader …`.
 ```
 cd vc_reader
 uv venv --python 3.14 .venv
-uv pip install --python .venv/bin/python -e '.[bench,test]'
+uv pip install --python .venv/bin/python scikit-build-core nanobind
+uv pip install --python .venv/bin/python --no-build-isolation -e '.[bench,test]'   # rerun after C++ changes
 .venv/bin/python -m pytest              # offline: catalog fixture + reader tests (local files, local HTTP server)
 .venv/bin/python -m pytest -m network   # parse the live metadata.json end to end
 ```

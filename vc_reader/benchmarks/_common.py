@@ -170,7 +170,8 @@ class Bench:
         """Run ``ops`` per backend ``reps`` times, interleaving backends; ``batch`` uses read_many.
 
         Every backend's output is compared with the first backend's (outside the
-        timed region); a mismatch aborts the run.
+        timed region); a mismatch aborts the run. Cold scenarios must use
+        ``reopen_each_rep`` so no reader holds pages across the eviction.
         """
         reps = reps or self.reps
         nbytes = sum(int(np.prod(s)) for _, s in ops)
@@ -202,6 +203,12 @@ class Bench:
                     total = sum(op_times)
                 digests = [digest(a) for a in outs]
                 del outs
+                if reopen_each_rep:
+                    # Release the reader now: a live reader may pin pages (e.g. persistent
+                    # mmaps), which would keep the next backend's "cold" files cached.
+                    dead = readers.pop(name)
+                    getattr(dead, "close", lambda: None)()
+                    del dead, reader
                 if ref is None:
                     ref = digests
                 elif digests != ref:

@@ -14,7 +14,7 @@ array is only ever read.
 
     python benchmarks/bench_local.py
     python benchmarks/bench_local.py --array /path/to/array.zarr/0 --reps 5
-    python benchmarks/bench_local.py --only crops64 --backends vc_reader:slab,vc_reader:mmap
+    python benchmarks/bench_local.py --only crops64 --backends vc_reader:slab,vc_reader:native
 """
 
 from __future__ import annotations
@@ -62,8 +62,8 @@ def main(argv=None) -> None:
     all_backends = [
         ("zarr", zarr_python(threads=w or 32)),
         ("vc_reader:slab", vc_reader(workers=w, read_mode="slab")),
-        ("vc_reader:pread", vc_reader(workers=w, read_mode="pread")),
-        ("vc_reader:mmap", vc_reader(workers=w, read_mode="mmap")),
+        ("vc_reader:native", vc_reader(workers=w, engine="native")),
+        ("vc_reader:native-slab", vc_reader(workers=w, engine="native", read_mode="slab")),
     ]
     if have("tensorstore"):
         all_backends.append(("tensorstore", tensorstore()))
@@ -87,15 +87,16 @@ def main(argv=None) -> None:
         for mode in modes:
             hook = (lambda f=files: evict_files(f)) if mode == "cold" else None
             bench.run(f"{name}-{mode}", "ct", root, all_backends, ops, batch=batch, before_rep=hook,
-                      warmup=mode == "warm", reopen_each_rep=False)
+                      warmup=mode == "warm", reopen_each_rep=mode == "cold")
 
     if not args.only or "memory" in args.only:
         # Hot loop over a small neighbourhood with vc_reader's memory cache.
         centre = random_crops(shape, 512, 1, 5, exists)[0][0]
         ops = random_crops(shape, 64, 500, 6, exists, lo=centre, hi=tuple(c + 512 for c in centre))
         cache = MemoryChunkCache(4 << 30)
-        mem = [b for b in all_backends if b[0] in ("zarr", "vc_reader:slab")]
+        mem = [b for b in all_backends if b[0] in ("zarr", "vc_reader:slab", "vc_reader:native")]
         mem.append(("vc_reader+memory", vc_reader(workers=w, memory_cache=cache)))
+        mem.append(("vc_reader:native+memory", vc_reader(workers=w, engine="native", memory_cache=4 << 30)))
         bench.run("crops64-hot", "ct", root, mem, ops, warmup=True, reopen_each_rep=False)
 
     save("local", dict(array=root, shape=shape, chunks=meta.chunks, workers=w,

@@ -40,6 +40,10 @@ Before each repetition, `-cold` scenarios drop every touched chunk file from
 the page cache with `posix_fadvise(DONTNEED)`, which needs no root (Linux
 only; skipped on tmpfs). `-warm` scenarios run one untimed repetition first.
 
+Local backends: `vc_reader:slab` is the Python engine, `vc_reader:native` the
+C++ engine (memory maps), and `vc_reader:native-slab` the C++ engine with
+`pread`. The `+memory` variants add each engine's memory cache.
+
 ## Remote reads: `bench_remote.py`
 
 ```

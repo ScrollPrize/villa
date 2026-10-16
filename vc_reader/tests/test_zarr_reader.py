@@ -15,6 +15,19 @@ pytest.importorskip("urllib3")
 from vc_reader.reader import MemoryChunkCache, ZarrReader  # noqa: E402
 from vc_reader.reader.disk_cache import MISSING_SUFFIX, decoded_cache_path  # noqa: E402
 
+ENGINES = ["python", "native"]
+
+
+def _open(location, engine="python", **kwargs):
+    """ZarrReader.open, skipping arrays the native engine declines (filters, F order)."""
+    try:
+        return ZarrReader.open(location, engine=engine, **kwargs)
+    except ValueError as exc:
+        if engine == "native" and "native engine cannot read" in str(exc):
+            pytest.skip(str(exc))
+        raise
+
+
 SHAPE = (37, 50, 45)
 CHUNKS = (16, 16, 16)
 
@@ -102,9 +115,10 @@ def _ref(exp, start, size):
 
 @pytest.mark.parametrize("read_mode", ["slab", "pread", "mmap"])
 @pytest.mark.parametrize("memory", [0, 64 << 20])
-def test_local_reads(local_array, memory, read_mode):
+@pytest.mark.parametrize("engine", ENGINES)
+def test_local_reads(local_array, memory, read_mode, engine):
     root, exp = local_array
-    with ZarrReader.open(root, memory_cache=memory, read_mode=read_mode) as r:
+    with _open(root, memory_cache=memory, read_mode=read_mode, engine=engine) as r:
         assert r.shape == SHAPE and r.chunks == CHUNKS and r.fill_value == 7
         for start, size in REGIONS:
             for _ in range(2):  # second pass hits the memory cache when enabled
@@ -112,17 +126,19 @@ def test_local_reads(local_array, memory, read_mode):
 
 
 @pytest.mark.parametrize("read_mode", ["slab", "pread", "mmap"])
-def test_read_many(local_array, read_mode):
+@pytest.mark.parametrize("engine", ENGINES)
+def test_read_many(local_array, read_mode, engine):
     root, exp = local_array
-    r = ZarrReader.open(root, read_mode=read_mode, workers=4)
+    r = _open(root, read_mode=read_mode, workers=4, engine=engine)
     outs = r.read_many(REGIONS)
     for (start, size), got in zip(REGIONS, outs):
         np.testing.assert_array_equal(got, _ref(exp, start, size))
 
 
-def test_read_many_into_given_outputs(local_array):
+@pytest.mark.parametrize("engine", ENGINES)
+def test_read_many_into_given_outputs(local_array, engine):
     root, exp = local_array
-    r = ZarrReader.open(root, workers=4)
+    r = _open(root, workers=4, engine=engine)
     regions = REGIONS[:3]
     outs = [np.empty(size, np.uint8) for _, size in regions]
     outs[1] = None  # allocated by the reader
@@ -134,9 +150,10 @@ def test_read_many_into_given_outputs(local_array):
         r.read_many(regions, out=outs[:2])
 
 
-def test_getitem(local_array):
+@pytest.mark.parametrize("engine", ENGINES)
+def test_getitem(local_array, engine):
     root, exp = local_array
-    r = ZarrReader.open(root)
+    r = _open(root, engine)
     np.testing.assert_array_equal(r[...], exp)
     np.testing.assert_array_equal(r[3:20, -10:, 5], exp[3:20, -10:, 5])
     np.testing.assert_array_equal(r[-1], exp[-1])
@@ -147,11 +164,12 @@ def test_getitem(local_array):
         r[SHAPE[0]]
 
 
-def test_matches_zarr_python(local_array):
+@pytest.mark.parametrize("engine", ENGINES)
+def test_matches_zarr_python(local_array, engine):
     zarr = pytest.importorskip("zarr")
     root, _ = local_array
     z = zarr.open_array(root, mode="r")
-    r = ZarrReader.open(root)
+    r = _open(root, engine)
     for start, size in REGIONS[:5]:
         sl = tuple(slice(max(s, 0), min(s + n, d)) for s, n, d in zip(start, size, SHAPE))
         ours = r.read([x.start for x in sl], [x.stop - x.start for x in sl])
@@ -177,12 +195,14 @@ def test_memory_cache_eviction():
     assert cache.nbytes <= 3000
 
 
-def test_pickle_roundtrip(local_array):
+@pytest.mark.parametrize("engine", ENGINES)
+def test_pickle_roundtrip(local_array, engine):
     root, exp = local_array
-    r = ZarrReader.open(root, memory_cache=1 << 20)
+    r = _open(root, memory_cache=1 << 20, engine=engine)
     r.read((0, 0, 0), (8, 8, 8))
     r2 = pickle.loads(pickle.dumps(r))
-    assert len(r2.memory_cache) == 0 and r2.memory_cache.max_bytes == 1 << 20
+    cache = r2.native_cache if engine == "native" else r2.memory_cache
+    assert len(cache) == 0 and cache.max_bytes == 1 << 20
     np.testing.assert_array_equal(r2[...], exp)
 
 
@@ -212,19 +232,21 @@ def server(tmp_path_factory, data):
 
 
 @pytest.mark.parametrize("name", ["raw.zarr", "blosc.zarr"])
-def test_http_reads(server, data, name):
+@pytest.mark.parametrize("engine", ENGINES)
+def test_http_reads(server, data, name, engine):
     httpd, base = server
     exp = _expected(data, MISSING, CHUNKS)
-    with ZarrReader.open(f"{base}/{name}") as r:
+    with _open(f"{base}/{name}", engine=engine) as r:
         for start, size in REGIONS:
             np.testing.assert_array_equal(r.read(start, size), _ref(exp, start, size))
 
 
-def test_disk_cache(server, data, tmp_path):
+@pytest.mark.parametrize("engine", ENGINES)
+def test_disk_cache(server, data, tmp_path, engine):
     httpd, base = server
     exp = _expected(data, MISSING, CHUNKS)
     url = f"{base}/blosc.zarr"
-    r = ZarrReader.open(url, cache_dir=tmp_path)
+    r = _open(url, cache_dir=tmp_path, engine=engine)
     np.testing.assert_array_equal(r[...], exp)
     root = decoded_cache_path(tmp_path, url)
     assert os.path.exists(os.path.join(root, "1/1/1" + MISSING_SUFFIX))
@@ -232,12 +254,12 @@ def test_disk_cache(server, data, tmp_path):
 
     # A second reader is served from disk: only the metadata request goes out.
     httpd.requests.clear()
-    r2 = ZarrReader.open(url, cache_dir=tmp_path)
+    r2 = _open(url, cache_dir=tmp_path, engine=engine)
     np.testing.assert_array_equal(r2[...], exp)
     assert httpd.requests == ["/blosc.zarr/.zarray"]
 
     # The cache is a plain uncompressed zarr array.
-    np.testing.assert_array_equal(ZarrReader.open(root)[...], exp)
+    np.testing.assert_array_equal(_open(root, engine)[...], exp)
     zarr = pytest.importorskip("zarr")
     np.testing.assert_array_equal(zarr.open_array(root, mode="r")[...], exp)
 
@@ -254,10 +276,11 @@ def test_disk_cache_rejects_changed_source(server, tmp_path):
         ZarrReader.open(url, cache_dir=tmp_path)
 
 
-def test_concurrent_reads_fetch_each_chunk_once(server, data, tmp_path):
+@pytest.mark.parametrize("engine", ENGINES)
+def test_concurrent_reads_fetch_each_chunk_once(server, data, tmp_path, engine):
     httpd, base = server
     url = f"{base}/raw.zarr"
-    r = ZarrReader.open(url, cache_dir=tmp_path, workers=8)
+    r = _open(url, cache_dir=tmp_path, workers=8, engine=engine)
     httpd.requests.clear()
     threads = [threading.Thread(target=r.read, args=((0, 0, 0), SHAPE)) for _ in range(6)]
     for t in threads:
@@ -298,12 +321,13 @@ def _foreign_cache(tmp_path, url, data, chunks=CHUNKS):
     return root
 
 
-def test_reuses_foreign_cache(server, data, tmp_path):
+@pytest.mark.parametrize("engine", ENGINES)
+def test_reuses_foreign_cache(server, data, tmp_path, engine):
     httpd, base = server
     url = f"{base}/blosc.zarr"
     root = _foreign_cache(tmp_path, url, data)
     zattrs_before = open(os.path.join(root, ".zattrs")).read()
-    r = ZarrReader.open(url, cache_dir=tmp_path)
+    r = _open(url, cache_dir=tmp_path, engine=engine)
     httpd.requests.clear()
     assert (r.read((0, 0, 0), (16, 16, 16)) == 99).all()  # served from the existing cache
     assert httpd.requests == []
@@ -360,14 +384,15 @@ def _vc3d_mirror(cache_root, group_url, src_group, chunk_keys=()):
     return vdir
 
 
-def test_vc3d_mirror_read_and_append(group_server, data, tmp_path):
+@pytest.mark.parametrize("engine", ENGINES)
+def test_vc3d_mirror_read_and_append(group_server, data, tmp_path, engine):
     httpd, base, src = group_server
     group = f"{base}/vol.zarr"
     exp = _expected(data, MISSING, CHUNKS)
     vdir = _vc3d_mirror(tmp_path, group, src, ["0/0/0"])
     (vdir / "0" / "0" / "0" / "1.empty").write_bytes(b"")  # VC3D's missing marker (chunk really exists remotely)
 
-    r = ZarrReader.open(group, level=0, cache_dir=tmp_path)
+    r = _open(group, level=0, cache_dir=tmp_path, engine=engine)
     assert isinstance(r.source.write_layer, Vc3dMirrorLayer)
     httpd.requests.clear()
     np.testing.assert_array_equal(r.read((0, 0, 0), (16, 16, 16)), exp[:16, :16, :16])
@@ -423,7 +448,8 @@ def test_vc3d_mirror_rejects_changed_source(group_server, tmp_path):
         ZarrReader.open(group, level=0, cache_dir=tmp_path)
 
 
-def test_several_cache_dirs(group_server, data, tmp_path):
+@pytest.mark.parametrize("engine", ENGINES)
+def test_several_cache_dirs(group_server, data, tmp_path, engine):
     httpd, base, src = group_server
     group = f"{base}/vol.zarr"
     exp = _expected(data, MISSING, CHUNKS)
@@ -431,7 +457,7 @@ def test_several_cache_dirs(group_server, data, tmp_path):
     raid.mkdir()
     _vc3d_mirror(vc3d, group, src, ["0/0/0"])
     # Only the second root holds the array: reads use it, and appends go to it.
-    r = ZarrReader.open(group, level=0, cache_dir=[raid, vc3d])
+    r = _open(group, level=0, cache_dir=[raid, vc3d], engine=engine)
     assert r.source.write_layer.root.startswith(str(vc3d))
     httpd.requests.clear()
     np.testing.assert_array_equal(r.read((0, 0, 0), (16, 16, 16)), exp[:16, :16, :16])
@@ -439,11 +465,12 @@ def test_several_cache_dirs(group_server, data, tmp_path):
     assert not any(raid.iterdir())
     r.close()
     # With neither holding it, a new decoded cache is made under the first root.
-    r = ZarrReader.open(f"{base}/vol.zarr", level=0, cache_dir=[tmp_path / "a", tmp_path / "b"])
+    r = _open(f"{base}/vol.zarr", level=0, cache_dir=[tmp_path / "a", tmp_path / "b"], engine=engine)
     assert r.source.write_layer.kind == "decoded" and r.source.root.startswith(str(tmp_path / "a"))
 
 
-def test_vc3d_delta3d_cache(group_server, data, tmp_path):
+@pytest.mark.parametrize("engine", ENGINES)
+def test_vc3d_delta3d_cache(group_server, data, tmp_path, engine):
     vc_delta3d = pytest.importorskip("vc_delta3d")
     httpd, base, src = group_server
     group = f"{base}/vol.zarr"
@@ -459,7 +486,7 @@ def test_vc3d_delta3d_cache(group_server, data, tmp_path):
     lossy = vc_delta3d.Delta3D(quant=5).encode(exp[:16, :16, 16:32].copy())
     (vdir / "0" / "0" / "0" / "1").write_bytes(lossy)
 
-    r = ZarrReader.open(group, level=0, cache_dir=tmp_path)
+    r = _open(group, level=0, cache_dir=tmp_path, engine=engine)
     assert r.source.write_layer.kind == "vc3d-delta3d"
     httpd.requests.clear()
     np.testing.assert_array_equal(r.read((0, 0, 0), (16, 16, 16)), exp[:16, :16, :16])

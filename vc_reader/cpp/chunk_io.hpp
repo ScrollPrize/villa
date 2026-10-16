@@ -1,0 +1,244 @@
+// Box geometry, copies, file reads (pread slabs, cached mmaps) and atomic writes.
+#pragma once
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <list>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <system_error>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+namespace vcr {
+
+using Index = std::vector<std::int64_t>;
+
+// Byte strides of a C-order array.
+inline Index c_strides(const Index& shape, std::size_t itemsize)
+{
+    Index s(shape.size());
+    std::int64_t acc = static_cast<std::int64_t>(itemsize);
+    for (std::size_t d = shape.size(); d-- > 0;) {
+        s[d] = acc;
+        acc *= shape[d];
+    }
+    return s;
+}
+
+// Byte offset of element `lo` in an array with byte strides `strides`.
+inline std::int64_t offset_of(const Index& lo, const Index& strides)
+{
+    std::int64_t off = 0;
+    for (std::size_t i = 0; i < lo.size(); ++i)
+        off += lo[i] * strides[i];
+    return off;
+}
+
+// Copies a box of `extent` elements. `s` and `d` point at the box's first
+// element in the source and destination, which have byte strides `ss` and `ds`.
+// Each innermost row is one memcpy. Every extent must be positive.
+inline void copy_box(const std::uint8_t* s, const Index& ss, std::uint8_t* d, const Index& ds, const Index& extent,
+                     std::size_t itemsize)
+{
+    const std::size_t nd = extent.size();
+    const std::size_t run = static_cast<std::size_t>(extent[nd - 1]) * itemsize;
+    if (nd == 1) {
+        std::memcpy(d, s, run);
+        return;
+    }
+    Index pos(nd - 1, 0);  // position over every axis but the last
+    for (;;) {
+        std::memcpy(d, s, run);
+        std::size_t ax = nd - 1;
+        for (;;) {
+            if (ax-- == 0)
+                return;
+            if (++pos[ax] < extent[ax]) {
+                s += ss[ax];
+                d += ds[ax];
+                break;
+            }
+            s -= (extent[ax] - 1) * ss[ax];
+            d -= (extent[ax] - 1) * ds[ax];
+            pos[ax] = 0;
+        }
+    }
+}
+
+// Fills a box of `extent` elements starting at `d` (strides `ds`) with the fill pattern.
+inline void fill_box(std::uint8_t* d, const Index& ds, const Index& extent, const std::vector<std::uint8_t>& fill)
+{
+    const std::size_t nd = extent.size();
+    const std::size_t itemsize = fill.size();
+    std::vector<std::uint8_t> row(static_cast<std::size_t>(extent[nd - 1]) * itemsize);
+    for (std::size_t i = 0; i < row.size(); i += itemsize)
+        std::memcpy(row.data() + i, fill.data(), itemsize);
+    Index ss(nd, 0);  // every row of the "source" is the same row
+    ss[nd - 1] = static_cast<std::int64_t>(itemsize);
+    copy_box(row.data(), ss, d, ds, extent, itemsize);
+}
+
+class File {
+public:
+    File() = default;
+    explicit File(int fd) : fd_(fd) {}
+    File(File&& o) noexcept : fd_(o.fd_) { o.fd_ = -1; }
+    File& operator=(File&& o) noexcept { std::swap(fd_, o.fd_); return *this; }
+    ~File() { if (fd_ >= 0) ::close(fd_); }
+    int fd() const noexcept { return fd_; }
+    explicit operator bool() const noexcept { return fd_ >= 0; }
+
+    // Opens for reading; an empty File if it does not exist.
+    static File open_read(const std::string& path)
+    {
+        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0 && errno != ENOENT && errno != ENOTDIR)
+            throw std::system_error(errno, std::generic_category(), "open " + path);
+        return File(fd);
+    }
+
+private:
+    int fd_ = -1;
+};
+
+inline bool exists(const std::string& path)
+{
+    struct stat st;
+    return ::stat(path.c_str(), &st) == 0;
+}
+
+// Reads exactly n bytes at offset; throws on a short read.
+inline void pread_exact(int fd, std::uint8_t* dst, std::size_t n, std::int64_t offset, const std::string& what)
+{
+    std::size_t got = 0;
+    while (got < n) {
+        const ssize_t k = ::pread(fd, dst + got, n - got, static_cast<off_t>(offset + got));
+        if (k < 0) {
+            if (errno == EINTR)
+                continue;
+            throw std::system_error(errno, std::generic_category(), "read " + what);
+        }
+        if (k == 0)
+            throw std::runtime_error(what + ": file is shorter than a chunk");
+        got += static_cast<std::size_t>(k);
+    }
+}
+
+inline std::vector<std::uint8_t> read_whole(int fd, const std::string& what)
+{
+    struct stat st;
+    if (::fstat(fd, &st) != 0)
+        throw std::system_error(errno, std::generic_category(), "stat " + what);
+    std::vector<std::uint8_t> data(static_cast<std::size_t>(st.st_size));
+    if (!data.empty())
+        pread_exact(fd, data.data(), data.size(), 0, what);
+    return data;
+}
+
+inline void hint_willneed(int fd, std::int64_t offset, std::int64_t length)
+{
+#if defined(POSIX_FADV_WILLNEED)
+    ::posix_fadvise(fd, offset, length, POSIX_FADV_WILLNEED);
+#else
+    (void)fd; (void)offset; (void)length;
+#endif
+}
+
+// Writes `data` to `path` atomically (temporary file + rename), creating parent directories.
+inline void atomic_write(const std::string& path, const std::uint8_t* data, std::size_t n)
+{
+    namespace fs = std::filesystem;
+    fs::create_directories(fs::path(path).parent_path());
+    const std::string tmp = path + ".tmp." + std::to_string(::getpid()) + "." +
+                            std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0)
+        throw std::system_error(errno, std::generic_category(), "create " + tmp);
+    std::size_t done = 0;
+    while (done < n) {
+        const ssize_t k = ::write(fd, data + done, n - done);
+        if (k < 0) {
+            if (errno == EINTR)
+                continue;
+            const int err = errno;
+            ::close(fd);
+            ::unlink(tmp.c_str());
+            throw std::system_error(err, std::generic_category(), "write " + tmp);
+        }
+        done += static_cast<std::size_t>(k);
+    }
+    if (::close(fd) != 0 || ::rename(tmp.c_str(), path.c_str()) != 0) {
+        const int err = errno;
+        ::unlink(tmp.c_str());
+        throw std::system_error(err, std::generic_category(), "rename " + tmp);
+    }
+}
+
+// LRU of read-only file mappings, so repeated reads of a chunk need no mmap/munmap.
+class MapCache {
+public:
+    struct Mapping {
+        const std::uint8_t* data = nullptr;
+        std::size_t size = 0;
+        ~Mapping() { if (data) ::munmap(const_cast<std::uint8_t*>(data), size); }
+    };
+    using MappingPtr = std::shared_ptr<const Mapping>;
+
+    explicit MapCache(std::size_t capacity) : capacity_(capacity) {}
+
+    // The mapping of `path` (nullptr if the file does not exist).
+    MappingPtr get(const std::string& path)
+    {
+        {
+            std::lock_guard lock(mutex_);
+            if (auto it = index_.find(path); it != index_.end()) {
+                order_.splice(order_.begin(), order_, it->second);
+                return it->second->second;
+            }
+        }
+        File f = File::open_read(path);
+        if (!f)
+            return nullptr;
+        struct stat st;
+        if (::fstat(f.fd(), &st) != 0)
+            throw std::system_error(errno, std::generic_category(), "stat " + path);
+        auto m = std::make_shared<Mapping>();
+        m->size = static_cast<std::size_t>(st.st_size);
+        if (m->size) {
+            void* p = ::mmap(nullptr, m->size, PROT_READ, MAP_SHARED, f.fd(), 0);
+            if (p == MAP_FAILED)
+                throw std::system_error(errno, std::generic_category(), "mmap " + path);
+            m->data = static_cast<const std::uint8_t*>(p);
+        }
+        std::lock_guard lock(mutex_);
+        if (auto it = index_.find(path); it != index_.end())
+            return it->second->second;
+        order_.emplace_front(path, m);
+        index_.emplace(path, order_.begin());
+        while (order_.size() > capacity_) {
+            index_.erase(order_.back().first);
+            order_.pop_back();  // unmapped once no reader holds it
+        }
+        return m;
+    }
+
+private:
+    std::size_t capacity_;
+    std::list<std::pair<std::string, MappingPtr>> order_;
+    std::unordered_map<std::string, std::list<std::pair<std::string, MappingPtr>>::iterator> index_;
+    std::mutex mutex_;
+};
+
+}  // namespace vcr

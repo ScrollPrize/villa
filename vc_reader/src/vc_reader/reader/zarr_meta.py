@@ -1,4 +1,4 @@
-"""Zarr v2 array metadata (``.zarray``) and chunk decoding."""
+"""Zarr v2 array metadata (``.zarray``)."""
 
 from __future__ import annotations
 
@@ -8,6 +8,9 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 import numpy as np
+
+#: Compressors the native reader decodes, by numcodecs id (None: uncompressed).
+SUPPORTED_COMPRESSORS = {None: "", "blosc": "blosc", "vc-delta3d": "vc-delta3d"}
 
 
 @dataclass(frozen=True)
@@ -63,45 +66,22 @@ class ArrayMeta:
     def grid_shape(self) -> tuple[int, ...]:
         return tuple(-(-s // c) for s, c in zip(self.shape, self.chunks))
 
+    @property
+    def codec_id(self) -> str:
+        """The native reader's id for this array's compressor; ValueError if it cannot read the chunks."""
+        cid = self.compressor.get("id") if self.compressor else None
+        if cid not in SUPPORTED_COMPRESSORS:
+            raise ValueError(f"vc_reader cannot read arrays compressed with {cid!r} "
+                             f"(supported: uncompressed, {', '.join(c for c in SUPPORTED_COMPRESSORS if c)})")
+        if self.filters:
+            raise ValueError("vc_reader cannot read arrays with numcodecs filters")
+        if self.order != "C":
+            raise ValueError("vc_reader cannot read arrays stored in Fortran order")
+        return SUPPORTED_COMPRESSORS[cid]
+
     def chunk_key(self, idx: tuple[int, ...]) -> str:
         return self.separator.join(map(str, idx))
 
     def decoded_zarray(self) -> dict[str, Any]:
-        """``.zarray`` of the same array stored uncompressed (the disk-cache layout)."""
+        """``.zarray`` of the same array stored uncompressed (the decoded-cache layout)."""
         return dict(self.raw, compressor=None, filters=None, order="C")
-
-
-class ChunkDecoder:
-    """Decodes stored chunk bytes into a full chunk ndarray (writable, C order)."""
-
-    def __init__(self, meta: ArrayMeta):
-        self.meta = meta
-        self._codec = None
-        self._filters: list[Any] = []
-        if meta.compressor is not None or meta.filters:
-            import numcodecs
-
-            from .codecs import ensure_registered
-
-            for config in (meta.compressor, *meta.filters):
-                if config is not None:
-                    ensure_registered(config.get("id"))
-            if meta.compressor is not None:
-                self._codec = numcodecs.get_codec(dict(meta.compressor))
-            self._filters = [numcodecs.get_codec(dict(f)) for f in meta.filters]
-
-    def decode(self, data: Any) -> np.ndarray:
-        m = self.meta
-        if self._codec is None and not self._filters:
-            buf = data
-        else:
-            buf = self._codec.decode(data) if self._codec is not None else data
-            for f in reversed(self._filters):
-                buf = f.decode(buf)
-        arr = np.frombuffer(buf, dtype=m.dtype)
-        if arr.size != math.prod(m.chunks):
-            raise ValueError(f"chunk decoded to {arr.size} elements, expected {math.prod(m.chunks)}")
-        arr = arr.reshape(m.chunks, order=m.order)
-        if m.order != "C" or not arr.flags.writeable:
-            arr = np.ascontiguousarray(arr) if m.order != "C" else arr.copy()
-        return arr

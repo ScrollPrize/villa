@@ -58,6 +58,7 @@ def main(argv=None) -> None:
         ("zarr", zarr_python(threads=w)),
         (f"zarr (concurrency={w})", zarr_python(concurrency=w, threads=w)),
         ("vc_reader", vc_reader(workers=w)),
+        ("vc_reader:native", vc_reader(workers=w, engine="native")),
     ]
     if have("tensorstore"):
         backends.append(("tensorstore", tensorstore()))
@@ -75,9 +76,12 @@ def main(argv=None) -> None:
 
         cache = args.cache_dir / name
         shutil.rmtree(cache, ignore_errors=True)
-        disk = ("vc_reader+disk", vc_reader(workers=w, cache_dir=cache))
-        bench.run("disk-fill-batch128", name, s3, [backends[0], disk], crops, batch=True, reps=1)
-        bench.run("disk-warm-batch128", name, s3, [backends[0], disk], crops, batch=True)
+        native_cache = args.cache_dir / (name + "-native")
+        shutil.rmtree(native_cache, ignore_errors=True)
+        disk = [("vc_reader+disk", vc_reader(workers=w, cache_dir=cache)),
+                ("vc_reader:native+disk", vc_reader(workers=w, engine="native", cache_dir=native_cache))]
+        bench.run("disk-fill-batch128", name, s3, [backends[0], *disk], crops, batch=True, reps=1)
+        bench.run("disk-warm-batch128", name, s3, [backends[0], *disk], crops, batch=True)
 
     save("remote", dict(arrays={k: f"{HTTPS}/{v}" for k, v in ARRAYS.items()}, region_start=REGION_START,
                         region_size=REGION_SIZE, workers=w), bench)
