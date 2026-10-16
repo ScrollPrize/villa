@@ -34,7 +34,8 @@ FetchContent_Declare(vc_delta3d
 FetchContent_MakeAvailable(vc_delta3d)
 set_target_properties(vc_delta3d PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-nanobind_add_module(_native NB_STATIC cpp/bindings.cpp)
+# NOMINSIZE: nanobind otherwise appends -Os, which costs the point samplers ~8%.
+nanobind_add_module(_native NB_STATIC NOMINSIZE cpp/bindings.cpp)
 target_include_directories(_native PRIVATE cpp)
 target_link_libraries(_native PRIVATE CURL::libcurl PkgConfig::BLOSC vc_delta3d::vc_delta3d Threads::Threads)
 install(TARGETS _native LIBRARY DESTINATION vc_reader)

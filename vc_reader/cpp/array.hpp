@@ -23,6 +23,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -390,22 +391,36 @@ private:
         Index src_lo, extent;
         std::uint8_t* dst = nullptr;
     };
+    // Built in place, field by field: a temporary copied into a vector costs store-forwarding
+    // stalls, and resizing a vector of these leaves them uninitialized.
     struct Point {
-        std::int64_t src = 0;   // byte offset in the chunk
-        std::uint64_t tag = 0;  // which output the element is for: the PointOp's business
+        std::int64_t src;   // byte offset in the chunk
+        std::uint64_t tag;  // which output the element is for: the PointOp's business
+        Point() {}
     };
-    // What a point read does with a chunk's points once the chunk is resolved.
-    struct PointOp {
-        std::int64_t reach = 0;  // bytes each point reads from its offset on
-        // `data` holds the chunk's bytes from byte offset `origin` on.
-        std::function<void(const std::uint8_t* data, std::int64_t origin, std::span<const Point>)> read;
-        std::function<void(std::span<const Point>)> fill;  // the chunk is not stored
+    // Consecutive points [first, first + count) that one chunk answers alone (see plan_points).
+    struct Run {
+        std::uint64_t first, count;
+        std::int64_t lo, hi;  // the lowest and highest byte offset in the chunk the points read from
     };
+    // Points per run: shorter runs are planned as single points (recomputing a point costs
+    // more than reading its planned offset); longer ones are cut, so runs can be shared out.
+    static constexpr std::uint64_t kRunMin = 8, kRunMax = std::uint64_t{1} << 12;
     // Everything one chunk supplies: boxes (read_many) or single elements (point reads).
     struct Work {
         Index idx;
         std::vector<Piece> pieces;
         std::span<const Point> points;
+        std::span<const Run> runs;
+
+        bool has_points() const noexcept { return !points.empty() || !runs.empty(); }
+    };
+    // What a point read does with a chunk's points and runs once the chunk is resolved.
+    struct PointOp {
+        std::int64_t reach = 0;  // bytes each point reads from its offset on
+        // `data` holds the chunk's bytes from byte offset `origin` on.
+        std::function<void(const std::uint8_t* data, std::int64_t origin, const Work&)> read;
+        std::function<void(const Work&)> fill;  // the chunk is not stored
     };
 
     // Resolves every chunk in parallel, in the order given.
@@ -418,16 +433,20 @@ private:
 
     std::size_t plan_segments(std::size_t n) const
     {
-        return std::clamp<std::size_t>(n / kPlanGrain, 1, pool_.size() + 1);
+        return std::clamp<std::size_t>(n / kPlanGrain, 1, 4 * (pool_.size() + 1));
     }
 
     // Groups point reads by chunk. The n points are split into plan_segments(n) contiguous
-    // ranges, each planned in order on one thread: locate(segment, p, scratch, emit) calls
-    // emit(index, tag) for each element point p reads (index: nd indices inside the array;
-    // scratch: room for nd indices). Returns one Work per chunk, in chunk order, whose
-    // points (byte offset and tag, in emission order) are stored in `points`.
+    // ranges, each planned in order on one thread: locate(segment, p, scratch, emit) reports
+    // what point p reads (scratch: room for nd indices; index: nd indices inside the array):
+    //  - emit.point(index, tag): the point is answered from the chunk holding `index` alone,
+    //    and the PointOp can recompute everything it needs from the point's number, `tag`;
+    //  - emit(index, tag): one element the point needs.
+    // Consecutive points answered from one chunk become a Run, which stores no per-point data;
+    // the other elements become Points (byte offset and tag). Returns one Work per chunk, in
+    // chunk order, whose points and runs (in emission order) are stored in `points` and `runs`.
     template <class Locate>
-    std::vector<Work> plan_points(std::size_t n, std::vector<Point>& points, Locate&& locate)
+    std::vector<Work> plan_points(std::size_t n, std::vector<Point>& points, std::vector<Run>& runs, Locate&& locate)
     {
         const std::size_t nd = spec_.shape.size();
         const std::size_t segs = plan_segments(n);
@@ -435,27 +454,43 @@ private:
             std::int64_t src;
             std::uint64_t tag;
             std::uint32_t id;
+            Entry(std::int64_t src, std::uint64_t tag, std::uint32_t id) : src(src), tag(tag), id(id) {}
+        };
+        struct RunEntry {
+            Run run;
+            std::uint32_t id;
+            RunEntry(const Run& run, std::uint32_t id) : run(run), id(id) {}
         };
         struct Segment {
             ChunkIds ids;
             std::vector<std::int64_t> linear;  // local id -> linear chunk index
             std::vector<std::size_t> next;     // local id -> element count; later its next slot in `points`
+            std::vector<std::size_t> next_run; // local id -> run count; later its next slot in `runs`
             std::vector<Entry> entries;
+            std::vector<RunEntry> run_entries;
         };
-        std::vector<Segment> seg(segs);
-        pool_.parallel_for(segs, [&](std::size_t s) {
-            Segment& g = seg[s];
-            const std::size_t p0 = n * s / segs, p1 = n * (s + 1) / segs;
-            g.entries.reserve(p1 - p0);
-            Index scratch(nd);
-            std::int64_t last = -1;
+        struct Emit {
+            const Array& a;
+            Segment& g;
+            std::int64_t last = -1;  // the last chunk looked up, and its local id
             std::uint32_t id = 0;
-            auto emit = [&](const std::int64_t* c, std::uint64_t tag) {
+            Run run{0, 0, 0, 0};  // the open run, of chunk run_id with first element run_base
+            std::uint32_t run_id = 0;
+            Index run_base;
+            std::int64_t run_src[kRunMin];  // the offsets of its first points
+
+            // The local id of the chunk holding `c`; returns c's byte offset in it. base: the
+            // chunk's first element, or null.
+            std::int64_t find(const std::int64_t* c, std::uint32_t& cid, std::int64_t* base)
+            {
                 std::int64_t linear = 0, offset = 0;
-                for (std::size_t i = 0; i < nd; ++i) {
-                    const std::int64_t q = c[i] / spec_.chunks[i];
-                    linear = linear * grid_[i] + q;
-                    offset += (c[i] - q * spec_.chunks[i]) * chunk_strides_[i];
+                for (std::size_t i = 0; i < a.grid_.size(); ++i) {
+                    const std::int64_t q = c[i] / a.spec_.chunks[i];
+                    const std::int64_t r = c[i] - q * a.spec_.chunks[i];
+                    linear = linear * a.grid_[i] + q;
+                    offset += r * a.chunk_strides_[i];
+                    if (base)
+                        base[i] = c[i] - r;
                 }
                 if (linear != last) {  // runs of points in one chunk skip the lookup
                     last = linear;
@@ -463,47 +498,131 @@ private:
                     if (id == g.linear.size()) {
                         g.linear.push_back(linear);
                         g.next.push_back(0);
+                        g.next_run.push_back(0);
                     }
                 }
-                ++g.next[id];
-                g.entries.push_back(Entry{offset, tag, id});
-            };
+                cid = id;
+                return offset;
+            }
+            void element(std::int64_t src, std::uint64_t tag, std::uint32_t cid)
+            {
+                ++g.next[cid];
+                g.entries.emplace_back(src, tag, cid);
+            }
+            void operator()(const std::int64_t* c, std::uint64_t tag)
+            {
+                std::uint32_t cid;
+                const std::int64_t src = find(c, cid, nullptr);
+                element(src, tag, cid);
+            }
+            void point(const std::int64_t* c, std::uint64_t tag)
+            {
+                if (run.count && tag == run.first + run.count && run.count < kRunMax) {
+                    bool inside = true;  // in the run's chunk: no division or lookup
+                    std::int64_t src = 0;
+                    for (std::size_t i = 0; i < run_base.size(); ++i) {
+                        const std::int64_t d = c[i] - run_base[i];
+                        inside &= d >= 0 && d < a.spec_.chunks[i];
+                        src += d * a.chunk_strides_[i];
+                    }
+                    if (inside) {
+                        if (run.count < kRunMin)
+                            run_src[run.count] = src;
+                        ++run.count;
+                        run.lo = std::min(run.lo, src);
+                        run.hi = std::max(run.hi, src);
+                        return;
+                    }
+                }
+                close();
+                const std::int64_t src = find(c, run_id, run_base.data());
+                run = Run{tag, 1, src, src};
+                run_src[0] = src;
+            }
+            void close()
+            {
+                if (run.count < kRunMin) {
+                    for (std::uint64_t j = 0; j < run.count; ++j)
+                        element(run_src[j], run.first + j, run_id);
+                } else {
+                    ++g.next_run[run_id];
+                    g.run_entries.emplace_back(run, run_id);
+                }
+                run.count = 0;
+            }
+        };
+        std::vector<Segment> seg(segs);
+        pool_.parallel_for(segs, [&](std::size_t s) {
+            Segment& g = seg[s];
+            const std::size_t p0 = n * s / segs, p1 = n * (s + 1) / segs;
+            g.entries.reserve(p1 - p0);
+            Index scratch(nd);
+            Emit emit{*this, g};
+            emit.run_base.resize(nd);
             for (std::size_t p = p0; p < p1; ++p)
                 locate(s, p, scratch.data(), emit);
+            emit.close();
         });
         // Chunks in order; within a chunk, each segment's elements after the earlier segments'.
-        std::vector<std::int64_t> chunks;
-        for (const auto& g : seg)
-            chunks.insert(chunks.end(), g.linear.begin(), g.linear.end());
-        std::sort(chunks.begin(), chunks.end());
-        chunks.erase(std::unique(chunks.begin(), chunks.end()), chunks.end());
-        std::vector<std::vector<std::size_t>> global(segs);
-        std::vector<std::size_t> start(chunks.size() + 1, 0);
+        // Every segment's chunks get a dense id (in order of appearance), then their rank.
+        ChunkIds all;
+        std::vector<std::int64_t> seen;  // dense id -> linear chunk index
+        std::vector<std::vector<std::uint32_t>> global(segs);
         for (std::size_t s = 0; s < segs; ++s) {
             const Segment& g = seg[s];
             global[s].resize(g.linear.size());
             for (std::size_t id = 0; id < g.linear.size(); ++id) {
-                global[s][id] = static_cast<std::size_t>(
-                    std::lower_bound(chunks.begin(), chunks.end(), g.linear[id]) - chunks.begin());
-                start[global[s][id] + 1] += g.next[id];
+                const auto fresh = static_cast<std::uint32_t>(seen.size());
+                global[s][id] = all.find_or_insert(g.linear[id], fresh);
+                if (global[s][id] == fresh)
+                    seen.push_back(g.linear[id]);
             }
         }
-        for (std::size_t c = 0; c < chunks.size(); ++c)
+        std::vector<std::uint32_t> order(seen.size()), rank(seen.size());
+        std::iota(order.begin(), order.end(), 0u);
+        std::sort(order.begin(), order.end(), [&](std::uint32_t a, std::uint32_t b) { return seen[a] < seen[b]; });
+        std::vector<std::int64_t> chunks(seen.size());
+        for (std::size_t c = 0; c < order.size(); ++c) {
+            chunks[c] = seen[order[c]];
+            rank[order[c]] = static_cast<std::uint32_t>(c);
+        }
+        // Counting sort of the elements and of the runs by chunk.
+        std::vector<std::size_t> start(chunks.size() + 1, 0), run_start(chunks.size() + 1, 0);
+        for (std::size_t s = 0; s < segs; ++s) {
+            const Segment& g = seg[s];
+            for (std::size_t id = 0; id < g.linear.size(); ++id) {
+                global[s][id] = rank[global[s][id]];
+                start[global[s][id] + 1] += g.next[id];
+                run_start[global[s][id] + 1] += g.next_run[id];
+            }
+        }
+        for (std::size_t c = 0; c < chunks.size(); ++c) {
             start[c + 1] += start[c];
+            run_start[c + 1] += run_start[c];
+        }
         std::vector<std::size_t> cursor(start.begin(), start.end() - 1);
+        std::vector<std::size_t> run_cursor(run_start.begin(), run_start.end() - 1);
         for (std::size_t s = 0; s < segs; ++s) {
             Segment& g = seg[s];
             for (std::size_t id = 0; id < g.linear.size(); ++id) {
-                const std::size_t count = g.next[id];
+                const std::size_t count = g.next[id], run_count = g.next_run[id];
                 g.next[id] = cursor[global[s][id]];
                 cursor[global[s][id]] += count;
+                g.next_run[id] = run_cursor[global[s][id]];
+                run_cursor[global[s][id]] += run_count;
             }
         }
         points.resize(start.back());
+        runs.resize(run_start.back());
         pool_.parallel_for(segs, [&](std::size_t s) {
             Segment& g = seg[s];
-            for (const Entry& e : g.entries)
-                points[g.next[e.id]++] = Point{e.src, e.tag};
+            for (const Entry& e : g.entries) {
+                Point& pt = points[g.next[e.id]++];
+                pt.src = e.src;
+                pt.tag = e.tag;
+            }
+            for (const RunEntry& e : g.run_entries)
+                runs[g.next_run[e.id]++] = e.run;
         });
         std::vector<Work> work(chunks.size());
         for (std::size_t c = 0; c < chunks.size(); ++c) {
@@ -515,6 +634,7 @@ private:
                 linear /= grid_[i];
             }
             w.points = std::span<const Point>(points.data() + start[c], start[c + 1] - start[c]);
+            w.runs = std::span<const Run>(runs.data() + run_start[c], run_start[c + 1] - run_start[c]);
         }
         return work;
     }
@@ -535,6 +655,46 @@ private:
         });
     }
 
+    // for_points for runs: parts of about equal point counts, cut between runs.
+    template <class Fn>
+    void for_runs(std::span<const Run> runs, Fn&& fn)
+    {
+        std::uint64_t total = 0;
+        for (const Run& r : runs)
+            total += r.count;
+        const std::uint64_t parts = total / kPlanGrain;
+        if (parts < 2) {
+            fn(runs);
+            return;
+        }
+        std::vector<std::size_t> cut{0};
+        std::uint64_t sum = 0;
+        for (std::size_t i = 0; i + 1 < runs.size(); ++i) {
+            sum += runs[i].count;
+            if (sum * parts >= total * cut.size())
+                cut.push_back(i + 1);
+        }
+        cut.push_back(runs.size());
+        pool_.parallel_for(cut.size() - 1, [&](std::size_t i) { fn(runs.subspan(cut[i], cut[i + 1] - cut[i])); });
+    }
+
+    // Byte offset of the element at `idx` in the chunk whose first element is `base`.
+    std::int64_t offset_in(const std::int64_t* idx, const std::int64_t* base) const
+    {
+        std::int64_t src = 0;
+        for (std::size_t i = 0; i < chunk_strides_.size(); ++i)
+            src += (idx[i] - base[i]) * chunk_strides_[i];
+        return src;
+    }
+
+    Index chunk_base(const Work& w) const
+    {
+        Index base(w.idx.size());
+        for (std::size_t i = 0; i < base.size(); ++i)
+            base[i] = w.idx[i] * spec_.chunks[i];
+        return base;
+    }
+
     template <std::size_t K>
     static void copy_points(const std::uint8_t* data, std::int64_t origin, std::span<const Point> pts,
                             std::uint8_t* out)
@@ -543,17 +703,19 @@ private:
             std::memcpy(out + pt.tag * K, data + (pt.src - origin), K);
     }
 
-    // Reads one element per located point into out[tag] (see plan_points for `locate`).
+    // Reads one element per located point into out[tag] (see plan_points for `locate`, which
+    // only emits elements here: planning a point costs less than recomputing it).
     template <class Locate>
     void gather_points(std::size_t n, std::uint8_t* out, Locate&& locate)
     {
         std::vector<Point> points;
-        auto work = plan_points(n, points, locate);
+        std::vector<Run> runs;
+        auto work = plan_points(n, points, runs, locate);
         const std::size_t isz = spec_.itemsize;
         PointOp op;
         op.reach = static_cast<std::int64_t>(isz);
-        op.read = [&](const std::uint8_t* data, std::int64_t origin, std::span<const Point> pts) {
-            for_points(pts, [&](std::span<const Point> part) {
+        op.read = [&](const std::uint8_t* data, std::int64_t origin, const Work& w) {
+            for_points(w.points, [&](std::span<const Point> part) {
                 switch (isz) {
                 case 1: return copy_points<1>(data, origin, part, out);
                 case 2: return copy_points<2>(data, origin, part, out);
@@ -565,8 +727,8 @@ private:
                 }
             });
         };
-        op.fill = [&](std::span<const Point> pts) {
-            for (const Point& pt : pts)
+        op.fill = [&](const Work& w) {
+            for (const Point& pt : w.points)
                 std::memcpy(out + pt.tag * isz, spec_.fill.data(), isz);
         };
         run(work, {}, &op);
@@ -667,10 +829,23 @@ private:
         std::vector<std::uint64_t> base;  // segment -> its first slot in raw
         std::vector<std::uint8_t> raw;
         std::vector<Point> points;
+        std::vector<Run> runs;
+        // A point whose neighbours all lie in the chunk at `at`'s; `at` is the near corner.
+        const auto value = [&](const Cell& cell, const std::uint8_t* at) {
+            if (nd == 3 && cell.k == 3)
+                return trilinear(cell.frac, at, chunk_strides_.data(), load);
+            return interpolate(cell, [&](std::size_t corner) {
+                std::int64_t offset = 0;
+                for (std::size_t a = 0; a < cell.k; ++a)
+                    if (corner >> a & 1)
+                        offset += chunk_strides_[cell.axes[a]];
+                return load(at + offset);
+            });
+        };
         for (std::size_t b0 = 0; b0 < n; b0 += kPointBatch) {
             const std::size_t m = std::min(kPointBatch, n - b0);
             split.assign(plan_segments(m), Splits{});
-            auto work = plan_points(m, points, [&](std::size_t s, std::size_t p, std::int64_t* idx, auto& emit) {
+            auto work = plan_points(m, points, runs, [&](std::size_t s, std::size_t p, std::int64_t* idx, auto& emit) {
                 const double* c = coords + (b0 + p) * nd;
                 bool finite = true, outside = false;
                 for (std::size_t i = 0; i < nd; ++i) {
@@ -691,7 +866,7 @@ private:
                     whole &= cell.lo[i] + 1 < spec_.shape[i] && cell.lo[i] % spec_.chunks[i] + 1 < spec_.chunks[i];
                 }
                 if (whole) {
-                    emit(cell.lo, b0 + p);
+                    emit.point(cell.lo, b0 + p);
                     return;
                 }
                 Splits& sp = split[s];
@@ -718,12 +893,11 @@ private:
                 slots += split[s].slots;
             }
             raw.resize(slots * isz);
-            for (std::uint64_t j = 0; j < slots; ++j)
-                std::memcpy(raw.data() + j * isz, spec_.fill.data(), isz);
+            fill_elements(raw.data(), slots, spec_.fill);
             PointOp op;
             op.reach = reach;
-            op.read = [&](const std::uint8_t* data, std::int64_t origin, std::span<const Point> pts) {
-                for_points(pts, [&](std::span<const Point> part) {
+            op.read = [&](const std::uint8_t* data, std::int64_t origin, const Work& w) {
+                for_points(w.points, [&](std::span<const Point> part) {
                     Cell cell;
                     for (const Point& pt : part) {
                         const std::uint8_t* at = data + (pt.src - origin);
@@ -733,28 +907,34 @@ private:
                             continue;
                         }
                         cell_of(coords + pt.tag * nd, nd, cell);
-                        if (nd == 3 && cell.k == 3) {
-                            store(pt.tag, trilinear(cell.frac, at, chunk_strides_.data(), load));
-                            continue;
-                        }
-                        store(pt.tag, interpolate(cell, [&](std::size_t corner) {
-                            std::int64_t offset = 0;
-                            for (std::size_t a = 0; a < cell.k; ++a)
-                                if (corner >> a & 1)
-                                    offset += chunk_strides_[cell.axes[a]];
-                            return load(at + offset);
-                        }));
+                        store(pt.tag, value(cell, at));
                     }
                 });
+                if (w.runs.empty())
+                    return;
+                const Index chunk = chunk_base(w);
+                for_runs(w.runs, [&](std::span<const Run> part) {
+                    Cell cell;
+                    for (const Run& r : part)
+                        for (std::uint64_t p = r.first; p < r.first + r.count; ++p) {
+                            cell_of(coords + p * nd, nd, cell);
+                            store(p, value(cell, data + (offset_in(cell.lo, chunk.data()) - origin)));
+                        }
+                });
             };
-            op.fill = [&](std::span<const Point> pts) {
+            op.fill = [&](const Work& w) {
                 Cell cell;
-                for (const Point& pt : pts) {
+                for (const Point& pt : w.points) {
                     if (pt.tag & kSplit)
                         continue;  // its raw slot holds fill already
                     cell_of(coords + pt.tag * nd, nd, cell);
                     store(pt.tag, interpolate(cell, [&](std::size_t) { return fill; }));
                 }
+                for (const Run& r : w.runs)
+                    for (std::uint64_t p = r.first; p < r.first + r.count; ++p) {
+                        cell_of(coords + p * nd, nd, cell);
+                        store(p, interpolate(cell, [&](std::size_t) { return fill; }));
+                    }
             };
             run(work, {}, &op);
             pool_.parallel_for(split.size(), [&](std::size_t s) {
@@ -827,16 +1007,16 @@ private:
         for (const auto& p : w.pieces)
             copy_box(chunk->data() + offset_of(p.src_lo, chunk_strides_), chunk_strides_, p.dst,
                      out_strides[p.region], p.extent, spec_.itemsize);
-        if (!w.points.empty())
-            op->read(chunk->data(), 0, w.points);
+        if (w.has_points())
+            op->read(chunk->data(), 0, w);
     }
 
     void fill_pieces(const Work& w, const std::vector<Index>& out_strides, const PointOp* op)
     {
         for (const auto& p : w.pieces)
             fill_box(p.dst, out_strides[p.region], p.extent, spec_.fill);
-        if (!w.points.empty())
-            op->fill(w.points);
+        if (w.has_points())
+            op->fill(w);
     }
 
     // Reads the pieces of a raw (uncompressed) chunk file straight into the outputs.
@@ -859,8 +1039,8 @@ private:
             for (const auto& p : w.pieces)
                 copy_box(m->data + offset_of(p.src_lo, chunk_strides_), chunk_strides_, p.dst,
                          out_strides[p.region], p.extent, spec_.itemsize);
-            if (!w.points.empty())
-                op->read(m->data, 0, w.points);
+            if (w.has_points())
+                op->read(m->data, 0, w);
             return Found::Copied;
         }
         File f = File::open_read(path);
@@ -874,15 +1054,19 @@ private:
             pread_exact(f.fd(), scratch.data(), static_cast<std::size_t>(len), first, path);
             copy_box(scratch.data(), chunk_strides_, p.dst, out_strides[p.region], p.extent, spec_.itemsize);
         }
-        if (!w.points.empty()) {  // one read of the span the points touch
+        if (w.has_points()) {  // one read of the span the points touch
             std::int64_t lo = INT64_MAX, hi = 0;
             for (const auto& pt : w.points) {
                 lo = std::min(lo, pt.src);
                 hi = std::max(hi, pt.src);
             }
+            for (const auto& r : w.runs) {
+                lo = std::min(lo, r.lo);
+                hi = std::max(hi, r.hi);
+            }
             hi = std::min(hi + op->reach, static_cast<std::int64_t>(chunk_bytes_));
             pread_exact(f.fd(), scratch.data(), static_cast<std::size_t>(hi - lo), lo, path);
-            op->read(scratch.data(), lo, w.points);
+            op->read(scratch.data(), lo, w);
         }
         return Found::Copied;
     }

@@ -77,14 +77,27 @@ inline void copy_box(const std::uint8_t* s, const Index& ss, std::uint8_t* d, co
     }
 }
 
+// Writes `count` copies of the element `fill` from d on.
+inline void fill_elements(std::uint8_t* d, std::size_t count, const std::vector<std::uint8_t>& fill)
+{
+    const std::size_t total = count * fill.size();
+    if (total == 0)
+        return;
+    std::memcpy(d, fill.data(), fill.size());
+    for (std::size_t done = fill.size(); done < total;) {  // double the filled prefix
+        const std::size_t n = std::min(done, total - done);
+        std::memcpy(d + done, d, n);
+        done += n;
+    }
+}
+
 // Fills a box of `extent` elements starting at `d` (strides `ds`) with the fill pattern.
 inline void fill_box(std::uint8_t* d, const Index& ds, const Index& extent, const std::vector<std::uint8_t>& fill)
 {
     const std::size_t nd = extent.size();
     const std::size_t itemsize = fill.size();
     std::vector<std::uint8_t> row(static_cast<std::size_t>(extent[nd - 1]) * itemsize);
-    for (std::size_t i = 0; i < row.size(); i += itemsize)
-        std::memcpy(row.data() + i, fill.data(), itemsize);
+    fill_elements(row.data(), static_cast<std::size_t>(extent[nd - 1]), fill);
     Index ss(nd, 0);  // every row of the "source" is the same row
     ss[nd - 1] = static_cast<std::int64_t>(itemsize);
     copy_box(row.data(), ss, d, ds, extent, itemsize);

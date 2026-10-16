@@ -232,6 +232,26 @@ def test_sample_linear_order_everywhere(array, read_mode, memory):
         np.testing.assert_array_equal(r.sample(pts), got.astype(np.float32))
 
 
+@pytest.mark.parametrize("read_mode", ["mmap", "slab"])
+@pytest.mark.parametrize("memory", [0, 64 << 20])
+def test_sample_plane(array, read_mode, memory):
+    """A sampling grid on a tilted plane (a surface patch) crossing many chunks, including a
+    missing one and the array's edge: consecutive points in one chunk are planned together, and
+    every point still sums the same way."""
+    root, exp = array
+    u = np.array([0.1, 0.2, 0.97]); u /= np.linalg.norm(u)
+    w = np.array([0.95, 0.3, 0.0]); w -= u * (u @ w); w /= np.linalg.norm(w)
+    v = np.cross(w, u)
+    a, b, c = np.meshgrid(np.arange(3), np.arange(70), np.arange(70), indexing="ij")
+    pts = np.array([10.0, 48.0, -1.5]) + 0.73 * (b[..., None] * v + c[..., None] * u) + 0.5 * a[..., None] * w
+    with ZarrReader.open(root, read_mode=read_mode, memory_cache=memory) as r:
+        got = r.sample(pts, dtype=np.float64)
+        assert got.shape == pts.shape[:-1]
+        np.testing.assert_array_max_ulp(got.ravel(), _linear_ordered(exp, pts), maxulp=MAX_ULP)
+        nearest = np.where((pts > -1) & (pts < np.asarray(SHAPE) + 1), np.rint(pts), -1).astype(np.int64)
+        np.testing.assert_array_equal(r.sample(pts, order=0), _gather(exp, nearest).reshape(pts.shape[:-1]))
+
+
 def test_point_reads_span_batches(array):
     """More points than one native batch (2^20): every output still lands in its place."""
     root, exp = array
