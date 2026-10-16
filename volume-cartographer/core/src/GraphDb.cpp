@@ -1333,7 +1333,7 @@ std::optional<std::filesystem::path> GraphDb::resolveStoragePath(
     namespace fs = std::filesystem;
     const auto object = objectByUuid(txn, objectUuid);
     if (!object || object->storageKind != "file" ||
-        (object->kind != "patch" && object->kind != "fiber"))
+        (object->kind != "patch" && object->kind != "fiber" && object->kind != "point_collection"))
         return std::nullopt;
 
     const bool patch = object->kind == "patch";
@@ -1347,6 +1347,15 @@ std::optional<std::filesystem::path> GraphDb::resolveStoragePath(
             return false;
         try {
             const auto json = nlohmann::json::parse(input);
+            if (object->kind == "point_collection") {
+                if (!json.is_object() || json.value("vc_pointcollections_json_version", "") != "1" ||
+                    !json.contains("collections") || !json.at("collections").is_object()) return false;
+                for (const auto& collection : json.at("collections")) {
+                    const auto sourceUuid = collection.value("uuid", "");
+                    if (util::isUuid(sourceUuid) && parseUuid(sourceUuid) == uuid) return true;
+                }
+                return false;
+            }
             if (!json.is_object() || !json.contains("uuid") || !json["uuid"].is_string())
                 return false;
             if (!patch && !json.contains("control_points") && !json.contains("line_points"))

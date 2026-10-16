@@ -641,6 +641,36 @@ NB_MODULE(graph, m)
             },
             nb::arg("file"))
         .def(
+            "link_point_collections_to_patches",
+            [](PyGraphDb& self, const std::string& collectionsFile, const std::string& patchesDir,
+               const nb::kwargs& kwargs) {
+                vc::graph_links::PointCollectionPatchParams p;
+                for (auto item : kwargs) {
+                    const auto key = nb::cast<std::string>(item.first);
+                    const nb::handle value = item.second;
+                    if (key == "tolerance") p.tolerance = nb::cast<double>(value);
+                    else if (key == "point_scale") p.pointScale = nb::cast<double>(value);
+                    else if (key == "patch_scale") p.patchScale = nb::cast<double>(value);
+                    else if (key == "window_points") p.windowPoints = nb::cast<int>(value);
+                    else if (key == "window_min_points") p.windowMinPoints = nb::cast<int>(value);
+                    else if (key == "absolute_winding") p.absoluteWinding = nb::cast<std::optional<bool>>(value);
+                    else if (key == "edge_kind") p.edgeKind = nb::cast<std::string>(value);
+                    else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(value);
+                    else throw std::runtime_error("link_point_collections_to_patches: unknown parameter '" + key + "'");
+                }
+                vc::graph_links::DetectorReport report;
+                auto& db = self.require();
+                {
+                    nb::gil_scoped_release release;
+                    report = vc::graph_links::linkPointCollectionsToPatches(db, collectionsFile, patchesDir, p);
+                }
+                return detectorReportToPy(report);
+            },
+            nb::arg("collections_file"), nb::arg("patches_dir"), nb::arg("kwargs"),
+            "Link regular PCL points to patches using Spiral's largest-area/nearest-named-pair rules. "
+            "Point IDs anchor the edges; winding annotations and patch grid coordinates are retained. "
+            "Defaults: tolerance=2.5, window_points=1, window_min_points=1; no CT required.")
+        .def(
             "link_patch_overlaps",
             [](PyGraphDb& self, const std::string& dir, const nb::kwargs& kwargs) {
                 vc::graph_links::PatchOverlapParams p;

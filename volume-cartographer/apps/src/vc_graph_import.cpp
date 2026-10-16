@@ -12,6 +12,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 using namespace vc::graph;
@@ -25,6 +26,12 @@ void usage()
         << "  --no-progress        disable terminal progress reporting (stderr)\n"
         << "  --fibers <dir>       import vc3d_fiber JSON files (objects + branch edges)\n"
         << "  --segments <dir>     register segment dirs with meta.json as patch objects\n"
+        << "  --link-pcl-patches <json>       link point collections to --segments patches (repeatable; no CT)\n"
+        << "  --pcl-tolerance <vx>           maximum point-to-patch distance (default 2.5)\n"
+        << "  --point-scale <factor>         point XYZ -> working XYZ (default 1)\n"
+        << "  --pcl-window-points <n>        centered support window (default 1)\n"
+        << "  --pcl-window-min-points <n>    required hits in that window (default 1)\n"
+        << "  --pcl-absolute / --pcl-relative override abs_winding.json filename rule\n"
         << "  --tracks <file>      register tracks from a JSON interchange list\n"
         << "                       ([{dataset_ref, external_key, family, point_count, ...}])\n"
         << "  --link-track-tracks <dbm>       register tracks and compute crossings directly into SQLite\n"
@@ -85,6 +92,8 @@ int main(int argc, char** argv)
 try {
     fs::path dbPath, fiberDir, segmentsDir, tracksPath, overlapDir, importJsonPath, exportJsonPath;
     fs::path linkFiberDir, linkTrackPath, ctVolume;
+    std::vector<fs::path> pclFiles;
+    vc::graph_links::PointCollectionPatchParams pclParams;
     vc::graph_links::TrackPatchParams trackPatchParams;
     vc::graph_links::FiberPatchParams fiberPatchParams;
     bool linkTracks = false;
@@ -103,6 +112,13 @@ try {
         else if (arg == "--author") author = next("--author");
         else if (arg == "--fibers") fiberDir = next("--fibers");
         else if (arg == "--segments") segmentsDir = next("--segments");
+        else if (arg == "--link-pcl-patches") pclFiles.emplace_back(next(arg.c_str()));
+        else if (arg == "--pcl-tolerance") pclParams.tolerance = std::stod(next(arg.c_str()));
+        else if (arg == "--point-scale") pclParams.pointScale = std::stod(next(arg.c_str()));
+        else if (arg == "--pcl-window-points") pclParams.windowPoints = std::stoi(next(arg.c_str()));
+        else if (arg == "--pcl-window-min-points") pclParams.windowMinPoints = std::stoi(next(arg.c_str()));
+        else if (arg == "--pcl-absolute") pclParams.absoluteWinding = true;
+        else if (arg == "--pcl-relative") pclParams.absoluteWinding = false;
         else if (arg == "--tracks") tracksPath = next("--tracks");
         else if (arg == "--link-track-tracks") {
             linkTracks = true;
@@ -165,6 +181,9 @@ try {
 
     if ((!linkFiberDir.empty() || !linkTrackPath.empty()) && (segmentsDir.empty() || (ctVolume.empty() && fiberPatchParams.normalsManifest.empty())))
         throw std::runtime_error("patch linking requires --segments and either --ct or --normals-manifest");
+    if (!pclFiles.empty() && segmentsDir.empty())
+        throw std::runtime_error("PCL linking requires --segments");
+    pclParams.patchScale = fiberPatchParams.patchScale;
 
     static_cast<vc::graph_links::LinePatchParams&>(trackPatchParams) = fiberPatchParams;
     trackPatchParams.sourceIds = trackParams.sourceIds;
@@ -192,7 +211,7 @@ try {
         progress.finish();
         printReport("fibers", report);
     }
-    if (!segmentsDir.empty() && linkFiberDir.empty() && linkTrackPath.empty()) {
+    if (!segmentsDir.empty() && linkFiberDir.empty() && linkTrackPath.empty() && pclFiles.empty()) {
         vc::util::TerminalProgress progress("Import patches", showProgress);
         auto w = db.write();
         ImportReport report = importPatches(db, w, segmentsDir, progress.callback());
@@ -258,6 +277,16 @@ try {
                   << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
         for (const auto& problem : report.problems)
             std::cerr << "  ! " << problem << "\n";
+    }
+    for (const auto& pclFile : pclFiles) {
+        vc::util::TerminalProgress progress("Point collections to patches", showProgress);
+        pclParams.progress = progress.callback();
+        const auto report = vc::graph_links::linkPointCollectionsToPatches(db, pclFile, segmentsDir, pclParams);
+        progress.finish();
+        std::cout << "pcl-patches: " << report.objectsConsidered << " objects, "
+                  << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
+                  << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
+        for (const auto& problem : report.problems) std::cerr << "  ! " << problem << "\n";
     }
     if (!importJsonPath.empty()) {
         vc::util::TerminalProgress progress("Import JSON", showProgress);

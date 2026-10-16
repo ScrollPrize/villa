@@ -32,6 +32,7 @@ inline constexpr const char* kFiberFiberDetector = "fiber-fiber";
 inline constexpr const char* kTrackFiberDetector = "track-fiber";
 inline constexpr const char* kTrackTrackDetector = "track-track";
 inline constexpr const char* kTrackPatchDetector = "track-patch";
+inline constexpr const char* kPointCollectionPatchDetector = "point-collection-patch";
 
 // One proposed connection. `kind` is the edge kind metadata to store
 // (detectors default it to "same-surface"); `score` and `meta` are
@@ -93,7 +94,35 @@ DetectorReport commitCandidates(graph::GraphDb& db, graph::WriteTxn& txn,
                                 const util::ProgressCallback& progress = {});
 
 // --- Detectors ---
-// Patch overlap, fiber->patch, track->track and track->patch are implemented; the rest are placeholders that
+struct PointCollectionPatchParams {
+    double tolerance = 2.5;       // working voxels, matching fit_spiral's default
+    double pointScale = 1.0;      // source XYZ -> working XYZ
+    double patchScale = 1.0;
+    int windowPoints = 1;         // even values use the next odd centered window
+    int windowMinPoints = 1;      // clipped at collection ends
+    // Like fit_spiral's explicit input role. When unset, only abs_winding.json
+    // is absolute; source metadata.winding_is_absolute is not authoritative.
+    std::optional<bool> absoluteWinding;
+    std::string edgeKind = "point-patch";
+    bool replaceStalePending = true;
+    util::ProgressCallback progress;
+};
+
+// Regular vc_pointcollections JSON -> patches, using Spiral's point projection
+// policy (no CT/strip or fiber-side filtering). Each collection needs a source
+// UUID and becomes kind="point_collection"; geometry stays in the JSON file.
+// One edge per attached point: aAnchor.index is the source point ID,
+// aAnchor.position is source XYZ, bAnchor.position is projected patch XYZ.
+// Metadata retains grid [row,column], distance and winding annotation.
+// General collections prefer largest valid-quad area, then distance; named
+// between_patches__A__B collections prefer nearest within that pair.
+// Absolute collections bypass the neighbor window. Registration and links
+// commit together; malformed input/cancellation leaves the DB unchanged.
+DetectorReport linkPointCollectionsToPatches(graph::GraphDb& db,
+    const std::filesystem::path& pointCollectionsJson, const std::filesystem::path& patchesDir,
+    const PointCollectionPatchParams& params = {}, const std::atomic_bool* cancel = nullptr);
+
+// PCL->patch, patch overlap, fiber->patch, track->track and track->patch are implemented; the rest are placeholders that
 // count the objects they would consider, write nothing, and report
 // "not implemented". Signatures and parameter structs are final
 // shapes so callers can be wired now.

@@ -151,6 +151,143 @@ def test_export_version_and_legacy_scalar_import(db):
         db.import_json(json.dumps(snapshot))
 
 
+def _write_pcl_patch(path, rows, cols, z, scale=(1.0, 1.0)):
+    import numpy as np
+    import tifffile
+    path.mkdir(parents=True)
+    yy, xx = np.mgrid[:rows, :cols]
+    uid = str(uuid.uuid4())
+    (path / "meta.json").write_text(json.dumps({"uuid": uid, "type": "seg", "format": "tifxyz", "scale": scale}))
+    for axis, values in zip("xyz", (xx + 100, yy + 100, np.full_like(xx, z))):
+        tifffile.imwrite(path / f"{axis}.tif", values.astype(np.float32))
+    return uid
+
+
+def _write_pcl(path, collections):
+    path.write_text(json.dumps({"vc_pointcollections_json_version": "1", "collections": collections}))
+
+
+def _pcl(name, points):
+    return {"uuid": str(uuid.uuid4()), "name": name, "metadata": {},
+            "points": {str(key): {"p": xyz, "wind_a": wind} for key, xyz, wind in points}}
+
+
+def test_pcl_patch_selection_anchors_identity_and_rerun(db, tmp_path):
+    patches = tmp_path / "patches"
+    large = _write_pcl_patch(patches / "large", 12, 12, 100)
+    small = _write_pcl_patch(patches / "small", 4, 4, 101)
+    other = _write_pcl_patch(patches / "other__name", 5, 5, 103)
+    general = _pcl("general", [(42, [202, 202, 202], 3.5)])
+    between = _pcl("between_patches__small__other__name", [(19, [202, 202, 202], None)])
+    fallback = _pcl("between_patches__small__missing", [(9, [202, 202, 202], 2)])
+    file = tmp_path / "points.json"
+    _write_pcl(file, {"8": general, "9": between, "10": fallback})
+    original = file.read_bytes()
+    report = db.link_point_collections_to_patches(str(file), str(patches), point_scale=0.5)
+    assert report["edges_created"] == 3
+    assert len(db.objects_by_kind("point_collection")) == 3
+    for collection, expected in [(general, large), (between, small), (fallback, large)]:
+        uid = collection["uuid"]
+        edge, = db.edges_of(uid)
+        assert {edge["a"], edge["b"]} == {uid, expected}
+        point = edge["a_anchor"] if edge["a"] == uid else edge["b_anchor"]
+        foot = edge["b_anchor"] if edge["a"] == uid else edge["a_anchor"]
+        assert point["index"] == int(next(iter(collection["points"])))
+        assert point["position"] == (202, 202, 202)
+        assert foot["position"] == (101, 101, 101 if expected == small else 100)
+        evidence = edge["meta"]["point_collection_patch"]
+        assert evidence["ij"] == pytest.approx([1, 1])
+        assert evidence["distance"] == pytest.approx(0 if expected == small else 1)
+        assert evidence["winding_annotation"] == next(iter(collection["points"].values()))["wind_a"]
+        assert edge["approval_state"] == "pending"
+        assert db.resolve_storage_path(uid) == file
+    before = db.export_json(), db.journal_since()
+    assert db.link_point_collections_to_patches(str(file), str(patches), point_scale=0.5)["edges_created"] == 0
+    assert (db.export_json(), db.journal_since()) == before
+    assert file.read_bytes() == original
+    renamed = file.with_name("renamed.json")
+    file.rename(renamed)
+    assert db.resolve_storage_path(general["uuid"]) == renamed
+
+
+def test_pcl_support_window_and_absolute_role(db, tmp_path):
+    patches = tmp_path / "patches"
+    _write_pcl_patch(patches / "patch", 8, 8, 100)
+    # Numeric ID order is 2,10,20,30. Last point has insufficient support;
+    # the first two support each other in the rounded-up three-point window.
+    collection = _pcl("chain", [(10, [102, 102, 100], 1), (2, [101, 101, 100], 1),
+                                (20, [200, 200, 100], 1), (30, [103, 103, 100], 1)])
+    collection["metadata"]["winding_is_absolute"] = True  # ignored by fit_spiral for regular filenames
+    file = tmp_path / "points.json"
+    _write_pcl(file, {"1": collection})
+    report = db.link_point_collections_to_patches(str(file), str(patches), window_points=2, window_min_points=2)
+    assert report["edges_created"] == 2
+    ids = {e["a_anchor" if e["a"] == collection["uuid"] else "b_anchor"]["index"] for e in db.edges_of(collection["uuid"])}
+    assert ids == {2, 10}
+    absolute = _pcl("absolute", [(10, [102, 102, 100], 1), (20, [200, 200, 100], 2), (30, [103, 103, 100], 3)])
+    absolute_file = tmp_path / "abs_winding.json"
+    _write_pcl(absolute_file, {"1": absolute})
+    report = db.link_point_collections_to_patches(str(absolute_file), str(patches), window_points=3, window_min_points=3)
+    assert report["edges_created"] == 2
+    overridden = db.link_point_collections_to_patches(str(absolute_file), str(patches), window_points=3,
+                                                   window_min_points=3, absolute_winding=False)
+    assert overridden["stale_removed"] == 2
+    assert db.edges_of(collection["uuid"])  # rerunning another file never removes these links
+
+
+def test_pcl_area_uses_both_grid_scales_and_preserves_source_coordinates(db, tmp_path):
+    patches = tmp_path / "patches"
+    _write_pcl_patch(patches / "large_grid", 12, 12, 100)
+    # 4 / (.1 * .2) > 121 / (1 * 1): grid dimensions alone rank these backwards.
+    winner = _write_pcl_patch(patches / "large_area", 3, 3, 101, scale=(0.1, 0.2))
+    collection = _pcl("scaled", [(10000000000, [202, 202, 201], -2)])
+    file = tmp_path / "points.json"
+    _write_pcl(file, {"1": collection})
+    report = db.link_point_collections_to_patches(str(file), str(patches), patch_scale=2, tolerance=1)
+    assert report["edges_created"] == 1  # tolerance equality is included
+    edge, = db.edges_of(collection["uuid"])
+    assert winner in (edge["a"], edge["b"])
+    anchor = edge["a_anchor"] if edge["a"] == winner else edge["b_anchor"]
+    assert anchor["position"] == (101, 101, 101)
+    evidence = edge["meta"]["point_collection_patch"]
+    assert evidence["ij"] == pytest.approx([1, 1])
+    assert evidence["distance"] == pytest.approx(1)
+    assert db.object(winner)["patch"]["scale"] == pytest.approx((0.1, 0.2))
+
+
+def test_pcl_stale_review_protection_and_invalid_input_atomicity(db, tmp_path):
+    patches = tmp_path / "patches"
+    _write_pcl_patch(patches / "patch", 8, 8, 100)
+    collection = _pcl("reviewed", [(1, [101, 101, 100], 1), (2, [102, 102, 100], 1)])
+    file = tmp_path / "points.json"
+    _write_pcl(file, {"1": collection})
+    db.link_point_collections_to_patches(str(file), str(patches))
+    edge = db.edges_of(collection["uuid"])[0]
+    db.set_approval(edge["uuid"], "approved")
+    collection["points"] = {}
+    _write_pcl(file, {"1": collection})
+    report = db.link_point_collections_to_patches(str(file), str(patches))
+    assert report["stale_removed"] == 1
+    assert db.edges_of(collection["uuid"]) == [db.edge(edge["uuid"])]
+    before = db.export_json(), db.journal_since()
+    good = _pcl("new", [(1, [101, 101, 100], 1)])
+    broken = _pcl("bad", [(1, [101, 101, 100], 1)])
+    del broken["uuid"]
+    _write_pcl(file, {"1": good, "2": broken})
+    with pytest.raises(RuntimeError, match="source UUID"):
+        db.link_point_collections_to_patches(str(file), str(patches))
+    assert (db.export_json(), db.journal_since()) == before
+    good["points"]["1"]["p"].append(999)
+    _write_pcl(file, {"1": good})
+    with pytest.raises(RuntimeError, match="three XYZ coordinates"):
+        db.link_point_collections_to_patches(str(file), str(patches))
+    assert (db.export_json(), db.journal_since()) == before
+    for kwargs in ({"tolerance": 0}, {"point_scale": -1}, {"window_points": 1, "window_min_points": 2}):
+        with pytest.raises(ValueError):
+            db.link_point_collections_to_patches(str(file), str(patches), **kwargs)
+    assert (db.export_json(), db.journal_since()) == before
+
+
 @pytest.fixture()
 def db_path(tmp_path: Path) -> str:
     return str(tmp_path / "graph.vcgr")

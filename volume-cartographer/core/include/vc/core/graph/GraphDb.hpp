@@ -217,8 +217,8 @@ public:
 
     std::vector<JournalEntry> journalSince(const Txn& txn, int64_t afterSeq) const;
 
-    // Resolve a file-backed patch/fiber by its source UUID. First verify
-    // storageRef against meta.json (patch) or the fiber JSON, then search
+    // Resolve a file-backed patch/fiber/point_collection by its source UUID.
+    // First verify storageRef against meta.json or the source JSON, then search
     // datasetRoot recursively if the hint is stale. The default root is
     // the DB directory; an explicit root also rebases relative hints.
     // Returns an absolute path, or nullopt for unknown/unsupported/missing

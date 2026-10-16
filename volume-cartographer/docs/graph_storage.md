@@ -1,13 +1,14 @@
 # Graph object identity and external files
 
 The graph identifies objects by UUID. Patch import preserves the UUID in
-`meta.json`; fiber import preserves the UUID in the fiber JSON. Edges reference
+`meta.json`; fiber import preserves the UUID in the fiber JSON. PCL linking
+preserves each collection's UUID in its point-collections JSON. Edges reference
 those UUIDs. `name` is a display label, and `storage_ref` is a location hint,
 normally relative to the graph file's directory. The graph stores metadata and
 relationships; geometry remains in the external files.
 
 Use `GraphDb::resolveStoragePath` in C++, or `resolve_storage_path` in Python,
-to locate a file-backed patch or fiber:
+to locate a file-backed patch, fiber or point collection:
 
 ```python
 from vc.graph import GraphDb
@@ -24,7 +25,9 @@ missing, unreadable, or belongs to a different UUID, it searches the dataset
 root recursively. By default the root is the graph file's directory; an
 explicit root also rebases relative path hints. Absolute hints remain absolute.
 The result is an absolute path (`pathlib.Path` in Python): the patch directory
-or fiber JSON file. Missing or unsupported objects return `None`.
+or fiber/point-collections JSON file. For a point collection the resolver checks
+the UUID inside `collections`; several objects may share the same file.
+Missing or unsupported objects return `None`.
 
 Discovery reads JSON metadata without loading TIFF geometry. It skips hidden
 directories (including `.strip-cache`) and `.zarr` stores, and does not recurse

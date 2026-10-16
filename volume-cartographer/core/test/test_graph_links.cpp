@@ -21,6 +21,7 @@
 #include <opencv2/core.hpp>
 
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/PointCollections.hpp"
 
 namespace
 {
@@ -138,6 +139,39 @@ TEST_CASE("patch importer reads actual QuadSurface metadata with distinct axis s
     REQUIRE(record->patch->bbox.has_value());
     CHECK((*record->patch->bbox)[0] == 100);
     CHECK((*record->patch->bbox)[4] == 203);
+}
+
+TEST_CASE("PCL linking accepts PointCollections output and cancellation rolls back registration and links")
+{
+    TempDir tmp("pcl_atomic");
+    const auto patches = tmp.dir / "patches";
+    const auto patch = writePatch(patches / "target", 8, 8,
+        [](int r, int c) { return cv::Vec3f(100 + c, 100 + r, 100); });
+    PointCollections points;
+    const auto collectionId = points.addCollection("annotations");
+    points.addPoint("annotations", cv::Vec3f(101, 101, 100));
+    const auto uuid = points.getAllCollections().at(collectionId).uuid;
+    const auto file = tmp.dir / "points.json";
+    REQUIRE(points.saveToJSON(file.string()));
+    auto db = makeDb(tmp.dir);
+    std::atomic_bool cancel{false};
+    PointCollectionPatchParams params;
+    params.progress = [&](const vc::util::ProgressUpdate& update) {
+        if (update.stage == "writing links") cancel = true;
+    };
+    CHECK_THROWS(linkPointCollectionsToPatches(db, file, patches, params, &cancel));
+    { auto read = db.read();
+      CHECK_FALSE(db.objectByUuid(read, uuid).has_value());
+      CHECK_FALSE(db.objectByUuid(read, patch).has_value());
+      CHECK(db.journalSince(read, 0).empty()); }
+    cancel = false;
+    params.progress = {};
+    const auto report = linkPointCollectionsToPatches(db, file, patches, params, &cancel);
+    CHECK(report.edgesCreated == 1);
+    { auto read = db.read();
+      CHECK(db.objectByUuid(read, uuid)->kind == "point_collection");
+      CHECK(db.resolveStoragePath(read, uuid) == fs::absolute(file));
+      CHECK(db.neighbours(read, uuid) == std::vector<std::string>{patch}); }
 }
 
 TEST_CASE("stale replacement removes only own pending edges")

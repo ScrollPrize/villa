@@ -226,6 +226,77 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PWD/build/python" \
 Use a Python interpreter matching the compiled bindings, with NumPy and pytest
 available; it must load `vc` from `build/python`, not an older installed build.
 
+## Point-collection-to-patch graph links
+
+Regular PCL linking uses the rules from Spiral's `fit_spiral.py`: each point
+chooses the largest patch within tolerance, then the closest on area ties.
+Area is the valid quad count divided by both grid scale factors, matching
+`tifxyz.Patch.area`. Collections named `between_patches__A__B` choose the
+nearest hit within that named pair. If either patch is absent, they use the
+general rule. Remaining ties use sorted patch-directory order.
+
+```sh
+build/bin/vc_graph_import --db graph.vcgr --author "$USER" \
+  --link-pcl-patches /data/relative_windings.json \
+  --link-pcl-patches /data/abs_winding.json \
+  --segments /data/verified_patches --pcl-tolerance 2.5
+```
+
+No CT volume is required. `--point-scale` and `--patch-scale` independently
+convert source XYZ coordinates to working coordinates; both default to 1.
+Tolerance is in working voxels. The default 2.5 matches Spiral's training
+configuration. Patch metadata's grid scale is separate from this XYZ scaling.
+
+```python
+with GraphDb.open("graph.vcgr", author="reviewer") as db:
+    report = db.link_point_collections_to_patches(
+        "/data/relative_windings.json", "/data/verified_patches",
+        tolerance=2.5, point_scale=1, patch_scale=1,
+        window_points=1, window_min_points=1,
+    )
+```
+
+C++ exposes `linkPointCollectionsToPatches` and `PointCollectionPatchParams`.
+The optional neighbor gate uses numeric point-ID order: the point itself must
+hit a patch, and at least `window_min_points` members of its centered
+`window_points` window must hit that same patch. Even window sizes round up to
+the next odd size; the requirement is clipped at collection ends. CLI flags
+are `--pcl-window-points` and `--pcl-window-min-points`; both default to 1.
+
+As in `fit_spiral.py`, `abs_winding.json` denotes absolute winding annotations
+and bypasses the neighbor gate. Stored `metadata.winding_is_absolute` does not
+override the file role. Use Python `absolute_winding=True/False` or CLI
+`--pcl-absolute` / `--pcl-relative` to override the filename rule explicitly.
+The CLI override applies to every PCL file in that invocation.
+
+Each collection becomes a `point_collection` object, preserving its source
+UUID. Every attached point creates a pending `point-patch` edge. Its collection
+anchor stores the source point ID and source XYZ; its patch anchor stores the
+projected XYZ in source patch units. Metadata records grid `[row, column]`,
+distance in working units, the original winding annotation (null if unknown),
+absolute/relative role, selection policy and detector settings. A collection
+can span several windings; its attachments retain their individual annotations.
+Python also accepts `edge_kind` and `replace_stale_pending`.
+
+The source JSON and TIFF files remain unchanged. Collections and patches must
+already carry valid source UUIDs; re-save legacy collections in VC3D first.
+Registration and links commit together for each input file. Malformed input or
+cancellation raises an exception and rolls back that run. Reruns deduplicate
+links and remove this detector's stale pending links only within the processed
+collection/patch scope. Reviewed and manual links survive. Geometry remains in
+the external files; `resolve_storage_path` locates a collection by UUID even
+after its JSON file is renamed.
+
+Validation used 29 real collections (259 points) and 24 real patches from
+`/home/sean/Desktop/spiral_dataset_graph_uuid`. All 17 selected attachments and
+winding annotations matched Spiral's Python fallback, with grid-coordinate
+differences below 0.000001 cells and distance differences below 0.0006 voxels.
+A three-point/two-hit neighbor gate rejected all 17 in both implementations;
+an absolute-role override restored them. CLI results and idempotent reruns
+matched. Regression tests also cover named pairs, anisotropic grid scales,
+independent XYZ scales, reviewed-edge preservation and cancellation rollback.
+No full-dataset run was performed.
+
 ## Track-to-patch graph links
 
 Track-to-patch linking shares the fiber-to-patch implementation: dense-point
