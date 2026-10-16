@@ -14,19 +14,38 @@ inline Footprint ball(std::size_t dim, double radius) {
     return result;
 }
 inline std::vector<double> morphology(const std::vector<double>& input, const Grid& g, const Footprint& footprint, bool dilate, bool outside = false) {
+    const auto d = g.shape.size();
+    Shape padding(d, 0), padded_shape = g.shape;
+    for (const auto& offset : footprint) for (std::size_t a = 0; a < d; ++a)
+        padding[a] = std::max(padding[a], std::size_t(std::abs(offset[a])));
+    for (std::size_t a = 0; a < d; ++a) padded_shape[a] += 2 * padding[a];
+    Grid padded(padded_shape);
+    std::vector<std::uint8_t> mask(padded.size, outside);
+    std::vector<std::ptrdiff_t> offsets;
+    for (const auto& offset : footprint) {
+        std::ptrdiff_t step = 0;
+        for (std::size_t a = 0; a < d; ++a) step += (dilate ? -offset[a] : offset[a]) * std::ptrdiff_t(padded.stride[a]);
+        offsets.push_back(step);
+    }
+    const auto nz = d == 3 ? g.shape[0] : 1, ny = g.shape[d - 2], nx = g.shape.back();
+    std::size_t origin = 0;
+    for (std::size_t a = 0; a < d; ++a) origin += padding[a] * padded.stride[a];
+    auto row_start = [&](std::size_t z, std::size_t y) { return origin + (d == 3 ? z * padded.stride[0] : 0) + y * padded.stride[d - 2]; };
+    for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y) {
+        auto* row = mask.data() + row_start(z, y);
+        for (std::size_t x = 0; x < nx; ++x) row[x] = input[(z * ny + y) * nx + x] != 0;
+    }
     std::vector<double> output(g.size);
-    for (std::size_t i = 0; i < g.size; ++i) {
-        bool result = !dilate;
-        for (const auto& offset : footprint) {
-            bool valid = true; std::size_t at = 0;
-            for (std::size_t a = 0; a < g.shape.size(); ++a) {
-                auto x = std::int64_t(g.coord(i, a)) + (dilate ? -offset[a] : offset[a]);
-                if (x < 0 || x >= std::int64_t(g.shape[a])) valid = false; else at += std::size_t(x) * g.stride[a];
+    for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y) {
+        const auto* row = mask.data() + row_start(z, y);
+        for (std::size_t x = 0; x < nx; ++x) {
+            bool result = !dilate;
+            for (auto offset : offsets) {
+                bool value = row[std::ptrdiff_t(x) + offset];
+                if (dilate ? value : !value) { result = dilate; break; }
             }
-            bool value = valid ? input[at] != 0 : outside;
-            if (dilate ? value : !value) { result = dilate; break; }
+            output[(z * ny + y) * nx + x] = double(result);
         }
-        output[i] = double(result);
     }
     return output;
 }
@@ -100,18 +119,26 @@ inline void apply(const RandomBinaryOperator& t, Sample& s, const Parameters& p)
 }
 inline std::vector<std::vector<std::size_t>> connected_components(const std::vector<double>& input, const Grid& g, bool full) {
     std::vector<std::vector<std::size_t>> result; std::vector<bool> visited(g.size); Grid neighborhood(Shape(g.shape.size(), 3));
+    Footprint neighbors;
+    for (std::size_t j = 0; j < neighborhood.size; ++j) {
+        std::array<int, 3> offset{}; int distance = 0;
+        for (std::size_t a = 0; a < g.shape.size(); ++a) { offset[a] = int(neighborhood.coord(j, a)) - 1; distance += std::abs(offset[a]); }
+        if (distance && (full || distance == 1)) neighbors.push_back(offset);
+    }
     for (std::size_t i = 0; i < g.size; ++i) {
         if (visited[i] || !input[i]) continue;
         visited[i] = true; std::vector<std::size_t> queue{i};
         for (std::size_t head = 0; head < queue.size(); ++head) {
-            for (std::size_t j = 0; j < neighborhood.size; ++j) {
-                bool valid = true; std::size_t next = 0; int distance = 0;
+            std::array<std::int64_t, 3> point{};
+            for (std::size_t a = 0; a < g.shape.size(); ++a) point[a] = g.coord(queue[head], a);
+            for (const auto& offset : neighbors) {
+                bool valid = true; std::size_t next = 0;
                 for (std::size_t a = 0; a < g.shape.size(); ++a) {
-                    int offset = int(neighborhood.coord(j, a)) - 1; distance += std::abs(offset);
-                    auto x = std::int64_t(g.coord(queue[head], a)) + offset;
-                    if (x < 0 || x >= std::int64_t(g.shape[a])) valid = false; else next += std::size_t(x) * g.stride[a];
+                    auto x = point[a] + offset[a];
+                    if (x < 0 || x >= std::int64_t(g.shape[a])) { valid = false; break; }
+                    next += std::size_t(x) * g.stride[a];
                 }
-                if (valid && distance && (full || distance == 1) && input[next] && !visited[next]) { visited[next] = true; queue.push_back(next); }
+                if (valid && input[next] && !visited[next]) { visited[next] = true; queue.push_back(next); }
             }
         }
         result.push_back(std::move(queue));
@@ -150,7 +177,12 @@ inline Array regions(const Array& input, std::size_t channel, const std::vector<
         require(std::isfinite(value) && std::abs(value) <= 9007199254740991., "label value out of exact range");
     require(channel < input.shape[0] && !labels.empty(), "invalid region channel or empty label groups");
     Shape shape = input.shape; shape[0] = labels.size(); Array out(shape, 'b', 1); auto n = product(input.spatial());
-    for (std::size_t c = 0; c < labels.size(); ++c) for (std::size_t i = 0; i < n; ++i) out.set(c * n + i, std::find(labels[c].begin(), labels[c].end(), input.get(channel * n + i)) != labels[c].end());
+    auto* dest = static_cast<std::uint8_t*>(out.data());
+    input.typed([&](const auto* src) {
+        for (std::size_t c = 0; c < labels.size(); ++c)
+            for (std::size_t i = 0; i < n; ++i)
+                dest[c * n + i] = std::find(labels[c].begin(), labels[c].end(), double(src[channel * n + i])) != labels[c].end();
+    });
     return out;
 }
 inline Parameters sample(const Regions&, const Sample&, Random&) { return {}; }
@@ -165,8 +197,14 @@ inline void apply(const OneHot& t, Sample& s, const Parameters&) {
     if (!t.append_to.empty()) {
         auto& image = s.at(t.append_to).array; require(image.spatial() == encoded.spatial(), "one-hot image grid mismatch");
         auto shape = image.shape; shape[0] += encoded.shape[0]; Array combined(shape, image.kind, image.bytes);
-        for (std::size_t i = 0; i < image.size(); ++i) combined.copy_element(i, image, i);
-        for (std::size_t i = 0; i < encoded.size(); ++i) combined.set(image.size() + i, encoded.get(i));
+        const auto count = image.size(), encoded_count = encoded.size();
+        std::memcpy(combined.data(), std::as_const(image).data(), count * image.bytes);
+        const auto* bits = static_cast<const std::uint8_t*>(std::as_const(encoded).data());
+        combined.typed([&](const auto* data) {
+            using T = std::remove_cv_t<std::remove_pointer_t<decltype(data)>>;
+            auto* dest = const_cast<T*>(data) + count;
+            for (std::size_t i = 0; i < encoded_count; ++i) dest[i] = static_cast<T>(bits[i]);
+        });
         image = std::move(combined);
     } else { source.array = std::move(encoded); source.target.role = Role::Label; source.source = t.on; s[t.output] = std::move(source); }
     if (t.remove_source) {

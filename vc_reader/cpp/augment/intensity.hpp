@@ -1,5 +1,6 @@
 #pragma once
 #include "core.hpp"
+#include <span>
 
 namespace vcr::augment {
 struct BrightnessMultiply { Scalar factor = Uniform{.75, 1.25}; ChannelOptions options; };
@@ -67,8 +68,11 @@ inline std::vector<double> local_kernel(const LocalOptions& t, const Grid& g, Ra
             kernels[a][x] = .5 * (std::erf((x + .5 - center) / (sigma * std::sqrt(2.))) - std::erf((x - .5 - center) / (sigma * std::sqrt(2.))));
     }
     std::vector<double> out(g.size, 1);
-    for (std::size_t i = 0; i < g.size; ++i)
-        for (std::size_t a = 0; a < g.shape.size(); ++a) out[i] *= kernels[a][g.coord(i, a)];
+    for (std::size_t a = 0; a < g.shape.size(); ++a)
+        for (std::size_t base = 0; base < g.size; base += g.shape[a] * g.stride[a])
+            for (std::size_t x = 0; x < g.shape[a]; ++x)
+                for (std::size_t j = 0; j < g.stride[a]; ++j)
+                    out[base + x * g.stride[a] + j] *= kernels[a][x];
     auto [lo, hi] = std::minmax_element(out.begin(), out.end()); double low = *lo, range = *hi - low;
     for (auto& v : out) v = range ? (v - low) / range : 0;
     if (centered) {
@@ -135,16 +139,10 @@ inline ChannelPlan channel_parameters(const Smear& t, const Array& a, Random&) {
     return {"", 0, {double(axis(t.axis, a.shape.size() - 1))}};
 }
 
-inline void channel_apply(const BrightnessMultiply&, std::vector<double>& v, const Grid&, const ChannelPlan& p) { for (auto& x : v) x *= p.values[0]; }
-inline void channel_apply(const BrightnessAdd&, std::vector<double>& v, const Grid&, const ChannelPlan& p) { for (auto& x : v) x += p.values[0]; }
-inline void channel_apply(const Contrast& t, std::vector<double>& v, const Grid&, const ChannelPlan& p) {
-    auto [lo, hi] = std::minmax_element(v.begin(), v.end()); double low = *lo, high = *hi, m = mean(v);
-    for (auto& x : v) { x = (x - m) * p.values[0] + m; if (t.preserve_range) x = std::clamp(x, low, high); }
-}
 inline void channel_apply(const Gamma&, std::vector<double>& v, const Grid&, const ChannelPlan& p) {
     bool invert = p.values[1], retain = p.values[2];
     if (invert) for (auto& x : v) x = -x;
-    double m = mean(v), std = deviation(v, m);
+    double m = retain ? mean(v) : 0, std = retain ? deviation(v, m) : 0;
     auto [lo, hi] = std::minmax_element(v.begin(), v.end()); double low = *lo, range = *hi - low;
     for (auto& x : v) x = std::pow((x - low) / std::max(range, 1e-7), p.values[0]) * range + low;
     if (retain) {
@@ -153,37 +151,70 @@ inline void channel_apply(const Gamma&, std::vector<double>& v, const Grid&, con
     }
     if (invert) for (auto& x : v) x = -x;
 }
-inline void channel_apply(const Invert&, std::vector<double>& v, const Grid&, const ChannelPlan&) { double m = mean(v); for (auto& x : v) x = 2 * m - x; }
+
 inline void channel_apply(const GaussianNoise&, std::vector<double>& v, const Grid&, const ChannelPlan& p) { Random r{p.seed}; for (auto& x : v) x += p.values[0] * r.normal(); }
 inline void channel_apply(const RicianNoise&, std::vector<double>& v, const Grid&, const ChannelPlan& p) {
     Random r{p.seed}; for (auto& x : v) { double re = x + p.values[0] * r.normal(), im = p.values[0] * r.normal(); x = std::sqrt(re * re + im * im); }
 }
 inline void channel_apply(const ClipOutliers&, std::vector<double>& v, const Grid&, const ChannelPlan& p) {
-    double std = deviation(v, mean(v)); auto sorted = v; std::sort(sorted.begin(), sorted.end());
-    auto percentile = [&](double q) { double pos = q / 100 * (v.size() - 1); auto lo = std::size_t(pos), hi = std::min(lo + 1, v.size() - 1); return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo); };
+    double std = p.values[2] ? deviation(v, mean(v)) : 0; auto sorted = v;
+    auto percentile = [&](double q) {
+        double pos = q / 100 * (v.size() - 1); auto lo = std::size_t(pos), hi = std::min(lo + 1, v.size() - 1);
+        std::nth_element(sorted.begin(), sorted.begin() + lo, sorted.end());
+        double low = sorted[lo], high = hi == lo ? low : *std::min_element(sorted.begin() + hi, sorted.end());
+        return low + (high - low) * (pos - lo);
+    };
     double low = percentile(p.values[0]), high = percentile(p.values[1]);
     for (auto& x : v) x = std::clamp(x, low, high);
     if (p.values[2]) { double m = mean(v), after = deviation(v, m); if (after > 1e-8) for (auto& x : v) x = (x - m) / after * std + m; }
 }
 inline void channel_apply(const GaussianBlur& t, std::vector<double>& v, const Grid& g, const ChannelPlan& p) { gaussian_blur(v, g, p.values, t.truncate, t.mirror_boundary, true); }
 inline void channel_apply(const MedianFilter&, std::vector<double>& v, const Grid& g, const ChannelPlan& p) {
-    auto k = std::size_t(p.values[0]); Grid kernel(Shape(g.shape.size(), k)); auto src = v;
-    std::vector<double> values(kernel.size);
-    for (std::size_t i = 0; i < g.size; ++i) {
-        for (std::size_t j = 0; j < kernel.size; ++j) {
-            std::size_t at = 0;
-            for (std::size_t a = 0; a < g.shape.size(); ++a) at += reflect(std::int64_t(g.coord(i, a) + kernel.coord(j, a)) - std::int64_t(k / 2), g.shape[a]) * g.stride[a];
-            values[j] = src[at];
+    auto k = std::size_t(p.values[0]);
+    if (k == 1) return;
+    // Precompute reflected coordinates once per axis, rather than performing
+    // division and modulo for every neighbor of every voxel.
+    const auto dim = g.shape.size();
+    const auto nz = dim == 3 ? g.shape[0] : 1, ny = g.shape[dim - 2], nx = g.shape.back();
+    const auto kz = dim == 3 ? k : 1;
+    auto indices = [&](std::size_t n, std::size_t width, std::size_t stride) {
+        std::vector<std::size_t> result(n * width);
+        for (std::size_t x = 0; x < n; ++x) for (std::size_t j = 0; j < width; ++j)
+            result[x * width + j] = reflect(std::int64_t(x + j) - std::int64_t(width / 2), n) * stride;
+        return result;
+    };
+    auto iz = indices(nz, kz, ny * nx), iy = indices(ny, k, nx), ix = indices(nx, k, 1);
+    auto src = v;
+    std::vector<double> values(kz * k * k);
+    for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y)
+        for (std::size_t x = 0; x < nx; ++x) {
+            std::size_t j = 0;
+            for (std::size_t dz = 0; dz < kz; ++dz) for (std::size_t dy = 0; dy < k; ++dy) {
+                const auto* row = src.data() + iz[z * kz + dz] + iy[y * k + dy];
+                for (std::size_t dx = 0; dx < k; ++dx) values[j++] = row[ix[x * k + dx]];
+            }
+            std::nth_element(values.begin(), values.begin() + values.size() / 2, values.end());
+            v[(z * ny + y) * nx + x] = values[values.size() / 2];
         }
-        std::nth_element(values.begin(), values.begin() + values.size() / 2, values.end()); v[i] = values[values.size() / 2];
-    }
 }
 inline void channel_apply(const Sharpen&, std::vector<double>& v, const Grid& g, const ChannelPlan& p) {
-    auto src = v; auto [lo, hi] = std::minmax_element(src.begin(), src.end());
+    auto [lo, hi] = std::minmax_element(v.begin(), v.end());
+    const double low = *lo, high = *hi;
+    std::vector<double> laplace(g.size);
+    for (std::size_t i = 0; i < g.size; ++i) laplace[i] = 2 * g.shape.size() * v[i];
+    for (std::size_t a = 0; a < g.shape.size(); ++a) {
+        const auto step = g.stride[a], extent = g.shape[a], block = step * extent;
+        for (std::size_t base = 0; base < g.size; base += block)
+            for (std::size_t x = 0; x < extent; ++x) {
+                const auto at = base + x * step;
+                const auto before = x ? at - step : at, after = x + 1 < extent ? at + step : at;
+                for (std::size_t j = 0; j < step; ++j) {
+                    laplace[at + j] -= v[before + j]; laplace[at + j] -= v[after + j];
+                }
+            }
+    }
     for (std::size_t i = 0; i < g.size; ++i) {
-        double laplace = 2 * g.shape.size() * src[i];
-        for (std::size_t a = 0; a < g.shape.size(); ++a) { auto x = g.coord(i, a); laplace -= src[x ? i - g.stride[a] : i]; laplace -= src[x + 1 < g.shape[a] ? i + g.stride[a] : i]; }
-        v[i] += p.values[0] * laplace; if (p.values[1]) v[i] = std::clamp(v[i], *lo, *hi);
+        v[i] += p.values[0] * laplace[i]; if (p.values[1]) v[i] = std::clamp(v[i], low, high);
     }
 }
 inline void channel_apply(const BrightnessGradient& t, std::vector<double>& v, const Grid&, const ChannelPlan& p) {
@@ -203,13 +234,22 @@ inline void channel_apply(const LocalSmoothing&, std::vector<double>& v, const G
     auto smoothed = v; gaussian_blur(smoothed, g, std::vector<double>(g.shape.size(), p.values[1]));
     for (std::size_t i = 0; i < v.size(); ++i) { double w = p.field[i] * p.values[0]; v[i] = v[i] * (1 - w) + smoothed[i] * w; }
 }
-inline void channel_apply(const BlankRectangle& t, std::vector<double>& v, const Grid& g, const ChannelPlan& p) {
+template<class Values> void channel_apply(const BlankRectangle& t, Values& v, const Grid& g, const ChannelPlan& p) {
     auto dim = g.shape.size(), stride = 2 * dim + 1;
     for (std::size_t b = 0; b < p.values.size(); b += stride) {
         std::vector<std::size_t> indices; std::vector<double> values;
-        for (std::size_t i = 0; i < g.size; ++i) {
-            bool inside = true; for (std::size_t a = 0; a < dim; ++a) { auto x = g.coord(i, a); inside &= x >= p.values[b + 2 * a] && x < p.values[b + 2 * a + 1]; }
-            if (inside) { indices.push_back(i); values.push_back(v[i]); }
+        Shape extent(dim);
+        std::size_t origin = 0;
+        for (std::size_t a = 0; a < dim; ++a) {
+            extent[a] = std::size_t(p.values[b + 2 * a + 1] - p.values[b + 2 * a]);
+            origin += std::size_t(p.values[b + 2 * a]) * g.stride[a];
+        }
+        Grid box(extent);
+        indices.reserve(box.size); values.reserve(box.size);
+        for (std::size_t j = 0; j < box.size; ++j) {
+            auto i = origin;
+            for (std::size_t a = 0; a < dim; ++a) i += box.coord(j, a) * g.stride[a];
+            indices.push_back(i); values.push_back(v[i]);
         }
         if (indices.empty()) continue;
         double value = p.values[b + 2 * dim];
@@ -218,26 +258,34 @@ inline void channel_apply(const BlankRectangle& t, std::vector<double>& v, const
         for (auto i : indices) v[i] = value;
     }
 }
-inline void channel_apply(const SliceIllumination&, std::vector<double>& v, const Grid& g, const ChannelPlan& p) {
-    for (std::size_t i = 0; i < g.size; ++i) v[i] *= p.field[g.coord(i, std::size_t(p.values[0]))];
+template<class Values> void channel_apply(const SliceIllumination&, Values& v, const Grid& g, const ChannelPlan& p) {
+    const auto a = std::size_t(p.values[0]);
+    for (std::size_t base = 0; base < g.size; base += g.shape[a] * g.stride[a])
+        for (std::size_t x = 0; x < g.shape[a]; ++x)
+            for (std::size_t j = 0; j < g.stride[a]; ++j) {
+                auto i = base + x * g.stride[a] + j;
+                v[i] = double(v[i]) * p.field[x];
+            }
 }
 inline void channel_apply(const Smear& t, std::vector<double>& v, const Grid& g, const ChannelPlan& p) {
     auto axis = std::size_t(p.values[0]);
     auto plane_shape = g.shape; plane_shape.erase(plane_shape.begin() + axis); Grid plane(plane_shape);
-    // Deliberately recursive: previous slices have already been smeared, as in Vesuvius.
+    // Cache in-plane addresses; the shifted slice is the same for each previous
+    // depth. Slice order remains recursive, matching the original transform.
+    std::vector<std::size_t> target(plane.size), source(plane.size);
+    for (std::size_t pixel = 0; pixel < plane.size; ++pixel) {
+        std::size_t pa = 0;
+        for (std::size_t a = 0; a < g.shape.size(); ++a) if (a != axis) {
+            auto x = plane.coord(pixel, pa); auto n = std::int64_t(g.shape[a]);
+            auto shifted = (std::int64_t(x) - t.shift[pa++]) % n;
+            target[pixel] += x * g.stride[a]; source[pixel] += std::size_t((shifted + n) % n) * g.stride[a];
+        }
+    }
     for (std::size_t slice = t.previous; slice < g.shape[axis]; ++slice)
         for (std::size_t pixel = 0; pixel < plane.size; ++pixel) {
-            std::size_t i = slice * g.stride[axis], pa = 0;
-            for (std::size_t a = 0; a < g.shape.size(); ++a) if (a != axis) i += plane.coord(pixel, pa++) * g.stride[a];
+            auto i = slice * g.stride[axis] + target[pixel];
             double sum = 0;
-            for (int j = 1; j <= t.previous; ++j) {
-                std::size_t at = (slice - j) * g.stride[axis], shift_axis = 0;
-                for (std::size_t a = 0; a < g.shape.size(); ++a) if (a != axis) {
-                    auto n = std::int64_t(g.shape[a]); auto x = (std::int64_t(g.coord(i, a)) - t.shift[shift_axis++]) % n;
-                    at += std::size_t((x + n) % n) * g.stride[a];
-                }
-                sum += v[at];
-            }
+            for (int j = 1; j <= t.previous; ++j) sum += v[(slice - j) * g.stride[axis] + source[pixel]];
             v[i] = (1 - t.alpha) * v[i] + t.alpha * sum / t.previous;
         }
 }
@@ -252,6 +300,45 @@ Parameters sample(const T& t, const Sample& s, Random& r) {
 }
 template<class T> requires requires(T t) { t.options; }
 void apply(const T& t, Sample& s, const Parameters& p) {
-    apply_channels(s, p, [&](auto& v, const Grid& g, const ChannelPlan& c) { channel_apply(t, v, g, c); });
+    if constexpr (std::is_same_v<T, BrightnessMultiply> || std::is_same_v<T, BrightnessAdd> ||
+                  std::is_same_v<T, Contrast> || std::is_same_v<T, Invert> ||
+                  std::is_same_v<T, BlankRectangle> || std::is_same_v<T, SliceIllumination>) {
+        for (const auto& c : p.channels) {
+            auto& a = s.at(c.key).array; Grid g(a.spatial());
+            if constexpr (std::is_same_v<T, BlankRectangle>) {
+                if (!t.statistic.empty()) { auto v = a.channel(c.channel); channel_apply(t, v, g, c); a.channel(c.channel, v); continue; }
+            }
+            auto run = [&](auto* data) {
+                using V = std::remove_pointer_t<decltype(data)>;
+                std::span<V> v(data + c.channel * g.size, g.size);
+                if constexpr (std::is_same_v<T, BlankRectangle> || std::is_same_v<T, SliceIllumination>)
+                    channel_apply(t, v, g, c);
+                else {
+                    double m = 0, low = 0, high = 0;
+                    if constexpr (std::is_same_v<T, Contrast> || std::is_same_v<T, Invert>) {
+                        for (auto x : v) m += double(x);
+                        m /= v.size();
+                    }
+                    if constexpr (std::is_same_v<T, Contrast>) {
+                        auto bounds = std::minmax_element(v.begin(), v.end()); low = *bounds.first; high = *bounds.second;
+                    }
+                    for (auto& x : v) {
+                        double y = x;
+                        if constexpr (std::is_same_v<T, BrightnessMultiply>) y *= c.values[0];
+                        if constexpr (std::is_same_v<T, BrightnessAdd>) y += c.values[0];
+                        if constexpr (std::is_same_v<T, Invert>) y = 2 * m - y;
+                        if constexpr (std::is_same_v<T, Contrast>) {
+                            y = (y - m) * c.values[0] + m;
+                            if (t.preserve_range) y = std::clamp(y, low, high);
+                        }
+                        x = static_cast<V>(y);
+                    }
+                }
+            };
+            if (a.bytes == 4) run(static_cast<float*>(a.data()));
+            else run(static_cast<double*>(a.data()));
+        }
+        restore_valid(s);
+    } else apply_channels(s, p, [&](auto& v, const Grid& g, const ChannelPlan& c) { channel_apply(t, v, g, c); });
 }
 } // namespace vcr::augment

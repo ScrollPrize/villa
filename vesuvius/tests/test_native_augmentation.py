@@ -86,3 +86,12 @@ def test_zarr_dataset_native_hook_without_io():
     np.testing.assert_array_equal(result["image"].numpy()[0], image[:, ::-1])
     np.testing.assert_array_equal(result["ink"].numpy()[0], (image > 10)[:, ::-1])
     assert "_aug_perf" in result
+
+
+def test_dataset_can_reuse_fresh_reader_style_buffers():
+    pipeline = A.Pipeline([A.BrightnessAdd(.5)])
+    safe = AugmentedDataset(Patches(), pipeline, seed=42)
+    inplace = AugmentedDataset(Patches(), pipeline, seed=42, inplace=True)
+    inplace = pickle.loads(pickle.dumps(inplace))
+    token = AugmentationIndex(2, epoch=3, draw=4)
+    torch.testing.assert_close(inplace[token]["image"], safe[token]["image"], rtol=0, atol=0)

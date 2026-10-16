@@ -31,14 +31,43 @@ parameters across channels within each image. Noise has a separate
 applies. Arguments and defaults are listed in
 [`__init__.pyi`](../src/vc_reader/augment/__init__.pyi).
 
+## Reusing reader buffers
+
+A fresh reader crop can be handed directly to augmentation without another
+input copy. The kernels still run in C++; the NumPy view only carries the buffer
+and its lifetime between the two modules:
+
+```python
+image = reader.read(start, shape, dtype=np.float32)[None]  # add channel axis
+result = augment({"image": image}, seed=patch_seed, inplace=True)
+image = result["image"]
+```
+
+`inplace=True` permits modification of the supplied arrays and lets outputs
+share their storage. Always use the returned dictionary: geometric transforms
+and shape changes can allocate new buffers. Inputs must be writable, contiguous,
+aligned, and nonoverlapping. Keep the default for cached samples or arrays needed
+elsewhere. Output views retain their reader buffer, including after the reader
+closes, so the output pool cannot recycle a buffer still in use.
+
+For dataset pipelines returning fresh crops:
+
+```python
+dataset = AugmentedDataset(dataset, augment, seed=42, inplace=True)
+```
+
+The default also avoids unnecessary copies before geometry: inputs are borrowed
+for reading and copied on first write. Unchanged outputs are copied on export to
+preserve the existing independent-output contract.
+
 ## Targets and containers
 
 Arrays are channel-first `(C,Y,X)` or `(C,Z,Y,X)`. Continuous targets require
 float32 or float64. Labels retain their integer/bool dtype; continuous outputs
 retain their float dtype. NumPy stays NumPy and Torch stays Torch. CUDA tensors,
 autograd tensors, non-native byte order, and nonfinite continuous values are
-rejected. Noncontiguous inputs are made contiguous. Inputs are never modified;
-outputs own their storage. Metadata passes through by reference.
+rejected. Noncontiguous inputs are made contiguous. By default, inputs are
+preserved and outputs have independent storage. Metadata passes through by reference.
 
 The default schema declares `image`, `mask`, and `padding_mask`; fields may be
 absent or `None`. Declare other arrays explicitly so labels and regression

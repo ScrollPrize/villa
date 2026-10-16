@@ -26,8 +26,8 @@ using Point = std::array<double, 3>;
 inline Point matvec(const Matrix& m, Point v, std::size_t d) {
     Point out{}; for (std::size_t i = 0; i < d; ++i) for (std::size_t j = 0; j < d; ++j) out[i] += m[i * d + j] * v[j]; return out;
 }
-template<class F> double linear_value(const Grid& g, Point q, bool border, double fill, F&& get) {
-    std::int64_t lo[3]; double fraction[3]; auto d = g.shape.size();
+template<std::size_t D = 0, class F> double linear_value(const Grid& g, Point q, bool border, double fill, F&& get) {
+    std::int64_t lo[3]; double fraction[3]; const auto d = D ? D : g.shape.size();
     for (std::size_t a = 0; a < d; ++a) {
         require(std::isfinite(q[a]), "nonfinite sampling coordinate");
         if (border) q[a] = std::clamp(q[a], 0., double(g.shape[a] - 1));
@@ -81,35 +81,102 @@ inline Point forward(const Parameters& p, Point source) {
     }
     throw std::invalid_argument("deformation inverse failed to converge for a point; reduce deformation strength");
 }
-inline Array resample(const Array& src, const Parameters& p, bool nearest, double fill, bool validity = false) {
-    Grid input(src.spatial()), output(p.shape); auto d = p.shape.size();
-    Shape shape{src.shape[0]}; shape.insert(shape.end(), p.shape.begin(), p.shape.end()); Array out(shape, src.kind, src.bytes);
-    for (std::size_t i = 0; i < output.size; ++i) {
-        Point pos{}; for (std::size_t a = 0; a < d; ++a) pos[a] = double(output.coord(i, a));
-        auto q = backward(p, pos);
-        if (nearest) {
-            bool valid = true; std::size_t at = 0;
-            for (std::size_t a = 0; a < d; ++a) {
-                require(std::isfinite(q[a]), "nonfinite sampling coordinate");
-                if (p.border) q[a] = std::clamp(q[a], 0., double(input.shape[a] - 1));
-                if (q[a] < -1 || q[a] > double(input.shape[a])) { valid = false; continue; }
-                auto lo = std::int64_t(std::floor(q[a])); auto fraction = q[a] - lo;
-                auto x = p.nearest_mode == 2 ? lo : lo + (fraction > .5 || (fraction == .5 && (p.nearest_mode == 1 || lo % 2 != 0)));
-                if (x < 0 || x >= std::int64_t(input.shape[a])) valid = false; else at += std::size_t(x) * input.stride[a];
-            }
-            for (std::size_t c = 0; c < src.shape[0]; ++c) {
-                if (valid) out.copy_element(c * output.size + i, src, c * input.size + at);
-                else out.set(c * output.size + i, fill);
-            }
-        } else {
-            for (std::size_t c = 0; c < src.shape[0]; ++c) {
-                double value = linear_value(input, q, validity ? false : p.border, fill, [&](auto at) { return src.get(c * input.size + at); });
-                // Conservative support: every interpolation contributor must be valid.
-                out.set(c * output.size + i, validity ? double(value >= 1.) : value);
-            }
+// Exact geometry is a signed axis permutation plus an integer translation.
+// Compute row addresses once, then copy contiguous runs or gather by stride.
+inline bool resample_exact(const Array& src, Array& out, const Parameters& p, double fill, bool validity) {
+    if (!p.exact || !p.field.empty() || p.border) return false;
+    Grid input(src.spatial()), output(p.shape);
+    const auto d = p.shape.size();
+    std::array<std::vector<std::ptrdiff_t>, 3> offsets;
+    constexpr auto invalid = std::numeric_limits<std::ptrdiff_t>::min();
+    std::ptrdiff_t xstep = 0;
+    for (std::size_t b = 0; b < d; ++b) {
+        std::size_t a = 0;
+        while (a < d && p.matrix[a * d + b] == 0) ++a;
+        if (a == d || std::abs(p.matrix[a * d + b]) != 1 || std::floor(p.offset[a]) != p.offset[a]) return false;
+        for (std::size_t j = 0; j < d; ++j)
+            if (j != b && p.matrix[a * d + j] != 0) return false;
+        auto sign = std::ptrdiff_t(p.matrix[a * d + b]);
+        if (b + 1 == d) xstep = sign * std::ptrdiff_t(input.stride[a]);
+        offsets[b].resize(p.shape[b]);
+        for (std::size_t x = 0; x < p.shape[b]; ++x) {
+            auto at = std::ptrdiff_t(p.offset[a]) + sign * std::ptrdiff_t(x);
+            offsets[b][x] = at >= 0 && at < std::ptrdiff_t(input.shape[a]) ? at * std::ptrdiff_t(input.stride[a]) : invalid;
         }
     }
+    const auto nx = p.shape.back(), ny = p.shape[d - 2], nz = d == 3 ? p.shape[0] : 1;
+    const auto& xs = offsets[d - 1];
+    std::size_t begin = 0, end = nx;
+    while (begin < nx && xs[begin] == invalid) ++begin;
+    while (end > begin && xs[end - 1] == invalid) --end;
+    // Validate the fill only when padding is actually required, as in resample.
+    bool padding = false;
+    for (std::size_t a = 0; a < d; ++a)
+        padding |= std::find(offsets[a].begin(), offsets[a].end(), invalid) != offsets[a].end();
+    if (padding) out.set(0, validity ? double(fill >= 1.) : fill);
+    src.typed([&](const auto* source) {
+        using T = std::remove_cv_t<std::remove_pointer_t<decltype(source)>>;
+        auto* dest = static_cast<T*>(out.data());
+        T pad = padding ? dest[0] : T{};
+        for (std::size_t c = 0; c < src.shape[0]; ++c)
+            for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y) {
+                auto* row = dest + c * output.size + (z * ny + y) * nx;
+                auto zo = d == 3 ? offsets[0][z] : 0, yo = offsets[d - 2][y];
+                if (zo == invalid || yo == invalid || begin == end) { std::fill(row, row + nx, pad); continue; }
+                std::fill(row, row + begin, pad); std::fill(row + end, row + nx, pad);
+                const auto* from = source + c * input.size + zo + yo + xs[begin];
+                if (xstep == 1) std::copy_n(from, end - begin, row + begin);
+                else if (xstep == -1) std::reverse_copy(from - (end - begin - 1), from + 1, row + begin);
+                else for (std::size_t x = begin; x < end; ++x) row[x] = from[std::ptrdiff_t(x - begin) * xstep];
+            }
+    });
+    return true;
+}
+template<std::size_t D> Array resample_impl(const Array& src, const Parameters& p, bool nearest, double fill, bool validity = false) {
+    Grid input(src.spatial()), output(p.shape); constexpr auto d = D;
+    Shape shape{src.shape[0]}; shape.insert(shape.end(), p.shape.begin(), p.shape.end()); auto out = Array::uninitialized(shape, src.kind, src.bytes);
+    if (resample_exact(src, out, p, fill, validity)) return out;
+    src.typed([&](const auto* source) {
+        using T = std::remove_cv_t<std::remove_pointer_t<decltype(source)>>;
+        auto* destination = static_cast<T*>(out.data());
+        for (std::size_t i = 0; i < output.size; ++i) {
+            Point pos{}; for (std::size_t a = 0; a < d; ++a) pos[a] = double(output.coord(i, a));
+            auto q = matvec(p.matrix, pos, d);
+            for (std::size_t a = 0; a < d; ++a) {
+                q[a] += p.offset[a];
+                // The displacement is already sampled on this output grid.
+                if (!p.field.empty()) q[a] += p.field[i * d + a];
+            }
+            if (nearest) {
+                bool valid = true; std::size_t at = 0;
+                for (std::size_t a = 0; a < d; ++a) {
+                    require(std::isfinite(q[a]), "nonfinite sampling coordinate");
+                    if (p.border) q[a] = std::clamp(q[a], 0., double(input.shape[a] - 1));
+                    if (q[a] < -1 || q[a] > double(input.shape[a])) { valid = false; continue; }
+                    auto lo = std::int64_t(std::floor(q[a])); auto fraction = q[a] - lo;
+                    auto x = p.nearest_mode == 2 ? lo : lo + (fraction > .5 || (fraction == .5 && (p.nearest_mode == 1 || lo % 2 != 0)));
+                    if (x < 0 || x >= std::int64_t(input.shape[a])) valid = false; else at += std::size_t(x) * input.stride[a];
+                }
+                for (std::size_t c = 0; c < src.shape[0]; ++c) {
+                    if (valid) destination[c * output.size + i] = source[c * input.size + at];
+                    else out.set(c * output.size + i, fill);
+                }
+            } else {
+                for (std::size_t c = 0; c < src.shape[0]; ++c) {
+                    double value = linear_value<D>(input, q, validity ? false : p.border, fill, [&](auto at) { return double(source[c * input.size + at]); });
+                    // Conservative support: every interpolation contributor must be valid.
+                    if (validity) value = double(value >= 1.);
+                    if constexpr (std::is_floating_point_v<T>) destination[c * output.size + i] = static_cast<T>(value);
+                    else out.set(c * output.size + i, value);
+                }
+            }
+        }
+    });
     return out;
+}
+inline Array resample(const Array& src, const Parameters& p, bool nearest, double fill, bool validity = false) {
+    return p.shape.size() == 2 ? resample_impl<2>(src, p, nearest, fill, validity)
+                               : resample_impl<3>(src, p, nearest, fill, validity);
 }
 inline void apply_geometry(Sample& sample, const Parameters& p) {
     auto d = p.shape.size(); auto canonical = axes(d); Grid output(p.shape);
@@ -256,14 +323,60 @@ template<Geometric T> void apply(const T&, Sample& s, const Parameters& p) { app
 // from a geometric deformation (point coordinates do not move).
 struct LowResolution { Scalar scale = Uniform{.5, 1}; std::string axes = "zyx"; bool shared_axes = true; ChannelOptions options; };
 struct ThickSlice { Scalar scale = Uniform{.25, .6}; std::string axes; bool labels = true; double p = 1; };
-inline Array resize_array(const Array& a, const Shape& shape, bool nearest, bool legacy_nearest = false) {
-    auto p = geometry(shape); auto d = shape.size(); p.border = true;
-    for (std::size_t i = 0; i < d; ++i) {
-        double ratio = double(a.shape[i + 1]) / shape[i]; p.matrix[i * d + i] = ratio;
-        p.offset[i] = legacy_nearest ? 0 : .5 * ratio - .5;
+template<std::size_t D> Array resize_array_impl(const Array& a, const Shape& shape, bool nearest, bool legacy_nearest) {
+    Grid input(a.spatial()), output(shape);
+    Shape out_shape{a.shape[0]}; out_shape.insert(out_shape.end(), shape.begin(), shape.end());
+    auto out = Array::uninitialized(out_shape, a.kind, a.bytes);
+    struct Axis { std::size_t lo, hi; double fraction; };
+    std::array<std::vector<Axis>, D> positions;
+    for (std::size_t axis = 0; axis < D; ++axis) {
+        const double ratio = double(input.shape[axis]) / shape[axis];
+        const double offset = legacy_nearest ? 0 : .5 * ratio - .5;
+        for (std::size_t x = 0; x < shape[axis]; ++x) {
+            double q = std::clamp(ratio * double(x) + offset, 0., double(input.shape[axis] - 1));
+            auto lo = std::size_t(std::floor(q)); double fraction = q - lo;
+            if (nearest) {
+                auto at = lo + (!legacy_nearest && fraction >= .5);
+                positions[axis].push_back({at * input.stride[axis], 0, 0});
+            } else positions[axis].push_back({lo * input.stride[axis], std::min(lo + 1, input.shape[axis] - 1) * input.stride[axis], fraction});
+        }
     }
-    p.nearest_mode = legacy_nearest ? 2 : 1;
-    return resample(a, p, nearest, 0);
+    a.typed([&](const auto* src) {
+        using T = std::remove_cv_t<std::remove_pointer_t<decltype(src)>>;
+        auto* dst = static_cast<T*>(out.data());
+        const auto nz = D == 3 ? shape[0] : 1, ny = shape[D - 2], nx = shape.back();
+        for (std::size_t c = 0; c < a.shape[0]; ++c)
+            for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y)
+                for (std::size_t x = 0; x < nx; ++x) {
+                    std::array<Axis, D> q;
+                    if constexpr (D == 3) q[0] = positions[0][z];
+                    q[D - 2] = positions[D - 2][y]; q[D - 1] = positions[D - 1][x];
+                    auto i = c * output.size + (z * ny + y) * nx + x;
+                    if (nearest) {
+                        std::size_t at = c * input.size;
+                        for (const auto& axis : q) at += axis.lo;
+                        dst[i] = src[at];
+                    } else {
+                        double value = 0;
+                        for (std::size_t corner = 0; corner < (1u << D); ++corner) {
+                            double weight = 1; std::size_t at = c * input.size;
+                            for (std::size_t axis = 0; axis < D; ++axis) {
+                                bool hi = (corner >> axis) & 1;
+                                weight *= hi ? q[axis].fraction : 1 - q[axis].fraction;
+                                at += hi ? q[axis].hi : q[axis].lo;
+                            }
+                            if (weight) value += weight * double(src[at]);
+                        }
+                        if constexpr (std::is_floating_point_v<T>) dst[i] = static_cast<T>(value);
+                        else out.set(i, value);
+                    }
+                }
+    });
+    return out;
+}
+inline Array resize_array(const Array& a, const Shape& shape, bool nearest, bool legacy_nearest = false) {
+    return shape.size() == 2 ? resize_array_impl<2>(a, shape, nearest, legacy_nearest)
+                             : resize_array_impl<3>(a, shape, nearest, legacy_nearest);
 }
 inline Parameters sample(const LowResolution& t, const Sample& s, Random& r) {
     return sample_channels(s, t.options, r, [&](const Array& a, Random& rng) {
@@ -278,10 +391,10 @@ inline Parameters sample(const LowResolution& t, const Sample& s, Random& r) {
 inline void apply(const LowResolution&, Sample& s, const Parameters& p) {
     for (const auto& c : p.channels) {
         auto& a = s.at(c.key).array; Shape shape = a.spatial(); auto n = product(shape); Shape one_shape{1}; one_shape.insert(one_shape.end(), shape.begin(), shape.end());
-        Array one(one_shape, a.kind, a.bytes); for (std::size_t i = 0; i < n; ++i) one.copy_element(i, a, c.channel * n + i);
+        Array one(one_shape, a.kind, a.bytes, static_cast<const char*>(std::as_const(a).data()) + c.channel * n * a.bytes);
         for (std::size_t j = 0; j < shape.size(); ++j) shape[j] = std::max<std::size_t>(1, std::size_t(round_even(shape[j] * c.values[j])));
         auto restored = resize_array(resize_array(one, shape, true), a.spatial(), false);
-        for (std::size_t i = 0; i < n; ++i) a.copy_element(c.channel * n + i, restored, i);
+        std::memcpy(static_cast<char*>(a.data()) + c.channel * n * a.bytes, restored.data(), n * a.bytes);
     }
     restore_valid(s);
 }

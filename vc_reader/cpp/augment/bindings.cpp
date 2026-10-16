@@ -78,15 +78,34 @@ static Morph morph(nb::handle object) {
     if (value == "close") return Morph::Close;
     throw nb::value_error("morphology operation must be dilate, erode, open or close");
 }
-static nb::object export_array(Array array) {
+static nb::object export_array(Array array, const std::map<std::string, Input>& inputs, bool inplace) {
+    // A safe call returns independent outputs even when no transform wrote a
+    // borrowed input. Explicit inplace calls can return views of reader buffers.
+    if (array.borrowed && !inplace) array.data();
+    nb::object input_owner = array.borrowed ? nb::cast(inputs.at(array.owner)) : nb::none();
     auto owner = std::make_unique<Array>(std::move(array)); auto* ptr = owner.get();
     nb::capsule capsule(owner.release(), [](void* p) noexcept { delete static_cast<Array*>(p); });
     nb::dlpack::dtype dtype;
     dtype.code = std::uint8_t(ptr->kind == 'f' ? nb::dlpack::dtype_code::Float : ptr->kind == 'i' ? nb::dlpack::dtype_code::Int : ptr->kind == 'b' ? nb::dlpack::dtype_code::Bool : nb::dlpack::dtype_code::UInt);
     dtype.bits = std::uint8_t(ptr->bytes * 8); dtype.lanes = 1;
-    return nb::cast(nb::ndarray<nb::numpy>(ptr->data(), ptr->shape.size(), ptr->shape.data(), capsule, nullptr, dtype));
+    return nb::cast(nb::ndarray<nb::numpy>(const_cast<void*>(std::as_const(*ptr).data()), ptr->shape.size(), ptr->shape.data(), ptr->borrowed ? input_owner : nb::borrow<nb::object>(capsule), nullptr, dtype));
 }
-static Sample import_sample(const Pipeline& pipeline, const std::map<std::string, Input>& inputs) {
+static void writable_inputs(const std::map<std::string, Input>& inputs) {
+    for (auto it = inputs.begin(); it != inputs.end(); ++it) {
+        nb::ndarray<nb::c_contig, nb::device::cpu> writable;
+        require(nb::try_cast(nb::cast(it->second), writable, false), "inplace augmentation requires writable contiguous arrays");
+        auto begin = reinterpret_cast<std::uintptr_t>(it->second.data());
+        require(begin % std::max<std::size_t>(1, it->second.dtype().bits / 8) == 0, "inplace augmentation requires aligned arrays");
+        auto end = begin + it->second.nbytes();
+        for (auto other = inputs.begin(); other != it; ++other) {
+            auto other_begin = reinterpret_cast<std::uintptr_t>(other->second.data());
+            auto other_end = other_begin + other->second.nbytes();
+            require(begin == end || other_begin == other_end || end <= other_begin || other_end <= begin,
+                    "inplace augmentation requires nonoverlapping target arrays");
+        }
+    }
+}
+static Sample import_sample(const Pipeline& pipeline, const std::map<std::string, Input>& inputs, bool inplace = false) {
     Sample result;
     for (const auto& [name, input] : inputs) {
         require(pipeline.targets().count(name), "undeclared array field: " + name);
@@ -97,17 +116,17 @@ static Sample import_sample(const Pipeline& pipeline, const std::map<std::string
         if (type.code == std::uint8_t(nb::dlpack::dtype_code::UInt)) kind = 'u';
         if (type.code == std::uint8_t(nb::dlpack::dtype_code::Bool)) kind = 'b';
         require(type.lanes == 1 && type.bits % 8 == 0, "unsupported input dtype");
-        Array array(shape, kind, type.bits / 8);
-        if (array.size()) std::memcpy(array.data(), input.data(), array.size() * array.bytes);
+        Array array(shape, kind, type.bits / 8, input.data(), name, inplace);
+        if (reinterpret_cast<std::uintptr_t>(input.data()) % array.bytes) array.data();
         result.emplace(name, Field{std::move(array), pipeline.targets().at(name), name});
     }
     return result;
 }
-static nb::tuple export_result(RunResult result, bool plan) {
+static nb::tuple export_result(RunResult result, bool plan, const std::map<std::string, Input>& inputs, bool inplace = false) {
     nb::dict arrays, sources;
     for (auto& [name, f] : result.sample) {
-        if (f.pyramid.empty()) arrays[nb::str(name.c_str())] = export_array(std::move(f.array));
-        else { nb::list levels; for (auto& level : f.pyramid) levels.append(export_array(std::move(level))); arrays[nb::str(name.c_str())] = levels; }
+        if (f.pyramid.empty()) arrays[nb::str(name.c_str())] = export_array(std::move(f.array), inputs, inplace);
+        else { nb::list levels; for (auto& level : f.pyramid) levels.append(export_array(std::move(level), inputs, inplace)); arrays[nb::str(name.c_str())] = levels; }
         sources[nb::str(name.c_str())] = nb::str(f.source.c_str());
     }
     return nb::make_tuple(arrays, sources, nb::cast(result.timings), plan ? nb::cast(std::move(result.plan)) : nb::none());
@@ -120,7 +139,7 @@ NB_MODULE(_augment, m) {
     nb::class_<Choice>(m, "Choice").def(nb::init<std::vector<double>>(), "values"_a);
     nb::class_<BalancedContrast>(m, "BalancedContrast").def(nb::init<double, double>(), "low"_a = .75, "high"_a = 1.25);
     nb::class_<Target>(m, "Target");
-    m.def("Image", [](double fill, nb::object valid) { Target t; t.fill = fill; t.valid = valid.is_none() ? "" : nb::cast<std::string>(valid); return t; }, "fill"_a = 0., "valid"_a = nb::str("padding_mask"));
+    m.def("Image", [](double fill, nb::object valid) { Target t; t.fill = fill; t.valid = valid.is_none() ? "" : nb::cast<std::string>(valid); return t; }, "fill"_a = 0., "valid"_a.none() = nb::str("padding_mask"));
     m.def("Label", [](nb::object ignore_value, double fill) { Target t; t.role = Role::Label; t.fill = ignore_value.is_none() ? fill : nb::cast<double>(ignore_value); return t; }, "ignore_value"_a = nb::none(), "fill"_a = 0.);
     m.def("ScalarField", [](double fill) { Target t; t.role = Role::Scalar; t.fill = fill; return t; }, "fill"_a = 0.);
     m.def("ValidMask", [] { Target t; t.role = Role::Valid; return t; });
@@ -196,14 +215,15 @@ NB_MODULE(_augment, m) {
     nb::class_<Pipeline>(m, "Pipeline")
         .def(nb::init<std::vector<Op>, std::map<std::string, Target>>(), "transforms"_a, "targets"_a)
         .def("load_plan", [](const Pipeline& p, nb::bytes bytes) { return load_plan(p.program(), std::string(bytes.c_str(), bytes.size())); })
-        .def("run", [](const Pipeline& p, const std::map<std::string, Input>& inputs, std::uint64_t seed, bool record, bool profile) {
+        .def("run", [](const Pipeline& p, const std::map<std::string, Input>& inputs, std::uint64_t seed, bool record, bool profile, bool inplace) {
+            if (inplace) writable_inputs(inputs);
             RunResult result;
-            { nb::gil_scoped_release release; result = p.run(import_sample(p, inputs), seed, record, profile); }
-            return export_result(std::move(result), record);
-        }, "inputs"_a, "seed"_a, "record"_a = false, "profile"_a = false)
+            { nb::gil_scoped_release release; result = p.run(import_sample(p, inputs, inplace), seed, record, profile); }
+            return export_result(std::move(result), record, inputs, inplace);
+        }, "inputs"_a, "seed"_a, "record"_a = false, "profile"_a = false, "inplace"_a = false)
         .def("replay", [](const Pipeline& p, const std::map<std::string, Input>& inputs, const Plan& plan) {
             RunResult result; { nb::gil_scoped_release release; result = p.replay(import_sample(p, inputs), plan); }
-            return export_result(std::move(result), false);
+            return export_result(std::move(result), false, inputs);
         });
     m.def("seed", [](nb::args parts) {
         std::uint64_t value = UINT64_C(14695981039346656037);

@@ -28,6 +28,9 @@ The optional NPZ contains before/after arrays and a JSON report. See the
 
 ## Augmentation comparison: `bench_augment.py`
 
+[Measured results on 64³ and 128³ PHercParis4 crops](augmentation_results.md)
+include all timings, numerical differences, and profiler findings.
+
 Compare the native public API with the actual Python transforms in the Vesuvius
 source tree on a real cached CT crop. Requires Torch, SciPy, scikit-image,
 fft-conv-pytorch, SimpleITK, pandas, and acvl-utils in addition to vc_reader.
@@ -70,6 +73,15 @@ the Vesuvius source package path without executing its root initializer. All
 augmentation modules and their dependencies execute unchanged. `--profile`
 creates separate cProfile reports after timing (three calls per backend). These
 locate Python-level costs; native calls appear as one opaque extension call.
+
+To include the reader handoff, use `--read-each-call --inplace`. Both backends
+read a fresh float32 crop through `vc_reader`, divide by 255, construct any
+synthetic labels, and augment it. Python uses the fresh tensor directly; native
+augmentation receives `inplace=True`. Reads and preparation are timed in this
+mode; construction and warmup remain outside timing. The JSON records reader
+counters and the reader extension hash. This measures warm local reads, not
+cold storage or network throughput. `--inplace` requires fresh reads to prevent
+repeatedly augmenting already-modified data.
 
 ## Local reads: `bench_local.py`
 
@@ -414,3 +426,21 @@ The session's full timings and hashes are in the ignored `results/` directory:
 `native-sample-before.json`, `native-sample-after.json`, local runs
 `local-20261016-070224.json` / `local-20261016-070305.json`, and the 21-repetition
 crop runs `local-20261016-070352.json` / `local-20261016-070356.json`.
+
+## Native hotspot profiling
+
+`profile_augment.cpp` runs five native calls on a raw 128³ uint8 chunk without
+Python. On Linux with GNU gprof, build with `-O2 -g -pg` and run from a temporary
+directory (gprof writes `gmon.out` in the working directory):
+
+```sh
+c++ -std=c++20 -O2 -g -pg -I vc_reader/cpp/augment \
+  vc_reader/benchmarks/profile_augment.cpp -o /tmp/profile_augment
+(cd /tmp && ./profile_augment /absolute/path/to/raw/chunk median)
+gprof -b -p /tmp/profile_augment /tmp/gmon.out > /tmp/augment-profile.txt
+```
+
+Operations: `copy`, `flip`, `median`, `blur`. Use uninstrumented Release builds
+and `bench_augment.py` for reported latency; instrumentation changes timings.
+The workload itself is portable C++20; use a platform profiler when gprof is not
+available.

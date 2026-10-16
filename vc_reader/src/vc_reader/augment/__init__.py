@@ -72,7 +72,7 @@ def translate_crop_box(box, points, *, seed, **kwargs):
     return tuple(_native.translate_crop_box(box, points.ravel().tolist(), seed, **kwargs))
 
 
-def _as_array(value):
+def _as_array(value, inplace=False):
     if isinstance(value, np.ndarray):
         array, converter = value, None
     elif type(value).__module__.split(".")[0] == "torch":
@@ -84,7 +84,9 @@ def _as_array(value):
         raise TypeError("targets must be NumPy arrays or CPU Torch tensors")
     if not array.dtype.isnative:
         raise TypeError("augmentation requires native-endian arrays")
-    return np.ascontiguousarray(array), converter
+    if inplace and (not array.flags.c_contiguous or not array.flags.writeable or not array.flags.aligned):
+        raise ValueError("inplace augmentation requires writable contiguous aligned arrays")
+    return np.require(array, requirements=["C", "A"]), converter
 
 
 class Plan:
@@ -111,7 +113,10 @@ class Pipeline:
     """Construct once; pass an explicit seed for each sample occurrence.
 
     Arrays use (C, Y, X)/(C, Z, Y, X); points use (N, D). Metadata passes
-    through, undeclared arrays raise, and inputs are never mutated.
+    through and undeclared arrays raise. Inputs are preserved by default.
+    Pass inplace=True when handing off fresh reader buffers: transforms may
+    modify them and outputs may share their storage. Always use returned arrays,
+    since geometry and shape-changing transforms allocate new buffers.
     """
     def __init__(self, transforms, *, targets=None):
         self.transforms = tuple(deepcopy(tuple(transforms)))
@@ -126,12 +131,12 @@ class Pipeline:
     def __setstate__(self, state):
         self.__init__(state[0], targets=state[1])
 
-    def _inputs(self, sample):
+    def _inputs(self, sample, inplace=False):
         arrays, converters = {}, {}
         for key, value in sample.items():
             if key in self.targets:
                 if value is not None:
-                    arrays[key], converters[key] = _as_array(value)
+                    arrays[key], converters[key] = _as_array(value, inplace)
             elif isinstance(value, np.ndarray) or type(value).__module__.split(".")[0] == "torch":
                 raise ValueError(f"array field {key!r} needs a target declaration")
         return arrays, converters
@@ -149,9 +154,9 @@ class Pipeline:
             out["_aug_perf"] = timings
         return out
 
-    def __call__(self, sample, *, seed, profile=False):
-        arrays, converters = self._inputs(sample)
-        result = self._native.run(arrays, seed, False, profile)
+    def __call__(self, sample, *, seed, profile=False, inplace=False):
+        arrays, converters = self._inputs(sample, inplace)
+        result = self._native.run(arrays, seed, False, profile, inplace)
         return self._outputs(sample, converters, result, profile)
 
     def sample(self, sample, *, seed):

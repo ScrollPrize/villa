@@ -203,6 +203,8 @@ def main():
     parser.add_argument("--shape", type=int, nargs=3, default=(128, 128, 128))
     parser.add_argument("--reps", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--read-each-call", action="store_true", help="time fresh vc_reader float32 reads, normalization and augmentation together")
+    parser.add_argument("--inplace", action="store_true", help="reuse freshly read native buffers; requires --read-each-call")
     parser.add_argument("--only", help="comma-separated case names")
     parser.add_argument("--profile", help="comma-separated cases to profile separately after timing")
     parser.add_argument("--output", type=Path, default=Path("/tmp/vc-augment-benchmark.json"))
@@ -211,6 +213,8 @@ def main():
     if args.reps < 1 or args.warmup < 0 or len(set(args.shape)) != 1 or min(args.shape) <= 8:
         parser.error("use a cubic patch larger than 8, positive reps and nonnegative warmup")
 
+    if args.inplace and not args.read_each_call:
+        parser.error("--inplace requires --read-each-call so each call receives fresh inputs")
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
     # The Vesuvius root initializer imports volume/download dependencies unrelated
@@ -231,12 +235,31 @@ def main():
     inputs = {"image": {"image": image}, "both": {"image": image, "segmentation": labels},
               "label": {"segmentation": labels}, "ignore_label": {"segmentation": ignore},
               "masked": {"image": image, "segmentation": ignore}, "binary": {"image": labels.float()}}
+    fresh_reader = ZarrReader.open(args.array, threads=1) if args.read_each_call else None
+
+    def fresh_sample(kind):
+        patch = fresh_reader.read(tuple(args.start), tuple(args.shape), dtype=np.float32)[None]
+        patch /= 255
+        image = torch.from_numpy(patch)
+        if kind == "image":
+            return {"image": image}
+        labels = (image > .5).to(torch.int16)
+        if kind in ("ignore_label", "masked"):
+            labels[:, :4] = -1
+        if kind == "binary":
+            return {"image": labels.float()}
+        result = {"segmentation": labels}
+        if kind in ("both", "masked"):
+            result["image"] = image
+        return result
+
     import vc_reader._augment as extension
     cpu_info = Path("/proc/cpuinfo")
     cpu = next((line.split(":", 1)[1].strip() for line in cpu_info.read_text().splitlines()
                 if line.startswith("model name")), platform.processor()) if cpu_info.exists() else platform.processor()
     report = dict(command=sys.argv, python=sys.version, platform=platform.platform(), cpu=cpu,
-                  logical_cpus=os.cpu_count(), torch=torch.__version__, numpy=np.__version__,
+                  logical_cpus=os.cpu_count(), cpu_affinity=sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
+                  torch=torch.__version__, numpy=np.__version__,
                   torch_threads=torch.get_num_threads(), torch_interop_threads=torch.get_num_interop_threads(),
                   thread_environment={k: os.environ.get(k) for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS")},
                   native_extension=extension.__file__, native_sha256=hashlib.sha256(Path(extension.__file__).read_bytes()).hexdigest(),
@@ -246,6 +269,13 @@ def main():
                   warmup=args.warmup, reps=args.reps, seed=123, ownership="Python timed input clone; native internal copy",
                   cases=[], excluded=["StripGeometry, SurfacePerturb and translate_crop_box: specialized tracing APIs outside this models benchmark",
                                      "OneOf/probability wrappers: no standalone kernel; not separately timed"])
+    report["read_each_call"] = args.read_each_call
+    report["inplace"] = args.inplace
+    if args.read_each_call:
+        import vc_reader._native as reader_extension
+        report["reader_extension"] = reader_extension.__file__
+        report["reader_sha256"] = hashlib.sha256(Path(reader_extension.__file__).read_bytes()).hexdigest()
+        report["ownership"] = "Both read fresh vc_reader float32 buffers; Python mutates them; native inplace=" + str(args.inplace)
     report["dependencies"] = {name: importlib.metadata.version(name) for name in
                               ("scipy", "scikit-image", "fft-conv-pytorch", "acvl-utils")}
     flags = args.build_dir / "CMakeFiles/_augment.dir/flags.make"
@@ -275,13 +305,14 @@ def main():
                 native = A.Pipeline(case.native, targets={"image": A.Image(), "segmentation": A.Label()})
 
                 def python_call():
-                    value = {key: tensor.clone() for key, tensor in sample.items()}
+                    value = fresh_sample(case.inputs) if fresh_reader else {key: tensor.clone() for key, tensor in sample.items()}
                     for transform in legacy:
                         value = transform.apply(value, **case.fixed) if case.fixed is not None else transform(**value)
                     return value
 
                 def native_call():
-                    return native(sample, seed=123)
+                    value = fresh_sample(case.inputs) if fresh_reader else sample
+                    return native(value, seed=123, **({"inplace": True} if args.inplace else {}))
 
                 before = {k: v.clone() for k, v in sample.items()}
                 reset_rng(123)
@@ -325,6 +356,10 @@ def main():
                 print(f"{case.name:24} ERROR {row['error']}", flush=True)
             report["cases"].append(row)
             args.output.write_text(json.dumps(report, indent=2) + "\n")
+    if fresh_reader:
+        report["reader_stats"] = fresh_reader.stats()
+        fresh_reader.close()
+        args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(f"Saved {args.output}", flush=True)
 
 

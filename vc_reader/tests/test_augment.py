@@ -308,3 +308,117 @@ def test_multichannel_pseudo2d_validity():
     pipeline = A.Pipeline([A.ToPseudo2D(), A.BrightnessAdd(shift=1), A.FromPseudo2D()])
     out = pipeline({"image": image, "padding_mask": valid}, seed=1)
     np.testing.assert_array_equal(out["image"], np.broadcast_to(valid, image.shape) * 2)
+
+
+@pytest.mark.parametrize("transform_index", range(len(transforms())), ids=[repr(t) for t in transforms()])
+def test_inplace_matches_safe_pipeline(transform_index):
+    transform = transforms()[transform_index]
+    sample = example((3, 5, 7))
+    pipeline = A.Pipeline([transform])
+    expected = pipeline(sample, seed=123)
+    actual = pipeline(sample, seed=123, inplace=True)
+    for key, value in expected.items():
+        if isinstance(value, np.ndarray):
+            np.testing.assert_array_equal(actual[key], value)
+        elif isinstance(value, list):
+            for a, b in zip(actual[key], value):
+                np.testing.assert_array_equal(a, b)
+
+
+def test_inplace_ownership_and_reshape():
+    import gc
+    image = np.arange(60, dtype=np.float32).reshape(1, 3, 4, 5)
+    pipeline = A.Pipeline([A.ToPseudo2D(), A.BrightnessAdd(.5)])
+    out = pipeline({"image": image}, seed=1, inplace=True)["image"]
+    assert out.shape == (3, 4, 5)
+    assert np.shares_memory(out, image)
+    expected = np.arange(60, dtype=np.float32).reshape(3, 4, 5) + .5
+    del image, pipeline
+    gc.collect()
+    np.testing.assert_array_equal(out, expected)
+    out[:] = 2
+    assert np.all(out == 2)
+
+
+def test_inplace_rejects_readonly_strides_and_aliasing():
+    pipeline = A.Pipeline([A.BrightnessAdd(1)])
+    image = np.ones((1, 3, 5), dtype=np.float32)
+    image.flags.writeable = False
+    with pytest.raises(ValueError, match="writable"):
+        pipeline({"image": image}, seed=1, inplace=True)
+    with pytest.raises(ValueError, match="writable"):
+        pipeline._native.run({"image": image}, 1, False, False, True)
+    # The default continues accepting readonly and strided inputs.
+    np.testing.assert_array_equal(pipeline({"image": image[:, :, ::-1]}, seed=1)["image"], 2)
+    image.flags.writeable = True
+    with pytest.raises(ValueError, match="contiguous"):
+        pipeline({"image": image[:, :, ::-1]}, seed=1, inplace=True)
+    with pytest.raises(ValueError, match="nonoverlapping"):
+        pipeline({"image": image, "mask": image}, seed=1, inplace=True)
+    np.testing.assert_array_equal(image, 1)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("shape", [(1, 5), (4, 7), (1, 3, 5), (3, 4, 7)])
+def test_resize_identity_and_half_up_nearest(dtype, shape):
+    image = np.arange(np.prod(shape), dtype=dtype).reshape(1, *shape)
+    pipeline = A.Pipeline([A.DeepSupervision([1, .6])])
+    out = pipeline({"mask": image}, seed=5)["mask"]
+    np.testing.assert_array_equal(out[0], image)
+    # Deep supervision uses half-up coordinates, unlike ThickSlice's legacy floor.
+    expected = image
+    for axis, extent in enumerate(shape, start=1):
+        size = max(1, round(extent * .6))
+        indices = np.floor((np.arange(size) + .5) * extent / size).astype(int)
+        expected = np.take(expected, indices, axis=axis)
+    np.testing.assert_array_equal(out[1], expected)
+
+
+def test_image_without_validity_mask():
+    pipeline = A.Pipeline([A.BrightnessAdd(1)], targets={"image": A.Image(valid=None)})
+    np.testing.assert_array_equal(pipeline({"image": np.zeros((1, 2, 3), np.float32)}, seed=0)["image"], 1)
+
+
+def test_inplace_reader_buffer_survives_close_and_reuse(tmp_path):
+    import gc
+    import json
+    from vc_reader.reader import ZarrReader
+
+    shape = (3, 4, 5)
+    expected = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+    (tmp_path / '.zarray').write_text(json.dumps({
+        "zarr_format": 2, "shape": shape, "chunks": shape, "dtype": "<f4",
+        "compressor": None, "filters": None, "fill_value": 0, "order": "C",
+    }))
+    (tmp_path / '0.0.0').write_bytes(expected.tobytes())
+    pipeline = A.Pipeline([A.BrightnessAdd(.5)])
+    with ZarrReader.open(str(tmp_path)) as reader:
+        image = reader.read((0, 0, 0), shape)[None]
+        out = pipeline({"image": image}, seed=1, inplace=True)["image"]
+        assert np.shares_memory(out, image)
+        del image
+        gc.collect()
+        # Retained augmented outputs must not return their buffers to the pool.
+        for _ in range(3):
+            np.testing.assert_array_equal(reader.read((0, 0, 0), shape), expected)
+    gc.collect()
+    np.testing.assert_array_equal(out[0], expected + .5)
+
+
+@pytest.mark.parametrize("value", [np.nan, np.inf, -np.inf])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_vectorized_validation_rejects_nonfinite(value, dtype):
+    image = np.zeros((1, 3, 17), dtype=dtype)
+    image.ravel()[35] = value
+    with pytest.raises(ValueError, match="nonfinite"):
+        A.Pipeline([])({"image": image}, seed=1)
+
+
+def test_unaligned_input_is_copied_or_rejected():
+    image = np.ndarray((1, 3, 5), dtype=np.float32, buffer=bytearray(61), offset=1)
+    image[:] = 2
+    pipeline = A.Pipeline([A.BrightnessAdd(1)])
+    np.testing.assert_array_equal(pipeline({"image": image}, seed=1)["image"], 3)
+    with pytest.raises(ValueError, match="aligned"):
+        pipeline({"image": image}, seed=1, inplace=True)
+    np.testing.assert_array_equal(image, 2)

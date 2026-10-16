@@ -2,6 +2,7 @@
 // Independent of Python, Torch, the reader, and process-global RNG/thread state.
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -18,6 +19,9 @@
 #include <vector>
 
 namespace vcr::augment {
+inline void require(bool ok, const char* message) {
+    if (!ok) throw std::invalid_argument(message);
+}
 inline void require(bool ok, const std::string& message) {
     if (!ok) throw std::invalid_argument(message);
 }
@@ -102,22 +106,56 @@ inline int draw_integer(const Scalar& value, Random& r) {
     require(v >= 0 && v <= 100000 && std::floor(v) == v, "expected nonnegative integer parameter"); return int(v);
 }
 
-// Aligned owning storage. Nearest/permutation operations copy bytes, including
+// Aligned storage with copy-on-write input views. Array copies always own their
+// data; the binding retains borrowed owners until export. Nearest/permutation
+// operations copy bytes, including
 // int64/uint64 labels that cannot be represented exactly as floating point.
 struct Array {
     Shape shape;
     char kind = 'f';
     std::size_t bytes = 4;
-    std::vector<std::uint64_t> storage;
+    std::unique_ptr<std::uint64_t[]> storage;
+    const void* borrowed = nullptr;
+    std::string owner;
+    bool writable = false;
     Array() = default;
-    Array(Shape s, char k = 'f', std::size_t b = 4) : shape(std::move(s)), kind(k), bytes(b) {
+    void allocate(bool clear) {
+        const auto words = std::max<std::size_t>(1, (size() * bytes + 7) / 8);
+        storage = std::make_unique_for_overwrite<std::uint64_t[]>(words);
+        if (clear) std::fill_n(storage.get(), words, 0);
+    }
+    Array(const Array& other) : shape(other.shape), kind(other.kind), bytes(other.bytes) {
+        if (!other.data()) return;
+        allocate(false);
+        if (size()) std::memcpy(storage.get(), other.data(), size() * bytes);
+    }
+    Array& operator=(const Array& other) {
+        if (this != &other) { Array copy(other); *this = std::move(copy); }
+        return *this;
+    }
+    Array(Array&&) noexcept = default;
+    Array& operator=(Array&&) noexcept = default;
+    Array(Shape s, char k = 'f', std::size_t b = 4, const void* input = nullptr,
+          std::string source = {}, bool inplace = false, bool zero = true)
+        : shape(std::move(s)), kind(k), bytes(b), borrowed(input), owner(std::move(source)), writable(inplace) {
         require((k == 'f' && (b == 4 || b == 8)) || ((k == 'i' || k == 'u') && (b == 1 || b == 2 || b == 4 || b == 8)) || (k == 'b' && b == 1), "unsupported array dtype");
         require(size() <= (std::numeric_limits<std::size_t>::max() - 7) / b, "array size overflow");
-        storage.resize(std::max<std::size_t>(1, (size() * b + 7) / 8));
+        if (!borrowed) allocate(zero);
+    }
+    // For kernels that write every output element before exposing the array.
+    static Array uninitialized(Shape shape, char kind, std::size_t bytes) {
+        return Array(std::move(shape), kind, bytes, nullptr, {}, false, false);
     }
     std::size_t size() const { return product(shape); }
-    void* data() { return storage.data(); }
-    const void* data() const { return storage.data(); }
+    void* data() {
+        if (borrowed && !writable) {
+            allocate(false);
+            if (size()) std::memcpy(storage.get(), borrowed, size() * bytes);
+            borrowed = nullptr; owner.clear();
+        }
+        return borrowed ? const_cast<void*>(borrowed) : storage.get();
+    }
+    const void* data() const { return borrowed ? borrowed : storage.get(); }
     Shape spatial() const { require(shape.size() >= 2, "expected a channel-first spatial array"); return Shape(shape.begin() + 1, shape.end()); }
     template<class F> decltype(auto) typed(F&& f) const {
         if (kind == 'f') { if (bytes == 4) return f(static_cast<const float*>(data())); return f(static_cast<const double*>(data())); }
@@ -142,6 +180,7 @@ struct Array {
         });
     }
     void set(std::size_t i, double v) {
+        data();
         typed([&](const auto* p) {
             using T = std::remove_cv_t<std::remove_pointer_t<decltype(p)>>;
             if constexpr (std::is_integral_v<T>) {
@@ -205,10 +244,26 @@ inline void validate(const Sample& s) {
             require(order == expected, name + ": invalid component order");
             if (!sparse(t.role)) require(a.shape[0] == component_dim, name + ": one channel per component required");
         }
-        for (std::size_t i = 0; i < a.size(); ++i) {
-            auto v = a.get(i); require(std::isfinite(v), name + ": nonfinite input; use a validity mask for missing data");
-            if (t.role == Role::Valid) require(v == 0 || v == 1, name + ": validity masks must contain only zero or one");
-        }
+        // Dispatch once. Integer targets are inherently finite; construct error
+        // messages only on failure, never in the voxel loop.
+        const auto n = a.size();
+        if (a.kind == 'f') a.typed([&](const auto* values) {
+            using V = std::remove_cv_t<std::remove_pointer_t<decltype(values)>>;
+            if constexpr (std::is_floating_point_v<V>) {
+                // Integer OR reduction vectorizes without relaxed floating-point
+                // flags. All-ones exponents identify both infinities and NaNs.
+                using Bits = std::conditional_t<sizeof(V) == 4, std::uint32_t, std::uint64_t>;
+                constexpr Bits exponent = sizeof(V) == 4 ? Bits(0x7f800000u) : Bits(UINT64_C(0x7ff0000000000000));
+                Bits invalid = 0;
+                for (std::size_t i = 0; i < n; ++i) invalid |= (std::bit_cast<Bits>(values[i]) & exponent) == exponent;
+                if (invalid) throw std::invalid_argument(name + ": nonfinite input; use a validity mask for missing data");
+            }
+        });
+        if (t.role == Role::Valid) a.typed([&](const auto* values) {
+            for (std::size_t i = 0; i < n; ++i)
+                if (values[i] != 0 && values[i] != 1)
+                    throw std::invalid_argument(name + ": validity masks must contain only zero or one");
+        });
         if (t.role == Role::Image && s.count(t.valid)) {
             const auto& mask = s.at(t.valid);
             require(mask.target.role == Role::Valid && (mask.array.shape[0] == 1 || mask.array.shape[0] == a.shape[0]), name + ": invalid validity-mask association");
@@ -262,14 +317,34 @@ inline void gaussian_blur(std::vector<double>& data, const Grid& g, const std::v
         std::vector<double> kernel(2 * radius + 1); double sum = 0;
         for (int d = -radius; d <= radius; ++d) sum += kernel[d + radius] = std::exp(-.5 * (d / sigma) * (d / sigma));
         for (auto& w : kernel) w /= sum;
-        for (std::size_t i = 0; i < g.size; ++i) {
-            auto x = g.coord(i, a), base = i - x * g.stride[a]; double v = 0;
+        // Traverse contiguous runs for each tap. Every output retains the
+        // original tap accumulation order, while the inner loop can vectorize.
+        const auto extent = g.shape[a], step = g.stride[a], block = extent * step;
+        std::fill(tmp.begin(), tmp.end(), 0.);
+        for (std::size_t base = 0; base < g.size; base += block)
             for (int d = -radius; d <= radius; ++d) {
-                auto at = mirror_boundary ? mirror(std::int64_t(x) + d, g.shape[a]) : reflect(std::int64_t(x) + d, g.shape[a]);
-                v += kernel[d + radius] * data[base + at * g.stride[a]];
+                const double weight = kernel[d + radius];
+                if (step == 1) {
+                    const auto begin = std::size_t(std::min<std::int64_t>(extent, std::max(0, -d)));
+                    const auto end = std::size_t(std::clamp<std::int64_t>(std::int64_t(extent) - d, begin, extent));
+                    for (std::size_t x = begin; x < end; ++x) tmp[base + x] += weight * data[base + x + d];
+                    for (std::size_t x = 0; x < begin; ++x) {
+                        auto at = mirror_boundary ? mirror(std::int64_t(x) + d, extent) : reflect(std::int64_t(x) + d, extent);
+                        tmp[base + x] += weight * data[base + at];
+                    }
+                    for (std::size_t x = end; x < extent; ++x) {
+                        auto at = mirror_boundary ? mirror(std::int64_t(x) + d, extent) : reflect(std::int64_t(x) + d, extent);
+                        tmp[base + x] += weight * data[base + at];
+                    }
+                    continue;
+                }
+                for (std::size_t x = 0; x < extent; ++x) {
+                    const auto at = mirror_boundary ? mirror(std::int64_t(x) + d, extent) : reflect(std::int64_t(x) + d, extent);
+                    auto* dst = tmp.data() + base + x * step;
+                    const auto* src = data.data() + base + at * step;
+                    for (std::size_t j = 0; j < step; ++j) dst[j] += weight * src[j];
+                }
             }
-            tmp[i] = v;
-        }
         data.swap(tmp);
     }
 }
