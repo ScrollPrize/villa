@@ -41,3 +41,7 @@ nanobind_add_module(_native NB_STATIC NOMINSIZE cpp/bindings.cpp)
 target_include_directories(_native PRIVATE cpp)
 target_link_libraries(_native PRIVATE CURL::libcurl PkgConfig::BLOSC PkgConfig::ZSTD SQLite::SQLite3 vc_delta3d::vc_delta3d Threads::Threads)
 install(TARGETS _native LIBRARY DESTINATION vc_reader)
+
+# Array-only augmentation kernels: no reader, codecs, networking, or Torch linkage.
+nanobind_add_module(_augment NB_STATIC NOMINSIZE cpp/augment/bindings.cpp)
+install(TARGETS _augment LIBRARY DESTINATION vc_reader)

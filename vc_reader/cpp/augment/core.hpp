@@ -1,0 +1,281 @@
+#pragma once
+// Independent of Python, Torch, the reader, and process-global RNG/thread state.
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <functional>
+#include <limits>
+#include <map>
+#include <memory>
+#include <numeric>
+#include <stdexcept>
+#include <string>
+#include <variant>
+#include <vector>
+
+namespace vcr::augment {
+inline void require(bool ok, const std::string& message) {
+    if (!ok) throw std::invalid_argument(message);
+}
+inline void probability(double p) { require(std::isfinite(p) && p >= 0 && p <= 1, "probability must be in [0, 1]"); }
+using Shape = std::vector<std::size_t>;
+inline std::size_t product(const Shape& shape) {
+    std::size_t n = 1;
+    for (auto s : shape) {
+        require(s == 0 || n <= std::numeric_limits<std::size_t>::max() / s, "shape overflow");
+        n *= s;
+    }
+    return n;
+}
+struct Grid {
+    Shape shape, stride;
+    std::size_t size;
+    explicit Grid(Shape s) : shape(std::move(s)), stride(shape.size()), size(product(shape)) {
+        require(!shape.empty() && shape.size() <= 3 && size, "expected nonempty 1D, 2D or 3D spatial grid");
+        std::size_t step = 1;
+        for (auto a = shape.size(); a-- > 0;) { stride[a] = step; step *= shape[a]; }
+    }
+    std::size_t coord(std::size_t i, std::size_t a) const { return i / stride[a] % shape[a]; }
+};
+inline std::string axes(std::size_t dim) { require(dim == 2 || dim == 3, "expected 2D or 3D spatial data"); return dim == 3 ? "zyx" : "yx"; }
+inline int axis(char c, std::size_t dim) {
+    auto pos = axes(dim).find(c); require(pos != std::string::npos, "axis is not present in the sample"); return int(pos);
+}
+
+struct Random {
+    std::uint64_t state;
+    std::uint64_t next() {
+        auto z = (state += UINT64_C(0x9e3779b97f4a7c15));
+        z = (z ^ (z >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)) * UINT64_C(0x94d049bb133111eb);
+        return z ^ (z >> 31);
+    }
+    double uniform() { return (double(next() >> 11) + 0.5) * 0x1.0p-53; }
+    bool chance(double p) { probability(p); return uniform() < p; }
+    std::size_t index(std::size_t n) {
+        require(n > 0, "cannot sample an empty choice");
+        auto threshold = (std::uint64_t(0) - n) % n;
+        std::uint64_t value; do { value = next(); } while (value < threshold);
+        return value % n;
+    }
+    double normal() { return std::sqrt(-2 * std::log(uniform())) * std::cos(6.2831853071795864769 * uniform()); }
+};
+inline std::uint64_t split_seed(std::uint64_t base, const std::string& name) {
+    // Stable across processes, standard libraries, and platforms.
+    for (unsigned char c : name) { base ^= c; base *= UINT64_C(1099511628211); }
+    Random r{base}; return r.next();
+}
+struct Uniform { double low, high; };
+struct Normal { double mean = 0, std = .1; };
+struct Choice { std::vector<double> values; };
+struct BalancedContrast { double low = .75, high = 1.25; };
+using Scalar = std::variant<double, Uniform, Normal, Choice, BalancedContrast>;
+inline double draw(const Scalar& value, Random& r) {
+    double result = std::visit([&](const auto& v) -> double {
+        using T = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<T, double>) return v;
+        else if constexpr (std::is_same_v<T, Uniform>) {
+            require(std::isfinite(v.low) && std::isfinite(v.high) && v.low <= v.high, "invalid uniform range");
+            return v.low + (v.high - v.low) * r.uniform();
+        } else if constexpr (std::is_same_v<T, Normal>) {
+            require(std::isfinite(v.mean) && std::isfinite(v.std) && v.std >= 0, "invalid normal distribution");
+            return v.mean + v.std * r.normal();
+        } else if constexpr (std::is_same_v<T, Choice>) return v.values[r.index(v.values.size())];
+        else {
+            require(v.low > 0 && v.low <= 1 && v.high >= 1 && std::isfinite(v.high), "balanced contrast must bracket one");
+            return r.chance(.5) ? v.low + (1 - v.low) * r.uniform() : 1 + (v.high - 1) * r.uniform();
+        }
+    }, value);
+    require(std::isfinite(result), "sampled parameter must be finite"); return result;
+}
+inline int draw_integer(const Scalar& value, Random& r) {
+    if (const auto* u = std::get_if<Uniform>(&value)) {
+        require(u->low >= 0 && u->high <= 100000 && u->low <= u->high &&
+                std::floor(u->low) == u->low && std::floor(u->high) == u->high, "invalid integer range");
+        return int(u->low) + int(r.index(std::size_t(u->high - u->low + 1)));
+    }
+    auto v = draw(value, r);
+    require(v >= 0 && v <= 100000 && std::floor(v) == v, "expected nonnegative integer parameter"); return int(v);
+}
+
+// Aligned owning storage. Nearest/permutation operations copy bytes, including
+// int64/uint64 labels that cannot be represented exactly as floating point.
+struct Array {
+    Shape shape;
+    char kind = 'f';
+    std::size_t bytes = 4;
+    std::vector<std::uint64_t> storage;
+    Array() = default;
+    Array(Shape s, char k = 'f', std::size_t b = 4) : shape(std::move(s)), kind(k), bytes(b) {
+        require((k == 'f' && (b == 4 || b == 8)) || ((k == 'i' || k == 'u') && (b == 1 || b == 2 || b == 4 || b == 8)) || (k == 'b' && b == 1), "unsupported array dtype");
+        require(size() <= (std::numeric_limits<std::size_t>::max() - 7) / b, "array size overflow");
+        storage.resize((size() * b + 7) / 8);
+    }
+    std::size_t size() const { return product(shape); }
+    void* data() { return storage.data(); }
+    const void* data() const { return storage.data(); }
+    Shape spatial() const { return Shape(shape.begin() + 1, shape.end()); }
+    template<class F> decltype(auto) typed(F&& f) const {
+        if (kind == 'f') { if (bytes == 4) return f(static_cast<const float*>(data())); return f(static_cast<const double*>(data())); }
+        if (kind == 'b' || kind == 'u') {
+            if (bytes == 1) return f(static_cast<const std::uint8_t*>(data()));
+            if (bytes == 2) return f(static_cast<const std::uint16_t*>(data()));
+            if (bytes == 4) return f(static_cast<const std::uint32_t*>(data()));
+            return f(static_cast<const std::uint64_t*>(data()));
+        }
+        if (bytes == 1) return f(static_cast<const std::int8_t*>(data()));
+        if (bytes == 2) return f(static_cast<const std::int16_t*>(data()));
+        if (bytes == 4) return f(static_cast<const std::int32_t*>(data()));
+        return f(static_cast<const std::int64_t*>(data()));
+    }
+    double get(std::size_t i) const { return typed([&](const auto* p) { return double(p[i]); }); }
+    void set(std::size_t i, double v) {
+        typed([&](const auto* p) {
+            using T = std::remove_cv_t<std::remove_pointer_t<decltype(p)>>;
+            if constexpr (std::is_integral_v<T>) {
+                require(std::isfinite(v) && static_cast<long double>(v) >= std::numeric_limits<T>::lowest() &&
+                        static_cast<long double>(v) <= std::numeric_limits<T>::max(), "value is not representable in target dtype");
+            }
+            const_cast<T*>(p)[i] = static_cast<T>(v);
+        });
+    }
+    void copy_element(std::size_t to, const Array& src, std::size_t from) {
+        require(kind == src.kind && bytes == src.bytes, "copy dtype mismatch");
+        std::memcpy(static_cast<char*>(data()) + to * bytes, static_cast<const char*>(src.data()) + from * bytes, bytes);
+    }
+    std::vector<double> channel(std::size_t c) const {
+        auto n = product(spatial()); require(c < shape[0], "channel out of bounds");
+        std::vector<double> result(n);
+        typed([&](const auto* p) { for (std::size_t i = 0; i < n; ++i) result[i] = double(p[c * n + i]); });
+        return result;
+    }
+    void channel(std::size_t c, const std::vector<double>& values) {
+        auto n = product(spatial()); require(c < shape[0] && values.size() == n, "channel shape mismatch");
+        for (std::size_t i = 0; i < n; ++i) set(c * n + i, values[i]);
+    }
+};
+
+enum class Role { Image, Label, Scalar, Valid, Points, Vectors, VectorField, NormalField, CoordinateField };
+struct Target {
+    Role role = Role::Image;
+    double fill = 0;
+    std::string valid = "padding_mask", components = "zyx", outside = "keep";
+    bool normalize = false, external = true;
+    bool operator==(const Target&) const = default;
+};
+struct Field { Array array; Target target; std::string source; std::vector<Array> pyramid; };
+using Sample = std::map<std::string, Field>;
+inline bool sparse(Role r) { return r == Role::Points || r == Role::Vectors; }
+inline bool directional(Role r) { return r == Role::Vectors || r == Role::VectorField || r == Role::NormalField; }
+inline Shape sample_shape(const Sample& s) {
+    for (const auto& [name, f] : s) if (!sparse(f.target.role)) return f.array.spatial();
+    throw std::invalid_argument("sample needs a spatial array");
+}
+inline void validate(const Sample& s) {
+    auto shape = sample_shape(s); auto names = axes(shape.size());
+    for (const auto& [name, f] : s) {
+        const auto& a = f.array; const auto& t = f.target;
+        if (sparse(t.role)) require(a.shape.size() == 2 && a.shape[1] == shape.size(), name + ": expected (N, D)");
+        else require(a.shape.size() >= 3 && a.shape[0] && a.spatial() == shape, name + ": expected channel-first matching spatial shape");
+        if (t.role != Role::Label && t.role != Role::Valid) require(a.kind == 'f', name + ": continuous targets require float32 or float64");
+        if (sparse(t.role) || directional(t.role) || t.role == Role::CoordinateField) {
+            auto order = t.components; std::sort(order.begin(), order.end()); auto expected = names; std::sort(expected.begin(), expected.end());
+            require(order == expected, name + ": invalid component order");
+            if (!sparse(t.role)) require(a.shape[0] == shape.size(), name + ": one channel per spatial component required");
+        }
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            auto v = a.get(i); require(std::isfinite(v), name + ": nonfinite input; use a validity mask for missing data");
+            if (t.role == Role::Valid) require(v == 0 || v == 1, name + ": validity masks must contain only zero or one");
+        }
+        if (t.role == Role::Image && s.count(t.valid)) {
+            const auto& mask = s.at(t.valid);
+            require(mask.target.role == Role::Valid && (mask.array.shape[0] == 1 || mask.array.shape[0] == a.shape[0]), name + ": invalid validity-mask association");
+        }
+        require(t.outside == "keep" || t.outside == "drop" || t.outside == "error", "outside must be keep, drop or error");
+    }
+}
+inline void restore_valid(Sample& s) {
+    for (auto& [name, f] : s) {
+        if (f.target.role != Role::Image || !s.count(f.target.valid)) continue;
+        const auto& mask = s.at(f.target.valid).array;
+        auto n = product(f.array.spatial());
+        for (std::size_t i = 0; i < f.array.size(); ++i)
+            if (!mask.get(mask.shape[0] == 1 ? i % n : i)) f.array.set(i, f.target.fill);
+    }
+}
+inline double mean(const std::vector<double>& v) { return std::accumulate(v.begin(), v.end(), 0.0) / v.size(); }
+inline double deviation(const std::vector<double>& v, double m) {
+    double sum = 0; for (auto x : v) sum += (x - m) * (x - m);
+    return v.size() > 1 ? std::sqrt(sum / (v.size() - 1)) : 0;
+}
+inline std::size_t reflect(std::int64_t i, std::size_t n) {
+    auto p = static_cast<std::int64_t>(2 * n); i = (i % p + p) % p;
+    return static_cast<std::size_t>(i < static_cast<std::int64_t>(n) ? i : p - 1 - i);
+}
+inline void gaussian_blur(std::vector<double>& data, const Grid& g, const std::vector<double>& sigmas, double truncate = 4) {
+    require(sigmas.size() == g.shape.size() && truncate > 0 && std::isfinite(truncate), "invalid Gaussian parameters");
+    std::vector<double> tmp(g.size);
+    for (std::size_t a = 0; a < sigmas.size(); ++a) {
+        auto sigma = sigmas[a]; require(sigma >= 0 && std::isfinite(sigma) && sigma * truncate < 100000, "invalid Gaussian sigma");
+        if (!sigma) continue;
+        int radius = int(sigma * truncate + .5); std::vector<double> kernel(2 * radius + 1); double sum = 0;
+        for (int d = -radius; d <= radius; ++d) sum += kernel[d + radius] = std::exp(-.5 * (d / sigma) * (d / sigma));
+        for (auto& w : kernel) w /= sum;
+        for (std::size_t i = 0; i < g.size; ++i) {
+            auto x = g.coord(i, a), base = i - x * g.stride[a]; double v = 0;
+            for (int d = -radius; d <= radius; ++d) v += kernel[d + radius] * data[base + reflect(std::int64_t(x) + d, g.shape[a]) * g.stride[a]];
+            tmp[i] = v;
+        }
+        data.swap(tmp);
+    }
+}
+struct ChannelOptions {
+    double p = 1, p_channel = 1;
+    bool shared = false;
+    std::vector<std::size_t> channels;
+    std::vector<std::string> on;
+};
+// A compact sampled record, owned by the native replay plan. Parameters are
+// interpreted by their concrete transform's overload, never a string dispatcher.
+struct ChannelPlan {
+    std::string key;
+    std::size_t channel = 0;
+    std::vector<double> values, field;
+    std::uint64_t seed = 0;
+};
+struct Parameters {
+    std::vector<ChannelPlan> channels;
+    Shape shape;
+    std::vector<double> matrix, offset, field;
+    bool border = false, exact = false;
+    int nearest_mode = 0; // 0: ties-to-even, 1: half-up resize, 2: floor resize
+};
+template<class F>
+Parameters sample_channels(const Sample& sample, const ChannelOptions& options, Random& r, F&& sample_one) {
+    Parameters result; auto base = r.next();
+    for (const auto& [name, f] : sample) {
+        if (f.target.role != Role::Image || (!options.on.empty() && std::find(options.on.begin(), options.on.end(), name) == options.on.end())) continue;
+        Random local{split_seed(base, name)};
+        auto channels = options.channels;
+        if (channels.empty()) { channels.resize(f.array.shape[0]); std::iota(channels.begin(), channels.end(), 0); }
+        ChannelPlan shared;
+        if (options.shared) shared = sample_one(f.array, local);
+        for (auto c : channels) {
+            require(c < f.array.shape[0], "channel out of bounds");
+            if (!local.chance(options.p_channel)) continue;
+            auto plan = options.shared ? shared : sample_one(f.array, local);
+            plan.key = name; plan.channel = c; result.channels.push_back(std::move(plan));
+        }
+    }
+    return result;
+}
+template<class F> void apply_channels(Sample& s, const Parameters& p, F&& apply_one) {
+    for (const auto& c : p.channels) {
+        auto& a = s.at(c.key).array; auto values = a.channel(c.channel);
+        apply_one(values, Grid(a.spatial()), c); a.channel(c.channel, values);
+    }
+    restore_valid(s);
+}
+} // namespace vcr::augment

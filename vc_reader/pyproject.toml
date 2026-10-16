@@ -22,6 +22,7 @@ dependencies = []
 
 [project.optional-dependencies]
 reader = ["numpy>=1.24"]
+augment = ["numpy>=1.24"]
 # Baselines for benchmarks/.
 bench = ["vc-reader[reader]", "zarr>=3", "s3fs", "tensorstore"]
 # numcodecs and vc-delta3d write the tests' blosc and Delta3D fixtures.
