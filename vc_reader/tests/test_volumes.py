@@ -98,3 +98,60 @@ def test_transforms(paris4):
 def test_superseded_pair_shares_frame(pherc139):
     assert pherc139.same_frame("20260102150214", "20260930100252")
     assert not pherc139.same_frame("20250728140407", "20260930100252")
+
+
+# Several volumes at one resolution and energy. Different scans cover
+# different regions; several exports of one scan are variants of the same data.
+
+
+def test_scan_parts_need_scan(paris4):
+    part1, part2 = "20230205180739", "20230206171837"  # stitched part 1 / part 2, 7.91um 54keV
+    with pytest.raises(AmbiguousMatchError) as err:
+        paris4.volume(resolution=7.91, energy_kev=54)
+    assert {v.id for v in err.value.candidates} == {part1, part2}
+    assert "narrow it with scan= or a volume id" in str(err.value)
+    assert paris4.volume(resolution=7.91, scan=part2).id == part2
+    assert paris4.volume(resolution=7.91, scan=paris4.scans[part1]).id == part1
+
+
+def test_scan_by_long_id(paris4):
+    assert paris4.volume(scan="20260311024914-2.400um-0.2m-78keV").id == VOL_78KEV
+    assert paris4.find_volumes(scan="19700101000000") == []
+
+
+def test_secondary_export_of_same_scan_dropped(pherc139, catalog):
+    main = "20250728140407"  # 9.362um, alongside its pag0/pag50 exports
+    assert len(pherc139.find_volumes(resolution=9.362)) == 3
+    assert {v.is_secondary for v in pherc139.find_volumes(resolution=9.362)} == {False, True}
+    assert pherc139.volume(resolution=9.362).id == main
+    assert pherc139.volume("20251107132835").is_secondary  # still reachable by id
+    pherc172 = catalog.sample("PHerc0172")
+    assert pherc172.volume(resolution=7.91).id == "20241024131838"
+
+
+def test_secondary_never_dropped_for_another_scan(pherc139):
+    # 2.4um: the main 2.399um volume (78keV scan) and four secondary 2.403um
+    # exports of two other scans. Nothing is preferred across scans.
+    with pytest.raises(AmbiguousMatchError) as err:
+        pherc139.volume(resolution=2.4)
+    assert len(err.value.candidates) == 5
+
+
+def test_two_secondary_exports_of_one_scan_need_id(pherc139):
+    with pytest.raises(AmbiguousMatchError) as err:
+        pherc139.volume(resolution=2.403, energy_kev=77)
+    assert len(err.value.candidates) == 4
+    assert "scan=" in str(err.value)
+    with pytest.raises(AmbiguousMatchError) as err:
+        pherc139.volume(resolution=2.403, scan="20250722040659")  # ROI2: Aug 2025 and Mar 2026 exports
+    assert {v.id for v in err.value.candidates} == {"20250820105138", "20260319133554"}
+    assert "narrow it with a volume id" in str(err.value)
+    assert "secondary" in str(err.value) and "scan=20250722040659" in str(err.value)
+
+
+def test_two_main_exports_of_one_scan_need_id(catalog):
+    pherc9b = catalog.sample("PHerc0009B")
+    with pytest.raises(AmbiguousMatchError) as err:
+        pherc9b.volume(resolution=2.401)
+    assert {v.id for v in err.value.candidates} == {"20250820154339", "20260319104112"}
+    assert "narrow it with a volume id" in str(err.value)

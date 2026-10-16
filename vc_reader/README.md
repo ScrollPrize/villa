@@ -80,9 +80,18 @@ for view in vol.segments(min_coverage=0.5):   # segments with a mesh on this vol
 - **Volumes**: look up by id or long id, or by `resolution` (µm). A volume
   whose pixel size is exactly the requested value wins. Otherwise any volume
   within 0.5% relative tolerance (`rel_tol=`) matches. Narrow the result with
-  `energy_kev=`. Superseded volumes are skipped unless you name them or pass
-  `include_superseded=True`. If more than one volume matches,
-  `AmbiguousMatchError` is raised with the candidates listed.
+  `energy_kev=` or `scan=` (scan id or long id). Superseded volumes are skipped
+  unless you name them or pass `include_superseded=True`.
+- **Several volumes at one resolution**: volumes of different scans usually
+  cover different regions (Scroll 1's stitched parts 1 and 2, PHerc0139's
+  ROI2 and B), so `volume()` never chooses between scans. Pass `scan=` instead. One
+  scan can also have several exports. `vol.is_secondary` marks the
+  ones the pipeline no longer renders segments on (`render_segments: false`),
+  such as experimental, ROI or redundant exports. `volume()` drops those when
+  the same scan has a main export, so PHerc0139 at 9.362 µm gives the main
+  volume rather than its `pag0`/`pag50` variants. If more than one volume is
+  left, `AmbiguousMatchError` is raised. It lists the candidates with their
+  scans and says which argument narrows the match. `find_volumes()` always returns every match.
 - **URLs**: `artifact.url()` returns HTTPS and prefers the open-data bucket.
   `url("s3")` returns the `s3://` form. EduceLab-licensed volumes are only on
   `data.aws.ash2txt.org` / `s3://vesuvius-challenge`.
@@ -192,6 +201,7 @@ Benchmarks against zarr-python and TensorStore are in
 vc-reader samples paris
 vc-reader volumes "Scroll 1"
 vc-reader labels "pherc paris 4" --resolution 2.399 --energy 78 --um 9.6
+vc-reader labels "Scroll 1" --resolution 7.91 --scan 20230206171837
 vc-reader --metadata ./metadata.json labels PHerc0139 --volume 20260930100252
 ```
 

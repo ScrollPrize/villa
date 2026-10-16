@@ -24,6 +24,10 @@ KEEP = {
     "PHerc0139": ["20260317000000", "20250831000000", "20250108000005"],
     # Two volumes at 3.24um, no segments kept.
     "PHerc0332": [],
+    # Two exports of one 7.91um scan; the second has render_segments false.
+    "PHerc0172": [],
+    # Two exports of one 2.401um scan, neither flagged.
+    "PHerc0009B": [],
     # Fragment with a display name and no volumes.
     "PHercParis1Fr39": [],
 }

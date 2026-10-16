@@ -33,7 +33,7 @@ def test_unknown_sample_suggests(catalog):
 
 def test_find_samples(catalog):
     assert [s.id for s in catalog.find_samples("paris")] == ["PHercParis1Fr39", "PHercParis4"]
-    assert [s.id for s in catalog.find_samples(type="fragment")] == ["PHercParis1Fr39"]
+    assert [s.id for s in catalog.find_samples(type="fragment")] == ["PHerc0009B", "PHercParis1Fr39"]
     assert len(catalog.find_samples()) == len(catalog.samples)
 
 

@@ -1,8 +1,8 @@
 """``vc-reader`` command line: browse the open-data catalog.
 
     vc-reader samples [QUERY]
-    vc-reader volumes SAMPLE [--resolution UM] [--energy KEV]
-    vc-reader labels SAMPLE (--volume ID | --resolution UM [--energy KEV]) [--um UM] [--direct-only]
+    vc-reader volumes SAMPLE [--resolution UM] [--energy KEV] [--scan ID]
+    vc-reader labels SAMPLE (--volume ID | --resolution UM [--energy KEV] [--scan ID]) [--um UM] [--direct-only]
 """
 
 from __future__ import annotations
@@ -37,19 +37,22 @@ def _cmd_samples(cat: Catalog, args: argparse.Namespace) -> None:
 
 def _cmd_volumes(cat: Catalog, args: argparse.Namespace) -> None:
     sample = cat.sample(args.sample)
-    vols = sample.find_volumes(resolution=args.resolution, energy_kev=args.energy, include_superseded=True)
-    rows = [["volume", "um", "keV", "shape zyx", "license", "segments", "labels on", "notes"]]
+    vols = sample.find_volumes(
+        resolution=args.resolution, energy_kev=args.energy, scan=args.scan, include_superseded=True
+    )
+    rows = [["volume", "um", "keV", "scan", "shape zyx", "license", "segments", "labels on", "notes"]]
     for v in vols:
         notes = []
         if v.is_superseded:
             notes.append(f"superseded by {v.superseded_by_id}")
-        if v.render_segments is False:
-            notes.append("not rendered")
+        if v.is_secondary:
+            notes.append("secondary")
         rows.append(
             [
                 v.long_id or v.id,
                 _fmt(v.pixel_size_um),
                 _fmt(v.energy_kev),
+                v.scan_id or "-",
                 "x".join(map(str, v.shape_zyx)) if v.shape_zyx else "-",
                 v.license.name if v.license else "-",
                 str(len(v.segments())),
@@ -63,7 +66,7 @@ def _cmd_volumes(cat: Catalog, args: argparse.Namespace) -> None:
 def _pick_volume(sample: Sample, args: argparse.Namespace):
     if args.volume:
         return sample.volume(args.volume)
-    return sample.volume(resolution=args.resolution, energy_kev=args.energy)
+    return sample.volume(resolution=args.resolution, energy_kev=args.energy, scan=args.scan)
 
 
 def _cmd_labels(cat: Catalog, args: argparse.Namespace) -> None:
@@ -101,6 +104,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     sp.add_argument("sample")
     sp.add_argument("--resolution", type=float, help="level-0 voxel size in um")
     sp.add_argument("--energy", type=float, help="X-ray energy in keV")
+    sp.add_argument("--scan", help="scan id or long id")
     sp.set_defaults(func=_cmd_volumes)
 
     sp = sub.add_parser("labels", help="ink labels on, or mappable onto, a volume")
@@ -108,13 +112,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     sp.add_argument("--volume", help="volume id or long id")
     sp.add_argument("--resolution", type=float, help="level-0 voxel size in um")
     sp.add_argument("--energy", type=float, help="X-ray energy in keV")
+    sp.add_argument("--scan", help="scan id or long id")
     sp.add_argument("--um", type=float, help="working scale in um (selects the pyramid level)")
     sp.add_argument("--direct-only", action="store_true", help="only labels published on this volume")
     sp.set_defaults(func=_cmd_labels)
 
     args = p.parse_args(argv)
-    if args.command == "labels" and not (args.volume or args.resolution):
-        p.error("labels: pass --volume or --resolution")
+    if args.command == "labels" and not (args.volume or args.resolution or args.scan):
+        p.error("labels: pass --volume, --resolution or --scan")
     try:
         cat = Catalog.load(args.metadata, refresh=args.refresh)
         args.func(cat, args)

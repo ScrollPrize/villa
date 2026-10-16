@@ -165,6 +165,14 @@ class Volume:
     def is_superseded(self) -> bool:
         return self.superseded_by_id is not None
 
+    @property
+    def is_secondary(self) -> bool:
+        """``render_segments: false``: segments are no longer rendered on this volume.
+
+        The pipeline sets it on experimental, ROI or redundant exports.
+        """
+        return self.render_segments is False
+
     def transform_to(self, other: Volume | str) -> Affine | None:
         """Level-0 ``[x, y, z]`` of this volume -> level-0 of ``other``; None if unregistered."""
         return self.sample.transform(self.id, _volume_id(other))
@@ -694,6 +702,7 @@ class Sample:
         *,
         resolution: float | None = None,
         energy_kev: float | None = None,
+        scan: Scan | str | None = None,
         include_superseded: bool = False,
         rel_tol: float = DEFAULT_RESOLUTION_REL_TOL,
     ) -> list[Volume]:
@@ -704,15 +713,18 @@ class Sample:
         any, otherwise all within relative tolerance ``rel_tol`` (so ``2.399``
         finds a ``2.4`` volume, but does not also return ``2.403`` volumes when a
         ``2.399`` one exists). ``energy_kev`` matches to within 0.5 keV.
-        Superseded volumes are skipped unless named by ``query`` or
-        ``include_superseded``. Results are ordered by distance to
-        ``resolution``, then id.
+        ``scan`` is a scan, scan id or scan long id. Superseded volumes are
+        skipped unless named by ``query`` or ``include_superseded``. Results are
+        ordered by distance to ``resolution``, then id.
         """
         vols = self.volume_list()
         if query is not None:
             vols = [v for v in vols if query in (v.id, v.long_id, (v.long_id or "").removesuffix(".zarr"))]
         elif not include_superseded:
             vols = [v for v in vols if not v.is_superseded]
+        if scan is not None:
+            sid = self._scan_id(scan)
+            vols = [v for v in vols if v.scan_id == sid]
         if resolution is not None:
             vols = [v for v in vols if _resolution_matches(v.pixel_size_um, resolution, rel_tol)]
             exact = [v for v in vols if v.pixel_size_um == resolution]
@@ -727,31 +739,62 @@ class Sample:
         *,
         resolution: float | None = None,
         energy_kev: float | None = None,
+        scan: Scan | str | None = None,
         include_superseded: bool = False,
         rel_tol: float = DEFAULT_RESOLUTION_REL_TOL,
     ) -> Volume:
-        """Exactly one volume; see :meth:`find_volumes`. Raises if none or several match."""
-        if query is None and resolution is None and energy_kev is None:
-            raise TypeError("pass a volume id/long id, resolution= or energy_kev=")
+        """Exactly one volume; see :meth:`find_volumes`. Raises if none or several match.
+
+        A scan can have several exports at one resolution. When some of a
+        scan's matching exports are secondary (:attr:`Volume.is_secondary`) and
+        some are not, the secondary ones are dropped. Volumes of different scans
+        are never preferred over each other: they usually cover different
+        regions (scan parts, ROIs).
+        """
+        if query is None and resolution is None and energy_kev is None and scan is None:
+            raise TypeError("pass a volume id/long id, resolution=, energy_kev= or scan=")
         vols = self.find_volumes(
-            query, resolution=resolution, energy_kev=energy_kev, include_superseded=include_superseded, rel_tol=rel_tol
+            query,
+            resolution=resolution,
+            energy_kev=energy_kev,
+            scan=scan,
+            include_superseded=include_superseded,
+            rel_tol=rel_tol,
         )
         criteria = ", ".join(
             f"{k}={v!r}"
-            for k, v in (("query", query), ("resolution", resolution), ("energy_kev", energy_kev))
+            for k, v in (
+                ("query", query),
+                ("resolution", resolution),
+                ("energy_kev", energy_kev),
+                ("scan", _scan_label(scan)),
+            )
             if v is not None
         )
         if not vols:
             listing = "\n".join("  " + _describe_volume(v) for v in self.volume_list())
             raise NotFoundError(f"no volume of {self.id} matches {criteria}. Volumes:\n{listing}")
+        main_scans = {v.scan_id for v in vols if not v.is_secondary}
+        vols = [v for v in vols if not v.is_secondary or v.scan_id not in main_scans]
         if len(vols) > 1:
+            narrow = [
+                name
+                for name, values in (("energy_kev=", {v.energy_kev for v in vols}), ("scan=", {v.scan_id for v in vols}))
+                if len(values) > 1
+            ]
             listing = "\n".join("  " + _describe_volume(v) for v in vols)
             raise AmbiguousMatchError(
                 f"{len(vols)} volumes of {self.id} match {criteria}; "
-                f"narrow it with a volume id or energy_kev=:\n{listing}",
+                f"narrow it with {' or '.join([*narrow, 'a volume id'])}:\n{listing}",
                 vols,
             )
         return vols[0]
+
+    def _scan_id(self, scan: Scan | str) -> str:
+        if isinstance(scan, Scan):
+            return scan.id
+        hits = [s.id for s in self.scans.values() if scan == s.long_id]
+        return hits[0] if hits else scan
 
     def transform(self, from_volume: Volume | str, to_volume: Volume | str) -> Affine | None:
         """Level-0 ``[x, y, z]`` of ``from_volume`` -> level-0 of ``to_volume``.
@@ -889,14 +932,19 @@ def _volume_id(v: Volume | str) -> str:
     return v.id if isinstance(v, Volume) else v
 
 
+def _scan_label(scan: Scan | str | None) -> str | None:
+    return scan.id if isinstance(scan, Scan) else scan
+
+
 def _describe_volume(v: Volume) -> str:
-    bits = [v.id, v.long_id or ""]
+    bits = [v.long_id or v.id, f"scan={v.scan_id}" if v.scan_id else ""]
     if v.shape_zyx:
         bits.append("shape=" + "x".join(map(str, v.shape_zyx)))
+    bits.append(f"segments={len(v.segments())}")
     if v.is_superseded:
         bits.append(f"superseded by {v.superseded_by_id}")
-    if v.render_segments is False:
-        bits.append("not rendered")
+    if v.is_secondary:
+        bits.append("secondary (render_segments=false)")
     return "  ".join(b for b in bits if b)
 
 
