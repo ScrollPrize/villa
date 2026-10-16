@@ -1,5 +1,9 @@
 # Augmentation performance after optimization — 2026-10-16
 
+This records the first optimization pass. See the [filter follow-up](filter_results.md)
+for subsequent median and Gaussian changes; the binaries and timings below are
+the historical baseline for that work.
+
 The native brightness → gamma → blur pipeline now takes **27.53 ms**, down from **244.21 ms**, on a real 128³ CT crop. The Python pipeline takes **89.07 ms** in the final comparison. Including a fresh `vc_reader` float32 read, normalization, and augmentation, native takes **27.06 ms** versus Python's **87.65 ms** with `inplace=True`.
 
 All 38 timed native cases improved over the original native implementation at 128³. This does **not** make every transform faster than Torch/SciPy: native wins 12 of 36 individual comparisons at 128³ and 14 at 64³. Noise generation, several local intensity operations, and some simple operations still trail the Python libraries. Median is approximately tied at 128³ after a 12× improvement. Timings below include the remaining slower cases.

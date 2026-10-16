@@ -30,6 +30,8 @@ The optional NPZ contains before/after arrays and a JSON report. See the
 
 [Measured results on 64³ and 128³ PHercParis4 crops](augmentation_results.md)
 include all timings, numerical differences, and profiler findings.
+The [median and Gaussian follow-up](filter_results.md) measures the later filter
+optimizations, including wider kernels and continuous-valued inputs.
 
 Compare the native public API with the actual Python transforms in the Vesuvius
 source tree on a real cached CT crop. Requires Torch, SciPy, scikit-image,
@@ -49,6 +51,19 @@ The default is a populated 128³ PHercParis4 crop at ZYX `(1280,2688,3200)`.
 label cases use an int16 threshold of the CT, not ground-truth annotations.
 `--only Flip,Gamma` selects cases. Use `--build-dir` to record the relevant
 CMake build flags and verify the extension matches that build.
+
+Use `--filter-sweep` for median sizes 3/4/5/7 and Gaussian sigmas .5/1/2/4.
+Add `--input-noise-std .01` to perturb the normalized CT with fixed Gaussian
+noise before timing and exercise the continuous-valued median fallback. In
+reader mode the same precomputed perturbation is added to each fresh crop
+inside the timer. For a populated 64³ crop:
+
+```sh
+PYTHONPATH=vc_reader/src:vesuvius/src vc_reader/.venv/bin/python \
+  vc_reader/benchmarks/bench_augment.py --filter-sweep --input-noise-std .01 \
+  --start 1312 2752 3232 --shape 64 64 64 --reps 5 --warmup 2 \
+  --output vc_reader/benchmarks/results/filters-noisy-64.json
+```
 
 Each operation is constructed once. Reads, parameter construction, RNG reset,
 and output comparisons are excluded from timings. Python receives a timed clone

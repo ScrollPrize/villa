@@ -196,6 +196,10 @@ use double intermediates and cast to the input dtype. Specific conventions:
   Here truncate describes the **full width**, following the existing blur, not
   SciPy's radius. `mirror` excludes the repeated edge pixel (Torch's reflect
   padding); `reflect` includes it. Small arrays support repeated reflection.
+- `MedianFilter` uses a sliding histogram when a channel has at most 256 distinct
+  values, including normalized uint8 CT. It stores the exact values; there is no
+  quantization. Channels with more distinct values (for example, after noise or
+  interpolation), or both signs of zero, use the general selection kernel.
 - `LowResolution` uses nearest-exact downsampling and linear upsampling;
   `ThickSlice` uses legacy nearest sampling in both directions.
 - `Morphology` defaults to a Euclidean ball. To reproduce the existing 3D
