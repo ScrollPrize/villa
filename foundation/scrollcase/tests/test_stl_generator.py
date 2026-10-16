@@ -103,7 +103,7 @@ class StlGeneratorTests(unittest.TestCase):
             label_file.write_text("# engraved on the top cap\nPHerc s.n.\n\ncass. 94\n")
             self.assertEqual(module.read_label(str(label_file)), ("PHerc s.n.", "cass. 94"))
             label_file.write_text("PHerc 1234\n")
-            self.assertEqual(module.read_label(str(label_file)), ("PHerc 1234", "v3"))
+            self.assertEqual(module.read_label(str(label_file)), ("PHerc 1234", "v4"))
             for bad in ("", "# only a comment\n", "a\nb\nc\n"):
                 label_file.write_text(bad)
                 with self.assertRaises(ValueError):
@@ -129,7 +129,7 @@ class StlGeneratorTests(unittest.TestCase):
         module.process_scroll("sncass94", "m.ply", "out", None, ("PHerc s.n.", "cass. 94"))
         self.assertEqual((seen["label_line_1"], seen["label_line_2"]), ("PHerc s.n.", "cass. 94"))
         module.process_scroll("0608", "m.ply", "out")
-        self.assertEqual((seen["label_line_1"], seen["label_line_2"]), ("PHerc0608", "v3"))
+        self.assertEqual((seen["label_line_1"], seen["label_line_2"]), ("PHerc0608", "v4"))
 
 
 if __name__ == "__main__":
