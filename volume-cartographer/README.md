@@ -407,7 +407,78 @@ _Widget for creating initial segmentations which can be used for traces or later
 - `Clear all paths` : clears any user drawn paths / points (use this over the clear buttons most of the time)
 - `Start label wraps` : this is used for absolute or relative wrap labels, is not used during the seeding step, will detail in another document
 
+### Patch-to-patch graph linking performance
+
+Patch overlap linking queries all eligible target patches together for each
+seed sample, instead of scanning the same seed separately for every target.
+Searches use up to eight workers automatically; small patches use fewer.
+`--overlap-workers 1` forces serial search, and a positive value requests that
+many workers. Python accepts `db.link_patch_overlaps(path, workers=4)`; C++ uses
+`PatchOverlapParams::workers`. The default is `0` (automatic).
+
+Workers retain bounded correspondence sets and merge in source order. Nearest
+triangle selection, distance ties, thinning, correspondence caps, RANSAC seeds,
+fitting and acceptance thresholds retain the original behavior. Index queries
+borrow immutable raw filter sets, avoid allocations for empty results, and
+share one index lock across each batch of 512 samples. Progress callbacks run
+on the calling thread, including updates during correspondence searches.
+
+Measurements on Linux arm64 with GCC 13, `RelWithDebInfo` and LTO, three runs
+per version with a fresh graph each time (seconds, min / median / max):
+
+| Input | Original total | Optimized total | Median speedup |
+| --- | --- | --- | --- |
+| 8 real patches | 0.710 / 0.721 / 0.729 | 0.225 / 0.277 / 0.323 | 2.6x |
+| 24 real patches | 1.563 / 1.565 / 1.569 | 0.298 / 0.317 / 0.328 | 4.9x |
+| 3 dense synthetic patches | 2.768 / 2.791 / 2.860 | 0.704 / 0.723 / 0.840 | 3.9x |
+
+Real inputs were small symlink subsets of
+`/home/sean/Desktop/spiral_dataset_graph_uuid/verified_patches`, staged in
+`/tmp/vc-overlap-perf/patches` and `patches24`. The 24-patch subset was the first
+24 sorted directories with at most 6 MB of TIFF geometry, giving 434,673 seed
+samples and 50 bounding-box candidate pairs. The synthetic input contained
+three 321x321 grids with curvature, small displacements, reflection and a hole,
+using sample spacing 1 to exercise the 4,096-correspondence cap. No full
+collection was tested; these timings do not predict full-collection runtime.
+
+Phase profiling identified correspondence collection as the bottleneck:
+on 24 patches its median fell from 1.389 s to 0.144 s (9.6x), and spatial
+queries fell from 3,902,813 to 408,683. Loading, indexing, fitting and agreement
+checks accounted for much less time. All accepted links (1, 9 and 3 respectively)
+and their complete fit metadata matched the original exactly across all runs.
+Regression tests additionally compare serial/parallel capped fits, cancellation,
+callback thread identity and batched/individual nearest queries.
+
+Build with `ninja -C build vc_graph_import vc_graph_bindings test_graph_links
+test_surface_patch_index`. The benchmark harness in `/tmp/vc-overlap-perf/bench.py`
+times the command below, with a new output basename for each run. The original
+executable and core library were saved in that temporary directory for comparison;
+benchmark inputs and output graphs are not repository files.
+
+```sh
+VC_PATCH_OVERLAP_PROFILE=1 build/bin/vc_graph_import \
+  --db /tmp/vc-overlap-perf/example.vcgr --author overlap-perf \
+  --link-patch-overlaps /tmp/vc-overlap-perf/patches24 --no-progress \
+  --export-json /tmp/vc-overlap-perf/example.json
+```
+
+Setting `VC_PATCH_OVERLAP_PROFILE` emits one `PATCH_OVERLAP_PROFILE` JSON line
+on stderr with phase timings and query counts. Profiling is off by default.
+
 ### Fiber-to-patch graph links
+
+`vc_graph_import` reports progress on stderr by default for every import and
+linking operation. It shows the current stage, completed/total counts and a bar
+when the total is known, elapsed time, and an estimated remaining time once
+progress is available. A heartbeat continues during individual slow loads,
+spatial-index builds, and database commits. Redirected output uses periodic
+plain-text lines; `--no-progress` disables reporting. Final reports stay on stdout.
+
+C++ callers can provide `vc::util::ProgressCallback` through detector
+`params.progress` or the optional last argument of the metadata import functions.
+The library itself does not print progress. `vc::util::TerminalProgress` is the
+shared CLI renderer, also used by `vc_zarr_download_region`; finish it before
+printing an operation's summary. Callback string views must be copied if retained.
 
 `vc_graph_import` proposes pending fiber-to-patch links using CT sheet normals:
 

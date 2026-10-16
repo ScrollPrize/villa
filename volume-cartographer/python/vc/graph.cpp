@@ -629,7 +629,8 @@ NB_MODULE(graph, m)
                 for (auto item : kwargs) {
                     const std::string key = nb::cast<std::string>(item.first);
                     const nb::handle val = item.second;
-                    if (key == "tolerance") p.tolerance = nb::cast<double>(val);
+                    if (key == "workers") p.workers = nb::cast<int>(val);
+                    else if (key == "tolerance") p.tolerance = nb::cast<double>(val);
                     else if (key == "sample_spacing") p.sampleSpacing = nb::cast<double>(val);
                     else if (key == "thinning_spacing") p.thinningSpacing = nb::cast<double>(val);
                     else if (key == "max_correspondences") p.maxCorrespondences = nb::cast<std::size_t>(val);

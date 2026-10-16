@@ -4,6 +4,7 @@
 
 #include "vc/core/graph/GraphDb.hpp"
 #include "vc/core/graph_links/GraphLinks.hpp"
+#include "vc/core/util/TerminalProgress.hpp"
 
 #include <exception>
 #include <filesystem>
@@ -21,6 +22,7 @@ void usage()
 {
     std::cerr
         << "usage: vc_graph_import --db <graph.vcgr> --author <name> [options]\n"
+        << "  --no-progress        disable terminal progress reporting (stderr)\n"
         << "  --fibers <dir>       import vc3d_fiber JSON files (objects + branch edges)\n"
         << "  --segments <dir>     register segment dirs with meta.json as patch objects\n"
         << "  --tracks <file>      register tracks from a JSON interchange list\n"
@@ -36,6 +38,7 @@ void usage()
         << "  --link-patch-overlaps <dir>\n"
         << "                       run the patch-overlap detector over the tifxyz\n"
         << "                       segment dirs in <dir>; creates pending edges\n"
+        << "  --overlap-workers <n>            search workers (default 0: auto, up to 8)\n"
         << "  --overlap-tolerance <vx>          (default 2)\n"
         << "  --overlap-uv-tolerance <vx>       (default 3)\n"
         << "  --overlap-sample-spacing <vx>     (default 4)\n"
@@ -83,6 +86,7 @@ try {
     vc::graph_links::TrackPatchParams trackPatchParams;
     vc::graph_links::FiberPatchParams fiberPatchParams;
     bool linkTracks = false;
+    bool showProgress = true;
     vc::graph_links::TrackTrackParams trackParams;
     std::string author;
     vc::graph_links::PatchOverlapParams overlapParams;
@@ -92,7 +96,8 @@ try {
             if (++i >= argc) throw std::runtime_error(std::string("missing value for ") + flag);
             return argv[i];
         };
-        if (arg == "--db") dbPath = next("--db");
+        if (arg == "--no-progress") showProgress = false;
+        else if (arg == "--db") dbPath = next("--db");
         else if (arg == "--author") author = next("--author");
         else if (arg == "--fibers") fiberDir = next("--fibers");
         else if (arg == "--segments") segmentsDir = next("--segments");
@@ -118,6 +123,7 @@ try {
         else if (arg == "--track-tangent-radius") trackParams.tangentRadiusVoxels = std::stod(next(arg.c_str()));
         else if (arg == "--track-cluster-radius") trackParams.clusterIndexRadius = std::stoi(next(arg.c_str()));
         else if (arg == "--link-patch-overlaps") overlapDir = next("--link-patch-overlaps");
+        else if (arg == "--overlap-workers") overlapParams.workers = std::stoi(next(arg.c_str()));
         else if (arg == "--overlap-tolerance") overlapParams.tolerance = std::stod(next(arg.c_str()));
         else if (arg == "--overlap-uv-tolerance") overlapParams.uvInlierTolerance = std::stod(next(arg.c_str()));
         else if (arg == "--overlap-sample-spacing") overlapParams.sampleSpacing = std::stod(next(arg.c_str()));
@@ -165,31 +171,48 @@ try {
     options.author = author;
     std::error_code ec;
     const bool exists = fs::exists(dbPath) && fs::file_size(dbPath, ec) > 0;
-    GraphDb db = exists ? GraphDb::open(dbPath, options) : GraphDb::create(dbPath, options);
+    GraphDb db = [&] {
+        vc::util::TerminalProgress progress("Open graph database", showProgress);
+        auto graph = exists ? GraphDb::open(dbPath, options) : GraphDb::create(dbPath, options);
+        progress.finish();
+        return graph;
+    }();
     if (!exists)
         std::cout << "created " << dbPath.string() << "\n";
 
     if (!fiberDir.empty()) {
+        vc::util::TerminalProgress progress("Import fibers", showProgress);
         auto w = db.write();
-        ImportReport report = importFibers(db, w, fiberDir);
+        ImportReport report = importFibers(db, w, fiberDir, progress.callback());
+        vc::util::reportProgress(progress.callback(), "committing transaction");
         w.commit();
+        progress.finish();
         printReport("fibers", report);
     }
     if (!segmentsDir.empty() && linkFiberDir.empty() && linkTrackPath.empty()) {
+        vc::util::TerminalProgress progress("Import patches", showProgress);
         auto w = db.write();
-        ImportReport report = importPatches(db, w, segmentsDir);
+        ImportReport report = importPatches(db, w, segmentsDir, progress.callback());
+        vc::util::reportProgress(progress.callback(), "committing transaction");
         w.commit();
+        progress.finish();
         printReport("segments", report);
     }
     if (!tracksPath.empty()) {
+        vc::util::TerminalProgress progress("Import tracks", showProgress);
         auto w = db.write();
-        ImportReport report = importTrackList(db, w, tracksPath);
+        ImportReport report = importTrackList(db, w, tracksPath, progress.callback());
+        vc::util::reportProgress(progress.callback(), "committing transaction");
         w.commit();
+        progress.finish();
         printReport("tracks", report);
     }
     bool trackLinkFailed = false;
     if (linkTracks) {
+        vc::util::TerminalProgress progress("Track crossings", showProgress);
+        trackParams.progress = progress.callback();
         const auto report = vc::graph_links::linkTracksToTracks(db, trackParams);
+        progress.finish();
         std::cout << "track-tracks: " << report.objectsConsidered << " tracks, "
                   << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
                   << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
@@ -198,7 +221,10 @@ try {
         trackLinkFailed = !report.problems.empty();
     }
     if (!overlapDir.empty()) {
+        vc::util::TerminalProgress progress("Patch overlaps", showProgress);
+        overlapParams.progress = progress.callback();
         const auto report = vc::graph_links::linkPatchOverlaps(db, overlapDir, overlapParams);
+        progress.finish();
         std::cout << "patch-overlaps: " << report.objectsConsidered << " patches, "
                   << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
                   << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
@@ -206,8 +232,11 @@ try {
             std::cerr << "  ! " << problem << "\n";
     }
     if (!linkTrackPath.empty()) {
+        vc::util::TerminalProgress progress("Track to patch", showProgress);
+        trackPatchParams.progress = progress.callback();
         const auto report = vc::graph_links::linkTracksToPatches(
             db, linkTrackPath, segmentsDir, ctVolume, trackPatchParams);
+        progress.finish();
         std::cout << "track-patches: " << report.objectsConsidered << " objects, "
                   << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
                   << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
@@ -216,8 +245,11 @@ try {
         trackLinkFailed |= !report.problems.empty();
     }
     if (!linkFiberDir.empty()) {
+        vc::util::TerminalProgress progress("Fiber to patch", showProgress);
+        fiberPatchParams.progress = progress.callback();
         const auto report = vc::graph_links::linkFibersToPatches(
             db, linkFiberDir, segmentsDir, ctVolume, fiberPatchParams);
+        progress.finish();
         std::cout << "fiber-patches: " << report.objectsConsidered << " objects, "
                   << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
                   << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
@@ -225,26 +257,37 @@ try {
             std::cerr << "  ! " << problem << "\n";
     }
     if (!importJsonPath.empty()) {
+        vc::util::TerminalProgress progress("Import JSON", showProgress);
+        vc::util::reportProgress(progress.callback(), "reading JSON");
         std::ifstream in(importJsonPath);
         if (!in) throw std::runtime_error("cannot read " + importJsonPath.string());
         std::ostringstream ss;
         ss << in.rdbuf();
+        vc::util::reportProgress(progress.callback(), "importing objects and edges");
         auto w = db.write();
         db.importJson(w, ss.str());
+        vc::util::reportProgress(progress.callback(), "committing transaction");
         w.commit();
+        progress.finish();
         std::cout << "imported JSON from " << importJsonPath.string() << "\n";
     }
     if (!exportJsonPath.empty()) {
+        vc::util::TerminalProgress progress("Export JSON", showProgress);
+        vc::util::reportProgress(progress.callback(), "serializing graph");
         std::string json;
         {
             auto r = db.read();
             json = db.exportJson(r);
         }
+        vc::util::reportProgress(progress.callback(), "checkpointing database");
         db.checkpoint();
+        vc::util::reportProgress(progress.callback(), "writing JSON");
         if (exportJsonPath == "-") {
             std::cout << json << "\n";
+            progress.finish();
         } else {
             std::ofstream(exportJsonPath) << json << "\n";
+            progress.finish();
             std::cout << "exported to " << exportJsonPath.string() << "\n";
         }
     }

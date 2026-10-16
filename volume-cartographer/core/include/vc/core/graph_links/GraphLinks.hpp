@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "vc/core/graph/GraphDb.hpp"
+#include "vc/core/util/Progress.hpp"
 
 namespace vc::graph_links {
 
@@ -79,7 +80,8 @@ struct StaleEdgeScope {
 DetectorReport commitCandidates(graph::GraphDb& db, const std::string& detectorName, int detectorVersion,
                                 const std::vector<LinkCandidate>& candidates,
                                 bool replaceStalePending = true,
-                                const StaleEdgeScope* staleScope = nullptr);
+                                const StaleEdgeScope* staleScope = nullptr,
+                                const util::ProgressCallback& progress = {});
 
 // Same operation in a caller-owned transaction. The caller commits/rolls back;
 // permits atomic registration of new objects together with their links.
@@ -87,7 +89,8 @@ DetectorReport commitCandidates(graph::GraphDb& db, graph::WriteTxn& txn,
                                 const std::string& detectorName, int detectorVersion,
                                 const std::vector<LinkCandidate>& candidates,
                                 bool replaceStalePending = true,
-                                const StaleEdgeScope* staleScope = nullptr);
+                                const StaleEdgeScope* staleScope = nullptr,
+                                const util::ProgressCallback& progress = {});
 
 // --- Detectors ---
 // Patch overlap, fiber->patch, track->track and track->patch are implemented; the rest are placeholders that
@@ -99,6 +102,8 @@ DetectorReport commitCandidates(graph::GraphDb& db, graph::WriteTxn& txn,
 // (spiral-fitting's patch_merger, merging-patches branch). Distances
 // are in base-volume voxels unless noted.
 struct PatchOverlapParams {
+    int workers = 0; // 0: auto, at most 8; positive: requested search concurrency
+    util::ProgressCallback progress; // optional; no terminal output from the library
     // 3D distance within which two surface points are the same sheet.
     // Used for correspondence search and (with uvInlierTolerance) the
     // dense 3D agreement radius.
@@ -149,6 +154,7 @@ DetectorReport linkPatchOverlaps(graph::GraphDb& db, const std::filesystem::path
 // original 7-row ribbon: stripRowsEachSide rows at stripSpacing on
 // each side of the centerline (default: one row at 20 vx each side).
 struct LinePatchParams {
+    util::ProgressCallback progress; // optional; no terminal output from the library
     // Isotropic coordinate multipliers: source XYZ * scale = working XYZ.
     // All detector distances are working voxels. Working XYZ multiplied by
     // workingToBaseScale / ctToBaseScale addresses selected CT voxels.
@@ -234,6 +240,7 @@ DetectorReport linkTracksToFibers(graph::GraphDb& db, const TrackFiberParams& pa
                                   const std::atomic_bool* cancel = nullptr);
 
 struct TrackTrackParams {
+    util::ProgressCallback progress; // optional; no terminal output from the library
     // DBM logical path (also accepts .dbm.db) or packed .vctracks directory.
     // Nonempty: discover/register tracks and compute links, atomically.
     // Empty: link already registered tracks as before.

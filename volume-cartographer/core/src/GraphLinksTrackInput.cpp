@@ -61,9 +61,10 @@ size_t trackRow(const PackedTrackStore& store, const graph::ObjectRecord& object
 }
 TrackInput loadTrackInput(graph::GraphDb& db, const std::filesystem::path& path,
     const std::vector<uint64_t>& sourceIds, const std::vector<std::string>& trackUuids,
-    const std::atomic_bool* cancel)
+    const std::atomic_bool* cancel, const util::ProgressCallback& progress)
 {
     checkCancelled(cancel);
+    util::reportProgress(progress, "opening track dataset");
     TrackInput result;
     std::set<std::string> requested(trackUuids.begin(), trackUuids.end());
     std::vector<graph::ObjectRecord> registered;
@@ -103,6 +104,7 @@ TrackInput loadTrackInput(graph::GraphDb& db, const std::filesystem::path& path,
     auto& objects = result.objects;
     for (size_t row = 0; row < store.sourceIds().size(); ++row) {
         checkCancelled(cancel);
+        if ((row & 16383) == 0) util::reportProgress(progress, "selecting tracks", row, store.sourceIds().size());
         const auto id = store.sourceIds()[row];
         if (!selectedIds.empty() && !selectedIds.contains(id)) continue;
         const auto found = existing.find(id);
@@ -132,6 +134,7 @@ TrackInput loadTrackInput(graph::GraphDb& db, const std::filesystem::path& path,
         throw std::runtime_error("some requested source IDs are missing or outside the UUID selection");
     if (!requested.empty() && objects.size() != requested.size())
         throw std::runtime_error("some requested track UUIDs were not found in the selected dataset");
+    util::reportProgress(progress, "selecting tracks", store.sourceIds().size(), store.sourceIds().size());
     result.packedPath = packedPath;
     return result;
 }

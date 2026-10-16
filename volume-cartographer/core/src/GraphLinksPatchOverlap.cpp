@@ -14,8 +14,15 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
+#include <future>
+#include <thread>
 #include <map>
+#include <set>
+#include <unordered_set>
 #include <unordered_map>
 #include <utility>
 
@@ -28,6 +35,27 @@
 
 namespace vc::graph_links {
 namespace {
+
+struct PhaseTimer {
+    using Clock = std::chrono::steady_clock;
+    double* seconds;
+    Clock::time_point start;
+    explicit PhaseTimer(double* value) : seconds(value), start(value ? Clock::now() : Clock::time_point{}) {}
+    ~PhaseTimer() { if (seconds) *seconds += std::chrono::duration<double>(Clock::now() - start).count(); }
+};
+struct Profile {
+    bool enabled = std::getenv("VC_PATCH_OVERLAP_PROFILE") != nullptr;
+    double loading = 0, index = 0, harvest = 0, fit = 0, agreement = 0;
+    uint64_t bboxPairs = 0, queries = 0, fitPairs = 0, samples = 0;
+    ~Profile() {
+        if (enabled) {
+            const nlohmann::json out{{"loading_s", loading}, {"index_s", index}, {"harvest_s", harvest},
+                {"fit_s", fit}, {"agreement_s", agreement}, {"bbox_pairs", bboxPairs},
+                {"queries", queries}, {"fit_pairs", fitPairs}, {"samples", samples}};
+            std::fprintf(stderr, "PATCH_OVERLAP_PROFILE %s\n", out.dump().c_str());
+        }
+    }
+};
 
 struct Vec2 {
     double x = 0.0, y = 0.0;
@@ -64,6 +92,7 @@ struct LoadedPatch {
     std::filesystem::path path;
     std::string uuid;
     std::shared_ptr<QuadSurface> surface;
+    const cv::Mat_<cv::Vec3f>* points = nullptr; // stable for this read-only detector run
     cv::Vec2f scale = {1.0f, 1.0f};
     std::vector<SamplePoint> samples;                  // strided by sampleSpacing
     cv::Vec3f bboxLow, bboxHigh;
@@ -109,7 +138,7 @@ std::optional<std::pair<cv::Vec3f, cv::Vec3f>> tangentsAt(
 // Bilinear xyz sample at metric UV; nullopt on invalid quad.
 std::optional<cv::Vec3f> sampleXyz(const LoadedPatch& patch, Vec2 uv)
 {
-    const auto* points = patch.surface->rawPointsPtr();
+    const auto* points = patch.points;
     double col = uv.x * patch.scale[0];
     double row = uv.y * patch.scale[1];
     const int c0 = int(std::floor(col));
@@ -153,6 +182,7 @@ std::optional<LoadedPatch> loadPatch(const std::filesystem::path& dir, const Pat
         return std::nullopt;
     }
     const auto* points = patch.surface->rawPointsPtr();
+    patch.points = points;
     const int stepR = std::max(1, int(std::llround(params.sampleSpacing * patch.scale[1])));
     const int stepC = std::max(1, int(std::llround(params.sampleSpacing * patch.scale[0])));
     patch.bboxLow = {1e30f, 1e30f, 1e30f};
@@ -190,54 +220,146 @@ struct Correspondence {
     std::uint64_t cell = 0;
 };
 
-std::vector<Correspondence> harvest(const LoadedPatch& seed, const LoadedPatch& target,
-                                    const SurfacePatchIndex& index, const PatchOverlapParams& params)
+// Keep the same lowest splitmix64(cell) ranks as the original final truncation,
+// but discard cells that can never survive as soon as the cap is reached.
+// This bounds memory when collecting many targets during one seed pass.
+class CorrespondenceCollector {
+public:
+    explicit CorrespondenceCollector(size_t limit) : limit_(limit) {}
+    void add(Correspondence c)
+    {
+        auto found = byCell_.find(c.cell);
+        if (found != byCell_.end()) {
+            if (c.distance < found->second.distance) found->second = c;
+            return;
+        }
+        if (byCell_.size() == limit_) {
+            if (ranks_.empty())
+                for (const auto& [cell, value] : byCell_) ranks_.emplace(splitmix64(cell), cell);
+            const auto rank = splitmix64(c.cell);
+            auto worst = std::prev(ranks_.end());
+            if (rank > worst->first) return; // splitmix64 is a bijection: no ties
+            byCell_.erase(worst->second);
+            ranks_.erase(worst);
+            ranks_.emplace(rank, c.cell);
+        }
+        byCell_.emplace(c.cell, c);
+    }
+    void merge(const CorrespondenceCollector& other)
+    {
+        for (const auto& [cell, c] : other.byCell_) add(c);
+    }
+    std::vector<Correspondence> take() const
+    {
+        std::vector<Correspondence> out;
+        out.reserve(byCell_.size());
+        for (const auto& [cell, c] : byCell_) out.push_back(c);
+        return out;
+    }
+private:
+    size_t limit_;
+    std::map<uint64_t, Correspondence> byCell_;
+    std::map<uint64_t, uint64_t> ranks_;
+};
+
+void addCorrespondence(const SamplePoint& sample, const LoadedPatch& target,
+    const SurfacePatchIndex::LookupResult& hit, const PatchOverlapParams& params,
+    CorrespondenceCollector& collector)
 {
-    std::map<std::uint64_t, Correspondence> byCell;
-    const auto* targetPoints = target.surface->rawPointsPtr();
-    for (const auto& sample : seed.samples) {
-        SurfacePatchIndex::PointQuery query;
-        query.worldPoint = sample.xyz;
-        query.tolerance = float(params.tolerance);
-        query.surfaces.only = target.surface;
-        const auto hit = index.locate(query);
-        if (!hit) continue;
-        const cv::Vec2f grid = target.surface->ptrToGrid(hit->ptr);  // (col, row)
-        const Vec2 targetUv{grid[0] / double(target.scale[0]), grid[1] / double(target.scale[1])};
-        const auto targetXyz = sampleXyz(target, targetUv);
-        if (!targetXyz) continue;
-        const cv::Vec3f delta = *targetXyz - sample.xyz;
-        const float distance = std::sqrt(delta.dot(delta));
-        if (distance > params.tolerance) continue;
-        const int row = std::clamp(int(std::lround(grid[1])), 0, targetPoints->rows - 1);
-        const int col = std::clamp(int(std::lround(grid[0])), 0, targetPoints->cols - 1);
-        const auto tangents = tangentsAt(*targetPoints, row, col, target.scale);
-        if (!tangents) continue;
-        Correspondence c;
-        c.seed = sample.uv;
-        c.target = targetUv;
-        c.seedTangentU = sample.tangentU;
-        c.seedTangentV = sample.tangentV;
-        c.targetTangentU = tangents->first;
-        c.targetTangentV = tangents->second;
-        c.distance = distance;
-        const auto cx = std::uint32_t(std::int32_t(std::floor(c.seed.x / params.thinningSpacing)));
-        const auto cy = std::uint32_t(std::int32_t(std::floor(c.seed.y / params.thinningSpacing)));
-        c.cell = (std::uint64_t(cy) << 32) | cx;
-        auto [it, inserted] = byCell.try_emplace(c.cell, c);
-        if (!inserted && c.distance < it->second.distance) it->second = c;
+    const auto* targetPoints = target.points;
+    const cv::Vec2f grid = target.surface->ptrToGrid(hit.ptr);
+    const Vec2 targetUv{grid[0] / double(target.scale[0]), grid[1] / double(target.scale[1])};
+    const auto targetXyz = sampleXyz(target, targetUv);
+    if (!targetXyz) return;
+    const cv::Vec3f delta = *targetXyz - sample.xyz;
+    const float distance = std::sqrt(delta.dot(delta));
+    if (distance > params.tolerance) return;
+    const int row = std::clamp(int(std::lround(grid[1])), 0, targetPoints->rows - 1);
+    const int col = std::clamp(int(std::lround(grid[0])), 0, targetPoints->cols - 1);
+    const auto tangents = tangentsAt(*targetPoints, row, col, target.scale);
+    if (!tangents) return;
+    Correspondence c;
+    c.seed = sample.uv;
+    c.target = targetUv;
+    c.seedTangentU = sample.tangentU;
+    c.seedTangentV = sample.tangentV;
+    c.targetTangentU = tangents->first;
+    c.targetTangentV = tangents->second;
+    c.distance = distance;
+    const auto cx = std::uint32_t(std::int32_t(std::floor(c.seed.x / params.thinningSpacing)));
+    const auto cy = std::uint32_t(std::int32_t(std::floor(c.seed.y / params.thinningSpacing)));
+    c.cell = (std::uint64_t(cy) << 32) | cx;
+    collector.add(c);
+}
+
+std::map<size_t, CorrespondenceCollector> harvestTargets(const LoadedPatch& seed,
+    const std::vector<LoadedPatch>& patches, const std::vector<size_t>& targets,
+    const SurfacePatchIndex& index, const PatchOverlapParams& params,
+    const std::atomic_bool* cancel, Profile& profile)
+{
+    std::map<size_t, CorrespondenceCollector> matches;
+    if (targets.empty()) return matches;
+    std::unordered_map<QuadSurface*, size_t> targetIndex;
+    std::unordered_set<QuadSurface*> included;
+    for (const auto ti : targets) {
+        targetIndex.emplace(patches[ti].surface.get(), ti);
+        included.insert(patches[ti].surface.get());
     }
-    std::vector<Correspondence> out;
-    out.reserve(byCell.size());
-    for (auto& [cell, c] : byCell) out.push_back(c);
-    if (out.size() > params.maxCorrespondences) {
-        std::sort(out.begin(), out.end(),
-                  [](const Correspondence& a, const Correspondence& b) { return splitmix64(a.cell) < splitmix64(b.cell); });
-        out.resize(params.maxCorrespondences);
-        std::sort(out.begin(), out.end(),
-                  [](const Correspondence& a, const Correspondence& b) { return a.cell < b.cell; });
+    using Matches = std::map<size_t, CorrespondenceCollector>;
+    std::atomic_size_t completed{0};
+    const auto label = seed.path.filename().string() + " -> " + std::to_string(targets.size()) + " patches";
+    auto harvestRange = [&](size_t begin, size_t end) {
+        Matches local;
+        SurfacePatchIndex::SurfaceFilter filter;
+        filter.includeRaw = &included;
+        std::array<cv::Vec3f, 512> points;
+        for (size_t first = begin; first < end; first += points.size()) {
+            if (cancel && cancel->load()) return local;
+            const size_t count = std::min(points.size(), end - first);
+            for (size_t i = 0; i < count; ++i) points[i] = seed.samples[first+i].xyz;
+            index.locateAllBatch(std::span(points.data(), count), float(params.tolerance), filter,
+                [&](size_t i, const auto& hits) {
+                    const auto& sample = seed.samples[first+i];
+                    // Same traversal and tie handling as individual locate()
+                    // calls, amortizing the shared lock across this batch.
+                    for (const auto& hit : hits) {
+                        const auto ti = targetIndex.at(hit.surface.get());
+                        auto [it, inserted] = local.try_emplace(ti, params.maxCorrespondences);
+                        addCorrespondence(sample, patches[ti], hit, params, it->second);
+                    }
+                });
+            completed.fetch_add(count, std::memory_order_relaxed);
+        }
+        return local;
+    };
+    const size_t requested = params.workers ? size_t(params.workers)
+        : std::min(8u, std::max(1u, std::thread::hardware_concurrency()));
+    const size_t workers = std::min(requested, std::max(size_t(1), seed.samples.size() / 16384));
+    util::reportProgress(params.progress, "finding patch correspondences", 0, seed.samples.size(), label);
+    std::vector<std::future<Matches>> jobs;
+    // Even one worker uses an asynchronous range so the caller can keep
+    // reporting progress and checking cancellation during a long search.
+    for (size_t worker = 0; worker < workers; ++worker) {
+        const size_t begin = seed.samples.size() * worker / workers;
+        const size_t end = seed.samples.size() * (worker + 1) / workers;
+        jobs.push_back(std::async(std::launch::async, harvestRange, begin, end));
     }
-    return out;
+    for (auto& job : jobs) {
+        while (job.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready)
+            util::reportProgress(params.progress, "finding patch correspondences",
+                completed.load(std::memory_order_relaxed), seed.samples.size(), label);
+        // Ranges merge in source order, preserving first-sample wins on exact
+        // distance ties. A globally retained cell must be in each range's top K
+        // if present there, so the per-range caps preserve the final selection.
+        for (auto& [ti, collector] : job.get()) {
+            auto [it, inserted] = matches.try_emplace(ti, params.maxCorrespondences);
+            it->second.merge(collector);
+        }
+    }
+    profile.queries += completed.load();
+    util::reportProgress(params.progress, "finding patch correspondences",
+        completed.load(), seed.samples.size(), label);
+    return matches;
 }
 
 double tangentMismatchSq(const Pose& pose, const Correspondence& v)
@@ -516,6 +638,7 @@ void validateParams(const PatchOverlapParams& params)
     positive(params.minMajorSpread, "minMajorSpread");
     positive(params.minMinorSpread, "minMinorSpread");
     positive(params.maxRefitRms, "maxRefitRms");
+    if (params.workers < 0) throw std::invalid_argument("graph links: workers must be nonnegative");
     if (params.maxCorrespondences == 0 || params.minInliers < 2 || params.ransacMaxHypotheses == 0)
         throw std::invalid_argument("graph links: correspondence/inlier/hypothesis counts must be positive");
     if (!(params.ransacConfidence > 0.0 && params.ransacConfidence < 1.0))
@@ -534,6 +657,9 @@ DetectorReport linkPatchOverlaps(graph::GraphDb& db, const std::filesystem::path
                                  const PatchOverlapParams& params, const std::atomic_bool* cancel)
 {
     validateParams(params);
+    Profile profile;
+    const auto& progress = params.progress;
+    util::reportProgress(progress, "scanning patch directory");
     DetectorReport report;
     auto cancelled = [&] { return cancel && cancel->load(); };
 
@@ -544,22 +670,29 @@ DetectorReport linkPatchOverlaps(graph::GraphDb& db, const std::filesystem::path
     std::sort(dirs.begin(), dirs.end());
 
     std::vector<LoadedPatch> patches;
+    size_t loadedCount = 0;
     for (const auto& dir : dirs) {
+        util::reportProgress(progress, "loading patches", loadedCount++, dirs.size(), dir.filename().string());
         if (cancelled()) {
             report.problems.push_back("patch-overlap: cancelled during loading");
             return report;
         }
+        PhaseTimer loadingTimer(profile.enabled ? &profile.loading : nullptr);
         if (auto loaded = loadPatch(dir, params, report))
             patches.push_back(std::move(*loaded));
     }
+    util::reportProgress(progress, "loading patches", dirs.size(), dirs.size());
     report.objectsConsidered = int64_t(patches.size());
+    for (const auto& patch : patches) profile.samples += patch.samples.size();
 
     // Register any patch objects the DB does not know about yet, so edges
     // always have endpoints. Existing registrations are left untouched.
     {
         auto txn = db.write();
         const auto dbDir = db.path().parent_path();
+        size_t registered = 0;
         for (const auto& patch : patches) {
+            util::reportProgress(progress, "registering patches", registered++, patches.size());
             if (db.objectByUuid(txn, patch.uuid)) continue;
             graph::ObjectRecord rec;
             rec.uuid = patch.uuid;
@@ -580,42 +713,67 @@ DetectorReport linkPatchOverlaps(graph::GraphDb& db, const std::filesystem::path
             rec.patch = detail;
             db.upsertObject(txn, rec);
         }
+        util::reportProgress(progress, "registering patches", patches.size(), patches.size());
         txn.commit();
     }
 
     // Triangle-accurate spatial index over every loaded patch, as in
-    // vc_seg_add_overlap; correspondences query it per target patch.
+    // vc_seg_add_overlap; each seed sample queries all eligible targets at once.
+    util::reportProgress(progress, "building patch spatial index");
     SurfacePatchIndex index;
     index.setSamplingStride(1);
     {
         std::vector<SurfacePatchIndex::SurfacePtr> surfaces;
         surfaces.reserve(patches.size());
         for (const auto& patch : patches) surfaces.push_back(patch.surface);
+        PhaseTimer indexTimer(profile.enabled ? &profile.index : nullptr);
         index.rebuild(surfaces, float(params.tolerance));
     }
 
     const double agreementRadius = params.tolerance + params.uvInlierTolerance;
     std::vector<LinkCandidate> candidates;
     std::map<std::string, std::size_t> rejections;
+    const uint64_t totalPairs = patches.empty() ? 0 : uint64_t(patches.size()) * (patches.size() - 1) / 2;
+    uint64_t processedPairs = 0;
+    util::reportProgress(progress, "checking patch pairs", 0, totalPairs);
     for (std::size_t si = 0; si < patches.size(); ++si) {
-        for (std::size_t ti = si + 1; ti < patches.size(); ++ti) {
+        const LoadedPatch& seed = patches[si];
+        std::vector<size_t> targets;
+        for (size_t ti = si + 1; ti < patches.size(); ++ti)
+            if (bboxOverlap(seed, patches[ti], params.tolerance)) targets.push_back(ti);
+        profile.bboxPairs += targets.size();
+        auto matches = [&] {
+            PhaseTimer timer(profile.enabled ? &profile.harvest : nullptr);
+            return harvestTargets(seed, patches, targets, index, params, cancel, profile);
+        }();
+        if (cancelled()) {
+            report.problems.push_back("patch-overlap: cancelled");
+            return report;
+        }
+        processedPairs += patches.size() - si - 1;
+        util::reportProgress(progress, "checking patch pairs", processedPairs, totalPairs);
+        for (auto& [ti, collector] : matches) {
             if (cancelled()) {
                 report.problems.push_back("patch-overlap: cancelled");
                 return report;
             }
-            const LoadedPatch& seed = patches[si];
             const LoadedPatch& target = patches[ti];
-            if (!bboxOverlap(seed, target, params.tolerance)) continue;
-
-            const auto correspondences = harvest(seed, target, index, params);
+            const auto correspondences = collector.take();
             if (correspondences.size() < params.minInliers) continue;
             const std::uint64_t pairSeed = splitmix64(std::uint64_t(si + 1) * 0x9E3779B9ULL ^ std::uint64_t(ti + 1));
-            FitResult fit = fitPair(correspondences, params, pairSeed);
+            ++profile.fitPairs;
+            FitResult fit = [&] {
+                PhaseTimer timer(profile.enabled ? &profile.fit : nullptr);
+                return fitPair(correspondences, params, pairSeed);
+            }();
             if (!fit.accepted) {
                 ++rejections[fit.rejection.empty() ? "rejected" : fit.rejection];
                 continue;
             }
-            const Consistency consistency = overlapConsistency(seed, target, fit.pose, agreementRadius);
+            const Consistency consistency = [&] {
+                PhaseTimer timer(profile.enabled ? &profile.agreement : nullptr);
+                return overlapConsistency(seed, target, fit.pose, agreementRadius);
+            }();
             if (consistency.samples < params.minInliers) {
                 ++rejections["insufficient_overlap_samples"];
                 continue;
@@ -627,6 +785,7 @@ DetectorReport linkPatchOverlaps(graph::GraphDb& db, const std::filesystem::path
             }
             double overlapFraction = 0.0;
             if (params.minOverlapFraction > 0.0) {
+                PhaseTimer timer(profile.enabled ? &profile.agreement : nullptr);
                 const Consistency reverse = overlapConsistency(target, seed, fit.pose.inverse(), agreementRadius);
                 const double seedFraction = consistency.total ? double(consistency.agreements) / double(consistency.total) : 0.0;
                 const double targetFraction = reverse.total ? double(reverse.agreements) / double(reverse.total) : 0.0;
@@ -656,10 +815,11 @@ DetectorReport linkPatchOverlaps(graph::GraphDb& db, const std::filesystem::path
             candidates.push_back(std::move(candidate));
         }
     }
+    util::reportProgress(progress, "checking patch pairs", totalPairs, totalPairs);
     for (const auto& [reason, count] : rejections)
         report.problems.push_back("patch-overlap: " + std::to_string(count) + " pair(s) rejected: " + reason);
 
-    DetectorReport committed = commitCandidates(db, kPatchOverlapDetector, 1, candidates, params.replaceStalePending);
+    DetectorReport committed = commitCandidates(db, kPatchOverlapDetector, 1, candidates, params.replaceStalePending, nullptr, progress);
     report.candidatesFound = committed.candidatesFound;
     report.edgesCreated = committed.edgesCreated;
     report.edgesSkippedExisting = committed.edgesSkippedExisting;

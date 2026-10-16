@@ -1,3 +1,4 @@
+#include "vc/core/util/TerminalProgress.hpp"
 #include "vc/core/render/ChunkFetch.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -182,75 +183,23 @@ std::uint64_t voxelCount(const Bounds& bounds)
     return z * y * x;
 }
 
-std::string progressBar(std::size_t done, std::size_t total)
-{
-    constexpr int WIDTH = 24;
-    const double fraction =
-        total > 0 ? std::clamp(static_cast<double>(done) / static_cast<double>(total), 0.0, 1.0)
-                  : 1.0;
-    const int filled = static_cast<int>(std::round(fraction * WIDTH));
-    return "[" + std::string(static_cast<std::size_t>(filled), '#') +
-           std::string(static_cast<std::size_t>(WIDTH - filled), '-') + "]";
-}
-
-void writeProgressLine(
-    bool tty,
-    std::size_t done,
-    std::size_t total,
-    std::size_t cached,
-    std::size_t missing,
-    std::size_t errors)
-{
-    const double percent =
-        total > 0 ? 100.0 * static_cast<double>(done) / static_cast<double>(total) : 100.0;
-    std::ostringstream line;
-    line << progressBar(done, total) << ' ' << std::fixed << std::setprecision(1)
-         << percent << "%  " << done << '/' << total
-         << "  cached=" << cached
-         << " missing=" << missing
-         << " errors=" << errors;
-    if (tty)
-        std::cerr << '\r' << line.str() << std::flush;
-    else
-        std::cerr << line.str() << '\n';
-}
-
 class DownloadProgress {
 public:
-    explicit DownloadProgress(std::size_t total)
-        : total_(total)
-        , tty_(isatty(fileno(stderr)) != 0)
-    {
-    }
-
+    explicit DownloadProgress(std::size_t total) : total_(total), progress_("Download") {}
     void update(std::size_t done, std::size_t cached, std::size_t missing, std::size_t errors)
     {
-        const auto now = std::chrono::steady_clock::now();
-        std::lock_guard lock(mutex_);
-        if (!tty_ && done != total_ &&
-            now - lastPrint_ < std::chrono::seconds(1) && done != 0) {
-            return;
-        }
-        if (tty_ && done != total_ &&
-            now - lastPrint_ < std::chrono::milliseconds(100) && done != 0) {
-            return;
-        }
-        lastPrint_ = now;
-        writeProgressLine(tty_, done, total_, cached, missing, errors);
+        const auto detail = "cached=" + std::to_string(cached) + " missing=" + std::to_string(missing)
+            + " errors=" + std::to_string(errors);
+        progress_.update({"chunks", done, total_, detail});
     }
-
     void finish(std::size_t done, std::size_t cached, std::size_t missing, std::size_t errors)
     {
-        std::lock_guard lock(mutex_);
-        writeProgressLine(tty_, done, total_, cached, missing, errors);
-        std::cerr << '\n';
+        update(done, cached, missing, errors);
+        progress_.finish();
     }
-
 private:
-    std::size_t total_ = 0;
-    bool tty_ = false;
-    std::mutex mutex_;
-    std::chrono::steady_clock::time_point lastPrint_;
+    std::size_t total_;
+    vc::util::TerminalProgress progress_;
 };
 
 } // namespace

@@ -1514,9 +1514,11 @@ Anchor branchAnchor(const nlohmann::json& j, const char* indexKey, const char* p
 
 }  // namespace
 
-ImportReport importFibers(GraphDb& db, WriteTxn& txn, const std::filesystem::path& fiberDir)
+ImportReport importFibers(GraphDb& db, WriteTxn& txn, const std::filesystem::path& fiberDir,
+    const util::ProgressCallback& progress)
 {
     ImportReport report;
+    util::reportProgress(progress, "scanning fiber directory");
     struct Parsed {
         std::filesystem::path path;
         std::string fileName;
@@ -1534,7 +1536,9 @@ ImportReport importFibers(GraphDb& db, WriteTxn& txn, const std::filesystem::pat
     }
     std::sort(files.begin(), files.end());
 
+    size_t fileIndex = 0;
     for (const auto& file : files) {
+        util::reportProgress(progress, "reading fibers", fileIndex++, files.size(), file.filename().string());
         nlohmann::json root;
         std::string text;
         try {
@@ -1611,9 +1615,13 @@ ImportReport importFibers(GraphDb& db, WriteTxn& txn, const std::filesystem::pat
         parsed.push_back(std::move(p));
     }
 
+    util::reportProgress(progress, "reading fibers", files.size(), files.size());
+
     // Objects first (edges need their endpoints to exist). Unchanged
     // files (same uuid + content hash) are skipped: re-import is a no-op.
+    size_t objectIndex = 0;
     for (const auto& p : parsed) {
+        util::reportProgress(progress, "registering fibers", objectIndex++, parsed.size());
         if (auto existing = db.objectByUuid(txn, p.object.uuid)) {
             if (existing->dataChecksum && *existing->dataChecksum == p.checksum) {
                 db.setFiberLength(txn, p.object.uuid, p.object.fiber->length);
@@ -1623,6 +1631,8 @@ ImportReport importFibers(GraphDb& db, WriteTxn& txn, const std::filesystem::pat
         db.upsertObject(txn, p.object);
         ++report.objectsImported;
     }
+
+    util::reportProgress(progress, "registering fibers", parsed.size(), parsed.size());
 
     auto hasReciprocal = [&](const Parsed& owner, const ParsedBranch& b) {
         auto it = byFileName.find(b.targetFile);
@@ -1635,7 +1645,9 @@ ImportReport importFibers(GraphDb& db, WriteTxn& txn, const std::filesystem::pat
     };
 
     std::set<std::string> seenPairs;
+    size_t branchIndex = 0;
     for (const auto& p : parsed) {
+        util::reportProgress(progress, "importing fiber branches", branchIndex++, parsed.size());
         for (const auto& b : p.branches) {
             auto it = byFileName.find(b.targetFile);
             if (it == byFileName.end()) {
@@ -1677,17 +1689,22 @@ ImportReport importFibers(GraphDb& db, WriteTxn& txn, const std::filesystem::pat
             ++report.edgesImported;
         }
     }
+    util::reportProgress(progress, "importing fiber branches", parsed.size(), parsed.size());
     return report;
 }
 
-ImportReport importPatches(GraphDb& db, WriteTxn& txn, const std::filesystem::path& segmentsDir)
+ImportReport importPatches(GraphDb& db, WriteTxn& txn, const std::filesystem::path& segmentsDir,
+    const util::ProgressCallback& progress)
 {
     ImportReport report;
+    util::reportProgress(progress, "scanning patch directory");
     std::vector<std::filesystem::path> dirs;
     for (const auto& entry : std::filesystem::directory_iterator(segmentsDir))
         if (entry.is_directory()) dirs.push_back(entry.path());
     std::sort(dirs.begin(), dirs.end());
+    size_t index = 0;
     for (const auto& dir : dirs) {
+        util::reportProgress(progress, "registering patches", index++, dirs.size(), dir.filename().string());
         const auto metaPath = dir / "meta.json";
         if (!std::filesystem::exists(metaPath)) continue;
         nlohmann::json root;
@@ -1718,12 +1735,15 @@ ImportReport importPatches(GraphDb& db, WriteTxn& txn, const std::filesystem::pa
         db.upsertObject(txn, o);
         ++report.objectsImported;
     }
+    util::reportProgress(progress, "registering patches", dirs.size(), dirs.size());
     return report;
 }
 
-ImportReport importTrackList(GraphDb& db, WriteTxn& txn, const std::filesystem::path& trackListJson)
+ImportReport importTrackList(GraphDb& db, WriteTxn& txn, const std::filesystem::path& trackListJson,
+    const util::ProgressCallback& progress)
 {
     ImportReport report;
+    util::reportProgress(progress, "reading track list");
     nlohmann::json root;
     try {
         root = nlohmann::json::parse(readFile(trackListJson));
@@ -1741,6 +1761,7 @@ ImportReport importTrackList(GraphDb& db, WriteTxn& txn, const std::filesystem::
             registered[{existing.track->datasetRef, existing.track->externalKey}] = existing;
 
     for (size_t i = 0; i < root.size(); ++i) {
+        util::reportProgress(progress, "registering tracks", i, root.size());
         const auto& entry = root.at(i);
         const std::string label = "entry " + std::to_string(i);
         if (!entry.is_object()) {
@@ -1790,6 +1811,7 @@ ImportReport importTrackList(GraphDb& db, WriteTxn& txn, const std::filesystem::
             ++report.objectsImported;
         }
     }
+    util::reportProgress(progress, "registering tracks", root.size(), root.size());
     return report;
 }
 

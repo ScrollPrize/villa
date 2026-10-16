@@ -179,14 +179,17 @@ std::shared_ptr<QuadSurface> buildStrip(const LineData& fiber, const SheetNormal
     for (int c = 0; c < cols; ++c) center[c] = atArc(columns[c]);
     for (int c = 0; c < cols; ++c)
         tangent[c] = unit(center[std::min(c + 1, cols - 1)] - center[std::max(c - 1, 0)]);
+    util::reportProgress(params.progress, "sampling centerline normals", 0, cols);
     bool anyNormal = false;
     for (int c = 0; c < cols; ++c) {
         checkCancelled(cancel);
+        util::reportProgress(params.progress, "sampling centerline normals", c, cols);
         const auto sample = sampler.sampleNormal(center[c], cancel);
         badNormal[c] = !sample.valid || cv::norm(sample.normal) < 1e-6;
         normal[c] = badNormal[c] ? cv::Vec3d{0, 0, 0} : unit(sample.normal);
         anyNormal |= !badNormal[c];
     }
+    util::reportProgress(params.progress, "sampling centerline normals", cols, cols);
     if (!anyNormal)
         throw std::runtime_error("no valid sheet normals along fiber " + fiber.uuid);
     int previous = -1;
@@ -222,7 +225,9 @@ std::shared_ptr<QuadSurface> buildStrip(const LineData& fiber, const SheetNormal
     for (int c = 0; c < cols; ++c) xyz[size_t(middle) * cols + c] = center[c];
     // Columns march independently. Start where the centerline pass finished
     // so its most recent CT gradient tiles can be reused before eviction.
+    util::reportProgress(params.progress, "marching normal strips", 0, cols);
     for (int c = cols; c-- > 0;) {
+        util::reportProgress(params.progress, "marching normal strips", cols - c - 1, cols);
         checkCancelled(cancel);
         for (int side : {-1, 1}) {
             if (rowsEachSide == 0) break;
@@ -248,6 +253,7 @@ std::shared_ptr<QuadSurface> buildStrip(const LineData& fiber, const SheetNormal
     // Contract inner-bend rows before they can fold across the centerline.
     std::vector<double> radius(cols, std::numeric_limits<double>::infinity());
     std::vector<cv::Vec3d> curvatureDir(cols, cv::Vec3d{0, 0, 0});
+    util::reportProgress(params.progress, "marching normal strips", cols, cols);
     for (int c = 1; c + 1 < cols; ++c) {
         const auto dt = tangent[c + 1] - tangent[c - 1];
         const double angle = std::asin(std::clamp(cv::norm(tangent[c + 1].cross(tangent[c - 1])), 0.0, 1.0));
@@ -496,10 +502,13 @@ void autoLink(const LineData& fiber, std::vector<Proposal>& proposals, const std
               const SheetNormalSource& sampler, const LinePatchParams& p, const std::atomic_bool* cancel)
 {
     if (proposals.empty()) return;
-    const Surface strip(buildStrip(fiber, sampler, p, cancel));
+    const auto stripGeometry = buildStrip(fiber, sampler, p, cancel);
+    util::reportProgress(p.progress, "indexing normal strip");
+    const Surface strip(stripGeometry);
     std::vector<size_t> fresh;
     std::vector<std::unique_ptr<Relation>> relations(proposals.size());
     for (size_t i = 0; i < proposals.size(); ++i) {
+        util::reportProgress(p.progress, "checking contact anchors", i, proposals.size());
         auto& c = proposals[i];
         const auto& patch = *patches[c.patch].surface;
         c.contact = contactLength(fiber, c.contacts, p.contactGap);
@@ -519,6 +528,7 @@ void autoLink(const LineData& fiber, std::vector<Proposal>& proposals, const std
             if (proposals[i].round < 0) pending.push_back(i);
         const size_t width = std::min<size_t>(8, std::max(1u, std::thread::hardware_concurrency()));
         for (size_t first = 0; first < pending.size(); first += width) {
+            util::reportProgress(p.progress, "growing linked patches", first, pending.size());
             std::vector<std::future<void>> jobs;
             for (size_t j = first; j < std::min(first + width, pending.size()); ++j)
                 jobs.push_back(std::async(std::launch::async, [&, i = pending[j]] {
@@ -528,6 +538,7 @@ void autoLink(const LineData& fiber, std::vector<Proposal>& proposals, const std
                 }));
             for (auto& job : jobs) job.get();
         }
+        util::reportProgress(p.progress, "growing linked patches", pending.size(), pending.size());
         fresh.clear();
         for (size_t i : pending) {
             auto& c = proposals[i];
@@ -595,7 +606,9 @@ DetectorReport linkLinesToPatches(graph::GraphDb& db, size_t lineCount, const Li
     DetectorReport report;
     try {
         checkCancelled(cancel);
+        util::reportProgress(params.progress, "opening normal source");
         const SheetNormalSource sampler(ctVolume, params);
+        util::reportProgress(params.progress, "scanning patch directory");
         std::vector<std::filesystem::path> dirs;
         for (const auto& e : std::filesystem::directory_iterator(patchesDir))
             if (e.is_directory() && std::filesystem::exists(e.path() / "meta.json")) dirs.push_back(e.path());
@@ -606,7 +619,9 @@ DetectorReport linkLinesToPatches(graph::GraphDb& db, size_t lineCount, const Li
                 throw std::runtime_error("graph links: duplicate input UUID " + uuid);
         };
         std::vector<Patch> patches;
+        size_t patchNumber = 0;
         for (const auto& dir : dirs) {
+            util::reportProgress(params.progress, "loading patches", patchNumber++, dirs.size(), dir.filename().string());
             checkCancelled(cancel);
             std::shared_ptr<QuadSurface> quad;
             std::unique_ptr<Surface> surface;
@@ -639,6 +654,7 @@ DetectorReport linkLinesToPatches(graph::GraphDb& db, size_t lineCount, const Li
             unique(uuid);
             patches.push_back({dir, uuid, std::move(surface)});
         }
+        util::reportProgress(params.progress, "loading patches", dirs.size(), dirs.size());
         report.objectsConsidered = int64_t(patches.size());
         std::vector<graph::ObjectRecord> registrations;
         // One discovery index finds every patch touched by each dense line
@@ -651,6 +667,7 @@ DetectorReport linkLinesToPatches(graph::GraphDb& db, size_t lineCount, const Li
             surfaces.push_back(patches[i].surface->quad);
             patchIndex.emplace(surfaces.back().get(), i);
         }
+        util::reportProgress(params.progress, "building patch discovery index");
         discovery.rebuild(surfaces);
         std::vector<LinkCandidate> candidates;
         StaleEdgeScope scope{{params.edgeKind}, {}};
@@ -659,21 +676,32 @@ DetectorReport linkLinesToPatches(graph::GraphDb& db, size_t lineCount, const Li
         settings[tracks ? "track_scale" : "fiber_scale"] = sourceScale;
         for (size_t input = 0; input < lineCount; ++input) {
             checkCancelled(cancel);
+            util::reportProgress(params.progress, "loading lines", input, lineCount);
             auto loaded = load(input, report);
             if (!loaded) continue;
             const auto& fiber = *loaded;
             unique(fiber.uuid);
             ++report.objectsConsidered;
             registrations.push_back(fiber.object);
+            const auto item = std::to_string(input + 1) + "/" + std::to_string(lineCount) + " " + fiber.path.filename().string();
+            auto lineParams = params;
+            if (params.progress) lineParams.progress = [&](const util::ProgressUpdate& event) {
+                util::reportProgress(params.progress, event.stage, event.completed, event.total, item);
+            };
             std::map<size_t, std::vector<size_t>> contacts;
             for (size_t i = fiber.firstLine; i <= fiber.lastLine; ++i) {
-                if ((i & 255) == 0) checkCancelled(cancel);
+                if ((i & 255) == 0 || i == fiber.firstLine) {
+                    checkCancelled(cancel);
+                    util::reportProgress(lineParams.progress, "finding patch contacts", i - fiber.firstLine, fiber.lastLine - fiber.firstLine + 1);
+                }
                 SurfacePatchIndex::PointQuery q;
                 q.worldPoint = cv::Vec3f(fiber.line[i]);
                 q.tolerance = float(params.proximity);
                 for (const auto& hit : discovery.locateAll(q))
                     contacts[patchIndex.at(hit.surface.get())].push_back(i);
             }
+            util::reportProgress(lineParams.progress, "finding patch contacts",
+                fiber.lastLine - fiber.firstLine + 1, fiber.lastLine - fiber.firstLine + 1);
             std::vector<Proposal> proposals;
             for (auto& [patch, lines] : contacts)
                 if (lines.size() >= params.minContacts) {
@@ -683,7 +711,7 @@ DetectorReport linkLinesToPatches(graph::GraphDb& db, size_t lineCount, const Li
                     proposals.push_back(std::move(proposal));
                 }
             try {
-                autoLink(fiber, proposals, patches, sampler, params, cancel);
+                autoLink(fiber, proposals, patches, sampler, lineParams, cancel);
             } catch (const std::exception& e) {
                 checkCancelled(cancel);
                 report.problems.push_back(fiber.path.filename().string() + ": " + e.what() + ", skipped");
@@ -750,6 +778,7 @@ DetectorReport linkLinesToPatches(graph::GraphDb& db, size_t lineCount, const Li
         checkCancelled(cancel);
         // Geometry work is complete before any registration writes. Preserve
         // existing metadata and approval; UUID kind conflicts abort atomically.
+        util::reportProgress(params.progress, "registering objects");
         auto txn = db.write();
         auto registerObject = [&](graph::ObjectRecord rec) {
             if (const auto existing = db.objectByUuid(txn, rec.uuid)) {
@@ -782,8 +811,9 @@ DetectorReport linkLinesToPatches(graph::GraphDb& db, size_t lineCount, const Li
             registerObject(rec);
         }
         checkCancelled(cancel);
-        const auto committed = commitCandidates(db, txn, detector, version, candidates, params.replaceStalePending, &scope);
+        const auto committed = commitCandidates(db, txn, detector, version, candidates, params.replaceStalePending, &scope, params.progress);
         checkCancelled(cancel);
+        util::reportProgress(params.progress, "committing objects and links");
         txn.commit();
         report.candidatesFound = committed.candidatesFound;
         report.edgesCreated = committed.edgesCreated;

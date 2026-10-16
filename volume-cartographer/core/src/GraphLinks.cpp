@@ -75,11 +75,12 @@ DetectorReport placeholder(graph::GraphDb& db, const char* detectorName,
 
 DetectorReport commitCandidates(graph::GraphDb& db, const std::string& detectorName, int detectorVersion,
                                 const std::vector<LinkCandidate>& candidates, bool replaceStalePending,
-                                const StaleEdgeScope* staleScope)
+                                const StaleEdgeScope* staleScope, const util::ProgressCallback& progress)
 {
     auto txn = db.write();
     auto report = commitCandidates(db, txn, detectorName, detectorVersion, candidates,
-                                   replaceStalePending, staleScope);
+                                   replaceStalePending, staleScope, progress);
+    util::reportProgress(progress, "committing links");
     txn.commit();
     return report;
 }
@@ -87,7 +88,7 @@ DetectorReport commitCandidates(graph::GraphDb& db, const std::string& detectorN
 DetectorReport commitCandidates(graph::GraphDb& db, graph::WriteTxn& txn,
                                 const std::string& detectorName, int detectorVersion,
                                 const std::vector<LinkCandidate>& candidates, bool replaceStalePending,
-                                const StaleEdgeScope* staleScope)
+                                const StaleEdgeScope* staleScope, const util::ProgressCallback& progress)
 {
     if (detectorName.empty())
         throw std::runtime_error("graph links: detector name must be non-empty");
@@ -103,6 +104,7 @@ DetectorReport commitCandidates(graph::GraphDb& db, graph::WriteTxn& txn,
         kinds.insert(scopedKinds.begin(), scopedKinds.end());
     }
 
+    util::reportProgress(progress, "reading existing links");
     std::unordered_map<std::string, EdgeRecord> existing;
     for (const auto& kind : kinds)
         for (auto& e : db.edgesByKind(txn, kind))
@@ -131,7 +133,9 @@ DetectorReport commitCandidates(graph::GraphDb& db, graph::WriteTxn& txn,
             if (!isDetectorsOwnEdge(e, detectorName)) continue;
             staleKeys.push_back(key);
         }
+        size_t removed = 0;
         for (const auto& key : staleKeys) {
+            util::reportProgress(progress, "removing stale links", removed++, staleKeys.size());
             db.removeEdge(txn, existing.at(key).uuid);
             ++report.staleRemoved;
             existing.erase(key);
@@ -139,7 +143,10 @@ DetectorReport commitCandidates(graph::GraphDb& db, graph::WriteTxn& txn,
     }
 
     std::set<std::string> seen;
+    size_t processed = 0;
+    util::reportProgress(progress, "writing links", 0, candidates.size());
     for (const auto& c : candidates) {
+        util::reportProgress(progress, "writing links", processed++, candidates.size());
         const std::string key = candidateKey(c);
         if (!seen.insert(key).second || existing.contains(key)) {
             ++report.edgesSkippedExisting;
@@ -164,6 +171,7 @@ DetectorReport commitCandidates(graph::GraphDb& db, graph::WriteTxn& txn,
         ++report.edgesCreated;
     }
 
+    util::reportProgress(progress, "writing links", candidates.size(), candidates.size());
     return report;
 }
 

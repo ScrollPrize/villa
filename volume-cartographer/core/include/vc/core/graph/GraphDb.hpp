@@ -7,6 +7,7 @@
 // generation with author/hostname/timestamp stamps, approval state)
 // plus an open-ended `meta` JSON object for caller-defined metadata.
 
+#include "vc/core/util/Progress.hpp"
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -252,13 +253,15 @@ struct ImportReport {
 // and one-sided entries are reported, never silently dropped. Runs in
 // the caller's WriteTxn. Idempotent: re-importing an unchanged file
 // (same uuid + same source content) is a no-op for that fiber.
-ImportReport importFibers(GraphDb& db, WriteTxn& txn, const std::filesystem::path& fiberDir);
+ImportReport importFibers(GraphDb& db, WriteTxn& txn, const std::filesystem::path& fiberDir,
+                         const util::ProgressCallback& progress = {});
 
 // Registers each immediate subdirectory of segmentsDir that contains a
 // meta.json with a "uuid" as a kind="patch" object. Reads nothing else
 // from segment directories (in particular, never overlapping.json)
 // and creates no edges.
-ImportReport importPatches(GraphDb& db, WriteTxn& txn, const std::filesystem::path& segmentsDir);
+ImportReport importPatches(GraphDb& db, WriteTxn& txn, const std::filesystem::path& segmentsDir,
+                         const util::ProgressCallback& progress = {});
 
 // Registers tracks from a JSON interchange file: an array of objects
 // with dataset_ref + external_key (the track identity) and optional
@@ -269,6 +272,7 @@ ImportReport importPatches(GraphDb& db, WriteTxn& txn, const std::filesystem::pa
 // Idempotent: an unchanged identity keeps its UUID and generation; a
 // changed entry updates in place. Geometry stays in the external
 // dataset; only metadata lands here.
-ImportReport importTrackList(GraphDb& db, WriteTxn& txn, const std::filesystem::path& trackListJson);
+ImportReport importTrackList(GraphDb& db, WriteTxn& txn, const std::filesystem::path& trackListJson,
+                         const util::ProgressCallback& progress = {});
 
 }  // namespace vc::graph

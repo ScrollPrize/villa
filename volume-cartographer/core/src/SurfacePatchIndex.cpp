@@ -176,6 +176,8 @@ struct RawSurfaceFilter {
     bool rejectAllIncludes = false;
     std::unordered_set<QuadSurface*> include;
     std::unordered_set<QuadSurface*> exclude;
+    const std::unordered_set<QuadSurface*>* includeView = nullptr;
+    const std::unordered_set<QuadSurface*>* excludeView = nullptr;
 
     bool accepts(QuadSurface* surface) const
     {
@@ -183,12 +185,14 @@ struct RawSurfaceFilter {
             return false;
         }
         if (hasInclude) {
-            const bool included = include.find(surface) != include.end();
+            const auto& selected = includeView ? *includeView : include;
+            const bool included = selected.find(surface) != selected.end();
             if (rejectAllIncludes || !included) {
                 return false;
             }
         }
-        return exclude.find(surface) == exclude.end();
+        return exclude.find(surface) == exclude.end() &&
+            (!excludeView || excludeView->find(surface) == excludeView->end());
     }
 };
 
@@ -199,8 +203,8 @@ RawSurfaceFilter makeRawSurfaceFilter(const SurfacePatchIndex::SurfaceFilter& fi
 
     if (filter.includeRaw) {
         raw.hasInclude = true;
-        raw.include = *filter.includeRaw;
-        raw.rejectAllIncludes = raw.include.empty();
+        raw.includeView = filter.includeRaw;
+        raw.rejectAllIncludes = filter.includeRaw->empty();
     } else if (filter.include) {
         raw.hasInclude = true;
         raw.include.reserve(filter.include->size());
@@ -213,7 +217,7 @@ RawSurfaceFilter makeRawSurfaceFilter(const SurfacePatchIndex::SurfaceFilter& fi
     }
 
     if (filter.excludeRaw) {
-        raw.exclude = *filter.excludeRaw;
+        raw.excludeView = filter.excludeRaw;
     }
     if (filter.exclude) {
         raw.exclude.reserve(filter.exclude->size());
@@ -2224,9 +2228,8 @@ SurfacePatchIndex::locateAny(const PointQuery& pointQuery) const
 
     const float toleranceSq = tol * tol;
 
-    // Filter directly against the caller's sets. makeRawSurfaceFilter copies
-    // the include/exclude sets per call, which is prohibitive when this runs
-    // per sample point with thousands of included surfaces.
+    // Filter directly against the caller's sets, avoiding even the shared-pointer
+    // set conversion used by makeRawSurfaceFilter.
     const SurfaceFilter& filter = pointQuery.surfaces;
     QuadSurface* const only = filter.only ? filter.only.get() : nullptr;
     if ((filter.includeRaw && filter.includeRaw->empty()) ||
@@ -2309,6 +2312,26 @@ std::vector<SurfacePatchIndex::LookupResult>
 SurfacePatchIndex::locateAll(const PointQuery& pointQuery) const
 {
     std::shared_lock<std::shared_mutex> lock(mutex_);
+    return locateAllUnlocked(pointQuery);
+}
+
+void SurfacePatchIndex::locateAllBatch(std::span<const cv::Vec3f> points, float tolerance,
+    const SurfaceFilter& surfaces,
+    const std::function<void(size_t, const std::vector<LookupResult>&)>& visitor) const
+{
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    PointQuery query;
+    query.tolerance = tolerance;
+    query.surfaces = surfaces;
+    for (size_t i = 0; i < points.size(); ++i) {
+        query.worldPoint = points[i];
+        visitor(i, locateAllUnlocked(query));
+    }
+}
+
+std::vector<SurfacePatchIndex::LookupResult>
+SurfacePatchIndex::locateAllUnlocked(const PointQuery& pointQuery) const
+{
     if (!impl_ || !impl_->tree || pointQuery.tolerance <= 0.0f ||
         !isFinitePoint(pointQuery.worldPoint)) {
         return {};
@@ -2334,12 +2357,12 @@ SurfacePatchIndex::locateAll(const PointQuery& pointQuery) const
         cv::Vec2f scale;
     };
     std::unordered_map<QuadSurface*, SurfaceInfo> surfaceInfoCache;
-    surfaceInfoCache.reserve(4);
     auto ensureSurfaceInfo = [&](QuadSurface* surface) -> const SurfaceInfo& {
         auto it = surfaceInfoCache.find(surface);
         if (it != surfaceInfoCache.end()) {
             return it->second;
         }
+        if (surfaceInfoCache.empty()) surfaceInfoCache.reserve(4);
         SurfaceInfo info{surface->center(), surface->scale()};
         auto [insertIt, _] = surfaceInfoCache.emplace(surface, info);
         return insertIt->second;
@@ -2350,7 +2373,6 @@ SurfacePatchIndex::locateAll(const PointQuery& pointQuery) const
         float distSq = std::numeric_limits<float>::infinity();
     };
     std::unordered_map<QuadSurface*, SurfaceHit> hits;
-    hits.reserve(8);
 
     auto processEntry = [&](const Impl::Entry& entry) {
         const Impl::PatchRecord& rec = entry.second;
@@ -2364,6 +2386,7 @@ SurfacePatchIndex::locateAll(const PointQuery& pointQuery) const
             return;
         }
 
+        if (hits.empty()) hits.reserve(8);
         auto& best = hits[rec.surface];
         if (hit.distSq > best.distSq) {
             return;

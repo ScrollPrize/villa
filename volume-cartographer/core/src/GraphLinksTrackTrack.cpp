@@ -34,6 +34,8 @@ DetectorReport linkTracksToTracks(graph::GraphDb& db, const TrackTrackParams& pa
         throw std::invalid_argument("source_ids requires a tracks DBM or packed directory");
     if (!params.tracksPath.empty() && !params.datasetRef.empty())
         throw std::invalid_argument("use tracksPath or datasetRef, not both");
+    const auto& progressCallback = params.progress;
+    util::reportProgress(progressCallback, "loading track registrations");
     DetectorReport report;
     std::vector<size_t> registrations;
     std::string registrationDataset;
@@ -49,7 +51,7 @@ DetectorReport linkTracksToTracks(graph::GraphDb& db, const TrackTrackParams& pa
             registered = db.objectsByKind(read, "track");
         }
         if (!params.tracksPath.empty()) {
-            auto input = detail::loadTrackInput(db, params.tracksPath, params.sourceIds, params.trackUuids, cancel);
+            auto input = detail::loadTrackInput(db, params.tracksPath, params.sourceIds, params.trackUuids, cancel, params.progress);
             registrationDataset = input.datasetRef;
             registrations = std::move(input.registrations);
             report.objectsConsidered = static_cast<int64_t>(input.objects.size());
@@ -75,6 +77,7 @@ DetectorReport linkTracksToTracks(graph::GraphDb& db, const TrackTrackParams& pa
             checkCancelled(cancel);
             const std::filesystem::path path(dataset);
             const auto resolved = path.is_absolute() ? path : db.path().parent_path() / path;
+            util::reportProgress(progressCallback, "opening track geometry", 0, 0, dataset);
             PackedTrackStore store(resolved);
             std::map<uint64_t, graph::ObjectRecord*> byId;
             for (auto& object : objects) {
@@ -88,7 +91,9 @@ DetectorReport linkTracksToTracks(graph::GraphDb& db, const TrackTrackParams& pa
             std::vector<uint64_t> sourceIds;
             std::vector<int8_t> families;
             std::vector<const graph::ObjectRecord*> rows;
+            size_t loaded = 0;
             for (const auto& [id, object] : byId) {
+                util::reportProgress(progressCallback, "loading track geometry", loaded++, byId.size());
                 checkCancelled(cancel);
                 const auto row = detail::trackRow(store, *object);
                 object->track->length = detail::trackPolylineLength(store, row, cancel);
@@ -107,11 +112,15 @@ DetectorReport linkTracksToTracks(graph::GraphDb& db, const TrackTrackParams& pa
                 rows.push_back(object);
                 scope.objectUuids.push_back(object->uuid);
             }
+            util::reportProgress(progressCallback, "loading track geometry", byId.size(), byId.size());
             const std::span<const int32_t> coordinates = wholeStore
                 ? store.coordinates() : std::span<const int32_t>(coordinateBuffer);
             std::vector<uint64_t> packed(coordinates.size() / 3);
             for (size_t i = 0; i < packed.size(); ++i) {
-                if (i % 500000 == 0) checkCancelled(cancel);
+                if (i % 500000 == 0) {
+                    checkCancelled(cancel);
+                    util::reportProgress(progressCallback, "packing track voxels", i, packed.size());
+                }
                 uint64_t key = 0;
                 for (int axis = 0; axis < 3; ++axis) {
                     const int32_t value = coordinates[3*i+axis];
@@ -121,7 +130,11 @@ DetectorReport linkTracksToTracks(graph::GraphDb& db, const TrackTrackParams& pa
                 }
                 packed[i] = key;
             }
-            auto progress = [cancel](const char*, uint64_t, uint64_t) { checkCancelled(cancel); };
+            util::reportProgress(progressCallback, "packing track voxels", packed.size(), packed.size());
+            auto progress = [&](const char* stage, uint64_t done, uint64_t total) {
+                checkCancelled(cancel);
+                util::reportProgress(progressCallback, stage, done, total);
+            };
             auto order = track_crossings::parallel_argsort(packed, params.workers, progress);
             auto events = track_crossings::scan_crossing_events(
                 coordinates, offsets, families, packed, order, params.workers, progress, crossingParams);
@@ -130,6 +143,7 @@ DetectorReport linkTracksToTracks(graph::GraphDb& db, const TrackTrackParams& pa
             const auto crossings = track_crossings::consolidate_crossing_events(
                 events, coordinates, offsets, sourceIds, params.workers, progress, crossingParams);
             for (size_t row = 0; row < rows.size(); ++row) {
+                util::reportProgress(progressCallback, "preparing crossing links", row, rows.size());
                 checkCancelled(cancel);
                 for (auto slot = crossings.offsets[row]; slot < crossings.offsets[row+1]; ++slot) {
                     const auto partner = crossings.partners[slot];
@@ -178,6 +192,7 @@ DetectorReport linkTracksToTracks(graph::GraphDb& db, const TrackTrackParams& pa
             }
         }
         checkCancelled(cancel);
+        util::reportProgress(progressCallback, "registering tracks");
         auto transaction = db.write();
         for (const auto row : registrations) {
             checkCancelled(cancel);
@@ -189,8 +204,9 @@ DetectorReport linkTracksToTracks(graph::GraphDb& db, const TrackTrackParams& pa
                 db.setTrackLength(transaction, object.uuid, object.track->length, object.track->family);
             }
         const auto committed = commitCandidates(db, transaction, kTrackTrackDetector, 1, candidates,
-                                                 params.replaceStalePending, &scope);
+                                                 params.replaceStalePending, &scope, progressCallback);
         checkCancelled(cancel);
+        util::reportProgress(progressCallback, "committing tracks and links");
         transaction.commit();
         report.candidatesFound = committed.candidatesFound;
         report.edgesCreated = committed.edgesCreated;

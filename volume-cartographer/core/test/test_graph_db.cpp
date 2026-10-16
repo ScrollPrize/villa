@@ -473,11 +473,18 @@ TEST_CASE("fiber importer: reciprocal, one-sided, unresolved, pending mapping")
 
     auto db = GraphDb::create(tmp.dir / "graph.vcgr", testOptions());
     ImportReport report;
+    std::set<std::string> stages;
     {
         auto w = db.write();
-        report = importFibers(db, w, dir);
+        report = importFibers(db, w, dir, [&](const vc::util::ProgressUpdate& update) {
+            CHECK((update.total == 0 || update.completed <= update.total));
+            stages.insert(std::string(update.stage));
+        });
         w.commit();
     }
+    CHECK(stages.contains("reading fibers"));
+    CHECK(stages.contains("registering fibers"));
+    CHECK(stages.contains("importing fiber branches"));
     CHECK(report.objectsImported == 3);
     CHECK(report.edgesImported == 2);
     REQUIRE(report.problems.size() == 2);  // one one-sided, one unresolved

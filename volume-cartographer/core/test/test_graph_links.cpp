@@ -8,12 +8,14 @@
 #endif
 
 #include <filesystem>
+#include <cmath>
 #include <functional>
 #include <fstream>
 #include <limits>
 #include <nlohmann/json.hpp>
 #include "vc/core/util/Uuid.hpp"
 #include <string>
+#include <thread>
 
 #include <opencv2/core.hpp>
 
@@ -197,7 +199,17 @@ TEST_CASE("patch overlap: reflected overlap linked, thin strip and disjoint reje
     REQUIRE(!b.empty());
 
     auto db = makeDb(tmp.dir);
-    const auto report = linkPatchOverlaps(db, patchesDir);
+    PatchOverlapParams params;
+    std::map<std::string, uint64_t> completed;
+    params.progress = [&](const vc::util::ProgressUpdate& update) {
+        CHECK((update.total == 0 || update.completed <= update.total));
+        completed[std::string(update.stage)] = update.completed;
+    };
+    const auto report = linkPatchOverlaps(db, patchesDir, params);
+    CHECK(completed.at("loading patches") == 4);
+    CHECK(completed.at("checking patch pairs") == 6);
+    CHECK(completed.contains("building patch spatial index"));
+    CHECK(completed.contains("committing links"));
     for (const auto& problem : report.problems) MESSAGE(problem.c_str());
     CHECK(report.objectsConsidered == 4);
     CHECK(report.edgesCreated == 1);
@@ -221,6 +233,52 @@ TEST_CASE("patch overlap: reflected overlap linked, thin strip and disjoint reje
     CHECK(again.edgesCreated == 0);
     CHECK(again.staleRemoved == 0);
     CHECK(edgeCount(db, a) == 1);
+}
+
+TEST_CASE("patch overlap: capped correspondences and parallel search are deterministic")
+{
+    TempDir tmp("patch_parallel");
+    const auto patches = tmp.dir / "patches";
+    writePatch(patches / "a", 257, 257, [](int r, int c) {
+        return cv::Vec3f(float(100+c), float(100+r), 100);
+    });
+    writePatch(patches / "b", 257, 257, [](int r, int c) {
+        return cv::Vec3f(float(356-c), float(100+r), 100);
+    });
+    writePatch(patches / "c", 257, 257, [](int r, int c) {
+        return cv::Vec3f(float(100+c + .1*std::sin(r/13.)), float(100+r), 100);
+    });
+    const auto callingThread = std::this_thread::get_id();
+    PatchOverlapParams params;
+    params.sampleSpacing = 1;
+    params.maxCorrespondences = 64;
+    params.progress = [&](const vc::util::ProgressUpdate&) {
+        CHECK(std::this_thread::get_id() == callingThread);
+    };
+    auto run = [&](int workers) {
+        params.workers = workers;
+        OpenOptions options; options.author = "test";
+        auto db = GraphDb::create(tmp.dir / (std::to_string(workers) + ".vcgr"), options);
+        REQUIRE(linkPatchOverlaps(db, patches, params).edgesCreated == 3);
+        std::map<std::pair<std::string, std::string>, std::string> evidence;
+        { auto read = db.read();
+          for (const auto& edge : db.edgesByKind(read, "same-surface")) {
+              evidence[{edge.aUuid, edge.bUuid}] = edge.meta;
+              CHECK(nlohmann::json::parse(edge.meta)["fit"]["correspondences"] == 64);
+          } }
+        return evidence;
+    };
+    CHECK(run(1) == run(4));
+    params.workers = -1;
+    auto db = makeDb(tmp.dir);
+    CHECK_THROWS(linkPatchOverlaps(db, patches, params));
+    params.workers = 4;
+    std::atomic_bool cancel{false};
+    params.progress = [&](const vc::util::ProgressUpdate& update) {
+        if (update.stage == "finding patch correspondences") cancel.store(true);
+    };
+    CHECK_FALSE(linkPatchOverlaps(db, patches, params, &cancel).problems.empty());
+    { auto read = db.read(); CHECK(db.edgesByKind(read, "same-surface").empty()); }
 }
 
 namespace {
@@ -296,7 +354,17 @@ TEST_CASE("fiber-patch: anchors, multi-round growth, strip gate and isolated clu
         writePatch(patches / ("wrong" + std::to_string(start)), 21, 71, [start](int r, int col) {
             return cv::Vec3f(float(start + 2 * col), float(108 + 2 * r), r == 10 ? 128.0f : 136.0f);
         });
-    const auto report = linkFibersToPatches(db, fibers, patches, ctVolume);
+    FiberPatchParams params;
+    std::map<std::string, uint64_t> completed;
+    params.progress = [&](const vc::util::ProgressUpdate& update) {
+        CHECK((update.total == 0 || update.completed <= update.total));
+        completed[std::string(update.stage)] = update.completed;
+    };
+    const auto report = linkFibersToPatches(db, fibers, patches, ctVolume, params);
+    CHECK(completed.at("loading patches") == 6);
+    CHECK(completed.at("sampling centerline normals") > 0);
+    CHECK(completed.at("marching normal strips") > 0);
+    CHECK(completed.contains("committing objects and links"));
     for (const auto& problem : report.problems) INFO(problem);
     CHECK(report.problems.empty());
     CHECK(report.objectsConsidered == 7);
@@ -675,7 +743,12 @@ TEST_CASE("track-patch uses fiber strip rules, raw anchors and existing track id
     // The crossing and patch detectors must reuse the same source identity.
     TrackTrackParams crossing;
     crossing.tracksPath = packed;
+    std::set<std::string> stages;
+    crossing.progress = [&](const vc::util::ProgressUpdate& update) { stages.insert(std::string(update.stage)); };
     REQUIRE(linkTracksToTracks(db, crossing).problems.empty());
+    CHECK(stages.contains("selecting tracks"));
+    CHECK(stages.contains("loading track geometry"));
+    CHECK(stages.contains("committing tracks and links"));
     std::string track;
     {
         auto read = db.read();

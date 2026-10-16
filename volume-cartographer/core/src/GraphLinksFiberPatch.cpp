@@ -102,6 +102,7 @@ DetectorReport linkFibersToPatches(graph::GraphDb& db, const std::filesystem::pa
         report.problems.push_back("fiber-patch: cancelled; no objects or edges committed");
         return report;
     }
+    util::reportProgress(params.progress, "scanning fiber directory");
     std::vector<std::filesystem::path> files;
     for (const auto& entry : std::filesystem::directory_iterator(fibersDir))
         if (entry.is_regular_file() && entry.path().extension() == ".json") files.push_back(entry.path());

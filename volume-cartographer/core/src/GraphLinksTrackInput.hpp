@@ -14,5 +14,5 @@ double trackPolylineLength(const PackedTrackStore& store, size_t row, const std:
 std::string trackFamily(const PackedTrackStore& store, size_t row);
 TrackInput loadTrackInput(graph::GraphDb& db, const std::filesystem::path& path,
     const std::vector<uint64_t>& sourceIds, const std::vector<std::string>& trackUuids,
-    const std::atomic_bool* cancel);
+    const std::atomic_bool* cancel, const util::ProgressCallback& progress = {});
 } // namespace vc::graph_links::detail

@@ -16,6 +16,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -128,6 +129,50 @@ TEST_CASE("locateAll returns all hits within tolerance")
     q.tolerance = 0.5f;
     auto rs = idx.locateAll(q);
     CHECK(rs.size() >= 1);
+}
+
+TEST_CASE("batched nearest hits preserve individual queries and raw filter precedence")
+{
+    SurfacePatchIndex index;
+    auto a = makeSurface(20, 20, 0.f);
+    auto b = makeSurface(20, 20, 0.f); // coincident geometry exercises ties
+    auto c = makeSurface(20, 20, 0.4f);
+    index.rebuild({a, b, c});
+    std::unordered_set<QuadSurface*> included{a.get(), b.get(), c.get()};
+    std::unordered_set<SurfacePatchIndex::SurfacePtr> includedShared{a};
+    std::unordered_set<QuadSurface*> excludedRaw{b.get()};
+    std::unordered_set<SurfacePatchIndex::SurfacePtr> excluded{c};
+    SurfacePatchIndex::SurfaceFilter filter;
+    filter.includeRaw = &included;
+    filter.include = &includedShared; // raw include takes precedence
+    filter.excludeRaw = &excludedRaw;
+    filter.exclude = &excluded; // exclusions combine
+    std::vector<cv::Vec3f> points;
+    for (int i = -2; i < 24; ++i) points.emplace_back(float(i), 5.25f, 0.2f);
+    index.locateAllBatch(points, 0.5f, filter, [&](size_t, const auto& hits) {
+        // Do not re-enter the index while the batch holds its lock.
+        CHECK(hits.size() <= 1);
+        if (!hits.empty()) CHECK(hits.front().surface == a);
+    });
+    filter.excludeRaw = nullptr; filter.exclude = nullptr;
+    std::vector<std::vector<SurfacePatchIndex::LookupResult>> batches;
+    index.locateAllBatch(points, 0.5f, filter,
+        [&](size_t i, const auto& hits) { CHECK(i == batches.size()); batches.push_back(hits); });
+    REQUIRE(batches[10].size() == 3);
+    for (size_t i = 0; i < points.size(); ++i) {
+        SurfacePatchIndex::PointQuery query;
+        query.worldPoint = points[i]; query.tolerance = 0.5f; query.surfaces = filter;
+        CHECK(index.locateAll(query).size() == batches[i].size());
+        for (const auto& hit : batches[i]) {
+            query.surfaces.only = hit.surface;
+            const auto single = index.locate(query);
+            REQUIRE(single.has_value());
+            CHECK(single->ptr == hit.ptr);
+            CHECK(single->distance == hit.distance);
+        }
+    }
+    included.clear(); // empty raw include rejects everything
+    index.locateAllBatch(points, 0.5f, filter, [&](size_t, const auto& hits) { CHECK(hits.empty()); });
 }
 
 TEST_CASE("locateSurfaces deduplicates surface results")

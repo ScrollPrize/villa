@@ -10,7 +10,7 @@ DetectorReport linkTracksToPatches(graph::GraphDb& db, const std::filesystem::pa
 {
     detail::validateLinePatchParams(params, params.trackScale);
     try {
-        const auto input = detail::loadTrackInput(db, tracksPath, params.sourceIds, params.trackUuids, cancel);
+        const auto input = detail::loadTrackInput(db, tracksPath, params.sourceIds, params.trackUuids, cancel, params.progress);
         const PackedTrackStore store(input.packedPath);
         auto load = [&](size_t index, DetectorReport& report) -> std::optional<detail::LineData> {
             const auto& object = input.objects[index];
