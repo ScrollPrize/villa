@@ -262,11 +262,17 @@ def select_layer_indices(
     return indices
 
 
-def _sliding_positions_1d(length: int, patch_size: int, stride: int) -> list[int]:
+def _sliding_positions_1d(
+    length: int, patch_size: int, stride: int, offset: int = 0
+) -> list[int]:
     if length <= patch_size:
         return [0]
-    positions = list(range(0, length - patch_size + 1, max(1, stride)))
     last = length - patch_size
+    start = min(max(0, int(offset)), last)
+    positions = list(range(start, last + 1, max(1, stride)))
+    if start > 0:
+        # A shifted grid still covers the first rows/columns.
+        positions.insert(0, 0)
     if positions[-1] != last:
         positions.append(last)
     return positions
@@ -278,24 +284,37 @@ def iter_blocks(
     stride: int,
     mask_lowres: np.ndarray | None = None,
     occupancy_scale: tuple[int, int] = (1, 1),
+    grid_offsets: Sequence[int] = (0,),
 ) -> list[Block]:
-    """Schedule flat patches, including a final boundary-aligned position."""
+    """Schedule flat patches, including a final boundary-aligned position.
+
+    Each value in ``grid_offsets`` adds one copy of the sliding grid whose
+    first interior position starts that many pixels in (along both axes).
+    All copies feed the same overlap-add accumulator, so the output is the
+    blend of the grid positions. Positions shared by several grids are
+    scheduled once.
+    """
 
     height, width = (int(value) for value in image_shape)
     scale_y, scale_x = (max(1, int(value)) for value in occupancy_scale)
     blocks: list[Block] = []
-    for y0 in _sliding_positions_1d(height, patch_size, stride):
-        valid_h = min(patch_size, height - y0)
-        for x0 in _sliding_positions_1d(width, patch_size, stride):
-            valid_w = min(patch_size, width - x0)
-            if mask_lowres is not None:
-                low_y0 = y0 // scale_y
-                low_x0 = x0 // scale_x
-                low_y1 = max(low_y0 + 1, math.ceil((y0 + valid_h) / scale_y))
-                low_x1 = max(low_x0 + 1, math.ceil((x0 + valid_w) / scale_x))
-                if not mask_lowres[low_y0:low_y1, low_x0:low_x1].any():
+    seen: set[tuple[int, int]] = set()
+    for offset in grid_offsets or (0,):
+        for y0 in _sliding_positions_1d(height, patch_size, stride, offset):
+            valid_h = min(patch_size, height - y0)
+            for x0 in _sliding_positions_1d(width, patch_size, stride, offset):
+                if (y0, x0) in seen:
                     continue
-            blocks.append(Block(y0, x0, valid_h, valid_w))
+                seen.add((y0, x0))
+                valid_w = min(patch_size, width - x0)
+                if mask_lowres is not None:
+                    low_y0 = y0 // scale_y
+                    low_x0 = x0 // scale_x
+                    low_y1 = max(low_y0 + 1, math.ceil((y0 + valid_h) / scale_y))
+                    low_x1 = max(low_x0 + 1, math.ceil((x0 + valid_w) / scale_x))
+                    if not mask_lowres[low_y0:low_y1, low_x0:low_x1].any():
+                        continue
+                blocks.append(Block(y0, x0, valid_h, valid_w))
     return blocks
 
 
@@ -1222,6 +1241,12 @@ def infer_single_zarr(
         overlap=args.overlap,
         explicit_stride=args.stride,
     )
+    grid_offsets = tuple(getattr(args, "tta_shift", None) or (0,))
+    if max(grid_offsets) >= stride:
+        raise ValueError(
+            f"--tta-shift offsets must be smaller than the stride ({stride}), "
+            f"got {list(grid_offsets)}"
+        )
     blend_mode = str(args.blend_mode)
     if blend_mode == "auto":
         blend_mode = "constant" if stride >= patch_size else "hann"
@@ -1239,7 +1264,7 @@ def infer_single_zarr(
     LOGGER.info(
         "Input level=%s shape=(depth=%d, height=%d, width=%d) "
         "chunks=(%d, %d) patch=%d stride=%d requested_overlap=%.3f "
-        "blend_mode=%s tta_mirror=%s",
+        "blend_mode=%s tta_mirror=%s tta_shift=%s",
         resolution,
         depth,
         height,
@@ -1251,6 +1276,7 @@ def infer_single_zarr(
         float(args.overlap),
         blend_mode,
         bool(args.tta_mirror),
+        list(grid_offsets) if grid_offsets != (0,) else None,
     )
     reader = FlatPatchReader(
         input_path=input_zarr,
@@ -1304,6 +1330,7 @@ def infer_single_zarr(
         stride,
         occupancy,
         occupancy_scale,
+        grid_offsets=grid_offsets,
     )
     LOGGER.info("Selected %d patches for inference", len(blocks))
     dataset = FlatBlockDataset(
@@ -1642,6 +1669,18 @@ def parse_args(argv: Sequence[str] | None = None):
         default="auto",
     )
     parser.add_argument("--tta-mirror", action="store_true")
+    parser.add_argument(
+        "--tta-shift",
+        type=int,
+        nargs="+",
+        metavar="PX",
+        help=(
+            "Also run the sliding grid shifted by these pixel offsets (both "
+            "axes) and blend all grid positions, e.g. '--tta-shift 0 4 8 12'. "
+            "Offsets must be smaller than the stride. Cost grows with the "
+            "number of offsets."
+        ),
+    )
     parser.add_argument("--tta-batch-size", type=int)
     parser.add_argument("--gpus")
     parser.add_argument("--compile-mode", default="reduce-overhead")
@@ -1660,6 +1699,10 @@ def parse_args(argv: Sequence[str] | None = None):
         parser.error("--batch-size must be positive")
     if args.tta_batch_size is not None and args.tta_batch_size <= 0:
         parser.error("--tta-batch-size must be positive")
+    if args.tta_shift is not None:
+        if any(offset < 0 for offset in args.tta_shift):
+            parser.error("--tta-shift offsets must be nonnegative")
+        args.tta_shift = sorted(set(args.tta_shift))
     try:
         args.gpu_ids = parse_gpu_ids(args.gpus)
     except ValueError as exc:

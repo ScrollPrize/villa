@@ -282,6 +282,35 @@ def test_blocks_occupancy_blend_accumulation_and_truncating_tiles():
     )
 
 
+def test_tta_shift_adds_offset_grids_without_losing_borders():
+    default = [(block.y0, block.x0) for block in iter_blocks((300, 300), 128, 64)]
+    assert default == [
+        (y0, x0) for y0 in (0, 64, 128, 172) for x0 in (0, 64, 128, 172)
+    ]
+    assert [
+        (block.y0, block.x0)
+        for block in iter_blocks((300, 300), 128, 64, grid_offsets=(0,))
+    ] == default
+
+    shifted = iter_blocks((300, 300), 128, 64, grid_offsets=(0, 4))
+    positions = [(block.y0, block.x0) for block in shifted]
+    assert len(positions) == len(set(positions))
+    assert set(default) <= set(positions)
+    offset_axis = (0, 4, 68, 132, 172)
+    assert {(y0, x0) for y0 in offset_axis for x0 in offset_axis} <= set(positions)
+    assert len(positions) == len(default) + 5 * 5 - 2 * 2
+    assert all(
+        block.valid_h == 128 and block.valid_w == 128 for block in shifted
+    )
+
+    assert parse_args(["in.zarr", "ck.pth", "out.tif"]).tta_shift is None
+    assert parse_args(
+        ["in.zarr", "ck.pth", "out.tif", "--tta-shift", "8", "0", "8", "4"]
+    ).tta_shift == [0, 4, 8]
+    with pytest.raises(SystemExit):
+        parse_args(["in.zarr", "ck.pth", "out.tif", "--tta-shift", "-4"])
+
+
 class _OrientationModel(nn.Module):
     def forward(self, image_BCZYX):
         depth_weights = torch.arange(
