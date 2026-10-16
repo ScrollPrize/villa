@@ -102,8 +102,9 @@ for view in vol.segments(min_coverage=0.5):   # segments with a mesh on this vol
 
 ## Reading zarr arrays
 
-`vc_reader.reader` reads zarr v2 arrays (OME-Zarr levels: CT volumes,
-predictions) from a local directory, `https://` or public `s3://`, optionally
+`vc_reader.reader` reads zarr v2 arrays and groups (OME-Zarr volumes and their
+levels: CT volumes, predictions) from a local directory, `http(s)://` or
+`s3://` (public, or with credentials), optionally
 through persistent disk caches and an in-memory chunk cache. The reading is
 done by a C++ extension (`vc_reader._native`, built by the pyproject with
 scikit-build-core and nanobind) on native threads without the GIL. Python only
@@ -124,6 +125,25 @@ block = r[8192:8704, 3584:4096, 3584:4096]
 ZarrReader.open("/data/volume.zarr/2")                # local array
 ZarrReader.open("s3://vesuvius-challenge-open-data/…/volume.zarr", level=2)
 shared = MemoryCache(16 << 30)                        # one budget for several readers
+
+vals = r.read_points(zyx)                             # (..., 3) ints -> stored values; outside: fill_value
+vals = r[z_idx, y_idx, x_idx]                         # numpy integer-array indexing, same path
+vals = r.sample(zyx_float)                            # trilinear, float32 (order=0: nearest, as stored)
+```
+
+Groups open their arrays with shared settings and one memory cache:
+
+```python
+from vc_reader.reader import ZarrGroup, S3Credentials
+
+g = ZarrGroup.open("s3://private-bucket/scroll.zarr", cache_dir="/data/cache", memory_cache=8 << 30)
+g.levels, g.attrs                                     # ("0", ..., "5") from OME multiscales, else "0", "1", ...
+r = g.level(2)                                        # ZarrReader; g["labels/ink"], "mask" in g, g.keys()
+vol.open_group()                                      # a catalog Volume's OME-Zarr root
+
+ZarrGroup.open(url, cache_dir="/data/cache", offline=True)   # only the disk caches, never the network
+ZarrReader.open("https://host/v.zarr/0", auth=("user", "password"))
+ZarrReader.open("s3://bucket/v.zarr/0", auth=S3Credentials(key_id, secret, region="us-east-1"))
 ```
 
 > [!NOTE]
@@ -137,6 +157,35 @@ shared = MemoryCache(16 << 30)                        # one budget for several r
 > readers is not shared there. Workers started with `spawn` or `forkserver`
 > receive a pickled reader, which is reopened the same way.
 
+- **Credentials** (`auth=`): the default `"auto"` signs `s3://` requests to
+  buckets without a known public https form with AWS credentials from the
+  environment (`AWS_ACCESS_KEY_ID`…, `AWS_PROFILE`, `~/.aws`; with botocore
+  installed also SSO and instance roles) when there are any, and reads
+  everything else anonymously. `"aws"` requires those credentials, which are
+  refreshed as they near expiry. `S3Credentials(...)` gives fixed keys (and
+  optionally `region`, `endpoint_url` for S3-compatible servers).
+  `(user, password)` is HTTP basic auth; `load_basic_auth(path)` reads the
+  JSON file vesuvius uses for `volume_auth_json`. Requests are signed with AWS
+  Signature V4 in the native code. 401/403 raise `PermissionError`: S3
+  answers 403 rather than 404 for an absent chunk unless the credentials may
+  list the bucket (`s3:ListBucket`), so sparse arrays in private buckets need
+  that permission.
+- **Offline** (`offline=True`, needs `cache_dir`): nothing is fetched. Array
+  and group metadata come from the disk caches (any supported layout); a chunk
+  none of them holds raises `vc_reader.CacheMissError`, and chunks the caches
+  mark as absent read as `fill_value`. Groups opened online with a writable
+  cache store their `.zgroup`/`.zattrs` there for later offline use.
+- **Points and sampling**: `read_points` gathers stored values at integer
+  indices; `sample` interpolates at real coordinates (voxel `i` at coordinate
+  `i`; `order=1` n-linear in float64, returned as float32 or float64, with
+  neighbours outside the array counting as `fill_value`, like
+  `scipy.ndimage.map_coordinates(mode="grid-constant")`; `order=0` nearest
+  with ties to even). Both run natively on the reader's threads and read each
+  chunk once per batch of 2^20 points, through the same caches as `read`.
+- **Groups**: `levels` follows the OME-NGFF `multiscales` datasets, else the
+  arrays `"0"`, `"1"`, … `keys()` lists local directories, consolidated
+  `.zmetadata`, S3 prefixes (ListObjectsV2) or, offline, the caches; plain
+  HTTP servers cannot be listed, so open children by name there.
 - **Codecs**: uncompressed, blosc and vc-delta3d chunks in C order. Other
   arrays (numcodecs filters, Fortran order, other compressors) raise
   `ValueError` when opened.
@@ -175,7 +224,7 @@ shared = MemoryCache(16 << 30)                        # one budget for several r
   `threads` threads (default 16 for local arrays, 32 for remote ones).
   Passing reused arrays as `out=` avoids the first-touch page faults of new
   memory.
-- **Remote reads**: anonymous GETs with libcurl, at most `connections=`
+- **Remote reads**: GETs with libcurl, at most `connections=`
   (default 16) in flight, a 10 s stall timeout and retries with backoff. A 404
   means fill. A chunk wanted by several reads at once is fetched once.
 - Readers pickle as their location plus metadata, so workers reopen them

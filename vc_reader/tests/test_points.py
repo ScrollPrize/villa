@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pickle
+import platform
 
 import pytest
 
@@ -59,6 +60,43 @@ def _linear(exp, pts):
             if w:
                 acc += w * padded[tuple(lo + c + 1)]
         out[n] = acc
+    return out
+
+
+# Without FMA contraction (x86-64 builds), sample() sums exactly as _linear_ordered does.
+MAX_ULP = 0 if platform.machine().lower() in ("x86_64", "amd64") else 4
+
+
+def _linear_ordered(exp, pts):
+    """n-linear interpolation formed in the reader's order: weights multiplied axis by axis,
+    corners summed with bit a stepping along the a-th off-grid axis. Fill outside, NaN if not finite."""
+    pts = np.asarray(pts, dtype=np.float64).reshape(-1, exp.ndim)
+    out = np.full(len(pts), np.nan)
+    finite = np.all(np.isfinite(pts), axis=1)
+    inside = finite & np.all((pts > -1) & (pts < np.asarray(exp.shape)), axis=1)
+    out[finite & ~inside] = FILL
+    lo = np.floor(pts[inside])
+    frac = pts[inside] - lo
+    lo = lo.astype(np.int64) + 1  # into the padded array
+    padded = np.pad(exp.astype(np.float64), 1, constant_values=FILL)
+    vals = np.empty(len(lo))
+    off_grid = frac != 0
+    for pattern in np.unique(off_grid, axis=0):
+        sel = np.all(off_grid == pattern, axis=1)
+        axes = np.flatnonzero(pattern)
+        acc = np.zeros(sel.sum())
+        for corner in range(2 ** len(axes)):
+            w = np.ones(sel.sum())
+            idx = lo[sel].copy()
+            for a, i in enumerate(axes):
+                if corner >> a & 1:
+                    w = w * frac[sel, i]
+                    idx[:, i] += 1
+                else:
+                    w = w * (1.0 - frac[sel, i])
+            acc = acc + w * padded[tuple(idx.T)]
+        vals[sel] = acc
+    out[inside] = vals
     return out
 
 
@@ -171,3 +209,37 @@ def test_points_over_http(tmp_path, data):
             r2.close()
     finally:
         httpd.shutdown()
+
+
+@pytest.mark.parametrize("read_mode", ["mmap", "slab"])
+@pytest.mark.parametrize("memory", [0, 64 << 20])
+def test_sample_linear_order_everywhere(array, read_mode, memory):
+    """Points read from one chunk, from several (chunk edges), from missing chunks, at the array's
+    edges, partly on the grid, and many in one chunk (split across threads) all sum the same way."""
+    root, exp = array
+    rng = np.random.default_rng(11)
+    sh, ch = np.asarray(SHAPE), np.asarray(CHUNKS)
+    edges = rng.integers(0, sh // ch + 2, size=(6000, 3)) * ch - 1 + rng.choice([0.0, 0.3, 0.999], size=(6000, 3))
+    wide = rng.uniform(-1.5, sh + 0.5, size=(6000, 3))
+    wide[:2000, 1] = np.round(wide[:2000, 1])  # on the grid along one axis
+    wide[2000:2500] = np.round(wide[2000:2500])  # on the grid
+    dense = 16 + rng.uniform(0.5, 14.5, size=(80000, 3))  # all in chunk (1, 1, 1), which is missing
+    dense2 = rng.uniform(0.5, 14.5, size=(80000, 3))  # all in chunk (0, 0, 0)
+    pts = np.concatenate([edges, wide, dense, dense2])
+    with ZarrReader.open(root, read_mode=read_mode, memory_cache=memory) as r:
+        got = r.sample(pts, dtype=np.float64)
+        np.testing.assert_array_max_ulp(got, _linear_ordered(exp, pts), maxulp=MAX_ULP)
+        np.testing.assert_array_equal(r.sample(pts), got.astype(np.float32))
+
+
+def test_point_reads_span_batches(array):
+    """More points than one native batch (2^20): every output still lands in its place."""
+    root, exp = array
+    rng = np.random.default_rng(12)
+    pts = rng.uniform(-1.5, np.asarray(SHAPE) + 0.5, size=((1 << 20) + 5000, 3))
+    with ZarrReader.open(root) as r:
+        ints = np.floor(pts).astype(np.int64)
+        np.testing.assert_array_equal(r.read_points(ints), _gather(exp, ints))
+        nearest = np.where((pts > -1) & (pts < np.asarray(SHAPE) + 1), np.rint(pts), -1).astype(np.int64)
+        np.testing.assert_array_equal(r.sample(pts, order=0), _gather(exp, nearest))
+        np.testing.assert_array_max_ulp(r.sample(pts, dtype=np.float64), _linear_ordered(exp, pts), maxulp=MAX_ULP)

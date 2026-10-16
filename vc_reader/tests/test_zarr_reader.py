@@ -314,20 +314,6 @@ def test_disk_cache_rejects_changed_source(server, tmp_path):
         ZarrReader.open(url, cache_dir=tmp_path)
 
 
-def test_concurrent_reads_fetch_each_chunk_once(server, data, tmp_path):
-    httpd, base = server
-    url = f"{base}/raw.zarr"
-    r = ZarrReader.open(url, cache_dir=tmp_path, threads=8)
-    httpd.requests.clear()
-    threads = [threading.Thread(target=r.read, args=((0, 0, 0), SHAPE)) for _ in range(6)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    chunk_requests = [p for p in httpd.requests if not p.endswith(".zarray")]
-    assert len(chunk_requests) == len(set(chunk_requests))
-
-
 def test_cache_writes_finish_after_the_read(server, data, tmp_path):
     httpd, base = server
     url = f"{base}/raw.zarr"

@@ -43,6 +43,22 @@ Local backends: `vc_reader` reads chunk files through memory maps (the
 default), `vc_reader:slab` through `pread`, and `vc_reader+memory` adds the
 memory cache.
 
+## Points and sampling: `bench_sample.py`
+
+```
+python benchmarks/bench_sample.py
+python benchmarks/bench_sample.py --reps 7 --compare results/sample-YYYYMMDD-HHMMSS.json
+```
+
+`read_points`, `sample(order=0)` and `sample(order=1)` on the default array
+above, warm (one untimed repetition first), through memory maps and through the
+memory cache. The point sets lie in one stored 1024³ region: 1M points uniform
+over it (`random`), a 16 × 512 × 512 sampling grid on a tilted plane (`patch`,
+an ink-detection patch), and 1M points in a 96³ box (`local`). Each scenario's
+output is hashed; `--compare` prints the speedup over an earlier results file
+and fails if any output differs from it, so a change can be shown to return
+exactly the same values.
+
 ## Remote reads: `bench_remote.py`
 
 ```

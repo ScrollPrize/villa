@@ -14,7 +14,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <cstring>
 #include <future>
@@ -22,6 +24,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -75,6 +78,61 @@ struct ElementType {
 // A chunk an offline read needs is in none of the disk layers.
 struct CacheMiss : std::runtime_error {
     using std::runtime_error::runtime_error;
+};
+
+// Linear chunk index -> dense id, for grouping point reads by chunk (open addressing).
+class ChunkIds {
+public:
+    // The id of `key` (>= 0); if absent, inserts it with id `fresh` and returns that.
+    std::uint32_t find_or_insert(std::int64_t key, std::uint32_t fresh)
+    {
+        if (2 * (size_ + 1) > keys_.size())
+            grow();
+        const std::size_t mask = keys_.size() - 1;
+        for (std::size_t i = slot(key);; i = (i + 1) & mask) {
+            if (keys_[i] == key)
+                return ids_[i];
+            if (keys_[i] == kEmpty) {
+                keys_[i] = key;
+                ids_[i] = fresh;
+                ++size_;
+                return fresh;
+            }
+        }
+    }
+
+private:
+    static constexpr std::int64_t kEmpty = -1;
+
+    std::size_t slot(std::int64_t key) const
+    {
+        return static_cast<std::size_t>((static_cast<std::uint64_t>(key) * 0x9E3779B97F4A7C15ull) >> shift_);
+    }
+
+    void grow()
+    {
+        std::vector<std::int64_t> keys = std::move(keys_);
+        std::vector<std::uint32_t> ids = std::move(ids_);
+        const std::size_t capacity = std::max<std::size_t>(64, 2 * keys.size());
+        keys_.assign(capacity, kEmpty);
+        ids_.assign(capacity, 0);
+        shift_ = 64 - std::countr_zero(capacity);
+        const std::size_t mask = capacity - 1;
+        for (std::size_t j = 0; j < keys.size(); ++j) {
+            if (keys[j] == kEmpty)
+                continue;
+            std::size_t i = slot(keys[j]);
+            while (keys_[i] != kEmpty)
+                i = (i + 1) & mask;
+            keys_[i] = keys[j];
+            ids_[i] = ids[j];
+        }
+    }
+
+    std::vector<std::int64_t> keys_;
+    std::vector<std::uint32_t> ids_;
+    std::size_t size_ = 0;
+    int shift_ = 64;
 };
 
 // One directory holding chunk files of the array, in one format.
@@ -214,7 +272,11 @@ public:
                 work[it->second].pieces.push_back(std::move(p));
             } while (next_index(idx, c0, c1));
         }
-        run(work, slot, out_strides);
+        std::vector<Work> ordered;  // chunk order: locality
+        ordered.reserve(work.size());
+        for (auto& [linear, i] : slot)
+            ordered.push_back(std::move(work[i]));
+        run(ordered, out_strides, nullptr);
     }
 
     // Reads the elements at `n` points into `out` (one element each, in order).
@@ -222,31 +284,19 @@ public:
     void read_points(const std::int64_t* coords, std::size_t n, std::uint8_t* out)
     {
         const std::size_t nd = spec_.shape.size();
-        std::map<std::int64_t, std::size_t> slot;
-        std::vector<Work> work;
-        Index idx(nd);
-        for (std::size_t p = 0; p < n; ++p) {
-            const std::int64_t* c = coords + p * nd;
-            std::uint8_t* dst = out + p * spec_.itemsize;
-            bool inside = true;
-            for (std::size_t i = 0; i < nd; ++i)
-                inside &= c[i] >= 0 && c[i] < spec_.shape[i];
-            if (!inside) {
-                std::memcpy(dst, spec_.fill.data(), spec_.itemsize);
-                continue;
-            }
-            std::int64_t linear = 0, offset = 0;
-            for (std::size_t i = 0; i < nd; ++i) {
-                idx[i] = c[i] / spec_.chunks[i];
-                linear = linear * grid_[i] + idx[i];
-                offset += (c[i] - idx[i] * spec_.chunks[i]) * chunk_strides_[i];
-            }
-            auto [it, fresh] = slot.emplace(linear, work.size());
-            if (fresh)
-                work.push_back(Work{idx, {}, {}});
-            work[it->second].points.push_back(Point{offset, dst});
+        for (std::size_t b0 = 0; b0 < n; b0 += kPointBatch) {
+            const std::size_t m = std::min(kPointBatch, n - b0);
+            gather_points(m, out, [&](std::size_t, std::size_t p, std::int64_t*, auto& emit) {
+                const std::int64_t* c = coords + (b0 + p) * nd;
+                bool inside = true;
+                for (std::size_t i = 0; i < nd; ++i)
+                    inside &= c[i] >= 0 && c[i] < spec_.shape[i];
+                if (inside)
+                    emit(c, b0 + p);
+                else
+                    std::memcpy(out + (b0 + p) * spec_.itemsize, spec_.fill.data(), spec_.itemsize);
+            });
         }
-        run(work, slot, {});
     }
 
     // Element nearest to each real-valued point (voxel i at coordinate i, ties to even),
@@ -254,18 +304,22 @@ public:
     void sample_nearest(const double* coords, std::size_t n, std::uint8_t* out)
     {
         const std::size_t nd = spec_.shape.size();
-        std::vector<std::int64_t> idx;
-        for (std::size_t b0 = 0; b0 < n; b0 += kSampleBatch) {
-            const std::size_t m = std::min(kSampleBatch, n - b0);
-            idx.resize(m * nd);
-            for (std::size_t p = 0; p < m; ++p)
+        for (std::size_t b0 = 0; b0 < n; b0 += kPointBatch) {
+            const std::size_t m = std::min(kPointBatch, n - b0);
+            gather_points(m, out, [&](std::size_t, std::size_t p, std::int64_t* idx, auto& emit) {
+                const double* c = coords + (b0 + p) * nd;
+                bool inside = true;
                 for (std::size_t i = 0; i < nd; ++i) {
-                    const double c = coords[(b0 + p) * nd + i];
                     // Out of range (or NaN): any index outside the array reads as fill.
-                    idx[p * nd + i] = c > -1.0 && c < static_cast<double>(spec_.shape[i]) + 1.0
-                                          ? static_cast<std::int64_t>(std::nearbyint(c)) : -1;
+                    idx[i] = c[i] > -1.0 && c[i] < static_cast<double>(spec_.shape[i]) + 1.0
+                                 ? static_cast<std::int64_t>(std::nearbyint(c[i])) : -1;
+                    inside &= idx[i] >= 0 && idx[i] < spec_.shape[i];
                 }
-            read_points(idx.data(), m, out + b0 * spec_.itemsize);
+                if (inside)
+                    emit(idx, b0 + p);
+                else
+                    std::memcpy(out + (b0 + p) * spec_.itemsize, spec_.fill.data(), spec_.itemsize);
+            });
         }
     }
 
@@ -275,76 +329,31 @@ public:
     // Computed in double; `out` holds float (out64 false) or double values.
     void sample_linear(const double* coords, std::size_t n, const ElementType& type, bool out64, void* out)
     {
-        const std::size_t nd = spec_.shape.size();
-        if (nd > 16)
+        if (spec_.shape.size() > kMaxSampleDims)
             throw std::invalid_argument("sample() supports at most 16 dimensions");
-        const double fill = type.load(spec_.fill.data());
-        std::vector<std::int64_t> corners;  // neighbour indices, nd per neighbour
-        std::vector<double> weights;        // one per neighbour
-        std::vector<std::uint32_t> first;   // each point's first neighbour; the end after the last
-        std::vector<double> value;          // each point's value when it needs no neighbours
-        std::vector<std::uint8_t> raw;
-        std::vector<std::int64_t> lo(nd);
-        std::vector<double> frac(nd);
-        std::vector<std::size_t> axes;
-        for (std::size_t b0 = 0; b0 < n; b0 += kSampleBatch) {
-            const std::size_t m = std::min(kSampleBatch, n - b0);
-            corners.clear();
-            weights.clear();
-            first.assign(m + 1, 0);
-            value.assign(m, 0.0);
-            for (std::size_t p = 0; p < m; ++p) {
-                first[p] = static_cast<std::uint32_t>(weights.size());
-                const double* c = coords + (b0 + p) * nd;
-                bool finite = true, outside = false;
-                axes.clear();
-                for (std::size_t i = 0; i < nd; ++i) {
-                    finite &= std::isfinite(c[i]);
-                    outside |= !(c[i] > -1.0 && c[i] < static_cast<double>(spec_.shape[i]));
-                }
-                if (!finite || outside) {  // no neighbour inside the array
-                    value[p] = finite ? fill : std::numeric_limits<double>::quiet_NaN();
-                    continue;
-                }
-                for (std::size_t i = 0; i < nd; ++i) {
-                    const double f = std::floor(c[i]);
-                    lo[i] = static_cast<std::int64_t>(f);
-                    frac[i] = c[i] - f;
-                    if (frac[i] != 0.0)
-                        axes.push_back(i);
-                }
-                const std::size_t count = std::size_t{1} << axes.size();
-                for (std::size_t corner = 0; corner < count; ++corner) {
-                    double w = 1.0;
-                    const std::size_t at = corners.size();
-                    corners.insert(corners.end(), lo.begin(), lo.end());
-                    for (std::size_t a = 0; a < axes.size(); ++a) {
-                        const std::size_t i = axes[a];
-                        if (corner >> a & 1) {
-                            ++corners[at + i];
-                            w *= frac[i];
-                        } else {
-                            w *= 1.0 - frac[i];
-                        }
-                    }
-                    weights.push_back(w);
-                }
-            }
-            first[m] = static_cast<std::uint32_t>(weights.size());
-            raw.resize(weights.size() * spec_.itemsize);
-            read_points(corners.data(), weights.size(), raw.data());
-            for (std::size_t p = 0; p < m; ++p) {
-                double v = value[p];
-                if (first[p] != first[p + 1]) {
-                    v = 0.0;
-                    for (std::uint32_t j = first[p]; j < first[p + 1]; ++j)
-                        v += weights[j] * type.load(raw.data() + j * spec_.itemsize);
-                }
-                if (out64)
-                    static_cast<double*>(out)[b0 + p] = v;
-                else
-                    static_cast<float*>(out)[b0 + p] = static_cast<float>(v);
-            }
+        // The element loads, chosen once: native-order numbers inline, the rest through `type`.
+        const auto with = [&]<class T>() {
+            sample_linear_as(coords, n, type, out64, out, [](const std::uint8_t* p) {
+                T v;
+                std::memcpy(&v, p, sizeof(T));
+                return static_cast<double>(v);
+            });
+        };
+        if (type.swap || type.kind == 'b')
+            return sample_linear_as(coords, n, type, out64, out, [&type](const std::uint8_t* p) { return type.load(p); });
+        switch (type.kind == 'f' ? 100 + type.itemsize : type.kind == 'i' ? 10 + type.itemsize : type.itemsize) {
+        case 1: return with.template operator()<std::uint8_t>();
+        case 2: return with.template operator()<std::uint16_t>();
+        case 4: return with.template operator()<std::uint32_t>();
+        case 8: return with.template operator()<std::uint64_t>();
+        case 11: return with.template operator()<std::int8_t>();
+        case 12: return with.template operator()<std::int16_t>();
+        case 14: return with.template operator()<std::int32_t>();
+        case 18: return with.template operator()<std::int64_t>();
+        case 104: return with.template operator()<float>();
+        case 108: return with.template operator()<double>();
+        default:
+            return sample_linear_as(coords, n, type, out64, out, [&type](const std::uint8_t* p) { return type.load(p); });
         }
     }
 
@@ -367,7 +376,14 @@ private:
         return false;
     }
 
-    static constexpr std::size_t kSampleBatch = 1 << 16;  // points per batch: bounds the neighbour lists
+    static constexpr std::size_t kPointBatch = std::size_t{1} << 20;  // points per plan: bounds its memory
+    static constexpr std::size_t kPlanGrain = std::size_t{1} << 14;   // points per planning segment, at least
+    static constexpr std::size_t kMaxSampleDims = 16;
+    // Tags of sample_linear's neighbour reads for points whose neighbours span chunks:
+    // the flag, the planning segment, and the neighbour's slot within that segment.
+    static constexpr std::uint64_t kSplit = std::uint64_t{1} << 63;
+    static constexpr int kSegmentShift = 40;
+    static constexpr std::uint64_t kSlotMask = (std::uint64_t{1} << kSegmentShift) - 1;
 
     struct Piece {
         std::size_t region = 0;
@@ -375,34 +391,383 @@ private:
         std::uint8_t* dst = nullptr;
     };
     struct Point {
-        std::int64_t src = 0;  // byte offset in the chunk
-        std::uint8_t* dst = nullptr;
+        std::int64_t src = 0;   // byte offset in the chunk
+        std::uint64_t tag = 0;  // which output the element is for: the PointOp's business
     };
-    // Everything one chunk supplies: boxes (read_many) or single elements (read_points).
+    // What a point read does with a chunk's points once the chunk is resolved.
+    struct PointOp {
+        std::int64_t reach = 0;  // bytes each point reads from its offset on
+        // `data` holds the chunk's bytes from byte offset `origin` on.
+        std::function<void(const std::uint8_t* data, std::int64_t origin, std::span<const Point>)> read;
+        std::function<void(std::span<const Point>)> fill;  // the chunk is not stored
+    };
+    // Everything one chunk supplies: boxes (read_many) or single elements (point reads).
     struct Work {
         Index idx;
         std::vector<Piece> pieces;
-        std::vector<Point> points;
+        std::span<const Point> points;
     };
 
-    // Resolves every chunk in parallel, in chunk order.
-    void run(std::vector<Work>& work, const std::map<std::int64_t, std::size_t>& slot,
-             const std::vector<Index>& out_strides)
+    // Resolves every chunk in parallel, in the order given.
+    void run(std::vector<Work>& work, const std::vector<Index>& out_strides, const PointOp* op)
     {
-        std::vector<Work*> ordered;
-        ordered.reserve(work.size());
-        for (auto& [linear, i] : slot)
-            ordered.push_back(&work[i]);
         if (spec_.hint && !cache_)
-            pool_.parallel_for(ordered.size(), [&](std::size_t i) { hint(*ordered[i]); });
-        pool_.parallel_for(ordered.size(), [&](std::size_t i) { resolve(*ordered[i], out_strides); });
+            pool_.parallel_for(work.size(), [&](std::size_t i) { hint(work[i]); });
+        pool_.parallel_for(work.size(), [&](std::size_t i) { resolve(work[i], out_strides, op); });
     }
 
-    void gather(const std::uint8_t* chunk, const Work& w) const
+    std::size_t plan_segments(std::size_t n) const
     {
-        for (const auto& pt : w.points)
-            std::memcpy(pt.dst, chunk + pt.src, spec_.itemsize);
+        return std::clamp<std::size_t>(n / kPlanGrain, 1, pool_.size() + 1);
     }
+
+    // Groups point reads by chunk. The n points are split into plan_segments(n) contiguous
+    // ranges, each planned in order on one thread: locate(segment, p, scratch, emit) calls
+    // emit(index, tag) for each element point p reads (index: nd indices inside the array;
+    // scratch: room for nd indices). Returns one Work per chunk, in chunk order, whose
+    // points (byte offset and tag, in emission order) are stored in `points`.
+    template <class Locate>
+    std::vector<Work> plan_points(std::size_t n, std::vector<Point>& points, Locate&& locate)
+    {
+        const std::size_t nd = spec_.shape.size();
+        const std::size_t segs = plan_segments(n);
+        struct Entry {
+            std::int64_t src;
+            std::uint64_t tag;
+            std::uint32_t id;
+        };
+        struct Segment {
+            ChunkIds ids;
+            std::vector<std::int64_t> linear;  // local id -> linear chunk index
+            std::vector<std::size_t> next;     // local id -> element count; later its next slot in `points`
+            std::vector<Entry> entries;
+        };
+        std::vector<Segment> seg(segs);
+        pool_.parallel_for(segs, [&](std::size_t s) {
+            Segment& g = seg[s];
+            const std::size_t p0 = n * s / segs, p1 = n * (s + 1) / segs;
+            g.entries.reserve(p1 - p0);
+            Index scratch(nd);
+            std::int64_t last = -1;
+            std::uint32_t id = 0;
+            auto emit = [&](const std::int64_t* c, std::uint64_t tag) {
+                std::int64_t linear = 0, offset = 0;
+                for (std::size_t i = 0; i < nd; ++i) {
+                    const std::int64_t q = c[i] / spec_.chunks[i];
+                    linear = linear * grid_[i] + q;
+                    offset += (c[i] - q * spec_.chunks[i]) * chunk_strides_[i];
+                }
+                if (linear != last) {  // runs of points in one chunk skip the lookup
+                    last = linear;
+                    id = g.ids.find_or_insert(linear, static_cast<std::uint32_t>(g.linear.size()));
+                    if (id == g.linear.size()) {
+                        g.linear.push_back(linear);
+                        g.next.push_back(0);
+                    }
+                }
+                ++g.next[id];
+                g.entries.push_back(Entry{offset, tag, id});
+            };
+            for (std::size_t p = p0; p < p1; ++p)
+                locate(s, p, scratch.data(), emit);
+        });
+        // Chunks in order; within a chunk, each segment's elements after the earlier segments'.
+        std::vector<std::int64_t> chunks;
+        for (const auto& g : seg)
+            chunks.insert(chunks.end(), g.linear.begin(), g.linear.end());
+        std::sort(chunks.begin(), chunks.end());
+        chunks.erase(std::unique(chunks.begin(), chunks.end()), chunks.end());
+        std::vector<std::vector<std::size_t>> global(segs);
+        std::vector<std::size_t> start(chunks.size() + 1, 0);
+        for (std::size_t s = 0; s < segs; ++s) {
+            const Segment& g = seg[s];
+            global[s].resize(g.linear.size());
+            for (std::size_t id = 0; id < g.linear.size(); ++id) {
+                global[s][id] = static_cast<std::size_t>(
+                    std::lower_bound(chunks.begin(), chunks.end(), g.linear[id]) - chunks.begin());
+                start[global[s][id] + 1] += g.next[id];
+            }
+        }
+        for (std::size_t c = 0; c < chunks.size(); ++c)
+            start[c + 1] += start[c];
+        std::vector<std::size_t> cursor(start.begin(), start.end() - 1);
+        for (std::size_t s = 0; s < segs; ++s) {
+            Segment& g = seg[s];
+            for (std::size_t id = 0; id < g.linear.size(); ++id) {
+                const std::size_t count = g.next[id];
+                g.next[id] = cursor[global[s][id]];
+                cursor[global[s][id]] += count;
+            }
+        }
+        points.resize(start.back());
+        pool_.parallel_for(segs, [&](std::size_t s) {
+            Segment& g = seg[s];
+            for (const Entry& e : g.entries)
+                points[g.next[e.id]++] = Point{e.src, e.tag};
+        });
+        std::vector<Work> work(chunks.size());
+        for (std::size_t c = 0; c < chunks.size(); ++c) {
+            Work& w = work[c];
+            w.idx.resize(nd);
+            std::int64_t linear = chunks[c];
+            for (std::size_t i = nd; i-- > 0;) {
+                w.idx[i] = linear % grid_[i];
+                linear /= grid_[i];
+            }
+            w.points = std::span<const Point>(points.data() + start[c], start[c + 1] - start[c]);
+        }
+        return work;
+    }
+
+    // Runs fn over `pts` in parts, in parallel when there are many (one chunk holding most
+    // of a batch's points would otherwise leave the other threads idle).
+    template <class Fn>
+    void for_points(std::span<const Point> pts, Fn&& fn)
+    {
+        const std::size_t parts = pts.size() / kPlanGrain;
+        if (parts < 2) {
+            fn(pts);
+            return;
+        }
+        pool_.parallel_for(parts, [&](std::size_t i) {
+            const std::size_t a = pts.size() * i / parts, b = pts.size() * (i + 1) / parts;
+            fn(pts.subspan(a, b - a));
+        });
+    }
+
+    template <std::size_t K>
+    static void copy_points(const std::uint8_t* data, std::int64_t origin, std::span<const Point> pts,
+                            std::uint8_t* out)
+    {
+        for (const Point& pt : pts)
+            std::memcpy(out + pt.tag * K, data + (pt.src - origin), K);
+    }
+
+    // Reads one element per located point into out[tag] (see plan_points for `locate`).
+    template <class Locate>
+    void gather_points(std::size_t n, std::uint8_t* out, Locate&& locate)
+    {
+        std::vector<Point> points;
+        auto work = plan_points(n, points, locate);
+        const std::size_t isz = spec_.itemsize;
+        PointOp op;
+        op.reach = static_cast<std::int64_t>(isz);
+        op.read = [&](const std::uint8_t* data, std::int64_t origin, std::span<const Point> pts) {
+            for_points(pts, [&](std::span<const Point> part) {
+                switch (isz) {
+                case 1: return copy_points<1>(data, origin, part, out);
+                case 2: return copy_points<2>(data, origin, part, out);
+                case 4: return copy_points<4>(data, origin, part, out);
+                case 8: return copy_points<8>(data, origin, part, out);
+                default:
+                    for (const Point& pt : part)
+                        std::memcpy(out + pt.tag * isz, data + (pt.src - origin), isz);
+                }
+            });
+        };
+        op.fill = [&](std::span<const Point> pts) {
+            for (const Point& pt : pts)
+                std::memcpy(out + pt.tag * isz, spec_.fill.data(), isz);
+        };
+        run(work, {}, &op);
+    }
+
+    // A point's grid cell: the corner below it, its fractional offsets, and the axes on
+    // which it is off the grid.
+    struct Cell {
+        std::int64_t lo[kMaxSampleDims];
+        double frac[kMaxSampleDims];
+        std::size_t axes[kMaxSampleDims];
+        std::size_t k = 0;
+    };
+
+    static void cell_of(const double* c, std::size_t nd, Cell& cell)
+    {
+        cell.k = 0;
+        for (std::size_t i = 0; i < nd; ++i) {
+            const double f = std::floor(c[i]);
+            cell.lo[i] = static_cast<std::int64_t>(f);
+            cell.frac[i] = c[i] - f;
+            if (cell.frac[i] != 0.0)
+                cell.axes[cell.k++] = i;
+        }
+    }
+
+    // The weighted sum of a cell's 2^k neighbours; value(corner) is neighbour `corner`
+    // (bit a set: one step up along axes[a]). The weights and the sum are always formed in
+    // this order, so a point's result does not depend on where its neighbours were read.
+    template <class Value>
+    static double interpolate(const Cell& cell, Value&& value)
+    {
+        const std::size_t count = std::size_t{1} << cell.k;
+        double v = 0.0;
+        for (std::size_t corner = 0; corner < count; ++corner) {
+            double w = 1.0;
+            for (std::size_t a = 0; a < cell.k; ++a) {
+                const double f = cell.frac[cell.axes[a]];
+                if (corner >> a & 1)
+                    w *= f;
+                else
+                    w *= 1.0 - f;
+            }
+            v += w * value(corner);
+        }
+        return v;
+    }
+
+    // interpolate() for a 3-D cell off the grid on every axis, unrolled: the same weights
+    // and the same sum, in the same order. `at` is the near corner, `step` the byte strides.
+    template <class Load>
+    static double trilinear(const double* f, const std::uint8_t* at, const std::int64_t* step, Load& load)
+    {
+        const double g0 = 1.0 - f[0], g1 = 1.0 - f[1], g2 = 1.0 - f[2];
+        const double w00 = g0 * g1, w10 = f[0] * g1, w01 = g0 * f[1], w11 = f[0] * f[1];
+        const std::int64_t s0 = step[0], s1 = step[1], s2 = step[2];
+        double v = 0.0;
+        v += w00 * g2 * load(at);
+        v += w10 * g2 * load(at + s0);
+        v += w01 * g2 * load(at + s1);
+        v += w11 * g2 * load(at + s0 + s1);
+        v += w00 * f[2] * load(at + s2);
+        v += w10 * f[2] * load(at + s0 + s2);
+        v += w01 * f[2] * load(at + s1 + s2);
+        v += w11 * f[2] * load(at + s0 + s1 + s2);
+        return v;
+    }
+
+    // sample_linear with element loads `load`. A point whose neighbours all lie in one chunk
+    // is interpolated from that chunk while it is resolved. The other ("split") points read
+    // their neighbours into `raw` (neighbour j of a split point at slot first + j of its
+    // planning segment) and are interpolated after.
+    template <class Load>
+    void sample_linear_as(const double* coords, std::size_t n, const ElementType& type, bool out64, void* out,
+                          Load load)
+    {
+        const std::size_t nd = spec_.shape.size();
+        const std::size_t isz = spec_.itemsize;
+        const double fill = type.load(spec_.fill.data());
+        const auto store = [&](std::size_t p, double v) {
+            if (out64)
+                static_cast<double*>(out)[p] = v;
+            else
+                static_cast<float*>(out)[p] = static_cast<float>(v);
+        };
+        struct Split {
+            std::size_t p;
+            std::uint64_t first;
+        };
+        struct Splits {
+            std::vector<Split> points;
+            std::uint64_t slots = 0;
+        };
+        std::int64_t reach = static_cast<std::int64_t>(isz);  // the far corner of a cell, from its near one
+        for (std::size_t i = 0; i < nd; ++i)
+            reach += chunk_strides_[i];
+        std::vector<Splits> split;
+        std::vector<std::uint64_t> base;  // segment -> its first slot in raw
+        std::vector<std::uint8_t> raw;
+        std::vector<Point> points;
+        for (std::size_t b0 = 0; b0 < n; b0 += kPointBatch) {
+            const std::size_t m = std::min(kPointBatch, n - b0);
+            split.assign(plan_segments(m), Splits{});
+            auto work = plan_points(m, points, [&](std::size_t s, std::size_t p, std::int64_t* idx, auto& emit) {
+                const double* c = coords + (b0 + p) * nd;
+                bool finite = true, outside = false;
+                for (std::size_t i = 0; i < nd; ++i) {
+                    finite &= std::isfinite(c[i]);
+                    outside |= !(c[i] > -1.0 && c[i] < static_cast<double>(spec_.shape[i]));
+                }
+                if (!finite || outside) {  // no neighbour inside the array
+                    store(b0 + p, finite ? fill : std::numeric_limits<double>::quiet_NaN());
+                    return;
+                }
+                Cell cell;
+                cell_of(c, nd, cell);
+                bool whole = true;  // every neighbour inside the array and in the near corner's chunk
+                for (std::size_t i = 0; i < nd; ++i)
+                    whole &= cell.lo[i] >= 0;
+                for (std::size_t a = 0; a < cell.k; ++a) {
+                    const std::size_t i = cell.axes[a];
+                    whole &= cell.lo[i] + 1 < spec_.shape[i] && cell.lo[i] % spec_.chunks[i] + 1 < spec_.chunks[i];
+                }
+                if (whole) {
+                    emit(cell.lo, b0 + p);
+                    return;
+                }
+                Splits& sp = split[s];
+                const std::uint64_t first = sp.slots;
+                const std::size_t count = std::size_t{1} << cell.k;
+                sp.points.push_back(Split{b0 + p, first});
+                sp.slots += count;
+                for (std::size_t corner = 0; corner < count; ++corner) {
+                    bool inside = true;
+                    for (std::size_t i = 0; i < nd; ++i)
+                        idx[i] = cell.lo[i];
+                    for (std::size_t a = 0; a < cell.k; ++a)
+                        idx[cell.axes[a]] += corner >> a & 1;
+                    for (std::size_t i = 0; i < nd; ++i)
+                        inside &= idx[i] >= 0 && idx[i] < spec_.shape[i];
+                    if (inside)  // outside neighbours keep raw's fill
+                        emit(idx, kSplit | std::uint64_t{s} << kSegmentShift | (first + corner));
+                }
+            });
+            base.assign(split.size(), 0);
+            std::uint64_t slots = 0;
+            for (std::size_t s = 0; s < split.size(); ++s) {
+                base[s] = slots;
+                slots += split[s].slots;
+            }
+            raw.resize(slots * isz);
+            for (std::uint64_t j = 0; j < slots; ++j)
+                std::memcpy(raw.data() + j * isz, spec_.fill.data(), isz);
+            PointOp op;
+            op.reach = reach;
+            op.read = [&](const std::uint8_t* data, std::int64_t origin, std::span<const Point> pts) {
+                for_points(pts, [&](std::span<const Point> part) {
+                    Cell cell;
+                    for (const Point& pt : part) {
+                        const std::uint8_t* at = data + (pt.src - origin);
+                        if (pt.tag & kSplit) {
+                            const std::uint64_t slot = base[(pt.tag & ~kSplit) >> kSegmentShift] + (pt.tag & kSlotMask);
+                            std::memcpy(raw.data() + slot * isz, at, isz);
+                            continue;
+                        }
+                        cell_of(coords + pt.tag * nd, nd, cell);
+                        if (nd == 3 && cell.k == 3) {
+                            store(pt.tag, trilinear(cell.frac, at, chunk_strides_.data(), load));
+                            continue;
+                        }
+                        store(pt.tag, interpolate(cell, [&](std::size_t corner) {
+                            std::int64_t offset = 0;
+                            for (std::size_t a = 0; a < cell.k; ++a)
+                                if (corner >> a & 1)
+                                    offset += chunk_strides_[cell.axes[a]];
+                            return load(at + offset);
+                        }));
+                    }
+                });
+            };
+            op.fill = [&](std::span<const Point> pts) {
+                Cell cell;
+                for (const Point& pt : pts) {
+                    if (pt.tag & kSplit)
+                        continue;  // its raw slot holds fill already
+                    cell_of(coords + pt.tag * nd, nd, cell);
+                    store(pt.tag, interpolate(cell, [&](std::size_t) { return fill; }));
+                }
+            };
+            run(work, {}, &op);
+            pool_.parallel_for(split.size(), [&](std::size_t s) {
+                Cell cell;
+                for (const Split& sp : split[s].points) {
+                    const std::uint8_t* at = raw.data() + (base[s] + sp.first) * isz;
+                    cell_of(coords + sp.p * nd, nd, cell);
+                    store(sp.p, interpolate(cell, [&](std::size_t corner) { return load(at + corner * isz); }));
+                }
+            });
+        }
+    }
+
     enum class Found { Copied, Missing, NotCached };
 
     std::string key(const Index& idx) const
@@ -453,28 +818,30 @@ private:
         hint_willneed(f.fd(), lo, hi - lo);
     }
 
-    void apply(const ChunkPtr& chunk, const Work& w, const std::vector<Index>& out_strides)
+    void apply(const ChunkPtr& chunk, const Work& w, const std::vector<Index>& out_strides, const PointOp* op)
     {
         if (!chunk) {
-            fill_pieces(w, out_strides);
+            fill_pieces(w, out_strides, op);
             return;
         }
         for (const auto& p : w.pieces)
             copy_box(chunk->data() + offset_of(p.src_lo, chunk_strides_), chunk_strides_, p.dst,
                      out_strides[p.region], p.extent, spec_.itemsize);
-        gather(chunk->data(), w);
+        if (!w.points.empty())
+            op->read(chunk->data(), 0, w.points);
     }
 
-    void fill_pieces(const Work& w, const std::vector<Index>& out_strides)
+    void fill_pieces(const Work& w, const std::vector<Index>& out_strides, const PointOp* op)
     {
         for (const auto& p : w.pieces)
             fill_box(p.dst, out_strides[p.region], p.extent, spec_.fill);
-        for (const auto& pt : w.points)
-            std::memcpy(pt.dst, spec_.fill.data(), spec_.itemsize);
+        if (!w.points.empty())
+            op->fill(w.points);
     }
 
     // Reads the pieces of a raw (uncompressed) chunk file straight into the outputs.
-    Found read_raw_pieces(const std::string& path, const Work& w, const std::vector<Index>& out_strides)
+    Found read_raw_pieces(const std::string& path, const Work& w, const std::vector<Index>& out_strides,
+                          const PointOp* op)
     {
         if (spec_.read_mode == "mmap") {
             auto m = maps_.get(path);
@@ -492,7 +859,8 @@ private:
             for (const auto& p : w.pieces)
                 copy_box(m->data + offset_of(p.src_lo, chunk_strides_), chunk_strides_, p.dst,
                          out_strides[p.region], p.extent, spec_.itemsize);
-            gather(m->data, w);
+            if (!w.points.empty())
+                op->read(m->data, 0, w.points);
             return Found::Copied;
         }
         File f = File::open_read(path);
@@ -510,11 +878,11 @@ private:
             std::int64_t lo = INT64_MAX, hi = 0;
             for (const auto& pt : w.points) {
                 lo = std::min(lo, pt.src);
-                hi = std::max(hi, pt.src + static_cast<std::int64_t>(spec_.itemsize));
+                hi = std::max(hi, pt.src);
             }
+            hi = std::min(hi + op->reach, static_cast<std::int64_t>(chunk_bytes_));
             pread_exact(f.fd(), scratch.data(), static_cast<std::size_t>(hi - lo), lo, path);
-            for (const auto& pt : w.points)
-                std::memcpy(pt.dst, scratch.data() + (pt.src - lo), spec_.itemsize);
+            op->read(scratch.data(), lo, w.points);
         }
         return Found::Copied;
     }
@@ -537,7 +905,7 @@ private:
         return ChunkPtr(std::move(chunk));
     }
 
-    void resolve(const Work& w, const std::vector<Index>& out_strides)
+    void resolve(const Work& w, const std::vector<Index>& out_strides, const PointOp* op)
     {
         const std::string k = key(w.idx);
         const std::string ck = spec_.identity + "|" + k;
@@ -545,7 +913,7 @@ private:
             auto [found, chunk] = cache_->get(ck);
             if (found) {
                 ++stats_.memory_hits;
-                apply(chunk, w, out_strides);
+                apply(chunk, w, out_strides, op);
                 return;
             }
         }
@@ -553,19 +921,19 @@ private:
             auto [found, chunk] = writes_->pending(k);
             if (found) {
                 ++stats_.pending_hits;
-                apply(chunk, w, out_strides);
+                apply(chunk, w, out_strides, op);
                 return;
             }
         }
         for (std::size_t li = 0; li < spec_.layers.size(); ++li) {
             const LayerSpec& l = spec_.layers[li];
             if (!cache_ && codecs_[li] == Codec::Raw) {
-                if (read_raw_pieces(l.root + "/" + k, w, out_strides) == Found::Copied) {
+                if (read_raw_pieces(l.root + "/" + k, w, out_strides, op) == Found::Copied) {
                     ++stats_.disk_hits;
                     return;
                 }
                 if (l.kind == "array" || exists(marker_path(l, k))) {
-                    fill_pieces(w, out_strides);
+                    fill_pieces(w, out_strides, op);
                     return;
                 }
                 continue;
@@ -574,20 +942,20 @@ private:
                 ++stats_.disk_hits;
                 if (cache_)
                     cache_->put(ck, *chunk);
-                apply(*chunk, w, out_strides);
+                apply(*chunk, w, out_strides, op);
                 return;
             }
         }
         if (spec_.offline)
             throw CacheMiss("chunk " + k + " of " + spec_.identity + " is not in the disk cache (offline)");
         if (!http_) {
-            fill_pieces(w, out_strides);
+            fill_pieces(w, out_strides, op);
             return;
         }
         ChunkPtr chunk = fetch(k);
         if (cache_)
             cache_->put(ck, chunk);
-        apply(chunk, w, out_strides);
+        apply(chunk, w, out_strides, op);
     }
 
     // Fetches a chunk from the remote once, however many reads want it at the same time.
