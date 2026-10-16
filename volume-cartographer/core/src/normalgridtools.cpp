@@ -1,4 +1,7 @@
 #include "vc/core/util/GridStore.hpp"
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include <random>
 #include <optional>
 #include <cstdint>
@@ -14,7 +17,8 @@ long total_candidates_before_dedup = 0;
 long total_candidates_after_dedup = 0;
 long nearest_neighbors_calls = 0;
 
-cv::Vec2f align_and_extract_umbilicus(const GridStore& grid_store, std::optional<std::uint32_t> seed) {
+cv::Vec2f align_and_extract_umbilicus(const GridStore& grid_store, std::optional<std::uint32_t> seed,
+                                      float uncrush) {
     auto segments = grid_store.get_all();
     if (segments.empty()) {
         return cv::Vec2f(std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
@@ -44,6 +48,63 @@ cv::Vec2f align_and_extract_umbilicus(const GridStore& grid_store, std::optional
         return cv::Vec2f(std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
     }
 
+    // 3b. Optional un-crush. The score below looks for the point the sheet normals point at,
+    // which is the centre of round windings but not of crushed ones: the normals of an ellipse
+    // do not point at its centre. With uncrush = beta > 0 the section is first stretched back
+    // towards round, by the anisotropy of its normals and not of its extent. The axial
+    // orientation tensor of the unit segment normals, T = sum n n^T, is round for a round section
+    // that spans half a turn or more, however unevenly it is sampled, so then next to nothing
+    // changes; on a crushed section the normals crowd across its flat sides, and x' = W (x - mu) with
+    // W = diag((t_i / t_mean)^(beta / 2)) V^T stretches it along that direction. The normals are
+    // carried by the inverse transpose of W, the search runs in that frame over the bounds of the
+    // transformed midpoints, and its result is mapped back with W^-1. uncrush = 0 is the
+    // estimator unchanged, draw for draw.
+    double w00 = 1.0, w01 = 0.0, w10 = 0.0, w11 = 1.0;   // W, row major
+    double mu_x = 0.0, mu_y = 0.0;
+    bool whiten = false;
+    if (uncrush > 0.0f) {
+        const double n = (double)all_line_segments.size();
+        for (const auto& s : all_line_segments) {
+            mu_x += 0.5 * (s.first.x + s.second.x);
+            mu_y += 0.5 * (s.first.y + s.second.y);
+        }
+        mu_x /= n;
+        mu_y /= n;
+        double txx = 0.0, txy = 0.0, tyy = 0.0;
+        for (const auto& s : all_line_segments) {
+            const double tx = s.second.x - s.first.x, ty = s.second.y - s.first.y;
+            const double len = std::hypot(tx, ty);
+            if (len <= 0.0) continue;
+            const double nx = -ty / len, ny = tx / len;
+            txx += nx * nx;
+            txy += nx * ny;
+            tyy += ny * ny;
+        }
+        // Eigen decomposition of the symmetric 2 x 2 tensor, in closed form. Only the ratios of
+        // the eigenvalues are used, so it is not divided by the number of segments.
+        const double half_trace = 0.5 * (txx + tyy);
+        const double r = std::hypot(0.5 * (txx - tyy), txy);
+        const double l1 = half_trace + r, l2 = half_trace - r;
+        if (l2 > 0.0) {
+            const double t = 0.5 * std::atan2(2.0 * txy, txx - tyy);   // where the normals crowd
+            const double f1 = std::pow(l1 / half_trace, 0.5 * uncrush);
+            const double f2 = std::pow(l2 / half_trace, 0.5 * uncrush);
+            w00 = f1 * std::cos(t);  w01 = f1 * std::sin(t);
+            w10 = -f2 * std::sin(t); w11 = f2 * std::cos(t);
+            whiten = true;
+            min_x = min_y = std::numeric_limits<float>::max();
+            max_x = max_y = std::numeric_limits<float>::lowest();
+            for (const auto& s : all_line_segments) {
+                const double dx = 0.5 * (s.first.x + s.second.x) - mu_x;
+                const double dy = 0.5 * (s.first.y + s.second.y) - mu_y;
+                const float wx = (float)(w00 * dx + w01 * dy), wy = (float)(w10 * dx + w11 * dy);
+                min_x = std::min(min_x, wx); max_x = std::max(max_x, wx);
+                min_y = std::min(min_y, wy); max_y = std::max(max_y, wy);
+            }
+        }
+    }
+    const double det = w00 * w11 - w01 * w10;
+
     // 4. Pre-sample points and calculate normals for consistent scoring
     std::vector<cv::Point2f> sample_points;
     std::vector<cv::Vec2f> sample_normals;
@@ -65,10 +126,20 @@ cv::Vec2f align_and_extract_umbilicus(const GridStore& grid_store, std::optional
         const auto& p2 = line_segment.second;
 
         sample_points.emplace_back((float)(p1.x + p2.x) / 2.0f, (float)(p1.y + p2.y) / 2.0f);
-        
+
         cv::Vec2f tangent((float)(p2.x - p1.x), (float)(p2.y - p1.y));
         cv::normalize(tangent, tangent);
         sample_normals.emplace_back(-tangent[1], tangent[0]); // Perpendicular
+
+        if (whiten) {
+            const double dx = sample_points.back().x - mu_x, dy = sample_points.back().y - mu_y;
+            sample_points.back() = cv::Point2f((float)(w00 * dx + w01 * dy), (float)(w10 * dx + w11 * dy));
+            const cv::Vec2f nrm = sample_normals.back();   // a normal goes through W^-T
+            cv::Vec2f wn((float)((w11 * nrm[0] - w10 * nrm[1]) / det),
+                         (float)((-w01 * nrm[0] + w00 * nrm[1]) / det));
+            cv::normalize(wn, wn);
+            sample_normals.back() = wn;
+        }
     }
 
     // 4. RANSAC loop
@@ -158,6 +229,12 @@ cv::Vec2f align_and_extract_umbilicus(const GridStore& grid_store, std::optional
         if (!moved) {
             step_size /= 2.0f;
         }
+    }
+
+    if (whiten) {   // back from the un-crushed frame, x = W^-1 x' + mu
+        const double ux = best_umbilicus[0], uy = best_umbilicus[1];
+        best_umbilicus = cv::Vec2f((float)((w11 * ux - w01 * uy) / det + mu_x),
+                                   (float)((-w10 * ux + w00 * uy) / det + mu_y));
     }
 
     std::cout << "Refined umbilicus estimate: " << best_umbilicus << " with score " << refined_best_score << std::endl;

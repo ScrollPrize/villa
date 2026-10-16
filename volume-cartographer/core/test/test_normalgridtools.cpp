@@ -369,3 +369,89 @@ TEST_CASE("align_and_extract_umbilicus: a real slice the published objective wal
             "refinement score has changed.");
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// The un-crush option, uncrush = beta > 0. Three cases.
+//
+//   6. "uncrush 0 is the estimator unchanged"      the default must not move a single draw.
+//   7. "a crushed half section"                    what the option is for: on ellipses the
+//      normals do not point at the centre, and stretching the section back first brings the
+//      estimate back towards it.
+//   8. "a round half section"                      what it must not do: a section that is round
+//      but partial has normals spread evenly over half a turn, so its orientation tensor is
+//      round and the option has to leave the estimate where it was. Stretching by the spread of
+//      the midpoints instead fails this case (2.42 to 4.58 mm median), which is why the
+//      normals and not the midpoints drive it.
+//
+// The crushed sections are the sections of cases 2 to 4 with every y offset from the centre
+// divided by a squash factor, so a circle of radius r becomes an ellipse with semi axes r and
+// r / squash. Measured over seeds 1 to 20 (g++ 13, libstdc++, -O2), errors in mm:
+//
+//   section                      uncrush 0 median / p90 / max    uncrush 1.5 median / p90 / max
+//   crushed 2.5:1, half          2.42 / 2.59 / 6.12              0.85 / 1.02 / 1.23
+//   crushed 2.5:1, full          2.41 / 3.26 / 3.33              0.59 / 1.27 / 1.38
+//   crushed 4:1, full            4.10 / 6.92 / 7.03              0.75 / 0.92 / 0.95
+//   round, half (case 3)         2.42 / 3.71 / 3.98              2.41 / 3.52 / 3.99
+//   round, thinned 1:10 (case 4) 2.24 / 2.62 / 3.51              2.23 / 2.60 / 2.63
+//
+// On the crushed half section the worst of 20 seeds with the option, 1.23 mm, is better than the
+// best without it, 1.78 mm. On the round half section the option moves the estimate by 0.041 mm
+// on average over the 20 seeds, under 0.02 mm on 19 of them and 0.70 mm on one, where the climb
+// settles on a neighbouring maximum. Tolerances are 1.5 times the p90 (or the maximum, for the
+// move on the round section), rounded up, as above. On real scrolls the option
+// was measured on the published normal grids of 16 scrolls against manual umbilici; the numbers
+// are in the pull request.
+
+namespace {
+
+void addCrushedSection(GridStore& gs, double squash, double frac)
+{
+    for (double r = 300.0; r <= 3500.0; r += 80.0) {
+        const int n = std::max(8, (int)(2.0 * kPi * r / 12.0));
+        const int m = std::max(3, (int)(n * frac));
+        std::vector<cv::Point> pts;
+        pts.reserve(m);
+        for (int i = 0; i < m; ++i) {
+            const double th = frac >= 1.0 ? 2.0 * kPi * i / m : 2.0 * kPi * frac * i / (m - 1);
+            pts.emplace_back(cvRound(kCentreX + r * std::cos(th)),
+                             cvRound(kCentreY + r / squash * std::sin(th)));
+        }
+        for (int i = 0; i + 1 < m; ++i) {
+            gs.add({pts[i], pts[i + 1]});
+        }
+    }
+}
+
+} // namespace
+
+TEST_CASE("align_and_extract_umbilicus: uncrush 0 is the estimator unchanged")
+{
+    GridStore gs(cv::Rect(0, 0, kSide, kSide), 64);
+    addSyntheticSection(gs, 1.0, 10, 3u);
+    auto a = align_and_extract_umbilicus(gs, 7u);
+    auto b = align_and_extract_umbilicus(gs, 7u, 0.0f);
+    CHECK(a[0] == b[0]);
+    CHECK(a[1] == b[1]);
+}
+
+TEST_CASE("align_and_extract_umbilicus: a crushed half section, uncrush 1.5 stays under 1.6 mm")
+{
+    GridStore gs(cv::Rect(0, 0, kSide, kSide), 64);
+    addCrushedSection(gs, 2.5, 0.5);
+    auto unchanged = align_and_extract_umbilicus(gs, 1u);
+    auto uncrushed = align_and_extract_umbilicus(gs, 1u, 1.5f);
+    REQUIRE(insideGrid(uncrushed));
+    CHECK(errorMm(uncrushed) < 1.6);                  // 20 seed median 0.85 mm, p90 1.02 mm
+    CHECK(errorMm(uncrushed) < errorMm(unchanged));   // 20 seed range 0.74 to 1.23 against 1.78 to 6.12 mm
+}
+
+TEST_CASE("align_and_extract_umbilicus: a round half section, uncrush 1.5 moves the estimate under 1.1 mm")
+{
+    GridStore gs(cv::Rect(0, 0, kSide, kSide), 64);
+    addSyntheticSection(gs, 0.5, 1, 0);
+    auto unchanged = align_and_extract_umbilicus(gs, 1u);
+    auto uncrushed = align_and_extract_umbilicus(gs, 1u, 1.5f);
+    REQUIRE(insideGrid(uncrushed));
+    const double moved = std::hypot(uncrushed[0] - unchanged[0], uncrushed[1] - unchanged[1]) * kUnitMm;
+    CHECK(moved < 1.1);   // 20 seed mean 0.041 mm, max 0.70 mm; the midpoint version moves it 2 mm
+}
