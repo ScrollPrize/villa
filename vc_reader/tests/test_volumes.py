@@ -155,3 +155,12 @@ def test_two_main_exports_of_one_scan_need_id(catalog):
         pherc9b.volume(resolution=2.401)
     assert {v.id for v in err.value.candidates} == {"20250820154339", "20260319104112"}
     assert "narrow it with a volume id" in str(err.value)
+
+
+def test_scan_names(paris4, pherc139):
+    # DLS records scan_name, ESRF the acquisition's scanRadix
+    assert paris4.scans["20230206171837"].name.startswith("PHercParis4 54keV stitched_part_2")
+    assert pherc139.scans["20250722040659"].name == "SCROLLS_HEL_2.403um_77keV_0.22m_PHerc_0139_ROI2_HA"
+    assert paris4.volume(scan="2.4um_137keV_PHerc-Paris4_ROI1").id == VOL_137KEV
+    with pytest.raises(AmbiguousMatchError, match=r"scan=20230206171837 +\(PHercParis4 54keV stitched_part_2"):
+        paris4.volume(resolution=7.91)

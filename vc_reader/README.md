@@ -80,11 +80,15 @@ for view in vol.segments(min_coverage=0.5):   # segments with a mesh on this vol
 - **Volumes**: look up by id or long id, or by `resolution` (µm). A volume
   whose pixel size is exactly the requested value wins. Otherwise any volume
   within 0.5% relative tolerance (`rel_tol=`) matches. Narrow the result with
-  `energy_kev=` or `scan=` (scan id or long id). Superseded volumes are skipped
+  `energy_kev=` or `scan=` (scan id, long id or `scan.name`). Superseded volumes are skipped
   unless you name them or pass `include_superseded=True`.
 - **Several volumes at one resolution**: volumes of different scans usually
   cover different regions (Scroll 1's stitched parts 1 and 2, PHerc0139's
-  ROI2 and B), so `volume()` never chooses between scans. Pass `scan=` instead. One
+  ROI2 and B), so `volume()` never chooses between scans. Pass `scan=` instead.
+  `scan.name` is the facility's name for the acquisition, which usually says
+  the region: the ESRF `scanRadix` (`SCROLLS_HEL_2.403um_77keV_0.22m_PHerc_0139_ROI2_HA`)
+  or the DLS `scan_name` (`PHercParis4 54keV stitched_part_2, …`). It is None
+  when the metadata records neither. One
   scan can also have several exports. `vol.is_secondary` marks the
   ones the pipeline no longer renders segments on (`render_segments: false`),
   such as experimental, ROI or redundant exports. `volume()` drops those when

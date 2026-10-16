@@ -45,6 +45,16 @@ def _resolution_matches(value: float | None, wanted: float, rel_tol: float) -> b
     return value is not None and math.isclose(value, wanted, rel_tol=rel_tol)
 
 
+def _scan_name(md: Mapping[str, Any]) -> str | None:
+    """The facility's name for a scan, from ``creation.metadata``.
+
+    ESRF records the acquisition's ``scanRadix`` (``2.4um_PHerc-Paris4_B_HA``),
+    DLS a ``scan_name`` (``PHercParis4 54keV stitched_part_2, …``).
+    """
+    acq = ((md.get("metadata") or {}).get("tomo") or {}).get("acquisition") or {}
+    return acq.get("scanRadix") or md.get("scan_name") or None
+
+
 # --------------------------------------------------------------------------
 # Small value types
 # --------------------------------------------------------------------------
@@ -106,6 +116,7 @@ class Scan:
         self.pixel_size_um = _num(p.get("pixel_size_um"))
         self.energy_kev = _num(p.get("energy_keV"))
         self.detector_distance_mm = _num(p.get("detector_distance_mm"))
+        self.name: str | None = _scan_name(self.creation.get("metadata") or {})
 
     @property
     def date(self) -> str | None:
@@ -713,7 +724,7 @@ class Sample:
         any, otherwise all within relative tolerance ``rel_tol`` (so ``2.399``
         finds a ``2.4`` volume, but does not also return ``2.403`` volumes when a
         ``2.399`` one exists). ``energy_kev`` matches to within 0.5 keV.
-        ``scan`` is a scan, scan id or scan long id. Superseded volumes are
+        ``scan`` is a scan, scan id, long id or name. Superseded volumes are
         skipped unless named by ``query`` or ``include_superseded``. Results are
         ordered by distance to ``resolution``, then id.
         """
@@ -793,7 +804,7 @@ class Sample:
     def _scan_id(self, scan: Scan | str) -> str:
         if isinstance(scan, Scan):
             return scan.id
-        hits = [s.id for s in self.scans.values() if scan == s.long_id]
+        hits = [s.id for s in self.scans.values() if scan in (s.long_id, s.name)]
         return hits[0] if hits else scan
 
     def transform(self, from_volume: Volume | str, to_volume: Volume | str) -> Affine | None:
@@ -937,7 +948,8 @@ def _scan_label(scan: Scan | str | None) -> str | None:
 
 
 def _describe_volume(v: Volume) -> str:
-    bits = [v.long_id or v.id, f"scan={v.scan_id}" if v.scan_id else ""]
+    scan = v.scan
+    bits = [v.long_id or v.id, f"scan={v.scan_id}" if v.scan_id else "", f"({scan.name})" if scan and scan.name else ""]
     if v.shape_zyx:
         bits.append("shape=" + "x".join(map(str, v.shape_zyx)))
     bits.append(f"segments={len(v.segments())}")

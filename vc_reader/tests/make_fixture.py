@@ -3,8 +3,9 @@
     python tests/make_fixture.py path/to/metadata.json
 
 The subset keeps real entries for the cases the tests cover and nulls the
-opaque provenance fields (``creation_info``, ``copy_info``, scan and volume
-``creation.metadata``) to keep it small.
+opaque provenance fields (``creation_info``, ``copy_info``, volume
+``creation.metadata``, and scan ``creation.metadata`` except the scan name) to
+keep it small.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from vc_reader._fetch import read_metadata_file  # noqa: E402
+from vc_reader.catalog import _scan_name  # noqa: E402
 
 KEEP = {
     # Scroll 1: two 2.4um volumes (78/137 keV), labels on the 78 keV volume only.
@@ -40,6 +42,16 @@ def _strip(entries):
             o["copy_info"] = None
 
 
+def _scan_name_only(md):
+    """Scan metadata reduced to the name, kept where the facility put it."""
+    name = _scan_name(md)
+    if name is None:
+        return None
+    if md.get("scan_name") == name:
+        return {"scan_name": name}
+    return {"metadata": {"tomo": {"acquisition": {"scanRadix": name}}}}
+
+
 def main(src: str) -> None:
     data = read_metadata_file(src)
     out = {"$schema": data.get("$schema"), "samples": {}, "models": data["models"]}
@@ -50,7 +62,9 @@ def main(src: str) -> None:
         for group in ("scans", "volumes", "segments"):
             for ent in tree[group].values():
                 _strip(ent.get("data"))
-                if group != "segments":
+                if group == "scans":
+                    ent["creation"]["metadata"] = _scan_name_only(ent["creation"].get("metadata") or {})
+                elif group == "volumes":
                     ent["creation"]["metadata"] = None
         out["samples"][sid] = tree
     dst = Path(__file__).parent / "data" / "metadata_subset.json"

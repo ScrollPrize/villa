@@ -40,7 +40,7 @@ def _cmd_volumes(cat: Catalog, args: argparse.Namespace) -> None:
     vols = sample.find_volumes(
         resolution=args.resolution, energy_kev=args.energy, scan=args.scan, include_superseded=True
     )
-    rows = [["volume", "um", "keV", "scan", "shape zyx", "license", "segments", "labels on", "notes"]]
+    rows = [["volume", "um", "keV", "scan", "scan name", "shape zyx", "license", "segments", "labels on", "notes"]]
     for v in vols:
         notes = []
         if v.is_superseded:
@@ -53,6 +53,7 @@ def _cmd_volumes(cat: Catalog, args: argparse.Namespace) -> None:
                 _fmt(v.pixel_size_um),
                 _fmt(v.energy_kev),
                 v.scan_id or "-",
+                (v.scan.name if v.scan else None) or "-",
                 "x".join(map(str, v.shape_zyx)) if v.shape_zyx else "-",
                 v.license.name if v.license else "-",
                 str(len(v.segments())),
@@ -104,7 +105,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     sp.add_argument("sample")
     sp.add_argument("--resolution", type=float, help="level-0 voxel size in um")
     sp.add_argument("--energy", type=float, help="X-ray energy in keV")
-    sp.add_argument("--scan", help="scan id or long id")
+    sp.add_argument("--scan", help="scan id, long id or name")
     sp.set_defaults(func=_cmd_volumes)
 
     sp = sub.add_parser("labels", help="ink labels on, or mappable onto, a volume")
@@ -112,7 +113,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     sp.add_argument("--volume", help="volume id or long id")
     sp.add_argument("--resolution", type=float, help="level-0 voxel size in um")
     sp.add_argument("--energy", type=float, help="X-ray energy in keV")
-    sp.add_argument("--scan", help="scan id or long id")
+    sp.add_argument("--scan", help="scan id, long id or name")
     sp.add_argument("--um", type=float, help="working scale in um (selects the pyramid level)")
     sp.add_argument("--direct-only", action="store_true", help="only labels published on this volume")
     sp.set_defaults(func=_cmd_labels)
