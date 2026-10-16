@@ -5,6 +5,15 @@ stl_generator.py
 A script to generate and export final STL models for all scroll cases found in a given input root directory.
 Each subfolder in the input directory should be named as the scroll number and contain a file named
    <scroll_number>-scaled.ply
+and optionally a file named
+   <scroll_number>-axis.txt
+giving the cylinder axis (e.g. along the umbilicus) in the mesh's coordinates, either as a direction
+(3 numbers) or as two points on the axis (6 numbers). Without it, the axis of the smallest enclosing
+cylinder is used. An optional
+   <scroll_number>-label.txt
+replaces the two label lines engraved on the top cap (default "PHerc<padded number>" and "v3") with its
+first one or two non-empty lines ('#' starts a comment), e.g. for an object without a number. Folder names
+that are not a number (optionally followed by one letter) are used unpadded.
 
 For each scroll, the script creates a subfolder (named using the padded scroll name) under the output root and saves:
    - <padded_scroll>_scroll.stl
@@ -35,16 +44,50 @@ def pad_scroll_name(scroll_number: str) -> str:
     Pads the numeric portion of the scroll number to 4 digits.
     For example, "800" becomes "0800" and "800A" becomes "0800A".
     """
-    if scroll_number and scroll_number[-1].isalpha():
+    if scroll_number and scroll_number[-1].isalpha() and scroll_number[:-1].isdigit():
         number_part = scroll_number[:-1]
         letter_part = scroll_number[-1].upper()
         padded = f"{int(number_part):04d}{letter_part}"
-    else:
+    elif scroll_number.isdigit():
         padded = f"{int(scroll_number):04d}"
+    else:
+        padded = scroll_number  # not a number (e.g. "sncass94"): used as it is
     return padded
 
 
-def process_scroll(padded_scroll: str, mesh_file: str, output_dir: str):
+def read_label(label_file: str) -> tuple[str, str]:
+    """
+    Reads the two label lines from a text file: the first one or two non-empty lines ('#' starts a comment).
+    A missing second line keeps the default "v3".
+    """
+    with open(label_file) as f:
+        lines = [line.split("#")[0].strip() for line in f]
+    lines = [line for line in lines if line]
+    if not lines or len(lines) > 2:
+        raise ValueError(f"{label_file}: expected one or two label lines, found {len(lines)}")
+    return lines[0], lines[1] if len(lines) == 2 else "v3"
+
+
+def read_axis(axis_file: str) -> tuple[float, float, float]:
+    """
+    Reads a cylinder axis from a text file of whitespace- or comma-separated numbers ('#' starts a comment):
+    3 numbers are a direction, 6 numbers are two points on the axis.
+    """
+    with open(axis_file) as f:
+        text = " ".join(line.split("#")[0] for line in f)
+    values = [float(v) for v in text.replace(",", " ").split()]
+    if len(values) == 6:
+        values = [b - a for a, b in zip(values[:3], values[3:])]
+    if len(values) != 3 or not any(values):
+        raise ValueError(
+            f"{axis_file}: expected a non-zero direction (3 numbers) or two distinct points (6 numbers)"
+        )
+    return tuple(values)
+
+
+def process_scroll(
+    padded_scroll: str, mesh_file: str, output_dir: str, cylinder_axis=None, label=None
+):
     """
     Process a single scroll:
       - Processes the mesh to build the lining.
@@ -59,6 +102,7 @@ def process_scroll(padded_scroll: str, mesh_file: str, output_dir: str):
     # Process the mesh to build the lining.
     scroll_mesh_params = mesh.ScrollMesh(
         mesh_file,
+        cylinder_axis=cylinder_axis,
     )
     (
         lining_mesh_pos,
@@ -75,8 +119,8 @@ def process_scroll(padded_scroll: str, mesh_file: str, output_dir: str):
     scroll_case_defaults = {
         "scroll_height_mm": height,
         "scroll_radius_mm": radius,
-        "label_line_1": f"PHerc{padded_scroll}",
-        "label_line_2": "v3",
+        "label_line_1": label[0] if label else f"PHerc{padded_scroll}",
+        "label_line_2": label[1] if label else "v3",
     }
 
     scroll_case = case.ScrollCaseConfig(**scroll_case_defaults)
@@ -148,7 +192,7 @@ def main():
         logger.error("No subdirectories found in the input root directory.")
         return
 
-    # Prepare a list of tasks: each task is a tuple (padded_scroll, mesh_file, scroll_output_dir)
+    # Prepare a list of tasks: each task is a tuple (padded_scroll, mesh_file, scroll_output_dir, axis, label)
     tasks = []
     for scroll_number in subdirs:
         padded_scroll = pad_scroll_name(scroll_number)
@@ -160,10 +204,30 @@ def main():
             )
             continue
 
+        axis_file = os.path.join(subdir_path, f"{scroll_number}-axis.txt")
+        cylinder_axis = None
+        if os.path.exists(axis_file):
+            try:
+                cylinder_axis = read_axis(axis_file)
+            except ValueError as exc:
+                logger.error(f"{exc}. Skipping.")
+                continue
+            print(f"{padded_scroll}: using cylinder axis {cylinder_axis} from {axis_file}")
+
+        label_file = os.path.join(subdir_path, f"{scroll_number}-label.txt")
+        label = None
+        if os.path.exists(label_file):
+            try:
+                label = read_label(label_file)
+            except ValueError as exc:
+                logger.error(f"{exc}. Skipping.")
+                continue
+            print(f"{padded_scroll}: label {label[0]!r} / {label[1]!r} from {label_file}")
+
         # Create output folder for this scroll case using the padded scroll name
         scroll_output_dir = os.path.join(output_root, padded_scroll)
         os.makedirs(scroll_output_dir, exist_ok=True)
-        tasks.append((padded_scroll, mesh_file, scroll_output_dir))
+        tasks.append((padded_scroll, mesh_file, scroll_output_dir, cylinder_axis, label))
 
     # List to accumulate CSV summary data as tuples: (Scroll ID, Height, Diameter)
     scroll_summary = []
@@ -175,8 +239,8 @@ def main():
         mp_context=multiprocessing.get_context("spawn"),
     ) as executor:
         future_to_scroll = {
-            executor.submit(process_scroll, padded, mesh_file, out_dir): padded
-            for padded, mesh_file, out_dir in tasks
+            executor.submit(process_scroll, padded, mesh_file, out_dir, axis, label): padded
+            for padded, mesh_file, out_dir, axis, label in tasks
         }
         for future in tqdm(
             as_completed(future_to_scroll),

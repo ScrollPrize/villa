@@ -214,8 +214,9 @@ const config = {
                 },
               ],
             },
-            { to: "/data_browser", label: "Data", position: "left" },
-            { to: "/winners", label: "Milestones", position: "left" },
+            // docSidebar items stay highlighted on every page of their sidebar.
+            { type: "docSidebar", sidebarId: "dataSidebar", label: "Data", position: "left" },
+            { type: "docSidebar", sidebarId: "milestonesSidebar", label: "Milestones", position: "left" },
             {
               type: "dropdown",
               label: "Community",
