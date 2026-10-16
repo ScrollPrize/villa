@@ -907,7 +907,8 @@ DetectorReport linkLinesToPatches(graph::GraphDb& db, size_t lineCount, const Li
         }
         checkCancelled(cancel);
         // Geometry work is complete before any registration writes. Preserve
-        // existing metadata and approval; UUID kind conflicts abort atomically.
+        // existing annotations; changed measurements invalidate approval.
+        // UUID kind conflicts abort atomically.
         util::reportProgress(params.progress, linkingStage, lineCount, lineCount);
         util::reportProgress(params.progress, "registering objects");
         auto txn = db.write();
@@ -929,7 +930,7 @@ DetectorReport linkLinesToPatches(graph::GraphDb& db, size_t lineCount, const Li
             const auto& s = *patch.surface;
             detail.gridWidth = s.quad->rawPointsPtr()->cols;
             detail.gridHeight = s.quad->rawPointsPtr()->rows;
-            detail.scale = s.quad->scale()[0];
+            detail.scale = {s.quad->scale()[0], s.quad->scale()[1]};
             detail.bbox = std::array<double, 6>{s.low[0] / params.patchScale, s.low[1] / params.patchScale,
                 s.low[2] / params.patchScale, s.high[0] / params.patchScale,
                 s.high[1] / params.patchScale, s.high[2] / params.patchScale};

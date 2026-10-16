@@ -162,7 +162,7 @@ nb::dict objectToPy(const vg::ObjectRecord& r)
         nb::dict p;
         p["grid_width"] = r.patch->gridWidth;
         p["grid_height"] = r.patch->gridHeight;
-        p["scale"] = r.patch->scale;
+        p["scale"] = nb::make_tuple(r.patch->scale[0], r.patch->scale[1]);
         p["bbox"] = bboxToPy(r.patch->bbox);
         d["patch"] = p;
     }
@@ -211,7 +211,12 @@ vg::ObjectRecord objectFromPy(const nb::dict& d)
         vg::PatchDetail det;
         det.gridWidth = getInt(p, "grid_width");
         det.gridHeight = getInt(p, "grid_height");
-        det.scale = getFloat(p, "scale");
+        if (has(p, "scale")) {
+            const nb::object scale = p["scale"];
+            if (nb::isinstance<nb::float_>(scale) || nb::isinstance<nb::int_>(scale))
+                det.scale.fill(nb::cast<double>(scale));
+            else det.scale = nb::cast<std::array<double, 2>>(scale);
+        }
         det.bbox = getBbox(p);
         r.patch = det;
     }
@@ -578,6 +583,11 @@ NB_MODULE(graph, m)
                     d["hostname"] = e.hostname;
                     d["timestamp"] = e.timestamp;
                     d["change_kind"] = e.changeKind;
+                    d["approval_state"] = e.approvalState ? nb::object(pyStr(*e.approvalState)) : nb::none();
+                    d["approved_by"] = e.approvedBy ? nb::object(pyStr(*e.approvedBy)) : nb::none();
+                    d["approved_at"] = e.approvedAt ? nb::object(pyStr(*e.approvedAt)) : nb::none();
+                    d["approved_host"] = e.approvedHost ? nb::object(pyStr(*e.approvedHost)) : nb::none();
+                    d["approved_generation"] = e.approvedGeneration ? nb::object(nb::int_(*e.approvedGeneration)) : nb::none();
                     out.append(d);
                 }
                 return out;

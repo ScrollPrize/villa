@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
+import uuid
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,135 @@ if os.environ.get("VC_BUILD_PYTHON"):
     vc.__path__.insert(0, str(Path(os.environ["VC_BUILD_PYTHON"]) / "vc"))
 graph = pytest.importorskip("vc.graph")
 GraphDb = graph.GraphDb
+
+
+def test_snapshot_preserves_provenance_and_conflicts_are_atomic(db, tmp_path):
+    a = db.upsert_object({"kind": "patch", "data_generation": 1,
+                          "patch": {"scale": [0.25, 0.5]}, "tags": ["review"]})
+    b = db.upsert_object({"kind": "fiber"})
+    edge = db.add_edge({"kind": "connected", "a": b, "b": a,
+                        "a_anchor": {"index": 3, "position": [1, 2, 3]}})
+    db.set_meta(a, "source", "scan")
+    db.set_meta(edge, "confidence", 0.8)
+    db.set_approval(a, "approved")
+    db.set_approval(edge, "rejected")
+    snapshot = json.loads(db.export_json())
+    assert snapshot["version"] == 2
+    with GraphDb.create(str(tmp_path / "restored.vcgr"), author="importer", hostname="elsewhere") as restored:
+        # Different internal IDs must not affect endpoint/anchor comparison.
+        swapped = dict(snapshot, objects=list(reversed(snapshot["objects"])))
+        restored.import_json(json.dumps(swapped))
+        for uid in (a, b):
+            assert restored.object(uid) == db.object(uid)
+        result = json.loads(restored.export_json())
+        assert result["edges"] == snapshot["edges"]
+        assert sorted(result["objects"], key=lambda o: o["uuid"]) == sorted(snapshot["objects"], key=lambda o: o["uuid"])
+        journal = restored.journal_since()
+        assert all(e["author"] == "importer" for e in journal)
+        restored.import_json(json.dumps(snapshot))
+        assert restored.journal_since() == journal
+        # Fail after a new record was inserted: the entire import rolls back.
+        conflicting = json.loads(json.dumps(snapshot))
+        new_object = dict(conflicting["objects"][0], uuid=str(uuid.uuid4()))
+        conflicting["objects"].insert(0, new_object)
+        conflicting["edges"][0]["meta"]["confidence"] = 0.1
+        with pytest.raises(RuntimeError, match="conflicts with existing edge"):
+            restored.import_json(json.dumps(conflicting))
+        assert restored.object(new_object["uuid"]) is None
+        assert restored.journal_since() == journal
+
+
+@pytest.mark.parametrize("kind", ["object", "edge"])
+def test_approval_journal_keeps_decisions_and_stamps(db, kind):
+    a = db.upsert_object({"kind": "fiber"})
+    uid = a
+    if kind == "edge":
+        b = db.upsert_object({"kind": "patch"})
+        uid = db.add_edge({"kind": "connected", "a": a, "b": b})
+    for state in ("approved", "rejected", "pending", "approved"):
+        db.set_approval(uid, state)
+    db.set_meta(uid, "edited", True)
+    entries = [e for e in db.journal_since() if e["record_uuid"] == uid]
+    assert [e["approval_state"] for e in entries] == ["pending", "approved", "rejected", "pending", "approved", "pending"]
+    for entry in (entries[1], entries[2], entries[4]):
+        assert entry["approved_by"] == "pytest"
+        assert entry["approved_host"] == "testhost"
+        assert entry["approved_at"]
+        assert entry["approved_generation"] == 1
+    assert entries[-1]["generation"] == 2
+    assert entries[-1]["approved_by"] is None
+
+
+def test_schema_v1_migration_preserves_surviving_approval(tmp_path):
+    path = tmp_path / "legacy.vcgr"
+    uid = uuid.uuid4()
+    with sqlite3.connect(path) as connection:
+        connection.executescript((Path(__file__).parent / "data" / "graph_v1.sql").read_text())
+        connection.execute("""INSERT INTO objects(uuid,kind,generation,created_by,created_at,created_host,
+            changed_by,changed_at,changed_host,approval_state,approved_by,approved_at,approved_host,approved_generation)
+            VALUES(?,'patch',7,'creator','created','original','editor','changed','workstation',
+                   'approved','reviewer','reviewed','reviewhost',7)""", (uid.bytes,))
+        connection.execute("INSERT INTO patches(object_id,scale) VALUES(1,0.25)")
+        connection.execute("""INSERT INTO journal(record_uuid,generation,author,hostname,timestamp,change_kind)
+            VALUES(?,7,'reviewer','reviewhost','reviewed','approval')""", (uid.bytes,))
+    with pytest.raises(RuntimeError, match="open read-write once"):
+        GraphDb.open(str(path), read_only=True)
+    with GraphDb.open(str(path), author="migrator") as migrated:
+        record = migrated.object(str(uid))
+        assert record["patch"]["scale"] == (0.25, 0.25)
+        assert record["generation"] == 7 and record["approved_by"] == "reviewer"
+        history = migrated.journal_since()
+        assert history[0]["approval_state"] is None  # no invented historical decision
+        assert history[1]["change_kind"] == "migration_snapshot"
+        assert history[1]["approval_state"] == "approved"
+        assert history[1]["approved_generation"] == 7
+        migrated.set_meta(str(uid), "edited", True)
+        assert migrated.journal_since()[1] == history[1]
+    with GraphDb.open(str(path), read_only=True) as reopened:
+        assert reopened.object(str(uid))["generation"] == 8
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        connection.execute("PRAGMA user_version=99")
+    for readonly in (True, False):
+        with pytest.raises(RuntimeError, match="unsupported schema version"):
+            GraphDb.open(str(path), author="tester", read_only=readonly)
+
+
+@pytest.mark.parametrize("scale, expected", [([0.25, 0.5], (0.25, 0.5)), (0.5, (0.5, 0.5))])
+def test_patch_import_tifxyz_metadata(db, tmp_path, scale, expected):
+    patches = tmp_path / "patches"
+    patch = patches / "valid"
+    patch.mkdir(parents=True)
+    uid = str(uuid.uuid4())
+    (patch / "meta.json").write_text(json.dumps({"uuid": uid, "type": "seg", "format": "tifxyz",
+        "scale": scale, "bbox": [[10, 20, 30], [40, 50, 60]]}))
+    bad = patches / "invalid"
+    bad.mkdir()
+    (bad / "meta.json").write_text(json.dumps({"uuid": str(uuid.uuid4()), "scale": [1, 2, 3]}))
+    report = db.import_patches(str(patches))
+    assert report["objects_imported"] == 1 and len(report["problems"]) == 1
+    record = db.object(uid)
+    assert record["patch"]["scale"] == expected
+    assert record["patch"]["bbox"] == (10, 20, 30, 40, 50, 60)
+    with GraphDb.create(str(tmp_path / "copy.vcgr"), author="copy") as copy:
+        copy.import_json(db.export_json())
+        assert copy.object(uid) == record
+
+
+def test_export_version_and_legacy_scalar_import(db):
+    uid = str(uuid.uuid4())
+    legacy = {"format": "vc_graph_export", "version": 1, "objects": [
+        {"uuid": uid, "kind": "patch", "data_generation": 5, "patch": {"scale": 0.5},
+         "approval_state": "approved"}], "edges": []}
+    db.import_json(json.dumps(legacy))
+    record = db.object(uid)
+    assert record["patch"]["scale"] == (0.5, 0.5)
+    assert record["generation"] == record["data_generation"] == 1
+    assert record["approved_by"] is None
+    snapshot = json.loads(db.export_json())
+    snapshot["version"] = 99
+    with pytest.raises(RuntimeError, match="unsupported export version"):
+        db.import_json(json.dumps(snapshot))
 
 
 @pytest.fixture()
@@ -187,7 +318,12 @@ def test_fiber_import_lengths_and_legacy_backfill(db, tmp_path, line, expected):
     db.set_approval(uid, "approved")
     before = db.object(uid)
     assert db.import_fibers(str(fibers))["problems"] == []
-    assert db.object(uid) == dict(before, fiber=dict(before["fiber"], length=expected))
+    after = db.object(uid)
+    assert after["fiber"] == dict(before["fiber"], length=expected)
+    assert after["generation"] == before["generation"] + (expected != 0)
+    assert after["approval_state"] == ("pending" if expected != 0 else "approved")
+    if expected != 0:
+        assert after["approved_by"] is None and after["approved_generation"] is None
     snapshot = db.export_json()
     journal = db.journal_since(0)
     assert db.import_fibers(str(fibers))["objects_imported"] == 0
@@ -411,13 +547,15 @@ def test_dbm_entry_subset_and_existing_relative_identity(db, tmp_path):
     first = db.link_tracks_to_tracks(str(path), source_ids=[0])
     assert first["problems"] == [] and first["candidates_found"] == 0
     assert len(db.objects_by_kind("track")) == 1
-    assert db.object(a)["generation"] == 1
-    expected = dict(before, track=dict(before["track"], length=30.0, family="horizontal"))
-    assert db.object(a) == expected
+    after = db.object(a)
+    assert after["generation"] == before["generation"] + 1
+    assert after["track"] == dict(before["track"], length=30.0, family="horizontal")
+    assert after["approval_state"] == "pending"
+    assert after["approved_generation"] is None
     second = db.link_tracks_to_tracks(str(path))
     assert second["problems"] == [] and second["edges_created"] == 1
     assert len(db.objects_by_kind("track")) == 2
-    assert db.object(a)["generation"] == 1
+    assert db.object(a) == after
     assert all(o["track"]["dataset_ref"] == packed.name for o in db.objects_by_kind("track"))
 
 
@@ -441,8 +579,8 @@ def test_track_polyline_lengths_include_bends_repeats_and_degenerate_tracks(db, 
     assert {o["track"]["external_key"]: o["track"]["family"] for o in objects} == {
         "10": "horizontal", "20": "horizontal", "30": "horizontal", "40": ""}
     if registered:
-        assert db.object(ids[0])["approval_state"] == "approved"
-        assert db.object(ids[0])["generation"] == 1
+        assert db.object(ids[0])["approval_state"] == "pending"
+        assert db.object(ids[0])["generation"] == 2
     before = db.export_json()
     assert db.link_tracks_to_tracks(str(packed))["problems"] == []
     assert db.export_json() == before

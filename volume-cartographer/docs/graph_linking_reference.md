@@ -52,8 +52,9 @@ Both fiber import and fiber-to-patch linking populate `fiber.length` from the
 full dense polyline in source voxels, including extensions beyond the control
 points. The importer uses the control-point polyline when there are no dense
 points. Linking scales do not affect the stored length. Existing lengths are
-refreshed on processing, including re-imports of unchanged files, without
-resetting approvals or generations.
+refreshed on processing, including re-imports of unchanged files. A changed
+length bumps the object generation, updates its change stamps, and resets its
+approval to pending. Identical lengths leave both generation and approval alone.
 
 Normals use the selected CT-only estimator: a 2/24 isotropic seed, followed by
 three 1/24/4 anisotropic tensor refinements with gradient magnitude weighting.
@@ -163,15 +164,18 @@ For a small run, optionally select source IDs with repeated
 `--track-source-id <id>` flags, or `source_ids=[...]` in Python. Source IDs are
 stable `source_ids.u64` values, not row numbers. Registration and edge updates
 commit together; failures leave neither partial registration nor partial edges.
-Reruns reuse existing UUIDs and preserve object approvals and generations.
+Reruns reuse existing UUIDs. Object approvals and generations are preserved
+when the stored measurements are unchanged.
 Both track linkers populate `track.length` with polyline arclength: the sum of
 Euclidean distances between consecutive raw points, in source dataset voxels.
 Repeated points contribute zero. Track-to-patch coordinate scaling does not
 change this stored length. Reruns refresh lengths for processed existing tracks
-without resetting their approvals or generations; unchanged lengths are a no-op.
+with normal content-change semantics: changed lengths bump generation and reset
+approval; unchanged lengths are a no-op.
 Track family is read from the packed family code: `horizontal`, `vertical`, or
 empty for unknown. Both linkers fill missing families on existing registrations;
-a conflicting nonempty family is reported as an input error.
+filling a missing family also bumps generation and resets approval, even if the
+length is unchanged. A conflicting nonempty family is reported as an input error.
 
 The advanced already-registered-track API is still available: omit the input
 path and optionally restrict `dataset_ref` / `track_uuids` in Python, or use a

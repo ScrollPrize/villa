@@ -33,7 +33,7 @@ namespace vc::graph {
 namespace {
 
 constexpr int kApplicationId = 0x56434752;  // VCGR
-constexpr int kSchemaVersion = 1;
+constexpr int kSchemaVersion = 2;
 
 [[noreturn]] void fail(sqlite3* db, const std::string& what)
 {
@@ -208,6 +208,7 @@ CREATE TABLE fibers(
 CREATE TABLE patches(
   object_id INTEGER PRIMARY KEY REFERENCES objects(id) ON DELETE CASCADE,
   grid_width INTEGER NOT NULL DEFAULT 0, grid_height INTEGER NOT NULL DEFAULT 0, scale REAL NOT NULL DEFAULT 0,
+  scale_y REAL NOT NULL DEFAULT 0,
   bbox_min_x REAL, bbox_min_y REAL, bbox_min_z REAL, bbox_max_x REAL, bbox_max_y REAL, bbox_max_z REAL
 );
 CREATE TABLE tracks(
@@ -255,7 +256,8 @@ CREATE TABLE journal(
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   record_uuid BLOB NOT NULL, generation INTEGER NOT NULL,
   author TEXT NOT NULL, hostname TEXT NOT NULL, timestamp TEXT NOT NULL,
-  change_kind TEXT NOT NULL
+  change_kind TEXT NOT NULL,
+  approval_state TEXT, approved_by TEXT, approved_at TEXT, approved_host TEXT, approved_generation INTEGER
 );
 CREATE INDEX journal_record ON journal(record_uuid, seq);
 )SQL";
@@ -295,6 +297,38 @@ int pragmaInt(sqlite3* db, const char* pragma)
     if (!s.row())
         throw std::runtime_error(std::string("graph db: PRAGMA ") + pragma + " returned no row");
     return int(s.i64(0));
+}
+
+void migrateSchema(sqlite3* db)
+{
+    exec(db, "BEGIN IMMEDIATE;");
+    try {
+        const int version = pragmaInt(db, "user_version");
+        if (version == 1) {
+            exec(db, "ALTER TABLE patches ADD COLUMN scale_y REAL NOT NULL DEFAULT 0;"
+                     "UPDATE patches SET scale_y=scale;"
+                     "ALTER TABLE journal ADD COLUMN approval_state TEXT;"
+                     "ALTER TABLE journal ADD COLUMN approved_by TEXT;"
+                     "ALTER TABLE journal ADD COLUMN approved_at TEXT;"
+                     "ALTER TABLE journal ADD COLUMN approved_host TEXT;"
+                     "ALTER TABLE journal ADD COLUMN approved_generation INTEGER;");
+            // Old decisions cannot be reconstructed. Preserve the state that
+            // survives migration before any subsequent edits can clear it.
+            for (const char* table : {"objects", "edges"}) {
+                exec(db, (std::string("INSERT INTO journal(record_uuid,generation,author,hostname,timestamp,change_kind,") +
+                    "approval_state,approved_by,approved_at,approved_host,approved_generation) "
+                    "SELECT uuid,generation,changed_by,changed_host,strftime('%Y-%m-%dT%H:%M:%SZ','now'),"
+                    "'migration_snapshot',approval_state,approved_by,approved_at,approved_host,approved_generation FROM " + table).c_str());
+            }
+            exec(db, "PRAGMA user_version=2;");
+        } else if (version != kSchemaVersion) {
+            throw std::runtime_error("graph db: unsupported schema version");
+        }
+        exec(db, "COMMIT;");
+    } catch (...) {
+        exec(db, "ROLLBACK;");
+        throw;
+    }
 }
 
 }  // namespace
@@ -382,8 +416,7 @@ std::unique_ptr<GraphDb::Impl> GraphDb::openImpl(const std::filesystem::path& pa
             exec(impl->writer, "PRAGMA synchronous=NORMAL;");
             if (pragmaInt(impl->writer, "application_id") != kApplicationId)
                 throw std::runtime_error("graph db: not a VC graph database: " + path.string());
-            if (pragmaInt(impl->writer, "user_version") != kSchemaVersion)
-                throw std::runtime_error("graph db: unsupported schema version in " + path.string());
+            migrateSchema(impl->writer);
         }
     }
 
@@ -393,9 +426,16 @@ std::unique_ptr<GraphDb::Impl> GraphDb::openImpl(const std::filesystem::path& pa
     const int readerFlags = options.readOnly ? SQLITE_OPEN_READONLY : SQLITE_OPEN_READWRITE;
     for (int i = 0; i < impl->options.readerPoolSize; ++i) {
         sqlite3* conn = openConnection(path, readerFlags, options, true);
-        if (options.readOnly && pragmaInt(conn, "application_id") != kApplicationId)
-            throw std::runtime_error("graph db: not a VC graph database: " + path.string());
         impl->readerPool.push_back(conn);
+        if (options.readOnly) {
+            if (pragmaInt(conn, "application_id") != kApplicationId)
+                throw std::runtime_error("graph db: not a VC graph database: " + path.string());
+            const auto version = pragmaInt(conn, "user_version");
+            if (version == 1)
+                throw std::runtime_error("graph db: schema v1 requires migration; open read-write once before opening read-only");
+            if (version != kSchemaVersion)
+                throw std::runtime_error("graph db: unsupported schema version in " + path.string());
+        }
     }
     return impl;
 }
@@ -506,13 +546,24 @@ const char* kObjectCols =
 void appendJournal(sqlite3* db, const std::string& author, const std::string& hostname,
                    const std::array<unsigned char, 16>& uuid, int64_t generation, const char* changeKind)
 {
-    Statement s(db, "INSERT INTO journal(record_uuid,generation,author,hostname,timestamp,change_kind) VALUES(?,?,?,?,?,?)");
+    Statement state(db, "SELECT approval_state,approved_by,approved_at,approved_host,approved_generation FROM objects WHERE uuid=? "
+                        "UNION ALL SELECT approval_state,approved_by,approved_at,approved_host,approved_generation FROM edges WHERE uuid=?");
+    state.bindBlob(1, uuid); state.bindBlob(2, uuid);
+    const bool hasState = state.row();
+    Statement s(db, "INSERT INTO journal(record_uuid,generation,author,hostname,timestamp,change_kind,"
+                    "approval_state,approved_by,approved_at,approved_host,approved_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?)");
     s.bindBlob(1, uuid);
     s.bind(2, generation);
     s.bind(3, author);
     s.bind(4, hostname);
     s.bind(5, nowIsoUtc());
     s.bind(6, std::string(changeKind));
+    for (int i = 0; i < 4; ++i) {
+        if (hasState && !state.isNull(i)) s.bind(7 + i, state.text(i));
+        else s.bindNull(7 + i);
+    }
+    if (hasState && !state.isNull(4)) s.bind(11, state.i64(4));
+    else s.bindNull(11);
     s.stepDone();
 }
 
@@ -588,15 +639,15 @@ ObjectRecord readObjectRow(sqlite3* db, const Statement& s)
             rec.fiber = f;
         }
     } else if (rec.kind == "patch") {
-        Statement d(db, "SELECT grid_width,grid_height,scale,bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z "
+        Statement d(db, "SELECT grid_width,grid_height,scale,scale_y,bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z "
                         "FROM patches WHERE object_id=?");
         d.bind(1, id);
         if (d.row()) {
             PatchDetail p;
             p.gridWidth = d.i64(0);
             p.gridHeight = d.i64(1);
-            p.scale = d.f64(2);
-            p.bbox = readBbox(d, 3);
+            p.scale = {d.f64(2), d.f64(3)};
+            p.bbox = readBbox(d, 4);
             rec.patch = p;
         }
     } else if (rec.kind == "track") {
@@ -649,11 +700,12 @@ void writeObjectDetail(sqlite3* db, int64_t id, const ObjectRecord& rec)
         bindBbox(s, 10, f.bbox);
         s.stepDone();
     } else if (rec.patch) {
-        Statement s(db, "INSERT INTO patches(object_id,grid_width,grid_height,scale,bbox_min_x,bbox_min_y,bbox_min_z,"
-                        "bbox_max_x,bbox_max_y,bbox_max_z) VALUES(?,?,?,?,?,?,?,?,?,?)");
+        Statement s(db, "INSERT INTO patches(object_id,grid_width,grid_height,scale,scale_y,bbox_min_x,bbox_min_y,bbox_min_z,"
+                        "bbox_max_x,bbox_max_y,bbox_max_z) VALUES(?,?,?,?,?,?,?,?,?,?,?)");
         const auto& p = *rec.patch;
-        s.bind(1, id); s.bind(2, p.gridWidth); s.bind(3, p.gridHeight); s.bind(4, p.scale);
-        bindBbox(s, 5, p.bbox);
+        s.bind(1, id); s.bind(2, p.gridWidth); s.bind(3, p.gridHeight);
+        s.bind(4, p.scale[0]); s.bind(5, p.scale[1]);
+        bindBbox(s, 6, p.bbox);
         s.stepDone();
     } else if (rec.track) {
         Statement s(db, "INSERT INTO tracks(object_id,dataset_ref,external_key,family,point_count,length,bbox_min_x,bbox_min_y,"
@@ -683,9 +735,26 @@ void writeTags(sqlite3* db, const char* table, const char* idColumn, int64_t id,
     }
 }
 
+void restoreCommon(sqlite3* db, const char* table, const RecordCommon& rec)
+{
+    Statement s(db, std::string("UPDATE ") + table + " SET generation=?,created_by=?,created_at=?,created_host=?,"
+        "changed_by=?,changed_at=?,changed_host=?,approval_state=?,approved_by=?,approved_at=?,approved_host=?,approved_generation=? WHERE uuid=?");
+    s.bind(1, rec.generation);
+    s.bind(2, rec.createdBy); s.bind(3, rec.createdAt); s.bind(4, rec.createdHost);
+    s.bind(5, rec.changedBy); s.bind(6, rec.changedAt); s.bind(7, rec.changedHost);
+    s.bind(8, rec.approvalState);
+    if (rec.approvedBy) s.bind(9, *rec.approvedBy); else s.bindNull(9);
+    if (rec.approvedAt) s.bind(10, *rec.approvedAt); else s.bindNull(10);
+    if (rec.approvedHost) s.bind(11, *rec.approvedHost); else s.bindNull(11);
+    if (rec.approvedGeneration) s.bind(12, *rec.approvedGeneration); else s.bindNull(12);
+    s.bindBlob(13, parseUuid(rec.uuid));
+    s.stepDone();
+}
+
 // preserveApproval is reserved for import paths seeding legacy records;
 // the public API always starts/resets approval through the normal rules.
-std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::string& host, const ObjectRecord& input, bool preserveApproval)
+std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::string& host, const ObjectRecord& input,
+                             bool preserveApproval, bool preserveRecord = false)
 {
     if (input.kind.empty())
         throw std::runtime_error("graph db: object kind must be non-empty");
@@ -746,7 +815,8 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
     }
     writeObjectDetail(db, id, rec);
     writeTags(db, "object_tags", "object_id", id, rec.tags);
-    appendJournal(db, author, host, uuid, generation, "upsert");
+    if (preserveRecord) restoreCommon(db, "objects", rec);
+    appendJournal(db, author, host, uuid, preserveRecord ? rec.generation : generation, preserveRecord ? "import" : "upsert");
     return rec.uuid;
 }
 
@@ -810,7 +880,8 @@ std::optional<int64_t> edgeIdByUuid(sqlite3* db, const std::array<unsigned char,
     return s.i64(0);
 }
 
-std::string addEdgeImpl(sqlite3* db, const std::string& author, const std::string& host, const EdgeRecord& input, bool preserveApproval)
+std::string addEdgeImpl(sqlite3* db, const std::string& author, const std::string& host, const EdgeRecord& input,
+                        bool preserveApproval, bool preserveRecord = false)
 {
     if (input.kind.empty())
         throw std::runtime_error("graph db: edge kind must be non-empty");
@@ -854,7 +925,8 @@ std::string addEdgeImpl(sqlite3* db, const std::string& author, const std::strin
     s.stepDone();
     const int64_t id = sqlite3_last_insert_rowid(db);
     writeTags(db, "edge_tags", "edge_id", id, rec.tags);
-    appendJournal(db, author, host, parseUuid(rec.uuid), 1, "add_edge");
+    if (preserveRecord) restoreCommon(db, "edges", rec);
+    appendJournal(db, author, host, parseUuid(rec.uuid), preserveRecord ? rec.generation : 1, preserveRecord ? "import" : "add_edge");
     return rec.uuid;
 }
 
@@ -922,7 +994,7 @@ void refreshLineMeasurements(sqlite3* db, const std::string& author, const std::
     update.bind(2, newFamily);
     update.bind(3, current.i64(0));
     update.stepDone();
-    appendJournal(db, author, host, key, current.i64(1), journalKind);
+    stampContentChange(db, author, host, "objects", current.i64(0), key, journalKind);
 }
 } // namespace
 
@@ -1225,7 +1297,8 @@ void GraphDb::removeMeta(WriteTxn& txn, const std::string& recordUuid, const std
 std::vector<JournalEntry> GraphDb::journalSince(const Txn& txn, int64_t afterSeq) const
 {
     sqlite3* db = GraphDbImplAccess::conn(txn);
-    Statement s(db, "SELECT seq,record_uuid,generation,author,hostname,timestamp,change_kind FROM journal WHERE seq>? ORDER BY seq");
+    Statement s(db, "SELECT seq,record_uuid,generation,author,hostname,timestamp,change_kind,"
+                    "approval_state,approved_by,approved_at,approved_host,approved_generation FROM journal WHERE seq>? ORDER BY seq");
     s.bind(1, afterSeq);
     std::vector<JournalEntry> out;
     while (s.row()) {
@@ -1237,6 +1310,11 @@ std::vector<JournalEntry> GraphDb::journalSince(const Txn& txn, int64_t afterSeq
         e.hostname = s.text(4);
         e.timestamp = s.text(5);
         e.changeKind = s.text(6);
+        e.approvalState = s.optText(7);
+        e.approvedBy = s.optText(8);
+        e.approvedAt = s.optText(9);
+        e.approvedHost = s.optText(10);
+        if (!s.isNull(11)) e.approvedGeneration = s.i64(11);
         out.push_back(std::move(e));
     }
     return out;
@@ -1385,11 +1463,64 @@ nlohmann::json bboxToJson(const std::optional<std::array<double, 6>>& box)
     return {(*box)[0], (*box)[1], (*box)[2], (*box)[3], (*box)[4], (*box)[5]};
 }
 
+std::array<double, 2> scaleFromJson(const nlohmann::json& value)
+{
+    std::array<double, 2> scale{};
+    if (value.is_number()) {
+        scale.fill(value.get<double>());  // v1 scalar scales were isotropic
+    } else if (value.is_array() && value.size() == 2) {
+        scale = {value.at(0).get<double>(), value.at(1).get<double>()};
+    } else {
+        throw std::runtime_error("graph db: patch scale must be a number or a two-element array");
+    }
+    for (double axis : scale)
+        if (!std::isfinite(axis) || axis < 0)
+            throw std::runtime_error("graph db: patch scale must be finite and nonnegative");
+    return scale;
+}
+
+nlohmann::json commonToJson(const RecordCommon& r)
+{
+    nlohmann::json j{{"uuid", r.uuid}, {"kind", r.kind}, {"generation", r.generation},
+        {"created_by", r.createdBy}, {"created_at", r.createdAt}, {"created_host", r.createdHost},
+        {"changed_by", r.changedBy}, {"changed_at", r.changedAt}, {"changed_host", r.changedHost},
+        {"tags", r.tags}, {"meta", nlohmann::json::parse(r.meta)}, {"approval_state", r.approvalState}};
+    j["approved_by"] = r.approvedBy ? nlohmann::json(*r.approvedBy) : nlohmann::json(nullptr);
+    j["approved_at"] = r.approvedAt ? nlohmann::json(*r.approvedAt) : nlohmann::json(nullptr);
+    j["approved_host"] = r.approvedHost ? nlohmann::json(*r.approvedHost) : nlohmann::json(nullptr);
+    j["approved_generation"] = r.approvedGeneration ? nlohmann::json(*r.approvedGeneration) : nlohmann::json(nullptr);
+    return j;
+}
+
+void commonFromJson(const nlohmann::json& j, RecordCommon& r)
+{
+    r.generation = j.at("generation").get<int64_t>();
+    if (r.generation < 1) throw std::runtime_error("graph db: snapshot generation must be positive");
+    r.createdBy = j.at("created_by").get<std::string>();
+    r.createdAt = j.at("created_at").get<std::string>();
+    r.createdHost = j.at("created_host").get<std::string>();
+    r.changedBy = j.at("changed_by").get<std::string>();
+    r.changedAt = j.at("changed_at").get<std::string>();
+    r.changedHost = j.at("changed_host").get<std::string>();
+    auto optionalText = [&](const char* key) -> std::optional<std::string> {
+        const auto& value = j.at(key);
+        return value.is_null() ? std::nullopt : std::optional(value.get<std::string>());
+    };
+    r.approvedBy = optionalText("approved_by");
+    r.approvedAt = optionalText("approved_at");
+    r.approvedHost = optionalText("approved_host");
+    if (!j.at("approved_generation").is_null()) r.approvedGeneration = j.at("approved_generation").get<int64_t>();
+    if (r.approvalState != "pending" && r.approvalState != "approved" && r.approvalState != "rejected")
+        throw std::runtime_error("graph db: invalid snapshot approval state");
+    if (r.approvedGeneration && *r.approvedGeneration != r.generation)
+        throw std::runtime_error("graph db: snapshot approval does not cover its generation");
+    if (r.approvalState == "pending" && (r.approvedBy || r.approvedAt || r.approvedHost || r.approvedGeneration))
+        throw std::runtime_error("graph db: pending snapshot has approval stamps");
+}
+
 nlohmann::json objectToJson(const ObjectRecord& r)
 {
-    nlohmann::json j;
-    j["uuid"] = r.uuid;
-    j["kind"] = r.kind;
+    nlohmann::json j = commonToJson(r);
     j["name"] = r.name;
     j["format_version"] = r.formatVersion;
     j["storage_kind"] = r.storageKind;
@@ -1451,7 +1582,7 @@ ObjectRecord objectFromJson(const nlohmann::json& j)
         PatchDetail d;
         d.gridWidth = p.value("grid_width", int64_t(0));
         d.gridHeight = p.value("grid_height", int64_t(0));
-        d.scale = p.value("scale", 0.0);
+        d.scale = scaleFromJson(p.value("scale", nlohmann::json(0.0)));
         if (p.contains("bbox")) d.bbox = bboxFromJson(p.at("bbox"));
         r.patch = d;
     }
@@ -1469,6 +1600,21 @@ ObjectRecord objectFromJson(const nlohmann::json& j)
     return r;
 }
 
+nlohmann::json edgeToJson(EdgeRecord e)
+{
+    // Stable across databases whose internal endpoint IDs differ.
+    if (e.bUuid < e.aUuid) {
+        std::swap(e.aUuid, e.bUuid);
+        std::swap(e.aAnchor, e.bAnchor);
+    }
+    auto j = commonToJson(e);
+    j["a"] = e.aUuid;
+    j["b"] = e.bUuid;
+    j["a_anchor"] = anchorToJson(e.aAnchor);
+    j["b_anchor"] = anchorToJson(e.bAnchor);
+    return j;
+}
+
 }  // namespace
 
 std::string GraphDb::exportJson(const Txn& txn, const std::optional<std::string>& objectKind,
@@ -1477,7 +1623,7 @@ std::string GraphDb::exportJson(const Txn& txn, const std::optional<std::string>
     sqlite3* db = GraphDbImplAccess::conn(txn);
     nlohmann::json out;
     out["format"] = "vc_graph_export";
-    out["version"] = 1;
+    out["version"] = 2;
     out["objects"] = nlohmann::json::array();
     out["edges"] = nlohmann::json::array();
     std::unordered_set<std::string> included;
@@ -1501,17 +1647,7 @@ std::string GraphDb::exportJson(const Txn& txn, const std::optional<std::string>
     while (edges.row()) {
         EdgeRecord e = readEdgeRow(db, edges);
         if (filtered && (!included.contains(e.aUuid) || !included.contains(e.bUuid))) continue;
-        nlohmann::json j;
-        j["uuid"] = e.uuid;
-        j["kind"] = e.kind;
-        j["a"] = e.aUuid;
-        j["b"] = e.bUuid;
-        j["a_anchor"] = anchorToJson(e.aAnchor);
-        j["b_anchor"] = anchorToJson(e.bAnchor);
-        j["tags"] = e.tags;
-        j["meta"] = nlohmann::json::parse(e.meta);
-        j["approval_state"] = e.approvalState;
-        out["edges"].push_back(std::move(j));
+        out["edges"].push_back(edgeToJson(e));
     }
     return out.dump(2);
 }
@@ -1522,21 +1658,58 @@ void GraphDb::importJson(WriteTxn& txn, const std::string& jsonText)
     const auto root = nlohmann::json::parse(jsonText);
     if (root.value("format", "") != "vc_graph_export")
         throw std::runtime_error("graph db: not a vc_graph_export document");
-    for (const auto& j : root.value("objects", nlohmann::json::array()))
-        upsertObjectImpl(db, impl_->options.author, impl_->hostname, objectFromJson(j), true);
-    for (const auto& j : root.value("edges", nlohmann::json::array())) {
-        EdgeRecord e;
-        e.uuid = j.value("uuid", "");
-        if (!e.uuid.empty() && edgeByUuid(txn, e.uuid)) continue;
-        e.kind = j.value("kind", "");
-        e.aUuid = j.value("a", "");
-        e.bUuid = j.value("b", "");
-        if (j.contains("a_anchor")) e.aAnchor = anchorFromJson(j.at("a_anchor"));
-        if (j.contains("b_anchor")) e.bAnchor = anchorFromJson(j.at("b_anchor"));
-        if (j.contains("tags")) e.tags = j.at("tags").get<std::vector<std::string>>();
-        if (j.contains("meta")) e.meta = j.at("meta").dump();
-        e.approvalState = j.value("approval_state", "pending");
-        addEdgeImpl(db, impl_->options.author, impl_->hostname, e, true);
+    const int version = root.value("version", 1);
+    if (version != 1 && version != 2)
+        throw std::runtime_error("graph db: unsupported export version");
+    const bool snapshot = version == 2;
+    // A failed import must not leave half a snapshot, even if the caller
+    // catches the error and commits other work in its enclosing transaction.
+    exec(db, "SAVEPOINT graph_import;");
+    try {
+        std::set<std::string> seen;
+        auto checkIdentity = [&](std::string& uuid) {
+            uuid = formatUuid(parseUuid(uuid));
+            if (!seen.insert(uuid).second)
+                throw std::runtime_error("graph db: duplicate snapshot UUID: " + uuid);
+        };
+        for (const auto& j : root.at("objects")) {
+            auto object = objectFromJson(j);
+            checkIdentity(object.uuid);
+            if (snapshot) commonFromJson(j, object);
+            else object.dataGeneration = object.dataGeneration > 0 ? 1 : 0;
+            if (edgeByUuid(txn, object.uuid))
+                throw std::runtime_error("graph db: snapshot UUID belongs to an edge: " + object.uuid);
+            if (auto existing = objectByUuid(txn, object.uuid)) {
+                if (snapshot && objectToJson(*existing) == objectToJson(object)) continue;
+                throw std::runtime_error("graph db: snapshot conflicts with existing object: " + object.uuid);
+            }
+            upsertObjectImpl(db, impl_->options.author, impl_->hostname, object, true, snapshot);
+        }
+        for (const auto& j : root.at("edges")) {
+            EdgeRecord e;
+            e.uuid = j.at("uuid").get<std::string>();
+            checkIdentity(e.uuid);
+            e.kind = j.at("kind").get<std::string>();
+            e.aUuid = formatUuid(parseUuid(j.at("a").get<std::string>()));
+            e.bUuid = formatUuid(parseUuid(j.at("b").get<std::string>()));
+            if (j.contains("a_anchor")) e.aAnchor = anchorFromJson(j.at("a_anchor"));
+            if (j.contains("b_anchor")) e.bAnchor = anchorFromJson(j.at("b_anchor"));
+            if (j.contains("tags")) e.tags = j.at("tags").get<std::vector<std::string>>();
+            if (j.contains("meta")) e.meta = j.at("meta").dump();
+            e.approvalState = j.value("approval_state", "pending");
+            if (snapshot) commonFromJson(j, e);
+            if (objectByUuid(txn, e.uuid))
+                throw std::runtime_error("graph db: snapshot UUID belongs to an object: " + e.uuid);
+            if (auto existing = edgeByUuid(txn, e.uuid)) {
+                if (snapshot && edgeToJson(*existing) == edgeToJson(e)) continue;
+                throw std::runtime_error("graph db: snapshot conflicts with existing edge: " + e.uuid);
+            }
+            addEdgeImpl(db, impl_->options.author, impl_->hostname, e, true, snapshot);
+        }
+        exec(db, "RELEASE graph_import;");
+    } catch (...) {
+        exec(db, "ROLLBACK TO graph_import; RELEASE graph_import;");
+        throw;
     }
 }
 
@@ -1808,9 +1981,25 @@ ImportReport importPatches(GraphDb& db, WriteTxn& txn, const std::filesystem::pa
         o.storageRef = relativeToDb(db, dir);
         o.dataGeneration = 1;
         PatchDetail p;
-        p.gridWidth = root.value("grid_width", int64_t(0));
-        p.gridHeight = root.value("grid_height", int64_t(0));
-        p.scale = root.value("scale", 0.0);
+        try {
+            p.gridWidth = root.value("grid_width", int64_t(0));
+            p.gridHeight = root.value("grid_height", int64_t(0));
+            p.scale = scaleFromJson(root.value("scale", nlohmann::json(0.0)));
+            if (root.contains("bbox")) {
+                const auto& box = root.at("bbox");
+                if (box.is_array() && box.size() == 2 && box.at(0).is_array() && box.at(1).is_array() &&
+                    box.at(0).size() == 3 && box.at(1).size() == 3) {
+                    p.bbox = std::array<double, 6>{box[0][0].get<double>(), box[0][1].get<double>(), box[0][2].get<double>(),
+                        box[1][0].get<double>(), box[1][1].get<double>(), box[1][2].get<double>()};
+                } else {
+                    p.bbox = bboxFromJson(box);
+                    if (!p.bbox) throw std::runtime_error("invalid patch bbox");
+                }
+            }
+        } catch (const std::exception& e) {
+            report.problems.push_back(dir.filename().string() + ": invalid patch metadata: " + e.what());
+            continue;
+        }
         o.patch = p;
         db.upsertObject(txn, o);
         ++report.objectsImported;

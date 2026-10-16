@@ -707,7 +707,7 @@ DetectorReport linkPatchOverlaps(graph::GraphDb& db, const std::filesystem::path
             const auto* points = patch.surface->rawPointsPtr();
             detail.gridWidth = points->cols;
             detail.gridHeight = points->rows;
-            detail.scale = patch.scale[0];
+            detail.scale = {patch.scale[0], patch.scale[1]};
             detail.bbox = std::array<double, 6>{patch.bboxLow[0], patch.bboxLow[1], patch.bboxLow[2],
                                                 patch.bboxHigh[0], patch.bboxHigh[1], patch.bboxHigh[2]};
             rec.patch = detail;

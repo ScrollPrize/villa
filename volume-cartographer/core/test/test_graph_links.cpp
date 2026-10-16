@@ -115,6 +115,31 @@ TEST_CASE("commitCandidates stamps provenance, pending, dedupes")
     CHECK(again.staleRemoved == 0);
 }
 
+TEST_CASE("patch importer reads actual QuadSurface metadata with distinct axis scales")
+{
+    TempDir tmp("patch_import_format");
+    const auto patches = tmp.dir / "patches";
+    cv::Mat_<cv::Vec3f> points(4, 5);
+    for (int r = 0; r < points.rows; ++r)
+        for (int c = 0; c < points.cols; ++c)
+            points(r, c) = cv::Vec3f(100 + c, 200 + r, 300);
+    QuadSurface surface(points, cv::Vec2f(0.25f, 0.5f));
+    fs::create_directories(patches / "patch");
+    surface.save(patches / "patch", true);
+    const auto uuid = QuadSurface(patches / "patch").objectUuid();
+    auto db = makeDb(tmp.dir);
+    { auto w = db.write(); const auto report = importPatches(db, w, patches);
+      REQUIRE(report.problems.empty()); CHECK(report.objectsImported == 1); w.commit(); }
+    auto r = db.read();
+    const auto record = db.objectByUuid(r, uuid);
+    REQUIRE(record.has_value()); REQUIRE(record->patch.has_value());
+    CHECK(record->patch->scale[0] == 0.25);
+    CHECK(record->patch->scale[1] == 0.5);
+    REQUIRE(record->patch->bbox.has_value());
+    CHECK((*record->patch->bbox)[0] == 100);
+    CHECK((*record->patch->bbox)[4] == 203);
+}
+
 TEST_CASE("stale replacement removes only own pending edges")
 {
     TempDir tmp("stale");
@@ -935,7 +960,7 @@ TEST_CASE("track-patch uses fiber strip rules, raw anchors and existing track id
     { auto read = db.read(); const auto object = db.objectByUuid(read, track);
       CHECK(object->track->length == 480); // source units, despite trackScale=0.5
       CHECK(object->track->family == "horizontal");
-      CHECK(object->approvalState == "approved"); CHECK(object->generation == 2); }
+      CHECK(object->approvalState == "pending"); CHECK(object->generation == 3); }
     std::map<std::string, nlohmann::json> fiberEvidence;
     for (const auto& edge : fiberEdges(db, fiber))
         fiberEvidence[edge.aUuid == fiber ? edge.bUuid : edge.aUuid] = nlohmann::json::parse(edge.meta)["fiber_patch"];

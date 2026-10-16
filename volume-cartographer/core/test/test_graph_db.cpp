@@ -121,7 +121,7 @@ TEST_CASE("create, open, and validation")
     }
 }
 
-TEST_CASE("derived track length preserves review, journals changes and rolls back")
+TEST_CASE("changed track measurements invalidate review, journal changes and roll back")
 {
     TempDir tmp("track_length");
     auto db = GraphDb::create(tmp.dir / "graph.vcgr", testOptions());
@@ -134,11 +134,14 @@ TEST_CASE("derived track length preserves review, journals changes and rolls bac
     { auto write = db.write(); db.setTrackLength(write, uuid, 17); write.commit(); }
     const auto after = getObject(db, uuid);
     CHECK(after.track->length == 17);
-    CHECK(after.generation == before.generation);
-    CHECK(after.changedAt == before.changedAt);
-    CHECK(after.approvedBy == before.approvedBy);
-    CHECK(after.approvedGeneration == before.approvedGeneration);
-    CHECK(after.approvalState == "approved");
+    CHECK(after.generation == before.generation + 1);
+    CHECK(after.changedBy == "tester");
+    CHECK(after.changedHost == "testhost");
+    CHECK_FALSE(after.approvedBy.has_value());
+    CHECK_FALSE(after.approvedAt.has_value());
+    CHECK_FALSE(after.approvedHost.has_value());
+    CHECK_FALSE(after.approvedGeneration.has_value());
+    CHECK(after.approvalState == "pending");
     int64_t seq;
     { auto read = db.read(); const auto journal = db.journalSince(read, 0);
       CHECK(journal.back().changeKind == "track_length"); seq = journal.back().seq; }
@@ -428,6 +431,51 @@ TEST_CASE("export and re-import preserve the graph")
     CHECK(edge->kind == "same-surface");
     CHECK(edge->approvalState == "approved");
     CHECK(db2.componentOf(r, a).size() == 2);
+}
+
+TEST_CASE("snapshot conflicts roll back only the import when caught inside a transaction")
+{
+    TempDir tmp("import_conflict");
+    auto source = GraphDb::create(tmp.dir / "source.vcgr", testOptions());
+    const auto a = addObject(source, "fiber", "first");
+    const auto b = addObject(source, "patch", "second");
+    std::string snapshot;
+    { auto read = source.read(); snapshot = source.exportJson(read); }
+    auto target = GraphDb::create(tmp.dir / "target.vcgr", testOptions());
+    auto conflicting = makeObject("patch", "local edit");
+    conflicting.uuid = b;
+    auto write = target.write();
+    target.upsertObject(write, conflicting);
+    const auto local = target.upsertObject(write, makeObject("fiber", "unrelated"));
+    const auto journalSize = target.journalSince(write, 0).size();
+    CHECK_THROWS(target.importJson(write, snapshot));
+    CHECK_FALSE(target.objectByUuid(write, a).has_value());
+    CHECK(target.objectByUuid(write, b)->name == "local edit");
+    CHECK(target.objectByUuid(write, local).has_value());
+    CHECK(target.journalSince(write, 0).size() == journalSize);
+    write.commit();
+    CHECK(getObject(target, b).name == "local edit");
+}
+
+TEST_CASE("family-only refresh invalidates approval and unchanged measurements preserve it")
+{
+    TempDir tmp("family_refresh");
+    auto db = GraphDb::create(tmp.dir / "graph.vcgr", testOptions());
+    auto object = makeObject("track");
+    object.track = TrackDetail{"dataset", "1"};
+    object.track->length = 17;
+    std::string uuid;
+    { auto w = db.write(); uuid = db.upsertObject(w, object); db.setApproval(w, uuid, "approved"); w.commit(); }
+    { auto w = db.write(); db.setTrackLength(w, uuid, 17, "horizontal"); w.commit(); }
+    CHECK(getObject(db, uuid).generation == 2);
+    CHECK(getObject(db, uuid).approvalState == "pending");
+    { auto w = db.write(); db.setApproval(w, uuid, "approved"); w.commit(); }
+    size_t journalSize;
+    { auto r = db.read(); journalSize = db.journalSince(r, 0).size(); }
+    { auto w = db.write(); db.setTrackLength(w, uuid, 17, "horizontal"); w.commit(); }
+    CHECK(getObject(db, uuid).generation == 2);
+    CHECK(getObject(db, uuid).approvalState == "approved");
+    { auto r = db.read(); CHECK(db.journalSince(r, 0).size() == journalSize); }
 }
 
 namespace

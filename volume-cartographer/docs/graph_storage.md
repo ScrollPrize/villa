@@ -44,3 +44,52 @@ report stale paths even when UUID discovery succeeds.
 Track records use their existing dataset reference and external track key;
 they are not individual UUID-bearing patch/fiber files and are outside this
 resolver's scope.
+
+## Record snapshots and approval history
+
+JSON export version 2 preserves each object's and edge's UUID, generation,
+creation/change stamps, approval state and approval stamps, along with its
+metadata, tags, detail fields and storage references. Import restores these
+fields exactly. Importing identical existing records is a no-op; a conflicting
+UUID rejects the whole import, without overwriting local changes. The import
+uses a savepoint, so a caller can catch a conflict without committing a partial
+snapshot. Unknown export versions are rejected.
+
+Each imported record receives a local journal entry attributed to the importer;
+its original authors remain on the record. A snapshot contains current records,
+not the source journal or external geometry, and is not a distributed merge or
+a complete database backup. Use a database copy after checkpointing for history.
+
+Legacy version 1 exports remain readable into fresh identities. Their missing
+provenance cannot be recovered: records start at generation 1, positive
+`data_generation` values become 1, and approval stamps remain unknown.
+
+The journal now captures approval state, reviewer, time, host and reviewed
+generation after each record mutation. Approval decisions remain visible after
+another decision or a content edit. Changes to derived lengths and fills of
+missing track families count as content edits: generation increases, change
+stamps update, and approval returns to pending. Identical measurements do not
+write a journal entry or invalidate approval.
+
+## Schema migration and patch scale
+
+Schema v1 databases migrate to v2 atomically on a writable open:
+
+```python
+with GraphDb.open("/data/graph.vcgr", author="reviewer"):
+    pass
+```
+
+Read-only opens never migrate and report when a writable open is needed first.
+Older binaries cannot open the migrated database for writing. Historical v1
+journal entries have null approval snapshot fields because the old decisions
+were not stored. Migration adds `migration_snapshot` entries preserving the
+current approval of every surviving record; it does not invent past decisions.
+
+Patch `scale` is now a two-element array in JSON, a pair in Python, and
+`std::array<double, 2>` in C++, matching the column/row values written by
+QuadSurface. Both axes survive import, export and linking. Legacy scalar input
+is accepted as isotropic; migration copies the stored scalar to both axes.
+Anisotropy previously discarded by v1 cannot be recovered from the database.
+Patch import also reads the nested bounding box in `meta.json`; malformed scale
+or bounding-box fields are reported and that patch is skipped.

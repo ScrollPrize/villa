@@ -34,7 +34,7 @@ struct FiberDetail {
 struct PatchDetail {
     int64_t gridWidth = 0;
     int64_t gridHeight = 0;
-    double scale = 0.0;
+    std::array<double, 2> scale{0.0, 0.0};  // column and row scale, as in tifxyz meta.json
     std::optional<std::array<double, 6>> bbox;
 };
 
@@ -91,6 +91,10 @@ struct JournalEntry {
     std::string recordUuid;
     int64_t generation = 0;
     std::string author, hostname, timestamp, changeKind;
+    // Approval snapshot after this change. Unknown for pre-v2 history
+    // and deletion events; migration records the surviving current state.
+    std::optional<std::string> approvalState, approvedBy, approvedAt, approvedHost;
+    std::optional<int64_t> approvedGeneration;
 };
 
 struct OpenOptions {
@@ -163,8 +167,8 @@ public:
     // empty) or updates by UUID; updates bump generation, restamp
     // changed_*, reset approval, and journal. Returns the UUID.
     std::string upsertObject(WriteTxn& txn, const ObjectRecord& record);
-    // Refresh derived geometry metadata without changing the track's geometry,
-    // generation, or approval. Journals a changed value; identical values are a no-op.
+    // Refresh geometry metadata. Changed values bump generation, restamp
+    // changed_*, reset approval and journal; identical values are a no-op.
     // An optional packed-store family fills an unset family; conflicts fail.
     void setTrackLength(WriteTxn& txn, const std::string& uuid, double length,
                         const std::optional<std::string>& family = std::nullopt);
@@ -238,9 +242,10 @@ public:
     // JSON export/import of the metadata graph (records only; external
     // data referenced by UUID/ref). Export optionally restricts to one
     // object kind and/or one tag. Import runs in the caller's WriteTxn
-    // and preserves UUIDs, generations are not preserved (fresh records
-    // start at generation 1), approval states are preserved with null
-    // stamps where unknown.
+    // Version 2 preserves UUIDs, generations and all record provenance.
+    // Existing identical records are a no-op; conflicts are rejected (no merge).
+    // Version 1 remains readable but cannot restore missing provenance.
+    // Journal history is local and is not part of a graph snapshot.
     std::string exportJson(const Txn& txn, const std::optional<std::string>& objectKind = std::nullopt,
                            const std::optional<std::string>& tag = std::nullopt) const;
     void importJson(WriteTxn& txn, const std::string& jsonText);
