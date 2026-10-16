@@ -1875,6 +1875,7 @@ class DinoIBOTPretrainer:
 
     def save_checkpoint(self, step: int) -> Path:
         path = self.output_dir / f"checkpoint_step_{step:06d}.pt"
+        tmp_path = path.with_suffix(".pt.tmp")
         torch.save(
             {
                 "step": step,
@@ -1893,8 +1894,9 @@ class DinoIBOTPretrainer:
                 "rng_state": self._capture_rng_state(),
                 "object_heads_start_step": self.object_heads_start_step,
             },
-            path,
+            tmp_path,
         )
+        tmp_path.replace(path)
         return path
 
     # Modules that may be added or upgraded after a checkpoint was written.

@@ -17,8 +17,8 @@
   "clip_grad": 3.0,
   "ibot_masked_loss_chunk_size": 4096,
   "max_iterations": 1000000,
-  "batch_size": 14,
-  "grad_accumulation_steps": 1,
+  "batch_size": 12,
+  "grad_accumulation_steps": 2,
   "train_monitor_every_n": 500,
   "monitor_batch_size": 12,
   "monitor_pca_sets": 4,
@@ -42,15 +42,15 @@
     "attention_type": "full",
     "attention_backend": "cudnn",
     "embedding_type": "deeper",
-    "embed_dim": 288,
+    "embed_dim": 480,
     "depth": 10,
-    "num_heads": 6,
+    "num_heads": 10,
     "patch_size": [8, 8, 8],
-    "deeper_embed_stage_channels": [16, 48, 128, 192],
+    "deeper_embed_stage_channels": [32, 64, 128, 256],
     "deeper_embed_stage_strides": [1, 2, 2, 2],
     "deeper_embed_depth_per_level": [1, 2, 2, 1],
     "deeper_embed_use_stem": true,
-    "deeper_embed_stem_channels": 16,
+    "deeper_embed_stem_channels": 32,
     "deeper_embed_stem_type": "conv",
     "deeper_embed_final_projection": true,
     "deeper_embed_batch_chunk_size": null,
@@ -72,9 +72,9 @@
     "untie_cls_and_patch_norms": false,
     "untie_global_and_local_cls_norm": true,
     "scale_mlp": false,
-    "mlp_ratio": 7.111111111111111,
+    "mlp_ratio": 7.2,
     "qkv_bias": false,
-    "grad_checkpointing": false
+    "grad_checkpointing": true
   },
   "gram": {
     "enabled": false
@@ -92,7 +92,7 @@
     "ink_queue_size": 512,
     "ramp_steps": 2000,
     "head": {
-      "hidden_dim": 256,
+      "hidden_dim": 384,
       "out_dim": 64,
       "ink_dim": 32,
       "region_dim": 128
@@ -409,10 +409,10 @@
       },
       {
         "sample_id": "PHerc1667",
-        "pixel_size_um": 7.91,
-        "scan_location": "DLS (Diamond Light Source)",
-        "volume_path": "https://data.aws.ash2txt.org/samples/PHerc1667/volumes/20231117161658-7.910um-53keV-masked.zarr/",
-        "volume_scale": 0
+        "pixel_size_um": 9.596,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc1667/volumes/20251217075048-2.399um-0.2m-78keV-masked.zarr/",
+        "volume_scale": 2
       },
       {
         "sample_id": "PHercParis4",
@@ -516,7 +516,7 @@
   },
   "lr_schedule": "constant",
   "koleo_distributed": true,
-  "koleo_loss_group_size": 28,
+  "koleo_loss_group_size": 24,
   "use_amp": true,
   "point_supervision": {
     "enabled": false
