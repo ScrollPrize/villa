@@ -583,6 +583,14 @@ NB_MODULE(graph, m)
                 return out;
             },
             nb::arg("after_seq") = 0)
+        .def("resolve_storage_path",
+             [](PyGraphDb& self, const std::string& uuid,
+                const std::optional<std::filesystem::path>& datasetRoot) {
+                 return self.withRead([&](vg::GraphDb& g, vg::ReadTxn& t) {
+                     return g.resolveStoragePath(t, uuid, datasetRoot);
+                 });
+             }, nb::arg("uuid"), nb::arg("dataset_root") = std::nullopt,
+             "Find a patch/fiber by source UUID, verifying the saved path before searching the dataset root.")
         .def("sweep_external_data",
              [](PyGraphDb& self) { return self.withRead([](vg::GraphDb& g, vg::ReadTxn& t) { return g.sweepExternalData(t); }); })
         .def("checkpoint", [](PyGraphDb& self) { self.require().checkpoint(); })

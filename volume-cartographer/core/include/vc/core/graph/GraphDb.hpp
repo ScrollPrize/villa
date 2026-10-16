@@ -67,7 +67,7 @@ struct ObjectRecord : RecordCommon {
     std::string name;
     int64_t formatVersion = 0;
     std::string storageKind;  // e.g. "file", "dataset", "" (db-only)
-    std::string storageRef;   // path relative to the DB directory, or dataset URI
+    std::string storageRef;   // location hint relative to DB directory, or dataset URI; uuid is identity
     int64_t dataGeneration = 0;
     std::optional<std::string> dataChecksum;
     std::optional<FiberDetail> fiber;
@@ -212,6 +212,19 @@ public:
     void removeMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key);
 
     std::vector<JournalEntry> journalSince(const Txn& txn, int64_t afterSeq) const;
+
+    // Resolve a file-backed patch/fiber by its source UUID. First verify
+    // storageRef against meta.json (patch) or the fiber JSON, then search
+    // datasetRoot recursively if the hint is stale. The default root is
+    // the DB directory; an explicit root also rebases relative hints.
+    // Returns an absolute path, or nullopt for unknown/unsupported/missing
+    // objects. Throws on ambiguous fallback matches or traversal errors.
+    // Discovery skips hidden directories and Zarr stores, does not follow
+    // directory symlinks, and reads JSON only (no geometry). No DB writes
+    // or persistent cache: subsequent calls see renamed/replaced files.
+    std::optional<std::filesystem::path> resolveStoragePath(
+        const Txn& txn, const std::string& objectUuid,
+        const std::optional<std::filesystem::path>& datasetRoot = std::nullopt) const;
 
     // Reports objects whose external data reference does not check out
     // (storage file missing, or data_generation ahead of generation).

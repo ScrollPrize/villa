@@ -544,6 +544,73 @@ TEST_CASE("patch importer registers segments and ignores overlapping.json")
         CHECK(db.edgesOf(r, p.uuid).empty());
 }
 
+TEST_CASE("external geometry resolves by UUID after rename and path reuse")
+{
+    TempDir tmp("resolve_uuid");
+    const auto patches = tmp.dir / "patches";
+    const auto fibers = tmp.dir / "fibers";
+    const std::string patchUuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const std::string fiberUuid = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    writeText(patches / "original" / "meta.json", "{\"uuid\":\"" + patchUuid + "\"}");
+    writeText(fibers / "original.json", "{\"uuid\":\"" + fiberUuid + "\",\"line_points\":[]}");
+    auto db = GraphDb::create(tmp.dir / "graph.vcgr", testOptions());
+    {
+        auto w = db.write();
+        REQUIRE(importPatches(db, w, patches).objectsImported == 1);
+        REQUIRE(importFibers(db, w, fibers).objectsImported == 1);
+        w.commit();
+    }
+    auto r = db.read();
+    CHECK(db.resolveStoragePath(r, patchUuid) == patches / "original");
+    CHECK(db.resolveStoragePath(r, fiberUuid) == fibers / "original.json");
+    fs::rename(patches / "original", patches / "renamed");
+    fs::rename(fibers / "original.json", fibers / "renamed.json");
+    // Reusing the old name must not silently substitute a different object.
+    writeText(patches / "original" / "meta.json", "{\"uuid\":\"" + fiberUuid + "\"}");
+    writeText(fibers / "original.json", "{\"uuid\":\"" + patchUuid + "\",\"line_points\":[]}");
+    writeText(fibers / "broken.json", "invalid JSON");
+    CHECK(db.resolveStoragePath(r, patchUuid) == patches / "renamed");
+    CHECK(db.resolveStoragePath(r, fiberUuid) == fibers / "renamed.json");
+    CHECK(db.objectByUuid(r, patchUuid)->storageRef == "patches/original");
+    CHECK(db.objectByUuid(r, fiberUuid)->generation == 1);
+    // A fallback search refuses ambiguous copies of the same UUID.
+    fs::copy_file(fibers / "renamed.json", fibers / "duplicate.json");
+    CHECK_THROWS(db.resolveStoragePath(r, fiberUuid));
+    fs::remove(fibers / "duplicate.json");
+    fs::remove(fibers / "renamed.json");
+    CHECK_FALSE(db.resolveStoragePath(r, fiberUuid).has_value());
+}
+
+TEST_CASE("external geometry supports a separate dataset root on read-only graphs")
+{
+    TempDir tmp("resolve_root");
+    const auto source = tmp.dir / "source";
+    const std::string uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    writeText(source / "patches" / "old" / "meta.json", "{\"uuid\":\"" + uuid + "\"}");
+    {
+        auto db = GraphDb::create(source / "graph.vcgr", testOptions());
+        auto w = db.write();
+        importPatches(db, w, source / "patches");
+        w.commit();
+        db.checkpoint();
+    }
+    fs::rename(source / "graph.vcgr", tmp.dir / "graph.vcgr");
+    fs::rename(source, tmp.dir / "dataset");
+    const auto root = tmp.dir / "dataset";
+    fs::rename(root / "patches" / "old", root / "patches" / "new");
+    // A duplicate inside the strip cache must not participate in discovery.
+    writeText(root / ".strip-cache" / "copy" / "meta.json", "{\"uuid\":\"" + uuid + "\"}");
+    OpenOptions options;
+    options.readOnly = true;
+    auto db = GraphDb::open(tmp.dir / "graph.vcgr", options);
+    auto r = db.read();
+    CHECK(db.resolveStoragePath(r, uuid, root) == root / "patches" / "new");
+    CHECK(db.resolveStoragePath(r, uuid, root / "patches" / "new") == root / "patches" / "new");
+    CHECK_FALSE(db.resolveStoragePath(r, uuid, tmp.dir / "missing").has_value());
+    CHECK_FALSE(db.resolveStoragePath(r, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", root).has_value());
+    CHECK(db.objectByUuid(r, uuid)->generation == 1);
+}
+
 TEST_CASE("sweep reports missing external data")
 {
     TempDir tmp("sweep");

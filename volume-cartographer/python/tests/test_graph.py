@@ -61,6 +61,29 @@ def test_object_and_edge_roundtrip(db) -> None:
     assert len(db.edges_of(b)) == 1
 
 
+@pytest.mark.parametrize("kind", ["fiber", "patch"])
+def test_resolve_storage_path_by_uuid(db, tmp_path, kind) -> None:
+    uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    root = tmp_path / "dataset"
+    root.mkdir()
+    original = root / ("original" if kind == "patch" else "original.json")
+    if kind == "patch":
+        original.mkdir()
+        metadata = original / "meta.json"
+    else:
+        metadata = original
+    metadata.write_text(json.dumps({"uuid": uuid, "line_points": []}))
+    db.upsert_object({"uuid": uuid, "kind": kind, "name": "original",
+                      "storage_kind": "file", "storage_ref": original.name})
+    assert db.resolve_storage_path(uuid, dataset_root=root) == original
+    renamed = original.with_name("renamed" if kind == "patch" else "renamed.json")
+    original.rename(renamed)
+    assert db.resolve_storage_path(uuid, dataset_root=root) == renamed
+    assert db.resolve_storage_path(uuid) == renamed
+    assert db.object(uuid)["storage_ref"] == original.name
+    assert db.resolve_storage_path("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb") is None
+
+
 def test_kinds_are_data_not_api(db) -> None:
     # A kind the library has no detail table for uses the same verbs.
     odd = db.upsert_object({"kind": "widget", "name": "w"})
