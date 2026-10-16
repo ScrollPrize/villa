@@ -112,6 +112,11 @@ NB_MODULE(_native, m)
         .def("__len__", &vcr::MemoryCache::size)
         .def("clear", &vcr::MemoryCache::clear);
 
+    nb::class_<vcr::DiskCache>(m, "DiskCache")
+        .def(nb::init<const std::string&, std::int64_t>(), "root"_a, "max_bytes"_a,
+             nb::call_guard<nb::gil_scoped_release>())
+        .def("set_max_bytes", &vcr::DiskCache::set_max_bytes, nb::call_guard<nb::gil_scoped_release>());
+
     nb::class_<vcr::Array>(m, "Array")
         .def(
             "__init__",
@@ -120,7 +125,7 @@ NB_MODULE(_native, m)
                std::string remote_url, std::string remote_codec, AuthTuple auth, bool offline,
                std::string read_mode, bool hint, std::size_t threads, int connections, long stall_timeout_s, int retries,
                std::shared_ptr<vcr::MemoryCache> cache, std::size_t writer_threads,
-               std::size_t max_pending_write_bytes) {
+               std::size_t max_pending_write_bytes, std::shared_ptr<vcr::DiskCache> disk_cache) {
                 vcr::ArraySpec spec;
                 spec.shape = std::move(shape);
                 spec.chunks = std::move(chunks);
@@ -141,6 +146,7 @@ NB_MODULE(_native, m)
                 spec.threads = threads;
                 spec.writer_threads = writer_threads;
                 spec.max_pending_write_bytes = max_pending_write_bytes;
+                spec.disk_cache = std::move(disk_cache);
                 spec.http.connections = connections;
                 spec.http.stall_timeout_s = stall_timeout_s;
                 spec.http.retries = retries;
@@ -151,7 +157,7 @@ NB_MODULE(_native, m)
             "offline"_a = false, "read_mode"_a = "slab",
             "hint"_a = false, "threads"_a = 16, "connections"_a = 16, "stall_timeout_s"_a = 10,
             "retries"_a = 5, "cache"_a.none() = nb::none(), "writer_threads"_a = 4,
-            "max_pending_write_bytes"_a = std::size_t{1} << 30)
+            "max_pending_write_bytes"_a = std::size_t{1} << 30, "disk_cache"_a.none() = nb::none())
         .def(
             "read_many",
             [](vcr::Array& a, const std::vector<vcr::Index>& starts, const std::vector<vcr::Index>& sizes,

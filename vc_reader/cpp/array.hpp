@@ -5,6 +5,7 @@
 
 #include "chunk_io.hpp"
 #include "codecs.hpp"
+#include "disk_cache.hpp"
 #include "http.hpp"
 #include "memory_cache.hpp"
 #include "thread_pool.hpp"
@@ -166,6 +167,7 @@ struct ArraySpec {
     std::size_t threads = 16;
     std::size_t writer_threads = 4;                    // background disk-cache writes
     std::size_t max_pending_write_bytes = 1ull << 30;  // reads wait beyond this much unwritten data
+    std::shared_ptr<DiskCache> disk_cache;
     HttpOptions http;
 };
 
@@ -1291,13 +1293,21 @@ private:
                 const std::array<int, 3> shape{static_cast<int>(spec_.chunks[0]), static_cast<int>(spec_.chunks[1]),
                                                static_cast<int>(spec_.chunks[2])};
                 auto enc = encode_delta3d(decoded.data(), decoded.size(), shape, spec_.itemsize);
-                atomic_write(path, enc.data(), enc.size());
+                store_bytes(path, enc.data(), enc.size());
             } else {
-                atomic_write(path, decoded.data(), decoded.size());
+                store_bytes(path, decoded.data(), decoded.size());
             }
         } catch (const std::exception& e) {
             write_failed(e.what());
         }
+    }
+
+    void store_bytes(const std::string& path, const std::uint8_t* data, std::size_t size)
+    {
+        if (spec_.disk_cache)
+            spec_.disk_cache->write(path, data, size);
+        else
+            atomic_write(path, data, size);
     }
 
     void store_missing(const std::string& k)

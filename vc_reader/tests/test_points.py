@@ -131,7 +131,8 @@ def test_index_arrays_follow_numpy(array):
         np.testing.assert_array_equal(r[z, y, x], exp[z, y, x])  # broadcast to (2, 4), negatives wrap
         np.testing.assert_array_equal(r[3, [1, 2], [4, 5]], exp[3, [1, 2], [4, 5]])
         np.testing.assert_array_equal(r[[0, 1], 2, 3], exp[[0, 1], 2, 3])
-        for bad in [(np.array([37]), 0, 0), (0, [1, 2], slice(None)), (np.array([True]), 0, 0)]:
+        np.testing.assert_array_equal(r[0, [1, 2], :], exp[0, [1, 2], :])
+        for bad in [(np.array([37]), 0, 0), (np.array([True]), 0, 0)]:
             with pytest.raises(IndexError):
                 r[bad]
 

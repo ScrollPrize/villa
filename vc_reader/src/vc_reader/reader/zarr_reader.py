@@ -21,8 +21,8 @@ worker on Linux) inherits the reader but not its threads. A reader therefore
 notices when it is used in a different process than it was opened in, and
 rebuilds its native engine there from its saved settings (as unpickling does);
 the inherited engine is left untouched, and the parent still finishes its own
-queued cache writes. Each forked reader starts with an empty memory cache of the
-same size (a MemoryCache shared by several readers is not shared in the child).
+queued cache writes. A shared MemoryCache starts empty in each worker and
+retains one budget shared by all the readers that reference it.
 Workers started with ``spawn``/``forkserver`` receive a pickled reader, which is
 reopened the same way.
 """
@@ -30,6 +30,8 @@ reopened the same way.
 from __future__ import annotations
 
 import itertools
+import json
+import operator
 import os
 import weakref
 from pathlib import Path
@@ -40,10 +42,10 @@ import numpy as np
 from .. import _native
 from ..errors import CacheMissError
 from .auth import Access, http_url, is_remote, resolve_access
-from .disk_cache import CacheLayer, cached_source_zarray, open_layers
+from .disk_cache import CacheLayer, cached_source_zarray, open_layers, cached_node_dirs, atomic_write, disk_budget
+from .memory_cache import MemoryCache
 from .zarr_meta import ArrayMeta
 
-MemoryCache = _native.MemoryCache
 READ_MODES = ("mmap", "slab")
 
 # Native engines inherited through fork, kept alive and never touched: their
@@ -111,6 +113,7 @@ class ZarrReader:
         else:
             self.meta = _read_zarray(self.location, self.access)
         self._spec = dict(spec, meta=dict(self.meta.raw))
+        self._attrs = spec.get("attrs")
         # Raises for arrays the native reader cannot decode; offline, chunks only come from the caches.
         codec = "" if self.offline else self.meta.codec_id
         self.cache_layers: list[CacheLayer] = []
@@ -124,7 +127,7 @@ class ZarrReader:
                 self.cache_layers, self.write_layer = open_layers(
                     spec["cache_dirs"], key_url, self.meta, group_url=group_url, level_key=spec["level_key"],
                     writable=spec["cache_writes"] and not self.offline, allow_lossy=spec["allow_lossy_cache"],
-                    compress=spec["compress_cache"])
+                    compress=spec["compress_cache"], cache_max_bytes=spec["cache_max_bytes"])
                 layers = [layer.native_spec() for layer in self.cache_layers]
                 if self.write_layer is not None:
                     write_index = self.cache_layers.index(self.write_layer)
@@ -137,12 +140,15 @@ class ZarrReader:
             identity = "file://" + root
         threads = spec["threads"] or (32 if remote_url else min(16, os.cpu_count() or 4))
         try:
+            budget = (disk_budget(self.write_layer.budget_root, spec["cache_max_bytes"])
+                      if self.write_layer is not None and self.write_layer.budget_root else None)
             self._array = _native.Array(
                 list(self.meta.shape), list(self.meta.chunks), self.meta.dtype.itemsize,
                 np.asarray(self.meta.fill_value, dtype=self.meta.dtype).tobytes(), self.meta.separator, identity,
                 layers, write_layer=write_index, remote_url=remote_url, remote_codec=codec if remote_url else "",
                 auth=_native_auth, offline=self.offline, read_mode=spec["read_mode"], threads=threads,
-                connections=spec["connections"], cache=cache)
+                connections=spec["connections"], cache=cache._native if cache is not None else None,
+                disk_cache=budget)
         except BaseException:
             for layer in self.cache_layers:
                 layer.close()
@@ -160,6 +166,7 @@ class ZarrReader:
         level: int | str | None = None,
         cache_dir: str | os.PathLike[str] | Sequence[str | os.PathLike[str]] | None = None,
         cache_writes: bool = True,
+        cache_max_bytes: int | None = None,
         compress_cache: bool = False,
         allow_lossy_cache: bool = False,
         memory_cache: int | MemoryCache | None = None,
@@ -198,6 +205,12 @@ class ZarrReader:
         cache whose chunks are quantized (lossy relative to the source) is
         skipped unless ``allow_lossy_cache``.
 
+        ``cache_max_bytes`` optionally caps stored chunk payload bytes across
+        decoded arrays in the first explicit cache directory. Oldest writes
+        are evicted first; metadata and VC3D-managed caches are retained.
+        Capped readers only append to that decoded cache. The budget is shared
+        across processes via SQLite; offline/read-only opens never evict.
+
         ``memory_cache`` is a byte budget or a :class:`MemoryCache` shared
         between readers. ``threads`` (default 16 local, 32 remote) read and
         decode; at most ``connections`` HTTP requests are in flight.
@@ -208,20 +221,17 @@ class ZarrReader:
         call (e.g. a Linux DataLoader worker) it rebuilds them on first use.
         """
         spec, cache = _make_spec(location, level=level, cache_dir=cache_dir, cache_writes=cache_writes,
+                                 cache_max_bytes=cache_max_bytes,
                                  compress_cache=compress_cache, allow_lossy_cache=allow_lossy_cache,
                                  memory_cache=memory_cache, threads=threads, connections=connections,
                                  read_mode=read_mode, auth=auth, offline=offline)
         return cls(spec, cache)
 
     def __getstate__(self):
-        # The new process reopens from the recorded metadata (no network round trip),
-        # with an empty memory cache of the same size.
-        budget = self.memory_cache.max_bytes if self.memory_cache is not None else 0
-        return {"spec": self._spec, "memory_cache_bytes": budget}
+        return {"spec": dict(self._spec, attrs=self._attrs), "memory_cache": self.memory_cache}
 
     def __setstate__(self, state):
-        budget = state["memory_cache_bytes"]
-        self.__init__(state["spec"], MemoryCache(budget) if budget else None)
+        self.__init__(state["spec"], state["memory_cache"])
 
     def __repr__(self) -> str:
         return f"ZarrReader({self.location!r}, shape={self.shape}, chunks={self.chunks}, dtype={self.dtype})"
@@ -231,8 +241,7 @@ class ZarrReader:
         if self._pid == os.getpid() or self._array is None:
             return
         self._abandon_inherited()
-        budget = self.memory_cache.max_bytes if self.memory_cache is not None else 0
-        self.__init__(self._spec, MemoryCache(budget) if budget else None)
+        self.__init__(dict(self._spec, attrs=self._attrs), self.memory_cache)
 
     def _abandon_inherited(self) -> None:
         self._finalizer.detach()  # the parent flushes and closes its own engine
@@ -261,6 +270,51 @@ class ZarrReader:
         self.close()
 
     # -- array properties --------------------------------------------------------
+
+    @property
+    def attrs(self) -> dict[str, Any]:
+        """Array attributes, loaded lazily. Editing this dict does not change the store.
+
+        Remote attributes read online are saved alongside writable caches for
+        offline use. A cache predating attribute support raises offline until
+        its attributes have been fetched once.
+        """
+        if self._attrs is None:
+            self._ready()
+            if self.offline:
+                for root in cached_node_dirs(self._spec["cache_dirs"], cache_url(self.location, self.access)):
+                    # Decoded-cache .zattrs belongs to the cache, not the source.
+                    path = root / ".vc_reader_source_attrs.json"
+                    if path.is_file():
+                        self._attrs = json.loads(path.read_bytes())
+                        break
+                else:
+                    raise CacheMissError(f"array attributes for {self.location} are not cached (offline)")
+            else:
+                data = read_node_file(self.location, ".zattrs", self.access)
+                self._attrs = json.loads(data) if data is not None else {}
+                self._cache_attrs()
+        return self._attrs
+
+    def _cache_attrs(self) -> None:
+        if self._attrs is not None and self.write_layer is not None:
+            try:
+                atomic_write(Path(self.write_layer.root) / ".vc_reader_source_attrs.json",
+                             json.dumps(self._attrs).encode())
+            except OSError:
+                pass  # Attribute access still works with a read-only cache.
+
+    @property
+    def compressor(self):
+        return self.meta.compressor
+
+    @property
+    def filters(self):
+        return list(self.meta.filters) or None
+
+    @property
+    def order(self) -> str:
+        return self.meta.order
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -396,10 +450,66 @@ class ZarrReader:
     def __getitem__(self, key: Any) -> np.ndarray:
         keys = key if isinstance(key, tuple) else (key,)
         if any(isinstance(k, (np.ndarray, list)) for k in keys):
+            if len(keys) < self.ndim or any(isinstance(k, slice) or k is Ellipsis for k in keys):
+                return self._read_mixed_index(keys)
             return self.read_points(_index_points(keys, self.shape))
         start, size, squeeze = _parse_index(key, self.shape)
         out = self.read(start, size)
         return out[tuple(0 if s else slice(None) for s in squeeze)] if any(squeeze) else out
+
+    def __array__(self, dtype=None, copy=None) -> np.ndarray:
+        """Materialize the array, as with ``reader[:]``."""
+        if copy is False:
+            raise ValueError("reading a Zarr array requires a copy")
+        values = self[...]
+        return values if dtype is None else values.astype(dtype, copy=False)
+
+    def _read_mixed_index(self, keys: tuple) -> np.ndarray:
+        """NumPy integer-array/slice indexing, assembled as a batch of thin blocks."""
+        original = keys
+        keys = _expand_index(keys, self.ndim)
+        if not any(isinstance(key, slice) for key in keys):
+            return self.read_points(_index_points(keys, self.shape))
+        arrays, axes, starts, sizes, slice_shape = [], [], [], [], []
+        for axis, (key, dim) in enumerate(zip(keys, self.shape)):
+            if isinstance(key, slice):
+                lo, hi, step = key.indices(dim)
+                if step != 1:
+                    raise IndexError("only unit-step slices are supported")
+                starts.append(lo)
+                sizes.append(max(hi - lo, 0))
+                slice_shape.append(max(hi - lo, 0))
+            else:
+                arrays.append(_integer_indices(key, dim))
+                axes.append(axis)
+                starts.append(0)
+                sizes.append(1)
+        arrays = np.broadcast_arrays(*arrays)
+        advanced_shape = arrays[0].shape
+        # Scalars participate in NumPy's advanced-axis placement too. A
+        # separating ellipsis still matters when it expands to zero axes.
+        separated = axes[-1] - axes[0] + 1 != len(axes)
+        if any(k is Ellipsis for k in original):
+            e = next(i for i, k in enumerate(original) if k is Ellipsis)
+            separated |= (any(not isinstance(k, slice) for k in original[:e]) and
+                          any(not isinstance(k, slice) for k in original[e + 1:]))
+        insert = 0 if separated else axes[0]
+        output_shape = tuple(slice_shape[:insert]) + advanced_shape + tuple(slice_shape[insert:])
+        result = _empty(output_shape, self.dtype)
+        regions, outputs = [], []
+        for idx in np.ndindex(advanced_shape):
+            start = starts.copy()
+            for axis, indices in zip(axes, arrays):
+                start[axis] = int(indices[idx])
+            selection = (slice(None),) * insert + idx + (slice(None),) * (len(slice_shape) - insert)
+            # Singleton dimensions can be inserted without copying the output.
+            view = result[selection]
+            for axis in axes:
+                view = np.expand_dims(view, axis)
+            regions.append((start, sizes))
+            outputs.append(view)
+        self.read_many(regions, out=outputs)
+        return result
 
     def _ready(self) -> None:
         """Rebuild after a fork, check the reader is open, and pass on refreshed credentials."""
@@ -430,6 +540,7 @@ def _make_spec(
     group: str | None = None,
     cache_dir: str | os.PathLike[str] | Sequence[str | os.PathLike[str]] | None = None,
     cache_writes: bool = True,
+    cache_max_bytes: int | None = None,
     compress_cache: bool = False,
     allow_lossy_cache: bool = False,
     memory_cache: int | MemoryCache | None = None,
@@ -467,8 +578,15 @@ def _make_spec(
         dirs = [os.fspath(d) for d in cache_dir]
     if offline and is_remote(loc) and not dirs:
         raise ValueError("offline reads of a remote array need cache_dir")
+    if cache_max_bytes is not None:
+        cache_max_bytes = operator.index(cache_max_bytes)
+        if cache_max_bytes < 0:
+            raise ValueError("cache_max_bytes must be nonnegative or None")
+        if is_remote(loc) and not dirs:
+            raise ValueError("cache_max_bytes requires cache_dir")
     access = auth if isinstance(auth, Access) else resolve_access(loc, auth)
     spec = dict(location=loc, group=group, level_key=level_key, cache_dirs=dirs, cache_writes=cache_writes,
+                cache_max_bytes=cache_max_bytes,
                 compress_cache=compress_cache, allow_lossy_cache=allow_lossy_cache, threads=threads,
                 connections=connections, read_mode=read_mode, meta=meta, access=access, offline=offline)
     return spec, _memory_cache(memory_cache)
@@ -507,12 +625,7 @@ def _parse_index(key: Any, shape: tuple[int, ...]) -> tuple[list[int], list[int]
     """numpy basic indexing (ints, unit-step slices, Ellipsis) -> start, size, axes to drop."""
     if not isinstance(key, tuple):
         key = (key,)
-    if any(k is Ellipsis for k in key):
-        i = next(i for i, k in enumerate(key) if k is Ellipsis)
-        key = key[:i] + (slice(None),) * (len(shape) - len(key) + 1) + key[i + 1:]
-    if len(key) > len(shape):
-        raise IndexError(f"too many indices for array of dimension {len(shape)}")
-    key = key + (slice(None),) * (len(shape) - len(key))
+    key = _expand_index(key, len(shape))
     start, size, squeeze = [], [], []
     for k, dim in zip(key, shape):
         if isinstance(k, slice):
@@ -523,7 +636,7 @@ def _parse_index(key: Any, shape: tuple[int, ...]) -> tuple[list[int], list[int]
             size.append(max(b - a, 0))
             squeeze.append(False)
         else:
-            i = int(k)
+            i = operator.index(k)
             if i < 0:
                 i += dim
             if not 0 <= i < dim:
@@ -539,19 +652,36 @@ def _index_points(keys: tuple, shape: tuple[int, ...]) -> np.ndarray:
     if len(keys) != len(shape) or any(isinstance(k, slice) or k is Ellipsis or k is None for k in keys):
         raise IndexError("index arrays must be combined with integers only, one per axis "
                          "(use read() for blocks, read_points() for points)")
-    arrays = []
-    for k, dim in zip(keys, shape):
-        a = np.asarray(k)
-        if a.dtype.kind == "b":
-            raise IndexError("boolean indexing is not supported")
-        if a.dtype.kind not in "iu" and a.size:
-            raise IndexError(f"index arrays must be integers, got {a.dtype}")
-        a = a.astype(np.int64)
-        a = np.where(a < 0, a + dim, a)
-        if a.size and (a.min() < 0 or a.max() >= dim):
-            raise IndexError(f"index out of bounds for axis of size {dim}")
-        arrays.append(a)
+    arrays = [_integer_indices(k, dim) for k, dim in zip(keys, shape)]
     return np.stack(np.broadcast_arrays(*arrays), axis=-1)
+
+
+def _integer_indices(key: Any, dim: int) -> np.ndarray:
+    a = np.asarray(key)
+    if a.dtype.kind == "b":
+        raise IndexError("boolean indexing is not supported")
+    if a.dtype.kind not in "iu" and a.size:
+        raise IndexError(f"index arrays must be integers, got {a.dtype}")
+    if a.dtype.kind == "u" and a.size and a.max() >= dim:
+        raise IndexError(f"index out of bounds for axis of size {dim}")
+    a = a.astype(np.int64)
+    a = np.where(a < 0, a + dim, a)
+    if a.size and (a.min() < 0 or a.max() >= dim):
+        raise IndexError(f"index out of bounds for axis of size {dim}")
+    return a
+
+
+def _expand_index(keys: tuple, ndim: int) -> tuple:
+    if sum(k is Ellipsis for k in keys) > 1:
+        raise IndexError("an index can only have a single ellipsis")
+    if any(k is Ellipsis for k in keys):
+        i = next(i for i, k in enumerate(keys) if k is Ellipsis)
+        keys = keys[:i] + (slice(None),) * max(0, ndim - len(keys) + 1) + keys[i + 1:]
+    if len(keys) > ndim:
+        raise IndexError(f"too many indices for array of dimension {ndim}")
+    if any(k is None for k in keys):
+        raise IndexError("newaxis indexing is not supported")
+    return keys + (slice(None),) * (ndim - len(keys))
 
 
 def open_zarr(location: str | os.PathLike[str], **kwargs: Any) -> ZarrReader:

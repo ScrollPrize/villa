@@ -65,7 +65,8 @@ def data():
 
 
 MISSING = {(1, 1, 1), (0, 3, 2)}
-VARIANTS = {"raw": dict(), "raw-dot-sep": dict(sep="."), "blosc": dict(compressor=BLOSC)}
+VARIANTS = {"raw": dict(), "raw-dot-sep": dict(sep="."), "blosc": dict(compressor=BLOSC),
+            "zstd": dict(compressor={"id": "zstd", "level": 1})}
 
 
 @pytest.fixture(scope="module", params=sorted(VARIANTS))
@@ -289,12 +290,13 @@ def server(tmp_path_factory, data):
     root = tmp_path_factory.mktemp("www")
     _write_zarr(str(root / "raw.zarr"), data, CHUNKS, missing=MISSING)
     _write_zarr(str(root / "blosc.zarr"), data, CHUNKS, missing=MISSING, compressor=BLOSC)
+    _write_zarr(str(root / "zstd.zarr"), data, CHUNKS, missing=MISSING, compressor={"id": "zstd", "level": 1})
     httpd, base = _serve(root)
     yield httpd, base
     httpd.shutdown()
 
 
-@pytest.mark.parametrize("name", ["raw.zarr", "blosc.zarr"])
+@pytest.mark.parametrize("name", ["raw.zarr", "blosc.zarr", "zstd.zarr"])
 def test_http_reads(server, data, name):
     httpd, base = server
     exp = _expected(data, MISSING, CHUNKS)

@@ -2,9 +2,9 @@ cmake_minimum_required(VERSION 3.20)
 project(vc_reader_native LANGUAGES CXX)
 
 # Native read path for vc_reader (module vc_reader._native), built by
-# scikit-build-core. Needs libcurl and c-blosc development files:
-#   Ubuntu: apt install libcurl4-openssl-dev libblosc-dev
-#   macOS:  brew install c-blosc   (libcurl comes with the SDK)
+# scikit-build-core. Needs libcurl, c-blosc, zstd and SQLite development files:
+#   Ubuntu: apt install libcurl4-openssl-dev libblosc-dev libzstd-dev libsqlite3-dev
+#   macOS:  brew install c-blosc zstd sqlite   (libcurl comes with the SDK)
 # VC-Delta3D is fetched at a pinned commit (the same codec VC3D links).
 
 set(CMAKE_CXX_STANDARD 20)
@@ -22,6 +22,8 @@ find_package(Threads REQUIRED)
 find_package(CURL REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(BLOSC REQUIRED IMPORTED_TARGET blosc)
+pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
+find_package(SQLite3 3.24 REQUIRED)
 
 include(FetchContent)
 set(VC_DELTA3D_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
@@ -37,5 +39,5 @@ set_target_properties(vc_delta3d PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # NOMINSIZE: nanobind otherwise appends -Os, which costs the point samplers ~8%.
 nanobind_add_module(_native NB_STATIC NOMINSIZE cpp/bindings.cpp)
 target_include_directories(_native PRIVATE cpp)
-target_link_libraries(_native PRIVATE CURL::libcurl PkgConfig::BLOSC vc_delta3d::vc_delta3d Threads::Threads)
+target_link_libraries(_native PRIVATE CURL::libcurl PkgConfig::BLOSC PkgConfig::ZSTD SQLite::SQLite3 vc_delta3d::vc_delta3d Threads::Threads)
 install(TARGETS _native LIBRARY DESTINATION vc_reader)

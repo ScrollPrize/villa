@@ -121,6 +121,8 @@ crop = r.read((8192, 3584, 3584), (128, 128, 128))   # out-of-bounds parts read 
 crops = r.read_many([(start, (64, 64, 64)) for start in starts])  # one parallel read; shared chunks read once
 crops = r.read_many(regions, out=crops)               # reuse arrays: no first-touch page faults
 block = r[8192:8704, 3584:4096, 3584:4096]
+layers = r[[8192, 8194, 8198], 3584:4096, 3584:4096]  # selected layers and spatial slices
+r.attrs                                             # array .zattrs, loaded on first access
 
 ZarrReader.open("/data/volume.zarr/2")                # local array
 ZarrReader.open("s3://vesuvius-challenge-open-data/…/volume.zarr", level=2)
@@ -139,6 +141,7 @@ from vc_reader.reader import ZarrGroup, S3Credentials
 g = ZarrGroup.open("s3://private-bucket/scroll.zarr", cache_dir="/data/cache", memory_cache=8 << 30)
 g.levels, g.attrs                                     # ("0", ..., "5") from OME multiscales, else "0", "1", ...
 r = g.level(2)                                        # ZarrReader; g["labels/ink"], "mask" in g, g.keys()
+g.array_keys(), g.group_keys()                        # immediate children, filtered by node type
 vol.open_group()                                      # a catalog Volume's OME-Zarr root
 
 ZarrGroup.open(url, cache_dir="/data/cache", offline=True)   # only the disk caches, never the network
@@ -152,10 +155,12 @@ ZarrReader.open("s3://bucket/v.zarr/0", auth=S3Credentials(key_id, secret, regio
 > inherits the reader but not those threads. So a reader notices when it is
 > used in a process other than the one that opened it, and rebuilds its native
 > engine there from its saved settings. The parent keeps its own engine and
-> finishes its own queued cache writes. In the child, each reader starts with
-> an empty memory cache of the same size: a `MemoryCache` shared by several
-> readers is not shared there. Workers started with `spawn` or `forkserver`
-> receive a pickled reader, which is reopened the same way.
+> finishes its own queued cache writes. In each child, a shared `MemoryCache`
+> starts empty and retains one budget shared by its readers. Workers started
+> with `spawn` or `forkserver` preserve that sharing when the readers are
+> pickled together, as in a dataset. Separate pickle streams create separate
+> caches. Cache contents are process-local, so multiply the budget by the
+> number of workers when planning total memory.
 
 - **Credentials** (`auth=`): the default `"auto"` signs `s3://` requests to
   buckets without a known public https form with AWS credentials from the
@@ -175,6 +180,18 @@ ZarrReader.open("s3://bucket/v.zarr/0", auth=S3Credentials(key_id, secret, regio
   none of them holds raises `vc_reader.CacheMissError`, and chunks the caches
   mark as absent read as `fill_value`. Groups opened online with a writable
   cache store their `.zgroup`/`.zattrs` there for later offline use.
+- **Array metadata**: `r.attrs` lazily reads source `.zattrs`; `r.compressor`,
+  `r.filters` and `r.order` expose the array's storage metadata. Attribute
+  dictionaries are in-memory snapshots; changing them does not write the
+  source. Attributes fetched with a writable cache are stored in
+  `.vc_reader_source_attrs.json`, separate from the cache's own `.zattrs`.
+  Accessing `.attrs` offline raises `CacheMissError` if it has never been
+  cached; a recorded absence of source `.zattrs` returns `{}`.
+- **Indexing**: integer arrays can be mixed with unit-step slices, with NumPy
+  broadcasting, axis ordering and negative-index handling. These selections
+  use batched block reads. `np.asarray(r)` materializes the entire array;
+  use slices for large volumes. Boolean indexing, new axes and non-unit
+  slice steps are not supported.
 - **Points and sampling**: `read_points` gathers stored values at integer
   indices; `sample` interpolates at real coordinates (voxel `i` at coordinate
   `i`; `order=1` n-linear in float64, returned as float32 or float64, with
@@ -186,7 +203,10 @@ ZarrReader.open("s3://bucket/v.zarr/0", auth=S3Credentials(key_id, secret, regio
   arrays `"0"`, `"1"`, … `keys()` lists local directories, consolidated
   `.zmetadata`, S3 prefixes (ListObjectsV2) or, offline, the caches; plain
   HTTP servers cannot be listed, so open children by name there.
-- **Codecs**: uncompressed, blosc and vc-delta3d chunks in C order. Other
+- **Codecs**: uncompressed, blosc, standalone zstd, LZW and vc-delta3d chunks
+  in C order. LZW supports TIFF-style MSB-first byte streams under
+  [`imagecodecs_lzw`](https://github.com/cgohlke/imagecodecs/blob/master/imagecodecs/numcodecs.py)
+  or the alias `lzw`; it does not open TIFF containers. Other
   arrays (numcodecs filters, Fortran order, other compressors) raise
   `ValueError` when opened.
 - **Disk caches** (`cache_dir=` one directory or a list; `"vc3d"` means
@@ -207,6 +227,27 @@ ZarrReader.open("s3://bucket/v.zarr/0", auth=S3Credentials(key_id, secret, regio
   `cache_writes=False` makes all caches read-only. A cache that disagrees with
   the remote `.zarray` raises instead of mixing data. Quantized (lossy) Delta3D
   chunks are refetched exactly, and replaced, unless `allow_lossy_cache=True`.
+- **Disk limits**: `cache_max_bytes=100 << 30` sets one shared budget for
+  decoded chunk payloads under the first explicit `cache_dir` (not `"vc3d"`).
+  With a limit, misses are written there; other cache directories and VC3D
+  caches remain readable but are not modified. Existing decoded chunks in
+  that directory's `http/`, `https/` and `s3/` trees count toward the budget.
+  Oldest writes are evicted first, using unlink so active memory maps remain
+  valid. A chunk larger than the limit is returned without being cached;
+  zero disables chunk storage. Missing-chunk markers, metadata, the SQLite
+  index and filesystem overhead are outside the payload budget.
+  Temporary writes and unlinked files held by active memory maps can use
+  additional space until those writes and readers finish.
+
+  SQLite serializes accounting and eviction across readers and processes.
+  Each process scans the decoded caches on its first bounded open to
+  reconcile existing files; later writes update the index incrementally.
+  Configure the same cap on every writer sharing a directory; changing it
+  updates the shared limit. Unbounded writers and other programs do not
+  participate in accounting until a later reconciliation. Offline and
+  `cache_writes=False` opens never evict. Call `flush()` to finish queued
+  writes and their eviction before checking usage. The index requires a
+  local filesystem with SQLite locking support.
 - **Write-behind**: a fetched chunk is decoded in memory and returned at once.
   Its cache file is written, and encoded if the cache is compressed, by
   background writer threads. Until then, rereads are served from the pending
@@ -240,9 +281,9 @@ Limits:
 - Each reader keeps up to 8192 mappings, against Linux's default
   `vm.max_map_count` of 65530.
 
-Building needs a C++20 compiler, CMake, libcurl and c-blosc development files
-(`apt install libcurl4-openssl-dev libblosc-dev`; on macOS `brew install
-c-blosc`). VC-Delta3D v0.1.1 is fetched at a pinned commit; its decoder runs
+Building needs a C++20 compiler, CMake, libcurl, c-blosc, zstd and SQLite development files
+(`apt install libcurl4-openssl-dev libblosc-dev libzstd-dev libsqlite3-dev`;
+on macOS `brew install c-blosc zstd sqlite`). VC-Delta3D v0.1.1 is fetched at a pinned commit; its decoder runs
 without the GIL.
 
 Benchmarks against zarr-python and TensorStore are in
@@ -275,6 +316,12 @@ The catalog tests also run on a bare Python 3.10+ without building
 (`PYTHONPATH=src python -m pytest`); the reader tests are then skipped. They
 need the built extension, plus numcodecs and `vc-delta3d` (the `test` extra)
 to write their fixtures.
+
+The LZW tests use checked-in raw strips encoded independently by libtiff:
+repetitions exercise dictionary self-references, and deterministic noise
+exercises 9–12-bit code widths and dictionary resets. Regenerate them with
+`python tests/make_lzw_fixtures.py` when libtiff is installed; libtiff is not
+a runtime dependency of the reader or its tests.
 
 `tests/data/metadata_subset.json` holds real entries trimmed from the published
 file. Regenerate it with `python tests/make_fixture.py path/to/metadata.json`.

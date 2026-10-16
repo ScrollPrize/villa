@@ -29,7 +29,7 @@ from .disk_cache import VC3D, atomic_write, cached_node_dirs, cached_source_zarr
 from .zarr_reader import MemoryCache, ZarrReader, _make_spec, cache_url, read_node_file
 
 #: Settings of ZarrGroup.open that its arrays are opened with.
-_READER_OPTIONS = ("cache_dir", "cache_writes", "compress_cache", "allow_lossy_cache", "threads", "connections",
+_READER_OPTIONS = ("cache_dir", "cache_writes", "cache_max_bytes", "compress_cache", "allow_lossy_cache", "threads", "connections",
                    "read_mode", "offline")
 
 
@@ -56,6 +56,7 @@ class ZarrGroup:
         auth: Any = "auto",
         cache_dir: str | os.PathLike[str] | Sequence[str | os.PathLike[str]] | None = None,
         cache_writes: bool = True,
+        cache_max_bytes: int | None = None,
         compress_cache: bool = False,
         allow_lossy_cache: bool = False,
         memory_cache: int | MemoryCache | None = None,
@@ -72,6 +73,7 @@ class ZarrGroup:
         """
         loc = os.fspath(location).rstrip("/")
         options = dict(cache_dir=cache_dir, cache_writes=cache_writes, compress_cache=compress_cache,
+                       cache_max_bytes=cache_max_bytes,
                        allow_lossy_cache=allow_lossy_cache, threads=threads, connections=connections,
                        read_mode=read_mode, offline=offline)
         # Validates the options and resolves the credentials once for the whole group.
@@ -97,15 +99,15 @@ class ZarrGroup:
         return cls(loc, options, cache, access, attrs)
 
     def __getstate__(self):
-        budget = self.memory_cache.max_bytes if self.memory_cache is not None else 0
-        return {"location": self.location, "options": self._options, "memory_cache_bytes": budget,
-                "access": self.access, "attrs": self.attrs, "nodes": self._nodes}
+        return {"location": self.location, "options": self._options, "memory_cache": self.memory_cache,
+                "access": self.access, "attrs": self.attrs, "nodes": self._nodes,
+                "consolidated": self._consolidated}
 
     def __setstate__(self, state):
-        budget = state["memory_cache_bytes"]
-        self.__init__(state["location"], state["options"], MemoryCache(budget) if budget else None,
+        self.__init__(state["location"], state["options"], state["memory_cache"],
                       state["access"], state["attrs"])
         self._nodes = state["nodes"]
+        self._consolidated = state["consolidated"]
 
     def __repr__(self) -> str:
         return f"ZarrGroup({self.location!r})"
@@ -219,6 +221,10 @@ class ZarrGroup:
         spec, _ = _make_spec(f"{self.location}/{key}", group=self.location, auth=self.access, meta=node[1],
                              **self._options)
         reader = ZarrReader(spec, self.memory_cache)
+        consolidated = self._consolidated_metadata()
+        if consolidated is not None:
+            reader._attrs = dict(consolidated.get(f"{key}/.zattrs", {}))
+            reader._cache_attrs()
         self._readers[key] = reader
         return reader
 
@@ -266,6 +272,14 @@ class ZarrGroup:
 
     def __iter__(self) -> Iterator[str]:
         return iter(self.keys())
+
+    def array_keys(self) -> list[str]:
+        """Names of immediate child arrays, sorted; same listing limits as keys()."""
+        return [key for key in self.keys() if (node := self._node(key)) is not None and node[0] == "array"]
+
+    def group_keys(self) -> list[str]:
+        """Names of immediate child groups, sorted; same listing limits as keys()."""
+        return [key for key in self.keys() if (node := self._node(key)) is not None and node[0] == "group"]
 
     def _list_s3(self) -> list[str]:
         """Immediate sub-prefixes of this group's S3 prefix (ListObjectsV2)."""

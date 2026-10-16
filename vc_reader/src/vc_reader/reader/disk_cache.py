@@ -45,6 +45,30 @@ VC3D_DELTA3D_MARKER = ".vc_delta3d_cache"
 VC3D_DELTA3D_MARKER_CONTENTS = b"D3D1\n"
 VC3D = "vc3d"  # cache_dir entry meaning "VC3D's configured remote cache root"
 
+_budget_pid = os.getpid()
+_budget_lock = threading.Lock()
+_budgets: dict[str, Any] = {}
+_inherited_budgets: list[Any] = []
+
+
+def disk_budget(root: str, max_bytes: int):
+    """One native eviction index per directory and process, shared by writers."""
+    global _budget_pid, _budget_lock, _budgets
+    if _budget_pid != os.getpid():
+        _inherited_budgets.append(_budgets)
+        _budgets = {}
+        _budget_lock = threading.Lock()
+        _budget_pid = os.getpid()
+    from .. import _native
+    with _budget_lock:
+        budget = _budgets.get(root)
+        if budget is None:
+            budget = _native.DiskCache(root, max_bytes)
+        else:
+            budget.set_max_bytes(max_bytes)
+        _budgets[root] = budget
+        return budget
+
 
 def atomic_write(path: str | os.PathLike[str], data: bytes) -> None:
     path = os.fspath(path)
@@ -149,6 +173,7 @@ class CacheLayer:
     empty_root: str = ""  # vc3d-delta3d: where missing-chunk markers live
     allow_lossy: bool = False
     lease: Vc3dLease | None = field(default=None, repr=False)
+    budget_root: str = ""  # only the selected decoded writer when a limit is configured
 
     def native_spec(self) -> tuple[str, str, str, str, bool]:
         return (self.kind, self.root, self.stored.codec_id, self.empty_root, self.allow_lossy)
@@ -387,6 +412,7 @@ def open_layers(
     writable: bool = True,
     allow_lossy: bool = False,
     compress: bool = False,
+    cache_max_bytes: int | None = None,
 ) -> tuple[list[CacheLayer], CacheLayer | None]:
     """Every existing cache of ``url`` under ``cache_dirs`` (in order), and the layer to append to.
 
@@ -396,14 +422,15 @@ def open_layers(
     ``group_url``/``level_key`` (the OME-Zarr group and the level's path in it)
     are needed to find VC3D caches, which are per volume.
     """
-    roots = cache_roots(cache_dirs)
+    roots = [root.resolve() for root in cache_roots(cache_dirs)]
     layers: list[CacheLayer] = []
     try:
         for root in roots:
             if group_url is not None and level_key is not None:
                 vdir = _vc3d_dir(root, group_url)
                 if vdir is not None:
-                    layer = _vc3d_layer(vdir, level_key, source, allow_lossy, writable)
+                    layer = _vc3d_layer(vdir, level_key, source, allow_lossy,
+                                        writable and cache_max_bytes is None)
                     if layer is not None:
                         layers.append(layer)
             layer = _decoded_layer(Path(decoded_cache_path(root, url)), source, url, create=False,
@@ -412,6 +439,20 @@ def open_layers(
                 layers.append(layer)
         if not writable:
             return layers, None
+        if cache_max_bytes is not None:
+            root = next((Path(d).expanduser().resolve() for d in cache_dirs if os.fspath(d) != VC3D), None)
+            if root is None:
+                raise ValueError("cache_max_bytes needs an explicit decoded cache directory (not only 'vc3d')")
+            target = decoded_cache_path(root, url)
+            writer = next((layer for layer in layers if layer.kind == "decoded" and layer.root == target), None)
+            if writer is None:
+                writer = _decoded_layer(Path(target), source, url, create=True, compress=compress,
+                                        allow_lossy=allow_lossy)
+                if writer is None:
+                    raise ValueError(f"bounded cache {target} is lossy; use a different cache directory")
+                layers.append(writer)
+            writer.budget_root = str(root)
+            return layers, writer
         if layers:
             return layers, layers[0]
         if not roots:

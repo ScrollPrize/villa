@@ -1,7 +1,10 @@
-// Chunk codecs implemented natively: raw (no compressor), blosc, vc-delta3d.
+// Chunk codecs implemented natively: raw, blosc, zstd, LZW and vc-delta3d.
 #pragma once
 
+#include "lzw.hpp"
+
 #include <blosc.h>
+#include <zstd.h>
 #include <vc_delta3d/codec.hpp>
 
 #include <array>
@@ -15,7 +18,7 @@
 
 namespace vcr {
 
-enum class Codec { Raw, Blosc, Delta3d };
+enum class Codec { Raw, Blosc, Zstd, Lzw, Delta3d };
 
 inline Codec parse_codec(const std::string& id)
 {
@@ -23,6 +26,10 @@ inline Codec parse_codec(const std::string& id)
         return Codec::Raw;
     if (id == "blosc")
         return Codec::Blosc;
+    if (id == "zstd")
+        return Codec::Zstd;
+    if (id == "lzw" || id == "imagecodecs_lzw")
+        return Codec::Lzw;
     if (id == "vc-delta3d")
         return Codec::Delta3d;
     throw std::invalid_argument("native reader does not support codec '" + id + "'");
@@ -55,6 +62,18 @@ inline void decode(Codec codec, const std::uint8_t* src, std::size_t n, std::uin
             throw std::runtime_error("blosc decode failed");
         return;
     }
+    case Codec::Zstd: {
+        const auto size = ZSTD_decompress(dst, dst_n, src, n);
+        if (ZSTD_isError(size))
+            throw std::runtime_error(std::string("zstd decode failed: ") + ZSTD_getErrorName(size));
+        if (size != dst_n)
+            throw std::runtime_error("zstd chunk decodes to " + std::to_string(size) + " bytes, expected " +
+                                     std::to_string(dst_n));
+        return;
+    }
+    case Codec::Lzw:
+        decode_lzw(src, n, dst, dst_n);
+        return;
     case Codec::Delta3d:
         if (!vc_delta3d::decompressInto(std::span(reinterpret_cast<const std::byte*>(src), n),
                                         std::span(reinterpret_cast<std::byte*>(dst), dst_n)))

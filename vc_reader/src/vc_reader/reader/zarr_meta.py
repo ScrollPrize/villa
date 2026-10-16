@@ -10,7 +10,8 @@ from typing import Any, Mapping
 import numpy as np
 
 #: Compressors the native reader decodes, by numcodecs id (None: uncompressed).
-SUPPORTED_COMPRESSORS = {None: "", "blosc": "blosc", "vc-delta3d": "vc-delta3d"}
+SUPPORTED_COMPRESSORS = {None: "", "blosc": "blosc", "zstd": "zstd", "lzw": "lzw",
+                         "imagecodecs_lzw": "lzw", "vc-delta3d": "vc-delta3d"}
 
 
 @dataclass(frozen=True)
