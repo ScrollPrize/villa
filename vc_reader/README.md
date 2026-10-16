@@ -91,24 +91,31 @@ for view in vol.segments(min_coverage=0.5):   # segments with a mesh on this vol
 
 `vc_reader.reader` reads zarr v2 arrays (OME-Zarr levels: CT volumes,
 predictions) from a local directory, `https://` or public `s3://`, optionally
-through a persistent disk cache and an in-memory chunk cache. It needs the
-`reader` extra (numpy, urllib3, numcodecs, and vc-delta3d on Python 3.12+).
+through persistent disk caches and an in-memory chunk cache. The reading is
+done by a C++ extension (`vc_reader._native`, built by the pyproject with
+scikit-build-core and nanobind) on native threads without the GIL. Python only
+finds the caches, checks them against the remote `.zarray` and holds VC3D's
+lease. It needs the `reader` extra (numpy).
 
 ```python
-from vc_reader.reader import ZarrReader, MemoryChunkCache
+from vc_reader.reader import ZarrReader, MemoryCache
 
 lvl = cat.sample("Scroll 1").volume(resolution=2.4, energy_kev=78).level(um=9.6)
 # reuse the RAID cache and VC3D's cache; misses are fetched and appended
 r = lvl.open(cache_dir=["/mnt/raid_nvme/volume_cache", "vc3d"], memory_cache=8 << 30)
 crop = r.read((8192, 3584, 3584), (128, 128, 128))   # out-of-bounds parts read as fill_value
-crops = r.read_many([(start, (64, 64, 64)) for start in starts])  # overlapping reads, one pool
+crops = r.read_many([(start, (64, 64, 64)) for start in starts])  # one parallel read; shared chunks read once
 crops = r.read_many(regions, out=crops)               # reuse arrays: no first-touch page faults
 block = r[8192:8704, 3584:4096, 3584:4096]
 
 ZarrReader.open("/data/volume.zarr/2")                # local array
 ZarrReader.open("s3://vesuvius-challenge-open-data/…/volume.zarr", level=2)
+shared = MemoryCache(16 << 30)                        # one budget for several readers
 ```
 
+- **Codecs**: uncompressed, blosc and vc-delta3d chunks in C order. Other
+  arrays (numcodecs filters, Fortran order, other compressors) raise
+  `ValueError` when opened.
 - **Disk caches** (`cache_dir=` one directory or a list; `"vc3d"` means
   VC3D's configured remote cache root): every existing cache of the array is
   found and read, and misses are appended to the first one in its own format.
@@ -118,75 +125,39 @@ ZarrReader.open("s3://vesuvius-challenge-open-data/…/volume.zarr", level=2)
   - VC3D mirror: `<root>/<name>-<fnv1a64>/<level>/`, holding the source's
     bytes verbatim.
   - VC3D Delta3D: the same, with chunks encoded as `vc-delta3d`.
-  
+
   VC3D caches are used under VC3D's shared lease, so VC3D never replaces a
   cache vc_reader has open. If none exists, a new decoded cache is created
   under the first directory. `cache_writes=False` makes all caches read-only.
   A cache that disagrees with the remote `.zarray` raises instead of mixing
-  data. Quantized (lossy) Delta3D chunks are refetched exactly unless
-  `allow_lossy_cache=True`. Decoding `vc-delta3d` needs `vc-delta3d>=0.1.1`
-  (in the `reader` extra on Python 3.12+), and `volcomp` needs the `volcomp_zarr` binding from
-  SuperOptimizer/volume-compressor.
-- **Memory cache** (`memory_cache=` bytes, or a shared `MemoryChunkCache`): an
-  LRU of decoded chunks, keyed by array, so one budget serves many readers.
-- **Local reads** of uncompressed chunks (`read_mode=`):
-  - `slab` (default): `pread` the contiguous rows a region needs into a
-    per-thread buffer.
-  - `pread`: read whole chunks.
-  - `mmap`: memory maps with `MADV_WILLNEED`, as in vesuvius `ChunkedArray`.
-  
-  Reads under 1 MiB (`inline_bytes=`) run in the caller after queueing
-  `POSIX_FADV_WILLNEED` readahead for every piece. Larger reads run on
-  `workers` threads (16 by default for local arrays). When their pieces are
-  small, as in crop batches, the pieces are split into a few hinted groups per
-  worker. Passing reused arrays as `out=` to `read`/`read_many` avoids the
-  first-touch page faults of new memory (warm 128³ batches: about 25%
-  faster).
-- **Remote reads**: anonymous GETs over a urllib3 pool, with at most
-  `connections=` (default 16) in flight and a 10 s stall timeout. Bodies are
-  read straight into the chunk buffer, 404 means fill, and other failures are
-  retried with backoff. A chunk wanted by several reads at once is fetched
-  once.
+  data. Quantized (lossy) Delta3D chunks are refetched exactly, and replaced,
+  unless `allow_lossy_cache=True`.
+- **Memory cache** (`memory_cache=` bytes, or a shared `MemoryCache`): an LRU
+  of decoded chunks, keyed by array, so one budget serves many readers.
+- **Local reads** of uncompressed chunks go through persistent memory maps
+  (`read_mode="mmap"`, the default) or `pread` (`read_mode="slab"`), on
+  `threads` threads (default 16 for local arrays, 32 for remote ones).
+  Passing reused arrays as `out=` avoids the first-touch page faults of new
+  memory.
+- **Remote reads**: anonymous GETs with libcurl, at most `connections=`
+  (default 16) in flight, a 10 s stall timeout and retries with backoff. A 404
+  means fill. A chunk wanted by several reads at once is fetched once.
 - Readers pickle as their location plus metadata, so DataLoader workers reopen
-  them without a network round trip. Values are exactly the stored values.
-
-### Native engine
-
-`engine="native"` reads through a C++ extension (`vc_reader._native`, built by
-the pyproject with scikit-build-core and nanobind). It does the whole read on
-native threads without the GIL:
-
-- local chunks, through persistent memory maps by default (`read_mode="slab"`
-  reads with `pread`);
-- HTTP fetches with libcurl, at most `connections` at once, with stall
-  timeouts and retries;
-- raw, blosc and vc-delta3d decoding;
-- the disk cache layers above, read and appended in their own formats;
-- an in-memory LRU of decoded chunks.
-
-Python still finds the caches, checks them against the remote `.zarray` and
-holds VC3D's lease, so both engines see the same caches and return identical
-values.
-
-```python
-r = lvl.open(engine="native", cache_dir=["/mnt/raid_nvme/volume_cache", "vc3d"], memory_cache=8 << 30)
-from vc_reader._native import MemoryCache
-shared = MemoryCache(16 << 30)                      # one budget for several native readers
-```
+  them without a network round trip. `r.stats()` counts memory and disk hits,
+  remote fetches and cache write errors. Values are exactly the stored values.
 
 Limits:
 
-- Arrays with numcodecs filters, Fortran order or other codecs need
-  `engine="python"`; opening them with the native engine raises `ValueError`.
 - Memory-mapped chunk files must only ever be replaced by rename (vc_reader,
   vesuvius and VC3D all write that way). Truncating a mapped file in place
-  would crash the process.
-- Each native reader keeps up to 8192 mappings, against Linux's default
+  would crash the process; use `read_mode="slab"` if something does that.
+- Each reader keeps up to 8192 mappings, against Linux's default
   `vm.max_map_count` of 65530.
 
-Building it needs a C++20 compiler, CMake, libcurl and c-blosc development
-files (`apt install libcurl4-openssl-dev libblosc-dev`; on macOS `brew install
-c-blosc`). VC-Delta3D is fetched at a pinned commit.
+Building needs a C++20 compiler, CMake, libcurl and c-blosc development files
+(`apt install libcurl4-openssl-dev libblosc-dev`; on macOS `brew install
+c-blosc`). VC-Delta3D v0.1.1 is fetched at a pinned commit; its decoder runs
+without the GIL.
 
 Benchmarks against zarr-python and TensorStore are in
 [`benchmarks/`](benchmarks/README.md).
@@ -213,9 +184,10 @@ uv pip install --python .venv/bin/python --no-build-isolation -e '.[bench,test]'
 .venv/bin/python -m pytest -m network   # parse the live metadata.json end to end
 ```
 
-The catalog tests also run on a bare Python 3.10+ (`PYTHONPATH=src python -m
-pytest`); the reader tests are skipped without numpy and urllib3, and the
-Delta3D cache test without `vc-delta3d`.
+The catalog tests also run on a bare Python 3.10+ without building
+(`PYTHONPATH=src python -m pytest`); the reader tests are then skipped. They
+need the built extension, plus numcodecs and `vc-delta3d` (the `test` extra)
+to write their fixtures.
 
 `tests/data/metadata_subset.json` holds real entries trimmed from the published
 file. Regenerate it with `python tests/make_fixture.py path/to/metadata.json`.

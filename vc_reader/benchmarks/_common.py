@@ -248,7 +248,7 @@ def environment() -> dict[str, Any]:
                cpus=os.cpu_count())
     from importlib.metadata import PackageNotFoundError, version
 
-    for m in ("numpy", "zarr", "numcodecs", "urllib3", "s3fs", "fsspec", "aiohttp", "tensorstore"):
+    for m in ("vc-reader", "numpy", "zarr", "numcodecs", "s3fs", "fsspec", "aiohttp", "tensorstore"):
         try:
             env[m] = version(m)
         except PackageNotFoundError:

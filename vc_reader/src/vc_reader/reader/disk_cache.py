@@ -5,9 +5,11 @@ checks that they hold the requested array, creates level metadata where an
 append needs it, and holds VC3D's lease. Supported layouts:
 
 * ``decoded`` (vc_reader, and vesuvius' ``RemoteChunkedArray``):
-  ``<root>/s3/<bucket>/<path>/<level>/`` is an uncompressed zarr v2 array of
-  decoded chunks. vc_reader marks missing chunks with ``<key>.missing``;
-  vesuvius writes them as fill-valued chunks, which read the same.
+  ``<root>/s3/<bucket>/<path>/<level>/`` is a zarr v2 array of the decoded
+  chunks, uncompressed or (vc_reader's ``compress_cache``) losslessly
+  Delta3D-encoded, as its ``.zarray`` says. vc_reader marks missing chunks with
+  ``<key>.missing``; vesuvius writes them as fill-valued chunks, which read the
+  same.
 * ``vc3d-mirror`` (VC3D ``ZarrMirror``): ``<root>/<name>-<fnv1a64(url)>/`` mirrors
   the source group. Chunks are the source's stored bytes and ``<key>.empty``
   marks a missing chunk.
@@ -202,30 +204,48 @@ def _read_json(path: Path) -> dict | None:
         return None
 
 
-def _decoded_layer(root: Path, source: ArrayMeta, url: str, create: bool) -> CacheLayer | None:
+def check_compressible(source: ArrayMeta) -> None:
+    """Raise unless chunks of this array can be stored Delta3D-encoded (3-D, uint8 or uint16)."""
+    if source.ndim != 3 or source.dtype.kind != "u" or source.dtype.itemsize not in (1, 2):
+        raise ValueError(f"compress_cache needs 3-D uint8 or uint16 chunks; this array is "
+                         f"{source.ndim}-D {source.dtype}")
+
+
+def _decoded_layer(root: Path, source: ArrayMeta, url: str, create: bool, compress: bool = False,
+                   allow_lossy: bool = False) -> CacheLayer | None:
     stored = _read_json(root / ".zarray")
-    decoded = ArrayMeta.from_zarray(source.decoded_zarray())
     if stored is None:
         if not create:
             return None
+        if compress:
+            check_compressible(source)
+        stored = delta3d_zarray(source) if compress else source.decoded_zarray()
         record = {"vc_reader": {"source_url": url, "source_zarray": dict(source.raw)}}
         atomic_write(root / ".zattrs", json.dumps(record, indent=1).encode())
-        atomic_write(root / ".zarray", json.dumps(source.decoded_zarray(), indent=1).encode())
-        return CacheLayer("decoded", str(root), decoded)
+        atomic_write(root / ".zarray", json.dumps(stored, indent=1).encode())
+        return CacheLayer("decoded", str(root), ArrayMeta.from_zarray(stored))
     record = (_read_json(root / ".zattrs") or {}).get("vc_reader")
-    if record is not None:
-        ok = record.get("source_zarray") == dict(source.raw)
+    if record is not None:  # ours: uncompressed or Delta3D, as its .zarray says
+        comp = stored.get("compressor")
+        ok = (record.get("source_zarray") == dict(source.raw) and not stored.get("filters")
+              and (comp is None or comp.get("id") == DELTA3D_ID))
+        if ok and not allow_lossy and not is_lossless_codec(comp):
+            return None
     else:  # written by another tool (vesuvius): usable if it holds the same decoded array
         ok = (stored.get("compressor") is None and not stored.get("filters")
               and (stored.get("order") or "C") == "C" and _same_array(stored, source, ignore_codec=True))
     if not ok:
         raise ValueError(f"disk cache {root} holds a different array than {url} "
                          "(the remote .zarray changed?); delete that cache directory to refill it")
-    return CacheLayer("decoded", str(root), decoded)
+    return CacheLayer("decoded", str(root), ArrayMeta.from_zarray(stored), allow_lossy=allow_lossy)
 
 
-def vc3d_delta3d_zarray(source: ArrayMeta) -> dict:
-    """The ``.zarray`` VC3D writes for a level of a Delta3D cache (configureDelta3dV2Array)."""
+def delta3d_zarray(source: ArrayMeta) -> dict:
+    """``.zarray`` of the decoded chunks stored with lossless Delta3D.
+
+    The same metadata VC3D writes for a level of its Delta3D caches
+    (configureDelta3dV2Array).
+    """
     meta = dict(source.raw, compressor={"id": DELTA3D_ID, "quant": 1}, filters=None)
     dt = str(meta.get("dtype", ""))
     if dt and dt[0] != "|":
@@ -249,7 +269,7 @@ def _vc3d_layer(volume_dir: Path, level_key: str, source: ArrayMeta, allow_lossy
         stored = _read_json(root / ".zarray")
         if stored is None and writable:
             # VC3D publishes each level's metadata when it first touches the level; do the same.
-            stored = vc3d_delta3d_zarray(source) if delta3d else dict(source.raw)
+            stored = delta3d_zarray(source) if delta3d else dict(source.raw)
             atomic_write(root / ".zarray", (json.dumps(stored, indent=2) + "\n").encode())
         if stored is None:
             lease.release()
@@ -291,11 +311,13 @@ def open_layers(
     level_key: str | None,
     writable: bool = True,
     allow_lossy: bool = False,
+    compress: bool = False,
 ) -> tuple[list[CacheLayer], CacheLayer | None]:
     """Every existing cache of ``url`` under ``cache_dirs`` (in order), and the layer to append to.
 
-    Appends go to the first layer that already holds the array. If none does
-    and ``writable``, a new decoded cache is created under the first directory.
+    Appends go to the first layer that already holds the array, in its format.
+    If none does and ``writable``, a new decoded cache is created under the
+    first directory, Delta3D-encoded if ``compress``.
     ``group_url``/``level_key`` (the OME-Zarr group and the level's path in it)
     are needed to find VC3D caches, which are per volume.
     """
@@ -318,7 +340,8 @@ def open_layers(
                         if layer is not None:
                             layers.append(layer)
                         break
-            layer = _decoded_layer(Path(decoded_cache_path(root, url)), source, url, create=False)
+            layer = _decoded_layer(Path(decoded_cache_path(root, url)), source, url, create=False,
+                                   allow_lossy=allow_lossy)
             if layer is not None:
                 layers.append(layer)
         if not writable:
@@ -327,7 +350,8 @@ def open_layers(
             return layers, layers[0]
         if not roots:
             return layers, None
-        created = _decoded_layer(Path(decoded_cache_path(roots[0], url)), source, url, create=True)
+        created = _decoded_layer(Path(decoded_cache_path(roots[0], url)), source, url, create=True,
+                                 compress=compress)
         return [created], created
     except BaseException:
         for layer in layers:
@@ -336,4 +360,4 @@ def open_layers(
 
 
 __all__: Sequence[Any] = ["CacheLayer", "open_layers", "decoded_cache_path", "vc3d_cache_root", "vc3d_volume_id",
-                          "vc3d_delta3d_zarray", "Vc3dLease"]
+                          "delta3d_zarray", "Vc3dLease"]

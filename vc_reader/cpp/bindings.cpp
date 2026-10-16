@@ -58,7 +58,8 @@ NB_MODULE(_native, m)
                std::string separator, std::string identity, std::vector<LayerTuple> layers, int write_layer,
                std::string remote_url, std::string remote_codec, std::string read_mode, bool hint,
                std::size_t threads, int connections, long stall_timeout_s, int retries,
-               std::shared_ptr<vcr::MemoryCache> cache) {
+               std::shared_ptr<vcr::MemoryCache> cache, std::size_t writer_threads,
+               std::size_t max_pending_write_bytes) {
                 vcr::ArraySpec spec;
                 spec.shape = std::move(shape);
                 spec.chunks = std::move(chunks);
@@ -75,6 +76,8 @@ NB_MODULE(_native, m)
                 spec.read_mode = std::move(read_mode);
                 spec.hint = hint;
                 spec.threads = threads;
+                spec.writer_threads = writer_threads;
+                spec.max_pending_write_bytes = max_pending_write_bytes;
                 spec.http.connections = connections;
                 spec.http.stall_timeout_s = stall_timeout_s;
                 spec.http.retries = retries;
@@ -83,7 +86,8 @@ NB_MODULE(_native, m)
             "shape"_a, "chunks"_a, "itemsize"_a, "fill"_a, "separator"_a, "identity"_a, "layers"_a,
             "write_layer"_a = -1, "remote_url"_a = "", "remote_codec"_a = "", "read_mode"_a = "slab",
             "hint"_a = false, "threads"_a = 16, "connections"_a = 16, "stall_timeout_s"_a = 10,
-            "retries"_a = 5, "cache"_a.none() = nb::none())
+            "retries"_a = 5, "cache"_a.none() = nb::none(), "writer_threads"_a = 4,
+            "max_pending_write_bytes"_a = std::size_t{1} << 30)
         .def(
             "read_many",
             [](vcr::Array& a, const std::vector<vcr::Index>& starts, const std::vector<vcr::Index>& sizes,
@@ -103,10 +107,14 @@ NB_MODULE(_native, m)
             },
             "starts"_a, "sizes"_a, "outs"_a, "itemsize"_a,
             "Read regions into flat uint8 views of C-order outputs (the GIL is released).")
+        .def("flush", &vcr::Array::flush, nb::call_guard<nb::gil_scoped_release>(),
+             "Wait for every queued disk-cache write.")
         .def("stats", [](vcr::Array& a) {
             const auto& s = a.stats();
             nb::dict d;
             d["memory_hits"] = s.memory_hits.load();
+            d["pending_hits"] = s.pending_hits.load();
+            d["pending_writes"] = a.pending_writes();
             d["disk_hits"] = s.disk_hits.load();
             d["remote_fetches"] = s.remote_fetches.load();
             d["remote_missing"] = s.remote_missing.load();

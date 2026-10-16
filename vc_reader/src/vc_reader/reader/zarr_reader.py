@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import itertools
 import os
+import weakref
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -76,7 +77,8 @@ class ZarrReader:
                 group = http_url(spec["group"]) if spec["group"] else None
                 self.cache_layers, self.write_layer = open_layers(
                     spec["cache_dirs"], remote_url, self.meta, group_url=group, level_key=spec["level_key"],
-                    writable=spec["cache_writes"], allow_lossy=spec["allow_lossy_cache"])
+                    writable=spec["cache_writes"], allow_lossy=spec["allow_lossy_cache"],
+                    compress=spec["compress_cache"])
                 layers = [layer.native_spec() for layer in self.cache_layers]
                 if self.write_layer is not None:
                     write_index = self.cache_layers.index(self.write_layer)
@@ -96,6 +98,8 @@ class ZarrReader:
             for layer in self.cache_layers:
                 layer.close()
             raise
+        # Queued cache writes finish even if the reader is dropped without close().
+        self._finalizer = weakref.finalize(self, _shutdown, self._array, self.cache_layers)
 
     # -- construction -----------------------------------------------------------
 
@@ -107,6 +111,7 @@ class ZarrReader:
         level: int | str | None = None,
         cache_dir: str | os.PathLike[str] | Sequence[str | os.PathLike[str]] | None = None,
         cache_writes: bool = True,
+        compress_cache: bool = False,
         allow_lossy_cache: bool = False,
         memory_cache: int | MemoryCache | None = None,
         threads: int | None = None,
@@ -123,9 +128,12 @@ class ZarrReader:
         :mod:`vc_reader.reader.disk_cache`). The entry ``"vc3d"`` stands for
         VC3D's configured remote cache root. Misses are fetched and appended to
         the first cache that holds the array, in its own format, or to a new
-        decoded cache under the first directory. ``cache_writes=False`` only
-        reads. A cache whose chunks are quantized (lossy relative to the source)
-        is skipped unless ``allow_lossy_cache``.
+        decoded cache under the first directory. Cache files are written in the
+        background after the read returns (see :meth:`flush`).
+        ``compress_cache=True`` stores that new cache's chunks with lossless
+        Delta3D (3-D uint8/uint16 arrays). ``cache_writes=False`` only reads. A
+        cache whose chunks are quantized (lossy relative to the source) is
+        skipped unless ``allow_lossy_cache``.
 
         ``memory_cache`` is a byte budget or a :class:`MemoryCache` shared
         between readers. ``threads`` (default 16 local, 32 remote) read and
@@ -158,7 +166,7 @@ class ZarrReader:
         else:
             raise TypeError("memory_cache must be a byte count or a vc_reader.reader.MemoryCache")
         spec = dict(location=loc, group=group, level_key=level_key, cache_dirs=dirs, cache_writes=cache_writes,
-                    allow_lossy_cache=allow_lossy_cache, threads=threads, connections=connections,
+                    compress_cache=compress_cache, allow_lossy_cache=allow_lossy_cache, threads=threads, connections=connections,
                     read_mode=read_mode, meta=None)
         return cls(spec, cache)
 
@@ -175,11 +183,15 @@ class ZarrReader:
     def __repr__(self) -> str:
         return f"ZarrReader({self.location!r}, shape={self.shape}, chunks={self.chunks}, dtype={self.dtype})"
 
+    def flush(self) -> None:
+        """Wait until every chunk fetched so far is written to the disk cache."""
+        if self._array is not None:
+            self._array.flush()
+
     def close(self) -> None:
-        """Stop the reader's threads and release its cache leases."""
+        """Finish queued cache writes, stop the reader's threads and release its cache leases."""
         self._array = None
-        for layer in self.cache_layers:
-            layer.close()
+        self._finalizer()
 
     def __enter__(self) -> ZarrReader:
         return self
@@ -266,6 +278,12 @@ class ZarrReader:
         start, size, squeeze = _parse_index(key, self.shape)
         out = self.read(start, size)
         return out[tuple(0 if s else slice(None) for s in squeeze)] if any(squeeze) else out
+
+
+def _shutdown(array, layers: list[CacheLayer]) -> None:
+    array.flush()
+    for layer in layers:
+        layer.close()
 
 
 def _parse_index(key: Any, shape: tuple[int, ...]) -> tuple[list[int], list[int], list[bool]]:

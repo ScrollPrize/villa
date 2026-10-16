@@ -7,8 +7,7 @@ Only the reads are timed: hashing, eviction and opening are not. Backends are
 interleaved inside each repetition, so they see the same disk and network
 conditions. Results are written as JSON to `results/` and printed as a table.
 
-Requirements: the `bench` extra (numpy, urllib3, numcodecs, zarr>=3, s3fs,
-tensorstore). With the development venv from the package README:
+Requirements: the `bench` extra (numpy, zarr>=3, s3fs, tensorstore). With the development venv from the package README:
 `.venv/bin/python benchmarks/bench_local.py`. TensorStore is skipped if it is
 not installed.
 
@@ -40,9 +39,9 @@ Before each repetition, `-cold` scenarios drop every touched chunk file from
 the page cache with `posix_fadvise(DONTNEED)`, which needs no root (Linux
 only; skipped on tmpfs). `-warm` scenarios run one untimed repetition first.
 
-Local backends: `vc_reader:slab` is the Python engine, `vc_reader:native` the
-C++ engine (memory maps), and `vc_reader:native-slab` the C++ engine with
-`pread`. The `+memory` variants add each engine's memory cache.
+Local backends: `vc_reader` reads chunk files through memory maps (the
+default), `vc_reader:slab` through `pread`, and `vc_reader+memory` adds the
+memory cache.
 
 ## Remote reads: `bench_remote.py`
 

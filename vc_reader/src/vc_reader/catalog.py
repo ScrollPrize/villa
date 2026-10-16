@@ -345,7 +345,7 @@ class VolumeLevel:
         """A :class:`~vc_reader.reader.ZarrReader` for this level's array.
 
         Keyword arguments go to :meth:`ZarrReader.open` (``cache_dir``,
-        ``memory_cache``, ``workers``, ...). Requires the ``reader`` extra.
+        ``memory_cache``, ``threads``, ...). Requires the ``reader`` extra.
         """
         from .reader import ZarrReader
 

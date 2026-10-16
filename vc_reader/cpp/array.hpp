@@ -8,6 +8,7 @@
 #include "http.hpp"
 #include "memory_cache.hpp"
 #include "thread_pool.hpp"
+#include "write_behind.hpp"
 
 #include <sys/mman.h>
 
@@ -51,12 +52,14 @@ struct ArraySpec {
     std::string read_mode = "slab";  // raw local chunks: "slab" (pread rows) or "mmap"
     bool hint = false;               // queue readahead for every piece before reading
     std::size_t threads = 16;
+    std::size_t writer_threads = 4;                    // background disk-cache writes
+    std::size_t max_pending_write_bytes = 1ull << 30;  // reads wait beyond this much unwritten data
     HttpOptions http;
 };
 
 struct Stats {
-    std::atomic<std::uint64_t> memory_hits{0}, disk_hits{0}, remote_fetches{0}, remote_missing{0},
-        remote_bytes{0}, write_errors{0};
+    std::atomic<std::uint64_t> memory_hits{0}, pending_hits{0}, disk_hits{0}, remote_fetches{0},
+        remote_missing{0}, remote_bytes{0}, write_errors{0};
 };
 
 class Array {
@@ -79,9 +82,20 @@ public:
         remote_codec_ = parse_codec(spec_.remote_codec);
         if (!spec_.remote_url.empty())
             http_ = std::make_unique<HttpClient>(spec_.http);
-        if (spec_.write_layer >= 0 && spec_.layers.at(spec_.write_layer).kind == "vc3d-delta3d" && nd != 3)
+        if (spec_.write_layer >= 0 && codecs_.at(spec_.write_layer) == Codec::Delta3d && nd != 3)
             throw std::invalid_argument("Delta3D caches hold 3-D chunks only");
+        if (spec_.write_layer >= 0)
+            writes_ = std::make_unique<WriteBehind>(spec_.writer_threads, spec_.max_pending_write_bytes);
     }
+
+    // Waits for every queued disk-cache write.
+    void flush()
+    {
+        if (writes_)
+            writes_->flush();
+    }
+
+    std::size_t pending_writes() { return writes_ ? writes_->outstanding() : 0; }
 
     // Reads every region [start, start+size) into its C-order output buffer.
     // Parts outside the array, and chunks that are not stored, read as fill.
@@ -309,6 +323,14 @@ private:
                 return;
             }
         }
+        if (writes_) {  // fetched, but its cache file is not written yet
+            auto [found, chunk] = writes_->pending(k);
+            if (found) {
+                ++stats_.pending_hits;
+                apply(chunk, w, out_strides);
+                return;
+            }
+        }
         for (std::size_t li = 0; li < spec_.layers.size(); ++li) {
             const LayerSpec& l = spec_.layers[li];
             if (!cache_ && codecs_[li] == Codec::Raw) {
@@ -380,40 +402,49 @@ private:
         const bool found = http_->get(spec_.remote_url + "/" + k, body, chunk_bytes_);
         if (!found) {
             ++stats_.remote_missing;
-            store_missing(k);
+            if (writes_ && !write_disabled_.load())
+                writes_->submit(k, nullptr, 64, [this, k] { store_missing(k); });
             return nullptr;
         }
         stats_.remote_bytes += body.size();
-        std::shared_ptr<Chunk> chunk;
+        ChunkPtr chunk;
+        std::shared_ptr<const std::vector<std::uint8_t>> payload;
         if (remote_codec_ == Codec::Raw) {
             if (body.size() != chunk_bytes_)
                 throw std::runtime_error(spec_.remote_url + "/" + k + ": body is not one chunk");
-            chunk = std::make_shared<Chunk>(std::move(body));
-            store(k, *chunk, *chunk);
+            chunk = std::make_shared<const Chunk>(std::move(body));
+            payload = chunk;  // the stored bytes are the decoded chunk
         } else {
-            chunk = std::make_shared<Chunk>(chunk_bytes_);
-            decode(remote_codec_, body.data(), body.size(), chunk->data(), chunk_bytes_);
-            store(k, *chunk, body);
+            auto decoded = std::make_shared<Chunk>(chunk_bytes_);
+            decode(remote_codec_, body.data(), body.size(), decoded->data(), chunk_bytes_);
+            chunk = std::move(decoded);
+            payload = std::make_shared<const std::vector<std::uint8_t>>(std::move(body));
+        }
+        // The read returns now; the cache file is written (and encoded) in the background.
+        if (writes_ && !write_disabled_.load()) {
+            const std::size_t bytes = chunk->size() + (payload == chunk ? 0 : payload->size());
+            writes_->submit(k, chunk, bytes, [this, k, chunk, payload] { store(k, *chunk, *payload); });
         }
         return chunk;
     }
 
+    // Writes a fetched chunk to the write layer in that layer's format.
     void store(const std::string& k, const Chunk& decoded, const std::vector<std::uint8_t>& payload)
     {
-        if (spec_.write_layer < 0 || write_disabled_.load())
+        if (write_disabled_.load())
             return;
         const LayerSpec& l = spec_.layers[spec_.write_layer];
         try {
             const std::string path = l.root + "/" + k;
-            if (l.kind == "decoded")
-                atomic_write(path, decoded.data(), decoded.size());
-            else if (l.kind == "vc3d-mirror")
+            if (l.kind == "vc3d-mirror") {
                 atomic_write(path, payload.data(), payload.size());  // the source's bytes, verbatim
-            else if (l.kind == "vc3d-delta3d") {
+            } else if (codecs_[spec_.write_layer] == Codec::Delta3d) {  // compressed decoded / VC3D Delta3D
                 const std::array<int, 3> shape{static_cast<int>(spec_.chunks[0]), static_cast<int>(spec_.chunks[1]),
                                                static_cast<int>(spec_.chunks[2])};
                 auto enc = encode_delta3d(decoded.data(), decoded.size(), shape, spec_.itemsize);
                 atomic_write(path, enc.data(), enc.size());
+            } else {
+                atomic_write(path, decoded.data(), decoded.size());
             }
         } catch (const std::exception& e) {
             write_failed(e.what());
@@ -422,7 +453,7 @@ private:
 
     void store_missing(const std::string& k)
     {
-        if (spec_.write_layer < 0 || write_disabled_.load())
+        if (write_disabled_.load())
             return;
         const std::string path = marker_path(spec_.layers[spec_.write_layer], k);
         if (path.empty())
@@ -457,6 +488,8 @@ private:
     std::atomic<bool> write_disabled_{false};
     std::mutex error_mutex_;
     std::string last_write_error_;
+    // Last member: destroyed first, so queued writes finish while everything they use still exists.
+    std::unique_ptr<WriteBehind> writes_;
 };
 
 }  // namespace vcr

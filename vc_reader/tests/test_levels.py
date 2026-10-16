@@ -83,6 +83,7 @@ def test_paired_bundle(vol):
 
 def test_open_level_reader(vol, monkeypatch):
     pytest.importorskip("numpy")
+    pytest.importorskip("vc_reader._native", reason="the native extension is not built")
     from vc_reader.reader import ZarrReader
 
     seen = {}

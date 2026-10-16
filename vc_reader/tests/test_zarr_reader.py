@@ -10,10 +10,11 @@ import threading
 import pytest
 
 np = pytest.importorskip("numpy")
+pytest.importorskip("vc_reader._native", reason="the native extension is not built")
 
 from vc_reader.reader import MemoryCache, ZarrReader  # noqa: E402
 from vc_reader.reader.disk_cache import (  # noqa: E402
-    VC3D_DELTA3D_MARKER, decoded_cache_path, vc3d_delta3d_zarray, vc3d_volume_id)
+    VC3D_DELTA3D_MARKER, decoded_cache_path, delta3d_zarray, vc3d_volume_id)
 from vc_reader.reader.zarr_meta import ArrayMeta  # noqa: E402
 
 SHAPE = (37, 50, 45)
@@ -251,6 +252,7 @@ def test_disk_cache(server, data, tmp_path):
     url = f"{base}/blosc.zarr"
     r = ZarrReader.open(url, cache_dir=tmp_path)
     np.testing.assert_array_equal(r[...], exp)
+    r.flush()  # cache files are written after the read returns
     root = decoded_cache_path(tmp_path, url)
     assert os.path.exists(os.path.join(root, "1/1/1.missing"))
     assert os.path.getsize(os.path.join(root, "0/0/0")) == 16**3  # stored decoded
@@ -302,6 +304,105 @@ def test_concurrent_reads_fetch_each_chunk_once(server, data, tmp_path):
     assert len(chunk_requests) == len(set(chunk_requests))
 
 
+def test_cache_writes_finish_after_the_read(server, data, tmp_path):
+    httpd, base = server
+    url = f"{base}/raw.zarr"
+    exp = _expected(data, MISSING, CHUNKS)
+    root = decoded_cache_path(tmp_path, url)
+    r = ZarrReader.open(url, cache_dir=tmp_path)
+    httpd.requests.clear()
+    np.testing.assert_array_equal(r[...], exp)
+    # Rereading while writes may still be queued never fetches a chunk twice.
+    np.testing.assert_array_equal(r[...], exp)
+    chunk_requests = [p for p in httpd.requests if not p.endswith(".zarray")]
+    assert len(chunk_requests) == len(set(chunk_requests)) == 3 * 4 * 3
+    r.close()  # finishes the queued writes
+    assert os.path.getsize(os.path.join(root, "2/3/2")) == 16**3
+    assert os.path.exists(os.path.join(root, "0/3/2.missing"))
+    # A reader dropped without close() still writes what it fetched.
+    other = tmp_path / "other"
+    r = ZarrReader.open(url, cache_dir=other)
+    r.read((0, 0, 0), (16, 16, 16))
+    del r
+    import gc
+
+    gc.collect()
+    assert os.path.getsize(os.path.join(decoded_cache_path(other, url), "0/0/0")) == 16**3
+
+
+@pytest.mark.parametrize("name", ["raw.zarr", "blosc.zarr"])
+def test_compressed_cache(server, data, tmp_path, name):
+    vc_delta3d = pytest.importorskip("vc_delta3d")  # only to check the stored payloads
+    httpd, base = server
+    url = f"{base}/{name}"
+    exp = _expected(data, MISSING, CHUNKS)
+    with ZarrReader.open(url, cache_dir=tmp_path, compress_cache=True) as r:
+        np.testing.assert_array_equal(r[...], exp)
+    root = decoded_cache_path(tmp_path, url)
+    assert json.load(open(os.path.join(root, ".zarray")))["compressor"] == {"id": "vc-delta3d", "quant": 1}
+    stored = open(os.path.join(root, "0/0/0"), "rb").read()
+    assert stored[:4] == b"D3D1" and stored[6] <= 1  # (random test data does not shrink)
+    np.testing.assert_array_equal(np.frombuffer(vc_delta3d.Delta3D().decode(stored), np.uint8).reshape(CHUNKS),
+                                  exp[:16, :16, :16])
+    assert os.path.exists(os.path.join(root, "1/1/1.missing"))
+    # Served from the compressed cache alone, by any reader (the flag only matters when creating it).
+    httpd.requests.clear()
+    r2 = ZarrReader.open(url, cache_dir=tmp_path)
+    np.testing.assert_array_equal(r2[...], exp)
+    assert httpd.requests == [f"/{name}/.zarray"] and r2.write_layer.stored.codec_id == "vc-delta3d"
+    # It is an ordinary zarr v2 array (zarr-python reads it once vc_delta3d is imported).
+    zarr = pytest.importorskip("zarr")
+    np.testing.assert_array_equal(zarr.open_array(root, mode="r")[...], exp)
+
+
+def test_compress_flag_keeps_existing_cache_format(server, data, tmp_path):
+    _, base = server
+    url = f"{base}/raw.zarr"
+    with ZarrReader.open(url, cache_dir=tmp_path) as r:
+        r.read((0, 0, 0), (16, 16, 16))
+    with ZarrReader.open(url, cache_dir=tmp_path, compress_cache=True) as r:
+        assert r.write_layer.stored.codec_id == ""  # appends stay uncompressed, like the cache
+        r.read((16, 0, 0), (16, 16, 16))
+    assert os.path.getsize(os.path.join(decoded_cache_path(tmp_path, url), "1/0/0")) == 16**3
+
+
+def test_compress_cache_needs_3d_uint(tmp_path):
+    root = tmp_path / "www"
+    data = np.zeros((8, 8), np.float32)
+    os.makedirs(root / "f.zarr")
+    json.dump(dict(zarr_format=2, shape=[8, 8], chunks=[4, 4], dtype="<f4", fill_value=0, order="C",
+                   compressor=None, filters=None), open(root / "f.zarr" / ".zarray", "w"))
+    httpd, base = _serve(root)
+    try:
+        with pytest.raises(ValueError, match="compress_cache needs 3-D"):
+            ZarrReader.open(f"{base}/f.zarr", cache_dir=tmp_path / "cache", compress_cache=True)
+        ZarrReader.open(f"{base}/f.zarr", cache_dir=tmp_path / "cache").read((0, 0), data.shape)
+    finally:
+        httpd.shutdown()
+
+
+def test_lossy_own_cache_is_skipped(server, data, tmp_path):
+    vc_delta3d = pytest.importorskip("vc_delta3d")
+    httpd, base = server
+    url = f"{base}/raw.zarr"
+    exp = _expected(data, MISSING, CHUNKS)
+    with ZarrReader.open(url, cache_dir=tmp_path, compress_cache=True) as r:
+        r.read((0, 0, 0), (16, 16, 16))
+    root = decoded_cache_path(tmp_path, url)
+    meta = json.load(open(os.path.join(root, ".zarray")))
+    meta["compressor"]["quant"] = 5  # a cache declared lossy
+    json.dump(meta, open(os.path.join(root, ".zarray"), "w"))
+    with open(os.path.join(root, "0/0/0"), "wb") as f:
+        f.write(vc_delta3d.Delta3D(quant=5).encode(exp[:16, :16, :16].copy()))
+    r = ZarrReader.open(url, cache_dir=[tmp_path], cache_writes=False)
+    assert r.cache_layers == []  # not used for reads
+    np.testing.assert_array_equal(r.read((0, 0, 0), (16, 16, 16)), exp[:16, :16, :16])
+    r = ZarrReader.open(url, cache_dir=[tmp_path], cache_writes=False, allow_lossy_cache=True)
+    httpd.requests.clear()
+    got = r.read((0, 0, 0), (16, 16, 16))
+    assert httpd.requests == [] and 0 < np.abs(got.astype(int) - exp[:16, :16, :16]).max() <= 2
+
+
 def test_missing_remote_array_raises(server):
     _, base = server
     with pytest.raises(FileNotFoundError):
@@ -342,6 +443,7 @@ def test_reuses_foreign_cache(server, data, tmp_path):
     assert (r.read((0, 0, 0), (16, 16, 16)) == 99).all()  # served from the existing cache
     assert httpd.requests == []
     np.testing.assert_array_equal(r.read((16, 0, 0), (16, 16, 16)), data[16:32, :16, :16])  # filled from remote
+    r.flush()
     assert os.path.getsize(os.path.join(root, "1", "0", "0")) == 16**3  # appended, decoded
     assert open(os.path.join(root, ".zattrs")).read() == zattrs_before
 
@@ -406,8 +508,9 @@ def test_vc3d_mirror_read_and_append(group_server, data, tmp_path):
 
     # A miss is fetched and appended in VC3D's format: the source bytes verbatim, .empty for absent chunks.
     np.testing.assert_array_equal(r.read((0, 16, 0), (16, 16, 16)), exp[:16, 16:32, :16])
-    assert (vdir / "0" / "0" / "1" / "0").read_bytes() == (src / "0" / "0" / "1" / "0").read_bytes()
     r.read((16, 16, 16), (16, 16, 16))  # (1, 1, 1) is not stored remotely
+    r.flush()
+    assert (vdir / "0" / "0" / "1" / "0").read_bytes() == (src / "0" / "0" / "1" / "0").read_bytes()
     assert (vdir / "0" / "1" / "1" / "1.empty").exists()
     r.close()
 
@@ -482,7 +585,7 @@ def test_vc3d_delta3d_cache(group_server, data, tmp_path):
     vdir = tmp_path / vc3d_volume_id(group)
     (vdir / "0" / "0" / "0").mkdir(parents=True)
     (vdir / VC3D_DELTA3D_MARKER).write_bytes(b"D3D1\n")
-    (vdir / "0" / ".zarray").write_text(json.dumps(vc3d_delta3d_zarray(ArrayMeta.from_zarray(source_meta))))
+    (vdir / "0" / ".zarray").write_text(json.dumps(delta3d_zarray(ArrayMeta.from_zarray(source_meta))))
     (vdir / "0" / "0" / "0" / "0").write_bytes(vc_delta3d.Delta3D(quant=1).encode(exp[:16, :16, :16].copy()))
     lossy = vc_delta3d.Delta3D(quant=5).encode(exp[:16, :16, 16:32].copy())
     (vdir / "0" / "0" / "0" / "1").write_bytes(lossy)
@@ -498,14 +601,16 @@ def test_vc3d_delta3d_cache(group_server, data, tmp_path):
     # A quantized chunk is not the source's values: refetched exactly, and the cache entry replaced.
     np.testing.assert_array_equal(r.read((0, 0, 16), (16, 16, 16)), exp[:16, :16, 16:32])
     assert len(httpd.requests) == 1
+    r.flush()
     assert (vdir / "0" / "0" / "0" / "1").read_bytes()[6] <= 1
     # Appends are Delta3D-encoded (losslessly); misses are marked under .vc_cache_empty.
     r.read((0, 16, 0), (16, 16, 16))
+    r.read((16, 16, 16), (16, 16, 16))
+    r.flush()
     stored = (vdir / "0" / "0" / "1" / "0").read_bytes()
     assert stored[:4] == b"D3D1" and stored[6] <= 1
     np.testing.assert_array_equal(
         np.frombuffer(vc_delta3d.Delta3D().decode(stored), np.uint8).reshape(CHUNKS), exp[:16, 16:32, :16])
-    r.read((16, 16, 16), (16, 16, 16))
     assert (vdir / ".vc_cache_empty" / "0" / "1" / "1" / "1.empty").exists()
     r.close()
     # With lossy caches allowed, a quantized chunk is served as stored (within its +-2 bound).
