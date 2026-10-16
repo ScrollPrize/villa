@@ -169,6 +169,92 @@ nearest ties, byte-swapped dtypes, output reuse, HTTP caches, pickle/offline
 reads, and more than 2²⁰ samples per crop. Existing point-sampler numerical
 tests still pass; no fast-math or reduced interpolation precision was added.
 
+## Casting and normalization: `bench_normalization.py`
+
+Compares block and affine crop reads plus NumPy post-processing against native
+`dtype`/`normalization` options. Both use float64 population statistics;
+z-score excludes zeros and preserves them in the output. Min/max includes
+the full crop. The baseline uses in-place NumPy arithmetic after casting;
+its zero mask and selected values are part of the measured workload.
+
+Save the baseline extension and its matching `zarr_reader.py` before changing
+or rebuilding them. The recorded baseline is `a879c21d7`:
+
+```bash
+mkdir -p /tmp/vcr-normalization-before
+cp build/cp314-cp314-linux_x86_64/_native*.so /tmp/vcr-normalization-before/
+cp src/vc_reader/reader/zarr_reader.py /tmp/vcr-normalization-before/zarr_reader.py
+
+.venv/bin/python benchmarks/run_native.py /tmp/vcr-normalization-before/_native*.so \
+  benchmarks/bench_normalization.py --baseline-reader /tmp/vcr-normalization-before/zarr_reader.py \
+  --methods numpy --reps 7 --output /tmp/normalization-before.json
+
+# After building the new extension:
+.venv/bin/python benchmarks/run_native.py build/cp314-cp314-linux_x86_64/_native*.so \
+  benchmarks/bench_normalization.py --reps 7 --output /tmp/normalization-final.json
+```
+
+The defaults use the same local PHercParis4 level-2 volume as the other
+benchmarks, a 128³ crop starting at `(9300, 4000, 4000)`, and the fixed affine
+matrix recorded in the script/JSON. The harness checks enclosing chunks are
+stored. `--edge`, `--paths block,affine`, `--dtypes float32,float64`, and
+`--modes cast,minmax,zscore` select workloads. `--cache-state cold` closes
+readers and evicts file pages before each method (Linux only); the results
+below use **warm mmap reads with no decoded memory cache**.
+
+Both builds: GCC 15.2, Release (`-O3 -DNDEBUG -g`), Python 3.14.4, 16 native
+reader threads, Linux x86-64 on the same 24-CPU/NVMe RAID host. One untimed
+warm-up and seven measured repetitions per case, alternating method order
+within the after-build run. Validation is outside the timer and uses
+`rtol=3e-6, atol=3e-6`, allowing rounding differences from NumPy's separate
+in-place arithmetic operations. No normalization approximations or fast-math
+flags were introduced. Fixed segment reductions make native output independent
+of reader thread count, but not necessarily bit-identical to NumPy.
+
+Times below are **mean / min / median / max milliseconds** for complete reads
+and post-processing, collected 2026-10-16. Speedup compares medians.
+
+| Crop / output / operation | Before: read + NumPy | After: native | Speedup |
+|---|---|---|---|
+| block / float32 / cast | 1.008 / 0.788 / 0.943 / 1.566 | 0.545 / 0.421 / 0.552 / 0.611 | 1.71× |
+| block / float32 / minmax | 1.615 / 1.547 / 1.583 / 1.728 | 2.183 / 1.304 / 2.374 / 3.129 | 0.67× |
+| block / float32 / zscore | 7.022 / 6.960 / 7.005 / 7.129 | 2.061 / 1.670 / 2.115 / 2.658 | 3.31× |
+| block / float64 / cast | 1.264 / 1.172 / 1.241 / 1.391 | 1.124 / 0.725 / 1.159 / 1.400 | 1.07× |
+| block / float64 / minmax | 3.131 / 2.902 / 2.970 / 3.661 | 3.265 / 2.315 / 3.492 / 3.812 | 0.85× |
+| block / float64 / zscore | 11.740 / 11.500 / 11.592 / 12.361 | 2.613 / 1.844 / 2.316 / 3.511 | 5.01× |
+| affine / float32 / cast | 6.778 / 6.351 / 6.800 / 7.208 | 6.775 / 6.400 / 6.812 / 6.993 | 1.00× |
+| affine / float32 / minmax | 7.948 / 7.383 / 7.986 / 8.225 | 7.391 / 6.808 / 7.255 / 8.205 | 1.10× |
+| affine / float32 / zscore | 13.390 / 12.748 / 13.200 / 14.268 | 7.645 / 6.855 / 7.784 / 8.199 | 1.70× |
+| affine / float64 / cast | 7.854 / 6.943 / 7.638 / 9.344 | 7.251 / 6.520 / 7.311 / 8.538 | 1.04× |
+| affine / float64 / minmax | 9.057 / 8.569 / 8.968 / 9.933 | 7.461 / 7.194 / 7.396 / 8.232 | 1.21× |
+| affine / float64 / zscore | 20.935 / 19.065 / 20.747 / 23.608 | 8.159 / 7.517 / 7.967 / 8.847 | 2.60× |
+
+Min/max block normalization is **not a demonstrated speedup** here; its
+thread scheduling and scalar reductions can cost more than NumPy's optimized
+min/max passes. The same-build interleaved NumPy/native medians were
+2.049/2.374 ms (float32) and 2.936/3.492 ms (float64), consistent with that
+limitation. The final JSON includes all interleaved measurements. Gains
+depend on crop size, zero density, cache state and competing loader workers.
+macOS/arm64, compressed/remote-source performance and end-to-end training
+throughput were not measured.
+
+`gprofng collect app -p hi` profiled 500 separate warm 128³ block min/max
+reads with output reuse, using the same Release objects relinked with symbols.
+Final exclusive CPU samples: normalization output loop 33.95%, first statistics
+pass 11.33%, and typed chunk conversion 9.22%. These include process startup
+(42.59% in NumPy's BLAS worker startup), so they are not wall-time fractions.
+The initial prototype spent 82.46% in the statistics pass; accumulating each
+segment locally before publishing its result removed shared-memory updates
+from that loop without changing reduction order.
+
+The final extension passed 456 offline tests (2 live-network tests deselected).
+New coverage includes independent crop statistics, zero masking, casts from
+native/byte-swapped source types, 1-D through 4-D boxes, affine sampling,
+output reuse, constant/empty/nonfinite/extreme-valued crops, thread-count
+determinism, and HTTP/pickle/offline cache reuse. Existing default-read and
+interpolation tests pass unchanged, except the old test rejecting nearest
+float output now rejects an unsupported integer conversion instead.
+
 ## Remote reads: `bench_remote.py`
 
 ```

@@ -4,6 +4,7 @@
 #pragma once
 
 #include "chunk_io.hpp"
+#include "output.hpp"
 #include "codecs.hpp"
 #include "disk_cache.hpp"
 #include "http.hpp"
@@ -67,49 +68,6 @@ struct AffineCoordinates {
         return c;
     }
     void prefetch(std::size_t) const {}
-};
-
-// How sample() reads stored elements as numbers.
-struct ElementType {
-    char kind = 'u';  // numpy kind: 'u', 'i', 'f' or 'b'
-    std::size_t itemsize = 1;
-    bool swap = false;  // stored in the other byte order
-
-    double load(const std::uint8_t* p) const
-    {
-        std::uint8_t b[8];
-        std::memcpy(b, p, itemsize);
-        if (swap)
-            std::reverse(b, b + itemsize);
-        switch (kind) {
-        case 'b':
-            return b[0] != 0;
-        case 'f':
-            if (itemsize == 4) {
-                float v;
-                std::memcpy(&v, b, 4);
-                return v;
-            } else {
-                double v;
-                std::memcpy(&v, b, 8);
-                return v;
-            }
-        case 'i':
-            switch (itemsize) {
-            case 1: return static_cast<double>(static_cast<std::int8_t>(b[0]));
-            case 2: { std::int16_t v; std::memcpy(&v, b, 2); return v; }
-            case 4: { std::int32_t v; std::memcpy(&v, b, 4); return v; }
-            default: { std::int64_t v; std::memcpy(&v, b, 8); return static_cast<double>(v); }
-            }
-        default:
-            switch (itemsize) {
-            case 1: return b[0];
-            case 2: { std::uint16_t v; std::memcpy(&v, b, 2); return v; }
-            case 4: { std::uint32_t v; std::memcpy(&v, b, 4); return v; }
-            default: { std::uint64_t v; std::memcpy(&v, b, 8); return static_cast<double>(v); }
-            }
-        }
-    }
 };
 
 // A chunk an offline read needs is in none of the disk layers.
@@ -318,7 +276,7 @@ public:
     // Reads every region [start, start+size) into its C-order output buffer.
     // Parts outside the array, and chunks that are not stored, read as fill.
     void read_many(const std::vector<Index>& starts, const std::vector<Index>& sizes,
-                   const std::vector<std::uint8_t*>& outs)
+                   const std::vector<std::uint8_t*>& outs, const BoxOutput* output = nullptr)
     {
         const std::size_t nd = spec_.shape.size();
         std::vector<Index> out_strides(starts.size());
@@ -329,7 +287,7 @@ public:
             const Index& size = sizes[r];
             if (start.size() != nd || size.size() != nd)
                 throw std::invalid_argument("region rank does not match the array");
-            out_strides[r] = c_strides(size, spec_.itemsize);
+            out_strides[r] = c_strides(size, output ? output->itemsize : spec_.itemsize);
             if (std::any_of(size.begin(), size.end(), [](std::int64_t n) { return n <= 0; }))
                 continue;  // nothing to read or fill
             Index lo(nd), hi(nd);
@@ -341,7 +299,7 @@ public:
                 clipped |= lo[i] != start[i] || hi[i] != start[i] + size[i];
             }
             if (empty || clipped)  // outside the array reads as fill; the inside is overwritten below
-                fill_box(outs[r], out_strides[r], size, spec_.fill);
+                fill_box(outs[r], out_strides[r], size, output ? output->fill : spec_.fill);
             if (empty)
                 continue;
             Index c0(nd), c1(nd);
@@ -376,7 +334,24 @@ public:
         ordered.reserve(work.size());
         for (auto& [linear, i] : slot)
             ordered.push_back(std::move(work[i]));
-        run(ordered, out_strides, nullptr);
+        run(ordered, out_strides, nullptr, output);
+    }
+
+    void read_many_float(const std::vector<Index>& starts, const std::vector<Index>& sizes,
+                         const std::vector<std::uint8_t*>& outs, const std::vector<std::size_t>& counts,
+                         const ElementType& type, bool out64, Normalization norm)
+    {
+        auto output = out64 ? BoxOutput::make<double>(type, spec_.fill) : BoxOutput::make<float>(type, spec_.fill);
+        read_many(starts, sizes, outs, &output);
+        for (std::size_t i = 0; i < outs.size(); ++i)
+            normalize_output(outs[i], counts[i], out64, norm);
+    }
+
+    void normalize_output(std::uint8_t* out, std::size_t n, bool out64, Normalization norm)
+    {
+        if (norm == Normalization::None) return;
+        if (out64) normalize_crop(reinterpret_cast<double*>(out), n, norm, pool_);
+        else normalize_crop(reinterpret_cast<float*>(out), n, norm, pool_);
     }
 
     // Reads the elements at `n` points into `out` (one element each, in order).
@@ -409,14 +384,26 @@ public:
     }
 
     void read_affine(const AffineCoordinates& grid, std::size_t n, int order,
-                     const ElementType& type, bool out64, std::uint8_t* out)
+                     const ElementType& type, bool out64, std::uint8_t* out,
+                     bool float_output = false, Normalization norm = Normalization::None)
     {
         if (ndim() != 3)
             throw std::invalid_argument("affine reads require a 3-D source array");
-        if (order == 0)
+        const bool same_float = type.kind == 'f' && !type.swap && type.itemsize == (out64 ? 8 : 4);
+        if (order == 0 && float_output && !same_float) {
+            if (n > std::numeric_limits<std::size_t>::max() / spec_.itemsize)
+                throw std::invalid_argument("nearest crop is too large");
+            std::vector<std::uint8_t> raw(n * spec_.itemsize);
+            read_points_as<3>(grid, n, raw.data());
+            auto convert = out64 ? BoxOutput::make<double>(type, spec_.fill) : BoxOutput::make<float>(type, spec_.fill);
+            if (n) convert.copy(raw.data(), {static_cast<std::int64_t>(spec_.itemsize)}, out,
+                                {static_cast<std::int64_t>(convert.itemsize)}, {static_cast<std::int64_t>(n)});
+        } else if (order == 0) {
             read_points_as<3>(grid, n, out);
-        else
+        } else {
             sample_linear_coordinates(grid, n, type, out64, out);
+        }
+        normalize_output(out, n, out64, norm);
     }
 
     template <class Coordinates>
@@ -432,29 +419,9 @@ public:
             else
                 sample_linear_as<0>(coords, n, type, out64, out, load);
         };
-        const auto with = [&]<class T>() {
-            dispatch([](const std::uint8_t* p) {
-                T v;
-                std::memcpy(&v, p, sizeof(T));
-                return static_cast<double>(v);
-            });
-        };
-        if (type.swap || type.kind == 'b')
-            return dispatch([&type](const std::uint8_t* p) { return type.load(p); });
-        switch (type.kind == 'f' ? 100 + type.itemsize : type.kind == 'i' ? 10 + type.itemsize : type.itemsize) {
-        case 1: return with.template operator()<std::uint8_t>();
-        case 2: return with.template operator()<std::uint16_t>();
-        case 4: return with.template operator()<std::uint32_t>();
-        case 8: return with.template operator()<std::uint64_t>();
-        case 11: return with.template operator()<std::int8_t>();
-        case 12: return with.template operator()<std::int16_t>();
-        case 14: return with.template operator()<std::int32_t>();
-        case 18: return with.template operator()<std::int64_t>();
-        case 104: return with.template operator()<float>();
-        case 108: return with.template operator()<double>();
-        default:
-            return dispatch([&type](const std::uint8_t* p) { return type.load(p); });
-        }
+        type.visit_load([&](auto load) {
+            dispatch([load](const std::uint8_t* p) { return static_cast<double>(load(p)); });
+        });
     }
 
     const Stats& stats() const noexcept { return stats_; }
@@ -532,11 +499,12 @@ private:
     };
 
     // Resolves every chunk in parallel, in the order given.
-    void run(std::vector<Work>& work, const std::vector<Index>& out_strides, const PointOp* op)
+    void run(std::vector<Work>& work, const std::vector<Index>& out_strides, const PointOp* op,
+             const BoxOutput* output = nullptr)
     {
         if (spec_.hint && !cache_)
             pool_.parallel_for(work.size(), [&](std::size_t i) { hint(work[i]); });
-        pool_.parallel_for(work.size(), [&](std::size_t i) { resolve(work[i], out_strides, op); });
+        pool_.parallel_for(work.size(), [&](std::size_t i) { resolve(work[i], out_strides, op, output); });
     }
 
     std::size_t plan_segments(std::size_t n) const
@@ -1191,30 +1159,39 @@ private:
         hint_willneed(f.fd(), lo, hi - lo);
     }
 
-    void apply(const ChunkPtr& chunk, const Work& w, const std::vector<Index>& out_strides, const PointOp* op)
+    void copy_piece(const std::uint8_t* src, const Piece& p, const std::vector<Index>& strides,
+                    const BoxOutput* output)
+    {
+        if (output) {
+            output->copy(src, chunk_strides_, p.dst, strides[p.region], p.extent);
+        } else {
+            copy_box(src, chunk_strides_, p.dst, strides[p.region], p.extent, spec_.itemsize);
+        }
+    }
+
+    void apply(const ChunkPtr& chunk, const Work& w, const std::vector<Index>& out_strides, const PointOp* op, const BoxOutput* output)
     {
         if (!chunk) {
-            fill_pieces(w, out_strides, op);
+            fill_pieces(w, out_strides, op, output);
             return;
         }
         for (const auto& p : w.pieces)
-            copy_box(chunk->data() + offset_of(p.src_lo, chunk_strides_), chunk_strides_, p.dst,
-                     out_strides[p.region], p.extent, spec_.itemsize);
+            copy_piece(chunk->data() + offset_of(p.src_lo, chunk_strides_), p, out_strides, output);
         if (w.has_points())
             op->read(chunk->data(), 0, w);
     }
 
-    void fill_pieces(const Work& w, const std::vector<Index>& out_strides, const PointOp* op)
+    void fill_pieces(const Work& w, const std::vector<Index>& out_strides, const PointOp* op, const BoxOutput* output)
     {
         for (const auto& p : w.pieces)
-            fill_box(p.dst, out_strides[p.region], p.extent, spec_.fill);
+            fill_box(p.dst, out_strides[p.region], p.extent, output ? output->fill : spec_.fill);
         if (w.has_points())
             op->fill(w);
     }
 
     // Reads the pieces of a raw (uncompressed) chunk file straight into the outputs.
     Found read_raw_pieces(const std::string& path, const Work& w, const std::vector<Index>& out_strides,
-                          const PointOp* op)
+                          const PointOp* op, const BoxOutput* output)
     {
         if (spec_.read_mode == "mmap") {
             bool fresh;
@@ -1238,8 +1215,7 @@ private:
                 advise(first, len);
             }
             for (const auto& p : w.pieces)
-                copy_box(m->data + offset_of(p.src_lo, chunk_strides_), chunk_strides_, p.dst,
-                         out_strides[p.region], p.extent, spec_.itemsize);
+                copy_piece(m->data + offset_of(p.src_lo, chunk_strides_), p, out_strides, output);
             if (w.has_points())
                 op->read(m->data, 0, w);
             return Found::Copied;
@@ -1253,7 +1229,7 @@ private:
         for (const auto& p : w.pieces) {
             auto [first, len] = span_of(p);
             pread_exact(f.fd(), scratch.data(), static_cast<std::size_t>(len), first, path);
-            copy_box(scratch.data(), chunk_strides_, p.dst, out_strides[p.region], p.extent, spec_.itemsize);
+            copy_piece(scratch.data(), p, out_strides, output);
         }
         if (w.has_points()) {  // one read of the span the points touch
             auto [lo, len] = point_span(w, *op);
@@ -1285,7 +1261,7 @@ private:
         return ChunkPtr(std::move(chunk));
     }
 
-    void resolve(const Work& w, const std::vector<Index>& out_strides, const PointOp* op)
+    void resolve(const Work& w, const std::vector<Index>& out_strides, const PointOp* op, const BoxOutput* output)
     {
         const std::string k = key(w.idx);
         const std::string ck = spec_.identity + "|" + k;
@@ -1293,7 +1269,7 @@ private:
             auto [found, chunk] = cache_->get(ck);
             if (found) {
                 ++stats_.memory_hits;
-                apply(chunk, w, out_strides, op);
+                apply(chunk, w, out_strides, op, output);
                 return;
             }
         }
@@ -1301,19 +1277,19 @@ private:
             auto [found, chunk] = writes_->pending(k);
             if (found) {
                 ++stats_.pending_hits;
-                apply(chunk, w, out_strides, op);
+                apply(chunk, w, out_strides, op, output);
                 return;
             }
         }
         for (std::size_t li = 0; li < spec_.layers.size(); ++li) {
             const LayerSpec& l = spec_.layers[li];
             if (!cache_ && codecs_[li] == Codec::Raw) {
-                if (read_raw_pieces(l.root + "/" + k, w, out_strides, op) == Found::Copied) {
+                if (read_raw_pieces(l.root + "/" + k, w, out_strides, op, output) == Found::Copied) {
                     ++stats_.disk_hits;
                     return;
                 }
                 if (l.kind == "array" || exists(marker_path(l, k))) {
-                    fill_pieces(w, out_strides, op);
+                    fill_pieces(w, out_strides, op, output);
                     return;
                 }
                 continue;
@@ -1322,7 +1298,7 @@ private:
                 ++stats_.disk_hits;
                 if (cache_)
                     cache_->put(ck, *chunk);
-                apply(*chunk, w, out_strides, op);
+                apply(*chunk, w, out_strides, op, output);
                 return;
             }
         }
@@ -1331,19 +1307,19 @@ private:
             if (chunk && chunk->size() != chunk_bytes_)
                 throw std::runtime_error("prefetch coordinator returned an invalid chunk size");
             if (cache_) cache_->put(ck, chunk);
-            apply(chunk, w, out_strides, op);
+            apply(chunk, w, out_strides, op, output);
             return;
         }
         if (spec_.offline)
             throw CacheMiss("chunk " + k + " of " + spec_.identity + " is not in the disk cache (offline)");
         if (!http_) {
-            fill_pieces(w, out_strides, op);
+            fill_pieces(w, out_strides, op, output);
             return;
         }
         ChunkPtr chunk = fetch(k);
         if (cache_)
             cache_->put(ck, chunk);
-        apply(chunk, w, out_strides, op);
+        apply(chunk, w, out_strides, op, output);
     }
 
     // Fetches a chunk from the remote once, however many reads want it at the same time.

@@ -85,7 +85,7 @@ def test_affine_rejects_bad_inputs(array):
         for axes in [np.eye(2), np.full((3, 3), np.nan)]:
             with pytest.raises(ValueError, match="axes"):
                 r.read_affine(grid[0], grid[1], axes)
-        for kwargs in [dict(order=2), dict(dtype="f2"), dict(order=0, dtype="f4")]:
+        for kwargs in [dict(order=2), dict(dtype="f2"), dict(order=0, dtype="i4")]:
             with pytest.raises(ValueError):
                 r.read_affine(*grid, **kwargs)
         readonly = np.empty(grid[0], np.float32)

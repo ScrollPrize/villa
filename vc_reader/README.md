@@ -168,10 +168,10 @@ There is no antialiasing filter when downsampling.
 
 `order=1` uses float64 interpolation and returns float32 by default, or
 `dtype=np.float64`. `order=0` uses nearest sampling (ties to even) and retains
-the stored dtype; an explicit dtype must match it. Outside neighbours and
+the stored dtype by default; an explicit float32/float64 dtype converts it. Outside neighbours and
 missing chunks use the array's stored `fill_value`. This does **not** imply
-zero padding for arrays with nonzero fill values. Normalization remains the
-caller's responsibility.
+zero padding for arrays with nonzero fill values. Optional normalization runs
+after sampling, as described below.
 
 `out` must have the requested dtype and shape and be writable, aligned and
 C-contiguous. `read_affine_many` accepts differing shapes and an optional
@@ -193,8 +193,53 @@ origin = input_scale * (pos_xyz + frame_xyz @ first_local)[::-1]
 image = r.read_affine((depth, height, width), origin, axes)
 ```
 
-Apply the dataset's intensity scaling and per-crop normalization afterwards.
+Request per-crop normalization with the options below, or apply the dataset's
+own intensity transformation afterwards.
 Existing tracer implementations are not automatically switched to this API.
+
+### Casting and per-crop normalization
+
+Defaults are unchanged. `read`/`read_many` return stored values in the stored
+dtype; affine reads return float32 for trilinear sampling and the stored dtype
+for nearest sampling. Opt in on any of these four methods:
+
+```python
+raw = r.read(start, size)
+floating = r.read(start, size, dtype=np.float32)  # cast only
+unit = r.read(start, size, normalization="minmax")  # float32 by default
+standard = r.read(start, size, normalization="zscore", dtype=np.float64)
+oriented = r.read_affine(shape, origin, axes, normalization="zscore")
+crops = r.read_many(regions, normalization="minmax", dtype=np.float32, out=buffers)
+crops = r.read_affine_many(grids, normalization="zscore", dtype=np.float32)
+```
+
+- `normalization=None` leaves intensities unchanged. Request `dtype=np.float32`
+  or `np.float64` independently to cast. No cast or normalization is inferred
+  from an `out` buffer.
+- `"minmax"` computes `(x - min) / (max - min)` over the full crop, including
+  zeros and fill values, producing values in `[0, 1]`.
+- `"zscore"` computes `(x - mean) / std` using **only nonzero voxels**, with
+  population standard deviation (`ddof=0`). All input zeros remain exactly
+  zero, including zero padding, missing chunks with zero fill, and zeros
+  stored in the volume. Nonzero fill values participate like other values.
+- Normalization requires float32 or float64 output and defaults to float32
+  when `dtype` is omitted. Each crop in a batch has independent statistics.
+  Statistics use float64 after casting (and after interpolation for affine
+  crops). Reductions have a fixed order independent of reader thread count.
+- Constant crops, all-zero crops, and z-score crops with constant nonzero
+  values become zero. Empty crops remain empty. Normalizing a crop containing
+  NaN or infinity raises `ValueError`; casts alone retain them. An error may
+  leave provided output buffers partially written.
+
+Normalization is native and releases the GIL. Block reads convert directly
+from source chunks into the requested floating output, followed by in-place
+per-crop statistics and normalization. Trilinear affine reads also normalize
+their final output in place. Nearest affine reads that change dtype currently
+use a temporary stored-dtype crop before conversion. Neither the source nor
+cached chunks nor `reader.dtype` are modified. These options do not apply
+automatically to indexing, `read_points` or `sample`.
+
+### Groups
 
 Groups open their arrays with shared settings and one memory cache:
 

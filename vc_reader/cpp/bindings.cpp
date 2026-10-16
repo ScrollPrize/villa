@@ -39,6 +39,33 @@ static vcr::ElementType sample_type(const std::string& name, std::size_t itemsiz
     return {kind, itemsize, swap};
 }
 
+static vcr::Normalization normalization(const std::string& name)
+{
+    if (name.empty()) return vcr::Normalization::None;
+    if (name == "minmax") return vcr::Normalization::MinMax;
+    if (name == "zscore") return vcr::Normalization::ZScore;
+    throw nb::value_error("normalization must be None, 'minmax' or 'zscore'");
+}
+
+static std::vector<std::size_t> output_counts(const std::vector<vcr::Index>& shapes,
+                                            const std::vector<Bytes>& outs, std::size_t itemsize)
+{
+    if (shapes.size() != outs.size()) throw nb::value_error("one output is required per region");
+    std::vector<std::size_t> counts;
+    for (std::size_t j = 0; j < shapes.size(); ++j) {
+        std::size_t n = 1;
+        for (auto dim : shapes[j]) {
+            if (dim < 0 || (dim && n > std::numeric_limits<std::size_t>::max() / dim))
+                throw nb::value_error("invalid or overflowing output shape");
+            n *= dim;
+        }
+        if (n > std::numeric_limits<std::size_t>::max() / itemsize || outs[j].size() != n * itemsize)
+            throw nb::value_error("an output buffer does not match its region");
+        counts.push_back(n);
+    }
+    return counts;
+}
+
 NB_MODULE(_native, m)
 {
     m.doc() = "Native zarr v2 read path: local and HTTP chunks, disk cache layers, memory cache.";
@@ -202,6 +229,23 @@ NB_MODULE(_native, m)
             "starts"_a, "sizes"_a, "outs"_a, "itemsize"_a,
             "Read regions into flat uint8 views of C-order outputs (the GIL is released).")
         .def(
+            "read_many_float",
+            [](vcr::Array& a, const std::vector<vcr::Index>& starts, const std::vector<vcr::Index>& sizes,
+               std::vector<Bytes> outs, const std::string& kind, std::size_t itemsize, bool swap,
+               bool out64, const std::string& norm_name) {
+                if (starts.size() != sizes.size()) throw nb::value_error("starts and sizes must match");
+                if (itemsize != a.itemsize()) throw nb::value_error("source itemsize does not match");
+                const auto type = sample_type(kind, itemsize, swap);
+                const auto norm = normalization(norm_name);
+                const auto counts = output_counts(sizes, outs, out64 ? 8 : 4);
+                std::vector<std::uint8_t*> ptrs;
+                for (auto& out : outs) ptrs.push_back(out.data());
+                nb::gil_scoped_release release;
+                a.read_many_float(starts, sizes, ptrs, counts, type, out64, norm);
+            },
+            "starts"_a, "sizes"_a, "outs"_a, "kind"_a, "itemsize"_a, "swap"_a, "out64"_a, "normalization"_a,
+            "Read directly into floating outputs and optionally normalize each crop.")
+        .def(
             "read_points",
             [](vcr::Array& a, nb::ndarray<std::int64_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> coords, Bytes out,
                std::size_t itemsize) {
@@ -246,7 +290,7 @@ NB_MODULE(_native, m)
                nb::ndarray<double, nb::ndim<2>, nb::c_contig, nb::device::cpu> origins,
                nb::ndarray<double, nb::ndim<3>, nb::c_contig, nb::device::cpu> axes,
                std::vector<Bytes> outs, int order, const std::string& kind, std::size_t itemsize,
-               bool swap, bool out64) {
+               bool swap, bool out64, bool float_output, const std::string& norm_name) {
                 if (a.ndim() != 3 || origins.shape(1) != 3 || axes.shape(1) != 3 || axes.shape(2) != 3)
                     throw nb::value_error("affine reads require 3-D shapes, origins and axes");
                 if (shapes.size() != outs.size() || shapes.size() != origins.shape(0) || shapes.size() != axes.shape(0))
@@ -255,8 +299,11 @@ NB_MODULE(_native, m)
                     throw nb::value_error("order must be 0 (nearest) or 1 (linear)");
                 if (itemsize != a.itemsize())
                     throw nb::value_error("itemsize does not match the source array");
-                const auto type = order == 1 ? sample_type(kind, itemsize, swap) : vcr::ElementType{};
-                const std::size_t outsize = order == 0 ? itemsize : (out64 ? 8 : 4);
+                const auto norm = normalization(norm_name);
+                if (norm != vcr::Normalization::None && order == 0 && !float_output)
+                    throw nb::value_error("normalization requires floating output");
+                const auto type = order == 1 || float_output ? sample_type(kind, itemsize, swap) : vcr::ElementType{};
+                const std::size_t outsize = order == 0 && !float_output ? itemsize : (out64 ? 8 : 4);
                 std::vector<vcr::AffineCoordinates> grids(shapes.size());
                 std::vector<std::size_t> counts(shapes.size());
                 // Validate the whole batch before writing any output.
@@ -286,9 +333,10 @@ NB_MODULE(_native, m)
                 }
                 nb::gil_scoped_release release;
                 for (std::size_t j = 0; j < grids.size(); ++j)
-                    a.read_affine(grids[j], counts[j], order, type, out64, outs[j].data());
+                    a.read_affine(grids[j], counts[j], order, type, out64, outs[j].data(), float_output, norm);
             },
             "shapes"_a, "origins"_a, "axes"_a, "outs"_a, "order"_a, "kind"_a, "itemsize"_a, "swap"_a, "out64"_a,
+            "float_output"_a = false, "normalization"_a = "",
             "Sample regular affine grids with generated coordinates (the GIL is released).")
         .def("load_chunk", &vcr::Array::load_chunk, nb::call_guard<nb::gil_scoped_release>())
         .def("publish_chunk", &vcr::Array::publish_chunk, nb::call_guard<nb::gil_scoped_release>())
