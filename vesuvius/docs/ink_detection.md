@@ -455,6 +455,12 @@ crop. It prefers `ema_model`, then common flat state-dict aliases, then
 `model`. The output is a tiled LZW uint8 BigTIFF. Probabilities are clipped to
 `[0,1]`, multiplied by 255, and truncated to uint8.
 
+The TIFF's `ImageDescription` holds a JSON provenance record (checkpoint name
+and sha256, input volume and level, layer window, direction, run settings), and
+when the input's OME-Zarr metadata declares a micrometre scale the TIFF also
+carries `XResolution`/`YResolution` in pixels per inch. `tiffcomment out.tif`
+prints the record.
+
 Flat inference has a narrower preprocessing contract than training. It accepts
 `robust_mad` only with the default 1st and 99th percentiles, and `divide` only
 with `divisor: 255`. Other normalization modes are rejected rather than being
