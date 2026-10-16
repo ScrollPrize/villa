@@ -708,13 +708,13 @@ TEST_CASE("fiber-patch: independent coordinate scales preserve links, source anc
     source.ensureLoaded();
     CHECK((*source.rawPointsPtr())(1, 0)[0] == doctest::Approx(50));
     CHECK((*source.rawPointsPtr())(0, 0)[0] == doctest::Approx(-1));
-    // Backfill a legacy registration without resetting its review.
+    // Backfilling a changed length must invalidate the legacy review.
     { auto write = db.write(); db.setFiberLength(write, fiber, 0);
       db.setApproval(write, fiber, "approved"); write.commit(); }
     REQUIRE(linkTestFiberPatches(db, fibers, patches, ctVolume, p).problems.empty());
     { auto read = db.read(); const auto f = db.objectByUuid(read, fiber);
-      CHECK(f->fiber->length == 960); CHECK(f->generation == 1);
-      CHECK(f->approvalState == "approved"); }
+      CHECK(f->fiber->length == 960); CHECK(f->generation == 3);
+      CHECK(f->approvalState == "pending"); }
     // An incorrect mapping puts the fiber outside the CT; preserve pending links.
     auto outside = p;
     outside.workingToBaseScale = 1;

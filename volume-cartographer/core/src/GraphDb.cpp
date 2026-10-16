@@ -299,7 +299,7 @@ int pragmaInt(sqlite3* db, const char* pragma)
     return int(s.i64(0));
 }
 
-void migrateSchema(sqlite3* db)
+void migrateSchema(sqlite3* db, const std::string& author, const std::string& hostname)
 {
     exec(db, "BEGIN IMMEDIATE;");
     try {
@@ -315,10 +315,12 @@ void migrateSchema(sqlite3* db)
             // Old decisions cannot be reconstructed. Preserve the state that
             // survives migration before any subsequent edits can clear it.
             for (const char* table : {"objects", "edges"}) {
-                exec(db, (std::string("INSERT INTO journal(record_uuid,generation,author,hostname,timestamp,change_kind,") +
+                Statement snapshot(db, std::string("INSERT INTO journal(record_uuid,generation,author,hostname,timestamp,change_kind,") +
                     "approval_state,approved_by,approved_at,approved_host,approved_generation) "
-                    "SELECT uuid,generation,changed_by,changed_host,strftime('%Y-%m-%dT%H:%M:%SZ','now'),"
-                    "'migration_snapshot',approval_state,approved_by,approved_at,approved_host,approved_generation FROM " + table).c_str());
+                    "SELECT uuid,generation,?,?,?,'migration_snapshot',approval_state,approved_by,approved_at,approved_host,"
+                    "approved_generation FROM " + table);
+                snapshot.bind(1, author); snapshot.bind(2, hostname); snapshot.bind(3, nowIsoUtc());
+                snapshot.stepDone();
             }
             exec(db, "PRAGMA user_version=2;");
         } else if (version != kSchemaVersion) {
@@ -416,7 +418,7 @@ std::unique_ptr<GraphDb::Impl> GraphDb::openImpl(const std::filesystem::path& pa
             exec(impl->writer, "PRAGMA synchronous=NORMAL;");
             if (pragmaInt(impl->writer, "application_id") != kApplicationId)
                 throw std::runtime_error("graph db: not a VC graph database: " + path.string());
-            migrateSchema(impl->writer);
+            migrateSchema(impl->writer, options.author, impl->hostname);
         }
     }
 
@@ -758,6 +760,10 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
 {
     if (input.kind.empty())
         throw std::runtime_error("graph db: object kind must be non-empty");
+    if (input.patch)
+        for (double axis : input.patch->scale)
+            if (!std::isfinite(axis) || axis < 0)
+                throw std::runtime_error("graph db: patch scale must be finite and nonnegative");
     ObjectRecord rec = input;
     if (rec.uuid.empty())
         rec.uuid = util::newUuid();
@@ -1527,9 +1533,6 @@ nlohmann::json objectToJson(const ObjectRecord& r)
     j["storage_ref"] = r.storageRef;
     j["data_generation"] = r.dataGeneration;
     if (r.dataChecksum) j["data_checksum"] = *r.dataChecksum;
-    j["tags"] = r.tags;
-    j["meta"] = nlohmann::json::parse(r.meta);
-    j["approval_state"] = r.approvalState;
     if (r.fiber) {
         j["fiber"] = {{"family", r.fiber->family}, {"manual_family", r.fiber->manualFamily},
                       {"control_point_count", r.fiber->controlPointCount}, {"line_point_count", r.fiber->linePointCount},

@@ -99,6 +99,7 @@ def test_schema_v1_migration_preserves_surviving_approval(tmp_path):
         history = migrated.journal_since()
         assert history[0]["approval_state"] is None  # no invented historical decision
         assert history[1]["change_kind"] == "migration_snapshot"
+        assert history[1]["author"] == "migrator"
         assert history[1]["approval_state"] == "approved"
         assert history[1]["approved_generation"] == 7
         migrated.set_meta(str(uid), "edited", True)
@@ -128,7 +129,7 @@ def test_patch_import_tifxyz_metadata(db, tmp_path, scale, expected):
     assert report["objects_imported"] == 1 and len(report["problems"]) == 1
     record = db.object(uid)
     assert record["patch"]["scale"] == expected
-    assert record["patch"]["bbox"] == (10, 20, 30, 40, 50, 60)
+    assert record["patch"]["bbox"] == [10, 20, 30, 40, 50, 60]
     with GraphDb.create(str(tmp_path / "copy.vcgr"), author="copy") as copy:
         copy.import_json(db.export_json())
         assert copy.object(uid) == record
