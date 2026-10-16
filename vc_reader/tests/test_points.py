@@ -193,6 +193,37 @@ def test_sample_2d(tmp_path):
         np.testing.assert_allclose(r.sample(pts, dtype=np.float64), _linear(exp, pts), rtol=1e-12)
 
 
+@pytest.mark.parametrize("chunks", [(1, 8, 7), (5, 6, 9), (8, 16, 16)])
+@pytest.mark.parametrize("read_mode", ["mmap", "slab"])
+def test_point_chunk_geometry(tmp_path, chunks, read_mode):
+    """Power-of-two, arbitrary and unit chunk axes use the same voxel boundaries."""
+    pytest.importorskip("numcodecs")
+    rng = np.random.default_rng(17)
+    exp = rng.integers(0, 65535, (19, 22, 31), dtype=np.uint16)
+    root = str(tmp_path / "geometry.zarr")
+    _write_zarr(root, exp, chunks)
+    pts = rng.uniform(-1.5, np.asarray(exp.shape) + 0.5, size=(3000, 3))
+    boundaries = np.asarray(chunks) * rng.integers(0, 4, (1000, 3))
+    pts = np.concatenate([pts, boundaries - 0.25, boundaries, boundaries + 0.5])
+    with ZarrReader.open(root, read_mode=read_mode) as r:
+        ints = np.floor(pts).astype(np.int64)
+        np.testing.assert_array_equal(r.read_points(ints), _gather(exp, ints))
+        np.testing.assert_array_equal(r.sample(pts, order=0), _gather(exp, np.rint(pts).astype(np.int64)))
+        np.testing.assert_array_max_ulp(r.sample(pts, dtype=np.float64), _linear_ordered(exp, pts), maxulp=MAX_ULP)
+
+
+def test_sample_4d(tmp_path):
+    pytest.importorskip("numcodecs")
+    rng = np.random.default_rng(18)
+    exp = rng.integers(0, 255, (5, 6, 7, 8), dtype=np.uint8)
+    root = str(tmp_path / "4d.zarr")
+    _write_zarr(root, exp, (3, 4, 5, 4))
+    pts = rng.uniform(-1.5, np.asarray(exp.shape) + 0.5, size=(1000, 4))
+    pts[::3] = np.rint(pts[::3])
+    with ZarrReader.open(root) as r:
+        np.testing.assert_array_max_ulp(r.sample(pts, dtype=np.float64), _linear_ordered(exp, pts), maxulp=MAX_ULP)
+
+
 def test_points_over_http(tmp_path, data):
     pytest.importorskip("numcodecs")
     _write_zarr(str(tmp_path / "a.zarr"), data, CHUNKS, missing=MISSING, compressor=BLOSC)

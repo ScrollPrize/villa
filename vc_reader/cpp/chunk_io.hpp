@@ -52,10 +52,27 @@ inline std::int64_t offset_of(const Index& lo, const Index& strides)
 inline void copy_box(const std::uint8_t* s, const Index& ss, std::uint8_t* d, const Index& ds, const Index& extent,
                      std::size_t itemsize)
 {
-    const std::size_t nd = extent.size();
-    const std::size_t run = static_cast<std::size_t>(extent[nd - 1]) * itemsize;
+    std::size_t nd = extent.size();
+    std::size_t run = static_cast<std::size_t>(extent[nd - 1]) * itemsize;
+    // Fold axes only when both arrays are contiguous across their rows.
+    // Whole chunks then use one memcpy instead of thousands of short copies.
+    while (nd > 1 && ss[nd - 2] == static_cast<std::int64_t>(run) &&
+                     ds[nd - 2] == static_cast<std::int64_t>(run)) {
+        --nd;
+        run *= static_cast<std::size_t>(extent[nd - 1]);
+    }
     if (nd == 1) {
         std::memcpy(d, s, run);
+        return;
+    }
+    if (nd <= 3) {
+        const std::int64_t planes = nd == 3 ? extent[0] : 1;
+        for (std::int64_t z = 0; z < planes; ++z) {
+            const auto* src = s + (nd == 3 ? z * ss[0] : 0);
+            auto* dst = d + (nd == 3 ? z * ds[0] : 0);
+            for (std::int64_t y = 0; y < extent[nd - 2]; ++y)
+                std::memcpy(dst + y * ds[nd - 2], src + y * ss[nd - 2], run);
+        }
         return;
     }
     Index pos(nd - 1, 0);  // position over every axis but the last
@@ -212,8 +229,9 @@ public:
     explicit MapCache(std::size_t capacity) : capacity_(capacity) {}
 
     // The mapping of `path` (nullptr if the file does not exist).
-    MappingPtr get(const std::string& path)
+    MappingPtr get(const std::string& path, bool& fresh)
     {
+        fresh = false;
         {
             std::lock_guard lock(mutex_);
             if (auto it = index_.find(path); it != index_.end()) {
@@ -240,6 +258,7 @@ public:
             return it->second->second;
         order_.emplace_front(path, m);
         index_.emplace(path, order_.begin());
+        fresh = true;
         while (order_.size() > capacity_) {
             index_.erase(order_.back().first);
             order_.pop_back();  // unmapped once no reader holds it

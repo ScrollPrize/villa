@@ -117,6 +117,40 @@ def test_read_many(local_array, read_mode):
         np.testing.assert_array_equal(got, _ref(exp, start, size))
 
 
+@pytest.mark.parametrize("ndim", [1, 2, 3, 4])
+@pytest.mark.parametrize("read_mode", ["mmap", "slab"])
+@pytest.mark.parametrize("memory", [0, 1 << 20])
+def test_contiguous_copy_axes(tmp_path, ndim, read_mode, memory):
+    """Only merge rows when both the source and destination are contiguous."""
+    pytest.importorskip("numcodecs")
+    chunks = (5, 6, 8, 9)[:ndim]
+    shape = tuple(c * 2 + 1 for c in chunks)
+    exp = np.arange(np.prod(shape), dtype=np.uint16).reshape(shape)
+    root = str(tmp_path / "copy.zarr")
+    _write_zarr(root, exp, chunks)
+    regions = [((0,) * ndim, chunks), ((0,) * ndim, shape), ((-1,) * ndim, shape)]
+    for axis in range(ndim):
+        size = list(chunks)
+        size[axis] -= 1
+        regions.append(((1,) * ndim, tuple(size)))
+        size[axis] = 1
+        regions.append(((0,) * ndim, tuple(size)))
+    with ZarrReader.open(root, read_mode=read_mode, memory_cache=memory) as r:
+        for (start, size), got in zip(regions, r.read_many(regions)):
+            np.testing.assert_array_equal(got, _ref(exp, start, size))
+
+
+@pytest.mark.parametrize("stored_bytes", [63, 65])
+def test_memory_cache_rejects_raw_chunk_size(tmp_path, stored_bytes):
+    pytest.importorskip("numcodecs")
+    root = tmp_path / "bad.zarr"
+    _write_zarr(str(root), np.zeros((8, 8, 8), dtype=np.uint8), (4, 4, 4))
+    (root / "0/0/0").write_bytes(bytes(stored_bytes))
+    with ZarrReader.open(str(root), memory_cache=1 << 20) as r:
+        with pytest.raises(RuntimeError, match="raw chunk has .* bytes, expected 64"):
+            r.read((0, 0, 0), (1, 1, 1))
+
+
 def test_read_many_into_given_outputs(local_array):
     root, exp = local_array
     r = ZarrReader.open(root, threads=4)

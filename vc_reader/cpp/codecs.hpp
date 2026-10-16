@@ -28,14 +28,19 @@ inline Codec parse_codec(const std::string& id)
     throw std::invalid_argument("native reader does not support codec '" + id + "'");
 }
 
+inline void check_raw_size(std::size_t n, std::size_t expected)
+{
+    if (n != expected)
+        throw std::runtime_error("raw chunk has " + std::to_string(n) + " bytes, expected " +
+                                 std::to_string(expected));
+}
+
 // Decodes `n` stored bytes into exactly `dst_n` bytes at `dst`; throws on corrupt input.
 inline void decode(Codec codec, const std::uint8_t* src, std::size_t n, std::uint8_t* dst, std::size_t dst_n)
 {
     switch (codec) {
     case Codec::Raw:
-        if (n != dst_n)
-            throw std::runtime_error("raw chunk has " + std::to_string(n) + " bytes, expected " +
-                                     std::to_string(dst_n));
+        check_raw_size(n, dst_n);
         std::memcpy(dst, src, n);
         return;
     case Codec::Blosc: {

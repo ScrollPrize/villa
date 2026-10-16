@@ -78,6 +78,12 @@ def main(argv=None) -> None:
         "batch128": (random_crops(shape, 128, 256, 3, exists), True),
         "block512": (random_crops(shape, 512, 4, 4, exists), False),
     }
+    # Whole stored chunks: unlike unaligned crops, both the source and output
+    # are contiguous. Reuse the same deterministic crop centres.
+    workloads["chunks"] = ([
+        (tuple((s + 64) // c * c for s, c in zip(start, meta.chunks)), meta.chunks)
+        for start, _ in workloads["batch128"][0]
+    ], True)
     bench = Bench(args.reps)
     for name, (ops, batch) in workloads.items():
         if args.only and not any(f in name for f in args.only.split(",")):

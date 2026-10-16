@@ -123,9 +123,9 @@ def evict_tree(root: Path) -> int:
 
 def chunk_files(root: str, regions: Iterable[Region]) -> list[str]:
     """The chunk files of a local zarr v2 array that the regions touch."""
-    r = ZarrReader.open(root)
-    keys = sorted({k for start, size in regions for k in r.chunk_indices(start, size)})
-    return [os.path.join(root, r.meta.chunk_key(k)) for k in keys]
+    with ZarrReader.open(root) as r:
+        keys = sorted({k for start, size in regions for k in r.chunk_indices(start, size)})
+        return [os.path.join(root, r.meta.chunk_key(k)) for k in keys]
 
 
 def filesystem_type(path: Path) -> str | None:
@@ -232,6 +232,7 @@ class Bench:
                 batch_size=batch_size,
                 bytes_per_rep=nbytes, seconds_min=min(ts), seconds_median=statistics.median(ts),
                 seconds_max=max(ts), mib_s_median=nbytes / 2**20 / statistics.median(ts),
+                seconds_mean=statistics.mean(ts), seconds=ts, digests=ref,
                 op_ms_p50=1e3 * ops_t[len(ops_t) // 2],
                 op_ms_p95=1e3 * ops_t[min(len(ops_t) - 1, int(0.95 * len(ops_t)))],
             ))
@@ -254,6 +255,9 @@ class Bench:
 def environment() -> dict[str, Any]:
     env = dict(python=sys.version.split()[0], platform=platform.platform(), machine=platform.machine(),
                cpus=os.cpu_count())
+    from vc_reader import _native
+
+    env["native_extension"] = _native.__file__
     from importlib.metadata import PackageNotFoundError, version
 
     for m in ("vc-reader", "numpy", "zarr", "numcodecs", "s3fs", "fsspec", "aiohttp", "tensorstore"):

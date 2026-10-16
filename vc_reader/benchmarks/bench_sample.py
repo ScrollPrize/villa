@@ -28,7 +28,7 @@ from pathlib import Path
 
 import numpy as np
 
-from _common import digest, environment
+from _common import chunk_files, digest, environment, evict_files, filesystem_type
 
 from vc_reader.reader import ZarrReader
 
@@ -69,51 +69,85 @@ def main(argv=None) -> None:
     ap.add_argument("--only", default="", help="comma-separated scenario prefixes, e.g. random-linear")
     ap.add_argument("--compare", help="results JSON whose output hashes must match")
     ap.add_argument("--label", default="", help="free-form note stored with the results")
+    ap.add_argument("--cache-state", choices=["warm", "cold", "both"], default="warm")
+    ap.add_argument("--readers", default="mmap,memory", help="comma-separated mmap, slab, memory")
+    ap.add_argument("--threads", type=int, default=16)
+    ap.add_argument("--start", type=int, nargs=3, default=REGION[0], metavar=("Z", "Y", "X"))
+    ap.add_argument("--edge", type=int, default=REGION[1])
+    ap.add_argument("--output", type=Path, help="write results to this file")
     args = ap.parse_args(argv)
+    if args.reps < 1 or args.scale <= 0:
+        ap.error("reps and scale must be positive")
+    reader_names = args.readers.split(",")
+    if not set(reader_names) <= {"mmap", "slab", "memory"}:
+        ap.error("readers must be mmap, slab or memory")
+    if args.cache_state != "warm" and filesystem_type(Path(args.array)) in ("tmpfs", "ramfs"):
+        ap.error("cold reads require a disk-backed array")
 
-    sets = point_sets(*REGION, args.scale)
+    sets = point_sets(args.start, args.edge, args.scale)
     for name, pts in sets.items():
         sets[name] = np.ascontiguousarray(pts)
-    readers = {
-        "mmap": ZarrReader.open(args.array),
-        "memory": ZarrReader.open(args.array, memory_cache=4 << 30),
-    }
+    states = ["cold", "warm"] if args.cache_state == "both" else [args.cache_state]
     only = [o for o in args.only.split(",") if o]
     rows = []
     for set_name, pts in sets.items():
         ipts = np.rint(pts).astype(np.int64)
         for op_name, op in OPS.items():
-            for reader_name, r in readers.items():
-                scenario = f"{set_name}-{op_name}-{reader_name}"
+            # Evict the enclosing box, including the upper interpolation neighbours.
+            # All readers are closed first: live mappings can keep pages resident.
+            p = ipts if op_name == "read_points" else pts
+            lo = np.floor(p.min(axis=0)).astype(np.int64)
+            hi = np.ceil(p.max(axis=0)).astype(np.int64) + 1
+            files = chunk_files(args.array, [(tuple(lo), tuple(hi - lo))])
+            for reader_name, state in ((r, s) for r in reader_names for s in states):
+                scenario = f"{set_name}-{op_name}-{reader_name}" + ("-cold" if state == "cold" else "")
                 if only and not any(scenario.startswith(o) for o in only):
                     continue
-                p = ipts if op_name == "read_points" else pts
-                out = op(r, p)  # warm-up: page cache, memory cache, output pool
-                h = digest(out)
-                del out
+                def open_reader():
+                    return ZarrReader.open(args.array, threads=args.threads,
+                                           read_mode="slab" if reader_name == "slab" else "mmap",
+                                           memory_cache=(4 << 30) if reader_name == "memory" else 0)
+
                 times = []
-                for _ in range(args.reps):
-                    t = time.perf_counter()
+                # Also prime the output pool for cold reads; close before eviction.
+                r = open_reader()
+                try:
                     out = op(r, p)
-                    times.append(time.perf_counter() - t)
+                    h = digest(out)
                     del out
+                    for _ in range(args.reps):
+                        if state == "cold":
+                            r.close()
+                            evict_files(files)
+                            r = open_reader()
+                        t = time.perf_counter()
+                        out = op(r, p)
+                        times.append(time.perf_counter() - t)
+                        if digest(out) != h:
+                            raise SystemExit(f"{scenario}: output changed between repetitions")
+                        del out
+                finally:
+                    r.close()
                 med = statistics.median(times)
                 rows.append(dict(scenario=scenario, points=len(p), reps=args.reps, seconds_min=min(times),
                                  seconds_median=med, seconds_max=max(times), mpts_s_median=len(p) / med / 1e6,
-                                 digest=h))
+                                 seconds_mean=statistics.mean(times), seconds=times, digest=h))
                 print(f"  {scenario:<28} {len(p):>9} pts  median {med * 1e3:8.1f} ms "
                       f"({min(times) * 1e3:.1f}-{max(times) * 1e3:.1f})  {len(p) / med / 1e6:7.1f} Mpts/s",
                       flush=True)
 
     ok = True
     if args.compare:
-        before = {r["scenario"]: r for r in json.loads(Path(args.compare).read_text())["rows"]}
+        previous = json.loads(Path(args.compare).read_text())
+        if previous["array"] != args.array or previous["region"] != [list(args.start), args.edge]:
+            raise SystemExit("comparison uses a different array or region")
+        before = {r["scenario"]: r for r in previous["rows"]}
         print(f"\n| scenario | points | before ms | after ms | speedup | same output |\n|---|---|---|---|---|---|")
         for r in rows:
             b = before.get(r["scenario"])
             if b is None:
                 continue
-            same = b["digest"] == r["digest"]
+            same = b["digest"] == r["digest"] and b["points"] == r["points"]
             ok &= same
             print(f"| {r['scenario']} | {r['points']} | {b['seconds_median'] * 1e3:.1f} | "
                   f"{r['seconds_median'] * 1e3:.1f} | {b['seconds_median'] / r['seconds_median']:.2f}x | "
@@ -121,9 +155,10 @@ def main(argv=None) -> None:
 
     out_dir = Path(__file__).parent / "results"
     out_dir.mkdir(exist_ok=True)
-    path = out_dir / f"sample-{time.strftime('%Y%m%d-%H%M%S')}.json"
+    path = args.output or out_dir / f"sample-{time.strftime('%Y%m%d-%H%M%S')}.json"
     path.write_text(json.dumps(dict(command=" ".join([sys.executable, *sys.argv]), environment=environment(),
-                                    array=args.array, region=REGION, label=args.label, rows=rows), indent=1))
+                                    array=args.array, region=(args.start, args.edge), threads=args.threads,
+                                    label=args.label, rows=rows), indent=1))
     print(f"\nwrote {path}")
     if not ok:
         raise SystemExit("output differs from the compared results")
