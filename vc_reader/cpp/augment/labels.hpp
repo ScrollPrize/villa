@@ -36,8 +36,21 @@ inline std::vector<double> morphology(const std::vector<double>& input, const Gr
         for (std::size_t x = 0; x < nx; ++x) row[x] = input[(z * ny + y) * nx + x] != 0;
     }
     std::vector<double> output(g.size);
+    std::vector<std::uint8_t> result_row(nx);
     for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y) {
         const auto* row = mask.data() + row_start(z, y);
+        // Small footprints benefit from contiguous, vectorizable boolean
+        // operations. Large footprints retain early termination per voxel.
+        if (offsets.size() <= 32) {
+            std::fill(result_row.begin(), result_row.end(), !dilate);
+            for (auto offset : offsets) {
+                const auto* neighbor = row + offset;
+                if (dilate) for (std::size_t x = 0; x < nx; ++x) result_row[x] |= neighbor[x];
+                else for (std::size_t x = 0; x < nx; ++x) result_row[x] &= neighbor[x];
+            }
+            for (std::size_t x = 0; x < nx; ++x) output[(z * ny + y) * nx + x] = result_row[x];
+            continue;
+        }
         for (std::size_t x = 0; x < nx; ++x) {
             bool result = !dilate;
             for (auto offset : offsets) {
@@ -99,8 +112,16 @@ inline void apply(const Morphology& t, Sample& s, const Parameters& p) {
         auto& a = s.at(c.key).array; auto values = a.channel(c.channel); double maximum = *std::max_element(values.begin(), values.end());
         for (auto& v : values) v = double(v > 0);
         auto footprint = t.repeated_cross ? repeated_cross(a.shape.size() - 1, c.values[0]) : ball(a.shape.size() - 1, c.values[0]);
-        values = morphology(values, Grid(a.spatial()), footprint, t.operation, t.neutral_border);
-        for (auto& v : values) v *= maximum; a.channel(c.channel, values);
+        values = morphology(std::move(values), Grid(a.spatial()), footprint, t.operation, t.neutral_border);
+        // Binary results can only restore zero or the original channel maximum,
+        // both already representable in this dtype. Avoid per-voxel checked
+        // integer conversion, retaining the double product (including -0).
+        a.data();
+        a.typed([&](const auto* data) {
+            using T = std::remove_cv_t<std::remove_pointer_t<decltype(data)>>;
+            auto* dest = const_cast<T*>(data) + c.channel * values.size();
+            for (std::size_t i = 0; i < values.size(); ++i) dest[i] = static_cast<T>(values[i] * maximum);
+        });
     }
 }
 inline Parameters sample(const RandomBinaryOperator& t, const Sample& s, Random& r) {
@@ -176,27 +197,32 @@ inline Array regions(const Array& input, std::size_t channel, const std::vector<
     for (const auto& group : labels) for (auto value : group)
         require(std::isfinite(value) && std::abs(value) <= 9007199254740991., "label value out of exact range");
     require(channel < input.shape[0] && !labels.empty(), "invalid region channel or empty label groups");
-    Shape shape = input.shape; shape[0] = labels.size(); Array out(shape, 'b', 1); auto n = product(input.spatial());
+    Shape shape = input.shape; shape[0] = labels.size(); auto out = Array::uninitialized(shape, 'b', 1); auto n = product(input.spatial());
     auto* dest = static_cast<std::uint8_t*>(out.data());
     input.typed([&](const auto* src) {
-        for (std::size_t c = 0; c < labels.size(); ++c)
-            for (std::size_t i = 0; i < n; ++i)
+        for (std::size_t c = 0; c < labels.size(); ++c) {
+            if (labels[c].size() == 1) {
+                const auto label = labels[c][0];
+                for (std::size_t i = 0; i < n; ++i) dest[c * n + i] = double(src[channel * n + i]) == label;
+            } else for (std::size_t i = 0; i < n; ++i)
                 dest[c * n + i] = std::find(labels[c].begin(), labels[c].end(), double(src[channel * n + i])) != labels[c].end();
+        }
     });
     return out;
 }
 inline Parameters sample(const Regions&, const Sample&, Random&) { return {}; }
 inline void apply(const Regions& t, Sample& s, const Parameters&) {
-    auto out = s.at(t.on); out.array = regions(out.array, t.channel, t.labels); out.target.role = Role::Label; out.source = t.on;
+    const auto& source = s.at(t.on);
+    Field out{regions(source.array, t.channel, t.labels), source.target, t.on, source.pyramid}; out.target.role = Role::Label;
     s[t.output.empty() ? t.on : t.output] = std::move(out);
 }
 inline Parameters sample(const OneHot&, const Sample&, Random&) { return {}; }
 inline void apply(const OneHot& t, Sample& s, const Parameters&) {
-    auto source = s.at(t.on); std::vector<std::vector<double>> labels; for (auto v : t.labels) labels.push_back({v});
+    const auto& source = s.at(t.on); std::vector<std::vector<double>> labels; for (auto v : t.labels) labels.push_back({v});
     auto encoded = regions(source.array, t.channel, labels); auto n = product(encoded.spatial());
     if (!t.append_to.empty()) {
         auto& image = s.at(t.append_to).array; require(image.spatial() == encoded.spatial(), "one-hot image grid mismatch");
-        auto shape = image.shape; shape[0] += encoded.shape[0]; Array combined(shape, image.kind, image.bytes);
+        auto shape = image.shape; shape[0] += encoded.shape[0]; auto combined = Array::uninitialized(shape, image.kind, image.bytes);
         const auto count = image.size(), encoded_count = encoded.size();
         std::memcpy(combined.data(), std::as_const(image).data(), count * image.bytes);
         const auto* bits = static_cast<const std::uint8_t*>(std::as_const(encoded).data());
@@ -206,7 +232,7 @@ inline void apply(const OneHot& t, Sample& s, const Parameters&) {
             for (std::size_t i = 0; i < encoded_count; ++i) dest[i] = static_cast<T>(bits[i]);
         });
         image = std::move(combined);
-    } else { source.array = std::move(encoded); source.target.role = Role::Label; source.source = t.on; s[t.output] = std::move(source); }
+    } else { Field out{std::move(encoded), source.target, t.on, source.pyramid}; out.target.role = Role::Label; s[t.output] = std::move(out); }
     if (t.remove_source) {
         auto& a = s.at(t.on).array;
         if (a.shape[0] == 1) s.erase(t.on);

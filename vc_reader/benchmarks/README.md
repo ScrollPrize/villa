@@ -32,6 +32,8 @@ The optional NPZ contains before/after arrays and a JSON report. See the
 include all timings, numerical differences, and profiler findings.
 The [median and Gaussian follow-up](filter_results.md) measures the later filter
 optimizations, including wider kernels and continuous-valued inputs.
+The [broader optimization follow-up](optimization_results.md) covers spatial
+resampling, local intensity transforms, morphology, noise and label encoding.
 
 Compare the native public API with the actual Python transforms in the Vesuvius
 source tree on a real cached CT crop. Requires Torch, SciPy, scikit-image,
@@ -76,6 +78,20 @@ Python blur uses direct convolution with autotuning disabled.
 Backends alternate order across repetitions, with one Torch/BLAS thread and two
 warm-ups by default. JSON includes every observation, mean, p50, p95, min/max,
 versions, CPU, build flags, extension hash, and per-output numerical differences.
+`native_output_sha256` records the exact output bytes outside the timer, including
+stochastic outputs at the fixed native seed, for before/after regression checks.
+To benchmark a saved augmentation binary without installing it, pass it to
+`run_native.py` before the benchmark filename:
+
+```sh
+PYTHONPATH=vc_reader/src:vesuvius/src vc_reader/.venv/bin/python \
+  vc_reader/benchmarks/run_native.py /tmp/before/_augment.cpython-314-x86_64-linux-gnu.so \
+  vc_reader/benchmarks/bench_augment.py --reps 11 --warmup 3 --output /tmp/before.json
+```
+
+Use the extension suffix matching your interpreter. The wrapper accepts both
+reader (`_native`) and augmentation (`_augment`) builds.
+
 Independent RNG draws are marked separately from deterministic comparisons;
 timing similar stochastic workloads does not establish identical augmentation
 distributions. A failed comparison remains visible as an error, not a speedup.
@@ -455,7 +471,9 @@ c++ -std=c++20 -O2 -g -pg -I vc_reader/cpp/augment \
 gprof -b -p /tmp/profile_augment /tmp/gmon.out > /tmp/augment-profile.txt
 ```
 
-Operations: `copy`, `flip`, `median`, `blur`. Use uninstrumented Release builds
+Operations: `copy`, `flip`, `median`, `blur`, `affine`, `elastic`, `sheet`,
+`local` (local gamma), `morphology`, `noise` (Gaussian). Morphology uses a binary
+threshold of the CT, not annotated labels. Use uninstrumented Release builds
 and `bench_augment.py` for reported latency; instrumentation changes timings.
 The workload itself is portable C++20; use a platform profiler when gprof is not
 available.

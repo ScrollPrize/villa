@@ -68,12 +68,16 @@ inline std::vector<double> local_kernel(const LocalOptions& t, const Grid& g, Ra
         for (std::size_t x = 0; x < g.shape[a]; ++x)
             kernels[a][x] = .5 * (std::erf((x + .5 - center) / (sigma * std::sqrt(2.))) - std::erf((x - .5 - center) / (sigma * std::sqrt(2.))));
     }
-    std::vector<double> out(g.size, 1);
-    for (std::size_t a = 0; a < g.shape.size(); ++a)
-        for (std::size_t base = 0; base < g.size; base += g.shape[a] * g.stride[a])
-            for (std::size_t x = 0; x < g.shape[a]; ++x)
-                for (std::size_t j = 0; j < g.stride[a]; ++j)
-                    out[base + x * g.stride[a] + j] *= kernels[a][x];
+    std::vector<double> out(g.size);
+    const auto dim = g.shape.size(), nz = dim == 3 ? g.shape[0] : 1;
+    const auto ny = g.shape[dim - 2], nx = g.shape.back();
+    for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y) {
+        // Same axis order as the separate full-volume multiplication passes.
+        double prefix = dim == 3 ? 1. * kernels[0][z] : 1.;
+        prefix *= kernels[dim - 2][y];
+        for (std::size_t x = 0; x < nx; ++x)
+            out[(z * ny + y) * nx + x] = prefix * kernels.back()[x];
+    }
     auto [lo, hi] = std::minmax_element(out.begin(), out.end()); double low = *lo, range = *hi - low;
     for (auto& v : out) v = range ? (v - low) / range : 0;
     if (centered) {
@@ -153,8 +157,8 @@ inline void channel_apply(const Gamma&, std::vector<double>& v, const Grid&, con
     if (invert) for (auto& x : v) x = -x;
 }
 
-inline void channel_apply(const GaussianNoise&, std::vector<double>& v, const Grid&, const ChannelPlan& p) { Random r{p.seed}; for (auto& x : v) x += p.values[0] * r.normal(); }
-inline void channel_apply(const RicianNoise&, std::vector<double>& v, const Grid&, const ChannelPlan& p) {
+template<class Values> void channel_apply(const GaussianNoise&, Values& v, const Grid&, const ChannelPlan& p) { Random r{p.seed}; for (auto& x : v) x = double(x) + p.values[0] * r.normal(); }
+template<class Values> void channel_apply(const RicianNoise&, Values& v, const Grid&, const ChannelPlan& p) {
     Random r{p.seed}; for (auto& x : v) { double re = x + p.values[0] * r.normal(), im = p.values[0] * r.normal(); x = std::sqrt(re * re + im * im); }
 }
 inline void channel_apply(const ClipOutliers&, std::vector<double>& v, const Grid&, const ChannelPlan& p) {
@@ -282,16 +286,16 @@ inline void channel_apply(const Sharpen&, std::vector<double>& v, const Grid& g,
         v[i] += p.values[0] * laplace[i]; if (p.values[1]) v[i] = std::clamp(v[i], low, high);
     }
 }
-inline void channel_apply(const BrightnessGradient& t, std::vector<double>& v, const Grid&, const ChannelPlan& p) {
+template<class Values> void channel_apply(const BrightnessGradient& t, Values& v, const Grid&, const ChannelPlan& p) {
     auto [lo, hi] = std::minmax_element(v.begin(), v.end()); double low = *lo, high = *hi;
-    for (std::size_t i = 0; i < v.size(); ++i) { v[i] += p.field[i] * p.values[0]; if (t.clip) v[i] = std::clamp(v[i], low, high); }
+    for (std::size_t i = 0; i < v.size(); ++i) { double value = double(v[i]) + p.field[i] * p.values[0]; if (t.clip) value = std::clamp(value, low, high); v[i] = value; }
 }
-inline void channel_apply(const LocalContrast&, std::vector<double>& v, const Grid&, const ChannelPlan& p) {
+template<class Values> void channel_apply(const LocalContrast&, Values& v, const Grid&, const ChannelPlan& p) {
     double sum = 0, weight = 1e-8; for (std::size_t i = 0; i < v.size(); ++i) { sum += v[i] * p.field[i]; weight += p.field[i]; }
     double m = sum / weight;
     for (std::size_t i = 0; i < v.size(); ++i) v[i] = v[i] * (1 - p.field[i]) + ((v[i] - m) * p.values[0] + m) * p.field[i];
 }
-inline void channel_apply(const LocalGamma&, std::vector<double>& v, const Grid&, const ChannelPlan& p) {
+template<class Values> void channel_apply(const LocalGamma&, Values& v, const Grid&, const ChannelPlan& p) {
     auto [lo, hi] = std::minmax_element(v.begin(), v.end()); double low = *lo, span = std::max(*hi - low, 1e-8);
     for (std::size_t i = 0; i < v.size(); ++i) { double norm = (v[i] - low) / span; v[i] = (norm * (1 - p.field[i]) + std::pow(norm, p.values[0]) * p.field[i]) * span + low; }
 }
@@ -310,6 +314,15 @@ template<class Values> void channel_apply(const BlankRectangle& t, Values& v, co
             origin += std::size_t(p.values[b + 2 * a]) * g.stride[a];
         }
         Grid box(extent);
+        if (t.statistic.empty()) {
+            const auto width = extent.back();
+            for (std::size_t row = 0; row < box.size; row += width) {
+                auto start = origin;
+                for (std::size_t a = 0; a + 1 < dim; ++a) start += box.coord(row, a) * g.stride[a];
+                std::fill_n(v.begin() + start, width, p.values[b + 2 * dim]);
+            }
+            continue;
+        }
         indices.reserve(box.size); values.reserve(box.size);
         for (std::size_t j = 0; j < box.size; ++j) {
             auto i = origin;
@@ -367,7 +380,9 @@ template<class T> requires requires(T t) { t.options; }
 void apply(const T& t, Sample& s, const Parameters& p) {
     if constexpr (std::is_same_v<T, BrightnessMultiply> || std::is_same_v<T, BrightnessAdd> ||
                   std::is_same_v<T, Contrast> || std::is_same_v<T, Invert> ||
-                  std::is_same_v<T, BlankRectangle> || std::is_same_v<T, SliceIllumination>) {
+                  std::is_same_v<T, BlankRectangle> || std::is_same_v<T, SliceIllumination> ||
+                  std::is_same_v<T, GaussianNoise> || std::is_same_v<T, RicianNoise> ||
+                  std::is_same_v<T, BrightnessGradient> || std::is_same_v<T, LocalContrast> || std::is_same_v<T, LocalGamma>) {
         for (const auto& c : p.channels) {
             auto& a = s.at(c.key).array; Grid g(a.spatial());
             if constexpr (std::is_same_v<T, BlankRectangle>) {
@@ -376,7 +391,9 @@ void apply(const T& t, Sample& s, const Parameters& p) {
             auto run = [&](auto* data) {
                 using V = std::remove_pointer_t<decltype(data)>;
                 std::span<V> v(data + c.channel * g.size, g.size);
-                if constexpr (std::is_same_v<T, BlankRectangle> || std::is_same_v<T, SliceIllumination>)
+                if constexpr (std::is_same_v<T, BlankRectangle> || std::is_same_v<T, SliceIllumination> ||
+                              std::is_same_v<T, GaussianNoise> || std::is_same_v<T, RicianNoise> ||
+                              std::is_same_v<T, BrightnessGradient> || std::is_same_v<T, LocalContrast> || std::is_same_v<T, LocalGamma>)
                     channel_apply(t, v, g, c);
                 else {
                     double m = 0, low = 0, high = 0;

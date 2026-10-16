@@ -7,7 +7,7 @@ using namespace vcr::augment;
 
 int main(int argc, char** argv) {
     if (argc < 3 || argc > 4) {
-        std::cerr << "usage: profile_augment RAW_CHUNK copy|flip|median|blur [iterations=5]\n";
+        std::cerr << "usage: profile_augment RAW_CHUNK copy|flip|median|blur|affine|elastic|sheet|local|morphology|noise [iterations=5]\n";
         return 2;
     }
     const int iterations = argc == 4 ? std::stoi(argv[3]) : 5;
@@ -26,6 +26,15 @@ int main(int argc, char** argv) {
     if (name == "flip") transforms.push_back(Flip{.axes = "x", .p_axis = 1});
     else if (name == "median") transforms.push_back(MedianFilter{.size = 3.});
     else if (name == "blur") transforms.push_back(GaussianBlur{.sigma = 1.});
+    else if (name == "affine") transforms.push_back(Affine{.scale = 1 / 1.1});
+    else if (name == "elastic") transforms.push_back(Elastic{.sigma = 3., .magnitude = 1.});
+    else if (name == "sheet") transforms.push_back(SheetCompression{.strength = .2, .intensity_sigma = 1., .smoothing = 3., .axes = "z"});
+    else if (name == "local") transforms.push_back(LocalGamma{.gamma = .8, .local = {.scale = 12., .loc = .5}});
+    else if (name == "morphology") {
+        for (std::size_t i = 0; i < image.size(); ++i) sample.at("image").array.set(i, image.get(i) > .5);
+        transforms.push_back(Morphology{.radius = 1., .on = {"image"}, .repeated_cross = true});
+    }
+    else if (name == "noise") transforms.push_back(GaussianNoise{.std = .05});
     else if (name != "copy") return 2;
     Pipeline pipeline(transforms, {{"image", Target{}}});
     double checksum = 0;

@@ -344,6 +344,10 @@ def main():
                 reset_rng(123)
                 reference, actual = python_call(), native_call()
                 row["difference"] = compare(reference, actual)
+                row["native_output_sha256"] = {
+                    key: hashlib.sha256(value.tobytes()).hexdigest()
+                    for key, value in flatten(actual).items()
+                }
                 for key, tensor in sample.items():
                     assert torch.equal(tensor, before[key]), "benchmark mutated its input"
                 assert all(np.isfinite(v).all() for v in flatten(actual).values()), "nonfinite native output"

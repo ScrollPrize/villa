@@ -2,6 +2,8 @@
 
     python benchmarks/run_native.py build/<tag>/_native*.so benchmarks/bench_sample.py --reps 7
     python benchmarks/run_native.py build/<tag>/_native*.so -m pytest -q
+
+Also accepts an _augment extension to select the augmentation build.
 """
 
 from __future__ import annotations
@@ -17,7 +19,10 @@ def main() -> None:
         raise SystemExit(__doc__)
     extension = Path(sys.argv[1]).resolve(strict=True)
     command = sys.argv[2:]
-    spec = importlib.util.spec_from_file_location("vc_reader._native", extension)
+    module = extension.name.split(".", 1)[0]
+    if module not in ("_native", "_augment"):
+        raise SystemExit("expected an _native or _augment extension")
+    spec = importlib.util.spec_from_file_location("vc_reader." + module, extension)
     if spec is None or spec.loader is None:
         raise SystemExit(f"cannot load native extension: {extension}")
     native = importlib.util.module_from_spec(spec)

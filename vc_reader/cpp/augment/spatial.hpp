@@ -34,7 +34,27 @@ template<std::size_t D = 0, class F> double linear_value(const Grid& g, Point q,
         if (q[a] < -1 || q[a] > double(g.shape[a])) return fill;
         lo[a] = std::int64_t(std::floor(q[a])); fraction[a] = q[a] - lo[a];
     }
+    // Interior stencils need no per-corner bounds checks. Keep the corner and
+    // weight multiplication order identical to the boundary path below.
+    bool interior = true;
+    std::size_t base = 0;
+    for (std::size_t a = 0; a < d; ++a) {
+        interior &= lo[a] >= 0 && lo[a] + 1 < std::int64_t(g.shape[a]);
+        if (lo[a] >= 0) base += std::size_t(lo[a]) * g.stride[a];
+    }
     double result = 0;
+    if (interior) {
+        for (std::size_t corner = 0; corner < (std::size_t(1) << d); ++corner) {
+            std::size_t at = base; double weight = 1;
+            for (std::size_t a = 0; a < d; ++a) {
+                auto bit = (corner >> a) & 1;
+                weight *= bit ? fraction[a] : 1 - fraction[a];
+                if (bit) at += g.stride[a];
+            }
+            if (weight) result += weight * get(at);
+        }
+        return result;
+    }
     for (std::size_t corner = 0; corner < (std::size_t(1) << d); ++corner) {
         bool valid = true; std::size_t at = 0; double weight = 1;
         for (std::size_t a = 0; a < d; ++a) {
@@ -139,8 +159,13 @@ template<std::size_t D> Array resample_impl(const Array& src, const Parameters& 
     src.typed([&](const auto* source) {
         using T = std::remove_cv_t<std::remove_pointer_t<decltype(source)>>;
         auto* destination = static_cast<T*>(out.data());
-        for (std::size_t i = 0; i < output.size; ++i) {
-            Point pos{}; for (std::size_t a = 0; a < d; ++a) pos[a] = double(output.coord(i, a));
+        const auto nz = d == 3 ? p.shape[0] : 1, ny = p.shape[d - 2], nx = p.shape.back();
+        for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y)
+            for (std::size_t x = 0; x < nx; ++x) {
+            const auto i = (z * ny + y) * nx + x;
+            Point pos{};
+            if constexpr (d == 3) pos[0] = double(z);
+            pos[d - 2] = double(y); pos[d - 1] = double(x);
             auto q = matvec(p.matrix, pos, d);
             for (std::size_t a = 0; a < d; ++a) {
                 q[a] += p.offset[a];

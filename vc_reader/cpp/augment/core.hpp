@@ -179,19 +179,22 @@ struct Array {
                         "value-based label transforms require integer IDs within +/- (2**53 - 1)");
         });
     }
+    template<class T> static T checked_cast(double v) {
+        if constexpr (std::is_integral_v<T>) {
+            // An exclusive power-of-two upper bound also works on platforms
+            // where long double cannot represent UINT64_MAX exactly.
+            double upper = std::ldexp(1., std::numeric_limits<T>::digits);
+            double lower = std::is_signed_v<T> ? -upper : 0;
+            require(std::isfinite(v) && v >= lower && v < upper && std::trunc(v) == v,
+                    "value is not representable in target dtype");
+        }
+        return static_cast<T>(v);
+    }
     void set(std::size_t i, double v) {
         data();
         typed([&](const auto* p) {
             using T = std::remove_cv_t<std::remove_pointer_t<decltype(p)>>;
-            if constexpr (std::is_integral_v<T>) {
-                // Use an exclusive power-of-two upper bound: double/long double
-                // can round UINT64_MAX up to 2**64 on some supported platforms.
-                double upper = std::ldexp(1., std::numeric_limits<T>::digits);
-                double lower = std::is_signed_v<T> ? -upper : 0;
-                require(std::isfinite(v) && v >= lower && v < upper && std::trunc(v) == v,
-                        "value is not representable in target dtype");
-            }
-            const_cast<T*>(p)[i] = static_cast<T>(v);
+            const_cast<T*>(p)[i] = checked_cast<T>(v);
         });
     }
     void copy_element(std::size_t to, const Array& src, std::size_t from) {
@@ -210,7 +213,14 @@ struct Array {
         if (kind == 'f') {
             if (bytes == 4) { auto* p = static_cast<float*>(data()) + c * n; for (std::size_t i = 0; i < n; ++i) p[i] = static_cast<float>(values[i]); }
             else std::copy(values.begin(), values.end(), static_cast<double*>(data()) + c * n);
-        } else for (std::size_t i = 0; i < n; ++i) set(c * n + i, values[i]);
+        } else {
+            data();
+            typed([&](const auto* p) {
+                using T = std::remove_cv_t<std::remove_pointer_t<decltype(p)>>;
+                auto* dest = const_cast<T*>(p) + c * n;
+                for (std::size_t i = 0; i < n; ++i) dest[i] = checked_cast<T>(values[i]);
+            });
+        }
     }
 };
 
