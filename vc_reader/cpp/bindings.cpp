@@ -7,6 +7,7 @@
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/vector.h>
 
 #include <functional>
@@ -17,6 +18,14 @@ using namespace nb::literals;
 
 using Bytes = nb::ndarray<std::uint8_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
 using LayerTuple = std::tuple<std::string, std::string, std::string, std::string, bool>;
+// (kind, user or access key id, password or secret key, session token, region); see vcr::Auth.
+using AuthTuple = std::tuple<std::string, std::string, std::string, std::string, std::string>;
+
+static vcr::Auth to_auth(const AuthTuple& t)
+{
+    auto& [kind, user, secret, token, region] = t;
+    return vcr::Auth{kind, user, secret, token, region};
+}
 
 NB_MODULE(_native, m)
 {
@@ -25,6 +34,18 @@ NB_MODULE(_native, m)
     // destroyed there (their threads do not exist in the child), so they are
     // still referenced at exit; that is not a leak worth reporting.
     nb::set_leak_warnings(false);
+
+    // Native errors with a Python meaning: offline cache misses and refused requests.
+    nb::register_exception_translator([](const std::exception_ptr& p, void*) {
+        try {
+            std::rethrow_exception(p);
+        } catch (const vcr::CacheMiss& e) {
+            nb::object cls = nb::module_::import_("vc_reader.errors").attr("CacheMissError");
+            PyErr_SetString(cls.ptr(), e.what());
+        } catch (const vcr::HttpDenied& e) {
+            PyErr_SetString(PyExc_PermissionError, e.what());
+        }
+    });
 
     m.def(
         "empty",
@@ -51,7 +72,7 @@ NB_MODULE(_native, m)
 
     m.def(
         "http_get",
-        [](const std::string& url, long stall_timeout_s, int retries) -> nb::object {
+        [](const std::string& url, const AuthTuple& auth, long stall_timeout_s, int retries) -> nb::object {
             std::vector<std::uint8_t> body;
             bool found;
             {
@@ -60,6 +81,7 @@ NB_MODULE(_native, m)
                 options.connections = 1;
                 options.stall_timeout_s = stall_timeout_s;
                 options.retries = retries;
+                options.auth = to_auth(auth);
                 vcr::HttpClient client(options);
                 found = client.get(url, body);
             }
@@ -67,8 +89,19 @@ NB_MODULE(_native, m)
                 return nb::none();
             return nb::bytes(reinterpret_cast<const char*>(body.data()), body.size());
         },
-        "url"_a, "stall_timeout_s"_a = 10, "retries"_a = 5,
-        "GET a small object (e.g. .zarray); None if it does not exist (404).");
+        "url"_a, "auth"_a = AuthTuple{}, "stall_timeout_s"_a = 10, "retries"_a = 5,
+        "GET a small object (e.g. .zarray); None if it does not exist (404). PermissionError on 401/403.");
+
+    m.def(
+        "sigv4_headers",
+        [](const std::string& url, const std::string& access_key, const std::string& secret_key,
+           const std::string& session_token, const std::string& region, const std::string& amz_date,
+           const std::vector<std::pair<std::string, std::string>>& extra) {
+            return vcr::sigv4_get_headers(url, {access_key, secret_key, session_token, region}, amz_date, extra);
+        },
+        "url"_a, "access_key"_a, "secret_key"_a, "session_token"_a, "region"_a, "amz_date"_a,
+        "extra"_a = std::vector<std::pair<std::string, std::string>>{},
+        "The headers that sign a GET of url for S3 at amz_date (YYYYMMDDTHHMMSSZ); for tests.");
 
     nb::class_<vcr::MemoryCache>(m, "MemoryCache", "Byte-bounded LRU of decoded chunks, shareable between arrays.")
         .def(nb::init<std::size_t>(), "max_bytes"_a)
@@ -84,8 +117,8 @@ NB_MODULE(_native, m)
             "__init__",
             [](vcr::Array* self, vcr::Index shape, vcr::Index chunks, std::size_t itemsize, nb::bytes fill,
                std::string separator, std::string identity, std::vector<LayerTuple> layers, int write_layer,
-               std::string remote_url, std::string remote_codec, std::string read_mode, bool hint,
-               std::size_t threads, int connections, long stall_timeout_s, int retries,
+               std::string remote_url, std::string remote_codec, AuthTuple auth, bool offline,
+               std::string read_mode, bool hint, std::size_t threads, int connections, long stall_timeout_s, int retries,
                std::shared_ptr<vcr::MemoryCache> cache, std::size_t writer_threads,
                std::size_t max_pending_write_bytes) {
                 vcr::ArraySpec spec;
@@ -101,6 +134,8 @@ NB_MODULE(_native, m)
                 spec.write_layer = write_layer;
                 spec.remote_url = std::move(remote_url);
                 spec.remote_codec = std::move(remote_codec);
+                spec.offline = offline;
+                spec.http.auth = to_auth(auth);
                 spec.read_mode = std::move(read_mode);
                 spec.hint = hint;
                 spec.threads = threads;
@@ -112,7 +147,8 @@ NB_MODULE(_native, m)
                 new (self) vcr::Array(std::move(spec), std::move(cache));
             },
             "shape"_a, "chunks"_a, "itemsize"_a, "fill"_a, "separator"_a, "identity"_a, "layers"_a,
-            "write_layer"_a = -1, "remote_url"_a = "", "remote_codec"_a = "", "read_mode"_a = "slab",
+            "write_layer"_a = -1, "remote_url"_a = "", "remote_codec"_a = "", "auth"_a = AuthTuple{},
+            "offline"_a = false, "read_mode"_a = "slab",
             "hint"_a = false, "threads"_a = 16, "connections"_a = 16, "stall_timeout_s"_a = 10,
             "retries"_a = 5, "cache"_a.none() = nb::none(), "writer_threads"_a = 4,
             "max_pending_write_bytes"_a = std::size_t{1} << 30)
@@ -135,6 +171,53 @@ NB_MODULE(_native, m)
             },
             "starts"_a, "sizes"_a, "outs"_a, "itemsize"_a,
             "Read regions into flat uint8 views of C-order outputs (the GIL is released).")
+        .def(
+            "read_points",
+            [](vcr::Array& a, nb::ndarray<std::int64_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> coords, Bytes out,
+               std::size_t itemsize) {
+                if (static_cast<std::size_t>(out.size()) != coords.shape(0) * itemsize)
+                    throw nb::value_error("the output buffer does not match the points");
+                if (coords.shape(1) != a.ndim())
+                    throw nb::value_error("points must have one index per array dimension");
+                nb::gil_scoped_release release;
+                a.read_points(coords.data(), coords.shape(0), out.data());
+            },
+            "coords"_a, "out"_a, "itemsize"_a,
+            "Read the elements at (n, ndim) int64 points into a flat uint8 view of n outputs (the GIL is released).")
+        .def(
+            "sample_nearest",
+            [](vcr::Array& a, nb::ndarray<double, nb::ndim<2>, nb::c_contig, nb::device::cpu> coords, Bytes out,
+               std::size_t itemsize) {
+                if (static_cast<std::size_t>(out.size()) != coords.shape(0) * itemsize)
+                    throw nb::value_error("the output buffer does not match the points");
+                if (coords.shape(1) != a.ndim())
+                    throw nb::value_error("points must have one coordinate per array dimension");
+                nb::gil_scoped_release release;
+                a.sample_nearest(coords.data(), coords.shape(0), out.data());
+            },
+            "coords"_a, "out"_a, "itemsize"_a, "Nearest elements at (n, ndim) float64 points (the GIL is released).")
+        .def(
+            "sample_linear",
+            [](vcr::Array& a, nb::ndarray<double, nb::ndim<2>, nb::c_contig, nb::device::cpu> coords, Bytes out,
+               const std::string& kind_name, std::size_t itemsize, bool swap, bool out64) {
+                const char kind = kind_name.size() == 1 ? kind_name[0] : '?';
+                if (static_cast<std::size_t>(out.size()) != coords.shape(0) * (out64 ? 8 : 4))
+                    throw nb::value_error("the output buffer does not match the points");
+                if (coords.shape(1) != a.ndim())
+                    throw nb::value_error("points must have one coordinate per array dimension");
+                const bool ok = (kind == 'u' || kind == 'i') ? (itemsize == 1 || itemsize == 2 || itemsize == 4 || itemsize == 8)
+                                : kind == 'f'                 ? (itemsize == 4 || itemsize == 8)
+                                                              : (kind == 'b' && itemsize == 1);
+                if (!ok)
+                    throw nb::type_error("sample() needs a bool, integer, float32 or float64 array");
+                nb::gil_scoped_release release;
+                a.sample_linear(coords.data(), coords.shape(0), vcr::ElementType{kind, itemsize, swap}, out64,
+                                out.data());
+            },
+            "coords"_a, "out"_a, "kind"_a, "itemsize"_a, "swap"_a, "out64"_a,
+            "N-linear interpolation at (n, ndim) float64 points into float32/float64 outputs (the GIL is released).")
+        .def("set_auth", [](vcr::Array& a, const AuthTuple& auth) { a.set_auth(to_auth(auth)); }, "auth"_a,
+             "Credentials for later fetches.")
         .def("flush", &vcr::Array::flush, nb::call_guard<nb::gil_scoped_release>(),
              "Wait for every queued disk-cache write.")
         .def("stats", [](vcr::Array& a) {

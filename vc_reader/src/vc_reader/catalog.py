@@ -203,6 +203,18 @@ class Volume:
         """URL of the OME-Zarr root (with trailing slash)."""
         return self.zarr.url(scheme) if self.zarr else None
 
+    def open_group(self, scheme: str = "https", **kwargs: Any):
+        """A :class:`~vc_reader.reader.ZarrGroup` for the volume's OME-Zarr root (all levels and attributes).
+
+        Keyword arguments go to :meth:`ZarrGroup.open`. Requires the ``reader`` extra.
+        """
+        from .reader import ZarrGroup
+
+        url = self.url(scheme)
+        if url is None:
+            raise NotFoundError(f"{self} has no OME-Zarr location")
+        return ZarrGroup.open(url, **kwargs)
+
     def surface_predictions(self) -> list[Artifact]:
         return self.artifacts_of(ArtifactType.SURFACE_PREDICTION_ZARR)
 

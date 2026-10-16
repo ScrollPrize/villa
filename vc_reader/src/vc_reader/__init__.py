@@ -30,7 +30,7 @@ from .catalog import (
     VolumeCoverage,
     VolumeLevel,
 )
-from .errors import AmbiguousMatchError, NotFoundError, VcReaderError
+from .errors import AmbiguousMatchError, CacheMissError, NotFoundError, VcReaderError
 
 __version__ = "0.1.0"
 
@@ -43,6 +43,7 @@ __all__ = [
     "AccessRoot",
     "Affine",
     "AmbiguousMatchError",
+    "CacheMissError",
     "Artifact",
     "ArtifactType",
     "Catalog",

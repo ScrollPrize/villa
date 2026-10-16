@@ -10,6 +10,11 @@ the remote ``.zarray`` and holds VC3D's lease.
 Values are exactly the stored values; missing chunks and out-of-bounds regions
 read as ``fill_value``.
 
+Remote arrays are read anonymously, with HTTP basic auth, or with signed S3
+requests (see :mod:`vc_reader.reader.auth`). ``offline=True`` reads only the
+disk caches: metadata comes from the caches and a chunk in none of them raises
+:class:`~vc_reader.errors.CacheMissError` instead of being fetched.
+
 Processes and fork: a reader's work runs on background threads (the read pool
 and the disk-cache writers), and a forked process (e.g. a PyTorch DataLoader
 worker on Linux) inherits the reader but not its threads. A reader therefore
@@ -33,7 +38,9 @@ from typing import Any, Iterable, Sequence
 import numpy as np
 
 from .. import _native
-from .disk_cache import CacheLayer, open_layers
+from ..errors import CacheMissError
+from .auth import Access, http_url, is_remote, resolve_access
+from .disk_cache import CacheLayer, cached_source_zarray, open_layers
 from .zarr_meta import ArrayMeta
 
 MemoryCache = _native.MemoryCache
@@ -44,30 +51,35 @@ READ_MODES = ("mmap", "slab")
 _INHERITED: list[Any] = []
 
 
-def http_url(url: str) -> str:
-    """https URL for an ``s3://`` URL (public buckets only), otherwise unchanged."""
-    if not url.startswith("s3://"):
-        return url
-    from ..artifacts import to_https
-
-    https = to_https(url)
-    if https is None:
-        bucket, _, key = url[len("s3://"):].partition("/")
-        https = f"https://{bucket}.s3.amazonaws.com/{key}"
-    return https
-
-
-def _is_remote(location: str) -> bool:
-    return location.startswith(("http://", "https://", "s3://"))
+def read_node_file(location: str, name: str, access: Access) -> bytes | None:
+    """``<location>/<name>`` (e.g. ``.zarray``) of a local or remote node; None if it does not exist."""
+    if not is_remote(location):
+        try:
+            return Path(location, name).read_bytes()
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+    try:
+        return _native.http_get(access.url(f"{location}/{name}"), auth=access.native())
+    except PermissionError as e:
+        if access.kind == "anonymous":
+            raise PermissionError(f"{e} (requested anonymously: pass auth= with credentials)") from None
+        raise
 
 
-def _read_zarray(location: str) -> ArrayMeta:
-    if _is_remote(location):
-        data = _native.http_get(http_url(location) + "/.zarray")
-        if data is None:
-            raise FileNotFoundError(f"no zarr v2 array at {location} (.zarray not found)")
-        return ArrayMeta.from_bytes(data)
-    return ArrayMeta.from_bytes(Path(location, ".zarray").read_bytes())
+def cache_url(location: str, access: Access) -> str:
+    """The URL that names a remote location in disk caches and the memory cache.
+
+    Signed S3 locations keep their ``s3://`` form; others the https form they
+    always had, so existing caches are found.
+    """
+    return location if access.kind == "s3" else http_url(location)
+
+
+def _read_zarray(location: str, access: Access) -> ArrayMeta:
+    data = read_node_file(location, ".zarray", access)
+    if data is None:
+        raise FileNotFoundError(f"no zarr v2 array at {location} (.zarray not found)")
+    return ArrayMeta.from_bytes(data)
 
 
 class ZarrReader:
@@ -83,25 +95,42 @@ class ZarrReader:
         self.memory_cache = cache
         self._pid = os.getpid()
         self.location: str = spec["location"]
-        self.meta = ArrayMeta.from_zarray(spec["meta"]) if spec["meta"] else _read_zarray(self.location)
+        remote = is_remote(self.location)
+        self.access: Access = spec["access"]
+        self.offline: bool = bool(spec["offline"]) and remote
+        key_url = cache_url(self.location, self.access) if remote else self.location
+        group_url = cache_url(spec["group"], self.access) if remote and spec["group"] else None
+        if spec["meta"]:
+            self.meta = ArrayMeta.from_zarray(spec["meta"])
+        elif self.offline:
+            cached = cached_source_zarray(spec["cache_dirs"], key_url, group_url=group_url,
+                                          level_key=spec["level_key"])
+            if cached is None:
+                raise CacheMissError(f"{self.location} is not in the disk caches {spec['cache_dirs']} (offline)")
+            self.meta = ArrayMeta.from_zarray(cached)
+        else:
+            self.meta = _read_zarray(self.location, self.access)
         self._spec = dict(spec, meta=dict(self.meta.raw))
-        codec = self.meta.codec_id  # raises for arrays the native reader cannot decode
+        # Raises for arrays the native reader cannot decode; offline, chunks only come from the caches.
+        codec = "" if self.offline else self.meta.codec_id
         self.cache_layers: list[CacheLayer] = []
         self.write_layer: CacheLayer | None = None
         layers: list[tuple] = []
         write_index, remote_url = -1, ""
-        if _is_remote(self.location):
-            remote_url = http_url(self.location)
+        self._auth = _native_auth = self.access.native() if remote and not self.offline else ("", "", "", "", "")
+        if remote:
+            remote_url = self.access.url(self.location)
             if spec["cache_dirs"]:
-                group = http_url(spec["group"]) if spec["group"] else None
                 self.cache_layers, self.write_layer = open_layers(
-                    spec["cache_dirs"], remote_url, self.meta, group_url=group, level_key=spec["level_key"],
-                    writable=spec["cache_writes"], allow_lossy=spec["allow_lossy_cache"],
+                    spec["cache_dirs"], key_url, self.meta, group_url=group_url, level_key=spec["level_key"],
+                    writable=spec["cache_writes"] and not self.offline, allow_lossy=spec["allow_lossy_cache"],
                     compress=spec["compress_cache"])
                 layers = [layer.native_spec() for layer in self.cache_layers]
                 if self.write_layer is not None:
                     write_index = self.cache_layers.index(self.write_layer)
-            identity = remote_url
+            if self.offline and not self.cache_layers:
+                raise CacheMissError(f"no disk cache of {self.location} under {spec['cache_dirs']} (offline)")
+            identity = key_url
         else:
             root = os.path.abspath(self.location)
             layers = [("array", root, codec, "", False)]
@@ -112,7 +141,8 @@ class ZarrReader:
                 list(self.meta.shape), list(self.meta.chunks), self.meta.dtype.itemsize,
                 np.asarray(self.meta.fill_value, dtype=self.meta.dtype).tobytes(), self.meta.separator, identity,
                 layers, write_layer=write_index, remote_url=remote_url, remote_codec=codec if remote_url else "",
-                read_mode=spec["read_mode"], threads=threads, connections=spec["connections"], cache=cache)
+                auth=_native_auth, offline=self.offline, read_mode=spec["read_mode"], threads=threads,
+                connections=spec["connections"], cache=cache)
         except BaseException:
             for layer in self.cache_layers:
                 layer.close()
@@ -136,10 +166,24 @@ class ZarrReader:
         threads: int | None = None,
         connections: int = 16,
         read_mode: str = "mmap",
+        auth: Any = "auto",
+        offline: bool = False,
     ) -> ZarrReader:
-        """Open the zarr v2 array at ``location`` (a directory, ``https://`` or public ``s3://`` URL).
+        """Open the zarr v2 array at ``location`` (a directory, ``http(s)://`` or ``s3://`` URL).
 
         ``level`` appends a sub-path (an OME-Zarr pyramid level).
+
+        ``auth`` says how remote requests authenticate: ``"auto"`` (anonymous,
+        except AWS credentials from the environment for ``s3://`` buckets
+        without a public https form), ``None``, ``"aws"``, an
+        :class:`~vc_reader.reader.S3Credentials` or a ``(username, password)``
+        tuple for HTTP basic auth. See :mod:`vc_reader.reader.auth`.
+
+        ``offline=True`` never contacts the remote: the array's metadata and
+        chunks come from the disk caches (``cache_dir`` is required), and a
+        chunk none of them holds raises :class:`~vc_reader.errors.CacheMissError`.
+        Chunks the caches mark as missing read as ``fill_value``. Local arrays
+        are unaffected.
 
         ``cache_dir`` is one directory or a list of them, searched in order for
         an existing cache of a remote array in any supported format: vc_reader
@@ -163,33 +207,10 @@ class ZarrReader:
         The reader works on background threads. In a process forked after this
         call (e.g. a Linux DataLoader worker) it rebuilds them on first use.
         """
-        if read_mode not in READ_MODES:
-            raise ValueError(f"read_mode must be one of {READ_MODES}")
-        loc = os.fspath(location).rstrip("/")
-        if level is not None:
-            group, level_key = loc, str(level)
-            loc = f"{loc}/{level}"
-        else:
-            # An OME-Zarr level is a digits-only path under its group.
-            head, _, tail = loc.rpartition("/")
-            group, level_key = (head, tail) if tail.isdigit() and head else (None, None)
-        if cache_dir is None:
-            dirs = None
-        elif isinstance(cache_dir, (str, os.PathLike)):
-            dirs = [os.fspath(cache_dir)]
-        else:
-            dirs = [os.fspath(d) for d in cache_dir]
-        if memory_cache is None or memory_cache == 0:
-            cache = None
-        elif isinstance(memory_cache, MemoryCache):
-            cache = memory_cache
-        elif isinstance(memory_cache, int):
-            cache = MemoryCache(memory_cache)
-        else:
-            raise TypeError("memory_cache must be a byte count or a vc_reader.reader.MemoryCache")
-        spec = dict(location=loc, group=group, level_key=level_key, cache_dirs=dirs, cache_writes=cache_writes,
-                    compress_cache=compress_cache, allow_lossy_cache=allow_lossy_cache, threads=threads, connections=connections,
-                    read_mode=read_mode, meta=None)
+        spec, cache = _make_spec(location, level=level, cache_dir=cache_dir, cache_writes=cache_writes,
+                                 compress_cache=compress_cache, allow_lossy_cache=allow_lossy_cache,
+                                 memory_cache=memory_cache, threads=threads, connections=connections,
+                                 read_mode=read_mode, auth=auth, offline=offline)
         return cls(spec, cache)
 
     def __getstate__(self):
@@ -295,9 +316,7 @@ class ZarrReader:
         a loop that drops its previous outputs gets already-touched memory, as
         if it passed them back as ``out``.
         """
-        self._check_process()
-        if self._array is None:
-            raise ValueError("reader is closed")
+        self._ready()
         nd = self.ndim
         regions = [(tuple(int(v) for v in s), tuple(int(v) for v in n)) for s, n in regions]
         if out is not None and len(out) != len(regions):
@@ -320,10 +339,139 @@ class ZarrReader:
                 res[...] = tgt
         return results
 
+    def read_points(self, points: Any) -> np.ndarray:
+        """The values at integer points: ``points`` of shape ``(..., ndim)`` -> values of shape ``(...)``.
+
+        Each point's chunk is read once, however many points fall in it. Points
+        outside the array read as ``fill_value`` (indices are not wrapped).
+        """
+        self._ready()
+        pts = np.asarray(points)
+        if pts.ndim == 0 or pts.shape[-1] != self.ndim:
+            raise ValueError(f"points must have shape (..., {self.ndim})")
+        if pts.dtype.kind not in "iu" and pts.size:
+            raise TypeError(f"points must be integers, got {pts.dtype}")
+        flat = np.ascontiguousarray(pts.reshape(-1, self.ndim), dtype=np.int64)
+        out = _empty((flat.shape[0],), self.dtype)
+        self._array.read_points(flat, out.view(np.uint8), self.dtype.itemsize)
+        return out.reshape(pts.shape[:-1])
+
+    def sample(self, points: Any, *, order: int = 1, dtype: Any = np.float32) -> np.ndarray:
+        """Values at real-valued points: ``points`` of shape ``(..., ndim)`` -> values of shape ``(...)``.
+
+        Element ``i`` sits at coordinate ``i`` along each axis.
+
+        ``order=1``: n-linear (trilinear for 3-D) interpolation of the
+        neighbouring elements, computed in float64 and returned as ``dtype``
+        (float32 or float64). Neighbours outside the array count as
+        ``fill_value``, as in ``scipy.ndimage.map_coordinates(mode="grid-constant",
+        cval=fill_value)``. Points with a non-finite coordinate give NaN.
+
+        ``order=0``: the nearest element (halves round to even, like ``np.rint``),
+        exactly as stored, in the array's dtype; outside points read as ``fill_value``.
+
+        The neighbours are read natively, each chunk once per batch of points.
+        Use :meth:`read_points` for integer indices.
+        """
+        self._ready()
+        pts = np.asarray(points)
+        if pts.ndim == 0 or pts.shape[-1] != self.ndim:
+            raise ValueError(f"points must have shape (..., {self.ndim})")
+        flat = np.ascontiguousarray(pts.reshape(-1, self.ndim), dtype=np.float64)
+        if order == 0:
+            out = _empty((flat.shape[0],), self.dtype)
+            self._array.sample_nearest(flat, out.view(np.uint8), self.dtype.itemsize)
+        elif order == 1:
+            out_dtype = np.dtype(dtype)
+            if out_dtype not in (np.float32, np.float64):
+                raise ValueError("dtype must be float32 or float64")
+            out = _empty((flat.shape[0],), out_dtype)
+            dt = self.dtype
+            self._array.sample_linear(flat, out.view(np.uint8), dt.kind, dt.itemsize, not dt.isnative,
+                                      out_dtype == np.float64)
+        else:
+            raise ValueError("order must be 0 (nearest) or 1 (linear)")
+        return out.reshape(pts.shape[:-1])
+
     def __getitem__(self, key: Any) -> np.ndarray:
+        keys = key if isinstance(key, tuple) else (key,)
+        if any(isinstance(k, (np.ndarray, list)) for k in keys):
+            return self.read_points(_index_points(keys, self.shape))
         start, size, squeeze = _parse_index(key, self.shape)
         out = self.read(start, size)
         return out[tuple(0 if s else slice(None) for s in squeeze)] if any(squeeze) else out
+
+    def _ready(self) -> None:
+        """Rebuild after a fork, check the reader is open, and pass on refreshed credentials."""
+        self._check_process()
+        if self._array is None:
+            raise ValueError("reader is closed")
+        if self.access.source is not None and not self.offline:
+            auth = self.access.native()
+            if auth is not self._auth:
+                self._array.set_auth(auth)
+                self._auth = auth
+
+
+def _memory_cache(memory_cache: int | MemoryCache | None) -> MemoryCache | None:
+    if memory_cache is None or memory_cache == 0:
+        return None
+    if isinstance(memory_cache, MemoryCache):
+        return memory_cache
+    if isinstance(memory_cache, int):
+        return MemoryCache(memory_cache)
+    raise TypeError("memory_cache must be a byte count or a vc_reader.reader.MemoryCache")
+
+
+def _make_spec(
+    location: str | os.PathLike[str],
+    *,
+    level: int | str | None = None,
+    group: str | None = None,
+    cache_dir: str | os.PathLike[str] | Sequence[str | os.PathLike[str]] | None = None,
+    cache_writes: bool = True,
+    compress_cache: bool = False,
+    allow_lossy_cache: bool = False,
+    memory_cache: int | MemoryCache | None = None,
+    threads: int | None = None,
+    connections: int = 16,
+    read_mode: str = "mmap",
+    auth: Any = "auto",
+    offline: bool = False,
+    meta: dict | None = None,
+) -> tuple[dict[str, Any], MemoryCache | None]:
+    """The settings a :class:`ZarrReader` is built (and rebuilt in other processes) from, and its memory cache.
+
+    ``group`` names the array's parent group explicitly (instead of inferring
+    an OME-Zarr level from a digits-only last path part); ``meta`` is its
+    already-read ``.zarray``.
+    """
+    if read_mode not in READ_MODES:
+        raise ValueError(f"read_mode must be one of {READ_MODES}")
+    loc = os.fspath(location).rstrip("/")
+    if level is not None:
+        group, level_key = loc, str(level)
+        loc = f"{loc}/{level}"
+    elif group is not None:
+        group = group.rstrip("/")
+        level_key = loc[len(group) + 1:]
+    else:
+        # An OME-Zarr level is a digits-only path under its group.
+        head, _, tail = loc.rpartition("/")
+        group, level_key = (head, tail) if tail.isdigit() and head else (None, None)
+    if cache_dir is None:
+        dirs = None
+    elif isinstance(cache_dir, (str, os.PathLike)):
+        dirs = [os.fspath(cache_dir)]
+    else:
+        dirs = [os.fspath(d) for d in cache_dir]
+    if offline and is_remote(loc) and not dirs:
+        raise ValueError("offline reads of a remote array need cache_dir")
+    access = auth if isinstance(auth, Access) else resolve_access(loc, auth)
+    spec = dict(location=loc, group=group, level_key=level_key, cache_dirs=dirs, cache_writes=cache_writes,
+                compress_cache=compress_cache, allow_lossy_cache=allow_lossy_cache, threads=threads,
+                connections=connections, read_mode=read_mode, meta=meta, access=access, offline=offline)
+    return spec, _memory_cache(memory_cache)
 
 
 def _empty(shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
@@ -384,6 +532,26 @@ def _parse_index(key: Any, shape: tuple[int, ...]) -> tuple[list[int], list[int]
             size.append(1)
             squeeze.append(True)
     return start, size, squeeze
+
+
+def _index_points(keys: tuple, shape: tuple[int, ...]) -> np.ndarray:
+    """numpy integer-array indexing (one integer or integer array per axis, broadcast) -> points."""
+    if len(keys) != len(shape) or any(isinstance(k, slice) or k is Ellipsis or k is None for k in keys):
+        raise IndexError("index arrays must be combined with integers only, one per axis "
+                         "(use read() for blocks, read_points() for points)")
+    arrays = []
+    for k, dim in zip(keys, shape):
+        a = np.asarray(k)
+        if a.dtype.kind == "b":
+            raise IndexError("boolean indexing is not supported")
+        if a.dtype.kind not in "iu" and a.size:
+            raise IndexError(f"index arrays must be integers, got {a.dtype}")
+        a = a.astype(np.int64)
+        a = np.where(a < 0, a + dim, a)
+        if a.size and (a.min() < 0 or a.max() >= dim):
+            raise IndexError(f"index out of bounds for axis of size {dim}")
+        arrays.append(a)
+    return np.stack(np.broadcast_arrays(*arrays), axis=-1)
 
 
 def open_zarr(location: str | os.PathLike[str], **kwargs: Any) -> ZarrReader:

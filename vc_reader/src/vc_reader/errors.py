@@ -19,3 +19,7 @@ class AmbiguousMatchError(VcReaderError, LookupError):
     def __init__(self, message: str, candidates: Sequence[Any]):
         super().__init__(message)
         self.candidates = list(candidates)
+
+
+class CacheMissError(VcReaderError, LookupError):
+    """An offline read needed data that is in none of the disk caches."""

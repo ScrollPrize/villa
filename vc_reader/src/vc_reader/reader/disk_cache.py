@@ -294,11 +294,86 @@ def _vc3d_layer(volume_dir: Path, level_key: str, source: ArrayMeta, allow_lossy
 
 def _url_spellings(url: str) -> list[str]:
     from ..artifacts import to_https, to_s3
+    from .auth import http_url
 
     out = []
-    for u in (url, to_https(url), to_s3(url)):
+    for u in (url, to_https(url), to_s3(url), http_url(url)):
         if u and u.rstrip("/") not in out:
             out.append(u.rstrip("/"))
+    return out
+
+
+def cache_roots(cache_dirs: Sequence[str | os.PathLike[str]]) -> list[Path]:
+    """The cache directories, with ``"vc3d"`` resolved (and dropped if VC3D has no cache root)."""
+    roots: list[Path] = []
+    for d in cache_dirs:
+        if os.fspath(d) == VC3D:
+            r = vc3d_cache_root()
+            if r is not None:
+                roots.append(r)
+        else:
+            roots.append(Path(d).expanduser())
+    return roots
+
+
+def _vc3d_dir(root: Path, group_url: str) -> Path | None:
+    for spelling in _url_spellings(group_url):
+        vdir = root / vc3d_volume_id(spelling)
+        if vdir.is_dir():
+            return vdir
+    return None
+
+
+def cached_source_zarray(
+    cache_dirs: Sequence[str | os.PathLike[str]], url: str, *, group_url: str | None, level_key: str | None,
+) -> dict | None:
+    """The remote ``.zarray`` of ``url`` as the caches under ``cache_dirs`` record it, for opening offline.
+
+    Exact records come first: the source ``.zarray`` that vc_reader keeps with
+    its decoded caches, and VC3D mirrors' copy. Otherwise a decoded or Delta3D
+    cache's own ``.zarray``, which has the source's shape, chunks, dtype and
+    fill value. None if no cache holds the array.
+    """
+    fallback = None
+    for root in cache_roots(cache_dirs):
+        vdir = _vc3d_dir(root, group_url) if group_url is not None and level_key is not None else None
+        if vdir is not None:
+            stored = _read_json(vdir / level_key / ".zarray")
+            if stored is not None:
+                if not (vdir / VC3D_DELTA3D_MARKER).exists():
+                    return stored
+                fallback = fallback or stored
+        droot = Path(decoded_cache_path(root, url))
+        record = (_read_json(droot / ".zattrs") or {}).get("vc_reader")
+        if record and record.get("source_zarray"):
+            return record["source_zarray"]
+        stored = _read_json(droot / ".zarray")
+        if stored is not None:
+            fallback = fallback or stored
+    return fallback
+
+
+def cached_node_dirs(cache_dirs: Sequence[str | os.PathLike[str]], url: str) -> list[Path]:
+    """Every cache directory that mirrors the remote node (group or array) at ``url``, in search order.
+
+    Decoded caches are laid out like the source (``decoded_cache_path``); a VC3D
+    volume directory mirrors its group, so ``url`` or one of its parents may be one.
+    """
+    out: list[Path] = []
+    for root in cache_roots(cache_dirs):
+        d = Path(decoded_cache_path(root, url))
+        if d.is_dir():
+            out.append(d)
+        parent, rel = url.rstrip("/"), []
+        while "/" in parent.split("://", 1)[-1]:
+            vdir = _vc3d_dir(root, parent)
+            if vdir is not None:
+                d = vdir.joinpath(*reversed(rel))
+                if d.is_dir():
+                    out.append(d)
+                break
+            parent, _, name = parent.rpartition("/")
+            rel.append(name)
     return out
 
 
@@ -321,25 +396,16 @@ def open_layers(
     ``group_url``/``level_key`` (the OME-Zarr group and the level's path in it)
     are needed to find VC3D caches, which are per volume.
     """
-    roots: list[Path] = []
-    for d in cache_dirs:
-        if os.fspath(d) == VC3D:
-            r = vc3d_cache_root()
-            if r is not None:
-                roots.append(r)
-        else:
-            roots.append(Path(d).expanduser())
+    roots = cache_roots(cache_dirs)
     layers: list[CacheLayer] = []
     try:
         for root in roots:
             if group_url is not None and level_key is not None:
-                for spelling in _url_spellings(group_url):
-                    vdir = root / vc3d_volume_id(spelling)
-                    if vdir.is_dir():
-                        layer = _vc3d_layer(vdir, level_key, source, allow_lossy, writable)
-                        if layer is not None:
-                            layers.append(layer)
-                        break
+                vdir = _vc3d_dir(root, group_url)
+                if vdir is not None:
+                    layer = _vc3d_layer(vdir, level_key, source, allow_lossy, writable)
+                    if layer is not None:
+                        layers.append(layer)
             layer = _decoded_layer(Path(decoded_cache_path(root, url)), source, url, create=False,
                                    allow_lossy=allow_lossy)
             if layer is not None:
@@ -360,4 +426,4 @@ def open_layers(
 
 
 __all__: Sequence[Any] = ["CacheLayer", "open_layers", "decoded_cache_path", "vc3d_cache_root", "vc3d_volume_id",
-                          "delta3d_zarray", "Vc3dLease"]
+                          "delta3d_zarray", "Vc3dLease", "cache_roots", "cached_source_zarray", "cached_node_dirs"]

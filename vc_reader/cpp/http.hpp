@@ -1,11 +1,16 @@
-// Anonymous HTTP(S) GETs over a bounded pool of libcurl handles.
+// HTTP(S) GETs over a bounded pool of libcurl handles: anonymous, HTTP basic
+// auth, or signed for S3 (AWS Signature Version 4).
 #pragma once
+
+#include "sigv4.hpp"
 
 #include <curl/curl.h>
 
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <ctime>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -14,11 +19,26 @@
 
 namespace vcr {
 
+// How requests authenticate.
+struct Auth {
+    std::string kind;  // "" (anonymous), "basic" or "s3"
+    std::string user;  // basic: user name; s3: access key id
+    std::string secret;  // basic: password; s3: secret access key
+    std::string token;   // s3: session token (may be empty)
+    std::string region;  // s3: the bucket's region
+};
+
+// 401/403: the request was not allowed (missing, wrong or expired credentials).
+struct HttpDenied : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 struct HttpOptions {
     int connections = 16;          // concurrent requests (and kept-alive connections)
     long connect_timeout_ms = 10000;
     long stall_timeout_s = 10;     // abort an attempt after this long without receiving data
     int retries = 5;
+    Auth auth;
 };
 
 class HttpClient {
@@ -37,6 +57,17 @@ public:
             handles_.push_back(h);
         }
         free_ = handles_;
+        auth_ = std::make_shared<const Auth>(options_.auth);
+        if (!auth_->kind.empty() && auth_->kind != "basic" && auth_->kind != "s3")
+            throw std::invalid_argument("unknown auth kind '" + auth_->kind + "'");
+    }
+
+    // Replaces the credentials of later requests (e.g. refreshed temporary S3 keys).
+    void set_auth(Auth auth)
+    {
+        auto next = std::make_shared<const Auth>(std::move(auth));
+        std::lock_guard lock(mutex_);
+        auth_ = std::move(next);
     }
 
     ~HttpClient()
@@ -49,12 +80,17 @@ public:
     HttpClient& operator=(const HttpClient&) = delete;
 
     // GET `url` into `body`. Returns false for 404 (not stored). Retries
-    // connection errors, stalls, 429 and 5xx with exponential backoff; any other
-    // status throws.
+    // connection errors, stalls, 429 and 5xx with exponential backoff; 401/403
+    // throw HttpDenied and any other status throws.
     bool get(const std::string& url, std::vector<std::uint8_t>& body, std::size_t size_hint = 0)
     {
         Lease lease(*this);
         CURL* h = lease.handle;
+        std::shared_ptr<const Auth> auth;
+        {
+            std::lock_guard lock(mutex_);
+            auth = auth_;
+        }
         double delay = 0.25;
         std::string last_error;
         for (int attempt = 0; attempt <= options_.retries; ++attempt) {
@@ -73,6 +109,18 @@ public:
             curl_easy_setopt(h, CURLOPT_TCP_KEEPALIVE, 1L);
             curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, &HttpClient::write);
             curl_easy_setopt(h, CURLOPT_WRITEDATA, &body);
+            HeaderList headers;
+            if (auth->kind == "basic") {
+                curl_easy_setopt(h, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
+                curl_easy_setopt(h, CURLOPT_USERNAME, auth->user.c_str());
+                curl_easy_setopt(h, CURLOPT_PASSWORD, auth->secret.c_str());
+            } else if (auth->kind == "s3") {
+                // Signed per attempt: the signature covers the request time.
+                const S3Key key{auth->user, auth->secret, auth->token, auth->region};
+                for (const auto& [name, value] : sigv4_get_headers(url, key, amz_date(std::time(nullptr))))
+                    headers.append(name + ": " + value);
+                curl_easy_setopt(h, CURLOPT_HTTPHEADER, headers.list);
+            }
             const CURLcode rc = curl_easy_perform(h);
             long status = 0;
             if (rc == CURLE_OK) {
@@ -82,8 +130,11 @@ public:
                 if (status == 404)
                     return false;
                 if (status != 429 && status < 500) {
-                    std::string snippet(body.begin(), body.begin() + std::min<std::size_t>(body.size(), 200));
-                    throw std::runtime_error("GET " + url + ": HTTP " + std::to_string(status) + ": " + snippet);
+                    std::string snippet(body.begin(), body.begin() + std::min<std::size_t>(body.size(), 300));
+                    const std::string what = "GET " + url + ": HTTP " + std::to_string(status) + ": " + snippet;
+                    if (status == 401 || status == 403)
+                        throw HttpDenied(what);
+                    throw std::runtime_error(what);
                 }
                 last_error = "HTTP " + std::to_string(status);
             } else {
@@ -99,6 +150,18 @@ public:
     }
 
 private:
+    struct HeaderList {
+        curl_slist* list = nullptr;
+        void append(const std::string& line)
+        {
+            curl_slist* next = curl_slist_append(list, line.c_str());
+            if (!next)
+                throw std::runtime_error("curl_slist_append failed");
+            list = next;
+        }
+        ~HeaderList() { curl_slist_free_all(list); }
+    };
+
     struct Lease {
         HttpClient& client;
         CURL* handle;
@@ -129,6 +192,7 @@ private:
     HttpOptions options_;
     std::vector<CURL*> handles_;
     std::vector<CURL*> free_;
+    std::shared_ptr<const Auth> auth_;  // guarded by mutex_
     std::mutex mutex_;
     std::condition_variable cv_;
 };
