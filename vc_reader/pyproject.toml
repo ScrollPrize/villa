@@ -16,12 +16,20 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering",
 ]
-# The catalog layer is stdlib-only. Streaming of zarr/tif/png data will add
-# optional extras.
+# The catalog layer is stdlib-only; readers need the `reader` extra.
 dependencies = []
 
 [project.optional-dependencies]
-test = ["pytest>=8"]
+reader = [
+    "numpy>=1.24",
+    "urllib3>=2",
+    "numcodecs>=0.12",
+    # VC3D Delta3D caches. 0.1.1 releases the GIL while decoding, so chunks decode in parallel.
+    "vc-delta3d>=0.1.1; python_version >= '3.12'",
+]
+# Baselines for benchmarks/ (TensorStore is optional there).
+bench = ["vc-reader[reader]", "zarr>=3", "s3fs", "tensorstore"]
+test = ["vc-reader[reader]", "pytest>=8"]
 
 [project.scripts]
 vc-reader = "vc_reader.cli:main"

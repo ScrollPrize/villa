@@ -4,10 +4,10 @@ Find and locate Vesuvius Challenge open data from the published
 [`metadata.json`](https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/metadata.json)
 (schema: [`metadata.schema.json`](https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/metadata.schema.json)).
 
-This first version covers the catalog only. It fetches and parses the metadata
-and answers "which volume / level / labels / predictions, and where are they".
-Reading the zarr, tif and png data itself comes next. The catalog layer uses
-only the standard library.
+The catalog fetches and parses the metadata and answers "which volume / level
+/ labels / predictions, and where are they". It uses only the standard library.
+`vc_reader.reader` then reads the data. Zarr v2 arrays are supported now
+(volumes and volume predictions). Zarr v3 (ink labels), tif and png are next.
 
 ## Usage
 
@@ -87,6 +87,67 @@ for view in vol.segments(min_coverage=0.5):   # segments with a mesh on this vol
   `url("s3")` returns the `s3://` form. EduceLab-licensed volumes are only on
   `data.aws.ash2txt.org` / `s3://vesuvius-challenge`.
 
+## Reading zarr arrays
+
+`vc_reader.reader` reads zarr v2 arrays (OME-Zarr levels: CT volumes,
+predictions) from a local directory, `https://` or public `s3://`, optionally
+through a persistent disk cache and an in-memory chunk cache. It needs the
+`reader` extra (numpy, urllib3, numcodecs, and vc-delta3d on Python 3.12+).
+
+```python
+from vc_reader.reader import ZarrReader, MemoryChunkCache
+
+lvl = cat.sample("Scroll 1").volume(resolution=2.4, energy_kev=78).level(um=9.6)
+# reuse the RAID cache and VC3D's cache; misses are fetched and appended
+r = lvl.open(cache_dir=["/mnt/raid_nvme/volume_cache", "vc3d"], memory_cache=8 << 30)
+crop = r.read((8192, 3584, 3584), (128, 128, 128))   # out-of-bounds parts read as fill_value
+crops = r.read_many([(start, (64, 64, 64)) for start in starts])  # overlapping reads, one pool
+block = r[8192:8704, 3584:4096, 3584:4096]
+
+ZarrReader.open("/data/volume.zarr/2")                # local array
+ZarrReader.open("s3://vesuvius-challenge-open-data/…/volume.zarr", level=2)
+```
+
+- **Disk caches** (`cache_dir=` one directory or a list; `"vc3d"` means
+  VC3D's configured remote cache root): every existing cache of the array is
+  found and read, and misses are appended to the first one in its own format.
+  Supported layouts:
+  - vc_reader / vesuvius `RemoteChunkedArray`: decoded chunks under
+    `<root>/s3/<bucket>/<path>/<level>/`, a plain uncompressed zarr v2 array.
+  - VC3D mirror: `<root>/<name>-<fnv1a64>/<level>/`, holding the source's
+    bytes verbatim.
+  - VC3D Delta3D: the same, with chunks encoded as `vc-delta3d`.
+  
+  VC3D caches are used under VC3D's shared lease, so VC3D never replaces a
+  cache vc_reader has open. If none exists, a new decoded cache is created
+  under the first directory. `cache_writes=False` makes all caches read-only.
+  A cache that disagrees with the remote `.zarray` raises instead of mixing
+  data. Quantized (lossy) Delta3D chunks are refetched exactly unless
+  `allow_lossy_cache=True`. Decoding `vc-delta3d` needs `vc-delta3d>=0.1.1`
+  (in the `reader` extra on Python 3.12+), and `volcomp` needs the `volcomp_zarr` binding from
+  SuperOptimizer/volume-compressor.
+- **Memory cache** (`memory_cache=` bytes, or a shared `MemoryChunkCache`): an
+  LRU of decoded chunks, keyed by array, so one budget serves many readers.
+- **Local reads** of uncompressed chunks (`read_mode=`):
+  - `slab` (default): `pread` the contiguous rows a region needs into a
+    per-thread buffer.
+  - `pread`: read whole chunks.
+  - `mmap`: memory maps with `MADV_WILLNEED`, as in vesuvius `ChunkedArray`.
+  
+  Reads under 1 MiB (`inline_bytes=`) run in the caller after queueing
+  `POSIX_FADV_WILLNEED` readahead for every piece. Larger reads run on
+  `workers` threads.
+- **Remote reads**: anonymous GETs over a urllib3 pool, with at most
+  `connections=` (default 16) in flight and a 10 s stall timeout. Bodies are
+  read straight into the chunk buffer, 404 means fill, and other failures are
+  retried with backoff. A chunk wanted by several reads at once is fetched
+  once.
+- Readers pickle as their location plus metadata, so DataLoader workers reopen
+  them without a network round trip. Values are exactly the stored values.
+
+Benchmarks against zarr-python and TensorStore are in
+[`benchmarks/`](benchmarks/README.md).
+
 ## CLI
 
 ```
@@ -102,9 +163,15 @@ Without installing: `PYTHONPATH=src python -m vc_reader …`.
 
 ```
 cd vc_reader
-python -m pytest              # offline, against tests/data/metadata_subset.json
-python -m pytest -m network   # parse the live metadata.json end to end
+uv venv --python 3.14 .venv
+uv pip install --python .venv/bin/python -e '.[bench,test]'
+.venv/bin/python -m pytest              # offline: catalog fixture + reader tests (local files, local HTTP server)
+.venv/bin/python -m pytest -m network   # parse the live metadata.json end to end
 ```
+
+The catalog tests also run on a bare Python 3.10+ (`PYTHONPATH=src python -m
+pytest`); the reader tests are skipped without numpy and urllib3, and the
+Delta3D cache test without `vc-delta3d`.
 
 `tests/data/metadata_subset.json` holds real entries trimmed from the published
 file. Regenerate it with `python tests/make_fixture.py path/to/metadata.json`.

@@ -80,3 +80,4 @@ volume-cartographer/AGENTS.md
 **/.claude/settings.local.json
 /vesuvius/src/vesuvius/neural_tracing/tracers/fibers/evaluation/audit
 /spiral-fitting/experiments
+/vc_reader/benchmarks/results

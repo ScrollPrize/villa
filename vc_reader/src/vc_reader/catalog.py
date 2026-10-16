@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Literal, Mapping, Sequence
 
 from . import _fetch
@@ -341,6 +341,19 @@ class VolumeLevel:
         root = self.volume.url(scheme)
         return None if root is None else root.rstrip("/") + f"/{self.level}/"
 
+    def open(self, scheme: str = "https", **kwargs: Any):
+        """A :class:`~vc_reader.reader.ZarrReader` for this level's array.
+
+        Keyword arguments go to :meth:`ZarrReader.open` (``cache_dir``,
+        ``memory_cache``, ``workers``, ...). Requires the ``reader`` extra.
+        """
+        from .reader import ZarrReader
+
+        url = self.url(scheme)
+        if url is None:
+            raise NotFoundError(f"{self.volume} has no OME-Zarr location")
+        return ZarrReader.open(url, **kwargs)
+
     @property
     def to_level0(self) -> Affine:
         """Voxel ``[x, y, z]`` at this level -> level-0 voxel of the same volume."""
@@ -405,6 +418,15 @@ class PairedArtifact:
     @property
     def aligned(self) -> bool:
         return self.sublevel is not None
+
+    def open(self, scheme: str = "https", **kwargs: Any):
+        """A :class:`~vc_reader.reader.ZarrReader` for the aligned sub-level (see :meth:`VolumeLevel.open`)."""
+        from .reader import ZarrReader
+
+        url = self.url(scheme)
+        if url is None:
+            raise NotFoundError(f"{self.artifact} has no array aligned with {self.level}")
+        return ZarrReader.open(url, **kwargs)
 
     def url(self, scheme: str | None = "https") -> str | None:
         """URL of the aligned sub-level array, or None if not aligned."""

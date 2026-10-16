@@ -79,3 +79,19 @@ def test_paired_bundle(vol):
     assert len(bundle.segments) == 3
     assert len(bundle.ink_labels) == 3
     assert len(bundle.predictions) == len(vol.derived_artifacts())
+
+
+def test_open_level_reader(vol, monkeypatch):
+    pytest.importorskip("numpy")
+    from vc_reader.reader import ZarrReader
+
+    seen = {}
+    monkeypatch.setattr(ZarrReader, "open", classmethod(lambda cls, url, **kw: seen.update(url=url, **kw) or "reader"))
+    assert vol.level(um=9.6).open(cache_dir="/c") == "reader"
+    assert seen == {"url": vol.url() + "2/", "cache_dir": "/c"}
+    pred = next(p for p in vol.level(2).predictions() if p.artifact.parameters.get("level") == 2)
+    pred.open()
+    assert seen["url"].endswith("-L2-th0.2.zarr/0/")
+    lasagna = next(p for p in vol.level(2).predictions() if p.artifact.type == "lasagna")
+    with pytest.raises(NotFoundError):
+        lasagna.open()
