@@ -176,6 +176,24 @@ TEST_CASE("sampleTileSlices(uint8): pure-tile path")
     CHECK(out[0].rows == 4);
 }
 
+TEST_CASE("readMultiSlice and sampleTileSlices round uint8 trilinear samples to nearest")
+{
+    // z ramp 20 + 40 z: offsets 0.015 and 1.015 sample 20.6 and 60.6, so 21 and 61 (truncation gave 20 and 60).
+    ZRampChunkArray a;
+    auto base = coordsGrid(4, 4);
+    cv::Mat_<cv::Vec3f> steps(4, 4, cv::Vec3f(0.f, 0.f, 1.f));
+    std::vector<float> offsets = {0.015f, 1.015f};
+    std::vector<cv::Mat_<uint8_t>> multi, tile;
+    readMultiSlice(multi, &a, /*level=*/0, base, steps, offsets);
+    sampleTileSlices(tile, &a, /*level=*/0, base, steps, offsets);
+    REQUIRE(multi.size() == 2);
+    REQUIRE(tile.size() == 2);
+    for (const auto* out : {&multi, &tile}) {
+        CHECK(int((*out)[0](1, 1)) == 21);
+        CHECK(int((*out)[1](1, 1)) == 61);
+    }
+}
+
 TEST_CASE("readCompositeFast: composite over a few slices")
 {
     ConstChunkArray a(100);
