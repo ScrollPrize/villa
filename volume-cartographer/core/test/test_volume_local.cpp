@@ -17,6 +17,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -375,6 +376,54 @@ TEST_CASE("Volume: writeXYZ and readXYZ obey UI-order offsets")
     bool ok = v->readXYZ(out, {0, 0, 0}, 0);
     CHECK(ok);
     CHECK(int(out(0, 0, 0)) == 77);
+    fs::remove_all(d);
+}
+
+TEST_CASE("Volume: a local metadata.json without a scan record opens like the remote one")
+{
+    // Published surface predictions carry a metadata.json with the run's
+    // record (kind, model, source) and no `scan`, and no meta.json. Opening a
+    // local copy used to throw "metadata.json missing 'scan' key".
+    auto d = tmpDir("prediction_metadata");
+    Volume::New(d, makeOpts({64, 48, 80}, {16, 16, 16}, 2));
+    fs::remove(d / "meta.json");
+
+    SUBCASE("shape from the zarr levels, voxel size from the source record")
+    {
+        writeTextFile(d / "metadata.json", R"({
+            "kind": "surface-inference",
+            "source": {"resolution": "0", "metadata": {"scan": {"tomo": {"acquisition":
+                {"detector": {"samplePixelSize": 0.009362}}}}}}
+        })");
+        std::shared_ptr<Volume> v;
+        REQUIRE_NOTHROW(v = Volume::New(d));
+        REQUIRE(v);
+        CHECK(v->numSlices() == 64);
+        CHECK(v->sliceHeight() == 48);
+        CHECK(v->sliceWidth() == 80);
+        CHECK(v->voxelSize() == doctest::Approx(9.362));
+    }
+
+    SUBCASE("no record of the voxel size still opens, with voxel size 0")
+    {
+        writeTextFile(d / "metadata.json", R"({"kind": "surface-inference"})");
+        std::shared_ptr<Volume> v;
+        REQUIRE_NOTHROW(v = Volume::New(d));
+        REQUIRE(v);
+        CHECK(v->numSlices() == 64);
+        CHECK(v->voxelSize() == 0.0);
+    }
+
+    SUBCASE("a metadata.json with a scan record is read as before")
+    {
+        writeTextFile(d / "metadata.json", R"({"scan": {"type": "vol", "uuid": "scan-uuid",
+            "width": 80, "height": 48, "slices": 64, "voxelsize": 7.91}})");
+        auto v = Volume::New(d);
+        REQUIRE(v);
+        CHECK(v->id() == "scan-uuid");
+        CHECK(v->voxelSize() == doctest::Approx(7.91));
+    }
+
     fs::remove_all(d);
 }
 
