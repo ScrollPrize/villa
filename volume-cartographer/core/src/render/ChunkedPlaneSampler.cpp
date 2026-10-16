@@ -697,7 +697,7 @@ bool sampleTrilinear(IChunkedArray& array,
                     const float c0 = std::fma(fy, c01 - c00, c00);
                     const float c1 = std::fma(fy, c11 - c10, c10);
                     const float value = std::clamp(std::fma(fz, c1 - c0, c0), 0.0f, 255.0f);
-                    out = static_cast<uint8_t>(value);
+                    out = static_cast<uint8_t>(value + 0.5f);
                     return true;
                 }
             }
@@ -725,7 +725,7 @@ bool sampleTrilinear(IChunkedArray& array,
     const float c0 = std::fma(fy, c01 - c00, c00);
     const float c1 = std::fma(fy, c11 - c10, c10);
     const float value = std::clamp(std::fma(fz, c1 - c0, c0), 0.0f, 255.0f);
-    out = static_cast<uint8_t>(value);
+    out = static_cast<uint8_t>(value + 0.5f);
     return true;
 }
 
@@ -798,7 +798,7 @@ StrictSampleStatus samplePinnedTrilinear(const PinnedChunkCache& cache,
     const float c0 = std::fma(fy, c01 - c00, c00);
     const float c1 = std::fma(fy, c11 - c10, c10);
     const float value = std::clamp(std::fma(fz, c1 - c0, c0), 0.0f, 255.0f);
-    out = static_cast<uint8_t>(value);
+    out = static_cast<uint8_t>(value + 0.5f);
     return StrictSampleStatus::Ready;
 }
 
