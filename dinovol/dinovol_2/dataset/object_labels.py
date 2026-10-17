@@ -410,8 +410,14 @@ class MeshSegment:
     tile_valid: np.ndarray | None = None
     anchor_valid_zyx: np.ndarray | None = None
     anchor_ink_zyx: np.ndarray | None = None
+    n_valid_points: int = 0
+    n_ink_points: int = 0
 
     def ensure_spatial_index(self) -> None:
+        if self.n_valid_points <= 0:
+            self.n_valid_points = int(self.valid.sum())
+        if self.has_ink and self.n_ink_points <= 0:
+            self.n_ink_points = int((self.ink_state == 1).sum())
         if self.tile_lo is not None:
             return
         h, w = self.valid.shape

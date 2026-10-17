@@ -161,6 +161,8 @@ class Volume:
     object_mask_source: str = "object"  # "object" (tissue envelope) or "sam2" (the published mask as-is)
     meshes: list[MeshSegment] | None = None
     has_ink_meshes: bool = False
+    mesh_scale: float = 0.0
+    ink_scale: float = 0.0
     oversample: float = 1.0
 
 
@@ -440,6 +442,8 @@ class SSLZarrDataset(Dataset):
         self.fiber_oversample = float(object_points.get("fiber_oversample", 1.25))
         self.mesh_anchor_prob = float(object_points.get("mesh_anchor_prob", 0.35))
         self.ink_anchor_prob = float(object_points.get("ink_anchor_prob", 0.50))
+        self.mesh_saturation_points = int(object_points.get("mesh_saturation_points", 10_000_000))
+        self.ink_saturation_points = int(object_points.get("ink_saturation_points", 100_000))
         if self.object_points_enabled and self.max_labeled_points > self.points_per_sample:
             raise ValueError("object_points.max_labeled_points must not exceed points_per_sample")
         # cross_view_token_patch_size: when set, each global view also carries, for every
