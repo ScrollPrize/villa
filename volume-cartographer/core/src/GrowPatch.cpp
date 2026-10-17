@@ -3530,6 +3530,8 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
 
 
     int w, h;
+    int resume_extra_cols = 0;
+    int resume_extra_rows = 0;
     if (resume_surf) {
         cv::Mat_<uint16_t> resume_generations = resume_surf->channel("generations");
         if (resume_generations.empty()) {
@@ -3556,6 +3558,8 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         const int grow_max_extra_rows = std::max(grow_extra_rows, params.value("grow_max_extra_rows", gen_diff));
         const int extra_cols = disable_grid_expansion ? grow_extra_cols : grow_max_extra_cols;
         const int extra_rows = disable_grid_expansion ? grow_extra_rows : grow_max_extra_rows;
+        resume_extra_cols = extra_cols;
+        resume_extra_rows = extra_rows;
         constexpr int grid_margin_each_side = 25;
         w = resume_generations.cols + 2 * extra_cols + 2 * grid_margin_each_side;
         h = resume_generations.rows + 2 * extra_rows + 2 * grid_margin_each_side;
@@ -3798,6 +3802,8 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
     // cv::Mat_<float> init_dist(size,0);
     cv::Mat_<uint16_t> loss_status(cv::Size(w,h),0);
     cv::Rect used_area;
+    // Resume only: where outward growth from the imported grid may place points.
+    cv::Rect resume_growth_limit;
     int generation = 1;
 
     int succ = 0;  // number of quads successfully added to the patch (each of size approx. step**2)
@@ -4021,6 +4027,12 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         resume_pad_y = (h - resume_points.rows) / 2;
 
         used_area = cv::Rect(resume_pad_x, resume_pad_y, resume_points.cols, resume_points.rows);
+        // Stay within the requested expansion (none with disable_grid_expansion, as in
+        // VC3D Fill) and two cells from the work grid edge, which add_losses requires.
+        resume_growth_limit = cv::Rect(resume_pad_x - resume_extra_cols, resume_pad_y - resume_extra_rows,
+                                       resume_points.cols + 2 * resume_extra_cols,
+                                       resume_points.rows + 2 * resume_extra_rows) &
+                              cv::Rect(2, 2, w - 4, h - 4);
 
         if (effective_allowed_growth_mask && !effective_allowed_growth_mask->empty()) {
             if (effective_allowed_growth_mask->rows != resume_points.rows || effective_allowed_growth_mask->cols != resume_points.cols) {
@@ -4780,6 +4792,36 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
                 for (const auto& n : neighs) {
                     append_candidate(p + n);
                 }
+            }
+        }
+
+        if (resume_surf) {
+            // Interior candidates that fail (e.g. at x/y/z limits) remain PROCESSING, and
+            // the hole-filling branch above never offers cells outside used_area. Offer
+            // the outward neighbours of the edge in the same generation, so that every
+            // untried cell next to the surface is offered and the trace ends only when
+            // none is left.
+            for (int j = used_area.y; j < used_area.br().y; ++j) {
+                for (int i = used_area.x; i < used_area.br().x; ++i) {
+                    if (j != used_area.y && j != used_area.br().y - 1 &&
+                        i != used_area.x && i != used_area.br().x - 1) {
+                        continue;
+                    }
+                    const cv::Vec2i p{j, i};
+                    if (!is_loc_valid(p)) {
+                        continue;
+                    }
+                    for (const auto& n : neighs) {
+                        const cv::Vec2i candidate = p + n;
+                        if (!is_inside_used_area(candidate) &&
+                            resume_growth_limit.contains(cv::Point(candidate[1], candidate[0]))) {
+                            append_candidate(candidate);
+                        }
+                    }
+                }
+            }
+            if (cands.empty()) {
+                break;
             }
         }
 
