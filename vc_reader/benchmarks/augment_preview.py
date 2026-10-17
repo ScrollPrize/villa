@@ -8,6 +8,34 @@ from bench_augment_native import arrays
 from augment_catalog import UTILITY_TRANSFORMS
 
 
+PREVIEW_COLUMNS = 3
+PREVIEW_TILE = 360
+PREVIEW_GAP = 24
+PREVIEW_TOP = 210
+PREVIEW_ROW_HEIGHT = PREVIEW_TILE + 62
+PREVIEW_FOOTER = 65
+
+
+def export_axis_previews(source, directory, name):
+    """Export paired original/augmented Z, Y, X panels from a numeric preview.
+
+    Keep its selected planes, display windows and localized-effect annotations
+    intact. Reject other layouts rather than silently exporting the wrong area.
+    """
+    expected=(PREVIEW_COLUMNS*PREVIEW_TILE+(PREVIEW_COLUMNS+1)*PREVIEW_GAP,
+              PREVIEW_TOP+2*PREVIEW_ROW_HEIGHT+PREVIEW_FOOTER)
+    directory.mkdir(parents=True,exist_ok=True)
+    paths=[]
+    with Image.open(source) as canvas:
+        if canvas.size!=expected:raise ValueError(f'expected a three-axis preview: {source}')
+        for axis,label in enumerate(('z','y','x')):
+            left=PREVIEW_GAP+axis*(PREVIEW_TILE+PREVIEW_GAP)
+            path=directory/f'{name}-{label}.webp'
+            canvas.crop((left,PREVIEW_TOP,left+PREVIEW_TILE,PREVIEW_TOP+2*PREVIEW_ROW_HEIGHT)).save(path,lossless=True,method=6)
+            paths.append(path)
+    return paths
+
+
 def font(size):
     try:
         return ImageFont.truetype('DejaVuSans.ttf',size)
@@ -29,11 +57,12 @@ def effect_strength(case, source, result):
     return int(np.count_nonzero(a!=b))
 
 
-def effect_slices(original, augmented, *, derived=False):
+def effect_slices(original, augmented, *, derived=False, interior_fraction=0):
     """Maximize changed area per axis; ties favor the center, never an empty slice.
 
     Changed grids are compared at corresponding relative positions, not claimed
     to be registered. Derived outputs select planes with the most output signal.
+    An interior search excludes boundary padding from both scoring and selection.
     """
     mapped=original
     if original.shape!=augmented.shape:
@@ -41,6 +70,9 @@ def effect_slices(original, augmented, *, derived=False):
             mapped=np.take(mapped,np.rint(np.linspace(0,mapped.shape[axis]-1,n)).astype(int),axis=axis)
     difference=np.abs(augmented.astype(np.float32)-mapped.astype(np.float32))
     signal=np.abs(augmented.astype(np.float32)) if derived else difference
+    if not 0<=interior_fraction<.5:raise ValueError('interior_fraction must be in [0, .5)')
+    margins=[min((n-1)//2,int(n*interior_fraction)) for n in signal.shape]
+    signal=signal[tuple(slice(m,n-m) for n,m in zip(signal.shape,margins))]
     indices=[]
     for axis in range(3):
         other=tuple(a for a in range(3) if a!=axis)
@@ -50,7 +82,7 @@ def effect_slices(original, augmented, *, derived=False):
         if strongest:
             magnitudes=signal.sum(axis=other)
             candidates=candidates[magnitudes[candidates]==magnitudes[candidates].max()]
-        indices.append(int(candidates[np.argmin(np.abs(candidates-(augmented.shape[axis]-1)/2))]))
+        indices.append(int(candidates[np.argmin(np.abs(candidates-(signal.shape[axis]-1)/2))])+margins[axis])
     original_indices=[round(i*(original.shape[a]-1)/max(1,augmented.shape[a]-1)) for a,i in enumerate(indices)]
     return original_indices,indices,difference
 
@@ -71,8 +103,10 @@ def preview(path, case, source, result, size, parameters, seed):
     panels=[]
     selection='2D input'; metadata={'seed':seed}; highlights={}
     if a.ndim==3 and b.ndim==3:
-        before,after,delta=effect_slices(a,b,derived=derived)
+        interior_fraction=.25 if case.name=='Elastic' else 0
+        before,after,delta=effect_slices(a,b,derived=derived,interior_fraction=interior_fraction)
         selection='most affected slices' if np.any(delta) else 'no voxel-value change for this sample'
+        if interior_fraction and np.any(delta):selection='most affected interior slices (boundary padding excluded from selection)'
         if derived:selection='slices with strongest derived output'
         if a.shape!=b.shape:selection+=' · coordinates mapped by relative grid position'
         panels=[(f'Original {key} · {axis}={index}',np.take(a,index,axis=j),False)
@@ -86,6 +120,7 @@ def preview(path, case, source, result, size, parameters, seed):
         metadata=dict(original_indices=before,augmented_indices=after,
                       changed_voxels=[int(np.count_nonzero(np.take(delta,index,axis=j))) for j,index in enumerate(after)],
                       selection=selection,seed=seed)
+        if interior_fraction:metadata['interior_fraction']=interior_fraction
     else:
         panels=[('Original · central Z plane / 2D input',a,False),('Augmented · 2D output',b,True)]
         if case.name=='SurfacePerturb':
@@ -95,8 +130,8 @@ def preview(path, case, source, result, size, parameters, seed):
     lo=min(float(v.min()) for v in joined);hi=max(float(v.max()) for v in joined)
     if not derived and case.sample in ('image','both','signed','channels','strip') and case.name not in ('Normalize',):
         lo=min(0.,lo);hi=max(1.,hi)
-    widths=3;tile=360;gap=24;top=210;rows=(len(panels)+2)//3
-    canvas=Image.new('RGB',(widths*tile+(widths+1)*gap,top+rows*(tile+62)+65),'#101827')
+    widths=PREVIEW_COLUMNS;tile=PREVIEW_TILE;gap=PREVIEW_GAP;top=PREVIEW_TOP;rows=(len(panels)+widths-1)//widths
+    canvas=Image.new('RGB',(widths*tile+(widths+1)*gap,top+rows*PREVIEW_ROW_HEIGHT+PREVIEW_FOOTER),'#101827')
     draw=ImageDraw.Draw(canvas)
     draw.text((gap,20),f'{case.name}  |  {size}³ input'+(' · 2D companion' if a.ndim==2 else ''),font=font(29),fill='white')
     y=65
@@ -104,7 +139,7 @@ def preview(path, case, source, result, size, parameters, seed):
         draw.text((gap,y),line,font=font(16),fill='#c6d3e5');y+=23
     draw.text((gap,top-30),f'CPU output · seed {seed} · channel {case.channel} · {selection}',font=font(15),fill='#a4b5ce')
     for i,(title,plane,is_output) in enumerate(panels):
-        x=gap+(i%widths)*(tile+gap);y=top+(i//widths)*(tile+62)
+        x=gap+(i%widths)*(tile+gap);y=top+(i//widths)*PREVIEW_ROW_HEIGHT
         low,high=lo,hi
         if derived:
             group=[v for _,v,out in panels if out==is_output]

@@ -26,6 +26,10 @@ class Workload:
 
 def catalog(size, reference, *, include_utilities=False):
     result = [Workload(c.name, c.native, c.inputs) for c in cases((size,) * 3)]
+    for case in result:
+        if case.name=='Elastic':
+            case.transforms=[A.Elastic(sigma=32,magnitude=8,border=True)]
+            case.note='Strong cubic B-spline example: 64-voxel knot spacing, requested RMS displacement 8 voxels, with border clamping.'
     def add(name, transform, sample='image', output='image', channel=0, note=''):
         result.append(Workload(name, transform if isinstance(transform, list) else [transform], sample, output, channel, note))
     add('ClipOutliers', A.ClipOutliers(lower=1, upper=99, p_retain_std=1))

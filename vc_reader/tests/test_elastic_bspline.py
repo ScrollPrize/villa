@@ -1,30 +1,15 @@
 """Public elastic geometry, strength, and replay contracts."""
 import pickle
-import struct
+import sys
+from pathlib import Path
 import numpy as np
 import pytest
 from vc_reader import augment as A
 
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]/"benchmarks"))
+from elastic_replay import displacement
 
-def displacement(plan):
-    """Inspect the first geometric step in the trusted VCA1 replay record."""
-    data=plan._native.dump(); offset=4
-    def number():
-        nonlocal offset
-        value=struct.unpack_from('<Q',data,offset)[0]; offset+=8; return value
-    def sequence(dtype):
-        nonlocal offset
-        count=number(); value=np.frombuffer(data,dtype=dtype,count=count,offset=offset).copy()
-        offset+=count*np.dtype(dtype).itemsize; return value
-    def text():
-        nonlocal offset
-        count=number(); offset+=count
-    for _ in range(number()): text(); sequence('<u8'); number(); number()
-    assert number()==1
-    sequence('<u8'); assert number()==0
-    shape=tuple(sequence('<u8').astype(int)); sequence('<f8'); sequence('<f8')
-    field=sequence('<f8')
-    return np.zeros((*shape,len(shape))) if not len(field) else field.reshape(*shape,len(shape))
+
 
 
 @pytest.mark.parametrize('shape',[(17,23),(13,17,23),(1,7,11),(1,1),
@@ -92,3 +77,25 @@ def test_zero_scale_and_distribution_reproducibility():
         a=pipeline(sample,seed=9)['image']; b=pipeline(sample,seed=9)['image']
         np.testing.assert_array_equal(a,b)
         assert not np.array_equal(a,pipeline(sample,seed=10)['image'])
+
+
+def test_animation_samples_one_native_field_on_fixed_planes():
+    pytest.importorskip('PIL')
+    pytest.importorskip('scipy.ndimage')
+    from animate_elastic import slice_samplers, sample_planes
+    image=np.random.default_rng(15).random((13,17,19),dtype=np.float32)
+    sample={'image':image[None]}
+    plan=A.Pipeline([A.Elastic(sigma=4,magnitude=2,border=True)]).sample(sample,seed=125)
+    field=displacement(plan)
+    indices=[6,8,9]
+    samplers=slice_samplers(image,field,indices)
+    endpoint=plan.apply(sample)['image'][0]
+    for axis,(original,final,half) in enumerate(zip(sample_planes(image,samplers,0),
+                                                  sample_planes(image,samplers,1),
+                                                  sample_planes(image,samplers,.5))):
+        np.testing.assert_array_equal(original,np.take(image,indices[axis],axis=axis))
+        np.testing.assert_allclose(final,np.take(endpoint,indices[axis],axis=axis),atol=2e-7,rtol=2e-7)
+        assert np.isfinite(half).all()
+        assert not np.array_equal(half,original)
+        assert not np.array_equal(half,final)
+        assert not np.allclose(half,.5*(original+final))  # Resampling, not crossfading.

@@ -1628,3 +1628,113 @@ for size in 128 256; do
     --output benchmarks/results/cpu-optimization/catalog
 done
 ```
+
+## Main README augmentation gallery
+
+`build_augmentation_readme.py` replaces the main `README.md` with the recorded
+128³ augmentation catalog. It uses the current utility filter (normalization is
+included), descriptions from `augmentation_descriptions.py`, and named argument
+signatures from the Python API stub. The original/augmented Z, Y and X panels
+are exported from the existing numeric previews, preserving selected planes,
+display windows and gold effect markers. No transforms or benchmarks run.
+The two 2D tracing companions are documented separately.
+Each augmentation is a collapsed `<details>` section, supported by GitHub's
+README renderer. Expanding it shows its parameters, timings and images without
+requiring JavaScript. The Elastic section also links to its WebM animation.
+
+To publish the current benchmark report into portable README assets:
+
+```bash
+AGENTS_AGENT_MODE=1 PYTHONPATH=src .venv/bin/python benchmarks/run_native.py \
+  /tmp/vc-volume-cpu/_augment.cpython-314-x86_64-linux-gnu.so \
+  benchmarks/build_augmentation_readme.py \
+  --report benchmarks/results/full-catalog-paris4-optimized/128.json
+```
+
+The generated `docs/augmentations/benchmark-128.json` retains measurements,
+preview seeds, parameters and per-run metadata, alongside 177 axis-pair WebPs,
+two companion WebPs, and the Elastic WebM with its WebP poster and animation
+manifest. All README images use lossless WebP, preserving the rendered pixels. These files belong in version control; the README
+does not link to the ignored benchmark result directories. After an installed
+native extension is available, regenerate entirely from this saved snapshot:
+
+```bash
+AGENTS_AGENT_MODE=1 PYTHONPATH=src .venv/bin/python \
+  benchmarks/build_augmentation_readme.py
+```
+
+With a separate development build, use the same `run_native.py` prefix as above
+and omit `--report`. `--readme` and `--assets` can redirect output, with assets
+inside the chosen README's directory. The generator deliberately replaces the
+whole README; keep future hand-written sections in the generator if needed.
+Validate with:
+
+```bash
+AGENTS_AGENT_MODE=1 PYTHONPATH=src .venv/bin/python benchmarks/run_native.py \
+  /tmp/vc-volume-cpu/_augment.cpython-314-x86_64-linux-gnu.so \
+  -m pytest tests/test_augment_catalog_benchmark.py tests/test_augmentation_readme.py -q
+```
+
+For a targeted preview refresh, pass `--only Elastic` to
+`refresh_augment_previews.py`. Elastic's slice selector scores only the central
+half of each dimension and selects planes there, so zero-filled crop boundaries
+do not dominate its examples. Other transforms retain their existing slice
+selection. Recorded parameters, seeds and timings are preserved. Refresh the
+main README afterward with `build_augmentation_readme.py --report
+benchmarks/results/full-catalog-paris4-optimized/128.json` using the native-loader
+prefix above.
+
+
+### Strong Elastic animation
+
+The full catalog's Elastic example uses `sigma=32, magnitude=8, border=True`:
+a cubic B-spline displacement field with 64-voxel knot spacing and a requested
+RMS displacement of 8 voxels. The gradient bound can reduce that strength;
+the displayed 128³ sample (seed 125) achieves 5.36 voxels. Public constructor
+defaults and the older comparison benchmark are unchanged. Historical reports
+keep their recorded parameters when their previews are refreshed.
+
+Remeasure the stronger recipe before publishing its timings:
+
+```bash
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  PYTHONPATH=src .venv/bin/python benchmarks/run_native.py \
+  /tmp/vc-reader-cuda/_native.cpython-314-x86_64-linux-gnu.so \
+  benchmarks/run_native.py /tmp/vc-volume-cuda/_augment.cpython-314-x86_64-linux-gnu.so \
+  benchmarks/bench_augment_catalog.py --size 128 --reps 5 --warmup 1 \
+  --only Elastic --output benchmarks/results/elastic-strong-readme
+```
+
+Create its animation from that report's input crop, parameters and chosen seed:
+
+```bash
+AGENTS_AGENT_MODE=1 PYTHONPATH=src .venv/bin/python benchmarks/run_native.py \
+  /tmp/vc-reader-cuda/_native.cpython-314-x86_64-linux-gnu.so \
+  benchmarks/run_native.py /tmp/vc-volume-cpu/_augment.cpython-314-x86_64-linux-gnu.so \
+  benchmarks/animate_elastic.py --report benchmarks/results/elastic-strong-readme/128.json
+```
+
+This requires Pillow, SciPy and an existing `gst-launch-1.0` with rawvideoparse,
+videoconvert, vp8enc, webmmux, matroskademux and vp8dec. It installs nothing.
+The six-second, 24 fps video holds fixed interior Z/Y/X planes and scales one
+sampled production field from zero to full strength and back. Each intermediate
+frame resamples the original volume with trilinear interpolation and nearest
+border handling. Original slices remain visible above the deforming slices.
+The native replay field stores double coordinates, retained only for matching
+the native sampler; image data remain float32. The endpoint is checked against
+the native transform before encoding. Every encoded frame is decoded to verify
+the frame count, and both endpoints are checked with a mean absolute error
+limit of 3/255 for the lossy VP8 video. The WebP poster is lossless.
+
+The animation manifest records field/input/output hashes, frame order, actual
+RMS and encoder settings. The report gains an `animation` entry, which the README
+generator copies into portable assets. The main 128³ report includes this
+separate run with its provenance; 256³ measurements retain their older recipe.
+
+Validate the replay extraction, animation sampler and README assets with:
+
+```bash
+AGENTS_AGENT_MODE=1 PYTHONPATH=src .venv/bin/python benchmarks/run_native.py \
+  /tmp/vc-volume-cpu/_augment.cpython-314-x86_64-linux-gnu.so \
+  -m pytest tests/test_elastic_bspline.py tests/test_augment_catalog_benchmark.py tests/test_augmentation_readme.py -q
+```

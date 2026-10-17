@@ -53,7 +53,8 @@ def test_html_only_refresh_filters_without_running_or_changing_results(tmp_path,
     assert (',OneHot,' in csv)==include_utilities
 
 
-def test_preview_refresh_skips_utility_execution(tmp_path,monkeypatch):
+@pytest.mark.parametrize('transform',['Normalize','Elastic'])
+def test_preview_refresh_skips_utility_execution(tmp_path,monkeypatch,transform):
     import json
     import sys
     from contextlib import contextmanager
@@ -68,17 +69,20 @@ def test_preview_refresh_skips_utility_execution(tmp_path,monkeypatch):
     executed=[]
     def pipeline(transforms,**kwargs):
         executed.extend(t._constructor.__name__ for t in transforms)
+        if transform=='Elastic':
+            from bench_augment_catalog import describe
+            assert describe(transforms[0])=='Elastic(sigma=3, magnitude=1)'
         return lambda source,seed:source
     monkeypatch.setattr(refresh,'ZarrReader',Reader)
     monkeypatch.setattr(refresh.A,'Pipeline',pipeline)
     monkeypatch.setattr(refresh,'preview',lambda *args:{'seed':123})
     report={'size':8,'array':'unused','start':[0]*3,'reference_start':[0]*3,'results':[
-        dict(name=name,parameters=name+'()',sample='image',preview=name+'.png',preview_selection={'seed':123})
-        for name in ('Normalize','OneHot')]}
+        dict(name=name,parameters='Elastic(sigma=3, magnitude=1)' if name=='Elastic' else name+'()',sample='image',preview=name+'.png',preview_selection={'seed':123})
+        for name in (transform,'OneHot')]}
     (tmp_path/'8.json').write_text(json.dumps(report))
     monkeypatch.setattr(sys,'argv',['refresh_augment_previews.py',str(tmp_path)])
     refresh.main()
-    assert executed==['Normalize']
+    assert executed==[transform]
 
 
 def test_orthogonal_preview_panels_are_enlarged(tmp_path,monkeypatch):
@@ -115,6 +119,23 @@ def test_preview_identity_and_resized_grids(monkeypatch):
     before,after,delta=render.effect_slices(source,np.zeros((12,14,16),np.float32))
     assert len(before)==len(after)==3
     assert delta.shape==(12,14,16)
+
+
+def test_interior_selection_ignores_elastic_boundary_fill(monkeypatch):
+    pytest.importorskip('PIL')
+    _,render=modules(monkeypatch)
+    original=np.ones((24,28,32),np.float32)
+    augmented=original.copy()
+    augmented[0]=0;augmented[:,-1]=0;augmented[:,:,0]=0
+    augmented[11:14,15:18,19:22]=.8
+    before,after,delta=render.effect_slices(original,augmented,interior_fraction=.25)
+    assert before==after
+    assert 11<=after[0]<14 and 15<=after[1]<18 and 19<=after[2]<22
+    # A constant/identity interior still chooses its center, including singleton axes.
+    for shape in ((1,1,1),(1,3,5),(24,28,32)):
+        source=np.ones(shape,np.float32)
+        before,after,_=render.effect_slices(source,source,interior_fraction=.25)
+        assert before==after==[(n-1)//2 for n in shape]
 
 
 def test_small_changed_regions_get_visible_locator_boxes(monkeypatch):
