@@ -3,6 +3,7 @@
 // operations complete before returning to Python; consumers may use any stream.
 #include <cuda_runtime.h>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -52,4 +53,24 @@ struct Buffer {
 using Storage = std::shared_ptr<Buffer>;
 inline Storage allocate(std::size_t bytes, int device) { return std::make_shared<Buffer>(bytes,device); }
 inline void complete() { check(cudaStreamSynchronize(0)); }
+
+// Reusable page-locked staging. The caller must finish all transfers before
+// resizing or destroying it; CPU-only builds never include this header.
+class PinnedBuffer {
+    std::uint8_t* ptr_ = nullptr;
+    std::size_t capacity_ = 0;
+    pid_t pid_ = getpid();
+public:
+    PinnedBuffer() = default;
+    PinnedBuffer(const PinnedBuffer&) = delete;
+    ~PinnedBuffer() { if (ptr_ && pid_ == getpid()) cudaFreeHost(ptr_); }
+    void reserve(std::size_t bytes) {
+        if (bytes <= capacity_) return;
+        // Free first to keep peak locked memory bounded when growing.
+        if (ptr_) { check(cudaFreeHost(ptr_)); ptr_ = nullptr; capacity_ = 0; }
+        check(cudaHostAlloc(reinterpret_cast<void**>(&ptr_), bytes, cudaHostAllocDefault));
+        capacity_ = bytes;
+    }
+    std::uint8_t* data() const { return ptr_; }
+};
 }

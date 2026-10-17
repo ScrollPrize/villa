@@ -235,3 +235,41 @@ def test_cuda_remote_compressed(tmp_path):
             assert gpu.stats['chunk_uploads']==before
     finally:
         server.shutdown()
+
+
+@pytest.mark.parametrize('read_mode', ['mmap', 'slab'])
+def test_upload_staging_reuse_and_read_failure(tmp_path, read_mode):
+    # 82 MiB crosses both 32 MiB staging slots and reuses the first while
+    # earlier transfers may still be in flight. A later read error must drain
+    # queued uploads before the caller can retry, clear, or close the reader.
+    chunks = (128, 128, 128)
+    count = 41
+    shape = (count * 128 - 3, 128, 128)
+    (tmp_path / '.zarray').write_text(json.dumps(dict(
+        zarr_format=2, shape=shape, chunks=chunks, dtype='|u1',
+        compressor=None, fill_value=37, order='C', filters=None)))
+    data = np.random.default_rng(95).integers(0, 256, chunks, dtype=np.uint8)
+    for i in range(count):
+        if i != 18:  # Missing chunk in the second batch must retain fill semantics.
+            (tmp_path / f'{i}.0.0').write_bytes((data ^ np.uint8(i)).tobytes())
+    broken = tmp_path / '20.0.0'
+    if read_mode == 'slab':
+        broken.write_bytes(b'short')
+    points = np.array([(i * 128 + z, y, x) for i in range(count)
+                       for z, y, x in ((0, 0, 0), (63, 89, 75), (127, 127, 127))], np.int64)
+    with ZarrReader.open(tmp_path, threads=4, memory_cache=0, read_mode=read_mode) as reader, reader.cuda(cache_bytes=96 << 20) as gpu:
+        if read_mode == 'slab':  # mmap intentionally retains immutable source mappings.
+            with pytest.raises(RuntimeError):
+                gpu.read_points(points, source='chunks')
+            gpu.clear_cache()
+            broken.write_bytes((data ^ np.uint8(20)).tobytes())
+        expected = reader.read_points(points)
+        for subset in (points[:3], points, points[:24], points):
+            gpu.clear_cache()
+            output = gpu.read_points(subset, source='chunks')
+            np.testing.assert_array_equal(output.numpy(), expected[:len(subset)])
+            before = gpu.stats['chunk_uploads']
+            np.testing.assert_array_equal(gpu.read_points(subset, source='chunks').numpy(), expected[:len(subset)])
+            assert gpu.stats['chunk_uploads'] == before
+        gpu.clear_cache()
+    np.testing.assert_array_equal(output.numpy(), expected)

@@ -26,7 +26,26 @@ class Reader {
     std::size_t budget_, chunk_bytes_=1, clock_=0;
     struct Entry { device::Storage data; std::size_t used; };
     std::unordered_map<std::int64_t,Entry> cache_;
-    std::vector<std::uint8_t> staging_;
+    struct Staging {
+        device::PinnedBuffer buffer;
+        cudaEvent_t done = nullptr;
+        int owner = 0;
+        pid_t pid = getpid();
+        void reserve(std::size_t bytes) {
+            if (!done) {
+                device::check(cudaGetDevice(&owner));
+                device::check(cudaEventCreateWithFlags(&done,cudaEventDisableTiming));
+            }
+            buffer.reserve(bytes);
+        }
+        ~Staging() {
+            if (!done || pid!=getpid()) return;
+            int previous;
+            if (cudaGetDevice(&previous)!=cudaSuccess || cudaSetDevice(owner)!=cudaSuccess) return;
+            cudaEventDestroy(done);
+            cudaSetDevice(previous);
+        }
+    } staging_[2];
     device::Storage keys_, pointers_, requests_;
     std::mutex mutex_;
     std::uint64_t hits_=0, uploads_=0, uploaded_=0, cpu_routes_=0, gpu_routes_=0;
@@ -58,6 +77,51 @@ class Reader {
         for (auto z=lo[0];z<=hi[0];++z) for (auto y=lo[1];y<=hi[1];++y) for (auto x=lo[2];x<=hi[2];++x)
             keys.insert((z*source_.grid[1]+y)*source_.grid[2]+x);
     }
+    void upload_missing(const std::vector<std::int64_t>& missing) {
+        if (missing.empty()) return;
+        // Two bounded pinned buffers: CPU reading batch N+1 overlaps the
+        // default-stream uploads of N. Events prevent reusing a buffer early.
+        // Allocation/copies/sampling share stream 0, including cudaMallocAsync.
+        constexpr std::size_t staging_limit=64ull<<20;
+        const auto batch=std::max<std::size_t>(1,(staging_limit/2)/chunk_bytes_);
+        // Allocate before enqueueing so pinning cannot serialize this pipeline.
+        for (std::size_t slot=0;slot<2 && slot*batch<missing.size();++slot)
+            staging_[slot].reserve(std::min(batch,missing.size()-slot*batch)*chunk_bytes_);
+        // Growing the CUDA pool between copies can stall the submitting thread.
+        // Reserve this request's already-budgeted destinations before uploads.
+        std::vector<device::Storage> destinations;
+        destinations.reserve(missing.size());
+        for (std::size_t i=0;i<missing.size();++i)
+            destinations.push_back(device::allocate(chunk_bytes_,device_));
+        try {
+            for (std::size_t first=0;first<missing.size();first+=batch) {
+                auto& staging=staging_[(first/batch)%2];
+                device::check(cudaEventSynchronize(staging.done));
+                auto n=std::min(batch,missing.size()-first);
+                std::vector<Index> starts, sizes(n,Index(source_.chunks,source_.chunks+3));
+                std::vector<std::uint8_t*> outputs;
+                for (std::size_t i=0;i<n;++i) {
+                    auto idx=index(missing[first+i]); for (int a=0;a<3;++a) idx[a]*=source_.chunks[a];
+                    starts.push_back(std::move(idx)); outputs.push_back(staging.buffer.data()+i*chunk_bytes_);
+                }
+                array_.read_many(starts,sizes,outputs);
+                for (std::size_t i=0;i<n;++i) {
+                    auto data=std::move(destinations[first+i]);
+                    device::check(cudaMemcpyAsync(data->ptr,outputs[i],chunk_bytes_,cudaMemcpyHostToDevice,0));
+                    cache_.emplace(missing[first+i],Entry{std::move(data),++clock_}); ++uploads_; uploaded_+=chunk_bytes_;
+                }
+                device::check(cudaEventRecord(staging.done,0));
+            }
+            device::complete();
+        } catch (...) {
+            // A later CPU read/allocation can fail with earlier uploads in
+            // flight. Drain before staging can be reused or destroyed, and
+            // discard entries whose asynchronous transfer may have failed.
+            cudaStreamSynchronize(0);
+            cache_.clear();
+            throw;
+        }
+    }
     void prepare(const std::set<std::int64_t>& needed) {
         std::vector<std::int64_t> missing;
         for (auto key:needed) {
@@ -72,25 +136,7 @@ class Reader {
             if (victim==cache_.end()) throw std::runtime_error("CUDA cache budget exhausted");
             cache_.erase(victim);
         }
-        // Bounded host staging, parallel native read_many, one load per missing chunk.
-        constexpr std::size_t staging_limit=64ull<<20;
-        const auto batch=std::max<std::size_t>(1,staging_limit/chunk_bytes_);
-        for (std::size_t first=0;first<missing.size();first+=batch) {
-            auto n=std::min(batch,missing.size()-first);
-            staging_.resize(n*chunk_bytes_);
-            std::vector<Index> starts, sizes(n,Index(source_.chunks,source_.chunks+3));
-            std::vector<std::uint8_t*> outputs;
-            for (std::size_t i=0;i<n;++i) {
-                auto idx=index(missing[first+i]); for (int a=0;a<3;++a) idx[a]*=source_.chunks[a];
-                starts.push_back(std::move(idx)); outputs.push_back(staging_.data()+i*chunk_bytes_);
-            }
-            array_.read_many(starts,sizes,outputs);
-            for (std::size_t i=0;i<n;++i) {
-                auto data=device::allocate(chunk_bytes_,device_);
-                device::check(cudaMemcpy(data->ptr,outputs[i],chunk_bytes_,cudaMemcpyHostToDevice));
-                cache_.emplace(missing[first+i],Entry{std::move(data),++clock_}); ++uploads_; uploaded_+=chunk_bytes_;
-            }
-        }
+        upload_missing(missing);
         std::size_t capacity=1; while (capacity<needed.size()*2) capacity*=2;
         std::vector<std::int64_t> keys(capacity,-1);
         std::vector<const unsigned char*> pointers(capacity,nullptr);
@@ -131,7 +177,7 @@ public:
         source_.fill=spec.fill[0];
     }
     int device_id() const { return device_; }
-    void clear() { ready(); std::lock_guard lock(mutex_); device::Guard guard(device_); cache_.clear(); staging_.clear(); device::complete(); }
+    void clear() { ready(); std::lock_guard lock(mutex_); device::Guard guard(device_); cache_.clear(); device::complete(); }
     std::vector<std::uint64_t> stats() { ready(); std::lock_guard lock(mutex_); return {cache_.size()*chunk_bytes_,budget_,hits_,uploads_,uploaded_,cpu_routes_,gpu_routes_}; }
     Result grids(std::vector<Grid> grids, int kind, int order, bool floating, const std::string& route) {
         ready(); std::lock_guard lock(mutex_); device::Guard guard(device_);

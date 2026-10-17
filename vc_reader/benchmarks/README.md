@@ -11,6 +11,17 @@ Requirements: the `bench` extra (numpy, zarr>=3, s3fs, tensorstore). With the de
 `.venv/bin/python benchmarks/bench_local.py`. TensorStore is skipped if it is
 not installed.
 
+## CUDA chunk uploads
+
+`bench_cuda_uploads.py` compares fresh and resident GPU caches on real local CT,
+including large requests that reuse staging buffers. It requires the existing
+CUDA reader build and NumPy. Run through `run_native.py`; `--compare` checks exact
+output hashes against another build. Reports contain raw timings, mean/p50/p95,
+uploaded bytes and binary identity. See the [upload results and reproduction
+commands](../docs/cuda_reader.md#upload-performance) for the pageable, pinned and
+asynchronous comparisons. Pinning and filesystem pages are warmed; this is not
+a cold-storage benchmark.
+
 ## Augmentation correctness: `validate_augment.py`
 
 This checks a local Zarr crop through the reader and native augmentation, with

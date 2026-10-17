@@ -57,8 +57,18 @@ in the device cache. Use explicit routes when the workload is known.
 The private per-adapter LRU cache is bounded by `cache_bytes`, including full
 padded source chunks. Native planning deduplicates chunks across crop batches.
 Only misses are read through the existing reader (local mmap/slab, codecs,
-remote/disk/memory caches) and uploaded. Host staging uses batches of at most
-64 MiB, or one chunk if a chunk is larger. Outputs, coordinate buffers and lookup
+remote/disk/memory caches) and uploaded. Host staging reuses two page-locked
+buffers of at most 32 MiB each, or one full chunk per buffer if a chunk is larger.
+Buffers grow lazily, survive `clear_cache()`, and are released when the adapter
+closes. Pinning has an initial allocation cost; reuse the adapter across requests.
+Pinned-memory allocation errors propagate as CUDA errors.
+
+Missing device chunks are allocated before transfer submission. Chunk uploads
+use `cudaMemcpyAsync` on the default stream, overlapping CPU reads of the next
+batch. Events prevent staging reuse before a transfer finishes; errors drain
+queued transfers and discard potentially incomplete cache entries. Public calls
+still finish before returning. CPU sampling/crop-upload routes are unchanged.
+Outputs, coordinate buffers and lookup
 scratch are additional memory, outside the source-cache budget. CUDA's allocator
 may also retain freed memory. No GPU decompression or direct storage I/O is claimed.
 
@@ -148,6 +158,72 @@ CUDA adapters, prepared requests and arrays cannot be pickled or used after fork
 Construct them inside each worker; the ordinary `ZarrReader` retains its existing
 fork/spawn support. Concurrent calls on one CUDA reader serialize cache mutation
 and sampling. Different adapters have independent caches.
+
+## Upload performance
+
+The upload comparison uses the local PHercParis4 78 keV level-2 decoded cache,
+128³ uint8 chunks, a GeForce RTX 5090, and Release builds targeting `sm_120`.
+`bench_cuda_uploads.py` uses 16 reader threads, no decoded memory cache, warm
+filesystem pages, five warmups and 31 measured repetitions. Each call includes
+planning, device allocation, CPU reading, transfer, sampling and synchronization.
+GPU source-cache clearing, verification downloads and output destruction are
+outside timing. Staging allocations are warmed and reused. Modes are shuffled
+with seed 901; builds are measured separately without concurrent tests/builds.
+
+Times are **mean / p50 / p95 milliseconds**. Chunk cases gather a few values but
+force full source-chunk uploads to isolate cache loading; ordinary sparse gathers
+should still consider `source="cpu"`. Affine cases produce full float32 crops.
+
+| Request | Uploaded MiB | Original pageable synchronous | Pinned synchronous | Pinned async with preallocation |
+|---|---:|---:|---:|---:|
+| 1 chunk | 2 | 0.189 / 0.189 / 0.193 | 0.177 / 0.176 / 0.179 | 0.177 / 0.177 / 0.179 |
+| 8 chunks | 16 | 1.560 / 1.561 / 1.780 | 0.956 / 0.939 / 1.176 | 0.986 / 0.937 / 1.317 |
+| 32 chunks | 64 | 7.745 / 7.514 / 8.729 | 3.986 / 3.904 / 4.498 | 3.704 / 3.657 / 4.090 |
+| 128 chunks | 256 | 27.202 / 27.329 / 27.963 | 16.172 / 16.122 / 17.097 | 15.558 / 15.521 / 16.746 |
+| Affine 128³ | 16 | 2.281 / 2.214 / 2.806 | 1.482 / 1.506 / 1.871 | 1.441 / 1.402 / 1.909 |
+| Affine 256³ | 54 | 8.396 / 8.188 / 9.467 | 5.301 / 5.241 / 5.702 | 5.210 / 5.197 / 5.650 |
+
+Pinning accounts for most of the improvement. Async double buffering with device
+allocations interleaved among copies initially took 16.725 ms p50 for 256 MiB;
+allocating destinations before submission reduced this to 15.521 ms. This is a
+small additional gain over pinned synchronous copies, not a further large speedup.
+Resident gather p50 remains 0.015–0.022 ms and resident affine p50 0.238–1.527 ms.
+Every measured output has the same SHA-256 as the original CUDA implementation;
+the CPU reference is also checked with the existing float32 tolerance. Sampling,
+normalization and augmentation arithmetic and RNG order are unchanged.
+
+An independent Nsight trace of the 256 MiB case (one warmup, one repetition)
+attributes 84.4% of baseline CUDA API time to synchronous `cudaMemcpy` (51.10 ms
+across all setup/verification/measured calls), versus 0.028 ms total gather kernel
+time. The first async trace reduced copy submission time to 1.39 ms but increased
+`cudaMallocAsync` time from 6.87 to 19.67 ms, motivating preallocation. These trace
+totals include untimed setup and validation; they are not the latency table.
+
+The results describe repeated requests through a reused adapter on this host.
+They do not measure storage-cold or remote I/O, first-use pinning latency, or other
+GPUs/platforms. Each active adapter can retain 64 MiB of pinned host memory
+(two full chunks for oversized chunks), separate from its GPU cache budget.
+CPU-only builds retain their existing path.
+
+Reproduce after building as below; use `run_native.py` to select preserved builds
+without installation. `--compare` enforces identical CUDA output hashes:
+
+```bash
+export AGENTS_AGENT_MODE=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+export PYTHONPATH=vc_reader/src
+vc_reader/.venv/bin/python vc_reader/benchmarks/run_native.py \
+  /tmp/vc-reader-cuda/_native.cpython-314-x86_64-linux-gnu.so \
+  vc_reader/benchmarks/bench_cuda_uploads.py --reps 31 --warmup 5 \
+  --build-dir /tmp/vc-reader-cuda --compare /tmp/vc-upload-baseline/uploads.json \
+  --output vc_reader/benchmarks/results/uploads/async-final.json
+```
+
+Omit `--compare` for the initial baseline. The default input is
+`/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/2`;
+`--array` overrides it. JSON includes raw timings, source path, command, binary
+hash, environment and CMake configuration. The pinned-only experiment retains
+the original single 64 MiB batch and synchronous copy loop. The async experiment
+uses two 32 MiB batches. Raw reports are under ignored `benchmarks/results/uploads/`.
 
 ## Build and validate
 
