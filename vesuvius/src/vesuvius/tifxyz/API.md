@@ -520,3 +520,64 @@ z_valid = z[valid]
 # Get all valid coordinates as point cloud
 points = np.stack([x[valid], y[valid], z[valid]], axis=1)
 ```
+
+---
+
+## Open data: `original_volume_downscale` (`tifxyz_normalized` meshes)
+
+In the open-data bucket every segment has a normalized mesh at
+`<sample>/segments/<segment>/mesh/intermediate/tifxyz_normalized/`. For some
+segments its coordinates are stored at `1 / original_volume_downscale` of the
+segment's original volume. On the 2026-10-07 catalog the factor is 4 or 2 for
+112 of 323 segments, in PHercParis4, PHerc0139 and PHerc0500P2.
+
+The factor is recorded in the bucket catalog `metadata.json`, under
+`samples[<sample>].segments[<segment>].properties.original_volume_downscale`.
+The mesh's own `meta.json` does not record it. Using those coordinates as
+voxels of the original volume, or applying a catalog transform to them, is
+off by that factor. The published transformed meshes
+(`mesh/<id>-on-<volume>-<um>.tifxyz`) already include it.
+
+```python
+from vesuvius.tifxyz import read_tifxyz, read_open_data_normalized, original_volume_downscale
+
+# Catalog-aware: sample/segment are taken from the bucket-layout path
+surface = read_open_data_normalized(
+    "PHerc0139/segments/20250108000004-w029_2025010827/mesh/intermediate/tifxyz_normalized",
+    "metadata.json",            # local copy of the bucket's metadata.json (plain or .gz)
+)
+
+# Explicit factor
+s = original_volume_downscale("metadata.json", "PHerc0139", "20250108000004")  # 4.0
+surface = read_tifxyz(path, downscale=s)
+surface.extra["original_volume_downscale_applied"]  # 4.0
+```
+
+What `downscale=s` does:
+
+- It calls `retarget(1 / s)`. Valid coordinates are multiplied by `s`, and
+  invalid points stay `-1`.
+- `bbox` is recomputed from the scaled valid points.
+- The grid `scale` is divided by `s`, so `full_resolution_shape` stays one
+  pixel per original-volume voxel.
+- It records `extra["original_volume_downscale_applied"]`, which `write_tifxyz`
+  saves to `meta.json`. A mesh that carries this key, or VC3D's
+  `vc_open_data_coordinates_scaled_to_original_volume` (written by VC3D's Open
+  Data cache after it scales a segment), is already in original-volume voxels:
+  `downscale=` other than 1 raises `ValueError` instead of scaling twice.
+
+With `downscale=None` (the default), nothing is applied. If the directory is an
+open-data `mesh/intermediate/tifxyz_normalized` path, an
+`OpenDataDownscaleWarning` is emitted. Pass `downscale=1` when the factor is
+known to be 1.
+
+`list_tifxyz` / `TifxyzInfo.bbox` report the stored, unscaled bbox, because
+they never see the catalog. `TifxyzInfo.load(downscale=s)` applies the factor.
+
+### Catalog-aware warning
+
+`read_tifxyz(path, open_data_catalog=...)` (or `$VESUVIUS_OPEN_DATA_CATALOG` set to a local
+`metadata.json`) looks up the segment's `original_volume_downscale`. Without `downscale=`, it
+warns only when the factor is not 1 and names it; `downscale="catalog"` applies it. A mesh whose
+`meta.json` carries `original_volume_downscale` (proposed optional field) is handled the same way
+without a catalog.

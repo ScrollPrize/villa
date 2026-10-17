@@ -35,6 +35,12 @@ from .reader import (
     load_folder,
     read_tifxyz,
 )
+from .open_data import (
+    OpenDataDownscaleWarning,
+    load_open_data_catalog,
+    original_volume_downscale,
+    read_open_data_normalized,
+)
 from .types import Tifxyz
 from .upsampling import (
     catmull_rom_smooth_1d,
@@ -55,6 +61,11 @@ __all__ = [
     "list_tifxyz",
     "load_folder",
     "TifxyzInfo",
+    # Open-data original_volume_downscale (tifxyz_normalized meshes)
+    "read_open_data_normalized",
+    "original_volume_downscale",
+    "load_open_data_catalog",
+    "OpenDataDownscaleWarning",
     # Writer
     "write_tifxyz",
     "TifxyzWriter",
