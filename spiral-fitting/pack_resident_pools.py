@@ -256,6 +256,9 @@ def pack_arrays(
     out_dir = Path(out_dir)
     meta_path = out_dir / 'meta.json'
     if meta_path.exists() and not force:
+        if ct_masker is not None and not json.loads(meta_path.read_text()).get('ct_mask'):
+            raise ValueError(f'{label}: {out_dir} was packed without a CT mask; '
+                             'use --force to rebuild it with one')
         print(f'{label}: {out_dir} already exists, skipping (--force to rebuild)')
         return str(out_dir)
 

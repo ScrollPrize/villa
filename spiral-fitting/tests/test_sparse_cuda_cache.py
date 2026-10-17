@@ -247,6 +247,25 @@ def test_bounds_check_env(tmp_path, monkeypatch):
         pool.gather(torch.tensor([[16, 0, 0]]))
 
 
+def test_explicit_ct_mask_does_not_reuse_unmasked_pool(tmp_path):
+    from pack_resident_pools import CtMasker
+
+    data = np.ones((32, 32, 32), dtype=np.uint8)
+    store = write_array(tmp_path / 'scalar', data)
+    zarr.open(
+        str(tmp_path / 'ct' / '2'), mode='w', shape=(16, 16, 16), chunks=(8, 8, 8),
+        dtype='|u1', compressor=None, fill_value=0, zarr_format=2,
+        dimension_separator='.',
+    )[:] = 7
+    out = pack_arrays([store], sidecar_path(store, '0'), label='plain')
+    masker = CtMasker(tmp_path / 'ct', '2', data.shape)
+
+    with pytest.raises(ValueError, match='without a CT mask'):
+        pack_arrays([store], out, label='plain', ct_masker=masker)
+    pack_arrays([store], out, label='plain', ct_masker=masker, force=True)
+    assert json.loads((Path(out) / 'meta.json').read_text())['ct_mask'] is not None
+
+
 def test_pack_ct_mask_zeroes_and_drops_bricks(tmp_path):
     from pack_resident_pools import CtMasker, verify_pool
 
