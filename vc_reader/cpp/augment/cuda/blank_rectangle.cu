@@ -20,16 +20,16 @@ void apply_cuda(const BlankRectangle& t, Sample& s, const Parameters& p, Session
         for (std::size_t b = 0; b < c.values.size(); b += 2*g.dim+1) {
             RectangleRegion region(grid,c,b); Layout box{Grid(region.extent)};
             if (t.statistic.empty()) {
-                fill_box<<<blocks(box.size),256>>>(v,g,box,region.origin,c.values[b+2*g.dim],nullptr,nullptr);
+                fill_box<<<blocks(box.size),256,0,vcr::device::stream()>>>(v,g,box,region.origin,c.values[b+2*g.dim],nullptr,nullptr);
             } else {
                 Buffer<double> values(box.size);
-                gather_box<<<blocks(box.size),256>>>(v,values.ptr,g,box,region.origin);
+                gather_box<<<blocks(box.size),256,0,vcr::device::stream()>>>(v,values.ptr,g,box,region.origin);
                 if (t.statistic == "mean") {
                     auto stats = statistics(View<double>{values.ptr,box.size});
-                    fill_box<<<blocks(box.size),256>>>(v,g,box,region.origin,0,stats.ptr,nullptr);
+                    fill_box<<<blocks(box.size),256,0,vcr::device::stream()>>>(v,g,box,region.origin,0,stats.ptr,nullptr);
                 } else {
                     thrust::sort(thrust::cuda::par.on(0),values.ptr,values.ptr+box.size);
-                    fill_box<<<blocks(box.size),256>>>(v,g,box,region.origin,0,nullptr,values.ptr+(box.size-1)/2);
+                    fill_box<<<blocks(box.size),256,0,vcr::device::stream()>>>(v,g,box,region.origin,0,nullptr,values.ptr+(box.size-1)/2);
                 }
             }
             check(cudaGetLastError());

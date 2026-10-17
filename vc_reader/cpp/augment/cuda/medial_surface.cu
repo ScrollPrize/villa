@@ -49,16 +49,16 @@ void apply_cuda(const MedialSurface& t, Sample& s, const Parameters&, Session& s
         const bool ignore = t.ignore.count(name); const double ignored = ignore ? t.ignore.at(name) : 0;
         // dilate/erode ping-pong through scratch; erosion uses the neutral border.
         const auto morph = [&](bool dilate) {
-            morphology_kernel<<<blocks(grid.size),256>>>(skeleton.ptr,scratch.ptr,g,footprint.ptr,footprint.size,dilate,!dilate);
+            morphology_kernel<<<blocks(grid.size),256,0,vcr::device::stream()>>>(skeleton.ptr,scratch.ptr,g,footprint.ptr,footprint.size,dilate,!dilate);
             std::swap(skeleton.ptr,scratch.ptr);
         };
         for (std::size_t c = 0; c < a.shape[0]; ++c) {
-            a.typed([&](auto labels) { binarize<<<blocks(grid.size),256>>>(labels.ptr+c*grid.size,skeleton.ptr,values.ptr,grid.size,ignore,ignored); });
-            thin_slices<<<unsigned(grid.size/(h*w)),1024>>>(skeleton.ptr,scratch.ptr,(long long)h,(long long)w);
+            a.typed([&](auto labels) { binarize<<<blocks(grid.size),256,0,vcr::device::stream()>>>(labels.ptr+c*grid.size,skeleton.ptr,values.ptr,grid.size,ignore,ignored); });
+            thin_slices<<<unsigned(grid.size/(h*w)),1024,0,vcr::device::stream()>>>(skeleton.ptr,scratch.ptr,(long long)h,(long long)w);
             if (t.tube) { morph(true); morph(true); }
             if (t.open) { morph(false); morph(true); }
             if (t.close) { morph(true); morph(false); }
-            multiply<<<blocks(grid.size),256>>>(skeleton.ptr,values.ptr,out.view<float>().ptr+c*grid.size,grid.size);
+            multiply<<<blocks(grid.size),256,0,vcr::device::stream()>>>(skeleton.ptr,values.ptr,out.view<float>().ptr+c*grid.size,grid.size);
             check(cudaGetLastError());
         }
         Array metadata; metadata.shape = a.shape; metadata.kind = 'f'; metadata.bytes = 4;

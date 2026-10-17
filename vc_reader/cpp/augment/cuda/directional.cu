@@ -146,7 +146,7 @@ void directional_cuda(DeviceArray& a, const Target& target, const Parameters& p,
     a.typed([&](auto view) {
         using T = typename decltype(view)::value_type;
         if constexpr (std::is_floating_point_v<T>)
-            dense_kernel<<<blocks(t.grid.size),256>>>(view.ptr,t,target.role,target.normalize,session.geometry_status());
+            dense_kernel<<<blocks(t.grid.size),256,0,vcr::device::stream()>>>(view.ptr,t,target.role,target.normalize,session.geometry_status());
     });
     check(cudaGetLastError());
 }
@@ -160,22 +160,23 @@ void sparse_cuda(DeviceArray& a, const Target& target, const Parameters& p, cons
     a.typed([&](auto view) {
         using T = typename decltype(view)::value_type;
         if constexpr (std::is_floating_point_v<T>) {
-            if (count) sparse_kernel<<<blocks(count),256>>>(view.ptr,count,t,target.role,target.normalize,outside,
+            if (count) sparse_kernel<<<blocks(count),256,0,vcr::device::stream()>>>(view.ptr,count,t,target.role,target.normalize,outside,
                                                             keep ? keep->ptr : nullptr,session.geometry_status());
             check(cudaGetLastError());
             if (!keep) return;
             // Dropping points changes the output shape: the kept count is the
             // one value read back, and only for outside="drop".
             Buffer<unsigned> index(count); std::size_t bytes = 0;
-            check(cub::DeviceScan::ExclusiveSum(nullptr,bytes,keep->ptr,index.ptr,count));
+            check(cub::DeviceScan::ExclusiveSum(nullptr,bytes,keep->ptr,index.ptr,count,vcr::device::stream()));
             Buffer<std::byte> scratch(bytes);
-            check(cub::DeviceScan::ExclusiveSum(scratch.ptr,bytes,keep->ptr,index.ptr,count));
+            check(cub::DeviceScan::ExclusiveSum(scratch.ptr,bytes,keep->ptr,index.ptr,count,vcr::device::stream()));
             unsigned last[2]{};
-            check(cudaMemcpy(last,index.ptr+count-1,sizeof(unsigned),cudaMemcpyDeviceToHost));
-            check(cudaMemcpy(last+1,keep->ptr+count-1,sizeof(unsigned),cudaMemcpyDeviceToHost));
+            check(cudaMemcpyAsync(last,index.ptr+count-1,sizeof(unsigned),cudaMemcpyDeviceToHost,vcr::device::stream()));
+            check(cudaMemcpyAsync(last+1,keep->ptr+count-1,sizeof(unsigned),cudaMemcpyDeviceToHost,vcr::device::stream()));
+            check(cudaStreamSynchronize(vcr::device::stream()));
             const std::size_t kept = std::size_t(last[0])+last[1];
             DeviceArray out(Shape{kept,d},a.kind,a.bytes);
-            compact_rows<<<blocks(count),256>>>(view.ptr,out.view<T>().ptr,keep->ptr,index.ptr,count,int(d));
+            compact_rows<<<blocks(count),256,0,vcr::device::stream()>>>(view.ptr,out.view<T>().ptr,keep->ptr,index.ptr,count,int(d));
             check(cudaGetLastError());
             a = std::move(out);
         }

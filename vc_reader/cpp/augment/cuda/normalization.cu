@@ -201,22 +201,22 @@ template<class T> __global__ void fixed_values(View<T> data, Options t, int* inv
 }
 template<class K> void sort_keys(Buffer<K>& keys, std::size_t n) {
     Buffer<K> sorted(n); std::size_t bytes = 0;
-    check(cub::DeviceRadixSort::SortKeys(nullptr,bytes,keys.ptr,sorted.ptr,n));
+    check(cub::DeviceRadixSort::SortKeys(nullptr,bytes,keys.ptr,sorted.ptr,n,0,int(sizeof(K)*8),vcr::device::stream()));
     Buffer<std::byte> scratch(bytes);
-    check(cub::DeviceRadixSort::SortKeys(scratch.ptr,bytes,keys.ptr,sorted.ptr,n));
+    check(cub::DeviceRadixSort::SortKeys(scratch.ptr,bytes,keys.ptr,sorted.ptr,n,0,int(sizeof(K)*8),vcr::device::stream()));
     std::swap(keys.ptr,sorted.ptr);
 }
 // Mean/standard deviation (and bounds) of the selected values.
 template<class T> void moments(View<T> data, Selection select, ParametersGPU* params, int* invalid, double eps, bool zscore) {
     const unsigned count = std::min(blocks(data.size),1024u);
     Buffer<Partial> partial(count);
-    collect_normalization<T,0><<<count,256>>>(data,partial.ptr,nullptr,select,invalid);
-    finish_normalization<0><<<1,256>>>(partial.ptr,count,params,zscore,eps);
+    collect_normalization<T,0><<<count,256,0,vcr::device::stream()>>>(data,partial.ptr,nullptr,select,invalid);
+    finish_normalization<0><<<1,256,0,vcr::device::stream()>>>(partial.ptr,count,params,zscore,eps);
     if (!zscore) return;
-    collect_normalization<T,1><<<count,256>>>(data,partial.ptr,params,select,invalid);
-    finish_normalization<1><<<1,256>>>(partial.ptr,count,params,true,eps);
-    collect_normalization<T,2><<<count,256>>>(data,partial.ptr,params,select,invalid);
-    finish_normalization<2><<<1,256>>>(partial.ptr,count,params,true,eps);
+    collect_normalization<T,1><<<count,256,0,vcr::device::stream()>>>(data,partial.ptr,params,select,invalid);
+    finish_normalization<1><<<1,256,0,vcr::device::stream()>>>(partial.ptr,count,params,true,eps);
+    collect_normalization<T,2><<<count,256,0,vcr::device::stream()>>>(data,partial.ptr,params,select,invalid);
+    finish_normalization<2><<<1,256,0,vcr::device::stream()>>>(partial.ptr,count,params,true,eps);
 }
 } // namespace
 
@@ -225,7 +225,7 @@ void apply_cuda(const Normalize& t, Sample& s, const Parameters& p, Session& ses
         using T = typename decltype(data)::value_type;
         auto* invalid = session.finite_status();
         if (t.mode == Normalization::Fixed) {
-            fixed_values<<<blocks(data.size),256>>>(data,Options(t),invalid); check(cudaGetLastError()); return;
+            fixed_values<<<blocks(data.size),256,0,vcr::device::stream()>>>(data,Options(t),invalid); check(cudaGetLastError()); return;
         }
         std::unique_ptr<Buffer<std::uint8_t>> valid;
         Buffer<unsigned long long> selected(1);
@@ -233,31 +233,31 @@ void apply_cuda(const Normalize& t, Sample& s, const Parameters& p, Session& ses
         if (t.masked && session.arrays.count(f.target.valid)) {
             const auto& mask = session.arrays.at(f.target.valid);
             valid = std::make_unique<Buffer<std::uint8_t>>(data.size);
-            check(cudaMemsetAsync(selected.ptr,0,sizeof(unsigned long long)));
+            check(cudaMemsetAsync(selected.ptr,0,sizeof(unsigned long long),vcr::device::stream()));
             const std::size_t offset = (mask.shape[0] == 1 ? 0 : c.channel)*data.size;
-            mask.typed([&](auto m) { select_valid<<<blocks(data.size),256>>>(m.ptr+offset,valid->ptr,data.size,selected.ptr); });
-            select_all_if_empty<<<blocks(data.size),256>>>(valid->ptr,data.size,selected.ptr);
+            mask.typed([&](auto m) { select_valid<<<blocks(data.size),256,0,vcr::device::stream()>>>(m.ptr+offset,valid->ptr,data.size,selected.ptr); });
+            select_all_if_empty<<<blocks(data.size),256,0,vcr::device::stream()>>>(valid->ptr,data.size,selected.ptr);
         }
         const Selection select{valid ? valid->ptr : nullptr,t.mode == Normalization::ZScore && t.nonzero};
         Buffer<ParametersGPU> params(1);
         if (t.mode == Normalization::MinMax || t.mode == Normalization::ZScore) {
             const bool zscore = t.mode == Normalization::ZScore;
             moments(data,select,params.ptr,invalid,t.eps,zscore);
-            normalize_values<<<blocks(data.size),256>>>(data,params.ptr,select.nonzero);
+            normalize_values<<<blocks(data.size),256,0,vcr::device::stream()>>>(data,params.ptr,select.nonzero);
             check(cudaGetLastError()); return;
         }
         if (t.mode == Normalization::Robust) moments(data,select,params.ptr,invalid,0.,true);
         Buffer<T> keys(data.size); Buffer<OrderGPU> order(1);
-        order_keys<<<blocks(data.size),256>>>(data,select.valid,keys.ptr,invalid);
+        order_keys<<<blocks(data.size),256,0,vcr::device::stream()>>>(data,select.valid,keys.ptr,invalid);
         sort_keys(keys,data.size);
-        order_parameters<<<1,1>>>(keys.ptr,valid ? selected.ptr : nullptr,data.size,order.ptr,Options(t),params.ptr);
+        order_parameters<<<1,1,0,vcr::device::stream()>>>(keys.ptr,valid ? selected.ptr : nullptr,data.size,order.ptr,Options(t),params.ptr);
         if (t.mode == Normalization::Robust) {
             Buffer<double> deviations(data.size);
-            deviation_keys<<<blocks(data.size),256>>>(data,select.valid,deviations.ptr,order.ptr);
+            deviation_keys<<<blocks(data.size),256,0,vcr::device::stream()>>>(data,select.valid,deviations.ptr,order.ptr);
             sort_keys(deviations,data.size);
-            robust_parameters<<<1,1>>>(deviations.ptr,order.ptr);
+            robust_parameters<<<1,1,0,vcr::device::stream()>>>(deviations.ptr,order.ptr);
         }
-        order_values<<<blocks(data.size),256>>>(data,order.ptr,t.mode == Normalization::Percentile || t.clip);
+        order_values<<<blocks(data.size),256,0,vcr::device::stream()>>>(data,order.ptr,t.mode == Normalization::Percentile || t.clip);
         check(cudaGetLastError());
     });
 }

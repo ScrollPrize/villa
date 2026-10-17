@@ -37,11 +37,11 @@ __global__ void finish_stats(const Partial* input, unsigned count, std::size_t n
 template<class T> Buffer<Statistics> stats_impl(View<T> data, bool deviation, const double* weights) {
     const unsigned count = std::min(blocks(data.size),1024u);
     Buffer<Partial> partial(count); Buffer<Statistics> result(1);
-    collect<T,false><<<count,256>>>(data,partial.ptr,weights,nullptr);
-    finish_stats<<<1,256>>>(partial.ptr,count,data.size,weights != nullptr,false,result.ptr);
+    collect<T,false><<<count,256,0,vcr::device::stream()>>>(data,partial.ptr,weights,nullptr);
+    finish_stats<<<1,256,0,vcr::device::stream()>>>(partial.ptr,count,data.size,weights != nullptr,false,result.ptr);
     if (deviation) {
-        collect<T,true><<<count,256>>>(data,partial.ptr,nullptr,result.ptr);
-        finish_stats<<<1,256>>>(partial.ptr,count,data.size,false,true,result.ptr);
+        collect<T,true><<<count,256,0,vcr::device::stream()>>>(data,partial.ptr,nullptr,result.ptr);
+        finish_stats<<<1,256,0,vcr::device::stream()>>>(partial.ptr,count,data.size,false,true,result.ptr);
     }
     check(cudaGetLastError()); return result;
 }

@@ -1,13 +1,15 @@
 #pragma once
 #include "../core.hpp"
+#include "../../cuda_stream.hpp"
 #include <cuda_runtime.h>
 #include <unistd.h>
 namespace vcr::augment::cuda {
 inline void check(cudaError_t status) {
     if (status != cudaSuccess) throw std::runtime_error(std::string("CUDA augmentation: ") + cudaGetErrorString(status));
 }
-// Stream-ordered allocations reuse CUDA's device pool. Buffers remain owned by
-// the invocation; no cached sample pointers or shared mutable scratch exist.
+// Stream-ordered allocations reuse CUDA's device pool, allocated and freed on
+// the stream current at construction. Buffers remain owned by the invocation;
+// no cached sample pointers or shared mutable scratch exist.
 template<class T> struct Buffer {
     T* ptr = nullptr;
     std::size_t size;
@@ -15,6 +17,7 @@ template<class T> struct Buffer {
     bool borrowed = false;
     bool exported = false;
     int device = 0;
+    cudaStream_t stream = vcr::device::stream();
     pid_t pid = getpid();
     explicit Buffer(std::size_t n) : size(n) {
         check(cudaGetDevice(&device));
@@ -23,13 +26,13 @@ template<class T> struct Buffer {
         int supported = 0;
         check(cudaDeviceGetAttribute(&supported,cudaDevAttrMemoryPoolsSupported,device));
         pooled = supported;
-        if (pooled) { check(cudaMallocAsync(&ptr,n*sizeof(T),0)); return; }
+        if (pooled) { check(cudaMallocAsync(&ptr,n*sizeof(T),stream)); return; }
 #endif
         check(cudaMalloc(&ptr,n*sizeof(T)));
     }
     explicit Buffer(const std::vector<T>& v) : Buffer(v.size()) { upload(v.data()); }
     Buffer(T* data, std::size_t n) : ptr(data),size(n),borrowed(true) { check(cudaGetDevice(&device)); }
-    Buffer(Buffer&& other) noexcept : ptr(std::exchange(other.ptr,nullptr)),size(other.size),pooled(other.pooled),borrowed(other.borrowed),exported(other.exported),device(other.device),pid(other.pid) {}
+    Buffer(Buffer&& other) noexcept : ptr(std::exchange(other.ptr,nullptr)),size(other.size),pooled(other.pooled),borrowed(other.borrowed),exported(other.exported),device(other.device),stream(other.stream),pid(other.pid) {}
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
     ~Buffer() {
@@ -38,13 +41,19 @@ template<class T> struct Buffer {
         if (cudaGetDevice(&previous) != cudaSuccess || cudaSetDevice(device) != cudaSuccess) return;
         if (exported) cudaDeviceSynchronize();
 #if CUDART_VERSION >= 11020
-        if (pooled) cudaFreeAsync(ptr,0); else
+        if (pooled) cudaFreeAsync(ptr,stream); else
 #endif
         cudaFree(ptr);
         cudaSetDevice(previous);
     }
-    void upload(const T* p) { if (size) check(cudaMemcpy(ptr,p,size*sizeof(T),cudaMemcpyHostToDevice)); }
-    void download(T* p) const { if (size) check(cudaMemcpy(p,ptr,size*sizeof(T),cudaMemcpyDeviceToHost)); }
+    // Pageable uploads are staged immediately and ordered on the stream;
+    // downloads synchronize the stream.
+    void upload(const T* p) { if (size) check(cudaMemcpyAsync(ptr,p,size*sizeof(T),cudaMemcpyHostToDevice,vcr::device::stream())); }
+    void download(T* p) const {
+        if (!size) return;
+        check(cudaMemcpyAsync(p,ptr,size*sizeof(T),cudaMemcpyDeviceToHost,vcr::device::stream()));
+        check(cudaStreamSynchronize(vcr::device::stream()));
+    }
 };
 struct Layout {
     std::size_t shape[3]{1,1,1}, stride[3]{1,1,1}, size = 1;

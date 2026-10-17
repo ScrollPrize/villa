@@ -16,7 +16,7 @@ void apply_cuda(const Sharpen& t, Sample& s, const Parameters& p, Session& sessi
     apply_channels(t,s,p,session,[](const auto&, auto v, const Grid& g, const ChannelPlan& c) {
         using V = typename decltype(v)::value_type;
         auto stats = statistics(v); Buffer<V> out(v.size);
-        sharpen_kernel<<<blocks(g.size),256>>>(v.ptr,out.ptr,Layout(g),V(c.values[0]),bool(c.values[1]),stats.ptr);
+        sharpen_kernel<<<blocks(g.size),256,0,vcr::device::stream()>>>(v.ptr,out.ptr,Layout(g),V(c.values[0]),bool(c.values[1]),stats.ptr);
         check(cudaGetLastError()); copy_device(v,View<V>{out.ptr,v.size});
     });
 }

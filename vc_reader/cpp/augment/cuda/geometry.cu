@@ -61,7 +61,7 @@ DeviceArray resample_cuda(const DeviceArray& src, const Parameters& p, bool near
         require(std::is_floating_point_v<T> || nearest || validity,"CUDA linear interpolation requires floating-point data");
         Buffer<int> used(fill_valid || validity ? 0 : 1); int used_host = 0;
         if (used.size) used.upload(&used_host);
-        geometry_kernel<<<blocks(out.size()),256>>>(input.ptr,out.view<T>().ptr,in,output,src.shape[0],args,field,pad,used.ptr);
+        geometry_kernel<<<blocks(out.size()),256,0,vcr::device::stream()>>>(input.ptr,out.view<T>().ptr,in,output,src.shape[0],args,field,pad,used.ptr);
         check(cudaGetLastError());
         if (used.size) { used.download(&used_host); require(!used_host,"value is not representable in target dtype"); }
     });

@@ -63,20 +63,20 @@ Parameters sample_elastic(const Elastic& t, const Sample& s, Random& r, bool rec
         }
         Buffer<double> w(weights); Buffer<std::size_t> pos(positions);
         auto next = std::make_shared<Buffer<double>>(product(target)*dim);
-        expand_controls<<<blocks(next->size),256>>>(data->ptr,next->ptr,Layout{Grid(shape)},Layout{Grid(target)},w.ptr,pos.ptr,axis);
+        expand_controls<<<blocks(next->size),256,0,vcr::device::stream()>>>(data->ptr,next->ptr,Layout{Grid(shape)},Layout{Grid(target)},w.ptr,pos.ptr,axis);
         check(cudaGetLastError()); data = std::move(next); shape = std::move(target);
     }
     Layout g{Grid(p.shape)}; const auto count = blocks(g.size);
     Buffer<double> partial(count*10),stats(10);
-    component_sums<<<count,256>>>(data->ptr,partial.ptr,g);
-    finish_reduce<3><<<1,256>>>(partial.ptr,stats.ptr,count);
-    center_field<<<blocks(data->size),256>>>(data->ptr,stats.ptr,g);
-    field_energy_gradient<<<count,256>>>(data->ptr,partial.ptr,g);
-    finish_reduce<10><<<1,256>>>(partial.ptr,stats.ptr,count);
+    component_sums<<<count,256,0,vcr::device::stream()>>>(data->ptr,partial.ptr,g);
+    finish_reduce<3><<<1,256,0,vcr::device::stream()>>>(partial.ptr,stats.ptr,count);
+    center_field<<<blocks(data->size),256,0,vcr::device::stream()>>>(data->ptr,stats.ptr,g);
+    field_energy_gradient<<<count,256,0,vcr::device::stream()>>>(data->ptr,partial.ptr,g);
+    finish_reduce<10><<<1,256,0,vcr::device::stream()>>>(partial.ptr,stats.ptr,count);
     // Normalization is invariant across the field. Compute the square root and
     // gradient cap once, rather than in every voxel/component thread.
-    scale_factor<<<1,1>>>(stats.ptr,g,magnitude);
-    field_scale<<<blocks(data->size),256>>>(data->ptr,stats.ptr,data->size);
+    scale_factor<<<1,1,0,vcr::device::stream()>>>(stats.ptr,g,magnitude);
+    field_scale<<<blocks(data->size),256,0,vcr::device::stream()>>>(data->ptr,stats.ptr,data->size);
     check(cudaGetLastError()); p.device_field = data;
     if (record) { p.field.resize(data->size); data->download(p.field.data()); }
     return p;

@@ -21,10 +21,10 @@ std::shared_ptr<Buffer<double>> local_field(const LocalOptions& options, const G
         coefficients.insert(coefficients.end(),axis.begin(),axis.end());
     }
     Buffer<double> table(coefficients); auto result = std::make_shared<Buffer<double>>(grid.size);
-    expand_local<<<blocks(grid.size),256>>>(result->ptr,Layout(grid),table.ptr,low,high-low);
+    expand_local<<<blocks(grid.size),256,0,vcr::device::stream()>>>(result->ptr,Layout(grid),table.ptr,low,high-low);
     if (centered) {
         auto stats = statistics(View<double>{result->ptr,result->size});
-        center_local<<<blocks(grid.size),256>>>(result->ptr,result->size,stats.ptr);
+        center_local<<<blocks(grid.size),256,0,vcr::device::stream()>>>(result->ptr,result->size,stats.ptr);
     }
     check(cudaGetLastError()); return result;
 }

@@ -1,6 +1,7 @@
 #pragma once
 // Shared ownership for reader outputs and external augmentation inputs. CUDA
 // operations complete before returning to Python; consumers may use any stream.
+#include "cuda_stream.hpp"
 #include <cuda_runtime.h>
 #include <cstddef>
 #include <cstdint>
@@ -25,13 +26,14 @@ struct Buffer {
     pid_t pid = getpid();
     bool pooled = false;
     bool exported = false;
+    cudaStream_t stream = vcr::device::stream();
     Buffer(std::size_t n, int d) : bytes(n),device(d) {
         Guard guard(device);
         if (!n) return;
 #if CUDART_VERSION >= 11020
         int supported = 0; check(cudaDeviceGetAttribute(&supported,cudaDevAttrMemoryPoolsSupported,device));
         pooled = supported;
-        if (pooled) { check(cudaMallocAsync(&ptr,n,0)); return; }
+        if (pooled) { check(cudaMallocAsync(&ptr,n,stream)); return; }
 #endif
         check(cudaMalloc(&ptr,n));
     }
@@ -43,7 +45,7 @@ struct Buffer {
         // last reference. Their allocator cannot track our external allocation.
         if (exported) cudaDeviceSynchronize();
 #if CUDART_VERSION >= 11020
-        if (pooled) cudaFreeAsync(ptr,0); else
+        if (pooled) cudaFreeAsync(ptr,stream); else
 #endif
         cudaFree(ptr);
         cudaSetDevice(previous);
@@ -52,7 +54,7 @@ struct Buffer {
 };
 using Storage = std::shared_ptr<Buffer>;
 inline Storage allocate(std::size_t bytes, int device) { return std::make_shared<Buffer>(bytes,device); }
-inline void complete() { check(cudaStreamSynchronize(0)); }
+inline void complete() { check(cudaStreamSynchronize(stream())); }
 
 // Reusable page-locked staging. The caller must finish all transfers before
 // resizing or destroying it; CPU-only builds never include this header.

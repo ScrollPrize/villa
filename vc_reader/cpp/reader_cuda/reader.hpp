@@ -197,9 +197,9 @@ class Reader {
             }
             array_.read_many(starts,sizes,outputs,nullptr,true);
             auto* device=static_cast<unsigned char*>(staging.device->ptr);
-            device::check(cudaMemcpyAsync(device,staging.buffer.data(),table(n)+n*sizeof(void*),cudaMemcpyHostToDevice,0));
+            device::check(cudaMemcpyAsync(device,staging.buffer.data(),table(n)+n*sizeof(void*),cudaMemcpyHostToDevice,device::stream()));
             scatter(device,reinterpret_cast<void* const*>(device+table(n)),n,brick_bytes_);
-            device::check(cudaEventRecord(staging.done,0));
+            device::check(cudaEventRecord(staging.done,device::stream()));
             uploads_+=n; uploaded_+=n*brick_bytes_;
             ready(first+n);
         }
@@ -235,7 +235,7 @@ class Reader {
         auto* table=reinterpret_cast<Slot*>(table_host_.data());
         fill_table(table,capacity,needed);
         // The previous request completed before returning, so the pinned table is free.
-        device::check(cudaMemcpyAsync(table_->ptr,table_host_.data(),bytes,cudaMemcpyHostToDevice,0));
+        device::check(cudaMemcpyAsync(table_->ptr,table_host_.data(),bytes,cudaMemcpyHostToDevice,device::stream()));
         source_.mask=capacity-1; source_.table=static_cast<const Slot*>(table_->ptr);
         return misses;
     }
@@ -255,7 +255,7 @@ class Reader {
             work();
             device::complete();
         } catch (...) {
-            cudaStreamSynchronize(0);
+            cudaStreamSynchronize(device::stream());
             drop_all();
             throw;
         }
@@ -373,13 +373,13 @@ public:
                 std::copy_n(g.axes,9,coords.axes.begin()); array_.sample_u8_float32(coords,g.count,order,host.data()+g.offset*(order ? 4 : 1));
             }
             if (floating && (kind==0 || !order)) {
-                reserve(requests_,total); device::check(cudaMemcpy(requests_->ptr,host.data(),total,cudaMemcpyHostToDevice)); cast(requests_->ptr,result.storage->ptr,total,1,4);
-            } else device::check(cudaMemcpy(result.storage->ptr,host.data(),host.size(),cudaMemcpyHostToDevice));
+                reserve(requests_,total); device::check(cudaMemcpyAsync(requests_->ptr,host.data(),total,cudaMemcpyHostToDevice,device::stream())); cast(requests_->ptr,result.storage->ptr,total,1,4);
+            } else device::check(cudaMemcpyAsync(result.storage->ptr,host.data(),host.size(),cudaMemcpyHostToDevice,device::stream()));
             if (valid) {
                 // CPU-sampled crops: geometric validity from the same descriptors.
                 std::size_t widest=0; for (const auto& g:grids) widest=std::max(widest,g.count);
                 reserve(requests_,grids.size()*sizeof(Grid));
-                device::check(cudaMemcpy(requests_->ptr,grids.data(),grids.size()*sizeof(Grid),cudaMemcpyHostToDevice));
+                device::check(cudaMemcpyAsync(requests_->ptr,grids.data(),grids.size()*sizeof(Grid),cudaMemcpyHostToDevice,device::stream()));
                 validity(source_,static_cast<const Grid*>(requests_->ptr),grids.size(),widest,nullptr,0,total,nullptr,kind,order,false,mask(result));
             }
         } else {
@@ -400,7 +400,7 @@ public:
                     after[j]=ordered.size();
                 }
                 reserve(requests_,grids.size()*sizeof(Grid));
-                device::check(cudaMemcpy(requests_->ptr,grids.data(),grids.size()*sizeof(Grid),cudaMemcpyHostToDevice));
+                device::check(cudaMemcpyAsync(requests_->ptr,grids.data(),grids.size()*sizeof(Grid),cudaMemcpyHostToDevice,device::stream()));
                 const auto* device_grids=static_cast<const Grid*>(requests_->ptr);
                 std::size_t launched=0;
                 const auto sample=[&](std::size_t uploaded) {
@@ -424,7 +424,7 @@ private:
         reserve(resident_table_,capacity*sizeof(Slot));
         // Synchronous: earlier resident kernels may still read the old table.
         device::complete();
-        device::check(cudaMemcpy(resident_table_->ptr,table.data(),capacity*sizeof(Slot),cudaMemcpyHostToDevice));
+        device::check(cudaMemcpyAsync(resident_table_->ptr,table.data(),capacity*sizeof(Slot),cudaMemcpyHostToDevice,device::stream()));
         resident_=source_; resident_.mask=capacity-1; resident_.table=static_cast<const Slot*>(resident_table_->ptr);
         resident_dirty_=false; return resident_;
     }
@@ -539,10 +539,10 @@ private:
                 if (bits==32) { auto* first=static_cast<const std::int32_t*>(points); wide.assign(first,first+3*count); ptr=wide.data(); }
                 array_.read_points(ptr,count,host.data());
             }
-            device::check(cudaMemcpy(result.storage->ptr,host.data(),host.size(),cudaMemcpyHostToDevice));
+            device::check(cudaMemcpyAsync(result.storage->ptr,host.data(),host.size(),cudaMemcpyHostToDevice,device::stream()));
             if (valid) {
                 const auto bytes=count*3*(bits/8); reserve(requests_,bytes);
-                if (!resident) device::check(cudaMemcpy(requests_->ptr,points,bytes,cudaMemcpyHostToDevice));
+                if (!resident) device::check(cudaMemcpyAsync(requests_->ptr,points,bytes,cudaMemcpyHostToDevice,device::stream()));
                 validity(source_,nullptr,0,0,resident ? resident : requests_->ptr,bits,count,base.data(),kind,order,false,mask(result));
             }
         } else {
@@ -551,7 +551,7 @@ private:
                 upload(admit(needed),[](std::size_t) {});
                 if (!resident) {
                     const auto bytes=count*3*(bits/8); reserve(requests_,bytes);
-                    device::check(cudaMemcpy(requests_->ptr,points,bytes,cudaMemcpyHostToDevice));
+                    device::check(cudaMemcpyAsync(requests_->ptr,points,bytes,cudaMemcpyHostToDevice,device::stream()));
                     resident=requests_->ptr;
                 }
                 launch(source_,nullptr,0,0,resident,bits,count,base.data(),kind,order,floating,result.storage->ptr,mask(result));
@@ -574,7 +574,7 @@ public:
         const auto bytes=count*3*(bits/8);
         plan->host.resize(bytes); if (bytes) std::memcpy(plan->host.data(),points,bytes);
         plan->coordinates=device::allocate(bytes,device_);
-        if (bytes) device::check(cudaMemcpy(plan->coordinates->ptr,points,bytes,cudaMemcpyHostToDevice));
+        if (bytes) device::check(cudaMemcpyAsync(plan->coordinates->ptr,points,bytes,cudaMemcpyHostToDevice,device::stream()));
         device::complete(); return plan;
     }
     Result read_plan(const PointPlan& plan, const std::string& route, bool valid=false) {

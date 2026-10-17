@@ -13,11 +13,11 @@ template<class To, class From> __global__ void convert_kernel(To* out, const Fro
 }
 template<class To, class From> void convert(View<To> to, View<From> from) {
     require(to.size == from.size,"CUDA conversion size mismatch");
-    convert_kernel<<<blocks(to.size),256>>>(to.ptr,from.ptr,to.size); check(cudaGetLastError());
+    convert_kernel<<<blocks(to.size),256,0,vcr::device::stream()>>>(to.ptr,from.ptr,to.size); check(cudaGetLastError());
 }
 template<class T> void copy_device(View<T> to, View<T> from) {
     require(to.size == from.size,"CUDA copy size mismatch");
-    check(cudaMemcpyAsync(to.ptr,from.ptr,to.size*sizeof(T),cudaMemcpyDeviceToDevice));
+    check(cudaMemcpyAsync(to.ptr,from.ptr,to.size*sizeof(T),cudaMemcpyDeviceToDevice,vcr::device::stream()));
 }
 struct DeviceArray {
     Shape shape;

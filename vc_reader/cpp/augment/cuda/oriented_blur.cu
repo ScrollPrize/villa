@@ -25,7 +25,7 @@ void apply_cuda(const OrientedBlur& t, Sample& s, const Parameters& p, Session& 
             require(f.target.role == Role::Vectors && v.shape.size() == 2 && v.shape[0] >= 1 && v.shape[1] == 3,
                     "OrientedBlur axis_from must name a 3D Vectors target with at least one row");
             int component[3]; for (int j = 0; j < 3; ++j) component[j] = axis(f.target.components[j],3);
-            v.typed([&](auto row) { frame_from_vectors<<<1,1>>>(row.ptr,component[0],component[1],component[2],frame.ptr); });
+            v.typed([&](auto row) { frame_from_vectors<<<1,1,0,vcr::device::stream()>>>(row.ptr,component[0],component[1],component[2],frame.ptr); });
         } else {
             double host[9]; const auto direction = oriented_detail::axis(t,s,c,t.axis_from.empty() ? nullptr : &s.at(t.axis_from).array);
             basis(direction.data(),host); frame.upload(host);
@@ -36,7 +36,7 @@ void apply_cuda(const OrientedBlur& t, Sample& s, const Parameters& p, Session& 
             const double sigma = c.values[pass ? 1 : 0];
             if (sigma <= 0) continue;
             Buffer<double> weights(kernel(sigma));
-            oriented_pass<<<blocks(data.size),256>>>(source,dest,g,frame.ptr,pass,weights.ptr,int(weights.size/2));
+            oriented_pass<<<blocks(data.size),256,0,vcr::device::stream()>>>(source,dest,g,frame.ptr,pass,weights.ptr,int(weights.size/2));
             check(cudaGetLastError()); std::swap(source,dest);
         }
         if (source != data.ptr) copy_device(data,View<T>{source,data.size});

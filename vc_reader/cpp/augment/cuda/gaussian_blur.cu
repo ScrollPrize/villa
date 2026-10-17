@@ -16,7 +16,7 @@ template<class T> void blur_impl(View<T> data, const Grid& grid, const std::vect
         require(sigmas[a] >= 0 && std::isfinite(sigmas[a]) && sigmas[a]*truncate < 100000, "invalid Gaussian sigma");
         if (!sigmas[a]) continue;
         auto host = gaussian_kernel<T>(sigmas[a],truncate,full); Buffer<T> weights(host);
-        convolution<<<blocks(g.size),256>>>(source,dest,g,a,weights.ptr,int(host.size()/2),mirror);
+        convolution<<<blocks(g.size),256,0,vcr::device::stream()>>>(source,dest,g,a,weights.ptr,int(host.size()/2),mirror);
         check(cudaGetLastError()); std::swap(source,dest);
     }
     if (source != data.ptr) copy_device(data,View<T>{source,data.size});

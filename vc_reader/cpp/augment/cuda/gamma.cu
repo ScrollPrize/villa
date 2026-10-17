@@ -20,13 +20,13 @@ template<class T> __global__ void finish_gamma(View<T> data, const Statistics* b
 void apply_cuda(const Gamma& t, Sample& s, const Parameters& p, Session& session) {
     apply_channels(t,s,p,session,[](const auto&, auto v, const Grid&, const ChannelPlan& c) {
         const bool invert = c.values[1], retain = c.values[2];
-        if (invert) invert_kernel<<<blocks(v.size),256>>>(v);
+        if (invert) invert_kernel<<<blocks(v.size),256,0,vcr::device::stream()>>>(v);
         auto before = statistics(v,retain);
-        gamma_kernel<<<blocks(v.size),256>>>(v,before.ptr,c.values[0]);
+        gamma_kernel<<<blocks(v.size),256,0,vcr::device::stream()>>>(v,before.ptr,c.values[0]);
         if (retain) {
             auto after = statistics(v,true);
-            finish_gamma<<<blocks(v.size),256>>>(v,before.ptr,after.ptr,true,invert);
-        } else if (invert) invert_kernel<<<blocks(v.size),256>>>(v);
+            finish_gamma<<<blocks(v.size),256,0,vcr::device::stream()>>>(v,before.ptr,after.ptr,true,invert);
+        } else if (invert) invert_kernel<<<blocks(v.size),256,0,vcr::device::stream()>>>(v);
         check(cudaGetLastError());
     });
 }

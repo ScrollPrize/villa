@@ -39,12 +39,12 @@ inline void bind(nb::module_& m) {
     m.def("_cuda_download",[](Device input,Bytes out) {
         if (input.nbytes()!=out.nbytes()) throw nb::value_error("download size mismatch");
         nb::gil_scoped_release release; device::Guard guard(input.device_id());
-        if (out.nbytes()) device::check(cudaMemcpy(out.data(),input.data(),out.nbytes(),cudaMemcpyDeviceToHost));
+        if (out.nbytes()) { device::check(cudaMemcpyAsync(out.data(),input.data(),out.nbytes(),cudaMemcpyDeviceToHost,device::stream())); device::complete(); }
     });
     m.def("_cuda_upload",[](Host input,int id) {
         device::Storage storage;
         { nb::gil_scoped_release release; device::Guard guard(id); storage=device::allocate(input.nbytes(),id);
-          if (input.nbytes()) device::check(cudaMemcpy(storage->ptr,input.data(),input.nbytes(),cudaMemcpyHostToDevice)); device::complete(); }
+          if (input.nbytes()) device::check(cudaMemcpyAsync(storage->ptr,input.data(),input.nbytes(),cudaMemcpyHostToDevice,device::stream())); device::complete(); }
         storage->exported=true;
         auto* owner=new device::Storage(std::move(storage));
         nb::capsule capsule(owner,[](void* p) noexcept { delete static_cast<device::Storage*>(p); });

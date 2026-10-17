@@ -75,9 +75,9 @@ template<class T> __global__ void quantize_kernel(View<T> data, const T* palette
 }
 template<class T> void quantize_median(View<T> v) {
     Buffer<unsigned long long> table(1024); Buffer<int> counts(2);
-    check(cudaMemsetAsync(table.ptr,255,1024*sizeof(unsigned long long)));
-    check(cudaMemsetAsync(counts.ptr,0,2*sizeof(int)));
-    palette_probe<<<blocks(v.size),256>>>(v,table.ptr,counts.ptr); check(cudaGetLastError());
+    check(cudaMemsetAsync(table.ptr,255,1024*sizeof(unsigned long long),vcr::device::stream()));
+    check(cudaMemsetAsync(counts.ptr,0,2*sizeof(int),vcr::device::stream()));
+    palette_probe<<<blocks(v.size),256,0,vcr::device::stream()>>>(v,table.ptr,counts.ptr); check(cudaGetLastError());
     int result[2]; counts.download(result);
     if (result[0] <= 256 && result[1] != 3) return;
     auto stats = statistics(v); Statistics bounds; stats.download(&bounds);
@@ -86,7 +86,7 @@ template<class T> void quantize_median(View<T> v) {
     std::vector<T> palette(256);
     for (std::size_t i = 0; i < 256; ++i) palette[i] = T(std::lerp(bounds.low,bounds.high,double(i)/255));
     Buffer<T> values(palette);
-    quantize_kernel<<<blocks(v.size),256>>>(v,values.ptr,bounds.low,range); check(cudaGetLastError());
+    quantize_kernel<<<blocks(v.size),256,0,vcr::device::stream()>>>(v,values.ptr,bounds.low,range); check(cudaGetLastError());
 }
 void apply_cuda(const MedianFilter& t, Sample& s, const Parameters& p, Session& session) {
     apply_channels(t,s,p,session,[](const auto& t, auto v, const Grid& grid, const ChannelPlan& c) {
@@ -94,8 +94,8 @@ void apply_cuda(const MedianFilter& t, Sample& s, const Parameters& p, Session& 
         if (c.values[0] == 1) return;
         if (t.quantize) quantize_median(v);
         Buffer<V> out(v.size); Layout g(grid);
-        if (g.dim == 3 && c.values[0] == 3) median3_kernel<<<blocks(g.size),256>>>(v.ptr,out.ptr,g);
-        else median_general<<<blocks(g.size),256>>>(v.ptr,out.ptr,g,int(c.values[0]));
+        if (g.dim == 3 && c.values[0] == 3) median3_kernel<<<blocks(g.size),256,0,vcr::device::stream()>>>(v.ptr,out.ptr,g);
+        else median_general<<<blocks(g.size),256,0,vcr::device::stream()>>>(v.ptr,out.ptr,g,int(c.values[0]));
         check(cudaGetLastError()); copy_device(v,View<V>{out.ptr,v.size});
     });
 }

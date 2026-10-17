@@ -261,17 +261,17 @@ void launch(Source s, const Grid* grids, std::size_t jobs, std::size_t largest,
     if (kind==1 && largest<(std::size_t(1)<<32)) {
         const bool pow2=s.shift[0]>=0 && s.shift[1]>=0 && s.shift[2]>=0;
         if (floating) {
-            if (pow2) sample_affine<float,true><<<blocks,256>>>(s,grids,order,static_cast<float*>(output),valid);
-            else sample_affine<float,false><<<blocks,256>>>(s,grids,order,static_cast<float*>(output),valid);
+            if (pow2) sample_affine<float,true><<<blocks,256,0,vcr::device::stream()>>>(s,grids,order,static_cast<float*>(output),valid);
+            else sample_affine<float,false><<<blocks,256,0,vcr::device::stream()>>>(s,grids,order,static_cast<float*>(output),valid);
         } else {
-            if (pow2) sample_affine<unsigned char,true><<<blocks,256>>>(s,grids,order,static_cast<unsigned char*>(output),valid);
-            else sample_affine<unsigned char,false><<<blocks,256>>>(s,grids,order,static_cast<unsigned char*>(output),valid);
+            if (pow2) sample_affine<unsigned char,true><<<blocks,256,0,vcr::device::stream()>>>(s,grids,order,static_cast<unsigned char*>(output),valid);
+            else sample_affine<unsigned char,false><<<blocks,256,0,vcr::device::stream()>>>(s,grids,order,static_cast<unsigned char*>(output),valid);
         }
         device::check(cudaGetLastError());
         return;
     }
-    if (floating) sample<<<blocks,256>>>(s,grids,points,bits,count,origin,kind,order,static_cast<float*>(output),valid);
-    else sample<<<blocks,256>>>(s,grids,points,bits,count,origin,kind,order,static_cast<unsigned char*>(output),valid);
+    if (floating) sample<<<blocks,256,0,vcr::device::stream()>>>(s,grids,points,bits,count,origin,kind,order,static_cast<float*>(output),valid);
+    else sample<<<blocks,256,0,vcr::device::stream()>>>(s,grids,points,bits,count,origin,kind,order,static_cast<unsigned char*>(output),valid);
     device::check(cudaGetLastError());
 }
 void scatter(const void* staging, void* const* targets, std::size_t count, std::size_t bytes) {
@@ -279,8 +279,8 @@ void scatter(const void* staging, void* const* targets, std::size_t count, std::
     for (std::size_t first=0;first<count;first+=65535) {
         const unsigned n=unsigned(std::min<std::size_t>(count-first,65535));
         // Pool slots and staging offsets are multiples of `bytes` from 256-byte aligned bases.
-        if (bytes%16==0) scatter_blocks<<<n,256>>>(static_cast<const uint4*>(staging)+first*(bytes/16),targets+first,bytes/16);
-        else scatter_blocks<<<n,256>>>(static_cast<const unsigned char*>(staging)+first*bytes,targets+first,bytes);
+        if (bytes%16==0) scatter_blocks<<<n,256,0,vcr::device::stream()>>>(static_cast<const uint4*>(staging)+first*(bytes/16),targets+first,bytes/16);
+        else scatter_blocks<<<n,256,0,vcr::device::stream()>>>(static_cast<const unsigned char*>(staging)+first*bytes,targets+first,bytes);
     }
     device::check(cudaGetLastError());
 }
@@ -291,7 +291,7 @@ void validity(Source s, const Grid* grids, std::size_t jobs, std::size_t largest
     Origin origin{}; if (base) std::copy_n(base,3,origin.v);
     const auto n=kind<2 ? largest : count;
     dim3 blocks(unsigned(std::min<std::size_t>((n+255)/256,65535)),unsigned(kind<2 ? jobs : 1));
-    valid_samples<<<blocks,256>>>(s,grids,points,bits,count,origin,kind,order,resident,static_cast<unsigned char*>(output));
+    valid_samples<<<blocks,256,0,vcr::device::stream()>>>(s,grids,points,bits,count,origin,kind,order,resident,static_cast<unsigned char*>(output));
     device::check(cudaGetLastError());
 }
 void device_grids(const void* origins, int bits, const float* axes, std::size_t jobs,
@@ -300,15 +300,15 @@ void device_grids(const void* origins, int bits, const float* axes, std::size_t 
     Origin extent{}, fixed{}; std::copy_n(shape,3,extent.v);
     if (coordinate_origin) std::copy_n(coordinate_origin,3,fixed.v);
     const unsigned blocks=unsigned(std::min<std::size_t>((jobs+255)/256,65535));
-    if (bits==64) build_grids<<<blocks,256>>>(static_cast<const double*>(origins),axes,jobs,extent,fixed,coordinate_origin!=nullptr,grids);
-    else build_grids<<<blocks,256>>>(static_cast<const float*>(origins),axes,jobs,extent,fixed,coordinate_origin!=nullptr,grids);
+    if (bits==64) build_grids<<<blocks,256,0,vcr::device::stream()>>>(static_cast<const double*>(origins),axes,jobs,extent,fixed,coordinate_origin!=nullptr,grids);
+    else build_grids<<<blocks,256,0,vcr::device::stream()>>>(static_cast<const float*>(origins),axes,jobs,extent,fixed,coordinate_origin!=nullptr,grids);
     device::check(cudaGetLastError());
 }
 void cast(const void* input, void* output, std::size_t n, int in, int out) {
     if (!n) return;
     const unsigned blocks=unsigned(std::min<std::size_t>((n+255)/256,65535));
-    if (in==out) device::check(cudaMemcpyAsync(output,input,n*in,cudaMemcpyDeviceToDevice));
-    else if (in==1 && out==4) convert<<<blocks,256>>>(static_cast<const unsigned char*>(input),static_cast<float*>(output),n);
+    if (in==out) device::check(cudaMemcpyAsync(output,input,n*in,cudaMemcpyDeviceToDevice,vcr::device::stream()));
+    else if (in==1 && out==4) convert<<<blocks,256,0,vcr::device::stream()>>>(static_cast<const unsigned char*>(input),static_cast<float*>(output),n);
     else throw std::invalid_argument("CUDA reader conversion supports uint8 to float32");
     device::check(cudaGetLastError());
 }

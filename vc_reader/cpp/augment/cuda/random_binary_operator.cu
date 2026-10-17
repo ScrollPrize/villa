@@ -19,7 +19,7 @@ void apply_cuda(const RandomBinaryOperator& t, Sample& s, const Parameters& p, S
         // Match the CPU value-based label contract without copying the volume.
         if ((image.kind == 'i' || image.kind == 'u') && image.bytes == 8 && !p.channels.empty()) {
             Buffer<int> invalid(1); int flag = 0; invalid.upload(&flag);
-            check_label_ids<<<blocks(all.size),256>>>(all,invalid.ptr); check(cudaGetLastError());
+            check_label_ids<<<blocks(all.size),256,0,vcr::device::stream()>>>(all,invalid.ptr); check(cudaGetLastError());
             invalid.download(&flag);
             require(!flag,"value-based label transforms require integer IDs within +/- (2**53 - 1)");
         }
@@ -27,12 +27,12 @@ void apply_cuda(const RandomBinaryOperator& t, Sample& s, const Parameters& p, S
             auto f = footprint_offsets(ball(g.dim,c.values[0])); const auto count = f.size;
             Buffer<std::uint8_t> first(g.size),second(g.size);
             auto op = static_cast<Morph>(int(c.values[1]));
-            morphology_kernel<<<blocks(g.size),256>>>(all.ptr+c.channel*g.size,first.ptr,g,f.ptr,count,op == Morph::Dilate || op == Morph::Close);
+            morphology_kernel<<<blocks(g.size),256,0,vcr::device::stream()>>>(all.ptr+c.channel*g.size,first.ptr,g,f.ptr,count,op == Morph::Dilate || op == Morph::Close);
             if (op == Morph::Close || op == Morph::Open) {
-                morphology_kernel<<<blocks(g.size),256>>>(first.ptr,second.ptr,g,f.ptr,count,op == Morph::Open);
+                morphology_kernel<<<blocks(g.size),256,0,vcr::device::stream()>>>(first.ptr,second.ptr,g,f.ptr,count,op == Morph::Open);
                 std::swap(first.ptr,second.ptr);
             }
-            assign_mask<<<blocks(g.size),256>>>(all.ptr,first.ptr,g.size,c.channel,selected.ptr,channels.size());
+            assign_mask<<<blocks(g.size),256,0,vcr::device::stream()>>>(all.ptr,first.ptr,g.size,c.channel,selected.ptr,channels.size());
             check(cudaGetLastError());
         }
     });
