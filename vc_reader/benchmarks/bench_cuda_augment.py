@@ -48,7 +48,7 @@ def main():
     parser.add_argument("--start", nargs=3, type=int)
     parser.add_argument("--additional-start", nargs=3, type=int, action="append", default=[])
     parser.add_argument("--only", default="")
-    parser.add_argument("--chains", action="store_true", help="also benchmark composed spatial and intensity pipelines")
+    parser.add_argument("--chains", action="store_true", help="also benchmark mixed and intensity pipelines")
     parser.add_argument("--reps", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--build-dir", type=Path, required=True)
@@ -64,7 +64,7 @@ def main():
     if args.chains:
         by_name = {c.name:c for c in workload}
         for name, inputs, steps in (
-            ("SpatialChain", "both", ("Elastic", "MedianFilter", "LocalSmoothing", "Gamma", "Contrast")),
+            ("MixedChain", "both", ("Elastic", "MedianFilter", "LocalSmoothing", "Gamma", "Contrast")),
             ("IntensityChain", "image", ("BrightnessMultiply", "GaussianNoise", "BrightnessGradient",
                                          "LocalContrast", "LocalGamma", "GaussianBlur", "Sharpen")),
         ):
@@ -91,7 +91,8 @@ def main():
                   protocol="single CPU thread; seeded shuffled case/backend order; seeds 123+repetition; synchronized public host-to-host API; includes sampling, validation, allocations and all transfers; excludes reads, normalization, output comparison/destruction",
                   reference="CPU default compact=True timed; dense compact=False also checked outside timing. CUDA uses dense buffers. Labels exact, images atol=3e-7 rtol=2e-6; no fast math or reduced precision.",
                   inputs="uint8 CT/255 float32; derived labels CT>.5 int16; continuous median adds fixed normal noise std .01 seed 123",
-                  crops=[], results={c.name:dict(cpu=[],cuda=[],comparisons=[]) for c in workload})
+                  crops=[], results={c.name:dict(transforms=[repr(t) for t in c.native],
+                                                cpu=[],cuda=[],comparisons=[]) for c in workload})
     order = random.Random(20261016)
     with ZarrReader.open(args.array,threads=1) as reader:
         if np.dtype(reader.dtype) != np.dtype("uint8"):

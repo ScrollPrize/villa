@@ -113,11 +113,13 @@ def test_public_cuda_benchmark(tmp_path, monkeypatch, ct_array):
     destination = tmp_path / "cuda.json"
     monkeypatch.setattr(sys, "argv", [
         "bench_cuda_augment.py", "--array", str(ct_array), "--start", "0", "0", "0",
-        "--shape", "7", "7", "7", "--reps", "1", "--warmup", "0",
+        "--shape", "7", "7", "7", "--reps", "1", "--warmup", "0", "--chains",
         "--build-dir", str(tmp_path), "--output", str(destination)])
     bench.main()
     result = json.loads(destination.read_text())
-    assert len(result["results"]) == 25
+    assert len(result["results"]) == 27
+    assert len(result["results"]["MixedChain"]["transforms"]) == 5
+    assert len(result["results"]["IntensityChain"]["transforms"]) == 7
     for row in result["results"].values():
         assert len(row["comparisons"]) == 1
         assert row["cpu"]["p50_ms"] > 0 and row["cuda"]["p50_ms"] > 0

@@ -197,3 +197,27 @@ def test_resident_shape_changes_and_data_dependent_statistics():
             A.BlankRectangle(2,value="mean",count=2),A.LocalContrast(2,factor=.8),
             A.LowResolution(.5),A.RandomBinaryOperator(channels=(0,1),operations=("open",))],
            dict(image=image))
+
+
+@gpu
+@pytest.mark.parametrize("dtype", [np.int64, np.uint64])
+def test_binary_operator_preserves_label_value_validation(dtype):
+    image = np.zeros((1,3,4,5),dtype=np.float32)
+    mask = np.full(image.shape,2**60,dtype=dtype)
+    for backend in ("cpu","cuda"):
+        pipeline = A.Pipeline([A.RandomBinaryOperator(on="mask",radius=1)],backend=backend)
+        with pytest.raises(ValueError,match="value-based label transforms"):
+            pipeline(dict(image=image,mask=mask),seed=123)
+
+
+@gpu
+def test_resident_invocations_have_independent_buffers():
+    from concurrent.futures import ThreadPoolExecutor
+    sample = dict(image=np.random.default_rng(23).uniform(size=(2,7,9,11)).astype(np.float32))
+    pipeline = A.Pipeline([A.Elastic(2,.5),A.LocalGamma(2),A.MedianFilter(3)],backend="cuda")
+    seeds = list(range(8))
+    expected = [pipeline(sample,seed=seed) for seed in seeds]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        actual = list(pool.map(lambda seed: pipeline(sample,seed=seed),seeds))
+    for out, ref in zip(actual,expected):
+        np.testing.assert_array_equal(out["image"],ref["image"])

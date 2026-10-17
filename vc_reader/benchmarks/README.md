@@ -965,6 +965,10 @@ additional continuous-valued median case. It shares the existing benchmark
 case definitions and six PHercParis4 crop locations. It checks every timed
 pair, exact CUDA replay/repeatability, preserved inputs, and an untimed dense
 CPU reference. No Torch, SciPy, new packages, or downloads are required.
+`--chains` also measures a five-step `MixedChain` (Elastic, MedianFilter,
+LocalSmoothing, Gamma, Contrast) and a seven-step intensity pipeline
+(BrightnessMultiply, GaussianNoise, BrightnessGradient, LocalContrast,
+LocalGamma, GaussianBlur, Sharpen), using the same case parameters and checks.
 
 Build with the [CUDA instructions](../docs/augmentation.md#optional-cuda-backend),
 then run from the repository root using the matching Python/extension ABI:
@@ -976,8 +980,8 @@ for edge in 64 128; do
   taskset -c 0 vc_reader/.venv/bin/python -S vc_reader/benchmarks/run_native.py \
     /tmp/vc-augment-cuda/_augment.cpython-314-x86_64-linux-gnu.so \
     vc_reader/benchmarks/bench_cuda_augment.py --shape "$edge" "$edge" "$edge" \
-    --reps 5 --warmup 2 --build-dir /tmp/vc-augment-cuda \
-    --output "vc_reader/benchmarks/results/cuda-augment-$edge.json"
+    --chains --reps 5 --warmup 2 --build-dir /tmp/vc-augment-cuda \
+    --output "vc_reader/benchmarks/results/cuda-resident-$edge.json"
 done
 ```
 
@@ -989,11 +993,11 @@ origins are in `bench_augment_native.py`. Labels are threshold masks, not
 annotations. Image values are float32 uint8/255; the continuous median adds
 fixed Gaussian noise with std .01 and seed 123.
 
-### Measurements: 2026-10-16
+### First-pass baseline: 2026-10-16
 
 Intel Core Ultra 7 270K Plus, RTX 5090, driver 595.84, CUDA 13.3,
-GCC 15.2, Release, `sm_120`,
-`--fmad=false`, no fast math. One CPU thread pinned to CPU 0; five repetitions
+GCC 15.2, Release, `sm_120`. The first pass used
+`--fmad=false`, no fast math, and host round trips between operations. One CPU thread pinned to CPU 0; five repetitions
 per crop (30 observations per case/backend), two warmups; seeded shuffled case
 and backend order. Timings include the public API, CPU sampling/validation,
 all allocations, transfers, and synchronization. Reads, normalization,
@@ -1042,16 +1046,119 @@ saved comparisons from the previous CPU optimization session exactly, using
 `check_augment_build.py /tmp/vc-cpu4-reference --only
 Elastic,LocalSmoothing,LocalGamma,BrightnessGradient,LocalContrast --atol 0 --rtol 0`.
 
-These are host-array measurements. Transfers and allocation outweigh device
-work for many small operations, so CUDA is not universally faster and `auto`
-only checks availability. Local fields, Elastic field construction, reductions,
-validity restoration, and mask-channel conflict resolution still run on CPU.
-GPU-resident chains, wider-median tuning, and other GPUs/architectures have not
-been benchmarked. The CPU default remains available for those workloads.
+This baseline exposed substantial overhead: local fields, Elastic field
+construction, reductions, validity restoration, and mask-channel conflict
+resolution ran on CPU, with intermediate volumes crossing the PCIe bus.
+The resident implementation moves those operations to the GPU and keeps image
+and label arrays there throughout a pipeline call. Default CUDA FMA contraction
+is now allowed; fast math and reduced precision remain disabled.
+
+### Resident pipelines and tuned kernels: 2026-10-16
+
+Final results use the same hardware, six crops, five repetitions per crop,
+and two warmups described above, with `--chains` enabled. Builds, tests,
+profiling, and other benchmarks were not run concurrently with these timings.
+CUDA uses default FMA contraction, double-precision deterministic reductions,
+GPU field expansion/statistics, and stream-ordered scratch allocation.
+Images stay float32/float64 throughout the chain; integer labels retain their
+dtype. There is no uint8 palette conversion between CUDA image transforms.
+
+128³ public API latency, **mean / p50 / p95** in milliseconds:
+
+| Transform / workload | CPU ms | CUDA ms | CPU/CUDA p50 |
+|---|---:|---:|---:|
+| BrightnessMultiply | 1.423 / 1.360 / 1.579 | 1.494 / 1.261 / 2.815 | 1.08× |
+| BrightnessAdd | 1.523 / 1.432 / 1.608 | 1.466 / 1.400 / 1.943 | 1.02× |
+| Contrast | 6.078 / 5.868 / 7.222 | 1.435 / 1.439 / 1.708 | 4.08× |
+| Gamma | 7.408 / 7.902 / 11.580 | 1.653 / 1.528 / 2.938 | 5.17× |
+| Invert | 2.669 / 2.325 / 5.024 | 1.569 / 1.464 / 2.816 | 1.59× |
+| GaussianNoise | 9.677 / 9.540 / 11.133 | 1.483 / 1.419 / 1.706 | 6.72× |
+| RicianNoise | 19.480 / 19.257 / 21.867 | 1.669 / 1.498 / 2.994 | 12.86× |
+| GaussianBlur | 9.752 / 9.513 / 11.174 | 1.721 / 1.623 / 2.045 | 5.86× |
+| MedianFilter | 14.753 / 15.213 / 18.793 | 1.427 / 1.435 / 1.606 | 10.60× |
+| Sharpen | 8.708 / 9.562 / 10.270 | 1.582 / 1.541 / 1.862 | 6.20× |
+| BrightnessGradient | 14.035 / 13.588 / 15.710 | 1.615 / 1.535 / 1.862 | 8.85× |
+| LocalContrast | 8.229 / 7.418 / 10.317 | 1.501 / 1.513 / 1.709 | 4.90× |
+| LocalGamma | 19.084 / 18.270 / 21.212 | 1.613 / 1.575 / 1.963 | 11.60× |
+| LocalSmoothing | 18.210 / 17.722 / 21.479 | 2.445 / 1.883 / 4.257 | 9.41× |
+| BlankRectangle | 0.998 / 0.876 / 2.393 | 1.550 / 1.308 / 3.695 | 0.67× |
+| SliceIllumination | 1.508 / 1.363 / 2.931 | 1.493 / 1.464 / 1.680 | 0.93× |
+| Smear | 9.131 / 9.117 / 10.684 | 1.807 / 1.793 / 2.013 | 5.08× |
+| Flip | 1.599 / 1.520 / 2.128 | 2.903 / 2.603 / 5.113 | 0.58× |
+| Rotate90 | 2.246 / 2.081 / 3.068 | 2.775 / 2.617 / 3.754 | 0.80× |
+| Transpose | 2.241 / 2.043 / 3.025 | 2.961 / 2.613 / 4.602 | 0.78× |
+| Elastic | 85.832 / 85.663 / 86.957 | 4.971 / 4.636 / 5.988 | 18.48× |
+| LowResolution | 9.414 / 8.912 / 10.754 | 1.837 / 1.796 / 1.992 | 4.96× |
+| ThickSlice | 2.561 / 2.303 / 4.003 | 3.123 / 2.873 / 3.909 | 0.80× |
+| RandomBinaryOperator | 26.796 / 26.975 / 30.074 | 1.505 / 1.485 / 1.807 | 18.17× |
+| MedianFilterContinuous | 55.195 / 55.099 / 57.208 | 1.454 / 1.445 / 1.528 | 38.13× |
+| MixedChain | 172.571 / 171.996 / 177.574 | 5.480 / 5.093 / 6.477 | 33.77× |
+| IntensityChain | 48.416 / 49.013 / 50.893 | 2.329 / 2.207 / 2.847 | 22.21× |
+
+Largest improvements over the first CUDA implementation (128³ p50):
+
+| Transform | First CUDA ms | Resident CUDA ms | Improvement |
+|---|---:|---:|---:|
+| Elastic | 42.570 | 4.636 | 9.18× |
+| BrightnessGradient | 17.122 | 1.535 | 11.15× |
+| LocalContrast | 11.653 | 1.513 | 7.70× |
+| LocalGamma | 13.522 | 1.575 | 8.59× |
+| LocalSmoothing | 12.016 | 1.883 | 6.38× |
+| RandomBinaryOperator | 19.393 | 1.485 | 13.06× |
+| MedianFilterContinuous | 3.011 | 1.445 | 2.08× |
+
+The preserved first-pass CUDA binary was also rerun on the two composed
+chains with the same six 128³ crops, five repetitions and two warmups. Its
+SHA-256 matches the first-pass results above. These baseline runs select only
+`MixedChain,IntensityChain`; the final rows come from the complete workload.
+Times are **mean / p50 / p95** in milliseconds:
+
+| Workload | First CUDA ms | Resident CUDA ms | Improvement (p50) |
+|---|---:|---:|---:|
+| MixedChain | 64.987 / 65.823 / 68.924 | 5.480 / 5.093 / 6.477 | 12.92× |
+| IntensityChain | 41.220 / 41.517 / 43.282 | 2.329 / 2.207 / 2.847 | 18.81× |
+
+Exact baseline rerun (using the retained binary, without rebuilding it):
+
+```bash
+bash /tmp/vc-cpu3-run \
+  /tmp/vc-augment-cuda-v1/_augment.cpython-314-x86_64-linux-gnu.so \
+  vc_reader/benchmarks/bench_cuda_augment.py --shape 128 128 128 \
+  --chains --only MixedChain,IntensityChain --reps 5 --warmup 2 \
+  --build-dir /tmp/vc-augment-cuda-v1 \
+  --output vc_reader/benchmarks/results/cuda-first-pass-chains-128.json
+```
+
+`/tmp/vc-cpu3-run` is the single-thread/CPU-0 launcher for `run_native.py`
+shown in the CPU optimization notes; the equivalent explicit launcher is
+used in the main commands above. Baseline build flags are preserved in the
+first-pass JSON, including Release, `sm_120`, and `--fmad=false`.
+
+64³ chain latency, **mean / p50 / p95** in milliseconds:
+
+| Workload | CPU ms | CUDA ms | CPU/CUDA p50 |
+|---|---:|---:|---:|
+| MixedChain | 17.395 / 17.335 / 17.426 | 0.873 / 0.821 / 1.018 | 21.10× |
+| IntensityChain | 4.979 / 4.951 / 4.973 | 0.421 / 0.393 / 0.482 | 12.59× |
+
+All real-data label comparisons remain exact. Across both sizes, maximum
+absolute image error is 2.39e-7 for individual operations and 1.08e-6 for
+composed chains; every comparison passes the unchanged float32 `atol=3e-7`,
+`rtol=2e-6` check. Seeded CUDA repetition and recorded replay remain byte-equal.
+The shared validity-mask fix uses contributing neighbours directly, preventing
+rounding from introducing false holes into an otherwise valid interpolation.
+
+CUDA is still not universally faster for short host-array workloads: standalone
+flips, transposes, rectangle fills, and some slice operations favour CPU.
+Host-array inputs/outputs still require the initial upload and final download.
+`auto` selects by availability, not measured latency. Wider median windows and
+other GPUs/architectures have not been performance-tuned; macOS retains the
+CPU-only build. Sparse/directional/local-coordinate geometry targets retain
+CPU handling as documented in the augmentation API.
 
 ### Profiler and memory checks
 
-Nsight Systems profiled one real 128³ crop at `(8960,4480,3200)`, with Elastic,
+The first-pass Nsight Systems trace used one real 128³ crop at `(8960,4480,3200)`, with Elastic,
 LocalSmoothing, RandomBinaryOperator, and MedianFilterContinuous. Among device
 kernel time, image/label interpolation accounted for 71.8%, convolution 13.3%,
 morphology 8.3%, median 5.4%, and blending 1.1%. Per-launch medians were about
@@ -1061,23 +1168,47 @@ morphology, 58 µs for median, and 13 µs for blending. Device memory copies too
 also paid context startup; profiled timings are excluded from the table above.
 This explains why faster kernels do not guarantee faster host-array pipelines.
 
+The final resident trace uses `MixedChain` on that same crop. Image/label
+interpolation accounts for 45.7% of kernel time, control-lattice expansion
+16.9%, convolution 8.3%, and displacement-gradient statistics 7.7%.
+Median takes about 56 µs per launch. Hoisting Elastic's invariant normalization
+factor reduced its scaling stage from 329 µs to 19 µs (factor plus scale).
+These are profiler observations, separate from uninstrumented API timings.
+
+The harness makes six CUDA calls in this trace, including plan recording,
+replay, repeatability, warmup, and timing. Nsight records exactly six 8 MiB
+image uploads/downloads and six 4 MiB label uploads/downloads: **one of each
+per call, across all five transforms**. Plan recording additionally downloads
+the 48 MiB Elastic field and 16 MiB local field; replay uploads those recorded
+fields once. Ordinary calls generate these fields on device. Each call also
+downloads 32 bytes of statistics for float32 overflow protection.
+
+Validation: 1,561 tests passed (two live-network tests excluded by the existing
+pytest configuration), and the CPU-only augmentation suite passed 868 tests
+with 140 CUDA-dependent skips. All 108 saved CPU reference comparisons remain
+bitwise equal. Focused Compute Sanitizer checks reported **0 errors**: seven
+resident/label/concurrency cases, followed by four chain/validity cases on the
+final index and normalization kernels. The existing standalone CUDA experiment
+also builds and passes its six-crop, edge-7 smoke run with the shared helpers.
+
 ```bash
 /usr/local/cuda/bin/nsys profile --trace=cuda --sample=none --cpuctxsw=none \
-  -o /tmp/vc-augment-cuda-profile \
+  -o /tmp/vc-augment-resident-final-profile \
   taskset -c 0 vc_reader/.venv/bin/python -S vc_reader/benchmarks/run_native.py \
   /tmp/vc-augment-cuda/_augment.cpython-314-x86_64-linux-gnu.so \
   vc_reader/benchmarks/bench_cuda_augment.py --shape 128 128 128 \
   --start 8960 4480 3200 \
-  --only MedianFilterContinuous,Elastic,LocalSmoothing,RandomBinaryOperator \
+  --chains --only MixedChain \
   --reps 1 --warmup 1 --build-dir /tmp/vc-augment-cuda \
-  --output /tmp/vc-augment-cuda-profile.json
+  --output /tmp/vc-augment-resident-final-profile.json
 /usr/local/cuda/bin/nsys stats \
   --report cuda_gpu_kern_sum,cuda_api_sum,cuda_gpu_mem_time_sum \
-  /tmp/vc-augment-cuda-profile.nsys-rep
+  /tmp/vc-augment-resident-final-profile.nsys-rep
 
 /usr/local/cuda/bin/compute-sanitizer --tool memcheck --target-processes all \
   --error-exitcode 99 vc_reader/.venv/bin/python -S \
   vc_reader/benchmarks/run_native.py \
   /tmp/vc-augment-cuda/_augment.cpython-314-x86_64-linux-gnu.so \
-  -m pytest vc_reader/tests/test_augment_cuda.py -q
+  -m pytest vc_reader/tests/test_augment_cuda.py -q \
+  -k 'chain_and_inplace or elastic_dense_validity_support'
 ```

@@ -34,11 +34,14 @@ __global__ void field_energy_gradient(const double* field, double* partial, Layo
     block_reduce(values);
     if (!threadIdx.x) for (int m = 0; m < 10; ++m) partial[blockIdx.x*10+m] = values[m][0];
 }
-__global__ void field_scale(double* field, const double* stats, Layout g, double rms) {
+__global__ void scale_factor(double* stats, Layout g, double rms) {
     double factor = stats[0] ? rms/sqrt(stats[0]/g.size) : 0, limit = 0;
     for (int c = 0; c < g.dim; ++c) limit = fmax(limit,stats[1+3*c]+stats[2+3*c]+stats[3+3*c]);
     if (limit) factor = fmin(factor,.8/limit);
-    EACH_INDEX(g.size*g.dim) field[i] *= factor;
+    stats[0] = factor;
+}
+__global__ void field_scale(double* field, const double* factor, std::size_t n) {
+    EACH_INDEX(n) field[i] *= factor[0];
 }
 Parameters sample_elastic(const Elastic& t, const Sample& s, Random& r, bool record) {
     auto p = geometry(sample_shape(s)); const auto [sigma,magnitude] = elastic_settings(t,r);
@@ -70,7 +73,10 @@ Parameters sample_elastic(const Elastic& t, const Sample& s, Random& r, bool rec
     center_field<<<blocks(data->size),256>>>(data->ptr,stats.ptr,g);
     field_energy_gradient<<<count,256>>>(data->ptr,partial.ptr,g);
     finish_reduce<10><<<1,256>>>(partial.ptr,stats.ptr,count);
-    field_scale<<<blocks(data->size),256>>>(data->ptr,stats.ptr,g,magnitude);
+    // Normalization is invariant across the field. Compute the square root and
+    // gradient cap once, rather than in every voxel/component thread.
+    scale_factor<<<1,1>>>(stats.ptr,g,magnitude);
+    field_scale<<<blocks(data->size),256>>>(data->ptr,stats.ptr,data->size);
     check(cudaGetLastError()); p.device_field = data;
     if (record) { p.field.resize(data->size); data->download(p.field.data()); }
     return p;

@@ -42,7 +42,13 @@ struct Layout {
     explicit Layout(const Grid& g) : size(g.size), dim(int(g.shape.size())) {
         for (int a = 0; a < dim; ++a) { shape[a] = g.shape[a]; stride[a] = g.stride[a]; }
     }
-    __device__ std::size_t coord(std::size_t i, int a) const { return i / stride[a] % shape[a]; }
+    __device__ std::size_t coord(std::size_t i, int a) const {
+        // Patch indices normally fit in 32 bits. Avoid the much more expensive
+        // 64-bit integer division in that case; retain the full-width path for
+        // large volumes. Every caller supplies a spatial index below size.
+        if (size <= 0xffffffffull) return unsigned(i) / unsigned(stride[a]) % unsigned(shape[a]);
+        return i / stride[a] % shape[a];
+    }
 };
 inline unsigned blocks(std::size_t n) { return unsigned(std::min<std::size_t>((n + 255) / 256, 65535)); }
 #define EACH_INDEX(n) for (std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < (n); i += std::size_t(blockDim.x) * gridDim.x)

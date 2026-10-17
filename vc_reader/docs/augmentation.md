@@ -389,18 +389,33 @@ output = pipeline({"image": image, "mask": labels}, seed=123)
 - Inputs and outputs are still NumPy arrays or CPU Torch tensors. CUDA tensors
   are not accepted. Calls are synchronous and preserve inputs by default.
   Profiling includes host/device transfers, allocation, and synchronization.
-- CUDA uses dense buffers, regardless of `compact`. Parameter sampling, local
-  Gaussian fields, Elastic field construction, data-dependent statistics,
-  sparse/directional target handling, and validity restoration reuse CPU code.
-  Device buffers are allocated per operation/channel; chains currently transfer
-  intermediate results back to host. GPU-resident chains are not implemented.
+- CUDA uses dense buffers, regardless of `compact`. Each call uploads images
+  and labels once, keeps them on the GPU across the entire chain, and
+  downloads the final outputs once. Images keep their float32/float64 dtype
+  throughout; the CPU uint8 palette optimization does not split CUDA chains.
+  Integer labels retain their dtype, and binary morphology uses uint8 scratch.
+  Local fields, Elastic field expansion, statistics, and validity restoration
+  run on the GPU. Scratch buffers use
+  CUDA's stream-ordered memory pool where supported, with a portable allocator
+  fallback. Buffers belong to the invocation; concurrent calls do not share data.
+- CPU parameter draws preserve the existing RNG sequence. Small coefficients
+  and control lattices are uploaded as needed. Overflow protection, explicit
+  median quantization, and integer-label validation can read small control
+  values back; they do not download images. Calling `pipeline.sample()` also
+  downloads sampled dense fields so replay plans remain serializable.
+  Sparse points, directional fields, and local coordinate fields retain their
+  existing CPU geometry handling; those specialized targets transfer around
+  spatial operations. Images and labels still stay on the GPU.
 - Seeds, probabilities, channel selection, target routing, interpolation rules,
   float32/float64 precision, integer label IDs, and replay are preserved.
   Replay is exact within the same build/backend/device. CUDA transcendental
   functions can round differently from CPU libm, so cross-backend image outputs
   need not be bitwise identical. Regression checks use float32 `atol=3e-7`,
   `rtol=2e-6`, and float64 `atol=2e-13`, `rtol=2e-12`; integer outputs are exact.
-  CUDA is compiled without fast math and with FMA contraction disabled.
+  CUDA permits FMA contraction and uses deterministic parallel reductions;
+  fast math and reduced precision are not enabled. Validity interpolation
+  checks every nonzero-weight contributor directly on both backends, avoiding
+  false holes caused by comparing a rounded sum with exactly one.
 - The 3D size-3 median shares the CPU selector schedule. Other sizes use a
   general exact rank filter with bounded scratch storage, supporting sizes
   1–63 and even windows. Wider windows are not performance-tuned. Equal-valued
