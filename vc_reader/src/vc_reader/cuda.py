@@ -91,6 +91,26 @@ class DeviceArray:
         return f"DeviceArray(shape={self.shape}, dtype={self.dtype}, device={self.device})"
 
 
+def is_device_array(value):
+    """True for DeviceArray or any CUDA DLPack producer (e.g. a CUDA torch tensor)."""
+    if isinstance(value, DeviceArray):
+        return True
+    describe = getattr(value, "__dlpack_device__", None)
+    try:
+        return describe is not None and describe()[0] == 2
+    except Exception:
+        return False
+
+
+def wrap(value):
+    """DeviceArray view sharing a CUDA DLPack producer's storage (no copy)."""
+    if isinstance(value, DeviceArray):
+        value._ready()
+        return value
+    shape, dtype, device = _native._cuda_describe(value)
+    return DeviceArray(_native._cuda_view(value, shape, 0), shape, np.dtype(dtype), device)
+
+
 def asarray(array, *, device=0):
     """Upload a native-endian NumPy array; no Torch/CuPy dependency."""
     if not is_available():

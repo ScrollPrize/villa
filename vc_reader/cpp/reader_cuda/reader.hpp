@@ -6,7 +6,9 @@
 #include <list>
 #include <set>
 namespace vcr::reader_cuda {
-struct Result { device::Storage storage; std::size_t count; bool floating; };
+// valid: optional uint8 mask, 1 where every neighbour read lies in the volume
+// (and, for source="resident", in a cached brick).
+struct Result { device::Storage storage; std::size_t count; bool floating; device::Storage valid; };
 // One cache per array/device. Requests serialize so eviction cannot invalidate a
 // running kernel. Outputs own independent storage and survive cache/reader close.
 class Reader;
@@ -58,6 +60,11 @@ class Reader {
     } staging_[2];
     device::Storage table_, requests_;
     device::PinnedBuffer table_host_;
+    // Lookup over every cached brick for source="resident"; rebuilt after the
+    // cache changes.
+    device::Storage resident_table_, resident_requests_;
+    Source resident_{};
+    bool resident_dirty_=true;
     std::mutex mutex_;
     std::uint64_t hits_=0, uploads_=0, uploaded_=0, cpu_routes_=0, gpu_routes_=0;
     void ready() const {
@@ -155,6 +162,7 @@ class Reader {
         const auto slot=free_.back(); free_.pop_back(); return slot;
     }
     void drop_all() {
+        resident_dirty_=true;
         cache_.clear(); lru_.clear(); free_.clear();
         for (std::size_t i=slots_;i-->0;) free_.push_back(std::uint32_t(i));
     }
@@ -215,27 +223,30 @@ class Reader {
         }
         std::vector<Miss> misses;
         misses.reserve(missing.size());
+        resident_dirty_ |= !missing.empty();
         for (auto key:missing) {
             const auto slot=take_slot();
             lru_.push_back(key); cache_.emplace(key,Entry{slot,std::prev(lru_.end())});
             misses.push_back({key,slot});
         }
         std::size_t capacity=1; while (capacity<needed.size()*2) capacity*=2;
-        const auto bytes=capacity*(sizeof(std::int64_t)+sizeof(void*));
+        const auto bytes=capacity*sizeof(Slot);
         table_host_.reserve(bytes); reserve(table_,bytes);
-        auto* keys=reinterpret_cast<std::int64_t*>(table_host_.data());
-        auto* pointers=reinterpret_cast<const unsigned char**>(keys+capacity);
-        std::fill_n(keys,capacity,-1);
-        for (auto key:needed) {
-            auto slot=(std::uint64_t(key)*UINT64_C(0x9e3779b97f4a7c15))&(capacity-1);
-            while (keys[slot]>=0) slot=(slot+1)&(capacity-1);
-            keys[slot]=key; pointers[slot]=slot_pointer(cache_.at(key).slot);
-        }
+        auto* table=reinterpret_cast<Slot*>(table_host_.data());
+        fill_table(table,capacity,needed);
         // The previous request completed before returning, so the pinned table is free.
         device::check(cudaMemcpyAsync(table_->ptr,table_host_.data(),bytes,cudaMemcpyHostToDevice,0));
-        source_.mask=capacity-1; source_.keys=static_cast<const std::int64_t*>(table_->ptr);
-        source_.pointers=reinterpret_cast<const unsigned char* const*>(source_.keys+capacity);
+        source_.mask=capacity-1; source_.table=static_cast<const Slot*>(table_->ptr);
         return misses;
+    }
+    template<class Keys> void fill_table(Slot* table, std::size_t capacity, const Keys& keys) const {
+        std::fill_n(table,capacity,Slot{-1,nullptr});
+        for (const auto& item:keys) {
+            const std::int64_t key=[&] { if constexpr (std::is_integral_v<std::decay_t<decltype(item)>>) return item; else return item.first; }();
+            auto slot=home_slot(key,capacity-1);
+            while (table[slot].key>=0) slot=(slot+1)&(capacity-1);
+            table[slot]={key,slot_pointer(cache_.at(key).slot)};
+        }
     }
     // Runs device work through the final synchronization. A failure, including
     // an asynchronous one, may leave admitted bricks unfilled: drain and drop them.
@@ -256,7 +267,10 @@ class Reader {
         std::size_t missing=0; for (auto key:needed) missing+=!cache_.count(key);
         return route=="cpu" || !fits || (route=="auto" && kind==0 && missing>count/brick_bytes_);
     }
-    Result output(std::size_t n, bool floating) { return {device::allocate(n*(floating ? 4 : 1),device_),n,floating}; }
+    Result output(std::size_t n, bool floating, bool valid=false) {
+        return {device::allocate(n*(floating ? 4 : 1),device_),n,floating,valid ? device::allocate(n,device_) : nullptr};
+    }
+    static void* mask(const Result& r) { return r.valid ? r.valid->ptr : nullptr; }
 public:
     Reader(Array& array, std::size_t budget, int device) : array_(array),device_(device),budget_(budget) {
         const auto& spec=array.spec();
@@ -282,10 +296,10 @@ public:
     int device_id() const { return device_; }
     void clear() {
         ready(); std::lock_guard lock(mutex_); device::Guard guard(device_);
-        cache_.clear(); lru_.clear(); free_.clear(); segments_.clear(); slots_=0; device::complete();
+        cache_.clear(); lru_.clear(); free_.clear(); segments_.clear(); slots_=0; resident_dirty_=true; device::complete();
     }
     std::vector<std::uint64_t> stats() { ready(); std::lock_guard lock(mutex_); return {cache_.size()*brick_bytes_,budget_,hits_,uploads_,uploaded_,cpu_routes_,gpu_routes_}; }
-    Result grids(std::vector<Grid> grids, int kind, int order, bool floating, const std::string& route) {
+    Result grids(std::vector<Grid> grids, int kind, int order, bool floating, const std::string& route, bool valid=false) {
         ready(); std::lock_guard lock(mutex_); device::Guard guard(device_);
         if (grids.size()>65535 || (kind!=0 && kind!=1) || (order!=0 && order!=1) || (kind==1 && order==1 && !floating)) throw std::invalid_argument("invalid CUDA grid request");
         std::set<std::int64_t> needed;
@@ -345,7 +359,7 @@ public:
             std::sort(all.begin(),all.end()); all.erase(std::unique(all.begin(),all.end()),all.end());
             needed.insert(all.begin(),all.end());
         }
-        auto result=output(total,floating);
+        auto result=output(total,floating,valid);
         if (!total) return result;
         if (route_cpu(needed,total,kind,route)) {
             ++cpu_routes_;
@@ -361,6 +375,13 @@ public:
             if (floating && (kind==0 || !order)) {
                 reserve(requests_,total); device::check(cudaMemcpy(requests_->ptr,host.data(),total,cudaMemcpyHostToDevice)); cast(requests_->ptr,result.storage->ptr,total,1,4);
             } else device::check(cudaMemcpy(result.storage->ptr,host.data(),host.size(),cudaMemcpyHostToDevice));
+            if (valid) {
+                // CPU-sampled crops: geometric validity from the same descriptors.
+                std::size_t widest=0; for (const auto& g:grids) widest=std::max(widest,g.count);
+                reserve(requests_,grids.size()*sizeof(Grid));
+                device::check(cudaMemcpy(requests_->ptr,grids.data(),grids.size()*sizeof(Grid),cudaMemcpyHostToDevice));
+                validity(source_,static_cast<const Grid*>(requests_->ptr),grids.size(),widest,nullptr,0,total,nullptr,kind,order,false,mask(result));
+            }
         } else {
             ++gpu_routes_;
             guarded([&] {
@@ -385,7 +406,7 @@ public:
                 const auto sample=[&](std::size_t uploaded) {
                     std::size_t end=launched, widest=0;
                     for (;end<grids.size() && after[end]<=uploaded;++end) widest=std::max(widest,grids[end].count);
-                    if (widest) launch(source_,device_grids+launched,end-launched,widest,nullptr,0,total,nullptr,kind,order,floating,result.storage->ptr);
+                    if (widest) launch(source_,device_grids+launched,end-launched,widest,nullptr,0,total,nullptr,kind,order,floating,result.storage->ptr,mask(result));
                     launched=end;
                 };
                 sample(0);
@@ -393,6 +414,68 @@ public:
             });
             return result;
         }
+        device::complete(); return result;
+    }
+private:
+    const Source& resident_source() {
+        if (!resident_dirty_) return resident_;
+        std::size_t capacity=1; while (capacity<std::max<std::size_t>(1,cache_.size())*2) capacity*=2;
+        std::vector<Slot> table(capacity); fill_table(table.data(),capacity,cache_);
+        reserve(resident_table_,capacity*sizeof(Slot));
+        // Synchronous: earlier resident kernels may still read the old table.
+        device::complete();
+        device::check(cudaMemcpy(resident_table_->ptr,table.data(),capacity*sizeof(Slot),cudaMemcpyHostToDevice));
+        resident_=source_; resident_.mask=capacity-1; resident_.table=static_cast<const Slot*>(resident_table_->ptr);
+        resident_dirty_=false; return resident_;
+    }
+    // Validates crop shapes/origins and assigns offsets; returns the total count.
+    static std::size_t layout(std::vector<Grid>& grids) {
+        std::size_t total=0;
+        for (auto& g:grids) {
+            g.count=1; g.offset=total;
+            for (int a=0;a<3;++a) {
+                if (g.shape[a]<0 || g.shape[a]>(1LL<<24) || (g.shape[a] && g.count>SIZE_MAX/4/std::size_t(g.shape[a]))) throw std::invalid_argument("invalid crop shape");
+                g.count*=g.shape[a];
+            }
+            if (g.count>SIZE_MAX/4-total) throw std::invalid_argument("batch size overflow");
+            total+=g.count;
+        }
+        return total;
+    }
+public:
+    // Loads the bricks of voxel boxes without producing output.
+    void warm(std::vector<Grid> boxes) {
+        ready(); std::lock_guard lock(mutex_); device::Guard guard(device_);
+        std::set<std::int64_t> needed;
+        for (const auto& g:boxes) box(needed,g.base,g.shape);
+        if (needed.size()>capacity_) throw std::invalid_argument("warm regions exceed CUDA chunk-cache budget; increase cache_bytes");
+        guarded([&] { upload(admit(needed),[](std::size_t) {}); });
+    }
+    // Device-coordinate sampling from resident bricks only: no planning, no
+    // host transfer of coordinates. Missing bricks read as fill.
+    Result points_resident(const void* points, std::size_t count, int bits, const Index& base, int kind, int order, bool valid) {
+        ready(); std::lock_guard lock(mutex_); device::Guard guard(device_);
+        if ((kind!=2 && kind!=3) || (kind==2 && bits!=32) || (bits!=32 && bits!=64) || (order!=0 && order!=1)) throw std::invalid_argument("invalid point request");
+        const bool floating=kind==2 && order; auto result=output(count,floating,valid);
+        if (!count) return result;
+        launch(resident_source(),nullptr,0,0,points,bits,count,base.data(),kind,order,floating,result.storage->ptr,mask(result));
+        device::complete(); return result;
+    }
+    // Affine crops of one shape from device origins/axes, resident bricks only.
+    // Returns samples and, with valid, their validity (residency included).
+    Result affine_resident(const void* origins, int bits, const float* axes, std::size_t jobs,
+            const std::int64_t* shape, const std::int64_t* coordinate_origin, int order, bool floating, bool valid) {
+        ready(); std::lock_guard lock(mutex_); device::Guard guard(device_);
+        if (jobs>65535 || (order!=0 && order!=1) || (order==1 && !floating)) throw std::invalid_argument("invalid CUDA affine request");
+        std::size_t count=1; for (int a=0;a<3;++a) { if (shape[a]<0 || shape[a]>(1LL<<24)) throw std::invalid_argument("invalid crop shape"); count*=std::size_t(shape[a]); }
+        if (jobs && count>SIZE_MAX/4/jobs) throw std::invalid_argument("batch size overflow");
+        auto result=output(jobs*count,floating,valid);
+        if (!jobs || !count) return result;
+        const auto& source=resident_source();
+        reserve(resident_requests_,jobs*sizeof(Grid));
+        auto* grids=static_cast<Grid*>(resident_requests_->ptr);
+        device_grids(origins,bits,axes,jobs,shape,coordinate_origin,grids);
+        launch(source,grids,jobs,count,nullptr,0,jobs*count,nullptr,1,order,floating,result.storage->ptr,mask(result));
         device::complete(); return result;
     }
 private:
@@ -442,9 +525,9 @@ private:
         return needed;
     }
     Result execute_points(const void* points, std::size_t count, int bits, const Index& base, int kind, int order,
-                          const std::set<std::int64_t>& needed, const void* resident, const std::string& route) {
+                          const std::set<std::int64_t>& needed, const void* resident, const std::string& route, bool valid) {
         const bool floating=kind==2 && order;
-        auto result=output(count,floating); if (!count) return result;
+        auto result=output(count,floating,valid); if (!count) return result;
         if (route_cpu(needed,count,kind,route)) {
             ++cpu_routes_; std::vector<std::uint8_t> host(count*(floating ? 4 : 1));
             if (kind==2) {
@@ -457,6 +540,11 @@ private:
                 array_.read_points(ptr,count,host.data());
             }
             device::check(cudaMemcpy(result.storage->ptr,host.data(),host.size(),cudaMemcpyHostToDevice));
+            if (valid) {
+                const auto bytes=count*3*(bits/8); reserve(requests_,bytes);
+                if (!resident) device::check(cudaMemcpy(requests_->ptr,points,bytes,cudaMemcpyHostToDevice));
+                validity(source_,nullptr,0,0,resident ? resident : requests_->ptr,bits,count,base.data(),kind,order,false,mask(result));
+            }
         } else {
             ++gpu_routes_;
             guarded([&] {
@@ -466,17 +554,17 @@ private:
                     device::check(cudaMemcpy(requests_->ptr,points,bytes,cudaMemcpyHostToDevice));
                     resident=requests_->ptr;
                 }
-                launch(source_,nullptr,0,0,resident,bits,count,base.data(),kind,order,floating,result.storage->ptr);
+                launch(source_,nullptr,0,0,resident,bits,count,base.data(),kind,order,floating,result.storage->ptr,mask(result));
             });
             return result;
         }
         device::complete(); return result;
     }
 public:
-    Result points(const void* points, std::size_t count, int bits, const Index& base, int kind, int order, const std::string& route) {
+    Result points(const void* points, std::size_t count, int bits, const Index& base, int kind, int order, const std::string& route, bool valid=false) {
         ready(); std::lock_guard lock(mutex_); device::Guard guard(device_);
         const auto needed=discover_points(points,count,bits,base,kind,order);
-        return execute_points(points,count,bits,base,kind,order,needed,nullptr,route);
+        return execute_points(points,count,bits,base,kind,order,needed,nullptr,route,valid);
     }
     std::shared_ptr<PointPlan> prepare_points(const void* points, std::size_t count, int bits, const Index& base, int kind, int order) {
         ready(); std::lock_guard lock(mutex_); device::Guard guard(device_);
@@ -489,10 +577,10 @@ public:
         if (bytes) device::check(cudaMemcpy(plan->coordinates->ptr,points,bytes,cudaMemcpyHostToDevice));
         device::complete(); return plan;
     }
-    Result read_plan(const PointPlan& plan, const std::string& route) {
+    Result read_plan(const PointPlan& plan, const std::string& route, bool valid=false) {
         ready(); std::lock_guard lock(mutex_); device::Guard guard(device_);
         if (plan.owner!=this) throw std::invalid_argument("point plan belongs to another reader");
-        return execute_points(plan.host.data(),plan.count,plan.bits,plan.base,plan.kind,plan.order,plan.needed,plan.coordinates->ptr,route);
+        return execute_points(plan.host.data(),plan.count,plan.bits,plan.base,plan.kind,plan.order,plan.needed,plan.coordinates->ptr,route,valid);
 
     }
 };

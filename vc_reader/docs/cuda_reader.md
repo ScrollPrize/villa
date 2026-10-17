@@ -120,6 +120,51 @@ nonoverlapping views into one contiguous device output allocation. Empty crops,
 missing chunks, out-of-volume neighbors and fill values follow CPU semantics.
 Integer gathers never convert their indices to floating point.
 
+## Validity masks, batches and device-resident coordinates
+
+Every read accepts `valid=True` and then also returns uint8 masks of the same
+shape: 1 where every neighbour the sample reads (nonzero linear weights, or the
+nearest voxel) lies inside the volume. For boxes this is a padding mask. GPU
+routes produce the mask in the sampling pass; CPU routes evaluate the same
+float32 geometry in a separate kernel.
+
+```python
+crops, masks = gpu.read_affine_many(grids, valid=True)
+batch = gpu.read_affine_batch((144, 128, 128), origins, axes)     # one (B, 144, 128, 128) array
+values, valid = gpu.sample(points, valid=True)
+```
+
+`read_affine_batch(shape, origins, axes)` takes `(B, 3)` origins and
+`(B, 3, 3)` axes and returns one contiguous `(B, *shape)` array. Origins, axes
+and `sample`/`read_points` coordinates may be CUDA arrays (`DeviceArray`, or any
+DLPack producer such as a CUDA torch tensor):
+
+- `source="resident"` samples them in place from bricks already in the cache:
+  no brick planning and no coordinate transfer. Bricks that are not resident
+  read as the fill value and are 0 in the validity mask. Load regions first
+  with `gpu.warm([(start, size), ...])` (which raises if they exceed the
+  budget); resident reads never load or evict. Device point coordinates are
+  absolute float32 unless `coordinate_origin` is given; float64 device origins
+  are split into an integer origin and float32 offsets on the GPU.
+- Other sources copy CUDA coordinates to the host (a synchronizing download of
+  the small coordinate arrays) and plan brick loads as usual.
+
+Brick lookup tables use Fibonacci hashing of the high product bits, with keys
+and pointers interleaved. The previous low-bit hash mapped bricks one z-slice
+of bricks apart (a power-of-two key stride on 8174-wide volumes) to the same
+home slot, lengthening linear probes. On PHercParis4 level 2 (RTX 5090), 32
+oblique 144×128×128 crops from cached bricks:
+
+| Path | Before | After |
+| --- | ---: | ---: |
+| `read_affine_many`, cached bricks (8 batches, p50) | 7.08 ms | 2.85 ms |
+| `read_affine_batch`, host frames, warmed (15 reps, p50) | 4.18 ms | 2.43 ms |
+| `read_affine_batch`, device frames, `source="resident"` | — | 2.13 ms |
+| ... with `valid=True` | — | 2.31 ms |
+
+Outputs are unchanged: SHA-256 over 8 batches of 32 crops and 64,000 points at
+both orders matches the previous build.
+
 ## Precision
 
 The default **3-D uint8 CPU path and CUDA path use float32** geometry, weights

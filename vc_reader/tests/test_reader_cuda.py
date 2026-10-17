@@ -318,3 +318,87 @@ def test_bricked_affine_footprints(bricked, order):
         np.testing.assert_allclose(gpu.read_affine(*small, source='chunks').numpy(), bricked.read_affine(*small), atol=5e-5, rtol=1e-6)
         # A small interior crop needs one 32**3 brick, not its whole 64**3 chunk.
         assert gpu.stats['uploaded_bytes'] - before == 32 ** 3
+
+
+def _reference_valid(points, shape, order):
+    """1 when every neighbour read lies in the volume (float64 reference)."""
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    ok = np.isfinite(pts).all(axis=1)
+    for a in range(3):
+        c = np.where(np.isfinite(pts[:, a]), pts[:, a], 0)
+        if order:
+            low = np.floor(c); up = np.where(c > low, low + 1, low)
+            ok &= (low >= 0) & (up < shape[a])
+        else:
+            near = np.floor(c); f = c - near
+            near = near + ((f > .5) | ((f == .5) & (near % 2 != 0)))
+            ok &= (near >= 0) & (near < shape[a])
+    return ok.astype(np.uint8)
+
+
+@pytest.mark.parametrize('source', ['chunks', 'cpu'])
+@pytest.mark.parametrize('order', [0, 1])
+def test_validity_masks(reader, order, source):
+    shape = reader.shape
+    with reader.cuda() as r:
+        boxes, masks = r.read_many([((-2, 1, 2), (4, 6, 7)), ((7, 8, 9), (4, 5, 6))], valid=True, source=source)
+        for (start, size), m in zip([((-2, 1, 2), (4, 6, 7)), ((7, 8, 9), (4, 5, 6))], masks):
+            coords = np.stack(np.meshgrid(*[np.arange(s, s + n) for s, n in zip(start, size)], indexing='ij'), -1)
+            np.testing.assert_array_equal(m.numpy(), _reference_valid(coords, shape, 0).reshape(size))
+        grids = [((4, 5, 6), [2.25, -.5, 3.75], [[.8, .1, 0], [.1, .9, .2], [0, .2, -.8]]), ((2, 3, 4), [7.5, 8, 9], np.eye(3))]
+        crops, masks = r.read_affine_many(grids, order=order, valid=True, source=source)
+        for (size, origin, axes), m in zip(grids, masks):
+            idx = np.stack(np.meshgrid(*[np.arange(n) for n in size], indexing='ij'), -1).reshape(-1, 3)
+            coords = np.asarray(origin, np.float32) + idx.astype(np.float32) @ np.asarray(axes, np.float32).T
+            np.testing.assert_array_equal(m.numpy().reshape(-1), _reference_valid(coords, shape, order))
+        pts = np.concatenate([np.random.default_rng(3).uniform(-2, 12, (500, 3)), [[np.nan, 0, 0], [8, 9, 10], [8, 9, 10.5]]])
+        values, mask = r.sample(pts, order=order, valid=True, source=source)
+        np.testing.assert_array_equal(mask.numpy(), _reference_valid(pts.astype(np.float32), shape, order))
+        ints = np.array([[0, 0, 0], [8, 9, 10], [9, 0, 0], [-1, 2, 2]], np.int64)
+        np.testing.assert_array_equal(r.read_points(ints, valid=True, source=source)[1].numpy(), [1, 1, 0, 0])
+        request = r.prepare_points(pts, order=order)
+        np.testing.assert_array_equal(request.read(valid=True, source=source)[1].numpy(), mask.numpy())
+
+
+@pytest.mark.parametrize('order', [0, 1])
+def test_resident_device_frames_and_points(reader, order):
+    torch = pytest.importorskip('torch')
+    if not torch.cuda.is_available():
+        pytest.skip('torch CUDA unavailable')
+    rng = np.random.default_rng(11)
+    origins = rng.uniform(0, 5, (6, 3))
+    axes = np.stack([np.linalg.qr(rng.normal(size=(3, 3)))[0] for _ in range(6)]).astype(np.float32)
+    with reader.cuda(cache_bytes=1 << 20) as r:
+        expected = r.read_affine_batch((3, 4, 5), origins, axes, order=order).numpy()
+        # Resident sampling before warming reads fill and reports invalid.
+        r.clear_cache()
+        cold, cold_mask = r.read_affine_batch((3, 4, 5), torch.as_tensor(origins, device='cuda'),
+                                              torch.as_tensor(axes, device='cuda'), order=order, source='resident', valid=True)
+        assert not cold_mask.numpy().any()
+        r.warm([((0, 0, 0), reader.shape)])
+        uploads = r.stats['chunk_uploads']
+        for origin_dtype in (torch.float32, torch.float64):
+            batch, mask = r.read_affine_batch((3, 4, 5), torch.as_tensor(origins, dtype=origin_dtype, device='cuda'),
+                                              torch.as_tensor(axes, device='cuda'), order=order, source='resident', valid=True)
+            assert batch.shape == (6, 3, 4, 5)
+            np.testing.assert_allclose(batch.numpy(), expected, atol=5e-5, rtol=1e-6)
+            _, host_mask = r.read_affine_batch((3, 4, 5), origins, axes, order=order, valid=True)
+            np.testing.assert_array_equal(mask.numpy(), host_mask.numpy())
+        assert r.stats['chunk_uploads'] == uploads  # resident reads never load
+        pts = rng.uniform(-1, 11, (300, 3)).astype(np.float32)
+        device_pts = torch.as_tensor(pts, device='cuda')
+        values, mask = r.sample(device_pts, order=order, source='resident', valid=True)
+        np.testing.assert_allclose(values.numpy(), r.sample(pts, order=order).numpy(), atol=5e-5, rtol=1e-6)
+        np.testing.assert_array_equal(mask.numpy(), r.sample(pts, order=order, valid=True)[1].numpy())
+        # Non-resident sources accept device coordinates through a host copy.
+        np.testing.assert_allclose(r.sample(device_pts, order=order).numpy(), r.sample(pts, order=order).numpy(), atol=5e-5)
+        ints = torch.as_tensor([[0, 0, 0], [8, 9, 10], [9, 0, 0]], device='cuda')
+        np.testing.assert_array_equal(r.read_points(ints, source='resident').numpy(), r.read_points(ints.cpu().numpy()).numpy())
+
+
+def test_warm_budget_and_resident_errors(reader):
+    with reader.cuda(cache_bytes=600) as r:  # ten 60-byte bricks; the volume has 24
+        with pytest.raises(ValueError, match='budget'):
+            r.warm([((0, 0, 0), reader.shape)])
+        with pytest.raises(ValueError, match='resident'):
+            r.read_affine_many([((2, 2, 2), [0, 0, 0], np.eye(3))], source='resident')
