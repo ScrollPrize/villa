@@ -7,6 +7,9 @@ import logging
 import math
 import shutil
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -397,8 +400,12 @@ class FlatPatchReader:
         layer_indices: np.ndarray,
         output_depth: int,
         preprocessing: str,
+        chunk_cache_size: int = 0,
     ) -> None:
         self.input_path = input_path
+        self.chunk_cache_size = max(0, int(chunk_cache_size))
+        self._chunk_cache: OrderedDict[tuple[int, int], np.ndarray] = OrderedDict()
+        self._chunk_lock = threading.Lock()
         self.resolution = str(resolution)
         self.depth_axis_first = bool(depth_axis_first)
         self.height = int(height)
@@ -430,15 +437,72 @@ class FlatPatchReader:
     def __getstate__(self):
         state = dict(self.__dict__)
         state["_array"] = None
+        state["_chunk_cache"] = OrderedDict()
+        state["_chunk_lock"] = None
         return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._chunk_lock = threading.Lock()
 
     def _ensure_array(self):
         if self._array is None:
             self._array = open_volume(self.input_path, self.resolution)
         return self._array
 
+    def _cached_chunk(self, array, row: int, col: int) -> np.ndarray:
+        """Return one Z-cropped source chunk, decoding it at most once while cached."""
+
+        key = (row, col)
+        with self._chunk_lock:
+            chunk = self._chunk_cache.get(key)
+            if chunk is not None:
+                self._chunk_cache.move_to_end(key)
+                return chunk
+        _, chunk_h, chunk_w = array.chunks
+        chunk = np.asarray(
+            array[
+                self._z_start : self._z_stop,
+                row * chunk_h : min(self.height, (row + 1) * chunk_h),
+                col * chunk_w : min(self.width, (col + 1) * chunk_w),
+            ]
+        )
+        with self._chunk_lock:
+            self._chunk_cache[key] = chunk
+            if len(self._chunk_cache) > self.chunk_cache_size:
+                self._chunk_cache.popitem(last=False)
+        return chunk
+
+    def _read_raw_cached(self, array, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
+        """Assemble a Z/Y/X block from cached chunks; overlapping patches share decodes."""
+
+        _, chunk_h, chunk_w = array.chunks
+        block = np.empty(
+            (self._z_stop - self._z_start, y1 - y0, x1 - x0), dtype=array.dtype
+        )
+        for row in range(y0 // chunk_h, (y1 - 1) // chunk_h + 1):
+            for col in range(x0 // chunk_w, (x1 - 1) // chunk_w + 1):
+                chunk = self._cached_chunk(array, row, col)
+                cy0, cx0 = row * chunk_h, col * chunk_w
+                iy0, iy1 = max(y0, cy0), min(y1, cy0 + chunk.shape[1])
+                ix0, ix1 = max(x0, cx0), min(x1, cx0 + chunk.shape[2])
+                block[:, iy0 - y0 : iy1 - y0, ix0 - x0 : ix1 - x0] = chunk[
+                    :, iy0 - cy0 : iy1 - cy0, ix0 - cx0 : ix1 - cx0
+                ]
+        return block
+
     def _read_raw(self, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
         array = self._ensure_array()
+        if (
+            self.chunk_cache_size
+            and self.depth_axis_first
+            and self._read_mode in {"ascending", "descending"}
+            and getattr(array, "chunks", None) is not None
+        ):
+            block = self._read_raw_cached(array, y0, y1, x0, x1)
+            if self._read_mode == "descending":
+                block = block[::-1]
+            return np.transpose(block, (1, 2, 0))
         if self.depth_axis_first:
             if self._read_mode == "ascending":
                 block = array[self._z_start : self._z_stop, y0:y1, x0:x1]
@@ -730,6 +794,50 @@ class ChunkAccumulator:
             self._flush(key)
 
 
+class ThreadedBatchLoader:
+    """Ordered batches read by a thread pool, avoiding spawn-worker startup.
+
+    Spawned DataLoader workers re-import torch and vesuvius before their first
+    batch, which costs tens of seconds on Windows. Zarr reads and the uint8
+    copies here release the GIL, so threads overlap them with GPU work.
+    """
+
+    def __init__(self, dataset: Dataset, *, batch_size: int, num_threads: int, prefetch_batches: int) -> None:
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.num_threads = max(1, int(num_threads))
+        self.prefetch_batches = max(1, int(prefetch_batches))
+
+    def __len__(self) -> int:
+        return math.ceil(len(self.dataset) / self.batch_size)
+
+    def _load(self, start: int):
+        items = [
+            self.dataset[index]
+            for index in range(start, min(len(self.dataset), start + self.batch_size))
+        ]
+        images, metadata = zip(*items)
+        images_BCZYX = torch.stack(images)
+        if torch.cuda.is_available():
+            images_BCZYX = images_BCZYX.pin_memory()
+        return images_BCZYX, torch.stack(metadata)
+
+    def __iter__(self):
+        starts = iter(range(0, len(self.dataset), self.batch_size))
+        with ThreadPoolExecutor(max_workers=self.num_threads) as pool:
+            pending = []
+            for start in starts:
+                pending.append(pool.submit(self._load, start))
+                if len(pending) >= self.num_threads * self.prefetch_batches:
+                    break
+            while pending:
+                batch = pending.pop(0).result()
+                start = next(starts, None)
+                if start is not None:
+                    pending.append(pool.submit(self._load, start))
+                yield batch
+
+
 def run_block_inference(
     *,
     loader: DataLoader,
@@ -1012,6 +1120,7 @@ def infer_single_zarr(
         layer_indices=layer_indices,
         output_depth=configured_model.input_depth,
         preprocessing=configured_model.preprocessing,
+        chunk_cache_size=args.chunk_cache_size,
     )
     mask = (
         None
@@ -1077,7 +1186,15 @@ def infer_single_zarr(
             prefetch_factor=args.prefetch_factor,
             multiprocessing_context="spawn",
         )
-    loader = DataLoader(**loader_kwargs)
+    if args.loader_threads > 0:
+        loader = ThreadedBatchLoader(
+            dataset,
+            batch_size=effective_batch_size,
+            num_threads=args.loader_threads,
+            prefetch_batches=args.prefetch_factor,
+        )
+    else:
+        loader = DataLoader(**loader_kwargs)
     weight_map = compute_importance_map_2d(
         patch_size=(patch_size, patch_size), mode=blend_mode
     ).numpy()
@@ -1095,16 +1212,26 @@ def infer_single_zarr(
             min(tile_shape[0], height),
             min(tile_shape[1], width),
         )
-        probability_sum = open_temp_zarr_array(
-            temporary / "probability.zarr",
-            shape=(height, width),
-            chunks=accumulation_chunks,
-        )
-        weight_sum = open_temp_zarr_array(
-            temporary / "weight.zarr",
-            shape=(height, width),
-            chunks=accumulation_chunks,
-        )
+        accumulation_bytes = 2 * 4 * height * width
+        if accumulation_bytes <= args.max_ram_accumulation_gb * 1024**3:
+            # Two float32 planes in RAM avoid one temp-zarr write per chunk
+            # here and one read per chunk when the TIFF is encoded.
+            LOGGER.info(
+                "Accumulating in RAM (%.2f GiB)", accumulation_bytes / 1024**3
+            )
+            probability_sum = np.zeros((height, width), dtype=np.float32)
+            weight_sum = np.zeros((height, width), dtype=np.float32)
+        else:
+            probability_sum = open_temp_zarr_array(
+                temporary / "probability.zarr",
+                shape=(height, width),
+                chunks=accumulation_chunks,
+            )
+            weight_sum = open_temp_zarr_array(
+                temporary / "weight.zarr",
+                shape=(height, width),
+                chunks=accumulation_chunks,
+            )
         accumulator = ChunkAccumulator(
             shape=(height, width),
             chunk_shape=accumulation_chunks,
@@ -1311,6 +1438,27 @@ def parse_args(argv: Sequence[str] | None = None):
     )
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument(
+        "--max-ram-accumulation-gb",
+        type=float,
+        default=2.0,
+        help="Keep the float32 probability/weight sums in RAM when they fit "
+        "in this many GiB; larger outputs use temporary Zarr arrays",
+    )
+    parser.add_argument(
+        "--loader-threads",
+        type=int,
+        default=0,
+        help="Read patches with this many threads instead of spawned "
+        "--num-workers processes (avoids per-worker import cost on Windows)",
+    )
+    parser.add_argument(
+        "--chunk-cache-size",
+        type=int,
+        default=256,
+        help="Decoded source chunks kept per loader worker so overlapping "
+        "patches reuse reads (0 disables)",
+    )
+    parser.add_argument(
         "--overlap",
         type=float,
         default=DEFAULT_OVERLAP,
@@ -1348,6 +1496,10 @@ def parse_args(argv: Sequence[str] | None = None):
         parser.error("--num-workers must be nonnegative")
     if args.prefetch_factor <= 0:
         parser.error("--prefetch-factor must be positive")
+    if args.loader_threads < 0:
+        parser.error("--loader-threads must be nonnegative")
+    if args.chunk_cache_size < 0:
+        parser.error("--chunk-cache-size must be nonnegative")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
     if args.tta_batch_size is not None and args.tta_batch_size <= 0:
