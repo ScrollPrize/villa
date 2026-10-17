@@ -288,12 +288,14 @@ precision follows the rules above. Specific conventions:
   Here truncate describes the **full width**, following the existing blur, not
   SciPy's radius. `mirror` excludes the repeated edge pixel (Torch's reflect
   padding); `reflect` includes it. Small arrays support repeated reflection.
-- `MedianFilter` uses a sliding histogram when a channel has at most 256 distinct
-  values, including normalized uint8 CT. By default it stores exact values;
-  continuous 3×3×3 inputs use a selection network and other widths use the
-  general selector. `MedianFilter(size=(2, 8), quantize=True)` additionally lets
-  higher-cardinality channels use the histogram after rounding to 256 evenly
-  spaced levels between that channel's current minimum and maximum. Codes stay
+- `MedianFilter` encodes channels with at most 256 distinct values, including
+  normalized uint8 CT, using an exact palette. 3×3×3 filters select ranks with
+  a shared selection network, processing 64 byte codes or 32 continuous values
+  at a time. Other palette windows use a sliding histogram; other continuous
+  windows use the general selector. `MedianFilter(size=(2, 8), quantize=True)`
+  additionally lets higher-cardinality channels use palette rank selection
+  after rounding to 256 evenly spaced levels between that channel's current
+  minimum and maximum. Codes stay
   uint8 internally; outputs retain the input float32/float64 dtype and range.
   This is opt-in and can be used after Elastic without moving the filter.
   Monotone quantization commutes with rank selection (also for even windows):

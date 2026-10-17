@@ -325,11 +325,16 @@ inline bool encode_median_palette(const Values& v, std::vector<std::uint8_t>& co
     return true;
 }
 
-// Histogram rank selection shared by ordinary and compact images.
+// Exact rank selection shared by ordinary and compact images.
 template<class Output, class Values>
 inline void median_rank_filter(const std::vector<std::uint8_t>& codes, Output& v, const Values& values,
                                const Grid& g, std::size_t k, const std::vector<std::size_t>& iz,
                                const std::vector<std::size_t>& iy, const std::vector<std::size_t>& ix) {
+    if (g.shape.size() == 3 && k == 3) {
+        median_detail::median3_filter<64>(codes, v, g, iz, iy, ix,
+                                        [&](std::uint8_t code) { return values[code]; });
+        return;
+    }
     constexpr std::size_t limit = 256;
     const auto dim = g.shape.size(), nz = dim == 3 ? g.shape[0] : 1;
     const auto ny = g.shape[dim - 2], nx = g.shape.back(), kz = dim == 3 ? k : 1;

@@ -34,7 +34,9 @@ Torch, SciPy, Vesuvius, or any other augmentation implementation. The case
 definitions are shared with the comparison harness below. See
 [the native ranking report](native_augmentation_results.md) for measured results.
 The [next CPU optimization pass](cpu_optimization_results.md) includes paired
-noise, float32 intermediates and continuous-input median measurements.
+noise, float32 intermediates and continuous-input median measurements. Its
+[latest follow-up](cpu_optimization_results.md#follow-up-exact-byte-code-median)
+measures the shared byte-code median selector and complete compact chains.
 
 ```sh
 AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \

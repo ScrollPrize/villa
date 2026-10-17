@@ -5,6 +5,27 @@ import pytest
 from vc_reader import augment as A
 
 
+@pytest.mark.parametrize("width", [1, 31, 32, 33, 63, 64, 65, 127, 128, 129])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("compact", [False, True])
+def test_palette_median3_blocks_and_reflected_tails(width, dtype, compact):
+    ndi = pytest.importorskip("scipy.ndimage")
+    codes = np.random.default_rng(73).integers(0, 256, size=(1, 5, 7, width))
+    if codes.size >= 256:
+        codes.flat[:256] = np.arange(256)
+    # Include windows dominated by the largest code, also used as network padding.
+    codes[:, -3:, -3:, -3:] = 255
+    palette = (np.arange(256, dtype=np.float64) ** 2 / 700 - 13).astype(dtype)
+    image = palette[codes]
+    before = image.copy()
+    pipeline = A.Pipeline([A.MedianFilter(3)], compact=compact)
+    actual = pipeline({"image": image}, seed=3)["image"]
+    expected = ndi.median_filter(image[0], size=3, mode="reflect")
+    assert actual[0].tobytes() == expected.tobytes()
+    assert image.tobytes() == before.tobytes()
+    assert pipeline.sample({"image": image}, seed=3).apply({"image": image})["image"].tobytes() == actual.tobytes()
+
+
 @pytest.mark.parametrize("shape", [(17, 19), (1, 3, 101), (5, 7, 11)])
 @pytest.mark.parametrize("size", [2, 3, 8])
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])

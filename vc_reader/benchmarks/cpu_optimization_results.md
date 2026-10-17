@@ -1,5 +1,8 @@
 # CPU augmentation follow-up: paired noise and image-precision kernels
 
+The latest pass is [Exact byte-code median](#follow-up-exact-byte-code-median)
+below, measured against the subsequent compact-pipeline implementation.
+
 Measured October 16, 2026 (America/Chicago), against source commit
 `996a4a721`. This pass targets the remaining CPU costs before considering CUDA.
 The user explicitly allowed paired Box–Muller draws and float32 computation
@@ -241,3 +244,226 @@ For the before run, substitute `/tmp/vc-augment-elastic` and `before` in the
 paths above. Both `cpu2-{before,after}-profile.{json,txt}` reports are retained.
 Whole-file hashes differ for the symbol-bearing relinks; latency reports use
 the original stripped extensions and record matching build hashes.
+
+
+## Follow-up: exact byte-code median
+
+Measured October 16, 2026, against `672df617b` (which already includes compact
+uint8 pipelines). This is a new baseline; the earlier table predates compact
+execution. **There is still useful CPU headroom:** the exact 3×3×3 palette
+median is now about 2.8× faster through the public API at both tested sizes.
+CUDA was not needed for this pass and was not benchmarked.
+
+### Implementation and numerical behavior
+
+`cpp/augment/median.hpp` now exposes the existing selector as a shared stencil
+helper. `intensity.hpp::median_rank_filter` uses it for 3D size-3 byte codes,
+so both ordinary images and compact chains benefit. Byte codes are processed
+in blocks of 64, with contiguous interior loads and reflected endpoints. The
+byte comparator decisions sit outside the lane loops to allow compiler
+vectorization without intrinsics or CPU-specific flags. The 2 KiB byte scratch
+buffer is local to each call.
+
+Padding the 27 neighbors with five maximum codes still selects the 14th
+smallest real value, including when real codes equal 255. Palette values are
+decoded only after selection. No additional quantization, changed precision,
+random draws, ordering of transforms, threads, dependencies or public API
+changes are involved. Wider/2D palette windows keep the histogram. Continuous
+inputs keep the original floating selector loop and gather strategy, and
+mixed signed zeros keep their original fallback. An attempted shared loop
+reorganization regressed continuous inputs; its floating-path changes were
+removed before the final measurements.
+
+### Matched measurements
+
+Same host, six PHercParis4 level-2 crops, normalization, affinity, compiler and
+Release flags as above: GCC 15.2, `-O3 -g -DNDEBUG`, C++20, one CPU worker.
+Builds, tests, latency runs and sampling profiles ran separately. Each size
+has two warmups and eleven repetitions per crop (66 observations per case).
+The API includes validation, sampling, ownership, palette encoding, filtering
+and final float32 decode; disk reads and output destruction are excluded.
+Timings are **mean / p50 / p95 milliseconds**; speedups use p50.
+
+#### 128³
+
+| Case | Before | After | p50 speedup |
+| --- | ---: | ---: | ---: |
+| MedianFilter | 49.755 / 49.162 / 59.153 | 17.771 / 17.184 / 24.109 | 2.86× |
+| Elastic | 83.919 / 83.835 / 85.100 | 82.247 / 82.266 / 83.371 | control |
+| LocalSmoothing | 28.651 / 29.075 / 29.795 | 27.488 / 27.935 / 28.429 | control |
+| RicianNoise | 19.206 / 19.046 / 19.380 | 19.197 / 19.051 / 19.270 | control |
+
+#### 64³
+
+| Case | Before | After | p50 speedup |
+| --- | ---: | ---: | ---: |
+| MedianFilter | 6.367 / 6.457 / 7.114 | 2.294 / 2.292 / 2.736 | 2.82× |
+| Elastic | 8.064 / 8.072 / 8.183 | 8.065 / 8.078 / 8.178 | control |
+| LocalSmoothing | 1.261 / 1.257 / 1.274 | 1.257 / 1.257 / 1.278 | control |
+| RicianNoise | 2.360 / 2.360 / 2.385 | 2.359 / 2.358 / 2.390 | control |
+
+Elastic, LocalSmoothing and RicianNoise are unchanged controls. Their small
+movements are not claimed as improvements. The median p95 spread includes
+variation across the six input crops; these are pooled observations, not
+confidence intervals.
+
+For continuous input (CT plus fixed Gaussian noise, std .01, seed 123), the
+128³ median uses one warmup and five repetitions per crop (30 observations):
+
+| Case | Before | After |
+| --- | ---: | ---: |
+| MedianFilter, CT + noise | 66.503 / 66.475 / 66.959 | 67.177 / 66.446 / 69.303 |
+
+Its p50 is unchanged; the candidate has a somewhat higher p95 in this run.
+
+#### Complete chains, 128³
+
+`bench_compact_pipeline.py` uses the same six crops, one validation/warmup per
+mode and eleven timed calls per crop/mode (66 observations), alternating the
+ordinary/compact order. Seed is always 123. The longer chain is median3,
+rotate90, transpose, flip, brightness multiply/add, contrast, two Gamma steps
+with retained statistics, and invert. All parameters remain in JSON.
+
+| Chain / execution mode | Before | After | p50 speedup |
+| --- | ---: | ---: | ---: |
+| Median3, ordinary | 50.794 / 50.596 / 57.665 | 18.089 / 17.889 / 22.133 | 2.83× |
+| Median3, compact | 50.045 / 49.818 / 57.348 | 17.662 / 17.346 / 21.950 | 2.87× |
+| Median + permutations + intensity, ordinary | 96.405 / 96.077 / 102.973 | 64.170 / 64.198 / 67.681 | 1.50× |
+| Median + permutations + intensity, compact | 53.585 / 53.263 / 60.823 | 21.811 / 21.542 / 26.037 | 2.47× |
+| Median + blur + Gamma, ordinary | 67.494 / 67.448 / 74.369 | 35.136 / 35.015 / 39.086 | 1.93× |
+| Median + blur + Gamma, compact | 67.108 / 66.839 / 74.248 | 34.919 / 34.738 / 39.117 | 1.92× |
+
+These are augmentation-chain measurements, not end-to-end training throughput.
+
+### Correctness and limits
+
+**863 augmentation tests passed.** The 40 new cases cover float32/float64,
+ordinary/compact execution, widths 1/31/32/33/63/64/65/127/128/129, reflected
+edges, maximum codes, nonuniform palettes, input preservation and replay
+against SciPy's independent exact median. Existing tests cover continuous
+inputs, quantization, 2D/wider windows, signed zeros and extreme ranges.
+
+Cross-build comparison of Elastic and MedianFilter on all six 128³ crops at
+seeds 123/124/125 has zero changed values and zero absolute error, with
+`atol=rtol=0`. All input/output hashes also match between builds for the four
+ranking cases at both sizes and for noisy median at 128³ (seed 123). Each
+chain's ordinary and compact outputs are byte-identical on all six crops.
+
+The implementation is portable C++20. Performance was measured only on Linux
+x86-64, at the specified shapes and parameters. macOS/arm64, very narrow
+volumes, concurrent workers and training throughput were not benchmarked.
+
+### Reproduction of this pass
+
+No packages were installed. The baseline extension, flags and headers are
+preserved in `/tmp/vc-augment-cpu3-before`; the candidate is in
+`/tmp/vc-augment-cpu3`. Baseline source is commit `672df617b`. Raw reports are
+`benchmarks/results/cpu3-*.json` (ignored locally); ranking reports record
+binary hashes, build flags, crop hashes and every observation. Commands below
+run from the repository root. The explicit Python paths, extension suffix and
+`taskset` are specific to this host.
+
+```bash
+AGENTS_AGENT_MODE=1 cmake -S vc_reader -B /tmp/vc-augment-cpu3 \
+  -DVC_READER_BUILD_READER=OFF \
+  -DPython_EXECUTABLE="$PWD/vc_reader/.venv/bin/python" \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE='-O3 -g -DNDEBUG' \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-augment-cpu3 --target _augment -j 2
+
+# Append site-packages after stdlib to avoid the old argparse backport.
+cat > /tmp/vc-cpu3-run <<'SH'
+#!/bin/bash
+export AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+export PYTHONPATH=vc_reader/src
+exec taskset -c 0 vc_reader/.venv/bin/python -S -c 'import sys, runpy; sys.path.append("vc_reader/.venv/lib/python3.14/site-packages"); sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0], run_name="__main__")' vc_reader/benchmarks/run_native.py "$@"
+SH
+
+for tag in before after; do
+  build=/tmp/vc-augment-cpu3
+  if [ "$tag" = before ]; then build=/tmp/vc-augment-cpu3-before; fi
+  extension="$build/_augment.cpython-314-x86_64-linux-gnu.so"
+  for edge in 128 64; do
+    bash /tmp/vc-cpu3-run "$extension" vc_reader/benchmarks/bench_augment.py \
+      --native-only --only Elastic,MedianFilter,LocalSmoothing,RicianNoise \
+      --build-dir "$build" --shape "$edge" "$edge" "$edge" --reps 11 --warmup 2 \
+      --output "vc_reader/benchmarks/results/cpu3-$tag-$edge.json"
+  done
+  bash /tmp/vc-cpu3-run "$extension" vc_reader/benchmarks/bench_compact_pipeline.py \
+    --cases Median3 Median3_permutations_intensity Median3_blur_gamma --reps 11 \
+    --output "vc_reader/benchmarks/results/cpu3-$tag-chains.json"
+  bash /tmp/vc-cpu3-run "$extension" vc_reader/benchmarks/bench_augment.py \
+    --native-only --only MedianFilter --build-dir "$build" \
+    --input-noise-std .01 --reps 5 --warmup 1 \
+    --output "vc_reader/benchmarks/results/cpu3-$tag-noisy-128.json"
+done
+
+bash /tmp/vc-cpu3-run /tmp/vc-augment-cpu3/_augment.cpython-314-x86_64-linux-gnu.so \
+  -m pytest vc_reader/tests/test_augment.py vc_reader/tests/test_augment_optimization.py \
+  vc_reader/tests/test_augment_compact.py vc_reader/tests/test_elastic_bspline.py \
+  vc_reader/tests/test_augment_benchmark.py vc_reader/tests/test_sheet_compression.py \
+  -q --tb=short
+
+# Capture needs a fresh reference directory; the measured capture is retained here.
+bash /tmp/vc-cpu3-run /tmp/vc-augment-cpu3-before/_augment.cpython-314-x86_64-linux-gnu.so \
+  vc_reader/benchmarks/check_augment_build.py /tmp/vc-cpu3-reference \
+  --capture --only Elastic,MedianFilter
+bash /tmp/vc-cpu3-run /tmp/vc-augment-cpu3/_augment.cpython-314-x86_64-linux-gnu.so \
+  vc_reader/benchmarks/check_augment_build.py /tmp/vc-cpu3-reference \
+  --only Elastic,MedianFilter --atol 0 --rtol 0 \
+  --output vc_reader/benchmarks/results/cpu3-equivalence.json
+```
+
+### Profile and remaining targets
+
+Separate `gprofng collect app -p hi` profiles use only Elastic and MedianFilter,
+the same six 128³ crops, seven repetitions and two warmups. They include
+startup, validation and hashing, and are excluded from latency measurements.
+Both symbol-bearing relinks have exactly the same `.text` bytes as their
+corresponding measured Release extensions.
+
+| Identified function | Before exclusive seconds (%) | After exclusive seconds (%) |
+| --- | ---: | ---: |
+| Palette median (wrapper + selector) | 3.170 (31.80%) | 0.781 (10.33%) |
+| Nearest label resampling | 1.504 (15.09%) | 1.522 (20.14%) |
+| Image interpolation | 1.487 (14.91%) | 1.499 (19.84%) |
+| Float palette encoding | 0.435 (4.36%) | 0.434 (5.74%) |
+| B-spline field construction | 0.402 (4.03%) | 0.411 (5.43%) |
+
+The after median row sums the wrapper and newly extracted selector. An
+unresolved libc address accounts for 1.188 seconds (15.72%) after the change;
+it is not attributed to a particular operation. Percentages are shares of the
+entire two-case profiling process, not of one Elastic or median call.
+
+Elastic remains the largest measured individual operation, about 82 ms at
+128³. Nearest label resampling and image interpolation together now account
+for about 40% of samples in this two-case workload. A bounded integer-floor
+rewrite was tested but gave no reliable end-to-end gain and was reverted.
+Continuous median remains about 66 ms on noisy CT; LocalSmoothing is about
+28 ms and RicianNoise about 19 ms. CPU possibilities are not exhausted, but
+Elastic resampling is the clearest next target. A future CUDA comparison
+should include transfers and match the current geometry, precision, labels
+and validity semantics; this pass makes no CUDA performance claim.
+
+The exact candidate profiling commands were:
+
+```bash
+mkdir -p /tmp/vc-augment-cpu3/symbols
+/usr/bin/c++ -fPIC -O3 -g -DNDEBUG -shared -Wl,--gc-sections \
+  -o /tmp/vc-augment-cpu3/symbols/_augment.cpython-314-x86_64-linux-gnu.so \
+  /tmp/vc-augment-cpu3/CMakeFiles/_augment.dir/cpp/augment/bindings.cpp.o \
+  /tmp/vc-augment-cpu3/libnanobind-static.a
+AGENTS_AGENT_MODE=1 gprofng collect app -p hi -O /tmp/vc-cpu3-after-profile.er \
+  bash /tmp/vc-cpu3-run \
+  /tmp/vc-augment-cpu3/symbols/_augment.cpython-314-x86_64-linux-gnu.so \
+  vc_reader/benchmarks/bench_augment.py --native-only --only Elastic,MedianFilter \
+  --build-dir /tmp/vc-augment-cpu3 --reps 7 --warmup 2 \
+  --output vc_reader/benchmarks/results/cpu3-after-profile.json
+gprofng display text -limit 25 -functions /tmp/vc-cpu3-after-profile.er \
+  > vc_reader/benchmarks/results/cpu3-after-profile.txt
+```
+
+The baseline was relinked before editing and retained under
+`/tmp/vc-augment-cpu3-before/symbols`; its profile substitutes that build and
+`before` in the paths above. Raw function summaries are retained alongside
+the latency JSON reports.
