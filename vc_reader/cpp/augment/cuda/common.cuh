@@ -5,18 +5,36 @@ namespace vcr::augment::cuda {
 inline void check(cudaError_t status) {
     if (status != cudaSuccess) throw std::runtime_error(std::string("CUDA augmentation: ") + cudaGetErrorString(status));
 }
-// Per-operation ownership is deliberate: no process-global context, cached
-// pointers, device switches, or shared scratch across threads/pipelines.
+// Stream-ordered allocations reuse CUDA's device pool. Buffers remain owned by
+// the invocation; no cached sample pointers or shared mutable scratch exist.
 template<class T> struct Buffer {
     T* ptr = nullptr;
     std::size_t size;
-    explicit Buffer(std::size_t n) : size(n) { if (n) check(cudaMalloc(&ptr, n * sizeof(T))); }
+    bool pooled = false;
+    explicit Buffer(std::size_t n) : size(n) {
+        if (!n) return;
+#if CUDART_VERSION >= 11020
+        int device = 0, supported = 0;
+        check(cudaGetDevice(&device));
+        check(cudaDeviceGetAttribute(&supported,cudaDevAttrMemoryPoolsSupported,device));
+        pooled = supported;
+        if (pooled) { check(cudaMallocAsync(&ptr,n*sizeof(T),0)); return; }
+#endif
+        check(cudaMalloc(&ptr,n*sizeof(T)));
+    }
     explicit Buffer(const std::vector<T>& v) : Buffer(v.size()) { upload(v.data()); }
+    Buffer(Buffer&& other) noexcept : ptr(std::exchange(other.ptr,nullptr)),size(other.size),pooled(other.pooled) {}
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
-    ~Buffer() { if (ptr) cudaFree(ptr); }
-    void upload(const T* p) { if (size) check(cudaMemcpy(ptr, p, size * sizeof(T), cudaMemcpyHostToDevice)); }
-    void download(T* p) const { if (size) check(cudaMemcpy(p, ptr, size * sizeof(T), cudaMemcpyDeviceToHost)); }
+    ~Buffer() {
+        if (!ptr) return;
+#if CUDART_VERSION >= 11020
+        if (pooled) { cudaFreeAsync(ptr,0); return; }
+#endif
+        cudaFree(ptr);
+    }
+    void upload(const T* p) { if (size) check(cudaMemcpy(ptr,p,size*sizeof(T),cudaMemcpyHostToDevice)); }
+    void download(T* p) const { if (size) check(cudaMemcpy(p,ptr,size*sizeof(T),cudaMemcpyDeviceToHost)); }
 };
 struct Layout {
     std::size_t shape[3]{1,1,1}, stride[3]{1,1,1}, size = 1;

@@ -2,14 +2,13 @@
 namespace vcr::augment::cuda {
 namespace {
 struct Function {
-    double gamma, low, span;
-    template<class T> __device__ double operator()(T x, std::size_t i, Layout g, const double* field) const { double norm = (double(x)-low)/span; return (norm*(1-field[i])+power<T>(norm,gamma)*field[i])*span+low; }
+    double gamma;
+    template<class T> __device__ double operator()(T x, std::size_t i, Layout g, const double* field, const Statistics* stats) const { double span = fmax(stats->high-stats->low,1e-8), norm = (double(x)-stats->low)/span; return (norm*(1-field[i])+power<T>(norm,gamma)*field[i])*span+stats->low; }
 };
 }
-void apply_cuda(const LocalGamma& t, Sample& s, const Parameters& p) {
-    apply_channels(t,s,p,[](const auto& t, auto& v, const Grid& g, const ChannelPlan& c) {
-        auto bounds = std::minmax_element(v.begin(),v.end());
-        pointwise(v,g,c,Function{c.values[0],double(*bounds.first),std::max(double(*bounds.second)-double(*bounds.first),1e-8)});
+void apply_cuda(const LocalGamma& t, Sample& s, const Parameters& p, Session& session) {
+    apply_channels(t,s,p,session,[](const auto& t, auto v, const Grid& g, const ChannelPlan& c) {
+        pointwise(v,g,c,Function{c.values[0]},true,false);
     });
 }
 } // namespace vcr::augment::cuda

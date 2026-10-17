@@ -51,20 +51,52 @@ template<class T> __global__ void median_general(const T* src, T* dst, Layout g,
         dst[i] = from_key<T>(low);
     }
 }
-void apply_cuda(const MedianFilter& t, Sample& s, const Parameters& p) {
-    apply_channels(t,s,p,[](const auto& t, auto& v, const Grid& grid, const ChannelPlan& c) {
-        using V = typename std::decay_t<decltype(v)>::value_type;
-        if (c.values[0] == 1) return;
-        if (t.quantize) {
-            std::vector<std::uint8_t> codes; std::vector<V> values;
-            if (encode_median_palette(v,codes,values,true))
-                for (std::size_t i = 0; i < v.size(); ++i) v[i] = values[codes[i]];
+template<class T> __global__ void palette_probe(View<T> input, unsigned long long* table, int* counts) {
+    EACH_INDEX(input.size) {
+        T value = input.ptr[i];
+        if (value == 0) atomicOr(counts+1,signbit(value) ? 2 : 1);
+        if (atomicAdd(counts,0) > 256) continue;
+        unsigned long long key;
+        if constexpr (std::is_same_v<T,float>) key = __float_as_uint(value);
+        else key = __double_as_longlong(value);
+        auto hash = (key ^ (key>>32))*0x9e3779b97f4a7c15ull;
+        for (unsigned slot = unsigned(hash>>54), j = 0; j < 1024; ++j, slot = (slot+1)&1023) {
+            auto old = atomicCAS(table+slot,~0ull,key);
+            if (old == key) break;
+            if (old == ~0ull) { atomicAdd(counts,1); break; }
         }
-        Buffer<V> data(v), out(v.size()); Layout g(grid);
-        if (g.dim == 3 && c.values[0] == 3) median3_kernel<<<blocks(g.size),256>>>(data.ptr,out.ptr,g);
-        else median_general<<<blocks(g.size),256>>>(data.ptr,out.ptr,g,int(c.values[0]));
-        check(cudaGetLastError()); out.download(v.data());
+    }
+}
+template<class T> __global__ void quantize_kernel(View<T> data, const T* palette, double low, double range) {
+    EACH_INDEX(data.size) {
+        int code = int(clamp_value(floor((double(data.ptr[i])-low)/range*255+.5),0,255));
+        data.ptr[i] = palette[code];
+    }
+}
+template<class T> void quantize_median(View<T> v) {
+    Buffer<unsigned long long> table(1024); Buffer<int> counts(2);
+    check(cudaMemsetAsync(table.ptr,255,1024*sizeof(unsigned long long)));
+    check(cudaMemsetAsync(counts.ptr,0,2*sizeof(int)));
+    palette_probe<<<blocks(v.size),256>>>(v,table.ptr,counts.ptr); check(cudaGetLastError());
+    int result[2]; counts.download(result);
+    if (result[0] <= 256 && result[1] != 3) return;
+    auto stats = statistics(v); Statistics bounds; stats.download(&bounds);
+    double range = bounds.high-bounds.low;
+    if (!(range > 0) || !std::isfinite(range)) return;
+    std::vector<T> palette(256);
+    for (std::size_t i = 0; i < 256; ++i) palette[i] = T(std::lerp(bounds.low,bounds.high,double(i)/255));
+    Buffer<T> values(palette);
+    quantize_kernel<<<blocks(v.size),256>>>(v,values.ptr,bounds.low,range); check(cudaGetLastError());
+}
+void apply_cuda(const MedianFilter& t, Sample& s, const Parameters& p, Session& session) {
+    apply_channels(t,s,p,session,[](const auto& t, auto v, const Grid& grid, const ChannelPlan& c) {
+        using V = typename decltype(v)::value_type;
+        if (c.values[0] == 1) return;
+        if (t.quantize) quantize_median(v);
+        Buffer<V> out(v.size); Layout g(grid);
+        if (g.dim == 3 && c.values[0] == 3) median3_kernel<<<blocks(g.size),256>>>(v.ptr,out.ptr,g);
+        else median_general<<<blocks(g.size),256>>>(v.ptr,out.ptr,g,int(c.values[0]));
+        check(cudaGetLastError()); copy_device(v,View<V>{out.ptr,v.size});
     });
 }
-
 } // namespace vcr::augment::cuda

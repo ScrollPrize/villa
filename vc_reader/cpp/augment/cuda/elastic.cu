@@ -1,6 +1,79 @@
 #include "geometry.cuh"
+#include "local_field.cuh"
+#include "reductions.cuh"
 namespace vcr::augment::cuda {
-void apply_cuda(const Elastic&, Sample& s, const Parameters& p) {
-    apply_geometry_with(s,p,resample_cuda);
+__global__ void expand_controls(const double* src, double* dst, Layout input, Layout output,
+                                const double* weights, const std::size_t* positions, int axis) {
+    EACH_INDEX(output.size*output.dim) {
+        const auto component = i/output.size, at = i%output.size, step = output.stride[axis];
+        const auto x = output.coord(at,axis), block = at/(output.shape[axis]*step), j = at%step;
+        const auto* from = src+component*input.size+(block*input.shape[axis]+positions[x])*step+j;
+        double value = 0;
+        for (int tap = 0; tap < 4; ++tap) value += weights[4*x+tap]*from[tap*step];
+        dst[axis == 0 ? at*output.dim+component : i] = value;
+    }
 }
+__global__ void component_sums(const double* field, double* partial, Layout g) {
+    __shared__ double values[3][256];
+    for (int c = 0; c < 3; ++c) values[c][threadIdx.x] = 0;
+    EACH_INDEX(g.size) for (int c = 0; c < g.dim; ++c) values[c][threadIdx.x] += field[i*g.dim+c];
+    block_reduce(values);
+    if (!threadIdx.x) for (int c = 0; c < 3; ++c) partial[blockIdx.x*3+c] = values[c][0];
+}
+__global__ void center_field(double* field, const double* sums, Layout g) {
+    EACH_INDEX(g.size*g.dim) field[i] -= sums[i%g.dim]/g.size;
+}
+__global__ void field_energy_gradient(const double* field, double* partial, Layout g) {
+    __shared__ double values[10][256];
+    for (int m = 0; m < 10; ++m) values[m][threadIdx.x] = 0;
+    EACH_INDEX(g.size) for (int c = 0; c < g.dim; ++c) {
+        const double value = field[g.dim*i+c]; values[0][threadIdx.x] += value*value;
+        for (int a = 0; a < g.dim; ++a) if (g.coord(i,a)+1 < g.shape[a])
+            values[1+3*c+a][threadIdx.x] = fmax(values[1+3*c+a][threadIdx.x],fabs(field[g.dim*(i+g.stride[a])+c]-value));
+    }
+    block_reduce(values);
+    if (!threadIdx.x) for (int m = 0; m < 10; ++m) partial[blockIdx.x*10+m] = values[m][0];
+}
+__global__ void field_scale(double* field, const double* stats, Layout g, double rms) {
+    double factor = stats[0] ? rms/sqrt(stats[0]/g.size) : 0, limit = 0;
+    for (int c = 0; c < g.dim; ++c) limit = fmax(limit,stats[1+3*c]+stats[2+3*c]+stats[3+3*c]);
+    if (limit) factor = fmin(factor,.8/limit);
+    EACH_INDEX(g.size*g.dim) field[i] *= factor;
+}
+Parameters sample_elastic(const Elastic& t, const Sample& s, Random& r, bool record) {
+    auto p = geometry(sample_shape(s)); const auto [sigma,magnitude] = elastic_settings(t,r);
+    p.border = t.border;
+    if (!magnitude) { p.exact = true; return p; }
+    const double spacing = std::max(1.,2*sigma); const auto dim = p.shape.size();
+    Shape knots; for (auto n : p.shape) knots.push_back(elastic_detail::controls(n,spacing,true));
+    std::vector<double> controls;
+    for (std::size_t c = 0; c < dim; ++c) {
+        auto values = elastic_detail::draw_controls(knots,r); controls.insert(controls.end(),values.begin(),values.end());
+    }
+    auto data = std::make_shared<Buffer<double>>(controls); Shape shape = knots;
+    for (int axis = int(dim)-1; axis >= 0; --axis) {
+        auto target = shape; target[axis] = p.shape[axis];
+        std::vector<double> weights; std::vector<std::size_t> positions;
+        for (std::size_t x = 0; x < target[axis]; ++x) {
+            double q = x/spacing; positions.push_back(std::size_t(q));
+            auto w = elastic_detail::weights(q-std::floor(q),true); weights.insert(weights.end(),w.begin(),w.end());
+        }
+        Buffer<double> w(weights); Buffer<std::size_t> pos(positions);
+        auto next = std::make_shared<Buffer<double>>(product(target)*dim);
+        expand_controls<<<blocks(next->size),256>>>(data->ptr,next->ptr,Layout{Grid(shape)},Layout{Grid(target)},w.ptr,pos.ptr,axis);
+        check(cudaGetLastError()); data = std::move(next); shape = std::move(target);
+    }
+    Layout g{Grid(p.shape)}; const auto count = blocks(g.size);
+    Buffer<double> partial(count*10),stats(10);
+    component_sums<<<count,256>>>(data->ptr,partial.ptr,g);
+    finish_reduce<3><<<1,256>>>(partial.ptr,stats.ptr,count);
+    center_field<<<blocks(data->size),256>>>(data->ptr,stats.ptr,g);
+    field_energy_gradient<<<count,256>>>(data->ptr,partial.ptr,g);
+    finish_reduce<10><<<1,256>>>(partial.ptr,stats.ptr,count);
+    field_scale<<<blocks(data->size),256>>>(data->ptr,stats.ptr,g,magnitude);
+    check(cudaGetLastError()); p.device_field = data;
+    if (record) { p.field.resize(data->size); data->download(p.field.data()); }
+    return p;
+}
+void apply_cuda(const Elastic&, Sample& s, const Parameters& p, Session& session) { geometry_cuda(s,p,session); }
 } // namespace vcr::augment::cuda

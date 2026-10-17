@@ -1,5 +1,6 @@
 #include "../pipeline.hpp"
 #include "dispatch.hpp"
+#include "local_field.cuh"
 #include <cuda_runtime.h>
 namespace vcr::augment::cuda {
 template<class T> constexpr bool intensity_supported =
@@ -23,9 +24,19 @@ void validate_program(const std::vector<Op>& ops) {
         else require(supported<T>, "transform is not supported by the CUDA backend; use backend='cpu'");
     },op);
 }
-void execute(const Op& op, Sample& s, const Parameters& p) {
+Parameters sample_parameters(const Op& op, const Sample& s, Random& r, bool record, void*) {
+    return std::visit([&](const auto& t) -> Parameters {
+        using T = std::decay_t<decltype(t)>;
+        if constexpr (std::is_same_v<T,BrightnessGradient> || std::is_same_v<T,LocalContrast> ||
+                      std::is_same_v<T,LocalGamma> || std::is_same_v<T,LocalSmoothing>) return sample_local(t,s,r,record);
+        else if constexpr (std::is_same_v<T,Elastic>) return sample_elastic(t,s,r,record);
+        else if constexpr (std::is_same_v<T,std::shared_ptr<OneOf>>) throw std::invalid_argument("unresolved OneOf");
+        else return sample(t,s,r);
+    },op);
+}
+void execute(const Op& op, Sample& s, const Parameters& p, void* context) {
     std::visit([&](const auto& t) {
-        if constexpr (supported<std::decay_t<decltype(t)>>) apply_cuda(t,s,p);
+        if constexpr (supported<std::decay_t<decltype(t)>>) apply_cuda(t,s,p,*static_cast<Session*>(context));
         else throw std::invalid_argument("transform is not supported by the CUDA backend");
     },op);
 }

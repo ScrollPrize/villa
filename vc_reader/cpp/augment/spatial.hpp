@@ -31,7 +31,7 @@ inline std::int64_t nearest_index(double q, int mode) {
     auto lo = std::int64_t(std::floor(q)); auto fraction = q - lo;
     return mode == 2 ? lo : lo + (fraction > .5 || (fraction == .5 && (mode == 1 || lo % 2 != 0)));
 }
-template<std::size_t D = 0, class F> double linear_value(const Grid& g, Point q, bool border, double fill, F&& get) {
+template<std::size_t D = 0, bool Validity = false, class F> double linear_value(const Grid& g, Point q, bool border, double fill, F&& get) {
     std::int64_t lo[3]; double fraction[3]; const auto d = D ? D : g.shape.size();
     for (std::size_t a = 0; a < d; ++a) {
         require(std::isfinite(q[a]), "nonfinite sampling coordinate");
@@ -56,9 +56,12 @@ template<std::size_t D = 0, class F> double linear_value(const Grid& g, Point q,
                 weight *= bit ? fraction[a] : 1 - fraction[a];
                 if (bit) at += g.stride[a];
             }
-            if (weight) result += weight * get(at);
+            if (weight) {
+                if constexpr (Validity) { if (get(at) < 1.) return 0.; }
+                else result += weight * get(at);
+            }
         }
-        return result;
+        return Validity ? 1. : result;
     }
     for (std::size_t corner = 0; corner < (std::size_t(1) << d); ++corner) {
         bool valid = true; std::size_t at = 0; double weight = 1;
@@ -68,9 +71,12 @@ template<std::size_t D = 0, class F> double linear_value(const Grid& g, Point q,
             if (x < 0 || x >= std::int64_t(g.shape[a])) valid = false;
             else at += std::size_t(x) * g.stride[a];
         }
-        if (weight) result += weight * (valid ? get(at) : fill);
+        if (weight) {
+            if constexpr (Validity) { if ((valid ? get(at) : fill) < 1.) return 0.; }
+            else result += weight * (valid ? get(at) : fill);
+        }
     }
-    return result;
+    return Validity ? 1. : result;
 }
 inline Point backward(const Parameters& p, Point out) {
     auto d = p.shape.size(); auto q = matvec(p.matrix, out, d);
@@ -243,9 +249,11 @@ template<std::size_t D> Array resample_impl(const Array& src, const Parameters& 
                 }
             } else {
                 for (std::size_t c = 0; c < src.shape[0]; ++c) {
-                    double value = linear_value<D>(input, q, validity ? false : p.border, fill, [&](auto at) { return double(source[c * input.size + at]); });
-                    // Conservative support: every interpolation contributor must be valid.
-                    if (validity) value = double(value >= 1.);
+                    auto get = [&](auto at) { return double(source[c * input.size + at]); };
+                    // Check support directly: a rounded sum of all-one samples
+                    // can be below 1 even though every contributor is valid.
+                    double value = validity ? linear_value<D, true>(input,q,false,fill,get)
+                                            : linear_value<D>(input,q,p.border,fill,get);
                     if constexpr (std::is_floating_point_v<T>) destination[c * output.size + i] = static_cast<T>(value);
                     else out.set(c * output.size + i, value);
                 }
@@ -373,11 +381,15 @@ inline Parameters sample(const Affine& t, const Sample& s, Random& r) {
     for (std::size_t a = 0; a < d; ++a) p.offset[a] = double(input[a] - 1) / 2 - center[a];
     p.border = t.border; return p;
 }
-inline Parameters sample(const Elastic& t, const Sample& s, Random& r) {
-    auto p = geometry(sample_shape(s));
+inline std::array<double,2> elastic_settings(const Elastic& t, Random& r) {
     const double sigma=draw(t.sigma,r), magnitude=draw(t.magnitude,r);
     require(sigma>=0 && sigma<=std::numeric_limits<double>::max()/2,"elastic sigma must be nonnegative and finite");
     require(magnitude>=0,"elastic magnitude must be nonnegative");
+    return {sigma,magnitude};
+}
+inline Parameters sample(const Elastic& t, const Sample& s, Random& r) {
+    auto p = geometry(sample_shape(s));
+    const auto [sigma,magnitude] = elastic_settings(t,r);
     // Historical argument names retained: sigma is half the knot spacing;
     // magnitude is now RMS vector displacement, limited to prevent folds.
     if (magnitude==0) { p.exact=true; p.border=t.border; return p; }

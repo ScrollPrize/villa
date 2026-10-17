@@ -3,6 +3,9 @@
 // with an int16 label channel, zero fill, and ties-to-even nearest sampling.
 #include "spatial.hpp"
 #include "cuda/median.cuh"
+#include "cuda/reductions.cuh"
+using vcr::augment::cuda::block_reduce;
+using vcr::augment::cuda::finish_reduce;
 #include <cuda_runtime.h>
 
 namespace {
@@ -70,21 +73,6 @@ __global__ void expand(const double* src, double* dst, const double* weights,
     dst[axis == 0 ? at*3+c : i] = value;
 }
 
-template<int Metrics> __device__ void block_reduce(double (&values)[Metrics][256]) {
-    const int t = threadIdx.x;
-    __syncthreads();
-    for (int offset = 128; offset; offset /= 2) {
-        if (t < offset) {
-            #pragma unroll
-            for (int m = 0; m < Metrics; ++m) {
-                if constexpr (Metrics == 3) values[m][t] += values[m][t+offset];
-                else if (m == 0) values[m][t] += values[m][t+offset];
-                else values[m][t] = fmax(values[m][t], values[m][t+offset]);
-            }
-        }
-        __syncthreads();
-    }
-}
 __global__ void component_sums(const double* field, double* partial, int count) {
     __shared__ double values[3][256];
     const int t = threadIdx.x, i = blockIdx.x*256+t;
@@ -92,22 +80,6 @@ __global__ void component_sums(const double* field, double* partial, int count) 
     for (int c = 0; c < 3; ++c) values[c][t] = i < count ? field[3*i+c] : 0;
     block_reduce(values);
     if (t == 0) for (int c = 0; c < 3; ++c) partial[blockIdx.x*3+c] = values[c][0];
-}
-template<int Metrics> __global__ void finish_reduce(const double* partial, double* stats, int blocks) {
-    __shared__ double values[Metrics][256];
-    const int t = threadIdx.x;
-    #pragma unroll
-    for (int m = 0; m < Metrics; ++m) {
-        double value = 0;
-        for (int i = t; i < blocks; i += 256) {
-            if constexpr (Metrics == 3) value += partial[i*Metrics+m];
-            else if (m == 0) value += partial[i*Metrics+m];
-            else value = fmax(value, partial[i*Metrics+m]);
-        }
-        values[m][t] = value;
-    }
-    block_reduce(values);
-    if (t == 0) for (int m = 0; m < Metrics; ++m) stats[m] = values[m][0];
 }
 __global__ void center(double* field, const double* sums, int count) {
     const int i = blockIdx.x*blockDim.x+threadIdx.x;

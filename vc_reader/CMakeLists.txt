@@ -44,23 +44,26 @@ if(VC_READER_ENABLE_CUDA)
         cpp/augment/cuda/geometry.cu
         cpp/augment/cuda/invert.cu
         cpp/augment/cuda/local_contrast.cu
+        cpp/augment/cuda/local_field.cu
         cpp/augment/cuda/local_gamma.cu
         cpp/augment/cuda/local_smoothing.cu
         cpp/augment/cuda/low_resolution.cu
         cpp/augment/cuda/median_filter.cu
         cpp/augment/cuda/random_binary_operator.cu
+        cpp/augment/cuda/resident.cu
         cpp/augment/cuda/rician_noise.cu
         cpp/augment/cuda/rotate90.cu
         cpp/augment/cuda/sharpen.cu
         cpp/augment/cuda/slice_illumination.cu
         cpp/augment/cuda/smear.cu
+        cpp/augment/cuda/statistics.cu
         cpp/augment/cuda/thick_slice.cu
         cpp/augment/cuda/transpose.cu
     )
     target_compile_definitions(_augment PRIVATE VC_READER_CUDA=1)
     target_link_libraries(_augment PRIVATE CUDA::cudart)
     set_target_properties(_augment PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
-    target_compile_options(_augment PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--expt-relaxed-constexpr>)
+    target_compile_options(_augment PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
 endif()
 
 option(VC_READER_BUILD_READER "Build the native Zarr reader as well as augmentation" ON)

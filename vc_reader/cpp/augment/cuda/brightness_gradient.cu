@@ -2,14 +2,13 @@
 namespace vcr::augment::cuda {
 namespace {
 struct Function {
-    double strength, low, high; bool clip;
-    template<class T> __device__ double operator()(T x, std::size_t i, Layout g, const double* field) const { double y = double(x)+field[i]*strength; return clip ? clamp_value(y,low,high) : y; }
+    double strength; bool clip;
+    template<class T> __device__ double operator()(T x, std::size_t i, Layout g, const double* field, const Statistics* stats) const { double y = double(x)+field[i]*strength; return clip ? clamp_value(y,stats->low,stats->high) : y; }
 };
 }
-void apply_cuda(const BrightnessGradient& t, Sample& s, const Parameters& p) {
-    apply_channels(t,s,p,[](const auto& t, auto& v, const Grid& g, const ChannelPlan& c) {
-        auto bounds = std::minmax_element(v.begin(),v.end());
-        pointwise(v,g,c,Function{c.values[0],double(*bounds.first),double(*bounds.second),t.clip});
+void apply_cuda(const BrightnessGradient& t, Sample& s, const Parameters& p, Session& session) {
+    apply_channels(t,s,p,session,[](const auto& t, auto v, const Grid& g, const ChannelPlan& c) {
+        pointwise(v,g,c,Function{c.values[0],t.clip},t.clip,false);
     });
 }
 } // namespace vcr::augment::cuda

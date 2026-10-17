@@ -1,6 +1,10 @@
 #include "geometry.cuh"
 namespace vcr::augment::cuda {
-void apply_cuda(const ThickSlice& t, Sample& s, const Parameters& p) {
-    apply_resolution(t,s,p,resize_cuda);
+void apply_cuda(const ThickSlice& t, Sample& s, const Parameters& p, Session& session) {
+    for (const auto& [key,f] : s) if (f.target.role == Role::Image || (t.labels && (f.target.role == Role::Label || f.target.role == Role::Scalar))) {
+        auto& a = session.arrays.at(key); auto shape = a.spatial();
+        a = resize_cuda(resize_cuda(a,p.shape,true,true),shape,true,true);
+    }
+    session.restore_valid(s);
 }
 } // namespace vcr::augment::cuda

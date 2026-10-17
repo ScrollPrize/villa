@@ -14,11 +14,15 @@ using Op = std::variant<
     SheetCompression, LowResolution, ThickSlice, Morphology, RandomBinaryOperator,
     RemoveComponents, ReplaceLabel, Regions, OneHot, MaskImage, DeepSupervision,
     ToPseudo2D, FromPseudo2D, MedialSurface, StripGeometry, SurfacePerturb, std::shared_ptr<OneOf>>;
-using Executor = void (*)(const Op&, Sample&, const Parameters&);
+using Executor = void (*)(const Op&, Sample&, const Parameters&, void*);
 #ifdef VC_READER_CUDA
 namespace cuda {
 bool available();
-void execute(const Op&, Sample&, const Parameters&);
+void execute(const Op&, Sample&, const Parameters&, void*);
+std::shared_ptr<void> begin(const Sample&);
+void finish(Sample&, void*);
+void synchronize();
+Parameters sample_parameters(const Op&, const Sample&, Random&, bool, void*);
 void validate_program(const std::vector<Op>&);
 }
 #else
@@ -65,7 +69,7 @@ inline void execute(const Op& op, Sample& s, const Parameters& p) {
         else throw std::invalid_argument("replay plan contains unresolved OneOf");
     }, op);
 }
-inline void prepare(const Op& op, Sample& s, Random& r, Shape path, std::vector<Step>* record, CompactState& compact, Executor executor = nullptr) {
+inline void prepare(const Op& op, Sample& s, Random& r, Shape path, std::vector<Step>* record, CompactState& compact, Executor executor = nullptr, void* context = nullptr) {
     if (!r.chance(chance(op))) return;
     if (const auto* choice = std::get_if<std::shared_ptr<OneOf>>(&op)) {
         const auto& t = **choice; require(!t.transforms.empty(), "OneOf needs transforms");
@@ -75,18 +79,27 @@ inline void prepare(const Op& op, Sample& s, Random& r, Shape path, std::vector<
         require(std::isfinite(total) && total > 0, "OneOf needs positive total weight");
         double threshold = r.uniform() * total; std::size_t chosen = 0;
         for (; chosen + 1 < weights.size() && threshold >= weights[chosen]; ++chosen) threshold -= weights[chosen];
-        path.push_back(chosen); prepare(t.transforms[chosen], s, r, std::move(path), record, compact, executor); return;
+        path.push_back(chosen); prepare(t.transforms[chosen], s, r, std::move(path), record, compact, executor, context); return;
     }
     std::visit([&](const auto& t) { compact.before(t, s); }, op);
-    auto parameters = std::visit([&](const auto& t) -> Parameters {
+    Parameters parameters;
+#ifdef VC_READER_CUDA
+    if (executor) parameters = cuda::sample_parameters(op,s,r,record != nullptr,context);
+    else
+#endif
+    parameters = std::visit([&](const auto& t) -> Parameters {
         if constexpr (!std::is_same_v<std::decay_t<decltype(t)>, std::shared_ptr<OneOf>>) return sample(t, s, r);
         else return {};
     }, op);
-    if (executor) executor(op, s, parameters);
+    if (executor) executor(op, s, parameters, context);
     else std::visit([&](const auto& t) {
         if constexpr (!std::is_same_v<std::decay_t<decltype(t)>, std::shared_ptr<OneOf>>) compact.apply_step(t, s, parameters);
     }, op);
-    if (record) record->push_back({std::move(path), std::move(parameters)});
+    if (record) {
+        parameters.device_field.reset();
+        for (auto& c : parameters.channels) c.device_field.reset();
+        record->push_back({std::move(path), std::move(parameters)});
+    }
 }
 class Pipeline {
     std::shared_ptr<const Program> program_;
@@ -113,13 +126,27 @@ public:
     RunResult run(Sample s, std::uint64_t seed, bool record, bool profile) const {
         validate(s); RunResult result; result.plan.program = program_; result.plan.inputs = input_specs(s);
         CompactState compact(compact_);
+        std::shared_ptr<void> context;
+        const auto upload_start = std::chrono::steady_clock::now();
+#ifdef VC_READER_CUDA
+        if (executor_) context = cuda::begin(s);
+#endif
+        const double upload_time = std::chrono::duration<double>(std::chrono::steady_clock::now()-upload_start).count();
         for (std::size_t i = 0; i < program_->transforms.size(); ++i) {
             for (const auto& [name, f] : s) require(f.pyramid.empty(), "DeepSupervision must be the last transform");
             auto start = std::chrono::steady_clock::now(); Random r{split_seed(seed, std::to_string(i))};
-            prepare(program_->transforms[i], s, r, {i}, record ? &result.plan.steps : nullptr, compact, executor_);
-            if (profile) result.timings[std::to_string(i)] = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            prepare(program_->transforms[i], s, r, {i}, record ? &result.plan.steps : nullptr, compact, executor_, context.get());
+#ifdef VC_READER_CUDA
+            if (executor_ && profile) cuda::synchronize();
+#endif
+            if (profile) result.timings[std::to_string(i)] = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count()
+                + (executor_ && i == 0 ? upload_time : 0);
         }
-        auto start = std::chrono::steady_clock::now(); compact.flush(s);
+        auto start = std::chrono::steady_clock::now();
+#ifdef VC_READER_CUDA
+        if (executor_) cuda::finish(s,context.get());
+#endif
+        compact.flush(s);
         if (profile && !program_->transforms.empty()) result.timings[std::to_string(program_->transforms.size() - 1)] +=
             std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         result.sample = std::move(s); return result;
@@ -128,14 +155,21 @@ public:
         require(plan.program == program_, "plan belongs to another pipeline; use plan.apply(sample)");
         validate(s); require(input_specs(s) == plan.inputs, "replay requires identical target names, shapes and dtypes");
         CompactState compact(compact_);
+        std::shared_ptr<void> context;
+#ifdef VC_READER_CUDA
+        if (executor_) context = cuda::begin(s);
+#endif
         for (const auto& step : plan.steps) {
-            if (executor_) { executor_(resolve(*program_, step.path), s, step.parameters); continue; }
+            if (executor_) { executor_(resolve(*program_, step.path), s, step.parameters, context.get()); continue; }
             std::visit([&](const auto& t) {
                 if constexpr (!std::is_same_v<std::decay_t<decltype(t)>, std::shared_ptr<OneOf>>) {
                     compact.before(t, s); compact.apply_step(t, s, step.parameters);
                 } else throw std::invalid_argument("replay plan contains unresolved OneOf");
             }, resolve(*program_, step.path));
         }
+#ifdef VC_READER_CUDA
+        if (executor_) cuda::finish(s,context.get());
+#endif
         compact.flush(s);
         RunResult result; result.sample = std::move(s); return result;
     }

@@ -1,6 +1,7 @@
 # Native augmentation
 
-`vc_reader.augment` runs CPU augmentation in C++20. Python constructs the
+`vc_reader.augment` runs native augmentation in C++20, with a CPU default and an
+optional CUDA backend. Python constructs the
 pipeline and converts NumPy arrays or CPU Torch tensors; parameter sampling,
 voxel operations, target routing, and replay run natively with the GIL released.
 Transforms are flat configuration structs and overloaded functions, sharing
@@ -357,3 +358,88 @@ PYTHONPATH=vc_reader/src python vc_reader/benchmarks/validate_augment.py \
 
 Omit the label path for an unlabeled CT volume. Supply three start/shape values
 for 3D. The harness is a correctness check, not a throughput benchmark.
+
+## Optional CUDA backend
+
+All 24 primary transforms from `bench_augment.py` have CUDA implementations:
+BrightnessMultiply, BrightnessAdd, Contrast, Gamma, Invert, GaussianNoise,
+RicianNoise, GaussianBlur, MedianFilter, Sharpen, BrightnessGradient,
+LocalContrast, LocalGamma, LocalSmoothing, BlankRectangle, SliceIllumination,
+Smear, Flip, Rotate90, Transpose, Elastic, LowResolution, ThickSlice, and
+RandomBinaryOperator. Each has its own `.cu` file under `cpp/augment/cuda/`.
+Small shared files provide interpolation, convolution, noise generation,
+channel adaptation, and device-buffer ownership. `OneOf` can compose these
+transforms. Other transforms remain available on CPU; selecting an unsupported
+transform with CUDA raises at pipeline construction.
+
+```python
+from vc_reader import augment as A
+from vc_reader.augment.cuda import is_available
+
+pipeline = A.Pipeline([A.GaussianNoise(.02), A.MedianFilter(3), A.Elastic(3, 1)],
+                      backend="auto")
+print(is_available(), pipeline.backend)  # Resolved backend: "cpu" or "cuda".
+output = pipeline({"image": image, "mask": labels}, seed=123)
+```
+
+- `backend="cpu"` remains the default and does not query CUDA.
+- `backend="cuda"` requires a CUDA-enabled build and visible device.
+- `backend="auto"` chooses CUDA when available and CPU otherwise. It is an
+  availability choice, **not a prediction of which backend is faster**.
+- Inputs and outputs are still NumPy arrays or CPU Torch tensors. CUDA tensors
+  are not accepted. Calls are synchronous and preserve inputs by default.
+  Profiling includes host/device transfers, allocation, and synchronization.
+- CUDA uses dense buffers, regardless of `compact`. Parameter sampling, local
+  Gaussian fields, Elastic field construction, data-dependent statistics,
+  sparse/directional target handling, and validity restoration reuse CPU code.
+  Device buffers are allocated per operation/channel; chains currently transfer
+  intermediate results back to host. GPU-resident chains are not implemented.
+- Seeds, probabilities, channel selection, target routing, interpolation rules,
+  float32/float64 precision, integer label IDs, and replay are preserved.
+  Replay is exact within the same build/backend/device. CUDA transcendental
+  functions can round differently from CPU libm, so cross-backend image outputs
+  need not be bitwise identical. Regression checks use float32 `atol=3e-7`,
+  `rtol=2e-6`, and float64 `atol=2e-13`, `rtol=2e-12`; integer outputs are exact.
+  CUDA is compiled without fast math and with FMA contraction disabled.
+- The 3D size-3 median shares the CPU selector schedule. Other sizes use a
+  general exact rank filter with bounded scratch storage, supporting sizes
+  1–63 and even windows. Wider windows are not performance-tuned. Equal-valued
+  signed-zero ties may select a different zero sign between backends.
+- CUDA errors are propagated; a failed call is never silently retried on CPU.
+  macOS and other CPU-only systems retain the existing build and execution path.
+
+Build with an **already installed** CUDA toolkit, C++20 compiler, nanobind,
+NumPy, and Python development headers. CUDA is off by default, and CPU builds
+have no CUDA toolkit/runtime dependency. From the repository root:
+
+```bash
+export AGENTS_AGENT_MODE=1
+cmake -S vc_reader -B /tmp/vc-augment-cuda \
+  -DVC_READER_BUILD_READER=OFF -DVC_READER_ENABLE_CUDA=ON \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+  -DCMAKE_CUDA_ARCHITECTURES=120 \
+  -DPython_EXECUTABLE="$PWD/vc_reader/.venv/bin/python" \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+cmake --build /tmp/vc-augment-cuda --target _augment -j 4
+```
+
+`120` is the architecture used for the tested RTX 5090; choose the appropriate
+CMake CUDA architecture for the target GPU. No packages are installed by these
+commands. To test this build without installing it (the paths below match this
+workspace's Python 3.14 environment; adjust for your interpreter):
+
+```bash
+export PYTHONPATH=vc_reader/src:vc_reader/.venv/lib/python3.14/site-packages
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+vc_reader/.venv/bin/python -S vc_reader/benchmarks/run_native.py \
+  /tmp/vc-augment-cuda/_augment.cpython-314-x86_64-linux-gnu.so \
+  -m pytest vc_reader/tests -q
+```
+
+GPU regression tests skip on CPU-only builds/devices; backend selection and CPU
+fallback remain tested. Tests cover every benchmark transform in float32 and
+float64, replay/pickle, 2D/3D and noncubic grids, multi-channel inputs, noncontiguous
+arrays, validity masks, integer label widths (including IDs above 2**53),
+probabilities, compositions, and overflow-protected float32 intermediates.
+See [public CUDA measurements](../benchmarks/README.md#public-cuda-augmentation-benchmark)
+for the real CT workload, comparison commands, and performance limitations.

@@ -145,3 +145,55 @@ def test_chain_and_inplace():
 def test_constant_and_wide_intermediates(image):
     for op in [A.GaussianBlur(1),A.LocalSmoothing(2),A.Sharpen(.1),A.Gamma(.8,p_retain_stats=1),A.MedianFilter(3)]:
         verify([op],dict(image=image))
+
+
+@gpu
+@pytest.mark.parametrize("op", [A.Elastic(1,.8,border=True), A.Elastic(1,.8), A.Transpose("yx")])
+def test_2d_geometry_and_targets(op):
+    image = np.random.default_rng(24).normal(size=(1,5,7)).astype(np.float64)
+    coords = np.indices((5,7)).astype(np.float64)
+    sample = dict(image=image, mask=(image>0).astype(np.int8), padding_mask=(image>-.5),
+                  points=np.array([[2.,3.],[1.,1.]]), normals=np.ones((2,5,7)), coords=coords)
+    targets = dict(image=A.Image(fill=-1), mask=A.Label(ignore_value=-2), padding_mask=A.ValidMask(),
+                   points=A.Points(order="yx"),normals=A.NormalField(components="yx"),
+                   coords=A.CoordinateField(components="yx",frame="local"))
+    verify([op],sample,targets)
+
+
+@gpu
+@pytest.mark.parametrize("seed", [0,1,2,2**63+9])
+def test_probabilities_and_channel_selection(seed):
+    image = np.random.default_rng(23).uniform(size=(3,4,5,6)).astype(np.float32)
+    verify([A.OneOf([A.Gamma((.7,1.2),p=.8,channels=(0,2)),
+                      A.GaussianNoise((.01,.1),shared_noise=True,p_channel=.6)],p=.7),
+            A.GaussianBlur((.3,1),shared=True,shared_axes=False,channels=(1,))],
+           dict(image=image),seed=seed)
+
+
+@gpu
+def test_noncontiguous_and_invalid_inputs():
+    image = np.arange(60,dtype=np.float32).reshape(1,3,4,5)
+    verify([A.MedianFilter(3)],dict(image=image[:,:,:,::-1]))
+    pipe = A.Pipeline([A.MedianFilter(3)],backend="cuda")
+    with pytest.raises(ValueError,match="contiguous"):
+        pipe(dict(image=image[:,:,:,::-1]),seed=1,inplace=True)
+    image[0,0,0,0] = np.nan
+    with pytest.raises(ValueError,match="nonfinite"):
+        pipe(dict(image=image),seed=1)
+
+
+@gpu
+@pytest.mark.parametrize("seed", [123,124,125])
+def test_elastic_dense_validity_support(seed):
+    image = np.random.default_rng(32).normal(size=(1,16,16,16)).astype(np.float32)
+    verify([A.Elastic(3,1)],dict(image=image,padding_mask=np.ones_like(image,dtype=np.uint8)),seed=seed)
+
+
+@gpu
+def test_resident_shape_changes_and_data_dependent_statistics():
+    image = np.random.default_rng(32).uniform(size=(2,3,5,7)).astype(np.float32)
+    verify([A.Transpose("xyz"),A.Rotate90(("yx",),(1,),resize=True),
+            A.BrightnessAdd(.4),A.Gamma(.8,p_retain_stats=1),A.Contrast(1.2),
+            A.BlankRectangle(2,value="mean",count=2),A.LocalContrast(2,factor=.8),
+            A.LowResolution(.5),A.RandomBinaryOperator(channels=(0,1),operations=("open",))],
+           dict(image=image))

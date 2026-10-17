@@ -1,4 +1,4 @@
-"""CPU augmentation with a native C++ pipeline.
+"""Native augmentation with CPU and optional CUDA execution.
 
 Python only constructs configurations and adapts dictionaries/array containers.
 Parameter sampling, target routing, transforms, and replay run without the GIL.
@@ -120,6 +120,11 @@ class Pipeline:
     compact=True keeps eligible float32 median/intensity chains in a lossless
     palette representation. Weighted statistics can differ slightly in rounding;
     compact=False retains the ordinary reduction order. Outputs keep their dtype.
+    backend="cpu" is the default. "cuda" requires the optional CUDA build and a
+    device; "auto" selects CUDA when available, otherwise CPU. CUDA uses dense
+    buffers regardless of compact, with the same host-array input/output API.
+    Only the primary benchmark transforms (and OneOf) support CUDA. Unsupported
+    transforms raise when CUDA is selected; execution errors never retry on CPU.
     """
     def __init__(self, transforms, *, targets=None, compact=True, backend="cpu"):
         self.compact = bool(compact)

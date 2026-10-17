@@ -1,6 +1,7 @@
 #pragma once
-#include "../spatial.hpp"
+#include "resident.cuh"
 namespace vcr::augment::cuda {
-Array resample_cuda(const Array&, const Parameters&, bool, double, bool, std::size_t);
-Array resize_cuda(const Array&, const Shape&, bool, bool);
-} // namespace vcr::augment::cuda
+DeviceArray resample_cuda(const DeviceArray&, const Parameters&, bool, double, bool, const double*);
+DeviceArray resize_cuda(const DeviceArray&, const Shape&, bool, bool);
+void geometry_cuda(Sample&, const Parameters&, Session&);
+}

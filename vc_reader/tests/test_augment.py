@@ -467,3 +467,12 @@ def test_median_palette_overflow_after_probe():
     expected = ndimage.median_filter(image[0], size=3, mode="reflect")
     actual = A.Pipeline([A.MedianFilter(3)])({"image": image}, seed=3)["image"][0]
     np.testing.assert_array_equal(actual, expected)
+
+
+def test_validity_checks_support_without_rounding_holes():
+    # An all-valid source must not develop holes inside the interpolation
+    # support just because an eight-corner sum rounds slightly below one.
+    image = np.ones((1,16,16,16),dtype=np.float32)
+    pipeline = A.Pipeline([A.Elastic(3,1)],compact=False)
+    out = pipeline(dict(image=image,padding_mask=np.ones_like(image,dtype=np.uint8)),seed=123)
+    assert np.all(out["padding_mask"][0,2:-2,2:-2,2:-2])

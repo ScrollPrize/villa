@@ -102,3 +102,22 @@ def test_default_workload_keeps_original_crops_and_adds_dense_regions(monkeypatc
     assert len(set(starts)) == 6
     args.start, args.additional_start = (1, 2, 3), [(4, 5, 6)]
     assert runner.crop_starts(args) == [(1, 2, 3), (4, 5, 6)]
+
+
+def test_public_cuda_benchmark(tmp_path, monkeypatch, ct_array):
+    from vc_reader.augment.cuda import is_available
+    if not is_available():
+        pytest.skip("CUDA build/device unavailable")
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "benchmarks"))
+    bench = importlib.import_module("bench_cuda_augment")
+    destination = tmp_path / "cuda.json"
+    monkeypatch.setattr(sys, "argv", [
+        "bench_cuda_augment.py", "--array", str(ct_array), "--start", "0", "0", "0",
+        "--shape", "7", "7", "7", "--reps", "1", "--warmup", "0",
+        "--build-dir", str(tmp_path), "--output", str(destination)])
+    bench.main()
+    result = json.loads(destination.read_text())
+    assert len(result["results"]) == 25
+    for row in result["results"].values():
+        assert len(row["comparisons"]) == 1
+        assert row["cpu"]["p50_ms"] > 0 and row["cuda"]["p50_ms"] > 0

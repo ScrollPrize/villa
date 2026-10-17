@@ -60,7 +60,7 @@ inline ChannelPlan channel_parameters(const MedianFilter& t, const Array&, Rando
 }
 inline ChannelPlan channel_parameters(const Sharpen& t, const Array&, Random& r) { return {"", 0, {draw(t.strength, r), double(r.chance(t.p_clamp))}}; }
 
-inline std::vector<double> local_kernel(const LocalOptions& t, const Grid& g, Random& r, bool centered = false) {
+inline std::vector<std::vector<double>> local_axes(const LocalOptions& t, const Grid& g, Random& r) {
     std::vector<std::vector<double>> kernels(g.shape.size());
     for (std::size_t a = 0; a < g.shape.size(); ++a) {
         double center = draw(t.loc, r) * g.shape[a], sigma = draw(t.scale, r);
@@ -69,6 +69,10 @@ inline std::vector<double> local_kernel(const LocalOptions& t, const Grid& g, Ra
         for (std::size_t x = 0; x < g.shape[a]; ++x)
             kernels[a][x] = .5 * (std::erf((x + .5 - center) / (sigma * std::sqrt(2.))) - std::erf((x - .5 - center) / (sigma * std::sqrt(2.))));
     }
+    return kernels;
+}
+inline std::vector<double> local_kernel(const LocalOptions& t, const Grid& g, Random& r, bool centered = false) {
+    auto kernels = local_axes(t,g,r);
     // The nonnegative separable product is monotone in every axis, including
     // floating-point rounding. Its extrema occur at the per-axis extrema;
     // multiply those in the same order as each voxel, without volume scans.

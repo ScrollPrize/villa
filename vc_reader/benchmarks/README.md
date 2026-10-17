@@ -53,8 +53,8 @@ for median and Elastic. `--gpu-field` adds GPU expansion and normalization of
 the dense displacement field, with CPU draws for the small random control
 lattice. The benchmark reports kernel and host-to-host latencies separately,
 validates every timed CPU/GPU output pair, and records numerical differences
-from the GPU's fixed double-precision reduction trees. CUDA is not enabled in
-the public pipeline.
+from the GPU's fixed double-precision reduction trees. The experiment is retained separately from the optional
+[public CUDA backend](#public-cuda-augmentation-benchmark).
 
 ```sh
 AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
@@ -956,3 +956,128 @@ pickle, input ownership, Torch output and concurrent calls to the same pipeline.
 Weighted statistics remain deterministic but can change rounding on other
 inputs; `compact=False` retains ordinary reduction order. No training-quality
 or macOS/arm64 performance claim is made.
+
+## Public CUDA augmentation benchmark
+
+`bench_cuda_augment.py` benchmarks all 24 primary cases through
+`Pipeline(backend="cuda")`, paired with the default CPU pipeline, plus an
+additional continuous-valued median case. It shares the existing benchmark
+case definitions and six PHercParis4 crop locations. It checks every timed
+pair, exact CUDA replay/repeatability, preserved inputs, and an untimed dense
+CPU reference. No Torch, SciPy, new packages, or downloads are required.
+
+Build with the [CUDA instructions](../docs/augmentation.md#optional-cuda-backend),
+then run from the repository root using the matching Python/extension ABI:
+
+```bash
+export AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+export PYTHONPATH=vc_reader/src:vc_reader/.venv/lib/python3.14/site-packages
+for edge in 64 128; do
+  taskset -c 0 vc_reader/.venv/bin/python -S vc_reader/benchmarks/run_native.py \
+    /tmp/vc-augment-cuda/_augment.cpython-314-x86_64-linux-gnu.so \
+    vc_reader/benchmarks/bench_cuda_augment.py --shape "$edge" "$edge" "$edge" \
+    --reps 5 --warmup 2 --build-dir /tmp/vc-augment-cuda \
+    --output "vc_reader/benchmarks/results/cuda-augment-$edge.json"
+done
+```
+
+`taskset` is optional Linux CPU pinning; omit it on other platforms. `--array`,
+`--start`, and repeated `--additional-start` select other local data. `--only`
+accepts comma-separated names. The default array is the local cached
+PHercParis4 2.399 µm volume's level 2 from `bench_augment.py`; the six crop
+origins are in `bench_augment_native.py`. Labels are threshold masks, not
+annotations. Image values are float32 uint8/255; the continuous median adds
+fixed Gaussian noise with std .01 and seed 123.
+
+### Measurements: 2026-10-16
+
+Intel Core Ultra 7 270K Plus, RTX 5090, driver 595.84, CUDA 13.3,
+GCC 15.2, Release, `sm_120`,
+`--fmad=false`, no fast math. One CPU thread pinned to CPU 0; five repetitions
+per crop (30 observations per case/backend), two warmups; seeded shuffled case
+and backend order. Timings include the public API, CPU sampling/validation,
+all allocations, transfers, and synchronization. Reads, normalization,
+comparisons, and output destruction are excluded. JSON files under ignored
+`benchmarks/results/` retain individual observations, hashes, build flags,
+commands, crop inputs, and per-pair numerical differences.
+
+128³ public API latency in milliseconds; each cell is **mean / p50 / p95**.
+Speedup uses paired backends' pooled p50. CPU uses its default compact mode;
+CUDA uses dense buffers.
+
+| Transform | CPU ms | CUDA ms | Speedup |
+|---|---:|---:|---:|
+| BrightnessMultiply | 1.330 / 1.292 / 1.539 | 4.175 / 3.104 / 7.138 | 0.42× |
+| BrightnessAdd | 1.605 / 1.428 / 2.951 | 4.573 / 4.225 / 8.160 | 0.34× |
+| Contrast | 6.229 / 5.898 / 7.989 | 8.369 / 6.985 / 12.204 | 0.84× |
+| Gamma | 7.364 / 7.105 / 11.587 | 7.779 / 7.319 / 11.406 | 0.97× |
+| Invert | 2.253 / 2.308 / 2.499 | 5.461 / 6.027 / 8.774 | 0.38× |
+| GaussianNoise | 9.497 / 9.449 / 9.650 | 3.577 / 3.085 / 5.587 | 3.06× |
+| RicianNoise | 19.302 / 19.238 / 19.345 | 4.710 / 3.905 / 8.481 | 4.93× |
+| GaussianBlur | 9.074 / 8.374 / 11.077 | 4.355 / 4.088 / 7.317 | 2.05× |
+| MedianFilter | 15.019 / 15.559 / 19.139 | 4.372 / 3.240 / 8.216 | 4.80× |
+| Sharpen | 8.389 / 8.344 / 12.299 | 7.115 / 6.926 / 7.757 | 1.20× |
+| BrightnessGradient | 10.677 / 9.839 / 12.925 | 17.079 / 17.122 / 18.323 | 0.57× |
+| LocalContrast | 5.729 / 4.787 / 8.961 | 11.385 / 11.653 / 12.299 | 0.41× |
+| LocalGamma | 15.896 / 15.253 / 18.386 | 13.248 / 13.522 / 15.723 | 1.13× |
+| LocalSmoothing | 14.655 / 13.573 / 18.788 | 10.526 / 12.016 / 17.580 | 1.13× |
+| BlankRectangle | 0.841 / 0.882 / 0.951 | 4.397 / 3.546 / 6.061 | 0.25× |
+| SliceIllumination | 1.515 / 1.358 / 2.940 | 4.281 / 3.341 / 7.382 | 0.41× |
+| Smear | 7.431 / 7.628 / 9.343 | 7.894 / 7.672 / 9.884 | 0.99× |
+| Flip | 1.628 / 1.499 / 3.211 | 3.459 / 3.086 / 5.974 | 0.49× |
+| Rotate90 | 2.485 / 2.100 / 4.854 | 3.420 / 3.105 / 5.116 | 0.68× |
+| Transpose | 2.277 / 2.009 / 4.010 | 3.554 / 3.144 / 5.180 | 0.64× |
+| Elastic | 84.095 / 83.774 / 86.807 | 42.954 / 42.570 / 45.534 | 1.97× |
+| LowResolution | 9.533 / 9.396 / 10.891 | 4.383 / 3.468 / 7.941 | 2.71× |
+| ThickSlice | 3.118 / 2.287 / 5.190 | 5.189 / 4.484 / 8.194 | 0.51× |
+| RandomBinaryOperator | 21.203 / 19.303 / 29.270 | 18.167 / 19.393 / 24.559 | 1.00× |
+| MedianFilterContinuous | 55.665 / 55.056 / 59.617 | 3.028 / 3.011 / 3.246 | 18.29× |
+
+At 64³, median p50 was 1.881 → 0.375 ms (5.02×); continuous median was
+6.397 → 0.407 ms (15.70×); Elastic was 8.098 → 2.802 ms (2.89×).
+All real-data label comparisons were exact. Only Gamma, LocalGamma,
+GaussianNoise, and RicianNoise changed floating-point values: maximum absolute
+error was 1.20e-7 or less across both sizes. The CPU backend also matched 108
+saved comparisons from the previous CPU optimization session exactly, using
+`check_augment_build.py /tmp/vc-cpu4-reference --only
+Elastic,LocalSmoothing,LocalGamma,BrightnessGradient,LocalContrast --atol 0 --rtol 0`.
+
+These are host-array measurements. Transfers and allocation outweigh device
+work for many small operations, so CUDA is not universally faster and `auto`
+only checks availability. Local fields, Elastic field construction, reductions,
+validity restoration, and mask-channel conflict resolution still run on CPU.
+GPU-resident chains, wider-median tuning, and other GPUs/architectures have not
+been benchmarked. The CPU default remains available for those workloads.
+
+### Profiler and memory checks
+
+Nsight Systems profiled one real 128³ crop at `(8960,4480,3200)`, with Elastic,
+LocalSmoothing, RandomBinaryOperator, and MedianFilterContinuous. Among device
+kernel time, image/label interpolation accounted for 71.8%, convolution 13.3%,
+morphology 8.3%, median 5.4%, and blending 1.1%. Per-launch medians were about
+426/360 µs for image/label interpolation, 49 µs for convolution, 91 µs for
+morphology, 58 µs for median, and 13 µs for blending. Device memory copies took
+67.4 ms across all profiled calls, versus 6.6 ms in kernels. The first allocation
+also paid context startup; profiled timings are excluded from the table above.
+This explains why faster kernels do not guarantee faster host-array pipelines.
+
+```bash
+/usr/local/cuda/bin/nsys profile --trace=cuda --sample=none --cpuctxsw=none \
+  -o /tmp/vc-augment-cuda-profile \
+  taskset -c 0 vc_reader/.venv/bin/python -S vc_reader/benchmarks/run_native.py \
+  /tmp/vc-augment-cuda/_augment.cpython-314-x86_64-linux-gnu.so \
+  vc_reader/benchmarks/bench_cuda_augment.py --shape 128 128 128 \
+  --start 8960 4480 3200 \
+  --only MedianFilterContinuous,Elastic,LocalSmoothing,RandomBinaryOperator \
+  --reps 1 --warmup 1 --build-dir /tmp/vc-augment-cuda \
+  --output /tmp/vc-augment-cuda-profile.json
+/usr/local/cuda/bin/nsys stats \
+  --report cuda_gpu_kern_sum,cuda_api_sum,cuda_gpu_mem_time_sum \
+  /tmp/vc-augment-cuda-profile.nsys-rep
+
+/usr/local/cuda/bin/compute-sanitizer --tool memcheck --target-processes all \
+  --error-exitcode 99 vc_reader/.venv/bin/python -S \
+  vc_reader/benchmarks/run_native.py \
+  /tmp/vc-augment-cuda/_augment.cpython-314-x86_64-linux-gnu.so \
+  -m pytest vc_reader/tests/test_augment_cuda.py -q
+```
