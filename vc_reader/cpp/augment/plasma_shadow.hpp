@@ -9,9 +9,9 @@ inline ChannelPlan channel_parameters(const PlasmaShadow& t,const Array& a,Rando
 }
 struct PlasmaShadowKernel {
     double strength,scale,persistence;int octaves;std::uint64_t seed;
-    VCR_HD double operator()(const double* v,std::size_t i,const volume_detail::ChannelContext& c) const {
+    template<class T> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T>& c) const {
         using namespace volume_detail;
-        return v[i]*(1-strength*(fractal(c.grid,i,seed,scale,persistence,octaves)+1)*.5);
+        return v[i]*(T(1)-T(strength)*(fractal(c.grid,i,seed,T(scale),T(persistence),octaves)+T(1))*T(.5));
     }
 };
 inline PlasmaShadowKernel make_kernel(const PlasmaShadow& t,const ChannelPlan& p) { return {p.values[0],p.values[1],p.values[2],t.octaves,p.seed}; }

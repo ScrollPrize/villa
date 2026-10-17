@@ -9,9 +9,9 @@ inline ChannelPlan channel_parameters(const PlasmaBrightnessContrast& t,const Ar
 }
 struct PlasmaBrightnessContrastKernel {
     double brightness,contrast,scale,persistence;int octaves;std::uint64_t seed;
-    VCR_HD double operator()(const double* v,std::size_t i,const volume_detail::ChannelContext& c) const {
+    template<class T> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T>& c) const {
         using namespace volume_detail;
-        double f=fractal(c.grid,i,seed,scale,persistence,octaves);return (v[i]-c.input.mean)*(1+contrast*f)+c.input.mean+brightness*(c.input.high-c.input.low)*f;
+        T f=fractal(c.grid,i,seed,T(scale),T(persistence),octaves),mean=T(c.input.mean);return (v[i]-mean)*(T(1)+T(contrast)*f)+mean+T(brightness)*T(c.input.high-c.input.low)*f;
     }
 };
 inline PlasmaBrightnessContrastKernel make_kernel(const PlasmaBrightnessContrast& t,const ChannelPlan& p) { return {p.values[0],p.values[1],p.values[2],p.values[3],t.octaves,p.seed}; }

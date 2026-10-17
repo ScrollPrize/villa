@@ -2,14 +2,15 @@
 #include "volume_grid.hpp"
 namespace vcr::augment::volume_detail {
 // FFT uses Bluestein for arbitrary line lengths, backed by a radix-2 FFT.
-// Identical transform convention and arithmetic are used on both backends.
-struct Complex {
-    double re=0,im=0;
-    VCR_HD Complex operator+(Complex b) const{return {re+b.re,im+b.im};}
-    VCR_HD Complex operator-(Complex b) const{return {re-b.re,im-b.im};}
-    VCR_HD Complex operator*(Complex b) const{return {re*b.re-im*b.im,re*b.im+im*b.re};}
-    VCR_HD Complex scale(double x) const{return {re*x,im*x};}
+// CUDA uses cuFFT with the same transform convention.
+template<class T> struct ComplexT {
+    T re=0,im=0;
+    VCR_HD ComplexT operator+(ComplexT b) const{return {re+b.re,im+b.im};}
+    VCR_HD ComplexT operator-(ComplexT b) const{return {re-b.re,im-b.im};}
+    VCR_HD ComplexT operator*(ComplexT b) const{return {re*b.re-im*b.im,re*b.im+im*b.re};}
+    VCR_HD ComplexT scale(T x) const{return {re*x,im*x};}
 };
+using Complex=ComplexT<double>;
 VCR_HD inline Complex phase(double x){return {cos(x),sin(x)};}
 VCR_HD inline void radix2(Complex* v,std::size_t n,bool inverse) {
     for(std::size_t i=1,j=0;i<n;++i){std::size_t bit=n>>1;for(;j&bit;bit>>=1)j^=bit;j^=bit;if(i<j){auto t=v[i];v[i]=v[j];v[j]=t;}}

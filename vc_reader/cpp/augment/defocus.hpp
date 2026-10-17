@@ -9,9 +9,9 @@ inline ChannelPlan channel_parameters(const Defocus& t,const Array& a,Random& r)
 }
 struct DefocusKernel {
     double radius;
-    VCR_HD double operator()(const double* v,std::size_t i,const volume_detail::ChannelContext& c) const {
+    template<class T> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T>& c) const {
         using namespace volume_detail;
-        if(radius==0)return v[i];int r=int(ceil(radius));double sum=0,count=0;for(int z=-r;z<=r;++z)for(int y=-r;y<=r;++y)for(int x=-r;x<=r;++x)if(double(z*z+y*y+x*x)<=radius*radius){double q[3]{double(c.grid.coord(i,0))+z,double(c.grid.coord(i,1))+y,double(c.grid.coord(i,2))+x};sum+=interpolate(v,c.grid,q);++count;}return sum/count;
+        if(radius==0)return v[i];int r=int(ceil(radius));T sum=0;int count=0;for(int z=-r;z<=r;++z)for(int y=-r;y<=r;++y)for(int x=-r;x<=r;++x)if(double(z*z+y*y+x*x)<=radius*radius){std::size_t index=0;const int offset[3]{z,y,x};for(int a=0;a<3;++a){auto q=(long long)c.grid.coord(i,a)+offset[a];q=q<0?0:q>=(long long)c.grid.n[a]?(long long)c.grid.n[a]-1:q;index+=std::size_t(q)*c.grid.stride[a];}sum+=v[index];++count;}return sum/count;
     }
 };
 inline DefocusKernel make_kernel(const Defocus& t,const ChannelPlan& p) { return {p.values[0]}; }

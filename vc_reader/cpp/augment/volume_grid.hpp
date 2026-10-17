@@ -12,12 +12,13 @@ struct Grid3 {
     }
     VCR_HD std::size_t coord(std::size_t i,int a) const { return i/stride[a]%n[a]; }
 };
-VCR_HD inline double clamp(double x,double a,double b) { return x<a?a:x>b?b:x; }
-template<class T> VCR_HD double interpolate(const T* v,const Grid3& g,const double* q) {
+template<class T> VCR_HD inline T clamp(T x,T a,T b) { return x<a?a:x>b?b:x; }
+VCR_HD inline double clamp(double x,double a,double b) { return clamp<double>(x,a,b); }
+template<class T> VCR_HD T interpolate(const T* v,const Grid3& g,const double* q) {
     std::size_t lo[3],hi[3];double f[3];
     for(int a=0;a<3;++a) { double x=clamp(q[a],0,double(g.n[a]-1));lo[a]=std::size_t(floor(x));hi[a]=lo[a]+1<g.n[a]?lo[a]+1:lo[a];f[a]=x-lo[a]; }
-    double result=0;
-    for(int c=0;c<8;++c) { std::size_t j=0;double w=1;for(int a=0;a<3;++a){int b=(c>>a)&1;j+=(b?hi[a]:lo[a])*g.stride[a];w*=b?f[a]:1-f[a];} result+=w*double(v[j]); }
+    T result=0;
+    for(int c=0;c<8;++c) { std::size_t j=0;double w=1;for(int a=0;a<3;++a){int b=(c>>a)&1;j+=(b?hi[a]:lo[a])*g.stride[a];w*=b?f[a]:1-f[a];} result+=T(w)*v[j]; }
     return result;
 }
 

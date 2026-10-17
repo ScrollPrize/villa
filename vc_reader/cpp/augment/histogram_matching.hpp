@@ -7,7 +7,7 @@ inline ChannelPlan channel_parameters(const HistogramMatching& t,const Array& a,
 }
 struct HistogramMatchingKernel {
     double blend;int bins;
-    VCR_HD double operator()(const double* v,std::size_t i,const volume_detail::ChannelContext& c) const {
+    template<class T> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T>& c) const {
         using namespace volume_detail;if(blend==0)return v[i];double rank=c.table[bin(v[i],c.input.low,c.input.high,bins)];const double* ref=c.table+bins;
         int j=0;while(j+1<bins && ref[j]<rank)++j;
         double mapped=c.reference.low+(c.reference.high-c.reference.low)*double(j)/(bins-1);return (1-blend)*v[i]+blend*mapped;

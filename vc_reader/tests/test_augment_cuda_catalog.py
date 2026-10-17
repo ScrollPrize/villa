@@ -164,3 +164,23 @@ def test_native_batch_pyramid_stays_on_device():
     for level, spec in enumerate(arrays['mask']):
         result = cuda.DeviceArray(*spec)
         np.testing.assert_array_equal(result.numpy(), np.stack([v[level] for v in expected]))
+
+
+@pytest.mark.parametrize('full', [False, True])
+@pytest.mark.parametrize('seed', [0, 19, 123])
+def test_parallel_components_across_blocks(full, seed):
+    rng=np.random.default_rng(37)
+    mask=(rng.random((2,31,33,35))>.94).astype(np.int16)
+    # Dense components spanning many CUDA blocks, including adjacent classes.
+    mask[:,2:13,3:15,4:17]=1
+    mask[:,2:13,3:15,17:22]=2
+    source={'image':rng.random(mask.shape,dtype=np.float32),'mask':mask}
+    verify([A.RemoveComponents(on='mask',max_fraction=.8,p_fill=1,full_connectivity=full)],source,seed=seed)
+    verify([A.ObjectDropout(drop_probability=.5)],source,seed=seed)
+
+
+@pytest.mark.parametrize('transform', [A.RandomToneCurve(),A.CLAHE(tile_shape=(8,8,8)),A.PlasmaBrightnessContrast()])
+def test_parallel_statistics_non_cubic_volume(transform):
+    rng=np.random.default_rng(72)
+    data=rng.uniform(.1,.9,(1,31,33,35)).astype(np.float32)
+    verify([transform],{'image':data})

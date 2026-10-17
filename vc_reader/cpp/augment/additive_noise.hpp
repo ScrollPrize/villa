@@ -9,14 +9,14 @@ inline ChannelPlan channel_parameters(const AdditiveNoise& t,const Array& a,Rand
 }
 struct AdditiveNoiseKernel {
     double scale,mean,alpha,beta;int distribution;std::uint64_t seed;
-    VCR_HD double operator()(const double* v,std::size_t i,const volume_detail::ChannelContext& c) const {
+    template<class T> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T>& c) const {
         using namespace volume_detail;
         Rng r{mix(seed+i)};double u=r.u(),noise=0;
         if(distribution==0)noise=(2*u-1)*scale;
         else if(distribution==1)noise=scale*r.gaussian();
         else if(distribution==2)noise=-scale*(u<.5?-1:1)*log(1-2*fabs(u-.5));
         else {double a=gamma_sample(alpha,r),b=gamma_sample(beta,r);noise=scale*(a/(a+b)-alpha/(alpha+beta));}
-        return v[i]+mean+noise;
+        return v[i]+T(mean)+T(noise);
     }
 };
 inline AdditiveNoiseKernel make_kernel(const AdditiveNoise& t,const ChannelPlan& p) { return {p.values[0],p.values[1],p.values[2],p.values[3],t.distribution,p.seed}; }

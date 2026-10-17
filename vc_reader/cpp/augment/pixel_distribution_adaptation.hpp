@@ -7,7 +7,7 @@ inline ChannelPlan channel_parameters(const PixelDistributionAdaptation& t,const
 }
 struct PixelDistributionAdaptationKernel {
     double blend;int mode;
-    VCR_HD double operator()(const double* v,std::size_t i,const volume_detail::ChannelContext& c) const {
+    template<class T> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T>& c) const {
         if(blend==0)return v[i];double span=c.input.high-c.input.low;
         double mapped=mode==1?(span>0?(v[i]-c.input.low)/span:0)*(c.reference.high-c.reference.low)+c.reference.low:
             (c.input.stddev>0?(v[i]-c.input.mean)/c.input.stddev:0)*c.reference.stddev+c.reference.mean;

@@ -7,9 +7,9 @@ inline ChannelPlan channel_parameters(const FDA& t,const Array& a,Random& r) {
     volume_detail::require_volume(a);double blend=draw(t.blend,r),fraction=draw(t.fraction,r);probability(blend);probability(fraction);
     require(t.reference.shape.size()==4 && Shape(t.reference.shape.begin()+1,t.reference.shape.end())==a.spatial(),"FDA reference must match spatial shape");ChannelPlan p;p.values={blend,fraction};return p;
 }
-VCR_HD inline volume_detail::Complex adapt_amplitude(volume_detail::Complex input,volume_detail::Complex reference,double blend) {
-    using namespace volume_detail;double amplitude=hypot(input.re,input.im),target=hypot(reference.re,reference.im);
-    auto unit=amplitude?input.scale(1/amplitude):Complex{1,0};return unit.scale((1-blend)*amplitude+blend*target);
+template<class T> VCR_HD inline volume_detail::ComplexT<T> adapt_amplitude(volume_detail::ComplexT<T> input,volume_detail::ComplexT<T> reference,T blend) {
+    using namespace volume_detail;T amplitude=hypot(input.re,input.im),target=hypot(reference.re,reference.im);
+    auto unit=amplitude?input.scale(T(1)/amplitude):ComplexT<T>{1,0};return unit.scale((T(1)-blend)*amplitude+blend*target);
 }
 inline void channel_apply(const FDA& t,std::vector<double>& v,const Grid& grid,const ChannelPlan& p){
     using namespace volume_detail;if(p.values[0]==0)return;Grid3 g(grid.shape);auto ref=reference_channel(t.reference,p.channel);std::vector<Complex> source(g.size),reference(g.size);

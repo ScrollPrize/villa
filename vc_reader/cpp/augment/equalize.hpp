@@ -7,7 +7,7 @@ inline ChannelPlan channel_parameters(const Equalize& t,const Array& a,Random&) 
 }
 struct EqualizeKernel {
     int bins;
-    VCR_HD double operator()(const double* v,std::size_t i,const volume_detail::ChannelContext& c) const {
+    template<class T> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T>& c) const {
         using namespace volume_detail;double span=c.input.high-c.input.low;if(span==0)return v[i];double first=0;
         for(int b=0;b<bins;++b)if(c.table[b]>0){first=c.table[b];break;}
         double rank=c.table[bin(v[i],c.input.low,c.input.high,bins)];

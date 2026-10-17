@@ -9,9 +9,9 @@ inline ChannelPlan channel_parameters(const BiasField& t,const Array& a,Random& 
 }
 struct BiasFieldKernel {
     double std,scale;std::uint64_t seed;
-    VCR_HD double operator()(const double* v,std::size_t i,const volume_detail::ChannelContext& c) const {
+    template<class T> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T>& c) const {
         using namespace volume_detail;
-        double q[3];for(int a=0;a<3;++a)q[a]=double(c.grid.coord(i,a))*scale;return v[i]*exp(std*lattice(q,seed,true,false));
+        T q[3];for(int a=0;a<3;++a)q[a]=T(c.grid.coord(i,a))*T(scale);return v[i]*exp(T(std)*lattice(q,seed,true,false));
     }
 };
 inline BiasFieldKernel make_kernel(const BiasField& t,const ChannelPlan& p) { return {p.values[0],p.values[1],p.seed}; }

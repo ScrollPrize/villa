@@ -113,7 +113,7 @@ if(VC_READER_ENABLE_CUDA)
         cpp/augment/cuda/transpose.cu
     )
     target_compile_definitions(_augment PRIVATE VC_READER_CUDA=1)
-    target_link_libraries(_augment PRIVATE CUDA::cudart)
+    target_link_libraries(_augment PRIVATE CUDA::cudart CUDA::cufft)
     set_target_properties(_augment PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
     target_compile_options(_augment PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
 endif()

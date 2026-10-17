@@ -8,11 +8,11 @@ inline ChannelPlan channel_parameters(const RingingOvershoot& t,const Array& a,R
 }
 struct RingingOvershootKernel {
     double cutoff;int radius,axis;
-    VCR_HD double operator()(const double* v,std::size_t i,const volume_detail::ChannelContext& c) const {
-        using namespace volume_detail;if(cutoff==1)return v[i];double sum=0,total=0;
+    template<class T> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T>& c) const {
+        using namespace volume_detail;if(cutoff==1)return v[i];T sum=0,total=0;
         for(int j=-radius;j<=radius;++j){double weight=j?sin(pi*cutoff*j)/(pi*j):cutoff;weight*=.5+.5*cos(pi*j/(radius+1));
             auto at=(long long)c.grid.coord(i,axis)+j;at=at<0?0:at>=(long long)c.grid.n[axis]?(long long)c.grid.n[axis]-1:at;
-            auto index=i-c.grid.coord(i,axis)*c.grid.stride[axis]+std::size_t(at)*c.grid.stride[axis];sum+=weight*v[index];total+=weight;}
+            auto index=i-c.grid.coord(i,axis)*c.grid.stride[axis]+std::size_t(at)*c.grid.stride[axis];sum+=T(weight)*v[index];total+=T(weight);}
         return sum/total;
     }
 };

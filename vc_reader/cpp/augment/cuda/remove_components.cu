@@ -1,14 +1,17 @@
 #include "label_values.cuh"
+#include "components.cuh"
 namespace vcr::augment::cuda {
-template<class T> __global__ void find_components(const T* input,component_detail::GridView grid,bool full,double max_fraction,
-        std::uint8_t* visited,std::size_t* queue,std::size_t* offsets,std::size_t* eligible,std::size_t* count) {
-    const auto total=component_detail::components(input,grid,full,visited,queue,offsets); *count=0;
-    for(std::size_t c=0;c<total;++c)if(offsets[c+1]-offsets[c]<grid.size*max_fraction)eligible[(*count)++]=c;
+__global__ void count_components(const ComponentIndex* parents,std::size_t n,ComponentIndex* sizes){
+    EACH_INDEX(n)if(parents[i]!=n)atomicAdd(sizes+parents[i],1ULL);
 }
-__global__ void component_extent(const std::size_t* offsets,const std::size_t* eligible,std::size_t index,std::size_t* extent) {
-    const auto c=eligible[index];extent[0]=offsets[c];extent[1]=offsets[c+1]-offsets[c];
+__global__ void eligible_components(const ComponentIndex* sizes,std::size_t n,double max_fraction,std::uint8_t* flags){
+    EACH_INDEX(n)flags[i]=sizes[i]>0 && sizes[i]<n*max_fraction;
 }
-__global__ void component_indices(const std::size_t* queue,double* indices,std::size_t count) {EACH_INDEX(count)indices[i]=double(queue[i]);}
+__global__ void component_extent(const ComponentIndex* sizes,const ComponentIndex* eligible,std::size_t index,ComponentIndex* extent){
+    const auto root=eligible[index];extent[0]=root;extent[1]=sizes[root];
+}
+__global__ void component_members(const ComponentIndex* parents,std::size_t n,ComponentIndex root,std::uint8_t* flags){EACH_INDEX(n)flags[i]=parents[i]==root;}
+__global__ void component_indices(const ComponentIndex* indices,double* field,std::size_t count){EACH_INDEX(count)field[i]=double(indices[i]);}
 template<class T> __global__ void erase_component(T* data,std::size_t n,std::size_t channel,long long other,const double* indices,std::size_t count) {
     EACH_INDEX(count) {const auto j=std::size_t(indices[i]);data[channel*n+j]=0;if(other>=0)data[std::size_t(other)*n+j]=1;}
 }
@@ -21,13 +24,19 @@ Parameters sample_components(const RemoveComponents& t,const Sample&,Random& r,b
     const auto& source=session.arrays.at(t.on);require_exact_labels(source,session);session.check_status();
     DeviceArray a(source.shape,source.kind,source.bytes);check(cudaMemcpyAsync(a.buffer->ptr,source.buffer->ptr,source.size()*source.bytes,cudaMemcpyDeviceToDevice,vcr::device::stream()));
     Grid g(a.spatial());const auto channels=selected_channels(t.channels,a.shape[0],&r);Parameters p;
-    Buffer<std::uint8_t> visited(g.size);Buffer<std::size_t> queue(g.size),offsets(g.size+1),eligible(g.size),count(1),extent(2);
+    Buffer<std::uint8_t> flags(g.size);Buffer<ComponentIndex> parents(g.size),sizes(g.size),eligible(g.size),count(1),extent(2);
     for(auto c:channels)if(r.chance(t.p_channel)) {
-        a.typed([&](auto v){find_components<<<1,1,0,vcr::device::stream()>>>(v.ptr+c*g.size,component_detail::GridView(g),t.full_connectivity,t.max_fraction,visited.ptr,queue.ptr,offsets.ptr,eligible.ptr,count.ptr);});check(cudaGetLastError());
-        std::size_t total;count.download(&total);if(!total)continue;
-        component_extent<<<1,1,0,vcr::device::stream()>>>(offsets.ptr,eligible.ptr,r.index(total),extent.ptr);check(cudaGetLastError());
-        std::size_t range[2];extent.download(range);auto field=std::make_shared<Buffer<double>>(range[1]);
-        component_indices<<<blocks(field->size),256,0,vcr::device::stream()>>>(queue.ptr+range[0],field->ptr,field->size);check(cudaGetLastError());
+        a.typed([&](auto v){label_components<false>(v.ptr+c*g.size,g,0,t.full_connectivity,parents);});
+        check(cudaMemsetAsync(sizes.ptr,0,sizes.size*sizeof(ComponentIndex),vcr::device::stream()));
+        count_components<<<blocks(g.size),256,0,vcr::device::stream()>>>(parents.ptr,g.size,sizes.ptr);
+        eligible_components<<<blocks(g.size),256,0,vcr::device::stream()>>>(sizes.ptr,g.size,t.max_fraction,flags.ptr);check(cudaGetLastError());
+        select_component_indices(flags,eligible,count);
+        ComponentIndex total;count.download(&total);if(!total)continue;
+        component_extent<<<1,1,0,vcr::device::stream()>>>(sizes.ptr,eligible.ptr,r.index(total),extent.ptr);check(cudaGetLastError());
+        ComponentIndex range[2];extent.download(range);auto field=std::make_shared<Buffer<double>>(range[1]);
+        component_members<<<blocks(g.size),256,0,vcr::device::stream()>>>(parents.ptr,g.size,range[0],flags.ptr);check(cudaGetLastError());
+        select_component_indices(flags,eligible,count);
+        component_indices<<<blocks(field->size),256,0,vcr::device::stream()>>>(eligible.ptr,field->ptr,field->size);check(cudaGetLastError());
         ChannelPlan plan{t.on,c,{-1}};plan.device_field=field;
         if(record){plan.field.resize(field->size);field->download(plan.field.data());}
         if(r.chance(t.p_fill) && channels.size()>1) {auto others=channels;others.erase(std::remove(others.begin(),others.end(),c),others.end());plan.values[0]=double(others[r.index(others.size())]);}

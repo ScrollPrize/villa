@@ -9,12 +9,12 @@ inline ChannelPlan channel_parameters(const Illumination& t,const Array& a,Rando
 }
 struct IlluminationKernel {
     double strength,radius;int mode;double direction[3],center[3];
-    VCR_HD double operator()(const double* v,std::size_t i,const volume_detail::ChannelContext& c) const {
+    template<class T> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T>& c) const {
         using namespace volume_detail;
-        double field=0;
-        if(mode==0){double denom=0;for(int a=0;a<3;++a){field+=direction[a]*(c.grid.n[a]>1?2*double(c.grid.coord(i,a))/double(c.grid.n[a]-1)-1:0);denom+=fabs(direction[a]);}field/=denom;}
-        else {double distance=0;for(int a=0;a<3;++a){double q=(c.grid.n[a]>1?double(c.grid.coord(i,a))/double(c.grid.n[a]-1):.5)-center[a];distance+=q*q;}field=mode==1?1-sqrt(distance/3):exp(-distance/(2*radius*radius));}
-        return v[i]*(1+strength*field);
+        T field=0;
+        if(mode==0){T denom=0;for(int a=0;a<3;++a){field+=T(direction[a])*(c.grid.n[a]>1?2*T(c.grid.coord(i,a))/T(c.grid.n[a]-1)-1:0);denom+=fabs(T(direction[a]));}field/=denom;}
+        else {T distance=0;for(int a=0;a<3;++a){T q=(c.grid.n[a]>1?T(c.grid.coord(i,a))/T(c.grid.n[a]-1):T(.5))-T(center[a]);distance+=q*q;}field=mode==1?1-sqrt(distance/T(3)):exp(-distance/(T(2)*T(radius)*T(radius)));}
+        return v[i]*(T(1)+T(strength)*field);
     }
 };
 inline IlluminationKernel make_kernel(const Illumination& t,const ChannelPlan& p) { return {p.values[0],p.values[1],t.mode,{p.values[2],p.values[3],p.values[4]},{p.values[5],p.values[6],p.values[7]}}; }

@@ -9,7 +9,7 @@ inline ChannelPlan channel_parameters(const SaltAndPepper& t,const Array& a,Rand
 }
 struct SaltAndPepperKernel {
     double amount,salt_fraction;std::uint64_t seed;
-    VCR_HD double operator()(const double* v,std::size_t i,const volume_detail::ChannelContext& c) const {
+    template<class T> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T>& c) const {
         using namespace volume_detail;
         return uniform(seed,i)<amount?(uniform(seed,i+c.grid.size)<salt_fraction?c.input.high:c.input.low):v[i];
     }

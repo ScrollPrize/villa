@@ -1,37 +1,49 @@
 #pragma once
 #include "channel.cuh"
+#include "channel_statistics.cuh"
 #include "../voxel_transform.hpp"
-namespace vcr::augment::cuda {
-namespace vd = volume_detail;
-__global__ inline void summarize_channel(const double* data,std::size_t size,vd::Stats* result) {
-    if(!threadIdx.x && !blockIdx.x)*result=vd::stats(data,size);
+namespace vcr::augment {
+struct RandomToneCurve;struct SaltAndPepper;struct Equalize;struct CLAHE;struct HistogramMatching;
+struct PlasmaBrightnessContrast;struct PixelDistributionAdaptation;
 }
-__global__ inline void check_channel_output(const double* data,std::size_t size,double limit,int* error) {
+namespace vcr::augment::cuda {
+template<class T> constexpr bool channel_moments = std::is_same_v<T,PlasmaBrightnessContrast> || std::is_same_v<T,PixelDistributionAdaptation>;
+template<class T> constexpr bool channel_bounds = channel_moments<T> || std::is_same_v<T,RandomToneCurve> || std::is_same_v<T,SaltAndPepper> || std::is_same_v<T,Equalize> || std::is_same_v<T,CLAHE> || std::is_same_v<T,HistogramMatching>;
+namespace vd = volume_detail;
+template<class T> __global__ void check_channel_output(const T* data,std::size_t size,double limit,int* error) {
     EACH_INDEX(size) if(!isfinite(data[i]) || fabs(data[i])>limit)atomicExch(error,1);
 }
-template<class Kernel> __global__ void voxel_transform_kernel(Kernel kernel,vd::Grid3 grid,const double* input,double* output,
-                                                               const vd::Stats* summary,const double* table,const vd::Stats* reference,int* error) {
-    vd::ChannelContext context{grid,*summary,table,reference?*reference:vd::Stats{}};
-    EACH_INDEX(grid.size){double value=kernel(input,i,context);if(!isfinite(value))atomicExch(error,1);output[i]=value;}
+template<class Kernel,class T> __global__ void voxel_transform_kernel(Kernel kernel,vd::Grid3 grid,const T* input,T* output,
+                                                               const vd::Stats* summary,const double* table,const vd::Stats* reference,int* error,const T* auxiliary) {
+    vd::ChannelContextT<T> context{grid,*summary,table,reference?*reference:vd::Stats{},auxiliary};
+    EACH_INDEX(grid.size){T value=kernel(input,i,context);if(!isfinite(value))atomicExch(error,1);output[i]=value;}
 }
-template<class Kernel> void launch_voxel_transform(const Kernel& kernel,const Grid& grid,View<double> input,View<double> output,
-                                                   const vd::Stats* summary,int* error,const double* table=nullptr,const vd::Stats* reference=nullptr) {
-    voxel_transform_kernel<<<blocks(input.size),256,0,vcr::device::stream()>>>(kernel,vd::Grid3(grid.shape),input.ptr,output.ptr,summary,table,reference,error);
+template<class Kernel,class T> void launch_voxel_transform(const Kernel& kernel,const Grid& grid,View<T> input,View<T> output,
+                                                   const vd::Stats* summary,int* error,const double* table=nullptr,const vd::Stats* reference=nullptr,const T* auxiliary=nullptr) {
+    voxel_transform_kernel<<<blocks(input.size),256,0,vcr::device::stream()>>>(kernel,vd::Grid3(grid.shape),input.ptr,output.ptr,summary,table,reference,error,auxiliary);
     check(cudaGetLastError());
 }
-template<class Transform,class Function> void with_double_channels(const Transform& t,Sample& s,const Parameters& p,Session& session,Function&& fn) {
+template<class Transform,class Function> void with_voxel_channels(const Transform& t,Sample& s,const Parameters& p,Session& session,Function&& fn) {
     apply_channels(t,s,p,session,[&](const auto&,auto image,const Grid& grid,const ChannelPlan& c){
-        Buffer<double> input(image.size),output(image.size);convert(View<double>{input.ptr,image.size},image);Buffer<vd::Stats> summary(1);
-        summarize_channel<<<1,1,0,vcr::device::stream()>>>(input.ptr,image.size,summary.ptr);check(cudaGetLastError());
-        fn(grid,c,View<double>{input.ptr,image.size},View<double>{output.ptr,image.size},summary.ptr,session.finite_status());
         using Value=typename decltype(image)::value_type;
+        Buffer<Value> output(image.size);Buffer<vd::Stats> summary(1);
+        if constexpr(channel_bounds<Transform>) summarize_channel(image,summary.ptr,channel_moments<Transform>);
+        else check(cudaMemsetAsync(summary.ptr,0,sizeof(vd::Stats),vcr::device::stream()));
+        fn(grid,c,image,View<Value>{output.ptr,image.size},summary.ptr,session.finite_status());
         check_channel_output<<<blocks(image.size),256,0,vcr::device::stream()>>>(output.ptr,image.size,std::numeric_limits<Value>::max(),session.finite_status());
         check(cudaGetLastError());
-        convert(image,View<double>{output.ptr,image.size});
+        copy_device(image,View<Value>{output.ptr,image.size});
     });
 }
+// Upload reference data in its original dtype, without promoting an entire
+// float32 reference volume. Small summaries/histogram CDFs retain their precision.
+template<class Function> void with_reference_channel(const vd::ReferenceVolume& reference,std::size_t channel,Function&& fn){
+    auto values=vd::reference_channel(reference,channel);
+    if(reference.wide){Buffer<double> data(values);fn(View<double>{data.ptr,data.size});}
+    else{Buffer<float> data(std::vector<float>(values.begin(),values.end()));fn(View<float>{data.ptr,data.size});}
+}
 template<class Transform> void apply_voxel_channels(const Transform& t,Sample& s,const Parameters& p,Session& session) {
-    with_double_channels(t,s,p,session,[&](const Grid& g,const ChannelPlan& c,auto input,auto output,const auto* stats,int* error){
+    with_voxel_channels(t,s,p,session,[&](const Grid& g,const ChannelPlan& c,auto input,auto output,const auto* stats,int* error){
         launch_voxel_transform(make_kernel(t,c),g,input,output,stats,error);
     });
 }

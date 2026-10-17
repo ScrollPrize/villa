@@ -9,7 +9,7 @@ inline ChannelPlan channel_parameters(const ShotNoise& t,const Array& a,Random& 
 }
 struct ShotNoiseKernel {
     double photons;std::uint64_t seed;
-    VCR_HD double operator()(const double* v,std::size_t i,const volume_detail::ChannelContext& c) const {
+    template<class T> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T>& c) const {
         using namespace volume_detail;
         if(v[i]<0 || v[i]*photons>1e12)return NAN;Rng r{mix(seed+i)};return poisson(v[i]*photons,r)/photons;
     }

@@ -1327,3 +1327,78 @@ also builds and passes its six-crop, edge-7 smoke run with the shared helpers.
   -m pytest vc_reader/tests/test_augment_cuda.py -q \
   -k 'chain_and_inplace or elastic_dense_validity_support'
 ```
+
+## Complete catalog and slice gallery
+
+`bench_augment_catalog.py` covers every native `Op`, including label operations,
+new volumetric transforms, and the two 2D-only tracing operations. It reuses the
+primary configurations from `bench_augment.py`; `augment_catalog.py` supplies
+explicit configurations for the rest. The coverage regression test compares the
+catalog with the C++ variant, so additions cannot silently disappear from this
+benchmark. NumPy, Pillow, and existing CUDA reader/augmentation builds are needed.
+No additional augmentation libraries are imported.
+
+The Paris4 run uses level `/2`, center ZYX `(9064,3664,3664)`, and nested 128³ and
+256³ float32 crops normalized by 255. Reference-based transforms use a second
+crop 384 level-2 voxels further along Z. Binary labels are `CT > .5`, not manual
+annotations. `MaskImage` receives -1 outside that foreground. Channel misalignment
+uses two channels (identical CT copies) and changes only the second; other
+intensity cases use one channel. Constructor parameters and input hashes are
+recorded in JSON and printed in each preview.
+
+Each case uses one warmup and five timed repetitions, with seeds `123 + rep`
+and reproducibly shuffled backend order. CPU uses the default lossless compact
+path and one thread. CUDA is measured both through the host-array API (including
+uploads/downloads) and with resident `DeviceArray` inputs/outputs. Resident
+measurements include the owning device input copy, validation, and synchronization;
+they exclude the initial upload and the explicit download for correctness checks.
+All modes exclude file reads, input preparation, pipeline construction, output
+destruction, comparisons, and PNG rendering. Every measured CUDA output is
+compared against the same-seed CPU output: exact labels, float `atol=rtol=3e-6`.
+Errors are retained in the report; failed cases are not presented as successful
+speedups. Timings are checkpoints after each case and include mean/p50/p95/min/max
+and all individual observations. This is one crop center and one configuration
+per transform, not an average over all training workloads.
+
+From `vc_reader/`, using the builds in this workspace:
+
+```bash
+export AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+export PYTHONPATH=src
+for size in 128 256; do
+  .venv/bin/python benchmarks/run_native.py \
+    /tmp/vc-reader-cuda/_native.cpython-314-x86_64-linux-gnu.so \
+    benchmarks/run_native.py \
+    /tmp/vc-volume-cuda/_augment.cpython-314-x86_64-linux-gnu.so \
+    benchmarks/bench_augment_catalog.py \
+    --size "$size" --reps 5 --warmup 1 \
+    --output benchmarks/results/full-catalog-paris4
+done
+```
+
+Run the two sizes sequentially to avoid CPU/GPU contention. `--only` selects
+comma-separated names. `--resume` skips completed names after checking the build,
+inputs and repetition counts. Adjust extension paths/ABI suffixes for your builds.
+The JSON records the actual extension hash, build flags, CPU/GPU, thread settings,
+command, and Git revision.
+
+Open `results/full-catalog-paris4/index.html` for the searchable timing table and
+image gallery. `timings.csv`, `128.json`, `256.json`, and
+`previews/<size>/<augmentation>.png` are standalone artifacts. Previews show
+original central Z/Y/X slices above augmented slices, with matching windows for
+like-valued data and labeled windows for derived quantities. Label operations
+show their label output; structure tensors show zz; deep supervision shows its
+half-resolution level while timing all levels. Metadata-only pseudo-2D reshapes
+are displayed in their original volume grid; FromPseudo2D includes ToPseudo2D
+setup. StripGeometry and SurfacePerturb are separately marked **2D companion**
+measurements on the central Z plane / a synthetic CT-height coordinate surface,
+not claimed as 128³ or 256³ volumetric operations.
+
+Validate the harness without a large run:
+
+```bash
+PYTHONPATH=src .venv/bin/python benchmarks/run_native.py \
+  /tmp/vc-volume-cpu/_augment.cpython-314-x86_64-linux-gnu.so \
+  -m pytest tests/test_augment_catalog_benchmark.py -q
+# Also run the benchmark above with --size 8 --reps 1 --warmup 0 for a GPU smoke check.
+```

@@ -9,9 +9,9 @@ inline ChannelPlan channel_parameters(const Vignetting& t,const Array& a,Random&
 }
 struct VignettingKernel {
     double strength,radius,center[3];
-    VCR_HD double operator()(const double* v,std::size_t i,const volume_detail::ChannelContext& c) const {
+    template<class T> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T>& c) const {
         using namespace volume_detail;
-        double distance=0;for(int a=0;a<3;++a){double q=(c.grid.n[a]>1?double(c.grid.coord(i,a))/double(c.grid.n[a]-1):.5)-center[a];distance+=q*q;}return v[i]*(1-strength*clamp(distance/(radius*radius),0,1));
+        T distance=0;for(int a=0;a<3;++a){T q=(c.grid.n[a]>1?T(c.grid.coord(i,a))/T(c.grid.n[a]-1):T(.5))-T(center[a]);distance+=q*q;}return v[i]*(T(1)-T(strength)*clamp(distance/(T(radius)*T(radius)),T(0),T(1)));
     }
 };
 inline VignettingKernel make_kernel(const Vignetting& t,const ChannelPlan& p) { return {p.values[0],p.values[1],{p.values[2],p.values[3],p.values[4]}}; }

@@ -9,9 +9,9 @@ inline ChannelPlan channel_parameters(const RandomToneCurve& t,const Array& a,Ra
 }
 struct RandomToneCurveKernel {
     double lower,upper;
-    VCR_HD double operator()(const double* v,std::size_t i,const volume_detail::ChannelContext& c) const {
+    template<class T> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T>& c) const {
         using namespace volume_detail;
-        double span=c.input.high-c.input.low;if(span==0)return v[i];double t=clamp((v[i]-c.input.low)/span,0,1),u=1-t;return c.input.low+span*(3*u*u*t*lower+3*u*t*t*upper+t*t*t);
+        T span=T(c.input.high-c.input.low);if(span==0)return v[i];T t=clamp((v[i]-T(c.input.low))/span,T(0),T(1)),u=T(1)-t;return T(c.input.low)+span*(3*u*u*t*T(lower)+3*u*t*t*T(upper)+t*t*t);
     }
 };
 inline RandomToneCurveKernel make_kernel(const RandomToneCurve& t,const ChannelPlan& p) { return {p.values[0],p.values[1]}; }

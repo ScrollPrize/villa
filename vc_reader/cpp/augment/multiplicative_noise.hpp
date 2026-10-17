@@ -9,9 +9,9 @@ inline ChannelPlan channel_parameters(const MultiplicativeNoise& t,const Array& 
 }
 struct MultiplicativeNoiseKernel {
     double low,high;std::uint64_t seed;
-    VCR_HD double operator()(const double* v,std::size_t i,const volume_detail::ChannelContext& c) const {
+    template<class T> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T>& c) const {
         using namespace volume_detail;
-        return v[i]*(low+(high-low)*uniform(seed,i));
+        return v[i]*(T(low)+T(high-low)*T(uniform(seed,i)));
     }
 };
 inline MultiplicativeNoiseKernel make_kernel(const MultiplicativeNoise& t,const ChannelPlan& p) { return {p.values[0],p.values[1],p.seed}; }
