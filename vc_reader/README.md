@@ -170,8 +170,8 @@ There is no antialiasing filter when downsampling.
 `dtype=np.float64`. `order=0` uses nearest sampling (ties to even) and retains
 the stored dtype by default; an explicit float32/float64 dtype converts it. Outside neighbours and
 missing chunks use the array's stored `fill_value`. This does **not** imply
-zero padding for arrays with nonzero fill values. Optional normalization runs
-after sampling, as described below.
+zero padding for arrays with nonzero fill values. Normalize the returned image
+with an augmentation pipeline, as described below.
 
 `out` must have the requested dtype and shape and be writable, aligned and
 C-contiguous. `read_affine_many` accepts differing shapes and an optional
@@ -193,51 +193,55 @@ origin = input_scale * (pos_xyz + frame_xyz @ first_local)[::-1]
 image = r.read_affine((depth, height, width), origin, axes)
 ```
 
-Request per-crop normalization with the options below, or apply the dataset's
-own intensity transformation afterwards.
-Existing tracer implementations are not automatically switched to this API.
+### Casting and normalization
 
-### Casting and per-crop normalization
+`read`/`read_many` return stored values in the stored dtype by default. Affine
+reads return float32 for trilinear sampling and the stored dtype for nearest
+sampling. All four methods accept explicit `dtype=np.float32` or `np.float64`
+conversion; `out` never opts into conversion implicitly. Source data, cached
+chunks and `reader.dtype` remain unchanged.
 
-Defaults are unchanged. `read`/`read_many` return stored values in the stored
-dtype; affine reads return float32 for trilinear sampling and the stored dtype
-for nearest sampling. Opt in on any of these four methods:
+**Normalization belongs to `vc_reader.augment`.** The `normalization=` reader
+argument has been removed from `read`, `read_many`, `read_affine`, and
+`read_affine_many`. Migrate a normalized read to an explicit floating read
+followed by a reusable pipeline:
 
 ```python
-raw = r.read(start, size)
-floating = r.read(start, size, dtype=np.float32)  # cast only
-unit = r.read(start, size, normalization="minmax")  # float32 by default
-standard = r.read(start, size, normalization="zscore", dtype=np.float64)
-oriented = r.read_affine(shape, origin, axes, normalization="zscore")
-crops = r.read_many(regions, normalization="minmax", dtype=np.float32, out=buffers)
-crops = r.read_affine_many(grids, normalization="zscore", dtype=np.float32)
+from vc_reader import augment as A
+
+normalize = A.Pipeline([A.Normalize("zscore")], backend="auto")
+image = r.read(start, size, dtype=np.float32)[None]  # (C, Z, Y, X)
+standard = normalize({"image": image}, seed=0, inplace=True)["image"][0]
+
+unit = A.Pipeline([A.Normalize("minmax")], backend="cpu")
+oriented = r.read_affine(shape, origin, axes, dtype=np.float64)[None]
+result = unit({"image": oriented}, seed=0)["image"][0]
 ```
 
-- `normalization=None` leaves intensities unchanged. Request `dtype=np.float32`
-  or `np.float64` independently to cast. No cast or normalization is inferred
-  from an `out` buffer.
-- `"minmax"` computes `(x - min) / (max - min)` over the full crop, including
-  zeros and fill values, producing values in `[0, 1]`.
-- `"zscore"` computes `(x - mean) / std` using **only nonzero voxels**, with
-  population standard deviation (`ddof=0`). All input zeros remain exactly
-  zero, including zero padding, missing chunks with zero fill, and zeros
-  stored in the volume. Nonzero fill values participate like other values.
-- Normalization requires float32 or float64 output and defaults to float32
-  when `dtype` is omitted. Each crop in a batch has independent statistics.
-  Statistics use float64 after casting (and after interpolation for affine
-  crops). Reductions have a fixed order independent of reader thread count.
-- Constant crops, all-zero crops, and z-score crops with constant nonzero
-  values become zero. Empty crops remain empty. Normalizing a crop containing
-  NaN or infinity raises `ValueError`; casts alone retain them. An error may
-  leave provided output buffers partially written.
+`inplace=True` permits reusing a freshly read buffer on CPU. A CUDA pipeline
+uploads the image once, keeps normalization and subsequent augmentations on
+device, and downloads the final result once. Use `backend="cpu"` for host
+execution, `"cuda"` to require CUDA, or `"auto"` for availability-based fallback.
+Add normalization at the desired position in an existing augmentation chain.
 
-Normalization is native and releases the GIL. Block reads convert directly
-from source chunks into the requested floating output, followed by in-place
-per-crop statistics and normalization. Trilinear affine reads also normalize
-their final output in place. Nearest affine reads that change dtype currently
-use a temporary stored-dtype crop before conversion. Neither the source nor
-cached chunks nor `reader.dtype` are modified. These options do not apply
-automatically to indexing, `read_points` or `sample`.
+- `Normalize("minmax")` maps each channel's minimum and maximum to 0 and 1,
+  including zero and fill values in its statistics.
+- `Normalize("zscore")` (the default) uses the population mean and standard
+  deviation (`ddof=0`) of **nonzero voxels only**. Input zeros remain zero;
+  nonzero fill values participate like other image values.
+- Statistics are independent for each selected image channel and use float64
+  after reading/casting/interpolation. Images retain their float32/float64
+  dtype. Constant/all-zero channels become zero; nonfinite inputs raise.
+- `Normalize` accepts the augmentation library's channel-first 2D/3D images.
+  Empty reader crops remain valid reader outputs; skip augmentation for empty
+  crops. CPU and CUDA can differ in floating-point rounding, while replay is
+  deterministic within a backend/build/device.
+
+Block reads still convert directly from source chunks into floating output.
+Nearest affine reads that change dtype use a temporary stored-dtype crop
+before conversion. These dtype options do not change indexing, `read_points`,
+or `sample` behavior. See [normalization details](docs/augmentation.md#normalization)
+for channel/target selection and migration examples.
 
 ### Groups
 

@@ -123,3 +123,20 @@ def test_public_cuda_benchmark(tmp_path, monkeypatch, ct_array):
     for row in result["results"].values():
         assert len(row["comparisons"]) == 1
         assert row["cpu"]["p50_ms"] > 0 and row["cuda"]["p50_ms"] > 0
+
+
+def test_normalization_benchmark_uses_augmentation(tmp_path,monkeypatch,ct_array):
+    from vc_reader.augment.cuda import is_available
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/"benchmarks"))
+    bench = importlib.import_module("bench_normalization")
+    destination = tmp_path/"normalization.json"
+    methods = ["numpy","cpu"] + (["cuda"] if is_available() else [])
+    monkeypatch.setattr(sys,"argv",[
+        "bench_normalization.py","--array",str(ct_array),"--start","2","2","2",
+        "--edge","7","--threads","1","--reps","1","--methods",",".join(methods),
+        "--output",str(destination)])
+    bench.main()
+    result = json.loads(destination.read_text())
+    assert len(result["rows"]) == 12*len(methods)
+    assert {row["method"] for row in result["rows"]} == set(methods)
+    assert all(row["median"] > 0 and row["max_abs_error"] < 1e-5 for row in result["rows"])

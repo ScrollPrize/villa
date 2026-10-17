@@ -32,6 +32,47 @@ parameters across channels within each image. Noise has a separate
 applies. Arguments and defaults are listed in
 [`__init__.pyi`](../src/vc_reader/augment/__init__.pyi).
 
+## Normalization
+
+`A.Normalize(mode="zscore")` is available on CPU and CUDA. It replaces the
+removed `normalization=` argument on the four Zarr crop-read methods.
+Read/cast first, add a channel dimension, then use normalization anywhere in
+an augmentation pipeline:
+
+```python
+pipeline = A.Pipeline([
+    A.Normalize("minmax"),
+    A.GaussianNoise(.02),
+    A.MedianFilter(3),
+    A.Normalize("zscore"),
+], backend="auto")
+image = reader.read(start, shape, dtype=np.float32)[None]
+result = pipeline({"image": image}, seed=123, inplace=True)
+```
+
+`"minmax"` uses `(x-min)/(max-min)`, including zeros and fill values.
+`"zscore"` uses `(x-mean)/std` over nonzero voxels, with population standard
+deviation (`ddof=0`), and preserves all zeros. Constant channels and channels
+with no nonzero values become zero. Both modes retain protection against
+extreme finite float64 values; they introduce no epsilon or clipping.
+Nonfinite image values raise, including values produced by an earlier step.
+
+Statistics use the current values of each selected channel independently;
+`on`, `channels`, `p` and `p_channel` follow the usual image-transform rules.
+Labels and other unselected targets are preserved. Validity-mask restoration
+uses the same target fill rules as other intensity transforms. Input images
+must be channel-first float32/float64, with nonempty 2D or 3D spatial grids.
+The reader retains support for arbitrary-rank and empty crops independently.
+
+The CPU implementation retains the reader's fixed segment boundaries and
+ordered double-precision reductions, without a reader thread-pool dependency.
+It decodes any CPU palette representation before computing statistics. CUDA
+keeps images and normalization statistics resident through the chain, using
+fixed parallel reductions and a single deferred finite-status check at the
+pipeline boundary. CUDA FMA/reduction rounding is tolerated; precision and
+zero-mask semantics are unchanged. Pickled pipelines and replay plans work
+on both backends; replay recalculates statistics from the supplied image.
+
 ## Compact intensity and median chains
 
 `Pipeline(..., compact=True)` is the default. When Gamma or median encounters
@@ -269,6 +310,7 @@ See the [CPU measurements and validation](../benchmarks/elastic_production_resul
 | Existing transforms | Native API |
 | --- | --- |
 | Compose, Random, OneOf, timing wrappers | `Pipeline`, `p=`, `OneOf`, `profile=True` |
+| Normalization | `Normalize` (`minmax`, zero-preserving population `zscore`) |
 | Brightness, contrast, gamma, inversion, random clipping | `BrightnessMultiply`, `BrightnessAdd`, `Contrast`, `Gamma`, `Invert`, `ClipOutliers` |
 | Gaussian/Rician noise, blur, median, sharpening | `GaussianNoise`, `RicianNoise`, `GaussianBlur`, `MedianFilter`, `Sharpen` |
 | Local brightness, contrast, gamma, smoothing | `BrightnessGradient`, `LocalContrast`, `LocalGamma`, `LocalSmoothing` |
@@ -366,7 +408,7 @@ BrightnessMultiply, BrightnessAdd, Contrast, Gamma, Invert, GaussianNoise,
 RicianNoise, GaussianBlur, MedianFilter, Sharpen, BrightnessGradient,
 LocalContrast, LocalGamma, LocalSmoothing, BlankRectangle, SliceIllumination,
 Smear, Flip, Rotate90, Transpose, Elastic, LowResolution, ThickSlice, and
-RandomBinaryOperator. Each has its own `.cu` file under `cpp/augment/cuda/`.
+RandomBinaryOperator. `Normalize` also supports both backends. Each has its own `.cu` file under `cpp/augment/cuda/`.
 Small shared files provide interpolation, convolution, noise generation,
 channel adaptation, and device-buffer ownership. `OneOf` can compose these
 transforms. Other transforms remain available on CPU; selecting an unsupported

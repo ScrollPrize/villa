@@ -384,28 +384,31 @@ tests still pass; no fast-math or reduced interpolation precision was added.
 
 ## Casting and normalization: `bench_normalization.py`
 
-Compares block and affine crop reads plus NumPy post-processing against native
-`dtype`/`normalization` options. Both use float64 population statistics;
-z-score excludes zeros and preserves them in the output. Min/max includes
-the full crop. The baseline uses in-place NumPy arithmetic after casting;
-its zero mask and selected values are part of the measured workload.
+Compares block and affine crop reads followed by NumPy, CPU augmentation, or
+CUDA augmentation normalization. The reader now only performs explicit dtype
+conversion. `--methods numpy,cpu` is the default; add `cuda` for a CUDA-enabled
+build/device. Every output is checked against NumPy. Freshly read buffers use
+`inplace=True`, matching the NumPy baseline's ownership semantics. CUDA timings
+include upload, normalization, download, and synchronization.
 
-Save the baseline extension and its matching `zarr_reader.py` before changing
-or rebuilding them. The recorded baseline is `a879c21d7`:
+From the repository root, after building both extensions:
 
 ```bash
-mkdir -p /tmp/vcr-normalization-before
-cp build/cp314-cp314-linux_x86_64/_native*.so /tmp/vcr-normalization-before/
-cp src/vc_reader/reader/zarr_reader.py /tmp/vcr-normalization-before/zarr_reader.py
-
-.venv/bin/python benchmarks/run_native.py /tmp/vcr-normalization-before/_native*.so \
-  benchmarks/bench_normalization.py --baseline-reader /tmp/vcr-normalization-before/zarr_reader.py \
-  --methods numpy --reps 7 --output /tmp/normalization-before.json
-
-# After building the new extension:
-.venv/bin/python benchmarks/run_native.py build/cp314-cp314-linux_x86_64/_native*.so \
-  benchmarks/bench_normalization.py --reps 7 --output /tmp/normalization-final.json
+export AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+export PYTHONPATH=vc_reader/src:vc_reader/.venv/lib/python3.14/site-packages
+vc_reader/.venv/bin/python -S vc_reader/benchmarks/run_native.py \
+  /tmp/vc-augment-cuda/_augment.cpython-314-x86_64-linux-gnu.so \
+  vc_reader/benchmarks/run_native.py \
+  vc_reader/build/cp314-cp314-linux_x86_64/_native.cpython-314-x86_64-linux-gnu.so \
+  vc_reader/benchmarks/bench_normalization.py --threads 1 --reps 5 \
+  --methods numpy,cpu,cuda --modes minmax,zscore \
+  --output vc_reader/benchmarks/results/normalization-augment.json
 ```
+
+The removed reader implementation can still be benchmarked with `--methods
+native --baseline-reader /path/to/saved/zarr_reader.py`, selecting its matching
+saved `_native` extension through `run_native.py`. This is only a comparison
+path in the harness; the current reader does not expose normalization.
 
 The defaults use the same local PHercParis4 level-2 volume as the other
 benchmarks, a 128³ crop starting at `(9300, 4000, 4000)`, and the fixed affine
@@ -415,6 +418,9 @@ stored. `--edge`, `--paths block,affine`, `--dtypes float32,float64`, and
 readers and evicts file pages before each method (Linux only); the results
 below use **warm mmap reads with no decoded memory cache**.
 
+### Historical reader-owned normalization results
+
+The following measurements predate the move to augmentation.
 Both builds: GCC 15.2, Release (`-O3 -DNDEBUG -g`), Python 3.14.4, 16 native
 reader threads, Linux x86-64 on the same 24-CPU/NVMe RAID host. One untimed
 warm-up and seven measured repetitions per case, alternating method order
