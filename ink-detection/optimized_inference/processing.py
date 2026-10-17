@@ -172,7 +172,12 @@ def _read_gray_any(path: str) -> np.ndarray:
                 return None
             if img.ndim > 2:
                 img = img[..., 0]
-            if img.dtype != np.uint8:
+            if img.dtype == np.uint16:
+                # 16-bit layers (what volume-cartographer renders) carry the signal in
+                # the high byte. Keep it, as cv2.IMREAD_GRAYSCALE does for the other
+                # formats; clipping at 255 saturates every voxel of such a layer.
+                img = (img >> 8).astype(np.uint8)
+            elif img.dtype != np.uint8:
                 # Minimal, safe conversion to uint8
                 img = np.clip(img, 0, 255).astype(np.uint8)
             return img
