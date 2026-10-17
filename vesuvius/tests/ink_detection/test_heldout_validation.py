@@ -217,6 +217,19 @@ def test_isolation_guard_refuses_a_heldout_segment_with_no_patches(tmp_path, roo
         assert_heldout_isolated(held.training_patches, [], held.config, held.segments)
 
 
+def test_isolation_guard_refuses_when_one_of_several_heldout_segments_is_missing(tmp_path, roots):
+    a, b = roots
+    _write_segment(b, "c", supervision=_mask(slice(4, 12), slice(None)), seed=3)
+    two = _source(b, "b", "B", "validation")
+    two["segments"] = ["b", "c"]
+    two["surface_volume_paths"]["c"] = str(b / "c" / "surface.zarr")
+    held = _dataset(tmp_path / "held", [_source(a, "a", "A"), two])
+    only_b = [p for p in held.validation_patches if p.segment.segment_name == "b"]
+    assert only_b and len(only_b) < len(held.validation_patches)
+    with pytest.raises(ValueError, match=r"found no patches for \['c'\]"):
+        assert_heldout_isolated(held.training_patches, only_b, held.config, held.segments)
+
+
 def _box_patch(volume: str, bbox: tuple) -> Patch:
     segment = Segment(
         data_config=None, source=SimpleNamespace(volume_scale=0), dataset_idx=0,
