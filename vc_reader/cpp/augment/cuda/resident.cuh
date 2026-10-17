@@ -48,6 +48,8 @@ struct DeviceArray {
 };
 struct Session {
     std::map<std::string,DeviceArray> arrays;
+    std::unique_ptr<Buffer<int>> nonfinite;
+    int* finite_status();
     explicit Session(const Sample&);
     void finish(Sample&);
     void restore_valid(const Sample&);

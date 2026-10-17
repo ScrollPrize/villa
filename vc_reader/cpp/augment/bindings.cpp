@@ -154,6 +154,11 @@ NB_MODULE(_augment, m) {
     bind<Contrast>(m, "Contrast", [](auto& t, auto& a) { t.factor = parameter(a, "factor", t.factor); t.preserve_range = a.get("preserve_range", true); });
     bind<Gamma>(m, "Gamma", [](auto& t, auto& a) { t.gamma = parameter(a, "gamma", t.gamma); t.p_invert = a.get("p_invert", 0.); t.p_retain_stats = a.get("p_retain_stats", 0.); probability(t.p_invert); probability(t.p_retain_stats); });
     bind<Invert>(m, "Invert", [](auto&, auto&) {});
+    bind<Normalize>(m, "Normalize", [](auto& t, auto& a) {
+        const auto mode = a.get("mode", std::string("zscore"));
+        require(mode == "minmax" || mode == "zscore", "normalization mode must be minmax or zscore");
+        t.mode = mode == "minmax" ? Normalization::MinMax : Normalization::ZScore;
+    });
     bind<GaussianNoise>(m, "GaussianNoise", [](auto& t, auto& a) { t.std = parameter(a, "std", t.std); t.shared_noise = a.get("shared_noise", false); });
     bind<RicianNoise>(m, "RicianNoise", [](auto& t, auto& a) { t.std = parameter(a, "std", t.std); t.shared_noise = a.get("shared_noise", false); });
     bind<ClipOutliers>(m, "ClipOutliers", [](auto& t, auto& a) { t.lower = parameter(a, "lower", t.lower); t.upper = parameter(a, "upper", t.upper); t.p_retain_std = a.get("p_retain_std", 1.); probability(t.p_retain_std); });

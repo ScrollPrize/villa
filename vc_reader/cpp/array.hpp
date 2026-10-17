@@ -338,20 +338,10 @@ public:
     }
 
     void read_many_float(const std::vector<Index>& starts, const std::vector<Index>& sizes,
-                         const std::vector<std::uint8_t*>& outs, const std::vector<std::size_t>& counts,
-                         const ElementType& type, bool out64, Normalization norm)
+                         const std::vector<std::uint8_t*>& outs, const ElementType& type, bool out64)
     {
         auto output = out64 ? BoxOutput::make<double>(type, spec_.fill) : BoxOutput::make<float>(type, spec_.fill);
         read_many(starts, sizes, outs, &output);
-        for (std::size_t i = 0; i < outs.size(); ++i)
-            normalize_output(outs[i], counts[i], out64, norm);
-    }
-
-    void normalize_output(std::uint8_t* out, std::size_t n, bool out64, Normalization norm)
-    {
-        if (norm == Normalization::None) return;
-        if (out64) normalize_crop(reinterpret_cast<double*>(out), n, norm, pool_);
-        else normalize_crop(reinterpret_cast<float*>(out), n, norm, pool_);
     }
 
     // Reads the elements at `n` points into `out` (one element each, in order).
@@ -385,7 +375,7 @@ public:
 
     void read_affine(const AffineCoordinates& grid, std::size_t n, int order,
                      const ElementType& type, bool out64, std::uint8_t* out,
-                     bool float_output = false, Normalization norm = Normalization::None)
+                     bool float_output = false)
     {
         if (ndim() != 3)
             throw std::invalid_argument("affine reads require a 3-D source array");
@@ -403,7 +393,6 @@ public:
         } else {
             sample_linear_coordinates(grid, n, type, out64, out);
         }
-        normalize_output(out, n, out64, norm);
     }
 
     template <class Coordinates>

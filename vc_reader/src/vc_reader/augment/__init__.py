@@ -50,7 +50,7 @@ def _factory(constructor):
 _constructors = (
     "Uniform Normal Choice BalancedContrast Image Label ScalarField ValidMask Points "
     "Vectors VectorField NormalField CoordinateField OneOf "
-    "BrightnessMultiply BrightnessAdd Contrast Gamma Invert GaussianNoise RicianNoise "
+    "BrightnessMultiply BrightnessAdd Contrast Gamma Invert Normalize GaussianNoise RicianNoise "
     "ClipOutliers GaussianBlur MedianFilter Sharpen BrightnessGradient LocalContrast "
     "LocalGamma LocalSmoothing BlankRectangle SliceIllumination Smear Flip Rotate90 "
     "Transpose CropPad Affine Elastic SheetCompression LowResolution ThickSlice "

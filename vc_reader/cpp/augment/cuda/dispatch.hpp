@@ -2,6 +2,7 @@
 #include "../labels.hpp"
 #include "resident.cuh"
 namespace vcr::augment::cuda {
+void apply_cuda(const Normalize&, Sample&, const Parameters&, Session&);
 void apply_cuda(const BrightnessMultiply&, Sample&, const Parameters&, Session&);
 void apply_cuda(const BrightnessAdd&, Sample&, const Parameters&, Session&);
 void apply_cuda(const Contrast&, Sample&, const Parameters&, Session&);

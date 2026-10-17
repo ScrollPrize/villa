@@ -1,5 +1,6 @@
 #pragma once
 #include "core.hpp"
+#include "normalization.hpp"
 #include "median.hpp"
 #include <span>
 #include <unordered_map>

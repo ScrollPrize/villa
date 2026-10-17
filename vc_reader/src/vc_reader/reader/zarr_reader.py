@@ -438,17 +438,17 @@ class ZarrReader:
 
     def read(
         self, start: Sequence[int], size: Sequence[int], out: np.ndarray | None = None, *,
-        dtype: Any = None, normalization: str | None = None,
+        dtype: Any = None,
     ) -> np.ndarray:
-        """Read a block, optionally cast and normalize it; see :meth:`read_many`."""
+        """Read a block, optionally cast it; see :meth:`read_many`."""
         return self.read_many([(start, size)], None if out is None else [out],
-                              dtype=dtype, normalization=normalization)[0]
+                              dtype=dtype)[0]
 
     def read_many(
         self,
         regions: Iterable[tuple[Sequence[int], Sequence[int]]],
         out: Sequence[np.ndarray | None] | None = None,
-        *, dtype: Any = None, normalization: str | None = None,
+        *, dtype: Any = None,
     ) -> list[np.ndarray]:
         """Several ``(start, size)`` blocks in one call; their chunk reads run in parallel.
 
@@ -460,21 +460,14 @@ class ZarrReader:
 
         Defaults return stored values/dtype, with ``fill_value`` outside the
         array. Request ``dtype=np.float32`` or ``np.float64`` to cast directly
-        into floating output. ``normalization="minmax"`` maps each crop's
-        minimum/maximum to 0/1. ``normalization="zscore"`` uses the population
-        mean/std of NONZERO voxels only, preserving all zeros (including zero
-        padding). Min/max includes zeros and fill values. Statistics cover
-        each crop independently, after casting, using float64 reductions.
-        Empty crops stay empty; constant/all-zero crops return zeros.
-        Nonfinite values raise ValueError when normalizing.
-
-        Normalization defaults to float32 unless dtype is specified; it
-        requires float32 or float64. No normalization or cast is inferred
-        from ``out``. The source, cached chunks and reader dtype are unchanged.
+        into floating output. No cast is inferred from ``out``. The source,
+        cached chunks and reader dtype are unchanged. Use
+        ``vc_reader.augment.Normalize`` in an augmentation pipeline for
+        min/max or zero-preserving z-score normalization.
         """
         self._ready()
         nd = self.ndim
-        out_dtype, floating = _crop_output_dtype(self.dtype, self.dtype, dtype, normalization)
+        out_dtype, floating = _crop_output_dtype(self.dtype, self.dtype, dtype)
         regions = [(tuple(int(v) for v in s), tuple(int(v) for v in n)) for s, n in regions]
         if out is not None and len(out) != len(regions):
             raise ValueError(f"out has {len(out)} arrays for {len(regions)} regions")
@@ -499,7 +492,7 @@ class ZarrReader:
         if floating:
             dt = self.dtype
             self._array.read_many_float(starts, sizes, buffers, dt.kind, dt.itemsize, not dt.isnative,
-                                        out_dtype == np.float64, normalization or "")
+                                        out_dtype == np.float64)
         else:
             self._array.read_many(starts, sizes, buffers, self.dtype.itemsize)
         for res, tgt in zip(results, targets):
@@ -526,7 +519,7 @@ class ZarrReader:
 
     def read_affine(
         self, shape: Sequence[int], origin: Any, axes: Any, *, order: int = 1,
-        dtype: Any = None, out: np.ndarray | None = None, normalization: str | None = None,
+        dtype: Any = None, out: np.ndarray | None = None,
     ) -> np.ndarray:
         """Sample an oriented 3-D crop without constructing a coordinate array.
 
@@ -542,21 +535,16 @@ class ZarrReader:
         order 0 rounds ties to even and returns the stored dtype. Missing
         chunks and outside neighbours use the source's ``fill_value``.
         Explicit ``dtype`` also permits float32/float64 conversion for order 0.
-        ``normalization="minmax"`` or ``"zscore"`` runs per crop AFTER sampling
-        and casting, with the same rules as :meth:`read_many`. Z-score excludes
-        every zero-valued sample from its statistics and keeps those zeros.
-        Normalization implies float32 when dtype is omitted.
-
         ``out`` must be writable, aligned, C-contiguous and have the requested
         shape and dtype. It is returned unchanged as an object. Coordinates
         are generated natively, with bounded point-planning scratch space.
         """
         return self.read_affine_many([(shape, origin, axes)], order=order, dtype=dtype,
-                                     out=None if out is None else [out], normalization=normalization)[0]
+                                     out=None if out is None else [out])[0]
 
     def read_affine_many(
         self, grids: Iterable[tuple[Sequence[int], Any, Any]], *, order: int = 1,
-        dtype: Any = None, out: Sequence[np.ndarray | None] | None = None, normalization: str | None = None,
+        dtype: Any = None, out: Sequence[np.ndarray | None] | None = None,
     ) -> list[np.ndarray]:
         """Sample ``(shape, origin, axes)`` grids using :meth:`read_affine` semantics.
 
@@ -566,8 +554,7 @@ class ZarrReader:
         (up to 2**20 points); reuse across grids depends on the caches.
         ``out`` optionally supplies one destination (or None) per grid.
         Output buffers must not overlap. No full source box or coordinate
-        grid is assembled. Normalization statistics are computed independently
-        for each completed crop, including crops larger than a point batch.
+        grid is assembled. Use an augmentation pipeline to normalize the output.
         """
         self._ready()
         if self.ndim != 3:
@@ -575,7 +562,7 @@ class ZarrReader:
         if order not in (0, 1):
             raise ValueError("order must be 0 (nearest) or 1 (linear)")
         default = self.dtype if order == 0 else np.dtype(np.float32)
-        out_dtype, floating = _crop_output_dtype(self.dtype, default, dtype, normalization)
+        out_dtype, floating = _crop_output_dtype(self.dtype, default, dtype)
         if order == 1 and out_dtype not in (np.dtype(np.float32), np.dtype(np.float64)):
             raise ValueError("dtype must be float32 or float64 for order=1")
         if order == 1:
@@ -623,7 +610,7 @@ class ZarrReader:
             shapes, np.ascontiguousarray(origins, dtype=np.float64).reshape(-1, 3),
             np.ascontiguousarray(matrices, dtype=np.float64).reshape(-1, 3, 3),
             [a.reshape(-1).view(np.uint8) for a in results], order, dt.kind, dt.itemsize,
-            not dt.isnative, out_dtype == np.float64, floating, normalization or "",
+            not dt.isnative, out_dtype == np.float64, floating,
         )
         return results
 
@@ -817,17 +804,12 @@ def _check_float_source(dtype: np.dtype) -> None:
         raise TypeError("floating output requires a bool, integer, float32 or float64 source")
 
 
-def _crop_output_dtype(source: np.dtype, default: np.dtype, dtype: Any,
-                       normalization: str | None) -> tuple[np.dtype, bool]:
-    if normalization not in (None, "minmax", "zscore"):
-        raise ValueError("normalization must be None, 'minmax' or 'zscore'")
-    result = np.dtype(dtype) if dtype is not None else (np.dtype(np.float32) if normalization else default)
+def _crop_output_dtype(source: np.dtype, default: np.dtype, dtype: Any) -> tuple[np.dtype, bool]:
+    result = np.dtype(dtype) if dtype is not None else default
     is_float = result in (np.dtype(np.float32), np.dtype(np.float64))
-    if normalization and not is_float:
-        raise ValueError("normalization requires float32 or float64 output")
     if dtype is not None and not is_float and result != source:
         raise ValueError("dtype must be float32, float64 or the stored dtype")
-    floating = bool(normalization) or (dtype is not None and is_float)
+    floating = dtype is not None and is_float
     if floating:
         _check_float_source(source)
     return result, floating

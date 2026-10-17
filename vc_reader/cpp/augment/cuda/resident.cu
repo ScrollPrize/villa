@@ -8,12 +8,23 @@ Session::Session(const Sample& s) {
     }
 }
 void Session::finish(Sample& s) {
+    if (nonfinite) {
+        int invalid = 0; nonfinite->download(&invalid);
+        require(!invalid,"normalization requires finite crop values");
+    }
     for (auto& [key,device] : arrays) {
         auto host = Array::uninitialized(device.shape,device.kind,device.bytes);
         device.buffer->download(static_cast<std::byte*>(host.data()));
         s.at(key).array = std::move(host);
     }
     check(cudaStreamSynchronize(0));
+}
+int* Session::finite_status() {
+    if (!nonfinite) {
+        nonfinite = std::make_unique<Buffer<int>>(1);
+        check(cudaMemsetAsync(nonfinite->ptr,0,sizeof(int)));
+    }
+    return nonfinite->ptr;
 }
 template<class T, class M> __global__ void restore_kernel(T* image, const M* valid, std::size_t n, std::size_t mask_size, double fill) {
     EACH_INDEX(n) if (!valid[i%mask_size]) image[i] = T(fill);
