@@ -153,7 +153,9 @@ specifically):
   "schema_version": 1,
   "name": "PHerc0826",
   "voxel_size_um": 9.362,
-  "spiral_outward_sense": "CW",
+  "z_direction_is_top_to_bottom": true,
+  "left_handed_coordinates": false,
+  "spiral_outward_sense": "ACW",
   "normal_zarr_group": "2",
   "lasagna_scale": 4,
   "paths": {
