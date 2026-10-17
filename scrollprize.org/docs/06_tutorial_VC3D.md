@@ -75,7 +75,16 @@ Downloads for all operating systems are available on the [releases page](https:/
   </TabItem>
   <TabItem value="linux" label="Linux">
   
-   Currently, the application must be built from source on linux. There is an install script at the volume-cartographer root 
+   Download the linux .AppImage file from the [releases page](https://github.com/ScrollPrize/villa/releases) of the villa repository and make it executable.
+   It needs no installation and contains VC3D together with the `vc_*` command-line tools:
+    ```bash
+    chmod +x VC3D-*-linux-x86_64.AppImage
+    ./VC3D-*-linux-x86_64.AppImage VC3D   # the GUI
+    ./VC3D-*-linux-x86_64.AppImage list   # the bundled command-line tools
+    ```
+   On a system without FUSE (inside most containers, for example), prefix the commands with `APPIMAGE_EXTRACT_AND_RUN=1`. The [AppImage notes](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/scripts/appimage/README.md) list the libraries the host must provide.
+
+   To build from source instead, there is an install script at the volume-cartographer root
    (villa/volume-cartographer/build_from_src_debian.sh) that will handle this build for you
     ```bash
     cd villa/volume-cartographer
@@ -88,8 +97,9 @@ Downloads for all operating systems are available on the [releases page](https:/
 <TabItem value="docker" label="Docker">
   Prebuilt docker containers are hosted on the GitHub container registry. To use them, run the following command:
   ```bash
-  docker pull ghcr.io/scrollprize/villa/volume-cartographer:stable
+  docker pull ghcr.io/scrollprize/villa/volume-cartographer:edge
   ```
+  The `edge` and `main` tags currently carry the build of 2026-05-13 (see [issue #1588](https://github.com/ScrollPrize/villa/issues/1588)); the `latest` downloads on the releases page are rebuilt from `main`.
 
   </TabItem>
 </Tabs>
@@ -100,7 +110,7 @@ Downloads for all operating systems are available on the [releases page](https:/
 Depending on your install method or operating system, the application may be launched in different ways.
 - **Mac:** Open the application from the Applications folder
 - **Windows:** Open the application from the Start menu
-- **Linux:** Navigate to the build folder and run the VC3D app. example: `cd build/bin && ./VC3D`
+- **Linux:** With the AppImage, run `./VC3D-*-linux-x86_64.AppImage VC3D`. With a source build, navigate to the build folder and run the VC3D app. example: `cd build/bin && ./VC3D`
 
 ## Using VC3D
 
