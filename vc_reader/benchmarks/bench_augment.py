@@ -1,4 +1,4 @@
-"""Compare native augmentation with the actual Vesuvius Python transforms.
+"""Benchmark native augmentation, optionally comparing Vesuvius Python transforms.
 
 Single-threaded CPU, one channel, fixed real CT input, owning outputs for both
 backends. File reads, construction, RNG reset, and correctness checks are untimed.
@@ -25,7 +25,6 @@ import time
 import types
 
 import numpy as np
-import torch
 
 from vc_reader import augment as A
 from vc_reader.reader import ZarrReader
@@ -57,7 +56,6 @@ def cases(shape):
         return Case(name, [native], [(module, cls, kwargs)], **options)
 
     result = [
-        Case("CopyOnly", [], [], inputs="both"),
         pair("BrightnessMultiply", A.BrightnessMultiply(1.1), "intensity.brightness",
              "MultiplicativeBrightnessTransform", dict(multiplier_range=1.1, synchronize_channels=True)),
         pair("BrightnessAdd", A.BrightnessAdd(.1), "intensity.brightness",
@@ -72,8 +70,6 @@ def cases(shape):
         pair("RicianNoise", A.RicianNoise(.05), "noise.extranoisetransforms", "RicianNoiseTransform",
              dict(noise_variance=(.0025, .0025)), comparison="independent RNG",
              note="Python takes variance=0.0025; native takes std=0.05."),
-        pair("ClipOutliers", A.ClipOutliers(1, 99, p_retain_std=0), "intensity.random_clip",
-             "CutOffOutliersTransform", dict(percentile_lower=1, percentile_upper=99, p_retain_std=0)),
         pair("GaussianBlur", A.GaussianBlur(1), "noise.gaussian_blur", "GaussianBlurTransform",
              dict(blur_sigma=1, synchronize_axes=True, benchmark=False),
              note="Python direct separable convolution; autotuning disabled, same radius=3."),
@@ -105,8 +101,6 @@ def cases(shape):
         pair("Transpose", A.Transpose("zxy"), "spatial.transpose", "TransposeAxesTransform",
              dict(allowed_axes={1, 2}), inputs="both", fixed=dict(axis_order=[0, 1, 3, 2]),
              note="Python apply with fixed axis order; native explicit order. No random no-op draws."),
-        pair("CropPad", A.CropPad(tuple(s - 8 for s in shape)), "spatial.spatial", "SpatialTransform",
-             dict(patch_size=tuple(s - 8 for s in shape), patch_center_dist_from_border=0, random_crop=False), inputs="both"),
         pair("Affine", A.Affine(scale=1 / 1.1), "spatial.spatial", "SpatialTransform",
              dict(patch_size=shape, patch_center_dist_from_border=0, random_crop=False,
                   p_scaling=1, scaling=1.1, p_synchronize_scaling_across_axes=1, mode_seg="nearest"), inputs="both",
@@ -124,37 +118,12 @@ def cases(shape):
              dict(scale=.5, synchronize_channels=True, synchronize_axes=True, ignore_axes=None)),
         pair("ThickSlice", A.ThickSlice(.5, axes="z"), "spatial.thick_slice", "SimulateThickSliceTransform",
              dict(scale_range=(.5, .5), candidate_axes=(0,)), inputs="both"),
-        pair("Morphology", A.Morphology(radius=1, footprint="repeated_cross", on="segmentation"),
-             "utils.morphological_closing", "MorphologicalClosingTransform", dict(structure_size=1), inputs="label"),
-        pair("RemoveComponents", A.RemoveComponents(channels=(0,), p_fill=0), "nnunet.remove_connected_components",
-             "RemoveRandomConnectedComponentFromOneHotEncodingTransform",
-             dict(channel_idx=(0,), fill_with_other_class_p=0), inputs="binary", comparison="independent RNG"),
-        pair("ReplaceLabel", A.ReplaceLabel(-1, 0, on="segmentation"), "utils.remove_label",
-             "RemoveLabelTansform", dict(label_value=-1, set_to=0), inputs="ignore_label"),
-        pair("Regions", A.Regions([0, 1], on="segmentation"), "utils.seg_to_regions",
-             "ConvertSegmentationToRegionsTransform", dict(regions=[0, 1]), inputs="label"),
-        pair("OneHot", A.OneHot([0, 1], on="segmentation", append_to="image"), "nnunet.seg_to_onehot",
-             "MoveSegAsOneHotToDataTransform", dict(source_channel_idx=0, all_labels=[0, 1], remove_channel_from_source=False), inputs="both"),
-        pair("MaskImage", A.MaskImage(mask="segmentation"), "utils.nnunet_masking", "MaskImageTransform",
-             dict(apply_to_channels=[0]), inputs="masked"),
-        pair("DeepSupervision", A.DeepSupervision([1, .5, .25], on="segmentation"), "utils.deep_supervision_downsampling",
-             "DownsampleSegForDSTransform", dict(ds_scales=[1, .5, .25]), inputs="label"),
-        pair("MedialSurface", A.MedialSurface(on="segmentation"), "utils.skeleton_transform",
-             "MedialSurfaceTransform", dict(target_keys=["segmentation"]), inputs="label",
-             comparison="algorithm comparison", note="Native Zhang-Suen vs scikit-image; exact equivalence not assumed."),
-        Case("Pseudo2DRoundTrip", [A.ToPseudo2D(), A.FromPseudo2D()],
-             [("utils.pseudo2d", "Convert3DTo2DTransform", {}), ("utils.pseudo2d", "Convert2DTo3DTransform", {})], inputs="both"),
     ]
     # The actual Python morphology callable is supplied after importing its module.
     result.append(pair("RandomBinaryOperator", A.RandomBinaryOperator(channels=(0,), radius=1, operations=("dilate",)),
                        "nnunet.random_binary_operator", "ApplyRandomBinaryOperatorTransform",
                        dict(channel_idx=(0,), strel_size=1), inputs="binary",
                        note="Both forced to dilation, radius=1; Python uses FFT convolution."))
-    brightness = result[1]
-    gamma = next(c for c in result if c.name == "Gamma")
-    blur = next(c for c in result if c.name == "GaussianBlur")
-    result.append(Case("IntensityPipeline", brightness.native + gamma.native + blur.native,
-                       brightness.legacy + gamma.legacy + blur.legacy))
     return result
 
 
@@ -214,10 +183,14 @@ def filter_cases(shape):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--array", default=DEFAULT_ARRAY)
-    parser.add_argument("--start", type=int, nargs=3, default=(1280, 2688, 3200))
+    parser.add_argument("--start", type=int, nargs=3,
+                        help="override crop origin; native-only defaults to six CT regions")
     parser.add_argument("--shape", type=int, nargs=3, default=(128, 128, 128))
     parser.add_argument("--reps", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--native-only", action="store_true", help="rank only C++ augmentation; needs NumPy and vc_reader, no Torch or Vesuvius")
+    parser.add_argument("--additional-start", type=int, nargs=3, action="append", default=[],
+                        help="additional real crop origin, repeatable; native-only mode")
     parser.add_argument("--filter-sweep", action="store_true", help="compare only median/blur with several kernel widths")
     parser.add_argument("--input-noise-std", type=float, default=0., help="fixed Gaussian perturbation of the real CT input; tests continuous-valued filters")
     parser.add_argument("--read-each-call", action="store_true", help="time fresh vc_reader float32 reads, normalization and augmentation together")
@@ -234,6 +207,18 @@ def main():
         parser.error("--inplace requires --read-each-call so each call receives fresh inputs")
     if not np.isfinite(args.input_noise_std) or args.input_noise_std < 0:
         parser.error("--input-noise-std must be finite and nonnegative")
+    if args.native_only:
+        if args.read_each_call or args.inplace:
+            parser.error("--native-only measures owning augmentation outputs with reads excluded")
+        from bench_augment_native import run
+        run(args, filter_cases(tuple(args.shape)) if args.filter_sweep else cases(tuple(args.shape)), summary)
+        return
+    if args.additional_start:
+        parser.error("--additional-start requires --native-only")
+    if args.start is None:
+        args.start = (1280, 2688, 3200)
+    global torch
+    import torch
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
     # The Vesuvius root initializer imports volume/download dependencies unrelated

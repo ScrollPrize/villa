@@ -26,6 +26,60 @@ PYTHONPATH=src python benchmarks/validate_augment.py /path/to/image.zarr \
 The optional NPZ contains before/after arrays and a JSON report. See the
 [augmentation guide](../docs/augmentation.md) for build requirements and tests.
 
+## C++ augmentation ranking: `bench_augment.py --native-only`
+
+Benchmark only the current C++ augmentation package through its public NumPy
+API. Requires NumPy and the built vc_reader extensions; it does not import
+Torch, SciPy, Vesuvius, or any other augmentation implementation. The case
+definitions are shared with the comparison harness below. See
+[the native ranking report](native_augmentation_results.md) for measured results.
+
+```sh
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  PYTHONPATH=vc_reader/src vc_reader/.venv/bin/python \
+  vc_reader/benchmarks/bench_augment.py --native-only \
+  --shape 128 128 128 \
+  --reps 20 --warmup 3 --profile all \
+  --output vc_reader/benchmarks/results/native-ranking-128.json
+```
+
+Each crop is read and normalized once, outside timing. Calls include native
+sampling, validation, output allocation and Python/NumPy adaptation, with
+default input-preserving ownership. Outputs are destroyed outside timing.
+There are no internal augmentation worker threads. Each repetition uses seed
+`123 + repetition`; cases are shuffled with a fixed ordering seed. All cases
+are checked for exact seeded repeatability, finite outputs and preserved
+inputs before timing. A failed check aborts the run.
+
+Without `--start`, native mode uses six PHercParis4 regions: the original three
+at ZYX `(8960,4480,3200)`, `(5120,3840,3840)`, `(5120,2816,5120)`, plus denser
+crops at `(4608,5760,5888)`, `(4480,5760,5248)`, `(4224,5888,5120)` for 128³.
+The additions have 72.8%, 57.8%, and 47.9% threshold foreground, versus
+10.3–25.9% in the original regions. Other shapes keep those crop centers;
+`--shape 64 64 64` uses centered subcrops. Explicit `--start` replaces the
+default workload; repeat `--additional-start` to supply further custom origins.
+
+Results are ranked by pooled p50 across all equally weighted crops. JSON stores
+every per-crop observation, mean/p50/p95/min/max, input/output hashes, transform
+parameters, build flags and binary identity. `--build-dir` should point at the
+measured CMake build; `run_native.py` (below) selects a specific extension
+without installing it. `--profile all` (or comma-separated case names) adds
+five separate calls using the native pipeline's per-transform timer; these
+are excluded from the latency samples. Use a sampling profiler for C++
+function-level attribution.
+
+`--only` selects transforms; `--filter-sweep` selects median sizes 3/4/5/7 and
+Gaussian sigmas .5/1/2/4. `--input-noise-std .01` explicitly adds fixed noise
+to the real CT before timing, exercising continuous-valued filter paths.
+Inputs must be uint8 CT. Labels are derived `CT > 127.5` masks, not annotations.
+The suite covers 26 individual image, spatial and mask-corruption augmentations.
+Data-preparation helpers, label encoding/cleanup, target generation, copy
+controls and composite pipelines are excluded. Tracing operations requiring surface
+coordinates or supervised points and standalone probability wrappers are
+listed as exclusions in the JSON. This mode excludes reader timing and
+`inplace` calls. It measures selected parameters, not training throughput or
+an average over all possible parameter settings.
+
 ## Augmentation comparison: `bench_augment.py`
 
 [Measured results on 64³ and 128³ PHercParis4 crops](augmentation_results.md)
@@ -100,9 +154,10 @@ reader (`_native`) and augmentation (`_augment`) builds.
 Independent RNG draws are marked separately from deterministic comparisons;
 timing similar stochastic workloads does not establish identical augmentation
 distributions. A failed comparison remains visible as an error, not a speedup.
-The specialized tracing APIs and probability/composition wrappers are excluded
-from individual-transform coverage; a three-transform intensity pipeline is
-included. A pseudo-2D conversion/restoration pair is also attempted.
+The comparison mode uses the same augmentation-only case list. Specialized
+tracing APIs, probability/composition wrappers, data-preparation helpers and
+target-generation utilities are excluded. Earlier linked comparison reports
+describe their original workloads.
 
 To avoid importing unrelated volume/download dependencies, the harness registers
 the Vesuvius source package path without executing its root initializer. All
