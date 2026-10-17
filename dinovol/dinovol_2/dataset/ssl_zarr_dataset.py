@@ -562,13 +562,10 @@ class SSLZarrDataset(Dataset):
                             mesh_cache_path=dataset.get("mesh_cache_path"),
                             s3_storage_options=self.s3_storage_options,
                         )
+                for seg in meshes:
+                    seg.ensure_spatial_index()
                 has_ink_meshes = any(m.has_ink for m in meshes)
                 oversample = float(dataset.get("oversample", 1.0))
-                if self.object_points_enabled:
-                    if meshes:
-                        oversample *= self.ink_oversample if has_ink_meshes else self.mesh_oversample
-                    if fiber_paths is not None:
-                        oversample *= self.fiber_oversample
                 self.volumes.append(Volume(
                     path=str(volume_path),
                     scale=volume_scale,
@@ -600,6 +597,29 @@ class SSLZarrDataset(Dataset):
         self.total_valid_crop_starts = sum(vol.valid_crop_starts for vol in self.volumes)
         if self.total_valid_crop_starts <= 0:
             raise ValueError("No valid crop starts found across configured volumes for the selected source crop size.")
+
+        if self.object_points_enabled:
+            max_mesh_pts = max(
+                (sum(m.n_valid_points for m in vol.meshes) for vol in self.volumes if vol.meshes),
+                default=0,
+            )
+            max_ink_pts = max(
+                (sum(m.n_ink_points for m in vol.meshes) for vol in self.volumes if vol.meshes),
+                default=0,
+            )
+            ref_mesh_pts = float(min(self.mesh_saturation_points, max_mesh_pts)) if max_mesh_pts > 0 else 1.0
+            ref_ink_pts = float(min(self.ink_saturation_points, max_ink_pts)) if max_ink_pts > 0 else 1.0
+            for vol in self.volumes:
+                if vol.meshes:
+                    vol_mesh_pts = sum(m.n_valid_points for m in vol.meshes)
+                    vol_ink_pts = sum(m.n_ink_points for m in vol.meshes)
+                    vol.mesh_scale = min(1.0, vol_mesh_pts / ref_mesh_pts) if ref_mesh_pts > 0 else 0.0
+                    vol.ink_scale = min(1.0, vol_ink_pts / ref_ink_pts) if ref_ink_pts > 0 else 0.0
+                    mesh_mult = 1.0 + (self.mesh_oversample - 1.0) * vol.mesh_scale
+                    ink_mult = 1.0 + (self.ink_oversample - 1.0) * vol.ink_scale
+                    vol.oversample *= max(mesh_mult, ink_mult)
+                if vol.fiber_paths is not None:
+                    vol.oversample *= self.fiber_oversample
 
         total_weighted = sum(vol.valid_crop_starts * vol.oversample for vol in self.volumes)
         for volume in self.volumes:
@@ -1293,19 +1313,32 @@ class SSLZarrDataset(Dataset):
         candidates = np.flatnonzero(volume.point_type_ids == selected_type)
         return int(np.random.choice(candidates))
 
-    def _sample_mesh_centered_start(self, vol: Volume) -> tuple[tuple[int, int, int], np.ndarray] | None:
+    def _sample_mesh_centered_start(
+        self,
+        vol: Volume,
+        *,
+        prefer_ink: bool | None = None,
+    ) -> tuple[tuple[int, int, int], np.ndarray] | None:
         """Sample a source window start centered around a valid mesh or ink point."""
         if not vol.meshes:
             return None
-        prefer_ink = vol.has_ink_meshes and (np.random.random() < 0.7)
+        if prefer_ink is None:
+            prefer_ink = vol.has_ink_meshes and (np.random.random() < 0.7)
         candidates = [m for m in vol.meshes if m.has_ink] if prefer_ink else vol.meshes
         if not candidates:
             candidates = vol.meshes
+            prefer_ink = False
+        for seg in candidates:
+            seg.ensure_spatial_index()
+        weights = np.asarray(
+            [max(1, seg.n_ink_points if prefer_ink else seg.n_valid_points) for seg in candidates],
+            dtype=np.float64,
+        )
+        weights /= weights.sum()
         bbox_lo = np.asarray(vol.usable_bbox[:3], dtype=np.float32)
         bbox_hi = np.asarray(vol.usable_bbox[3:], dtype=np.float32)
         for _ in range(8):
-            seg = candidates[int(np.random.randint(len(candidates)))]
-            seg.ensure_spatial_index()
+            seg = candidates[int(np.random.choice(len(candidates), p=weights))]
             pts = seg.anchor_ink_zyx if (prefer_ink and seg.has_ink and seg.anchor_ink_zyx.shape[0] > 0) else seg.anchor_valid_zyx
             if pts is None or pts.shape[0] == 0:
                 continue
@@ -1341,9 +1374,13 @@ class SSLZarrDataset(Dataset):
                     vol.point_coordinates[anchor_index],
                 )
             elif self.object_points_enabled and vol.meshes:
-                anchor_prob = self.ink_anchor_prob if vol.has_ink_meshes else self.mesh_anchor_prob
-                if np.random.random() < anchor_prob:
-                    centered = self._sample_mesh_centered_start(vol)
+                mesh_scale = vol.mesh_scale if vol.mesh_scale > 0.0 else 1.0
+                ink_scale = vol.ink_scale if vol.has_ink_meshes else 0.0
+                p_ink_anchor = 0.7 * self.ink_anchor_prob * ink_scale
+                p_mesh_anchor = self.mesh_anchor_prob * mesh_scale * (1.0 - 0.7 * ink_scale)
+                u = np.random.random()
+                if u < p_ink_anchor + p_mesh_anchor:
+                    centered = self._sample_mesh_centered_start(vol, prefer_ink=(u < p_ink_anchor))
                     if centered is not None:
                         starts, mesh_anchor = centered
             if starts is None:
