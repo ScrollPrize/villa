@@ -209,6 +209,10 @@ int main(int argc, char** argv)
         ("seed", po::value<std::uint32_t>(),
             "Base seed. Slice z repeat r uses seed + z + 1000 * r, so a run repeats exactly. "
             "Without it the library's shared hardware seeded generator is used, as published")
+        ("uncrush", po::value<double>()->default_value(0.0),
+            "Un-crush strength for crushed scrolls: each slice is stretched along the axis its "
+            "segment normals crowd towards before the search, and round slices are left as they "
+            "are. 0 is the estimator unchanged; 1.5 is the measured setting")
         ("repeats", po::value<int>()->default_value(1),
             "Estimates per slice. The control point written is their coordinatewise median")
         ("threads", po::value<int>()->default_value(1),
@@ -254,12 +258,17 @@ int main(int argc, char** argv)
     const int level = vm["level"].as<int>();
     const int repeats = vm["repeats"].as<int>();
     const int threads = vm["threads"].as<int>();
+    const double uncrush = vm["uncrush"].as<double>();
     const std::optional<std::uint32_t> baseSeed =
         vm.count("seed") ? std::optional<std::uint32_t>(vm["seed"].as<std::uint32_t>())
                          : std::nullopt;
 
     if (repeats < 1) {
         std::cerr << "Error: --repeats must be at least 1." << std::endl;
+        return EXIT_FAILURE;
+    }
+    if (!(uncrush >= 0.0 && uncrush <= 4.0)) {
+        std::cerr << "Error: --uncrush must be between 0 and 4." << std::endl;
         return EXIT_FAILURE;
     }
     if (threads < 1) {
@@ -402,7 +411,7 @@ int main(int argc, char** argv)
                     e.seed = static_cast<std::uint32_t>(*baseSeed + slice +
                                                         1000 * static_cast<std::uint32_t>(task.repeat));
                 }
-                e.point = align_and_extract_umbilicus(*grid, e.seed);
+                e.point = align_and_extract_umbilicus(*grid, e.seed, static_cast<float>(uncrush));
                 if (std::isnan(e.point[0]) || std::isnan(e.point[1])) {
                     std::lock_guard<std::mutex> lock(reportMutex);
                     std::cerr << "slice " << slice << ": no segments, skipped" << std::endl;
@@ -493,6 +502,7 @@ int main(int argc, char** argv)
     metadata["plane"] = "xy";
     metadata["coordinate_scale"] = coordinateScale;
     metadata["repeats"] = repeats;
+    metadata["uncrush"] = uncrush;
     if (baseSeed) {
         metadata["seed"] = static_cast<int64_t>(*baseSeed);
     }
