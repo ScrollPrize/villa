@@ -85,6 +85,9 @@ class CropTransformerArchitecture:
     multiscale_fine_width: int | None = None
     multiscale_coarse_pool: int = 2
     multiscale_coarse_channels: tuple | None = None  # the coarse CNN's channels per stage; None: cnn_channels
+    # > 0: the (fine) CNN ends in a stride-2 context block of this many channels, added back to its last map
+    # (models/blocks.CropCNN ``context``; starts without influence). Wide context without a second, coarse CNN.
+    cnn_context_channels: int = 0
     # Per-head RMS normalization of attention queries and keys (models/blocks.py). Unbounded, the flow model's adaLN
     # time modulation of the path tokens grew their q/k norms until path attention saturated and training diverged.
     qk_norm: bool = False
@@ -222,9 +225,10 @@ class CropTransformer(nn.Module):
         super().__init__()
         self.cfg, self.model_type = cfg, cfg.model_type
         h, cells = cfg.hidden, cfg.cnn_channels[-1]
-        cnn = lambda channels: CropCNN(channels, cfg.cnn_stage_strides, cfg.cnn_blocks, stem=cfg.cnn_stem,
-                                       activation=cfg.cnn_activation)
-        self.cnn = cnn(cfg.cnn_channels)  # the whole crop, or a multiscale CNN's fine box
+        cnn = lambda channels, context=0: CropCNN(channels, cfg.cnn_stage_strides, cfg.cnn_blocks, stem=cfg.cnn_stem,
+                                                  activation=cfg.cnn_activation, in_channels=cfg.input_channels,
+                                                  context=context)
+        self.cnn = cnn(cfg.cnn_channels, cfg.cnn_context_channels)  # the whole crop, or a multiscale CNN's fine box
         self.levels = feature_levels(cfg)
         level_channels = (cells,)
         if len(self.levels) > 1:
@@ -267,6 +271,11 @@ class CropTransformer(nn.Module):
         values, support = self.sample_cells(ctx, points)
         return torch.cat((values, support[..., None].to(values.dtype)), -1)
 
+    def extra_cell_tokens(self, ctx, x):
+        """Context tokens (B, T, hidden) beside the cell tokens, positions included (``ctx`` holds the CNN lattices);
+        None: none. A hook for subclasses."""
+        return None
+
     def context(self, x, hist, hmask):
         """Every layer's context keys/values for one decision per row, and its CNN cells."""
         cfg = self.cfg
@@ -276,6 +285,9 @@ class CropTransformer(nn.Module):
         dtype = tokens.dtype
         tokens = tokens+self.cell_position(self.cell_xyz/16.).to(dtype)+self.kind[CELL].to(dtype)
         ctx = dict(cells=cells, levels=levels)
+        extra = self.extra_cell_tokens(ctx, x)
+        if extra is not None:
+            tokens = torch.cat((tokens, extra.to(dtype)), 1)
         references, mask = reference_points(x, hist, hmask, cfg.fine)
         local, _ = self.sample_cells(ctx, references)
         references = self.reference_token(torch.cat((local, reference_metadata(x, hist, references, mask)), -1))

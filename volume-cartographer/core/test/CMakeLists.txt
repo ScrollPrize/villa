@@ -220,11 +220,14 @@ vc_add_test(NAME test_segmentation_lasagna_panel_ui
     DEFS VC_TEST_DISABLE_LASAGNA_DISCOVERY VC_TEST_DISABLE_LASAGNA_DIALOGS)
 
 qt6_wrap_cpp(spiral_config_profile_editor_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/SpiralConfigProfileEditor.hpp)
+qt6_wrap_cpp(spiral_descriptions_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/SpiralDescriptions.hpp)
 vc_add_test(NAME test_spiral_config_profile_editor
     SOURCES test_spiral_config_profile_editor.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/SpiralConfigProfileEditor.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/CollapsibleSettingsGroup.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/SpiralDescriptions.cpp
             ${spiral_config_profile_editor_moc}
+            ${spiral_descriptions_moc}
             ${collapsible_settings_group_moc}
     LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
@@ -339,6 +342,20 @@ if(VC_RUN_E2E)
     # CTest runs reliably regardless of the working directory.
     set_tests_properties(test_merge_e2e_small PROPERTIES
         ENVIRONMENT "VC_RUN_E2E=1;VC_MERGE_TIFXYZ_BIN=$<TARGET_FILE:vc_merge_tifxyz>")
+endif()
+
+# End-to-end test that spawns the built vc_obj2tifxyz_legacy on two synthetic
+# plane meshes (clean, and with 3% stretched triangles) and checks the output
+# cell size under the three scale methods (median, mean, manual). Opt-in via
+# VC_RUN_E2E=1.
+add_executable(test_obj2tifxyz_legacy_scale test_obj2tifxyz_legacy_scale.cpp)
+target_link_libraries(test_obj2tifxyz_legacy_scale PRIVATE doctest::doctest vc_core)
+vc_register_test_target(test_obj2tifxyz_legacy_scale)
+if(VC_RUN_E2E)
+    add_test(NAME test_obj2tifxyz_legacy_scale COMMAND test_obj2tifxyz_legacy_scale)
+    vc_register_ctest(test_obj2tifxyz_legacy_scale test_obj2tifxyz_legacy_scale)
+    set_tests_properties(test_obj2tifxyz_legacy_scale PROPERTIES
+        ENVIRONMENT "VC_RUN_E2E=1;VC_OBJ2TIFXYZ_LEGACY_BIN=$<TARGET_FILE:vc_obj2tifxyz_legacy>")
 endif()
 
 add_executable(bench_volume_sample bench_volume_sample.cpp)

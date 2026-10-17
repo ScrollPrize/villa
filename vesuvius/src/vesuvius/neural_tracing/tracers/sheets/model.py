@@ -18,7 +18,7 @@ from torch import nn
 
 from vesuvius.neural_tracing.tracers.sheets.data.episodes import FIBER_CODE_DIM
 from vesuvius.neural_tracing.tracers.models.blocks import MLP, CropCNN, SelfAttentionLayer
-from vesuvius.neural_tracing.tracers.models.weights import load_matching_weights
+from vesuvius.neural_tracing.tracers.models.weights import add_input_channels, load_matching_weights
 from vesuvius.neural_tracing.tracers.shared.compile import compile_options
 
 POINT_FEATURES = 16
@@ -161,19 +161,6 @@ def upgrade_state(saved: dict) -> dict:
 
 
 OPTIONAL_MODULES = ('mode_', 'fiber_')  # modules a checkpoint without them starts fresh (``init_model_state``)
-
-
-def add_input_channels(model: SheetTracer, saved: dict) -> dict:
-    """``saved`` with the weights over a crop's input channels (the encoders' first convolutions and skip
-    projections) widened by zeros to the model's, e.g. a one-channel checkpoint for ``model.neighbor_channel``: the
-    added channels start without influence, so the model computes what the checkpoint did."""
-    own, out = model.state_dict(), dict(saved)
-    for key, value in saved.items():
-        target = own.get(key)
-        if (target is not None and value.ndim == 5 and target.ndim == 5 and value.shape[1] < target.shape[1]
-                and value.shape[:1]+value.shape[2:] == target.shape[:1]+target.shape[2:]):
-            out[key] = torch.cat([value, value.new_zeros(value.shape[0], target.shape[1]-value.shape[1], *value.shape[2:])], 1)
-    return out
 
 
 def init_model_state(model: SheetTracer, saved: dict) -> None:
