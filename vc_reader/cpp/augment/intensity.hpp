@@ -14,7 +14,7 @@ struct GaussianNoise { Scalar std = Uniform{0, .1}; bool shared_noise = false; C
 struct RicianNoise { Scalar std = Uniform{0, .1}; bool shared_noise = false; ChannelOptions options; };
 struct ClipOutliers { Scalar lower = .2, upper = 99.8; double p_retain_std = 1; ChannelOptions options; };
 struct GaussianBlur { Scalar sigma = Uniform{.3, 1.5}; bool shared_axes = true, mirror_boundary = true; double truncate = 6; ChannelOptions options; };
-struct MedianFilter { Scalar size = Uniform{3, 7}; ChannelOptions options; };
+struct MedianFilter { Scalar size = Uniform{3, 7}; bool quantize = false; ChannelOptions options; };
 struct Sharpen { Scalar strength = Uniform{.1, .5}; double p_clamp = .5; ChannelOptions options; };
 struct LocalOptions { Scalar scale = Uniform{10, 30}, loc = Uniform{-1, 2}; };
 struct BrightnessGradient { Scalar strength = Uniform{-.5, .5}; bool mean_centered = true, clip = false; LocalOptions local; ChannelOptions options; };
@@ -157,18 +157,41 @@ template<class T> inline double intensity_power(double base, double exponent) {
     return std::pow(base, exponent);
 }
 
-template<class T>
-inline void channel_apply(const Gamma&, std::vector<T>& v, const Grid&, const ChannelPlan& p) {
+// Share the transform with compact palette consumers. Their statistics and
+// bounds must be weighted by the actual number of voxels at each palette entry.
+template<class T, class Statistics, class Bounds>
+inline void gamma_values(std::vector<T>& v, const ChannelPlan& p, Statistics&& statistics, Bounds&& bounds) {
     bool invert = p.values[1], retain = p.values[2];
     if (invert) for (auto& x : v) x = -x;
-    double m = retain ? mean(v) : 0, std = retain ? deviation(v, m) : 0;
-    auto [lo, hi] = std::minmax_element(v.begin(), v.end()); double low = *lo, range = *hi - low;
+    const auto before = retain ? statistics(v) : std::pair{0., 0.};
+    const auto [low, high] = bounds(v); double range = high - low;
     for (auto& x : v) x = intensity_power<T>((x - low) / std::max(range, 1e-7), p.values[0]) * range + low;
     if (retain) {
-        double after = mean(v), scale = std / std::max(deviation(v, after), 1e-7);
-        for (auto& x : v) x = (x - after) * scale + m;
+        const auto after = statistics(v); double scale = before.second / std::max(after.second, 1e-7);
+        for (auto& x : v) x = (x - after.first) * scale + before.first;
     }
     if (invert) for (auto& x : v) x = -x;
+}
+template<class T>
+inline void channel_apply(const Gamma&, std::vector<T>& v, const Grid&, const ChannelPlan& p) {
+    gamma_values(v, p,
+        [](const auto& values) { double m = mean(values); return std::pair{m, deviation(values, m)}; },
+        [](const auto& values) {
+            const auto [lo, hi] = std::minmax_element(values.begin(), values.end());
+            return std::pair<double, double>{*lo, *hi};
+        });
+}
+
+template<class T>
+inline double pointwise_intensity(const T& t, double y, const ChannelPlan& p, double m, double low, double high) {
+    if constexpr (std::is_same_v<T, BrightnessMultiply>) y *= p.values[0];
+    if constexpr (std::is_same_v<T, BrightnessAdd>) y += p.values[0];
+    if constexpr (std::is_same_v<T, Invert>) y = 2 * m - y;
+    if constexpr (std::is_same_v<T, Contrast>) {
+        y = (y - m) * p.values[0] + m;
+        if (t.preserve_range) y = std::clamp(y, low, high);
+    }
+    return y;
 }
 
 template<class Values> void channel_apply(const GaussianNoise&, Values& v, const Grid&, const ChannelPlan& p) {
@@ -205,10 +228,53 @@ inline void channel_apply(const GaussianBlur& t, std::vector<T>& v, const Grid& 
 // Exact palette compression, not quantization. This benefits CT patches and
 // pointwise intensity transforms of them; continuous-valued inputs use the
 // small-window network or nth_element. The bounded palette stays in L1 cache.
-template<class T>
-inline bool median_histogram(std::vector<T>& v, const Grid& g, std::size_t k,
-                             const std::vector<std::size_t>& iz, const std::vector<std::size_t>& iy,
-                             const std::vector<std::size_t>& ix) {
+// Fixed open addressing avoids allocating/hash-dividing for every float voxel.
+// Compare bit patterns so encoding is lossless; mixed signed zeros retain the
+// ordinary median selector's tie behavior via fallback.
+template<class Values>
+inline bool float_palette(const Values& v, std::vector<std::uint8_t>& codes,
+                          std::vector<float>& values, bool sorted = true) {
+    constexpr std::size_t slots = 1024;
+    std::array<std::uint32_t, slots> keys{};
+    std::array<std::uint16_t, slots> indices;
+    indices.fill(256);
+    values.clear();
+    bool positive_zero = false, negative_zero = false;
+    auto encode = [&](float value) -> int {
+        if (!std::isfinite(value)) return -1;
+        if (value == 0) { if (std::signbit(value)) negative_zero = true; else positive_zero = true; }
+        if (positive_zero && negative_zero) return -1;
+        const auto bits = std::bit_cast<std::uint32_t>(value);
+        auto slot = (bits * UINT32_C(0x9e3779b9)) >> 22;
+        while (indices[slot] != 256 && keys[slot] != bits) slot = (slot + 1) % slots;
+        if (indices[slot] == 256) {
+            if (values.size() == 256) return -1;
+            keys[slot] = bits; indices[slot] = std::uint16_t(values.size()); values.push_back(value);
+        }
+        return indices[slot];
+    };
+    const auto probes = std::min<std::size_t>(4096, v.size());
+    for (std::size_t i = 0; i < probes; ++i) if (encode(v[i * (v.size() / probes)]) < 0) { values.clear(); return false; }
+    codes.resize(v.size());
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        const auto code = encode(v[i]);
+        if (code < 0) { values.clear(); return false; }
+        codes[i] = std::uint8_t(code);
+    }
+    if (sorted) {
+        auto previous = values;
+        std::sort(values.begin(), values.end());
+        std::array<std::uint8_t, 256> ranks{};
+        for (std::size_t i = 0; i < previous.size(); ++i)
+            ranks[i] = std::uint8_t(std::lower_bound(values.begin(), values.end(), previous[i]) - values.begin());
+        for (auto& code : codes) code = ranks[code];
+    }
+    return true;
+}
+template<class Values, class T>
+inline bool median_palette(const Values& v, std::vector<std::uint8_t>& codes,
+                           std::vector<T>& values) {
+    if constexpr (std::is_same_v<T, float>) return float_palette(v, codes, values);
     constexpr std::size_t limit = 256;
     std::unordered_map<T, std::uint16_t> palette;
     palette.reserve(limit + 1);
@@ -223,20 +289,48 @@ inline bool median_histogram(std::vector<T>& v, const Grid& g, std::size_t k,
     // Reject typical high-cardinality inputs before allocating an index volume.
     const auto probes = std::min<std::size_t>(4096, v.size());
     for (std::size_t i = 0; i < probes; ++i) if (encode(v[i * (v.size() / probes)]) < 0) return false;
-    std::vector<std::uint16_t> codes(v.size());
+    codes.resize(v.size());
     for (std::size_t i = 0; i < v.size(); ++i) {
         const auto code = encode(v[i]);
         if (code < 0) return false;
-        codes[i] = static_cast<std::uint16_t>(code);
+        codes[i] = static_cast<std::uint8_t>(code);
     }
-    if (palette.size() == 1) return true;
-    std::vector<T> values;
     for (const auto& [value, code] : palette) values.push_back(value);
     std::sort(values.begin(), values.end());
-    std::array<std::uint16_t, limit> ranks{};
-    for (std::size_t rank = 0; rank < values.size(); ++rank) ranks[palette.at(values[rank])] = static_cast<std::uint16_t>(rank);
+    std::array<std::uint8_t, limit> ranks{};
+    for (std::size_t rank = 0; rank < values.size(); ++rank) ranks[palette.at(values[rank])] = static_cast<std::uint8_t>(rank);
     for (auto& code : codes) code = ranks[code];
+    return true;
+}
 
+template<class Values, class T>
+inline bool encode_median_palette(const Values& v, std::vector<std::uint8_t>& codes,
+                                  std::vector<T>& values, bool quantize) {
+    constexpr std::size_t limit = 256;
+    if (!median_palette(v, codes, values)) {
+        if (!quantize || !std::all_of(v.begin(), v.end(), [](T x) { return std::isfinite(x); })) return false;
+        const auto bounds = std::minmax_element(v.begin(), v.end());
+        const double low = *bounds.first, high = *bounds.second, range = high - low;
+        // Keep the exact fallback for unrepresentable ranges and signed-zero ties.
+        if (!(range > 0) || !std::isfinite(range)) return false;
+        values.resize(limit);
+        for (std::size_t code = 0; code < limit; ++code)
+            values[code] = T(std::lerp(low, high, double(code) / (limit - 1)));
+        codes.resize(v.size());
+        for (std::size_t i = 0; i < v.size(); ++i)
+            codes[i] = std::uint8_t(std::clamp(std::floor((double(v[i]) - low) / range * (limit - 1) + .5), 0., double(limit - 1)));
+        // Monotone quantization commutes with rank selection: the result is
+        // the quantized exact median, within range/510 plus output rounding.
+    }
+    return true;
+}
+
+// Histogram rank selection shared by ordinary and compact images.
+template<class Output, class Values>
+inline void median_rank_filter(const std::vector<std::uint8_t>& codes, Output& v, const Values& values,
+                               const Grid& g, std::size_t k, const std::vector<std::size_t>& iz,
+                               const std::vector<std::size_t>& iy, const std::vector<std::size_t>& ix) {
+    constexpr std::size_t limit = 256;
     const auto dim = g.shape.size(), nz = dim == 3 ? g.shape[0] : 1;
     const auto ny = g.shape[dim - 2], nx = g.shape.back(), kz = dim == 3 ? k : 1;
     const auto middle = kz * k * k / 2;
@@ -285,10 +379,27 @@ inline bool median_histogram(std::vector<T>& v, const Grid& g, std::size_t k,
             }
         }
     }
-    return true;
+}
+
+inline std::vector<std::size_t> median_indices(std::size_t n, std::size_t width, std::size_t stride) {
+    std::vector<std::size_t> result(n * width);
+    for (std::size_t x = 0; x < n; ++x) for (std::size_t j = 0; j < width; ++j)
+        result[x * width + j] = reflect(std::int64_t(x + j) - std::int64_t(width / 2), n) * stride;
+    return result;
 }
 template<class T>
-inline void channel_apply(const MedianFilter&, std::vector<T>& v, const Grid& g, const ChannelPlan& p) {
+inline bool median_histogram(std::vector<T>& v, const Grid& g, std::size_t k,
+                             const std::vector<std::size_t>& iz, const std::vector<std::size_t>& iy,
+                             const std::vector<std::size_t>& ix, bool quantize) {
+    std::vector<std::uint8_t> codes;
+    std::vector<T> values;
+    if (!encode_median_palette(v, codes, values, quantize)) return false;
+    if (values.size() > 1) median_rank_filter(codes, v, values, g, k, iz, iy, ix);
+    return true;
+}
+
+template<class T>
+inline void channel_apply(const MedianFilter& t, std::vector<T>& v, const Grid& g, const ChannelPlan& p) {
     auto k = std::size_t(p.values[0]);
     if (k == 1) return;
     // Precompute reflected coordinates once per axis, rather than performing
@@ -296,14 +407,8 @@ inline void channel_apply(const MedianFilter&, std::vector<T>& v, const Grid& g,
     const auto dim = g.shape.size();
     const auto nz = dim == 3 ? g.shape[0] : 1, ny = g.shape[dim - 2], nx = g.shape.back();
     const auto kz = dim == 3 ? k : 1;
-    auto indices = [&](std::size_t n, std::size_t width, std::size_t stride) {
-        std::vector<std::size_t> result(n * width);
-        for (std::size_t x = 0; x < n; ++x) for (std::size_t j = 0; j < width; ++j)
-            result[x * width + j] = reflect(std::int64_t(x + j) - std::int64_t(width / 2), n) * stride;
-        return result;
-    };
-    auto iz = indices(nz, kz, ny * nx), iy = indices(ny, k, nx), ix = indices(nx, k, 1);
-    if (median_histogram(v, g, k, iz, iy, ix)) return;
+    auto iz = median_indices(nz, kz, ny * nx), iy = median_indices(ny, k, nx), ix = median_indices(nx, k, 1);
+    if (median_histogram(v, g, k, iz, iy, ix, t.quantize)) return;
     if (dim == 3 && k == 3 && median_detail::median3(v, g, iz, iy, ix)) return;
     auto src = v;
     std::vector<T> values(kz * k * k);
@@ -493,15 +598,7 @@ void apply(const T& t, Sample& s, const Parameters& p) {
                         auto bounds = std::minmax_element(v.begin(), v.end()); low = *bounds.first; high = *bounds.second;
                     }
                     for (auto& x : v) {
-                        double y = x;
-                        if constexpr (std::is_same_v<T, BrightnessMultiply>) y *= c.values[0];
-                        if constexpr (std::is_same_v<T, BrightnessAdd>) y += c.values[0];
-                        if constexpr (std::is_same_v<T, Invert>) y = 2 * m - y;
-                        if constexpr (std::is_same_v<T, Contrast>) {
-                            y = (y - m) * c.values[0] + m;
-                            if (t.preserve_range) y = std::clamp(y, low, high);
-                        }
-                        x = static_cast<V>(y);
+                        x = static_cast<V>(pointwise_intensity(t, x, c, m, low, high));
                     }
                 }
             };

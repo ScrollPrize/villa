@@ -567,3 +567,372 @@ threshold of the CT, not annotated labels. Use uninstrumented Release builds
 and `bench_augment.py` for reported latency; instrumentation changes timings.
 The workload itself is portable C++20; use a platform profiler when gprof is not
 available.
+
+## Optional quantized median and uint8 storage experiment
+
+`bench_median_quantized.py` compares exact median with
+`MedianFilter(size, quantize=True)` on real CT after native Elastic (sigma 3,
+magnitude 1, seed 123). Three original PHercParis4 crops, 128³, one float32
+channel divided by 255; one reference/warmup call and three measured calls per
+crop/window (nine timings per mode). Windows 2, 3, 5, and 8 exercise both even
+and odd selectors. Reading, deformation and validation are untimed; native
+per-transform profiling is recorded alongside public API latency. Every voxel
+is checked against the exact result's half-bin bound plus float32 rounding.
+This measures median after deformation, not the cost of Elastic itself.
+
+`bench_uint8_chain.cpp` is an experimental standalone C++ consumer of the same
+median, permutation, and intensity kernels. It compares float32, literal uint8
+rounded/clipped to [0,1], and uint8 indices with a 256-entry float32 palette.
+The last representation updates the palette for pointwise transforms, then
+decodes the full image only at the end. No public uint8 image API is added.
+Prefixes are permutations only, median + permutations, then cumulative
+BrightnessMultiply(1.1), BrightnessAdd(.05), and Gamma(.8). Gamma in this
+experiment does **not** retain statistics; this differs from the trainer's
+Gamma configuration. The experiment does not reorder an existing trainer.
+Every listed transform is forced on; these are chain costs, not
+probability-weighted trainer step times.
+
+The float32 and palette outputs must match bit-for-bit. Literal uint8 must
+match for median/permutations; intensity prefixes report max error, RMSE,
+bias, changed-voxel fraction and the fraction clipped across intensity stages.
+Timing includes initial conversion/copy, native pipeline construction and
+execution, and the final decode. Input reads and output destruction are
+excluded. All modes end with float32 output. Each prefix is timed independently;
+prefix times should not be added together. Intermediate uint8 volume storage
+uses one byte per voxel, plus 1 KiB for the optional float32 palette.
+
+Reproduce from the repository root using the existing environment (adjust the
+Python ABI paths if needed). Builds and benchmark jobs are run sequentially;
+`taskset -c 0` is Linux-only and can be omitted on macOS.
+
+```sh
+AGENTS_AGENT_MODE=1 cmake -S vc_reader -B /tmp/vc-median-quantized \
+  -DVC_READER_BUILD_READER=OFF \
+  -DPython_EXECUTABLE="$PWD/vc_reader/.venv/bin/python" \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE='-O3 -g -DNDEBUG' \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-median-quantized --target _augment -j 2
+AGENTS_AGENT_MODE=1 g++ -std=c++20 -O3 -g -DNDEBUG -Ivc_reader/cpp/augment \
+  vc_reader/benchmarks/bench_uint8_chain.cpp -o /tmp/bench_uint8_chain
+
+export AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+export PYTHONPATH=vc_reader/src:vc_reader/.venv/lib/python3.14/site-packages
+taskset -c 0 vc_reader/.venv/bin/python -S vc_reader/benchmarks/run_native.py \
+  /tmp/vc-median-quantized/_augment.cpython-314-x86_64-linux-gnu.so \
+  vc_reader/benchmarks/bench_median_quantized.py \
+  --output vc_reader/benchmarks/results/median-quantized-128.json
+taskset -c 0 vc_reader/.venv/bin/python -S vc_reader/benchmarks/run_native.py \
+  /tmp/vc-median-quantized/_augment.cpython-314-x86_64-linux-gnu.so \
+  vc_reader/benchmarks/bench_uint8_chain.py --binary /tmp/bench_uint8_chain \
+  --output vc_reader/benchmarks/results/uint8-chain-128.json
+```
+
+Regression validation uses independent SciPy rank filters, per-channel error
+bounds, sparse palettes, extreme ranges, replay/pickle, and the existing
+augmentation suites. To avoid a stale editable-build import hook, the explicit
+extension runner can also execute tests:
+
+```sh
+AGENTS_AGENT_MODE=1 PYTHONPATH=vc_reader/src vc_reader/.venv/bin/python -S -c '
+import sys, runpy
+sys.path.append("vc_reader/.venv/lib/python3.14/site-packages")
+sys.argv = ["vc_reader/benchmarks/run_native.py",
+    "/tmp/vc-median-quantized/_augment.cpython-314-x86_64-linux-gnu.so",
+    "-m", "pytest", "vc_reader/tests/test_augment.py",
+    "vc_reader/tests/test_augment_optimization.py",
+    "vc_reader/tests/test_elastic_bspline.py",
+    "vc_reader/tests/test_augment_benchmark.py",
+    "vc_reader/tests/test_sheet_compression.py", "-q", "--tb=short"]
+runpy.run_path(sys.argv[0], run_name="__main__")'
+```
+
+Measured on Intel Core Ultra 7 270K Plus, Linux x86-64, GCC 15.2 Release
+(`-O3 -g -DNDEBUG`), CPU 0, one thread. All times below are
+**mean / p50 / p95 milliseconds**. The augmentation suites above passed
+**786 tests**. No model training/quality comparison was performed.
+
+Median after Elastic (nine observations per cell):
+
+| Window | Exact | Quantized | p50 speedup |
+| --- | ---: | ---: | ---: |
+| 2³ | 92.506 / 91.187 / 95.121 | 47.067 / 46.882 / 49.464 | 1.95× |
+| 3³ | 67.134 / 66.543 / 69.898 | 51.099 / 50.764 / 53.491 | 1.31× |
+| 5³ | 1701.613 / 1697.360 / 1733.498 | 70.756 / 70.172 / 72.717 | 24.19× |
+| 8³ | 6121.076 / 6084.649 / 6225.325 | 124.110 / 123.753 / 125.421 | 49.17× |
+
+Maximum absolute error across these crops/windows was 0.00194860; maximum
+per-crop RMSE was 0.00112596 on CT scaled by 255. All errors satisfied the
+per-channel half-bin bound. Native profiling attributes 46.69, 50.74, 70.40,
+and 123.73 ms respectively to the quantized median step; public API overhead
+is under 0.4 ms here. The size-3 exact network is already fast, while wider
+continuous-input windows benefit much more from the histogram. Raw samples,
+per-crop errors, input and extension hashes are in
+`results/median-quantized-128.json` (ignored benchmark output).
+
+Uint8 experiment: three original crops, 12 measured repetitions per crop
+(36 observations per cell), with all six mode orders balanced across
+repetitions. Raw results and binary hash: `results/uint8-chain-128.json`.
+Median in these chains uses size 3 on the original CT, not deformed CT.
+
+| Forced chain | Float32 | Uint8, rounding/clipping | Uint8 + float32 palette |
+| --- | ---: | ---: | ---: |
+| Rotate90 + transpose + flip | 9.241 / 8.955 / 12.016 | 5.495 / 5.404 / 7.309 | 5.309 / 3.898 / 7.245 |
+| Median + those permutations | 87.217 / 87.363 / 91.356 | 54.652 / 54.567 / 58.851 | 54.692 / 54.324 / 58.964 |
+| Above + multiply + add + Gamma | 101.045 / 100.721 / 107.400 | 64.145 / 63.820 / 67.884 | 62.259 / 61.874 / 66.030 |
+
+Both byte representations are bit-exact through median/permutations. The
+palette variant remains bit-exact through all three intensity stages. Its
+float32 table retains values outside [0,1], so brightness does not clip.
+Literal uint8 accumulation gives the following errors versus float32:
+
+| Intensity prefix (after median/permutations) | Max absolute error | RMSE |
+| --- | ---: | ---: |
+| Multiply | 0.10000002 | 0.00144256 |
+| Multiply + add | 0.14999998 | 0.00215957 |
+| Multiply + add + Gamma | 0.14999998 | 0.01196044 |
+
+Only 0.01144% of voxel/stage visits clipped in the full uint8 chain, but that
+clipping changed the range used by Gamma and spread error beyond those voxels.
+The palette representation avoids this and is the more promising extension.
+For this experiment it is sufficient to keep indices and update 256 table
+entries for each global intensity operation. Contrast, inversion, and
+statistics-retaining Gamma additionally need statistics weighted by the
+actual index counts; the extended experiment below tests those. Interpolation, per-voxel noise,
+and local intensity fields generally create more than 256 values and are
+natural places to materialize float32 again. Whether later requantization is
+acceptable is a separate numerical decision. These timings are prototype
+evidence, not a production pipeline implementation or a training-quality result.
+
+### Extended palette experiment: statistics, geometry, slice illumination
+
+`bench_uint8_chain.py --suite extended` tests Contrast, Invert,
+statistics-retaining Gamma (with and without inversion), CropPad, ThickSlice,
+and SliceIllumination, individually and in chains. The implementation in
+`palette_extended.hpp` reuses native kernels and matched native replay plans.
+Gamma and the pointwise intensity formulas are shared helpers in
+`cpp/augment/intensity.hpp`; production float32/float64 behavior is unchanged.
+
+The compact representation is **uint8 indices plus a float32 palette**, not
+rounded/clipped uint8 intensities. It caches index counts and weights means
+and sample variances by those counts. CropPad and nearest-neighbor ThickSlice
+operate on the indices and invalidate the counts. Padding requires a palette
+entry for zero: if there is no existing zero or unused index, the prototype
+promotes to float32 for the remainder of that chain.
+
+Slice illumination uses the same sampled brightness curve as the reference,
+evaluated on 256 entries per z slice. It requantizes these tables over their
+combined range, remaps the volume's indices, and retains one shared palette.
+This introduces bounded quantization error, without clipping, and permits
+later palette transforms. The experiment supports one channel and z slices;
+it does not add a public uint8 pipeline API or modify trainer configurations.
+
+Build and run from the repository root:
+
+```sh
+AGENTS_AGENT_MODE=1 cmake -S vc_reader -B /tmp/vc-palette-extended \
+  -DVC_READER_BUILD_READER=OFF \
+  -DPython_EXECUTABLE="$PWD/vc_reader/.venv/bin/python" \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE='-O3 -g -DNDEBUG' \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-palette-extended --target _augment -j 2
+AGENTS_AGENT_MODE=1 g++ -std=c++20 -O3 -g -DNDEBUG -Ivc_reader/cpp/augment \
+  vc_reader/benchmarks/bench_uint8_chain.cpp -o /tmp/bench_palette_extended
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  PYTHONPATH=vc_reader/src:vc_reader/.venv/lib/python3.14/site-packages \
+  taskset -c 0 vc_reader/.venv/bin/python -S vc_reader/benchmarks/run_native.py \
+  /tmp/vc-palette-extended/_augment.cpython-314-x86_64-linux-gnu.so \
+  vc_reader/benchmarks/bench_uint8_chain.py --suite extended \
+  --binary /tmp/bench_palette_extended --crops 6 \
+  --output vc_reader/benchmarks/results/palette-extended-128.json
+```
+
+The same machine/compiler settings as above, all six PHercParis4 crop locations
+from `DEFAULT_CROPS_128`, 128³ voxels normalized by 255. Each case has 12 measured
+repetitions per crop (72 observations per mode), alternating the two mode orders,
+after one correctness/warmup call per crop/mode. Seed is 123 plus crop index.
+Timing includes initial copy/upcast, replay execution and final float32 decode;
+it excludes I/O, plan sampling, validation and output destruction. Every
+transform is forced on: these are augmentation costs, not training step times.
+Raw timings, errors, byte comparisons, promotions and input/binary hashes are
+in the ignored `results/palette-extended-128.json`.
+
+All times are **mean / p50 / p95 milliseconds**:
+
+| Case | Float32 | Uint8 indices + palette |
+| --- | ---: | ---: |
+| Contrast | 5.638 / 5.406 / 6.769 | 5.378 / 5.375 / 5.406 |
+| Invert | 1.677 / 1.628 / 1.927 | 5.245 / 5.231 / 5.328 |
+| Gamma, retain statistics | 16.761 / 16.735 / 17.008 | 5.263 / 5.265 / 5.302 |
+| Gamma, invert + retain statistics | 17.159 / 17.146 / 17.479 | 5.278 / 5.271 / 5.371 |
+| CropPad, crop | 0.681 / 0.678 / 0.692 | 2.404 / 2.403 / 2.415 |
+| CropPad, pad | 0.825 / 0.782 / 0.904 | 3.482 / 3.481 / 3.500 |
+| ThickSlice | 1.334 / 1.273 / 1.456 | 6.041 / 6.038 / 6.071 |
+| Slice illumination | 0.791 / 0.764 / 0.920 | 5.927 / 5.926 / 5.948 |
+| Statistics chain | 40.055 / 39.733 / 41.890 | 5.382 / 5.380 / 5.409 |
+| Geometry + statistics chain | 39.962 / 39.637 / 41.647 | 8.810 / 8.808 / 8.851 |
+| Geometry + slice illumination + statistics | 39.983 / 39.917 / 40.374 | 11.922 / 11.920 / 11.969 |
+| Geometry + statistics + slice illumination | 40.213 / 39.899 / 42.003 | 9.192 / 9.196 / 9.226 |
+| Contrast + Gamma + Invert + padding | 23.674 / 23.438 / 24.870 | 6.088 / 6.053 / 6.147 |
+
+Statistics chain = Contrast(1.2), Gamma(1.3, invert), Gamma(.8), Invert;
+both Gammas retain statistics. Geometry = crop to 120³, pad back to 128³,
+ThickSlice(.5, z). Standalone CropPad padding produces 136³. These chains do
+not include median. Each illumination ordering has its own matched float32
+reference; moving illumination changes the augmentation itself.
+
+All non-illumination cases were **byte-for-byte equal** to their float32
+references on these six crops. Weighted reductions can differ in rounding on
+other inputs; the harness allows up to 2e-6 for these cases and separately
+records byte equality. The padding-after-statistics case required promotion
+on one of six crops; its timings include that fallback.
+
+| Approximate case | Max pixel error | RMSE | Max difference in a slice's mean |
+| --- | ---: | ---: | ---: |
+| Slice illumination alone | 0.00195891 | 0.00102152 | 0.00141247 |
+| Geometry + illumination + statistics | 0.00721085 | 0.00091615 | 0.00094231 |
+| Geometry + statistics + illumination | 0.00212118 | 0.00089808 | 0.00195110 |
+
+The harness checks the half-bin bound after illumination when it is last.
+Subsequent Gamma can amplify quantization error, as the middle row shows.
+These are intensity errors on the original normalized scale, not model-quality
+metrics. Synthetic 32³ zero, constant-127, binary-0/255 and repeated-0..255
+volumes also passed all 13 cases, including the palette-full padding fallback.
+The five augmentation test files listed above passed **786 tests** against
+`/tmp/vc-palette-extended` (substitute that build path in the test command).
+An additional comparison of 26 float32/float64 intensity configurations against
+the preceding native build found no value changes after extracting shared math.
+
+Gamma is the clear standalone speedup. Contrast and Invert are useful within
+a chain that already has counts: all four statistics transforms together cost
+5.382 ms versus 40.055 ms. Geometry can preserve the representation exactly,
+but the prototype's generic byte geometry kernels and final decode make the
+standalone cases slower. Slice illumination is already cheap in float32;
+keeping it compact only makes sense if enough later palette work offsets its
+remapping and histogram costs. For example, illumination followed by the
+statistics chain remains much faster overall, but illumination at the end
+would be a reasonable place to decode and use the existing float32 kernel.
+This is experimental evidence, not a production dispatch policy; performance
+has not been measured on macOS/arm64 or in a training job.
+
+### Production compact execution
+
+The experiment above led to `Pipeline(..., compact=True)` (default). Production
+execution starts compact storage at eligible float32 Gamma/median calls and
+carries it through median, permutations and global intensity transforms.
+Gaussian blur and other unsupported transforms decode first. Float64 and
+validity-masked images use ordinary execution. See
+[API details and numerical caveats](../docs/augmentation.md#compact-intensity-and-median-chains).
+The experiment's approximate slice illumination and byte CropPad/ThickSlice
+paths remain outside production execution.
+
+`bench_compact_pipeline.py` measures the **public API**, including float32 input
+validation, parameter sampling, initial palette encoding and final decode.
+This differs from the earlier prototype, which started with raw uint8 CT.
+The initial integration exposed expensive float hashing; a shared fixed-size
+exact float palette encoder now benefits ordinary median as well as compact
+execution. It rejects high-cardinality inputs early and preserves the ordinary
+fallback for mixed signed zeros. The histogram rank kernel and weighted
+intensity math are shared with the experiments, rather than copied kernels.
+
+Build/run from the repository root, using the existing Python environment:
+
+```sh
+AGENTS_AGENT_MODE=1 cmake -S vc_reader -B /tmp/vc-compact-production \
+  -DVC_READER_BUILD_READER=OFF \
+  -DPython_EXECUTABLE="$PWD/vc_reader/.venv/bin/python" \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE='-O3 -g -DNDEBUG' \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-compact-production --target _augment -j 2
+
+export AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+export PYTHONPATH=vc_reader/src:vc_reader/.venv/lib/python3.14/site-packages
+taskset -c 0 vc_reader/.venv/bin/python -S vc_reader/benchmarks/run_native.py \
+  /tmp/vc-compact-production/_augment.cpython-314-x86_64-linux-gnu.so \
+  vc_reader/benchmarks/bench_compact_pipeline.py --crops 6 --reps 12 \
+  --output vc_reader/benchmarks/results/compact-production-128.json
+
+# Frozen pre-integration build from the experiment above. This flag adapts its
+# two-argument native constructor and records ordinary timings only.
+taskset -c 0 vc_reader/.venv/bin/python -S vc_reader/benchmarks/run_native.py \
+  /tmp/vc-palette-extended/_augment.cpython-314-x86_64-linux-gnu.so \
+  vc_reader/benchmarks/bench_compact_pipeline.py --legacy-constructor --crops 6 --reps 12 \
+  --output vc_reader/benchmarks/results/compact-before-128.json
+```
+
+Same Intel Core Ultra 7 270K Plus, GCC 15.2, Release flags, one CPU 0 as above.
+Six real PHercParis4 crops (`DEFAULT_CROPS_128`), each 128³, one float32 channel
+scaled by 255. Deformed cases use Elastic(sigma=3, magnitude=1), seed 123,
+prepared outside timing. Each cell has 72 observations (12 per crop), after
+one validation/warmup per crop/mode. Current ordinary/compact order alternates;
+the frozen baseline is a separate sequential run. I/O, deformation preparation,
+correctness comparisons and output destruction are untimed. Raw observations,
+input/extension hashes and native per-transform profiles are in the JSON files.
+All transforms are forced on; these are augmentation latencies, not trainer
+step-time estimates.
+
+Frozen build before integration versus the new default, **mean / p50 / p95
+milliseconds** (identical input hashes):
+
+| Case | Before integration | After integration |
+| --- | ---: | ---: |
+| Gamma, retain statistics | 16.922 / 16.916 / 17.022 | 7.212 / 6.908 / 11.458 |
+| Statistics chain | 40.609 / 40.303 / 42.392 | 9.115 / 9.048 / 11.076 |
+| Median3 | 76.851 / 76.047 / 80.185 | 49.680 / 49.328 / 56.843 |
+| Median3 + permutations + intensity | 123.016 / 122.057 / 127.225 | 53.546 / 53.329 / 60.838 |
+| Quantized median5 + statistics, deformed CT | 107.503 / 107.245 / 109.684 | 73.292 / 72.679 / 75.494 |
+| Gamma, retain statistics, deformed CT | 16.977 / 16.963 / 17.145 | 16.971 / 16.951 / 17.132 |
+| Gaussian blur, sigma 1 | 5.479 / 5.434 / 5.739 | 5.566 / 5.523 / 5.907 |
+| Median3 + blur + Gamma | 94.160 / 93.387 / 97.796 | 66.779 / 66.575 / 74.127 |
+
+Current build, **mean / p50 / p95 milliseconds**. The ordinary column disables
+compact execution but includes the shared faster palette encoder:
+
+| Case | Ordinary (`compact=False`) | Compact (default) |
+| --- | ---: | ---: |
+| Gamma(.8), retain statistics | 17.144 / 17.142 / 17.358 | 7.212 / 6.908 / 11.458 |
+| Statistics chain | 40.338 / 40.007 / 42.041 | 9.115 / 9.048 / 11.076 |
+| Median3 | 50.297 / 50.002 / 57.159 | 49.680 / 49.328 / 56.843 |
+| Median3 + permutations + intensity | 96.642 / 96.114 / 103.181 | 53.546 / 53.329 / 60.838 |
+| Quantized median5 + statistics, deformed CT | 106.379 / 106.121 / 108.908 | 73.292 / 72.679 / 75.494 |
+| Gamma(.8), retain statistics, deformed CT | 16.939 / 16.930 / 17.123 | 16.971 / 16.951 / 17.132 |
+| Gaussian blur, sigma 1 | 5.564 / 5.522 / 5.930 | 5.566 / 5.523 / 5.907 |
+| Median3 + blur + Gamma(.8) | 67.250 / 66.882 / 74.084 | 66.779 / 66.575 / 74.127 |
+
+Statistics = Contrast(1.2), Gamma(1.3, invert + retain statistics), Gamma(.8,
+retain statistics), Invert. The longer chain inserts Rotate90(yx,1),
+Transpose(xyz), Flip(z), BrightnessMultiply(1.1), BrightnessAdd(.05) after
+median and before statistics. Pipeline order is unchanged. All eight cases
+matched their current ordinary references **byte-for-byte on all six crops**.
+For the quantized case both references request `quantize=True`; this comparison
+measures additional error from chaining, not error versus exact median.
+
+Native profiling explains the remaining cost: in the longer chain compact
+median takes about 49.0 ms and transpose 2.13 ms. The two subsequent Gamma
+steps take about 0.0046 and 0.0024 ms, versus 16.55 and 16.07 ms ordinarily.
+Contrast/counting takes about 0.42 ms; final decode is charged to the last
+transform. These profiles are untimed warmup observations; the table above
+uses repeated calls without profiling enabled.
+
+Validation command:
+
+```sh
+AGENTS_AGENT_MODE=1 PYTHONPATH=vc_reader/src vc_reader/.venv/bin/python -S -c '
+import sys, runpy
+sys.path.append("vc_reader/.venv/lib/python3.14/site-packages")
+sys.argv = ["vc_reader/benchmarks/run_native.py",
+    "/tmp/vc-compact-production/_augment.cpython-314-x86_64-linux-gnu.so",
+    "-m", "pytest", "vc_reader/tests/test_augment.py",
+    "vc_reader/tests/test_augment_optimization.py", "vc_reader/tests/test_augment_compact.py",
+    "vc_reader/tests/test_elastic_bspline.py", "vc_reader/tests/test_augment_benchmark.py",
+    "vc_reader/tests/test_sheet_compression.py", "-q", "--tb=short"]
+runpy.run_path(sys.argv[0], run_name="__main__")'
+```
+
+**823 tests passed.** Regression coverage includes 2D/3D, multiple channels/targets, validity fills,
+float64 fallback, continuous and late-overflow palettes, constants/signed zeros,
+negative brightness and median rank ordering, quantization of selected channels,
+decode before data-dependent sampling, nested OneOf/skipped transforms, replay,
+pickle, input ownership, Torch output and concurrent calls to the same pipeline.
+Weighted statistics remain deterministic but can change rounding on other
+inputs; `compact=False` retains ordinary reduction order. No training-quality
+or macOS/arm64 performance claim is made.

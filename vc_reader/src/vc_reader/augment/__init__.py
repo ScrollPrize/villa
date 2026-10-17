@@ -117,19 +117,23 @@ class Pipeline:
     Pass inplace=True when handing off fresh reader buffers: transforms may
     modify them and outputs may share their storage. Always use returned arrays,
     since geometry and shape-changing transforms allocate new buffers.
+    compact=True keeps eligible float32 median/intensity chains in a lossless
+    palette representation. Weighted statistics can differ slightly in rounding;
+    compact=False retains the ordinary reduction order. Outputs keep their dtype.
     """
-    def __init__(self, transforms, *, targets=None):
+    def __init__(self, transforms, *, targets=None, compact=True):
+        self.compact = bool(compact)
         self.transforms = tuple(deepcopy(tuple(transforms)))
         self.targets = deepcopy(targets) if targets is not None else {
             "image": Image(), "mask": Label(), "padding_mask": ValidMask(),
         }
-        self._native = _native.Pipeline(_unwrap(self.transforms), _unwrap(self.targets))
+        self._native = _native.Pipeline(_unwrap(self.transforms), _unwrap(self.targets), self.compact)
 
     def __getstate__(self):
-        return self.transforms, self.targets
+        return self.transforms, self.targets, self.compact
 
     def __setstate__(self, state):
-        self.__init__(state[0], targets=state[1])
+        self.__init__(state[0], targets=state[1], compact=state[2] if len(state) > 2 else True)
 
     def _inputs(self, sample, inplace=False):
         arrays, converters = {}, {}

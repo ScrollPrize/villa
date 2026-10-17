@@ -31,6 +31,38 @@ parameters across channels within each image. Noise has a separate
 applies. Arguments and defaults are listed in
 [`__init__.pyi`](../src/vc_reader/augment/__init__.pyi).
 
+## Compact intensity and median chains
+
+`Pipeline(..., compact=True)` is the default. When Gamma or median encounters
+a float32 image whose channels each contain at most 256 distinct values, the
+pipeline can keep uint8 indices and a float32 palette for each channel.
+No rounding or clipping is needed to encode those values. Subsequent median,
+Flip, Rotate90, Transpose, BrightnessMultiply, BrightnessAdd, Contrast, Gamma,
+and Invert can continue in that representation. Transform order, probabilities,
+channel selection and random parameter streams are unchanged.
+
+Gaussian blur, interpolation, noise, CropPad, ThickSlice, slice illumination
+and other unsupported transforms cause a decode before sampling/execution.
+The public input and output remain float32; this does not add uint8 image input
+or change normalization. Float64 images and images with an associated validity
+mask use the ordinary path. Standalone Contrast, Invert, brightness and
+permutations do not pay the conversion cost: they use compact storage only if
+an earlier Gamma or median has already created it.
+
+`MedianFilter(..., quantize=True)` can also start a compact chain after
+deformation. That existing opt-in quantization still applies only to selected
+channels and only when median is actually applied. The default median remains
+exact. Median reorders the palette before rank selection, so inversion and
+negative brightness factors are supported.
+
+Mean and sample standard deviation are weighted by the number of voxels at
+each palette entry. This changes reduction order and can produce small
+floating-point rounding differences; it is not a universal bit-exact promise.
+Use `compact=False` to retain the ordinary reduction order or compare timings.
+Both modes support replay, pickling, NumPy/Torch containers and `inplace=True`.
+When profiling, conversion is charged to the entering transform, and decoding
+to the following ordinary transform or the final transform at pipeline exit.
+
 ## Reusing reader buffers
 
 A fresh reader crop can be handed directly to augmentation without another
@@ -145,7 +177,7 @@ LocalSmoothing and Sharpen, float32 selection buffers for MedianFilter, and
 float32 powers for Gamma/LocalGamma. Gamma also uses a float32 working buffer;
 its statistics still accumulate in double. Noise's Box–Muller math follows image
 precision. Float64 images retain double-precision computation. Median filtering
-still selects exact input values; other float32 paths introduce small rounding
+selects exact input values by default; other float32 paths introduce small rounding
 differences from the previous double intermediates.
 
 Double remains where it has a numerical purpose: Gaussian coefficient
@@ -248,8 +280,8 @@ reading a crop and takes only valid supervised `(N,3)` points.
 
 This is a new backend, not a bitwise replacement for the old training pipeline.
 Construct the desired probabilities and ranges explicitly. Linear interpolation
-is used for continuous targets; no cubic interpolation mode is supplied. Kernels
-use double intermediates and cast to the input dtype. Specific conventions:
+is used for continuous targets; no cubic interpolation mode is supplied. Working
+precision follows the rules above. Specific conventions:
 
 - `GaussianBlur(sigma=..., truncate=6, boundary="mirror")` uses an odd filter
   width near `truncate * sigma`: radius is `floor((truncate*sigma + .5)/2)`.
@@ -257,9 +289,19 @@ use double intermediates and cast to the input dtype. Specific conventions:
   SciPy's radius. `mirror` excludes the repeated edge pixel (Torch's reflect
   padding); `reflect` includes it. Small arrays support repeated reflection.
 - `MedianFilter` uses a sliding histogram when a channel has at most 256 distinct
-  values, including normalized uint8 CT. It stores the exact values; there is no
-  quantization. Channels with more distinct values (for example, after noise or
-  interpolation), or both signs of zero, use the general selection kernel.
+  values, including normalized uint8 CT. By default it stores exact values;
+  continuous 3×3×3 inputs use a selection network and other widths use the
+  general selector. `MedianFilter(size=(2, 8), quantize=True)` additionally lets
+  higher-cardinality channels use the histogram after rounding to 256 evenly
+  spaced levels between that channel's current minimum and maximum. Codes stay
+  uint8 internally; outputs retain the input float32/float64 dtype and range.
+  This is opt-in and can be used after Elastic without moving the filter.
+  Monotone quantization commutes with rank selection (also for even windows):
+  error versus the exact median is at most `(max - min) / 510`, plus output
+  floating-point rounding. Already-small palettes remain exact; size 1 is an
+  identity. Unrepresentable ranges use the exact fallback. Outliers widen the
+  quantization step because the range is not clipped. The option does not
+  change parameter sampling, and replay remains deterministic within a build.
 - `LowResolution` uses nearest-exact downsampling and linear upsampling;
   `ThickSlice` uses legacy nearest sampling in both directions.
 - `Morphology` defaults to a Euclidean ball. To reproduce the existing 3D

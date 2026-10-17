@@ -161,7 +161,7 @@ NB_MODULE(_augment, m) {
         t.sigma = parameter(a, "sigma", t.sigma); t.shared_axes = a.get("shared_axes", true); t.truncate = a.get("truncate", 6.);
         auto boundary = a.get("boundary", std::string("mirror")); require(boundary == "mirror" || boundary == "reflect", "boundary must be mirror or reflect"); t.mirror_boundary = boundary == "mirror";
     });
-    bind<MedianFilter>(m, "MedianFilter", [](auto& t, auto& a) { t.size = parameter(a, "size", t.size); });
+    bind<MedianFilter>(m, "MedianFilter", [](auto& t, auto& a) { t.size = parameter(a, "size", t.size); t.quantize = a.kw("quantize", false); });
     bind<Sharpen>(m, "Sharpen", [](auto& t, auto& a) { t.strength = parameter(a, "strength", t.strength); t.p_clamp = a.get("p_clamp", .5); probability(t.p_clamp); });
     bind<BrightnessGradient>(m, "BrightnessGradient", [](auto& t, auto& a) { t.local = local_options(a); t.strength = parameter(a, "strength", t.strength); t.mean_centered = a.get("mean_centered", true); t.clip = a.get("clip", false); });
     bind<LocalContrast>(m, "LocalContrast", [](auto& t, auto& a) { t.local = local_options(a); t.factor = parameter(a, "factor", t.factor); });
@@ -213,7 +213,7 @@ NB_MODULE(_augment, m) {
         .def_prop_ro("steps", [](const Plan& p) { return p.steps.size(); })
         .def("dump", [](const Plan& p) { auto bytes = save_plan(p); return nb::bytes(bytes.data(), bytes.size()); });
     nb::class_<Pipeline>(m, "Pipeline")
-        .def(nb::init<std::vector<Op>, std::map<std::string, Target>>(), "transforms"_a, "targets"_a)
+        .def(nb::init<std::vector<Op>, std::map<std::string, Target>, bool>(), "transforms"_a, "targets"_a, "compact"_a = true)
         .def("load_plan", [](const Pipeline& p, nb::bytes bytes) { return load_plan(p.program(), std::string(bytes.c_str(), bytes.size())); })
         .def("run", [](const Pipeline& p, const std::map<std::string, Input>& inputs, std::uint64_t seed, bool record, bool profile, bool inplace) {
             if (inplace) writable_inputs(inputs);

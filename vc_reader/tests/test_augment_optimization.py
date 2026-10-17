@@ -5,6 +5,79 @@ import pytest
 from vc_reader import augment as A
 
 
+@pytest.mark.parametrize("shape", [(17, 19), (1, 3, 101), (5, 7, 11)])
+@pytest.mark.parametrize("size", [2, 3, 8])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_quantized_median_matches_quantized_exact_rank(shape, size, dtype):
+    ndi = pytest.importorskip("scipy.ndimage")
+    rng = np.random.default_rng(92)
+    image = np.stack([rng.uniform(-3, 5, shape), rng.uniform(200, 1200, shape)]).astype(dtype)
+    before = image.copy()
+    result = A.Pipeline([A.MedianFilter(size, quantize=True)])({"image": image}, seed=19)["image"]
+    for channel, actual in zip(image, result):
+        exact = ndi.median_filter(channel, size=size, mode="reflect").astype(np.float64)
+        low, high = float(channel.min()), float(channel.max())
+        levels = np.linspace(low, high, 256)
+        # Independent reference: select the exact median first, then find its
+        # nearest reconstruction value without encoding/filtering the image.
+        expected = levels[np.abs(exact[..., None] - levels).argmin(axis=-1)].astype(dtype)
+        rounding = np.finfo(dtype).eps * max(abs(low), abs(high)) * 2
+        np.testing.assert_allclose(actual, expected, rtol=0, atol=rounding)
+        assert np.abs(actual.astype(np.float64) - exact).max() <= (high - low) / 510 + rounding
+    np.testing.assert_array_equal(image, before)
+    assert result.dtype == dtype
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("size", [1, 2, 8])
+def test_quantized_median_preserves_existing_exact_palette(dtype, size):
+    ndi = pytest.importorskip("scipy.ndimage")
+    rng = np.random.default_rng(3)
+    image = rng.choice(np.array([-7., -2.03, .001, 100]), size=(1, 5, 7, 19)).astype(dtype)
+    for source in (image, np.full_like(image, .123)):
+        actual = A.Pipeline([A.MedianFilter(size, quantize=True)])({"image": source}, seed=3)["image"]
+        np.testing.assert_array_equal(actual[0], ndi.median_filter(source[0], size=size, mode="reflect"))
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_quantized_median_extreme_ranges(dtype):
+    ndi = pytest.importorskip("scipy.ndimage")
+    magnitude = np.finfo(dtype).max * .75
+    image = (np.random.default_rng(8).uniform(-1, 1, (1, 17, 19)) * magnitude).astype(dtype)
+    actual = A.Pipeline([A.MedianFilter(2, quantize=True)])({"image": image}, seed=3)["image"]
+    exact = ndi.median_filter(image[0], size=2, mode="reflect")
+    assert np.isfinite(actual).all()
+    if dtype == np.float64:
+        # The channel's range exceeds double: use the exact selector.
+        np.testing.assert_array_equal(actual[0], exact)
+    else:
+        error = np.abs(actual[0].astype(np.float64) - exact.astype(np.float64)).max()
+        assert error <= (float(image.max()) - float(image.min())) / 510 + magnitude * 2e-7
+
+
+def test_quantized_median_nonfinite_fallback_and_identity():
+    image = np.arange(323, dtype=np.float32).reshape(1, 17, 19)
+    for size in (1, 3):
+        pipeline = A.Pipeline([A.MedianFilter(size, quantize=True)])
+        if size == 1:
+            np.testing.assert_array_equal(pipeline({"image": image}, seed=2)["image"], image)
+        invalid = image.copy()
+        invalid[0, 8, 8] = np.inf
+        with pytest.raises(ValueError, match="nonfinite input"):
+            pipeline({"image": invalid}, seed=2)
+
+
+def test_quantized_median_replays_after_elastic_and_pickle():
+    import pickle
+    image = np.random.default_rng(43).random((1, 9, 11, 13), dtype=np.float32)
+    sample = {"image": image}
+    pipeline = A.Pipeline([A.Elastic(sigma=3, magnitude=1), A.MedianFilter((2, 8), quantize=True)])
+    expected = pipeline(sample, seed=13)["image"]
+    plan = pipeline.sample(sample, seed=13)
+    for replay in (plan, pickle.loads(pickle.dumps(plan))):
+        np.testing.assert_array_equal(replay.apply(sample)["image"], expected)
+
+
 @pytest.mark.parametrize("shape", [(7, 11), (5, 7, 11), (1, 3, 2)])
 @pytest.mark.parametrize("radius", [0, 1, 3])
 @pytest.mark.parametrize("operation", ["dilate", "erode", "open", "close"])
