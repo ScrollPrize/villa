@@ -11,13 +11,16 @@ template<class T, class Channel> void apply_channels(const T& t, Sample& s, cons
         if constexpr (std::is_same_v<T,GaussianBlur> || std::is_same_v<T,Sharpen> || std::is_same_v<T,LocalSmoothing>) {
             // Match the CPU overflow-protection decision; only four statistics,
             // never image data, cross back to the host for this dispatch.
-            auto summary = statistics(input); Statistics stats; summary.download(&stats);
+            auto summary = statistics(input);
             double limit = std::numeric_limits<float>::max()/64.;
             if constexpr (std::is_same_v<T,Sharpen>) {
                 limit /= std::max(1.,std::abs(c.values[0]));
                 wide |= std::abs(c.values[0]) > std::numeric_limits<float>::max();
             }
-            wide |= std::max(std::abs(stats.low),std::abs(stats.high)) > limit;
+            // Asynchronous sessions keep float32 and flag inputs that would
+            // need the float64 path, rather than reading statistics back.
+            if (session.async) flag_magnitude(summary,limit,session.check_flags(),4);
+            else { Statistics stats; summary.download(&stats); wide |= std::max(std::abs(stats.low),std::abs(stats.high)) > limit; }
         }
         if (wide) {
             Buffer<double> promoted(input.size); View<double> v{promoted.ptr,input.size};

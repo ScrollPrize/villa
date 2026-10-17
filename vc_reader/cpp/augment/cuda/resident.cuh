@@ -50,10 +50,15 @@ struct DeviceArray {
 };
 struct Session {
     std::map<std::string,DeviceArray> arrays;
-    std::unique_ptr<Buffer<int>> nonfinite, geometry;
+    std::unique_ptr<Buffer<int>> nonfinite, geometry, checks;
+    // Asynchronous sessions never read device data back to decide anything:
+    // checks become device flags, raised by check_status() when consumed.
+    bool async = false;
     int* finite_status();
     // Deferred directional/point failures, checked when the pipeline finishes.
     int* geometry_status();
+    // Input validation and float32 overflow-protection flags (async only).
+    int* check_flags();
     void check_status();
     Session() = default;
     explicit Session(const Sample&);
@@ -67,5 +72,7 @@ inline std::shared_ptr<Buffer<double>> field_buffer(const std::vector<double>& f
 }
 struct Statistics { double mean, low, high, deviation; };
 Buffer<Statistics> statistics(View<float>, bool deviation = false, const double* weights = nullptr);
+// Sets `bit` in flags when max(|low|, |high|) exceeds limit.
+void flag_magnitude(const Buffer<Statistics>&, double limit, int* flags, int bit);
 Buffer<Statistics> statistics(View<double>, bool deviation = false, const double* weights = nullptr);
 } // namespace vcr::augment::cuda

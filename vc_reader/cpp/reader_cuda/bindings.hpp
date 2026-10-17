@@ -1,26 +1,44 @@
 #pragma once
 #include "reader.hpp"
+#include "../cuda_event.hpp"
 #include <nanobind/stl/array.h>
 #include <nanobind/stl/optional.h>
 namespace vcr::reader_cuda {
-inline nb::object tensor(Result result, int device);
+// Device storage handed to Python. It is marked exported (its destruction then
+// synchronizes the device) only when shared through DLPack: arrays that stay
+// inside vc_reader free stream-ordered without blocking.
+struct Owned {
+    device::Storage storage; std::size_t count; nb::dlpack::dtype dtype; int device;
+    nb::object array(nb::handle self) const {
+        return nb::cast(nb::ndarray<nb::array_api, nb::device::cuda>(storage->ptr,1,&count,self,nullptr,dtype,nb::device::cuda::value,device));
+    }
+};
+inline nb::object owned(device::Storage storage, std::size_t count, nb::dlpack::dtype dtype, int device) {
+    return nb::cast(Owned{std::move(storage),count,dtype,device});
+}
+inline nb::object tensor(Result result, int device) {
+    nb::dlpack::dtype dtype{std::uint8_t(result.floating ? nb::dlpack::dtype_code::Float : nb::dlpack::dtype_code::UInt),std::uint8_t(result.floating ? 32 : 8),1};
+    return owned(std::move(result.storage),result.count,dtype,device);
+}
 // Samples, or (samples, validity) when the request asked for a mask.
 inline nb::object outputs(Result result, int device) {
     if (!result.valid) return tensor(std::move(result),device);
     Result mask{std::move(result.valid),result.count,false,nullptr};
     return nb::make_tuple(tensor(std::move(result),device),tensor(std::move(mask),device));
 }
-inline nb::object tensor(Result result, int device) {
-    result.storage->exported=true;
-    auto* owner=new device::Storage(std::move(result.storage));
-    nb::capsule capsule(owner,[](void* p) noexcept { delete static_cast<device::Storage*>(p); });
-    nb::dlpack::dtype dtype{std::uint8_t(result.floating ? nb::dlpack::dtype_code::Float : nb::dlpack::dtype_code::UInt),std::uint8_t(result.floating ? 32 : 8),1};
-    return nb::cast(nb::ndarray<nb::array_api, nb::device::cuda>((*owner)->ptr,1,&result.count,capsule,nullptr,dtype,nb::device::cuda::value,device));
-}
 inline void bind(nb::module_& m) {
     using Host=nb::ndarray<nb::ro,nb::c_contig,nb::device::cpu>;
     using Device=nb::ndarray<nb::array_api,nb::c_contig,nb::device::cuda>;
     m.def("reader_cuda_available",[] { int n=0; return cudaGetDeviceCount(&n)==cudaSuccess && n>0; });
+    nb::class_<Owned>(m,"CudaStorage")
+        .def("array",[](nb::handle self) { return nb::cast<const Owned&>(self).array(self); })
+        .def("export",[](Owned& o) { o.storage->exported=true; });
+    m.def("_set_stream",[](std::uintptr_t handle) { device::current_stream()=handle ? device::stream_handle(handle) : nullptr; });
+    nb::class_<device::Event>(m,"CudaEvent")
+        .def("synchronize",&device::Event::synchronize,nb::call_guard<nb::gil_scoped_release>())
+        .def("wait",&device::Event::wait)
+        .def("done",&device::Event::done);
+    m.def("_record_event",[] { return std::make_shared<device::Event>(); });
     nb::class_<PointPlan>(m,"CudaPointPlan");
     m.def("_cuda_view",[](Device input,const std::vector<std::size_t>& shape,std::size_t offset) {
         std::size_t n=1; for (auto s:shape) { if (s && n>SIZE_MAX/s) throw nb::value_error("shape overflow"); n*=s; }
@@ -45,11 +63,8 @@ inline void bind(nb::module_& m) {
         device::Storage storage;
         { nb::gil_scoped_release release; device::Guard guard(id); storage=device::allocate(input.nbytes(),id);
           if (input.nbytes()) device::check(cudaMemcpyAsync(storage->ptr,input.data(),input.nbytes(),cudaMemcpyHostToDevice,device::stream())); device::complete(); }
-        storage->exported=true;
-        auto* owner=new device::Storage(std::move(storage));
-        nb::capsule capsule(owner,[](void* p) noexcept { delete static_cast<device::Storage*>(p); });
-        std::vector<std::size_t> shape; for (std::size_t a=0;a<input.ndim();++a) shape.push_back(input.shape(a));
-        return nb::ndarray<nb::array_api, nb::device::cuda>((*owner)->ptr,shape.size(),shape.data(),capsule,nullptr,input.dtype(),nb::device::cuda::value,id);
+        std::size_t count=1; for (std::size_t a=0;a<input.ndim();++a) count*=input.shape(a);
+        return owned(std::move(storage),count,input.dtype(),id);
     });
     m.def("_cuda_cast",[](Device input) {
         if (input.dtype().code!=std::uint8_t(nb::dlpack::dtype_code::UInt) || input.dtype().bits!=8) throw nb::value_error("astype supports uint8 to float32");
@@ -102,14 +117,14 @@ inline void bind(nb::module_& m) {
             auto grids=make_grids(shapes,bases,std::vector<std::array<float,3>>(shapes.size()),std::vector<std::array<float,9>>(shapes.size()));
             nb::gil_scoped_release release; r.warm(std::move(grids));
         })
-        .def("points_resident",[point_dtype](Reader& r,Device points,const Index& base,int kind,int order,bool valid) {
+        .def("points_resident",[point_dtype](Reader& r,Device points,const Index& base,int kind,int order,bool valid,bool sync) {
             const int bits=point_dtype(points,kind);
             if (points.device_id()!=r.device_id()) throw nb::value_error("points are on another CUDA device");
-            Result result; { nb::gil_scoped_release release; result=r.points_resident(points.data(),points.shape(0),bits,base,kind,order,valid); }
+            Result result; { nb::gil_scoped_release release; result=r.points_resident(points.data(),points.shape(0),bits,base,kind,order,valid,sync); }
             return outputs(std::move(result),r.device_id());
         })
         .def("affine_resident",[](Reader& r,Device origins,Device axes,const std::array<std::int64_t,3>& shape,
-            std::optional<std::array<std::int64_t,3>> coordinate_origin,int order,bool floating,bool valid) {
+            std::optional<std::array<std::int64_t,3>> coordinate_origin,int order,bool floating,bool valid,bool sync) {
             const auto od=origins.dtype(), ad=axes.dtype();
             if (origins.ndim()!=2 || origins.shape(1)!=3 || od.code!=std::uint8_t(nb::dlpack::dtype_code::Float) || (od.bits!=32 && od.bits!=64))
                 throw nb::value_error("origins must be a (B, 3) float32/float64 CUDA array");
@@ -119,7 +134,7 @@ inline void bind(nb::module_& m) {
             Result result;
             { nb::gil_scoped_release release;
               result=r.affine_resident(origins.data(),int(od.bits),static_cast<const float*>(axes.data()),origins.shape(0),shape.data(),
-                                       coordinate_origin ? coordinate_origin->data() : nullptr,order,floating,valid); }
+                                       coordinate_origin ? coordinate_origin->data() : nullptr,order,floating,valid,sync); }
             return outputs(std::move(result),r.device_id());
         })
         .def("points",[](Reader& r,Host points,const Index& base,int kind,int order,const std::string& route,bool valid) {

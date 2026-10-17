@@ -7,7 +7,20 @@ Session::Session(const Sample& s) {
         device.buffer->upload(static_cast<const std::byte*>(f.array.data()));
     }
 }
+int* Session::check_flags() {
+    if (!checks) {
+        checks = std::make_unique<Buffer<int>>(1);
+        check(cudaMemsetAsync(checks->ptr,0,sizeof(int),vcr::device::stream()));
+    }
+    return checks->ptr;
+}
 void Session::check_status() {
+    if (checks) {
+        int flags = 0; checks->download(&flags);
+        require(!(flags&1),"nonfinite input; use a validity mask for missing data");
+        require(!(flags&2),"validity masks must contain only zero or one");
+        require(!(flags&4),"values too large for float32 filtering without the float64 fallback; use sync=True");
+    }
     if (nonfinite) {
         int invalid = 0; nonfinite->download(&invalid);
         require(!invalid,"normalization requires finite crop values");
@@ -70,13 +83,15 @@ template<class T> __global__ void validate_device_values(View<T> data, bool mask
         if (mask && data.ptr[i]!=0 && data.ptr[i]!=1) atomicOr(invalid,2);
     }
 }
-std::shared_ptr<void> begin_device(const std::map<std::string,DeviceInput>& inputs, Sample& sample, bool inplace) {
-    auto session=std::make_shared<Session>();
-    Buffer<int> invalid(1); int flags=0; check(cudaMemsetAsync(invalid.ptr,0,sizeof(int),vcr::device::stream()));
+std::shared_ptr<void> begin_device(const std::map<std::string,DeviceInput>& inputs, Sample& sample, bool inplace, bool async) {
+    auto session=std::make_shared<Session>(); session->async=async;
+    Buffer<int> invalid(async ? 0 : 1); int flags=0;
+    int* status=async ? session->check_flags() : invalid.ptr;
+    if (!async) check(cudaMemsetAsync(invalid.ptr,0,sizeof(int),vcr::device::stream()));
     for (const auto& [key,in]:inputs) {
         auto& f=sample.at(key);
         DeviceArray array(in.shape,in.kind,in.bytes,in.data);
-        array.typed([&](auto view) { if (view.size) validate_device_values<<<blocks(view.size),256,0,vcr::device::stream()>>>(view,f.target.role==Role::Valid,invalid.ptr); });
+        array.typed([&](auto view) { if (view.size) validate_device_values<<<blocks(view.size),256,0,vcr::device::stream()>>>(view,f.target.role==Role::Valid,status); });
         check(cudaGetLastError());
         if (inplace) session->arrays.emplace(key,std::move(array));
         else {
@@ -85,6 +100,7 @@ std::shared_ptr<void> begin_device(const std::map<std::string,DeviceInput>& inpu
             session->arrays.emplace(key,std::move(copy));
         }
     }
+    if (async) return session;
     invalid.download(&flags);
     require(!(flags&1),"nonfinite input; use a validity mask for missing data");
     require(!(flags&2),"validity masks must contain only zero or one");
@@ -92,14 +108,18 @@ std::shared_ptr<void> begin_device(const std::map<std::string,DeviceInput>& inpu
 }
 std::map<std::string,DeviceInput> device_outputs(void* context) {
     std::map<std::string,DeviceInput> out;
-    for (const auto& [key,a]:static_cast<Session*>(context)->arrays) {
-        a.buffer->exported=true;
+    for (const auto& [key,a]:static_cast<Session*>(context)->arrays)
         out.emplace(key,DeviceInput{a.buffer->ptr,a.shape,a.kind,a.bytes,a.buffer->device});
-    }
     return out;
 }
+void export_outputs(void* context) {
+    for (auto& [key,a]:static_cast<Session*>(context)->arrays) a.buffer->exported=true;
+}
+void check_device(void* context) { static_cast<Session*>(context)->check_status(); }
 void finish_device(void* context) {
-    static_cast<Session*>(context)->check_status();
+    auto& session=*static_cast<Session*>(context);
+    if (session.async) return;
+    session.check_status();
     check(cudaStreamSynchronize(vcr::device::stream()));
 }
 }

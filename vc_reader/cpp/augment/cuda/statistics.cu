@@ -45,6 +45,12 @@ template<class T> Buffer<Statistics> stats_impl(View<T> data, bool deviation, co
     }
     check(cudaGetLastError()); return result;
 }
+__global__ void magnitude_flag(const Statistics* s, double limit, int* flags, int bit) {
+    if (fmax(fabs(s->low),fabs(s->high)) > limit) atomicOr(flags,bit);
+}
+void flag_magnitude(const Buffer<Statistics>& s, double limit, int* flags, int bit) {
+    magnitude_flag<<<1,1,0,vcr::device::stream()>>>(s.ptr,limit,flags,bit); check(cudaGetLastError());
+}
 Buffer<Statistics> statistics(View<float> v, bool d, const double* w) { return stats_impl(v,d,w); }
 Buffer<Statistics> statistics(View<double> v, bool d, const double* w) { return stats_impl(v,d,w); }
 } // namespace vcr::augment::cuda

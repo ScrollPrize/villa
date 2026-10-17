@@ -44,6 +44,7 @@ static Scalar scalar(nb::handle value) {
     if (nb::isinstance<Normal>(value)) return nb::cast<Normal>(value);
     if (nb::isinstance<Choice>(value)) return nb::cast<Choice>(value);
     if (nb::isinstance<BalancedContrast>(value)) return nb::cast<BalancedContrast>(value);
+    if (nb::isinstance<Named>(value)) return nb::cast<Named>(value);
     if (nb::isinstance<nb::tuple>(value) || nb::isinstance<nb::list>(value)) {
         auto values = nb::cast<std::vector<double>>(value); require(values.size() == 2, "range needs two bounds"); return Uniform{values[0], values[1]};
     }
@@ -141,6 +142,7 @@ NB_MODULE(_augment, m) {
     nb::class_<Normal>(m, "Normal").def(nb::init<double, double>(), "mean"_a = 0., "std"_a = .1);
     nb::class_<Choice>(m, "Choice").def(nb::init<std::vector<double>>(), "values"_a);
     nb::class_<BalancedContrast>(m, "BalancedContrast").def(nb::init<double, double>(), "low"_a = .75, "high"_a = 1.25);
+    nb::class_<Named>(m, "Param").def(nb::init<std::string>(), "name"_a);
     nb::class_<Target>(m, "Target");
     m.def("Image", [](double fill, nb::object valid) { Target t; t.fill = fill; t.valid = valid.is_none() ? "" : nb::cast<std::string>(valid); return t; }, "fill"_a = 0., "valid"_a.none() = nb::str("padding_mask"));
     m.def("Label", [](nb::object ignore_value, double fill) { Target t; t.role = Role::Label; t.fill = ignore_value.is_none() ? fill : nb::cast<double>(ignore_value); return t; }, "ignore_value"_a = nb::none(), "fill"_a = 0.);

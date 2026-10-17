@@ -66,6 +66,15 @@ class Reader {
     Source resident_{};
     bool resident_dirty_=true;
     std::mutex mutex_;
+    // Completion of this reader's latest request. Each request's stream waits
+    // on it first, so reused scratch and lookup tables stay ordered when
+    // asynchronous resident requests run on different streams.
+    cudaEvent_t last_=nullptr;
+    void chain() { if (last_) device::check(cudaStreamWaitEvent(device::stream(),last_,0)); }
+    void mark() {
+        if (!last_) device::check(cudaEventCreateWithFlags(&last_,cudaEventDisableTiming));
+        device::check(cudaEventRecord(last_,device::stream()));
+    }
     std::uint64_t hits_=0, uploads_=0, uploaded_=0, cpu_routes_=0, gpu_routes_=0;
     void ready() const {
         if (pid_!=getpid()) throw std::runtime_error("CUDA reader cannot be used after fork; create it in the worker");
@@ -293,14 +302,19 @@ public:
         capacity_=std::min<std::size_t>(budget_/brick_bytes_,UINT32_MAX);
         segment_slots_=std::max<std::size_t>(1,(256ull<<20)/brick_bytes_);
     }
+    ~Reader() {
+        if (!last_ || pid_!=getpid()) return;
+        int previous; if (cudaGetDevice(&previous)!=cudaSuccess || cudaSetDevice(device_)!=cudaSuccess) return;
+        cudaEventSynchronize(last_); cudaEventDestroy(last_); cudaSetDevice(previous);
+    }
     int device_id() const { return device_; }
     void clear() {
-        ready(); std::lock_guard lock(mutex_); device::Guard guard(device_);
+        ready(); std::lock_guard lock(mutex_); device::Guard guard(device_); chain();
         cache_.clear(); lru_.clear(); free_.clear(); segments_.clear(); slots_=0; resident_dirty_=true; device::complete();
     }
     std::vector<std::uint64_t> stats() { ready(); std::lock_guard lock(mutex_); return {cache_.size()*brick_bytes_,budget_,hits_,uploads_,uploaded_,cpu_routes_,gpu_routes_}; }
     Result grids(std::vector<Grid> grids, int kind, int order, bool floating, const std::string& route, bool valid=false) {
-        ready(); std::lock_guard lock(mutex_); device::Guard guard(device_);
+        ready(); std::lock_guard lock(mutex_); device::Guard guard(device_); chain();
         if (grids.size()>65535 || (kind!=0 && kind!=1) || (order!=0 && order!=1) || (kind==1 && order==1 && !floating)) throw std::invalid_argument("invalid CUDA grid request");
         std::set<std::int64_t> needed;
         std::vector<std::vector<std::int64_t>> footprints(grids.size());
@@ -445,7 +459,7 @@ private:
 public:
     // Loads the bricks of voxel boxes without producing output.
     void warm(std::vector<Grid> boxes) {
-        ready(); std::lock_guard lock(mutex_); device::Guard guard(device_);
+        ready(); std::lock_guard lock(mutex_); device::Guard guard(device_); chain();
         std::set<std::int64_t> needed;
         for (const auto& g:boxes) box(needed,g.base,g.shape);
         if (needed.size()>capacity_) throw std::invalid_argument("warm regions exceed CUDA chunk-cache budget; increase cache_bytes");
@@ -453,19 +467,19 @@ public:
     }
     // Device-coordinate sampling from resident bricks only: no planning, no
     // host transfer of coordinates. Missing bricks read as fill.
-    Result points_resident(const void* points, std::size_t count, int bits, const Index& base, int kind, int order, bool valid) {
-        ready(); std::lock_guard lock(mutex_); device::Guard guard(device_);
+    Result points_resident(const void* points, std::size_t count, int bits, const Index& base, int kind, int order, bool valid, bool sync=true) {
+        ready(); std::lock_guard lock(mutex_); device::Guard guard(device_); chain();
         if ((kind!=2 && kind!=3) || (kind==2 && bits!=32) || (bits!=32 && bits!=64) || (order!=0 && order!=1)) throw std::invalid_argument("invalid point request");
         const bool floating=kind==2 && order; auto result=output(count,floating,valid);
         if (!count) return result;
         launch(resident_source(),nullptr,0,0,points,bits,count,base.data(),kind,order,floating,result.storage->ptr,mask(result));
-        device::complete(); return result;
+        mark(); if (sync) device::complete(); return result;
     }
     // Affine crops of one shape from device origins/axes, resident bricks only.
     // Returns samples and, with valid, their validity (residency included).
     Result affine_resident(const void* origins, int bits, const float* axes, std::size_t jobs,
-            const std::int64_t* shape, const std::int64_t* coordinate_origin, int order, bool floating, bool valid) {
-        ready(); std::lock_guard lock(mutex_); device::Guard guard(device_);
+            const std::int64_t* shape, const std::int64_t* coordinate_origin, int order, bool floating, bool valid, bool sync=true) {
+        ready(); std::lock_guard lock(mutex_); device::Guard guard(device_); chain();
         if (jobs>65535 || (order!=0 && order!=1) || (order==1 && !floating)) throw std::invalid_argument("invalid CUDA affine request");
         std::size_t count=1; for (int a=0;a<3;++a) { if (shape[a]<0 || shape[a]>(1LL<<24)) throw std::invalid_argument("invalid crop shape"); count*=std::size_t(shape[a]); }
         if (jobs && count>SIZE_MAX/4/jobs) throw std::invalid_argument("batch size overflow");
@@ -476,7 +490,7 @@ public:
         auto* grids=static_cast<Grid*>(resident_requests_->ptr);
         device_grids(origins,bits,axes,jobs,shape,coordinate_origin,grids);
         launch(source,grids,jobs,count,nullptr,0,jobs*count,nullptr,1,order,floating,result.storage->ptr,mask(result));
-        device::complete(); return result;
+        mark(); if (sync) device::complete(); return result;
     }
 private:
     std::set<std::int64_t> discover_points(const void* points, std::size_t count, int bits, const Index& base, int kind, int order) {
@@ -562,7 +576,7 @@ private:
     }
 public:
     Result points(const void* points, std::size_t count, int bits, const Index& base, int kind, int order, const std::string& route, bool valid=false) {
-        ready(); std::lock_guard lock(mutex_); device::Guard guard(device_);
+        ready(); std::lock_guard lock(mutex_); device::Guard guard(device_); chain();
         const auto needed=discover_points(points,count,bits,base,kind,order);
         return execute_points(points,count,bits,base,kind,order,needed,nullptr,route,valid);
     }
@@ -580,6 +594,7 @@ public:
     Result read_plan(const PointPlan& plan, const std::string& route, bool valid=false) {
         ready(); std::lock_guard lock(mutex_); device::Guard guard(device_);
         if (plan.owner!=this) throw std::invalid_argument("point plan belongs to another reader");
+        chain();
         return execute_points(plan.host.data(),plan.count,plan.bits,plan.base,plan.kind,plan.order,plan.needed,plan.coordinates->ptr,route,valid);
 
     }
