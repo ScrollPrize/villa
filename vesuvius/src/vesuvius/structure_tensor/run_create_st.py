@@ -532,9 +532,12 @@ def main():
         if not ok:
             return 1
         if args.delete_intermediate:
-            delete_intermediate_file(zarr_path, verbose=args.verbose)
+            delete_intermediate_file(f"{zarr_path.rstrip('/')}/structure_tensor", verbose=args.verbose)
         print("\n--- All computations completed successfully ---")
-        print(f"  - Structure tensor: {zarr_path}/structure_tensor")
+        if args.delete_intermediate:
+            print("  - Structure tensor: deleted after eigenanalysis (--delete-intermediate)")
+        else:
+            print(f"  - Structure tensor: {zarr_path}/structure_tensor")
         if not args.no_ome_out:
             print(f"  - first_component/, second_component/, normal/, confidence/ (scale '{args.ome_scale}', ds={args.ome_downsample})")
         if args.keep_eigen:
