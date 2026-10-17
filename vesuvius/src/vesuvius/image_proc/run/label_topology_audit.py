@@ -235,7 +235,10 @@ def _parse_fail_on(specs: Sequence[str]) -> dict[str, float]:
         key, sep, val = spec.partition("=")
         if not sep or key not in set(flat_keys()):
             raise SystemExit(f"--fail-on expects METRIC=MAX with METRIC in {flat_keys()}: {spec!r}")
-        limits[key] = float(val)
+        try:
+            limits[key] = float(val)
+        except ValueError:
+            raise SystemExit(f"--fail-on limit must be a number: {spec!r}") from None
     return limits
 
 
@@ -261,7 +264,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--min-piece", type=int, default=500, help="minimum voxels of a post-erosion piece")
     ap.add_argument("--plot", action="store_true", help="write overlay PNGs (needs --image / batch images)")
     ap.add_argument("--fail-on", action="append", default=[], metavar="METRIC=MAX",
-                    help="exit 2 if a crop's metric exceeds MAX (repeatable), e.g. b1_total_big=0")
+                    help="exit 2 if a crop's metric (or its --after volume's) exceeds MAX (repeatable), e.g. b1_total_big=0")
     return ap
 
 
@@ -280,6 +283,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not labels:
             ap.error(f"no labels/*.tif under {a.batch}")
         jobs = [(p, a.batch / "images" / p.name, a.after / p.name if a.after else None) for p in labels]
+        missing = [str(j[2]) for j in jobs if j[2] is not None and not j[2].exists()]
+        if missing:
+            ap.error(f"--after is missing {len(missing)} paired file(s), e.g. {missing[0]}")
     else:
         jobs = [(a.label, a.image, a.after)]
 
@@ -304,10 +310,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             delta = {k: [f[k], f2[k]] for k in f}
             (a.out / f"{name}.delta.json").write_text(json.dumps(delta, indent=1))
             print("delta (before, after):", json.dumps(delta))
-        for key, limit in limits.items():
-            if f[key] > limit:
-                print(f"FAIL {name}: {key}={f[key]} > {limit}", file=sys.stderr)
-                failed = True
+        checked = [("", f)] + ([(" (after)", f2)] if after_path else [])
+        for tag, vals in checked:
+            for key, limit in limits.items():
+                if vals[key] > limit:
+                    print(f"FAIL {name}{tag}: {key}={vals[key]} > {limit}", file=sys.stderr)
+                    failed = True
     with open(a.out / "aggregate.csv", "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0]))
         w.writeheader()

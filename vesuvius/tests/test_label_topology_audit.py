@@ -51,6 +51,19 @@ def test_hollow_shell_has_one_cavity():
     assert (m["b2_total_big"], m["b1_total_big"]) == (1, 0)
 
 
+def test_cavity_closed_only_diagonally_counts_as_cavity():
+    # 26-connected foreground pairs with 6-connected background: a cavity whose only route
+    # outside is a diagonal (edge) step between two removed wall voxels is still closed.
+    # With the wrong pairing it would leak (b2=0) or get a spurious handle.
+    v = np.zeros((30, 30, 30), np.uint8)
+    v[4:26, 4:26, 4:26] = 1
+    v[6:24, 6:24, 6:24] = 0          # 2-voxel-thick hollow cube
+    v[4, 15, 15] = 0                 # outer wall layer
+    v[5, 16, 15] = 0                 # inner wall layer, edge-adjacent only
+    m, _ = lta.audit(v)
+    assert (m["b2_total_big"], m["b1_total_big"]) == (1, 0)
+
+
 def test_specks_are_counted_as_tiny_fragments():
     v = sheet()
     for i in range(5):
@@ -94,3 +107,18 @@ def test_cli_after_delta_and_fail_on(tmp_path):
     rc = lta.main(["--label", str(tmp_path / "after.tif"), "--out", str(out),
                    "--fail-on", "b1_total_big=0"])
     assert rc == 2
+    # a regression only in the --after volume must also fail
+    rc = lta.main(["--label", str(tmp_path / "before.tif"), "--after", str(tmp_path / "after.tif"),
+                   "--out", str(out), "--fail-on", "b1_total_big=0"])
+    assert rc == 2
+    with pytest.raises(SystemExit):
+        lta.main(["--label", str(tmp_path / "before.tif"), "--out", str(out), "--fail-on", "b1_total_big=abc"])
+
+
+def test_batch_after_missing_pair_errors_before_writing(tmp_path):
+    (tmp_path / "labels").mkdir(); (tmp_path / "after").mkdir()
+    tifffile.imwrite(tmp_path / "labels" / "a.tif", sheet())
+    out = tmp_path / "out"
+    with pytest.raises(SystemExit):
+        lta.main(["--batch", str(tmp_path), "--after", str(tmp_path / "after"), "--out", str(out)])
+    assert not out.exists()
