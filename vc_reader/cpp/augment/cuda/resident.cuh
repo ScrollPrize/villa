@@ -50,6 +50,7 @@ struct DeviceArray {
 };
 struct Session {
     std::map<std::string,DeviceArray> arrays;
+    std::map<std::string,std::vector<DeviceArray>> pyramids;
     std::unique_ptr<Buffer<int>> nonfinite, geometry, checks;
     // Asynchronous sessions never read device data back to decide anything:
     // checks become device flags, raised by check_status() when consumed.

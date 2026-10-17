@@ -69,6 +69,11 @@ static nb::tuple run_device(const Pipeline& pipeline, const std::map<std::string
         arrays[nb::str(key.c_str())]=nb::make_tuple(device_array(a.data,a.shape,a.kind,a.bytes,a.device,owner),a.shape,std::string(1,a.kind)+std::to_string(a.bytes),a.device);
         sources[nb::str(key.c_str())]=nb::str(result.sample.at(key).source.c_str());
     }
+    for (const auto& [key,levels]:cuda::device_pyramids(context.get())) {
+        nb::list items;
+        for (const auto& a:levels) items.append(nb::make_tuple(device_array(a.data,a.shape,a.kind,a.bytes,a.device,owner),a.shape,std::string(1,a.kind)+std::to_string(a.bytes),a.device));
+        arrays[nb::str(key.c_str())]=items;
+    }
     return nb::make_tuple(arrays,sources,nb::cast(result.timings),record ? nb::cast(std::move(result.plan)) : nb::none(),outputs);
 }
 // One pipeline invocation per leading-axis sample, on the current stream with
@@ -85,6 +90,7 @@ static nb::tuple run_batch(const Pipeline& pipeline, const std::map<std::string,
     auto imported=import_device(pipeline,inputs,1);
     auto owner=std::make_shared<DeviceOutputs>();
     std::vector<std::map<std::string,cuda::DeviceInput>> results(count);
+    std::vector<std::map<std::string,std::vector<cuda::DeviceInput>>> pyramids(count);
     std::map<std::string,std::string> sources;
     {
         nb::gil_scoped_release release; vcr::device::Guard guard(imported.device);
@@ -97,6 +103,7 @@ static nb::tuple run_batch(const Pipeline& pipeline, const std::map<std::string,
             auto context=cuda::begin_device(arrays,sample,inplace,async);
             auto result=pipeline.run(std::move(sample),seeds[b],false,false,context);
             results[b]=cuda::device_outputs(context.get());
+            pyramids[b]=cuda::device_pyramids(context.get());
             if (!b) for (const auto& [key,f]:result.sample) sources[key]=f.source;
             owner->sessions.push_back(std::move(context));
         }
@@ -105,31 +112,41 @@ static nb::tuple run_batch(const Pipeline& pipeline, const std::map<std::string,
     nb::list input_owners;
     for (const auto& [key,in]:inputs) input_owners.append(nb::cast(in,nb::rv_policy::reference));
     nb::dict arrays;
-    for (const auto& [key,first]:results[0]) {
-        bool uniform=true;
-        for (const auto& r:results) uniform &= r.count(key) && r.at(key).shape==first.shape && r.at(key).kind==first.kind && r.at(key).bytes==first.bytes;
-        if (!uniform) {
-            nb::list items; nb::object list_owner=nb::make_tuple(holder,input_owners);
-            for (const auto& r:results) { const auto& a=r.at(key); items.append(device_array(a.data,a.shape,a.kind,a.bytes,a.device,list_owner)); }
-            arrays[nb::str(key.c_str())]=items; continue;
+    const auto pack = [&](const std::string& key,const std::vector<cuda::DeviceInput>& values,bool allow_out) -> nb::object {
+        const auto& first=values.front();bool uniform=true;
+        for(const auto& a:values)uniform &= a.shape==first.shape && a.kind==first.kind && a.bytes==first.bytes;
+        if(!uniform) {
+            nb::list items;nb::object list_owner=nb::make_tuple(holder,input_owners);
+            for(const auto& a:values)items.append(device_array(a.data,a.shape,a.kind,a.bytes,a.device,list_owner));
+            return items;
         }
-        Shape shape{count}; shape.insert(shape.end(),first.shape.begin(),first.shape.end());
-        const std::size_t bytes=product(first.shape)*first.bytes;
-        void* target; nb::object array_owner;
-        if (out.count(key)) {
-            const auto& dest=out.at(key);
-            Shape got; for (std::size_t a=0;a<dest.ndim();++a) got.push_back(dest.shape(a));
+        Shape shape{count};shape.insert(shape.end(),first.shape.begin(),first.shape.end());
+        const std::size_t bytes=product(first.shape)*first.bytes;void* target;nb::object array_owner;
+        if(allow_out && out.count(key)) {
+            const auto& dest=out.at(key);Shape got;for(std::size_t a=0;a<dest.ndim();++a)got.push_back(dest.shape(a));
             require(got==shape && dlpack_kind(dest.dtype())==first.kind && std::size_t(dest.dtype().bits/8)==first.bytes && dest.device_id()==imported.device,
                     key+": out array must match the stacked output shape, dtype and device");
-            target=dest.data(); array_owner=nb::cast(dest,nb::rv_policy::reference);
+            target=dest.data();array_owner=nb::cast(dest,nb::rv_policy::reference);
         } else {
-            auto buffer=vcr::device::allocate(count*bytes,imported.device);
-            owner->stacked.push_back(buffer); target=buffer->ptr; array_owner=holder;
+            auto buffer=vcr::device::allocate(count*bytes,imported.device);owner->stacked.push_back(buffer);target=buffer->ptr;array_owner=holder;
         }
-        { nb::gil_scoped_release release; vcr::device::Guard guard(imported.device);
-          for (std::size_t b=0;b<count;++b)
-              vcr::device::check(cudaMemcpyAsync(static_cast<char*>(target)+b*bytes,results[b].at(key).data,bytes,cudaMemcpyDeviceToDevice,vcr::device::stream())); }
-        arrays[nb::str(key.c_str())]=nb::make_tuple(device_array(target,shape,first.kind,first.bytes,imported.device,array_owner),shape,std::string(1,first.kind)+std::to_string(first.bytes),imported.device);
+        {nb::gil_scoped_release release;vcr::device::Guard guard(imported.device);
+         for(std::size_t b=0;b<count;++b)vcr::device::check(cudaMemcpyAsync(static_cast<char*>(target)+b*bytes,values[b].data,bytes,cudaMemcpyDeviceToDevice,vcr::device::stream()));}
+        return nb::make_tuple(device_array(target,shape,first.kind,first.bytes,imported.device,array_owner),shape,std::string(1,first.kind)+std::to_string(first.bytes),imported.device);
+    };
+    for(const auto& [key,first]:results[0]) {
+        if(pyramids[0].count(key))continue;
+        std::vector<cuda::DeviceInput> values;for(const auto& r:results){require(r.count(key),"batch output keys must agree");values.push_back(r.at(key));}
+        arrays[nb::str(key.c_str())]=pack(key,values,true);
+    }
+    for(const auto& [key,levels]:pyramids[0]) {
+        require(!out.count(key),"preallocated out does not accept pyramid lists");nb::list items;
+        for(std::size_t level=0;level<levels.size();++level) {
+            std::vector<cuda::DeviceInput> values;
+            for(const auto& r:pyramids){require(r.count(key) && r.at(key).size()==levels.size(),"batch pyramid levels must agree");values.push_back(r.at(key)[level]);}
+            items.append(pack(key,values,false));
+        }
+        arrays[nb::str(key.c_str())]=items;
     }
     // Stacked per-sample arrays are no longer needed: free them stream-ordered,
     // keeping each session's small status buffers for check().

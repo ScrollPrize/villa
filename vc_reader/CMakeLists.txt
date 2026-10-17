@@ -62,6 +62,21 @@ if(VC_READER_ENABLE_CUDA)
         cpp/augment/cuda/object_dropout.cu
         cpp/augment/cuda/fourier.cu
         cpp/augment/cuda/dropout_mask.cu
+        cpp/augment/cuda/clip_outliers.cu
+        cpp/augment/cuda/crop_pad.cu
+        cpp/augment/cuda/affine.cu
+        cpp/augment/cuda/sheet_compression.cu
+        cpp/augment/cuda/strip_geometry.cu
+        cpp/augment/cuda/surface_perturb.cu
+        cpp/augment/cuda/morphology.cu
+        cpp/augment/cuda/remove_components.cu
+        cpp/augment/cuda/replace_label.cu
+        cpp/augment/cuda/regions.cu
+        cpp/augment/cuda/one_hot.cu
+        cpp/augment/cuda/mask_image.cu
+        cpp/augment/cuda/deep_supervision.cu
+        cpp/augment/cuda/to_pseudo_2d.cu
+        cpp/augment/cuda/from_pseudo_2d.cu
         cpp/augment/cuda/backend.cu
         cpp/augment/cuda/blank_rectangle.cu
         cpp/augment/cuda/brightness_add.cu

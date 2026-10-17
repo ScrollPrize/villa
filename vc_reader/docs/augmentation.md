@@ -491,17 +491,14 @@ for 3D. The harness is a correctness check, not a throughput benchmark.
 
 ## Optional CUDA backend
 
-All 24 primary transforms from `bench_augment.py` have CUDA implementations:
-BrightnessMultiply, BrightnessAdd, Contrast, Gamma, Invert, GaussianNoise,
-RicianNoise, GaussianBlur, MedianFilter, Sharpen, BrightnessGradient,
-LocalContrast, LocalGamma, LocalSmoothing, BlankRectangle, SliceIllumination,
-Smear, Flip, Rotate90, Transpose, Elastic, LowResolution, ThickSlice, and
-RandomBinaryOperator. `Normalize`, `MedialSurface`, `OrientedBlur`,
-`DistanceTransform` and `StructureTensor` also support both backends. Each has its own `.cu` file under `cpp/augment/cuda/`.
-Small shared files provide interpolation, convolution, noise generation,
-channel adaptation, and device-buffer ownership. `OneOf` can compose these
-transforms. Other transforms remain available on CPU; selecting an unsupported
-transform with CUDA raises at pipeline construction.
+Every CPU transform has a CUDA implementation, including label conversions,
+morphology, component removal, crop/pad, affine and tracing geometry, clipping,
+pseudo-2D reshapes, and deep-supervision pyramids. `OneOf` can compose the entire
+catalog. CUDA dispatch is exhaustive at compile time: adding a CPU transform
+without a CUDA overload fails the CUDA build. There is no per-transform CPU
+fallback. Each added transform has its own descriptively named `.cu` file under
+`cpp/augment/cuda/`; interpolation, sorting, component traversal, and buffer
+ownership use shared helpers.
 
 ```python
 from vc_reader import augment as A
@@ -517,9 +514,11 @@ output = pipeline({"image": image, "mask": labels}, seed=123)
 - `backend="cuda"` requires a CUDA-enabled build and visible device.
 - `backend="auto"` chooses CUDA when available and CPU otherwise. It is an
   availability choice, **not a prediction of which backend is faster**.
-- Inputs and outputs are still NumPy arrays or CPU Torch tensors. CUDA tensors
-  are not accepted. Calls are synchronous and preserve inputs by default.
-  Profiling includes host/device transfers, allocation, and synchronization.
+- NumPy arrays and CPU Torch tensors use one upload/download per invocation.
+  `vc_reader.cuda.DeviceArray` inputs and outputs remain resident, including
+  derived labels and lists of deep-supervision levels. Calls through `Pipeline`
+  are synchronous and preserve inputs by default. Profiling includes any
+  host/device transfers, allocation, and synchronization.
 - CUDA uses dense buffers, regardless of `compact`. Each call uploads images
   and labels once, keeps them on the GPU across the entire chain, and
   downloads the final outputs once. Images keep their float32/float64 dtype
@@ -538,6 +537,12 @@ output = pipeline({"image": image, "mask": labels}, seed=123)
   the CPU's Jacobian/inverse rules (central differences of the displacement,
   Newton inversion for coordinates). Sparse points and vectors supplied as host
   arrays keep the CPU geometry; supplied as device arrays they stay resident.
+- Foreground cropping, component removal, and surface perturbation select
+  data-dependent locations on the GPU and read back small counts/indices for
+  the existing parameter RNG. These require synchronous execution; they never
+  download a volume to run a CPU transform. Component traversal and some
+  histogram/statistics kernels prioritize deterministic semantics over parallel
+  throughput and have not been performance-tuned.
 - Seeds, probabilities, channel selection, target routing, interpolation rules,
   float32/float64 precision, integer label IDs, and replay are preserved.
   Replay is exact within the same build/backend/device. CUDA transcendental
@@ -584,7 +589,7 @@ vc_reader/.venv/bin/python -S vc_reader/benchmarks/run_native.py \
 ```
 
 GPU regression tests skip on CPU-only builds/devices; backend selection and CPU
-fallback remain tested. Tests cover every benchmark transform in float32 and
+availability selection remain tested. Tests cover the complete catalog in float32 and
 float64, replay/pickle, 2D/3D and noncubic grids, multi-channel inputs, noncontiguous
 arrays, validity masks, integer label widths (including IDs above 2**53),
 probabilities, compositions, and overflow-protected float32 intermediates.
@@ -693,8 +698,11 @@ AGENTS_AGENT_MODE=1 cmake -S . -B /tmp/vc-volume-cpu \
 cmake --build /tmp/vc-volume-cpu --target _augment -j 2
 # For CUDA add -DVC_READER_ENABLE_CUDA=ON and the installed toolkit/compiler
 # and architecture flags described in the CUDA build section above.
-cp /tmp/vc-volume-cpu/_augment*.so src/vc_reader/
-.venv/bin/python -m pytest tests/test_augment_volumetric.py -q
+PYTHONPATH=src .venv/bin/python benchmarks/run_native.py \
+  /tmp/vc-volume-cpu/_augment.cpython-314-x86_64-linux-gnu.so \
+  -m pytest tests/test_augment_volumetric.py tests/test_augment_cuda_catalog.py tests/test_augment_cuda.py -q
+# Substitute the CUDA build path to run CUDA tests; adjust the ABI suffix
+# for your Python version. Resident-input tests also need a CUDA reader build.
 ```
 
 The regression suite includes independent NumPy FFT and SciPy filter references,

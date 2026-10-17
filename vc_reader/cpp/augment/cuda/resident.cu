@@ -19,6 +19,8 @@ void Session::check_status() {
         int flags = 0; checks->download(&flags);
         require(!(flags&1),"nonfinite input; use a validity mask for missing data");
         require(!(flags&2),"validity masks must contain only zero or one");
+        require(!(flags&8),"value-based label transforms require integer IDs within +/- (2**53 - 1)");
+        require(!(flags&16),"value is not representable in target dtype");
         require(!(flags&4),"values too large for float32 filtering without the float64 fallback; use sync=True");
     }
     if (nonfinite) {
@@ -45,6 +47,13 @@ void Session::finish(Sample& s) {
         auto host = Array::uninitialized(device.shape,device.kind,device.bytes);
         device.buffer->download(static_cast<std::byte*>(host.data()));
         s.at(key).array = std::move(host);
+    }
+    for (const auto& [key,levels] : pyramids) {
+        auto& output=s.at(key).pyramid; output.clear();
+        for (const auto& level:levels) {
+            auto host=Array::uninitialized(level.shape,level.kind,level.bytes);
+            level.buffer->download(static_cast<std::byte*>(host.data()));output.push_back(std::move(host));
+        }
     }
     check(cudaStreamSynchronize(vcr::device::stream()));
 }
@@ -112,8 +121,15 @@ std::map<std::string,DeviceInput> device_outputs(void* context) {
         out.emplace(key,DeviceInput{a.buffer->ptr,a.shape,a.kind,a.bytes,a.buffer->device});
     return out;
 }
+std::map<std::string,std::vector<DeviceInput>> device_pyramids(void* context) {
+    std::map<std::string,std::vector<DeviceInput>> out;
+    for (const auto& [key,levels]:static_cast<Session*>(context)->pyramids)
+        for (const auto& a:levels) out[key].push_back(DeviceInput{a.buffer->ptr,a.shape,a.kind,a.bytes,a.buffer->device});
+    return out;
+}
 void export_outputs(void* context) {
     for (auto& [key,a]:static_cast<Session*>(context)->arrays) a.buffer->exported=true;
+    for (auto& [key,levels]:static_cast<Session*>(context)->pyramids) for (auto& a:levels) a.buffer->exported=true;
 }
 void check_device(void* context) { static_cast<Session*>(context)->check_status(); }
 void release_outputs(void* context, const std::vector<std::string>& keys) {

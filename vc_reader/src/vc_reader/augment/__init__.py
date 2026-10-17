@@ -191,7 +191,8 @@ class Pipeline:
             # lifetime tracking. This synchronous adapter exposes the arrays
             # directly, so protect external DLPack users on destruction.
             result[4].export()
-        return ({k: DeviceArray(*v) for k, v in arrays.items()}, sources, timings, plan)
+        return ({k: [DeviceArray(*level) for level in v] if isinstance(v, list) else DeviceArray(*v)
+                 for k, v in arrays.items()}, sources, timings, plan)
 
     @staticmethod
     def _outputs(sample, converters, result, profile):

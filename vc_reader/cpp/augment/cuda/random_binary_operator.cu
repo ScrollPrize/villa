@@ -1,10 +1,7 @@
 #include "../labels.hpp"
 #include "morphology.cuh"
+#include "label_values.cuh"
 namespace vcr::augment::cuda {
-template<class T> __global__ void check_label_ids(View<T> data, int* invalid) {
-    EACH_INDEX(data.size) if (data.ptr[i] < -9007199254740991. || data.ptr[i] > 9007199254740991.)
-        atomicExch(invalid,1);
-}
 template<class T> __global__ void assign_mask(T* data, const std::uint8_t* result, std::size_t n, std::size_t channel, const std::size_t* channels, std::size_t count) {
     EACH_INDEX(n) {
         if (result[i] && !data[channel*n+i])
@@ -16,13 +13,7 @@ void apply_cuda(const RandomBinaryOperator& t, Sample& s, const Parameters& p, S
     auto& image = session.arrays.at(t.on); Grid grid(image.spatial()); Layout g(grid);
     auto channels = selected_channels(t.channels,image.shape[0]); Buffer<std::size_t> selected(channels);
     image.typed([&](auto all) {
-        // Match the CPU value-based label contract without copying the volume.
-        if ((image.kind == 'i' || image.kind == 'u') && image.bytes == 8 && !p.channels.empty()) {
-            Buffer<int> invalid(1); int flag = 0; invalid.upload(&flag);
-            check_label_ids<<<blocks(all.size),256,0,vcr::device::stream()>>>(all,invalid.ptr); check(cudaGetLastError());
-            invalid.download(&flag);
-            require(!flag,"value-based label transforms require integer IDs within +/- (2**53 - 1)");
-        }
+        if (!p.channels.empty()) require_exact_labels(image,session);
         for (const auto& c : p.channels) {
             auto f = footprint_offsets(ball(g.dim,c.values[0])); const auto count = f.size;
             Buffer<std::uint8_t> first(g.size),second(g.size);

@@ -1,5 +1,6 @@
 #pragma once
 #include "labels.hpp"
+#include "surface_displacement.hpp"
 
 namespace vcr::augment {
 // Specialized tracing operations share the same native geometry/target machinery.
@@ -7,13 +8,13 @@ struct StripGeometry {
     Scalar shift_x = 0., shift_y = 0., degrees = 0., scale = 1., shear_x = 0., shear_y = 0.;
     Scalar smooth_offset = 0., stride = 16.; double p_flip_x = 0, p_flip_y = 0, p = 1; Shape shape;
 };
-inline double cubic(const std::vector<double>& values, double position) {
+VCR_HD inline double cubic(const double* values, std::size_t count, double position) {
     auto i = std::int64_t(std::floor(position)); double t = position - i;
-    auto get = [&](std::int64_t at) { return values[std::size_t(std::clamp<std::int64_t>(at, 0, std::int64_t(values.size()) - 1))]; };
+    auto get = [&](std::int64_t at) { return values[std::size_t(std::clamp<std::int64_t>(at, 0, std::int64_t(count) - 1))]; };
     double v0 = get(i - 1), v1 = get(i), v2 = get(i + 1), v3 = get(i + 2);
     return .5 * (2 * v1 + (-v0 + v2) * t + (2 * v0 - 5 * v1 + 4 * v2 - v3) * t * t + (-v0 + 3 * v1 - 3 * v2 + v3) * t * t * t);
 }
-inline Parameters sample(const StripGeometry& t, const Sample& s, Random& r) {
+inline Parameters strip_parameters(const StripGeometry& t, const Sample& s, Random& r, std::vector<double>& controls, double& stride) {
     auto source = sample_shape(s); require(source.size() == 2, "StripGeometry requires a 2D grid");
     auto p = geometry(t.shape.empty() ? source : t.shape); require(p.shape.size() == 2 && product(p.shape), "invalid strip output shape");
     double scale = draw(t.scale, r), angle = draw(t.degrees, r) * 0.017453292519943295;
@@ -24,20 +25,26 @@ inline Parameters sample(const StripGeometry& t, const Sample& s, Random& r) {
     p.matrix = multiply(rotation, multiply(shear, flip_scale, 2), 2);
     Point center{double(p.shape[0] - 1) / 2 + dy, double(p.shape[1] - 1) / 2 + dx, 0}; center = matvec(p.matrix, center, 2);
     p.offset = {double(source[0] - 1) / 2 - center[0], double(source[1] - 1) / 2 - center[1]};
-    double amplitude = draw(t.smooth_offset, r), stride = draw(t.stride, r); require(stride >= 1, "strip control stride must be at least one voxel");
+    double amplitude = draw(t.smooth_offset, r); stride = draw(t.stride, r); require(stride >= 1, "strip control stride must be at least one voxel");
     if (amplitude != 0) {
         auto count = std::max<std::size_t>(2, std::size_t(std::ceil(double(std::max<std::size_t>(1, source[1] - 1)) / stride)) + 3);
-        std::vector<double> controls(count); double seed = double(r.next() & 0x7fffffff);
+        controls.resize(count); double seed = double(r.next() & 0x7fffffff);
         for (std::size_t i = 0; i < count; ++i) {
             double h = std::fmod(double(i) * 1103515245. + seed * 12345. + 67890., 2147483647.);
             h = std::fmod(h * 1103515245. + 12345., 2147483647.); controls[i] = (h / 2147483647. * 2 - 1) * amplitude;
         }
-        Grid g(p.shape); std::vector<double> offsets(g.size * 2);
-        for (std::size_t i = 0; i < g.size; ++i) {
-            auto q = backward(p, Point{double(g.coord(i, 0)), double(g.coord(i, 1)), 0});
-            offsets[i * 2] = cubic(controls, q[1] / stride + 1);
+    }
+    return p;
+}
+inline Parameters sample(const StripGeometry& t, const Sample& s, Random& r) {
+    std::vector<double> controls; double stride;
+    auto p=strip_parameters(t,s,r,controls,stride);
+    if (!controls.empty()) {
+        Grid g(p.shape); p.field.resize(g.size*2);
+        for (std::size_t i=0;i<g.size;++i) {
+            auto q=backward(p,Point{double(g.coord(i,0)),double(g.coord(i,1)),0});
+            p.field[i*2]=cubic(controls.data(),controls.size(),q[1]/stride+1);
         }
-        p.field = std::move(offsets);
     }
     return p;
 }
@@ -54,26 +61,18 @@ inline Parameters sample(const SurfacePerturb& t, const Sample& s, Random& r) {
     auto h = a.shape[1], w = a.shape[2], n = h * w; Parameters p; ChannelPlan plan; plan.key = t.on; plan.field.resize(3 * n);
     if (h < 2 || w < 2 || t.max_displacement == 0) { p.channels.push_back(std::move(plan)); return p; }
     std::vector<Point> normals(n); std::vector<std::size_t> valid;
-    for (std::size_t y = 0; y < h; ++y) for (std::size_t x = 0; x < w; ++x) {
-        auto i = y * w + x; Point row{}, col{};
-        for (std::size_t c = 0; c < 3; ++c) {
-            row[c] = a.get(c * n + std::min(y + 1, h - 1) * w + x) - a.get(c * n + (y ? y - 1 : y) * w + x);
-            col[c] = a.get(c * n + y * w + std::min(x + 1, w - 1)) - a.get(c * n + y * w + (x ? x - 1 : x));
-        }
-        normals[i] = {col[1] * row[2] - col[2] * row[1], col[2] * row[0] - col[0] * row[2], col[0] * row[1] - col[1] * row[0]};
-        double norm = 0; for (auto v : normals[i]) norm += v * v; norm = std::sqrt(norm);
-        if (norm > 1e-6) { for (auto& v : normals[i]) v /= norm; valid.push_back(i); } else normals[i] = {};
-    }
+    for (std::size_t i=0;i<n;++i)
+        if(surface_detail::normal([&](std::size_t j){return a.get(j);},h,w,i,normals[i].data()))valid.push_back(i);
     if (valid.empty()) { p.channels.push_back(std::move(plan)); return p; }
     std::vector<double> displacement(n), distance(n);
     for (int blob = draw_integer(t.blobs, r); blob > 0; --blob) {
-        auto center = valid[r.index(valid.size())]; double y = double(center / w), x = double(center % w);
-        for (std::size_t i = 0; i < n; ++i) distance[i] = std::pow(double(i / w) - y, 2) + std::pow(double(i % w) - x, 2);
+        auto center = valid[r.index(valid.size())];
+        for (std::size_t i = 0; i < n; ++i) distance[i] = surface_detail::distance(i,center,w);
         double sigma, radius2;
         if (t.points_affected) { auto sorted = distance; auto k = std::min(t.points_affected, n) - 1; std::nth_element(sorted.begin(), sorted.begin() + k, sorted.end()); radius2 = sorted[k]; sigma = std::max(.3, std::sqrt(std::max(radius2, 1e-6)) / t.radius_sigma); }
         else { sigma = std::max(.3, draw(t.sigma_fraction, r) * std::min(h, w)); radius2 = std::pow(t.radius_sigma * sigma, 2); }
         double amplitude = draw(t.amplitude, r) * (r.chance(.5) ? 1 : -1);
-        for (std::size_t i = 0; i < n; ++i) if (distance[i] <= radius2) displacement[i] += amplitude * std::exp(-.5 * distance[i] / std::max(sigma * sigma, 1e-6));
+        for (std::size_t i = 0; i < n; ++i) displacement[i] += surface_detail::contribution(distance[i],radius2,sigma,amplitude);
     }
     for (std::size_t i = 0; i < n; ++i) for (std::size_t c = 0; c < 3; ++c) plan.field[c * n + i] = normals[i][c] * std::clamp(displacement[i], -t.max_displacement, t.max_displacement);
     p.channels.push_back(std::move(plan)); return p;

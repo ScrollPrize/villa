@@ -1,5 +1,6 @@
 #pragma once
 #include "spatial.hpp"
+#include "component_traversal.hpp"
 
 namespace vcr::augment {
 using Footprint = std::vector<std::array<int, 3>>;
@@ -145,33 +146,14 @@ inline void apply(const RandomBinaryOperator& t, Sample& s, const Parameters& p)
     });
 }
 inline std::vector<std::vector<std::size_t>> connected_components(const std::vector<double>& input, const Grid& g, bool full) {
-    std::vector<std::vector<std::size_t>> result; std::vector<bool> visited(g.size); Grid neighborhood(Shape(g.shape.size(), 3));
-    Footprint neighbors;
-    for (std::size_t j = 0; j < neighborhood.size; ++j) {
-        std::array<int, 3> offset{}; int distance = 0;
-        for (std::size_t a = 0; a < g.shape.size(); ++a) { offset[a] = int(neighborhood.coord(j, a)) - 1; distance += std::abs(offset[a]); }
-        if (distance && (full || distance == 1)) neighbors.push_back(offset);
-    }
-    for (std::size_t i = 0; i < g.size; ++i) {
-        if (visited[i] || !input[i]) continue;
-        visited[i] = true; std::vector<std::size_t> queue{i};
-        for (std::size_t head = 0; head < queue.size(); ++head) {
-            std::array<std::int64_t, 3> point{};
-            for (std::size_t a = 0; a < g.shape.size(); ++a) point[a] = g.coord(queue[head], a);
-            for (const auto& offset : neighbors) {
-                bool valid = true; std::size_t next = 0;
-                for (std::size_t a = 0; a < g.shape.size(); ++a) {
-                    auto x = point[a] + offset[a];
-                    if (x < 0 || x >= std::int64_t(g.shape[a])) { valid = false; break; }
-                    next += std::size_t(x) * g.stride[a];
-                }
-                if (valid && input[next] && !visited[next]) { visited[next] = true; queue.push_back(next); }
-            }
-        }
-        result.push_back(std::move(queue));
-    }
+    std::vector<std::uint8_t> visited(g.size);
+    std::vector<std::size_t> queue(g.size),offsets(g.size+1);
+    const auto count=component_detail::components(input.data(),component_detail::GridView(g),full,visited.data(),queue.data(),offsets.data());
+    std::vector<std::vector<std::size_t>> result; result.reserve(count);
+    for(std::size_t c=0;c<count;++c)result.emplace_back(queue.begin()+offsets[c],queue.begin()+offsets[c+1]);
     return result;
 }
+
 inline void remove_component(Array& a, const ChannelPlan& p) {
     auto n = product(a.spatial());
     for (auto index : p.field) { auto i = std::size_t(index); a.set(p.channel * n + i, 0); if (p.values[0] >= 0) a.set(std::size_t(p.values[0]) * n + i, 1); }

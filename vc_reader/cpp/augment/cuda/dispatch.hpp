@@ -1,5 +1,5 @@
 #pragma once
-#include "../labels.hpp"
+#include "../tracing.hpp"
 #include "../bias_field.hpp"
 #include "../plasma_brightness_contrast.hpp"
 #include "../plasma_shadow.hpp"
@@ -29,6 +29,25 @@
 #include "../object_dropout.hpp"
 #include "resident.cuh"
 namespace vcr::augment::cuda {
+void apply_cuda(const ClipOutliers&, Sample&, const Parameters&, Session&);
+void apply_cuda(const CropPad&, Sample&, const Parameters&, Session&);
+void apply_cuda(const Affine&, Sample&, const Parameters&, Session&);
+void apply_cuda(const SheetCompression&, Sample&, const Parameters&, Session&);
+void apply_cuda(const StripGeometry&, Sample&, const Parameters&, Session&);
+void apply_cuda(const SurfacePerturb&, Sample&, const Parameters&, Session&);
+void apply_cuda(const Morphology&, Sample&, const Parameters&, Session&);
+void apply_cuda(const RemoveComponents&, Sample&, const Parameters&, Session&);
+void apply_cuda(const ReplaceLabel&, Sample&, const Parameters&, Session&);
+void apply_cuda(const Regions&, Sample&, const Parameters&, Session&);
+void apply_cuda(const OneHot&, Sample&, const Parameters&, Session&);
+void apply_cuda(const MaskImage&, Sample&, const Parameters&, Session&);
+void apply_cuda(const DeepSupervision&, Sample&, const Parameters&, Session&);
+void apply_cuda(const ToPseudo2D&, Sample&, const Parameters&, Session&);
+void apply_cuda(const FromPseudo2D&, Sample&, const Parameters&, Session&);
+Parameters sample_strip(const StripGeometry&, const Sample&, Random&, bool);
+Parameters sample_sheet(const SheetCompression&, const Sample&, Random&, bool, Session&);
+Parameters sample_surface(const SurfacePerturb&, const Sample&, Random&, bool, Session&);
+Parameters sample_components(const RemoveComponents&, const Sample&, Random&, bool, Session&);
 Parameters sample_foreground(const ForegroundCrop&, const Sample&, Random&, Session&);
 Parameters sample_dropout(const GridDropout&, const Sample&, Random&, bool, Session&);
 Parameters sample_dropout(const StripeMasking&, const Sample&, Random&, bool, Session&);

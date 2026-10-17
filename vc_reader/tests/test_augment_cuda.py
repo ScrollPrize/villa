@@ -66,8 +66,7 @@ def test_backend_selection():
         with pytest.raises(ValueError, match="unavailable"):
             A.Pipeline([], backend="cuda")
     else:
-        with pytest.raises(ValueError, match="not supported"):
-            A.Pipeline([A.ClipOutliers()], backend="cuda")
+        assert A.Pipeline([A.ClipOutliers()], backend="cuda").backend == "cuda"
 
 
 @gpu

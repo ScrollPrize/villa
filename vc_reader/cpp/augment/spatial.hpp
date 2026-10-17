@@ -397,13 +397,18 @@ inline Parameters sample(const Elastic& t, const Sample& s, Random& r) {
     elastic_detail::normalize(p.field,p.shape,magnitude,.8);
     p.border = t.border; return p;
 }
-inline Parameters sample(const SheetCompression& t, const Sample& s, Random& r) {
+struct SheetSettings { Parameters parameters; std::size_t chosen; double strength,sigma,smooth; };
+inline SheetSettings sheet_parameters(const SheetCompression& t, const Sample& s, Random& r) {
     auto p = geometry(sample_shape(s)); Grid g(p.shape); auto d = p.shape.size();
     require(s.count(t.image) && s.at(t.image).target.role == Role::Image, "sheet compression needs its reference image");
     auto allowed = t.axes.empty() ? axes(d) : t.axes;
     auto chosen = std::size_t(axis(allowed[r.index(allowed.size())], d));
     double strength = draw(t.strength, r), sigma = draw(t.intensity_sigma, r), smooth = draw(t.smoothing, r);
     require(strength >= 0 && strength < 1, "compression strength must be in [0, 1)");
+    return {std::move(p),chosen,strength,sigma,smooth};
+}
+inline Parameters sample(const SheetCompression& t, const Sample& s, Random& r) {
+    auto [p,chosen,strength,sigma,smooth]=sheet_parameters(t,s,r); Grid g(p.shape); const auto d=p.shape.size();
     auto values = s.at(t.image).array.channel(0); if (sigma > .5) gaussian_blur(values, g, std::vector<double>(d, sigma), 6, Boundary::Mirror, true);
     auto [lo, hi] = std::minmax_element(values.begin(), values.end()); double low = *lo, span = *hi - low;
     if (span <= 1e-8) return p;

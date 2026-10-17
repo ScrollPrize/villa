@@ -1,6 +1,6 @@
 #include "channel.cuh"
 #include "statistics.cuh"
-#include <cub/device/device_radix_sort.cuh>
+#include "sort_keys.cuh"
 
 namespace vcr::augment::cuda {
 namespace {
@@ -198,13 +198,6 @@ template<class T> __global__ void fixed_values(View<T> data, Options t, int* inv
         if (!isfinite(x)) atomicExch(invalid,1);
         data.ptr[i] = finite_or_zero<T>((double(clamp_to(x,t.low,t.high))-t.center)/t.scale);
     }
-}
-template<class K> void sort_keys(Buffer<K>& keys, std::size_t n) {
-    Buffer<K> sorted(n); std::size_t bytes = 0;
-    check(cub::DeviceRadixSort::SortKeys(nullptr,bytes,keys.ptr,sorted.ptr,n,0,int(sizeof(K)*8),vcr::device::stream()));
-    Buffer<std::byte> scratch(bytes);
-    check(cub::DeviceRadixSort::SortKeys(scratch.ptr,bytes,keys.ptr,sorted.ptr,n,0,int(sizeof(K)*8),vcr::device::stream()));
-    std::swap(keys.ptr,sorted.ptr);
 }
 // Mean/standard deviation (and bounds) of the selected values.
 template<class T> void moments(View<T> data, Selection select, ParametersGPU* params, int* invalid, double eps, bool zscore) {
