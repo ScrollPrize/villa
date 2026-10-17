@@ -414,6 +414,50 @@ class ObjectPointDatasetTests(unittest.TestCase):
                 self.assertEqual(set(transform.allowed_axes), {0, 1, 2})
         dataset.close()
 
+    def test_mesh_and_ink_oversampling_scales_with_point_counts(self):
+        # Create a second volume entry whose mesh has 100x fewer ink points than self.volume.
+        u = np.arange(8, dtype=np.float32)[:, None] * 2.0
+        v = np.arange(8, dtype=np.float32)[None, :] * 2.0
+        z_grid = np.broadcast_to(u, (8, 8)).copy()
+        y_grid = np.broadcast_to(v, (8, 8)).copy()
+        ink_tiny = np.zeros((8, 8), dtype=np.uint8)
+        sup_tiny = np.full((8, 8), 255, dtype=np.uint8)
+        ink_tiny[:2, :2] = 255  # 4 ink points vs 3 * 24 * 48 = 3456 in self.volume
+        tiny_seg = build_mesh_segment_from_arrays(
+            "tiny_ink",
+            np.full((8, 8), 30.0, dtype=np.float32),
+            y_grid + 20.0,
+            z_grid + 20.0,
+            (SIZE, SIZE, SIZE),
+            (SIZE, SIZE, SIZE),
+            inklabels=ink_tiny,
+            supervision=sup_tiny,
+        )
+        tiny_vol = {
+            **self.volume,
+            "mesh_cache_path": None,
+            "meshes": [tiny_seg],
+            "fiber_presence_path": None,
+        }
+        full_vol = {**self.volume, "fiber_presence_path": None}
+        cfg = self.dataset_config(datasets=[full_vol, tiny_vol])
+        cfg["object_points"] = {
+            **cfg["object_points"],
+            "mesh_oversample": 1.25,
+            "ink_oversample": 1.5,
+        }
+        dataset = SSLZarrDataset(cfg, do_augmentations=False)
+        try:
+            v_full, v_tiny = dataset.volumes
+            self.assertAlmostEqual(v_full.ink_scale, 1.0)
+            self.assertAlmostEqual(v_full.mesh_scale, 1.0)
+            self.assertAlmostEqual(v_full.oversample, 1.5)
+            self.assertAlmostEqual(v_tiny.ink_scale, 4.0 / 3456.0, places=5)
+            self.assertAlmostEqual(v_tiny.mesh_scale, 64.0 / 6912.0, places=5)
+            self.assertLess(v_tiny.oversample, 1.01)
+        finally:
+            dataset.close()
+
 
 class ObjectLossTrainingTests(unittest.TestCase):
     def setUp(self):
