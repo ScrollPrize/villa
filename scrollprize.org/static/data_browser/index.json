@@ -3849,7 +3849,7 @@
       "desc": "",
       "legacy": null,
       "n_scans": 5,
-      "n_volumes": 9,
+      "n_volumes": 10,
       "n_segments": 39,
       "min_px": 1.129,
       "scans": [
@@ -3935,6 +3935,10 @@
             {
               "id": "20260102150214",
               "zarr": "s3://vesuvius-challenge-open-data/PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr/"
+            },
+            {
+              "id": "20260930100252",
+              "zarr": "s3://vesuvius-challenge-open-data/PHerc0139/volumes/20260930100252-2.399um-0.2m-78keV-masked.zarr/"
             }
           ],
           "volume": "s3://vesuvius-challenge-open-data/PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr/"
@@ -4001,6 +4005,12 @@
           "px": 1.129,
           "energy": 59,
           "zarr": "s3://vesuvius-challenge-open-data/PHerc0139/volumes/20260413113053-1.129um-0.2m-59keV-masked.zarr/"
+        },
+        {
+          "id": "20260930100252",
+          "px": 2.399,
+          "energy": 78,
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0139/volumes/20260930100252-2.399um-0.2m-78keV-masked.zarr/"
         }
       ],
       "display": "PHerc0139",
@@ -6085,29 +6095,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20260226123353-auto_grown_20260226123353106/surface-volumes/9.362um-1.2m-113keV-volume-20250804134230.zarr/",
-          "folder": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20260226123353-auto_grown_20260226123353106/",
-          "renders": [
-            {
-              "url": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0814/segments/20260226123353-auto_grown_20260226123353106/ink-detection/PHerc0814-20260226123353-2.399um-0.22m-78keV-volume-20260309142202-20260417190342-new_canon_autoresearch_recipe-tile256-stride128.tif",
-              "um": 2.399,
-              "energy": 78,
-              "targetVolume": "20260309142202",
-              "modelId": "20260417190342",
-              "modelName": "new_canon_autoresearch_recipe",
-              "renderLevel": null,
-              "thumbUrl": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0814/segments/20260226123353-auto_grown_20260226123353106/ink-detection/downsampled/PHerc0814-20260226123353-2.399um-0.22m-78keV-volume-20260309142202-20260417190342-new_canon_autoresearch_recipe-tile256-stride128-ds8.jpg"
-            },
-            {
-              "url": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0814/segments/20260226123353-auto_grown_20260226123353106/ink-detection/PHerc0814-20260226123353-1.129um-0.22m-59keV-volume-20260521123630-L1-20260709123958-mrg20736-1um-s1z2-tile256-stride128.tif",
-              "um": 1.129,
-              "energy": 59,
-              "targetVolume": "20260521123630",
-              "modelId": "20260709123958",
-              "modelName": "mrg20736_1um_s1z2",
-              "renderLevel": "1",
-              "thumbUrl": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0814/segments/20260226123353-auto_grown_20260226123353106/ink-detection/downsampled/PHerc0814-20260226123353-1.129um-0.22m-59keV-volume-20260521123630-L1-20260709123958-mrg20736-1um-s1z2-tile256-stride128-ds8.jpg"
-            }
-          ]
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20260226123353-auto_grown_20260226123353106/"
         },
         {
           "id": "20250926165636",

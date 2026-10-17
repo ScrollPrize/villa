@@ -220,11 +220,14 @@ vc_add_test(NAME test_segmentation_lasagna_panel_ui
     DEFS VC_TEST_DISABLE_LASAGNA_DISCOVERY VC_TEST_DISABLE_LASAGNA_DIALOGS)
 
 qt6_wrap_cpp(spiral_config_profile_editor_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/SpiralConfigProfileEditor.hpp)
+qt6_wrap_cpp(spiral_descriptions_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/SpiralDescriptions.hpp)
 vc_add_test(NAME test_spiral_config_profile_editor
     SOURCES test_spiral_config_profile_editor.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/SpiralConfigProfileEditor.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/CollapsibleSettingsGroup.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/SpiralDescriptions.cpp
             ${spiral_config_profile_editor_moc}
+            ${spiral_descriptions_moc}
             ${collapsible_settings_group_moc}
     LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
