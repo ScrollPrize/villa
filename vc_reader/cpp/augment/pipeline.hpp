@@ -2,6 +2,33 @@
 #include "tracing.hpp"
 #include "palette.hpp"
 #include "structure.hpp"
+#include "bias_field.hpp"
+#include "plasma_brightness_contrast.hpp"
+#include "plasma_shadow.hpp"
+#include "illumination.hpp"
+#include "vignetting.hpp"
+#include "random_tone_curve.hpp"
+#include "multiplicative_noise.hpp"
+#include "shot_noise.hpp"
+#include "additive_noise.hpp"
+#include "salt_and_pepper.hpp"
+#include "motion_blur.hpp"
+#include "defocus.hpp"
+#include "zoom_blur.hpp"
+#include "equalize.hpp"
+#include "clahe.hpp"
+#include "histogram_matching.hpp"
+#include "pixel_distribution_adaptation.hpp"
+#include "fourier_domain_adaptation.hpp"
+#include "unsharp_mask.hpp"
+#include "gibbs_ringing.hpp"
+#include "ringing_overshoot.hpp"
+#include "foreground_crop.hpp"
+#include "channel_misalignment.hpp"
+#include "grid_dropout.hpp"
+#include "stripe_masking.hpp"
+#include "foreground_dropout.hpp"
+#include "object_dropout.hpp"
 #include <bit>
 #include <chrono>
 
@@ -14,7 +41,7 @@ using Op = std::variant<
     SliceIllumination, Smear, Flip, Rotate90, Transpose, CropPad, Affine, Elastic,
     SheetCompression, LowResolution, ThickSlice, Morphology, RandomBinaryOperator,
     RemoveComponents, ReplaceLabel, Regions, OneHot, MaskImage, DeepSupervision,
-    ToPseudo2D, FromPseudo2D, MedialSurface, StripGeometry, SurfacePerturb, std::shared_ptr<OneOf>, Normalize, OrientedBlur, DistanceTransform, StructureTensor>;
+    ToPseudo2D, FromPseudo2D, MedialSurface, StripGeometry, SurfacePerturb, std::shared_ptr<OneOf>, Normalize, OrientedBlur, DistanceTransform, StructureTensor, BiasField, PlasmaBrightnessContrast, PlasmaShadow, Illumination, Vignetting, RandomToneCurve, MultiplicativeNoise, ShotNoise, AdditiveNoise, SaltAndPepper, MotionBlur, Defocus, ZoomBlur, Equalize, CLAHE, HistogramMatching, PixelDistributionAdaptation, FDA, UnsharpMask, GibbsRinging, RingingOvershoot, ForegroundCrop, ChannelMisalignment, GridDropout, StripeMasking, ForegroundDropout, ObjectDropout>;
 using Executor = void (*)(const Op&, Sample&, const Parameters&, void*);
 #ifdef VC_READER_CUDA
 namespace cuda {

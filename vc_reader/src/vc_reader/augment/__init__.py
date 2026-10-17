@@ -56,7 +56,11 @@ _constructors = (
     "Transpose CropPad Affine Elastic SheetCompression LowResolution ThickSlice "
     "Morphology RandomBinaryOperator RemoveComponents ReplaceLabel Regions OneHot "
     "MaskImage DeepSupervision ToPseudo2D FromPseudo2D MedialSurface StripGeometry SurfacePerturb OrientedBlur "
-    "DistanceTransform StructureTensor"
+    "DistanceTransform StructureTensor "
+    "BiasField PlasmaBrightnessContrast PlasmaShadow Illumination Vignetting RandomToneCurve "
+    "Equalize CLAHE HistogramMatching PixelDistributionAdaptation FDA MultiplicativeNoise ShotNoise "
+    "AdditiveNoise SaltAndPepper MotionBlur Defocus ZoomBlur UnsharpMask GibbsRinging RingingOvershoot "
+    "ForegroundCrop ChannelMisalignment GridDropout StripeMasking ForegroundDropout ObjectDropout"
 ).split()
 globals().update({name: _factory(getattr(_native, name)) for name in _constructors})
 seed = _native.seed
@@ -181,7 +185,12 @@ class Pipeline:
     @staticmethod
     def _device_result(result):
         from ..cuda import DeviceArray
-        arrays, sources, timings, plan = result
+        arrays, sources, timings, plan = result[:4]
+        if len(result) == 5:
+            # Native device results carry an owner for deferred checks and
+            # lifetime tracking. This synchronous adapter exposes the arrays
+            # directly, so protect external DLPack users on destruction.
+            result[4].export()
         return ({k: DeviceArray(*v) for k, v in arrays.items()}, sources, timings, plan)
 
     @staticmethod

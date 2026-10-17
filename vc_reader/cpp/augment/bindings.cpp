@@ -136,6 +136,8 @@ static nb::tuple export_result(RunResult result, bool plan, const std::map<std::
     return nb::make_tuple(arrays, sources, nb::cast(result.timings), plan ? nb::cast(std::move(result.plan)) : nb::none());
 }
 
+#include "volumetric_bindings.hpp"
+
 NB_MODULE(_augment, m) {
     m.doc() = "Native CPU augmentation: configuration, sampling, execution and replay.";
     nb::class_<Uniform>(m, "Uniform").def(nb::init<double, double>(), "low"_a, "high"_a);
@@ -288,30 +290,39 @@ NB_MODULE(_augment, m) {
                 "point evaluation (at) returns the tensor and needs rho > 0");
         require(std::all_of(t.at.begin(), t.at.end(), [](double v) { return std::isfinite(v); }), "at must be finite");
     });
+    bind_volumetric(m);
     bind<OneOf>(m, "OneOf", [](auto& t, auto& a) { t.transforms = a.get("transforms", t.transforms); t.weights = a.get("weights", t.weights); });
 
     nb::class_<Plan>(m, "Plan")
         .def_prop_ro("steps", [](const Plan& p) { return p.steps.size(); })
         .def("dump", [](const Plan& p) { auto bytes = save_plan(p); return nb::bytes(bytes.data(), bytes.size()); });
     m.def("cuda_available", &cuda::available);
+#ifdef VC_READER_CUDA
+    nb::class_<DeviceOutputs>(m, "DeviceOutputs")
+        .def("export", &DeviceOutputs::mark_exported)
+        .def("check", &DeviceOutputs::check, nb::call_guard<nb::gil_scoped_release>());
+    m.def("_set_stream", [](std::uintptr_t handle) { vcr::device::current_stream() = handle ? vcr::device::stream_handle(handle) : nullptr; });
+#endif
     nb::class_<Pipeline>(m, "Pipeline")
         .def(nb::init<std::vector<Op>, std::map<std::string, Target>, bool, std::string>(), "transforms"_a, "targets"_a, "compact"_a = true, "backend"_a = "cpu")
         .def_prop_ro("backend", &Pipeline::backend)
 #ifdef VC_READER_CUDA
-        .def("run_device", [](const Pipeline& p, const std::map<std::string,DeviceInputArray>& inputs, std::uint64_t seed, bool record, bool profile, bool inplace) {
-            return run_device(p,inputs,seed,record,profile,inplace);
-        })
+        .def("run_device", [](const Pipeline& p, const std::map<std::string,DeviceInputArray>& inputs, std::uint64_t seed, bool record, bool profile, bool inplace,
+                              bool async, const NamedValues& params) {
+            return run_device(p,inputs,seed,record,profile,inplace,nullptr,async,params);
+        }, "inputs"_a, "seed"_a, "record"_a = false, "profile"_a = false, "inplace"_a = false, "async_"_a = false, "params"_a = NamedValues{})
+        .def("run_batch", &run_batch, "inputs"_a, "seeds"_a, "params"_a, "inplace"_a, "async_"_a, "out"_a)
         .def("replay_device", [](const Pipeline& p, const std::map<std::string,DeviceInputArray>& inputs, const Plan& plan) {
             return run_device(p,inputs,0,false,false,false,&plan);
         })
 #endif
         .def("load_plan", [](const Pipeline& p, nb::bytes bytes) { return load_plan(p.program(), std::string(bytes.c_str(), bytes.size())); })
-        .def("run", [](const Pipeline& p, const std::map<std::string, Input>& inputs, std::uint64_t seed, bool record, bool profile, bool inplace) {
+        .def("run", [](const Pipeline& p, const std::map<std::string, Input>& inputs, std::uint64_t seed, bool record, bool profile, bool inplace, const NamedValues& params) {
             if (inplace) writable_inputs(inputs);
             RunResult result;
-            { nb::gil_scoped_release release; result = p.run(import_sample(p, inputs, inplace), seed, record, profile); }
+            { nb::gil_scoped_release release; NamedScope named(&params); result = p.run(import_sample(p, inputs, inplace), seed, record, profile); }
             return export_result(std::move(result), record, inputs, inplace);
-        }, "inputs"_a, "seed"_a, "record"_a = false, "profile"_a = false, "inplace"_a = false)
+        }, "inputs"_a, "seed"_a, "record"_a = false, "profile"_a = false, "inplace"_a = false, "params"_a = NamedValues{})
         .def("replay", [](const Pipeline& p, const std::map<std::string, Input>& inputs, const Plan& plan) {
             RunResult result; { nb::gil_scoped_release release; result = p.replay(import_sample(p, inputs), plan); }
             return export_result(std::move(result), false, inputs);

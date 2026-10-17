@@ -590,3 +590,115 @@ arrays, validity masks, integer label widths (including IDs above 2**53),
 probabilities, compositions, and overflow-protected float32 intermediates.
 See [public CUDA measurements](../benchmarks/README.md#public-cuda-augmentation-benchmark)
 for the real CT workload, comparison commands, and performance limitations.
+
+## Volumetric illumination, acquisition artifacts and sampling
+
+The following transforms have native CPU and CUDA implementations. Every one
+requires `(C,Z,Y,X)` input; a singleton axis is supported. They operate on the
+volume jointly, rather than applying an independent 2D effect to each slice.
+Each transform has its own named CPU header and CUDA translation unit. Shared
+helpers implement lattice interpolation, random sampling, histogram operations,
+FFT lines, channel execution, and mask erasure.
+
+```python
+from vc_reader import augment as A
+
+pipeline = A.Pipeline([
+    A.ForegroundCrop((64, 96, 96), mask="mask"),
+    A.BiasField(std=(0, .25), scale=.025, p=.3),
+    A.PlasmaBrightnessContrast(brightness=(-.1, .1), contrast=(0, .2), p=.2),
+    A.MultiplicativeNoise(low=.95, high=1.05, p=.2),
+    A.RandomToneCurve(scale=.08, p=.2),
+    A.UnsharpMask(strength=(.1, .3), sigma=(.5, 1.5), p=.2),
+], backend="cuda")
+result = pipeline({"image": image, "mask": labels}, seed=123)
+```
+
+Image transforms retain `on`, `channels`, `p`, `p_channel`, and `shared`.
+`shared` shares parameter draws and field seeds across channels. The four noise
+transforms additionally expose `shared_noise` to share a noise realization
+without forcing shared sampled strengths. Geometry and dropout preserve integer
+label dtypes; intensity transforms leave labels unchanged. Existing validity
+masks restore padding after execution. Pipelines and sampled plans are picklable;
+sampled crop coordinates and dropout masks are retained in replay plans.
+
+| Transform | Volumetric definition and parameters |
+| --- | --- |
+| `BiasField(std, scale)` | Multiply by `exp(std * field)`; the field is a trilinearly interpolated Gaussian log-gain lattice. `scale` is lattice frequency in inverse voxels. |
+| `PlasmaBrightnessContrast(brightness, contrast, scale, persistence, octaves)` | 3D fractal value noise modulates additive brightness (relative to channel range) and contrast around the channel mean. Each octave doubles frequency; `persistence` scales its amplitude. |
+| `PlasmaShadow(strength, scale, persistence, octaves)` | The same 3D fractal field produces multiplicative attenuation. |
+| `Illumination(strength, mode, radius, direction, center)` | `linear`: directional gain ramp; `corner`: distance falloff from a cube corner; `gaussian`: localized gain. Direction is ZYX, randomly oriented when omitted. Center is relative ZYX in `[0,1]`; omitted corner centers are sampled from eight corners. |
+| `Vignetting(strength, radius, center)` | Radial attenuation in normalized ZYX coordinates, including through depth. Center defaults to `(0.5,0.5,0.5)`; `radius` is in normalized coordinates. |
+| `RandomToneCurve(scale)` | Monotone cubic Bezier intensity curve with two perturbed, ordered control ordinates; endpoints are the channel minimum and maximum. |
+| `Equalize(bins)` | Whole-volume histogram CDF equalization with first occupied CDF subtraction; output retains the channel range. Constant channels remain unchanged. |
+| `CLAHE(clip_limit, tile_shape, bins)` | Histograms of 3D tiles, clipping relative to average bin occupancy, excess redistribution, and trilinear interpolation between tile CDFs. `tile_shape` is the maximum tile size in voxels; edge tiles partition the volume without padding. Zero clip limit disables clipping. |
+| `HistogramMatching(reference, blend, bins)` | Match the whole-volume channel CDF to a reference CDF. Histogram bins approximate continuous values; increasing `bins` improves intensity resolution. |
+| `PixelDistributionAdaptation(reference, blend, mode)` | `standard` transfers per-channel population mean/std; `minmax` transfers range. Constant inputs map to the reference mean/minimum respectively. |
+| `FDA(reference, blend, fraction)` | Replace/blend amplitudes in a centered cuboid of the 3D Fourier spectrum while preserving source phase. `fraction` is the retained fraction of each axis's Nyquist interval. |
+| `MultiplicativeNoise(low, high)` | Independent voxelwise uniform gain, preserving zero. |
+| `ShotNoise(photons)` | `Poisson(image * photons) / photons`, with exact Poisson sampling. Input must be nonnegative, and rate at most `1e12`. Apply before zero-centered normalization. No photographic gamma conversion or clipping is performed. |
+| `AdditiveNoise(scale, distribution, mean, alpha, beta)` | Uniform `[-scale,scale]`, Gaussian std `scale`, Laplace scale `scale`, or centered beta noise scaled by `scale`; `mean` adds an offset. Beta shapes are `alpha`, `beta`. |
+| `SaltAndPepper(amount, salt_fraction)` | Selected voxels become the channel maximum or minimum. Noise masks are shared across channels by default. |
+| `MotionBlur(length, direction, samples)` | Average trilinear samples along a 3D line, with length in voxels. |
+| `Defocus(radius)` | Average over a 3D ball footprint, radius in voxels. |
+| `ZoomBlur(strength, center, samples)` | Average 3D zoom states around a relative ZYX center. |
+| `UnsharpMask(strength, sigma)` | `image + strength * (image - GaussianBlur3D(image))`, using nearest boundary extension and radius `round(4*sigma)`. |
+| `GibbsRinging(cutoff)` | Truncate the 3D Fourier spectrum to a centered cuboid, producing ringing at edges. `cutoff=1` is exact identity. |
+| `RingingOvershoot(cutoff, radius)` | Separable 3D windowed-sinc filtering, using a cosine window and nearest boundaries. Output overshoots are retained. |
+| `ForegroundCrop(shape, mask, channel, threshold)` | Uniformly selects a foreground voxel (`mask > threshold`), then a random crop containing it. Empty foreground falls back to random cropping; oversized axes are center-padded. All geometric targets follow the crop. |
+| `ChannelMisalignment(degrees, translate, scale, shared_scale, border)` | Independent 3D affine mappings for selected image channels. Labels and other targets stay aligned to their original grid. |
+| `GridDropout(unit_size, ratio, axes, fill, fill_mask)` | Random-offset periodic cuboid holes, intersecting the holes on enabled axes. |
+| `StripeMasking(unit_size, ratio, axes, fill, fill_mask)` | Random-offset periodic slabs, taking the union of holes on enabled axes. |
+| `ForegroundDropout(mask, size, count, mask_channel, threshold, fill, fill_mask)` | Cuboids centered on sampled foreground voxels, with erasure restricted to eligible foreground. |
+| `ObjectDropout(mask, drop_probability, mask_channel, threshold, fill, fill_mask)` | Independently erases 6-connected, same-label foreground components. Adjacent different label IDs remain separate. |
+
+Reference transforms snapshot a contiguous CPU NumPy float32/float64 volume at
+construction; one reference channel broadcasts, otherwise channels correspond by
+index. Histogram/statistical references may have different spatial sizes. `FDA`
+requires matching spatial sizes. Reference data remains part of pipeline pickles;
+changes to the original reference array do not alter an existing pipeline.
+
+Dropout uses one spatial mask across selected image channels. `fill_mask=None`
+leaves labels unchanged; a number fills every Label target under the erased mask.
+`ObjectDropout` defaults to `fill_mask=0`; other dropout defaults preserve labels.
+Point annotations are retained by dropout, and are transformed by cropping.
+The erasure field is sampled from the original mask and fixed during replay.
+
+These are semantic volumetric implementations inspired by AlbumentationsX's
+lighting/noise/histogram/filter transforms, batchgeneratorsv2's channel
+misalignment, and foreground cropping in AlbumentationsX/Volumentations. They
+are not seeded or numerical replacements for those packages. In particular,
+fractal fields use 3D multioctave value noise, defocus uses a ball, tone curves
+preserve the observed channel range, and statistical adaptation currently
+supports `standard` and `minmax` rather than cross-channel PCA. Frequency
+transforms use an arbitrary-size Bluestein/radix-2 FFT with periodic boundaries;
+non-frequency blur uses nearest boundaries. No new dependencies are required.
+
+CUDA executes voxel operations, histograms, FFTs, and mask generation on device;
+it does not fall back to CPU implementations. `ForegroundCrop` reads back only
+its selected voxel index to construct geometry and requires synchronous device
+execution. Recorded dropout plans download their field for serialization.
+Histogram accumulation and component selection currently favor deterministic
+execution over throughput; large-volume performance has not been tuned.
+Float64 intermediates preserve precision in the new kernels; returned arrays
+retain their input float dtype. CPU/CUDA differences from transcendental math
+and FMA are tested with tolerances, not claimed bitwise equal across backends.
+
+Build with the existing environment (from `vc_reader/`):
+
+```bash
+AGENTS_AGENT_MODE=1 cmake -S . -B /tmp/vc-volume-cpu \
+  -DVC_READER_BUILD_READER=OFF -DPython_EXECUTABLE="$PWD/.venv/bin/python" \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build /tmp/vc-volume-cpu --target _augment -j 2
+# For CUDA add -DVC_READER_ENABLE_CUDA=ON and the installed toolkit/compiler
+# and architecture flags described in the CUDA build section above.
+cp /tmp/vc-volume-cpu/_augment*.so src/vc_reader/
+.venv/bin/python -m pytest tests/test_augment_volumetric.py -q
+```
+
+The regression suite includes independent NumPy FFT and SciPy filter references,
+known histogram mappings, noise mean/variance, volumetric lighting variation,
+foreground retention and point geometry, exact label preservation, selected
+channels, validity masks, constant/singleton volumes, replay, pickles, and
+CPU/CUDA comparisons.

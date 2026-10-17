@@ -116,6 +116,9 @@ void export_outputs(void* context) {
     for (auto& [key,a]:static_cast<Session*>(context)->arrays) a.buffer->exported=true;
 }
 void check_device(void* context) { static_cast<Session*>(context)->check_status(); }
+void release_outputs(void* context, const std::vector<std::string>& keys) {
+    for (const auto& key:keys) static_cast<Session*>(context)->arrays.erase(key);
+}
 void finish_device(void* context) {
     auto& session=*static_cast<Session*>(context);
     if (session.async) return;

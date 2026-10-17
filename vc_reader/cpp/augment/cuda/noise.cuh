@@ -1,13 +1,11 @@
 #pragma once
 #include "channel.cuh"
+#include "../random_sampling.hpp"
 namespace vcr::augment::cuda {
 // SplitMix is indexed by each Box-Muller pair, preserving the CPU RNG stream.
 // Each thread uses the same two uniforms, with the same precision as CPU.
 __device__ inline double uniform_at(std::uint64_t state, std::uint64_t draw) {
-    auto z = state + UINT64_C(0x9e3779b97f4a7c15) * (draw + 1);
-    z = (z ^ (z >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
-    z = (z ^ (z >> 27)) * UINT64_C(0x94d049bb133111eb);
-    return (double((z ^ (z >> 31)) >> 11) + .5) * 0x1.0p-53;
+    return volume_detail::uniform(state, draw);
 }
 template<class T> __global__ void noise_kernel(T* data, std::size_t n, double sigma, std::uint64_t seed, bool rician) {
     EACH_INDEX(rician ? n : (n + 1) / 2) {

@@ -33,6 +33,35 @@ if(VC_READER_ENABLE_CUDA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
     target_sources(_augment PRIVATE
+        cpp/augment/cuda/bias_field.cu
+        cpp/augment/cuda/plasma_brightness_contrast.cu
+        cpp/augment/cuda/plasma_shadow.cu
+        cpp/augment/cuda/illumination.cu
+        cpp/augment/cuda/vignetting.cu
+        cpp/augment/cuda/random_tone_curve.cu
+        cpp/augment/cuda/multiplicative_noise.cu
+        cpp/augment/cuda/shot_noise.cu
+        cpp/augment/cuda/additive_noise.cu
+        cpp/augment/cuda/salt_and_pepper.cu
+        cpp/augment/cuda/motion_blur.cu
+        cpp/augment/cuda/defocus.cu
+        cpp/augment/cuda/zoom_blur.cu
+        cpp/augment/cuda/equalize.cu
+        cpp/augment/cuda/clahe.cu
+        cpp/augment/cuda/histogram_matching.cu
+        cpp/augment/cuda/pixel_distribution_adaptation.cu
+        cpp/augment/cuda/fourier_domain_adaptation.cu
+        cpp/augment/cuda/unsharp_mask.cu
+        cpp/augment/cuda/gibbs_ringing.cu
+        cpp/augment/cuda/ringing_overshoot.cu
+        cpp/augment/cuda/foreground_crop.cu
+        cpp/augment/cuda/channel_misalignment.cu
+        cpp/augment/cuda/grid_dropout.cu
+        cpp/augment/cuda/stripe_masking.cu
+        cpp/augment/cuda/foreground_dropout.cu
+        cpp/augment/cuda/object_dropout.cu
+        cpp/augment/cuda/fourier.cu
+        cpp/augment/cuda/dropout_mask.cu
         cpp/augment/cuda/backend.cu
         cpp/augment/cuda/blank_rectangle.cu
         cpp/augment/cuda/brightness_add.cu
