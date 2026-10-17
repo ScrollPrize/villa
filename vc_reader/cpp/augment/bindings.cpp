@@ -159,8 +159,36 @@ NB_MODULE(_augment, m) {
     bind<Invert>(m, "Invert", [](auto&, auto&) {});
     bind<Normalize>(m, "Normalize", [](auto& t, auto& a) {
         const auto mode = a.get("mode", std::string("zscore"));
-        require(mode == "minmax" || mode == "zscore", "normalization mode must be minmax or zscore");
-        t.mode = mode == "minmax" ? Normalization::MinMax : Normalization::ZScore;
+        const std::map<std::string, Normalization> modes{{"minmax", Normalization::MinMax}, {"zscore", Normalization::ZScore},
+            {"robust", Normalization::Robust}, {"percentile", Normalization::Percentile}, {"fixed", Normalization::Fixed}};
+        require(modes.count(mode), "normalization mode must be minmax, zscore, robust, percentile or fixed");
+        t.mode = modes.at(mode);
+        // Each option belongs to one mode; reject options another mode would ignore.
+        const auto option = [&](const char* name, std::initializer_list<Normalization> owners, auto fallback) {
+            if (a.keywords.contains(name))
+                require(std::find(owners.begin(), owners.end(), t.mode) != owners.end(), std::string(name) + " does not apply to normalization mode " + mode);
+            return a.kw(name, fallback);
+        };
+        using N = Normalization;
+        t.masked = option("masked", {N::MinMax, N::ZScore, N::Robust, N::Percentile}, false);
+        t.nonzero = option("nonzero", {N::ZScore}, true);
+        t.eps = option("eps", {N::ZScore}, 0.);
+        t.lower = option("lower", {N::Robust, N::Percentile}, 1.);
+        t.upper = option("upper", {N::Robust, N::Percentile}, 99.);
+        t.clip = option("clip", {N::Robust}, true);
+        t.median = option("median", {N::Percentile}, false);
+        t.center = option("center", {N::Fixed}, 0.);
+        t.scale = option("scale", {N::Fixed}, 1.);
+        auto bounds = option("bounds", {N::Fixed}, nb::object(nb::none()));
+        if (!bounds.is_none()) {
+            auto values = nb::cast<std::vector<double>>(bounds); require(values.size() == 2, "bounds needs (low, high)");
+            t.low = values[0]; t.high = values[1];
+        }
+        require(std::isfinite(t.eps) && t.eps >= 0, "eps must be finite and nonnegative");
+        require(std::isfinite(t.lower) && std::isfinite(t.upper) && 0 <= t.lower && t.lower <= t.upper && t.upper <= 100,
+                "percentiles must satisfy 0 <= lower <= upper <= 100");
+        require(std::isfinite(t.center) && std::isfinite(t.scale) && t.scale != 0, "fixed normalization needs finite center and nonzero finite scale");
+        require(!std::isnan(t.low) && !std::isnan(t.high) && t.low <= t.high, "bounds must satisfy low <= high");
     });
     bind<GaussianNoise>(m, "GaussianNoise", [](auto& t, auto& a) { t.std = parameter(a, "std", t.std); t.shared_noise = a.get("shared_noise", false); });
     bind<RicianNoise>(m, "RicianNoise", [](auto& t, auto& a) { t.std = parameter(a, "std", t.std); t.shared_noise = a.get("shared_noise", false); });

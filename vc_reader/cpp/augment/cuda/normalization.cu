@@ -1,27 +1,34 @@
 #include "channel.cuh"
 #include "statistics.cuh"
+#include <cub/device/device_radix_sort.cuh>
 
 namespace vcr::augment::cuda {
 namespace {
+using namespace normalization_detail;
 struct ParametersGPU {
-    double center, scale, divisor, count;
+    double center, scale, divisor, count, low, high;
     bool constant;
 };
+// Selection for masked statistics: one byte per voxel, or null for all voxels.
+struct Selection { const std::uint8_t* valid; bool nonzero; };
+template<class T> __device__ inline bool skip(const Selection& s, std::size_t i, T x) {
+    return (s.valid && !s.valid[i]) || (s.nonzero && x == T(0));
+}
 
 // Bounds/count, scaled mean, then centered population variance. Separate
 // passes retain the reader's protection against overflow and cancellation.
 template<class T, int Phase> __global__ void collect_normalization(
-        View<T> input, Partial* output, const ParametersGPU* params, bool mask_zero, int* invalid) {
+        View<T> input, Partial* output, const ParametersGPU* params, Selection select, int* invalid) {
     if constexpr (Phase != 0) if (params->constant) return;
     __shared__ Partial values[256];
     Partial p{0,0,INFINITY,-INFINITY};
-    if constexpr (Phase == 0) if (mask_zero) {
+    if constexpr (Phase == 0) if (select.nonzero) {
         // Bounds and count do not depend on order and are exact in T. With
         // zeros excluded, min/max never compare signed zeros. No float64 work.
         T low = INFINITY, high = -INFINITY; unsigned long long count = 0;
         EACH_INDEX(input.size) {
             const T x = input.ptr[i];
-            if (x == T(0)) continue;
+            if (skip(select,i,x)) continue;
             if (!isfinite(x)) { atomicExch(invalid,1); continue; }
             low = x < low ? x : low; high = x > high ? x : high; ++count;
         }
@@ -36,7 +43,7 @@ template<class T, int Phase> __global__ void collect_normalization(
     const auto each = [&](auto unscaled) {
         EACH_INDEX(input.size) {
             // Exact: a T value is zero exactly when its float64 conversion is.
-            if (mask_zero && input.ptr[i] == T(0)) continue;
+            if (skip(select,i,input.ptr[i])) continue;
             const double x = to_double(input.ptr[i]);
             if constexpr (Phase == 0) {
                 if (!isfinite(x)) { atomicExch(invalid,1); continue; }
@@ -54,7 +61,7 @@ template<class T, int Phase> __global__ void collect_normalization(
 }
 
 template<int Phase> __global__ void finish_normalization(
-        const Partial* input, unsigned count, ParametersGPU* params, bool zscore) {
+        const Partial* input, unsigned count, ParametersGPU* params, bool zscore, double eps) {
     if constexpr (Phase != 0) if (params->constant) return;
     __shared__ Partial values[256];
     Partial p{0,0,INFINITY,-INFINITY};
@@ -66,7 +73,7 @@ template<int Phase> __global__ void finish_normalization(
     if (!threadIdx.x) {
         const auto q = values[0];
         if constexpr (Phase == 0) {
-            *params = {q.low,1,q.high-q.low,q.weight,q.weight == 0 || q.low == q.high};
+            *params = {q.low,1,q.high-q.low,q.weight,q.low,q.high,q.weight == 0 || q.low == q.high};
             if (params->constant) { params->divisor = 0; return; }
             if (zscore) {
                 const double magnitude = fmax(fabs(q.low),fabs(q.high));
@@ -76,7 +83,7 @@ template<int Phase> __global__ void finish_normalization(
                 params->divisor = q.high/2-params->center;
             }
         } else if constexpr (Phase == 1) params->center = q.sum/params->count;
-        else params->divisor = sqrt(q.sum/params->count);
+        else params->divisor = fmax(sqrt(q.sum/params->count),eps/params->scale);
     }
 }
 
@@ -119,24 +126,138 @@ template<class T> __global__ void normalize_values(View<T> data, const Parameter
         }
     }
 }
+
+// Validity flags for one channel, counting valid voxels; with none valid,
+// statistics use every voxel (flags become all ones).
+template<class M> __global__ void select_valid(const M* mask, std::uint8_t* valid, std::size_t n, unsigned long long* count) {
+    unsigned long long local = 0;
+    EACH_INDEX(n) { valid[i] = mask[i] != M(0); local += valid[i]; }
+    if (local) atomicAdd(count,local);
+}
+__global__ void select_all_if_empty(std::uint8_t* valid, std::size_t n, const unsigned long long* count) {
+    if (*count) return;
+    EACH_INDEX(n) valid[i] = 1;
+}
+
+// Order statistics sort the selected values; unselected voxels sort last as +inf.
+template<class T> __global__ void order_keys(View<T> data, const std::uint8_t* valid, T* keys, int* invalid) {
+    EACH_INDEX(data.size) {
+        const T x = data.ptr[i];
+        if (!isfinite(x)) atomicExch(invalid,1);
+        keys[i] = !valid || valid[i] ? x : T(INFINITY);
+    }
+}
+struct OrderGPU { double low, high, center, scale, deviation, count; bool zero; };
+// Kernel-copyable mode options (Normalize itself holds channel-selection vectors).
+struct Options {
+    Normalization mode; bool clip, median; double lower, upper, low, high, center, scale;
+    explicit Options(const Normalize& t) : mode(t.mode),clip(t.clip),median(t.median),lower(t.lower),upper(t.upper),
+        low(t.low),high(t.high),center(t.center),scale(t.scale) {}
+};
+// One thread: percentiles and median of the clipped values. Clipping is
+// monotone, so the clipped values stay sorted.
+template<class T> __global__ void order_parameters(const T* sorted, const unsigned long long* selected, std::size_t n,
+                                                   OrderGPU* out, Options t, const ParametersGPU* moments) {
+    const std::size_t count = selected ? std::size_t(*selected) ? std::size_t(*selected) : n : n;
+    const auto at = [&](std::size_t k) { return double(sorted[k]); };
+    const bool clip = t.mode == Normalization::Percentile || t.clip;
+    OrderGPU q{at(0),at(count-1),0,1,0,double(count),false};
+    if (clip) { q.low = sorted_percentile(at,count,t.lower); q.high = sorted_percentile(at,count,t.upper); }
+    const auto clipped = [&](std::size_t k) { return double(clamp_to(sorted[k],q.low,q.high)); };
+    if (t.mode == Normalization::Percentile) {
+        q.scale = percentile_scale(q.low,q.high,t.median);
+        q.center = t.median ? sorted_percentile(clipped,count,50) : q.low;
+        q.zero = q.scale == 0;
+    } else {
+        q.center = sorted_percentile(clipped,count,50);
+        q.deviation = moments->divisor*moments->scale;
+    }
+    *out = q;
+}
+template<class T> __global__ void deviation_keys(View<T> data, const std::uint8_t* valid, double* keys, const OrderGPU* params) {
+    const OrderGPU q = *params;
+    EACH_INDEX(data.size)
+        keys[i] = !valid || valid[i] ? fabs(double(clamp_to(data.ptr[i],q.low,q.high))-q.center) : double(INFINITY);
+}
+__global__ void robust_parameters(const double* sorted, OrderGPU* params) {
+    auto& q = *params;
+    const auto at = [&](std::size_t k) { return sorted[k]; };
+    q.scale = robust_scale(sorted_percentile(at,std::size_t(q.count),50),q.deviation,q.high-q.low);
+}
+template<class T> __global__ void order_values(View<T> data, const OrderGPU* params, bool clip) {
+    const OrderGPU q = *params;
+    EACH_INDEX(data.size) {
+        if (q.zero) { data.ptr[i] = T(0); continue; }
+        const T x = clip ? clamp_to(data.ptr[i],q.low,q.high) : data.ptr[i];
+        data.ptr[i] = finite_or_zero<T>((double(x)-q.center)/q.scale);
+    }
+}
+template<class T> __global__ void fixed_values(View<T> data, Options t, int* invalid) {
+    EACH_INDEX(data.size) {
+        const T x = data.ptr[i];
+        if (!isfinite(x)) atomicExch(invalid,1);
+        data.ptr[i] = finite_or_zero<T>((double(clamp_to(x,t.low,t.high))-t.center)/t.scale);
+    }
+}
+template<class K> void sort_keys(Buffer<K>& keys, std::size_t n) {
+    Buffer<K> sorted(n); std::size_t bytes = 0;
+    check(cub::DeviceRadixSort::SortKeys(nullptr,bytes,keys.ptr,sorted.ptr,n));
+    Buffer<std::byte> scratch(bytes);
+    check(cub::DeviceRadixSort::SortKeys(scratch.ptr,bytes,keys.ptr,sorted.ptr,n));
+    std::swap(keys.ptr,sorted.ptr);
+}
+// Mean/standard deviation (and bounds) of the selected values.
+template<class T> void moments(View<T> data, Selection select, ParametersGPU* params, int* invalid, double eps, bool zscore) {
+    const unsigned count = std::min(blocks(data.size),1024u);
+    Buffer<Partial> partial(count);
+    collect_normalization<T,0><<<count,256>>>(data,partial.ptr,nullptr,select,invalid);
+    finish_normalization<0><<<1,256>>>(partial.ptr,count,params,zscore,eps);
+    if (!zscore) return;
+    collect_normalization<T,1><<<count,256>>>(data,partial.ptr,params,select,invalid);
+    finish_normalization<1><<<1,256>>>(partial.ptr,count,params,true,eps);
+    collect_normalization<T,2><<<count,256>>>(data,partial.ptr,params,select,invalid);
+    finish_normalization<2><<<1,256>>>(partial.ptr,count,params,true,eps);
+}
 } // namespace
 
 void apply_cuda(const Normalize& t, Sample& s, const Parameters& p, Session& session) {
-    apply_channels(t,s,p,session,[&](const auto& t, auto data, const Grid&, const ChannelPlan&) {
+    apply_channels(t,s,p,session,[&](const auto& t, auto data, const Grid&, const ChannelPlan& c) {
         using T = typename decltype(data)::value_type;
-        const bool zscore = t.mode == Normalization::ZScore;
-        const unsigned count = std::min(blocks(data.size),1024u);
-        Buffer<Partial> partial(count); Buffer<ParametersGPU> params(1);
         auto* invalid = session.finite_status();
-        collect_normalization<T,0><<<count,256>>>(data,partial.ptr,nullptr,zscore,invalid);
-        finish_normalization<0><<<1,256>>>(partial.ptr,count,params.ptr,zscore);
-        if (zscore) {
-            collect_normalization<T,1><<<count,256>>>(data,partial.ptr,params.ptr,true,invalid);
-            finish_normalization<1><<<1,256>>>(partial.ptr,count,params.ptr,true);
-            collect_normalization<T,2><<<count,256>>>(data,partial.ptr,params.ptr,true,invalid);
-            finish_normalization<2><<<1,256>>>(partial.ptr,count,params.ptr,true);
+        if (t.mode == Normalization::Fixed) {
+            fixed_values<<<blocks(data.size),256>>>(data,Options(t),invalid); check(cudaGetLastError()); return;
         }
-        normalize_values<<<blocks(data.size),256>>>(data,params.ptr,zscore);
+        std::unique_ptr<Buffer<std::uint8_t>> valid;
+        Buffer<unsigned long long> selected(1);
+        const auto& f = s.at(c.key);
+        if (t.masked && session.arrays.count(f.target.valid)) {
+            const auto& mask = session.arrays.at(f.target.valid);
+            valid = std::make_unique<Buffer<std::uint8_t>>(data.size);
+            check(cudaMemsetAsync(selected.ptr,0,sizeof(unsigned long long)));
+            const std::size_t offset = (mask.shape[0] == 1 ? 0 : c.channel)*data.size;
+            mask.typed([&](auto m) { select_valid<<<blocks(data.size),256>>>(m.ptr+offset,valid->ptr,data.size,selected.ptr); });
+            select_all_if_empty<<<blocks(data.size),256>>>(valid->ptr,data.size,selected.ptr);
+        }
+        const Selection select{valid ? valid->ptr : nullptr,t.mode == Normalization::ZScore && t.nonzero};
+        Buffer<ParametersGPU> params(1);
+        if (t.mode == Normalization::MinMax || t.mode == Normalization::ZScore) {
+            const bool zscore = t.mode == Normalization::ZScore;
+            moments(data,select,params.ptr,invalid,t.eps,zscore);
+            normalize_values<<<blocks(data.size),256>>>(data,params.ptr,select.nonzero);
+            check(cudaGetLastError()); return;
+        }
+        if (t.mode == Normalization::Robust) moments(data,select,params.ptr,invalid,0.,true);
+        Buffer<T> keys(data.size); Buffer<OrderGPU> order(1);
+        order_keys<<<blocks(data.size),256>>>(data,select.valid,keys.ptr,invalid);
+        sort_keys(keys,data.size);
+        order_parameters<<<1,1>>>(keys.ptr,valid ? selected.ptr : nullptr,data.size,order.ptr,Options(t),params.ptr);
+        if (t.mode == Normalization::Robust) {
+            Buffer<double> deviations(data.size);
+            deviation_keys<<<blocks(data.size),256>>>(data,select.valid,deviations.ptr,order.ptr);
+            sort_keys(deviations,data.size);
+            robust_parameters<<<1,1>>>(deviations.ptr,order.ptr);
+        }
+        order_values<<<blocks(data.size),256>>>(data,order.ptr,t.mode == Normalization::Percentile || t.clip);
         check(cudaGetLastError());
     });
 }

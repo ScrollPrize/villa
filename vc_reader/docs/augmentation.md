@@ -57,6 +57,30 @@ with no nonzero values become zero. Both modes retain protection against
 extreme finite float64 values; they introduce no epsilon or clipping.
 Nonfinite image values raise, including values produced by an earlier step.
 
+Further modes cover the vesuvius trainer normalizations (all on CPU and CUDA):
+
+| Call | Definition |
+| --- | --- |
+| `Normalize("zscore", nonzero=False, eps=1e-8)` | `(x-mean)/max(std, eps)` over all voxels (vesuvius `normalize_zscore`, tracer `crop_zscore_v1` with `eps=1e-6`) |
+| `Normalize("robust", lower=1, upper=99, clip=True)` | clip to percentiles, `(x-median)/(1.4826 MAD)` with vesuvius `normalize_robust` fallbacks (ink `robust_mad`) |
+| `Normalize("percentile", lower=, upper=)` | clip to percentiles, `(x-p_lower)/(p_upper-p_lower)`; zero span gives zeros (ink percentile modes; `lower=0, upper=100` is ink `minmax`) |
+| `Normalize("percentile", median=True)` | clip, `(x-median)/((p_upper-p_lower)/2)` (ink `robust_percentile_span`) |
+| `Normalize("fixed", center=, scale=, bounds=(lo, hi))` | `(clip(x, lo, hi)-center)/scale` with constants: vesuvius `ct`, ink `clip_zscore`/`divide`, `/255*2-1` as `center=scale=127.5` |
+
+`masked=True` (all modes except `fixed`) restricts statistics to the image's
+validity mask, like vesuvius `use_mask` or statistics computed before padding.
+Without a mask, or with no valid voxel, every voxel is used. All voxels are
+transformed; padding is then refilled from the mask as usual. Percentiles use
+NumPy's default linear interpolation; the robust, percentile and fixed modes
+replace nonfinite results with zero (NumPy `nan_to_num`), and every mode
+rejects nonfinite inputs. An option belonging to another mode raises.
+
+These modes compute statistics in float64 rather than NumPy's float32 pairwise
+sums, so results agree with the vesuvius functions within float32 rounding,
+not bitwise. CUDA computes percentiles from a device radix sort of the selected
+values with no host readback; a 128³ float32 crop takes about 1 ms (robust 1.3 ms)
+on the RTX 5090, versus 15–60 ms on one CPU core.
+
 Statistics use the current values of each selected channel independently;
 `on`, `channels`, `p` and `p_channel` follow the usual image-transform rules.
 Labels and other unselected targets are preserved. Validity-mask restoration

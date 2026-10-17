@@ -3,9 +3,22 @@ from typing import Any, Mapping, Sequence
 class _Config: ...
 Scalar = float | tuple[float, float] | _Config
 
-def Normalize(mode: str = "zscore", *, on: str | Sequence[str] | None = None,
+def Normalize(mode: str = "zscore", *, masked: bool = False, nonzero: bool = True, eps: float = 0,
+              lower: float = 1, upper: float = 99, clip: bool = True, median: bool = False,
+              center: float = 0, scale: float = 1, bounds: tuple[float, float] | None = None,
+              on: str | Sequence[str] | None = None,
               channels: Sequence[int] = ..., p: float = 1, p_channel: float = 1) -> _Config:
-    """Per-channel min/max scaling or zero-preserving population z-score normalization."""
+    """Per-channel intensity normalization.
+
+    minmax: (x-min)/(max-min). zscore: (x-mean)/max(std, eps), population std;
+    nonzero=True (default) excludes and preserves zeros. robust: clip to the
+    lower/upper percentiles (clip=True), then (x-median)/(1.4826 MAD) with
+    vesuvius' fallbacks. percentile: clip to the percentiles, then
+    (x-lower)/(upper-lower), or (x-median)/((upper-lower)/2) with median=True.
+    fixed: (clip(x, *bounds)-center)/scale with given constants. masked=True
+    restricts statistics to the image's validity mask. Options belonging to
+    another mode raise.
+    """
     ...
 
 def Uniform(low: float, high: float) -> _Config: ...

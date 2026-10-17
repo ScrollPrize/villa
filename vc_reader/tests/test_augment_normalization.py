@@ -127,3 +127,147 @@ def test_validation_and_skipping(backend):
         np.testing.assert_array_equal(A.Pipeline([transform],backend=backend)(dict(image=image),seed=1)["image"],image)
     with pytest.raises(ValueError,match="float"):
         A.Pipeline([A.Normalize()],backend=backend)(dict(image=image.astype(np.uint8)),seed=1)
+
+
+# References for the extended modes follow the vesuvius NumPy definitions
+# (image_proc.intensity.normalization, ink_detection.data.normalization),
+# evaluated in float64.
+def _selected(values, valid):
+    return values[valid] if valid is not None and valid.any() else values.reshape(-1)
+
+
+def _robust_reference(values, valid, lower, upper, clip):
+    selected = _selected(values, valid)
+    std, lo, hi = selected.std(), selected.min(), selected.max()
+    if clip:
+        lo, hi = np.percentile(selected, lower), np.percentile(selected, upper)
+        values = np.clip(values, lo, hi)
+        selected = np.clip(selected, lo, hi)
+    median = np.median(selected)
+    scale = 1.4826 * np.median(np.abs(selected - median))
+    if not np.isfinite(scale) or scale < 1e-6:
+        candidates = [abs(std), abs(hi - lo) / 2]
+        scale = next((c for c in candidates if np.isfinite(c) and c >= 1e-6), 1.)
+    return np.nan_to_num((values - median) / scale, nan=0., posinf=0., neginf=0.)
+
+
+def _percentile_reference(values, valid, lower, upper, median):
+    selected = _selected(values, valid)
+    lo, hi = np.percentile(selected, lower), np.percentile(selected, upper)
+    values = np.clip(values, lo, hi)
+    if median:
+        scale = .5 * (hi - lo)
+        scale = scale if np.isfinite(scale) and scale >= 1e-6 else 1.
+        return (values - np.median(np.clip(selected, lo, hi))) / scale
+    scale = hi - lo
+    if not np.isfinite(scale) or scale < 1e-6:
+        return np.zeros_like(values)
+    return (values - lo) / scale
+
+
+def _zscore_reference(values, valid, eps):
+    selected = _selected(values, valid)
+    if selected.min() == selected.max():
+        return np.zeros_like(values)
+    return (values - selected.mean()) / max(selected.std(), eps)
+
+
+def _extended(image, valid, mode, **options):
+    out = np.empty_like(image, dtype=np.float64)
+    for c, values in enumerate(image.astype(np.float64)):
+        v = None if valid is None else valid[0 if len(valid) == 1 else c].astype(bool)
+        if mode == "robust":
+            out[c] = _robust_reference(values, v, options.get("lower", 1), options.get("upper", 99), options.get("clip", True))
+        elif mode == "percentile":
+            out[c] = _percentile_reference(values, v, options.get("lower", 1), options.get("upper", 99), options.get("median", False))
+        elif mode == "zscore":
+            out[c] = _zscore_reference(values, v, options.get("eps", 0))
+        else:
+            low, high = options.get("bounds", (-np.inf, np.inf))
+            out[c] = np.nan_to_num((np.clip(values, low, high) - options.get("center", 0)) / options.get("scale", 1),
+                                   nan=0., posinf=0., neginf=0.)
+    return out
+
+
+EXTENDED = [
+    ("zscore", dict(nonzero=False)),
+    ("zscore", dict(nonzero=False, eps=1e-8)),
+    ("robust", {}),
+    ("robust", dict(lower=5, upper=95)),
+    ("robust", dict(clip=False)),
+    ("percentile", dict(lower=0.5, upper=99.5)),
+    ("percentile", dict(lower=2, upper=98, median=True)),
+    ("percentile", dict(lower=0, upper=100)),
+    ("fixed", dict(center=127.5, scale=127.5)),
+    ("fixed", dict(center=90.25, scale=31.5, bounds=(12., 230.))),
+]
+
+
+@pytest.mark.parametrize("mode,options", EXTENDED)
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("masked", [False, True])
+def test_extended_modes_match_vesuvius_references(backend, mode, options, dtype, masked):
+    rng = np.random.default_rng(7)
+    image = rng.integers(0, 256, (2, 9, 11, 13)).astype(dtype)
+    image[:, :2] = 0  # zeros are ordinary values outside the default z-score
+    valid = np.ones((1, 9, 11, 13), np.uint8); valid[:, :, :3] = 0
+    targets = dict(image=A.Image(fill=-7), padding_mask=A.ValidMask())
+    if mode == "fixed" and masked:
+        pytest.skip("fixed normalization has no statistics")
+    transform = A.Normalize(mode, masked=masked, **options) if mode != "fixed" else A.Normalize(mode, **options)
+    sample = dict(image=image, padding_mask=valid)
+    actual = A.Pipeline([transform], targets=targets, backend=backend)(sample, seed=3)["image"]
+    expected = _extended(image, valid if masked else None, mode, **options)
+    expected[:, valid[0] == 0] = -7
+    tol = 2e-6 if dtype == np.float32 else 1e-12
+    np.testing.assert_allclose(actual, expected, rtol=tol, atol=tol)
+    assert actual.dtype == dtype
+
+
+@pytest.mark.parametrize("mode", ["zscore", "robust", "percentile"])
+def test_masked_statistics_without_valid_voxels_use_every_voxel(backend, mode):
+    image = np.random.default_rng(2).normal(5, 3, (1, 6, 7, 8)).astype(np.float32)
+    options = dict(nonzero=False) if mode == "zscore" else {}
+    targets = dict(image=A.Image(valid=None), padding_mask=A.ValidMask())
+    sample = dict(image=image, padding_mask=np.zeros((1, 6, 7, 8), np.uint8))
+    masked = A.Pipeline([A.Normalize(mode, masked=True, **options)], targets=targets, backend=backend)(sample, seed=0)
+    plain = A.Pipeline([A.Normalize(mode, **options)], targets=targets, backend=backend)(sample, seed=0)
+    np.testing.assert_allclose(masked["image"], plain["image"], rtol=2e-6, atol=2e-6)
+    np.testing.assert_allclose(plain["image"][0], _extended(image, None, mode, **options)[0], rtol=2e-6, atol=2e-6)
+
+
+@pytest.mark.parametrize("mode", ["robust", "percentile"])
+def test_order_statistics_constant_and_tiny_spans(backend, mode):
+    for image in (np.full((1, 4, 5), 3., np.float32), np.array([[[0, 1e-7, 2e-7, 0, 1e-7]]], np.float32)):
+        actual = A.Pipeline([A.Normalize(mode)], backend=backend)(dict(image=image), seed=0)["image"]
+        np.testing.assert_allclose(actual, _extended(image, None, mode), rtol=2e-6, atol=2e-6)
+
+
+def test_extended_mode_options_are_validated():
+    with pytest.raises(ValueError, match="does not apply"):
+        A.Normalize("minmax", eps=1)
+    with pytest.raises(ValueError, match="does not apply"):
+        A.Normalize("fixed", masked=True)
+    with pytest.raises(ValueError, match="percentiles"):
+        A.Normalize("robust", lower=60, upper=40)
+    with pytest.raises(ValueError, match="scale"):
+        A.Normalize("fixed", scale=0)
+    with pytest.raises(ValueError, match="bounds"):
+        A.Normalize("fixed", bounds=(2, 1))
+
+
+def test_extended_modes_on_resident_device_arrays():
+    if not is_available():
+        pytest.skip("CUDA build/device unavailable")
+    from vc_reader import cuda
+    if not cuda.is_available():
+        pytest.skip("CUDA reader unavailable")
+    image = np.random.default_rng(4).integers(0, 256, (1, 16, 17, 18)).astype(np.float32)
+    valid = np.ones((1, 16, 17, 18), np.uint8); valid[..., :4] = 0
+    targets = dict(image=A.Image(), padding_mask=A.ValidMask())
+    for mode, options in EXTENDED:
+        transform = A.Normalize(mode, **options) if mode == "fixed" else A.Normalize(mode, masked=True, **options)
+        pipeline = A.Pipeline([transform], targets=targets, backend="cuda")
+        host = pipeline(dict(image=image, padding_mask=valid), seed=1)["image"]
+        device = pipeline(dict(image=cuda.asarray(image), padding_mask=cuda.asarray(valid)), seed=1)["image"].numpy()
+        np.testing.assert_array_equal(device, host)
