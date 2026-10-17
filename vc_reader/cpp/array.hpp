@@ -294,8 +294,12 @@ public:
 
     // Reads every region [start, start+size) into its C-order output buffer.
     // Parts outside the array, and chunks that are not stored, read as fill.
+    // `stream`: raw local chunks missing from the memory cache are copied straight
+    // into the outputs without being read whole and inserted (callers with their
+    // own cache, e.g. the CUDA reader). Memory-cache hits are still used.
     void read_many(const std::vector<Index>& starts, const std::vector<Index>& sizes,
-                   const std::vector<std::uint8_t*>& outs, const BoxOutput* output = nullptr)
+                   const std::vector<std::uint8_t*>& outs, const BoxOutput* output = nullptr,
+                   bool stream = false)
     {
         const std::size_t nd = spec_.shape.size();
         std::vector<Index> out_strides(starts.size());
@@ -353,7 +357,7 @@ public:
         ordered.reserve(work.size());
         for (auto& [linear, i] : slot)
             ordered.push_back(std::move(work[i]));
-        run(ordered, out_strides, nullptr, output);
+        run(ordered, out_strides, nullptr, output, stream);
     }
 
     void read_many_float(const std::vector<Index>& starts, const std::vector<Index>& sizes,
@@ -520,11 +524,11 @@ private:
 
     // Resolves every chunk in parallel, in the order given.
     void run(std::vector<Work>& work, const std::vector<Index>& out_strides, const PointOp* op,
-             const BoxOutput* output = nullptr)
+             const BoxOutput* output = nullptr, bool stream = false)
     {
-        if (spec_.hint && !cache_)
+        if (spec_.hint && (!cache_ || stream))
             pool_.parallel_for(work.size(), [&](std::size_t i) { hint(work[i]); });
-        pool_.parallel_for(work.size(), [&](std::size_t i) { resolve(work[i], out_strides, op, output); });
+        pool_.parallel_for(work.size(), [&](std::size_t i) { resolve(work[i], out_strides, op, output, stream); });
     }
 
     std::size_t plan_segments(std::size_t n) const
@@ -1193,10 +1197,22 @@ private:
                 ::madvise(const_cast<std::uint8_t*>(m->data) + a, static_cast<std::size_t>(first + len - a),
                           MADV_WILLNEED);
             };
+            // Many pieces of one chunk (sub-chunk blocks) share one hint over their
+            // span unless it would advise much more than the pieces themselves.
+            std::int64_t lo = INT64_MAX, hi = 0, total = 0;
             for (const auto& p : w.pieces) {
                 auto [first, len] = span_of(p);
-                advise(first, len);
+                lo = std::min(lo, first);
+                hi = std::max(hi, first + len);
+                total += len;
             }
+            if (!w.pieces.empty() && hi - lo <= 2 * total)
+                advise(lo, hi - lo);
+            else
+                for (const auto& p : w.pieces) {
+                    auto [first, len] = span_of(p);
+                    advise(first, len);
+                }
             if (fresh && w.has_points()) {
                 auto [first, len] = point_span(w, *op);
                 advise(first, len);
@@ -1213,11 +1229,23 @@ private:
         thread_local std::vector<std::uint8_t> scratch;
         if (scratch.size() < chunk_bytes_)
             scratch.resize(chunk_bytes_);
+        std::int64_t lo = INT64_MAX, hi = 0, total = 0;
         for (const auto& p : w.pieces) {
             auto [first, len] = span_of(p);
-            pread_exact(f.fd(), scratch.data(), static_cast<std::size_t>(len), first, path);
-            copy_piece(scratch.data(), p, out_strides, output);
+            lo = std::min(lo, first);
+            hi = std::max(hi, first + len);
+            total += len;
         }
+        if (w.pieces.size() > 1 && hi - lo <= total) {  // overlapping spans (sub-chunk blocks): one read
+            pread_exact(f.fd(), scratch.data(), static_cast<std::size_t>(hi - lo), lo, path);
+            for (const auto& p : w.pieces)
+                copy_piece(scratch.data() + (span_of(p).first - lo), p, out_strides, output);
+        } else
+            for (const auto& p : w.pieces) {
+                auto [first, len] = span_of(p);
+                pread_exact(f.fd(), scratch.data(), static_cast<std::size_t>(len), first, path);
+                copy_piece(scratch.data(), p, out_strides, output);
+            }
         if (w.has_points()) {  // one read of the span the points touch
             auto [lo, len] = point_span(w, *op);
             pread_exact(f.fd(), scratch.data(), static_cast<std::size_t>(len), lo, path);
@@ -1248,7 +1276,8 @@ private:
         return ChunkPtr(std::move(chunk));
     }
 
-    void resolve(const Work& w, const std::vector<Index>& out_strides, const PointOp* op, const BoxOutput* output)
+    void resolve(const Work& w, const std::vector<Index>& out_strides, const PointOp* op, const BoxOutput* output,
+                 bool stream = false)
     {
         const std::string k = key(w.idx);
         const std::string ck = spec_.identity + "|" + k;
@@ -1270,7 +1299,7 @@ private:
         }
         for (std::size_t li = 0; li < spec_.layers.size(); ++li) {
             const LayerSpec& l = spec_.layers[li];
-            if (!cache_ && codecs_[li] == Codec::Raw) {
+            if ((!cache_ || stream) && codecs_[li] == Codec::Raw) {
                 if (read_raw_pieces(l.root + "/" + k, w, out_strides, op, output) == Found::Copied) {
                     ++stats_.disk_hits;
                     return;

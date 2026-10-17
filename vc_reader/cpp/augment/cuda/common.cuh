@@ -60,6 +60,33 @@ struct Layout {
         return i / stride[a] % shape[a];
     }
 };
+// Exact float32<->float64 conversion. Consumer GPUs convert at the slow float64
+// rate; for normal values both are bit moves (narrow rounds to nearest even) on
+// the integer pipe. Zero, subnormal, infinite and NaN values use the hardware.
+__device__ inline double widen(float x) {
+    const unsigned u = __float_as_uint(x);
+    if (((u >> 23) & 0xffu) - 1u < 254u)
+        return __longlong_as_double(static_cast<long long>((static_cast<unsigned long long>(u & 0x80000000u) << 32) |
+            ((static_cast<unsigned long long>(u & 0x7fffffffu) << 29) + (static_cast<unsigned long long>(1023 - 127) << 52))));
+    return double(x);
+}
+__device__ inline float narrow(double x) {
+    const auto b = static_cast<unsigned long long>(__double_as_longlong(x));
+    const unsigned e = unsigned(b >> 52) & 0x7ffu;
+    if (e - 897u < 254u) {
+        const unsigned rest = unsigned(b) & 0x1fffffffu;
+        unsigned f = (unsigned(b >> 32) & 0x80000000u) | ((e - 896u) << 23) | (unsigned(b >> 29) & 0x7fffffu);
+        f += rest > 0x10000000u || (rest == 0x10000000u && (f & 1u));
+        return __uint_as_float(f);
+    }
+    return float(x);
+}
+template<class T> __device__ inline double to_double(T x) {
+    if constexpr (std::is_same_v<T, float>) return widen(x); else return double(x);
+}
+template<class T> __device__ inline T from_double(double x) {
+    if constexpr (std::is_same_v<T, float>) return narrow(x); else return T(x);
+}
 inline unsigned blocks(std::size_t n) { return unsigned(std::min<std::size_t>((n + 255) / 256, 65535)); }
 #define EACH_INDEX(n) for (std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < (n); i += std::size_t(blockDim.x) * gridDim.x)
 __device__ inline double clamp_value(double x, double low, double high) { return x < low ? low : x > high ? high : x; }

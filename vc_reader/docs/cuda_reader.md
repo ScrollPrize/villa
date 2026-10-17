@@ -39,13 +39,13 @@ No Torch/CuPy runtime dependency is required by the backend.
 The adapter methods mirror the corresponding reader operations, returning
 `DeviceArray` (or a list of arrays for batches). They accept `source=`:
 
-- `"auto"` (default) samples from cached/uploaded source chunks. For axis-aligned
-  reads it instead crops uint8 on CPU and uploads the crop if missing source
-  chunks occupy more bytes than the raw crop output. Any request exceeding the
-  chunk-cache budget uses CPU sampling/cropping followed by upload. Floating box
+- `"auto"` (default) samples from cached/uploaded source bricks (see below). For
+  axis-aligned reads it instead crops uint8 on CPU and uploads the crop if missing
+  source bricks occupy more bytes than the raw crop output. Any request exceeding
+  the cache budget uses CPU sampling/cropping followed by upload. Floating box
   conversion happens on GPU. Execution errors are propagated, never retried.
 - `"chunks"` requires GPU sampling and sufficient cache budget for the request's
-  chunk union. It raises before source loading if that working set exceeds the
+  brick union. It raises before source loading if that working set exceeds the
   budget. Use this to warm the cache deliberately.
 - `"cpu"` explicitly samples/crops on CPU and uploads its result. The returned
   device-array contract is identical.
@@ -54,26 +54,42 @@ The routing rule compares transferred bytes; it is not a universal latency
 predictor. Fresh, sparse requests can favor CPU processing even when they fit
 in the device cache. Use explicit routes when the workload is known.
 
-The private per-adapter LRU cache is bounded by `cache_bytes`, including full
-padded source chunks. Native planning deduplicates chunks across crop batches.
-Only misses are read through the existing reader (local mmap/slab, codecs,
-remote/disk/memory caches) and uploaded. Host staging reuses two page-locked
-buffers of at most 32 MiB each, or one full chunk per buffer if a chunk is larger.
-Buffers grow lazily, survive `clear_cache()`, and are released when the adapter
-closes. Pinning has an initial allocation cost; reuse the adapter across requests.
-Pinned-memory allocation errors propagate as CUDA errors.
+The private per-adapter LRU cache holds **bricks**: blocks of at most 32 voxels
+per axis that evenly divide the storage chunks (128³ chunks hold 4³ bricks of
+32³; chunk axes of 32 or fewer, or odd extents, are not subdivided). It is bounded
+by `cache_bytes`, counting whole bricks, including padding past the volume edge.
+Planning keeps only bricks the request can read: boxes use their brick overlap;
+affine crops test every brick in their bounding box against the sampled
+parallelepiped with a conservative separating-axis test (dilated by the
+interpolation neighbourhood and float32 rounding). Oblique crops therefore load
+roughly their own footprint instead of every chunk their bounding box touches.
+Native planning deduplicates bricks across crop batches. Only misses are read
+through the existing reader (local mmap/slab, codecs, remote/disk/memory caches)
+and uploaded. Raw local chunks are copied brick by brick straight into staging
+without being read whole or inserted into the host memory cache; memory-cache
+hits and compressed chunks still use it.
 
-Missing device chunks are allocated before transfer submission. Chunk uploads
-use `cudaMemcpyAsync` on the default stream, overlapping CPU reads of the next
-batch. Events prevent staging reuse before a transfer finishes; errors drain
-queued transfers and discard potentially incomplete cache entries. Public calls
-still finish before returning. CPU sampling/crop-upload routes are unchanged.
-Outputs, coordinate buffers and lookup
-scratch are additional memory, outside the source-cache budget. CUDA's allocator
-may also retain freed memory. No GPU decompression or direct storage I/O is claimed.
+Bricks live in fixed slots of device segments (up to 256 MiB each, allocated on
+demand within the budget and freed by `clear_cache()` and `close()`). Host staging
+reuses two page-locked buffers of at most 32 MiB each, or one brick per buffer if
+a brick is larger, plus device staging of the same size. Each staging batch is one
+`cudaMemcpyAsync` followed by a scatter kernel into the bricks' slots, on the
+default stream, overlapping CPU reads of the next batch. Misses are uploaded in
+order of the first crop needing them, and each crop's sampling kernel is enqueued
+as soon as its bricks' transfers are, so sampling overlaps the remaining reads.
+Events prevent staging reuse before a transfer finishes; errors drain queued work
+and discard potentially incomplete cache entries. Public calls still finish before
+returning. Buffers grow lazily, survive `clear_cache()`, and are released when the
+adapter closes. Pinning has an initial allocation cost; reuse the adapter across
+requests. Pinned-memory allocation errors propagate as CUDA errors. CPU
+sampling/crop-upload routes are unchanged. Outputs, coordinate buffers, staging
+and lookup scratch are additional memory, outside the source-cache budget. CUDA's
+allocator may also retain freed memory. No GPU decompression or direct storage I/O
+is claimed.
 
-`gpu.stats` reports resident cache bytes/budget, cache hits, chunk uploads,
-uploaded bytes, and CPU/GPU route counts. `gpu.clear_cache()` drops cached chunks.
+`gpu.stats` reports resident cache bytes/budget, cache hits, uploads, uploaded
+bytes, and CPU/GPU route counts. Hits and `chunk_uploads` count bricks (the key
+name is kept for compatibility). `gpu.clear_cache()` drops cached bricks.
 Source volumes are treated as immutable; clear the GPU cache after changing data.
 Closing the adapter frees its cache and scratch, but leaves returned outputs valid.
 The source reader must remain open while issuing new requests.
@@ -159,7 +175,68 @@ Construct them inside each worker; the ordinary `ZarrReader` retains its existin
 fork/spawn support. Concurrent calls on one CUDA reader serialize cache mutation
 and sampling. Different adapters have independent caches.
 
+## Brick residency and resident-pipeline performance
+
+Measured 2026-10-17 on the RTX 5090 / Core Ultra 7 270K Plus host, Release
+`sm_120`, against the previous implementation (commit `61aefe673`). Workload: the
+Paris4 sheet-strip trainer capture (`fiber_strip_results.md`), 32 oblique
+144×128×128 crops per batch. Times are **mean / p50 / p95 ms per batch**.
+
+| Measurement | Before | After |
+|---|---:|---:|
+| `read_affine_many` only, cache cleared per batch (8 batches × 5) | 81.5 / 80.0 / 91.4 | 16.0 / 15.8 / 17.0 |
+| Uploaded per batch | 969 MiB | 164 MiB |
+| Replay: read → `Normalize("zscore")` → augmentation, on device (16 batches) | 100.1 / 99.3 / 115.6 | 25.9 / 25.5 / 28.4 |
+| — read stage | 86.3 | 16.2 |
+| — normalize + augment stage | 13.0 | 8.8 |
+| 14-worker trainer loader, crops/s (56 measured batches) | 137.8 | 190.2 |
+
+Every affine output has the same SHA-256 as before, and CUDA augmentation outputs
+match bit for bit across 280 input/pipeline cases (real crops, zeros, constants,
+subnormal, tiny and huge magnitudes, float64). The loader is now limited by its
+CPU workers (mean wait 92 ms per batch), not by the CUDA image path.
+
+Where the time went, and what changed:
+
+- **Bytes.** Whole-chunk residency moved ~6× more data than sampling reads;
+  bricks plus the separating-axis footprint reduce uploads to the 32³-granular
+  footprint. Copying raw chunks straight into staging (rather than through the
+  host memory cache) removes a full extra chunk copy per miss. Brick sizes from
+  16³ to 32×32×128 were measured; 32³ was fastest. The CPU brick copy is now the
+  main read cost and is close to this host's memory bandwidth for 32-byte rows.
+- **Sampling kernel** (7.0 → 2.7 ms per batch): 32-bit indices and shifts for
+  power-of-two bricks, and register-gathered corners for cells crossing a brick
+  edge. Previously nearly every warp took the generic per-corner path. The
+  per-case arithmetic is unchanged: `trilinear()` within a brick and the
+  generic k=3 sum otherwise.
+- **Normalization** (5.3 → 2.2 ms per batch): consumer GPUs run float64
+  arithmetic *and* float32↔float64 conversions at 1/64 rate. The z-score bounds
+  pass runs in float32 with an integer count (exact: order-free, zeros excluded).
+  Loops are versioned on the uniform scale test, which an in-loop division had
+  defeated. Float32 outputs divide by multiplying with RN(1/d) plus one Markstein
+  correction; results within one float64 ulp of a float32 rounding midpoint (or
+  outside the normal float32 range) fall back to true division, so the float32
+  result is identical. This was verified over all finite float32 inputs for
+  three (center, divisor) pairs and 2.1 billion more inputs across 500
+  adversarial pairs: 14.9 billion cases, zero mismatches. Float64 outputs keep
+  true division.
+- **Conversions.** Normal-range float32↔float64 conversions in the hot kernels
+  (normalization, statistics, contrast, brightness, noise) are integer bit moves
+  with round-to-nearest-even. Verified exhaustively for widening and on 60 billion
+  doubles around every float32 value and rounding midpoint for narrowing.
+  Zero, subnormal, infinite and NaN values use the hardware conversion.
+
+Remaining per-crop costs are mostly host-side: each augmentation call validates
+inputs with a device readback and completes before returning, so CPU work for the
+next crop cannot overlap GPU work. Gaussian blur (~1 ms per batch) is the largest
+remaining augmentation kernel.
+
+Reproduce with `benchmarks/bench_cuda_strip_reads.py` (read-only, hash-compared)
+and the fiber-strip replay/loader commands in `fiber_strip_results.md`.
+
 ## Upload performance
+
+The sections below describe the previous whole-chunk implementation.
 
 The upload comparison uses the local PHercParis4 78 keV level-2 decoded cache,
 128³ uint8 chunks, a GeForce RTX 5090, and Release builds targeting `sm_120`.

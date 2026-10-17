@@ -4,15 +4,20 @@ namespace vcr::augment::cuda {
 template<class T, bool Variance> __global__ void collect(View<T> input, Partial* output, const double* weights, const Statistics* stats) {
     __shared__ Partial values[256];
     Partial p{0,0,INFINITY,-INFINITY};
-    EACH_INDEX(input.size) {
-        double x = input.ptr[i];
-        if constexpr (Variance) p.sum += (x-stats->mean)*(x-stats->mean);
-        else {
-            p.sum += weights ? x*weights[i] : x;
-            p.weight += weights ? weights[i] : 0;
-            p.low = fmin(p.low,x); p.high = fmax(p.high,x);
+    // Versioned on the uniform weights test. Unweighted, the weight stays +0
+    // exactly as when +0 was added per element.
+    const auto each = [&](auto weighted) {
+        EACH_INDEX(input.size) {
+            const double x = to_double(input.ptr[i]);
+            if constexpr (Variance) p.sum += (x-stats->mean)*(x-stats->mean);
+            else {
+                if constexpr (decltype(weighted)::value) { p.sum += x*weights[i]; p.weight += weights[i]; }
+                else p.sum += x;
+                p.low = fmin(p.low,x); p.high = fmax(p.high,x);
+            }
         }
-    }
+    };
+    if (weights) each(std::true_type{}); else each(std::false_type{});
     values[threadIdx.x] = p; reduce(values);
     if (!threadIdx.x) output[blockIdx.x] = values[0];
 }

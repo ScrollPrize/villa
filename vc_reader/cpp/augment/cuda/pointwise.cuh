@@ -2,7 +2,11 @@
 #include "channel.cuh"
 namespace vcr::augment::cuda {
 template<class T, class Function> __global__ void pointwise_kernel(View<T> data, Layout g, const double* field, const Statistics* stats, Function fn) {
-    EACH_INDEX(data.size) data.ptr[i] = T(fn(data.ptr[i],i,g,field,stats));
+    EACH_INDEX(data.size) {
+        const auto y = fn(data.ptr[i],i,g,field,stats);
+        if constexpr (std::is_same_v<decltype(y), const double>) data.ptr[i] = from_double<T>(y);
+        else data.ptr[i] = T(y);
+    }
 }
 template<class T, class Function> void pointwise(View<T> data, const Grid& grid, const ChannelPlan& c, Function fn, bool needs_stats = false, bool weighted = false) {
     auto field = field_buffer(c.field,c.device_field);

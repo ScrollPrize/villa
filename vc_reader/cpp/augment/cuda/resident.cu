@@ -56,7 +56,7 @@ template<class T> __global__ void validate_device_values(View<T> data, bool mask
 }
 std::shared_ptr<void> begin_device(const std::map<std::string,DeviceInput>& inputs, Sample& sample, bool inplace) {
     auto session=std::make_shared<Session>();
-    Buffer<int> invalid(1); int flags=0; invalid.upload(&flags);
+    Buffer<int> invalid(1); int flags=0; check(cudaMemsetAsync(invalid.ptr,0,sizeof(int)));
     for (const auto& [key,in]:inputs) {
         auto& f=sample.at(key);
         require(!sparse(f.target.role) && !directional(f.target.role) && f.target.role!=Role::CoordinateField,

@@ -221,3 +221,24 @@ def test_resident_invocations_have_independent_buffers():
         actual = list(pool.map(lambda seed: pipeline(sample,seed=seed),seeds))
     for out, ref in zip(actual,expected):
         np.testing.assert_array_equal(out["image"],ref["image"])
+
+
+@gpu
+def test_cuda_normalization_matches_float64_formula():
+    # Values pair around 1500, so every statistic is exact in any reduction
+    # order. Outputs must equal float32((x - center) / divisor) bit for bit.
+    from vc_reader.cuda import asarray
+    rng = np.random.default_rng(17)
+    v = rng.integers(1, 1500, 200_000).astype(np.float64)
+    x = np.concatenate([v, 3000 - v, np.zeros(1000)])
+    x = rng.permutation(x).astype(np.float32).reshape(1, 8, 125, 401)
+    nonzero = x[x != 0].astype(np.float64)
+    center = nonzero.sum() / nonzero.size
+    deviation = np.sqrt(((nonzero - center) ** 2).sum() / nonzero.size)
+    zscore = np.where(x == 0, 0, (x.astype(np.float64) - center) / deviation).astype(np.float32)
+    low, high = float(x.min()), float(x.max())
+    minmax = ((x.astype(np.float64) - low) / (high - low)).astype(np.float32)
+    for mode, expected in (("zscore", zscore), ("minmax", minmax)):
+        pipe = A.Pipeline([A.Normalize(mode)], targets={"image": A.Image()}, compact=False, backend="cuda")
+        out = pipe({"image": asarray(x)}, seed=0)["image"].numpy()
+        np.testing.assert_array_equal(out.view(np.uint32), expected.view(np.uint32))

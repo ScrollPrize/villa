@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
 #include <filesystem>
 #include <list>
 #include <memory>
@@ -67,11 +68,21 @@ inline void copy_box(const std::uint8_t* s, const Index& ss, std::uint8_t* d, co
     }
     if (nd <= 3) {
         const std::int64_t planes = nd == 3 ? extent[0] : 1;
-        for (std::int64_t z = 0; z < planes; ++z) {
-            const auto* src = s + (nd == 3 ? z * ss[0] : 0);
-            auto* dst = d + (nd == 3 ? z * ds[0] : 0);
-            for (std::int64_t y = 0; y < extent[nd - 2]; ++y)
-                std::memcpy(dst + y * ds[nd - 2], src + y * ss[nd - 2], run);
+        const auto rows = [&]<std::size_t N>(std::integral_constant<std::size_t, N>) {
+            for (std::int64_t z = 0; z < planes; ++z) {
+                const auto* src = s + (nd == 3 ? z * ss[0] : 0);
+                auto* dst = d + (nd == 3 ? z * ds[0] : 0);
+                for (std::int64_t y = 0; y < extent[nd - 2]; ++y)
+                    std::memcpy(dst + y * ds[nd - 2], src + y * ss[nd - 2], N ? N : run);
+            }
+        };
+        // Short rows (sub-chunk blocks) are inlined fixed-size copies, not library calls.
+        switch (run) {
+        case 16: rows(std::integral_constant<std::size_t, 16>{}); break;
+        case 32: rows(std::integral_constant<std::size_t, 32>{}); break;
+        case 64: rows(std::integral_constant<std::size_t, 64>{}); break;
+        case 128: rows(std::integral_constant<std::size_t, 128>{}); break;
+        default: rows(std::integral_constant<std::size_t, 0>{});
         }
         return;
     }

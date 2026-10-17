@@ -2,7 +2,8 @@
 #include "../array.hpp"
 #include "../cuda_buffer.hpp"
 #include "types.hpp"
-#include <unordered_set>
+#include <bit>
+#include <list>
 #include <set>
 namespace vcr::reader_cuda {
 struct Result { device::Storage storage; std::size_t count; bool floating; };
@@ -23,11 +24,20 @@ class Reader {
     Source source_{};
     int device_;
     pid_t pid_=getpid();
-    std::size_t budget_, chunk_bytes_=1, clock_=0;
-    struct Entry { device::Storage data; std::size_t used; };
+    // The cache holds bricks: blocks of at most kBrick voxels per axis that evenly
+    // divide storage chunks. Sampling reads only the bricks a request touches.
+    static constexpr std::int64_t kBrick=32;
+    std::size_t budget_, brick_bytes_=1, capacity_=0;
+    // Bricks live in fixed slots of large device segments, in LRU order.
+    struct Entry { std::uint32_t slot; std::list<std::int64_t>::iterator age; };
     std::unordered_map<std::int64_t,Entry> cache_;
+    std::list<std::int64_t> lru_;
+    std::vector<device::Storage> segments_;
+    std::vector<std::uint32_t> free_;
+    std::size_t segment_slots_=1, slots_=0;
     struct Staging {
         device::PinnedBuffer buffer;
+        device::Storage device;
         cudaEvent_t done = nullptr;
         int owner = 0;
         pid_t pid = getpid();
@@ -46,7 +56,8 @@ class Reader {
             cudaSetDevice(previous);
         }
     } staging_[2];
-    device::Storage keys_, pointers_, requests_;
+    device::Storage table_, requests_;
+    device::PinnedBuffer table_host_;
     std::mutex mutex_;
     std::uint64_t hits_=0, uploads_=0, uploaded_=0, cpu_routes_=0, gpu_routes_=0;
     void ready() const {
@@ -62,101 +73,188 @@ class Reader {
         std::int64_t key=0;
         for (int a=0;a<3;++a) {
             if (at[a]<0 || at[a]>=source_.shape[a]) return;
-            key=key*source_.grid[a]+at[a]/source_.chunks[a];
+            key=key*source_.grid[a]+at[a]/source_.brick[a];
         }
         keys.insert(key);
     }
-    void box(std::set<std::int64_t>& keys, const std::int64_t* start, const std::int64_t* size) const {
+    // Bricks overlapping a voxel box; `keep(brick start)` may reject candidates.
+    template<class Keep> void box(std::set<std::int64_t>& keys, const std::int64_t* start, const std::int64_t* size, Keep&& keep) const {
         std::int64_t lo[3],hi[3];
         for (int a=0;a<3;++a) {
             if (!size[a]) return;
             lo[a]=std::max<std::int64_t>(start[a],0); hi[a]=std::min(start[a]+size[a],source_.shape[a]);
             if (lo[a]>=hi[a]) return;
-            lo[a]/=source_.chunks[a]; hi[a]=(hi[a]-1)/source_.chunks[a];
+            lo[a]/=source_.brick[a]; hi[a]=(hi[a]-1)/source_.brick[a];
         }
-        for (auto z=lo[0];z<=hi[0];++z) for (auto y=lo[1];y<=hi[1];++y) for (auto x=lo[2];x<=hi[2];++x)
-            keys.insert((z*source_.grid[1]+y)*source_.grid[2]+x);
+        for (auto z=lo[0];z<=hi[0];++z) for (auto y=lo[1];y<=hi[1];++y) for (auto x=lo[2];x<=hi[2];++x) {
+            const std::int64_t at[3]{z*source_.brick[0],y*source_.brick[1],x*source_.brick[2]};
+            if (keep(at)) keys.insert((z*source_.grid[1]+y)*source_.grid[2]+x);
+        }
     }
-    void upload_missing(const std::vector<std::int64_t>& missing) {
-        if (missing.empty()) return;
-        // Two bounded pinned buffers: CPU reading batch N+1 overlaps the
-        // default-stream uploads of N. Events prevent reusing a buffer early.
-        // Allocation/copies/sampling share stream 0, including cudaMallocAsync.
-        constexpr std::size_t staging_limit=64ull<<20;
-        const auto batch=std::max<std::size_t>(1,(staging_limit/2)/chunk_bytes_);
-        // Allocate before enqueueing so pinning cannot serialize this pipeline.
-        for (std::size_t slot=0;slot<2 && slot*batch<missing.size();++slot)
-            staging_[slot].reserve(std::min(batch,missing.size()-slot*batch)*chunk_bytes_);
-        // Growing the CUDA pool between copies can stall the submitting thread.
-        // Reserve this request's already-budgeted destinations before uploads.
-        std::vector<device::Storage> destinations;
-        destinations.reserve(missing.size());
-        for (std::size_t i=0;i<missing.size();++i)
-            destinations.push_back(device::allocate(chunk_bytes_,device_));
-        try {
-            for (std::size_t first=0;first<missing.size();first+=batch) {
-                auto& staging=staging_[(first/batch)%2];
-                device::check(cudaEventSynchronize(staging.done));
-                auto n=std::min(batch,missing.size()-first);
-                std::vector<Index> starts, sizes(n,Index(source_.chunks,source_.chunks+3));
-                std::vector<std::uint8_t*> outputs;
-                for (std::size_t i=0;i<n;++i) {
-                    auto idx=index(missing[first+i]); for (int a=0;a<3;++a) idx[a]*=source_.chunks[a];
-                    starts.push_back(std::move(idx)); outputs.push_back(staging.buffer.data()+i*chunk_bytes_);
+    void box(std::set<std::int64_t>& keys, const std::int64_t* start, const std::int64_t* size) const {
+        box(keys,start,size,[](const std::int64_t*) { return true; });
+    }
+    // Conservative separating-axis test between an affine crop's sample
+    // parallelepiped and the coordinates whose interpolation can read a brick.
+    // Any subset of axes is conservative; the margin dominates float32 rounding.
+    struct Footprint {
+        double axis[15][3], centre[15], radius[15], margin;
+        int count=0;
+        Footprint(const Grid& g) {
+            double p[3], e[3][3], scale=0;
+            for (int a=0;a<3;++a) {
+                p[a]=g.origin[a];
+                for (int k=0;k<3;++k) {
+                    e[k][a]=double(g.axes[3*a+k])*double(std::max<std::int64_t>(g.shape[k]-1,0))/2;
+                    p[a]+=e[k][a]; scale+=std::abs(e[k][a]);
                 }
-                array_.read_many(starts,sizes,outputs);
-                for (std::size_t i=0;i<n;++i) {
-                    auto data=std::move(destinations[first+i]);
-                    device::check(cudaMemcpyAsync(data->ptr,outputs[i],chunk_bytes_,cudaMemcpyHostToDevice,0));
-                    cache_.emplace(missing[first+i],Entry{std::move(data),++clock_}); ++uploads_; uploaded_+=chunk_bytes_;
-                }
-                device::check(cudaEventRecord(staging.done,0));
+                scale+=std::abs(p[a]);
             }
-            device::complete();
-        } catch (...) {
-            // A later CPU read/allocation can fail with earlier uploads in
-            // flight. Drain before staging can be reused or destroyed, and
-            // discard entries whose asynchronous transfer may have failed.
-            cudaStreamSynchronize(0);
-            cache_.clear();
-            throw;
+            margin=1e-3+1e-5*scale;
+            const auto push=[&](double x, double y, double z) {
+                const double n=std::sqrt(x*x+y*y+z*z);
+                if (!(n>1e-9)) return;
+                auto& l=axis[count]; l[0]=x/n; l[1]=y/n; l[2]=z/n;
+                centre[count]=l[0]*p[0]+l[1]*p[1]+l[2]*p[2]; radius[count]=0;
+                for (int k=0;k<3;++k) radius[count]+=std::abs(l[0]*e[k][0]+l[1]*e[k][1]+l[2]*e[k][2]);
+                ++count;
+            };
+            for (int a=0;a<3;++a) push(a==0,a==1,a==2);
+            for (int k=0;k<3;++k) {
+                const auto& u=e[k]; const auto& v=e[(k+1)%3];
+                push(u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0]);
+            }
+            for (int a=0;a<3;++a) for (int k=0;k<3;++k) {
+                const double u[3]{double(a==0),double(a==1),double(a==2)}; const auto& v=e[k];
+                push(u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0]);
+            }
+        }
+        // Local coordinates c can read voxel floor(c)+{0,1} (linear) or a rounded
+        // neighbour (nearest), so a brick [lo, lo+size) needs c in [lo-1, lo+size].
+        bool touches(const double* lo, const std::int64_t* size) const {
+            double q[3], h[3];
+            for (int a=0;a<3;++a) { q[a]=lo[a]+double(size[a]-1)/2; h[a]=double(size[a]+1)/2+margin; }
+            for (int i=0;i<count;++i) {
+                const auto& l=axis[i];
+                const double extent=radius[i]+h[0]*std::abs(l[0])+h[1]*std::abs(l[1])+h[2]*std::abs(l[2]);
+                if (std::abs(l[0]*q[0]+l[1]*q[1]+l[2]*q[2]-centre[i])>extent) return false;
+            }
+            return true;
+        }
+    };
+    const unsigned char* slot_pointer(std::uint32_t slot) const {
+        return static_cast<const unsigned char*>(segments_[slot/segment_slots_]->ptr)+std::size_t(slot%segment_slots_)*brick_bytes_;
+    }
+    std::uint32_t take_slot() {
+        if (free_.empty()) {
+            const auto n=std::min(segment_slots_,capacity_-slots_);
+            segments_.push_back(device::allocate(n*brick_bytes_,device_));
+            for (std::size_t i=n;i-->0;) free_.push_back(std::uint32_t(slots_+i));
+            slots_+=n;
+        }
+        const auto slot=free_.back(); free_.pop_back(); return slot;
+    }
+    void drop_all() {
+        cache_.clear(); lru_.clear(); free_.clear();
+        for (std::size_t i=slots_;i-->0;) free_.push_back(std::uint32_t(i));
+    }
+    struct Miss { std::int64_t key; std::uint32_t slot; };
+    // Uploads misses in order. Two bounded pinned buffers: CPU reading batch
+    // N+1 overlaps the default-stream upload and scatter of N; each slot's event
+    // prevents reusing its host/device staging early. Bricks are read
+    // contiguously, uploaded with one copy, then scattered into their slots.
+    // ready(n) runs once the first n misses are enqueued; work it enqueues on
+    // the default stream is ordered after their transfer.
+    template<class Ready> void upload(const std::vector<Miss>& missing, Ready&& ready) {
+        if (missing.empty()) return;
+        constexpr std::size_t staging_limit=64ull<<20;
+        const auto batch=std::max<std::size_t>(1,(staging_limit/2)/(brick_bytes_+sizeof(void*)));
+        const auto table=[&](std::size_t n) { return (n*brick_bytes_+15)/16*16; };
+        for (std::size_t slot=0;slot<2 && slot*batch<missing.size();++slot) {
+            const auto n=std::min(batch,missing.size()-slot*batch), bytes=table(n)+n*sizeof(void*);
+            staging_[slot].reserve(bytes);
+            if (!staging_[slot].device || staging_[slot].device->bytes<bytes) staging_[slot].device=device::allocate(bytes,device_);
+        }
+        for (std::size_t first=0;first<missing.size();first+=batch) {
+            auto& staging=staging_[(first/batch)%2];
+            device::check(cudaEventSynchronize(staging.done));
+            auto n=std::min(batch,missing.size()-first);
+            std::vector<Index> starts, sizes(n,Index(source_.brick,source_.brick+3));
+            std::vector<std::uint8_t*> outputs;
+            auto* targets=reinterpret_cast<const unsigned char**>(staging.buffer.data()+table(n));
+            for (std::size_t i=0;i<n;++i) {
+                auto idx=index(missing[first+i].key); for (int a=0;a<3;++a) idx[a]*=source_.brick[a];
+                starts.push_back(std::move(idx)); outputs.push_back(staging.buffer.data()+i*brick_bytes_);
+                targets[i]=slot_pointer(missing[first+i].slot);
+            }
+            array_.read_many(starts,sizes,outputs,nullptr,true);
+            auto* device=static_cast<unsigned char*>(staging.device->ptr);
+            device::check(cudaMemcpyAsync(device,staging.buffer.data(),table(n)+n*sizeof(void*),cudaMemcpyHostToDevice,0));
+            scatter(device,reinterpret_cast<void* const*>(device+table(n)),n,brick_bytes_);
+            device::check(cudaEventRecord(staging.done,0));
+            uploads_+=n; uploaded_+=n*brick_bytes_;
+            ready(first+n);
         }
     }
-    void prepare(const std::set<std::int64_t>& needed) {
+    // Refreshes a request's hits, evicts the oldest bricks outside it, and
+    // assigns slots to its misses, which are entered now and filled by
+    // upload(). Publishes the request's device lookup table.
+    std::vector<Miss> admit(const std::set<std::int64_t>& needed) {
         std::vector<std::int64_t> missing;
         for (auto key:needed) {
             auto it=cache_.find(key);
-            if (it==cache_.end()) missing.push_back(key); else { it->second.used=++clock_; ++hits_; }
+            if (it==cache_.end()) missing.push_back(key);
+            else { lru_.splice(lru_.end(),lru_,it->second.age); ++hits_; }
         }
-        // Evict only entries outside this request. Request size was checked first.
-        while ((cache_.size()+missing.size())*chunk_bytes_>budget_) {
-            auto victim=cache_.end();
-            for (auto it=cache_.begin();it!=cache_.end();++it)
-                if (!needed.count(it->first) && (victim==cache_.end() || it->second.used<victim->second.used)) victim=it;
-            if (victim==cache_.end()) throw std::runtime_error("CUDA cache budget exhausted");
-            cache_.erase(victim);
+        // Hits are now youngest: evict the oldest entries outside this request.
+        // Request size was checked first.
+        while (cache_.size()+missing.size()>capacity_) {
+            if (lru_.empty() || needed.count(lru_.front())) throw std::runtime_error("CUDA cache budget exhausted");
+            auto victim=cache_.find(lru_.front());
+            free_.push_back(victim->second.slot); cache_.erase(victim); lru_.pop_front();
         }
-        upload_missing(missing);
+        std::vector<Miss> misses;
+        misses.reserve(missing.size());
+        for (auto key:missing) {
+            const auto slot=take_slot();
+            lru_.push_back(key); cache_.emplace(key,Entry{slot,std::prev(lru_.end())});
+            misses.push_back({key,slot});
+        }
         std::size_t capacity=1; while (capacity<needed.size()*2) capacity*=2;
-        std::vector<std::int64_t> keys(capacity,-1);
-        std::vector<const unsigned char*> pointers(capacity,nullptr);
+        const auto bytes=capacity*(sizeof(std::int64_t)+sizeof(void*));
+        table_host_.reserve(bytes); reserve(table_,bytes);
+        auto* keys=reinterpret_cast<std::int64_t*>(table_host_.data());
+        auto* pointers=reinterpret_cast<const unsigned char**>(keys+capacity);
+        std::fill_n(keys,capacity,-1);
         for (auto key:needed) {
             auto slot=(std::uint64_t(key)*UINT64_C(0x9e3779b97f4a7c15))&(capacity-1);
             while (keys[slot]>=0) slot=(slot+1)&(capacity-1);
-            keys[slot]=key; pointers[slot]=static_cast<const unsigned char*>(cache_.at(key).data->ptr);
+            keys[slot]=key; pointers[slot]=slot_pointer(cache_.at(key).slot);
         }
-        reserve(keys_,capacity*sizeof(std::int64_t)); reserve(pointers_,capacity*sizeof(void*));
-        device::check(cudaMemcpy(keys_->ptr,keys.data(),keys.size()*sizeof(std::int64_t),cudaMemcpyHostToDevice));
-        device::check(cudaMemcpy(pointers_->ptr,pointers.data(),pointers.size()*sizeof(void*),cudaMemcpyHostToDevice));
-        source_.mask=capacity-1; source_.keys=static_cast<const std::int64_t*>(keys_->ptr);
-        source_.pointers=static_cast<const unsigned char* const*>(pointers_->ptr);
+        // The previous request completed before returning, so the pinned table is free.
+        device::check(cudaMemcpyAsync(table_->ptr,table_host_.data(),bytes,cudaMemcpyHostToDevice,0));
+        source_.mask=capacity-1; source_.keys=static_cast<const std::int64_t*>(table_->ptr);
+        source_.pointers=reinterpret_cast<const unsigned char* const*>(source_.keys+capacity);
+        return misses;
+    }
+    // Runs device work through the final synchronization. A failure, including
+    // an asynchronous one, may leave admitted bricks unfilled: drain and drop them.
+    template<class Work> void guarded(Work&& work) {
+        try {
+            work();
+            device::complete();
+        } catch (...) {
+            cudaStreamSynchronize(0);
+            drop_all();
+            throw;
+        }
     }
     bool route_cpu(const std::set<std::int64_t>& needed, std::size_t count, int kind, const std::string& route) {
         if (route!="auto" && route!="chunks" && route!="cpu") throw std::invalid_argument("source must be auto, chunks or cpu");
-        const bool fits=needed.size()<=budget_/chunk_bytes_;
+        const bool fits=needed.size()<=capacity_;
         if (route=="chunks" && !fits) throw std::invalid_argument("request exceeds CUDA chunk-cache budget; increase cache_bytes or use source='auto'");
         std::size_t missing=0; for (auto key:needed) missing+=!cache_.count(key);
-        return route=="cpu" || !fits || (route=="auto" && kind==0 && missing>count/chunk_bytes_);
+        return route=="cpu" || !fits || (route=="auto" && kind==0 && missing>count/brick_bytes_);
     }
     Result output(std::size_t n, bool floating) { return {device::allocate(n*(floating ? 4 : 1),device_),n,floating}; }
 public:
@@ -167,23 +265,33 @@ public:
         std::int64_t total=1;
         for (int a=0;a<3;++a) {
             if (spec.shape[a]>(1LL<<30) || spec.chunks[a]>(1LL<<30)) throw std::invalid_argument("CUDA reader dimensions must be at most 2**30");
-            source_.shape[a]=spec.shape[a]; source_.chunks[a]=spec.chunks[a];
-            source_.grid[a]=(spec.shape[a]+spec.chunks[a]-1)/spec.chunks[a];
+            auto brick=spec.chunks[a];
+            while (brick>kBrick && brick%2==0) brick/=2;
+            source_.shape[a]=spec.shape[a]; source_.brick[a]=brick;
+            source_.shift[a]=std::has_single_bit(std::uint64_t(brick)) ? std::countr_zero(std::uint64_t(brick)) : -1;
+            source_.grid[a]=(spec.shape[a]+brick-1)/brick;
             if (source_.grid[a] && total>INT64_MAX/source_.grid[a]) throw std::invalid_argument("chunk grid overflow");
             total*=source_.grid[a];
-            if (chunk_bytes_>SIZE_MAX/std::size_t(spec.chunks[a])) throw std::invalid_argument("chunk size overflow");
-            chunk_bytes_*=spec.chunks[a];
+            if (brick_bytes_>SIZE_MAX/std::size_t(brick)) throw std::invalid_argument("chunk size overflow");
+            brick_bytes_*=brick;
         }
         source_.fill=spec.fill[0];
+        capacity_=std::min<std::size_t>(budget_/brick_bytes_,UINT32_MAX);
+        segment_slots_=std::max<std::size_t>(1,(256ull<<20)/brick_bytes_);
     }
     int device_id() const { return device_; }
-    void clear() { ready(); std::lock_guard lock(mutex_); device::Guard guard(device_); cache_.clear(); device::complete(); }
-    std::vector<std::uint64_t> stats() { ready(); std::lock_guard lock(mutex_); return {cache_.size()*chunk_bytes_,budget_,hits_,uploads_,uploaded_,cpu_routes_,gpu_routes_}; }
+    void clear() {
+        ready(); std::lock_guard lock(mutex_); device::Guard guard(device_);
+        cache_.clear(); lru_.clear(); free_.clear(); segments_.clear(); slots_=0; device::complete();
+    }
+    std::vector<std::uint64_t> stats() { ready(); std::lock_guard lock(mutex_); return {cache_.size()*brick_bytes_,budget_,hits_,uploads_,uploaded_,cpu_routes_,gpu_routes_}; }
     Result grids(std::vector<Grid> grids, int kind, int order, bool floating, const std::string& route) {
         ready(); std::lock_guard lock(mutex_); device::Guard guard(device_);
         if (grids.size()>65535 || (kind!=0 && kind!=1) || (order!=0 && order!=1) || (kind==1 && order==1 && !floating)) throw std::invalid_argument("invalid CUDA grid request");
         std::set<std::int64_t> needed;
-        std::size_t total=0,largest=0;
+        std::vector<std::vector<std::int64_t>> footprints(grids.size());
+        std::vector<std::pair<std::array<std::int64_t,3>,std::array<std::int64_t,3>>> bounds(grids.size());
+        std::size_t total=0;
         for (auto& g:grids) {
             g.count=1; g.offset=total;
             for (int a=0;a<3;++a) {
@@ -195,12 +303,13 @@ public:
             }
             for (float value:g.axes) if (!std::isfinite(value)) throw std::invalid_argument("nonfinite axes");
             if (g.count>SIZE_MAX/4-total) throw std::invalid_argument("batch size overflow");
-            total+=g.count; largest=std::max(largest,g.count);
+            total+=g.count;
             if (!g.count) continue;
-            if (kind==0) box(needed,g.base,g.shape);
+            auto& [lo,size]=bounds[&g-grids.data()];
+            if (kind==0) { std::copy_n(g.base,3,lo.begin()); std::copy_n(g.shape,3,size.begin()); }
             else {
                 // Corner bounds in the same float32 evaluation order as sampling.
-                std::int64_t lo[3],hi[3];
+                std::int64_t hi[3];
                 for (int a=0;a<3;++a) { lo[a]=source_.shape[a]; hi[a]=-1; }
                 for (unsigned corner=0;corner<8;++corner) for (int a=0;a<3;++a) {
                     float c=g.origin[a]; for (int b=0;b<3;++b) c=sampling::step(c,g.axes[3*a+b],float((corner>>b&1) ? g.shape[b]-1 : 0));
@@ -212,9 +321,29 @@ public:
                     lo[a]=std::min(lo[a],std::max<std::int64_t>(0,at));
                     hi[a]=std::max(hi[a],std::min(source_.shape[a],at+1+(order && bounded!=low)));
                 }
-                std::int64_t size[3]; for (int a=0;a<3;++a) size[a]=std::max<std::int64_t>(0,hi[a]-lo[a]);
-                box(needed,lo,size);
+                for (int a=0;a<3;++a) size[a]=std::max<std::int64_t>(0,hi[a]-lo[a]);
             }
+        }
+        // Brick footprints are independent per crop; enumerate them in parallel.
+        array_.parallel_for(grids.size(),[&](std::size_t j) {
+            const auto& g=grids[j]; const auto& [lo,size]=bounds[j];
+            if (!g.count) return;
+            std::set<std::int64_t> keys;
+            if (kind==0) box(keys,lo.data(),size.data());
+            else {
+                const Footprint footprint(g);
+                box(keys,lo.data(),size.data(),[&](const std::int64_t* at) {
+                    const double local[3]{double(at[0]-g.base[0]),double(at[1]-g.base[1]),double(at[2]-g.base[2])};
+                    return footprint.touches(local,source_.brick);
+                });
+            }
+            footprints[j].assign(keys.begin(),keys.end());
+        });
+        {
+            std::vector<std::int64_t> all;
+            for (const auto& f:footprints) all.insert(all.end(),f.begin(),f.end());
+            std::sort(all.begin(),all.end()); all.erase(std::unique(all.begin(),all.end()),all.end());
+            needed.insert(all.begin(),all.end());
         }
         auto result=output(total,floating);
         if (!total) return result;
@@ -233,9 +362,36 @@ public:
                 reserve(requests_,total); device::check(cudaMemcpy(requests_->ptr,host.data(),total,cudaMemcpyHostToDevice)); cast(requests_->ptr,result.storage->ptr,total,1,4);
             } else device::check(cudaMemcpy(result.storage->ptr,host.data(),host.size(),cudaMemcpyHostToDevice));
         } else {
-            ++gpu_routes_; prepare(needed); reserve(requests_,grids.size()*sizeof(Grid));
-            device::check(cudaMemcpy(requests_->ptr,grids.data(),grids.size()*sizeof(Grid),cudaMemcpyHostToDevice));
-            launch(source_,static_cast<const Grid*>(requests_->ptr),grids.size(),largest,nullptr,0,total,nullptr,kind,order,floating,result.storage->ptr);
+            ++gpu_routes_;
+            guarded([&] {
+                auto missing=admit(needed);
+                // Upload misses in order of the first crop needing them; each
+                // crop samples as soon as its bricks' transfers are enqueued.
+                std::unordered_map<std::int64_t,std::size_t> position;
+                for (std::size_t i=0;i<missing.size();++i) position.emplace(missing[i].key,i);
+                std::vector<Miss> ordered; ordered.reserve(missing.size());
+                std::vector<std::size_t> after(grids.size());
+                for (std::size_t j=0;j<grids.size();++j) {
+                    for (auto key:footprints[j]) {
+                        auto it=position.find(key);
+                        if (it!=position.end()) { ordered.push_back(missing[it->second]); position.erase(it); }
+                    }
+                    after[j]=ordered.size();
+                }
+                reserve(requests_,grids.size()*sizeof(Grid));
+                device::check(cudaMemcpy(requests_->ptr,grids.data(),grids.size()*sizeof(Grid),cudaMemcpyHostToDevice));
+                const auto* device_grids=static_cast<const Grid*>(requests_->ptr);
+                std::size_t launched=0;
+                const auto sample=[&](std::size_t uploaded) {
+                    std::size_t end=launched, widest=0;
+                    for (;end<grids.size() && after[end]<=uploaded;++end) widest=std::max(widest,grids[end].count);
+                    if (widest) launch(source_,device_grids+launched,end-launched,widest,nullptr,0,total,nullptr,kind,order,floating,result.storage->ptr);
+                    launched=end;
+                };
+                sample(0);
+                upload(ordered,sample);
+            });
+            return result;
         }
         device::complete(); return result;
     }
@@ -273,7 +429,7 @@ private:
                 }
                 if (outside) continue;
                 bool whole=true;
-                for (int a=0;a<3;++a) whole &= at[a]>=0 && at[a]+1<source_.shape[a] && at[a]%source_.chunks[a]+1<source_.chunks[a];
+                for (int a=0;a<3;++a) whole &= at[a]>=0 && at[a]+1<source_.shape[a] && at[a]%source_.brick[a]+1<source_.brick[a];
                 if (!order || whole) add(keys,at);
                 else for (unsigned corner=0;corner<8;++corner) {
                     std::int64_t v[3]; for (int a=0;a<3;++a) v[a]=at[a]+((corner>>a&1) && frac[a]!=0);
@@ -302,13 +458,17 @@ private:
             }
             device::check(cudaMemcpy(result.storage->ptr,host.data(),host.size(),cudaMemcpyHostToDevice));
         } else {
-            ++gpu_routes_; prepare(needed);
-            if (!resident) {
-                const auto bytes=count*3*(bits/8); reserve(requests_,bytes);
-                device::check(cudaMemcpy(requests_->ptr,points,bytes,cudaMemcpyHostToDevice));
-                resident=requests_->ptr;
-            }
-            launch(source_,nullptr,0,0,resident,bits,count,base.data(),kind,order,floating,result.storage->ptr);
+            ++gpu_routes_;
+            guarded([&] {
+                upload(admit(needed),[](std::size_t) {});
+                if (!resident) {
+                    const auto bytes=count*3*(bits/8); reserve(requests_,bytes);
+                    device::check(cudaMemcpy(requests_->ptr,points,bytes,cudaMemcpyHostToDevice));
+                    resident=requests_->ptr;
+                }
+                launch(source_,nullptr,0,0,resident,bits,count,base.data(),kind,order,floating,result.storage->ptr);
+            });
+            return result;
         }
         device::complete(); return result;
     }

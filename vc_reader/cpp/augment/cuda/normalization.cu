@@ -15,18 +15,40 @@ template<class T, int Phase> __global__ void collect_normalization(
     if constexpr (Phase != 0) if (params->constant) return;
     __shared__ Partial values[256];
     Partial p{0,0,INFINITY,-INFINITY};
-    EACH_INDEX(input.size) {
-        const double x = input.ptr[i];
-        if (mask_zero && x == 0) continue;
-        if constexpr (Phase == 0) {
+    if constexpr (Phase == 0) if (mask_zero) {
+        // Bounds and count do not depend on order and are exact in T. With
+        // zeros excluded, min/max never compare signed zeros. No float64 work.
+        T low = INFINITY, high = -INFINITY; unsigned long long count = 0;
+        EACH_INDEX(input.size) {
+            const T x = input.ptr[i];
+            if (x == T(0)) continue;
             if (!isfinite(x)) { atomicExch(invalid,1); continue; }
-            p.low = fmin(p.low,x); p.high = fmax(p.high,x); p.weight += 1;
-        } else {
-            const double scaled = params->scale == 1 ? x : x/params->scale;
-            if constexpr (Phase == 1) p.sum += scaled;
-            else { const double d = scaled-params->center; p.sum += d*d; }
+            low = x < low ? x : low; high = x > high ? x : high; ++count;
         }
+        p.low = low; p.high = high; p.weight = double(count);
+        values[threadIdx.x] = p; reduce(values);
+        if (!threadIdx.x) output[blockIdx.x] = values[0];
+        return;
     }
+    const double scale = Phase == 0 ? 1. : params->scale, center = Phase == 2 ? params->center : 0.;
+    // The loop is versioned on the uniform scale test: an in-loop division
+    // branch defeats unrolling. Each element's arithmetic and order are unchanged.
+    const auto each = [&](auto unscaled) {
+        EACH_INDEX(input.size) {
+            // Exact: a T value is zero exactly when its float64 conversion is.
+            if (mask_zero && input.ptr[i] == T(0)) continue;
+            const double x = to_double(input.ptr[i]);
+            if constexpr (Phase == 0) {
+                if (!isfinite(x)) { atomicExch(invalid,1); continue; }
+                p.low = fmin(p.low,x); p.high = fmax(p.high,x); p.weight += 1;
+            } else {
+                const double scaled = decltype(unscaled)::value ? x : x/scale;
+                if constexpr (Phase == 1) p.sum += scaled;
+                else { const double d = scaled-center; p.sum += d*d; }
+            }
+        }
+    };
+    if (scale == 1) each(std::true_type{}); else each(std::false_type{});
     values[threadIdx.x] = p; reduce(values);
     if (!threadIdx.x) output[blockIdx.x] = values[0];
 }
@@ -58,13 +80,42 @@ template<int Phase> __global__ void finish_normalization(
     }
 }
 
+// RN32(s/d) for float32 output without a per-element float64 division. With
+// y = RN64(1/d), one correction q1 = RN64(q0 + RN64(s - q0*d)*y), q0 = RN64(s*y),
+// is within one float64 ulp of RN64(s/d). Both round to the same float32 unless a
+// float32 rounding midpoint lies within one ulp of q1 or q1 is outside the
+// normal float32 range; those cases divide exactly.
+// Out of line: an inlined division in the per-element loop slows the common path.
+__device__ __noinline__ float divide_exactly(double s, double d) { return float(s/d); }
+__device__ inline float divide_to_float(double s, double d, double y) {
+    const double q0 = s*y, q1 = fma(fma(-q0,d,s),y,q0);
+    const auto bits = static_cast<unsigned long long>(__double_as_longlong(q1));
+    const auto magnitude = bits & 0x7fffffffffffffffull;
+    // Midpoints have low 29 significand bits equal to 2**28; [2**-125, 2**127).
+    const bool safe = magnitude >= 0x3820000000000000ull && magnitude < 0x47e0000000000000ull &&
+                      (unsigned(bits) & 0x1fffffffu) - ((1u << 28) - 1) > 2u;
+    if (safe) return narrow(q1);
+    return divide_exactly(s,d);
+}
+
 template<class T> __global__ void normalize_values(View<T> data, const ParametersGPU* params, bool mask_zero) {
+    const ParametersGPU q = *params;
+    const bool zero = q.constant || q.divisor == 0;
+    if constexpr (std::is_same_v<T,float>) if (!zero && q.scale == 1) {
+        const double y = 1/q.divisor;
+        EACH_INDEX(data.size) {
+            const T raw = data.ptr[i];
+            data.ptr[i] = mask_zero && raw == T(0) ? T{0} : divide_to_float(widen(raw)-q.center,q.divisor,y);
+        }
+        return;
+    }
     EACH_INDEX(data.size) {
-        const double x = data.ptr[i];
-        if (params->constant || params->divisor == 0 || (mask_zero && x == 0)) data.ptr[i] = T{0};
+        const T raw = data.ptr[i];
+        if (zero || (mask_zero && raw == T(0))) data.ptr[i] = T{0};
         else {
-            const double scaled = params->scale == 1 ? x : x/params->scale;
-            data.ptr[i] = T((scaled-params->center)/params->divisor);
+            const double x = to_double(raw);
+            const double scaled = q.scale == 1 ? x : x/q.scale;
+            data.ptr[i] = from_double<T>((scaled-q.center)/q.divisor);
         }
     }
 }

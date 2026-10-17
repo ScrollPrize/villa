@@ -273,3 +273,48 @@ def test_upload_staging_reuse_and_read_failure(tmp_path, read_mode):
             assert gpu.stats['chunk_uploads'] == before
         gpu.clear_cache()
     np.testing.assert_array_equal(output.numpy(), expected)
+
+
+@pytest.fixture
+def bricked(tmp_path):
+    # 64**3 chunks hold 2**3 resident 32**3 bricks; one chunk is missing (fill).
+    shape, chunks = (150, 140, 130), (64, 64, 64)
+    (tmp_path / '.zarray').write_text(json.dumps(dict(zarr_format=2, shape=shape, chunks=chunks, dtype='|u1',
+        compressor=None, fill_value=37, order='C', filters=None)))
+    rng = np.random.default_rng(41)
+    for idx in np.ndindex(3, 3, 3):
+        if idx != (1, 0, 1):
+            (tmp_path / '.'.join(map(str, idx))).write_bytes(rng.integers(0, 256, chunks, dtype=np.uint8).tobytes())
+    with ZarrReader.open(tmp_path, threads=3, memory_cache=0) as r:
+        yield r
+
+
+def _rotation(seed):
+    q = np.random.default_rng(seed).normal(size=4); q /= np.linalg.norm(q)
+    w, x, y, z = q
+    return np.array([[1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w)],
+                     [2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w)],
+                     [2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)]])
+
+
+@pytest.mark.parametrize('order', [0, 1])
+def test_bricked_affine_footprints(bricked, order):
+    # Oblique crops cross brick, chunk and volume edges and the missing chunk.
+    # Sub-chunk residency must read exactly what the CPU reader reads.
+    grids = [((24, 20, 28), np.array([20.3, 30.7, 40.1]) + 40 * (k % 3), _rotation(k) * (0.6 + 0.2 * (k % 4)))
+             for k in range(12)]
+    grids += [((16, 16, 16), (-6.5, 131.25, 120.75), _rotation(99)), ((8, 9, 10), (140.5, -3.25, 2.5), np.eye(3))]
+    expected = bricked.read_affine_many(grids, order=order)
+    with bricked.cuda(cache_bytes=4 << 20) as gpu:
+        for _ in range(2):  # second pass reuses resident bricks and evicts under the small budget
+            for out, ref in zip(gpu.read_affine_many(grids, order=order, source='chunks'), expected):
+                if order:
+                    np.testing.assert_allclose(out.numpy(), ref, atol=5e-5, rtol=1e-6)
+                else:
+                    np.testing.assert_array_equal(out.numpy(), ref)
+        gpu.clear_cache()
+        before = gpu.stats['uploaded_bytes']
+        small = ((4, 4, 4), (70.25, 70.5, 70.75), np.eye(3))
+        np.testing.assert_allclose(gpu.read_affine(*small, source='chunks').numpy(), bricked.read_affine(*small), atol=5e-5, rtol=1e-6)
+        # A small interior crop needs one 32**3 brick, not its whole 64**3 chunk.
+        assert gpu.stats['uploaded_bytes'] - before == 32 ** 3

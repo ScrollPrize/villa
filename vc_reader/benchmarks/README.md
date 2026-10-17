@@ -22,6 +22,23 @@ commands](../docs/cuda_reader.md#upload-performance) for the pageable, pinned an
 asynchronous comparisons. Pinning and filesystem pages are warmed; this is not
 a cold-storage benchmark.
 
+## CUDA reads on trainer geometry: `bench_cuda_strip_reads.py`
+
+Replays the sheet-strip trainer's oblique crops (32 per batch) through
+`CudaReader.read_affine_many` only, clearing the GPU cache before each batch, and
+hashes every output. `export` converts a `bench_fiber_strip.py capture` file into
+plain grids and needs the trainer environment; `run` needs only vc_reader. Run
+both through `run_native.py`; `--compare` fails unless output hashes match another
+build's report. Results are in the [CUDA reader guide](../docs/cuda_reader.md#brick-residency-and-resident-pipeline-performance).
+
+```bash
+python benchmarks/run_native.py <build>/_native*.so benchmarks/run_native.py <build>/_augment*.so \
+  benchmarks/bench_cuda_strip_reads.py export --capture /tmp/fiber-strip-capture.pt --output /tmp/strip-grids.npz
+python benchmarks/run_native.py <build>/_native*.so \
+  benchmarks/bench_cuda_strip_reads.py run --grids /tmp/strip-grids.npz --reps 5 \
+  [--compare other-build.json] --output /tmp/strip-reads.json
+```
+
 ## Augmentation correctness: `validate_augment.py`
 
 This checks a local Zarr crop through the reader and native augmentation, with
