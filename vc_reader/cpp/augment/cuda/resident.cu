@@ -7,11 +7,27 @@ Session::Session(const Sample& s) {
         device.buffer->upload(static_cast<const std::byte*>(f.array.data()));
     }
 }
-void Session::finish(Sample& s) {
+void Session::check_status() {
     if (nonfinite) {
         int invalid = 0; nonfinite->download(&invalid);
         require(!invalid,"normalization requires finite crop values");
     }
+    if (geometry) {
+        int flags = 0; geometry->download(&flags);
+        require(!(flags&2),"point outside output");
+        require(!(flags&1),"deformation inverse failed to converge for a point; reduce deformation strength");
+        require(!(flags&4),"singular spatial transform");
+    }
+}
+int* Session::geometry_status() {
+    if (!geometry) {
+        geometry = std::make_unique<Buffer<int>>(1);
+        check(cudaMemsetAsync(geometry->ptr,0,sizeof(int)));
+    }
+    return geometry->ptr;
+}
+void Session::finish(Sample& s) {
+    check_status();
     for (auto& [key,device] : arrays) {
         auto host = Array::uninitialized(device.shape,device.kind,device.bytes);
         device.buffer->download(static_cast<std::byte*>(host.data()));
@@ -59,8 +75,6 @@ std::shared_ptr<void> begin_device(const std::map<std::string,DeviceInput>& inpu
     Buffer<int> invalid(1); int flags=0; check(cudaMemsetAsync(invalid.ptr,0,sizeof(int)));
     for (const auto& [key,in]:inputs) {
         auto& f=sample.at(key);
-        require(!sparse(f.target.role) && !directional(f.target.role) && f.target.role!=Role::CoordinateField,
-                "device augmentation supports image, scalar, label and validity-mask targets");
         DeviceArray array(in.shape,in.kind,in.bytes,in.data);
         array.typed([&](auto view) { if (view.size) validate_device_values<<<blocks(view.size),256>>>(view,f.target.role==Role::Valid,invalid.ptr); });
         check(cudaGetLastError());
@@ -85,11 +99,7 @@ std::map<std::string,DeviceInput> device_outputs(void* context) {
     return out;
 }
 void finish_device(void* context) {
-    auto& session=*static_cast<Session*>(context);
-    if (session.nonfinite) {
-        int invalid=0; session.nonfinite->download(&invalid);
-        require(!invalid,"normalization requires finite crop values");
-    }
+    static_cast<Session*>(context)->check_status();
     check(cudaStreamSynchronize(0));
 }
 }

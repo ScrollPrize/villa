@@ -469,9 +469,10 @@ output = pipeline({"image": image, "mask": labels}, seed=123)
   median quantization, and integer-label validation can read small control
   values back; they do not download images. Calling `pipeline.sample()` also
   downloads sampled dense fields so replay plans remain serializable.
-  Sparse points, directional fields, and local coordinate fields retain their
-  existing CPU geometry handling; those specialized targets transfer around
-  spatial operations. Images and labels still stay on the GPU.
+  Dense vector, normal and local coordinate fields are mapped on the GPU with
+  the CPU's Jacobian/inverse rules (central differences of the displacement,
+  Newton inversion for coordinates). Sparse points and vectors supplied as host
+  arrays keep the CPU geometry; supplied as device arrays they stay resident.
 - Seeds, probabilities, channel selection, target routing, interpolation rules,
   float32/float64 precision, integer label IDs, and replay are preserved.
   Replay is exact within the same build/backend/device. CUDA transcendental

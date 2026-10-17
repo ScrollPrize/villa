@@ -39,6 +39,7 @@ if(VC_READER_ENABLE_CUDA)
         cpp/augment/cuda/brightness_gradient.cu
         cpp/augment/cuda/brightness_multiply.cu
         cpp/augment/cuda/contrast.cu
+        cpp/augment/cuda/directional.cu
         cpp/augment/cuda/elastic.cu
         cpp/augment/cuda/flip.cu
         cpp/augment/cuda/gamma.cu

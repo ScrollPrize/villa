@@ -156,9 +156,12 @@ mask dtypes are preserved, and metadata passes through. Use `.astype(np.float32)
 for raw uint8 reader output before normalization. Inputs are preserved by default
 using a device copy; `inplace=True` permits modification and avoids that copy.
 Always use returned arrays, since spatial operations can replace storage.
-Replay/plan recording also accepts device samples. Sparse/directional/local
-coordinate targets retain the existing host API and are rejected by the resident
-API, which prevents hidden full-image downloads.
+Replay/plan recording also accepts device samples. Every target role is
+accepted, including `Points`/`Vectors` `(N, D)` arrays and vector, normal and
+coordinate fields, which Flip, Rotate90, Transpose and Elastic map on device.
+Point/inversion failures (`outside="error"`, nonconverging inverses, singular
+Jacobians) are flagged on device and raised when the call finishes. Points with
+`outside="drop"` read back one kept-row count to size their output.
 
 Calls use the selected device's default stream and **complete before returning**.
 There is no arbitrary producer-stream/asynchronous-call API in this version.

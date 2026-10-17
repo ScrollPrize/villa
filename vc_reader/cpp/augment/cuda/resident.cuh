@@ -50,8 +50,11 @@ struct DeviceArray {
 };
 struct Session {
     std::map<std::string,DeviceArray> arrays;
-    std::unique_ptr<Buffer<int>> nonfinite;
+    std::unique_ptr<Buffer<int>> nonfinite, geometry;
     int* finite_status();
+    // Deferred directional/point failures, checked when the pipeline finishes.
+    int* geometry_status();
+    void check_status();
     Session() = default;
     explicit Session(const Sample&);
     void finish(Sample&);

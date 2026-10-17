@@ -157,7 +157,10 @@ def test_2d_geometry_and_targets(op):
     targets = dict(image=A.Image(fill=-1), mask=A.Label(ignore_value=-2), padding_mask=A.ValidMask(),
                    points=A.Points(order="yx"),normals=A.NormalField(components="yx"),
                    coords=A.CoordinateField(components="yx",frame="local"))
-    verify([op],sample,targets)
+    host = verify([op],sample,targets)
+    from vc_reader.cuda import asarray
+    device = A.Pipeline([op],targets=targets,backend="cuda")({k: asarray(v) for k, v in sample.items()},seed=123)
+    compare({k: v.numpy() for k, v in device.items()},host)
 
 
 @gpu
@@ -242,3 +245,64 @@ def test_cuda_normalization_matches_float64_formula():
         pipe = A.Pipeline([A.Normalize(mode)], targets={"image": A.Image()}, compact=False, backend="cuda")
         out = pipe({"image": asarray(x)}, seed=0)["image"].numpy()
         np.testing.assert_array_equal(out.view(np.uint32), expected.view(np.uint32))
+
+
+def _directional_sample(rng, shape=(6, 7, 8)):
+    image = rng.normal(size=(1, *shape)).astype(np.float32)
+    vectors = rng.normal(size=(3, *shape))
+    return dict(
+        image=image, mask=(image > 0).astype(np.uint8),
+        points=np.array([[1., 2., 3.], [4.5, 5.25, .5], [0., 0., 0.], [5., 6., 7.]]),
+        directions=np.array([[1., 0., 0.], [.2, -.4, .9]]),
+        flow=vectors, normals=vectors / np.linalg.norm(vectors, axis=0),
+        coords=np.indices(shape).astype(np.float64))
+
+
+DIRECTIONAL_TARGETS = dict(
+    image=A.Image(), mask=A.Label(), points=A.Points(order="xyz"),
+    directions=A.Vectors(components="zyx", normalize=True), flow=A.VectorField(components="yxz"),
+    normals=A.NormalField(), coords=A.CoordinateField(frame="local"))
+
+
+@gpu
+@pytest.mark.parametrize("op", [A.Flip(), A.Rotate90(), A.Transpose(), A.Elastic(2, .8), A.Elastic(2, .8, border=True)])
+@pytest.mark.parametrize("seed", [0, 7])
+def test_resident_directional_and_sparse_targets(op, seed):
+    from vc_reader.cuda import asarray
+    sample = _directional_sample(np.random.default_rng(seed))
+    if repr(op).startswith("Elastic"):
+        sample.pop("directions")  # sparse vectors have no location for a nonlinear map
+    targets = {k: v for k, v in DIRECTIONAL_TARGETS.items() if k in sample}
+    host = verify([op], sample, targets, seed=seed)
+    pipeline = A.Pipeline([op], targets=targets, backend="cuda")
+    device = pipeline({k: asarray(v) for k, v in sample.items()}, seed=seed)
+    compare({k: v.numpy() for k, v in device.items()}, host)
+
+
+@gpu
+def test_resident_points_outside_modes():
+    from vc_reader.cuda import asarray
+    image = np.zeros((1, 4, 5, 6), np.float32)
+    points = np.array([[0., 0., 0.], [3., 4., 5.], [3.5, 4., 5.], [-.5, 1., 1.]])
+    for outside, expected_rows in (("keep", 4), ("drop", 2)):
+        targets = dict(image=A.Image(), points=A.Points(outside=outside))
+        pipeline = A.Pipeline([A.Flip(axes="z", p_axis=1)], targets=targets, backend="cuda")
+        cpu = A.Pipeline([A.Flip(axes="z", p_axis=1)], targets=targets)
+        out = pipeline(dict(image=asarray(image), points=asarray(points)), seed=0)["points"]
+        ref = cpu(dict(image=image, points=points), seed=0)["points"]
+        assert out.shape == (expected_rows, 3)
+        np.testing.assert_array_equal(out.numpy(), ref)
+    targets = dict(image=A.Image(), points=A.Points(outside="error"))
+    pipeline = A.Pipeline([A.Flip(axes="z", p_axis=1)], targets=targets, backend="cuda")
+    with pytest.raises(ValueError, match="outside"):
+        pipeline(dict(image=asarray(image), points=asarray(points)), seed=0)
+
+
+@gpu
+def test_resident_sparse_vectors_reject_nonlinear():
+    from vc_reader.cuda import asarray
+    image = np.zeros((1, 6, 6, 6), np.float32)
+    targets = dict(image=A.Image(), directions=A.Vectors())
+    pipeline = A.Pipeline([A.Elastic(2, 1)], targets=targets, backend="cuda")
+    with pytest.raises(ValueError, match="locations"):
+        pipeline(dict(image=asarray(image), directions=asarray(np.ones((2, 3)))), seed=0)

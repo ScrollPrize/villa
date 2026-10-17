@@ -77,19 +77,20 @@ DeviceArray resize_cuda(const DeviceArray& src, const Shape& shape, bool nearest
 }
 void geometry_cuda(Sample& s, const Parameters& p, Session& session) {
     auto field = field_buffer(p.field,p.device_field);
+    const double* displacement = p.field.empty() && !p.device_field ? nullptr : field->ptr;
     Sample specialized;
     for (auto& [key,f] : s) {
         auto role = f.target.role;
-        // Sparse points and covariant vectors keep the established CPU math.
-        // Only these specialized targets transfer; images/labels stay resident.
-        if (sparse(role)) { specialized.emplace(key,f); continue; }
-        auto& a = session.arrays.at(key);
-        if (directional(role) || (role == Role::CoordinateField && !f.target.external)) {
-            auto host = Array::uninitialized(a.shape,a.kind,a.bytes);
-            a.buffer->download(static_cast<std::byte*>(host.data()));
-            specialized.emplace(key,Field{std::move(host),f.target,f.source}); continue;
+        if (sparse(role)) {
+            // Host-supplied points keep the CPU math; resident ones stay on device.
+            if (!session.arrays.count(key)) { specialized.emplace(key,f); continue; }
+            auto& a = session.arrays.at(key);
+            sparse_cuda(a,f.target,p,displacement,session); f.array.shape = a.shape; continue;
         }
+        auto& a = session.arrays.at(key);
         a = resample_cuda(a,p,role == Role::Label || (p.exact && role != Role::Valid),f.target.fill,role == Role::Valid,field->ptr);
+        if (directional(role) || (role == Role::CoordinateField && !f.target.external))
+            directional_cuda(a,f.target,p,displacement,session);
         f.array.shape = a.shape;
     }
     if (!specialized.empty()) {
