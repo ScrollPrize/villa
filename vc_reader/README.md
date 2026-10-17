@@ -18,6 +18,10 @@ without an intermediate image download. See the [CUDA reader guide](docs/cuda_re
 for the API, routing, float32 precision contract, DLPack ownership, build commands
 and validation. CPU-only builds remain the default.
 
+The [Paris4 sheet-strip benchmark](benchmarks/fiber_strip_results.md) compares
+the existing training data pipeline with CPU and CUDA reader/augmentation paths,
+including the trainer's 14-worker loader and reproducible commands.
+
 ## Usage
 
 ```python
