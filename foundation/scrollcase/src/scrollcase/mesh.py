@@ -161,6 +161,29 @@ class ScrollMesh:
         cylinder_axis: Cylinder axis direction in input mesh coordinates, e.g. along
         the umbilicus. Defaults to None, which fits the axis giving the smallest
         enclosing cylinder.
+        parting_z_margin_mm: How far beyond the lining, along the axis, the parting
+        surface between the halves may leave the S-shaped divider; no more than the
+        case's upper and lower margins, where the caps (split on the divider) begin.
+        Defaults to 2.5.
+        parting_min_fill_fraction: Bend the parting surface through the scroll only
+        where parting on the S-shaped divider would leave room around the scroll
+        (split_fill_and_depth's fill) of at least this fraction of the lined scroll's
+        volume; otherwise part on the divider, as for scrolls. Defaults to 0.027, which
+        bends 1482, 0525, 0990 and 1585 of the first photogrammetry fragments.
+        parting_land_mm: Width of the level land around the scroll's outline, over
+        which the parting surface leaves it across the pull, so the halves meet the
+        cavity's rim square. Defaults to 3.
+        parting_max_slope_deg: Steepest the parting surface may be in returning to the
+        divider at those ends, so the halves do not slide along each other there.
+        Defaults to 50.
+        rotation_search: After rotation_callback, turn the mesh about the cylinder axis
+        to where the split leaves the scroll least room (rotation_minimising_fill), so
+        the parting surface bends least. Defaults to True.
+        rotation_search_depth_tolerance_mm: Only consider rotations whose pocket depth
+        is within this of the shallowest. Defaults to 5.
+        rotation_search_min_gain: Keep the rotation_callback's split unless the search
+        cuts the room by at least this fraction of the lined scroll's volume. Defaults
+        to 0.01.
 
     """
 
@@ -178,6 +201,321 @@ class ScrollMesh:
     smoothing_unite_with_original: bool = True
     vertical_offset: Optional[float] = None
     cylinder_axis: Optional[tuple[float, float, float]] = None
+    parting_z_margin_mm: float = 2.5
+    parting_max_slope_deg: float = 50
+    parting_land_mm: float = 3
+    parting_min_fill_fraction: float = 0.027
+    rotation_search: bool = True
+    rotation_search_depth_tolerance_mm: float = 5
+    rotation_search_min_gain: float = 0.01
+
+
+def _lined_grid(
+    mesh: mm.Mesh, lining_offset_mm: float, pitch: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Voxels of a pitch-sized grid within lining_offset_mm of the mesh's interior, as a
+    boolean array indexed [x, y, z], and the position of voxel [0, 0, 0]'s centre."""
+    box = mesh.computeBoundingBox()
+    pad = lining_offset_mm + pitch
+    params = mm.MeshToDistanceVolumeParams()
+    params.vol.origin = mm.Vector3f(box.min.x - pad, box.min.y - pad, box.min.z - pad)
+    params.vol.voxelSize = mm.Vector3f(pitch, pitch, pitch)
+    size = box.size()
+    params.vol.dimensions = mm.Vector3i(
+        *[int(np.ceil((s + 2 * pad) / pitch)) + 1 for s in (size.x, size.y, size.z)]
+    )
+    params.dist.signMode = mm.SignDetectionMode.HoleWindingRule
+    volume = mn.getNumpy3Darray(mm.meshToDistanceVolume(mm.MeshPart(mesh), params))
+    origin = np.array([params.vol.origin.x, params.vol.origin.y, params.vol.origin.z])
+    return volume < lining_offset_mm, origin + pitch / 2
+
+
+def split_fill_and_depth(
+    mesh: mm.Mesh,
+    angle_rad: float,
+    lining_outer_radius: float,
+    lining_offset_mm: float,
+    wall_thickness_mm: float,
+    pitch: float,
+) -> tuple[float, float, float]:
+    """Fill and pocket depth of the case split, with the mesh rotated by angle_rad
+    (anticlockwise) about Z, and the lined mesh's volume, all from a pitch-sized grid.
+
+    Each half's cavity is pullable along Y, so in every (x, z) column it spans from the
+    divider to the lined mesh's farthest voxel on that side. The fill, in mm^3, is the
+    cavity beyond the lined mesh: the room the scroll would have to move in if the
+    case parted on the divider. The depth is the farthest lined voxel from the divider
+    over both halves.
+    """
+    rotated = _copy_meshlib(mesh)
+    # affine_rotation(a) rotates by -a.
+    rotated.transform(affine_rotation(-angle_rad))
+    lined, centre = _lined_grid(rotated, lining_offset_mm, pitch)
+    x = centre[0] + pitch * np.arange(lined.shape[0])
+    y = centre[1] + pitch * np.arange(lined.shape[1])
+    # Distance of each voxel from the divider, along Y, for each column [x, :, z].
+    beyond = (
+        y[None, :] - curved_divider_wall.divider_y(x, lining_outer_radius, wall_thickness_mm)[:, None]
+    )[:, :, None]
+    fill, depth = 0.0, 0.0
+    for side in (lined & (beyond > 0), lined & (beyond <= 0)):
+        farthest = np.where(side, np.abs(beyond), 0).max(axis=1)
+        count = side.sum(axis=1)
+        fill += ((farthest / pitch + 0.5)[count > 0] - count[count > 0]).clip(min=0).sum() * pitch**3
+        depth = max(depth, farthest.max() + pitch / 2)
+    return fill, depth, lined.sum() * pitch**3
+
+
+def rotation_minimising_fill(
+    mesh: mm.Mesh,
+    lining_outer_radius: float,
+    lining_offset_mm: float,
+    wall_thickness_mm: float,
+    depth_tolerance_mm: float,
+    min_gain: float,
+    pitch: float = 0.5,
+) -> float:
+    """Rotation about Z (radians, anticlockwise) giving the least fill (see
+    split_fill_and_depth) among those whose pocket depth is within depth_tolerance_mm
+    of the shallowest, searched every 10 degrees and then every degree around the best.
+    Zero unless that cuts the fill by at least min_gain times the lined mesh's volume.
+
+    The divider is symmetric under a half turn, so angles in (-90, 90] degrees cover it;
+    beyond those, a half turn would only swap which half holds which side of the scroll.
+    """
+    evaluated = {}
+
+    def evaluate(degrees):
+        for d in degrees:
+            d = (d + 89) % 180 - 89
+            if d not in evaluated:
+                evaluated[d] = split_fill_and_depth(
+                    mesh,
+                    np.radians(d),
+                    lining_outer_radius,
+                    lining_offset_mm,
+                    wall_thickness_mm,
+                    pitch,
+                )
+
+    def best():
+        shallowest = min(depth for _, depth, _ in evaluated.values())
+        ok = [d for d, (_, depth, _) in evaluated.items() if depth <= shallowest + depth_tolerance_mm]
+        return min(ok, key=lambda d: evaluated[d][0])
+
+    evaluate(range(-80, 91, 10))
+    evaluate(range(best() - 5, best() + 6))
+    pick = best()
+    fill_0, depth_0, lined_volume = evaluated[0]
+    fill, depth, _ = evaluated[pick]
+    logger.info(
+        f"Split fill {fill_0 / 1000:.2f} cm3 (depth {depth_0:.1f} mm) at the current "
+        f"rotation, {fill / 1000:.2f} cm3 (depth {depth:.1f} mm) at {pick} deg"
+    )
+    if fill_0 - fill < min_gain * lined_volume:
+        return 0.0
+    return float(np.radians(pick))
+
+
+def _parting_surface(
+    mesh: mm.Mesh,
+    lining_offset_mm: float,
+    lining_outer_radius: float,
+    wall_thickness_mm: float,
+    z_margin_mm: float,
+    max_slope_deg: float,
+    land_mm: float,
+    pitch: float,
+    iterations: int = 20000,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Height (y) of the surface parting the case halves over a grid of (x, z).
+
+    Across the lining in x, and to z_margin_mm beyond it along the axis, the surface
+    may leave the S-shaped divider. In every column the lined scroll occupies, it
+    passes through the scroll's inner half (at least a quarter of its extent in from its
+    lowest and highest points), as near the divider as that allows, smoothed over
+    neighbouring columns: so each half meets the scroll on its side however the scroll
+    lies, and where the scroll lies off the divider the surface leaves it at its edge,
+    where the inner half narrows to a line, as a mould's parting line follows an
+    object's outline, rather than folding back along one face of it. For land_mm
+    around that outline it carries on level from it, as a mould's parting surface
+    leaves an object across the pull, so that each half meets the cavity's rim (whose
+    wall runs along the pull) square rather than in a knife edge. Elsewhere it
+    departs from the divider as smoothly as it can: the departure is harmonic, zero at
+    the region's ends along the axis (where the caps, split on the divider, begin) and
+    free at its sides, found by red-black successive over-relaxation. Then it is made no steeper than
+    max_slope_deg anywhere, so the halves do not slide along each other as they part:
+    where the scroll would need it steeper (mostly towards the ends along the axis), it
+    lies wholly in one half for a little way.
+
+    Returns the grid's x and z coordinates and the heights, indexed [x, z].
+    """
+    lined, centre = _lined_grid(mesh, lining_offset_mm, pitch)
+    occupied = lined.any(axis=1)
+    first = lined.argmax(axis=1)
+    last = lined.shape[1] - 1 - lined[:, ::-1, :].argmax(axis=1)
+    lowest = centre[1] + pitch * (first - 0.5)
+    highest = centre[1] + pitch * (last + 0.5)
+
+    x_end = lining_outer_radius
+    box = mesh.computeBoundingBox()
+    z_reach = lining_offset_mm + wall_thickness_mm + z_margin_mm
+    z_lo, z_hi = box.min.z - z_reach, box.max.z + z_reach
+    # Nodes on the lined grid's columns, between nodes on the region's edges.
+    kx = np.arange(np.floor((-x_end - centre[0]) / pitch) + 1, np.ceil((x_end - centre[0]) / pitch))
+    kz = np.arange(np.floor((z_lo - centre[2]) / pitch) + 1, np.ceil((z_hi - centre[2]) / pitch))
+    xs = np.concatenate([[-x_end], centre[0] + pitch * kx, [x_end]])
+    zs = np.concatenate([[z_lo], centre[2] + pitch * kz, [z_hi]])
+    ix = np.concatenate([[-1], kx, [-1]]).astype(int)
+    iz = np.concatenate([[-1], kz, [-1]]).astype(int)
+    inside = (ix[:, None] >= 0) & (ix[:, None] < lined.shape[0]) & (iz[None, :] >= 0) & (iz[None, :] < lined.shape[2])
+    jx, jz = np.clip(ix, 0, lined.shape[0] - 1), np.clip(iz, 0, lined.shape[2] - 1)
+    bound = inside & occupied[jx][:, jz]
+    bound[:, [0, -1]] = False
+    lo, hi = lowest[jx][:, jz], highest[jx][:, jz]
+
+    divider = curved_divider_wall.divider_y(xs, lining_outer_radius, wall_thickness_mm)[:, None]
+    # Within the scroll's inner half, smoothed over a millimetre or so of neighbouring
+    # columns (its extent at the outline is noisy), and kept within it.
+    quarter = (hi - lo) / 4
+    middle = np.where(bound, np.clip(divider, lo + quarter, hi - quarter), 0)
+    for _ in range(int(np.ceil(1 / pitch)) * 2):
+        total = np.zeros_like(middle)
+        count = np.zeros_like(middle)
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                total += np.roll(np.roll(np.where(bound, middle, 0), di, 0), dj, 1)
+                count += np.roll(np.roll(bound, di, 0), dj, 1)
+        middle = np.where(bound, total / np.maximum(count, 1), 0)
+    middle = np.clip(middle, lo, hi)
+
+    departure = np.where(bound, middle - divider, 0)
+
+    # The level land around the outline: grown out a step at a time, each new point
+    # taking the mean height of its neighbours already set.
+    fixed = bound.copy()
+    height = np.where(bound, middle, 0)
+    land = np.zeros_like(bound)
+    for _ in range(int(round(land_mm / pitch))):
+        total = np.zeros_like(height)
+        count = np.zeros_like(height)
+        for di, dj in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            total += np.roll(np.roll(np.where(fixed, height, 0), di, 0), dj, 1)
+            count += np.roll(np.roll(fixed, di, 0), dj, 1)
+        grow = ~fixed & (count > 0)
+        grow[:, [0, -1]] = False
+        height = np.where(grow, total / np.maximum(count, 1), height)
+        fixed |= grow
+        land |= grow
+    departure = np.where(land, height - divider, departure)
+    # Held while smoothing, but for its outer millimetre, to blend into the rest.
+    held_land = land.copy()
+    for _ in range(int(round(1 / pitch))):
+        edge = np.zeros_like(held_land)
+        for di, dj in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            edge |= ~np.roll(np.roll(fixed, di, 0), dj, 1)
+        held_land &= ~edge
+        fixed &= ~edge | bound
+    held = departure.copy()
+    free = ~(bound | land)
+    free[:, [0, -1]] = False
+
+    n = max(len(xs), len(zs))
+    omega = 2 / (1 + np.sin(np.pi / n))
+    parity = (np.arange(len(xs))[:, None] + np.arange(len(zs))[None, :]) % 2
+    d = departure
+    for _ in range(iterations):
+        change = 0.0
+        for colour in (0, 1):
+            interior = d[1:-1, 1:-1]
+            mean = 0.25 * (d[:-2, 1:-1] + d[2:, 1:-1] + d[1:-1, :-2] + d[1:-1, 2:])
+            moving = (parity[1:-1, 1:-1] == colour) & free[1:-1, 1:-1]
+            step = np.where(moving, omega * (mean - interior), 0)
+            change = max(change, np.abs(step).max())
+            d[1:-1, 1:-1] = interior + step
+            d[0, 1:-1] = np.where(free[0, 1:-1], d[1, 1:-1], d[0, 1:-1])
+            d[-1, 1:-1] = np.where(free[-1, 1:-1], d[-2, 1:-1], d[-1, 1:-1])
+        if change < 1e-4:
+            break
+
+    # Smoothed across the scroll's outline, where the pinned and free parts meet at a
+    # kink, over a millimetre or so, kept within the scroll and on the divider at the
+    # region's ends.
+    for _ in range(int(np.ceil(1 / pitch)) * 2):
+        padded = np.pad(d, 1, mode="edge")
+        d = sum(padded[1 + di : 1 + di + d.shape[0], 1 + dj : 1 + dj + d.shape[1]] for di in (-1, 0, 1) for dj in (-1, 0, 1)) / 9
+        d = np.where(bound, np.clip(d, lo - divider, hi - divider), d)
+        d = np.where(held_land, held, d)
+        d[:, [0, -1]] = 0
+
+    # No steeper than max_slope_deg between neighbours: alternately limit each point's
+    # departure to its neighbours' plus the rise that slope allows, along each axis,
+    # which only ever brings the surface back towards the divider.
+    # Each axis's share, so that the two together are no steeper in any direction.
+    slope = np.tan(np.radians(max_slope_deg)) / np.sqrt(2)
+    rise_x = slope * np.diff(xs)[:, None]
+    rise_z = slope * np.diff(zs)[None, :]
+
+    def limit(target, neighbour, rise):
+        return np.sign(target) * np.minimum(np.abs(target), np.abs(neighbour) + rise)
+
+    for _ in range(iterations):
+        before = d.copy()
+        for j in range(1, d.shape[1]):
+            d[:, j] = limit(d[:, j], d[:, j - 1], rise_z[:, j - 1])
+        for j in range(d.shape[1] - 2, -1, -1):
+            d[:, j] = limit(d[:, j], d[:, j + 1], rise_z[:, j])
+        for i in range(1, d.shape[0]):
+            d[i] = limit(d[i], d[i - 1], rise_x[i - 1])
+        for i in range(d.shape[0] - 2, -1, -1):
+            d[i] = limit(d[i], d[i + 1], rise_x[i])
+        if np.abs(d - before).max() < 1e-6:
+            break
+    return xs, zs, divider + d
+
+
+def _heightfield_solid(
+    xs: np.ndarray, zs: np.ndarray, bottom: np.ndarray, top: np.ndarray
+) -> mm.Mesh:
+    """Closed mesh of the region bottom < y < top over the grid xs x zs, the heights
+    indexed [x, z]."""
+    nx, nz = len(xs), len(zs)
+    X, Z = np.meshgrid(xs, zs, indexing="ij")
+    verts = np.concatenate(
+        [np.stack([X, bottom, Z], -1).reshape(-1, 3), np.stack([X, top, Z], -1).reshape(-1, 3)]
+    )
+    n = nx * nz
+    idx = np.arange(n).reshape(nx, nz)
+    a, b, c, d = idx[:-1, :-1].ravel(), idx[1:, :-1].ravel(), idx[1:, 1:].ravel(), idx[:-1, 1:].ravel()
+    faces = [
+        np.stack([a, b, c], 1), np.stack([a, c, d], 1),  # bottom, facing -y
+        np.stack([a, c, b], 1) + n, np.stack([a, d, c], 1) + n,  # top, facing +y
+    ]
+
+    def wall(edge, outward_sign):
+        p, q = edge[:-1], edge[1:]
+        tris = [np.stack([p, q, q + n], 1), np.stack([p, q + n, p + n], 1)]
+        return [t[:, ::-1] for t in tris] if outward_sign < 0 else tris
+
+    faces += wall(idx[:, 0], -1) + wall(idx[:, -1], 1) + wall(idx[0, :], 1) + wall(idx[-1, :], -1)
+    solid = mn.meshFromFacesVerts(np.concatenate(faces).astype(np.int32), verts.astype(np.float32))
+    if solid.volume() < 0:
+        raise RuntimeError("Heightfield solid came out inside out")
+    return solid
+
+
+def _exact_boolean(a: mm.Mesh, b: mm.Mesh, op: mm.BooleanOperation, voxel_size: float):
+    """Exact boolean, falling back to a voxel boolean where it fails (as it can on
+    self-intersecting voxel-derived meshes)."""
+    result = mm.boolean(a, b, op)
+    if result.valid():
+        return result.mesh
+    logger.warning(f"Exact boolean failed ({result.errorString}); using voxels")
+    voxel_op = {
+        mm.BooleanOperation.Union: mm.voxelBooleanUnite,
+        mm.BooleanOperation.DifferenceAB: mm.voxelBooleanSubtract,
+    }[op]
+    return voxel_op(a, b, voxel_size)
 
 
 def assert_one_component(mesh: mm.Mesh):
@@ -267,6 +605,21 @@ def build_lining(
     if mesh_params.rotation_callback is not None:
         mesh_scroll = mesh_params.rotation_callback(mesh_scroll)
 
+    # Turn the split to where the case leaves the scroll least room
+    if mesh_params.rotation_search:
+        angle = rotation_minimising_fill(
+            mesh_scroll,
+            radius + mesh_params.lining_offset_mm + mesh_params.wall_thickness_mm,
+            mesh_params.lining_offset_mm,
+            mesh_params.wall_thickness_mm,
+            mesh_params.rotation_search_depth_tolerance_mm,
+            mesh_params.rotation_search_min_gain,
+        )
+        if angle:
+            logger.info(f"Rotating mesh by {np.degrees(angle):.0f} deg about the axis")
+            # affine_rotation(a) rotates by -a.
+            mesh_scroll.transform(affine_rotation(-angle))
+
     # Optionally translate mesh
     if mesh_params.vertical_offset is not None:
         logger.info("Translating mesh by %.2f", mesh_params.vertical_offset)
@@ -283,22 +636,60 @@ def build_lining(
 
     logger.debug(f"Offset mesh: {count_vertices(offset_mesh)} vertices")
 
+    # Bend the parting surface through the scroll only where the S-shaped divider
+    # would leave it much room: a thin, curved fragment lying off the divider.
+    lining_outer_radius = radius + mesh_params.lining_offset_mm + mesh_params.wall_thickness_mm
+    fill, _, lined_volume = split_fill_and_depth(
+        mesh_scroll,
+        0,
+        lining_outer_radius,
+        mesh_params.lining_offset_mm,
+        mesh_params.wall_thickness_mm,
+        0.5,
+    )
+    bend = fill >= mesh_params.parting_min_fill_fraction * lined_volume
+    logger.info(
+        f"Room on the divider {fill / lined_volume:.1%} of the lined volume: "
+        f"{'bending the parting surface through the scroll' if bend else 'parting on the divider'}"
+    )
+
     # Split in two
     logger.info("Splitting mesh")
     hole_edges_pos = mm.UndirectedEdgeBitSet()
     hole_edges_neg = mm.UndirectedEdgeBitSet()
 
-    # Get divider piece
-    divider_piece = (
-        curved_divider_wall.build_divider_solid(
-            radius + mesh_params.lining_offset_mm + mesh_params.wall_thickness_mm,
-            112.5 / 2,
-            mesh_params.wall_thickness_mm,
+    if not bend:
+        divider_piece = (
+            curved_divider_wall.build_divider_solid(
+                lining_outer_radius, 112.5 / 2, mesh_params.wall_thickness_mm
+            )
+            .part.move(bd.Location((0, 0, -100)))
+            .solid()
         )
-        .part.move(bd.Location((0, 0, -100)))
-        .solid()
-    )
-    divider_piece_mesh = brep_to_mesh(divider_piece)
+        divider_piece_mesh = brep_to_mesh(divider_piece)
+    else:
+        # The region of the positive half, bounded by the parting surface: the S-shaped
+        # divider (as build_divider_solid, which splits the caps) away from the scroll,
+        # bent to pass through it.
+        xs, zs, parting = _parting_surface(
+            mesh_scroll,
+            mesh_params.lining_offset_mm,
+            lining_outer_radius,
+            mesh_params.wall_thickness_mm,
+            mesh_params.parting_z_margin_mm,
+            mesh_params.parting_max_slope_deg,
+            mesh_params.parting_land_mm,
+            min(voxel_size, 0.5),
+        )
+        extent = 112.5  # build_divider_solid's reach for build_lining's case_max_radius
+        big_xs = np.concatenate([[-extent], xs, [extent]])
+        big_zs = np.concatenate([[-100], zs, [900]])
+        divider = curved_divider_wall.divider_y(big_xs, lining_outer_radius, mesh_params.wall_thickness_mm)
+        big_parting = np.repeat(divider[:, None], len(big_zs), axis=1)
+        big_parting[1:-1, 1:-1] = parting
+        divider_piece_mesh = _heightfield_solid(
+            big_xs, big_zs, big_parting, np.full_like(big_parting, extent)
+        )
 
     # Create positive mesh
     split_mesh_pos = _copy_meshlib(offset_mesh)
@@ -329,30 +720,81 @@ def build_lining(
 
     # Build mesh
     logger.info("Building lining")
-    cavity_mesh_pos_offset = mm.offsetMesh(cavity_mesh_pos, offset=mesh_params.wall_thickness_mm, params=params)  # type: ignore
-    cavity_mesh_neg_offset = mm.offsetMesh(cavity_mesh_neg, offset=mesh_params.wall_thickness_mm, params=params)  # type: ignore
 
-    # mm.trimWithPlane(cavity_mesh_pos_offset, cut_plane, outCutEdges=hole_edges_pos)
-    # mm.trimWithPlane(cavity_mesh_neg_offset, -cut_plane, outCutEdges=hole_edges_neg)
-    cavity_mesh_pos_offset = mm.boolean(
-        cavity_mesh_pos_offset, divider_piece_mesh, mm.BooleanOperation.Intersection
-    ).mesh
-    cavity_mesh_neg_offset = mm.boolean(
-        cavity_mesh_neg_offset, divider_piece_mesh, mm.BooleanOperation.DifferenceAB
-    ).mesh
+    if not bend:
+        w = mesh_params.wall_thickness_mm
+        cavity_mesh_pos_offset = mm.offsetMesh(cavity_mesh_pos, offset=w, params=params)  # type: ignore
+        cavity_mesh_neg_offset = mm.offsetMesh(cavity_mesh_neg, offset=w, params=params)  # type: ignore
+        cavity_mesh_pos_offset = mm.boolean(
+            cavity_mesh_pos_offset, divider_piece_mesh, mm.BooleanOperation.Intersection
+        ).mesh
+        cavity_mesh_neg_offset = mm.boolean(
+            cavity_mesh_neg_offset, divider_piece_mesh, mm.BooleanOperation.DifferenceAB
+        ).mesh
+        lining_mesh_pos = mm.voxelBooleanSubtract(cavity_mesh_pos_offset, cavity_mesh_pos, voxel_size)
+        lining_mesh_neg = mm.voxelBooleanSubtract(cavity_mesh_neg_offset, cavity_mesh_neg, voxel_size)
+    else:
+        # Each half's lining and divider wall are one shell, wall_thickness_mm thick, around
+        # its cavity and a thin sheet on the parting surface, cut along the surface: the
+        # wall follows the surface at the lining's thickness, and meets the lining without a
+        # seam. The wall replaces the case's wall on the S-shaped divider, and the posts at
+        # its ends there, which are removed with the cavities; both are trimmed at the
+        # lining's outer radius, so the wall ends flush with it, square to the joint. The
+        # sheet reaches a millimetre beyond the surface's grid along the axis, where the
+        # surface is back on the divider, to fuse with the case's wall beyond.
+        w = mesh_params.wall_thickness_mm
+        sheet_zs = np.concatenate([[zs[0] - 1], zs, [zs[-1] + 1]])
+        sheet_parting = np.concatenate([parting[:, :1], parting, parting[:, -1:]], axis=1)
+        half_thickness = max(voxel_size, 0.25)
+        sheet = _heightfield_solid(
+            xs, sheet_zs, sheet_parting - half_thickness, sheet_parting + half_thickness
+        )
+        length = sheet_zs[-1] - sheet_zs[0] + 4 * w
+        within = mm.makeCylinderAdvanced(
+            lining_outer_radius + 0.1, lining_outer_radius + 0.1, 0, 2 * np.pi, length, 256
+        )
+        within.transform(mm.AffineXf3f.translation(mm.Vector3f(0, 0, sheet_zs[0] - 2 * w)))
+        cavity_mesh_pos_offset = mm.voxelBooleanIntersect(
+            mm.offsetMesh(mm.voxelBooleanUnite(cavity_mesh_pos, sheet, voxel_size), offset=w, params=params),  # type: ignore
+            within,
+            voxel_size,
+        )
+        cavity_mesh_neg_offset = mm.voxelBooleanIntersect(
+            mm.offsetMesh(mm.voxelBooleanUnite(cavity_mesh_neg, sheet, voxel_size), offset=w, params=params),  # type: ignore
+            within,
+            voxel_size,
+        )
+        # Generously: over the lining the case has nothing else near the divider. A
+        # millimetre wider than the parting surface's grid, past the end posts' outer edge,
+        # and a wall thickness more than the old wall each way, past its swept ends.
+        flat_xs = np.concatenate([[xs[0] - 1], xs, [xs[-1] + 1]])
+        flat = np.repeat(
+            curved_divider_wall.divider_y(flat_xs, lining_outer_radius, w)[:, None], len(zs), axis=1
+        )
+        flat_thickness = w * np.sqrt(1 + np.gradient(flat, flat_xs, axis=0) ** 2) + w
+        old_wall_pos = _heightfield_solid(flat_xs, zs, flat - w, flat + flat_thickness)
+        old_wall_neg = _heightfield_solid(flat_xs, zs, flat - flat_thickness, flat + w)
 
-    fill_hole_params = mm.FillHoleParams()
-    edges_pos = mm.std_vector_Id_EdgeTag(hole_edges_pos)
-    edges_neg = mm.std_vector_Id_EdgeTag(hole_edges_neg)
-    mm.fillHoles(cavity_mesh_pos_offset, edges_pos, fill_hole_params)
-    mm.fillHoles(cavity_mesh_neg_offset, edges_neg, fill_hole_params)
+        # Each half's lining is cut along the parting surface against the same distance
+        # field, so the two halves' cut faces coincide, before its cavity is removed (a
+        # voxel boolean fills a closed shell's internal void). The positive half's region
+        # is taken over the case only, to keep the voxel grid small.
+        reach = lining_outer_radius + 2 * w
+        local_xs = np.concatenate([[-reach], xs, [reach]])
+        local_parting = np.concatenate([parting[:1], parting, parting[-1:]], axis=0)
+        local_parting = np.concatenate([local_parting[:, :1], local_parting, local_parting[:, -1:]], axis=1)
+        local_zs = np.concatenate([[zs[0] - 3 * w], zs, [zs[-1] + 3 * w]])
+        positive_side = _heightfield_solid(
+            local_xs, local_zs, local_parting, np.full_like(local_parting, reach)
+        )
+        lining_mesh_pos = mm.voxelBooleanIntersect(cavity_mesh_pos_offset, positive_side, voxel_size)
+        lining_mesh_neg = mm.voxelBooleanSubtract(cavity_mesh_neg_offset, positive_side, voxel_size)
+        lining_mesh_pos = mm.voxelBooleanSubtract(lining_mesh_pos, cavity_mesh_pos, voxel_size)
+        lining_mesh_neg = mm.voxelBooleanSubtract(lining_mesh_neg, cavity_mesh_neg, voxel_size)
 
-    lining_mesh_pos = mm.voxelBooleanSubtract(
-        cavity_mesh_pos_offset, cavity_mesh_pos, voxel_size
-    )
-    lining_mesh_neg = mm.voxelBooleanSubtract(
-        cavity_mesh_neg_offset, cavity_mesh_neg, voxel_size
-    )
+        unite = partial(_exact_boolean, op=mm.BooleanOperation.Union, voxel_size=voxel_size)
+        cavity_mesh_pos = unite(cavity_mesh_pos, old_wall_pos)
+        cavity_mesh_neg = unite(cavity_mesh_neg, old_wall_neg)
 
     logger.debug(f"Lining mesh pos: {count_vertices(lining_mesh_pos)} vertices")
 
@@ -402,7 +844,11 @@ def combine_case_lining(
     )
 
     combined_mesh = mm.boolean(case_mesh, cavity_mesh, mm.BooleanOperation.DifferenceAB)
+    if not combined_mesh.valid():
+        raise RuntimeError(f"Removing the cavity from the case failed: {combined_mesh.errorString}")
     combined_mesh = mm.boolean(
         combined_mesh.mesh, lining_mesh, mm.BooleanOperation.Union
     )
+    if not combined_mesh.valid():
+        raise RuntimeError(f"Adding the lining to the case failed: {combined_mesh.errorString}")
     return combined_mesh.mesh
