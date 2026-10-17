@@ -163,6 +163,7 @@ and sampling. Different adapters have independent caches.
 
 The upload comparison uses the local PHercParis4 78 keV level-2 decoded cache,
 128³ uint8 chunks, a GeForce RTX 5090, and Release builds targeting `sm_120`.
+The original implementation is commit `a51c9f1ba`.
 `bench_cuda_uploads.py` uses 16 reader threads, no decoded memory cache, warm
 filesystem pages, five warmups and 31 measured repetitions. Each call includes
 planning, device allocation, CPU reading, transfer, sampling and synchronization.
@@ -198,6 +199,26 @@ across all setup/verification/measured calls), versus 0.028 ms total gather kern
 time. The first async trace reduced copy submission time to 1.39 ms but increased
 `cudaMallocAsync` time from 6.87 to 19.67 ms, motivating preallocation. These trace
 totals include untimed setup and validation; they are not the latency table.
+In the final trace, `cudaMallocAsync` takes 5.35 ms. GPU copies overlap the CPU
+staging intervals between an event wait returning and submission of the next
+batch's copies. Initial pinning of the two 32 MiB buffers takes 18.56 ms in that
+trace, reinforcing the need to reuse the adapter rather than recreate it per crop.
+
+The existing `bench_reader_cuda.py` end-to-end workload also improves. It uses
+different crop coordinates from the transfer-focused harness, three warmups,
+11 measured repetitions, and the same real volume, thread count and build flags.
+Fresh GPU-cache times are **mean / p50 / p95 milliseconds**:
+
+| Request | Original | Final |
+|---|---:|---:|
+| Affine 128³ | 3.641 / 3.585 / 4.014 | 2.347 / 2.278 / 2.612 |
+| Affine 256³ | 10.796 / 10.865 / 11.475 | 6.405 / 6.319 / 6.919 |
+| Eight overlapping affine crops | 4.386 / 4.400 / 4.738 | 3.158 / 3.064 / 3.589 |
+| Box 256³, forced chunk route | 7.429 / 7.386 / 8.232 | 4.201 / 4.146 / 4.579 |
+| Affine 128³ → minmax → brightness → noise | 3.879 / 3.782 / 4.373 | 2.556 / 2.484 / 2.956 |
+
+Automatic routing still chooses CPU cropping for the box case: its p50 remains
+2.84–2.86 ms. The resident pipeline remains 0.43–0.44 ms. Routing is unchanged.
 
 The results describe repeated requests through a reused adapter on this host.
 They do not measure storage-cold or remote I/O, first-use pinning latency, or other
@@ -216,6 +237,24 @@ vc_reader/.venv/bin/python vc_reader/benchmarks/run_native.py \
   vc_reader/benchmarks/bench_cuda_uploads.py --reps 31 --warmup 5 \
   --build-dir /tmp/vc-reader-cuda --compare /tmp/vc-upload-baseline/uploads.json \
   --output vc_reader/benchmarks/results/uploads/async-final.json
+
+vc_reader/.venv/bin/python vc_reader/benchmarks/run_native.py \
+  /tmp/vc-reader-cuda/_native.cpython-314-x86_64-linux-gnu.so \
+  vc_reader/benchmarks/run_native.py \
+  /tmp/vc-reader-cuda/_augment.cpython-314-x86_64-linux-gnu.so \
+  vc_reader/benchmarks/bench_reader_cuda.py \
+  --only affine128,affine256,box256,affine_batch8,pipeline --reps 11 --warmup 3 \
+  --output vc_reader/benchmarks/results/uploads/public-final.json
+
+DEBUGINFOD_URLS='' /usr/local/cuda/bin/nsys profile --trace=cuda \
+  --sample=none --cpuctxsw=none --resolve-symbols=false \
+  -o /tmp/vc-upload-final-profile \
+  vc_reader/.venv/bin/python vc_reader/benchmarks/run_native.py \
+  /tmp/vc-reader-cuda/_native.cpython-314-x86_64-linux-gnu.so \
+  vc_reader/benchmarks/bench_cuda_uploads.py --only chunks128 --reps 1 --warmup 1 \
+  --output /tmp/vc-upload-final-profile.json
+/usr/local/cuda/bin/nsys stats --report cuda_api_sum,cuda_gpu_mem_time_sum,cuda_gpu_kern_sum \
+  /tmp/vc-upload-final-profile.nsys-rep
 ```
 
 Omit `--compare` for the initial baseline. The default input is
