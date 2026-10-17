@@ -101,6 +101,12 @@ autograd tensors, non-native byte order, and nonfinite continuous values are
 rejected. Noncontiguous inputs are made contiguous. By default, inputs are
 preserved and outputs have independent storage. Metadata passes through by reference.
 
+Binary labels can already use bool or uint8 (one byte per voxel). Use a signed
+dtype such as int8 when a `-1` ignore value must be represented, and ensure all
+label/fill values fit the chosen dtype. There is no automatic narrowing or bit
+packing. Smaller label storage did not improve Elastic latency in the
+[measured dtype comparison](../benchmarks/cpu_optimization_results.md#follow-up-high-cost-kernels-and-binary-label-dtypes).
+
 The default schema declares `image`, `mask`, and `padding_mask`; fields may be
 absent or `None`. Declare other arrays explicitly so labels and regression
 targets cannot accidentally receive intensity augmentation:
@@ -290,8 +296,10 @@ precision follows the rules above. Specific conventions:
   padding); `reflect` includes it. Small arrays support repeated reflection.
 - `MedianFilter` encodes channels with at most 256 distinct values, including
   normalized uint8 CT, using an exact palette. 3×3×3 filters select ranks with
-  a shared selection network, processing 64 byte codes or 32 continuous values
-  at a time. Other palette windows use a sliding histogram; other continuous
+  a generated odd-even merge selection network, processing 64 byte codes or
+  32 continuous values at a time. Maximum padding values are eliminated during
+  schedule generation, and only comparisons needed for the median are kept.
+  Other palette windows use a sliding histogram; other continuous
   windows use the general selector. `MedianFilter(size=(2, 8), quantize=True)`
   additionally lets higher-cardinality channels use palette rank selection
   after rounding to 256 evenly spaced levels between that channel's current

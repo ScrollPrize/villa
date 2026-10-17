@@ -130,13 +130,19 @@ inline Parameters sample(const RandomBinaryOperator& t, const Sample& s, Random&
         p.channels.push_back({t.on, c, {draw(t.radius, r), double(static_cast<int>(t.operations[r.index(t.operations.size())]))}});
     return p;
 }
-inline void apply(const RandomBinaryOperator& t, Sample& s, const Parameters& p) {
+template<class MorphologyKernel>
+inline void apply_binary(const RandomBinaryOperator& t, Sample& s, const Parameters& p, MorphologyKernel&& kernel) {
     auto& a = s.at(t.on).array; auto n = product(a.spatial()); auto channels = selected_channels(t.channels, a.shape[0]);
     for (const auto& c : p.channels) {
-        auto original = a.channel(c.channel); auto result = morphology(original, Grid(a.spatial()), ball(a.shape.size() - 1, c.values[0]), static_cast<Morph>(int(c.values[1])));
+        auto original = a.channel(c.channel); auto result = kernel(original, Grid(a.spatial()), ball(a.shape.size() - 1, c.values[0]), static_cast<Morph>(int(c.values[1])));
         for (std::size_t i = 0; i < n; ++i) if (result[i] && !original[i]) for (auto other : channels) if (other != c.channel) a.set(other * n + i, 0);
         a.channel(c.channel, result);
     }
+}
+inline void apply(const RandomBinaryOperator& t, Sample& s, const Parameters& p) {
+    apply_binary(t,s,p,[](const auto& v, const auto& g, const auto& footprint, Morph op) {
+        return morphology(v,g,footprint,op);
+    });
 }
 inline std::vector<std::vector<std::size_t>> connected_components(const std::vector<double>& input, const Grid& g, bool full) {
     std::vector<std::vector<std::size_t>> result; std::vector<bool> visited(g.size); Grid neighborhood(Shape(g.shape.size(), 3));

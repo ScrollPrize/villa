@@ -32,6 +32,8 @@ def cases():
         "Gamma_continuous": (True, [A.Gamma(.8, p_retain_stats=1)]),
         "GaussianBlur": (False, [A.GaussianBlur(1)]),
         "Median3_blur_gamma": (False, [A.MedianFilter(3), A.GaussianBlur(1), A.Gamma(.8)]),
+        "Elastic_median3_local_smoothing": (False, [A.Elastic(sigma=3, magnitude=1), A.MedianFilter(3),
+                                                   A.LocalSmoothing(12, loc=.5, strength=.7, sigma=1)]),
     }
 
 

@@ -4,22 +4,41 @@
 namespace vcr::augment::median_detail {
 struct Comparator { std::size_t low, high; bool minimum = false, maximum = false; };
 
-// A 32-input bitonic sorting network, pruned backwards to the 14th output.
-// Padding 27 neighbors with +infinity (255 for byte codes) makes that output
-// the exact 3D median, even when real neighbors equal the padding value.
-// Construct the schedule rather than maintaining an opaque hand-written list.
+// Generate a 32-input odd-even merge network, then eliminate its five known
+// maximum padding values and prune backwards to the 14th output. Logical wires
+// containing padding can be renamed instead of copying values at runtime.
+struct Network {
+    std::array<Comparator, 191> comparisons{};
+    std::size_t count = 0, output = 13;
+};
 inline constexpr auto network = [] {
-    std::array<Comparator, 240> result{};
-    std::size_t n = 0;
-    for (std::size_t size = 2; size <= 32; size *= 2)
-        for (std::size_t step = size / 2; step; step /= 2)
-            for (std::size_t i = 0; i < 32; ++i) {
-                const auto j = i ^ step;
-                if (j > i) result[n++] = (i & size) ? Comparator{j, i} : Comparator{i, j};
-            }
-    std::array<bool, 32> needed{}; needed[13] = true;
-    for (std::size_t i = n; i-- > 0;) {
-        auto& c = result[i];
+    Network result;
+    std::array<std::size_t, 32> wires{};
+    std::iota(wires.begin(), wires.end(), 0);
+    auto compare = [&](std::size_t low, std::size_t high) {
+        if (wires[high] >= 27) return;
+        if (wires[low] >= 27) { std::swap(wires[low], wires[high]); return; }
+        result.comparisons[result.count++] = {wires[low], wires[high]};
+    };
+    auto merge = [&](auto&& self, std::size_t first, std::size_t size, std::size_t stride) -> void {
+        const auto step = 2 * stride;
+        if (step < size) {
+            self(self, first, size, step);
+            self(self, first + stride, size, step);
+            for (auto i = first + stride; i + stride < first + size; i += step) compare(i, i + stride);
+        } else compare(first, first + stride);
+    };
+    auto sort = [&](auto&& self, std::size_t first, std::size_t size) -> void {
+        if (size == 1) return;
+        self(self, first, size / 2);
+        self(self, first + size / 2, size / 2);
+        merge(merge, first, size, 1);
+    };
+    sort(sort, 0, 32);
+    result.output = wires[13];
+    std::array<bool, 32> needed{}; needed[result.output] = true;
+    for (std::size_t i = result.count; i-- > 0;) {
+        auto& c = result.comparisons[i];
         c.minimum = needed[c.low]; c.maximum = needed[c.high];
         if (c.minimum || c.maximum) needed[c.low] = needed[c.high] = true;
     }
@@ -28,7 +47,8 @@ inline constexpr auto network = [] {
 
 template<class T, std::size_t L>
 inline void select(std::array<std::array<T, L>, 32>& values) {
-    for (const auto& c : network) {
+    for (std::size_t i = 0; i < network.count; ++i) {
+        const auto& c = network.comparisons[i];
         if (!c.minimum && !c.maximum) continue;
         auto& low = values[c.low]; auto& high = values[c.high];
         if constexpr (!std::is_same_v<T, std::uint8_t>) {
@@ -84,12 +104,10 @@ void median3_filter(const std::vector<T>& source, Output& values, const Grid& gr
                     std::fill(neighbors.begin() + count, neighbors.end(), neighbors[count - 1]);
                 }
             }
-            // Comparisons overwrite padding as well as neighbors.
-            for (std::size_t i = 27; i < 32; ++i) window[i].fill(std::numeric_limits<T>::has_infinity ?
-                std::numeric_limits<T>::infinity() : std::numeric_limits<T>::max());
+            // Padding has been eliminated from the generated schedule.
             select(window);
             for (std::size_t lane = 0; lane < count; ++lane)
-                values[(z * ny + y) * nx + x + lane] = decode(window[13][lane]);
+                values[(z * ny + y) * nx + x + lane] = decode(window[network.output][lane]);
         }
 }
 

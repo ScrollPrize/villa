@@ -212,8 +212,10 @@ NB_MODULE(_augment, m) {
     nb::class_<Plan>(m, "Plan")
         .def_prop_ro("steps", [](const Plan& p) { return p.steps.size(); })
         .def("dump", [](const Plan& p) { auto bytes = save_plan(p); return nb::bytes(bytes.data(), bytes.size()); });
+    m.def("cuda_available", &cuda::available);
     nb::class_<Pipeline>(m, "Pipeline")
-        .def(nb::init<std::vector<Op>, std::map<std::string, Target>, bool>(), "transforms"_a, "targets"_a, "compact"_a = true)
+        .def(nb::init<std::vector<Op>, std::map<std::string, Target>, bool, std::string>(), "transforms"_a, "targets"_a, "compact"_a = true, "backend"_a = "cpu")
+        .def_prop_ro("backend", &Pipeline::backend)
         .def("load_plan", [](const Pipeline& p, nb::bytes bytes) { return load_plan(p.program(), std::string(bytes.c_str(), bytes.size())); })
         .def("run", [](const Pipeline& p, const std::map<std::string, Input>& inputs, std::uint64_t seed, bool record, bool profile, bool inplace) {
             if (inplace) writable_inputs(inputs);

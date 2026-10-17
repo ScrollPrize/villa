@@ -121,19 +121,26 @@ class Pipeline:
     palette representation. Weighted statistics can differ slightly in rounding;
     compact=False retains the ordinary reduction order. Outputs keep their dtype.
     """
-    def __init__(self, transforms, *, targets=None, compact=True):
+    def __init__(self, transforms, *, targets=None, compact=True, backend="cpu"):
         self.compact = bool(compact)
+        self._requested_backend = backend
         self.transforms = tuple(deepcopy(tuple(transforms)))
         self.targets = deepcopy(targets) if targets is not None else {
             "image": Image(), "mask": Label(), "padding_mask": ValidMask(),
         }
-        self._native = _native.Pipeline(_unwrap(self.transforms), _unwrap(self.targets), self.compact)
+        self._native = _native.Pipeline(_unwrap(self.transforms), _unwrap(self.targets), self.compact, backend)
 
     def __getstate__(self):
-        return self.transforms, self.targets, self.compact
+        return self.transforms, self.targets, self.compact, self._requested_backend
 
     def __setstate__(self, state):
-        self.__init__(state[0], targets=state[1], compact=state[2] if len(state) > 2 else True)
+        self.__init__(state[0], targets=state[1], compact=state[2] if len(state) > 2 else True,
+                      backend=state[3] if len(state) > 3 else "cpu")
+
+    @property
+    def backend(self):
+        """Resolved execution backend (cpu or cuda)."""
+        return self._native.backend
 
     def _inputs(self, sample, inplace=False):
         arrays, converters = {}, {}

@@ -14,6 +14,16 @@ using Op = std::variant<
     SheetCompression, LowResolution, ThickSlice, Morphology, RandomBinaryOperator,
     RemoveComponents, ReplaceLabel, Regions, OneHot, MaskImage, DeepSupervision,
     ToPseudo2D, FromPseudo2D, MedialSurface, StripGeometry, SurfacePerturb, std::shared_ptr<OneOf>>;
+using Executor = void (*)(const Op&, Sample&, const Parameters&);
+#ifdef VC_READER_CUDA
+namespace cuda {
+bool available();
+void execute(const Op&, Sample&, const Parameters&);
+void validate_program(const std::vector<Op>&);
+}
+#else
+namespace cuda { inline bool available() { return false; } }
+#endif
 struct OneOf { std::vector<Op> transforms; std::vector<double> weights; double p = 1; };
 struct Program { std::vector<Op> transforms; std::map<std::string, Target> targets; };
 struct InputSpec {
@@ -55,7 +65,7 @@ inline void execute(const Op& op, Sample& s, const Parameters& p) {
         else throw std::invalid_argument("replay plan contains unresolved OneOf");
     }, op);
 }
-inline void prepare(const Op& op, Sample& s, Random& r, Shape path, std::vector<Step>* record, CompactState& compact) {
+inline void prepare(const Op& op, Sample& s, Random& r, Shape path, std::vector<Step>* record, CompactState& compact, Executor executor = nullptr) {
     if (!r.chance(chance(op))) return;
     if (const auto* choice = std::get_if<std::shared_ptr<OneOf>>(&op)) {
         const auto& t = **choice; require(!t.transforms.empty(), "OneOf needs transforms");
@@ -65,14 +75,15 @@ inline void prepare(const Op& op, Sample& s, Random& r, Shape path, std::vector<
         require(std::isfinite(total) && total > 0, "OneOf needs positive total weight");
         double threshold = r.uniform() * total; std::size_t chosen = 0;
         for (; chosen + 1 < weights.size() && threshold >= weights[chosen]; ++chosen) threshold -= weights[chosen];
-        path.push_back(chosen); prepare(t.transforms[chosen], s, r, std::move(path), record, compact); return;
+        path.push_back(chosen); prepare(t.transforms[chosen], s, r, std::move(path), record, compact, executor); return;
     }
     std::visit([&](const auto& t) { compact.before(t, s); }, op);
     auto parameters = std::visit([&](const auto& t) -> Parameters {
         if constexpr (!std::is_same_v<std::decay_t<decltype(t)>, std::shared_ptr<OneOf>>) return sample(t, s, r);
         else return {};
     }, op);
-    std::visit([&](const auto& t) {
+    if (executor) executor(op, s, parameters);
+    else std::visit([&](const auto& t) {
         if constexpr (!std::is_same_v<std::decay_t<decltype(t)>, std::shared_ptr<OneOf>>) compact.apply_step(t, s, parameters);
     }, op);
     if (record) record->push_back({std::move(path), std::move(parameters)});
@@ -80,12 +91,23 @@ inline void prepare(const Op& op, Sample& s, Random& r, Shape path, std::vector<
 class Pipeline {
     std::shared_ptr<const Program> program_;
     bool compact_;
+    Executor executor_ = nullptr;
+    std::string backend_ = "cpu";
 public:
-    Pipeline(std::vector<Op> transforms, std::map<std::string, Target> targets, bool compact = true)
+    Pipeline(std::vector<Op> transforms, std::map<std::string, Target> targets, bool compact = true, std::string backend = "cpu")
         : program_(std::make_shared<Program>(Program{std::move(transforms), std::move(targets)})), compact_(compact) {
+        require(backend == "cpu" || backend == "cuda" || backend == "auto", "backend must be cpu, cuda or auto");
+        if (backend == "cuda" || (backend == "auto" && cuda::available())) {
+            require(cuda::available(), "CUDA augmentation is unavailable: build with VC_READER_ENABLE_CUDA=ON and use a CUDA device");
+#ifdef VC_READER_CUDA
+            cuda::validate_program(program_->transforms);
+            executor_ = cuda::execute; backend_ = "cuda"; compact_ = false;
+#endif
+        }
         require(!program_->targets.empty(), "target schema must not be empty");
         for (const auto& op : program_->transforms) probability(chance(op));
     }
+    const auto& backend() const { return backend_; }
     const auto& targets() const { return program_->targets; }
     const auto& program() const { return program_; }
     RunResult run(Sample s, std::uint64_t seed, bool record, bool profile) const {
@@ -94,7 +116,7 @@ public:
         for (std::size_t i = 0; i < program_->transforms.size(); ++i) {
             for (const auto& [name, f] : s) require(f.pyramid.empty(), "DeepSupervision must be the last transform");
             auto start = std::chrono::steady_clock::now(); Random r{split_seed(seed, std::to_string(i))};
-            prepare(program_->transforms[i], s, r, {i}, record ? &result.plan.steps : nullptr, compact);
+            prepare(program_->transforms[i], s, r, {i}, record ? &result.plan.steps : nullptr, compact, executor_);
             if (profile) result.timings[std::to_string(i)] = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         }
         auto start = std::chrono::steady_clock::now(); compact.flush(s);
@@ -107,6 +129,7 @@ public:
         validate(s); require(input_specs(s) == plan.inputs, "replay requires identical target names, shapes and dtypes");
         CompactState compact(compact_);
         for (const auto& step : plan.steps) {
+            if (executor_) { executor_(resolve(*program_, step.path), s, step.parameters); continue; }
             std::visit([&](const auto& t) {
                 if constexpr (!std::is_same_v<std::decay_t<decltype(t)>, std::shared_ptr<OneOf>>) {
                     compact.before(t, s); compact.apply_step(t, s, step.parameters);

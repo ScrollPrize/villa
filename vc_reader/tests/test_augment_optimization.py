@@ -5,6 +5,66 @@ import pytest
 from vc_reader import augment as A
 
 
+@pytest.mark.parametrize("shape", [(1, 1), (7, 9), (1, 5, 1), (5, 7, 11)])
+@pytest.mark.parametrize("scale", [.03, 2., 12., 1e150])
+@pytest.mark.parametrize("loc", [-3., .4, 5.])
+@pytest.mark.parametrize("centered", [False, True])
+def test_local_field_extrema_match_full_volume_reference(shape, scale, loc, centered):
+    import math
+    # Reproduce the former full-volume construction independently. Use scalar
+    # libm erf and a serial sum so no tolerance hides changes in normalization.
+    expected = np.ones(shape, dtype=np.float64)
+    for axis, n in enumerate(shape):
+        center = loc * n
+        values = [.5 * (math.erf((x + .5 - center) / (scale * math.sqrt(2.))) -
+                         math.erf((x - .5 - center) / (scale * math.sqrt(2.)))) for x in range(n)]
+        extent = [1] * len(shape); extent[axis] = n
+        expected *= np.array(values).reshape(extent)
+    low, high = float(expected.min()), float(expected.max())
+    expected = (expected - low) / (high - low) if high != low else np.zeros(shape)
+    if centered:
+        total = 0.
+        for value in expected.flat:
+            total += float(value)
+        expected -= total / expected.size
+        maximum = float(np.abs(expected).max())
+        if maximum > 1e-8:
+            expected /= maximum
+    pipeline = A.Pipeline([A.BrightnessGradient(scale=scale, loc=loc, strength=1,
+                                               mean_centered=centered, clip=False)])
+    actual = pipeline({"image": np.zeros((1, *shape), dtype=np.float64)}, seed=2)["image"][0]
+    np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_median_network_rank_with_padding_and_duplicate_extremes(dtype):
+    ndi = pytest.importorskip("scipy.ndimage")
+    rng = np.random.default_rng(193)
+    image = rng.normal(size=(1, 3, 5, 257)).astype(dtype)
+    # Continuous values exercise the float network; long runs of extrema
+    # exercise rank 14 when many actual neighbors tie with one another.
+    image[..., :17] = np.finfo(dtype).max
+    image[..., -17:] = -np.finfo(dtype).max
+    image[..., 70:90] = 0
+    actual = A.Pipeline([A.MedianFilter(3)])({"image": image}, seed=4)["image"]
+    expected = ndi.median_filter(image[0], size=3, mode="reflect")
+    assert actual[0].tobytes() == expected.tobytes()
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_local_smoothing_selected_channel_ownership_and_inplace(dtype):
+    image = np.random.default_rng(9).normal(size=(2, 5, 7, 9)).astype(dtype)
+    original = image.copy()
+    pipeline = A.Pipeline([A.LocalSmoothing(2, loc=.4, strength=.7, sigma=1, channels=(1,))])
+    expected = pipeline({"image": image}, seed=5)["image"]
+    assert image.tobytes() == original.tobytes()
+    np.testing.assert_array_equal(expected[0], original[0])
+    actual = pipeline({"image": image}, seed=5, inplace=True)["image"]
+    assert actual.tobytes() == expected.tobytes()
+    replay = pipeline.sample({"image": original}, seed=5).apply({"image": original})["image"]
+    assert replay.tobytes() == expected.tobytes()
+
+
 @pytest.mark.parametrize("width", [1, 31, 32, 33, 63, 64, 65, 127, 128, 129])
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 @pytest.mark.parametrize("compact", [False, True])

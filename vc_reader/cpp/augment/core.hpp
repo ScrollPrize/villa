@@ -343,6 +343,24 @@ inline void convolve_run(const T* source, T* output, std::size_t count,
         output[i] = sum;
     }
 }
+// Coefficient construction is shared by CPU and CUDA convolution.
+template<class T>
+inline std::vector<T> gaussian_kernel(double sigma, double truncate, bool full_width) {
+    require(sigma > 0 && std::isfinite(sigma) && truncate > 0 && std::isfinite(truncate) && sigma * truncate < 100000, "invalid Gaussian sigma");
+    int radius = int(sigma * truncate + .5);
+    if (full_width) {
+        double extent = sigma * truncate + .5; int size = int(round_even(extent));
+        if (size % 2 == 0) size += extent - size >= 0 ? 1 : -1;
+        radius = std::max(0, (size - 1) / 2);
+    }
+    // Normalize the small coefficient table in double; full-volume buffers
+    // and convolution arithmetic follow the image dtype.
+    std::vector<double> weights(2 * radius + 1); double sum = 0;
+    for (int d = -radius; d <= radius; ++d) sum += weights[d + radius] = std::exp(-.5 * (d / sigma) * (d / sigma));
+    std::vector<T> kernel(weights.size());
+    for (std::size_t i = 0; i < weights.size(); ++i) kernel[i] = T(weights[i] / sum);
+    return kernel;
+}
 template<class T>
 inline void gaussian_blur(std::vector<T>& data, const Grid& g, const std::vector<double>& sigmas, double truncate = 4, bool mirror_boundary = false, bool full_width = false) {
     require(sigmas.size() == g.shape.size() && truncate > 0 && std::isfinite(truncate), "invalid Gaussian parameters");
@@ -350,18 +368,8 @@ inline void gaussian_blur(std::vector<T>& data, const Grid& g, const std::vector
     for (std::size_t a = 0; a < sigmas.size(); ++a) {
         auto sigma = sigmas[a]; require(sigma >= 0 && std::isfinite(sigma) && sigma * truncate < 100000, "invalid Gaussian sigma");
         if (!sigma) continue;
-        int radius = int(sigma * truncate + .5);
-        if (full_width) {
-            double extent = sigma * truncate + .5; int size = int(round_even(extent));
-            if (size % 2 == 0) size += extent - size >= 0 ? 1 : -1;
-            radius = std::max(0, (size - 1) / 2);
-        }
-        // Normalize the small coefficient table in double; full-volume buffers
-        // and convolution arithmetic follow the image dtype.
-        std::vector<double> weights(2 * radius + 1); double sum = 0;
-        for (int d = -radius; d <= radius; ++d) sum += weights[d + radius] = std::exp(-.5 * (d / sigma) * (d / sigma));
-        std::vector<T> kernel(weights.size());
-        for (std::size_t i = 0; i < weights.size(); ++i) kernel[i] = T(weights[i] / sum);
+        const auto kernel = gaussian_kernel<T>(sigma, truncate, full_width);
+        const auto radius = int(kernel.size() / 2);
         const auto extent = g.shape[a], step = g.stride[a], block = extent * step;
         auto boundary = [&](std::int64_t x) { return mirror_boundary ? mirror(x, extent) : reflect(x, extent); };
         if (step == 1) {

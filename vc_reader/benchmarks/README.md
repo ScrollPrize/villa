@@ -35,8 +35,26 @@ definitions are shared with the comparison harness below. See
 [the native ranking report](native_augmentation_results.md) for measured results.
 The [next CPU optimization pass](cpu_optimization_results.md) includes paired
 noise, float32 intermediates and continuous-input median measurements. Its
-[latest follow-up](cpu_optimization_results.md#follow-up-exact-byte-code-median)
-measures the shared byte-code median selector and complete compact chains.
+[latest follow-up](cpu_optimization_results.md#follow-up-high-cost-kernels-and-binary-label-dtypes)
+measures continuous median, local smoothing, binary label dtypes, complete
+chains, and optional CUDA kernels including GPU Elastic field construction.
+
+`bench_label_dtypes.py --output results/labels.json` compares bool/uint8/int8/
+int16/int32/int64 threshold masks through Elastic, checking equal outputs and
+preserved inputs. Casting is outside timing. Run through `run_native.py` as
+below. `bench_compact_pipeline.py --cases Elastic_median3_local_smoothing`
+measures the full image-only high-cost chain, including Elastic sampling.
+
+`bench_cuda.cu` and `bench_cuda.py` are an **optional experiment**, separate from
+the production CPU build. They require an existing CUDA toolkit/GPU, NumPy and
+the reader/augmentation extensions; no Torch or new package installation is
+needed. See the [build/run commands and limitations](cpu_optimization_results.md#cuda-feasibility)
+for median and Elastic. `--gpu-field` adds GPU expansion and normalization of
+the dense displacement field, with CPU draws for the small random control
+lattice. The benchmark reports kernel and host-to-host latencies separately,
+validates every timed CPU/GPU output pair, and records numerical differences
+from the GPU's fixed double-precision reduction trees. CUDA is not enabled in
+the public pipeline.
 
 ```sh
 AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \

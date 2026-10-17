@@ -258,7 +258,8 @@ inline Array resample(const Array& src, const Parameters& p, bool nearest, doubl
     return p.shape.size() == 2 ? resample_impl<2>(src, p, nearest, fill, validity, field_axis)
                                : resample_impl<3>(src, p, nearest, fill, validity, field_axis);
 }
-inline void apply_geometry(Sample& sample, const Parameters& p) {
+template<class Resample>
+inline void apply_geometry_with(Sample& sample, const Parameters& p, Resample&& resample) {
     auto d = p.shape.size(); auto canonical = axes(d); Grid output(p.shape);
     const auto field_axis = displacement_axis(p);
     for (auto& [name, f] : sample) {
@@ -295,6 +296,7 @@ inline void apply_geometry(Sample& sample, const Parameters& p) {
     }
     restore_valid(sample);
 }
+inline void apply_geometry(Sample& sample, const Parameters& p) { apply_geometry_with(sample, p, resample); }
 inline Parameters geometry(Shape shape) { Parameters p; p.matrix = identity(shape.size()); p.offset.assign(shape.size(), 0); p.shape = std::move(shape); return p; }
 struct Flip { std::string axes; double p_axis = .5, p = 1; };
 struct Rotate90 { std::vector<std::string> planes; Choice turns{{1, 2, 3}}; bool resize = false; double p = 1; };
@@ -479,12 +481,13 @@ inline Parameters sample(const LowResolution& t, const Sample& s, Random& r) {
         return p;
     });
 }
-inline void apply(const LowResolution&, Sample& s, const Parameters& p) {
+template<class Resize>
+inline void apply_resolution(const LowResolution&, Sample& s, const Parameters& p, Resize&& resize) {
     for (const auto& c : p.channels) {
         auto& a = s.at(c.key).array; Shape shape = a.spatial(); auto n = product(shape); Shape one_shape{1}; one_shape.insert(one_shape.end(), shape.begin(), shape.end());
         Array one(one_shape, a.kind, a.bytes, static_cast<const char*>(std::as_const(a).data()) + c.channel * n * a.bytes);
         for (std::size_t j = 0; j < shape.size(); ++j) shape[j] = std::max<std::size_t>(1, std::size_t(round_even(shape[j] * c.values[j])));
-        auto restored = resize_array(resize_array(one, shape, true), a.spatial(), false);
+        auto restored = resize(resize(one, shape, true, false), a.spatial(), false, false);
         std::memcpy(static_cast<char*>(a.data()) + c.channel * n * a.bytes, restored.data(), n * a.bytes);
     }
     restore_valid(s);
@@ -495,10 +498,13 @@ inline Parameters sample(const ThickSlice& t, const Sample& s, Random& r) {
     double scale = draw(t.scale, r); require(scale > 0 && scale <= 1, "thick-slice scale must be in (0, 1]");
     shape[a] = std::max<std::size_t>(1, std::size_t(round_even(shape[a] * scale))); Parameters p; p.shape = shape; return p;
 }
-inline void apply(const ThickSlice& t, Sample& s, const Parameters& p) {
+template<class Resize>
+inline void apply_resolution(const ThickSlice& t, Sample& s, const Parameters& p, Resize&& resize) {
     for (auto& [name, f] : s) if (f.target.role == Role::Image || (t.labels && (f.target.role == Role::Label || f.target.role == Role::Scalar))) {
-        auto shape = f.array.spatial(); f.array = resize_array(resize_array(f.array, p.shape, true, true), shape, true, true);
+        auto shape = f.array.spatial(); f.array = resize(resize(f.array, p.shape, true, true), shape, true, true);
     }
     restore_valid(s);
 }
+inline void apply(const LowResolution& t, Sample& s, const Parameters& p) { apply_resolution(t, s, p, resize_array); }
+inline void apply(const ThickSlice& t, Sample& s, const Parameters& p) { apply_resolution(t, s, p, resize_array); }
 } // namespace vcr::augment

@@ -41,6 +41,11 @@ inline std::vector<double> expand(std::vector<double> values, Shape shape,
 inline std::size_t controls(std::size_t edge,double spacing,bool cubic) {
     return std::size_t(std::floor((edge-1)/spacing))+(cubic ? 4 : 2);
 }
+inline std::vector<double> draw_controls(const Shape& knots, Random& rng) {
+    std::vector<double> values(product(knots));
+    for (auto& value:values) value=rng.normal();
+    return values;
+}
 
 // Component-major control draws match the inspected experimental B-spline field.
 template<std::size_t D>
@@ -49,7 +54,7 @@ std::vector<double> bspline_field_impl(const Shape& shape,double spacing,Random&
     for (auto n:shape) knots.push_back(controls(n,spacing,true));
     std::array<std::vector<double>,D> components;
     for (auto& v:components) {
-        v.resize(product(knots)); for (auto& value:v) value=rng.normal();
+        v=draw_controls(knots,rng);
         // Leave the outermost interpolation for the final interleaved write.
         // This avoids allocating and copying D full-resolution component arrays.
         v=expand(std::move(v),knots,shape,spacing,true,1);

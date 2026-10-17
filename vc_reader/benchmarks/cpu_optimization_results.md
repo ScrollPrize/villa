@@ -1,7 +1,7 @@
 # CPU augmentation follow-up: paired noise and image-precision kernels
 
-The latest pass is [Exact byte-code median](#follow-up-exact-byte-code-median)
-below, measured against the subsequent compact-pipeline implementation.
+The latest pass is [High-cost kernels, binary labels and CUDA](#follow-up-high-cost-kernels-and-binary-label-dtypes)
+below, measured against the preceding median optimization.
 
 Measured October 16, 2026 (America/Chicago), against source commit
 `996a4a721`. This pass targets the remaining CPU costs before considering CUDA.
@@ -467,3 +467,296 @@ The baseline was relinked before editing and retained under
 `/tmp/vc-augment-cpu3-before/symbols`; its profile substitutes that build and
 `before` in the paths above. Raw function summaries are retained alongside
 the latency JSON reports.
+
+## Follow-up: high-cost kernels and binary label dtypes
+
+Measured October 16, 2026, against `0a5094037` (the previous median pass).
+There is still CPU headroom: continuous median and LocalSmoothing each improve
+about 1.29× at 128³. CUDA experiments show substantially more headroom for
+median and Elastic, particularly when the **dense field is built on GPU**.
+
+### Production CPU changes
+
+- `median.hpp`: generate an odd-even merge selection network; eliminate known
+  padding and comparisons that cannot affect rank 14. Active comparators fall
+  from 191 to 126, and required min/max operations from 351 to 226. Floating
+  and exact palette-code paths share the schedule. No quantization is added;
+  the existing mixed-signed-zero fallback remains.
+- `intensity.hpp`: obtain local-field extrema from nonnegative separable axis
+  extrema, preserving multiplication order, and normalize during the first
+  volume write. Unsafe extrema retain the original full-volume fallback.
+  LocalSmoothing blends directly into the writable float32 image instead of
+  copying a channel out and back. Float64, overflow fallbacks, input ownership,
+  channel selection and replay behavior are preserved.
+- `elastic.hpp`: extract the existing control-lattice draws into a shared
+  helper for CPU and CUDA experiments. RNG draws and order are unchanged.
+  Experimental CPU interpolation rewrites had no reliable public-API gain
+  and were discarded; CPU Elastic performance is effectively unchanged.
+
+Same machine, source array and six `DEFAULT_CROPS_128` positions as above:
+Intel Core Ultra 7 270K Plus, Ubuntu x86-64, GCC 15.2, Python 3.14.4;
+Release `-O3 -g -DNDEBUG`, C++20, no fast-math or architecture flags. CPU 0,
+one thread. Inputs are one float32 CT channel /255; Elastic additionally uses
+an int16 threshold mask. The 64³ cases use centered subcrops. The continuous
+median input adds fixed Gaussian noise (std .01, NumPy seed 123) before timing.
+
+Standalone cases: two warmups and eleven repetitions per crop (66 samples),
+seeds 123–133, deterministically shuffled case order. Continuous median: one
+warmup and five repetitions (30 samples). Public API timing includes sampling,
+validation, allocation and input-preserving execution, excluding I/O,
+normalization, hashing and output destruction. Before/after builds run
+sequentially. Every cell is **mean / p50 / p95 milliseconds**.
+
+#### 128³ CPU
+
+| Case | Before | After | p50 speedup |
+| --- | ---: | ---: | ---: |
+| MedianFilter, continuous CT | 66.387 / 66.366 / 66.674 | 51.513 / 51.498 / 51.670 | 1.29× |
+| LocalSmoothing | 26.990 / 27.903 / 28.429 | 20.834 / 21.692 / 22.331 | 1.29× |
+| MedianFilter | 18.152 / 17.771 / 22.475 | 14.603 / 14.175 / 19.028 | 1.25× |
+| LocalGamma | 18.694 / 17.603 / 25.963 | 16.374 / 15.301 / 23.329 | 1.15× |
+| Elastic | 82.318 / 82.361 / 82.940 | 82.162 / 82.115 / 83.020 | 1.00× |
+
+#### 64³ CPU
+
+| Case | Before | After | p50 speedup |
+| --- | ---: | ---: | ---: |
+| MedianFilter, continuous CT | 8.175 / 8.174 / 8.188 | 6.343 / 6.342 / 6.362 | 1.29× |
+| LocalSmoothing | 1.258 / 1.256 / 1.278 | 0.885 / 0.883 / 0.904 | 1.42× |
+| MedianFilter | 2.537 / 2.533 / 2.979 | 1.849 / 1.844 / 2.300 | 1.37× |
+| LocalGamma | 2.129 / 2.127 / 2.155 | 1.826 / 1.824 / 1.846 | 1.17× |
+| Elastic | 8.058 / 8.079 / 8.132 | 8.056 / 8.079 / 8.137 | 1.00× |
+
+#### Complete CPU chain, 128³
+
+Image only: Elastic(3,1) → MedianFilter(3) → LocalSmoothing(12, loc=.5,
+strength=.7, sigma=1). Includes field sampling and all three transforms, one
+warmup and eleven repetitions per crop (66 samples/mode), fixed seed 123.
+Ordinary/compact ordering alternates. Compact and ordinary outputs match
+byte-for-byte in both builds; deformation makes these median inputs continuous.
+
+| Mode | Before | After |
+| --- | ---: | ---: |
+| ordinary | 151.055 / 150.985 / 151.859 | 120.364 / 120.222 / 121.103 |
+| compact | 151.173 / 151.160 / 152.062 | 120.255 / 120.254 / 120.919 |
+
+### CPU profile
+
+Separate `gprofng` sampling runs use Elastic, median and LocalSmoothing on the
+six noisy 128³ crops, one warmup and five repetitions. These profiles include
+startup/validation/hashing and are excluded from the latency tables. Both
+symbol-bearing relinks have identical `.text` bytes to their corresponding
+measured Release extensions.
+
+| Function | Before exclusive seconds (%) | After exclusive seconds (%) |
+| --- | ---: | ---: |
+| Continuous median selector/stencil | 3.349 (37.70%) | 2.576 (32.46%) |
+| Nearest label resampling | 1.127 (12.68%) | 1.108 (13.96%) |
+| Image interpolation | 1.060 (11.93%) | 1.066 (13.43%) |
+| B-spline field construction | .295 (3.32%) | .301 (3.79%) |
+| Gaussian blur | .215 (2.42%) | .220 (2.78%) |
+| Local field construction | .062 (.70%) | .037 (.46%) |
+
+The local-field inclusive time drops from .210 to .071 seconds; this includes
+helpers such as the removed full-volume extrema scan. Percentage shares are
+of the whole profiling process, not one augmentation. Continuous median and
+Elastic resampling remain the leading CPU kernels.
+
+For each `build` and `tag` from the reproduction loop below:
+
+```bash
+mkdir -p "$build/symbols"
+/usr/bin/c++ -fPIC -O3 -g -DNDEBUG -shared -Wl,--gc-sections \
+  -o "$build/symbols/_augment.cpython-314-x86_64-linux-gnu.so" \
+  "$build/CMakeFiles/_augment.dir/cpp/augment/bindings.cpp.o" \
+  "$build/libnanobind-static.a"
+AGENTS_AGENT_MODE=1 gprofng collect app -p hi -O "/tmp/vc-cpu4-$tag-profile.er" \
+  bash /tmp/vc-cpu3-run "$build/symbols/_augment.cpython-314-x86_64-linux-gnu.so" \
+  vc_reader/benchmarks/bench_augment.py --native-only \
+  --only Elastic,MedianFilter,LocalSmoothing --input-noise-std .01 \
+  --build-dir "$build" --reps 5 --warmup 1 \
+  --output "vc_reader/benchmarks/results/cpu4-$tag-profile.json"
+gprofng display text -limit 20 -functions "/tmp/vc-cpu4-$tag-profile.er" \
+  > "vc_reader/benchmarks/results/cpu4-$tag-profile.txt"
+```
+
+The retained final after experiment is `/tmp/vc-cpu4-after-final-profile.er`.
+The baseline symbols were preserved from the previous build; relinking a
+fresh baseline needs its object and nanobind archive as in the command above.
+
+### Binary label dtype check
+
+The existing label path already preserves bool and integer dtypes. Storing a
+binary mask as bool/uint8 uses 2 MiB at 128³ versus 4 MiB for int16 or 16 MiB
+for int64. Int8 can also represent a -1 ignore label. Choose a dtype that can
+represent all labels and fill values; no implicit narrowing or bitpacking was
+added. Smaller storage did **not** speed up this Elastic workload.
+
+Six real CT-derived masks, one validation/warmup and five repetitions per crop
+(30 samples/dtype/mode), shuffled order, seeds 123–127. Casts and I/O are
+excluded. Every dtype matches the int16 reference, preserves its output dtype,
+and leaves the input unchanged. Baseline extension used for this quick check.
+
+| Dtype | Labels only | Image + labels |
+| --- | ---: | ---: |
+| bool | 55.265 / 55.244 / 55.966 | 83.299 / 83.185 / 84.241 |
+| uint8 | 55.193 / 55.191 / 56.142 | 83.400 / 83.378 / 84.481 |
+| int8 | 55.080 / 54.998 / 56.057 | 83.297 / 83.281 / 84.325 |
+| int16 | 54.361 / 54.326 / 55.159 | 82.648 / 82.624 / 83.417 |
+| int32 | 54.481 / 54.417 / 55.453 | 82.499 / 82.521 / 83.250 |
+| int64 | 55.969 / 55.286 / 56.447 | 83.864 / 83.783 / 85.366 |
+
+### CUDA feasibility
+
+Optional benchmark (`bench_cuda.cu`, `bench_cuda.py`), **not production
+pipeline dispatch**. NVIDIA RTX 5090, driver 595.84, CUDA toolkit 13.3,
+`sm_120`, `-O3 --fmad=false`, no fast-math. CUDA access requires running outside
+the sandbox on this host. No packages were installed. CPU and CUDA backends
+run in a seeded shuffled order in one process, pinned to CPU 0. Six crops,
+one warmup per case/crop and five repetitions (30 samples), seeds 123–127.
+
+The first Elastic experiment reused the exact CPU field to isolate resampling.
+The second uploads only the small CPU-drawn random control lattice and builds
+**all dense B-spline expansion, centering, RMS/gradient normalization and
+resampling on GPU**. At 128³ this uploads 375,000 bytes of controls instead of
+50,331,648 bytes of dense field. Small B-spline weight tables are initialized
+once from the shared production helper. CPU RNG/control draws remain included
+in host-to-host timings. This preserves existing draws without requiring GPU
+libm to reproduce CPU transcendental functions.
+
+Median uses the production selection schedule compiled into GPU registers.
+Elastic uses float64 field values, weights and interpolation accumulation,
+float32 image outputs, int16 labels, zero fill and ties-to-even nearest
+sampling. GPU field reductions use fixed double-precision trees: deterministic
+on this tested GPU, but a different summation order from the CPU.
+
+Host-to-host timings include host output allocation, CPU field/control draws,
+pageable H2D/D2H transfers, GPU kernels and synchronization. Device buffers and
+context are reused. Kernel timings use CUDA events, exclude transfers and CPU
+work, and **include field expansion/normalization** in the GPU-field row.
+The prototype omits public schema/finite validation and supports only one
+finite float32 channel on a cubic 3D grid with these fixed parameters. Thus
+these are feasibility results, not a drop-in production API speedup claim.
+
+#### 128³ CUDA comparison
+
+| Case | CPU public API | CUDA host-to-host | CUDA kernels |
+| --- | ---: | ---: | ---: |
+| MedianFilter_continuous | 52.937 / 52.741 / 55.296 | 1.174 / 1.160 / 1.203 | 0.095 / 0.098 / 0.103 |
+| Elastic | 82.263 / 82.170 / 82.805 | 37.016 / 36.369 / 40.226 | 0.241 / 0.241 / 0.245 |
+| Elastic_gpu_field | 82.343 / 82.234 / 83.221 | 3.297 / 3.143 / 3.801 | 0.617 / 0.618 / 0.631 |
+
+#### 64³ CUDA comparison
+
+| Case | CPU public API | CUDA host-to-host | CUDA kernels |
+| --- | ---: | ---: | ---: |
+| MedianFilter_continuous | 6.539 / 6.444 / 7.054 | 0.255 / 0.268 / 0.293 | 0.053 / 0.068 / 0.074 |
+| Elastic | 8.384 / 8.156 / 10.296 | 2.857 / 2.472 / 4.444 | 0.064 / 0.081 / 0.088 |
+| Elastic_gpu_field | 8.538 / 8.110 / 10.302 | 0.577 / 0.583 / 0.649 | 0.136 / 0.156 / 0.167 |
+
+All 128³ GPU-field images and labels matched CPU **byte-for-byte** across the
+30 timed calls; the maximum double-precision field difference was
+1.1102230246251565e-15. The harness also compares fields at 64³ and exercises
+1³, 2³ and 7³ grids, Gaussian random inputs, zeros, binary plateaus and signed
+labels. Repeated GPU fields for the same seed matched byte-for-byte.
+CUDA Compute Sanitizer memcheck on the 7³ synthetic and six-crop workload
+reported **0 errors**. Sanitizer timings are excluded from the tables.
+
+These observed image matches are not a guarantee for every input: altered
+reduction rounding can affect an interpolation result or a nearest-neighbor
+tie. The GPU-field experiment explicitly permits field error up to 5e-12 and
+image error up to 2e-7, while requiring labels to be exact; it records actual
+errors and unequal counts after every timed pair. The original CPU-field
+experiment and median require byte equality. No CPU numerical policy changed.
+
+GPU field construction removes the main limitation of the first experiment:
+128³ Elastic falls from about 36 ms with a CPU field to about 3.1 ms with a GPU
+field, including transfers. GPU work itself is about .62 ms. Continuous
+median is about 1.16 ms including transfers. Keeping consecutive transforms
+and training tensors on device is the next integration opportunity; trainer
+throughput, other GPUs, macOS/arm64 performance and a production CUDA API have
+not been measured here.
+
+### Validation and reproduction
+
+**963 augmentation tests passed** on the final CPU build. Added exact tests
+cover local-field separable extrema against the former full-volume reference
+(including extreme scales, off-image centers, singleton axes and centering),
+continuous median with duplicate extrema, and LocalSmoothing channel selection,
+inplace/owning behavior and replay. Cross-build comparison of Elastic,
+LocalSmoothing, LocalGamma, BrightnessGradient and LocalContrast on six real
+128³ crops and seeds 123–125 found maximum absolute error zero. All standalone
+CPU before/after output hashes, including noisy median, match.
+
+Builds are `/tmp/vc-augment-cpu4-before` and `/tmp/vc-augment-cpu4`. Raw JSON,
+including every observation, input/output fingerprints and binary identity,
+is under ignored `benchmarks/results/cpu4-*`. The 128³ CUDA run used the
+candidate just before the behavior-preserving control-draw helper extraction;
+final CPU benchmarks/tests and the 64³ CUDA run use the rebuilt final candidate.
+Run from the repository root, using the `/tmp/vc-cpu3-run` wrapper defined
+[above](#reproduction-of-this-pass), which selects a native extension and fixes
+Python paths, CPU affinity and thread environment.
+
+```bash
+AGENTS_AGENT_MODE=1 cmake -S vc_reader -B /tmp/vc-augment-cpu4 \
+  -DVC_READER_BUILD_READER=OFF \
+  -DPython_EXECUTABLE="$PWD/vc_reader/.venv/bin/python" \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE='-O3 -g -DNDEBUG' \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-augment-cpu4 --target _augment -j 2
+
+for tag in before after; do
+  build=/tmp/vc-augment-cpu4
+  if [ "$tag" = before ]; then build=/tmp/vc-augment-cpu4-before; fi
+  extension="$build/_augment.cpython-314-x86_64-linux-gnu.so"
+  for edge in 128 64; do
+    bash /tmp/vc-cpu3-run "$extension" vc_reader/benchmarks/bench_augment.py \
+      --native-only --only Elastic,MedianFilter,LocalSmoothing,LocalGamma \
+      --build-dir "$build" --shape "$edge" "$edge" "$edge" --reps 11 --warmup 2 \
+      --output "vc_reader/benchmarks/results/cpu4-$tag-$edge.json"
+    bash /tmp/vc-cpu3-run "$extension" vc_reader/benchmarks/bench_augment.py \
+      --native-only --only MedianFilter --input-noise-std .01 \
+      --build-dir "$build" --shape "$edge" "$edge" "$edge" --reps 5 --warmup 1 \
+      --output "vc_reader/benchmarks/results/cpu4-$tag-noisy-$edge.json"
+  done
+  bash /tmp/vc-cpu3-run "$extension" vc_reader/benchmarks/bench_compact_pipeline.py \
+    --cases Elastic_median3_local_smoothing --reps 11 \
+    --output "vc_reader/benchmarks/results/cpu4-$tag-chain.json"
+done
+bash /tmp/vc-cpu3-run /tmp/vc-augment-cpu4-before/_augment.cpython-314-x86_64-linux-gnu.so \
+  vc_reader/benchmarks/bench_label_dtypes.py --reps 5 \
+  --output vc_reader/benchmarks/results/cpu4-label-dtypes.json
+
+bash /tmp/vc-cpu3-run /tmp/vc-augment-cpu4/_augment.cpython-314-x86_64-linux-gnu.so \
+  -m pytest vc_reader/tests/test_augment.py vc_reader/tests/test_augment_optimization.py \
+  vc_reader/tests/test_augment_compact.py vc_reader/tests/test_elastic_bspline.py \
+  vc_reader/tests/test_augment_benchmark.py vc_reader/tests/test_sheet_compression.py \
+  -q --tb=short
+
+# Use a fresh capture directory when reproducing.
+bash /tmp/vc-cpu3-run /tmp/vc-augment-cpu4-before/_augment.cpython-314-x86_64-linux-gnu.so \
+  vc_reader/benchmarks/check_augment_build.py /tmp/vc-cpu4-reference \
+  --capture --only Elastic,LocalSmoothing,LocalGamma,BrightnessGradient,LocalContrast
+bash /tmp/vc-cpu3-run /tmp/vc-augment-cpu4/_augment.cpython-314-x86_64-linux-gnu.so \
+  vc_reader/benchmarks/check_augment_build.py /tmp/vc-cpu4-reference \
+  --only Elastic,LocalSmoothing,LocalGamma,BrightnessGradient,LocalContrast \
+  --atol 0 --rtol 0 --output vc_reader/benchmarks/results/cpu4-equivalence.json
+
+# Optional CUDA experiment: sm_120 is specific to the tested RTX 5090.
+AGENTS_AGENT_MODE=1 /usr/local/cuda/bin/nvcc -std=c++20 -O3 --fmad=false \
+  --expt-relaxed-constexpr -arch=sm_120 -Xcompiler=-O3,-fPIC -shared \
+  -Ivc_reader/cpp/augment vc_reader/benchmarks/bench_cuda.cu -o /tmp/vc-bench-cuda.so
+for edge in 128 64 1 2 7; do
+  bash /tmp/vc-cpu3-run /tmp/vc-augment-cpu4/_augment.cpython-314-x86_64-linux-gnu.so \
+    vc_reader/benchmarks/bench_cuda.py --binary /tmp/vc-bench-cuda.so \
+    --edge "$edge" --reps 5 --gpu-field \
+    --output "vc_reader/benchmarks/results/cpu4-cuda-field-$edge.json"
+done
+
+AGENTS_AGENT_MODE=1 /usr/local/cuda/bin/compute-sanitizer --tool memcheck \
+  --target-processes all --error-exitcode 99 bash /tmp/vc-cpu3-run \
+  /tmp/vc-augment-cpu4/_augment.cpython-314-x86_64-linux-gnu.so \
+  vc_reader/benchmarks/bench_cuda.py --binary /tmp/vc-bench-cuda.so \
+  --edge 7 --reps 1 --gpu-field \
+  --output vc_reader/benchmarks/results/cpu4-cuda-memcheck.json
+```
