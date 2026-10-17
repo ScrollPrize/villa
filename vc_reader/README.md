@@ -1,46 +1,96 @@
 # vc_reader
 
-## Pipeline benchmark
+## Performance
 
-[`benchmarks/bench_pipeline.py`](benchmarks/bench_pipeline.py) exercises affine
-reading/sampling, normalization, and a fixed augmentation chain (flip, brightness,
-gamma, Gaussian blur). It uses the package's NumPy dependency and accepts a local,
-HTTP, or S3 **3-D uint8 Zarr v2 array**. With no `--array`, it generates a temporary,
-seeded synthetic input for smoke checks; use representative CT data for performance
-decisions.
+Measured on PHercParis4 (level 2) using an Intel Core Ultra 7 270K Plus and
+NVIDIA RTX 5090, with 8 reader workers and 60 requests per workload/backend.
+These results use a local uncompressed volume with warm filesystem caches;
+CUDA timings include fresh uploads and final downloads to host. Performance
+will vary with storage, chunking, and cache reuse.
 
-```bash
-# CPU smoke check using synthetic input.
-python benchmarks/bench_pipeline.py --backend cpu --shape 32 32 32 --crops 2 --reps 3
+See the [benchmark guide](benchmarks/README.md) for methodology, dependencies,
+commands, augmentation parameters, and complete timing reports.
 
-# CPU/CUDA comparison on the same real data and crop origins.
-python benchmarks/bench_pipeline.py --array /path/to/volume.zarr --level 0 \
-  --backend both --shape 128 128 128 --crops 4 --threads 8 \
-  --warmup 2 --reps 10 --output /tmp/pipeline.json
+### Reading and sampling
+
+Median milliseconds per request, including sampling where needed. TensorStore
+and zarr-python use SciPy for interpolation of curved surfaces and rotated boxes.
+The surface workload samples tiles from a real horizontal PHercParis4 tifxyz
+strip, [included with the benchmarks](benchmarks/README.md#reusable-tifxyz-surface).
+
+| Workload | zarr-python | TensorStore | vc_reader CPU | vc_reader CUDA |
+| --- | ---: | ---: | ---: | ---: |
+| ML batch: 8 × 128³ crops | 13.911 | 4.910 | 1.140 | 4.671 |
+| Curved tifxyz surface: 96 × 512 | 10.606 | 6.601 | 0.775 | 1.745 |
+| Axis-aligned slab: 16 × 512² | 6.197 | 2.679 | 0.470 | 2.197 |
+| Rotated box: 128³ | 68.116 | 64.903 | 13.682 | 1.593 |
+
+CPU is faster for direct batches, slabs, and these surface tiles. CUDA provides the
+largest benefit for rotated boxes: **8.59× faster than vc_reader CPU**,
+**40.74× than TensorStore**, and **42.76× than zarr-python**.
+
+### Full training pipeline
+
+vc_reader fetches a rotated 128³ crop, applies min-max normalization, then runs
+12 augmentations: elastic deformation, median filtering, flipping, Gaussian
+blur, brightness multiplication and addition, contrast, gamma, local contrast,
+local smoothing, sharpening, and low-resolution simulation. This comparison
+uses vc_reader only.
+
+| Stage | CPU median (ms) | CUDA median (ms) |
+| --- | ---: | ---: |
+| Fetching + sampling | 15.199 | 1.076 |
+| Normalization | 5.230 | 0.136 |
+| 12 augmentations | 169.915 | 3.115 |
+| Final host download | — | 0.529 |
+| **End-to-end** | **189.966** | **4.881** |
+
+CUDA delivers **38.92× lower median latency**, with throughput of **202.63
+crops/s** versus **5.26 crops/s** on CPU.
+
+### Axis-aligned boxes with CUDA augmentation
+
+For axis-aligned 128³ crops with the same normalization and augmentation chain,
+reading on CPU and then moving to CUDA is the fastest measured route:
+
+| Pipeline | Median total (ms) | Crops/s | Speedup over CPU |
+| --- | ---: | ---: | ---: |
+| CPU throughout | 173.431 | 5.77 | 1.00× |
+| CUDA reading + processing | 4.812 | 204.86 | 36.04× |
+| CPU reading → CUDA processing | **4.371** | **227.66** | **39.68×** |
+
+The hybrid route is **1.10× faster** than CUDA reading and processing for these
+boxes. All routes passed output correctness checks; detailed statistics and
+validation results are in the [benchmark guide](benchmarks/README.md).
+
+## Add labels or channels to a pipeline
+
+`with_targets()` returns a new pipeline with additional named targets, keeping
+the existing transforms and execution settings:
+
+```python
+from vc_reader import augment as A
+
+pipeline = existing_pipeline.with_targets(
+    extra_label=A.Label(),
+    confidence=A.ScalarField(),
+)
+result = pipeline(
+    {"image": ct, "extra_label": segmentation, "confidence": confidence_map},
+    seed=123,
+)
 ```
 
-Use matching Release reader/augmentation extensions; CUDA requires a build with
-`VC_READER_ENABLE_CUDA=ON` and an accessible GPU. `--native-dir /path/to/cmake-build`
-selects both extensions from an existing build without installing them.
-`--backend cuda` measures CUDA alone. `--start Z Y X`, `--jitter`, `--angle`,
-`--normalization`, and cache-budget options control the workload; see `--help`.
+The sample dictionary supplies the arrays; the declarations specify their
+treatment. `Label()` shares geometry using nearest-neighbor interpolation.
+`ScalarField()` shares geometry using continuous interpolation. Both skip image
+normalization and intensity transforms. Use `Image()` for another image channel
+that should receive those transforms too; existing target selectors still apply.
 
-The report includes mean/p50/p95/min/max stage and total latency, crops/s,
-Mvoxels/s, output GiB/s, and CPU/CUDA median speedups. JSON also records every
-measurement, crop geometry, seeds, platform, extension hashes, cache counters,
-and validation errors. Validation and warmup are excluded from timings. CPU/CUDA
-outputs must agree within `atol=5e-5, rtol=1e-5`; single-backend runs check shape,
-dtype, and finite values.
-
-Reading and affine sampling are fused, so their time is reported together.
-Normalization and augmentation use separate calls for stage measurement.
-CUDA sampling uses device chunks without automatic CPU fallback. The default
-includes the final download so both backends return host arrays;
-`--cuda-output device` measures a GPU-consumer endpoint instead. Calls complete
-before timing stops. Host/OS caches stay warm; `--cuda-cache clear` drops device
-chunks before each crop to include uploads, while `warm` reuses the device cache
-subject to its budget. This is a sequential latency/throughput benchmark, not a
-cold-storage or overlapped training-loader benchmark.
+Arrays must already be spatially aligned and use channel-first shapes such as
+`(C, Z, Y, X)`. Existing declarations are retained unless you replace the same
+name. The original pipeline is unchanged; replay plans stay with the pipeline
+that created them.
 
 ## Regenerate augmentation previews
 

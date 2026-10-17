@@ -24,6 +24,7 @@ dependencies = []
 reader = ["numpy>=1.24"]
 augment = ["numpy>=1.24"]
 previews = ["numpy>=1.24", "Pillow>=10.1"]
+bench = ["numpy>=1.24", "tensorstore>=0.1.60", "zarr>=3", "scipy>=1.11", "tifffile", "s3fs", "aiohttp"]
 
 [project.scripts]
 vc-reader = "vc_reader.cli:main"

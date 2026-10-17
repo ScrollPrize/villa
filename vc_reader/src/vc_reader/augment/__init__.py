@@ -143,6 +143,18 @@ class Pipeline:
         }
         self._native = _native.Pipeline(_unwrap(self.transforms), _unwrap(self.targets), self.compact, backend)
 
+    def with_targets(self, **targets):
+        """Return a new pipeline with added or replaced target declarations.
+
+        Values describe how arrays are treated, e.g. extra_label=Label() or
+        confidence=ScalarField(). Supply the actual arrays under those names
+        when calling the returned pipeline. Existing targets, transforms,
+        compact mode and the requested backend are preserved; this pipeline
+        is unchanged. Replay plans belong to their original pipeline.
+        """
+        return Pipeline(self.transforms, targets={**self.targets, **targets},
+                        compact=self.compact, backend=self._requested_backend)
+
     def __getstate__(self):
         return self.transforms, self.targets, self.compact, self._requested_backend
 

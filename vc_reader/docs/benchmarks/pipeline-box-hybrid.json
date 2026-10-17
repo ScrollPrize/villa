@@ -1,0 +1,2184 @@
+{
+  "schema_version": 2,
+  "suite": "pipeline",
+  "command": [
+    "/home/sean/Documents/villa2/villa/vc_reader/.venv/bin/python",
+    "benchmarks/bench_pipeline.py",
+    "--suite",
+    "pipeline",
+    "--native-dir",
+    "/tmp/vc-reader-cuda",
+    "--backend",
+    "both",
+    "--array",
+    "/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+    "--level",
+    "2",
+    "--start",
+    "9000",
+    "3600",
+    "3600",
+    "--shape",
+    "128",
+    "128",
+    "128",
+    "--crops",
+    "6",
+    "--jitter",
+    "256",
+    "--warmup",
+    "2",
+    "--reps",
+    "10",
+    "--threads",
+    "8",
+    "--memory-cache-mib",
+    "0",
+    "--cuda-cache",
+    "clear",
+    "--augmentation",
+    "heavy",
+    "--pipeline-read",
+    "box",
+    "--include-hybrid",
+    "--output",
+    "docs/benchmarks/pipeline-box-hybrid.json"
+  ],
+  "config": {
+    "suite": "pipeline",
+    "baselines": [
+      "tensorstore",
+      "zarr"
+    ],
+    "workloads": [
+      "ml_batch",
+      "plane",
+      "slab",
+      "rotated_box"
+    ],
+    "batch_size": 8,
+    "plane_size": [
+      256,
+      256
+    ],
+    "slab_depth": 16,
+    "augmentation": "heavy",
+    "pipeline_read": "box",
+    "include_hybrid": true,
+    "array": "/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+    "level": "2",
+    "backend": "both",
+    "shape": [
+      128,
+      128,
+      128
+    ],
+    "start": [
+      9000.0,
+      3600.0,
+      3600.0
+    ],
+    "crops": 6,
+    "jitter": 256.0,
+    "angle": 10,
+    "normalization": "minmax",
+    "reps": 10,
+    "warmup": 2,
+    "threads": 8,
+    "seed": 123,
+    "memory_cache_mib": 0,
+    "cuda_cache_mib": 512,
+    "cuda_cache": "clear",
+    "cuda_output": "host",
+    "device": 0,
+    "native_dir": "/tmp/vc-reader-cuda",
+    "output": "docs/benchmarks/pipeline-box-hybrid.json"
+  },
+  "environment": {
+    "python": "3.14.4 (main, Aug 20 2026, 10:41:58) [GCC 15.2.0]",
+    "numpy": "2.5.4",
+    "platform": "Linux-7.0.0-30-generic-x86_64-with-glibc2.43",
+    "processor": "",
+    "cpu_count": 24,
+    "affinity": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23
+    ],
+    "extensions": {
+      "reader": {
+        "path": "/tmp/vc-reader-cuda/_native.cpython-314-x86_64-linux-gnu.so",
+        "sha256": "3949897ef766d47edfbd773e3bab3d266404019c386713da0e25c534c936e5cb"
+      },
+      "augment": {
+        "path": "/tmp/vc-reader-cuda/_augment.cpython-314-x86_64-linux-gnu.so",
+        "sha256": "569524640ef1debebd065acb75ac6c6564cad9975b3e64b19f8b1d3f9b74ea89"
+      }
+    },
+    "build": {
+      "CMAKE_BUILD_TYPE": "Release",
+      "CMAKE_CUDA_ARCHITECTURES": "120",
+      "CMAKE_CXX_COMPILER": "/usr/bin/c++",
+      "VC_READER_ENABLE_CUDA": "ON"
+    },
+    "gpus": [
+      "0, NVIDIA GeForce RTX 5090, 595.84"
+    ]
+  },
+  "transforms": [
+    "Elastic(sigma=12, magnitude=2, border=True)",
+    "MedianFilter(3)",
+    "Flip(axes='x', p_axis=1)",
+    "GaussianBlur(0.7)",
+    "BrightnessMultiply(1.1)",
+    "BrightnessAdd(0.03)",
+    "Contrast(1.15)",
+    "Gamma(0.9)",
+    "LocalContrast(12, loc=0.5, factor=1.1)",
+    "LocalSmoothing(12, loc=0.5, strength=0.3, sigma=1)",
+    "Sharpen(0.1, p_clamp=0)",
+    "LowResolution(0.85)"
+  ],
+  "protocol": {
+    "timing": "synchronous wall time; fused read/sample, separate normalization and augmentation calls",
+    "included": "chunk I/O/decode, planning, allocations, sampling, normalization, augmentation; CUDA upload on cache misses",
+    "excluded": "input generation, reader/pipeline construction, validation, warmup, cache clearing, output destruction",
+    "caches": "host and OS caches are not flushed; warm CUDA cache may evict if its budget is too small",
+    "order": "backend order rotates each repetition; identical crops and seeds",
+    "routes": "cpu: CPU read/normalize/augment; cuda: device chunks; hybrid: CPU read/sample + upload, CUDA normalize/augment",
+    "hybrid_upload": "box: uint8 crop uploaded then cast on GPU; affine: CPU-sampled float32 crop uploaded",
+    "throughput": "output voxels and float32 output bytes, not storage or PCIe bandwidth",
+    "speedup": "CPU / CUDA p50 latency; >1 means CUDA is faster",
+    "endpoints": "CPU host; CUDA host"
+  },
+  "validation": {
+    "atol": 5e-05,
+    "rtol": 1e-05,
+    "crops": [
+      {
+        "crop": 0,
+        "sha256": {
+          "cpu": "4a685bc6430a2fdfcd667fe87f6edb0873db76d1e1f377ef81313fe6982fc881",
+          "cuda": "025c7b6f478cb620c9b877f6dfc954bf1219f03186a43a6a2af315a7346d9cb5",
+          "hybrid": "025c7b6f478cb620c9b877f6dfc954bf1219f03186a43a6a2af315a7346d9cb5"
+        },
+        "reference": "cpu",
+        "comparisons": {
+          "cuda": {
+            "max_abs": 3.5762786865234375e-07,
+            "rmse": 3.1336807818286395e-08
+          },
+          "hybrid": {
+            "max_abs": 3.5762786865234375e-07,
+            "rmse": 3.1336807818286395e-08
+          }
+        },
+        "max_abs": 3.5762786865234375e-07,
+        "rmse": 3.1336807818286395e-08
+      },
+      {
+        "crop": 1,
+        "sha256": {
+          "cpu": "7c6171a5e8d240173a8e4e644dce04c5e43bca13690cce35ad92f04d75ea1b3c",
+          "cuda": "d21b52e747a3b1ead0c6c928445d45a56cc9f59d6e7937ec89edc1058209e269",
+          "hybrid": "d21b52e747a3b1ead0c6c928445d45a56cc9f59d6e7937ec89edc1058209e269"
+        },
+        "reference": "cpu",
+        "comparisons": {
+          "cuda": {
+            "max_abs": 2.980232238769531e-07,
+            "rmse": 2.8888062924169316e-08
+          },
+          "hybrid": {
+            "max_abs": 2.980232238769531e-07,
+            "rmse": 2.8888062924169316e-08
+          }
+        },
+        "max_abs": 2.980232238769531e-07,
+        "rmse": 2.8888062924169316e-08
+      },
+      {
+        "crop": 2,
+        "sha256": {
+          "cpu": "f5dfb6acce09023c4415e246737cdc86debd245784797a3b91fe5f3da9de71ec",
+          "cuda": "0797ba41ae9344484fe8cf6f9798c8e0da627bd037a19dcaf5ce239a9def412f",
+          "hybrid": "0797ba41ae9344484fe8cf6f9798c8e0da627bd037a19dcaf5ce239a9def412f"
+        },
+        "reference": "cpu",
+        "comparisons": {
+          "cuda": {
+            "max_abs": 3.5762786865234375e-07,
+            "rmse": 3.132335709958174e-08
+          },
+          "hybrid": {
+            "max_abs": 3.5762786865234375e-07,
+            "rmse": 3.132335709958174e-08
+          }
+        },
+        "max_abs": 3.5762786865234375e-07,
+        "rmse": 3.132335709958174e-08
+      },
+      {
+        "crop": 3,
+        "sha256": {
+          "cpu": "0a3986c3f26636a453d908e1a3ab6f4c8f19dabc8fc7fad5d3a4bc267ae28b14",
+          "cuda": "3e7527acd5262af519ff28a271f9c08eee613e1772d0b4b2405a2b3afaeea512",
+          "hybrid": "3e7527acd5262af519ff28a271f9c08eee613e1772d0b4b2405a2b3afaeea512"
+        },
+        "reference": "cpu",
+        "comparisons": {
+          "cuda": {
+            "max_abs": 2.980232238769531e-07,
+            "rmse": 2.996515759086542e-08
+          },
+          "hybrid": {
+            "max_abs": 2.980232238769531e-07,
+            "rmse": 2.996515759086542e-08
+          }
+        },
+        "max_abs": 2.980232238769531e-07,
+        "rmse": 2.996515759086542e-08
+      },
+      {
+        "crop": 4,
+        "sha256": {
+          "cpu": "02dd5b9e4b5cd431880eb05da6fc61c8d8909134b925d72144efa104aeba3c6e",
+          "cuda": "71b90d5a20c2d2cd2422953b0ca638ebba9b453981a60abfceb61b1ac4edcabc",
+          "hybrid": "71b90d5a20c2d2cd2422953b0ca638ebba9b453981a60abfceb61b1ac4edcabc"
+        },
+        "reference": "cpu",
+        "comparisons": {
+          "cuda": {
+            "max_abs": 2.980232238769531e-07,
+            "rmse": 3.140938539675697e-08
+          },
+          "hybrid": {
+            "max_abs": 2.980232238769531e-07,
+            "rmse": 3.140938539675697e-08
+          }
+        },
+        "max_abs": 2.980232238769531e-07,
+        "rmse": 3.140938539675697e-08
+      },
+      {
+        "crop": 5,
+        "sha256": {
+          "cpu": "1dd2b552cf55b81a1e59aaf92debbfe401319894593c54976489ec297538f177",
+          "cuda": "887430ea044a3c46ebf5f12655db1a4be7af90338798866207d79768be707c3e",
+          "hybrid": "887430ea044a3c46ebf5f12655db1a4be7af90338798866207d79768be707c3e"
+        },
+        "reference": "cpu",
+        "comparisons": {
+          "cuda": {
+            "max_abs": 3.5762786865234375e-07,
+            "rmse": 2.6200469789918783e-08
+          },
+          "hybrid": {
+            "max_abs": 3.5762786865234375e-07,
+            "rmse": 2.6200469789918783e-08
+          }
+        },
+        "max_abs": 3.5762786865234375e-07,
+        "rmse": 2.6200469789918783e-08
+      }
+    ],
+    "comparison": "cpu/cuda/hybrid allclose"
+  },
+  "results": {
+    "cpu": {
+      "timings": {
+        "read_sample": {
+          "mean_ms": 0.53218285,
+          "p50_ms": 0.4851955,
+          "p95_ms": 0.7910241499999999,
+          "min_ms": 0.339882,
+          "max_ms": 0.882844
+        },
+        "normalization": {
+          "mean_ms": 5.42266545,
+          "p50_ms": 5.3889855,
+          "p95_ms": 5.78715155,
+          "min_ms": 5.146955,
+          "max_ms": 5.898297
+        },
+        "augmentation": {
+          "mean_ms": 167.49335793333336,
+          "p50_ms": 167.572573,
+          "p95_ms": 169.18259909999998,
+          "min_ms": 164.855678,
+          "max_ms": 170.450457
+        },
+        "download": {
+          "mean_ms": 0.0,
+          "p50_ms": 0.0,
+          "p95_ms": 0.0,
+          "min_ms": 0.0,
+          "max_ms": 0.0
+        },
+        "total": {
+          "mean_ms": 173.44842443333334,
+          "p50_ms": 173.4312425,
+          "p95_ms": 175.08880385,
+          "min_ms": 170.582317,
+          "max_ms": 176.853136
+        }
+      },
+      "samples": 60,
+      "raw_ms": [
+        {
+          "repetition": 0,
+          "crop": 0,
+          "read_sample": 0.394046,
+          "normalization": 5.341681,
+          "augmentation": 165.495976,
+          "download": 0.0,
+          "total": 171.231853
+        },
+        {
+          "repetition": 0,
+          "crop": 1,
+          "read_sample": 0.607012,
+          "normalization": 5.333357,
+          "augmentation": 166.355577,
+          "download": 0.0,
+          "total": 172.29627
+        },
+        {
+          "repetition": 0,
+          "crop": 2,
+          "read_sample": 0.524141,
+          "normalization": 5.412578,
+          "augmentation": 166.787772,
+          "download": 0.0,
+          "total": 172.724994
+        },
+        {
+          "repetition": 0,
+          "crop": 3,
+          "read_sample": 0.745298,
+          "normalization": 5.373356,
+          "augmentation": 167.325015,
+          "download": 0.0,
+          "total": 173.443808
+        },
+        {
+          "repetition": 0,
+          "crop": 4,
+          "read_sample": 0.483428,
+          "normalization": 5.586556,
+          "augmentation": 169.002165,
+          "download": 0.0,
+          "total": 175.072221
+        },
+        {
+          "repetition": 0,
+          "crop": 5,
+          "read_sample": 0.55955,
+          "normalization": 5.842962,
+          "augmentation": 170.450457,
+          "download": 0.0,
+          "total": 176.853136
+        },
+        {
+          "repetition": 1,
+          "crop": 0,
+          "read_sample": 0.3444,
+          "normalization": 5.335018,
+          "augmentation": 168.863778,
+          "download": 0.0,
+          "total": 174.543338
+        },
+        {
+          "repetition": 1,
+          "crop": 1,
+          "read_sample": 0.34812,
+          "normalization": 5.419404,
+          "augmentation": 169.168108,
+          "download": 0.0,
+          "total": 174.935743
+        },
+        {
+          "repetition": 1,
+          "crop": 2,
+          "read_sample": 0.538272,
+          "normalization": 5.392176,
+          "augmentation": 166.887271,
+          "download": 0.0,
+          "total": 172.817883
+        },
+        {
+          "repetition": 1,
+          "crop": 3,
+          "read_sample": 0.485177,
+          "normalization": 5.281647,
+          "augmentation": 165.904804,
+          "download": 0.0,
+          "total": 171.672123
+        },
+        {
+          "repetition": 1,
+          "crop": 4,
+          "read_sample": 0.555769,
+          "normalization": 5.530701,
+          "augmentation": 167.586249,
+          "download": 0.0,
+          "total": 173.673059
+        },
+        {
+          "repetition": 1,
+          "crop": 5,
+          "read_sample": 0.788729,
+          "normalization": 5.391795,
+          "augmentation": 166.734623,
+          "download": 0.0,
+          "total": 172.915391
+        },
+        {
+          "repetition": 2,
+          "crop": 0,
+          "read_sample": 0.390141,
+          "normalization": 5.382896,
+          "augmentation": 168.85363,
+          "download": 0.0,
+          "total": 174.627134
+        },
+        {
+          "repetition": 2,
+          "crop": 1,
+          "read_sample": 0.37004,
+          "normalization": 5.830007,
+          "augmentation": 168.657566,
+          "download": 0.0,
+          "total": 174.857794
+        },
+        {
+          "repetition": 2,
+          "crop": 2,
+          "read_sample": 0.496411,
+          "normalization": 5.146955,
+          "augmentation": 167.665683,
+          "download": 0.0,
+          "total": 173.309214
+        },
+        {
+          "repetition": 2,
+          "crop": 3,
+          "read_sample": 0.482368,
+          "normalization": 5.387822,
+          "augmentation": 168.886709,
+          "download": 0.0,
+          "total": 174.757011
+        },
+        {
+          "repetition": 2,
+          "crop": 4,
+          "read_sample": 0.470494,
+          "normalization": 5.440001,
+          "augmentation": 167.934067,
+          "download": 0.0,
+          "total": 173.844622
+        },
+        {
+          "repetition": 2,
+          "crop": 5,
+          "read_sample": 0.764821,
+          "normalization": 5.428334,
+          "augmentation": 167.711867,
+          "download": 0.0,
+          "total": 173.905288
+        },
+        {
+          "repetition": 3,
+          "crop": 0,
+          "read_sample": 0.448893,
+          "normalization": 5.339898,
+          "augmentation": 166.308787,
+          "download": 0.0,
+          "total": 172.0977
+        },
+        {
+          "repetition": 3,
+          "crop": 1,
+          "read_sample": 0.376173,
+          "normalization": 5.731702,
+          "augmentation": 166.557838,
+          "download": 0.0,
+          "total": 172.665827
+        },
+        {
+          "repetition": 3,
+          "crop": 2,
+          "read_sample": 0.457712,
+          "normalization": 5.282118,
+          "augmentation": 166.347792,
+          "download": 0.0,
+          "total": 172.087755
+        },
+        {
+          "repetition": 3,
+          "crop": 3,
+          "read_sample": 0.6733,
+          "normalization": 5.462162,
+          "augmentation": 168.303892,
+          "download": 0.0,
+          "total": 174.439424
+        },
+        {
+          "repetition": 3,
+          "crop": 4,
+          "read_sample": 0.480166,
+          "normalization": 5.461215,
+          "augmentation": 166.495492,
+          "download": 0.0,
+          "total": 172.437153
+        },
+        {
+          "repetition": 3,
+          "crop": 5,
+          "read_sample": 0.624048,
+          "normalization": 5.487623,
+          "augmentation": 168.043814,
+          "download": 0.0,
+          "total": 174.155748
+        },
+        {
+          "repetition": 4,
+          "crop": 0,
+          "read_sample": 0.350837,
+          "normalization": 5.444111,
+          "augmentation": 167.29267,
+          "download": 0.0,
+          "total": 173.087773
+        },
+        {
+          "repetition": 4,
+          "crop": 1,
+          "read_sample": 0.341958,
+          "normalization": 5.460173,
+          "augmentation": 166.305334,
+          "download": 0.0,
+          "total": 172.107561
+        },
+        {
+          "repetition": 4,
+          "crop": 2,
+          "read_sample": 0.700537,
+          "normalization": 5.390149,
+          "augmentation": 167.232324,
+          "download": 0.0,
+          "total": 173.323604
+        },
+        {
+          "repetition": 4,
+          "crop": 3,
+          "read_sample": 0.485214,
+          "normalization": 5.393739,
+          "augmentation": 168.695104,
+          "download": 0.0,
+          "total": 174.574209
+        },
+        {
+          "repetition": 4,
+          "crop": 4,
+          "read_sample": 0.645784,
+          "normalization": 5.414679,
+          "augmentation": 169.45793,
+          "download": 0.0,
+          "total": 175.518505
+        },
+        {
+          "repetition": 4,
+          "crop": 5,
+          "read_sample": 0.706597,
+          "normalization": 5.345128,
+          "augmentation": 168.400375,
+          "download": 0.0,
+          "total": 174.452323
+        },
+        {
+          "repetition": 5,
+          "crop": 0,
+          "read_sample": 0.359359,
+          "normalization": 5.386765,
+          "augmentation": 166.889193,
+          "download": 0.0,
+          "total": 172.635511
+        },
+        {
+          "repetition": 5,
+          "crop": 1,
+          "read_sample": 0.428216,
+          "normalization": 5.321909,
+          "augmentation": 166.482055,
+          "download": 0.0,
+          "total": 172.23244
+        },
+        {
+          "repetition": 5,
+          "crop": 2,
+          "read_sample": 0.834632,
+          "normalization": 5.381263,
+          "augmentation": 167.0756,
+          "download": 0.0,
+          "total": 173.291748
+        },
+        {
+          "repetition": 5,
+          "crop": 3,
+          "read_sample": 0.59011,
+          "normalization": 5.374491,
+          "augmentation": 167.17158,
+          "download": 0.0,
+          "total": 173.136494
+        },
+        {
+          "repetition": 5,
+          "crop": 4,
+          "read_sample": 0.692024,
+          "normalization": 5.339305,
+          "augmentation": 167.708072,
+          "download": 0.0,
+          "total": 173.739816
+        },
+        {
+          "repetition": 5,
+          "crop": 5,
+          "read_sample": 0.396998,
+          "normalization": 5.411864,
+          "augmentation": 167.609421,
+          "download": 0.0,
+          "total": 173.418677
+        },
+        {
+          "repetition": 6,
+          "crop": 0,
+          "read_sample": 0.572248,
+          "normalization": 5.494158,
+          "augmentation": 168.732637,
+          "download": 0.0,
+          "total": 174.799149
+        },
+        {
+          "repetition": 6,
+          "crop": 1,
+          "read_sample": 0.408245,
+          "normalization": 5.336091,
+          "augmentation": 166.36046,
+          "download": 0.0,
+          "total": 172.105084
+        },
+        {
+          "repetition": 6,
+          "crop": 2,
+          "read_sample": 0.678446,
+          "normalization": 5.898297,
+          "augmentation": 166.233082,
+          "download": 0.0,
+          "total": 172.810016
+        },
+        {
+          "repetition": 6,
+          "crop": 3,
+          "read_sample": 0.740054,
+          "normalization": 5.343228,
+          "augmentation": 167.121236,
+          "download": 0.0,
+          "total": 173.204705
+        },
+        {
+          "repetition": 6,
+          "crop": 4,
+          "read_sample": 0.843229,
+          "normalization": 5.377435,
+          "augmentation": 167.697427,
+          "download": 0.0,
+          "total": 173.918331
+        },
+        {
+          "repetition": 6,
+          "crop": 5,
+          "read_sample": 0.533555,
+          "normalization": 5.446318,
+          "augmentation": 169.087408,
+          "download": 0.0,
+          "total": 175.067922
+        },
+        {
+          "repetition": 7,
+          "crop": 0,
+          "read_sample": 0.339882,
+          "normalization": 5.311429,
+          "augmentation": 165.445335,
+          "download": 0.0,
+          "total": 171.096796
+        },
+        {
+          "repetition": 7,
+          "crop": 1,
+          "read_sample": 0.351708,
+          "normalization": 5.784896,
+          "augmentation": 166.73487,
+          "download": 0.0,
+          "total": 172.871612
+        },
+        {
+          "repetition": 7,
+          "crop": 2,
+          "read_sample": 0.473185,
+          "normalization": 5.253338,
+          "augmentation": 164.855678,
+          "download": 0.0,
+          "total": 170.582317
+        },
+        {
+          "repetition": 7,
+          "crop": 3,
+          "read_sample": 0.374437,
+          "normalization": 5.311651,
+          "augmentation": 165.045782,
+          "download": 0.0,
+          "total": 170.732008
+        },
+        {
+          "repetition": 7,
+          "crop": 4,
+          "read_sample": 0.464173,
+          "normalization": 5.368964,
+          "augmentation": 166.247293,
+          "download": 0.0,
+          "total": 172.080657
+        },
+        {
+          "repetition": 7,
+          "crop": 5,
+          "read_sample": 0.882844,
+          "normalization": 5.363926,
+          "augmentation": 167.558897,
+          "download": 0.0,
+          "total": 173.805732
+        },
+        {
+          "repetition": 8,
+          "crop": 0,
+          "read_sample": 0.59385,
+          "normalization": 5.543244,
+          "augmentation": 168.843436,
+          "download": 0.0,
+          "total": 174.980781
+        },
+        {
+          "repetition": 8,
+          "crop": 1,
+          "read_sample": 0.37467,
+          "normalization": 5.393948,
+          "augmentation": 166.371066,
+          "download": 0.0,
+          "total": 172.139749
+        },
+        {
+          "repetition": 8,
+          "crop": 2,
+          "read_sample": 0.684702,
+          "normalization": 5.302262,
+          "augmentation": 167.785783,
+          "download": 0.0,
+          "total": 173.772891
+        },
+        {
+          "repetition": 8,
+          "crop": 3,
+          "read_sample": 0.418279,
+          "normalization": 5.313617,
+          "augmentation": 166.826195,
+          "download": 0.0,
+          "total": 172.558226
+        },
+        {
+          "repetition": 8,
+          "crop": 4,
+          "read_sample": 0.684394,
+          "normalization": 5.503781,
+          "augmentation": 167.891646,
+          "download": 0.0,
+          "total": 174.079892
+        },
+        {
+          "repetition": 8,
+          "crop": 5,
+          "read_sample": 0.429657,
+          "normalization": 5.318446,
+          "augmentation": 168.454077,
+          "download": 0.0,
+          "total": 174.202305
+        },
+        {
+          "repetition": 9,
+          "crop": 0,
+          "read_sample": 0.39516,
+          "normalization": 5.436732,
+          "augmentation": 169.571807,
+          "download": 0.0,
+          "total": 175.403878
+        },
+        {
+          "repetition": 9,
+          "crop": 1,
+          "read_sample": 0.378732,
+          "normalization": 5.350812,
+          "augmentation": 167.010448,
+          "download": 0.0,
+          "total": 172.740475
+        },
+        {
+          "repetition": 9,
+          "crop": 2,
+          "read_sample": 0.74394,
+          "normalization": 5.435105,
+          "augmentation": 168.437389,
+          "download": 0.0,
+          "total": 174.616735
+        },
+        {
+          "repetition": 9,
+          "crop": 3,
+          "read_sample": 0.603354,
+          "normalization": 5.382796,
+          "augmentation": 168.929357,
+          "download": 0.0,
+          "total": 174.915722
+        },
+        {
+          "repetition": 9,
+          "crop": 4,
+          "read_sample": 0.468391,
+          "normalization": 5.458656,
+          "augmentation": 167.939164,
+          "download": 0.0,
+          "total": 173.866338
+        },
+        {
+          "repetition": 9,
+          "crop": 5,
+          "read_sample": 0.553061,
+          "normalization": 5.345257,
+          "augmentation": 167.772413,
+          "download": 0.0,
+          "total": 173.670995
+        }
+      ],
+      "crops_per_second": 5.765402616178622,
+      "mvoxels_per_second": 12.090925627324228,
+      "output_gib_per_second": 0.04504220793889548
+    },
+    "cuda": {
+      "timings": {
+        "read_sample": {
+          "mean_ms": 1.0098786666666666,
+          "p50_ms": 0.990089,
+          "p95_ms": 1.2703950499999999,
+          "min_ms": 0.703822,
+          "max_ms": 1.423655
+        },
+        "normalization": {
+          "mean_ms": 0.13861163333333335,
+          "p50_ms": 0.137436,
+          "p95_ms": 0.14608649999999995,
+          "min_ms": 0.108836,
+          "max_ms": 0.200437
+        },
+        "augmentation": {
+          "mean_ms": 3.164896166666667,
+          "p50_ms": 3.1265655,
+          "p95_ms": 3.3833596499999996,
+          "min_ms": 3.071177,
+          "max_ms": 3.674617
+        },
+        "download": {
+          "mean_ms": 0.5680268666666667,
+          "p50_ms": 0.5565835,
+          "p95_ms": 0.6745302499999998,
+          "min_ms": 0.527468,
+          "max_ms": 0.795029
+        },
+        "total": {
+          "mean_ms": 4.881413333333333,
+          "p50_ms": 4.812175,
+          "p95_ms": 5.31245095,
+          "min_ms": 4.44237,
+          "max_ms": 5.63566
+        }
+      },
+      "samples": 60,
+      "raw_ms": [
+        {
+          "repetition": 0,
+          "crop": 0,
+          "read_sample": 0.988641,
+          "normalization": 0.137991,
+          "augmentation": 3.130369,
+          "download": 0.543876,
+          "total": 4.800877
+        },
+        {
+          "repetition": 0,
+          "crop": 1,
+          "read_sample": 1.116655,
+          "normalization": 0.137227,
+          "augmentation": 3.129463,
+          "download": 0.556601,
+          "total": 4.939946
+        },
+        {
+          "repetition": 0,
+          "crop": 2,
+          "read_sample": 1.062611,
+          "normalization": 0.14036,
+          "augmentation": 3.127334,
+          "download": 0.609945,
+          "total": 4.94025
+        },
+        {
+          "repetition": 0,
+          "crop": 3,
+          "read_sample": 0.906201,
+          "normalization": 0.143498,
+          "augmentation": 3.126118,
+          "download": 0.565443,
+          "total": 4.74126
+        },
+        {
+          "repetition": 0,
+          "crop": 4,
+          "read_sample": 1.083967,
+          "normalization": 0.135707,
+          "augmentation": 3.107928,
+          "download": 0.567565,
+          "total": 4.895167
+        },
+        {
+          "repetition": 0,
+          "crop": 5,
+          "read_sample": 0.973691,
+          "normalization": 0.137712,
+          "augmentation": 3.119122,
+          "download": 0.583105,
+          "total": 4.81363
+        },
+        {
+          "repetition": 1,
+          "crop": 0,
+          "read_sample": 0.703822,
+          "normalization": 0.108836,
+          "augmentation": 3.071177,
+          "download": 0.558535,
+          "total": 4.44237
+        },
+        {
+          "repetition": 1,
+          "crop": 1,
+          "read_sample": 0.819179,
+          "normalization": 0.135269,
+          "augmentation": 3.124365,
+          "download": 0.56691,
+          "total": 4.645723
+        },
+        {
+          "repetition": 1,
+          "crop": 2,
+          "read_sample": 0.960319,
+          "normalization": 0.138917,
+          "augmentation": 3.12402,
+          "download": 0.571849,
+          "total": 4.795105
+        },
+        {
+          "repetition": 1,
+          "crop": 3,
+          "read_sample": 0.860353,
+          "normalization": 0.137122,
+          "augmentation": 3.466079,
+          "download": 0.671499,
+          "total": 5.135053
+        },
+        {
+          "repetition": 1,
+          "crop": 4,
+          "read_sample": 1.186948,
+          "normalization": 0.137151,
+          "augmentation": 3.125253,
+          "download": 0.546015,
+          "total": 4.995367
+        },
+        {
+          "repetition": 1,
+          "crop": 5,
+          "read_sample": 1.40017,
+          "normalization": 0.154665,
+          "augmentation": 3.34261,
+          "download": 0.542244,
+          "total": 5.439689
+        },
+        {
+          "repetition": 2,
+          "crop": 0,
+          "read_sample": 1.094028,
+          "normalization": 0.137644,
+          "augmentation": 3.130434,
+          "download": 0.55953,
+          "total": 4.921636
+        },
+        {
+          "repetition": 2,
+          "crop": 1,
+          "read_sample": 0.981774,
+          "normalization": 0.135656,
+          "augmentation": 3.126655,
+          "download": 0.566635,
+          "total": 4.81072
+        },
+        {
+          "repetition": 2,
+          "crop": 2,
+          "read_sample": 1.008986,
+          "normalization": 0.13656,
+          "augmentation": 3.131345,
+          "download": 0.568321,
+          "total": 4.845212
+        },
+        {
+          "repetition": 2,
+          "crop": 3,
+          "read_sample": 0.858105,
+          "normalization": 0.137473,
+          "augmentation": 3.119343,
+          "download": 0.595932,
+          "total": 4.710853
+        },
+        {
+          "repetition": 2,
+          "crop": 4,
+          "read_sample": 1.042875,
+          "normalization": 0.137399,
+          "augmentation": 3.117123,
+          "download": 0.547809,
+          "total": 4.845206
+        },
+        {
+          "repetition": 2,
+          "crop": 5,
+          "read_sample": 1.199619,
+          "normalization": 0.138869,
+          "augmentation": 3.125028,
+          "download": 0.542441,
+          "total": 5.005957
+        },
+        {
+          "repetition": 3,
+          "crop": 0,
+          "read_sample": 0.854358,
+          "normalization": 0.133792,
+          "augmentation": 3.116982,
+          "download": 0.550285,
+          "total": 4.655417
+        },
+        {
+          "repetition": 3,
+          "crop": 1,
+          "read_sample": 0.892766,
+          "normalization": 0.134021,
+          "augmentation": 3.129333,
+          "download": 0.542926,
+          "total": 4.699046
+        },
+        {
+          "repetition": 3,
+          "crop": 2,
+          "read_sample": 1.003641,
+          "normalization": 0.135277,
+          "augmentation": 3.131812,
+          "download": 0.568854,
+          "total": 4.839584
+        },
+        {
+          "repetition": 3,
+          "crop": 3,
+          "read_sample": 0.874877,
+          "normalization": 0.140768,
+          "augmentation": 3.124925,
+          "download": 0.577739,
+          "total": 4.718309
+        },
+        {
+          "repetition": 3,
+          "crop": 4,
+          "read_sample": 0.95092,
+          "normalization": 0.140384,
+          "augmentation": 3.110034,
+          "download": 0.54069,
+          "total": 4.742028
+        },
+        {
+          "repetition": 3,
+          "crop": 5,
+          "read_sample": 0.94303,
+          "normalization": 0.137038,
+          "augmentation": 3.119582,
+          "download": 0.556566,
+          "total": 4.756216
+        },
+        {
+          "repetition": 4,
+          "crop": 0,
+          "read_sample": 0.742746,
+          "normalization": 0.109325,
+          "augmentation": 3.094928,
+          "download": 0.527468,
+          "total": 4.474467
+        },
+        {
+          "repetition": 4,
+          "crop": 1,
+          "read_sample": 0.793858,
+          "normalization": 0.136247,
+          "augmentation": 3.104091,
+          "download": 0.539223,
+          "total": 4.573419
+        },
+        {
+          "repetition": 4,
+          "crop": 2,
+          "read_sample": 1.194893,
+          "normalization": 0.137652,
+          "augmentation": 3.131302,
+          "download": 0.541934,
+          "total": 5.005781
+        },
+        {
+          "repetition": 4,
+          "crop": 3,
+          "read_sample": 0.891287,
+          "normalization": 0.139043,
+          "augmentation": 3.133161,
+          "download": 0.580627,
+          "total": 4.744118
+        },
+        {
+          "repetition": 4,
+          "crop": 4,
+          "read_sample": 0.933408,
+          "normalization": 0.136091,
+          "augmentation": 3.113914,
+          "download": 0.575093,
+          "total": 4.758506
+        },
+        {
+          "repetition": 4,
+          "crop": 5,
+          "read_sample": 1.053634,
+          "normalization": 0.138296,
+          "augmentation": 3.320402,
+          "download": 0.795029,
+          "total": 5.307361
+        },
+        {
+          "repetition": 5,
+          "crop": 0,
+          "read_sample": 1.045365,
+          "normalization": 0.13861,
+          "augmentation": 3.126476,
+          "download": 0.587291,
+          "total": 4.897742
+        },
+        {
+          "repetition": 5,
+          "crop": 1,
+          "read_sample": 1.153074,
+          "normalization": 0.145635,
+          "augmentation": 3.565324,
+          "download": 0.545127,
+          "total": 5.40916
+        },
+        {
+          "repetition": 5,
+          "crop": 2,
+          "read_sample": 1.266489,
+          "normalization": 0.139185,
+          "augmentation": 3.128423,
+          "download": 0.542456,
+          "total": 5.076553
+        },
+        {
+          "repetition": 5,
+          "crop": 3,
+          "read_sample": 0.941654,
+          "normalization": 0.136274,
+          "augmentation": 3.127216,
+          "download": 0.55475,
+          "total": 4.759894
+        },
+        {
+          "repetition": 5,
+          "crop": 4,
+          "read_sample": 1.34461,
+          "normalization": 0.143888,
+          "augmentation": 3.146539,
+          "download": 0.578514,
+          "total": 5.213551
+        },
+        {
+          "repetition": 5,
+          "crop": 5,
+          "read_sample": 1.012365,
+          "normalization": 0.137634,
+          "augmentation": 3.198796,
+          "download": 0.760999,
+          "total": 5.109794
+        },
+        {
+          "repetition": 6,
+          "crop": 0,
+          "read_sample": 0.832824,
+          "normalization": 0.133442,
+          "augmentation": 3.105686,
+          "download": 0.540508,
+          "total": 4.61246
+        },
+        {
+          "repetition": 6,
+          "crop": 1,
+          "read_sample": 0.977007,
+          "normalization": 0.137897,
+          "augmentation": 3.1288,
+          "download": 0.535892,
+          "total": 4.779596
+        },
+        {
+          "repetition": 6,
+          "crop": 2,
+          "read_sample": 1.423655,
+          "normalization": 0.138294,
+          "augmentation": 3.133992,
+          "download": 0.533187,
+          "total": 5.229128
+        },
+        {
+          "repetition": 6,
+          "crop": 3,
+          "read_sample": 1.003845,
+          "normalization": 0.13708,
+          "augmentation": 3.115211,
+          "download": 0.532724,
+          "total": 4.78886
+        },
+        {
+          "repetition": 6,
+          "crop": 4,
+          "read_sample": 1.246154,
+          "normalization": 0.13563,
+          "augmentation": 3.12142,
+          "download": 0.556887,
+          "total": 5.060091
+        },
+        {
+          "repetition": 6,
+          "crop": 5,
+          "read_sample": 0.94002,
+          "normalization": 0.136674,
+          "augmentation": 3.123721,
+          "download": 0.555796,
+          "total": 4.756211
+        },
+        {
+          "repetition": 7,
+          "crop": 0,
+          "read_sample": 0.933423,
+          "normalization": 0.118773,
+          "augmentation": 3.098253,
+          "download": 0.555447,
+          "total": 4.705896
+        },
+        {
+          "repetition": 7,
+          "crop": 1,
+          "read_sample": 0.958584,
+          "normalization": 0.136564,
+          "augmentation": 3.366873,
+          "download": 0.56802,
+          "total": 5.030041
+        },
+        {
+          "repetition": 7,
+          "crop": 2,
+          "read_sample": 1.003443,
+          "normalization": 0.13926,
+          "augmentation": 3.134046,
+          "download": 0.530203,
+          "total": 4.806952
+        },
+        {
+          "repetition": 7,
+          "crop": 3,
+          "read_sample": 0.86285,
+          "normalization": 0.140381,
+          "augmentation": 3.127208,
+          "download": 0.534735,
+          "total": 4.665174
+        },
+        {
+          "repetition": 7,
+          "crop": 4,
+          "read_sample": 1.029115,
+          "normalization": 0.13683,
+          "augmentation": 3.118957,
+          "download": 0.531908,
+          "total": 4.81681
+        },
+        {
+          "repetition": 7,
+          "crop": 5,
+          "read_sample": 1.008486,
+          "normalization": 0.140833,
+          "augmentation": 3.112856,
+          "download": 0.558031,
+          "total": 4.820206
+        },
+        {
+          "repetition": 8,
+          "crop": 0,
+          "read_sample": 0.991537,
+          "normalization": 0.13716,
+          "augmentation": 3.131998,
+          "download": 0.533013,
+          "total": 4.793708
+        },
+        {
+          "repetition": 8,
+          "crop": 1,
+          "read_sample": 1.222294,
+          "normalization": 0.200437,
+          "augmentation": 3.674617,
+          "download": 0.538312,
+          "total": 5.63566
+        },
+        {
+          "repetition": 8,
+          "crop": 2,
+          "read_sample": 0.953825,
+          "normalization": 0.141887,
+          "augmentation": 3.120167,
+          "download": 0.533126,
+          "total": 4.749005
+        },
+        {
+          "repetition": 8,
+          "crop": 3,
+          "read_sample": 1.007681,
+          "normalization": 0.137765,
+          "augmentation": 3.120334,
+          "download": 0.538158,
+          "total": 4.803938
+        },
+        {
+          "repetition": 8,
+          "crop": 4,
+          "read_sample": 1.081311,
+          "normalization": 0.136457,
+          "augmentation": 3.117303,
+          "download": 0.55244,
+          "total": 4.887511
+        },
+        {
+          "repetition": 8,
+          "crop": 5,
+          "read_sample": 0.936032,
+          "normalization": 0.13761,
+          "augmentation": 3.138238,
+          "download": 0.585611,
+          "total": 4.797491
+        },
+        {
+          "repetition": 9,
+          "crop": 0,
+          "read_sample": 0.845854,
+          "normalization": 0.13319,
+          "augmentation": 3.379006,
+          "download": 0.732124,
+          "total": 5.090174
+        },
+        {
+          "repetition": 9,
+          "crop": 1,
+          "read_sample": 0.915357,
+          "normalization": 0.136331,
+          "augmentation": 3.123589,
+          "download": 0.563468,
+          "total": 4.738745
+        },
+        {
+          "repetition": 9,
+          "crop": 2,
+          "read_sample": 1.097978,
+          "normalization": 0.13731,
+          "augmentation": 3.126742,
+          "download": 0.56023,
+          "total": 4.92226
+        },
+        {
+          "repetition": 9,
+          "crop": 3,
+          "read_sample": 1.02936,
+          "normalization": 0.141955,
+          "augmentation": 3.137254,
+          "download": 0.560806,
+          "total": 4.869375
+        },
+        {
+          "repetition": 9,
+          "crop": 4,
+          "read_sample": 1.175382,
+          "normalization": 0.183372,
+          "augmentation": 3.34896,
+          "download": 0.57512,
+          "total": 5.282834
+        },
+        {
+          "repetition": 9,
+          "crop": 5,
+          "read_sample": 0.975784,
+          "normalization": 0.13435,
+          "augmentation": 3.121533,
+          "download": 0.54604,
+          "total": 4.777707
+        }
+      ],
+      "crops_per_second": 204.8587021245213,
+      "mvoxels_per_second": 429.6198368778441,
+      "output_gib_per_second": 1.6004586103478227
+    },
+    "hybrid": {
+      "timings": {
+        "read_sample": {
+          "mean_ms": 0.55162825,
+          "p50_ms": 0.5408615,
+          "p95_ms": 0.7804199499999999,
+          "min_ms": 0.316488,
+          "max_ms": 0.900323
+        },
+        "normalization": {
+          "mean_ms": 0.11876634999999999,
+          "p50_ms": 0.11280699999999999,
+          "p95_ms": 0.14186855,
+          "min_ms": 0.102299,
+          "max_ms": 0.216854
+        },
+        "augmentation": {
+          "mean_ms": 3.1644031500000005,
+          "p50_ms": 3.09907,
+          "p95_ms": 3.5034710499999995,
+          "min_ms": 3.07443,
+          "max_ms": 3.826753
+        },
+        "download": {
+          "mean_ms": 0.5577937,
+          "p50_ms": 0.546051,
+          "p95_ms": 0.6682859999999999,
+          "min_ms": 0.514562,
+          "max_ms": 0.722292
+        },
+        "total": {
+          "mean_ms": 4.39259145,
+          "p50_ms": 4.370788,
+          "p95_ms": 4.94602015,
+          "min_ms": 4.068164,
+          "max_ms": 5.448903
+        }
+      },
+      "samples": 60,
+      "raw_ms": [
+        {
+          "repetition": 0,
+          "crop": 0,
+          "read_sample": 0.655835,
+          "normalization": 0.120388,
+          "augmentation": 3.114351,
+          "download": 0.524543,
+          "total": 4.415117
+        },
+        {
+          "repetition": 0,
+          "crop": 1,
+          "read_sample": 0.34725,
+          "normalization": 0.110468,
+          "augmentation": 3.093787,
+          "download": 0.547747,
+          "total": 4.099252
+        },
+        {
+          "repetition": 0,
+          "crop": 2,
+          "read_sample": 0.619327,
+          "normalization": 0.115657,
+          "augmentation": 3.088153,
+          "download": 0.559354,
+          "total": 4.382491
+        },
+        {
+          "repetition": 0,
+          "crop": 3,
+          "read_sample": 0.476353,
+          "normalization": 0.111779,
+          "augmentation": 3.146923,
+          "download": 0.564976,
+          "total": 4.300031
+        },
+        {
+          "repetition": 0,
+          "crop": 4,
+          "read_sample": 0.612445,
+          "normalization": 0.111561,
+          "augmentation": 3.07599,
+          "download": 0.555708,
+          "total": 4.355704
+        },
+        {
+          "repetition": 0,
+          "crop": 5,
+          "read_sample": 0.573954,
+          "normalization": 0.112783,
+          "augmentation": 3.081503,
+          "download": 0.589729,
+          "total": 4.357969
+        },
+        {
+          "repetition": 1,
+          "crop": 0,
+          "read_sample": 0.392234,
+          "normalization": 0.10563,
+          "augmentation": 3.083581,
+          "download": 0.550414,
+          "total": 4.131859
+        },
+        {
+          "repetition": 1,
+          "crop": 1,
+          "read_sample": 0.374433,
+          "normalization": 0.111277,
+          "augmentation": 3.08887,
+          "download": 0.561255,
+          "total": 4.135835
+        },
+        {
+          "repetition": 1,
+          "crop": 2,
+          "read_sample": 0.681855,
+          "normalization": 0.112577,
+          "augmentation": 3.087959,
+          "download": 0.535046,
+          "total": 4.417437
+        },
+        {
+          "repetition": 1,
+          "crop": 3,
+          "read_sample": 0.554329,
+          "normalization": 0.108156,
+          "augmentation": 3.428089,
+          "download": 0.581099,
+          "total": 4.671673
+        },
+        {
+          "repetition": 1,
+          "crop": 4,
+          "read_sample": 0.900323,
+          "normalization": 0.118958,
+          "augmentation": 3.106213,
+          "download": 0.529035,
+          "total": 4.654529
+        },
+        {
+          "repetition": 1,
+          "crop": 5,
+          "read_sample": 0.505227,
+          "normalization": 0.11287,
+          "augmentation": 3.088591,
+          "download": 0.520026,
+          "total": 4.226714
+        },
+        {
+          "repetition": 2,
+          "crop": 0,
+          "read_sample": 0.674982,
+          "normalization": 0.141824,
+          "augmentation": 3.202983,
+          "download": 0.628001,
+          "total": 4.64779
+        },
+        {
+          "repetition": 2,
+          "crop": 1,
+          "read_sample": 0.392549,
+          "normalization": 0.11209,
+          "augmentation": 3.090762,
+          "download": 0.535737,
+          "total": 4.131138
+        },
+        {
+          "repetition": 2,
+          "crop": 2,
+          "read_sample": 0.707224,
+          "normalization": 0.124322,
+          "augmentation": 3.121156,
+          "download": 0.560084,
+          "total": 4.512786
+        },
+        {
+          "repetition": 2,
+          "crop": 3,
+          "read_sample": 0.596729,
+          "normalization": 0.115764,
+          "augmentation": 3.124138,
+          "download": 0.566131,
+          "total": 4.402762
+        },
+        {
+          "repetition": 2,
+          "crop": 4,
+          "read_sample": 0.483313,
+          "normalization": 0.112619,
+          "augmentation": 3.090466,
+          "download": 0.560034,
+          "total": 4.246432
+        },
+        {
+          "repetition": 2,
+          "crop": 5,
+          "read_sample": 0.624588,
+          "normalization": 0.121751,
+          "augmentation": 3.099845,
+          "download": 0.560901,
+          "total": 4.407085
+        },
+        {
+          "repetition": 3,
+          "crop": 0,
+          "read_sample": 0.414726,
+          "normalization": 0.113244,
+          "augmentation": 3.089995,
+          "download": 0.529058,
+          "total": 4.147023
+        },
+        {
+          "repetition": 3,
+          "crop": 1,
+          "read_sample": 0.339595,
+          "normalization": 0.109735,
+          "augmentation": 3.094811,
+          "download": 0.537505,
+          "total": 4.081646
+        },
+        {
+          "repetition": 3,
+          "crop": 2,
+          "read_sample": 0.778473,
+          "normalization": 0.120114,
+          "augmentation": 3.439611,
+          "download": 0.607467,
+          "total": 4.945665
+        },
+        {
+          "repetition": 3,
+          "crop": 3,
+          "read_sample": 0.420018,
+          "normalization": 0.113478,
+          "augmentation": 3.109555,
+          "download": 0.56017,
+          "total": 4.203221
+        },
+        {
+          "repetition": 3,
+          "crop": 4,
+          "read_sample": 0.366896,
+          "normalization": 0.110947,
+          "augmentation": 3.087415,
+          "download": 0.54749,
+          "total": 4.112748
+        },
+        {
+          "repetition": 3,
+          "crop": 5,
+          "read_sample": 0.737928,
+          "normalization": 0.216854,
+          "augmentation": 3.826753,
+          "download": 0.667368,
+          "total": 5.448903
+        },
+        {
+          "repetition": 4,
+          "crop": 0,
+          "read_sample": 0.417326,
+          "normalization": 0.109403,
+          "augmentation": 3.084565,
+          "download": 0.51566,
+          "total": 4.126954
+        },
+        {
+          "repetition": 4,
+          "crop": 1,
+          "read_sample": 0.353777,
+          "normalization": 0.109348,
+          "augmentation": 3.086898,
+          "download": 0.524389,
+          "total": 4.074412
+        },
+        {
+          "repetition": 4,
+          "crop": 2,
+          "read_sample": 0.477455,
+          "normalization": 0.111329,
+          "augmentation": 3.096097,
+          "download": 0.523307,
+          "total": 4.208188
+        },
+        {
+          "repetition": 4,
+          "crop": 3,
+          "read_sample": 0.426899,
+          "normalization": 0.110967,
+          "augmentation": 3.090342,
+          "download": 0.583654,
+          "total": 4.211862
+        },
+        {
+          "repetition": 4,
+          "crop": 4,
+          "read_sample": 0.43719,
+          "normalization": 0.110385,
+          "augmentation": 3.500475,
+          "download": 0.685728,
+          "total": 4.733778
+        },
+        {
+          "repetition": 4,
+          "crop": 5,
+          "read_sample": 0.602521,
+          "normalization": 0.118041,
+          "augmentation": 3.471911,
+          "download": 0.566337,
+          "total": 4.75881
+        },
+        {
+          "repetition": 5,
+          "crop": 0,
+          "read_sample": 0.525073,
+          "normalization": 0.141173,
+          "augmentation": 3.185305,
+          "download": 0.568808,
+          "total": 4.420359
+        },
+        {
+          "repetition": 5,
+          "crop": 1,
+          "read_sample": 0.690178,
+          "normalization": 0.117045,
+          "augmentation": 3.423253,
+          "download": 0.722292,
+          "total": 4.952768
+        },
+        {
+          "repetition": 5,
+          "crop": 2,
+          "read_sample": 0.817412,
+          "normalization": 0.113687,
+          "augmentation": 3.092737,
+          "download": 0.527461,
+          "total": 4.551297
+        },
+        {
+          "repetition": 5,
+          "crop": 3,
+          "read_sample": 0.776828,
+          "normalization": 0.123179,
+          "augmentation": 3.103539,
+          "download": 0.546356,
+          "total": 4.549902
+        },
+        {
+          "repetition": 5,
+          "crop": 4,
+          "read_sample": 0.674584,
+          "normalization": 0.113984,
+          "augmentation": 3.104254,
+          "download": 0.523164,
+          "total": 4.415986
+        },
+        {
+          "repetition": 5,
+          "crop": 5,
+          "read_sample": 0.385456,
+          "normalization": 0.108505,
+          "augmentation": 3.096892,
+          "download": 0.586208,
+          "total": 4.177061
+        },
+        {
+          "repetition": 6,
+          "crop": 0,
+          "read_sample": 0.522712,
+          "normalization": 0.11086,
+          "augmentation": 3.090773,
+          "download": 0.517871,
+          "total": 4.242216
+        },
+        {
+          "repetition": 6,
+          "crop": 1,
+          "read_sample": 0.316488,
+          "normalization": 0.109269,
+          "augmentation": 3.101393,
+          "download": 0.541014,
+          "total": 4.068164
+        },
+        {
+          "repetition": 6,
+          "crop": 2,
+          "read_sample": 0.841403,
+          "normalization": 0.102299,
+          "augmentation": 3.103521,
+          "download": 0.517251,
+          "total": 4.564474
+        },
+        {
+          "repetition": 6,
+          "crop": 3,
+          "read_sample": 0.601286,
+          "normalization": 0.120141,
+          "augmentation": 3.114701,
+          "download": 0.522957,
+          "total": 4.359085
+        },
+        {
+          "repetition": 6,
+          "crop": 4,
+          "read_sample": 0.547695,
+          "normalization": 0.110294,
+          "augmentation": 3.087398,
+          "download": 0.582409,
+          "total": 4.327796
+        },
+        {
+          "repetition": 6,
+          "crop": 5,
+          "read_sample": 0.658151,
+          "normalization": 0.209526,
+          "augmentation": 3.574278,
+          "download": 0.576078,
+          "total": 5.018033
+        },
+        {
+          "repetition": 7,
+          "crop": 0,
+          "read_sample": 0.612851,
+          "normalization": 0.117736,
+          "augmentation": 3.109075,
+          "download": 0.545746,
+          "total": 4.385408
+        },
+        {
+          "repetition": 7,
+          "crop": 1,
+          "read_sample": 0.597945,
+          "normalization": 0.125635,
+          "augmentation": 3.560396,
+          "download": 0.529483,
+          "total": 4.813459
+        },
+        {
+          "repetition": 7,
+          "crop": 2,
+          "read_sample": 0.47108,
+          "normalization": 0.112101,
+          "augmentation": 3.086217,
+          "download": 0.523944,
+          "total": 4.193342
+        },
+        {
+          "repetition": 7,
+          "crop": 3,
+          "read_sample": 0.44566,
+          "normalization": 0.122294,
+          "augmentation": 3.081478,
+          "download": 0.522092,
+          "total": 4.171524
+        },
+        {
+          "repetition": 7,
+          "crop": 4,
+          "read_sample": 0.478906,
+          "normalization": 0.110924,
+          "augmentation": 3.07443,
+          "download": 0.524476,
+          "total": 4.188736
+        },
+        {
+          "repetition": 7,
+          "crop": 5,
+          "read_sample": 0.74409,
+          "normalization": 0.112646,
+          "augmentation": 3.090889,
+          "download": 0.543839,
+          "total": 4.491464
+        },
+        {
+          "repetition": 8,
+          "crop": 0,
+          "read_sample": 0.534028,
+          "normalization": 0.142715,
+          "augmentation": 3.396992,
+          "download": 0.622358,
+          "total": 4.696093
+        },
+        {
+          "repetition": 8,
+          "crop": 1,
+          "read_sample": 0.355132,
+          "normalization": 0.1121,
+          "augmentation": 3.096281,
+          "download": 0.514562,
+          "total": 4.078075
+        },
+        {
+          "repetition": 8,
+          "crop": 2,
+          "read_sample": 0.50133,
+          "normalization": 0.114586,
+          "augmentation": 3.104932,
+          "download": 0.522524,
+          "total": 4.243372
+        },
+        {
+          "repetition": 8,
+          "crop": 3,
+          "read_sample": 0.411714,
+          "normalization": 0.111649,
+          "augmentation": 3.112363,
+          "download": 0.528395,
+          "total": 4.164121
+        },
+        {
+          "repetition": 8,
+          "crop": 4,
+          "read_sample": 0.518109,
+          "normalization": 0.112831,
+          "augmentation": 3.164363,
+          "download": 0.688182,
+          "total": 4.483485
+        },
+        {
+          "repetition": 8,
+          "crop": 5,
+          "read_sample": 0.655685,
+          "normalization": 0.108845,
+          "augmentation": 3.094826,
+          "download": 0.52919,
+          "total": 4.388546
+        },
+        {
+          "repetition": 9,
+          "crop": 0,
+          "read_sample": 0.468104,
+          "normalization": 0.115057,
+          "augmentation": 3.09057,
+          "download": 0.550081,
+          "total": 4.223812
+        },
+        {
+          "repetition": 9,
+          "crop": 1,
+          "read_sample": 0.614679,
+          "normalization": 0.11935,
+          "augmentation": 3.122995,
+          "download": 0.544409,
+          "total": 4.401433
+        },
+        {
+          "repetition": 9,
+          "crop": 2,
+          "read_sample": 0.625194,
+          "normalization": 0.125624,
+          "augmentation": 3.110591,
+          "download": 0.541145,
+          "total": 4.402554
+        },
+        {
+          "repetition": 9,
+          "crop": 3,
+          "read_sample": 0.450575,
+          "normalization": 0.111496,
+          "augmentation": 3.098295,
+          "download": 0.555209,
+          "total": 4.215575
+        },
+        {
+          "repetition": 9,
+          "crop": 4,
+          "read_sample": 0.646284,
+          "normalization": 0.124824,
+          "augmentation": 3.10137,
+          "download": 0.527808,
+          "total": 4.400286
+        },
+        {
+          "repetition": 9,
+          "crop": 5,
+          "read_sample": 0.663309,
+          "normalization": 0.111287,
+          "augmentation": 3.098294,
+          "download": 0.544357,
+          "total": 4.417247
+        }
+      ],
+      "crops_per_second": 227.65604572672012,
+      "mvoxels_per_second": 477.42933160788255,
+      "output_gib_per_second": 1.778562857240001
+    }
+  },
+  "input": {
+    "location": "/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+    "shape": [
+      18946,
+      8174,
+      8174
+    ],
+    "chunks": [
+      128,
+      128,
+      128
+    ],
+    "dtype": "uint8",
+    "origins": [
+      [
+        9000,
+        3600,
+        3600
+      ],
+      [
+        9093,
+        3371,
+        3456
+      ],
+      [
+        8838,
+        3434,
+        3759
+      ],
+      [
+        9216,
+        3485,
+        3763
+      ],
+      [
+        9199,
+        3606,
+        3469
+      ],
+      [
+        9166,
+        3453,
+        3723
+      ]
+    ],
+    "axes": [
+      [
+        1.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        1.0,
+        -0.0
+      ],
+      [
+        0.0,
+        0.0,
+        1.0
+      ]
+    ]
+  },
+  "cache_stats": {
+    "before_measurement": {
+      "host": {
+        "memory_hits": 0,
+        "pending_hits": 0,
+        "pending_writes": 0,
+        "disk_hits": 360,
+        "remote_fetches": 0,
+        "remote_missing": 0,
+        "remote_bytes": 0,
+        "write_errors": 0,
+        "last_write_error": ""
+      },
+      "cuda": {
+        "cache_bytes": 0,
+        "cache_budget": 536870912,
+        "cache_hits": 0,
+        "chunk_uploads": 2100,
+        "uploaded_bytes": 68812800,
+        "cpu_routes": 18,
+        "gpu_routes": 18
+      }
+    },
+    "after_measurement": {
+      "host": {
+        "memory_hits": 0,
+        "pending_hits": 0,
+        "pending_writes": 0,
+        "disk_hits": 1560,
+        "remote_fetches": 0,
+        "remote_missing": 0,
+        "remote_bytes": 0,
+        "write_errors": 0,
+        "last_write_error": ""
+      },
+      "cuda": {
+        "cache_bytes": 0,
+        "cache_budget": 536870912,
+        "cache_hits": 0,
+        "chunk_uploads": 9100,
+        "uploaded_bytes": 298188800,
+        "cpu_routes": 78,
+        "gpu_routes": 78
+      }
+    }
+  },
+  "speedup_cpu_over_cuda": {
+    "read_sample": 0.49005240942985934,
+    "normalization": 39.21087269710993,
+    "augmentation": 53.596373720620925,
+    "total": 36.04009465574298
+  },
+  "speedup_over_hybrid": {
+    "cpu": 39.67962813570459,
+    "cuda": 1.1009856803853217
+  }
+}
