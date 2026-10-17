@@ -42,6 +42,36 @@ chunks before each crop to include uploads, while `warm` reuses the device cache
 subject to its budget. This is a sequential latency/throughput benchmark, not a
 cold-storage or overlapped training-loader benchmark.
 
+## Regenerate augmentation previews
+
+[`scripts/generate_augment_previews.py`](scripts/generate_augment_previews.py)
+reads a real Zarr crop and writes lossless WebPs with the filenames used below.
+It needs the `previews` extra (NumPy and Pillow with WebP support) and the native
+reader/augmentation extensions. The README's constructor examples supply the
+recipes, so there is no separate catalog to maintain.
+
+```bash
+python scripts/generate_augment_previews.py --array /path/to/volume.zarr --level 2 \
+  --start 9000 3600 3600 --reference-start 9384 3600 3600 --size 128 \
+  --output docs/augmentations/previews --manifest /tmp/augmentation-previews.json
+```
+
+Use coordinates appropriate to your volume and selected level; omit `--start`
+for a centered crop. The default intensity divisor is 255; set `--divisor` for
+other intensity ranges. `--only Elastic Gamma` regenerates selected examples.
+The default seed is 123, with five candidate seeds per augmentation; the script
+chooses the one changing the most voxels. It selects visibly affected Z/Y/X
+planes and uses a shared display window for each original/augmented pair.
+Gold boxes mark localized changes. Label examples use a mask derived from
+CT > 0.5 after scaling, not manual annotations. The 2D companions get one WebP
+each; `SurfacePerturb` uses a synthetic coordinate surface with CT-derived height.
+
+The optional manifest records input hashes, recipes, selected seeds, and slice
+indices. Use `--output /tmp/previews` to inspect a new dataset first. This script
+generates still images; existing README timings and the Elastic video are
+preserved. Recipes retain their literal sizes (such as the 112³ crop), so use
+128³ input to match the documented examples.
+
 ## Augmentations
 
 Each entry shows the **measured configuration**, not the constructor defaults. Use `from vc_reader import augment as A`.

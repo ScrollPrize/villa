@@ -22,6 +22,13 @@ class DeviceArray:
     reshape() is a view; astype(float32) converts uint8 on device.
     """
     def __init__(self, native, shape, dtype, device=0):
+        storage_type = getattr(_native, "CudaStorage", None)
+        if storage_type is not None and isinstance(native, storage_type):
+            # Native reader results own storage; kernels consume its array view.
+            # This synchronous public adapter can export views through DLPack,
+            # so keep destruction safe for consumers on external streams.
+            native.export()
+            native = _native._cuda_view(native.array(), shape, 0)
         self._native = native
         self.shape = tuple(shape)
         self.dtype = np.dtype(dtype)

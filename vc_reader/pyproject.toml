@@ -23,6 +23,7 @@ dependencies = []
 [project.optional-dependencies]
 reader = ["numpy>=1.24"]
 augment = ["numpy>=1.24"]
+previews = ["numpy>=1.24", "Pillow>=10.1"]
 
 [project.scripts]
 vc-reader = "vc_reader.cli:main"

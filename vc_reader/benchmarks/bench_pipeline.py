@@ -12,8 +12,10 @@ import hashlib
 import importlib.util
 import itertools
 import json
+import os
 from pathlib import Path
 import platform
+import subprocess
 import sys
 import tempfile
 import time
@@ -171,6 +173,22 @@ def benchmark(args):
                                 speedup="CPU / CUDA p50 latency; >1 means CUDA is faster",
                                 endpoints="CPU host; CUDA " + args.cuda_output),
                   validation=dict(atol=5e-5, rtol=1e-5, crops=[]), results={})
+    report["environment"].update(cpu_count=os.cpu_count(),
+                                 affinity=sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None)
+    cache = args.native_dir / "CMakeCache.txt" if args.native_dir else None
+    report["environment"]["build"] = {"type": "unknown (use --native-dir to record CMake settings)"}
+    if cache and cache.is_file():
+        keys = ("CMAKE_BUILD_TYPE", "CMAKE_CXX_COMPILER", "CMAKE_CUDA_ARCHITECTURES", "VC_READER_ENABLE_CUDA")
+        report["environment"]["build"] = {line.split(":", 1)[0]: line.split("=", 1)[1]
+                                          for line in cache.read_text().splitlines()
+                                          if "=" in line and line.split(":", 1)[0] in keys}
+    if "cuda" in modes:
+        try:
+            info = subprocess.run(["nvidia-smi", "--query-gpu=index,name,driver_version", "--format=csv,noheader"],
+                                  capture_output=True, text=True, timeout=5, check=True)
+            report["environment"]["gpus"] = info.stdout.strip().splitlines()
+        except (OSError, subprocess.SubprocessError):
+            report["environment"]["gpus"] = "nvidia-smi unavailable"
     for name, module in (("reader", _native), ("augment", _augment)):
         path = Path(module.__file__)
         report["environment"]["extensions"][name] = dict(path=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest())
@@ -195,7 +213,7 @@ def benchmark(args):
             return run_crop(readers[mode], *pipelines[mode], origins[index], axes, args,
                             args.seed + index, cuda=mode == "cuda")
 
-        # Validate before warmup. A CUDA-only run never silently executes CPU work.
+        # Validate before warmup; CUDA-only runs do not run a CPU reference pipeline.
         for index in range(args.crops):
             outputs = {}
             for mode in modes:
