@@ -399,6 +399,10 @@ def _run_training(request: TrainingRequest) -> int:
     from tqdm import tqdm
 
     from vesuvius.ink_detection.data.dataset import InkDataset
+    from vesuvius.ink_detection.data.heldout import (
+        assert_heldout_isolated,
+        has_heldout_validation,
+    )
     from vesuvius.ink_detection.training.losses import create_loss
     from vesuvius.ink_detection.models.model import make_model
     from vesuvius.ink_detection.training.optimizers import create_training_optimizer
@@ -459,6 +463,17 @@ def _run_training(request: TrainingRequest) -> int:
     if not shared_dataset.training_patches:
         raise ValueError(
             "InkDataset produced no training patches after applying supervision masking"
+        )
+    if has_heldout_validation(dataset_config):
+        heldout_report = assert_heldout_isolated(
+            shared_dataset.training_patches,
+            shared_dataset.validation_patches,
+            dataset_config,
+            shared_dataset.segments,
+        )
+        accelerator.print(
+            "heldout_validation=" + json.dumps(heldout_report, sort_keys=True),
+            flush=True,
         )
     train_dataset_kwargs = {
         "do_augmentations": True,
