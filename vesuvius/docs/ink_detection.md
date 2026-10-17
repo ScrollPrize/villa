@@ -93,10 +93,15 @@ subdirectory once. An over-budget directory is pruned oldest-mtime-first to at
 most 90% of the budget; an at- or under-budget directory is left alone. Zarr's
 CacheStore then applies a process-local steady-state LRU. Multiple workers may
 share the directory safely because LocalStore installs complete values
-atomically, but independent process accounting means the directory can briefly
-overshoot its budget before a later open-time sweep. Every process constructs
-its own source store after it starts; a remote fsspec store is never inherited
-as the active transport across a fork.
+atomically; on Windows the cache-side store additionally retries the transient
+`PermissionError` (winerror `ERROR_ACCESS_DENIED`/`ERROR_SHARING_VIOLATION`,
+surfacing as errno 13) that NTFS reports when one worker opens a cache file at
+the exact moment another worker atomically replaces it, with the same bounded
+sub-second backoff zarr uses on the write side. A denial that persists past
+that bound still propagates. Independent process accounting means the directory
+can briefly overshoot its budget before a later open-time sweep. Every process
+constructs its own source store after it starts; a remote fsspec store is
+never inherited as the active transport across a fork.
 
 ## Shipped aligned-corpus configs
 

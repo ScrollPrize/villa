@@ -6,6 +6,7 @@ import hashlib
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import multiprocessing as mp
 import os
+import sys
 from pathlib import Path
 import threading
 from types import SimpleNamespace
@@ -423,3 +424,157 @@ def test_missing_node_error_has_zarr2_fallback(monkeypatch):
     assert isinstance(
         volume_io._missing_node_error("missing"), CompatiblePathError
     )
+
+
+@pytest.mark.skipif(
+    not _ZARR_V3 or sys.platform != "win32",
+    reason="Windows-only NTFS replace-vs-open retry mechanism",
+)
+def test_shared_cache_backend_retries_transient_permission_error(tmp_path):
+    """A transient replace-vs-open PermissionError is retried, not raised."""
+    from zarr.core.buffer.core import default_buffer_prototype
+
+    store = volume_io._cache_store_for_shared_cache(tmp_path)
+    target = tmp_path / "k"
+    target.write_bytes(b"payload")
+
+    original = Path.read_bytes
+    failures = [0]
+
+    def flaky_read(path):
+        if path == target and failures[0] < 1:
+            failures[0] += 1
+            raise PermissionError(13, "Permission denied")
+        return original(path)
+
+    Path.read_bytes = flaky_read
+    try:
+        buf = asyncio.run(store.get("k", prototype=default_buffer_prototype()))
+    finally:
+        Path.read_bytes = original
+    assert buf is not None and buf.to_bytes() == b"payload"
+    assert failures[0] == 1
+
+
+@pytest.mark.skipif(
+    not _ZARR_V3 or sys.platform != "win32",
+    reason="Windows-only NTFS replace-vs-open retry mechanism",
+)
+def test_shared_cache_backend_retries_transient_permission_error_with_range(
+    tmp_path,
+):
+    """A transient denial on a byte-range read is also retried."""
+    from zarr.abc.store import OffsetByteRequest
+    from zarr.core.buffer.core import default_buffer_prototype
+
+    store = volume_io._cache_store_for_shared_cache(tmp_path)
+    target = tmp_path / "k"
+    target.write_bytes(b"payload")
+
+    original_open = Path.open
+    failures = [0]
+
+    def flaky_open(path, *args, **kwargs):
+        if path == target and failures[0] < 1:
+            failures[0] += 1
+            raise PermissionError(13, "Permission denied")
+        return original_open(path, *args, **kwargs)
+
+    Path.open = flaky_open
+    try:
+        buf = asyncio.run(
+            store.get(
+                "k",
+                prototype=default_buffer_prototype(),
+                byte_range=OffsetByteRequest(4),
+            )
+        )
+    finally:
+        Path.open = original_open
+    assert buf is not None and buf.to_bytes() == b"oad"
+    assert failures[0] == 1
+
+
+@pytest.mark.skipif(
+    not _ZARR_V3 or sys.platform != "win32",
+    reason="Windows-only NTFS replace-vs-open retry mechanism",
+)
+def test_shared_cache_backend_raises_after_retry_exhaustion(tmp_path):
+    """A persistent denial exhausts the bounded retries and then propagates."""
+    from zarr.core.buffer.core import default_buffer_prototype
+
+    store = volume_io._cache_store_for_shared_cache(tmp_path)
+    target = tmp_path / "k"
+    target.write_bytes(b"payload")
+
+    attempts = [0]
+
+    def always_denied(path):
+        if path == target:
+            attempts[0] += 1
+        raise PermissionError(13, "Permission denied")
+
+    original = Path.read_bytes
+    Path.read_bytes = always_denied
+    try:
+        with pytest.raises(PermissionError):
+            asyncio.run(store.get("k", prototype=default_buffer_prototype()))
+    finally:
+        Path.read_bytes = original
+    assert attempts[0] == 1 + len(volume_io._TRANSIENT_READ_DELAYS)
+
+
+@pytest.mark.skipif(
+    not _ZARR_V3 or sys.platform != "win32",
+    reason="Windows-only NTFS replace-vs-open retry mechanism",
+)
+def test_shared_cache_backend_non_transient_winerror_is_not_retried(tmp_path):
+    """A PermissionError carrying a non-transient winerror fails immediately."""
+    from zarr.core.buffer.core import default_buffer_prototype
+
+    store = volume_io._cache_store_for_shared_cache(tmp_path)
+    target = tmp_path / "k"
+    target.write_bytes(b"payload")
+
+    attempts = [0]
+
+    def denied_write_protected(path):
+        if path == target:
+            attempts[0] += 1
+        error = PermissionError(13, "Permission denied")
+        error.winerror = 19
+        raise error
+
+    original = Path.read_bytes
+    Path.read_bytes = denied_write_protected
+    try:
+        with pytest.raises(PermissionError):
+            asyncio.run(store.get("k", prototype=default_buffer_prototype()))
+    finally:
+        Path.read_bytes = original
+    assert attempts[0] == 1
+
+
+@pytest.mark.skipif(not _ZARR_V3, reason="volume disk cache requires Zarr 3")
+def test_shared_cache_backend_missing_key_returns_none(tmp_path):
+    """Absent cache entries read as None on both platforms."""
+    from zarr.core.buffer.core import default_buffer_prototype
+
+    store = volume_io._cache_store_for_shared_cache(tmp_path)
+    assert (
+        asyncio.run(store.get("missing", prototype=default_buffer_prototype()))
+        is None
+    )
+
+
+@pytest.mark.skipif(not _ZARR_V3, reason="volume disk cache requires Zarr 3")
+def test_shared_cache_backend_reads_plain_values_with_explicit_prototype(
+    tmp_path,
+):
+    """The cache backend serves plain reads on every platform."""
+    from zarr.core.buffer.core import default_buffer_prototype
+
+    store = volume_io._cache_store_for_shared_cache(tmp_path)
+    (tmp_path / "k").write_bytes(b"payload")
+    buf = asyncio.run(store.get("k", prototype=default_buffer_prototype()))
+    assert buf is not None and buf.to_bytes() == b"payload"

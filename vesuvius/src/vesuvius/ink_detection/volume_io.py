@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +84,50 @@ def _missing_node_error(message: str) -> Exception:
     return error_type(message)
 
 
+_TRANSIENT_WIN_ERRORS = frozenset({5, 32})
+
+_TRANSIENT_READ_DELAYS = (0.001, 0.005, 0.02, 0.05, 0.2)
+
+
+def _is_transient_replace_read_error(error: PermissionError) -> bool:
+    """True for the transient NTFS replace-vs-open denial (errno 13)."""
+    if error.errno != 13:
+        return False
+    winerror = getattr(error, "winerror", None)
+    return winerror is None or winerror in _TRANSIENT_WIN_ERRORS
+
+
+if sys.platform == "win32" and ZARR_V3:
+
+    class _SharedCacheLocalStore(zarr.storage.LocalStore):
+        """Cache-side LocalStore that retries NTFS replace-vs-open races.
+
+        Only ``get`` is wrapped, delegating to ``LocalStore.get`` so key
+        validation, byte ranges, and prototypes stay the store's own. A
+        denial that survives the bounded delays still propagates.
+        """
+
+        async def get(self, key, prototype=None, byte_range=None):
+            for delay in _TRANSIENT_READ_DELAYS:
+                try:
+                    return await super().get(key, prototype, byte_range)
+                except PermissionError as error:
+                    if _is_transient_replace_read_error(error):
+                        await asyncio.sleep(delay)
+                        continue
+                    raise
+            return await super().get(key, prototype, byte_range)
+
+
+def _cache_store_for_shared_cache(cache_path: Path):
+    """Return the cache backend, retrying transient Windows read races."""
+    if sys.platform != "win32" or not ZARR_V3:
+        from zarr.storage import LocalStore
+
+        return LocalStore(cache_path)
+    return _SharedCacheLocalStore(cache_path)
+
+
 def open_volume_root(
     path: str | Path,
     auth_json_path: str | Path | None = None,
@@ -137,7 +183,7 @@ def open_volume_root(
             source_store = LocalStore(path_text, read_only=True)
         store = CacheStore(
             store=source_store,
-            cache_store=LocalStore(cache_path),
+            cache_store=_cache_store_for_shared_cache(cache_path),
             max_size=maximum_bytes,
         )
         return zarr.open(store=store, mode="r")
