@@ -29,6 +29,7 @@ from vesuvius.ink_detection.volume_io import (
     open_volume_root,
     select_volume_level,
 )
+from vesuvius.models.utilities.get_accelerator import get_accelerator
 
 def test_inference_import_does_not_add_runtime_side_effects():
     source = """
@@ -125,8 +126,9 @@ def test_compile_fallback_returns_eager_model_when_compiler_is_unavailable(monke
     )
 
     assert prepared is source
-    # get_accelerator() picks MPS on Apple Silicon.
-    assert device.type in {"cpu", "cuda", "mps"}
+    # Without --gpus the device is get_accelerator()'s (cuda, else mps, else cpu), and the model is on it.
+    assert device == get_accelerator()
+    assert next(prepared.parameters()).device.type == device.type
 
 
 class _BackendThatFailsWhenItRuns(nn.Module):
