@@ -17,6 +17,8 @@ set(srcs
     CWindow.cpp
     FiberCollectionController.cpp
     FiberCollectionController.hpp
+    GraphDbController.cpp
+    GraphDbController.hpp
     CWindowContextMenu.cpp
     StatusDockPanelHost.cpp
     StatusDockPanelHost.hpp
@@ -322,6 +324,7 @@ set(srcs
     agent_bridge/AgentBridgeMethods_surfaceops.cpp
     agent_bridge/AgentBridgeMethods_viewer.cpp
     agent_bridge/AgentBridgeMethods_wrap.cpp
+    agent_bridge/AgentBridgeMethods_graph.cpp
     agent_bridge/AgentBridgeCommandError.hpp
     agent_bridge/AgentBridgeInternal.hpp
     agent_bridge/AgentBridgeJobs.cpp
@@ -338,6 +341,7 @@ set(srcs
     agent_bridge/AgentBridgeHandlers_review.cpp
     agent_bridge/AgentBridgeHandlers_viewer.cpp
     agent_bridge/AgentBridgeHandlers_surfaceops.cpp
+    agent_bridge/AgentBridgeHandlers_graph.cpp
 )
 
 if(VC_ENABLE_TSAN OR VC_ENABLE_LSAN OR VC_ENABLE_UBSAN OR VC_ENABLE_ASAN)
@@ -387,6 +391,7 @@ target_link_libraries(VC3D
     $<$<BOOL:${mimalloc_FOUND}>:mimalloc>
     vc_core
     vc_fiber_collection
+    vc_graph
     vc_atlas
     vc_lasagna
     vc_fiber_tracer

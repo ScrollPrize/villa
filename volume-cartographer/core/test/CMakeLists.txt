@@ -68,6 +68,11 @@ vc_add_test(NAME test_smoke LIBS doctest::doctest)
 
 vc_add_test(NAME test_fiber_collection LIBS doctest::doctest vc_fiber_collection)
 
+vc_add_test(NAME test_graph_db LIBS doctest::doctest vc_graph)
+vc_add_test(NAME test_progress LIBS doctest::doctest vc_graph)
+
+vc_add_test(NAME test_graph_links LIBS doctest::doctest vc_graph_links vc_core)
+
 vc_add_test(NAME test_omp_thread_point_collection)
 
 vc_add_test(NAME test_surface_area_units)

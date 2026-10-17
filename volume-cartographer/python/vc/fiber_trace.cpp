@@ -328,6 +328,20 @@ NB_MODULE(fiber_trace, m)
         .def_prop_ro("location", [](const PredictionFieldHandle& self) { return self.location; });
 
     nb::class_<NormalSamplerHandle>(m, "NormalSampler")
+        .def("sample_normal", [](const NormalSamplerHandle& self, Vec3 point) {
+            for (double v : point)
+                if (!std::isfinite(v)) throw std::invalid_argument("normal sample point must be finite");
+            vc::lasagna::NormalSample sample;
+            {
+                nb::gil_scoped_release release;
+                sample = self.sampler->sampleNormal(toVec(point));
+            }
+            nb::dict result;
+            result["normal"] = fromVec(sample.normal);
+            result["valid"] = sample.valid;
+            result["reason"] = sample.reason;
+            return result;
+        }, "point_xyz"_a, "Sample a Lasagna normal at working XYZ; returns normal, valid, and reason.")
         .def_prop_ro("working_to_base_scale",
                      [](const NormalSamplerHandle& self) { return self.workingToBaseScale; })
         .def_prop_ro("location", [](const NormalSamplerHandle& self) { return self.location; });

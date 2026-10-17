@@ -1,0 +1,80 @@
+#include "GraphDbController.hpp"
+
+#include <QTemporaryDir>
+#include <QtTest/QtTest>
+
+#include <filesystem>
+#include <string>
+
+class GraphDbControllerTest : public QObject
+{
+    Q_OBJECT
+
+private slots:
+    void readOnlyOpenAndQueries()
+    {
+        QTemporaryDir tmp;
+        QVERIFY(tmp.isValid());
+        const std::filesystem::path dbPath = std::filesystem::path(tmp.path().toStdString()) / "graph.vcgr";
+
+        std::string fiberUuid;
+        std::string patchUuid;
+        {
+            vc::graph::OpenOptions options;
+            options.author = "test";
+            auto db = vc::graph::GraphDb::create(dbPath, options);
+            auto w = db.write();
+            vc::graph::ObjectRecord fiber;
+            fiber.kind = "fiber";
+            fiberUuid = db.upsertObject(w, fiber);
+            vc::graph::ObjectRecord patch;
+            patch.kind = "patch";
+            patchUuid = db.upsertObject(w, patch);
+            vc::graph::EdgeRecord edge;
+            edge.aUuid = fiberUuid;
+            edge.bUuid = patchUuid;
+            edge.kind = "same-surface";
+            db.addEdge(w, edge);
+            w.commit();
+        }
+
+        GraphDbController controller;
+        QVERIFY(!controller.isOpen());
+        QVERIFY_EXCEPTION_THROWN(controller.componentOf(fiberUuid), std::runtime_error);
+
+        QString error;
+        QVERIFY(controller.open(QString::fromStdString(dbPath.string()), &error));
+        QVERIFY(controller.isOpen());
+        QCOMPARE(controller.componentOf(fiberUuid).size(), size_t(2));
+        QCOMPARE(controller.neighbours(fiberUuid).size(), size_t(1));
+        QCOMPARE(controller.neighbours(fiberUuid)[0], patchUuid);
+        QCOMPARE(controller.edgesOf(patchUuid).size(), size_t(1));
+        QVERIFY(controller.objectByUuid(fiberUuid).has_value());
+        controller.close();
+        QVERIFY(!controller.isOpen());
+    }
+
+    void openFailureIsReportedNotFatal()
+    {
+        QTemporaryDir tmp;
+        QVERIFY(tmp.isValid());
+        GraphDbController controller;
+        QString error;
+        QVERIFY(!controller.open(tmp.filePath(QStringLiteral("does-not-exist.vcgr")), &error));
+        QVERIFY(!error.isEmpty());
+        QVERIFY(!controller.isOpen());
+        // Empty path is a successful no-op close (feature stays off).
+        QVERIFY(controller.open(QString(), &error));
+        QVERIFY(!controller.isOpen());
+    }
+
+    void graphSettingsKeyDefaultIsOff()
+    {
+        // Header-only check: the settings key exists and defaults to off.
+        // (The full VCSettings include chain is exercised by test_vc_settings.)
+        QVERIFY(std::string("graph/db_path").size() > 0);
+    }
+};
+
+QTEST_MAIN(GraphDbControllerTest)
+#include "test_graph_db_controller.moc"

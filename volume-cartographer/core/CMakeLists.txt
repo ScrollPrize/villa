@@ -3,6 +3,7 @@ configure_file(src/Version.cpp.in Version.cpp)
 # Independent read-only collection reader: usable by the GUI and small tools
 # without linking the CT/tracing stack. R*Tree support is verified on open.
 find_package(SQLite3 REQUIRED)
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 add_library(vc_fiber_collection STATIC src/FiberCollection.cpp)
 target_include_directories(vc_fiber_collection PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 if(TARGET SQLite3::SQLite3)
@@ -13,7 +14,47 @@ endif()
 target_compile_features(vc_fiber_collection PUBLIC cxx_std_20)
 set_target_properties(vc_fiber_collection PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# Unified geometry/metadata graph (SQLite). Standalone like vc_fiber_collection:
+# no Qt / tracing stack, usable from the GUI, CLI tools and tests.
+add_library(vc_graph STATIC src/GraphDb.cpp)
+target_include_directories(vc_graph PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+if(TARGET SQLite3::SQLite3)
+    target_link_libraries(vc_graph PUBLIC SQLite3::SQLite3)
+else()
+    target_link_libraries(vc_graph PUBLIC SQLite::SQLite3)
+endif()
+target_link_libraries(vc_graph PRIVATE nlohmann_json::nlohmann_json OpenSSL::Crypto)
+target_compile_features(vc_graph PUBLIC cxx_std_20)
+set_target_properties(vc_graph PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# Shared with Spiral's native Python adapter; independent of geometry/Qt/Python.
+add_library(vc_track_crossings STATIC src/TrackCrossings.cpp)
+target_include_directories(vc_track_crossings PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(vc_track_crossings PRIVATE OpenMP::OpenMP_CXX)
+target_compile_features(vc_track_crossings PUBLIC cxx_std_20)
+set_target_properties(vc_track_crossings PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# Source-format ingestion/export is separate from the standalone SQLite store.
+add_library(vc_graph_geometry STATIC src/GeometryIngest.cpp src/GeometryExport.cpp)
+target_include_directories(vc_graph_geometry PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(vc_graph_geometry PUBLIC vc_graph PRIVATE vc_core nlohmann_json::nlohmann_json)
+target_compile_features(vc_graph_geometry PUBLIC cxx_std_20)
+set_target_properties(vc_graph_geometry PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# Edge detection layer above vc_graph: geometry passes that propose
+# edges (pending approval, provenance in edge meta). Depends on vc_core
+# for geometry (QuadSurface, SurfacePatchIndex, ...); vc_graph itself
+# stores typed geometry bytes without depending on source-format readers.
+add_library(vc_graph_links STATIC src/GraphLinks.cpp src/GraphLinksPatchOverlap.cpp src/GraphLinksFiberPatch.cpp src/GraphLinksTrackTrack.cpp
+    src/GraphLinksTrackInput.cpp src/GraphLinksLinePatch.cpp src/GraphLinksTrackPatch.cpp
+    src/GraphLinksPointCollectionPatch.cpp)
+target_include_directories(vc_graph_links PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(vc_graph_links PUBLIC vc_graph PRIVATE vc_track_crossings vc_core vc_lasagna nlohmann_json::nlohmann_json)
+target_compile_features(vc_graph_links PUBLIC cxx_std_20)
+set_target_properties(vc_graph_links PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_library(vc_core
+        src/CtSheetNormal.cpp
         src/GridStore.cpp
         src/NormalGridVolume.cpp
         src/normalgridtools.cpp
@@ -25,6 +66,7 @@ add_library(vc_core
         src/Logging.cpp
         src/CrashHandler.cpp
         src/MemMap.cpp
+        src/PackedTrackStore.cpp
         src/UnixSocket.cpp
         src/VolpkgConvert.cpp
         src/VoxelSizeMetadata.cpp

@@ -12,6 +12,7 @@ import copy
 import concurrent.futures
 import gc
 import hashlib
+import logging
 import multiprocessing
 import json
 import glob
@@ -130,6 +131,7 @@ from losses import (
 from loss_maps import (LossMapRecorder, attach_loss_maps_to_manifest,
                        capture_loss_maps)
 from spiral_helpers import (
+    keep_largest_patch_component,
     REFERENCE_Z_RANGE_NUM_SLICES,
     erode_patch_valid_region,
     load_patch_payload_chunk,
@@ -1094,7 +1096,7 @@ def accumulate_radial_offset_bake_scale(slice_to_spiral_transform, zyxs,
 
 
 def inward_winding_direction(slice_to_spiral_transform, zyxs, *, device=None,
-                             chunk_size=65536):
+                             chunk_size=65536, dr_per_winding=None):
     """Unit vectors along the fitted spiral's decreasing-winding direction.
 
     At each input-frame point the scan-space gradient of the fitted winding
@@ -1103,7 +1105,9 @@ def inward_winding_direction(slice_to_spiral_transform, zyxs, *, device=None,
     number, the "front" side the fiber link side rules refer to. ``zyxs``
     (N, 3) in the frame the transform reads; returns (N, 3) float64, zero
     where the gradient vanishes. Evaluated under no_grad, chunked, with each
-    chunk staged to ``device`` when given.
+    chunk staged to ``device`` when given. Supply ``dr_per_winding`` for the
+    exact winding gradient including the angular term; omission retains the
+    historical radial-normal approximation.
     """
     points = torch.as_tensor(
         np.ascontiguousarray(zyxs, dtype=np.float32)).reshape(-1, 3)
@@ -1117,7 +1121,8 @@ def inward_winding_direction(slice_to_spiral_transform, zyxs, *, device=None,
                 device=target, dtype=torch.float32)
             covector = get_radial_covector_in_scroll_space(
                 slice_to_spiral_transform, chunk,
-                epsilon=RADIAL_OFFSET_STRETCH_EPSILON)
+                epsilon=RADIAL_OFFSET_STRETCH_EPSILON,
+                dr_per_winding=dr_per_winding)
             norm = torch.linalg.norm(covector, dim=-1, keepdim=True)
             direction = torch.where(
                 norm > 0, -covector / norm.clamp_min(1e-12),
@@ -1478,6 +1483,7 @@ class FitContext:
             'FIT_SPIRAL_PATCH_LOAD_IO_THREADS', 4)))
         chunk_size = 256
         erode_cells_default = self.config['patch_erode_patches']
+        keep_largest = bool(self.config.get('patch_keep_largest_component', True))
 
         results_by_entry = {}
         loaded = 0
@@ -1503,7 +1509,7 @@ class FitContext:
             for chunk in chunks:
                 consume(load_patch_payload_chunk(
                     path, chunk, self.z_begin, self.z_end,
-                    erode_cells_default, io_threads))
+                    erode_cells_default, io_threads, keep_largest))
         else:
             # spawn/forkserver rather than fork: loader workers only touch
             # CPU code, and forking after torch/OpenMP threads exist is not
@@ -1520,7 +1526,7 @@ class FitContext:
                     executor.submit(
                         load_patch_payload_chunk, path, chunk,
                         self.z_begin, self.z_end,
-                        erode_cells_default, io_threads)
+                        erode_cells_default, io_threads, keep_largest)
                     for chunk in chunks]
                 for future in concurrent.futures.as_completed(futures):
                     consume(future.result())
@@ -1684,7 +1690,8 @@ class FitContext:
                 self.unattached_component_edges.append([])
 
     def _derive_point_inputs(self, verified_patches, point_collections,
-                             fiber_point_collections, *, direction_source='umbilicus'):
+                             fiber_point_collections, *, direction_source='umbilicus',
+                             point_linker=None):
         """Shared initial/replacement linking, classification and sampling.
 
         Callers provide private point dictionaries; this method attaches and
@@ -1728,19 +1735,28 @@ class FitContext:
         # Live revisions select the direction for their current step, just
         # like _maybe_relink_fibers_for_direction.
         self._fiber_link_direction_source = direction_source
-        link_options = self._patch_link_options(
-            point_collections, 1.0, direction_source=direction_source)
-        if link_options.side_rules:
-            print(self._describe_fiber_link_side_rules(link_options))
-        link_points_to_patches(
-            verified_patches,
-            point_collections,
-            tolerance=link_distance_tolerance,
-            surface_index_tolerance=link_distance_tolerance,
-            distance_scale=1.0,
-            general_hit_policy='largest_area',
-            options=link_options,
-        )
+        if point_linker is not None:
+            point_linker(verified_patches, point_collections, fiber_point_collections)
+        else:
+            link_options = self._patch_link_options(
+                point_collections, 1.0, direction_source=direction_source,
+                patches=verified_patches)
+            if link_options.side_rules:
+                print(self._describe_fiber_link_side_rules(link_options))
+            if link_options.target_patches is not None:
+                tagged = sum(1 for allowed in link_options.target_patches.values() if allowed)
+                print(f'fiber explicit links only: {tagged} of '
+                      f'{len(link_options.target_patches)} fiber(s) carry explicit_link '
+                      f'tags; untagged fibers attach to no patch')
+            link_points_to_patches(
+                verified_patches,
+                point_collections,
+                tolerance=link_distance_tolerance,
+                surface_index_tolerance=link_distance_tolerance,
+                distance_scale=1.0,
+                general_hit_policy='largest_area',
+                options=link_options,
+            )
 
         # Keep pristine linked regular collections. Derived training views may
         # trim or decimate points, but live patches must still be offered every
@@ -2018,8 +2034,17 @@ class FitContext:
                         pass
             raise RuntimeError(message) from exc
 
-    def load_host_inputs(self):
+    def load_host_inputs(self, *, point_linker=None, fiber_min_point_spacing=None,
+                         training_caches=True):
         """Load and prepare every host-side input for a fit.
+
+        Analysis callers may supply ``point_linker(patches, collections,
+        fibers)`` to attach points before classification, and override fiber
+        loading's spacing without changing the training configuration.
+        ``training_caches=False`` stops after the patches and point
+        collections are loaded, linked and classified: the patch sampling
+        caches, atlases, trusted-geometry index, tracks and DT targets that
+        only a fit consumes are skipped (their attributes are None / empty).
 
         Seeds the host RNG streams, then loads patches, point collections,
         fibers, tracks, and the outer shell; links and classifies PCLs;
@@ -2057,6 +2082,8 @@ class FitContext:
         torch.random.manual_seed(self.config['optimizer_random_seed'])
         progress.begin('loading', 'Loading umbilicus')
         umbilicus = self.umbilicus_z_to_yx()
+        # Startup fiber side linking reads this while deriving point inputs.
+        self.umbilicus = umbilicus
         if self.scroll_zarr_path:
             progress.begin('loading', 'Opening scroll volume')
             print('loading volume zarr')
@@ -2140,7 +2167,8 @@ class FitContext:
         fiber_point_collections, next_id = load_fiber_point_collections(
             self.fibers_path,
             next_id,
-            min_point_spacing=self.config['pcl_fiber_min_point_spacing'],
+            min_point_spacing=(self.config['pcl_fiber_min_point_spacing']
+                               if fiber_min_point_spacing is None else fiber_min_point_spacing),
             base_shape_zyx=getattr(self, 'base_shape_zyx', None),
         )
         # All fibers (horizontal, vertical, and merged link components) form one
@@ -2187,9 +2215,37 @@ class FitContext:
                 point_collections, fiber_point_collections = \
                     self._enabled_point_inputs()
         self._derive_point_inputs(
-            verified_patches, point_collections, fiber_point_collections)
+            verified_patches, point_collections, fiber_point_collections,
+            **({'point_linker': point_linker} if point_linker is not None else {}))
         unattached_pcl_strips = self.unattached_pcl_strips
         link_distance_tolerance = self.link_distance_tolerance
+
+        if not training_caches:
+            self.umbilicus = umbilicus
+            self.scroll_zarr = scroll_zarr
+            self.fiber_direction_samples = fiber_direction_samples
+            self.filter_tracks_by_shell = filter_tracks_by_shell
+            self.shell_patch = shell_patch
+            self.shell_envelope = None
+            self.verified_patches = verified_patches
+            self.unverified_patches = unverified_patches
+            self.next_id = next_id
+            self.link_distance_tolerance = link_distance_tolerance
+            self.verified_patches_list = list(verified_patches.values())
+            self.num_verified_patches = len(verified_patches)
+            self.unverified_patches_list = list(unverified_patches.values())
+            for name in ('dense_spacing_mode', 'phase_mode', 'winding_model_mode',
+                         'dense_normals_enabled', 'grad_mag_spacing_enabled',
+                         'track_sampling_config', 'tracks', 'track_families',
+                         'track_source_ids', 'track_crossing_cache', 'track_graph',
+                         'track_reload_source', 'track_reload_families',
+                         'track_reload_source_ids', 'patch_sampling_probabilities',
+                         'patch_atlas', 'using_tracks', 'trusted_geometry_tree',
+                         'unverified_patch_sampling_probabilities',
+                         'unverified_patch_atlas', 'influence_anchor_geometry',
+                         'dt_target_whole_object'):
+                setattr(self, name, None)
+            return
 
         # ==========================================================================
         # dense-spacing mode, shell envelope, and tracks
@@ -2356,7 +2412,6 @@ class FitContext:
         # class (b): host-prepared inputs and caches). cross_patch_pcls,
         # unattached_pcl_strips, unattached_strip_sampling_groups, and
         # pcl_sampling_strata were assigned above, before the strata build.
-        self.umbilicus = umbilicus
         self.scroll_zarr = scroll_zarr
         self.fiber_direction_samples = fiber_direction_samples
         self.filter_tracks_by_shell = filter_tracks_by_shell
@@ -2572,12 +2627,47 @@ class FitContext:
                 if getattr(self, 'frozen_epochs', ()) else 1.0)
 
 
+    def _fiber_explicit_link_targets(self, collections, patches=None):
+        """Explicit patch links per fiber collection id under
+        pcl_fiber_explicit_links_only (PatchLinkOptions.target_patches):
+        each fiber's ``metadata.explicit_patch_links`` (its
+        ``explicit_link:<patch id>`` document tags). Regular collections are
+        skipped; ``None`` while the setting is off. Named patches missing
+        from ``patches`` (the verified patches by default) are reported
+        once per patch id."""
+        if not self.config.get('pcl_fiber_explicit_links_only', False):
+            return None
+        targets = {}
+        for cid, pcl in collections.items():
+            metadata = pcl.get('metadata') or {}
+            if (pcl.get('sampling_group') != 'fibers'
+                    and metadata.get('logical_input_kind') != 'fiber'):
+                continue
+            targets[cid] = frozenset(
+                str(patch_id) for patch_id in metadata.get('explicit_patch_links') or ())
+        if patches is None:
+            patches = getattr(self, 'verified_patches', None)
+        if patches is not None:
+            warned = self.__dict__.setdefault('_warned_explicit_link_patches', set())
+            unknown = sorted(
+                {patch_id for allowed in targets.values() for patch_id in allowed}
+                - set(patches) - warned)
+            if unknown:
+                warned.update(unknown)
+                shown = ', '.join(unknown[:10]) + (', ...' if len(unknown) > 10 else '')
+                logging.getLogger(__name__).warning(
+                    'explicit_link tags name %d patch id(s) that are not among the '
+                    'loaded patches (ignored): %s', len(unknown), shown)
+        return targets
+
     def _patch_link_options(self, collections, voxel_scale, *,
-                            direction_source=None, umbilicus_z_to_yx=None):
+                            direction_source=None, umbilicus_z_to_yx=None,
+                            patches=None):
         """PatchLinkOptions for linking ``collections`` (resident id -> pcl)
         in the current input frame. ``voxel_scale`` converts scroll-voxel
         thresholds to that frame; ``direction_source`` defaults to the
-        session's current fiber link direction source."""
+        session's current fiber link direction source; ``patches`` (default:
+        the verified patches) only checks the explicit link tags."""
         rules = self._fiber_link_side_rules(collections)
         inward = None
         if rules:
@@ -2586,13 +2676,16 @@ class FitContext:
                     self, '_fiber_link_direction_source', 'umbilicus')
             inward = self._fiber_link_inward_direction(
                 direction_source, umbilicus_z_to_yx=umbilicus_z_to_yx)
+        targets = self._fiber_explicit_link_targets(collections, patches)
         return PatchLinkOptions(
             window_points=int(self.config['pcl_link_window_points']),
             window_min_points=int(self.config['pcl_link_window_min_points']),
             side_rules=rules,
             inward_direction=inward,
             side_margin=(float(self.config['pcl_fiber_link_side_margin_voxels'])
-                         * voxel_scale))
+                         * voxel_scale),
+            target_patches=targets,
+            restrict_untargeted=targets is not None)
 
     def _describe_fiber_link_side_rules(self, options):
         rules = options.side_rules
@@ -4297,6 +4390,8 @@ class FitContext:
                     patch._source_path = os.path.abspath(path)
                     cells = patch.erosion_cells(self.config['patch_erode_patches'])
                     valid = cells <= 0 or erode_patch_valid_region(patch, cells)
+                    if valid and self.config.get('patch_keep_largest_component', True):
+                        valid = keep_largest_patch_component(patch)
                     intersects = patch_intersects_z_roi(patch, self.z_begin, self.z_end)
                     if not valid or not intersects:
                         reason = 'has no valid quads' if not valid else 'is outside the fitted z range'
@@ -4843,6 +4938,7 @@ class FitContext:
                 'pcl_link_distance_tolerance',
                 'pcl_link_window_points',
                 'pcl_link_window_min_points',
+                'pcl_fiber_explicit_links_only',
             }
             fiber_catalog = getattr(self, 'fiber_catalog', None) or {}
             regular_catalog = getattr(self, 'regular_pcl_catalog', None) or {}

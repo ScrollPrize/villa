@@ -296,5 +296,89 @@ class SideRuleLinkingTests(unittest.TestCase, _BackendCases):
             PatchLinkOptions(side_rules={1: 'sideways'}, inward_direction=lambda z: z)
 
 
+class ExplicitLinkTests(unittest.TestCase, _BackendCases):
+    """PatchLinkOptions.target_patches: fibers attach only to the patches
+    their explicit_link tags name; other collections link as usual."""
+    TOL = 2.0
+
+    def _scene(self):
+        # Two z-plane patches side by side: 'a' spans x in [0, 40], 'b' spans
+        # x in [50, 90]; every collection has two points over each patch.
+        patches = {'a': _z_plane(50.5, -20.0, 0.0), 'b': _z_plane(50.5, -20.0, 50.0)}
+        zyxs = [(50.0, 0.0, 10.0), (50.0, 0.0, 20.0), (50.0, 0.0, 60.0), (50.0, 0.0, 70.0)]
+        tagged = _collection(1, zyxs, name='tagged', metadata={
+            'logical_input_kind': 'fiber', 'explicit_patch_links': ['a']})
+        tagged['sampling_group'] = 'fibers'
+        untagged = _collection(2, zyxs, name='untagged', metadata={
+            'logical_input_kind': 'fiber', 'explicit_patch_links': []})
+        untagged['sampling_group'] = 'fibers'
+        regular = _collection(3, zyxs, name='regular')
+        absolute = _collection(4, zyxs, name='abs', metadata={'winding_is_absolute': True})
+        return patches, {1: tagged, 2: untagged, 3: regular, 4: absolute}
+
+    def _link(self, options):
+        patches, collections = self._scene()
+        link_points_to_patches(
+            patches, collections, tolerance=self.TOL, surface_index_tolerance=self.TOL,
+            general_hit_policy='largest_area', options=options)
+        return collections
+
+    def test_only_tagged_patches_receive_fiber_attachments(self):
+        def body():
+            pcls = self._link(PatchLinkOptions(
+                target_patches={1: frozenset({'a'})}, restrict_untargeted=True))
+            self.assertEqual(_attached(pcls[1]), ['a', 'a', None, None])
+            self.assertEqual(_attached(pcls[2]), [None] * 4)
+            self.assertEqual(_attached(pcls[3]), ['a', 'a', 'b', 'b'])
+            self.assertEqual(_attached(pcls[4]), ['a', 'a', 'b', 'b'])
+        self.for_each_backend(body)
+
+    def test_untargeted_fibers_link_normally_without_the_restriction(self):
+        def body():
+            pcls = self._link(PatchLinkOptions(target_patches={1: {'a'}}))
+            self.assertEqual(_attached(pcls[1]), ['a', 'a', None, None])
+            self.assertEqual(_attached(pcls[2]), ['a', 'a', 'b', 'b'])
+        self.for_each_backend(body)
+
+    def test_default_options_ignore_the_tags(self):
+        def body():
+            pcls = self._link(PatchLinkOptions())
+            for cid in (1, 2, 3, 4):
+                self.assertEqual(_attached(pcls[cid]), ['a', 'a', 'b', 'b'])
+        self.for_each_backend(body)
+
+    def test_unknown_patch_ids_leave_the_fiber_unattached(self):
+        def body():
+            pcls = self._link(PatchLinkOptions(
+                target_patches={1: {'missing'}, 2: {'b'}}, restrict_untargeted=True))
+            self.assertEqual(_attached(pcls[1]), [None] * 4)
+            self.assertEqual(_attached(pcls[2]), [None, None, 'b', 'b'])
+        self.for_each_backend(body)
+
+    def test_relink_of_unattached_points_honours_the_targets(self):
+        def body():
+            patches, pcls = self._scene()
+            gained = link_unattached_points_to_patches(
+                pcls, patches, patches, tolerance=self.TOL,
+                surface_index_tolerance=self.TOL, general_hit_policy='largest_area',
+                options=PatchLinkOptions(target_patches={1: {'b'}}, restrict_untargeted=True))
+            # The absolute collection offers only positively annotated points
+            # to new patches, so it gains nothing here.
+            self.assertEqual(gained, {1: 2, 3: 4})
+            self.assertEqual(_attached(pcls[1]), [None, None, 'b', 'b'])
+            self.assertEqual(_attached(pcls[2]), [None] * 4)
+        self.for_each_backend(body)
+
+    def test_options_validation(self):
+        with self.assertRaises(ValueError):
+            PatchLinkOptions(restrict_untargeted=True)
+        with self.assertRaises(ValueError):
+            PatchLinkOptions(target_patches={1: 'a'})
+        options = PatchLinkOptions(target_patches={1: ['b', 'a']})
+        self.assertEqual(options.target_patches, {1: frozenset({'a', 'b'})})
+        self.assertTrue(options.restricts_patches)
+        self.assertFalse(PatchLinkOptions().restricts_patches)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,6 @@
 """Fiber supervision: classification, patch-side linking and radial offsets."""
 
+import json
 import unittest
 from unittest import mock
 
@@ -11,6 +12,7 @@ import fit_spiral
 import point_collection
 from config import Config, FitConfig
 from dt_targets import compute_strip_dt_target_cache
+from fit_session import ScrollSpec, SpiralInputPaths
 from fit_spiral import (
     FitContext,
     _build_strip_flat_bundle,
@@ -30,6 +32,49 @@ from test_revisioned_geometry import context
 
 DR = 12.0
 WINDING = 40
+
+
+@pytest.mark.parametrize('tag, side', [('V', SIDE_FRONT), ('H', SIDE_BEHIND)])
+def test_host_startup_initializes_umbilicus_before_fiber_side_linking(
+        tmp_path, tag, side):
+    umbilicus = tmp_path / 'umbilicus.json'
+    umbilicus.write_text(json.dumps({'control_points': [
+        {'z': 0, 'y': 20, 'x': 30}, {'z': 200, 'y': 20, 'x': 30}]}))
+    fibers = tmp_path / 'fibers'
+    fibers.mkdir()
+    (fibers / 'fiber.json').write_text(json.dumps({
+        'type': 'vc3d_fiber', 'line_points': [],
+        'control_points': [[40, 20, 50], [40, 20, 100]],
+        'hv_classification': {'manual_tag': tag},
+    }))
+    ctx = FitContext(
+        FitConfig(Config({
+            'z_begin': 0, 'z_end': 200,
+            'input_disable_patches': True,
+            'input_use_outer_shell': False,
+            'input_use_fibers': True,
+            'pcl_fiber_link_side_filter': True,
+            'pcl_use_fiber_links': True,
+            'pcl_fiber_min_point_spacing': 0,
+            'pcl_unattached_pcl_min_point_spacing': 0,
+        }).as_dict()),
+        scroll=ScrollSpec(name='test', voxel_size_um=1.0,
+                          spiral_outward_sense='CW'),
+        paths=SpiralInputPaths(umbilicus=str(umbilicus), fibers=str(fibers)),
+    )
+    with mock.patch.object(
+            fit_spiral, 'link_points_to_patches',
+            wraps=fit_spiral.link_points_to_patches) as link:
+        ctx.load_host_inputs()
+
+    options = link.call_args.kwargs['options']
+    assert list(options.side_rules.values()) == [side]
+    np.testing.assert_allclose(
+        options.inward_direction(np.array([[50., 20., 40.]])),
+        [[0., 0., -1.]])
+    np.testing.assert_allclose(ctx.umbilicus(np.array([50.])), [[20., 30.]])
+    assert ctx.fiber_catalog
+    assert ctx.unattached_pcl_strips
 
 
 def _vertical_fiber(theta_of_z, z_len=400.0, spacing=20.0, winding=WINDING):
@@ -356,6 +401,61 @@ class RelinkFibersTests(unittest.TestCase):
         self.assertEqual(rules, {1: SIDE_FRONT, 2: SIDE_BEHIND})
         context.config = FitConfig(Config({'pcl_fiber_link_side_filter': False}).as_dict())
         self.assertEqual(context._fiber_link_side_rules({1: vertical}), {})
+
+
+class ExplicitLinkOptionsTests(unittest.TestCase):
+    def _context(self, **overrides):
+        context = FitContext.__new__(FitContext)
+        context.config = FitConfig(Config({
+            'pcl_fiber_explicit_links_only': True, **overrides}).as_dict())
+        context.verified_patches = {'front': _y_plane(20.0, 40.0, -20.0)}
+        return context
+
+    def _collections(self):
+        tagged = _fiber(1, [(60.0, 21.0, 0.0), (61.0, 21.0, 1.0)])
+        tagged['metadata']['explicit_patch_links'] = ['front', 'gone']
+        untagged = _fiber(2, [(60.0, 21.0, 5.0)])
+        untagged['metadata']['explicit_patch_links'] = []
+        regular = _fiber(3, [(60.0, 21.0, 9.0)], kind=None)
+        regular['metadata']['explicit_patch_links'] = ['front']
+        return {1: tagged, 2: untagged, 3: regular}
+
+    def test_targets_follow_the_fiber_tags_and_warn_once_about_unknown_patches(self):
+        context = self._context()
+        with self.assertLogs('fit_spiral', level='WARNING') as logs:
+            options = context._patch_link_options(self._collections(), 1.0)
+        self.assertEqual(options.target_patches,
+                         {1: frozenset({'front', 'gone'}), 2: frozenset()})
+        self.assertTrue(options.restrict_untargeted)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn('gone', logs.output[0])
+        # The same unknown id is not reported again.
+        with mock.patch.object(fit_spiral.logging.getLogger('fit_spiral'), 'warning') as warning:
+            context._patch_link_options(self._collections(), 1.0)
+        warning.assert_not_called()
+
+    def test_off_by_default_leaves_the_options_unrestricted(self):
+        context = self._context(pcl_fiber_explicit_links_only=False)
+        options = context._patch_link_options(self._collections(), 1.0)
+        self.assertIsNone(options.target_patches)
+        self.assertFalse(options.restrict_untargeted)
+        self.assertFalse(Config().pcl_fiber_explicit_links_only)
+
+    def test_relink_attaches_only_tagged_fibers(self):
+        context = self._context()
+        collections = self._collections()
+        context.fiber_catalog = {'1': collections[1], '2': collections[2]}
+        context.link_distance_tolerance = 2.0
+        context._baked_voxel_scale = mock.Mock(return_value=1.0)
+        context._rematerialize_fiber_views = mock.Mock()
+        context.dist = mock.Mock(is_main_process=True)
+        with mock.patch.object(point_collection, 'can_use_surface_index_backend',
+                               return_value=False):
+            context._relink_fibers_to_patches('umbilicus', iteration=0)
+        self.assertEqual(
+            [p['on_patch']['id'] for _, p in sorted(collections[1]['points'].items())],
+            ['front'] * 2)
+        self.assertNotIn('on_patch', collections[2]['points'][0])
 
 
 class YxScale:

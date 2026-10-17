@@ -15,6 +15,7 @@ from spiral_helpers import (
     _structurally_disabled_dense_weight_keys,
     load_fiber_point_collection,
     resolve_outer_winding_idx_and_notes,
+    explicit_patch_links_from_tags,
 )
 from fit_spiral import (
     FitContext,
@@ -175,6 +176,31 @@ class FiberPointCollectionTests(unittest.TestCase):
             collection = load_fiber_point_collection(path, collection_id=7)
 
             self.assertIsNone(collection)
+
+    def test_explicit_link_tags_are_parsed_into_metadata(self):
+        tags = ["reviewed", "explicit_link:band-b.tifxyz", "explicit_link:band-a.tifxyz",
+                "explicit_link:band-b.tifxyz", "explicit_link:", 7]
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self._write_fiber(temporary, {
+                "control_points": [[4, 8, 12], [20, 24, 28]],
+                "line_points": [],
+                "tags": tags,
+            })
+            metadata = load_fiber_point_collection(path, 7, min_point_spacing=0)["metadata"]
+            self.assertEqual(metadata["explicit_patch_links"],
+                             ["band-a.tifxyz", "band-b.tifxyz"])
+            # The raw tag list is kept as before.
+            self.assertEqual(metadata["fiber_tags"], tags)
+
+            path = self._write_fiber(temporary, {
+                "control_points": [[4, 8, 12], [20, 24, 28]],
+                "line_points": [],
+            })
+            metadata = load_fiber_point_collection(path, 7, min_point_spacing=0)["metadata"]
+            self.assertEqual(metadata["explicit_patch_links"], [])
+            self.assertEqual(metadata["fiber_tags"], [])
+        self.assertEqual(explicit_patch_links_from_tags(None), [])
+        self.assertEqual(explicit_patch_links_from_tags("explicit_link:x"), [])
 
     @staticmethod
     def _linked_member(collection_id, logical_id, targets, x_offset,

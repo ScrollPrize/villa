@@ -1,0 +1,52 @@
+{
+  "checkpoint": "/home/sean/Desktop/graph_patch_merging/checkpoint_autosave.ckpt",
+  "patches_dir": "/home/sean/Desktop/graph_patch_merging/graph_patches_only",
+  "umbilicus": "/home/sean/Desktop/spiral_dataset/umbilicus.json",
+  "patch_id": "band-seed3720186-20260729-184610-941.tifxyz",
+  "pcl": [
+    "/home/sean/Desktop/spiral_dataset/abs_winding.json"
+  ],
+  "fibers": "/home/sean/Desktop/spiral_dataset/fibers",
+  "z_range": "7000,17500",
+  "detect_loops": true,
+  "min_fix": false,
+  "plot": false,
+  "linking": {
+    "distance": 1.5,
+    "window_points": 7,
+    "min_points": 5,
+    "vertical_max_behind_fraction": 0.0,
+    "horizontal_max_front_fraction": 0.35,
+    "side_margin_voxels": 0.25,
+    "selection": "support_then_distance",
+    "fiber_stride": 1,
+    "patch_stride": 1,
+    "strips": false
+  },
+  "growth": {
+    "min_contact_length": 10.0,
+    "support_length": 40.0,
+    "fit_scale": 1.0,
+    "min_agreement": 1.0,
+    "overlaps": true,
+    "overlap_distance": 3.0,
+    "overlap_min_area": 400.0,
+    "overlap_normal_cos": 0.95,
+    "coincidence_tolerance": 3.0,
+    "max_steps": null,
+    "seed_mode": "all_components",
+    "coincidence_metric": "normal_grid",
+    "coincidence_grid_size": 3
+  },
+  "workspace": {
+    "spacing": 20.0,
+    "fiber_half_width": 20.0
+  },
+  "edge_divergence": {
+    "radius": 60.0,
+    "max_median_offset": 2.0,
+    "max_spread": null,
+    "min_samples": 6,
+    "report_kept": false
+  }
+}

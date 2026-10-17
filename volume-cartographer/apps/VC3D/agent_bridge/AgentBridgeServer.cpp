@@ -701,6 +701,7 @@ void AgentBridgeServer::registerHandlers()
     registerFlattenHandlers();
 
     registerSurfaceOpsHandlers();
+    registerGraphHandlers();
 }
 
 

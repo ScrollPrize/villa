@@ -144,3 +144,18 @@ def test_extrapolation_validates_config_and_required_normals(dataset):
         fiber_trace.trace_extrapolation(field, START, (1.,0.,0.), 16., config())
     with pytest.raises(ValueError, match='step voxels must be positive'):
         fiber_trace.trace_extrapolation(field, START, (1.,0.,0.), 16., config(step_voxels=0.))
+
+
+def test_sample_sheet_normal_and_coordinate_scale(dataset):
+    root, _, normals = dataset
+    sample = normals.sample_normal(START)
+    assert sample['valid'], sample['reason']
+    np.testing.assert_allclose(sample['normal'], [0., 1., 0.])
+    scaled = fiber_trace.open_normal_sampler(str(root / 'normals.lasagna.json'), 2.)
+    sample_scaled = scaled.sample_normal(tuple(x / 2 for x in START))
+    assert sample_scaled['valid']
+    np.testing.assert_allclose(sample_scaled['normal'], sample['normal'])
+    outside = normals.sample_normal((-100., -100., -100.))
+    assert not outside['valid'] and outside['reason']
+    with pytest.raises(ValueError, match='finite'):
+        normals.sample_normal((float('nan'), 0., 0.))
