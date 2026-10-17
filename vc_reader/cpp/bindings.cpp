@@ -22,6 +22,10 @@ using LayerTuple = std::tuple<std::string, std::string, std::string, std::string
 // (kind, user or access key id, password or secret key, session token, region); see vcr::Auth.
 using AuthTuple = std::tuple<std::string, std::string, std::string, std::string, std::string>;
 
+#ifdef VC_READER_CUDA
+#include "reader_cuda/bindings.hpp"
+#endif
+
 static vcr::Auth to_auth(const AuthTuple& t)
 {
     auto& [kind, user, secret, token, region] = t;
@@ -63,6 +67,11 @@ static std::vector<std::size_t> output_counts(const std::vector<vcr::Index>& sha
 NB_MODULE(_native, m)
 {
     m.doc() = "Native zarr v2 read path: local and HTTP chunks, disk cache layers, memory cache.";
+#ifdef VC_READER_CUDA
+    vcr::reader_cuda::bind(m);
+#else
+    m.def("reader_cuda_available", [] { return false; });
+#endif
     // Engines inherited by a forked process are deliberately kept alive and never
     // destroyed there (their threads do not exist in the child), so they are
     // still referenced at exit; that is not a leak worth reporting.
@@ -328,6 +337,42 @@ NB_MODULE(_native, m)
             "shapes"_a, "origins"_a, "axes"_a, "outs"_a, "order"_a, "kind"_a, "itemsize"_a, "swap"_a, "out64"_a,
             "float_output"_a = false,
             "Sample regular affine grids with generated coordinates (the GIL is released).")
+        // Float32 CT implementation shared by the public CPU and CUDA fallback.
+        .def("_sample_u8_float32", [](vcr::Array& a,
+             nb::ndarray<float, nb::ndim<2>, nb::c_contig, nb::device::cpu> points,
+             const vcr::Index& offset, Bytes out, int order) {
+            if (points.shape(1) != 3 || offset.size() != 3 || (order != 0 && order != 1))
+                throw nb::value_error("expected 3-D points/origin and order 0 or 1");
+            if (out.size() != points.shape(0)*(order ? sizeof(float) : 1))
+                throw nb::value_error("output size does not match points");
+            vcr::FloatPoints coords;
+            coords.data=points.data(); coords.ndim=3;
+            for (int i=0;i<3;++i) {
+                if (offset[i] < 0 || offset[i] > (1LL<<30)) throw nb::value_error("invalid integer origin");
+                coords.offset[i]=offset[i];
+            }
+            nb::gil_scoped_release release;
+            a.sample_u8_float32(coords,points.shape(0),order,out.data());
+        })
+        .def("_affine_u8_float32", [](vcr::Array& a, const vcr::Index& shape,
+             const std::vector<float>& origin, const std::vector<float>& axes,
+             const vcr::Index& offset, Bytes out, int order) {
+            if (shape.size()!=3 || origin.size()!=3 || axes.size()!=9 || offset.size()!=3 || (order!=0 && order!=1))
+                throw nb::value_error("expected 3-D affine geometry and order 0 or 1");
+            const auto counts=output_counts({shape},{out},order ? sizeof(float) : 1);
+            vcr::FloatAffine grid;
+            for (int i=0;i<3;++i) {
+                if (!std::isfinite(origin[i]) || offset[i]<0 || offset[i]>(1LL<<30))
+                    throw nb::value_error("invalid affine origin");
+                grid.shape[i]=shape[i]; grid.origin[i]=origin[i]; grid.offset[i]=offset[i];
+            }
+            for (int i=0;i<9;++i) {
+                if (!std::isfinite(axes[i])) throw nb::value_error("axes must be finite");
+                grid.axes[i]=axes[i];
+            }
+            nb::gil_scoped_release release;
+            a.sample_u8_float32(grid,counts[0],order,out.data());
+        })
         .def("load_chunk", &vcr::Array::load_chunk, nb::call_guard<nb::gil_scoped_release>())
         .def("publish_chunk", &vcr::Array::publish_chunk, nb::call_guard<nb::gil_scoped_release>())
         .def("set_fetcher", &vcr::Array::set_fetcher)

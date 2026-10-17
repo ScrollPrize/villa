@@ -26,6 +26,8 @@ struct DeviceArray {
     std::shared_ptr<Buffer<std::byte>> buffer;
     DeviceArray(Shape s, char k, std::size_t b) : shape(std::move(s)),kind(k),bytes(b),
         buffer(std::make_shared<Buffer<std::byte>>(product(shape)*bytes)) {}
+    DeviceArray(Shape s, char k, std::size_t b, void* data) : shape(std::move(s)),kind(k),bytes(b),
+        buffer(std::make_shared<Buffer<std::byte>>(static_cast<std::byte*>(data),product(shape)*bytes)) {}
     Shape spatial() const { return {shape.begin()+1,shape.end()}; }
     std::size_t size() const { return product(shape); }
     template<class T> View<T> view() const { return {reinterpret_cast<T*>(buffer->ptr),size()}; }
@@ -50,6 +52,7 @@ struct Session {
     std::map<std::string,DeviceArray> arrays;
     std::unique_ptr<Buffer<int>> nonfinite;
     int* finite_status();
+    Session() = default;
     explicit Session(const Sample&);
     void finish(Sample&);
     void restore_valid(const Sample&);

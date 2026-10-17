@@ -37,18 +37,25 @@ DEFAULT_ARRAY = ("/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/"
 REGION = ((9000, 3600, 3600), 1024)  # start (z, y, x), edge: stored throughout at level 2
 
 
+def patch_geometry(start, edge, scale):
+    """Shared physical plane geometry for explicit-point and affine benchmarks."""
+    s = np.asarray(start, np.float64)
+    u = np.array([0.1, 0.2, 0.97]); u /= np.linalg.norm(u)
+    w = np.array([0.95, 0.3, 0.0]); w -= u * (u @ w); w /= np.linalg.norm(w)
+    v = np.cross(w, u)
+    side = int(512 * scale ** 0.5)
+    origin = s + edge / 2 - 0.73 * side / 2 * (u + v)
+    return side, origin, u, v, w
+
+
 def point_sets(start, edge, scale: float) -> dict[str, np.ndarray]:
     rng = np.random.default_rng(0)
     s = np.asarray(start, np.float64)
     n = int(1_000_000 * scale)
     random = s + rng.uniform(0, edge - 1, size=(n, 3))
     # 16 x 512 x 512 grid on a tilted plane: in-plane axes u, v and a normal w.
-    u = np.array([0.1, 0.2, 0.97]); u /= np.linalg.norm(u)
-    w = np.array([0.95, 0.3, 0.0]); w -= u * (u @ w); w /= np.linalg.norm(w)
-    v = np.cross(w, u)
-    side = int(512 * scale ** 0.5)
+    side, origin, u, v, w = patch_geometry(start, edge, scale)
     a, b, c = np.meshgrid(np.arange(16), np.arange(side), np.arange(side), indexing="ij")
-    origin = s + edge / 2 - 0.73 * side / 2 * (u + v)
     patch = origin + 0.73 * (b[..., None] * v + c[..., None] * u) + 0.5 * a[..., None] * w
     local = s + 300 + rng.uniform(0, 95, size=(n, 3))
     return {"random": random, "patch": patch.reshape(-1, 3), "local": local}

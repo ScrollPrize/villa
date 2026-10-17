@@ -11,6 +11,9 @@ namespace nb = nanobind;
 using namespace nb::literals;
 using namespace vcr::augment;
 using Input = nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu>;
+#ifdef VC_READER_CUDA
+#include "device_bindings.hpp"
+#endif
 
 // Constructor parsing only. Native execution never reads Python objects.
 struct Arguments {
@@ -221,6 +224,14 @@ NB_MODULE(_augment, m) {
     nb::class_<Pipeline>(m, "Pipeline")
         .def(nb::init<std::vector<Op>, std::map<std::string, Target>, bool, std::string>(), "transforms"_a, "targets"_a, "compact"_a = true, "backend"_a = "cpu")
         .def_prop_ro("backend", &Pipeline::backend)
+#ifdef VC_READER_CUDA
+        .def("run_device", [](const Pipeline& p, const std::map<std::string,DeviceInputArray>& inputs, std::uint64_t seed, bool record, bool profile, bool inplace) {
+            return run_device(p,inputs,seed,record,profile,inplace);
+        })
+        .def("replay_device", [](const Pipeline& p, const std::map<std::string,DeviceInputArray>& inputs, const Plan& plan) {
+            return run_device(p,inputs,0,false,false,false,&plan);
+        })
+#endif
         .def("load_plan", [](const Pipeline& p, nb::bytes bytes) { return load_plan(p.program(), std::string(bytes.c_str(), bytes.size())); })
         .def("run", [](const Pipeline& p, const std::map<std::string, Input>& inputs, std::uint64_t seed, bool record, bool profile, bool inplace) {
             if (inplace) writable_inputs(inputs);

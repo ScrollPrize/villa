@@ -150,9 +150,9 @@ def test_sample_linear(array):
         assert np.isnan(got[60])
         on_grid = pts[:50].astype(np.int64)
         np.testing.assert_array_equal(got[:50], _gather(exp, on_grid).astype(np.float64))
-        f32 = r.sample(pts)
+        f32 = r.sample(pts.astype(np.float32), coordinate_origin=(0, 0, 0))
         assert f32.dtype == np.float32
-        np.testing.assert_allclose(f32, got.astype(np.float32), equal_nan=True)
+        np.testing.assert_allclose(f32, _linear(exp, pts.astype(np.float32)), atol=5e-5, rtol=1e-6, equal_nan=True)
         assert r.sample(pts.reshape(20, 20, 3)).shape == (20, 20)
 
 
@@ -261,7 +261,8 @@ def test_sample_linear_order_everywhere(array, read_mode, memory):
     with ZarrReader.open(root, read_mode=read_mode, memory_cache=memory) as r:
         got = r.sample(pts, dtype=np.float64)
         np.testing.assert_array_max_ulp(got, _linear_ordered(exp, pts), maxulp=MAX_ULP)
-        np.testing.assert_array_equal(r.sample(pts), got.astype(np.float32))
+        np.testing.assert_allclose(r.sample(pts.astype(np.float32), coordinate_origin=(0, 0, 0)),
+                                   _linear_ordered(exp, pts.astype(np.float32)), atol=5e-5, rtol=1e-6)
 
 
 @pytest.mark.parametrize("read_mode", ["mmap", "slab"])
@@ -280,8 +281,9 @@ def test_sample_plane(array, read_mode, memory):
         got = r.sample(pts, dtype=np.float64)
         assert got.shape == pts.shape[:-1]
         np.testing.assert_array_max_ulp(got.ravel(), _linear_ordered(exp, pts), maxulp=MAX_ULP)
-        nearest = np.where((pts > -1) & (pts < np.asarray(SHAPE) + 1), np.rint(pts), -1).astype(np.int64)
-        np.testing.assert_array_equal(r.sample(pts, order=0), _gather(exp, nearest).reshape(pts.shape[:-1]))
+        local32 = pts.astype(np.float32)
+        nearest = np.where((local32 > -1) & (local32 < np.asarray(SHAPE) + 1), np.rint(local32), -1).astype(np.int64)
+        np.testing.assert_array_equal(r.sample(local32, order=0, coordinate_origin=(0, 0, 0)), _gather(exp, nearest).reshape(pts.shape[:-1]))
 
 
 def test_point_reads_span_batches(array):
@@ -292,6 +294,7 @@ def test_point_reads_span_batches(array):
     with ZarrReader.open(root) as r:
         ints = np.floor(pts).astype(np.int64)
         np.testing.assert_array_equal(r.read_points(ints), _gather(exp, ints))
-        nearest = np.where((pts > -1) & (pts < np.asarray(SHAPE) + 1), np.rint(pts), -1).astype(np.int64)
-        np.testing.assert_array_equal(r.sample(pts, order=0), _gather(exp, nearest))
+        local32 = pts.astype(np.float32)
+        nearest = np.where((local32 > -1) & (local32 < np.asarray(SHAPE) + 1), np.rint(local32), -1).astype(np.int64)
+        np.testing.assert_array_equal(r.sample(local32, order=0, coordinate_origin=(0, 0, 0)), _gather(exp, nearest))
         np.testing.assert_array_max_ulp(r.sample(pts, dtype=np.float64), _linear_ordered(exp, pts), maxulp=MAX_ULP)

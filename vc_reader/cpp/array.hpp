@@ -5,6 +5,7 @@
 
 #include "chunk_io.hpp"
 #include "output.hpp"
+#include "sampling_math.hpp"
 #include "codecs.hpp"
 #include "disk_cache.hpp"
 #include "http.hpp"
@@ -43,6 +44,7 @@ struct PointCoordinates {
     using value_type = T;
     const T* data;
     std::size_t ndim;
+    std::int64_t base(std::size_t) const { return 0; }
     const T* operator()(std::size_t p, T*) const { return data + p * ndim; }
     void prefetch(std::size_t p) const {
 #if defined(__GNUC__) || defined(__clang__)
@@ -52,23 +54,38 @@ struct PointCoordinates {
 };
 
 // A regular 3-D output grid in source-array coordinates. No voxel-sized
-// coordinate buffer: each point is reconstructed independently in float64.
-struct AffineCoordinates {
-    using value_type = double;
+// coordinate buffer: each point is reconstructed in the chosen scalar type.
+template<class Real>
+struct BasicAffineCoordinates {
+    using value_type = Real;
+    std::int64_t base(std::size_t) const { return 0; }
     std::array<std::size_t, 3> shape;
-    std::array<double, 3> origin;
-    std::array<double, 9> axes;  // row major: columns are output-axis steps
+    std::array<Real, 3> origin;
+    std::array<Real, 9> axes;  // row major: columns are output-axis steps
 
-    const double* operator()(std::size_t p, double* c) const {
+    const Real* operator()(std::size_t p, Real* c) const {
         const auto x = p % shape[2];
         p /= shape[2];
         const auto y = p % shape[1], z = p / shape[1];
-        for (std::size_t i = 0; i < 3; ++i)
-            c[i] = origin[i] + axes[3*i] * z + axes[3*i+1] * y + axes[3*i+2] * x;
+        for (std::size_t i = 0; i < 3; ++i) {
+            if constexpr (std::is_same_v<Real,float>) c[i]=sampling::affine(origin[i],axes.data()+3*i,float(z),float(y),float(x));
+            else c[i] = origin[i] + axes[3*i] * z + axes[3*i+1] * y + axes[3*i+2] * x;
+        }
         return c;
     }
     void prefetch(std::size_t) const {}
 };
+
+using AffineCoordinates = BasicAffineCoordinates<double>;
+
+// Float32 CT paths: global location is integer, arithmetic local.
+template<class Coordinates>
+struct RebasedCoordinates : Coordinates {
+    std::array<std::int64_t, 3> offset{};
+    std::int64_t base(std::size_t axis) const { return offset[axis]; }
+};
+using FloatPoints = RebasedCoordinates<PointCoordinates<float>>;
+using FloatAffine = RebasedCoordinates<BasicAffineCoordinates<float>>;
 
 // A chunk an offline read needs is in none of the disk layers.
 struct CacheMiss : std::runtime_error {
@@ -214,6 +231,8 @@ public:
 
     std::size_t pending_writes() { return writes_ ? writes_->outstanding() : 0; }
     std::size_t ndim() const noexcept { return spec_.shape.size(); }
+    const ArraySpec& spec() const noexcept { return spec_; }
+    void parallel_for(std::size_t n, const std::function<void(std::size_t)>& fn) { pool_.parallel_for(n,fn); }
     std::size_t itemsize() const noexcept { return spec_.itemsize; }
 
     void set_fetcher(std::function<ChunkHandle(const Index&)> fetcher)
@@ -411,6 +430,18 @@ public:
         type.visit_load([&](auto load) {
             dispatch([load](const std::uint8_t* p) { return static_cast<double>(load(p)); });
         });
+    }
+
+    // Float32 uint8 CT entry: shares the general planner and interpolation math.
+    template<class Coordinates>
+    void sample_u8_float32(const Coordinates& coords, std::size_t n, int order, void* out) {
+        if (ndim() != 3 || spec_.itemsize != 1)
+            throw std::invalid_argument("float32 sampling requires 3-D uint8 CT");
+        if (order == 0) read_points_as<3>(coords,n,static_cast<std::uint8_t*>(out));
+        else if (order == 1)
+            sample_linear_as<3>(coords,n,ElementType{'u',1,false},false,out,
+                               [](const std::uint8_t* at) { return float(*at); });
+        else throw std::invalid_argument("order must be 0 or 1");
     }
 
     const Stats& stats() const noexcept { return stats_; }
@@ -820,10 +851,17 @@ private:
                 Coord scratch[N ? N : kMaxSampleDims];
                 const Coord* c = coords(b0 + p, scratch);
                 const std::int64_t* at;
-                if constexpr (std::is_same_v<Coord, double>) {
-                    for (std::size_t i = 0; i < nd; ++i)
-                        idx[i] = c[i] > -1.0 && c[i] < static_cast<double>(spec_.shape[i]) + 1.0
-                                     ? static_cast<std::int64_t>(std::nearbyint(c[i])) : -1;
+                if constexpr (std::is_floating_point_v<Coord>) {
+                    for (std::size_t i = 0; i < nd; ++i) {
+                        const auto base = coords.base(i);
+                        if (!(c[i] > Coord(-1-base) && c[i] < Coord(spec_.shape[i]-base)+Coord(1))) {
+                            idx[i] = -1;
+                        } else if constexpr (std::is_same_v<Coord,float>) {
+                            const float low = std::floor(c[i]), f = c[i]-low;
+                            const auto integer = base+static_cast<std::int64_t>(low);
+                            idx[i] = integer+(f > .5f || (f == .5f && (integer & 1)));
+                        } else idx[i] = base+static_cast<std::int64_t>(std::nearbyint(c[i]));
+                    }
                     at = idx;
                 } else {
                     at = c;
@@ -841,67 +879,26 @@ private:
 
     // A point's grid cell: the corner below it, its fractional offsets, and the axes on
     // which it is off the grid.
-    template <std::size_t N>
+    template <std::size_t N, class Real = double>
     struct Cell {
+        using value_type = Real;
         std::int64_t lo[N ? N : kMaxSampleDims];
-        double frac[N ? N : kMaxSampleDims];
+        Real frac[N ? N : kMaxSampleDims];
         std::size_t axes[N ? N : kMaxSampleDims];
         std::size_t k = 0;
     };
 
-    template <std::size_t N = 0>
-    static void cell_of(const double* c, std::size_t nd, Cell<N>& cell)
+    template <std::size_t N, class Real, class Coordinates>
+    static void cell_of(const Real* c, std::size_t nd, Cell<N,Real>& cell, const Coordinates& coords)
     {
         cell.k = 0;
         for (std::size_t i = 0; i < (N ? N : nd); ++i) {
-            const double f = std::floor(c[i]);
-            cell.lo[i] = static_cast<std::int64_t>(f);
+            const Real f = std::floor(c[i]);
+            cell.lo[i] = coords.base(i) + static_cast<std::int64_t>(f);
             cell.frac[i] = c[i] - f;
             if (cell.frac[i] != 0.0)
                 cell.axes[cell.k++] = i;
         }
-    }
-
-    // The weighted sum of a cell's 2^k neighbours; value(corner) is neighbour `corner`
-    // (bit a set: one step up along axes[a]). The weights and the sum are always formed in
-    // this order, so a point's result does not depend on where its neighbours were read.
-    template <std::size_t N, class Value>
-    static double interpolate(const Cell<N>& cell, Value&& value)
-    {
-        const std::size_t count = std::size_t{1} << cell.k;
-        double v = 0.0;
-        for (std::size_t corner = 0; corner < count; ++corner) {
-            double w = 1.0;
-            for (std::size_t a = 0; a < cell.k; ++a) {
-                const double f = cell.frac[cell.axes[a]];
-                if (corner >> a & 1)
-                    w *= f;
-                else
-                    w *= 1.0 - f;
-            }
-            v += w * value(corner);
-        }
-        return v;
-    }
-
-    // interpolate() for a 3-D cell off the grid on every axis, unrolled: the same weights
-    // and the same sum, in the same order. `at` is the near corner, `step` the byte strides.
-    template <class Load>
-    static double trilinear(const double* f, const std::uint8_t* at, const std::int64_t* step, Load& load)
-    {
-        const double g0 = 1.0 - f[0], g1 = 1.0 - f[1], g2 = 1.0 - f[2];
-        const double w00 = g0 * g1, w10 = f[0] * g1, w01 = g0 * f[1], w11 = f[0] * f[1];
-        const std::int64_t s0 = step[0], s1 = step[1], s2 = step[2];
-        double v = 0.0;
-        v += w00 * g2 * load(at);
-        v += w10 * g2 * load(at + s0);
-        v += w01 * g2 * load(at + s1);
-        v += w11 * g2 * load(at + s0 + s1);
-        v += w00 * f[2] * load(at + s2);
-        v += w10 * f[2] * load(at + s0 + s2);
-        v += w01 * f[2] * load(at + s1 + s2);
-        v += w11 * f[2] * load(at + s0 + s1 + s2);
-        return v;
     }
 
     // sample_linear with element loads `load`. A point whose neighbours all lie in one chunk
@@ -912,10 +909,11 @@ private:
     void sample_linear_as(const Coordinates& coords, std::size_t n, const ElementType& type, bool out64, void* out,
                           Load load)
     {
+        using Real = typename Coordinates::value_type;
         const std::size_t nd = N ? N : spec_.shape.size();
         const std::size_t isz = spec_.itemsize;
-        const double fill = type.load(spec_.fill.data());
-        const auto store = [&](std::size_t p, double v) {
+        const Real fill = static_cast<Real>(type.load(spec_.fill.data()));
+        const auto store = [&](std::size_t p, Real v) {
             if (out64)
                 static_cast<double*>(out)[p] = v;
             else
@@ -938,10 +936,10 @@ private:
         std::vector<Point> points;
         std::vector<Run> runs;
         // A point whose neighbours all lie in the chunk at `at`'s; `at` is the near corner.
-        const auto value = [&](const Cell<N>& cell, const std::uint8_t* at) {
+        const auto value = [&](const Cell<N,Real>& cell, const std::uint8_t* at) {
             if (nd == 3 && cell.k == 3)
-                return trilinear(cell.frac, at, chunk_strides_.data(), load);
-            return interpolate(cell, [&](std::size_t corner) {
+                return sampling::trilinear(cell.frac, at, chunk_strides_.data(), load);
+            return sampling::interpolate(cell, [&](std::size_t corner) {
                 std::int64_t offset = 0;
                 for (std::size_t a = 0; a < cell.k; ++a)
                     if (corner >> a & 1)
@@ -953,19 +951,19 @@ private:
             const std::size_t m = std::min(kPointBatch, n - b0);
             split.assign(plan_segments(m), Splits{});
             auto work = plan_points<N>(m, points, runs, [&](std::size_t s, std::size_t p, std::int64_t* idx, auto& emit) {
-                double scratch[N ? N : kMaxSampleDims];
-                const double* c = coords(b0 + p, scratch);
+                Real scratch[N ? N : kMaxSampleDims];
+                const Real* c = coords(b0 + p, scratch);
                 bool finite = true, outside = false;
                 for (std::size_t i = 0; i < nd; ++i) {
                     finite &= std::isfinite(c[i]);
-                    outside |= !(c[i] > -1.0 && c[i] < static_cast<double>(spec_.shape[i]));
+                    outside |= !(c[i] > Real(-1-coords.base(i)) && c[i] < Real(spec_.shape[i]-coords.base(i)));
                 }
                 if (!finite || outside) {  // no neighbour inside the array
-                    store(b0 + p, finite ? fill : std::numeric_limits<double>::quiet_NaN());
+                    store(b0 + p, finite ? fill : std::numeric_limits<Real>::quiet_NaN());
                     return;
                 }
-                Cell<N> cell;
-                cell_of<N>(c, nd, cell);
+                Cell<N,Real> cell;
+                cell_of<N>(c, nd, cell, coords);
                 bool whole = true;  // every neighbour inside the array and in the near corner's chunk
                 for (std::size_t i = 0; i < nd; ++i)
                     whole &= cell.lo[i] >= 0;
@@ -1009,8 +1007,8 @@ private:
             op.reach = reach;
             op.read = [&](const std::uint8_t* data, std::int64_t origin, const Work& w) {
                 for_points(w.points, [&](std::span<const Point> part) {
-                    Cell<N> cell;
-                    double coordinate[N ? N : kMaxSampleDims];
+                    Cell<N,Real> cell;
+                    Real coordinate[N ? N : kMaxSampleDims];
                     for (std::size_t j = 0; j < part.size(); ++j) {
 #if defined(__GNUC__) || defined(__clang__)
                         // Chunk grouping makes the voxel reads local, but random
@@ -1038,7 +1036,7 @@ private:
                             std::memcpy(raw.data() + slot * isz, at, isz);
                             continue;
                         }
-                        cell_of<N>(coords(pt.tag, coordinate), nd, cell);
+                        cell_of<N>(coords(pt.tag, coordinate), nd, cell, coords);
                         store(pt.tag, value(cell, at));
                     }
                 });
@@ -1046,38 +1044,38 @@ private:
                     return;
                 const Index chunk = chunk_base(w);
                 for_runs(w.runs, [&](std::span<const Run> part) {
-                    Cell<N> cell;
-                    double coordinate[N ? N : kMaxSampleDims];
+                    Cell<N,Real> cell;
+                    Real coordinate[N ? N : kMaxSampleDims];
                     for (const Run& r : part)
                         for (std::uint64_t p = r.first; p < r.first + r.count; ++p) {
-                            cell_of<N>(coords(p, coordinate), nd, cell);
+                            cell_of<N>(coords(p, coordinate), nd, cell, coords);
                             store(p, value(cell, data + (offset_in<N>(cell.lo, chunk.data()) - origin)));
                         }
                 });
             };
             op.fill = [&](const Work& w) {
-                Cell<N> cell;
-                double coordinate[N ? N : kMaxSampleDims];
+                Cell<N,Real> cell;
+                Real coordinate[N ? N : kMaxSampleDims];
                 for (const Point& pt : w.points) {
                     if (pt.tag & kSplit)
                         continue;  // its raw slot holds fill already
-                    cell_of<N>(coords(pt.tag, coordinate), nd, cell);
-                    store(pt.tag, interpolate(cell, [&](std::size_t) { return fill; }));
+                    cell_of<N>(coords(pt.tag, coordinate), nd, cell, coords);
+                    store(pt.tag, sampling::interpolate(cell, [&](std::size_t) { return fill; }));
                 }
                 for (const Run& r : w.runs)
                     for (std::uint64_t p = r.first; p < r.first + r.count; ++p) {
-                        cell_of<N>(coords(p, coordinate), nd, cell);
-                        store(p, interpolate(cell, [&](std::size_t) { return fill; }));
+                        cell_of<N>(coords(p, coordinate), nd, cell, coords);
+                        store(p, sampling::interpolate(cell, [&](std::size_t) { return fill; }));
                     }
             };
             run(work, {}, &op);
             pool_.parallel_for(split.size(), [&](std::size_t s) {
-                Cell<N> cell;
-                double coordinate[N ? N : kMaxSampleDims];
+                Cell<N,Real> cell;
+                Real coordinate[N ? N : kMaxSampleDims];
                 for (const Split& sp : split[s].points) {
                     const std::uint8_t* at = raw.data() + (base[s] + sp.first) * isz;
-                    cell_of<N>(coords(sp.p, coordinate), nd, cell);
-                    store(sp.p, interpolate(cell, [&](std::size_t corner) { return load(at + corner * isz); }));
+                    cell_of<N>(coords(sp.p, coordinate), nd, cell, coords);
+                    store(sp.p, sampling::interpolate(cell, [&](std::size_t corner) { return load(at + corner * isz); }));
                 }
             });
         }

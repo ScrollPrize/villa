@@ -19,6 +19,17 @@ def coordinates(shape, origin, axes):
             + indices[2, ..., None] * np.asarray(axes)[:, 2])
 
 
+def coordinates32(shape, origin, axes):
+    """NumPy oracle with separate float32 operations and integer world origin."""
+    base = np.maximum(0, np.floor(origin)).astype(np.int64)
+    local = np.asarray(np.asarray(origin) - base, np.float32)
+    indices = np.indices(shape, dtype=np.float32)
+    axes = np.asarray(axes, np.float32)
+    return (local + indices[0, ..., None] * axes[:, 0]
+            + indices[1, ..., None] * axes[:, 1]
+            + indices[2, ..., None] * axes[:, 2]), base
+
+
 @pytest.mark.parametrize("read_mode", ["mmap", "slab"])
 @pytest.mark.parametrize("memory", [0, 8 << 20])
 @pytest.mark.parametrize("order", [0, 1])
@@ -42,7 +53,11 @@ def test_affine_geometry(array, read_mode, memory, order):
             pts = coordinates(shape, origin, axes)
             assert got.shape == shape
             assert got.dtype == (np.float64 if order else exp.dtype)
-            np.testing.assert_allclose(got, r.sample(pts, order=order, dtype=np.float64), rtol=1e-12)
+            if order:
+                np.testing.assert_allclose(got, r.sample(pts, order=order, dtype=np.float64), rtol=1e-12)
+            else:
+                local, base = coordinates32(shape, origin, axes)
+                np.testing.assert_array_equal(got, r.sample(local, order=0, coordinate_origin=base))
             if order:
                 np.testing.assert_allclose(got.ravel(), _linear(exp, pts), rtol=1e-12)
         # Changing an output never changes a cached chunk.
@@ -119,7 +134,8 @@ def test_affine_spans_point_batches(array, order):
     grid = ((65, 129, 129), (-0.3, 1.5, 2.5), np.diag([0.5, 0.3, 0.3]))
     with ZarrReader.open(root) as r:
         got = r.read_affine(*grid, order=order)
-        np.testing.assert_allclose(got, r.sample(coordinates(*grid), order=order), rtol=1e-6)
+        local, base = coordinates32(*grid)
+        np.testing.assert_allclose(got, r.sample(local, order=order, coordinate_origin=base), atol=5e-5, rtol=1e-6)
 
 
 def test_affine_http_and_pickle(tmp_path, data):
@@ -128,7 +144,8 @@ def test_affine_http_and_pickle(tmp_path, data):
     server, base = _serve(tmp_path)
     try:
         with ZarrReader.open(f"{base}/a.zarr", cache_dir=tmp_path / "cache") as r:
-            expected = r.sample(coordinates(*grid))
+            local, coordinate_origin = coordinates32(*grid)
+            expected = r.sample(local, coordinate_origin=coordinate_origin)
             np.testing.assert_allclose(r.read_affine(*grid), expected)
             with pickle.loads(pickle.dumps(r)) as child:
                 np.testing.assert_allclose(child.read_affine(*grid), expected)

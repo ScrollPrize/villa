@@ -122,7 +122,10 @@ class Pipeline:
     compact=False retains the ordinary reduction order. Outputs keep their dtype.
     backend="cpu" is the default. "cuda" requires the optional CUDA build and a
     device; "auto" selects CUDA when available, otherwise CPU. CUDA uses dense
-    buffers regardless of compact, with the same host-array input/output API.
+    buffers regardless of compact. NumPy/CPU Torch inputs return host arrays;
+    vc_reader.cuda.DeviceArray inputs and outputs remain on device. Device
+    samples support image, scalar, label and validity-mask targets, all on one
+    device. Calls complete before returning; DLPack consumers may use any stream.
     Only the primary benchmark transforms (and OneOf) support CUDA. Unsupported
     transforms raise when CUDA is selected; execution errors never retry on CPU.
     """
@@ -157,6 +160,29 @@ class Pipeline:
                 raise ValueError(f"array field {key!r} needs a target declaration")
         return arrays, converters
 
+    def _device_inputs(self, sample):
+        from ..cuda import DeviceArray
+        if not any(isinstance(v, DeviceArray) for v in sample.values()):
+            return None
+        if self.backend != "cuda":
+            raise ValueError("device inputs require a CUDA pipeline")
+        arrays = {}
+        for key, value in sample.items():
+            if key in self.targets and value is not None:
+                if not isinstance(value, DeviceArray):
+                    raise TypeError("device samples require DeviceArray for every array target")
+                value._ready()
+                arrays[key] = value._native
+            elif isinstance(value, (DeviceArray, np.ndarray)):
+                raise ValueError(f"array field {key!r} needs a target declaration")
+        return arrays
+
+    @staticmethod
+    def _device_result(result):
+        from ..cuda import DeviceArray
+        arrays, sources, timings, plan = result
+        return ({k: DeviceArray(*v) for k, v in arrays.items()}, sources, timings, plan)
+
     @staticmethod
     def _outputs(sample, converters, result, profile):
         arrays, sources, timings, _ = result
@@ -171,17 +197,28 @@ class Pipeline:
         return out
 
     def __call__(self, sample, *, seed, profile=False, inplace=False):
+        device = self._device_inputs(sample)
+        if device is not None:
+            result = self._device_result(self._native.run_device(device, seed, False, profile, inplace))
+            return self._outputs(sample, dict.fromkeys(device), result, profile)
         arrays, converters = self._inputs(sample, inplace)
         result = self._native.run(arrays, seed, False, profile, inplace)
         return self._outputs(sample, converters, result, profile)
 
     def sample(self, sample, *, seed):
+        device = self._device_inputs(sample)
+        if device is not None:
+            return Plan(self, self._native.run_device(device, seed, True, False, False)[3])
         arrays, _ = self._inputs(sample)
         return Plan(self, self._native.run(arrays, seed, True, False)[3])
 
     def apply(self, sample, plan):
         if not isinstance(plan, Plan) or plan._pipeline is not self:
             raise ValueError("plan belongs to another pipeline; use plan.apply(sample)")
+        device = self._device_inputs(sample)
+        if device is not None:
+            result = self._device_result(self._native.replay_device(device, plan._native))
+            return self._outputs(sample, dict.fromkeys(device), result, False)
         arrays, converters = self._inputs(sample)
         return self._outputs(sample, converters, self._native.replay(arrays, plan._native), False)
 

@@ -21,6 +21,7 @@ bool available();
 void execute(const Op&, Sample&, const Parameters&, void*);
 std::shared_ptr<void> begin(const Sample&);
 void finish(Sample&, void*);
+void finish_device(void*);
 void synchronize();
 Parameters sample_parameters(const Op&, const Sample&, Random&, bool, void*);
 void validate_program(const std::vector<Op>&);
@@ -123,13 +124,14 @@ public:
     const auto& backend() const { return backend_; }
     const auto& targets() const { return program_->targets; }
     const auto& program() const { return program_; }
-    RunResult run(Sample s, std::uint64_t seed, bool record, bool profile) const {
-        validate(s); RunResult result; result.plan.program = program_; result.plan.inputs = input_specs(s);
+    RunResult run(Sample s, std::uint64_t seed, bool record, bool profile, std::shared_ptr<void> context = {}) const {
+        const bool resident = bool(context);
+        require(!resident || executor_, "device inputs require a CUDA pipeline");
+        validate(s, !resident); RunResult result; result.plan.program = program_; result.plan.inputs = input_specs(s);
         CompactState compact(compact_);
-        std::shared_ptr<void> context;
         const auto upload_start = std::chrono::steady_clock::now();
 #ifdef VC_READER_CUDA
-        if (executor_) context = cuda::begin(s);
+        if (executor_ && !resident) context = cuda::begin(s);
 #endif
         const double upload_time = std::chrono::duration<double>(std::chrono::steady_clock::now()-upload_start).count();
         for (std::size_t i = 0; i < program_->transforms.size(); ++i) {
@@ -144,20 +146,21 @@ public:
         }
         auto start = std::chrono::steady_clock::now();
 #ifdef VC_READER_CUDA
-        if (executor_) cuda::finish(s,context.get());
+        if (executor_) { if (resident) cuda::finish_device(context.get()); else cuda::finish(s,context.get()); }
 #endif
         compact.flush(s);
         if (profile && !program_->transforms.empty()) result.timings[std::to_string(program_->transforms.size() - 1)] +=
             std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         result.sample = std::move(s); return result;
     }
-    RunResult replay(Sample s, const Plan& plan) const {
+    RunResult replay(Sample s, const Plan& plan, std::shared_ptr<void> context = {}) const {
         require(plan.program == program_, "plan belongs to another pipeline; use plan.apply(sample)");
-        validate(s); require(input_specs(s) == plan.inputs, "replay requires identical target names, shapes and dtypes");
+        const bool resident = bool(context);
+        require(!resident || executor_, "device inputs require a CUDA pipeline");
+        validate(s, !resident); require(input_specs(s) == plan.inputs, "replay requires identical target names, shapes and dtypes");
         CompactState compact(compact_);
-        std::shared_ptr<void> context;
 #ifdef VC_READER_CUDA
-        if (executor_) context = cuda::begin(s);
+        if (executor_ && !resident) context = cuda::begin(s);
 #endif
         for (const auto& step : plan.steps) {
             if (executor_) { executor_(resolve(*program_, step.path), s, step.parameters, context.get()); continue; }
@@ -168,7 +171,7 @@ public:
             }, resolve(*program_, step.path));
         }
 #ifdef VC_READER_CUDA
-        if (executor_) cuda::finish(s,context.get());
+        if (executor_) { if (resident) cuda::finish_device(context.get()); else cuda::finish(s,context.get()); }
 #endif
         compact.flush(s);
         RunResult result; result.sample = std::move(s); return result;

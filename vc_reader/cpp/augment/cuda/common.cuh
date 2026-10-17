@@ -1,6 +1,7 @@
 #pragma once
 #include "../core.hpp"
 #include <cuda_runtime.h>
+#include <unistd.h>
 namespace vcr::augment::cuda {
 inline void check(cudaError_t status) {
     if (status != cudaSuccess) throw std::runtime_error(std::string("CUDA augmentation: ") + cudaGetErrorString(status));
@@ -11,11 +12,15 @@ template<class T> struct Buffer {
     T* ptr = nullptr;
     std::size_t size;
     bool pooled = false;
+    bool borrowed = false;
+    bool exported = false;
+    int device = 0;
+    pid_t pid = getpid();
     explicit Buffer(std::size_t n) : size(n) {
+        check(cudaGetDevice(&device));
         if (!n) return;
 #if CUDART_VERSION >= 11020
-        int device = 0, supported = 0;
-        check(cudaGetDevice(&device));
+        int supported = 0;
         check(cudaDeviceGetAttribute(&supported,cudaDevAttrMemoryPoolsSupported,device));
         pooled = supported;
         if (pooled) { check(cudaMallocAsync(&ptr,n*sizeof(T),0)); return; }
@@ -23,15 +28,20 @@ template<class T> struct Buffer {
         check(cudaMalloc(&ptr,n*sizeof(T)));
     }
     explicit Buffer(const std::vector<T>& v) : Buffer(v.size()) { upload(v.data()); }
-    Buffer(Buffer&& other) noexcept : ptr(std::exchange(other.ptr,nullptr)),size(other.size),pooled(other.pooled) {}
+    Buffer(T* data, std::size_t n) : ptr(data),size(n),borrowed(true) { check(cudaGetDevice(&device)); }
+    Buffer(Buffer&& other) noexcept : ptr(std::exchange(other.ptr,nullptr)),size(other.size),pooled(other.pooled),borrowed(other.borrowed),exported(other.exported),device(other.device),pid(other.pid) {}
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
     ~Buffer() {
-        if (!ptr) return;
+        if (!ptr || borrowed || pid != getpid()) return;
+        int previous = 0;
+        if (cudaGetDevice(&previous) != cudaSuccess || cudaSetDevice(device) != cudaSuccess) return;
+        if (exported) cudaDeviceSynchronize();
 #if CUDART_VERSION >= 11020
-        if (pooled) { cudaFreeAsync(ptr,0); return; }
+        if (pooled) cudaFreeAsync(ptr,0); else
 #endif
         cudaFree(ptr);
+        cudaSetDevice(previous);
     }
     void upload(const T* p) { if (size) check(cudaMemcpy(ptr,p,size*sizeof(T),cudaMemcpyHostToDevice)); }
     void download(T* p) const { if (size) check(cudaMemcpy(p,ptr,size*sizeof(T),cudaMemcpyDeviceToHost)); }

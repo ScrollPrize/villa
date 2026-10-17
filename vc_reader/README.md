@@ -9,6 +9,15 @@ The catalog fetches and parses the metadata and answers "which volume / level
 `vc_reader.reader` then reads the data. Zarr v2 arrays are supported now
 (volumes and volume predictions). Zarr v3 (ink labels), tif and png are next.
 
+## Optional CUDA CT sampling
+
+`reader.cuda()` provides device outputs for affine crops/batches, nearest and
+trilinear point sampling, integer gathers, and axis-aligned reads. It reuses a
+bounded GPU chunk cache and can feed `augment.Pipeline(..., backend="cuda")`
+without an intermediate image download. See the [CUDA reader guide](docs/cuda_reader.md)
+for the API, routing, float32 precision contract, DLPack ownership, build commands
+and validation. CPU-only builds remain the default.
+
 ## Usage
 
 ```python
@@ -166,8 +175,10 @@ anisotropic spacing are supported; axes need not be orthonormal. Coordinates
 are relative to the opened pyramid level, not physical units or level 0.
 There is no antialiasing filter when downsampling.
 
-`order=1` uses float64 interpolation and returns float32 by default, or
-`dtype=np.float64`. `order=0` uses nearest sampling (ties to even) and retains
+For 3-D uint8 CT, default geometry/interpolation uses float32 with integer
+global origins; `coordinate_origin=` accepts already-local geometry. Explicit
+`dtype=np.float64` retains the CPU reference path. Other source dtypes retain
+their existing float64 interpolation. `order=0` uses nearest sampling (ties to even) and retains
 the stored dtype by default; an explicit float32/float64 dtype converts it. Outside neighbours and
 missing chunks use the array's stored `fill_value`. This does **not** imply
 zero padding for arrays with nonzero fill values. Normalize the returned image
@@ -394,7 +405,8 @@ Focused verification uses tiny local arrays and a loopback HTTP fixture:
   slice steps are not supported.
 - **Points and sampling**: `read_points` gathers stored values at integer
   indices; `sample` interpolates at real coordinates (voxel `i` at coordinate
-  `i`; `order=1` n-linear in float64, returned as float32 or float64, with
+  `i`; `order=1` uses float32 for default 3-D uint8 CT sampling, or the legacy
+  float64 path for other source types/explicit float64 output, with
   neighbours outside the array counting as `fill_value`, like
   `scipy.ndimage.map_coordinates(mode="grid-constant")`; `order=0` nearest
   with ties to even). Both run natively on the reader's threads and read each

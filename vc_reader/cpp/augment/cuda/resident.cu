@@ -45,3 +45,51 @@ std::shared_ptr<void> begin(const Sample& s) { return std::make_shared<Session>(
 void finish(Sample& s, void* context) { static_cast<Session*>(context)->finish(s); }
 void synchronize() { check(cudaStreamSynchronize(0)); }
 } // namespace vcr::augment::cuda
+
+#include "device_io.hpp"
+namespace vcr::augment::cuda {
+template<class T> __global__ void validate_device_values(View<T> data, bool mask, int* invalid) {
+    EACH_INDEX(data.size) {
+        if constexpr (std::is_floating_point_v<T>) if (!isfinite(data.ptr[i])) atomicOr(invalid,1);
+        if (mask && data.ptr[i]!=0 && data.ptr[i]!=1) atomicOr(invalid,2);
+    }
+}
+std::shared_ptr<void> begin_device(const std::map<std::string,DeviceInput>& inputs, Sample& sample, bool inplace) {
+    auto session=std::make_shared<Session>();
+    Buffer<int> invalid(1); int flags=0; invalid.upload(&flags);
+    for (const auto& [key,in]:inputs) {
+        auto& f=sample.at(key);
+        require(!sparse(f.target.role) && !directional(f.target.role) && f.target.role!=Role::CoordinateField,
+                "device augmentation supports image, scalar, label and validity-mask targets");
+        DeviceArray array(in.shape,in.kind,in.bytes,in.data);
+        array.typed([&](auto view) { if (view.size) validate_device_values<<<blocks(view.size),256>>>(view,f.target.role==Role::Valid,invalid.ptr); });
+        check(cudaGetLastError());
+        if (inplace) session->arrays.emplace(key,std::move(array));
+        else {
+            DeviceArray copy(in.shape,in.kind,in.bytes);
+            check(cudaMemcpyAsync(copy.buffer->ptr,in.data,array.size()*array.bytes,cudaMemcpyDeviceToDevice));
+            session->arrays.emplace(key,std::move(copy));
+        }
+    }
+    invalid.download(&flags);
+    require(!(flags&1),"nonfinite input; use a validity mask for missing data");
+    require(!(flags&2),"validity masks must contain only zero or one");
+    return session;
+}
+std::map<std::string,DeviceInput> device_outputs(void* context) {
+    std::map<std::string,DeviceInput> out;
+    for (const auto& [key,a]:static_cast<Session*>(context)->arrays) {
+        a.buffer->exported=true;
+        out.emplace(key,DeviceInput{a.buffer->ptr,a.shape,a.kind,a.bytes,a.buffer->device});
+    }
+    return out;
+}
+void finish_device(void* context) {
+    auto& session=*static_cast<Session*>(context);
+    if (session.nonfinite) {
+        int invalid=0; session.nonfinite->download(&invalid);
+        require(!invalid,"normalization requires finite crop values");
+    }
+    check(cudaStreamSynchronize(0));
+}
+}

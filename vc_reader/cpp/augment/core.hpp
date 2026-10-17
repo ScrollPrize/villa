@@ -249,7 +249,7 @@ inline Shape sample_shape(const Sample& s) {
     for (const auto& [name, f] : s) if (!sparse(f.target.role)) return f.array.spatial();
     throw std::invalid_argument("sample needs a spatial array");
 }
-inline void validate(const Sample& s) {
+inline void validate(const Sample& s, bool values = true) {
     auto shape = sample_shape(s); auto names = axes(shape.size());
     require(std::all_of(shape.begin(), shape.end(), [](auto extent) { return extent > 0; }), "spatial dimensions must be nonempty");
     for (const auto& [name, f] : s) {
@@ -266,7 +266,7 @@ inline void validate(const Sample& s) {
         // Dispatch once. Integer targets are inherently finite; construct error
         // messages only on failure, never in the voxel loop.
         const auto n = a.size();
-        if (a.kind == 'f') a.typed([&](const auto* values) {
+        if (values && a.kind == 'f') a.typed([&](const auto* values) {
             using V = std::remove_cv_t<std::remove_pointer_t<decltype(values)>>;
             if constexpr (std::is_floating_point_v<V>) {
                 // Integer OR reduction vectorizes without relaxed floating-point
@@ -278,7 +278,7 @@ inline void validate(const Sample& s) {
                 if (invalid) throw std::invalid_argument(name + ": nonfinite input; use a validity mask for missing data");
             }
         });
-        if (t.role == Role::Valid) a.typed([&](const auto* values) {
+        if (values && t.role == Role::Valid) a.typed([&](const auto* values) {
             for (std::size_t i = 0; i < n; ++i)
                 if (values[i] != 0 && values[i] != 1)
                     throw std::invalid_argument(name + ": validity masks must contain only zero or one");

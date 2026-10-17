@@ -18,6 +18,9 @@ execute_process(
     COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
     OUTPUT_VARIABLE nanobind_ROOT OUTPUT_STRIP_TRAILING_WHITESPACE)
 find_package(nanobind CONFIG REQUIRED)
+if(nanobind_VERSION VERSION_LESS 2.10.2)
+    message(FATAL_ERROR "vc_reader requires nanobind >= 2.10.2 for device-array ownership")
+endif()
 find_package(Threads REQUIRED)
 
 # The augmentation module has no dependency on reader networking or codecs.
@@ -25,7 +28,7 @@ nanobind_add_module(_augment NB_STATIC NOMINSIZE cpp/augment/bindings.cpp)
 install(TARGETS _augment LIBRARY DESTINATION vc_reader)
 
 # CPU builds never require the toolkit or load the CUDA runtime.
-option(VC_READER_ENABLE_CUDA "Build the optional CUDA augmentation backend" OFF)
+option(VC_READER_ENABLE_CUDA "Build optional CUDA reader and augmentation backends" OFF)
 if(VC_READER_ENABLE_CUDA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
@@ -88,6 +91,12 @@ if(VC_READER_BUILD_READER)
 
     # NOMINSIZE: nanobind otherwise appends -Os, which costs the point samplers ~8%.
     nanobind_add_module(_native NB_STATIC NOMINSIZE cpp/bindings.cpp)
+    if(VC_READER_ENABLE_CUDA)
+        target_sources(_native PRIVATE cpp/reader_cuda/kernels.cu)
+        target_compile_definitions(_native PRIVATE VC_READER_CUDA=1)
+        target_link_libraries(_native PRIVATE CUDA::cudart)
+        set_target_properties(_native PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+    endif()
     target_include_directories(_native PRIVATE cpp)
     target_link_libraries(_native PRIVATE CURL::libcurl PkgConfig::BLOSC PkgConfig::ZSTD SQLite::SQLite3 vc_delta3d::vc_delta3d Threads::Threads)
     install(TARGETS _native LIBRARY DESTINATION vc_reader)

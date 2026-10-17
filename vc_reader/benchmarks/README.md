@@ -259,6 +259,14 @@ memory cache.
 
 ## Points and sampling: `bench_sample.py`
 
+The optional [float32 CUDA sampler experiment](cuda_sampling_results.md)
+compares the native CPU planner with CUDA sampling from compact source boxes
+and packed chunks, including uploads and device-resident outputs. It includes
+real CT measurements, precision checks, build commands and profiling results.
+The [remaining read-path experiments](cuda_read_paths_results.md) cover integer
+gathers, axis-aligned `read`/`read_many`, and batched affine crops. They compare
+resident chunks, fresh uploads, CPU crop upload, and one versus many GPU launches.
+
 ```
 python benchmarks/bench_sample.py
 python benchmarks/bench_sample.py --reps 7 --compare results/sample-YYYYMMDD-HHMMSS.json

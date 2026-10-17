@@ -176,6 +176,15 @@ class ZarrReader:
 
     # -- construction -----------------------------------------------------------
 
+    def cuda(self, *, cache_bytes=512 << 20, device=0):
+        """Optional CUDA adapter for 3-D uint8 CT; outputs remain on device.
+
+        Owns a bounded device chunk cache. Create one per worker/device and
+        reuse it across reads; close it or use it as a context manager.
+        """
+        from .cuda import CudaReader
+        return CudaReader(self, cache_bytes=cache_bytes, device=device)
+
     @classmethod
     def open(
         cls,
@@ -519,7 +528,7 @@ class ZarrReader:
 
     def read_affine(
         self, shape: Sequence[int], origin: Any, axes: Any, *, order: int = 1,
-        dtype: Any = None, out: np.ndarray | None = None,
+        dtype: Any = None, out: np.ndarray | None = None, coordinate_origin=None,
     ) -> np.ndarray:
         """Sample an oriented 3-D crop without constructing a coordinate array.
 
@@ -530,8 +539,9 @@ class ZarrReader:
         anisotropic spacing, reflections, shears and singleton-axis planes
         are supported. No antialiasing is applied when downsampling.
 
-        Interpolation and boundaries follow :meth:`sample`: order 1 uses
-        float64 arithmetic and returns float32 by default (or float64);
+        Interpolation and boundaries follow :meth:`sample`: uint8 CT with
+        uint8/float32 output uses local float32 geometry and arithmetic.
+        Explicit float64 output retains the legacy float64 reference path;
         order 0 rounds ties to even and returns the stored dtype. Missing
         chunks and outside neighbours use the source's ``fill_value``.
         Explicit ``dtype`` also permits float32/float64 conversion for order 0.
@@ -540,11 +550,12 @@ class ZarrReader:
         are generated natively, with bounded point-planning scratch space.
         """
         return self.read_affine_many([(shape, origin, axes)], order=order, dtype=dtype,
-                                     out=None if out is None else [out])[0]
+                                     out=None if out is None else [out], coordinate_origin=coordinate_origin)[0]
 
     def read_affine_many(
         self, grids: Iterable[tuple[Sequence[int], Any, Any]], *, order: int = 1,
         dtype: Any = None, out: Sequence[np.ndarray | None] | None = None,
+        coordinate_origin=None,
     ) -> list[np.ndarray]:
         """Sample ``(shape, origin, axes)`` grids using :meth:`read_affine` semantics.
 
@@ -570,6 +581,30 @@ class ZarrReader:
         grids = list(grids)
         if out is not None and len(out) != len(grids):
             raise ValueError("out must have one array per grid")
+        if self.dtype == np.uint8 and out_dtype != np.float64:
+            from ._sampling import affine32
+            prepared = [affine32(*g, coordinate_origin) for g in grids]
+            results = []
+            for i, (shape, _, _, _) in enumerate(prepared):
+                given = None if out is None else out[i]
+                if given is None:
+                    given = _empty(shape, out_dtype)
+                if not isinstance(given, np.ndarray) or given.shape != shape or given.dtype != out_dtype:
+                    raise ValueError(f"out must have shape {shape} and dtype {out_dtype}")
+                if not (given.flags.writeable and given.flags.c_contiguous and given.flags.aligned):
+                    raise ValueError("out must be writable, aligned, C-contiguous")
+                if any(np.shares_memory(given, previous) for previous in results):
+                    raise ValueError("output buffers must not overlap")
+                results.append(given)
+            for (shape, base, origin, axes), result in zip(prepared, results):
+                target = result if order or out_dtype == np.uint8 else np.empty(shape, np.uint8)
+                self._array._affine_u8_float32(shape, origin.tolist(), axes.ravel().tolist(), base,
+                                             target.reshape(-1).view(np.uint8), order)
+                if target is not result:
+                    result[...] = target
+            return results
+        if coordinate_origin is not None:
+            raise ValueError("coordinate_origin requires uint8 CT and uint8/float32 output")
         shapes, origins, matrices, results = [], [], [], []
         for i, (shape, origin, axes) in enumerate(grids):
             try:
@@ -614,14 +649,18 @@ class ZarrReader:
         )
         return results
 
-    def sample(self, points: Any, *, order: int = 1, dtype: Any = np.float32) -> np.ndarray:
+    def sample(self, points: Any, *, order: int = 1, dtype: Any = np.float32, coordinate_origin=None) -> np.ndarray:
         """Values at real-valued points: ``points`` of shape ``(..., ndim)`` -> values of shape ``(...)``.
 
         Element ``i`` sits at coordinate ``i`` along each axis.
 
         ``order=1``: n-linear (trilinear for 3-D) interpolation of the
         neighbouring elements, computed in float64 and returned as ``dtype``
-        (float32 or float64). Neighbours outside the array count as
+        (float32 or float64). For 3-D uint8 CT, float32 output instead uses
+        float32 coordinates, weights and accumulation. Integer global origins
+        are split off before narrowing. Pass coordinate_origin=(z,y,x) with
+        already-local float32 points to preserve precision at large locations.
+        Neighbours outside the array count as
         ``fill_value``, as in ``scipy.ndimage.map_coordinates(mode="grid-constant",
         cval=fill_value)``. Points with a non-finite coordinate give NaN.
 
@@ -632,6 +671,16 @@ class ZarrReader:
         Use :meth:`read_points` for integer indices.
         """
         self._ready()
+        if self.ndim == 3 and self.dtype == np.uint8 and (order == 0 or np.dtype(dtype) == np.float32):
+            from ._sampling import points32
+            if order not in (0, 1):
+                raise ValueError("order must be 0 or 1")
+            local, base, shape = points32(points, coordinate_origin)
+            result = _empty((len(local),), np.dtype(np.uint8 if order == 0 else np.float32))
+            self._array._sample_u8_float32(local, base, result.view(np.uint8), order)
+            return result.reshape(shape)
+        if coordinate_origin is not None:
+            raise ValueError("coordinate_origin requires 3-D uint8 CT and uint8/float32 output")
         pts = np.asarray(points)
         if pts.ndim == 0 or pts.shape[-1] != self.ndim:
             raise ValueError(f"points must have shape (..., {self.ndim})")
