@@ -297,3 +297,21 @@ Adjust Python ABI paths, cached codec location and CUDA architecture for the
 local environment. Tests that use local HTTP fixtures require localhost socket
 access; CUDA tests require a GPU and skip in CPU-only builds. Performance and
 memory-check commands/results are in the public-backend benchmark report.
+
+The final upload implementation passes 1,616 tests (one skipped, two live-network
+tests deselected). CPU-only sampling checks pass 81 tests with 26 CUDA skips;
+the two local HTTP cases require socket access outside the sandbox. Compute
+Sanitizer reports zero errors for four staging reuse/error recovery,
+eviction/concurrency and resident-pipeline cases:
+
+```bash
+AGENTS_AGENT_MODE=1 PYTHONPATH=vc_reader/src OPENBLAS_NUM_THREADS=1 \
+  OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  /usr/local/cuda/bin/compute-sanitizer --tool memcheck --target-processes all \
+  --error-exitcode 99 vc_reader/.venv/bin/python vc_reader/benchmarks/run_native.py \
+  /tmp/vc-reader-cuda/_native.cpython-314-x86_64-linux-gnu.so \
+  vc_reader/benchmarks/run_native.py \
+  /tmp/vc-reader-cuda/_augment.cpython-314-x86_64-linux-gnu.so \
+  -m pytest -q vc_reader/tests/test_reader_cuda.py \
+  -k 'upload_staging or cache_budget or resident_pipeline'
+```
