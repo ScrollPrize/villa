@@ -696,7 +696,7 @@ def run_inference_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = No
     """Execute the inference step (either standard or partitioned mode)."""
     # Import torch and related dependencies only when doing inference
     import torch
-from device_utils import select_device, amp_device_type
+    from device_utils import select_device, amp_device_type
     from torch.nn import DataParallel
     from inference import run_inference, CFG
     from processing import path_exists
