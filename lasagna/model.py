@@ -6,7 +6,6 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
-from dtypes import torch_float_hi, numpy_float_hi
 
 import fit_data
 
@@ -3177,8 +3176,8 @@ class Model3D(nn.Module):
 		device = uv_yx.device
 		result_device = device if output_device is None else torch.device(output_device)
 		dtype = uv_yx.dtype
-		uv = uv_yx.detach().cpu().numpy().astype(numpy_float_hi, copy=False)
-		xyz = source_xyz.detach().cpu().numpy().astype(numpy_float_hi, copy=False)
+		uv = uv_yx.detach().cpu().numpy().astype(np.float32, copy=False)
+		xyz = source_xyz.detach().cpu().numpy().astype(np.float32, copy=False)
 		cell_valid = source_cell_valid.detach().cpu().numpy().astype(bool, copy=False)
 		Hs, Ws = int(uv.shape[0]), int(uv.shape[1])
 		min_h, min_w = min_shape if min_shape is not None else Model3D._flatten_output_shape_for_source(
@@ -3312,7 +3311,7 @@ class Model3D(nn.Module):
 				0, torch.from_numpy(cand.reshape(-1)),
 			).view(int(cand.shape[0]), int(cand.shape[1]), -1)
 		if not use_tree:
-			centers_c = torch.as_tensor(centers, dtype=torch_float_hi, device=device)
+			centers_c = torch.as_tensor(centers, dtype=torch.float32, device=device)
 
 		out_map_t = torch.zeros((out_h * out_w, 2), dtype=torch.float32, device=result_device)
 		out_xyz_t = torch.zeros((out_h * out_w, 3), dtype=torch.float32, device=result_device)
@@ -3327,7 +3326,7 @@ class Model3D(nn.Module):
 			flat_idx = np.arange(start, stop, dtype=np.int64)
 			oy = flat_idx // int(out_w)
 			ox = flat_idx - oy * int(out_w)
-			points = np.stack([lo[0] + oy.astype(numpy_float_hi), lo[1] + ox.astype(numpy_float_hi)], axis=-1)
+			points = np.stack([lo[0] + oy.astype(np.float32), lo[1] + ox.astype(np.float32)], axis=-1)
 			return flat_idx, points
 
 		def _stage_chunk(start: int):
@@ -3362,16 +3361,16 @@ class Model3D(nn.Module):
 					flat_idx, points, cand, staged = _stage_chunk(start)
 				else:
 					flat_idx, points = _chunk_points(start)
-					pts_bf = torch.as_tensor(points, dtype=torch_float_hi, device=device)
+					pts_bf = torch.as_tensor(points, dtype=torch.float32, device=device)
 					d2 = ((pts_bf[:, None, :] - centers_c[None, :, :]) ** 2).sum(dim=-1)
 					cand = torch.topk(
 						d2, min(k, int(centers_c.shape[0])), dim=1, largest=False,
 					).indices.detach().cpu().numpy()
 					staged = _gather_staged(cand)
 
-				pts_t = torch.as_tensor(points, dtype=torch_float_hi, device=device)
+				pts_t = torch.as_tensor(points, dtype=torch.float32, device=device)
 				cand_table = torch.as_tensor(
-					staged, dtype=torch_float_hi, device=device)
+					staged, dtype=torch.float32, device=device)
 				del staged
 				q00_c = cand_table[..., 0:2]
 				e0s = cand_table[..., 2:4]
@@ -3452,7 +3451,7 @@ class Model3D(nn.Module):
 				def _selected_tensor(values: np.ndarray) -> torch.Tensor:
 					return torch.as_tensor(
 						np.ascontiguousarray(values[best_cell]),
-						dtype=torch_float_hi,
+						dtype=torch.float32,
 						device=device,
 					)
 
