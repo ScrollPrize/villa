@@ -325,7 +325,8 @@ inline double round_even(double v) {
 }
 // Convolution boundaries: reflect repeats the edge sample (SciPy "reflect"),
 // mirror does not (Torch "reflect"), nearest replicates it (SciPy "nearest").
-enum class Boundary { Reflect, Mirror, Nearest };
+// Zero pads with zeros (Torch conv padding); only structure tensors use it.
+enum class Boundary { Reflect, Mirror, Nearest, Zero };
 inline std::size_t mirror(std::int64_t i, std::size_t n) {
     if (n == 1) return 0;
     auto p = std::int64_t(2 * (n - 1)); i = (i % p + p) % p;

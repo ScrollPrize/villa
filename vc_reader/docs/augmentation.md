@@ -214,6 +214,58 @@ with their configured fill. Geometry preserves int64/uint64 IDs exactly.
 Value-based label operations require IDs within ±(2**53 − 1), and reject larger
 IDs rather than silently rounding them.
 
+## Distance transforms and structure tensors
+
+Two transforms create derived targets for auxiliary losses and normals, on CPU
+and CUDA. Like `MedialSurface`, they add fields; place them after geometry.
+
+```python
+pipeline = A.Pipeline([
+    A.Rotate90(), A.Transpose(),
+    # mask -> mask_sdt (signed distance) and mask_normals (Scharr normals)
+    A.DistanceTransform(on="mask", normals="_normals", components="xyz"),
+    # in-plane direction: smallest eigenvector of the SDT structure tensor
+    A.StructureTensor(on="mask_sdt", output="inplane", field="tangent", components="xyz"),
+], backend="cuda")
+```
+
+- `DistanceTransform` is an exact Felzenszwalb–Huttenlocher EDT of one label
+  channel (foreground `value > threshold`): `mode="signed"` gives
+  `outside - inside` as the vesuvius aux SDT; `"inside"`/`"outside"` give one
+  side. `normals=` also creates the vesuvius aux surface normals: the skimage
+  Scharr gradient (reflect boundary) of the signed distance divided by
+  `max(|g|, 1e-6)`. A class absent from the crop contributes zero distance
+  (SciPy's result is ill-defined there). Distances are float32.
+- `StructureTensor(derivative="pavel")` matches vesuvius
+  `StructureTensorComputer` (Gaussian presmoothing radius `int(3*sigma)`,
+  Holoborodko derivative, component smoothing `int(3*rho)`, zero padding).
+  `derivative="gaussian"` is SciPy's Gaussian derivative and smoothing
+  (`truncate`, nearest boundary by default). `scale` multiplies the input
+  (e.g. `1/255`). `field="components"` gives `zz, zy, zx, yy, yx, xx` (2D: `yy,
+  yx, xx`); `"normal"`/`"tangent"` give the largest/smallest eigenvector as a
+  `NormalField` (sign: largest-magnitude component positive) and `confidence=`
+  names an optional relative-eigengap field. Outputs follow the input's
+  float32/float64 precision.
+- `StructureTensor(at=(z, y, x), rho=...)` evaluates one `(D, D)` tensor (a
+  `Vectors`-shaped target) with Gaussian weights normalized over the whole grid,
+  as the tracers' `ct_structure_tensor`
+  (`derivative="gaussian", sigma=2, rho=8, scale=1/255` for its 2/8 policy).
+  Its rows are array-axis (zyx) order; reverse both axes for xyz.
+
+Measured on the RTX 5090 (resident inputs, p50) against one CPU core:
+
+| Workload | CPU | CUDA |
+| --- | ---: | ---: |
+| Signed distance, 128³ | 121 ms | 2.3 ms |
+| Signed distance + normals, 128³ | 246 ms | 3.0 ms |
+| Signed distance + tangent field, 128³ | 1009 ms | 6.1 ms |
+| Pavel components, 128³ | 421 ms | 2.0 ms |
+| Point tensor, 44×34×34 (heading normals) | 5.0 ms | 0.17 ms |
+
+Tests compare against SciPy `distance_transform_edt`, skimage `scharr`, the
+Torch `StructureTensorComputer` code and SciPy `ct_structure_tensor` code
+within float32 tolerances.
+
 ## Replay and reproducibility
 
 ```python
@@ -338,6 +390,7 @@ See the [CPU measurements and validation](../benchmarks/elastic_production_resul
 | Brightness, contrast, gamma, inversion, random clipping | `BrightnessMultiply`, `BrightnessAdd`, `Contrast`, `Gamma`, `Invert`, `ClipOutliers` |
 | Gaussian/Rician noise, blur, median, sharpening | `GaussianNoise`, `RicianNoise`, `GaussianBlur`, `MedianFilter`, `Sharpen` |
 | Oriented anisotropic blur (fiber_trace_3d) | `OrientedBlur` |
+| Aux SDT/normals, structure tensors, CT normals | `DistanceTransform`, `StructureTensor` |
 | Local brightness, contrast, gamma, smoothing | `BrightnessGradient`, `LocalContrast`, `LocalGamma`, `LocalSmoothing` |
 | Blanking, illumination, smear | `BlankRectangle`, `SliceIllumination`, `Smear` |
 | Mirroring, rotation, transpose, cropping | `Flip`, `Rotate90`, `Transpose`, `CropPad` |
@@ -443,8 +496,8 @@ BrightnessMultiply, BrightnessAdd, Contrast, Gamma, Invert, GaussianNoise,
 RicianNoise, GaussianBlur, MedianFilter, Sharpen, BrightnessGradient,
 LocalContrast, LocalGamma, LocalSmoothing, BlankRectangle, SliceIllumination,
 Smear, Flip, Rotate90, Transpose, Elastic, LowResolution, ThickSlice, and
-RandomBinaryOperator. `Normalize`, `MedialSurface` and `OrientedBlur` also
-support both backends. Each has its own `.cu` file under `cpp/augment/cuda/`.
+RandomBinaryOperator. `Normalize`, `MedialSurface`, `OrientedBlur`,
+`DistanceTransform` and `StructureTensor` also support both backends. Each has its own `.cu` file under `cpp/augment/cuda/`.
 Small shared files provide interpolation, convolution, noise generation,
 channel adaptation, and device-buffer ownership. `OneOf` can compose these
 transforms. Other transforms remain available on CPU; selecting an unsupported

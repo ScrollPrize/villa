@@ -255,6 +255,37 @@ NB_MODULE(_augment, m) {
         t.on = a.get("on", t.on); t.blobs = parameter(a, "blobs", t.blobs); t.sigma_fraction = parameter(a, "sigma_fraction", t.sigma_fraction); t.amplitude = parameter(a, "amplitude", t.amplitude);
         t.points_affected = a.get("points_affected", t.points_affected); t.radius_sigma = a.get("radius_sigma", t.radius_sigma); t.max_displacement = a.get("max_displacement", t.max_displacement);
     });
+    bind<DistanceTransform>(m, "DistanceTransform", [](auto& t, auto& a) {
+        t.on = names(a.take("on", nb::none())); t.channel = a.get("channel", t.channel); t.threshold = a.get("threshold", t.threshold);
+        const auto mode = a.get("mode", std::string("signed"));
+        require(mode == "signed" || mode == "inside" || mode == "outside", "distance mode must be signed, inside or outside");
+        t.mode = mode == "signed" ? DistanceMode::Signed : mode == "inside" ? DistanceMode::Inside : DistanceMode::Outside;
+        t.suffix = a.get("suffix", t.suffix); auto normals = a.get("normals", nb::object(nb::none()));
+        t.normals = normals.is_none() ? "" : nb::cast<std::string>(normals); t.components = a.get("components", t.components);
+        require(t.suffix != t.normals && !t.suffix.empty(), "distance and normal suffixes must be distinct and nonempty");
+    });
+    bind<StructureTensor>(m, "StructureTensor", [](auto& t, auto& a) {
+        t.on = a.get("on", t.on); t.channel = a.get("channel", t.channel); t.output = a.get("output", t.output);
+        t.sigma = a.get("sigma", t.sigma); t.rho = a.get("rho", t.rho); t.truncate = a.get("truncate", t.truncate); t.scale = a.get("scale", t.scale);
+        const auto derivative = a.get("derivative", std::string("pavel"));
+        require(derivative == "pavel" || derivative == "gaussian", "derivative must be pavel or gaussian");
+        t.derivative = derivative == "pavel" ? Derivative::Pavel : Derivative::Gaussian;
+        const auto boundary = a.get("boundary", std::string(t.derivative == Derivative::Pavel ? "zero" : "nearest"));
+        const std::map<std::string, Boundary> edges{{"zero", Boundary::Zero}, {"nearest", Boundary::Nearest}, {"reflect", Boundary::Reflect}, {"mirror", Boundary::Mirror}};
+        require(edges.count(boundary), "boundary must be zero, nearest, reflect or mirror"); t.boundary = edges.at(boundary);
+        const auto field = a.get("field", std::string("components"));
+        require(field == "components" || field == "normal" || field == "tangent", "field must be components, normal or tangent");
+        t.field = field == "components" ? StructureField::Components : field == "normal" ? StructureField::Normal : StructureField::Tangent;
+        t.components = a.get("components", t.components); auto confidence = a.get("confidence", nb::object(nb::none()));
+        t.confidence = confidence.is_none() ? "" : nb::cast<std::string>(confidence);
+        auto at = a.get("at", nb::object(nb::none())); if (!at.is_none()) t.at = nb::cast<std::vector<double>>(at);
+        require(std::isfinite(t.sigma) && t.sigma >= 0 && t.sigma < 1000 && std::isfinite(t.rho) && t.rho >= 0 && t.rho < 1000, "sigma and rho must be in [0, 1000)");
+        require(t.derivative == Derivative::Pavel || t.sigma > 0, "gaussian derivatives need sigma > 0");
+        require(std::isfinite(t.truncate) && t.truncate > 0 && std::isfinite(t.scale), "truncate must be positive and scale finite");
+        require(t.at.empty() || (t.rho > 0 && t.field == StructureField::Components && t.confidence.empty()),
+                "point evaluation (at) returns the tensor and needs rho > 0");
+        require(std::all_of(t.at.begin(), t.at.end(), [](double v) { return std::isfinite(v); }), "at must be finite");
+    });
     bind<OneOf>(m, "OneOf", [](auto& t, auto& a) { t.transforms = a.get("transforms", t.transforms); t.weights = a.get("weights", t.weights); });
 
     nb::class_<Plan>(m, "Plan")

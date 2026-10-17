@@ -63,6 +63,7 @@ if(VC_READER_ENABLE_CUDA)
         cpp/augment/cuda/sharpen.cu
         cpp/augment/cuda/slice_illumination.cu
         cpp/augment/cuda/smear.cu
+        cpp/augment/cuda/structure.cu
         cpp/augment/cuda/statistics.cu
         cpp/augment/cuda/thick_slice.cu
         cpp/augment/cuda/transpose.cu

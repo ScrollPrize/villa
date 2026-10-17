@@ -88,6 +88,34 @@ def MaskImage(mask: str = "mask", on: str = "image", mask_channel: int = 0, chan
 def DeepSupervision(scales: Sequence[float | Sequence[float]], on: str = "mask", output: str = "", *, p: float = 1) -> _Config: ...
 def ToPseudo2D(*, p: float = 1) -> _Config: ...
 def FromPseudo2D(*, p: float = 1) -> _Config: ...
+def DistanceTransform(on: str | Sequence[str] | None = None, *, channel: int = 0, threshold: float = 0,
+                      mode: str = "signed", suffix: str = "_sdt", normals: str | None = None,
+                      components: str = "zyx", p: float = 1) -> _Config:
+    """Exact Euclidean distance of one label channel (foreground: value > threshold).
+
+    Creates ``name + suffix`` (ScalarField): signed = outside - inside distance
+    (vesuvius aux SDT), inside, or outside. normals: also create ``name + normals``,
+    a NormalField of the Scharr gradient of the signed distance divided by
+    max(|gradient|, 1e-6) (vesuvius aux surface normals; use components="xyz").
+    A class absent from the crop contributes zero distance.
+    """
+    ...
+def StructureTensor(on: str = "image", *, channel: int = 0, output: str | None = None, sigma: float = 1,
+                    rho: float = 1.5, derivative: str = "pavel", boundary: str | None = None, truncate: float = 3,
+                    scale: float = 1, field: str = "components", components: str = "zyx",
+                    confidence: str | None = None, at: Sequence[float] | None = None, p: float = 1) -> _Config:
+    """Structure tensor of one channel, created as ``output`` (default ``on + "_st"``).
+
+    derivative="pavel" (boundary "zero"): vesuvius StructureTensorComputer;
+    "gaussian" (boundary "nearest"): SciPy Gaussian derivative, truncate as SciPy.
+    Input is multiplied by scale first. field="components": zz, zy, zx, yy, yx,
+    xx (2D: yy, yx, xx) ScalarField smoothed with rho; "normal"/"tangent":
+    NormalField of the largest/smallest eigenvector (largest component positive),
+    optionally a ``confidence`` ScalarField with the relative eigengap.
+    at=(z, y, x): one (D, D) tensor (a Vectors target) with Gaussian rho weights
+    normalized over the whole grid, as tracers' ct_structure_tensor.
+    """
+    ...
 def MedialSurface(on: str | Sequence[str] | None = None, suffix: str = "_skel", tube: bool = True, open: bool = False, close: bool = True, ignore: Mapping[str, float] = ..., *, p: float = 1) -> _Config: ...
 
 class Plan:
