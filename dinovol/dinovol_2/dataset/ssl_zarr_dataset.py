@@ -163,6 +163,7 @@ class Volume:
     has_ink_meshes: bool = False
     mesh_scale: float = 0.0
     ink_scale: float = 0.0
+    ink_anchor_weight: float = 1.0
     oversample: float = 1.0
 
 
@@ -583,6 +584,7 @@ class SSLZarrDataset(Dataset):
                     object_mask_source=str(dataset.get("object_mask_source", "object")),
                     meshes=meshes if meshes else None,
                     has_ink_meshes=has_ink_meshes,
+                    ink_anchor_weight=float(dataset.get("ink_anchor_weight", 1.0)),
                     oversample=oversample,
                 ))
             finally:
@@ -598,6 +600,10 @@ class SSLZarrDataset(Dataset):
         if self.total_valid_crop_starts <= 0:
             raise ValueError("No valid crop starts found across configured volumes for the selected source crop size.")
 
+        self.global_ink_anchor_prob = 0.0
+        self.global_mesh_anchor_prob = 0.0
+        self.ink_anchor_vol_weights: np.ndarray | None = None
+        self.mesh_anchor_vol_weights: np.ndarray | None = None
         if self.object_points_enabled:
             max_mesh_pts = max(
                 (sum(m.n_valid_points for m in vol.meshes) for vol in self.volumes if vol.meshes),
@@ -620,6 +626,32 @@ class SSLZarrDataset(Dataset):
                     vol.oversample *= max(mesh_mult, ink_mult)
                 if vol.fiber_paths is not None:
                     vol.oversample *= self.fiber_oversample
+
+            n_active_vols = max(1, sum(1 for vol in self.volumes if vol.valid_crop_starts > 0))
+            w_ink = np.asarray(
+                [
+                    vol.ink_scale * vol.ink_anchor_weight
+                    if (vol.has_ink_meshes and vol.valid_crop_starts > 0)
+                    else 0.0
+                    for vol in self.volumes
+                ],
+                dtype=np.float64,
+            )
+            w_mesh = np.asarray(
+                [
+                    vol.mesh_scale * (1.0 - 0.7 * vol.ink_scale * min(1.0, vol.ink_anchor_weight))
+                    if (vol.meshes and vol.valid_crop_starts > 0)
+                    else 0.0
+                    for vol in self.volumes
+                ],
+                dtype=np.float64,
+            )
+            if w_ink.sum() > 0:
+                self.global_ink_anchor_prob = 0.7 * self.ink_anchor_prob * float(w_ink.sum() / n_active_vols)
+                self.ink_anchor_vol_weights = w_ink / w_ink.sum()
+            if w_mesh.sum() > 0:
+                self.global_mesh_anchor_prob = self.mesh_anchor_prob * float(w_mesh.sum() / n_active_vols)
+                self.mesh_anchor_vol_weights = w_mesh / w_mesh.sum()
 
         total_weighted = sum(vol.valid_crop_starts * vol.oversample for vol in self.volumes)
         for volume in self.volumes:
@@ -1357,32 +1389,41 @@ class SSLZarrDataset(Dataset):
     def _draw_source_plan(self, nonzero_threshold):
         vol_weights = [vol.weight for vol in self.volumes]
         while True:
-            vol_idx = np.random.choice(len(self.volumes), p=vol_weights)
-            vol = self.volumes[vol_idx]
             anchor_index = None
             mesh_anchor = None
             starts = None
+            u_anchor = np.random.random()
             if (
-                self.point_supervision_enabled
-                and vol.point_coordinates is not None
-                and vol.point_coordinates.shape[0] > 0
-                and np.random.random() < self.point_sampling_probability
+                self.object_points_enabled
+                and self.ink_anchor_vol_weights is not None
+                and u_anchor < self.global_ink_anchor_prob
             ):
-                anchor_index = self._sample_volume_anchor(vol)
-                starts = self._sample_point_centered_source_start(
-                    vol.usable_bbox,
-                    vol.point_coordinates[anchor_index],
-                )
-            elif self.object_points_enabled and vol.meshes:
-                mesh_scale = vol.mesh_scale if vol.mesh_scale > 0.0 else 1.0
-                ink_scale = vol.ink_scale if vol.has_ink_meshes else 0.0
-                p_ink_anchor = 0.7 * self.ink_anchor_prob * ink_scale
-                p_mesh_anchor = self.mesh_anchor_prob * mesh_scale * (1.0 - 0.7 * ink_scale)
-                u = np.random.random()
-                if u < p_ink_anchor + p_mesh_anchor:
-                    centered = self._sample_mesh_centered_start(vol, prefer_ink=(u < p_ink_anchor))
-                    if centered is not None:
-                        starts, mesh_anchor = centered
+                vol = self.volumes[int(np.random.choice(len(self.volumes), p=self.ink_anchor_vol_weights))]
+                centered = self._sample_mesh_centered_start(vol, prefer_ink=True)
+                if centered is not None:
+                    starts, mesh_anchor = centered
+            elif (
+                self.object_points_enabled
+                and self.mesh_anchor_vol_weights is not None
+                and u_anchor < self.global_ink_anchor_prob + self.global_mesh_anchor_prob
+            ):
+                vol = self.volumes[int(np.random.choice(len(self.volumes), p=self.mesh_anchor_vol_weights))]
+                centered = self._sample_mesh_centered_start(vol, prefer_ink=False)
+                if centered is not None:
+                    starts, mesh_anchor = centered
+            else:
+                vol = self.volumes[int(np.random.choice(len(self.volumes), p=vol_weights))]
+                if (
+                    self.point_supervision_enabled
+                    and vol.point_coordinates is not None
+                    and vol.point_coordinates.shape[0] > 0
+                    and np.random.random() < self.point_sampling_probability
+                ):
+                    anchor_index = self._sample_volume_anchor(vol)
+                    starts = self._sample_point_centered_source_start(
+                        vol.usable_bbox,
+                        vol.point_coordinates[anchor_index],
+                    )
             if starts is None:
                 if self.object_mask_enabled:
                     starts = self._sample_object_start(vol)

@@ -439,7 +439,7 @@ class ObjectPointDatasetTests(unittest.TestCase):
             "meshes": [tiny_seg],
             "fiber_presence_path": None,
         }
-        full_vol = {**self.volume, "fiber_presence_path": None}
+        full_vol = {**self.volume, "fiber_presence_path": None, "ink_anchor_weight": 0.4}
         cfg = self.dataset_config(datasets=[full_vol, tiny_vol])
         cfg["object_points"] = {
             **cfg["object_points"],
@@ -455,6 +455,8 @@ class ObjectPointDatasetTests(unittest.TestCase):
             self.assertAlmostEqual(v_tiny.ink_scale, 4.0 / 3456.0, places=5)
             self.assertAlmostEqual(v_tiny.mesh_scale, 64.0 / 6912.0, places=5)
             self.assertLess(v_tiny.oversample, 1.01)
+            expected_w0 = 0.4 / (0.4 + 4.0 / 3456.0)
+            self.assertAlmostEqual(float(dataset.ink_anchor_vol_weights[0]), expected_w0, places=5)
         finally:
             dataset.close()
 
