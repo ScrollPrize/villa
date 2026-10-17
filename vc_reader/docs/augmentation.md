@@ -133,6 +133,31 @@ platforms. There are no internal worker threads: DataLoader workers provide
 parallelism. `profile=True` adds `_aug_perf`, a dict of transform indices to
 elapsed seconds.
 
+GaussianNoise and RicianNoise now consume both Box–Muller outputs. Their seeded
+noise differs from builds using one output per draw; old noise plans store seeds
+and therefore also produce the new sequence when applied by this build. Repeated
+calls, shared-channel noise, and saved/reloaded plans remain deterministic within
+the build. Parameter sampling and Elastic control-field draws retain their prior
+RNG sequence.
+
+Float32 images use float32 buffers and convolution arithmetic for GaussianBlur,
+LocalSmoothing and Sharpen, float32 selection buffers for MedianFilter, and
+float32 powers for Gamma/LocalGamma. Gamma also uses a float32 working buffer;
+its statistics still accumulate in double. Noise's Box–Muller math follows image
+precision. Float64 images retain double-precision computation. Median filtering
+still selects exact input values; other float32 paths introduce small rounding
+differences from the previous double intermediates.
+
+Double remains where it has a numerical purpose: Gaussian coefficient
+normalization, intensity ranges and statistics, local-field construction,
+geometric coordinates/interpolation and Elastic normalization. Rician squared
+magnitudes use double to avoid float32 intermediate overflow. Filters fall back
+to double for extreme image values/strengths, and gamma powers do so when
+conversion of a normalized base or exponent risks underflow, or a large exponent
+amplifies rounding near one. See the
+[CPU optimization measurements](../benchmarks/cpu_optimization_results.md) for
+real-CT errors, timings and reproduction commands.
+
 ## Vesuvius datasets
 
 `ZarrDataset` accepts an explicit pipeline. Its existing behavior is unchanged

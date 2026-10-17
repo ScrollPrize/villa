@@ -1,5 +1,6 @@
 #pragma once
 #include "core.hpp"
+#include "median.hpp"
 #include <span>
 #include <unordered_map>
 
@@ -144,12 +145,25 @@ inline ChannelPlan channel_parameters(const Smear& t, const Array& a, Random&) {
     return {"", 0, {double(axis(t.axis, a.shape.size() - 1))}};
 }
 
-inline void channel_apply(const Gamma&, std::vector<double>& v, const Grid&, const ChannelPlan& p) {
+// Normalized intensity powers need only image precision. Preserve the wider
+// calculation when conversion would underflow, or a large exponent would
+// amplify rounding a normalized base close to one.
+template<class T> inline double intensity_power(double base, double exponent) {
+    if constexpr (std::is_same_v<T, float>) {
+        if ((base == 0 || base >= std::numeric_limits<float>::min()) &&
+            exponent >= std::numeric_limits<float>::min() && exponent <= 16)
+            return std::pow(float(base), float(exponent));
+    }
+    return std::pow(base, exponent);
+}
+
+template<class T>
+inline void channel_apply(const Gamma&, std::vector<T>& v, const Grid&, const ChannelPlan& p) {
     bool invert = p.values[1], retain = p.values[2];
     if (invert) for (auto& x : v) x = -x;
     double m = retain ? mean(v) : 0, std = retain ? deviation(v, m) : 0;
     auto [lo, hi] = std::minmax_element(v.begin(), v.end()); double low = *lo, range = *hi - low;
-    for (auto& x : v) x = std::pow((x - low) / std::max(range, 1e-7), p.values[0]) * range + low;
+    for (auto& x : v) x = intensity_power<T>((x - low) / std::max(range, 1e-7), p.values[0]) * range + low;
     if (retain) {
         double after = mean(v), scale = std / std::max(deviation(v, after), 1e-7);
         for (auto& x : v) x = (x - after) * scale + m;
@@ -157,9 +171,22 @@ inline void channel_apply(const Gamma&, std::vector<double>& v, const Grid&, con
     if (invert) for (auto& x : v) x = -x;
 }
 
-template<class Values> void channel_apply(const GaussianNoise&, Values& v, const Grid&, const ChannelPlan& p) { Random r{p.seed}; for (auto& x : v) x = double(x) + p.values[0] * r.normal(); }
+template<class Values> void channel_apply(const GaussianNoise&, Values& v, const Grid&, const ChannelPlan& p) {
+    Random r{p.seed};
+    for (std::size_t i = 0; i < v.size(); i += 2) {
+        const auto noise = r.normal_pair<typename Values::value_type>();
+        v[i] = double(v[i]) + p.values[0] * noise[0];
+        if (i + 1 < v.size()) v[i + 1] = double(v[i + 1]) + p.values[0] * noise[1];
+    }
+}
 template<class Values> void channel_apply(const RicianNoise&, Values& v, const Grid&, const ChannelPlan& p) {
-    Random r{p.seed}; for (auto& x : v) { double re = x + p.values[0] * r.normal(), im = p.values[0] * r.normal(); x = std::sqrt(re * re + im * im); }
+    Random r{p.seed}; for (auto& x : v) {
+        const auto noise = r.normal_pair<typename Values::value_type>();
+        // Double prevents overflow of the squared components for finite float
+        // inputs whose magnitude is larger than sqrt(FLT_MAX).
+        double re = x + p.values[0] * noise[0], im = p.values[0] * noise[1];
+        x = std::sqrt(re * re + im * im);
+    }
 }
 inline void channel_apply(const ClipOutliers&, std::vector<double>& v, const Grid&, const ChannelPlan& p) {
     double std = p.values[2] ? deviation(v, mean(v)) : 0; auto sorted = v;
@@ -173,18 +200,20 @@ inline void channel_apply(const ClipOutliers&, std::vector<double>& v, const Gri
     for (auto& x : v) x = std::clamp(x, low, high);
     if (p.values[2]) { double m = mean(v), after = deviation(v, m); if (after > 1e-8) for (auto& x : v) x = (x - m) / after * std + m; }
 }
-inline void channel_apply(const GaussianBlur& t, std::vector<double>& v, const Grid& g, const ChannelPlan& p) { gaussian_blur(v, g, p.values, t.truncate, t.mirror_boundary, true); }
+template<class T>
+inline void channel_apply(const GaussianBlur& t, std::vector<T>& v, const Grid& g, const ChannelPlan& p) { gaussian_blur(v, g, p.values, t.truncate, t.mirror_boundary, true); }
 // Exact palette compression, not quantization. This benefits CT patches and
-// pointwise intensity transforms of them; continuous-valued inputs fall back to
-// nth_element. The bounded palette keeps the histogram in L1 cache.
-inline bool median_histogram(std::vector<double>& v, const Grid& g, std::size_t k,
+// pointwise intensity transforms of them; continuous-valued inputs use the
+// small-window network or nth_element. The bounded palette stays in L1 cache.
+template<class T>
+inline bool median_histogram(std::vector<T>& v, const Grid& g, std::size_t k,
                              const std::vector<std::size_t>& iz, const std::vector<std::size_t>& iy,
                              const std::vector<std::size_t>& ix) {
     constexpr std::size_t limit = 256;
-    std::unordered_map<double, std::uint16_t> palette;
+    std::unordered_map<T, std::uint16_t> palette;
     palette.reserve(limit + 1);
     bool positive_zero = false, negative_zero = false;
-    auto encode = [&](double value) -> int {
+    auto encode = [&](T value) -> int {
         // Preserve the general selector's handling of signed-zero ties.
         if (value == 0) { if (std::signbit(value)) negative_zero = true; else positive_zero = true; }
         if (std::isnan(value) || (positive_zero && negative_zero)) return -1;
@@ -201,7 +230,7 @@ inline bool median_histogram(std::vector<double>& v, const Grid& g, std::size_t 
         codes[i] = static_cast<std::uint16_t>(code);
     }
     if (palette.size() == 1) return true;
-    std::vector<double> values;
+    std::vector<T> values;
     for (const auto& [value, code] : palette) values.push_back(value);
     std::sort(values.begin(), values.end());
     std::array<std::uint16_t, limit> ranks{};
@@ -258,7 +287,8 @@ inline bool median_histogram(std::vector<double>& v, const Grid& g, std::size_t 
     }
     return true;
 }
-inline void channel_apply(const MedianFilter&, std::vector<double>& v, const Grid& g, const ChannelPlan& p) {
+template<class T>
+inline void channel_apply(const MedianFilter&, std::vector<T>& v, const Grid& g, const ChannelPlan& p) {
     auto k = std::size_t(p.values[0]);
     if (k == 1) return;
     // Precompute reflected coordinates once per axis, rather than performing
@@ -274,8 +304,9 @@ inline void channel_apply(const MedianFilter&, std::vector<double>& v, const Gri
     };
     auto iz = indices(nz, kz, ny * nx), iy = indices(ny, k, nx), ix = indices(nx, k, 1);
     if (median_histogram(v, g, k, iz, iy, ix)) return;
+    if (dim == 3 && k == 3 && median_detail::median3(v, g, iz, iy, ix)) return;
     auto src = v;
-    std::vector<double> values(kz * k * k);
+    std::vector<T> values(kz * k * k);
     for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y)
         for (std::size_t x = 0; x < nx; ++x) {
             std::size_t j = 0;
@@ -287,25 +318,33 @@ inline void channel_apply(const MedianFilter&, std::vector<double>& v, const Gri
             v[(z * ny + y) * nx + x] = values[values.size() / 2];
         }
 }
-inline void channel_apply(const Sharpen&, std::vector<double>& v, const Grid& g, const ChannelPlan& p) {
-    auto [lo, hi] = std::minmax_element(v.begin(), v.end());
-    const double low = *lo, high = *hi;
-    std::vector<double> laplace(g.size);
-    for (std::size_t i = 0; i < g.size; ++i) laplace[i] = 2 * g.shape.size() * v[i];
-    for (std::size_t a = 0; a < g.shape.size(); ++a) {
-        const auto step = g.stride[a], extent = g.shape[a], block = step * extent;
-        for (std::size_t base = 0; base < g.size; base += block)
-            for (std::size_t x = 0; x < extent; ++x) {
-                const auto at = base + x * step;
-                const auto before = x ? at - step : at, after = x + 1 < extent ? at + step : at;
-                for (std::size_t j = 0; j < step; ++j) {
-                    laplace[at + j] -= v[before + j]; laplace[at + j] -= v[after + j];
-                }
-            }
+template<class T>
+inline void channel_apply(const Sharpen&, std::vector<T>& v, const Grid& g, const ChannelPlan& p) {
+    T low = 0, high = 0;
+    if (p.values[1]) { const auto bounds = std::minmax_element(v.begin(), v.end()); low = *bounds.first; high = *bounds.second; }
+    const T strength = T(p.values[0]);
+    const auto dim = g.shape.size(), nz = dim == 3 ? g.shape[0] : 1;
+    const auto ny = g.shape[dim - 2], nx = g.shape.back(), plane = ny * nx;
+    std::vector<T> output(g.size);
+    // Fuse the stencil and final update, retaining the original z/y/x
+    // subtraction order. Neighbor rows are reused across contiguous outputs.
+    for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y) {
+        const auto base = z * plane + y * nx;
+        const auto* row = v.data() + base;
+        const auto* above = row - (y ? nx : 0);
+        const auto* below = row + (y + 1 < ny ? nx : 0);
+        const auto* front = row - (z ? plane : 0);
+        const auto* back = row + (z + 1 < nz ? plane : 0);
+        for (std::size_t x = 0; x < nx; ++x) {
+            T laplace = T(2 * dim) * row[x];
+            if (dim == 3) { laplace -= front[x]; laplace -= back[x]; }
+            laplace -= above[x]; laplace -= below[x];
+            laplace -= row[x ? x - 1 : x]; laplace -= row[x + 1 < nx ? x + 1 : x];
+            T value = row[x] + strength * laplace;
+            output[base + x] = p.values[1] ? std::clamp(value, low, high) : value;
+        }
     }
-    for (std::size_t i = 0; i < g.size; ++i) {
-        v[i] += p.values[0] * laplace[i]; if (p.values[1]) v[i] = std::clamp(v[i], low, high);
-    }
+    v.swap(output);
 }
 template<class Values> void channel_apply(const BrightnessGradient& t, Values& v, const Grid&, const ChannelPlan& p) {
     auto [lo, hi] = std::minmax_element(v.begin(), v.end()); double low = *lo, high = *hi;
@@ -317,12 +356,14 @@ template<class Values> void channel_apply(const LocalContrast&, Values& v, const
     for (std::size_t i = 0; i < v.size(); ++i) v[i] = v[i] * (1 - p.field[i]) + ((v[i] - m) * p.values[0] + m) * p.field[i];
 }
 template<class Values> void channel_apply(const LocalGamma&, Values& v, const Grid&, const ChannelPlan& p) {
+    using T = typename Values::value_type;
     auto [lo, hi] = std::minmax_element(v.begin(), v.end()); double low = *lo, span = std::max(*hi - low, 1e-8);
-    for (std::size_t i = 0; i < v.size(); ++i) { double norm = (v[i] - low) / span; v[i] = (norm * (1 - p.field[i]) + std::pow(norm, p.values[0]) * p.field[i]) * span + low; }
+    for (std::size_t i = 0; i < v.size(); ++i) { double norm = (v[i] - low) / span; v[i] = (norm * (1 - p.field[i]) + intensity_power<T>(norm, p.values[0]) * p.field[i]) * span + low; }
 }
-inline void channel_apply(const LocalSmoothing&, std::vector<double>& v, const Grid& g, const ChannelPlan& p) {
+template<class T>
+inline void channel_apply(const LocalSmoothing&, std::vector<T>& v, const Grid& g, const ChannelPlan& p) {
     auto smoothed = v; gaussian_blur(smoothed, g, std::vector<double>(g.shape.size(), p.values[1]));
-    for (std::size_t i = 0; i < v.size(); ++i) { double w = p.field[i] * p.values[0]; v[i] = v[i] * (1 - w) + smoothed[i] * w; }
+    for (std::size_t i = 0; i < v.size(); ++i) { T w = T(p.field[i] * p.values[0]); v[i] = v[i] * (T(1) - w) + smoothed[i] * w; }
 }
 template<class Values> void channel_apply(const BlankRectangle& t, Values& v, const Grid& g, const ChannelPlan& p) {
     auto dim = g.shape.size(), stride = 2 * dim + 1;
@@ -399,7 +440,33 @@ Parameters sample(const T& t, const Sample& s, Random& r) {
 }
 template<class T> requires requires(T t) { t.options; }
 void apply(const T& t, Sample& s, const Parameters& p) {
-    if constexpr (std::is_same_v<T, BrightnessMultiply> || std::is_same_v<T, BrightnessAdd> ||
+    if constexpr (std::is_same_v<T, Gamma> || std::is_same_v<T, GaussianBlur> || std::is_same_v<T, MedianFilter> ||
+                  std::is_same_v<T, Sharpen> || std::is_same_v<T, LocalSmoothing>) {
+        for (const auto& c : p.channels) {
+            auto& a = s.at(c.key).array; Grid g(a.spatial());
+            if (a.bytes == 4) {
+                auto* data = static_cast<float*>(a.data()) + c.channel * g.size;
+                // Float arithmetic is sufficient for ordinary images. Retain
+                // the wider path near overflow (including large strengths),
+                // where finite inputs can have unrepresentable intermediates.
+                if constexpr (!std::is_same_v<T, MedianFilter> && !std::is_same_v<T, Gamma>) {
+                    double limit = std::numeric_limits<float>::max() / 64.;
+                    if constexpr (std::is_same_v<T, Sharpen>) limit /= std::max(1., std::abs(c.values[0]));
+                    if (std::any_of(data, data + g.size, [&](float x) { return std::abs(double(x)) > limit; }) ||
+                        (std::is_same_v<T, Sharpen> && std::abs(c.values[0]) > std::numeric_limits<float>::max())) {
+                        auto values = a.channel(c.channel); channel_apply(t, values, g, c); a.channel(c.channel, values);
+                        continue;
+                    }
+                }
+                std::vector<float> values(data, data + g.size);
+                channel_apply(t, values, g, c);
+                std::copy(values.begin(), values.end(), data);
+            } else {
+                auto values = a.channel(c.channel); channel_apply(t, values, g, c); a.channel(c.channel, values);
+            }
+        }
+        restore_valid(s);
+    } else if constexpr (std::is_same_v<T, BrightnessMultiply> || std::is_same_v<T, BrightnessAdd> ||
                   std::is_same_v<T, Contrast> || std::is_same_v<T, Invert> ||
                   std::is_same_v<T, BlankRectangle> || std::is_same_v<T, SliceIllumination> ||
                   std::is_same_v<T, GaussianNoise> || std::is_same_v<T, RicianNoise> ||

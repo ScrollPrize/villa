@@ -4,6 +4,11 @@ Initial ranking measured 2026-10-16, source commit
 `b8fdd7c62d66482423ea65b469ceba56d5931b2d`. This benchmarks only the vc_reader C++ package; no other augmentation
 implementation was run.
 
+The [next CPU optimization pass](cpu_optimization_results.md) measures paired
+noise generation, float32 filter/intensity paths, fused sharpening, and an exact
+continuous-input 3×3×3 median selector against the final build described below.
+Use that report for the latest timings.
+
 In the initial ranking across all six 128³ crops, the slowest median
 calls are Elastic, MedianFilter and RicianNoise. At 64³,
 MedianFilter is slowest among the measured augmentations.

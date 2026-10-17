@@ -67,6 +67,15 @@ struct Random {
         return value % n;
     }
     double normal() { return std::sqrt(-2 * std::log(uniform())) * std::cos(6.2831853071795864769 * uniform()); }
+    // Noise kernels consume both independent outputs. Keep normal() unchanged:
+    // parameter sampling and elastic control lattices retain their RNG stream.
+    template<class T = double> std::array<T, 2> normal_pair() {
+        // Match image precision for the expensive transcendental operations.
+        // uniform() is strictly positive, including after conversion to float.
+        const T radius = std::sqrt(T(-2) * std::log(T(uniform())));
+        const T angle = T(6.2831853071795864769 * uniform());
+        return {radius * std::cos(angle), radius * std::sin(angle)};
+    }
 };
 inline std::uint64_t split_seed(std::uint64_t base, const std::string& name) {
     // Stable across processes, standard libraries, and platforms.
@@ -294,8 +303,8 @@ inline void restore_valid(Sample& s) {
             if (!mask.get(mask.shape[0] == 1 ? i % n : i % mask.size())) f.array.set(i, f.target.fill);
     }
 }
-inline double mean(const std::vector<double>& v) { return std::accumulate(v.begin(), v.end(), 0.0) / v.size(); }
-inline double deviation(const std::vector<double>& v, double m) {
+template<class T> inline double mean(const std::vector<T>& v) { return std::accumulate(v.begin(), v.end(), 0.0) / v.size(); }
+template<class T> inline double deviation(const std::vector<T>& v, double m) {
     double sum = 0; for (auto x : v) sum += (x - m) * (x - m);
     return v.size() > 1 ? std::sqrt(sum / (v.size() - 1)) : 0;
 }
@@ -314,12 +323,13 @@ inline std::size_t mirror(std::int64_t i, std::size_t n) {
 }
 // Accumulate a few adjacent outputs in registers, then write them once. Tap
 // order is unchanged, including the initial addition to zero.
-inline void convolve_run(const double* source, double* output, std::size_t count,
-                         const std::vector<double>& kernel, const std::size_t* offsets) {
+template<class T>
+inline void convolve_run(const T* source, T* output, std::size_t count,
+                         const std::vector<T>& kernel, const std::size_t* offsets) {
     constexpr std::size_t lanes = 16;
     std::size_t i = 0;
     for (; i + lanes <= count; i += lanes) {
-        std::array<double, lanes> sum{};
+        std::array<T, lanes> sum{};
         for (std::size_t tap = 0; tap < kernel.size(); ++tap) {
             const auto* input = source + offsets[tap] + i;
             const auto weight = kernel[tap];
@@ -328,14 +338,15 @@ inline void convolve_run(const double* source, double* output, std::size_t count
         std::copy(sum.begin(), sum.end(), output + i);
     }
     for (; i < count; ++i) {
-        double sum = 0;
+        T sum = 0;
         for (std::size_t tap = 0; tap < kernel.size(); ++tap) sum += kernel[tap] * source[offsets[tap] + i];
         output[i] = sum;
     }
 }
-inline void gaussian_blur(std::vector<double>& data, const Grid& g, const std::vector<double>& sigmas, double truncate = 4, bool mirror_boundary = false, bool full_width = false) {
+template<class T>
+inline void gaussian_blur(std::vector<T>& data, const Grid& g, const std::vector<double>& sigmas, double truncate = 4, bool mirror_boundary = false, bool full_width = false) {
     require(sigmas.size() == g.shape.size() && truncate > 0 && std::isfinite(truncate), "invalid Gaussian parameters");
-    std::vector<double> tmp(g.size);
+    std::vector<T> tmp(g.size);
     for (std::size_t a = 0; a < sigmas.size(); ++a) {
         auto sigma = sigmas[a]; require(sigma >= 0 && std::isfinite(sigma) && sigma * truncate < 100000, "invalid Gaussian sigma");
         if (!sigma) continue;
@@ -345,9 +356,12 @@ inline void gaussian_blur(std::vector<double>& data, const Grid& g, const std::v
             if (size % 2 == 0) size += extent - size >= 0 ? 1 : -1;
             radius = std::max(0, (size - 1) / 2);
         }
-        std::vector<double> kernel(2 * radius + 1); double sum = 0;
-        for (int d = -radius; d <= radius; ++d) sum += kernel[d + radius] = std::exp(-.5 * (d / sigma) * (d / sigma));
-        for (auto& w : kernel) w /= sum;
+        // Normalize the small coefficient table in double; full-volume buffers
+        // and convolution arithmetic follow the image dtype.
+        std::vector<double> weights(2 * radius + 1); double sum = 0;
+        for (int d = -radius; d <= radius; ++d) sum += weights[d + radius] = std::exp(-.5 * (d / sigma) * (d / sigma));
+        std::vector<T> kernel(weights.size());
+        for (std::size_t i = 0; i < weights.size(); ++i) kernel[i] = T(weights[i] / sum);
         const auto extent = g.shape[a], step = g.stride[a], block = extent * step;
         auto boundary = [&](std::int64_t x) { return mirror_boundary ? mirror(x, extent) : reflect(x, extent); };
         if (step == 1) {
@@ -356,7 +370,7 @@ inline void gaussian_blur(std::vector<double>& data, const Grid& g, const std::v
             std::vector<std::size_t> indices(extent + 2 * radius), offsets(kernel.size());
             for (std::size_t x = 0; x < indices.size(); ++x) indices[x] = boundary(std::int64_t(x) - radius);
             std::iota(offsets.begin(), offsets.end(), 0);
-            std::vector<double> row(indices.size());
+            std::vector<T> row(indices.size());
             for (std::size_t base = 0; base < g.size; base += extent) {
                 for (std::size_t x = 0; x < row.size(); ++x) row[x] = data[base + indices[x]];
                 convolve_run(row.data(), tmp.data() + base, extent, kernel, offsets.data());
