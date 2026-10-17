@@ -220,11 +220,14 @@ vc_add_test(NAME test_segmentation_lasagna_panel_ui
     DEFS VC_TEST_DISABLE_LASAGNA_DISCOVERY VC_TEST_DISABLE_LASAGNA_DIALOGS)
 
 qt6_wrap_cpp(spiral_config_profile_editor_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/SpiralConfigProfileEditor.hpp)
+qt6_wrap_cpp(spiral_descriptions_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/SpiralDescriptions.hpp)
 vc_add_test(NAME test_spiral_config_profile_editor
     SOURCES test_spiral_config_profile_editor.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/SpiralConfigProfileEditor.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/CollapsibleSettingsGroup.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/SpiralDescriptions.cpp
             ${spiral_config_profile_editor_moc}
+            ${spiral_descriptions_moc}
             ${collapsible_settings_group_moc}
     LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
@@ -339,6 +342,20 @@ if(VC_RUN_E2E)
     # CTest runs reliably regardless of the working directory.
     set_tests_properties(test_merge_e2e_small PROPERTIES
         ENVIRONMENT "VC_RUN_E2E=1;VC_MERGE_TIFXYZ_BIN=$<TARGET_FILE:vc_merge_tifxyz>")
+endif()
+
+# End-to-end test that spawns the built vc_obj2tifxyz_legacy on two synthetic
+# plane meshes (clean, and with 3% stretched triangles) and checks the output
+# cell size under the three scale methods (median, mean, manual). Opt-in via
+# VC_RUN_E2E=1.
+add_executable(test_obj2tifxyz_legacy_scale test_obj2tifxyz_legacy_scale.cpp)
+target_link_libraries(test_obj2tifxyz_legacy_scale PRIVATE doctest::doctest vc_core)
+vc_register_test_target(test_obj2tifxyz_legacy_scale)
+if(VC_RUN_E2E)
+    add_test(NAME test_obj2tifxyz_legacy_scale COMMAND test_obj2tifxyz_legacy_scale)
+    vc_register_ctest(test_obj2tifxyz_legacy_scale test_obj2tifxyz_legacy_scale)
+    set_tests_properties(test_obj2tifxyz_legacy_scale PROPERTIES
+        ENVIRONMENT "VC_RUN_E2E=1;VC_OBJ2TIFXYZ_LEGACY_BIN=$<TARGET_FILE:vc_obj2tifxyz_legacy>")
 endif()
 
 add_executable(bench_volume_sample bench_volume_sample.cpp)
@@ -782,6 +799,20 @@ vc_add_test(NAME test_surface_patch_index)
 vc_add_test(NAME test_tiff_merge)
 
 vc_add_test(NAME test_http_fetch_errors)
+vc_add_test(NAME test_sftp_fetch LIBS doctest::doctest vc_core Qt6::Core)
+if(VC_BUILD_PYTHON)
+    find_package(Python REQUIRED COMPONENTS Interpreter)
+    add_dependencies(test_sftp_fetch vc_volume)
+    add_test(NAME python_sftp_volume
+        COMMAND "${CMAKE_COMMAND}" -E env
+            "PYTHONPATH=${CMAKE_BINARY_DIR}/python"
+            "PYTHONNOUSERSITE=1"
+            "${Python_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/python/tests/test_sftp_volume.py"
+            --ssh-fixture "$<TARGET_FILE:test_sftp_fetch>"
+            --work-dir "${CMAKE_CURRENT_BINARY_DIR}")
+    set_tests_properties(python_sftp_volume PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 200)
+    vc_register_ctest(python_sftp_volume test_sftp_fetch)
+endif()
 
 # Live S3: stages PHerc 0172 level 5 to a local zarr dir, then exercises
 # the NormalGridGenerate library API against it. Soft-skips on network.
@@ -973,6 +1004,10 @@ vc_add_test(NAME test_volume_extras)
 vc_add_test(NAME test_zarr_more)
 
 vc_add_test(NAME test_vcdataset_compressors)
+
+vc_add_test(NAME test_vcdataset_volcomp)
+
+vc_add_test(NAME test_zarr_shard_index_location)
 
 vc_add_test(NAME test_volume_static_read)
 

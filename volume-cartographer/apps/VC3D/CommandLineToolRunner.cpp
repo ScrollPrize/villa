@@ -282,7 +282,8 @@ bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
     if (tool == Tool::GrowSegFromSegment || tool == Tool::AlphaCompRefine) {
         const auto lowered = _volumePath.trimmed().toLower();
         if (lowered.startsWith("http://") || lowered.startsWith("https://") ||
-            lowered.startsWith("s3://") || lowered.startsWith("s3+")) {
+            lowered.startsWith("s3://") || lowered.startsWith("s3+") ||
+            lowered.startsWith("sftp://") || lowered.startsWith("ssh://")) {
             warn(
                 tr("Unsupported Remote Volume"),
                 tr("This command accepts only a local volume path. "

@@ -95,17 +95,22 @@ Vesuvius Challenge is ongoing and **YOU** can win the below prizes and help us m
 
 <PrizePoolBanner />
 
-***
-
 ## 2027 Grand Prize {#2027-grand-prize}
+
+<div className="vc-prize-meta">
+<div className="vc-deadline">Deadline: June 25th, 2027 (11:59pm Pacific)</div>
+<div className="vc-submit">
+
+[Submission Form](https://forms.gle/wvNK7DkNKuRKjHJdA)
+
+</div>
+</div>
 
 **<span className="vc-money">\$800,000</span> to the first team or individual to fully unroll and make readable a scroll from the set below.** We also have prizes for **second place (<span className="vc-money">\$100,000</span>)**, **third place (<span className="vc-money">\$50,000</span>)**, and **fourth place (<span className="vc-money">\$50,000</span>)** — <span className="vc-money">\$1,000,000</span> in total. Prizes are awarded according to the rules listed below.
 
 Prizes will be awarded to any team or individual that fully digitally unrolls and makes readable (according to the conditions and requirements specified below) one of the eligible CT scans of carbonized scrolls from Herculaneum:
 
 <EligibleVolumes prize="grand-prize-2027" />
-
-**Deadline: June 25th, 2027 (11:59pm Pacific)**
 
 <details>
 <summary>Submission criteria and requirements</summary>
@@ -187,23 +192,26 @@ This is a big prize, and it breaks into two stages: first **segmentation** (unro
 
 </details>
 
-[Submission Form](https://forms.gle/wvNK7DkNKuRKjHJdA)
-
-***
-
 ## First Letters Prizes {#first-letters-prizes}
+
+<div className="vc-prize-meta">
+<div className="vc-deadline">Deadline: June 25th, 2027 (11:59pm Pacific)</div>
+<div className="vc-submit">
+
+[Submission Form](https://forms.gle/TM5ao8GwC2mDrdLk9)
+
+</div>
+</div>
 
 One of the frontiers of Vesuvius Challenge is finding techniques that work across multiple scrolls.
 While we’ve discovered text in some of our scrolls, others have not yet produced legible findings.
 For these prizes, your mission is to prove that ink detection works on scrolls where nothing has been read yet. The review bar is deliberately high — we’d rather be slow than wrong.
 
-**First Letters: <span className="vc-money">\$50,000</span> per scroll, for any of the eligible scroll volumes listed below.** <span className="vc-money">\$50,000</span> to the first team that uncovers 10 letters within a single 4 cm² area of that scroll — and open sources their code, data, model weights and results (after winning the prize). First Letters prizes will be awarded for a maximum of 10 scrolls — up to <span className="vc-money">\$500,000</span> in total.
+**First Letters: <span className="vc-money">\$50,000</span> per scroll, for any of the eligible scroll volumes listed below.** <span className="vc-money">\$50,000</span> to the first team that uncovers 10 letters within a single 4 cm² area of that scroll — and open sources their code, data, model weights and results (after winning the prize). First Letters prizes will be awarded for a maximum of 9 more scrolls — up to <span className="vc-money">\$450,000</span> in total.
 
 Note the eligible set here is different than the [2027 Grand Prize](#2027-grand-prize) set: it includes several other scrolls where no text has been read yet, and excludes those where letters have now been found.
 
 <EligibleVolumes prize="first-letters-2027" />
-
-**Deadline: June 25th, 2027 (11:59pm Pacific)**
 
 <details>
 <summary>Submission criteria and requirements</summary>
@@ -249,17 +257,20 @@ A few things worth knowing:
 
 </details>
 
-[Submission Form](https://forms.gle/TM5ao8GwC2mDrdLk9)
-
-***
-
 ## PHerc. Paris 4’s Title Prize {#first-title-prize}
+
+<div className="vc-prize-meta">
+<div className="vc-deadline">Deadline: June 25th, 2027 (11:59pm Pacific)</div>
+<div className="vc-submit">
+
+[Submission Form](https://forms.gle/4zeVPPBtNdSCAQa88)
+
+</div>
+</div>
 
 Discovering a scroll’s title tells scholars what — and whom — they have been reading, and helps contextualize the entire work. We have already recovered the titles of [PHerc. 172](/data_browser/PHerc0172) and [PHerc. 139](/data_browser/PHerc0139) — but the title of Scroll 1, the scroll where the first passages were read, is still missing.
 
 **PHerc. Paris 4’s Title: <span className="vc-money">\$50,000</span> to the first team to discover the title of [PHerc. Paris 4](/data_browser/PHercParis4) (Scroll 1), using any of its scans — including the 2.4 µm volumes.** Scroll 1 is one of our most-read scrolls: substantial continuous Greek text of an Epicurean prose work has been recovered, yet its author and title remain unknown. The expected title region has shown no detectable ink so far — possibly a different ink, and the top rows are physically missing — so finding it may take better methods, higher resolution, or looking somewhere new.
-
-**Deadline: June 25th, 2027 (11:59pm Pacific)**
 
 <div className="mb-4">
   <img src="/img/data/title_example.webp" className="w-[50%]"/>
@@ -291,15 +302,28 @@ Discovering a scroll’s title tells scholars what — and whom — they have be
 * As with the Grand Prize, you **must not** make your discovery public until the prize is officially announced. We will work with you to announce your findings.
 </details>
 
-[Submission Form](https://forms.gle/4zeVPPBtNdSCAQa88)
-
-***
-
 :::tip
 The prizes above feel too ambitious? There are plenty of other ways to contribute!
 :::
 
 ## Progress Prizes
+
+<div className="vc-prize-meta">
+<div className="vc-deadline">
+
+{/* progress-prizes:deadline:start */}
+Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, October 31st, 2026!
+{/* progress-prizes:deadline:end */}
+
+</div>
+<div className="vc-submit">
+
+{/* progress-prizes:form:start */}
+[Submission Form](https://docs.google.com/forms/d/e/1FAIpQLSc4flEfgK2nyjoczz2_U_XrIGMlgrnSknWatLqrFPnbtKfZwg/viewform)
+{/* progress-prizes:form:end */}
+
+</div>
+</div>
 
 In addition to milestone-based prizes, we offer monthly prizes for open source contributions that help read the scrolls.
 These prizes are more open-ended, and we have a wishlist to provide some ideas.
@@ -322,9 +346,7 @@ We maintain a [public wishlist](https://github.com/ScrollPrize/villa/issues?q=is
 [Improvements to VC3D](https://github.com/ScrollPrize/villa/issues?q=is%3Aissue%20state%3Aopen%20label%3AVC3D) can be also considered for progress prizes!
 Some are additionally labeled as [good first issues](https://github.com/ScrollPrize/villa/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22) for newcomers!
 
-{/* progress-prizes:deadline:start */}
-Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, October 31st, 2026!
-{/* progress-prizes:deadline:end */}
+If you make multiple small contributions in a month, for example several bugfix PRs on our [villa](https://github.com/ScrollPrize/villa) monorepo, please bundle them into a single submission. More substantial contributions (new methods, models or datasets) should each be submitted separately, unless they are closely coupled.
 
 <details>
 <summary>Submission criteria and requirements</summary>
@@ -342,12 +364,6 @@ Submissions are evaluated monthly, and multiple submissions/awards per month are
    * Maintain consistent output formats
    * Designed for modular integration
 </details>
-
-{/* progress-prizes:form:start */}
-[Submission Form](https://docs.google.com/forms/d/e/1FAIpQLSc4flEfgK2nyjoczz2_U_XrIGMlgrnSknWatLqrFPnbtKfZwg/viewform)
-{/* progress-prizes:form:end */}
-
-***
 
 ## Terms and Conditions
 
