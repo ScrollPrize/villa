@@ -396,7 +396,7 @@ From the repository root, after building both extensions:
 ```bash
 export AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
 export PYTHONPATH=vc_reader/src:vc_reader/.venv/lib/python3.14/site-packages
-vc_reader/.venv/bin/python -S vc_reader/benchmarks/run_native.py \
+taskset -c 0 vc_reader/.venv/bin/python -S vc_reader/benchmarks/run_native.py \
   /tmp/vc-augment-cuda/_augment.cpython-314-x86_64-linux-gnu.so \
   vc_reader/benchmarks/run_native.py \
   vc_reader/build/cp314-cp314-linux_x86_64/_native.cpython-314-x86_64-linux-gnu.so \
@@ -417,6 +417,79 @@ stored. `--edge`, `--paths block,affine`, `--dtypes float32,float64`, and
 `--modes cast,minmax,zscore` select workloads. `--cache-state cold` closes
 readers and evicts file pages before each method (Linux only); the results
 below use **warm mmap reads with no decoded memory cache**.
+
+### Normalization moved to augmentation: 2026-10-16
+
+The new CPU/CUDA runs and saved reader baseline use the same 128³ CT block
+and affine grids described above. One reader thread, CPU 0 affinity, one
+warmup and five repetitions; warm mmap reads, alternating method order.
+GCC 15.2 Release, Python 3.14, CUDA 13.3, RTX 5090 (`sm_120`, driver 595.84).
+CUDA allows FMA, without fast math or reduced precision. These are complete
+read-plus-normalize API times, including transfers. No builds, tests, or
+profiling ran concurrently with timing. Each cell is **mean / min / median /
+max milliseconds**; JSON also records p95 and per-output numerical error.
+
+| Crop / dtype / mode | Previous reader normalization | CPU augmentation | CUDA augmentation |
+|---|---:|---:|---:|
+| block / float32 / minmax | 5.356 / 5.271 / 5.282 / 5.664 | 5.651 / 5.632 / 5.654 / 5.671 | 3.358 / 2.223 / 2.500 / 4.983 |
+| block / float32 / zscore | 6.763 / 6.745 / 6.764 / 6.776 | 7.114 / 7.058 / 7.097 / 7.220 | 3.496 / 2.307 / 2.654 / 5.310 |
+| block / float64 / minmax | 5.909 / 5.858 / 5.889 / 6.035 | 6.843 / 6.725 / 6.844 / 6.955 | 6.137 / 3.996 / 4.038 / 9.487 |
+| block / float64 / zscore | 7.577 / 7.484 / 7.489 / 7.930 | 8.228 / 8.125 / 8.237 / 8.300 | 4.079 / 4.008 / 4.096 / 4.169 |
+| affine / float32 / minmax | 67.538 / 67.338 / 67.492 / 67.822 | 68.523 / 68.139 / 68.371 / 69.034 | 65.663 / 64.546 / 65.017 / 67.137 |
+| affine / float32 / zscore | 69.096 / 68.967 / 69.014 / 69.299 | 69.680 / 69.374 / 69.599 / 70.291 | 65.707 / 64.514 / 65.015 / 67.167 |
+| affine / float64 / minmax | 68.135 / 68.006 / 68.114 / 68.313 | 68.400 / 67.787 / 68.481 / 69.065 | 67.350 / 65.237 / 65.378 / 70.630 |
+| affine / float64 / zscore | 69.618 / 69.566 / 69.612 / 69.673 | 69.772 / 69.047 / 69.542 / 70.455 | 67.358 / 65.277 / 65.472 / 70.390 |
+
+The migration adds a separate validation/API boundary on CPU. On these block
+crops, CPU medians are 0.37–0.96 ms slower than the former fused reader path;
+normalization now composes with arbitrary augmentation chains and runs on CUDA.
+CUDA reduces block z-score median latency from 6.76 to 2.65 ms (float32) and
+7.49 to 4.10 ms (float64). Affine read time dominates those workloads.
+Standalone NumPy min/max remains faster here: 2.04/3.22 ms for float32/float64
+block reads. This is not a claim that every standalone normalization is faster
+on CUDA; residency matters when it is part of a longer chain.
+
+All eight CPU comparisons against saved reader outputs are byte-identical.
+CUDA is byte-identical for float32 and min/max on these inputs; its largest
+float64 z-score difference is 4.54e-12. These checks include both block and
+affine reads. Constant, zero-only, nonfinite, extreme float64, multi-channel,
+channel/target selection, replay, and chained-statistics cases have regression
+coverage. The full suite passes **1,584 tests** (two live-network tests excluded);
+CPU-only focused suites pass **934 tests**, with 170 CUDA-dependent skips.
+Compute Sanitizer reports **0 errors** across 16 new CUDA normalization cases.
+
+Nsight Systems on one warmup and one timed float32 z-score call records exactly
+one 8 MiB upload and one 8 MiB download per call, plus a four-byte finite-status
+download at the pipeline boundary. Statistics never download image data.
+The seven kernels total about 151 µs per call: normalization writes 33.5%,
+variance collection 24.4%, mean collection 22.8%, and bounds collection 12.3%.
+Profiler timings are excluded from the end-to-end table.
+
+The raw baseline is `/tmp/vc-normalize-baseline/results.json`; its saved
+extension, reader source and reference arrays are in the same directory.
+New observations are in `benchmarks/results/normalization-augment.json`.
+Build and verification commands used (from the repository root):
+
+```bash
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-augment-cuda -j 3
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-augment-cuda-cpu -j 2
+AGENTS_AGENT_MODE=1 cmake --build vc_reader/build/cp314-cp314-linux_x86_64 --target _native -j 2
+bash /tmp/vc-cpu3-run /tmp/vc-augment-cuda/_augment.cpython-314-x86_64-linux-gnu.so \
+  vc_reader/benchmarks/run_native.py \
+  vc_reader/build/cp314-cp314-linux_x86_64/_native.cpython-314-x86_64-linux-gnu.so \
+  -m pytest vc_reader/tests -q
+/usr/local/cuda/bin/compute-sanitizer --tool memcheck --target-processes all \
+  --error-exitcode 99 bash /tmp/vc-cpu3-run \
+  /tmp/vc-augment-cuda/_augment.cpython-314-x86_64-linux-gnu.so \
+  -m pytest vc_reader/tests/test_augment_normalization.py -q \
+  -k 'cuda and (constants_and_extreme_float64 or nonfinite_from_previous_step_rejected or normalization_in_chain)'
+```
+
+`/tmp/vc-cpu3-run` supplies the same environment and explicit `run_native.py`
+launcher shown above, with CPU-0 pinning. The profiler uses that same launcher
+and the benchmark arguments `--threads 1 --reps 1 --methods cuda --paths block
+--dtypes float32 --modes zscore`, under `nsys profile --trace=cuda --sample=none
+--cpuctxsw=none`. All measured crops and default origin/matrix are recorded in JSON.
 
 ### Historical reader-owned normalization results
 
