@@ -14,8 +14,8 @@ source .venv/bin/activate
 ```
 
 The bootstrap uses `nvidia-smi` to select a pinned official PyTorch build for
-CUDA 12.8, CUDA 13.0, or CPU, then installs Lasagna. Override detection with
-`--backend cpu`, `--backend cu128`, or `--backend cu130`, for example:
+CUDA 12.8, CUDA 13.0, or CPU (or the ROCm build when only ROCm tools are found), then installs Lasagna. Override detection with
+`--backend cpu`, `--backend cu128`, `--backend cu130`, or `--backend rocm`, for example:
 
 ```bash
 python3 scripts/bootstrap_venv.py --venv .venv --backend cu128
