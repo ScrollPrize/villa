@@ -375,7 +375,7 @@ def _torch_oriented_blur(volume, axis, along, across):
 
 
 @pytest.mark.parametrize("backend", ["cpu", pytest.param("cuda", marks=gpu)])
-@pytest.mark.parametrize("axis", [(1., 0., 0.), (.2, .7, -.4), (0., .05, 1.)])
+@pytest.mark.parametrize("axis", [(1., 0., 0.), (-1., 0., 0.), (0., 1., 0.), (0., 0., -1.), (.2, .7, -.4), (0., .05, 1.)])
 def test_oriented_blur_matches_vesuvius_reference(backend, axis):
     image = np.random.default_rng(3).normal(size=(1, 9, 11, 13)).astype(np.float32)
     op = A.OrientedBlur(sigma_along=1.7, sigma_across=.6, axis=axis)

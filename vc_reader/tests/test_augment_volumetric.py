@@ -76,6 +76,39 @@ def run(transform, source, backend):
     return A.Pipeline([transform], backend=backend)(dict(image=source), seed=17)['image']
 
 
+@pytest.mark.parametrize('radius',[.1,1.5,2,5])
+@pytest.mark.parametrize('shape',[(3,5,37),(1,3,5)])
+def test_defocus_interior_runs_and_wide_boundary_kernel(backend,radius,shape):
+    source=image(shape,np.float64,1)
+    r=int(np.ceil(radius));padded=np.pad(source[0],r,mode='edge')
+    expected=np.zeros(shape,np.float64);count=0
+    for z in range(-r,r+1):
+        for y in range(-r,r+1):
+            for x in range(-r,r+1):
+                if z*z+y*y+x*x<=radius*radius:
+                    expected+=padded[r+z:r+z+shape[0],r+y:r+y+shape[1],r+x:r+x+shape[2]]
+                    count+=1
+    expected/=count
+    np.testing.assert_allclose(run(A.Defocus(radius=radius),source,backend)[0],expected,rtol=2e-14,atol=2e-14)
+
+
+@pytest.mark.parametrize('radius',[1,4,12])
+def test_ringing_overshoot_keeps_boundary_and_tap_order(backend,radius):
+    import math
+    source=image((1,5,37),np.float64,1);expected=source[0].copy();cutoff=.7
+    weights=[]
+    for j in range(-radius,radius+1):
+        w=math.sin(math.pi*cutoff*j)/(math.pi*j) if j else cutoff
+        weights.append(w*(.5+.5*math.cos(math.pi*j/(radius+1))))
+    for axis in range(3):
+        result=np.zeros_like(expected)
+        for j,w in zip(range(-radius,radius+1),weights):
+            indices=np.clip(np.arange(expected.shape[axis])+j,0,expected.shape[axis]-1)
+            result+=w*np.take(expected,indices,axis=axis)
+        expected=result/sum(weights)
+    np.testing.assert_allclose(run(A.RingingOvershoot(cutoff=cutoff,radius=radius),source,backend)[0],expected,rtol=2e-14,atol=2e-14)
+
+
 def test_closed_form_intensity_operations(backend):
     source = image(dtype=np.float64, channels=1)
     z = np.linspace(-1, 1, source.shape[1])[:, None, None]
@@ -292,3 +325,22 @@ def test_reference_snapshot_and_shared_noise(backend):
                       A.ShotNoise(photons=100, shared_noise=True), A.BiasField(std=.2, shared=True)]:
         result = run(transform, source, backend)
         np.testing.assert_array_equal(result[0], result[1])
+
+
+@pytest.mark.parametrize('transform', [A.Defocus(radius=2), A.MotionBlur(length=3), A.ZoomBlur(strength=.2),
+                                     A.GibbsRinging(cutoff=.7), A.UnsharpMask(strength=.5)])
+def test_float32_intermediate_overflow_protection(backend, transform):
+    # The result fits float32, while unnormalized sums / FFT coefficients do not.
+    source=np.full((1,5,7,9),1e37,np.float32)
+    actual=run(transform,source,backend)
+    np.testing.assert_allclose(actual,source,rtol=3e-6)
+    assert np.isfinite(actual).all()
+
+
+@pytest.mark.parametrize('transform', [A.Illumination(mode='gaussian',radius=1e-30),
+                                     A.MultiplicativeNoise(low=1e50,high=1e50)])
+def test_extreme_parameters_preserve_representable_result(backend, transform):
+    source=np.full((1,5,7,9),1e-20,np.float32)
+    actual=run(transform,source,backend)
+    expected=run(transform,source,'cpu')
+    np.testing.assert_allclose(actual,expected,rtol=3e-6,atol=0)

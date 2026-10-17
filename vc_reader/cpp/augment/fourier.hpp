@@ -19,21 +19,44 @@ VCR_HD inline void radix2(Complex* v,std::size_t n,bool inverse) {
     if(inverse)for(std::size_t i=0;i<n;++i)v[i]=v[i].scale(1./n);
 }
 inline std::size_t fft_scratch(std::size_t n){std::size_t m=1;while(m<2*n-1)m*=2;return 2*m;}
-VCR_HD inline void fft_line(Complex* v,std::size_t n,std::size_t stride,Complex* scratch,std::size_t m,bool inverse) {
-    auto* a=scratch;auto* b=scratch+m;
-    for(std::size_t i=0;i<m;++i){a[i]={};b[i]={};}
-    double sign=inverse?1:-1;
-    for(std::size_t i=0;i<n;++i){double angle=sign*pi*(double(i)*double(i)/n);a[i]=v[i*stride]*phase(angle);b[i]=phase(-angle);if(i)b[m-i]=b[i];}
-    radix2(a,m,false);radix2(b,m,false);for(std::size_t i=0;i<m;++i)a[i]=a[i]*b[i];radix2(a,m,true);
-    for(std::size_t i=0;i<n;++i)v[i*stride]=(a[i]*phase(sign*pi*(double(i)*double(i)/n))).scale(inverse?1./n:1);
-}
+// Bluestein's chirp and its transformed convolution kernel depend only on the
+// axis length/direction, not on the line. Keep the original FFT and arithmetic
+// order, but prepare these once per axis instead of once per line.
+struct FourierLinePlan {
+    std::size_t n,m;
+    bool inverse;
+    std::vector<Complex> chirp,kernel;
+    FourierLinePlan(std::size_t length,bool inv):n(length),m(fft_scratch(n)/2),inverse(inv),chirp(n),kernel(m) {
+        double sign=inverse?1:-1;
+        for(std::size_t i=0;i<n;++i){
+            double angle=sign*pi*(double(i)*double(i)/n);
+            chirp[i]=phase(angle);kernel[i]=phase(-angle);
+            if(i)kernel[m-i]=kernel[i];
+        }
+        radix2(kernel.data(),m,false);
+    }
+    void apply(Complex* v,std::size_t stride,Complex* scratch) const {
+        std::fill(scratch,scratch+m,Complex{});
+        for(std::size_t i=0;i<n;++i)scratch[i]=v[i*stride]*chirp[i];
+        radix2(scratch,m,false);
+        for(std::size_t i=0;i<m;++i)scratch[i]=scratch[i]*kernel[i];
+        radix2(scratch,m,true);
+        for(std::size_t i=0;i<n;++i)v[i*stride]=(scratch[i]*chirp[i]).scale(inverse?1./n:1);
+    }
+};
 
 } // namespace vcr::augment::volume_detail
 
 namespace vcr::augment::volume_detail {
 inline void fft_volume(std::vector<Complex>& data,const Grid3& g,bool inverse) {
-    for(int a=0;a<3;++a){auto len=g.n[a],stride=g.stride[a],count=g.size/len,size=fft_scratch(len);std::vector<Complex> scratch(size);
-        for(std::size_t line=0;line<count;++line){auto base=(line/stride)*len*stride+line%stride;fft_line(data.data()+base,len,stride,scratch.data(),size/2,inverse);}}
+    for(int a=0;a<3;++a){
+        auto len=g.n[a],stride=g.stride[a],count=g.size/len;
+        FourierLinePlan plan(len,inverse);std::vector<Complex> scratch(plan.m);
+        for(std::size_t line=0;line<count;++line){
+            auto base=(line/stride)*len*stride+line%stride;
+            plan.apply(data.data()+base,stride,scratch.data());
+        }
+    }
 }
 VCR_HD inline bool low_frequency(const Grid3& g,std::size_t i,double fraction) {
     for(int a=0;a<3;++a){auto k=g.coord(i,a);k=k<g.n[a]-k?k:g.n[a]-k;if(double(k)>fraction*double(g.n[a])/2)return false;}return true;

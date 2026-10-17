@@ -16,7 +16,39 @@ struct DefocusKernel {
 };
 inline DefocusKernel make_kernel(const Defocus& t,const ChannelPlan& p) { return {p.values[0]}; }
 inline void channel_apply(const Defocus& t,std::vector<double>& v,const Grid& g,const ChannelPlan& p) {
-    volume_detail::map_channel(v,g,make_kernel(t,p));
+    const double radius=p.values[0];if(radius==0)return;
+    const int r=int(ceil(radius));
+    std::vector<std::array<int,3>> taps;
+    for(int z=-r;z<=r;++z)for(int y=-r;y<=r;++y)for(int x=-r;x<=r;++x)
+        if(double(z*z+y*y+x*x)<=radius*radius)taps.push_back({z,y,x});
+    std::vector<double> output(v.size());std::vector<std::size_t> rows(taps.size());
+    const auto nz=g.shape[0],ny=g.shape[1],nx=g.shape[2];
+    auto clamp_index=[](long long x,std::size_t n){return std::size_t(std::clamp(x,0LL,(long long)n-1));};
+    for(std::size_t z=0;z<nz;++z)for(std::size_t y=0;y<ny;++y){
+        const auto base=(z*ny+y)*nx;
+        for(std::size_t k=0;k<taps.size();++k)
+            rows[k]=(clamp_index((long long)z+taps[k][0],nz)*ny+clamp_index((long long)y+taps[k][1],ny))*nx;
+        std::size_t x=0;
+        while(x<nx){
+            // Interior runs have contiguous loads and no per-voxel bounds or
+            // coordinate divisions. Each lane retains the original tap order.
+            constexpr std::size_t lanes=16;
+            if(x>=std::size_t(r) && x+lanes+std::size_t(r)<=nx){
+                std::array<double,lanes> sums{};
+                for(std::size_t k=0;k<taps.size();++k){
+                    const auto* source=v.data()+rows[k]+std::size_t((long long)x+taps[k][2]);
+                    for(std::size_t lane=0;lane<lanes;++lane)sums[lane]+=source[lane];
+                }
+                for(std::size_t lane=0;lane<lanes;++lane)output[base+x+lane]=sums[lane]/int(taps.size());
+                x+=lanes;
+            }else{
+                double sum=0;
+                for(std::size_t k=0;k<taps.size();++k)sum+=v[rows[k]+clamp_index((long long)x+taps[k][2],nx)];
+                output[base+x++]=sum/int(taps.size());
+            }
+        }
+    }
+    v.swap(output);
 }
 inline void apply(const Defocus& t,Sample& s,const Parameters& p) { volume_detail::apply_checked_channels(t,s,p); }
 } // namespace vcr::augment

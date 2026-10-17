@@ -387,6 +387,39 @@ inline std::vector<T> gaussian_kernel(double sigma, double truncate, bool full_w
     for (std::size_t i = 0; i < weights.size(); ++i) kernel[i] = T(weights[i] / sum);
     return kernel;
 }
+// Shared one-axis convolution with the same tap order for Gaussian and sinc filters.
+template<class T>
+inline void convolve_axis(const std::vector<T>& data, std::vector<T>& tmp, const Grid& g,
+                          std::size_t a, const std::vector<T>& kernel, Boundary edge, bool reverse=false) {
+    const auto radius = int(kernel.size() / 2);
+    const auto extent = g.shape[a], step = g.stride[a], block = extent * step;
+    auto boundary = [&](std::int64_t x) {
+        if (edge == Boundary::Nearest) return std::size_t(std::clamp<std::int64_t>(x, 0, std::int64_t(extent) - 1));
+        return edge == Boundary::Mirror ? mirror(x, extent) : reflect(x, extent);
+    };
+    if (step == 1) {
+        // Extend each contiguous row once; even wide kernels and singleton
+        // dimensions then use the same branch-free convolution loop.
+        std::vector<std::size_t> indices(extent + 2 * radius), offsets(kernel.size());
+        for (std::size_t x = 0; x < indices.size(); ++x) indices[x] = boundary(std::int64_t(x) - radius);
+        std::iota(offsets.begin(), offsets.end(), 0);
+        if(reverse)std::reverse(offsets.begin(),offsets.end());
+        std::vector<T> row(indices.size());
+        for (std::size_t base = 0; base < g.size; base += extent) {
+            for (std::size_t x = 0; x < row.size(); ++x) row[x] = data[base + indices[x]];
+            convolve_run(row.data(), tmp.data() + base, extent, kernel, offsets.data());
+        }
+    } else {
+        std::vector<std::size_t> offsets(extent * kernel.size());
+        for (std::size_t x = 0; x < extent; ++x)
+            for (std::size_t tap = 0; tap < kernel.size(); ++tap)
+                offsets[x * kernel.size() + tap] = boundary(std::int64_t(x) + (reverse ? radius-std::int64_t(tap) : std::int64_t(tap)-radius)) * step;
+        for (std::size_t base = 0; base < g.size; base += block)
+            for (std::size_t x = 0; x < extent; ++x)
+                convolve_run(data.data() + base, tmp.data() + base + x * step, step,
+                             kernel, offsets.data() + x * kernel.size());
+    }
+}
 template<class T>
 inline void gaussian_blur(std::vector<T>& data, const Grid& g, const std::vector<double>& sigmas, double truncate = 4, Boundary edge = Boundary::Reflect, bool full_width = false) {
     require(sigmas.size() == g.shape.size() && truncate > 0 && std::isfinite(truncate), "invalid Gaussian parameters");
@@ -395,33 +428,7 @@ inline void gaussian_blur(std::vector<T>& data, const Grid& g, const std::vector
         auto sigma = sigmas[a]; require(sigma >= 0 && std::isfinite(sigma) && sigma * truncate < 100000, "invalid Gaussian sigma");
         if (!sigma) continue;
         const auto kernel = gaussian_kernel<T>(sigma, truncate, full_width);
-        const auto radius = int(kernel.size() / 2);
-        const auto extent = g.shape[a], step = g.stride[a], block = extent * step;
-        auto boundary = [&](std::int64_t x) {
-            if (edge == Boundary::Nearest) return std::size_t(std::clamp<std::int64_t>(x, 0, std::int64_t(extent) - 1));
-            return edge == Boundary::Mirror ? mirror(x, extent) : reflect(x, extent);
-        };
-        if (step == 1) {
-            // Extend each contiguous row once; even wide kernels and singleton
-            // dimensions then use the same branch-free convolution loop.
-            std::vector<std::size_t> indices(extent + 2 * radius), offsets(kernel.size());
-            for (std::size_t x = 0; x < indices.size(); ++x) indices[x] = boundary(std::int64_t(x) - radius);
-            std::iota(offsets.begin(), offsets.end(), 0);
-            std::vector<T> row(indices.size());
-            for (std::size_t base = 0; base < g.size; base += extent) {
-                for (std::size_t x = 0; x < row.size(); ++x) row[x] = data[base + indices[x]];
-                convolve_run(row.data(), tmp.data() + base, extent, kernel, offsets.data());
-            }
-        } else {
-            std::vector<std::size_t> offsets(extent * kernel.size());
-            for (std::size_t x = 0; x < extent; ++x)
-                for (std::size_t tap = 0; tap < kernel.size(); ++tap)
-                    offsets[x * kernel.size() + tap] = boundary(std::int64_t(x + tap) - radius) * step;
-            for (std::size_t base = 0; base < g.size; base += block)
-                for (std::size_t x = 0; x < extent; ++x)
-                    convolve_run(data.data() + base, tmp.data() + base + x * step, step,
-                                 kernel, offsets.data() + x * kernel.size());
-        }
+        convolve_axis(data, tmp, g, a, kernel, edge);
         data.swap(tmp);
     }
 }

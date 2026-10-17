@@ -1,7 +1,6 @@
 #pragma once
 #include "resident.cuh"
-#include <cub/device/device_select.cuh>
-#include <thrust/iterator/counting_iterator.h>
+#include "select_indices.cuh"
 namespace vcr::augment::cuda {
 using ComponentIndex=unsigned long long;
 // Each union links a higher root to a lower root. The canonical root is the
@@ -41,10 +40,5 @@ template<bool Classes,class T> void label_components(const T* mask,const Grid& g
     initialize_components<T,Classes><<<blocks(grid.size),256,0,vcr::device::stream()>>>(mask,grid.size,threshold,parents.ptr);
     connect_components<T,Classes><<<blocks(grid.size),256,0,vcr::device::stream()>>>(mask,Layout(grid),full,parents.ptr);
     flatten_components<<<blocks(grid.size),256,0,vcr::device::stream()>>>(parents.ptr,grid.size);check(cudaGetLastError());
-}
-inline void select_component_indices(const Buffer<std::uint8_t>& flags,Buffer<ComponentIndex>& selected,Buffer<ComponentIndex>& count){
-    thrust::counting_iterator<ComponentIndex> indices(0);std::size_t bytes=0;
-    check(cub::DeviceSelect::Flagged(nullptr,bytes,indices,flags.ptr,selected.ptr,count.ptr,flags.size,vcr::device::stream()));Buffer<std::byte> scratch(bytes);
-    check(cub::DeviceSelect::Flagged(scratch.ptr,bytes,indices,flags.ptr,selected.ptr,count.ptr,flags.size,vcr::device::stream()));
 }
 }

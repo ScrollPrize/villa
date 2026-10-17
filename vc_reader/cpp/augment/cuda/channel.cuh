@@ -1,5 +1,8 @@
 #pragma once
 #include "resident.cuh"
+namespace vcr::augment {
+struct UnsharpMask;struct Defocus;struct MotionBlur;struct ZoomBlur;struct RingingOvershoot;struct GibbsRinging;struct FDA;
+}
 namespace vcr::augment::cuda {
 template<class T, class Channel> void apply_channels(const T& t, Sample& s, const Parameters& p, Session& session, Channel&& channel) {
     for (const auto& c : p.channels) {
@@ -8,12 +11,18 @@ template<class T, class Channel> void apply_channels(const T& t, Sample& s, cons
         auto input = a.channel<float>(c.channel);
         bool wide = std::is_same_v<T,Smear>;
         if constexpr (std::is_same_v<T,BlankRectangle>) wide |= !t.statistic.empty();
-        if constexpr (std::is_same_v<T,GaussianBlur> || std::is_same_v<T,Sharpen> || std::is_same_v<T,LocalSmoothing>) {
-            // Match the CPU overflow-protection decision; only four statistics,
+        if constexpr (std::is_same_v<T,GaussianBlur> || std::is_same_v<T,Sharpen> || std::is_same_v<T,LocalSmoothing> ||
+                      std::is_same_v<T,UnsharpMask> || std::is_same_v<T,Defocus> || std::is_same_v<T,MotionBlur> ||
+                      std::is_same_v<T,ZoomBlur> || std::is_same_v<T,RingingOvershoot> || std::is_same_v<T,GibbsRinging> || std::is_same_v<T,FDA>) {
+            // Protect large-value intermediates; only four statistics,
             // never image data, cross back to the host for this dispatch.
             auto summary = statistics(input);
-            double limit = std::numeric_limits<float>::max()/64.;
-            if constexpr (std::is_same_v<T,Sharpen>) {
+            double limit = std::numeric_limits<float>::max()/1024.;
+            if constexpr(std::is_same_v<T,GaussianBlur> || std::is_same_v<T,Sharpen> || std::is_same_v<T,LocalSmoothing>)limit=std::numeric_limits<float>::max()/64.;
+            if constexpr(std::is_same_v<T,Defocus>)limit=std::numeric_limits<float>::max()/1000000.;
+            if constexpr(std::is_same_v<T,GibbsRinging> || std::is_same_v<T,FDA>)limit=std::numeric_limits<float>::max()/(4.*g.size);
+            if constexpr(std::is_same_v<T,FDA>)wide |= t.reference.wide;
+            if constexpr (std::is_same_v<T,Sharpen> || std::is_same_v<T,UnsharpMask>) {
                 limit /= std::max(1.,std::abs(c.values[0]));
                 wide |= std::abs(c.values[0]) > std::numeric_limits<float>::max();
             }

@@ -17,7 +17,7 @@ import time
 import numpy as np
 from vc_reader import _augment, augment as A, cuda
 from vc_reader.reader import ZarrReader
-from augment_catalog import catalog, inputs, describe
+from augment_catalog import catalog, inputs, describe, UTILITY_TRANSFORMS
 from augment_preview import preview, gallery, effect_strength
 from bench_augment import DEFAULT_ARRAY, summary
 from bench_augment_native import arrays, fingerprint
@@ -49,10 +49,10 @@ def compare(output, reference):
     return report
 
 
-def save(directory, report):
+def save(directory, report, *, include_utilities=False):
     path=directory/f"{report['size']}.json";temporary=path.with_suffix('.tmp')
     temporary.write_text(json.dumps(report,indent=2)+'\n');temporary.replace(path)
-    gallery(directory,[json.loads(p.read_text()) for p in sorted(directory.glob('[0-9]*.json'))])
+    gallery(directory,[json.loads(p.read_text()) for p in sorted(directory.glob('[0-9]*.json'))],include_utilities=include_utilities)
 
 
 def main():
@@ -66,7 +66,11 @@ def main():
     parser.add_argument('--build-dir',type=Path,default=Path('/tmp/vc-volume-cuda'))
     parser.add_argument('--only',default='')
     parser.add_argument('--resume',action='store_true')
+    parser.add_argument('--include-utilities',action='store_true',help='Also benchmark and display preprocessing, derived targets and pipeline helpers.')
     args=parser.parse_args()
+    selected={name.strip() for name in args.only.split(',') if name.strip()} or None
+    if selected and not args.include_utilities and selected & UTILITY_TRANSFORMS:
+        parser.error('utility cases require --include-utilities: '+', '.join(sorted(selected & UTILITY_TRANSFORMS)))
     if args.size<8 or args.reps<1 or args.warmup<0:parser.error('size>=8, reps>=1, warmup>=0 required')
     if not cuda.is_available():parser.error('CUDA reader and augmentation builds required')
     args.output.mkdir(parents=True,exist_ok=True)
@@ -101,9 +105,9 @@ def main():
             if old[key]!=report[key]:raise ValueError('resume protocol/input/build mismatch: '+key)
         report['results']=old['results']
     done={r['name'] for r in report['results']}
-    selected=set(args.only.split(',')) if args.only else None
-    workload=catalog(args.size,reference)
+    workload=catalog(args.size,reference,include_utilities=args.include_utilities)
     if selected and selected-{c.name for c in workload}:raise ValueError('unknown case')
+    report['requested_cases']=[c.name for c in workload if not selected or c.name in selected]
     random.Random(21017).shuffle(workload)
     for case in workload:
         if case.name in done or selected and case.name not in selected:continue
@@ -147,7 +151,8 @@ def main():
             import traceback
             traceback.print_exc()
         row['wall_seconds']=time.perf_counter()-begun
-        report['results'].append(row);save(args.output,report)
+        report['results'].append(row);save(args.output,report,include_utilities=args.include_utilities)
+    save(args.output,report,include_utilities=args.include_utilities)
     print(f"COMPLETE {args.size}: {len(report['results'])} cases; {sum('error' in r for r in report['results'])} reported errors",flush=True)
 
 

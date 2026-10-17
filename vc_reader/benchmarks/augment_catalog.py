@@ -5,6 +5,15 @@ from vc_reader import augment as A
 from bench_augment import cases
 
 
+# Preprocessing, derived targets, reshaping and pipeline control. Normalize is
+# deliberately retained in the default gallery alongside the augmentations.
+UTILITY_TRANSFORMS = frozenset({
+    'ReplaceLabel', 'Regions', 'OneHot', 'MaskImage', 'DeepSupervision',
+    'ToPseudo2D', 'FromPseudo2D', 'MedialSurface', 'DistanceTransform',
+    'StructureTensor', 'OneOf',
+})
+
+
 @dataclass
 class Workload:
     name: str
@@ -15,7 +24,7 @@ class Workload:
     note: str = ''
 
 
-def catalog(size, reference):
+def catalog(size, reference, *, include_utilities=False):
     result = [Workload(c.name, c.native, c.inputs) for c in cases((size,) * 3)]
     def add(name, transform, sample='image', output='image', channel=0, note=''):
         result.append(Workload(name, transform if isinstance(transform, list) else [transform], sample, output, channel, note))
@@ -67,7 +76,7 @@ def catalog(size, reference):
     add('ObjectDropout', A.ObjectDropout(drop_probability=.5), 'both')
     add('StripGeometry', A.StripGeometry(degrees=5,smooth_offset=2,stride=16), 'strip',note='2D-only companion: central Z slice, not a cubic-volume timing.')
     add('SurfacePerturb', A.SurfacePerturb(blobs=3,amplitude=1,points_affected=100,p=1), 'surface','surface',note='2D-only companion: synthetic coordinate surface with CT-derived height. Preview is displacement magnitude, not an anatomical surface.')
-    return result
+    return [case for case in result if include_utilities or case.name not in UTILITY_TRANSFORMS]
 
 
 def inputs(image):

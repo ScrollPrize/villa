@@ -102,8 +102,18 @@ inline void apply(const OrientedBlur& t, Sample& s, const Parameters& p) {
             const double sigma = c.values[pass ? 1 : 0];
             if (sigma <= 0) continue;
             const auto w = oriented_detail::kernel(sigma); const int radius = int(w.size() / 2);
-            for (std::size_t i = 0; i < g.size; ++i)
-                next[i] = oriented_detail::pass(values.data(), shape.data(), g.coord(i, 0), g.coord(i, 1), g.coord(i, 2), frame + 3 * pass, w.data(), radius);
+            const auto* direction=frame+3*pass;
+            int aligned=-1;
+            for(int axis=0;axis<3;++axis)
+                if(std::abs(direction[axis])==1 && direction[(axis+1)%3]==0 && direction[(axis+2)%3]==0)aligned=axis;
+            if(aligned>=0){
+                // Integer axis-aligned samples need no trilinear interpolation.
+                // Negative directions retain the original reversed tap order.
+                convolve_axis(values,next,g,aligned,w,Boundary::Nearest,direction[aligned]<0);
+            }else{
+                for (std::size_t i = 0; i < g.size; ++i)
+                    next[i] = oriented_detail::pass(values.data(), shape.data(), g.coord(i, 0), g.coord(i, 1), g.coord(i, 2), direction, w.data(), radius);
+            }
             values.swap(next);
         }
         a.channel(c.channel, values);

@@ -16,12 +16,69 @@ def test_benchmark_covers_every_native_transform(monkeypatch):
     pytest.importorskip('PIL')
     catalog,_=modules(monkeypatch)
     reference=np.zeros((1,8,8,8),np.float32)
-    names=[c.name for c in catalog.catalog(8,reference)]
+    names=[c.name for c in catalog.catalog(8,reference,include_utilities=True)]
     native=(Path(__file__).resolve().parents[1]/'cpp/augment/pipeline.hpp').read_text()
     variant=native.split('using Op = std::variant<',1)[1].split('>;',1)[0]
     expected={v.strip().replace('std::shared_ptr<OneOf>','OneOf') for v in variant.split(',')}
     assert set(names)==expected
     assert len(names)==len(set(names))
+    defaults={c.name for c in catalog.catalog(8,reference)}
+    assert defaults==expected-catalog.UTILITY_TRANSFORMS
+    assert 'Normalize' in defaults
+
+
+@pytest.mark.parametrize('include_utilities',[False,True])
+def test_html_only_refresh_filters_without_running_or_changing_results(tmp_path,monkeypatch,include_utilities):
+    import json
+    import sys
+    pytest.importorskip('PIL')
+    modules(monkeypatch)
+    refresh=importlib.import_module('refresh_augment_previews')
+    def unexpected(*args,**kwargs):
+        pytest.fail('HTML-only refresh must not read volumes or execute transforms')
+    monkeypatch.setattr(refresh,'ZarrReader',type('Reader',(),{'open':unexpected}))
+    monkeypatch.setattr(refresh.A,'Pipeline',unexpected)
+    report={'size':8,'results':[dict(name=name,parameters=name+'()',sample='image',timings={},preview=name+'.png')
+                                for name in ('Normalize','OneHot','Gamma')]}
+    path=tmp_path/'8.json';original=json.dumps(report);path.write_text(original)
+    argv=['refresh_augment_previews.py',str(tmp_path),'--html-only']
+    if include_utilities:argv.append('--include-utilities')
+    monkeypatch.setattr(sys,'argv',argv)
+    refresh.main()
+    assert path.read_text()==original
+    page=(tmp_path/'index.html').read_text();csv=(tmp_path/'timings.csv').read_text()
+    assert 'data-name="normalize"' in page and ',Normalize,' in csv
+    assert 'data-name="gamma"' in page and ',Gamma,' in csv
+    assert ('data-name="onehot"' in page)==include_utilities
+    assert (',OneHot,' in csv)==include_utilities
+
+
+def test_preview_refresh_skips_utility_execution(tmp_path,monkeypatch):
+    import json
+    import sys
+    from contextlib import contextmanager
+    pytest.importorskip('PIL')
+    modules(monkeypatch)
+    refresh=importlib.import_module('refresh_augment_previews')
+    class Reader:
+        @staticmethod
+        @contextmanager
+        def open(*args,**kwargs):yield Reader()
+        def read(self,*args):return np.ones((8,8,8),np.uint8)
+    executed=[]
+    def pipeline(transforms,**kwargs):
+        executed.extend(t._constructor.__name__ for t in transforms)
+        return lambda source,seed:source
+    monkeypatch.setattr(refresh,'ZarrReader',Reader)
+    monkeypatch.setattr(refresh.A,'Pipeline',pipeline)
+    monkeypatch.setattr(refresh,'preview',lambda *args:{'seed':123})
+    report={'size':8,'array':'unused','start':[0]*3,'reference_start':[0]*3,'results':[
+        dict(name=name,parameters=name+'()',sample='image',preview=name+'.png',preview_selection={'seed':123})
+        for name in ('Normalize','OneHot')]}
+    (tmp_path/'8.json').write_text(json.dumps(report))
+    monkeypatch.setattr(sys,'argv',['refresh_augment_previews.py',str(tmp_path)])
+    refresh.main()
+    assert executed==['Normalize']
 
 
 def test_orthogonal_preview_panels_are_enlarged(tmp_path,monkeypatch):
@@ -58,3 +115,13 @@ def test_preview_identity_and_resized_grids(monkeypatch):
     before,after,delta=render.effect_slices(source,np.zeros((12,14,16),np.float32))
     assert len(before)==len(after)==3
     assert delta.shape==(12,14,16)
+
+
+def test_small_changed_regions_get_visible_locator_boxes(monkeypatch):
+    pytest.importorskip('PIL')
+    _,render=modules(monkeypatch)
+    delta=np.zeros((100,120),np.float32)
+    delta[7,95]=1
+    assert render.changed_bounds(delta)==(92,4,99,11)
+    assert render.changed_bounds(np.ones_like(delta)) is None
+    assert render.changed_bounds(np.zeros_like(delta)) is None

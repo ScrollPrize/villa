@@ -1330,13 +1330,23 @@ also builds and passes its six-crop, edge-7 smoke run with the shared helpers.
 
 ## Complete catalog and slice gallery
 
-`bench_augment_catalog.py` covers every native `Op`, including label operations,
+`bench_augment_catalog.py --include-utilities` covers every native `Op`, including label operations,
 new volumetric transforms, and the two 2D-only tracing operations. It reuses the
 primary configurations from `bench_augment.py`; `augment_catalog.py` supplies
 explicit configurations for the rest. The coverage regression test compares the
 catalog with the C++ variant, so additions cannot silently disappear from this
 benchmark. NumPy, Pillow, and existing CUDA reader/augmentation builds are needed.
 No additional augmentation libraries are imported.
+
+By default, the benchmark and preview refresh run 61 cases, including `Normalize`.
+They skip these 11 utility cases entirely: `ReplaceLabel`, `Regions`, `OneHot`,
+`MaskImage`, `DeepSupervision`, `ToPseudo2D`, `FromPseudo2D`, `MedialSurface`,
+`DistanceTransform`, `StructureTensor`, and `OneOf`. The HTML and timing CSV use
+the same filter. Pass `--include-utilities` to either script to restore all 72
+cases. Explicit utility names in benchmark `--only` also require that flag.
+The historical full-catalog JSON reports and PNGs are retained when filtered;
+new default runs do not time or render utilities. Use `--include-utilities` with
+the command below to reproduce the original exhaustive benchmark.
 
 The Paris4 run uses level `/2`, center ZYX `(9064,3664,3664)`, and nested 128³ and
 256³ float32 crops normalized by 255. Reference-based transforms use a second
@@ -1351,7 +1361,10 @@ and reproducibly shuffled backend order. CPU uses the default lossless compact
 path and one thread. CUDA is measured both through the host-array API (including
 uploads/downloads) and with resident `DeviceArray` inputs/outputs. Resident
 measurements include the owning device input copy, validation, and synchronization;
-they exclude the initial upload and the explicit download for correctness checks.
+they exclude the initial image upload and the explicit output download for
+correctness checks. Constructor reference volumes are host snapshots; their
+per-call reference upload is included in both CUDA modes. Parameter sampling on
+the host is also included; voxel computations remain on the device.
 All modes exclude file reads, input preparation, pipeline construction, output
 destruction, comparisons, and PNG rendering. Every measured CUDA output is
 compared against the same-seed CPU output: exact labels, float `atol=rtol=3e-6`.
@@ -1372,7 +1385,7 @@ for size in 128 256; do
     /tmp/vc-volume-cuda/_augment.cpython-314-x86_64-linux-gnu.so \
     benchmarks/bench_augment_catalog.py \
     --size "$size" --reps 5 --warmup 1 \
-    --output benchmarks/results/full-catalog-paris4
+    --output benchmarks/results/full-catalog-paris4-optimized
 done
 ```
 
@@ -1382,10 +1395,16 @@ inputs and repetition counts. Adjust extension paths/ABI suffixes for your build
 The JSON records the actual extension hash, build flags, CPU/GPU, thread settings,
 command, and Git revision.
 
-Open `results/full-catalog-paris4/index.html` for the searchable timing table and
+Open `results/full-catalog-paris4-optimized/index.html` for the searchable timing table and
 image gallery. `timings.csv`, `128.json`, `256.json`, and
 `previews/<size>/<augmentation>.png` are standalone artifacts. Previews show
-original central Z/Y/X slices above augmented slices, with matching windows for
+original Z/Y/X slices above augmented slices. Each axis selects a plane containing
+the largest changed area (ties use magnitude, then proximity to the center),
+using the most visibly changed of the five measured seeds. Original and output
+use identical slice coordinates when their shapes match; resized grids explicitly
+label relative-position mapping. JSON includes selected coordinates, seed, and
+changed voxel counts for each plane. Value-preserving encodings/reshapes are
+labeled as such. Previews use matching windows for
 like-valued data and labeled windows for derived quantities. Label operations
 show their label output; structure tensors show zz; deep supervision shows its
 half-resolution level while timing all levels. Metadata-only pseudo-2D reshapes
@@ -1401,4 +1420,211 @@ PYTHONPATH=src .venv/bin/python benchmarks/run_native.py \
   /tmp/vc-volume-cpu/_augment.cpython-314-x86_64-linux-gnu.so \
   -m pytest tests/test_augment_catalog_benchmark.py -q
 # Also run the benchmark above with --size 8 --reps 1 --warmup 0 for a GPU smoke check.
+```
+
+
+The CUDA performance changes remove serial full-volume statistics, histogram,
+foreground reservoir, connected-component, and valid-surface scans. Integer
+prefix sums, histogram counts, and minimum-index component roots preserve
+seeded discrete decisions. RemoveComponents records the same selected voxel set
+in increasing-index order rather than BFS order; applying or serializing the
+plan preserves the output. No image computation falls back to CPU.
+
+Float32 inputs now use float32 voxel buffers and math, including cuFFT spectra.
+Float64 inputs remain supported. Deliberate higher-precision exceptions are
+Welford moments (finite float32 squared deviations can overflow float32), exact
+histogram bins/CDF comparisons, continuous spatial sampling coordinates, seeded
+rejection/discrete random sampling, and small geometry/replay metadata. Extremely
+large images/parameters use a device-side float64 path when intermediate sums or
+FFT coefficients would overflow float32. References retain their original dtype
+for histogram/statistical adaptation. cuFFT is linked only by the optional CUDA
+augmentation target; CPU builds do not require the toolkit. cuFFT plans are
+bounded and cached separately per host thread, device, and CUDA stream.
+
+The original results in `results/full-catalog-paris4/` are preserved as the
+baseline (128³ complete; 256³ intentionally stopped after identifying serial
+GPU work). That directory also contains the original Nsight trace and its exact
+command in `profile-summary.json`. Do not mix baseline and optimized extension
+hashes using `--resume`.
+
+Rebuild the already configured Release targets and run the augmentation suite:
+
+```bash
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-volume-cpu --target _augment -j 2
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-volume-cuda --target _augment -j 3
+# Use /tmp/vc-volume-cpu below for the CPU-only augmentation build.
+AGENTS_AGENT_MODE=1 PYTHONPATH=src .venv/bin/python benchmarks/run_native.py \
+  /tmp/vc-reader-cuda/_native.cpython-314-x86_64-linux-gnu.so \
+  benchmarks/run_native.py \
+  /tmp/vc-volume-cuda/_augment.cpython-314-x86_64-linux-gnu.so \
+  -m pytest tests/test_augment*.py tests/test_structure.py \
+  tests/test_sheet_compression.py tests/test_elastic_bspline.py -q
+```
+
+The optimized result directory includes `verification.json` and test logs in
+addition to timing reports. Hardware, Release compiler flags, binary hashes,
+input hashes, and individual timing samples are embedded in each size's JSON.
+
+To regenerate sparse-effect previews (including gold locator boxes around small
+changed regions) from the recorded seeds without rerunning timings:
+
+```bash
+AGENTS_AGENT_MODE=1 PYTHONPATH=src .venv/bin/python benchmarks/run_native.py \
+  /tmp/vc-reader-cuda/_native.cpython-314-x86_64-linux-gnu.so \
+  benchmarks/run_native.py \
+  /tmp/vc-volume-cpu/_augment.cpython-314-x86_64-linux-gnu.so \
+  benchmarks/refresh_augment_previews.py \
+  benchmarks/results/full-catalog-paris4-optimized --localized-only
+```
+
+Omit `--localized-only` to rebuild every preview. This renders CPU outputs only;
+GPU comparisons are recorded by the benchmark itself. Locator boxes annotate
+both original and augmented panels; their presence is stated in the image footer.
+
+To refresh only the HTML and CSV (no volume reads, transforms, or image rendering):
+
+```bash
+AGENTS_AGENT_MODE=1 PYTHONPATH=src .venv/bin/python benchmarks/run_native.py \
+  /tmp/vc-volume-cpu/_augment.cpython-314-x86_64-linux-gnu.so \
+  benchmarks/refresh_augment_previews.py \
+  benchmarks/results/full-catalog-paris4-optimized --html-only
+```
+
+Both scripts are reusable: the benchmark accepts `--array`, `--center`, `--size`,
+`--reps`, `--warmup`, `--output`, `--only`, and `--resume`; preview refresh reads
+the input coordinates and seeds from the chosen output directory's JSON reports.
+
+`before-after.csv` compares the original and optimized runs and includes mean,
+p50, and p95 for the optimized CPU/resident CUDA measurements. Blank baseline
+256³ cells indicate cases that had not run when the original benchmark was
+paused. `profile-summary.json` and `profile-kernels.csv` describe the separate
+post-change Nsight check; its serial statistics scan is absent.
+
+## CPU hot-path optimizations (Paris4, 128³ and 256³)
+
+The CPU pass targets eight slow catalog cases: `Defocus`, `RingingOvershoot`,
+`BiasField`, `PlasmaBrightnessContrast`, `PlasmaShadow`, `OrientedBlur`,
+`GibbsRinging`, and `FDA`. Defocus prepares spherical offsets once and accumulates
+adjacent outputs together. Sinc ringing and exactly axis-aligned oriented blur
+reuse the existing convolution loop, extracted into `convolve_axis`; oblique
+oriented blur keeps its interpolation path. Negative axes preserve tap order.
+Bias/plasma cache coarse random lattice vertices and axis coordinates; fine
+lattices fall back to the same stateless hash. The vertex cache is bounded by
+one volume or 64 MiB, whichever is smaller. Fourier transforms reuse Bluestein
+chirps and the transformed convolution kernel across all lines of each axis.
+
+These changes preserve the existing precision, RNG, tap/corner/octave order,
+and FFT algorithm. No fast-math flags, additional threads, lower resolution,
+or approximate filters are used. The field cache needs one extra field buffer;
+its vertex table is bounded independently. No platform-specific intrinsics or
+new dependencies were added.
+
+`bench_augment_cpu.py` is a reusable CPU-only harness. It records mean, p50,
+p95, min/max, individual samples, input/reference hashes and per-seed exact
+output hashes. It uses the same catalog configurations and CT coordinates as
+the CPU/CUDA gallery. `--baseline` rejects changed inputs, parameters or output
+bytes. Timed calls include the public Pipeline's copies and validation; volume
+reads, constructor setup, hashing and output destruction are outside timing.
+Use existing native builds through `run_native.py`, for example:
+
+```bash
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-volume-cpu --target _augment -j 2
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  PYTHONPATH=src .venv/bin/python benchmarks/run_native.py \
+  /tmp/vc-reader-cuda/_native.cpython-314-x86_64-linux-gnu.so \
+  benchmarks/run_native.py \
+  /tmp/vc-volume-cpu/_augment.cpython-314-x86_64-linux-gnu.so \
+  benchmarks/bench_augment_cpu.py --sizes 128 256 --reps 5 --warmup 1 \
+  --only FDA,GibbsRinging,Defocus,RingingOvershoot,BiasField,PlasmaShadow,PlasmaBrightnessContrast \
+  --baseline benchmarks/results/cpu-optimization/before.json \
+  --output benchmarks/results/cpu-optimization/recheck.json
+```
+
+Omit `--baseline` to measure a new dataset/configuration. The baseline run used
+an unchanged copy of the original CPU extension in `/tmp/vc-cpu-before`; the
+oriented-blur baseline is recorded separately in `oriented-before.json`. Seeds
+are 123–127 after one warmup. Both builds are Release (`-O3 -DNDEBUG`) and use
+one CPU thread. Results, original baseline logs and profiler output are in
+`results/cpu-optimization/`. The comparison table includes both volume sizes
+and all summary statistics.
+
+`perf` counters are disabled on this host (`perf_event_paranoid=4`), so the
+hotspot check uses the standalone native driver with gprof and source-line
+attribution. Baseline defocus spends about 99% of sampled time in its voxel
+map (including repeated coordinate division); plasma shadow spends about 98%
+in its field map, dominated by lattice/hash evaluation. FFT samples concentrate
+in complex arithmetic and radix-2/Bluestein routines. The driver calls the same
+channel implementations as Pipeline, with a raw normalized float32 CT crop
+exported by `bench_augment_cpu.py --export-crops`. For a fresh profile:
+
+```bash
+c++ -std=c++20 -O3 -g -pg -Icpp benchmarks/profile_cpu_augment.cpp \
+  -o /tmp/vc-cpu-profile
+GMON_OUT_PREFIX=/tmp/vc-profile-defocus /tmp/vc-cpu-profile \
+  benchmarks/results/cpu-optimization/crop128.f32 128 Defocus 30
+gprof -b -p -l /tmp/vc-cpu-profile /tmp/vc-profile-defocus.[0-9]*
+```
+
+The timings come from uninstrumented public Pipeline calls, not gprof. For
+exact old/new checks across small irregular volumes, singleton axes, wide and
+fractional radii, fine/high-octave fields, positive/negative/oblique directions,
+two channels, float32/float64, and two seeds:
+
+```bash
+AGENTS_AGENT_MODE=1 PYTHONPATH=src .venv/bin/python benchmarks/run_native.py \
+  /tmp/vc-volume-cpu/_augment.cpython-314-x86_64-linux-gnu.so \
+  benchmarks/check_augment_cpu_outputs.py /tmp/cpu-edge-recheck.json \
+  benchmarks/results/cpu-optimization/edge-before.json
+AGENTS_AGENT_MODE=1 PYTHONPATH=src .venv/bin/python benchmarks/run_native.py \
+  /tmp/vc-reader-cuda/_native.cpython-314-x86_64-linux-gnu.so \
+  benchmarks/run_native.py \
+  /tmp/vc-volume-cpu/_augment.cpython-314-x86_64-linux-gnu.so \
+  -m pytest tests/test_augment*.py tests/test_structure.py \
+  tests/test_sheet_compression.py tests/test_elastic_bspline.py -q
+```
+
+The first check compares 360 output digests exactly. The regression tests also
+cover defocus's contiguous interior and clamped boundary paths, wide ringing
+kernels on singleton axes, signed oriented-blur directions, analytical/NumPy
+Fourier references, replay and CPU/CUDA parity.
+
+Measured CPU medians (milliseconds; five calls after one warmup):
+
+| Transform | 128³ before → after | 256³ before → after | 256³ speedup |
+|---|---:|---:|---:|
+| Defocus | 841.3 → 24.4 | 6738.7 → 188.8 | 35.7× |
+| OrientedBlur | 707.2 → 28.6 | 5646.7 → 216.4 | 26.1× |
+| RingingOvershoot | 465.9 → 27.3 | 3810.4 → 235.1 | 16.2× |
+| PlasmaShadow | 504.3 → 38.8 | 4043.1 → 317.1 | 12.8× |
+| PlasmaBrightnessContrast | 504.3 → 45.4 | 4008.7 → 373.7 | 10.7× |
+| BiasField | 274.6 → 24.2 | 2217.9 → 196.4 | 11.3× |
+| FDA | 1149.2 → 611.9 | 10354.3 → 5510.0 | 1.9× |
+| GibbsRinging | 765.2 → 407.2 | 6907.0 → 3700.1 | 1.9× |
+
+All 80 measured outputs are byte-identical to the baseline. The CPU-only suite
+passed 1,176 tests (526 CUDA-dependent skips); the CUDA-enabled suite passed
+1,694 tests (8 skips). The exact edge-case checker passed all 360 outputs on
+both builds. See [the comparison report](results/cpu-optimization/index.html)
+and [CSV with mean/p50/p95/min/max](results/cpu-optimization/comparison.csv).
+
+The eight cases were also rerun through `bench_augment_catalog.py` on both
+128³ and 256³ with five repetitions and one warmup, using the new CUDA-enabled
+build. All 16 cases passed the CPU/host-CUDA/resident-CUDA comparison. Their
+complete reports and regenerated previews are in `results/cpu-optimization/catalog/`;
+the main gallery now uses those refreshed rows. Other cases retain their
+previous measurements. The main JSON reports link to supplementary run metadata,
+and the original complete reports were backed up as `gallery-before-128.json`
+and `gallery-before-256.json` in the CPU optimization result directory.
+
+```bash
+for size in 128 256; do
+  AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+    PYTHONPATH=src .venv/bin/python benchmarks/run_native.py \
+    /tmp/vc-reader-cuda/_native.cpython-314-x86_64-linux-gnu.so \
+    benchmarks/run_native.py \
+    /tmp/vc-volume-cuda/_augment.cpython-314-x86_64-linux-gnu.so \
+    benchmarks/bench_augment_catalog.py --size "$size" --reps 5 --warmup 1 \
+    --only FDA,GibbsRinging,Defocus,RingingOvershoot,BiasField,PlasmaShadow,PlasmaBrightnessContrast,OrientedBlur \
+    --output benchmarks/results/cpu-optimization/catalog
+done
 ```

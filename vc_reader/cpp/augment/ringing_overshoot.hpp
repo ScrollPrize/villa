@@ -17,7 +17,21 @@ struct RingingOvershootKernel {
     }
 };
 inline void channel_apply(const RingingOvershoot&,std::vector<double>& v,const Grid& g,const ChannelPlan& p){
-    for(int a=0;a<3;++a)volume_detail::map_channel(v,g,RingingOvershootKernel{p.values[0],int(p.values[1]),a});
+    const double cutoff=p.values[0];const int radius=int(p.values[1]);
+    if(cutoff==1)return;
+    std::vector<double> weights(2*radius+1);double total=0;
+    for(int j=-radius;j<=radius;++j){
+        double weight=j?sin(volume_detail::pi*cutoff*j)/(volume_detail::pi*j):cutoff;
+        weight*=.5+.5*cos(volume_detail::pi*j/(radius+1));
+        total+=weights[j+radius]=weight;
+    }
+    std::vector<double> output(v.size());
+    for(int a=0;a<3;++a){
+        convolve_axis(v,output,g,a,weights,Boundary::Nearest);
+        // Divide after accumulation, matching the original rounding order.
+        for(auto& value:output){value/=total;require(std::isfinite(value),"augmentation produced nonfinite values");}
+        v.swap(output);
+    }
 }
 inline void apply(const RingingOvershoot& t,Sample& s,const Parameters& p) { volume_detail::apply_checked_channels(t,s,p); }
 } // namespace vcr::augment

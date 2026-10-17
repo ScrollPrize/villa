@@ -9,14 +9,20 @@ inline ChannelPlan channel_parameters(const PlasmaBrightnessContrast& t,const Ar
 }
 struct PlasmaBrightnessContrastKernel {
     double brightness,contrast,scale,persistence;int octaves;std::uint64_t seed;
+    template<class T> VCR_HD T apply_field(T value,T f,const volume_detail::Stats& input) const {
+        T mean=T(input.mean);return (value-mean)*(T(1)+T(contrast)*f)+mean+T(brightness)*T(input.high-input.low)*f;
+    }
     template<class T> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T>& c) const {
         using namespace volume_detail;
-        T f=fractal(c.grid,i,seed,T(scale),T(persistence),octaves),mean=T(c.input.mean);return (v[i]-mean)*(T(1)+T(contrast)*f)+mean+T(brightness)*T(c.input.high-c.input.low)*f;
+        return apply_field(v[i],fractal(c.grid,i,seed,T(scale),T(persistence),octaves),c.input);
     }
 };
 inline PlasmaBrightnessContrastKernel make_kernel(const PlasmaBrightnessContrast& t,const ChannelPlan& p) { return {p.values[0],p.values[1],p.values[2],p.values[3],t.octaves,p.seed}; }
 inline void channel_apply(const PlasmaBrightnessContrast& t,std::vector<double>& v,const Grid& g,const ChannelPlan& p) {
-    volume_detail::map_channel(v,g,make_kernel(t,p));
+    const auto kernel=make_kernel(t,p);
+    const auto input=volume_detail::stats(v.data(),v.size());
+    const auto field=volume_detail::fractal_field(g,kernel.seed,kernel.scale,kernel.persistence,kernel.octaves);
+    for(std::size_t i=0;i<v.size();++i)v[i]=kernel.apply_field(v[i],field[i],input);
 }
 inline void apply(const PlasmaBrightnessContrast& t,Sample& s,const Parameters& p) { volume_detail::apply_checked_channels(t,s,p); }
 } // namespace vcr::augment

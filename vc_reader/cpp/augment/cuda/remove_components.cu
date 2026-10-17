@@ -30,12 +30,12 @@ Parameters sample_components(const RemoveComponents& t,const Sample&,Random& r,b
         check(cudaMemsetAsync(sizes.ptr,0,sizes.size*sizeof(ComponentIndex),vcr::device::stream()));
         count_components<<<blocks(g.size),256,0,vcr::device::stream()>>>(parents.ptr,g.size,sizes.ptr);
         eligible_components<<<blocks(g.size),256,0,vcr::device::stream()>>>(sizes.ptr,g.size,t.max_fraction,flags.ptr);check(cudaGetLastError());
-        select_component_indices(flags,eligible,count);
+        select_flagged_indices(flags,eligible,count);
         ComponentIndex total;count.download(&total);if(!total)continue;
         component_extent<<<1,1,0,vcr::device::stream()>>>(sizes.ptr,eligible.ptr,r.index(total),extent.ptr);check(cudaGetLastError());
         ComponentIndex range[2];extent.download(range);auto field=std::make_shared<Buffer<double>>(range[1]);
         component_members<<<blocks(g.size),256,0,vcr::device::stream()>>>(parents.ptr,g.size,range[0],flags.ptr);check(cudaGetLastError());
-        select_component_indices(flags,eligible,count);
+        select_flagged_indices(flags,eligible,count);
         component_indices<<<blocks(field->size),256,0,vcr::device::stream()>>>(eligible.ptr,field->ptr,field->size);check(cudaGetLastError());
         ChannelPlan plan{t.on,c,{-1}};plan.device_field=field;
         if(record){plan.field.resize(field->size);field->download(plan.field.data());}

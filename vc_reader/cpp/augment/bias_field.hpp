@@ -16,7 +16,9 @@ struct BiasFieldKernel {
 };
 inline BiasFieldKernel make_kernel(const BiasField& t,const ChannelPlan& p) { return {p.values[0],p.values[1],p.seed}; }
 inline void channel_apply(const BiasField& t,std::vector<double>& v,const Grid& g,const ChannelPlan& p) {
-    volume_detail::map_channel(v,g,make_kernel(t,p));
+    std::vector<double> field(g.size);
+    volume_detail::accumulate_lattice(field,g,p.values[1],p.seed,true,false,1);
+    for(std::size_t i=0;i<v.size();++i)v[i]*=exp(p.values[0]*field[i]);
 }
 inline void apply(const BiasField& t,Sample& s,const Parameters& p) { volume_detail::apply_checked_channels(t,s,p); }
 } // namespace vcr::augment

@@ -6,7 +6,7 @@ static void volume_reference(volume_detail::ReferenceVolume& t, Arguments& a) {
     require(input.ndim()==4,"reference must have shape (C,Z,Y,X)");
     for(std::size_t i=0;i<4;++i)t.shape.push_back(input.shape(i));
     require(product(t.shape)>0,"reference must be nonempty");
-    auto dtype=input.dtype();require(dtype.code==std::uint8_t(nb::dlpack::dtype_code::Float) && (dtype.bits==32 || dtype.bits==64),"reference must be float32 or float64");
+    auto dtype=input.dtype();t.wide=dtype.bits==64;require(dtype.code==std::uint8_t(nb::dlpack::dtype_code::Float) && (dtype.bits==32 || dtype.bits==64),"reference must be float32 or float64");
     Array values(t.shape,'f',dtype.bits/8,input.data());t.values.resize(values.size());
     for(std::size_t i=0;i<values.size();++i){auto x=values.get(i);require(std::isfinite(x),"reference must be finite");t.values[i]=x;}
 }

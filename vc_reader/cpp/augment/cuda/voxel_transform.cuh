@@ -3,7 +3,7 @@
 #include "channel_statistics.cuh"
 #include "../voxel_transform.hpp"
 namespace vcr::augment {
-struct RandomToneCurve;struct SaltAndPepper;struct Equalize;struct CLAHE;struct HistogramMatching;
+struct Illumination;struct Vignetting;struct RandomToneCurve;struct SaltAndPepper;struct Equalize;struct CLAHE;struct HistogramMatching;
 struct PlasmaBrightnessContrast;struct PixelDistributionAdaptation;
 }
 namespace vcr::augment::cuda {
@@ -25,14 +25,26 @@ template<class Kernel,class T> void launch_voxel_transform(const Kernel& kernel,
 }
 template<class Transform,class Function> void with_voxel_channels(const Transform& t,Sample& s,const Parameters& p,Session& session,Function&& fn) {
     apply_channels(t,s,p,session,[&](const auto&,auto image,const Grid& grid,const ChannelPlan& c){
-        using Value=typename decltype(image)::value_type;
-        Buffer<Value> output(image.size);Buffer<vd::Stats> summary(1);
-        if constexpr(channel_bounds<Transform>) summarize_channel(image,summary.ptr,channel_moments<Transform>);
-        else check(cudaMemsetAsync(summary.ptr,0,sizeof(vd::Stats),vcr::device::stream()));
-        fn(grid,c,image,View<Value>{output.ptr,image.size},summary.ptr,session.finite_status());
-        check_channel_output<<<blocks(image.size),256,0,vcr::device::stream()>>>(output.ptr,image.size,std::numeric_limits<Value>::max(),session.finite_status());
-        check(cudaGetLastError());
-        copy_device(image,View<Value>{output.ptr,image.size});
+        auto run=[&](auto values){
+            using Value=typename decltype(values)::value_type;
+            Buffer<Value> output(values.size);Buffer<vd::Stats> summary(1);
+            if constexpr(channel_bounds<Transform>) summarize_channel(values,summary.ptr,channel_moments<Transform>);
+            else check(cudaMemsetAsync(summary.ptr,0,sizeof(vd::Stats),vcr::device::stream()));
+            fn(grid,c,values,View<Value>{output.ptr,values.size},summary.ptr,session.finite_status());
+            check_channel_output<<<blocks(values.size),256,0,vcr::device::stream()>>>(output.ptr,values.size,std::numeric_limits<Value>::max(),session.finite_status());
+            check(cudaGetLastError());
+            copy_device(values,View<Value>{output.ptr,values.size});
+        };
+        if constexpr(std::is_same_v<typename decltype(image)::value_type,float>){
+            bool wide=false;
+            for(double x:c.values)wide |= std::abs(x)>std::numeric_limits<float>::max() || (x!=0 && std::abs(x)<std::numeric_limits<float>::min());
+            if constexpr(std::is_same_v<Transform,Illumination> || std::is_same_v<Transform,Vignetting>)wide |= c.values[1]<std::sqrt(std::numeric_limits<float>::min());
+            if(wide){
+                Buffer<double> values(image.size);View<double> promoted{values.ptr,values.size};convert(promoted,image);run(promoted);
+                check_channel_output<<<blocks(image.size),256,0,vcr::device::stream()>>>(values.ptr,image.size,std::numeric_limits<float>::max(),session.finite_status());
+                check(cudaGetLastError());convert(image,promoted);
+            }else run(image);
+        }else run(image);
     });
 }
 // Upload reference data in its original dtype, without promoting an entire

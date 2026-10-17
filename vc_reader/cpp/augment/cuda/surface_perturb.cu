@@ -1,12 +1,10 @@
 #include "../tracing.hpp"
 #include "label_values.cuh"
 #include "sort_keys.cuh"
+#include "select_indices.cuh"
 namespace vcr::augment::cuda {
 template<class T> __global__ void surface_normals(const T* input,double* normals,std::uint8_t* valid,std::size_t h,std::size_t w) {
     EACH_INDEX(h*w) valid[i]=surface_detail::normal([&](std::size_t j){return double(input[j]);},h,w,i,normals+3*i);
-}
-__global__ void compact_normals(const std::uint8_t* valid,std::size_t n,std::size_t* indices,std::size_t* count) {
-    *count=0;for(std::size_t i=0;i<n;++i)if(valid[i])indices[(*count)++]=i;
 }
 __global__ void choose_surface_center(const std::size_t* valid,std::size_t index,std::size_t* center) {*center=valid[index];}
 __global__ void surface_distances(double* distance,std::size_t n,std::size_t w,const std::size_t* center) {EACH_INDEX(n)distance[i]=surface_detail::distance(i,*center,w);}
@@ -29,7 +27,7 @@ Parameters sample_surface(const SurfacePerturb& t,const Sample&,Random& r,bool r
     if(h>=2 && w>=2 && t.max_displacement>0) {
         Buffer<double> normals(3*n),displacement(n),distance(n);Buffer<std::uint8_t> valid(n);Buffer<std::size_t> indices(n),count(1),center(1);
         a.typed([&](auto v){surface_normals<<<blocks(n),256,0,vcr::device::stream()>>>(v.ptr,normals.ptr,valid.ptr,h,w);});
-        compact_normals<<<1,1,0,vcr::device::stream()>>>(valid.ptr,n,indices.ptr,count.ptr);check(cudaGetLastError());std::size_t total;count.download(&total);
+        select_flagged_indices(valid,indices,count);std::size_t total;count.download(&total);
         check(cudaMemsetAsync(displacement.ptr,0,n*sizeof(double),vcr::device::stream()));
         if(total)for(int blob=draw_integer(t.blobs,r);blob>0;--blob) {
             choose_surface_center<<<1,1,0,vcr::device::stream()>>>(indices.ptr,r.index(total),center.ptr);
