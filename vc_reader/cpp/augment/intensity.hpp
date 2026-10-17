@@ -176,11 +176,11 @@ inline void channel_apply(const ClipOutliers&, std::vector<double>& v, const Gri
 inline void channel_apply(const GaussianBlur& t, std::vector<double>& v, const Grid& g, const ChannelPlan& p) { gaussian_blur(v, g, p.values, t.truncate, t.mirror_boundary, true); }
 // Exact palette compression, not quantization. This benefits CT patches and
 // pointwise intensity transforms of them; continuous-valued inputs fall back to
-// nth_element. The bounded palette keeps both histogram levels in L1 cache.
+// nth_element. The bounded palette keeps the histogram in L1 cache.
 inline bool median_histogram(std::vector<double>& v, const Grid& g, std::size_t k,
                              const std::vector<std::size_t>& iz, const std::vector<std::size_t>& iy,
                              const std::vector<std::size_t>& ix) {
-    constexpr std::size_t limit = 256, group_size = 16;
+    constexpr std::size_t limit = 256;
     std::unordered_map<double, std::uint16_t> palette;
     palette.reserve(limit + 1);
     bool positive_zero = false, negative_zero = false;
@@ -213,16 +213,16 @@ inline bool median_histogram(std::vector<double>& v, const Grid& g, std::size_t 
     const auto middle = kz * k * k / 2;
     for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y) {
         std::array<std::uint32_t, limit> counts{};
-        std::array<std::uint32_t, limit / group_size> groups{};
         for (std::size_t dz = 0; dz < kz; ++dz) for (std::size_t dy = 0; dy < k; ++dy) {
             const auto* row = codes.data() + iz[z * kz + dz] + iy[y * k + dy];
-            for (std::size_t dx = 0; dx < k; ++dx) { auto code = row[ix[dx]]; ++counts[code]; ++groups[code / group_size]; }
+            for (std::size_t dx = 0; dx < k; ++dx) ++counts[row[ix[dx]]];
         }
+        // Adjacent windows tend to have nearby medians. Maintain the count
+        // below the previous median as samples enter/leave, then adjust its
+        // rank. This avoids a second histogram and restarting every search.
+        std::size_t code = 0, below = 0;
+        while (below + counts[code] <= middle) below += counts[code++];
         for (std::size_t x = 0; x < nx; ++x) {
-            std::size_t rank = middle, group = 0;
-            while (rank >= groups[group]) rank -= groups[group++];
-            auto code = group * group_size;
-            while (rank >= counts[code]) rank -= counts[code++];
             v[(z * ny + y) * nx + x] = values[code];
             if (x + 1 == nx) break;
             const auto leave = ix[x * k], enter = ix[(x + 1) * k + k - 1];
@@ -230,8 +230,29 @@ inline bool median_histogram(std::vector<double>& v, const Grid& g, std::size_t 
                 const auto* row = codes.data() + iz[z * kz + dz] + iy[y * k + dy];
                 auto from = row[leave], to = row[enter];
                 if (from == to) continue;
-                --counts[from]; --groups[from / group_size];
-                ++counts[to]; ++groups[to / group_size];
+                --counts[from]; ++counts[to];
+                below -= from < code;
+                below += to < code;
+            }
+            // Walk nearby ranks cheaply, but sum blocks when crossing a long
+            // run of empty bins (e.g. sharp dark/bright stripes in a full
+            // palette). This bounds branch-heavy searching on such inputs.
+            if (below > middle) {
+                for (int n = 0; n < 4 && below > middle; ++n) below -= counts[--code];
+                while (below > middle && code >= 16) {
+                    const auto mass = std::accumulate(counts.begin() + code - 16, counts.begin() + code, std::size_t(0));
+                    if (below - mass <= middle) break;
+                    below -= mass; code -= 16;
+                }
+                while (below > middle) below -= counts[--code];
+            } else if (below + counts[code] <= middle) {
+                for (int n = 0; n < 4 && below + counts[code] <= middle; ++n) below += counts[code++];
+                while (below + counts[code] <= middle && code + 16 <= limit) {
+                    const auto mass = std::accumulate(counts.begin() + code, counts.begin() + code + 16, std::size_t(0));
+                    if (below + mass > middle) break;
+                    below += mass; code += 16;
+                }
+                while (below + counts[code] <= middle) below += counts[code++];
             }
         }
     }

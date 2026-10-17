@@ -39,6 +39,18 @@ def test_morphology_preserves_negative_zero():
     assert np.signbit(out).all()
 
 
+@pytest.mark.parametrize("size", [2, 3, 4, 7])
+def test_median_tracks_large_rank_jumps_and_empty_bins(size):
+    ndi = pytest.importorskip("scipy.ndimage")
+    image = np.broadcast_to(((np.arange(257) // 3) % 2) * 255., (1, 5, 9, 257)).copy()
+    # Include all 256 palette values globally, but leave large gaps in most
+    # local histograms. Moving across stripes jumps between the extreme ranks.
+    image[0, 0, 0, :256] = np.arange(256)
+    expected = ndi.median_filter(image[0], size=size, mode="reflect")
+    output = A.Pipeline([A.MedianFilter(size)])({"image": image}, seed=123)["image"]
+    np.testing.assert_array_equal(output[0], expected)
+
+
 @pytest.mark.parametrize("shape", [(9, 11), (7, 9, 11), (1, 3, 2)])
 @pytest.mark.parametrize("border", [False, True])
 @pytest.mark.parametrize("scale", [.8, 1.2])

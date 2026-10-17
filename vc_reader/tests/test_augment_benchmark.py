@@ -9,11 +9,8 @@ import numpy as np
 import pytest
 
 
-def test_native_benchmark_all_cases_without_torch(tmp_path, monkeypatch):
-    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "benchmarks"))
-    for name in ("torch", "vesuvius", "scipy"):
-        monkeypatch.setitem(sys.modules, name, None)
-    bench = importlib.import_module("bench_augment")
+@pytest.fixture
+def ct_array(tmp_path):
     array = tmp_path / "ct.zarr"
     array.mkdir()
     # Small uncompressed reader fixture; performance measurements use real CT.
@@ -22,6 +19,16 @@ def test_native_benchmark_all_cases_without_torch(tmp_path, monkeypatch):
         compressor=None, filters=None, fill_value=0, order="C")))
     data = np.arange(16 ** 3).astype(np.uint8).reshape((16,) * 3)
     (array / "0.0.0").write_bytes(data.tobytes())
+    return array
+
+
+def test_native_benchmark_all_cases_without_torch(tmp_path, monkeypatch, ct_array):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "benchmarks"))
+    for name in ("torch", "vesuvius", "scipy"):
+        monkeypatch.setitem(sys.modules, name, None)
+    bench = importlib.import_module("bench_augment")
+    array = ct_array
+    original = (array / "0.0.0").read_bytes()
     destination = tmp_path / "result.json"
     monkeypatch.setattr(sys, "argv", [
         "bench_augment.py", "--native-only", "--array", str(array),
@@ -31,12 +38,12 @@ def test_native_benchmark_all_cases_without_torch(tmp_path, monkeypatch):
     bench.main()
     result = json.loads(destination.read_text())
     assert result["mode"] == "native-only"
-    assert len(result["cases"]) == len(bench.cases((12,) * 3)) == 26
+    assert len(result["cases"]) == len(bench.cases((12,) * 3)) == 24
     names = {case["name"] for case in result["cases"]}
     assert not names & {
         "CopyOnly", "CropPad", "Morphology", "ReplaceLabel", "Regions", "OneHot",
         "MaskImage", "DeepSupervision", "MedialSurface", "Pseudo2DRoundTrip", "IntensityPipeline",
-        "RemoveComponents", "ClipOutliers",
+        "RemoveComponents", "ClipOutliers", "Affine", "SheetCompression",
     }
     assert {"RandomBinaryOperator", "Flip", "Rotate90", "Transpose"} <= names
     assert len(result["crops"]) == 2
@@ -47,14 +54,39 @@ def test_native_benchmark_all_cases_without_torch(tmp_path, monkeypatch):
         assert case["latency"]["min_ms"] > 0
         assert "python" not in case
         assert all("native_steps" in crop and crop["output"] for crop in case["crops"])
-    assert (array / "0.0.0").read_bytes() == data.tobytes()
+    assert (array / "0.0.0").read_bytes() == original
 
 
-def test_native_benchmark_rejects_unknown_case(monkeypatch):
+@pytest.mark.parametrize("field", ["image", "segmentation"])
+def test_build_comparison_checks_images_and_labels(tmp_path, monkeypatch, ct_array, field):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "benchmarks"))
+    check = importlib.import_module("check_augment_build")
+    monkeypatch.setattr(check, "crop_starts", lambda args: [(0, 0, 0)])
+    reference, report = tmp_path / "reference", tmp_path / "comparison.json"
+    command = ["check_augment_build.py", str(reference), "--array", str(ct_array),
+               "--shape", "12", "12", "12", "--seeds", "123", "--output", str(report)]
+    monkeypatch.setattr(sys, "argv", command + ["--capture"])
+    check.main()
+    monkeypatch.setattr(sys, "argv", command)
+    check.main()
+    result = json.loads(report.read_text())
+    assert len(result["comparisons"]) == 2
+    assert all(c["max_abs_error"] == 0 and c["changed"] == 0 for c in result["comparisons"])
+    snapshot = reference / "Elastic-0-123.npz"
+    with np.load(snapshot) as saved:
+        modified = {key: saved[key] for key in saved.files}
+    modified[field].flat[0] += 1
+    np.savez(snapshot, **modified)
+    with pytest.raises(AssertionError):
+        check.main()
+
+
+@pytest.mark.parametrize("case", ["Typo", "Affine", "SheetCompression"])
+def test_native_benchmark_rejects_unknown_case(monkeypatch, case):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "benchmarks"))
     bench = importlib.import_module("bench_augment")
-    monkeypatch.setattr(sys, "argv", ["bench_augment.py", "--native-only", "--only", "Typo"])
-    with pytest.raises(SystemExit, match="Unknown cases: Typo"):
+    monkeypatch.setattr(sys, "argv", ["bench_augment.py", "--native-only", "--only", case])
+    with pytest.raises(SystemExit, match=f"Unknown cases: {case}"):
         bench.main()
 
 

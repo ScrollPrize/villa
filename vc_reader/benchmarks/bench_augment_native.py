@@ -101,6 +101,7 @@ def run(args, cases, summary):
                   order="deterministically shuffled cases each repetition (Python Random(20261016))",
                   input_noise_std=args.input_noise_std, crops=[], cases=[],
                   excluded=["Data preparation, label encoding/cleanup, target generation, copy controls and composite pipelines",
+                            "RemoveComponents, ClipOutliers, Affine, SheetCompression: excluded by request",
                             "StripGeometry, SurfacePerturb, translate_crop_box: require tracing/surface inputs not provided by CT crops",
                             "OneOf and standalone probability wrappers; parameters chosen to exercise transforms, not training application frequencies"])
     inputs = []

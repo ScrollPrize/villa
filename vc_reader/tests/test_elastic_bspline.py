@@ -27,7 +27,8 @@ def displacement(plan):
     return np.zeros((*shape,len(shape))) if not len(field) else field.reshape(*shape,len(shape))
 
 
-@pytest.mark.parametrize('shape',[(17,23),(13,17,23),(1,7,11),(1,1)])
+@pytest.mark.parametrize('shape',[(17,23),(13,17,23),(1,7,11),(1,1),
+                                 (7,1,5),(7,5,1),(7,5,2),(3,5,16)])
 @pytest.mark.parametrize('strength',[0.,.1,8.])
 def test_strength_bounds_replay_and_independent_resampling(shape,strength):
     ndi=pytest.importorskip('scipy.ndimage')

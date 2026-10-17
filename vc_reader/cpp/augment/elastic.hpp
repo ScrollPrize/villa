@@ -87,33 +87,50 @@ template<std::size_t D>
 double normalize_impl(std::vector<double>& field,const Shape& shape,double rms,double bound) {
     require(rms>=0 && std::isfinite(rms) && bound>0 && bound<1,"invalid strength/gradient bound");
     Grid g(shape); constexpr auto d=D; require(field.size()==d*g.size,"field shape mismatch");
-    double energy=0;
-    for (double v:field) { require(std::isfinite(v),"nonfinite displacement"); energy+=v*v; }
+    // Independent accumulators allow SIMD without enabling global fast-math.
+    // The reduction is deterministic, but may differ by a few rounding bits
+    // from the old serial sum. Validate before using the resulting scale.
+    constexpr std::size_t energy_lanes=8;
+    std::array<double,energy_lanes> energies{};
+    bool finite=true;
+    std::size_t i=0;
+    for (;i+energy_lanes<=field.size();i+=energy_lanes)
+        for (std::size_t lane=0;lane<energy_lanes;++lane) {
+            const double v=field[i+lane];
+            finite &= std::isfinite(v);
+            energies[lane]+=v*v;
+        }
+    double energy=std::accumulate(energies.begin(),energies.end(),0.);
+    for (;i<field.size();++i) { finite &= std::isfinite(field[i]); energy+=field[i]*field[i]; }
+    require(finite,"nonfinite displacement");
     double factor=energy ? rms/std::sqrt(energy/g.size) : 0;
     double maxima[3][3]{};
-    // Separate axes into contiguous runs: no coordinate divisions or per-voxel
-    // boundary branches. Max reductions may be reordered for finite abs values.
-    // Independent lanes permit vectorization without changing energy summation.
-    constexpr std::size_t lanes=8;
-    for (std::size_t a=0;a<d;++a) {
-        double lane_max[lanes][D]{};
-        const auto stride=g.stride[a], block=stride*shape[a], count=block-stride;
-        for (std::size_t base=0;base<g.size;base+=block) {
-            std::size_t i=0;
-            for (;i+lanes<=count;i+=lanes)
-                for (std::size_t lane=0;lane<lanes;++lane)
-                    for (std::size_t c=0;c<d;++c) {
-                        const auto index=d*(base+i+lane)+c;
-                        lane_max[lane][c]=std::max(lane_max[lane][c],std::abs(field[index+d*stride]-field[index]));
-                    }
-            for (;i<count;++i) for (std::size_t c=0;c<d;++c) {
-                const auto index=d*(base+i)+c;
-                lane_max[0][c]=std::max(lane_max[0][c],std::abs(field[index+d*stride]-field[index]));
+    // Visit all forward neighbors together, while the current row and adjacent
+    // rows/planes are cached, instead of rereading the entire field per axis.
+    // Maxima of finite absolute differences are independent of reduction order.
+    constexpr std::size_t lanes=2;
+    double lane_max[D][lanes][D]{};
+    const auto nx=shape.back(), ny=shape[d-2], nz=d==3 ? shape[0] : 1;
+    for (std::size_t z=0;z<nz;++z) for (std::size_t y=0;y<ny;++y) {
+        const auto base=(z*ny+y)*nx;
+        auto accumulate=[&](std::size_t x,std::size_t count,bool right) {
+            for (std::size_t lane=0;lane<count;++lane) for (std::size_t c=0;c<d;++c) {
+                const auto index=d*(base+x+lane)+c;
+                const auto current=field[index];
+                if constexpr (d==3) if (z+1<nz)
+                    lane_max[0][lane][c]=std::max(lane_max[0][lane][c],std::abs(field[index+d*ny*nx]-current));
+                if (y+1<ny)
+                    lane_max[d-2][lane][c]=std::max(lane_max[d-2][lane][c],std::abs(field[index+d*nx]-current));
+                if (right)
+                    lane_max[d-1][lane][c]=std::max(lane_max[d-1][lane][c],std::abs(field[index+d]-current));
             }
-        }
-        for (std::size_t lane=0;lane<lanes;++lane)
-            for (std::size_t c=0;c<d;++c) maxima[c][a]=std::max(maxima[c][a],lane_max[lane][c]);
+        };
+        std::size_t x=0;
+        for (;x+lanes<nx;x+=lanes) accumulate(x,lanes,true);
+        for (;x<nx;++x) accumulate(x,1,x+1<nx);
     }
+    for (std::size_t a=0;a<d;++a) for (std::size_t lane=0;lane<lanes;++lane)
+        for (std::size_t c=0;c<d;++c) maxima[c][a]=std::max(maxima[c][a],lane_max[a][lane][c]);
     double limit=0;
     for (const auto& row:maxima) limit=std::max(limit,row[0]+row[1]+row[2]);
     if (limit) factor=std::min(factor,bound/limit);

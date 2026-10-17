@@ -1,11 +1,11 @@
 # C++ augmentation ranking on real CT
 
-Measured 2026-10-16, source commit `b8fdd7c62d66482423ea65b469ceba56d5931b2d`.
-This benchmarks the current vc_reader C++ package only. No augmentation kernels
-were changed and no other augmentation implementation was run.
+Initial ranking measured 2026-10-16, source commit
+`b8fdd7c62d66482423ea65b469ceba56d5931b2d`. This benchmarks only the vc_reader C++ package; no other augmentation
+implementation was run.
 
-For the selected parameters across all six 128³ crops, the slowest median
-calls are SheetCompression, Elastic, MedianFilter and RicianNoise. At 64³,
+In the initial ranking across all six 128³ crops, the slowest median
+calls are Elastic, MedianFilter and RicianNoise. At 64³,
 MedianFilter is slowest among the measured augmentations.
 On CT perturbed with fixed noise, MedianFilter rises to **495.32 ms** at 128³
 and becomes the strongest optimization candidate among the measured cases.
@@ -24,7 +24,7 @@ and becomes the strongest optimization candidate among the measured cases.
 - Label operations use int16 masks derived from `CT > 127.5`, **not annotations**.
   Geometry operates on image plus label; image-only operations receive just the
   image. Mask-corruption augmentations receive a float32 binary mask.
-- 26 individual augmentations, three warmups per case/crop, 20 measured repetitions per crop:
+- 24 individual augmentations, three warmups per case/crop, 20 measured repetitions per crop:
   **120 observations per case and size**. Seed is `123 + repetition`, shared
   across crops/cases. Case order is deterministically shuffled per repetition.
 - Timed: the public NumPy API including adaptation, native validation, parameter
@@ -34,28 +34,146 @@ and becomes the strongest optimization candidate among the measured cases.
 - Ranking uses pooled p50 across equally weighted crops. P95 includes both
   timing variation and crop differences; it is not a confidence interval.
   Per-crop observations and mean/p50/p95/min/max are retained in JSON.
-  The main samples were collected with two subsequently excluded cases
-  (RemoveComponents and ClipOutliers) in the interleaving. Their rows were
+  The main samples were collected with four subsequently excluded cases
+  (RemoveComponents, ClipOutliers, Affine and SheetCompression) in the interleaving. Their rows were
   removed without retiming the remaining
-  cases; JSON records this collection detail. New runs use only the 26 cases.
+  cases; JSON records this collection detail. New runs use only the 24 cases.
 - Parameters are fixed workloads, not a sweep of defaults or training
   application probabilities. Notably: Elastic `sigma=3, magnitude=1` (current
-  cubic B-spline implementation); SheetCompression `strength=.2,
-  intensity_sigma=1, smoothing=3, axes='z'`; MedianFilter `size=3`; RicianNoise
-  and GaussianNoise `std=.05`; GaussianBlur `sigma=1`; Affine `scale=1/1.1`.
+  cubic B-spline implementation); MedianFilter `size=3`; RicianNoise
+  and GaussianNoise `std=.05`; GaussianBlur `sigma=1`.
   Every native constructor is recorded in JSON.
 
-## Full ranking
+## Optimization follow-up: Elastic and MedianFilter
+
+The next pass allows small floating-point rounding differences, as requested.
+It changes only the existing C++ implementation; no other augmentation library
+is benchmarked. All 24 benchmark cases and the six crop centers are unchanged.
+Affine, SheetCompression, RemoveComponents and ClipOutliers remain excluded.
+
+Fresh before/after runs use the same Release flags, CPU affinity, input ownership
+and seeds as above, but select **Elastic, MedianFilter and RicianNoise**, with
+**two warmups and 11 repetitions per crop (66 observations per case/size)**.
+RicianNoise is unchanged and acts as a timing control. Times are **mean / p50 /
+p95 milliseconds**; reductions compare p50.
+
+| Case | Shape | Before ms | After ms | Reduction |
+| --- | --- | ---: | ---: | ---: |
+| Elastic | 128³ | 97.031 / 97.013 / 98.083 | 82.741 / 82.645 / 83.674 | 14.8% |
+| MedianFilter | 128³ | 87.714 / 88.227 / 88.988 | 82.957 / 82.488 / 86.902 | 6.5% |
+| RicianNoise | 128³ | 72.967 / 72.939 / 73.183 | 72.987 / 72.957 / 73.213 | unchanged |
+| Elastic | 64³ | 9.499 / 9.501 / 9.681 | 8.109 / 8.114 / 8.269 | 14.6% |
+| MedianFilter | 64³ | 10.622 / 10.694 / 10.949 | 9.668 / 9.580 / 10.464 | 10.4% |
+| RicianNoise | 64³ | 9.085 / 9.082 / 9.128 | 9.080 / 9.078 / 9.112 | unchanged |
+
+Elastic now computes gradient maxima across all axes in one traversal, improving
+cache reuse. Its energy reduction uses eight independent double accumulators.
+The original interpolation and boundary handling are retained, including
+conservative validity interpolation and integer targets. RNG draws and replay format are
+unchanged. There are no reduced-precision buffers, global fast-math flags or
+platform-specific instructions in the source.
+
+MedianFilter tracks the previous histogram median and the count below it as
+samples enter and leave the window. Large rank jumps skip blocks of bins to
+avoid long scalar searches. Palette encoding is still exact; the continuous
+`nth_element` fallback is unchanged. Median outputs must remain exact.
+
+Supplementary 128³ median checks use the same native builds and preserve exact
+output hashes. CT plus fixed Gaussian noise (`--input-noise-std .01`) uses all
+six crops, one warmup and three repetitions per crop. Synthetic full-palette
+stripes and uniform uint8 noise each use one crop, one warmup and five measured
+calls. Times are mean / p50 / p95 milliseconds:
+
+| Input | Before ms | After ms |
+| --- | ---: | ---: |
+| CT plus continuous noise | 499.435 / 501.639 / 505.507 | 498.828 / 500.960 / 505.356 |
+| Alternating dark/bright stripes | 46.691 / 46.738 / 46.806 | 48.610 / 48.605 / 48.671 |
+| Uniform uint8 noise | 79.336 / 79.319 / 79.495 | 77.658 / 77.628 / 77.800 |
+
+The continuous selector remains a roughly 0.5-second bottleneck; this pass does
+not optimize that algorithm. The stripe stress fixture is **4.0% slower** than
+before, a remaining tradeoff despite block skipping. It alternates 0/255 every
+three columns and includes all 256 values in its first two rows. Uniform noise
+uses NumPy seed 23. Stress results are separate from the real-CT ranking.
+
+`check_augment_build.py` compares the same C++ package before and after the
+change. All six 128³ crops at Elastic seeds 123/124/125 had **zero float32 image
+error and identical integer labels**. MedianFilter was checked on all six crops
+with zero tolerances and matched exactly. The synthetic cross-build suite covers
+1,068 arrays across 2D/3D, float32/float64 and seeds 1/123; integer outputs match
+exactly, float32 maximum absolute error is zero, and float64 maximum absolute
+error is **4.44e-15**. Replay, ownership, bounds and seeded determinism are also
+covered by the tests below. These are observed errors on these inputs, not a
+universal numerical-error guarantee.
+
+The preserved pre-change extension is in `/tmp/vc-augment-perf`; the current
+candidate is in `/tmp/vc-augment-elastic`. Raw reports are
+`results/elastic-pass-{before,after}-{128,64}.json`, with binary hashes, every
+observation and per-crop summaries. Numerical comparisons are in
+`results/elastic-pass-equivalence.json` and `results/median-pass-equivalence.json`.
+Build the candidate with the command under Verification, then reproduce timings:
+
+```bash
+export AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+export PYTHONPATH=vc_reader/src:vc_reader/.venv/lib/python3.14/site-packages
+for size in 128 64; do
+  for tag in before after; do
+    build=/tmp/vc-augment-perf
+    if [ "$tag" = after ]; then build=/tmp/vc-augment-elastic; fi
+    taskset -c 0 vc_reader/.venv/bin/python -S vc_reader/benchmarks/run_native.py \
+      "$build/_augment.cpython-314-x86_64-linux-gnu.so" \
+      vc_reader/benchmarks/bench_augment.py --native-only \
+      --only Elastic,MedianFilter,RicianNoise --shape "$size" "$size" "$size" \
+      --reps 11 --warmup 2 --build-dir "$build" \
+      --output "vc_reader/benchmarks/results/elastic-pass-$tag-$size.json"
+  done
+done
+```
+
+The comparison harness commands are in [the benchmark README](README.md).
+Measurements are single-threaded Linux x86-64 results; macOS/arm64 performance
+has not been measured.
+
+The final sampling profile uses the same three cases, six crops, ten repetitions
+and three warmups (`gprofng collect app -p hi`). It includes startup/validation
+and is separate from the latency measurements. The main remaining exclusive
+CPU sample shares are:
+
+| Function | CPU samples |
+| --- | ---: |
+| Median histogram | 28.35% |
+| RicianNoise apply | 12.59% |
+| Nearest-neighbor label resampling | 8.76% |
+| Image interpolation | 8.48% |
+| Palette hashing (`std::_Hash_bytes`) | 3.59% |
+
+An unresolved libm address accounts for another 16.50%; it is not assigned to
+a specific algorithm here. The final profile is in
+`results/elastic-pass-profile.{json,txt}`. Reproduce it with the symbol-bearing
+relink described under Initial native function profile, using
+`/tmp/vc-augment-elastic` as the build directory, then:
+
+```bash
+gprofng collect app -p hi -O /tmp/vc-augment-elastic/final-profile.er \
+  taskset -c 0 vc_reader/.venv/bin/python -S vc_reader/benchmarks/run_native.py \
+  /tmp/vc-augment-elastic/symbols/_augment.cpython-314-x86_64-linux-gnu.so \
+  vc_reader/benchmarks/bench_augment.py --native-only \
+  --only Elastic,MedianFilter,RicianNoise --shape 128 128 128 \
+  --reps 10 --warmup 3 --build-dir /tmp/vc-augment-elastic \
+  --output vc_reader/benchmarks/results/elastic-pass-profile.json
+gprofng display text -limit 25 -functions /tmp/vc-augment-elastic/final-profile.er \
+  > vc_reader/benchmarks/results/elastic-pass-profile.txt
+```
+
+## Initial full ranking
 
 Times are **mean / p50 / p95 milliseconds per call**, ordered by 128³ p50.
 
 | Case | Inputs | 128³ ms | 64³ ms |
 | --- | --- | ---: | ---: |
-| SheetCompression | both | 103.019 / 103.434 / 104.858 | 9.323 / 9.349 / 9.514 |
 | Elastic | both | 97.700 / 97.630 / 98.791 | 9.494 / 9.499 / 9.607 |
 | MedianFilter | image | 87.965 / 88.441 / 89.693 | 10.462 / 10.568 / 10.779 |
 | RicianNoise | image | 73.152 / 72.954 / 73.129 | 9.072 / 9.071 / 9.105 |
-| Affine | both | 44.431 / 44.287 / 45.229 | 5.767 / 5.765 / 5.805 |
 | LocalSmoothing | image | 43.371 / 44.009 / 44.638 | 1.886 / 1.871 / 2.009 |
 | GaussianNoise | image | 36.975 / 36.922 / 37.065 | 4.579 / 4.577 / 4.620 |
 | RandomBinaryOperator | binary | 27.853 / 28.366 / 30.178 | 1.308 / 1.280 / 1.515 |
@@ -176,9 +294,9 @@ editable-reader import hook in this environment. Normally `PYTHONPATH=vc_reader/
 with a working environment suffices. `taskset` and the extension filename above
 are specific to this Linux/Python host; the harness itself also supports macOS.
 
-## Native function profile
+## Initial native function profile
 
-A separate `gprofng collect app -p hi` run used the four slowest 128³ cases,
+A separate `gprofng collect app -p hi` run used the three slowest 128³ cases,
 10 repetitions on each of the six crops, and three warmups. It includes startup,
 validation and hashing. These are exclusive CPU sample percentages of the
 whole profiling process, **not latency fractions for individual transforms**.
@@ -186,15 +304,15 @@ The main timing tables do not use profiled observations.
 
 | Native function | Exclusive CPU samples |
 | --- | ---: |
-| `median_histogram` | 21.46% |
-| `linear_value<3>` (image interpolation) | 11.53% |
-| `resample_impl<3>` for int16 labels | 10.99% |
-| `apply<RicianNoise>` | 8.56% |
-| `sample(Elastic)` | 6.33% |
-| `gaussian_blur` | 4.41% |
-| `sample(SheetCompression)` | 2.92% |
+| `median_histogram` | 28.93% |
+| `apply<RicianNoise>` | 11.64% |
+| `sample(Elastic)` | 8.57% |
+| `resample_impl<3>` for int16 labels | 8.14% |
+| `linear_value<3>` (image interpolation) | 7.72% |
+| `std::_Hash_bytes` | 3.17% |
+| `bspline_field_impl<3>` | 2.12% |
 
-There is also 5.52% in an unresolved libc address and 11.10% in an unresolved
+There is also 6.94% in an unresolved libc address and 14.84% in an unresolved
 libm address; these are not assigned to particular algorithms here. The profile
 supports investigating median histogram maintenance, geometric resampling and
 noise generation.
@@ -219,15 +337,15 @@ args.remove('-Wl,-s')
 args[args.index('-o') + 1] = str(dest / '_augment.cpython-314-x86_64-linux-gnu.so')
 subprocess.run(args, cwd=build, check=True)
 PY
-gprofng collect app -p hi -O /tmp/vc-augment-ranking/profile.er \
+gprofng collect app -p hi -O /tmp/vc-augment-ranking/retained-profile.er \
   taskset -c 0 vc_reader/.venv/bin/python -S vc_reader/benchmarks/run_native.py \
   /tmp/vc-augment-ranking/symbols/_augment.cpython-314-x86_64-linux-gnu.so \
   vc_reader/benchmarks/bench_augment.py --native-only \
   --shape 128 128 128 \
-  --only Elastic,SheetCompression,MedianFilter,RicianNoise \
+  --only Elastic,MedianFilter,RicianNoise \
   --reps 10 --warmup 3 --build-dir /tmp/vc-augment-ranking \
   --output vc_reader/benchmarks/results/native-ranking-profile.json
-gprofng display text -limit 25 -functions /tmp/vc-augment-ranking/profile.er \
+gprofng display text -limit 25 -functions /tmp/vc-augment-ranking/retained-profile.er \
   > vc_reader/benchmarks/results/native-ranking-profile.txt
 ```
 
@@ -239,12 +357,12 @@ not directly interchangeable with the public-call latencies.
 
 ## Coverage and limitations
 
-The 26 cases cover individual image, spatial and mask-corruption augmentations.
+The 24 cases cover individual image, spatial and mask-corruption augmentations.
 Exact case names and constructor arguments are in the raw JSON. CopyOnly,
 CropPad, Morphology (label closing), ReplaceLabel, Regions, OneHot, MaskImage,
 DeepSupervision, MedialSurface, Pseudo2DRoundTrip and the composite
 IntensityPipeline were removed from the benchmark and current results.
-RemoveComponents and ClipOutliers are also excluded by request. All package
+RemoveComponents, ClipOutliers, Affine and SheetCompression are also excluded by request. All package
 implementations remain available. RandomBinaryOperator remains as a deliberate
 mask perturbation.
 
@@ -262,15 +380,39 @@ directory. This document retains the measurements for repository review.
 
 ## Verification
 
-**566 tests passed** against the freshly built augmentation extension, covering
+**683 tests passed** against the freshly built augmentation extension, covering
 the augmentation suite, optimized kernels, B-spline elastic and the new
-benchmark regression tests. The latter run all 26 cases through a tiny local
+benchmark regression tests. The latter run all 24 cases through a tiny local
 Zarr fixture with Torch/Vesuvius/SciPy imports blocked, validate multiple crops,
 sample counts and ranked output, check that helper cases stay excluded, and
 reject unknown case names. Additional tests preserve the original three crop
 centers, verify the six-region default at both sizes and check explicit crop
 overrides. The actual performance runs use the real CT crops listed above and separately check
 finite outputs, exact seeded repeatability and input preservation.
+
+The retained SheetCompression implementation now uses single-axis interpolation
+when its field permits it, sharing the existing interpolation and nearest-index
+rules. Its prefix sum traverses contiguous runs without coordinate division.
+That earlier pass preserved RNG draws, arithmetic/reduction order, precision
+and the replay schema. The general geometry path remains for other fields and validity masks.
+The new 97 compression tests cover every axis in 2D/3D, singleton dimensions,
+float32/float64, uint64 labels, thresholds, strengths, signed zero, replay and
+inplace calls. During that earlier pass, 1,068 output arrays matched the original binary byte
+for byte, and all six real-crop output fingerprints matched for every case in
+the performance follow-up. Affine and SheetCompression were then removed from
+the benchmark and saved rankings by request; their library implementations and
+correctness tests remain.
+
+Build the current optimization candidate separately, preserving the pre-change binary:
+
+```bash
+AGENTS_AGENT_MODE=1 cmake -S vc_reader -B /tmp/vc-augment-elastic \
+  -DVC_READER_BUILD_READER=OFF \
+  -DPython_EXECUTABLE="$PWD/vc_reader/.venv/bin/python" \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE='-O3 -g -DNDEBUG' \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-augment-elastic --target _augment -j 2
+```
 
 The test command appends site-packages after the standard library: this
 environment contains an old `argparse` backport that otherwise shadows the
@@ -283,11 +425,12 @@ import runpy
 import sys
 sys.path.append('vc_reader/.venv/lib/python3.14/site-packages')
 sys.argv = ['vc_reader/benchmarks/run_native.py',
-            '/tmp/vc-augment-ranking/_augment.cpython-314-x86_64-linux-gnu.so',
+            '/tmp/vc-augment-elastic/_augment.cpython-314-x86_64-linux-gnu.so',
             '-m', 'pytest', 'vc_reader/tests/test_augment.py',
             'vc_reader/tests/test_augment_optimization.py',
             'vc_reader/tests/test_elastic_bspline.py',
-            'vc_reader/tests/test_augment_benchmark.py', '-q', '--tb=short']
+            'vc_reader/tests/test_augment_benchmark.py',
+            'vc_reader/tests/test_sheet_compression.py', '-q', '--tb=short']
 runpy.run_path(sys.argv[0], run_name='__main__')
 PY
 ```

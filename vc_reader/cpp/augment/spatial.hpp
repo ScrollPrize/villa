@@ -27,6 +27,10 @@ using Point = std::array<double, 3>;
 inline Point matvec(const Matrix& m, Point v, std::size_t d) {
     Point out{}; for (std::size_t i = 0; i < d; ++i) for (std::size_t j = 0; j < d; ++j) out[i] += m[i * d + j] * v[j]; return out;
 }
+inline std::int64_t nearest_index(double q, int mode) {
+    auto lo = std::int64_t(std::floor(q)); auto fraction = q - lo;
+    return mode == 2 ? lo : lo + (fraction > .5 || (fraction == .5 && (mode == 1 || lo % 2 != 0)));
+}
 template<std::size_t D = 0, class F> double linear_value(const Grid& g, Point q, bool border, double fill, F&& get) {
     std::int64_t lo[3]; double fraction[3]; const auto d = D ? D : g.shape.size();
     for (std::size_t a = 0; a < d; ++a) {
@@ -153,10 +157,60 @@ inline bool resample_exact(const Array& src, Array& out, const Parameters& p, do
     });
     return true;
 }
-template<std::size_t D> Array resample_impl(const Array& src, const Parameters& p, bool nearest, double fill, bool validity = false) {
+// Infer this from the dense field so saved replay plans need no new metadata.
+// General deformations normally fail the check within their first voxel.
+inline std::size_t displacement_axis(const Parameters& p) {
+    const auto d = p.shape.size();
+    if (p.field.empty() || !p.border || p.matrix != identity(d) ||
+        std::any_of(p.offset.begin(), p.offset.end(), [](double v) { return v != 0; })) return d;
+    std::size_t chosen = d;
+    for (std::size_t i = 0; i < p.field.size(); i += d)
+        for (std::size_t a = 0; a < d; ++a) if (p.field[i + a] != 0) {
+            if (chosen != d && chosen != a) return d;
+            chosen = a;
+        }
+    return chosen == d ? 0 : chosen;
+}
+inline void resample_axis_displacement(const Array& src, Array& out, const Parameters& p,
+                                       std::size_t axis, bool nearest, double fill) {
+    Grid grid(p.shape), line({p.shape[axis]});
+    const auto d = p.shape.size(), extent = p.shape[axis], step = grid.stride[axis];
+    src.typed([&](const auto* source) {
+        using T = std::remove_cv_t<std::remove_pointer_t<decltype(source)>>;
+        auto* destination = static_cast<T*>(out.data());
+        for (std::size_t block = 0; block < grid.size; block += extent * step)
+            for (std::size_t x = 0; x < extent; ++x)
+                for (std::size_t j = 0; j < step; ++j) {
+                    const auto i = block + x * step + j, base = block + j;
+                    Point q{double(x) + p.field[i * d + axis], 0, 0};
+                    if (nearest) {
+                        require(std::isfinite(q[0]), "nonfinite sampling coordinate");
+                        auto at = base + std::size_t(nearest_index(std::clamp(q[0], 0., double(extent - 1)), p.nearest_mode)) * step;
+                        for (std::size_t c = 0; c < src.shape[0]; ++c)
+                            destination[c * grid.size + i] = source[c * grid.size + at];
+                    } else {
+                        for (std::size_t c = 0; c < src.shape[0]; ++c) {
+                            // The omitted axes have fraction zero, so their
+                            // weights are exactly one. Keep low/high corner
+                            // accumulation (including the initial +0) unchanged.
+                            double value = linear_value<1>(line, q, true, fill, [&](auto at) {
+                                return double(source[c * grid.size + base + at * step]);
+                            });
+                            if constexpr (std::is_floating_point_v<T>) destination[c * grid.size + i] = static_cast<T>(value);
+                            else out.set(c * grid.size + i, value);
+                        }
+                    }
+                }
+    });
+}
+template<std::size_t D> Array resample_impl(const Array& src, const Parameters& p, bool nearest, double fill, bool validity = false, std::size_t field_axis = D) {
     Grid input(src.spatial()), output(p.shape); constexpr auto d = D;
     Shape shape{src.shape[0]}; shape.insert(shape.end(), p.shape.begin(), p.shape.end()); auto out = Array::uninitialized(shape, src.kind, src.bytes);
     if (resample_exact(src, out, p, fill, validity)) return out;
+    if (field_axis < d && !validity && input.shape == p.shape) {
+        resample_axis_displacement(src, out, p, field_axis, nearest, fill);
+        return out;
+    }
     src.typed([&](const auto* source) {
         using T = std::remove_cv_t<std::remove_pointer_t<decltype(source)>>;
         auto* destination = static_cast<T*>(out.data());
@@ -180,8 +234,7 @@ template<std::size_t D> Array resample_impl(const Array& src, const Parameters& 
                     require(std::isfinite(q[a]), "nonfinite sampling coordinate");
                     if (p.border) q[a] = std::clamp(q[a], 0., double(input.shape[a] - 1));
                     if (q[a] < -1 || q[a] > double(input.shape[a])) { valid = false; continue; }
-                    auto lo = std::int64_t(std::floor(q[a])); auto fraction = q[a] - lo;
-                    auto x = p.nearest_mode == 2 ? lo : lo + (fraction > .5 || (fraction == .5 && (p.nearest_mode == 1 || lo % 2 != 0)));
+                    auto x = nearest_index(q[a], p.nearest_mode);
                     if (x < 0 || x >= std::int64_t(input.shape[a])) valid = false; else at += std::size_t(x) * input.stride[a];
                 }
                 for (std::size_t c = 0; c < src.shape[0]; ++c) {
@@ -201,12 +254,13 @@ template<std::size_t D> Array resample_impl(const Array& src, const Parameters& 
     });
     return out;
 }
-inline Array resample(const Array& src, const Parameters& p, bool nearest, double fill, bool validity = false) {
-    return p.shape.size() == 2 ? resample_impl<2>(src, p, nearest, fill, validity)
-                               : resample_impl<3>(src, p, nearest, fill, validity);
+inline Array resample(const Array& src, const Parameters& p, bool nearest, double fill, bool validity = false, std::size_t field_axis = 3) {
+    return p.shape.size() == 2 ? resample_impl<2>(src, p, nearest, fill, validity, field_axis)
+                               : resample_impl<3>(src, p, nearest, fill, validity, field_axis);
 }
 inline void apply_geometry(Sample& sample, const Parameters& p) {
     auto d = p.shape.size(); auto canonical = axes(d); Grid output(p.shape);
+    const auto field_axis = displacement_axis(p);
     for (auto& [name, f] : sample) {
         auto& a = f.array; const auto& t = f.target; auto role = t.role;
         if (sparse(role)) {
@@ -223,7 +277,7 @@ inline void apply_geometry(Sample& sample, const Parameters& p) {
             }
             out.shape[0] = kept; a = std::move(out); continue;
         }
-        auto out = resample(a, p, role == Role::Label || (p.exact && role != Role::Valid), t.fill, role == Role::Valid);
+        auto out = resample(a, p, role == Role::Label || (p.exact && role != Role::Valid), t.fill, role == Role::Valid, field_axis);
         if (directional(role) || (role == Role::CoordinateField && !t.external)) {
             for (std::size_t i = 0; i < output.size; ++i) {
                 Point v{}, pos{}; for (std::size_t j = 0; j < d; ++j) { v[axis(t.components[j], d)] = out.get(j * output.size + i); pos[j] = double(output.coord(i, j)); }
@@ -339,9 +393,17 @@ inline Parameters sample(const SheetCompression& t, const Sample& s, Random& r) 
     auto values = s.at(t.image).array.channel(0); if (sigma > .5) gaussian_blur(values, g, std::vector<double>(d, sigma), 6, true, true);
     auto [lo, hi] = std::minmax_element(values.begin(), values.end()); double low = *lo, span = *hi - low;
     if (span <= 1e-8) return p;
-    for (std::size_t i = 0; i < g.size; ++i) { double norm = (values[i] - low) / span; values[i] = (t.threshold >= 0 ? double(norm < t.threshold) : 1 - norm) * strength; if (g.coord(i, chosen)) values[i] += values[i - g.stride[chosen]]; }
+    const auto step = g.stride[chosen], extent = g.shape[chosen];
+    for (std::size_t block = 0; block < g.size; block += extent * step)
+        for (std::size_t x = 0; x < extent; ++x)
+            for (std::size_t j = 0; j < step; ++j) {
+                const auto i = block + x * step + j;
+                double norm = (values[i] - low) / span;
+                values[i] = (t.threshold >= 0 ? double(norm < t.threshold) : 1 - norm) * strength;
+                if (x) values[i] += values[i - step];
+            }
     if (smooth > .5) { std::vector<double> sigmas(d, smooth); sigmas[chosen] = 0; gaussian_blur(values, g, sigmas, 6, true, true); }
-    p.field.assign(g.size * d, 0);
+    p.field = std::vector<double>(g.size * d);
     for (std::size_t i = 0; i < g.size; ++i) p.field[i * d + chosen] = -values[i] * double(g.shape[chosen] - 1) / g.shape[chosen];
     p.border = true; return p;
 }

@@ -72,13 +72,41 @@ function-level attribution.
 Gaussian sigmas .5/1/2/4. `--input-noise-std .01` explicitly adds fixed noise
 to the real CT before timing, exercising continuous-valued filter paths.
 Inputs must be uint8 CT. Labels are derived `CT > 127.5` masks, not annotations.
-The suite covers 26 individual image, spatial and mask-corruption augmentations.
+The suite covers 24 individual image, spatial and mask-corruption augmentations.
 Data-preparation helpers, label encoding/cleanup, target generation, copy
-controls and composite pipelines are excluded. Tracing operations requiring surface
+controls and composite pipelines are excluded. RemoveComponents, ClipOutliers,
+Affine and SheetCompression are also excluded by request; their implementations
+remain available. Tracing operations requiring surface
 coordinates or supervised points and standalone probability wrappers are
 listed as exclusions in the JSON. This mode excludes reader timing and
 `inplace` calls. It measures selected parameters, not training throughput or
 an average over all possible parameter settings.
+
+To check numerical differences between two native builds on these same six
+crops, use `check_augment_build.py` through `run_native.py`. Capture reference
+outputs once, then compare the candidate. This is an untimed check; it records
+binary hashes, input hashes, changed-value counts and maximum absolute error.
+Integer outputs must match exactly. Floating-point defaults are `atol=1e-7`,
+`rtol=1e-6`; override them explicitly if needed. Neither mode imports another
+augmentation implementation.
+
+```bash
+export AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+export PYTHONPATH=vc_reader/src:vc_reader/.venv/lib/python3.14/site-packages
+vc_reader/.venv/bin/python -S vc_reader/benchmarks/run_native.py \
+  /tmp/vc-augment-perf/_augment.cpython-314-x86_64-linux-gnu.so \
+  vc_reader/benchmarks/check_augment_build.py /tmp/vc-elastic-reference --capture
+vc_reader/.venv/bin/python -S vc_reader/benchmarks/run_native.py \
+  /tmp/vc-augment-elastic/_augment.cpython-314-x86_64-linux-gnu.so \
+  vc_reader/benchmarks/check_augment_build.py /tmp/vc-elastic-reference \
+  --output vc_reader/benchmarks/results/elastic-pass-equivalence.json
+```
+
+Defaults are Elastic, 128³, and seeds 123/124/125. `--only`, `--shape`,
+`--seeds`, and `--array` must match between capture and comparison. Use a new
+reference directory for a different workload. Capture refuses to overwrite an
+existing manifest. Tests exercise capture/comparison with a tiny local Zarr and
+verify that image and label mismatches fail the check.
 
 ## Augmentation comparison: `bench_augment.py`
 
