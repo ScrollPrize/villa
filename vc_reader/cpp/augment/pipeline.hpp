@@ -13,7 +13,7 @@ using Op = std::variant<
     SliceIllumination, Smear, Flip, Rotate90, Transpose, CropPad, Affine, Elastic,
     SheetCompression, LowResolution, ThickSlice, Morphology, RandomBinaryOperator,
     RemoveComponents, ReplaceLabel, Regions, OneHot, MaskImage, DeepSupervision,
-    ToPseudo2D, FromPseudo2D, MedialSurface, StripGeometry, SurfacePerturb, std::shared_ptr<OneOf>, Normalize>;
+    ToPseudo2D, FromPseudo2D, MedialSurface, StripGeometry, SurfacePerturb, std::shared_ptr<OneOf>, Normalize, OrientedBlur>;
 using Executor = void (*)(const Op&, Sample&, const Parameters&, void*);
 #ifdef VC_READER_CUDA
 namespace cuda {

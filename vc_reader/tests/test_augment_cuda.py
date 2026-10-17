@@ -306,3 +306,126 @@ def test_resident_sparse_vectors_reject_nonlinear():
     pipeline = A.Pipeline([A.Elastic(2, 1)], targets=targets, backend="cuda")
     with pytest.raises(ValueError, match="locations"):
         pipeline(dict(image=asarray(image), directions=asarray(np.ones((2, 3)))), seed=0)
+
+
+def _blobs(rng, shape, labels=3):
+    from itertools import product
+    volume = np.zeros(shape, np.int16)
+    grid = np.indices(shape)
+    for label in range(1, labels + 1):
+        center = [rng.uniform(0, n) for n in shape]
+        radius = rng.uniform(2, max(shape) / 2)
+        inside = sum((g - c) ** 2 for g, c in zip(grid, center)) <= radius ** 2
+        volume[inside] = label
+    volume[tuple(slice(0, 2) for _ in shape)] = -1
+    return volume
+
+
+@gpu
+@pytest.mark.parametrize("shape", [(9, 23, 31), (40, 37)])
+@pytest.mark.parametrize("options", [dict(), dict(tube=False), dict(open=True, close=False), dict(ignore={"mask": -1})])
+def test_medial_surface_matches_cpu(shape, options):
+    from vc_reader.cuda import asarray
+    rng = np.random.default_rng(len(shape))
+    mask = _blobs(rng, shape)[None]
+    sample = dict(image=rng.normal(size=mask.shape).astype(np.float32), mask=mask)
+    op = A.MedialSurface(**options)
+    host = verify([op], sample)
+    assert host["mask_skel"].any()
+    device = A.Pipeline([op], backend="cuda")({k: asarray(v) for k, v in sample.items()}, seed=0)
+    compare({k: v.numpy() for k, v in device.items()}, host)
+
+
+def _torch_oriented_blur(volume, axis, along, across):
+    """vesuvius fiber_trace_3d._anisotropic_blur_3d, verbatim semantics."""
+    torch = pytest.importorskip("torch")
+    import math
+    import torch.nn.functional as F
+
+    def kernel1d(sigma):
+        radius = max(1, int(math.ceil(3.0 * sigma)))
+        coords = torch.arange(-radius, radius + 1, dtype=torch.float64)
+        k = torch.exp(-0.5 * (coords / sigma) ** 2)
+        return k / k.sum().clamp_min(1.0e-12)
+
+    def blur1d(vol, u, sigma):
+        if sigma <= 0:
+            return vol
+        k = kernel1d(sigma); radius = (k.numel() - 1) // 2
+        d, h, w = vol.shape
+        base = torch.stack(torch.meshgrid(*(torch.arange(n, dtype=torch.float64) for n in (d, h, w)), indexing="ij"), -1)
+        u = u / torch.linalg.vector_norm(u).clamp_min(1e-12)
+        acc = torch.zeros_like(vol)
+        for offset, weight in zip(range(-radius, radius + 1), k):
+            q = base + float(offset) * u.view(1, 1, 1, 3)
+            grid = torch.stack([q[..., 2] * (2.0 / max(w - 1, 1)) - 1.0, q[..., 1] * (2.0 / max(h - 1, 1)) - 1.0,
+                                q[..., 0] * (2.0 / max(d - 1, 1)) - 1.0], -1).unsqueeze(0)
+            acc = acc + F.grid_sample(vol.view(1, 1, d, h, w), grid, mode="bilinear", padding_mode="border", align_corners=True)[0, 0] * weight
+        return acc
+
+    axis = torch.as_tensor(axis, dtype=torch.float64); axis = axis / torch.linalg.vector_norm(axis).clamp_min(1e-12)
+    ref = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float64)
+    if abs(float(axis @ ref)) > 0.9:
+        ref = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float64)
+    a = torch.linalg.cross(axis, ref); a = a / torch.linalg.vector_norm(a)
+    b = torch.linalg.cross(axis, a); b = b / torch.linalg.vector_norm(b)
+    out = torch.as_tensor(volume, dtype=torch.float64)
+    for u, s in ((axis, along), (a, across), (b, across)):
+        out = blur1d(out, u, s)
+    return out.numpy()
+
+
+@pytest.mark.parametrize("backend", ["cpu", pytest.param("cuda", marks=gpu)])
+@pytest.mark.parametrize("axis", [(1., 0., 0.), (.2, .7, -.4), (0., .05, 1.)])
+def test_oriented_blur_matches_vesuvius_reference(backend, axis):
+    image = np.random.default_rng(3).normal(size=(1, 9, 11, 13)).astype(np.float32)
+    op = A.OrientedBlur(sigma_along=1.7, sigma_across=.6, axis=axis)
+    out = A.Pipeline([op], backend=backend)(dict(image=image), seed=0)["image"]
+    expected = _torch_oriented_blur(image[0].astype(np.float64), axis, 1.7, .6)
+    np.testing.assert_allclose(out[0], expected, rtol=1e-5, atol=1e-5)
+
+
+@gpu
+def test_oriented_blur_random_axis_and_target_axis_parity():
+    from vc_reader.cuda import asarray
+    rng = np.random.default_rng(5)
+    image = rng.normal(size=(2, 8, 9, 10)).astype(np.float32)
+    verify([A.OrientedBlur(p_channel=.7)], dict(image=image), seed=11)
+    targets = dict(image=A.Image(), fiber=A.Vectors(components="xyz"))
+    sample = dict(image=image, fiber=np.array([[.3, -.2, .9]]))
+    ops = [A.Flip(axes="zx", p_axis=1), A.OrientedBlur(1.2, .5, axis="fiber")]
+    host = verify(ops, sample, targets)
+    device = A.Pipeline(ops, targets=targets, backend="cuda")({k: asarray(v) for k, v in sample.items()}, seed=123)
+    compare({k: v.numpy() for k, v in device.items()}, host)
+    # The axis follows the flipped vector: equal to a fixed blur with that axis after the flip.
+    flipped = A.Pipeline(ops[:1], targets=targets)(sample, seed=123)
+    z, y, x = flipped["fiber"][0][::-1]
+    fixed = A.Pipeline([A.OrientedBlur(1.2, .5, axis=(z, y, x))])(dict(image=flipped["image"]), seed=0)["image"]
+    np.testing.assert_allclose(host["image"], fixed, rtol=1e-6, atol=1e-6)
+
+
+def test_oriented_blur_validation():
+    with pytest.raises(ValueError, match="axis"):
+        A.OrientedBlur(axis=(0, 0, 0))
+    with pytest.raises(ValueError, match="3D"):
+        A.Pipeline([A.OrientedBlur()])(dict(image=np.zeros((1, 4, 5), np.float32)), seed=0)
+
+
+@pytest.mark.parametrize("backend", ["cpu", pytest.param("cuda", marks=gpu)])
+def test_gaussian_blur_nearest_boundary(backend):
+    image = np.random.default_rng(8).normal(size=(1, 6, 7, 8))
+    sigma, truncate = .9, 6.
+    out = A.Pipeline([A.GaussianBlur(sigma, truncate=truncate, boundary="nearest")], backend=backend)(dict(image=image), seed=0)["image"]
+    # Full-width truncation as documented; edge samples replicate.
+    extent = sigma * truncate + .5; size = int(np.round(extent))
+    if size % 2 == 0:
+        size += 1 if extent - size >= 0 else -1
+    radius = max(0, (size - 1) // 2)
+    taps = np.exp(-.5 * (np.arange(-radius, radius + 1) / sigma) ** 2); taps /= taps.sum()
+    expected = image[0]
+    for axis in range(3):
+        padded = np.pad(expected, [(radius, radius) if a == axis else (0, 0) for a in range(3)], mode="edge")
+        expected = sum(w * np.take(padded, np.arange(k, k + expected.shape[axis]), axis=axis) for k, w in enumerate(taps))
+    np.testing.assert_allclose(out[0], expected, rtol=1e-12, atol=1e-12)
+    with pytest.raises(ValueError, match="boundary"):
+        A.GaussianBlur(boundary="wrap")

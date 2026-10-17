@@ -53,7 +53,9 @@ if(VC_READER_ENABLE_CUDA)
         cpp/augment/cuda/local_smoothing.cu
         cpp/augment/cuda/low_resolution.cu
         cpp/augment/cuda/median_filter.cu
+        cpp/augment/cuda/medial_surface.cu
         cpp/augment/cuda/normalization.cu
+        cpp/augment/cuda/oriented_blur.cu
         cpp/augment/cuda/random_binary_operator.cu
         cpp/augment/cuda/resident.cu
         cpp/augment/cuda/rician_noise.cu

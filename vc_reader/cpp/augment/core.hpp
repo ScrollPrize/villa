@@ -18,6 +18,13 @@
 #include <variant>
 #include <vector>
 
+// Helpers shared by CPU and CUDA implementations.
+#ifdef __CUDACC__
+#define VCR_HD __host__ __device__
+#else
+#define VCR_HD
+#endif
+
 namespace vcr::augment {
 inline void require(bool ok, const char* message) {
     if (!ok) throw std::invalid_argument(message);
@@ -316,6 +323,9 @@ inline double round_even(double v) {
     double lo = std::floor(v), fraction = v - lo;
     return lo + (fraction > .5 || (fraction == .5 && std::fmod(lo, 2.) != 0));
 }
+// Convolution boundaries: reflect repeats the edge sample (SciPy "reflect"),
+// mirror does not (Torch "reflect"), nearest replicates it (SciPy "nearest").
+enum class Boundary { Reflect, Mirror, Nearest };
 inline std::size_t mirror(std::int64_t i, std::size_t n) {
     if (n == 1) return 0;
     auto p = std::int64_t(2 * (n - 1)); i = (i % p + p) % p;
@@ -362,7 +372,7 @@ inline std::vector<T> gaussian_kernel(double sigma, double truncate, bool full_w
     return kernel;
 }
 template<class T>
-inline void gaussian_blur(std::vector<T>& data, const Grid& g, const std::vector<double>& sigmas, double truncate = 4, bool mirror_boundary = false, bool full_width = false) {
+inline void gaussian_blur(std::vector<T>& data, const Grid& g, const std::vector<double>& sigmas, double truncate = 4, Boundary edge = Boundary::Reflect, bool full_width = false) {
     require(sigmas.size() == g.shape.size() && truncate > 0 && std::isfinite(truncate), "invalid Gaussian parameters");
     std::vector<T> tmp(g.size);
     for (std::size_t a = 0; a < sigmas.size(); ++a) {
@@ -371,7 +381,10 @@ inline void gaussian_blur(std::vector<T>& data, const Grid& g, const std::vector
         const auto kernel = gaussian_kernel<T>(sigma, truncate, full_width);
         const auto radius = int(kernel.size() / 2);
         const auto extent = g.shape[a], step = g.stride[a], block = extent * step;
-        auto boundary = [&](std::int64_t x) { return mirror_boundary ? mirror(x, extent) : reflect(x, extent); };
+        auto boundary = [&](std::int64_t x) {
+            if (edge == Boundary::Nearest) return std::size_t(std::clamp<std::int64_t>(x, 0, std::int64_t(extent) - 1));
+            return edge == Boundary::Mirror ? mirror(x, extent) : reflect(x, extent);
+        };
         if (step == 1) {
             // Extend each contiguous row once; even wide kernels and singleton
             // dimensions then use the same branch-free convolution loop.

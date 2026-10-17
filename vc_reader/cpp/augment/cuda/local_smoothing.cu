@@ -8,7 +8,7 @@ void apply_cuda(const LocalSmoothing& t, Sample& s, const Parameters& p, Session
         using V = typename decltype(v)::value_type;
         Buffer<V> smooth(v.size); View<V> smoothed{smooth.ptr,v.size}; copy_device(smoothed,v);
         auto field = field_buffer(c.field,c.device_field);
-        blur(smoothed,g,std::vector<double>(g.shape.size(),c.values[1]),4,false,false);
+        blur(smoothed,g,std::vector<double>(g.shape.size(),c.values[1]),4,Boundary::Reflect,false);
         blend<<<blocks(g.size),256>>>(v.ptr,smooth.ptr,field->ptr,g.size,c.values[0]);
         check(cudaGetLastError());
     });

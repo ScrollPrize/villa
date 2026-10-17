@@ -11,7 +11,7 @@ template<class T> __global__ void median3_kernel(const T* src, T* dst, Layout g)
             for (int dy = 0; dy < 3; ++dy) {
                 #pragma unroll
                 for (int dx = 0; dx < 3; ++dx)
-                    v[(dz*3+dy)*3+dx] = src[boundary(static_cast<long long>(z)+dz-1,g.shape[0],false)*g.stride[0] + boundary(static_cast<long long>(y)+dy-1,g.shape[1],false)*g.stride[1] + boundary(static_cast<long long>(x)+dx-1,g.shape[2],false)];
+                    v[(dz*3+dy)*3+dx] = src[boundary(static_cast<long long>(z)+dz-1,g.shape[0],Boundary::Reflect)*g.stride[0] + boundary(static_cast<long long>(y)+dy-1,g.shape[1],Boundary::Reflect)*g.stride[1] + boundary(static_cast<long long>(x)+dx-1,g.shape[2],Boundary::Reflect)];
             }
         }
         select27(v); dst[i] = v[median_detail::network.output];
@@ -43,7 +43,7 @@ template<class T> __global__ void median_general(const T* src, T* dst, Layout g,
         while (low < high) {
             auto mid = low + (high-low)/2; int count = 0;
             for (int dz = 0; dz < kz; ++dz) for (int dy = 0; dy < k; ++dy) for (int dx = 0; dx < k; ++dx) {
-                auto at = (boundary(static_cast<long long>(z)+dz-kz/2,nz,false)*ny + boundary(static_cast<long long>(y)+dy-k/2,ny,false))*nx + boundary(static_cast<long long>(x)+dx-k/2,nx,false);
+                auto at = (boundary(static_cast<long long>(z)+dz-kz/2,nz,Boundary::Reflect)*ny + boundary(static_cast<long long>(y)+dy-k/2,ny,Boundary::Reflect))*nx + boundary(static_cast<long long>(x)+dx-k/2,nx,Boundary::Reflect);
                 count += ordered_key(src[at]) <= mid;
             }
             if (count > rank) high = mid; else low = mid+1;

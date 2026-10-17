@@ -90,7 +90,9 @@ template<class T> __device__ inline T from_double(double x) {
 inline unsigned blocks(std::size_t n) { return unsigned(std::min<std::size_t>((n + 255) / 256, 65535)); }
 #define EACH_INDEX(n) for (std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < (n); i += std::size_t(blockDim.x) * gridDim.x)
 __device__ inline double clamp_value(double x, double low, double high) { return x < low ? low : x > high ? high : x; }
-__device__ inline std::size_t boundary(long long x, std::size_t n, bool mirror) {
+__device__ inline std::size_t boundary(long long x, std::size_t n, Boundary edge) {
+    if (edge == Boundary::Nearest) return x < 0 ? 0 : x >= static_cast<long long>(n) ? n - 1 : std::size_t(x);
+    const bool mirror = edge == Boundary::Mirror;
     if (n == 1) return 0;
     const auto period = static_cast<long long>(mirror ? 2 * (n - 1) : 2 * n);
     x = (x % period + period) % period;

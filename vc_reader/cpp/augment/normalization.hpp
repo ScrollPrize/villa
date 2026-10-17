@@ -1,12 +1,6 @@
 #pragma once
 #include "core.hpp"
 
-#ifdef __CUDACC__
-#define VCR_NORMALIZE_HD __host__ __device__
-#else
-#define VCR_NORMALIZE_HD
-#endif
-
 namespace vcr::augment {
 enum class Normalization { MinMax, ZScore, Robust, Percentile, Fixed };
 // Statistics use the selected voxels of each channel: those inside the image's
@@ -30,15 +24,15 @@ inline ChannelPlan channel_parameters(const Normalize&, const Array&, Random&) {
 namespace normalization_detail {
 // NumPy's default ("linear") percentile, including its virtual-index and
 // interpolation formulas, evaluated in float64 on sorted selected values.
-VCR_NORMALIZE_HD inline double percentile_index(std::size_t n, double percent) {
+VCR_HD inline double percentile_index(std::size_t n, double percent) {
     const double q = percent / 100;
     return double(n) * q + (1 + q * -1.) - 1;
 }
-VCR_NORMALIZE_HD inline double lerp(double a, double b, double t) {
+VCR_HD inline double lerp(double a, double b, double t) {
     const double d = b - a;
     return t >= .5 ? b - d * (1 - t) : a + d * t;
 }
-template<class Get> VCR_NORMALIZE_HD double sorted_percentile(Get&& get, std::size_t n, double percent) {
+template<class Get> VCR_HD double sorted_percentile(Get&& get, std::size_t n, double percent) {
     const double v = percentile_index(n, percent);
     if (v >= double(n - 1)) return get(n - 1);
     if (v < 0) return get(0);
@@ -47,7 +41,7 @@ template<class Get> VCR_NORMALIZE_HD double sorted_percentile(Get&& get, std::si
     return lerp(get(j), get(j + 1), v - below);
 }
 // The robust scale: 1.4826 MAD, else the first usable fallback.
-VCR_NORMALIZE_HD inline double robust_scale(double mad, double deviation, double span) {
+VCR_HD inline double robust_scale(double mad, double deviation, double span) {
     double scale = 1.4826 * mad;
     if (std::isfinite(scale) && scale >= 1e-6) return scale;
     if (std::isfinite(deviation) && std::fabs(deviation) >= 1e-6) return std::fabs(deviation);
@@ -55,16 +49,16 @@ VCR_NORMALIZE_HD inline double robust_scale(double mad, double deviation, double
     return 1;
 }
 // (x-lower)/span, or (x-median)/(span/2); zero span gives zeros or scale one.
-VCR_NORMALIZE_HD inline double percentile_scale(double low, double high, bool median) {
+VCR_HD inline double percentile_scale(double low, double high, bool median) {
     const double scale = median ? .5 * (high - low) : high - low;
     if (std::isfinite(scale) && scale >= 1e-6) return scale;
     return median ? 1 : 0;
 }
-template<class T> VCR_NORMALIZE_HD T clamp_to(T x, double low, double high) {
+template<class T> VCR_HD T clamp_to(T x, double low, double high) {
     const T lo = T(low), hi = T(high);
     return x < lo ? lo : x > hi ? hi : x;
 }
-template<class T> VCR_NORMALIZE_HD T finite_or_zero(double x) {
+template<class T> VCR_HD T finite_or_zero(double x) {
     const T value = T(x);
     return std::isfinite(value) ? value : T(0);
 }

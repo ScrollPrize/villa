@@ -404,7 +404,7 @@ inline Parameters sample(const SheetCompression& t, const Sample& s, Random& r) 
     auto chosen = std::size_t(axis(allowed[r.index(allowed.size())], d));
     double strength = draw(t.strength, r), sigma = draw(t.intensity_sigma, r), smooth = draw(t.smoothing, r);
     require(strength >= 0 && strength < 1, "compression strength must be in [0, 1)");
-    auto values = s.at(t.image).array.channel(0); if (sigma > .5) gaussian_blur(values, g, std::vector<double>(d, sigma), 6, true, true);
+    auto values = s.at(t.image).array.channel(0); if (sigma > .5) gaussian_blur(values, g, std::vector<double>(d, sigma), 6, Boundary::Mirror, true);
     auto [lo, hi] = std::minmax_element(values.begin(), values.end()); double low = *lo, span = *hi - low;
     if (span <= 1e-8) return p;
     const auto step = g.stride[chosen], extent = g.shape[chosen];
@@ -416,7 +416,7 @@ inline Parameters sample(const SheetCompression& t, const Sample& s, Random& r) 
                 values[i] = (t.threshold >= 0 ? double(norm < t.threshold) : 1 - norm) * strength;
                 if (x) values[i] += values[i - step];
             }
-    if (smooth > .5) { std::vector<double> sigmas(d, smooth); sigmas[chosen] = 0; gaussian_blur(values, g, sigmas, 6, true, true); }
+    if (smooth > .5) { std::vector<double> sigmas(d, smooth); sigmas[chosen] = 0; gaussian_blur(values, g, sigmas, 6, Boundary::Mirror, true); }
     p.field = std::vector<double>(g.size * d);
     for (std::size_t i = 0; i < g.size; ++i) p.field[i * d + chosen] = -values[i] * double(g.shape[chosen] - 1) / g.shape[chosen];
     p.border = true; return p;

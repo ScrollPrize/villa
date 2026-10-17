@@ -55,7 +55,7 @@ _constructors = (
     "LocalGamma LocalSmoothing BlankRectangle SliceIllumination Smear Flip Rotate90 "
     "Transpose CropPad Affine Elastic SheetCompression LowResolution ThickSlice "
     "Morphology RandomBinaryOperator RemoveComponents ReplaceLabel Regions OneHot "
-    "MaskImage DeepSupervision ToPseudo2D FromPseudo2D MedialSurface StripGeometry SurfacePerturb"
+    "MaskImage DeepSupervision ToPseudo2D FromPseudo2D MedialSurface StripGeometry SurfacePerturb OrientedBlur"
 ).split()
 globals().update({name: _factory(getattr(_native, name)) for name in _constructors})
 seed = _native.seed

@@ -195,7 +195,19 @@ NB_MODULE(_augment, m) {
     bind<ClipOutliers>(m, "ClipOutliers", [](auto& t, auto& a) { t.lower = parameter(a, "lower", t.lower); t.upper = parameter(a, "upper", t.upper); t.p_retain_std = a.get("p_retain_std", 1.); probability(t.p_retain_std); });
     bind<GaussianBlur>(m, "GaussianBlur", [](auto& t, auto& a) {
         t.sigma = parameter(a, "sigma", t.sigma); t.shared_axes = a.get("shared_axes", true); t.truncate = a.get("truncate", 6.);
-        auto boundary = a.get("boundary", std::string("mirror")); require(boundary == "mirror" || boundary == "reflect", "boundary must be mirror or reflect"); t.mirror_boundary = boundary == "mirror";
+        auto boundary = a.get("boundary", std::string("mirror"));
+        require(boundary == "mirror" || boundary == "reflect" || boundary == "nearest", "boundary must be mirror, reflect or nearest");
+        t.boundary = boundary == "mirror" ? Boundary::Mirror : boundary == "nearest" ? Boundary::Nearest : Boundary::Reflect;
+    });
+    bind<OrientedBlur>(m, "OrientedBlur", [](auto& t, auto& a) {
+        t.sigma_along = parameter(a, "sigma_along", t.sigma_along); t.sigma_across = parameter(a, "sigma_across", t.sigma_across);
+        auto axis = a.take("axis", nb::none());
+        if (nb::isinstance<nb::str>(axis)) t.axis_from = nb::cast<std::string>(axis);
+        else if (!axis.is_none()) {
+            t.axis = nb::cast<std::vector<double>>(axis);
+            require(t.axis.size() == 3 && std::all_of(t.axis.begin(), t.axis.end(), [](double v) { return std::isfinite(v); }) &&
+                    std::any_of(t.axis.begin(), t.axis.end(), [](double v) { return v != 0; }), "axis must be a finite nonzero (z, y, x) vector");
+        }
     });
     bind<MedianFilter>(m, "MedianFilter", [](auto& t, auto& a) { t.size = parameter(a, "size", t.size); t.quantize = a.kw("quantize", false); });
     bind<Sharpen>(m, "Sharpen", [](auto& t, auto& a) { t.strength = parameter(a, "strength", t.strength); t.p_clamp = a.get("p_clamp", .5); probability(t.p_clamp); });

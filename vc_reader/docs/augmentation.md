@@ -337,6 +337,7 @@ See the [CPU measurements and validation](../benchmarks/elastic_production_resul
 | Normalization | `Normalize` (`minmax`, zero-preserving population `zscore`) |
 | Brightness, contrast, gamma, inversion, random clipping | `BrightnessMultiply`, `BrightnessAdd`, `Contrast`, `Gamma`, `Invert`, `ClipOutliers` |
 | Gaussian/Rician noise, blur, median, sharpening | `GaussianNoise`, `RicianNoise`, `GaussianBlur`, `MedianFilter`, `Sharpen` |
+| Oriented anisotropic blur (fiber_trace_3d) | `OrientedBlur` |
 | Local brightness, contrast, gamma, smoothing | `BrightnessGradient`, `LocalContrast`, `LocalGamma`, `LocalSmoothing` |
 | Blanking, illumination, smear | `BlankRectangle`, `SliceIllumination`, `Smear` |
 | Mirroring, rotation, transpose, cropping | `Flip`, `Rotate90`, `Transpose`, `CropPad` |
@@ -360,7 +361,14 @@ precision follows the rules above. Specific conventions:
   width near `truncate * sigma`: radius is `floor((truncate*sigma + .5)/2)`.
   Here truncate describes the **full width**, following the existing blur, not
   SciPy's radius. `mirror` excludes the repeated edge pixel (Torch's reflect
-  padding); `reflect` includes it. Small arrays support repeated reflection.
+  padding); `reflect` includes it; `nearest` replicates it (SciPy
+  `mode="nearest"`). Small arrays support repeated reflection.
+- `OrientedBlur(sigma_along, sigma_across, axis=...)` is the fiber_trace_3d
+  anisotropic blur: three 1D Gaussian passes (radius `max(1, ceil(3*sigma))`)
+  along the axis and two perpendicular directions, each summing trilinear,
+  border-clamped samples. `axis` is a fixed `(z, y, x)` vector, the name of a
+  `Vectors` target whose first row is used (so earlier Flip/Rotate90/Transpose
+  rotate it with the crop), or `None` for a uniformly random direction. 3D only.
 - `MedianFilter` encodes channels with at most 256 distinct values, including
   normalized uint8 CT, using an exact palette. 3×3×3 filters select ranks with
   a generated odd-even merge selection network, processing 64 byte codes or
@@ -388,6 +396,9 @@ precision follows the rules above. Specific conventions:
 - `MedialSurface` uses native Zhang–Suen thinning per YX slice with optional
   morphology. Exact equivalence to every scikit-image version has not been
   established; review these targets before changing an existing experiment.
+  CUDA thins each slice in one thread block with the same simultaneous-deletion
+  subpasses and matches the CPU output exactly (192³ labels: 1.9 ms versus
+  459 ms on one CPU core).
 
 ## Build and validation
 
@@ -432,7 +443,8 @@ BrightnessMultiply, BrightnessAdd, Contrast, Gamma, Invert, GaussianNoise,
 RicianNoise, GaussianBlur, MedianFilter, Sharpen, BrightnessGradient,
 LocalContrast, LocalGamma, LocalSmoothing, BlankRectangle, SliceIllumination,
 Smear, Flip, Rotate90, Transpose, Elastic, LowResolution, ThickSlice, and
-RandomBinaryOperator. `Normalize` also supports both backends. Each has its own `.cu` file under `cpp/augment/cuda/`.
+RandomBinaryOperator. `Normalize`, `MedialSurface` and `OrientedBlur` also
+support both backends. Each has its own `.cu` file under `cpp/augment/cuda/`.
 Small shared files provide interpolation, convolution, noise generation,
 channel adaptation, and device-buffer ownership. `OneOf` can compose these
 transforms. Other transforms remain available on CPU; selecting an unsupported
