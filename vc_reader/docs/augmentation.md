@@ -167,6 +167,41 @@ dataset, disable its augmentation and use
 
 ## Transform coverage and migration
 
+### Elastic deformation
+
+`Elastic` now uses a mean-centered cubic B-spline displacement field on CPU.
+The dense Gaussian implementation has been removed from the production transform.
+It supports 2D and 3D crops, including non-cubic shapes, using the same field for
+images, labels, points, and normals. Image resampling remains linear; cubic
+B-splines describe the displacement field, not the image interpolation.
+
+The constructor keeps its argument names, with these new meanings:
+
+- `sigma`: half the control-knot spacing in voxels; spacing is `max(1, 2*sigma)`.
+  Larger values give broader, smoother bends. The default range remains `(5, 10)`.
+- `magnitude`: requested RMS **vector** displacement in voxels after removing
+  global translation. The default range remains `(1, 5)`. Zero gives identity.
+- Each range is sampled once per transform. A conservative displacement-gradient
+  bound of 0.8 reduces strength when necessary to keep the mapping injective
+  inside the crop. Requested strength is consequently an upper bound.
+- `border` and `p` retain their existing meanings.
+
+For the strongest B-spline setting shown in the Paris 4 animated comparison:
+
+```python
+A.Elastic(sigma=32, magnitude=8)
+```
+
+This intentionally changes the distribution and seeded outputs of existing
+Elastic configurations: the old magnitude was a per-component maximum scale,
+not RMS vector displacement. Review strength settings when resuming training.
+Previously saved replay plans contain their actual displacement fields and
+continue to replay without regenerating a field.
+
+See the [CPU measurements and validation](../benchmarks/elastic_production_results.md).
+
+### Coverage
+
 | Existing transforms | Native API |
 | --- | --- |
 | Compose, Random, OneOf, timing wrappers | `Pipeline`, `p=`, `OneOf`, `profile=True` |

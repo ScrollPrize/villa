@@ -1,0 +1,15 @@
+cmake_minimum_required(VERSION 3.20)
+project(vc_elastic_lab LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+find_package(Python 3.10 COMPONENTS Interpreter Development.Module REQUIRED)
+execute_process(COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
+    OUTPUT_VARIABLE nanobind_ROOT OUTPUT_STRIP_TRAILING_WHITESPACE)
+find_package(nanobind CONFIG REQUIRED)
+find_package(OpenCV REQUIRED COMPONENTS core)
+nanobind_add_module(_elastic_lab NB_STATIC NOMINSIZE lab.cpp)
+target_include_directories(_elastic_lab PRIVATE ../../cpp/augment ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(_elastic_lab PRIVATE ${OpenCV_LIBS})
+add_executable(profile_elastic profile.cpp)
+target_include_directories(profile_elastic PRIVATE ../../cpp/augment)
+# This is an opt-in experiment. No target is installed with vc_reader.

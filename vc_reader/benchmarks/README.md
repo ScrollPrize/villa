@@ -34,6 +34,11 @@ The [median and Gaussian follow-up](filter_results.md) measures the later filter
 optimizations, including wider kernels and continuous-valued inputs.
 The [broader optimization follow-up](optimization_results.md) covers spatial
 resampling, local intensity transforms, morphology, noise and label encoding.
+The [elastic experiment](elastic/README.md) compares dense Gaussian, coarse
+Gaussian, cubic B-spline, and tensor-guided fields on three Paris 4 regions,
+with [parameter comparison images](../elastic_comparison/README.md).
+The [production B-spline follow-up](elastic_production_results.md) documents
+the replacement of Gaussian Elastic, CPU optimizations, and current timings.
 
 Compare the native public API with the actual Python transforms in the Vesuvius
 source tree on a real cached CT crop. Requires Torch, SciPy, scikit-image,

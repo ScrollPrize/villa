@@ -1,5 +1,6 @@
 #pragma once
 #include "intensity.hpp"
+#include "elastic.hpp"
 
 namespace vcr::augment {
 using Matrix = std::vector<double>;
@@ -160,13 +161,14 @@ template<std::size_t D> Array resample_impl(const Array& src, const Parameters& 
         using T = std::remove_cv_t<std::remove_pointer_t<decltype(source)>>;
         auto* destination = static_cast<T*>(out.data());
         const auto nz = d == 3 ? p.shape[0] : 1, ny = p.shape[d - 2], nx = p.shape.back();
+        const bool displaced_identity=!p.field.empty() && p.matrix==identity(d);
         for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y)
             for (std::size_t x = 0; x < nx; ++x) {
             const auto i = (z * ny + y) * nx + x;
             Point pos{};
             if constexpr (d == 3) pos[0] = double(z);
             pos[d - 2] = double(y); pos[d - 1] = double(x);
-            auto q = matvec(p.matrix, pos, d);
+            auto q = displaced_identity ? pos : matvec(p.matrix, pos, d);
             for (std::size_t a = 0; a < d; ++a) {
                 q[a] += p.offset[a];
                 // The displacement is already sampled on this output grid.
@@ -316,13 +318,15 @@ inline Parameters sample(const Affine& t, const Sample& s, Random& r) {
     p.border = t.border; return p;
 }
 inline Parameters sample(const Elastic& t, const Sample& s, Random& r) {
-    auto p = geometry(sample_shape(s)); Grid g(p.shape); auto d = p.shape.size(); p.field.resize(g.size * d);
-    for (std::size_t a = 0; a < d; ++a) {
-        double sigma = draw(t.sigma, r), magnitude = draw(t.magnitude, r); require(magnitude >= 0, "elastic magnitude must be nonnegative");
-        std::vector<double> noise(g.size); for (auto& v : noise) v = r.normal(); gaussian_blur(noise, g, std::vector<double>(d, sigma), 6, true, true);
-        double maxabs = 0; for (auto v : noise) maxabs = std::max(maxabs, std::abs(v));
-        double m = mean(noise); for (std::size_t i = 0; i < g.size; ++i) p.field[i * d + a] = maxabs ? (noise[i] - m) * magnitude / maxabs : 0;
-    }
+    auto p = geometry(sample_shape(s));
+    const double sigma=draw(t.sigma,r), magnitude=draw(t.magnitude,r);
+    require(sigma>=0 && sigma<=std::numeric_limits<double>::max()/2,"elastic sigma must be nonnegative and finite");
+    require(magnitude>=0,"elastic magnitude must be nonnegative");
+    // Historical argument names retained: sigma is half the knot spacing;
+    // magnitude is now RMS vector displacement, limited to prevent folds.
+    if (magnitude==0) { p.exact=true; p.border=t.border; return p; }
+    p.field=elastic_detail::bspline_field(p.shape,std::max(1.,2*sigma),r);
+    elastic_detail::normalize(p.field,p.shape,magnitude,.8);
     p.border = t.border; return p;
 }
 inline Parameters sample(const SheetCompression& t, const Sample& s, Random& r) {
