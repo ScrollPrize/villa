@@ -642,7 +642,8 @@ def _path_match_text(tifxyz_path):
     parts = list(tifxyz_path.parts[-6:])
     parts.extend(
         str(meta.get(key, ""))
-        for key in ("scroll_source", "volume", "uuid", "seed_surface_id")
+        # Not "uuid": it is an opaque random identity, not a name to match.
+        for key in ("scroll_source", "volume", "seed_surface_id")
     )
     return _normalize_match_token(" ".join(parts))
 

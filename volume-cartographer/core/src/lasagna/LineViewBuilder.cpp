@@ -768,6 +768,36 @@ cv::Vec3d pointTangent(const LineModel& line, size_t index)
 
 } // namespace
 
+LineModel lineModelForInspection(const std::vector<cv::Vec3d>& points)
+{
+    if (points.empty())
+        throw std::invalid_argument("Cannot inspect an empty line");
+    LineModel line;
+    line.points.reserve(points.size());
+    for (const auto& point : points) {
+        if (!finite(point))
+            throw std::invalid_argument("Cannot inspect a non-finite line");
+        line.points.push_back({point, {}, true});
+    }
+    const size_t anchor = points.size() / 2;
+    line.displayFrameAnchorIndex = static_cast<int>(anchor);
+    const auto tangent = pointTangent(line, anchor);
+    line.points[anchor].sampledNormal = {
+        projectToTangentPlane(axisFallbackLeastAlignedWith(tangent), tangent),
+        true, "display frame only"};
+    auto transport = [&](size_t from, size_t to) {
+        line.points[to].sampledNormal = {
+            transportNormal(line.points[from].sampledNormal.normal,
+                            pointTangent(line, from), pointTangent(line, to)),
+            true, "display frame only"};
+    };
+    for (size_t i = anchor + 1; i < points.size(); ++i)
+        transport(i - 1, i);
+    for (size_t i = anchor; i > 0; --i)
+        transport(i, i - 1);
+    return line;
+}
+
 bool LineStripPositionMap::valid() const
 {
     return originalArclengths.size() >= 2 && totalArclength > kEpsilon &&

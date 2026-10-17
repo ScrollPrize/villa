@@ -1,4 +1,6 @@
 #include "CWindow.hpp"
+#include "FiberLengthDisplay.hpp"
+#include "VolumeDisplayNames.hpp"
 #include "OpenDataCoordinateIdentity.hpp"
 #include "OpenDataLasagna.hpp"
 
@@ -138,6 +140,7 @@
 #include "CFiberWidget.hpp"
 #include "FiberAnnotationController.hpp"
 #include "overlays/FiberOverlayController.hpp"
+#include "FiberCollectionController.hpp"
 #include "LineAnnotationController.hpp"
 #include "LineAnnotationDialog.hpp"
 #include "SurfaceTreeWidget.hpp"
@@ -2536,6 +2539,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     connect(_workspaceTabs, &QTabWidget::currentChanged, this, [this]() {
         scheduleWindowStateSave();
         updateActiveWorkspaceViewerControls();
+        updateLineAnnotationLengthLabel();
         QTimer::singleShot(0, this, &CWindow::updateProjectNameLabel);
     });
     connect(_workspaceTabs, &QTabWidget::tabCloseRequested, this, [this](int index) {
@@ -2745,13 +2749,15 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             configureChunkedViewerConnections(chunkedViewer);
         }
     });
-    // Fiber annotation gets first refusal on volume clicks before the shared
-    // Ctrl+click-to-focus policy runs.
+    // Fiber annotation gets first refusal on volume clicks, then Automated
+    // Fiber Volume picking, before the shared Ctrl+click-to-focus policy runs.
     _viewerManager->setVolumeClickInterceptor(
         [this](const cv::Vec3f& volLoc, const cv::Vec3f& normal, Surface* surf,
                Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
-            return _fiberController &&
-                   _fiberController->handleVolumeClick(volLoc, normal, surf, button, modifiers);
+            return (_fiberController &&
+                    _fiberController->handleVolumeClick(volLoc, normal, surf, button, modifiers)) ||
+                   (_fiberCollection && !(_segmentationModule && _segmentationModule->editingEnabled()) &&
+                    _fiberCollection->handleVolumeClick(button, modifiers));
         });
     connect(_viewerManager.get(), &ViewerManager::surfaceActivationRequested,
             this, [this](const std::string& surfaceId) {
@@ -2761,6 +2767,18 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             });
     connect(_viewerManager.get(), &ViewerManager::sharedCacheStatsChanged,
             this, &CWindow::onSharedCacheStatsChanged);
+
+    // Left of the cache figures: the length of the fiber being annotated,
+    // while a Line Annotation tab is the active workspace.
+    _lineAnnotationLengthLabel = new QLabel(this);
+    _lineAnnotationLengthLabel->setObjectName(QStringLiteral("lineAnnotationLengthLabel"));
+    _lineAnnotationLengthLabel->setContentsMargins(8, 0, 8, 0);
+    _lineAnnotationLengthLabel->setToolTip(
+        tr("Line length of the fiber open in this Line Annotation tab. "
+           "Centimetres when the annotation frame's voxel size is known, "
+           "otherwise voxels."));
+    _lineAnnotationLengthLabel->hide();
+    statusBar()->addPermanentWidget(_lineAnnotationLengthLabel);
 
     _sharedCacheStatsLabel = new QLabel(this);
     _sharedCacheStatsLabel->setContentsMargins(8, 0, 8, 0);
@@ -2810,6 +2828,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
 
     _fiberOverlay = std::make_unique<FiberOverlayController>(this);
     _fiberOverlay->bindToViewerManager(_viewerManager.get());
+    _fiberCollection = std::make_unique<FiberCollectionController>(_state, _viewerManager.get(), this, _lineAnnotationController.get());
+    updateActiveWorkspaceViewerControls();
     if (_spiralWorkspace && _spiralWorkspace->viewerManager()) {
         _spiralWorkspace->viewerManager()->forEachBaseViewer(
             [this](VolumeViewerBase* viewer) {
@@ -3513,6 +3533,7 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
         auto* fiberMenu = menu->addMenu(tr("Fibers"));
         addDock(fiberMenu, _fiberWidget);
         addDock(fiberMenu, _fiberSliceWidget);
+        if (_fiberCollection) addDock(fiberMenu, _fiberCollection->dock());
     }
 }
 
@@ -3711,6 +3732,10 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                             _lineAnnotationController &&
                             _lineAnnotationController->canLaunchFromViewer(viewer) &&
                             viewer->sampleSceneVolume(scenePoint).has_value());
+
+                        QAction* modelLineAnnotationAction = menu.addAction(tr("New 2D line annotation (model)"));
+                        modelLineAnnotationAction->setObjectName(QStringLiteral("model2dLineAnnotationAction"));
+                        modelLineAnnotationAction->setEnabled(newLineAnnotationAction->isEnabled());
 
                         QAction* createGrowPatchAction = menu.addAction(tr("Create Segment (GrowPatch)"));
                         createGrowPatchAction->setEnabled(validVolumePoint &&
@@ -3921,6 +3946,9 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                             newLineAnnotationAction->isEnabled() &&
                             _lineAnnotationController) {
                             _lineAnnotationController->launchFromViewerAtPoint(viewer, scenePoint);
+                        } else if (selected == modelLineAnnotationAction &&
+                                   modelLineAnnotationAction->isEnabled() && _lineAnnotationController) {
+                            _lineAnnotationController->launchFromViewerAtPoint(viewer, scenePoint, true, true);
                         }
                     });
             viewer->setProperty("vc_annotation_context_bound", true);
@@ -4118,6 +4146,10 @@ ViewerManager* CWindow::activeWorkspaceViewerManager() const
 
 void CWindow::updateActiveWorkspaceViewerControls()
 {
+    if (_fiberCollection) {
+        _fiberCollection->setLineAnnotationActive(
+            _workspaceTabs && qobject_cast<LineAnnotationDialog*>(_workspaceTabs->currentWidget()));
+    }
     auto* manager = activeWorkspaceViewerManager();
     if (_viewerControlsPanel) {
         _viewerControlsPanel->setViewerManager(manager);
@@ -7939,7 +7971,7 @@ void CWindow::CreateWidgets(void)
                     fiber.name,
                     fiber.controlPointCount,
                     fiber.linePointCount,
-                    fiber.lengthVx,
+                    fiber.annotatedLengthVx,
                     alignment,
                     spans,
                     fiber.hvZDistance,
@@ -7955,6 +7987,13 @@ void CWindow::CreateWidgets(void)
                     traceState,
                 });
             }
+            _fiberLengthVxById.clear();
+            _fiberLengthVxById.reserve(fibers.size());
+            for (const auto& fiber : fibers) {
+                _fiberLengthVxById[fiber.id] = fiber.annotatedLengthVx;
+            }
+            // Unit first, so the rebuilt rows below are texted once in it.
+            updateFiberLengthUnits();
             if (_fiberWidget) {
                 _fiberWidget->setFibers(entries);
                 _fiberWidget->setKnownTags(_lineAnnotationController->knownFiberTags());
@@ -8148,6 +8187,12 @@ void CWindow::CreateWidgets(void)
         connectFiberWidget(_fiberWidget);
         connectFiberWidget(_fiberSliceWidget);
         updateFiberList(_lineAnnotationController->fiberSummaries());
+        // The annotation frame (and so the cm conversion) follows the
+        // current volume; the lengths themselves do not change.
+        connect(_state, &CState::volumeChanged, this,
+                [this](const std::shared_ptr<Volume>&, const std::string&) {
+                    updateFiberLengthUnits();
+                });
     }
     connect(_fiberController.get(), &FiberAnnotationController::crosshairModeChanged,
             this, &CWindow::onFiberCrosshairModeChanged);
@@ -8852,6 +8897,51 @@ void CWindow::onSharedCacheStatsChanged(const QStringList& items)
     updateSharedStatusLabel();
 }
 
+void CWindow::updateFiberLengthUnits()
+{
+    if (_destroyingWindow) {
+        return;
+    }
+    std::optional<double> voxelSizeUm;
+    if (_lineAnnotationController) {
+        voxelSizeUm = _lineAnnotationController->annotationFrame().voxelSizeUm;
+    }
+    if (_fiberWidget) {
+        _fiberWidget->setAnnotationVoxelSizeUm(voxelSizeUm);
+    }
+    if (_fiberSliceWidget) {
+        _fiberSliceWidget->setAnnotationVoxelSizeUm(voxelSizeUm);
+    }
+    updateLineAnnotationLengthLabel();
+}
+
+void CWindow::updateLineAnnotationLengthLabel()
+{
+    if (_destroyingWindow || !_lineAnnotationLengthLabel) {
+        return;
+    }
+    auto* dialog = _workspaceTabs
+        ? qobject_cast<LineAnnotationDialog*>(_workspaceTabs->currentWidget())
+        : nullptr;
+    const uint64_t fiberId = (dialog && _lineAnnotationController)
+        ? _lineAnnotationController->fiberIdForDialog(dialog)
+        : 0;
+    const auto it = fiberId != 0 ? _fiberLengthVxById.find(fiberId)
+                                 : _fiberLengthVxById.end();
+    if (it == _fiberLengthVxById.end()) {
+        _lineAnnotationLengthLabel->clear();
+        _lineAnnotationLengthLabel->hide();
+        return;
+    }
+    // The same frame the Fibers dock converts with, read from the controller
+    // rather than cached here so the two can never disagree.
+    const std::optional<double> voxelSizeUm =
+        _lineAnnotationController->annotationFrame().voxelSizeUm;
+    _lineAnnotationLengthLabel->setText(
+        tr("Fiber length %1").arg(vc3d::fiber_length::formatLength(it->second, voxelSizeUm)));
+    _lineAnnotationLengthLabel->show();
+}
+
 void CWindow::updateSharedStatusLabel()
 {
     if (!_sharedCacheStatsLabel)
@@ -9008,6 +9098,11 @@ bool CWindow::OpenVolume(const QString& path,
         _fileWatcher->startWatching();
     }
     return true;
+}
+
+void CWindow::openFiberCollection(const QString& path)
+{
+    _fiberCollection->openCollection(path);
 }
 
 bool CWindow::openVolumePackage(const QString& path,
@@ -9386,13 +9481,14 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
     QString bestGrowthVolumeId;
     bool preferredVolumeFound = false;
     const bool hasOpenDataSegments = packageHasOpenDataSegments(*_state->vpkg());
-    const auto volumeIds = _state->vpkg()->volumeIDs();
+    const auto volumeIds = vc3d::orderedDisplayVolumeIds(*_state->vpkg());
     for (const auto& id : volumeIds) {
         try {
             auto vol = _state->vpkg()->volume(id);
             const QString idStr = QString::fromStdString(id);
             const QString nameStr = QString::fromStdString(vol->name());
-            const QString label = nameStr.isEmpty() ? idStr : QStringLiteral("%1 (%2)").arg(nameStr, idStr);
+            const QString label = vc3d::volumeDisplayLabel(*_state->vpkg(), id,
+                nameStr.isEmpty() ? idStr : QStringLiteral("%1 (%2)").arg(nameStr, idStr));
 
             orderedIds.push_back(idStr);
             volumeEntries.append({idStr, label});

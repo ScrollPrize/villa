@@ -1,8 +1,9 @@
 # Status
 
-- [x] Inspect menus and reset/save path
-- [x] Plan and local review
-- [x] Implement both scopes with shared controller logic
-- [x] Update docs and regression coverage
-- [x] Build VC3D and run focused tests
-- [ ] Live GUI validation
+- [x] Inspect existing paths and write plan.
+- [x] Independent review.
+- [x] Filters and fresh creation.
+- [x] Dialog and opening.
+- [x] Documentation and regression tests.
+- [x] Final rebuild/test after review fixes.
+- [ ] Live GUI validation (manual).

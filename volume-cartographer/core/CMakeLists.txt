@@ -1,5 +1,18 @@
 configure_file(src/Version.cpp.in Version.cpp)
 
+# Independent read-only collection reader: usable by the GUI and small tools
+# without linking the CT/tracing stack. R*Tree support is verified on open.
+find_package(SQLite3 REQUIRED)
+add_library(vc_fiber_collection STATIC src/FiberCollection.cpp)
+target_include_directories(vc_fiber_collection PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+if(TARGET SQLite3::SQLite3)
+    target_link_libraries(vc_fiber_collection PUBLIC SQLite3::SQLite3)
+else()
+    target_link_libraries(vc_fiber_collection PUBLIC SQLite::SQLite3)
+endif()
+target_compile_features(vc_fiber_collection PUBLIC cxx_std_20)
+set_target_properties(vc_fiber_collection PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_library(vc_core
         src/GridStore.cpp
         src/NormalGridVolume.cpp
@@ -71,11 +84,12 @@ target_link_libraries(vc_core
         CURL::libcurl
 )
 
-# utils header-only library + vendored c3d codec.
+# utils header-only library + vendored c3d and volcomp codecs.
 target_link_libraries(vc_core PUBLIC
     $<BUILD_INTERFACE:utils>
     $<BUILD_INTERFACE:utils_c3d_codec>
     vc_delta3d::vc_delta3d
+    $<BUILD_INTERFACE:utils_volcomp_codec>
 )
 target_link_libraries(vc_core PRIVATE
     Blosc::blosc

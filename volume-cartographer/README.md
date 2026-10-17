@@ -35,6 +35,37 @@ distribution must provide CMake 3.28 or newer; Ubuntu 24.04+ and Debian 13+
 meet that requirement. Set `JOBS`, `BUILD_DIR`, or `PREFIX` to override the
 corresponding defaults.
 
+#### Python source builds
+
+`uv sync` in this directory builds the Python bindings from C++ source. The
+monorepo's `vesuvius` environment also builds this local package when selecting
+the `models` or `all` extra (including `uv sync --all-extras`). Install the native
+build prerequisites first: `uv` manages Python packages, not system C++ libraries.
+The [Python CI workflow](../.github/workflows/test-vesuvius.yml) lists the native
+packages used for the Python-only build on Ubuntu.
+
+**Qt6 Core development files are required even with GUI targets disabled.** The
+shared SFTP implementation uses Qt Core for subprocess and URL handling. This
+does not require a display server, Qt Widgets, or Python Qt bindings. Installing
+`pyqt6` is not a substitute for the native development package.
+
+To add Qt to an otherwise prepared build environment:
+
+```bash
+# Ubuntu / Debian
+sudo apt-get install qt6-base-dev
+
+# macOS (Homebrew)
+brew install qt
+```
+
+These commands install Qt, not the complete native dependency set. The existing
+Linux dependency setup and macOS build helper already include Qt. If CMake cannot
+find `Qt6Config.cmake` after installation, add the Qt installation prefix to
+`CMAKE_PREFIX_PATH` before running `uv sync`. Keep the Qt Core runtime libraries
+installed when using the compiled bindings. See [SFTP access](docs/sftp_remote_access.md)
+for the OpenSSH runtime and authentication requirements.
+
 #### Windows
 
 A self-contained Windows 10/11 installer (`VC3D-<version>-win64.exe`, with all dependencies bundled) is attached to each [GitHub release](https://github.com/ScrollPrize/villa/releases) — download, run, and launch VC3D from the Start menu. A portable `.zip` of the same tree is published alongside it.
@@ -183,9 +214,9 @@ Your folder structure should resemble this:
 
 ### Working on remote volumes from the command line
 
-`vc_grow_seg_from_seed` accepts the remote locators described above and
-`vc_render_tifxyz` streams through `--remote-url`, so a segment can be grown
-and rendered on a public OME-Zarr volume without downloading it or building a
+`vc_grow_seg_from_seed` and `vc_render_tifxyz` both take the remote locators
+described above as `-v` and stream them, so a segment can be grown and
+rendered on a public OME-Zarr volume without downloading it or building a
 volpkg. The tools fetch only the chunks they touch, over anonymous HTTPS or
 S3. The GUI equivalent is `File -> Open Data Catalog…`, covered in the
 [VC3D tutorial](https://scrollprize.org/tutorial_VC3D).
@@ -250,24 +281,27 @@ the remote volume as before.
 #### Rendering it
 
 ```bash
-vc_render_tifxyz -v render_cache --remote-url "$URL" -s out/auto_grown_* \
+vc_render_tifxyz -v "$URL" -s out/auto_grown_* \
   --scale 1 -g 0 --voxel-size 45.532 --voxel-unit micrometer --tif-output render/
 ```
 
 This writes `render/00.tif` (360×360 pixels for the segment above, about
 17 MiB fetched). Things to know:
 
-- `-v` is mandatory, but with `--remote-url` it is only consulted for a local
-  `meta.json`: a nonexistent or empty directory works and stays empty. Since
-  #1657 the renderer opens the remote volume the same way the tracer does, so
-  the chunks it fetches persist in the shared remote cache
+- `-v` takes the URL itself, and nothing is written under a local directory.
+  `--remote-url` is a deprecated alias for the same locator: alone it fills
+  `-v`, next to an equal `-v` it warns, next to a different one it is an
+  error. Since #1657 the renderer opens the remote volume the same way the
+  tracer does, so the chunks it fetches persist in the shared remote cache
   (`~/.VC3D/remote_cache/<volume>-<id>/`, or `remote_cache_dir` under
   `[viewer]` in `VC3D.ini`); `--cache-gb` (default 16) sizes the process-wide
   decoded-chunk cache and `--prefetch-remote` warms it before rendering starts.
-- Remote volumes are not probed for a voxel size. Without `--voxel-size` the
-  log says `Voxel size: 1.0 (no metadata found; override with --voxel-size)`
-  and the TIFF carries no resolution tag. `--voxel-unit` defaults to
-  `nanometer`, so pass both flags; `--voxel-size 45.532` alone yields a TIFF
+- The renderer reads the voxel size from the remote volume's metadata, as the
+  tracer does: without `--voxel-size` the log says
+  `Voxel size (from volume metadata): 45.532` and the TIFF carries the
+  matching resolution tag. Metadata values count as micrometers, while
+  `--voxel-unit` applies to `--voxel-size` and defaults to `nanometer`, so
+  pass both flags when overriding; `--voxel-size 45.532` alone yields a TIFF
   resolution 1000× too large.
 - `-g` selects the pyramid level: `-g 3` renders the same segment at 1/8
   scale (45×45 pixels, about 4 MiB fetched). A level the remote pyramid does

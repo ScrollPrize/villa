@@ -1,6 +1,7 @@
 #include "OpenDataCatalogWindow.hpp"
 
 #include "OpenDataNormalGrids.hpp"
+#include "ProjectCreationDefaults.hpp"
 #include "OpenDataSegmentCache.hpp"
 #include "VCSettings.hpp"
 
@@ -16,6 +17,12 @@
 #include <QDateTime>
 #include <QDesktopServices>
 #include <QDir>
+#include <QDialogButtonBox>
+#include <QFileDialog>
+#include <QFileInfo>
+#include <QFormLayout>
+#include <QMessageBox>
+#include <QTreeWidget>
 #include <QGuiApplication>
 #include <QHeaderView>
 #include <QHBoxLayout>
@@ -360,6 +367,44 @@ QString representationParameters(const OpenDataArtifact& artifact)
     return details.empty() ? QStringLiteral("—") : qstr(details.dump());
 }
 
+QStringList volumeCells(const std::filesystem::path& remoteRoot,
+                        const OpenDataSample& sample, const OpenDataVolume& volume)
+{
+    return {qstr(volume.id), qstr(volume.scanId), qstr(volume.suffix),
+            optionalNumber(volume.pixelSizeUm), optionalNumber(volume.energyKeV, 'f', 1),
+            optionalNumber(volume.detectorDistanceMm, 'f', 1), qstr(volume.dataFormat),
+            normalGridsStatusDisplay(remoteRoot, sample.id, volume), qstr(volume.createdAt),
+            volumeSourceFilename(volume)};
+}
+
+QStringList representationCells(const OpenDataVolume& volume, const OpenDataArtifact& artifact,
+                                OpenDataRepresentationKind kind)
+{
+    return {qstr(volume.id), predictionType(artifact), qstr(artifact.type),
+            qstr(artifact.modelId.value_or(std::string{})), representationCoordinates(artifact, kind),
+            qstr(artifact.accessUsage), representationParameters(artifact), artifactUrl(artifact),
+            artifact.sourceCoordinateLevel ? QString::number(*artifact.sourceCoordinateLevel)
+                                           : QStringLiteral("—")};
+}
+
+QStringList segmentCells(const std::filesystem::path& remoteRoot,
+                         const OpenDataSample& sample, const OpenDataSegment& segment)
+{
+    return {qstr(segment.id), qstr(segment.suffix), qstr(segment.originalVolumeId),
+            optionalInt(segment.width), optionalInt(segment.height), yesNo(segment.hasTifxyz()),
+            yesNo(segment.hasInkDetection()), yesNo(segment.hasLayersZarr()),
+            cacheStateDisplay(cacheStateForSegment(remoteRoot, sample, segment)), qstr(segment.createdAt)};
+}
+
+void setCatalogRow(QTableWidget* table, int row, const QStringList& cells)
+{
+    for (int col = 0; col < cells.size(); ++col) {
+        auto* cell = item(cells[col]);
+        cell->setToolTip(cells[col]);
+        table->setItem(row, col, cell);
+    }
+}
+
 QImage imageFromBytes(const std::vector<std::byte>& bytes)
 {
     if (bytes.empty() || bytes.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
@@ -437,6 +482,13 @@ OpenDataCatalogWindow::OpenDataCatalogWindow(QWidget* parent)
     reloadManifest();
 }
 
+OpenDataCatalogWindow::OpenDataCatalogWindow(const OpenDataManifest& manifest, QWidget* parent)
+    : QDialog(parent)
+{
+    buildUi();
+    applyManifest(manifest, tr("Provided catalog"), false);
+}
+
 OpenDataCatalogWindow::~OpenDataCatalogWindow()
 {
     if (_fetchWatcher) {
@@ -453,6 +505,168 @@ void OpenDataCatalogWindow::setOpenSampleHandler(std::function<bool(const OpenDa
 {
     _openSampleHandler = std::move(handler);
     updateActionButtons();
+}
+
+void OpenDataCatalogWindow::setCreateProjectHandler(CreateProjectHandler handler)
+{
+    _createProjectHandler = std::move(handler);
+    updateActionButtons();
+}
+
+void OpenDataCatalogWindow::createSelectedProject()
+{
+    if (_manifestRefreshPending || !selectedSample() || !_createProjectHandler) return;
+    // Snapshot indices and metadata while the modal dialog is open.
+    const auto sample = *selectedSample();
+    const auto remoteRoot = vc3d::remoteCachePathFs();
+    QDialog dialog(this);
+    dialog.setWindowTitle(tr("Create Project - %1").arg(QString::fromStdString(sample.id)));
+    dialog.resize(1400, 700);
+    auto* layout = new QVBoxLayout(&dialog);
+    auto* form = new QFormLayout;
+    auto* name = new QLineEdit(QString::fromStdString(sample.id), &dialog);
+    name->setObjectName(QStringLiteral("catalogProjectName"));
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const auto defaultDirectory = vc3d::defaultNewProjectDirectory(settings);
+    const auto defaultPath = QDir(defaultDirectory).filePath(
+        QString::fromStdString(sample.id) + ".volpkg.json");
+    auto* path = new QLineEdit(defaultPath, &dialog);
+    path->setObjectName(QStringLiteral("catalogProjectPath"));
+    bool nameEdited = false;
+    connect(name, &QLineEdit::textEdited, &dialog, [&]() { nameEdited = true; });
+    connect(path, &QLineEdit::textChanged, &dialog, [&](const QString& value) {
+        if (nameEdited) return;
+        auto filename = QFileInfo(value.trimmed()).fileName();
+        if (filename.endsWith(".volpkg.json", Qt::CaseInsensitive))
+            filename.chop(int(QStringLiteral(".volpkg.json").size()));
+        name->setText(filename);
+    });
+    auto* browse = new QPushButton(tr("Browse..."), &dialog);
+    auto* pathRow = new QHBoxLayout;
+    pathRow->addWidget(path);
+    pathRow->addWidget(browse);
+    form->addRow(tr("Project name"), name);
+    form->addRow(tr("Project JSON"), pathRow);
+    layout->addLayout(form);
+    auto* tabs = new QTabWidget(&dialog);
+    layout->addWidget(tabs, 1);
+    auto makeTree = [&](const QString& label, const QTableWidget* catalog) {
+        auto* tree = new QTreeWidget(tabs);
+        QStringList headers;
+        for (int i = 0; i < catalog->columnCount(); ++i)
+            headers.push_back(catalog->horizontalHeaderItem(i)->text());
+        tree->setHeaderLabels(headers);
+        tree->header()->setStretchLastSection(false);
+        for (int visual = 0; visual < catalog->columnCount(); ++visual) {
+            const int logical = catalog->horizontalHeader()->logicalIndex(visual);
+            tree->header()->moveSection(tree->header()->visualIndex(logical), visual);
+            tree->setColumnWidth(logical, std::clamp(catalog->columnWidth(logical), 90, 360));
+        }
+        tree->setColumnWidth(0, 260);
+        tabs->addTab(tree, label);
+        return tree;
+    };
+    auto* volumeTree = makeTree(tr("Volumes"), _volumesTable);
+    auto* representationTree = makeTree(tr("Representations"), _representationsTable);
+    auto* segmentTree = makeTree(tr("Segments"), _segmentsTable);
+    auto group = [](QTreeWidget* tree, const QString& label) {
+        auto* item = new QTreeWidgetItem(tree, {label});
+        item->setFlags(item->flags() | Qt::ItemIsUserCheckable | Qt::ItemIsAutoTristate);
+        item->setCheckState(0, Qt::Unchecked);
+        return item;
+    };
+    auto leaf = [](QTreeWidgetItem* parent, const QStringList& labels) {
+        auto* item = new QTreeWidgetItem(parent, labels);
+        for (int col = 0; col < labels.size(); ++col)
+            item->setToolTip(col, labels[col]);
+        item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
+        item->setCheckState(0, Qt::Unchecked);
+        return item;
+    };
+    std::vector<std::pair<QTreeWidgetItem*, std::string>> volumes, segments;
+    std::vector<std::pair<QTreeWidgetItem*, OpenDataRepresentationRef>> representations;
+    auto* sourceGroup = group(volumeTree, tr("Source volumes"));
+    for (std::size_t row = 0; row < sample.volumes.size(); ++row) {
+        const auto& volume = sample.volumes[row];
+        if (std::none_of(volume.artifacts.begin(), volume.artifacts.end(),
+                        [](const auto& a) { return !classifyDerivedRepresentation(a) && a.hasResolvedUrl(); }))
+            continue;
+        volumes.emplace_back(leaf(sourceGroup, volumeCells(remoteRoot, sample, volume)), volume.id);
+    }
+    QMap<QString, QTreeWidgetItem*> groups;
+    const auto refs = derivedRepresentations(sample);
+    for (std::size_t row = 0; row < refs.size(); ++row) {
+        const auto& ref = refs[row];
+        const auto& volume = sample.volumes.at(ref.volumeIndex);
+        const auto& artifact = volume.artifacts.at(ref.artifactIndex);
+        const QString type = QString::fromUtf8(representationKindName(ref.kind).data(),
+                                              int(representationKindName(ref.kind).size()));
+        const QString prediction = predictionType(artifact);
+        const QString label = prediction.isEmpty() ? type : type + " / " + prediction;
+        if (!groups.contains(label)) groups[label] = group(representationTree, label);
+        auto* item = leaf(groups[label], representationCells(volume, artifact, ref.kind));
+        representations.emplace_back(item, ref);
+    }
+    auto* segmentGroup = group(segmentTree, tr("Segments (tifxyz)"));
+    for (std::size_t row = 0; row < sample.segments.size(); ++row) {
+        const auto& segment = sample.segments[row];
+        if (segment.hasTifxyz())
+            segments.emplace_back(leaf(segmentGroup, segmentCells(remoteRoot, sample, segment)), segment.id);
+    }
+    const std::array trees{volumeTree, representationTree, segmentTree};
+    for (auto* tree : trees) tree->expandAll();
+    auto* selectionRow = new QHBoxLayout;
+    for (const auto& [label, checked] : {std::pair{tr("Select all"), true},
+                                       std::pair{tr("Select none"), false}}) {
+        auto* button = new QPushButton(label, &dialog);
+        selectionRow->addWidget(button);
+        connect(button, &QPushButton::clicked, &dialog, [trees, checked]() {
+            for (auto* tree : trees)
+                for (int i = 0; i < tree->topLevelItemCount(); ++i)
+                    tree->topLevelItem(i)->setCheckState(0, checked ? Qt::Checked : Qt::Unchecked);
+        });
+    }
+    selectionRow->addStretch();
+    layout->addLayout(selectionRow);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel, &dialog);
+    buttons->button(QDialogButtonBox::Save)->setText(tr("Create and Open"));
+    layout->addWidget(buttons);
+    connect(browse, &QPushButton::clicked, &dialog, [&]() {
+        const auto destination = QFileDialog::getSaveFileName(&dialog, tr("New Project"),
+            path->text().isEmpty() ? QDir(defaultDirectory).filePath(name->text() + ".volpkg.json") : path->text(),
+            tr("VC3D project (*.volpkg.json)"), nullptr, QFileDialog::DontConfirmOverwrite);
+        if (!destination.isEmpty()) path->setText(destination);
+    });
+    auto validate = [&]() {
+        buttons->button(QDialogButtonBox::Save)->setEnabled(
+            !name->text().trimmed().isEmpty() && !path->text().trimmed().isEmpty());
+    };
+    connect(name, &QLineEdit::textChanged, &dialog, validate);
+    connect(path, &QLineEdit::textChanged, &dialog, validate);
+    validate();
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, [&]() {
+        if (!path->text().trimmed().endsWith(".volpkg.json", Qt::CaseInsensitive))
+            path->setText(path->text().trimmed() + ".volpkg.json");
+        if (QFileInfo::exists(path->text()) && QMessageBox::question(&dialog, tr("Overwrite Project File"),
+                tr("A project file already exists at:\n%1\n\nOverwrite this file on disk?").arg(path->text()), QMessageBox::Yes | QMessageBox::No,
+                QMessageBox::No) != QMessageBox::Yes) return;
+        dialog.accept();
+    });
+    if (dialog.exec() != QDialog::Accepted) return;
+    OpenDataResourceSelection selection;
+    selection.rawVolumeIds.emplace();
+    selection.representations.emplace();
+    selection.segmentIds.emplace();
+    for (const auto& [item, id] : volumes)
+        if (item->checkState(0) == Qt::Checked) selection.rawVolumeIds->push_back(id);
+    for (const auto& [item, ref] : representations)
+        if (item->checkState(0) == Qt::Checked) selection.representations->push_back(ref);
+    for (const auto& [item, id] : segments)
+        if (item->checkState(0) == Qt::Checked) selection.segmentIds->push_back(id);
+    const OpenDataNewProject project{QFileInfo(path->text()).absoluteFilePath().toStdString(),
+                                     name->text().trimmed().toStdString()};
+    if (_createProjectHandler(sample, selection, project)) accept();
 }
 
 void OpenDataCatalogWindow::buildUi()
@@ -660,6 +874,8 @@ void OpenDataCatalogWindow::buildUi()
     _statusLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     _syncSampleCacheButton = new QPushButton(tr("Sync Local Data"), this);
     _openSampleButton = new QPushButton(tr("Open Sample"), this);
+    _createProjectButton = new QPushButton(tr("Create Project..."), this);
+    _createProjectButton->setToolTip(tr("Choose resources for a new project"));
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     _doNotShowOnNextOpenCheck = new QCheckBox(tr("Do not show on next open"), this);
     _doNotShowOnNextOpenCheck->setChecked(
@@ -670,6 +886,7 @@ void OpenDataCatalogWindow::buildUi()
     bottomRow->addWidget(_doNotShowOnNextOpenCheck);
     bottomRow->addWidget(_syncSampleCacheButton);
     bottomRow->addWidget(_openSampleButton);
+    bottomRow->addWidget(_createProjectButton);
     bottomRow->addWidget(closeButton);
     mainLayout->addLayout(bottomRow);
 
@@ -726,6 +943,7 @@ void OpenDataCatalogWindow::buildUi()
     connect(_openSegmentCacheFolderButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::openSelectedSegmentCacheFolder);
     connect(_syncSampleCacheButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::syncSelectedSampleCache);
     connect(_openSampleButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::openSelectedSample);
+    connect(_createProjectButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::createSelectedProject);
     connect(_doNotShowOnNextOpenCheck, &QCheckBox::toggled, this, [](bool checked) {
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         settings.setValue(vc3d::settings::project::SHOW_OPEN_DATA_CATALOG_ON_STARTUP,
@@ -899,6 +1117,7 @@ void OpenDataCatalogWindow::populateSamples()
     }
 
     QSignalBlocker blocker(_sampleTable);
+    QSignalBlocker selectionBlocker(_sampleTable->selectionModel());
     _sampleTable->setSortingEnabled(false);
     _sampleTable->setRowCount(static_cast<int>(_visibleSampleIndexes.size()));
     for (int row = 0; row < static_cast<int>(_visibleSampleIndexes.size()); ++row) {
@@ -921,6 +1140,8 @@ void OpenDataCatalogWindow::populateSamples()
 
     if (_sampleTable->rowCount() > 0) {
         _sampleTable->selectRow(0);
+        // Filtering can retain row 0 without emitting a new selection signal.
+        updateSelectedSample();
     } else {
         clearDetails();
     }
@@ -978,22 +1199,8 @@ void OpenDataCatalogWindow::populateDetails(const OpenDataSample* sample)
     _volumesTable->setRowCount(static_cast<int>(sample->volumes.size()));
     for (int row = 0; row < static_cast<int>(sample->volumes.size()); ++row) {
         const auto& volume = sample->volumes[static_cast<std::size_t>(row)];
-        auto* idItem = item(qstr(volume.id));
-        idItem->setData(Qt::UserRole, row);
-        _volumesTable->setItem(row, 0, idItem);
-        _volumesTable->setItem(row, 1, item(qstr(volume.scanId)));
-        _volumesTable->setItem(row, 2, item(qstr(volume.suffix)));
-        _volumesTable->setItem(row, 3, item(optionalNumber(volume.pixelSizeUm)));
-        _volumesTable->setItem(row, 4, item(optionalNumber(volume.energyKeV, 'f', 1)));
-        _volumesTable->setItem(row, 5, item(optionalNumber(volume.detectorDistanceMm, 'f', 1)));
-        _volumesTable->setItem(row, 6, item(qstr(volume.dataFormat)));
-        _volumesTable->setItem(row, 7,
-                               item(normalGridsStatusDisplay(remoteRoot, sample->id, volume)));
-        _volumesTable->setItem(row, 8, item(qstr(volume.createdAt)));
-        const QString filename = volumeSourceFilename(volume);
-        auto* sourceItem = item(filename);
-        sourceItem->setToolTip(filename);
-        _volumesTable->setItem(row, 9, sourceItem);
+        setCatalogRow(_volumesTable, row, volumeCells(remoteRoot, *sample, volume));
+        _volumesTable->item(row, 0)->setData(Qt::UserRole, row);
     }
     _volumesTable->resizeColumnsToContents();
     _volumesTable->setColumnWidth(9, std::min(_volumesTable->columnWidth(9), 420));
@@ -1003,31 +1210,12 @@ void OpenDataCatalogWindow::populateDetails(const OpenDataSample* sample)
         const auto& ref = representations[static_cast<std::size_t>(row)];
         const auto& volume = sample->volumes[ref.volumeIndex];
         const auto& artifact = volume.artifacts[ref.artifactIndex];
-        auto* volumeItem = item(qstr(volume.id));
+        setCatalogRow(_representationsTable, row, representationCells(volume, artifact, ref.kind));
+        auto* volumeItem = _representationsTable->item(row, 0);
         volumeItem->setData(kRepresentationVolumeIndexRole,
                             static_cast<qulonglong>(ref.volumeIndex));
         volumeItem->setData(kRepresentationArtifactIndexRole,
                             static_cast<qulonglong>(ref.artifactIndex));
-        _representationsTable->setItem(row, 0, volumeItem);
-        _representationsTable->setItem(
-            row, 1, item(predictionType(artifact)));
-        _representationsTable->setItem(row, 2, item(qstr(artifact.type)));
-        _representationsTable->setItem(
-            row, 3, item(qstr(artifact.modelId.value_or(std::string{}))));
-        _representationsTable->setItem(
-            row, 4, item(representationCoordinates(artifact, ref.kind)));
-        _representationsTable->setItem(row, 5, item(qstr(artifact.accessUsage)));
-        const QString parameters = representationParameters(artifact);
-        auto* parametersItem = item(parameters);
-        parametersItem->setToolTip(parameters);
-        _representationsTable->setItem(row, 6, parametersItem);
-        const QString url = artifactUrl(artifact);
-        auto* urlItem = item(url);
-        urlItem->setToolTip(url);
-        _representationsTable->setItem(row, 7, urlItem);
-        _representationsTable->setItem(
-            row, 8, item(artifact.sourceCoordinateLevel
-                ? QString::number(*artifact.sourceCoordinateLevel) : QStringLiteral("—")));
     }
     _representationsTable->resizeColumnsToContents();
     _representationsTable->setColumnWidth(
@@ -1040,19 +1228,8 @@ void OpenDataCatalogWindow::populateDetails(const OpenDataSample* sample)
     _segmentsTable->setRowCount(static_cast<int>(sample->segments.size()));
     for (int row = 0; row < static_cast<int>(sample->segments.size()); ++row) {
         const auto& segment = sample->segments[static_cast<std::size_t>(row)];
-        auto* idItem = item(qstr(segment.id));
-        idItem->setData(Qt::UserRole, row);
-        _segmentsTable->setItem(row, 0, idItem);
-        _segmentsTable->setItem(row, 1, item(qstr(segment.suffix)));
-        _segmentsTable->setItem(row, 2, item(qstr(segment.originalVolumeId)));
-        _segmentsTable->setItem(row, 3, item(optionalInt(segment.width)));
-        _segmentsTable->setItem(row, 4, item(optionalInt(segment.height)));
-        _segmentsTable->setItem(row, 5, item(yesNo(segment.hasTifxyz())));
-        _segmentsTable->setItem(row, 6, item(yesNo(segment.hasInkDetection())));
-        _segmentsTable->setItem(row, 7, item(yesNo(segment.hasLayersZarr())));
-        const auto state = cacheStateForSegment(remoteRoot, *sample, segment);
-        _segmentsTable->setItem(row, 8, item(cacheStateDisplay(state)));
-        _segmentsTable->setItem(row, 9, item(qstr(segment.createdAt)));
+        setCatalogRow(_segmentsTable, row, segmentCells(remoteRoot, *sample, segment));
+        _segmentsTable->item(row, 0)->setData(Qt::UserRole, row);
     }
     _segmentsTable->resizeColumnsToContents();
     updateActionButtons();
@@ -1361,6 +1538,8 @@ void OpenDataCatalogWindow::updateActionButtons()
     if (_openSampleButton) {
         _openSampleButton->setEnabled(canOpenSample);
     }
+    if (_createProjectButton)
+        _createProjectButton->setEnabled(manifestReady && sample && bool(_createProjectHandler));
     if (_syncSampleCacheButton) {
         _syncSampleCacheButton->setEnabled(canSyncSample);
         _syncSampleCacheButton->setText(sampleSummary.hasLocal()

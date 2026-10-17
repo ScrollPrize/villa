@@ -50,7 +50,8 @@ TEST_CASE("concurrent saveChannel + saveOverwrite on same dir does not crash or 
     auto seg = root / "seg";
     {
         QuadSurface qs(grid(), cv::Vec2f(1.f, 1.f));
-        qs.save(seg.string(), "uuid-a", false);
+        qs.meta["uuid"] = "uuid-a";
+        qs.save(seg.string(), false);
     }
 
     constexpr int kIters = 200;

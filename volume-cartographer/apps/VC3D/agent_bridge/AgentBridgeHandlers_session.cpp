@@ -650,6 +650,7 @@ QJsonObject AgentBridgeServer::handleSegmentsCreateEditableCopy(const QJsonValue
                 sourcePath, copySourceRoot);
     }
     const std::filesystem::path editableRoot = editablePath.parent_path();
+    const std::string editableId = editablePath.filename().string();
     std::error_code existsError;
     const bool alreadyExisted = std::filesystem::exists(editablePath, existsError);
     if (existsError) {
@@ -666,7 +667,7 @@ QJsonObject AgentBridgeServer::handleSegmentsCreateEditableCopy(const QJsonValue
         vc3d::opendata::attachEditableOpenDataSegmentRoot(
             *vpkg, sourcePath, editableRoot, true);
 
-        auto editableSurface = vpkg->loadSurface(segmentId);
+        auto editableSurface = vpkg->loadSurface(editableId);
         if (!editableSurface) {
             editableSurface = std::make_shared<QuadSurface>(editablePath);
         }
@@ -707,7 +708,7 @@ QJsonObject AgentBridgeServer::handleSegmentsCreateEditableCopy(const QJsonValue
         };
     }
     QString activationError;
-    if (!panel->activateSurfaceById(segmentId, &activationError)) {
+    if (!panel->activateSurfaceById(editableId, &activationError)) {
         throw AgentBridgeError{
             -32005,
             "Editable segment copy was created but could not be activated",
@@ -725,7 +726,7 @@ QJsonObject AgentBridgeServer::handleSegmentsCreateEditableCopy(const QJsonValue
     };
     std::filesystem::path resolvedPath;
     try {
-        if (auto resolved = vpkg->segmentation(segmentId)) {
+        if (auto resolved = vpkg->segmentation(editableId)) {
             resolvedPath = resolved->path();
         }
     } catch (...) {
@@ -738,7 +739,7 @@ QJsonObject AgentBridgeServer::handleSegmentsCreateEditableCopy(const QJsonValue
         activeSurface ? activeSurface->path : std::filesystem::path{};
     const std::filesystem::path activeWeakPath =
         activeWeakSurface ? activeWeakSurface->path : std::filesystem::path{};
-    if (state->activeSurfaceId() != segmentId ||
+    if (state->activeSurfaceId() != editableId ||
         !equivalentPath(vpkg->outputSegmentsPath(), editableRoot) ||
         !equivalentPath(resolvedPath, editablePath) ||
         !equivalentPath(activePath, editablePath) ||
@@ -761,7 +762,7 @@ QJsonObject AgentBridgeServer::handleSegmentsCreateEditableCopy(const QJsonValue
     return QJsonObject{
         {"created", !alreadyExisted},
         {"alreadyExisted", alreadyExisted},
-        {"segmentId", segmentIdQ},
+        {"segmentId", QString::fromStdString(editableId)},
         {"sourcePath", QString::fromStdString(sourcePath.string())},
         {"path", QString::fromStdString(editablePath.string())},
         {"activated", true},
