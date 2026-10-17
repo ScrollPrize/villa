@@ -111,12 +111,12 @@ def test_float_output_http_pickle_offline(tmp_path):
     server, base = _serve(tmp_path)
     try:
         with ZarrReader.open(f"{base}/a.zarr", cache_dir=tmp_path / "cache") as r:
-            np.testing.assert_allclose(r.read((0, 0, 0), raw.shape), raw.astype(np.float32))
+            np.testing.assert_allclose(r.read((0, 0, 0), raw.shape,dtype=np.float32), raw.astype(np.float32))
             r.flush()
             with pickle.loads(pickle.dumps(r)) as other:
                 np.testing.assert_array_equal(other.read((0, 0, 0), raw.shape), raw)
         with ZarrReader.open(f"{base}/a.zarr", cache_dir=tmp_path / "cache", offline=True) as r:
-            np.testing.assert_allclose(r.read((0, 0, 0), raw.shape), raw.astype(np.float32))
+            np.testing.assert_allclose(r.read((0, 0, 0), raw.shape,dtype=np.float32), raw.astype(np.float32))
     finally:
         server.shutdown()
 
