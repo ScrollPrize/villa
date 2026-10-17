@@ -23,10 +23,6 @@ dependencies = []
 [project.optional-dependencies]
 reader = ["numpy>=1.24"]
 augment = ["numpy>=1.24"]
-# Baselines for benchmarks/.
-bench = ["vc-reader[reader]", "zarr>=3", "s3fs", "tensorstore"]
-# numcodecs and vc-delta3d write the tests' blosc and Delta3D fixtures.
-test = ["vc-reader[reader]", "pytest>=8", "numcodecs>=0.12", "vc-delta3d>=0.1.1; python_version >= '3.12'"]
 
 [project.scripts]
 vc-reader = "vc_reader.cli:main"
@@ -37,9 +33,5 @@ minimum-version = "build-system.requires"
 wheel.packages = ["src/vc_reader"]
 cmake.build-type = "Release"
 build-dir = "build/{wheel_tag}"
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["src"]
-addopts = "-m 'not network'"
-markers = ["network: tests that fetch the live metadata.json"]
+# Keep local development artifacts out of source releases if regenerated.
+sdist.exclude = ["benchmarks/results/**", "tests/**", "elastic_comparison/**"]

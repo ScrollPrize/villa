@@ -1,8 +1,50 @@
 # vc_reader
 
+## Pipeline benchmark
+
+[`benchmarks/bench_pipeline.py`](benchmarks/bench_pipeline.py) exercises affine
+reading/sampling, normalization, and a fixed augmentation chain (flip, brightness,
+gamma, Gaussian blur). It uses the package's NumPy dependency and accepts a local,
+HTTP, or S3 **3-D uint8 Zarr v2 array**. With no `--array`, it generates a temporary,
+seeded synthetic input for smoke checks; use representative CT data for performance
+decisions.
+
+```bash
+# CPU smoke check using synthetic input.
+python benchmarks/bench_pipeline.py --backend cpu --shape 32 32 32 --crops 2 --reps 3
+
+# CPU/CUDA comparison on the same real data and crop origins.
+python benchmarks/bench_pipeline.py --array /path/to/volume.zarr --level 0 \
+  --backend both --shape 128 128 128 --crops 4 --threads 8 \
+  --warmup 2 --reps 10 --output /tmp/pipeline.json
+```
+
+Use matching Release reader/augmentation extensions; CUDA requires a build with
+`VC_READER_ENABLE_CUDA=ON` and an accessible GPU. `--native-dir /path/to/cmake-build`
+selects both extensions from an existing build without installing them.
+`--backend cuda` measures CUDA alone. `--start Z Y X`, `--jitter`, `--angle`,
+`--normalization`, and cache-budget options control the workload; see `--help`.
+
+The report includes mean/p50/p95/min/max stage and total latency, crops/s,
+Mvoxels/s, output GiB/s, and CPU/CUDA median speedups. JSON also records every
+measurement, crop geometry, seeds, platform, extension hashes, cache counters,
+and validation errors. Validation and warmup are excluded from timings. CPU/CUDA
+outputs must agree within `atol=5e-5, rtol=1e-5`; single-backend runs check shape,
+dtype, and finite values.
+
+Reading and affine sampling are fused, so their time is reported together.
+Normalization and augmentation use separate calls for stage measurement.
+CUDA sampling uses device chunks without automatic CPU fallback. The default
+includes the final download so both backends return host arrays;
+`--cuda-output device` measures a GPU-consumer endpoint instead. Calls complete
+before timing stops. Host/OS caches stay warm; `--cuda-cache clear` drops device
+chunks before each crop to include uploads, while `warm` reuses the device cache
+subject to its budget. This is a sequential latency/throughput benchmark, not a
+cold-storage or overlapped training-loader benchmark.
+
 ## Augmentations
 
-Each entry shows the **measured configuration**, not the constructor defaults. Use `from vc_reader import augment as A`; see the [augmentation API guide](docs/augmentation.md) for options and pipeline usage.
+Each entry shows the **measured configuration**, not the constructor defaults. Use `from vc_reader import augment as A`.
 
 Benchmarks use **128 × 128 × 128 float32** crops from PHercParis4 volume `20260411134726-2.400um-0.2m-78keV-masked.zarr`, **scale 2**, centered at ZYX `(9064, 3664, 3664)`. CT values are divided by 255. Timings are medians of 5 measured calls after 1 warmup, using one CPU thread and a Release build.
 
