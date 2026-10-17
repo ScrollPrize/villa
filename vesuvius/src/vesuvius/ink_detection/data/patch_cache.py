@@ -205,4 +205,10 @@ def load_patch_cache(
                 ),
             )
         )
+    if config.discovery_mode != "unlabeled":
+        # Every labeled segment yields patches or fails discovery, so a segment with no
+        # record means the cache predates it (a dataset added under the same out_dir).
+        covered = {patch.segment.cache_key for patch in patches}
+        if any(segment.cache_key not in covered for segment in segments_by_key.values()):
+            return None
     return patches

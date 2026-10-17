@@ -302,6 +302,23 @@ Each `datasets` item supports:
 | `sampling_scroll` | Scroll identifier required by balanced and fixed-prior sampling. |
 | `sampling_physical_segment_keys` | Per-segment physical identity required by fixed-prior sampling. |
 | `sampling_representation_keys` | Per-segment representation identity required by fixed-prior sampling. |
+| `split` | `train` (default) or `validation`. A `validation` dataset is held out whole; see below. Flat mode only. |
+
+By default validation windows come from each training segment's
+`_validation_mask`. Training supervision excludes those voxels, but a validation
+crop can cover image voxels that neighbouring training crops also read, so the
+score measures interpolation within segments the model was trained on. Marking a
+dataset `"split": "validation"` holds it out whole: every window it would have
+trained on is scored on its supervision mask (its own `_validation_mask` windows
+are scored too), none of it is trained on, and in-segment validation windows of
+training datasets are dropped. The training patches of training datasets do not
+change. The trainer refuses the split, before the first step, unless every
+dataset sets `sampling_scroll` and no held-out scroll is also a training scroll,
+the two sides share no image volume, segment directory or label asset, every
+held-out segment yields patches, and no validation crop shares a voxel with a
+training crop. It prints the checked counts as `heldout_validation={...}`.
+With `val_steps` at least the number of held-out batches, each validation pass
+scores the whole held-out set.
 
 Data, patch, and augmentation controls:
 
