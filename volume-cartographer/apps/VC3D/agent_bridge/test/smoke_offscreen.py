@@ -1369,6 +1369,136 @@ def check_open_data_editable_copy(
         )
 
 
+def check_segment_reload_keeps_active(
+    binary: str,
+    results: Results,
+    root: Path,
+) -> None:
+    """In an Open Data project, the segment-list reload after ABF++ flatten
+    must not make an unfetched catalog segment the shown segment (reading its
+    missing tifxyz aborted VC3D with "Failed to open TIFF"), and must keep the
+    active segment active when it is reloaded itself. Runs its own VC3D so an
+    abort cannot take the other checks down."""
+    project_root = root / "reload-project"
+    volpkg = create_test_project(project_root)
+    catalog_root = project_root / "catalog-segments"
+    catalog_folder = catalog_root / "published-L0"
+    active_id = "20241113080880"
+    other_id = "20241113090990"
+    for segment_id in (active_id, other_id):
+        shutil.copytree(
+            REPO_ROOT / "core" / "test" / "data" / "segments" / segment_id,
+            catalog_folder / segment_id,
+        )
+        (catalog_folder / segment_id / "catalog-origin.json").write_text("{}")
+    # A catalog segment that was never fetched: meta.json and
+    # catalog-origin.json, no tifxyz. Every reload re-queues it.
+    placeholder_id = "unfetched-placeholder"
+    placeholder = catalog_folder / placeholder_id
+    placeholder.mkdir()
+    (placeholder / "meta.json").write_text(json.dumps({
+        "type": "seg",
+        "uuid": placeholder_id,
+        "name": placeholder_id,
+        "format": "tifxyz",
+        "scale": [1.0, 1.0],
+        "tiff_dimensions": [16, 8],
+        "vc_open_data_lazy_placeholder": True,
+    }))
+    (placeholder / "catalog-origin.json").write_text(json.dumps({
+        "cache_state": "remote",
+        "materialization": {"kind": "download"},
+    }))
+    project = json.loads(volpkg.read_text())
+    project["segments"] = [{
+        "location": str(catalog_root),
+        "tags": [
+            "open-data",
+            "immutable",
+            "vc-open-data-segment-aggregate",
+            "vc-open-data-target-volume-id:vol1",
+        ],
+    }]
+    project["output_segments"] = str(catalog_root)
+    volpkg.write_text(json.dumps(project))
+
+    proc = launch(binary, unique_name("reload"),
+                  config_home=str(project_root / "config"))
+    client = None
+    try:
+        client = BridgeClient(
+            proc.wait_for_handshake(timeout=60.0),
+            connect_timeout=RPC_TIMEOUT,
+        )
+        client.call("volume.open", {"path": str(volpkg)}, timeout=RPC_TIMEOUT)
+        listed, _ = client.call("segments.list", {}, timeout=RPC_TIMEOUT)
+        ids = {segment.get("id") for segment in listed.get("segments", [])}
+
+        def flatten_and_reload(segment_id: str) -> tuple[object, object]:
+            started, _ = client.call(
+                "flatten.abf",
+                {"segmentId": segment_id, "iterations": 1},
+                timeout=RPC_TIMEOUT,
+            )
+            status = wait_for_job(client, started.get("jobId", ""), 60.0)
+            # A finished flatten reloads the segment list; the intersection
+            # render that reads the shown segment follows asynchronously.
+            deadline = time.monotonic() + 2.0
+            while proc.is_running() and time.monotonic() < deadline:
+                time.sleep(0.1)
+            state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+            return status.get("state"), (state.get("activeSurface") or {}).get("id")
+
+        job_state, active = flatten_and_reload(other_id)
+        results.record(
+            "segment_reload_without_active_segment",
+            {active_id, other_id, placeholder_id} <= ids
+            and job_state == "succeeded"
+            and active is None,
+            f"listed={sorted(value for value in ids if value)} "
+            f"job={job_state} active={active}",
+        )
+
+        client.call(
+            "segments.activate",
+            {"segmentId": active_id},
+            timeout=RPC_TIMEOUT,
+        )
+        # Generate Mask writes mask.tif, so the next reload reloads the
+        # active segment itself.
+        client.call(
+            "segment.generate_mask",
+            {"segmentId": active_id},
+            timeout=RPC_TIMEOUT,
+        )
+        job_state, active = flatten_and_reload(active_id)
+        results.record(
+            "segment_reload_keeps_active_segment",
+            job_state == "succeeded" and active == active_id,
+            f"job={job_state} active={active}",
+        )
+    except Exception as error:  # noqa: BLE001
+        # An abort can first show up as an RPC timeout while VC3D writes its
+        # crash report: give it time to exit, then print the report.
+        deadline = time.monotonic() + 30.0
+        while proc.is_running() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        try:
+            require_running(proc, results, "the segment reload check")
+        except RuntimeError:
+            pass
+        results.record(
+            "segment_reload_workflow",
+            False,
+            f"unexpected {type(error).__name__}: {error} "
+            f"(VC3D exit code {proc.exit_code()})",
+        )
+    finally:
+        if client is not None:
+            client.close()
+        proc.terminate()
+
+
 def check_c4(client: BridgeClient, results: Results, volpkg: str,
              broken_fiber_volpkg: str) -> None:
     # Liveness / dispatch sanity.
@@ -1811,6 +1941,7 @@ def main() -> int:
             check_volume_attach(client, results, tmp_path, volpkg)
             check_segments_attach(client, results, tmp_path, volpkg)
             check_open_data_editable_copy(client, results, tmp_path, volpkg)
+            check_segment_reload_keeps_active(binary, results, tmp_path)
             check_c4(client, results, str(volpkg), str(broken_volpkg))
             check_legacy_fiber_uuid(client, results, str(legacy_fiber_volpkg),
                                     legacy_fiber)

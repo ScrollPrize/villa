@@ -492,6 +492,7 @@ void SurfacePanelController::loadSurfacesIncremental()
     if (!changes.toReload.empty()) {
         std::vector<std::string> reloadedIds;
         reloadedIds.reserve(changes.toReload.size());
+        std::string activeSegId;  // the reloaded surface that was "segmentation"
 
         for (const auto& id : changes.toReload) {
             std::cout << "Queueing for reload: " << id << std::endl;
@@ -502,6 +503,7 @@ void SurfacePanelController::loadSurfacesIncremental()
             if (_state) {
                 _state->setSurface(id, nullptr, true, false);
                 if (wasActiveSeg) {
+                    activeSegId = id;
                     _state->setSurface("segmentation", nullptr, false, false);
                 }
             }
@@ -520,8 +522,12 @@ void SurfacePanelController::loadSurfacesIncremental()
 
             if (_state) {
                 _state->setSurface(id, reloadedSurface, true, false);
-                auto activeSegSurface = _state ? _state->surface("segmentation") : nullptr;
-                if (activeSegSurface == nullptr) {
+                // Only the segment that was active becomes active again (its
+                // unload above cleared CState's active surface); any other
+                // reloaded surface, e.g. an unfetched Open Data placeholder
+                // with no tifxyz yet, must not become "segmentation".
+                if (id == activeSegId) {
+                    _state->setActiveSurface(id, reloadedSurface);
                     _state->setSurface("segmentation", reloadedSurface, false, false);
                 }
             }
