@@ -7,6 +7,7 @@ import logging
 import math
 import shutil
 import tempfile
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -46,6 +47,7 @@ from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
 LOGGER = logging.getLogger(__name__)
+PROGRESS_LOG_INTERVAL_SECONDS = 30.0
 DEFAULT_OCCUPANCY_SCAN_LEVEL = "3"
 DEFAULT_OVERLAP = 0.5
 
@@ -741,10 +743,21 @@ def run_block_inference(
     amp_dtype: torch.dtype | None,
     tta_axes: Sequence[int],
     tta_batch_size: int | None,
+    progress_interval: float = PROGRESS_LOG_INTERVAL_SECONDS,
 ) -> None:
-    """Forward nonempty flat patches and feed their weighted probabilities."""
+    """Forward nonempty flat patches and feed their weighted probabilities.
+
+    Logs progress at INFO every ``progress_interval`` seconds (patches done,
+    rate, elapsed, remaining) and one summary line at the end, so a long run
+    over a remote volume is not silent between "Selected N patches" and the
+    TIFF write.
+    """
 
     mask_f32 = None if mask is None else mask.astype(np.float32, copy=False)
+    total_patches = len(loader.dataset)  # scheduled blocks, empty ones included
+    done_patches = 0
+    started = time.monotonic()
+    last_report = started
     autocast = (
         torch.autocast("cuda", dtype=amp_dtype)
         if device.type == "cuda"
@@ -752,6 +765,23 @@ def run_block_inference(
     )
     with torch.inference_mode(), autocast:
         for images_BCZYX, metadata in loader:
+            done_patches += int(metadata.shape[0])
+            now = time.monotonic()
+            if now - last_report >= progress_interval and done_patches < total_patches:
+                last_report = now
+                elapsed = now - started
+                rate = done_patches / elapsed if elapsed > 0 else 0.0
+                remaining = (total_patches - done_patches) / rate if rate > 0 else float("nan")
+                LOGGER.info(
+                    "ink inference: %d/%d patches (%.1f%%), %.1f patches/s, "
+                    "elapsed %.0f s, about %.0f s remaining",
+                    done_patches,
+                    total_patches,
+                    100.0 * done_patches / max(total_patches, 1),
+                    rate,
+                    elapsed,
+                    remaining,
+                )
             # The dataset records occupancy on raw patches; normalized all-zero
             # input is not a valid signal for this skip.
             keep = metadata[:, 4] > 0
@@ -786,6 +816,13 @@ def run_block_inference(
                     tile=tile,
                     tile_weights=weights,
                 )
+    elapsed = time.monotonic() - started
+    LOGGER.info(
+        "ink inference: %d patches in %.0f s (%.1f patches/s)",
+        done_patches,
+        elapsed,
+        done_patches / elapsed if elapsed > 0 else 0.0,
+    )
 
 
 def iter_probability_tiles(
