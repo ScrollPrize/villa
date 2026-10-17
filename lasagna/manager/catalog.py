@@ -11,6 +11,7 @@ import tempfile
 import time
 from typing import Any, Iterable
 from urllib.error import HTTPError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from .config import ManagerConfig
@@ -50,6 +51,22 @@ class VolumeRecord:
         for root in self.selected_origin.get("access_roots") or ():
             if root.get("type") == "s3" and root.get("url"):
                 return root["url"].rstrip("/") + "/" + self.selected_origin.get("path", "").lstrip("/")
+        return None
+
+    @property
+    def prefetch_url(self) -> str | None:
+        """Preferred bulk-prefetch source, preserving S3 precedence."""
+        if self.s3_url:
+            return self.s3_url
+        for origin in self.origins:
+            for root in _iter_values(origin.get("access_roots")):
+                url = root.get("url")
+                if (
+                    str(root.get("usage") or "").lower() == "public-read"
+                    and isinstance(url, str)
+                    and urlparse(url).scheme.lower() in {"http", "https"}
+                ):
+                    return url.rstrip("/") + "/" + str(origin.get("path") or "").lstrip("/")
         return None
 
 
@@ -169,6 +186,22 @@ def _iter_values(value: Any) -> Iterable[dict[str, Any]]:
     return (item for item in values if isinstance(item, dict))
 
 
+def _public_http_origin(origins: tuple[dict[str, Any], ...]) -> dict[str, Any] | None:
+    return next(
+        (
+            origin
+            for origin in origins
+            if any(
+                str(root.get("usage") or "").lower() == "public-read"
+                and isinstance(root.get("url"), str)
+                and urlparse(root["url"]).scheme.lower() in {"http", "https"}
+                for root in _iter_values(origin.get("access_roots"))
+            )
+        ),
+        None,
+    )
+
+
 def index_volumes(cache: CatalogCache) -> list[VolumeRecord]:
     records: list[VolumeRecord] = []
     for sample_key, sample_entry in sorted(cache.document.get("samples", {}).items()):
@@ -184,7 +217,19 @@ def index_volumes(cache: CatalogCache) -> list[VolumeRecord]:
                 for entry in ome_entries
                 for origin in _iter_values(entry.get("origins"))
             )
-            selected = next((origin for origin in origins if any(root.get("type") == "s3" for root in _iter_values(origin.get("access_roots")))), None)
+            selected = next(
+                (
+                    origin
+                    for origin in origins
+                    if any(
+                        root.get("type") == "s3"
+                        for root in _iter_values(origin.get("access_roots"))
+                    )
+                ),
+                None,
+            )
+            if selected is None:
+                selected = _public_http_origin(origins)
             properties = volume.get("properties") if isinstance(volume.get("properties"), dict) else {}
             license_value = properties.get("license")
             shape_value = properties.get("shape")
