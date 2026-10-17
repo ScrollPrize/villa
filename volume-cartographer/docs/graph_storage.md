@@ -1,11 +1,16 @@
-# Graph object identity and external files
+# Graph object identity and storage
+
+Schema v3 also supports [managed geometry inside SQLite](graph_geometry.md),
+including immutable revisions, chunked binary arrays, and source ingestion.
+The external-file behavior below describes metadata-only objects and the
+source-location hints retained for re-ingestion.
 
 The graph identifies objects by UUID. Patch import preserves the UUID in
 `meta.json`; fiber import preserves the UUID in the fiber JSON. PCL linking
 preserves each collection's UUID in its point-collections JSON. Edges reference
 those UUIDs. `name` is a display label, and `storage_ref` is a location hint,
-normally relative to the graph file's directory. The graph stores metadata and
-relationships; geometry remains in the external files.
+normally relative to the graph file's directory. Until explicitly ingested, the graph stores metadata and
+relationships and geometry remains in the external files.
 
 Use `GraphDb::resolveStoragePath` in C++, or `resolve_storage_path` in Python,
 to locate a file-backed patch, fiber or point collection:

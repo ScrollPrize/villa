@@ -7,8 +7,8 @@
 // stamps detector provenance into each edge's meta and leaves every
 // found edge approval_state='pending' until reviewed.
 //
-// vc_graph itself stays a metadata-only store; everything geometric
-// lives here (and in vc_core). Detector entry points are placeholders
+// vc_graph also stores immutable geometry; these detectors still read their
+// external source formats. Detector entry points are placeholders
 // until their geometry passes land; the commit plumbing is final.
 
 #include <array>

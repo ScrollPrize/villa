@@ -17,6 +17,8 @@
 #include <nanobind/stl/vector.h>
 
 #include "vc/core/graph/GraphDb.hpp"
+#include "vc/core/graph/GeometryIngest.hpp"
+#include "vc/core/graph/GeometryExport.hpp"
 #include "vc/core/graph_links/GraphLinks.hpp"
 #include "vc/core/util/CtSheetNormal.hpp"
 
@@ -282,6 +284,50 @@ nb::dict reportToPy(const vg::ImportReport& rep)
     for (const auto& p : rep.problems) problems.append(pyStr(p));
     d["problems"] = problems;
     return d;
+}
+
+vg::GeometryData geometryFromPy(const nb::dict& input)
+{
+    vg::GeometryData result;
+    result.kind = nb::cast<std::string>(input["kind"]);
+    if (input.contains("format_version")) result.formatVersion = nb::cast<int64_t>(input["format_version"]);
+    if (input.contains("coordinate_system")) result.coordinateSystem = nb::cast<std::string>(input["coordinate_system"]);
+    if (input.contains("attributes")) result.attributes = jsonDumps(input["attributes"]);
+    for (const auto item : nb::cast<nb::list>(input["arrays"])) {
+        const auto a = nb::cast<nb::dict>(item);
+        vg::GeometryArray array;
+        array.name = nb::cast<std::string>(a["name"]);
+        array.dtype = nb::cast<std::string>(a["dtype"]);
+        array.shape = nb::cast<std::vector<int64_t>>(a["shape"]);
+        const auto bytes = nb::cast<nb::bytes>(a["data"]);
+        const auto* begin = reinterpret_cast<const uint8_t*>(bytes.c_str());
+        array.bytes.assign(begin, begin + bytes.size());
+        result.arrays.push_back(std::move(array));
+    }
+    return result;
+}
+nb::dict geometryToPy(const vg::GeometryRevision& r)
+{
+    nb::dict result;
+    result["uuid"] = r.uuid; result["object_uuid"] = r.objectUuid;
+    result["parent_uuid"] = r.parentUuid; result["content_hash"] = r.contentHash;
+    result["kind"] = r.kind; result["format_version"] = r.formatVersion;
+    result["coordinate_system"] = r.coordinateSystem; result["attributes"] = jsonLoads(r.attributes);
+    result["object_generation"] = r.objectGeneration;
+    result["created_by"] = r.createdBy; result["created_at"] = r.createdAt; result["created_host"] = r.createdHost;
+    nb::list arrays;
+    for (const auto& a : r.arrays) {
+        nb::dict item; item["name"] = a.name; item["dtype"] = a.dtype;
+        item["shape"] = a.shape; item["byte_length"] = a.byteLength; arrays.append(item);
+    }
+    result["arrays"] = arrays;
+    return result;
+}
+nb::dict geometryReportToPy(const vg::GeometryIngestReport& r)
+{
+    nb::dict result;
+    result["ingested"] = r.ingested; result["unchanged"] = r.unchanged; result["problems"] = r.problems;
+    return result;
 }
 
 struct PyGraphDb {
@@ -593,6 +639,57 @@ NB_MODULE(graph, m)
                 return out;
             },
             nb::arg("after_seq") = 0)
+        .def("put_geometry", [](PyGraphDb& self, const std::string& uuid, const nb::dict& input,
+                               const std::optional<std::string>& expected) {
+            const auto data = geometryFromPy(input);
+            nb::gil_scoped_release release;
+            return self.withWrite([&](vg::GraphDb& db, vg::WriteTxn& txn) { return db.putGeometry(txn, uuid, data, expected); });
+        }, nb::arg("object_uuid"), nb::arg("geometry"), nb::arg("expected_revision") = std::nullopt)
+        .def("current_geometry", [](PyGraphDb& self, const std::string& uuid) -> nb::object {
+            const auto revision = self.withRead([&](vg::GraphDb& db, vg::ReadTxn& txn) { return db.currentGeometry(txn, uuid); });
+            return revision ? nb::object(geometryToPy(*revision)) : nb::none();
+        }, nb::arg("object_uuid"))
+        .def("geometry_revision", [](PyGraphDb& self, const std::string& uuid) -> nb::object {
+            const auto revision = self.withRead([&](vg::GraphDb& db, vg::ReadTxn& txn) { return db.geometryRevision(txn, uuid); });
+            return revision ? nb::object(geometryToPy(*revision)) : nb::none();
+        }, nb::arg("revision_uuid"))
+        .def("geometry_history", [](PyGraphDb& self, const std::string& uuid) {
+            const auto revisions = self.withRead([&](vg::GraphDb& db, vg::ReadTxn& txn) { return db.geometryHistory(txn, uuid); });
+            nb::list result; for (const auto& r : revisions) result.append(geometryToPy(r)); return result;
+        }, nb::arg("object_uuid"))
+        .def("read_geometry_array", [](PyGraphDb& self, const std::string& uuid, const std::string& name,
+                                      int64_t offset, const std::optional<int64_t>& count) {
+            std::vector<uint8_t> bytes;
+            { nb::gil_scoped_release release;
+              bytes = self.withRead([&](vg::GraphDb& db, vg::ReadTxn& txn) { return db.readGeometryArray(txn, uuid, name, offset, count); }); }
+            return nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        }, nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("byte_offset") = 0, nb::arg("byte_count") = std::nullopt)
+        .def("edge_geometry_state", [](PyGraphDb& self, const std::string& uuid) {
+            const auto state = self.withRead([&](vg::GraphDb& db, vg::ReadTxn& txn) { return db.edgeGeometryState(txn, uuid); });
+            nb::dict result; result["a_revision"] = state.aRevision; result["b_revision"] = state.bRevision; result["stale"] = state.stale; return result;
+        }, nb::arg("edge_uuid"))
+        .def("revalidate_edge_geometry", [](PyGraphDb& self, const std::string& uuid) {
+            self.withWrite([&](vg::GraphDb& db, vg::WriteTxn& txn) { db.revalidateEdgeGeometry(txn, uuid); return 0; });
+        }, nb::arg("edge_uuid"))
+        .def("ingest_registered_geometry", [](PyGraphDb& self, const std::optional<std::filesystem::path>& root,
+                                             const std::vector<std::string>& uuids) {
+            vg::GeometryIngestReport result;
+            { nb::gil_scoped_release release; result = vg::ingestRegisteredGeometry(self.require(), root, uuids); }
+            return geometryReportToPy(result);
+        }, nb::arg("dataset_root") = std::nullopt, nb::arg("object_uuids") = std::vector<std::string>{})
+        .def("ingest_geometry_source", [](PyGraphDb& self, const std::string& kind, const std::filesystem::path& source) {
+            vg::GeometryIngestReport result;
+            { nb::gil_scoped_release release; result = vg::ingestGeometrySource(self.require(), kind, source); }
+            return geometryReportToPy(result);
+        }, nb::arg("kind"), nb::arg("source"))
+        .def("export_geometry", [](PyGraphDb& self, const std::string& object,
+                                   const std::filesystem::path& destination,
+                                   const std::optional<std::string>& revision, bool overwrite) {
+            nb::gil_scoped_release release;
+            return vg::exportGeometry(self.require(), object, destination, revision, overwrite);
+        }, nb::arg("object_uuid"), nb::arg("destination"), nb::arg("revision_uuid") = std::nullopt,
+           nb::arg("overwrite") = false,
+           "Export one immutable revision to native files; return its UUID. Does not modify the graph.")
         .def("resolve_storage_path",
              [](PyGraphDb& self, const std::string& uuid,
                 const std::optional<std::filesystem::path>& datasetRoot) {
@@ -798,6 +895,14 @@ NB_MODULE(graph, m)
             const bool failed = nb::len(args) > 0 && !args[0].is_none();
             self.exit(failed);
         })
+        .def("put_geometry", [](PyWriteTxn& self, const std::string& uuid, const nb::dict& input,
+                               const std::optional<std::string>& expected) {
+            const auto data = geometryFromPy(input);
+            return self.owner->require().putGeometry(self.require(), uuid, data, expected);
+        }, nb::arg("object_uuid"), nb::arg("geometry"), nb::arg("expected_revision") = std::nullopt)
+        .def("revalidate_edge_geometry", [](PyWriteTxn& self, const std::string& uuid) {
+            self.owner->require().revalidateEdgeGeometry(self.require(), uuid);
+        }, nb::arg("edge_uuid"))
         .def("upsert_object",
              [](PyWriteTxn& self, const nb::dict& rec) { return self.owner->upsertObjectIn(self.owner->require(), self.require(), rec); })
         .def("add_edge",

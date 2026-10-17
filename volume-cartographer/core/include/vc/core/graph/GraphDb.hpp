@@ -1,6 +1,6 @@
 #pragma once
 
-// SQLite-backed unified metadata graph (see
+// SQLite-backed unified geometry and metadata graph (see
 // docs/plans/graph_db_initial_implementation.md). Objects and edges are
 // generic records: `kind` is metadata on the record, never encoded in
 // API verbs. Every record carries explicit tier-1 fields (uuid, kind,
@@ -8,6 +8,7 @@
 // plus an open-ended `meta` JSON object for caller-defined metadata.
 
 #include "vc/core/util/Progress.hpp"
+#include "vc/core/graph/Geometry.hpp"
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -163,6 +164,26 @@ public:
     std::string hostname() const;
     std::string author() const;
 
+    // Immutable geometry. A null expectedRevision means "expect no geometry";
+    // pass the current revision UUID to replace it. Stale writers fail, even
+    // when their proposed bytes match. Identical current content is a no-op.
+    // The write is savepoint-protected and invalidates connected edge approvals.
+    std::string putGeometry(WriteTxn& txn, const std::string& objectUuid,
+                            const GeometryData& data,
+                            const std::optional<std::string>& expectedRevision = std::nullopt);
+    std::optional<GeometryRevision> currentGeometry(const Txn& txn, const std::string& objectUuid) const;
+    std::optional<GeometryRevision> geometryRevision(const Txn& txn, const std::string& revisionUuid) const;
+    std::vector<GeometryRevision> geometryHistory(const Txn& txn, const std::string& objectUuid) const;
+    // Byte ranges allow bounded loading without materializing a whole array.
+    // Every touched chunk is verified against its SHA-256 content address.
+    std::vector<uint8_t> readGeometryArray(const Txn& txn, const std::string& revisionUuid,
+        const std::string& arrayName, int64_t byteOffset = 0,
+        const std::optional<int64_t>& byteCount = std::nullopt) const;
+    EdgeGeometryState edgeGeometryState(const Txn& txn, const std::string& edgeUuid) const;
+    // Explicitly acknowledge that anchors/relationship have been revalidated
+    // against the current endpoint revisions. Resets approval and journals.
+    void revalidateEdgeGeometry(WriteTxn& txn, const std::string& edgeUuid);
+
     // Objects. upsertObject creates (minting a UUID when record.uuid is
     // empty) or updates by UUID; updates bump generation, restamp
     // changed_*, reset approval, and journal. Returns the UUID.
@@ -177,7 +198,7 @@ public:
     std::vector<ObjectRecord> objectsByKind(const Txn& txn, const std::string& kind,
                                             const std::optional<std::string>& approvalState = std::nullopt) const;
     std::vector<ObjectRecord> objectsByTag(const Txn& txn, const std::string& tag) const;
-    void deleteObject(WriteTxn& txn, const std::string& uuid);  // fails while edges reference it
+    void deleteObject(WriteTxn& txn, const std::string& uuid);  // fails while edges or retained geometry reference it
 
     // Edges. addEdge normalises endpoint order (swapping anchors to
     // match) and enforces (kind, endpoints, anchors) uniqueness.
@@ -230,6 +251,7 @@ public:
         const Txn& txn, const std::string& objectUuid,
         const std::optional<std::filesystem::path>& datasetRoot = std::nullopt) const;
 
+    // Managed geometry objects are excluded from this external-source audit.
     // Reports objects whose external data reference does not check out
     // (storage file missing, or data_generation ahead of generation).
     // Paths are resolved relative to the DB file's directory.
@@ -246,6 +268,8 @@ public:
     // Existing identical records are a no-op; conflicts are rejected (no merge).
     // Version 1 remains readable but cannot restore missing provenance.
     // Journal history is local and is not part of a graph snapshot.
+    // Export refuses selected objects with managed geometry: use a SQLite
+    // backup for a self-contained geometry database (including history).
     std::string exportJson(const Txn& txn, const std::optional<std::string>& objectKind = std::nullopt,
                            const std::optional<std::string>& tag = std::nullopt) const;
     void importJson(WriteTxn& txn, const std::string& jsonText);

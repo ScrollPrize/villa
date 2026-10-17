@@ -1,5 +1,6 @@
 #include "vc/core/graph/GraphDb.hpp"
 #include "GraphFiberInput.hpp"
+#include "GraphGeometryInternal.hpp"
 
 #include <sqlite3.h>
 
@@ -33,7 +34,7 @@ namespace vc::graph {
 namespace {
 
 constexpr int kApplicationId = 0x56434752;  // VCGR
-constexpr int kSchemaVersion = 2;
+constexpr int kSchemaVersion = 3;
 
 [[noreturn]] void fail(sqlite3* db, const std::string& what)
 {
@@ -262,6 +263,54 @@ CREATE TABLE journal(
 CREATE INDEX journal_record ON journal(record_uuid, seq);
 )SQL";
 
+const char* kGeometrySchemaSql = R"SQL(
+CREATE TABLE geometry_chunks(
+  hash TEXT PRIMARY KEY CHECK(length(hash)=64),
+  data BLOB NOT NULL CHECK(length(data)>0 AND length(data)<=1048576)
+);
+CREATE TABLE geometry_revisions(
+  uuid BLOB PRIMARY KEY CHECK(length(uuid)=16),
+  object_uuid BLOB NOT NULL REFERENCES objects(uuid) ON DELETE RESTRICT,
+  parent_uuid BLOB,
+  content_hash TEXT NOT NULL CHECK(length(content_hash)=64),
+  manifest TEXT NOT NULL CHECK(json_valid(manifest) AND json_type(manifest)='object'),
+  object_generation INTEGER NOT NULL,
+  created_by TEXT NOT NULL, created_at TEXT NOT NULL, created_host TEXT NOT NULL,
+  UNIQUE(object_uuid,uuid),
+  FOREIGN KEY(object_uuid,parent_uuid) REFERENCES geometry_revisions(object_uuid,uuid)
+);
+CREATE INDEX geometry_history ON geometry_revisions(object_uuid,object_generation);
+CREATE TABLE geometry_heads(
+  object_uuid BLOB PRIMARY KEY REFERENCES objects(uuid) ON DELETE RESTRICT,
+  revision_uuid BLOB NOT NULL,
+  FOREIGN KEY(object_uuid,revision_uuid) REFERENCES geometry_revisions(object_uuid,uuid)
+);
+CREATE TABLE geometry_revision_chunks(
+  revision_uuid BLOB NOT NULL REFERENCES geometry_revisions(uuid),
+  array_name TEXT NOT NULL, chunk_index INTEGER NOT NULL CHECK(chunk_index>=0),
+  hash TEXT NOT NULL REFERENCES geometry_chunks(hash),
+  PRIMARY KEY(revision_uuid,array_name,chunk_index)
+);
+CREATE TABLE edge_geometry_bindings(
+  edge_id INTEGER PRIMARY KEY REFERENCES edges(id) ON DELETE CASCADE,
+  a_revision BLOB REFERENCES geometry_revisions(uuid),
+  b_revision BLOB REFERENCES geometry_revisions(uuid)
+);
+INSERT INTO edge_geometry_bindings(edge_id) SELECT id FROM edges;
+CREATE TRIGGER geometry_chunks_immutable_update BEFORE UPDATE ON geometry_chunks
+  BEGIN SELECT RAISE(ABORT,'geometry chunks are immutable'); END;
+CREATE TRIGGER geometry_chunks_immutable_delete BEFORE DELETE ON geometry_chunks
+  BEGIN SELECT RAISE(ABORT,'geometry chunks are retained'); END;
+CREATE TRIGGER geometry_revisions_immutable_update BEFORE UPDATE ON geometry_revisions
+  BEGIN SELECT RAISE(ABORT,'geometry revisions are immutable'); END;
+CREATE TRIGGER geometry_revisions_immutable_delete BEFORE DELETE ON geometry_revisions
+  BEGIN SELECT RAISE(ABORT,'geometry revisions are retained'); END;
+CREATE TRIGGER geometry_revision_chunks_immutable_update BEFORE UPDATE ON geometry_revision_chunks
+  BEGIN SELECT RAISE(ABORT,'geometry chunk references are immutable'); END;
+CREATE TRIGGER geometry_revision_chunks_immutable_delete BEFORE DELETE ON geometry_revision_chunks
+  BEGIN SELECT RAISE(ABORT,'geometry chunk references are retained'); END;
+)SQL";
+
 void applyPragmas(sqlite3* db, const OpenOptions& options, bool queryOnly)
 {
     sqlite3_busy_timeout(db, options.busyTimeoutMs);
@@ -323,6 +372,10 @@ void migrateSchema(sqlite3* db, const std::string& author, const std::string& ho
                 snapshot.stepDone();
             }
             exec(db, "PRAGMA user_version=2;");
+        }
+        if (version == 1 || version == 2) {
+            exec(db, kGeometrySchemaSql);
+            exec(db, "PRAGMA user_version=3;");
         } else if (version != kSchemaVersion) {
             throw std::runtime_error("graph db: unsupported schema version");
         }
@@ -405,6 +458,7 @@ std::unique_ptr<GraphDb::Impl> GraphDb::openImpl(const std::filesystem::path& pa
         exec(impl->writer, "BEGIN IMMEDIATE;");
         try {
             exec(impl->writer, kSchemaSql);
+            exec(impl->writer, kGeometrySchemaSql);
             exec(impl->writer, ("PRAGMA user_version=" + std::to_string(kSchemaVersion) + ";").c_str());
             exec(impl->writer, "COMMIT;");
         } catch (...) {
@@ -433,8 +487,8 @@ std::unique_ptr<GraphDb::Impl> GraphDb::openImpl(const std::filesystem::path& pa
             if (pragmaInt(conn, "application_id") != kApplicationId)
                 throw std::runtime_error("graph db: not a VC graph database: " + path.string());
             const auto version = pragmaInt(conn, "user_version");
-            if (version == 1)
-                throw std::runtime_error("graph db: schema v1 requires migration; open read-write once before opening read-only");
+            if (version > 0 && version < kSchemaVersion)
+                throw std::runtime_error("graph db: schema v" + std::to_string(version) + " requires migration; open read-write once before opening read-only");
             if (version != kSchemaVersion)
                 throw std::runtime_error("graph db: unsupported schema version in " + path.string());
         }
@@ -771,6 +825,16 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
         rec.meta = "{}";
     const auto uuid = parseUuid(rec.uuid);
     const std::string now = nowIsoUtc();
+    Statement managed(db, "SELECT o.data_generation,o.data_checksum,o.storage_ref FROM objects o JOIN geometry_heads h ON h.object_uuid=o.uuid WHERE o.uuid=?");
+    managed.bindBlob(1, uuid);
+    if (managed.row()) {
+        rec.storageKind = "sqlite";
+        rec.storageRef = managed.text(2);
+        rec.dataGeneration = managed.i64(0);
+        rec.dataChecksum = managed.text(1);
+    } else if (rec.storageKind == "sqlite") {
+        throw std::invalid_argument("graph db: managed geometry requires putGeometry, not a storage_kind override");
+    }
 
     int64_t id = 0;
     int64_t generation = 1;
@@ -930,6 +994,11 @@ std::string addEdgeImpl(sqlite3* db, const std::string& author, const std::strin
     s.bind(31, rec.meta);
     s.stepDone();
     const int64_t id = sqlite3_last_insert_rowid(db);
+    Statement binding(db, "INSERT INTO edge_geometry_bindings(edge_id,a_revision,b_revision) VALUES(?,"
+        "(SELECT revision_uuid FROM geometry_heads WHERE object_uuid=?),"
+        "(SELECT revision_uuid FROM geometry_heads WHERE object_uuid=?))");
+    binding.bind(1, id); binding.bindBlob(2, parseUuid(rec.aUuid)); binding.bindBlob(3, parseUuid(rec.bUuid));
+    binding.stepDone();
     writeTags(db, "edge_tags", "edge_id", id, rec.tags);
     if (preserveRecord) restoreCommon(db, "edges", rec);
     appendJournal(db, author, host, parseUuid(rec.uuid), preserveRecord ? rec.generation : 1, preserveRecord ? "import" : "add_edge");
@@ -1217,6 +1286,8 @@ std::vector<std::string> GraphDb::reachableWithin(const Txn& txn, const std::str
 
 void GraphDb::setApproval(WriteTxn& txn, const std::string& recordUuid, const std::string& state)
 {
+    if (state == "approved" && edgeByUuid(txn, recordUuid) && edgeGeometryState(txn, recordUuid).stale)
+        throw std::runtime_error("graph db: revalidate edge geometry before approving a stale edge");
     if (state != "pending" && state != "approved" && state != "rejected")
         throw std::runtime_error("graph db: invalid approval state: " + state);
     sqlite3* db = GraphDbImplAccess::conn(txn);
@@ -1332,7 +1403,7 @@ std::optional<std::filesystem::path> GraphDb::resolveStoragePath(
 {
     namespace fs = std::filesystem;
     const auto object = objectByUuid(txn, objectUuid);
-    if (!object || object->storageKind != "file" ||
+    if (!object || (object->storageKind != "file" && object->storageKind != "sqlite") ||
         (object->kind != "patch" && object->kind != "fiber" && object->kind != "point_collection"))
         return std::nullopt;
 
@@ -1419,7 +1490,7 @@ std::vector<std::string> GraphDb::sweepExternalData(const Txn& txn) const
 {
     sqlite3* db = GraphDbImplAccess::conn(txn);
     std::vector<std::string> problems;
-    Statement s(db, "SELECT uuid,storage_ref,data_generation,generation FROM objects WHERE storage_ref<>'' ORDER BY id");
+    Statement s(db, "SELECT uuid,storage_ref,data_generation,generation FROM objects WHERE storage_ref<>'' AND storage_kind<>'sqlite' ORDER BY id");
     const auto root = impl_->path.parent_path();
     while (s.row()) {
         const std::string uuid = formatUuid(s.blob16(0));
@@ -1652,6 +1723,8 @@ std::string GraphDb::exportJson(const Txn& txn, const std::optional<std::string>
     if (tag && objectKind)
         std::erase_if(objects, [&](const ObjectRecord& o) { return o.kind != *objectKind; });
     for (const auto& o : objects) {
+        if (currentGeometry(txn, o.uuid))
+            throw std::runtime_error("graph db: JSON export is metadata-only; use a SQLite backup to preserve geometry and revision history");
         included.insert(o.uuid);
         out["objects"].push_back(objectToJson(o));
     }
@@ -2094,6 +2167,194 @@ ImportReport importTrackList(GraphDb& db, WriteTxn& txn, const std::filesystem::
     }
     util::reportProgress(progress, "registering tracks", root.size(), root.size());
     return report;
+}
+
+namespace {
+std::optional<std::string> geometryHead(sqlite3* db, const std::string& objectUuid)
+{
+    Statement s(db, "SELECT revision_uuid FROM geometry_heads WHERE object_uuid=?");
+    s.bindBlob(1, parseUuid(objectUuid));
+    return s.row() ? std::optional(formatUuid(s.blob16(0))) : std::nullopt;
+}
+
+GeometryRevision readGeometryRevision(const Statement& s)
+{
+    GeometryRevision r;
+    r.uuid = formatUuid(s.blob16(0)); r.objectUuid = formatUuid(s.blob16(1));
+    if (!s.isNull(2)) r.parentUuid = formatUuid(s.blob16(2));
+    r.contentHash = s.text(3);
+    const auto text = s.text(4);
+    if (detail::geometryHash(std::span(reinterpret_cast<const uint8_t*>(text.data()), text.size())) != r.contentHash)
+        throw std::runtime_error("geometry: corrupt revision manifest");
+    const auto manifest = nlohmann::json::parse(text);
+    r.kind = manifest.at("kind"); r.formatVersion = manifest.at("format_version");
+    r.coordinateSystem = manifest.at("coordinate_system"); r.attributes = manifest.at("attributes").dump();
+    r.objectGeneration = s.i64(5); r.createdBy = s.text(6); r.createdAt = s.text(7); r.createdHost = s.text(8);
+    for (const auto& [name, a] : manifest.at("arrays").items())
+        r.arrays.push_back({name, a.at("dtype"), a.at("shape").get<std::vector<int64_t>>(), a.at("byte_length")});
+    return r;
+}
+constexpr const char* geometryColumns = "uuid,object_uuid,parent_uuid,content_hash,manifest,object_generation,created_by,created_at,created_host";
+}
+
+std::optional<GeometryRevision> GraphDb::geometryRevision(const Txn& txn, const std::string& revisionUuid) const
+{
+    if (txn.db_ != this) throw std::invalid_argument("geometry: transaction belongs to another database");
+    Statement s(GraphDbImplAccess::conn(txn), std::string("SELECT ") + geometryColumns + " FROM geometry_revisions WHERE uuid=?");
+    s.bindBlob(1, parseUuid(revisionUuid));
+    return s.row() ? std::optional(readGeometryRevision(s)) : std::nullopt;
+}
+
+std::optional<GeometryRevision> GraphDb::currentGeometry(const Txn& txn, const std::string& objectUuid) const
+{
+    if (txn.db_ != this) throw std::invalid_argument("geometry: transaction belongs to another database");
+    const auto head = geometryHead(GraphDbImplAccess::conn(txn), objectUuid);
+    return head ? geometryRevision(txn, *head) : std::nullopt;
+}
+
+std::vector<GeometryRevision> GraphDb::geometryHistory(const Txn& txn, const std::string& objectUuid) const
+{
+    if (txn.db_ != this) throw std::invalid_argument("geometry: transaction belongs to another database");
+    Statement s(GraphDbImplAccess::conn(txn), std::string("SELECT ") + geometryColumns + " FROM geometry_revisions WHERE object_uuid=? ORDER BY object_generation");
+    s.bindBlob(1, parseUuid(objectUuid));
+    std::vector<GeometryRevision> result;
+    while (s.row()) result.push_back(readGeometryRevision(s));
+    return result;
+}
+
+std::string GraphDb::putGeometry(WriteTxn& txn, const std::string& objectUuid, const GeometryData& data,
+    const std::optional<std::string>& expectedRevision)
+{
+    if (txn.db_ != this) throw std::invalid_argument("geometry: transaction belongs to another database");
+    auto* db = GraphDbImplAccess::conn(txn);
+    const auto object = objectByUuid(txn, objectUuid);
+    if (!object || object->kind != data.kind) throw std::invalid_argument("geometry: object missing or kind mismatch");
+    const auto current = currentGeometry(txn, objectUuid);
+    const auto expected = expectedRevision ? std::optional(formatUuid(parseUuid(*expectedRevision))) : std::nullopt;
+    if ((current ? std::optional(current->uuid) : std::nullopt) != expected)
+        throw std::runtime_error("geometry: current revision changed; reload before committing");
+    const auto manifest = detail::geometryManifest(data);
+    const auto manifestText = manifest.dump();
+    const auto contentHash = detail::geometryHash(std::span(reinterpret_cast<const uint8_t*>(manifestText.data()), manifestText.size()));
+    if (current && current->contentHash == contentHash) return current->uuid;
+
+    exec(db, "SAVEPOINT geometry_publish;");
+    try {
+        const auto revisionUuid = util::newUuid();
+        Statement revision(db, "INSERT INTO geometry_revisions VALUES(?,?,?,?,?,?,?,?,?)");
+        revision.bindBlob(1, parseUuid(revisionUuid)); revision.bindBlob(2, parseUuid(objectUuid));
+        if (current) revision.bindBlob(3, parseUuid(current->uuid)); else revision.bindNull(3);
+        revision.bind(4, contentHash); revision.bind(5, manifestText); revision.bind(6, object->generation + 1);
+        revision.bind(7, author()); revision.bind(8, nowIsoUtc()); revision.bind(9, hostname()); revision.stepDone();
+        Statement insert(db, "INSERT INTO geometry_chunks(hash,data) VALUES(?,?) ON CONFLICT(hash) DO NOTHING");
+        Statement verify(db, "SELECT data FROM geometry_chunks WHERE hash=?");
+        Statement reference(db, "INSERT INTO geometry_revision_chunks VALUES(?,?,?,?)");
+        for (const auto& array : data.arrays) {
+            size_t index = 0;
+            for (size_t offset = 0; offset < array.bytes.size(); offset += detail::geometryChunkSize, ++index) {
+                const auto bytes = std::span(array.bytes).subspan(offset, std::min(detail::geometryChunkSize, array.bytes.size() - offset));
+                const std::string hash = manifest.at("arrays").at(array.name).at("chunks").at(index);
+                insert.reset(); insert.bind(1, hash);
+                check(sqlite3_bind_blob64(insert.value, 2, bytes.data(), bytes.size(), SQLITE_STATIC), db, "bind geometry chunk");
+                insert.stepDone();
+                // Never silently reuse corrupt data, even on a hash collision.
+                verify.reset(); verify.bind(1, hash);
+                if (!verify.row() || sqlite3_column_bytes(verify.value, 0) != static_cast<int>(bytes.size()) ||
+                    std::memcmp(sqlite3_column_blob(verify.value, 0), bytes.data(), bytes.size()) != 0)
+                    throw std::runtime_error("geometry: corrupt or colliding payload hash");
+                reference.reset(); reference.bindBlob(1, parseUuid(revisionUuid)); reference.bind(2, array.name);
+                reference.bind(3, static_cast<int64_t>(index)); reference.bind(4, hash); reference.stepDone();
+            }
+        }
+        Statement head(db, "INSERT INTO geometry_heads VALUES(?,?) ON CONFLICT(object_uuid) DO UPDATE SET revision_uuid=excluded.revision_uuid");
+        head.bindBlob(1, parseUuid(objectUuid)); head.bindBlob(2, parseUuid(revisionUuid)); head.stepDone();
+        const auto id = *objectIdByUuid(db, parseUuid(objectUuid));
+        stampContentChange(db, author(), hostname(), "objects", id, parseUuid(objectUuid), "geometry");
+        Statement update(db, "UPDATE objects SET storage_kind='sqlite',data_generation=generation,data_checksum=? WHERE id=?");
+        update.bind(1, contentHash); update.bind(2, id); update.stepDone();
+        // Retain endpoint bindings: they now identify what old anchors refer to.
+        // Legacy edges have unknown bindings and become stale on first ingestion.
+        for (const auto& edge : edgesOf(txn, objectUuid))
+            stampContentChange(db, author(), hostname(), "edges", *edgeIdByUuid(db, parseUuid(edge.uuid)), parseUuid(edge.uuid), "geometry_invalidated");
+        exec(db, "RELEASE geometry_publish;");
+        return revisionUuid;
+    } catch (...) {
+        exec(db, "ROLLBACK TO geometry_publish; RELEASE geometry_publish;");
+        throw;
+    }
+}
+
+std::vector<uint8_t> GraphDb::readGeometryArray(const Txn& txn, const std::string& revisionUuid,
+    const std::string& arrayName, int64_t byteOffset, const std::optional<int64_t>& byteCount) const
+{
+    const auto revision = geometryRevision(txn, revisionUuid);
+    if (!revision) throw std::invalid_argument("geometry: revision not found");
+    const auto array = std::find_if(revision->arrays.begin(), revision->arrays.end(), [&](const auto& a) { return a.name == arrayName; });
+    if (array == revision->arrays.end()) throw std::invalid_argument("geometry: array not found: " + arrayName);
+    if (byteOffset < 0 || byteOffset > array->byteLength) throw std::out_of_range("geometry: invalid byte offset");
+    const auto count = byteCount.value_or(array->byteLength - byteOffset);
+    if (count < 0 || count > array->byteLength - byteOffset) throw std::out_of_range("geometry: invalid byte count");
+    std::vector<uint8_t> result(static_cast<size_t>(count));
+    if (!count) return result;
+    auto* db = GraphDbImplAccess::conn(txn);
+    Statement manifestQuery(db, "SELECT manifest FROM geometry_revisions WHERE uuid=?");
+    manifestQuery.bindBlob(1, parseUuid(revisionUuid)); (void)manifestQuery.row();
+    const auto hashes = nlohmann::json::parse(manifestQuery.text(0)).at("arrays").at(arrayName).at("chunks");
+    const auto first = byteOffset / detail::geometryChunkSize, last = (byteOffset + count - 1) / detail::geometryChunkSize;
+    Statement chunk(db, "SELECT c.data,r.hash FROM geometry_revision_chunks r JOIN geometry_chunks c ON c.hash=r.hash "
+        "WHERE r.revision_uuid=? AND r.array_name=? AND r.chunk_index=?");
+    for (auto i = first; i <= last; ++i) {
+        chunk.reset(); chunk.bindBlob(1, parseUuid(revisionUuid)); chunk.bind(2, arrayName); chunk.bind(3, static_cast<int64_t>(i));
+        if (!chunk.row()) throw std::runtime_error("geometry: missing payload chunk");
+        const auto bytes = std::span(static_cast<const uint8_t*>(sqlite3_column_blob(chunk.value, 0)), static_cast<size_t>(sqlite3_column_bytes(chunk.value, 0)));
+        const auto base = static_cast<int64_t>(i * detail::geometryChunkSize);
+        if (static_cast<int64_t>(bytes.size()) != std::min<int64_t>(detail::geometryChunkSize, array->byteLength - base) ||
+            chunk.text(1) != hashes.at(i).get<std::string>() || detail::geometryHash(bytes) != chunk.text(1))
+            throw std::runtime_error("geometry: corrupt payload chunk");
+        const auto begin = std::max(base, byteOffset), end = std::min(base + static_cast<int64_t>(bytes.size()), byteOffset + count);
+        std::memcpy(result.data() + begin - byteOffset, bytes.data() + begin - base, static_cast<size_t>(end - begin));
+    }
+    return result;
+}
+
+EdgeGeometryState GraphDb::edgeGeometryState(const Txn& txn, const std::string& edgeUuid) const
+{
+    if (txn.db_ != this) throw std::invalid_argument("geometry: transaction belongs to another database");
+    auto* db = GraphDbImplAccess::conn(txn);
+    const auto edge = edgeByUuid(txn, edgeUuid);
+    if (!edge) throw std::invalid_argument("geometry: edge not found");
+    Statement binding(db, "SELECT b.a_revision,b.b_revision FROM edge_geometry_bindings b JOIN edges e ON e.id=b.edge_id WHERE e.uuid=?");
+    binding.bindBlob(1, parseUuid(edgeUuid));
+    EdgeGeometryState result;
+    if (binding.row()) {
+        if (!binding.isNull(0)) result.aRevision = formatUuid(binding.blob16(0));
+        if (!binding.isNull(1)) result.bRevision = formatUuid(binding.blob16(1));
+    }
+    result.stale = result.aRevision != geometryHead(db, edge->aUuid) || result.bRevision != geometryHead(db, edge->bUuid);
+    return result;
+}
+
+void GraphDb::revalidateEdgeGeometry(WriteTxn& txn, const std::string& edgeUuid)
+{
+    const auto state = edgeGeometryState(txn, edgeUuid);
+    if (!state.stale) return;
+    auto* db = GraphDbImplAccess::conn(txn);
+    const auto edge = *edgeByUuid(txn, edgeUuid);
+    const auto id = *edgeIdByUuid(db, parseUuid(edgeUuid));
+    exec(db, "SAVEPOINT geometry_revalidate;");
+    try {
+        Statement s(db, "INSERT INTO edge_geometry_bindings VALUES(?,?,?) ON CONFLICT(edge_id) DO UPDATE SET a_revision=excluded.a_revision,b_revision=excluded.b_revision");
+        s.bind(1, id);
+        const auto a = geometryHead(db, edge.aUuid), b = geometryHead(db, edge.bUuid);
+        if (a) s.bindBlob(2, parseUuid(*a)); else s.bindNull(2);
+        if (b) s.bindBlob(3, parseUuid(*b)); else s.bindNull(3);
+        s.stepDone();
+        stampContentChange(db, author(), hostname(), "edges", id, parseUuid(edgeUuid), "geometry_revalidated");
+        exec(db, "RELEASE geometry_revalidate;");
+    } catch (...) {
+        exec(db, "ROLLBACK TO geometry_revalidate; RELEASE geometry_revalidate;");
+        throw;
+    }
 }
 
 }  // namespace vc::graph
