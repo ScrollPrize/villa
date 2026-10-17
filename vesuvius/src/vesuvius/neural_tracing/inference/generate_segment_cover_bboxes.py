@@ -440,6 +440,19 @@ def _optimize_band_bboxes(
     records = sorted(records, key=lambda r: (int(r["grid_index"][1]), int(r["grid_index"][2])))
     neighbor_map = _build_band_neighbor_map(records)
 
+    # Bounds, medians and candidate objectives depend only on the unchanged
+    # point arrays in this optimization call. Cache them across passes.
+    point_bounds = []
+    point_medians = []
+    objective_cache = {}
+    for rec in records:
+        pts = rec["points"]
+        if len(pts):
+            point_bounds.append((np.min(pts, axis=0), np.max(pts, axis=0)))
+        else:
+            point_bounds.append(None)
+        point_medians.append((float(np.median(pts[:, 1])), float(np.median(pts[:, 2]))))
+
     states = []
     for rec in records:
         bbox = rec["initial_bbox"]
@@ -468,16 +481,23 @@ def _optimize_band_bboxes(
                     continue
 
                 _, _, base_center = _axis_min_and_size(init_bbox, axis)
-                axis_idx = 1 if axis == "y" else 2
-                median_pt = float(np.median(pts[:, axis_idx]))
+                median_pt = point_medians[idx][0 if axis == "y" else 1]
                 ideal_shift = median_pt - base_center
                 cur_shift_for_axis = int(current["shift"]) if axis == current["axis"] else 0
                 candidates = _generate_shift_candidates(low, high, ideal_shift, cur_shift_for_axis)
 
                 for shift in candidates:
                     cand_bbox = _bbox_from_state(init_bbox, axis, shift)
-                    if not np.all(_points_within_bbox(pts, cand_bbox)):
-                        continue
+                    if point_bounds[idx] is not None:
+                        lo, hi = point_bounds[idx]
+                        # Equivalent to checking every finite point: all points
+                        # fit iff the coordinate extrema fit the half-open box.
+                        if not (
+                            lo[0] >= cand_bbox[0] and hi[0] < cand_bbox[1] + 1
+                            and lo[1] >= cand_bbox[2] and hi[1] < cand_bbox[3] + 1
+                            and lo[2] >= cand_bbox[4] and hi[2] < cand_bbox[5] + 1
+                        ):
+                            continue
 
                     ok_touch = True
                     for nbr_idx, relation in neighbor_map[idx]:
@@ -499,7 +519,11 @@ def _optimize_band_bboxes(
                     if not ok_touch:
                         continue
 
-                    cand_obj = _axis_objective(pts, cand_bbox, axis)
+                    obj_key = (idx, axis, int(shift))
+                    cand_obj = objective_cache.get(obj_key)
+                    if cand_obj is None:
+                        cand_obj = _axis_objective(pts, cand_bbox, axis)
+                        objective_cache[obj_key] = cand_obj
                     if _is_candidate_better(cand_obj, axis, shift, best_obj, best_axis, best_shift):
                         best_obj = cand_obj
                         best_axis = axis
