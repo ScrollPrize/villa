@@ -6,6 +6,37 @@ struct GeometryArgs {
     bool border = false, nearest = false, validity = false;
     int mode = 0;
 };
+// Exact same-shape axis reflections need only integer address arithmetic.
+// Keep geometry_cuda's target routing, sparse/directional handling and validity
+// restoration shared with the general resampler.
+template<class T, class Index> __global__ void reflect_kernel(const T* src, T* dst, Layout g, std::size_t channels,
+                                                            unsigned reflected, bool validity) {
+    EACH_INDEX(g.size*channels) {
+        const Index index=Index(i), size=Index(g.size), voxel=index%size;
+        Index at=voxel;
+        for (int a=0;a<g.dim;++a) if (reflected & (1u<<a)) {
+            const Index stride=Index(g.stride[a]), extent=Index(g.shape[a]);
+            const Index x=(voxel/stride)%extent;
+            at -= x*stride;
+            at += (extent-1-x)*stride;
+        }
+        const T value=src[(index/size)*size+at];
+        // The general validity interpolation canonicalizes signed zero too.
+        dst[i]=validity ? T(value>=T(1)) : value;
+    }
+}
+static int reflection_axes(const Parameters& p, const Shape& shape, const double* field) {
+    if (!p.exact || field || p.shape!=shape) return -1;
+    unsigned reflected=0;
+    for (std::size_t a=0;a<shape.size();++a) {
+        const auto diagonal=p.matrix[a*shape.size()+a];
+        if (diagonal!=1 && diagonal!=-1) return -1;
+        if (p.offset[a]!=(diagonal==1 ? 0 : double(shape[a]-1))) return -1;
+        for (std::size_t b=0;b<shape.size();++b) if (a!=b && p.matrix[a*shape.size()+b]!=0) return -1;
+        if (diagonal==-1) reflected |= 1u<<a;
+    }
+    return int(reflected);
+}
 template<class T> __global__ void geometry_kernel(const T* src, T* dst, Layout in, Layout out, std::size_t channels, GeometryArgs p, const double* field, T pad, int* used_pad) {
     EACH_INDEX(out.size*channels) {
         const auto voxel = i%out.size, channel = i/out.size;
@@ -52,6 +83,17 @@ DeviceArray resample_cuda(const DeviceArray& src, const Parameters& p, bool near
     Shape shape{src.shape[0]}; shape.insert(shape.end(),p.shape.begin(),p.shape.end());
     DeviceArray out(shape,src.kind,src.bytes);
     Layout in{Grid(src.spatial())}, output{Grid(p.shape)};
+    const int reflected=reflection_axes(p,src.spatial(),field);
+    if (reflected>=0 && (nearest || validity)) {
+        src.typed([&](auto input) {
+            using T=typename decltype(input)::value_type;
+            if (out.size()<=UINT32_MAX)
+                reflect_kernel<T,std::uint32_t><<<blocks(out.size()),256,0,vcr::device::stream()>>>(input.ptr,out.view<T>().ptr,in,src.shape[0],unsigned(reflected),validity);
+            else
+                reflect_kernel<T,std::size_t><<<blocks(out.size()),256,0,vcr::device::stream()>>>(input.ptr,out.view<T>().ptr,in,src.shape[0],unsigned(reflected),validity);
+        });
+        check(cudaGetLastError()); return out;
+    }
     GeometryArgs args{}; std::copy(p.matrix.begin(),p.matrix.end(),args.matrix); std::copy(p.offset.begin(),p.offset.end(),args.offset);
     args.fill = fill; args.border = p.border; args.nearest = nearest; args.validity = validity; args.mode = p.nearest_mode;
     src.typed([&](auto input) {

@@ -1,7 +1,7 @@
 #pragma once
 #include <cuda_runtime.h>
 namespace vcr::augment::cuda {
-template<int Metrics> __device__ void block_reduce(double (&values)[Metrics][256]) {
+template<int Metrics, class Real> __device__ void block_reduce(Real (&values)[Metrics][256]) {
     const int t = threadIdx.x;
     __syncthreads();
     for (int offset = 128; offset; offset /= 2) {
@@ -16,12 +16,12 @@ template<int Metrics> __device__ void block_reduce(double (&values)[Metrics][256
         __syncthreads();
     }
 }
-template<int Metrics> __global__ void finish_reduce(const double* partial, double* stats, int blocks) {
-    __shared__ double values[Metrics][256];
+template<int Metrics, bool Mean = false, class Real> __global__ void finish_reduce(const Real* partial, Real* stats, int blocks, std::size_t count = 1) {
+    __shared__ Real values[Metrics][256];
     const int t = threadIdx.x;
     #pragma unroll
     for (int m = 0; m < Metrics; ++m) {
-        double value = 0;
+        Real value = 0;
         for (int i = t; i < blocks; i += 256) {
             if constexpr (Metrics == 3) value += partial[i*Metrics+m];
             else if (m == 0) value += partial[i*Metrics+m];
@@ -30,6 +30,9 @@ template<int Metrics> __global__ void finish_reduce(const double* partial, doubl
         values[m][t] = value;
     }
     block_reduce(values);
-    if (t == 0) for (int m = 0; m < Metrics; ++m) stats[m] = values[m][0];
+    if (t == 0) for (int m = 0; m < Metrics; ++m) {
+        if constexpr (Mean) stats[m] = values[m][0]/Real(count);
+        else stats[m] = values[m][0];
+    }
 }
 }

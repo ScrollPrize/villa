@@ -242,5 +242,79 @@ class LoaderTests(unittest.TestCase):
         torch.testing.assert_close(result, ref, rtol=0, atol=0)
 
 
+@unittest.skipUnless(torch.cuda.is_available() and A._native.cuda_available(), "CUDA build and device required")
+class GeometryTests(unittest.TestCase):
+    def test_exact_reflections_all_axes_shapes_and_dtypes(self):
+        import itertools
+        for shape in ((1, 7), (5, 9), (1, 5, 9), (3, 5, 7)):
+            names = 'zyx'[-len(shape):]
+            size = 2 * int(np.prod(shape))
+            for dtype in (np.float32, np.float64, np.int8, np.uint16, np.int64, np.uint64):
+                values = np.arange(size).reshape(2, *shape).astype(dtype)
+                if np.issubdtype(dtype, np.floating):
+                    values.reshape(-1)[::3] = -0.0
+                    role = A.Image(valid=None)
+                else:
+                    if np.dtype(dtype).itemsize == 8:
+                        values += np.array(1 << 54, dtype=dtype)
+                    role = A.Label(fill=1000)
+                for flags in itertools.product((False, True), repeat=len(shape)):
+                    selected = ''.join(a for a, use in zip(names, flags) if use)
+                    p = A.Pipeline([A.Flip(axes=selected or names, p_axis=int(bool(selected)))],
+                                   targets={'data': role}, backend='cuda')
+                    actual = p({'data': cuda.asarray(values)}, seed=19)['data'].numpy()
+                    axes = tuple(i+1 for i, use in enumerate(flags) if use)
+                    expected = np.flip(values, axes)
+                    self.assertEqual(actual.tobytes(), expected.tobytes(), (shape, dtype, flags))
+
+    def test_reflection_validity_and_directional_routing(self):
+        image = np.arange(24, dtype=np.float32).reshape(1, 4, 6)
+        valid = np.ones_like(image)
+        valid[0, 0, ::2] = -0.0
+        sample = {'image': image, 'valid': valid,
+                  'points': np.array([[0., 0.], [2., 3.]], dtype=np.float64),
+                  'field': np.broadcast_to(np.array([1., 2.])[:, None, None], (2, 4, 6)).copy()}
+        targets = {'image': A.Image(valid='valid'), 'valid': A.ValidMask(),
+                   'points': A.Points(order='yx'), 'field': A.VectorField(components='yx')}
+        transforms = [A.Flip(axes='yx', p_axis=1)]
+        cpu = A.Pipeline(transforms, targets=targets, backend='cpu')(sample, seed=19)
+        gpu = A.Pipeline(transforms, targets=targets, backend='cuda')(
+            {k: cuda.asarray(v) for k, v in sample.items()}, seed=19)
+        for key in sample:
+            np.testing.assert_array_equal(gpu[key].numpy(), cpu[key])
+        actual = gpu['valid'].numpy()
+        self.assertFalse(np.signbit(actual[actual == 0]).any())
+
+    def test_affine_fallback_and_elastic_replay(self):
+        image = np.random.default_rng(42).random((2, 9, 13), dtype=np.float32)
+        sample = {'image': cuda.asarray(image)}
+        for transform in (A.Affine(degrees=7, rotation_axes='yx'),
+                          A.Elastic(sigma=3, magnitude=1, border=True)):
+            p = A.Pipeline([transform], backend='cuda')
+            direct = p(sample, seed=9)['image'].numpy()
+            plan = p.sample(sample, seed=9)
+            replay = plan.apply(sample)['image'].numpy()
+            self.assertEqual(direct.tobytes(), replay.tobytes())
+
+    def test_float32_elastic_matches_cpu_and_preserves_labels(self):
+        rng = np.random.default_rng(19)
+        for shape in ((1, 1), (1, 9), (9, 13), (1, 5, 7), (17, 19, 23)):
+            image = rng.random((1, *shape), dtype=np.float32)
+            mask = rng.integers(0, 5, image.shape, dtype=np.int64) + (1 << 54)
+            sample = {'image': cuda.asarray(image), 'mask': cuda.asarray(mask)}
+            for sigma in (0, 3, 12):
+                for magnitude in (0, 2, 100):
+                    with self.subTest(shape=shape, sigma=sigma, magnitude=magnitude):
+                        transforms = [A.Elastic(sigma=sigma, magnitude=magnitude, border=True)]
+                        cpu = A.Pipeline(transforms, backend='cpu')({'image': image}, seed=456)['image']
+                        pipeline = A.Pipeline(transforms, backend='cuda')
+                        actual = pipeline(sample, seed=456)
+                        np.testing.assert_allclose(actual['image'].numpy(), cpu, atol=2e-5, rtol=0)
+                        self.assertTrue(np.isin(actual['mask'].numpy(), mask).all())
+                        repeated = pipeline(sample, seed=456)
+                        for key in sample:
+                            self.assertEqual(actual[key].numpy().tobytes(), repeated[key].numpy().tobytes())
+
+
 if __name__ == '__main__':
     unittest.main()
