@@ -138,6 +138,22 @@ The 10 crops at the top of `ranked.csv`, with the audit's hole masks passed to
   cut, which no tool here makes, and these were the most common defect in the
   spot check.
 
+A lower b1 does not mean the repair is right. We rendered the voxels each method
+added on the CT, for the four largest located holes per crop (20 tiles per
+method), and judged each tile. The judge was an AI reviewer, not an expert, and
+the tiles are small, so treat this as a warning sign rather than a measurement:
+
+| method | fill on papyrus | fill on background or between sheets | no change | unclear |
+| --- | --- | --- | --- | --- |
+| `2d_hole_fill` | 5 | 3 | 5 | 7 |
+| `close`, kernel 2 | 1 | 4 | 8 | 7 |
+| `close`, kernel 3 | 1 | 6 | 8 | 5 |
+
+Closing mostly fills the dark wedge between two sheets, which joins them. Run
+`--after` and look at the added voxels on the CT before keeping any automatic
+fill. Most holes that were left unchanged looked like pockets between merged
+sheets.
+
 ## Related tools
 
 - `scripts/detect_holes.py` computes the same per-component Betti numbers and
