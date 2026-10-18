@@ -298,10 +298,10 @@ def check_rpc_describe(
         coverage = description.get("coverage", {})
         complete = (
             description.get("undocumented") == []
-            and coverage.get("described") == 124
-            and coverage.get("registered") == 124
+            and coverage.get("described") == 126
+            and coverage.get("registered") == 126
             and coverage.get("complete") is True
-            and len(snapshot["methods"]) == 124
+            and len(snapshot["methods"]) == 126
         )
         rendered = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         if update_snapshot:
@@ -1777,6 +1777,55 @@ def check_segment_transform(client: BridgeClient, results: Results, root: Path) 
         )
 
 
+def check_segment_export(client: BridgeClient, results: Results, root: Path) -> None:
+    ok, detail = expect_param_error(
+        client,
+        "segment.export_obj",
+        {"segmentId": SMOKE_SEGMENT_ID, "outputPath": "relative/seg.obj"},
+        "outputPath",
+    )
+    results.record("segment_export_obj_requires_absolute_obj_path", ok, detail)
+    ok, detail = expect_param_error(
+        client,
+        "segment.rasterize",
+        {"segmentIds": [SMOKE_SEGMENT_ID], "zMin": 10, "zMax": 10},
+        "zMax",
+    )
+    results.record("segment_rasterize_rejects_empty_z_range", ok, detail)
+    ok, detail = expect_bridge_error(
+        client,
+        "segment.rasterize",
+        {"segmentIds": [SMOKE_SEGMENT_ID, "no-such-segment"]},
+        -32007,
+    )
+    results.record("segment_rasterize_unknown_segment", ok, detail)
+
+    obj_path = root / "exports" / f"{SMOKE_SEGMENT_ID}.obj"
+    params = {"segmentId": SMOKE_SEGMENT_ID, "outputPath": str(obj_path)}
+    try:
+        result, _ = client.call("segment.export_obj", params, timeout=RPC_TIMEOUT)
+        status = wait_for_job(client, result["jobId"], timeout=120.0)
+        ok = (
+            result.get("outputPath") == str(obj_path)
+            and status.get("state") == "succeeded"
+            and status.get("outputPath") == str(obj_path)
+            and obj_path.is_file()
+        )
+        results.record("segment_export_obj_job", ok, f"result={result} status={status}")
+    except BridgeError as error:
+        # A build without vc_tifxyz2obj reports the missing tool explicitly.
+        results.record("segment_export_obj_job", error.code == -32006,
+                       f"code={error.code} message={error.message}")
+        return
+    except Exception as error:  # noqa: BLE001
+        results.record("segment_export_obj_job", False,
+                       f"{type(error).__name__}: {error}")
+        return
+    if obj_path.is_file():
+        ok, detail = expect_bridge_error(client, "segment.export_obj", params, -32005)
+        results.record("segment_export_obj_refuses_existing_file", ok, detail)
+
+
 def check_open_data_editable_copy(
     client: BridgeClient,
     results: Results,
@@ -2482,6 +2531,7 @@ def main() -> int:
             check_volume_attach(client, results, tmp_path, volpkg)
             check_segments_attach(client, results, tmp_path, volpkg)
             check_segment_transform(client, results, tmp_path)
+            check_segment_export(client, results, tmp_path)
             check_open_data_editable_copy(client, results, tmp_path, volpkg)
             check_c4(client, results, str(volpkg), str(broken_volpkg))
             check_legacy_fiber_uuid(client, results, str(legacy_fiber_volpkg),

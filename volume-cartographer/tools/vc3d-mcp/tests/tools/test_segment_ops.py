@@ -19,7 +19,11 @@ from typing import Any
 from tests.support import FakeBridgeServer
 from vc3d_mcp import core
 from vc3d_mcp.tools import segment_ops
-from vc3d_mcp.tools.segment_ops import vc3d_transform_segment
+from vc3d_mcp.tools.segment_ops import (
+    vc3d_export_segment_obj,
+    vc3d_rasterize_segments,
+    vc3d_transform_segment,
+)
 
 
 class SegmentOpsBridge(FakeBridgeServer):
@@ -67,6 +71,36 @@ class SegmentOpsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.bridge.params_for("segment.transform"),
             {"segmentId": "seg-1", "op": "rotate90", "confirm": True},
+        )
+
+    async def test_export_obj_maps_options(self) -> None:
+        result = await vc3d_export_segment_obj(
+            "seg-1", output_path="/out/seg.obj", normalize_uv=True, omp_threads=4)
+        self.assertEqual(result["jobId"], "job-7")
+        self.assertNotIn("state", result)
+        self.assertEqual(
+            self.bridge.params_for("segment.export_obj"),
+            {"segmentId": "seg-1", "outputPath": "/out/seg.obj",
+             "overwrite": False, "normalizeUv": True, "alignGrid": False,
+             "ompThreads": 4},
+        )
+
+    async def test_export_obj_wait_returns_terminal_status(self) -> None:
+        result = await vc3d_export_segment_obj("seg-1", overwrite=True, wait=True)
+        self.assertEqual(result["state"], "succeeded")
+        self.assertEqual(result["outputPath"], "/vpkg/paths/final")
+        self.assertEqual(
+            self.bridge.params_for("segment.export_obj"),
+            {"segmentId": "seg-1", "overwrite": True, "normalizeUv": False,
+             "alignGrid": False},
+        )
+
+    async def test_rasterize_maps_options_and_omits_unset(self) -> None:
+        result = await vc3d_rasterize_segments(["seg-1", "seg-2"], z_max=20)
+        self.assertEqual(result["jobId"], "job-7")
+        self.assertEqual(
+            self.bridge.params_for("segment.rasterize"),
+            {"segmentIds": ["seg-1", "seg-2"], "zMax": 20},
         )
 
     def test_synchronous_file_operations_outlast_default_timeout(self) -> None:

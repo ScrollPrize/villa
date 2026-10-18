@@ -224,7 +224,7 @@ per source is tracked:
 
 | Source | Authority |
 |---|---|
-| `tool` | `CommandLineToolRunner` lifecycle |
+| `tool` | `CommandLineToolRunner` lifecycle; operations that post-process tool output or run several passes end on their own completion |
 | `growth` | segmentation growth lifecycle |
 | `lasagna` | Lasagna optimization lifecycle |
 | `atlas` | bridge-started atlas search lifecycle |
@@ -577,6 +577,16 @@ caller that retries after a timeout reads the segment's state first.
   degrees clockwise, and saves it in place. The context menu's "Normals (H
   Flip)" entry is `flip_v`. Flips are exact and their own inverse;
   `rotate90` resamples the grid and requires `confirm: true`.
+- `segment.export_obj` converts one segment with `vc_tifxyz2obj` as a `tool`
+  job. `outputPath` must be an absolute path ending in `.obj` (default:
+  `<segment>/<segment id>.obj`); an existing file is refused unless
+  `overwrite: true`. The job's terminal `outputPath` is the OBJ file.
+- `segment.rasterize` runs `vc_tifxyz2zarr_sparse` over one or more segments
+  as a `tool` job. Ids without tifxyz meshes are skipped and reported as
+  `skippedIds`; at least one must remain. The job ends after the labels zarr is
+  moved into `volumes/` and its metadata written, and its terminal
+  `outputPath` is that zarr. Defaults are the dialog's code defaults, not the
+  person's last dialog values.
 
 ## MCP behavior
 
@@ -665,6 +675,7 @@ is the sole bridge method without an MCP tool; `vc3d_wait_job` and
 | `vc3d_describe_catalog_sample` | `catalog.describe_sample` |
 | `vc3d_drag` | `canvas.drag` |
 | `vc3d_enable_editing` | `segmentation.enable_editing` | Turn segmentation editing mode on/off for the active segment. |
+| `vc3d_export_segment_obj` | `segment.export_obj` | Convert a segment to an OBJ file (`tool` job); an existing file needs `overwrite`. |
 | `vc3d_fetch_segment` | `segments.fetch` | Download ("materialize") an open-data placeholder segment so it can be activated/edited. Sync if already materialized; else a `"catalog"` job (`wait` defaults true). |
 | `vc3d_fiber_create_atlas` | `fiber.create_atlas` |
 | `vc3d_fiber_delete` | `fiber.delete` |
@@ -715,6 +726,7 @@ is the sole bridge method without an MCP tool; `vc3d_wait_job` and
 | `vc3d_push_pull_set_config` | `segmentation.push_pull.set_config` |
 | `vc3d_push_pull_start` | `segmentation.push_pull.start` |
 | `vc3d_push_pull_stop` | `segmentation.push_pull.stop` |
+| `vc3d_rasterize_segments` | `segment.rasterize` | Rasterize segments into a labels zarr under `volumes/` (`tool` job that ends after the zarr is moved and described). |
 | `vc3d_recalc_segment_area` | `segment.recalc_area` | Recompute surface area for one or more segments. Synchronous. |
 | `vc3d_refine_segment_alpha_comp` | `segment.refine_alpha_comp` | Alpha-composite refinement of a segment. Asynchronous (`source:"tool"`); rejects remote volumes; supports `wait: bool = false` (30-minute cap). |
 | `vc3d_remove_point_collection_tag` | `points.remove_collection_tag` |

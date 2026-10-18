@@ -188,6 +188,11 @@ void AgentBridgeServer::subscribeJobSignals()
                 [this](bool success, const QString& message, const QString& outputPath) {
                     handleFlattenFinished(success, message, outputPath);
                 });
+        connect(sch, &SegmentationCommandHandler::segmentOperationFinished, this,
+                [this](const QString& kind, bool success, const QString& message,
+                       const QString& outputPath) {
+                    handleSegmentOperationFinished(kind, success, message, outputPath);
+                });
     }
 
     // Lasagna optimization lifecycle -> source:"lasagna" jobs.
@@ -466,6 +471,27 @@ void AgentBridgeServer::handleToolStarted(const QString& message)
 void AgentBridgeServer::handleToolFinished(bool success, const QString& message,
                                            const QString& outputPath)
 {
+    auto it = _activeJobs.find(QStringLiteral("tool"));
+    if (it != _activeJobs.end() && !it->closingOperation.isEmpty()) {
+        // The operation reports its own terminal state after post-processing
+        // or its remaining passes; keep the runner's sentence meanwhile.
+        if (!message.isEmpty())
+            it->message = message;
+        return;
+    }
+    finishJob(QStringLiteral("tool"), success, message, outputPath);
+}
+
+
+void AgentBridgeServer::handleSegmentOperationFinished(const QString& kind, bool success,
+                                                       const QString& message,
+                                                       const QString& outputPath)
+{
+    auto it = _activeJobs.find(QStringLiteral("tool"));
+    // Operations launched from the GUI are tracked as plain external tool
+    // jobs and have already ended on toolFinished.
+    if (it == _activeJobs.end() || it->closingOperation != kind)
+        return;
     finishJob(QStringLiteral("tool"), success, message, outputPath);
 }
 

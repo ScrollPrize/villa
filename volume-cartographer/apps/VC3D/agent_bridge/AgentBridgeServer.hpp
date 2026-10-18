@@ -398,6 +398,16 @@ private:
     // Throws -32004 while `segmentId` is being edited (any segment when
     // empty), a mask render runs, or a "tool" job runs.
     void requireSegmentFilesIdle(const QString& segmentId, const QString& operation) const;
+    QJsonObject handleSegmentExportObj(const QJsonValue& params);
+    QJsonObject handleSegmentRasterize(const QJsonValue& params);
+    // Registers a "tool" job for a launch that `launch` performs (reporting
+    // the job's output path) and, when `closingOperation` is non-empty, keeps
+    // it open until that operation's segmentOperationFinished. Throws the
+    // mapped launch error on failure.
+    QString launchSegmentToolJob(
+        const QString& kind, const QString& label, const QString& segmentId,
+        const QString& closingOperation,
+        const std::function<bool(CommandLaunchError* error, QString* outputPath)>& launch);
 
     // --- Open Data manifest acquisition ---
     // Serves the cached manifest synchronously when available and `refresh` is
@@ -431,6 +441,11 @@ private:
         // Additive terminal result body. Empty => "result": null on
         // the wire; catalog and volume-attachment jobs carry structured bodies.
         QJsonObject resultJson;
+        // Non-empty for a "tool" job whose operation post-processes the tool
+        // output or runs several tool passes: the job then ends on
+        // SegmentationCommandHandler::segmentOperationFinished for this kind
+        // instead of on the runner's toolFinished.
+        QString closingOperation;
     };
     void subscribeJobSignals();
     // Per-source running check: true when a bridge JobRecord for `source` is
@@ -456,6 +471,8 @@ private:
     // stays free of CommandLineToolRunner's enum).
     void handleToolStarted(const QString& message);
     void handleToolFinished(bool success, const QString& message, const QString& outputPath);
+    void handleSegmentOperationFinished(const QString& kind, bool success,
+                                        const QString& message, const QString& outputPath);
     void handleConsoleOutput(const QString& output);
     void handleGrowthStatusChanged(bool running);
     // Closes the "autosave"-source job when an explicit segment save

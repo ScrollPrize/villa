@@ -2515,6 +2515,62 @@
         "type": "object"
       }
     },
+    "segment.export_obj": {
+      "errors": [
+        -32602,
+        -32000,
+        -32001,
+        -32004,
+        -32005,
+        -32006,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "extraParams": [
+          "wait"
+        ],
+        "paramRenames": {
+          "alignGrid": "align_grid",
+          "normalizeUv": "normalize_uv",
+          "ompThreads": "omp_threads",
+          "outputPath": "output_path",
+          "segmentId": "segment_id"
+        },
+        "tool": "vc3d_export_segment_obj"
+      },
+      "params": {
+        "properties": {
+          "alignGrid": {
+            "default": false,
+            "type": "boolean"
+          },
+          "normalizeUv": {
+            "default": false,
+            "type": "boolean"
+          },
+          "ompThreads": {
+            "maximum": 2147483647,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "outputPath": {
+            "type": "string"
+          },
+          "overwrite": {
+            "default": false,
+            "type": "boolean"
+          },
+          "segmentId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "segmentId"
+        ],
+        "type": "object"
+      }
+    },
     "segment.generate_mask": {
       "errors": [
         -32602,
@@ -2537,6 +2593,58 @@
         },
         "required": [
           "segmentId"
+        ],
+        "type": "object"
+      }
+    },
+    "segment.rasterize": {
+      "errors": [
+        -32602,
+        -32000,
+        -32004,
+        -32005,
+        -32006,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "extraParams": [
+          "wait"
+        ],
+        "paramRenames": {
+          "chunkSize": "chunk_size",
+          "segmentIds": "segment_ids",
+          "zMax": "z_max",
+          "zMin": "z_min"
+        },
+        "tool": "vc3d_rasterize_segments"
+      },
+      "params": {
+        "properties": {
+          "chunkSize": {
+            "maximum": 4096,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "segmentIds": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "zMax": {
+            "maximum": 2147483647,
+            "minimum": -1,
+            "type": "integer"
+          },
+          "zMin": {
+            "maximum": 2147483647,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "segmentIds"
         ],
         "type": "object"
       }
