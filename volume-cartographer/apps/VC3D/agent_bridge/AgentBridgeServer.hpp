@@ -5,7 +5,9 @@
 //
 // Everything here runs on the Qt GUI thread: QLocalSocket delivers readyRead on
 // the main thread, so no extra thread is required and handlers may touch the UI
-// directly. Handlers must never spin a nested event loop (no dialog exec()).
+// directly. Handlers must never spin a nested event loop (no dialog exec());
+// should one run anyway (canvas.key answering a dialog that a shortcut
+// opened), requests that arrive meanwhile wait until the current one ends.
 
 #include <QByteArray>
 #include <QHash>
@@ -102,6 +104,10 @@ private:
     void writeRegistryFile();
     void removeRegistryFile();
 
+    // Dispatches the complete lines buffered for `socket`, in frame order.
+    void processBufferedLines(QLocalSocket* socket);
+    // Reports an oversized request best-effort and drops only that client.
+    void dropOversizedClient(QLocalSocket* socket);
     void processLine(QLocalSocket* socket, const QByteArray& line);
     void dispatch(QLocalSocket* socket, const QJsonObject& request);
     void sendResponse(QLocalSocket* socket, const QJsonValue& id, const QJsonObject& result);
@@ -440,6 +446,19 @@ private:
     // finishes: stores the result body in the job record and calls finishJob.
     void completeCatalogOpenJob(const MenuActionController::OpenDataSampleOpenOutcome& outcome);
     void completeVolumeAttachmentJob(const VolumeAttachmentOutcome& outcome);
+
+    // --- Re-entry ---
+    // While a request is handled, or queued work runs, the bridge is busy:
+    // new request lines only accumulate in their buffers, and work passed to
+    // runWhenIdle() waits. Both run, in order, once it is idle again.
+    class BusyScope;
+    void runWhenIdle(std::function<void()> work);
+    void scheduleIdleWork();
+    void runIdleWork();
+    int _busyDepth = 0;
+    bool _idleWorkScheduled = false;
+    bool _requestsPending = false;
+    std::vector<std::function<void()>> _idleWork;
 
     // --- Deferred responses ---
     // A handler calls beginDeferred() to stash the current (socket, id), arm a

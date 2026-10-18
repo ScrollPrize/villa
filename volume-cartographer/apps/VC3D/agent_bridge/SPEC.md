@@ -79,7 +79,9 @@ VC3D-AGENT-BRIDGE: listening name=<serverName> path=<fullServerName>
   and is disconnected without affecting other clients.
 - Multiple clients may connect. Requests are dispatched in frame order;
   deferred responses may complete out of order and are correlated by `id`.
-- Handlers run serially on the Qt GUI thread.
+- Handlers run serially on the Qt GUI thread. A request that arrives while
+  another is being handled waits until that one finishes, even when its
+  handler runs a nested event loop.
 - Server notifications have no `id` and are broadcast to all connected
   clients.
 - A notification request never receives a response, including on error.

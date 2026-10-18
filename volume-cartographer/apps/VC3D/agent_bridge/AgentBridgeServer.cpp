@@ -240,45 +240,140 @@ void AgentBridgeServer::onNewConnection()
 }
 
 
+// Marks the bridge busy while a request or queued work runs; leaving the
+// outermost scope schedules what waited (runWhenIdle below).
+class AgentBridgeServer::BusyScope
+{
+public:
+    explicit BusyScope(AgentBridgeServer* server) : _server(server) { ++_server->_busyDepth; }
+    ~BusyScope()
+    {
+        if (--_server->_busyDepth == 0 &&
+            (_server->_requestsPending || !_server->_idleWork.empty()))
+            _server->scheduleIdleWork();
+    }
+    BusyScope(const BusyScope&) = delete;
+    BusyScope& operator=(const BusyScope&) = delete;
+
+private:
+    AgentBridgeServer* _server;
+};
+
+
 void AgentBridgeServer::onSocketReadyRead()
 {
     auto* socket = qobject_cast<QLocalSocket*>(sender());
     if (!socket)
         return;
+    const auto buffer = _buffers.find(socket);
+    if (buffer == _buffers.end())
+        return;
+    buffer->append(socket->readAll());
+    if (_busyDepth > 0) {
+        // A request is still being handled (its handler is running a nested
+        // event loop); these lines are dispatched after it, in frame order.
+        _requestsPending = true;
+        return;
+    }
+    processBufferedLines(socket);
+}
 
-    QByteArray& buffer = _buffers[socket];
-    buffer.append(socket->readAll());
 
-    int newlineIdx;
-    while ((newlineIdx = buffer.indexOf('\n')) != -1) {
-        QByteArray line = buffer.left(newlineIdx);
-        buffer.remove(0, newlineIdx + 1);
+void AgentBridgeServer::processBufferedLines(QLocalSocket* socket)
+{
+    const QPointer<QLocalSocket> alive(socket);
+    while (alive) {
+        // Look the buffer up again for every line: handling a request runs
+        // application code that may connect or disconnect clients, which
+        // changes _buffers.
+        const auto buffer = _buffers.find(socket);
+        if (buffer == _buffers.end())
+            return;
+        const int newlineIdx = buffer->indexOf('\n');
+        if (newlineIdx < 0) {
+            // Bound the unterminated remainder: an oversized request that never
+            // sends a newline must not grow memory without limit. Any residual
+            // over the bound is a partial oversized line -- report it
+            // best-effort and drop only this client.
+            if (buffer->size() > kMaxLineBytes)
+                dropOversizedClient(socket);
+            return;
+        }
+        QByteArray line = buffer->left(newlineIdx);
+        buffer->remove(0, newlineIdx + 1);
         if (line.endsWith('\r'))
             line.chop(1);
         // Reject a complete line whose own length exceeds the limit.
         if (line.size() > kMaxLineBytes) {
-            sendError(socket, QJsonValue(QJsonValue::Null), -32600,
-                      QStringLiteral("Invalid Request: request exceeds %1-byte limit")
-                          .arg(kMaxLineBytes));
-            _buffers.remove(socket);  // `buffer` dangles after this; do not touch it
-            socket->disconnectFromServer();
+            dropOversizedClient(socket);
             return;
         }
         if (line.trimmed().isEmpty())
             continue;
+        BusyScope busy(this);
         processLine(socket, line);
     }
+}
 
-    // Bound the unterminated remainder: an oversized request that never sends a
-    // newline must not grow memory without limit. Any residual over the bound is
-    // a partial oversized line -- report it best-effort and drop only this client.
-    if (buffer.size() > kMaxLineBytes) {
-        sendError(socket, QJsonValue(QJsonValue::Null), -32600,
-                  QStringLiteral("Invalid Request: request exceeds %1-byte limit")
-                      .arg(kMaxLineBytes));
-        _buffers.remove(socket);  // `buffer` dangles after this; do not touch it
-        socket->disconnectFromServer();
+
+void AgentBridgeServer::dropOversizedClient(QLocalSocket* socket)
+{
+    sendError(socket, QJsonValue(QJsonValue::Null), -32600,
+              QStringLiteral("Invalid Request: request exceeds %1-byte limit")
+                  .arg(kMaxLineBytes));
+    _buffers.remove(socket);
+    socket->disconnectFromServer();
+}
+
+
+// ---------------------------------------------------------------------------
+// Re-entry. A handler may run a nested event loop (a dialog that a
+// synthesized key opens); requests, timers and state checks that arrive
+// meanwhile wait until the bridge is idle again.
+// ---------------------------------------------------------------------------
+
+void AgentBridgeServer::runWhenIdle(std::function<void()> work)
+{
+    _idleWork.push_back(std::move(work));
+    scheduleIdleWork();
+}
+
+
+void AgentBridgeServer::scheduleIdleWork()
+{
+    if (_idleWorkScheduled)
         return;
+    _idleWorkScheduled = true;
+    QTimer::singleShot(0, this, [this]() { runIdleWork(); });
+}
+
+
+void AgentBridgeServer::runIdleWork()
+{
+    _idleWorkScheduled = false;
+    if (_busyDepth > 0)
+        return;  // the outermost BusyScope schedules it again
+    std::vector<std::function<void()>> work;
+    work.swap(_idleWork);
+    for (const auto& job : work) {
+        BusyScope busy(this);
+        try {
+            job();
+        } catch (const std::exception& e) {
+            qWarning("agent bridge: queued work failed: %s", e.what());
+        } catch (...) {
+            qWarning("agent bridge: queued work failed");
+        }
+    }
+    if (!_requestsPending)
+        return;
+    _requestsPending = false;
+    std::vector<QPointer<QLocalSocket>> sockets;
+    for (auto it = _buffers.keyBegin(); it != _buffers.keyEnd(); ++it)
+        sockets.emplace_back(*it);
+    for (const QPointer<QLocalSocket>& socket : sockets) {
+        if (socket && _busyDepth == 0)
+            processBufferedLines(socket.data());
     }
 }
 
