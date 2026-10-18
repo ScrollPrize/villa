@@ -3,7 +3,7 @@
 namespace vcr::augment {
 struct PlasmaShadow { Scalar strength=Uniform{.1,.5}, scale=.025, persistence=.5;int octaves=5; ChannelOptions options; };
 inline ChannelPlan channel_parameters(const PlasmaShadow& t,const Array& a,Random& r) {
-    volume_detail::require_volume(a);ChannelPlan p;
+    volume_detail::require_image(a);ChannelPlan p;
     double strength=draw(t.strength,r),scale=draw(t.scale,r),persistence=draw(t.persistence,r);probability(strength);require(scale>0 && scale<=1 && persistence>0 && persistence<=1 && t.octaves>=1 && t.octaves<=16,"invalid fractal parameters");p.values={strength,scale,persistence};
     p.seed=r.next();return p;
 }
@@ -12,7 +12,7 @@ struct PlasmaShadowKernel {
     template<class T> VCR_HD T apply_field(T value,T field) const {
         return value*(T(1)-T(strength)*(field+T(1))*T(.5));
     }
-    template<class T> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T>& c) const {
+    template<class T,int D> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T,D>& c) const {
         using namespace volume_detail;
         return apply_field(v[i],fractal(c.grid,i,seed,T(scale),T(persistence),octaves));
     }

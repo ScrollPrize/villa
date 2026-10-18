@@ -3,11 +3,11 @@
 namespace vcr::augment {
 struct PixelDistributionAdaptation {volume_detail::ReferenceVolume reference;Scalar blend=Uniform{.5,1};int mode=0;ChannelOptions options;};
 inline ChannelPlan channel_parameters(const PixelDistributionAdaptation& t,const Array& a,Random& r) {
-    volume_detail::require_volume(a);double blend=draw(t.blend,r);probability(blend);ChannelPlan p;p.values={blend};return p;
+    volume_detail::require_image(a);double blend=draw(t.blend,r);probability(blend);ChannelPlan p;p.values={blend};return p;
 }
 struct PixelDistributionAdaptationKernel {
     double blend;int mode;
-    template<class T> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T>& c) const {
+    template<class T,int D> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T,D>& c) const {
         if(blend==0)return v[i];double span=c.input.high-c.input.low;
         double mapped=mode==1?(span>0?(v[i]-c.input.low)/span:0)*(c.reference.high-c.reference.low)+c.reference.low:
             (c.input.stddev>0?(v[i]-c.input.mean)/c.input.stddev:0)*c.reference.stddev+c.reference.mean;

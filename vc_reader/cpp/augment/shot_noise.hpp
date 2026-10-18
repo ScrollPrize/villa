@@ -3,13 +3,13 @@
 namespace vcr::augment {
 struct ShotNoise { Scalar photons=Uniform{50,200};bool shared_noise=false; ChannelOptions options; };
 inline ChannelPlan channel_parameters(const ShotNoise& t,const Array& a,Random& r) {
-    volume_detail::require_volume(a);ChannelPlan p;
+    volume_detail::require_image(a);ChannelPlan p;
     double photons=draw(t.photons,r);require(photons>0 && photons<=1e9,"photons must be (0,1e9]");p.values={photons};
     p.seed=r.next();return p;
 }
 struct ShotNoiseKernel {
     double photons;std::uint64_t seed;
-    template<class T> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T>& c) const {
+    template<class T,int D> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T,D>& c) const {
         using namespace volume_detail;
         if(v[i]<0 || v[i]*photons>1e12)return NAN;Rng r{mix(seed+i)};return poisson(v[i]*photons,r)/photons;
     }

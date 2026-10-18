@@ -207,11 +207,42 @@ normalization and intensity transforms. Use `Image()` for another image channel
 that should receive those transforms too; existing target selectors still apply.
 
 Arrays must already be spatially aligned and use channel-first shapes such as
-`(C, Z, Y, X)`. Existing declarations are retained unless you replace the same
+`(C, Y, X)` or `(C, Z, Y, X)`. Existing declarations are retained unless you replace the same
 name. The original pipeline is unchanged; replay plans stay with the pipeline
 that created them.
 
 ## Augmentations
+
+All image augmentations and normalization modes support channel-first **2D
+`(C, Y, X)` and 3D `(C, Z, Y, X)`** arrays on CPU and CUDA. Spatial tuples
+(`shape`, `size`, `tile_shape`, `unit_size`, `direction`, `center`, and a fixed
+`OrientedBlur.axis`) must have two entries for 2D or three for 3D. Axis names
+for 2D are `y` and `x`; use `axis="y"` or `"x"` for `SliceIllumination` and
+`Smear`, and a one-element `shift` for 2D `Smear`. Vector targets likewise
+use `components="yx"` or `"xy"` in 2D.
+
+Omitted CLAHE tile sizes default to 16 per axis; dropout sizes default to 8
+per axis. `GridDropout` and `StripeMasking` default to all spatial axes.
+Reference images may be `(C, Y, X)` or `(C, Z, Y, X)`; FDA requires matching
+spatial shapes. 2D filters use planar neighborhoods, bilinear interpolation,
+and 2D Fourier transforms. `OrientedBlur` uses one perpendicular direction in
+2D and two in 3D.
+
+```python
+pipeline = A.Pipeline([
+    A.Normalize("minmax"),
+    A.CLAHE(tile_shape=(16, 16)),
+    A.MotionBlur(length=3, direction=(1, 2)),
+    A.GridDropout(unit_size=(8, 8)),
+], backend="cuda")
+result = pipeline({"image": image}, seed=123)  # image: (C, Y, X), float32
+```
+
+`StripGeometry` operates on a 2D strip, and `SurfacePerturb` on a `(3, H, W)`
+coordinate surface. `ToPseudo2D`/`FromPseudo2D` convert representations; these
+specialized contracts remain separate from image augmentation dimensionality.
+[2D validation and 3D performance checks](benchmarks/README.md#2d-augmentation-support-2026-10-17)
+describe the dimension-specific CPU/CUDA implementations and measurements.
 
 Each entry shows the **measured configuration**, not the constructor defaults. Use `from vc_reader import augment as A`.
 

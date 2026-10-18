@@ -3,7 +3,7 @@
 namespace vcr::augment {
 struct PlasmaBrightnessContrast { Scalar brightness=Uniform{-.2,.2}, contrast=Uniform{0,.3}, scale=.025, persistence=.5;int octaves=5; ChannelOptions options; };
 inline ChannelPlan channel_parameters(const PlasmaBrightnessContrast& t,const Array& a,Random& r) {
-    volume_detail::require_volume(a);ChannelPlan p;
+    volume_detail::require_image(a);ChannelPlan p;
     double b=draw(t.brightness,r),contrast=draw(t.contrast,r),scale=draw(t.scale,r),persistence=draw(t.persistence,r);require(fabs(contrast)<=1 && scale>0 && scale<=1 && persistence>0 && persistence<=1 && t.octaves>=1 && t.octaves<=16,"invalid fractal parameters");p.values={b,contrast,scale,persistence};
     p.seed=r.next();return p;
 }
@@ -12,7 +12,7 @@ struct PlasmaBrightnessContrastKernel {
     template<class T> VCR_HD T apply_field(T value,T f,const volume_detail::Stats& input) const {
         T mean=T(input.mean);return (value-mean)*(T(1)+T(contrast)*f)+mean+T(brightness)*T(input.high-input.low)*f;
     }
-    template<class T> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T>& c) const {
+    template<class T,int D> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T,D>& c) const {
         using namespace volume_detail;
         return apply_field(v[i],fractal(c.grid,i,seed,T(scale),T(persistence),octaves),c.input);
     }

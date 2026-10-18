@@ -13,15 +13,17 @@ namespace vd = volume_detail;
 template<class T> __global__ void check_channel_output(const T* data,std::size_t size,double limit,int* error) {
     EACH_INDEX(size) if(!isfinite(data[i]) || fabs(data[i])>limit)atomicExch(error,1);
 }
-template<class Kernel,class T> __global__ void voxel_transform_kernel(Kernel kernel,vd::Grid3 grid,const T* input,T* output,
+template<class Kernel,class T,int D> __global__ void voxel_transform_kernel(Kernel kernel,vd::GridND<D> grid,const T* input,T* output,
                                                                const vd::Stats* summary,const double* table,const vd::Stats* reference,int* error,const T* auxiliary) {
-    vd::ChannelContextT<T> context{grid,*summary,table,reference?*reference:vd::Stats{},auxiliary};
+    vd::ChannelContextT<T,D> context{grid,*summary,table,reference?*reference:vd::Stats{},auxiliary};
     EACH_INDEX(grid.size){T value=kernel(input,i,context);if(!isfinite(value))atomicExch(error,1);output[i]=value;}
 }
 template<class Kernel,class T> void launch_voxel_transform(const Kernel& kernel,const Grid& grid,View<T> input,View<T> output,
                                                    const vd::Stats* summary,int* error,const double* table=nullptr,const vd::Stats* reference=nullptr,const T* auxiliary=nullptr) {
-    voxel_transform_kernel<<<blocks(input.size),256,0,vcr::device::stream()>>>(kernel,vd::Grid3(grid.shape),input.ptr,output.ptr,summary,table,reference,error,auxiliary);
+    vd::with_grid(grid.shape,[&](const auto& g) {
+    voxel_transform_kernel<<<blocks(input.size),256,0,vcr::device::stream()>>>(kernel,g,input.ptr,output.ptr,summary,table,reference,error,auxiliary);
     check(cudaGetLastError());
+    });
 }
 template<class Transform,class Function> void with_voxel_channels(const Transform& t,Sample& s,const Parameters& p,Session& session,Function&& fn) {
     apply_channels(t,s,p,session,[&](const auto&,auto image,const Grid& grid,const ChannelPlan& c){

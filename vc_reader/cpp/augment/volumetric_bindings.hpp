@@ -3,8 +3,8 @@
 static void volume_reference(volume_detail::ReferenceVolume& t, Arguments& a) {
     auto object=a.take("reference",nb::none());require(!object.is_none(),"reference volume is required");
     Input input;require(nb::try_cast(object,input,false),"reference must be a contiguous CPU NumPy array");
-    require(input.ndim()==4,"reference must have shape (C,Z,Y,X)");
-    for(std::size_t i=0;i<4;++i)t.shape.push_back(input.shape(i));
+    require((input.ndim()==3 || input.ndim()==4),"reference must have shape (C,Y,X) or (C,Z,Y,X)");
+    for(std::size_t i=0;i<input.ndim();++i)t.shape.push_back(input.shape(i));
     require(product(t.shape)>0,"reference must be nonempty");
     auto dtype=input.dtype();t.wide=dtype.bits==64;require(dtype.code==std::uint8_t(nb::dlpack::dtype_code::Float) && (dtype.bits==32 || dtype.bits==64),"reference must be float32 or float64");
     Array values(t.shape,'f',dtype.bits/8,input.data());
@@ -41,7 +41,7 @@ static void bind_volumetric(nb::module_& m) {
     bind<UnsharpMask>(m,"UnsharpMask",[](auto& t,auto& a){t.strength=parameter(a,"strength",Uniform{.1,.5});t.sigma=parameter(a,"sigma",Uniform{.5,1.5});});
     bind<GibbsRinging>(m,"GibbsRinging",[](auto& t,auto& a){t.cutoff=parameter(a,"cutoff",Uniform{.5,.9});});
     bind<RingingOvershoot>(m,"RingingOvershoot",[](auto& t,auto& a){t.cutoff=parameter(a,"cutoff",Uniform{.5,.9});t.radius=parameter(a,"radius",4.);});
-    bind<ForegroundCrop>(m,"ForegroundCrop",[](auto& t,auto& a){t.shape=a.get("shape",t.shape);t.mask=a.get("mask",t.mask);t.channel=a.get("channel",t.channel);t.threshold=a.get("threshold",0.);require(t.shape.size()==3 && product(t.shape)>0,"shape needs three positive sizes");require(std::isfinite(t.threshold),"threshold must be finite");});
+    bind<ForegroundCrop>(m,"ForegroundCrop",[](auto& t,auto& a){t.shape=a.get("shape",t.shape);t.mask=a.get("mask",t.mask);t.channel=a.get("channel",t.channel);t.threshold=a.get("threshold",0.);require((t.shape.size()==2 || t.shape.size()==3) && product(t.shape)>0,"shape needs two or three positive sizes");require(std::isfinite(t.threshold),"threshold must be finite");});
     bind<ChannelMisalignment>(m,"ChannelMisalignment",[](auto& t,auto& a){t.affine.degrees=parameter(a,"degrees",Uniform{-5,5});t.affine.translate=parameter(a,"translate",Uniform{-2,2});t.affine.scale=parameter(a,"scale",Uniform{.95,1.05});t.affine.shared_scale=a.get("shared_scale",false);t.affine.border=a.get("border",false);});
     bind<GridDropout>(m,"GridDropout",[](auto& t,auto& a){t.unit_size=a.get("unit_size",t.unit_size);t.ratio=parameter(a,"ratio",t.ratio);t.axes=a.get("axes",t.axes);erase_options(t.fill,a);});
     bind<StripeMasking>(m,"StripeMasking",[](auto& t,auto& a){t.unit_size=a.get("unit_size",t.unit_size);t.ratio=parameter(a,"ratio",t.ratio);t.axes=a.get("axes",t.axes);erase_options(t.fill,a);});

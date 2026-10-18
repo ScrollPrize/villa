@@ -48,8 +48,8 @@ template<class T> struct FourierLinePlan {
 } // namespace vcr::augment::volume_detail
 
 namespace vcr::augment::volume_detail {
-template<class T> inline void fft_volume(std::vector<ComplexT<T>>& data,const Grid3& g,bool inverse) {
-    for(int a=0;a<3;++a){
+template<class T,int D> inline void fft_volume(std::vector<ComplexT<T>>& data,const GridND<D>& g,bool inverse) {
+    for(int a=0;a<D;++a){
         auto len=g.n[a],stride=g.stride[a],count=g.size/len;
         FourierLinePlan<T> plan(len,inverse);std::vector<ComplexT<T>> scratch(plan.m);
         for(std::size_t line=0;line<count;++line){
@@ -58,7 +58,7 @@ template<class T> inline void fft_volume(std::vector<ComplexT<T>>& data,const Gr
         }
     }
 }
-VCR_HD inline bool low_frequency(const Grid3& g,std::size_t i,double fraction) {
-    for(int a=0;a<3;++a){auto k=g.coord(i,a);k=k<g.n[a]-k?k:g.n[a]-k;if(double(k)>fraction*double(g.n[a])/2)return false;}return true;
+template<int D> VCR_HD inline bool low_frequency(const GridND<D>& g,std::size_t i,double fraction) {
+    for(int a=0;a<D;++a){auto k=g.coord(i,a);k=k<g.n[a]-k?k:g.n[a]-k;if(double(k)>fraction*double(g.n[a])/2)return false;}return true;
 }
 } // namespace vcr::augment::volume_detail

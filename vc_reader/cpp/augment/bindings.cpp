@@ -209,8 +209,8 @@ NB_MODULE(_augment, m) {
         if (nb::isinstance<nb::str>(axis)) t.axis_from = nb::cast<std::string>(axis);
         else if (!axis.is_none()) {
             t.axis = nb::cast<std::vector<double>>(axis);
-            require(t.axis.size() == 3 && std::all_of(t.axis.begin(), t.axis.end(), [](double v) { return std::isfinite(v); }) &&
-                    std::any_of(t.axis.begin(), t.axis.end(), [](double v) { return v != 0; }), "axis must be a finite nonzero (z, y, x) vector");
+            require((t.axis.size() == 2 || t.axis.size() == 3) && std::all_of(t.axis.begin(), t.axis.end(), [](double v) { return std::isfinite(v); }) &&
+                    std::any_of(t.axis.begin(), t.axis.end(), [](double v) { return v != 0; }), "axis must be a finite nonzero (y, x) or (z, y, x) vector");
         }
     });
     bind<MedianFilter>(m, "MedianFilter", [](auto& t, auto& a) { t.size = parameter(a, "size", t.size); t.quantize = a.kw("quantize", false); });

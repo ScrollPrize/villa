@@ -3,13 +3,13 @@
 namespace vcr::augment {
 struct MultiplicativeNoise { Scalar low=.9,high=1.1;bool shared_noise=false; ChannelOptions options; };
 inline ChannelPlan channel_parameters(const MultiplicativeNoise& t,const Array& a,Random& r) {
-    volume_detail::require_volume(a);ChannelPlan p;
+    volume_detail::require_image(a);ChannelPlan p;
     double low=draw(t.low,r),high=draw(t.high,r);require(low>=0 && high>=low,"multipliers need 0 <= low <= high");p.values={low,high};
     p.seed=r.next();return p;
 }
 struct MultiplicativeNoiseKernel {
     double low,high;std::uint64_t seed;
-    template<class T> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T>& c) const {
+    template<class T,int D> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T,D>& c) const {
         using namespace volume_detail;
         return v[i]*(T(low)+T(high-low)*T(uniform(seed,i)));
     }

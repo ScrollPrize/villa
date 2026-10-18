@@ -3,11 +3,11 @@
 namespace vcr::augment {
 struct HistogramMatching {volume_detail::ReferenceVolume reference;Scalar blend=Uniform{.5,1};int bins=256;ChannelOptions options;};
 inline ChannelPlan channel_parameters(const HistogramMatching& t,const Array& a,Random& r) {
-    volume_detail::require_volume(a);double blend=draw(t.blend,r);probability(blend);require(t.bins>=2 && t.bins<=4096,"bins must be [2,4096]");ChannelPlan p;p.values={blend};return p;
+    volume_detail::require_image(a);double blend=draw(t.blend,r);probability(blend);require(t.bins>=2 && t.bins<=4096,"bins must be [2,4096]");ChannelPlan p;p.values={blend};return p;
 }
 struct HistogramMatchingKernel {
     double blend;int bins;
-    template<class T> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T>& c) const {
+    template<class T,int D> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T,D>& c) const {
         using namespace volume_detail;if(blend==0)return v[i];double rank=c.table[bin(v[i],c.input.low,c.input.high,bins)];const double* ref=c.table+bins;
         int j=0;while(j+1<bins && ref[j]<rank)++j;
         double mapped=c.reference.low+(c.reference.high-c.reference.low)*double(j)/(bins-1);return (1-blend)*v[i]+blend*mapped;

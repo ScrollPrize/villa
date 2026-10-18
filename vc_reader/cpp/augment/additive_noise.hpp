@@ -3,13 +3,13 @@
 namespace vcr::augment {
 struct AdditiveNoise { Scalar scale=.05,mean=0.,alpha=2.,beta=2.;int distribution=0;bool shared_noise=false; ChannelOptions options; };
 inline ChannelPlan channel_parameters(const AdditiveNoise& t,const Array& a,Random& r) {
-    volume_detail::require_volume(a);ChannelPlan p;
+    volume_detail::require_image(a);ChannelPlan p;
     double scale=draw(t.scale,r),mean=draw(t.mean,r),alpha=draw(t.alpha,r),beta=draw(t.beta,r);require(scale>=0 && alpha>0 && beta>0,"noise scale must be nonnegative, beta shapes positive");p.values={scale,mean,alpha,beta};
     p.seed=r.next();return p;
 }
 struct AdditiveNoiseKernel {
     double scale,mean,alpha,beta;int distribution;std::uint64_t seed;
-    template<class T> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T>& c) const {
+    template<class T,int D> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T,D>& c) const {
         using namespace volume_detail;
         Rng r{mix(seed+i)};double u=r.u(),noise=0;
         if(distribution==0)return v[i]+T(mean)+(T(2)*T(u)-T(1))*T(scale);

@@ -68,6 +68,35 @@ class BatchTests(unittest.TestCase):
     def assertSame(self, actual, expected):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
+    def test_planar_catalog_streams_and_retained_outputs(self):
+        from test_dimensions import image_transforms
+        rng = np.random.default_rng(23)
+        host = (.1+.8*rng.random((2, 2, 9, 11))).astype(np.float32)
+        reference = rng.random((1, 9, 11), dtype=np.float32)
+        transforms = image_transforms(reference)
+        transforms += [A.GridDropout(), A.StripeMasking(), A.ForegroundDropout(), A.ObjectDropout()]
+        for transform in transforms:
+            with self.subTest(transform=repr(transform)):
+                cpu = A.Pipeline([transform], compact=False)
+                gpu = A.Pipeline([transform], backend='cuda', compact=False)
+                labels = (host > .5).astype(np.int64)
+                expected = [cpu({'image': host[i], 'mask': labels[i]}, seed=i) for i in range(2)]
+                stream = torch.cuda.Stream()
+                with torch.cuda.stream(stream):
+                    source = torch.from_numpy(host).to('cuda')
+                    batch = {'image': source, 'mask': torch.from_numpy(labels).to('cuda')}
+                    first = gpu.batch(batch, seeds=[0, 1])
+                    second = gpu.batch(batch, seeds=[0, 1])
+                    weight = torch.ones((), device='cuda', requires_grad=True)
+                    (first['image']*weight).sum().backward()
+                stream.synchronize()
+                for key in first:
+                    target = torch.from_numpy(np.stack([x[key] for x in expected]))
+                    torch.testing.assert_close(first[key].cpu(), target, atol=6e-5, rtol=1e-5)
+                    self.assertSame(first[key], second[key])
+                self.assertSame(source.cpu(), torch.from_numpy(host))
+                self.assertTrue(torch.isfinite(weight.grad))
+
     def test_samples_labels_metadata_and_inputs(self):
         pipeline = A.Pipeline([A.Normalize('minmax'), A.Flip(axes='x', p_axis=1), A.BrightnessMultiply((.5, 1.5))],
                               targets={'image': A.Image(), 'label': A.Label()}, backend='cuda')

@@ -53,9 +53,30 @@ def workload(name):
     return Workload(name, "both" if name in ("Affine", "CropPad", "Elastic", "Flip", "Rotate90", "Transpose",
                                              "ThickSlice", "SheetCompression", "ForegroundCrop", "ForegroundDropout", "ObjectDropout") else "image")
 
+def planar_recipe(name, recipe):
+    """Adapt the catalog's explicit 3D settings for a planar benchmark.
+
+    Keep YX sizes/directions, map a Z-only operation to Y, and use a Y-aligned
+    oriented blur. Return the actual recipe so reports record these choices.
+    """
+    call = ast.parse(recipe.strip(), mode='eval').body
+    spatial = {'shape', 'size', 'unit_size', 'tile_shape', 'direction', 'center'}
+    for kw in call.keywords:
+        if kw.arg in spatial and isinstance(kw.value, (ast.Tuple, ast.List)) and len(kw.value.elts) == 3:
+            kw.value.elts = kw.value.elts[-2:]
+        elif kw.arg in ('axes', 'order') and isinstance(kw.value, ast.Constant):
+            kw.value.value = kw.value.value.replace('z', '') or 'y'
+        elif name == 'OrientedBlur' and kw.arg == 'axis':
+            kw.value = ast.parse('(1, 0)', mode='eval').body
+        elif name == 'Smear' and kw.arg == 'shift':
+            kw.value.elts = kw.value.elts[:1]
+    if name in ('SliceIllumination', 'Smear'):
+        call.keywords.append(ast.keyword(arg='axis', value=ast.Constant('y')))
+    return ast.unparse(call)
+
 def inputs(image):
     labels = (image > .5).astype(np.int16)
-    plane = np.ascontiguousarray(image[:, image.shape[1] // 2])
+    plane = image if image.ndim == 3 else np.ascontiguousarray(image[:, image.shape[1] // 2])
     y, x = np.indices(plane.shape[1:], dtype=np.float32)
     return dict(image=dict(image=image), both=dict(image=image, mask=labels),
                 binary=dict(image=labels.astype(np.float32)), labels=dict(mask=labels),

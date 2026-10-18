@@ -9,11 +9,25 @@ from unittest.mock import patch
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
-from bench_augmentations import compare, constructor, inputs, recipes, update_readme, workload
+from bench_augmentations import compare, constructor, inputs, planar_recipe, recipes, update_readme, workload
 from bench_pipeline import load_extensions
 
 
 class AugmentationBenchmarkTests(unittest.TestCase):
+    def test_planar_recipes_and_targets(self):
+        image = np.ones((1, 7, 9), dtype=np.float32)
+        sample = inputs(image)
+        self.assertEqual(sample['image']['image'].shape, (1, 7, 9))
+        self.assertEqual(sample['both']['mask'].shape, (1, 7, 9))
+        self.assertEqual(sample['channels']['image'].shape, (2, 7, 9))
+        self.assertEqual(sample['surface']['surface'].shape, (3, 7, 9))
+        self.assertEqual(planar_recipe('CLAHE', 'A.CLAHE(tile_shape=(3, 4, 5))'),
+                         'A.CLAHE(tile_shape=(4, 5))')
+        self.assertEqual(planar_recipe('OrientedBlur', 'A.OrientedBlur(axis=(1, 0, 0))'),
+                         'A.OrientedBlur(axis=(1, 0))')
+        self.assertEqual(planar_recipe('StripeMasking', "A.StripeMasking(axes='zyx')"),
+                         "A.StripeMasking(axes='yx')")
+
     def test_native_override_is_idempotent(self):
         import importlib.machinery
         with tempfile.TemporaryDirectory() as directory:

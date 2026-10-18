@@ -21,7 +21,7 @@ from bench_pipeline import environment, load_extensions, nonnegative, positive, 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
-from augment_examples import constructor, inputs, recipes, workload
+from augment_examples import constructor, inputs, planar_recipe, recipes, workload
 
 
 def fingerprint(sample):
@@ -77,7 +77,7 @@ def main():
     parser.add_argument('--start', type=int, nargs=3, default=(9000, 3600, 3600))
     parser.add_argument('--size', type=positive, default=128)
     parser.add_argument('--plane', action='store_true',
-                        help='read one Z plane for 2D image/strip recipes selected with --only')
+                        help='read one Z plane and adapt catalog recipes to 2D; record adapted recipes')
     parser.add_argument('--reps', type=positive, default=5)
     parser.add_argument('--warmup', type=positive, default=1)
     parser.add_argument('--seed', type=nonnegative, default=123)
@@ -100,8 +100,8 @@ def main():
         if set(args.only)-selected.keys():
             parser.error('unknown augmentation name')
         selected = {name: recipe for name, recipe in selected.items() if name in args.only}
-    if args.plane and any(workload(name).sample not in ('image', 'strip') for name in selected):
-        parser.error('--plane requires image-only or strip recipes; select them with --only')
+    if args.plane:
+        selected = {name: planar_recipe(name, recipe) for name, recipe in selected.items()}
     shape = (1, args.size, args.size) if args.plane else (args.size,)*3
     reference_start = (args.start[0]+384, *args.start[1:])
     with ZarrReader.open(args.array, level=args.level, threads=1) as reader:
@@ -112,10 +112,10 @@ def main():
         reference = reader.read(reference_start, shape, dtype=np.float32)[None]/np.float32(255)
     if not np.isfinite(image).all() or not np.isfinite(reference).all() or np.ptp(image) == 0:
         parser.error('input must be finite and contain visible CT signal')
-    samples = inputs(image)
     if args.plane:
-        samples['image'] = samples['strip']
+        image = np.ascontiguousarray(image[:, 0])
         reference = np.ascontiguousarray(reference[:, 0])
+    samples = inputs(image)
     report = dict(command=[sys.executable, *sys.argv],
                   recorded_at=datetime.now(timezone.utc).isoformat(),
                   git_revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),

@@ -93,8 +93,8 @@ retain commands, configuration, extension hashes, raw timings and comparisons.
 
 Reproduce with the existing environment/builds (no installation). Use
 `/tmp/vc-median-before` for the saved baseline, and distinct report paths for
-repetitions. `--plane` reads a single Z plane and supports image-only/strip
-recipes; it cannot update the cubic-volume README timing tables.
+repetitions. `--plane` reads a single Z plane and adapts the catalog recipes
+and their targets to 2D; it cannot update the cubic-volume README timing tables.
 
 ```bash
 AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-reader-cuda --target _augment --parallel 4

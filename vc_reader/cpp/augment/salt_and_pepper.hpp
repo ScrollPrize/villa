@@ -3,13 +3,13 @@
 namespace vcr::augment {
 struct SaltAndPepper { Scalar amount=.01,salt_fraction=.5;bool shared_noise=true; ChannelOptions options; };
 inline ChannelPlan channel_parameters(const SaltAndPepper& t,const Array& a,Random& r) {
-    volume_detail::require_volume(a);ChannelPlan p;
+    volume_detail::require_image(a);ChannelPlan p;
     double amount=draw(t.amount,r),salt=draw(t.salt_fraction,r);probability(amount);probability(salt);p.values={amount,salt};
     p.seed=r.next();return p;
 }
 struct SaltAndPepperKernel {
     double amount,salt_fraction;std::uint64_t seed;
-    template<class T> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T>& c) const {
+    template<class T,int D> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T,D>& c) const {
         using namespace volume_detail;
         return uniform(seed,i)<amount?(uniform(seed,i+c.grid.size)<salt_fraction?c.input.high:c.input.low):v[i];
     }

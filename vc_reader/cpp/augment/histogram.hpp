@@ -29,27 +29,30 @@ VCR_HD inline void cdf(double* h,int bins,double clip_limit=0) {
 namespace vcr::augment::volume_detail {
 struct HistogramGrid {
     std::size_t tiles[3],count=1;int bins;double clip_limit;
-    HistogramGrid(const Grid3& g,const Shape& tile,int bins,double clip):bins(bins),clip_limit(clip) {
-        require(bins>=2 && bins<=4096,"bins must be [2,4096]");require(tile.size()==3,"tile_shape needs three dimensions");
-        for(int a=0;a<3;++a){require(tile[a]>0 && tile[a]<=65536,"tile sizes must be [1,65536]");tiles[a]=(g.n[a]+tile[a]-1)/tile[a];count*=tiles[a];}
+    template<int D> HistogramGrid(const GridND<D>& g,const Shape& requested,int bins,double clip):bins(bins),clip_limit(clip) {
+        const auto tile=spatial_sizes(requested,D,16);
+        require(bins>=2 && bins<=4096,"bins must be [2,4096]");
+        for(int a=0;a<D;++a){require(tile[a]>0 && tile[a]<=65536,"tile sizes must be [1,65536]");tiles[a]=(g.n[a]+tile[a]-1)/tile[a];count*=tiles[a];}
     }
 };
-template<class T> VCR_HD inline void histogram_tile(const T* v,const Grid3& g,const Stats& s,const HistogramGrid& layout,std::size_t tile,double* table) {
+template<class T,int D> VCR_HD inline void histogram_tile(const T* v,const GridND<D>& g,const Stats& s,const HistogramGrid& layout,std::size_t tile,double* table) {
     double* h=table+tile*layout.bins;for(int b=0;b<layout.bins;++b)h[b]=0;
-    std::size_t pos[3]{tile/(layout.tiles[1]*layout.tiles[2]),tile/layout.tiles[2]%layout.tiles[1],tile%layout.tiles[2]},lo[3],hi[3];
-    for(int a=0;a<3;++a){lo[a]=pos[a]*g.n[a]/layout.tiles[a];hi[a]=(pos[a]+1)*g.n[a]/layout.tiles[a];}
-    for(std::size_t z=lo[0];z<hi[0];++z)for(std::size_t y=lo[1];y<hi[1];++y)for(std::size_t x=lo[2];x<hi[2];++x)
-        h[bin(v[z*g.stride[0]+y*g.stride[1]+x],s.low,s.high,layout.bins)]+=1;
+    std::size_t pos[3],lo[3],hi[3];
+    if constexpr(D==3){pos[0]=tile/(layout.tiles[1]*layout.tiles[2]);pos[1]=tile/layout.tiles[2]%layout.tiles[1];pos[2]=tile%layout.tiles[2];}
+    else {pos[0]=tile/layout.tiles[1];pos[1]=tile%layout.tiles[1];}
+    for(int a=0;a<D;++a){lo[a]=pos[a]*g.n[a]/layout.tiles[a];hi[a]=(pos[a]+1)*g.n[a]/layout.tiles[a];}
+    for(std::size_t z=D==3?lo[0]:0;z<(D==3?hi[0]:1);++z)for(std::size_t y=lo[D-2];y<hi[D-2];++y)for(std::size_t x=lo[D-1];x<hi[D-1];++x)
+        h[bin(v[(D==3?z*g.stride[0]:0)+y*g.stride[D-2]+x],s.low,s.high,layout.bins)]+=1;
     cdf(h,layout.bins,layout.clip_limit);
 }
-VCR_HD inline double interpolate_histograms(const Grid3& g,const HistogramGrid& layout,std::size_t i,int b,const double* table) {
+template<int D> VCR_HD inline double interpolate_histograms(const GridND<D>& g,const HistogramGrid& layout,std::size_t i,int b,const double* table) {
     std::size_t lo[3],hi[3];double f[3];
-    for(int a=0;a<3;++a){double q=clamp((double(g.coord(i,a))+.5)*layout.tiles[a]/g.n[a]-.5,0,double(layout.tiles[a]-1));lo[a]=std::size_t(floor(q));hi[a]=lo[a]+1<layout.tiles[a]?lo[a]+1:lo[a];f[a]=q-lo[a];}
+    for(int a=0;a<D;++a){double q=clamp((double(g.coord(i,a))+.5)*layout.tiles[a]/g.n[a]-.5,0,double(layout.tiles[a]-1));lo[a]=std::size_t(floor(q));hi[a]=lo[a]+1<layout.tiles[a]?lo[a]+1:lo[a];f[a]=q-lo[a];}
     double result=0;
-    for(int corner=0;corner<8;++corner){std::size_t t=0;double w=1;for(int a=0;a<3;++a){bool bit=(corner>>a)&1;t=t*layout.tiles[a]+(bit?hi[a]:lo[a]);w*=bit?f[a]:1-f[a];}result+=w*table[t*layout.bins+b];}
+    for(int corner=0;corner<(1<<D);++corner){std::size_t t=0;double w=1;for(int a=0;a<D;++a){bool bit=(corner>>a)&1;t=t*layout.tiles[a]+(bit?hi[a]:lo[a]);w*=bit?f[a]:1-f[a];}result+=w*table[t*layout.bins+b];}
     return result;
 }
-template<class T> inline std::vector<double> channel_histograms(const std::vector<T>& v,const Grid3& g,const HistogramGrid& layout) {
+template<class T,int D> inline std::vector<double> channel_histograms(const std::vector<T>& v,const GridND<D>& g,const HistogramGrid& layout) {
     auto summary=stats(v.data(),v.size());std::vector<double> table(layout.count*layout.bins);
     for(std::size_t tile=0;tile<layout.count;++tile)histogram_tile(v.data(),g,summary,layout,tile,table.data());return table;
 }
