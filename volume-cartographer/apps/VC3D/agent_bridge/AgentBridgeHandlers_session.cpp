@@ -72,6 +72,7 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         result["sameWrapAnnotation"] = QJsonValue::Null;
         result["autosave"] = QJsonValue::Null;
         result["viewers"] = QJsonArray();
+        result["workspace"] = workspacesJson();
         result["job"] = QJsonValue::Null;
         result["focusPoi"] = QJsonValue::Null;
         return result;
@@ -192,9 +193,15 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         v["kind"] = (dynamic_cast<CChunkedVolumeViewer*>(e.viewer) != nullptr)
                         ? QStringLiteral("chunked") : QStringLiteral("other");
         v["scale"] = e.viewer->getCurrentScale();
+        const auto* widget = qobject_cast<const QWidget*>(e.object.data());
+        const QString workspace = workspaceIdFor(widget);
+        v["workspace"] = workspace.isEmpty() ? QJsonValue(QJsonValue::Null)
+                                             : QJsonValue(workspace);
+        v["visible"] = widget != nullptr && widget->isVisible();
         viewers.push_back(v);
     }
     result["viewers"] = viewers;
+    result["workspace"] = workspacesJson();
 
     // "job" is the most recently started active job; "jobs" lists all of them.
     QJsonObject mostRecentActive;

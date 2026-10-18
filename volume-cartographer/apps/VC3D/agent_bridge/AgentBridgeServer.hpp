@@ -150,9 +150,15 @@ private:
     std::vector<WorkspaceTab> workspaceTabs() const;
     QWidget* workspacePage(const QString& id) const;
     QString currentWorkspaceId() const;
+    // Id of the workspace tab whose page contains `widget` (floating docks
+    // included), or empty when the widget is outside every addressable tab.
+    QString workspaceIdFor(const QWidget* widget) const;
     // Makes `id` the current tab exactly as the GUI does. Returns false when
     // no tab has that id.
     bool setCurrentWorkspace(const QString& id);
+    // state.get's "workspace": the current tab's id and {id, title} of every
+    // addressable tab in tab order.
+    QJsonObject workspacesJson() const;
 
     // --- Handlers ---
     QJsonObject handlePing(const QJsonValue& params);

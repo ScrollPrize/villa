@@ -536,12 +536,22 @@ def check_workspaces(client: BridgeClient, results: Results) -> None:
     and the original fiber_slice spelling still works."""
     failures: list[str] = []
     try:
+        state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        available = [
+            entry.get("id") for entry in (state.get("workspace") or {}).get("available", [])
+        ]
+        # Exactly the bridge's ids, in tab order: a tab added to CWindow must
+        # be added to agentBridgeWorkspaceIds() too.
+        if available != list(WORKSPACE_IDS):
+            failures.append(f"available={available}")
         previous = None
         for workspace_id in WORKSPACE_IDS:
             result, _ = client.call(
                 "workspace.switch", {"name": workspace_id}, timeout=RPC_TIMEOUT)
-            if result.get("workspace") != workspace_id:
-                failures.append(f"{workspace_id}: result={result}")
+            after, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+            current = (after.get("workspace") or {}).get("current")
+            if result.get("workspace") != workspace_id or current != workspace_id:
+                failures.append(f"{workspace_id}: result={result} current={current}")
             if previous is not None and result.get("previous") != previous:
                 failures.append(f"{workspace_id}: previous={result.get('previous')}")
             previous = workspace_id
@@ -557,6 +567,24 @@ def check_workspaces(client: BridgeClient, results: Results) -> None:
         not failures,
         "every workspace switched in tab order" if not failures else "; ".join(failures[:4]),
     )
+
+    try:
+        state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        viewers = state.get("viewers", [])
+        shaped = all("workspace" in v and "visible" in v for v in viewers)
+        main_viewers = [v for v in viewers if v.get("workspace") == "main"]
+        spiral = [v for v in viewers if v.get("workspace") == "spiral"]
+        visible_main = [v for v in main_viewers if v.get("visible")]
+        ok = shaped and bool(visible_main) and not any(v.get("visible") for v in spiral)
+        results.record(
+            "viewers_every_manager",
+            ok,
+            f"viewers={len(viewers)} main={len(main_viewers)} "
+            f"visible main={len(visible_main)} spiral={len(spiral)}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "viewers_every_manager", False, f"{type(error).__name__}: {error}")
 
 
 def check_project_create(

@@ -21,7 +21,8 @@ async def vc3d_ping() -> dict[str, Any]:
 @mcp.tool()
 async def vc3d_get_state() -> dict[str, Any]:
     """Snapshot of VC3D: open volume package, current volume, active segment,
-    viewers (ids/names), editing mode, running job. Call this first."""
+    viewers (ids/names, each with its workspace and visibility), the current
+    and available workspaces, editing mode, running job. Call this first."""
     return await _call("state.get")
 
 
@@ -96,11 +97,13 @@ async def vc3d_switch_workspace(
     "spiral", "fiber-map". "fiber_slice" is the older spelling of
     "fiber-slice" and is still accepted.
 
-    Spiral's own viewer panes reuse the main slot names ("segmentation",
+    Viewers from every workspace (including Spiral's own panes) appear in
+    vc3d_get_state's viewers list with a "workspace" field and a "visible"
+    flag; vc3d_get_state's "workspace" field names the current tab and the
+    available ids. Spiral's panes reuse the main slot names ("segmentation",
     "xy plane", ...), which keep meaning the main panes, so target Spiral's
-    panes by "viewerId" from vc3d_get_state. A viewer in a hidden tab can
-    still receive input, but vc3d_screenshot needs it visible, so switch here
-    first.
+    by "viewerId". A viewer in a hidden tab can still receive input, but
+    vc3d_screenshot needs it visible, so switch here first.
 
     The tab is real Qt UI state that persists across restarts: a freshly
     launched VC3D can open on a leftover tab from a prior session. There is no

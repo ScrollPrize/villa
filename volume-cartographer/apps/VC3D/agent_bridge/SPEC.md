@@ -266,7 +266,11 @@ dialog.
 
 - `ping` reports process, application, and protocol identity.
 - `state.get` is a non-mutating snapshot of the current package, volume,
-  active segment, editing modes, viewers, point state, and active jobs.
+  active segment, editing modes, viewers, point state, and active jobs. Each
+  viewer entry names its `workspace` (null outside an addressable tab) and
+  whether it is `visible`. `workspace.current` is the current tab's id (null
+  for an unnamed line-annotation tab) and `workspace.available` lists
+  `{id, title}` in tab order.
 - `workspace.switch` accepts every workspace id (`main`, `lasagna`, `atlas`,
   `fiber-slice`, `intersections`, `spiral`, `fiber-map`) plus the original
   `fiber_slice` spelling, and changes the tab exactly as the GUI does. It

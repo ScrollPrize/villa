@@ -1,5 +1,6 @@
 #include "agent_bridge/AgentBridgeServer.hpp"
 
+#include <QJsonArray>
 #include <QTabWidget>
 #include <QVariant>
 #include <QWidget>
@@ -47,6 +48,21 @@ QString AgentBridgeServer::currentWorkspaceId() const
 }
 
 
+QString AgentBridgeServer::workspaceIdFor(const QWidget* widget) const
+{
+    QTabWidget* tabWidget = _window ? _window->_workspaceTabs : nullptr;
+    if (!tabWidget)
+        return QString();
+    // parentWidget() crosses floating dock windows, which stay children of
+    // their workspace's QMainWindow.
+    for (const QWidget* w = widget; w; w = w->parentWidget()) {
+        if (tabWidget->indexOf(const_cast<QWidget*>(w)) >= 0)
+            return w->property("workspaceId").toString();
+    }
+    return QString();
+}
+
+
 bool AgentBridgeServer::setCurrentWorkspace(const QString& id)
 {
     QWidget* page = workspacePage(id);
@@ -63,4 +79,21 @@ bool AgentBridgeServer::setCurrentWorkspace(const QString& id)
     else
         _window->_workspaceTabs->setCurrentWidget(page);
     return true;
+}
+
+
+QJsonObject AgentBridgeServer::workspacesJson() const
+{
+    QJsonArray available;
+    for (const WorkspaceTab& tab : workspaceTabs()) {
+        QJsonObject entry;
+        entry["id"] = tab.id;
+        entry["title"] = tab.title;
+        available.append(entry);
+    }
+    const QString current = currentWorkspaceId();
+    QJsonObject result;
+    result["current"] = current.isEmpty() ? QJsonValue(QJsonValue::Null) : QJsonValue(current);
+    result["available"] = available;
+    return result;
 }
