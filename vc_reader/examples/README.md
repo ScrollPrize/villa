@@ -63,7 +63,7 @@ The examples never download a complete CT volume or search it for random patches
 
 ## Data and supervision choices
 
-The 2.5D example selects PHercParis4 segment `20231012184424`, label set
+The 2.5D example selects PHercParis4 segment `20231210121321`, label set
 `20260918`, native volume `20260411134726`. It prints the published ink,
 supervision and CT URLs plus the original annotation raster names. This segment
 has no published validation mask. The notebook reserves a contiguous bottom
@@ -147,15 +147,15 @@ and detailed stage timings, see [training integration](../docs/training-workflow
 
 ## Recorded validation
 
-The 2.5D notebook was executed on the real PHercParis4 data with CUDA and
-replayed offline. Its coverage tests also exercise local paired readers,
+The 2.5D notebook was executed on real PHercParis4 segment `20231210121321`
+with CUDA. Its coverage tests also exercise local paired readers,
 partial edge tiles, negative-only labels and rejection of an empty split.
 CPU/CUDA model tests check variable-depth chunks, depth max pooling, finite
 gradients and updates to the 3D convolution weights. The recorded
-split contains 64 training tiles (6,614,757 supported pixels) and 18 validation
-tiles (1,359,430 pixels). The validation section begins at level-3 Y = 4608,
-covering 17.0% of supervision. Saved outputs report the three-epoch metrics alongside the
-all-ink baseline; this short run demonstrates the workflow. Prepared patches occupy about 226 MiB on disk. The 2.5D notebook explicitly
+split contains 39 training tiles (2,217,069 supported pixels) and 13 validation
+tiles (543,948 pixels). The validation section begins at level-3 Y = 4608,
+covering 19.7% of supervision. Saved outputs report the three-epoch metrics alongside the
+all-ink baseline; this short run demonstrates the workflow. Prepared patches occupy about 143 MiB on disk. The 2.5D notebook explicitly
 caps the shared source cache at 4 GiB so this full-segment run fits for replay.
 
 The reader, augmentation and mesh notebooks were executed on CPU, including
