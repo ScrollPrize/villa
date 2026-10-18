@@ -46,7 +46,7 @@ def main():
         raise RuntimeError('CUDA device is unavailable')
     catalog = load(args.metadata)
     label, image = discover(catalog)
-    ambiguous = catalog.scrolls['PHerc0139'].on_volume('20260413113053').segments['20260302000001'].images.filter(format='zarr')
+    ambiguous = catalog.scrolls['PHerc0139'].on_volume('20260413113053').segments['20260302000001'].surface_volumes.filter(format='zarr')
     assert len(ambiguous) == 2
     try:
         ambiguous.zarr()

@@ -1,397 +1,119 @@
 # vc_reader
 
-## Browse a sample and read CT with ink
+Tools for working with Vesuvius Challenge data: discover scans and annotations,
+read and sample large CT volumes, and augment aligned training inputs on CPU
+or CUDA. The package is built for large multidimensional images and PyTorch
+training pipelines; its Zarr reader and augmentations also work with your own data.
+
+- **Discover data:** browse published metadata for samples, volumes, segments,
+  ink labels and geometry, including scans at a requested resolution.
+- **Read and sample:** fetch local, HTTP or S3 Zarr crops with bounded caches,
+  batch reads, and sample rotated boxes or curved surfaces.
+- **Align targets:** read CT with ink and supervision masks, sample registered
+  labels into a volume grid, or project surface annotations into 3D.
+- **Augment for training:** apply CPU/CUDA geometry, intensity, noise and filter
+  transforms to 2D or 3D inputs while keeping images and labels aligned.
+  `CudaLoader` adds GPU augmentation and prefetching to a PyTorch DataLoader.
+
+## Quick start
+
+See [installation and notebook setup](examples/README.md#run). This example
+finds a published ink label and reads its corresponding surface-rendered CT
+layers and masks:
 
 ```python
 from vc_reader import load, ScrollSource
 
 catalog = load()
-scroll = ScrollSource("PHerc0009B", "20250820154339", catalog=catalog)
-segment = scroll.segments["20250919125754"]
+scroll = ScrollSource("PHerc0009B", catalog=catalog)
+ct_volume = scroll.volumes["20250820154339"]
+segment = ct_volume.segments["20250919125754"]
 label = segment.labels.ink(label_set="20260918")
-image = label.images.zarr()
+surface_volume = label.surface_volumes.zarr()
 
-with label.open_paired(image=image, layers=slice(40, 65), backend="cpu") as reader:
+with label.open_paired(image=surface_volume, layers=slice(40, 65), backend="cpu") as reader:
     patch = reader[18576:18704, 7984:8112]
-    image_data = patch.image.data         # (1, 25, 128, 128)
-    ink = patch.label.data                # (1, 128, 128)
+    ct_layers = patch.image.data                # (1, 25, 128, 128)
+    ink = patch.label.data                      # (1, 128, 128)
     supervision = patch.label.masks["supervision"]
     validation = patch.label.masks["validation"]
-    mesh_valid = patch.label.valid
 ```
 
-`patch` is the sampled crop. Each target groups its data, geometric validity,
-and companion masks: `patch.label` holds the cropped ink and its masks, while
-`patch.image` holds the CT layers. Named targets are also accessible through
-`patch[name]`; `patch.targets` contains the target mapping.
-
-This published crop contains **9,926 nonzero ink pixels**. CT, ink, and both
-masks are checked against independently opened arrays by
-[`scripts/paired_reading.py`](scripts/paired_reading.py). The stored depth axis
-contains sampled surface layers. Labels stay two-dimensional; masks retain
-their published values without choosing a training policy. `backend="cuda"`
-returns device arrays in the process that owns the GPU.
-
-Browse `scroll.volumes`, `scroll.segments`, `scroll.labels`,
-`scroll.images`, `scroll.representations`, and `scroll.geometry`.
-`label.volume` is its native target; `label.mappable_volumes` lists explicit
-transforms, known coverage, and required operations such as surface projection.
-`image.labels.ink(label_set="20260918")` follows the same relationships in
-reverse. `.ink(...)` returns the matching label and raises with candidates when
-none or multiple match. Use `.labels.filter(artifact_kind="ink-labels")` to
-browse multiple ink labels.
-
-`catalog.samples[id]` and `ScrollSource(...)` return the same kind of view.
-`catalog.scrolls` filters samples to published type `scroll`; PHerc0009B is
-classified as a fragment and remains in `catalog.samples`. Omit `volume` to
-browse every direct association; `.on_volume(id)` returns a contextual view.
-Only explicitly superseded entries are hidden. Use
-`.filter(include_superseded=True)` or historical ID lookup to inspect them.
-
-Labels expose volume registrations through their native volume:
+`surface_volume` is CT sampled along the segment's curved surface; its depth
+axis indexes surface layers. `ct_volume` is the original 3D scan in ZYX voxel
+coordinates. Read the original scan directly with:
 
 ```python
-label = catalog.samples["PHerc0009B"].segments["20250919125754"].labels.ink(label_set="20260918")
-print(label.summary())  # native volume, mapped destinations, coverage and unresolved fields
-mapping = label.mappable_volumes["20250521125136"]
-print(mapping.required_operations)  # surface_projection, volume_transform
+with ct_volume.open(level=0) as reader:
+    voxels = reader[100:104, 200:204, 300:304]  # Z, Y, X
 ```
 
-Surface labels can have known volume affines while still needing an explicit
-pixel-to-UV declaration. See [discovery](docs/discovery.md#find-labels-mapped-to-another-scan)
-and the runnable [`published-transfer` workflow](docs/training-workflows.md).
+`.surface_volumes.zarr()` requires a unique matching render; multiple matches
+raise an error. Use filters such as `artifact_id=...` to select among them.
 
-## Discover CT by resolution
+`patch` keeps each target's data, geometric validity and companion masks
+together. CUDA reading and augmentation require a build with
+`VC_READER_ENABLE_CUDA=ON` and an accessible CUDA device.
 
-```python
-matches = catalog.scrolls.volumes.at_resolution(8.0, rel_tol=0.02)
-paris = catalog.scrolls["PHercParis4"].volumes.at_resolution(8.0, rel_tol=0.02)
-for match in paris:
-    print(match.volume.id, match.level, match.estimated_resolution_um, match.verified)
+## Performance highlights
 
-candidate = paris.get(volume="20230206171837")
-confirmed = candidate.resolve()  # reads headers; confirms selection, spacing, shape
-with candidate.open() as ct:
-    crop = ct[100:104, 200:204, 300:304]
-```
+Recorded on an **Intel Core Ultra 7 270K Plus / RTX 5090**, using PHercParis4
+level 2, a Release build, and a **local uncompressed Zarr cache with warm
+filesystem access**. These timings do not measure remote downloads or decoding
+compressed chunks.
 
-Discovery makes no array requests. Native arrays and estimated pyramid levels
-are returned within tolerance, ordered by resolution difference and stable IDs.
-The default tolerance is 0.5%; 2% includes PHercParis4's 7.91 µm scans in an
-8 µm search. Opening validates headers and fails on missing levels or
-contradictions. It never resamples CT to satisfy a resolution query.
-
-## Attach custom data
-
-```python
-from vc_reader import Source, Storage
-
-view = scroll.with_source(
-    Source("my-image", Storage("/data/image.zarr", "zarr"),
-           role="image", axes=("z", "y", "x")),
-    kind="image", volume=scroll.volume, segment="user:my-segment",
-)
-view = view.with_source(
-    Source("my-ink", Storage("/data/ink.png", "png"),
-           role="label", axes=("y", "x"), artifact_kind="ink-labels"),
-    kind="label", volume=scroll.volume, segment="user:my-segment",
-    image="user:my-image", same_grid=True,
-)
-with view.labels["user:my-ink"].open_paired() as reader:
-    patch = reader[:128, :128]
-```
-
-Custom pairs require `same_grid=True` or an explicit 2×3 `pixel_affine` mapping
-label XY pixels into image XY pixels. Volume-aligned labels and representations
-use `VolumeRegistration` and `volume.open_aligned(...)`. Unregistered sources
-remain raw-readable through `.open()`. Overlays preserve published metadata and
-serialize with `view.to_dict()` / `ScrollSource.from_dict(...)`.
-
-See [discovery and pairing](docs/discovery.md), [source formats and caches](docs/source-reading.md),
-and [real-data validation and measurements](docs/scroll-reading-benchmarks.md).
-Generate physical-offset surface layers with `reader.render_surface(...)`, or
-turn a 2D label patch into aligned 3D CT/labels with
-`reader.project_surface(surface, start_yx, size_yx, label_target="ink")`.
-Projection derives the volume crop from registered geometry; `padding_um` adds
-CT context and `thickness_um` controls the label band. Large requests can use
-`iter_project_surface(...)`. See [surface sampling](docs/surface-sampling.md)
-for explicit geometry registration, coverage/conflict masks, and CPU/CUDA use.
-
-## Notebook examples
-
-Start with the [notebooks in `examples/`](examples/README.md):
-
-- [2.5D ink training](examples/01_ink_training_25d.ipynb): discover PHercParis4 labels, train a small model on CT layers, and validate on a held-out segment.
-- [3D ink training](examples/02_ink_training_3d.ipynb): project ink into CT and supply a separate target-sheet input channel.
-- [General Zarr reading](examples/03_zarr_reader.ipynb): groups, levels, slices, batched reads, buffers and caches.
-- [Augmentations and the CUDA pipeline](examples/04_augmentations_and_cuda.ipynb): aligned targets through DataLoader, GPU augmentation and a model step.
-- [Render a mesh segment](examples/05_render_mesh_segment.ipynb): central CT surface and −1/+1 normal offsets.
-
-The notebooks show the Dataset, model, supervision policy, short training loop,
-validation and figures directly. For process-local streaming readers, persistent
-spawned workers and cache controls, see [training integration](docs/training-workflows.md)
-and its [acceptance measurements](docs/training-workflow-benchmarks.md).
-
-## PyTorch CUDA batches
-
-Keep your ordinary PyTorch dataset and DataLoader. Wrap the loader to upload
-whole batches and run normalization and augmentation on the training GPU:
-
-```python
-from torch.utils.data import DataLoader
-from vc_reader import augment as A
-from vc_reader.torch import CudaLoader
-
-def train(dataset, model):
-    # Each dataset item is a dict, e.g. image: (C, Z, Y, X), label: (C, Z, Y, X).
-    cpu_loader = DataLoader(
-        dataset, batch_size=4, num_workers=4,
-        multiprocessing_context="spawn", pin_memory=True, persistent_workers=True,
-    )
-    pipeline = A.Pipeline(
-        [A.Normalize("minmax"), A.Flip(axes="xyz"), A.Gamma((0.8, 1.2))],
-        targets={"image": A.Image(), "label": A.Label()},
-        backend="cuda",
-    )
-    loader = CudaLoader(cpu_loader, pipeline, device="cuda:0", seed=123)
-    for epoch in range(10):
-        loader.set_epoch(epoch)
-        for batch in loader:
-            prediction = model(batch["image"])
-            # batch["label"] is also a CUDA tensor, with its original dtype.
-            # Compute loss, backward, and optimizer step here.
-
-# Call train(...) under `if __name__ == "__main__":` when using spawn workers.
-```
-
-This requires PyTorch (the optional `torch` extra), a CUDA-enabled vc_reader
-build (`VC_READER_ENABLE_CUDA=ON`), and an accessible CUDA device. Importing the
-catalog, reader, or ordinary augmentation API does not import PyTorch.
-
-The dataset can use `ZarrReader` to return CPU crops. CUDA work belongs in the
-training process: wrap the **DataLoader**, rather than calling a CUDA pipeline
-inside `Dataset.__getitem__` or a worker's `collate_fn`. The wrapper also accepts
-an iterable that supplies already-resident CUDA batches in that process. It
-does not change your sampler, dataset, or worker configuration.
-
-- Dense batch targets have shape `(B, C, Y, X)` or `(B, C, Z, Y, X)`. Include the
-  channel axis even for one-channel images and labels. Points/vectors use the
-  existing per-sample shapes with a leading batch axis.
-- Each declared target is uploaded as one batch. `uint8` continuous targets
-  become `float32` **on the GPU**; float32/float64 and label dtypes are preserved.
-  Other continuous integer types and reduced-precision floats require an
-  explicit conversion. Existing CUDA inputs must be on the selected device.
-- Only fields declared in `pipeline.targets` are processed. Metadata—including
-  CPU tensors of sample IDs or seeds—passes through unchanged. All target
-  inputs are preserved; this preprocessing API does not accept autograd inputs.
-- Normalization and augmentation stay on device. Results are ordinary
-  PyTorch-owned tensors, safe to retain after advancing or closing the iterator.
-  Equal output shapes are stacked; variable shapes produce per-sample lists.
-  Deep-supervision outputs are lists of levels, each stacked when shapes agree.
-- The default `prefetch=True` queues one batch ahead on a private CUDA stream.
-  Completion and data-validation errors are checked before a batch is yielded.
-  Only small validation flags return to CPU. Use `prefetch=False` for on-demand
-  iteration. If keeping an iterator after an early break, call `iterator.close()`
-  (or use `contextlib.closing`) to promptly release the prefetched batch.
-
-For custom training loops, use the same executor directly:
-
-```python
-# CPU/NumPy targets are uploaded; CUDA tensors or DeviceArrays stay on device.
-result = pipeline.batch(batch, seeds=per_sample_seeds, device="cuda:0")
-```
-
-`Pipeline.batch()` infers the device from resident targets when `device` is
-omitted, otherwise uses the current CUDA device. It uses PyTorch's current
-stream and completes/checks once per batch before returning. As with normal
-PyTorch tensors, callers switching streams after the return must coordinate
-those streams. Native batch execution currently loops over samples internally;
-the public API submits the full batch and does not synchronize between samples.
-
-Default loader seeds depend on `seed`, `epoch`, and sample position in the
-local iteration order. `set_epoch()` changes augmentation seeds only: call
-`DistributedSampler.set_epoch()` separately when using DDP, and create one
-`CudaLoader` per training rank with its assigned device. For seeds independent
-of batching, ordering, or rank, supply a CPU metadata field and set
-`CudaLoader(..., seed_key="aug_seed")`. Each entry must be a uint64-range integer;
-`np.asarray(A.seed(run_seed, epoch, sample_id), dtype=np.uint64)` is suitable for
-dataset items and default PyTorch collation. Explicit seeds override generated
-seeds, so `set_epoch()` does not change them.
-
-See the [loader benchmark and regression commands](benchmarks/README.md#pytorch-cuda-batches)
-for timing scope and validation.
-
-## Performance
-
-Low-resolution simulation composes nearest reduction and linear reconstruction
-into one sampling pass on CPU and CUDA. It avoids the reduced image and, for
-single-channel CUDA crops, two full-volume copies. See the
-[composed resize measurements](benchmarks/README.md#composed-low-resolution-sampling-2026-10-17)
-for transform timings and full-loader throughput.
-
-Local brightness, contrast, gamma and smoothing use separable float32 fields:
-a 128³ field needs 388 floats (1.52 KiB), with weights evaluated during image
-processing. See the [compact local-field measurements](benchmarks/README.md#compact-local-fields-2026-10-17)
-for CPU/CUDA timings and full-loader throughput.
-
-### Reading and sampling
-
-Median milliseconds per request, including sampling where needed: six requests
-× ten repetitions per workload/backend, after validation and two warmups, with
-eight reader workers. CUDA includes fresh source uploads and final host downloads.
-TensorStore and zarr-python use SciPy to interpolate identical coordinate grids.
-The curved surface uses the [bundled tifxyz strip](benchmarks/README.md#reusable-tifxyz-surface).
+**Zarr reading and sampling — median milliseconds per request:**
 
 | Workload | zarr-python | TensorStore | vc_reader CPU | vc_reader CUDA |
 | --- | ---: | ---: | ---: | ---: |
-| ML batch: 8 × 128³ crops | 14.158 | 4.894 | 1.147 | 4.796 |
-| Curved tifxyz surface: 96 × 512 | 10.824 | 6.645 | 0.868 | 1.792 |
-| Axis-aligned slab: 16 × 512² | 6.263 | 2.900 | 0.401 | 2.314 |
-| Rotated box: 128³ | 69.288 | 65.259 | 13.792 | 1.629 |
+| Batch of 8 × 128³ crops | 14.158 | 4.894 | **1.147** | 4.796 |
+| Curved surface, 96 × 512 | 10.824 | 6.645 | **0.868** | 1.792 |
+| Rotated box, 128³ | 69.288 | 65.259 | 13.792 | **1.629** |
 
-CPU is faster for direct batches, slabs, and these surface tiles. For rotated
-boxes, CUDA is 8.46× faster than vc_reader CPU
+Eight reader workers; 60 measured requests per workload/backend. CUDA includes
+fresh uploads and final CPU outputs. The zarr-python and TensorStore sampling
+paths use SciPy interpolation. See [methodology and full results](benchmarks/README.md#readingsampling-timing-comparisons).
 
-### Axis-aligned single-crop latency (12 augmentations, CPU output)
+**Augmentation pipeline — median milliseconds per 128³ crop:**
 
-Axis-aligned crops are the default workload here. Each request reads a 128³
-box, applies min-max normalization, then runs 12 augmentations: elastic
-deformation, median filtering, flipping, Gaussian blur, brightness multiplication
-and addition, contrast, gamma, local contrast, local smoothing, sharpening, and
-low-resolution simulation. These benchmarks measure input preparation only;
-no model forward or backward pass is included.
-
-Reading on CPU and then moving to CUDA is the fastest measured route. Each
-route uses six crops × ten repetitions, with fresh GPU uploads and final host
-downloads.
-
-| Pipeline | Median total (ms) | Crops/s | Speedup over CPU |
-| --- | ---: | ---: | ---: |
-| CPU throughout | 149.723 | 6.68 | 1.00× |
-| CUDA reading + processing | 2.468 | 389.54 | 60.65× |
-| CPU reading → CUDA processing | 1.833 | 534.70 | 81.68× |
-
-The hybrid route is **1.35× faster** than CUDA reading and processing for these
-boxes. All routes passed output correctness checks; full distributions and
-validation results are in the [benchmark guide](benchmarks/README.md).
-
-### PyTorch batch throughput (12 augmentations, GPU output)
-
-This benchmark compares ways to feed batches to a PyTorch model, including
-loader workers and prefetching. It uses the same min-max normalization and
-12 augmentations as the axis-aligned single-crop benchmark, with identical
-parameters and order. Batches use axis-aligned reads, warm reader caches and GPU outputs;
-the single-crop timings above include final CPU outputs. No model forward or
-backward pass is included.
-
-Batches contain four 128³ crops. Three timed epochs of 64 batches follow a
-validation/warmup epoch per route. Four loader workers and four reader threads
-per worker serve the batch routes. Epoch throughput includes reading, transfers,
-augmentation, collation and disposal; outputs remain on the GPU.
-
-| Route | Mean batch ms | p50 ms | p95 ms | Crops/s |
-| --- | ---: | ---: | ---: | ---: |
-| Per-sample CUDA, `num_workers=0` | 4.873 | 4.714 | 5.933 | 820.23 |
-| `Pipeline.batch()` | 3.638 | 3.306 | 4.022 | 1098.67 |
-| `CudaLoader`, one batch ahead | 3.281 | 2.927 | 3.935 | 1218.34 |
-
-### Special case: rotated-crop sampling
-
-When a crop must be read at an angle, fetching also requires trilinear
-interpolation. This benchmark samples a 128³ crop with a 10° YX rotation, then
-uses the same normalization and 12 augmentations as the axis-aligned benchmark.
-It uses the same six crops × ten repetitions and final CPU output endpoint.
-
-| Stage | CPU median (ms) | CUDA median (ms) |
+| Work | CPU throughout | CPU read → CUDA processing |
 | --- | ---: | ---: |
-| Fetching + sampling | 15.164 | 1.186 |
-| Normalization | 2.586 | 0.125 |
-| 12 augmentations | 143.225 | 0.695 |
-| Final host download | — | 0.525 |
-| End-to-end | 160.279 | 2.544 |
+| 12 augmentations only, excluding transfers | 146.465 | **0.673** |
+| Read + normalize + 12 augmentations + CPU output | 149.723 | **1.833** |
 
-CUDA delivers **63.01× lower median latency**, with throughput of **386.87
-crops/s** versus **6.21 crops/s** on CPU.
+The full pipeline is **81.7× faster** with CUDA processing in this measurement,
+including upload and download. The recipe includes elastic deformation,
+median filtering, blur, intensity transforms and low-resolution simulation;
+no model forward or backward pass is timed.
+[Recipe, validation and timing scope](benchmarks/README.md#single-crop-latency-12-augmentations-cpu-output).
 
+## Examples and guides
 
-## Add labels or channels to a pipeline
+The [notebooks](examples/README.md) cover 2.5D and 3D ink training, general Zarr
+reading, CUDA augmentation, and mesh-segment rendering.
 
-`with_targets()` returns a new pipeline with additional named targets, keeping
-the existing transforms and execution settings:
-
-```python
-from vc_reader import augment as A
-
-pipeline = existing_pipeline.with_targets(
-    extra_label=A.Label(),
-    confidence=A.ScalarField(),
-)
-result = pipeline(
-    {"image": ct, "extra_label": segmentation, "confidence": confidence_map},
-    seed=123,
-)
-```
-
-The sample dictionary supplies the arrays; the declarations specify their
-treatment. `Label()` shares geometry using nearest-neighbor interpolation.
-`ScalarField()` shares geometry using continuous interpolation. Both skip image
-normalization and intensity transforms. Use `Image()` for another image channel
-that should receive those transforms too; existing target selectors still apply.
-
-Arrays must already be spatially aligned and use channel-first shapes such as
-`(C, Y, X)` or `(C, Z, Y, X)`. Existing declarations are retained unless you replace the same
-name. The original pipeline is unchanged; replay plans stay with the pipeline
-that created them.
+| Topic | Guide |
+| --- | --- |
+| Metadata, resolution queries and custom data | [Discovery and pairing](docs/discovery.md) |
+| Source formats, storage and caches | [Source reading](docs/source-reading.md) |
+| Registered labels and fields | [Aligned sampling](docs/aligned-sampling.md) |
+| Surface layers and projecting ink into CT | [Surface sampling](docs/surface-sampling.md) |
+| DataLoader integration and worker lifecycle | [Training workflows](docs/training-workflows.md) |
+| Measurements and reproduction commands | [Benchmarks](benchmarks/README.md) |
 
 ## Augmentations
 
-All image augmentations and normalization modes support channel-first **2D
-`(C, Y, X)` and 3D `(C, Z, Y, X)`** arrays on CPU and CUDA. Spatial tuples
-(`shape`, `size`, `tile_shape`, `unit_size`, `direction`, `center`, and a fixed
-`OrientedBlur.axis`) must have two entries for 2D or three for 3D. Axis names
-for 2D are `y` and `x`; use `axis="y"` or `"x"` for `SliceIllumination` and
-`Smear`, and a one-element `shift` for 2D `Smear`. Vector targets likewise
-use `components="yx"` or `"xy"` in 2D.
+Image augmentations and normalization support channel-first **2D `(C, Y, X)`
+and 3D `(C, Z, Y, X)`** arrays on CPU and CUDA. Use
+`from vc_reader import augment as A`. Expand an entry for its measured
+configuration, timings and previews; the recipes are examples, not constructor
+defaults. Z/Y/X slice pairs show the original above the augmented output.
 
-Omitted CLAHE tile sizes default to 16 per axis; dropout sizes default to 8
-per axis. `GridDropout` and `StripeMasking` default to all spatial axes.
-Reference images may be `(C, Y, X)` or `(C, Z, Y, X)`; FDA requires matching
-spatial shapes. 2D filters use planar neighborhoods, bilinear interpolation,
-and 2D Fourier transforms. `OrientedBlur` uses one perpendicular direction in
-2D and two in 3D.
-
-```python
-pipeline = A.Pipeline([
-    A.Normalize("minmax"),
-    A.CLAHE(tile_shape=(16, 16)),
-    A.MotionBlur(length=3, direction=(1, 2)),
-    A.GridDropout(unit_size=(8, 8)),
-], backend="cuda")
-result = pipeline({"image": image}, seed=123)  # image: (C, Y, X), float32
-```
-
-`StripGeometry` operates on a 2D strip, and `SurfacePerturb` on a `(3, H, W)`
-coordinate surface. `ToPseudo2D`/`FromPseudo2D` convert representations; these
-specialized contracts remain separate from image augmentation dimensionality.
-[2D validation and 3D performance checks](benchmarks/README.md#2d-augmentation-support-2026-10-17)
-describe the dimension-specific CPU/CUDA implementations and measurements.
-
-Each entry shows the **measured configuration**, not the constructor defaults. Use `from vc_reader import augment as A`.
-
-Benchmarks use **128 × 128 × 128 float32** crops from PHercParis4 volume `20260411134726-2.400um-0.2m-78keV-masked.zarr`, **scale 2**, centered at ZYX `(9064, 3664, 3664)`. CT values are divided by 255. Timings are medians of 5 measured calls after 1 warmup, using one CPU thread and a Release build. Refreshed 2026-10-17 at `46b908a31`; all raw timings and validation (`docs/benchmarks/augmentations.json`) and [reproduction commands](benchmarks/README.md#readme-augmentation-timings) are saved.
-
-**CUDA uploaded** includes uploading the host input and downloading the output. **CUDA resident** starts and ends with device arrays. Speedup is CPU time divided by the corresponding CUDA time; values above 1× mean CUDA is faster.
-
-Calls use `compact=True`, seeds 123–127, and deterministically shuffled backend
-order. Copies and input validation inside the public API are timed; reading,
-setup, output comparison and disposal are excluded. Most examples use one image
-channel; geometric examples also transform labels, and ChannelMisalignment uses
-two image channels. `reference` is a second CT crop 384 voxels farther along Z.
-
-
-**Images:** Z, Y and X slice pairs show the original above the augmented output. Planes are selected where the effect is visible, with the same display window
-
-Expand an augmentation below to see its parameters, timings and images. Elastic also includes a WebM animation.
+Gallery timings use 128³ float32 CT crops, one CPU thread, and medians of five
+calls after one warmup. **CUDA uploaded** includes upload and download;
+**CUDA resident** starts and ends on the GPU. Reading is excluded.
+[Full measurement setup](benchmarks/README.md#readme-augmentation-timings).
+The two 2D tracing companions have separate input shapes noted below.
 
 <details>
 <summary><strong>AdditiveNoise</strong></summary>
@@ -1573,26 +1295,3 @@ A.SurfacePerturb(blobs=3, amplitude=1, points_affected=100, p=1)
 2D-only companion: synthetic coordinate surface with CT-derived height. Preview is displacement magnitude, not an anatomical surface.
 
 </details>
-
-## Aligned source sampling
-
-Use `vc_reader.sampling.open_sample(reference, targets, backend="cpu")` to read
-registered labels and representations into a selected volume grid. Results
-contain channel-first data, per-target geometric validity, and separate source
-masks. CPU and CUDA sampling support integer labels, multichannel arrays,
-embedded slices, vectors, normals, and coordinate fields.
-
-```python
-from vc_reader.sampling import open_sample
-
-with open_sample(reference, {"label": label, "field": field}) as reader:
-    sample = reader[100:132, 200:328, 300:428]  # shared ZYX selection
-    component = reader["field"][1, 100:132, 200:328, 300:428]  # CZYX
-```
-
-Slices preserve axes; integer indices remove them. A named target returns its
-array; a shared spatial selection returns data, validity, and companion masks.
-
-See [aligned sampling](docs/aligned-sampling.md) for registration, value-frame,
-cache, worker, and build contracts, and [measurements](docs/aligned-sampling-benchmarks.md)
-for reproducible real-input benchmarks.

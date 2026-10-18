@@ -7,6 +7,7 @@ import math
 import operator
 
 from .affine import Affine
+from .artifacts import ArtifactType
 from .catalog import Catalog, DEFAULT_RESOLUTION_REL_TOL, PYRAMID_LEVELS
 from .errors import AmbiguousMatchError, NotFoundError
 from .sources import Source, SurfaceRegistration, VolumeRegistration
@@ -14,6 +15,12 @@ from .sources import Source, SurfaceRegistration, VolumeRegistration
 
 def _id(value):
     return value.id if hasattr(value, 'id') else value
+
+
+def _surface_volumes(images):
+    return Collection((a for a in images._all
+                       if a.artifact_kind in (ArtifactType.LAYERS_ZARR, ArtifactType.LAYERS_TIF)),
+                      include_superseded=images.include_superseded, ordered=True)
 
 
 class Collection:
@@ -128,6 +135,14 @@ class _Context:
     @property
     def images(self):
         return self._assets('image')
+
+    @property
+    def surface_volumes(self):
+        """Rendered layer stacks associated with this sample, volume or segment.
+
+        Depth follows sampled surface layers, rather than the CT voxel Z axis.
+        """
+        return _surface_volumes(self._assets('image'))
 
     @property
     def representations(self):
@@ -399,6 +414,11 @@ class Asset:
     @property
     def images(self):
         return Collection(Asset(self._index, p.image_id) for p in self._index.pairs.get(self.id, ()))
+
+    @property
+    def surface_volumes(self):
+        """Surface layer stacks paired with this label; volume is the native CT."""
+        return _surface_volumes(self.images)
 
     @property
     def labels(self):

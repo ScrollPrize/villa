@@ -14,15 +14,23 @@ Saved outputs show an executed run on the published data.
 
 ## Run
 
-Use a Jupyter Python kernel with the repository/package available and its native
-extensions built. The reader notebook needs NumPy and Pillow. The surface and
-training notebooks also need the `labels` dependencies (including tifffile),
+Install the package in the Python environment used by your Jupyter kernel.
+From the repository root, install the package with the extras used by the notebooks:
+
+```bash
+python -m pip install -e '.[reader,labels,torch]'
+```
+
+This builds and installs the native extensions. The reader notebook needs NumPy
+and Pillow. The surface and training notebooks also need the `labels`
+dependencies (including tifffile),
 and training/augmentation need PyTorch. These correspond to the package's
 `reader`, `labels` and `torch` extras. Jupyter and its Python kernel must already
 be installed in your chosen environment. No notebook installs packages.
 
 From the repository root, launch `jupyter lab examples/` and run the cells in
-order. Restart the kernel before switching between native builds. CUDA sections
+order. Use `examples/` as the notebook working directory so the adjacent
+`_display.py` helper can be imported. CUDA sections
 need a CUDA-enabled build and device; both training notebooks also run on CPU.
 The general reader and mesh-rendering notebooks do not import PyTorch.
 
@@ -40,17 +48,15 @@ print(_augment.__file__)
 ```
 
 Use the environment containing the current build. After reinstalling native
-extensions or changing `VC_READER_NATIVE_DIR`, **restart the kernel and run all
-cells**; re-running imports does not unload an extension already in memory.
+extensions, **restart the kernel and run all cells**; re-running imports does
+not unload an extension already in memory.
 
 Configuration is visible in the setup cells. Optional environment variables:
 
 | Variable | Purpose |
 | --- | --- |
-| `VC_READER_NATIVE_DIR` | Existing native build directory, e.g. `/tmp/vc-reader-cuda`; omit for an installed build. |
 | `VC_EXAMPLE_METADATA` | Local metadata snapshot; omit to use normal catalog loading. |
 | `VC_EXAMPLE_CACHE` | Disk cache, default `/tmp/vc-reader-notebooks`. |
-| `VC_EXAMPLE_OFFLINE=1` | Require already-cached headers and data. Populate the cache online first. |
 | `VC_EXAMPLE_DEVICE=cpu` | Run the training models on CPU even if Torch sees a GPU. The dedicated CUDA demonstration still checks CUDA independently. |
 
 The first real-data run can take substantially longer than training while it
@@ -189,5 +195,5 @@ The run used CPython 3.14, Linux amd64 and an RTX 5090, with metadata SHA256
 fingerprint `de38ba456eedfa4e0c4c6d6b4e093f4664d635eae551bfbe923bbdf6dc4ec58d`.
 Cells were executed directly as Python and their real text/PNG outputs saved;
 the Jupyter application itself was not available in the validation environment.
-The refreshed editable installation was also checked with `VC_READER_NATIVE_DIR`
-unset, exercising the same default imports used by the notebooks.
+The refreshed editable installation was also checked, exercising the same
+package imports used by the notebooks.

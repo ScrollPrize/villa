@@ -30,6 +30,65 @@ def catalog():
 
 
 class BrowsingTests(unittest.TestCase):
+    def test_surface_volume_collections_are_distinct_from_ct_and_other_images(self):
+        tree = catalog().raw
+        tree['samples']['s']['segments']['seg']['data'].extend([
+            artifact('layers-tif', 'tiff-layers', 'a'),
+            artifact('alpha-render', 'alpha', 'a'),
+            artifact('alpha-render-downsampled', 'alpha-small', 'a'),
+            artifact('layers-zarr', 'other-scan-render', 'b'),
+        ])
+        with patch('urllib.request.urlopen', side_effect=AssertionError('array request')):
+            scroll = Catalog(tree).samples['s']
+            volume = scroll.volumes['a']
+            segment = volume.segments['seg']
+            label = segment.labels.ink(label_set='2021')
+            expected = {'render1', 'render2', 'tiff-layers'}
+            for context in (scroll.on_volume('a'), volume, segment, label):
+                self.assertEqual({a.artifact_id for a in context.surface_volumes}, expected)
+            self.assertEqual({a.artifact_id for a in scroll.surface_volumes},
+                             expected | {'other-scan-render'})
+            self.assertEqual({a.artifact_id for a in scroll.segments['seg'].surface_volumes},
+                             expected | {'other-scan-render'})
+            self.assertEqual(volume.images.zarr().artifact_kind, 'ome-zarr')
+            self.assertEqual(volume.source.axes, ('z', 'y', 'x'))
+            self.assertIsInstance(volume.source.registration, VolumeRegistration)
+            self.assertTrue(volume.representations)
+            self.assertGreater(len(label.images), len(label.surface_volumes))
+            render = label.surface_volumes.zarr(artifact_id='render1')
+            self.assertEqual(render.depth_semantics, 'sampled_layers')
+            self.assertEqual(render.volume.id, volume.id)
+            with self.assertRaises(AmbiguousMatchError):
+                label.surface_volumes.zarr()
+            for excluded in ('ct', 'alpha', 'alpha-small', 'other-scan-render', 'absent'):
+                with self.assertRaises(NotFoundError):
+                    label.surface_volumes.zarr(artifact_id=excluded)
+
+    def test_surface_volume_supersession_and_explicit_history(self):
+        tree = catalog().raw
+        data = tree['samples']['s']['segments']['seg']['data']
+        next(a for a in data if a['id'] == 'render2')['properties'] = {'supersedes': 'render1'}
+        scroll = Catalog(tree).samples['s'].on_volume('a')
+        label = scroll.labels.ink()
+        for context in (scroll, scroll.volume, scroll.segments['seg'], label):
+            renders = context.surface_volumes
+            self.assertEqual(renders.zarr().artifact_id, 'render2')
+            self.assertEqual(len(renders.filter(include_superseded=True)), 2)
+            old = renders.zarr(include_superseded=True, artifact_id='render1')
+            self.assertEqual(renders[old.id].artifact_id, 'render1')
+
+    def test_custom_surface_volume_requires_explicit_artifact_kind(self):
+        scroll = catalog().samples['s']
+        image = Source('image', Storage('/tmp/image.zarr', 'zarr'), role='image', axes=('z', 'y', 'x'))
+        render = replace(image, id='user:surface', artifact_kind='layers-zarr')
+        label = Source('label', Storage('/tmp/label.png', 'png'), role='label', axes=('y', 'x'))
+        scroll = scroll.with_source(image, kind='image', volume='b')
+        scroll = scroll.with_source(render, kind='image', volume='b')
+        scroll = scroll.with_source(label, kind='label', volume='b', image=render.id, same_grid=True)
+        self.assertEqual(scroll.labels[label.id].surface_volumes.zarr().id, render.id)
+        self.assertEqual([a.id for a in scroll.volumes['b'].surface_volumes], [render.id])
+        self.assertNotIn(image.id, [a.id for a in scroll.surface_volumes])
+
     def test_shared_records_direct_context_and_reverse_links(self):
         c = catalog()
         scroll = ScrollSource('s', 'a', catalog=c)
@@ -162,7 +221,7 @@ class BrowsingTests(unittest.TestCase):
             if a['id'] == 'new':
                 a['creation_info'] = dict(target=dict(render='https://example.test/render2'))
         label = Catalog(tree).samples['s'].labels.ink(artifact_id='new')
-        self.assertEqual(label.images.zarr().artifact_id, 'render2')
+        self.assertEqual(label.surface_volumes.zarr().artifact_id, 'render2')
 
 
 class PublishedLabelMappingTests(unittest.TestCase):
@@ -172,6 +231,12 @@ class PublishedLabelMappingTests(unittest.TestCase):
         with patch('urllib.request.urlopen', side_effect=AssertionError('metadata browsing requested I/O')):
             c = Catalog.from_file(fixture)
             label = c.samples['PHerc0009B'].segments['20250919125754'].labels.ink(label_set='20260918')
+            surface_volume = label.surface_volumes.zarr()
+            self.assertEqual(surface_volume.artifact_kind, 'layers-zarr')
+            self.assertEqual(surface_volume.depth_semantics, 'sampled_layers')
+            self.assertEqual(surface_volume.volume.id, label.volume.id)
+            self.assertEqual(label.volume.source.artifact_kind, 'ome-zarr')
+            self.assertNotEqual(surface_volume.source.id, label.volume.source.id)
             summary = label.summary()
             self.assertEqual(summary['native_volume'], '20250820154339')
             self.assertIn('registration.pixel_to_uv', summary['unresolved_fields'])

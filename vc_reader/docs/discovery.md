@@ -11,8 +11,8 @@ from vc_reader import load, ScrollSource
 catalog = load()
 scroll = ScrollSource('PHerc0009B', '20250820154339', catalog=catalog)
 label = scroll.segments['20250919125754'].labels.ink(label_set='20260918')
-image = label.images.zarr()
-assert image.labels[label.id].id == label.id
+surface_volume = label.surface_volumes.zarr()
+assert surface_volume.labels[label.id].id == label.id
 assert label.volume.id == '20250820154339'
 ```
 
@@ -35,18 +35,35 @@ missing/ambiguous match errors. `labels.ink()` works when exactly one ink label
 is present. To browse multiple ink labels, use
 `labels.filter(artifact_kind='ink-labels')` and iterate the returned collection.
 
-`images.zarr()` selects the single Zarr image. Pass criteria such as
-`images.zarr(artifact_id='...')` to choose among multiple images; missing or
-ambiguous matches raise the same errors. Use `images.filter(format='zarr')`
-to browse all Zarr images.
+`label.surface_volumes` contains surface-rendered layer stacks paired with the
+label. `.zarr()` selects a unique Zarr render; pass criteria such as
+`.zarr(artifact_id='...')` when multiple renders exist. Missing or ambiguous
+matches raise the same errors.
+
+Surface volumes contain CT sampled along a segment's surface: their depth axis
+indexes sampled layers. The original CT scan uses the volume's ZYX voxel grid:
+
+```python
+ct_volume = scroll.volumes['20250820154339']  # also label.volume
+with ct_volume.open(level=0) as reader:
+    voxels = reader[100:104, 200:204, 300:304]  # Z, Y, X
+```
+
+`scroll.surface_volumes`, `ct_volume.surface_volumes`, and
+`segment.surface_volumes` browse the renders associated with each context.
+These collections include `layers-zarr` and `layers-tif` assets and exclude
+original CT arrays, alpha renders and predictions. `images` remains the general
+image collection for custom pairs and other image types. Custom surface stacks
+declare `Source(..., artifact_kind='layers-zarr')` or `'layers-tif'` explicitly;
+their shape alone does not establish that they are surface renders.
 
 An omitted volume exposes the complete sample. `.on_volume(id)` shows direct
 associations only. A segment qualifies if any published asset targets that
 volume, including labels or images without a mesh. Views share entity records
 and immutable `Source` descriptors; navigation never rewrites registration.
 
-- `volumes`, `segments`, `labels`, `images`, `representations`, and
-  `geometry` expose distinct kinds. `.artifacts` retains unknown types too.
+- Browse `volumes`, `segments`, `labels`, `images`, `surface_volumes`,
+  `representations`, and `geometry`. `.artifacts` retains unknown types too.
 - `label.segment`, `label.volume`, `label.images`, `label.masks`, and
   `image.labels` follow the indexed relationships. Image variants remain
   separate. Explicit published image references constrain the segment/target
@@ -117,7 +134,7 @@ explicitly, using its actual storage transform for aligned sampling.
 ## Flattened paired reads
 
 ```python
-with label.open_paired(layers=slice(40, 65), backend='cpu') as reader:
+with label.open_paired(image=surface_volume, layers=slice(40, 65), backend='cpu') as reader:
     patch = reader[18576:18704, 7984:8112]
     image = patch.image.data       # C,D,H,W
     ink = patch.label.data         # C,H,W

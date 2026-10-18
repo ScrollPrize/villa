@@ -10,7 +10,7 @@ def discover(catalog):
     from vc_reader import ScrollSource
     scroll = ScrollSource('PHerc0009B', '20250820154339', catalog=catalog)
     label = scroll.segments['20250919125754'].labels.ink(label_set='20260918')
-    return label, label.images.zarr()
+    return label, label.surface_volumes.zarr()
 
 
 def main():

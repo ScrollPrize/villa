@@ -89,7 +89,7 @@ from training_workflows import (
 )
 from vc_reader.torch import CudaLoader
 
-# label and image are assets from label.images.zarr(), as in the README.
+# image is the render selected by label.surface_volumes.zarr(), as in the README.
 arrays = {**image_arrays(layers=True),
           **label_arrays(masks=("supervision", "validation"))}
 spec = ReadSpec(label, mode="paired", image=image, layers=slice(40, 65))

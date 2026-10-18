@@ -26,7 +26,8 @@ class InkNotebookTests(unittest.TestCase):
             return Source(name, Storage(str(path), 'zarr'), role=role, axes=axes)
 
         shape = supervision.shape
-        render = source('ct', np.full((9, *shape), 127, np.uint8), ('z', 'y', 'x'), 'image')
+        render = replace(source('ct', np.full((9, *shape), 127, np.uint8), ('z', 'y', 'x'), 'image'),
+                         artifact_kind='layers-zarr')
         ink = np.zeros(shape, np.uint8)
         ink[1::3, 2::4] = 255
         mask = source('supervision', supervision, ('y', 'x'), 'label')
@@ -37,7 +38,7 @@ class InkNotebookTests(unittest.TestCase):
         scroll = scroll.with_source(label, kind='label', image=render.id, same_grid=True)
         label = scroll.labels[label.id]
         return dict(np=np, torch=torch, Path=Path, Dataset=Dataset, DataLoader=DataLoader,
-                    CACHE=root / 'cache', label=label, image_asset=label.images.zarr(),
+                    CACHE=root / 'cache', label=label, image_asset=label.surface_volumes.zarr(),
                     LEVEL=0, PATCH_YX=(8, 8), LAYERS=slice(0, 9), BATCH_SIZE=2,
                     VALIDATION_FRACTION=.2, options={'threads': 1})
 
