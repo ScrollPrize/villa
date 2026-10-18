@@ -23,7 +23,7 @@ template<class T, class Function> void local_pointwise(View<T> data, const Grid&
     auto buffer=field_buffer(c.field,c.device_field);
     const LocalFieldView field(c.field,grid,buffer->ptr);
     if (needs_stats) {
-        auto stats=weighted ? local_statistics(data,field) : statistics(data);
+        auto stats=weighted ? local_statistics(data,field) : bounds(data);
         pointwise_kernel<<<blocks(data.size),256,0,vcr::device::stream()>>>(data,Layout(grid),field,stats.ptr,fn);
     } else pointwise_kernel<<<blocks(data.size),256,0,vcr::device::stream()>>>(data,Layout(grid),field,nullptr,fn);
     check(cudaGetLastError());

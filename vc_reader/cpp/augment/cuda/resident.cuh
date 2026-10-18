@@ -74,8 +74,10 @@ inline std::shared_ptr<Buffer<float>> field_buffer(const std::vector<float>& fie
 }
 struct Statistics { double mean, low, high, deviation; };
 Buffer<Statistics> statistics(View<float>, bool deviation = false, const float* weights = nullptr);
-// Sets `bit` in flags when max(|low|, |high|) exceeds limit.
-void flag_magnitude(const Buffer<Statistics>&, double limit, int* flags, int bit);
+Buffer<Statistics> bounds(View<float>);
+Buffer<Statistics> bounds(View<double>);
+// Sets `bit` when any input magnitude exceeds limit, without computing statistics.
+void flag_magnitude(View<float>, double limit, int* flags, int bit);
 Buffer<Statistics> statistics(View<double>, bool deviation = false, const float* weights = nullptr);
 Buffer<Statistics> local_statistics(View<float>, LocalFieldView);
 Buffer<Statistics> local_statistics(View<double>, LocalFieldView);

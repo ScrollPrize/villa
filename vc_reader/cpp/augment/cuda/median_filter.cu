@@ -80,7 +80,7 @@ template<class T> void quantize_median(View<T> v) {
     palette_probe<<<blocks(v.size),256,0,vcr::device::stream()>>>(v,table.ptr,counts.ptr); check(cudaGetLastError());
     int result[2]; counts.download(result);
     if (result[0] <= 256 && result[1] != 3) return;
-    auto stats = statistics(v); Statistics bounds; stats.download(&bounds);
+    auto stats = bounds(v); Statistics bounds; stats.download(&bounds);
     double range = bounds.high-bounds.low;
     if (!(range > 0) || !std::isfinite(range)) return;
     std::vector<T> palette(256);

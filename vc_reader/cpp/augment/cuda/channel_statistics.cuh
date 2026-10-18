@@ -52,11 +52,20 @@ template<class T> __global__ void collect_channel_bounds(View<T> input,ChannelBo
     __shared__ ChannelBounds<T> shared[256];shared[threadIdx.x]=value;reduce_bounds(shared);
     if(!threadIdx.x)partial[blockIdx.x]=shared[0];
 }
-template<class T> __global__ void finish_channel_bounds(const ChannelBounds<T>* partial,unsigned count,volume_detail::Stats* result){
+template<class T,class Result> __global__ void finish_channel_bounds(const ChannelBounds<T>* partial,unsigned count,Result* result){
     ChannelBounds<T> value{std::numeric_limits<T>::max(),std::numeric_limits<T>::lowest()};
     for(unsigned i=threadIdx.x;i<count;i+=256){const auto b=partial[i];value.low=value.low<b.low?value.low:b.low;value.high=value.high>b.high?value.high:b.high;}
     __shared__ ChannelBounds<T> shared[256];shared[threadIdx.x]=value;reduce_bounds(shared);
-    if(!threadIdx.x)*result={double(shared[0].low),double(shared[0].high),0,0};
+    if(!threadIdx.x){*result={};result->low=double(shared[0].low);result->high=double(shared[0].high);}
+}
+// Both channel transforms and intensity transforms consume these bounds.
+// The reduction stays in the image dtype; only the two final scalars widen.
+template<class T,class Result> void summarize_bounds(View<T> data,Result* output) {
+    const unsigned count=std::min(blocks(data.size),1024u);
+    Buffer<ChannelBounds<T>> partial(count);
+    collect_channel_bounds<<<count,256,0,vcr::device::stream()>>>(data,partial.ptr);
+    finish_channel_bounds<<<1,256,0,vcr::device::stream()>>>(partial.ptr,count,output);
+    check(cudaGetLastError());
 }
 template<class T> void summarize_channel(View<T> data,volume_detail::Stats* output,bool moments) {
     const unsigned count=std::min(blocks(data.size),1024u);
@@ -65,9 +74,7 @@ template<class T> void summarize_channel(View<T> data,volume_detail::Stats* outp
         collect_channel_moments<T,true><<<count,256,0,vcr::device::stream()>>>(data,partial.ptr);
         finish_channel_moments<true><<<1,256,0,vcr::device::stream()>>>(partial.ptr,count,output);
     }else{
-        Buffer<ChannelBounds<T>> partial(count);
-        collect_channel_bounds<<<count,256,0,vcr::device::stream()>>>(data,partial.ptr);
-        finish_channel_bounds<<<1,256,0,vcr::device::stream()>>>(partial.ptr,count,output);
+        summarize_bounds(data,output);
     }
     check(cudaGetLastError());
 }

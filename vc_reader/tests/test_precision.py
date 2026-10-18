@@ -415,6 +415,47 @@ class PrecisionTests(unittest.TestCase):
             result = pipeline({'image': image}, seed=0)['image']
             np.testing.assert_allclose(result, reference, atol=2e-6, rtol=0)
 
+    def test_gamma_and_sharpen_statistics(self):
+        rng = np.random.default_rng(917)
+        for shape in ((1, 1), (7, 37), (3, 7, 37)):
+            for dtype in (np.float32, np.float64):
+                image = rng.uniform(-3, 5, (2, *shape)).astype(dtype)
+                original = image.copy()
+                cases = []
+                for invert in (False, True):
+                    for retain in (False, True):
+                        expected = image.astype(np.float64).copy()
+                        for channel in expected:
+                            before = -channel.copy() if invert else channel.copy()
+                            low, high = before.min(), before.max()
+                            result = ((before-low)/max(high-low, 1e-7))**.8*(high-low)+low
+                            if retain:
+                                sd = lambda a: a.std(ddof=1) if a.size > 1 else 0.
+                                result = (result-result.mean())*(sd(before)/max(sd(result), 1e-7))+before.mean()
+                            channel[:] = -result if invert else result
+                        cases.append((A.Gamma(.8, p_invert=int(invert), p_retain_stats=int(retain)), expected))
+                for clip in (False, True):
+                    source = image.astype(np.float64)
+                    laplace = 2*len(shape)*source
+                    for axis, n in enumerate(shape, 1):
+                        laplace -= np.take(source, np.maximum(np.arange(n)-1, 0), axis=axis)
+                        laplace -= np.take(source, np.minimum(np.arange(n)+1, n-1), axis=axis)
+                    expected = source+.25*laplace
+                    if clip:
+                        axes = tuple(range(1, image.ndim))
+                        expected = np.clip(expected, source.min(axis=axes, keepdims=True),
+                                           source.max(axis=axes, keepdims=True))
+                    cases.append((A.Sharpen(.25, p_clamp=int(clip)), expected))
+                for transform, expected in cases:
+                    for backend in self.backends():
+                        with self.subTest(shape=shape, dtype=dtype, transform=repr(transform), backend=backend):
+                            pipeline = A.Pipeline([transform], backend=backend, compact=False)
+                            output = pipeline({'image': image}, seed=0)['image']
+                            np.testing.assert_allclose(output, expected, rtol=2e-6, atol=3e-6)
+                            plan = pickle.loads(pickle.dumps(pipeline.sample({'image': image}, seed=0)))
+                            np.testing.assert_array_equal(plan.apply({'image': image})['image'], output)
+                            np.testing.assert_array_equal(image, original)
+
     def test_extreme_float32_intermediates_remain_finite(self):
         image = np.full((1, 5, 7, 9), np.finfo(np.float32).max, dtype=np.float32)
         for backend in self.backends():

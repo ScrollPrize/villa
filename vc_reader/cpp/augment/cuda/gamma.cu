@@ -29,7 +29,7 @@ void apply_cuda(const Gamma& t, Sample& s, const Parameters& p, Session& session
     apply_channels(t,s,p,session,[](const auto&, auto v, const Grid&, const ChannelPlan& c) {
         const bool invert = c.values[1], retain = c.values[2];
         if (invert) invert_kernel<<<blocks(v.size),256,0,vcr::device::stream()>>>(v);
-        auto before = statistics(v,retain);
+        auto before = retain ? statistics(v,true) : bounds(v);
         gamma_kernel<<<blocks(v.size),256,0,vcr::device::stream()>>>(v,before.ptr,c.values[0]);
         if (retain) {
             auto after = statistics(v,true);

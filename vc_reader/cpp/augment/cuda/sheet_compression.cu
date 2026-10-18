@@ -22,7 +22,7 @@ Parameters sample_sheet(const SheetCompression& t,const Sample& s,Random& r,bool
     Buffer<T> values(g.size); View<T> data{values.ptr,g.size};
     copy_device(data,View<T>{image.view<T>().ptr,g.size});
     if(sigma>.5) blur(data,g,std::vector<double>(d,sigma),6,Boundary::Mirror,true);
-    auto stats=statistics(data);
+    auto stats=bounds(data);
     compression_prefix<<<blocks(g.size/g.shape[chosen]),256,0,vcr::device::stream()>>>(values.ptr,Layout(g),int(chosen),strength,t.threshold,stats.ptr);
     if(smooth>.5) {std::vector<double> sigmas(d,smooth);sigmas[chosen]=0;blur(data,g,sigmas,6,Boundary::Mirror,true);}
     auto field=std::make_shared<Buffer<float>>(g.size*d);

@@ -15,7 +15,7 @@ template<class T> __global__ void sharpen_kernel(const T* src, T* dst, Layout g,
 void apply_cuda(const Sharpen& t, Sample& s, const Parameters& p, Session& session) {
     apply_channels(t,s,p,session,[](const auto&, auto v, const Grid& g, const ChannelPlan& c) {
         using V = typename decltype(v)::value_type;
-        auto stats = statistics(v); Buffer<V> out(v.size);
+        auto stats = c.values[1] ? bounds(v) : Buffer<Statistics>(0); Buffer<V> out(v.size);
         sharpen_kernel<<<blocks(g.size),256,0,vcr::device::stream()>>>(v.ptr,out.ptr,Layout(g),V(c.values[0]),bool(c.values[1]),stats.ptr);
         check(cudaGetLastError()); copy_device(v,View<V>{out.ptr,v.size});
     });

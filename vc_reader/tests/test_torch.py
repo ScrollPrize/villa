@@ -158,6 +158,34 @@ class BatchTests(unittest.TestCase):
         ref = p({'image': cuda.asarray(np.ones((1, 2, 3, 4), np.float32))}, seed=1)
         self.assertTrue(np.all(ref['image'].numpy() == 1))
 
+    def test_filter_magnitude_threshold_and_recovery(self):
+        # Check both sides of the exact double threshold, including one that
+        # rounds upward to float32. The last voxel lies in a partial CUDA block.
+        for strength in (1., 1.3, 1.1):
+            limit = float(np.finfo(np.float32).max)/64/max(1., strength)
+            rounded = np.float32(limit)
+            values = (np.nextafter(rounded, np.float32(0)), rounded,
+                      np.nextafter(rounded, np.float32(np.inf)))
+            pipeline = A.Pipeline([A.Sharpen(strength, p_clamp=0)], backend='cuda', compact=False)
+            stream = torch.cuda.Stream()
+            for value in values:
+                for sign in (-1, 1):
+                    with self.subTest(strength=strength, value=value, sign=sign):
+                        image = torch.zeros((1, 1, 3, 7, 37), dtype=torch.float32)
+                        image.flatten()[-1] = float(value)*sign
+                        with torch.cuda.stream(stream):
+                            if float(value) > limit:
+                                with self.assertRaisesRegex((ValueError, RuntimeError), 'values too large'):
+                                    pipeline.batch({'image': image}, seeds=[0])
+                            else:
+                                output = pipeline.batch({'image': image}, seeds=[0])['image']
+                                reference = pipeline({'image': image[0].numpy()}, seed=0)['image']
+                                np.testing.assert_array_equal(output[0].cpu().numpy(), reference)
+                        stream.synchronize()
+            # Deferred error flags must not leak into another invocation.
+            output = pipeline.batch({'image': image_batch(1)}, seeds=[0])['image']
+            self.assertTrue(torch.isfinite(output).all())
+
     def test_low_resolution_stream_and_output_ownership(self):
         transforms = [A.LowResolution(.7), A.BrightnessAdd(.25), A.LowResolution(.85)]
         cpu = A.Pipeline(transforms, compact=False)

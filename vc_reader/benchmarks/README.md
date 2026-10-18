@@ -11,8 +11,119 @@ Release extensions for every suite. The refresh manifest (`docs/benchmarks/refre
 records report hashes and coverage. Current results are in the PyTorch, resident
 geometry, augmentation catalog, and reader/pipeline sections. The two optimization
 history sections are explicitly marked historical and retain their original data.
-The resize, Gaussian and compact-field experiments below measure subsequent changes
+The statistics, resize, Gaussian and compact-field experiments below measure subsequent changes
 separately; they do not replace the catalog-wide refresh.
+
+## Remove unused CUDA statistics (2026-10-17)
+
+Filter overflow guards now evaluate a boolean magnitude predicate directly,
+without image sums, extrema, or a second reduction kernel. Synchronous calls
+read a single flag to choose promotion; asynchronous batches publish into their
+existing error flags. Rounding the threshold downward to float32 preserves the
+original double comparison for finite float32 inputs. CPU guards already use
+a direct predicate. Unclipped CUDA sharpening skips its unused statistics scan.
+Gamma without retained statistics, clipped sharpening, local gamma, clipped
+local brightness, sheet compression, and median quantization share the existing
+channel bounds reduction, which computes only extrema in the input dtype.
+CPU algorithms, image dtypes, probabilities, and random draws are unchanged.
+
+Measured on Linux amd64 / RTX 5090, Release, CUDA architecture 120, against the
+saved extension from the clean `cae66d562` workspace. The full loader uses
+PHercParis4 level-2 128³ CT crops, min-max normalization, and the shared
+12-transform `heavy_transforms()` chain. There are four spawned loader workers,
+four reader threads per worker, and four crops per batch. Each run has a
+validation/warmup epoch and three repetitions of 64 batches per route, with
+rotating route order and warm caches. Two runs per build, in before/after then
+after/before order, provide **384 measurements per route/build**. Reads,
+transfers, casts, augmentation, collation, disposal and stream completion are
+included; model computation is excluded. All 256 validation crop hashes match
+across routes, runs, and builds. Values are **mean / p50 / p95 milliseconds**.
+
+| Loader route | Before | After | Crops/s before → after |
+| --- | ---: | ---: | ---: |
+| `Pipeline.batch()` | 3.900 / 3.429 / 4.720 | 3.489 / 3.109 / 4.138 | 1024.95 → 1145.71 (+11.8%) |
+| `CudaLoader` prefetch | 3.794 / 3.416 / 4.476 | 3.349 / 2.964 / 3.856 | 1053.73 → 1192.79 (+13.2%) |
+
+Separate Nsight Systems traces cover four validation/warmup and four measured
+batches (32 crops). General statistics collection initially accounts for 12.5%
+of kernel time, its final reduction 3.2%, median filtering 9.0%, and strided
+Gaussian convolution 8.3%. General statistics scans fall from **192 to 32**;
+the remaining scans serve contrast. Gamma adds 32 bounds-only scans. Direct
+magnitude checks replace the 96 guard reductions, and 32 unused sharpening
+scans disappear. Across these affected groups, launches fall **480 → 224**
+and kernel time falls **3.197 → 1.106 ms (65.4% less)**. Each crop avoids one
+8 MiB image read and eight launches. Total traced kernel time is 20.036 →
+16.828 ms, but includes unrelated scheduling outliers; use the affected-group
+comparison to assess this change. The remaining leading groups are median
+filtering (10.8%), strided convolution (9.9%), and geometry sampling (9.7%).
+Instrumented timings are excluded from throughput measurements.
+[Before profile](../docs/benchmarks/statistics-profile-before.csv) and
+[after profile](../docs/benchmarks/statistics-profile-after.csv) retain the kernel summaries.
+
+Isolated README recipes use the level-2 128³ float32 CT crop at
+`(9000, 3600, 3600)`, divided by 255, with one CPU thread. Each route has five
+warmups and 60 measurements at seeds 123–182, with deterministic shuffled
+case/route order. These synchronous public calls include input preservation
+and validation; reads, output comparison/disposal, and initial resident upload
+and final download are excluded. The clean measurements ran after/before,
+after compilation finished. An initial baseline overlapping compilation is
+retained locally but excluded from this table.
+
+| Transform, resident CUDA | Before | After |
+| --- | ---: | ---: |
+| Gamma | 0.152 / 0.146 / 0.202 | 0.147 / 0.144 / 0.218 |
+| LocalGamma | 0.153 / 0.157 / 0.213 | 0.153 / 0.149 / 0.210 |
+| GaussianBlur | 0.202 / 0.206 / 0.255 | 0.203 / 0.196 / 0.270 |
+| LocalSmoothing | 0.383 / 0.410 / 0.544 | 0.425 / 0.400 / 0.578 |
+| Sharpen | 0.263 / 0.214 / 0.429 | 0.193 / 0.187 / 0.244 |
+
+Synchronous gains are smaller and noisy; LocalSmoothing's mean regresses despite
+a slightly lower median. These results do not establish a speedup for every
+isolated transform. Raw reports also include CPU and uploaded CUDA measurements.
+All measured seeds pass CPU/CUDA comparisons, with maximum absolute image
+difference 1.19e-7. This is a numerical check, not model-quality evidence.
+
+All 40 tests pass with CUDA; all 16 precision tests pass in the CPU-only build.
+Added NumPy gamma/sharpen references cover 2D/3D, singleton and partial-block
+sizes, two channels, float32/float64, inversion, retained moments, clipping,
+input preservation and pickle replay. A batch regression checks both sides of
+exact and rounded overflow thresholds, positive/negative exceptional voxels,
+nondefault streams and recovery after rejection. macOS/arm64 and arrays
+requiring 64-bit indexing were not runtime-tested.
+
+Local ignored reports `statistics-loader-{before,after}{,-repeat}.json` and
+`statistics-summary.json` retain loader measurements. The isolated table uses
+`statistics-before-repeat.json` and `statistics-after.json`. Reports record
+commands, input/configuration, extension hashes, and numerical checks. Nsight
+traces are `/tmp/statistics-profile-{before,after}.nsys-rep`.
+
+Reproduce using the existing builds and environment (no installation). Use
+`/tmp/vc-statistics-before` for the saved baseline and distinct report paths;
+run the loader twice per build in reversed order for the combined results.
+
+```bash
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-reader-cuda --target _augment --parallel 4
+VC_BENCH_VOLUME=/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr
+AGENTS_AGENT_MODE=1 .venv/bin/python benchmarks/bench_torch.py \
+  --native-dir /tmp/vc-reader-cuda --modes batch prefetch \
+  --array "$VC_BENCH_VOLUME" --level 2 --batches 64 --batch-size 4 --reps 3 \
+  --output /tmp/statistics-loader-after.json
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  .venv/bin/python benchmarks/bench_augmentations.py \
+  --native-dir /tmp/vc-reader-cuda --array "$VC_BENCH_VOLUME" \
+  --only Gamma GaussianBlur Sharpen LocalGamma LocalSmoothing \
+  --warmup 5 --reps 60 --output /tmp/statistics-after.json
+AGENTS_AGENT_MODE=1 nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
+  --force-overwrite=true --output=/tmp/statistics-profile-after \
+  .venv/bin/python benchmarks/bench_torch.py --native-dir /tmp/vc-reader-cuda \
+  --modes prefetch --array "$VC_BENCH_VOLUME" --level 2 \
+  --batches 4 --batch-size 4 --reps 1 --output /tmp/statistics-profile-after.json
+nsys stats --report cuda_gpu_kern_sum --format csv /tmp/statistics-profile-after.nsys-rep
+AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=/tmp/vc-reader-cuda \
+  .venv/bin/python -m unittest discover -s tests -v
+AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=/tmp/vc-volume-cpu \
+  .venv/bin/python -m unittest discover -s tests -p test_precision.py -v
+```
 
 ## Composed low-resolution sampling (2026-10-17)
 

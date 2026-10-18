@@ -1,5 +1,6 @@
 #include "resident.cuh"
 #include "statistics.cuh"
+#include "channel_statistics.cuh"
 namespace vcr::augment::cuda {
 template<class T, bool Variance> __global__ void collect(View<T> input, Partial* output, const float* weights, const Statistics* stats) {
     __shared__ Partial values[256];
@@ -45,12 +46,25 @@ template<class T> Buffer<Statistics> stats_impl(View<T> data, bool deviation, co
     }
     check(cudaGetLastError()); return result;
 }
-__global__ void magnitude_flag(const Statistics* s, double limit, int* flags, int bit) {
-    if (fmax(fabs(s->low),fabs(s->high)) > limit) atomicOr(flags,bit);
+__global__ void magnitude_flag(View<float> input, float limit, int* flags, int bit) {
+    bool exceeded = false;
+    EACH_INDEX(input.size) exceeded |= fabsf(input.ptr[i]) > limit;
+    // Ordinary images perform no atomics. Exceptional blocks publish once.
+    const bool any = __syncthreads_or(exceeded);
+    if (!threadIdx.x && any) atomicOr(flags,bit);
 }
-void flag_magnitude(const Buffer<Statistics>& s, double limit, int* flags, int bit) {
-    magnitude_flag<<<1,1,0,vcr::device::stream()>>>(s.ptr,limit,flags,bit); check(cudaGetLastError());
+void flag_magnitude(View<float> input, double limit, int* flags, int bit) {
+    // Round down so comparing float inputs preserves the double threshold.
+    float threshold = float(limit);
+    if (double(threshold) > limit) threshold = std::nextafter(threshold,-INFINITY);
+    magnitude_flag<<<blocks(input.size),256,0,vcr::device::stream()>>>(input,threshold,flags,bit);
+    check(cudaGetLastError());
 }
+template<class T> Buffer<Statistics> bounds_impl(View<T> input) {
+    Buffer<Statistics> result(1); summarize_bounds(input,result.ptr); return result;
+}
+Buffer<Statistics> bounds(View<float> v) { return bounds_impl(v); }
+Buffer<Statistics> bounds(View<double> v) { return bounds_impl(v); }
 Buffer<Statistics> statistics(View<float> v, bool d, const float* w) { return stats_impl(v,d,w); }
 Buffer<Statistics> statistics(View<double> v, bool d, const float* w) { return stats_impl(v,d,w); }
 } // namespace vcr::augment::cuda

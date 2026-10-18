@@ -50,9 +50,20 @@ weights remain float32. LocalContrast also retains double weighted accumulation.
 
 These exceptions do not promise arbitrary-precision geometry or exact results
 for ill-conditioned inputs. They identify where narrowing would remove a useful
-numerical capability. Asynchronous batch execution flags exceptional channel magnitudes that would
-require a statistics readback and rejects them at completion; the synchronous
+numerical capability. Asynchronous batch execution flags exceptional channel magnitudes that
+require wider execution and rejects them at completion; the synchronous
 channel path can promote them. Ordinary CT batches avoid that readback.
+
+Filter range guards compare float32 magnitudes directly and reduce only a
+boolean predicate. The double threshold is rounded downward to float32 so the
+comparison selects exactly the same finite float32 values. Synchronous calls
+read one flag for promotion; asynchronous calls publish into the session's
+deferred error flags. Neither route computes image sums or extrema for this
+check. Gamma without retained statistics, clipped sharpening, local gamma,
+clipped local brightness, sheet compression, and median quantization use the
+shared bounds-only CUDA reduction in the image dtype. Unclipped sharpening
+skips its unused bounds scan. Mean and deviation calculations retain their
+existing wider arithmetic.
 
 There is no public precision mode to tune for ordinary ML
 use, and no fast-math compiler change.
