@@ -157,7 +157,13 @@ NB_MODULE(_native, m)
     nb::class_<vcr::DiskCache>(m, "DiskCache")
         .def(nb::init<const std::string&, std::int64_t>(), "root"_a, "max_bytes"_a,
              nb::call_guard<nb::gil_scoped_release>())
-        .def("set_max_bytes", &vcr::DiskCache::set_max_bytes, nb::call_guard<nb::gil_scoped_release>());
+        .def("set_max_bytes", &vcr::DiskCache::set_max_bytes, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("max_bytes", &vcr::DiskCache::max_bytes, nb::call_guard<nb::gil_scoped_release>())
+        .def("open_file", [](vcr::DiskCache& cache, const std::string& path, const std::string& url,
+                              const AuthTuple& auth, bool offline, bool refresh) {
+            nb::gil_scoped_release release;
+            return cache.open_file(path, url, to_auth(auth), offline, refresh);
+        }, "path"_a, "url"_a, "auth"_a, "offline"_a, "refresh"_a);
 
     nb::class_<vcr::ChunkHandle>(m, "ChunkHandle")
         .def("to_bytes", [](const vcr::ChunkHandle& h) -> nb::object {
@@ -179,7 +185,9 @@ NB_MODULE(_native, m)
                std::string remote_url, std::string remote_codec, AuthTuple auth, bool offline,
                std::string read_mode, bool hint, std::size_t threads, int connections, long stall_timeout_s, int retries,
                std::shared_ptr<vcr::MemoryCache> cache, std::size_t writer_threads,
-               std::size_t max_pending_write_bytes, std::shared_ptr<vcr::DiskCache> disk_cache) {
+               std::size_t max_pending_write_bytes, std::shared_ptr<vcr::DiskCache> disk_cache,
+               std::string source_root, std::string source_prefix, vcr::Index shard_chunks,
+               bool shard_index_end, bool shard_index_crc) {
                 vcr::ArraySpec spec;
                 spec.shape = std::move(shape);
                 spec.chunks = std::move(chunks);
@@ -193,6 +201,11 @@ NB_MODULE(_native, m)
                 spec.write_layer = write_layer;
                 spec.remote_url = std::move(remote_url);
                 spec.remote_codec = std::move(remote_codec);
+                spec.source_root = std::move(source_root);
+                spec.source_prefix = std::move(source_prefix);
+                spec.shard_chunks = std::move(shard_chunks);
+                spec.shard_index_end = shard_index_end;
+                spec.shard_index_crc = shard_index_crc;
                 spec.offline = offline;
                 spec.http.auth = to_auth(auth);
                 spec.read_mode = std::move(read_mode);
@@ -211,7 +224,9 @@ NB_MODULE(_native, m)
             "offline"_a = false, "read_mode"_a = "slab",
             "hint"_a = false, "threads"_a = 16, "connections"_a = 16, "stall_timeout_s"_a = 10,
             "retries"_a = 5, "cache"_a.none() = nb::none(), "writer_threads"_a = 4,
-            "max_pending_write_bytes"_a = std::size_t{1} << 30, "disk_cache"_a.none() = nb::none())
+            "max_pending_write_bytes"_a = std::size_t{1} << 30, "disk_cache"_a.none() = nb::none(),
+            "source_root"_a = "", "source_prefix"_a = "", "shard_chunks"_a = vcr::Index{},
+            "shard_index_end"_a = true, "shard_index_crc"_a = false)
         .def(
             "read_many",
             [](vcr::Array& a, const std::vector<vcr::Index>& starts, const std::vector<vcr::Index>& sizes,

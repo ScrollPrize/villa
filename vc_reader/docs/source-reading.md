@@ -1,16 +1,16 @@
-# Reading local label sources
+# Reading label sources
 
-`Source.open()` currently reads local PNG, JPEG, TIFF, and explicitly ordered
-stacks of 2D image files. It returns spatial crops with stored values or a
-caller-declared integer/color encoding. This is the first implementation
-increment of the label-reader plan; remote file caching and Zarr source
-resolution remain outstanding. Existing `open_zarr()` is unchanged.
+`Source.open()` reads local, HTTP(S), and S3 Zarr arrays/groups, PNG, JPEG,
+TIFF, and explicitly ordered stacks of 2D files. It exposes `shape`, `dtype`,
+`axes`, `read(start, size)`, `read_many(regions)`, `companions`, `resolved`,
+`stats()`, and `close()`. The source descriptor stays immutable.
 
-Use the optional `labels` extra (NumPy, Pillow, tifffile). Local image reads do
-not import the native reader, PyTorch, or CUDA. Decoder imports happen only for
-the selected file format. Additional TIFF codecs can require `imagecodecs`;
-errors identify the compression and missing decoder. No installation happens
-at runtime.
+Zarr sources use the existing native reader, authentication, memory cache,
+chunk planning, disk cache, prefetch support, and worker lifecycle. Remote image
+files use that same HTTP/S3 transport and directory budget. No installation
+occurs at runtime. Image decoders come from the optional `labels` extra
+(NumPy, Pillow, tifffile); local image reads do not load the native extension,
+PyTorch, or CUDA. Unsupported TIFF compression identifies the required codec.
 
 ```python
 from vc_reader import Encoding, Source, Storage
@@ -26,118 +26,159 @@ with source.open(decoded_cache=cache) as reader:
     labels = reader.read(start=(100, 200), size=(64, 96))
 ```
 
-Starts/sizes contain only spatial coordinates, in YX or ZYX order. Output uses
-storage channel positions: CYX stays CYX, YXC stays YXC. Select channels/time
-through `source.with_selection(channels=(2, 0), time=0)`; a selected time axis
-is removed, and singleton channels remain. TIFF series and pyramid levels must
-be selected when ambiguous. Anonymous TIFF dimensions require declared axes;
-channels are never guessed to be depth.
+Published ink-label descriptors select pyramid level zero, including their
+separately named supervision and validation arrays:
 
-Reader `shape`, `dtype`, and `axes` describe the selected, encoded output.
-Color encoding removes the color-channel axis. Palette PNGs expose their stored
-indices and `reader.palette` (palette values, mode, and transparency); they are
-not implicitly expanded to RGB. PNG alpha and grayscale bit depth are preserved.
-Integer IDs, including uint64 values above float32 precision, never pass through
-floating-point lookup arithmetic. Stored float32 TIFF samples stay float32.
+```python
+source = volume.labels()[0]
+with source.open(cache_dir='/data/label-cache', cache_max_bytes=1 << 30,
+                 memory_cache=64 << 20, threads=1) as reader:
+    labels = reader.read((100, 200), (128, 128))
+    supervision = reader.companions['supervision'].read((100, 200), (128, 128))
+```
 
-Out-of-bounds crops retain the requested size and use `Source.fill_value`, or
-zero for these image formats. The explicit fill belongs to the output dtype
-and bypasses the encoding lookup. Unknown in-bounds encoding values raise unless
-an encoding fallback was supplied. Failed/missing files raise rather than being
-filled. `read_many()` returns an ordered list of arrays. Results remain usable
-after subsequent reads, eviction, or reader close.
+Companion names do not choose training splits or merge masks with validity.
+An explicit `same_grid` binding checks spatial shape and available transforms
+before inheriting the parent's placement. Changing a parent selection does not
+silently change independently declared companion selections: declare matching
+companion grids when choosing a different pyramid level.
 
-## Memory and workers
+## Values and selection
 
-`decoded_cache_bytes` and `max_decode_bytes` default to 256 MiB per reader.
-Alternatively, pass one `DecodedCache` to multiple readers to share both budgets
-within each process. Do not also pass byte limits to those readers: configure
-them on the cache object. Closing a reader clears its owned cache but leaves an
-explicitly shared cache available to its other users.
+Crop coordinates contain only spatial dimensions, in YX or ZYX order. CYX
+storage returns CYX; YXC returns YXC. Channels/time use
+`source.with_selection(channels=(2, 0), time=0)`. Channel names are supported when
+metadata supplies them. Time selection removes the time axis; singleton
+channels remain. `with_selection` replaces the selection, so include an existing
+level/series selection when changing channels or time.
 
-PNG/JPEG decode whole images. TIFF reads selected pages and memory-maps
-uncompressed pages when supported. Compressed TIFF currently decodes a selected
-page within the explicit limit; direct tile/strip decoding remains outstanding.
-Preflight estimates include decoder buffers, compressed input, decoded segments,
-and selection/encoding scratch. These are conservative allocation estimates,
-not an operating-system RSS limit on opaque codec internals. Cache retention
-and caller-owned output arrays are accounted separately. A small returned crop
-does not retain a whole decoded image. `cache.stats()` exposes retained bytes,
-hits/misses, and the peak estimated working set.
+Zarr group children and ambiguous TIFF series/levels require explicit selection.
+For example, `source.with_selection(level=0)` or
+`source.with_selection(array_path='labels', series='main')`. Anonymous TIFF axes
+require declarations. Explicit stacks keep their supplied order, inspect the
+first plane at open, and inspect other planes only when requested.
 
-Work on a shared cache is serialized; tifffile decode uses one worker. Separate
-cache owners can run concurrently. Pickling stores descriptors/configuration,
-not cached arrays or file handles. Spawn/fork workers reopen lazily and start
-with empty caches and new locks. `close()` is idempotent, and reads after close
-raise. Local-file validators detect changes during an open reader's lifetime.
-Ordered stacks inspect the first image at open, validate other planes as they
-are requested, and never sort filenames or probe missing unused planes.
+Reader properties describe the selected, encoded output. Integer lookup keeps
+axes; exact color lookup removes the channel axis. Unknown values raise unless
+an explicit fallback is supplied. Raw palette PNG reads preserve indices and
+expose palette/transparency metadata through `reader.palette`. RGB, alpha,
+16-bit grayscale, float32 samples, and uint64 label IDs retain their values.
+JPEG returns decoded samples without thresholding or assigning classes.
 
-## Remaining plan work
+Out-of-bounds reads keep the requested size. `Source.fill_value` belongs to the
+output dtype and bypasses encoding. Otherwise Zarr uses its storage fill,
+encoded when applicable, and image files use zero. Missing Zarr chunks are
+in-bounds fill data and undergo normal encoding. Failed downloads, corrupt
+images, and missing stack planes raise. Returned arrays remain valid after
+subsequent reads, eviction, or close.
 
-- HTTP/S3 file materialization, authentication reuse, offline file hits/misses,
-  bounded encoded disk caching, and concurrent atomic publication.
-- `Source.open()` over Zarr arrays/groups, storage transforms and units,
-  corresponding levels, changed-grid registration, and companion validation.
-- TIFF tile/strip decoding, color mappings across separate channel pages, and
-  additional codec/layout coverage. Unsupported cases fail explicitly.
-- Complete real remote-asset acceptance, decoder memory/I/O instrumentation,
-  and macOS/arm64 runtime checks.
+## Storage metadata and placement
 
-Raw reads accept unregistered sources; they do not establish alignment.
-Aligned sampling and CPU/CUDA categorical equality belong to plan 03.
+`reader.resolved` records the actual location/selection, selected output layout,
+array-to-storage transform and units, and resolved registration. Raw reads can
+remain unregistered. Contradictory axes, shapes, dtypes, frames, transforms, or
+companion bindings fail with the source ID.
+
+NGFF scale/translation metadata and available TIFF physical spacing resolve
+selected grids. Unit conversion uses micrometers internally. Storage-frame
+placement requires explicit `VolumeRegistration.storage_units` for dimensional
+metadata. Catalog fallback placement records `volume_spacing_um` so physical
+metadata can supersede an estimated scale. Unknown units and unknown
+relationships between different grids/series fail rather than inventing
+placement. Explicit array placement keeps its crop origin and does not acquire
+an extra scale on the same grid. Corresponding-level requests require one exact
+resolution match, including a published cross-volume transform when applicable.
+
+Small affine compositions use the existing Python floating-point matrices.
+The regression with origin `2**26 + .25` demonstrates why float32 would lose a
+required subvoxel origin. Label IDs and shard offsets use exact integers; no
+bulk float64 coordinate arrays are introduced.
+
+## Bounded I/O, decoding, and workers
+
+Remote images stream into seekable disk files. The default encoded-file payload
+budget is 1 GiB. `cache_max_bytes` configures the shared directory budget for
+both image files and decoded Zarr chunks; omitting it reuses a previously set
+limit. Existing Zarr-only defaults are preserved. SQLite coordinates atomic
+publication and eviction across processes. Temporary materialization without
+a writable cache also has a finite budget. An image larger than the limit raises
+with instructions to increase it. Metadata/index files and filesystem overhead
+are separate from the payload budget.
+
+ETag/Last-Modified revalidation occurs once per image location and reader/process.
+Decoded keys include content identity. Repeated reads use pinned file handles
+and avoid rehashing unchanged content. `offline=True` serves cached files/chunks
+or raises `CacheMissError`; it does not fetch credentials for image-cache hits.
+`cache_writes=False` uses existing files or a bounded temporary cache online.
+Open descriptors remain valid if an eviction unlinks their files. Physical
+blocks for an actively pinned inode can remain until its read finishes.
+
+`decoded_cache_bytes` and `max_decode_bytes` default to 256 MiB. They control
+retained image/tile data and concurrent image decode/conversion working space.
+Pass one `DecodedCache` to share both limits across readers in a process;
+configure limits on that object, without also passing per-reader byte limits.
+Zarr retains its native `memory_cache` and bounded thread/connections controls;
+source selection/encoding scratch is additionally checked against
+`max_decode_bytes`. Caller-owned output arrays have separate accounting.
+
+PNG/JPEG may decode the complete image, even for a tiny crop. TIFF maps
+uncompressed pages when possible and selectively decodes intersecting compressed
+tiles/strips, including planar channels and separate channel pages. Dimensions
+and conservative decoder/scratch estimates are checked before allocation.
+Opaque codec internals prevent these estimates from being a hard OS RSS limit.
+Small outputs do not retain uncached whole-image allocations.
+
+Shared decode work is serialized, including conversions. Source readers default
+to one decode/read thread per worker. Pickle stores configuration and descriptors;
+fork/spawn workers reopen resources and caches lazily. Closing is idempotent and
+preserves explicitly shared cache ownership.
+
+## Zarr v3 support
+
+The shared `ZarrReader` and `ZarrGroup` support v2 and the v3 layouts used by the
+published ink labels: regular grids, default/v2 chunk keys, bytes serialization,
+optional Blosc or Zstd compression, and `sharding_indexed`. Unsupported codec
+pipelines/storage transformers fail explicitly. Shard indexes support
+little-endian bytes with optional CRC32C and either index location, following the
+[Zarr sharding specification](https://zarr-specs.readthedocs.io/en/latest/v3/codecs/sharding-indexed/index.html).
+
+Only the index and requested compressed inner chunks are fetched. HTTP ranges
+are validated; ignored ranges are rejected before accepting a whole-shard body.
+A strong ETag binds payload ranges to the index version. Missing inner chunks
+retain the normal fill/cache behavior. Decoded inner chunks use the existing
+v2 disk-cache representation, including offline reads and shared budgets.
+
+Index working storage is limited to 64 MiB. One remote index of at most 8 MiB
+can be retained per array; larger indexes are reread within the working limit.
+Encoded payloads are capped at twice the decoded inner-chunk size plus 1 MiB.
+Arrays requiring larger indexes or unusual oversized encoded payloads raise.
+These limits never materialize an entire shard. Native chunk sizes and worker
+counts still determine the native decoder's working memory.
 
 ## Run and validate
 
-With the package and `labels` dependencies available, no native rebuild is
-needed for this increment:
+With existing dependencies and configured build directories:
 
 ```bash
-AGENTS_AGENT_MODE=1 python -m unittest discover -s tests -p test_source_readers.py -v
-AGENTS_AGENT_MODE=1 python benchmarks/bench_source_readers.py --output /tmp/source-reading.json
+AGENTS_AGENT_MODE=1 cmake --build build/cp314-cp314-linux_x86_64 --target _native -j 2
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-reader-cuda --target _native -j 2
+AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=/tmp/vc-reader-cuda .venv/bin/python -m unittest discover -s tests -v
+AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=build/cp314-cp314-linux_x86_64 .venv/bin/python -m unittest discover -s tests -p 'test_source*.py' -v
+AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=build/cp314-cp314-linux_x86_64 .venv/bin/python -m unittest discover -s tests -p test_zarr_v3.py -v
 ```
 
-The isolated worktree was validated using dependencies from the existing local
-environment without installation. These exact commands keep the worktree ahead
-of the installed editable package and the standard library ahead of installed
-backports, including in subprocesses:
+HTTP tests use loopback servers. No dependencies were installed. Tests cover
+exact image/label values, selection and registration, pre-decode limits,
+shared budgets, eviction, atomic population, authentication/retries, offline
+hits/misses, v3 range/checksum failures, and process reopening. The configured
+CUDA build also runs existing sampling/augmentation/training tests; new aligned
+label sampling and its CPU/CUDA equality checks belong to plan 03.
 
-```bash
-cd /tmp/vc-reader-plan02-worktree/vc_reader
-export AGENTS_AGENT_MODE=1
-export PYTHONPATH="src:/usr/lib/python3.14:/home/sean/Documents/villa2/villa/vc_reader/.venv/lib/python3.14/site-packages"
-/usr/bin/python3.14 -S -m unittest discover -s tests -p test_source_readers.py -v
-VC_READER_NATIVE_DIR=/tmp/vc-reader-cuda /usr/bin/python3.14 -S -m unittest discover -s tests -v
-/usr/bin/python3.14 -S benchmarks/bench_source_readers.py --output /tmp/vc-reader-plan02-local-benchmark.json
-```
+The complete configured suite passed 94 tests, including existing CUDA tests.
+The CPU-only build separately passed 36 source/descriptor tests and seven v3
+tests. Validation was performed on Linux amd64. macOS and arm64 runtime checks were
+not available; the implementation uses portable CPU code without new SIMD or
+GPU codec dependencies.
 
-The 16 new tests cover exact decoding/encoding, padding, TIFF selection,
-ordered stacks, metadata disagreement, pre-decode limits, shared caches,
-concurrency/eviction, buffer ownership, lazy imports, and spawn/fork reopening.
-CUDA sampling is not implemented in this increment.
-
-The full configured suite completed with 52 passing tests and 20 CUDA-dependent
-skips (72 total); the sandbox exposed no usable CUDA device. All public reader
-exports and an existing uint16 Zarr crop were also smoke-tested against the
-cached native build. No dependencies were installed or extensions rebuilt.
-
-The real-data smoke benchmark uses the bundled PHercParis4 geometry mask
-`benchmarks/fixtures/fiber_132487/mask.tif`, shape `(25, 4800)`, uint8,
-uncompressed TIFF. Its SHA-256 is
-`bcc69634665c8bcde3e0736232eea41e00c039f83ce52ce60244d041cc16166f`.
-It is a surface geometry mask, not an ink-label dataset. Six fixed `(16, 512)`
-crops are checked against tifffile, with two warmups and ten measured
-repetitions (60 measured crops per method). Linux amd64, Python 3.14.4,
-NumPy 2.5.4, tifffile 2026.10.15; the benchmark loads no native extension.
-
-| Method | Mean ms/crop | p50 | p95 |
-| --- | ---: | ---: | ---: |
-| Direct tifffile page read/copy | 0.0949 | 0.0944 | 0.0999 |
-| Source reader | 0.1161 | 0.1159 | 0.1229 |
-
-Opening took 1.041 ms and the first read took 0.318 ms. The source reader's
-warm traced Python allocation peak was 191,028 bytes; whole-process peak RSS
-was 50,089,984 bytes. Mapped pages retained zero decoded-cache bytes. Physical
-I/O bytes were not measured. The OS file cache was not cleared, so the first
-read is not a disk-cold measurement. This is initial wrapper-overhead evidence,
-not completion of the plan's remote/codec acceptance protocol.
+See [label-reader benchmark results](source-reading-benchmarks.md) for exact
+inputs, reproduction commands, latency, memory, I/O, and profiling limits.

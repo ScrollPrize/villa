@@ -3,6 +3,7 @@
 #pragma once
 
 #include "chunk_io.hpp"
+#include "http.hpp"
 
 #include <sqlite3.h>
 #include <algorithm>
@@ -16,8 +17,8 @@ public:
     DiskCache(const std::string& root, std::int64_t max_bytes)
         : root_(std::filesystem::weakly_canonical(root))
     {
-        if (max_bytes < 0)
-            throw std::invalid_argument("cache_max_bytes must be nonnegative");
+        if (max_bytes < -1)
+            throw std::invalid_argument("invalid cache_max_bytes");
         std::filesystem::create_directories(root_);
         const auto path = (root_ / ".vc_reader_cache.sqlite3").string();
         if (sqlite3_open_v2(path.c_str(), &db_, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
@@ -32,7 +33,7 @@ public:
             exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;"
                  "CREATE TABLE IF NOT EXISTS budget(id INTEGER PRIMARY KEY, max_bytes INTEGER,"
                  " total INTEGER NOT NULL DEFAULT 0, clock INTEGER NOT NULL DEFAULT 0);"
-                 "INSERT OR IGNORE INTO budget(id,max_bytes) VALUES(1,0);"
+                 "INSERT OR IGNORE INTO budget(id,max_bytes) VALUES(1,1073741824);"
                  "CREATE TABLE IF NOT EXISTS chunks(path TEXT PRIMARY KEY, size INTEGER, age INTEGER);"
                  "CREATE INDEX IF NOT EXISTS oldest_chunk ON chunks(age,path);"
                  "CREATE TRIGGER IF NOT EXISTS add_chunk AFTER INSERT ON chunks BEGIN "
@@ -41,6 +42,7 @@ public:
                  "UPDATE budget SET total=total-old.size WHERE id=1; END;"
                  "CREATE TRIGGER IF NOT EXISTS resize_chunk AFTER UPDATE OF size ON chunks BEGIN "
                  "UPDATE budget SET total=total+new.size-old.size WHERE id=1; END;");
+            exec("CREATE TABLE IF NOT EXISTS file_headers(path TEXT PRIMARY KEY, etag TEXT, modified TEXT);");
             transaction([&] {
                 // Reconcile after a crash or writes by an unbounded reader.
                 // Only numeric chunk files in the decoded-cache namespaces
@@ -54,10 +56,22 @@ public:
                         continue;
                     scan(base, files);
                 }
+                const auto encoded = root_ / "encoded";
+                if (std::filesystem::is_directory(encoded)) {
+                    for (const auto& file : std::filesystem::directory_iterator(encoded))
+                        if (file.is_regular_file() && !file.is_symlink() && file.path().extension() == ".blob")
+                            files.emplace_back(file.last_write_time(), file.path().string(), file.file_size());
+                }
+                if (std::filesystem::is_directory(encoded)) {
+                    for (const auto& file : std::filesystem::directory_iterator(encoded))
+                        if (file.is_regular_file() && file.path().filename().string().find(".blob.tmp.") != std::string::npos)
+                            std::filesystem::remove(file.path());
+                }
                 std::sort(files.begin(), files.end());
                 for (const auto& [time, file, size] : files)
                     record(file, size);
-                set_limit(max_bytes);
+                exec("DELETE FROM file_headers WHERE path NOT IN (SELECT path FROM chunks);");
+                if (max_bytes >= 0) set_limit(max_bytes);
                 evict();
             });
         } catch (...) {
@@ -90,6 +104,79 @@ public:
             record(path, static_cast<std::int64_t>(size));
             evict();
         });
+    }
+
+    std::int64_t max_bytes()
+    {
+        std::lock_guard lock(mutex_);
+        return number("SELECT max_bytes FROM budget WHERE id=1");
+    }
+
+    // Pin the inode before releasing the cross-process publication lock. A
+    // later eviction unlinks it without invalidating an active decoder's FD.
+    std::tuple<int, std::string, std::string, std::size_t> open_file(
+        const std::string& path, const std::string& url, const Auth& auth, bool offline, bool refresh)
+    {
+        check_path(path);
+        if (std::filesystem::path(path).parent_path() != root_ / "encoded")
+            throw std::invalid_argument("encoded files must use the encoded cache namespace");
+        std::lock_guard lock(mutex_);
+        int fd = -1;
+        std::string etag, modified;
+        std::size_t bytes = 0;
+        try {
+            transaction([&] {
+                const bool exists = std::filesystem::is_regular_file(path);
+                if (exists) {
+                    Statement h(db_, "SELECT etag,modified FROM file_headers WHERE path=?");
+                    h.text(1, path);
+                    if (h.step()) {
+                        etag = reinterpret_cast<const char*>(sqlite3_column_text(h.get(), 0));
+                        modified = reinterpret_cast<const char*>(sqlite3_column_text(h.get(), 1));
+                    }
+                }
+                if (!offline && (!exists || refresh)) {
+                    AtomicFile output(path);
+                    HttpOptions options;
+                    options.connections = 1;
+                    options.auth = auth;
+                    HttpClient client(options);
+                    const auto limit = number("SELECT max_bytes FROM budget WHERE id=1");
+                    std::size_t received = 0;
+                    std::vector<std::pair<std::string, std::string>> headers;
+                    if (exists && !etag.empty()) headers.emplace_back("If-None-Match", etag);
+                    else if (exists && !modified.empty()) headers.emplace_back("If-Modified-Since", modified);
+                    auto response = client.get_stream(url, [&] { output.reset(); received = 0; },
+                        [&](const char* data, std::size_t n) {
+                            if (n > static_cast<std::size_t>(limit) - received)
+                                throw std::runtime_error("encoded file exceeds cache_max_bytes; increase the disk limit");
+                            // Reserve before writing. Both temporary bytes and
+                            // already-published chunks/images stay within budget.
+                            evict_to(limit - static_cast<std::int64_t>(received+n));
+                            output.write(reinterpret_cast<const std::uint8_t*>(data), n);
+                            received += n;
+                        }, headers);
+                    bytes = response.bytes;
+                    if (response.status == 404) return;
+                    if (response.status == 200) {
+                        output.publish();
+                        record(path, static_cast<std::int64_t>(received));
+                        etag = response.etag;
+                        modified = response.modified;
+                        Statement h(db_, "INSERT INTO file_headers(path,etag,modified) VALUES(?,?,?) "
+                                         "ON CONFLICT(path) DO UPDATE SET etag=excluded.etag,modified=excluded.modified");
+                        h.text(1, path); h.text(2, etag); h.text(3, modified); h.step();
+                    }
+                }
+                fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+                if (fd < 0 && errno != ENOENT)
+                    throw std::system_error(errno, std::generic_category(), "open " + path);
+            });
+        } catch (...) {
+            if (fd >= 0) ::close(fd);
+            throw;
+        }
+        return {fd, etag, modified, bytes};
     }
 
 private:
@@ -162,9 +249,11 @@ private:
         s.step();
     }
 
-    void evict()
+    void evict() { evict_to(number("SELECT max_bytes FROM budget WHERE id=1")); }
+
+    void evict_to(std::int64_t limit)
     {
-        while (number("SELECT total>max_bytes FROM budget WHERE id=1")) {
+        while (number("SELECT total FROM budget WHERE id=1") > limit) {
             std::string path;
             {
                 Statement s(db_, "SELECT path FROM chunks ORDER BY age,path LIMIT 1");
@@ -177,6 +266,8 @@ private:
             Statement s(db_, "DELETE FROM chunks WHERE path=?");
             s.text(1, path);
             s.step();
+            Statement h(db_, "DELETE FROM file_headers WHERE path=?");
+            h.text(1, path); h.step();
         }
     }
 

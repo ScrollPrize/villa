@@ -33,7 +33,7 @@ class DecodedCache:
         self._pid = os.getpid()
         self._lock = threading.RLock()
         self._entries = OrderedDict()
-        self._nbytes = self._hits = self._misses = self._peak_working = 0
+        self._nbytes = self._hits = self._misses = self._peak_working = self._working = 0
 
     def _process(self):
         if self._pid != os.getpid():
@@ -71,12 +71,12 @@ class DecodedCache:
         with self._lock:
             array = self._entries.get(key)
             working = scratch_bytes + (decode_bytes if array is None else 0)
-            if working > self.max_decode_bytes:
+            if working + self._working > self.max_decode_bytes:
                 raise MemoryError(
                     f"decode working set needs {working} bytes; max_decode_bytes="
                     f"{self.max_decode_bytes}. Increase the limit or use a chunked source."
                 )
-            self._peak_working = max(self._peak_working, working)
+            self._peak_working = max(self._peak_working, working + self._working)
             if array is None:
                 self._misses += 1
                 array = load()
@@ -92,18 +92,26 @@ class DecodedCache:
             else:
                 self._hits += 1
                 self._entries.move_to_end(key)
-            yield array
+            self._working += working
+            try:
+                yield array
+            finally:
+                self._working -= working
 
     @contextmanager
     def working(self, nbytes):
         """Reserve scratch for a memory-mapped read without retaining a page."""
         self._process()
         with self._lock:
-            if nbytes > self.max_decode_bytes:
+            if nbytes + self._working > self.max_decode_bytes:
                 raise MemoryError(f"read scratch needs {nbytes} bytes; max_decode_bytes="
                                   f"{self.max_decode_bytes}. Increase the limit or read a smaller region.")
-            self._peak_working = max(self._peak_working, nbytes)
-            yield
+            self._peak_working = max(self._peak_working, nbytes + self._working)
+            self._working += nbytes
+            try:
+                yield
+            finally:
+                self._working -= nbytes
 
     def __getstate__(self):
         return self.max_bytes, self.max_decode_bytes

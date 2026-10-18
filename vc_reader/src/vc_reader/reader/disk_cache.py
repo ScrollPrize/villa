@@ -51,7 +51,7 @@ _budgets: dict[str, Any] = {}
 _inherited_budgets: list[Any] = []
 
 
-def disk_budget(root: str, max_bytes: int):
+def disk_budget(root: str, max_bytes: int | None):
     """One native eviction index per directory and process, shared by writers."""
     global _budget_pid, _budget_lock, _budgets
     if _budget_pid != os.getpid():
@@ -63,8 +63,8 @@ def disk_budget(root: str, max_bytes: int):
     with _budget_lock:
         budget = _budgets.get(root)
         if budget is None:
-            budget = _native.DiskCache(root, max_bytes)
-        else:
+            budget = _native.DiskCache(root, -1 if max_bytes is None else max_bytes)
+        elif max_bytes is not None:
             budget.set_max_bytes(max_bytes)
         _budgets[root] = budget
         return budget
@@ -271,7 +271,7 @@ def delta3d_zarray(source: ArrayMeta) -> dict:
     The same metadata VC3D writes for a level of its Delta3D caches
     (configureDelta3dV2Array).
     """
-    meta = dict(source.raw, compressor={"id": DELTA3D_ID, "quant": 1}, filters=None)
+    meta = dict(source.decoded_zarray(), compressor={"id": DELTA3D_ID, "quant": 1}, filters=None)
     dt = str(meta.get("dtype", ""))
     if dt and dt[0] != "|":
         meta["dtype"] = ("<" if np.little_endian else ">") + dt[1:]
@@ -280,6 +280,8 @@ def delta3d_zarray(source: ArrayMeta) -> dict:
 
 def _vc3d_layer(volume_dir: Path, level_key: str, source: ArrayMeta, allow_lossy: bool,
                 writable: bool) -> CacheLayer | None:
+    if '_vc_reader_v3' in source.raw:
+        return None  # VC3D mirror layouts describe v2 source chunks.
     lease = Vc3dLease(volume_dir)
     if not lease.acquire():
         warnings.warn(f"VC3D cache {volume_dir} is being replaced by another process (its lease is held "
@@ -439,8 +441,10 @@ def open_layers(
                 layers.append(layer)
         if not writable:
             return layers, None
-        if cache_max_bytes is not None:
-            root = next((Path(d).expanduser().resolve() for d in cache_dirs if os.fspath(d) != VC3D), None)
+        configured = next((root for root in roots if (root / '.vc_reader_cache.sqlite3').is_file()), None)
+        if cache_max_bytes is not None or configured is not None:
+            root = (next((Path(d).expanduser().resolve() for d in cache_dirs if os.fspath(d) != VC3D), None)
+                    if cache_max_bytes is not None else configured)
             if root is None:
                 raise ValueError("cache_max_bytes needs an explicit decoded cache directory (not only 'vc3d')")
             target = decoded_cache_path(root, url)

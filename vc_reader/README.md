@@ -8,10 +8,12 @@ sources without opening storage. Query `volume.labels()`,
 `SourceCollection` to include user annotations. See [source discovery](docs/discovery.md)
 for registration, serialization, examples, and validation commands.
 
-Local PNG/JPEG/TIFF sources and ordered image stacks can be opened with
-`source.open()` for exact spatial crops, explicit label encodings, and bounded
-decoded caching. See [local source reading](docs/source-reading.md) for supported
-formats, worker lifecycle, examples, and the remaining reader-plan work.
+Open local/HTTP/S3 Zarr v2/v3, PNG/JPEG/TIFF, and ordered image stacks with
+`source.open()` for exact spatial crops, explicit label encodings, resolved
+registration, and bounded caching. Published sharded Zarr v3 ink labels and
+their companion masks share the existing native reader and authentication.
+See [source reading](docs/source-reading.md) for formats, worker lifecycle,
+examples, and [acceptance measurements](docs/source-reading-benchmarks.md).
 
 ## PyTorch CUDA batches
 

@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, PropertyMock
 
 import numpy as np
 try:
@@ -261,7 +261,7 @@ class SourceReaderTests(unittest.TestCase):
             np.testing.assert_array_equal(output.view(np.uint32), values.view(np.uint32))
         source = self.tiff(np.zeros((5, 7), dtype=np.uint8), axes='YX',
                            filename='compressed.tif', compression='deflate')
-        with source.open() as reader, patch.object(tifffile.TiffPage, 'asarray',
+        with source.open() as reader, patch.object(tifffile.TiffPage, 'decode', new_callable=PropertyMock,
                                                    side_effect=ValueError('requires imagecodecs')):
             with self.assertRaisesRegex(ValueError, 'TIFF codec.*imagecodecs'):
                 reader.read((0, 0), (1, 1))
@@ -368,6 +368,7 @@ s = Source('unopened', Storage('/absent.png', 'png'))
 assert callable(s.open)
 assert not any(n in sys.modules for n in ('numpy', 'PIL', 'tifffile', 'torch', 'vc_reader._native'))
 '''
+        code = f'import sys; sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / "src")!r})\n' + code
         result = subprocess.run([sys.executable, '-S', '-c', code], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 

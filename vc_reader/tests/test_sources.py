@@ -97,7 +97,9 @@ class SourceTests(unittest.TestCase):
         surface = Surface('surface', Storage('/tmp/mesh', 'tifxyz'), 's', 'a', axes=('y', 'x'),
                           xyz_to_volume=Affine.scale(4), pixel_to_uv=((2, 0, 0), (0, 3, 0)))
         mask = Source('mask', Storage('/tmp/mask.tif', 'tiff'), role='label', axes=('y', 'x'))
-        examples = [crop, replace(crop, registration=plane, axes=('y', 'x')),
+        examples = [crop, replace(crop, registration=VolumeRegistration('s', 'a', affine=Affine.identity(),
+                        mode='storage', storage_frame='physical', storage_units='micrometer', volume_spacing_um=(2., 2., 3.))),
+                    replace(crop, registration=plane, axes=('y', 'x')),
                     replace(crop, storage=Storage(format='stack', locations=('a.tif', 'b.tif'))),
                     replace(crop, registration=SurfaceRegistration(surface, ((1, 0, 0), (0, 1, 0))),
                             companions=(Companion('supervision', mask, same_grid=True),)),

@@ -16,6 +16,12 @@ For local label reading, `bench_source_readers.py` validates and times six fixed
 TIFF crops against equivalent tifffile reads, using the bundled PHercParis4
 geometry mask by default. See [commands, measurements, and limitations](../docs/source-reading.md#run-and-validate).
 
+`bench_source_storage.py` adds fresh-cache and warm-crop acceptance for published
+sharded Zarr v3 ink labels and image formats, with content hashes, I/O counters,
+allocation measurements, and profiles. `prepare_source_formats.py` prepares
+documented image derivatives of the bundled real mask. See the
+[label-reader protocol and results](../docs/source-reading-benchmarks.md).
+
 Catalog-wide results were refreshed **2026-10-17** at `46b908a31`, with the same
 Release extensions for every suite. The refresh manifest (`docs/benchmarks/refresh.json`)
 records report hashes and coverage. Current results are in the PyTorch, resident

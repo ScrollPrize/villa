@@ -234,6 +234,8 @@ class VolumeRegistration(_Value):
     storage_frame: str | None = None
     declared_grid: Selection | None = None
     origin: str = "explicit"
+    storage_units: str | None = None
+    volume_spacing_um: tuple[float, float, float] | None = None
 
     def _validate(self):
         _name(self.sample_id, "sample_id")
@@ -250,6 +252,14 @@ class VolumeRegistration(_Value):
                 raise ValueError("plane placement requires a Plane and no affine/storage mode")
         if self.declared_grid is not None and not isinstance(self.declared_grid, Selection):
             raise TypeError("declared_grid must be a Selection")
+        if self.storage_units is not None:
+            _name(self.storage_units, "storage_units")
+            if self.mode != "storage":
+                raise ValueError("storage_units requires storage placement")
+        if self.volume_spacing_um is not None:
+            _vector(self.volume_spacing_um, "volume_spacing_um")
+            if any(v <= 0 for v in self.volume_spacing_um):
+                raise ValueError("volume spacing must be positive")
         _name(self.origin, "registration origin")
 
 

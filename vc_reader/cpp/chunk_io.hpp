@@ -198,33 +198,53 @@ inline void hint_willneed(int fd, std::int64_t offset, std::int64_t length)
 }
 
 // Writes `data` to `path` atomically (temporary file + rename), creating parent directories.
+// Shared atomic publication for chunk buffers and streamed image files.
+class AtomicFile {
+public:
+    explicit AtomicFile(const std::string& path) : path_(path)
+    {
+        std::filesystem::create_directories(std::filesystem::path(path).parent_path());
+        tmp_ = path + ".tmp." + std::to_string(::getpid()) + "." +
+               std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+        fd_ = ::open(tmp_.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (fd_ < 0) throw std::system_error(errno, std::generic_category(), "create " + tmp_);
+    }
+    ~AtomicFile() { if (fd_ >= 0) ::close(fd_); if (!tmp_.empty()) ::unlink(tmp_.c_str()); }
+    AtomicFile(const AtomicFile&) = delete;
+    AtomicFile& operator=(const AtomicFile&) = delete;
+    void reset()
+    {
+        if (::ftruncate(fd_, 0) || ::lseek(fd_, 0, SEEK_SET) < 0)
+            throw std::system_error(errno, std::generic_category(), "truncate " + tmp_);
+    }
+    void write(const std::uint8_t* data, std::size_t n)
+    {
+        for (std::size_t done = 0; done < n;) {
+            const ssize_t k = ::write(fd_, data+done, n-done);
+            if (k < 0 && errno == EINTR) continue;
+            if (k <= 0) throw std::system_error(k < 0 ? errno : EIO, std::generic_category(), "write " + tmp_);
+            done += static_cast<std::size_t>(k);
+        }
+    }
+    void publish()
+    {
+        const int fd = fd_;
+        fd_ = -1;
+        if (::close(fd)) throw std::system_error(errno, std::generic_category(), "close " + tmp_);
+        if (::rename(tmp_.c_str(), path_.c_str()))
+            throw std::system_error(errno, std::generic_category(), "rename " + tmp_);
+        tmp_.clear();
+    }
+private:
+    std::string path_, tmp_;
+    int fd_ = -1;
+};
+
 inline void atomic_write(const std::string& path, const std::uint8_t* data, std::size_t n)
 {
-    namespace fs = std::filesystem;
-    fs::create_directories(fs::path(path).parent_path());
-    const std::string tmp = path + ".tmp." + std::to_string(::getpid()) + "." +
-                            std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()));
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd < 0)
-        throw std::system_error(errno, std::generic_category(), "create " + tmp);
-    std::size_t done = 0;
-    while (done < n) {
-        const ssize_t k = ::write(fd, data + done, n - done);
-        if (k < 0) {
-            if (errno == EINTR)
-                continue;
-            const int err = errno;
-            ::close(fd);
-            ::unlink(tmp.c_str());
-            throw std::system_error(err, std::generic_category(), "write " + tmp);
-        }
-        done += static_cast<std::size_t>(k);
-    }
-    if (::close(fd) != 0 || ::rename(tmp.c_str(), path.c_str()) != 0) {
-        const int err = errno;
-        ::unlink(tmp.c_str());
-        throw std::system_error(err, std::generic_category(), "rename " + tmp);
-    }
+    AtomicFile file(path);
+    file.write(data, n);
+    file.publish();
 }
 
 // LRU of read-only file mappings, so repeated reads of a chunk need no mmap/munmap.

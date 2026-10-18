@@ -1,4 +1,4 @@
-"""Zarr v2 array metadata (``.zarray``)."""
+"""Zarr array metadata normalized for native chunks and decoded disk caches."""
 
 from __future__ import annotations
 
@@ -28,8 +28,11 @@ class ArrayMeta:
 
     @classmethod
     def from_zarray(cls, d: Mapping[str, Any]) -> ArrayMeta:
+        if d.get('zarr_format') == 3:
+            from .zarr_v3 import normalize
+            d = normalize(d)
         if d.get("zarr_format") != 2:
-            raise ValueError(f"only zarr v2 arrays are supported, got zarr_format={d.get('zarr_format')!r}")
+            raise ValueError(f"only Zarr v2/v3 arrays are supported, got zarr_format={d.get('zarr_format')!r}")
         dtype = np.dtype(d["dtype"])
         if dtype.hasobject:
             raise ValueError(f"object dtype {dtype} is not supported")
@@ -85,4 +88,6 @@ class ArrayMeta:
 
     def decoded_zarray(self) -> dict[str, Any]:
         """``.zarray`` of the same array stored uncompressed (the decoded-cache layout)."""
-        return dict(self.raw, compressor=None, filters=None, order="C")
+        result = dict(self.raw, compressor=None, filters=None, order="C")
+        result.pop('_vc_reader_v3', None)
+        return result

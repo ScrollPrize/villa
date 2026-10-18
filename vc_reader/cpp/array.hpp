@@ -1,4 +1,4 @@
-// Native read path for one zarr v2 array: plan, then resolve every chunk through
+// Native read path for one Zarr array: plan, then resolve every chunk through
 // the memory cache, the disk layers (in their own formats) and the remote, and
 // copy into the caller's output buffers.
 #pragma once
@@ -12,6 +12,7 @@
 #include "memory_cache.hpp"
 #include "thread_pool.hpp"
 #include "write_behind.hpp"
+#include "zarr_storage.hpp"
 
 #include <sys/mman.h>
 
@@ -176,6 +177,9 @@ struct ArraySpec {
     int write_layer = -1;            // index into layers, or -1
     std::string remote_url;          // "" for a purely local array
     std::string remote_codec;
+    std::string source_root, source_prefix;  // v3 physical objects; cache keys stay logical
+    Index shard_chunks;
+    bool shard_index_end = true, shard_index_crc = false;
     bool offline = false;            // never fetch: a chunk in no layer raises CacheMiss
     std::string read_mode = "slab";  // raw local chunks: "slab" (pread rows) or "mmap"
     bool hint = false;               // queue readahead for every piece before reading
@@ -216,6 +220,10 @@ public:
         remote_codec_ = parse_codec(spec_.remote_codec);
         if (!spec_.remote_url.empty() && !spec_.offline)
             http_ = std::make_unique<HttpClient>(spec_.http);
+        if (!spec_.source_root.empty() && !spec_.offline)
+            source_ = std::make_unique<ZarrStorage>(spec_.source_root, spec_.source_prefix, spec_.separator,
+                spec_.shard_chunks, spec_.shard_index_end, spec_.shard_index_crc, chunk_bytes_, http_.get(),
+                stats_.remote_fetches, stats_.remote_bytes);
         if (spec_.write_layer >= 0 && codecs_.at(spec_.write_layer) == Codec::Delta3d && nd != 3)
             throw std::invalid_argument("Delta3D caches hold 3-D chunks only");
         if (spec_.write_layer >= 0)
@@ -266,7 +274,7 @@ public:
         if (!found) {
             if (spec_.offline)
                 throw CacheMiss("chunk " + k + " of " + spec_.identity + " is not in the disk cache (offline)");
-            if (http_) chunk = fetch(k);
+            if (http_ || source_) chunk = fetch(k);
         }
         if (cache_) cache_->put(ck, chunk);
         return {chunk};
@@ -1328,7 +1336,7 @@ private:
         }
         if (spec_.offline)
             throw CacheMiss("chunk " + k + " of " + spec_.identity + " is not in the disk cache (offline)");
-        if (!http_) {
+        if (!http_ && !source_) {
             fill_pieces(w, out_strides, op, output);
             return;
         }
@@ -1374,15 +1382,21 @@ private:
     ChunkPtr fetch_now(const std::string& k)
     {
         std::vector<std::uint8_t> body;
-        ++stats_.remote_fetches;
-        const bool found = http_->get(spec_.remote_url + "/" + k, body, chunk_bytes_);
+        bool found;
+        if (source_) {
+            found = source_->read(k, body);
+            if (!http_ && found) ++stats_.disk_hits;
+        } else {
+            ++stats_.remote_fetches;
+            found = http_->get(spec_.remote_url + "/" + k, body, chunk_bytes_);
+            stats_.remote_bytes += body.size();
+        }
         if (!found) {
             ++stats_.remote_missing;
             if (writes_ && !write_disabled_.load())
                 writes_->submit(k, nullptr, 64, [this, k] { store_missing(k); });
             return nullptr;
         }
-        stats_.remote_bytes += body.size();
         ChunkPtr chunk;
         std::shared_ptr<const std::vector<std::uint8_t>> payload;
         if (remote_codec_ == Codec::Raw) {
@@ -1468,6 +1482,7 @@ private:
     std::vector<int> chunk_shift_;
     std::size_t chunk_bytes_ = 0;
     Stats stats_;
+    std::unique_ptr<ZarrStorage> source_;
     std::mutex inflight_mutex_;
     using Fetcher = std::function<ChunkHandle(const Index&)>;
     std::atomic<std::shared_ptr<const Fetcher>> fetcher_;

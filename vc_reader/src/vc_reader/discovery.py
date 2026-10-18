@@ -133,6 +133,7 @@ class SourceCollection:
                 registration = VolumeRegistration(
                     sample.id, owner.id, affine=Affine.scale(2**g) if g is not None else None,
                     declared_grid=Selection(level=0), origin="catalog-fallback",
+                    volume_spacing_um=((owner.pixel_size_um,) * 3 if owner.pixel_size_um is not None else None),
                 )
             elif artifact.type == T.NORMAL_GRIDS:
                 role = "normal"  # Bundle layout and component frame stay unknown.
@@ -159,7 +160,7 @@ class SourceCollection:
                 storage = Storage(
                     location=labels.array_url() or (root.rstrip("/") + "/inklabels.zarr/" if root else None),
                     alternatives=tuple(u.rstrip("/") + "/inklabels.zarr/" for u in artifact.urls()),
-                    format="zarr",
+                    format="zarr", pyramid=True, selection=Selection(level=0),
                 )
                 role, axes = "label", ("y", "x")
                 companions = tuple(Companion(
@@ -168,7 +169,7 @@ class SourceCollection:
                         storage=Storage(
                             location=root.rstrip("/") + f"/{name}.zarr/" if root else None,
                             alternatives=tuple(u.rstrip("/") + f"/{name}.zarr/" for u in artifact.urls()),
-                            format="zarr",
+                            format="zarr", pyramid=True, selection=Selection(level=0),
                         ), role="label", axes=axes,
                     ), same_grid=True,
                 ) for name in ("supervision", "validation") if name in labels.arrays)

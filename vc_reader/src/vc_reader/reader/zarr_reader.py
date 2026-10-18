@@ -1,4 +1,4 @@
-"""Fast reads of zarr v2 arrays, local or remote, with optional disk and memory chunk caches.
+"""Fast reads of Zarr v2/v3 arrays, local or remote, with optional disk and memory chunk caches.
 
 All reading happens in the native extension (``vc_reader._native``, C++): local
 chunk files through persistent memory maps (or ``pread``), HTTP fetches with
@@ -54,39 +54,20 @@ READ_MODES = ("mmap", "slab")
 _INHERITED: list[Any] = []
 
 
-def read_node_file(location: str, name: str, access: Access) -> bytes | None:
-    """``<location>/<name>`` (e.g. ``.zarray``) of a local or remote node; None if it does not exist."""
-    if not is_remote(location):
-        try:
-            return Path(location, name).read_bytes()
-        except (FileNotFoundError, NotADirectoryError):
-            return None
-    try:
-        return _native.http_get(access.url(f"{location}/{name}"), auth=access.native())
-    except PermissionError as e:
-        if access.kind == "anonymous":
-            raise PermissionError(f"{e} (requested anonymously: pass auth= with credentials)") from None
-        raise
-
-
-def cache_url(location: str, access: Access) -> str:
-    """The URL that names a remote location in disk caches and the memory cache.
-
-    Signed S3 locations keep their ``s3://`` form; others the https form they
-    always had, so existing caches are found.
-    """
-    return location if access.kind == "s3" else http_url(location)
+from .transport import read_node_file, cache_url
 
 
 def _read_zarray(location: str, access: Access) -> ArrayMeta:
     data = read_node_file(location, ".zarray", access)
     if data is None:
-        raise FileNotFoundError(f"no zarr v2 array at {location} (.zarray not found)")
+        data = read_node_file(location, 'zarr.json', access)
+        if data is None or json.loads(data).get('node_type') != 'array':
+            raise FileNotFoundError(f"no Zarr array at {location} (.zarray/zarr.json not found)")
     return ArrayMeta.from_bytes(data)
 
 
 class ZarrReader:
-    """A zarr v2 array opened for reading. Use :meth:`open`.
+    """A Zarr v2/v3 array opened for reading. Use :meth:`open`.
 
     Indexing is ``[z, y, x]`` like the stored array.
 
@@ -127,6 +108,12 @@ class ZarrReader:
             self.meta = _read_zarray(self.location, self.access)
         self._spec = dict(spec, meta=dict(self.meta.raw))
         self._attrs = spec.get("attrs")
+        v3 = self.meta.raw.get('_vc_reader_v3')
+        if v3 is not None and self._attrs is None:
+            self._attrs = dict(v3['metadata'].get('attributes', {}))
+            names = v3['metadata'].get('dimension_names')
+            if names is not None:
+                self._attrs['_ARRAY_DIMENSIONS'] = names
         # Raises for arrays the native reader cannot decode; offline, chunks only come from the caches.
         codec = "" if self.offline else self.meta.codec_id
         self.cache_layers: list[CacheLayer] = []
@@ -150,7 +137,7 @@ class ZarrReader:
             identity = key_url
         else:
             root = os.path.abspath(self.location)
-            layers = [("array", root, codec, "", False)]
+            layers = [] if v3 is not None else [("array", root, codec, "", False)]
             identity = "file://" + root
         threads = spec["threads"] or (32 if remote_url else min(16, os.cpu_count() or 4))
         try:
@@ -159,11 +146,14 @@ class ZarrReader:
             self._array = _native.Array(
                 list(self.meta.shape), list(self.meta.chunks), self.meta.dtype.itemsize,
                 np.asarray(self.meta.fill_value, dtype=self.meta.dtype).tobytes(), self.meta.separator, identity,
-                layers, write_layer=write_index, remote_url=remote_url, remote_codec=codec if remote_url else "",
+                layers, write_layer=write_index, remote_url=remote_url, remote_codec=codec if remote_url or v3 else "",
                 auth=_native_auth, offline=self.offline or self._prefetch_client is not None,
                 read_mode=spec["read_mode"], threads=threads,
                 connections=spec["connections"], cache=cache._native if cache is not None else None,
-                disk_cache=budget)
+                disk_cache=budget,
+                source_root=(remote_url if remote else root) if v3 else '',
+                source_prefix=v3['prefix'] if v3 else '', shard_chunks=v3['shard_chunks'] if v3 else [],
+                shard_index_end=v3['index_end'] if v3 else True, shard_index_crc=v3['index_crc'] if v3 else False)
         except BaseException:
             for layer in self.cache_layers:
                 layer.close()
@@ -204,7 +194,7 @@ class ZarrReader:
         offline: bool = False,
         prefetcher=None,
     ) -> ZarrReader:
-        """Open the zarr v2 array at ``location`` (a directory, ``http(s)://`` or ``s3://`` URL).
+        """Open the Zarr v2/v3 array at ``location`` (a directory, ``http(s)://`` or ``s3://`` URL).
 
         ``level`` appends a sub-path (an OME-Zarr pyramid level).
 

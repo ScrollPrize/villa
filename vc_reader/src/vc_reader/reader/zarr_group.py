@@ -1,4 +1,4 @@
-"""Zarr v2 groups: OME-Zarr pyramids and other groups of arrays, local or remote.
+"""Zarr v2/v3 groups: OME-Zarr pyramids and other groups of arrays, local or remote.
 
 A group opens its arrays as :class:`~vc_reader.reader.ZarrReader` objects with
 the group's settings (credentials, disk caches, offline mode, threads) and one
@@ -26,7 +26,8 @@ from typing import Any, Iterator, Sequence
 from ..errors import CacheMissError
 from .auth import Access, is_remote, split_s3
 from .disk_cache import VC3D, atomic_write, cached_node_dirs, cached_source_zarray, decoded_cache_path
-from .zarr_reader import MemoryCache, ZarrReader, _make_spec, cache_url, read_node_file
+from .zarr_reader import MemoryCache, ZarrReader, _make_spec
+from .transport import cache_url, read_node_file
 
 #: Settings of ZarrGroup.open that its arrays are opened with.
 _READER_OPTIONS = ("cache_dir", "cache_writes", "cache_max_bytes", "compress_cache", "allow_lossy_cache", "threads", "connections",
@@ -34,14 +35,15 @@ _READER_OPTIONS = ("cache_dir", "cache_writes", "cache_max_bytes", "compress_cac
 
 
 class ZarrGroup:
-    """A zarr v2 group opened for reading. Use :meth:`open`."""
+    """A Zarr v2/v3 group opened for reading. Use :meth:`open`."""
 
     def __init__(self, location: str, options: dict[str, Any], cache: MemoryCache | None, access: Access,
-                 attrs: dict[str, Any]):
+                 attrs: dict[str, Any], version=2):
         self.location = location
         self.access = access
         self.memory_cache = cache
         self.attrs: dict[str, Any] = attrs
+        self.version = version
         self._options = options
         self._nodes: dict[str, tuple[str, dict | None] | None] = {}  # child -> ("array", .zarray) / ("group", None)
         self._readers: dict[str, ZarrReader] = {}
@@ -66,7 +68,7 @@ class ZarrGroup:
         offline: bool = False,
         prefetcher=None,
     ) -> ZarrGroup:
-        """Open the zarr v2 group at ``location`` (a directory, ``http(s)://`` or ``s3://`` URL).
+        """Open the Zarr v2/v3 group at ``location`` (a directory, ``http(s)://`` or ``s3://`` URL).
 
         The arguments are those of :meth:`ZarrReader.open`, applied to every
         array opened through the group. A ``memory_cache`` byte budget becomes
@@ -82,6 +84,7 @@ class ZarrGroup:
         access: Access = spec["access"]
         options["cache_dir"] = spec["cache_dirs"]
         remote = is_remote(loc)
+        version = 2
         if remote and offline:
             dirs = cached_node_dirs(spec["cache_dirs"], cache_url(loc, access))
             if not dirs:
@@ -91,22 +94,32 @@ class ZarrGroup:
             zgroup = read_node_file(loc, ".zgroup", access)
             zattrs = read_node_file(loc, ".zattrs", access)
             if zgroup is None and zattrs is None:
+                data = read_node_file(loc, 'zarr.json', access)
+                node = json.loads(data) if data else None
+                if node is not None:
+                    if node.get('zarr_format') != 3 or node.get('node_type') != 'group':
+                        raise ValueError(f'{loc} is not a Zarr group')
+                    version = 3
+                    # The disk layer stores decoded inner chunks as v2 arrays.
+                    zgroup = b'{"zarr_format": 2}'
+                    zattrs = json.dumps(node.get('attributes', {})).encode()
+            if zgroup is None and zattrs is None:
                 if read_node_file(loc, ".zarray", access) is not None:
                     raise ValueError(f"{loc} is an array, not a group: open it with ZarrReader.open")
-                raise FileNotFoundError(f"no zarr v2 group at {loc} (.zgroup not found)")
+                raise FileNotFoundError(f"no Zarr group at {loc} (.zgroup/zarr.json not found)")
             attrs = json.loads(zattrs) if zattrs else {}
             if remote and cache_writes and spec["cache_dirs"]:
                 _cache_group_metadata(spec["cache_dirs"], cache_url(loc, access), zgroup, zattrs)
-        return cls(loc, options, cache, access, attrs)
+        return cls(loc, options, cache, access, attrs, version)
 
     def __getstate__(self):
         return {"location": self.location, "options": self._options, "memory_cache": self.memory_cache,
                 "access": self.access, "attrs": self.attrs, "nodes": self._nodes,
-                "consolidated": self._consolidated}
+                "consolidated": self._consolidated, "version": self.version}
 
     def __setstate__(self, state):
         self.__init__(state["location"], state["options"], state["memory_cache"],
-                      state["access"], state["attrs"])
+                      state["access"], state["attrs"], state['version'])
         self._nodes = state["nodes"]
         self._consolidated = state["consolidated"]
 
@@ -179,6 +192,14 @@ class ZarrGroup:
             elif any((d / ".zgroup").exists() or (d / ".zattrs").exists()
                      for d in cached_node_dirs(dirs, cache_url(loc, self.access))):
                 node = ("group", None)
+        elif self.version == 3:
+            data = read_node_file(loc, 'zarr.json', self.access)
+            if data is not None:
+                metadata = json.loads(data)
+                kind = metadata.get('node_type')
+                if kind not in ('array', 'group'):
+                    raise ValueError(f'{loc}: invalid Zarr v3 node_type')
+                node = (kind, metadata if kind == 'array' else None)
         else:
             zarray = read_node_file(loc, ".zarray", self.access)
             if zarray is not None:
@@ -191,7 +212,7 @@ class ZarrGroup:
     def _consolidated_metadata(self) -> dict[str, Any] | None:
         """The group's consolidated ``.zmetadata`` (online only), or None."""
         if self._consolidated is False:
-            data = None if self.offline else read_node_file(self.location, ".zmetadata", self.access)
+            data = None if self.offline or self.version == 3 else read_node_file(self.location, ".zmetadata", self.access)
             self._consolidated = json.loads(data).get("metadata") if data else None
         return self._consolidated  # type: ignore[return-value]
 
@@ -238,6 +259,10 @@ class ZarrGroup:
         if node is None or node[0] != "group":
             raise KeyError(f"no group {key!r} in {self.location}")
         loc = f"{self.location}/{key}"
+        if self.version == 3:
+            g = ZarrGroup.open(loc, auth=self.access, memory_cache=self.memory_cache, **self._options)
+            self._groups[key] = g
+            return g
         if self.offline:
             dirs = cached_node_dirs(self._options["cache_dir"], cache_url(loc, self.access))
             attrs = next((a for a in (_read_json(d / ".zattrs") for d in dirs) if a is not None), {})
@@ -344,7 +369,7 @@ def _read_json(path: Path) -> dict | None:
 
 
 def _is_node_dir(path: Path) -> bool:
-    return any((path / name).is_file() for name in (".zarray", ".zgroup", ".zattrs"))
+    return any((path / name).is_file() for name in (".zarray", ".zgroup", ".zattrs", "zarr.json"))
 
 
 def _cache_group_metadata(cache_dirs: Sequence[str], url: str, zgroup: bytes | None, zattrs: bytes | None) -> None:

@@ -10,6 +10,10 @@
 #include <condition_variable>
 #include <cstdint>
 #include <ctime>
+#include <functional>
+#include <exception>
+#include <cctype>
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -39,6 +43,12 @@ struct HttpOptions {
     long stall_timeout_s = 10;     // abort an attempt after this long without receiving data
     int retries = 5;
     Auth auth;
+};
+
+struct HttpResponse {
+    long status = 0;
+    std::string etag, modified, content_range;
+    std::size_t bytes = 0;
 };
 
 class HttpClient {
@@ -84,62 +94,87 @@ public:
     // throw HttpDenied and any other status throws.
     bool get(const std::string& url, std::vector<std::uint8_t>& body, std::size_t size_hint = 0)
     {
+        return get_stream(url, [&] {
+            body.clear();
+            if (size_hint) body.reserve(size_hint);
+        }, [&](const char* data, std::size_t n) {
+            body.insert(body.end(), data, data + n);
+        }).status == 200;
+    }
+
+    HttpResponse get_range(const std::string& url, std::vector<std::uint8_t>& body,
+                           const std::string& range, std::size_t length, const std::string& etag = "")
+    {
+        std::vector<std::pair<std::string, std::string>> headers{{"Range", "bytes=" + range},
+                                                               {"Accept-Encoding", "identity"}};
+        if (!etag.empty() && etag.rfind("W/", 0) != 0) headers.emplace_back("If-Match", etag);
+        auto response = get_stream(url, [&] { body.clear(); }, [&](const char* p, std::size_t n) {
+            if (n > length - body.size()) throw std::runtime_error("HTTP range exceeds requested length");
+            body.insert(body.end(), p, p+n);
+        }, headers, 206);
+        if (response.status != 404 && (response.status != 206 || body.size() != length))
+            throw std::runtime_error("server did not return the requested HTTP byte range: " + url);
+        return response;
+    }
+
+    // The same transport/auth/retry machinery as chunk reads, with a bounded
+    // caller-owned sink. Exceptions from callbacks never cross the C ABI.
+    HttpResponse get_stream(const std::string& url, std::function<void()> reset,
+                            std::function<void(const char*, std::size_t)> write,
+                            const std::vector<std::pair<std::string, std::string>>& extra = {}, long body_status = 200)
+    {
         Lease lease(*this);
         CURL* h = lease.handle;
         std::shared_ptr<const Auth> auth;
-        {
-            std::lock_guard lock(mutex_);
-            auth = auth_;
-        }
+        { std::lock_guard lock(mutex_); auth = auth_; }
         float delay = 0.25f;
         std::string last_error;
         for (int attempt = 0; attempt <= options_.retries; ++attempt) {
-            body.clear();
-            if (size_hint)
-                body.reserve(size_hint);
+            reset();
+            Transfer transfer{write, body_status};
             curl_easy_reset(h);
             curl_easy_setopt(h, CURLOPT_URL, url.c_str());
             curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
             curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);
             curl_easy_setopt(h, CURLOPT_USERAGENT, "vc_reader");
-            curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, "");  // .zarray etc. may be served gzip-encoded
+            curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, "");
             curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, options_.connect_timeout_ms);
             curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, 1L);
             curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, options_.stall_timeout_s);
             curl_easy_setopt(h, CURLOPT_TCP_KEEPALIVE, 1L);
-            curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, &HttpClient::write);
-            curl_easy_setopt(h, CURLOPT_WRITEDATA, &body);
+            curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, &HttpClient::receive);
+            curl_easy_setopt(h, CURLOPT_WRITEDATA, &transfer);
+            curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, &HttpClient::header);
+            curl_easy_setopt(h, CURLOPT_HEADERDATA, &transfer);
             HeaderList headers;
             if (auth->kind == "basic") {
                 curl_easy_setopt(h, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
                 curl_easy_setopt(h, CURLOPT_USERNAME, auth->user.c_str());
                 curl_easy_setopt(h, CURLOPT_PASSWORD, auth->secret.c_str());
-            } else if (auth->kind == "s3") {
-                // Signed per attempt: the signature covers the request time.
-                const S3Key key{auth->user, auth->secret, auth->token, auth->region};
-                for (const auto& [name, value] : sigv4_get_headers(url, key, amz_date(std::time(nullptr))))
-                    headers.append(name + ": " + value);
-                curl_easy_setopt(h, CURLOPT_HTTPHEADER, headers.list);
             }
+            if (auth->kind == "s3") {
+                const S3Key key{auth->user, auth->secret, auth->token, auth->region};
+                for (const auto& [name, value] : sigv4_get_headers(url, key, amz_date(std::time(nullptr)), extra))
+                    headers.append(name + ": " + value);
+            } else {
+                for (const auto& [name, value] : extra) headers.append(name + ": " + value);
+            }
+            curl_easy_setopt(h, CURLOPT_HTTPHEADER, headers.list);
             const CURLcode rc = curl_easy_perform(h);
-            long status = 0;
+            if (transfer.error) std::rethrow_exception(transfer.error);
             if (rc == CURLE_OK) {
+                long status = 0;
                 curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);
-                if (status == 200)
-                    return true;
-                if (status == 404)
-                    return false;
+                transfer.response.status = status;
+                if (status == body_status || status == 304 || status == 404)
+                    return transfer.response;
                 if (status != 429 && status < 500) {
-                    std::string snippet(body.begin(), body.begin() + std::min<std::size_t>(body.size(), 300));
-                    const std::string what = "GET " + url + ": HTTP " + std::to_string(status) + ": " + snippet;
-                    if (status == 401 || status == 403)
-                        throw HttpDenied(what);
+                    const std::string what = "GET " + url + ": HTTP " + std::to_string(status) + ": " + transfer.snippet;
+                    if (status == 401 || status == 403) throw HttpDenied(what);
                     throw std::runtime_error(what);
                 }
                 last_error = "HTTP " + std::to_string(status);
-            } else {
-                last_error = curl_easy_strerror(rc);
-            }
+            } else last_error = curl_easy_strerror(rc);
             if (attempt < options_.retries) {
                 std::this_thread::sleep_for(std::chrono::duration<float>(delay));
                 delay = std::min(delay * 2, 8.0f);
@@ -182,11 +217,50 @@ private:
         }
     };
 
-    static std::size_t write(char* data, std::size_t size, std::size_t n, void* user)
+    struct Transfer {
+        std::function<void(const char*, std::size_t)>& sink;
+        long body_status;
+        HttpResponse response;
+        std::string snippet;
+        std::exception_ptr error;
+    };
+
+    static std::size_t receive(char* data, std::size_t size, std::size_t count, void* user) noexcept
     {
-        auto* body = static_cast<std::vector<std::uint8_t>*>(user);
-        body->insert(body->end(), data, data + size * n);
-        return size * n;
+        auto& t = *static_cast<Transfer*>(user);
+        const auto n = size * count;
+        try {
+            if (t.body_status == 206 && t.response.status == 200)
+                throw std::runtime_error("server ignored HTTP Range; refusing a whole-shard download");
+            if (t.response.status == t.body_status) {
+                t.sink(data, n);
+                t.response.bytes += n;
+            } else if (t.snippet.size() < 300) t.snippet.append(data, std::min(n, 300-t.snippet.size()));
+            return n;
+        } catch (...) { t.error = std::current_exception(); return 0; }
+    }
+
+    static std::size_t header(char* data, std::size_t size, std::size_t count, void* user) noexcept
+    {
+        auto& t = *static_cast<Transfer*>(user);
+        const auto n = size * count;
+        try {
+            std::string line(data, n);
+            if (line.rfind("HTTP/", 0) == 0) {
+                t.response = {};
+                t.snippet.clear();
+                std::sscanf(line.c_str(), "%*s %ld", &t.response.status);
+            } else if (auto colon = line.find(':'); colon != std::string::npos) {
+                std::string name = line.substr(0, colon), value = line.substr(colon+1);
+                for (auto& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                auto begin = value.find_first_not_of(" \t\r\n"), end = value.find_last_not_of(" \t\r\n");
+                value = begin == std::string::npos ? "" : value.substr(begin, end-begin+1);
+                if (name == "etag") t.response.etag = value;
+                if (name == "last-modified") t.response.modified = value;
+                if (name == "content-range") t.response.content_range = value;
+            }
+            return n;
+        } catch (...) { t.error = std::current_exception(); return 0; }
     }
 
     HttpOptions options_;
