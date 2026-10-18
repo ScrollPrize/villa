@@ -3623,11 +3623,90 @@ void SegmentationCommandHandler::onConvertToObj(const std::string& segmentId)
         return;
     }
 
-    _cmdRunner->setToObjParams(dlg.tifxyzPath(), dlg.objPath());
-    _cmdRunner->setNextOmpThreads(dlg.ompThreads());
-    _cmdRunner->setToObjOptions(dlg.normalizeUV(), dlg.alignGrid());
-    _cmdRunner->execute(CommandLineToolRunner::Tool::tifxyz2obj);
+    ConvertToObjParams params;
+    params.objPath = dlg.objPath();
+    params.normalizeUV = dlg.normalizeUV();
+    params.alignGrid = dlg.alignGrid();
+    params.ompThreads = dlg.ompThreads();
+    launchConvertToObj(dlg.tifxyzPath(), params, CommandLineToolRunner::ExecutionOptions{});
     emit statusMessage(tr("Converting segment to OBJ: %1").arg(QString::fromStdString(segmentId)), 5000);
+}
+
+bool SegmentationCommandHandler::launchConvertToObj(
+    const QString& tifxyzPath,
+    const ConvertToObjParams& params,
+    CommandLineToolRunner::ExecutionOptions options)
+{
+    _cmdRunner->setToObjParams(tifxyzPath, params.objPath);
+    _cmdRunner->setNextOmpThreads(params.ompThreads);
+    _cmdRunner->setToObjOptions(params.normalizeUV, params.alignGrid);
+    return _cmdRunner->execute(CommandLineToolRunner::Tool::tifxyz2obj, options);
+}
+
+bool SegmentationCommandHandler::startConvertToObj(const std::string& segmentId,
+                                                   const ConvertToObjParams& params,
+                                                   CommandLaunchError* error,
+                                                   QString* resolvedObjPath)
+{
+    const CommandLaunchErrorSetter setErr{error};
+
+    // The checks of requireSurfaceAndRunner, without its dialogs.
+    if (!_state || _state->currentVolume() == nullptr || !_state->vpkg()) {
+        setErr(tr("No volume package or volume loaded."), CommandLaunchError::InvalidState);
+        return false;
+    }
+    auto surf = _state->vpkg()->getSurface(segmentId);
+    if (!surf) {
+        setErr(tr("Invalid segment or segment not loaded: %1")
+                   .arg(QString::fromStdString(segmentId)),
+               CommandLaunchError::SegmentNotFound);
+        return false;
+    }
+    if (!_cmdRunner) {
+        setErr(tr("Command line tools not available"), CommandLaunchError::ToolUnavailable);
+        return false;
+    }
+    if (_cmdRunner->isRunning()) {
+        setErr(tr("A command line tool is already running."), CommandLaunchError::Busy);
+        return false;
+    }
+    const QFileInfo toolInfo(QCoreApplication::applicationDirPath() +
+                             QStringLiteral("/vc_tifxyz2obj"));
+    if (!toolInfo.exists() || !toolInfo.isExecutable()) {
+        setErr(tr("vc_tifxyz2obj not found or not executable."),
+               CommandLaunchError::ToolUnavailable);
+        return false;
+    }
+
+    // The dialog's suggestion unless a path is given.
+    const std::filesystem::path objPath = params.objPath.isEmpty()
+        ? surf->path / (segmentId + ".obj")
+        : std::filesystem::path(params.objPath.toStdString());
+    std::error_code ec;
+    if (!params.overwrite && std::filesystem::exists(objPath, ec)) {
+        setErr(tr("%1 already exists.").arg(QString::fromStdString(objPath.string())),
+               CommandLaunchError::InvalidState);
+        return false;
+    }
+    if (objPath.has_parent_path() && !std::filesystem::exists(objPath.parent_path(), ec)) {
+        std::filesystem::create_directories(objPath.parent_path(), ec);
+        if (ec) {
+            setErr(tr("Failed to create output directory: %1")
+                       .arg(QString::fromStdString(ec.message())));
+            return false;
+        }
+    }
+
+    ConvertToObjParams resolved = params;
+    resolved.objPath = QString::fromStdString(objPath.string());
+    if (!launchConvertToObj(QString::fromStdString(surf->path.string()), resolved,
+                            CommandLineToolRunner::ExecutionOptions::silent())) {
+        setErr(tr("Failed to start OBJ conversion."));
+        return false;
+    }
+    if (resolvedObjPath)
+        *resolvedObjPath = resolved.objPath;
+    return true;
 }
 
 void SegmentationCommandHandler::onCropSurfaceToValidRegion(const std::string& segmentId)

@@ -147,6 +147,16 @@ public:
 
     using AlphaCompRefineParams = AlphaCompRefineRequest;
 
+    // Arguments accepted by startConvertToObj. Options the dialog shows but
+    // the conversion does not pass to vc_tifxyz2obj are omitted.
+    struct ConvertToObjParams {
+        QString objPath;          // empty => <segment>/<segment id>.obj
+        bool    normalizeUV{false};
+        bool    alignGrid{false};
+        int     ompThreads{-1};   // -1 => runner default
+        bool    overwrite{true};  // false => an existing OBJ file is refused
+    };
+
     // --- Construction ---
 
     explicit SegmentationCommandHandler(QWidget* parentWidget,
@@ -326,6 +336,15 @@ public:
                               CommandLaunchError* error = nullptr,
                               QString* resolvedOutputDir = nullptr);
 
+    /// Dialog-free OBJ conversion launch (vc_tifxyz2obj). The interactive slot
+    /// gathers the same params from its dialog. Completion is observable via
+    /// CommandLineToolRunner::toolFinished, whose output path is the OBJ file.
+    /// On success `resolvedObjPath` receives the OBJ file path when provided.
+    bool startConvertToObj(const std::string& segmentId,
+                           const ConvertToObjParams& params,
+                           CommandLaunchError* error = nullptr,
+                           QString* resolvedObjPath = nullptr);
+
     /// Dialog-free core of onCropSurfaceToValidRegion (the interactive slot wraps
     /// this). Crops the surface grid to its tightest valid bounds, writes it in
     /// place, and refreshes metrics; failures via `errorMessage` (never a dialog)
@@ -426,6 +445,9 @@ private:
                                   QString* resolvedOutputDir);
     static QJsonObject alphaCompRefineParamsJson(
         const AlphaCompRefineParams& params);
+    bool launchConvertToObj(const QString& tifxyzPath,
+                            const ConvertToObjParams& params,
+                            CommandLineToolRunner::ExecutionOptions options);
 
     /**
      * Resolve a segment launch's output directory: the surface's own parent
