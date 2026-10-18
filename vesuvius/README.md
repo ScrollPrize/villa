@@ -76,6 +76,13 @@ first, including **Qt6 Core development files** (`qt6-base-dev` on Ubuntu/Debian
 libraries. This requirement does not apply to the base `vesuvius` installation
 shown above.
 
+To run the neural Copy script (`vesuvius.neural_tracing.inference.infer_rowcol_triplet_wraps`)
+without building `volume-cartographer` (for example on Windows), skip that package:
+`uv sync --frozen --extra models --no-install-package volume-cartographer`. The script then
+reads the volume with zarr-python and keeps no disk chunk cache (`--volume-cache-dir` and
+`--volume-chunk-cache-gb` are not used). Without uv's monorepo sources, `vesuvius[models]`
+does not resolve, because `volume-cartographer` is not on PyPI.
+
 ___
 **Note:** 
 

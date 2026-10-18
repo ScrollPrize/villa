@@ -11,7 +11,11 @@ from scipy import ndimage
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-import vc
+
+try:
+    import vc
+except ImportError:  # vc ships with the monorepo-only volume-cartographer package (not on PyPI)
+    vc = None
 
 try:
     import trimesh
@@ -128,8 +132,96 @@ class _VcVolumeLevel:
         )
 
 
+class _ZarrVolume:
+    """zarr-python stand-in for the vc.Volume calls made here, used when vc is not installed.
+
+    Voxels outside the volume and missing chunks read as the array's fill_value (0 when it is
+    unset), where vc reads 0 outside the volume. missing_policy is accepted for call
+    compatibility only (in vc it is the policy for missing scale levels). It keeps no disk
+    cache: --volume-cache-dir and --volume-chunk-cache-gb are not used on this path.
+    """
+
+    def __init__(self, path):
+        import zarr
+
+        from vesuvius.neural_tracing.datasets.common import _make_remote_store
+        from vesuvius.neural_tracing.s3_utils import s3_storage_options_for_path
+
+        path = str(path)
+        if path.startswith(("http://", "https://", "s3://")):
+            store = _make_remote_store(
+                path, s3_storage_options_for_path(path), missing_exceptions=(KeyError, FileNotFoundError)
+            )
+        else:
+            store = path
+        node = zarr.open(store, mode="r")
+        self.single_array = not hasattr(node, "array_keys")
+        if self.single_array:
+            self._levels = {0: node}
+        else:
+            multiscales = node.attrs.get("multiscales") or [{}]
+            names = [str(d.get("path")) for d in multiscales[0].get("datasets", [])]
+            names = [n for n in names if n.isdigit()] or [k for k in node.array_keys() if str(k).isdigit()]
+            self._levels = {int(k): node[str(k)] for k in names}
+        if not self._levels:
+            raise RuntimeError(f"no zarr scale levels found at {path!r}")
+        self.dtype = np.dtype(self._levels[min(self._levels)].dtype)
+
+    def has_scale_level(self, level):
+        return int(level) in self._levels
+
+    def present_scale_levels(self):
+        return sorted(self._levels)
+
+    def shape_at(self, level):
+        return tuple(self._levels[int(level)].shape)
+
+    def chunk_shape(self, level):
+        return tuple(self._levels[int(level)].chunks)
+
+    def read_zyx(self, starts, shape, level=0, missing_policy="all_fill"):
+        array = self._levels[int(level)]
+        fill = 0 if array.fill_value is None else array.fill_value
+        starts = [int(v) for v in starts]
+        shape = [int(v) for v in shape]
+        out = np.full(shape, fill, dtype=self.dtype)
+        lo = [max(0, s) for s in starts]
+        hi = [min(int(n), s + d) for n, s, d in zip(array.shape, starts, shape)]
+        if all(h > l for l, h in zip(lo, hi)):
+            out[tuple(slice(l - s, h - s) for l, h, s in zip(lo, hi, starts))] = array[
+                tuple(slice(l, h) for l, h in zip(lo, hi))
+            ]
+        return out
+
+
+_ZARR_FALLBACK_NOTICE_SHOWN = False
+
+
+def _open_zarr_volume_level(volume_path, volume_scale):
+    """Open one OME-Zarr scale level with zarr-python (the path used when vc is not installed)."""
+    global _ZARR_FALLBACK_NOTICE_SHOWN
+    if not _ZARR_FALLBACK_NOTICE_SHOWN:
+        _ZARR_FALLBACK_NOTICE_SHOWN = True
+        print(
+            "vc (volume-cartographer) is not installed: reading the volume with zarr-python "
+            "(no chunk cache; --volume-cache-dir and --volume-chunk-cache-gb are ignored)",
+            file=sys.stderr,
+        )
+    volume = _ZarrVolume(volume_path)
+    target_level = int(volume_scale)
+    if volume.single_array:
+        return _VcVolumeLevel(volume, 0), target_level
+    if volume.has_scale_level(target_level):
+        level = target_level
+    else:
+        level = min(volume.present_scale_levels(), key=lambda v: abs(v - target_level))
+    return _VcVolumeLevel(volume, level), level
+
+
 def _open_vc_volume_level(volume_path, volume_scale, cache_dir, chunk_cache_gb):
     path = str(volume_path)
+    if vc is None:
+        return _open_zarr_volume_level(path, volume_scale)
     cache_bytes = int(round(float(chunk_cache_gb) * (1024 ** 3)))
     vc.set_chunk_cache_budget(cache_bytes)
 
