@@ -12,9 +12,9 @@ template<class T> VCR_HD inline volume_detail::ComplexT<T> adapt_amplitude(volum
     auto unit=amplitude?input.scale(T(1)/amplitude):ComplexT<T>{1,0};return unit.scale((T(1)-blend)*amplitude+blend*target);
 }
 template<class T> inline void channel_apply(const FDA& t,std::vector<T>& v,const Grid& grid,const ChannelPlan& p){
-    using namespace volume_detail;if(p.values[0]==0)return;Grid3 g(grid.shape);auto ref=reference_channel(t.reference,p.channel);std::vector<Complex> source(g.size),reference(g.size);
+    using namespace volume_detail;if(p.values[0]==0)return;Grid3 g(grid.shape);auto ref=reference_channel<T>(t.reference,p.channel);std::vector<ComplexT<T>> source(g.size),reference(g.size);
     for(std::size_t i=0;i<g.size;++i){source[i].re=v[i];reference[i].re=ref[i];}fft_volume(source,g,false);fft_volume(reference,g,false);
-    for(std::size_t i=0;i<g.size;++i)if(low_frequency(g,i,p.values[1]))source[i]=adapt_amplitude(source[i],reference[i],p.values[0]);
+    for(std::size_t i=0;i<g.size;++i)if(low_frequency(g,i,p.values[1]))source[i]=adapt_amplitude(source[i],reference[i],T(p.values[0]));
     fft_volume(source,g,true);for(std::size_t i=0;i<g.size;++i)v[i]=source[i].re;
 }
 inline void apply(const FDA& t,Sample& s,const Parameters& p) { volume_detail::apply_checked_channels(t,s,p); }

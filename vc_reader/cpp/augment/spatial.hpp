@@ -177,7 +177,7 @@ inline std::size_t displacement_axis(const Parameters& p) {
         }
     return chosen == d ? 0 : chosen;
 }
-inline void resample_axis_displacement(const Array& src, Array& out, const Parameters& p,
+template<class Real> inline void resample_axis_displacement(const Array& src, Array& out, const Parameters& p,
                                        std::size_t axis, bool nearest, double fill) {
     Grid grid(p.shape), line({p.shape[axis]});
     const auto d = p.shape.size(), extent = p.shape[axis], step = grid.stride[axis];
@@ -188,10 +188,10 @@ inline void resample_axis_displacement(const Array& src, Array& out, const Param
             for (std::size_t x = 0; x < extent; ++x)
                 for (std::size_t j = 0; j < step; ++j) {
                     const auto i = block + x * step + j, base = block + j;
-                    Point q{double(x) + p.field[i * d + axis], 0, 0};
+                    std::array<Real,3> q{Real(x) + p.field[i * d + axis], 0, 0};
                     if (nearest) {
                         require(std::isfinite(q[0]), "nonfinite sampling coordinate");
-                        auto at = base + std::size_t(nearest_index(std::clamp(q[0], 0., double(extent - 1)), p.nearest_mode)) * step;
+                        auto at = base + std::size_t(nearest_index(std::clamp(q[0], Real(0), Real(extent - 1)), p.nearest_mode)) * step;
                         for (std::size_t c = 0; c < src.shape[0]; ++c)
                             destination[c * grid.size + i] = source[c * grid.size + at];
                     } else {
@@ -199,8 +199,8 @@ inline void resample_axis_displacement(const Array& src, Array& out, const Param
                             // The omitted axes have fraction zero, so their
                             // weights are exactly one. Keep low/high corner
                             // accumulation (including the initial +0) unchanged.
-                            double value = linear_value<1>(line, q, true, fill, [&](auto at) {
-                                return double(source[c * grid.size + base + at * step]);
+                            Real value = linear_value<1>(line, q, true, fill, [&](auto at) {
+                                return Real(source[c * grid.size + base + at * step]);
                             });
                             if constexpr (std::is_floating_point_v<T>) destination[c * grid.size + i] = static_cast<T>(value);
                             else out.set(c * grid.size + i, value);
@@ -229,7 +229,7 @@ template<std::size_t D, class Real> Array resample_impl(const Array& src, const 
     Shape shape{src.shape[0]}; shape.insert(shape.end(), p.shape.begin(), p.shape.end()); auto out = Array::uninitialized(shape, src.kind, src.bytes);
     if (resample_exact(src, out, p, fill, validity)) return out;
     if (field_axis < d && !validity && input.shape == p.shape) {
-        resample_axis_displacement(src, out, p, field_axis, nearest, fill);
+        resample_axis_displacement<Real>(src, out, p, field_axis, nearest, fill);
         return out;
     }
     src.typed([&](const auto* source) {
@@ -431,9 +431,11 @@ inline SheetSettings sheet_parameters(const SheetCompression& t, const Sample& s
 }
 inline Parameters sample(const SheetCompression& t, const Sample& s, Random& r) {
     auto [p,chosen,strength,sigma,smooth]=sheet_parameters(t,s,r); Grid g(p.shape); const auto d=p.shape.size();
-    auto values = s.at(t.image).array.channel(0); if (sigma > .5) gaussian_blur(values, g, std::vector<double>(d, sigma), 6, Boundary::Mirror, true);
+    const auto& image = s.at(t.image).array;
+    const auto build = [&]<class Value>() {
+    auto values = image.channel<Value>(0); if (sigma > .5) gaussian_blur(values, g, std::vector<double>(d, sigma), 6, Boundary::Mirror, true);
     auto [lo, hi] = std::minmax_element(values.begin(), values.end()); double low = *lo, span = *hi - low;
-    if (span <= 1e-8) return p;
+    if (span <= 1e-8) return;
     const auto step = g.stride[chosen], extent = g.shape[chosen];
     for (std::size_t block = 0; block < g.size; block += extent * step)
         for (std::size_t x = 0; x < extent; ++x)
@@ -446,7 +448,10 @@ inline Parameters sample(const SheetCompression& t, const Sample& s, Random& r) 
     if (smooth > .5) { std::vector<double> sigmas(d, smooth); sigmas[chosen] = 0; gaussian_blur(values, g, sigmas, 6, Boundary::Mirror, true); }
     p.field = std::vector<float>(g.size * d);
     for (std::size_t i = 0; i < g.size; ++i) p.field[i * d + chosen] = -values[i] * double(g.shape[chosen] - 1) / g.shape[chosen];
-    p.border = true; return p;
+    p.border = true;
+    };
+    if (image.bytes==4) build.template operator()<float>(); else build.template operator()<double>();
+    return p;
 }
 template<class T> concept Geometric = std::is_same_v<T, Flip> || std::is_same_v<T, Rotate90> || std::is_same_v<T, Transpose> || std::is_same_v<T, CropPad> || std::is_same_v<T, Affine> || std::is_same_v<T, Elastic> || std::is_same_v<T, SheetCompression>;
 template<Geometric T> void apply(const T&, Sample& s, const Parameters& p) { apply_geometry(s, p); }
@@ -455,18 +460,18 @@ template<Geometric T> void apply(const T&, Sample& s, const Parameters& p) { app
 // from a geometric deformation (point coordinates do not move).
 struct LowResolution { Scalar scale = Uniform{.5, 1}; std::string axes = "zyx"; bool shared_axes = true; ChannelOptions options; };
 struct ThickSlice { Scalar scale = Uniform{.25, .6}; std::string axes; bool labels = true; double p = 1; };
-template<std::size_t D> Array resize_array_impl(const Array& a, const Shape& shape, bool nearest, bool legacy_nearest) {
+template<std::size_t D,class Real> Array resize_array_impl(const Array& a, const Shape& shape, bool nearest, bool legacy_nearest) {
     Grid input(a.spatial()), output(shape);
     Shape out_shape{a.shape[0]}; out_shape.insert(out_shape.end(), shape.begin(), shape.end());
     auto out = Array::uninitialized(out_shape, a.kind, a.bytes);
-    struct Axis { std::size_t lo, hi; double fraction; };
+    struct Axis { std::size_t lo, hi; Real fraction; };
     std::array<std::vector<Axis>, D> positions;
     for (std::size_t axis = 0; axis < D; ++axis) {
         const double ratio = double(input.shape[axis]) / shape[axis];
         const double offset = legacy_nearest ? 0 : .5 * ratio - .5;
         for (std::size_t x = 0; x < shape[axis]; ++x) {
             double q = std::clamp(ratio * double(x) + offset, 0., double(input.shape[axis] - 1));
-            auto lo = std::size_t(std::floor(q)); double fraction = q - lo;
+            auto lo = std::size_t(std::floor(q)); Real fraction = q - lo;
             if (nearest) {
                 auto at = lo + (!legacy_nearest && fraction >= .5);
                 positions[axis].push_back({at * input.stride[axis], 0, 0});
@@ -489,15 +494,15 @@ template<std::size_t D> Array resize_array_impl(const Array& a, const Shape& sha
                         for (const auto& axis : q) at += axis.lo;
                         dst[i] = src[at];
                     } else {
-                        double value = 0;
+                        Real value = 0;
                         for (std::size_t corner = 0; corner < (1u << D); ++corner) {
-                            double weight = 1; std::size_t at = c * input.size;
+                            Real weight = 1; std::size_t at = c * input.size;
                             for (std::size_t axis = 0; axis < D; ++axis) {
                                 bool hi = (corner >> axis) & 1;
                                 weight *= hi ? q[axis].fraction : 1 - q[axis].fraction;
                                 at += hi ? q[axis].hi : q[axis].lo;
                             }
-                            if (weight) value += weight * double(src[at]);
+                            if (weight) value += weight * Real(src[at]);
                         }
                         if constexpr (std::is_floating_point_v<T>) dst[i] = static_cast<T>(value);
                         else out.set(i, value);
@@ -507,8 +512,11 @@ template<std::size_t D> Array resize_array_impl(const Array& a, const Shape& sha
     return out;
 }
 inline Array resize_array(const Array& a, const Shape& shape, bool nearest, bool legacy_nearest = false) {
-    return shape.size() == 2 ? resize_array_impl<2>(a, shape, nearest, legacy_nearest)
-                             : resize_array_impl<3>(a, shape, nearest, legacy_nearest);
+    if (a.kind != 'f' || a.bytes == 4)
+        return shape.size() == 2 ? resize_array_impl<2,float>(a, shape, nearest, legacy_nearest)
+                                 : resize_array_impl<3,float>(a, shape, nearest, legacy_nearest);
+    return shape.size() == 2 ? resize_array_impl<2,double>(a, shape, nearest, legacy_nearest)
+                             : resize_array_impl<3,double>(a, shape, nearest, legacy_nearest);
 }
 inline Parameters sample(const LowResolution& t, const Sample& s, Random& r) {
     return sample_channels(s, t.options, r, [&](const Array& a, Random& rng) {

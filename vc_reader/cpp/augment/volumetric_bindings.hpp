@@ -7,8 +7,9 @@ static void volume_reference(volume_detail::ReferenceVolume& t, Arguments& a) {
     for(std::size_t i=0;i<4;++i)t.shape.push_back(input.shape(i));
     require(product(t.shape)>0,"reference must be nonempty");
     auto dtype=input.dtype();t.wide=dtype.bits==64;require(dtype.code==std::uint8_t(nb::dlpack::dtype_code::Float) && (dtype.bits==32 || dtype.bits==64),"reference must be float32 or float64");
-    Array values(t.shape,'f',dtype.bits/8,input.data());t.values.resize(values.size());
-    for(std::size_t i=0;i<values.size();++i){auto x=values.get(i);require(std::isfinite(x),"reference must be finite");t.values[i]=x;}
+    Array values(t.shape,'f',dtype.bits/8,input.data());
+    values.typed([&](const auto* data){for(std::size_t i=0;i<values.size();++i)require(std::isfinite(data[i]),"reference must be finite");});
+    t.values=values; // Own a copy in the supplied dtype.
 }
 static int volume_mode(Arguments& a,const char* name,const std::vector<std::string>& choices,const char* fallback) {
     auto mode=a.get(name,std::string(fallback));auto it=std::find(choices.begin(),choices.end(),mode);require(it!=choices.end(),std::string("invalid ")+name+": "+mode);return int(it-choices.begin());

@@ -14,9 +14,11 @@ struct HistogramMatchingKernel {
     }
 };
 template<class T> inline void channel_apply(const HistogramMatching& t,std::vector<T>& v,const Grid& g,const ChannelPlan& p) {
-    using namespace volume_detail;auto ref=reference_channel(t.reference,p.channel);auto summary=stats(ref.data(),ref.size());auto input=stats(v.data(),v.size());std::vector<double> table(2*t.bins);
+    using namespace volume_detail;Stats summary{};auto input=stats(v.data(),v.size());std::vector<double> table(2*t.bins);
     histogram(v.data(),v.size(),table.data(),t.bins,input.low,input.high);cdf(table.data(),t.bins);
-    histogram(ref.data(),ref.size(),table.data()+t.bins,t.bins,summary.low,summary.high);cdf(table.data()+t.bins,t.bins);
+    visit_reference_channel(t.reference,p.channel,[&](const auto& ref){
+        summary=stats(ref.data(),ref.size());histogram(ref.data(),ref.size(),table.data()+t.bins,t.bins,summary.low,summary.high);
+    });cdf(table.data()+t.bins,t.bins);
     map_channel(v,g,HistogramMatchingKernel{p.values[0],t.bins},table.data(),summary);
 }
 inline void apply(const HistogramMatching& t,Sample& s,const Parameters& p) { volume_detail::apply_checked_channels(t,s,p); }

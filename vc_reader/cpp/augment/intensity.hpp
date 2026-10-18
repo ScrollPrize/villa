@@ -221,20 +221,28 @@ inline Real pointwise_intensity(const T& t, Real y, const ChannelPlan& p, Real m
 }
 
 template<class Values> void channel_apply(const GaussianNoise&, Values& v, const Grid&, const ChannelPlan& p) {
+    using T=typename Values::value_type;
+    const auto add=[&](T x,T noise) {
+        T y=x+T(p.values[0])*noise;
+        if constexpr(std::is_same_v<T,float>) if(!std::isfinite(y)) y=T(double(x)+p.values[0]*double(noise));
+        return y;
+    };
     Random r{p.seed};
     for (std::size_t i = 0; i < v.size(); i += 2) {
         const auto noise = r.normal_pair<typename Values::value_type>();
-        v[i] = double(v[i]) + p.values[0] * noise[0];
-        if (i + 1 < v.size()) v[i + 1] = double(v[i + 1]) + p.values[0] * noise[1];
+        v[i] = add(v[i],noise[0]);
+        if (i + 1 < v.size()) v[i + 1] = add(v[i+1],noise[1]);
     }
 }
 template<class Values> void channel_apply(const RicianNoise&, Values& v, const Grid&, const ChannelPlan& p) {
     Random r{p.seed}; for (auto& x : v) {
         const auto noise = r.normal_pair<typename Values::value_type>();
-        // Double prevents overflow of the squared components for finite float
-        // inputs whose magnitude is larger than sqrt(FLT_MAX).
-        double re = x + p.values[0] * noise[0], im = p.values[0] * noise[1];
-        x = std::sqrt(re * re + im * im);
+        using T=typename Values::value_type;
+        const T re=x+T(p.values[0])*noise[0], im=T(p.values[0])*noise[1];
+        T y=std::hypot(re,im);
+        if constexpr(std::is_same_v<T,float>) if(!std::isfinite(y))
+            y=T(std::hypot(double(x)+p.values[0]*noise[0],p.values[0]*noise[1]));
+        x=y;
     }
 }
 template<class T> inline void channel_apply(const ClipOutliers&, std::vector<T>& v, const Grid&, const ChannelPlan& p) {

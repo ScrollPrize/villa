@@ -36,9 +36,7 @@ template<class Transform,class Function> void with_voxel_channels(const Transfor
             copy_device(values,View<Value>{output.ptr,values.size});
         };
         if constexpr(std::is_same_v<typename decltype(image)::value_type,float>){
-            bool wide=false;
-            for(double x:c.values)wide |= std::abs(x)>std::numeric_limits<float>::max() || (x!=0 && std::abs(x)<std::numeric_limits<float>::min());
-            if constexpr(std::is_same_v<Transform,Illumination> || std::is_same_v<Transform,Vignetting>)wide |= c.values[1]<std::sqrt(std::numeric_limits<float>::min());
+            const bool wide=channel_wide_parameters(t,c);
             if(wide){
                 Buffer<double> values(image.size);View<double> promoted{values.ptr,values.size};convert(promoted,image);run(promoted);
                 check_channel_output<<<blocks(image.size),256,0,vcr::device::stream()>>>(values.ptr,image.size,std::numeric_limits<float>::max(),session.finite_status());
@@ -50,9 +48,10 @@ template<class Transform,class Function> void with_voxel_channels(const Transfor
 // Upload reference data in its original dtype, without promoting an entire
 // float32 reference volume. Small summaries/histogram CDFs retain their precision.
 template<class Function> void with_reference_channel(const vd::ReferenceVolume& reference,std::size_t channel,Function&& fn){
-    auto values=vd::reference_channel(reference,channel);
-    if(reference.wide){Buffer<double> data(values);fn(View<double>{data.ptr,data.size});}
-    else{Buffer<float> data(std::vector<float>(values.begin(),values.end()));fn(View<float>{data.ptr,data.size});}
+    vd::visit_reference_channel(reference,channel,[&](const auto& values) {
+        using T=typename std::decay_t<decltype(values)>::value_type;
+        Buffer<T> data(values);fn(View<T>{data.ptr,data.size});
+    });
 }
 template<class Transform> void apply_voxel_channels(const Transform& t,Sample& s,const Parameters& p,Session& session) {
     with_voxel_channels(t,s,p,session,[&](const Grid& g,const ChannelPlan& c,auto input,auto output,const auto* stats,int* error){

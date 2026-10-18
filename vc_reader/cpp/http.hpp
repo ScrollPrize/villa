@@ -91,7 +91,7 @@ public:
             std::lock_guard lock(mutex_);
             auth = auth_;
         }
-        double delay = 0.25;
+        float delay = 0.25f;
         std::string last_error;
         for (int attempt = 0; attempt <= options_.retries; ++attempt) {
             body.clear();
@@ -141,7 +141,7 @@ public:
                 last_error = curl_easy_strerror(rc);
             }
             if (attempt < options_.retries) {
-                std::this_thread::sleep_for(std::chrono::duration<double>(delay));
+                std::this_thread::sleep_for(std::chrono::duration<float>(delay));
                 delay = std::min(delay * 2, 8.0);
             }
         }

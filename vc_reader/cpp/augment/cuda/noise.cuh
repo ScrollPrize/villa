@@ -10,15 +10,23 @@ __device__ inline double uniform_at(std::uint64_t state, std::uint64_t draw) {
 template<class T> __global__ void noise_kernel(T* data, std::size_t n, double sigma, std::uint64_t seed, bool rician) {
     EACH_INDEX(rician ? n : (n + 1) / 2) {
         const T u = from_double<T>(uniform_at(seed, 2*i));
-        const T angle = from_double<T>(6.2831853071795864769 * uniform_at(seed, 2*i+1));
+        const T angle = T(6.2831853071795864769) * from_double<T>(uniform_at(seed, 2*i+1));
         T radius, a, b;
         if constexpr (std::is_same_v<T, float>) {
             radius = sqrtf(T(-2) * logf(u)); a = radius * cosf(angle); b = radius * sinf(angle);
         } else { radius = sqrt(T(-2) * log(u)); a = radius * cos(angle); b = radius * sin(angle); }
-        if (rician) { double re = data[i] + sigma * a, im = sigma * b; data[i] = T(sqrt(re*re + im*im)); }
-        else {
-            data[2*i] = from_double<T>(to_double(data[2*i]) + sigma*to_double(a));
-            if (2*i+1 < n) data[2*i+1] = from_double<T>(to_double(data[2*i+1]) + sigma*to_double(b));
+        const auto add = [&](T x,T noise) {
+            T y=x+T(sigma)*noise;
+            if constexpr(std::is_same_v<T,float>) if(!isfinite(y)) y=T(widen(x)+sigma*widen(noise));
+            return y;
+        };
+        if (rician) {
+            const T re=add(data[i],a), im=T(sigma)*b;
+            // hypot rescales its operands, avoiding overflow of re*re + im*im.
+            data[i]=hypot(re,im);
+        } else {
+            data[2*i]=add(data[2*i],a);
+            if(2*i+1<n)data[2*i+1]=add(data[2*i+1],b);
         }
     }
 }

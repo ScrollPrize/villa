@@ -1,7 +1,7 @@
 #include "gaussian.cuh"
 namespace vcr::augment::cuda {
 template<class T> __global__ void blend(T* data, const T* smoothed, const float* field, std::size_t n, double strength) {
-    EACH_INDEX(n) { T w = T(field[i] * strength); data[i] = data[i] * (T(1)-w) + smoothed[i]*w; }
+    EACH_INDEX(n) { T w = T(field[i]) * T(strength); data[i] = data[i] * (T(1)-w) + smoothed[i]*w; }
 }
 void apply_cuda(const LocalSmoothing& t, Sample& s, const Parameters& p, Session& session) {
     apply_channels(t,s,p,session,[](const auto&, auto v, const Grid& g, const ChannelPlan& c) {

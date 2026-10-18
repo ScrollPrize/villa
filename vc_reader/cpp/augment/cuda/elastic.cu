@@ -50,19 +50,19 @@ Parameters sample_elastic(const Elastic& t, const Sample& s, Random& r, bool rec
     if (!magnitude) { p.exact = true; return p; }
     const double spacing = std::max(1.,2*sigma); const auto dim = p.shape.size();
     Shape knots; for (auto n : p.shape) knots.push_back(elastic_detail::controls(n,spacing,true));
-    std::vector<double> controls;
+    std::vector<float> controls;
     for (std::size_t c = 0; c < dim; ++c) {
         auto values = elastic_detail::draw_controls(knots,r); controls.insert(controls.end(),values.begin(),values.end());
     }
-    auto data = std::make_shared<Buffer<Real>>(std::vector<Real>(controls.begin(),controls.end())); Shape shape = knots;
+    auto data = std::make_shared<Buffer<Real>>(controls); Shape shape = knots;
     for (int axis = int(dim)-1; axis >= 0; --axis) {
         auto target = shape; target[axis] = p.shape[axis];
-        std::vector<double> weights; std::vector<std::size_t> positions;
+        std::vector<float> weights; std::vector<std::size_t> positions;
         for (std::size_t x = 0; x < target[axis]; ++x) {
             double q = x/spacing; positions.push_back(std::size_t(q));
             auto w = elastic_detail::weights(q-std::floor(q),true); weights.insert(weights.end(),w.begin(),w.end());
         }
-        Buffer<Real> w(std::vector<Real>(weights.begin(),weights.end())); Buffer<std::size_t> pos(positions);
+        Buffer<Real> w(weights); Buffer<std::size_t> pos(positions);
         auto next = std::make_shared<Buffer<Real>>(product(target)*dim);
         if (next->size<=UINT32_MAX && data->size<=UINT32_MAX)
             expand_controls<std::uint32_t><<<blocks(next->size),256,0,vcr::device::stream()>>>(data->ptr,next->ptr,Layout{Grid(shape)},Layout{Grid(target)},w.ptr,pos.ptr,axis);

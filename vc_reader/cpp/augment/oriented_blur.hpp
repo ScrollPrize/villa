@@ -27,9 +27,9 @@ inline ChannelPlan channel_parameters(const OrientedBlur& t, const Array& a, Ran
 }
 namespace oriented_detail {
 // Kernel radius max(1, ceil(3 sigma)); weights normalized in double.
-inline std::vector<double> kernel(double sigma) {
+template<class T = double> inline std::vector<T> kernel(double sigma) {
     const int radius = std::max(1, int(std::ceil(3 * sigma)));
-    std::vector<double> w(2 * radius + 1); double sum = 0;
+    std::vector<T> w(2 * radius + 1); double sum = 0;
     for (int k = -radius; k <= radius; ++k) sum += w[k + radius] = std::exp(-.5 * (k / sigma) * (k / sigma));
     for (auto& x : w) x /= std::max(sum, 1e-12);
     return w;
@@ -52,34 +52,38 @@ VCR_HD inline void basis(const double* axis, double* out) {
     cross3(along, a, b); normalize3(b);
 }
 // Trilinear sample at a zyx position, coordinates clamped into the grid.
-template<class T> VCR_HD double sample(const T* src, const std::size_t* shape, const double* q) {
-    long long lo[3]; double f[3];
+template<class T,class Real> VCR_HD T sample(const T* src, const std::size_t* shape, const Real* q) {
+    long long lo[3]; Real f[3];
     for (int a = 0; a < 3; ++a) {
-        const double x = q[a] < 0 ? 0 : q[a] > double(shape[a] - 1) ? double(shape[a] - 1) : q[a];
-        lo[a] = (long long)std::floor(x); f[a] = x - double(lo[a]);
+        const Real x = q[a] < 0 ? 0 : q[a] > Real(shape[a] - 1) ? Real(shape[a] - 1) : q[a];
+        lo[a] = (long long)std::floor(x); f[a] = x - Real(lo[a]);
     }
-    double value = 0;
+    T value = 0;
     for (int corner = 0; corner < 8; ++corner) {
-        double w = 1; std::size_t at = 0;
+        T w = 1; std::size_t at = 0;
         for (int a = 0; a < 3; ++a) {
             const int bit = (corner >> (2 - a)) & 1;
             w *= bit ? f[a] : 1 - f[a];
             long long x = lo[a] + bit; if (x >= (long long)shape[a]) x = (long long)shape[a] - 1;
             at = at * shape[a] + std::size_t(x);
         }
-        if (w) value += w * double(src[at]);
+        if (w) value += w * T(src[at]);
     }
     return value;
 }
 // One pass for voxel (z, y, x): sum of weighted samples along direction u.
-template<class T> VCR_HD double pass(const T* src, const std::size_t* shape, std::size_t z, std::size_t y, std::size_t x,
-                                     const double* u, const double* w, int radius) {
-    double sum = 0;
+template<class T,class Real> VCR_HD T pass(const T* src, const std::size_t* shape, std::size_t z, std::size_t y, std::size_t x,
+                                     const double* u, const T* w, int radius) {
+    T sum = 0;
     for (int k = -radius; k <= radius; ++k) {
-        const double q[3] = {double(z) + k * u[0], double(y) + k * u[1], double(x) + k * u[2]};
+        const Real q[3] = {Real(z) + Real(k) * Real(u[0]), Real(y) + Real(k) * Real(u[1]), Real(x) + Real(k) * Real(u[2])};
         sum += w[k + radius] * sample(src, shape, q);
     }
     return sum;
+}
+VCR_HD inline bool wide_coordinates(const std::size_t* shape,int radius) {
+    const auto extent=std::max(shape[0],std::max(shape[1],shape[2]));
+    return (double(extent)+radius)*8*std::numeric_limits<float>::epsilon()>1e-3;
 }
 // The axis of one channel plan: explicit/random values, or the target's first row.
 inline std::array<double, 3> axis(const OrientedBlur& t, const Sample& s, const ChannelPlan& c, const Array* vectors) {
@@ -97,11 +101,12 @@ inline void apply(const OrientedBlur& t, Sample& s, const Parameters& p) {
         auto& a = s.at(c.key).array; const auto shape = a.spatial(); Grid g(shape);
         double frame[9]; const auto axis = oriented_detail::axis(t, s, c, t.axis_from.empty() ? nullptr : &s.at(t.axis_from).array);
         oriented_detail::basis(axis.data(), frame);
-        auto values = a.channel(c.channel); std::vector<double> next(values.size());
+        const auto run = [&]<class T>() {
+        auto values = a.channel<T>(c.channel); std::vector<T> next(values.size());
         for (int pass = 0; pass < 3; ++pass) {
             const double sigma = c.values[pass ? 1 : 0];
             if (sigma <= 0) continue;
-            const auto w = oriented_detail::kernel(sigma); const int radius = int(w.size() / 2);
+            const auto w = oriented_detail::kernel<T>(sigma); const int radius = int(w.size() / 2);
             const auto* direction=frame+3*pass;
             int aligned=-1;
             for(int axis=0;axis<3;++axis)
@@ -111,12 +116,16 @@ inline void apply(const OrientedBlur& t, Sample& s, const Parameters& p) {
                 // Negative directions retain the original reversed tap order.
                 convolve_axis(values,next,g,aligned,w,Boundary::Nearest,direction[aligned]<0);
             }else{
+                const bool wide = sizeof(T)==8 || oriented_detail::wide_coordinates(shape.data(),radius);
                 for (std::size_t i = 0; i < g.size; ++i)
-                    next[i] = oriented_detail::pass(values.data(), shape.data(), g.coord(i, 0), g.coord(i, 1), g.coord(i, 2), direction, w.data(), radius);
+                    next[i] = wide ? oriented_detail::pass<T,double>(values.data(), shape.data(), g.coord(i, 0), g.coord(i, 1), g.coord(i, 2), direction, w.data(), radius)
+                                   : oriented_detail::pass<T,float>(values.data(), shape.data(), g.coord(i, 0), g.coord(i, 1), g.coord(i, 2), direction, w.data(), radius);
             }
             values.swap(next);
         }
         a.channel(c.channel, values);
+        };
+        if(a.bytes==4)run.template operator()<float>();else run.template operator()<double>();
     }
     restore_valid(s);
 }

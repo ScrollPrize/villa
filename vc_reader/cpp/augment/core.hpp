@@ -80,7 +80,7 @@ struct Random {
         // Match image precision for the expensive transcendental operations.
         // uniform() is strictly positive, including after conversion to float.
         const T radius = std::sqrt(T(-2) * std::log(T(uniform())));
-        const T angle = T(6.2831853071795864769 * uniform());
+        const T angle = T(6.2831853071795864769) * T(uniform());
         return {radius * std::cos(angle), radius * std::sin(angle)};
     }
 };
