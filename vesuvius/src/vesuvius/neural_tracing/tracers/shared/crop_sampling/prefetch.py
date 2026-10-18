@@ -18,7 +18,7 @@ import uuid
 import numpy as np
 
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import RemoteChunkedArray, chunk_lock_path, chunk_slices, open_remote_array, padded_chunk
-from vesuvius.neural_tracing.tracers.shared.io import atomic_write
+from vesuvius.neural_tracing.tracers.shared.io import atomic_write, lock_exclusive
 
 DEMAND, AHEAD = 0, 10
 COUNTERS = ('submitted', 'deferred', 'cached', 'completed', 'completed_bytes',
@@ -168,7 +168,6 @@ class AsyncFetcher:
             raise
 
     async def fetch(self, descriptor, key):
-        import fcntl
         path,_ = _paths(descriptor,key,self.session)
         if path.is_file():
             return 'cached',0
@@ -181,7 +180,7 @@ class AsyncFetcher:
         with lock_path.open('a+b') as lock:
             while True:
                 try:
-                    fcntl.flock(lock,fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    lock_exclusive(lock, blocking=False)
                     break
                 except BlockingIOError:
                     # Never block the event loop behind another process's chunk.

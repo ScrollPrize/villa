@@ -203,10 +203,23 @@ class GPUChunkCache:
 _GATHERS: dict = {}
 
 
+def _compiles_on(device):
+    """Whether inductor can compile for ``device``: CUDA needs Triton, which has no official Windows wheels."""
+    if device.type != 'cuda':
+        return True
+    try:
+        from torch.utils._triton import has_triton
+    except ImportError:  # a private torch helper: without it, look for the package itself
+        import importlib.util
+        return importlib.util.find_spec('triton') is not None
+    return has_triton()
+
+
 def _gather_trilinear(pool, table, anchor, rel, frame, local, bounds, shifts):
-    """The compiled gather for these chunk shifts (constants in the kernel)."""
+    """The compiled gather for these chunk shifts (constants in the kernel); eager where inductor cannot compile."""
     if shifts not in _GATHERS:
-        _GATHERS[shifts] = torch.compile(_gather_kernel(*shifts), dynamic=True)
+        kernel = _gather_kernel(*shifts)
+        _GATHERS[shifts] = torch.compile(kernel, dynamic=True) if _compiles_on(pool.device) else kernel
     return _GATHERS[shifts](pool, table, anchor, rel, frame, local, bounds)
 
 

@@ -141,6 +141,11 @@ VC3D's Line Annotation can trace its Fiber model lines with this model (hamburge
 for the Fiber model"; off by default) through `tracing/service.py`, which VC3D starts with the Python environment it
 was launched from: the default checkpoint unless one is chosen there.
 
+On native Windows (no `fcntl`, no official Triton wheels for Windows, no `vc` bindings in the win64 VC3D build), the
+chunk-cache locks use `msvcrt`, `--crops gpu` falls back to an eager (uncompiled) gather, and `tracing/service.py`
+reads CT through the remote chunk cache (`--cache-dir`, else `$XDG_CACHE_HOME/vesuvius/volume_cache`) with a
+printed warning when `vc` is missing.
+
 ## Evaluation
 
 ```bash
