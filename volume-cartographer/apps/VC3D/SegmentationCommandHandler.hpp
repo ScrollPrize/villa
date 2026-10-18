@@ -58,6 +58,8 @@ public:
         QString resumeOptMode{QStringLiteral("local")};
         int pass2OmpThreads{1};
         bool copyOut{true};
+        bool interactive{true};     // false => silent passes, no dialogs
+        bool cancelled{false};      // set by cancelNeighborCopy
         QSet<QString> baselineEntries;
         std::unique_ptr<QTemporaryFile> pass1JsonFile;
         std::unique_ptr<QTemporaryFile> pass2JsonFile;
@@ -146,6 +148,25 @@ public:
     };
 
     using AlphaCompRefineParams = AlphaCompRefineRequest;
+
+    // Arguments accepted by startNeighborCopy; defaults match the dialog.
+    struct NeighborCopyParams {
+        QString     volumeId;                 // empty => current volume
+        QString     outputDir;                // empty => <volpkg>/paths; relative =>
+                                              // against the volpkg root
+        int         neighborMaxDistance{200};
+        int         neighborMinClearance{4};
+        bool        neighborFill{true};
+        int         neighborInterpWindow{5};
+        int         generations{2};
+        int         neighborSpikeWindow{2};
+        int         resumeLocalOptStep{20};
+        int         resumeLocalOptRadius{40};
+        int         resumeLocalMaxIters{1000};
+        bool        resumeLocalDenseQr{false};
+        int         pass2OmpThreads{1};       // >= 1
+        QJsonObject pass2ParamOverrides;      // merged over the pass-2 tracer params
+    };
 
     // Arguments accepted by startConvertToObj. Options the dialog shows but
     // the conversion does not pass to vc_tifxyz2obj are omitted.
@@ -249,8 +270,8 @@ signals:
      * Emitted once when a segment operation that post-processes command-line
      * tool output reaches its terminal state, after that post-processing.
      * Emitted for interactive and dialog-free launches. `kind` names the
-     * operation ("rasterize"); `outputPath` is the produced artifact on
-     * success.
+     * operation ("rasterize", "neighbor_copy"); `outputPath` is the produced
+     * artifact on success.
      */
     void segmentOperationFinished(QString kind, bool success, QString message,
                                   QString outputPath);
@@ -378,6 +399,23 @@ public:
                                 CommandLaunchError* error = nullptr,
                                 RasterizeLaunch* launch = nullptr);
 
+    /// Dialog-free neighbor copy (two vc_grow_seg_from_seed passes). The
+    /// interactive slot gathers the same params from its dialog. Completion,
+    /// after the second pass, is reported by
+    /// segmentOperationFinished("neighbor_copy"). On success
+    /// `resolvedOutputDir` receives the output directory when provided.
+    bool startNeighborCopy(const QString& segmentId,
+                           bool copyOut,
+                           const NeighborCopyParams& params,
+                           CommandLaunchError* error = nullptr,
+                           QString* resolvedOutputDir = nullptr);
+
+    /// Cancels a running neighbor copy, including the hop between its passes:
+    /// a running pass's process is terminated and a queued second pass does
+    /// not start. The copy ends with segmentOperationFinished("neighbor_copy",
+    /// false, "Neighbor copy cancelled."). Returns false when none is running.
+    bool cancelNeighborCopy();
+
     /// Dialog-free core of onCropSurfaceToValidRegion (the interactive slot wraps
     /// this). Crops the surface grid to its tightest valid bounds, writes it in
     /// place, and refreshes metrics; failures via `errorMessage` (never a dialog)
@@ -478,6 +516,14 @@ private:
                                   QString* resolvedOutputDir);
     static QJsonObject alphaCompRefineParamsJson(
         const AlphaCompRefineParams& params);
+    bool startNeighborCopyImpl(const QString& segmentId,
+                               bool copyOut,
+                               const NeighborCopyParams& params,
+                               bool interactive,
+                               CommandLaunchError* error,
+                               QString* resolvedOutputDir);
+    void finishNeighborCopy(bool success, const QString& message,
+                            const QString& outputPath);
     bool launchConvertToObj(const QString& tifxyzPath,
                             const ConvertToObjParams& params,
                             CommandLineToolRunner::ExecutionOptions options);
