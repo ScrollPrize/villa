@@ -259,7 +259,8 @@ protected:
 
 private:
     QStringList collectGridNames() const;          // row-major, empties as ""
-    QString buildMergeJsonText() const;            // pretty JSON for preview + write
+    QVector<QStringList> collectGridRows() const;  // grid rows, empties as ""
+    QString buildMergeJsonText() const;            // pretty JSON for preview
     void rebuildPreview();
     void updateRefCombo();
     void resizeGrid(int newRows, int newCols);

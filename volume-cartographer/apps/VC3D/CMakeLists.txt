@@ -288,6 +288,8 @@ set(srcs
     CommandLineToolRunner.hpp
     ToolDialogs.cpp
     ToolDialogs.hpp
+    MergeTifxyzInputs.cpp
+    MergeTifxyzInputs.hpp
     ConsoleOutputWidget.cpp
     ConsoleOutputWidget.hpp
     CPointCollectionWidget.cpp

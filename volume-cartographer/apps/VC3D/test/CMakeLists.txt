@@ -712,3 +712,13 @@ add_test(NAME spiral_brush_patch COMMAND test_spiral_brush_patch)
 vc_register_test_target(test_spiral_brush_patch)
 vc_register_ctest(spiral_brush_patch test_spiral_brush_patch)
 set_tests_properties(spiral_brush_patch PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+add_executable(test_merge_tifxyz_inputs
+    test_merge_tifxyz_inputs.cpp
+    ../MergeTifxyzInputs.cpp ../MergeTifxyzInputs.hpp)
+set_target_properties(test_merge_tifxyz_inputs PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_merge_tifxyz_inputs PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_merge_tifxyz_inputs PRIVATE Qt6::Core Qt6::Test)
+add_test(NAME merge_tifxyz_inputs COMMAND test_merge_tifxyz_inputs)
+vc_register_test_target(test_merge_tifxyz_inputs)
+vc_register_ctest(merge_tifxyz_inputs test_merge_tifxyz_inputs)
