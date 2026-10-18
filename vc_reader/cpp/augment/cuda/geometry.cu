@@ -1,8 +1,9 @@
 #include "common.cuh"
 #include "geometry.cuh"
 namespace vcr::augment::cuda {
-struct GeometryArgs {
-    double matrix[9]{}, offset[3]{}, fill = 0;
+template<class Real> struct GeometryArgs {
+    Real matrix[9]{}, offset[3]{};
+    double fill = 0;
     bool border = false, nearest = false, validity = false;
     int mode = 0;
 };
@@ -25,7 +26,7 @@ template<class T, class Index> __global__ void reflect_kernel(const T* src, T* d
         dst[i]=validity ? T(value>=T(1)) : value;
     }
 }
-static int reflection_axes(const Parameters& p, const Shape& shape, const double* field) {
+static int reflection_axes(const Parameters& p, const Shape& shape, const float* field) {
     if (!p.exact || field || p.shape!=shape) return -1;
     unsigned reflected=0;
     for (std::size_t a=0;a<shape.size();++a) {
@@ -37,17 +38,17 @@ static int reflection_axes(const Parameters& p, const Shape& shape, const double
     }
     return int(reflected);
 }
-template<class T> __global__ void geometry_kernel(const T* src, T* dst, Layout in, Layout out, std::size_t channels, GeometryArgs p, const double* field, T pad, int* used_pad) {
+template<class T, class Real> __global__ void geometry_kernel(const T* src, T* dst, Layout in, Layout out, std::size_t channels, GeometryArgs<Real> p, const float* field, T pad, int* used_pad) {
     EACH_INDEX(out.size*channels) {
         const auto voxel = i%out.size, channel = i/out.size;
-        double q[3]{}, fraction[3]{}; long long lo[3]{};
+        Real q[3]{}, fraction[3]{}; long long lo[3]{};
         bool far = false;
         for (int a = 0; a < out.dim; ++a) {
-            for (int b = 0; b < out.dim; ++b) q[a] += p.matrix[a*out.dim+b]*double(out.coord(voxel,b));
+            for (int b = 0; b < out.dim; ++b) q[a] += p.matrix[a*out.dim+b]*Real(out.coord(voxel,b));
             q[a] += p.offset[a];
-            if (field) q[a] += field[voxel*out.dim+a];
-            if (p.border && !p.validity) q[a] = clamp_value(q[a],0,double(in.shape[a]-1));
-            if (!isfinite(q[a]) || q[a] < -1 || q[a] > double(in.shape[a])) { far = true; continue; }
+            if (field) q[a] += Real(field[voxel*out.dim+a]);
+            if (p.border && !p.validity) q[a] = fmin(fmax(q[a],Real(0)),Real(in.shape[a]-1));
+            if (!isfinite(q[a]) || q[a] < -1 || q[a] > Real(in.shape[a])) { far = true; continue; }
             lo[a] = static_cast<long long>(floor(q[a])); fraction[a] = q[a]-lo[a];
         }
         if (far) { dst[i] = p.validity ? T(p.fill>=1) : pad; if (used_pad) atomicExch(used_pad,1); continue; }
@@ -60,26 +61,27 @@ template<class T> __global__ void geometry_kernel(const T* src, T* dst, Layout i
             if (valid) dst[i] = src[channel*in.size+at];
             else { dst[i] = pad; if (used_pad) atomicExch(used_pad,1); }
         } else {
-            double value = 0; bool support = true;
+            using Value = std::conditional_t<std::is_same_v<T,double>,double,Real>;
+            Value value = 0; bool support = true;
             for (int corner = 0; corner < (1<<out.dim); ++corner) {
-                double weight = 1; std::size_t at = 0; bool valid = true;
+                Real weight = 1; std::size_t at = 0; bool valid = true;
                 for (int a = 0; a < out.dim; ++a) {
                     int bit = (corner>>a)&1; auto x = lo[a]+bit;
                     weight *= bit ? fraction[a] : 1-fraction[a];
                     if (x < 0 || x >= static_cast<long long>(in.shape[a])) valid = false; else at += x*in.stride[a];
                 }
                 if (weight) {
-                    const double neighbor = valid ? double(src[channel*in.size+at]) : p.fill;
+                    const Value neighbor = valid ? Value(src[channel*in.size+at]) : Value(p.fill);
                     if (p.validity) { if (neighbor < 1.) { support = false; break; } }
                     else value += weight*neighbor;
                 }
             }
-            if (p.validity) value = double(support);
+            if (p.validity) value = Value(support);
             dst[i] = T(value);
         }
     }
 }
-DeviceArray resample_cuda(const DeviceArray& src, const Parameters& p, bool nearest, double fill, bool validity, const double* field) {
+DeviceArray resample_cuda(const DeviceArray& src, const Parameters& p, bool nearest, double fill, bool validity, const float* field) {
     Shape shape{src.shape[0]}; shape.insert(shape.end(),p.shape.begin(),p.shape.end());
     DeviceArray out(shape,src.kind,src.bytes);
     Layout in{Grid(src.spatial())}, output{Grid(p.shape)};
@@ -94,19 +96,26 @@ DeviceArray resample_cuda(const DeviceArray& src, const Parameters& p, bool near
         });
         check(cudaGetLastError()); return out;
     }
-    GeometryArgs args{}; std::copy(p.matrix.begin(),p.matrix.end(),args.matrix); std::copy(p.offset.begin(),p.offset.end(),args.offset);
-    args.fill = fill; args.border = p.border; args.nearest = nearest; args.validity = validity; args.mode = p.nearest_mode;
-    src.typed([&](auto input) {
-        using T = typename decltype(input)::value_type;
-        T pad{}; bool fill_valid = true;
-        try { pad = Array::checked_cast<T>(fill); } catch (const std::invalid_argument&) { fill_valid = false; }
-        require(std::is_floating_point_v<T> || nearest || validity,"CUDA linear interpolation requires floating-point data");
-        Buffer<int> used(fill_valid || validity ? 0 : 1); int used_host = 0;
-        if (used.size) used.upload(&used_host);
-        geometry_kernel<<<blocks(out.size()),256,0,vcr::device::stream()>>>(input.ptr,out.view<T>().ptr,in,output,src.shape[0],args,field,pad,used.ptr);
-        check(cudaGetLastError());
-        if (used.size) { used.download(&used_host); require(!used_host,"value is not representable in target dtype"); }
-    });
+    // Bound float32 affine roundoff to < 0.001 voxel. Large coordinates or
+    // cancellation between large matrix/offset terms use float64 coordinates.
+    const bool narrow = !(src.kind == 'f' && src.bytes == 8) && geometry_float32(p, src.spatial());
+    const auto run = [&]<class Real>() {
+        GeometryArgs<Real> args{};
+        std::copy(p.matrix.begin(),p.matrix.end(),args.matrix); std::copy(p.offset.begin(),p.offset.end(),args.offset);
+        args.fill = fill; args.border = p.border; args.nearest = nearest; args.validity = validity; args.mode = p.nearest_mode;
+        src.typed([&](auto input) {
+            using T = typename decltype(input)::value_type;
+            T pad{}; bool fill_valid = true;
+            try { pad = Array::checked_cast<T>(fill); } catch (const std::invalid_argument&) { fill_valid = false; }
+            require(std::is_floating_point_v<T> || nearest || validity,"CUDA linear interpolation requires floating-point data");
+            Buffer<int> used(fill_valid || validity ? 0 : 1); int used_host = 0;
+            if (used.size) used.upload(&used_host);
+            geometry_kernel<<<blocks(out.size()),256,0,vcr::device::stream()>>>(input.ptr,out.view<T>().ptr,in,output,src.shape[0],args,field,pad,used.ptr);
+            check(cudaGetLastError());
+            if (used.size) { used.download(&used_host); require(!used_host,"value is not representable in target dtype"); }
+        });
+    };
+    if (narrow) run.template operator()<float>(); else run.template operator()<double>();
     return out;
 }
 DeviceArray resize_cuda(const DeviceArray& src, const Shape& shape, bool nearest, bool legacy) {
@@ -119,7 +128,7 @@ DeviceArray resize_cuda(const DeviceArray& src, const Shape& shape, bool nearest
 }
 void geometry_cuda(Sample& s, const Parameters& p, Session& session) {
     auto field = field_buffer(p.field,p.device_field);
-    const double* displacement = p.field.empty() && !p.device_field ? nullptr : field->ptr;
+    const float* displacement = p.field.empty() && !p.device_field ? nullptr : field->ptr;
     Sample specialized;
     for (auto& [key,f] : s) {
         auto role = f.target.role;

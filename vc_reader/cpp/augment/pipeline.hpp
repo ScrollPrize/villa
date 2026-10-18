@@ -126,7 +126,7 @@ inline void prepare(const Op& op, Sample& s, Random& r, Shape path, std::vector<
     }, op);
     if (record) {
         parameters.device_field.reset();
-        for (auto& c : parameters.channels) c.device_field.reset();
+        for (auto& c : parameters.channels) { c.device_field.reset(); c.device_indices.reset(); }
         record->push_back({std::move(path), std::move(parameters)});
     }
 }

@@ -443,15 +443,20 @@ struct ChannelOptions {
 struct ChannelPlan {
     std::string key;
     std::size_t channel = 0;
-    std::vector<double> values, field;
+    std::vector<double> values;
+    std::vector<float> field;
     std::uint64_t seed = 0;
     // Transient backend-owned field; materialized into field for replay.
     std::shared_ptr<void> device_field;
+    // Voxel indices are integers, not floating-point deformation samples.
+    std::vector<std::size_t> indices;
+    std::shared_ptr<void> device_indices;
 };
 struct Parameters {
     std::vector<ChannelPlan> channels;
     Shape shape;
-    std::vector<double> matrix, offset, field;
+    std::vector<double> matrix, offset;
+    std::vector<float> field;
     bool border = false, exact = false;
     std::shared_ptr<void> device_field;
     int nearest_mode = 0; // 0: ties-to-even, 1: half-up resize, 2: floor resize

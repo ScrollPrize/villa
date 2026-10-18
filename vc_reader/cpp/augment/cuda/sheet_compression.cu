@@ -12,7 +12,7 @@ __global__ void compression_prefix(double* values,Layout g,int axis,double stren
         }
     }
 }
-__global__ void compression_field(const double* values,double* field,Layout g,int axis) {
+__global__ void compression_field(const double* values,float* field,Layout g,int axis) {
     EACH_INDEX(g.size) for(int a=0;a<g.dim;++a) field[i*g.dim+a]=a==axis?-values[i]*double(g.shape[a]-1)/g.shape[a]:0;
 }
 Parameters sample_sheet(const SheetCompression& t,const Sample& s,Random& r,bool record,Session& session) {
@@ -24,7 +24,7 @@ Parameters sample_sheet(const SheetCompression& t,const Sample& s,Random& r,bool
     auto stats=statistics(data);
     compression_prefix<<<blocks(g.size/g.shape[chosen]),256,0,vcr::device::stream()>>>(values.ptr,Layout(g),int(chosen),strength,t.threshold,stats.ptr);
     if(smooth>.5) {std::vector<double> sigmas(d,smooth);sigmas[chosen]=0;blur(data,g,sigmas,6,Boundary::Mirror,true);}
-    auto field=std::make_shared<Buffer<double>>(g.size*d);
+    auto field=std::make_shared<Buffer<float>>(g.size*d);
     compression_field<<<blocks(g.size),256,0,vcr::device::stream()>>>(values.ptr,field->ptr,Layout(g),int(chosen));
     check(cudaGetLastError());p.device_field=field;p.border=true;
     if(record) {p.field.resize(field->size);field->download(p.field.data());}

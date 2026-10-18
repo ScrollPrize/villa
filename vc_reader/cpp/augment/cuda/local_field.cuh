@@ -1,7 +1,7 @@
 #pragma once
 #include "resident.cuh"
 namespace vcr::augment::cuda {
-std::shared_ptr<Buffer<double>> local_field(const LocalOptions&, const Grid&, Random&, bool centered);
+std::shared_ptr<Buffer<float>> local_field(const LocalOptions&, const Grid&, Random&, bool centered);
 template<class T> Parameters sample_local(const T& t, const Sample& s, Random& r, bool record) {
     return sample_channels(s,t.options,r,[&](const Array& a, Random& rng) {
         ChannelPlan c;

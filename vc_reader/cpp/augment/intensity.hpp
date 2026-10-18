@@ -73,7 +73,7 @@ inline std::vector<std::vector<double>> local_axes(const LocalOptions& t, const 
     }
     return kernels;
 }
-inline std::vector<double> local_kernel(const LocalOptions& t, const Grid& g, Random& r, bool centered = false) {
+inline std::vector<float> local_kernel(const LocalOptions& t, const Grid& g, Random& r, bool centered = false) {
     auto kernels = local_axes(t,g,r);
     // The nonnegative separable product is monotone in every axis, including
     // floating-point rounding. Its extrema occur at the per-axis extrema;
@@ -86,7 +86,7 @@ inline std::vector<double> local_kernel(const LocalOptions& t, const Grid& g, Ra
         low *= *lo; high *= *hi;
     }
     const double range = high - low;
-    std::vector<double> out(g.size);
+    std::vector<float> out(g.size);
     const auto dim = g.shape.size(), nz = dim == 3 ? g.shape[0] : 1;
     const auto ny = g.shape[dim - 2], nx = g.shape.back();
     for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y) {
@@ -105,7 +105,7 @@ inline std::vector<double> local_kernel(const LocalOptions& t, const Grid& g, Ra
     }
     if (centered) {
         double m = mean(out), maxabs = 0;
-        for (auto& v : out) maxabs = std::max(maxabs, std::abs(v -= m));
+        for (auto& v : out) maxabs = std::max(maxabs, double(std::abs(v -= m)));
         if (maxabs > 1e-8) for (auto& v : out) v /= maxabs;
     }
     return out;
@@ -150,7 +150,7 @@ inline ChannelPlan channel_parameters(const SliceIllumination& t, const Array& a
         require(width > 0, "illumination defect width must be positive");
         for (std::size_t i = 0; i < n; ++i) p.field[i] *= 1 - std::exp(-.5 * std::pow((i - pos) / width, 2)) * (1 - reduction);
     }
-    for (auto& v : p.field) v = std::clamp(v, .1, 1.);
+    for (auto& v : p.field) v = std::clamp(v, .1f, 1.f);
     double bp = draw(t.base_p, r); probability(bp);
     auto count = std::size_t(std::round(bp * n));
     std::vector<double> weights(n); for (std::size_t i = 0; i < n; ++i) weights[i] = 2 - p.field[i];
@@ -159,7 +159,7 @@ inline ChannelPlan channel_parameters(const SliceIllumination& t, const Array& a
         std::size_t i = 0; for (; i + 1 < n && threshold >= weights[i]; ++i) threshold -= weights[i];
         weights[i] = 0; p.field[i] *= draw(t.base_reduction, r);
     }
-    for (auto& v : p.field) v = std::clamp(v, .1, 2.);
+    for (auto& v : p.field) v = std::clamp(v, .1f, 2.f);
     return p;
 }
 inline ChannelPlan channel_parameters(const Smear& t, const Array& a, Random&) {
@@ -482,7 +482,7 @@ template<class Values> void channel_apply(const BrightnessGradient& t, Values& v
     auto [lo, hi] = std::minmax_element(v.begin(), v.end()); double low = *lo, high = *hi;
     for (std::size_t i = 0; i < v.size(); ++i) { double value = double(v[i]) + p.field[i] * p.values[0]; if (t.clip) value = std::clamp(value, low, high); v[i] = value; }
 }
-template<class Values> double local_mean(const Values& v, const std::vector<double>& field) {
+template<class Values> double local_mean(const Values& v, const std::vector<float>& field) {
     double sum = 0, weight = 1e-8;
     for (std::size_t i = 0; i < v.size(); ++i) { sum += v[i] * field[i]; weight += field[i]; }
     return sum / weight;

@@ -3,7 +3,7 @@ namespace vcr::augment::cuda {
 namespace {
 struct Function {
 
-    template<class T> __device__ double operator()(T x, std::size_t i, Layout g, const double* field, const Statistics* stats) const { return 2*stats->mean-double(x); }
+    template<class T> __device__ double operator()(T x, std::size_t i, Layout g, const float* field, const Statistics* stats) const { return 2*stats->mean-double(x); }
 };
 }
 void apply_cuda(const Invert& t, Sample& s, const Parameters& p, Session& session) {

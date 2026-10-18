@@ -2,14 +2,14 @@
 #include "core.hpp"
 
 namespace vcr::augment::elastic_detail {
-inline std::array<double,4> weights(double t,bool cubic) {
-    if (!cubic) return {1-t,t,0,0};
-    return {std::pow(1-t,3)/6,(3*t*t*t-6*t*t+4)/6,
-            (-3*t*t*t+3*t*t+3*t+1)/6,t*t*t/6};
+inline std::array<float,4> weights(double t,bool cubic) {
+    if (!cubic) return {float(1-t),float(t),0,0};
+    return {float(std::pow(1-t,3)/6),float((3*t*t*t-6*t*t+4)/6),
+            float((-3*t*t*t+3*t*t+3*t+1)/6),float(t*t*t/6)};
 }
 // Tensor-product linear or cardinal cubic B-spline expansion, in dimension-wise
 // separable passes. Controls have a one-knot left halo for cubic interpolation.
-inline std::vector<double> expand(std::vector<double> values, Shape shape,
+inline std::vector<float> expand(std::vector<float> values, Shape shape,
                                   const Shape& target_shape, double spacing, bool cubic,
                                   std::size_t first_axis=0) {
     require(shape.size()==target_shape.size() && spacing>=1 && std::isfinite(spacing), "invalid lattice");
@@ -17,7 +17,7 @@ inline std::vector<double> expand(std::vector<double> values, Shape shape,
     for (int axis=int(shape.size())-1;axis>=int(first_axis);--axis) {
         const auto edge=target_shape[axis];
         Grid input(shape); auto target=shape; target[axis]=edge; Grid output(target);
-        std::vector<double> next(output.size);
+        std::vector<float> next(output.size);
         const auto step=input.stride[axis], blocks=input.size/(shape[axis]*step);
         for (std::size_t x=0;x<edge;++x) {
             const double q=x/spacing, t=q-std::floor(q);
@@ -28,7 +28,7 @@ inline std::vector<double> expand(std::vector<double> values, Shape shape,
                 const auto* src=values.data()+(b*shape[axis]+lo)*step;
                 auto* dst=next.data()+(b*edge+x)*step;
                 for (std::size_t j=0;j<step;++j) {
-                    double value=0;
+                    float value=0;
                     for (std::size_t tap=0;tap<taps;++tap) value+=w[tap]*src[tap*step+j];
                     dst[j]=value;
                 }
@@ -41,25 +41,25 @@ inline std::vector<double> expand(std::vector<double> values, Shape shape,
 inline std::size_t controls(std::size_t edge,double spacing,bool cubic) {
     return std::size_t(std::floor((edge-1)/spacing))+(cubic ? 4 : 2);
 }
-inline std::vector<double> draw_controls(const Shape& knots, Random& rng) {
-    std::vector<double> values(product(knots));
+inline std::vector<float> draw_controls(const Shape& knots, Random& rng) {
+    std::vector<float> values(product(knots));
     for (auto& value:values) value=rng.normal();
     return values;
 }
 
 // Component-major control draws match the inspected experimental B-spline field.
 template<std::size_t D>
-std::vector<double> bspline_field_impl(const Shape& shape,double spacing,Random& rng) {
+std::vector<float> bspline_field_impl(const Shape& shape,double spacing,Random& rng) {
     Grid g(shape); constexpr auto d=D; Shape knots;
     for (auto n:shape) knots.push_back(controls(n,spacing,true));
-    std::array<std::vector<double>,D> components;
+    std::array<std::vector<float>,D> components;
     for (auto& v:components) {
         v=draw_controls(knots,rng);
         // Leave the outermost interpolation for the final interleaved write.
         // This avoids allocating and copying D full-resolution component arrays.
         v=expand(std::move(v),knots,shape,spacing,true,1);
     }
-    std::vector<double> field(d*g.size);
+    std::vector<float> field(d*g.size);
     std::array<double,D> sums{};
     const auto slab=g.stride[0];
     for (std::size_t z=0;z<shape[0];++z) {
@@ -67,7 +67,7 @@ std::vector<double> bspline_field_impl(const Shape& shape,double spacing,Random&
         const auto w=weights(q-std::floor(q),true);
         for (std::size_t i=0;i<slab;++i) for (std::size_t c=0;c<d;++c) {
             const auto* src=components[c].data()+lo*slab+i;
-            double value=0;
+            float value=0;
             for (std::size_t tap=0;tap<4;++tap) value+=w[tap]*src[tap*slab];
             field[(z*slab+i)*d+c]=value;
             sums[c]+=value; // Same per-component reduction order as mean().
@@ -77,7 +77,7 @@ std::vector<double> bspline_field_impl(const Shape& shape,double spacing,Random&
     for (std::size_t i=0;i<g.size;++i) for (std::size_t c=0;c<d;++c) field[d*i+c]-=sums[c];
     return field;
 }
-inline std::vector<double> bspline_field(const Shape& shape,double spacing,Random& rng) {
+inline std::vector<float> bspline_field(const Shape& shape,double spacing,Random& rng) {
     require(shape.size()==2 || shape.size()==3,"elastic needs a 2D or 3D grid");
     require(std::isfinite(spacing) && spacing>=1,"invalid knot spacing");
     return shape.size()==3 ? bspline_field_impl<3>(shape,spacing,rng) : bspline_field_impl<2>(shape,spacing,rng);
@@ -89,7 +89,7 @@ inline std::vector<double> bspline_field(const Shape& shape,double spacing,Rando
 // grid-edge differences. The sum of their componentwise maxima bounds every
 // Jacobian row, including between voxels; identity+field is then injective.
 template<std::size_t D>
-double normalize_impl(std::vector<double>& field,const Shape& shape,double rms,double bound) {
+double normalize_impl(std::vector<float>& field,const Shape& shape,double rms,double bound) {
     require(rms>=0 && std::isfinite(rms) && bound>0 && bound<1,"invalid strength/gradient bound");
     Grid g(shape); constexpr auto d=D; require(field.size()==d*g.size,"field shape mismatch");
     // Independent accumulators allow SIMD without enabling global fast-math.
@@ -123,11 +123,11 @@ double normalize_impl(std::vector<double>& field,const Shape& shape,double rms,d
                 const auto index=d*(base+x+lane)+c;
                 const auto current=field[index];
                 if constexpr (d==3) if (z+1<nz)
-                    lane_max[0][lane][c]=std::max(lane_max[0][lane][c],std::abs(field[index+d*ny*nx]-current));
+                    lane_max[0][lane][c]=std::max(lane_max[0][lane][c],double(std::abs(field[index+d*ny*nx]-current)));
                 if (y+1<ny)
-                    lane_max[d-2][lane][c]=std::max(lane_max[d-2][lane][c],std::abs(field[index+d*nx]-current));
+                    lane_max[d-2][lane][c]=std::max(lane_max[d-2][lane][c],double(std::abs(field[index+d*nx]-current)));
                 if (right)
-                    lane_max[d-1][lane][c]=std::max(lane_max[d-1][lane][c],std::abs(field[index+d]-current));
+                    lane_max[d-1][lane][c]=std::max(lane_max[d-1][lane][c],double(std::abs(field[index+d]-current)));
             }
         };
         std::size_t x=0;
@@ -142,7 +142,7 @@ double normalize_impl(std::vector<double>& field,const Shape& shape,double rms,d
     for (auto& v:field) v*=factor;
     return factor;
 }
-inline double normalize(std::vector<double>& field,const Shape& shape,double rms,double bound) {
+inline double normalize(std::vector<float>& field,const Shape& shape,double rms,double bound) {
     require(shape.size()==2 || shape.size()==3,"elastic needs a 2D or 3D grid");
     return shape.size()==3 ? normalize_impl<3>(field,shape,rms,bound) : normalize_impl<2>(field,shape,rms,bound);
 }

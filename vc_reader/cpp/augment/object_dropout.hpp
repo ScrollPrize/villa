@@ -7,7 +7,7 @@ struct ObjectDropout {std::string mask="mask";std::size_t mask_channel=0;double 
 struct ObjectDropoutKernel {
     double probability,threshold;std::uint64_t seed;
     VCR_HD static std::size_t root(std::size_t* parents,std::size_t i){while(parents[i]!=i){parents[i]=parents[parents[i]];i=parents[i];}return i;}
-    template<class T> VCR_HD void operator()(const T* mask,const volume_detail::Grid3& g,double* field,std::size_t* parents)const{
+    template<class T> VCR_HD void operator()(const T* mask,const volume_detail::Grid3& g,float* field,std::size_t* parents)const{
         for(std::size_t i=0;i<g.size;++i)parents[i]=i;
         for(std::size_t i=0;i<g.size;++i)if(double(mask[i])>threshold)for(int a=0;a<3;++a)if(g.coord(i,a)>0){auto j=i-g.stride[a];if(mask[j]==mask[i]){auto x=root(parents,i),y=root(parents,j);if(x!=y)parents[x>y?x:y]=x<y?x:y;}}
         for(std::size_t i=0;i<g.size;++i)field[i]=double(mask[i])>threshold && volume_detail::uniform(seed,root(parents,i))<probability;

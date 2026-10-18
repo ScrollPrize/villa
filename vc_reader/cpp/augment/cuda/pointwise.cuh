@@ -1,7 +1,7 @@
 #pragma once
 #include "channel.cuh"
 namespace vcr::augment::cuda {
-template<class T, class Function> __global__ void pointwise_kernel(View<T> data, Layout g, const double* field, const Statistics* stats, Function fn) {
+template<class T, class Function> __global__ void pointwise_kernel(View<T> data, Layout g, const float* field, const Statistics* stats, Function fn) {
     EACH_INDEX(data.size) {
         const auto y = fn(data.ptr[i],i,g,field,stats);
         if constexpr (std::is_same_v<decltype(y), const double>) data.ptr[i] = from_double<T>(y);

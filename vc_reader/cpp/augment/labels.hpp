@@ -156,7 +156,7 @@ inline std::vector<std::vector<std::size_t>> connected_components(const std::vec
 
 inline void remove_component(Array& a, const ChannelPlan& p) {
     auto n = product(a.spatial());
-    for (auto index : p.field) { auto i = std::size_t(index); a.set(p.channel * n + i, 0); if (p.values[0] >= 0) a.set(std::size_t(p.values[0]) * n + i, 1); }
+    for (auto i : p.indices) { a.set(p.channel * n + i, 0); if (p.values[0] >= 0) a.set(std::size_t(p.values[0]) * n + i, 1); }
 }
 inline Parameters sample(const RemoveComponents& t, const Sample& s, Random& r) {
     probability(t.max_fraction); auto a = s.at(t.on).array; Grid g(a.spatial()); Parameters p;
@@ -165,7 +165,7 @@ inline Parameters sample(const RemoveComponents& t, const Sample& s, Random& r) 
         auto components = connected_components(a.channel(c), g, t.full_connectivity);
         components.erase(std::remove_if(components.begin(), components.end(), [&](const auto& v) { return v.size() >= g.size * t.max_fraction; }), components.end());
         if (components.empty()) continue;
-        ChannelPlan plan{t.on, c, {-1}}; for (auto i : components[r.index(components.size())]) plan.field.push_back(double(i));
+        ChannelPlan plan{t.on, c, {-1}}; plan.indices = components[r.index(components.size())];
         if (r.chance(t.p_fill) && channels.size() > 1) { auto others = channels; others.erase(std::remove(others.begin(), others.end(), c), others.end()); plan.values[0] = double(others[r.index(others.size())]); }
         remove_component(a, plan); p.channels.push_back(std::move(plan));
     }

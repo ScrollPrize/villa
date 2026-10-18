@@ -7,9 +7,9 @@ namespace {
 struct Transform {
     double matrix[9]{}, inverse[9]{}, offset[3]{};
     Layout grid;
-    const double* field = nullptr;
+    const float* field = nullptr;
     int component[3]{};  // spatial axis of each stored component
-    explicit Transform(const Parameters& p, const Target& t, const double* f) : grid(Grid(p.shape)), field(f) {
+    explicit Transform(const Parameters& p, const Target& t, const float* f) : grid(Grid(p.shape)), field(f) {
         const auto d = p.shape.size(); const auto inv = vcr::augment::inverse(p.matrix,d);
         std::copy(p.matrix.begin(),p.matrix.end(),matrix); std::copy(inv.begin(),inv.end(),inverse);
         std::copy(p.offset.begin(),p.offset.end(),offset);
@@ -141,7 +141,7 @@ template<class T> __global__ void compact_rows(const T* data, T* out, const unsi
 }
 } // namespace
 
-void directional_cuda(DeviceArray& a, const Target& target, const Parameters& p, const double* field, Session& session) {
+void directional_cuda(DeviceArray& a, const Target& target, const Parameters& p, const float* field, Session& session) {
     Transform t(p,target,field);
     a.typed([&](auto view) {
         using T = typename decltype(view)::value_type;
@@ -150,7 +150,7 @@ void directional_cuda(DeviceArray& a, const Target& target, const Parameters& p,
     });
     check(cudaGetLastError());
 }
-void sparse_cuda(DeviceArray& a, const Target& target, const Parameters& p, const double* field, Session& session) {
+void sparse_cuda(DeviceArray& a, const Target& target, const Parameters& p, const float* field, Session& session) {
     require(target.role != Role::Vectors || !field, "nonlinear transforms of sparse vectors require locations; use a vector field");
     Transform t(p,target,field);
     const auto count = a.shape[0], d = a.shape[1];

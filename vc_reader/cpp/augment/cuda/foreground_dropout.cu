@@ -2,7 +2,7 @@
 #include "dropout_mask.cuh"
 #include "foreground_selection.cuh"
 namespace vcr::augment::cuda {
-template<class T> __global__ void foreground_holes(ForegroundDropoutKernel kernel,const T* mask,volume_detail::Grid3 grid,const ForegroundCount* centers,double* field) {
+template<class T> __global__ void foreground_holes(ForegroundDropoutKernel kernel,const T* mask,volume_detail::Grid3 grid,const ForegroundCount* centers,float* field) {
     EACH_INDEX(grid.size) {
         bool erase=false;
         if(double(mask[i])>kernel.threshold)for(std::size_t h=0;h<kernel.count && !erase;++h) {
@@ -14,7 +14,7 @@ template<class T> __global__ void foreground_holes(ForegroundDropoutKernel kerne
     }
 }
 Parameters sample_dropout(const ForegroundDropout& t,const Sample& s,Random& r,bool record,Session& session){
-    auto kernel=sample_holes(t,r);volume_detail::mask_field(s,t.mask,t.mask_channel);auto p=volume_detail::select_dropout_channels(t.options,s,r);volume_detail::Grid3 g(p.shape);auto field=std::make_shared<Buffer<double>>(g.size);
+    auto kernel=sample_holes(t,r);volume_detail::mask_field(s,t.mask,t.mask_channel);auto p=volume_detail::select_dropout_channels(t.options,s,r);volume_detail::Grid3 g(p.shape);auto field=std::make_shared<Buffer<float>>(g.size);
     Buffer<ForegroundCount> prefix(g.size),centers(kernel.count);
     session.arrays.at(t.mask).typed([&](auto v){
         foreground_prefix(v.ptr+t.mask_channel*g.size,g.size,t.threshold,prefix);choose_foreground_indices(prefix,kernel.seed,centers,true);

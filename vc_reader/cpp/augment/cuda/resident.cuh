@@ -68,12 +68,12 @@ struct Session {
 };
 // Fields are already resident for newly sampled CUDA operations. Legacy/loaded
 // replay plans upload their recorded field once for the operation.
-inline std::shared_ptr<Buffer<double>> field_buffer(const std::vector<double>& field, const std::shared_ptr<void>& device) {
-    return device ? std::static_pointer_cast<Buffer<double>>(device) : std::make_shared<Buffer<double>>(field);
+inline std::shared_ptr<Buffer<float>> field_buffer(const std::vector<float>& field, const std::shared_ptr<void>& device) {
+    return device ? std::static_pointer_cast<Buffer<float>>(device) : std::make_shared<Buffer<float>>(field);
 }
 struct Statistics { double mean, low, high, deviation; };
-Buffer<Statistics> statistics(View<float>, bool deviation = false, const double* weights = nullptr);
+Buffer<Statistics> statistics(View<float>, bool deviation = false, const float* weights = nullptr);
 // Sets `bit` in flags when max(|low|, |high|) exceeds limit.
 void flag_magnitude(const Buffer<Statistics>&, double limit, int* flags, int bit);
-Buffer<Statistics> statistics(View<double>, bool deviation = false, const double* weights = nullptr);
+Buffer<Statistics> statistics(View<double>, bool deviation = false, const float* weights = nullptr);
 } // namespace vcr::augment::cuda

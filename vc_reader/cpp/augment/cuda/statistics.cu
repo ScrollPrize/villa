@@ -1,7 +1,7 @@
 #include "resident.cuh"
 #include "statistics.cuh"
 namespace vcr::augment::cuda {
-template<class T, bool Variance> __global__ void collect(View<T> input, Partial* output, const double* weights, const Statistics* stats) {
+template<class T, bool Variance> __global__ void collect(View<T> input, Partial* output, const float* weights, const Statistics* stats) {
     __shared__ Partial values[256];
     Partial p{0,0,INFINITY,-INFINITY};
     // Versioned on the uniform weights test. Unweighted, the weight stays +0
@@ -34,7 +34,7 @@ __global__ void finish_stats(const Partial* input, unsigned count, std::size_t n
         else *output = {q.sum/(weighted ? q.weight+1e-8 : double(n)),q.low,q.high,0};
     }
 }
-template<class T> Buffer<Statistics> stats_impl(View<T> data, bool deviation, const double* weights) {
+template<class T> Buffer<Statistics> stats_impl(View<T> data, bool deviation, const float* weights) {
     const unsigned count = std::min(blocks(data.size),1024u);
     Buffer<Partial> partial(count); Buffer<Statistics> result(1);
     collect<T,false><<<count,256,0,vcr::device::stream()>>>(data,partial.ptr,weights,nullptr);
@@ -51,6 +51,6 @@ __global__ void magnitude_flag(const Statistics* s, double limit, int* flags, in
 void flag_magnitude(const Buffer<Statistics>& s, double limit, int* flags, int bit) {
     magnitude_flag<<<1,1,0,vcr::device::stream()>>>(s.ptr,limit,flags,bit); check(cudaGetLastError());
 }
-Buffer<Statistics> statistics(View<float> v, bool d, const double* w) { return stats_impl(v,d,w); }
-Buffer<Statistics> statistics(View<double> v, bool d, const double* w) { return stats_impl(v,d,w); }
+Buffer<Statistics> statistics(View<float> v, bool d, const float* w) { return stats_impl(v,d,w); }
+Buffer<Statistics> statistics(View<double> v, bool d, const float* w) { return stats_impl(v,d,w); }
 } // namespace vcr::augment::cuda

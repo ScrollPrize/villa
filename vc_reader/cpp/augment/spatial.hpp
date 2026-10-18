@@ -305,6 +305,21 @@ inline void apply_geometry_with(Sample& sample, const Parameters& p, Resample&& 
     restore_valid(sample);
 }
 inline void apply_geometry(Sample& sample, const Parameters& p) { apply_geometry_with(sample, p, resample); }
+// Float32 has enough resolution for ordinary crop-local resampling. Use a
+// conservative absolute error budget; large coordinates/cancelling affine terms
+// need more mantissa bits.
+inline bool geometry_float32(const Parameters& p, const Shape& input) {
+    constexpr double budget = 1e-3, roundoff = 8 * std::numeric_limits<float>::epsilon();
+    for (std::size_t a=0;a<p.shape.size();++a) {
+        double bound=std::abs(p.offset[a]);
+        for (std::size_t b=0;b<p.shape.size();++b) bound += std::abs(p.matrix[a*p.shape.size()+b])*double(p.shape[b]-1);
+        // For in-bounds samples, |displacement| <= |affine| + input extent.
+        // Coordinates far outside the input require no subvoxel precision.
+        bound = 2*bound + double(input[a]) + 1;
+        if (bound*roundoff > budget) return false;
+    }
+    return true;
+}
 inline Parameters geometry(Shape shape) { Parameters p; p.matrix = identity(shape.size()); p.offset.assign(shape.size(), 0); p.shape = std::move(shape); return p; }
 struct Flip { std::string axes; double p_axis = .5, p = 1; };
 struct Rotate90 { std::vector<std::string> planes; Choice turns{{1, 2, 3}}; bool resize = false; double p = 1; };
@@ -422,7 +437,7 @@ inline Parameters sample(const SheetCompression& t, const Sample& s, Random& r) 
                 if (x) values[i] += values[i - step];
             }
     if (smooth > .5) { std::vector<double> sigmas(d, smooth); sigmas[chosen] = 0; gaussian_blur(values, g, sigmas, 6, Boundary::Mirror, true); }
-    p.field = std::vector<double>(g.size * d);
+    p.field = std::vector<float>(g.size * d);
     for (std::size_t i = 0; i < g.size; ++i) p.field[i * d + chosen] = -values[i] * double(g.shape[chosen] - 1) / g.shape[chosen];
     p.border = true; return p;
 }

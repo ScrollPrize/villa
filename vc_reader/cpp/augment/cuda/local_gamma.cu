@@ -3,7 +3,7 @@ namespace vcr::augment::cuda {
 namespace {
 struct Function {
     double gamma;
-    template<class T> __device__ double operator()(T x, std::size_t i, Layout g, const double* field, const Statistics* stats) const { double span = fmax(stats->high-stats->low,1e-8), norm = (double(x)-stats->low)/span; return (norm*(1-field[i])+power<T>(norm,gamma)*field[i])*span+stats->low; }
+    template<class T> __device__ double operator()(T x, std::size_t i, Layout g, const float* field, const Statistics* stats) const { double span = fmax(stats->high-stats->low,1e-8), norm = (double(x)-stats->low)/span; return (norm*(1-field[i])+power<T>(norm,gamma)*field[i])*span+stats->low; }
 };
 }
 void apply_cuda(const LocalGamma& t, Sample& s, const Parameters& p, Session& session) {

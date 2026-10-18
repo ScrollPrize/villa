@@ -40,10 +40,8 @@ template<class Real> __global__ void scale_factor(Real* stats, Layout g, double 
     if (limit) factor = fmin(factor,Real(.8)/limit);
     stats[0] = factor;
 }
-__global__ void field_scale(const float* field, const float* factor, double* output, std::size_t n) {
-    // Round construction to float32, then retain the existing geometry/replay
-    // representation. Fuse scaling and widening to avoid another full pass.
-    EACH_INDEX(n) output[i] = widen(field[i]*factor[0]);
+__global__ void field_scale(float* field, const float* factor, std::size_t n) {
+    EACH_INDEX(n) field[i] *= factor[0];
 }
 Parameters sample_elastic(const Elastic& t, const Sample& s, Random& r, bool record) {
     using Real = float;
@@ -83,11 +81,10 @@ Parameters sample_elastic(const Elastic& t, const Sample& s, Random& r, bool rec
     // Normalization is invariant across the field. Compute the square root and
     // gradient cap once, rather than in every voxel/component thread.
     scale_factor<<<1,1,0,vcr::device::stream()>>>(stats.ptr,g,magnitude);
-    auto final_field = std::make_shared<Buffer<double>>(data->size);
-    field_scale<<<blocks(data->size),256,0,vcr::device::stream()>>>(data->ptr,stats.ptr,final_field->ptr,data->size);
+    field_scale<<<blocks(data->size),256,0,vcr::device::stream()>>>(data->ptr,stats.ptr,data->size);
     check(cudaGetLastError());
-    p.device_field = final_field;
-    if (record) { p.field.resize(final_field->size); final_field->download(p.field.data()); }
+    p.device_field = data;
+    if (record) { p.field.resize(data->size); data->download(p.field.data()); }
     return p;
 }
 void apply_cuda(const Elastic&, Sample& s, const Parameters& p, Session& session) { geometry_cuda(s,p,session); }
