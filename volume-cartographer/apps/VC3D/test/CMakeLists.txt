@@ -732,3 +732,13 @@ target_link_libraries(test_segment_files PRIVATE Qt6::Core Qt6::Test utils)
 add_test(NAME segment_files COMMAND test_segment_files)
 vc_register_test_target(test_segment_files)
 vc_register_ctest(segment_files test_segment_files)
+
+add_executable(test_project_locations
+    test_project_locations.cpp
+    ../ProjectLocations.cpp ../ProjectLocations.hpp)
+set_target_properties(test_project_locations PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_project_locations PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_project_locations PRIVATE Qt6::Core Qt6::Test vc_core)
+add_test(NAME project_locations COMMAND test_project_locations)
+vc_register_test_target(test_project_locations)
+vc_register_ctest(project_locations test_project_locations)

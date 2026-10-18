@@ -218,6 +218,8 @@ set(srcs
     VolumeAttachmentController.hpp
     ProjectAttachmentController.cpp
     ProjectAttachmentController.hpp
+    ProjectLocations.cpp
+    ProjectLocations.hpp
     UnifiedBrowserDialog.cpp
     UnifiedBrowserDialog.hpp
     segmentation/SegmentationModule.cpp

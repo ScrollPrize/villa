@@ -30,8 +30,6 @@
 #include "vc/core/Version.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/LoadJson.hpp"
-#include "vc/core/util/ScrollUmbilicus.hpp"
-#include "vc/core/util/Umbilicus.hpp"
 #include "vc/core/util/VolpkgConvert.hpp"
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/lasagna/Dataset.hpp"
@@ -1896,17 +1894,13 @@ void MenuActionController::attachNormalGrid()
                               settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
                               {}, false, true);
     if (loc.isEmpty()) return;
-    const auto err = vc::project::validateLocation(vc::project::Category::NormalGrids, loc.toStdString());
-    if (!err.empty()) {
-        QMessageBox::warning(_window, QObject::tr("Attach failed"),
-            QObject::tr("Not a valid normal-grid location:\n\n%1").arg(QString::fromStdString(err)));
-        return;
+    const auto outcome = _window->_projectAttachmentController->attachNormalGrid(loc);
+    if (!outcome.success) {
+        QMessageBox::warning(_window, QObject::tr("Attach failed"), outcome.error);
+    } else if (!outcome.changed) {
+        QMessageBox::information(_window, QObject::tr("Attach Normal Grid"),
+            QObject::tr("This normal grid is already attached."));
     }
-    if (!_window->_state->vpkg()->addNormalGridEntry(loc.toStdString())) {
-        QMessageBox::warning(_window, QObject::tr("Attach failed"), QObject::tr("Could not add normal grid (already attached?)"));
-        return;
-    }
-    _window->refreshCurrentVolumePackageUi(QString(), true);
 }
 
 void MenuActionController::attachUmbilicus()
@@ -1922,49 +1916,14 @@ void MenuActionController::attachUmbilicus()
         QObject::tr("Umbilicus (*.json)"));
     if (file.isEmpty()) return;
 
-    vc::core::util::UmbilicusFileInfo info;
-    try {
-        info = vc::core::util::Umbilicus::LoadFileInfo(
-            std::filesystem::path(file.toStdString()));
-    } catch (const std::exception& e) {
-        QMessageBox::warning(_window, QObject::tr("Attach failed"),
-            QObject::tr("%1 is not a valid umbilicus file:\n\n%2")
-                .arg(file, QString::fromUtf8(e.what())));
+    const auto outcome = _window->_projectAttachmentController->attachUmbilicus(file);
+    if (!outcome.success) {
+        QMessageBox::warning(_window, QObject::tr("Attach failed"), outcome.error);
         return;
     }
-
-    // Malformed metadata makes the file unusable until it is fixed — the
-    // resolver refuses it — so attaching it would store an attachment nothing
-    // can use and report success beside a warning. Rejected instead, naming
-    // the errors; fix the file and attach again.
-    if (!info.metadataErrors.empty()) {
-        QStringList errors;
-        errors.reserve(static_cast<int>(info.metadataErrors.size()));
-        for (const auto& error : info.metadataErrors) {
-            errors << QString::fromStdString(error);
-        }
-        QMessageBox::warning(_window, QObject::tr("Attach failed"),
-            QObject::tr("%1 declares malformed frame metadata and was not "
-                        "attached:\n\n%2")
-                .arg(QFileInfo(file).fileName(), errors.join(QStringLiteral("\n"))));
-        return;
-    }
-
-    pkg->setUmbilicus(file.toStdString());
-    // Consumers that placed geometry relative to the old umbilicus have no other
-    // way to learn this happened.
-    _window->_state->notifyUmbilicusChanged();
-    if (_window->statusBar()) {
-        _window->showStatusBarMessage(
-            QObject::tr("Attached umbilicus %1").arg(QFileInfo(file).fileName()), 5000);
-    }
-    if (!vc::core::util::umbilicusFrameClaim(info).any()) {
-        // Dimensions alone are a complete statement — the preferred one, in fact,
-        // being exact integer counts — so warning about a missing voxelsize_um
-        // there would call the better-stamped file unstamped.
+    if (!outcome.warnings.isEmpty()) {
         QMessageBox::information(_window, QObject::tr("Attach Umbilicus"),
-            QObject::tr("%1 declares no frame, so consumers may have to guess "
-                        "the grid its coordinates index.").arg(QFileInfo(file).fileName()));
+                                 outcome.warnings.join(QStringLiteral("\n\n")));
     }
 }
 
@@ -1974,23 +1933,13 @@ void MenuActionController::detachUmbilicus()
         QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
         return;
     }
-    auto pkg = _window->_state->vpkg();
-    const auto configured = pkg->umbilicus();
+    const auto outcome = _window->_projectAttachmentController->detachUmbilicus();
+    const auto configured = outcome.changed ? outcome.location.toStdString() : std::string{};
     if (configured.empty()) {
         QMessageBox::information(_window, QObject::tr("Detach Umbilicus"),
             QObject::tr("No umbilicus is attached — the project already resolves one "
                         "automatically."));
         return;
-    }
-    // Clearing the field persists the project and restores automatic
-    // resolution; the umbilicus is a single-valued field, so it is not part of
-    // the entry-based Detach dialog.
-    pkg->setUmbilicus({});
-    _window->_state->notifyUmbilicusChanged();
-    if (_window->statusBar()) {
-        _window->showStatusBarMessage(
-            QObject::tr("Detached umbilicus %1; resolution is automatic again")
-                .arg(QString::fromStdString(configured)), 5000);
     }
 }
 
@@ -2072,7 +2021,7 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote, const QSt
     const bool fiberInference = role == QObject::tr("Fiber inference");
 
     QPointer<MenuActionController> guard(this);
-    QString startError;
+    ProjectAttachmentOutcome refusal;
     const bool started = _window->_projectAttachmentController->startLasagnaAttachment(
         location, fiberInference,
         [guard](const ProjectAttachmentOutcome& outcome) {
@@ -2085,9 +2034,9 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote, const QSt
             if (!outcome.success)
                 QMessageBox::warning(guard->_window, QObject::tr("Attach Lasagna failed"), outcome.error);
         },
-        &startError);
+        &refusal);
     if (!started) {
-        QMessageBox::warning(_window, QObject::tr("Attach failed"), startError);
+        QMessageBox::warning(_window, QObject::tr("Attach failed"), refusal.error);
         return;
     }
     _attachLasagnaManifestAct->setEnabled(false);
@@ -2103,22 +2052,27 @@ void MenuActionController::detachEntry()
     auto pkg = _window->_state->vpkg();
     QStringList items;
     QStringList locations;
+    std::vector<ProjectEntryKind> kinds;
     for (const auto& e : pkg->volumeEntries()) {
         items << QObject::tr("[volume] %1").arg(QString::fromStdString(e.location));
         locations << QString::fromStdString(e.location);
+        kinds.push_back(ProjectEntryKind::Volume);
     }
     for (const auto& e : pkg->segmentEntries()) {
         items << QObject::tr("[segments] %1").arg(QString::fromStdString(e.location));
         locations << QString::fromStdString(e.location);
+        kinds.push_back(ProjectEntryKind::Segments);
     }
     for (const auto& e : pkg->normalGridEntries()) {
         items << QObject::tr("[normal_grid] %1").arg(QString::fromStdString(e.location));
         locations << QString::fromStdString(e.location);
+        kinds.push_back(ProjectEntryKind::NormalGrid);
     }
     for (const auto& e : pkg->allLasagnaDatasetEntries()) {
         const bool fiber = vc::project::isFiberLasagnaEntry(e);
         items << QObject::tr("[%1 Lasagna] %2").arg(fiber ? QObject::tr("fiber") : QObject::tr("regular"), QString::fromStdString(e.location));
         locations << QString::fromStdString(e.location);
+        kinds.push_back(ProjectEntryKind::Lasagna);
     }
     if (items.isEmpty()) {
         QMessageBox::information(_window, QObject::tr("Detach"),
@@ -2138,12 +2092,10 @@ void MenuActionController::detachEntry()
             QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) {
         return;
     }
-    if (!pkg->removeEntry(loc.toStdString())) {
-        QMessageBox::warning(_window, QObject::tr("Detach failed"),
-            QObject::tr("Could not remove entry (not found)."));
-        return;
+    const auto outcome = _window->_projectAttachmentController->detachEntry(kinds.at(idx), loc);
+    if (!outcome.success) {
+        QMessageBox::warning(_window, QObject::tr("Detach failed"), outcome.error);
     }
-    _window->refreshCurrentVolumePackageUi(QString(), true);
 }
 
 void MenuActionController::setOutputSegments()

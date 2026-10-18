@@ -14,16 +14,35 @@
 
 #include "CState.hpp"
 #include "CWindow.hpp"
+#include "ProjectLocations.hpp"
 #include "VCSettings.hpp"
 #include "VolumeAttachmentController.hpp"
 
 #include "utils/Json.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/util/ScrollUmbilicus.hpp"
+#include "vc/core/util/Umbilicus.hpp"
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/ProjectVolumes.hpp"
 
 namespace {
+
+namespace fs = std::filesystem;
+using Error = ProjectAttachmentOutcome::Error;
+
+ProjectAttachmentOutcome failure(Error kind, const QString& location, const QString& error)
+{
+    ProjectAttachmentOutcome outcome;
+    outcome.errorKind = kind;
+    outcome.location = location;
+    outcome.error = error;
+    return outcome;
+}
+
+using vc3d::project_locations::findEntry;
+using vc3d::project_locations::looksRemote;
+using vc3d::project_locations::storedLocalLocation;
 
 struct LasagnaTaskResult {
     std::vector<VolumePkg::PreparedVolumeAttachment> volumes;
@@ -38,36 +57,212 @@ ProjectAttachmentController::ProjectAttachmentController(CWindow* window)
 {
 }
 
-bool ProjectAttachmentController::hasProject(QString* error) const
+bool ProjectAttachmentController::hasProject(ProjectAttachmentOutcome* outcome) const
 {
     if (_window && _window->_state && _window->_state->vpkg()) {
         return true;
     }
-    if (error) {
-        *error = QObject::tr("Open or create a project first.");
+    if (outcome) {
+        outcome->errorKind = Error::NoProject;
+        outcome->error = QObject::tr("Open or create a project first.");
     }
     return false;
+}
+
+ProjectAttachmentOutcome ProjectAttachmentController::attachUmbilicus(const QString& file)
+{
+    ProjectAttachmentOutcome outcome;
+    if (!hasProject(&outcome)) {
+        return outcome;
+    }
+    auto pkg = _window->_state->vpkg();
+    const fs::path projectDir = pkg->path().parent_path();
+    if (file.trimmed().isEmpty() || looksRemote(file)) {
+        return failure(Error::InvalidLocation, file.trimmed(),
+                       QObject::tr("An umbilicus must be a local file."));
+    }
+    const QString location = storedLocalLocation(file, projectDir);
+    outcome.location = location;
+
+    vc::core::util::UmbilicusFileInfo info;
+    try {
+        info = vc::core::util::Umbilicus::LoadFileInfo(
+            std::filesystem::path(location.toStdString()));
+    } catch (const std::exception& e) {
+        return failure(Error::InvalidLocation, location,
+                       QObject::tr("%1 is not a valid umbilicus file:\n\n%2")
+                           .arg(location, QString::fromUtf8(e.what())));
+    }
+
+    // Malformed metadata makes the file unusable until it is fixed (the
+    // resolver refuses it), so attaching it would store an attachment nothing
+    // can use and report success beside a warning. Rejected instead, naming
+    // the errors; fix the file and attach again.
+    if (!info.metadataErrors.empty()) {
+        QStringList errors;
+        errors.reserve(static_cast<int>(info.metadataErrors.size()));
+        for (const auto& error : info.metadataErrors) {
+            errors << QString::fromStdString(error);
+        }
+        return failure(Error::InvalidLocation, location,
+                       QObject::tr("%1 declares malformed frame metadata and was not "
+                                   "attached:\n\n%2")
+                           .arg(QFileInfo(location).fileName(),
+                                errors.join(QStringLiteral("\n"))));
+    }
+
+    if (!vc::core::util::umbilicusFrameClaim(info).any()) {
+        // Dimensions alone are a complete statement (the preferred one, in fact,
+        // being exact integer counts), so warning about a missing voxelsize_um
+        // there would call the better-stamped file unstamped.
+        outcome.warnings << QObject::tr("%1 declares no frame, so consumers may have to guess "
+                                        "the grid its coordinates index.")
+                                .arg(QFileInfo(location).fileName());
+    }
+
+    outcome.success = true;
+    const QString configured = QString::fromStdString(pkg->umbilicus());
+    if (!configured.isEmpty() &&
+        vc::project::sameLocation(configured.toStdString(), location.toStdString(), projectDir)) {
+        outcome.location = configured;
+        return outcome;
+    }
+    outcome.previousLocation = configured;
+    pkg->setUmbilicus(location.toStdString());
+    outcome.changed = true;
+    // Consumers that placed geometry relative to the old umbilicus have no other
+    // way to learn this happened.
+    _window->_state->notifyUmbilicusChanged();
+    _window->showStatusBarMessage(
+        QObject::tr("Attached umbilicus %1").arg(QFileInfo(location).fileName()), 5000);
+    return outcome;
+}
+
+ProjectAttachmentOutcome ProjectAttachmentController::detachUmbilicus()
+{
+    ProjectAttachmentOutcome outcome;
+    if (!hasProject(&outcome)) {
+        return outcome;
+    }
+    auto pkg = _window->_state->vpkg();
+    const QString configured = QString::fromStdString(pkg->umbilicus());
+    outcome.location = configured;
+    outcome.success = true;
+    if (configured.isEmpty()) {
+        return outcome;
+    }
+    // Clearing the field persists the project and restores automatic
+    // resolution; the umbilicus is a single-valued field, so it is not part of
+    // the entry-based detach.
+    pkg->setUmbilicus({});
+    outcome.changed = true;
+    _window->_state->notifyUmbilicusChanged();
+    _window->showStatusBarMessage(
+        QObject::tr("Detached umbilicus %1; resolution is automatic again").arg(configured),
+        5000);
+    return outcome;
+}
+
+ProjectAttachmentOutcome ProjectAttachmentController::attachNormalGrid(const QString& location)
+{
+    ProjectAttachmentOutcome outcome;
+    if (!hasProject(&outcome)) {
+        return outcome;
+    }
+    auto pkg = _window->_state->vpkg();
+    const fs::path projectDir = pkg->path().parent_path();
+    if (location.trimmed().isEmpty() || looksRemote(location)) {
+        return failure(Error::InvalidLocation, location.trimmed(),
+                       QObject::tr("Not a valid normal-grid location:\n\n%1")
+                           .arg(QObject::tr("Remote locations are only supported for volumes.")));
+    }
+    const QString normalized = storedLocalLocation(location, projectDir);
+    outcome.location = normalized;
+    const auto err = vc::project::validateLocation(vc::project::Category::NormalGrids,
+                                                   normalized.toStdString());
+    if (!err.empty()) {
+        return failure(Error::InvalidLocation, normalized,
+                       QObject::tr("Not a valid normal-grid location:\n\n%1")
+                           .arg(QString::fromStdString(err)));
+    }
+    outcome.success = true;
+    if (const QString stored = findEntry(pkg->normalGridEntries(), normalized, projectDir);
+        !stored.isEmpty()) {
+        outcome.location = stored;
+        return outcome;
+    }
+    if (!pkg->addNormalGridEntry(normalized.toStdString())) {
+        return failure(Error::Failed, normalized, QObject::tr("Could not add normal grid."));
+    }
+    outcome.changed = true;
+    _window->refreshCurrentVolumePackageUi(QString(), true);
+    return outcome;
+}
+
+ProjectAttachmentOutcome ProjectAttachmentController::detachEntry(ProjectEntryKind kind,
+                                                                  const QString& location)
+{
+    ProjectAttachmentOutcome outcome;
+    if (!hasProject(&outcome)) {
+        return outcome;
+    }
+    auto pkg = _window->_state->vpkg();
+    const fs::path projectDir = pkg->path().parent_path();
+    std::vector<vc::project::Entry> entries;
+    switch (kind) {
+    case ProjectEntryKind::Volume:     entries = pkg->volumeEntries(); break;
+    case ProjectEntryKind::Segments:   entries = pkg->segmentEntries(); break;
+    case ProjectEntryKind::NormalGrid: entries = pkg->normalGridEntries(); break;
+    case ProjectEntryKind::Lasagna:    entries = pkg->allLasagnaDatasetEntries(); break;
+    }
+    const QString stored = findEntry(entries, location.trimmed(), projectDir);
+    if (stored.isEmpty() || !pkg->removeEntry(stored.toStdString())) {
+        return failure(Error::NotFound, location,
+                       QObject::tr("Could not remove entry (not found)."));
+    }
+    outcome.success = true;
+    outcome.changed = true;
+    outcome.location = stored;
+    _window->refreshCurrentVolumePackageUi(QString(), true);
+    return outcome;
 }
 
 bool ProjectAttachmentController::startLasagnaAttachment(
     const QString& requestedLocation,
     bool fiberInference,
     std::function<void(const ProjectAttachmentOutcome&)> onFinished,
-    QString* error)
+    ProjectAttachmentOutcome* refusal)
 {
-    auto fail = [error](const QString& message) {
-        if (error) *error = message;
+    auto fail = [refusal](Error kind, const QString& message) {
+        if (refusal) {
+            refusal->errorKind = kind;
+            refusal->error = message;
+        }
         return false;
     };
-    QString projectError;
-    if (!hasProject(&projectError)) {
-        return fail(projectError);
+    ProjectAttachmentOutcome check;
+    if (!hasProject(&check)) {
+        return fail(check.errorKind, check.error);
     }
     if (_lasagnaInFlight) {
-        return fail(QObject::tr("A Lasagna manifest attachment is already in progress."));
+        return fail(Error::Busy,
+                    QObject::tr("A Lasagna manifest attachment is already in progress."));
     }
-    const QString location = requestedLocation;
-    const bool remote = vc::lasagna::isRemoteLasagnaLocation(location.toStdString());
+    const QString trimmed = requestedLocation.trimmed();
+    if (trimmed.isEmpty()) {
+        return fail(Error::InvalidLocation,
+                    QObject::tr("Lasagna manifest location must not be blank."));
+    }
+    // Lasagna treats schemes case-insensitively; a local manifest is stored
+    // as an absolute, normal path like the other attachments.
+    const bool remote = vc::lasagna::isRemoteLasagnaLocation(trimmed.toStdString());
+    const QString location = remote
+        ? trimmed
+        : storedLocalLocation(trimmed, _window->_state->vpkg()->path().parent_path());
+    if (!remote && !QFileInfo(location).isFile()) {
+        return fail(Error::InvalidLocation,
+                    QObject::tr("Lasagna manifest not found: %1").arg(location));
+    }
 
     vc::lasagna::LasagnaDatasetOpenOptions openOptions;
     bool needsRemoteCache = remote;
@@ -104,11 +299,11 @@ bool ProjectAttachmentController::startLasagnaAttachment(
     if (needsRemoteAuth || needsRemoteCache) {
         auto* attachment = _window->_volumeAttachmentController.get();
         if (!attachment) {
-            return fail(QObject::tr("Remote attachment settings are unavailable."));
+            return fail(Error::Failed, QObject::tr("Remote attachment settings are unavailable."));
         }
         QString authError;
         if (!attachment->resolveRemoteAuth(authLocation, &openOptions.remoteAuth, &authError)) {
-            return fail(authError);
+            return fail(Error::Failed, authError);
         }
     }
     if (needsRemoteCache) {
@@ -116,16 +311,24 @@ bool ProjectAttachmentController::startLasagnaAttachment(
     }
 
     const auto targetPackage = _window->_state->vpkg();
-    const std::string persistedLocation = location.toStdString();
+    // Another spelling of an attached manifest updates that entry; VolumePkg
+    // matches manifests by their stored string.
+    const QString attached = remote
+        ? QString()
+        : findEntry(targetPackage->allLasagnaDatasetEntries(), location,
+                    targetPackage->path().parent_path());
+    const std::string persistedLocation =
+        (attached.isEmpty() ? location : attached).toStdString();
     auto* watcher = new QFutureWatcher<LasagnaTaskResult>(this);
     connect(watcher, &QFutureWatcher<LasagnaTaskResult>::finished, this,
-            [this, watcher, targetPackage, persistedLocation, location, fiberInference,
+            [this, watcher, targetPackage, persistedLocation, fiberInference,
              onFinished = std::move(onFinished)]() {
         auto task = watcher->result();
         watcher->deleteLater();
         _lasagnaInFlight = false;
         ProjectAttachmentOutcome outcome;
-        outcome.location = location;
+        outcome.location = QString::fromStdString(persistedLocation);
+        outcome.errorKind = Error::Failed;
         if (!task.error.isEmpty()) {
             outcome.error = task.error;
         } else if (!_window || !_window->_state || _window->_state->vpkg() != targetPackage) {
@@ -138,6 +341,7 @@ bool ProjectAttachmentController::startLasagnaAttachment(
                     outcome.error = QObject::tr("A Lasagna volume conflicts with an existing volume id.");
                 } else {
                     outcome.success = true;
+                    outcome.errorKind = Error::None;
                     outcome.changed = result == VolumePkg::AttachLasagnaResult::Attached;
                     _window->refreshCurrentVolumePackageUi(QString(), true);
                 }
