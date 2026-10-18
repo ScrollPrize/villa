@@ -55,6 +55,25 @@ add_test(NAME spiral_input_draft COMMAND test_spiral_input_draft)
 vc_register_test_target(test_spiral_input_draft)
 vc_register_ctest(spiral_input_draft test_spiral_input_draft)
 
+add_executable(test_settings_filter
+    test_settings_filter.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SettingsFilter.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SettingsFilter.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/VCSettings.ui)
+# The test also filters the real VCSettings.ui form.
+set_target_properties(test_settings_filter PROPERTIES
+    AUTOMOC ON AUTOUIC ON AUTORCC OFF
+    AUTOUIC_SEARCH_PATHS ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_include_directories(test_settings_filter PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_settings_filter PRIVATE
+    Qt6::Core Qt6::Gui Qt6::Test Qt6::Widgets)
+add_test(NAME settings_filter COMMAND test_settings_filter)
+vc_register_test_target(test_settings_filter)
+vc_register_ctest(settings_filter test_settings_filter)
+set_tests_properties(settings_filter PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
 add_executable(test_line_annotation_coordinate_scale
     test_line_annotation_coordinate_scale.cpp)
 
