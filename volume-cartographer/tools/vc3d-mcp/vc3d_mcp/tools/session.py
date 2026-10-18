@@ -22,7 +22,12 @@ async def vc3d_ping() -> dict[str, Any]:
 async def vc3d_get_state() -> dict[str, Any]:
     """Snapshot of VC3D: open volume package, current volume, active segment,
     viewers (ids/names, each with its workspace and visibility), the current
-    and available workspaces, editing mode, running job. Call this first."""
+    and available workspaces, editing mode, running job. Call this first.
+
+    "revision" increases whenever the project, volume, active segment,
+    editing modes, viewers, workspace, overlay or jobs change, including
+    changes a person makes in the GUI; compare it with an earlier snapshot to
+    see whether anything moved."""
     return await _call("state.get")
 
 

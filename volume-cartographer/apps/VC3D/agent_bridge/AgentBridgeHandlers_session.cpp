@@ -54,6 +54,16 @@ QJsonObject AgentBridgeServer::handlePing(const QJsonValue&)
 
 QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
 {
+    QJsonObject result = stateSnapshot();
+    // Refresh first so the revision matches the snapshot it is returned with.
+    refreshObservedState(result);
+    result["revision"] = static_cast<double>(_stateTracker.revision());
+    return result;
+}
+
+
+QJsonObject AgentBridgeServer::stateSnapshot()
+{
     QJsonObject result;
     CState* state = _window ? _window->_state : nullptr;
 

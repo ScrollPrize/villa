@@ -323,6 +323,7 @@ QString AgentBridgeServer::beginJob(const QString& source, const QString& kind,
         auto it = _activeJobs.find(source);
         broadcastJobProgress(it.value(), QStringLiteral("started"));
     }
+    queueStateRefresh();
     return job.id;
 }
 
@@ -350,6 +351,7 @@ void AgentBridgeServer::finishJob(const QString& source, bool success,
     hist.push_back(job);
     while (hist.size() > 8)
         hist.pop_front();
+    queueStateRefresh();
 }
 
 

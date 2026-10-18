@@ -31,6 +31,7 @@
 #include "agent_bridge/AgentBridgeError.hpp"  // AgentBridgeError
 #include "agent_bridge/AgentBridgeKeyboard.hpp"
 #include "agent_bridge/AgentBridgeMethod.hpp"
+#include "agent_bridge/AgentBridgeObservation.hpp"
 
 class QLocalServer;
 class QLocalSocket;
@@ -169,6 +170,23 @@ private:
     // state.get's "workspace": the current tab's id and {id, title} of every
     // addressable tab in tab order.
     QJsonObject workspacesJson() const;
+
+    // --- Observation (AgentBridgeObservation.cpp) ---
+    // state.get's snapshot and revision, and the state.changed notification.
+    // Fingerprints of the observed fields are compared when an application
+    // signal reports a change (connectStateSignals), after every request
+    // before its response, and in every state.get, so changes a person makes
+    // in the GUI are reported too. There is no polling.
+    QJsonObject stateSnapshot();
+    QHash<QString, QByteArray> observedStateFingerprints(const QJsonObject& snapshot);
+    // Bumps the revision and broadcasts state.changed when a fingerprint
+    // differs from the previous refresh.
+    void refreshObservedState(const QJsonObject& snapshot);
+    // Takes a snapshot and refreshes now; never throws.
+    void refreshObservedStateNow();
+    // Refreshes once the bridge is idle; repeated calls coalesce.
+    void queueStateRefresh();
+    void connectStateSignals();
 
     // --- Handlers ---
     QJsonObject handlePing(const QJsonValue& params);
@@ -535,6 +553,9 @@ private:
     std::vector<ViewerEntry> _viewers;
     int _nextViewerNum = 1;
     std::vector<QPointer<ViewerManager>> _viewerManagers;
+
+    AgentBridgeStateTracker _stateTracker;
+    bool _stateRefreshQueued = false;
 
     // At most one active job per source, with the last eight completed records
     // retained per source. Job numbers are shared across sources.

@@ -327,6 +327,8 @@ set(srcs
     agent_bridge/AgentBridgeInternal.hpp
     agent_bridge/AgentBridgeKeyboard.cpp
     agent_bridge/AgentBridgeKeyboard.hpp
+    agent_bridge/AgentBridgeObservation.cpp
+    agent_bridge/AgentBridgeObservation.hpp
     agent_bridge/AgentBridgeUi.hpp
     agent_bridge/AgentBridgeWorkspaces.cpp
     agent_bridge/AgentBridgeJobs.cpp

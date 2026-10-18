@@ -15,6 +15,7 @@
 #include "agent_bridge/AgentBridgeInput.hpp"
 #include "agent_bridge/AgentBridgeInternal.hpp"
 #include "agent_bridge/AgentBridgeMethod.hpp"
+#include "agent_bridge/AgentBridgeObservation.hpp"
 #include "agent_bridge/AgentBridgeUi.hpp"
 
 namespace {
@@ -380,6 +381,37 @@ int main()
         CHECK(jsonToModifiers(mods) == (Qt::ShiftModifier | Qt::KeypadModifier));
         CHECK(modifiersToJson(jsonToModifiers(mods)) == mods);
         CHECK(jsonToModifiers(QJsonValue(QJsonValue::Null)) == Qt::NoModifier);
+    }
+
+    // --- state.changed revisions ---
+    {
+        AgentBridgeStateTracker tracker;
+        QHash<QString, QByteArray> fields{
+            {QStringLiteral("workspace"), QByteArray("main")},
+            {QStringLiteral("volume"), QByteArray("v1")},
+        };
+        CHECK(!tracker.update(fields));  // priming reports nothing
+        CHECK(tracker.revision() == 0);
+        CHECK(!tracker.update(fields));
+        CHECK(tracker.revision() == 0);
+        CHECK(tracker.takePending().isEmpty());
+
+        fields[QStringLiteral("workspace")] = QByteArray("spiral");
+        fields[QStringLiteral("volume")] = QByteArray("v2");
+        CHECK(tracker.update(fields));
+        CHECK(tracker.revision() == 1);  // one bump per refresh
+
+        fields.remove(QStringLiteral("volume"));
+        fields[QStringLiteral("jobs")] = QByteArray("job-1:running");
+        CHECK(tracker.update(fields));
+        CHECK(tracker.revision() == 2);
+        // Pending fields accumulate until taken, sorted.
+        CHECK(tracker.takePending() ==
+              QStringList({QStringLiteral("jobs"), QStringLiteral("volume"),
+                           QStringLiteral("workspace")}));
+        CHECK(tracker.takePending().isEmpty());
+        CHECK(agentBridgeObservedFields().size() == 8);
+        CHECK(agentBridgeObservedFields().contains(QStringLiteral("overlay")));
     }
 
     // Workspace ids: tab order, and the legacy workspace.switch spelling.

@@ -104,6 +104,11 @@ AgentBridgeServer::AgentBridgeServer(CWindow* window, QObject* parent)
     syncViewerManagers();
 
     subscribeJobSignals();
+
+    // Prime the observed fingerprints, then follow the application's change
+    // signals.
+    refreshObservedStateNow();
+    connectStateSignals();
 }
 
 
@@ -492,11 +497,13 @@ void AgentBridgeServer::dispatch(QLocalSocket* socket, const QJsonObject& reques
         _currentSocket = nullptr;
         _currentRequestId = QJsonValue();
         _currentMethod.clear();
+        queueStateRefresh();
         return;
     } catch (const AgentBridgeError& e) {
         _currentSocket = nullptr;
         _currentRequestId = QJsonValue();
         _currentMethod.clear();
+        refreshObservedStateNow();
         if (!isNotification)
             sendError(socket, id, e.code, e.message, e.data);
         return;
@@ -504,6 +511,7 @@ void AgentBridgeServer::dispatch(QLocalSocket* socket, const QJsonObject& reques
         _currentSocket = nullptr;
         _currentRequestId = QJsonValue();
         _currentMethod.clear();
+        refreshObservedStateNow();
         if (!isNotification) {
             QJsonObject data;
             data["detail"] = QString::fromUtf8(e.what());
@@ -514,6 +522,7 @@ void AgentBridgeServer::dispatch(QLocalSocket* socket, const QJsonObject& reques
         _currentSocket = nullptr;
         _currentRequestId = QJsonValue();
         _currentMethod.clear();
+        refreshObservedStateNow();
         if (!isNotification)
             sendError(socket, id, -32010, "Internal error");
         return;
@@ -523,6 +532,9 @@ void AgentBridgeServer::dispatch(QLocalSocket* socket, const QJsonObject& reques
     _currentRequestId = QJsonValue();
     _currentMethod.clear();
 
+    // A request's state.changed goes out before its response, so a client
+    // that has the response has also seen the change it caused.
+    refreshObservedStateNow();
     if (!isNotification)
         sendResponse(socket, id, result);
 }
@@ -619,9 +631,15 @@ void AgentBridgeServer::syncViewerManagers()
         const bool primary =
             _window && _window->_viewerManager && manager == _window->_viewerManager.get();
         connect(manager, &ViewerManager::baseViewerCreated,
-                this, [this, primary](VolumeViewerBase* v) { registerViewer(v, primary); });
+                this, [this, primary](VolumeViewerBase* v) {
+                    registerViewer(v, primary);
+                    queueStateRefresh();
+                });
         connect(manager, &ViewerManager::baseViewerClosing,
-                this, [this](VolumeViewerBase* v) { unregisterViewer(v); });
+                this, [this](VolumeViewerBase* v) {
+                    unregisterViewer(v);
+                    queueStateRefresh();
+                });
         for (VolumeViewerBase* v : manager->baseViewers())
             registerViewer(v, primary);
     }
@@ -881,6 +899,7 @@ void AgentBridgeServer::completeDeferredResult(int token, const QJsonObject& res
         pd.timer->stop();
         pd.timer->deleteLater();
     }
+    refreshObservedStateNow();
     if (!pd.id.isUndefined() &&
         pd.socket && pd.socket->state() == QLocalSocket::ConnectedState) {
         sendResponse(pd.socket.data(), pd.id, result);
@@ -900,6 +919,7 @@ void AgentBridgeServer::completeDeferredError(int token, int code, const QString
         pd.timer->stop();
         pd.timer->deleteLater();
     }
+    refreshObservedStateNow();
     if (!pd.id.isUndefined() &&
         pd.socket && pd.socket->state() == QLocalSocket::ConnectedState) {
         sendError(pd.socket.data(), pd.id, code, message, data);

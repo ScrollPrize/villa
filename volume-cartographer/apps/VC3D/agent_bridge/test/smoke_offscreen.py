@@ -744,6 +744,38 @@ def check_canvas_input(sock_path: str, client: BridgeClient, results: Results) -
         results.record("canvas_wheel_zoom", False, f"{type(error).__name__}: {error}")
 
 
+def check_state_changes(sock_path: str, client: BridgeClient, results: Results) -> None:
+    """A change made by one client reaches another as state.changed."""
+    observer = None
+    try:
+        observer = BridgeClient(sock_path, connect_timeout=RPC_TIMEOUT)
+        before, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        client.call("workspace.switch", {"name": "lasagna"}, timeout=RPC_TIMEOUT)
+        note = observer.wait_for_notification(
+            "state.changed",
+            predicate=lambda p: "workspace" in p.get("changed", []),
+            timeout=5.0,
+        )
+        after, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        client.call("workspace.switch", {"name": "main"}, timeout=RPC_TIMEOUT)
+        ok = (
+            isinstance(before.get("revision"), int)
+            and after.get("revision", -1) > before.get("revision", 0)
+            and note.get("revision", -1) <= after.get("revision", -1)
+        )
+        results.record(
+            "state_changed_notification",
+            ok,
+            f"revision {before.get('revision')} -> {after.get('revision')}; note={note}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "state_changed_notification", False, f"{type(error).__name__}: {error}")
+    finally:
+        if observer is not None:
+            observer.close()
+
+
 # Every workspace id in tab order (AgentBridgeUi.hpp's agentBridgeWorkspaceIds,
 # set as each tab page's "workspaceId" property in CWindow's constructor).
 WORKSPACE_IDS = (
@@ -2172,6 +2204,7 @@ def main() -> int:
             check_workspaces(client, results)
             check_canvas_input(sock_path, client, results)
             require_running(proc, results, "canvas input")
+            check_state_changes(sock_path, client, results)
 
             check_volume_attach(client, results, tmp_path, volpkg)
             check_segments_attach(client, results, tmp_path, volpkg)

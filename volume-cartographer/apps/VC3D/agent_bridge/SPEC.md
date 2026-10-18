@@ -277,6 +277,43 @@ timer, and completes the response exactly once from the signal or timeout.
 Disconnecting a client discards its pending replies without affecting other
 clients or application work.
 
+## State changes
+
+`state.changed` is a notification broadcast to every client when observed
+application state differs from the previous check, whoever changed it: a
+bridge call, another client, or a person using the GUI. Its params are:
+
+```json
+{"revision": 12, "changed": ["volume", "workspace"]}
+```
+
+`changed` is a sorted subset of these fields:
+
+| Field | Changes when |
+|---|---|
+| `project` | a volume package opens or closes |
+| `volume` | the current volume changes |
+| `activeSegment` | the active segment changes |
+| `editing` | segmentation editing, manual add, its line or interpolation mode, correction points, same-wrap annotation, or axis-aligned slices change |
+| `viewers` | a viewer is created or closed, or changes workspace or visibility |
+| `workspace` | the current workspace tab changes |
+| `overlay` | the active workspace's overlay-volume settings change |
+| `jobs` | a job starts or finishes |
+
+The bridge checks when an application signal reports a change (the project,
+the volume, a newly active segment, segmentation editing, same-wrap
+annotation, the workspace tab, a viewer created or closed, a job started or
+finished), after every request it handles, and inside every `state.get`; it
+does not poll. A person's change to a field without such a signal (manual
+add, corrections, axis-aligned slices, overlay settings, viewer visibility)
+is reported at the next request or `state.get`. A request's notification is
+sent before its response, and changes within one check are coalesced into
+one notification. `revision` starts at 0 when VC3D
+starts and increases by one per notification; `state.get` returns the
+revision that matches its snapshot. Zoom, pan, cursor, and point edits are not
+reported. Delivery is best-effort like `job.progress`; `state.get` is
+authoritative.
+
 ## Headless application behavior
 
 An explicit RPC is treated as consent for the requested mutation, never as
@@ -306,7 +343,8 @@ dialog.
   whether it is `visible`. `workspace.current` is the current tab's id (null
   for an unnamed line-annotation tab) and `workspace.available` lists
   `{id, title}` in tab order. `heldKeys` lists the keys `canvas.key` holds
-  (`key`, `modifiers`, `viewerId`).
+  (`key`, `modifiers`, `viewerId`). `revision` is the observation revision
+  described under State changes, current as of this snapshot.
 - `workspace.switch` accepts every workspace id (`main`, `lasagna`, `atlas`,
   `fiber-slice`, `intersections`, `spiral`, `fiber-map`) plus the original
   `fiber_slice` spelling, and changes the tab exactly as the GUI does. It
