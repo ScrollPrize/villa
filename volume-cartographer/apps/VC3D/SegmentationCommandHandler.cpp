@@ -1,6 +1,7 @@
 #include "SegmentationCommandHandler.hpp"
 
 #include "MergeTifxyzInputs.hpp"
+#include "SegmentFiles.hpp"
 
 #include "OpenDataCoordinateIdentity.hpp"
 #include "CState.hpp"
@@ -5943,161 +5944,213 @@ bool SegmentationCommandHandler::appendRasterizationMetadata(const QString& outp
 
 void SegmentationCommandHandler::onReloadFromBackup(const QString& segmentId, int backupIndex)
 {
-    if (!_state->vpkg()) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("No volume package loaded."));
-        return;
+    restoreSurfaceFromBackupImpl(segmentId, backupIndex, /*interactive=*/true, nullptr, nullptr);
+}
+
+std::vector<vc3d::segment_files::Backup>
+SegmentationCommandHandler::listSurfaceBackups(const QString& segmentId) const
+{
+    if (!_state || !_state->vpkg()) {
+        return {};
+    }
+    auto surf = _state->vpkg()->getSurface(segmentId.toStdString());
+    if (!surf || surf->path.empty()) {
+        return {};
+    }
+    return vc3d::segment_files::listBackups(
+        vc3d::segment_files::backupsDirectory(surf->path, surf->backupRoot));
+}
+
+bool SegmentationCommandHandler::restoreSurfaceFromBackup(const QString& segmentId,
+                                                          int backupIndex,
+                                                          QString* errorMessage,
+                                                          int* copiedFiles)
+{
+    return restoreSurfaceFromBackupImpl(segmentId, backupIndex, /*interactive=*/false,
+                                        errorMessage, copiedFiles);
+}
+
+bool SegmentationCommandHandler::restoreSurfaceFromBackupImpl(const QString& segmentId,
+                                                              int backupIndex,
+                                                              bool interactive,
+                                                              QString* errorMessage,
+                                                              int* copiedFiles)
+{
+    // Interactive restores present each failure in the message box the menu
+    // always used.
+    auto fail = [&](const QString& message, bool critical = false,
+                    const QString& title = QString()) -> bool {
+        if (interactive) {
+            const QString boxTitle = title.isEmpty() ? tr("Error") : title;
+            if (critical) {
+                QMessageBox::critical(_parentWidget, boxTitle, message);
+            } else {
+                QMessageBox::warning(_parentWidget, boxTitle, message);
+            }
+        }
+        if (errorMessage) {
+            *errorMessage = message;
+        }
+        return false;
+    };
+
+    if (!_state || !_state->vpkg()) {
+        return fail(tr("No volume package loaded."));
     }
 
     const std::string segIdStd = segmentId.toStdString();
     auto surf = _state->vpkg()->getSurface(segIdStd);
     if (!surf) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Surface not found: %1").arg(segmentId));
-        return;
+        return fail(tr("Surface not found: %1").arg(segmentId));
     }
 
-    // Backups live under <backupRoot>/backups/<id>/<index> (backupRoot is the
-    // volpkg.json's directory), matching QuadSurface::saveSnapshot().
     namespace fs = std::filesystem;
-    fs::path segmentDir = surf->path;
-    fs::path backupRoot = surf->backupRoot.empty() ? segmentDir.parent_path() : surf->backupRoot;
-    fs::path backupDir = backupRoot / "backups" / segmentDir.filename() / std::to_string(backupIndex);
+    const fs::path segmentDir = surf->path;
+    const fs::path backupDir =
+        vc3d::segment_files::backupsDirectory(segmentDir, surf->backupRoot) /
+        std::to_string(backupIndex);
 
     if (!fs::exists(backupDir)) {
-        QMessageBox::warning(_parentWidget, tr("Error"),
-            tr("Backup directory does not exist: %1").arg(QString::fromStdString(backupDir.string())));
-        return;
+        return fail(tr("Backup directory does not exist: %1")
+                        .arg(QString::fromStdString(backupDir.string())));
     }
 
     if (!fs::exists(segmentDir)) {
-        QMessageBox::warning(_parentWidget, tr("Error"),
-            tr("Segment directory does not exist: %1").arg(QString::fromStdString(segmentDir.string())));
-        return;
+        return fail(tr("Segment directory does not exist: %1")
+                        .arg(QString::fromStdString(segmentDir.string())));
     }
 
-    // Confirm with user
-    QMessageBox::StandardButton reply = QMessageBox::question(
-        _parentWidget,
-        tr("Confirm Reload from Backup"),
-        tr("This will replace the current segment '%1' with backup %2.\n\n"
-           "The current segment data will be overwritten. Continue?")
-           .arg(segmentId).arg(backupIndex),
-        QMessageBox::Yes | QMessageBox::No,
-        QMessageBox::No);
-
-    if (reply != QMessageBox::Yes) {
-        emit statusMessage(tr("Reload from backup cancelled"), 3000);
-        return;
-    }
-
-    // Files to copy from backup
-    std::vector<std::string> filesToCopy = {
-        "mesh.ply",
-        "mask.tif",
-        "meta.json",
-        "generations.tif"
-    };
-
-    std::error_code ec;
-    int copiedCount = 0;
-
-    for (const auto& filename : filesToCopy) {
-        fs::path srcFile = backupDir / filename;
-        fs::path dstFile = segmentDir / filename;
-
-        if (fs::exists(srcFile)) {
-            // Remove existing file first
-            if (fs::exists(dstFile)) {
-                fs::remove(dstFile, ec);
-                if (ec) {
-                    QMessageBox::warning(_parentWidget, tr("Error"),
-                        tr("Failed to remove existing file %1: %2")
-                           .arg(QString::fromStdString(dstFile.string()))
-                           .arg(QString::fromStdString(ec.message())));
-                    return;
-                }
-            }
-
-            // Copy from backup
-            fs::copy_file(srcFile, dstFile, fs::copy_options::overwrite_existing, ec);
-            if (ec) {
-                QMessageBox::warning(_parentWidget, tr("Error"),
-                    tr("Failed to copy %1: %2")
-                       .arg(QString::fromStdString(filename))
-                       .arg(QString::fromStdString(ec.message())));
-                return;
-            }
-            copiedCount++;
+    if (interactive) {
+        const QMessageBox::StandardButton reply = QMessageBox::question(
+            _parentWidget,
+            tr("Confirm Reload from Backup"),
+            tr("This will replace the current segment '%1' with backup %2.\n\n"
+               "The current segment data will be overwritten. Continue?")
+               .arg(segmentId).arg(backupIndex),
+            QMessageBox::Yes | QMessageBox::No,
+            QMessageBox::No);
+        if (reply != QMessageBox::Yes) {
+            emit statusMessage(tr("Reload from backup cancelled"), 3000);
+            return false;
         }
+    }
+
+    // The state being replaced becomes the newest backup first, so a restore
+    // can itself be undone from the same menu.
+    QString restoreError;
+    const int copiedCount = vc3d::segment_files::restoreBackupFiles(
+        backupDir, segmentDir,
+        [&surf](QString* error) {
+            try {
+                surf->saveSnapshot(-1, /*force=*/true);
+                return true;
+            } catch (const std::exception& e) {
+                *error = tr("Could not back up the current segment, so nothing was "
+                            "restored: %1").arg(QString::fromUtf8(e.what()));
+                return false;
+            }
+        },
+        &restoreError);
+    if (copiedCount < 0) {
+        return fail(restoreError);
+    }
+    if (copiedFiles) {
+        *copiedFiles = copiedCount;
     }
 
     if (copiedCount == 0) {
-        QMessageBox::warning(_parentWidget, tr("Error"),
-            tr("No files found in backup directory."));
-        return;
+        return fail(tr("No files found in backup directory."));
     }
 
     // Reload the surface
-    bool wasSelected = (_state->activeSurfaceId() == segIdStd);
+    const bool wasSelected = (_state->activeSurfaceId() == segIdStd);
 
-    if (_state->vpkg()->reloadSingleSegmentation(segIdStd)) {
-        try {
-            auto reloadedSurf = _state->vpkg()->loadSurface(segIdStd);
-            if (reloadedSurf) {
-                if (_state) {
-                    _state->setSurface(segIdStd, reloadedSurf, false, false);
-                }
+    if (!_state->vpkg()->reloadSingleSegmentation(segIdStd)) {
+        return fail(tr("Files were copied but failed to reload the segmentation. "
+                       "Try using the reload button."),
+                    false, tr("Warning"));
+    }
+    try {
+        auto reloadedSurf = _state->vpkg()->loadSurface(segIdStd);
+        if (reloadedSurf) {
+            _state->setSurface(segIdStd, reloadedSurf, false, false);
+
+            if (_surfacePanel) {
+                _surfacePanel->refreshSurfaceMetrics(segIdStd);
+            }
+
+            if (wasSelected) {
+                _state->setActiveSurface(segIdStd, std::dynamic_pointer_cast<QuadSurface>(reloadedSurf));
+                _state->setSurface("segmentation", reloadedSurf, false, false);
 
                 if (_surfacePanel) {
-                    _surfacePanel->refreshSurfaceMetrics(segIdStd);
+                    _surfacePanel->syncSelectionUi(segIdStd, reloadedSurf.get());
                 }
-
-                if (wasSelected) {
-                    _state->setActiveSurface(segIdStd, std::dynamic_pointer_cast<QuadSurface>(reloadedSurf));
-
-                    if (_state) {
-                        _state->setSurface("segmentation", reloadedSurf, false, false);
-                    }
-
-                    if (_surfacePanel) {
-                        _surfacePanel->syncSelectionUi(segIdStd, reloadedSurf.get());
-                    }
-                }
-
-                emit statusMessage(
-                    tr("Restored '%1' from backup %2 (%3 files)")
-                       .arg(segmentId).arg(backupIndex).arg(copiedCount),
-                    5000);
             }
-        } catch (const std::exception& e) {
-            QMessageBox::critical(_parentWidget, tr("Error"),
-                tr("Failed to reload surface after restore: %1")
-                   .arg(QString::fromUtf8(e.what())));
+
+            emit statusMessage(
+                tr("Restored '%1' from backup %2 (%3 files)")
+                   .arg(segmentId).arg(backupIndex).arg(copiedCount),
+                5000);
         }
-    } else {
-        QMessageBox::warning(_parentWidget, tr("Warning"),
-            tr("Files were copied but failed to reload the segmentation. "
-               "Try using the reload button."));
+    } catch (const std::exception& e) {
+        return fail(tr("Failed to reload surface after restore: %1")
+                        .arg(QString::fromUtf8(e.what())),
+                    true);
     }
+    return true;
 }
 
 void SegmentationCommandHandler::onMoveSegmentToPaths(const QString& segmentId)
 {
-    if (!_state->vpkg()) {
-        emit statusMessage(tr("No volume package loaded"), 3000);
-        return;
+    moveSegmentToPathsImpl(segmentId, /*replaceExisting=*/false, /*interactive=*/true,
+                           nullptr, nullptr, nullptr);
+}
+
+bool SegmentationCommandHandler::moveSegmentToPaths(const QString& segmentId,
+                                                    bool replaceExisting,
+                                                    QString* errorMessage,
+                                                    QString* newPath,
+                                                    bool* destinationExists)
+{
+    return moveSegmentToPathsImpl(segmentId, replaceExisting, /*interactive=*/false,
+                                  errorMessage, newPath, destinationExists);
+}
+
+bool SegmentationCommandHandler::moveSegmentToPathsImpl(const QString& segmentId,
+                                                        bool replaceExisting,
+                                                        bool interactive,
+                                                        QString* errorMessage,
+                                                        QString* newPathOut,
+                                                        bool* destinationExistsOut)
+{
+    auto setError = [&](const QString& message) {
+        if (errorMessage) {
+            *errorMessage = message;
+        }
+        return false;
+    };
+    // Precondition failures are status-bar notes in the menu.
+    auto note = [&](const QString& message) {
+        if (interactive) {
+            emit statusMessage(message, 3000);
+        }
+        return setError(message);
+    };
+
+    if (!_state || !_state->vpkg()) {
+        return note(tr("No volume package loaded"));
     }
 
     // Verify we're in traces directory
     if (_state->vpkg()->getSegmentationDirectory() != "traces") {
-        emit statusMessage(tr("Can only move segments from traces directory"), 3000);
-        return;
+        return note(tr("Can only move segments from traces directory"));
     }
 
     // Get the segment
     auto seg = _state->vpkg()->segmentation(segmentId.toStdString());
     if (!seg) {
-        emit statusMessage(tr("Segment not found: %1").arg(segmentId), 3000);
-        return;
+        return note(tr("Segment not found: %1").arg(segmentId));
     }
 
     // Build paths
@@ -6105,42 +6158,39 @@ void SegmentationCommandHandler::onMoveSegmentToPaths(const QString& segmentId)
     std::filesystem::path currentPath = seg->path();
     std::filesystem::path newPath = volpkgPath / "paths" / currentPath.filename();
 
-    // Check if destination exists
-    if (std::filesystem::exists(newPath)) {
-        QMessageBox::StandardButton reply = QMessageBox::question(
-            _parentWidget,
-            tr("Destination Exists"),
-            tr("Segment '%1' already exists in paths/.\nDo you want to replace it?").arg(segmentId),
-            QMessageBox::Yes | QMessageBox::No,
-            QMessageBox::No
-        );
-
-        if (reply != QMessageBox::Yes) {
-            return;
-        }
-
-        // Remove the existing one
-        try {
-            std::filesystem::remove_all(newPath);
-        } catch (const std::exception& e) {
-            QMessageBox::critical(_parentWidget, tr("Error"),
-                tr("Failed to remove existing segment: %1").arg(e.what()));
-            return;
-        }
+    const bool destinationExists = std::filesystem::exists(newPath);
+    if (destinationExistsOut) {
+        *destinationExistsOut = destinationExists;
     }
+    if (interactive) {
+        if (destinationExists) {
+            const QMessageBox::StandardButton reply = QMessageBox::question(
+                _parentWidget,
+                tr("Destination Exists"),
+                tr("Segment '%1' already exists in paths/.\nDo you want to replace it?").arg(segmentId),
+                QMessageBox::Yes | QMessageBox::No,
+                QMessageBox::No
+            );
+            if (reply != QMessageBox::Yes) {
+                return false;
+            }
+            replaceExisting = true;
+        }
 
-    // Confirm the move
-    QMessageBox::StandardButton reply = QMessageBox::question(
-        _parentWidget,
-        tr("Move to Paths"),
-        tr("Move segment '%1' from traces/ to paths/?\n\n"
-           "Note: The segment will be closed if currently open.").arg(segmentId),
-        QMessageBox::Yes | QMessageBox::No,
-        QMessageBox::Yes
-    );
-
-    if (reply != QMessageBox::Yes) {
-        return;
+        // Confirm the move
+        const QMessageBox::StandardButton reply = QMessageBox::question(
+            _parentWidget,
+            tr("Move to Paths"),
+            tr("Move segment '%1' from traces/ to paths/?\n\n"
+               "Note: The segment will be closed if currently open.").arg(segmentId),
+            QMessageBox::Yes | QMessageBox::No,
+            QMessageBox::Yes
+        );
+        if (reply != QMessageBox::Yes) {
+            return false;
+        }
+    } else if (destinationExists && !replaceExisting) {
+        return setError(tr("Segment '%1' already exists in paths/.").arg(segmentId));
     }
 
     // === CRITICAL: Clean up the segment before moving ===
@@ -6150,18 +6200,16 @@ void SegmentationCommandHandler::onMoveSegmentToPaths(const QString& segmentId)
     bool wasSelected = (_state->activeSurfaceId() == idStd);
 
     // Clear from surface collection (including "segmentation" if it matches)
-    if (_state) {
-        auto currentSurface = _state->surface(idStd);
-        auto segmentationSurface = _state->surface("segmentation");
+    auto currentSurface = _state->surface(idStd);
+    auto segmentationSurface = _state->surface("segmentation");
 
-        // If this surface is currently shown as "segmentation", clear it
-        if (currentSurface && segmentationSurface && currentSurface == segmentationSurface) {
-            _state->setSurface("segmentation", nullptr, false, false);
-        }
-
-        // Clear the surface from the collection
-        _state->setSurface(idStd, nullptr, false, false);
+    // If this surface is currently shown as "segmentation", clear it
+    if (currentSurface && segmentationSurface && currentSurface == segmentationSurface) {
+        _state->setSurface("segmentation", nullptr, false, false);
     }
+
+    // Clear the surface from the collection
+    _state->setSurface(idStd, nullptr, false, false);
 
     // Unload the surface from VolumePkg
     _state->vpkg()->unloadSurface(idStd);
@@ -6173,30 +6221,37 @@ void SegmentationCommandHandler::onMoveSegmentToPaths(const QString& segmentId)
         }
     }
 
-    // Perform the move
-    try {
-        std::filesystem::rename(currentPath, newPath);
-
-        // Remove from VolumePkg's internal tracking for traces
-        _state->vpkg()->removeSingleSegmentation(idStd);
-
-        // The inotify system will pick up the IN_MOVED_TO in paths/
-        // and handle adding it there if the user switches to that directory
-
-        if (_surfacePanel) {
-            _surfacePanel->removeSingleSegmentation(idStd);
+    // Perform the move. A replaced paths/ segment is deleted only after the
+    // move succeeded and is put back if it fails.
+    QString moveError;
+    if (!vc3d::segment_files::moveSegmentDirectory(currentPath, newPath, replaceExisting,
+                                                   &moveError)) {
+        // The segment stays unloaded; reloading it here could race with the
+        // file watcher.
+        const QString message = tr("%1\n\nThe segment has been unloaded from the viewer.")
+                                    .arg(moveError);
+        if (interactive) {
+            QMessageBox::critical(_parentWidget, tr("Error"), message);
         }
-
-        emit statusMessage(
-            tr("Moved %1 from traces/ to paths/. Switch to paths directory to see it.").arg(segmentId), 5000);
-
-    } catch (const std::exception& e) {
-        // If move failed, we might want to reload the segment
-        // but it's probably safer to leave it unloaded
-        QMessageBox::critical(_parentWidget, tr("Error"),
-            tr("Failed to move segment: %1\n\n"
-               "The segment has been unloaded from the viewer.").arg(e.what()));
+        return setError(message);
     }
+
+    // Remove from VolumePkg's internal tracking for traces
+    _state->vpkg()->removeSingleSegmentation(idStd);
+
+    // The inotify system will pick up the IN_MOVED_TO in paths/
+    // and handle adding it there if the user switches to that directory
+
+    if (_surfacePanel) {
+        _surfacePanel->removeSingleSegmentation(idStd);
+    }
+
+    emit statusMessage(
+        tr("Moved %1 from traces/ to paths/. Switch to paths directory to see it.").arg(segmentId), 5000);
+    if (newPathOut) {
+        *newPathOut = QString::fromStdString(newPath.string());
+    }
+    return true;
 }
 
 void SegmentationCommandHandler::onRenameSurface(const QString& segmentId)

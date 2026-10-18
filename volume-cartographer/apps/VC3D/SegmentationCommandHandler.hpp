@@ -17,6 +17,7 @@
 #include "elements/VolumeSelector.hpp"
 #include "AlphaCompRefineRequest.hpp"
 #include "CommandLaunchError.hpp"
+#include "SegmentFiles.hpp"
 // Full definition needed: RenderSegmentParams stores a
 // CommandLineToolRunner::RenderOutputFormat (nested enum) by value.
 #include "CommandLineToolRunner.hpp"
@@ -456,6 +457,32 @@ public:
     bool startMergePatch(const MergePatchParams& params,
                          CommandLaunchError* error = nullptr);
 
+    /// The segment's rotating backups, as the context menu's "Reload from
+    /// Backup" entries offer them. Empty when the segment or its backups are
+    /// missing.
+    std::vector<vc3d::segment_files::Backup> listSurfaceBackups(const QString& segmentId) const;
+
+    /// Dialog-free core of onReloadFromBackup: replaces the segment's files
+    /// with every file of the backup slot and reloads it. The state being
+    /// replaced is snapshotted as the newest backup first; if that snapshot
+    /// fails nothing is restored. Failures via `errorMessage`; `copiedFiles`
+    /// receives the number of files restored.
+    bool restoreSurfaceFromBackup(const QString& segmentId,
+                                  int backupIndex,
+                                  QString* errorMessage = nullptr,
+                                  int* copiedFiles = nullptr);
+
+    /// Dialog-free core of onMoveSegmentToPaths: unloads a traces/ segment and
+    /// moves its folder to paths/. A paths/ segment of the same name is
+    /// refused unless `replaceExisting`; `destinationExists` reports whether
+    /// there was one. Failures via `errorMessage`; `newPath` receives the
+    /// destination folder.
+    bool moveSegmentToPaths(const QString& segmentId,
+                            bool replaceExisting,
+                            QString* errorMessage = nullptr,
+                            QString* newPath = nullptr,
+                            bool* destinationExists = nullptr);
+
     /// Cancels a running neighbor copy, including the hop between its passes:
     /// a running pass's process is terminated and a queued second pass does
     /// not start. The copy ends with segmentOperationFinished("neighbor_copy",
@@ -582,6 +609,17 @@ private:
     // output that is not in `baselineEntries`; empty when none.
     static QString findNewMergedSegment(const QString& pathsDir,
                                         const QSet<QString>& baselineEntries);
+    bool restoreSurfaceFromBackupImpl(const QString& segmentId,
+                                      int backupIndex,
+                                      bool interactive,
+                                      QString* errorMessage,
+                                      int* copiedFiles);
+    bool moveSegmentToPathsImpl(const QString& segmentId,
+                                bool replaceExisting,
+                                bool interactive,
+                                QString* errorMessage,
+                                QString* newPath,
+                                bool* destinationExists);
     bool launchConvertToObj(const QString& tifxyzPath,
                             const ConvertToObjParams& params,
                             CommandLineToolRunner::ExecutionOptions options);
