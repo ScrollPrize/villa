@@ -3,6 +3,95 @@
 Usage, methodology, and full results for the [package benchmark summary](../README.md#performance).
 Run all commands below from the package root (`vc_reader/`).
 
+## PyTorch CUDA batches
+
+`bench_torch.py` measures GPU-ready batches using the same image data and
+per-sample seeds across four routes:
+
+- `serial`: ordinary `DataLoader(num_workers=0)` with per-sample CUDA processing.
+- `prototype`: the earlier async native batch prototype, with fixed-shape,
+  PyTorch-owned output buffers and four CPU loader workers by default.
+- `batch`: the public `Pipeline.batch()` API after the CPU loader.
+- `prefetch`: the public `CudaLoader` wrapper, with one batch queued ahead.
+
+The chain is min-max normalization, elastic deformation, median filtering,
+flipping, and gamma. All routes end with stacked CUDA tensors. Uploads, GPU
+casts, reading, augmentation, collation, and output disposal are included in
+epoch throughput. Batch latency measures `next()` through completion on the
+consumer stream; final producer-stream completion is included in epoch timing.
+There is no model, backward pass, or simulated training delay. Prefetch benefit
+during actual training must be measured with that model separately.
+
+The first full epoch validates finite output/shape and exact crop hashes across
+routes and warms readers, CUDA, and persistent workers. It is excluded from
+timing. Backend order rotates between repetitions. OS/reader caches remain
+warm; this is not a cold-storage benchmark. JSON records raw measurements,
+mean/p50/p95/min/max, epoch throughput, seeds, configuration, extension hashes,
+build flags, and environment. `--modes` limits the routes for profiling.
+
+Use an existing Release CUDA build and an environment with PyTorch and NumPy:
+
+```bash
+cmake --build /tmp/vc-reader-cuda --parallel 4
+
+# Small generated-input smoke check; creates and removes a temporary raw Zarr.
+AGENTS_AGENT_MODE=1 .venv/bin/python benchmarks/bench_torch.py \
+  --native-dir /tmp/vc-reader-cuda --shape 16 16 16 \
+  --batches 4 --reps 1 --output /tmp/torch-smoke.json
+
+# Real-data comparison: 3 × 64 batches of four 128³ crops per route.
+AGENTS_AGENT_MODE=1 .venv/bin/python benchmarks/bench_torch.py \
+  --native-dir /tmp/vc-reader-cuda --array /path/to/volume.zarr --level 2 \
+  --batches 64 --batch-size 4 --reps 3 --output /tmp/torch-loader.json
+
+# Regression tests: real CUDA when available, CPU configuration checks otherwise.
+AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=/tmp/vc-reader-cuda \
+  .venv/bin/python tests/test_torch.py -v
+
+# A separate profiling run, excluded from performance comparisons.
+AGENTS_AGENT_MODE=1 nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
+  --output=/tmp/torch-loader-profile .venv/bin/python benchmarks/bench_torch.py \
+  --native-dir /tmp/vc-reader-cuda --modes prefetch --shape 128 128 128 \
+  --batches 4 --reps 1 --output /tmp/torch-profile-timing.json
+```
+
+The regression suite checks per-sample equivalence, image/label routing,
+metadata, source removal, variable/pyramid outputs, dtypes, CUDA streams,
+training backward, epoch seeds, spawn workers, partial batches, early iterator
+closure, and validation errors. `VC_READER_NATIVE_DIR` is inherited by spawned
+test/benchmark workers so they load the same extensions as the parent. Without
+that variable, tests use the installed extensions.
+
+Measured on PHercParis4 level 2 with an RTX 5090, PyTorch 2.14.1+cu130 and a
+Release CUDA build: three repetitions of 64 batches of four 128³ crops, after
+one validation/warmup epoch per route. Four spawned CPU loader workers and four
+native reader threads per worker were used for the batch routes. All 256 crop
+hashes matched exactly across routes. The [complete report](../docs/benchmarks/torch.json)
+contains the exact volume path, command, build provenance and raw timings.
+
+| Route | Mean batch ms | p50 ms | p95 ms | Crops/s |
+| --- | ---: | ---: | ---: | ---: |
+| Per-sample CUDA, `num_workers=0` | 8.765 | 8.631 | 9.478 | 456.18 |
+| Fixed-shape async prototype | 7.497 | 6.878 | 8.482 | 533.31 |
+| `Pipeline.batch()` | 7.744 | 7.340 | 8.597 | 516.33 |
+| `CudaLoader`, one batch ahead | 7.539 | 7.157 | 8.540 | 530.35 |
+
+The public loader delivered 16.3% higher throughput than the per-sample route,
+and was within 0.6% of the fixed-shape prototype. These are loader-only results,
+not a measured training speedup. Public outputs use the PyTorch allocator and
+support target routing and shape changes; no float precision or transform
+parameters were changed. The native executor still loops over samples within
+the submitted batch; this change exposes and schedules it, rather than adding
+new batched kernels.
+
+A separate Nsight Systems trace of the public prefetch route (four warmup plus
+four measured batches on the same volume) attributed 46.1% of GPU kernel time
+to `geometry_kernel`, 19.5% to `expand_controls`, and 10.4% to
+`field_energy_gradient`. These existing geometry/elastic kernels remain the
+main GPU costs. Profiling includes warmup and is excluded from the timing table.
+
+## Reader and pipeline benchmarks
+
 [`bench_pipeline.py`](bench_pipeline.py) has two suites:
 
 - `--suite readers` (default): reading/sampling only, comparing vc_reader CPU,

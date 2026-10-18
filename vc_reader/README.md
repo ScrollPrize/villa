@@ -1,5 +1,94 @@
 # vc_reader
 
+## PyTorch CUDA batches
+
+Keep your ordinary PyTorch dataset and DataLoader. Wrap the loader to upload
+whole batches and run normalization and augmentation on the training GPU:
+
+```python
+from torch.utils.data import DataLoader
+from vc_reader import augment as A
+from vc_reader.torch import CudaLoader
+
+def train(dataset, model):
+    # Each dataset item is a dict, e.g. image: (C, Z, Y, X), label: (C, Z, Y, X).
+    cpu_loader = DataLoader(
+        dataset, batch_size=4, num_workers=4,
+        multiprocessing_context="spawn", pin_memory=True, persistent_workers=True,
+    )
+    pipeline = A.Pipeline(
+        [A.Normalize("minmax"), A.Flip(axes="xyz"), A.Gamma((0.8, 1.2))],
+        targets={"image": A.Image(), "label": A.Label()},
+        backend="cuda",
+    )
+    loader = CudaLoader(cpu_loader, pipeline, device="cuda:0", seed=123)
+    for epoch in range(10):
+        loader.set_epoch(epoch)
+        for batch in loader:
+            prediction = model(batch["image"])
+            # batch["label"] is also a CUDA tensor, with its original dtype.
+            # Compute loss, backward, and optimizer step here.
+
+# Call train(...) under `if __name__ == "__main__":` when using spawn workers.
+```
+
+This requires PyTorch (the optional `torch` extra), a CUDA-enabled vc_reader
+build (`VC_READER_ENABLE_CUDA=ON`), and an accessible CUDA device. Importing the
+catalog, reader, or ordinary augmentation API does not import PyTorch.
+
+The dataset can use `ZarrReader` to return CPU crops. CUDA work belongs in the
+training process: wrap the **DataLoader**, rather than calling a CUDA pipeline
+inside `Dataset.__getitem__` or a worker's `collate_fn`. The wrapper also accepts
+an iterable that supplies already-resident CUDA batches in that process. It
+does not change your sampler, dataset, or worker configuration.
+
+- Dense batch targets have shape `(B, C, Y, X)` or `(B, C, Z, Y, X)`. Include the
+  channel axis even for one-channel images and labels. Points/vectors use the
+  existing per-sample shapes with a leading batch axis.
+- Each declared target is uploaded as one batch. `uint8` continuous targets
+  become `float32` **on the GPU**; float32/float64 and label dtypes are preserved.
+  Other continuous integer types and reduced-precision floats require an
+  explicit conversion. Existing CUDA inputs must be on the selected device.
+- Only fields declared in `pipeline.targets` are processed. Metadata—including
+  CPU tensors of sample IDs or seeds—passes through unchanged. All target
+  inputs are preserved; this preprocessing API does not accept autograd inputs.
+- Normalization and augmentation stay on device. Results are ordinary
+  PyTorch-owned tensors, safe to retain after advancing or closing the iterator.
+  Equal output shapes are stacked; variable shapes produce per-sample lists.
+  Deep-supervision outputs are lists of levels, each stacked when shapes agree.
+- The default `prefetch=True` queues one batch ahead on a private CUDA stream.
+  Completion and data-validation errors are checked before a batch is yielded.
+  Only small validation flags return to CPU. Use `prefetch=False` for on-demand
+  iteration. If keeping an iterator after an early break, call `iterator.close()`
+  (or use `contextlib.closing`) to promptly release the prefetched batch.
+
+For custom training loops, use the same executor directly:
+
+```python
+# CPU/NumPy targets are uploaded; CUDA tensors or DeviceArrays stay on device.
+result = pipeline.batch(batch, seeds=per_sample_seeds, device="cuda:0")
+```
+
+`Pipeline.batch()` infers the device from resident targets when `device` is
+omitted, otherwise uses the current CUDA device. It uses PyTorch's current
+stream and completes/checks once per batch before returning. As with normal
+PyTorch tensors, callers switching streams after the return must coordinate
+those streams. Native batch execution currently loops over samples internally;
+the public API submits the full batch and does not synchronize between samples.
+
+Default loader seeds depend on `seed`, `epoch`, and sample position in the
+local iteration order. `set_epoch()` changes augmentation seeds only: call
+`DistributedSampler.set_epoch()` separately when using DDP, and create one
+`CudaLoader` per training rank with its assigned device. For seeds independent
+of batching, ordering, or rank, supply a CPU metadata field and set
+`CudaLoader(..., seed_key="aug_seed")`. Each entry must be a uint64-range integer;
+`np.asarray(A.seed(run_seed, epoch, sample_id), dtype=np.uint64)` is suitable for
+dataset items and default PyTorch collation. Explicit seeds override generated
+seeds, so `set_epoch()` does not change them.
+
+See the [loader benchmark and regression commands](benchmarks/README.md#pytorch-cuda-batches)
+for timing scope and validation.
+
 ## Performance
 
 Measured on PHercParis4 (level 2) using an Intel Core Ultra 7 270K Plus and

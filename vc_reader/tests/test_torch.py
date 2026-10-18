@@ -158,6 +158,16 @@ class BatchTests(unittest.TestCase):
         ref = p({'image': cuda.asarray(np.ones((1, 2, 3, 4), np.float32))}, seed=1)
         self.assertTrue(np.all(ref['image'].numpy() == 1))
 
+    def test_full_uint64_seeds_after_default_collation(self):
+        seeds = [(1 << 64) - 1, 1 << 63, 7]
+        p = A.Pipeline([A.BrightnessMultiply((.5, 1.5))], backend='cuda')
+        batch = torch.utils.data.default_collate([
+            {'image': x, 'seed': np.asarray(seed, dtype=np.uint64)}
+            for x, seed in zip(image_batch(), seeds)])
+        expected = p.batch(batch, seeds=seeds)['image']
+        self.assertSame(p.batch(batch, seeds=batch['seed'])['image'], expected)
+        self.assertSame(next(iter(CudaLoader([batch], p, seed_key='seed')))['image'], expected)
+
 
 @unittest.skipUnless(torch.cuda.is_available() and A._native.cuda_available(), "CUDA build and device required")
 class LoaderTests(unittest.TestCase):

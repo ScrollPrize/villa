@@ -44,8 +44,12 @@ def _targets(pipeline, batch):
 
 
 def _seeds(values, count):
-    if isinstance(values, torch.Tensor) and values.device.type != "cpu":
-        raise ValueError("seeds must be on CPU")
+    if isinstance(values, torch.Tensor):
+        if values.device.type != "cpu":
+            raise ValueError("seeds must be on CPU")
+        # Tensor.__index__ converts through signed int64 even for uint64.
+        # tolist() preserves the full range emitted by augment.seed().
+        values = values.tolist()
     result = [operator.index(value) for value in values]
     if len(result) != count:
         raise ValueError("seeds must contain one integer per sample")
