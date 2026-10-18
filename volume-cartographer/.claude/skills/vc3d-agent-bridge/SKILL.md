@@ -68,7 +68,12 @@ it takes a few seconds.
 `vc3d_push_pull_start` acts at the last recorded pointer position, not a
 position you pass it. Use `vc3d_drag` with `button="none"` to hover-position
 the cursor first (no press/release, just interpolated move events), then
-call `vc3d_push_pull_start`, wait, then `vc3d_push_pull_stop`.
+call `vc3d_push_pull_start`, wait, then `vc3d_push_pull_stop`. The same rule
+applies to keyboard holds: hover first, then `vc3d_key(key="A", hold_ms=...)`.
+A `vc3d_key(action="press")` stays down until a matching `action="release"`
+or until its `hold_ms` (10 s by default) runs out, and keys are also released
+if the MCP connection drops; `vc3d_get_state` lists held keys in `heldKeys`.
+Prefer the typed tool whenever one exists.
 
 ## 7. Fiber tracing (`vc3d_fiber_launch` + a fiber workspace pane)
 

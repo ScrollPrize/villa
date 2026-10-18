@@ -411,6 +411,68 @@
         "type": "object"
       }
     },
+    "canvas.key": {
+      "errors": [
+        -32602,
+        -32002,
+        -32009,
+        -32004,
+        -32005
+      ],
+      "mcp": {
+        "paramRenames": {
+          "holdMs": "hold_ms"
+        },
+        "tool": "vc3d_key"
+      },
+      "params": {
+        "properties": {
+          "action": {
+            "default": "tap",
+            "enum": [
+              "tap",
+              "press",
+              "release"
+            ],
+            "type": "string"
+          },
+          "holdMs": {
+            "maximum": 60000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "key": {
+            "type": "string"
+          },
+          "modifiers": {
+            "items": {
+              "enum": [
+                "shift",
+                "ctrl",
+                "alt",
+                "meta",
+                "keypad"
+              ],
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "viewer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "type": "object"
+      }
+    },
     "canvas.shift_click": {
       "errors": [
         -32602,
@@ -487,6 +549,83 @@
         },
         "required": [
           "position"
+        ],
+        "type": "object"
+      }
+    },
+    "canvas.wheel": {
+      "errors": [
+        -32602,
+        -32002,
+        -32009,
+        -32001,
+        -32003
+      ],
+      "mcp": {
+        "paramRenames": {
+          "deltaY": "delta_y"
+        },
+        "tool": "vc3d_wheel"
+      },
+      "params": {
+        "properties": {
+          "deltaY": {
+            "maximum": 12000,
+            "minimum": -12000,
+            "type": "integer"
+          },
+          "modifiers": {
+            "items": {
+              "enum": [
+                "shift",
+                "ctrl",
+                "alt",
+                "meta",
+                "keypad"
+              ],
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "position": {
+            "properties": {
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              },
+              "z": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "type": "object"
+          },
+          "space": {
+            "default": "volume",
+            "enum": [
+              "volume",
+              "scene"
+            ],
+            "type": "string"
+          },
+          "viewer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "position",
+          "deltaY"
         ],
         "type": "object"
       }

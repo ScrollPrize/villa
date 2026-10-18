@@ -31,6 +31,7 @@ import shutil
 import socket
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -296,10 +297,10 @@ def check_rpc_describe(
         coverage = description.get("coverage", {})
         complete = (
             description.get("undocumented") == []
-            and coverage.get("described") == 120
-            and coverage.get("registered") == 120
+            and coverage.get("described") == 122
+            and coverage.get("registered") == 122
             and coverage.get("complete") is True
-            and len(snapshot["methods"]) == 120
+            and len(snapshot["methods"]) == 122
         )
         rendered = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         if update_snapshot:
@@ -516,6 +517,188 @@ def check_viewer_registry(client: BridgeClient, results: Results) -> None:
         )
     except Exception as error:  # noqa: BLE001
         results.record("viewer_registry", False, f"{type(error).__name__}: {error}")
+
+
+def check_canvas_input(sock_path: str, client: BridgeClient, results: Results) -> None:
+    """canvas.key and canvas.wheel reach the viewer through real Qt events."""
+    failures: list[str] = []
+    try:
+        client.call("workspace.switch", {"name": "main"}, timeout=RPC_TIMEOUT)
+        tap, _ = client.call("canvas.key", {"key": "Escape"}, timeout=RPC_TIMEOUT)
+        if (tap.get("key") != "Esc" or tap.get("heldKeys") != []
+                or "accepted" not in tap or tap.get("dismissed") != []):
+            failures.append(f"tap={tap}")
+        pressed, _ = client.call(
+            "canvas.key", {"key": "Shift", "action": "press"}, timeout=RPC_TIMEOUT)
+        state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        held_in_state = [k.get("key") for k in state.get("heldKeys", [])]
+        released, _ = client.call(
+            "canvas.key", {"key": "Shift", "action": "release"}, timeout=RPC_TIMEOUT)
+        if pressed.get("heldKeys") != ["Shift"] or released.get("heldKeys") != []:
+            failures.append(f"press={pressed} release={released}")
+        if pressed.get("holdMs") != 10000 or held_in_state != ["Shift"]:
+            failures.append(f"press limit={pressed.get('holdMs')} state={held_in_state}")
+        if released.get("wasHeld") is not True:
+            failures.append(f"release wasHeld={released.get('wasHeld')}")
+        # A press with a short limit is released without a release call.
+        client.call(
+            "canvas.key", {"key": "F23", "action": "press", "holdMs": 100},
+            timeout=RPC_TIMEOUT)
+        time.sleep(0.5)
+        state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        if state.get("heldKeys") != []:
+            failures.append(f"press limit kept {state.get('heldKeys')}")
+        started = time.monotonic()
+        held, _ = client.call(
+            "canvas.key", {"key": "F24", "holdMs": 200}, timeout=RPC_TIMEOUT)
+        elapsed = time.monotonic() - started
+        if held.get("holdMs") != 200 or held.get("heldKeys") != [] or elapsed < 0.19:
+            failures.append(f"hold={held} elapsed={elapsed:.3f}")
+        # A hold's timer releases only its own press: release the held key
+        # early and press it again, and the new press outlives the old timer.
+        hold_result: dict = {}
+
+        def hold() -> None:
+            try:
+                hold_result["value"], _ = client.call(
+                    "canvas.key", {"key": "F20", "holdMs": 800}, timeout=RPC_TIMEOUT)
+            except Exception as error:  # noqa: BLE001
+                hold_result["error"] = f"{type(error).__name__}: {error}"
+
+        holder = threading.Thread(target=hold, daemon=True)
+        holder.start()
+        time.sleep(0.2)
+        client.call("canvas.key", {"key": "F20", "action": "release"}, timeout=RPC_TIMEOUT)
+        client.call(
+            "canvas.key", {"key": "F20", "action": "press", "holdMs": 5000},
+            timeout=RPC_TIMEOUT)
+        holder.join(timeout=RPC_TIMEOUT)
+        time.sleep(0.2)
+        state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        still_held = [k.get("key") for k in state.get("heldKeys", [])]
+        client.call("canvas.key", {"key": "F20", "action": "release"}, timeout=RPC_TIMEOUT)
+        if (hold_result.get("value", {}).get("releasedEarly") is not True
+                or still_held != ["F20"]):
+            failures.append(f"hold serial: hold={hold_result} held after={still_held}")
+        # Tapping a key this connection holds is refused.
+        client.call("canvas.key", {"key": "F22", "action": "press"}, timeout=RPC_TIMEOUT)
+        try:
+            client.call("canvas.key", {"key": "F22"}, timeout=RPC_TIMEOUT)
+            failures.append("tap of a held key accepted")
+        except BridgeError as error:
+            if error.code != -32009:
+                failures.append(f"tap of a held key code={error.code}")
+        client.call("canvas.key", {"key": "F22", "action": "release"}, timeout=RPC_TIMEOUT)
+        # A viewer on a hidden workspace is refused: its key would reach the
+        # focused widget's shortcuts instead.
+        spiral = [v for v in state.get("viewers", [])
+                  if v.get("workspace") == "spiral" and v.get("kind") == "chunked"]
+        if spiral:
+            try:
+                client.call(
+                    "canvas.key", {"key": "Escape", "viewer": spiral[0]["viewerId"]},
+                    timeout=RPC_TIMEOUT)
+                failures.append("key to a hidden viewer accepted")
+            except BridgeError as error:
+                if error.code != -32009:
+                    failures.append(f"hidden viewer code={error.code}")
+    except Exception as error:  # noqa: BLE001
+        failures.append(f"{type(error).__name__}: {error}")
+    for params, param in (
+        ({"key": "A,B"}, "key"),
+        ({"key": "A", "action": "release", "holdMs": 10}, "holdMs"),
+        ({"key": "A", "holdMs": 60001}, "holdMs"),
+    ):
+        ok, detail = expect_param_error(client, "canvas.key", params, param)
+        if not ok:
+            failures.append(f"{params}: {detail}")
+    results.record(
+        "canvas_key",
+        not failures,
+        "tap, press/release, press limit and hold delivered" if not failures
+        else "; ".join(failures[:4]),
+    )
+
+    # A key whose shortcut opens a modal dialog (Ctrl+O opens the project
+    # browser) gets the dialog answered, while another client's requests
+    # wait for the call instead of running inside the dialog's event loop.
+    failures = []
+    other = None
+    try:
+        before, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        other = BridgeClient(sock_path, connect_timeout=RPC_TIMEOUT)
+        stop = threading.Event()
+        pings: list[str] = []
+
+        def ping_loop() -> None:
+            while not stop.is_set():
+                try:
+                    other.call("ping", {}, timeout=RPC_TIMEOUT)
+                    pings.append("ok")
+                except Exception as error:  # noqa: BLE001
+                    pings.append(f"{type(error).__name__}: {error}")
+                    return
+
+        pinger = threading.Thread(target=ping_loop, daemon=True)
+        pinger.start()
+        opened = []
+        for _ in range(3):
+            result, _ = client.call("canvas.key", {"key": "Ctrl+O"}, timeout=RPC_TIMEOUT)
+            opened.extend(result.get("dismissed", []))
+            if any(not {"class", "title", "answer"} <= set(entry) for entry in opened):
+                failures.append(f"dismissed={opened}")
+        stop.set()
+        pinger.join(timeout=RPC_TIMEOUT)
+        after, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        if after.get("vpkg") != before.get("vpkg"):
+            failures.append(f"project changed: {after.get('vpkg')}")
+        if not pings or any(p != "ok" for p in pings):
+            failures.append(f"pings={pings[-3:]}")
+        detail = f"dismissed={[(e.get('class'), e.get('answer')) for e in opened]} pings={len(pings)}"
+    except Exception as error:  # noqa: BLE001
+        failures.append(f"{type(error).__name__}: {error}")
+        detail = ""
+    finally:
+        if other is not None:
+            other.close()
+    results.record(
+        "canvas_key_dialog",
+        not failures,
+        detail if not failures else "; ".join(failures[:4]),
+    )
+
+    try:
+        ok, detail = expect_param_error(
+            client,
+            "canvas.wheel",
+            {"viewer": "xy plane", "position": {"x": 5, "y": 5}, "space": "scene",
+             "deltaY": 0},
+            "deltaY",
+        )
+        state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        before = next(
+            (v["scale"] for v in state.get("viewers", []) if v.get("surfName") == "xy plane"),
+            None,
+        )
+        wheel, _ = client.call(
+            "canvas.wheel",
+            {"viewer": "xy plane", "position": {"x": 5, "y": 5}, "space": "scene",
+             "deltaY": 120},
+            timeout=RPC_TIMEOUT,
+        )
+        state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        after = next(
+            (v["scale"] for v in state.get("viewers", []) if v.get("surfName") == "xy plane"),
+            None,
+        )
+        ok = ok and wheel.get("notches") == 1.0 and before is not None and after != before
+        results.record(
+            "canvas_wheel_zoom",
+            ok,
+            f"{detail}; scale {before} -> {after}; accepted={wheel.get('accepted')}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record("canvas_wheel_zoom", False, f"{type(error).__name__}: {error}")
 
 
 # Every workspace id in tab order (AgentBridgeUi.hpp's agentBridgeWorkspaceIds,
@@ -1944,6 +2127,8 @@ def main() -> int:
             check_canvas_normalization(client, results)
             check_viewer_registry(client, results)
             check_workspaces(client, results)
+            check_canvas_input(sock_path, client, results)
+            require_running(proc, results, "canvas input")
 
             check_volume_attach(client, results, tmp_path, volpkg)
             check_segments_attach(client, results, tmp_path, volpkg)

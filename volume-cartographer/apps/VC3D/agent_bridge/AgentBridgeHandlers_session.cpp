@@ -73,6 +73,7 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         result["autosave"] = QJsonValue::Null;
         result["viewers"] = QJsonArray();
         result["workspace"] = workspacesJson();
+        result["heldKeys"] = heldKeysJson();
         result["job"] = QJsonValue::Null;
         result["focusPoi"] = QJsonValue::Null;
         return result;
@@ -202,6 +203,7 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
     }
     result["viewers"] = viewers;
     result["workspace"] = workspacesJson();
+    result["heldKeys"] = heldKeysJson();
 
     // "job" is the most recently started active job; "jobs" lists all of them.
     QJsonObject mostRecentActive;

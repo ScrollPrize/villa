@@ -443,3 +443,119 @@ async def vc3d_drag(
             }
         ),
     )
+
+
+
+@mcp.tool()
+async def vc3d_key(
+    key: str,
+    viewer: Optional[str] = None,
+    modifiers: Optional[_Modifiers] = None,
+    action: Literal["tap", "press", "release"] = "tap",
+    hold_ms: Optional[int] = None,
+) -> dict[str, Any]:
+    """Press a key in a viewer as a keyboard user would. VC3D receives real
+    key events: shortcuts get the first chance, then the viewer, then the main
+    window's key handler (segmentation editing, wrap annotation, fibers), so
+    every keybinding behaves as it does for a person. Prefer a typed tool
+    when one exists (vc3d_grow_segment, vc3d_push_pull_start/stop,
+    vc3d_enable_editing, vc3d_manual_add_begin, vc3d_zoom_viewer, ...): it
+    reports errors and jobs, which a key cannot. Use keys for bindings without
+    a typed tool.
+
+    key: one key in Qt portable text, case-insensitive: "E", "Esc", "Space",
+    "Delete", "F5", "Left", "1", "%", or a combination such as "Shift+G".
+    Bare modifier keys are "Shift", "Ctrl", "Alt", "Meta". VC3D's Help >
+    Keybinds dialog lists every binding; among those without a typed tool are
+    B / N (approval / unapproval painting), S (line drawing, held), Q / E
+    (push/pull radius), Space (toggle the volume overlay), R (center focus on
+    the cursor), X (recenter on focus), and Shift+G / Shift+H (lower / raise
+    the Z-scroll sensitivity).
+    viewer: viewer id ("v1") or surface-slot name; default "segmentation".
+    It must be visible (switch to its workspace first). Keyboard focus moves
+    to it for the call and then returns to where it was.
+    modifiers: any of "shift", "ctrl", "alt", "meta", "keypad", merged with
+    any spelled in key. Modifier keys go down before the key and come up
+    after it.
+    action: "tap" (press then release, the default), "press" (the key stays
+    down until a matching "release" on this connection, or until hold_ms
+    runs out; pressing a held key again is an auto-repeat), or "release".
+    hold_ms: with "tap", keep the key down this long (1..60000 ms) and return
+    after the release; use it for hold tools such as line drawing (S). With
+    "press", the longest the key stays down before VC3D releases it
+    (default 10000), so a forgotten press cannot keep a tool running.
+
+    Keys held by this MCP connection are released automatically if it
+    disconnects; vc3d_get_state lists them in "heldKeys". Do not send keys
+    while a person is typing in VC3D: the events share the real focus chain.
+    A key whose shortcut opens a dialog or menu has it answered as Escape
+    would (Cancel or No, never a destructive choice) and listed in
+    "dismissed"; use the typed tool for that action instead.
+
+    Returns {"viewerId", "key", "modifiers", "action", "accepted" (a widget or
+    shortcut handled the key), "heldKeys" (keys this connection still holds),
+    "dismissed"}, plus "holdMs"/"releasedEarly" for holds, "holdMs" and
+    "autoRepeat" for press, and "wasHeld" for release. Errors: -32602
+    (unknown key, hold_ms with release), -32002 (viewer), -32009 (not a
+    volume viewer, viewer not visible, a modal dialog or menu is open, or
+    tapping a key this connection holds), -32004 (another hold is already
+    pending on this connection).
+    """
+    # A tap with hold_ms answers only after the release.
+    timeout = hold_ms / 1000.0 + 10.0 if hold_ms is not None and action == "tap" else None
+    return await _call(
+        "canvas.key",
+        _strip_none(
+            {
+                "viewer": viewer,
+                "key": key,
+                "modifiers": modifiers,
+                "action": action,
+                "holdMs": hold_ms,
+            }
+        ),
+        timeout=timeout,
+    )
+
+
+@mcp.tool()
+async def vc3d_wheel(
+    position: _Point,
+    delta_y: int,
+    viewer: Optional[str] = None,
+    space: Literal["volume", "scene"] = "volume",
+    modifiers: Optional[_Modifiers] = None,
+) -> dict[str, Any]:
+    """Turn the mouse wheel over a viewer at a position. VC3D receives a real
+    wheel event at that point, so the viewer's own wheel bindings apply:
+    plain wheel zooms around the point by one step per call whatever the
+    number of notches (use vc3d_zoom_viewer for a set factor), Shift+wheel
+    steps the slice (or the surface offset) one step per notch, and
+    Ctrl+wheel changes the segmentation tool radius by one step per notch.
+
+    position: {"x","y","z"} in volume space (default) or {"x","y"} in scene
+    space when space="scene"; a volume point must lie on the viewer's current
+    view (-32003), as for vc3d_click.
+    delta_y: wheel angle in Qt units, 120 per notch; positive scrolls up
+    (zoom in), negative down. Nonzero, within -12000..12000. Partial notches
+    accumulate in the viewer like a smooth-scrolling mouse.
+    viewer: viewer id ("v1") or surface-slot name; default "segmentation".
+    modifiers: any of "shift", "ctrl", "alt", "meta", "keypad".
+
+    Returns {"viewerId", "scene", "volumePoint" (null off the surface),
+    "deltaY", "notches", "modifiers", "accepted"}. Errors: -32602, -32002,
+    -32009 (not a volume viewer, or a modal dialog or menu is open), -32001
+    (no volume loaded), -32003 (point not on the view).
+    """
+    return await _call(
+        "canvas.wheel",
+        _strip_none(
+            {
+                "viewer": viewer,
+                "position": position,
+                "space": space,
+                "deltaY": delta_y,
+                "modifiers": modifiers,
+            }
+        ),
+    )

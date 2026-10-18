@@ -165,4 +165,48 @@ void AgentBridgeServer::registerCanvasHandlers()
             },
         },
         [this](const QJsonValue& p) { return handleCanvasDrag(p); });
+
+    // How long a tap holds the key, or the longest a press keeps it down.
+    AgentBridgeParam holdMs = Params::optionalInteger(QStringLiteral("holdMs"));
+    holdMs.minimum = 1;
+    holdMs.maximum = 60000;
+    registerMethod(
+        {
+            .name = QStringLiteral("canvas.key"),
+            .params = {
+                optionalViewer(),
+                Params::requiredString(QStringLiteral("key")),
+                optionalModifiers(),
+                Params::optionalStringEnum(
+                    QStringLiteral("action"),
+                    {
+                        QStringLiteral("tap"),
+                        QStringLiteral("press"),
+                        QStringLiteral("release"),
+                    },
+                    QStringLiteral("tap")),
+                holdMs,
+            },
+            .errors = {-32602, -32002, -32009, -32004, -32005},
+            .mcp = canvasMcp(QStringLiteral("vc3d_key")),
+        },
+        [this](const QJsonValue& p) { return handleCanvasKey(p); });
+
+    AgentBridgeParam deltaY = Params::requiredInteger(QStringLiteral("deltaY"));
+    deltaY.minimum = -12000;
+    deltaY.maximum = 12000;
+    registerMethod(
+        {
+            .name = QStringLiteral("canvas.wheel"),
+            .params = {
+                optionalViewer(),
+                point(QStringLiteral("position")),
+                space(),
+                deltaY,
+                optionalModifiers(),
+            },
+            .errors = {-32602, -32002, -32009, -32001, -32003},
+            .mcp = canvasMcp(QStringLiteral("vc3d_wheel")),
+        },
+        [this](const QJsonValue& p) { return handleCanvasWheel(p); });
 }

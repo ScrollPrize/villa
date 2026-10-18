@@ -112,6 +112,7 @@ AgentBridgeServer::~AgentBridgeServer()
     // Clean-shutdown removal of the discovery registry file. A hard kill skips
     // this; the reader-side stale-PID check reaps the orphan instead.
     removeRegistryFile();
+    delete _keyboardModifierSink.data();
 }
 
 
@@ -384,6 +385,7 @@ void AgentBridgeServer::onSocketDisconnected()
     if (!socket)
         return;
     _buffers.remove(socket);
+    releaseHeldKeys(socket);
 
     // Drop any deferred responses still pending for this connection so their
     // timers do not fire against a dead socket and the (connection, method)

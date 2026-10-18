@@ -88,7 +88,9 @@ VC3D-AGENT-BRIDGE: listening name=<serverName> path=<fullServerName>
 
 Handlers must not open dialogs or run nested event loops. Operations that may
 outlive one GUI-thread turn return jobs or use a deferred response completed by
-an application signal.
+an application signal. The one exception is `canvas.key`: a key can reach a
+shortcut that opens a dialog or menu, which the bridge answers from inside its
+event loop (see Canvas and viewers).
 
 ## Method descriptions
 
@@ -147,6 +149,33 @@ Buttons are `left`, `right`, `middle`, or, where declared, `none`. Modifiers
 are arrays containing `shift`, `ctrl`, `alt`, `meta`, or `keypad`. The bridge
 delivers the corresponding Qt input to the real viewer so existing signal
 wiring and tool behavior remain authoritative.
+
+### Keyboard and wheel input
+
+`canvas.key` and `canvas.wheel` construct real `QKeyEvent` and `QWheelEvent`
+objects and send them through `QApplication::notify`. A key press is offered
+to the shortcut map first; the target viewer's view then receives it and
+propagates keys it does not handle to its parents, so
+`CWindow::keyPressEvent` and `SegmentationModule` stay authoritative. A wheel
+event goes to the viewer's viewport at the requested point, as for a pointer
+over it.
+
+A key is one key in Qt portable text (`E`, `Esc`, `Space`, `F5`, `Ctrl+Z`);
+bare modifier keys are `Shift`, `Ctrl` or `Control`, `Alt`, `Meta`. Modifiers
+spelled in the key merge with the `modifiers` array. Modifier keys are pressed
+before the key, in the order Shift, Control, Alt, Meta, and released after it
+in reverse order. Keyboard focus moves to the target viewer for the call, as a
+click into it would, so shortcuts scoped to the viewer match; afterwards it
+returns to the widget that had it, unless the key moved it. A synthesized
+press leaves its modifiers in `QGuiApplication::keyboardModifiers()`, which
+item views and other code read, so after keys are released the bridge resets
+that value to the modifiers of the keys still held. Wheel deltas use Qt angle
+units, 120 per notch.
+
+Synthesized events bypass Qt's modal blocking, so `canvas.key` and
+`canvas.wheel` return -32009 with `data.window` (`class`, `title`) while a
+modal dialog or popup menu is open, as a person could not reach the viewers
+either.
 
 ### Identifiers
 
@@ -272,7 +301,8 @@ dialog.
   viewer entry names its `workspace` (null outside an addressable tab) and
   whether it is `visible`. `workspace.current` is the current tab's id (null
   for an unnamed line-annotation tab) and `workspace.available` lists
-  `{id, title}` in tab order.
+  `{id, title}` in tab order. `heldKeys` lists the keys `canvas.key` holds
+  (`key`, `modifiers`, `viewerId`).
 - `workspace.switch` accepts every workspace id (`main`, `lasagna`, `atlas`,
   `fiber-slice`, `intersections`, `spiral`, `fiber-map`) plus the original
   `fiber_slice` spelling, and changes the tab exactly as the GUI does. It
@@ -325,6 +355,33 @@ dialog.
 
 - `canvas.click`, `canvas.shift_click`, and `canvas.drag` deliver real viewer
   input. A buttonless drag moves the cursor without starting a gesture.
+- `canvas.key` `tap` presses and releases. `press` leaves the key down until
+  a `release` on the same connection or until `holdMs` elapses (10000 ms when
+  omitted), and a second `press` of a held key is an auto-repeat. With `tap`,
+  `holdMs` keeps the key down for that long and answers after the release as
+  a deferred response; a second hold on the same connection while one is
+  pending returns -32004, and a `release` of the held key ends the hold early.
+  `release` rejects `holdMs`. Tapping a key the connection holds returns
+  -32009. Keys a connection holds are released when it disconnects, and a
+  held key is released with the modifiers it was pressed with; `state.get`
+  lists every held key in `heldKeys`. For `tap` and `press` the viewer must
+  be visible (-32009 otherwise): shortcuts are matched against the focused
+  widget, so a key for a hidden viewer would reach another widget's shortcut.
+  A `release` is always delivered, even behind a modal dialog or to a hidden
+  viewer, so a held key can always be let go. `accepted` reports
+  whether a widget or shortcut handled the key event.
+- A key can reach a shortcut that opens a dialog or menu. The bridge answers
+  it as Escape would, from inside its event loop: a message box gets its
+  escape button (its Cancel, No, or only button), or is closed without a
+  button when it has none; any other modal dialog is rejected; a menu is
+  closed. Each is listed in `dismissed` with `class`, `title`, and `answer`.
+  Non-modal windows and progress dialogs are left alone. Native dialogs are
+  switched off for the call, so file pickers are Qt dialogs. Requests from
+  any client, the bridge's key-release timers, and its queued state checks
+  that come due meanwhile wait until the call ends.
+- `canvas.wheel` rejects a zero `deltaY`. It requires a current volume and,
+  for volume-space positions, a point on the viewer's current view. Partial
+  notches accumulate in the view as they do for a smooth-scrolling mouse.
 - `viewer.rotate` accepts normalized plane spellings and supports relative or
   absolute angles. Axis-aligned slices must be enabled.
 - Wrap annotation mode, commit, and undo target the selected chunked viewer and
@@ -477,6 +534,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_grow_patch_from_seed` | `segmentation.grow_patch_from_seed` | Create a brand-new segment by growing a patch from a 3D seed point (headless GrowPatch). Async: returns a jobId and outputDir. |
 | `vc3d_grow_segment` | `segmentation.grow` | Grow the active segmentation surface (method: tracer/corrections/patch_tracer; direction; steps). Async: returns a jobId. |
 | `vc3d_job_status` | `job.status` | Poll a job by id (or the latest job): state, message, console tail. |
+| `vc3d_key` | `canvas.key` | Press, release, tap, or hold a key in a viewer; keybindings behave as for a keyboard. |
 | `vc3d_lasagna_cancel` | `lasagna.cancel` |
 | `vc3d_lasagna_ensure_service` | `lasagna.ensure_service` |
 | `vc3d_lasagna_jobs` | `lasagna.jobs` |
@@ -543,6 +601,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_switch_workspace` | `workspace.switch` | Switch to any of the seven workspace tabs, as a tab click does. |
 | `vc3d_undo_wrap_annotation` | `wrap_annotation.undo` | Undo the same-wrap annotation (Ctrl+Z equivalent): clear the preview or undo the last committed collection. |
 | `vc3d_update_point` | `points.update_point` |
+| `vc3d_wheel` | `canvas.wheel` | Turn the mouse wheel over a viewer point (zoom, slice step with Shift, tool radius with Ctrl). |
 | `vc3d_zoom_viewer` | `viewer.zoom` | Multiply a viewer's zoom by a factor (>1 zooms in). Returns the new scale. |
 
 ## Verification
@@ -586,3 +645,8 @@ volume-package fixtures and is intentionally separate from hermetic CI.
   fixture geometry require their corresponding runtime resources.
 - The local bridge is a trusted-user control surface, not a remote security
   boundary.
+- Synthesized keys share the live focus chain with a person at the keyboard.
+  They never reach the platform, but Qt's cached keyboard modifiers follow
+  them until the bridge resets them. Window-context shortcuts match only while
+  VC3D's window is active, as for hardware keys; after answering a dialog the
+  bridge activates the previously active window again if no window is active.

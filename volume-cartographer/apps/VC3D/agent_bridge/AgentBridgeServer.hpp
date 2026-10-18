@@ -11,6 +11,7 @@
 
 #include <QByteArray>
 #include <QHash>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QObject>
@@ -28,6 +29,7 @@
 #include "VolumeAttachmentController.hpp"
 
 #include "agent_bridge/AgentBridgeError.hpp"  // AgentBridgeError
+#include "agent_bridge/AgentBridgeKeyboard.hpp"
 #include "agent_bridge/AgentBridgeMethod.hpp"
 
 class QLocalServer;
@@ -188,6 +190,15 @@ private:
     QJsonObject handleCursorVolumePoint(const QJsonValue& params);
     QJsonObject handleCanvasClick(const QJsonValue& params, bool addShift);
     QJsonObject handleCanvasDrag(const QJsonValue& params);
+    // Keyboard and wheel input (AgentBridgeHandlers_input.cpp). Real QKeyEvent
+    // and QWheelEvent objects go through QApplication::notify, so shortcut
+    // overrides, the viewer's own handlers and propagation to
+    // CWindow::keyPressEvent behave as for hardware input.
+    QJsonObject handleCanvasKey(const QJsonValue& params);
+    QJsonObject handleCanvasWheel(const QJsonValue& params);
+    // Throws -32009 with data.window while a modal dialog or popup menu is
+    // open: synthesized events bypass Qt's modal blocking.
+    void requireNoBlockingWindow() const;
     // The viewer as a chunked volume viewer; any other kind of viewer throws
     // -32009 "Unsupported viewer for <operation>".
     static CChunkedVolumeViewer* requireChunkedViewer(
@@ -459,6 +470,40 @@ private:
     bool _idleWorkScheduled = false;
     bool _requestsPending = false;
     std::vector<std::function<void()>> _idleWork;
+
+    // --- Keys held by a connection (AgentBridgeHandlers_input.cpp) ---
+    // canvas.key presses and holds are tracked per connection, so a client
+    // that disconnects cannot leave a tool latched, and every held key has a
+    // timer that releases it.
+    struct HeldKey {
+        int serial = 0;  // matches the timer that releases this press only
+        QPointer<QLocalSocket> socket;
+        QPointer<QWidget> target;
+        QString viewerId;
+        AgentBridgeKeyStroke stroke;
+        bool orphaned = false;  // its connection closed; the release is queued
+    };
+    HeldKey& holdKey(QLocalSocket* socket, QWidget* target, const QString& viewerId,
+                     const AgentBridgeKeyStroke& stroke);
+    // After `delayMs`, releases the press `serial` if it is still held; with
+    // a deferred `token`, then answers it with `result`.
+    void scheduleHeldKeyRelease(int serial, int delayMs, int token,
+                                const QJsonObject& result, QLocalSocket* socket);
+    void finishHeldKey(int serial, int token, QJsonObject result,
+                       const QPointer<QLocalSocket>& socket);
+    // Releases a closed connection's keys once the bridge is idle.
+    void releaseHeldKeys(QLocalSocket* socket);
+    void releaseOrphanedKeys();
+    // Sets QGuiApplication::keyboardModifiers() to the modifiers of the keys
+    // still held (agentBridgeResetModifiers).
+    void resetKeyboardModifiers();
+    QJsonArray heldKeyNames(QLocalSocket* socket) const;
+    // state.get's "heldKeys": {key, modifiers, viewerId} for every held key.
+    QJsonArray heldKeysJson() const;
+    std::vector<HeldKey> _heldKeys;
+    int _nextHeldKeySerial = 1;
+    // Never shown and without a parent; deleted with the server.
+    QPointer<QWidget> _keyboardModifierSink;
 
     // --- Deferred responses ---
     // A handler calls beginDeferred() to stash the current (socket, id), arm a

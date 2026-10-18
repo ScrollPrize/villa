@@ -12,6 +12,7 @@
 #include <opencv2/core.hpp>
 
 #include "agent_bridge/AgentBridgeCommandError.hpp"
+#include "agent_bridge/AgentBridgeInput.hpp"
 #include "agent_bridge/AgentBridgeInternal.hpp"
 #include "agent_bridge/AgentBridgeMethod.hpp"
 #include "agent_bridge/AgentBridgeUi.hpp"
@@ -316,6 +317,70 @@ int main()
     const auto busyError = mapLaunchError(CommandLaunchError::Busy);
     CHECK(busyError.code == -32004);
     CHECK(busyError.data.value("source").toString() == QLatin1String("tool"));
+
+    // --- Keyboard input: key spelling, event text, modifier key order ---
+    {
+        const AgentBridgeKeySpec e = parseAgentBridgeKey(QStringLiteral("e"), Qt::NoModifier);
+        CHECK(e.key == Qt::Key_E);
+        CHECK(e.modifiers == Qt::NoModifier);
+        CHECK(e.text == QLatin1String("e"));
+        CHECK(e.name == QLatin1String("E"));
+
+        const AgentBridgeKeySpec shiftE =
+            parseAgentBridgeKey(QStringLiteral("E"), Qt::ShiftModifier);
+        CHECK(shiftE.text == QLatin1String("E"));
+
+        const AgentBridgeKeySpec undo =
+            parseAgentBridgeKey(QStringLiteral("ctrl+z"), Qt::NoModifier);
+        CHECK(undo.key == Qt::Key_Z);
+        CHECK(undo.modifiers == Qt::ControlModifier);
+        CHECK(undo.text.isEmpty());
+        CHECK(undo.name == QLatin1String("Z"));
+
+        // Spelled and array modifiers merge.
+        const AgentBridgeKeySpec merged =
+            parseAgentBridgeKey(QStringLiteral("Ctrl+G"), Qt::ShiftModifier);
+        CHECK(merged.modifiers == (Qt::ControlModifier | Qt::ShiftModifier));
+
+        CHECK(parseAgentBridgeKey(QStringLiteral("Esc"), Qt::NoModifier).key == Qt::Key_Escape);
+        CHECK(parseAgentBridgeKey(QStringLiteral("Space"), Qt::NoModifier).text ==
+              QLatin1String(" "));
+        CHECK(parseAgentBridgeKey(QStringLiteral("%"), Qt::NoModifier).text ==
+              QLatin1String("%"));
+        CHECK(parseAgentBridgeKey(QStringLiteral("F5"), Qt::NoModifier).text.isEmpty());
+        CHECK(parseAgentBridgeKey(QStringLiteral("Shift"), Qt::NoModifier).key == Qt::Key_Shift);
+        CHECK(parseAgentBridgeKey(QStringLiteral("Ctrl"), Qt::NoModifier).key == Qt::Key_Control);
+        CHECK(parseAgentBridgeKey(QStringLiteral("ctrl"), Qt::NoModifier).key == Qt::Key_Control);
+    }
+    expectParamError("key<-empty", "key",
+        [&] { parseAgentBridgeKey(QString(), Qt::NoModifier); });
+    expectParamError("key<-sequence", "key",
+        [&] { parseAgentBridgeKey(QStringLiteral("A,B"), Qt::NoModifier); });
+    expectParamError("key<-unknown", "key",
+        [&] { parseAgentBridgeKey(QStringLiteral("NotAKey"), Qt::NoModifier); });
+    expectParamError("key<-dangling-modifier", "key",
+        [&] { parseAgentBridgeKey(QStringLiteral("Shift+"), Qt::NoModifier); });
+    {
+        const auto keys = agentBridgeModifierKeys(
+            Qt::MetaModifier | Qt::ShiftModifier | Qt::ControlModifier | Qt::KeypadModifier,
+            Qt::Key_A);
+        CHECK(keys.size() == 3);
+        CHECK(keys.size() == 3 && keys[0].first == Qt::Key_Shift);
+        CHECK(keys.size() == 3 && keys[1].first == Qt::Key_Control);
+        CHECK(keys.size() == 3 && keys[2].first == Qt::Key_Meta);
+        // A bare modifier key is not pressed twice.
+        CHECK(agentBridgeModifierKeys(Qt::ShiftModifier, Qt::Key_Shift).empty());
+        // A held key keeps its modifiers down, and a held modifier key its own.
+        CHECK(agentBridgeHeldModifiers(Qt::Key_Z, Qt::ControlModifier) == Qt::ControlModifier);
+        CHECK(agentBridgeHeldModifiers(Qt::Key_Shift, Qt::NoModifier) == Qt::ShiftModifier);
+        CHECK(agentBridgeHeldModifiers(Qt::Key_Control, Qt::ShiftModifier) ==
+              (Qt::ShiftModifier | Qt::ControlModifier));
+        CHECK(agentBridgeHeldModifiers(Qt::Key_A, Qt::NoModifier) == Qt::NoModifier);
+        const QJsonArray mods{QStringLiteral("shift"), QStringLiteral("keypad")};
+        CHECK(jsonToModifiers(mods) == (Qt::ShiftModifier | Qt::KeypadModifier));
+        CHECK(modifiersToJson(jsonToModifiers(mods)) == mods);
+        CHECK(jsonToModifiers(QJsonValue(QJsonValue::Null)) == Qt::NoModifier);
+    }
 
     // Workspace ids: tab order, and the legacy workspace.switch spelling.
     CHECK(agentBridgeWorkspaceIds().size() == 7);
