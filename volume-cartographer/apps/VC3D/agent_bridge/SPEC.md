@@ -372,6 +372,44 @@ dialog.
 - Resource selections may filter volume ids, derived-representation refs, and
   representation kinds. An explicit empty volume selection is invalid.
 
+### Inspection
+
+`ui.inspect` returns a read-only tree rooted at `window`, `focused`,
+`dock:<objectName>`, or `workspace:<id>`, plus the list of docks
+(`objectName`, `title`, `visible`, `floating`, `workspace`) and the
+workspaces. The tree is read from Qt's accessibility interfaces, the model a
+screen reader uses, so roles, names, values, and states are Qt's own. Nodes
+report `role` (a `QAccessible::Role` name such as `SpinBox` or
+`EditableText`), `path`, `enabled`, `visible`, and where they apply `class`,
+`objectName`, `name` (the accessible name, else the buddy label's text, else
+the name of the form row it sits in), `description` (tooltip or
+placeholder), `value` (text, or a number with `minimum` and `maximum`),
+`checked`, `selected`, `focused`, `readOnly`, `items` with `rows` (and
+`columns`, `selectedRows`) for lists, trees, tables and combo boxes,
+`viewerId`, and `children`. Paths and object names describe where a widget
+is; they are not a stable contract.
+
+- Unnamed layout containers are replaced by their children and do not count
+  toward `depth`. Controls, item views, text views, and viewer panes are
+  leaves; item views list at most 200 rows. Nodes below `depth` are replaced
+  by `childrenOmitted: true`; more than 4000 nodes set `truncated`.
+- Without `includeHidden`, a widget is listed when it would be visible with
+  the root shown, so a workspace that is not current can still be read.
+- Other top-level windows, including dialogs such as Settings, are never
+  entered. A floating dock is read through `dock:<objectName>`. `focused`
+  requires the focus widget to belong to the main window (-32007 otherwise).
+- A text entry (line edit, text edit, editable combo box) reports no value
+  when its echo mode hides input or when its name, row label, placeholder,
+  tooltip, or object name names a credential (password, passphrase, secret,
+  token, credential, API, access, private or secret key, auth, bearer,
+  cookie, matched as whole words). Any name, value, description, or item
+  that contains a credential itself (a URL with a password, a URL query with
+  a token, signature, key, secret or password, an AWS access key id, a
+  bearer token, or a private key block) is left out. Either sets
+  `redacted: true` on the node. Other text, such as program and checkpoint
+  paths, is reported as shown.
+- There is no generic setter; mutations stay typed methods.
+
 ### Segments and review state
 
 - `segments.attach` adds one absolute local tifxyz path to the open package.
@@ -583,6 +621,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_get_state` | `state.get` | Snapshot of VC3D: open volume package, current volume, active segment, viewers (ids/names), editing mode, running job. Call this first. |
 | `vc3d_grow_patch_from_seed` | `segmentation.grow_patch_from_seed` | Create a brand-new segment by growing a patch from a 3D seed point (headless GrowPatch). Async: returns a jobId and outputDir. |
 | `vc3d_grow_segment` | `segmentation.grow` | Grow the active segmentation surface (method: tracer/corrections/patch_tracer; direction; steps). Async: returns a jobId. |
+| `vc3d_inspect_ui` | `ui.inspect` | Read the accessibility tree of the window, a dock, a workspace, or the focused widget, with credentials withheld. |
 | `vc3d_job_status` | `job.status` | Poll a job by id (or the latest job): state, message, console tail. |
 | `vc3d_key` | `canvas.key` | Press, release, tap, or hold a key in a viewer; keybindings behave as for a keyboard. |
 | `vc3d_lasagna_cancel` | `lasagna.cancel` |

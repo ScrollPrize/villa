@@ -423,6 +423,41 @@ int main()
     CHECK(canonicalWorkspaceId(QStringLiteral("spiral")) == QLatin1String("spiral"));
     CHECK(!agentBridgeWorkspaceIds().contains(QStringLiteral("fiber_slice")));
 
+    // ui.inspect redaction: credential labels, matched as whole words.
+    for (const char* label : {"Password", "API key", "apiKeyEdit", "AWSSecretKey",
+                              "aws_secret_access_key", "Access token", "Auth:",
+                              "Private key file", "Bearer", "session cookie"}) {
+        CHECK(agentBridgeCredentialLabel(QString::fromLatin1(label)));
+    }
+    for (const char* label : {"", "Steps", "Draws", "Checkpoint", "Python executable",
+                              "Endpoint", "SSH host", "Author", "Keyboard", "Monkey"}) {
+        CHECK(!agentBridgeCredentialLabel(QString::fromLatin1(label)));
+    }
+    // ...and credential-shaped content anywhere.
+    for (const char* text : {"http://user:pw@gpu-host:8765",
+                             "https://b.s3.amazonaws.com/a.zarr?X-Amz-Signature=ab12",
+                             "https://host/api?token=abc", "key AKIAABCDEFGHIJKLMNOP",
+                             "Authorization: Bearer abcdefgh12345678",
+                             "-----BEGIN OPENSSH PRIVATE KEY-----"}) {
+        CHECK(agentBridgeCredentialContent(QString::fromLatin1(text)));
+    }
+    for (const char* text : {"", "http://gpu-host:8765", "/models/checkpoint.pt",
+                             "https://dl.ash2txt.org/full-scrolls/PHerc0332.volpkg",
+                             "s3://bucket/path?versionId=3", "akiaabcdefghijklmnop"}) {
+        CHECK(!agentBridgeCredentialContent(QString::fromLatin1(text)));
+    }
+    {
+        QString kind;
+        QString name;
+        CHECK(splitAgentBridgeTarget(QStringLiteral("dock:dockWidgetVolumes"), &kind, &name));
+        CHECK(kind == QLatin1String("dock") && name == QLatin1String("dockWidgetVolumes"));
+        CHECK(splitAgentBridgeTarget(QStringLiteral("workspace:fiber-map"), &kind, &name));
+        CHECK(kind == QLatin1String("workspace") && name == QLatin1String("fiber-map"));
+        CHECK(!splitAgentBridgeTarget(QStringLiteral("dock:"), &kind, &name));
+        CHECK(!splitAgentBridgeTarget(QStringLiteral("window"), &kind, &name));
+        CHECK(!splitAgentBridgeTarget(QStringLiteral("v1"), &kind, &name));
+    }
+
     if (g_failures == 0) {
         std::printf("PASS: all %d checks in test_agent_bridge_contract\n", g_checks);
         return 0;

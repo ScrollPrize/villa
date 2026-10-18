@@ -82,6 +82,48 @@ async def vc3d_screenshot(
 
 
 @mcp.tool()
+async def vc3d_inspect_ui(
+    root: str = "window",
+    depth: int = 8,
+    include_hidden: bool = False,
+) -> dict[str, Any]:
+    """Read VC3D's panels as a tree: what each control shows, without a
+    screenshot. The tree is Qt's accessibility tree, the one a screen reader
+    uses. Read-only; change settings through the typed tools.
+
+    root: "window" (the whole main window), "dock:<objectName>" (one dock;
+    the result's "docks" list gives every dock's objectName, title,
+    visibility and workspace), "workspace:<id>" (one workspace tab, such as
+    "workspace:spiral"), or "focused" (the widget with keyboard focus).
+    depth: levels below root to expand (0..64, default 8); deeper nodes carry
+    "childrenOmitted": true. Unnamed layout containers are skipped, so
+    depth counts meaningful widgets.
+    include_hidden: also list widgets hidden within root, such as other
+    tabs' pages. By default only widgets that would show with root are
+    listed, so a workspace that is not current can still be read.
+
+    Each node has "role" (such as "SpinBox", "CheckBox", "EditableText",
+    "ComboBox", "List", "PageTab"), "path", "enabled", "visible", and when
+    they apply: "class", "objectName", "name" (its label as a person reads
+    it), "description" (tooltip or placeholder), "value" (text, or a number
+    with "minimum"/"maximum"), "checked", "selected", "focused",
+    "readOnly", "items" with "rows" for lists, trees, tables and combo
+    boxes, "viewerId" for a viewer pane, and "children". Credentials are
+    withheld: a password or API-key entry, or any text containing a
+    password, token, signed URL or key, shows "redacted": true without that
+    text. Dialogs such as Settings are never read.
+
+    Returns {"root", "tree", "nodeCount", "truncated" (more than 4000 nodes),
+    "docks", "workspace"}. Errors: -32602 (malformed root), -32007 (no such
+    dock or workspace, or nothing has focus).
+    """
+    return await _call(
+        "ui.inspect",
+        {"root": root, "depth": depth, "includeHidden": include_hidden},
+    )
+
+
+@mcp.tool()
 async def vc3d_switch_workspace(
     name: Literal[
         "main",

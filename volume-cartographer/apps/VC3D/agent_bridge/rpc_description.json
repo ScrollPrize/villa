@@ -3399,6 +3399,38 @@
         "type": "object"
       }
     },
+    "ui.inspect": {
+      "errors": [
+        -32602,
+        -32007,
+        -32010
+      ],
+      "mcp": {
+        "paramRenames": {
+          "includeHidden": "include_hidden"
+        },
+        "tool": "vc3d_inspect_ui"
+      },
+      "params": {
+        "properties": {
+          "depth": {
+            "default": 8,
+            "maximum": 64,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "includeHidden": {
+            "default": false,
+            "type": "boolean"
+          },
+          "root": {
+            "default": "window",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
     "viewer.center_on_point": {
       "errors": [
         -32602,

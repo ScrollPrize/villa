@@ -323,6 +323,8 @@ set(srcs
     agent_bridge/AgentBridgeMethods_viewer.cpp
     agent_bridge/AgentBridgeMethods_wrap.cpp
     agent_bridge/AgentBridgeCommandError.hpp
+    agent_bridge/AgentBridgeAccessible.cpp
+    agent_bridge/AgentBridgeAccessible.hpp
     agent_bridge/AgentBridgeInput.hpp
     agent_bridge/AgentBridgeInternal.hpp
     agent_bridge/AgentBridgeKeyboard.cpp
@@ -336,6 +338,7 @@ set(srcs
     agent_bridge/AgentBridgeHandlers_session.cpp
     agent_bridge/AgentBridgeHandlers_editing.cpp
     agent_bridge/AgentBridgeHandlers_input.cpp
+    agent_bridge/AgentBridgeHandlers_ui.cpp
     agent_bridge/AgentBridgeHandlers_wrap.cpp
     agent_bridge/AgentBridgeHandlers_atlas.cpp
     agent_bridge/AgentBridgeHandlers_fiber.cpp

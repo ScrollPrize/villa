@@ -33,6 +33,7 @@
 #include "agent_bridge/AgentBridgeMethod.hpp"
 #include "agent_bridge/AgentBridgeObservation.hpp"
 
+class QDockWidget;
 class QLocalServer;
 class QLocalSocket;
 class QTimer;
@@ -170,6 +171,10 @@ private:
     // state.get's "workspace": the current tab's id and {id, title} of every
     // addressable tab in tab order.
     QJsonObject workspacesJson() const;
+    // Dock lookup by objectName (a visible match preferred) and the dock list
+    // ui.inspect reports (AgentBridgeHandlers_ui.cpp).
+    QDockWidget* findDock(const QString& objectName) const;
+    QJsonArray docksJson() const;
 
     // --- Observation (AgentBridgeObservation.cpp) ---
     // state.get's snapshot and revision, and the state.changed notification.
@@ -205,6 +210,10 @@ private:
     // heavy surface load.
     QJsonObject handleSegmentsReview(const QJsonValue& params);
     QJsonObject handleScreenshotCapture(const QJsonValue& params);
+    // Read-only accessibility tree of the main window, a dock, a workspace,
+    // or the focused widget (AgentBridgeHandlers_ui.cpp,
+    // AgentBridgeAccessible.cpp).
+    QJsonObject handleUiInspect(const QJsonValue& params);
     QJsonObject handleCursorVolumePoint(const QJsonValue& params);
     QJsonObject handleCanvasClick(const QJsonValue& params, bool addShift);
     QJsonObject handleCanvasDrag(const QJsonValue& params);

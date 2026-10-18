@@ -25,14 +25,16 @@ add_test(NAME agent_bridge_contract COMMAND test_agent_bridge_contract)
 vc_register_test_target(test_agent_bridge_contract)
 vc_register_ctest(agent_bridge_contract test_agent_bridge_contract)
 
-# Offscreen widget test for the keyboard synthesis behind canvas.key:
-# shortcuts and widgets receive synthesized keys, the cached modifiers are
-# reset, dialogs and menus a key opens are answered as Escape would, and
-# focus returns. It needs no VC3D window.
+# Offscreen widget test for the widget-level bridge code: the keyboard
+# synthesis behind canvas.key (shortcuts and widgets receive synthesized keys,
+# the cached modifiers are reset, dialogs and menus a key opens are answered
+# as Escape would, focus returns) and ui.inspect's accessibility tree with
+# its redaction. It needs no VC3D window.
 find_package(Qt6 REQUIRED COMPONENTS Test Widgets)
 
 add_executable(test_agent_bridge_widgets
     test_agent_bridge_widgets.cpp
+    ../AgentBridgeAccessible.cpp
     ../AgentBridgeKeyboard.cpp)
 
 set_target_properties(test_agent_bridge_widgets PROPERTIES

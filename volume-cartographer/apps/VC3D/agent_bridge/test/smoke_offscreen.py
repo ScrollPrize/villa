@@ -297,10 +297,10 @@ def check_rpc_describe(
         coverage = description.get("coverage", {})
         complete = (
             description.get("undocumented") == []
-            and coverage.get("described") == 122
-            and coverage.get("registered") == 122
+            and coverage.get("described") == 123
+            and coverage.get("registered") == 123
             and coverage.get("complete") is True
-            and len(snapshot["methods"]) == 122
+            and len(snapshot["methods"]) == 123
         )
         rendered = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         if update_snapshot:
@@ -774,6 +774,82 @@ def check_state_changes(sock_path: str, client: BridgeClient, results: Results) 
     finally:
         if observer is not None:
             observer.close()
+
+
+def _walk_nodes(node: dict):
+    yield node
+    for child in node.get("children", []):
+        yield from _walk_nodes(child)
+
+
+def check_ui_inspect(client: BridgeClient, results: Results) -> None:
+    """ui.inspect reads panels through Qt's accessibility tree and never
+    reports a redacted value."""
+    failures: list[str] = []
+    try:
+        window, _ = client.call("ui.inspect", {"depth": 3}, timeout=RPC_TIMEOUT)
+        tree = window.get("tree", {})
+        if tree.get("class") != "CWindow" or tree.get("role") != "Window":
+            failures.append(f"window root={tree.get('class')}/{tree.get('role')}")
+        if not window.get("docks"):
+            failures.append("no docks listed")
+        visible_docks = [d for d in window.get("docks", []) if d.get("visible")]
+        if visible_docks:
+            dock_name = visible_docks[0]["objectName"]
+            dock, _ = client.call(
+                "ui.inspect", {"root": f"dock:{dock_name}"}, timeout=RPC_TIMEOUT)
+            if dock.get("tree", {}).get("objectName") != dock_name:
+                failures.append(f"dock root={dock.get('tree')}")
+        main, _ = client.call(
+            "ui.inspect",
+            {"root": "workspace:main", "depth": 64, "includeHidden": True},
+            timeout=RPC_TIMEOUT,
+        )
+        nodes = list(_walk_nodes(main.get("tree", {})))
+        if any("role" not in n for n in nodes):
+            failures.append("a node has no role")
+        if not any(n.get("viewerId") for n in nodes):
+            failures.append("no viewer pane reported a viewerId")
+        if not any(n.get("role") == "SpinBox" and "value" in n for n in nodes):
+            failures.append("no spin box value read")
+        # Spiral's API key entry (password echo, labeled "API key") is read
+        # from a workspace that is not current, and withheld.
+        spiral, _ = client.call(
+            "ui.inspect",
+            {"root": "workspace:spiral", "depth": 64, "includeHidden": True},
+            timeout=RPC_TIMEOUT,
+        )
+        nodes += list(_walk_nodes(spiral.get("tree", {})))
+        leaked = [
+            n for n in nodes
+            if n.get("redacted") and n.get("role") == "EditableText" and "value" in n
+        ]
+        api_keys = [
+            n for n in nodes
+            if n.get("role") == "EditableText" and n.get("name") == "API key"
+        ]
+        if leaked:
+            failures.append(f"redaction leaked: {leaked[:1]}")
+        if not api_keys or any("value" in n or not n.get("redacted") for n in api_keys):
+            failures.append(f"API key entries={api_keys}")
+    except Exception as error:  # noqa: BLE001
+        failures.append(f"{type(error).__name__}: {error}")
+    for params, param in (({"root": "bogus"}, "root"), ({"depth": 65}, "depth")):
+        ok, detail = expect_param_error(client, "ui.inspect", params, param)
+        if not ok:
+            failures.append(f"{params}: {detail}")
+    try:
+        client.call("ui.inspect", {"root": "dock:noSuchDock"}, timeout=RPC_TIMEOUT)
+        failures.append("unknown dock did not fail")
+    except BridgeError as error:
+        if error.code != -32007:
+            failures.append(f"unknown dock code={error.code}")
+    results.record(
+        "ui_inspect",
+        not failures,
+        "window, dock and workspace roots read; redaction held" if not failures
+        else "; ".join(failures[:4]),
+    )
 
 
 # Every workspace id in tab order (AgentBridgeUi.hpp's agentBridgeWorkspaceIds,
@@ -2205,6 +2281,7 @@ def main() -> int:
             check_canvas_input(sock_path, client, results)
             require_running(proc, results, "canvas input")
             check_state_changes(sock_path, client, results)
+            check_ui_inspect(client, results)
 
             check_volume_attach(client, results, tmp_path, volpkg)
             check_segments_attach(client, results, tmp_path, volpkg)

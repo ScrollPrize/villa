@@ -189,6 +189,24 @@ void AgentBridgeServer::registerSessionHandlers()
         },
         [this](const QJsonValue& p) { return handleScreenshotCapture(p); });
 
+    AgentBridgeParam inspectDepth =
+        Params::optionalInteger(QStringLiteral("depth"), 8);
+    inspectDepth.minimum = 0;
+    inspectDepth.maximum = 64;
+    registerMethod(
+        {
+            .name = QStringLiteral("ui.inspect"),
+            .params = {
+                // "window", "focused", "dock:<objectName>" or "workspace:<id>".
+                Params::optionalString(QStringLiteral("root"), QStringLiteral("window")),
+                inspectDepth,
+                Params::optionalBoolean(QStringLiteral("includeHidden"), false),
+            },
+            .errors = {-32602, -32007, -32010},
+            .mcp = mcp(QStringLiteral("vc3d_inspect_ui"), true),
+        },
+        [this](const QJsonValue& p) { return handleUiInspect(p); });
+
     registerMethod(
         {
             .name = QStringLiteral("project.create"),
