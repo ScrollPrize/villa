@@ -9,8 +9,13 @@ using DeviceInputArray = nb::ndarray<nb::array_api, nb::c_contig, nb::device::cu
 struct DeviceOutputs {
     std::vector<std::shared_ptr<void>> sessions;
     std::vector<std::shared_ptr<vcr::device::Buffer>> stacked;
+    int device = 0;
+    cudaStream_t stream = vcr::device::stream();
     void mark_exported() { for (auto& s:sessions) cuda::export_outputs(s.get()); for (auto& b:stacked) b->exported=true; }
-    void check() { for (auto& s:sessions) cuda::check_device(s.get()); }
+    void check() {
+        vcr::device::Guard guard(device); vcr::device::StreamScope scope(stream);
+        for (auto& s:sessions) cuda::check_device(s.get());
+    }
 };
 static char dlpack_kind(nb::dlpack::dtype dt) {
     return dt.code==std::uint8_t(nb::dlpack::dtype_code::Float) ? 'f' : dt.code==std::uint8_t(nb::dlpack::dtype_code::Int) ? 'i' :
@@ -60,7 +65,7 @@ static nb::tuple run_device(const Pipeline& pipeline, const std::map<std::string
       validate(imported.sample,false); context=cuda::begin_device(imported.arrays,imported.sample,inplace,async && !record && !profile);
       result=plan ? pipeline.replay(std::move(imported.sample),*plan,context) : pipeline.run(std::move(imported.sample),seed,record,profile,context); }
     // The owner keeps the session (outputs) and, for inplace views, the inputs alive.
-    nb::object outputs=nb::cast(DeviceOutputs{{context},{}});
+    nb::object outputs=nb::cast(DeviceOutputs{{context},{},imported.device});
     nb::list input_owners;
     for (const auto& [key,in]:inputs) input_owners.append(nb::cast(in,nb::rv_policy::reference));
     nb::object owner=nb::make_tuple(outputs,input_owners);
@@ -81,7 +86,10 @@ static nb::tuple run_device(const Pipeline& pipeline, const std::map<std::string
 // stacked into (B, ...) arrays (into `out` when given); others are lists.
 static nb::tuple run_batch(const Pipeline& pipeline, const std::map<std::string,DeviceInputArray>& inputs,
                           const std::vector<std::uint64_t>& seeds, const std::map<std::string,std::vector<double>>& params,
-                          bool inplace, bool async, const std::map<std::string,DeviceInputArray>& out) {
+                          bool inplace, bool async, const std::map<std::string,DeviceInputArray>& out,
+                          nb::object allocator, nb::object stream) {
+    vcr::device::StreamScope scope(stream.is_none() ? vcr::device::stream() : vcr::device::stream_handle(nb::cast<std::uintptr_t>(stream)));
+    require(allocator.is_none() || out.empty(), "allocator and preallocated out are mutually exclusive");
     const std::size_t count=seeds.size();
     require(count>0,"batch needs at least one seed");
     for (const auto& [key,in]:inputs) require(in.ndim()>0 && std::size_t(in.shape(0))==count,key+": leading axis must equal len(seeds)");
@@ -89,6 +97,7 @@ static nb::tuple run_batch(const Pipeline& pipeline, const std::map<std::string,
     if (inplace) require_disjoint(inputs);
     auto imported=import_device(pipeline,inputs,1);
     auto owner=std::make_shared<DeviceOutputs>();
+    owner->device=imported.device;
     std::vector<std::map<std::string,cuda::DeviceInput>> results(count);
     std::vector<std::map<std::string,std::vector<cuda::DeviceInput>>> pyramids(count);
     std::map<std::string,std::string> sources;
@@ -112,15 +121,32 @@ static nb::tuple run_batch(const Pipeline& pipeline, const std::map<std::string,
     nb::list input_owners;
     for (const auto& [key,in]:inputs) input_owners.append(nb::cast(in,nb::rv_policy::reference));
     nb::dict arrays;
+    // Optional consumer allocator owns the final tensors. This also handles
+    // shape-changing, ragged and pyramid outputs without predicting shapes in
+    // Python or exporting native allocations to an unrelated stream allocator.
+    const auto allocated = [&](const Shape& shape, const std::vector<cuda::DeviceInput>& values) -> nb::object {
+        const auto& first=values.front();
+        auto result=allocator(nb::cast(shape), std::string(1,first.kind)+std::to_string(first.bytes), imported.device);
+        const auto dest=nb::cast<DeviceInputArray>(result);
+        Shape got; for (std::size_t a=0;a<dest.ndim();++a) got.push_back(dest.shape(a));
+        require(got==shape && dlpack_kind(dest.dtype())==first.kind && std::size_t(dest.dtype().bits/8)==first.bytes && dest.device_id()==imported.device,
+                "allocator must return a contiguous CUDA array of the requested shape, dtype and device");
+        const std::size_t bytes=product(first.shape)*first.bytes;
+        { nb::gil_scoped_release release; vcr::device::Guard guard(imported.device);
+          for (std::size_t b=0;b<values.size();++b)
+              if (bytes) vcr::device::check(cudaMemcpyAsync(static_cast<char*>(dest.data())+b*bytes,values[b].data,bytes,cudaMemcpyDeviceToDevice,vcr::device::stream())); }
+        return result;
+    };
     const auto pack = [&](const std::string& key,const std::vector<cuda::DeviceInput>& values,bool allow_out) -> nb::object {
         const auto& first=values.front();bool uniform=true;
         for(const auto& a:values)uniform &= a.shape==first.shape && a.kind==first.kind && a.bytes==first.bytes;
         if(!uniform) {
             nb::list items;nb::object list_owner=nb::make_tuple(holder,input_owners);
-            for(const auto& a:values)items.append(device_array(a.data,a.shape,a.kind,a.bytes,a.device,list_owner));
+            for(const auto& a:values)items.append(allocator.is_none() ? device_array(a.data,a.shape,a.kind,a.bytes,a.device,list_owner) : allocated(a.shape,{a}));
             return items;
         }
         Shape shape{count};shape.insert(shape.end(),first.shape.begin(),first.shape.end());
+        if (!allocator.is_none()) return allocated(shape,values);
         const std::size_t bytes=product(first.shape)*first.bytes;void* target;nb::object array_owner;
         if(allow_out && out.count(key)) {
             const auto& dest=out.at(key);Shape got;for(std::size_t a=0;a<dest.ndim();++a)got.push_back(dest.shape(a));
@@ -151,7 +177,7 @@ static nb::tuple run_batch(const Pipeline& pipeline, const std::map<std::string,
     // Stacked per-sample arrays are no longer needed: free them stream-ordered,
     // keeping each session's small status buffers for check().
     std::vector<std::string> stacked;
-    for (auto item:arrays) if (!nb::isinstance<nb::list>(item.second)) stacked.push_back(nb::cast<std::string>(item.first));
+    for (auto item:arrays) if (!allocator.is_none() || !nb::isinstance<nb::list>(item.second)) stacked.push_back(nb::cast<std::string>(item.first));
     { nb::gil_scoped_release release; vcr::device::Guard guard(imported.device);
       for (auto& s:owner->sessions) cuda::release_outputs(s.get(),stacked);
       if (!async) { for (auto& s:owner->sessions) cuda::check_device(s.get()); vcr::device::complete(); } }

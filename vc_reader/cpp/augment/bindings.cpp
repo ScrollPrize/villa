@@ -311,7 +311,8 @@ NB_MODULE(_augment, m) {
                               bool async, const NamedValues& params) {
             return run_device(p,inputs,seed,record,profile,inplace,nullptr,async,params);
         }, "inputs"_a, "seed"_a, "record"_a = false, "profile"_a = false, "inplace"_a = false, "async_"_a = false, "params"_a = NamedValues{})
-        .def("run_batch", &run_batch, "inputs"_a, "seeds"_a, "params"_a, "inplace"_a, "async_"_a, "out"_a)
+        .def("run_batch", &run_batch, "inputs"_a, "seeds"_a, "params"_a, "inplace"_a, "async_"_a, "out"_a,
+             "allocator"_a = nb::none(), "stream"_a = nb::none())
         .def("replay_device", [](const Pipeline& p, const std::map<std::string,DeviceInputArray>& inputs, const Plan& plan) {
             return run_device(p,inputs,0,false,false,false,&plan);
         })

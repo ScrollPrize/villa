@@ -235,6 +235,23 @@ class Pipeline:
         arrays, _ = self._inputs(sample)
         return Plan(self, self._native.run(arrays, seed, True, False)[3])
 
+    def batch(self, batch, *, seeds, device=None):
+        """Augment a batch, returning PyTorch CUDA tensors and unchanged metadata.
+
+        Requires the optional PyTorch integration and a CUDA pipeline. Dense
+        targets use (B, C, Y, X) or (B, C, Z, Y, X); seeds has one uint64 per
+        sample. NumPy/CPU targets are uploaded once per target; CUDA inputs stay
+        on device. uint8 continuous targets are cast to float32 on the GPU;
+        other dtypes are preserved. Inputs are not modified.
+
+        Work uses PyTorch's current stream and completes/checks once per batch.
+        CudaLoader uses the same executor with one batch of GPU prefetch.
+        Uniform outputs are stacked tensors; differing sample shapes are lists.
+        Undeclared fields, including tensor metadata, pass through unchanged.
+        """
+        from ..torch import _batch
+        return _batch(self, batch, seeds=seeds, device=device)
+
     def apply(self, sample, plan):
         if not isinstance(plan, Plan) or plan._pipeline is not self:
             raise ValueError("plan belongs to another pipeline; use plan.apply(sample)")
