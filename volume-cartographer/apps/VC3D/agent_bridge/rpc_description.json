@@ -2937,6 +2937,43 @@
         "type": "object"
       }
     },
+    "segment.restore_backup": {
+      "errors": [
+        -32602,
+        -32000,
+        -32004,
+        -32005,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "paramRenames": {
+          "segmentId": "segment_id"
+        },
+        "tool": "vc3d_restore_segment_backup"
+      },
+      "params": {
+        "properties": {
+          "confirm": {
+            "default": false,
+            "type": "boolean"
+          },
+          "index": {
+            "maximum": 9,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "segmentId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "segmentId",
+          "index"
+        ],
+        "type": "object"
+      }
+    },
     "segment.transform": {
       "errors": [
         -32602,
@@ -3628,6 +3665,42 @@
             "type": "integer"
           }
         },
+        "type": "object"
+      }
+    },
+    "segments.move_to_paths": {
+      "errors": [
+        -32602,
+        -32000,
+        -32004,
+        -32005,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "paramRenames": {
+          "replaceExisting": "replace_existing",
+          "segmentId": "segment_id"
+        },
+        "tool": "vc3d_move_segment_to_paths"
+      },
+      "params": {
+        "properties": {
+          "confirm": {
+            "default": false,
+            "type": "boolean"
+          },
+          "replaceExisting": {
+            "default": false,
+            "type": "boolean"
+          },
+          "segmentId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "segmentId"
+        ],
         "type": "object"
       }
     },

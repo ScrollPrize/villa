@@ -327,3 +327,61 @@ async def vc3d_patch_segment(
         ),
     )
     return await _wait_for_job(result["jobId"], wait, result, ctx)
+
+
+@mcp.tool()
+async def vc3d_restore_segment_backup(
+    segment_id: str, index: int, confirm: bool = False
+) -> dict[str, Any]:
+    """Restore a segment from one of its rotating backups, the headless twin of
+    the context menu's "Reload from Backup > Backup N". Every file of the
+    backup (x/y/z grid, mask, meta and the rest) replaces the segment's file
+    of the same name, then the segment reloads. Synchronous.
+
+    segment_id: the segment to restore.
+    index: backup slot 0-9.
+    confirm: must be true to restore. Without it nothing changes and the call
+    fails with -32602 whose data.available lists the backups as
+    [{index, timestamp}], so call it without confirm to see them; an index
+    that does not exist fails with -32007 and the same data.available.
+
+    The state being replaced is first saved as the newest backup, so the
+    result's "backups" shows the slot that undoes this restore. Not
+    idempotent: if a call times out, read the backups before retrying.
+    Patches from vc3d_patch_segment keep their own snapshot elsewhere and are
+    not listed here. Refused (-32004) for the segment being edited, while a
+    mask render runs, and while a source:"tool" job runs. Returns
+    {"restored": true, "segmentId", "index", "copiedFiles", "backups"}.
+    """
+    return await _call(
+        "segment.restore_backup",
+        {"segmentId": segment_id, "index": index, "confirm": confirm},
+        timeout=SEGMENT_FILE_OP_TIMEOUT_S,
+    )
+
+
+@mcp.tool()
+async def vc3d_move_segment_to_paths(
+    segment_id: str, replace_existing: bool = False, confirm: bool = False
+) -> dict[str, Any]:
+    """Move a segment from the traces/ directory to paths/, the headless twin of
+    the context menu's "Move to Paths". The segment is unloaded first and is
+    listed again once the paths directory is selected. Requires confirm=true.
+    Synchronous.
+
+    segment_id: a segment of the currently selected traces directory (other
+    directories are refused with -32009).
+    replace_existing: replace a paths/ segment of the same name; without it a
+    name clash fails with -32602 (param replaceExisting). The replaced folder
+    is deleted only after the move succeeded and is put back if it fails.
+
+    Not idempotent: after a timeout, list the segments before retrying.
+    Refused while segmentation editing is on (-32004). Returns
+    {"moved": true, "segmentId", "path", "replaced"}.
+    """
+    return await _call(
+        "segments.move_to_paths",
+        {"segmentId": segment_id, "replaceExisting": replace_existing,
+         "confirm": confirm},
+        timeout=SEGMENT_FILE_OP_TIMEOUT_S,
+    )

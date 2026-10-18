@@ -521,3 +521,119 @@ QJsonObject AgentBridgeServer::handleSegmentsPatch(const QJsonValue& params)
                                              : QJsonValue(QJsonValue::Null);
     return result;
 }
+
+
+// ---------------------------------------------------------------------------
+// segment.restore_backup
+// ---------------------------------------------------------------------------
+
+namespace {
+
+QJsonArray backupsJson(const std::vector<vc3d::segment_files::Backup>& backups)
+{
+    QJsonArray out;
+    for (const auto& backup : backups) {
+        out.append(QJsonObject{{"index", backup.index},
+                               {"timestamp", backup.timestamp.isEmpty()
+                                                 ? QJsonValue(QJsonValue::Null)
+                                                 : QJsonValue(backup.timestamp)}});
+    }
+    return out;
+}
+
+}  // namespace
+
+QJsonObject AgentBridgeServer::handleSegmentRestoreBackup(const QJsonValue& params)
+{
+    const QJsonObject p = params.toObject();
+    CState* state = requireProject(_window ? _window->_state : nullptr);
+    const QString segmentId = p.value("segmentId").toString();
+    const int index = p.value("index").toInt();
+    requireKnownSegment(state, segmentId);
+
+    SegmentationCommandHandler* handler = requireCommandHandler(
+        _window->_segmentationCommandHandler.get(), QStringLiteral("Restore"));
+
+    // The listing comes before the confirm check, so a call without confirm
+    // reports the backups and changes nothing.
+    const auto backups = handler->listSurfaceBackups(segmentId);
+    const QJsonArray available = backupsJson(backups);
+    const bool known = std::any_of(backups.begin(), backups.end(),
+                                   [index](const auto& backup) { return backup.index == index; });
+    if (!known) {
+        throw AgentBridgeError{
+            -32007, QStringLiteral("Backup %1 not found for %2").arg(index).arg(segmentId),
+            QJsonObject{{"kind", "backup"}, {"id", index}, {"available", available}}};
+    }
+    if (!p.value("confirm").toBool(false)) {
+        throw AgentBridgeError{
+            -32602, "confirm must be true (restoring a backup overwrites the segment)",
+            QJsonObject{{"param", "confirm"},
+                        {"reason", "destructive; pass confirm=true"},
+                        {"available", available}}};
+    }
+    requireSegmentFilesIdle(segmentId, QStringLiteral("restore"));
+
+    QString err;
+    int copiedFiles = 0;
+    if (!handler->restoreSurfaceFromBackup(segmentId, index, &err, &copiedFiles)) {
+        throw AgentBridgeError{-32005, "Restore failed", QJsonObject{{"detail", err}}};
+    }
+
+    QJsonObject result;
+    result["restored"] = true;
+    result["segmentId"] = segmentId;
+    result["index"] = index;
+    result["copiedFiles"] = copiedFiles;
+    // The replaced state is now the newest backup.
+    result["backups"] = backupsJson(handler->listSurfaceBackups(segmentId));
+    return result;
+}
+
+
+// ---------------------------------------------------------------------------
+// segments.move_to_paths
+// ---------------------------------------------------------------------------
+
+QJsonObject AgentBridgeServer::handleSegmentsMoveToPaths(const QJsonValue& params)
+{
+    const QJsonObject p = params.toObject();
+    CState* state = requireProject(_window ? _window->_state : nullptr);
+    const QString segmentId = p.value("segmentId").toString();
+    requireKnownSegment(state, segmentId);
+    if (state->vpkg()->getSegmentationDirectory() != "traces") {
+        throw AgentBridgeError{
+            -32009, "Only segments in the traces directory can move to paths",
+            QJsonObject{{"detail", QString::fromStdString(
+                                       state->vpkg()->getSegmentationDirectory())}}};
+    }
+    requireConfirm(p, QStringLiteral("moving unloads the segment and changes its folder"));
+    // Moving unloads the segment, which an editing session on any segment
+    // may still reference through the shared surface state.
+    requireSegmentFilesIdle(QString(), QStringLiteral("move"));
+
+    SegmentationCommandHandler* handler = requireCommandHandler(
+        _window->_segmentationCommandHandler.get(), QStringLiteral("Move"));
+
+    const bool replaceExisting = p.value("replaceExisting").toBool(false);
+    bool destinationExists = false;
+    QString err;
+    QString newPath;
+    if (!handler->moveSegmentToPaths(segmentId, replaceExisting, &err, &newPath,
+                                     &destinationExists)) {
+        if (destinationExists && !replaceExisting) {
+            throw AgentBridgeError{
+                -32602, "A segment of this name already exists in paths/",
+                QJsonObject{{"param", "replaceExisting"},
+                            {"detail", "pass replaceExisting=true to replace it"}}};
+        }
+        throw AgentBridgeError{-32005, "Move failed", QJsonObject{{"detail", err}}};
+    }
+
+    QJsonObject result;
+    result["moved"] = true;
+    result["segmentId"] = segmentId;
+    result["path"] = newPath;
+    result["replaced"] = destinationExists;
+    return result;
+}

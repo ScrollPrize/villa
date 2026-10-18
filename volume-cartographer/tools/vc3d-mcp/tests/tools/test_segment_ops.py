@@ -22,9 +22,11 @@ from vc3d_mcp.tools import segment_ops
 from vc3d_mcp.tools.segment_ops import (
     vc3d_export_segment_obj,
     vc3d_merge_segments,
+    vc3d_move_segment_to_paths,
     vc3d_neighbor_copy_segment,
     vc3d_patch_segment,
     vc3d_rasterize_segments,
+    vc3d_restore_segment_backup,
     vc3d_transform_segment,
 )
 
@@ -135,6 +137,18 @@ class SegmentOpsTest(unittest.IsolatedAsyncioTestCase):
             self.bridge.params_for("segments.patch"),
             {"segmentIds": ["a", "b"], "parentId": "a", "confirm": True,
              "borderCells": 8},
+        )
+
+    async def test_restore_and_move_send_confirm(self) -> None:
+        await vc3d_restore_segment_backup("seg-1", 3, confirm=True)
+        self.assertEqual(
+            self.bridge.params_for("segment.restore_backup"),
+            {"segmentId": "seg-1", "index": 3, "confirm": True},
+        )
+        await vc3d_move_segment_to_paths("seg-1")
+        self.assertEqual(
+            self.bridge.params_for("segments.move_to_paths"),
+            {"segmentId": "seg-1", "replaceExisting": False, "confirm": False},
         )
 
     def test_synchronous_file_operations_outlast_default_timeout(self) -> None:

@@ -190,4 +190,36 @@ void AgentBridgeServer::registerSegmentOpsHandlers()
             },
             [this](const QJsonValue& p) { return handleSegmentsPatch(p); });
     }
+
+    registerMethod(
+        {
+            .name = QStringLiteral("segment.restore_backup"),
+            .params = {
+                Params::requiredString(QStringLiteral("segmentId")),
+                [] {
+                    AgentBridgeParam index =
+                        Params::requiredInteger(QStringLiteral("index"));
+                    index.minimum = 0;
+                    index.maximum = 9;
+                    return index;
+                }(),
+                Params::optionalBoolean(QStringLiteral("confirm"), false),
+            },
+            .errors = {-32602, -32000, -32004, -32005, -32007, -32009},
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_restore_segment_backup")),
+        },
+        [this](const QJsonValue& p) { return handleSegmentRestoreBackup(p); });
+
+    registerMethod(
+        {
+            .name = QStringLiteral("segments.move_to_paths"),
+            .params = {
+                Params::requiredString(QStringLiteral("segmentId")),
+                Params::optionalBoolean(QStringLiteral("replaceExisting"), false),
+                Params::optionalBoolean(QStringLiteral("confirm"), false),
+            },
+            .errors = {-32602, -32000, -32004, -32005, -32007, -32009},
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_move_segment_to_paths")),
+        },
+        [this](const QJsonValue& p) { return handleSegmentsMoveToPaths(p); });
 }

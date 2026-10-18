@@ -605,6 +605,18 @@ caller that retries after a timeout reads the segment's state first.
   `backups/<parent>/` inside the segments directory, not beside the project
   file where VC3D keeps backups, so `segment.restore_backup` does not list
   that snapshot.
+- `segment.restore_backup` replaces a segment's files with every file of one
+  of its rotating backups, the slots the context menu's "Reload from Backup"
+  offers, and reloads it. The replaced state is snapshotted as the newest
+  backup first, so the result's `backups` lists the slot that undoes the
+  restore; nothing is restored if that snapshot fails. An unknown index
+  returns -32007 and a call without `confirm: true` returns -32602, both with
+  `data.available` and without changing anything, so a call without confirm
+  lists the backups.
+- `segments.move_to_paths` requires `confirm: true`, applies only to the
+  traces directory and is refused while editing is on. A name clash in paths/
+  is refused unless `replaceExisting` is true; the replaced folder is moved
+  aside, restored if the move fails, and deleted only after it succeeds.
 
 ## MCP behavior
 
@@ -739,6 +751,7 @@ is the sole bridge method without an MCP tool; `vc3d_wait_job` and
 | `vc3d_manual_add_set_line_mode` | `segmentation.manual_add.set_line_mode` |
 | `vc3d_manual_add_undo_constraint` | `segmentation.manual_add.undo_constraint` |
 | `vc3d_merge_segments` | `segments.merge` | Merge segments laid out in a grid into a new segment (`tool` job ending with the merged folder). |
+| `vc3d_move_segment_to_paths` | `segments.move_to_paths` | Move a traces/ segment to paths/ (`confirm` required). |
 | `vc3d_neighbor_copy_segment` | `segment.neighbor_copy` | Grow the neighboring sheet from a segment (two passes, one `tool` job; cancellable between passes). |
 | `vc3d_open_catalog_sample` | `catalog.open_sample` | Open a sample returned by `vc3d_list_catalog_samples`, using its manifest sample id. |
 | `vc3d_open_volume` | `volume.open` | Open a volume package (.volpkg / .volpkg.json / zarr project) and optionally select a volume id. |
@@ -757,6 +770,7 @@ is the sole bridge method without an MCP tool; `vc3d_wait_job` and
 | `vc3d_render_tifxyz` | `render.tifxyz` |
 | `vc3d_reoptimize_segment` | `segment.reoptimize` | Resume-opt local reoptimization of a segment. Asynchronous (`source:"tool"`); supports `wait: bool = false` (30-minute cap). |
 | `vc3d_reset_windings` | `points.reset_windings` |
+| `vc3d_restore_segment_backup` | `segment.restore_backup` | Restore a segment from one of its rotating backups (`confirm` required; without it the call lists the backups and changes nothing). |
 | `vc3d_review_segments` | `segments.review` | List segments with review-tag state and optional server-side filtering (the programmatic equivalent of the surface panel's review filter checkboxes). |
 | `vc3d_rotate_viewer` | `viewer.rotate` | Rotate the "seg xz"/"seg yz" axis-aligned slice plane (middle-drag equivalent). Relative delta by default. |
 | `vc3d_run_trace` | `tracer.run_trace` |

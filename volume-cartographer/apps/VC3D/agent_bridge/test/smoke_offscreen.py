@@ -298,10 +298,10 @@ def check_rpc_describe(
         coverage = description.get("coverage", {})
         complete = (
             description.get("undocumented") == []
-            and coverage.get("described") == 129
-            and coverage.get("registered") == 129
+            and coverage.get("described") == 131
+            and coverage.get("registered") == 131
             and coverage.get("complete") is True
-            and len(snapshot["methods"]) == 129
+            and len(snapshot["methods"]) == 131
         )
         rendered = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         if update_snapshot:
@@ -1873,6 +1873,89 @@ def check_segment_tool_operations(client: BridgeClient, results: Results) -> Non
     results.record("segments_patch_requires_confirm", ok, detail)
 
 
+def check_segment_backups(client: BridgeClient, results: Results, root: Path) -> None:
+    """Seeds backup slot 0 by hand, changes the segment, then restores it."""
+    segment = smoke_segment_dir(root)
+    backups = root / "backups" / segment.name
+    slot = backups / "0"
+    try:
+        slot.mkdir(parents=True, exist_ok=True)
+        for item in segment.iterdir():
+            if item.is_file():
+                shutil.copy2(item, slot / item.name)
+        backup_digest = file_digest(slot / "x.tif")
+        client.call(
+            "segment.transform",
+            {"segmentId": SMOKE_SEGMENT_ID, "op": "flip_u"},
+            timeout=RPC_TIMEOUT,
+        )
+        changed_digest = file_digest(segment / "x.tif")
+    except Exception as error:  # noqa: BLE001
+        results.record("segment_restore_backup_roundtrip", False,
+                       f"setup {type(error).__name__}: {error}")
+        return
+
+    try:
+        client.call(
+            "segment.restore_backup",
+            {"segmentId": SMOKE_SEGMENT_ID, "index": 0},
+            timeout=RPC_TIMEOUT,
+        )
+        results.record("segment_restore_backup_lists_without_confirm", False,
+                       "restore ran without confirm")
+    except BridgeError as error:
+        available = error.data.get("available") or []
+        ok = (
+            error.code == -32602
+            and error.data.get("param") == "confirm"
+            and [entry.get("index") for entry in available] == [0]
+            and file_digest(segment / "x.tif") == changed_digest
+        )
+        results.record("segment_restore_backup_lists_without_confirm", ok,
+                       f"code={error.code} available={available}")
+    ok, detail = expect_bridge_error(
+        client,
+        "segment.restore_backup",
+        {"segmentId": SMOKE_SEGMENT_ID, "index": 9, "confirm": True},
+        -32007,
+    )
+    results.record("segment_restore_backup_unknown_index", ok, detail)
+
+    try:
+        restored, _ = client.call(
+            "segment.restore_backup",
+            {"segmentId": SMOKE_SEGMENT_ID, "index": 0, "confirm": True},
+            timeout=RPC_TIMEOUT,
+        )
+        listed = [entry.get("index") for entry in restored.get("backups", [])]
+        snapshot = backups / "1" / "x.tif"
+        ok = (
+            restored.get("restored") is True
+            and changed_digest != backup_digest
+            and file_digest(segment / "x.tif") == backup_digest
+            and listed == [0, 1]
+            and snapshot.is_file()
+            and file_digest(snapshot) == changed_digest
+        )
+        results.record(
+            "segment_restore_backup_roundtrip",
+            ok,
+            f"restored={restored} digests backup={backup_digest[:12]} "
+            f"changed={changed_digest[:12]} now={file_digest(segment / 'x.tif')[:12]}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record("segment_restore_backup_roundtrip", False,
+                       f"{type(error).__name__}: {error}")
+
+    ok, detail = expect_bridge_error(
+        client,
+        "segments.move_to_paths",
+        {"segmentId": SMOKE_SEGMENT_ID, "confirm": True},
+        -32009,
+    )
+    results.record("segments_move_to_paths_needs_traces_directory", ok, detail)
+
+
 def check_open_data_editable_copy(
     client: BridgeClient,
     results: Results,
@@ -2580,6 +2663,7 @@ def main() -> int:
             check_segment_transform(client, results, tmp_path)
             check_segment_export(client, results, tmp_path)
             check_segment_tool_operations(client, results)
+            check_segment_backups(client, results, tmp_path)
             check_open_data_editable_copy(client, results, tmp_path, volpkg)
             check_c4(client, results, str(volpkg), str(broken_volpkg))
             check_legacy_fiber_uuid(client, results, str(legacy_fiber_volpkg),

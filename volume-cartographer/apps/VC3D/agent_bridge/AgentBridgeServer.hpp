@@ -403,6 +403,8 @@ private:
     QJsonObject handleSegmentNeighborCopy(const QJsonValue& params);
     QJsonObject handleSegmentsMerge(const QJsonValue& params);
     QJsonObject handleSegmentsPatch(const QJsonValue& params);
+    QJsonObject handleSegmentRestoreBackup(const QJsonValue& params);
+    QJsonObject handleSegmentsMoveToPaths(const QJsonValue& params);
     // Registers a "tool" job for a launch that `launch` performs (reporting
     // the job's output path) and, when `closingOperation` is non-empty, keeps
     // it open until that operation's segmentOperationFinished. Throws the
