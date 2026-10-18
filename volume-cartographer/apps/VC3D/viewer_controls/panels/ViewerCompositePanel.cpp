@@ -180,6 +180,74 @@ void ViewerCompositePanel::setSegmentationCompositeChecked(bool checked)
     _uiRefs.compositeEnabled->setChecked(checked);
 }
 
+const std::vector<std::string>& ViewerCompositePanel::compositeMethods()
+{
+    static const std::vector<std::string> methods{"max", "mean", "min", "alpha", "volumetric"};
+    return methods;
+}
+
+ViewerCompositePanel::Controls ViewerCompositePanel::controls() const
+{
+    auto checked = [](const QCheckBox* box) { return box && box->isChecked(); };
+    auto value = [](const QSpinBox* box) { return box ? box->value() : 0; };
+    Controls c;
+    c.enabled = checked(_uiRefs.compositeEnabled);
+    c.method = compositeMethodForModeIndex(
+        _uiRefs.compositeMode ? _uiRefs.compositeMode->currentIndex() : 0);
+    c.layersFront = value(_uiRefs.layersInFront);
+    c.layersBehind = value(_uiRefs.layersBehind);
+    c.reverseDirection = checked(_uiRefs.reverseDirection);
+    c.alphaMin = value(_uiRefs.alphaMin);
+    c.alphaMax = value(_uiRefs.alphaMax);
+    c.alphaThreshold = value(_uiRefs.alphaThreshold);
+    c.material = value(_uiRefs.material);
+    c.planeXY = checked(_uiRefs.planeCompositeXY);
+    c.planeXZ = checked(_uiRefs.planeCompositeXZ);
+    c.planeYZ = checked(_uiRefs.planeCompositeYZ);
+    c.planeLayersFront = value(_uiRefs.planeLayersFront);
+    c.planeLayersBehind = value(_uiRefs.planeLayersBehind);
+    c.planeReverseDirection = checked(_uiRefs.planeReverseDirection);
+    if (_volumetricGamma) c.volumetricGamma = _volumetricGamma->value();
+    if (_volumetricLighting) c.volumetricLighting = _volumetricLighting->value();
+    if (_volumetricWScale) c.volumetricWScale = _volumetricWScale->value();
+    return c;
+}
+
+void ViewerCompositePanel::applyControls(const ControlsUpdate& update)
+{
+    auto check = [](QCheckBox* box, const std::optional<bool>& value) {
+        if (box && value) box->setChecked(*value);
+    };
+    auto spin = [](QSpinBox* box, const std::optional<int>& value) {
+        if (box && value) box->setValue(*value);
+    };
+    if (_uiRefs.compositeMode && update.method) {
+        const auto& methods = compositeMethods();
+        if (std::find(methods.begin(), methods.end(), *update.method) != methods.end())
+            _uiRefs.compositeMode->setCurrentIndex(compositeModeIndexForMethod(*update.method));
+    }
+    check(_uiRefs.compositeEnabled, update.enabled);
+    spin(_uiRefs.layersInFront, update.layersFront);
+    spin(_uiRefs.layersBehind, update.layersBehind);
+    check(_uiRefs.reverseDirection, update.reverseDirection);
+    spin(_uiRefs.alphaMin, update.alphaMin);
+    spin(_uiRefs.alphaMax, update.alphaMax);
+    spin(_uiRefs.alphaThreshold, update.alphaThreshold);
+    spin(_uiRefs.material, update.material);
+    check(_uiRefs.planeCompositeXY, update.planeXY);
+    check(_uiRefs.planeCompositeXZ, update.planeXZ);
+    check(_uiRefs.planeCompositeYZ, update.planeYZ);
+    spin(_uiRefs.planeLayersFront, update.planeLayersFront);
+    spin(_uiRefs.planeLayersBehind, update.planeLayersBehind);
+    check(_uiRefs.planeReverseDirection, update.planeReverseDirection);
+    if (_volumetricGamma && update.volumetricGamma)
+        _volumetricGamma->setValue(*update.volumetricGamma);
+    if (_volumetricLighting && update.volumetricLighting)
+        _volumetricLighting->setValue(*update.volumetricLighting);
+    if (_volumetricWScale && update.volumetricWScale)
+        _volumetricWScale->setValue(*update.volumetricWScale);
+}
+
 void ViewerCompositePanel::setupVolumetricControls(QVBoxLayout* layout)
 {
     // The volumetric mode is available in the plane (slice) views too. The
