@@ -162,7 +162,12 @@ class _ZarrVolume:
             multiscales = node.attrs.get("multiscales") or [{}]
             names = [str(d.get("path")) for d in multiscales[0].get("datasets", [])]
             names = [n for n in names if n.isdigit()] or [k for k in node.array_keys() if str(k).isdigit()]
-            self._levels = {int(k): node[str(k)] for k in names}
+            self._levels = {}
+            for name in names:
+                try:
+                    self._levels[int(name)] = node[str(name)]
+                except KeyError:  # listed in .zattrs but not in the store (a partial local copy)
+                    continue
         if not self._levels:
             raise RuntimeError(f"no zarr scale levels found at {path!r}")
         self.dtype = np.dtype(self._levels[min(self._levels)].dtype)
