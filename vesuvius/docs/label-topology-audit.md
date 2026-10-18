@@ -27,10 +27,36 @@ vesuvius.label_topology_audit --batch DATA_DIR --out audit_out
 Outputs: `<crop>.json` (full metrics), `aggregate.csv` (one row per crop),
 `ranked.csv` with `--batch` (crops with any finding, worst first, with a one-line
 reason), `<crop>.delta.json` (`metric: [before, after]`) with `--after`,
-`<crop>.png` with `--plot`.
+`<crop>.png` and `<crop>.holes.png` (three orthogonal slices per located hole,
+label green, ignore blue, hole red) with `--plot`, `<crop>.hole_mask.tif` with
+`--hole-masks`.
 
 `ranked.csv` sorts on interior holes, then cavities, fused components, junction
 clusters, and finally holes that touch a crop face.
+
+## Workflow: from a dataset to fixed crops
+
+`ranked.csv` works as a proofreading queue: look at the top rows first, and fix
+or drop those crops before training.
+
+```bash
+# 1. audit the dataset, write hole tiles and hole masks
+vesuvius.label_topology_audit --batch DATA_DIR --plot --hole-masks --out audit_out
+
+# 2. open audit_out/ranked.csv; look at <crop>.holes.png for the top crops
+
+# 3. fill the located holes with scripts/fix_holes.py, which expects
+#    IN/<crop>/<crop>_surf.tif next to IN/<crop>/hole_mask.tif
+mkdir -p fix_in/sample_00340
+cp DATA_DIR/labels/sample_00340.tif fix_in/sample_00340/sample_00340_surf.tif
+cp audit_out/sample_00340.hole_mask.tif fix_in/sample_00340/hole_mask.tif
+# (run from vesuvius/; add --fg-value if your surface value is not 1)
+python src/vesuvius/scripts/fix_holes.py --in-dir fix_in --ignore-value 2 --method 2d_hole_fill
+
+# 4. check that the fix removed the holes and added nothing else
+vesuvius.label_topology_audit --label DATA_DIR/labels/sample_00340.tif \
+  --after fix_in/sample_00340/sample_00340_surf_2d_hole_fill.tif --out audit_out
+```
 
 ## Metrics
 
@@ -40,7 +66,8 @@ clusters, and finally holes that touch a crop face.
 | `n_tiny`, `tiny_voxel_frac` | components under 100 voxels (specks) and their share of foreground |
 | `n_big_components` | components of at least 100 voxels; topology is computed for these only |
 | `b1_total_big`, `n_big_with_b1` | Betti-1: holes/handles through a sheet (a flat sheet is 0, a sheet with a hole or a torus is 1) |
-| `b1_interior` | `b1_total_big` recomputed with 6 voxels trimmed off every crop face; trimming can split a sheet, so it is occasionally higher |
+| `n_holes_located`, `holes` | holes found by location: background blobs that a 3-step closing fills and whose filling lowers b1 (centre, voxels, interior or crop face); wider holes are not located |
+| `b1_face`, `b1_interior`, `b1_unlocated` | `b1_total_big` split by location: `b1_face` is located holes centred within 6 voxels of a crop face, `b1_interior` is the rest, including `b1_unlocated` (holes too wide to locate) |
 | `b2_total_big` | Betti-2: enclosed cavities (a hollow shell is 1) |
 | `n_closed_big`, `n_closed_with_b1` | big components not touching the crop border or ignore voxels; only these have untruncated topology |
 | `thick_*` | sheet thickness in voxels (`2*EDT-1` at medial ridge voxels); `frac_ge_7` is the share at 7 voxels or more |
@@ -61,7 +88,10 @@ All 892 crops of `surfaces/kaggle/labels` (840 at 320³, 51 at 256³, one at 384
 | finding | crops | total |
 | --- | --- | --- |
 | holes/handles (`b1_total_big` > 0) | 152 (17%) | 571 |
-| interior holes (`b1_interior` > 0) | 96 (11%) | 342 |
+| located, interior | 74 | 237 |
+| located, on a crop face (`b1_face`) | 71 | 257 |
+| not located (`b1_unlocated`) | 49 | 77 |
+| interior (`b1_interior` > 0: located interior + not located) | 107 (12%) | 314 |
 | cavities (`b2_total_big` > 0) | 69 (8%) | 206 |
 | junction clusters | 281 (32%) | 651 |
 | fused components | 22 (2%) | |
@@ -70,7 +100,10 @@ All 892 crops of `surfaces/kaggle/labels` (840 at 320³, 51 at 256³, one at 384
 Holes cluster in the later crops: 1% of crops 0-99 have one, 49% of crops 800-899
 and 81% of crops 900+. None of the holes are caused by ignore voxels. Filling
 holes with only the ignore voxels inside them removes none of the 571. Filling
-them with background voxels removes 495.
+them with background voxels removes 495. Of the 571 holes, 494 (87%) were
+located; the other 77 are too wide for a 3-step closing. Each located hole is
+measured with the earlier holes already filled, so one loop is never counted
+twice.
 
 Spot check: 29 located holes from 20 flagged crops, plus 10 clean crops as
 controls. Each was shown as three orthogonal CT slices with the label overlaid.
@@ -82,6 +115,28 @@ controls. Each was shown as three orthogonal CT slices with the label overlaid.
 - All 10 clean controls followed the sheet.
 
 The judging was done at thumbnail resolution, so treat the counts as indicative.
+
+### Before/after with `fix_holes.py`
+
+The 10 crops at the top of `ranked.csv`, with the audit's hole masks passed to
+`scripts/fix_holes.py`, then audited again with `--after`:
+
+| method | b1 | b2 | voxels added |
+| --- | --- | --- | --- |
+| `2d_hole_fill` | 111 → 49 | 19 → 12 | 3,731 |
+| `close`, kernel 2 | 111 → 73 | 19 → 12 | 1,997 |
+| `close`, kernel 3 | 111 → 67 | 19 → 12 | 4,689 |
+
+- `2d_hole_fill` cleared 3 crops completely (13, 17 and 9 holes to 0), and
+  took 3 more down to 1 hole each.
+- It left 3 crops unchanged (26, 9 and 7 holes). One had no located holes,
+  because they were all too wide. In the other two, the hole is not enclosed
+  within any z-slice, and `2d_hole_fill` only fills holes in z-slices.
+- Closing made one crop worse (6 holes to 7 with kernel 2, and to 8 with
+  kernel 3). This is why `--after` is worth running on any fix.
+- `fix_holes.py` only adds voxels. A pocket between two merged sheets needs a
+  cut, which no tool here makes, and these were the most common defect in the
+  spot check.
 
 ## Related tools
 

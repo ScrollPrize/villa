@@ -9,11 +9,14 @@ Per crop it measures:
   * connected components (26-connectivity): count, size histogram, tiny fragments
   * per component: Euler characteristic and Betti numbers b1 (handles/holes
     through a sheet) and b2 (enclosed cavities), from a padded bounding box;
-    ``b1_interior`` repeats b1 with 6 voxels trimmed off each crop face
+    b1 is split into ``b1_face`` (located holes centred within 6 voxels of a crop face)
+    and ``b1_interior`` (the rest, including ``b1_unlocated``: holes too wide to locate)
   * sheet thickness: 2*EDT-1 sampled at medial-ridge voxels (local EDT maxima)
   * fused sheets: after eroding by ``--erode`` voxels, a component that splits
     into >= 2 pieces of >= ``--min-piece`` voxels is "fused" (blind on 1-3
     voxel sheets, which erosion deletes)
+  * hole locations: closing-filled background blobs whose filling lowers b1
+    (centre, size, interior/crop face); ``--hole-masks`` writes them for fix_holes.py
   * non-planar junction clusters (structure tensor): a clean sheet is rank-1;
     a second large eigenvalue marks merged sheets or bridges
 
@@ -52,7 +55,7 @@ from vesuvius.image_proc.topology import component_betti
 TINY = 100  # voxels; components smaller than this are "tiny fragments"
 THICK = 7  # voxels; ridge thickness at or above this is flagged
 SIZE_BINS = [1, 10, 100, 1_000, 10_000, 100_000, 10**9]
-EDGE = 6  # voxels; b1_interior ignores holes within this distance of a crop face
+EDGE = 6  # voxels; a located hole centred closer than this to a crop face is not interior
 # ranked.csv order: most severe first; each entry is (metric, phrase for the reason column)
 SEVERITY = [("b1_interior", "interior holes"), ("b2_total_big", "cavities"),
             ("n_fused_components", "fused components"), ("n_junction_clusters", "junction clusters"),
@@ -60,7 +63,7 @@ SEVERITY = [("b1_interior", "interior holes"), ("b2_total_big", "cavities"),
 
 FLAT_KEYS = [
     "n_components", "n_tiny", "tiny_voxel_frac", "n_big_components", "n_closed_big",
-    "b1_total_big", "b1_interior", "n_big_with_b1", "n_closed_with_b1", "b2_total_big",
+    "b1_total_big", "b1_interior", "b1_face", "b1_unlocated", "n_holes_located", "n_big_with_b1", "n_closed_with_b1", "b2_total_big",
     "n_fused_components", "fused_voxel_frac", "bridge_voxels",
     "n_junction_clusters", "junction_voxel_frac", "n_components_with_junction",
     "largest_component_frac",
@@ -87,16 +90,40 @@ def component_topology(mask: np.ndarray) -> dict[str, int]:
     return {"euler": chi, "b1": b1, "b2": b2}
 
 
-def interior_b1(fg: np.ndarray, margin: int) -> int:
-    """Total b1 of the big components left after trimming ``margin`` voxels off every crop face."""
-    cc3d, ndi, _ = _deps()
-    if min(fg.shape) <= 2 * margin:
-        return 0
-    core = fg[(slice(margin, -margin or None),) * fg.ndim]
-    comp = cc3d.connected_components(core, connectivity=26)
-    return sum(component_topology(comp[sl] == cid)["b1"]
-               for cid, sl in enumerate(ndi.find_objects(comp), start=1)
-               if sl is not None and np.count_nonzero(comp[sl] == cid) >= TINY)
+def locate_holes(mask: np.ndarray, b1: int, blocked: np.ndarray | None = None, closing: int = 3):
+    """Hole sites of one component: blobs of background voxels that a ``closing``-step closing
+    fills and whose filling lowers b1. Holes wider than the closing are not located.
+
+    Returns (list of {"center_zyx", "voxels", "fixes"}, mask of the located blobs).
+    """
+    _, ndi, euler_number = _deps()
+    st = ndi.generate_binary_structure(3, 3)
+    p = closing + 1
+    fill = ndi.binary_closing(np.pad(mask, p), st, iterations=closing)[p:-p, p:-p, p:-p] & ~mask
+    if blocked is not None:
+        fill &= ~blocked
+    lab, _ = ndi.label(fill, st)
+    sizes = np.bincount(lab.ravel())[1:]
+    # blobs are measured against the mask with earlier blobs already filled, so two blobs
+    # that close the same loop are not both counted
+    holes, cur = [], mask.copy()
+    for j, sl in sorted(enumerate(ndi.find_objects(lab), start=1), key=lambda t: -sizes[t[0] - 1]):
+        if b1 <= 0:
+            break
+        blob = lab == j
+        # Euler number is local: a chi change in a window around the blob screens candidates
+        # before the full b1 check (filling a hole through a sheet raises chi by 1)
+        win = tuple(slice(max(s.start - 2, 0), s.stop + 2) for s in sl)
+        before = cur[win]
+        if euler_number(np.pad(before | blob[win], 1), 3) <= euler_number(np.pad(before, 1), 3):
+            continue
+        b1_after = component_topology(cur | blob)["b1"]
+        if b1_after < b1:
+            c = np.argwhere(blob).mean(0).round().astype(int)
+            holes.append({"center_zyx": c.tolist(), "voxels": int(sizes[j - 1]), "fixes": int(b1 - b1_after)})
+            cur |= blob
+            b1 = b1_after
+    return holes, cur & ~mask
 
 
 def thickness_stats(fg: np.ndarray):
@@ -166,12 +193,20 @@ def audit(label, erode=1, min_piece=500, surface_value=1, ignore_value=2):
             border[(slice(None),) * ax + (s,)] = True
     open_ids = set(np.unique(comp[(border | near_unl) & fg]).tolist()) - {0}
 
-    rows = []
+    rows, holes, hole_mask = [], [], np.zeros_like(fg)
     for cid, sl in enumerate(ndi.find_objects(comp), start=1):
         if sl is None:
             continue
         topo = component_topology(comp[sl] == cid) if sizes[cid] >= TINY else {}
         rows.append({"id": cid, "size": int(sizes[cid]), "open": cid in open_ids, **topo})
+        if topo.get("b1"):
+            found, blobs = locate_holes(comp[sl] == cid, topo["b1"], unl[sl] | (comp[sl] > 0))
+            off = np.array([s.start for s in sl])
+            for h in found:
+                c = np.array(h["center_zyx"]) + off
+                inside = bool(np.all((c >= EDGE) & (c < np.array(fg.shape) - EDGE)))
+                holes.append({"component": cid, **h, "center_zyx": c.tolist(), "interior": inside})
+            hole_mask[sl] |= blobs
     big = [r for r in rows if "b1" in r]
     closed = [r for r in big if not r["open"]]
 
@@ -200,10 +235,16 @@ def audit(label, erode=1, min_piece=500, surface_value=1, ignore_value=2):
         "euler_total_big": int(sum(r["euler"] for r in big)),
         "b1_total_big": int(sum(r["b1"] for r in big)),
         "b1_total_closed": int(sum(r["b1"] for r in closed)),
-        "b1_interior": int(interior_b1(fg, EDGE)) if big else 0,
         "n_big_with_b1": sum(r["b1"] > 0 for r in big),
         "n_closed_with_b1": sum(r["b1"] > 0 for r in closed),
         "b2_total_big": int(sum(r["b2"] for r in big)),
+        "n_holes_located": int(sum(h["fixes"] for h in holes)),
+        # b1_total_big = b1_face + b1_interior; b1_interior includes b1_unlocated, since holes
+        # too wide to locate are not crop-face slivers
+        "b1_face": int(sum(h["fixes"] for h in holes if not h["interior"])),
+        "b1_unlocated": int(sum(r["b1"] for r in big) - sum(h["fixes"] for h in holes)),
+        "b1_interior": int(sum(r["b1"] for r in big) - sum(h["fixes"] for h in holes if not h["interior"])),
+        "holes": holes,
         "thickness": {k: float(v) for k, v in thick.items()},
         "n_fused_components": len(fused),
         "fused_voxel_frac": float(np.isin(comp, fused).sum() / max(nfg, 1)),
@@ -213,7 +254,7 @@ def audit(label, erode=1, min_piece=500, surface_value=1, ignore_value=2):
         "n_components_with_junction": int(junc_comps.size),
         "components": sorted(rows, key=lambda r: -r["size"])[:25],
     }
-    flags = {"tiny": tiny_mask, "bridge": bridge, "thick": thick_mask, "junction": junc}
+    flags = {"tiny": tiny_mask, "bridge": bridge, "thick": thick_mask, "junction": junc, "hole": hole_mask}
     return m, flags
 
 
@@ -246,6 +287,38 @@ def overlay(img, label, flags, path, surface_value=1):
         a.axis("off")
     fig.tight_layout()
     fig.savefig(path, dpi=110)
+    plt.close(fig)
+
+
+def hole_tiles(img, label, holes, hole_mask, path, surface_value=1, ignore_value=2, half=32, limit=8):
+    """Three orthogonal CT slices through each of the first ``limit`` located holes."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    holes = holes[:limit]
+    fig, axs = plt.subplots(len(holes), 3, figsize=(7.5, 2.5 * len(holes)), squeeze=False)
+    scale = max(float(img.max()), 1.0)
+    for row, h in zip(axs, holes):
+        c = h["center_zyx"]
+        for axis, a in enumerate(row):
+            sl = [slice(max(q - half, 0), q + half) for q in c]
+            sl[axis] = c[axis]
+            sl = tuple(sl)
+            rgb = np.repeat((img[sl] / scale)[..., None], 3, axis=2)
+            lb = label[sl]
+            rgb[lb == surface_value] = 0.55 * rgb[lb == surface_value] + 0.45 * np.array([0, 1, 0])
+            rgb[lb == ignore_value] = 0.7 * rgb[lb == ignore_value] + 0.3 * np.array([0, 0.3, 1])
+            rgb[hole_mask[sl]] = (1, 0, 0)
+            a.imshow(rgb, interpolation="nearest")
+            a.set_xticks([])
+            a.set_yticks([])
+        tag = "interior" if h["interior"] else "crop face"
+        row[0].set_ylabel(f"zyx {c}\n{h['voxels']} vox, {tag}", fontsize=7)
+    axs[0, 1].set_title("label green, ignore blue, hole red", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=100)
     plt.close(fig)
 
 
@@ -294,6 +367,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--erode", type=int, default=1, help="erosion iterations for the fusion test")
     ap.add_argument("--min-piece", type=int, default=500, help="minimum voxels of a post-erosion piece")
     ap.add_argument("--plot", action="store_true", help="write overlay PNGs (needs --image / batch images)")
+    ap.add_argument("--hole-masks", action="store_true",
+                    help="write <crop>.hole_mask.tif (located holes = 1), the input format of scripts/fix_holes.py")
     ap.add_argument("--fail-on", action="append", default=[], metavar="METRIC=MAX",
                     help="exit 2 if a crop's metric (or its --after volume's) exceeds MAX (repeatable), e.g. b1_total_big=0")
     return ap
@@ -334,7 +409,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             if image_path is None or not Path(image_path).exists():
                 print(f"{name}: --plot skipped, no image", file=sys.stderr)
             else:
-                overlay(tifffile.imread(image_path), lab, flags, a.out / f"{name}.png", a.surface_value)
+                img = tifffile.imread(image_path)
+                overlay(img, lab, flags, a.out / f"{name}.png", a.surface_value)
+                if m["holes"]:
+                    hole_tiles(img, lab, m["holes"], flags["hole"], a.out / f"{name}.holes.png",
+                               a.surface_value, -1 if ignore is None else ignore)
+        if a.hole_masks:
+            tifffile.imwrite(a.out / f"{name}.hole_mask.tif", flags["hole"].astype(np.uint8))
         if after_path:
             m2, _ = audit(tifffile.imread(after_path), a.erode, a.min_piece, a.surface_value, ignore)
             f2 = flat(m2)

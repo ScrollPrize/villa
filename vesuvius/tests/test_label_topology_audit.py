@@ -133,10 +133,10 @@ def test_hole_at_crop_face_is_excluded_from_interior_b1():
     mid[:, 18:22, 18:22] = 0
     mf, _ = lta.audit(face)
     mm, _ = lta.audit(mid)
-    assert (mf["b1_total_big"], mf["b1_interior"]) == (1, 0)
-    assert (mm["b1_total_big"], mm["b1_interior"]) == (1, 1)
+    assert (mf["b1_total_big"], mf["b1_interior"], mf["b1_face"]) == (1, 0, 1)
+    assert (mm["b1_total_big"], mm["b1_interior"], mm["b1_face"], mm["b1_unlocated"]) == (1, 1, 0, 0)
 
-    # a crop thinner than the trimmed margin has no interior
+    # a crop thinner than twice the face margin has no interior
     tiny = np.zeros((10, 40, 40), np.uint8); tiny[2:8, 4:-4, 4:-4] = 1; tiny[2:8, 18:22, 18:22] = 0
     mt, _ = lta.audit(tiny)
     assert (mt["b1_total_big"], mt["b1_interior"]) == (1, 0)
@@ -171,3 +171,55 @@ def test_detect_holes_cpu_topology_matches_known_shapes():
     for fg, bg in ((26, 6), (6, 26)):
         topo = lambda v: dh.compute_component_topology(v, fg_connectivity=fg, bg_connectivity=bg, use_cpu=True)[:2]
         assert (topo(torus()), topo(shell()), topo(sheet())) == ((1, 0), (0, 1), (0, 0))
+
+
+def test_holes_are_located_where_they_are():
+    # locations are what make a flag checkable (and fixable with fix_holes.py), so each
+    # small hole must come back at its own position
+    v = sheet()
+    v[:, 10:13, 10:13] = 0
+    v[:, 26:29, 24:27] = 0
+    m, flags = lta.audit(v)
+    assert m["b1_total_big"] == m["n_holes_located"] == 2
+    centres = sorted(tuple(h["center_zyx"][1:]) for h in m["holes"])
+    assert centres == [(11, 11), (27, 25)]
+    assert flags["hole"].sum() == 2 * 9 * 2 and not (flags["hole"] & (v == 1)).any()
+
+
+def test_wide_hole_is_not_located_but_still_counts_as_interior():
+    v = sheet()
+    v[:, 12:28, 12:28] = 0           # 16 voxels across, wider than the 3-step closing reaches
+    m, _ = lta.audit(v)
+    assert (m["b1_total_big"], m["n_holes_located"], m["b1_interior"]) == (1, 0, 1)
+    assert (m["b1_face"], m["b1_unlocated"]) == (0, 1)
+
+
+def test_one_loop_closed_from_two_sides_is_counted_once():
+    # tube A (long) and tube B (short, narrow bore) joined by a bridge: b1 = 2. An ignore plug
+    # splits A's bore into two blobs, and filling either caps A. Counting both against the
+    # original b1 would use up b1 on A and never locate B's hole.
+    z, y, x = np.mgrid[:24, :16, :30]
+    ra, rb = np.hypot(y - 7.5, x - 7.5), np.hypot(y - 7.5, x - 21.5)
+    v = (ra < 4) & (ra >= 2) & (z >= 2) & (z < 22)
+    v |= (rb < 4) & (rb >= 1) & (z >= 2) & (z < 8)
+    v |= (z >= 2) & (z < 4) & (y >= 5) & (y < 11) & (x >= 10) & (x < 20) & ~((ra < 2) | (rb < 1))
+    plug = (ra < 2) & (z >= 11) & (z < 13)
+    assert lta.component_topology(v)["b1"] == 2
+    holes, found = lta.locate_holes(v, 2, plug)
+    assert sorted(h["center_zyx"][2] > 15 for h in holes) == [False, True]   # one per tube
+    assert sum(h["fixes"] for h in holes) == 2
+    assert not (found & plug).any()
+
+
+def test_cli_hole_masks_and_hole_tiles(tmp_path):
+    pytest.importorskip("matplotlib")
+    v = sheet()
+    v[:, 18:21, 18:21] = 0
+    tifffile.imwrite(tmp_path / "lab.tif", v)
+    tifffile.imwrite(tmp_path / "img.tif", (v * 200).astype(np.uint8))
+    out = tmp_path / "out"
+    assert lta.main(["--label", str(tmp_path / "lab.tif"), "--image", str(tmp_path / "img.tif"),
+                     "--out", str(out), "--plot", "--hole-masks"]) == 0
+    mask = tifffile.imread(out / "lab.hole_mask.tif")
+    assert mask.sum() == 9 * 2 and mask[18:20, 18:21, 18:21].all()
+    assert (out / "lab.holes.png").exists()
