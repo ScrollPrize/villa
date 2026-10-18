@@ -518,6 +518,47 @@ def check_viewer_registry(client: BridgeClient, results: Results) -> None:
         results.record("viewer_registry", False, f"{type(error).__name__}: {error}")
 
 
+# Every workspace id in tab order (AgentBridgeUi.hpp's agentBridgeWorkspaceIds,
+# set as each tab page's "workspaceId" property in CWindow's constructor).
+WORKSPACE_IDS = (
+    "main",
+    "lasagna",
+    "atlas",
+    "fiber-slice",
+    "intersections",
+    "spiral",
+    "fiber-map",
+)
+
+
+def check_workspaces(client: BridgeClient, results: Results) -> None:
+    """workspace.switch reaches every tab, each id is present in this build,
+    and the original fiber_slice spelling still works."""
+    failures: list[str] = []
+    try:
+        previous = None
+        for workspace_id in WORKSPACE_IDS:
+            result, _ = client.call(
+                "workspace.switch", {"name": workspace_id}, timeout=RPC_TIMEOUT)
+            if result.get("workspace") != workspace_id:
+                failures.append(f"{workspace_id}: result={result}")
+            if previous is not None and result.get("previous") != previous:
+                failures.append(f"{workspace_id}: previous={result.get('previous')}")
+            previous = workspace_id
+        legacy, _ = client.call(
+            "workspace.switch", {"name": "fiber_slice"}, timeout=RPC_TIMEOUT)
+        if legacy.get("workspace") != "fiber-slice":
+            failures.append(f"fiber_slice alias -> {legacy}")
+        client.call("workspace.switch", {"name": "main"}, timeout=RPC_TIMEOUT)
+    except Exception as error:  # noqa: BLE001
+        failures.append(f"{type(error).__name__}: {error}")
+    results.record(
+        "workspace_switch_all",
+        not failures,
+        "every workspace switched in tab order" if not failures else "; ".join(failures[:4]),
+    )
+
+
 def check_project_create(
     client: BridgeClient,
     results: Results,
@@ -1874,6 +1915,7 @@ def main() -> int:
             require_running(proc, results, "viewer normalization")
             check_canvas_normalization(client, results)
             check_viewer_registry(client, results)
+            check_workspaces(client, results)
 
             check_volume_attach(client, results, tmp_path, volpkg)
             check_segments_attach(client, results, tmp_path, volpkg)

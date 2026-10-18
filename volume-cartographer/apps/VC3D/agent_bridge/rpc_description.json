@@ -3749,7 +3749,8 @@
     "workspace.switch": {
       "errors": [
         -32602,
-        -32000
+        -32000,
+        -32007
       ],
       "mcp": {
         "tool": "vc3d_switch_workspace"
@@ -3760,6 +3761,11 @@
             "enum": [
               "main",
               "lasagna",
+              "atlas",
+              "fiber-slice",
+              "intersections",
+              "spiral",
+              "fiber-map",
               "fiber_slice"
             ],
             "type": "string"

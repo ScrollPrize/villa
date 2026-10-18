@@ -427,7 +427,16 @@ class ToolSchemaTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             by_name["vc3d_switch_workspace"]["properties"]["name"]["enum"],
-            ["main", "lasagna", "fiber_slice"],
+            [
+                "main",
+                "lasagna",
+                "atlas",
+                "fiber-slice",
+                "intersections",
+                "spiral",
+                "fiber-map",
+                "fiber_slice",
+            ],
         )
         self.assertEqual(
             by_name["vc3d_atlas_search_start"]["properties"]["mode"]["enum"],

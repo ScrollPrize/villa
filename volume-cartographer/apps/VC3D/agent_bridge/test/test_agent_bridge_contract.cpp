@@ -14,6 +14,7 @@
 #include "agent_bridge/AgentBridgeCommandError.hpp"
 #include "agent_bridge/AgentBridgeInternal.hpp"
 #include "agent_bridge/AgentBridgeMethod.hpp"
+#include "agent_bridge/AgentBridgeUi.hpp"
 
 namespace {
 
@@ -315,6 +316,15 @@ int main()
     const auto busyError = mapLaunchError(CommandLaunchError::Busy);
     CHECK(busyError.code == -32004);
     CHECK(busyError.data.value("source").toString() == QLatin1String("tool"));
+
+    // Workspace ids: tab order, and the legacy workspace.switch spelling.
+    CHECK(agentBridgeWorkspaceIds().size() == 7);
+    CHECK(agentBridgeWorkspaceIds().front() == QLatin1String("main"));
+    CHECK(agentBridgeWorkspaceIds().contains(QStringLiteral("fiber-map")));
+    CHECK(canonicalWorkspaceId(QStringLiteral("fiber_slice")) ==
+          QLatin1String("fiber-slice"));
+    CHECK(canonicalWorkspaceId(QStringLiteral("spiral")) == QLatin1String("spiral"));
+    CHECK(!agentBridgeWorkspaceIds().contains(QStringLiteral("fiber_slice")));
 
     if (g_failures == 0) {
         std::printf("PASS: all %d checks in test_agent_bridge_contract\n", g_checks);

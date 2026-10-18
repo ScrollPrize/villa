@@ -77,26 +77,37 @@ async def vc3d_screenshot(
 
 @mcp.tool()
 async def vc3d_switch_workspace(
-    name: Literal["main", "lasagna", "fiber_slice"]
+    name: Literal[
+        "main",
+        "lasagna",
+        "atlas",
+        "fiber-slice",
+        "intersections",
+        "spiral",
+        "fiber-map",
+        "fiber_slice",
+    ]
 ) -> dict[str, Any]:
-    """Switch VC3D's active workspace tab. Requires a volume package to be open.
+    """Switch VC3D's active workspace tab, exactly as clicking the tab does.
+    Requires a volume package to be open.
 
-    name: "main" (the default segmentation/navigation workspace -- v1-v4's
-    viewers live here), "lasagna" (the Lasagna optimization workspace), or
-    "fiber_slice" (the fiber-slice workspace). Any viewers the workspace
-    creates register with the ViewerManager and become targetable by
-    vc3d_click / vc3d_drag / vc3d_screenshot etc. (they appear in
-    vc3d_get_state's viewers list).
+    name: a workspace id, in tab order: "main" (segmentation and navigation;
+    v1-v4 live here), "lasagna", "atlas", "fiber-slice", "intersections",
+    "spiral", "fiber-map". "fiber_slice" is the older spelling of
+    "fiber-slice" and is still accepted.
 
-    "main" is the only documented way back from "lasagna"/"fiber_slice" --
-    there's no automatic return. This tab is real Qt UI state that persists
-    across app restarts: a freshly launched VC3D can silently open on a
-    leftover "lasagna"/"fiber_slice" tab from a prior session, in which case
-    vc3d_screenshot on a main-tab viewer fails -32009 (not visible) until you
-    call this with name="main" first. Check vc3d_get_state's viewers, or just
-    call this proactively if a main-tab capture unexpectedly fails.
+    Spiral's own viewer panes reuse the main slot names ("segmentation",
+    "xy plane", ...), which keep meaning the main panes, so target Spiral's
+    panes by "viewerId" from vc3d_get_state. A viewer in a hidden tab can
+    still receive input, but vc3d_screenshot needs it visible, so switch here
+    first.
 
-    Returns {"workspace": str}. Errors: -32602 (unknown name), -32000 (no volume
-    package loaded).
+    The tab is real Qt UI state that persists across restarts: a freshly
+    launched VC3D can open on a leftover tab from a prior session. There is no
+    automatic return; switch back to "main" yourself.
+
+    Returns {"workspace": id, "previous": id or null}. Errors: -32602 (unknown
+    name), -32000 (no volume package loaded), -32007 (that workspace is not
+    present in this build).
     """
     return await _call("workspace.switch", {"name": name})

@@ -30,6 +30,7 @@
 class QLocalServer;
 class QLocalSocket;
 class QTimer;
+class QWidget;
 class CWindow;
 class ViewerManager;
 class VolumeViewerBase;
@@ -135,6 +136,23 @@ private:
     // AgentBridgeError (-32002) on ambiguity or no match.
     VolumeViewerBase* resolveViewer(const QJsonValue& ref,
                                     const QString& defaultSlot = QStringLiteral("segmentation")) const;
+
+    // --- Workspaces (AgentBridgeWorkspaces.cpp) ---
+    // A workspace is a tab of CWindow's workspace tab widget whose page carries
+    // a "workspaceId" property. Line-annotation tabs have no id and are not
+    // addressable.
+    struct WorkspaceTab {
+        QString id;
+        QString title;
+        int index = -1;
+        QWidget* page = nullptr;
+    };
+    std::vector<WorkspaceTab> workspaceTabs() const;
+    QWidget* workspacePage(const QString& id) const;
+    QString currentWorkspaceId() const;
+    // Makes `id` the current tab exactly as the GUI does. Returns false when
+    // no tab has that id.
+    bool setCurrentWorkspace(const QString& id);
 
     // --- Handlers ---
     QJsonObject handlePing(const QJsonValue& params);

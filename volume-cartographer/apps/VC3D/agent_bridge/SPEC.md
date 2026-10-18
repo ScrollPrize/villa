@@ -267,6 +267,12 @@ dialog.
 - `ping` reports process, application, and protocol identity.
 - `state.get` is a non-mutating snapshot of the current package, volume,
   active segment, editing modes, viewers, point state, and active jobs.
+- `workspace.switch` accepts every workspace id (`main`, `lasagna`, `atlas`,
+  `fiber-slice`, `intersections`, `spiral`, `fiber-map`) plus the original
+  `fiber_slice` spelling, and changes the tab exactly as the GUI does. It
+  returns the canonical id and the previous id (null for an unnamed
+  line-annotation tab). An id whose tab is absent returns -32007 with
+  `data.kind` `workspace`.
 - `project.create` writes a new `.volpkg.json` referencing one local zarr
   volume or remote `.zarr` URL. It does not change the current session;
   remote availability is checked by `volume.open` when the new project is
@@ -528,7 +534,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_set_segment_tag` | `tags.set` |
 | `vc3d_set_wrap_annotation_mode` | `wrap_annotation.set_mode` | Enable/disable "Same-wrap annotation mode" (prerequisite for the shift+E commit workflow; seed the preview via `vc3d_shift_click`). |
 | `vc3d_shift_click` | `canvas.shift_click` | Shift+click convenience: the canonical place-point / set-focus gesture. |
-| `vc3d_switch_workspace` | `workspace.switch` |
+| `vc3d_switch_workspace` | `workspace.switch` | Switch to any of the seven workspace tabs, as a tab click does. |
 | `vc3d_undo_wrap_annotation` | `wrap_annotation.undo` | Undo the same-wrap annotation (Ctrl+Z equivalent): clear the preview or undo the last committed collection. |
 | `vc3d_update_point` | `points.update_point` |
 | `vc3d_zoom_viewer` | `viewer.zoom` | Multiply a viewer's zoom by a factor (>1 zooms in). Returns the new scale. |
