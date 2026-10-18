@@ -5,6 +5,8 @@ from __future__ import annotations
 import base64
 from typing import Any, Literal, Optional
 
+from typing_extensions import TypedDict
+
 from mcp.server.fastmcp import Image
 
 from ..core import mcp, _call, _strip_none
@@ -31,13 +33,23 @@ async def vc3d_get_state() -> dict[str, Any]:
     return await _call("state.get")
 
 
+class _Region(TypedDict):
+    x: int
+    y: int
+    width: int
+    height: int
+
+
 @mcp.tool()
 async def vc3d_screenshot(
     target: str = "window",
     file_path: Optional[str] = None,
     max_dim: Optional[int] = None,
+    region: Optional[_Region] = None,
+    reveal: bool = False,
 ) -> Any:
-    """Capture a PNG of the whole VC3D window or one viewer pane.
+    """Capture a PNG of the VC3D window, one viewer pane, one dock, or one
+    workspace.
 
     Return contract depends on file_path:
     - file_path omitted: the PNG is returned inline as an MCP image content
@@ -47,19 +59,32 @@ async def vc3d_screenshot(
       the raw result dict (path/metadata; its base64 field is null). No image
       is embedded in the reply.
 
-    target: "window" for the whole app, or a viewer ref (a "vN" registry id
-    or a surface-slot name like "segmentation"/"xy plane"/"seg xz"/"seg yz").
+    target: "window" for the whole app; a viewer ref (a "vN" registry id or a
+    surface-slot name like "segmentation"/"xy plane"/"seg xz"/"seg yz");
+    "dock:<objectName>" for one dock (vc3d_inspect_ui lists them); or
+    "workspace:<id>" for one workspace tab, e.g. "workspace:spiral".
     file_path: absolute path; when set, the PNG is written to disk and the
     result dict is returned. Omit to get the PNG back as an inline image.
     max_dim: optional downscale, longest side in pixels, aspect preserved.
     Inline captures default to 2048 pixels so their base64 response stays
     within the bridge transport budget. File captures default to full size.
+    region: {"x","y","width","height"} in the target's logical pixels, to
+    capture part of it; clipped to the target, -32602 when entirely outside.
+    reveal: when the target is hidden (another workspace tab, or a closed
+    dock), switch to its workspace and show its dock just for this capture,
+    then put the tab, the dock layout and keyboard focus back. A viewer
+    revealed this way may still be drawing its tiles, so its image can lag;
+    the person at the screen sees a brief switch. A target in a hidden
+    floating dock is refused (-32009) rather than opened as a window.
 
-    Fails -32009 if the target widget isn't currently visible (e.g. it's on a
-    non-frontmost tab, such as a fiber/lasagna workspace pane while a
-    different tab is active) or its captured size is degenerate (<8px on a
-    side) -- rather than silently returning a meaningless near-zero-size
-    image. Switch to the right tab/workspace first if you hit this.
+    Fields that would hold credentials (password and API-key entries, text
+    containing a password, token or signed URL) are painted over in the
+    image; the result's "masked" counts them.
+
+    Fails -32009 if the target isn't visible and reveal is false (or
+    revealing could not show it), or its size is degenerate (<8px on a
+    side), rather than silently returning a meaningless image; -32007 for an
+    unknown dock or workspace.
     """
     effective_max_dim = max_dim
     if effective_max_dim is None and file_path is None:
@@ -68,7 +93,13 @@ async def vc3d_screenshot(
     result = await _call(
         "screenshot.capture",
         _strip_none(
-            {"target": target, "filePath": file_path, "maxDim": effective_max_dim}
+            {
+                "target": target,
+                "filePath": file_path,
+                "maxDim": effective_max_dim,
+                "region": region,
+                "reveal": reveal,
+            }
         ),
     )
     if file_path is not None:

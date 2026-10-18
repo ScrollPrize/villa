@@ -1,14 +1,21 @@
 #include "agent_bridge/AgentBridgeServer.hpp"
+#include "agent_bridge/AgentBridgeAccessible.hpp"
 #include "agent_bridge/AgentBridgeInternal.hpp"
+#include "agent_bridge/AgentBridgeUi.hpp"
 
 #include <QBuffer>
 #include <QByteArray>
 #include <QCoreApplication>
+#include <QDockWidget>
 #include <QImage>
 #include <QJsonArray>
+#include <QMainWindow>
 #include <QPixmap>
 #include <QPointF>
+#include <QPointer>
+#include <QRect>
 #include <QRegularExpression>
+#include <QTabWidget>
 #include <QWidget>
 
 #include <algorithm>
@@ -894,15 +901,60 @@ QJsonObject AgentBridgeServer::handleSegmentsFetch(const QJsonValue& params)
 }
 
 
+namespace {
+
+// What screenshot.capture's reveal changed: the workspace tab it left, the
+// keyboard focus it may have moved, the docks it showed, and the layout of
+// each main window that owns one of those docks.
+struct RevealRecord {
+    bool tabSwitched = false;
+    QString previousWorkspace;
+    int previousIndex = -1;
+    QPointer<QWidget> previousFocus;
+    std::vector<QPointer<QDockWidget>> shownDocks;
+    std::vector<std::pair<QPointer<QMainWindow>, QByteArray>> layouts;
+
+    bool changed() const { return tabSwitched || !shownDocks.empty(); }
+
+    void showDock(QDockWidget* dock)
+    {
+        auto* owner = qobject_cast<QMainWindow*>(dock->parentWidget());
+        const bool saved = std::any_of(layouts.begin(), layouts.end(),
+                                       [owner](const auto& l) { return l.first == owner; });
+        if (owner && !saved)
+            layouts.emplace_back(owner, owner->saveState());
+        dock->show();
+        shownDocks.emplace_back(dock);
+    }
+};
+
+}  // namespace
+
+
 QJsonObject AgentBridgeServer::handleScreenshotCapture(const QJsonValue& params)
 {
     const QJsonObject p = params.toObject();
     const QString target =
         p.value("target").toString(QStringLiteral("window"));
+    const bool reveal = p.value("reveal").toBool(false);
 
     QWidget* widget = nullptr;
+    QString kind;
+    QString name;
     if (target.isEmpty() || target == QLatin1String("window")) {
         widget = _window;
+    } else if (splitAgentBridgeTarget(target, &kind, &name)) {
+        widget = kind == QLatin1String("dock") ? static_cast<QWidget*>(findDock(name))
+                                               : workspacePage(name);
+        if (!widget) {
+            QJsonObject data;
+            data["kind"] = kind;
+            data["id"] = name;
+            throw AgentBridgeError{-32007,
+                kind == QLatin1String("dock") ? QStringLiteral("Dock not found")
+                                              : QStringLiteral("Workspace not available"),
+                data};
+        }
     } else {
         VolumeViewerBase* viewer = resolveViewer(QJsonValue(target));
         widget = dynamic_cast<QWidget*>(viewer);
@@ -916,28 +968,111 @@ QJsonObject AgentBridgeServer::handleScreenshotCapture(const QJsonValue& params)
     if (!widget)
         throw AgentBridgeError{-32002, "No capture target available", {}};
 
-    if (!widget->isVisible()) {
-        QJsonObject data;
-        data["detail"] = "target widget is not currently visible (e.g. it's on a "
-                          "non-frontmost tab or a hidden pane) -- a grab() of a "
-                          "hidden widget returns a meaningless, often near-zero-size "
-                          "image; switch to it (e.g. via workspace.switch) before "
-                          "capturing";
-        throw AgentBridgeError{-32009, "Capture target not visible", data};
-    }
+    // reveal: switch to the target's workspace and show the docks around it
+    // for this capture only. Everything is put back by restoreReveal(), on
+    // success and on failure, outside any exception unwinding.
+    RevealRecord revealed;
+    QTabWidget* tabs = _window ? _window->_workspaceTabs : nullptr;
+    auto restoreReveal = [&]() {
+        for (auto it = revealed.shownDocks.rbegin(); it != revealed.shownDocks.rend(); ++it) {
+            if (*it)
+                (*it)->hide();
+        }
+        for (const auto& [owner, layout] : revealed.layouts) {
+            if (owner)
+                owner->restoreState(layout);
+        }
+        if (revealed.tabSwitched) {
+            if (!revealed.previousWorkspace.isEmpty())
+                setCurrentWorkspace(revealed.previousWorkspace);
+            else if (tabs && revealed.previousIndex >= 0 &&
+                     revealed.previousIndex < tabs->count())
+                tabs->setCurrentIndex(revealed.previousIndex);
+        }
+        if (revealed.changed() && revealed.previousFocus)
+            revealed.previousFocus->setFocus(Qt::OtherFocusReason);
+    };
 
-    QPixmap pixmap = widget->grab();
+    QPixmap pixmap;
+    QRect area;
+    int masked = 0;
+    try {
+        if (reveal && !widget->isVisible()) {
+            // Showing a hidden floating dock would open a window on the
+            // person's desktop; refuse before changing anything.
+            for (QWidget* w = widget; w && w != _window; w = w->parentWidget()) {
+                auto* dock = qobject_cast<QDockWidget*>(w);
+                if (dock && dock->isHidden() && dock->isFloating()) {
+                    QJsonObject data;
+                    data["detail"] = QStringLiteral(
+                        "the target is in the hidden floating dock \"%1\"; showing it "
+                        "would open a separate window").arg(dock->objectName());
+                    throw AgentBridgeError{-32009, "Capture target not revealable", data};
+                }
+            }
+            revealed.previousFocus = _window ? _window->focusWidget() : nullptr;
+            const QString workspace =
+                kind == QLatin1String("workspace") ? name : workspaceIdFor(widget);
+            if (!workspace.isEmpty() && workspace != currentWorkspaceId()) {
+                revealed.previousWorkspace = currentWorkspaceId();
+                revealed.previousIndex = tabs ? tabs->currentIndex() : -1;
+                revealed.tabSwitched = setCurrentWorkspace(workspace);
+            }
+            for (QWidget* w = widget; w && w != _window; w = w->parentWidget()) {
+                if (auto* dock = qobject_cast<QDockWidget*>(w); dock && dock->isHidden())
+                    revealed.showDock(dock);
+            }
+            // Apply the layouts the switch posted so the target has its real
+            // geometry; this delivers only pending layout requests.
+            QCoreApplication::sendPostedEvents(nullptr, QEvent::LayoutRequest);
+        }
 
-    static constexpr int kMinCaptureDim = 8;
-    if (pixmap.width() < kMinCaptureDim || pixmap.height() < kMinCaptureDim) {
-        QJsonObject data;
-        data["detail"] = QStringLiteral(
-                              "captured pixmap is degenerate (%1x%2) -- the target "
-                              "widget has not been laid out to a meaningful size")
-                              .arg(pixmap.width())
-                              .arg(pixmap.height());
-        throw AgentBridgeError{-32009, "Capture target has degenerate size", data};
+        if (!widget->isVisible()) {
+            QJsonObject data;
+            data["detail"] = "target widget is not currently visible (e.g. it's on a "
+                             "non-frontmost tab or a hidden pane) -- a grab() of a "
+                             "hidden widget returns a meaningless, often near-zero-size "
+                             "image; switch to it (e.g. via workspace.switch) or pass "
+                             "reveal:true before capturing";
+            throw AgentBridgeError{-32009, "Capture target not visible", data};
+        }
+
+        static constexpr int kMinCaptureDim = 8;
+        if (widget->width() < kMinCaptureDim || widget->height() < kMinCaptureDim) {
+            QJsonObject data;
+            data["detail"] = QStringLiteral(
+                                 "captured pixmap is degenerate (%1x%2) -- the target "
+                                 "widget has not been laid out to a meaningful size")
+                                 .arg(widget->width())
+                                 .arg(widget->height());
+            throw AgentBridgeError{-32009, "Capture target has degenerate size", data};
+        }
+
+        // region: a rectangle in the target's logical pixels, clipped to it.
+        area = widget->rect();
+        if (p.contains("region")) {
+            const QJsonObject r = p.value("region").toObject();
+            area = agentBridgeCaptureArea(r.value("x").toInt(), r.value("y").toInt(),
+                                          r.value("width").toInt(), r.value("height").toInt(),
+                                          widget->size());
+            if (area.isEmpty()) {
+                QJsonObject data;
+                data["param"] = "region";
+                data["detail"] = QStringLiteral("region lies outside the %1x%2 target")
+                                     .arg(widget->width())
+                                     .arg(widget->height());
+                throw AgentBridgeError{-32602, "region is outside the target", data};
+            }
+        }
+
+        pixmap = widget->grab(area);
+        // Withhold what ui.inspect withholds.
+        masked = agentBridgeMaskSecrets(pixmap, widget, area);
+    } catch (...) {
+        restoreReveal();
+        throw;
     }
+    restoreReveal();
 
     if (p.contains("maxDim")) {
         const int maxDim = p.value("maxDim").toInt();
@@ -955,6 +1090,16 @@ QJsonObject AgentBridgeServer::handleScreenshotCapture(const QJsonValue& params)
     result["width"] = image.width();
     result["height"] = image.height();
     result["format"] = "png";
+    result["revealed"] = revealed.changed();
+    result["masked"] = masked;
+    if (p.contains("region")) {
+        QJsonObject region;
+        region["x"] = area.x();
+        region["y"] = area.y();
+        region["width"] = area.width();
+        region["height"] = area.height();
+        result["region"] = region;
+    }
 
     const QString filePath = p.value("filePath").toString();
     if (!filePath.isEmpty()) {

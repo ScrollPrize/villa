@@ -458,6 +458,19 @@ int main()
         CHECK(!splitAgentBridgeTarget(QStringLiteral("v1"), &kind, &name));
     }
 
+    // screenshot.capture regions clip to the target without overflow.
+    {
+        const QSize target(100, 50);
+        CHECK(agentBridgeCaptureArea(10, 5, 20, 10, target) == QRect(10, 5, 20, 10));
+        CHECK(agentBridgeCaptureArea(90, 40, 50, 50, target) == QRect(90, 40, 10, 10));
+        CHECK(agentBridgeCaptureArea(0, 0, std::numeric_limits<int>::max(),
+                                     std::numeric_limits<int>::max(), target) ==
+              QRect(0, 0, 100, 50));
+        CHECK(agentBridgeCaptureArea(100, 0, 5, 5, target).isEmpty());
+        CHECK(agentBridgeCaptureArea(std::numeric_limits<int>::max(), 0, 5, 5, target).isEmpty());
+        CHECK(agentBridgeCaptureArea(0, 0, 0, 5, target).isEmpty());
+    }
+
     if (g_failures == 0) {
         std::printf("PASS: all %d checks in test_agent_bridge_contract\n", g_checks);
         return 0;

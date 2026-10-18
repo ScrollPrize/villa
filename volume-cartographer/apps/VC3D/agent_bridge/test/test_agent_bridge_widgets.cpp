@@ -1,7 +1,9 @@
-// Offscreen widget test for the bridge's keyboard synthesis: shortcuts and
-// widgets receive synthesized keys, the cached modifier state is reset, the
-// dialogs and menus a key opens are answered as Escape would answer them,
-// and keyboard focus returns to where it was. It needs no VC3D window.
+// Offscreen widget test for the bridge's widget-level code: keyboard
+// synthesis (shortcuts and widgets receive synthesized keys, the cached
+// modifier state is reset, the dialogs and menus a key opens are answered as
+// Escape would answer them, keyboard focus returns), ui.inspect's
+// accessibility tree with its redaction, and screenshot masking. It needs no
+// VC3D window.
 
 #include <QApplication>
 #include <QCheckBox>
@@ -19,6 +21,7 @@
 #include <QMainWindow>
 #include <QMenu>
 #include <QMessageBox>
+#include <QPixmap>
 #include <QPlainTextEdit>
 #include <QProgressDialog>
 #include <QPushButton>
@@ -94,6 +97,7 @@ private slots:
     void inspectRedactsCredentials();
     void inspectRedactionDoesNotDependOnRoot();
     void inspectBoundsDepthNodesAndViewers();
+    void screenshotMaskCoversSecrets();
 };
 
 
@@ -633,6 +637,35 @@ void AgentBridgeWidgetsTest::inspectBoundsDepthNodesAndViewers()
     QCOMPARE(pane.value("objectName").toString(), QStringLiteral("viewerPane"));
     QVERIFY(!pane.contains("children"));
     QVERIFY(named(withViewer.tree, QStringLiteral("StaticText"), QStringLiteral("inside viewer")).isEmpty());
+}
+
+
+void AgentBridgeWidgetsTest::screenshotMaskCoversSecrets()
+{
+    Panel panel;
+    QVERIFY(QTest::qWaitForWindowExposed(&panel.window));
+    QWidget* central = panel.window.centralWidget();
+    const QRect area = central->rect();
+    QPixmap pixmap = central->grab(area);
+    // The API key, SSH password, endpoint with a password, token, and the
+    // signed URL label.
+    QCOMPARE(agentBridgeMaskSecrets(pixmap, central, area), 5);
+    const QImage image = pixmap.toImage();
+    auto colorAt = [&](QWidget* widget) {
+        const QPoint center = widget->mapTo(central, widget->rect().center());
+        const qreal ratio = pixmap.devicePixelRatio();
+        return image.pixelColor(QPoint(int(center.x() * ratio), int(center.y() * ratio)));
+    };
+    QCOMPARE(colorAt(panel.apiKey), QColor(Qt::black));
+    QCOMPARE(colorAt(panel.signedUrl), QColor(Qt::black));
+    QVERIFY(colorAt(panel.draws) != QColor(Qt::black));
+
+    // A region is masked in its own coordinates; widgets outside it are not
+    // counted.
+    const QRect apiKeyRect(panel.apiKey->mapTo(central, QPoint(0, 0)), panel.apiKey->size());
+    QPixmap part = central->grab(apiKeyRect);
+    QCOMPARE(agentBridgeMaskSecrets(part, central, apiKeyRect), 1);
+    QCOMPARE(part.toImage().pixelColor(2, 2), QColor(Qt::black));
 }
 
 

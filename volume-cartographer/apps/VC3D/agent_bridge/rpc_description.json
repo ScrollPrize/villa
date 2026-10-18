@@ -2245,6 +2245,7 @@
       "errors": [
         -32602,
         -32002,
+        -32007,
         -32009,
         -32005
       ],
@@ -2264,6 +2265,41 @@
             "maximum": 2147483647,
             "minimum": -2147483648,
             "type": "integer"
+          },
+          "region": {
+            "properties": {
+              "height": {
+                "maximum": 2147483647,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "width": {
+                "maximum": 2147483647,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "x": {
+                "maximum": 2147483647,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "y": {
+                "maximum": 2147483647,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "x",
+              "y",
+              "width",
+              "height"
+            ],
+            "type": "object"
+          },
+          "reveal": {
+            "default": false,
+            "type": "boolean"
           },
           "target": {
             "default": "window",

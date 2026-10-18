@@ -11,6 +11,8 @@
 #include <QString>
 
 class QObject;
+class QPixmap;
+class QRect;
 class QWidget;
 
 struct AgentBridgeInspectOptions {
@@ -39,3 +41,9 @@ AgentBridgeInspection agentBridgeInspect(QWidget* root, const AgentBridgeInspect
 // whose text contains credential-shaped content. ui.inspect withholds what
 // such a widget shows; screenshot.capture paints over it.
 bool agentBridgeWidgetShowsSecret(QWidget* widget);
+
+// Paints over, in `pixmap` (grabbed from `area` of `source`), every visible
+// entry or label inside that area for which agentBridgeWidgetShowsSecret()
+// holds, so a screenshot withholds what ui.inspect withholds. Returns how
+// many widgets were covered.
+int agentBridgeMaskSecrets(QPixmap& pixmap, QWidget* source, const QRect& area);

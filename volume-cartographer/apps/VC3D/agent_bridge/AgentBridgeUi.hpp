@@ -4,7 +4,11 @@
 // only on QtCore so the contract test can exercise them without a running
 // application.
 
+#include <algorithm>
+
+#include <QRect>
 #include <QRegularExpression>
+#include <QSize>
 #include <QString>
 #include <QStringList>
 
@@ -94,4 +98,15 @@ inline bool splitAgentBridgeTarget(const QString& target, QString* kind, QString
         }
     }
     return false;
+}
+
+// screenshot.capture's region clipped to a target of `size`, in the target's
+// logical pixels. Empty when the region starts outside the target. Clipping
+// happens before the rectangle is built, so any non-negative int is safe.
+inline QRect agentBridgeCaptureArea(int x, int y, int width, int height, const QSize& size)
+{
+    if (x < 0 || y < 0 || width <= 0 || height <= 0 ||
+        x >= size.width() || y >= size.height())
+        return QRect();
+    return QRect(x, y, std::min(width, size.width() - x), std::min(height, size.height() - y));
 }

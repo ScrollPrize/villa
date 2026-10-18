@@ -485,6 +485,27 @@ is; they are not a stable contract.
   the segmentation surface and are not applied to the segmentation viewer
   itself.
 
+### Screenshots
+
+- `screenshot.capture` targets `window`, a viewer, `dock:<objectName>`, or
+  `workspace:<id>`; an unknown dock or workspace returns -32007.
+- `region` `{x, y, width, height}` is in the target's logical pixels and is
+  clipped to it; a region that starts outside the target returns -32602 with
+  `data.param` `region`. `maxDim` scaling applies after the crop.
+- A hidden target returns -32009 unless `reveal` is true. Reveal switches to
+  the target's workspace tab through the GUI's own switch path and shows
+  hidden docks around it, applies the pending layout requests, and captures.
+  It then hides those docks, restores the layout of their main windows,
+  returns to the previous tab the same way, and gives keyboard focus back,
+  also when the capture fails. A target inside a hidden floating dock returns
+  -32009, because showing it would open a separate window. `revealed` in the
+  result reports whether anything was switched or shown; a revealed viewer
+  may still be loading tiles.
+- Entries and labels that `ui.inspect` would withhold (see Inspection) are
+  painted over in the image; `masked` counts them. Other content is captured
+  as shown.
+- A target smaller than 8 logical pixels on a side returns -32009.
+
 ### Segmentation editing
 
 - Editing must have an active materialized segment.
@@ -665,7 +686,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_save_points_json` | `points.save_json` |
 | `vc3d_save_points_segment_path` | `points.save_segment_path` |
 | `vc3d_save_segment` | `segmentation.save` | Force the active segment's pending autosave to disk. Idle no-op (`jobId:null`) when nothing is dirty; else an `"autosave"` job (`wait` defaults true). |
-| `vc3d_screenshot` | `screenshot.capture` | Capture a PNG of the whole VC3D window or one viewer pane. Returns the PNG as MCP image content when `file_path` is omitted, or a dict with the on-disk path when `file_path` is set (MCP-layer note below). |
+| `vc3d_screenshot` | `screenshot.capture` | Capture a PNG of the whole VC3D window, one viewer pane, one dock, or one workspace, optionally a region of it, revealing a hidden target for the capture. Returns the PNG as MCP image content when `file_path` is omitted, or a dict with the on-disk path when `file_path` is set (MCP-layer note below). |
 | `vc3d_seeding_analyze_paths` | `seeding.analyze_paths` |
 | `vc3d_seeding_cancel` | `seeding.cancel` |
 | `vc3d_seeding_cast_rays` | `seeding.cast_rays` |
@@ -734,6 +755,8 @@ volume-package fixtures and is intentionally separate from hermetic CI.
   fixture geometry require their corresponding runtime resources.
 - The local bridge is a trusted-user control surface, not a remote security
   boundary.
+- `screenshot.capture` with `reveal` changes the visible tab for the
+  duration of one capture; a person at the screen sees it switch and back.
 - Synthesized keys share the live focus chain with a person at the keyboard.
   They never reach the platform, but Qt's cached keyboard modifiers follow
   them until the bridge resets them. Window-context shortcuts match only while

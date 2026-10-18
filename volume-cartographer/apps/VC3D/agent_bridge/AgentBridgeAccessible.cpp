@@ -7,6 +7,8 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMetaEnum>
+#include <QPainter>
+#include <QPixmap>
 #include <QPlainTextEdit>
 #include <QTextDocumentFragment>
 #include <QTextEdit>
@@ -368,4 +370,31 @@ bool agentBridgeWidgetShowsSecret(QWidget* widget)
     return agentBridgeCredentialContent(name) ||
            agentBridgeCredentialContent(iface->text(QAccessible::Value)) ||
            agentBridgeCredentialContent(iface->text(QAccessible::Description));
+}
+
+
+int agentBridgeMaskSecrets(QPixmap& pixmap, QWidget* source, const QRect& area)
+{
+    if (!source || pixmap.isNull())
+        return 0;
+    QList<QWidget*> widgets = source->findChildren<QWidget*>();
+    widgets.prepend(source);
+    QPainter painter;
+    int masked = 0;
+    for (QWidget* widget : widgets) {
+        // grab() draws the source's own window only, never other windows.
+        if (!widget->isVisible() || widget->window() != source->window())
+            continue;
+        if (!isEntry(widget) && !qobject_cast<QLabel*>(widget))
+            continue;
+        QRect rect(widget->mapTo(source, QPoint(0, 0)), widget->size());
+        rect = rect.intersected(area);
+        if (rect.isEmpty() || !agentBridgeWidgetShowsSecret(widget))
+            continue;
+        if (!painter.isActive())
+            painter.begin(&pixmap);
+        painter.fillRect(rect.translated(-area.topLeft()), Qt::black);
+        ++masked;
+    }
+    return masked;
 }

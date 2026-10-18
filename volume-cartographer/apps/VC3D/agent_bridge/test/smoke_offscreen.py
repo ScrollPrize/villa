@@ -852,6 +852,68 @@ def check_ui_inspect(client: BridgeClient, results: Results) -> None:
     )
 
 
+def check_screenshot_targets(client: BridgeClient, results: Results) -> None:
+    """Dock and workspace targets, regions, and reveal with restore."""
+    failures: list[str] = []
+
+    def capture(params: dict) -> dict:
+        result, _ = client.call("screenshot.capture", params, timeout=RPC_TIMEOUT)
+        result.pop("base64", None)
+        return result
+
+    try:
+        client.call("workspace.switch", {"name": "main"}, timeout=RPC_TIMEOUT)
+        part = capture({"target": "window",
+                        "region": {"x": 0, "y": 0, "width": 64, "height": 32}})
+        if (part.get("region") != {"x": 0, "y": 0, "width": 64, "height": 32}
+                or part.get("width", 0) < 64):
+            failures.append(f"region={part}")
+        main = capture({"target": "workspace:main"})
+        if main.get("revealed") is not False or not isinstance(main.get("masked"), int):
+            failures.append(
+                f"current workspace revealed={main.get('revealed')} masked={main.get('masked')}")
+        try:
+            capture({"target": "workspace:lasagna"})
+            failures.append("hidden workspace captured without reveal")
+        except BridgeError as error:
+            if error.code != -32009:
+                failures.append(f"hidden workspace code={error.code}")
+        hidden = capture({"target": "workspace:lasagna", "reveal": True})
+        state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        current = (state.get("workspace") or {}).get("current")
+        if hidden.get("revealed") is not True or current != "main":
+            failures.append(f"reveal={hidden.get('revealed')} restored={current}")
+        docks, _ = client.call("ui.inspect", {"depth": 0}, timeout=RPC_TIMEOUT)
+        visible = [d for d in docks.get("docks", []) if d.get("visible")]
+        if visible:
+            capture({"target": f"dock:{visible[0]['objectName']}"})
+        try:
+            capture({"target": "dock:noSuchDock"})
+            failures.append("unknown dock captured")
+        except BridgeError as error:
+            if error.code != -32007:
+                failures.append(f"unknown dock code={error.code}")
+        spiral = [v for v in state.get("viewers", []) if v.get("workspace") == "spiral"]
+        if spiral:
+            capture({"target": spiral[0]["viewerId"], "reveal": True, "maxDim": 256})
+    except Exception as error:  # noqa: BLE001
+        failures.append(f"{type(error).__name__}: {error}")
+    ok, detail = expect_param_error(
+        client,
+        "screenshot.capture",
+        {"region": {"x": 100000, "y": 0, "width": 8, "height": 8}},
+        "region",
+    )
+    if not ok:
+        failures.append(f"outside region: {detail}")
+    results.record(
+        "screenshot_targets",
+        not failures,
+        "region, dock, workspace and reveal captures behaved" if not failures
+        else "; ".join(failures[:4]),
+    )
+
+
 # Every workspace id in tab order (AgentBridgeUi.hpp's agentBridgeWorkspaceIds,
 # set as each tab page's "workspaceId" property in CWindow's constructor).
 WORKSPACE_IDS = (
@@ -2282,6 +2344,7 @@ def main() -> int:
             require_running(proc, results, "canvas input")
             check_state_changes(sock_path, client, results)
             check_ui_inspect(client, results)
+            check_screenshot_targets(client, results)
 
             check_volume_attach(client, results, tmp_path, volpkg)
             check_segments_attach(client, results, tmp_path, volpkg)

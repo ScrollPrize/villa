@@ -105,7 +105,10 @@ workspace pane while the main tab is active, or vice versa), `vc3d_screenshot`
 now fails `-32009` instead of silently returning a near-zero-size image — this
 used to return a genuinely degenerate (e.g. 15×50px) but "successful" PNG,
 which cost real debugging time before anyone noticed. If you hit this, switch
-to the right tab/workspace (or activate that pane) before capturing.
+to the right tab/workspace (or activate that pane) before capturing, or pass
+`reveal=True` to switch and show it for that one capture and put the GUI back
+afterwards. A revealed viewer may still be loading tiles; for a reliable image
+of a viewer, switch first and capture on a later call.
 
 ## 9. Seeding batch runs (`vc3d_seeding_run`/`_expand`) need a real local `paths`/`seed.json` — even on a remote volume
 
