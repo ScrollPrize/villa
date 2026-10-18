@@ -432,7 +432,14 @@ def _discover_levels(bucket: str, prefix: str, anon: bool) -> list[int]:
     return sorted(levels)
 
 
-def _parse_multiscales(zattrs: dict) -> dict[int, list[float]]:
+def _parse_multiscales(zattrs: dict, missing: set[int] | None = None) -> dict[int, list[float]]:
+    """Map level -> ZYX scale from OME metadata.
+
+    A level whose dataset has no `scale` coordinate transformation is recorded as
+    1.0 per voxel (the OME default for a missing transform). Such levels are also
+    reported through `missing`, so callers can warn rather than silently proceed
+    with a unitless scale.
+    """
     ms_list = zattrs.get("multiscales", [])
     if not ms_list:
         return {}
@@ -447,11 +454,15 @@ def _parse_multiscales(zattrs: dict) -> dict[int, list[float]]:
             continue
         transforms = ds.get("coordinateTransformations", [])
         scale = [1.0, 1.0, 1.0]
+        has_scale = False
         for t in transforms:
             if t.get("type") == "scale":
                 s = t["scale"]
                 scale = [float(v) for v in s[-n_spatial:]]
+                has_scale = True
                 break
+        if not has_scale and missing is not None:
+            missing.add(lvl)
         result[lvl] = scale
     return result
 
@@ -1100,6 +1111,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Z slice range at scale 0: z0,z1 (downloads all X/Y for that Z range)")
     p.add_argument("--workers", type=_positive_int, default=64,
                    help="Parallel download threads (default: 64)")
+    p.add_argument(
+        "--require-scale",
+        action="store_true",
+        help="Fail instead of proceeding when OME metadata carries no physical scale",
+    )
     p.add_argument("--order", choices=("z", "morton", "random"), default="z",
                    help="Chunk queue order: z is z-major z/y/x, morton is a Z-order curve (default: z)")
     p.add_argument("--no-remote-inventory", action="store_true",
@@ -1167,7 +1183,8 @@ def main(argv: list[str] | None = None) -> int:
     except (botocore.exceptions.ClientError, FileNotFoundError):
         zattrs = {}
 
-    multiscales = _parse_multiscales(zattrs)
+    missing_scale: set[int] = set()
+    multiscales = _parse_multiscales(zattrs, missing_scale)
     available_levels = _discover_levels(bucket, prefix, anon)
     if not available_levels:
         print("ERROR: no OME-Zarr levels found", file=sys.stderr)
@@ -1214,6 +1231,20 @@ def main(argv: list[str] | None = None) -> int:
     if not multiscales:
         for lvl in levels:
             multiscales[lvl] = [1.0, 1.0, 1.0]
+        missing_scale.update(levels)
+
+    if missing_scale:
+        print(
+            f"WARN: no physical scale in OME metadata for level(s) "
+            f"{sorted(missing_scale)} of {prefix}; assuming 1.0 per voxel. "
+            "Offsets and distances derived from this scale will be wrong unless the "
+            "real voxel size is known to be 1.0.",
+            file=sys.stderr,
+        )
+        if args.require_scale:
+            print("ERROR: --require-scale was set and OME metadata carries no physical scale",
+                  file=sys.stderr)
+            return 1
 
     # --- Run ---
     local_chunk_keys: dict[int, set[str]] = {}

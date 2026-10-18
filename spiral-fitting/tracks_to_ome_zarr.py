@@ -611,6 +611,12 @@ def main(track_dbms, output_path, shape_text, reference_path, like_group, voxel_
         scale = _parse_zyx(voxel_size, '--voxel-size', float)
     else:
         scale = reference_scale or (1.0, 1.0, 1.0)
+        if not reference_scale:
+            click.echo(
+                'WARN: no --voxel-size and no --like reference provide a physical scale; '
+                'writing 1.0 per voxel into the output OME-Zarr metadata. Pass '
+                '--voxel-size Z,Y,X if the voxel size is known.'
+            )
     unit = unit or reference_unit
 
     parameters = {
