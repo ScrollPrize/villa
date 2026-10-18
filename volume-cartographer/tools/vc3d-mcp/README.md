@@ -220,7 +220,8 @@ Tool names use a `vc3d_` prefix and snake_case. The surface includes:
 - project creation, attached volumes, project attachments, Save As, and the Open
   Data catalog;
 - viewer navigation, mouse, keyboard and wheel input, workspaces,
-  screenshots, render settings, and volume overlays;
+  screenshots, render settings, volume overlays, and the ink detection
+  overlay;
 - segment loading, growth, editing, masks, refinement, transforms, and review;
 - points, tags, winding annotations, seeding, and push/pull;
 - fiber annotation, Atlas search, and Lasagna workflows;

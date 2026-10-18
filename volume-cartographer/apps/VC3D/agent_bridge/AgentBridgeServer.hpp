@@ -100,6 +100,7 @@ private:
     void registerSurfaceOpsHandlers();
     void registerSegmentOpsHandlers();
     void registerProjectHandlers();
+    void registerViewerDisplayHandlers();
     void registerMethod(AgentBridgeMethod method, Handler handler);
 
     // --- Discovery registry file (mirrors LasagnaServiceManager's
@@ -256,6 +257,10 @@ private:
     QJsonObject handleViewerSetOverlay(const QJsonValue& params);
     QJsonObject handleViewerListOverlayVolumes(const QJsonValue& params);
     QJsonObject handleViewerSetIntersects(const QJsonValue& params);
+    // Ink detection overlay (AgentBridgeHandlers_viewerdisplay.cpp).
+    QJsonObject handleViewerGetInkOverlay(const QJsonValue& params);
+    QJsonObject handleViewerSetInkOverlay(const QJsonValue& params);
+    QJsonObject inkOverlayJson() const;
     QJsonObject handleSegmentationEnableEditing(const QJsonValue& params);
     QJsonObject handleSegmentationGrow(const QJsonValue& params);
     QJsonObject handleSegmentationGrowPatchFromSeed(const QJsonValue& params);

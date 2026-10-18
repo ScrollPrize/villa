@@ -331,6 +331,7 @@ set(srcs
     agent_bridge/AgentBridgeMethods_session.cpp
     agent_bridge/AgentBridgeMethods_surfaceops.cpp
     agent_bridge/AgentBridgeMethods_viewer.cpp
+    agent_bridge/AgentBridgeMethods_viewerdisplay.cpp
     agent_bridge/AgentBridgeMethods_wrap.cpp
     agent_bridge/AgentBridgeCommandError.hpp
     agent_bridge/AgentBridgeAccessible.cpp
@@ -358,6 +359,7 @@ set(srcs
     agent_bridge/AgentBridgeHandlers_points.cpp
     agent_bridge/AgentBridgeHandlers_review.cpp
     agent_bridge/AgentBridgeHandlers_viewer.cpp
+    agent_bridge/AgentBridgeHandlers_viewerdisplay.cpp
     agent_bridge/AgentBridgeHandlers_surfaceops.cpp
     agent_bridge/AgentBridgeHandlers_segmentops.cpp
     agent_bridge/AgentBridgeHandlers_project.cpp

@@ -525,6 +525,12 @@ is; they are not a stable contract.
   volumes must resolve in the open package. Intersection sets always include
   the segmentation surface and are not applied to the segmentation viewer
   itself.
+- The ink detection overlay methods drive `InkDetectionOverlayController`,
+  which the Ink Detection panel follows. Only detections matching the active
+  segment are selectable; `refresh` rescans the cache first. Opacity is
+  reported and set in `[0,1]` and stored as whole percent. Updates validate
+  every field before applying any; an empty or null `path` clears the
+  selection.
 
 ### Screenshots
 
@@ -763,6 +769,7 @@ is the sole bridge method without an MCP tool; `vc3d_wait_job` and
 | `vc3d_flatten_straighten` | `flatten.straighten` |
 | `vc3d_generate_segment_mask` | `segment.generate_mask` | Render a segment's binary mask. Blocks until the render completes (130 s client timeout); no job to poll. |
 | `vc3d_get_cursor_point` | `canvas.get_cursor_volume_point` | Resolve a viewer scene position (or the current cursor) to a 3D volume point + surface normal. |
+| `vc3d_get_ink_overlay` | `viewer.get_ink_overlay` | Read the ink detection overlay: available detections for the active segment, selection, opacity, colormap, flips. |
 | `vc3d_get_overlay` | `viewer.get_overlay` | Read the active workspace's overlay-volume settings, shared with the GUI controls. |
 | `vc3d_get_render_settings` | `viewer.get_render_settings` | Read the shared viewer render/overlay settings (intersection lines, overlay opacity, surface normals, direction hints, highlighted surfaces). |
 | `vc3d_get_state` | `state.get` | Snapshot of VC3D: open volume package, current volume, active segment, viewers (ids/names), editing mode, running job. Call this first. |
@@ -831,6 +838,7 @@ is the sole bridge method without an MCP tool; `vc3d_wait_job` and
 | `vc3d_select_volume` | `volume.select` |
 | `vc3d_set_auto_fill_mode` | `points.set_auto_fill_mode` |
 | `vc3d_set_axis_aligned_slices` | `viewer.set_axis_aligned_slices` | Enable/disable axis-aligned slice mode (checkbox equivalent) — prerequisite for `viewer.rotate`. |
+| `vc3d_set_ink_overlay` | `viewer.set_ink_overlay` | Select, clear, recolor, fade or flip the ink detection overlay; any subset. |
 | `vc3d_set_intersects` | `viewer.set_intersects` | Set which surfaces' intersection lines a viewer draws. |
 | `vc3d_set_overlay` | `viewer.set_overlay` | Update the active workspace and GUI overlay controls together (volume, colormap, opacity, threshold, window, resolution cap, composite); any subset. |
 | `vc3d_set_point_collection_color` | `points.set_collection_color` |

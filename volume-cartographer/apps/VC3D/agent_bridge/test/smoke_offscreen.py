@@ -298,10 +298,10 @@ def check_rpc_describe(
         coverage = description.get("coverage", {})
         complete = (
             description.get("undocumented") == []
-            and coverage.get("described") == 134
-            and coverage.get("registered") == 134
+            and coverage.get("described") == 136
+            and coverage.get("registered") == 136
             and coverage.get("complete") is True
-            and len(snapshot["methods"]) == 134
+            and len(snapshot["methods"]) == 136
         )
         rendered = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         if update_snapshot:
@@ -2093,6 +2093,50 @@ def check_project_attachments(
                            f"{type(error).__name__}: {error}")
 
 
+def check_ink_overlay(client: BridgeClient, results: Results) -> None:
+    try:
+        state, _ = client.call("viewer.get_ink_overlay", {"refresh": True},
+                               timeout=RPC_TIMEOUT)
+        ok = (
+            isinstance(state.get("available"), list)
+            and 0.0 <= state.get("opacity", -1) <= 1.0
+            and "" in state.get("colormaps", [])
+        )
+        results.record("viewer_get_ink_overlay", ok, f"state={state}")
+    except Exception as error:  # noqa: BLE001
+        results.record("viewer_get_ink_overlay", False,
+                       f"{type(error).__name__}: {error}")
+        return
+    ok, detail = expect_bridge_error(
+        client, "viewer.set_ink_overlay", {"path": "/no/such/detection.png"}, -32007)
+    results.record("viewer_set_ink_overlay_unknown_path", ok, detail)
+    ok, detail = expect_param_error(
+        client, "viewer.set_ink_overlay", {"colormap": "no-such-map"}, "colormap")
+    results.record("viewer_set_ink_overlay_unknown_colormap", ok, detail)
+    try:
+        before = state.get("opacity")
+        changed, _ = client.call(
+            "viewer.set_ink_overlay",
+            {"opacity": 0.25, "flipHorizontal": True},
+            timeout=RPC_TIMEOUT,
+        )
+        restored, _ = client.call(
+            "viewer.set_ink_overlay",
+            {"opacity": before, "flipHorizontal": state.get("flipHorizontal")},
+            timeout=RPC_TIMEOUT,
+        )
+        ok = (
+            changed.get("opacity") == 0.25
+            and changed.get("flipHorizontal") is True
+            and restored.get("opacity") == before
+        )
+        results.record("viewer_set_ink_overlay_round_trip", ok,
+                       f"changed={changed} restored={restored}")
+    except Exception as error:  # noqa: BLE001
+        results.record("viewer_set_ink_overlay_round_trip", False,
+                       f"{type(error).__name__}: {error}")
+
+
 def check_open_data_editable_copy(
     client: BridgeClient,
     results: Results,
@@ -2802,6 +2846,7 @@ def main() -> int:
             check_segment_tool_operations(client, results)
             check_segment_backups(client, results, tmp_path)
             check_project_attachments(client, results, tmp_path, volpkg)
+            check_ink_overlay(client, results)
             check_open_data_editable_copy(client, results, tmp_path, volpkg)
             check_c4(client, results, str(volpkg), str(broken_volpkg))
             check_legacy_fiber_uuid(client, results, str(legacy_fiber_volpkg),

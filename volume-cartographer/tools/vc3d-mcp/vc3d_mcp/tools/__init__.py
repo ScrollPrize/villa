@@ -24,5 +24,6 @@ from . import (  # noqa: F401  (imported for their registration side effects)
     session,
     surface_ops,
     viewer,
+    viewer_display,
     wrap,
 )
