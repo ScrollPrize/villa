@@ -12,6 +12,10 @@ local catalog snapshot. It records hashes, query IDs, mean/p50/p95 latency,
 index initialization, and peak Python allocation without opening asset storage.
 See [discovery commands and methodology](../docs/discovery.md#run-and-verify).
 
+For local label reading, `bench_source_readers.py` validates and times six fixed
+TIFF crops against equivalent tifffile reads, using the bundled PHercParis4
+geometry mask by default. See [commands, measurements, and limitations](../docs/source-reading.md#run-and-validate).
+
 Catalog-wide results were refreshed **2026-10-17** at `46b908a31`, with the same
 Release extensions for every suite. The refresh manifest (`docs/benchmarks/refresh.json`)
 records report hashes and coverage. Current results are in the PyTorch, resident

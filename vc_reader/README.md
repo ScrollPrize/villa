@@ -8,6 +8,11 @@ sources without opening storage. Query `volume.labels()`,
 `SourceCollection` to include user annotations. See [source discovery](docs/discovery.md)
 for registration, serialization, examples, and validation commands.
 
+Local PNG/JPEG/TIFF sources and ordered image stacks can be opened with
+`source.open()` for exact spatial crops, explicit label encodings, and bounded
+decoded caching. See [local source reading](docs/source-reading.md) for supported
+formats, worker lifecycle, examples, and the remaining reader-plan work.
+
 ## PyTorch CUDA batches
 
 Keep your ordinary PyTorch dataset and DataLoader. Wrap the loader to upload
