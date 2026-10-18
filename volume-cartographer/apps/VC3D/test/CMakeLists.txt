@@ -111,6 +111,35 @@ add_test(NAME vc_settings COMMAND test_vc_settings)
 vc_register_test_target(test_vc_settings)
 vc_register_ctest(vc_settings test_vc_settings)
 
+add_executable(test_theme_engine
+    test_theme_engine.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/themes/ClassicTheme.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/themes/ClassicTheme.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/themes/ThemeEngine.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/themes/ThemeEngine.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/themes/ThemeManager.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/themes/ThemeManager.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/themes/themes.qrc)
+
+set_target_properties(test_theme_engine PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC ON)
+
+target_include_directories(test_theme_engine PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D
+    ${PROJECT_SOURCE_DIR}/core/include)
+
+target_link_libraries(test_theme_engine PRIVATE
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Test
+    Qt6::Widgets)
+
+add_test(NAME theme_engine COMMAND test_theme_engine)
+vc_register_test_target(test_theme_engine)
+vc_register_ctest(theme_engine test_theme_engine)
+set_tests_properties(theme_engine PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 60)
+
 add_executable(test_unified_browser_dialog
     test_unified_browser_dialog.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/UnifiedBrowserDialog.cpp

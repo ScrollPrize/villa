@@ -124,6 +124,10 @@ set(srcs
     SettingsDialog.cpp
     themes/ClassicTheme.cpp
     themes/ClassicTheme.hpp
+    themes/ThemeEngine.cpp
+    themes/ThemeEngine.hpp
+    themes/ThemeManager.cpp
+    themes/ThemeManager.hpp
     SurfaceTreeWidget.hpp
     SurfaceTreeWidget.cpp
     SurfaceDisplayName.hpp
@@ -347,7 +351,7 @@ if(VC_ENABLE_TSAN OR VC_ENABLE_LSAN OR VC_ENABLE_UBSAN OR VC_ENABLE_ASAN)
 endif()
 
 
-add_executable(VC3D ${srcs} resources.qrc)
+add_executable(VC3D ${srcs} resources.qrc themes/themes.qrc)
 
 if(WIN32)
     # GUI subsystem so double-click launch doesn't open a console window.

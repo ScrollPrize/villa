@@ -182,6 +182,15 @@ namespace viewer {
 }
 
 // -----------------------------------------------------------------------------
+// Appearance Settings
+// -----------------------------------------------------------------------------
+namespace appearance {
+    // Theme id ("classic", "modern-dark", a user theme) or a theme file path.
+    constexpr auto THEME = "appearance/theme";
+    constexpr auto THEME_DEFAULT = "classic";
+}
+
+// -----------------------------------------------------------------------------
 // Atlas Workspace Settings
 // -----------------------------------------------------------------------------
 namespace atlas {

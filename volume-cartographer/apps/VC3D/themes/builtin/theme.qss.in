@@ -1,0 +1,894 @@
+/* Scope: application chrome only. Viewer canvases, overlays and widgets that
+   set their own style sheet keep their colors (a widget's own sheet always
+   wins over the application sheet). No rule here targets QWidget, QFrame,
+   QAbstractScrollArea or QGraphicsView in general, so render surfaces are
+   untouched; the few rules on plain widgets name them (#workspaceContainer)
+   or match the exact class (.QWidget) inside a settings section.
+   Every color is a token, so a user theme can change all of them. Item rules
+   never draw at rest (no background or border on a plain ::item), so rows
+   colored by their model keep their colors. Focus rules come after the
+   checked and default rules they must win over. */
+
+/* ---------------------------------------------------------------- windows */
+QMainWindow, QDialog {
+    background: @window@;
+}
+QMainWindow::separator {
+    background: @chrome@;
+    width: 4px;
+    height: 4px;
+}
+QMainWindow::separator:hover {
+    background: @accent_soft_border@;
+}
+
+/* --------------------------------------------------------------- menu bar */
+QMenuBar {
+    background: @chrome@;
+    color: @text_secondary@;
+    border-bottom: 1px solid @border_subtle@;
+    padding: 2px 6px;
+    spacing: 2px;
+}
+QMenuBar::item {
+    background: transparent;
+    color: @text_secondary@;
+    padding: 4px 10px;
+    border-radius: @radius@;
+}
+QMenuBar::item:selected {
+    background: @hover@;
+    color: @text@;
+}
+QMenuBar::item:pressed {
+    background: @accent_soft@;
+    color: @accent_soft_text@;
+}
+
+/* ------------------------------------------------------------------ menus */
+QMenu {
+    background: @raised@;
+    color: @text@;
+    border: 1px solid @border@;
+    border-radius: @radius_popup@;
+    padding: 5px;
+}
+QMenu::item {
+    background: transparent;
+    padding: 5px 28px 5px 10px;
+    border-radius: @radius_small@;
+}
+QMenu::item:selected {
+    background: @accent_soft@;
+    color: @accent_soft_text@;
+}
+QMenu::item:disabled {
+    background: transparent;
+    color: @text_muted@;
+}
+QMenu::separator {
+    height: 1px;
+    background: @border_subtle@;
+    margin: 4px 6px;
+}
+QMenu::icon {
+    padding-left: 6px;
+}
+QMenu::indicator {
+    width: 14px;
+    height: 14px;
+    padding-left: 6px;
+}
+QMenu::indicator:non-exclusive:checked,
+QMenu::indicator:exclusive:checked {
+    image: url(vc3dtheme:@name@/menu-check.png);
+}
+QMenu::right-arrow {
+    image: url(vc3dtheme:@name@/chevron-right.png);
+    width: 12px;
+    height: 12px;
+    padding-right: 6px;
+}
+QMenu::right-arrow:selected {
+    image: url(vc3dtheme:@name@/chevron-right-selected.png);
+}
+
+/* ------------------------------------------------------------- tool tips */
+QToolTip {
+    background: @raised@;
+    color: @text@;
+    border: 1px solid @field_border@;
+    border-radius: @radius_popup@;
+    padding: 3px 6px;
+}
+
+/* ------------------------------------------------------------------- tabs */
+QTabWidget::pane {
+    border: 1px solid @border_subtle@;
+    border-radius: @radius_large@;
+    background: @window@;
+    top: -1px;
+}
+QTabWidget#workspaceTabs::pane {
+    border: none;
+    border-top: 1px solid @border_subtle@;
+    border-radius: 0;
+    top: 0;
+}
+QTabWidget#workspaceTabs > QTabBar {
+    background: @chrome@;
+}
+/* The rest of the tab row (right of the tabs, behind the project name). */
+QWidget#workspaceContainer {
+    background: @chrome@;
+}
+/* CWindow sizes this label to its text plus 16 px and gives it 8 px side
+   margins. Padding adds to those margins, so side padding would clip the
+   name; the bottom padding lifts it to the tab labels' baseline. */
+QLabel#currentProjectName {
+    color: @text_secondary@;
+    padding: 0 0 6px 0;
+}
+QTabBar::tab {
+    background: transparent;
+    color: @text_secondary@;
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 6px 14px 5px 14px;
+    margin-right: 2px;
+}
+QTabBar::tab:hover {
+    background: @hover@;
+    color: @text@;
+    border-top-left-radius: @radius@;
+    border-top-right-radius: @radius@;
+}
+QTabBar::tab:selected {
+    color: @text@;
+    border-bottom: 2px solid @accent@;
+}
+QTabBar::tab:selected:focus {
+    background: @hover@;
+    border-top-left-radius: @radius@;
+    border-top-right-radius: @radius@;
+    border-bottom: 2px solid @focus@;
+}
+QTabBar::tab:disabled {
+    color: @text_muted@;
+}
+/* Scroll arrows of a tab row that overflows: no padding, or the arrow
+   shrinks to a dot. */
+QTabBar QToolButton {
+    padding: 0;
+    border-radius: @radius_small@;
+}
+
+/* ---------------------------------------------------------------- buttons */
+QPushButton {
+    background: @button@;
+    color: @text@;
+    border: 1px solid @border@;
+    border-radius: @radius@;
+    padding: 3px 8px;
+}
+QPushButton:hover {
+    background: @button_hover@;
+    border-color: @border_strong@;
+}
+QPushButton:pressed {
+    background: @button_pressed@;
+}
+QPushButton:checked {
+    background: @accent_soft@;
+    color: @accent@;
+    border-color: @accent@;
+}
+QPushButton:checked:hover {
+    background: @accent_soft_hover@;
+}
+QPushButton:default {
+    background: @accent_fill@;
+    color: @on_accent@;
+    border-color: @accent_fill@;
+}
+QPushButton:default:hover {
+    background: @accent_hover@;
+    border-color: @accent_hover@;
+}
+QPushButton:default:pressed {
+    background: @accent_pressed@;
+    border-color: @accent_pressed@;
+}
+QPushButton:focus,
+QPushButton:checked:focus {
+    border-color: @focus_soft@;
+}
+QPushButton:default:focus {
+    border: 2px solid @focus_on_accent@;
+    padding: 2px 7px;
+}
+QPushButton:disabled {
+    background: @button_disabled@;
+    color: @text_muted@;
+    border-color: @border_subtle@;
+}
+QPushButton:flat {
+    background: transparent;
+    border-color: transparent;
+}
+QPushButton:flat:hover {
+    background: @hover@;
+}
+QPushButton::menu-indicator {
+    image: url(vc3dtheme:@name@/chevron-down.png);
+    subcontrol-origin: padding;
+    subcontrol-position: right center;
+    width: 12px;
+    height: 12px;
+    right: 2px;
+}
+QDialogButtonBox {
+    dialogbuttonbox-buttons-have-icons: 0;
+}
+QDialogButtonBox QPushButton {
+    min-width: 64px;
+}
+
+/* Tool buttons look like push buttons (so "Filters" and "Tags" read as
+   buttons); auto-raise ones (tool bars, the dock pin) stay flat until hovered. */
+QToolButton {
+    background: @button@;
+    color: @text@;
+    border: 1px solid @border@;
+    border-radius: @radius@;
+    padding: 3px 6px;
+}
+QToolButton[autoRaise="true"] {
+    background: transparent;
+    border-color: transparent;
+    padding: 3px;
+}
+QToolButton:hover {
+    background: @button_hover@;
+    border-color: @border_strong@;
+}
+QToolButton[autoRaise="true"]:hover {
+    background: @hover@;
+    border-color: @border@;
+}
+QToolButton:pressed {
+    background: @button_pressed@;
+}
+QToolButton:checked {
+    background: @accent_soft@;
+    color: @accent@;
+    border-color: @accent@;
+}
+QToolButton:focus,
+QToolButton[autoRaise="true"]:focus,
+QToolButton:checked:focus {
+    border-color: @focus_soft@;
+}
+QToolButton:disabled {
+    background: @button_disabled@;
+    color: @text_muted@;
+    border-color: @border_subtle@;
+}
+QToolButton[autoRaise="true"]:disabled {
+    background: transparent;
+    border-color: transparent;
+}
+QToolButton[popupMode="1"] {
+    padding-right: 16px;
+}
+QToolButton::menu-button {
+    border: none;
+    border-left: 1px solid @border_subtle@;
+    width: 14px;
+}
+/* Instant pop-up buttons (drop-down check lists such as "Tags"): the
+   chevron sits inside the button, centered on the right. */
+QToolButton[popupMode="2"] {
+    padding-right: 20px;
+}
+QToolButton::menu-indicator {
+    image: url(vc3dtheme:@name@/chevron-down.png);
+    subcontrol-origin: padding;
+    subcontrol-position: right center;
+    width: 12px;
+    height: 12px;
+    right: 5px;
+}
+QToolButton::menu-arrow {
+    image: url(vc3dtheme:@name@/chevron-down.png);
+    width: 10px;
+    height: 10px;
+}
+/* The line annotation menu button hides its indicator in its own sheet. */
+QToolButton#lineAnnotationMenuButton {
+    padding-right: 6px;
+}
+
+/* Collapsible settings sections (dock panels). The header is a checkable,
+   auto-raise tool button; [checkable] lifts these rules above the generic
+   auto-raise ones. */
+CollapsibleSettingsGroup > QToolButton[checkable="true"] {
+    background: @section@;
+    color: @text@;
+    border: 1px solid @border_subtle@;
+    border-radius: @radius@;
+    padding: 5px 6px;
+    font-weight: 600;
+}
+CollapsibleSettingsGroup > QToolButton[checkable="true"]:checked {
+    background: @section@;
+    color: @text@;
+    border-color: @border_subtle@;
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+}
+CollapsibleSettingsGroup > QToolButton[checkable="true"]:hover {
+    background: @hover@;
+}
+CollapsibleSettingsGroup > QToolButton[checkable="true"]:focus {
+    border-color: @focus_soft@;
+}
+CollapsibleSettingsGroup > QToolButton[checkable="true"]:disabled {
+    color: @text_muted@;
+}
+CollapsibleSettingsGroup > QFrame > .QWidget {
+    background: transparent;
+}
+CollapsibleSettingsGroup > QFrame {
+    background: @section_body@;
+    border: 1px solid @border_subtle@;
+    border-top: none;
+    border-bottom-left-radius: @radius@;
+    border-bottom-right-radius: @radius@;
+}
+
+/* ----------------------------------------------------------------- inputs */
+QLineEdit,
+QAbstractSpinBox,
+QComboBox {
+    background: @input@;
+    color: @text@;
+    border: 1px solid @field_border@;
+    border-radius: @radius@;
+    padding: 2px 4px;
+    selection-background-color: @selection@;
+    selection-color: @selection_text@;
+}
+QLineEdit:hover,
+QAbstractSpinBox:hover,
+QComboBox:hover {
+    border-color: @border_strong@;
+}
+QLineEdit:focus,
+QAbstractSpinBox:focus,
+QComboBox:focus {
+    border-color: @focus@;
+}
+QLineEdit:disabled,
+QAbstractSpinBox:disabled,
+QComboBox:disabled {
+    background: @input_disabled@;
+    color: @text_muted@;
+    border-color: @border@;
+}
+/* A pseudo-state, not [readOnly], so it follows setReadOnly() at run time. */
+QLineEdit:read-only {
+    background: @input_disabled@;
+    color: @text_secondary@;
+}
+/* Fields keep Classic's text width: Qt adds 2 px inside the padding. */
+QLineEdit {
+    padding-left: 2px;
+    padding-right: 2px;
+}
+QLineEdit[frame="false"] {
+    border-color: transparent;
+    background: transparent;
+}
+
+/* Qt already keeps the text clear of the step buttons, and adds 2 px inside
+   the padding, as for line edits; wider padding would cut off values in
+   VC3D's fixed-width fields (80 and 92 px). Checked at 10 and 13 pt. */
+QAbstractSpinBox {
+    padding-left: 2px;
+    padding-right: 0;
+}
+QAbstractSpinBox::up-button,
+QAbstractSpinBox::down-button {
+    subcontrol-origin: border;
+    width: 16px;
+    border: none;
+    border-left: 1px solid @border_subtle@;
+    background: transparent;
+}
+QAbstractSpinBox::up-button {
+    subcontrol-position: top right;
+    border-top-right-radius: @radius@;
+}
+QAbstractSpinBox::down-button {
+    subcontrol-position: bottom right;
+    border-bottom-right-radius: @radius@;
+}
+QAbstractSpinBox::up-button:hover,
+QAbstractSpinBox::down-button:hover {
+    background: @hover@;
+}
+QAbstractSpinBox::up-arrow {
+    image: url(vc3dtheme:@name@/spin-up.png);
+    width: 10px;
+    height: 10px;
+}
+QAbstractSpinBox::down-arrow {
+    image: url(vc3dtheme:@name@/spin-down.png);
+    width: 10px;
+    height: 10px;
+}
+QAbstractSpinBox::up-arrow:hover {
+    image: url(vc3dtheme:@name@/spin-up-hover.png);
+}
+QAbstractSpinBox::down-arrow:hover {
+    image: url(vc3dtheme:@name@/spin-down-hover.png);
+}
+QAbstractSpinBox::up-arrow:disabled,
+QAbstractSpinBox::up-arrow:off {
+    image: url(vc3dtheme:@name@/spin-up-disabled.png);
+}
+QAbstractSpinBox::down-arrow:disabled,
+QAbstractSpinBox::down-arrow:off {
+    image: url(vc3dtheme:@name@/spin-down-disabled.png);
+}
+
+/* The drop-down button sits inside the right padding: Qt already keeps the
+   text clear of it. */
+QComboBox {
+    padding: 2px 4px 2px 8px;
+    combobox-popup: 0;
+}
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    width: 20px;
+    border: none;
+}
+QComboBox::down-arrow {
+    image: url(vc3dtheme:@name@/chevron-down.png);
+    width: 12px;
+    height: 12px;
+}
+QComboBox::down-arrow:hover,
+QComboBox::down-arrow:on {
+    image: url(vc3dtheme:@name@/chevron-down-hover.png);
+}
+QComboBox::down-arrow:disabled {
+    image: url(vc3dtheme:@name@/chevron-down-disabled.png);
+}
+QComboBox QAbstractItemView {
+    background: @raised@;
+    color: @text@;
+    border: 1px solid @border@;
+    border-radius: @radius_popup@;
+    padding: 4px;
+    outline: 0;
+    selection-background-color: @item_selected@;
+    selection-color: @accent_soft_text@;
+}
+QComboBox QAbstractItemView::item {
+    min-height: 22px;
+    padding: 0 6px;
+    border-radius: @radius_small@;
+}
+
+/* --------------------------------------------------- check and radio boxes */
+QCheckBox,
+QRadioButton {
+    spacing: 7px;
+    padding: 3px 0;
+}
+QCheckBox:disabled,
+QRadioButton:disabled {
+    color: @text_muted@;
+}
+QCheckBox::indicator,
+QGroupBox::indicator,
+QAbstractItemView::indicator {
+    width: 14px;
+    height: 14px;
+    border: 1px solid @field_border@;
+    border-radius: @radius_small@;
+    background: @input@;
+}
+QRadioButton::indicator {
+    width: 14px;
+    height: 14px;
+    border: 1px solid @field_border@;
+    border-radius: 8px; /* circle: half of 14px plus the border */
+    background: @input@;
+}
+QCheckBox::indicator:hover,
+QRadioButton::indicator:hover,
+QGroupBox::indicator:hover {
+    border-color: @accent@;
+}
+QCheckBox::indicator:checked,
+QGroupBox::indicator:checked,
+QAbstractItemView::indicator:checked {
+    background: @accent_fill@;
+    border-color: @accent_fill@;
+    image: url(vc3dtheme:@name@/check.png);
+}
+QCheckBox::indicator:indeterminate,
+QAbstractItemView::indicator:indeterminate {
+    background: @accent_fill@;
+    border-color: @accent_fill@;
+    image: url(vc3dtheme:@name@/dash.png);
+}
+QRadioButton::indicator:checked {
+    border-color: @accent_fill@;
+    background: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5,
+        stop:0 @on_accent@, stop:0.30 @on_accent@, stop:0.40 @accent_fill@, stop:1 @accent_fill@);
+}
+QCheckBox::indicator:checked:hover,
+QCheckBox::indicator:indeterminate:hover,
+QRadioButton::indicator:checked:hover,
+QGroupBox::indicator:checked:hover {
+    border-color: @accent@;
+}
+/* Keyboard focus: a 2 px ring (the box keeps its 16 px outer size). */
+QCheckBox::indicator:focus,
+QRadioButton::indicator:focus {
+    border: 2px solid @focus@;
+    width: 12px;
+    height: 12px;
+}
+QCheckBox::indicator:checked:focus,
+QCheckBox::indicator:indeterminate:focus,
+QRadioButton::indicator:checked:focus {
+    border-color: @focus_on_accent@;
+}
+QCheckBox::indicator:disabled,
+QRadioButton::indicator:disabled,
+QGroupBox::indicator:disabled {
+    background: @input_disabled@;
+    border-color: @border@;
+}
+QCheckBox::indicator:checked:disabled,
+QGroupBox::indicator:checked:disabled {
+    background: @accent_disabled@;
+    border-color: @accent_disabled@;
+    image: url(vc3dtheme:@name@/check-disabled.png);
+}
+QCheckBox::indicator:indeterminate:disabled {
+    background: @accent_disabled@;
+    border-color: @accent_disabled@;
+    image: url(vc3dtheme:@name@/dash-disabled.png);
+}
+QRadioButton::indicator:checked:disabled {
+    border-color: @accent_disabled@;
+    background: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5,
+        stop:0 @on_accent_disabled@, stop:0.30 @on_accent_disabled@, stop:0.40 @accent_disabled@, stop:1 @accent_disabled@);
+}
+
+/* ------------------------------------------------------------- group boxes */
+/* A card, like the collapsible sections, with its title above it. Qt ignores
+   font rules on ::title (tested on 6.4), and a weight on QGroupBox itself
+   would bold every child, so the title differs by color only. */
+QGroupBox {
+    background: @section_body@;
+    border: 1px solid @border_subtle@;
+    border-radius: @radius@;
+    margin-top: 18px;
+    padding: 6px 4px 4px 4px;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 6px;
+    top: 1px;
+    padding: 0 4px;
+    color: @text@;
+}
+QGroupBox::title:disabled {
+    color: @text_muted@;
+}
+QGroupBox:flat {
+    background: transparent;
+    border: none;
+    border-top: 1px solid @border_subtle@;
+    border-radius: 0;
+}
+/* The volume package box has no title, so it needs no room for one. Matched
+   through its parent, which already has its name when the box is built
+   (a group box sizes its frame once, in its constructor). */
+QWidget#dockWidgetVolumesContent > QGroupBox {
+    margin-top: 4px;
+}
+
+/* -------------------------------------------------------------- item views */
+QAbstractItemView {
+    background: @input@;
+    alternate-background-color: @alt_row@;
+    color: @text@;
+    border: 1px solid @field_border@;
+    border-radius: @radius@;
+    outline: 0;
+    selection-background-color: @item_selected@;
+    selection-color: @accent_soft_text@;
+}
+QAbstractItemView::item:hover {
+    background: @hover@;
+}
+QAbstractItemView::item:selected {
+    background: @item_selected@;
+    color: @accent_soft_text@;
+}
+QAbstractItemView::item:focus {
+    border: 1px solid @focus@;
+}
+QAbstractItemView:disabled {
+    color: @text_muted@;
+}
+QHeaderView {
+    background: @header@;
+    border: none;
+}
+QHeaderView::section {
+    background: @header@;
+    color: @text_secondary@;
+    border: none;
+    border-right: 1px solid @border_subtle@;
+    border-bottom: 1px solid @border@;
+    padding: 1px 8px;
+    font-weight: 600;
+}
+QHeaderView::section:hover {
+    color: @text@;
+}
+QTableCornerButton::section {
+    background: @header@;
+    border: none;
+    border-bottom: 1px solid @border@;
+}
+
+QTextEdit,
+QPlainTextEdit {
+    background: @input@;
+    color: @text@;
+    border: 1px solid @field_border@;
+    border-radius: @radius@;
+    selection-background-color: @selection@;
+    selection-color: @selection_text@;
+}
+QTextEdit:focus,
+QPlainTextEdit:focus {
+    border-color: @focus@;
+}
+/* Code and logs: JSON profiles, the console, fiber trace details. */
+QPlainTextEdit {
+    font-family: @mono@;
+}
+
+/* ------------------------------------------------------------- scroll bars */
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 2px 1px 2px 1px;
+    border: none;
+}
+QScrollBar:horizontal {
+    background: transparent;
+    height: 10px;
+    margin: 1px 2px 1px 2px;
+    border: none;
+}
+QScrollBar::handle:vertical {
+    background: @scroll_handle@;
+    min-height: 32px;
+    border-radius: @radius_small@;
+    margin: 0;
+}
+QScrollBar::handle:horizontal {
+    background: @scroll_handle@;
+    min-width: 32px;
+    border-radius: @radius_small@;
+    margin: 0;
+}
+QScrollBar::handle:hover {
+    background: @scroll_handle_hover@;
+}
+QScrollBar::handle:pressed {
+    background: @accent_soft_border@;
+}
+QScrollBar::add-line,
+QScrollBar::sub-line {
+    width: 0;
+    height: 0;
+    border: none;
+    background: none;
+}
+QScrollBar::add-page,
+QScrollBar::sub-page {
+    background: none;
+}
+QAbstractScrollArea::corner {
+    background: transparent;
+    border: none;
+}
+
+/* ----------------------------------------------------------------- sliders */
+QSlider::groove:horizontal {
+    height: 4px;
+    background: @slider_track@;
+    border-radius: 2px;
+}
+QSlider::groove:vertical {
+    width: 4px;
+    background: @slider_track@;
+    border-radius: 2px;
+}
+QSlider::sub-page:horizontal,
+QSlider::add-page:vertical {
+    background: @accent@;
+    border-radius: 2px;
+}
+QSlider::add-page:horizontal,
+QSlider::sub-page:vertical {
+    background: @slider_track@;
+    border-radius: 2px;
+}
+QSlider::handle:horizontal {
+    background: @slider_handle@;
+    border: 2px solid @accent@;
+    width: 12px;
+    height: 12px;
+    margin: -6px 0;
+    border-radius: 8px;
+}
+QSlider::handle:vertical {
+    background: @slider_handle@;
+    border: 2px solid @accent@;
+    width: 12px;
+    height: 12px;
+    margin: 0 -6px;
+    border-radius: 8px;
+}
+QSlider::handle:hover {
+    background: @accent@;
+}
+QSlider::handle:focus {
+    border-color: @focus_on_accent@;
+}
+QSlider::sub-page:horizontal:disabled,
+QSlider::add-page:vertical:disabled {
+    background: @border_strong@;
+}
+QSlider::handle:disabled {
+    background: @input_disabled@;
+    border-color: @border_strong@;
+}
+
+/* ----------------------------------------------------------- progress bars */
+QProgressBar {
+    background: @progress_track@;
+    color: @progress_text@;
+    border: 1px solid @field_border@;
+    border-radius: @radius_small@;
+    text-align: center;
+}
+QProgressBar::chunk {
+    background: @progress_chunk@;
+    border-radius: @radius_small@;
+}
+
+/* ---------------------------------------------------------------- splitters */
+QSplitter::handle {
+    background: @border_subtle@;
+}
+QSplitter::handle:hover {
+    background: @accent_soft_border@;
+}
+
+/* ------------------------------------------------------------ dock widgets */
+QDockWidget {
+    color: @text@;
+}
+QDockWidget::title {
+    background: @chrome@;
+    color: @text@;
+    padding: 6px 8px;
+    border-bottom: 1px solid @border_subtle@;
+    text-align: left;
+}
+
+/* --------------------------------------------------------------- status bar */
+QStatusBar {
+    background: @window@;
+    color: @text_secondary@;
+}
+QStatusBar::item {
+    border: none;
+}
+QStatusBar QLabel {
+    color: @text_secondary@;
+}
+
+/* Bottom dock bar: flat buttons that show an outline only under the pointer
+   and when their panel is open. StatusDockPanelHost draws the panel frames
+   from the palette (Window, Mid, Highlight). */
+QPushButton[statusDockPanelButton="true"] {
+    background: transparent;
+    color: @text_secondary@;
+    text-align: left;
+    border: 1px solid transparent;
+    border-radius: @radius@;
+    padding: 2px 6px;
+    font-size: @font_size_small@;
+}
+QPushButton[statusDockPanelButton="true"]:hover {
+    background: @hover@;
+    color: @text@;
+    border-color: @border@;
+}
+QPushButton[statusDockPanelButton="true"]:focus {
+    border-color: @focus_soft@;
+}
+QPushButton[statusDockPanelButton="true"][active="true"] {
+    background: @accent_soft@;
+    color: @accent_soft_text@;
+    border-color: @accent_soft_border@;
+    font-weight: 600;
+}
+/* Dock panel header: title, pin and collapse buttons. */
+QFrame[statusDockPanelHeader="true"] QLabel {
+    color: @text@;
+    font-weight: 600;
+}
+QFrame[statusDockPanelHeader="true"] QToolButton {
+    background: transparent;
+    color: @text_secondary@;
+    border: 1px solid transparent;
+    padding: 2px 4px;
+}
+QFrame[statusDockPanelHeader="true"] QToolButton:hover {
+    background: @hover@;
+    color: @text@;
+    border-color: @border@;
+}
+QFrame[statusDockPanelHeader="true"] QToolButton:checked {
+    background: @accent_soft@;
+    border-color: @accent_soft_border@;
+}
+QFrame[statusDockPanelHeader="true"] QToolButton:focus {
+    border-color: @focus_soft@;
+}
+
+/* VC3D's yellow cache warning banner keeps its own background; its label and
+   button need a dark text color, which a frame's color does not pass down. */
+QLabel#persistentCacheWarningText {
+    color: @warning_text@;
+}
+QFrame#persistentCacheWarningBanner QPushButton {
+    background: transparent;
+    color: @warning_text@;
+    border: 1px solid @warning_border@;
+}
+QFrame#persistentCacheWarningBanner QPushButton:hover {
+    border-color: @warning_text@;
+}
+
+/* Status text. A panel can mark a label with the dynamic property
+   vc3dStatus ("danger", "warning" or "success") instead of hard coding a
+   color, so the color follows the theme. */
+QLabel[vc3dStatus="danger"] {
+    color: @danger@;
+}
+QLabel[vc3dStatus="warning"] {
+    color: @warning@;
+}
+QLabel[vc3dStatus="success"] {
+    color: @success@;
+}
