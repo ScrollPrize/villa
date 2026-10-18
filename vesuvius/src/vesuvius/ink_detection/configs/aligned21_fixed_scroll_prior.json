@@ -4,7 +4,7 @@
   "representations": [
     {"source_family": "public_2p4_level2_zmean4", "segment": "pherc0139-w016", "scroll": "0139", "physical_segment_key": "0139:w016", "representation_key": "public_2p4_level2_zmean4:pherc0139-w016"},
     {"source_family": "public_2p4_level2_zmean4", "segment": "pherc0139-w017", "scroll": "0139", "physical_segment_key": "0139:w017", "representation_key": "public_2p4_level2_zmean4:pherc0139-w017"},
-    {"source_family": "public_2p4_level2_zmean4", "segment": "pherc0139-w028", "scroll": "0139", "physical_segment_key": "0139:w028", "representation_key": "public_2p4_level2_zmean4:pherc0139-w028"},
+    {"source_family": "public_2p4_level2_zmean4", "segment": "pherc0139-w028", "scroll": "0139", "physical_segment_key": "0139:w044", "representation_key": "public_2p4_level2_zmean4:pherc0139-w028"},
     {"source_family": "public_2p4_level2_zmean4", "segment": "pherc0139-w029", "scroll": "0139", "physical_segment_key": "0139:w029", "representation_key": "public_2p4_level2_zmean4:pherc0139-w029"},
     {"source_family": "public_2p4_level2_zmean4", "segment": "pherc0139-w035", "scroll": "0139", "physical_segment_key": "0139:w035", "representation_key": "public_2p4_level2_zmean4:pherc0139-w035"},
     {"source_family": "public_2p4_level2_zmean4", "segment": "pherc0139-w039", "scroll": "0139", "physical_segment_key": "0139:w039", "representation_key": "public_2p4_level2_zmean4:pherc0139-w039"},
