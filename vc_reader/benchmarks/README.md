@@ -17,8 +17,175 @@ Release extensions for every suite. The refresh manifest (`docs/benchmarks/refre
 records report hashes and coverage. Current results are in the PyTorch, resident
 geometry, augmentation catalog, and reader/pipeline sections. The two optimization
 history sections are explicitly marked historical and retain their original data.
-The median, statistics, resize, Gaussian and compact-field experiments below measure subsequent changes
+The 2D support, median, statistics, resize, Gaussian and compact-field experiments below measure subsequent changes
 separately; they do not replace the catalog-wide refresh.
+
+## 2D augmentation support (2026-10-17)
+
+The 28 remaining image augmentations now support `(C,Y,X)` as well as
+`(C,Z,Y,X)` on CPU and CUDA. Shared grid, neighborhood, field, histogram and
+Fourier helpers specialize on spatial dimension at compile time. Host dispatch
+selects the specialization; pixel loops do not branch on dimension. 2D uses
+four interpolation corners, disk neighborhoods, two separable passes and 2D
+FFT plans as appropriate. Explicit spatial tuples must match the image dimension;
+omitted CLAHE/dropout sizes and dropout axes adapt to it. The tracing and
+representation-conversion operations retain their specialized contracts.
+
+CPU and CUDA now share channel-statistics requirements. The shared CPU pixel mapper
+skips unused statistics and computes only bounds when moments are unnecessary.
+CPU ringing filters normalize their short weight arrays once, removing a
+per-output division pass. This permits small rounding differences; random
+sampling and 3D neighborhood definitions are unchanged.
+
+Validation: all 56 tests pass with CUDA; the CPU-only build passes with 20 CUDA
+skips. Tests cover both float dtypes, singleton/odd dimensions, selected channels,
+validity masks, large integer labels, replay, parameter validation, independent
+NumPy filter/Fourier references, batched resident tensors, nondefault streams,
+retained outputs and training backward. All 61 catalog recipes pass on a real
+512×512 CT slice. On the saved 64³ CT crop, all 28 CUDA outputs and 27 CPU outputs
+are bit-identical to baseline; CPU RingingOvershoot differs by at most
+2.98e-7. This is numerical validation, not a model-quality evaluation.
+
+The baseline is the saved `ba1184aeb` Release extension. Both builds use the same
+compiler settings, on Linux amd64, Intel Core Ultra 7 270K Plus / RTX 5090,
+CUDA architecture 120. Inputs are PHercParis4 volume
+`20260411134726-2.400um-0.2m-78keV-masked.zarr`, level 2, origin
+`(9000,3600,3600)`, float32 divided by 255. References start 384 voxels farther
+along Z. The 3D crop is 128³; the 2D crop is a single 512² Z plane.
+
+Each public-call route has five warmups and 20 measurements, seeds 123–142,
+with shuffled route order and CPU affinity fixed to core 0. Builds run
+sequentially. Reading, preparation, validation comparisons, disposal and initial
+resident upload/final download are excluded. Public-call copies and input/output
+validation are included; CUDA uploaded includes transfers. Earlier unpinned and
+intermediate-build measurements are excluded from the tables below. CPU allocator
+state and public-call overhead cause variability; kernel profiling and isolated
+CPU repeats supplement these measurements.
+
+Cells are **mean / p50 / p95 milliseconds**.
+
+| 128³ transform | CPU before | CPU after | CUDA resident before | CUDA resident after |
+| --- | ---: | ---: | ---: | ---: |
+| AdditiveNoise | 21.268 / 21.277 / 21.540 | 15.651 / 15.710 / 15.958 | 0.226 / 0.218 / 0.290 | 0.240 / 0.235 / 0.299 |
+| BiasField | 12.188 / 11.966 / 13.191 | 11.635 / 11.656 / 11.921 | 0.320 / 0.320 / 0.376 | 0.333 / 0.316 / 0.431 |
+| CLAHE | 59.217 / 59.182 / 59.444 | 52.773 / 52.847 / 53.030 | 0.550 / 0.527 / 0.612 | 0.559 / 0.557 / 0.616 |
+| ChannelMisalignment | 62.119 / 62.100 / 62.829 | 62.128 / 62.150 / 62.619 | 0.288 / 0.259 / 0.450 | 0.271 / 0.259 / 0.368 |
+| Defocus | 17.488 / 17.545 / 17.692 | 15.992 / 16.032 / 16.369 | 0.771 / 0.774 / 0.836 | 0.782 / 0.793 / 0.844 |
+| Equalize | 24.662 / 24.652 / 24.831 | 19.460 / 19.465 / 19.703 | 0.372 / 0.408 / 0.427 | 0.357 / 0.357 / 0.422 |
+| FDA | 626.328 / 626.271 / 629.860 | 622.657 / 624.581 / 628.723 | 4.538 / 4.448 / 8.093 | 3.741 / 2.220 / 8.239 |
+| ForegroundCrop | 2.273 / 2.282 / 2.428 | 2.305 / 2.319 / 2.413 | 0.471 / 0.447 / 0.565 | 0.491 / 0.458 / 0.735 |
+| ForegroundDropout | 10.105 / 12.249 / 12.670 | 6.619 / 6.577 / 6.826 | 0.345 / 0.300 / 0.468 | 0.350 / 0.365 / 0.454 |
+| GibbsRinging | 428.767 / 428.752 / 429.866 | 429.047 / 429.656 / 437.309 | 0.397 / 0.394 / 0.511 | 0.393 / 0.376 / 0.508 |
+| GridDropout | 44.729 / 44.765 / 44.934 | 38.858 / 38.893 / 39.025 | 0.155 / 0.135 / 0.235 | 0.146 / 0.121 / 0.204 |
+| HistogramMatching | 97.836 / 97.891 / 98.137 | 87.569 / 87.517 / 87.987 | 4.405 / 4.941 / 5.243 | 1.933 / 1.894 / 2.040 |
+| Illumination | 40.065 / 40.027 / 40.552 | 28.062 / 28.083 / 28.422 | 0.166 / 0.184 / 0.219 | 0.150 / 0.143 / 0.210 |
+| MotionBlur | 250.077 / 249.985 / 250.617 | 243.999 / 243.983 / 244.581 | 1.356 / 1.370 / 1.412 | 1.355 / 1.355 / 1.432 |
+| MultiplicativeNoise | 12.244 / 12.211 / 12.512 | 8.338 / 8.360 / 8.570 | 0.146 / 0.130 / 0.232 | 0.139 / 0.149 / 0.205 |
+| ObjectDropout | 22.267 / 22.272 / 22.731 | 22.681 / 22.632 / 23.045 | 0.426 / 0.473 / 0.519 | 0.541 / 0.442 / 0.781 |
+| OrientedBlur | 16.395 / 16.436 / 16.698 | 7.628 / 7.586 / 8.005 | 0.762 / 0.731 / 0.976 | 0.724 / 0.726 / 0.899 |
+| PixelDistributionAdaptation | 24.639 / 24.580 / 24.943 | 18.500 / 18.495 / 18.722 | 4.047 / 4.479 / 5.339 | 1.477 / 1.435 / 1.672 |
+| PlasmaBrightnessContrast | 31.437 / 31.380 / 31.750 | 31.655 / 31.696 / 31.943 | 0.664 / 0.655 / 0.735 | 0.680 / 0.708 / 0.734 |
+| PlasmaShadow | 25.268 / 25.319 / 25.524 | 25.349 / 25.379 / 25.617 | 0.593 / 0.593 / 0.643 | 0.591 / 0.597 / 0.641 |
+| RandomToneCurve | 14.036 / 14.028 / 14.304 | 11.824 / 11.796 / 12.088 | 0.138 / 0.114 / 0.201 | 0.172 / 0.137 / 0.332 |
+| RingingOvershoot | 18.136 / 18.157 / 18.382 | 13.991 / 13.973 / 14.348 | 4.415 / 4.295 / 4.942 | 4.348 / 4.302 / 4.741 |
+| SaltAndPepper | 18.603 / 18.567 / 18.966 | 10.074 / 10.104 / 10.285 | 0.151 / 0.132 / 0.218 | 0.162 / 0.153 / 0.217 |
+| ShotNoise | 71.223 / 71.237 / 71.426 | 67.767 / 67.833 / 68.103 | 1.228 / 1.212 / 1.293 | 1.240 / 1.256 / 1.294 |
+| StripeMasking | 39.556 / 39.548 / 39.735 | 39.719 / 39.697 / 39.871 | 0.154 / 0.188 / 0.200 | 0.155 / 0.170 / 0.208 |
+| UnsharpMask | 16.188 / 16.096 / 16.535 | 10.227 / 10.239 / 10.585 | 0.351 / 0.384 / 0.455 | 0.339 / 0.386 / 0.437 |
+| Vignetting | 40.332 / 40.305 / 40.829 | 29.106 / 28.276 / 29.359 | 0.173 / 0.173 / 0.237 | 0.168 / 0.205 / 0.224 |
+| ZoomBlur | 267.789 / 267.794 / 268.140 | 261.578 / 261.590 / 261.900 | 1.879 / 1.860 / 1.939 | 1.911 / 1.931 / 2.036 |
+
+Isolated CPU repeats use the same 128³ source, core 0, ten warmups and 100
+measurements per transform, without CUDA calls interleaved. These checks were
+used to investigate timing changes in the initial implementation.
+
+| CPU transform | Before mean / p50 / p95 ms | After mean / p50 / p95 ms |
+| --- | ---: | ---: |
+| MultiplicativeNoise | 17.624 / 17.679 / 17.914 | 13.695 / 13.694 / 14.078 |
+| RingingOvershoot | 17.756 / 17.741 / 18.215 | 13.037 / 13.044 / 13.394 |
+| UnsharpMask | 21.624 / 21.730 / 21.949 | 15.467 / 15.513 / 15.828 |
+
+Nsight Systems traces use the same 28 3D recipes, one warmup and two measured
+calls per route; instrumented public-call timings are excluded above. Leading
+kernel groups are ringing, zoom, motion and shot noise. Kernel statistics below
+are **mean / p50 / p95 microseconds per launch**.
+
+| CUDA kernel | Before | After |
+| --- | ---: | ---: |
+| RingingOvershoot | 1384.750 / 1365.130 / 1420.454 | 1424.170 / 1365.386 / 1710.550 |
+| ZoomBlur | 1734.899 / 1735.193 / 1736.240 | 1735.026 / 1735.255 / 1736.360 |
+| MotionBlur | 1195.377 / 1195.643 / 1196.827 | 1195.339 / 1195.467 / 1197.043 |
+| ShotNoise | 1093.340 / 1093.148 / 1099.092 | 1094.438 / 1093.995 / 1098.411 |
+| Defocus | 625.363 / 625.261 / 626.230 | 624.781 / 624.877 / 625.429 |
+| OrientedBlur | 193.212 / 136.159 / 307.919 | 193.535 / 136.192 / 308.775 |
+| PlasmaBrightnessContrast | 465.742 / 465.550 / 466.351 | 465.459 / 465.406 / 465.630 |
+| PlasmaShadow | 458.350 / 456.798 / 462.862 | 457.353 / 456.382 / 461.302 |
+
+The trace contains 879 kernel launches before and after, with unchanged register
+counts for the measured augmentation kernels. Their medians differ by less than
+0.2%, except the small UnsharpMask pointwise kernel (4.560 → 4.704 µs); ringing
+shows tail variability in the instrumented trace. The largest CPU public-call
+p50 increase is 1.64% for ForegroundCrop (0.037 ms); the two confirmed prototype
+regressions are faster than baseline in both catalog and isolated measurements.
+
+CPU hardware-counter profiling was unavailable because the host sets
+`perf_event_paranoid=4`. macOS and arm64 were not runtime-tested; the CPU path
+adds no platform-specific instructions.
+
+Representative 512² results, **mean / p50 / p95 milliseconds**:
+
+| 2D transform | CPU | CUDA uploaded | CUDA resident |
+| --- | ---: | ---: | ---: |
+| BiasField | 1.072 / 1.070 / 1.091 | 0.226 / 0.209 / 0.290 | 0.079 / 0.062 / 0.184 |
+| CLAHE | 5.315 / 5.313 / 5.361 | 0.476 / 0.463 / 0.529 | 0.320 / 0.306 / 0.387 |
+| Defocus | 0.506 / 0.513 / 0.546 | 0.273 / 0.243 / 0.430 | 0.093 / 0.079 / 0.152 |
+| FDA | 63.468 / 63.454 / 63.733 | 0.480 / 0.508 / 0.613 | 0.289 / 0.238 / 0.459 |
+| MotionBlur | 19.301 / 19.311 / 19.417 | 0.386 / 0.381 / 0.460 | 0.236 / 0.187 / 0.381 |
+| OrientedBlur | 0.625 / 0.622 / 0.648 | 0.241 / 0.234 / 0.292 | 0.099 / 0.084 / 0.106 |
+| RingingOvershoot | 0.703 / 0.703 / 0.717 | 0.588 / 0.586 / 0.601 | 0.442 / 0.436 / 0.450 |
+| GridDropout | 3.287 / 3.285 / 3.314 | 0.216 / 0.196 / 0.272 | 0.108 / 0.051 / 0.251 |
+
+Local ignored reports `docs/benchmarks/2d-{volume-before,volume-after,plane,numerics,summary}.json`
+contain exact commands, extension hashes, raw timings, comparisons and profile
+samples. The summary also contains the isolated CPU samples and measurement
+script source. Reproduce with existing builds and environment (no installation);
+`taskset` is the Linux timing
+control used here and can be omitted on other platforms:
+
+```bash
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-reader-cuda --target _augment --parallel 4
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-volume-cpu --target _augment --parallel 2
+VC_BENCH_VOLUME=/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr
+VC_2D_TRANSFORMS=(AdditiveNoise BiasField ChannelMisalignment CLAHE Defocus Equalize FDA
+  ForegroundCrop ForegroundDropout GibbsRinging GridDropout HistogramMatching Illumination
+  MotionBlur MultiplicativeNoise ObjectDropout OrientedBlur PixelDistributionAdaptation
+  PlasmaBrightnessContrast PlasmaShadow RandomToneCurve RingingOvershoot SaltAndPepper
+  ShotNoise StripeMasking UnsharpMask Vignetting ZoomBlur)
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  taskset -c 0 .venv/bin/python benchmarks/bench_augmentations.py \
+  --native-dir /tmp/vc-reader-cuda --array "$VC_BENCH_VOLUME" \
+  --only "${VC_2D_TRANSFORMS[@]}" --warmup 5 --reps 20 --output /tmp/2d-volume-complete.json
+# Use /tmp/vc-2d-before and a distinct output path for the saved baseline.
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  taskset -c 0 .venv/bin/python benchmarks/bench_augmentations.py \
+  --native-dir /tmp/vc-reader-cuda --array "$VC_BENCH_VOLUME" \
+  --plane --size 512 --warmup 5 --reps 20 --output /tmp/2d-plane-complete.json
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  taskset -c 0 nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
+  --force-overwrite=true --output=/tmp/2d-profile-complete-pinned \
+  .venv/bin/python benchmarks/bench_augmentations.py --native-dir /tmp/vc-reader-cuda \
+  --array "$VC_BENCH_VOLUME" --only "${VC_2D_TRANSFORMS[@]}" --warmup 1 --reps 2 \
+  --output /tmp/2d-profile-complete-pinned.json
+nsys stats --report cuda_gpu_kern_sum --format csv /tmp/2d-profile-complete-pinned.nsys-rep
+# Isolated CPU script: source is retained in 2d-summary.json, cpu_isolated_script.
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  taskset -c 0 .venv/bin/python /tmp/profile_planar_3d_cpu.py /tmp/vc-reader-cuda \
+  RingingOvershoot,MultiplicativeNoise,UnsharpMask /tmp/2d-cpu-isolated-complete.json
+AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=/tmp/vc-reader-cuda \
+  .venv/bin/python -m unittest discover -s tests -v
+AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=/tmp/vc-volume-cpu \
+  .venv/bin/python -m unittest discover -s tests -v
+```
 
 ## Reuse overlapping median neighborhoods (2026-10-17)
 
