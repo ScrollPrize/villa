@@ -304,7 +304,7 @@
       "crops_per_second": 524.6355302117205
     }
   },
-  "protocol": "one validation/warmup epoch per mode; rotated mode order per repetition; warm caches; GPU-ready batches; includes reads, transfers, casts, augmentation, collation and output disposal; excludes startup/validation and model execution; private prototype versus public APIs",
+  "protocol": "one validation/warmup epoch per mode; rotated mode order per repetition; warm caches; GPU-ready batches; includes reads, transfers, casts, augmentation, collation and output disposal; excludes startup/validation and model execution",
   "input": "/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
   "transforms": [
     "Normalize('minmax')",

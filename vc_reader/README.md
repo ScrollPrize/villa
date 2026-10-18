@@ -91,72 +91,85 @@ for timing scope and validation.
 
 ## Performance
 
-Measured on PHercParis4 (level 2) using an Intel Core Ultra 7 270K Plus and
-NVIDIA RTX 5090, with 8 reader workers and 60 requests per workload/backend.
-These results use a local uncompressed volume with warm filesystem caches;
-CUDA timings include fresh uploads and final downloads to host. Performance
-will vary with storage, chunking, and cache reuse.
-
-See the [benchmark guide](benchmarks/README.md) for methodology, dependencies,
-commands, augmentation parameters, and complete timing reports.
-
-The latest [CUDA geometry measurements](benchmarks/README.md#cuda-geometry-work-reduction)
-show **1,644 crops/s** for GPU-ready batches of four 128³ crops, up from 852,
-and **3.53× faster elastic augmentation**. This loader chain uses normalization,
-elastic, median, flip and gamma; it includes no model/backward pass. The tables
-below retain the earlier reader and 12-transform pipeline measurements.
-
 ### Reading and sampling
 
-Median milliseconds per request, including sampling where needed. TensorStore
-and zarr-python use SciPy for interpolation of curved surfaces and rotated boxes.
-The surface workload samples tiles from a real horizontal PHercParis4 tifxyz
-strip, [included with the benchmarks](benchmarks/README.md#reusable-tifxyz-surface).
+Median milliseconds per request, including sampling where needed: six requests
+× ten repetitions per workload/backend, after validation and two warmups, with
+eight reader workers. CUDA includes fresh source uploads and final host downloads.
+TensorStore and zarr-python use SciPy to interpolate identical coordinate grids.
+The curved surface uses the [bundled tifxyz strip](benchmarks/README.md#reusable-tifxyz-surface).
 
 | Workload | zarr-python | TensorStore | vc_reader CPU | vc_reader CUDA |
 | --- | ---: | ---: | ---: | ---: |
-| ML batch: 8 × 128³ crops | 13.911 | 4.910 | 1.140 | 4.671 |
-| Curved tifxyz surface: 96 × 512 | 10.606 | 6.601 | 0.775 | 1.745 |
-| Axis-aligned slab: 16 × 512² | 6.197 | 2.679 | 0.470 | 2.197 |
-| Rotated box: 128³ | 68.116 | 64.903 | 13.682 | 1.593 |
+| ML batch: 8 × 128³ crops | 13.553 | 4.867 | 1.136 | 4.734 |
+| Curved tifxyz surface: 96 × 512 | 10.462 | 6.503 | 0.832 | 1.796 |
+| Axis-aligned slab: 16 × 512² | 6.134 | 2.730 | 0.471 | 2.104 |
+| Rotated box: 128³ | 69.232 | 65.362 | 14.870 | 1.592 |
 
-CPU is faster for direct batches, slabs, and these surface tiles. CUDA provides the
-largest benefit for rotated boxes: **8.59× faster than vc_reader CPU**,
-**40.74× than TensorStore**, and **42.76× than zarr-python**.
+CPU is faster for direct batches, slabs, and these surface tiles. For rotated
+boxes, CUDA is 9.34× faster than vc_reader CPU
 
-### Full training pipeline
+### Axis-aligned single-crop latency (12 augmentations, CPU output)
 
-vc_reader fetches a rotated 128³ crop, applies min-max normalization, then runs
-12 augmentations: elastic deformation, median filtering, flipping, Gaussian
-blur, brightness multiplication and addition, contrast, gamma, local contrast,
-local smoothing, sharpening, and low-resolution simulation. This comparison
-uses vc_reader only.
+Axis-aligned crops are the default workload here. Each request reads a 128³
+box, applies min-max normalization, then runs 12 augmentations: elastic
+deformation, median filtering, flipping, Gaussian blur, brightness multiplication
+and addition, contrast, gamma, local contrast, local smoothing, sharpening, and
+low-resolution simulation. These benchmarks measure input preparation only;
+no model forward or backward pass is included.
 
-| Stage | CPU median (ms) | CUDA median (ms) |
-| --- | ---: | ---: |
-| Fetching + sampling | 15.199 | 1.076 |
-| Normalization | 5.230 | 0.136 |
-| 12 augmentations | 169.915 | 3.115 |
-| Final host download | — | 0.529 |
-| **End-to-end** | **189.966** | **4.881** |
-
-CUDA delivers **38.92× lower median latency**, with throughput of **202.63
-crops/s** versus **5.26 crops/s** on CPU.
-
-### Axis-aligned boxes with CUDA augmentation
-
-For axis-aligned 128³ crops with the same normalization and augmentation chain,
-reading on CPU and then moving to CUDA is the fastest measured route:
+Reading on CPU and then moving to CUDA is the fastest measured route. Each
+route uses six crops × ten repetitions, with fresh GPU uploads and final host
+downloads.
 
 | Pipeline | Median total (ms) | Crops/s | Speedup over CPU |
 | --- | ---: | ---: | ---: |
-| CPU throughout | 173.431 | 5.77 | 1.00× |
-| CUDA reading + processing | 4.812 | 204.86 | 36.04× |
-| CPU reading → CUDA processing | **4.371** | **227.66** | **39.68×** |
+| CPU throughout | 151.408 | 6.60 | 1.00× |
+| CUDA reading + processing | 3.169 | 317.23 | 47.78× |
+| CPU reading → CUDA processing | 2.548 | 394.24 | 59.41× |
 
-The hybrid route is **1.10× faster** than CUDA reading and processing for these
-boxes. All routes passed output correctness checks; detailed statistics and
+The hybrid route is **1.24× faster** than CUDA reading and processing for these
+boxes. All routes passed output correctness checks; full distributions and
 validation results are in the [benchmark guide](benchmarks/README.md).
+
+### PyTorch batch throughput (12 augmentations, GPU output)
+
+This benchmark compares ways to feed batches to a PyTorch model, including
+loader workers and prefetching. It uses the same min-max normalization and
+12 augmentations as the axis-aligned single-crop benchmark, with identical
+parameters and order. Batches use axis-aligned reads, warm reader caches and GPU outputs;
+the single-crop timings above include final CPU outputs. No model forward or
+backward pass is included.
+
+Batches contain four 128³ crops. Three timed epochs of 64 batches follow a
+validation/warmup epoch per route. Four loader workers and four reader threads
+per worker serve the batch routes. Epoch throughput includes reading, transfers,
+augmentation, collation and disposal; outputs remain on the GPU.
+
+| Route | Mean batch ms | p50 ms | p95 ms | Crops/s |
+| --- | ---: | ---: | ---: | ---: |
+| Per-sample CUDA, `num_workers=0` | 7.135 | 6.920 | 8.294 | 560.35 |
+| `Pipeline.batch()` | 5.158 | 4.874 | 5.943 | 775.21 |
+| `CudaLoader`, one batch ahead | 5.187 | 4.774 | 5.876 | 770.86 |
+
+### Special case: rotated-crop sampling
+
+When a crop must be read at an angle, fetching also requires trilinear
+interpolation. This benchmark samples a 128³ crop with a 10° YX rotation, then
+uses the same normalization and 12 augmentations as the axis-aligned benchmark.
+It uses the same six crops × ten repetitions and final CPU output endpoint.
+
+| Stage | CPU median (ms) | CUDA median (ms) |
+| --- | ---: | ---: |
+| Fetching + sampling | 13.781 | 1.168 |
+| Normalization | 2.639 | 0.123 |
+| 12 augmentations | 144.002 | 1.353 |
+| Final host download | — | 0.537 |
+| End-to-end | 161.036 | 3.177 |
+
+CUDA delivers **50.69× lower median latency**, with throughput of **307.03
+crops/s** versus **6.22 crops/s** on CPU.
+
 
 ## Add labels or channels to a pipeline
 
@@ -187,46 +200,22 @@ Arrays must already be spatially aligned and use channel-first shapes such as
 name. The original pipeline is unchanged; replay plans stay with the pipeline
 that created them.
 
-## Regenerate augmentation previews
-
-[`scripts/generate_augment_previews.py`](scripts/generate_augment_previews.py)
-reads a real Zarr crop and writes lossless WebPs with the filenames used below.
-It needs the `previews` extra (NumPy and Pillow with WebP support) and the native
-reader/augmentation extensions. The README's constructor examples supply the
-recipes, so there is no separate catalog to maintain.
-
-```bash
-python scripts/generate_augment_previews.py --array /path/to/volume.zarr --level 2 \
-  --start 9000 3600 3600 --reference-start 9384 3600 3600 --size 128 \
-  --output docs/augmentations/previews --manifest /tmp/augmentation-previews.json
-```
-
-Use coordinates appropriate to your volume and selected level; omit `--start`
-for a centered crop. The default intensity divisor is 255; set `--divisor` for
-other intensity ranges. `--only Elastic Gamma` regenerates selected examples.
-The default seed is 123, with five candidate seeds per augmentation; the script
-chooses the one changing the most voxels. It selects visibly affected Z/Y/X
-planes and uses a shared display window for each original/augmented pair.
-Gold boxes mark localized changes. Label examples use a mask derived from
-CT > 0.5 after scaling, not manual annotations. The 2D companions get one WebP
-each; `SurfacePerturb` uses a synthetic coordinate surface with CT-derived height.
-
-The optional manifest records input hashes, recipes, selected seeds, and slice
-indices. Use `--output /tmp/previews` to inspect a new dataset first. This script
-generates still images; existing README timings and the Elastic video are
-preserved. Recipes retain their literal sizes (such as the 112³ crop), so use
-128³ input to match the documented examples.
-
 ## Augmentations
 
 Each entry shows the **measured configuration**, not the constructor defaults. Use `from vc_reader import augment as A`.
 
-Benchmarks use **128 × 128 × 128 float32** crops from PHercParis4 volume `20260411134726-2.400um-0.2m-78keV-masked.zarr`, **scale 2**, centered at ZYX `(9064, 3664, 3664)`. CT values are divided by 255. Timings are medians of 5 measured calls after 1 warmup, using one CPU thread and a Release build.
+Benchmarks use **128 × 128 × 128 float32** crops from PHercParis4 volume `20260411134726-2.400um-0.2m-78keV-masked.zarr`, **scale 2**, centered at ZYX `(9064, 3664, 3664)`. CT values are divided by 255. Timings are medians of 5 measured calls after 1 warmup, using one CPU thread and a Release build. Refreshed 2026-10-17 at `0fd629ebd`; [all raw timings and validation](docs/benchmarks/augmentations.json) and [reproduction commands](benchmarks/README.md#readme-augmentation-timings) are saved.
 
 **CUDA uploaded** includes uploading the host input and downloading the output. **CUDA resident** starts and ends with device arrays. Speedup is CPU time divided by the corresponding CUDA time; values above 1× mean CUDA is faster.
 
-**Images:** Z, Y and X slice pairs show the original above the augmented output. Planes are selected where the effect is visible, with the same display window 
+Calls use `compact=True`, seeds 123–127, and deterministically shuffled backend
+order. Copies and input validation inside the public API are timed; reading,
+setup, output comparison and disposal are excluded. Most examples use one image
+channel; geometric examples also transform labels, and ChannelMisalignment uses
+two image channels. `reference` is a second CT crop 384 voxels farther along Z.
 
+
+**Images:** Z, Y and X slice pairs show the original above the augmented output. Planes are selected where the effect is visible, with the same display window
 
 Expand an augmentation below to see its parameters, timings and images. Elastic also includes a WebM animation.
 
@@ -241,7 +230,7 @@ A.AdditiveNoise(scale=0.05, distribution='laplace', mean=0)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 21.679 ms | 1.362 ms | 0.286 ms | 15.9× | 75.8× |
+| 26.999 ms | 3.964 ms | 0.249 ms | 6.8× | 108.4× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -260,7 +249,7 @@ A.Affine(degrees=5, translate=2, scale=0.95)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 55.834 ms | 6.180 ms | 0.920 ms | 9.0× | 60.7× |
+| 67.410 ms | 5.853 ms | 0.602 ms | 11.5× | 112.0× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -279,7 +268,7 @@ A.BiasField(std=0.3, scale=0.025)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 12.392 ms | 2.508 ms | 1.465 ms | 4.9× | 8.5× |
+| 17.591 ms | 3.963 ms | 0.338 ms | 4.4× | 52.0× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -298,7 +287,7 @@ A.BlankRectangle(size=16, value=0, count=3)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 0.659 ms | 1.259 ms | 0.152 ms | 0.5× | 4.3× |
+| 0.794 ms | 1.244 ms | 0.120 ms | 0.6× | 6.6× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -317,7 +306,7 @@ A.BrightnessAdd(shift=0.1)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 1.355 ms | 1.178 ms | 0.117 ms | 1.2× | 11.6× |
+| 4.515 ms | 3.947 ms | 0.157 ms | 1.1× | 28.7× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -336,7 +325,7 @@ A.BrightnessGradient(scale=12, loc=0.5, strength=0.3)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 9.871 ms | 1.567 ms | 0.475 ms | 6.3× | 20.8× |
+| 8.393 ms | 1.451 ms | 0.212 ms | 5.8× | 39.6× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -355,7 +344,7 @@ A.BrightnessMultiply(factor=1.1)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 1.221 ms | 1.068 ms | 0.112 ms | 1.1× | 10.9× |
+| 1.560 ms | 1.257 ms | 0.109 ms | 1.2× | 14.4× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -374,7 +363,7 @@ A.ChannelMisalignment(degrees=5, translate=2, scale=1, channels=(1,))
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 50.230 ms | 2.857 ms | 0.539 ms | 17.6× | 93.2× |
+| 64.195 ms | 2.728 ms | 0.253 ms | 23.5× | 254.1× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -395,7 +384,7 @@ A.CLAHE(clip_limit=2, tile_shape=(16, 16, 16), bins=256)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 52.156 ms | 1.698 ms | 0.595 ms | 30.7× | 87.7× |
+| 61.903 ms | 3.795 ms | 0.604 ms | 16.3× | 102.5× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -414,7 +403,7 @@ A.ClipOutliers(lower=1, upper=99, p_retain_std=1)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 23.865 ms | 1.568 ms | 0.524 ms | 15.2× | 45.5× |
+| 27.146 ms | 3.892 ms | 0.505 ms | 7.0× | 53.7× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -433,7 +422,7 @@ A.Contrast(factor=1.2)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 5.554 ms | 1.177 ms | 0.135 ms | 4.7× | 41.3× |
+| 5.757 ms | 1.292 ms | 0.183 ms | 4.5× | 31.5× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -452,7 +441,7 @@ A.CropPad(shape=(112, 112, 112))
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 0.765 ms | 1.902 ms | 0.555 ms | 0.4× | 1.4× |
+| 2.668 ms | 4.559 ms | 0.439 ms | 0.6× | 6.1× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -471,7 +460,7 @@ A.Defocus(radius=2)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 13.262 ms | 1.949 ms | 0.808 ms | 6.8× | 16.4× |
+| 14.577 ms | 4.384 ms | 0.833 ms | 3.3× | 17.5× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -498,7 +487,7 @@ See the [precision policy](docs/precision.md) and
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 91.666 ms | 3.527 ms | 1.796 ms | 26.0× | 51.0× |
+| 95.743 ms | 2.409 ms | 0.700 ms | 39.7× | 136.7× |
 
 [▶ Watch Elastic animation (WebM)](docs/augmentations/animations/Elastic.webm)
 
@@ -525,7 +514,7 @@ A.Equalize(bins=256)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 23.191 ms | 1.448 ms | 0.406 ms | 16.0× | 57.1× |
+| 30.755 ms | 4.161 ms | 0.425 ms | 7.4× | 72.3× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -544,7 +533,7 @@ A.FDA(reference=reference, blend=1, fraction=0.1)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 608.138 ms | 4.508 ms | 3.091 ms | 134.9× | 196.7× |
+| 622.364 ms | 4.097 ms | 2.410 ms | 151.9× | 258.2× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -563,7 +552,7 @@ A.Flip(axes='x', p_axis=1)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 1.216 ms | 2.390 ms | 0.871 ms | 0.5× | 1.4× |
+| 3.254 ms | 5.494 ms | 0.337 ms | 0.6× | 9.6× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -582,7 +571,7 @@ A.ForegroundCrop(shape=(112, 112, 112))
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 2.324 ms | 2.018 ms | 0.691 ms | 1.2× | 3.4× |
+| 2.302 ms | 1.899 ms | 0.524 ms | 1.2× | 4.4× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -601,7 +590,7 @@ A.ForegroundDropout(size=(16, 16, 16), count=3)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 12.382 ms | 1.959 ms | 0.417 ms | 6.3× | 29.7× |
+| 12.092 ms | 5.798 ms | 0.421 ms | 2.1× | 28.7× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -620,7 +609,7 @@ A.Gamma(gamma=0.8)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 8.721 ms | 1.325 ms | 0.236 ms | 6.6× | 36.9× |
+| 8.649 ms | 1.359 ms | 0.193 ms | 6.4× | 44.9× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -639,7 +628,7 @@ A.GaussianBlur(sigma=1)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 5.919 ms | 1.478 ms | 0.316 ms | 4.0× | 18.7× |
+| 6.508 ms | 1.508 ms | 0.344 ms | 4.3× | 18.9× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -658,7 +647,7 @@ A.GaussianNoise(std=0.05)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 9.287 ms | 1.245 ms | 0.122 ms | 7.5× | 76.3× |
+| 9.359 ms | 3.868 ms | 0.176 ms | 2.4× | 53.1× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -677,7 +666,7 @@ A.GibbsRinging(cutoff=0.7)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 397.072 ms | 1.585 ms | 0.487 ms | 250.5× | 815.4× |
+| 429.916 ms | 1.524 ms | 0.503 ms | 282.1× | 855.5× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -696,7 +685,7 @@ A.GridDropout(unit_size=(16, 16, 16), ratio=0.4)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 39.331 ms | 1.415 ms | 0.336 ms | 27.8× | 117.2× |
+| 38.598 ms | 1.380 ms | 0.183 ms | 28.0× | 210.8× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -715,7 +704,7 @@ A.HistogramMatching(reference=reference, blend=1, bins=256)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 97.854 ms | 4.232 ms | 3.148 ms | 23.1× | 31.1× |
+| 90.217 ms | 2.945 ms | 1.925 ms | 30.6× | 46.9× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -734,7 +723,7 @@ A.Illumination(strength=0.3, mode='linear', direction=(1, 1, 1))
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 35.146 ms | 1.314 ms | 0.204 ms | 26.7× | 172.0× |
+| 33.811 ms | 1.500 ms | 0.213 ms | 22.5× | 158.5× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -753,7 +742,7 @@ A.Invert()
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 2.170 ms | 1.127 ms | 0.180 ms | 1.9× | 12.1× |
+| 5.461 ms | 3.929 ms | 0.148 ms | 1.4× | 36.8× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -772,7 +761,7 @@ A.LocalContrast(scale=12, loc=0.5, factor=1.2)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 4.171 ms | 1.423 ms | 0.427 ms | 2.9× | 9.8× |
+| 5.623 ms | 1.359 ms | 0.223 ms | 4.1× | 25.2× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -791,7 +780,7 @@ A.LocalGamma(scale=12, loc=0.5, gamma=0.8)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 15.140 ms | 1.494 ms | 0.449 ms | 10.1× | 33.7× |
+| 18.246 ms | 3.869 ms | 0.274 ms | 4.7× | 66.5× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -810,7 +799,7 @@ A.LocalSmoothing(scale=12, loc=0.5, strength=0.7, sigma=1)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 8.806 ms | 1.687 ms | 0.578 ms | 5.2× | 15.2× |
+| 7.835 ms | 1.613 ms | 0.549 ms | 4.9× | 14.3× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -829,7 +818,7 @@ A.LowResolution(scale=0.5)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 7.724 ms | 1.531 ms | 0.684 ms | 5.0× | 11.3× |
+| 12.369 ms | 4.059 ms | 0.414 ms | 3.0× | 29.9× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -848,7 +837,7 @@ A.MedianFilter(size=3)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 16.054 ms | 1.267 ms | 0.211 ms | 12.7× | 75.9× |
+| 15.795 ms | 1.458 ms | 0.174 ms | 10.8× | 90.5× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -867,7 +856,7 @@ A.Morphology(operation='close', radius=1)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 11.810 ms | 0.701 ms | 0.263 ms | 16.8× | 44.9× |
+| 12.358 ms | 0.715 ms | 0.261 ms | 17.3× | 47.4× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -886,7 +875,7 @@ A.MotionBlur(length=5, direction=(1, 1, 1), samples=9)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 215.162 ms | 2.470 ms | 1.397 ms | 87.1× | 154.1× |
+| 248.041 ms | 2.475 ms | 1.348 ms | 100.2× | 183.9× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -905,7 +894,7 @@ A.MultiplicativeNoise(low=0.8, high=1.2)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 13.039 ms | 1.192 ms | 0.184 ms | 10.9× | 70.9× |
+| 18.146 ms | 3.860 ms | 0.205 ms | 4.7× | 88.6× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -924,7 +913,7 @@ A.Normalize(mode='zscore')
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 6.590 ms | 1.338 ms | 0.179 ms | 4.9× | 36.8× |
+| 9.445 ms | 3.810 ms | 0.201 ms | 2.5× | 47.0× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -943,7 +932,7 @@ A.ObjectDropout(drop_probability=0.5)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 14.822 ms | 2.138 ms | 0.500 ms | 6.9× | 29.6× |
+| 22.031 ms | 6.054 ms | 0.479 ms | 3.6× | 46.0× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -962,7 +951,7 @@ A.OrientedBlur(sigma_along=2, sigma_across=0.5, axis=(1, 0, 0))
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 12.713 ms | 4.846 ms | 4.078 ms | 2.6× | 3.1× |
+| 7.995 ms | 1.952 ms | 0.807 ms | 4.1× | 9.9× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -981,7 +970,7 @@ A.PixelDistributionAdaptation(reference=reference, blend=1, mode='standard')
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 32.552 ms | 5.949 ms | 7.677 ms | 5.5× | 4.2× |
+| 21.318 ms | 5.432 ms | 1.887 ms | 3.9× | 11.3× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -1000,7 +989,7 @@ A.PlasmaBrightnessContrast(brightness=0.2, contrast=0.3, scale=0.025, persistenc
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 34.523 ms | 1.916 ms | 0.817 ms | 18.0× | 42.3× |
+| 36.947 ms | 4.375 ms | 0.673 ms | 8.4× | 54.9× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -1019,7 +1008,7 @@ A.PlasmaShadow(strength=0.5, scale=0.025, persistence=0.5, octaves=5)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 27.610 ms | 1.812 ms | 0.742 ms | 15.2× | 37.2× |
+| 31.045 ms | 4.239 ms | 0.641 ms | 7.3× | 48.4× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -1038,7 +1027,7 @@ A.RandomBinaryOperator(channels=(0,), radius=1, operations=('dilate',))
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 16.719 ms | 1.314 ms | 0.253 ms | 12.7× | 66.0× |
+| 28.838 ms | 4.026 ms | 0.257 ms | 7.2× | 112.4× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -1057,7 +1046,7 @@ A.RandomToneCurve(scale=0.1)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 13.544 ms | 1.279 ms | 0.159 ms | 10.6× | 85.2× |
+| 14.437 ms | 1.255 ms | 0.151 ms | 11.5× | 95.3× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -1076,7 +1065,7 @@ A.RemoveComponents(on='mask', max_fraction=0.25, p_fill=0)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 26.932 ms | 1.299 ms | 0.941 ms | 20.7× | 28.6× |
+| 29.042 ms | 2.673 ms | 1.008 ms | 10.9× | 28.8× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -1095,7 +1084,7 @@ A.RicianNoise(std=0.05)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 18.819 ms | 1.272 ms | 0.178 ms | 14.8× | 105.6× |
+| 21.186 ms | 1.310 ms | 0.186 ms | 16.2× | 113.6× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -1114,7 +1103,7 @@ A.RingingOvershoot(cutoff=0.7, radius=4)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 15.109 ms | 5.878 ms | 4.299 ms | 2.6× | 3.5× |
+| 18.022 ms | 7.921 ms | 4.311 ms | 2.3× | 4.2× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -1133,7 +1122,7 @@ A.Rotate90(planes=('yx',), turns=(1,))
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 1.959 ms | 2.451 ms | 0.829 ms | 0.8× | 2.4× |
+| 2.055 ms | 6.046 ms | 0.568 ms | 0.3× | 3.6× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -1152,7 +1141,7 @@ A.SaltAndPepper(amount=0.02, salt_fraction=0.5)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 13.376 ms | 1.665 ms | 0.231 ms | 8.0× | 57.9× |
+| 15.691 ms | 3.656 ms | 0.168 ms | 4.3× | 93.2× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -1171,7 +1160,7 @@ A.Sharpen(strength=0.25, p_clamp=0)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 7.270 ms | 1.390 ms | 0.252 ms | 5.2× | 28.9× |
+| 4.343 ms | 1.470 ms | 0.265 ms | 3.0× | 16.4× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -1190,7 +1179,7 @@ A.SheetCompression(strength=0.2, intensity_sigma=1, smoothing=2, axes='z')
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 84.264 ms | 3.213 ms | 1.557 ms | 26.2× | 54.1× |
+| 59.454 ms | 6.470 ms | 1.209 ms | 9.2× | 49.2× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -1209,7 +1198,7 @@ A.ShotNoise(photons=100)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 62.775 ms | 2.459 ms | 1.269 ms | 25.5× | 49.5× |
+| 67.751 ms | 4.798 ms | 1.230 ms | 14.1× | 55.1× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -1228,7 +1217,7 @@ A.SliceIllumination(defects=3, width=4, reduction=0.5, base_p=0.1, base_reductio
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 1.243 ms | 1.227 ms | 0.180 ms | 1.0× | 6.9× |
+| 1.085 ms | 1.279 ms | 0.153 ms | 0.8× | 7.1× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -1247,7 +1236,7 @@ A.Smear(shift=(3, 0), alpha=0.25)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 4.304 ms | 1.796 ms | 0.681 ms | 2.4× | 6.3× |
+| 4.165 ms | 1.609 ms | 0.431 ms | 2.6× | 9.7× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -1266,7 +1255,7 @@ A.StripeMasking(unit_size=(16, 16, 16), ratio=0.25, axes='zyx')
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 39.608 ms | 1.350 ms | 0.274 ms | 29.3× | 144.8× |
+| 39.565 ms | 1.306 ms | 0.187 ms | 30.3× | 211.8× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -1285,7 +1274,7 @@ A.ThickSlice(scale=0.5, axes='z')
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 1.996 ms | 2.593 ms | 0.996 ms | 0.8× | 2.0× |
+| 2.935 ms | 6.104 ms | 0.489 ms | 0.5× | 6.0× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -1304,7 +1293,7 @@ A.Transpose(order='zxy')
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 1.936 ms | 2.529 ms | 0.854 ms | 0.8× | 2.3× |
+| 2.185 ms | 6.131 ms | 0.586 ms | 0.4× | 3.7× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -1323,7 +1312,7 @@ A.UnsharpMask(strength=0.5, sigma=1)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 21.419 ms | 1.636 ms | 0.526 ms | 13.1× | 40.7× |
+| 16.269 ms | 1.643 ms | 0.542 ms | 9.9× | 30.0× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -1342,7 +1331,7 @@ A.Vignetting(strength=0.5, radius=0.8)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 30.211 ms | 1.199 ms | 0.167 ms | 25.2× | 180.8× |
+| 33.883 ms | 1.207 ms | 0.215 ms | 28.1× | 157.4× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -1361,7 +1350,7 @@ A.ZoomBlur(strength=0.15, samples=9)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 235.889 ms | 3.011 ms | 1.942 ms | 78.4× | 121.4× |
+| 270.777 ms | 5.831 ms | 1.906 ms | 46.4× | 142.1× |
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
@@ -1384,7 +1373,7 @@ A.StripGeometry(degrees=5, smooth_offset=2, stride=16)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 1.008 ms | 0.048 ms | 0.050 ms | 21.0× | 20.2× |
+| 1.088 ms | 0.038 ms | 0.042 ms | 29.0× | 25.9× |
 
 [![StripGeometry: original and augmented 2D views](docs/augmentations/previews/StripGeometry.webp)](docs/augmentations/previews/StripGeometry.webp)
 
@@ -1403,7 +1392,7 @@ A.SurfacePerturb(blobs=3, amplitude=1, points_affected=100, p=1)
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 0.512 ms | 0.280 ms | 0.268 ms | 1.8× | 1.9× |
+| 0.521 ms | 0.286 ms | 0.268 ms | 1.8× | 1.9× |
 
 [![SurfacePerturb: original and augmented 2D views](docs/augmentations/previews/SurfacePerturb.webp)](docs/augmentations/previews/SurfacePerturb.webp)
 

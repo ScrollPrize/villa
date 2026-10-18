@@ -53,6 +53,12 @@
       "slab",
       "rotated_box"
     ],
+    "surface": "/home/sean/Documents/villa2/villa/vc_reader/benchmarks/fixtures/fiber_132487",
+    "surface_size": [
+      96,
+      512
+    ],
+    "surface_coordinate_scale": 1.0,
     "batch_size": 8,
     "plane_size": [
       256,
@@ -60,6 +66,8 @@
     ],
     "slab_depth": 16,
     "augmentation": "heavy",
+    "pipeline_read": "affine",
+    "include_hybrid": false,
     "array": "/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
     "level": "2",
     "backend": "both",
@@ -124,11 +132,11 @@
     "extensions": {
       "reader": {
         "path": "/tmp/vc-reader-cuda/_native.cpython-314-x86_64-linux-gnu.so",
-        "sha256": "3949897ef766d47edfbd773e3bab3d266404019c386713da0e25c534c936e5cb"
+        "sha256": "61987e8540abcbeb170889ba069b936752839c4c34db04931f4ed192ea9183fc"
       },
       "augment": {
         "path": "/tmp/vc-reader-cuda/_augment.cpython-314-x86_64-linux-gnu.so",
-        "sha256": "569524640ef1debebd065acb75ac6c6564cad9975b3e64b19f8b1d3f9b74ea89"
+        "sha256": "e47d51a474b4ade2a8100f3f2db45aef51296b2653e4a31d89f9c63831217ba3"
       }
     },
     "build": {
@@ -160,7 +168,9 @@
     "included": "chunk I/O/decode, planning, allocations, sampling, normalization, augmentation; CUDA upload on cache misses",
     "excluded": "input generation, reader/pipeline construction, validation, warmup, cache clearing, output destruction",
     "caches": "host and OS caches are not flushed; warm CUDA cache may evict if its budget is too small",
-    "order": "CPU/CUDA order alternates each repetition; identical crops and seeds",
+    "order": "backend order rotates each repetition; identical crops and seeds",
+    "routes": "cpu: CPU read/normalize/augment; cuda: device chunks; hybrid: CPU read/sample + upload, CUDA normalize/augment",
+    "hybrid_upload": "box: uint8 crop uploaded then cast on GPU; affine: CPU-sampled float32 crop uploaded",
     "throughput": "output voxels and float32 output bytes, not storage or PCIe bandwidth",
     "speedup": "CPU / CUDA p50 latency; >1 means CUDA is faster",
     "endpoints": "CPU host; CUDA host"
@@ -172,83 +182,125 @@
       {
         "crop": 0,
         "sha256": {
-          "cpu": "7ef8f64286cb276a1ac02795cdc31068878adea6375d97882602bdf88e3dd216",
-          "cuda": "e2efb3bbf506bad07d75fc3a7a1ecbfa673ca0e98bec4c3c4f9e26e41efd897a"
+          "cpu": "c05d495fcadcc856fdd6881caa5f2bcf573000dd2669d23a5e99a6e199d3a682",
+          "cuda": "670b0338fd798fb800811292e59915b6a5bf9045320036013b8b4e5c028d528e"
         },
-        "max_abs": 2.980232238769531e-07,
-        "rmse": 3.061557875934774e-08
+        "reference": "cpu",
+        "comparisons": {
+          "cuda": {
+            "max_abs": 8.344650268554688e-07,
+            "rmse": 4.872745318811755e-08
+          }
+        },
+        "max_abs": 8.344650268554688e-07,
+        "rmse": 4.872745318811755e-08
       },
       {
         "crop": 1,
         "sha256": {
-          "cpu": "2b552679c100f7391934bce67f1b1ae848eab623a749be40e94b80c9da701982",
-          "cuda": "979ac57080f3aa536b34e433ed354149b28505a458e7d96c9a8f63cd61de41b2"
+          "cpu": "724e121c1ebcbbd88c6271e554603f1361ccc7c102c67454c6f85a47899bcff7",
+          "cuda": "3547a6ef1f6fe181dbc5e2d8df84ae4e3dea912078b391ffce49d455e4777382"
         },
-        "max_abs": 2.980232238769531e-07,
-        "rmse": 3.406571031031508e-08
+        "reference": "cpu",
+        "comparisons": {
+          "cuda": {
+            "max_abs": 7.450580596923828e-07,
+            "rmse": 4.393318162605251e-08
+          }
+        },
+        "max_abs": 7.450580596923828e-07,
+        "rmse": 4.393318162605251e-08
       },
       {
         "crop": 2,
         "sha256": {
-          "cpu": "da4d7ebcb60d0d19832d5a570c4d7b35c5caac69f03a5a616536eff5a28d55ee",
-          "cuda": "0331a9c734fef91755fb4375a8efb7a22f5ace1c8620761f13d0186767d9783f"
+          "cpu": "7a5385ffb6e37c90b8252e9fc8a5be6121af2f7340df2a10422c5907abab6cb7",
+          "cuda": "a985b65f06aed70fbc3b54dee24117207fe61f1ea57131235ccb11df21c8a794"
         },
-        "max_abs": 3.5762786865234375e-07,
-        "rmse": 5.711798080316992e-08
+        "reference": "cpu",
+        "comparisons": {
+          "cuda": {
+            "max_abs": 9.238719940185547e-07,
+            "rmse": 7.128617699457073e-08
+          }
+        },
+        "max_abs": 9.238719940185547e-07,
+        "rmse": 7.128617699457073e-08
       },
       {
         "crop": 3,
         "sha256": {
-          "cpu": "b442116f08a6e4378ed2966964a048fd539f329b56da36cec3412ec4b0c17d31",
-          "cuda": "9f68b03e520c74728f45220027cb1686265f29686cb87b820cbd17f7eea113e8"
+          "cpu": "a8445a3d7bdf6f249019feec3cafed3122c439b9e5e82817ce1d468484d737ac",
+          "cuda": "4d1c60d991b64a148520747be0ec4044066f018de7deffcd44c92eadde23535b"
         },
-        "max_abs": 3.5762786865234375e-07,
-        "rmse": 3.704593671402622e-08
+        "reference": "cpu",
+        "comparisons": {
+          "cuda": {
+            "max_abs": 1.0132789611816406e-06,
+            "rmse": 4.903348028709348e-08
+          }
+        },
+        "max_abs": 1.0132789611816406e-06,
+        "rmse": 4.903348028709348e-08
       },
       {
         "crop": 4,
         "sha256": {
-          "cpu": "038c3cc84ee634ac1d285f3cfe4001f7b742a095f4683d239227f0fa9a35c3ef",
-          "cuda": "df2b0bd89b65e0eeb1821408ce0631eb574580ff045a8114af10d4f468be1d17"
+          "cpu": "055115356ce6c56fa2cac0e19e84298f0a2b4219b65da2fab0e57273bd6d7491",
+          "cuda": "663ac6bf71d0febac8b6ae182437bf4bfe5247735cdd2d10b6b802deaba0b45b"
         },
-        "max_abs": 3.5762786865234375e-07,
-        "rmse": 2.7777388802026476e-08
+        "reference": "cpu",
+        "comparisons": {
+          "cuda": {
+            "max_abs": 7.450580596923828e-07,
+            "rmse": 4.8592134978838387e-08
+          }
+        },
+        "max_abs": 7.450580596923828e-07,
+        "rmse": 4.8592134978838387e-08
       },
       {
         "crop": 5,
         "sha256": {
-          "cpu": "5584059871ad59ec2e11458cc01b27a71f87d50862d8bd3bb3c99732dfc6c50a",
-          "cuda": "fadca31b2d13c32338f16b5195f8f5bd81300e4cf9b8c0308503ade80e4b3e5b"
+          "cpu": "1582aeb3ebde48664da400b208fb3eebb9d56ed3103a3e7d431f552647745d91",
+          "cuda": "c197cb6eb8a157dc81ca3bed26fdaf973bee6c6c1b8485e8dc4bf6e8fd6f9851"
         },
-        "max_abs": 3.5762786865234375e-07,
-        "rmse": 2.9505569589031448e-08
+        "reference": "cpu",
+        "comparisons": {
+          "cuda": {
+            "max_abs": 7.748603820800781e-07,
+            "rmse": 4.876495007740333e-08
+          }
+        },
+        "max_abs": 7.748603820800781e-07,
+        "rmse": 4.876495007740333e-08
       }
     ],
-    "comparison": "CPU/CUDA allclose"
+    "comparison": "cpu/cuda allclose"
   },
   "results": {
     "cpu": {
       "timings": {
         "read_sample": {
-          "mean_ms": 15.124447666666667,
-          "p50_ms": 15.1991065,
-          "p95_ms": 19.100109149999998,
-          "min_ms": 9.547446,
-          "max_ms": 20.183262
+          "mean_ms": 14.036944866666666,
+          "p50_ms": 13.781264,
+          "p95_ms": 17.895336349999997,
+          "min_ms": 9.103068,
+          "max_ms": 19.485167
         },
         "normalization": {
-          "mean_ms": 5.236616166666668,
-          "p50_ms": 5.229801999999999,
-          "p95_ms": 5.3406935,
-          "min_ms": 5.120216,
-          "max_ms": 5.44274
+          "mean_ms": 2.6815801833333333,
+          "p50_ms": 2.6391090000000004,
+          "p95_ms": 2.9532618999999998,
+          "min_ms": 2.521789,
+          "max_ms": 3.265059
         },
         "augmentation": {
-          "mean_ms": 169.8531344,
-          "p50_ms": 169.9145385,
-          "p95_ms": 171.95111490000002,
-          "min_ms": 167.6191,
-          "max_ms": 173.14201
+          "mean_ms": 144.05073760000002,
+          "p50_ms": 144.0019985,
+          "p95_ms": 146.0459835,
+          "min_ms": 141.799114,
+          "max_ms": 147.176512
         },
         "download": {
           "mean_ms": 0.0,
@@ -258,11 +310,11 @@
           "max_ms": 0.0
         },
         "total": {
-          "mean_ms": 190.21454015000003,
-          "p50_ms": 189.965962,
-          "p95_ms": 195.15709090000001,
-          "min_ms": 184.119485,
-          "max_ms": 195.734093
+          "mean_ms": 160.76944243333335,
+          "p50_ms": 161.03553449999998,
+          "p95_ms": 164.6509394,
+          "min_ms": 153.986396,
+          "max_ms": 165.800141
         }
       },
       "samples": 60,
@@ -270,584 +322,584 @@
         {
           "repetition": 0,
           "crop": 0,
-          "read_sample": 11.687724,
-          "normalization": 5.319618,
-          "augmentation": 169.291806,
+          "read_sample": 13.513216,
+          "normalization": 2.604207,
+          "augmentation": 142.989721,
           "download": 0.0,
-          "total": 186.299495
+          "total": 159.107254
         },
         {
           "repetition": 0,
           "crop": 1,
-          "read_sample": 15.522749,
-          "normalization": 5.158466,
-          "augmentation": 169.985536,
+          "read_sample": 10.77154,
+          "normalization": 3.265059,
+          "augmentation": 141.799114,
           "download": 0.0,
-          "total": 190.66695
+          "total": 155.836065
         },
         {
           "repetition": 0,
           "crop": 2,
-          "read_sample": 17.388618,
-          "normalization": 5.161093,
-          "augmentation": 170.748156,
+          "read_sample": 15.644582,
+          "normalization": 2.667245,
+          "augmentation": 143.033225,
           "download": 0.0,
-          "total": 193.298316
+          "total": 161.345186
         },
         {
           "repetition": 0,
           "crop": 3,
-          "read_sample": 16.519706,
-          "normalization": 5.194982,
-          "augmentation": 173.14201,
+          "read_sample": 15.109276,
+          "normalization": 2.60708,
+          "augmentation": 144.996623,
           "download": 0.0,
-          "total": 194.856983
+          "total": 162.713092
         },
         {
           "repetition": 0,
           "crop": 4,
-          "read_sample": 11.060912,
-          "normalization": 5.33354,
-          "augmentation": 172.243884,
+          "read_sample": 11.154275,
+          "normalization": 2.71669,
+          "augmentation": 144.433704,
           "download": 0.0,
-          "total": 188.638587
+          "total": 158.305012
         },
         {
           "repetition": 0,
           "crop": 5,
-          "read_sample": 18.452967,
-          "normalization": 5.2677,
-          "augmentation": 171.470085,
+          "read_sample": 17.115898,
+          "normalization": 2.738612,
+          "augmentation": 144.711258,
           "download": 0.0,
-          "total": 195.190909
+          "total": 164.565882
         },
         {
           "repetition": 1,
           "crop": 0,
-          "read_sample": 15.959523,
-          "normalization": 5.273723,
-          "augmentation": 170.546687,
+          "read_sample": 10.216972,
+          "normalization": 2.621385,
+          "augmentation": 143.341013,
           "download": 0.0,
-          "total": 191.780197
+          "total": 156.179607
         },
         {
           "repetition": 1,
           "crop": 1,
-          "read_sample": 19.604581,
-          "normalization": 5.305267,
-          "augmentation": 170.215539,
+          "read_sample": 12.233892,
+          "normalization": 2.54113,
+          "augmentation": 143.400611,
           "download": 0.0,
-          "total": 195.125775
+          "total": 158.175802
         },
         {
           "repetition": 1,
           "crop": 2,
-          "read_sample": 19.788467,
-          "normalization": 5.310228,
-          "augmentation": 170.635124,
+          "read_sample": 13.144197,
+          "normalization": 2.556758,
+          "augmentation": 144.4448,
           "download": 0.0,
-          "total": 195.734093
+          "total": 160.145884
         },
         {
           "repetition": 1,
           "crop": 3,
-          "read_sample": 19.073558,
-          "normalization": 5.232191,
-          "augmentation": 169.242113,
+          "read_sample": 13.631916,
+          "normalization": 2.521789,
+          "augmentation": 143.226479,
           "download": 0.0,
-          "total": 193.54808
+          "total": 159.38037
         },
         {
           "repetition": 1,
           "crop": 4,
-          "read_sample": 17.968371,
-          "normalization": 5.268087,
-          "augmentation": 169.954066,
+          "read_sample": 11.810012,
+          "normalization": 2.643152,
+          "augmentation": 143.151065,
           "download": 0.0,
-          "total": 193.190892
+          "total": 157.604478
         },
         {
           "repetition": 1,
           "crop": 5,
-          "read_sample": 13.387272,
-          "normalization": 5.24652,
-          "augmentation": 168.895425,
+          "read_sample": 15.806849,
+          "normalization": 2.615945,
+          "augmentation": 142.747176,
           "download": 0.0,
-          "total": 187.52947
+          "total": 161.170132
         },
         {
           "repetition": 2,
           "crop": 0,
-          "read_sample": 13.952613,
-          "normalization": 5.292882,
-          "augmentation": 170.096648,
+          "read_sample": 10.766023,
+          "normalization": 2.671524,
+          "augmentation": 142.767484,
           "download": 0.0,
-          "total": 189.342524
+          "total": 156.205177
         },
         {
           "repetition": 2,
           "crop": 1,
-          "read_sample": 17.358998,
-          "normalization": 5.199358,
-          "augmentation": 169.384215,
+          "read_sample": 15.858857,
+          "normalization": 2.622304,
+          "augmentation": 142.4299,
           "download": 0.0,
-          "total": 191.942748
+          "total": 160.91121
         },
         {
           "repetition": 2,
           "crop": 2,
-          "read_sample": 17.47161,
-          "normalization": 5.268898,
-          "augmentation": 169.878881,
+          "read_sample": 19.485167,
+          "normalization": 2.581416,
+          "augmentation": 143.147356,
           "download": 0.0,
-          "total": 192.619579
+          "total": 165.214099
         },
         {
           "repetition": 2,
           "crop": 3,
-          "read_sample": 18.002515,
-          "normalization": 5.222915,
-          "augmentation": 167.75776,
+          "read_sample": 16.172404,
+          "normalization": 2.586639,
+          "augmentation": 143.800653,
           "download": 0.0,
-          "total": 190.98361
+          "total": 162.559791
         },
         {
           "repetition": 2,
           "crop": 4,
-          "read_sample": 15.682704,
-          "normalization": 5.16185,
-          "augmentation": 168.421416,
+          "read_sample": 14.926301,
+          "normalization": 2.942463,
+          "augmentation": 144.465854,
           "download": 0.0,
-          "total": 189.266471
+          "total": 162.334874
         },
         {
           "repetition": 2,
           "crop": 5,
-          "read_sample": 16.770753,
-          "normalization": 5.144542,
-          "augmentation": 168.20161,
+          "read_sample": 11.341845,
+          "normalization": 2.667491,
+          "augmentation": 146.391225,
           "download": 0.0,
-          "total": 190.117273
+          "total": 160.40067
         },
         {
           "repetition": 3,
           "crop": 0,
-          "read_sample": 9.547446,
-          "normalization": 5.299331,
-          "augmentation": 169.27244,
+          "read_sample": 15.836566,
+          "normalization": 2.952912,
+          "augmentation": 145.793331,
           "download": 0.0,
-          "total": 184.119485
+          "total": 164.582962
         },
         {
           "repetition": 3,
           "crop": 1,
-          "read_sample": 16.538859,
-          "normalization": 5.25141,
-          "augmentation": 169.457944,
+          "read_sample": 11.741669,
+          "normalization": 2.536603,
+          "augmentation": 142.729441,
           "download": 0.0,
-          "total": 191.24882
+          "total": 157.007946
         },
         {
           "repetition": 3,
           "crop": 2,
-          "read_sample": 16.321443,
-          "normalization": 5.308302,
-          "augmentation": 171.935706,
+          "read_sample": 15.710946,
+          "normalization": 2.597836,
+          "augmentation": 143.919612,
           "download": 0.0,
-          "total": 193.566132
+          "total": 162.228544
         },
         {
           "repetition": 3,
           "crop": 3,
-          "read_sample": 17.036151,
-          "normalization": 5.208113,
-          "augmentation": 171.107746,
+          "read_sample": 13.792723,
+          "normalization": 2.60397,
+          "augmentation": 142.42367,
           "download": 0.0,
-          "total": 193.352464
+          "total": 158.820531
         },
         {
           "repetition": 3,
           "crop": 4,
-          "read_sample": 14.138395,
-          "normalization": 5.264199,
-          "augmentation": 169.950196,
+          "read_sample": 13.769805,
+          "normalization": 2.738251,
+          "augmentation": 142.880712,
           "download": 0.0,
-          "total": 189.353226
+          "total": 159.388926
         },
         {
           "repetition": 3,
           "crop": 5,
-          "read_sample": 14.656393,
-          "normalization": 5.335006,
-          "augmentation": 168.69455,
+          "read_sample": 14.655125,
+          "normalization": 2.658219,
+          "augmentation": 145.218604,
           "download": 0.0,
-          "total": 188.686329
+          "total": 162.532102
         },
         {
           "repetition": 4,
           "crop": 0,
-          "read_sample": 15.250623,
-          "normalization": 5.318038,
-          "augmentation": 170.13341,
+          "read_sample": 9.553783,
+          "normalization": 2.723546,
+          "augmentation": 144.234,
           "download": 0.0,
-          "total": 190.702345
+          "total": 156.511602
         },
         {
           "repetition": 4,
           "crop": 1,
-          "read_sample": 11.959091,
-          "normalization": 5.142355,
-          "augmentation": 168.859361,
+          "read_sample": 14.897589,
+          "normalization": 2.573391,
+          "augmentation": 143.881533,
           "download": 0.0,
-          "total": 185.961131
+          "total": 161.352686
         },
         {
           "repetition": 4,
           "crop": 2,
-          "read_sample": 15.250503,
-          "normalization": 5.160338,
-          "augmentation": 169.403565,
+          "read_sample": 17.141779,
+          "normalization": 2.605212,
+          "augmentation": 142.621579,
           "download": 0.0,
-          "total": 189.814651
+          "total": 162.368656
         },
         {
           "repetition": 4,
           "crop": 3,
-          "read_sample": 19.039671,
-          "normalization": 5.194996,
-          "augmentation": 170.866093,
+          "read_sample": 17.882792,
+          "normalization": 2.600102,
+          "augmentation": 142.53208,
           "download": 0.0,
-          "total": 195.100864
+          "total": 163.015245
         },
         {
           "repetition": 4,
           "crop": 4,
-          "read_sample": 17.769129,
-          "normalization": 5.268624,
-          "augmentation": 172.349297,
+          "read_sample": 15.801907,
+          "normalization": 2.766544,
+          "augmentation": 143.412525,
           "download": 0.0,
-          "total": 195.387422
+          "total": 161.981218
         },
         {
           "repetition": 4,
           "crop": 5,
-          "read_sample": 13.989983,
-          "normalization": 5.232456,
-          "augmentation": 170.980568,
+          "read_sample": 15.133915,
+          "normalization": 3.115451,
+          "augmentation": 144.184476,
           "download": 0.0,
-          "total": 190.203324
+          "total": 162.434007
         },
         {
           "repetition": 5,
           "crop": 0,
-          "read_sample": 18.441792,
-          "normalization": 5.304783,
-          "augmentation": 171.405965,
+          "read_sample": 11.103307,
+          "normalization": 2.73888,
+          "augmentation": 144.188104,
           "download": 0.0,
-          "total": 195.152807
+          "total": 158.03048
         },
         {
           "repetition": 5,
           "crop": 1,
-          "read_sample": 13.866541,
-          "normalization": 5.164995,
-          "augmentation": 168.950796,
+          "read_sample": 16.201426,
+          "normalization": 2.75313,
+          "augmentation": 143.960752,
           "download": 0.0,
-          "total": 187.982721
+          "total": 162.915533
         },
         {
           "repetition": 5,
           "crop": 2,
-          "read_sample": 14.155831,
-          "normalization": 5.177218,
-          "augmentation": 168.512178,
+          "read_sample": 13.133122,
+          "normalization": 2.635066,
+          "augmentation": 145.286596,
           "download": 0.0,
-          "total": 187.845583
+          "total": 161.054952
         },
         {
           "repetition": 5,
           "crop": 3,
-          "read_sample": 18.568387,
-          "normalization": 5.176754,
-          "augmentation": 169.280546,
+          "read_sample": 13.191142,
+          "normalization": 2.632644,
+          "augmentation": 142.841597,
           "download": 0.0,
-          "total": 193.026094
+          "total": 158.665507
         },
         {
           "repetition": 5,
           "crop": 4,
-          "read_sample": 11.049161,
-          "normalization": 5.172696,
-          "augmentation": 168.965451,
+          "read_sample": 17.068857,
+          "normalization": 2.592593,
+          "augmentation": 143.734296,
           "download": 0.0,
-          "total": 185.187578
+          "total": 163.395867
         },
         {
           "repetition": 5,
           "crop": 5,
-          "read_sample": 14.684085,
-          "normalization": 5.370609,
-          "augmentation": 170.757874,
+          "read_sample": 15.798398,
+          "normalization": 2.670846,
+          "augmentation": 145.279228,
           "download": 0.0,
-          "total": 190.812834
+          "total": 163.748726
         },
         {
           "repetition": 6,
           "crop": 0,
-          "read_sample": 12.809597,
-          "normalization": 5.44274,
-          "augmentation": 168.891803,
+          "read_sample": 16.009035,
+          "normalization": 2.750537,
+          "augmentation": 145.86863,
           "download": 0.0,
-          "total": 187.144398
+          "total": 164.628433
         },
         {
           "repetition": 6,
           "crop": 1,
-          "read_sample": 13.818668,
-          "normalization": 5.203735,
-          "augmentation": 167.771486,
+          "read_sample": 14.081624,
+          "normalization": 2.566453,
+          "augmentation": 144.367973,
           "download": 0.0,
-          "total": 186.794169
+          "total": 161.016117
         },
         {
           "repetition": 6,
           "crop": 2,
-          "read_sample": 18.133723,
-          "normalization": 5.147042,
-          "augmentation": 167.76464,
+          "read_sample": 18.136283,
+          "normalization": 2.598678,
+          "augmentation": 144.343403,
           "download": 0.0,
-          "total": 191.045932
+          "total": 165.078561
         },
         {
           "repetition": 6,
           "crop": 3,
-          "read_sample": 12.975723,
-          "normalization": 5.311766,
-          "augmentation": 168.805706,
+          "read_sample": 13.537798,
+          "normalization": 2.601855,
+          "augmentation": 143.003738,
           "download": 0.0,
-          "total": 187.093585
+          "total": 159.14352
         },
         {
           "repetition": 6,
           "crop": 4,
-          "read_sample": 14.074441,
-          "normalization": 5.209246,
-          "augmentation": 170.144557,
+          "read_sample": 12.889949,
+          "normalization": 2.617257,
+          "augmentation": 144.275053,
           "download": 0.0,
-          "total": 189.428799
+          "total": 159.782435
         },
         {
           "repetition": 6,
           "crop": 5,
-          "read_sample": 13.97053,
-          "normalization": 5.267417,
-          "augmentation": 169.322476,
+          "read_sample": 11.376168,
+          "normalization": 2.65902,
+          "augmentation": 144.873847,
           "download": 0.0,
-          "total": 188.56103
+          "total": 158.909293
         },
         {
           "repetition": 7,
           "crop": 0,
-          "read_sample": 11.861325,
-          "normalization": 5.187192,
-          "augmentation": 168.385812,
+          "read_sample": 15.239394,
+          "normalization": 2.95991,
+          "augmentation": 145.813109,
           "download": 0.0,
-          "total": 185.434791
+          "total": 164.012607
         },
         {
           "repetition": 7,
           "crop": 1,
-          "read_sample": 12.024871,
-          "normalization": 5.150141,
-          "augmentation": 168.32303,
+          "read_sample": 11.754171,
+          "normalization": 2.672174,
+          "augmentation": 146.356662,
           "download": 0.0,
-          "total": 185.498293
+          "total": 160.783188
         },
         {
           "repetition": 7,
           "crop": 2,
-          "read_sample": 20.183262,
-          "normalization": 5.203572,
-          "augmentation": 169.768048,
+          "read_sample": 12.580311,
+          "normalization": 2.682699,
+          "augmentation": 146.005229,
           "download": 0.0,
-          "total": 195.155311
+          "total": 161.26851
         },
         {
           "repetition": 7,
           "crop": 3,
-          "read_sample": 13.077791,
-          "normalization": 5.134367,
-          "augmentation": 170.146018,
+          "read_sample": 18.133679,
+          "normalization": 2.630542,
+          "augmentation": 145.035721,
           "download": 0.0,
-          "total": 188.358527
+          "total": 165.800141
         },
         {
           "repetition": 7,
           "crop": 4,
-          "read_sample": 10.781921,
-          "normalization": 5.339119,
-          "augmentation": 170.084885,
+          "read_sample": 13.138316,
+          "normalization": 2.869596,
+          "augmentation": 144.191031,
           "download": 0.0,
-          "total": 186.206094
+          "total": 160.199392
         },
         {
           "repetition": 7,
           "crop": 5,
-          "read_sample": 11.063866,
-          "normalization": 5.248338,
-          "augmentation": 170.380657,
+          "read_sample": 12.941024,
+          "normalization": 2.727985,
+          "augmentation": 143.631737,
           "download": 0.0,
-          "total": 186.693247
+          "total": 159.300857
         },
         {
           "repetition": 8,
           "crop": 0,
-          "read_sample": 12.607362,
-          "normalization": 5.197136,
-          "augmentation": 170.64457,
+          "read_sample": 9.103068,
+          "normalization": 2.665399,
+          "augmentation": 142.217639,
           "download": 0.0,
-          "total": 188.449241
+          "total": 153.986396
         },
         {
           "repetition": 8,
           "crop": 1,
-          "read_sample": 11.336836,
-          "normalization": 5.439457,
-          "augmentation": 169.371192,
+          "read_sample": 14.528034,
+          "normalization": 2.618501,
+          "augmentation": 143.737792,
           "download": 0.0,
-          "total": 186.147902
+          "total": 160.884494
         },
         {
           "repetition": 8,
           "crop": 2,
-          "read_sample": 16.910161,
-          "normalization": 5.243419,
-          "augmentation": 170.877401,
+          "read_sample": 12.227552,
+          "normalization": 2.592924,
+          "augmentation": 142.240495,
           "download": 0.0,
-          "total": 193.031265
+          "total": 157.06117
         },
         {
           "repetition": 8,
           "crop": 3,
-          "read_sample": 17.395097,
-          "normalization": 5.228707,
-          "augmentation": 171.327438,
+          "read_sample": 16.83396,
+          "normalization": 2.59676,
+          "augmentation": 142.80003,
           "download": 0.0,
-          "total": 193.951413
+          "total": 162.230824
         },
         {
           "repetition": 8,
           "crop": 4,
-          "read_sample": 11.609199,
-          "normalization": 5.20429,
-          "augmentation": 168.752109,
+          "read_sample": 12.417974,
+          "normalization": 2.661334,
+          "augmentation": 144.043245,
           "download": 0.0,
-          "total": 185.565882
+          "total": 159.122602
         },
         {
           "repetition": 8,
           "crop": 5,
-          "read_sample": 18.582414,
-          "normalization": 5.195234,
-          "augmentation": 169.863419,
+          "read_sample": 13.066504,
+          "normalization": 2.652655,
+          "augmentation": 144.388458,
           "download": 0.0,
-          "total": 193.641564
+          "total": 160.107725
         },
         {
           "repetition": 9,
           "crop": 0,
-          "read_sample": 14.591077,
-          "normalization": 5.162183,
-          "augmentation": 169.123398,
+          "read_sample": 12.513717,
+          "normalization": 2.705962,
+          "augmentation": 146.029632,
           "download": 0.0,
-          "total": 188.877023
+          "total": 161.249564
         },
         {
           "repetition": 9,
           "crop": 1,
-          "read_sample": 16.731628,
-          "normalization": 5.184971,
-          "augmentation": 170.251573,
+          "read_sample": 11.828615,
+          "normalization": 2.594741,
+          "augmentation": 145.485983,
           "download": 0.0,
-          "total": 192.168383
+          "total": 159.909448
         },
         {
           "repetition": 9,
           "crop": 2,
-          "read_sample": 17.102301,
-          "normalization": 5.230897,
-          "augmentation": 171.065657,
+          "read_sample": 12.825614,
+          "normalization": 2.578353,
+          "augmentation": 147.176512,
           "download": 0.0,
-          "total": 193.399246
+          "total": 162.580595
         },
         {
           "repetition": 9,
           "crop": 3,
-          "read_sample": 11.982668,
-          "normalization": 5.120216,
-          "augmentation": 170.996417,
+          "read_sample": 15.973453,
+          "normalization": 2.581344,
+          "augmentation": 145.276646,
           "download": 0.0,
-          "total": 188.099724
+          "total": 163.831559
         },
         {
           "repetition": 9,
           "crop": 4,
-          "read_sample": 10.777564,
-          "normalization": 5.279168,
-          "augmentation": 170.512025,
+          "read_sample": 14.12082,
+          "normalization": 2.78018,
+          "augmentation": 144.721859,
           "download": 0.0,
-          "total": 186.569126
+          "total": 161.622974
         },
         {
           "repetition": 9,
           "crop": 5,
-          "read_sample": 15.14771,
-          "normalization": 5.154534,
-          "augmentation": 167.6191,
+          "read_sample": 15.841556,
+          "normalization": 2.863867,
+          "augmentation": 142.760435,
           "download": 0.0,
-          "total": 187.921702
+          "total": 161.466066
         }
       ],
-      "crops_per_second": 5.257221657247741,
-      "mvoxels_per_second": 11.025192912940415,
-      "output_gib_per_second": 0.04107204419724798
+      "crops_per_second": 6.220087504593247,
+      "mvoxels_per_second": 13.044468950432737,
+      "output_gib_per_second": 0.04859443362963474
     },
     "cuda": {
       "timings": {
         "read_sample": {
-          "mean_ms": 1.1040537333333336,
-          "p50_ms": 1.076114,
-          "p95_ms": 1.33302335,
-          "min_ms": 0.884526,
-          "max_ms": 1.739057
+          "mean_ms": 1.1756940833333331,
+          "p50_ms": 1.168292,
+          "p95_ms": 1.4044476499999998,
+          "min_ms": 0.894042,
+          "max_ms": 1.677966
         },
         "normalization": {
-          "mean_ms": 0.13827885,
-          "p50_ms": 0.1358665,
-          "p95_ms": 0.14243385,
-          "min_ms": 0.114657,
-          "max_ms": 0.338186
+          "mean_ms": 0.125965,
+          "p50_ms": 0.122867,
+          "p95_ms": 0.1560773,
+          "min_ms": 0.089327,
+          "max_ms": 0.225481
         },
         "augmentation": {
-          "mean_ms": 3.14986275,
-          "p50_ms": 3.11545,
-          "p95_ms": 3.3724969,
-          "min_ms": 3.093634,
-          "max_ms": 3.793253
+          "mean_ms": 1.4048290833333332,
+          "p50_ms": 1.3530790000000001,
+          "p95_ms": 1.7026480499999994,
+          "min_ms": 1.312064,
+          "max_ms": 1.938836
         },
         "download": {
-          "mean_ms": 0.5429788,
-          "p50_ms": 0.528635,
-          "p95_ms": 0.5878318499999996,
-          "min_ms": 0.503903,
-          "max_ms": 0.886066
+          "mean_ms": 0.5505146500000001,
+          "p50_ms": 0.5367885,
+          "p95_ms": 0.6316366,
+          "min_ms": 0.506319,
+          "max_ms": 0.803649
         },
         "total": {
-          "mean_ms": 4.935174133333334,
-          "p50_ms": 4.881335,
-          "p95_ms": 5.3742988,
-          "min_ms": 4.64309,
-          "max_ms": 5.643712
+          "mean_ms": 3.257002816666666,
+          "p50_ms": 3.177136,
+          "p95_ms": 3.8967198,
+          "min_ms": 2.901117,
+          "max_ms": 4.048013
         }
       },
       "samples": 60,
@@ -855,547 +907,547 @@
         {
           "repetition": 0,
           "crop": 0,
-          "read_sample": 1.435887,
-          "normalization": 0.140642,
-          "augmentation": 3.135764,
-          "download": 0.51361,
-          "total": 5.225903
+          "read_sample": 1.147182,
+          "normalization": 0.120368,
+          "augmentation": 1.350761,
+          "download": 0.529052,
+          "total": 3.147363
         },
         {
           "repetition": 0,
           "crop": 1,
-          "read_sample": 0.977372,
-          "normalization": 0.134341,
-          "augmentation": 3.124425,
-          "download": 0.527945,
-          "total": 4.764083
+          "read_sample": 0.989357,
+          "normalization": 0.119909,
+          "augmentation": 1.336687,
+          "download": 0.522647,
+          "total": 2.9686
         },
         {
           "repetition": 0,
           "crop": 2,
-          "read_sample": 1.235651,
-          "normalization": 0.136855,
-          "augmentation": 3.122819,
-          "download": 0.53259,
-          "total": 5.027915
+          "read_sample": 1.173343,
+          "normalization": 0.127013,
+          "augmentation": 1.356244,
+          "download": 0.535956,
+          "total": 3.192556
         },
         {
           "repetition": 0,
           "crop": 3,
-          "read_sample": 0.981098,
-          "normalization": 0.133139,
-          "augmentation": 3.365745,
-          "download": 0.886066,
-          "total": 5.366048
+          "read_sample": 1.190763,
+          "normalization": 0.1559,
+          "augmentation": 1.916169,
+          "download": 0.633244,
+          "total": 3.896076
         },
         {
           "repetition": 0,
           "crop": 4,
-          "read_sample": 1.202271,
-          "normalization": 0.138265,
-          "augmentation": 3.107801,
-          "download": 0.52436,
-          "total": 4.972697
+          "read_sample": 1.351161,
+          "normalization": 0.126464,
+          "augmentation": 1.938836,
+          "download": 0.631552,
+          "total": 4.048013
         },
         {
           "repetition": 0,
           "crop": 5,
-          "read_sample": 1.060388,
-          "normalization": 0.136032,
-          "augmentation": 3.113337,
-          "download": 0.516436,
-          "total": 4.826193
+          "read_sample": 1.473012,
+          "normalization": 0.225481,
+          "augmentation": 1.599444,
+          "download": 0.611015,
+          "total": 3.908952
         },
         {
           "repetition": 1,
           "crop": 0,
-          "read_sample": 1.236045,
-          "normalization": 0.115982,
-          "augmentation": 3.115572,
-          "download": 0.556575,
-          "total": 5.024174
+          "read_sample": 0.970752,
+          "normalization": 0.089327,
+          "augmentation": 1.315337,
+          "download": 0.525701,
+          "total": 2.901117
         },
         {
           "repetition": 1,
           "crop": 1,
-          "read_sample": 1.165938,
-          "normalization": 0.139446,
-          "augmentation": 3.12584,
-          "download": 0.526827,
-          "total": 4.958051
+          "read_sample": 0.963037,
+          "normalization": 0.123374,
+          "augmentation": 1.359318,
+          "download": 0.525211,
+          "total": 2.97094
         },
         {
           "repetition": 1,
           "crop": 2,
-          "read_sample": 1.174071,
-          "normalization": 0.134185,
-          "augmentation": 3.127176,
-          "download": 0.520062,
-          "total": 4.955494
+          "read_sample": 1.31676,
+          "normalization": 0.121296,
+          "augmentation": 1.353978,
+          "download": 0.514838,
+          "total": 3.306872
         },
         {
           "repetition": 1,
           "crop": 3,
-          "read_sample": 1.048688,
-          "normalization": 0.136413,
-          "augmentation": 3.116909,
-          "download": 0.581938,
-          "total": 4.883948
+          "read_sample": 1.119971,
+          "normalization": 0.120452,
+          "augmentation": 1.338262,
+          "download": 0.537769,
+          "total": 3.116454
         },
         {
           "repetition": 1,
           "crop": 4,
-          "read_sample": 1.094311,
-          "normalization": 0.139177,
-          "augmentation": 3.116922,
-          "download": 0.528312,
-          "total": 4.878722
+          "read_sample": 1.289718,
+          "normalization": 0.12387,
+          "augmentation": 1.363845,
+          "download": 0.537621,
+          "total": 3.315054
         },
         {
           "repetition": 1,
           "crop": 5,
-          "read_sample": 1.189869,
-          "normalization": 0.138914,
-          "augmentation": 3.132341,
-          "download": 0.512169,
-          "total": 4.973293
+          "read_sample": 1.20416,
+          "normalization": 0.12549,
+          "augmentation": 1.34839,
+          "download": 0.521818,
+          "total": 3.199858
         },
         {
           "repetition": 2,
           "crop": 0,
-          "read_sample": 1.207488,
-          "normalization": 0.133513,
-          "augmentation": 3.10274,
-          "download": 0.528958,
-          "total": 4.972699
+          "read_sample": 1.677966,
+          "normalization": 0.127818,
+          "augmentation": 1.34945,
+          "download": 0.516114,
+          "total": 3.671348
         },
         {
           "repetition": 2,
           "crop": 1,
-          "read_sample": 0.959703,
-          "normalization": 0.135947,
-          "augmentation": 3.106344,
-          "download": 0.535099,
-          "total": 4.737093
+          "read_sample": 0.998805,
+          "normalization": 0.120127,
+          "augmentation": 1.341814,
+          "download": 0.519003,
+          "total": 2.979749
         },
         {
           "repetition": 2,
           "crop": 2,
-          "read_sample": 1.080701,
-          "normalization": 0.137218,
-          "augmentation": 3.129642,
-          "download": 0.520649,
-          "total": 4.86821
+          "read_sample": 1.364109,
+          "normalization": 0.122523,
+          "augmentation": 1.357425,
+          "download": 0.523301,
+          "total": 3.367358
         },
         {
           "repetition": 2,
           "crop": 3,
-          "read_sample": 1.180425,
-          "normalization": 0.138751,
-          "augmentation": 3.131335,
-          "download": 0.526324,
-          "total": 4.976835
+          "read_sample": 1.207405,
+          "normalization": 0.124779,
+          "augmentation": 1.352549,
+          "download": 0.553493,
+          "total": 3.238226
         },
         {
           "repetition": 2,
           "crop": 4,
-          "read_sample": 1.289854,
-          "normalization": 0.141657,
-          "augmentation": 3.141239,
-          "download": 0.530756,
-          "total": 5.103506
+          "read_sample": 1.143213,
+          "normalization": 0.126927,
+          "augmentation": 1.354939,
+          "download": 0.583726,
+          "total": 3.208805
         },
         {
           "repetition": 2,
           "crop": 5,
-          "read_sample": 1.154115,
-          "normalization": 0.133758,
-          "augmentation": 3.111069,
-          "download": 0.51673,
-          "total": 4.915672
+          "read_sample": 1.106199,
+          "normalization": 0.122755,
+          "augmentation": 1.33949,
+          "download": 0.563483,
+          "total": 3.131927
         },
         {
           "repetition": 3,
           "crop": 0,
-          "read_sample": 1.225957,
-          "normalization": 0.117303,
-          "augmentation": 3.114087,
-          "download": 0.503903,
-          "total": 4.96125
+          "read_sample": 1.170161,
+          "normalization": 0.096965,
+          "augmentation": 1.333443,
+          "download": 0.546235,
+          "total": 3.146804
         },
         {
           "repetition": 3,
           "crop": 1,
-          "read_sample": 0.942142,
-          "normalization": 0.134695,
-          "augmentation": 3.108016,
-          "download": 0.530553,
-          "total": 4.715406
+          "read_sample": 1.09781,
+          "normalization": 0.122099,
+          "augmentation": 1.339195,
+          "download": 0.524674,
+          "total": 3.083778
         },
         {
           "repetition": 3,
           "crop": 2,
-          "read_sample": 1.277314,
-          "normalization": 0.136859,
-          "augmentation": 3.115328,
-          "download": 0.538725,
-          "total": 5.068226
+          "read_sample": 1.177162,
+          "normalization": 0.12525,
+          "augmentation": 1.361731,
+          "download": 0.517082,
+          "total": 3.181225
         },
         {
           "repetition": 3,
           "crop": 3,
-          "read_sample": 1.275366,
-          "normalization": 0.13609,
-          "augmentation": 3.117334,
-          "download": 0.550036,
-          "total": 5.078826
+          "read_sample": 0.930616,
+          "normalization": 0.118827,
+          "augmentation": 1.33477,
+          "download": 0.521807,
+          "total": 2.90602
         },
         {
           "repetition": 3,
           "crop": 4,
-          "read_sample": 0.991934,
-          "normalization": 0.134084,
-          "augmentation": 3.114587,
-          "download": 0.533979,
-          "total": 4.774584
+          "read_sample": 1.128568,
+          "normalization": 0.123498,
+          "augmentation": 1.357734,
+          "download": 0.528366,
+          "total": 3.138166
         },
         {
           "repetition": 3,
           "crop": 5,
-          "read_sample": 0.964202,
-          "normalization": 0.134816,
-          "augmentation": 3.097492,
-          "download": 0.530161,
-          "total": 4.726671
+          "read_sample": 1.138019,
+          "normalization": 0.127122,
+          "augmentation": 1.693452,
+          "download": 0.539762,
+          "total": 3.498355
         },
         {
           "repetition": 4,
           "crop": 0,
-          "read_sample": 1.141496,
-          "normalization": 0.133857,
-          "augmentation": 3.111577,
-          "download": 0.518643,
-          "total": 4.905573
+          "read_sample": 1.483359,
+          "normalization": 0.12061,
+          "augmentation": 1.354891,
+          "download": 0.533587,
+          "total": 3.492447
         },
         {
           "repetition": 4,
           "crop": 1,
-          "read_sample": 1.192232,
-          "normalization": 0.338186,
-          "augmentation": 3.490702,
-          "download": 0.514631,
-          "total": 5.535751
+          "read_sample": 1.220522,
+          "normalization": 0.127925,
+          "augmentation": 1.360101,
+          "download": 0.54445,
+          "total": 3.252998
         },
         {
           "repetition": 4,
           "crop": 2,
-          "read_sample": 1.130338,
-          "normalization": 0.134082,
-          "augmentation": 3.114913,
-          "download": 0.542002,
-          "total": 4.921335
+          "read_sample": 1.296811,
+          "normalization": 0.122453,
+          "augmentation": 1.352724,
+          "download": 0.521158,
+          "total": 3.293146
         },
         {
           "repetition": 4,
           "crop": 3,
-          "read_sample": 1.071527,
-          "normalization": 0.133386,
-          "augmentation": 3.111917,
-          "download": 0.54336,
-          "total": 4.86019
+          "read_sample": 1.163919,
+          "normalization": 0.123531,
+          "augmentation": 1.347282,
+          "download": 0.519696,
+          "total": 3.154428
         },
         {
           "repetition": 4,
           "crop": 4,
-          "read_sample": 1.030598,
-          "normalization": 0.135786,
-          "augmentation": 3.114978,
-          "download": 0.547147,
-          "total": 4.828509
+          "read_sample": 1.171268,
+          "normalization": 0.129832,
+          "augmentation": 1.355319,
+          "download": 0.516628,
+          "total": 3.173047
         },
         {
           "repetition": 4,
           "crop": 5,
-          "read_sample": 1.081396,
-          "normalization": 0.136468,
-          "augmentation": 3.122873,
-          "download": 0.547707,
-          "total": 4.888444
+          "read_sample": 1.30603,
+          "normalization": 0.140279,
+          "augmentation": 1.65556,
+          "download": 0.620216,
+          "total": 3.722085
         },
         {
           "repetition": 5,
           "crop": 0,
-          "read_sample": 1.371904,
-          "normalization": 0.118458,
-          "augmentation": 3.118533,
-          "download": 0.537697,
-          "total": 5.146592
+          "read_sample": 1.124011,
+          "normalization": 0.097446,
+          "augmentation": 1.337726,
+          "download": 0.533526,
+          "total": 3.092709
         },
         {
           "repetition": 5,
           "crop": 1,
-          "read_sample": 1.061623,
-          "normalization": 0.136641,
-          "augmentation": 3.105306,
-          "download": 0.551068,
-          "total": 4.854638
+          "read_sample": 0.930721,
+          "normalization": 0.120542,
+          "augmentation": 1.347675,
+          "download": 0.533726,
+          "total": 2.932664
         },
         {
           "repetition": 5,
           "crop": 2,
-          "read_sample": 0.947283,
-          "normalization": 0.131751,
-          "augmentation": 3.103761,
-          "download": 0.521979,
-          "total": 4.704774
+          "read_sample": 1.307686,
+          "normalization": 0.12206,
+          "augmentation": 1.350951,
+          "download": 0.522917,
+          "total": 3.303614
         },
         {
           "repetition": 5,
           "crop": 3,
-          "read_sample": 1.024191,
-          "normalization": 0.143172,
-          "augmentation": 3.10959,
-          "download": 0.52467,
-          "total": 4.801623
+          "read_sample": 0.967087,
+          "normalization": 0.12523,
+          "augmentation": 1.340595,
+          "download": 0.524036,
+          "total": 2.956948
         },
         {
           "repetition": 5,
           "crop": 4,
-          "read_sample": 0.976376,
-          "normalization": 0.139009,
-          "augmentation": 3.095514,
-          "download": 0.512914,
-          "total": 4.723813
+          "read_sample": 1.361905,
+          "normalization": 0.121496,
+          "augmentation": 1.355549,
+          "download": 0.514593,
+          "total": 3.353543
         },
         {
           "repetition": 5,
           "crop": 5,
-          "read_sample": 0.994513,
-          "normalization": 0.140831,
-          "augmentation": 3.12152,
-          "download": 0.548393,
-          "total": 4.805257
+          "read_sample": 0.953394,
+          "normalization": 0.120765,
+          "augmentation": 1.345384,
+          "download": 0.532563,
+          "total": 2.952106
         },
         {
           "repetition": 6,
           "crop": 0,
-          "read_sample": 1.330977,
-          "normalization": 0.147898,
-          "augmentation": 3.341602,
-          "download": 0.525059,
-          "total": 5.345536
+          "read_sample": 1.20142,
+          "normalization": 0.122841,
+          "augmentation": 1.342849,
+          "download": 0.528937,
+          "total": 3.196047
         },
         {
           "repetition": 6,
           "crop": 1,
-          "read_sample": 0.948211,
-          "normalization": 0.134806,
-          "augmentation": 3.105747,
-          "download": 0.528099,
-          "total": 4.716863
+          "read_sample": 1.009658,
+          "normalization": 0.120224,
+          "augmentation": 1.361638,
+          "download": 0.564255,
+          "total": 3.055775
         },
         {
           "repetition": 6,
           "crop": 2,
-          "read_sample": 0.939974,
-          "normalization": 0.13436,
-          "augmentation": 3.118563,
-          "download": 0.522674,
-          "total": 4.715571
+          "read_sample": 1.284458,
+          "normalization": 0.120764,
+          "augmentation": 1.42594,
+          "download": 0.578101,
+          "total": 3.409263
         },
         {
           "repetition": 6,
           "crop": 3,
-          "read_sample": 1.165916,
-          "normalization": 0.134342,
-          "augmentation": 3.108437,
-          "download": 0.51777,
-          "total": 4.926465
+          "read_sample": 1.166423,
+          "normalization": 0.124991,
+          "augmentation": 1.353434,
+          "download": 0.517967,
+          "total": 3.162815
         },
         {
           "repetition": 6,
           "crop": 4,
-          "read_sample": 0.983709,
-          "normalization": 0.134737,
-          "augmentation": 3.11617,
-          "download": 0.543038,
-          "total": 4.777654
+          "read_sample": 1.141518,
+          "normalization": 0.117723,
+          "augmentation": 1.334456,
+          "download": 0.534389,
+          "total": 3.128086
         },
         {
           "repetition": 6,
           "crop": 5,
-          "read_sample": 1.212591,
-          "normalization": 0.139579,
-          "augmentation": 3.368039,
-          "download": 0.573417,
-          "total": 5.293626
+          "read_sample": 1.067563,
+          "normalization": 0.120655,
+          "augmentation": 1.346964,
+          "download": 0.550028,
+          "total": 3.08521
         },
         {
           "repetition": 7,
           "crop": 0,
-          "read_sample": 1.000176,
-          "normalization": 0.114657,
-          "augmentation": 3.104889,
-          "download": 0.505979,
-          "total": 4.725701
+          "read_sample": 1.058268,
+          "normalization": 0.090002,
+          "augmentation": 1.312064,
+          "download": 0.528988,
+          "total": 2.989322
         },
         {
           "repetition": 7,
           "crop": 1,
-          "read_sample": 0.997722,
-          "normalization": 0.137059,
-          "augmentation": 3.793253,
-          "download": 0.715678,
-          "total": 5.643712
+          "read_sample": 0.894042,
+          "normalization": 0.11986,
+          "augmentation": 1.336931,
+          "download": 0.560642,
+          "total": 2.911475
         },
         {
           "repetition": 7,
           "crop": 2,
-          "read_sample": 1.030991,
-          "normalization": 0.136679,
-          "augmentation": 3.105317,
-          "download": 0.517468,
-          "total": 4.790455
+          "read_sample": 1.126811,
+          "normalization": 0.125929,
+          "augmentation": 1.354313,
+          "download": 0.552197,
+          "total": 3.15925
         },
         {
           "repetition": 7,
           "crop": 3,
-          "read_sample": 1.064789,
-          "normalization": 0.137401,
-          "augmentation": 3.110171,
-          "download": 0.52058,
-          "total": 4.832941
+          "read_sample": 0.989132,
+          "normalization": 0.120461,
+          "augmentation": 1.330949,
+          "download": 0.570834,
+          "total": 3.011376
         },
         {
           "repetition": 7,
           "crop": 4,
-          "read_sample": 1.081665,
-          "normalization": 0.137219,
-          "augmentation": 3.110675,
-          "download": 0.539196,
-          "total": 4.868755
+          "read_sample": 1.011256,
+          "normalization": 0.12251,
+          "augmentation": 1.359269,
+          "download": 0.54931,
+          "total": 3.042345
         },
         {
           "repetition": 7,
           "crop": 5,
-          "read_sample": 0.884526,
-          "normalization": 0.132877,
-          "augmentation": 3.103009,
-          "download": 0.522678,
-          "total": 4.64309
+          "read_sample": 1.254228,
+          "normalization": 0.131256,
+          "augmentation": 1.354313,
+          "download": 0.568477,
+          "total": 3.308274
         },
         {
           "repetition": 8,
           "crop": 0,
-          "read_sample": 1.203213,
-          "normalization": 0.138437,
-          "augmentation": 3.107591,
-          "download": 0.519648,
-          "total": 4.968889
+          "read_sample": 1.381384,
+          "normalization": 0.124386,
+          "augmentation": 1.877373,
+          "download": 0.54954,
+          "total": 3.932683
         },
         {
           "repetition": 8,
           "crop": 1,
-          "read_sample": 1.124679,
-          "normalization": 0.133308,
-          "augmentation": 3.116265,
-          "download": 0.521947,
-          "total": 4.896199
+          "read_sample": 1.154478,
+          "normalization": 0.125641,
+          "augmentation": 1.348336,
+          "download": 0.506319,
+          "total": 3.134774
         },
         {
           "repetition": 8,
           "crop": 2,
-          "read_sample": 1.739057,
-          "normalization": 0.140929,
-          "augmentation": 3.119177,
-          "download": 0.531901,
-          "total": 5.531064
+          "read_sample": 1.354483,
+          "normalization": 0.123359,
+          "augmentation": 1.36137,
+          "download": 0.528308,
+          "total": 3.36752
         },
         {
           "repetition": 8,
           "crop": 3,
-          "read_sample": 1.022126,
-          "normalization": 0.142395,
-          "augmentation": 3.457197,
-          "download": 0.699815,
-          "total": 5.321533
+          "read_sample": 0.988322,
+          "normalization": 0.11858,
+          "augmentation": 1.336951,
+          "download": 0.543067,
+          "total": 2.98692
         },
         {
           "repetition": 8,
           "crop": 4,
-          "read_sample": 1.009977,
-          "normalization": 0.134797,
-          "augmentation": 3.093634,
-          "download": 0.55799,
-          "total": 4.796398
+          "read_sample": 1.367268,
+          "normalization": 0.125962,
+          "augmentation": 1.372725,
+          "download": 0.539431,
+          "total": 3.405386
         },
         {
           "repetition": 8,
           "crop": 5,
-          "read_sample": 0.93975,
-          "normalization": 0.132778,
-          "augmentation": 3.101507,
-          "download": 0.516703,
-          "total": 4.690738
+          "read_sample": 1.207312,
+          "normalization": 0.217787,
+          "augmentation": 1.586531,
+          "download": 0.67546,
+          "total": 3.68709
         },
         {
           "repetition": 9,
           "crop": 0,
-          "read_sample": 1.093892,
-          "normalization": 0.11545,
-          "augmentation": 3.121361,
-          "download": 0.522669,
-          "total": 4.853372
+          "read_sample": 1.400839,
+          "normalization": 0.159446,
+          "augmentation": 1.343096,
+          "download": 0.546283,
+          "total": 3.449664
         },
         {
           "repetition": 9,
           "crop": 1,
-          "read_sample": 0.910232,
-          "normalization": 0.132218,
-          "augmentation": 3.094621,
-          "download": 0.536029,
-          "total": 4.6731
+          "read_sample": 0.98888,
+          "normalization": 0.122279,
+          "augmentation": 1.346618,
+          "download": 0.566384,
+          "total": 3.024161
         },
         {
           "repetition": 9,
           "crop": 2,
-          "read_sample": 1.03274,
-          "normalization": 0.135142,
-          "augmentation": 3.123396,
-          "download": 0.541775,
-          "total": 4.833053
+          "read_sample": 1.319853,
+          "normalization": 0.122893,
+          "augmentation": 1.529338,
+          "download": 0.57233,
+          "total": 3.544414
         },
         {
           "repetition": 9,
           "crop": 3,
-          "read_sample": 1.051897,
-          "normalization": 0.139046,
-          "augmentation": 3.11943,
-          "download": 0.5505,
-          "total": 4.860873
+          "read_sample": 1.216639,
+          "normalization": 0.11933,
+          "augmentation": 1.331412,
+          "download": 0.569104,
+          "total": 3.236485
         },
         {
           "repetition": 9,
           "crop": 4,
-          "read_sample": 0.963301,
-          "normalization": 0.135782,
-          "augmentation": 3.123826,
-          "download": 0.542358,
-          "total": 4.765267
+          "read_sample": 1.106363,
+          "normalization": 0.123411,
+          "augmentation": 1.368285,
+          "download": 0.546313,
+          "total": 3.144372
         },
         {
           "repetition": 9,
           "crop": 5,
-          "read_sample": 1.136846,
-          "normalization": 0.135126,
-          "augmentation": 3.11284,
-          "download": 0.522783,
-          "total": 4.907595
+          "read_sample": 1.235085,
+          "normalization": 0.127807,
+          "augmentation": 1.67757,
+          "download": 0.803649,
+          "total": 3.844111
         }
       ],
-      "crops_per_second": 202.62709541407332,
-      "mvoxels_per_second": 424.9398184018147,
-      "output_gib_per_second": 1.5830241829224478
+      "crops_per_second": 307.0307446106037,
+      "mvoxels_per_second": 643.8901401216167,
+      "output_gib_per_second": 2.398677692270341
     }
   },
   "input": {
@@ -1508,9 +1560,9 @@
     }
   },
   "speedup_cpu_over_cuda": {
-    "read_sample": 14.124067245663563,
-    "normalization": 38.49221110428251,
-    "augmentation": 54.53932449565873,
-    "total": 38.91680493143781
+    "read_sample": 11.796078377665857,
+    "normalization": 21.479396420519752,
+    "augmentation": 106.42541824978439,
+    "total": 50.6857542453329
   }
 }

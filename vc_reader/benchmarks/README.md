@@ -3,19 +3,28 @@
 Usage, methodology, and full results for the [package benchmark summary](../README.md#performance).
 Run all commands below from the package root (`vc_reader/`).
 
+Current results were refreshed **2026-10-17** at `0fd629ebd`, with the same
+Release extensions for every suite. The [refresh manifest](../docs/benchmarks/refresh.json)
+records report hashes and coverage. Current results are in the PyTorch, resident
+geometry, augmentation catalog, and reader/pipeline sections. The two optimization
+history sections are explicitly marked historical and retain their original data.
+
+
 ## PyTorch CUDA batches
 
 `bench_torch.py` measures GPU-ready batches using the same image data and
-per-sample seeds across four routes:
+per-sample seeds across three routes:
 
 - `serial`: ordinary `DataLoader(num_workers=0)` with per-sample CUDA processing.
-- `prototype`: the earlier async native batch prototype, with fixed-shape,
-  PyTorch-owned output buffers and four CPU loader workers by default.
 - `batch`: the public `Pipeline.batch()` API after the CPU loader.
 - `prefetch`: the public `CudaLoader` wrapper, with one batch queued ahead.
 
-The chain is min-max normalization, elastic deformation, median filtering,
-flipping, and gamma. All routes end with stacked CUDA tensors. Uploads, GPU
+The chain is min-max normalization followed by the same 12 augmentations, with
+identical parameters and order, as the [single-crop benchmark](#single-crop-latency-12-augmentations-cpu-output).
+Both harnesses use `heavy_transforms()` from `bench_pipeline.py` to keep the
+recipe consistent. The loader uses one combined pipeline with `compact=False`;
+the single-crop benchmark separates normalization to measure its stage cost.
+All routes end with stacked CUDA tensors. Uploads, GPU
 casts, reading, augmentation, collation, and output disposal are included in
 epoch throughput. Batch latency measures `next()` through completion on the
 consumer stream; final producer-stream completion is included in epoch timing.
@@ -42,7 +51,7 @@ AGENTS_AGENT_MODE=1 .venv/bin/python benchmarks/bench_torch.py \
 # Real-data comparison: 3 × 64 batches of four 128³ crops per route.
 AGENTS_AGENT_MODE=1 .venv/bin/python benchmarks/bench_torch.py \
   --native-dir /tmp/vc-reader-cuda --array /path/to/volume.zarr --level 2 \
-  --batches 64 --batch-size 4 --reps 3 --output /tmp/torch-loader.json
+  --batches 64 --batch-size 4 --reps 3 --output docs/benchmarks/torch.json
 
 # Regression tests: real CUDA when available, CPU configuration checks otherwise.
 AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=/tmp/vc-reader-cuda \
@@ -62,35 +71,142 @@ closure, and validation errors. `VC_READER_NATIVE_DIR` is inherited by spawned
 test/benchmark workers so they load the same extensions as the parent. Without
 that variable, tests use the installed extensions.
 
-Measured on PHercParis4 level 2 with an RTX 5090, PyTorch 2.14.1+cu130 and a
-Release CUDA build: three repetitions of 64 batches of four 128³ crops, after
+Measured on PHercParis4 level 2 with RTX 5090, PyTorch 2.14.1+cu130 and a
+Release CUDA build: three repetitions of 64 batches of four 128³ crops after
 one validation/warmup epoch per route. Four spawned CPU loader workers and four
-native reader threads per worker were used for the batch routes. All 256 crop
-hashes matched exactly across routes. The [complete report](../docs/benchmarks/torch.json)
-contains the exact volume path, command, build provenance and raw timings.
+native reader threads per worker serve the batch routes. All 256 crop hashes
+matched exactly across routes. The [complete report](../docs/benchmarks/torch.json)
+contains the exact command, input, build hashes and raw measurements.
 
 | Route | Mean batch ms | p50 ms | p95 ms | Crops/s |
 | --- | ---: | ---: | ---: | ---: |
-| Per-sample CUDA, `num_workers=0` | 8.765 | 8.631 | 9.478 | 456.18 |
-| Fixed-shape async prototype | 7.497 | 6.878 | 8.482 | 533.31 |
-| `Pipeline.batch()` | 7.744 | 7.340 | 8.597 | 516.33 |
-| `CudaLoader`, one batch ahead | 7.539 | 7.157 | 8.540 | 530.35 |
+| Per-sample CUDA, `num_workers=0` | 7.135 | 6.920 | 8.294 | 560.35 |
+| `Pipeline.batch()` | 5.158 | 4.874 | 5.943 | 775.21 |
+| `CudaLoader`, one batch ahead | 5.187 | 4.774 | 5.876 | 770.86 |
 
-The public loader delivered 16.3% higher throughput than the per-sample route,
-and was within 0.6% of the fixed-shape prototype. These are loader-only results,
-not a measured training speedup. Public outputs use the PyTorch allocator and
-support target routing and shape changes; no float precision or transform
-parameters were changed. The native executor still loops over samples within
-the submitted batch; this change exposes and schedules it, rather than adding
-new batched kernels.
+The public prefetch loader delivered 37.6% higher throughput than the serial route.
+These are loader-only results. The native executor still loops over samples within each submitted batch.
 
-A separate Nsight Systems trace of the public prefetch route (four warmup plus
-four measured batches on the same volume) attributed 46.1% of GPU kernel time
-to `geometry_kernel`, 19.5% to `expand_controls`, and 10.4% to
-`field_energy_gradient`. These existing geometry/elastic kernels remain the
-main GPU costs. Profiling includes warmup and is excluded from the timing table.
+### Current kernel profile
+
+A separate Nsight Systems trace of the same 12-augmentation chain covers four
+warmup and four measured batches (32 crops). The sum of GPU kernel time is
+31.732 ms. This excludes host work,
+transfers and waiting; instrumented wall timings are not performance comparisons.
+The largest kernel groups in that trace, amortized per crop, are:
+
+| Kernel group | µs/crop | Share of kernel time |
+| --- | ---: | ---: |
+| Convolution | 275.8 | 27.8% |
+| Trilinear resampling | 117.7 | 11.9% |
+| Statistics collection | 98.8 | 10.0% |
+| Local-field expansion | 82.5 | 8.3% |
+| Median filter | 56.5 | 5.7% |
+| Nearest-neighbor resizing | 51.4 | 5.2% |
+
+Convolution now accounts for the largest kernel group. These groups aggregate
+shared kernels across transforms; they are not per-augmentation timings.
+[Kernel/API report](../docs/benchmarks/current-profile.csv) ·
+[Profile configuration](../docs/benchmarks/current-profile.json).
+
+```bash
+VC_BENCH_VOLUME=/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr
+AGENTS_AGENT_MODE=1 nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
+  --force-overwrite=true --output=/tmp/vc-readme-refresh-profile \
+  .venv/bin/python benchmarks/bench_torch.py --native-dir /tmp/vc-reader-cuda \
+  --modes prefetch --array "$VC_BENCH_VOLUME" --level 2 \
+  --batches 4 --batch-size 4 --reps 1 --output docs/benchmarks/current-profile.json
+nsys stats --report cuda_gpu_kern_sum,cuda_api_sum --format csv \
+  /tmp/vc-readme-refresh-profile.nsys-rep > docs/benchmarks/current-profile.csv
+```
+
+## Resident CUDA geometry
+
+Current float32 128³ random-image timings: 200 synchronous calls per case after
+20 warmups, rotating case order. Upload, download and output destruction are
+excluded; public-call input preservation, validation and field construction are
+included. Three seeds validate exact same-backend replay and label outputs.
+
+| Operation | Mean ms | p50 ms | p95 ms |
+| --- | ---: | ---: | ---: |
+| flip_x | 0.099 | 0.097 | 0.150 |
+| flip_all | 0.105 | 0.078 | 0.213 |
+| elastic | 0.250 | 0.234 | 0.378 |
+
+The image-only Elastic case uses sigma 12/magnitude 2; the README gallery uses a
+stronger sigma 32/magnitude 8 recipe and transforms both image and label arrays.
+[Complete resident geometry report](../docs/benchmarks/geometry.json).
+
+```bash
+AGENTS_AGENT_MODE=1 .venv/bin/python benchmarks/bench_cuda_geometry.py \
+  --native-dir /tmp/vc-reader-cuda --warmup 20 --reps 200 \
+  --output docs/benchmarks/geometry.json
+```
+
+## README augmentation timings
+
+[`bench_augmentations.py`](bench_augmentations.py) measures all **61** README
+recipes (59 volume examples and two 2D companions) on CPU, CUDA with host
+inputs/outputs, and CUDA with resident inputs/outputs. Recipe parsing and sample
+construction are shared with preview generation in `scripts/augment_examples.py`;
+there is no second hand-maintained transform list. This command updates only
+timing rows, preserving recipes, descriptions, images and the Elastic video.
+
+The real PHercParis4 level-2 image starts at `(9000, 3600, 3600)`, is 128³, and
+is divided by 255 to float32. The reference image starts 384 voxels farther along
+Z. Masks are int16 CT > 0.5; geometric cases route both images and labels,
+ChannelMisalignment uses two identical image channels, and the two companions
+use a central slice or CT-derived coordinate surface. These match the README
+preview helpers and the previous catalog's workload construction.
+
+One CPU thread, `compact=True`, one warmup and five measured calls per route,
+seeds 123–127; case and backend orders are deterministically shuffled. All calls
+complete synchronously. Reading, setup, validation/comparison, output disposal,
+initial resident upload and final resident download are excluded. API input
+copies and validation are included. Uploaded CUDA includes host/device transfers.
+The short five-call protocol matches the old tables; inspect raw samples for
+jitter rather than treating speedup ratios as confidence intervals.
+
+[Full report](../docs/benchmarks/augmentations.json) records recipes, input hashes,
+seeds, build hashes, commands, mean/p50/p95/min/max, every timing and numerical
+comparison. All floating outputs pass `atol=5e-5, rtol=1e-5`. Strong Elastic has
+8 CPU/CUDA label differences across 10,485,760 voxels, consistent with float32
+nearest-neighbor boundary rounding; all other labels match exactly. CUDA host
+and resident results match exactly for every case. `--allow-differences` records
+numerical mismatches explicitly; it never bypasses finite, shape, dtype,
+source-preservation or CUDA-route checks. Review the report when using it on a
+new build. The existing geometry/precision tests cover the field's RMS/gradient
+limits independently.
+
+```bash
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-reader-cuda --parallel 4
+VC_BENCH_VOLUME=/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  .venv/bin/python benchmarks/bench_augmentations.py \
+  --native-dir /tmp/vc-reader-cuda --array "$VC_BENCH_VOLUME" --level 2 \
+  --start 9000 3600 3600 --size 128 --warmup 1 --reps 5 --allow-differences \
+  --output docs/benchmarks/augmentations.json --update-readme
+AGENTS_AGENT_MODE=1 .venv/bin/python tests/test_augment_benchmark.py -v
+```
+
+Use `--only Elastic Gamma` for a subset, and omit `--update-readme` to inspect a
+report first. NumPy and the existing reader/augmentation extensions suffice;
+preview rendering still uses Pillow. The new harness tests verify numerical
+failure detection, exact large integer comparisons, safe recipe parsing, input
+routing, and timing-row updates without modifying recipes/images.
+The shared native-build loader is idempotent so combined unittest discovery
+does not re-register native types. Run the complete regression suite with:
+
+```bash
+AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=/tmp/vc-reader-cuda \
+  .venv/bin/python -m unittest discover -s tests -v
+```
 
 ## CUDA geometry work reduction
+
+**Historical optimization comparison (0fd629ebd).** These are the original
+before/after measurements, not the current refresh. Current standalone results
+are above; current reader and full-pipeline results are below.
 
 The next pass after `f0f71d65b` removes repeated work in elastic construction and
 resampling. It keeps the same lattice, seeds, image/field dtypes, cubic-spline
@@ -235,6 +351,10 @@ macOS/arm64 and other GPU architectures were not measured. The pre-existing
 intermittent Python 3.14 semaphore cleanup warning also occurred in this loader run.
 
 ## CUDA geometry optimizations
+
+**Historical optimization comparison (f0f71d65b).** These are the original
+before/after measurements, not the current refresh. Current standalone results
+are above; current reader and full-pipeline results are below.
 
 The precision pass builds on exact integer flips and float32 elastic construction.
 Ordinary crop geometry, resident fields, CPU image workspaces and new replay
@@ -504,7 +624,7 @@ and is still included in the default synthetic smoke run.
 
 ## Reading/sampling timing comparisons
 
-Measured on the supplied PHercParis4 volume:
+Refreshed 2026-10-17 at `0fd629ebd` on the supplied PHercParis4 volume:
 
 ```text
 /mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr
@@ -543,10 +663,10 @@ those columns are not claims of built-in interpolation in either storage library
 
 | Workload | zarr-python | TensorStore | vc_reader CPU | vc_reader CUDA |
 | --- | ---: | ---: | ---: | ---: |
-| ML batch: 8 × 128³ crops | 13.965 / 13.911 / 15.278 | 4.890 / 4.910 / 5.747 | 1.153 / 1.140 / 1.291 | 4.701 / 4.671 / 5.374 |
-| Curved tifxyz surface: 96 × 512 | 10.789 / 10.606 / 13.900 | 6.730 / 6.601 / 8.192 | 0.801 / 0.775 / 1.149 | 1.775 / 1.745 / 1.986 |
-| Axis-aligned slab: 16 × 512² | 6.161 / 6.197 / 7.155 | 2.678 / 2.679 / 2.985 | 0.494 / 0.470 / 0.823 | 2.010 / 2.197 / 2.642 |
-| Rotated box: 128³ | 68.466 / 68.116 / 71.360 | 64.874 / 64.903 / 65.886 | 13.921 / 13.682 / 17.377 | 1.617 / 1.593 / 1.879 |
+| ML batch: 8 × 128³ crops | 13.914 / 13.553 / 15.472 | 4.839 / 4.867 / 5.773 | 1.153 / 1.136 / 1.316 | 4.791 / 4.734 / 5.633 |
+| Curved tifxyz surface: 96 × 512 | 10.933 / 10.462 / 14.651 | 6.576 / 6.503 / 8.391 | 0.845 / 0.832 / 1.189 | 1.832 / 1.796 / 2.175 |
+| Axis-aligned slab: 16 × 512² | 6.177 / 6.134 / 7.157 | 2.789 / 2.730 / 3.202 | 0.491 / 0.471 / 0.806 | 1.987 / 2.104 / 2.488 |
+| Rotated box: 128³ | 83.160 / 69.232 / 99.469 | 73.106 / 65.362 / 97.817 | 14.776 / 14.870 / 18.662 | 1.670 / 1.592 / 1.927 |
 
 Throughput is **requests/s** over the sum of measured latencies; one ML request
 is an entire 8-crop batch. JSON also reports crops/s, Mvoxels/s, output GiB/s,
@@ -554,20 +674,20 @@ stage times, min/max, cache counters, and every individual measurement.
 
 | Workload | zarr-python | TensorStore | vc_reader CPU | vc_reader CUDA |
 | --- | ---: | ---: | ---: | ---: |
-| ML batch: 8 × 128³ crops | 71.6 | 204.5 | 867.4 | 212.7 |
-| Curved tifxyz surface: 96 × 512 | 92.7 | 148.6 | 1248.4 | 563.3 |
-| Axis-aligned slab: 16 × 512² | 162.3 | 373.4 | 2023.7 | 497.5 |
-| Rotated box: 128³ | 14.6 | 15.4 | 71.8 | 618.5 |
+| ML batch: 8 × 128³ crops | 71.9 | 206.7 | 867.6 | 208.7 |
+| Curved tifxyz surface: 96 × 512 | 91.5 | 152.1 | 1183.9 | 545.8 |
+| Axis-aligned slab: 16 × 512² | 161.9 | 358.6 | 2037.6 | 503.2 |
+| Rotated box: 128³ | 12.0 | 13.7 | 67.7 | 598.9 |
 
 Speedups divide baseline p50 by the corresponding vc_reader p50. Values below
 1× mean vc_reader is slower for that comparison.
 
 | Workload | CPU vs zarr | CPU vs TensorStore | CUDA vs zarr | CUDA vs TensorStore | CUDA vs CPU |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| ML batch: 8 × 128³ crops | 12.20× | 4.31× | 2.98× | 1.05× | 0.24× |
-| Curved tifxyz surface: 96 × 512 | 13.68× | 8.51× | 6.08× | 3.78× | 0.44× |
-| Axis-aligned slab: 16 × 512² | 13.18× | 5.70× | 2.82× | 1.22× | 0.21× |
-| Rotated box: 128³ | 4.98× | 4.74× | 42.76× | 40.74× | 8.59× |
+| ML batch: 8 × 128³ crops | 11.94× | 4.29× | 2.86× | 1.03× | 0.24× |
+| Curved tifxyz surface: 96 × 512 | 12.58× | 7.82× | 5.83× | 3.62× | 0.46× |
+| Axis-aligned slab: 16 × 512² | 13.04× | 5.80× | 2.92× | 1.30× | 0.22× |
+| Rotated box: 128³ | 4.66× | 4.40× | 43.48× | 41.05× | 9.34× |
 
 CPU is the faster vc_reader path for direct ML batches, axis-aligned slabs,
 and the real surface tiles in this host-output workload. CUDA benefits the
@@ -578,13 +698,19 @@ and cache policy; other chunking, codecs, storage, and locality can change them.
 
 [Full reading/sampling report](../docs/benchmarks/readers.json).
 
-## Full training-pipeline timing comparison
+## Single-crop latency (12 augmentations, CPU output)
 
-This comparison uses **vc_reader CPU versus vc_reader CUDA only**. It uses the
-same volume, level, hardware, Release build, thread setting, cache policy, and
-60-call measurement protocol above. Each request fetches and trilinearly samples
-one 128³ crop, applies min-max normalization, then executes this **12-transform
-heavy augmentation chain** in order:
+Axis-aligned crops are the default workload; rotated sampling is a separate
+special case below. Both benchmarks measure input preparation for one crop at
+a time and return the result to CPU memory, with no model forward or backward
+pass. The PyTorch loader benchmark uses the same axis-aligned reads,
+normalization and 12 augmentations, but measures batches with warm reader caches
+and GPU outputs.
+
+These comparisons use the same volume, level, hardware, Release build, thread
+setting, cache policy, and 60-call measurement protocol above. Each request
+fetches one 128³ crop, applies min-max normalization, then executes this
+**12-transform heavy augmentation chain** in order:
 
 ```python
 A.Elastic(sigma=12, magnitude=2, border=True)
@@ -601,39 +727,16 @@ A.Sharpen(0.1, p_clamp=0)
 A.LowResolution(0.85)
 ```
 
-The same fixed recipe and per-crop seed are used on both backends, with all
-transforms active. Sampling uses a 10° YX rotation. Normalization and augmentation
-are separate calls for stage measurement; augmentation uses `compact=False`.
+The same fixed recipe and per-crop seed are used across routes, with all
+transforms active. Normalization and augmentation are separate calls for stage
+measurement; augmentation uses `compact=False`.
 Timing includes the fresh source upload and final result download for CUDA.
 The listed chain is a reproducible heavy workload, not a prescribed training recipe.
 
-Cells are **mean / p50 / p95 milliseconds per crop**. Speedups use p50.
+### Default: axis-aligned boxes
 
-| Stage | vc_reader CPU | vc_reader CUDA | CUDA speedup |
-| --- | ---: | ---: | ---: |
-| Fetching + sampling | 15.124 / 15.199 / 19.100 | 1.104 / 1.076 / 1.333 | 14.12× |
-| Normalization | 5.237 / 5.230 / 5.341 | 0.138 / 0.136 / 0.142 | 38.49× |
-| 12 augmentations | 169.853 / 169.915 / 171.951 | 3.150 / 3.115 / 3.372 | 54.54× |
-| Final host download | 0.000 / 0.000 / 0.000 | 0.543 / 0.529 / 0.588 | — |
-| End-to-end | 190.215 / 189.966 / 195.157 | 4.935 / 4.881 / 5.374 | 38.92× |
-
-| Throughput | vc_reader CPU | vc_reader CUDA |
-| --- | ---: | ---: |
-| Crops/s | 5.26 | 202.63 |
-| Mvoxels/s | 11.03 | 424.94 |
-
-CPU/CUDA outputs passed the same tolerance check; maximum absolute difference
-was 3.58e-7 after the full chain. [Full pipeline report](../docs/benchmarks/pipeline.json).
-Setup, validation, warmup, cache clearing, and final output destruction are
-outside both suites' timed intervals. Their JSON reports contain exact commands,
-versions, origins, seeds, extension hashes, and raw samples.
-
-### Axis-aligned boxes: CPU read followed by CUDA augmentation
-
-This additional run uses the same volume, level 2, Release build, 128³ shape,
-12 augmentations, cache policy, and 60 calls per mode. All three routes fetch
-the same integer axis-aligned boxes; these timings are a separate comparison
-from the rotated crops above. The hybrid route reads uint8 crops on CPU,
+All three routes fetch the same integer axis-aligned 128³ boxes, without
+interpolation during reading. The hybrid route reads uint8 crops on CPU,
 uploads only the crop, casts to float32 on GPU, and executes normalization and
 all augmentations on CUDA. The CUDA-chunks route fetches source chunks onto the
 GPU before extracting each box. Both include the final host download.
@@ -642,47 +745,75 @@ Cells are **mean / p50 / p95 milliseconds per crop**.
 
 | Stage | CPU throughout | CUDA chunks + CUDA pipeline | CPU read + CUDA pipeline |
 | --- | ---: | ---: | ---: |
-| Fetching + conversion/upload | 0.532 / 0.485 / 0.791 | 1.010 / 0.990 / 1.270 | 0.552 / 0.541 / 0.780 |
-| Normalization | 5.423 / 5.389 / 5.787 | 0.139 / 0.137 / 0.146 | 0.119 / 0.113 / 0.142 |
-| 12 augmentations | 167.493 / 167.573 / 169.183 | 3.165 / 3.127 / 3.383 | 3.164 / 3.099 / 3.503 |
-| Final host download | 0.000 / 0.000 / 0.000 | 0.568 / 0.557 / 0.675 | 0.558 / 0.546 / 0.668 |
-| End-to-end | 173.448 / 173.431 / 175.089 | 4.881 / 4.812 / 5.312 | 4.393 / 4.371 / 4.946 |
+| Fetching + conversion/upload | 0.545 / 0.528 / 0.844 | 1.077 / 1.103 / 1.350 | 0.540 / 0.573 / 0.745 |
+| Normalization | 2.783 / 2.776 / 2.870 | 0.126 / 0.126 / 0.134 | 0.096 / 0.095 / 0.120 |
+| 12 augmentations | 148.213 / 148.094 / 150.146 | 1.395 / 1.371 / 1.630 | 1.363 / 1.336 / 1.508 |
+| Final host download | 0.000 / 0.000 / 0.000 | 0.554 / 0.549 / 0.600 | 0.537 / 0.523 / 0.585 |
+| End-to-end | 151.542 / 151.408 / 153.622 | 3.152 / 3.169 / 3.520 | 2.537 / 2.548 / 2.933 |
 
 | Metric | CPU throughout | CUDA chunks + CUDA pipeline | CPU read + CUDA pipeline |
 | --- | ---: | ---: | ---: |
-| Crops/s | 5.77 | 204.86 | 227.66 |
-| Mvoxels/s | 12.09 | 429.62 | 477.43 |
-| Speedup over CPU (p50) | 1.00× | 36.04× | 39.68× |
+| Crops/s | 6.60 | 317.23 | 394.24 |
+| Mvoxels/s | 13.84 | 665.27 | 826.79 |
+| Speedup over CPU (p50) | 1.00× | 47.78× | 59.41× |
 
-For these boxes, CPU reading followed by CUDA processing was **39.68× faster
-than staying on CPU** and **1.10× faster than the CUDA-chunks route** end to end
+For these boxes, CPU reading followed by CUDA processing was **59.41× faster
+than staying on CPU** and **1.24× faster than the CUDA-chunks route** end to end
 (p50). Hybrid and CUDA-chunks outputs matched bit-for-bit for all six crops;
-the maximum difference from CPU was 3.58e-7. This measures fresh uploads with
+the maximum difference from CPU was 1.1e-06. This measures fresh uploads with
 warm filesystem access; reusing GPU source chunks can change the tradeoff.
 [Axis-aligned hybrid report](../docs/benchmarks/pipeline-box-hybrid.json).
+
+### Special case: rotated-crop sampling
+
+This comparison samples a 128³ crop with a 10° YX rotation using trilinear
+interpolation. It compares CPU and CUDA reading and processing with the same
+normalization, augmentation chain and measurement protocol as the axis-aligned
+benchmark above.
+
+Cells are **mean / p50 / p95 milliseconds per crop**. Speedups use p50.
+
+| Stage | vc_reader CPU | vc_reader CUDA | CUDA speedup |
+| --- | ---: | ---: | ---: |
+| Fetching + sampling | 14.037 / 13.781 / 17.895 | 1.176 / 1.168 / 1.404 | 11.80× |
+| Normalization | 2.682 / 2.639 / 2.953 | 0.126 / 0.123 / 0.156 | 21.48× |
+| 12 augmentations | 144.051 / 144.002 / 146.046 | 1.405 / 1.353 / 1.703 | 106.43× |
+| Final host download | 0.000 / 0.000 / 0.000 | 0.551 / 0.537 / 0.632 | — |
+| End-to-end | 160.769 / 161.036 / 164.651 | 3.257 / 3.177 / 3.897 | 50.69× |
+
+| Throughput | vc_reader CPU | vc_reader CUDA |
+| --- | ---: | ---: |
+| Crops/s | 6.22 | 307.03 |
+| Mvoxels/s | 13.04 | 643.89 |
+
+CPU/CUDA outputs passed the same tolerance check; maximum absolute difference
+was 1.01e-06 after the full chain. [Full pipeline report](../docs/benchmarks/pipeline.json).
+Setup, validation, warmup, cache clearing, and final output destruction are
+outside both suites' timed intervals. Their JSON reports contain exact commands,
+versions, origins, seeds, extension hashes, and raw samples.
 
 Reproduce these runs using the existing Release CUDA build (adjust its path if
 needed):
 
 ```bash
-VOLUME=/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr
+VC_BENCH_VOLUME=/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr
 NATIVE_BUILD=/tmp/vc-reader-cuda
 
-.venv/bin/python benchmarks/bench_pipeline.py --suite readers --backend both \
-  --native-dir "$NATIVE_BUILD" --array "$VOLUME" --level 2 --start 9000 3600 3600 \
+AGENTS_AGENT_MODE=1 .venv/bin/python benchmarks/bench_pipeline.py --suite readers --backend both \
+  --native-dir "$NATIVE_BUILD" --array "$VC_BENCH_VOLUME" --level 2 --start 9000 3600 3600 \
   --workloads ml_batch surface slab rotated_box --surface-size 96 512 \
   --shape 128 128 128 --plane-size 512 512 --slab-depth 16 --batch-size 8 \
   --crops 6 --jitter 256 --warmup 2 --reps 10 --threads 8 \
   --memory-cache-mib 0 --cuda-cache clear --output docs/benchmarks/readers.json
 
-.venv/bin/python benchmarks/bench_pipeline.py --suite pipeline --backend both \
-  --native-dir "$NATIVE_BUILD" --array "$VOLUME" --level 2 --start 9000 3600 3600 \
+AGENTS_AGENT_MODE=1 .venv/bin/python benchmarks/bench_pipeline.py --suite pipeline --backend both \
+  --native-dir "$NATIVE_BUILD" --array "$VC_BENCH_VOLUME" --level 2 --start 9000 3600 3600 \
   --shape 128 128 128 --crops 6 --jitter 256 --warmup 2 --reps 10 --threads 8 \
   --memory-cache-mib 0 --cuda-cache clear --augmentation heavy \
   --output docs/benchmarks/pipeline.json
 
-.venv/bin/python benchmarks/bench_pipeline.py --suite pipeline --backend both \
-  --native-dir "$NATIVE_BUILD" --array "$VOLUME" --level 2 --start 9000 3600 3600 \
+AGENTS_AGENT_MODE=1 .venv/bin/python benchmarks/bench_pipeline.py --suite pipeline --backend both \
+  --native-dir "$NATIVE_BUILD" --array "$VC_BENCH_VOLUME" --level 2 --start 9000 3600 3600 \
   --shape 128 128 128 --crops 6 --jitter 256 --warmup 2 --reps 10 --threads 8 \
   --memory-cache-mib 0 --cuda-cache clear --augmentation heavy \
   --pipeline-read box --include-hybrid \

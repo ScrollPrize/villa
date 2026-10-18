@@ -1,4 +1,4 @@
-"""GPU-ready PyTorch loader batches: serial, prototype, public batch and prefetch.
+"""GPU-ready PyTorch loader batches: serial, public batch and prefetch.
 
 No installs or downloads. --array selects real data; otherwise a seeded local
 Zarr is generated. See benchmarks/README.md for commands and timing scope.
@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from bench_pipeline import environment, load_extensions, positive, summary, synthetic_array
+from bench_pipeline import environment, heavy_transforms, load_extensions, positive, summary, synthetic_array
 
 # Spawned DataLoader workers must import the same extensions as the parent.
 if os.environ.get("VC_READER_NATIVE_DIR"):
@@ -26,8 +26,7 @@ if os.environ.get("VC_READER_NATIVE_DIR"):
 
 def pipeline():
     from vc_reader import augment as A
-    return A.Pipeline([A.Normalize('minmax'), A.Elastic(sigma=12, magnitude=2, border=True),
-                       A.MedianFilter(3), A.Flip(axes='x', p_axis=1), A.Gamma(.9)],
+    return A.Pipeline([A.Normalize('minmax'), *heavy_transforms()],
                       backend='cuda', compact=False)
 
 
@@ -58,23 +57,6 @@ class Crops(Dataset):
         return {'image': image, 'aug_seed': np.asarray(seed, dtype=np.uint64)}
 
 
-class Prototype:
-    """Original measured async prototype; fixed-shape image-only baseline."""
-    def __init__(self, loader, augmentation):
-        self.loader, self.augmentation = loader, augmentation
-
-    def __iter__(self):
-        for batch in self.loader:
-            x = batch['image'].to('cuda', non_blocking=True).float()
-            out = torch.empty_like(x)
-            _, _, owner = self.augmentation._native.run_batch(
-                {'image': x}, batch['aug_seed'].tolist(), {}, False, True, {'image': out},
-                stream=torch.cuda.current_stream().cuda_stream)
-            torch.cuda.current_stream().synchronize()
-            owner.check()
-            yield {**batch, 'image': out}
-
-
 class PublicBatch:
     def __init__(self, loader, augmentation):
         self.loader, self.augmentation = loader, augmentation
@@ -89,8 +71,8 @@ def main():
     parser.add_argument('--array')
     parser.add_argument('--level')
     parser.add_argument('--native-dir', type=Path)
-    parser.add_argument('--modes', nargs='+', choices=['serial', 'prototype', 'batch', 'prefetch'],
-                        default=['serial', 'prototype', 'batch', 'prefetch'])
+    parser.add_argument('--modes', nargs='+', choices=['serial', 'batch', 'prefetch'],
+                        default=['serial', 'batch', 'prefetch'])
     parser.add_argument('--shape', type=positive, nargs=3, default=(128, 128, 128))
     parser.add_argument('--batches', type=positive, default=64)
     parser.add_argument('--batch-size', type=positive, default=4)
@@ -113,7 +95,7 @@ def main():
                   environment=environment(args, augmentation=True), torch=torch.__version__, results={},
                   protocol='one validation/warmup epoch per mode; rotated mode order per repetition; warm caches; '
                            'GPU-ready batches; includes reads, transfers, casts, augmentation, collation and output disposal; '
-                           'excludes startup/validation and model execution; private prototype versus public APIs')
+                           'excludes startup/validation and model execution')
     with ExitStack() as stack:
         location = args.array
         if location is None:
@@ -125,7 +107,7 @@ def main():
         augmentation = pipeline()
         report['transforms'] = [repr(t) for t in augmentation.transforms]
         loaders = dict(serial=DataLoader(Crops(args, location, serial=True), batch_size=args.batch_size),
-                       prototype=Prototype(cpu, augmentation), batch=PublicBatch(cpu, augmentation),
+                       batch=PublicBatch(cpu, augmentation),
                        prefetch=CudaLoader(cpu, augmentation, seed_key='aug_seed'))
         hashes = {}
         for mode in args.modes:

@@ -1,0 +1,59 @@
+Generating SQLite file /tmp/vc-readme-refresh-profile.sqlite from /tmp/vc-readme-refresh-profile.nsys-rep
+Processing [/tmp/vc-readme-refresh-profile.sqlite] with [/opt/nvidia/nsight-systems/2026.1.3/target-linux-x64/reports/cuda_gpu_kern_sum.py]... 
+Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
+27.8,8824317,192,45960.0,45232.0,42208,50368,2626.4,"void vcr::augment::cuda::convolution<float>(const T1 *, T1 *, vcr::augment::cuda::Layout, int, const T1 *, int, vcr::augment::Boundary)"
+11.9,3765904,64,58842.3,53568.0,47744,422047,46168.0,"void vcr::augment::cuda::geometry_kernel<float, float, (int)3, unsigned int>(const T1 *, T1 *, vcr::augment::cuda::Layout, vcr::augment::cuda::Layout, unsigned long, vcr::augment::cuda::GeometryArgs<T2>, const float *, T1, int *)"
+10.0,3161174,224,14112.4,12992.0,12864,20896,2746.0,"void vcr::augment::cuda::collect<float, (bool)0>(vcr::augment::cuda::View<T1>, vcr::augment::cuda::Partial *, const float *, const vcr::augment::cuda::Statistics *)"
+8.3,2640629,64,41259.8,41119.0,40736,42432,440.6,"vcr::augment::cuda::expand_local(float *, vcr::augment::cuda::Layout, const float *, float, float)"
+5.7,1806969,32,56467.8,56416.0,56223,57056,204.7,"void vcr::augment::cuda::median3_kernel<float>(const T1 *, T1 *, vcr::augment::cuda::Layout)"
+5.2,1645371,32,51417.8,51328.0,51104,53312,385.0,"void vcr::augment::cuda::resize_nearest_kernel<float>(const T1 *, T1 *, vcr::augment::cuda::Layout, vcr::augment::cuda::Layout, unsigned long, bool)"
+4.3,1380346,32,43135.8,43136.0,42944,43360,105.0,"void vcr::augment::cuda::sharpen_kernel<float>(const T1 *, T1 *, vcr::augment::cuda::Layout, T1, bool, const vcr::augment::cuda::Statistics *)"
+4.2,1334648,32,41707.8,41616.0,41248,43136,373.8,"void vcr::augment::cuda::reflect_kernel<float, unsigned int>(const T1 *, T1 *, vcr::augment::cuda::Layout, unsigned long, unsigned int, bool)"
+4.0,1283869,32,40120.9,26544.0,26335,460030,76624.8,"void vcr::augment::cuda::expand_outer<(int)3, unsigned int>(const float *, float *, unsigned long, unsigned long, unsigned long, const float *, const unsigned long *)"
+2.4,765565,128,5981.0,4976.0,4352,9728,2115.5,"void vcr::augment::cuda::pointwise_kernel<float, vcr::augment::cuda::<unnamed>::Function>(vcr::augment::cuda::View<T1>, vcr::augment::cuda::Layout, const float *, const vcr::augment::cuda::Statistics *, T2)"
+2.4,747098,224,3335.3,3296.0,3232,3807,105.2,"vcr::augment::cuda::finish_stats(const vcr::augment::cuda::Partial *, unsigned int, unsigned long, bool, bool, vcr::augment::cuda::Statistics *)"
+2.2,702366,32,21948.9,21968.0,21312,22208,179.8,"void vcr::augment::cuda::field_center_scale<(int)3>(float *, const float *, const float *, unsigned long)"
+2.1,659582,64,10306.0,10240.0,2048,20768,8186.8,"void vcr::augment::cuda::expand_controls<unsigned int, float>(const T2 *, T2 *, vcr::augment::cuda::Layout, vcr::augment::cuda::Layout, const T2 *, const unsigned long *, int)"
+1.9,587998,32,18374.9,18368.0,18271,18624,82.0,"void vcr::augment::cuda::<unnamed>::collect_normalization<float, (int)0>(vcr::augment::cuda::View<T1>, vcr::augment::cuda::Partial *, const vcr::augment::cuda::<unnamed>::ParametersGPU *, vcr::augment::cuda::<unnamed>::Selection, int *)"
+1.5,480157,32,15004.9,14976.0,14720,15584,207.6,"void vcr::augment::cuda::field_energy_gradient<(int)3, unsigned int>(const float *, const float *, float *, vcr::augment::cuda::Layout)"
+1.5,462141,32,14441.9,14432.0,14336,14559,55.3,"void vcr::augment::cuda::gamma_kernel<float>(vcr::augment::cuda::View<T1>, const vcr::augment::cuda::Statistics *, double)"
+1.0,327934,32,10247.9,10272.0,10048,10496,160.7,"void vcr::augment::cuda::<unnamed>::normalize_values<float>(vcr::augment::cuda::View<T1>, const vcr::augment::cuda::<unnamed>::ParametersGPU *, bool, bool)"
+0.7,226463,32,7077.0,7728.0,4480,8640,1443.5,"void vcr::augment::cuda::validate_device_values<float>(vcr::augment::cuda::View<T1>, bool, int *)"
+0.7,213439,32,6670.0,6656.0,6368,7232,202.7,"void vcr::augment::cuda::component_sums<float>(const T1 *, T1 *, vcr::augment::cuda::Layout)"
+0.6,176031,8,22003.9,22512.0,16160,24832,2838.4,"void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 3)]::operator ()() const::[lambda() (instance 7)]::operator ()() const::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>, (int)4, TrivialOffsetCalculator<(int)1, unsigned int>, TrivialOffsetCalculator<(int)1, unsigned int>, at::native::memory::LoadWithCast<(int)1>, at::native::memory::StoreWithCast<(int)1>>(int, T1, T2, T4, T5, T6, T7)"
+0.5,153216,32,4788.0,4768.0,4736,4928,42.0,"void vcr::augment::cuda::blend<float>(T1 *, const T1 *, const float *, unsigned long, double)"
+0.5,152160,32,4755.0,4704.0,4672,4928,76.2,"void vcr::augment::cuda::finish_reduce<(int)10, (bool)0, float>(const T3 *, T3 *, int, unsigned long)"
+0.3,103167,32,3224.0,3200.0,3136,3360,69.0,"void vcr::augment::cuda::<unnamed>::finish_normalization<(int)0>(const vcr::augment::cuda::Partial *, unsigned int, vcr::augment::cuda::<unnamed>::ParametersGPU *, bool, double)"
+0.2,53568,96,558.0,544.0,480,672,41.7,"vcr::augment::cuda::magnitude_flag(const vcr::augment::cuda::Statistics *, double, int *, int)"
+0.1,45376,32,1418.0,1376.0,1344,1568,79.8,"void vcr::augment::cuda::finish_reduce<(int)3, (bool)1, float>(const T3 *, T3 *, int, unsigned long)"
+0.1,32704,32,1022.0,960.0,896,1280,100.2,"void vcr::augment::cuda::scale_factor<float>(T1 *, vcr::augment::cuda::Layout, double)"
+
+Processing [/tmp/vc-readme-refresh-profile.sqlite] with [/opt/nvidia/nsight-systems/2026.1.3/target-linux-x64/reports/cuda_api_sum.py]... 
+Time (%),Total Time (ns),Num Calls,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
+38.3,40951975,844,48521.3,2375.0,1316,9750004,660997.6,cudaMemcpyAsync
+15.3,16294955,9,1810550.6,1843664.0,12074,6734320,2130496.8,cudaHostAlloc
+14.0,14928121,1608,9283.7,2173.0,1690,8514187,213600.7,cudaLaunchKernel
+12.4,13209116,16,825569.8,62112.5,684,2891078,1246739.8,cudaEventSynchronize
+10.8,11590885,16,724430.3,112365.5,40798,9000444,2217550.1,cuLibraryLoadData
+5.4,5730336,1696,3378.7,391.0,267,4269291,103763.3,cudaMallocAsync
+1.5,1605833,128,12545.6,1142.0,855,221919,30672.8,cudaStreamCreateWithPriority
+0.8,829623,9,92180.3,62012.0,41044,169648,50176.9,cudaMalloc
+0.7,760502,1696,448.4,402.0,274,6159,246.8,cudaFreeAsync
+0.3,346384,2,173192.0,173192.0,127946,218438,63987.5,cudaDeviceSynchronize
+0.2,163924,64,2561.3,1935.5,1321,12679,1966.8,cudaMemsetAsync
+0.1,151406,1608,94.2,79.0,50,1457,70.5,cuKernelGetName
+0.1,63235,72,878.3,453.5,385,5022,908.4,cudaStreamSynchronize
+0.1,55568,24,2315.3,1453.0,661,7831,2027.2,cudaEventRecordWithFlags
+0.0,33084,22,1503.8,759.5,408,8714,1992.5,cudaEventCreateWithFlags
+0.0,23005,10,2300.5,951.0,370,10929,3402.5,cudaEventQuery
+0.0,22756,53,429.4,289.0,129,2029,434.7,cudaStreamIsCapturing
+0.0,18557,29,639.9,315.0,130,6549,1248.1,cuLibraryGetKernel
+0.0,16279,8,2034.9,1759.5,782,4131,1339.4,cudaStreamWaitEvent
+0.0,14036,16,877.3,501.0,239,4173,967.9,cudaEventDestroy
+0.0,12503,35,357.2,311.0,133,1796,271.0,cudaGetDriverEntryPointByVersion
+0.0,11069,8,1383.6,1186.0,575,3238,807.2,cudaEventRecord
+0.0,4027,1,4027.0,4027.0,4027,4027,0.0,cuLogsUnregisterCallback
+0.0,2041,1,2041.0,2041.0,2041,2041,0.0,cuLogsRegisterCallback
+0.0,1441,1,1441.0,1441.0,1441,1441,0.0,cuModuleGetLoadingMode
+0.0,299,2,149.5,149.5,115,184,48.8,cudaGetDeviceProperties
+

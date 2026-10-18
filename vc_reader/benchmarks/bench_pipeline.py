@@ -109,6 +109,11 @@ def load_extensions(directory):
         path = next((p for p in candidates if p.is_file()), None)
         if path is None:
             raise ValueError(f"no {name} extension in {directory}")
+        # Several test/benchmark modules can request the same build in one
+        # process. Loading it twice re-registers nanobind types and breaks casts.
+        loaded = sys.modules.get(f"vc_reader.{name}")
+        if loaded is not None and Path(loaded.__file__).resolve() == path.resolve():
+            continue
         spec = importlib.util.spec_from_file_location(f"vc_reader.{name}", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -532,6 +537,17 @@ def run_crop(reader, normalization, augmentation, origin, axes, args, seed, cuda
     return output, times
 
 
+def heavy_transforms():
+    """Shared 12-transform workload for single-crop and PyTorch benchmarks."""
+    from vc_reader import augment as A
+    return [A.Elastic(sigma=12, magnitude=2, border=True), A.MedianFilter(3),
+            A.Flip(axes="x", p_axis=1), A.GaussianBlur(.7), A.BrightnessMultiply(1.1),
+            A.BrightnessAdd(.03), A.Contrast(1.15), A.Gamma(.9),
+            A.LocalContrast(12, loc=.5, factor=1.1),
+            A.LocalSmoothing(12, loc=.5, strength=.3, sigma=1),
+            A.Sharpen(.1, p_clamp=0), A.LowResolution(.85)]
+
+
 def benchmark(args):
     if args.native_dir:
         load_extensions(args.native_dir.resolve())
@@ -545,12 +561,7 @@ def benchmark(args):
         modes.append("hybrid")
     transforms = [A.Flip(axes="x", p_axis=1), A.BrightnessMultiply(1.1), A.Gamma(.9), A.GaussianBlur(1)]
     if args.augmentation == "heavy":
-        transforms = [A.Elastic(sigma=12, magnitude=2, border=True), A.MedianFilter(3),
-                      A.Flip(axes="x", p_axis=1), A.GaussianBlur(.7), A.BrightnessMultiply(1.1),
-                      A.BrightnessAdd(.03), A.Contrast(1.15), A.Gamma(.9),
-                      A.LocalContrast(12, loc=.5, factor=1.1),
-                      A.LocalSmoothing(12, loc=.5, strength=.3, sigma=1),
-                      A.Sharpen(.1, p_clamp=0), A.LowResolution(.85)]
+        transforms = heavy_transforms()
     pipelines = {mode: (A.Pipeline([A.Normalize(args.normalization)], backend="cpu" if mode == "cpu" else "cuda", compact=False),
                         A.Pipeline(transforms, backend="cpu" if mode == "cpu" else "cuda", compact=False)) for mode in modes}
     report = dict(schema_version=2, suite="pipeline", command=[sys.executable, *sys.argv],
