@@ -2,9 +2,12 @@
 
 Usage, methodology, and full results for the [package benchmark summary](../README.md#performance).
 Run all commands below from the package root (`vc_reader/`).
+Generated JSON reports under `docs/benchmarks/` are kept locally and ignored by
+Git. Report paths below refer to those local files; benchmark input fixtures
+remain versioned.
 
 Current results were refreshed **2026-10-17** at `0fd629ebd`, with the same
-Release extensions for every suite. The [refresh manifest](../docs/benchmarks/refresh.json)
+Release extensions for every suite. The refresh manifest (`docs/benchmarks/refresh.json`)
 records report hashes and coverage. Current results are in the PyTorch, resident
 geometry, augmentation catalog, and reader/pipeline sections. The two optimization
 history sections are explicitly marked historical and retain their original data.
@@ -75,7 +78,7 @@ Measured on PHercParis4 level 2 with RTX 5090, PyTorch 2.14.1+cu130 and a
 Release CUDA build: three repetitions of 64 batches of four 128³ crops after
 one validation/warmup epoch per route. Four spawned CPU loader workers and four
 native reader threads per worker serve the batch routes. All 256 crop hashes
-matched exactly across routes. The [complete report](../docs/benchmarks/torch.json)
+matched exactly across routes. The complete report (`docs/benchmarks/torch.json`)
 contains the exact command, input, build hashes and raw measurements.
 
 | Route | Mean batch ms | p50 ms | p95 ms | Crops/s |
@@ -107,7 +110,7 @@ The largest kernel groups in that trace, amortized per crop, are:
 Convolution now accounts for the largest kernel group. These groups aggregate
 shared kernels across transforms; they are not per-augmentation timings.
 [Kernel/API report](../docs/benchmarks/current-profile.csv) ·
-[Profile configuration](../docs/benchmarks/current-profile.json).
+Profile configuration (`docs/benchmarks/current-profile.json`).
 
 ```bash
 VC_BENCH_VOLUME=/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr
@@ -135,7 +138,7 @@ included. Three seeds validate exact same-backend replay and label outputs.
 
 The image-only Elastic case uses sigma 12/magnitude 2; the README gallery uses a
 stronger sigma 32/magnitude 8 recipe and transforms both image and label arrays.
-[Complete resident geometry report](../docs/benchmarks/geometry.json).
+Complete resident geometry report (`docs/benchmarks/geometry.json`).
 
 ```bash
 AGENTS_AGENT_MODE=1 .venv/bin/python benchmarks/bench_cuda_geometry.py \
@@ -167,7 +170,7 @@ copies and validation are included. Uploaded CUDA includes host/device transfers
 The short five-call protocol matches the old tables; inspect raw samples for
 jitter rather than treating speedup ratios as confidence intervals.
 
-[Full report](../docs/benchmarks/augmentations.json) records recipes, input hashes,
+Full report (`docs/benchmarks/augmentations.json`) records recipes, input hashes,
 seeds, build hashes, commands, mean/p50/p95/min/max, every timing and numerical
 comparison. All floating outputs pass `atol=5e-5, rtol=1e-5`. Strong Elastic has
 8 CPU/CUDA label differences across 10,485,760 voxels, consistent with float32
@@ -234,8 +237,8 @@ from `f0f71d65b` in `/tmp/vc-work-reduction-before` before rebuilding.
 
 | GPU-ready loader | Mean batch ms | p50 ms | p95 ms | Crops/s |
 | --- | ---: | ---: | ---: | ---: |
-| [Before](../docs/benchmarks/work-reduction-loader-before.json) | 4.695 | 4.342 | 5.059 | 851.65 |
-| [After](../docs/benchmarks/work-reduction-loader-after.json) | 2.432 | 2.082 | 2.904 | 1643.53 |
+| Before | 4.695 | 4.342 | 5.059 | 851.65 |
+| After | 2.432 | 2.082 | 2.904 | 1643.53 |
 
 Three timed epochs of 64 batches × four 128³ crops, after a validation/warmup
 epoch: **93.0% higher loader throughput**. Epoch startup and disposal remain
@@ -244,8 +247,8 @@ desktop GPU activity contribute jitter; these are not confidence intervals.
 
 | Resident elastic, random float32 128³ | Mean ms | p50 ms | p95 ms |
 | --- | ---: | ---: | ---: |
-| [Before](../docs/benchmarks/work-reduction-geometry-before.json) | 0.858 | 0.837 | 0.988 |
-| [After](../docs/benchmarks/work-reduction-geometry-after.json) | 0.243 | 0.231 | 0.346 |
+| Before | 0.858 | 0.837 | 0.988 |
+| After | 0.243 | 0.231 | 0.346 |
 
 200 synchronous calls per case after 20 warmups, rotating case order:
 **3.53× faster mean elastic time**. Flip kernels are unchanged; their short-call
@@ -261,8 +264,8 @@ repetitions, one warmup, host outputs and cleared CUDA chunk caches:
 | Hybrid | Before | 2.306 | 2.241 | 2.536 | 3.544 |
 | Hybrid | After | 1.337 | 1.330 | 1.391 | 2.504 |
 
-The [before](../docs/benchmarks/work-reduction-ct-before.json) and
-[after](../docs/benchmarks/work-reduction-ct-after.json) reports include CPU
+The before (`docs/benchmarks/work-reduction-ct-before.json`) and
+after (`docs/benchmarks/work-reduction-ct-after.json`) reports include CPU
 controls, stage distributions, input coordinates and raw samples. Image
 normalization and reader code are unchanged. CPU/CUDA maximum absolute output
 difference on these crops was 9.54e-7; hybrid and CUDA outputs matched exactly.
@@ -283,8 +286,8 @@ exclude host work/transfers and are not end-to-end latency.
 Median filtering now accounts for 17.5% of kernel time, resampling 16.1%, and
 reflection 12.9%. See the full [before](../docs/benchmarks/work-reduction-profile-before.csv)
 and [after](../docs/benchmarks/work-reduction-profile-after.csv) kernel/API reports,
-with [before](../docs/benchmarks/work-reduction-profile-before.json) and
-[after](../docs/benchmarks/work-reduction-profile-after.json) profiling configurations.
+with before (`docs/benchmarks/work-reduction-profile-before.json`) and
+after (`docs/benchmarks/work-reduction-profile-after.json`) profiling configurations.
 Instrumented wall timings are excluded from the performance comparisons.
 
 Across three random 128³ reference images, maximum change from the old CUDA
@@ -419,9 +422,9 @@ GPU-ready batch latency and epoch throughput (192 timed batches per build):
 
 | Build | Mean batch ms | p50 ms | p95 ms | Crops/s |
 | --- | ---: | ---: | ---: | ---: |
-| [Original batch pipeline](../docs/benchmarks/torch-original.json) | 7.622 | 7.261 | 8.352 | 524.64 |
-| [Before this precision pass](../docs/benchmarks/torch-before-precision.json) | 5.627 | 5.260 | 6.114 | 710.47 |
-| [Float32 execution and fields](../docs/benchmarks/torch-float32.json) | 4.694 | 4.360 | 4.991 | 851.88 |
+| Original batch pipeline | 7.622 | 7.261 | 8.352 | 524.64 |
+| Before this precision pass | 5.627 | 5.260 | 6.114 | 710.47 |
+| Float32 execution and fields | 4.694 | 4.360 | 4.991 | 851.88 |
 
 This precision pass raised loader throughput by 19.9%; the full optimization
 sequence raised it by 62.4%. These are separate runs on the same machine/input,
@@ -440,9 +443,9 @@ Resident microbenchmarks (200 calls per case, 20 warmups, synchronous wall time)
 
 Elastic mean time fell 23.2% in this pass. Flip timings are dominated by short-call
 host overhead and jitter; the integer flip kernel was already present in this
-baseline. [Original geometry timings](../docs/benchmarks/geometry-original.json),
-[pre-pass timings](../docs/benchmarks/geometry-before-precision.json), and
-[final timings/numerical comparisons](../docs/benchmarks/geometry-float32.json)
+baseline. Original geometry timings (`docs/benchmarks/geometry-original.json`),
+pre-pass timings (`docs/benchmarks/geometry-before-precision.json`), and
+final timings/numerical comparisons (`docs/benchmarks/geometry-float32.json`)
 include all raw samples and min/max values.
 
 The separate heavy pipeline uses three CT crops × three timed repetitions per
@@ -459,8 +462,8 @@ normalization and reading; total includes reading, normalization and download:
 | hybrid | After | 2.153 | 2.144 | 2.202 | 3.496 |
 
 CPU normalization also fell from 5.392 to 2.823 ms mean. Full stage distributions,
-commands and raw samples are in the [before](../docs/benchmarks/precision-ct-before.json)
-and [after](../docs/benchmarks/precision-ct-after.json) reports. Final CPU/CUDA
+commands and raw samples are in the before (`docs/benchmarks/precision-ct-before.json`)
+and after (`docs/benchmarks/precision-ct-after.json`) reports. Final CPU/CUDA
 maximum absolute difference across these three crops was 1.014e-6; hybrid and
 CUDA outputs matched exactly. This comparison is between current backends,
 not a claim of unchanged outputs from the old implementation.
@@ -485,7 +488,7 @@ total to .463 ms; normalization application fell from .879 to .332 ms.
 See the [final kernel/API report](../docs/benchmarks/precision-profile.csv),
 [pre-pass report](../docs/benchmarks/geometry-profile.csv), and
 [original report](../docs/benchmarks/original-profile.csv). The
-[profile configuration](../docs/benchmarks/precision-profile.json) identifies the
+profile configuration (`docs/benchmarks/precision-profile.json`) identifies the
 build/input; its instrumented timings are excluded from performance comparisons.
 
 Validation: seven precision tests pass on both CPU-only and CUDA builds; all 18
@@ -696,7 +699,7 @@ Direct reads matched exactly; the maximum discrepancy across sampled outputs
 was 0.0000458 intensity units. These results describe this dataset, geometry,
 and cache policy; other chunking, codecs, storage, and locality can change them.
 
-[Full reading/sampling report](../docs/benchmarks/readers.json).
+Full reading/sampling report (`docs/benchmarks/readers.json`).
 
 ## Single-crop latency (12 augmentations, CPU output)
 
@@ -762,7 +765,7 @@ than staying on CPU** and **1.24× faster than the CUDA-chunks route** end to en
 (p50). Hybrid and CUDA-chunks outputs matched bit-for-bit for all six crops;
 the maximum difference from CPU was 1.1e-06. This measures fresh uploads with
 warm filesystem access; reusing GPU source chunks can change the tradeoff.
-[Axis-aligned hybrid report](../docs/benchmarks/pipeline-box-hybrid.json).
+Axis-aligned hybrid report (`docs/benchmarks/pipeline-box-hybrid.json`).
 
 ### Special case: rotated-crop sampling
 
@@ -787,7 +790,7 @@ Cells are **mean / p50 / p95 milliseconds per crop**. Speedups use p50.
 | Mvoxels/s | 13.04 | 643.89 |
 
 CPU/CUDA outputs passed the same tolerance check; maximum absolute difference
-was 1.01e-06 after the full chain. [Full pipeline report](../docs/benchmarks/pipeline.json).
+was 1.01e-06 after the full chain. Full pipeline report (`docs/benchmarks/pipeline.json`).
 Setup, validation, warmup, cache clearing, and final output destruction are
 outside both suites' timed intervals. Their JSON reports contain exact commands,
 versions, origins, seeds, extension hashes, and raw samples.
