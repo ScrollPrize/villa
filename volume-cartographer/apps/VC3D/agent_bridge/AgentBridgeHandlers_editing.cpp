@@ -1,4 +1,5 @@
 #include "agent_bridge/AgentBridgeServer.hpp"
+#include "agent_bridge/AgentBridgeInput.hpp"
 #include "agent_bridge/AgentBridgeInternal.hpp"
 
 #include <QBuffer>
@@ -82,38 +83,6 @@ QString mouseButtonToJson(Qt::MouseButton button)
     }
 }
 
-Qt::KeyboardModifiers jsonToModifiers(const QJsonValue& value)
-{
-    Qt::KeyboardModifiers mods = Qt::NoModifier;
-    if (value.isUndefined() || value.isNull())
-        return mods;
-    for (const QJsonValue& mv : value.toArray()) {
-        const QString s = mv.toString();
-        if (s == QLatin1String("shift"))
-            mods |= Qt::ShiftModifier;
-        else if (s == QLatin1String("ctrl"))
-            mods |= Qt::ControlModifier;
-        else if (s == QLatin1String("alt"))
-            mods |= Qt::AltModifier;
-        else if (s == QLatin1String("meta"))
-            mods |= Qt::MetaModifier;
-        else if (s == QLatin1String("keypad"))
-            mods |= Qt::KeypadModifier;
-    }
-    return mods;
-}
-
-QJsonArray modifiersToJson(Qt::KeyboardModifiers mods)
-{
-    QJsonArray arr;
-    if (mods & Qt::ShiftModifier)   arr.append(QStringLiteral("shift"));
-    if (mods & Qt::ControlModifier) arr.append(QStringLiteral("ctrl"));
-    if (mods & Qt::AltModifier)     arr.append(QStringLiteral("alt"));
-    if (mods & Qt::MetaModifier)    arr.append(QStringLiteral("meta"));
-    if (mods & Qt::KeypadModifier)  arr.append(QStringLiteral("keypad"));
-    return arr;
-}
-
 } // namespace
 
 
@@ -121,17 +90,52 @@ QJsonArray modifiersToJson(Qt::KeyboardModifiers mods)
 // Canvas + viewer control
 // ---------------------------------------------------------------------------
 
+CChunkedVolumeViewer* AgentBridgeServer::requireChunkedViewer(VolumeViewerBase* viewer,
+                                                              const QString& operation)
+{
+    auto* chunked = dynamic_cast<CChunkedVolumeViewer*>(viewer);
+    if (!chunked) {
+        QJsonObject data;
+        data["detail"] = "viewer is not a chunked volume viewer";
+        throw AgentBridgeError{-32009,
+            QStringLiteral("Unsupported viewer for %1").arg(operation), data};
+    }
+    return chunked;
+}
+
+
+QPointF AgentBridgeServer::canvasScenePoint(VolumeViewerBase* viewer,
+                                            const QJsonValue& position,
+                                            const QString& space) const
+{
+    if (space == QLatin1String("scene")) {
+        const QJsonObject po = position.toObject();
+        return QPointF(jsonRequireFiniteFloat(po.value("x"), "x"),
+                       jsonRequireFiniteFloat(po.value("y"), "y"));
+    }
+    const cv::Vec3f vol = jsonToVec3(position, "position");
+    const QPointF scenePos = viewer->volumeToScene(vol);
+    // Verify the round-trip lands within 2.0 voxels: otherwise the point is
+    // not on this viewer's current slice/surface view.
+    const cv::Vec3f back = viewer->sceneToVolume(scenePos);
+    const double dist = cv::norm(back - vol);
+    if (!std::isfinite(dist) || dist > 2.0) {
+        QJsonObject data;
+        data["point"] = vec3ToJson(vol);
+        data["detail"] = QStringLiteral("point is not on this viewer's view (round-trip %1 voxels)")
+                             .arg(dist, 0, 'f', 3);
+        throw AgentBridgeError{-32003, "Invalid coordinates", data};
+    }
+    return scenePos;
+}
+
+
 QJsonObject AgentBridgeServer::handleCanvasClick(const QJsonValue& params, bool addShift)
 {
     const QJsonObject p = params.toObject();
 
     VolumeViewerBase* viewer = resolveViewer(p.value("viewer"));
-    auto* chunked = dynamic_cast<CChunkedVolumeViewer*>(viewer);
-    if (!chunked) {
-        QJsonObject data;
-        data["detail"] = "viewer is not a chunked volume viewer";
-        throw AgentBridgeError{-32009, "Unsupported viewer for canvas operation", data};
-    }
+    CChunkedVolumeViewer* chunked = requireChunkedViewer(viewer);
     if (!chunked->currentVolume())
         throw AgentBridgeError{-32001, "No volume loaded", {}};
 
@@ -140,29 +144,9 @@ QJsonObject AgentBridgeServer::handleCanvasClick(const QJsonValue& params, bool 
     if (addShift)
         modifiers |= Qt::ShiftModifier;
 
-    const QString space =
-        p.value("space").toString(QStringLiteral("volume"));
-    QPointF scenePos;
-    if (space == QLatin1String("scene")) {
-        const QJsonValue posv = p.value("position");
-        const QJsonObject po = posv.toObject();
-        scenePos = QPointF(jsonRequireFiniteFloat(po.value("x"), "x"),
-                           jsonRequireFiniteFloat(po.value("y"), "y"));
-    } else if (space == QLatin1String("volume")) {
-        const cv::Vec3f vol = jsonToVec3(p.value("position"), "position");
-        scenePos = chunked->volumeToScene(vol);
-        // Verify the round-trip lands within 2.0 voxels: otherwise the point is
-        // not on this viewer's current slice/surface view.
-        const cv::Vec3f back = chunked->sceneToVolume(scenePos);
-        const double dist = cv::norm(back - vol);
-        if (!std::isfinite(dist) || dist > 2.0) {
-            QJsonObject data;
-            data["point"] = vec3ToJson(vol);
-            data["detail"] = QStringLiteral("point is not on this viewer's view (round-trip %1 voxels)")
-                                 .arg(dist, 0, 'f', 3);
-            throw AgentBridgeError{-32003, "Invalid coordinates", data};
-        }
-    }
+    const QPointF scenePos = canvasScenePoint(
+        chunked, p.value("position"),
+        p.value("space").toString(QStringLiteral("volume")));
 
     // Synthesize the full click through the real mouse slots so all signal
     // wiring (sendVolumeClicked -> CWindow::onVolumeClicked, point placement,
@@ -809,12 +793,7 @@ QJsonObject AgentBridgeServer::handleCanvasDrag(const QJsonValue& params)
     const QJsonObject p = params.toObject();
 
     VolumeViewerBase* viewer = resolveViewer(p.value("viewer"));
-    auto* chunked = dynamic_cast<CChunkedVolumeViewer*>(viewer);
-    if (!chunked) {
-        QJsonObject data;
-        data["detail"] = "viewer is not a chunked volume viewer";
-        throw AgentBridgeError{-32009, "Unsupported viewer for canvas operation", data};
-    }
+    CChunkedVolumeViewer* chunked = requireChunkedViewer(viewer);
     if (!chunked->currentVolume())
         throw AgentBridgeError{-32001, "No volume loaded", {}};
 

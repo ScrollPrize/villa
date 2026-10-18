@@ -110,12 +110,7 @@ QJsonObject AgentBridgeServer::handleWrapAnnotationCommit(const QJsonValue& para
         // Resolve an explicit target and commit on that viewer, using the same
         // round-trip resolution as canvas.click.
         VolumeViewerBase* viewer = resolveViewer(p.value("viewer"));
-        auto* chunked = dynamic_cast<CChunkedVolumeViewer*>(viewer);
-        if (!chunked) {
-            QJsonObject data;
-            data["detail"] = "viewer is not a chunked volume viewer";
-            throw AgentBridgeError{-32009, "Unsupported viewer for canvas operation", data};
-        }
+        CChunkedVolumeViewer* chunked = requireChunkedViewer(viewer);
         hadPreview = chunked->hasSameWrapAnnotationPreview();
         committed = chunked->commitSameWrapAnnotationPreview();
     } else {
@@ -154,12 +149,7 @@ QJsonObject AgentBridgeServer::handleWrapAnnotationUndo(const QJsonValue& params
 
     if (p.contains("viewer") && !p.value("viewer").isNull()) {
         VolumeViewerBase* viewer = resolveViewer(p.value("viewer"));
-        auto* chunked = dynamic_cast<CChunkedVolumeViewer*>(viewer);
-        if (!chunked) {
-            QJsonObject data;
-            data["detail"] = "viewer is not a chunked volume viewer";
-            throw AgentBridgeError{-32009, "Unsupported viewer for canvas operation", data};
-        }
+        CChunkedVolumeViewer* chunked = requireChunkedViewer(viewer);
         undone = chunked->undoSameWrapAnnotation();
     } else {
         ViewerManager* vm = _window ? _window->_viewerManager.get() : nullptr;

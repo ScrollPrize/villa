@@ -12,6 +12,7 @@
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QObject>
+#include <QPointF>
 #include <QPointer>
 #include <QString>
 #include <QStringList>
@@ -31,6 +32,7 @@ class QLocalServer;
 class QLocalSocket;
 class QTimer;
 class QWidget;
+class CChunkedVolumeViewer;
 class CWindow;
 class ViewerManager;
 class VolumeViewerBase;
@@ -180,6 +182,16 @@ private:
     QJsonObject handleCursorVolumePoint(const QJsonValue& params);
     QJsonObject handleCanvasClick(const QJsonValue& params, bool addShift);
     QJsonObject handleCanvasDrag(const QJsonValue& params);
+    // The viewer as a chunked volume viewer; any other kind of viewer throws
+    // -32009 "Unsupported viewer for <operation>".
+    static CChunkedVolumeViewer* requireChunkedViewer(
+        VolumeViewerBase* viewer,
+        const QString& operation = QStringLiteral("canvas operation"));
+    // Converts a canvas "position" in `space` ("volume" or "scene") to a scene
+    // point; a volume point must round-trip onto the viewer's current view
+    // (-32003).
+    QPointF canvasScenePoint(VolumeViewerBase* viewer, const QJsonValue& position,
+                             const QString& space) const;
     QJsonObject handleViewerCenterOnPoint(const QJsonValue& params);
     QJsonObject handleViewerZoom(const QJsonValue& params);
     QJsonObject handleViewerRotate(const QJsonValue& params);

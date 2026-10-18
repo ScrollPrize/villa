@@ -323,6 +323,7 @@ set(srcs
     agent_bridge/AgentBridgeMethods_viewer.cpp
     agent_bridge/AgentBridgeMethods_wrap.cpp
     agent_bridge/AgentBridgeCommandError.hpp
+    agent_bridge/AgentBridgeInput.hpp
     agent_bridge/AgentBridgeInternal.hpp
     agent_bridge/AgentBridgeUi.hpp
     agent_bridge/AgentBridgeWorkspaces.cpp

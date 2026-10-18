@@ -975,12 +975,7 @@ QJsonObject AgentBridgeServer::handleCursorVolumePoint(const QJsonValue& params)
     const QJsonObject p = params.toObject();
 
     VolumeViewerBase* viewer = resolveViewer(p.value("viewer"));
-    auto* chunked = dynamic_cast<CChunkedVolumeViewer*>(viewer);
-    if (!chunked) {
-        QJsonObject data;
-        data["detail"] = "viewer is not a chunked volume viewer";
-        throw AgentBridgeError{-32009, "Unsupported viewer for canvas operation", data};
-    }
+    CChunkedVolumeViewer* chunked = requireChunkedViewer(viewer);
 
     if (!chunked->currentVolume())
         throw AgentBridgeError{-32001, "No volume loaded", {}};
