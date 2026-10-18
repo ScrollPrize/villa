@@ -206,6 +206,64 @@ class PrecisionTests(unittest.TestCase):
             result = pipeline({'image': image}, seed=0)['image']
             self.assertEqual(result[0, 1, 4096], delta)
 
+    def test_gaussian_tiles_and_boundaries(self):
+        # Independent separable reference: partial CUDA tiles, multiple rows,
+        # singleton axes, identity taps, and radii on either side of the tiled
+        # dispatch limit. No optional SciPy dependency is needed.
+        rng = np.random.default_rng(418)
+        for shape in ((1, 1), (9, 35), (2, 9, 257), (3, 1, 7)):
+            for dtype in (np.float32, np.float64):
+                image = rng.standard_normal((2, *shape)).astype(dtype)
+                for sigma in (0, .1, .7, 10.75, 11):
+                    extent = sigma * 6 + .5
+                    size = round(extent)
+                    if size % 2 == 0:
+                        size += 1 if extent >= size else -1
+                    radius = max(0, (size - 1) // 2)
+                    weights = np.exp(-.5 * (np.arange(-radius, radius+1) / sigma)**2) if sigma else np.ones(1)
+                    weights = (weights / weights.sum()).astype(dtype)
+                    for edge in ('mirror', 'reflect', 'nearest'):
+                        expected = image.copy()
+                        for axis, n in enumerate(shape, start=1):
+                            result = np.zeros_like(expected)
+                            for j, weight in enumerate(weights):
+                                indices = np.arange(n) + j - radius
+                                if edge == 'nearest' or n == 1:
+                                    indices = np.clip(indices, 0, n-1)
+                                else:
+                                    period = 2 * (n-1) if edge == 'mirror' else 2*n
+                                    indices %= period
+                                    indices = np.where(indices < n, indices, period-indices-(edge == 'reflect'))
+                                result += weight * np.take(expected, indices, axis=axis)
+                            expected = result
+                        for backend in self.backends():
+                            with self.subTest(shape=shape, dtype=dtype, sigma=sigma, edge=edge, backend=backend):
+                                pipeline = A.Pipeline([A.GaussianBlur(sigma, boundary=edge)], backend=backend, compact=False)
+                                out = pipeline({'image': image}, seed=31)['image']
+                                tolerance = 2e-6 if dtype == np.float32 else 1e-13
+                                np.testing.assert_allclose(out, expected, atol=tolerance, rtol=tolerance)
+
+    def test_separate_blur_output(self):
+        # Local smoothing retains the source for blending. Exercise no passes,
+        # even/odd pass counts, and shared-memory/general convolution paths.
+        rng = np.random.default_rng(419)
+        for shape in ((9, 35), (3, 9, 35)):
+            for dtype in (np.float32, np.float64):
+                image = rng.random((2, *shape)).astype(dtype)
+                original = image.copy()
+                for sigma in (0, .01, .7, 8.25):
+                    transforms = [A.LocalSmoothing(scale=3, loc=.5, strength=.7, sigma=sigma)]
+                    if len(shape) == 3 and sigma > 0:
+                        transforms.append(A.UnsharpMask(sigma=sigma))
+                    for transform in transforms:
+                        expected = A.Pipeline([transform], backend='cpu', compact=False)({'image': image}, seed=41)['image']
+                        for backend in self.backends():
+                            with self.subTest(shape=shape, dtype=dtype, transform=repr(transform), backend=backend):
+                                pipeline = A.Pipeline([transform], backend=backend, compact=False)
+                                out = pipeline({'image': image}, seed=41)['image']
+                                np.testing.assert_allclose(out, expected, atol=2e-6, rtol=2e-6)
+                                np.testing.assert_array_equal(image, original)
+
     def test_zscore_large_baseline_small_deviation(self):
         image = np.full((1, 17, 19), 1e6, dtype=np.float32)
         image.ravel()[::3] += .125

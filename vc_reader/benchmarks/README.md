@@ -6,12 +6,105 @@ Generated JSON reports under `docs/benchmarks/` are kept locally and ignored by
 Git. Report paths below refer to those local files; benchmark input fixtures
 remain versioned.
 
-Current results were refreshed **2026-10-17** at `0fd629ebd`, with the same
+Catalog-wide results were refreshed **2026-10-17** at `0fd629ebd`, with the same
 Release extensions for every suite. The refresh manifest (`docs/benchmarks/refresh.json`)
 records report hashes and coverage. Current results are in the PyTorch, resident
 geometry, augmentation catalog, and reader/pipeline sections. The two optimization
 history sections are explicitly marked historical and retain their original data.
+The Gaussian experiment below measures subsequent changes separately; it does
+not replace the catalog-wide refresh.
 
+## Gaussian filter work reduction (2026-10-17)
+
+The real training-loader profile identified Gaussian convolution as 28.4% of
+GPU kernel time. The CUDA implementation now extends shared-memory tiles once
+and reuses their samples across outputs, instead of fetching and boundary-mapping
+every tap independently. It uses 128-element rows for the contiguous axis and
+eight positions on 32 adjacent lines for other axes. Small-array tile arithmetic
+uses 32-bit indices with headroom for inactive threads; large arrays retain
+64-bit indices. Radii above 32 retain the general convolution implementation.
+CPU convolution already extends rows and shares boundary tables.
+
+LocalSmoothing and UnsharpMask now call the same blur implementation with
+separate input/output buffers. Choosing buffers by pass parity eliminates the
+initial image copy and the final result copy for a three-axis blur: two fewer
+8 MiB copies per 128³ float32 crop. Identity kernels also skip filtering and
+scratch allocation. Coefficients, tap order, boundary modes, image dtypes,
+overflow handling, and random draws remain unchanged; CUDA FMA remains enabled.
+
+Measured on RTX 5090, Release CUDA architecture 120, PHercParis4 level 2,
+128³ crops. The single-transform cases use the README recipes, crop origin
+`(9000, 3600, 3600)`, float32 CT / 255, one CPU thread, five warmups and 30
+measurements per route (seeds 123–152). Cases/routes are deterministically
+shuffled. Resident timings include public-call copies/validation and exclude
+initial upload, final download, and output disposal. Values below are
+**mean / p50 / p95 milliseconds**; timing tails remain noisy.
+
+| Resident CUDA transform | Before | After |
+| --- | ---: | ---: |
+| GaussianBlur | 0.278 / 0.272 / 0.341 | 0.181 / 0.183 / 0.241 |
+| LocalSmoothing | 0.492 / 0.529 / 0.597 | 0.430 / 0.441 / 0.702 |
+| UnsharpMask | 0.460 / 0.489 / 0.672 | 0.370 / 0.407 / 0.563 |
+| SheetCompression | 1.113 / 1.087 / 1.268 | 0.928 / 0.888 / 1.034 |
+
+The full loader uses min-max normalization and the shared 12-transform chain,
+four spawned CPU loader workers, four reader threads per worker, and batches of
+four crops. Each route has one validation/warmup epoch, then three repetitions
+of 64 batches with rotating route order and warm caches. Timings include reads,
+upload/casts, augmentation, collation, output disposal, and stream completion;
+they exclude model execution. All 256 validation crop hashes matched across
+routes **and across the before/after builds**.
+
+| Loader route | Before mean / p50 / p95 ms | After mean / p50 / p95 ms | Crops/s before → after |
+| --- | ---: | ---: | ---: |
+| `Pipeline.batch()` | 5.310 / 4.883 / 5.889 | 4.461 / 4.053 / 4.900 | 752.93 → 896.23 (+19.0%) |
+| `CudaLoader` prefetch | 5.153 / 4.772 / 5.736 | 4.393 / 3.980 / 4.701 | 775.96 → 910.19 (+17.3%) |
+
+Separate Nsight Systems runs cover four warmup and four measured batches
+(32 crops). Convolution kernel time fell from **8.808 to 2.553 ms (3.45×)**;
+total kernel time fell from 31.052 to 24.946 ms. Device-to-device copies fell
+from 288 to 224, confirming two eliminated copies per crop. The largest remaining
+kernel groups are trilinear resampling (13.6%), statistics collection (12.7%),
+and dense local-field expansion (10.6%). Instrumented wall times are excluded
+from performance comparisons. [Before profile](../docs/benchmarks/gaussian-profile-before.csv)
+and [after profile](../docs/benchmarks/gaussian-profile-after.csv) retain the data.
+
+The local JSON reports `docs/benchmarks/gaussian-{before,after}.json`,
+`gaussian-loader-{before,after}.json`, and `gaussian-profile-{before,after}.json`
+record commands, input hashes, extension hashes, raw measurements, and validation.
+Reproduce with the existing environments/builds (no setup required):
+
+```bash
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-reader-cuda --target _augment --parallel 4
+VC_BENCH_VOLUME=/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr
+# Use /tmp/vc-filter-baseline and a separate output path for the saved before build.
+AGENTS_AGENT_MODE=1 .venv/bin/python benchmarks/bench_augmentations.py \
+  --native-dir /tmp/vc-reader-cuda --array "$VC_BENCH_VOLUME" \
+  --only GaussianBlur LocalSmoothing UnsharpMask SheetCompression \
+  --warmup 5 --reps 30 --output /tmp/filter-final-after.json
+AGENTS_AGENT_MODE=1 .venv/bin/python benchmarks/bench_torch.py \
+  --native-dir /tmp/vc-reader-cuda --modes batch prefetch \
+  --array "$VC_BENCH_VOLUME" --level 2 --batches 64 --batch-size 4 --reps 3 \
+  --output /tmp/filter-loader-after.json
+AGENTS_AGENT_MODE=1 nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
+  --force-overwrite=true --output=/tmp/filter-profile-final \
+  .venv/bin/python benchmarks/bench_torch.py --native-dir /tmp/vc-reader-cuda \
+  --modes prefetch --array "$VC_BENCH_VOLUME" --level 2 \
+  --batches 4 --batch-size 4 --reps 1 --output /tmp/filter-profile-final.json
+nsys stats --report cuda_gpu_kern_sum,cuda_gpu_mem_time_sum --format csv \
+  /tmp/filter-profile-final.nsys-rep
+AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=/tmp/vc-reader-cuda \
+  .venv/bin/python -m unittest discover -s tests -v
+```
+
+All 33 tests pass with CUDA, including stream, replay, backward, and spawn-worker
+coverage. New numerical tests compare an independent NumPy separable reference
+over signed float32/float64 data, partial tiles, singleton axes, all three edge
+modes, identity filters, and radii 32/33. Separate-output tests cover even/odd
+pass counts and preservation of source images. The CPU-only precision suite
+also passes. Real CT CPU/CUDA differences stay below 5.01e-6 for all four
+affected recipes. Performance was measured on Linux amd64/RTX 5090 only;
+macOS/arm64 and arrays requiring 64-bit indexing were not runtime-tested.
 
 ## PyTorch CUDA batches
 
