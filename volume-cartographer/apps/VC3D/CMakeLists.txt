@@ -122,6 +122,8 @@ set(srcs
     elements/ViewerSplitGrid.cpp
     elements/ViewerSplitGrid.hpp
     SettingsDialog.cpp
+    themes/ClassicTheme.cpp
+    themes/ClassicTheme.hpp
     SurfaceTreeWidget.hpp
     SurfaceTreeWidget.cpp
     SurfaceDisplayName.hpp
