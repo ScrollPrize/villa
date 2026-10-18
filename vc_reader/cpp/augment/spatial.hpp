@@ -31,12 +31,12 @@ inline std::int64_t nearest_index(double q, int mode) {
     auto lo = std::int64_t(std::floor(q)); auto fraction = q - lo;
     return mode == 2 ? lo : lo + (fraction > .5 || (fraction == .5 && (mode == 1 || lo % 2 != 0)));
 }
-template<std::size_t D = 0, bool Validity = false, class F> double linear_value(const Grid& g, Point q, bool border, double fill, F&& get) {
-    std::int64_t lo[3]; double fraction[3]; const auto d = D ? D : g.shape.size();
+template<std::size_t D = 0, bool Validity = false, class Real, class F> Real linear_value(const Grid& g, std::array<Real,3> q, bool border, double fill, F&& get) {
+    std::int64_t lo[3]; Real fraction[3]; const auto d = D ? D : g.shape.size();
     for (std::size_t a = 0; a < d; ++a) {
         require(std::isfinite(q[a]), "nonfinite sampling coordinate");
-        if (border) q[a] = std::clamp(q[a], 0., double(g.shape[a] - 1));
-        if (q[a] < -1 || q[a] > double(g.shape[a])) return fill;
+        if (border) q[a] = std::clamp(q[a], Real(0), Real(g.shape[a] - 1));
+        if (q[a] < -1 || q[a] > Real(g.shape[a])) return fill;
         lo[a] = std::int64_t(std::floor(q[a])); fraction[a] = q[a] - lo[a];
     }
     // Interior stencils need no per-corner bounds checks. Keep the corner and
@@ -47,10 +47,10 @@ template<std::size_t D = 0, bool Validity = false, class F> double linear_value(
         interior &= lo[a] >= 0 && lo[a] + 1 < std::int64_t(g.shape[a]);
         if (lo[a] >= 0) base += std::size_t(lo[a]) * g.stride[a];
     }
-    double result = 0;
+    Real result = 0;
     if (interior) {
         for (std::size_t corner = 0; corner < (std::size_t(1) << d); ++corner) {
-            std::size_t at = base; double weight = 1;
+            std::size_t at = base; Real weight = 1;
             for (std::size_t a = 0; a < d; ++a) {
                 auto bit = (corner >> a) & 1;
                 weight *= bit ? fraction[a] : 1 - fraction[a];
@@ -64,7 +64,7 @@ template<std::size_t D = 0, bool Validity = false, class F> double linear_value(
         return Validity ? 1. : result;
     }
     for (std::size_t corner = 0; corner < (std::size_t(1) << d); ++corner) {
-        bool valid = true; std::size_t at = 0; double weight = 1;
+        bool valid = true; std::size_t at = 0; Real weight = 1;
         for (std::size_t a = 0; a < d; ++a) {
             auto bit = (corner >> a) & 1; auto x = lo[a] + std::int64_t(bit);
             weight *= bit ? fraction[a] : 1 - fraction[a];
@@ -72,8 +72,8 @@ template<std::size_t D = 0, bool Validity = false, class F> double linear_value(
             else at += std::size_t(x) * g.stride[a];
         }
         if (weight) {
-            if constexpr (Validity) { if ((valid ? get(at) : fill) < 1.) return 0.; }
-            else result += weight * (valid ? get(at) : fill);
+            if constexpr (Validity) { if ((valid ? Real(get(at)) : Real(fill)) < 1.) return 0.; }
+            else result += weight * (valid ? Real(get(at)) : Real(fill));
         }
     }
     return Validity ? 1. : result;
@@ -209,7 +209,22 @@ inline void resample_axis_displacement(const Array& src, Array& out, const Param
                 }
     });
 }
-template<std::size_t D> Array resample_impl(const Array& src, const Parameters& p, bool nearest, double fill, bool validity = false, std::size_t field_axis = D) {
+// Float32 has enough resolution for ordinary crop-local resampling. Use a
+// conservative absolute error budget; large coordinates/cancelling affine terms
+// need more mantissa bits.
+inline bool geometry_float32(const Parameters& p, const Shape& input) {
+    constexpr double budget = 1e-3, roundoff = 8 * std::numeric_limits<float>::epsilon();
+    for (std::size_t a=0;a<p.shape.size();++a) {
+        double bound=std::abs(p.offset[a]);
+        for (std::size_t b=0;b<p.shape.size();++b) bound += std::abs(p.matrix[a*p.shape.size()+b])*double(p.shape[b]-1);
+        // For in-bounds samples, |displacement| <= |affine| + input extent.
+        // Coordinates far outside the input require no subvoxel precision.
+        bound = 2*bound + double(input[a]) + 1;
+        if (bound*roundoff > budget) return false;
+    }
+    return true;
+}
+template<std::size_t D, class Real> Array resample_impl(const Array& src, const Parameters& p, bool nearest, double fill, bool validity = false, std::size_t field_axis = D) {
     Grid input(src.spatial()), output(p.shape); constexpr auto d = D;
     Shape shape{src.shape[0]}; shape.insert(shape.end(), p.shape.begin(), p.shape.end()); auto out = Array::uninitialized(shape, src.kind, src.bytes);
     if (resample_exact(src, out, p, fill, validity)) return out;
@@ -225,12 +240,16 @@ template<std::size_t D> Array resample_impl(const Array& src, const Parameters& 
         for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y)
             for (std::size_t x = 0; x < nx; ++x) {
             const auto i = (z * ny + y) * nx + x;
-            Point pos{};
-            if constexpr (d == 3) pos[0] = double(z);
-            pos[d - 2] = double(y); pos[d - 1] = double(x);
-            auto q = displaced_identity ? pos : matvec(p.matrix, pos, d);
+            std::array<Real,3> pos{};
+            if constexpr (d == 3) pos[0] = Real(z);
+            pos[d - 2] = Real(y); pos[d - 1] = Real(x);
+            auto q = pos;
+            if (!displaced_identity) {
+                q = {};
+                for (std::size_t a=0;a<d;++a) for(std::size_t b=0;b<d;++b) q[a] += Real(p.matrix[a*d+b])*pos[b];
+            }
             for (std::size_t a = 0; a < d; ++a) {
-                q[a] += p.offset[a];
+                q[a] += Real(p.offset[a]);
                 // The displacement is already sampled on this output grid.
                 if (!p.field.empty()) q[a] += p.field[i * d + a];
             }
@@ -238,8 +257,8 @@ template<std::size_t D> Array resample_impl(const Array& src, const Parameters& 
                 bool valid = true; std::size_t at = 0;
                 for (std::size_t a = 0; a < d; ++a) {
                     require(std::isfinite(q[a]), "nonfinite sampling coordinate");
-                    if (p.border) q[a] = std::clamp(q[a], 0., double(input.shape[a] - 1));
-                    if (q[a] < -1 || q[a] > double(input.shape[a])) { valid = false; continue; }
+                    if (p.border) q[a] = std::clamp(q[a], Real(0), Real(input.shape[a] - 1));
+                    if (q[a] < -1 || q[a] > Real(input.shape[a])) { valid = false; continue; }
                     auto x = nearest_index(q[a], p.nearest_mode);
                     if (x < 0 || x >= std::int64_t(input.shape[a])) valid = false; else at += std::size_t(x) * input.stride[a];
                 }
@@ -249,10 +268,10 @@ template<std::size_t D> Array resample_impl(const Array& src, const Parameters& 
                 }
             } else {
                 for (std::size_t c = 0; c < src.shape[0]; ++c) {
-                    auto get = [&](auto at) { return double(source[c * input.size + at]); };
+                    auto get = [&](auto at) { return Real(source[c * input.size + at]); };
                     // Check support directly: a rounded sum of all-one samples
                     // can be below 1 even though every contributor is valid.
-                    double value = validity ? linear_value<D, true>(input,q,false,fill,get)
+                    Real value = validity ? linear_value<D, true>(input,q,false,fill,get)
                                             : linear_value<D>(input,q,p.border,fill,get);
                     if constexpr (std::is_floating_point_v<T>) destination[c * output.size + i] = static_cast<T>(value);
                     else out.set(c * output.size + i, value);
@@ -305,21 +324,6 @@ inline void apply_geometry_with(Sample& sample, const Parameters& p, Resample&& 
     restore_valid(sample);
 }
 inline void apply_geometry(Sample& sample, const Parameters& p) { apply_geometry_with(sample, p, resample); }
-// Float32 has enough resolution for ordinary crop-local resampling. Use a
-// conservative absolute error budget; large coordinates/cancelling affine terms
-// need more mantissa bits.
-inline bool geometry_float32(const Parameters& p, const Shape& input) {
-    constexpr double budget = 1e-3, roundoff = 8 * std::numeric_limits<float>::epsilon();
-    for (std::size_t a=0;a<p.shape.size();++a) {
-        double bound=std::abs(p.offset[a]);
-        for (std::size_t b=0;b<p.shape.size();++b) bound += std::abs(p.matrix[a*p.shape.size()+b])*double(p.shape[b]-1);
-        // For in-bounds samples, |displacement| <= |affine| + input extent.
-        // Coordinates far outside the input require no subvoxel precision.
-        bound = 2*bound + double(input[a]) + 1;
-        if (bound*roundoff > budget) return false;
-    }
-    return true;
-}
 inline Parameters geometry(Shape shape) { Parameters p; p.matrix = identity(shape.size()); p.offset.assign(shape.size(), 0); p.shape = std::move(shape); return p; }
 struct Flip { std::string axes; double p_axis = .5, p = 1; };
 struct Rotate90 { std::vector<std::string> planes; Choice turns{{1, 2, 3}}; bool resize = false; double p = 1; };

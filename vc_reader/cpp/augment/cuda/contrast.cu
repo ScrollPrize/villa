@@ -3,7 +3,7 @@ namespace vcr::augment::cuda {
 namespace {
 struct Function {
     double factor; bool clip;
-    template<class T> __device__ double operator()(T x, std::size_t i, Layout g, const float* field, const Statistics* stats) const { double y = (to_double(x)-stats->mean)*factor+stats->mean; return clip ? clamp_value(y,stats->low,stats->high) : y; }
+    template<class T> __device__ T operator()(T x, std::size_t i, Layout g, const float* field, const Statistics* stats) const { T m=T(stats->mean), y=(x-m)*T(factor)+m; return clip ? fmin(fmax(y,T(stats->low)),T(stats->high)) : y; }
 };
 }
 void apply_cuda(const Contrast& t, Sample& s, const Parameters& p, Session& session) {

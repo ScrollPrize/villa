@@ -18,7 +18,7 @@ struct IlluminationKernel {
     }
 };
 inline IlluminationKernel make_kernel(const Illumination& t,const ChannelPlan& p) { return {p.values[0],p.values[1],t.mode,{p.values[2],p.values[3],p.values[4]},{p.values[5],p.values[6],p.values[7]}}; }
-inline void channel_apply(const Illumination& t,std::vector<double>& v,const Grid& g,const ChannelPlan& p) {
+template<class T> inline void channel_apply(const Illumination& t,std::vector<T>& v,const Grid& g,const ChannelPlan& p) {
     volume_detail::map_channel(v,g,make_kernel(t,p));
 }
 inline void apply(const Illumination& t,Sample& s,const Parameters& p) { volume_detail::apply_checked_channels(t,s,p); }

@@ -20,7 +20,7 @@ struct AdditiveNoiseKernel {
     }
 };
 inline AdditiveNoiseKernel make_kernel(const AdditiveNoise& t,const ChannelPlan& p) { return {p.values[0],p.values[1],p.values[2],p.values[3],t.distribution,p.seed}; }
-inline void channel_apply(const AdditiveNoise& t,std::vector<double>& v,const Grid& g,const ChannelPlan& p) {
+template<class T> inline void channel_apply(const AdditiveNoise& t,std::vector<T>& v,const Grid& g,const ChannelPlan& p) {
     volume_detail::map_channel(v,g,make_kernel(t,p));
 }
 inline Parameters sample(const AdditiveNoise& t,const Sample& s,Random& r) { return volume_detail::sample_noise(t,s,r); }

@@ -13,7 +13,7 @@ struct HistogramMatchingKernel {
         double mapped=c.reference.low+(c.reference.high-c.reference.low)*double(j)/(bins-1);return (1-blend)*v[i]+blend*mapped;
     }
 };
-inline void channel_apply(const HistogramMatching& t,std::vector<double>& v,const Grid& g,const ChannelPlan& p) {
+template<class T> inline void channel_apply(const HistogramMatching& t,std::vector<T>& v,const Grid& g,const ChannelPlan& p) {
     using namespace volume_detail;auto ref=reference_channel(t.reference,p.channel);auto summary=stats(ref.data(),ref.size());auto input=stats(v.data(),v.size());std::vector<double> table(2*t.bins);
     histogram(v.data(),v.size(),table.data(),t.bins,input.low,input.high);cdf(table.data(),t.bins);
     histogram(ref.data(),ref.size(),table.data()+t.bins,t.bins,summary.low,summary.high);cdf(table.data()+t.bins,t.bins);

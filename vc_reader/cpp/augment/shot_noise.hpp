@@ -15,7 +15,7 @@ struct ShotNoiseKernel {
     }
 };
 inline ShotNoiseKernel make_kernel(const ShotNoise& t,const ChannelPlan& p) { return {p.values[0],p.seed}; }
-inline void channel_apply(const ShotNoise& t,std::vector<double>& v,const Grid& g,const ChannelPlan& p) {
+template<class T> inline void channel_apply(const ShotNoise& t,std::vector<T>& v,const Grid& g,const ChannelPlan& p) {
     volume_detail::map_channel(v,g,make_kernel(t,p));
 }
 inline Parameters sample(const ShotNoise& t,const Sample& s,Random& r) { return volume_detail::sample_noise(t,s,r); }

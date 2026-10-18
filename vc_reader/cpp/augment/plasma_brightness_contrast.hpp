@@ -18,11 +18,11 @@ struct PlasmaBrightnessContrastKernel {
     }
 };
 inline PlasmaBrightnessContrastKernel make_kernel(const PlasmaBrightnessContrast& t,const ChannelPlan& p) { return {p.values[0],p.values[1],p.values[2],p.values[3],t.octaves,p.seed}; }
-inline void channel_apply(const PlasmaBrightnessContrast& t,std::vector<double>& v,const Grid& g,const ChannelPlan& p) {
+template<class T> inline void channel_apply(const PlasmaBrightnessContrast& t,std::vector<T>& v,const Grid& g,const ChannelPlan& p) {
     const auto kernel=make_kernel(t,p);
     const auto input=volume_detail::stats(v.data(),v.size());
     const auto field=volume_detail::fractal_field(g,kernel.seed,kernel.scale,kernel.persistence,kernel.octaves);
-    for(std::size_t i=0;i<v.size();++i)v[i]=kernel.apply_field(v[i],field[i],input);
+    for(std::size_t i=0;i<v.size();++i)v[i]=kernel.apply_field(v[i],T(field[i]),input);
 }
 inline void apply(const PlasmaBrightnessContrast& t,Sample& s,const Parameters& p) { volume_detail::apply_checked_channels(t,s,p); }
 } // namespace vcr::augment

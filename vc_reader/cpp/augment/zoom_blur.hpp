@@ -15,7 +15,7 @@ struct ZoomBlurKernel {
     }
 };
 inline ZoomBlurKernel make_kernel(const ZoomBlur& t,const ChannelPlan& p) { return {p.values[0],{p.values[1],p.values[2],p.values[3]},t.samples}; }
-inline void channel_apply(const ZoomBlur& t,std::vector<double>& v,const Grid& g,const ChannelPlan& p) {
+template<class T> inline void channel_apply(const ZoomBlur& t,std::vector<T>& v,const Grid& g,const ChannelPlan& p) {
     volume_detail::map_channel(v,g,make_kernel(t,p));
 }
 inline void apply(const ZoomBlur& t,Sample& s,const Parameters& p) { volume_detail::apply_checked_channels(t,s,p); }

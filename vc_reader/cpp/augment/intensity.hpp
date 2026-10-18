@@ -62,14 +62,18 @@ inline ChannelPlan channel_parameters(const MedianFilter& t, const Array&, Rando
 }
 inline ChannelPlan channel_parameters(const Sharpen& t, const Array&, Random& r) { return {"", 0, {draw(t.strength, r), double(r.chance(t.p_clamp))}}; }
 
-inline std::vector<std::vector<double>> local_axes(const LocalOptions& t, const Grid& g, Random& r) {
-    std::vector<std::vector<double>> kernels(g.shape.size());
+inline std::vector<std::vector<float>> local_axes(const LocalOptions& t, const Grid& g, Random& r) {
+    std::vector<std::vector<float>> kernels(g.shape.size());
     for (std::size_t a = 0; a < g.shape.size(); ++a) {
         double center = draw(t.loc, r) * g.shape[a], sigma = draw(t.scale, r);
         require(sigma > 0, "local Gaussian scale must be positive");
         kernels[a].resize(g.shape[a]);
         for (std::size_t x = 0; x < g.shape[a]; ++x)
             kernels[a][x] = .5 * (std::erf((x + .5 - center) / (sigma * std::sqrt(2.))) - std::erf((x - .5 - center) / (sigma * std::sqrt(2.))));
+        // erf differences need extra precision in the tails; normalize the
+        // axis before forming products so bounded float32 fields cannot underflow.
+        const float peak = *std::max_element(kernels[a].begin(), kernels[a].end());
+        if (peak) for (auto& value : kernels[a]) value /= peak;
     }
     return kernels;
 }
@@ -79,33 +83,33 @@ inline std::vector<float> local_kernel(const LocalOptions& t, const Grid& g, Ran
     // floating-point rounding. Its extrema occur at the per-axis extrema;
     // multiply those in the same order as each voxel, without volume scans.
     bool separable_bounds = true;
-    double low = 1., high = 1.;
+    float low = 1, high = 1;
     for (const auto& kernel : kernels) {
         const auto [lo, hi] = std::minmax_element(kernel.begin(), kernel.end());
         separable_bounds &= std::isfinite(*lo) && std::isfinite(*hi) && *lo >= 0;
         low *= *lo; high *= *hi;
     }
-    const double range = high - low;
+    const float range = high - low;
     std::vector<float> out(g.size);
     const auto dim = g.shape.size(), nz = dim == 3 ? g.shape[0] : 1;
     const auto ny = g.shape[dim - 2], nx = g.shape.back();
     for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y) {
         // Same axis order as the separate full-volume multiplication passes.
-        double prefix = dim == 3 ? 1. * kernels[0][z] : 1.;
+        float prefix = dim == 3 ? 1. * kernels[0][z] : 1.;
         prefix *= kernels[dim - 2][y];
         for (std::size_t x = 0; x < nx; ++x) {
-            const double value = prefix * kernels.back()[x];
+            const float value = prefix * kernels.back()[x];
             out[(z * ny + y) * nx + x] = separable_bounds ? (range ? (value - low) / range : 0) : value;
         }
     }
     if (!separable_bounds) {
         const auto [lo, hi] = std::minmax_element(out.begin(), out.end());
-        const double fallback_low = *lo, fallback_range = *hi - fallback_low;
+        const float fallback_low = *lo, fallback_range = *hi - fallback_low;
         for (auto& v : out) v = fallback_range ? (v - fallback_low) / fallback_range : 0;
     }
     if (centered) {
-        double m = mean(out), maxabs = 0;
-        for (auto& v : out) maxabs = std::max(maxabs, double(std::abs(v -= m)));
+        float m = float(mean(out)), maxabs = 0;
+        for (auto& v : out) maxabs = std::max(maxabs, std::abs(v -= m));
         if (maxabs > 1e-8) for (auto& v : out) v /= maxabs;
     }
     return out;
@@ -204,13 +208,13 @@ inline void channel_apply(const Gamma&, std::vector<T>& v, const Grid&, const Ch
         });
 }
 
-template<class T>
-inline double pointwise_intensity(const T& t, double y, const ChannelPlan& p, double m, double low, double high) {
-    if constexpr (std::is_same_v<T, BrightnessMultiply>) y *= p.values[0];
-    if constexpr (std::is_same_v<T, BrightnessAdd>) y += p.values[0];
+template<class T,class Real>
+inline Real pointwise_intensity(const T& t, Real y, const ChannelPlan& p, Real m, Real low, Real high) {
+    if constexpr (std::is_same_v<T, BrightnessMultiply>) y *= Real(p.values[0]);
+    if constexpr (std::is_same_v<T, BrightnessAdd>) y += Real(p.values[0]);
     if constexpr (std::is_same_v<T, Invert>) y = 2 * m - y;
     if constexpr (std::is_same_v<T, Contrast>) {
-        y = (y - m) * p.values[0] + m;
+        y = (y - m) * Real(p.values[0]) + m;
         if (t.preserve_range) y = std::clamp(y, low, high);
     }
     return y;
@@ -233,7 +237,7 @@ template<class Values> void channel_apply(const RicianNoise&, Values& v, const G
         x = std::sqrt(re * re + im * im);
     }
 }
-inline void channel_apply(const ClipOutliers&, std::vector<double>& v, const Grid&, const ChannelPlan& p) {
+template<class T> inline void channel_apply(const ClipOutliers&, std::vector<T>& v, const Grid&, const ChannelPlan& p) {
     double std = p.values[2] ? deviation(v, mean(v)) : 0; auto sorted = v;
     auto percentile = [&](double q) {
         double pos = q / 100 * (v.size() - 1); auto lo = std::size_t(pos), hi = std::min(lo + 1, v.size() - 1);
@@ -242,7 +246,7 @@ inline void channel_apply(const ClipOutliers&, std::vector<double>& v, const Gri
         return low + (high - low) * (pos - lo);
     };
     double low = percentile(p.values[0]), high = percentile(p.values[1]);
-    for (auto& x : v) x = std::clamp(x, low, high);
+    for (auto& x : v) x = std::clamp(double(x), low, high);
     if (p.values[2]) { double m = mean(v), after = deviation(v, m); if (after > 1e-8) for (auto& x : v) x = (x - m) / after * std + m; }
 }
 template<class T>
@@ -549,7 +553,7 @@ template<class Values> void channel_apply(const SliceIllumination&, Values& v, c
                 v[i] = double(v[i]) * p.field[x];
             }
 }
-inline void channel_apply(const Smear& t, std::vector<double>& v, const Grid& g, const ChannelPlan& p) {
+template<class T> inline void channel_apply(const Smear& t, std::vector<T>& v, const Grid& g, const ChannelPlan& p) {
     auto axis = std::size_t(p.values[0]);
     auto plane_shape = g.shape; plane_shape.erase(plane_shape.begin() + axis); Grid plane(plane_shape);
     // Cache in-plane addresses; the shifted slice is the same for each previous
@@ -642,7 +646,10 @@ void apply(const T& t, Sample& s, const Parameters& p) {
                         auto bounds = std::minmax_element(v.begin(), v.end()); low = *bounds.first; high = *bounds.second;
                     }
                     for (auto& x : v) {
-                        x = static_cast<V>(pointwise_intensity(t, x, c, m, low, high));
+                        V y = pointwise_intensity(t, x, c, V(m), V(low), V(high));
+                        if constexpr (std::is_same_v<V,float>)
+                            if (!std::isfinite(y)) y = V(pointwise_intensity(t, double(x), c, m, low, high));
+                        x = y;
                     }
                 }
             };

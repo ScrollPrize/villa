@@ -15,7 +15,7 @@ struct RandomToneCurveKernel {
     }
 };
 inline RandomToneCurveKernel make_kernel(const RandomToneCurve& t,const ChannelPlan& p) { return {p.values[0],p.values[1]}; }
-inline void channel_apply(const RandomToneCurve& t,std::vector<double>& v,const Grid& g,const ChannelPlan& p) {
+template<class T> inline void channel_apply(const RandomToneCurve& t,std::vector<T>& v,const Grid& g,const ChannelPlan& p) {
     volume_detail::map_channel(v,g,make_kernel(t,p));
 }
 inline void apply(const RandomToneCurve& t,Sample& s,const Parameters& p) { volume_detail::apply_checked_channels(t,s,p); }

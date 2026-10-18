@@ -232,14 +232,14 @@ struct Array {
         require(kind == src.kind && bytes == src.bytes, "copy dtype mismatch");
         std::memcpy(static_cast<char*>(data()) + to * bytes, static_cast<const char*>(src.data()) + from * bytes, bytes);
     }
-    std::vector<double> channel(std::size_t c) const {
+    template<class Value = double> std::vector<Value> channel(std::size_t c) const {
         require_exact_values();
         auto n = product(spatial()); require(c < shape[0], "channel out of bounds");
-        std::vector<double> result(n);
-        typed([&](const auto* p) { for (std::size_t i = 0; i < n; ++i) result[i] = double(p[c * n + i]); });
+        std::vector<Value> result(n);
+        typed([&](const auto* p) { for (std::size_t i = 0; i < n; ++i) result[i] = Value(p[c * n + i]); });
         return result;
     }
-    void channel(std::size_t c, const std::vector<double>& values) {
+    template<class Value> void channel(std::size_t c, const std::vector<Value>& values) {
         auto n = product(spatial()); require(c < shape[0] && values.size() == n, "channel shape mismatch");
         if (kind == 'f') {
             if (bytes == 4) { auto* p = static_cast<float*>(data()) + c * n; for (std::size_t i = 0; i < n; ++i) p[i] = static_cast<float>(values[i]); }
@@ -482,8 +482,14 @@ Parameters sample_channels(const Sample& sample, const ChannelOptions& options, 
 }
 template<class F> void apply_channels(Sample& s, const Parameters& p, F&& apply_one) {
     for (const auto& c : p.channels) {
-        auto& a = s.at(c.key).array; auto values = a.channel(c.channel);
-        apply_one(values, Grid(a.spatial()), c); a.channel(c.channel, values);
+        auto& a = s.at(c.key).array;
+        if (a.kind == 'f' && a.bytes == 4) {
+            auto values = a.channel<float>(c.channel);
+            apply_one(values, Grid(a.spatial()), c); a.channel(c.channel, values);
+        } else {
+            auto values = a.channel(c.channel);
+            apply_one(values, Grid(a.spatial()), c); a.channel(c.channel, values);
+        }
     }
     restore_valid(s);
 }

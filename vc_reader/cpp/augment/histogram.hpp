@@ -34,7 +34,7 @@ struct HistogramGrid {
         for(int a=0;a<3;++a){require(tile[a]>0 && tile[a]<=65536,"tile sizes must be [1,65536]");tiles[a]=(g.n[a]+tile[a]-1)/tile[a];count*=tiles[a];}
     }
 };
-VCR_HD inline void histogram_tile(const double* v,const Grid3& g,const Stats& s,const HistogramGrid& layout,std::size_t tile,double* table) {
+template<class T> VCR_HD inline void histogram_tile(const T* v,const Grid3& g,const Stats& s,const HistogramGrid& layout,std::size_t tile,double* table) {
     double* h=table+tile*layout.bins;for(int b=0;b<layout.bins;++b)h[b]=0;
     std::size_t pos[3]{tile/(layout.tiles[1]*layout.tiles[2]),tile/layout.tiles[2]%layout.tiles[1],tile%layout.tiles[2]},lo[3],hi[3];
     for(int a=0;a<3;++a){lo[a]=pos[a]*g.n[a]/layout.tiles[a];hi[a]=(pos[a]+1)*g.n[a]/layout.tiles[a];}
@@ -49,7 +49,7 @@ VCR_HD inline double interpolate_histograms(const Grid3& g,const HistogramGrid& 
     for(int corner=0;corner<8;++corner){std::size_t t=0;double w=1;for(int a=0;a<3;++a){bool bit=(corner>>a)&1;t=t*layout.tiles[a]+(bit?hi[a]:lo[a]);w*=bit?f[a]:1-f[a];}result+=w*table[t*layout.bins+b];}
     return result;
 }
-inline std::vector<double> channel_histograms(const std::vector<double>& v,const Grid3& g,const HistogramGrid& layout) {
+template<class T> inline std::vector<double> channel_histograms(const std::vector<T>& v,const Grid3& g,const HistogramGrid& layout) {
     auto summary=stats(v.data(),v.size());std::vector<double> table(layout.count*layout.bins);
     for(std::size_t tile=0;tile<layout.count;++tile)histogram_tile(v.data(),g,summary,layout,tile,table.data());return table;
 }

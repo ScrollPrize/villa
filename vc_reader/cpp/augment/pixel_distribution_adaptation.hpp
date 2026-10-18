@@ -14,7 +14,7 @@ struct PixelDistributionAdaptationKernel {
         return (1-blend)*v[i]+blend*mapped;
     }
 };
-inline void channel_apply(const PixelDistributionAdaptation& t,std::vector<double>& v,const Grid& g,const ChannelPlan& p) {
+template<class T> inline void channel_apply(const PixelDistributionAdaptation& t,std::vector<T>& v,const Grid& g,const ChannelPlan& p) {
     auto ref=volume_detail::reference_channel(t.reference,p.channel);auto summary=volume_detail::stats(ref.data(),ref.size());
     volume_detail::map_channel(v,g,PixelDistributionAdaptationKernel{p.values[0],t.mode},nullptr,summary);
 }

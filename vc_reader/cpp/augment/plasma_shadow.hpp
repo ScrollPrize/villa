@@ -18,10 +18,10 @@ struct PlasmaShadowKernel {
     }
 };
 inline PlasmaShadowKernel make_kernel(const PlasmaShadow& t,const ChannelPlan& p) { return {p.values[0],p.values[1],p.values[2],t.octaves,p.seed}; }
-inline void channel_apply(const PlasmaShadow& t,std::vector<double>& v,const Grid& g,const ChannelPlan& p) {
+template<class T> inline void channel_apply(const PlasmaShadow& t,std::vector<T>& v,const Grid& g,const ChannelPlan& p) {
     const auto kernel=make_kernel(t,p);
     const auto field=volume_detail::fractal_field(g,kernel.seed,kernel.scale,kernel.persistence,kernel.octaves);
-    for(std::size_t i=0;i<v.size();++i)v[i]=kernel.apply_field(v[i],field[i]);
+    for(std::size_t i=0;i<v.size();++i)v[i]=kernel.apply_field(v[i],T(field[i]));
 }
 inline void apply(const PlasmaShadow& t,Sample& s,const Parameters& p) { volume_detail::apply_checked_channels(t,s,p); }
 } // namespace vcr::augment

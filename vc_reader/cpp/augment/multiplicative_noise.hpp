@@ -15,7 +15,7 @@ struct MultiplicativeNoiseKernel {
     }
 };
 inline MultiplicativeNoiseKernel make_kernel(const MultiplicativeNoise& t,const ChannelPlan& p) { return {p.values[0],p.values[1],p.seed}; }
-inline void channel_apply(const MultiplicativeNoise& t,std::vector<double>& v,const Grid& g,const ChannelPlan& p) {
+template<class T> inline void channel_apply(const MultiplicativeNoise& t,std::vector<T>& v,const Grid& g,const ChannelPlan& p) {
     volume_detail::map_channel(v,g,make_kernel(t,p));
 }
 inline Parameters sample(const MultiplicativeNoise& t,const Sample& s,Random& r) { return volume_detail::sample_noise(t,s,r); }

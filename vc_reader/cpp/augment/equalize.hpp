@@ -14,7 +14,7 @@ struct EqualizeKernel {
         return first<1?c.input.low+span*clamp((rank-first)/(1-first),0,1):v[i];
     }
 };
-inline void channel_apply(const Equalize& t,std::vector<double>& v,const Grid& g,const ChannelPlan&) {
+template<class T> inline void channel_apply(const Equalize& t,std::vector<T>& v,const Grid& g,const ChannelPlan&) {
     auto table=volume_detail::channel_histograms(v,volume_detail::Grid3(g.shape),volume_detail::HistogramGrid(volume_detail::Grid3(g.shape),g.shape,t.bins,0));
     volume_detail::map_channel(v,g,EqualizeKernel{t.bins},table.data());
 }

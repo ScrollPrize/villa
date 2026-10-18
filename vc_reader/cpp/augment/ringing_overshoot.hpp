@@ -16,16 +16,16 @@ struct RingingOvershootKernel {
         return sum/total;
     }
 };
-inline void channel_apply(const RingingOvershoot&,std::vector<double>& v,const Grid& g,const ChannelPlan& p){
+template<class T> inline void channel_apply(const RingingOvershoot&,std::vector<T>& v,const Grid& g,const ChannelPlan& p){
     const double cutoff=p.values[0];const int radius=int(p.values[1]);
     if(cutoff==1)return;
-    std::vector<double> weights(2*radius+1);double total=0;
+    std::vector<T> weights(2*radius+1);double total=0;
     for(int j=-radius;j<=radius;++j){
         double weight=j?sin(volume_detail::pi*cutoff*j)/(volume_detail::pi*j):cutoff;
         weight*=.5+.5*cos(volume_detail::pi*j/(radius+1));
         total+=weights[j+radius]=weight;
     }
-    std::vector<double> output(v.size());
+    std::vector<T> output(v.size());
     for(int a=0;a<3;++a){
         convolve_axis(v,output,g,a,weights,Boundary::Nearest);
         // Divide after accumulation, matching the original rounding order.

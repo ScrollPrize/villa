@@ -9,9 +9,9 @@ struct UnsharpMaskKernel {
     double strength;
     template<class T> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T>& c) const {return v[i]+T(strength)*(v[i]-c.auxiliary[i]);}
 };
-inline void channel_apply(const UnsharpMask&,std::vector<double>& v,const Grid& g,const ChannelPlan& p){
+template<class T> inline void channel_apply(const UnsharpMask&,std::vector<T>& v,const Grid& g,const ChannelPlan& p){
     auto blurred=v;gaussian_blur(blurred,g,std::vector<double>(3,p.values[1]),4,Boundary::Nearest);
-    volume_detail::map_channel(v,g,UnsharpMaskKernel{p.values[0]},blurred.data());
+    volume_detail::map_channel(v,g,UnsharpMaskKernel{p.values[0]},nullptr,{},blurred.data());
 }
 inline void apply(const UnsharpMask& t,Sample& s,const Parameters& p) { volume_detail::apply_checked_channels(t,s,p); }
 } // namespace vcr::augment

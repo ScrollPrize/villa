@@ -1,7 +1,7 @@
 #include "channel.cuh"
 namespace vcr::augment::cuda {
 struct SmearArgs { int axis, previous, shift[3]{}; double alpha; };
-__global__ void smear_slice(double* data, Layout g, SmearArgs p, std::size_t slice) {
+template<class T> __global__ void smear_slice(T* data, Layout g, SmearArgs p, std::size_t slice) {
     EACH_INDEX(g.size/g.shape[p.axis]) {
         // Remove the smear axis from the flattened plane index.
         const auto step = g.stride[p.axis];
@@ -12,14 +12,14 @@ __global__ void smear_slice(double* data, Layout g, SmearArgs p, std::size_t sli
             auto x = (static_cast<long long>(g.coord(at,a))-p.shift[pa++]) % n;
             from += std::size_t((x+n)%n)*g.stride[a];
         }
-        double sum = 0;
+        T sum = 0;
         for (int j = 1; j <= p.previous; ++j) sum += data[(slice-j)*step+from];
-        data[slice*step+at] = (1-p.alpha)*data[slice*step+at] + p.alpha*sum/p.previous;
+        data[slice*step+at] = (T(1)-T(p.alpha))*data[slice*step+at] + T(p.alpha)*sum/T(p.previous);
     }
 }
 
 void apply_cuda(const Smear& t, Sample& s, const Parameters& p, Session& session) {
-    apply_channels(t,s,p,session,[](const auto& t, View<double> v, const Grid& grid, const ChannelPlan& c) {
+    apply_channels(t,s,p,session,[](const auto& t, auto v, const Grid& grid, const ChannelPlan& c) {
         Layout g(grid); SmearArgs args{int(c.values[0]),t.previous,{},t.alpha};
         std::copy_n(t.shift.begin(),g.dim-1,args.shift);
         for (std::size_t slice = t.previous; slice < grid.shape[args.axis]; ++slice) {

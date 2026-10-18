@@ -48,7 +48,7 @@ struct PaletteChannel {
                 m = palette_statistics(values, counts, n).first;
                 std::tie(low, high) = palette_bounds(values, counts);
             }
-            for (auto& x : values) x = float(pointwise_intensity(t, x, p, m, low, high));
+            for (auto& x : values) x = float(pointwise_intensity(t, x, p, float(m), float(low), float(high)));
         }
     }
     void median(std::uint8_t* data, const Grid& g, std::size_t k) {

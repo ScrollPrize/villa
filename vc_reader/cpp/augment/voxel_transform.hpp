@@ -11,10 +11,10 @@ template<class T> struct ChannelContextT {
     const T* auxiliary=nullptr;
 };
 using ChannelContext=ChannelContextT<double>;
-template<class Kernel> void map_channel(std::vector<double>& values,const Grid& grid,const Kernel& kernel,
-                                      const double* table=nullptr,Stats reference={}) {
-    ChannelContext context{Grid3(grid.shape),stats(values.data(),values.size()),table,reference,table};
-    std::vector<double> output(values.size());
+template<class Kernel,class T> void map_channel(std::vector<T>& values,const Grid& grid,const Kernel& kernel,
+                                      const double* table=nullptr,Stats reference={},const T* auxiliary=nullptr) {
+    ChannelContextT<T> context{Grid3(grid.shape),stats(values.data(),values.size()),table,reference,auxiliary};
+    std::vector<T> output(values.size());
     for(std::size_t i=0;i<values.size();++i){output[i]=kernel(values.data(),i,context);require(std::isfinite(output[i]),"augmentation produced nonfinite values");}
     values.swap(output);
 }
