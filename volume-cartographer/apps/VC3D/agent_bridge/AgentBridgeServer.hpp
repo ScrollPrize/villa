@@ -400,6 +400,9 @@ private:
     void requireSegmentFilesIdle(const QString& segmentId, const QString& operation) const;
     QJsonObject handleSegmentExportObj(const QJsonValue& params);
     QJsonObject handleSegmentRasterize(const QJsonValue& params);
+    QJsonObject handleSegmentNeighborCopy(const QJsonValue& params);
+    QJsonObject handleSegmentsMerge(const QJsonValue& params);
+    QJsonObject handleSegmentsPatch(const QJsonValue& params);
     // Registers a "tool" job for a launch that `launch` performs (reporting
     // the job's output path) and, when `closingOperation` is non-empty, keeps
     // it open until that operation's segmentOperationFinished. Throws the

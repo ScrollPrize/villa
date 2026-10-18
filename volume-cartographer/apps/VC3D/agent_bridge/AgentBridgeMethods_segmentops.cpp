@@ -1,6 +1,8 @@
 #include "agent_bridge/AgentBridgeServer.hpp"
 
 #include <optional>
+#include <utility>
+#include <vector>
 
 namespace Params = AgentBridgeParams;
 namespace Mcp = AgentBridgeMcpTools;
@@ -15,6 +17,27 @@ AgentBridgeParam boundedInteger(const QString& name, double minimum,
     if (maximum)
         param.maximum = *maximum;
     return param;
+}
+
+AgentBridgeParam boundedNumber(const QString& name, double minimum, double maximum)
+{
+    AgentBridgeParam param = Params::optionalNumber(name);
+    param.minimum = minimum;
+    param.maximum = maximum;
+    return param;
+}
+
+// The RANSAC alignment tunables shared by vc_merge_tifxyz and vc_merge_patch,
+// bounded like the dialogs' spin boxes.
+void appendRansacParams(std::vector<AgentBridgeParam>& params)
+{
+    params.push_back(boundedInteger(QStringLiteral("ransacIters"), 1, 1000000));
+    params.push_back(boundedNumber(QStringLiteral("ransacMinThresh"), 0.1, 1000.0));
+    params.push_back(boundedNumber(QStringLiteral("ransacMaxThresh"), 0.1, 1000.0));
+    params.push_back(boundedNumber(QStringLiteral("ransacMadK"), 0.1, 20.0));
+    params.push_back(boundedInteger(QStringLiteral("ransacSeed"), 0));
+    params.push_back(boundedInteger(QStringLiteral("anchorCap"), 0, 1000000));
+    params.push_back(boundedInteger(QStringLiteral("ompThreads"), 1));
 }
 
 }  // namespace
@@ -81,4 +104,90 @@ void AgentBridgeServer::registerSegmentOpsHandlers()
                 {QStringLiteral("wait")}),
         },
         [this](const QJsonValue& p) { return handleSegmentRasterize(p); });
+
+    registerMethod(
+        {
+            .name = QStringLiteral("segment.neighbor_copy"),
+            .params = {
+                Params::requiredString(QStringLiteral("segmentId")),
+                Params::requiredStringEnum(
+                    QStringLiteral("direction"),
+                    {QStringLiteral("out"), QStringLiteral("in")}),
+                Params::optionalString(QStringLiteral("volumeId")),
+                Params::optionalString(QStringLiteral("outputDir")),
+                boundedInteger(QStringLiteral("neighborMaxDistance"), 1, 500),
+                boundedInteger(QStringLiteral("neighborMinClearance"), 1, 100),
+                Params::optionalBoolean(QStringLiteral("neighborFill")),
+                boundedInteger(QStringLiteral("neighborInterpWindow"), 1, 50),
+                boundedInteger(QStringLiteral("generations"), 1, 10),
+                boundedInteger(QStringLiteral("neighborSpikeWindow"), 1, 20),
+                boundedInteger(QStringLiteral("resumeLocalOptStep"), 1, 512),
+                boundedInteger(QStringLiteral("resumeLocalOptRadius"), 1, 2048),
+                boundedInteger(QStringLiteral("resumeLocalMaxIters"), 1, 10000),
+                Params::optionalBoolean(QStringLiteral("resumeLocalDenseQr")),
+                boundedInteger(QStringLiteral("pass2OmpThreads"), 1, 256),
+                Params::optionalObject(QStringLiteral("pass2ParamOverrides"), {}),
+            },
+            .errors = {
+                -32602, -32000, -32004, -32005, -32006, -32007, -32009,
+            },
+            .mcp = Mcp::snakeCase(
+                QStringLiteral("vc3d_neighbor_copy_segment"),
+                {QStringLiteral("wait")}),
+        },
+        [this](const QJsonValue& p) { return handleSegmentNeighborCopy(p); });
+
+    {
+        std::vector<AgentBridgeParam> params{
+            Params::optionalArray(
+                QStringLiteral("segmentIds"),
+                Params::requiredString(QString())),
+            Params::optionalArray(
+                QStringLiteral("grid"),
+                Params::optionalArray(
+                    QString(),
+                    Params::nullable(Params::optionalString(QString())))),
+            Params::optionalString(QStringLiteral("refSegmentId")),
+            boundedInteger(QStringLiteral("stripCols"), 0, 1024),
+        };
+        appendRansacParams(params);
+        registerMethod(
+            {
+                .name = QStringLiteral("segments.merge"),
+                .params = std::move(params),
+                .errors = {
+                    -32602, -32000, -32004, -32005, -32006, -32007, -32009,
+                },
+                .mcp = Mcp::snakeCase(
+                    QStringLiteral("vc3d_merge_segments"),
+                    {QStringLiteral("wait")}),
+            },
+            [this](const QJsonValue& p) { return handleSegmentsMerge(p); });
+    }
+
+    {
+        std::vector<AgentBridgeParam> params{
+            Params::requiredArray(
+                QStringLiteral("segmentIds"),
+                Params::requiredString(QString())),
+            Params::optionalString(QStringLiteral("parentId")),
+            boundedInteger(QStringLiteral("borderCells"), 1, 256),
+            boundedInteger(QStringLiteral("blendCells"), 1, 256),
+            boundedInteger(QStringLiteral("idwK"), 1, 16),
+            Params::optionalBoolean(QStringLiteral("confirm"), false),
+        };
+        appendRansacParams(params);
+        registerMethod(
+            {
+                .name = QStringLiteral("segments.patch"),
+                .params = std::move(params),
+                .errors = {
+                    -32602, -32000, -32004, -32005, -32006, -32007, -32009,
+                },
+                .mcp = Mcp::snakeCase(
+                    QStringLiteral("vc3d_patch_segment"),
+                    {QStringLiteral("wait")}),
+            },
+            [this](const QJsonValue& p) { return handleSegmentsPatch(p); });
+    }
 }

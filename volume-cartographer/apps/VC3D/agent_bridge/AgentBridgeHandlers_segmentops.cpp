@@ -5,6 +5,7 @@
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QString>
+#include <QRegularExpression>
 #include <QStringList>
 
 #include <algorithm>
@@ -292,5 +293,231 @@ QJsonObject AgentBridgeServer::handleSegmentRasterize(const QJsonValue& params)
     result["segmentIds"] = toJsonArray(launch.segmentIds);
     result["skippedIds"] = toJsonArray(launch.skippedIds);
     result["outputPath"] = launch.outputPath;
+    return result;
+}
+
+
+// ---------------------------------------------------------------------------
+// segment.neighbor_copy
+// ---------------------------------------------------------------------------
+
+QJsonObject AgentBridgeServer::handleSegmentNeighborCopy(const QJsonValue& params)
+{
+    const QJsonObject p = params.toObject();
+    CState* state = requireProject(_window ? _window->_state : nullptr);
+
+    const QString segmentId = p.value("segmentId").toString();
+    requireKnownSegment(state, segmentId);
+    const bool copyOut = p.value("direction").toString() == QLatin1String("out");
+
+    SegmentationCommandHandler::NeighborCopyParams copy;
+    copy.volumeId = p.value("volumeId").toString();
+    if (!copy.volumeId.isEmpty()) {
+        const auto ids = state->vpkg()->volumeIDs();
+        if (std::find(ids.begin(), ids.end(), copy.volumeId.toStdString()) == ids.end()) {
+            throw AgentBridgeError{
+                -32007, QStringLiteral("Unknown volume id: %1").arg(copy.volumeId),
+                QJsonObject{{"kind", "volume"}, {"id", copy.volumeId}}};
+        }
+    }
+    copy.outputDir = p.value("outputDir").toString();
+    copy.neighborMaxDistance = p.value("neighborMaxDistance").toInt(copy.neighborMaxDistance);
+    copy.neighborMinClearance = p.value("neighborMinClearance").toInt(copy.neighborMinClearance);
+    copy.neighborFill = p.value("neighborFill").toBool(copy.neighborFill);
+    copy.neighborInterpWindow = p.value("neighborInterpWindow").toInt(copy.neighborInterpWindow);
+    copy.generations = p.value("generations").toInt(copy.generations);
+    copy.neighborSpikeWindow = p.value("neighborSpikeWindow").toInt(copy.neighborSpikeWindow);
+    copy.resumeLocalOptStep = p.value("resumeLocalOptStep").toInt(copy.resumeLocalOptStep);
+    // The dialog's radius default follows the step (twice the step).
+    copy.resumeLocalOptRadius = p.value("resumeLocalOptRadius").toInt(copy.resumeLocalOptStep * 2);
+    copy.resumeLocalMaxIters = p.value("resumeLocalMaxIters").toInt(copy.resumeLocalMaxIters);
+    copy.resumeLocalDenseQr = p.value("resumeLocalDenseQr").toBool(copy.resumeLocalDenseQr);
+    copy.pass2OmpThreads = p.value("pass2OmpThreads").toInt(copy.pass2OmpThreads);
+    copy.pass2ParamOverrides = p.value("pass2ParamOverrides").toObject();
+
+    SegmentationCommandHandler* handler = requireCommandHandler(
+        _window->_segmentationCommandHandler.get(), QStringLiteral("Neighbor copy"));
+
+    QString outputDir;
+    const QString jobId = launchSegmentToolJob(
+        QStringLiteral("segment.neighbor_copy"),
+        copyOut ? QStringLiteral("Copy segment out") : QStringLiteral("Copy segment in"),
+        segmentId, QStringLiteral("neighbor_copy"),
+        [&](CommandLaunchError* error, QString* jobOutput) {
+            const bool ok = handler->startNeighborCopy(segmentId, copyOut, copy, error, &outputDir);
+            *jobOutput = outputDir;
+            return ok;
+        });
+
+    QJsonObject result;
+    result["jobId"] = jobId;
+    result["kind"] = "segment.neighbor_copy";
+    result["source"] = "tool";
+    result["segmentId"] = segmentId;
+    result["direction"] = copyOut ? "out" : "in";
+    result["outputDir"] = outputDir;
+    return result;
+}
+
+
+// ---------------------------------------------------------------------------
+// segments.merge / segments.patch
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// RANSAC options shared by merge and patch; min must stay below max, as the
+// dialogs require.
+template <class Params>
+void readRansacParams(const QJsonObject& p, Params& out)
+{
+    out.ransacIters = p.value("ransacIters").toInt(out.ransacIters);
+    out.ransacMinThresh = p.value("ransacMinThresh").toDouble(out.ransacMinThresh);
+    out.ransacMaxThresh = p.value("ransacMaxThresh").toDouble(out.ransacMaxThresh);
+    out.ransacMadK = p.value("ransacMadK").toDouble(out.ransacMadK);
+    out.ransacSeed = p.value("ransacSeed").toInt(out.ransacSeed);
+    out.anchorCap = p.value("anchorCap").toInt(out.anchorCap);
+    out.ompThreads = p.value("ompThreads").toInt(out.ompThreads);
+    if (out.ransacMinThresh >= out.ransacMaxThresh) {
+        throw AgentBridgeError{-32602, "ransacMinThresh must be smaller than ransacMaxThresh",
+                               QJsonObject{{"param", "ransacMinThresh"}}};
+    }
+}
+
+QStringList requireSegmentIdList(const QJsonObject& p)
+{
+    QStringList ids;
+    for (const QJsonValue& value : p.value("segmentIds").toArray())
+        ids.append(value.toString());
+    return ids;
+}
+
+}  // namespace
+
+QJsonObject AgentBridgeServer::handleSegmentsMerge(const QJsonValue& params)
+{
+    const QJsonObject p = params.toObject();
+    CState* state = requireProject(_window ? _window->_state : nullptr);
+
+    SegmentationCommandHandler::MergeTifxyzParams merge;
+    if (p.contains("grid") == p.contains("segmentIds")) {
+        throw AgentBridgeError{-32602, "Pass either grid or segmentIds",
+                               QJsonObject{{"param", "grid"}}};
+    }
+    QString param = QStringLiteral("segmentIds");
+    if (p.contains("grid")) {
+        param = QStringLiteral("grid");
+        for (const QJsonValue& rowValue : p.value("grid").toArray()) {
+            QStringList row;
+            for (const QJsonValue& cell : rowValue.toArray())
+                row.append(cell.isNull() ? QString() : cell.toString().trimmed());
+            merge.grid.append(row);
+        }
+    } else {
+        // Without a grid the segments form one row, left to right.
+        merge.grid.append(requireSegmentIdList(p));
+    }
+
+    // The grid rules of the Merge tifxyz dialog, checked here so a bad grid is
+    // a parameter error and an unknown name a lookup error.
+    QStringList names;
+    for (const QStringList& row : merge.grid) {
+        for (const QString& name : row) {
+            if (!name.isEmpty() && !names.contains(name))
+                names.append(name);
+        }
+    }
+    if (names.size() < 2) {
+        throw AgentBridgeError{-32602, "merge needs at least two distinct segments",
+                               QJsonObject{{"param", param}}};
+    }
+    for (const QString& name : names) {
+        if (name.contains(QRegularExpression(QStringLiteral("\\s")))) {
+            throw AgentBridgeError{
+                -32602,
+                QStringLiteral("Segment name '%1' contains whitespace, which merge.json "
+                               "cannot express").arg(name),
+                QJsonObject{{"param", param}}};
+        }
+    }
+    merge.refSurface = p.value("refSegmentId").toString();
+    if (!merge.refSurface.isEmpty() && !names.contains(merge.refSurface)) {
+        throw AgentBridgeError{-32602, "refSegmentId must be one of the merged segments",
+                               QJsonObject{{"param", "refSegmentId"}}};
+    }
+    merge.stripCols = p.value("stripCols").toInt(merge.stripCols);
+    readRansacParams(p, merge);
+    for (const QString& name : names)
+        requireKnownSegment(state, name);
+
+    SegmentationCommandHandler* handler = requireCommandHandler(
+        _window->_segmentationCommandHandler.get(), QStringLiteral("Merge"));
+
+    QString mergeJsonPath;
+    const QString jobId = launchSegmentToolJob(
+        QStringLiteral("segments.merge"), QStringLiteral("Merge tifxyz"),
+        names.front(), QStringLiteral("merge"),
+        [&](CommandLaunchError* error, QString*) {
+            return handler->startMergeTifxyz(merge, error, &mergeJsonPath);
+        });
+
+    QJsonObject result;
+    result["jobId"] = jobId;
+    result["kind"] = "segments.merge";
+    result["source"] = "tool";
+    result["segmentIds"] = toJsonArray(names);
+    result["mergeJsonPath"] = mergeJsonPath;
+    return result;
+}
+
+QJsonObject AgentBridgeServer::handleSegmentsPatch(const QJsonValue& params)
+{
+    const QJsonObject p = params.toObject();
+    CState* state = requireProject(_window ? _window->_state : nullptr);
+
+    const QStringList segmentIds = requireSegmentIdList(p);
+    if (segmentIds.size() != 2 || segmentIds[0] == segmentIds[1]) {
+        throw AgentBridgeError{-32602, "patch needs exactly two different segmentIds",
+                               QJsonObject{{"param", "segmentIds"}}};
+    }
+    const QString parentId = p.value("parentId").toString();
+    if (!parentId.isEmpty() && !segmentIds.contains(parentId)) {
+        throw AgentBridgeError{-32602, "parentId must be one of segmentIds",
+                               QJsonObject{{"param", "parentId"}}};
+    }
+
+    SegmentationCommandHandler::MergePatchParams patch;
+    patch.explicitRoles = !parentId.isEmpty();
+    patch.parentId = patch.explicitRoles ? parentId : segmentIds[0];
+    patch.childId = patch.parentId == segmentIds[0] ? segmentIds[1] : segmentIds[0];
+    patch.borderCells = p.value("borderCells").toInt(patch.borderCells);
+    patch.blendCells = p.value("blendCells").toInt(patch.blendCells);
+    patch.idwK = p.value("idwK").toInt(patch.idwK);
+    readRansacParams(p, patch);
+    requireConfirm(p, QStringLiteral("patch overwrites the parent segment in place"));
+    for (const QString& id : segmentIds)
+        requireKnownSegment(state, id);
+
+    // Either segment may become the parent, which is rewritten on disk.
+    for (const QString& id : segmentIds)
+        requireSegmentFilesIdle(id, QStringLiteral("patch"));
+
+    SegmentationCommandHandler* handler = requireCommandHandler(
+        _window->_segmentationCommandHandler.get(), QStringLiteral("Patch"));
+
+    const QString jobId = launchSegmentToolJob(
+        QStringLiteral("segments.patch"), QStringLiteral("Patch tifxyz"),
+        patch.parentId, QStringLiteral("patch"),
+        [&](CommandLaunchError* error, QString*) {
+            return handler->startMergePatch(patch, error);
+        });
+
+    QJsonObject result;
+    result["jobId"] = jobId;
+    result["kind"] = "segments.patch";
+    result["source"] = "tool";
+    result["segmentIds"] = toJsonArray(segmentIds);
+    result["parentId"] = patch.explicitRoles ? QJsonValue(patch.parentId)
+                                             : QJsonValue(QJsonValue::Null);
     return result;
 }

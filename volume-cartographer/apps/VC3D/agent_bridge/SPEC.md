@@ -587,6 +587,24 @@ caller that retries after a timeout reads the segment's state first.
   moved into `volumes/` and its metadata written, and its terminal
   `outputPath` is that zarr. Defaults are the dialog's code defaults, not the
   person's last dialog values.
+- `segment.neighbor_copy` runs both neighbor-copy passes as one `tool` job
+  that ends after the second pass; its terminal `outputPath` is the new
+  surface folder. `job.cancel` stops either pass, or the hop between them
+  where no process runs; the job then fails with `Neighbor copy cancelled.`
+  and the second pass does not start.
+- `segments.merge` lays segments out in a `grid` (null for a hole), or takes at
+  least two `segmentIds` as one row, writes the grid's merge.json beside the
+  segments directory and runs `vc_merge_tifxyz` as a `tool` job. Grid rules
+  (two distinct names, no whitespace, a reference inside the grid, RANSAC min
+  below max) are -32602; unknown names are -32007. The job ends after the
+  surface list is reloaded; its terminal `outputPath` is the new merged
+  segment folder.
+- `segments.patch` runs `vc_merge_patch` on exactly two segments as a `tool`
+  job, overwrites the parent in place and requires `confirm: true`; the job
+  ends after the surface list is reloaded. The tool snapshots the parent into
+  `backups/<parent>/` inside the segments directory, not beside the project
+  file where VC3D keeps backups, so `segment.restore_backup` does not list
+  that snapshot.
 
 ## MCP behavior
 
@@ -720,8 +738,11 @@ is the sole bridge method without an MCP tool; `vc3d_wait_job` and
 | `vc3d_manual_add_set_interpolation` | `segmentation.manual_add.set_interpolation` |
 | `vc3d_manual_add_set_line_mode` | `segmentation.manual_add.set_line_mode` |
 | `vc3d_manual_add_undo_constraint` | `segmentation.manual_add.undo_constraint` |
+| `vc3d_merge_segments` | `segments.merge` | Merge segments laid out in a grid into a new segment (`tool` job ending with the merged folder). |
+| `vc3d_neighbor_copy_segment` | `segment.neighbor_copy` | Grow the neighboring sheet from a segment (two passes, one `tool` job; cancellable between passes). |
 | `vc3d_open_catalog_sample` | `catalog.open_sample` | Open a sample returned by `vc3d_list_catalog_samples`, using its manifest sample id. |
 | `vc3d_open_volume` | `volume.open` | Open a volume package (.volpkg / .volpkg.json / zarr project) and optionally select a volume id. |
+| `vc3d_patch_segment` | `segments.patch` | Patch a child segment into a parent in place (`confirm` required; `tool` job). |
 | `vc3d_ping` | `ping` | Check the VC3D bridge is alive; returns pid, app version, and protocol version. |
 | `vc3d_push_pull_set_config` | `segmentation.push_pull.set_config` |
 | `vc3d_push_pull_start` | `segmentation.push_pull.start` |

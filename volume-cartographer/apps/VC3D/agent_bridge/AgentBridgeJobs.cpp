@@ -825,6 +825,7 @@ QJsonObject AgentBridgeServer::handleJobCancel(const QJsonValue& params)
     const QString outSource = rec->source;
     const QString outKind = rec->kind;
     const QString externalId = rec->externalId;
+    const QString closingOperation = rec->closingOperation;
 
     // Dispatch on the job's source to its per-source cancel authority.
     if (outSource == QLatin1String("atlas")) {
@@ -852,6 +853,18 @@ QJsonObject AgentBridgeServer::handleJobCancel(const QJsonValue& params)
             mgr.stopOptimization();
         else
             mgr.cancelJob(externalId);
+    } else if (outSource == QLatin1String("tool") &&
+               closingOperation == QLatin1String("neighbor_copy")) {
+        // A neighbor copy also has a window between its two passes in which no
+        // process runs; its own cancel covers both and ends the job through
+        // segmentOperationFinished.
+        SegmentationCommandHandler* sch =
+            _window ? _window->_segmentationCommandHandler.get() : nullptr;
+        if (!sch || !sch->cancelNeighborCopy()) {
+            QJsonObject data;
+            data["detail"] = "no running neighbor copy to cancel";
+            throw AgentBridgeError{-32005, "Neighbor copy not running", data};
+        }
     } else if (outSource == QLatin1String("tool")) {
         // grow/trace/render tools run as CommandLineToolRunner child QProcesses:
         // terminate cleanly; toolFinished then resolves the job via finishJob.

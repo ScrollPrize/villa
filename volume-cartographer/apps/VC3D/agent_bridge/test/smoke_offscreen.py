@@ -298,10 +298,10 @@ def check_rpc_describe(
         coverage = description.get("coverage", {})
         complete = (
             description.get("undocumented") == []
-            and coverage.get("described") == 126
-            and coverage.get("registered") == 126
+            and coverage.get("described") == 129
+            and coverage.get("registered") == 129
             and coverage.get("complete") is True
-            and len(snapshot["methods"]) == 126
+            and len(snapshot["methods"]) == 129
         )
         rendered = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         if update_snapshot:
@@ -1826,6 +1826,53 @@ def check_segment_export(client: BridgeClient, results: Results, root: Path) -> 
         results.record("segment_export_obj_refuses_existing_file", ok, detail)
 
 
+def check_segment_tool_operations(client: BridgeClient, results: Results) -> None:
+    ok, detail = expect_bridge_error(
+        client,
+        "segment.neighbor_copy",
+        {"segmentId": SMOKE_SEGMENT_ID, "direction": "out",
+         "volumeId": "no-such-volume"},
+        -32007,
+    )
+    results.record("segment_neighbor_copy_unknown_volume", ok, detail)
+    ok, detail = expect_param_error(
+        client,
+        "segments.merge",
+        {"segmentIds": [SMOKE_SEGMENT_ID]},
+        "segmentIds",
+    )
+    results.record("segments_merge_needs_two_segments", ok, detail)
+    ok, detail = expect_param_error(
+        client,
+        "segments.merge",
+        {"grid": [[SMOKE_SEGMENT_ID, "initial-segment"]],
+         "ransacMinThresh": 10, "ransacMaxThresh": 5},
+        "ransacMinThresh",
+    )
+    results.record("segments_merge_rejects_inverted_thresholds", ok, detail)
+    ok, detail = expect_bridge_error(
+        client,
+        "segments.merge",
+        {"segmentIds": [SMOKE_SEGMENT_ID, "no-such-segment"]},
+        -32007,
+    )
+    results.record("segments_merge_unknown_segment", ok, detail)
+    ok, detail = expect_param_error(
+        client,
+        "segments.patch",
+        {"segmentIds": [SMOKE_SEGMENT_ID, SMOKE_SEGMENT_ID], "confirm": True},
+        "segmentIds",
+    )
+    results.record("segments_patch_needs_two_distinct_segments", ok, detail)
+    ok, detail = expect_param_error(
+        client,
+        "segments.patch",
+        {"segmentIds": [SMOKE_SEGMENT_ID, "initial-segment"]},
+        "confirm",
+    )
+    results.record("segments_patch_requires_confirm", ok, detail)
+
+
 def check_open_data_editable_copy(
     client: BridgeClient,
     results: Results,
@@ -2532,6 +2579,7 @@ def main() -> int:
             check_segments_attach(client, results, tmp_path, volpkg)
             check_segment_transform(client, results, tmp_path)
             check_segment_export(client, results, tmp_path)
+            check_segment_tool_operations(client, results)
             check_open_data_editable_copy(client, results, tmp_path, volpkg)
             check_c4(client, results, str(volpkg), str(broken_volpkg))
             check_legacy_fiber_uuid(client, results, str(legacy_fiber_volpkg),
