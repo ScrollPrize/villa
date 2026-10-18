@@ -220,7 +220,8 @@ def build_pyramid(
 ) -> None:
     """Build pyramid levels 1..num_levels-1 from level 0.
 
-    Uses nearest-neighbor downsampling with uniform 2x downsample per level.
+    Uses nearest-neighbor downsampling with uniform 2x downsample per level;
+    each level is ceil(n / 2) voxels along an axis of n voxels.
 
     Args:
         base_group_path: Path to the base zarr group
@@ -235,8 +236,10 @@ def build_pyramid(
         out_path = f"{base_group_path}/{level}"
 
         in_z = zarr.open(in_path, mode="r")
+        # Ceiling division, which VC3D's Volume loader checks every level against.
+        # round() rounds half to even and dropped the last plane of a 4k + 1 axis.
         out_shape = tuple(
-            max(1, int(round(s * dim)))
+            max(1, int(np.ceil(s * dim)))
             for dim, s in zip(in_z.shape, per_axis_scales)
         )
         out_chunks = tuple(min(c, s) for c, s in zip(in_z.chunks, out_shape))
