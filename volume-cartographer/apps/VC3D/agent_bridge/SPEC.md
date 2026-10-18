@@ -591,6 +591,24 @@ still-running job id.
 
 `vc3d_wait_job` applies the same behavior to an existing job.
 
+`observe` is an MCP-only option, like `wait`, on the interaction tools:
+`vc3d_click`, `vc3d_shift_click`, `vc3d_drag`, `vc3d_key`, `vc3d_wheel`,
+`vc3d_center_viewer`, `vc3d_zoom_viewer`, `vc3d_rotate_viewer`, and
+`vc3d_switch_workspace`. `none`, the default, returns the bridge result
+unchanged. `state` reads `state.get` before and after the call and adds an
+`observation` object to the result: `stateDiff` (RFC 6902 add, remove and
+replace operations between the two snapshots, ignoring `revision` and running
+jobs' console and progress tails), `revision`, and `changed` (the
+`state.changed` fields the MCP connection received since the previous
+observation, read after the last bridge call). These tools keep returning a
+JSON object with their output schema. `vc3d_observe` makes the same
+observation without a call, diffing against the last snapshot an observation
+saw, so changes made in the GUI show up too; its `screenshot` and `both`
+modes add an image with a 1024-pixel longest side, and a failed capture is
+reported as `observation.screenshotError` rather than failing the call.
+Observation bookkeeping is per MCP server process, which serves one client
+over stdio.
+
 Without `file_path`, `vc3d_screenshot` decodes inline PNG data into FastMCP
 image content. With `file_path`, it returns the bridge's file result and does
 not include inline image data.
@@ -598,7 +616,8 @@ not include inline image data.
 ## MCP tool map
 
 The following rows are checked against the descriptor snapshot. `rpc.describe`
-is the sole bridge method without an MCP tool.
+is the sole bridge method without an MCP tool; `vc3d_wait_job` and
+`vc3d_observe` are the MCP-only tools.
 
 | MCP tool | RPC method | Agent-facing purpose |
 |---|---|---|

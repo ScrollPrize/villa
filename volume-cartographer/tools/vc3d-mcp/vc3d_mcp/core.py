@@ -9,10 +9,12 @@ module registers its ``@mcp.tool()`` functions on, the bridge-client plumbing
 from __future__ import annotations
 
 import asyncio
+import base64
+import copy
 import json
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp import Context, FastMCP, Image
 
 from .bridge_client import (
     BridgeClient,
@@ -81,6 +83,130 @@ async def _call(
 
 def _strip_none(d: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
+
+
+# ``observe`` on the interaction tools: "state" diffs state.get around the
+# call. MCP-only, like ``wait``. Screenshots come from vc3d_observe and
+# vc3d_screenshot, so the interaction tools keep returning plain dicts.
+ObserveMode = Literal["none", "state"]
+OBSERVE_SCREENSHOT_MAX_DIM = 1024
+
+# The last state.get snapshot an observation saw; vc3d_observe diffs against
+# it. Like the bridge client's state.changed bookkeeping, it belongs to this
+# server process, which serves one MCP client over stdio.
+_last_observed_state: dict[str, Any] | None = None
+
+
+def _json_pointer_token(key: str) -> str:
+    return key.replace("~", "~0").replace("/", "~1")
+
+
+def state_diff(before: Any, after: Any, path: str = "") -> list[dict[str, Any]]:
+    """JSON Patch (RFC 6902) add/remove/replace operations turning ``before``
+    into ``after``. Objects are compared key by key and equal-length arrays
+    element by element; any other difference replaces the value at its path."""
+    if isinstance(before, dict) and isinstance(after, dict):
+        ops: list[dict[str, Any]] = []
+        for key in sorted(before.keys() | after.keys()):
+            child = f"{path}/{_json_pointer_token(str(key))}"
+            if key not in after:
+                ops.append({"op": "remove", "path": child})
+            elif key not in before:
+                ops.append({"op": "add", "path": child, "value": after[key]})
+            else:
+                ops.extend(state_diff(before[key], after[key], child))
+        return ops
+    if isinstance(before, list) and isinstance(after, list) and len(before) == len(after):
+        ops = []
+        for index, (old, new) in enumerate(zip(before, after)):
+            ops.extend(state_diff(old, new, f"{path}/{index}"))
+        return ops
+    if before == after and isinstance(before, bool) == isinstance(after, bool):
+        return []
+    return [{"op": "replace", "path": path, "value": after}]
+
+
+def _observable_state(state: Any) -> dict[str, Any]:
+    """state.get without the fields that change on every read: the revision
+    (reported on its own) and running jobs' console and progress tails."""
+    if not isinstance(state, dict):
+        return {}
+    observed = copy.deepcopy(state)
+    observed.pop("revision", None)
+    jobs = observed.get("jobs")
+    if isinstance(jobs, list):
+        for job in jobs:
+            if isinstance(job, dict):
+                job.pop("consoleTail", None)
+                job.pop("progressHistory", None)
+    return observed
+
+
+async def _observation(
+    mode: str,
+    before: dict[str, Any] | None,
+    screenshot_target: str,
+) -> tuple[dict[str, Any], Image | None]:
+    """Read state and/or a screenshot for an observation. ``before`` is the
+    snapshot to diff against (None when there is no baseline)."""
+    global _last_observed_state
+    observation: dict[str, Any] = {}
+    if mode in ("state", "both"):
+        after = await _call("state.get")
+        observation["revision"] = after.get("revision") if isinstance(after, dict) else None
+        if before is None:
+            observation["baseline"] = True
+        else:
+            observation["stateDiff"] = state_diff(
+                _observable_state(before), _observable_state(after)
+            )
+        _last_observed_state = after if isinstance(after, dict) else None
+    image: Image | None = None
+    if mode in ("screenshot", "both"):
+        try:
+            shot = await _call(
+                "screenshot.capture",
+                {"target": screenshot_target, "maxDim": OBSERVE_SCREENSHOT_MAX_DIM},
+            )
+            data = shot.get("base64") if isinstance(shot, dict) else None
+            if data:
+                image = Image(data=base64.b64decode(data), format="png")
+                observation["screenshot"] = {
+                    "target": screenshot_target,
+                    "width": shot.get("width"),
+                    "height": shot.get("height"),
+                }
+        except BridgeError as exc:
+            observation["screenshotError"] = exc.to_dict()
+    # Taken after the last bridge call: the bridge sends a request's
+    # state.changed before its response, so every change up to here is in.
+    _, changed = _get_client().take_state_changes()
+    observation["changed"] = changed
+    return observation, image
+
+
+async def _observed_call(
+    method: str,
+    params: dict[str, Any] | None,
+    observe: str,
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """Call a bridge method, then observe its effect.
+
+    ``observe="none"`` returns the bridge result unchanged. With "state" the
+    result dict gains an ``observation`` object: ``stateDiff`` (JSON Patch
+    operations between state.get just before and just after the call),
+    ``revision``, and ``changed`` (state.changed fields seen since the last
+    observation, including changes a person made).
+    """
+    if observe == "none":
+        return await _call(method, params, timeout=timeout)
+    before = await _call("state.get")
+    result = await _call(method, params, timeout=timeout)
+    observation, _ = await _observation("state", before, "window")
+    out = dict(result) if isinstance(result, dict) else {"result": result}
+    out["observation"] = observation
+    return out
 
 
 def _is_placeholder_error(exc: Exception) -> bool:

@@ -127,7 +127,9 @@ void AgentBridgeServer::registerLasagnaHandlers()
                     agentBridgeWorkspaceIds() << QStringLiteral("fiber_slice")),
             },
             .errors = {-32602, -32000, -32007},
-            .mcp = Mcp::exact(QStringLiteral("vc3d_switch_workspace")),
+            .mcp = Mcp::exact(
+                QStringLiteral("vc3d_switch_workspace"),
+                {QStringLiteral("observe")}),
         },
         [this](const QJsonValue& p) { return handleWorkspaceSwitch(p); });
 }

@@ -13,7 +13,7 @@ VC_ROOT = Path(__file__).resolve().parents[3]
 SPEC_PATH = VC_ROOT / "apps/VC3D/agent_bridge/SPEC.md"
 DESCRIPTION_PATH = VC_ROOT / "apps/VC3D/agent_bridge/rpc_description.json"
 EXPECTED_RPC_METHODS = 123
-MCP_ONLY_TOOLS = {"vc3d_wait_job"}
+MCP_ONLY_TOOLS = {"vc3d_wait_job", "vc3d_observe"}
 
 
 def _resolve_ref(schema: dict[str, Any], root: dict[str, Any]) -> dict[str, Any]:

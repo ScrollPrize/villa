@@ -9,7 +9,15 @@ from typing_extensions import TypedDict
 
 from mcp.server.fastmcp import Image
 
-from ..core import mcp, _call, _strip_none
+from ..core import (
+    ObserveMode,
+    _call,
+    _observation,
+    _observed_call,
+    _strip_none,
+    mcp,
+)
+from .. import core
 
 INLINE_SCREENSHOT_MAX_DIM = 2048
 
@@ -169,7 +177,8 @@ async def vc3d_switch_workspace(
         "spiral",
         "fiber-map",
         "fiber_slice",
-    ]
+    ],
+    observe: ObserveMode = "none",
 ) -> dict[str, Any]:
     """Switch VC3D's active workspace tab, exactly as clicking the tab does.
     Requires a volume package to be open.
@@ -191,8 +200,44 @@ async def vc3d_switch_workspace(
     launched VC3D can open on a leftover tab from a prior session. There is no
     automatic return; switch back to "main" yourself.
 
+    observe: "none" (default) returns the plain result. "state" adds an
+    "observation" with a JSON Patch "stateDiff" of vc3d_get_state from just
+    before to just after the switch, the "revision", and the "changed"
+    fields. For a picture, call vc3d_observe next.
+
     Returns {"workspace": id, "previous": id or null}. Errors: -32602 (unknown
     name), -32000 (no volume package loaded), -32007 (that workspace is not
     present in this build).
     """
-    return await _call("workspace.switch", {"name": name})
+    return await _observed_call("workspace.switch", {"name": name}, observe)
+
+
+@mcp.tool()
+async def vc3d_observe(
+    mode: Literal["state", "screenshot", "both"] = "both",
+    target: str = "window",
+) -> Any:
+    """Look at VC3D now: what changed since your last observation, and what it
+    looks like. Use it after any tool without an observe option, or to notice
+    what a person did in the GUI.
+
+    mode: "state" returns an "observation" with "stateDiff" (JSON Patch
+    operations on vc3d_get_state since the previous observation from this MCP
+    server; the first one returns "baseline": true instead), the current
+    "revision", and "changed" (field names from VC3D's state.changed
+    notifications since the last observation: project, volume,
+    activeSegment, editing, viewers, workspace, overlay, jobs). "screenshot"
+    adds an image of target; "both" does both.
+    target: "window" or anything vc3d_screenshot accepts as a target.
+
+    The interaction tools (vc3d_click, vc3d_shift_click, vc3d_drag, vc3d_key,
+    vc3d_wheel, vc3d_center_viewer, vc3d_zoom_viewer, vc3d_rotate_viewer,
+    vc3d_switch_workspace) take observe="state" to diff the state around a
+    single call; call this tool after one of them for its picture.
+
+    Returns {"observation": {...}} or [that, image]. A failed capture is
+    reported as observation.screenshotError rather than an error.
+    """
+    observation, image = await _observation(mode, core._last_observed_state, target)
+    out = {"observation": observation}
+    return [out, image] if image is not None else out

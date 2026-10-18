@@ -51,7 +51,7 @@ class InputToolTest(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_key_hold_forwards_hold_ms_and_extends_timeout(self) -> None:
-        with mock.patch("vc3d_mcp.tools.viewer._call", wraps=core._call) as call:
+        with mock.patch("vc3d_mcp.core._call", wraps=core._call) as call:
             await vc3d_key(key="A", hold_ms=2500)
         method, params = call.call_args.args
         self.assertEqual(method, "canvas.key")
@@ -59,7 +59,7 @@ class InputToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(call.call_args.kwargs["timeout"], 2.5 + 10.0)
 
     async def test_key_press_limit_keeps_default_timeout(self) -> None:
-        with mock.patch("vc3d_mcp.tools.viewer._call", wraps=core._call) as call:
+        with mock.patch("vc3d_mcp.core._call", wraps=core._call) as call:
             await vc3d_key(key="S", action="press", hold_ms=30000)
         self.assertEqual(
             call.call_args.args[1], {"key": "S", "action": "press", "holdMs": 30000}
@@ -67,7 +67,7 @@ class InputToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(call.call_args.kwargs["timeout"])
 
     async def test_key_without_hold_uses_default_timeout(self) -> None:
-        with mock.patch("vc3d_mcp.tools.viewer._call", wraps=core._call) as call:
+        with mock.patch("vc3d_mcp.core._call", wraps=core._call) as call:
             await vc3d_key(key="Esc")
         self.assertIsNone(call.call_args.kwargs["timeout"])
 

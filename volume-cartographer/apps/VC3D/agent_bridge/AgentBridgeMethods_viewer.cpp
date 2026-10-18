@@ -62,6 +62,7 @@ void AgentBridgeServer::registerViewerHandlers()
             .mcp = {
                 .tool = QStringLiteral("vc3d_center_viewer"),
                 .snakeCaseParams = true,
+                .extraParams = {QStringLiteral("observe")},
             },
         },
         [this](const QJsonValue& p) { return handleViewerCenterOnPoint(p); });
@@ -74,7 +75,10 @@ void AgentBridgeServer::registerViewerHandlers()
                 Params::requiredPositiveNumber(QStringLiteral("factor")),
             },
             .errors = {-32602, -32002},
-            .mcp = {.tool = QStringLiteral("vc3d_zoom_viewer")},
+            .mcp = {
+                .tool = QStringLiteral("vc3d_zoom_viewer"),
+                .extraParams = {QStringLiteral("observe")},
+            },
         },
         [this](const QJsonValue& p) { return handleViewerZoom(p); });
 
@@ -89,7 +93,10 @@ void AgentBridgeServer::registerViewerHandlers()
                 Params::optionalBoolean(QStringLiteral("relative"), true),
             },
             .errors = {-32602, -32002, -32000},
-            .mcp = {.tool = QStringLiteral("vc3d_rotate_viewer")},
+            .mcp = {
+                .tool = QStringLiteral("vc3d_rotate_viewer"),
+                .extraParams = {QStringLiteral("observe")},
+            },
         },
         [this](const QJsonValue& p) { return handleViewerRotate(p); });
 

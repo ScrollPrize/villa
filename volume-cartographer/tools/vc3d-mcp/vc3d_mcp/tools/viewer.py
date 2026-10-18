@@ -6,7 +6,7 @@ from typing import Any, Literal, Optional
 
 from typing_extensions import NotRequired, TypedDict
 
-from ..core import mcp, _call, _strip_none
+from ..core import ObserveMode, mcp, _call, _observed_call, _strip_none
 
 
 class _Vec3(TypedDict):
@@ -79,6 +79,7 @@ async def vc3d_click(
     space: Literal["volume", "scene"] = "volume",
     button: Literal["left", "right", "middle"] = "left",
     modifiers: Optional[_Modifiers] = None,
+    observe: ObserveMode = "none",
 ) -> dict[str, Any]:
     """Synthesize a mouse click in a viewer at a volume-space (or scene-space)
     position, with button and modifiers (e.g. modifiers=["shift"] to place a
@@ -91,6 +92,10 @@ async def vc3d_click(
     space="scene" with on-screen pixel coordinates.
     button: "left" | "right" | "middle".
     modifiers: any of "shift", "ctrl", "alt", "meta", "keypad".
+    observe: "none" (default) returns the plain result. "state" adds an
+    "observation" with a JSON Patch "stateDiff" of vc3d_get_state from just
+    before to just after the call, the "revision", and the "changed" fields.
+    For a picture of the result, call vc3d_observe or vc3d_screenshot next.
 
     Fails -32009 while a modal dialog or menu is open in VC3D (the click
     would land behind it), as for a person.
@@ -101,7 +106,7 @@ async def vc3d_click(
     NOT place a control point on these panes, unlike its usual place-point
     role elsewhere.
     """
-    return await _call(
+    return await _observed_call(
         "canvas.click",
         _strip_none(
             {
@@ -112,6 +117,7 @@ async def vc3d_click(
                 "modifiers": modifiers if modifiers is not None else [],
             }
         ),
+        observe,
     )
 
 
@@ -122,14 +128,20 @@ async def vc3d_shift_click(
     space: Literal["volume", "scene"] = "volume",
     button: Literal["left", "right", "middle"] = "left",
     modifiers: Optional[_Modifiers] = None,
+    observe: ObserveMode = "none",
 ) -> dict[str, Any]:
     """Shift+click convenience: the canonical place-point / set-focus gesture.
     Identical to vc3d_click with "shift" unioned into modifiers.
 
+    observe: "none" (default) returns the plain result. "state" adds an
+    "observation" with a JSON Patch "stateDiff" of vc3d_get_state from just
+    before to just after the call, the "revision", and the "changed" fields.
+    For a picture of the result, call vc3d_observe or vc3d_screenshot next.
+
     Exception: on a fiber-tracing (Line Annotation) workspace pane, this
     triggers a "predicted snap point" gesture instead of adding a control
     point -- use plain vc3d_click (no shift) there to add control points."""
-    return await _call(
+    return await _observed_call(
         "canvas.shift_click",
         _strip_none(
             {
@@ -140,29 +152,54 @@ async def vc3d_shift_click(
                 "modifiers": modifiers if modifiers is not None else [],
             }
         ),
+        observe,
     )
 
 
 @mcp.tool()
 async def vc3d_center_viewer(
-    point: _Vec3, viewer: Optional[str] = None, force_render: bool = True
+    point: _Vec3,
+    viewer: Optional[str] = None,
+    force_render: bool = True,
+    observe: ObserveMode = "none",
 ) -> dict[str, Any]:
-    """Center a viewer pane on a 3D volume point."""
-    return await _call(
+    """Center a viewer pane on a 3D volume point.
+
+    observe: "none" (default) returns the plain result. "state" adds an
+    "observation" with a JSON Patch "stateDiff" of vc3d_get_state from just
+    before to just after the call, the "revision", and the "changed" fields.
+    For a picture of the result, call vc3d_observe or vc3d_screenshot next.
+    """
+    return await _observed_call(
         "viewer.center_on_point",
         _strip_none({"viewer": viewer, "point": point, "forceRender": force_render}),
+        observe,
     )
 
 
 @mcp.tool()
-async def vc3d_zoom_viewer(factor: float, viewer: Optional[str] = None) -> dict[str, Any]:
+async def vc3d_zoom_viewer(
+    factor: float,
+    viewer: Optional[str] = None,
+    observe: ObserveMode = "none",
+) -> dict[str, Any]:
     """Multiply a viewer's zoom scale by `factor` (>1 zooms in, <1 zooms out;
     e.g. 10 = 10x closer, 0.5 = half). It is a true multiplier applied in one
     call -- no need to repeat small steps. Returns the new scale, which is
     clamped to the viewer's zoom limits, so a very large factor saturates at
     max zoom and the returned scale may reflect less than the full multiply.
-    Compare the returned scale to gauge how much room is left."""
-    return await _call("viewer.zoom", _strip_none({"viewer": viewer, "factor": factor}))
+    Compare the returned scale to gauge how much room is left.
+
+    observe: "none" (default) returns the plain result. "state" adds an
+    "observation" with a JSON Patch "stateDiff" of vc3d_get_state from just
+    before to just after the call, the "revision", and the "changed" fields.
+    For a picture of the result, call vc3d_observe or vc3d_screenshot next.
+    """
+    return await _observed_call(
+        "viewer.zoom",
+        _strip_none({"viewer": viewer, "factor": factor}),
+        observe,
+    )
 
 
 @mcp.tool()
@@ -170,6 +207,7 @@ async def vc3d_rotate_viewer(
     plane: Literal["seg xz", "seg yz", "xz", "yz"],
     degrees: float,
     relative: bool = True,
+    observe: ObserveMode = "none",
 ) -> dict[str, Any]:
     """Rotate an axis-aligned slice plane -- the same rotation a human gets by
     middle-drag on the "seg xz" / "seg yz" panes. `plane` must be "seg xz" or
@@ -178,9 +216,17 @@ async def vc3d_rotate_viewer(
     a relative delta added to the current angle (positive = same sense as
     dragging up); pass relative=False to set an absolute angle. Requires
     axis-aligned slice mode to be active. Returns the new and previous angles in
-    degrees."""
-    return await _call(
-        "viewer.rotate", {"plane": plane, "degrees": degrees, "relative": relative}
+    degrees.
+
+    observe: "none" (default) returns the plain result. "state" adds an
+    "observation" with a JSON Patch "stateDiff" of vc3d_get_state from just
+    before to just after the call, the "revision", and the "changed" fields.
+    For a picture of the result, call vc3d_observe or vc3d_screenshot next.
+    """
+    return await _observed_call(
+        "viewer.rotate",
+        {"plane": plane, "degrees": degrees, "relative": relative},
+        observe,
     )
 
 
@@ -403,6 +449,7 @@ async def vc3d_drag(
     button: Literal["left", "right", "middle", "none"] = "left",
     modifiers: Optional[_Modifiers] = None,
     steps: int = 8,
+    observe: ObserveMode = "none",
 ) -> dict[str, Any]:
     """Synthesize a full press-move-release drag in a viewer, from one point to
     another (the twin of a human click-and-drag). Dispatched through the
@@ -432,8 +479,13 @@ async def vc3d_drag(
     active (see vc3d_corrections_set_point_mode) commits an anchored correction
     and auto-triggers the corrections solver (a source:"growth" job -- poll
     vc3d_job_status before further editing RPCs).
+
+    observe: "none" (default) returns the plain result. "state" adds an
+    "observation" with a JSON Patch "stateDiff" of vc3d_get_state from just
+    before to just after the call, the "revision", and the "changed" fields.
+    For a picture of the result, call vc3d_observe or vc3d_screenshot next.
     """
-    return await _call(
+    return await _observed_call(
         "canvas.drag",
         _strip_none(
             {
@@ -446,8 +498,8 @@ async def vc3d_drag(
                 "steps": steps,
             }
         ),
+        observe,
     )
-
 
 
 @mcp.tool()
@@ -457,6 +509,7 @@ async def vc3d_key(
     modifiers: Optional[_Modifiers] = None,
     action: Literal["tap", "press", "release"] = "tap",
     hold_ms: Optional[int] = None,
+    observe: ObserveMode = "none",
 ) -> dict[str, Any]:
     """Press a key in a viewer as a keyboard user would. VC3D receives real
     key events: shortcuts get the first chance, then the viewer, then the main
@@ -510,10 +563,15 @@ async def vc3d_key(
     volume viewer, viewer not visible, a modal dialog or menu is open, or
     tapping a key this connection holds), -32004 (another hold is already
     pending on this connection).
+
+    observe: "none" (default) returns the plain result. "state" adds an
+    "observation" with a JSON Patch "stateDiff" of vc3d_get_state from just
+    before to just after the call, the "revision", and the "changed" fields.
+    For a picture of the result, call vc3d_observe or vc3d_screenshot next.
     """
     # A tap with hold_ms answers only after the release.
     timeout = hold_ms / 1000.0 + 10.0 if hold_ms is not None and action == "tap" else None
-    return await _call(
+    return await _observed_call(
         "canvas.key",
         _strip_none(
             {
@@ -524,6 +582,7 @@ async def vc3d_key(
                 "holdMs": hold_ms,
             }
         ),
+        observe,
         timeout=timeout,
     )
 
@@ -535,6 +594,7 @@ async def vc3d_wheel(
     viewer: Optional[str] = None,
     space: Literal["volume", "scene"] = "volume",
     modifiers: Optional[_Modifiers] = None,
+    observe: ObserveMode = "none",
 ) -> dict[str, Any]:
     """Turn the mouse wheel over a viewer at a position. VC3D receives a real
     wheel event at that point, so the viewer's own wheel bindings apply:
@@ -556,8 +616,13 @@ async def vc3d_wheel(
     "deltaY", "notches", "modifiers", "accepted"}. Errors: -32602, -32002,
     -32009 (not a volume viewer, or a modal dialog or menu is open), -32001
     (no volume loaded), -32003 (point not on the view).
+
+    observe: "none" (default) returns the plain result. "state" adds an
+    "observation" with a JSON Patch "stateDiff" of vc3d_get_state from just
+    before to just after the call, the "revision", and the "changed" fields.
+    For a picture of the result, call vc3d_observe or vc3d_screenshot next.
     """
-    return await _call(
+    return await _observed_call(
         "canvas.wheel",
         _strip_none(
             {
@@ -568,4 +633,5 @@ async def vc3d_wheel(
                 "modifiers": modifiers,
             }
         ),
+        observe,
     )

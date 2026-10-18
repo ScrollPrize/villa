@@ -86,12 +86,20 @@ std::vector<AgentBridgeParam> clickParams()
     };
 }
 
-AgentBridgeMcp canvasMcp(const QString& tool)
+AgentBridgeMcp canvasMcp(const QString& tool, QStringList extraParams = {})
 {
     return {
         .tool = tool,
         .snakeCaseParams = true,
+        .extraParams = std::move(extraParams),
     };
+}
+
+// MCP-only option on the interaction tools: read state and/or a screenshot
+// around the call.
+QStringList observeParam()
+{
+    return {QStringLiteral("observe")};
 }
 
 }  // namespace
@@ -116,7 +124,7 @@ void AgentBridgeServer::registerCanvasHandlers()
             .name = QStringLiteral("canvas.click"),
             .params = clickParams(),
             .errors = {-32602, -32002, -32009, -32001, -32003},
-            .mcp = canvasMcp(QStringLiteral("vc3d_click")),
+            .mcp = canvasMcp(QStringLiteral("vc3d_click"), observeParam()),
         },
         [this](const QJsonValue& p) {
             return handleCanvasClick(p, /*addShift=*/false);
@@ -127,7 +135,7 @@ void AgentBridgeServer::registerCanvasHandlers()
             .name = QStringLiteral("canvas.shift_click"),
             .params = clickParams(),
             .errors = {-32602, -32002, -32009, -32001, -32003},
-            .mcp = canvasMcp(QStringLiteral("vc3d_shift_click")),
+            .mcp = canvasMcp(QStringLiteral("vc3d_shift_click"), observeParam()),
         },
         [this](const QJsonValue& p) {
             return handleCanvasClick(p, /*addShift=*/true);
@@ -162,6 +170,7 @@ void AgentBridgeServer::registerCanvasHandlers()
                         QStringLiteral("to_point"),
                     },
                 },
+                .extraParams = observeParam(),
             },
         },
         [this](const QJsonValue& p) { return handleCanvasDrag(p); });
@@ -188,7 +197,7 @@ void AgentBridgeServer::registerCanvasHandlers()
                 holdMs,
             },
             .errors = {-32602, -32002, -32009, -32004, -32005},
-            .mcp = canvasMcp(QStringLiteral("vc3d_key")),
+            .mcp = canvasMcp(QStringLiteral("vc3d_key"), observeParam()),
         },
         [this](const QJsonValue& p) { return handleCanvasKey(p); });
 
@@ -206,7 +215,7 @@ void AgentBridgeServer::registerCanvasHandlers()
                 optionalModifiers(),
             },
             .errors = {-32602, -32002, -32009, -32001, -32003},
-            .mcp = canvasMcp(QStringLiteral("vc3d_wheel")),
+            .mcp = canvasMcp(QStringLiteral("vc3d_wheel"), observeParam()),
         },
         [this](const QJsonValue& p) { return handleCanvasWheel(p); });
 }
