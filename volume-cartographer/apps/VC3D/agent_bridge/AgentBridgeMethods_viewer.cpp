@@ -25,6 +25,13 @@ AgentBridgeParam requiredVec3(const QString& name)
     return param;
 }
 
+AgentBridgeParam optionalVec3(const QString& name)
+{
+    AgentBridgeParam param = requiredVec3(name);
+    param.required = false;
+    return param;
+}
+
 AgentBridgeParam optionalWindow(const QString& name)
 {
     return AgentBridgeParams::optionalObject(
@@ -138,8 +145,56 @@ void AgentBridgeServer::registerViewerHandlers()
                 Params::optionalBoolean(QStringLiteral("segmentationCursorMirroring")),
                 Params::optionalInteger(QStringLiteral("samplingStride")),
                 Params::optionalNumber(QStringLiteral("zScrollSensitivity")),
+                Params::optionalBoolean(QStringLiteral("axisOverlays")),
+                Params::optionalBoolean(QStringLiteral("coordinateFrames")),
+                Params::optionalBoolean(QStringLiteral("rawPoints")),
+                Params::optionalObject(
+                    QStringLiteral("focusBounds"),
+                    {
+                        Params::optionalBoolean(QStringLiteral("enabled")),
+                        optionalVec3(QStringLiteral("min")),
+                        optionalVec3(QStringLiteral("max")),
+                    }),
+                Params::optionalObject(
+                    QStringLiteral("composite"),
+                    {
+                        Params::optionalBoolean(QStringLiteral("enabled")),
+                        Params::optionalStringEnum(
+                            QStringLiteral("method"),
+                            {
+                                QStringLiteral("max"),
+                                QStringLiteral("mean"),
+                                QStringLiteral("min"),
+                                QStringLiteral("alpha"),
+                                QStringLiteral("volumetric"),
+                            }),
+                        Params::optionalInteger(QStringLiteral("layersFront")),
+                        Params::optionalInteger(QStringLiteral("layersBehind")),
+                        Params::optionalBoolean(QStringLiteral("reverseDirection")),
+                        Params::optionalInteger(QStringLiteral("alphaMin")),
+                        Params::optionalInteger(QStringLiteral("alphaMax")),
+                        Params::optionalInteger(QStringLiteral("alphaThreshold")),
+                        Params::optionalInteger(QStringLiteral("material")),
+                        Params::optionalObject(
+                            QStringLiteral("planes"),
+                            {
+                                Params::optionalBoolean(QStringLiteral("xy")),
+                                Params::optionalBoolean(QStringLiteral("xz")),
+                                Params::optionalBoolean(QStringLiteral("yz")),
+                            }),
+                        Params::optionalInteger(QStringLiteral("planeLayersFront")),
+                        Params::optionalInteger(QStringLiteral("planeLayersBehind")),
+                        Params::optionalBoolean(QStringLiteral("planeReverseDirection")),
+                    }),
+                Params::optionalObject(
+                    QStringLiteral("volumetric"),
+                    {
+                        Params::optionalNumber(QStringLiteral("gamma")),
+                        Params::optionalNumber(QStringLiteral("lighting")),
+                        Params::optionalNumber(QStringLiteral("wScale")),
+                    }),
             },
-            .errors = {-32602, -32010},
+            .errors = {-32602, -32001, -32010},
             .mcp = {
                 .tool = QStringLiteral("vc3d_set_render_settings"),
                 .snakeCaseParams = true,
@@ -182,6 +237,9 @@ void AgentBridgeServer::registerViewerHandlers()
                         Params::optionalInteger(QStringLiteral("layersFront")),
                         Params::optionalInteger(QStringLiteral("layersBehind")),
                     }),
+                Params::optionalStringEnum(
+                    QStringLiteral("interpolation"),
+                    {QStringLiteral("nearest"), QStringLiteral("trilinear")}),
             },
             .errors = {-32602, -32010, -32007, -32000},
             .mcp = {

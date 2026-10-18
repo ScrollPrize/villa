@@ -12,12 +12,14 @@
 
 #include "CWindow.hpp"
 #include "VolumeViewerCmaps.hpp"
+#include "volume_viewers/VolumeViewerBase.hpp"
 #include "overlays/InkDetectionOverlayController.hpp"
 
 // ===========================================================================
 // Viewer display state beyond the shared render settings: the ink detection
 // overlay shown over flattened segment views, whose setters drive the same
-// controller as the Ink Detection panel.
+// controller as the Ink Detection panel, and per-viewer view resets matching
+// the Reset View and Zoom to Fit shortcuts.
 // ===========================================================================
 
 namespace {
@@ -142,4 +144,38 @@ QJsonObject AgentBridgeServer::handleViewerSetInkOverlay(const QJsonValue& param
     if (p.contains("flipVertical"))
         overlay->setVerticalFlip(p.value("flipVertical").toBool());
     return inkOverlayJson();
+}
+
+
+// ---------------------------------------------------------------------------
+// viewer.reset
+// ---------------------------------------------------------------------------
+
+QJsonObject AgentBridgeServer::handleViewerReset(const QJsonValue& params)
+{
+    const QJsonObject p = params.toObject();
+    VolumeViewerBase* viewer = resolveViewer(p.value("viewer"));
+    const QString fit = p.value("fit").toString(QStringLiteral("surface"));
+
+    // The reset-view shortcut clears the pan and normal offsets, then fits;
+    // the requested normal offset is applied after that reset, so it is
+    // absolute (the viewer clamps it to the volume's largest dimension).
+    viewer->resetSurfaceOffsets();
+    if (p.contains("zOffset")) {
+        const double zOffset = p.value("zOffset").toDouble();
+        if (zOffset != 0.0)
+            viewer->adjustSurfaceOffset(static_cast<float>(zOffset));
+    }
+    if (fit == QLatin1String("surface"))
+        viewer->fitSurfaceInView();
+    else if (fit == QLatin1String("content"))
+        viewer->resetViewForCurrentContent(true);
+    viewer->renderVisible(true);
+
+    QJsonObject result;
+    result["viewer"] = viewerIdFor(viewer);
+    result["fit"] = fit;
+    result["zOffset"] = viewer->normalOffset();
+    result["scale"] = viewer->getCurrentScale();
+    return result;
 }

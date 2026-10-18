@@ -531,6 +531,23 @@ is; they are not a stable contract.
   reported and set in `[0,1]` and stored as whole percent. Updates validate
   every field before applying any; an empty or null `path` clears the
   selection.
+- `viewer.reset` performs the Reset View shortcut on one viewer: it clears the
+  pan and normal offsets, applies `zOffset` as an absolute normal offset (the
+  viewer clamps it), then fits the surface (`fit: "surface"`, the default),
+  fits the current content like Zoom to Fit (`"content"`), or keeps the scale
+  (`"none"`). It returns the resulting normal offset and scale.
+- `viewer.set_render_settings` also covers the View dock's axis overlays,
+  coordinate frames, raw points and focus bounds, and the Composite dock:
+  method, layers, alpha controls, plane composites, and volumetric gamma,
+  lighting (`[0,1]`) and w scale. The View dock checkboxes are set the way
+  `viewer.set_axis_aligned_slices` sets its checkbox, and the Composite dock
+  fields go through `ViewerCompositePanel::applyControls`; either way each
+  control's own handler applies, clamps (silently, to the control's range) and
+  saves the value as a person's edit would. Focus bounds need a loaded volume;
+  `min` and `max` come together, are rounded to voxels and clamped to the
+  volume, and `enabled: true` fails until a box exists.
+- `viewer.set_overlay` accepts `interpolation` (`nearest` or `trilinear`), the
+  overlay sampling the Overlay panel's combo box sets.
 
 ### Screenshots
 
@@ -817,6 +834,7 @@ is the sole bridge method without an MCP tool; `vc3d_wait_job` and
 | `vc3d_rename_segment` | `segments.rename` | Rename a segment (id + folder). `new_name` must match `^[a-zA-Z0-9_-]+$`, differ from the current name, and not collide. Fails while editing is enabled. |
 | `vc3d_render_tifxyz` | `render.tifxyz` |
 | `vc3d_reoptimize_segment` | `segment.reoptimize` | Resume-opt local reoptimization of a segment. Asynchronous (`source:"tool"`); supports `wait: bool = false` (30-minute cap). |
+| `vc3d_reset_viewer` | `viewer.reset` | Reset one viewer's pan and normal offset, optionally set an absolute normal offset, then fit the surface or the current content (Reset View and Zoom to Fit shortcuts). |
 | `vc3d_reset_windings` | `points.reset_windings` |
 | `vc3d_restore_segment_backup` | `segment.restore_backup` | Restore a segment from one of its rotating backups (`confirm` required; without it the call lists the backups and changes nothing). |
 | `vc3d_review_segments` | `segments.review` | List segments with review-tag state and optional server-side filtering (the programmatic equivalent of the surface panel's review filter checkboxes). |
@@ -840,12 +858,12 @@ is the sole bridge method without an MCP tool; `vc3d_wait_job` and
 | `vc3d_set_axis_aligned_slices` | `viewer.set_axis_aligned_slices` | Enable/disable axis-aligned slice mode (checkbox equivalent) — prerequisite for `viewer.rotate`. |
 | `vc3d_set_ink_overlay` | `viewer.set_ink_overlay` | Select, clear, recolor, fade or flip the ink detection overlay; any subset. |
 | `vc3d_set_intersects` | `viewer.set_intersects` | Set which surfaces' intersection lines a viewer draws. |
-| `vc3d_set_overlay` | `viewer.set_overlay` | Update the active workspace and GUI overlay controls together (volume, colormap, opacity, threshold, window, resolution cap, composite); any subset. |
+| `vc3d_set_overlay` | `viewer.set_overlay` | Update the active workspace and GUI overlay controls together (volume, colormap, opacity, threshold, window, resolution cap, composite, interpolation); any subset. |
 | `vc3d_set_point_collection_color` | `points.set_collection_color` |
 | `vc3d_set_point_collection_metadata` | `points.set_collection_metadata` |
 | `vc3d_set_point_collection_tag` | `points.set_collection_tag` |
 | `vc3d_set_point_windings_linked` | `points.set_windings_linked` |
-| `vc3d_set_render_settings` | `viewer.set_render_settings` | Set any subset of the viewer render/overlay settings; returns the full settings after applying. Viewer-specific toggle fields are no-ops when no viewer is open; highlighted surface ids are retained by the surface panel. |
+| `vc3d_set_render_settings` | `viewer.set_render_settings` | Set any subset of the viewer render/overlay settings; returns the full settings after applying. Viewer-specific toggle fields are no-ops when no viewer is open; highlighted surface ids are retained by the surface panel. Also sets the View dock (axis overlays, coordinate frames, raw points, focus bounds) and Composite dock controls. |
 | `vc3d_set_segment_tag` | `tags.set` |
 | `vc3d_set_wrap_annotation_mode` | `wrap_annotation.set_mode` | Enable/disable "Same-wrap annotation mode" (prerequisite for the shift+E commit workflow; seed the preview via `vc3d_shift_click`). |
 | `vc3d_shift_click` | `canvas.shift_click` | Shift+click convenience: the canonical place-point / set-focus gesture. |

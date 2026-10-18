@@ -4230,6 +4230,41 @@
         "type": "object"
       }
     },
+    "viewer.reset": {
+      "errors": [
+        -32602,
+        -32002
+      ],
+      "mcp": {
+        "paramRenames": {
+          "zOffset": "z_offset"
+        },
+        "tool": "vc3d_reset_viewer"
+      },
+      "params": {
+        "properties": {
+          "fit": {
+            "default": "surface",
+            "enum": [
+              "surface",
+              "content",
+              "none"
+            ],
+            "type": "string"
+          },
+          "viewer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "zOffset": {
+            "type": "number"
+          }
+        },
+        "type": "object"
+      }
+    },
     "viewer.rotate": {
       "errors": [
         -32602,
@@ -4415,6 +4450,13 @@
             },
             "type": "object"
           },
+          "interpolation": {
+            "enum": [
+              "nearest",
+              "trilinear"
+            ],
+            "type": "string"
+          },
           "maxDisplayedResolution": {
             "maximum": 2147483647,
             "minimum": -2147483648,
@@ -4451,10 +4493,14 @@
     "viewer.set_render_settings": {
       "errors": [
         -32602,
+        -32001,
         -32010
       ],
       "mcp": {
         "paramRenames": {
+          "axisOverlays": "axis_overlays",
+          "coordinateFrames": "coordinate_frames",
+          "focusBounds": "focus_bounds",
           "highlightedSurfaceIds": "highlighted_surface_ids",
           "intersectionMaxSurfaces": "intersection_max_surfaces",
           "intersectionOpacity": "intersection_opacity",
@@ -4463,6 +4509,7 @@
           "normalMaxArrows": "normal_max_arrows",
           "overlayOpacity": "overlay_opacity",
           "planeIntersectionLinesVisible": "plane_intersection_lines_visible",
+          "rawPoints": "raw_points",
           "samplingStride": "sampling_stride",
           "segmentationCursorMirroring": "segmentation_cursor_mirroring",
           "showDirectionHints": "show_direction_hints",
@@ -4475,6 +4522,136 @@
       },
       "params": {
         "properties": {
+          "axisOverlays": {
+            "type": "boolean"
+          },
+          "composite": {
+            "properties": {
+              "alphaMax": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "alphaMin": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "alphaThreshold": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "enabled": {
+                "type": "boolean"
+              },
+              "layersBehind": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "layersFront": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "material": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "method": {
+                "enum": [
+                  "max",
+                  "mean",
+                  "min",
+                  "alpha",
+                  "volumetric"
+                ],
+                "type": "string"
+              },
+              "planeLayersBehind": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "planeLayersFront": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "planeReverseDirection": {
+                "type": "boolean"
+              },
+              "planes": {
+                "properties": {
+                  "xy": {
+                    "type": "boolean"
+                  },
+                  "xz": {
+                    "type": "boolean"
+                  },
+                  "yz": {
+                    "type": "boolean"
+                  }
+                },
+                "type": "object"
+              },
+              "reverseDirection": {
+                "type": "boolean"
+              }
+            },
+            "type": "object"
+          },
+          "coordinateFrames": {
+            "type": "boolean"
+          },
+          "focusBounds": {
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "max": {
+                "properties": {
+                  "x": {
+                    "type": "number"
+                  },
+                  "y": {
+                    "type": "number"
+                  },
+                  "z": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "x",
+                  "y",
+                  "z"
+                ],
+                "type": "object"
+              },
+              "min": {
+                "properties": {
+                  "x": {
+                    "type": "number"
+                  },
+                  "y": {
+                    "type": "number"
+                  },
+                  "z": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "x",
+                  "y",
+                  "z"
+                ],
+                "type": "object"
+              }
+            },
+            "type": "object"
+          },
           "highlightedSurfaceIds": {
             "items": {
               "type": "string"
@@ -4504,6 +4681,9 @@
             "type": "number"
           },
           "planeIntersectionLinesVisible": {
+            "type": "boolean"
+          },
+          "rawPoints": {
             "type": "boolean"
           },
           "samplingStride": {
@@ -4536,6 +4716,20 @@
               "low",
               "high"
             ],
+            "type": "object"
+          },
+          "volumetric": {
+            "properties": {
+              "gamma": {
+                "type": "number"
+              },
+              "lighting": {
+                "type": "number"
+              },
+              "wScale": {
+                "type": "number"
+              }
+            },
             "type": "object"
           },
           "zScrollSensitivity": {

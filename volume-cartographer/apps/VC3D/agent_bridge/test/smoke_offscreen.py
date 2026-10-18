@@ -300,10 +300,10 @@ def check_rpc_describe(
         coverage = description.get("coverage", {})
         complete = (
             description.get("undocumented") == []
-            and coverage.get("described") == 136
-            and coverage.get("registered") == 136
+            and coverage.get("described") == 137
+            and coverage.get("registered") == 137
             and coverage.get("complete") is True
-            and len(snapshot["methods"]) == 136
+            and len(snapshot["methods"]) == 137
         )
         rendered = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         if update_snapshot:
@@ -2151,6 +2151,101 @@ def check_ink_overlay(client: BridgeClient, results: Results) -> None:
                        f"{type(error).__name__}: {error}")
 
 
+def check_viewer_display_settings(client: BridgeClient, results: Results) -> None:
+    ok, detail = expect_param_error(client, "viewer.reset", {"fit": "bogus"}, "fit")
+    results.record("viewer_reset_rejects_unknown_fit", ok, detail)
+    try:
+        offset, _ = client.call(
+            "viewer.reset", {"fit": "none", "zOffset": 3}, timeout=RPC_TIMEOUT)
+        reset, _ = client.call("viewer.reset", {}, timeout=RPC_TIMEOUT)
+        ok = (
+            offset.get("fit") == "none"
+            and offset.get("zOffset") == 3
+            and reset.get("fit") == "surface"
+            and reset.get("zOffset") == 0
+            and isinstance(reset.get("viewer"), str)
+            and reset.get("scale", 0) > 0
+        )
+        results.record("viewer_reset", ok, f"offset={offset} reset={reset}")
+    except Exception as error:  # noqa: BLE001
+        results.record("viewer_reset", False, f"{type(error).__name__}: {error}")
+
+    ok, detail = expect_param_error(
+        client, "viewer.set_render_settings",
+        {"focusBounds": {"min": {"x": 0, "y": 0, "z": 0}}},
+        "focusBounds")
+    results.record("render_settings_focus_bounds_needs_both", ok, detail)
+    ok, detail = expect_param_error(
+        client, "viewer.set_render_settings",
+        {"focusBounds": {"min": {"x": 5, "y": 0, "z": 0},
+                         "max": {"x": 1, "y": 4, "z": 4}}},
+        "focusBounds")
+    results.record("render_settings_focus_bounds_ordered", ok, detail)
+    ok, detail = expect_param_error(
+        client, "viewer.set_render_settings",
+        {"composite": {"method": "median"}}, "composite.method")
+    results.record("render_settings_composite_method_enum", ok, detail)
+    try:
+        before, _ = client.call("viewer.get_render_settings", {}, timeout=RPC_TIMEOUT)
+        changed, _ = client.call(
+            "viewer.set_render_settings",
+            {
+                # The smoke volume is 16 voxels on each side.
+                "focusBounds": {"enabled": True,
+                                "min": {"x": 1.4, "y": 1, "z": 1},
+                                "max": {"x": 100, "y": 4, "z": 4}},
+                "composite": {"method": "mean", "layersFront": 3,
+                              "planes": {"xz": True}},
+                "volumetric": {"lighting": 0.5},
+                "axisOverlays": not before.get("axisOverlays"),
+            },
+            timeout=RPC_TIMEOUT,
+        )
+        client.call(
+            "viewer.set_render_settings",
+            {
+                "focusBounds": {"enabled": False},
+                "composite": before.get("composite", {}),
+                "volumetric": before.get("volumetric", {}),
+                "axisOverlays": before.get("axisOverlays"),
+            },
+            timeout=RPC_TIMEOUT,
+        )
+        focus = changed.get("focusBounds", {})
+        composite = changed.get("composite", {})
+        ok = (
+            focus.get("enabled") is True
+            and focus.get("min") == {"x": 1, "y": 1, "z": 1}
+            and focus.get("max") == {"x": 15, "y": 4, "z": 4}
+            and composite.get("method") == "mean"
+            and composite.get("layersFront") == 3
+            and composite.get("planes", {}).get("xz") is True
+            and changed.get("volumetric", {}).get("lighting") == 0.5
+            and changed.get("axisOverlays") is (not before.get("axisOverlays"))
+        )
+        results.record("render_settings_docks_round_trip", ok,
+                       f"focus={focus} composite={composite} "
+                       f"volumetric={changed.get('volumetric')}")
+    except Exception as error:  # noqa: BLE001
+        results.record("render_settings_docks_round_trip", False,
+                       f"{type(error).__name__}: {error}")
+    try:
+        overlay, _ = client.call("viewer.get_overlay", {}, timeout=RPC_TIMEOUT)
+        original = overlay.get("interpolation")
+        target = "trilinear" if original != "trilinear" else "nearest"
+        changed, _ = client.call(
+            "viewer.set_overlay", {"interpolation": target},
+            timeout=RPC_TIMEOUT)
+        client.call("viewer.set_overlay", {"interpolation": original},
+                    timeout=RPC_TIMEOUT)
+        ok = original in ("nearest", "trilinear") and changed.get("interpolation") == target
+        results.record("overlay_interpolation_round_trip", ok,
+                       f"original={original} changed={changed.get('interpolation')}")
+    except Exception as error:  # noqa: BLE001
+        results.record("overlay_interpolation_round_trip", False,
+                       f"{type(error).__name__}: {error}")
+
+
 def check_open_data_editable_copy(
     client: BridgeClient,
     results: Results,
@@ -2861,6 +2956,7 @@ def main() -> int:
             check_segment_backups(client, results, tmp_path)
             check_project_attachments(client, results, tmp_path, volpkg)
             check_ink_overlay(client, results)
+            check_viewer_display_settings(client, results)
             check_open_data_editable_copy(client, results, tmp_path, volpkg)
             check_c4(client, results, str(volpkg), str(broken_volpkg))
             check_legacy_fiber_uuid(client, results, str(legacy_fiber_volpkg),

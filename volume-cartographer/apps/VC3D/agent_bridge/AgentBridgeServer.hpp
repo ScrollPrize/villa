@@ -261,6 +261,7 @@ private:
     QJsonObject handleViewerGetInkOverlay(const QJsonValue& params);
     QJsonObject handleViewerSetInkOverlay(const QJsonValue& params);
     QJsonObject inkOverlayJson() const;
+    QJsonObject handleViewerReset(const QJsonValue& params);
     QJsonObject handleSegmentationEnableEditing(const QJsonValue& params);
     QJsonObject handleSegmentationGrow(const QJsonValue& params);
     QJsonObject handleSegmentationGrowPatchFromSeed(const QJsonValue& params);

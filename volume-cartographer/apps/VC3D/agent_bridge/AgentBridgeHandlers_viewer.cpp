@@ -1,6 +1,7 @@
 #include "agent_bridge/AgentBridgeServer.hpp"
 #include "agent_bridge/AgentBridgeInternal.hpp"
 
+#include <QCheckBox>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -9,6 +10,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
 #include <functional>
 #include <memory>
 #include <set>
@@ -20,7 +22,9 @@
 #include "SurfacePanelController.hpp"
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
+#include "overlays/RawPointsOverlayController.hpp"
 #include "overlays/VolumeOverlayController.hpp"
+#include "viewer_controls/panels/ViewerCompositePanel.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 
@@ -76,6 +80,8 @@ QJsonObject overlaySettingsJson(
     composite["layersFront"] = state.composite.layersFront;
     composite["layersBehind"] = state.composite.layersBehind;
     o["composite"] = composite;
+    o["interpolation"] = state.samplingMethod == vc::Sampling::Trilinear
+        ? QStringLiteral("trilinear") : QStringLiteral("nearest");
     return o;
 }
 
@@ -152,6 +158,11 @@ QJsonObject AgentBridgeServer::handleViewerSetOverlay(const QJsonValue& params)
             composite.layersBehind = object.value("layersBehind").toInt();
     }
 
+    const bool hasInterpolation = p.contains("interpolation");
+    const vc::Sampling interpolation =
+        p.value("interpolation").toString() == QLatin1String("trilinear")
+            ? vc::Sampling::Trilinear : vc::Sampling::Nearest;
+
     VolumeOverlayController::Update update;
     if (clearVolume)
         update.volumeId = std::string{};
@@ -173,6 +184,8 @@ QJsonObject AgentBridgeServer::handleViewerSetOverlay(const QJsonValue& params)
         update.maxDisplayedResolution = maxRes;
     if (hasComposite)
         update.composite = composite;
+    if (hasInterpolation)
+        update.samplingMethod = interpolation;
 
     const auto applyResult = overlay->apply(update);
     if (applyResult ==
@@ -348,6 +361,45 @@ QJsonObject AgentBridgeServer::viewerRenderSettingsJson() const
             highlightIds.append(QString::fromStdString(id));
     }
     o["highlightedSurfaceIds"] = highlightIds;
+
+    // View dock and Composite dock state, read from the controls the person
+    // sees; each control's handler is what applies its value to the viewers.
+    const auto& ui = _window->ui;
+    o["axisOverlays"] = ui.chkAxisOverlays && ui.chkAxisOverlays->isChecked();
+    o["coordinateFrames"] = ui.chkCoordinateFrames && ui.chkCoordinateFrames->isChecked();
+    o["rawPoints"] = _window->_rawPointsOverlay && _window->_rawPointsOverlay->isEnabled();
+
+    QJsonObject focus;
+    CState* state = _window->_state;
+    const std::optional<Rect3D> bounds = state ? state->focusBounds() : std::nullopt;
+    focus["enabled"] = state && state->focusBoundsEnabled();
+    focus["min"] = bounds ? QJsonValue(vec3ToJson(bounds->low)) : QJsonValue(QJsonValue::Null);
+    focus["max"] = bounds ? QJsonValue(vec3ToJson(bounds->high)) : QJsonValue(QJsonValue::Null);
+    o["focusBounds"] = focus;
+
+    if (const ViewerCompositePanel* panel = _window->_viewerCompositePanel) {
+        const ViewerCompositePanel::Controls c = panel->controls();
+        o["composite"] = QJsonObject{
+            {"enabled", c.enabled},
+            {"method", QString::fromStdString(c.method)},
+            {"layersFront", c.layersFront},
+            {"layersBehind", c.layersBehind},
+            {"reverseDirection", c.reverseDirection},
+            {"alphaMin", c.alphaMin},
+            {"alphaMax", c.alphaMax},
+            {"alphaThreshold", c.alphaThreshold},
+            {"material", c.material},
+            {"planes", QJsonObject{{"xy", c.planeXY}, {"xz", c.planeXZ}, {"yz", c.planeYZ}}},
+            {"planeLayersFront", c.planeLayersFront},
+            {"planeLayersBehind", c.planeLayersBehind},
+            {"planeReverseDirection", c.planeReverseDirection},
+        };
+        o["volumetric"] = QJsonObject{
+            {"gamma", c.volumetricGamma},
+            {"lighting", c.volumetricLighting / 100.0},
+            {"wScale", c.volumetricWScale},
+        };
+    }
     return o;
 }
 
@@ -465,6 +517,88 @@ QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& p
         normalMaxArrows = std::clamp(v, 4, 100);
     }
 
+    // Focus bounds need the current volume to clamp against, like the View
+    // dock's fields.
+    const bool hasFocusBounds = p.contains("focusBounds");
+    const QJsonObject focusBounds = p.value("focusBounds").toObject();
+    std::optional<Rect3D> focusRect;
+    CState* state = _window->_state;
+    if (hasFocusBounds) {
+        const bool needsVolume = focusBounds.value("enabled").toBool(false) ||
+                                 focusBounds.contains("min") || focusBounds.contains("max");
+        if (needsVolume && (!state || !state->currentVolume()))
+            throw AgentBridgeError{-32001, "No volume loaded", {}};
+        if (focusBounds.contains("min") != focusBounds.contains("max")) {
+            throw AgentBridgeError{-32602, "focusBounds needs both min and max",
+                                   QJsonObject{{"param", "focusBounds"}}};
+        }
+        if (focusBounds.contains("min")) {
+            cv::Vec3f low = jsonToVec3(focusBounds.value("min"), "min");
+            cv::Vec3f high = jsonToVec3(focusBounds.value("max"), "max");
+            const auto [width, height, depth] = state->currentVolume()->shapeXyz();
+            const cv::Vec3f volumeHigh{
+                static_cast<float>(std::max(0, width - 1)),
+                static_cast<float>(std::max(0, height - 1)),
+                static_cast<float>(std::max(0, depth - 1))};
+            for (int axis = 0; axis < 3; ++axis) {
+                low[axis] = std::clamp(std::round(low[axis]), 0.0f, volumeHigh[axis]);
+                high[axis] = std::clamp(std::round(high[axis]), 0.0f, volumeHigh[axis]);
+                if (low[axis] > high[axis]) {
+                    throw AgentBridgeError{-32602, "focusBounds.min must not exceed max",
+                                           QJsonObject{{"param", "focusBounds"}}};
+                }
+            }
+            focusRect = Rect3D{low, high};
+        } else if (focusBounds.value("enabled").toBool(false) && !state->focusBounds()) {
+            throw AgentBridgeError{-32602, "focusBounds has no box yet; pass min and max",
+                                   QJsonObject{{"param", "focusBounds"}}};
+        }
+    }
+
+    // Composite dock fields map onto the panel's controls; the method enum is
+    // checked by the descriptor.
+    ViewerCompositePanel::ControlsUpdate compositeUpdate;
+    const bool hasCompositeControls = p.contains("composite") || p.contains("volumetric");
+    if (hasCompositeControls) {
+        const QJsonObject composite = p.value("composite").toObject();
+        auto boolField = [](const QJsonObject& o, const char* key) -> std::optional<bool> {
+            if (!o.contains(QLatin1String(key)))
+                return std::nullopt;
+            return o.value(QLatin1String(key)).toBool();
+        };
+        auto intField = [](const QJsonObject& o, const char* key) -> std::optional<int> {
+            if (!o.contains(QLatin1String(key)))
+                return std::nullopt;
+            return o.value(QLatin1String(key)).toInt();
+        };
+        compositeUpdate.enabled = boolField(composite, "enabled");
+        if (composite.contains("method"))
+            compositeUpdate.method = composite.value("method").toString().toStdString();
+        compositeUpdate.layersFront = intField(composite, "layersFront");
+        compositeUpdate.layersBehind = intField(composite, "layersBehind");
+        compositeUpdate.reverseDirection = boolField(composite, "reverseDirection");
+        compositeUpdate.alphaMin = intField(composite, "alphaMin");
+        compositeUpdate.alphaMax = intField(composite, "alphaMax");
+        compositeUpdate.alphaThreshold = intField(composite, "alphaThreshold");
+        compositeUpdate.material = intField(composite, "material");
+        const QJsonObject planes = composite.value("planes").toObject();
+        compositeUpdate.planeXY = boolField(planes, "xy");
+        compositeUpdate.planeXZ = boolField(planes, "xz");
+        compositeUpdate.planeYZ = boolField(planes, "yz");
+        compositeUpdate.planeLayersFront = intField(composite, "planeLayersFront");
+        compositeUpdate.planeLayersBehind = intField(composite, "planeLayersBehind");
+        compositeUpdate.planeReverseDirection = boolField(composite, "planeReverseDirection");
+        const QJsonObject volumetric = p.value("volumetric").toObject();
+        if (volumetric.contains("gamma"))
+            compositeUpdate.volumetricGamma = volumetric.value("gamma").toDouble();
+        if (volumetric.contains("lighting")) {
+            compositeUpdate.volumetricLighting = static_cast<int>(
+                std::lround(volumetric.value("lighting").toDouble() * 100.0));
+        }
+        if (volumetric.contains("wScale"))
+            compositeUpdate.volumetricWScale = volumetric.value("wScale").toDouble();
+    }
+
     // Apply as a group. Global controls go via ViewerManager (broadcast +
     // QSettings-persisted).
     if (hasIntersectionOpacity)
@@ -527,6 +661,25 @@ QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& p
         settings.setValue(vc3d::settings::viewer::NORMAL_MAX_ARROWS, normalMaxArrows);
         broadcast([normalMaxArrows](VolumeViewerBase* base) { base->setNormalMaxArrows(normalMaxArrows); });
     }
+
+    // View dock checkboxes are set the way viewer.set_axis_aligned_slices sets
+    // its checkbox: toggling the control runs its handler, which applies and
+    // saves the value.
+    auto& ui = _window->ui;
+    if (ui.chkAxisOverlays && p.contains("axisOverlays"))
+        ui.chkAxisOverlays->setChecked(p.value("axisOverlays").toBool());
+    if (ui.chkCoordinateFrames && p.contains("coordinateFrames"))
+        ui.chkCoordinateFrames->setChecked(p.value("coordinateFrames").toBool());
+    if (p.contains("rawPoints") && _window->_rawPointsOverlay)
+        _window->_rawPointsOverlay->setEnabled(p.value("rawPoints").toBool());
+    if (hasFocusBounds) {
+        if (focusRect)
+            state->setFocusBounds(*focusRect);
+        if (focusBounds.contains("enabled"))
+            state->setFocusBoundsEnabled(focusBounds.value("enabled").toBool());
+    }
+    if (hasCompositeControls && _window->_viewerCompositePanel)
+        _window->_viewerCompositePanel->applyControls(compositeUpdate);
 
     // Echo the resulting full settings (unknown keys are ignored).
     return viewerRenderSettingsJson();

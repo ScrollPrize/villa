@@ -1,8 +1,9 @@
-"""Viewer display state with its own controller: the ink detection overlay."""
+"""Viewer display state outside the shared render settings: the ink detection
+overlay and per-viewer view resets."""
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from ..core import mcp, _call, _strip_none
 
@@ -57,4 +58,28 @@ async def vc3d_set_ink_overlay(
                 "flipVertical": flip_vertical,
             }
         ),
+    )
+
+
+@mcp.tool()
+async def vc3d_reset_viewer(
+    viewer: Optional[str] = None,
+    fit: Literal["surface", "content", "none"] = "surface",
+    z_offset: Optional[float] = None,
+) -> dict[str, Any]:
+    """Reset one viewer's view, the headless twin of the Reset View shortcut
+    (M) and, with fit="content", Zoom to Fit (Ctrl+0).
+
+    viewer: viewer id or name (see vc3d_get_state); default the active one.
+    fit: "surface" fits the surface in view (Reset View), "content" fits the
+    current content (Zoom to Fit), "none" keeps the zoom.
+    z_offset: normal offset to set after the reset, absolute, in voxels; the
+    viewer clamps it to the volume's largest dimension. Omitted: 0.
+
+    Pan and normal offset are always cleared first. Returns {"viewer", "fit",
+    "zOffset" (the resulting offset), "scale"}.
+    """
+    return await _call(
+        "viewer.reset",
+        _strip_none({"viewer": viewer, "fit": fit, "zOffset": z_offset}),
     )

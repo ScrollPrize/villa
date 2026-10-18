@@ -41,6 +41,40 @@ class _OverlayComposite(TypedDict, total=False):
     layersBehind: int
 
 
+class _FocusBounds(TypedDict, total=False):
+    enabled: bool
+    min: _Vec3
+    max: _Vec3
+
+
+class _CompositePlanes(TypedDict, total=False):
+    xy: bool
+    xz: bool
+    yz: bool
+
+
+class _BaseComposite(TypedDict, total=False):
+    enabled: bool
+    method: Literal["max", "mean", "min", "alpha", "volumetric"]
+    layersFront: int
+    layersBehind: int
+    reverseDirection: bool
+    alphaMin: int
+    alphaMax: int
+    alphaThreshold: int
+    material: int
+    planes: _CompositePlanes
+    planeLayersFront: int
+    planeLayersBehind: int
+    planeReverseDirection: bool
+
+
+class _Volumetric(TypedDict, total=False):
+    gamma: float
+    lighting: float
+    wScale: float
+
+
 _OverlayColormap = Literal[
     "",
     "fire",
@@ -258,7 +292,10 @@ async def vc3d_get_render_settings() -> dict[str, Any]:
     "planeIntersectionLinesVisible" (bool), "showSurfaceNormals" (bool),
     "showDirectionHints" (bool), "surfaceOverlayEnabled" (bool),
     "normalArrowLengthScale" (float), "normalMaxArrows" (int),
-    "highlightedSurfaceIds" ([str...])}."""
+    "highlightedSurfaceIds" ([str...]), "axisOverlays", "coordinateFrames",
+    "rawPoints" (bool), "focusBounds" ({"enabled", "min", "max"}),
+    "composite" (the Composite dock, see vc3d_set_render_settings),
+    "volumetric" ({"gamma", "lighting", "wScale"})}."""
     return await _call("viewer.get_render_settings")
 
 
@@ -279,6 +316,12 @@ async def vc3d_set_render_settings(
     segmentation_cursor_mirroring: Optional[bool] = None,
     sampling_stride: Optional[int] = None,
     z_scroll_sensitivity: Optional[float] = None,
+    axis_overlays: Optional[bool] = None,
+    coordinate_frames: Optional[bool] = None,
+    raw_points: Optional[bool] = None,
+    focus_bounds: Optional[_FocusBounds] = None,
+    composite: Optional[_BaseComposite] = None,
+    volumetric: Optional[_Volumetric] = None,
 ) -> dict[str, Any]:
     """Update the global viewer render settings; changes apply across all
     viewers. Every argument is optional -- omitted (None) fields are left
@@ -303,6 +346,24 @@ async def vc3d_set_render_settings(
     sampling_stride: surface-patch intersection sampling stride, floored to 1.
     z_scroll_sensitivity: scroll-to-move-through-z sensitivity, clamped
     0.1..100.
+    axis_overlays: show the axis-aligned slice overlays (View dock).
+    coordinate_frames: show the coordinate frame gizmo (View dock).
+    raw_points: show the raw points overlay (the P key).
+    focus_bounds: {"enabled", "min", "max"} focus box in volume voxels
+    (View dock); min/max are rounded and clamped to the volume, need each
+    other, and need a current volume (-32001); enabled=true fails until a box
+    exists.
+    composite: the Composite dock's base-volume compositing, in the dock's
+    units: {"enabled", "method" ("max"|"mean"|"min"|"alpha"|"volumetric"),
+    "layersFront", "layersBehind", "reverseDirection", "alphaMin" /
+    "alphaMax" / "material" (0..255), "alphaThreshold" (0..10000), "planes":
+    {"xy", "xz", "yz"}, "planeLayersFront", "planeLayersBehind",
+    "planeReverseDirection"}. "enabled", the layer counts and
+    "reverseDirection" apply to the flattened segmentation view; the
+    "plane..." fields to the slice views; the rest to every view. Values are
+    set on the dock's controls, which clamp them to their ranges; read the
+    result to see the applied values.
+    volumetric: volumetric-mode {"gamma", "lighting" (0..1), "wScale"}.
 
     The numeric/global fields (opacities, thickness, max-surfaces, volume
     window, sampling stride, z-scroll sensitivity, cursor mirroring,
@@ -334,6 +395,12 @@ async def vc3d_set_render_settings(
                 "segmentationCursorMirroring": segmentation_cursor_mirroring,
                 "samplingStride": sampling_stride,
                 "zScrollSensitivity": z_scroll_sensitivity,
+                "axisOverlays": axis_overlays,
+                "coordinateFrames": coordinate_frames,
+                "rawPoints": raw_points,
+                "focusBounds": focus_bounds,
+                "composite": composite,
+                "volumetric": volumetric,
             }
         ),
     )
@@ -349,7 +416,8 @@ async def vc3d_get_overlay() -> dict[str, Any]:
     for grayscale), "opacity" (0..1), "threshold" (0..255), "windowLow"/
     "windowHigh" (0..255), "maxDisplayedResolution" (int 0..5),
     "composite": {"enabled" (bool), "method" ("max"|"mean"|"min"),
-    "layersFront"/"layersBehind" (int 0..64)}}."""
+    "layersFront"/"layersBehind" (int 0..64)}, "interpolation" ("nearest" |
+    "trilinear")}."""
     return await _call("viewer.get_overlay")
 
 
@@ -363,6 +431,7 @@ async def vc3d_set_overlay(
     window: Optional[_Window] = None,
     max_displayed_resolution: Optional[int] = None,
     composite: Optional[_OverlayComposite] = None,
+    interpolation: Optional[Literal["nearest", "trilinear"]] = None,
 ) -> dict[str, Any]:
     """Update the overlay-volume settings. Every argument is optional --
     omitted (None) fields are left unchanged; pass only what you want to
@@ -382,6 +451,8 @@ async def vc3d_set_overlay(
     composite: {"enabled", "method" ("max"|"mean"|"min"), "layersFront",
     "layersBehind"} -- any subset; merged over the current composite settings.
     An unrecognized method raises -32602.
+    interpolation: overlay sampling, "nearest" or "trilinear" (the Overlay
+    Volume controls' sampling choice).
 
     Returns the full resulting overlay settings object (same shape as
     vc3d_get_overlay). The active workspace and its Overlay Volume controls
@@ -401,6 +472,7 @@ async def vc3d_set_overlay(
                 "window": window,
                 "maxDisplayedResolution": max_displayed_resolution,
                 "composite": composite,
+                "interpolation": interpolation,
             }
         ),
     )

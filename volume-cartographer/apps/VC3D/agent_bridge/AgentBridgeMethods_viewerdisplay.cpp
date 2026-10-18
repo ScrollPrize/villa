@@ -2,6 +2,17 @@
 
 namespace Params = AgentBridgeParams;
 
+namespace {
+
+AgentBridgeParam optionalViewer()
+{
+    AgentBridgeParam param = Params::optionalString(QStringLiteral("viewer"));
+    param.nullable = true;
+    return param;
+}
+
+}  // namespace
+
 void AgentBridgeServer::registerViewerDisplayHandlers()
 {
     registerMethod(
@@ -36,4 +47,27 @@ void AgentBridgeServer::registerViewerDisplayHandlers()
             },
         },
         [this](const QJsonValue& p) { return handleViewerSetInkOverlay(p); });
+
+    registerMethod(
+        {
+            .name = QStringLiteral("viewer.reset"),
+            .params = {
+                optionalViewer(),
+                Params::optionalStringEnum(
+                    QStringLiteral("fit"),
+                    {
+                        QStringLiteral("surface"),
+                        QStringLiteral("content"),
+                        QStringLiteral("none"),
+                    },
+                    QStringLiteral("surface")),
+                Params::optionalNumber(QStringLiteral("zOffset")),
+            },
+            .errors = {-32602, -32002},
+            .mcp = {
+                .tool = QStringLiteral("vc3d_reset_viewer"),
+                .snakeCaseParams = true,
+            },
+        },
+        [this](const QJsonValue& p) { return handleViewerReset(p); });
 }
