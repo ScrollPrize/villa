@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 
 import numpy as np
@@ -287,3 +288,65 @@ def test_fusion_heuristic_flags_thick_lobes_joined_by_a_thin_bridge():
     metrics, _ = lta.audit(label)
     assert metrics["n_components"] == metrics["n_fused_components"] == 1
     assert metrics["fused_voxel_frac"] == 1
+
+
+def test_parse_roi_clips_and_rejects_empty():
+    assert lta.parse_roi(None, (4, 5, 6)) == (slice(0, 4), slice(0, 5), slice(0, 6))
+    assert lta.parse_roi("1:3,:,2:99", (4, 5, 6)) == (slice(1, 3), slice(0, 5), slice(2, 6))
+    with pytest.raises(SystemExit):
+        lta.parse_roi("1:3,0:5", (4, 5, 6))
+    with pytest.raises(SystemExit):
+        lta.parse_roi("3:1,:,:", (4, 5, 6))
+
+
+def test_tile_windows_drops_partial_far_edge():
+    roi = (slice(0, 5), slice(1, 5), slice(0, 4))
+    wins = lta.tile_windows(roi, 2)
+    # 2 full z tiles (4..5 dropped), 2 y tiles from 1, 2 x tiles
+    assert len(wins) == 8
+    assert wins[0] == (slice(0, 2), slice(1, 3), slice(0, 2))
+    assert all(w[0].stop <= 5 and w[1].stop <= 5 and w[2].stop <= 4 for w in wins)
+    assert lta.tile_windows(roi, None) == [roi]
+    with pytest.raises(SystemExit):
+        lta.tile_windows(roi, 6)
+
+
+def test_cli_zarr_roi_tile_threshold(tmp_path):
+    # a 0/255 mask in an OME-Zarr group with a hole in one tile only: the tiled run must find
+    # the hole in that tile and name tiles by their window so results map back to the volume
+    zarr = pytest.importorskip("zarr")
+    v = np.zeros((40, 80, 40), np.uint8)
+    v[18:20, 4:-4, 4:-4] = 255
+    v[:, 58:64, 18:24] = 0  # hole in the y >= 40 tile only
+    g = zarr.open_group(str(tmp_path / "pred.zarr"), mode="w")
+    create = getattr(g, "create_array", None) or g.create_dataset
+    create("0", shape=v.shape, chunks=(20, 20, 20), dtype=v.dtype)
+    g["0"][:] = v
+    g.attrs["multiscales"] = [{"version": "0.4", "datasets": [{"path": "0"}]}]
+    out = tmp_path / "out"
+    rc = lta.main(["--label", str(tmp_path / "pred.zarr"), "--threshold", "1", "--tile", "40",
+                   "--out", str(out)])
+    assert rc == 0
+    rows = {r["crop"]: r for r in csv.DictReader(open(out / "aggregate.csv"))}
+    assert set(rows) == {"pred_z0_y0_x0", "pred_z0_y40_x0"}
+    assert (int(rows["pred_z0_y0_x0"]["b1_total_big"]), int(rows["pred_z0_y40_x0"]["b1_total_big"])) == (0, 1)
+    assert (out / "ranked.csv").exists()  # tiled runs are ranked like a batch
+    # --roi restricts the read; a window inside the clean tile has no hole and no ranking file
+    out2 = tmp_path / "out2"
+    rc = lta.main(["--label", str(tmp_path / "pred.zarr"), "--threshold", "1", "--roi", ":,0:40,:",
+                   "--out", str(out2)])
+    assert rc == 0
+    m = json.loads((out2 / "pred.json").read_text())
+    assert m["b1_total_big"] == 0 and m["shape"] == [40, 40, 40]
+    assert not (out2 / "ranked.csv").exists()
+    # without --threshold a 0/255 mask has no voxels equal to surface value 1: an empty audit,
+    # which is why the threshold exists
+    assert lta.main(["--label", str(tmp_path / "pred.zarr"), "--out", str(tmp_path / "out3")]) == 0
+    assert json.loads((tmp_path / "out3" / "pred.json").read_text())["fg_voxels"] == 0
+
+
+def test_cli_batch_rejects_roi_and_tile(tmp_path):
+    (tmp_path / "labels").mkdir()
+    tifffile.imwrite(tmp_path / "labels" / "a.tif", sheet())
+    with pytest.raises(SystemExit):
+        lta.main(["--batch", str(tmp_path), "--tile", "20", "--out", str(tmp_path / "out")])

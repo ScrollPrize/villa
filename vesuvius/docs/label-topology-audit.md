@@ -23,7 +23,35 @@ vesuvius.label_topology_audit --label before.tif --after refined.tif --out audit
 
 # a folder with labels/*.tif (and optional images/*.tif)
 vesuvius.label_topology_audit --batch DATA_DIR --out audit_out
+
+# a window of a zarr prediction mask (local path or URL), split into 256-voxel cubes
+vesuvius.label_topology_audit \
+  --label https://dl.ash2txt.org/community-uploads/yupeng/herc_PHerc1447_th0.3.zarr \
+  --threshold 1 --roi 12288:13056,3840:4608,3584:4352 --tile 256 --out audit_out
 ```
+
+## Input formats
+
+`--label`, `--after` and `--image` accept a `.tif` file or a zarr array or
+OME-Zarr group, given as a local path or an `http(s)://` URL (a name ending in
+`.zarr`, a URL, or a directory holding `.zarray`, `.zattrs` or `zarr.json`).
+For a group, `--level` picks the multiscale level (default `0`, the full
+resolution; the pyramid levels of a binary mask are max-pooled and not
+meaningful for topology). Zarr input is read lazily, so:
+
+- `--roi Z0:Z1,Y0:Y1,X0:X1` reads only that window (empty bounds mean the whole
+  axis; bounds are clipped to the array). Without it the whole array is read,
+  which is only sensible for crop-sized arrays.
+- `--tile N` splits the window into N-voxel cubes and audits each as its own
+  crop named `<name>_z<z0>_y<y0>_x<x0>`, with `aggregate.csv` and `ranked.csv`
+  as for `--batch`. Partial cubes at the far edge are dropped, so choose the
+  window as a multiple of N. Topology is measured per cube: a hole or sheet cut
+  by a cube face counts as open (`b1_face`), the same way crop faces do.
+- `--threshold T` binarises the input as `value >= T`, for probability volumes
+  (`128` for a uint8 probability at 0.5) and for `0/255` masks (`1`). It sets
+  the surface value to 1 and disables the ignore value.
+
+`--batch` stays a folder of `.tif` crops.
 
 Outputs: `<crop>.json` (full metrics), `aggregate.csv` (one row per crop),
 `ranked.csv` with `--batch` (crops with topology/fusion/junction findings, worst first, with a one-line

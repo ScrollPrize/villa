@@ -25,7 +25,14 @@ Usage:
   vesuvius.label_topology_audit --label LABEL.tif --image IMG.tif --out DIR --plot
   vesuvius.label_topology_audit --label BEFORE.tif --after AFTER.tif --out DIR
   vesuvius.label_topology_audit --batch DATA_DIR --out DIR --fail-on b1_total_big=0
+  vesuvius.label_topology_audit --label PRED.zarr --threshold 128 \
+      --roi 12288:13312,4096:5120,3584:4608 --tile 512 --out DIR
 
+``--label``, ``--after`` and ``--image`` take a ``.tif`` file or a zarr array or
+OME-Zarr group (local path or http(s) URL; ``--level`` picks the pyramid level).
+``--roi z0:z1,y0:y1,x0:x1`` reads a window of it, ``--tile N`` splits the window
+into N-voxel cubes audited as separate crops (``<name>_z<z0>_y<y0>_x<x0>``), and
+``--threshold T`` binarises an image or probability volume as ``value >= T``.
 ``--batch`` reads ``DATA_DIR/labels/*.tif`` (and ``DATA_DIR/images/<same name>``
 when present, for ``--plot``); with ``--after`` it names a directory holding
 same-named label files.
@@ -43,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import itertools
 import json
 import sys
 from pathlib import Path
@@ -363,16 +371,109 @@ def flat_keys() -> list[str]:
     return ["fg_frac", "unlabeled_frac"] + FLAT_KEYS
 
 
+
+def _is_zarr(src: str) -> bool:
+    s = str(src)
+    return s.rstrip("/").endswith(".zarr") or "://" in s or (Path(s) / ".zarray").exists() \
+        or (Path(s) / ".zattrs").exists() or (Path(s) / "zarr.json").exists()
+
+
+def open_volume(src: str, level: str = "0"):
+    """Return an array-like with .shape/.ndim/__getitem__ for a .tif file or a zarr array/group."""
+    if not _is_zarr(src):
+        import tifffile
+        return tifffile.imread(src)
+    try:
+        import zarr
+    except ImportError as exc:  # pragma: no cover
+        raise SystemExit(f"zarr input needs the zarr package: {exc}")
+    node = zarr.open(str(src), mode="r")
+    if hasattr(node, "shape"):
+        return node
+    path = str(level)
+    for ms in node.attrs.get("multiscales", []):
+        datasets = ms.get("datasets", [])
+        if str(level).isdigit() and int(level) < len(datasets):
+            path = datasets[int(level)]["path"]
+            break
+    try:
+        return node[path]
+    except KeyError:
+        raise SystemExit(f"{src}: no array {path!r} in the group (levels: {sorted(node.array_keys())})") from None
+
+
+def parse_roi(spec: str | None, shape: Sequence[int]) -> tuple[slice, ...]:
+    """'z0:z1,y0:y1,x0:x1' -> slices clipped to shape; empty bounds mean the full axis."""
+    if not spec:
+        return tuple(slice(0, n) for n in shape)
+    parts = spec.split(",")
+    if len(parts) != len(shape):
+        raise SystemExit(f"--roi needs {len(shape)} comma-separated ranges, got {spec!r}")
+    out = []
+    for part, n in zip(parts, shape):
+        lo, _, hi = part.partition(":")
+        try:
+            a = int(lo) if lo else 0
+            b = int(hi) if hi else n
+        except ValueError:
+            raise SystemExit(f"--roi range must be integers: {part!r}") from None
+        a, b = max(a, 0), min(b, n)
+        if a >= b:
+            raise SystemExit(f"--roi range {part!r} is empty within axis length {n}")
+        out.append(slice(a, b))
+    return tuple(out)
+
+
+def tile_windows(roi: Sequence[slice], tile: int | None) -> list[tuple[slice, ...]]:
+    """Full tile-sized cubes covering roi (whole roi when tile is None); partial far-edge cubes are dropped."""
+    if tile is None:
+        return [tuple(roi)]
+    if tile < 1:
+        raise SystemExit("--tile must be a positive integer")
+    starts = [range(s.start, s.stop - tile + 1, tile) for s in roi]
+    if any(len(r) == 0 for r in starts):
+        raise SystemExit(f"--tile {tile} does not fit in the window {[(s.start, s.stop) for s in roi]}")
+    return [tuple(slice(z, z + tile) for z in zs) for zs in itertools.product(*starts)]
+
+
+def window_name(stem: str, win: Sequence[slice], tiled: bool) -> str:
+    return stem if not tiled else f"{stem}_z{win[0].start}_y{win[1].start}_x{win[2].start}"
+
+
+def read_window(vol, win: Sequence[slice], threshold: float | None = None) -> np.ndarray:
+    arr = np.asarray(vol[tuple(win)])
+    if threshold is not None:
+        arr = (arr >= threshold).astype(np.uint8)
+    return arr
+
+
+def volume_stem(src: str) -> str:
+    name = str(src).rstrip("/").rsplit("/", 1)[-1]
+    for suffix in (".zarr", ".tif", ".tiff"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="vesuvius.label_topology_audit",
         description="Audit topology (components, Betti numbers, thickness, fusion) of 3D surface labels.",
     )
-    ap.add_argument("--label", type=Path, help="label volume (.tif)")
-    ap.add_argument("--image", type=Path, help="matching image volume; only needed for --plot")
+    ap.add_argument("--label", help="label volume: .tif file, zarr array/group directory or URL")
+    ap.add_argument("--image", help="matching image volume (same formats); only needed for --plot")
     ap.add_argument("--batch", type=Path, help="directory with labels/*.tif (and optional images/)")
-    ap.add_argument("--after", type=Path,
+    ap.add_argument("--after",
                     help="second label volume (batch: directory of same-named files); writes <crop>.delta.json")
+    ap.add_argument("--roi", metavar="Z0:Z1,Y0:Y1,X0:X1",
+                    help="window of --label/--after/--image to read (zarr input is read lazily)")
+    ap.add_argument("--tile", type=int, metavar="N",
+                    help="split the volume (or --roi) into N-voxel cubes audited as separate crops; "
+                         "partial cubes at the far edge are dropped")
+    ap.add_argument("--level", default="0", help="pyramid level of an OME-Zarr group (default 0)")
+    ap.add_argument("--threshold", type=float, metavar="T",
+                    help="binarise the label input as value >= T (e.g. 128 for uint8 probabilities, "
+                         "1 for 0/255 masks); implies --surface-value 1 and no ignore value")
     ap.add_argument("--out", type=Path, default=Path("audit_out"), help="output directory")
     ap.add_argument("--surface-value", type=int, default=1, help="label value of the surface")
     ap.add_argument("--ignore-value", type=int, default=2,
@@ -394,36 +495,65 @@ def main(argv: Sequence[str] | None = None) -> int:
     a = ap.parse_args(argv)
     if bool(a.label) == bool(a.batch):
         ap.error("give exactly one of --label or --batch")
+    if a.batch and (a.roi or a.tile or a.threshold is not None):
+        ap.error("--roi, --tile and --threshold apply to --label input only")
     limits = _parse_fail_on(a.fail_on)
     ignore = None if a.ignore_value < 0 else a.ignore_value
+    surface_value = a.surface_value
+    if a.threshold is not None:
+        surface_value, ignore = 1, None
 
+    # each job: (name, label window, image window or None, after window or None), windows as (volume, slices)
     if a.batch:
         labels = sorted((a.batch / "labels").glob("*.tif"))
         if not labels:
             ap.error(f"no labels/*.tif under {a.batch}")
-        jobs = [(p, a.batch / "images" / p.name, a.after / p.name if a.after else None) for p in labels]
-        missing = [str(j[2]) for j in jobs if j[2] is not None and not j[2].exists()]
+        after_dir = Path(a.after) if a.after else None
+        missing = [str(after_dir / p.name) for p in labels if after_dir and not (after_dir / p.name).exists()]
         if missing:
             ap.error(f"--after is missing {len(missing)} paired file(s), e.g. {missing[0]}")
+        jobs = []
+        for p in labels:
+            img = a.batch / "images" / p.name
+            jobs.append((p.stem, (p, None), (img, None) if a.plot and img.exists() else None,
+                         (after_dir / p.name, None) if after_dir else None))
     else:
-        jobs = [(a.label, a.image, a.after)]
+        lab_vol = open_volume(a.label, a.level)
+        if lab_vol.ndim != 3:
+            ap.error(f"{a.label}: expected a 3D volume, got shape {lab_vol.shape}")
+        after_vol = open_volume(a.after, a.level) if a.after else None
+        img_vol = open_volume(a.image, a.level) if a.plot and a.image else None
+        for tag, vol in (("--after", after_vol), ("--image", img_vol)):
+            if vol is not None and tuple(vol.shape) != tuple(lab_vol.shape):
+                ap.error(f"{tag} shape {tuple(vol.shape)} differs from label shape {tuple(lab_vol.shape)}")
+        roi = parse_roi(a.roi, lab_vol.shape)
+        wins = tile_windows(roi, a.tile)
+        stem = volume_stem(a.label)
+        jobs = [(window_name(stem, w, a.tile is not None), (lab_vol, w),
+                 (img_vol, w) if img_vol is not None else None,
+                 (after_vol, w) if after_vol is not None else None) for w in wins]
+
+    def load(window, threshold=None):
+        vol, w = window
+        if w is None:  # batch: a .tif path read whole
+            return tifffile.imread(vol)
+        return read_window(vol, w, threshold)
 
     rows, failed = [], False
-    for label_path, image_path, after_path in jobs:
-        name = label_path.stem
-        lab = tifffile.imread(label_path)
-        after_lab = tifffile.imread(after_path) if after_path else None
+    for name, label_win, image_win, after_win in jobs:
+        lab = load(label_win, a.threshold)
+        after_lab = load(after_win, a.threshold) if after_win else None
         if after_lab is not None and after_lab.shape != lab.shape:
             ap.error(f"{name}: --after shape {after_lab.shape} differs from label shape {lab.shape}")
         img = None
-        if a.plot and image_path is not None and Path(image_path).exists():
-            img = tifffile.imread(image_path)
+        if a.plot and image_win is not None:
+            img = load(image_win)
             if img.shape != lab.shape:
                 ap.error(f"{name}: image shape {img.shape} differs from label shape {lab.shape}")
         try:
-            m, flags = audit(lab, a.erode, a.min_piece, a.surface_value, ignore)
+            m, flags = audit(lab, a.erode, a.min_piece, surface_value, ignore)
             if after_lab is not None:
-                m2, _ = audit(after_lab, a.erode, a.min_piece, a.surface_value, ignore)
+                m2, _ = audit(after_lab, a.erode, a.min_piece, surface_value, ignore)
         except ValueError as exc:
             ap.error(f"{name}: {exc}")
         a.out.mkdir(parents=True, exist_ok=True)
@@ -435,18 +565,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             if img is None:
                 print(f"{name}: --plot skipped, no image", file=sys.stderr)
             else:
-                overlay(img, lab, flags, a.out / f"{name}.png", a.surface_value)
+                overlay(img, lab, flags, a.out / f"{name}.png", surface_value)
                 if m["holes"]:
                     hole_tiles(img, lab, m["holes"], flags["hole"], a.out / f"{name}.holes.png",
-                               a.surface_value, -1 if ignore is None else ignore)
+                               surface_value, -1 if ignore is None else ignore)
         if a.hole_masks:
             tifffile.imwrite(a.out / f"{name}.hole_mask.tif", flags["hole"].astype(np.uint8))
-        if after_path:
+        if after_win:
             f2 = flat(m2)
             delta = {k: [f[k], f2[k]] for k in f}
             (a.out / f"{name}.delta.json").write_text(json.dumps(delta, indent=1))
             print("delta (before, after):", json.dumps(delta))
-        checked = [("", f)] + ([(" (after)", f2)] if after_path else [])
+        checked = [("", f)] + ([(" (after)", f2)] if after_win else [])
         for tag, vals in checked:
             for key, limit in limits.items():
                 if vals[key] > limit:
@@ -456,7 +586,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         w = csv.DictWriter(fh, fieldnames=list(rows[0]))
         w.writeheader()
         w.writerows(rows)
-    if a.batch:
+    if a.batch or a.tile is not None:
         top = ranked(rows)
         with open(a.out / "ranked.csv", "w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=["rank", "crop", "reason"] + [k for k, _ in SEVERITY])
