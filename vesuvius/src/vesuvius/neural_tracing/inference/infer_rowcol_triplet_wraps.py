@@ -883,8 +883,8 @@ def parse_args(argv=None):
             f"--bbox-band-workers must be <= {max_band_workers} "
             f"(half available CPUs; detected cpu_count={cpu_count})."
         )
-    if args.bbox_overlap < 0.0 or args.bbox_overlap >= 1.0:
-        parser.error("--bbox-overlap must satisfy 0.0 <= overlap < 1.0")
+    if not np.isfinite(args.bbox_overlap) or args.bbox_overlap < 0.0 or args.bbox_overlap >= 1.0:
+        parser.error("--bbox-overlap must be finite and satisfy 0.0 <= overlap < 1.0")
     if args.crop_size is not None and any(v < 1 for v in args.crop_size):
         parser.error("--crop-size values must be >= 1")
     if args.volume_cache_retry_seconds < 0.0:
