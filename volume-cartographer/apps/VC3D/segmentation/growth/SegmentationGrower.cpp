@@ -44,7 +44,7 @@
 
 #include "utils/Json.hpp"
 
-#include "vc/core/util/UnixSocket.hpp"
+#include "../../SocketRequest.hpp"
 
 Q_DECLARE_LOGGING_CATEGORY(lcSegGrowth);
 
@@ -492,7 +492,7 @@ void saveCorrectionsAnnotation(
     std::filesystem::path beforePath = correctionsDir / "before";
     try {
         auto* mutableBefore = const_cast<QuadSurface*>(beforeCrop);
-        mutableBefore->save(beforePath.string(), "before", true);
+        mutableBefore->saveAsNew(beforePath, true);
     } catch (const std::exception& ex) {
         qCWarning(lcSegGrowth) << "Failed to save before tifxyz:" << ex.what();
     }
@@ -501,7 +501,7 @@ void saveCorrectionsAnnotation(
     std::filesystem::path afterPath = correctionsDir / "after";
     try {
         auto* mutableAfter = const_cast<QuadSurface*>(afterCrop);
-        mutableAfter->save(afterPath.string(), "after", true);
+        mutableAfter->saveAsNew(afterPath, true);
     } catch (const std::exception& ex) {
         qCWarning(lcSegGrowth) << "Failed to save after tifxyz:" << ex.what();
     }
@@ -897,49 +897,8 @@ bool uiPatchIndexMatchesSourceFolder(CState* state,
 
 utils::Json sendSocketJsonRequest(const QString& socketPath, const utils::Json& request)
 {
-    const std::string socketStd = socketPath.toStdString();
-    vc::unixsocket::Socket sock = vc::unixsocket::connectStream(socketStd);
-    if (!vc::unixsocket::isValid(sock)) {
-        throw std::runtime_error("Failed to connect to neural trace socket.");
-    }
-
-    const std::string requestPayload = request.dump() + "\n";
-    const char* ptr = requestPayload.c_str();
-    size_t remaining = requestPayload.size();
-    while (remaining > 0) {
-        auto sent = ::send(sock, ptr, remaining, 0);
-        if (sent < 0) {
-            vc::unixsocket::closeSocket(sock);
-            throw std::runtime_error("Failed to send dense displacement request.");
-        }
-        ptr += sent;
-        remaining -= static_cast<size_t>(sent);
-    }
-
-    vc::unixsocket::setRecvTimeoutSeconds(sock, 300);  // 5 minute timeout
-
-    std::string responsePayload;
-    char buf[4096];
-    long long n;
-    while ((n = ::recv(sock, buf, sizeof(buf), 0)) > 0) {
-        for (long long i = 0; i < n; ++i) {
-            if (buf[i] == '\n') {
-                vc::unixsocket::closeSocket(sock);
-                if (responsePayload.empty()) {
-                    throw std::runtime_error("Dense displacement service returned an empty response.");
-                }
-                return utils::Json::parse(responsePayload);
-            }
-            responsePayload.push_back(buf[i]);
-        }
-    }
-    vc::unixsocket::closeSocket(sock);
-
-    if (responsePayload.empty()) {
-        throw std::runtime_error("Dense displacement service returned an empty response.");
-    }
-
-    return utils::Json::parse(responsePayload);
+    return utils::Json::parse(vc3d::socketRequestLine(
+        socketPath.toStdString(), request.dump(), 300, "dense displacement"));  // 5 minute timeout
 }
 
 std::string sanitizeSegmentId(const std::string& value)
@@ -1567,9 +1526,6 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
             : QFileInfo(segmentationPath).dir().absolutePath();
         const QString denseInputPath = createDenseSnapshotPath(denseSnapshotDir);
         try {
-            const QFileInfo snapshotInfo(denseInputPath);
-            const std::string snapshotId = snapshotInfo.fileName().toStdString();
-
             // QuadSurface::save mutates the instance path/id/meta. Preserve and restore
             // so taking a dense snapshot does not retarget the live segmentation surface.
             const std::filesystem::path originalSurfacePath = segmentationSurface->path;
@@ -1583,7 +1539,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
             };
 
             try {
-                segmentationSurface->save(denseInputPath.toStdString(), snapshotId, false);
+                segmentationSurface->saveAsNew(denseInputPath.toStdString(), false);
             } catch (...) {
                 restoreLiveSurfaceState();
                 throw;
@@ -1950,9 +1906,6 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
         : QFileInfo(segmentationPath).dir().absolutePath();
     const QString snapshotPath = createDenseSnapshotPath(snapshotDir);
     try {
-        const QFileInfo snapshotInfo(snapshotPath);
-        const std::string snapshotId = snapshotInfo.fileName().toStdString();
-
         const std::filesystem::path originalSurfacePath = segmentationSurface->path;
         const std::string originalSurfaceId = segmentationSurface->id;
         utils::Json originalSurfaceMeta2 = segmentationSurface->meta;
@@ -1964,7 +1917,7 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
         };
 
         try {
-            segmentationSurface->save(snapshotPath.toStdString(), snapshotId, false);
+            segmentationSurface->saveAsNew(snapshotPath.toStdString(), false);
         } catch (...) {
             restoreLiveSurfaceState();
             throw;
@@ -2265,7 +2218,7 @@ void SegmentationGrower::onFutureFinished()
                 vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
                     *surface, *request.volumeContext.package,
                     request.volumeContext.activeVolumeId);
-                surface->save(newSegmentPath.string(), newSegmentId, false);
+                surface->saveAsNew(newSegmentPath, false);
             } catch (const std::exception& ex) {
                 showStatus(tr("Failed to save displacement copy result: %1").arg(ex.what()), kStatusLong);
                 return std::nullopt;
@@ -2368,7 +2321,7 @@ void SegmentationGrower::onFutureFinished()
             vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
                 *result.surface, *request.volumeContext.package,
                 request.volumeContext.activeVolumeId);
-            result.surface->save(newSegmentPath.string(), newSegmentId, false);
+            result.surface->saveAsNew(newSegmentPath, false);
         } catch (const std::exception& ex) {
             showStatus(tr("Failed to save dense displacement result: %1").arg(ex.what()), kStatusLong);
             cleanupDisplacementTemporarySurfaces();
@@ -2471,6 +2424,9 @@ void SegmentationGrower::onFutureFinished()
             targetSurface->invalidateCache();
         }
 
+        // The grown result replaces the target's meta below; the target keeps
+        // its object identity.
+        const std::string preservedUuid = targetSurface->objectUuid();
         utils::Json preservedTags = utils::Json::object();
         bool hadPreservedTags = false;
         if (!targetSurface->meta.is_null() && targetSurface->meta.is_object()) {
@@ -2502,6 +2458,9 @@ void SegmentationGrower::onFutureFinished()
                 mergedTags.update(targetSurface->meta["tags"]);
             }
             targetSurface->meta["tags"] = mergedTags;
+        }
+        if (!preservedUuid.empty() && targetSurface->meta.is_object()) {
+            targetSurface->meta["uuid"] = preservedUuid;
         }
 
         updateSegmentationSurfaceMetadata(targetSurface, voxelSize);
