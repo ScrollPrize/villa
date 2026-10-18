@@ -841,6 +841,9 @@ QString CommandLineToolRunner::getOutputPath() const
         // the post-run notification can point users at what changed.
         return _patchParentPath;
     }
+    if (_currentTool == Tool::tifxyz2obj) {
+        return _objPath;
+    }
     if (_currentTool == Tool::CustomCommand) {
         return QString();
     }
