@@ -1,5 +1,13 @@
 # vc_reader
 
+## Source discovery
+
+Describe published labels, derived representations, and explicit local/remote
+sources without opening storage. Query `volume.labels()`,
+`volume.level(2).representations()`, or `volume.registered_volumes()`; use
+`SourceCollection` to include user annotations. See [source discovery](docs/discovery.md)
+for registration, serialization, examples, and validation commands.
+
 ## PyTorch CUDA batches
 
 Keep your ordinary PyTorch dataset and DataLoader. Wrap the loader to upload

@@ -24,7 +24,7 @@ from typing import Any, Literal, Mapping, Sequence
 
 from . import _fetch
 from .affine import Affine
-from .artifacts import Artifact, ArtifactType, parse_artifacts
+from .artifacts import Artifact, ArtifactType, parse_artifacts, pyramid_sublevel
 from .errors import AmbiguousMatchError, NotFoundError
 from .names import COMMUNITY_ALIASES, SampleNameIndex
 
@@ -308,26 +308,27 @@ class Volume:
         """
         out: list[InkLabelMatch] = []
         for seg in self.sample.segment_list():
-            coverage = seg.coverage.get(self.id)
-            matches: list[InkLabelMatch] = []
-            for labels in seg.ink_labels(label_set=label_set, latest_only=latest_only):
-                if labels.target_volume_id == self.id:
-                    matches.append(InkLabelMatch(labels, self, "direct", Affine.identity(), coverage))
-                    continue
-                if not mappable:
-                    continue
-                if coverage is not None and coverage.overlap_ratio <= min_coverage:
-                    continue
-                tf = self.sample.transform(labels.target_volume_id, self.id)
-                if tf is not None:
-                    matches.append(InkLabelMatch(labels, self, "transform", tf, coverage))
-            if dedupe:
-                best: dict[str | None, InkLabelMatch] = {}
-                for m in sorted(matches, key=lambda m: m._preference):
-                    best.setdefault(m.labels.label_set, m)
-                matches = list(best.values())
-            out.extend(matches)
+            sets = seg.ink_labels(label_set=label_set, latest_only=latest_only)
+            if sets:
+                out.extend(_match_ink_labels(
+                    sets, self, seg.coverage.get(self.id), mappable=mappable,
+                    dedupe=dedupe, min_coverage=min_coverage,
+                ))
         return out
+
+    def labels(self, *, mappable: bool = True, latest_only: bool = True, label_set: str | None = None):
+        """Metadata-only label Sources; direct-only queries use this volume ID."""
+        return self.sample.catalog.sources.labels(
+            volume=self, mappable=mappable, latest_only=latest_only, label_set=label_set,
+        )
+
+    def representations(self, *, mappable: bool = True, latest_only: bool = True):
+        """Derived Sources; choose an array explicitly or query a VolumeLevel."""
+        return self.sample.catalog.sources.representations(volume=self, mappable=mappable, latest_only=latest_only)
+
+    def registered_volumes(self) -> list[Volume]:
+        """Other published volumes with a known transform into this volume."""
+        return self.sample.catalog.sources.registered_volumes(volume=self)
 
 
 class VolumeLevel:
@@ -416,6 +417,19 @@ class VolumeLevel:
         """Same as :meth:`Volume.ink_labels`; use :attr:`from_level0` on mapped coordinates."""
         return self.volume.ink_labels(**kwargs)
 
+    def labels(self, *, mappable: bool = True, latest_only: bool = True, label_set: str | None = None):
+        """Label Sources on their native grids, with this level as query context."""
+        return self.volume.sample.catalog.sources.labels(
+            volume=self, mappable=mappable, latest_only=latest_only, label_set=label_set,
+        )
+
+    def representations(self, *, mappable: bool = True, latest_only: bool = True):
+        """Derived Sources requesting the corresponding pyramid resolution."""
+        return self.volume.sample.catalog.sources.representations(volume=self, mappable=mappable, latest_only=latest_only)
+
+    def registered_volumes(self) -> list[Volume]:
+        return self.volume.registered_volumes()
+
     def paired(self, **ink_label_kwargs: Any) -> PairedData:
         """Everything published for this volume, viewed at this scale."""
         return PairedData(
@@ -442,8 +456,8 @@ class PairedArtifact:
 
     @classmethod
     def for_level(cls, artifact: Artifact, level: VolumeLevel) -> PairedArtifact:
-        g = artifact.grid_level
-        sub = level.level - g if g is not None and level.level >= g else None
+        requested = pyramid_sublevel(artifact.grid_level, level.level)
+        sub = requested if requested is not None and requested >= 0 else None
         return cls(artifact, level, sub)
 
     @property
@@ -522,12 +536,7 @@ class Segment:
 
     def ink_labels(self, *, label_set: str | None = None, latest_only: bool = True) -> list[InkLabelSet]:
         sets = [InkLabelSet(self, a) for a in self.artifacts_of(ArtifactType.INK_LABELS)]
-        if label_set is not None:
-            sets = [s for s in sets if s.label_set == label_set]
-        if latest_only:
-            superseded = {(s.target_volume_id, s.supersedes) for s in sets if s.supersedes}
-            sets = [s for s in sets if (s.target_volume_id, s.label_set) not in superseded]
-        return sorted(sets, key=lambda s: (s.target_volume_id or "", s.label_set or ""))
+        return _filter_ink_labels(sets, label_set=label_set, latest_only=latest_only) if sets else []
 
 
 class SegmentOnVolume:
@@ -889,6 +898,14 @@ class Catalog:
     def __repr__(self) -> str:
         return f"Catalog(samples={len(self.samples)}, models={len(self.models)}, source={self.source!r})"
 
+    @property
+    def sources(self):
+        """Lazily indexed source snapshot. Construct a new catalog after edits."""
+        if not hasattr(self, "_source_collection"):
+            from .discovery import SourceCollection
+            self._source_collection = SourceCollection(self)
+        return self._source_collection
+
     # -- construction ------------------------------------------------------------
 
     @classmethod
@@ -949,6 +966,36 @@ class Catalog:
         if len(hits) > 1:
             raise AmbiguousMatchError(f"{len(hits)} volumes match {volume_id!r}", hits)
         return hits[0]
+
+
+def _filter_ink_labels(sets, *, label_set=None, latest_only=True):
+    """Shared label-set filtering, preserving published supersession semantics."""
+    if label_set is not None:
+        sets = [s for s in sets if s.label_set == label_set]
+    if latest_only:
+        superseded = {(s.target_volume_id, s.supersedes) for s in sets if s.supersedes}
+        sets = [s for s in sets if (s.target_volume_id, s.label_set) not in superseded]
+    return sorted(sets, key=lambda s: (s.target_volume_id or "", s.label_set or ""))
+
+
+def _match_ink_labels(sets, volume, coverage, *, mappable=True, dedupe=True, min_coverage=0.0):
+    """Shared direct/mapped matching and per-segment preference rules."""
+    matches = []
+    for labels in sets:
+        if labels.target_volume_id == volume.id:
+            matches.append(InkLabelMatch(labels, volume, "direct", Affine.identity(), coverage))
+            continue
+        if not mappable or (coverage is not None and coverage.overlap_ratio <= min_coverage):
+            continue
+        transform = volume.sample.transform(labels.target_volume_id, volume.id)
+        if transform is not None:
+            matches.append(InkLabelMatch(labels, volume, "transform", transform, coverage))
+    if dedupe:
+        best = {}
+        for match in sorted(matches, key=lambda m: m._preference):
+            best.setdefault(match.labels.label_set, match)
+        matches = list(best.values())
+    return matches
 
 
 def _volume_id(v: Volume | str) -> str:

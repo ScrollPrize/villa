@@ -6,6 +6,12 @@ Generated JSON reports under `docs/benchmarks/` are kept locally and ignored by
 Git. Report paths below refer to those local files; benchmark input fixtures
 remain versioned.
 
+For metadata-only discovery, `bench_discovery.py` compares existing ink-label
+queries with indexed `SourceCollection` queries on six fixed volumes from a
+local catalog snapshot. It records hashes, query IDs, mean/p50/p95 latency,
+index initialization, and peak Python allocation without opening asset storage.
+See [discovery commands and methodology](../docs/discovery.md#run-and-verify).
+
 Catalog-wide results were refreshed **2026-10-17** at `0fd629ebd`, with the same
 Release extensions for every suite. The refresh manifest (`docs/benchmarks/refresh.json`)
 records report hashes and coverage. Current results are in the PyTorch, resident

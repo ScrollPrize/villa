@@ -31,6 +31,12 @@ from .catalog import (
     VolumeLevel,
 )
 from .errors import AmbiguousMatchError, CacheMissError, NotFoundError, VcReaderError
+from .sources import (
+    Companion, Encoding, Frame, LevelRequest, Plane, QueryContext, SampleResult,
+    Selection, Source, Storage, Surface, SurfaceRegistration, ValueFrame,
+    VolumeRegistration,
+)
+from .discovery import SourceCollection
 
 __version__ = "0.1.0"
 
@@ -67,4 +73,19 @@ __all__ = [
     "load",
     "to_https",
     "to_s3",
+    "Companion",
+    "Encoding",
+    "Frame",
+    "LevelRequest",
+    "Plane",
+    "QueryContext",
+    "SampleResult",
+    "Selection",
+    "Source",
+    "SourceCollection",
+    "Storage",
+    "Surface",
+    "SurfaceRegistration",
+    "ValueFrame",
+    "VolumeRegistration",
 ]
