@@ -217,7 +217,8 @@ Inline screenshots cross the local bridge as base64. For large captures, pass
 
 Tool names use a `vc3d_` prefix and snake_case. The surface includes:
 
-- project creation, attached volumes, and the Open Data catalog;
+- project creation, attached volumes, project attachments, Save As, and the Open
+  Data catalog;
 - viewer navigation, mouse, keyboard and wheel input, workspaces,
   screenshots, render settings, and volume overlays;
 - segment loading, growth, editing, masks, refinement, transforms, and review;

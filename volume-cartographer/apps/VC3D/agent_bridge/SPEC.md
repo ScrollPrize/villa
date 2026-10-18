@@ -232,6 +232,7 @@ per source is tracked:
 | `flatten` | SLIM, ABF, and straighten lifecycle |
 | `seeding` | bridge-started run or expand batch |
 | `autosave` | explicit dirty-segment save |
+| `project` | bridge-started Lasagna manifest and automated fiber volume attachments |
 
 Application work started outside the bridge is represented when its lifecycle
 is observable, but only bridge-started atlas and seeding operations are
@@ -371,6 +372,37 @@ dialog.
   bridge catalog opens.
 - Resource selections may filter volume ids, derived-representation refs, and
   representation kinds. An explicit empty volume selection is invalid.
+- `project.attach` and `project.detach` use the controllers behind the File
+  menu: `ProjectAttachmentController` for the umbilicus, normal grids, Lasagna
+  manifests and entries, and `FiberCollectionController` for automated fiber
+  volumes. Local locations must be absolute; they are stored lexically normal
+  without a trailing separator, and an existing entry is found with the
+  project's own identity rule (`vc::project::sameLocation`), so attaching
+  another spelling of an attached location returns `alreadyAttached: true`
+  and detach accepts any spelling. Only Lasagna manifests may be remote;
+  other kinds refuse a remote location with -32007, as `segments.attach`
+  does. Umbilicus and normal-grid attachments are synchronous and report a
+  replaced umbilicus as `previousLocation`. Lasagna manifests and automated
+  fiber volumes are `project` jobs whose result carries the same fields; a
+  fiber volume needs a current volume (-32001) with a verified coordinate
+  identity (-32009), and attaching the open one again returns a synchronous
+  result with `jobId: null`. A fiber volume whose attachment record cannot be
+  written fails the job, since it would not reopen with the project.
+- `project.detach` requires `confirm: true` and never deletes data files;
+  detaching an automated fiber volume removes its attachment record beside the
+  project file. An entry is removed from every entry list that stores the
+  same location string, as the File menu's Detach does. Volume and segments
+  entries are refused while editing is on or any job runs (-32004), and the
+  entry backing the current volume is refused (-32009). `umbilicus` and
+  `afv` take no location.
+- `project.save_as` writes the open project to a new absolute path and, like
+  the File menu's Save Project As, continues the session on the new file:
+  later changes persist there and relative entry locations resolve against
+  its folder (each such entry is named in `warnings` when the folder
+  changes). An open automated fiber volume's attachment record is written
+  beside the new file, and the file is listed among recent projects. An
+  existing file is replaced only with `overwrite: true` (-32005 otherwise, as
+  in `project.create`).
 
 ### Inspection
 
@@ -684,6 +716,7 @@ is the sole bridge method without an MCP tool; `vc3d_wait_job` and
 | `vc3d_append_segment_mask` | `segment.append_mask` | Append a volume-image layer to a segment's mask. Blocks until the render completes (130 s client timeout); requires a current volume. |
 | `vc3d_apply_anchor_offset` | `points.apply_anchor_offset` |
 | `vc3d_attach_segments` | `segments.attach` | Attach a local tifxyz segment, or a folder containing tifxyz segments, to the open volume package. |
+| `vc3d_attach_to_project` | `project.attach` | Attach an umbilicus, normal grid, Lasagna manifest (`project` job) or automated fiber volume (`project` job) to the open project; idempotent across spellings. |
 | `vc3d_attach_volume` | `volume.attach` | Attach one local zarr volume or remote `.zarr` URL to the open project without changing the current primary volume. Returns a `volume` job; compose with `vc3d_list_overlay_volumes` and `vc3d_set_overlay` to display it. |
 | `vc3d_atlas_open_result` | `atlas.open_result` |
 | `vc3d_atlas_open` | `atlas.open` |
@@ -707,6 +740,7 @@ is the sole bridge method without an MCP tool; `vc3d_wait_job` and
 | `vc3d_crop_segment_bounds` | `segment.crop_bounds` | Crop a segment's surface grid to its tightest valid bounds. Synchronous. |
 | `vc3d_delete_segment` | `segments.delete` | Delete a segment from disk. **Irreversible** — requires `confirm=true`. Fails while segmentation editing is enabled; deleting the active segment is allowed. |
 | `vc3d_describe_catalog_sample` | `catalog.describe_sample` |
+| `vc3d_detach_from_project` | `project.detach` | Remove a project attachment of a given kind (`confirm` required; data files are kept). |
 | `vc3d_drag` | `canvas.drag` |
 | `vc3d_enable_editing` | `segmentation.enable_editing` | Turn segmentation editing mode on/off for the active segment. |
 | `vc3d_export_segment_obj` | `segment.export_obj` | Convert a segment to an OBJ file (`tool` job); an existing file needs `overwrite`. |
@@ -780,6 +814,7 @@ is the sole bridge method without an MCP tool; `vc3d_wait_job` and
 | `vc3d_run_trace` | `tracer.run_trace` |
 | `vc3d_save_points_json` | `points.save_json` |
 | `vc3d_save_points_segment_path` | `points.save_segment_path` |
+| `vc3d_save_project_as` | `project.save_as` | Write the open project to a new `.volpkg.json` and continue the session there (File > Save Project As). |
 | `vc3d_save_segment` | `segmentation.save` | Force the active segment's pending autosave to disk. Idle no-op (`jobId:null`) when nothing is dirty; else an `"autosave"` job (`wait` defaults true). |
 | `vc3d_screenshot` | `screenshot.capture` | Capture a PNG of the whole VC3D window, one viewer pane, one dock, or one workspace, optionally a region of it, revealing a hidden target for the capture. Returns the PNG as MCP image content when `file_path` is omitted, or a dict with the on-disk path when `file_path` is set (MCP-layer note below). |
 | `vc3d_seeding_analyze_paths` | `seeding.analyze_paths` |

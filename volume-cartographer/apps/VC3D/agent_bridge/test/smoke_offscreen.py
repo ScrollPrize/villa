@@ -298,10 +298,10 @@ def check_rpc_describe(
         coverage = description.get("coverage", {})
         complete = (
             description.get("undocumented") == []
-            and coverage.get("described") == 131
-            and coverage.get("registered") == 131
+            and coverage.get("described") == 134
+            and coverage.get("registered") == 134
             and coverage.get("complete") is True
-            and len(snapshot["methods"]) == 131
+            and len(snapshot["methods"]) == 134
         )
         rendered = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         if update_snapshot:
@@ -1956,6 +1956,143 @@ def check_segment_backups(client: BridgeClient, results: Results, root: Path) ->
     results.record("segments_move_to_paths_needs_traces_directory", ok, detail)
 
 
+def project_document(path: Path) -> dict:
+    return json.loads(path.read_text())
+
+
+def entry_locations(document: dict, key: str) -> list[str]:
+    return [
+        entry.get("location") if isinstance(entry, dict) else entry
+        for entry in document.get(key, [])
+    ]
+
+
+def check_project_attachments(
+    client: BridgeClient,
+    results: Results,
+    root: Path,
+    volpkg: Path,
+) -> None:
+    umbilicus = root / "umbilicus.json"
+    umbilicus.write_text(json.dumps(
+        [{"z": z, "y": 8.0, "x": 8.0} for z in (0.0, 8.0, 15.0)]))
+    grid = root / "grids" / "ng"
+    for plane in ("xy", "xz", "yz"):
+        (grid / plane).mkdir(parents=True, exist_ok=True)
+    (grid / "metadata.json").write_text(json.dumps({}))
+
+    def attach(kind: str, location: str) -> dict:
+        reply, _ = client.call(
+            "project.attach", {"kind": kind, "location": location},
+            timeout=RPC_TIMEOUT)
+        return reply
+
+    ok, detail = expect_param_error(
+        client, "project.attach",
+        {"kind": "normal_grid", "location": "relative/grids"}, "location")
+    results.record("project_attach_requires_absolute_path", ok, detail)
+    ok, detail = expect_bridge_error(
+        client, "project.attach",
+        {"kind": "normal_grid", "location": "S3://bucket/grids"}, -32007)
+    results.record("project_attach_refuses_remote_normal_grid", ok, detail)
+
+    try:
+        first = attach("umbilicus", str(umbilicus))
+        again = attach("umbilicus", str(root / "grids" / ".." / "umbilicus.json"))
+        grid_first = attach("normal_grid", str(grid))
+        grid_again = attach("normal_grid", str(grid) + os.sep)
+        document = project_document(volpkg)
+        ok = (
+            first.get("attached") is True
+            and again.get("alreadyAttached") is True
+            and again.get("location") == first.get("location")
+            and document.get("umbilicus") == str(umbilicus)
+            and grid_first.get("attached") is True
+            and grid_again.get("alreadyAttached") is True
+            and entry_locations(document, "normal_grids").count(str(grid)) == 1
+        )
+        results.record(
+            "project_attach_idempotent_across_spellings", ok,
+            f"umbilicus={first}/{again} grid={grid_first}/{grid_again}")
+    except Exception as error:  # noqa: BLE001
+        results.record("project_attach_idempotent_across_spellings", False,
+                       f"{type(error).__name__}: {error}")
+
+    # Reopen: the attachments come back from the project file.
+    try:
+        client.call("volume.open", {"path": str(volpkg)}, timeout=RPC_TIMEOUT)
+        umbilicus_reopened = attach("umbilicus", str(umbilicus))
+        grid_reopened = attach("normal_grid", str(grid))
+        ok = (
+            umbilicus_reopened.get("alreadyAttached") is True
+            and grid_reopened.get("alreadyAttached") is True
+        )
+        results.record("project_attachments_survive_reopen", ok,
+                       f"umbilicus={umbilicus_reopened} grid={grid_reopened}")
+    except Exception as error:  # noqa: BLE001
+        results.record("project_attachments_survive_reopen", False,
+                       f"{type(error).__name__}: {error}")
+
+    ok, detail = expect_param_error(
+        client, "project.detach", {"kind": "umbilicus"}, "confirm")
+    results.record("project_detach_requires_confirm", ok, detail)
+    ok, detail = expect_bridge_error(
+        client, "project.detach",
+        {"kind": "normal_grid", "location": str(root / "missing"), "confirm": True},
+        -32007)
+    results.record("project_detach_unknown_entry", ok, detail)
+    try:
+        grid_detached, _ = client.call(
+            "project.detach",
+            {"kind": "normal_grid", "location": str(grid) + os.sep, "confirm": True},
+            timeout=RPC_TIMEOUT)
+        umbilicus_detached, _ = client.call(
+            "project.detach", {"kind": "umbilicus", "confirm": True},
+            timeout=RPC_TIMEOUT)
+        document = project_document(volpkg)
+        ok = (
+            grid_detached.get("detached") is True
+            and grid_detached.get("location") == str(grid)
+            and str(grid) not in entry_locations(document, "normal_grids")
+            and umbilicus_detached.get("detached") is True
+            and not document.get("umbilicus")
+            and grid.is_dir()
+            and umbilicus.is_file()
+        )
+        results.record("project_detach_by_any_spelling", ok,
+                       f"grid={grid_detached} umbilicus={umbilicus_detached}")
+    except Exception as error:  # noqa: BLE001
+        results.record("project_detach_by_any_spelling", False,
+                       f"{type(error).__name__}: {error}")
+
+    # Save As continues the session on the copy, like the File menu.
+    copy = root / "copy.volpkg.json"
+    try:
+        saved, _ = client.call("project.save_as", {"path": str(copy)},
+                               timeout=RPC_TIMEOUT)
+        ok, detail = expect_bridge_error(
+            client, "project.save_as", {"path": str(copy)}, -32005)
+        attach("umbilicus", str(umbilicus))
+        ok = (
+            ok
+            and saved.get("saved") is True
+            and saved.get("path") == str(copy)
+            and project_document(copy).get("umbilicus") == str(umbilicus)
+            and not project_document(volpkg).get("umbilicus")
+        )
+        results.record("project_save_as_switches_to_copy", ok,
+                       f"saved={saved} {detail}")
+    except Exception as error:  # noqa: BLE001
+        results.record("project_save_as_switches_to_copy", False,
+                       f"{type(error).__name__}: {error}")
+    finally:
+        try:
+            client.call("volume.open", {"path": str(volpkg)}, timeout=RPC_TIMEOUT)
+        except Exception as error:  # noqa: BLE001
+            results.record("project_reopen_original", False,
+                           f"{type(error).__name__}: {error}")
+
+
 def check_open_data_editable_copy(
     client: BridgeClient,
     results: Results,
@@ -2664,6 +2801,7 @@ def main() -> int:
             check_segment_export(client, results, tmp_path)
             check_segment_tool_operations(client, results)
             check_segment_backups(client, results, tmp_path)
+            check_project_attachments(client, results, tmp_path, volpkg)
             check_open_data_editable_copy(client, results, tmp_path, volpkg)
             check_c4(client, results, str(volpkg), str(broken_volpkg))
             check_legacy_fiber_uuid(client, results, str(legacy_fiber_volpkg),

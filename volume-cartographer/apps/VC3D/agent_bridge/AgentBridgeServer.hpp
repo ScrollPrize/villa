@@ -43,6 +43,7 @@ class CWindow;
 class ViewerManager;
 class VolumeViewerBase;
 struct CommandLaunchError;
+struct ProjectAttachmentOutcome;
 
 namespace vc3d::opendata {
 struct OpenDataManifest;
@@ -98,6 +99,7 @@ private:
     void registerSeedingHandlers();
     void registerSurfaceOpsHandlers();
     void registerSegmentOpsHandlers();
+    void registerProjectHandlers();
     void registerMethod(AgentBridgeMethod method, Handler handler);
 
     // --- Discovery registry file (mirrors LasagnaServiceManager's
@@ -405,6 +407,14 @@ private:
     QJsonObject handleSegmentsPatch(const QJsonValue& params);
     QJsonObject handleSegmentRestoreBackup(const QJsonValue& params);
     QJsonObject handleSegmentsMoveToPaths(const QJsonValue& params);
+
+    // Project attachments and Save As (AgentBridgeHandlers_project.cpp).
+    // Asynchronous attachments are "project" jobs.
+    QJsonObject handleProjectAttach(const QJsonValue& params);
+    QJsonObject handleProjectDetach(const QJsonValue& params);
+    QJsonObject handleProjectSaveAs(const QJsonValue& params);
+    QJsonObject attachFiberVolume(const QString& location);
+    void completeProjectAttachmentJob(const QString& kind, const ProjectAttachmentOutcome& outcome);
     // Registers a "tool" job for a launch that `launch` performs (reporting
     // the job's output path) and, when `closingOperation` is non-empty, keeps
     // it open until that operation's segmentOperationFinished. Throws the

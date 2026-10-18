@@ -2127,6 +2127,50 @@
         "type": "object"
       }
     },
+    "project.attach": {
+      "errors": [
+        -32602,
+        -32000,
+        -32001,
+        -32004,
+        -32005,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "extraParams": [
+          "wait"
+        ],
+        "paramRenames": {
+          "fiberInference": "fiber_inference"
+        },
+        "tool": "vc3d_attach_to_project"
+      },
+      "params": {
+        "properties": {
+          "fiberInference": {
+            "type": "boolean"
+          },
+          "kind": {
+            "enum": [
+              "umbilicus",
+              "normal_grid",
+              "lasagna_manifest",
+              "afv"
+            ],
+            "type": "string"
+          },
+          "location": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "location"
+        ],
+        "type": "object"
+      }
+    },
     "project.create": {
       "errors": [
         -32602,
@@ -2162,6 +2206,70 @@
         "required": [
           "path",
           "volume"
+        ],
+        "type": "object"
+      }
+    },
+    "project.detach": {
+      "errors": [
+        -32602,
+        -32000,
+        -32004,
+        -32005,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "tool": "vc3d_detach_from_project"
+      },
+      "params": {
+        "properties": {
+          "confirm": {
+            "default": false,
+            "type": "boolean"
+          },
+          "kind": {
+            "enum": [
+              "umbilicus",
+              "normal_grid",
+              "lasagna_manifest",
+              "afv",
+              "volume",
+              "segments"
+            ],
+            "type": "string"
+          },
+          "location": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      }
+    },
+    "project.save_as": {
+      "errors": [
+        -32602,
+        -32000,
+        -32005
+      ],
+      "mcp": {
+        "tool": "vc3d_save_project_as"
+      },
+      "params": {
+        "properties": {
+          "overwrite": {
+            "default": false,
+            "type": "boolean"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
         ],
         "type": "object"
       }
