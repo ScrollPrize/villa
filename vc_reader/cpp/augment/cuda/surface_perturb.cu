@@ -14,7 +14,7 @@ __global__ void add_surface_blob(double* displacement,std::size_t n,std::size_t 
     if(points)sigma=fmax(.3,sqrt(fmax(radius2,1e-6))/radius_sigma);
     EACH_INDEX(n) displacement[i]+=surface_detail::contribution(surface_detail::distance(i,*center,w),radius2,sigma,amplitude);
 }
-__global__ void surface_field(const double* normals,const float* displacement,float* field,std::size_t n,double limit) {
+__global__ void surface_field(const double* normals,const double* displacement,float* field,std::size_t n,double limit) {
     EACH_INDEX(n)for(std::size_t c=0;c<3;++c)field[c*n+i]=normals[3*i+c]*fmin(limit,fmax(-limit,displacement[i]));
 }
 template<class T> __global__ void move_surface(T* input,const float* field,std::size_t n,int* status) {EACH_INDEX(n)input[i]=checked_label_cast<T>(double(input[i])+field[i],status);}

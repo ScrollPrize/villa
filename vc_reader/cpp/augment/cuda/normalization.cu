@@ -105,9 +105,17 @@ __device__ inline float divide_to_float(double s, double d, double y) {
     return divide_exactly(s,d);
 }
 
-template<class T> __global__ void normalize_values(View<T> data, const ParametersGPU* params, bool mask_zero) {
+template<class T> __global__ void normalize_values(View<T> data, const ParametersGPU* params, bool mask_zero, bool minmax) {
     const ParametersGPU q = *params;
     const bool zero = q.constant || q.divisor == 0;
+    if constexpr (std::is_same_v<T,float>) if (minmax && !zero && q.scale == 1 && isfinite(float(q.divisor))) {
+        // Min/max are input values, so float32 preserves both endpoints exactly.
+        // Z-score keeps a wider mean: rounding it before subtracting can erase
+        // small deviations from a large baseline intensity.
+        const float low = float(q.center), range = float(q.divisor);
+        EACH_INDEX(data.size) data.ptr[i] = (data.ptr[i]-low)/range;
+        return;
+    }
     if constexpr (std::is_same_v<T,float>) if (!zero && q.scale == 1) {
         const double y = 1/q.divisor;
         EACH_INDEX(data.size) {
@@ -236,7 +244,7 @@ void apply_cuda(const Normalize& t, Sample& s, const Parameters& p, Session& ses
         if (t.mode == Normalization::MinMax || t.mode == Normalization::ZScore) {
             const bool zscore = t.mode == Normalization::ZScore;
             moments(data,select,params.ptr,invalid,t.eps,zscore);
-            normalize_values<<<blocks(data.size),256,0,vcr::device::stream()>>>(data,params.ptr,select.nonzero);
+            normalize_values<<<blocks(data.size),256,0,vcr::device::stream()>>>(data,params.ptr,select.nonzero,!zscore);
             check(cudaGetLastError()); return;
         }
         if (t.mode == Normalization::Robust) moments(data,select,params.ptr,invalid,0.,true);

@@ -5,8 +5,16 @@ template<class T> __global__ void invert_kernel(View<T> data) {
 }
 template<class T> __global__ void gamma_kernel(View<T> data, const Statistics* stats, double gamma) {
     EACH_INDEX(data.size) {
-        const double low = stats->low, range = stats->high-low;
-        data.ptr[i] = T(power<T>((data.ptr[i]-low)/fmax(range,1e-7),gamma)*range+low);
+        const T low = T(stats->low), range = T(stats->high)-low;
+        T value = pow((data.ptr[i]-low)/fmax(range,T(1e-7)),T(gamma))*range+low;
+        if constexpr (std::is_same_v<T,float>) {
+            // Finite float32 endpoints can still have an overflowing difference.
+            if (!isfinite(value) || !isfinite(range) || !isfinite(T(gamma))) {
+                const double wide_range = stats->high-stats->low;
+                value = T(pow((widen(data.ptr[i])-stats->low)/fmax(wide_range,1e-7),gamma)*wide_range+stats->low);
+            }
+        }
+        data.ptr[i] = value;
     }
 }
 template<class T> __global__ void finish_gamma(View<T> data, const Statistics* before, const Statistics* after, bool retain, bool invert) {
