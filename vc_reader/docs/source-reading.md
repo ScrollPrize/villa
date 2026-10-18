@@ -2,7 +2,7 @@
 
 `Source.open()` reads local, HTTP(S), and S3 Zarr arrays/groups, PNG, JPEG,
 TIFF, and explicitly ordered stacks of 2D files. It exposes `shape`, `dtype`,
-`axes`, `read(start, size)`, `read_many(regions)`, `companions`, `resolved`,
+`axes`, NumPy-style indexing, `companions`, `resolved`,
 `stats()`, and `close()`. The source descriptor stays immutable.
 
 Zarr sources use the existing native reader, authentication, memory cache,
@@ -23,7 +23,7 @@ source = Source(
 )
 cache = DecodedCache(max_bytes=256 << 20, max_decode_bytes=256 << 20)
 with source.open(decoded_cache=cache) as reader:
-    labels = reader.read(start=(100, 200), size=(64, 96))
+    labels = reader[100:164, 200:296]
 ```
 
 Published ink-label descriptors select pyramid level zero, including their
@@ -33,8 +33,8 @@ separately named supervision and validation arrays:
 source = volume.labels()[0]
 with source.open(cache_dir='/data/label-cache', cache_max_bytes=1 << 30,
                  memory_cache=64 << 20, threads=1) as reader:
-    labels = reader.read((100, 200), (128, 128))
-    supervision = reader.companions['supervision'].read((100, 200), (128, 128))
+    labels = reader[100:228, 200:328]
+    supervision = reader.companions['supervision'][100:228, 200:328]
 ```
 
 Companion names do not choose training splits or merge masks with validity.
@@ -45,8 +45,14 @@ companion grids when choosing a different pyramid level.
 
 ## Values and selection
 
-Crop coordinates contain only spatial dimensions, in YX or ZYX order. CYX
-storage returns CYX; YXC returns YXC. Channels/time use
+Indexing follows `reader.axes` and `reader.shape`, including the channel axis:
+CYX sources use `reader[channel, y0:y1, x0:x1]`, and YXC sources use
+`reader[y0:y1, x0:x1, channel]`. Integers remove axes; slices preserve them.
+Unit-step slices, negative indices, omitted trailing axes, and `...` follow
+NumPy bounds rules. Slice bounds clip; out-of-range integers raise `IndexError`.
+Stepped slices, boolean/array indexing, and `None` are not supported.
+
+Opening-time channels/time selection uses
 `source.with_selection(channels=(2, 0), time=0)`. Channel names are supported when
 metadata supplies them. Time selection removes the time axis; singleton
 channels remain. `with_selection` replaces the selection, so include an existing
@@ -65,7 +71,10 @@ expose palette/transparency metadata through `reader.palette`. RGB, alpha,
 16-bit grayscale, float32 samples, and uint64 label IDs retain their values.
 JPEG returns decoded samples without thresholding or assigning classes.
 
-Out-of-bounds reads keep the requested size. `Source.fill_value` belongs to the
+For padded crops, `read(start, size)` accepts spatial YX/ZYX origins and extents;
+`read_many(regions)` batches those region requests. These explicit region reads
+keep the requested size outside the array, without NumPy clipping or
+negative-index wrapping. `Source.fill_value` belongs to the
 output dtype and bypasses encoding. Otherwise Zarr uses its storage fill,
 encoded when applicable, and image files use zero. Missing Zarr chunks are
 in-bounds fill data and undergo normal encoding. Failed downloads, corrupt

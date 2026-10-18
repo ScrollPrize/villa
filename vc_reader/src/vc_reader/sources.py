@@ -572,9 +572,10 @@ class Source(_Value):
 
 @dataclass
 class SampleResult:
-    """One unbatched result; arrays and runtime validation arrive with sampling.
+    """One unbatched aligned result.
 
-    Dense data are CZYX; valid/mask arrays have one channel. Every data key has
+    Slice-only volume data are CZYX; integer indexing removes spatial axes.
+    Valid/mask arrays have one channel. Every data key has
     a valid entry and a masks dictionary (possibly empty). Metadata is optional
     and should be omitted or converted before default DataLoader collation.
     """

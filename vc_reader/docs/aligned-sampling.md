@@ -13,17 +13,37 @@ from vc_reader.sampling import open_sample
 # reference is a selected VolumeLevel or registered image Source.
 # label and field are explicitly chosen Source descriptors.
 with open_sample(reference, {"label": label, "field": field}) as reader:
-    sample = reader.read(start=(100, 200, 300), size=(32, 128, 128))
+    sample = reader[100:132, 200:328, 300:428]
     image = sample.data["image"]
     labels = sample.data["label"]
     supported = sample.valid["label"]
     source_masks = sample.masks["label"]
+    # A named target uses CZYX indexing and returns just that target's array.
+    component = reader["field"][1, 100:132, 200:328, 300:428]
 ```
 
-Starts and sizes are ZYX indices in the selected reference array. Integer
-indices are voxel centers. Each result has CZYX data, boolean `(1, Z, Y, X)`
-validity, and separately named single-channel companion masks. Singleton
-channels and selected channel order are preserved. `read_many(regions)` returns
+Index the shared reference grid in ZYX order. `reader.shape` is that grid's
+spatial shape. Unit-step slices, integers, negative indices, omitted trailing
+axes, and `...` follow NumPy rules: slice bounds clip to the array, negative
+indices count from its end, and out-of-range integers raise `IndexError`.
+Stepped slices, boolean/array indexing, and `None` are not supported.
+
+Slice-only selections return CZYX data, boolean `(1, Z, Y, X)` validity,
+and separately named single-channel companion masks. Integer indices remove
+the corresponding spatial axes from every data, validity, and mask array;
+`reader[z, :, :]` therefore returns CYX arrays. Channel axes remain present.
+
+`reader["field"]` exposes one target on the same reference grid with CZYX
+indexing and a CZYX `shape`. `reader["field"][1, ...]` selects one channel,
+removes that channel axis, and returns an array. Use `1:2` to retain the axis.
+This reads only the named target; geometric components are transformed together
+before channel selection. The returned CUDA array is a device view, with no
+host download. Raw `Source.open()` readers instead index their reported storage
+axes, such as YXC or CYX. Selected channel order is preserved.
+
+For padded regions extending outside the reference grid, `read(start, size)`
+uses explicit ZYX origins and extents without NumPy clipping or negative-index
+wrapping. `read_many(regions)` batches those region requests and returns
 a list in request order; callers own batching and training policies. Empty
 regions and empty request lists are supported. Buffers survive subsequent reads,
 cache eviction, and `close()`.

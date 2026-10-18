@@ -82,6 +82,37 @@ class _Bounded:
         self.bytes += size
 
 
+class _SampleTarget:
+    """One aligned target, indexed in CZYX order on its reader's reference grid."""
+
+    def __init__(self, reader, name):
+        self._reader, self._name = reader, name
+
+    @property
+    def shape(self):
+        self._reader._ready()
+        return (self._reader._targets[self._name]['channels'], *self._reader.shape)
+
+    def __getitem__(self, key):
+        from .reader._indexing import parse_index
+        reader = self._reader
+        reader._ready()
+        with reader._lock:
+            start, size, squeeze = parse_index(key, self.shape)
+            target = reader._targets[self._name]
+            # Transform complete geometric components before selecting channels:
+            # one output component may depend on every input component.
+            spatial_size = tuple(size[1:]) if size[0] else (0, 0, 0)
+            array, _ = reader._sample_many(target, [(tuple(start[1:]), spatial_size)])[0]
+            shape = tuple(n for n, drop in zip(size, squeeze) if not drop)
+            if reader.backend == 'cuda':
+                offset = start[0] * math.prod(size[1:]) if all(size) else 0
+                return array._view(shape, offset)
+            array = array[start[0]:start[0] + size[0]]
+            array = array.reshape(shape)
+            return array[()] if not shape else array
+
+
 class SampleReader:
     def __init__(self, reference, targets=None, *, backend='cpu', catalog=None,
                  sampling_cache_bytes=64 << 20, sampling_work_bytes=64 << 20,
@@ -499,6 +530,31 @@ class SampleReader:
                 output = output.astype(target['dtype'], copy=False)
             results.append((output, valid))
         return results
+
+    @property
+    def shape(self):
+        """ZYX shape of the selected reference grid, independent of channels."""
+        self._ready()
+        return self._targets['image']['shape']
+
+    def __getitem__(self, key):
+        """Index shared ZYX space, or select a named target for CZYX indexing."""
+        from .reader._indexing import parse_index
+        if isinstance(key, str):
+            self._ready()
+            if key not in self._targets:
+                raise KeyError(key)
+            return _SampleTarget(self, key)
+        start, size, squeeze = parse_index(key, self.shape)
+        result = self.read(start, size)
+        if any(squeeze):
+            spatial = tuple(n for n, drop in zip(size, squeeze) if not drop)
+            # Contiguous singleton-axis removal is a view on CPU and CUDA.
+            # Coordinate values and their metadata stay in the reference frame.
+            for values in (result.data, result.valid, *result.masks.values()):
+                for name, array in values.items():
+                    values[name] = array.reshape((array.shape[0], *spatial))
+        return result
 
     def read(self, start, size):
         return self.read_many([(start, size)])[0]

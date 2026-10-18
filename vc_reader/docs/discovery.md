@@ -128,12 +128,12 @@ surface labels `(C,Y,X)`, and sampled surface layers `(C,D,Y,X)`. Each target ha
 singleton-channel validity and a dictionary of named masks. `read_many` will
 return an ordered list of unbatched results; batching belongs to the caller.
 
-Future sampler API sketch (not executable in this increment):
+Aligned sampling uses these descriptors directly:
 
 ```python
-# from vc_reader.sampling import open_sample
-# with open_sample(volume.level(2), targets={"annotation": crop}) as reader:
-#     result = reader.read(start=(0, 0, 0), size=(32, 32, 32))
+from vc_reader.sampling import open_sample
+with open_sample(volume.level(2), targets={"annotation": crop}) as reader:
+    result = reader[:32, :32, :32]
 ```
 
 ## Run and verify

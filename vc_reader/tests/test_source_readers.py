@@ -97,6 +97,38 @@ class SourceReaderTests(unittest.TestCase):
             expected[1:, 1:] = 2**40+2
             np.testing.assert_array_equal(out, expected)
 
+    def test_numpy_indexing_axes_channels_encoding_and_bounds(self):
+        rgb = np.arange(5*7*3, dtype='uint8').reshape(5, 7, 3)
+        source, _ = self.png(values=rgb)
+        keys = [Ellipsis, (), np.s_[1:4, 2:6], np.s_[..., -1], np.s_[-2, :, 0:2],
+                np.s_[1, 2, 0], np.s_[-100:100, 5:99, :], np.s_[3:1, :, :],
+                np.s_[:, :, 2:1], np.s_[99:, :, :]]
+        with source.open() as reader:
+            for key in keys:
+                with self.subTest(key=key):
+                    np.testing.assert_array_equal(reader[key], rgb[key])
+                    self.assertEqual(reader[key].shape, rgb[key].shape)
+            for key in [np.s_[5, :, :], np.s_[-6, :, :], np.s_[..., ...],
+                        np.s_[:, :, :, :], np.s_[::2], None, True, np.bool_(False), [0, 1], .5]:
+                with self.subTest(invalid=key), self.assertRaises(IndexError):
+                    reader[key]
+            with self.assertRaises(ValueError):
+                reader[::0]
+            saved = reader[1:3, 2:5, 1]
+        np.testing.assert_array_equal(saved, rgb[1:3, 2:5, 1])
+        with self.assertRaisesRegex(ValueError, 'closed'):
+            reader[:]
+
+        data = np.moveaxis(rgb, -1, 0)
+        channel_first = self.tiff(data, axes='CYX', photometric='rgb', planarconfig='separate')
+        with channel_first.with_selection(channels=(2, 0)).open() as reader:
+            np.testing.assert_array_equal(reader[1, 1:4, -3:], data[0, 1:4, -3:])
+        encoded = replace(source, encoding=Encoding('color', tuple((tuple(map(int, color)), i)
+                           for i, color in enumerate(rgb.reshape(-1, 3))), 'uint64'))
+        with encoded.open() as reader:
+            expected = np.arange(35, dtype='uint64').reshape(5, 7)
+            np.testing.assert_array_equal(reader[-2:, 1:4], expected[-2:, 1:4])
+
     def test_palette_indices_alpha_and_png16(self):
         indices = np.arange(35, dtype=np.uint8).reshape(5, 7) % 2
         path = self.root / 'palette.png'

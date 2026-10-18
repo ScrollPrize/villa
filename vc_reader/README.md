@@ -1465,6 +1465,17 @@ contain channel-first data, per-target geometric validity, and separate source
 masks. CPU and CUDA sampling support integer labels, multichannel arrays,
 embedded slices, vectors, normals, and coordinate fields.
 
+```python
+from vc_reader.sampling import open_sample
+
+with open_sample(reference, {"label": label, "field": field}) as reader:
+    sample = reader[100:132, 200:328, 300:428]  # shared ZYX selection
+    component = reader["field"][1, 100:132, 200:328, 300:428]  # CZYX
+```
+
+Slices preserve axes; integer indices remove them. A named target returns its
+array; a shared spatial selection returns data, validity, and companion masks.
+
 See [aligned sampling](docs/aligned-sampling.md) for registration, value-frame,
 cache, worker, and build contracts, and [measurements](docs/aligned-sampling-benchmarks.md)
 for reproducible real-input benchmarks.

@@ -16,6 +16,7 @@ from .encoded_files import EncodedFiles
 from .source_resolution import ResolvedSource, resolve_registration, spatial_selection, matches_reference
 from .decoded_cache import DecodedCache, DEFAULT_DECODE_BYTES
 from .image_files import ImageFile
+from ._indexing import parse_index
 
 
 def _fill(value, dtype):
@@ -78,7 +79,8 @@ class _Lookup:
 class SourceReader:
     """Zarr, PNG/JPEG/TIFF and explicit-stack reader over local/HTTP/S3 storage.
 
-    ``read(start, size)`` takes YX or ZYX coordinates. Output preserves storage
+    Index with integers, unit-step slices and ellipsis in ``axes`` order.
+    Output preserves storage
     channel position and order; time selection removes the time axis. Encoding
     consumes a color channel axis and reports the encoded shape/axes/dtype.
     ``decoded_cache`` shares both memory budgets across readers in each process.
@@ -337,6 +339,21 @@ class SourceReader:
                 self._ready()
             return self.__dict__[name]
         raise AttributeError(name)
+
+    def __getitem__(self, key):
+        """Read a NumPy-style selection of the selected, encoded source array."""
+        self._ready()
+        start, size, squeeze = parse_index(key, self.shape)
+        if not all(size):
+            return np.empty(tuple(n for n, drop in zip(size, squeeze) if not drop), dtype=self.dtype)
+        spatial = [self.axes.index(axis) for axis in self.spatial_axes]
+        output = self.read(tuple(start[i] for i in spatial), tuple(size[i] for i in spatial))
+        # read() already crops spatial axes; channel indexing uses its output
+        # positions, after source selection and any color encoding.
+        index = tuple((start[i] if squeeze[i] else slice(start[i], start[i] + size[i]))
+                      if axis == 'c' else (0 if squeeze[i] else slice(None))
+                      for i, axis in enumerate(self.axes))
+        return output[index]
 
     def read(self, start, size):
         """Return one owned NumPy crop, padded in the encoded output domain."""

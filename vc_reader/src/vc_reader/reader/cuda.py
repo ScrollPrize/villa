@@ -5,6 +5,7 @@ import numpy as np
 from .. import _native
 from ..cuda import DeviceArray, is_available, is_device_array, wrap
 from ._sampling import affine32, origin3, points32, shape3
+from ._indexing import parse_index
 
 
 def _integer_points(points):
@@ -131,6 +132,13 @@ class CudaReader:
         flat, masks, shapes = self._grids(grids, kind, order, dtype, source, valid)
         crops = self._split(flat, shapes)
         return (crops, self._split(masks, shapes)) if valid else crops
+
+    def __getitem__(self, key):
+        """Read a basic NumPy-style selection without downloading the result."""
+        self._ready()
+        start, size, squeeze = parse_index(key, self.reader.shape)
+        output = self.read(start, size)
+        return output.reshape(tuple(n for n, drop in zip(size, squeeze) if not drop))
 
     def read(self, start, size, *, dtype=None, source="auto", valid=False):
         out = self.read_many([(start, size)], dtype=dtype, source=source, valid=valid)

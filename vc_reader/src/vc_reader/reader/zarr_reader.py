@@ -45,6 +45,7 @@ from ..errors import CacheMissError
 from .auth import Access, http_url, is_remote, resolve_access
 from .disk_cache import CacheLayer, cached_source_zarray, open_layers, cached_node_dirs, atomic_write, disk_budget
 from .memory_cache import MemoryCache
+from ._indexing import parse_index, expand_index
 from .zarr_meta import ArrayMeta
 
 READ_MODES = ("mmap", "slab")
@@ -696,7 +697,7 @@ class ZarrReader:
             if len(keys) < self.ndim or any(isinstance(k, slice) or k is Ellipsis for k in keys):
                 return self._read_mixed_index(keys)
             return self.read_points(_index_points(keys, self.shape))
-        start, size, squeeze = _parse_index(key, self.shape)
+        start, size, squeeze = parse_index(key, self.shape)
         out = self.read(start, size)
         return out[tuple(0 if s else slice(None) for s in squeeze)] if any(squeeze) else out
 
@@ -710,7 +711,7 @@ class ZarrReader:
     def _read_mixed_index(self, keys: tuple) -> np.ndarray:
         """NumPy integer-array/slice indexing, assembled as a batch of thin blocks."""
         original = keys
-        keys = _expand_index(keys, self.ndim)
+        keys = expand_index(keys, self.ndim)
         if not any(isinstance(key, slice) for key in keys):
             return self.read_points(_index_points(keys, self.shape))
         arrays, axes, starts, sizes, slice_shape = [], [], [], [], []
@@ -883,32 +884,6 @@ def _shutdown(array, layers: list[CacheLayer], pid: int) -> None:
         layer.close()
 
 
-def _parse_index(key: Any, shape: tuple[int, ...]) -> tuple[list[int], list[int], list[bool]]:
-    """numpy basic indexing (ints, unit-step slices, Ellipsis) -> start, size, axes to drop."""
-    if not isinstance(key, tuple):
-        key = (key,)
-    key = _expand_index(key, len(shape))
-    start, size, squeeze = [], [], []
-    for k, dim in zip(key, shape):
-        if isinstance(k, slice):
-            a, b, step = k.indices(dim)
-            if step != 1:
-                raise IndexError("only unit-step slices are supported")
-            start.append(a)
-            size.append(max(b - a, 0))
-            squeeze.append(False)
-        else:
-            i = operator.index(k)
-            if i < 0:
-                i += dim
-            if not 0 <= i < dim:
-                raise IndexError(f"index {k} out of bounds for axis of size {dim}")
-            start.append(i)
-            size.append(1)
-            squeeze.append(True)
-    return start, size, squeeze
-
-
 def _index_points(keys: tuple, shape: tuple[int, ...]) -> np.ndarray:
     """numpy integer-array indexing (one integer or integer array per axis, broadcast) -> points."""
     if len(keys) != len(shape) or any(isinstance(k, slice) or k is Ellipsis or k is None for k in keys):
@@ -931,19 +906,6 @@ def _integer_indices(key: Any, dim: int) -> np.ndarray:
     if a.size and (a.min() < 0 or a.max() >= dim):
         raise IndexError(f"index out of bounds for axis of size {dim}")
     return a
-
-
-def _expand_index(keys: tuple, ndim: int) -> tuple:
-    if sum(k is Ellipsis for k in keys) > 1:
-        raise IndexError("an index can only have a single ellipsis")
-    if any(k is Ellipsis for k in keys):
-        i = next(i for i, k in enumerate(keys) if k is Ellipsis)
-        keys = keys[:i] + (slice(None),) * max(0, ndim - len(keys) + 1) + keys[i + 1:]
-    if len(keys) > ndim:
-        raise IndexError(f"too many indices for array of dimension {ndim}")
-    if any(k is None for k in keys):
-        raise IndexError("newaxis indexing is not supported")
-    return keys + (slice(None),) * (ndim - len(keys))
 
 
 def open_zarr(location: str | os.PathLike[str], **kwargs: Any) -> ZarrReader:

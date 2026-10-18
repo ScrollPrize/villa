@@ -155,7 +155,7 @@ using existing cached chunks, with cache writes disabled. Snapshot SHA-256:
 AGENTS_AGENT_MODE=1 .venv/bin/python scripts/sampling_examples.py \
   --metadata /home/sean/.cache/vc_reader/metadata-cff196b7c8a57b2d.bin \
   --sample PHercParis4 --volume 20260411134726 --level 2 \
-  --start 9000 3600 3600 --size 16 32 32 \
+  --slice 9000:9016 3600:3632 3600:3632 \
   --cache-dir /mnt/raid_nvme/volume_cache --native-dir /tmp/vc-reader-cuda
 ```
 

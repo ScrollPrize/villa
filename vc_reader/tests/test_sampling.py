@@ -94,6 +94,69 @@ class SamplingTests(unittest.TestCase):
     def backends(self):
         return ('cpu', 'cuda') if is_available() else ('cpu',)
 
+    def test_numpy_indexing_shared_space_channels_and_validity(self):
+        values = np.arange(7*8*9, dtype='uint16').reshape(7, 8, 9)
+        channels = np.stack((values, values+1000, values+2000))
+        mask = self.source('index-mask', (values % 2).astype('uint8'))
+        label = self.source('index-label', values, companions=(Companion('quality', mask),))
+        scalar = self.source('index-channels', channels, role='scalar')
+        keys = [Ellipsis, (), np.s_[1:4, 2:6, 3:8], np.s_[-2:, ..., -1],
+                np.s_[2], np.s_[1, 2, 3], np.s_[-100:100, 5:99, :], np.s_[3:1], np.s_[99:]]
+        for backend in self.backends():
+            with self.subTest(backend=backend), open_sample(self.ref, {'label': label, 'field': scalar}, backend=backend) as reader:
+                self.assertEqual(reader.shape, values.shape)
+                for key in keys:
+                    result = reader[key]
+                    for name, data in [('image', values[None]), ('label', values[None]), ('field', channels)]:
+                        index = (slice(None), *(key if isinstance(key, tuple) else (key,)))
+                        np.testing.assert_array_equal(host(result.data[name]), data[index])
+                        expected_valid = np.ones((1, *values.shape), dtype=bool)[index]
+                        np.testing.assert_array_equal(host(result.valid[name]), expected_valid)
+                    np.testing.assert_array_equal(host(result.masks['label']['quality']), (values[None] % 2)[index])
+                view = reader['field']
+                self.assertEqual(view.shape, channels.shape)
+                for key in [Ellipsis, np.s_[1, 1:4, 2:5, 3:7], np.s_[-1, ..., -1],
+                            np.s_[1:3, 2, :, :], np.s_[0, 1, 2, 3], np.s_[2:1], np.s_[:, 99:]]:
+                    np.testing.assert_array_equal(host(view[key]), channels[key])
+                # Named target reads do not sample unrelated targets or masks.
+                with patch.object(reader, '_sample_many', wraps=reader._sample_many) as sample_many:
+                    saved = view[1, 1:3, 2:4, 3:5]
+                    self.assertEqual(sample_many.call_count, 1)
+                for key in [np.s_[7], np.s_[-8], np.s_[::2], np.s_[..., ...],
+                            np.s_[:, :, :, :], None, True, [0, 1], .5]:
+                    with self.subTest(invalid=key), self.assertRaises(IndexError):
+                        reader[key]
+                with self.assertRaises(KeyError):
+                    reader['missing']
+                with self.assertRaises(IndexError):
+                    view[3]
+            np.testing.assert_array_equal(host(saved), channels[1, 1:3, 2:4, 3:5])
+            with self.assertRaisesRegex(ValueError, 'closed'):
+                view[:]
+
+    def test_channel_indexing_follows_geometric_transform(self):
+        values = np.broadcast_to(np.array([1, 2, 3], 'float32')[:, None, None, None], (3, 7, 8, 9)).copy()
+        field = self.source('index-vector', values, role='vector', component_order=('x', 'y', 'z'),
+                            normalize=False, value_frame=ValueFrame(sample_id='s', volume_id='v',
+                            affine=Affine.from_rows(((1, 2, 0, 0), (0, 1, 3, 0), (0, 0, 1, 0)))))
+        for backend in self.backends():
+            with open_sample(self.ref, {'vector': field}, backend=backend) as reader:
+                np.testing.assert_array_equal(host(reader['vector'][0, 1:3, 2:4, 3:5]), np.full((2, 2, 2), 5, 'float32'))
+
+    def test_zarr_indexing_cpu_and_cuda(self):
+        from vc_reader.reader import open_zarr
+        values = np.arange(4*5*6, dtype='uint8').reshape(4, 5, 6)
+        source = self.source('index-u8', values, role='image')
+        with open_zarr(source.storage.location) as reader:
+            for key in [Ellipsis, np.s_[1:3, 2:4, 3:], np.s_[-1, ..., -2:], np.s_[1, 2, 3], np.s_[99:]]:
+                np.testing.assert_array_equal(reader[key], values[key])
+                if is_available():
+                    with reader.cuda() as cuda:
+                        np.testing.assert_array_equal(cuda[key].numpy(), values[key])
+            np.testing.assert_array_equal(reader[[0, 2], :, 1:3], values[[0, 2], :, 1:3])
+        with source.open() as reader:
+            np.testing.assert_array_equal(reader[-2:, 1:4, -3:], values[-2:, 1:4, -3:])
+
     def test_affines_against_independent_reference(self):
         values = np.arange(5*6*7, dtype='uint64').reshape(5, 6, 7) + 2**55
         matrices = [Affine.identity(), Affine.from_rows(((1, 0, 0, .5), (0, 1, 0, -.5), (0, 0, 1, 1.25))),
