@@ -1,6 +1,7 @@
 #pragma once
 #include "core.hpp"
 #include "normalization.hpp"
+#include "local_field.hpp"
 #include "median.hpp"
 #include "oriented_blur.hpp"
 #include <span>
@@ -18,7 +19,6 @@ struct ClipOutliers { Scalar lower = .2, upper = 99.8; double p_retain_std = 1; 
 struct GaussianBlur { Scalar sigma = Uniform{.3, 1.5}; bool shared_axes = true; Boundary boundary = Boundary::Mirror; double truncate = 6; ChannelOptions options; };
 struct MedianFilter { Scalar size = Uniform{3, 7}; bool quantize = false; ChannelOptions options; };
 struct Sharpen { Scalar strength = Uniform{.1, .5}; double p_clamp = .5; ChannelOptions options; };
-struct LocalOptions { Scalar scale = Uniform{10, 30}, loc = Uniform{-1, 2}; };
 struct BrightnessGradient { Scalar strength = Uniform{-.5, .5}; bool mean_centered = true, clip = false; LocalOptions local; ChannelOptions options; };
 struct LocalContrast { Scalar factor = Uniform{.5, 1.5}; LocalOptions local; ChannelOptions options; };
 struct LocalGamma { Scalar gamma = Uniform{.5, 1.5}; LocalOptions local; ChannelOptions options; };
@@ -62,72 +62,20 @@ inline ChannelPlan channel_parameters(const MedianFilter& t, const Array&, Rando
 }
 inline ChannelPlan channel_parameters(const Sharpen& t, const Array&, Random& r) { return {"", 0, {draw(t.strength, r), double(r.chance(t.p_clamp))}}; }
 
-inline std::vector<std::vector<float>> local_axes(const LocalOptions& t, const Grid& g, Random& r) {
-    std::vector<std::vector<float>> kernels(g.shape.size());
-    for (std::size_t a = 0; a < g.shape.size(); ++a) {
-        double center = draw(t.loc, r) * g.shape[a], sigma = draw(t.scale, r);
-        require(sigma > 0, "local Gaussian scale must be positive");
-        kernels[a].resize(g.shape[a]);
-        for (std::size_t x = 0; x < g.shape[a]; ++x)
-            kernels[a][x] = .5 * (std::erf((x + .5 - center) / (sigma * std::sqrt(2.))) - std::erf((x - .5 - center) / (sigma * std::sqrt(2.))));
-        // erf differences need extra precision in the tails; normalize the
-        // axis before forming products so bounded float32 fields cannot underflow.
-        const float peak = *std::max_element(kernels[a].begin(), kernels[a].end());
-        if (peak) for (auto& value : kernels[a]) value /= peak;
-    }
-    return kernels;
-}
-inline std::vector<float> local_kernel(const LocalOptions& t, const Grid& g, Random& r, bool centered = false) {
-    auto kernels = local_axes(t,g,r);
-    // The nonnegative separable product is monotone in every axis, including
-    // floating-point rounding. Its extrema occur at the per-axis extrema;
-    // multiply those in the same order as each voxel, without volume scans.
-    bool separable_bounds = true;
-    float low = 1, high = 1;
-    for (const auto& kernel : kernels) {
-        const auto [lo, hi] = std::minmax_element(kernel.begin(), kernel.end());
-        separable_bounds &= std::isfinite(*lo) && std::isfinite(*hi) && *lo >= 0;
-        low *= *lo; high *= *hi;
-    }
-    const float range = high - low;
-    std::vector<float> out(g.size);
-    const auto dim = g.shape.size(), nz = dim == 3 ? g.shape[0] : 1;
-    const auto ny = g.shape[dim - 2], nx = g.shape.back();
-    for (std::size_t z = 0; z < nz; ++z) for (std::size_t y = 0; y < ny; ++y) {
-        // Same axis order as the separate full-volume multiplication passes.
-        float prefix = dim == 3 ? 1. * kernels[0][z] : 1.;
-        prefix *= kernels[dim - 2][y];
-        for (std::size_t x = 0; x < nx; ++x) {
-            const float value = prefix * kernels.back()[x];
-            out[(z * ny + y) * nx + x] = separable_bounds ? (range ? (value - low) / range : 0) : value;
-        }
-    }
-    if (!separable_bounds) {
-        const auto [lo, hi] = std::minmax_element(out.begin(), out.end());
-        const float fallback_low = *lo, fallback_range = *hi - fallback_low;
-        for (auto& v : out) v = fallback_range ? (v - fallback_low) / fallback_range : 0;
-    }
-    if (centered) {
-        float m = float(mean(out)), maxabs = 0;
-        for (auto& v : out) maxabs = std::max(maxabs, std::abs(v -= m));
-        if (maxabs > 1e-8) for (auto& v : out) v /= maxabs;
-    }
-    return out;
-}
 inline ChannelPlan channel_parameters(const BrightnessGradient& t, const Array& a, Random& r) {
-    return {"", 0, {draw(t.strength, r)}, local_kernel(t.local, Grid(a.spatial()), r, t.mean_centered)};
+    return {"", 0, {draw(t.strength, r)}, local_coefficients(t.local, Grid(a.spatial()), r, t.mean_centered)};
 }
 inline ChannelPlan channel_parameters(const LocalContrast& t, const Array& a, Random& r) {
-    return {"", 0, {draw(t.factor, r)}, local_kernel(t.local, Grid(a.spatial()), r)};
+    return {"", 0, {draw(t.factor, r)}, local_coefficients(t.local, Grid(a.spatial()), r)};
 }
 inline ChannelPlan channel_parameters(const LocalGamma& t, const Array& a, Random& r) {
     auto gamma = draw(t.gamma, r); require(gamma > 0, "gamma must be positive");
-    return {"", 0, {gamma}, local_kernel(t.local, Grid(a.spatial()), r)};
+    return {"", 0, {gamma}, local_coefficients(t.local, Grid(a.spatial()), r)};
 }
 inline ChannelPlan channel_parameters(const LocalSmoothing& t, const Array& a, Random& r) {
     auto strength = draw(t.strength, r); probability(strength);
     auto sigma = draw(t.sigma, r); require(sigma >= 0, "smoothing sigma must be nonnegative");
-    return {"", 0, {strength, sigma}, local_kernel(t.local, Grid(a.spatial()), r)};
+    return {"", 0, {strength, sigma}, local_coefficients(t.local, Grid(a.spatial()), r)};
 }
 inline ChannelPlan channel_parameters(const BlankRectangle& t, const Array& a, Random& r) {
     auto shape = a.spatial(); auto dim = shape.size();
@@ -495,48 +443,50 @@ inline void channel_apply(const Sharpen&, std::vector<T>& v, const Grid& g, cons
     }
     v.swap(output);
 }
-template<class Values> void channel_apply(const BrightnessGradient& t, Values& v, const Grid&, const ChannelPlan& p) {
+template<class Values> void channel_apply(const BrightnessGradient& t, Values& v, const Grid& g, const ChannelPlan& p) {
     using T=typename Values::value_type;
-    auto [lo, hi] = std::minmax_element(v.begin(), v.end()); T low = *lo, high = *hi;
-    for (std::size_t i = 0; i < v.size(); ++i) {
-        T value=v[i]+T(p.field[i])*T(p.values[0]);
-        if constexpr(std::is_same_v<T,float>) if(!std::isfinite(value)) value=T(double(v[i])+p.field[i]*p.values[0]);
+    T low=0,high=0;
+    if(t.clip) { const auto [lo,hi]=std::minmax_element(v.begin(),v.end()); low=*lo; high=*hi; }
+    LocalFieldView(p.field,g).each([&](std::size_t i,float w) {
+        T value=v[i]+T(w)*T(p.values[0]);
+        if constexpr(std::is_same_v<T,float>) if(!std::isfinite(value)) value=T(double(v[i])+w*p.values[0]);
         if(t.clip)value=std::clamp(value,low,high);v[i]=value;
-    }
+    });
 }
-template<class Values> double local_mean(const Values& v, const std::vector<float>& field) {
+template<class Values> double local_mean(const Values& v, const LocalFieldView& field) {
     double sum = 0, weight = 1e-8;
-    for (std::size_t i = 0; i < v.size(); ++i) { sum += v[i] * field[i]; weight += field[i]; }
+    field.each([&](std::size_t i,float w) { sum += double(v[i])*w; weight += w; });
     return sum / weight;
 }
-template<class Values> void channel_apply(const LocalContrast&, Values& v, const Grid&, const ChannelPlan& p) {
+template<class Values> void channel_apply(const LocalContrast&, Values& v, const Grid& g, const ChannelPlan& p) {
     using T=typename Values::value_type;
-    const double wide_mean=local_mean(v,p.field);const T m=T(wide_mean),factor=T(p.values[0]);
-    for (std::size_t i=0;i<v.size();++i) {
-        const T w=T(p.field[i]);T value=v[i]*(T(1)-w)+((v[i]-m)*factor+m)*w;
+    const LocalFieldView field(p.field,g);
+    const double wide_mean=local_mean(v,field);const T m=T(wide_mean),factor=T(p.values[0]);
+    field.each([&](std::size_t i,float weight) {
+        const T w=T(weight);T value=v[i]*(T(1)-w)+((v[i]-m)*factor+m)*w;
         if constexpr(std::is_same_v<T,float>) if(!std::isfinite(value))
             value=T(double(v[i])*(1-double(w))+((double(v[i])-wide_mean)*p.values[0]+wide_mean)*w);
         v[i]=value;
-    }
+    });
 }
-template<class Values> void channel_apply(const LocalGamma&, Values& v, const Grid&, const ChannelPlan& p) {
+template<class Values> void channel_apply(const LocalGamma&, Values& v, const Grid& g, const ChannelPlan& p) {
     using T = typename Values::value_type;
     auto [lo, hi] = std::minmax_element(v.begin(), v.end());T low=*lo,span=std::max(*hi-low,T(1e-8));const double wide_low=*lo,wide_high=*hi;
-    for (std::size_t i=0;i<v.size();++i) {
-        const T norm=(v[i]-low)/span,w=T(p.field[i]);T value=(norm*(T(1)-w)+std::pow(norm,T(p.values[0]))*w)*span+low;
+    LocalFieldView(p.field,g).each([&](std::size_t i,float weight) {
+        const T norm=(v[i]-low)/span,w=T(weight);T value=(norm*(T(1)-w)+std::pow(norm,T(p.values[0]))*w)*span+low;
         if constexpr(std::is_same_v<T,float>) if(!std::isfinite(value)) {
             const double range=std::max(wide_high-wide_low,1e-8),n=(double(v[i])-wide_low)/range;
             value=T((n*(1-double(w))+std::pow(n,p.values[0])*w)*range+wide_low);
         }
         v[i]=value;
-    }
+    });
 }
 template<class Values>
 inline void channel_apply(const LocalSmoothing&, Values& v, const Grid& g, const ChannelPlan& p) {
     using T = typename Values::value_type;
     std::vector<T> smoothed(v.begin(), v.end());
     gaussian_blur(smoothed, g, std::vector<double>(g.shape.size(), p.values[1]));
-    for (std::size_t i = 0; i < v.size(); ++i) { T w = T(p.field[i]) * T(p.values[0]); v[i] = v[i] * (T(1) - w) + smoothed[i] * w; }
+    LocalFieldView(p.field,g).each([&](std::size_t i,float weight) { T w = T(weight) * T(p.values[0]); v[i] = v[i] * (T(1) - w) + smoothed[i] * w; });
 }
 // Shared region/statistic calculation; overlapping boxes observe earlier fills.
 struct RectangleRegion {

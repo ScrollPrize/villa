@@ -1,6 +1,7 @@
 """Numerical contracts for float32 execution and justified wider arithmetic."""
 import os
 import io
+import math
 from pathlib import Path
 import pickle
 import sys
@@ -263,6 +264,79 @@ class PrecisionTests(unittest.TestCase):
                                 out = pipeline({'image': image}, seed=41)['image']
                                 np.testing.assert_allclose(out, expected, atol=2e-6, rtol=2e-6)
                                 np.testing.assert_array_equal(image, original)
+
+    def test_separable_local_fields(self):
+        # Independent dense construction checks the product, normalization and
+        # centering semantics, including narrow and almost constant fields.
+        rng = np.random.default_rng(431)
+        for shape in ((1, 1), (1, 9), (7, 35), (1, 7, 9), (3, 5, 257)):
+            for scale, loc in ((.2, .5), (3., .5), (1000., .5), (1., -10.)):
+                axes = []
+                for n in shape:
+                    axis = np.array([.5 * (math.erf((x+.5-loc*n)/(scale*math.sqrt(2))) -
+                                          math.erf((x-.5-loc*n)/(scale*math.sqrt(2))))
+                                     for x in range(n)], dtype=np.float32)
+                    if axis.max() > 0:
+                        axis /= axis.max()
+                    axes.append(axis)
+                weight = axes[0]
+                for axis in axes[1:]:
+                    weight = np.multiply.outer(weight, axis)
+                span = weight.max() - weight.min()
+                weight = (weight-weight.min())/span if span else np.zeros(shape, dtype=np.float32)
+                centered = weight - np.float32(weight.mean(dtype=np.float64))
+                if np.abs(centered).max() > 1e-8:
+                    centered /= np.abs(centered).max()
+                for dtype in (np.float32, np.float64):
+                    image = rng.random((2, *shape)).astype(dtype)*3-1
+                    sample = {'image': image}
+                    original = image.copy()
+                    low = image.min(axis=tuple(range(1, image.ndim)), keepdims=True)
+                    high = image.max(axis=tuple(range(1, image.ndim)), keepdims=True)
+                    w = weight.astype(dtype)
+                    mean = (image.astype(np.float64)*w).sum(axis=tuple(range(1, image.ndim)), keepdims=True)/(w.sum(dtype=np.float64)+1e-8)
+                    mean = mean.astype(dtype)
+                    norm = (image-low)/np.maximum(high-low, dtype(1e-8))
+                    transforms = [
+                        (A.BrightnessGradient(scale, loc=loc, strength=.3), image+centered*dtype(.3)),
+                        (A.BrightnessGradient(scale, loc=loc, strength=.3, mean_centered=False, clip=True),
+                         np.clip(image+w*dtype(.3), low, high)),
+                        (A.LocalContrast(scale, loc=loc, factor=1.3), image*(1-w)+((image-mean)*dtype(1.3)+mean)*w),
+                        (A.LocalGamma(scale, loc=loc, gamma=.7), (norm*(1-w)+norm**dtype(.7)*w)*np.maximum(high-low, dtype(1e-8))+low),
+                    ]
+                    taps = np.exp(-.5*(np.arange(-3, 4)/.7)**2)
+                    taps = (taps/taps.sum()).astype(dtype)
+                    smooth = image.copy()
+                    for axis, n in enumerate(shape, start=1):
+                        filtered = np.zeros_like(smooth)
+                        for j, tap in enumerate(taps):
+                            indices = (np.arange(n)+j-3) % (2*n)
+                            indices = np.where(indices < n, indices, 2*n-indices-1)
+                            filtered += tap*np.take(smooth, indices, axis=axis)
+                        smooth = filtered
+                    blend = w*dtype(.6)
+                    transforms.append((A.LocalSmoothing(scale, loc=loc, strength=.6, sigma=.7),
+                                       image*(1-blend)+smooth*blend))
+                    for transform, expected in transforms:
+                        for backend in self.backends():
+                            with self.subTest(shape=shape, scale=scale, loc=loc, dtype=dtype,
+                                              transform=repr(transform), backend=backend):
+                                pipeline = A.Pipeline([transform], backend=backend, compact=False)
+                                actual = pipeline(sample, seed=8)['image']
+                                np.testing.assert_allclose(actual, expected, atol=3e-6, rtol=2e-6)
+                                replay = pickle.loads(pickle.dumps(pipeline.sample(sample, seed=8)))
+                                np.testing.assert_array_equal(replay.apply(sample)['image'], actual)
+                                np.testing.assert_array_equal(image, original)
+
+    def test_local_plan_storage_scales_with_axes(self):
+        sample = {'image': np.zeros((1, 128, 128, 128), dtype=np.float32)}
+        for transform in (A.BrightnessGradient(12), A.LocalContrast(12),
+                          A.LocalGamma(12), A.LocalSmoothing(12)):
+            for backend in self.backends():
+                with self.subTest(transform=repr(transform), backend=backend):
+                    pipeline = A.Pipeline([transform], backend=backend, compact=False)
+                    plan = pipeline.sample(sample, seed=0)
+                    self.assertLess(len(plan._native.dump()), 2048)
 
     def test_zscore_large_baseline_small_deviation(self):
         image = np.full((1, 17, 19), 1e6, dtype=np.float32)

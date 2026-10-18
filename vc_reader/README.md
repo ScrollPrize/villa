@@ -91,6 +91,11 @@ for timing scope and validation.
 
 ## Performance
 
+Local brightness, contrast, gamma and smoothing use separable float32 fields:
+a 128³ field needs 388 floats (1.52 KiB), with weights evaluated during image
+processing. See the [compact local-field measurements](benchmarks/README.md#compact-local-fields-2026-10-17)
+for CPU/CUDA timings and full-loader throughput.
+
 ### Reading and sampling
 
 Median milliseconds per request, including sampling where needed: six requests

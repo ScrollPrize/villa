@@ -1,5 +1,6 @@
 #pragma once
 #include "common.cuh"
+#include "../local_field.hpp"
 #include "../spatial.hpp"
 
 namespace vcr::augment::cuda {
@@ -76,4 +77,6 @@ Buffer<Statistics> statistics(View<float>, bool deviation = false, const float* 
 // Sets `bit` in flags when max(|low|, |high|) exceeds limit.
 void flag_magnitude(const Buffer<Statistics>&, double limit, int* flags, int bit);
 Buffer<Statistics> statistics(View<double>, bool deviation = false, const float* weights = nullptr);
+Buffer<Statistics> local_statistics(View<float>, LocalFieldView);
+Buffer<Statistics> local_statistics(View<double>, LocalFieldView);
 } // namespace vcr::augment::cuda

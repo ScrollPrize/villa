@@ -5,12 +5,21 @@ Compatibility with old floating-point outputs or old replay records is **not**
 a reason to use float64. New wider arithmetic must identify a range, conditioning,
 accumulation, or explicit-input requirement, with a numerical example or test.
 
-Dense elastic controls/displacements, local intensity fields, dropout fields,
+Elastic controls/displacements, separable local intensity coefficients, dropout fields,
 CPU image workspaces, FFT spectra, reference images and ordinary geometry now
 follow float32 rather than being unconditionally widened. Explicit float64 image
 inputs retain their precision. Label indices use integer storage. Exact flips
 use integer addressing, without interpolation. Nearest resize uses a shared
 integer ratio in `resize_index.hpp`, avoiding floating-point half-voxel ties.
+
+Local brightness, contrast, gamma and smoothing fields store four float32
+normalization scalars and one float32 vector per spatial axis. Both CPU and CUDA
+evaluate their separable product while consuming the image. Centered brightness
+fields use the product of axis means; when the unnormalized range is below .01,
+a scan of evaluated weights avoids amplifying product rounding in an almost
+constant field. That exceptional scan allocates no dense field. Axis means use
+double for accumulation and cancellation; stored coefficients and evaluated
+weights remain float32. LocalContrast also retains double weighted accumulation.
 
 ## Where wider arithmetic remains
 
@@ -41,7 +50,8 @@ use, and no fast-math compiler change.
 
 ## Replay and numerical changes
 
-New replay records use `VCA2`. Dense fields are serialized as float32; component
+New replay records use `VCA2`. Local intensity fields serialize their compact
+axis coefficients and normalization scalars. Dense fields are serialized as float32; component
 indices are integers. Matrices and shared scalar parameters retain the reasons
 listed above. `VCA1` records are rejected: regenerate old plans. A new plan
 reproduces its recorded execution exactly on the tested backend; CPU/CUDA and

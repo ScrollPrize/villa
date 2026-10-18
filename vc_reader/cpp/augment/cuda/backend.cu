@@ -21,9 +21,7 @@ void validate_program(const std::vector<Op>& ops) {
 Parameters sample_parameters(const Op& op, const Sample& s, Random& r, bool record, void* context) {
     return std::visit([&](const auto& t) -> Parameters {
         using T = std::decay_t<decltype(t)>;
-        if constexpr (std::is_same_v<T,BrightnessGradient> || std::is_same_v<T,LocalContrast> ||
-                      std::is_same_v<T,LocalGamma> || std::is_same_v<T,LocalSmoothing>) return sample_local(t,s,r,record);
-        else if constexpr (std::is_same_v<T,Elastic>) return sample_elastic(t,s,r,record);
+        if constexpr (std::is_same_v<T,Elastic>) return sample_elastic(t,s,r,record);
         else if constexpr (std::is_same_v<T,StripGeometry>) return sample_strip(t,s,r,record);
         else if constexpr (std::is_same_v<T,SheetCompression>) return sample_sheet(t,s,r,record,*static_cast<Session*>(context));
         else if constexpr (std::is_same_v<T,SurfacePerturb>) return sample_surface(t,s,r,record,*static_cast<Session*>(context));

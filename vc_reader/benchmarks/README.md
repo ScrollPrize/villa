@@ -11,8 +11,112 @@ Release extensions for every suite. The refresh manifest (`docs/benchmarks/refre
 records report hashes and coverage. Current results are in the PyTorch, resident
 geometry, augmentation catalog, and reader/pipeline sections. The two optimization
 history sections are explicitly marked historical and retain their original data.
-The Gaussian experiment below measures subsequent changes separately; it does
-not replace the catalog-wide refresh.
+The Gaussian and compact-field experiments below measure subsequent changes
+separately; they do not replace the catalog-wide refresh.
+
+## Compact local fields (2026-10-17)
+
+BrightnessGradient, LocalContrast, LocalGamma and LocalSmoothing now consume
+separable fields directly on CPU and CUDA. Each field stores four normalization
+scalars and one float32 vector per axis: **1,552 bytes for 128³**, eliminating
+the 8 MiB dense weight array and its expansion pass. CPU loops reuse each row's
+prefix product. Centered brightness uses the product of axis means; nearly
+constant fields use an allocation-free scan to avoid amplifying product rounding.
+Unclipped brightness also skips unused image bounds. CUDA LocalContrast computes
+only the weighted mean it needs, without collecting unused image bounds.
+Sampling and field evaluation are shared between backends. No compiler precision
+flags, image dtypes, transform probabilities, or random draw order changed.
+
+Measured on Linux amd64 / RTX 5090, Release CUDA architecture 120. README recipes
+use a PHercParis4 level-2 128³ float32 CT crop at `(9000, 3600, 3600)`, divided
+by 255, with one CPU thread. Results combine **two blocks of 30 measurements**
+per case/route, each after five warmups (seeds 123–152 in each block). Case and
+route orders are deterministically shuffled. Public-call validation and input
+preservation are included; setup, reads, comparison, output disposal, and initial
+resident upload/final download are excluded. Values are **mean / p50 / p95 ms**.
+The repeat blocks check timing variability; they are not independent datasets.
+
+| Transform / route | Before | After |
+| --- | ---: | ---: |
+| BrightnessGradient, CPU | 13.667 / 14.005 / 14.554 | 2.590 / 2.577 / 2.796 |
+| BrightnessGradient, resident CUDA | 0.243 / 0.218 / 0.442 | 0.136 / 0.133 / 0.210 |
+| LocalContrast, CPU | 9.371 / 9.396 / 9.779 | 4.189 / 4.191 / 4.338 |
+| LocalContrast, resident CUDA | 0.250 / 0.220 / 0.435 | 0.151 / 0.138 / 0.216 |
+| LocalGamma, CPU | 18.068 / 18.064 / 18.376 | 12.307 / 12.329 / 12.515 |
+| LocalGamma, resident CUDA | 0.245 / 0.221 / 0.436 | 0.160 / 0.161 / 0.219 |
+| LocalSmoothing, CPU | 19.115 / 19.081 / 19.740 | 7.132 / 7.100 / 7.532 |
+| LocalSmoothing, resident CUDA | 0.416 / 0.444 / 0.596 | 0.389 / 0.393 / 0.451 |
+
+The loader uses min-max normalization and `heavy_transforms()`'s shared
+12-transform chain, four spawned loader workers with four reader threads each,
+and batches of four 128³ crops. Each route has a full validation/warmup epoch,
+then three repetitions of 64 batches in rotating route order, with warm caches.
+Reading, transfers, casts, augmentation, collation, disposal and stream completion
+are included; there is no model computation. All 256 validation crop hashes
+match between batch and prefetch routes within each build.
+
+| Loader route | Before mean / p50 / p95 ms | After mean / p50 / p95 ms | Crops/s before → after |
+| --- | ---: | ---: | ---: |
+| `Pipeline.batch()` | 4.491 / 4.088 / 4.972 | 4.254 / 3.956 / 4.909 | 890.13 → 939.86 (+5.6%) |
+| `CudaLoader` prefetch | 4.458 / 4.026 / 4.984 | 4.183 / 3.869 / 4.628 | 896.90 → 955.77 (+6.6%) |
+
+A separate Nsight Systems trace covers four warmup and four measured batches
+(32 crops). The baseline's leading kernel groups were resampling (13.7%),
+statistics collection (12.9%) and local-field expansion (10.7%). All **64 dense
+local-field expansion launches disappear**, removing 2.633 ms of kernel work.
+Consumers now evaluate their weights, so the net change in total kernel time is
+24.607 → 22.723 ms (7.7% less). The largest remaining groups are resampling
+(14.9%), statistics collection (11.0%) and strided convolution (9.0%).
+Instrumented timings are excluded from the throughput tables; the trace includes
+occasional scheduling outliers. [Before profile](../docs/benchmarks/separable-profile-before.csv)
+and [after profile](../docs/benchmarks/separable-profile-after.csv) retain the data.
+
+The CUDA regression suite passes all 35 tests; the separate CPU-only precision
+suite passes all 13 tests. Independent NumPy references cover each transform,
+2D/3D data, singleton axes, narrow/off-image/near-constant fields, two channels,
+float32/float64 inputs, source preservation, and exact same-backend pickle replay.
+A storage regression keeps each 128³ single-channel local-transform plan below
+2 KiB. The real-data catalog checks pass for every measured seed. A separate
+comparison of the four recipes at seeds 123–125 gives maximum before/after
+absolute error **5.96e-8** across CPU and CUDA. This is a numerical comparison,
+not a model-quality measurement. macOS/arm64 and arrays requiring the 64-bit
+indexing fallback were not runtime-tested. See the [precision policy](../docs/precision.md).
+
+Local JSON reports `docs/benchmarks/separable-{before,after}{,-repeat}.json`
+contain commands, raw samples, input hashes, extension hashes and numerical
+checks. `separable-summary.json` combines their 60 samples per route;
+`separable-loader-{before,after}.json` and `separable-profile-{before,after}.json`
+record loader/profiler configurations, and `separable-numerics.json` records the
+separate numerical comparison.
+
+Reproduce using the existing build/environment (no setup required). To compare
+the saved baseline, use `/tmp/vc-separable-before` and a separate output path.
+Run the augmentation command twice with distinct report paths for the two blocks.
+
+```bash
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-reader-cuda --target _augment --parallel 4
+VC_BENCH_VOLUME=/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  .venv/bin/python benchmarks/bench_augmentations.py \
+  --native-dir /tmp/vc-reader-cuda --array "$VC_BENCH_VOLUME" \
+  --only BrightnessGradient LocalContrast LocalGamma LocalSmoothing \
+  --warmup 5 --reps 30 --output /tmp/separable-after.json
+AGENTS_AGENT_MODE=1 .venv/bin/python benchmarks/bench_torch.py \
+  --native-dir /tmp/vc-reader-cuda --modes batch prefetch \
+  --array "$VC_BENCH_VOLUME" --level 2 --batches 64 --batch-size 4 --reps 3 \
+  --output /tmp/separable-loader-after.json
+AGENTS_AGENT_MODE=1 nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
+  --force-overwrite=true --output=/tmp/separable-profile-after \
+  .venv/bin/python benchmarks/bench_torch.py --native-dir /tmp/vc-reader-cuda \
+  --modes prefetch --array "$VC_BENCH_VOLUME" --level 2 \
+  --batches 4 --batch-size 4 --reps 1 --output /tmp/separable-profile-after.json
+nsys stats --report cuda_gpu_kern_sum --format csv /tmp/separable-profile-after.nsys-rep
+AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=/tmp/vc-reader-cuda \
+  .venv/bin/python -m unittest discover -s tests -v
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-volume-cpu --target _augment --parallel 4
+AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=/tmp/vc-volume-cpu \
+  .venv/bin/python -m unittest discover -s tests -p test_precision.py -v
+```
 
 ## Gaussian filter work reduction (2026-10-17)
 
