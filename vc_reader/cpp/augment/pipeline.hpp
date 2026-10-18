@@ -1,7 +1,8 @@
 #pragma once
 #include "tracing.hpp"
 #include "palette.hpp"
-#include "structure.hpp"
+#include "distance_transform.hpp"
+#include "structure_tensor.hpp"
 #include "bias_field.hpp"
 #include "plasma_brightness_contrast.hpp"
 #include "plasma_shadow.hpp"

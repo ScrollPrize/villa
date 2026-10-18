@@ -67,6 +67,31 @@ class PrecisionTests(unittest.TestCase):
                     with self.subTest(transform=repr(transform), dtype=dtype, comparison='cpu/cuda'):
                         np.testing.assert_allclose(results['cuda'], results['cpu'], atol=5e-5, rtol=1e-5)
 
+    def test_derived_fields(self):
+        rng = np.random.default_rng(99)
+        image = rng.random((1, 7, 9, 11), dtype=np.float32)
+        mask = (image > .6).astype(np.uint8)
+        transforms = [A.DistanceTransform(normals='_normal'),
+                      A.StructureTensor(field='components'),
+                      A.StructureTensor(field='normal', confidence='confidence'),
+                      A.StructureTensor(at=(3, 4, 5))]
+        for transform in transforms:
+            results = {}
+            for backend in self.backends():
+                pipeline = A.Pipeline([transform], backend=backend, compact=False)
+                sample = {'image': image, 'mask': mask}
+                out = pipeline(sample, seed=17)
+                replay = pickle.loads(pickle.dumps(pipeline.sample(sample, seed=17))).apply(sample)
+                for key in out:
+                    np.testing.assert_array_equal(out[key], replay[key])
+                    self.assertTrue(np.isfinite(out[key]).all())
+                    if key not in sample:
+                        self.assertEqual(out[key].dtype, np.float32)
+                results[backend] = out
+            if len(results) == 2:
+                for key in results['cpu']:
+                    np.testing.assert_allclose(results['cpu'][key], results['cuda'][key], atol=5e-5, rtol=1e-5)
+
     def test_large_coordinates_keep_subvoxel_translation(self):
         # At 4096, float32 cannot represent this translation. Wider coordinate
         # arithmetic is required even though the image/output are float32.

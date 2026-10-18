@@ -1,20 +1,8 @@
 #pragma once
-#include "labels.hpp"
+#include "separable_filter.hpp"
+#include "derived_field.hpp"
 
-// Derived geometric targets: exact Euclidean distance transforms with optional
-// Scharr normals, and structure tensors (components, eigenvector fields or a
-// point-evaluated tensor). Each creates new fields; place them after geometry.
-// The 1D kernels, distance envelopes and eigen solver are shared with CUDA.
 namespace vcr::augment {
-enum class DistanceMode { Signed, Inside, Outside };
-// vesuvius aux targets: inside = EDT(foreground), outside = EDT(background),
-// signed = outside - inside; foreground is value > threshold of one channel.
-struct DistanceTransform {
-    std::vector<std::string> on; std::size_t channel = 0; double threshold = 0;
-    DistanceMode mode = DistanceMode::Signed; std::string suffix = "_sdt";
-    std::string normals; std::string components = "zyx";  // normals: field suffix, empty for none
-    double p = 1;
-};
 enum class Derivative { Pavel, Gaussian };
 enum class StructureField { Components, Normal, Tangent };
 // pavel: vesuvius StructureTensorComputer (Gaussian presmoothing radius
@@ -31,8 +19,9 @@ struct StructureTensor {
     double p = 1;
 };
 
-namespace structure_detail {
-struct Taps { std::vector<double> weights; int radius = 0; };
+namespace structure_tensor_detail {
+using namespace filter_detail;
+using namespace derived_field_detail;
 // Correlation taps: out[i] = sum_k weights[k] * in[i + k - radius].
 inline Taps torch_gaussian(double sigma) {
     const int radius = int(3 * sigma); Taps t{std::vector<double>(2 * radius + 1), radius}; double sum = 0;
@@ -53,42 +42,8 @@ inline Taps scipy_gaussian(double sigma, int order, double truncate) {
 // Holoborodko derivative as Torch conv taps (cross-correlation).
 inline Taps pavel_derivative() { return {{2 / 96., 1 / 96., -16 / 96., -27 / 96., 0., 27 / 96., 16 / 96., -1 / 96., -2 / 96.}, 4}; }
 inline Taps pavel_smooth() { return {{1 / 16., 4 / 16., 6 / 16., 4 / 16., 1 / 16.}, 2}; }
-// Scharr (skimage, ndi.convolve): x[i+1] - x[i-1]; [3, 10, 3]/16 smoothing.
-inline Taps scharr_derivative() { return {{-1., 0., 1.}, 1}; }
-inline Taps scharr_smooth() { return {{3 / 16., 10 / 16., 3 / 16.}, 1}; }
 inline Taps identity() { return {{1.}, 0}; }
 
-// Index of a neighbour, or -1 for a zero-padded sample.
-VCR_HD inline long long neighbour(long long x, long long n, Boundary edge) {
-    if (x >= 0 && x < n) return x;
-    if (edge == Boundary::Zero) return -1;
-    if (edge == Boundary::Nearest) return x < 0 ? 0 : n - 1;
-    if (n == 1) return 0;
-    const bool mirror = edge == Boundary::Mirror;
-    const long long period = mirror ? 2 * (n - 1) : 2 * n;
-    x = (x % period + period) % period;
-    return x < n ? x : period - x - (mirror ? 0 : 1);
-}
-template<class T> void correlate(const T* in, T* out, const Grid& g, std::size_t axis, const Taps& t, Boundary edge) {
-    const auto n = (long long)g.shape[axis]; const auto stride = g.stride[axis];
-    for (std::size_t i = 0; i < g.size; ++i) {
-        const auto x = (long long)g.coord(i, axis); const auto base = i - std::size_t(x) * stride;
-        double sum = 0;
-        for (int k = -t.radius; k <= t.radius; ++k) {
-            const auto j = neighbour(x + k, n, edge);
-            if (j >= 0) sum += t.weights[k + t.radius] * double(in[base + std::size_t(j) * stride]);
-        }
-        out[i] = T(sum);
-    }
-}
-// Applies taps[a] along each axis a (identity taps are skipped).
-template<class T> void separable(std::vector<T>& data, const Grid& g, const std::vector<Taps>& taps, Boundary edge) {
-    std::vector<T> tmp(data.size());
-    for (std::size_t a = 0; a < taps.size(); ++a) {
-        if (taps[a].radius == 0 && taps[a].weights[0] == 1) continue;
-        correlate(data.data(), tmp.data(), g, a, taps[a], edge); data.swap(tmp);
-    }
-}
 // Taps per axis for each gradient component, plus optional presmoothing.
 inline std::vector<std::vector<Taps>> gradient_taps(const StructureTensor& t, std::size_t d) {
     std::vector<std::vector<Taps>> result(d, std::vector<Taps>(d));
@@ -161,96 +116,12 @@ VCR_HD inline double principal(const double* components, int d, bool normal, dou
     return normal ? (values[d - 1] - values[d - 2]) / largest : (values[1] - values[0]) / largest;
 }
 
-// Felzenszwalb-Huttenlocher squared distance of one line in place (stride
-// apart). v/z are scratch of n and n+1 entries. Infinite lines stay infinite.
-template<class T, class V, class Z> VCR_HD void envelope(T* f, std::size_t n, std::size_t stride, V* v, Z* z, T* scratch) {
-    const double inf = 1e300;
-    long long k = -1;
-    for (long long q = 0; q < (long long)n; ++q) {
-        const double fq = double(f[q * stride]);
-        if (!(fq < inf)) continue;
-        while (k >= 0) {
-            const double fv = double(f[(long long)v[k] * stride]);
-            const double s = ((fq + double(q) * q) - (fv + double(v[k]) * v[k])) / (2. * q - 2. * v[k]);
-            if (s <= z[k]) --k; else { ++k; v[k] = q; z[k] = s; z[k + 1] = inf; break; }
-        }
-        if (k < 0) { k = 0; v[0] = q; z[0] = -inf; z[1] = inf; }
-    }
-    for (std::size_t q = 0; q < n; ++q) scratch[q] = f[q * stride];
-    if (k < 0) return;
-    long long j = 0;
-    for (long long q = 0; q < (long long)n; ++q) {
-        while (z[j + 1] < double(q)) ++j;
-        const double dq = double(q) - double(v[j]);
-        f[q * stride] = T(dq * dq + double(scratch[v[j]]));
-    }
-}
-// Squared EDT to the nearest voxel where `feature` holds, all axes.
-inline void squared_edt(std::vector<double>& f, const Grid& g) {
-    const auto n = *std::max_element(g.shape.begin(), g.shape.end());
-    std::vector<long long> v(n); std::vector<double> z(n + 1), scratch(n);
-    for (std::size_t a = 0; a < g.shape.size(); ++a) {
-        const auto stride = g.stride[a], extent = g.shape[a];
-        for (std::size_t i = 0; i < g.size; ++i) {
-            if (g.coord(i, a) != 0) continue;
-            envelope(f.data() + i, extent, stride, v.data(), z.data(), scratch.data());
-        }
-    }
-}
-// Distances to the nearest voxel of the other class. A class absent from the
-// grid contributes zero (SciPy's result is undefined there).
-inline std::vector<double> distance(const std::vector<std::uint8_t>& foreground, const Grid& g, bool inside) {
-    std::vector<double> f(g.size); bool any = false;
-    for (std::size_t i = 0; i < g.size; ++i) { const bool feature = bool(foreground[i]) != inside; f[i] = feature ? 0 : 1e300; any |= feature; }
-    if (!any) return std::vector<double>(g.size, 0.);
-    squared_edt(f, g);
-    for (auto& x : f) x = std::sqrt(x);
-    return f;
-}
-inline Target derived(Role role, const std::string& components = "zyx") { Target t; t.role = role; t.components = components; return t; }
-} // namespace structure_detail
-
-inline Parameters sample(const DistanceTransform&, const Sample&, Random&) { return {}; }
-inline void apply(const DistanceTransform& t, Sample& s, const Parameters&) {
-    using namespace structure_detail;
-    std::vector<std::pair<std::string, Field>> outputs;
-    for (const auto& [name, f] : s) if (selected_label(name, f, t.on)) {
-        const auto& a = f.array; Grid g(a.spatial()); const auto d = g.shape.size();
-        require(t.channel < a.shape[0], "DistanceTransform channel out of bounds");
-        const auto values = a.channel(t.channel);
-        std::vector<std::uint8_t> foreground(g.size);
-        for (std::size_t i = 0; i < g.size; ++i) foreground[i] = values[i] > t.threshold;
-        std::vector<double> result(g.size, 0.);
-        if (t.mode != DistanceMode::Inside) result = distance(foreground, g, false);
-        if (t.mode != DistanceMode::Outside) { auto inside = distance(foreground, g, true); for (std::size_t i = 0; i < g.size; ++i) result[i] -= inside[i]; }
-        if (t.mode == DistanceMode::Inside) for (auto& x : result) x = -x;
-        Shape shape{1}; shape.insert(shape.end(), g.shape.begin(), g.shape.end());
-        Field out{Array(shape), derived(Role::Scalar), name}; out.array.channel(0, result);
-        if (!t.normals.empty()) {
-            Shape vshape{d}; vshape.insert(vshape.end(), g.shape.begin(), g.shape.end());
-            Field normals{Array(vshape), derived(Role::NormalField, t.components), name};
-            std::vector<std::vector<double>> gradient(d, result);
-            for (std::size_t a = 0; a < d; ++a) {
-                std::vector<Taps> taps(d, scharr_smooth()); taps[a] = scharr_derivative();
-                separable(gradient[a], g, taps, Boundary::Reflect);
-            }
-            for (std::size_t i = 0; i < g.size; ++i) {
-                double norm = 0; for (std::size_t a = 0; a < d; ++a) norm += gradient[a][i] * gradient[a][i];
-                norm = std::max(std::sqrt(norm), 1e-6);
-                for (std::size_t a = 0; a < d; ++a) gradient[a][i] /= norm;
-            }
-            for (std::size_t j = 0; j < d; ++j) normals.array.channel(j, gradient[std::size_t(axis(t.components[j], d))]);
-            outputs.emplace_back(name + t.normals, std::move(normals));
-        }
-        outputs.emplace_back(name + t.suffix, std::move(out));
-    }
-    for (auto& [name, f] : outputs) { require(!s.count(name), "derived field already exists: " + name); s.emplace(name, std::move(f)); }
-}
+} // namespace structure_tensor_detail
 
 inline Parameters sample(const StructureTensor&, const Sample&, Random&) { return {}; }
 // Gradient components (d channels, array-axis order) of the scaled input.
 template<class T> std::vector<std::vector<T>> structure_gradients(const StructureTensor& t, const std::vector<T>& input, const Grid& g) {
-    using namespace structure_detail;
+    using namespace structure_tensor_detail;
     const auto d = g.shape.size();
     auto base = input; for (auto& x : base) x = T(double(x) * t.scale);
     if (t.derivative == Derivative::Pavel && t.sigma > 0) separable(base, g, std::vector<Taps>(d, torch_gaussian(t.sigma)), t.boundary);
@@ -260,14 +131,14 @@ template<class T> std::vector<std::vector<T>> structure_gradients(const Structur
     return gradient;
 }
 inline void apply(const StructureTensor& t, Sample& s, const Parameters&) {
-    using namespace structure_detail;
+    using namespace structure_tensor_detail;
     const auto& f = s.at(t.on); const auto& a = f.array; Grid g(a.spatial()); const int d = int(g.shape.size());
     require(t.channel < a.shape[0], "StructureTensor channel out of bounds");
     const auto name = t.output.empty() ? t.on + "_st" : t.output;
     std::vector<std::pair<std::string, Field>> outputs;
     const auto run = [&](auto tag) {
         using T = decltype(tag);
-        const auto source = a.channel(t.channel); std::vector<T> input(source.begin(), source.end());
+        const auto input = a.channel<T>(t.channel);
         auto gradient = structure_gradients(t, input, g);
         const int count = component_count(d);
         std::vector<std::vector<T>> components(count, std::vector<T>(g.size));
@@ -292,9 +163,9 @@ inline void apply(const StructureTensor& t, Sample& s, const Parameters&) {
         Field out{Array(shape, 'f', sizeof(T)), derived(t.field == StructureField::Components ? Role::Scalar : Role::NormalField, t.components), t.on};
         Array confidence(Shape{1}); if (!t.confidence.empty()) { Shape c{1}; c.insert(c.end(), g.shape.begin(), g.shape.end()); confidence = Array(c, 'f', sizeof(T)); }
         if (t.field == StructureField::Components) {
-            for (int c = 0; c < count; ++c) out.array.channel(std::size_t(c), std::vector<double>(components[c].begin(), components[c].end()));
+            for (int c = 0; c < count; ++c) out.array.channel(std::size_t(c), components[c]);
         } else {
-            std::vector<std::vector<double>> vectors(d, std::vector<double>(g.size)); std::vector<double> gap(g.size);
+            std::vector<std::vector<T>> vectors(d, std::vector<T>(g.size)); std::vector<T> gap(g.size);
             for (std::size_t i = 0; i < g.size; ++i) {
                 double tensor[6], vector[3]; for (int c = 0; c < count; ++c) tensor[c] = double(components[c][i]);
                 gap[i] = principal(tensor, d, t.field == StructureField::Normal, vector);
