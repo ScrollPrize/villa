@@ -58,6 +58,16 @@ whole sampled planes relative to previous floating-point tie rounding; it is
 a deliberate index-semantics correction, separate from small interpolation
 roundoff. See [performance measurements](../benchmarks/README.md#cuda-geometry-optimizations).
 
+The subsequent [CUDA work-reduction pass](../benchmarks/README.md#cuda-geometry-work-reduction)
+factors interior interpolation into axis blends, shares B-spline expansion work
+across components, fuses field centering with statistics/scaling, and changes
+the reduction grid. The lattice, float32 field storage, RMS convention and
+gradient cap remain the same. Arithmetic grouping/reduction order changes are
+intentional: maximum image difference against the preceding CUDA implementation
+was 7.99e-6 on three random 128³ images, with no changed labels in that sample.
+VCA2 records retain their format and size; old records still load, but image
+interpolation can round differently across versions. Same-version replay is exact.
+
 ## Code boundaries and validation
 
 Structure-tensor definitions and CPU/CUDA implementations live in

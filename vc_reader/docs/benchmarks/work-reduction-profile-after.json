@@ -1,0 +1,148 @@
+{
+  "command": [
+    "/home/sean/Documents/villa2/villa/vc_reader/.venv/bin/python",
+    "benchmarks/bench_torch.py",
+    "--native-dir",
+    "/tmp/vc-reader-cuda",
+    "--modes",
+    "prefetch",
+    "--array",
+    "/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+    "--level",
+    "2",
+    "--batches",
+    "4",
+    "--batch-size",
+    "4",
+    "--reps",
+    "1",
+    "--output",
+    "/tmp/work-reduction-profile-after.json"
+  ],
+  "config": {
+    "array": "/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+    "level": "2",
+    "native_dir": "/tmp/vc-reader-cuda",
+    "modes": [
+      "prefetch"
+    ],
+    "shape": [
+      128,
+      128,
+      128
+    ],
+    "batches": 4,
+    "batch_size": 4,
+    "workers": 4,
+    "reader_threads": 4,
+    "reps": 1,
+    "seed": 123,
+    "output": "/tmp/work-reduction-profile-after.json",
+    "backend": "cuda"
+  },
+  "environment": {
+    "python": "3.14.4 (main, Aug 20 2026, 10:41:58) [GCC 15.2.0]",
+    "numpy": "2.5.4",
+    "platform": "Linux-7.0.0-30-generic-x86_64-with-glibc2.43",
+    "processor": "",
+    "cpu_count": 24,
+    "affinity": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23
+    ],
+    "extensions": {
+      "reader": {
+        "path": "/tmp/vc-reader-cuda/_native.cpython-314-x86_64-linux-gnu.so",
+        "sha256": "61987e8540abcbeb170889ba069b936752839c4c34db04931f4ed192ea9183fc"
+      },
+      "augment": {
+        "path": "/tmp/vc-reader-cuda/_augment.cpython-314-x86_64-linux-gnu.so",
+        "sha256": "e47d51a474b4ade2a8100f3f2db45aef51296b2653e4a31d89f9c63831217ba3"
+      }
+    },
+    "build": {
+      "CMAKE_BUILD_TYPE": "Release",
+      "CMAKE_CUDA_ARCHITECTURES": "120",
+      "CMAKE_CXX_COMPILER": "/usr/bin/c++",
+      "VC_READER_ENABLE_CUDA": "ON"
+    },
+    "gpus": [
+      "0, NVIDIA GeForce RTX 5090, 595.84"
+    ]
+  },
+  "torch": "2.14.1+cu130",
+  "results": {
+    "prefetch": {
+      "raw_batch_ms": [
+        14.41453117877245,
+        1.3593509793281555,
+        1.7913738265633583,
+        0.9685391560196877
+      ],
+      "epoch_seconds": [
+        0.01868720818310976
+      ],
+      "batch_ms": {
+        "mean_ms": 4.633448785170913,
+        "p50_ms": 1.575362402945757,
+        "p95_ms": 12.521057575941082,
+        "min_ms": 0.9685391560196877,
+        "max_ms": 14.41453117877245
+      },
+      "crops_per_second": 856.2006610736769
+    }
+  },
+  "protocol": "one validation/warmup epoch per mode; rotated mode order per repetition; warm caches; GPU-ready batches; includes reads, transfers, casts, augmentation, collation and output disposal; excludes startup/validation and model execution; private prototype versus public APIs",
+  "input": "/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+  "transforms": [
+    "Normalize('minmax')",
+    "Elastic(sigma=12, magnitude=2, border=True)",
+    "MedianFilter(3)",
+    "Flip(axes='x', p_axis=1)",
+    "Gamma(0.9)"
+  ],
+  "validation": {
+    "crops": 16,
+    "comparison": "byte-identical across selected modes",
+    "hashes": [
+      "187eb5672faa974c6343f0a23044d4396b824ef40bc29697d526fbee7dfe5518",
+      "9e3775e162a01289db10dca2e2659b3f553b7fdbdcb8bf3c3eaf86c44e30f0dd",
+      "c3d426a4e157b00c987e641ac772f7b228b5b20978bf7bb88814ab0b2f4b3816",
+      "a96e19bdbb1e584bb1f58f701476da1a74ad2b0e1c281f4cbd0ac8444ae9b1bd",
+      "b5c9ce5d26d4469746be5a13135050b98517ee1ff554be46621d9ef4019b7a16",
+      "f2ac15720eae7846fbb8589c8547ed3080468f3ec3a347feec9573a0e2622971",
+      "6dfea954294b65fac5544f5275207f2aef017faf771d0a21a6b1b88e0bbe2907",
+      "aa2bfbbbc5aba069b28b1b4d6bd2a05b3193f225ee592577e42f4f3056bf74cd",
+      "9a980ca368066c50ad2e768db0f9bcf00bbdc12e1a0639aa49f772d5d52c8dbb",
+      "93e2950c26afe1b315a641f95c12bffa8d8f3ff133162aab21641efff4ce96b6",
+      "65f14c98e27b94307a301e04449927bf244aeebba396e9358d89c2b471a8029e",
+      "848a0ace845c6054bc5ef8c0a612c459b738e451b04af210bbe0530e60ecfe27",
+      "afce2805f22ae53488b8bd618cdb755e812619c22cbdd010329636059ef8f3fe",
+      "643e8493f5ba08a5dcb566b69fde52d729ef89c1336720d63f0546c87581f936",
+      "ba2828b12a4bf303c303c4a6a9bf66438607fe2a04fcd3760dfdd364c8a2c868",
+      "9833c97f5461f67f52725e0719a67b644f60112b05af41e5ef9ad264a704cff4"
+    ]
+  }
+}

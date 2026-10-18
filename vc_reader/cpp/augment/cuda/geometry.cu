@@ -4,7 +4,7 @@ namespace vcr::augment::cuda {
 template<class Real> struct GeometryArgs {
     Real matrix[9]{}, offset[3]{};
     double fill = 0;
-    bool border = false, nearest = false, validity = false;
+    bool border = false, nearest = false, validity = false, identity = false;
     int mode = 0;
 };
 // Exact same-shape axis reflections need only integer address arithmetic.
@@ -56,15 +56,42 @@ template<class Acc, class T, class Real> __device__ Acc linear_sample(const T* s
     }
     return validity?Acc(1):value;
 }
-template<class T, class Real> __global__ void geometry_kernel(const T* src, T* dst, Layout in, Layout out, std::size_t channels, GeometryArgs<Real> p, const float* field, T pad, int* used_pad) {
+// Factor the interior tensor-product stencil into seven lerps (three in 2D).
+// Boundary/validity sampling still uses the shared corner evaluator. Avoid
+// b-a: that difference can overflow for finite endpoints of opposite signs.
+template<class Real> __device__ Real blend(Real a, Real b, Real t) {
+    if (t == 0) return a;
+    if (t == 1) return b;
+    return (Real(1)-t)*a+t*b;
+}
+template<int D, class Real, class T, class Index>
+__device__ Real interior_sample(const T* src, Index base, Layout in, const Real* f) {
+    const Index sy=Index(in.stride[D-2]);
+    const auto plane = [&](Index at) {
+        return blend(blend(Real(src[at]),Real(src[at+1]),f[D-1]),
+                     blend(Real(src[at+sy]),Real(src[at+sy+1]),f[D-1]),f[D-2]);
+    };
+    if constexpr (D == 3) return blend(plane(base),plane(base+Index(in.stride[0])),f[0]);
+    else return plane(base);
+}
+template<class T, class Real, int D = 0, class Index = std::size_t>
+__global__ void geometry_kernel(const T* src, T* dst, Layout in, Layout out, std::size_t channels, GeometryArgs<Real> p, const float* field, T pad, int* used_pad) {
     EACH_INDEX(out.size*channels) {
-        const auto voxel = i%out.size, channel = i/out.size;
-        Real q[3]{}, fraction[3]{}; long long lo[3]{};
+        const Index voxel = Index(i)%Index(out.size), channel = Index(i)/Index(out.size);
+        const int dim = D ? D : out.dim;
+        Real q[3]{}, fraction[3]{}, coords[3]{}; long long lo[3]{};
+        // Decompose the output index once, rather than once per matrix row.
+        Index remainder=voxel;
+        for (int a=0;a<dim;++a) {
+            coords[a]=Real(remainder/Index(out.stride[a]));
+            remainder%=Index(out.stride[a]);
+        }
         bool far = false;
-        for (int a = 0; a < out.dim; ++a) {
-            for (int b = 0; b < out.dim; ++b) q[a] += p.matrix[a*out.dim+b]*Real(out.coord(voxel,b));
+        for (int a = 0; a < dim; ++a) {
+            if (p.identity) q[a]=coords[a];
+            else for (int b = 0; b < dim; ++b) q[a] += p.matrix[a*dim+b]*coords[b];
             q[a] += p.offset[a];
-            if (field) q[a] += Real(field[voxel*out.dim+a]);
+            if (field) q[a] += Real(field[std::size_t(voxel)*dim+a]);
             if (p.border && !p.validity) q[a] = fmin(fmax(q[a],Real(0)),Real(in.shape[a]-1));
             if (!isfinite(q[a]) || q[a] < -1 || q[a] > Real(in.shape[a])) { far = true; continue; }
             lo[a] = static_cast<long long>(floor(q[a])); fraction[a] = q[a]-lo[a];
@@ -72,7 +99,7 @@ template<class T, class Real> __global__ void geometry_kernel(const T* src, T* d
         if (far) { dst[i] = p.validity ? T(p.fill>=1) : pad; if (used_pad) atomicExch(used_pad,1); continue; }
         if (p.nearest) {
             bool valid = true; std::size_t at = 0;
-            for (int a = 0; a < out.dim; ++a) {
+            for (int a = 0; a < dim; ++a) {
                 auto x = lo[a] + (p.mode == 2 ? 0 : (fraction[a] > .5 || (fraction[a] == .5 && (p.mode == 1 || lo[a]%2 != 0))));
                 if (x < 0 || x >= static_cast<long long>(in.shape[a])) valid = false; else at += x*in.stride[a];
             }
@@ -80,7 +107,18 @@ template<class T, class Real> __global__ void geometry_kernel(const T* src, T* d
             else { dst[i] = pad; if (used_pad) atomicExch(used_pad,1); }
         } else {
             using Value = std::conditional_t<std::is_same_v<T,double>,double,Real>;
-            Value value=linear_sample<Value>(src+channel*in.size,in,lo,fraction,p.fill,p.validity);
+            Value value;
+            bool interior=false;
+            Index base=0;
+            if constexpr (D != 0) {
+                interior=!p.validity;
+                for (int a=0;a<D;++a) {
+                    interior &= lo[a]>=0 && lo[a]+1<static_cast<long long>(in.shape[a]);
+                    if (lo[a]>=0) base+=Index(lo[a])*Index(in.stride[a]);
+                }
+                if (interior) value=interior_sample<D,Value>(src+channel*in.size,base,in,fraction);
+            }
+            if (!interior) value=linear_sample<Value>(src+channel*in.size,in,lo,fraction,p.fill,p.validity);
             if constexpr(std::is_same_v<Value,float>) {
                 // A float32 weighted sum can overflow near FLT_MAX even when
                 // the convex interpolation result is representable.
@@ -112,6 +150,7 @@ DeviceArray resample_cuda(const DeviceArray& src, const Parameters& p, bool near
         GeometryArgs<Real> args{};
         std::copy(p.matrix.begin(),p.matrix.end(),args.matrix); std::copy(p.offset.begin(),p.offset.end(),args.offset);
         args.fill = fill; args.border = p.border; args.nearest = nearest; args.validity = validity; args.mode = p.nearest_mode;
+        args.identity = p.matrix == identity(p.shape.size());
         src.typed([&](auto input) {
             using T = typename decltype(input)::value_type;
             T pad{}; bool fill_valid = true;
@@ -119,7 +158,17 @@ DeviceArray resample_cuda(const DeviceArray& src, const Parameters& p, bool near
             require(std::is_floating_point_v<T> || nearest || validity,"CUDA linear interpolation requires floating-point data");
             Buffer<int> used(fill_valid || validity ? 0 : 1); int used_host = 0;
             if (used.size) used.upload(&used_host);
-            geometry_kernel<<<blocks(out.size()),256,0,vcr::device::stream()>>>(input.ptr,out.view<T>().ptr,in,output,src.shape[0],args,field,pad,used.ptr);
+            bool specialized=false;
+            if constexpr (std::is_same_v<T,float> && std::is_same_v<Real,float>) {
+                if (out.size()<=UINT32_MAX && in.size<=UINT32_MAX) {
+                    if (output.dim==3)
+                        geometry_kernel<T,Real,3,std::uint32_t><<<blocks(out.size()),256,0,vcr::device::stream()>>>(input.ptr,out.view<T>().ptr,in,output,src.shape[0],args,field,pad,used.ptr);
+                    else
+                        geometry_kernel<T,Real,2,std::uint32_t><<<blocks(out.size()),256,0,vcr::device::stream()>>>(input.ptr,out.view<T>().ptr,in,output,src.shape[0],args,field,pad,used.ptr);
+                    specialized=true;
+                }
+            }
+            if (!specialized) geometry_kernel<<<blocks(out.size()),256,0,vcr::device::stream()>>>(input.ptr,out.view<T>().ptr,in,output,src.shape[0],args,field,pad,used.ptr);
             check(cudaGetLastError());
             if (used.size) { used.download(&used_host); require(!used_host,"value is not representable in target dtype"); }
         });

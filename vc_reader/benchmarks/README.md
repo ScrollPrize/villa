@@ -90,6 +90,150 @@ to `geometry_kernel`, 19.5% to `expand_controls`, and 10.4% to
 `field_energy_gradient`. These existing geometry/elastic kernels remain the
 main GPU costs. Profiling includes warmup and is excluded from the timing table.
 
+## CUDA geometry work reduction
+
+The next pass after `f0f71d65b` removes repeated work in elastic construction and
+resampling. It keeps the same lattice, seeds, image/field dtypes, cubic-spline
+and linear interpolants, requested RMS strength, and gradient cap. Changes are in
+`cpp/augment/cuda/elastic.cu` and `cpp/augment/cuda/geometry.cu`:
+
+- Expand the outer B-spline axis once per voxel, sharing its four weights and
+  index calculations across displacement components.
+- Decompose output coordinates once and skip multiplication by an identity
+  matrix. Specialize ordinary float32 2D/3D sampling with bounded 32-bit indices.
+- Factor interior bilinear/trilinear interpolation into three/seven axis blends,
+  avoiding repeated corner weights, address construction and bounds checks.
+  Boundary, validity, wider-coordinate and exceptional-value paths remain available.
+- Fuse elastic centering into energy/gradient collection and the final scaling
+  pass, removing a full field write/read. Cap reduction partials at 1024 instead
+  of 8192 for 128³ crops, and reuse neighbor tests across field components.
+  Energy still uses centered values, avoiding cancellation from subtracting
+  squared means. Reduction order and floating-point grouping change.
+
+Linux x86-64, RTX 5090, Release without fast-math; PHercParis4 level 2 at the
+path in the commands below. These are loader/augmentation measurements without
+a model or backward pass. Warm host/OS caches, identical crops and seeds, no
+changes to batch size or transform settings. Baseline extensions were preserved
+from `f0f71d65b` in `/tmp/vc-work-reduction-before` before rebuilding.
+
+| GPU-ready loader | Mean batch ms | p50 ms | p95 ms | Crops/s |
+| --- | ---: | ---: | ---: | ---: |
+| [Before](../docs/benchmarks/work-reduction-loader-before.json) | 4.695 | 4.342 | 5.059 | 851.65 |
+| [After](../docs/benchmarks/work-reduction-loader-after.json) | 2.432 | 2.082 | 2.904 | 1643.53 |
+
+Three timed epochs of 64 batches × four 128³ crops, after a validation/warmup
+epoch: **93.0% higher loader throughput**. Epoch startup and disposal remain
+included; the JSON contains all samples and min/max. Run-to-run scheduling and
+desktop GPU activity contribute jitter; these are not confidence intervals.
+
+| Resident elastic, random float32 128³ | Mean ms | p50 ms | p95 ms |
+| --- | ---: | ---: | ---: |
+| [Before](../docs/benchmarks/work-reduction-geometry-before.json) | 0.858 | 0.837 | 0.988 |
+| [After](../docs/benchmarks/work-reduction-geometry-after.json) | 0.243 | 0.231 | 0.346 |
+
+200 synchronous calls per case after 20 warmups, rotating case order:
+**3.53× faster mean elastic time**. Flip kernels are unchanged; their short-call
+wall times are dominated by host overhead and jitter.
+
+The separate 12-transform heavy pipeline uses three real CT crops × three
+repetitions, one warmup, host outputs and cleared CUDA chunk caches:
+
+| Route | Build | Augment mean ms | p50 ms | p95 ms | Total mean ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| CUDA | Before | 2.222 | 2.174 | 2.465 | 3.929 |
+| CUDA | After | 1.438 | 1.368 | 1.749 | 3.136 |
+| Hybrid | Before | 2.306 | 2.241 | 2.536 | 3.544 |
+| Hybrid | After | 1.337 | 1.330 | 1.391 | 2.504 |
+
+The [before](../docs/benchmarks/work-reduction-ct-before.json) and
+[after](../docs/benchmarks/work-reduction-ct-after.json) reports include CPU
+controls, stage distributions, input coordinates and raw samples. Image
+normalization and reader code are unchanged. CPU/CUDA maximum absolute output
+difference on these crops was 9.54e-7; hybrid and CUDA outputs matched exactly.
+
+Separate Nsight Systems profiles cover 32 crops (four warmup and four measured
+batches). Total GPU kernel time fell from **30.016 to 10.276 ms**; these sums
+exclude host work/transfers and are not end-to-end latency.
+
+| Kernel group | Before total ms | After total ms |
+| --- | ---: | ---: |
+| Resampling | 10.072 | 1.650 |
+| B-spline expansion (all axes) | 9.243 | 1.505 |
+| Field energy/gradient | 2.981 | 0.478 |
+| Final energy/gradient reduction | 0.943 | 0.154 |
+| Median filter | 1.799 | 1.803 |
+| Integer reflection | 1.322 | 1.325 |
+
+Median filtering now accounts for 17.5% of kernel time, resampling 16.1%, and
+reflection 12.9%. See the full [before](../docs/benchmarks/work-reduction-profile-before.csv)
+and [after](../docs/benchmarks/work-reduction-profile-after.csv) kernel/API reports,
+with [before](../docs/benchmarks/work-reduction-profile-before.json) and
+[after](../docs/benchmarks/work-reduction-profile-after.json) profiling configurations.
+Instrumented wall timings are excluded from the performance comparisons.
+
+Across three random 128³ reference images, maximum change from the old CUDA
+elastic output was 7.99e-6, with RMSE at most 1.59e-7. All 6,291,456 sampled label
+voxels matched in this comparison; this is not a guarantee at every nearest
+boundary. New plans replay exactly on the same backend. The VCA2 format and
+field size are unchanged, so old VCA2 records still load, but replayed image
+interpolation may round differently. This does not measure model quality.
+
+Reproduce using existing configured builds and dependencies, from `vc_reader/`:
+
+```bash
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-reader-cuda --parallel 4
+VC_BENCH_VOLUME=/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr
+
+AGENTS_AGENT_MODE=1 .venv/bin/python benchmarks/bench_cuda_geometry.py \
+  --native-dir /tmp/vc-work-reduction-before --warmup 20 --reps 200 \
+  --snapshot /tmp/work-reduction-reference.npz --output /tmp/work-reduction-geometry-before.json
+AGENTS_AGENT_MODE=1 .venv/bin/python benchmarks/bench_cuda_geometry.py \
+  --native-dir /tmp/vc-reader-cuda --warmup 20 --reps 200 \
+  --reference /tmp/work-reduction-reference.npz --allow-differences \
+  --output /tmp/work-reduction-geometry-after.json
+
+# Repeat with the preserved baseline directory and a separate output filename.
+AGENTS_AGENT_MODE=1 .venv/bin/python benchmarks/bench_torch.py \
+  --native-dir /tmp/vc-reader-cuda --modes prefetch --array "$VC_BENCH_VOLUME" \
+  --level 2 --batches 64 --batch-size 4 --reps 3 --output /tmp/work-reduction-loader-after.json
+AGENTS_AGENT_MODE=1 .venv/bin/python benchmarks/bench_pipeline.py \
+  --suite pipeline --backend both --native-dir /tmp/vc-reader-cuda \
+  --array "$VC_BENCH_VOLUME" --level 2 --start 9000 3600 3600 \
+  --shape 128 128 128 --crops 3 --jitter 256 --warmup 1 --reps 3 \
+  --threads 8 --memory-cache-mib 0 --cuda-cache clear --augmentation heavy \
+  --pipeline-read box --include-hybrid --output /tmp/work-reduction-ct-after.json
+
+AGENTS_AGENT_MODE=1 nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
+  --force-overwrite=true --output=/tmp/work-reduction-profile-after \
+  .venv/bin/python benchmarks/bench_torch.py --native-dir /tmp/vc-reader-cuda \
+  --modes prefetch --array "$VC_BENCH_VOLUME" --level 2 \
+  --batches 4 --batch-size 4 --reps 1 --output /tmp/work-reduction-profile-after.json
+nsys stats --report cuda_gpu_kern_sum,cuda_api_sum --format csv \
+  /tmp/work-reduction-profile-after.nsys-rep > /tmp/work-reduction-profile-after.csv
+
+AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=/tmp/vc-reader-cuda \
+  .venv/bin/python tests/test_precision.py -v
+AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=/tmp/vc-reader-cuda \
+  .venv/bin/python tests/test_torch.py -v
+AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=/tmp/vc-reader-cuda \
+  /usr/local/cuda/bin/compute-sanitizer --tool memcheck --error-exitcode 1 \
+  .venv/bin/python tests/test_precision.py \
+  PrecisionTests.test_elastic_field_strength_and_gradient \
+  PrecisionTests.test_geometry_multilinear_and_boundaries -v
+```
+
+Nine precision tests pass on both CPU-only and CUDA builds, and all 18 loader
+tests pass with CUDA (CPU-only: two pass, 16 skip). Compute Sanitizer reports zero
+memory errors for the two added geometry/field tests. The CPU-only check used
+the existing augmentation-only `/tmp/vc-volume-cpu` build with the CPU reader
+extension from `build/cp314-cp314-linux_x86_64`, staged together in
+`/tmp/vc-work-reduction-cpu` for `VC_READER_NATIVE_DIR`. New checks cover
+elastic mean/RMS/gradient limits, singleton/non-cubic 2D/3D grids, noninteger
+knot spacing, capped reductions, multichannel interpolation against analytic
+multilinear functions, boundary fills, validity masks, int64 labels and replay.
+macOS/arm64 and other GPU architectures were not measured. The pre-existing
+intermittent Python 3.14 semaphore cleanup warning also occurred in this loader run.
+
 ## CUDA geometry optimizations
 
 The precision pass builds on exact integer flips and float32 elastic construction.

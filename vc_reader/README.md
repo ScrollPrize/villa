@@ -100,6 +100,12 @@ will vary with storage, chunking, and cache reuse.
 See the [benchmark guide](benchmarks/README.md) for methodology, dependencies,
 commands, augmentation parameters, and complete timing reports.
 
+The latest [CUDA geometry measurements](benchmarks/README.md#cuda-geometry-work-reduction)
+show **1,644 crops/s** for GPU-ready batches of four 128³ crops, up from 852,
+and **3.53× faster elastic augmentation**. This loader chain uses normalization,
+elastic, median, flip and gamma; it includes no model/backward pass. The tables
+below retain the earlier reader and 12-transform pipeline measurements.
+
 ### Reading and sampling
 
 Median milliseconds per request, including sampling where needed. TensorStore

@@ -1,0 +1,735 @@
+{
+  "schema_version": 2,
+  "suite": "pipeline",
+  "command": [
+    "/home/sean/Documents/villa2/villa/vc_reader/.venv/bin/python",
+    "benchmarks/bench_pipeline.py",
+    "--suite",
+    "pipeline",
+    "--backend",
+    "both",
+    "--native-dir",
+    "/tmp/vc-reader-cuda",
+    "--array",
+    "/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+    "--level",
+    "2",
+    "--start",
+    "9000",
+    "3600",
+    "3600",
+    "--shape",
+    "128",
+    "128",
+    "128",
+    "--crops",
+    "3",
+    "--jitter",
+    "256",
+    "--warmup",
+    "1",
+    "--reps",
+    "3",
+    "--threads",
+    "8",
+    "--memory-cache-mib",
+    "0",
+    "--cuda-cache",
+    "clear",
+    "--augmentation",
+    "heavy",
+    "--pipeline-read",
+    "box",
+    "--include-hybrid",
+    "--output",
+    "/tmp/work-reduction-ct-after.json"
+  ],
+  "config": {
+    "suite": "pipeline",
+    "baselines": [
+      "tensorstore",
+      "zarr"
+    ],
+    "workloads": [
+      "ml_batch",
+      "plane",
+      "slab",
+      "rotated_box"
+    ],
+    "surface": "/home/sean/Documents/villa2/villa/vc_reader/benchmarks/fixtures/fiber_132487",
+    "surface_size": [
+      96,
+      512
+    ],
+    "surface_coordinate_scale": 1.0,
+    "batch_size": 8,
+    "plane_size": [
+      256,
+      256
+    ],
+    "slab_depth": 16,
+    "augmentation": "heavy",
+    "pipeline_read": "box",
+    "include_hybrid": true,
+    "array": "/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+    "level": "2",
+    "backend": "both",
+    "shape": [
+      128,
+      128,
+      128
+    ],
+    "start": [
+      9000.0,
+      3600.0,
+      3600.0
+    ],
+    "crops": 3,
+    "jitter": 256.0,
+    "angle": 10,
+    "normalization": "minmax",
+    "reps": 3,
+    "warmup": 1,
+    "threads": 8,
+    "seed": 123,
+    "memory_cache_mib": 0,
+    "cuda_cache_mib": 512,
+    "cuda_cache": "clear",
+    "cuda_output": "host",
+    "device": 0,
+    "native_dir": "/tmp/vc-reader-cuda",
+    "output": "/tmp/work-reduction-ct-after.json"
+  },
+  "environment": {
+    "python": "3.14.4 (main, Aug 20 2026, 10:41:58) [GCC 15.2.0]",
+    "numpy": "2.5.4",
+    "platform": "Linux-7.0.0-30-generic-x86_64-with-glibc2.43",
+    "processor": "",
+    "cpu_count": 24,
+    "affinity": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23
+    ],
+    "extensions": {
+      "reader": {
+        "path": "/tmp/vc-reader-cuda/_native.cpython-314-x86_64-linux-gnu.so",
+        "sha256": "61987e8540abcbeb170889ba069b936752839c4c34db04931f4ed192ea9183fc"
+      },
+      "augment": {
+        "path": "/tmp/vc-reader-cuda/_augment.cpython-314-x86_64-linux-gnu.so",
+        "sha256": "e47d51a474b4ade2a8100f3f2db45aef51296b2653e4a31d89f9c63831217ba3"
+      }
+    },
+    "build": {
+      "CMAKE_BUILD_TYPE": "Release",
+      "CMAKE_CUDA_ARCHITECTURES": "120",
+      "CMAKE_CXX_COMPILER": "/usr/bin/c++",
+      "VC_READER_ENABLE_CUDA": "ON"
+    },
+    "gpus": [
+      "0, NVIDIA GeForce RTX 5090, 595.84"
+    ]
+  },
+  "transforms": [
+    "Elastic(sigma=12, magnitude=2, border=True)",
+    "MedianFilter(3)",
+    "Flip(axes='x', p_axis=1)",
+    "GaussianBlur(0.7)",
+    "BrightnessMultiply(1.1)",
+    "BrightnessAdd(0.03)",
+    "Contrast(1.15)",
+    "Gamma(0.9)",
+    "LocalContrast(12, loc=0.5, factor=1.1)",
+    "LocalSmoothing(12, loc=0.5, strength=0.3, sigma=1)",
+    "Sharpen(0.1, p_clamp=0)",
+    "LowResolution(0.85)"
+  ],
+  "protocol": {
+    "timing": "synchronous wall time; fused read/sample, separate normalization and augmentation calls",
+    "included": "chunk I/O/decode, planning, allocations, sampling, normalization, augmentation; CUDA upload on cache misses",
+    "excluded": "input generation, reader/pipeline construction, validation, warmup, cache clearing, output destruction",
+    "caches": "host and OS caches are not flushed; warm CUDA cache may evict if its budget is too small",
+    "order": "backend order rotates each repetition; identical crops and seeds",
+    "routes": "cpu: CPU read/normalize/augment; cuda: device chunks; hybrid: CPU read/sample + upload, CUDA normalize/augment",
+    "hybrid_upload": "box: uint8 crop uploaded then cast on GPU; affine: CPU-sampled float32 crop uploaded",
+    "throughput": "output voxels and float32 output bytes, not storage or PCIe bandwidth",
+    "speedup": "CPU / CUDA p50 latency; >1 means CUDA is faster",
+    "endpoints": "CPU host; CUDA host"
+  },
+  "validation": {
+    "atol": 5e-05,
+    "rtol": 1e-05,
+    "crops": [
+      {
+        "crop": 0,
+        "sha256": {
+          "cpu": "dedc017381b326316c56dddf839456b2b6a90afa96e17148f1004987fb598032",
+          "cuda": "e2257bcd3dc7be82288101c97bd88c354a80cc897a14c5ea76b9a5e5d9bbb9fa",
+          "hybrid": "e2257bcd3dc7be82288101c97bd88c354a80cc897a14c5ea76b9a5e5d9bbb9fa"
+        },
+        "reference": "cpu",
+        "comparisons": {
+          "cuda": {
+            "max_abs": 8.940696716308594e-07,
+            "rmse": 5.096772759767928e-08
+          },
+          "hybrid": {
+            "max_abs": 8.940696716308594e-07,
+            "rmse": 5.096772759767928e-08
+          }
+        },
+        "max_abs": 8.940696716308594e-07,
+        "rmse": 5.096772759767928e-08
+      },
+      {
+        "crop": 1,
+        "sha256": {
+          "cpu": "c7310b27b9b4d93e42709c0577fe725485cef5056b9f5370173e767c74a3c128",
+          "cuda": "dadd4842863c6b63256d3f8a44b1edd279e4422af14d4c7b363149c5eaffdb6d",
+          "hybrid": "dadd4842863c6b63256d3f8a44b1edd279e4422af14d4c7b363149c5eaffdb6d"
+        },
+        "reference": "cpu",
+        "comparisons": {
+          "cuda": {
+            "max_abs": 7.599592208862305e-07,
+            "rmse": 4.695125893183115e-08
+          },
+          "hybrid": {
+            "max_abs": 7.599592208862305e-07,
+            "rmse": 4.695125893183115e-08
+          }
+        },
+        "max_abs": 7.599592208862305e-07,
+        "rmse": 4.695125893183115e-08
+      },
+      {
+        "crop": 2,
+        "sha256": {
+          "cpu": "dd9806db63870a17a1b3d816c70ea00446f2aaada312d1c1370062e7cb92f325",
+          "cuda": "bf6376b4c28f2ca224909ac196983945deb6fefc025e42265a2577e134c507ca",
+          "hybrid": "bf6376b4c28f2ca224909ac196983945deb6fefc025e42265a2577e134c507ca"
+        },
+        "reference": "cpu",
+        "comparisons": {
+          "cuda": {
+            "max_abs": 9.5367431640625e-07,
+            "rmse": 5.277824909074956e-08
+          },
+          "hybrid": {
+            "max_abs": 9.5367431640625e-07,
+            "rmse": 5.277824909074956e-08
+          }
+        },
+        "max_abs": 9.5367431640625e-07,
+        "rmse": 5.277824909074956e-08
+      }
+    ],
+    "comparison": "cpu/cuda/hybrid allclose"
+  },
+  "results": {
+    "cpu": {
+      "timings": {
+        "read_sample": {
+          "mean_ms": 0.5036448888888888,
+          "p50_ms": 0.397186,
+          "p95_ms": 0.7803859999999999,
+          "min_ms": 0.3543,
+          "max_ms": 0.849688
+        },
+        "normalization": {
+          "mean_ms": 2.8416846666666666,
+          "p50_ms": 2.80946,
+          "p95_ms": 3.0335958,
+          "min_ms": 2.732283,
+          "max_ms": 3.084243
+        },
+        "augmentation": {
+          "mean_ms": 149.9275488888889,
+          "p50_ms": 149.704313,
+          "p95_ms": 150.7700878,
+          "min_ms": 149.22609,
+          "max_ms": 150.852909
+        },
+        "download": {
+          "mean_ms": 0.0,
+          "p50_ms": 0.0,
+          "p95_ms": 0.0,
+          "min_ms": 0.0,
+          "max_ms": 0.0
+        },
+        "total": {
+          "mean_ms": 153.27300411111113,
+          "p50_ms": 153.029612,
+          "p95_ms": 154.309317,
+          "min_ms": 152.397157,
+          "max_ms": 154.422469
+        }
+      },
+      "samples": 9,
+      "raw_ms": [
+        {
+          "repetition": 0,
+          "crop": 0,
+          "read_sample": 0.374953,
+          "normalization": 2.80946,
+          "augmentation": 150.852909,
+          "download": 0.0,
+          "total": 154.037361
+        },
+        {
+          "repetition": 0,
+          "crop": 1,
+          "read_sample": 0.849688,
+          "normalization": 2.957625,
+          "augmentation": 150.615115,
+          "download": 0.0,
+          "total": 154.422469
+        },
+        {
+          "repetition": 0,
+          "crop": 2,
+          "read_sample": 0.660982,
+          "normalization": 2.832501,
+          "augmentation": 150.645856,
+          "download": 0.0,
+          "total": 154.139589
+        },
+        {
+          "repetition": 1,
+          "crop": 0,
+          "read_sample": 0.366775,
+          "normalization": 2.784596,
+          "augmentation": 149.245746,
+          "download": 0.0,
+          "total": 152.397157
+        },
+        {
+          "repetition": 1,
+          "crop": 1,
+          "read_sample": 0.3543,
+          "normalization": 2.862871,
+          "augmentation": 149.22609,
+          "download": 0.0,
+          "total": 152.443315
+        },
+        {
+          "repetition": 1,
+          "crop": 2,
+          "read_sample": 0.676433,
+          "normalization": 3.084243,
+          "augmentation": 149.704313,
+          "download": 0.0,
+          "total": 153.465134
+        },
+        {
+          "repetition": 2,
+          "crop": 0,
+          "read_sample": 0.397186,
+          "normalization": 2.77501,
+          "augmentation": 149.537368,
+          "download": 0.0,
+          "total": 152.709674
+        },
+        {
+          "repetition": 2,
+          "crop": 1,
+          "read_sample": 0.375542,
+          "normalization": 2.736573,
+          "augmentation": 149.700248,
+          "download": 0.0,
+          "total": 152.812726
+        },
+        {
+          "repetition": 2,
+          "crop": 2,
+          "read_sample": 0.476945,
+          "normalization": 2.732283,
+          "augmentation": 149.820295,
+          "download": 0.0,
+          "total": 153.029612
+        }
+      ],
+      "crops_per_second": 6.524306128136414,
+      "mvoxels_per_second": 13.682461645233536,
+      "output_gib_per_second": 0.05097114162606573
+    },
+    "cuda": {
+      "timings": {
+        "read_sample": {
+          "mean_ms": 0.9844815555555555,
+          "p50_ms": 0.968561,
+          "p95_ms": 1.1557206,
+          "min_ms": 0.724612,
+          "max_ms": 1.171555
+        },
+        "normalization": {
+          "mean_ms": 0.12085522222222224,
+          "p50_ms": 0.126045,
+          "p95_ms": 0.1303572,
+          "min_ms": 0.084088,
+          "max_ms": 0.131986
+        },
+        "augmentation": {
+          "mean_ms": 1.4378931111111113,
+          "p50_ms": 1.368191,
+          "p95_ms": 1.7485865999999999,
+          "min_ms": 1.310727,
+          "max_ms": 1.840259
+        },
+        "download": {
+          "mean_ms": 0.5931438888888888,
+          "p50_ms": 0.57579,
+          "p95_ms": 0.6907698,
+          "min_ms": 0.551279,
+          "max_ms": 0.737569
+        },
+        "total": {
+          "mean_ms": 3.1363737777777776,
+          "p50_ms": 3.081566,
+          "p95_ms": 3.5660464,
+          "min_ms": 2.670706,
+          "max_ms": 3.67255
+        }
+      },
+      "samples": 9,
+      "raw_ms": [
+        {
+          "repetition": 0,
+          "crop": 0,
+          "read_sample": 0.925832,
+          "normalization": 0.123202,
+          "augmentation": 1.359779,
+          "download": 0.603229,
+          "total": 3.012042
+        },
+        {
+          "repetition": 0,
+          "crop": 1,
+          "read_sample": 1.131969,
+          "normalization": 0.126868,
+          "augmentation": 1.368893,
+          "download": 0.620571,
+          "total": 3.248301
+        },
+        {
+          "repetition": 0,
+          "crop": 2,
+          "read_sample": 1.171555,
+          "normalization": 0.131986,
+          "augmentation": 1.380024,
+          "download": 0.55199,
+          "total": 3.235555
+        },
+        {
+          "repetition": 1,
+          "crop": 0,
+          "read_sample": 0.724612,
+          "normalization": 0.084088,
+          "augmentation": 1.310727,
+          "download": 0.551279,
+          "total": 2.670706
+        },
+        {
+          "repetition": 1,
+          "crop": 1,
+          "read_sample": 0.871126,
+          "normalization": 0.121188,
+          "augmentation": 1.358468,
+          "download": 0.559608,
+          "total": 2.91039
+        },
+        {
+          "repetition": 1,
+          "crop": 2,
+          "read_sample": 1.086886,
+          "normalization": 0.127914,
+          "augmentation": 1.611078,
+          "download": 0.580413,
+          "total": 3.406291
+        },
+        {
+          "repetition": 2,
+          "crop": 0,
+          "read_sample": 1.01154,
+          "normalization": 0.126045,
+          "augmentation": 1.368191,
+          "download": 0.57579,
+          "total": 3.081566
+        },
+        {
+          "repetition": 2,
+          "crop": 1,
+          "read_sample": 0.968253,
+          "normalization": 0.126469,
+          "augmentation": 1.840259,
+          "download": 0.737569,
+          "total": 3.67255
+        },
+        {
+          "repetition": 2,
+          "crop": 2,
+          "read_sample": 0.968561,
+          "normalization": 0.119937,
+          "augmentation": 1.343619,
+          "download": 0.557846,
+          "total": 2.989963
+        }
+      ],
+      "crops_per_second": 318.83954874426104,
+      "mvoxels_per_second": 668.6549973281245,
+      "output_gib_per_second": 2.4909339745645394
+    },
+    "hybrid": {
+      "timings": {
+        "read_sample": {
+          "mean_ms": 0.5024416666666667,
+          "p50_ms": 0.537685,
+          "p95_ms": 0.6151242,
+          "min_ms": 0.34273,
+          "max_ms": 0.630485
+        },
+        "normalization": {
+          "mean_ms": 0.107769,
+          "p50_ms": 0.091425,
+          "p95_ms": 0.17226499999999997,
+          "min_ms": 0.086259,
+          "max_ms": 0.199515
+        },
+        "augmentation": {
+          "mean_ms": 1.3371199999999999,
+          "p50_ms": 1.330003,
+          "p95_ms": 1.3906334,
+          "min_ms": 1.315679,
+          "max_ms": 1.426779
+        },
+        "download": {
+          "mean_ms": 0.5570187777777778,
+          "p50_ms": 0.55594,
+          "p95_ms": 0.5927026,
+          "min_ms": 0.525209,
+          "max_ms": 0.606001
+        },
+        "total": {
+          "mean_ms": 2.5043494444444447,
+          "p50_ms": 2.508993,
+          "p95_ms": 2.6391824,
+          "min_ms": 2.302184,
+          "max_ms": 2.663418
+        }
+      },
+      "samples": 9,
+      "raw_ms": [
+        {
+          "repetition": 0,
+          "crop": 0,
+          "read_sample": 0.39868,
+          "normalization": 0.088452,
+          "augmentation": 1.315679,
+          "download": 0.606001,
+          "total": 2.408812
+        },
+        {
+          "repetition": 0,
+          "crop": 1,
+          "read_sample": 0.592083,
+          "normalization": 0.095655,
+          "augmentation": 1.336415,
+          "download": 0.560762,
+          "total": 2.584915
+        },
+        {
+          "repetition": 0,
+          "crop": 2,
+          "read_sample": 0.630485,
+          "normalization": 0.095256,
+          "augmentation": 1.334744,
+          "download": 0.542344,
+          "total": 2.602829
+        },
+        {
+          "repetition": 1,
+          "crop": 0,
+          "read_sample": 0.537685,
+          "normalization": 0.091425,
+          "augmentation": 1.330003,
+          "download": 0.525209,
+          "total": 2.484322
+        },
+        {
+          "repetition": 1,
+          "crop": 1,
+          "read_sample": 0.34273,
+          "normalization": 0.086259,
+          "augmentation": 1.317255,
+          "download": 0.55594,
+          "total": 2.302184
+        },
+        {
+          "repetition": 1,
+          "crop": 2,
+          "read_sample": 0.475797,
+          "normalization": 0.199515,
+          "augmentation": 1.332318,
+          "download": 0.572755,
+          "total": 2.580385
+        },
+        {
+          "repetition": 2,
+          "crop": 0,
+          "read_sample": 0.54344,
+          "normalization": 0.13139,
+          "augmentation": 1.426779,
+          "download": 0.561809,
+          "total": 2.663418
+        },
+        {
+          "repetition": 2,
+          "crop": 1,
+          "read_sample": 0.45139,
+          "normalization": 0.090671,
+          "augmentation": 1.322795,
+          "download": 0.538431,
+          "total": 2.403287
+        },
+        {
+          "repetition": 2,
+          "crop": 2,
+          "read_sample": 0.549685,
+          "normalization": 0.091298,
+          "augmentation": 1.318092,
+          "download": 0.549918,
+          "total": 2.508993
+        }
+      ],
+      "crops_per_second": 399.3052975168313,
+      "mvoxels_per_second": 837.4039032980178,
+      "output_gib_per_second": 3.1195726368502443
+    }
+  },
+  "input": {
+    "location": "/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+    "shape": [
+      18946,
+      8174,
+      8174
+    ],
+    "chunks": [
+      128,
+      128,
+      128
+    ],
+    "dtype": "uint8",
+    "origins": [
+      [
+        9000,
+        3600,
+        3600
+      ],
+      [
+        9093,
+        3371,
+        3456
+      ],
+      [
+        8838,
+        3434,
+        3759
+      ]
+    ],
+    "axes": [
+      [
+        1.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        1.0,
+        -0.0
+      ],
+      [
+        0.0,
+        0.0,
+        1.0
+      ]
+    ]
+  },
+  "cache_stats": {
+    "before_measurement": {
+      "host": {
+        "memory_hits": 0,
+        "pending_hits": 0,
+        "pending_writes": 0,
+        "disk_hits": 120,
+        "remote_fetches": 0,
+        "remote_missing": 0,
+        "remote_bytes": 0,
+        "write_errors": 0,
+        "last_write_error": ""
+      },
+      "cuda": {
+        "cache_bytes": 0,
+        "cache_budget": 536870912,
+        "cache_hits": 0,
+        "chunk_uploads": 700,
+        "uploaded_bytes": 22937600,
+        "cpu_routes": 6,
+        "gpu_routes": 6
+      }
+    },
+    "after_measurement": {
+      "host": {
+        "memory_hits": 0,
+        "pending_hits": 0,
+        "pending_writes": 0,
+        "disk_hits": 300,
+        "remote_fetches": 0,
+        "remote_missing": 0,
+        "remote_bytes": 0,
+        "write_errors": 0,
+        "last_write_error": ""
+      },
+      "cuda": {
+        "cache_bytes": 4096000,
+        "cache_budget": 536870912,
+        "cache_hits": 0,
+        "chunk_uploads": 1750,
+        "uploaded_bytes": 57344000,
+        "cpu_routes": 15,
+        "gpu_routes": 15
+      }
+    }
+  },
+  "speedup_cpu_over_cuda": {
+    "read_sample": 0.4100784565969515,
+    "normalization": 22.289341108334327,
+    "augmentation": 109.4177004526415,
+    "total": 49.65968991090893
+  },
+  "speedup_over_hybrid": {
+    "cpu": 60.992442784814465,
+    "cuda": 1.2282082891422974
+  }
+}

@@ -1,5 +1,6 @@
 """Numerical contracts for float32 execution and justified wider arithmetic."""
 import os
+import io
 from pathlib import Path
 import pickle
 import sys
@@ -13,6 +14,30 @@ if os.environ.get('VC_READER_NATIVE_DIR'):
     load_extensions(Path(os.environ['VC_READER_NATIVE_DIR']))
 
 from vc_reader import augment as A
+
+
+def elastic_field(plan):
+    """Read the field from a single Elastic VCA2 record for independent checks."""
+    stream = io.BytesIO(plan._native.dump())
+    assert stream.read(4) == b'VCA2'
+
+    def number():
+        return int.from_bytes(stream.read(8), 'little')
+
+    def skip_vector(width):
+        stream.seek(number()*width, 1)
+
+    for _ in range(number()):  # Input names, shapes, kinds and item sizes.
+        skip_vector(1)
+        skip_vector(8)
+        stream.read(16)
+    assert number() == 1
+    skip_vector(8)  # Transform path.
+    assert number() == 0  # Elastic has no per-channel parameters.
+    shape = tuple(number() for _ in range(number()))
+    skip_vector(8)  # Matrix.
+    skip_vector(8)  # Offset.
+    return np.frombuffer(stream.read(number()*4), dtype='<f4').reshape(*shape, len(shape)).astype(np.float64)
 
 
 class PrecisionTests(unittest.TestCase):
@@ -93,6 +118,69 @@ class PrecisionTests(unittest.TestCase):
             if len(results) == 2:
                 for key in results['cpu']:
                     np.testing.assert_allclose(results['cpu'][key], results['cuda'][key], atol=5e-5, rtol=1e-5)
+
+    def test_elastic_field_strength_and_gradient(self):
+        # Include tiny grids, singleton axes, noninteger knot spacing and a
+        # volume large enough to exercise the capped CUDA reduction grid.
+        for shape in ((1, 1), (1, 7), (7, 9), (1, 1, 1), (1, 7, 9),
+                      (5, 1, 9), (9, 11, 13), (65, 67, 69)):
+            sample = {'image': np.zeros((1, *shape), dtype=np.float32)}
+            for sigma, magnitude in ((.5, .2), (2.3, 20), (12, 2)):
+                fields = {}
+                for backend in self.backends():
+                    with self.subTest(shape=shape, sigma=sigma, magnitude=magnitude, backend=backend):
+                        pipeline = A.Pipeline([A.Elastic(sigma, magnitude)], backend=backend)
+                        plan = pipeline.sample(sample, seed=173)
+                        field = elastic_field(plan)
+                        self.assertTrue(np.isfinite(field).all())
+                        np.testing.assert_allclose(field.mean(axis=tuple(range(len(shape)))), 0, atol=2e-5)
+                        rms = np.sqrt(np.mean(np.sum(field*field, axis=-1)))
+                        self.assertLessEqual(rms, magnitude+2e-5)
+                        row_bounds = np.zeros(len(shape))
+                        for axis, extent in enumerate(shape):
+                            if extent > 1:
+                                row_bounds += np.abs(np.diff(field, axis=axis)).reshape(-1, len(shape)).max(axis=0)
+                        self.assertLessEqual(row_bounds.max(), .8+2e-5)
+                        # At least one of the strength/gradient limits is active
+                        # except for a single voxel, whose centered field is zero.
+                        if np.prod(shape) > 1:
+                            self.assertTrue(abs(rms-magnitude) < 2e-5 or abs(row_bounds.max()-.8) < 2e-5)
+                        fields[backend] = field
+                if len(fields) == 2:
+                    np.testing.assert_allclose(fields['cuda'], fields['cpu'], atol=3e-5, rtol=1e-5)
+
+    def test_geometry_multilinear_and_boundaries(self):
+        for shape in ((7, 9), (5, 7, 9), (1, 7, 9), (5, 1, 9)):
+            grid = np.indices(shape, dtype=np.float64)
+            scale = np.maximum(np.array(shape)-1, 1).reshape(-1, *([1]*len(shape)))
+            polynomial = np.prod(1+grid/scale, axis=0)
+            image = np.stack([polynomial, -2*polynomial]).astype(np.float32)
+            label = np.arange(np.prod(shape), dtype=np.int64).reshape(1, *shape)+(1 << 40)
+            valid = np.ones((1, *shape), dtype=np.uint8)
+            valid.reshape(-1)[::11] = 0
+            for border in (False, True):
+                for translation in (0, .5, -.375, 20):
+                    outputs = {}
+                    for backend in self.backends():
+                        with self.subTest(shape=shape, border=border, translation=translation, backend=backend):
+                            transform = A.Affine(translate=translation, border=border)
+                            pipeline = A.Pipeline([transform], backend=backend,
+                                                  targets={'image': A.Image(fill=-7, valid=None),
+                                                           'mask': A.Label(fill=-9), 'padding_mask': A.ValidMask()})
+                            sample = {'image': image, 'mask': label, 'padding_mask': valid}
+                            out = pipeline(sample, seed=1)
+                            replay = pickle.loads(pickle.dumps(pipeline.sample(sample, seed=1))).apply(sample)
+                            for key in sample:
+                                np.testing.assert_array_equal(out[key], replay[key])
+                            if border:
+                                q = np.clip(grid-translation, 0, np.array(shape).reshape(scale.shape)-1)
+                                expected = np.prod(1+q/scale, axis=0)
+                                np.testing.assert_allclose(out['image'], np.stack([expected, -2*expected]), atol=2e-6, rtol=1e-6)
+                            outputs[backend] = out
+                    if len(outputs) == 2:
+                        np.testing.assert_allclose(outputs['cuda']['image'], outputs['cpu']['image'], atol=2e-6, rtol=1e-6)
+                        for key in ('mask', 'padding_mask'):
+                            np.testing.assert_array_equal(outputs['cuda'][key], outputs['cpu'][key])
 
     def test_resize_exact_half_voxel_ties(self):
         # 128 -> 109 maps output x=54 to source 63.5 exactly. Floating
