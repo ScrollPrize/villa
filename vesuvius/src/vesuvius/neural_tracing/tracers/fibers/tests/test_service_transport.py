@@ -49,6 +49,12 @@ def test_one_json_line_per_connection(monkeypatch):
         path.unlink(missing_ok=True)
 
 
+def test_socket_path_too_long_is_a_clear_error():
+    assert service._sockaddr_un('x'*107).sun_path == b'x'*107
+    with pytest.raises(OSError, match='too long'):
+        service._sockaddr_un('x'*108)  # would fill sun_path with no terminating NUL
+
+
 def test_parent_check_follows_a_live_then_ended_process():
     child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
     try:

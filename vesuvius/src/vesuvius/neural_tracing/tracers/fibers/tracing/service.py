@@ -279,7 +279,10 @@ def _sockaddr_un(path):
 
     class SockaddrUn(ctypes.Structure):
         _fields_ = [('sun_family', ctypes.c_ushort), ('sun_path', ctypes.c_char*108)]
-    return SockaddrUn(1, os.fsencode(path))
+    raw = os.fsencode(path)
+    if len(raw) >= 108:  # sun_path holds 107 bytes and the terminating NUL
+        raise OSError(f'socket path is too long for AF_UNIX ({len(raw)} bytes, at most 107): {path}')
+    return SockaddrUn(1, raw)
 
 
 if hasattr(socketserver, 'UnixStreamServer'):

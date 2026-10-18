@@ -60,9 +60,11 @@ def test_blocking_lock_waits_for_release(tmp_path):
 
     thread = threading.Thread(target=waiter)
     thread.start()
-    thread.join(.5)
-    assert thread.is_alive()
-    order.append('released')
-    first.close()
+    try:
+        thread.join(.5)
+        assert thread.is_alive()
+        order.append('released')
+    finally:
+        first.close()
     thread.join(60)
     assert order == ['released', 'waiter']
