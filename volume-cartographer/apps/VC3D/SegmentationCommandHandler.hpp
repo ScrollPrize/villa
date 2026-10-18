@@ -336,6 +336,21 @@ public:
     bool cropSurfaceToValidRegion(const std::string& segmentId,
                                   QString* errorMessage = nullptr);
 
+    /// Grid transforms offered by the segment context menu's Flip and Rotate
+    /// entries. The "Normals (H Flip)" entry is FlipV.
+    enum class SurfaceTransform { FlipU, FlipV, Rotate90 };
+
+    /// Dialog-free core of onFlipSurface / onRotateSurface. Applies the
+    /// transform, saves the segment in place and refreshes the shared surface
+    /// state; failures via `errorMessage` (never a dialog). Failure sentences:
+    /// "No volume package or volume loaded", "Invalid segment or segment not
+    /// loaded", "Could not prepare a managed working copy", and save failures.
+    /// A failed save leaves the in-memory surface transformed, matching the
+    /// interactive slots.
+    bool transformSurface(const std::string& segmentId,
+                          SurfaceTransform transform,
+                          QString* errorMessage = nullptr);
+
     /// Dialog-free core of onRenameSurface: renames the segment folder + meta.json
     /// UUID from `oldId` to `newName`, keeping the editing guard, name validation
     /// (^[a-zA-Z0-9_-]+$), collision check, CState/vpkg cleanup, and rollback.
@@ -400,6 +415,10 @@ private:
                                     const GrowPatchSeedParams& params,
                                     bool interactive,
                                     CommandLaunchError* error);
+    bool transformSurfaceImpl(const std::string& segmentId,
+                              SurfaceTransform transform,
+                              bool interactive,
+                              QString* errorMessage);
     bool startAlphaCompRefineImpl(const std::string& segmentId,
                                   const AlphaCompRefineParams& params,
                                   bool interactive,

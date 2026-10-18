@@ -3797,75 +3797,106 @@ bool SegmentationCommandHandler::cropSurfaceToValidRegion(const std::string& seg
 
 void SegmentationCommandHandler::onFlipSurface(const std::string& segmentId, bool flipU)
 {
-    auto* surface = requireSurfaceAndRunner(segmentId, false);
-    if (!surface) return;
-
-    auto surf = _state->vpkg()->getSurface(segmentId);
-
-    if (flipU) {
-        surface->flipU();
-    } else {
-        surface->flipV();
-    }
-
-    try {
-        surface->save(surface->path, true);
-        emit surfaceSavedTo(QString::fromStdString(surface->path.string()));
-    } catch (const std::exception& ex) {
-        QMessageBox::critical(_parentWidget,
-                              tr("Flip failed"),
-                              tr("Failed to save flipped surface %1: %2")
-                                  .arg(QString::fromStdString(segmentId))
-                                  .arg(QString::fromUtf8(ex.what())));
-        return;
-    }
-
-    if (_state) {
-        _state->setSurface(segmentId, surf, false, false);
-        if (_state->activeSurfaceId() == segmentId) {
-            _state->setSurface("segmentation", surf, false, false);
-        }
-    }
-
-    const QString directionLabel = flipU ? tr("vertically") : tr("horizontally");
-    emit statusMessage(
-        tr("Flipped %1 %2")
-            .arg(QString::fromStdString(segmentId))
-            .arg(directionLabel),
-        5000);
+    transformSurfaceImpl(segmentId,
+                         flipU ? SurfaceTransform::FlipU : SurfaceTransform::FlipV,
+                         /*interactive=*/true, nullptr);
 }
 
 void SegmentationCommandHandler::onRotateSurface(const std::string& segmentId)
 {
-    auto* surface = requireSurfaceAndRunner(segmentId, false);
-    if (!surface) return;
+    transformSurfaceImpl(segmentId, SurfaceTransform::Rotate90, /*interactive=*/true, nullptr);
+}
 
+bool SegmentationCommandHandler::transformSurface(const std::string& segmentId,
+                                                  SurfaceTransform transform,
+                                                  QString* errorMessage)
+{
+    return transformSurfaceImpl(segmentId, transform, /*interactive=*/false, errorMessage);
+}
+
+bool SegmentationCommandHandler::transformSurfaceImpl(const std::string& segmentId,
+                                                      SurfaceTransform transform,
+                                                      bool interactive,
+                                                      QString* errorMessage)
+{
+    auto fail = [&](const QString& message) -> bool {
+        if (errorMessage) {
+            *errorMessage = message;
+        }
+        return false;
+    };
+
+    // The checks of requireSurfaceAndRunner, which presents them in dialogs;
+    // the runner is irrelevant to a synchronous transform.
+    if (!_state || _state->currentVolume() == nullptr || !_state->vpkg()) {
+        const QString message = tr("No volume package or volume loaded.");
+        if (interactive) {
+            QMessageBox::warning(_parentWidget, tr("Error"), message);
+        }
+        return fail(message);
+    }
     auto surf = _state->vpkg()->getSurface(segmentId);
-    surface->rotate(90.0f);
+    if (!surf) {
+        const QString message = tr("Invalid segment or segment not loaded: %1")
+                                    .arg(QString::fromStdString(segmentId));
+        if (interactive) {
+            QMessageBox::warning(_parentWidget, tr("Error"), message);
+        }
+        return fail(message);
+    }
+    // The resolver reports its own failure on the status bar.
+    if (_editingDestinationResolver && !_editingDestinationResolver(surf)) {
+        return fail(tr("Could not prepare a managed working copy"));
+    }
+    QuadSurface* surface = surf.get();
 
+    switch (transform) {
+    case SurfaceTransform::FlipU:
+        surface->flipU();
+        break;
+    case SurfaceTransform::FlipV:
+        surface->flipV();
+        break;
+    case SurfaceTransform::Rotate90:
+        surface->rotate(90.0f);
+        break;
+    }
+
+    const QString segLabel = QString::fromStdString(segmentId);
     try {
         surface->save(surface->path, true);
         emit surfaceSavedTo(QString::fromStdString(surface->path.string()));
     } catch (const std::exception& ex) {
-        QMessageBox::critical(_parentWidget,
-                              tr("Rotate failed"),
-                              tr("Failed to save rotated surface %1: %2")
-                                  .arg(QString::fromStdString(segmentId))
-                                  .arg(QString::fromUtf8(ex.what())));
-        return;
-    }
-
-    if (_state) {
-        _state->setSurface(segmentId, surf, false, false);
-        if (_state->activeSurfaceId() == segmentId) {
-            _state->setSurface("segmentation", surf, false, false);
+        const QString detail = QString::fromUtf8(ex.what());
+        const bool rotate = transform == SurfaceTransform::Rotate90;
+        const QString message = rotate
+            ? tr("Failed to save rotated surface %1: %2").arg(segLabel, detail)
+            : tr("Failed to save flipped surface %1: %2").arg(segLabel, detail);
+        if (interactive) {
+            QMessageBox::critical(_parentWidget,
+                                  rotate ? tr("Rotate failed") : tr("Flip failed"),
+                                  message);
         }
+        return fail(message);
     }
 
-    emit statusMessage(
-        tr("Rotated %1 by 90 degrees clockwise")
-            .arg(QString::fromStdString(segmentId)),
-        5000);
+    _state->setSurface(segmentId, surf, false, false);
+    if (_state->activeSurfaceId() == segmentId) {
+        _state->setSurface("segmentation", surf, false, false);
+    }
+
+    switch (transform) {
+    case SurfaceTransform::FlipU:
+        emit statusMessage(tr("Flipped %1 %2").arg(segLabel, tr("vertically")), 5000);
+        break;
+    case SurfaceTransform::FlipV:
+        emit statusMessage(tr("Flipped %1 %2").arg(segLabel, tr("horizontally")), 5000);
+        break;
+    case SurfaceTransform::Rotate90:
+        emit statusMessage(tr("Rotated %1 by 90 degrees clockwise").arg(segLabel), 5000);
+        break;
+    }
+    return true;
 }
 
 void SegmentationCommandHandler::onAlphaCompRefine(const std::string& segmentId)
