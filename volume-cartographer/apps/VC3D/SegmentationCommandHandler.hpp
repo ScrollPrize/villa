@@ -178,6 +178,38 @@ public:
         bool    overwrite{true};  // false => an existing OBJ file is refused
     };
 
+    // Arguments accepted by startMergeTifxyz; RANSAC defaults match the dialog.
+    struct MergeTifxyzParams {
+        QVector<QStringList> grid;            // row-major segment names; "" is a hole
+        QString refSurface;                   // empty => largest valid-cell count
+        int     ransacIters{3000};
+        double  ransacMinThresh{5.0};
+        double  ransacMaxThresh{10.0};
+        double  ransacMadK{3.0};
+        int     ransacSeed{0};
+        int     anchorCap{0};
+        int     stripCols{0};
+        int     ompThreads{-1};               // -1 => runner default
+    };
+
+    // Arguments accepted by startMergePatch; defaults match the dialog.
+    struct MergePatchParams {
+        QString parentId;                     // overwritten in place
+        QString childId;
+        bool    explicitRoles{false};         // false => vc_merge_patch picks the
+                                              // parent by valid-cell count
+        int     borderCells{16};
+        int     blendCells{6};
+        int     idwK{4};
+        int     ransacIters{3000};
+        double  ransacMinThresh{5.0};
+        double  ransacMaxThresh{10.0};
+        double  ransacMadK{3.0};
+        int     ransacSeed{0};
+        int     anchorCap{0};
+        int     ompThreads{-1};               // -1 => runner default
+    };
+
     // Arguments accepted by startRasterizeSegments.
     struct RasterizeParams {
         int chunkSize{128};       // isotropic chunk size, 1..4096
@@ -270,8 +302,8 @@ signals:
      * Emitted once when a segment operation that post-processes command-line
      * tool output reaches its terminal state, after that post-processing.
      * Emitted for interactive and dialog-free launches. `kind` names the
-     * operation ("rasterize", "neighbor_copy"); `outputPath` is the produced
-     * artifact on success.
+     * operation ("rasterize", "neighbor_copy", "merge", "patch"); `outputPath`
+     * is the produced artifact on success.
      */
     void segmentOperationFinished(QString kind, bool success, QString message,
                                   QString outputPath);
@@ -410,6 +442,20 @@ public:
                            CommandLaunchError* error = nullptr,
                            QString* resolvedOutputDir = nullptr);
 
+    /// Dialog-free vc_merge_tifxyz launch: validates the grid like the dialog,
+    /// writes its merge.json next to the segments directory and starts the
+    /// tool. Completion, after the surface list is reloaded, is reported by
+    /// segmentOperationFinished("merge") with the new segment folder.
+    bool startMergeTifxyz(const MergeTifxyzParams& params,
+                          CommandLaunchError* error = nullptr,
+                          QString* mergeJsonPath = nullptr);
+
+    /// Dialog-free vc_merge_patch launch. The parent tifxyz is overwritten in
+    /// place; the tool keeps a rotating backup ring of the parent first.
+    /// Completion is reported by segmentOperationFinished("patch").
+    bool startMergePatch(const MergePatchParams& params,
+                         CommandLaunchError* error = nullptr);
+
     /// Cancels a running neighbor copy, including the hop between its passes:
     /// a running pass's process is terminated and a queued second pass does
     /// not start. The copy ends with segmentOperationFinished("neighbor_copy",
@@ -524,6 +570,18 @@ private:
                                QString* resolvedOutputDir);
     void finishNeighborCopy(bool success, const QString& message,
                             const QString& outputPath);
+    bool launchMergeTifxyz(const QString& mergeJsonPath,
+                           const QString& pathsDir,
+                           const MergeTifxyzParams& params,
+                           bool interactive);
+    bool launchMergePatch(const QString& parentPath,
+                          const QString& childPath,
+                          const MergePatchParams& params,
+                          bool interactive);
+    // The newest directory under `pathsDir` named like a vc_merge_tifxyz
+    // output that is not in `baselineEntries`; empty when none.
+    static QString findNewMergedSegment(const QString& pathsDir,
+                                        const QSet<QString>& baselineEntries);
     bool launchConvertToObj(const QString& tifxyzPath,
                             const ConvertToObjParams& params,
                             CommandLineToolRunner::ExecutionOptions options);

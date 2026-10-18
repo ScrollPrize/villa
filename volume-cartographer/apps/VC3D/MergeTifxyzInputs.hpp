@@ -4,9 +4,9 @@
 #include <QStringList>
 #include <QVector>
 
-// Inputs of vc_merge_tifxyz as the Merge tifxyz dialog builds them: the
-// surface grid, its merge.json form, and the output name the tool derives
-// from it.
+// Inputs of vc_merge_tifxyz shared by the Merge tifxyz dialog and the
+// dialog-free merge launch: the surface grid, its merge.json form, and the
+// output name the tool derives from it.
 namespace vc3d::merge_tifxyz {
 
 // A row-major grid of segment directory names; an empty name is a hole.

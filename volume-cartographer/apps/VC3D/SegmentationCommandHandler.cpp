@@ -1,5 +1,7 @@
 #include "SegmentationCommandHandler.hpp"
 
+#include "MergeTifxyzInputs.hpp"
+
 #include "OpenDataCoordinateIdentity.hpp"
 #include "CState.hpp"
 #include "SurfacePanelController.hpp"
@@ -4771,6 +4773,24 @@ bool SegmentationCommandHandler::startRasterizeSegmentsImpl(
     return true;
 }
 
+QString SegmentationCommandHandler::findNewMergedSegment(const QString& pathsDir,
+                                                         const QSet<QString>& baselineEntries)
+{
+    QFileInfo newest;
+    bool found = false;
+    for (const auto& info : QDir(pathsDir).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+        const QString name = info.fileName();
+        if (baselineEntries.contains(name) || !name.contains(QStringLiteral("_merged"))) {
+            continue;
+        }
+        if (!found || info.lastModified() > newest.lastModified()) {
+            newest = info;
+            found = true;
+        }
+    }
+    return found ? newest.absoluteFilePath() : QString();
+}
+
 void SegmentationCommandHandler::onMergeTifxyz(const QStringList& segmentIds)
 {
     if (!_state || !_state->vpkg()) {
@@ -4829,17 +4849,46 @@ void SegmentationCommandHandler::onMergeTifxyz(const QStringList& segmentIds)
         return;
     }
 
-    _cmdRunner->setMergeParams(dlg.mergeJsonPath(),
+    MergeTifxyzParams params;
+    params.refSurface = dlg.refSurface();
+    params.ransacIters = dlg.ransacIters();
+    params.ransacMinThresh = dlg.ransacMinThresh();
+    params.ransacMaxThresh = dlg.ransacMaxThresh();
+    params.ransacMadK = dlg.ransacMadK();
+    params.ransacSeed = dlg.ransacSeed();
+    params.anchorCap = dlg.anchorCap();
+    params.stripCols = dlg.stripCols();
+    params.ompThreads = dlg.ompThreads();
+    if (!launchMergeTifxyz(dlg.mergeJsonPath(), pathsDir, params, /*interactive=*/true)) {
+        return;
+    }
+    emit statusMessage(tr("Merging tifxyz surfaces..."), 0);
+}
+
+bool SegmentationCommandHandler::launchMergeTifxyz(const QString& mergeJsonPath,
+                                                   const QString& pathsDir,
+                                                   const MergeTifxyzParams& params,
+                                                   bool interactive)
+{
+    auto vpkg = _state->vpkg();
+    // vc_merge_tifxyz names its output folder itself (<first name>_merged with
+    // a version suffix); the runner reports the merge.json, so the new folder
+    // is found against this snapshot when the run ends.
+    QSet<QString> baselineEntries;
+    for (const auto& info : QDir(pathsDir).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+        baselineEntries.insert(info.fileName());
+    }
+    _cmdRunner->setMergeParams(mergeJsonPath,
                                pathsDir,
-                               dlg.refSurface(),
-                               dlg.ransacIters(),
-                               dlg.ransacMinThresh(),
-                               dlg.ransacMaxThresh(),
-                               dlg.ransacMadK(),
-                               dlg.ransacSeed(),
-                               dlg.anchorCap(),
-                               dlg.stripCols());
-    if (dlg.ompThreads() > 0) _cmdRunner->setNextOmpThreads(dlg.ompThreads());
+                               params.refSurface,
+                               params.ransacIters,
+                               params.ransacMinThresh,
+                               params.ransacMaxThresh,
+                               params.ransacMadK,
+                               params.ransacSeed,
+                               params.anchorCap,
+                               params.stripCols);
+    if (params.ompThreads > 0) _cmdRunner->setNextOmpThreads(params.ompThreads);
     const QJsonObject outputCoordinateIdentity = coordinateIdentityObject(
         vc3d::opendata::coordinateIdentityForVolume(
             *vpkg, _state->currentVolumeId()));
@@ -4847,11 +4896,11 @@ void SegmentationCommandHandler::onMergeTifxyz(const QStringList& segmentIds)
     auto connection = std::make_shared<QMetaObject::Connection>();
     *connection = connect(
         _cmdRunner, &CommandLineToolRunner::toolFinished, this,
-        [this, guard, connection, outputCoordinateIdentity](
+        [this, guard, connection, outputCoordinateIdentity, pathsDir, baselineEntries](
             CommandLineToolRunner::Tool tool,
             bool success,
+            const QString& message,
             const QString&,
-            const QString& outputPath,
             bool) {
             if (!guard) {
                 disconnect(*connection);
@@ -4860,19 +4909,100 @@ void SegmentationCommandHandler::onMergeTifxyz(const QStringList& segmentIds)
             if (tool != CommandLineToolRunner::Tool::MergeTifxyz)
                 return;
             disconnect(*connection);
-            if (success && !updateSegmentCoordinateMetadata(
-                               outputPath, outputCoordinateIdentity)) {
-                emit showWarning(
-                    tr("Warning"),
-                    tr("Merged tifxyz created, but coordinate metadata update failed."));
+            QString outcome = message;
+            QString mergedPath;
+            if (success) {
+                mergedPath = findNewMergedSegment(pathsDir, baselineEntries);
+                if (mergedPath.isEmpty()) {
+                    outcome = tr("vc_merge_tifxyz finished, but no new merged segment "
+                                 "was found in %1.").arg(pathsDir);
+                    emit showWarning(tr("Warning"), outcome);
+                } else if (!updateSegmentCoordinateMetadata(
+                               mergedPath, outputCoordinateIdentity)) {
+                    outcome = tr("Merged tifxyz created, but coordinate metadata update failed.");
+                    emit showWarning(tr("Warning"), outcome);
+                }
+                if (_surfacePanel) {
+                    _surfacePanel->reloadSurfacesFromDisk();
+                }
             }
+            emit segmentOperationFinished(QStringLiteral("merge"), success, outcome,
+                                          mergedPath);
         });
-    _cmdRunner->showConsoleOutput();
-    if (!_cmdRunner->execute(CommandLineToolRunner::Tool::MergeTifxyz)) {
+    if (interactive) {
+        _cmdRunner->showConsoleOutput();
+    }
+    const auto options = interactive
+        ? CommandLineToolRunner::ExecutionOptions{}
+        : CommandLineToolRunner::ExecutionOptions::silent();
+    if (!_cmdRunner->execute(CommandLineToolRunner::Tool::MergeTifxyz, options)) {
         disconnect(*connection);
-        return;
+        return false;
+    }
+    return true;
+}
+
+bool SegmentationCommandHandler::startMergeTifxyz(const MergeTifxyzParams& params,
+                                                  CommandLaunchError* error,
+                                                  QString* mergeJsonPath)
+{
+    const CommandLaunchErrorSetter setErr{error};
+    if (!_state || !_state->vpkg()) {
+        setErr(tr("Open a volpkg first."), CommandLaunchError::InvalidState);
+        return false;
+    }
+    if (!_cmdRunner) {
+        setErr(tr("Command runner is not initialized."), CommandLaunchError::ToolUnavailable);
+        return false;
+    }
+    if (_cmdRunner->isRunning()) {
+        setErr(tr("A command-line tool is already running."), CommandLaunchError::Busy);
+        return false;
+    }
+    const QFileInfo toolInfo(QCoreApplication::applicationDirPath() +
+                             QStringLiteral("/vc_merge_tifxyz"));
+    if (!toolInfo.exists() || !toolInfo.isExecutable()) {
+        setErr(tr("vc_merge_tifxyz not found or not executable."),
+               CommandLaunchError::ToolUnavailable);
+        return false;
+    }
+
+    auto vpkg = _state->vpkg();
+    const std::filesystem::path resolvedSeg = vpkg->outputSegmentsPath();
+    if (resolvedSeg.empty() || !std::filesystem::is_directory(resolvedSeg)) {
+        setErr(tr("No active segmentation directory; pick one before running merge."),
+               CommandLaunchError::InvalidState);
+        return false;
+    }
+    const QString pathsDir = QString::fromStdString(resolvedSeg.string());
+    const QString volpkgDir = QString::fromStdString(resolvedSeg.parent_path().string());
+
+    QStringList availableSegments;
+    for (const auto& id : vpkg->segmentationIDs()) {
+        availableSegments << QString::fromStdString(id);
+    }
+    const QString invalid = vc3d::merge_tifxyz::validate(
+        params.grid, availableSegments, pathsDir, params.refSurface,
+        params.ransacMinThresh, params.ransacMaxThresh);
+    if (!invalid.isEmpty()) {
+        setErr(invalid);
+        return false;
+    }
+
+    QString writeError;
+    const QString jsonPath = vc3d::merge_tifxyz::writeMergeJson(volpkgDir, params.grid, &writeError);
+    if (jsonPath.isEmpty()) {
+        setErr(writeError);
+        return false;
+    }
+    if (!launchMergeTifxyz(jsonPath, pathsDir, params, /*interactive=*/false)) {
+        setErr(tr("Failed to start vc_merge_tifxyz."));
+        return false;
     }
     emit statusMessage(tr("Merging tifxyz surfaces..."), 0);
+    if (mergeJsonPath)
+        *mergeJsonPath = jsonPath;
+    return true;
 }
 
 void SegmentationCommandHandler::onMergePatch(const QStringList& segmentIds)
@@ -4925,19 +5055,43 @@ void SegmentationCommandHandler::onMergePatch(const QStringList& segmentIds)
         return;
     }
 
-    _cmdRunner->setMergePatchParams(dlg.parentPath(),
-                                    dlg.childPath(),
-                                    dlg.explicitRoles(),
-                                    dlg.borderCells(),
-                                    dlg.blendCells(),
-                                    dlg.idwK(),
-                                    dlg.ransacIters(),
-                                    dlg.ransacMinThresh(),
-                                    dlg.ransacMaxThresh(),
-                                    dlg.ransacMadK(),
-                                    dlg.ransacSeed(),
-                                    dlg.anchorCap());
-    if (dlg.ompThreads() > 0) _cmdRunner->setNextOmpThreads(dlg.ompThreads());
+    MergePatchParams params;
+    params.explicitRoles = dlg.explicitRoles();
+    params.borderCells = dlg.borderCells();
+    params.blendCells = dlg.blendCells();
+    params.idwK = dlg.idwK();
+    params.ransacIters = dlg.ransacIters();
+    params.ransacMinThresh = dlg.ransacMinThresh();
+    params.ransacMaxThresh = dlg.ransacMaxThresh();
+    params.ransacMadK = dlg.ransacMadK();
+    params.ransacSeed = dlg.ransacSeed();
+    params.anchorCap = dlg.anchorCap();
+    params.ompThreads = dlg.ompThreads();
+    if (!launchMergePatch(dlg.parentPath(), dlg.childPath(), params, /*interactive=*/true)) {
+        emit statusMessage(tr("Failed to start vc_merge_patch"), 5000);
+        return;
+    }
+    emit statusMessage(tr("Patching tifxyz..."), 0);
+}
+
+bool SegmentationCommandHandler::launchMergePatch(const QString& parentPath,
+                                                  const QString& childPath,
+                                                  const MergePatchParams& params,
+                                                  bool interactive)
+{
+    _cmdRunner->setMergePatchParams(parentPath,
+                                    childPath,
+                                    params.explicitRoles,
+                                    params.borderCells,
+                                    params.blendCells,
+                                    params.idwK,
+                                    params.ransacIters,
+                                    params.ransacMinThresh,
+                                    params.ransacMaxThresh,
+                                    params.ransacMadK,
+                                    params.ransacSeed,
+                                    params.anchorCap);
+    if (params.ompThreads > 0) _cmdRunner->setNextOmpThreads(params.ompThreads);
 
     // One-shot handler: on success, force-refresh the parent (and any
     // other modified) surface from disk. The mask.tif mtime drives the
@@ -4948,7 +5102,7 @@ void SegmentationCommandHandler::onMergePatch(const QStringList& segmentIds)
     auto connection = std::make_shared<QMetaObject::Connection>();
     *connection = connect(_cmdRunner, &CommandLineToolRunner::toolFinished,
                           this,
-                          [this, guard, connection]
+                          [this, guard, connection, interactive]
                           (CommandLineToolRunner::Tool tool,
                            bool success,
                            const QString& message,
@@ -4962,30 +5116,109 @@ void SegmentationCommandHandler::onMergePatch(const QStringList& segmentIds)
             return;
         }
         disconnect(*connection);
+        QString outcome;
         if (success) {
             if (_surfacePanel) _surfacePanel->reloadSurfacesFromDisk();
-            emit statusMessage(
-                tr("Patch applied to %1")
-                    .arg(QDir::toNativeSeparators(outputPath)), 5000);
+            outcome = tr("Patch applied to %1").arg(QDir::toNativeSeparators(outputPath));
+            emit statusMessage(outcome, 5000);
         } else {
-            QMessageBox::critical(_parentWidget, tr("Patch tifxyz"),
-                                  tr("vc_merge_patch failed.\n%1").arg(message));
+            outcome = tr("vc_merge_patch failed.\n%1").arg(message);
+            if (interactive) {
+                QMessageBox::critical(_parentWidget, tr("Patch tifxyz"), outcome);
+            }
             emit statusMessage(tr("Patch failed"), 5000);
         }
+        emit segmentOperationFinished(QStringLiteral("patch"), success, outcome,
+                                      success ? outputPath : QString());
     });
 
-    _cmdRunner->showConsoleOutput();
+    if (interactive) {
+        _cmdRunner->showConsoleOutput();
+    }
+    const auto options = interactive
+        ? CommandLineToolRunner::ExecutionOptions{}
+        : CommandLineToolRunner::ExecutionOptions::silent();
     // If execute() rejects the launch (preflight failure, missing binary),
     // it never emits toolFinished -- so the one-shot lambda above would
     // stay attached and fire on the NEXT tool's toolFinished. Disconnect
     // immediately on launch failure to keep the runner's signal table
     // clean across subsequent runs.
-    if (!_cmdRunner->execute(CommandLineToolRunner::Tool::MergePatch)) {
+    if (!_cmdRunner->execute(CommandLineToolRunner::Tool::MergePatch, options)) {
         QObject::disconnect(*connection);
-        emit statusMessage(tr("Failed to start vc_merge_patch"), 5000);
-        return;
+        return false;
+    }
+    return true;
+}
+
+bool SegmentationCommandHandler::startMergePatch(const MergePatchParams& params,
+                                                 CommandLaunchError* error)
+{
+    const CommandLaunchErrorSetter setErr{error};
+    if (!_state || !_state->vpkg()) {
+        setErr(tr("Open a volpkg first."), CommandLaunchError::InvalidState);
+        return false;
+    }
+    if (!_cmdRunner) {
+        setErr(tr("Command runner is not initialized."), CommandLaunchError::ToolUnavailable);
+        return false;
+    }
+    if (_cmdRunner->isRunning()) {
+        setErr(tr("A command-line tool is already running."), CommandLaunchError::Busy);
+        return false;
+    }
+    const QFileInfo toolInfo(QCoreApplication::applicationDirPath() +
+                             QStringLiteral("/vc_merge_patch"));
+    if (!toolInfo.exists() || !toolInfo.isExecutable()) {
+        setErr(tr("vc_merge_patch not found or not executable."),
+               CommandLaunchError::ToolUnavailable);
+        return false;
+    }
+
+    auto vpkg = _state->vpkg();
+    const std::filesystem::path resolvedSeg = vpkg->outputSegmentsPath();
+    if (resolvedSeg.empty() || !std::filesystem::is_directory(resolvedSeg)) {
+        setErr(tr("No active segmentation directory; pick one before running patch."),
+               CommandLaunchError::InvalidState);
+        return false;
+    }
+    if (params.parentId.isEmpty() || params.childId.isEmpty()) {
+        setErr(tr("Pick two surfaces before proceeding."));
+        return false;
+    }
+    if (params.parentId == params.childId) {
+        setErr(tr("Parent and child must be different surfaces."));
+        return false;
+    }
+    if (params.ransacMinThresh >= params.ransacMaxThresh) {
+        setErr(tr("RANSAC min threshold must be strictly less than max."));
+        return false;
+    }
+    const auto ids = vpkg->segmentationIDs();
+    for (const QString& id : {params.parentId, params.childId}) {
+        if (std::find(ids.begin(), ids.end(), id.toStdString()) == ids.end()) {
+            setErr(tr("Invalid segment or segment not loaded: %1").arg(id),
+                   CommandLaunchError::SegmentNotFound);
+            return false;
+        }
+    }
+
+    // Same resolution as the dialog: both directories sit in the segments dir.
+    const std::filesystem::path parentDir = resolvedSeg / params.parentId.toStdString();
+    const std::filesystem::path childDir = resolvedSeg / params.childId.toStdString();
+    if (!std::filesystem::is_directory(parentDir) || !std::filesystem::is_directory(childDir)) {
+        setErr(tr("Surface directories not found under %1.")
+                   .arg(QString::fromStdString(resolvedSeg.string())),
+               CommandLaunchError::InputNotFound);
+        return false;
+    }
+    if (!launchMergePatch(QString::fromStdString(parentDir.string()),
+                          QString::fromStdString(childDir.string()),
+                          params, /*interactive=*/false)) {
+        setErr(tr("Failed to start vc_merge_patch"));
+        return false;
     }
     emit statusMessage(tr("Patching tifxyz..."), 0);
+    return true;
 }
 
 void SegmentationCommandHandler::onGrowTrackPatches()
