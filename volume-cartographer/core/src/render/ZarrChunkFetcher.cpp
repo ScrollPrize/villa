@@ -5,6 +5,7 @@
 #include "vc/core/util/RemoteUrl.hpp"
 
 #include <utils/http_fetch.hpp>
+#include <utils/sftp_fetch.hpp>
 #include <utils/zarr.hpp>
 
 #include <algorithm>
@@ -114,7 +115,7 @@ public:
             return true;
         if (response.not_found())
             return false;
-        if (isOptionalRemoteMetadataMiss(
+        if (!utils::is_sftp_url(baseUrl_) && isOptionalRemoteMetadataMiss(
                 response.status_code, key, response.body_string())) {
             sawForbiddenMetadataMiss_.store(true, std::memory_order_relaxed);
             return false;
@@ -140,7 +141,7 @@ public:
         }
         if (response.not_found())
             return std::nullopt;
-        if (isOptionalRemoteMetadataMiss(
+        if (!utils::is_sftp_url(baseUrl_) && isOptionalRemoteMetadataMiss(
                 response.status_code, key, response.body_string())) {
             sawForbiddenMetadataMiss_.store(true, std::memory_order_relaxed);
             return std::nullopt;

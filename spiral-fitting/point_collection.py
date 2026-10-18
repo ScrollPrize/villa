@@ -151,6 +151,9 @@ def load_point_collection(filename: str) -> Optional[Dict[int, Dict[str, Any]]]:
                 "metadata": collection_data.get("metadata", {}),
                 "color": collection_data.get("color", [0.0, 0.0, 0.0])
             }
+            # The collection's persistent identity, carried only when stored.
+            if "uuid" in collection_data:
+                collection["uuid"] = collection_data["uuid"]
 
             # Load points
             points_data = collection_data.get("points", {})

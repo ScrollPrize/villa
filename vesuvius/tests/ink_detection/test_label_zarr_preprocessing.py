@@ -432,3 +432,89 @@ def test_label_command_validates_scan_root(tmp_path):
     file_path.touch()
     with pytest.raises(NotADirectoryError, match="Root path is not a directory"):
         main([str(file_path)])
+
+
+def test_multipage_striped_tiff_converts_page_one_and_warns(tmp_path, caplog):
+    """A multi-page striped TIFF used to become a (pages, height) zarr (#1738).
+
+    tifffile.imread stacks the pages and the channel squeeze then takes the
+    page axis for height. The converter now reads page 1 explicitly, so the
+    label keeps its (height, width), and it says which pages it ignored.
+    """
+    label_path = tmp_path / "segment-a_multipage_supervision_mask.tif"
+    volume_ZYX = np.random.default_rng(3).integers(
+        0, 2, size=(5, 20, 30), dtype=np.uint8
+    )
+    tifffile.imwrite(label_path, volume_ZYX)  # striped, 5 pages
+    with tifffile.TiffFile(label_path) as tif:
+        assert len(tif.pages) == 5, "fixture must actually be multi-page"
+        assert not tif.pages[0].is_tiled, "fixture must actually be striped"
+
+    with caplog.at_level("WARNING"):
+        result = convert_image(label_path, levels=1)
+    assert result["streamed_tiled_tiff"] == "false"
+    group = zarr.open_group(label_path.with_suffix(".zarr"), mode="r")
+    converted = group["0"][DEFAULT_LABEL_SLICE]
+    assert converted.shape == (20, 30), "page count must not become the height"
+    np.testing.assert_array_equal(converted, volume_ZYX[0])
+    assert "has 5 pages; converting page 1 only" in caplog.text
+
+
+def test_multipage_tiled_tiff_streams_page_one_and_warns(tmp_path, caplog):
+    """The tiled streaming path always converted page 1; now it says so."""
+    label_path = tmp_path / "segment-a_multipage_supervision_mask.tif"
+    volume_ZYX = np.random.default_rng(4).integers(
+        0, 2, size=(5, 32, 48), dtype=np.uint8
+    )
+    tifffile.imwrite(label_path, volume_ZYX, tile=(16, 16))
+    with caplog.at_level("WARNING"):
+        result = convert_image(label_path, levels=1)
+    assert result["streamed_tiled_tiff"] == "true"
+    group = zarr.open_group(label_path.with_suffix(".zarr"), mode="r")
+    np.testing.assert_array_equal(group["0"][DEFAULT_LABEL_SLICE], volume_ZYX[0])
+    assert "has 5 pages; converting page 1 only" in caplog.text
+
+
+def test_single_page_tiff_conversion_is_unchanged_and_silent(tmp_path, caplog):
+    label_path = tmp_path / "segment-a_supervision_mask.tif"
+    image_YX = np.random.default_rng(5).integers(0, 2, size=(20, 30), dtype=np.uint8)
+    tifffile.imwrite(label_path, image_YX, compression="jpeg")  # not streamable
+    with caplog.at_level("WARNING"):
+        result = convert_image(label_path, levels=1)
+    assert result["streamed_tiled_tiff"] == "false"
+    group = zarr.open_group(label_path.with_suffix(".zarr"), mode="r")
+    assert group["0"][DEFAULT_LABEL_SLICE].shape == (20, 30)
+    assert "converting page 1 only" not in caplog.text
+
+
+def test_pyramid_sub_ifds_are_not_extra_pages(tmp_path, caplog):
+    """libvips/QuPath-style pyramids keep reduced levels as subfiletype=1 IFDs.
+
+    ``tifffile.imread`` already returned the base level for those, so the
+    output is unchanged and no multi-page warning is due.
+    """
+    label_path = tmp_path / "segment-a_supervision_mask.tif"
+    base_YX = np.random.default_rng(6).integers(0, 2, size=(64, 64), dtype=np.uint8)
+    with tifffile.TiffWriter(label_path) as writer:
+        writer.write(base_YX, compression="jpeg")  # keep it off the streaming path
+        writer.write(base_YX[::2, ::2], subfiletype=1, compression="jpeg")
+    with tifffile.TiffFile(label_path) as tif:
+        assert len(tif.pages) == 2 and tif.pages[1].subfiletype & 1
+
+    with caplog.at_level("WARNING"):
+        result = convert_image(label_path, levels=1)
+    assert result["streamed_tiled_tiff"] == "false"
+    group = zarr.open_group(label_path.with_suffix(".zarr"), mode="r")
+    assert group["0"][DEFAULT_LABEL_SLICE].shape == (64, 64)
+    assert "converting page 1 only" not in caplog.text
+
+
+def test_two_page_tiff_warning_names_the_one_ignored_page(tmp_path, caplog):
+    label_path = tmp_path / "segment-a_two_supervision_mask.tif"
+    volume_ZYX = np.random.default_rng(7).integers(0, 2, size=(2, 20, 30), dtype=np.uint8)
+    tifffile.imwrite(label_path, volume_ZYX)
+    with tifffile.TiffFile(label_path) as tif:
+        assert len(tif.pages) == 2, "fixture must actually be two pages"
+    with caplog.at_level("WARNING"):
+        convert_image(label_path, levels=1)
+    assert "has 2 pages; converting page 1 only (page 2 is ignored)" in caplog.text

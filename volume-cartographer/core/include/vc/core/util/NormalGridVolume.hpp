@@ -28,6 +28,8 @@ namespace vc::core::util {
             uint64_t decodedPathEvictions = 0;
             size_t decodedPathEntries = 0;
             size_t decodedPathBytes = 0;
+            size_t bucketIndexEntries = 0;
+            size_t bucketIndexBytes = 0;
         };
 
         explicit NormalGridVolume(const std::string& path);
