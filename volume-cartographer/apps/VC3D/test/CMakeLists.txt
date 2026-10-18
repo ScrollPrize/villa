@@ -45,6 +45,29 @@ vc_register_ctest(intersection_layer_item test_intersection_layer_item)
 set_tests_properties(intersection_layer_item PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
+add_executable(test_status_message_history
+    test_status_message_history.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/StatusMessageHistory.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/StatusMessageHistory.hpp)
+
+set_target_properties(test_status_message_history PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_status_message_history PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_status_message_history PRIVATE
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Test
+    Qt6::Widgets)
+
+add_test(NAME status_message_history COMMAND test_status_message_history)
+vc_register_test_target(test_status_message_history)
+vc_register_ctest(status_message_history test_status_message_history)
+set_tests_properties(status_message_history PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
 add_executable(test_spiral_input_draft test_spiral_input_draft.cpp)
 set_target_properties(test_spiral_input_draft PROPERTIES
     AUTOMOC ON AUTOUIC OFF AUTORCC OFF)

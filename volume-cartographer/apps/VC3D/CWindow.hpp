@@ -110,6 +110,7 @@ class MenuActionController;
 class VolumeAttachmentController;
 class SegmentationGrower;
 class ViewerControlsPanel;
+class StatusMessageHistoryButton;
 class QLabel;
 class QMainWindow;
 class QMenu;
@@ -415,6 +416,9 @@ private:
     QLabel* _segmentationGrowthWarning{nullptr};
     QLabel* _segmentTransformWarning{nullptr};
     QLabel* _statusMessageLabel{nullptr};
+    // Owned by the status bar; a QPointer so messages sent after the
+    // destructor detaches the status bar find it gone.
+    QPointer<StatusMessageHistoryButton> _statusHistoryButton;
     // Owned by the status bar, which the destructor detaches (and Qt then
     // deletes) before the volume closes: a QPointer, so the late refreshes
     // that close triggers see it gone.

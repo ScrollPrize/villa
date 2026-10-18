@@ -1,5 +1,6 @@
 #include "CWindow.hpp"
 #include "FiberLengthDisplay.hpp"
+#include "elements/StatusMessageHistory.hpp"
 #include "VolumeDisplayNames.hpp"
 #include "OpenDataCoordinateIdentity.hpp"
 #include "OpenDataLasagna.hpp"
@@ -2923,6 +2924,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _statusMessageLabel->setMinimumWidth(160);
     _statusMessageLabel->setWordWrap(false);
     statusBar()->addWidget(_statusMessageLabel, 1);
+    _statusHistoryButton = new StatusMessageHistoryButton(this);
+    statusBar()->addWidget(_statusHistoryButton);
 
     _statusMessageTimer = new QTimer(this);
     _statusMessageTimer->setSingleShot(true);
@@ -8815,6 +8818,9 @@ void CWindow::onShowStatusMessage(QString text, int timeout)
 
 void CWindow::showStatusBarMessage(const QString& text, int timeout)
 {
+    if (_statusHistoryButton) {
+        _statusHistoryButton->record(text);
+    }
     if (!_statusMessageLabel) {
         if (statusBar()) {
             statusBar()->showMessage(text, timeout);
