@@ -233,6 +233,30 @@ vc_register_ctest(spiral_point_collection_edit test_spiral_point_collection_edit
 set_tests_properties(spiral_point_collection_edit PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
+add_executable(test_segmentation_undo_history
+    test_segmentation_undo_history.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/Keybinds.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/Keybinds.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/segmentation/SegmentationUndoHistory.hpp)
+
+set_target_properties(test_segmentation_undo_history PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_segmentation_undo_history PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_segmentation_undo_history PRIVATE
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Test
+    opencv_core)
+
+add_test(NAME segmentation_undo_history COMMAND test_segmentation_undo_history)
+vc_register_test_target(test_segmentation_undo_history)
+vc_register_ctest(segmentation_undo_history test_segmentation_undo_history)
+set_tests_properties(segmentation_undo_history PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
 add_executable(test_spiral_preview_provenance
     test_spiral_preview_provenance.cpp)
 

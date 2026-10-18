@@ -1049,7 +1049,8 @@ std::vector<std::pair<int, int>> SegmentationModule::filterVerticesForAutoApprov
     return result;
 }
 
-void SegmentationModule::performAutoApproval(const std::vector<std::pair<int, int>>& vertices)
+void SegmentationModule::performAutoApproval(const std::vector<std::pair<int, int>>& vertices,
+                                             bool pairWithLastUndo)
 {
     if (vertices.empty() || !_overlay || !_overlay->hasApprovalMaskData()) {
         return;
@@ -1058,7 +1059,11 @@ void SegmentationModule::performAutoApproval(const std::vector<std::pair<int, in
     constexpr uint8_t kApproved = 255;
     constexpr bool kIsAutoApproval = true;
     const QColor brushColor = approvalBrushColor();
-    _overlay->paintApprovalMaskDirect(vertices, _autoApprovalRadius, kApproved, brushColor, false, 0.0f, 0.0f, kIsAutoApproval);
+    const std::uint64_t approvalId = _overlay->paintApprovalMaskDirect(
+        vertices, _autoApprovalRadius, kApproved, brushColor, false, 0.0f, 0.0f, kIsAutoApproval);
+    if (pairWithLastUndo && approvalId != 0) {
+        _undoHistory.setLastAutoApprovalId(approvalId);
+    }
     _overlay->scheduleDebouncedSave(_editManager->baseSurface().get());
     qCDebug(lcSegModule) << "Auto-approved" << vertices.size() << "vertices with radius" << _autoApprovalRadius;
 }
@@ -1136,16 +1141,14 @@ void SegmentationModule::applyEdits()
         : std::vector<SegmentationEditManager::VertexEdit>{};
 
     // Capture delta for undo before applyPreview() clears edited vertices
-    if (hadPendingChanges) {
-        (void)captureUndoDelta();
-    }
+    const bool undoCaptured = hadPendingChanges && captureUndoDelta();
 
     // Auto-approve edited regions if approval mask is active (you edited it, so it's reviewed)
     if (_autoApprovalEnabled && _overlay && _overlay->hasApprovalMaskData() && hadPendingChanges) {
         const auto editedVerts = _editManager->editedVertices();
         if (!editedVerts.empty()) {
             const auto filteredVerts = filterVerticesForAutoApproval(editedVerts, std::nullopt);
-            performAutoApproval(filteredVerts);
+            performAutoApproval(filteredVerts, undoCaptured);
         }
     }
 
@@ -2569,7 +2572,7 @@ void SegmentationModule::finishDrag()
         const auto editedVerts = _editManager->editedVertices();
 
         // Capture delta for undo before applyPreview() clears edited vertices
-        (void)captureUndoDelta();
+        const bool undoCaptured = captureUndoDelta();
 
         // Auto-approve edited regions before applyPreview() clears them
         if (_autoApprovalEnabled && _overlay && _overlay->hasApprovalMaskData()) {
@@ -2581,7 +2584,7 @@ void SegmentationModule::finishDrag()
                     dragCenter = std::make_pair(activeDrag.center.row, activeDrag.center.col);
                 }
                 const auto filteredVerts = filterVerticesForAutoApproval(editedVerts, dragCenter);
-                performAutoApproval(filteredVerts);
+                performAutoApproval(filteredVerts, undoCaptured);
             }
         }
 
@@ -2595,6 +2598,14 @@ void SegmentationModule::finishDrag()
 
     refreshOverlay();
     emitPendingChanges();
+}
+
+bool SegmentationModule::editInProgress() const
+{
+    return _drag.active ||
+           (_pushPullTool && _pushPullTool->isActive()) ||
+           (_lineTool && _lineTool->strokeActive()) ||
+           (_surfaceMaskTool && (_surfaceMaskTool->strokeActive() || _surfaceMaskTool->hasPendingStroke()));
 }
 
 void SegmentationModule::cancelDrag()

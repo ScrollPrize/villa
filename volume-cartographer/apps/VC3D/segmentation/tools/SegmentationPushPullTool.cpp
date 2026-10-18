@@ -615,7 +615,7 @@ void SegmentationPushPullTool::stopAll()
         const auto editedVerts = _editManager->editedVertices();
 
         // Capture delta for undo before applyPreview() clears edited vertices
-        (void)_module.captureUndoDelta();
+        const bool undoCaptured = _module.captureUndoDelta();
 
         // Auto-approve edited regions before applyPreview() clears them
         if (_module.autoApprovalEnabled() && _overlay && _overlay->hasApprovalMaskData()) {
@@ -626,7 +626,7 @@ void SegmentationPushPullTool::stopAll()
                     dragCenter = std::make_pair(_cachedRow, _cachedCol);
                 }
                 const auto filteredVerts = _module.filterVerticesForAutoApproval(editedVerts, dragCenter);
-                _module.performAutoApproval(filteredVerts);
+                _module.performAutoApproval(filteredVerts, undoCaptured);
             }
         }
 

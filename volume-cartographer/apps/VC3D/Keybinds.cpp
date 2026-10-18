@@ -1,5 +1,6 @@
 #include "Keybinds.hpp"
 
+#include <QKeyEvent>
 #include <QString>
 
 namespace vc3d::keybinds {
@@ -267,6 +268,14 @@ const KeyPressDef SegmentationUndo{
     Qt::ControlModifier,
     true
 };
+const KeyPressDef SegmentationRedo{
+    "segmentation_redo",
+    kSectionSegEditing,
+    "Redo last undone segmentation change",
+    Qt::Key_Z,
+    Qt::ControlModifier | Qt::ShiftModifier,
+    true
+};
 const KeyPressDef ManualAddToggle{
     "manual_add_toggle",
     kSectionSegEditing,
@@ -494,6 +503,22 @@ QKeySequence sequenceFor(const KeyPressDef& def)
     return QKeySequence(def.key | def.modifiers);
 }
 
+HistoryRequest historyRequestFor(const QKeyEvent& event)
+{
+    const Qt::KeyboardModifiers modifiers = event.modifiers() & ~Qt::KeypadModifier;
+    if (event.matches(standard::Redo) ||
+        (event.key() == keypress::SegmentationRedo.key &&
+         modifiers == keypress::SegmentationRedo.modifiers)) {
+        return HistoryRequest::Redo;
+    }
+    if (event.matches(standard::Undo) ||
+        (event.key() == keypress::SegmentationUndo.key &&
+         (modifiers & keypress::SegmentationUndo.modifiers) == keypress::SegmentationUndo.modifiers)) {
+        return HistoryRequest::Undo;
+    }
+    return HistoryRequest::None;
+}
+
 QString buildKeybindsHelpText()
 {
     const HelpEntry kHelpEntries[] = {
@@ -525,6 +550,7 @@ QString buildKeybindsHelpText()
         { kSectionSurfaceTags, shortcuts::ApplyDefectiveTag.description, HelpKeyType::Shortcut, &shortcuts::ApplyDefectiveTag, nullptr, nullptr },
 
         { kSectionSegEditing, keypress::SegmentationUndo.description, HelpKeyType::KeyPress, nullptr, &keypress::SegmentationUndo, nullptr },
+        { kSectionSegEditing, keypress::SegmentationRedo.description, HelpKeyType::KeyPress, nullptr, &keypress::SegmentationRedo, nullptr },
         { kSectionSegEditing, keypress::ManualAddToggle.description, HelpKeyType::KeyPress, nullptr, &keypress::ManualAddToggle, nullptr },
         { kSectionSegEditing, keypress::LineDrawHold.description, HelpKeyType::KeyPress, nullptr, &keypress::LineDrawHold, nullptr },
         { kSectionSegEditing, keypress::ToggleAnnotation.description, HelpKeyType::KeyPress, nullptr, &keypress::ToggleAnnotation, nullptr },
