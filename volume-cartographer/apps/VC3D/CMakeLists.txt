@@ -290,6 +290,8 @@ set(srcs
     ToolDialogs.hpp
     MergeTifxyzInputs.cpp
     MergeTifxyzInputs.hpp
+    SegmentFiles.cpp
+    SegmentFiles.hpp
     ConsoleOutputWidget.cpp
     ConsoleOutputWidget.hpp
     CPointCollectionWidget.cpp

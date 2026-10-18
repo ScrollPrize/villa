@@ -722,3 +722,13 @@ target_link_libraries(test_merge_tifxyz_inputs PRIVATE Qt6::Core Qt6::Test)
 add_test(NAME merge_tifxyz_inputs COMMAND test_merge_tifxyz_inputs)
 vc_register_test_target(test_merge_tifxyz_inputs)
 vc_register_ctest(merge_tifxyz_inputs test_merge_tifxyz_inputs)
+
+add_executable(test_segment_files
+    test_segment_files.cpp
+    ../SegmentFiles.cpp ../SegmentFiles.hpp)
+set_target_properties(test_segment_files PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_segment_files PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_segment_files PRIVATE Qt6::Core Qt6::Test utils)
+add_test(NAME segment_files COMMAND test_segment_files)
+vc_register_test_target(test_segment_files)
+vc_register_ctest(segment_files test_segment_files)
