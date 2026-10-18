@@ -66,7 +66,7 @@ def test_copy_bbox_overlap_allows_explicit_custom_value():
     assert _run_production_parser(["--bbox-overlap", "0.25"]).bbox_overlap == pytest.approx(0.25)
 
 
-@pytest.mark.parametrize("invalid", ["-0.01", "1.0", "1.5", "not-a-number"])
+@pytest.mark.parametrize("invalid", ["-0.01", "1.0", "1.5", "nan", "NaN", "inf", "-inf", "not-a-number"])
 def test_copy_bbox_overlap_rejects_invalid_values(invalid):
     with pytest.raises(SystemExit) as exc:
         _run_production_parser(["--bbox-overlap", invalid])
