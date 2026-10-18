@@ -2,13 +2,13 @@
 #include "core.hpp"
 
 namespace vcr::augment {
-struct GaussianBlur; struct Sharpen; struct LocalSmoothing; struct Smear;
+struct OrientedBlur; struct GaussianBlur; struct Sharpen; struct LocalSmoothing; struct Smear;
 struct UnsharpMask; struct Defocus; struct MotionBlur; struct ZoomBlur;
 struct RingingOvershoot; struct GibbsRinging; struct FDA;
 struct Illumination; struct Vignetting;
 
 template<class T> constexpr bool channel_range_guard =
-    std::is_same_v<T,GaussianBlur> || std::is_same_v<T,Sharpen> || std::is_same_v<T,LocalSmoothing> ||
+    std::is_same_v<T,OrientedBlur> || std::is_same_v<T,GaussianBlur> || std::is_same_v<T,Sharpen> || std::is_same_v<T,LocalSmoothing> ||
     std::is_same_v<T,Smear> || std::is_same_v<T,UnsharpMask> || std::is_same_v<T,Defocus> ||
     std::is_same_v<T,MotionBlur> || std::is_same_v<T,ZoomBlur> || std::is_same_v<T,RingingOvershoot> ||
     std::is_same_v<T,GibbsRinging> || std::is_same_v<T,FDA>;

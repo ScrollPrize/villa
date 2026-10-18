@@ -141,6 +141,11 @@ void normalize_crop(T* values, std::size_t n, const Normalize& t, const std::uin
         for (const auto& s : stats) variance += s.sum / static_cast<double>(count);
         divisor = std::max(std::sqrt(variance), t.eps / scale);  // population standard deviation, ddof=0
     }
+    if constexpr(std::is_same_v<T,float>) if(t.mode==Normalization::MinMax && scale==1 && std::isfinite(float(divisor)) && divisor!=0) {
+        const float low=float(center), range=float(divisor);
+        for(std::size_t i=0;i<n;++i) values[i]=(values[i]-low)/range;
+        return;
+    }
     // Unselected nonzero voxels (outside a validity mask) use the same formula.
     for_parts(parts, [&](std::size_t p) {
         for (std::size_t i = p * grain; i < std::min(n, (p + 1) * grain); ++i)

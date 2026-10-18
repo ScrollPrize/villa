@@ -125,7 +125,12 @@ inline void apply(const OrientedBlur& t, Sample& s, const Parameters& p) {
         }
         a.channel(c.channel, values);
         };
-        if(a.bytes==4)run.template operator()<float>();else run.template operator()<double>();
+        bool wide=a.bytes==8;
+        if(!wide) {
+            const auto* data=static_cast<const float*>(std::as_const(a).data())+c.channel*g.size;
+            wide=std::any_of(data,data+g.size,[](float x){return std::abs(double(x))>std::numeric_limits<float>::max()/1024.;});
+        }
+        if(wide)run.template operator()<double>();else run.template operator()<float>();
     }
     restore_valid(s);
 }

@@ -39,6 +39,13 @@ template<std::size_t D = 0, bool Validity = false, class Real, class F> Real lin
         if (q[a] < -1 || q[a] > Real(g.shape[a])) return fill;
         lo[a] = std::int64_t(std::floor(q[a])); fraction[a] = q[a] - lo[a];
     }
+    const auto finish = [&](Real value) -> Real {
+        if constexpr(std::is_same_v<Real,float>) if(!std::isfinite(value)) {
+            const Point wide{double(q[0]),double(q[1]),double(q[2])};
+            return Real(linear_value<D,Validity>(g,wide,border,fill,[&](auto at){return double(get(at));}));
+        }
+        return value;
+    };
     // Interior stencils need no per-corner bounds checks. Keep the corner and
     // weight multiplication order identical to the boundary path below.
     bool interior = true;
@@ -61,7 +68,7 @@ template<std::size_t D = 0, bool Validity = false, class Real, class F> Real lin
                 else result += weight * get(at);
             }
         }
-        return Validity ? 1. : result;
+        return finish(Validity ? Real(1) : result);
     }
     for (std::size_t corner = 0; corner < (std::size_t(1) << d); ++corner) {
         bool valid = true; std::size_t at = 0; Real weight = 1;
@@ -76,7 +83,7 @@ template<std::size_t D = 0, bool Validity = false, class Real, class F> Real lin
             else result += weight * (valid ? Real(get(at)) : Real(fill));
         }
     }
-    return Validity ? 1. : result;
+    return finish(Validity ? Real(1) : result);
 }
 inline Point backward(const Parameters& p, Point out) {
     auto d = p.shape.size(); auto q = matvec(p.matrix, out, d);
@@ -494,16 +501,21 @@ template<std::size_t D,class Real> Array resize_array_impl(const Array& a, const
                         for (const auto& axis : q) at += axis.lo;
                         dst[i] = src[at];
                     } else {
-                        Real value = 0;
+                        const auto interpolate = [&]<class Acc>() {
+                        Acc value = 0;
                         for (std::size_t corner = 0; corner < (1u << D); ++corner) {
-                            Real weight = 1; std::size_t at = c * input.size;
+                            Acc weight = 1; std::size_t at = c * input.size;
                             for (std::size_t axis = 0; axis < D; ++axis) {
                                 bool hi = (corner >> axis) & 1;
-                                weight *= hi ? q[axis].fraction : 1 - q[axis].fraction;
+                                weight *= hi ? Acc(q[axis].fraction) : Acc(1) - Acc(q[axis].fraction);
                                 at += hi ? q[axis].hi : q[axis].lo;
                             }
-                            if (weight) value += weight * Real(src[at]);
+                            if (weight) value += weight * Acc(src[at]);
                         }
+                        return value;
+                        };
+                        Real value=interpolate.template operator()<Real>();
+                        if constexpr(std::is_same_v<Real,float>) if(!std::isfinite(value)) value=float(interpolate.template operator()<double>());
                         if constexpr (std::is_floating_point_v<T>) dst[i] = static_cast<T>(value);
                         else out.set(i, value);
                     }

@@ -24,6 +24,8 @@ class PrecisionTests(unittest.TestCase):
         reference = rng.random((1, 5, 7, 9), dtype=np.float32)
         transforms = [
             A.Elastic(sigma=3, magnitude=2, border=True), A.SheetCompression(strength=.2),
+            A.Affine(degrees=7, scale=.9, border=True), A.LowResolution(.7), A.ThickSlice(.7),
+            A.OrientedBlur(sigma_along=.7, sigma_across=.4, axis=(1, 2, 3)),
             A.BrightnessMultiply(1.2), A.BrightnessAdd(.1), A.Contrast(.8), A.Invert(),
             A.Gamma(.8), A.GaussianNoise(.1), A.RicianNoise(.1), A.ClipOutliers(),
             A.GaussianBlur(.7), A.MedianFilter(3), A.Sharpen(.1),
@@ -84,6 +86,21 @@ class PrecisionTests(unittest.TestCase):
             pipeline = A.Pipeline([A.Normalize('zscore', nonzero=False)], backend=backend)
             result = pipeline({'image': image}, seed=0)['image']
             np.testing.assert_allclose(result, reference, atol=2e-6, rtol=0)
+
+    def test_extreme_float32_intermediates_remain_finite(self):
+        image = np.full((1, 5, 7, 9), np.finfo(np.float32).max, dtype=np.float32)
+        for backend in self.backends():
+            for transform in (A.Affine(degrees=7, border=True), A.Elastic(sigma=3, magnitude=2, border=True),
+                              A.LowResolution(.7), A.OrientedBlur(.7, .4, axis=(1, 2, 3)),
+                              A.Defocus(radius=1), A.GibbsRinging(.8), A.Gamma(.8)):
+                with self.subTest(backend=backend, transform=repr(transform)):
+                    out = A.Pipeline([transform], backend=backend, compact=False)({'image': image}, seed=17)['image']
+                    self.assertTrue(np.isfinite(out).all())
+                    np.testing.assert_allclose(out, image, rtol=3e-6, atol=0)
+            # Squaring this input would overflow float32. hypot avoids promotion.
+            large = np.full_like(image, 1e30)
+            out = A.Pipeline([A.RicianNoise(.1)], backend=backend)({'image': large}, seed=17)['image']
+            np.testing.assert_array_equal(out, large)
 
     def test_explicit_float64_data_and_component_indices(self):
         image = np.full((1, 5, 7, 9), 1+2.**-40, dtype=np.float64)

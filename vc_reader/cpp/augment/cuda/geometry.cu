@@ -38,6 +38,24 @@ static int reflection_axes(const Parameters& p, const Shape& shape, const float*
     }
     return int(reflected);
 }
+template<class Acc, class T, class Real> __device__ Acc linear_sample(const T* src,Layout in,const long long* lo,
+                                                                    const Real* fraction,double fill,bool validity) {
+    Acc value=0;
+    for(int corner=0;corner<(1<<in.dim);++corner) {
+        Acc weight=1;std::size_t at=0;bool valid=true;
+        for(int a=0;a<in.dim;++a) {
+            const int bit=(corner>>a)&1;const auto x=lo[a]+bit;
+            weight*=bit?Acc(fraction[a]):Acc(1)-Acc(fraction[a]);
+            if(x<0 || x>=static_cast<long long>(in.shape[a]))valid=false;else at+=x*in.stride[a];
+        }
+        if(weight) {
+            const Acc neighbor=valid?Acc(src[at]):Acc(fill);
+            if(validity){if(neighbor<Acc(1))return 0;}
+            else value+=weight*neighbor;
+        }
+    }
+    return validity?Acc(1):value;
+}
 template<class T, class Real> __global__ void geometry_kernel(const T* src, T* dst, Layout in, Layout out, std::size_t channels, GeometryArgs<Real> p, const float* field, T pad, int* used_pad) {
     EACH_INDEX(out.size*channels) {
         const auto voxel = i%out.size, channel = i/out.size;
@@ -62,21 +80,12 @@ template<class T, class Real> __global__ void geometry_kernel(const T* src, T* d
             else { dst[i] = pad; if (used_pad) atomicExch(used_pad,1); }
         } else {
             using Value = std::conditional_t<std::is_same_v<T,double>,double,Real>;
-            Value value = 0; bool support = true;
-            for (int corner = 0; corner < (1<<out.dim); ++corner) {
-                Real weight = 1; std::size_t at = 0; bool valid = true;
-                for (int a = 0; a < out.dim; ++a) {
-                    int bit = (corner>>a)&1; auto x = lo[a]+bit;
-                    weight *= bit ? fraction[a] : 1-fraction[a];
-                    if (x < 0 || x >= static_cast<long long>(in.shape[a])) valid = false; else at += x*in.stride[a];
-                }
-                if (weight) {
-                    const Value neighbor = valid ? Value(src[channel*in.size+at]) : Value(p.fill);
-                    if (p.validity) { if (neighbor < 1.) { support = false; break; } }
-                    else value += weight*neighbor;
-                }
+            Value value=linear_sample<Value>(src+channel*in.size,in,lo,fraction,p.fill,p.validity);
+            if constexpr(std::is_same_v<Value,float>) {
+                // A float32 weighted sum can overflow near FLT_MAX even when
+                // the convex interpolation result is representable.
+                if(!isfinite(value)) value=float(linear_sample<double>(src+channel*in.size,in,lo,fraction,p.fill,p.validity));
             }
-            if (p.validity) value = Value(support);
             dst[i] = T(value);
         }
     }

@@ -142,7 +142,7 @@ public:
             }
             if (attempt < options_.retries) {
                 std::this_thread::sleep_for(std::chrono::duration<float>(delay));
-                delay = std::min(delay * 2, 8.0);
+                delay = std::min(delay * 2, 8.0f);
             }
         }
         throw std::runtime_error("GET " + url + " failed after " + std::to_string(options_.retries + 1) +

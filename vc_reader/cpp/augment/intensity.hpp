@@ -191,7 +191,12 @@ inline void gamma_values(std::vector<T>& v, const ChannelPlan& p, Statistics&& s
     if (invert) for (auto& x : v) x = -x;
     const auto before = retain ? statistics(v) : std::pair{0., 0.};
     const auto [low, high] = bounds(v); double range = high - low;
-    for (auto& x : v) x = intensity_power<T>((x - low) / std::max(range, 1e-7), p.values[0]) * range + low;
+    for (auto& x : v) {
+        T value=std::pow((x-T(low))/std::max(T(range),T(1e-7)),T(p.values[0]))*T(range)+T(low);
+        if constexpr(std::is_same_v<T,float>) if(!std::isfinite(value) || !std::isfinite(T(range)))
+            value=T(std::pow((double(x)-low)/std::max(range,1e-7),p.values[0])*range+low);
+        x=value;
+    }
     if (retain) {
         const auto after = statistics(v); double scale = before.second / std::max(after.second, 1e-7);
         for (auto& x : v) x = (x - after.first) * scale + before.first;
@@ -491,8 +496,13 @@ inline void channel_apply(const Sharpen&, std::vector<T>& v, const Grid& g, cons
     v.swap(output);
 }
 template<class Values> void channel_apply(const BrightnessGradient& t, Values& v, const Grid&, const ChannelPlan& p) {
-    auto [lo, hi] = std::minmax_element(v.begin(), v.end()); double low = *lo, high = *hi;
-    for (std::size_t i = 0; i < v.size(); ++i) { double value = double(v[i]) + p.field[i] * p.values[0]; if (t.clip) value = std::clamp(value, low, high); v[i] = value; }
+    using T=typename Values::value_type;
+    auto [lo, hi] = std::minmax_element(v.begin(), v.end()); T low = *lo, high = *hi;
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        T value=v[i]+T(p.field[i])*T(p.values[0]);
+        if constexpr(std::is_same_v<T,float>) if(!std::isfinite(value)) value=T(double(v[i])+p.field[i]*p.values[0]);
+        if(t.clip)value=std::clamp(value,low,high);v[i]=value;
+    }
 }
 template<class Values> double local_mean(const Values& v, const std::vector<float>& field) {
     double sum = 0, weight = 1e-8;
@@ -500,20 +510,33 @@ template<class Values> double local_mean(const Values& v, const std::vector<floa
     return sum / weight;
 }
 template<class Values> void channel_apply(const LocalContrast&, Values& v, const Grid&, const ChannelPlan& p) {
-    double m = local_mean(v, p.field);
-    for (std::size_t i = 0; i < v.size(); ++i) v[i] = v[i] * (1 - p.field[i]) + ((v[i] - m) * p.values[0] + m) * p.field[i];
+    using T=typename Values::value_type;
+    const double wide_mean=local_mean(v,p.field);const T m=T(wide_mean),factor=T(p.values[0]);
+    for (std::size_t i=0;i<v.size();++i) {
+        const T w=T(p.field[i]);T value=v[i]*(T(1)-w)+((v[i]-m)*factor+m)*w;
+        if constexpr(std::is_same_v<T,float>) if(!std::isfinite(value))
+            value=T(double(v[i])*(1-double(w))+((double(v[i])-wide_mean)*p.values[0]+wide_mean)*w);
+        v[i]=value;
+    }
 }
 template<class Values> void channel_apply(const LocalGamma&, Values& v, const Grid&, const ChannelPlan& p) {
     using T = typename Values::value_type;
-    auto [lo, hi] = std::minmax_element(v.begin(), v.end()); double low = *lo, span = std::max(*hi - low, 1e-8);
-    for (std::size_t i = 0; i < v.size(); ++i) { double norm = (v[i] - low) / span; v[i] = (norm * (1 - p.field[i]) + intensity_power<T>(norm, p.values[0]) * p.field[i]) * span + low; }
+    auto [lo, hi] = std::minmax_element(v.begin(), v.end());T low=*lo,span=std::max(*hi-low,T(1e-8));const double wide_low=*lo,wide_high=*hi;
+    for (std::size_t i=0;i<v.size();++i) {
+        const T norm=(v[i]-low)/span,w=T(p.field[i]);T value=(norm*(T(1)-w)+std::pow(norm,T(p.values[0]))*w)*span+low;
+        if constexpr(std::is_same_v<T,float>) if(!std::isfinite(value)) {
+            const double range=std::max(wide_high-wide_low,1e-8),n=(double(v[i])-wide_low)/range;
+            value=T((n*(1-double(w))+std::pow(n,p.values[0])*w)*range+wide_low);
+        }
+        v[i]=value;
+    }
 }
 template<class Values>
 inline void channel_apply(const LocalSmoothing&, Values& v, const Grid& g, const ChannelPlan& p) {
     using T = typename Values::value_type;
     std::vector<T> smoothed(v.begin(), v.end());
     gaussian_blur(smoothed, g, std::vector<double>(g.shape.size(), p.values[1]));
-    for (std::size_t i = 0; i < v.size(); ++i) { T w = T(p.field[i] * p.values[0]); v[i] = v[i] * (T(1) - w) + smoothed[i] * w; }
+    for (std::size_t i = 0; i < v.size(); ++i) { T w = T(p.field[i]) * T(p.values[0]); v[i] = v[i] * (T(1) - w) + smoothed[i] * w; }
 }
 // Shared region/statistic calculation; overlapping boxes observe earlier fills.
 struct RectangleRegion {
@@ -558,7 +581,7 @@ template<class Values> void channel_apply(const SliceIllumination&, Values& v, c
         for (std::size_t x = 0; x < g.shape[a]; ++x)
             for (std::size_t j = 0; j < g.stride[a]; ++j) {
                 auto i = base + x * g.stride[a] + j;
-                v[i] = double(v[i]) * p.field[x];
+                v[i] *= typename Values::value_type(p.field[x]);
             }
 }
 template<class T> inline void channel_apply(const Smear& t, std::vector<T>& v, const Grid& g, const ChannelPlan& p) {
