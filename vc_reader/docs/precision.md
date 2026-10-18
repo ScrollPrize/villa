@@ -21,6 +21,14 @@ images retain float64 weights and arithmetic. Identity reductions skip sampling.
 This changes rounding, but not the selected nearest neighbors, half-pixel mapping,
 boundary clamping, random draws, or channel/target selection.
 
+CUDA size-3 median filters share sorted columns between neighboring outputs and
+select the middle rank with the same compile-time network generator used by the
+CPU selector. Float32 inputs stay float32; explicit float64 inputs stay float64.
+The neighborhood and reflection rule are unchanged, and the result remains an
+exact selected value (or the selected quantized palette value when requested).
+Ties between signed zeros may choose either sign. Single-channel CUDA results
+replace the working buffer without an additional image copy.
+
 Local brightness, contrast, gamma and smoothing fields store four float32
 normalization scalars and one float32 vector per spatial axis. Both CPU and CUDA
 evaluate their separable product while consuming the image. Centered brightness

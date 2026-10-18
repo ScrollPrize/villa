@@ -11,8 +11,115 @@ Release extensions for every suite. The refresh manifest (`docs/benchmarks/refre
 records report hashes and coverage. Current results are in the PyTorch, resident
 geometry, augmentation catalog, and reader/pipeline sections. The two optimization
 history sections are explicitly marked historical and retain their original data.
-The statistics, resize, Gaussian and compact-field experiments below measure subsequent changes
+The median, statistics, resize, Gaussian and compact-field experiments below measure subsequent changes
 separately; they do not replace the catalog-wide refresh.
+
+## Reuse overlapping median neighborhoods (2026-10-17)
+
+CUDA size-3 median filtering sorts three-value columns once per thread and
+shares them with adjacent X outputs through warp shuffles. A 3D interior output
+loads nine source values instead of 27; warp endpoints load missing columns
+explicitly. A shared compile-time odd-even merge generator selects the exact
+middle rank from the sorted columns. The 2D path uses the same mechanism for
+nine neighbors, replacing repeated full-neighborhood IEEE-key searches.
+Reflection, channel selection, quantization options, and output dtypes are
+unchanged. Single-channel CUDA outputs replace the working buffer, removing an
+8 MiB copy per 128³ float32 crop; multiple channels retain per-channel copies.
+Index arithmetic uses uint32 when the volume fits and size_t otherwise.
+
+Measured against the saved clean `c169c451e` extension on Linux amd64 / RTX 5090,
+Release, CUDA architecture 120. The loader uses PHercParis4 level-2 128³ CT crops,
+min-max normalization, and the shared 12-transform `heavy_transforms()` chain.
+There are four spawned workers, four reader threads per worker, and four crops
+per batch. Each route has a validation/warmup epoch and three repetitions of
+64 batches with rotating route order and warm caches. Two runs per
+build give **384 measurements per route/build**. These results use the two after
+runs followed by two baseline runs; the earlier exploratory baseline is excluded.
+Reads, transfers, casts, augmentation, collation, disposal and stream completion
+are included; model computation is excluded. All 256 validation crop hashes
+match across routes, runs, and builds. Values are **mean / p50 / p95 milliseconds**.
+
+| Loader route | Before | After | Crops/s before → after |
+| --- | ---: | ---: | ---: |
+| `Pipeline.batch()` | 3.580 / 3.117 / 4.363 | 3.404 / 2.977 / 3.868 | 1116.37 → 1174.31 (+5.2%) |
+| `CudaLoader` prefetch | 3.398 / 3.009 / 3.909 | 3.274 / 2.899 / 3.739 | 1176.49 → 1220.92 (+3.8%) |
+
+Separate Nsight Systems traces cover four validation/warmup and four measured
+batches (32 crops). Baseline leading groups are median filtering (10.4% of kernel
+time), strided Gaussian convolution (9.6%), and geometry sampling (9.5%). Median
+kernel mean / p50 / p95 time falls **56.459 / 56.384 / 56.811 µs →
+31.338 / 31.312 / 31.616 µs**, a 44.5% reduction in mean time. Device-to-device
+copies fall **160 → 128**, removing **256 MiB** across the trace. The leading
+remaining groups are sharpening, strided convolution, and geometry sampling;
+sharpening includes a scheduling outlier. Instrumented timings are excluded
+from the throughput measurements. Kernel summaries are in local ignored
+`docs/benchmarks/median-profile-{before,after}.csv`; traces are
+`/tmp/median-profile-before.nsys-rep` and `/tmp/median-prototype.nsys-rep`.
+
+Isolated `MedianFilter(3)` calls use the float32 CT crop at `(9000, 3600, 3600)`,
+divided by 255, with one CPU thread. The 3D input is 128³; the 2D input is a
+512×512 Z plane. Each route has five warmups followed by 60 measurements with
+seeds 123–182 and deterministically shuffled route order. The 3D results combine
+two after/before blocks (120 measurements); 2D uses one before/after block (60).
+Public-call input preservation and validation are included. Reads, preparation,
+comparisons, output disposal, and initial resident upload/final download are
+excluded; uploaded CUDA includes transfers. CPU/CUDA outputs match exactly.
+
+| Input / route | Before mean / p50 / p95 ms | After mean / p50 / p95 ms |
+| --- | ---: | ---: |
+| 128³ CPU | 16.158 / 16.105 / 16.679 | 16.001 / 15.953 / 16.200 |
+| 128³ CUDA uploaded | 1.477 / 1.470 / 1.774 | 1.416 / 1.392 / 1.744 |
+| 128³ CUDA resident | 0.182 / 0.176 / 0.231 | 0.159 / 0.164 / 0.208 |
+| 512² CPU | 5.428 / 5.444 / 5.488 | 5.469 / 5.468 / 5.495 |
+| 512² CUDA uploaded | 0.512 / 0.507 / 0.561 | 0.202 / 0.191 / 0.248 |
+| 512² CUDA resident | 0.370 / 0.365 / 0.432 | 0.069 / 0.051 / 0.149 |
+
+The 2D resident p50 improves 7.2×. Host overhead and timing variability limit
+isolated 3D gains; CPU timings are essentially unchanged. These are throughput
+and numerical checks, not model-quality measurements. All 43 tests pass with
+CUDA; all 18 precision tests pass in the CPU-only build. Independent NumPy rank
+references cover 2D/3D, singleton axes, row/warp/block boundaries, partial warps,
+float32/float64, selected channels, exact palettes, quantization, finite extremes,
+signed zeros, even windows, validity masks, input preservation and pickle replay.
+Batch tests cover retained outputs, nondefault streams and training backward.
+Signed-zero tie signs are not guaranteed. macOS/arm64 and volumes needing
+64-bit CUDA indexing were not runtime-tested. One loader run emitted the existing
+Python resource-tracker semaphore cleanup warning after completing successfully.
+
+Raw local reports are `docs/benchmarks/median-{before-repeat,before-clean,after,after-repeat}.json`,
+`median-plane-{before,after}.json`, and `median-loader-{before-repeat,before-clean,after,after-repeat}.json`.
+`median-summary.json` combines the samples and checks validation hashes. Reports
+retain commands, configuration, extension hashes, raw timings and comparisons.
+
+Reproduce with the existing environment/builds (no installation). Use
+`/tmp/vc-median-before` for the saved baseline, and distinct report paths for
+repetitions. `--plane` reads a single Z plane and supports image-only/strip
+recipes; it cannot update the cubic-volume README timing tables.
+
+```bash
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-reader-cuda --target _augment --parallel 4
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-volume-cpu --target _augment --parallel 2
+VC_BENCH_VOLUME=/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  .venv/bin/python benchmarks/bench_augmentations.py \
+  --native-dir /tmp/vc-reader-cuda --array "$VC_BENCH_VOLUME" \
+  --only MedianFilter --warmup 5 --reps 60 --output /tmp/median-after.json
+# Add --plane --size 512 and use a distinct output path for the 2D measurement.
+AGENTS_AGENT_MODE=1 .venv/bin/python benchmarks/bench_torch.py \
+  --native-dir /tmp/vc-reader-cuda --modes batch prefetch \
+  --array "$VC_BENCH_VOLUME" --level 2 --batches 64 --batch-size 4 --reps 3 \
+  --output /tmp/median-loader-after.json
+AGENTS_AGENT_MODE=1 nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
+  --force-overwrite=true --output=/tmp/median-profile-after \
+  .venv/bin/python benchmarks/bench_torch.py --native-dir /tmp/vc-reader-cuda \
+  --modes prefetch --array "$VC_BENCH_VOLUME" --level 2 \
+  --batches 4 --batch-size 4 --reps 1 --output /tmp/median-profile-after.json
+nsys stats --report cuda_gpu_kern_sum,cuda_gpu_mem_size_sum --format csv /tmp/median-profile-after.nsys-rep
+AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=/tmp/vc-reader-cuda \
+  .venv/bin/python -m unittest discover -s tests -v
+AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=/tmp/vc-volume-cpu \
+  .venv/bin/python -m unittest discover -s tests -p test_precision.py -v
+```
 
 ## Remove unused CUDA statistics (2026-10-17)
 
