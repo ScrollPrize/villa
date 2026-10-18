@@ -117,7 +117,14 @@ public:
     void setCorrectionCollections(const QVector<QPair<uint64_t, QString>>& collections,
                                    std::optional<uint64_t> activeId);
     void setGrowthSteps(int steps, bool persist = true);
+    void setGrowthScale(int scale);
+    void setCorrectionsZRange(bool enabled, int zMin, int zMax);
+    void setAllowedGrowthDirections(const std::vector<SegmentationGrowthDirection>& directions);
+    void setPatchTracerParams(const utils::Json& params);
+    bool selectGrowthVolume(const QString& volumeId);
+    void setDirectionFieldConfigs(const std::vector<SegmentationDirectionFieldConfig>& configs);
     [[nodiscard]] std::optional<std::pair<int, int>> correctionsZRange() const;
+    [[nodiscard]] std::pair<int, int> correctionsZBounds() const;
 
     [[nodiscard]] std::vector<SegmentationGrowthDirection> allowedGrowthDirections() const;
     [[nodiscard]] std::vector<SegmentationDirectionFieldConfig> directionFieldConfigs() const;
