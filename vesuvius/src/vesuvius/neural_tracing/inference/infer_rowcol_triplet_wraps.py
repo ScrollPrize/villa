@@ -766,7 +766,15 @@ def parse_args(argv=None):
         help="Number of worker threads used to prepare per-bbox crop inputs.",
     )
 
-    parser.add_argument("--bbox-overlap", type=float, default=0.0)
+    parser.add_argument(
+        "--bbox-overlap",
+        type=float,
+        default=0.5,
+        help=(
+            "Overlap fraction for Copy inference crops (default: 0.5 to reduce "
+            "block-edge seams). Pass 0.0 to restore the previous faster behavior."
+        ),
+    )
     parser.add_argument("--bbox-prune", dest="bbox_prune", action="store_true")
     parser.add_argument("--no-bbox-prune", dest="bbox_prune", action="store_false")
     parser.set_defaults(bbox_prune=True)
