@@ -1,6 +1,8 @@
 #include "ProjectAttachmentController.hpp"
 
+#include <QDir>
 #include <QFileInfo>
+#include <QSettings>
 #include <QFutureWatcher>
 #include <QtConcurrent>
 
@@ -14,6 +16,7 @@
 
 #include "CState.hpp"
 #include "CWindow.hpp"
+#include "FiberCollectionController.hpp"
 #include "ProjectLocations.hpp"
 #include "VCSettings.hpp"
 #include "VolumeAttachmentController.hpp"
@@ -377,4 +380,67 @@ bool ProjectAttachmentController::startLasagnaAttachment(
         return result;
     }));
     return true;
+}
+
+ProjectAttachmentOutcome ProjectAttachmentController::saveProjectAs(const QString& path)
+{
+    ProjectAttachmentOutcome outcome;
+    if (!hasProject(&outcome)) {
+        return outcome;
+    }
+    QString file = path.trimmed();
+    if (file.isEmpty()) {
+        return failure(Error::InvalidLocation, file, QObject::tr("Project path must not be blank."));
+    }
+    if (!file.endsWith(QStringLiteral(".volpkg.json"), Qt::CaseInsensitive)) {
+        file += QStringLiteral(".volpkg.json");
+    }
+    file = QFileInfo(file).absoluteFilePath();
+    outcome.location = file;
+
+    auto pkg = _window->_state->vpkg();
+    const fs::path oldDir = pkg->path().parent_path();
+    const fs::path newDir = fs::path(file.toStdString()).parent_path();
+    try {
+        pkg->save(fs::path(file.toStdString()));
+    } catch (const std::exception& e) {
+        return failure(Error::Failed, file, QString::fromUtf8(e.what()));
+    }
+    outcome.success = true;
+    outcome.changed = true;
+
+    std::error_code ec;
+    if (!fs::equivalent(oldDir, newDir, ec)) {
+        QStringList relative;
+        auto collect = [&relative](const std::vector<vc::project::Entry>& entries) {
+            for (const auto& entry : entries) {
+                if (!vc::project::isLocationRemote(entry.location) &&
+                    !vc::project::resolveLocalPath(entry.location).is_absolute()) {
+                    relative << QString::fromStdString(entry.location);
+                }
+            }
+        };
+        collect(pkg->volumeEntries());
+        collect(pkg->segmentEntries());
+        collect(pkg->normalGridEntries());
+        collect(pkg->allLasagnaDatasetEntries());
+        collect({{pkg->umbilicus(), {}}});
+        relative.removeAll(QString());
+        if (!relative.isEmpty()) {
+            outcome.warnings << QObject::tr("These relative locations now resolve against %1: %2")
+                                    .arg(QString::fromStdString(newDir.string()),
+                                         relative.join(QStringLiteral(", ")));
+        }
+    }
+
+    FiberCollectionController* collection = _window->_fiberCollection.get();
+    if (collection && !collection->collectionPath().isEmpty() &&
+        !collection->saveAttachmentRecord()) {
+        outcome.warnings << QObject::tr("The automated fiber volume's attachment could not "
+                                        "be saved beside the new project file.");
+    }
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue(vc3d::settings::project::DEFAULT_PATH, QFileInfo(file).absolutePath());
+    return outcome;
 }

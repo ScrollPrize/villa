@@ -1770,13 +1770,15 @@ void MenuActionController::saveProjectAs()
         _window, QObject::tr("Save Project As"), defaultDir,
         QObject::tr("Project (*.volpkg.json)"));
     if (file.isEmpty()) return;
-    if (!file.endsWith(".volpkg.json", Qt::CaseInsensitive)) file += ".volpkg.json";
-    try {
-        _window->_state->vpkg()->save(std::filesystem::path(file.toStdString()));
-        settings.setValue(vc3d::settings::project::DEFAULT_PATH, QFileInfo(file).absolutePath());
-        updateRecentVolpkgList(file);
-    } catch (const std::exception& e) {
-        QMessageBox::warning(_window, QObject::tr("Save failed"), QString::fromUtf8(e.what()));
+    const auto outcome = _window->_projectAttachmentController->saveProjectAs(file);
+    if (!outcome.success) {
+        QMessageBox::warning(_window, QObject::tr("Save failed"), outcome.error);
+        return;
+    }
+    updateRecentVolpkgList(outcome.location);
+    if (!outcome.warnings.isEmpty()) {
+        QMessageBox::information(_window, QObject::tr("Save Project As"),
+                                 outcome.warnings.join(QStringLiteral("\n\n")));
     }
 }
 

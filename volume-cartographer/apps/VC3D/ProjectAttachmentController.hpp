@@ -76,6 +76,15 @@ public:
                                 ProjectAttachmentOutcome* refusal = nullptr);
     bool lasagnaAttachmentInFlight() const { return _lasagnaInFlight; }
 
+    // Writes the open project to `path` (".volpkg.json" is appended when
+    // missing) and continues the session on that file, like Save As in any
+    // editor: later changes persist there, and relative locations resolve
+    // against its folder (each relative entry is named in a warning when the
+    // folder changes). An open automated fiber volume's attachment record is
+    // written beside the new file. The folder is remembered for file dialogs;
+    // callers list the file among recent projects.
+    ProjectAttachmentOutcome saveProjectAs(const QString& path);
+
 private:
     bool hasProject(ProjectAttachmentOutcome* outcome) const;
 
