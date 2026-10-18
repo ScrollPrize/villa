@@ -8,17 +8,22 @@ from vc_reader import load, ScrollSource
 catalog = load()
 scroll = ScrollSource("PHerc0009B", "20250820154339", catalog=catalog)
 segment = scroll.segments["20250919125754"]
-label = segment.labels.ink.one(label_set="20260918")
-render = label.renders.zarr.one()
+label = segment.labels.ink(label_set="20260918")
+image = label.images.zarr()
 
-with label.open_paired(render=render, layers=slice(40, 65), backend="cpu") as reader:
+with label.open_paired(image=image, layers=slice(40, 65), backend="cpu") as reader:
     patch = reader[18576:18704, 7984:8112]
-    image = patch.data["image"]              # (1, 25, 128, 128)
-    ink = patch.data["label"]                # (1, 128, 128)
-    supervision = patch.masks["label"]["supervision"]
-    validation = patch.masks["label"]["validation"]
-    geometric_validity = patch.valid["label"]
+    image_data = patch.image.data         # (1, 25, 128, 128)
+    ink = patch.label.data                # (1, 128, 128)
+    supervision = patch.label.masks["supervision"]
+    validation = patch.label.masks["validation"]
+    mesh_valid = patch.label.valid
 ```
+
+`patch` is the sampled crop. Each target groups its data, geometric validity,
+and companion masks: `patch.label` holds the cropped ink and its masks, while
+`patch.image` holds the CT layers. Named targets are also accessible through
+`patch[name]`; `patch.targets` contains the target mapping.
 
 This published crop contains **9,926 nonzero ink pixels**. CT, ink, and both
 masks are checked against independently opened arrays by
@@ -27,12 +32,14 @@ contains sampled surface layers. Labels stay two-dimensional; masks retain
 their published values without choosing a training policy. `backend="cuda"`
 returns device arrays in the process that owns the GPU.
 
-Browse `scroll.volumes`, `scroll.segments`, `scroll.labels.ink`,
-`scroll.renders.zarr`, `scroll.representations`, and `scroll.geometry`.
+Browse `scroll.volumes`, `scroll.segments`, `scroll.labels`,
+`scroll.images`, `scroll.representations`, and `scroll.geometry`.
 `label.volume` is its native target; `label.mappable_volumes` lists explicit
 transforms, known coverage, and required operations such as surface projection.
-`render.labels.ink` follows the same relationships in reverse. `.one()` raises
-with candidates when selection is missing or ambiguous.
+`image.labels.ink(label_set="20260918")` follows the same relationships in
+reverse. `.ink(...)` returns the matching label and raises with candidates when
+none or multiple match. Use `.labels.filter(artifact_kind="ink-labels")` to
+browse multiple ink labels.
 
 `catalog.samples[id]` and `ScrollSource(...)` return the same kind of view.
 `catalog.scrolls` filters samples to published type `scroll`; PHerc0009B is
@@ -49,7 +56,7 @@ paris = catalog.scrolls["PHercParis4"].volumes.at_resolution(8.0, rel_tol=0.02)
 for match in paris:
     print(match.volume.id, match.level, match.estimated_resolution_um, match.verified)
 
-candidate = paris.one(volume="20230206171837")
+candidate = paris.get(volume="20230206171837")
 confirmed = candidate.resolve()  # reads headers; confirms selection, spacing, shape
 with candidate.open() as ct:
     crop = ct[100:104, 200:204, 300:304]
@@ -67,22 +74,22 @@ contradictions. It never resamples CT to satisfy a resolution query.
 from vc_reader import Source, Storage
 
 view = scroll.with_source(
-    Source("my-render", Storage("/data/render.zarr", "zarr"),
+    Source("my-image", Storage("/data/image.zarr", "zarr"),
            role="image", axes=("z", "y", "x")),
-    kind="render", volume=scroll.volume, segment="user:my-segment",
+    kind="image", volume=scroll.volume, segment="user:my-segment",
 )
 view = view.with_source(
     Source("my-ink", Storage("/data/ink.png", "png"),
            role="label", axes=("y", "x"), artifact_kind="ink-labels"),
     kind="label", volume=scroll.volume, segment="user:my-segment",
-    render="user:my-render", same_grid=True,
+    image="user:my-image", same_grid=True,
 )
 with view.labels["user:my-ink"].open_paired() as reader:
     patch = reader[:128, :128]
 ```
 
 Custom pairs require `same_grid=True` or an explicit 2×3 `pixel_affine` mapping
-label XY pixels into render XY pixels. Volume-aligned labels and representations
+label XY pixels into image XY pixels. Volume-aligned labels and representations
 use `VolumeRegistration` and `volume.open_aligned(...)`. Unregistered sources
 remain raw-readable through `.open()`. Overlays preserve published metadata and
 serialize with `view.to_dict()` / `ScrollSource.from_dict(...)`.

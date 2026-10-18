@@ -20,7 +20,7 @@ def host(value):
 
 def read_worker(reader):
     with reader:
-        return reader[1:3, 2:5].data
+        return reader[1:3, 2:5]
 
 
 def pyramid(path, values, scales):
@@ -49,8 +49,8 @@ class PairedTests(unittest.TestCase):
         return Source(name, Storage(str(path), 'zarr'), role=role, axes=axes)
 
     def pair(self, render, label, **mapping):
-        scroll = self.scroll.with_source(render, kind='render', volume='v')
-        scroll = scroll.with_source(label, kind='label', volume='v', render=render.id, **(mapping or {'same_grid': True}))
+        scroll = self.scroll.with_source(render, kind='image', volume='v')
+        scroll = scroll.with_source(label, kind='label', volume='v', image=render.id, **(mapping or {'same_grid': True}))
         return scroll.labels[label.id]
 
     def backends(self):
@@ -65,31 +65,42 @@ class PairedTests(unittest.TestCase):
         label = replace(label, companions=(Companion('supervision', mask, True),))
         asset = self.pair(render, label)
         for backend in self.backends():
-            with asset.open_paired(layers=slice(1, 4), backend=backend) as reader:
+            with asset.open_paired(image=asset.images.zarr(), layers=slice(1, 4), backend=backend) as reader:
                 patch = reader[-6:-2, -7:-2]
-                np.testing.assert_array_equal(host(patch.data['image']), image[:, 1:4, 1:5, 2:7])
-                np.testing.assert_array_equal(host(patch.data['label']), labels[None, 1:5, 2:7])
-                np.testing.assert_array_equal(host(patch.masks['label']['supervision']), 128)
-                self.assertEqual(patch.valid['label'].shape, (1, 4, 5))
+                self.assertEqual(patch.metadata['image_id'], asset.images.zarr().id)
+                self.assertIs(patch.image, patch['image'])
+                self.assertIs(patch.label, patch['label'])
+                self.assertEqual(patch.image.masks, {})
+                np.testing.assert_array_equal(host(patch['image'].data), image[:, 1:4, 1:5, 2:7])
+                np.testing.assert_array_equal(host(patch['label'].data), labels[None, 1:5, 2:7])
+                np.testing.assert_array_equal(host(patch['label'].masks['supervision']), 128)
+                self.assertEqual(patch['label'].valid.shape, (1, 4, 5))
                 np.testing.assert_array_equal(host(reader['image'][1, -1, 2:5, 3:6]), image[1, 3, 2:5, 3:6])
                 np.testing.assert_array_equal(host(reader['label'][0, -1, -1]), labels[-1, -1])
-                self.assertEqual(reader[3, 2:4].data['image'].shape, (2, 3, 2))
-                self.assertEqual(reader[3, 2:4].data['label'].shape, (1, 2))
-                self.assertEqual(reader[:0, :].data['image'].shape, (2, 3, 0, 9))
+                self.assertEqual(reader[3, 2:4]['image'].data.shape, (2, 3, 2))
+                self.assertEqual(reader[3, 2:4]['label'].data.shape, (1, 2))
+                row = reader[3, 2:4].label
+                self.assertEqual(row.valid.shape, (1, 2))
+                np.testing.assert_array_equal(host(row.masks['supervision']), [[128, 128]])
+                crops = reader.read_many([((1, 2), (2, 3)), ((4, 5), (1, 2))])
+                crops[0].label.masks.clear()
+                self.assertEqual(crops[1].label.masks['supervision'].shape, (1, 1, 2))
+                self.assertEqual(patch.label.masks['supervision'].shape, (1, 4, 5))
+                self.assertEqual(reader[:0, :]['image'].data.shape, (2, 3, 0, 9))
                 self.assertEqual(reader['image'][:0, :, :, :].shape, (0, 3, 7, 9))
                 with self.assertRaises(IndexError):
                     reader[99, :]
                 with self.assertRaises(IndexError):
                     reader[::2, :]
                 clipped = reader[-100:100, :]
-                self.assertEqual(clipped.data['label'].shape, (1, 7, 9))
+                self.assertEqual(clipped['label'].data.shape, (1, 7, 9))
                 reader[0:1, 0:1]
-            np.testing.assert_array_equal(host(patch.data['label']), labels[None, 1:5, 2:7])
+            np.testing.assert_array_equal(host(patch['label'].data), labels[None, 1:5, 2:7])
             with asset.open_paired(layers=-1, backend=backend) as reader:
-                np.testing.assert_array_equal(host(reader[:2, :3].data['image']), image[:, -1, :2, :3])
+                np.testing.assert_array_equal(host(reader[:2, :3]['image'].data), image[:, -1, :2, :3])
             with asset.open_paired(layers=slice(0, 0), backend=backend) as reader:
-                self.assertEqual(reader[:2, :3].data['image'].shape, (2, 0, 2, 3))
-                self.assertEqual(reader[:2, :3].data['label'].shape, (1, 2, 3))
+                self.assertEqual(reader[:2, :3]['image'].data.shape, (2, 0, 2, 3))
+                self.assertEqual(reader[:2, :3]['label'].data.shape, (1, 2, 3))
 
     def test_affine_exact_categories_validity_padding_and_cache(self):
         image = np.zeros((3, 8, 10), 'uint8')
@@ -109,13 +120,13 @@ class PairedTests(unittest.TestCase):
             with asset.open_paired(backend=backend, sampling_cache_bytes=1024, plan_cache_bytes=1024) as reader:
                 for _ in range(2):
                     result = reader[:, :]
-                    np.testing.assert_array_equal(host(result.data['label']), expected)
-                    np.testing.assert_array_equal(host(result.valid['label']), valid)
+                    np.testing.assert_array_equal(host(result['label'].data), expected)
+                    np.testing.assert_array_equal(host(result['label'].valid), valid)
                 stats = reader.stats()
                 self.assertLessEqual(stats['tile_cache_bytes'], 1024)
                 self.assertLessEqual(stats['plan_cache_bytes'], 1024)
                 padded = reader.read((-3, -2), (5, 4))
-                self.assertFalse(host(padded.valid['image'])[..., :3, :].any())
+                self.assertFalse(host(padded['image'].valid)[..., :3, :].any())
 
     def test_small_affine_difference_on_large_canvas_is_not_snapped(self):
         width = 20000001
@@ -136,7 +147,7 @@ class PairedTests(unittest.TestCase):
         # small scale difference would instead select the next chunk's class.
         for backend in self.backends():
             with asset.open_paired(backend=backend) as reader:
-                np.testing.assert_array_equal(host(reader[:,10000000:10000001].data['label']), [[[99]]])
+                np.testing.assert_array_equal(host(reader[:,10000000:10000001]['label'].data), [[[99]]])
 
     def test_independent_pyramids_choose_matching_grid_or_sample_base(self):
         image = np.arange(3*8*10, dtype='uint16').reshape(3, 8, 10)
@@ -151,24 +162,24 @@ class PairedTests(unittest.TestCase):
             with asset.open_paired(level=1, backend=backend) as reader:
                 self.assertEqual(reader.metadata['label_selection'].array_path, '2')
                 result = reader[:, :]
-                np.testing.assert_array_equal(host(result.data['image']), image[None, :, ::2, ::2])
-                np.testing.assert_array_equal(host(result.data['label']), labels[None, ::2, ::2])
-                np.testing.assert_array_equal(host(result.masks['label']['validation']), 255)
+                np.testing.assert_array_equal(host(result['image'].data), image[None, :, ::2, ::2])
+                np.testing.assert_array_equal(host(result['label'].data), labels[None, ::2, ::2])
+                np.testing.assert_array_equal(host(result['label'].masks['validation']), 255)
         # With no matching stored label level, resample categorical base values.
         label2 = self.source('labels2', labels, 'label')
         asset = self.pair(render, label2)
         with asset.open_paired(level=1) as reader:
-            np.testing.assert_array_equal(reader[:, :].data['label'], labels[None, ::2, ::2])
+            np.testing.assert_array_equal(reader[:, :]['label'].data, labels[None, ::2, ::2])
         with self.assertRaises((ValueError, FileNotFoundError)):
             asset.open_paired(level=3)
 
     def test_no_implicit_pairing_and_reject_contradictory_grids(self):
         render = self.source('r', np.zeros((2, 4, 5), 'uint8'), 'image')
         label = self.source('l', np.zeros((4, 5), 'uint8'), 'label')
-        scroll = self.scroll.with_source(render, kind='render', volume='v').with_source(label, kind='label', volume='v')
-        self.assertFalse(scroll.labels.one().renders)
+        scroll = self.scroll.with_source(render, kind='image', volume='v').with_source(label, kind='label', volume='v')
+        self.assertFalse(scroll.labels.get().images)
         with self.assertRaisesRegex(ValueError, 'absent'):
-            scroll.labels.one().open_paired(render=scroll.renders.one())
+            scroll.labels.get().open_paired(image=scroll.images.get())
         bad = self.source('bad', np.zeros((3, 5), 'uint8'), 'label')
         with self.assertRaisesRegex(ValueError, 'shapes'):
             self.pair(render, bad).open_paired()
@@ -195,10 +206,10 @@ class PairedTests(unittest.TestCase):
         for backend in self.backends():
             with self.pair(render, label).open_paired(backend=backend) as reader:
                 result = reader[:, :]
-                np.testing.assert_array_equal(host(result.data['image']), image[None])
-                np.testing.assert_array_equal(host(result.data['label']), labels[None])
-                np.testing.assert_array_equal(host(result.masks['label']['supervision']), expected)
-                self.assertTrue(host(result.valid['label']).all())
+                np.testing.assert_array_equal(host(result['image'].data), image[None])
+                np.testing.assert_array_equal(host(result['label'].data), labels[None])
+                np.testing.assert_array_equal(host(result['label'].masks['supervision']), expected)
+                self.assertTrue(host(result['label'].valid).all())
 
     def test_custom_volume_and_representation_alignment(self):
         data = np.arange(3*7*9, dtype='uint16').reshape(3,7,9)
@@ -211,7 +222,7 @@ class PairedTests(unittest.TestCase):
         with volume.open() as reader:
             np.testing.assert_array_equal(reader[:], data)
         with volume.open_aligned({'representation': scroll.representations[representation.id]}) as reader:
-            np.testing.assert_array_equal(reader[:].data['representation'], data[None])
+            np.testing.assert_array_equal(reader[:]['representation'].data, data[None])
 
     def test_pickle_and_spawn_reopen_cpu_only(self):
         image = np.arange(3*7*9, dtype='uint16').reshape(3, 7, 9)
@@ -220,10 +231,10 @@ class PairedTests(unittest.TestCase):
         with asset.open_paired() as reader:
             restored = pickle.loads(pickle.dumps(reader))
             self.assertTrue(restored._lazy)
-            np.testing.assert_array_equal(read_worker(restored)['label'], labels[None, 1:3, 2:5])
+            np.testing.assert_array_equal(read_worker(restored).label.data, labels[None, 1:3, 2:5])
             with multiprocessing.get_context('spawn').Pool(1) as pool:
                 result = pool.apply(read_worker, (reader,))
-            np.testing.assert_array_equal(result['image'], image[None, :, 1:3, 2:5])
+            np.testing.assert_array_equal(result.image.data, image[None, :, 1:3, 2:5])
         if is_available():
             with asset.open_paired(backend='cuda') as reader:
                 with self.assertRaisesRegex(TypeError, 'CUDA'):
@@ -241,7 +252,7 @@ class ResolutionTests(unittest.TestCase):
             (root/'ct'/'.zattrs').write_text(json.dumps(attrs))
             data = dict(samples=dict(s=dict(sample=dict(id='s', properties=dict(type='scroll')), volumes=dict(v=dict(id='v', properties=dict(pixel_size_um=1, shape=[8, 8, 8]), data=[dict(type='ome-zarr', id='ct', origins=[dict(path=str(root/'ct'), access_roots=[dict(url='')])])])))))
             c = Catalog(data)
-            candidate = c.scrolls.volumes.at_resolution(2).one()
+            candidate = c.scrolls.volumes.at_resolution(2).get()
             resolved = candidate.resolve()
             self.assertTrue(resolved.verified)
             self.assertEqual(resolved.shape, (4, 4, 4))
@@ -249,7 +260,7 @@ class ResolutionTests(unittest.TestCase):
             with candidate.open() as reader:
                 self.assertEqual(reader.shape, (4, 4, 4))
             with self.assertRaises(ValueError):
-                c.scrolls.volumes.at_resolution(4).one().resolve()
+                c.scrolls.volumes.at_resolution(4).get().resolve()
             data['samples']['s']['volumes']['v']['properties']['pixel_size_um'] = 2
             with self.assertRaisesRegex(ValueError, 'contradicts'):
-                Catalog(data).scrolls.volumes.at_resolution(2).one().open()
+                Catalog(data).scrolls.volumes.at_resolution(2).get().open()

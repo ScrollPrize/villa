@@ -66,9 +66,9 @@ def main():
             first=[];accepted=[]
             for i,request in enumerate(requests):
                 now=time.perf_counter();result=operation(*request);first.append((time.perf_counter()-now)*1000)
-                actual={k:host(v) for k,v in result.data.items()}
-                valid={k:host(v) for k,v in result.valid.items()}
-                masks={k:{m:host(v) for m,v in group.items()} for k,group in result.masks.items()}
+                actual={k:host(t.data) for k,t in result.targets.items()}
+                valid={k:host(t.valid) for k,t in result.targets.items()}
+                masks={k:{m:host(v) for m,v in t.masks.items()} for k,t in result.targets.items()}
                 if backend=='cpu':baseline[i]=(actual,valid,masks)
                 elif i in baseline:
                     for k in actual:
@@ -117,7 +117,7 @@ def main():
                         zero=reader.project_surface(surface,*request,label_target='ink')
                         zmeta=zero.metadata['projection']
                         oracle=project(triangles,labels,request[0],request[0],request[1],zmeta['origin_zyx'],zmeta['shape_zyx'],surface.spacing_um)
-                        for name,actual_field,expected_field in zip(('values','coverage','conflict'),(zero.data['ink'],zero.valid['ink'],zero.masks['ink']['conflict']),oracle[:3]):
+                        for name,actual_field,expected_field in zip(('values','coverage','conflict'),(zero['ink'].data,zero['ink'].valid,zero['ink'].masks['conflict']),oracle[:3]):
                             np.testing.assert_array_equal(host(actual_field)[0],expected_field,err_msg=name)
                         report['independent_projection_oracle']='zero thickness: values, coverage and conflicts match float64 scalar geometry'
                 else:

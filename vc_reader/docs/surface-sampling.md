@@ -17,10 +17,10 @@ with open_sample(reference, {"ink": ink}, backend="cpu") as reader:
         surface, start=(100, 200), size=(128, 128), label_target="ink",
         thickness_um=8, padding_um=32,
     )
-    ct = sample.data["image"]                 # (C, Z, Y, X)
-    labels = sample.data["ink"]               # (C, Z, Y, X), stored integer type
-    coverage = sample.masks["ink"]["coverage"] # (1, Z, Y, X)
-    conflicts = sample.masks["ink"]["conflict"]
+    ct = sample.image.data                 # (C, Z, Y, X)
+    labels = sample["ink"].data               # (C, Z, Y, X), stored integer type
+    coverage = sample["ink"].masks["coverage"] # (1, Z, Y, X)
+    conflicts = sample["ink"].masks["conflict"]
     origin = sample.metadata["projection"]["origin_zyx"]
 ```
 

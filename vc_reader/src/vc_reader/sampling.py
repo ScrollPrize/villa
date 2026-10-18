@@ -9,7 +9,7 @@ import os
 
 from .affine import Affine
 from .browsing import VolumeLevel
-from .sources import Source, VolumeRegistration, SurfaceRegistration, SampleResult
+from .sources import Source, VolumeRegistration, SurfaceRegistration, SampleResult, TargetResult
 
 from ._sampling_engine import SamplingEngine
 from .reader.source_resolution import array_placement
@@ -255,9 +255,11 @@ class SampleReader(SamplingEngine):
             spatial = tuple(n for n, drop in zip(size, squeeze) if not drop)
             # Contiguous singleton-axis removal is a view on CPU and CUDA.
             # Coordinate values and their metadata stay in the reference frame.
-            for values in (result.data, result.valid, *result.masks.values()):
-                for name, array in values.items():
-                    values[name] = array.reshape((array.shape[0], *spatial))
+            for target in result.targets.values():
+                target.data = target.data.reshape((target.data.shape[0], *spatial))
+                target.valid = target.valid.reshape((target.valid.shape[0], *spatial))
+                for name, array in target.masks.items():
+                    target.masks[name] = array.reshape((array.shape[0], *spatial))
         return result
 
     def read(self, start, size):
@@ -272,13 +274,13 @@ class SampleReader(SamplingEngine):
             if self._closed:
                 raise ValueError('sample reader is closed')
             regions = [_region(*region) for region in regions]
-            results = [SampleResult({}, {}, {}, copy.deepcopy(self.metadata)) for _ in regions]
+            results = [SampleResult({}, copy.deepcopy(self.metadata)) for _ in regions]
             for name, target in self._targets.items():
                 for result, (array, valid) in zip(results, self._sample_many(target, regions)):
-                    result.data[name], result.valid[name], result.masks[name] = array, valid, {}
+                    result.targets[name] = TargetResult(array, valid)
                 for mask, child in target['companions'].items():
                     for result, (array, _) in zip(results, self._sample_many(child, regions)):
-                        result.masks[name][mask] = array
+                        result[name].masks[mask] = array
             return results
 
     def render_surface(self, surface, start, size, *, offsets_um=(0,)):

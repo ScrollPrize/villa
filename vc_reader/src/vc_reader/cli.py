@@ -22,7 +22,7 @@ def main(argv=None):
     samples = commands.add_parser('samples', help='list scrolls and fragments')
     samples.add_argument('--type', choices=('scroll', 'fragment'))
     scrolls = commands.add_parser('scrolls', help='list scrolls')
-    for name in ('volumes', 'labels', 'segments', 'renders', 'representations'):
+    for name in ('volumes', 'labels', 'segments', 'images', 'representations'):
         p = commands.add_parser(name, help=f'list directly associated {name}')
         p.add_argument('scroll')
         p.add_argument('--volume')
@@ -56,8 +56,8 @@ def main(argv=None):
                     rows = [['volume', 'native um', 'labels', 'segments']]
                     rows.extend([v.id, v.pixel_size_um, len(v.labels), len(v.segments)] for v in values)
             elif args.command == 'segments':
-                rows = [['segment', 'labels', 'renders']]
-                rows.extend([s.id, len(s.labels), len(s.renders)] for s in values)
+                rows = [['segment', 'labels', 'images']]
+                rows.extend([s.id, len(s.labels), len(s.images)] for s in values)
             else:
                 if args.command == 'labels' and args.label_set:
                     values = values.filter(label_set=args.label_set)

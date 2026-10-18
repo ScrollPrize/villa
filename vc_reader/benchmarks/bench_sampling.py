@@ -90,7 +90,7 @@ def main():
                 hashes = []
                 for request in requests:
                     now = time.perf_counter(); result = reader.read(*request); cold.append((time.perf_counter()-now)*1000)
-                    data = result.data['image' if name == 'direct' else 'target']
+                    data = result['image' if name == 'direct' else 'target'].data
                     data = data.numpy() if backend == 'cuda' else data
                     hashes.append(hashlib.sha256(data.tobytes()).hexdigest())
                 initial_stats = reader.stats()
@@ -122,7 +122,7 @@ def main():
                             actual = reader.read(start, size)
                             expected = raw.read(start, size) if name == 'direct' else raw.read_affine(
                                 size, tuple(reversed(pull.apply(tuple(reversed(start))))), matrix)
-                            output = actual.data['image' if name == 'direct' else 'target']
+                            output = actual['image' if name == 'direct' else 'target'].data
                             output = output.numpy() if backend == 'cuda' else output
                             np.testing.assert_allclose(output[0], expected, rtol=2e-6, atol=2e-5)
                         if device_reader is not None:

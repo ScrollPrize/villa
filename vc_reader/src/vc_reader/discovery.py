@@ -19,8 +19,8 @@ def _storage(artifact, *, format=None, pyramid=False):
 @dataclass(frozen=True)
 class Pairing:
     label_id: str
-    render_id: str
-    # Label base pixel XY -> render base pixel XY. None means inspect metadata.
+    image_id: str
+    # Label base pixel XY -> image base pixel XY. None means inspect metadata.
     pixel_affine: tuple | None
     evidence: str
 
@@ -67,7 +67,7 @@ class RelationshipIndex:
                     source = self._adapt(sample, kind, owner, artifact)
                     asset_kind = ('volume' if kind == 'volume' and artifact.type == T.OME_ZARR else
                                   'label' if artifact.type == T.INK_LABELS else
-                                  'render' if artifact.type in (T.LAYERS_ZARR, T.LAYERS_TIF, T.ALPHA_RENDER, T.ALPHA_RENDER_DOWNSAMPLED) else
+                                  'image' if artifact.type in (T.LAYERS_ZARR, T.LAYERS_TIF, T.ALPHA_RENDER, T.ALPHA_RENDER_DOWNSAMPLED) else
                                   'geometry' if artifact.type.startswith(('tifxyz', 'obj')) or artifact.type in (T.UMBILICUS, T.FIBERLETS) else
                                   'representation' if (source.derived and source.role is not None) or artifact.type in (T.LASAGNA, T.INK_DETECTION, T.INK_DETECTION_DOWNSAMPLED, T.INK_3D_PREDICTION) else 'artifact')
                     volume = owner.id if kind == 'volume' else artifact.target_volume_id
@@ -77,7 +77,7 @@ class RelationshipIndex:
             source = Source.from_dict(entry['source'])
             if not source.id.startswith('user:') or entry['sample'] not in catalog._samples or source.sample_id != entry['sample']:
                 raise ValueError('overlay sources require user: IDs and a consistent owning sample')
-            if entry['kind'] not in ('volume', 'render', 'label', 'representation', 'geometry', 'artifact'):
+            if entry['kind'] not in ('volume', 'image', 'label', 'representation', 'geometry', 'artifact'):
                 raise ValueError('unknown overlay asset kind')
             if entry['kind'] == 'volume' and (not entry['volume'] or not entry['volume'].startswith('user:')):
                 raise ValueError('new volume IDs must use the user: namespace')
@@ -129,29 +129,29 @@ class RelationshipIndex:
             creation = artifact.get('creation_info') or {}
             explicit = (creation.get('target') or {}).get('render')
             for other in self.by_segment[(source.sample_id, self.segment_ids[identifier])]:
-                render = self.sources[other]
-                if self.kinds[other] != 'render' or self.volume_ids[other] != self.volume_ids[identifier]:
+                image = self.sources[other]
+                if self.kinds[other] != 'image' or self.volume_ids[other] != self.volume_ids[identifier]:
                     continue
                 # Published labels are on the target segment canvas. An explicit
-                # render reference narrows this convention, never shape matching.
-                locations = (render.storage.location, *render.storage.alternatives)
+                # image reference narrows this convention, never shape matching.
+                locations = (image.storage.location, *image.storage.alternatives)
                 if explicit and explicit.rstrip('/') not in {v.rstrip('/') for v in locations if v}:
                     continue
-                self._pair(Pairing(identifier, other, identity, 'published render reference' if explicit else 'segment/target-volume canvas convention'))
+                self._pair(Pairing(identifier, other, identity, 'published image reference' if explicit else 'segment/target-volume canvas convention'))
         for entry in self.overlays:
             for relationship in entry.get('pairs', ()):
-                label, render = relationship['label'], relationship['render']
-                if self.kinds.get(label) != 'label' or self.kinds.get(render) != 'render':
-                    raise ValueError('pair relationships require known label and render IDs')
-                if self.owners[label] != self.owners[render]:
+                label, image = relationship['label'], relationship['image']
+                if self.kinds.get(label) != 'label' or self.kinds.get(image) != 'image':
+                    raise ValueError('pair relationships require known label and image IDs')
+                if self.owners[label] != self.owners[image]:
                     raise ValueError('paired assets must belong to the same sample')
-                self._pair(Pairing(label, render, tuple(tuple(r) for r in relationship['affine']), 'explicit same grid' if relationship.get('same_grid') else 'explicit user pixel mapping'))
+                self._pair(Pairing(label, image, tuple(tuple(r) for r in relationship['affine']), 'explicit same grid' if relationship.get('same_grid') else 'explicit user pixel mapping'))
 
     def _pair(self, relationship):
-        if any(p.render_id == relationship.render_id for p in self.pairs[relationship.label_id]):
-            raise ValueError('duplicate label/render relationship')
+        if any(p.image_id == relationship.image_id for p in self.pairs[relationship.label_id]):
+            raise ValueError('duplicate label/image relationship')
         self.pairs[relationship.label_id].append(relationship)
-        self.reverse_pairs[relationship.render_id].append(relationship)
+        self.reverse_pairs[relationship.image_id].append(relationship)
 
     def _surface_descriptor(self, sample, mesh, target, identifier):
         volume = sample.volumes.get(target)

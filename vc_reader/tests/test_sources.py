@@ -90,7 +90,7 @@ from test_sources import catalog
 with patch('urllib.request.urlopen', side_effect=AssertionError('network request')):
     c = catalog()
     list(c.samples['s'].artifacts)
-    c.samples['s'].on_volume('a').labels.ink
+    c.samples['s'].on_volume('a').labels.ink()
     c.samples['s'].volumes.at_resolution(8)
 assert not any(n in sys.modules for n in ('numpy', 'torch', 'PIL', 'tifffile', 'vc_reader._native'))
 """

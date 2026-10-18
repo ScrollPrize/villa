@@ -57,16 +57,27 @@ class Collection:
         return Collection((v for v in self._all if matches(v)), ordered=True,
                           include_superseded=self.include_superseded if include_superseded is None else include_superseded)
 
-    def one(self, **criteria):
+    def get(self, **criteria):
+        """Return the item matching all criteria, requiring a unique match.
+
+        Raise NotFoundError for no match or AmbiguousMatchError for multiple
+        matches. With no criteria, the collection must contain exactly one item.
+        """
         return self._one(list(self.filter(**criteria)), repr(criteria))
 
-    @property
-    def ink(self):
-        return self.filter(artifact_kind='ink-labels')
+    def ink(self, **criteria):
+        """Return the matching ink label, raising for missing or ambiguous matches.
 
-    @property
-    def zarr(self):
-        return self.filter(format='zarr')
+        Use ``filter(artifact_kind='ink-labels')`` to browse multiple labels.
+        """
+        return self.filter(artifact_kind='ink-labels').get(**criteria)
+
+    def zarr(self, **criteria):
+        """Return the matching Zarr asset, raising for missing or ambiguous matches.
+
+        Use ``filter(format='zarr')`` to browse multiple assets.
+        """
+        return self.filter(format='zarr').get(**criteria)
 
     @property
     def volumes(self):
@@ -115,8 +126,8 @@ class _Context:
         return self._assets('label')
 
     @property
-    def renders(self):
-        return self._assets('render')
+    def images(self):
+        return self._assets('image')
 
     @property
     def representations(self):
@@ -186,18 +197,18 @@ class ScrollSource(_Context):
     def transform(self, source, destination):
         return self.record.transform(_id(source), _id(destination))
 
-    def with_source(self, source, *, kind, volume=None, segment=None, render=None, label=None,
+    def with_source(self, source, *, kind, volume=None, segment=None, image=None, label=None,
                     same_grid=False, pixel_affine=None):
         """Attach a descriptor to a new view without mutating published metadata.
 
-        kind is volume/render/label/representation/geometry/artifact. Pairing
-        requires render= (for labels) or label= (for renders) and exactly one of
-        same_grid=True or a 2x3 label-XY-to-render-XY pixel_affine.
+        kind is volume/image/label/representation/geometry/artifact. Pairing
+        requires image= (for labels) or label= (for images) and exactly one of
+        same_grid=True or a 2x3 label-XY-to-image-XY pixel_affine.
         """
         from .discovery import RelationshipIndex
         if not isinstance(source, Source) or not source.id.startswith('user:'):
             raise ValueError('custom sources require the user: namespace')
-        if kind not in ('volume', 'render', 'label', 'representation', 'geometry', 'artifact'):
+        if kind not in ('volume', 'image', 'label', 'representation', 'geometry', 'artifact'):
             raise ValueError(f'unknown asset kind {kind!r}')
         if type(same_grid) is not bool:
             raise TypeError('same_grid must be boolean')
@@ -214,7 +225,7 @@ class ScrollSource(_Context):
                 self.volumes[volume]
         if segment is not None and segment not in self.record.segments and not segment.startswith('user:'):
             raise ValueError('new segment IDs must use the user: namespace')
-        if source.role is None and kind in ('volume', 'render', 'label'):
+        if source.role is None and kind in ('volume', 'image', 'label'):
             source = replace(source, role='label' if kind == 'label' else 'image')
         reg = source.registration
         if reg is not None and (reg.sample_id != self.id or (volume is not None and reg.volume_id != volume)):
@@ -224,9 +235,9 @@ class ScrollSource(_Context):
             source = replace(source, registration=VolumeRegistration(self.id, volume, affine=Affine.identity()))
         source = replace(source, sample_id=self.id, owner_id=segment or volume or self.id)
         pairs = []
-        if render is not None or label is not None:
-            if (render is not None and (kind != 'label' or label is not None)) or (label is not None and kind != 'render'):
-                raise ValueError('pair a label with render=, or a render with label=')
+        if image is not None or label is not None:
+            if (image is not None and (kind != 'label' or label is not None)) or (label is not None and kind != 'image'):
+                raise ValueError('pair a label with image=, or an image with label=')
             if same_grid == (pixel_affine is not None):
                 raise ValueError('declare exactly one of same_grid=True or pixel_affine')
             matrix = ((1., 0., 0.), (0., 1., 0.)) if same_grid else pixel_affine
@@ -236,7 +247,7 @@ class ScrollSource(_Context):
             Affine.from_rows(((matrix[0][0], matrix[0][1], 0, matrix[0][2]),
                               (matrix[1][0], matrix[1][1], 0, matrix[1][2]), (0, 0, 1, 0))).inverse()
             pairs.append(dict(label=source.id if kind == 'label' else _id(label),
-                              render=_id(render) if kind == 'label' else source.id, affine=matrix, same_grid=same_grid))
+                              image=_id(image) if kind == 'label' else source.id, affine=matrix, same_grid=same_grid))
         elif same_grid or pixel_affine is not None:
             raise ValueError('pixel mapping requires an explicit paired asset')
         entry = dict(source=source.to_dict(), kind=kind, sample=self.id, volume=volume, segment=segment, pairs=pairs)
@@ -295,7 +306,7 @@ class Volume(_Context):
 
     @property
     def source(self):
-        return self.images.one().source
+        return self.images.get().source
 
     @property
     def segments(self):
@@ -386,8 +397,8 @@ class Asset:
         return ScrollSource._view(self._index, self._index.owners[self._parent or self.id])
 
     @property
-    def renders(self):
-        return Collection(Asset(self._index, p.render_id) for p in self._index.pairs.get(self.id, ()))
+    def images(self):
+        return Collection(Asset(self._index, p.image_id) for p in self._index.pairs.get(self.id, ()))
 
     @property
     def labels(self):
@@ -399,7 +410,7 @@ class Asset:
 
     @property
     def depth_semantics(self):
-        return 'sampled_layers' if self.kind == 'render' else None
+        return 'sampled_layers' if self.kind == 'image' else None
 
     @property
     def mappable_volumes(self):
@@ -422,18 +433,18 @@ class Asset:
         source = self.source if level is None else _select_level(self.source, level)
         return source.open(**options)
 
-    def open_paired(self, *, render=None, level=0, layers=slice(None), backend='cpu', **options):
+    def open_paired(self, *, image=None, level=0, layers=slice(None), backend='cpu', **options):
         from .paired import PairedReader
         if self.kind != 'label':
             raise TypeError('open_paired requires a label')
-        if render is None:
-            render = self.renders.one()
-        if not isinstance(render, Asset) or self._index.sources.get(render.id) != render.source:
-            raise ValueError('render must belong to the same scroll view')
-        matches = [p for p in self._index.pairs.get(self.id, ()) if p.render_id == render.id]
+        if image is None:
+            image = self.images.get()
+        if not isinstance(image, Asset) or self._index.sources.get(image.id) != image.source:
+            raise ValueError('image must belong to the same scroll view')
+        matches = [p for p in self._index.pairs.get(self.id, ()) if p.image_id == image.id]
         if len(matches) != 1:
-            raise ValueError('label/render relationship is absent or ambiguous')
-        return PairedReader(self.source, render.source, matches[0], level=level, layers=layers, backend=backend, **options)
+            raise ValueError('label/image relationship is absent or ambiguous')
+        return PairedReader(self.source, image.source, matches[0], level=level, layers=layers, backend=backend, **options)
 
     def __repr__(self):
         return f'Asset({self.id!r}, kind={self.kind!r})'

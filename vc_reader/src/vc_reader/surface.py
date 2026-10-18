@@ -7,7 +7,7 @@ import math
 import operator
 import time
 from .affine import Affine
-from .sources import Source, Storage, Surface, SurfaceRegistration, SampleResult
+from .sources import Source, Storage, Surface, SurfaceRegistration, SampleResult, TargetResult
 from .reader.source_resolution import pixel_affine
 
 
@@ -326,7 +326,7 @@ def render_surface(reader, surface, start, size, offsets):
     between = reader._between(next(iter(targets.values()))['source'] if targets else reader.reference,
                               (surface.sample_id,surface.volume_id))
     destination = reader._reference_map.inverse() @ between @ surface.xyz_to_volume @ _scale(surface.spacing_um).inverse()
-    result = SampleResult({}, {}, {}, dict(reader.metadata or {}))
+    result = SampleResult({}, dict(reader.metadata or {}))
     result.metadata['surface'] = dict(id=surface.id,uv_start=start,uv_size=size,offsets_um=offsets,
         coordinate_frame=(surface.sample_id,surface.volume_id),reference_frame=reader._reference_frame,
         array_to_level0=reader._reference_map.matrix)
@@ -337,9 +337,10 @@ def render_surface(reader, surface, start, size, offsets):
         dtype = np.dtype('float32') if target['order'] else target['native_dtype']
         if reader.backend == 'cpu' and not target['order']:
             dtype = target['dtype']
-        result.data[name] = reader._owned_empty((target['channels'],depth*n),dtype)
-        result.valid[name] = reader._owned_empty((1,depth*n),np.dtype('bool'))
-        result.masks[name] = {k:reader._owned_empty((t['channels'],depth*n),np.dtype('float32') if t['order'] else
+        result.targets[name] = TargetResult(
+            reader._owned_empty((target['channels'],depth*n),dtype),
+            reader._owned_empty((1,depth*n),np.dtype('bool')))
+        result[name].masks = {k:reader._owned_empty((t['channels'],depth*n),np.dtype('float32') if t['order'] else
                               t['dtype'] if reader.backend == 'cpu' else t['native_dtype'])
                               for k,t in target['companions'].items()}
     for first in range(0,n,8192):
@@ -356,20 +357,20 @@ def render_surface(reader, surface, start, size, offsets):
                 else:
                     local,base=_pixel_points(uv,target['mapping'],uv_origin)
                 values,valid=reader._sample_points(target,local,base)
-                reader._copy_columns(values,result.data[name],d*n+first)
-                reader._copy_columns(valid,result.valid[name],d*n+first)
+                reader._copy_columns(values,result[name].data,d*n+first)
+                reader._copy_columns(valid,result[name].valid,d*n+first)
                 for key,child in target['companions'].items():
                     if volume:
                         p,b=_transform(points[d],child['mapping'],point_base);p=np.ascontiguousarray(p[:,::-1]);b=tuple(reversed(b))
                     else:
                         p,b=_pixel_points(uv,child['mapping'],uv_origin)
                     values,_=reader._sample_points(child,p,b)
-                    reader._copy_columns(values,result.masks[name][key],d*n+first)
+                    reader._copy_columns(values,result[name].masks[key],d*n+first)
     for name,target in {**reader._targets,**targets}.items():
         shape=(len(offsets),*size) if name in reader._targets else size
-        result.data[name]=result.data[name].reshape((target['channels'],*shape))
-        result.valid[name]=result.valid[name].reshape((1,*shape))
-        result.masks[name]={k:v.reshape((target['companions'][k]['channels'],*shape)) for k,v in result.masks[name].items()}
+        result[name].data=result[name].data.reshape((target['channels'],*shape))
+        result[name].valid=result[name].valid.reshape((1,*shape))
+        result[name].masks={k:v.reshape((target['companions'][k]['channels'],*shape)) for k,v in result[name].masks.items()}
     return result
 
 
@@ -638,11 +639,11 @@ class Projection:
         r=self.reader
         _check_budget(r,size)
         # These are ordinary volume reads; surface targets are explicitly handled below.
-        result=SampleResult({}, {}, {}, dict(r.metadata or {}))
+        result=SampleResult({}, dict(r.metadata or {}))
         result.metadata['projection']=self.metadata(start,size)
         for name,target in r._targets.items():
-            result.data[name],result.valid[name]=r._sample_many(target,[(start,size)])[0]
-            result.masks[name]={k:r._sample_many(t,[(start,size)])[0][0] for k,t in target['companions'].items()}
+            result.targets[name]=TargetResult(*r._sample_many(target,[(start,size)])[0])
+            result[name].masks={k:r._sample_many(t,[(start,size)])[0][0] for k,t in target['companions'].items()}
         states={name:self._state(t,size) for name,t in self.targets.items()}
         request_lo=tuple(reversed(start));request_hi=tuple(s+n-1 for s,n in zip(request_lo,reversed(size)))
         tiles=self.index.query(request_lo,request_hi,self.expansion) if self.index is not None else self.tiles()
@@ -661,15 +662,15 @@ class Projection:
             values,coverage,conflict,_,_,uv=states[name]
             if r.backend == 'cpu':
                 values=values.astype(target['dtype'],copy=False)
-            result.data[name]=values.reshape((target['channels'],*size))
-            result.valid[name]=coverage.reshape((1,*size))
-            result.masks[name]={'coverage':result.valid[name],'conflict':conflict.reshape((1,*size))}
+            result.targets[name]=TargetResult(values.reshape((target['channels'],*size)),
+                                              coverage.reshape((1,*size)))
+            result[name].masks={'coverage':result[name].valid,'conflict':conflict.reshape((1,*size))}
             if target['companions']:
                 uv=uv.numpy() if r.backend=='cuda' else uv
                 for key,child in target['companions'].items():
                     p,b=_pixel_points(uv,child['mapping'] @ patch_shift)
                     mask,_=r._sample_points(child,p,b)
-                    result.masks[name][key]=mask.reshape((child['channels'],*size))
+                    result[name].masks[key]=mask.reshape((child['channels'],*size))
         return result
 
 
@@ -713,20 +714,20 @@ def _read_crop(projection,origin,shape):
         if size==shape:
             return block
         if result is None:
-            result=SampleResult({}, {}, {}, block.metadata)
+            result=SampleResult({}, block.metadata)
             result.metadata['projection']=projection.metadata(origin,shape)
-            for dest,source in ((result.data,block.data),(result.valid,block.valid)):
-                for name,array in source.items():
-                    dest[name]=r._owned_empty((array.shape[0],*shape),array.dtype)
-            for name,masks in block.masks.items():
-                result.masks[name]={key:r._owned_empty((array.shape[0],*shape),array.dtype) for key,array in masks.items()}
+            for name,target in block.targets.items():
+                result.targets[name]=TargetResult(
+                    r._owned_empty((target.data.shape[0],*shape),target.data.dtype),
+                    r._owned_empty((target.valid.shape[0],*shape),target.valid.dtype),
+                    {key:r._owned_empty((array.shape[0],*shape),array.dtype) for key,array in target.masks.items()})
         offset=tuple(a-b for a,b in zip(start,origin))
-        for dest,source in ((result.data,block.data),(result.valid,block.valid)):
-            for name,array in source.items():
-                _copy_region(r,array,dest[name],offset)
-        for name,masks in block.masks.items():
-            for key,array in masks.items():
-                _copy_region(r,array,result.masks[name][key],offset)
+        for name,target in block.targets.items():
+            dest=result[name]
+            _copy_region(r,target.data,dest.data,offset)
+            _copy_region(r,target.valid,dest.valid,offset)
+            for key,array in target.masks.items():
+                _copy_region(r,array,dest.masks[key],offset)
     return result
 
 

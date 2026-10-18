@@ -10,9 +10,9 @@ import NumPy, native extensions, Pillow, or PyTorch.
 from vc_reader import load, ScrollSource
 catalog = load()
 scroll = ScrollSource('PHerc0009B', '20250820154339', catalog=catalog)
-label = scroll.segments['20250919125754'].labels.ink.one(label_set='20260918')
-render = label.renders.zarr.one()
-assert render.labels.ink[label.id].id == label.id
+label = scroll.segments['20250919125754'].labels.ink(label_set='20260918')
+image = label.images.zarr()
+assert image.labels[label.id].id == label.id
 assert label.volume.id == '20250820154339'
 ```
 
@@ -22,22 +22,34 @@ fragment in the acceptance snapshot; its classification is preserved.
 `ScrollSource` also resolves the catalog's common sample-name aliases.
 
 Collections iterate entities in stable ID order and support `[id]`,
-`.filter(attribute=value, ...)`, and `.one(...)`. Filters use exact values;
-relationship filters also accept entity IDs, e.g. `.one(volume='...')`.
-Resolution queries have their own explicit tolerance. `.one()` raises
-`NotFoundError` or `AmbiguousMatchError` with candidates, never a preference
-for the first alternative. A missing ID also raises `NotFoundError`.
+`.filter(attribute=value, ...)`, and `.get(...)`. Filters use exact values;
+relationship filters also accept entity IDs, e.g. `.get(volume='...')`.
+Resolution queries have their own explicit tolerance. `.get()` returns the
+single matching item. It raises `NotFoundError` if nothing matches or
+`AmbiguousMatchError` if multiple items match, with candidates in the error.
+With no criteria, the collection must contain exactly one item.
+A missing ID also raises `NotFoundError`.
+
+`labels.ink(label_set='20260918')` selects an ink label directly, with the same
+missing/ambiguous match errors. `labels.ink()` works when exactly one ink label
+is present. To browse multiple ink labels, use
+`labels.filter(artifact_kind='ink-labels')` and iterate the returned collection.
+
+`images.zarr()` selects the single Zarr image. Pass criteria such as
+`images.zarr(artifact_id='...')` to choose among multiple images; missing or
+ambiguous matches raise the same errors. Use `images.filter(format='zarr')`
+to browse all Zarr images.
 
 An omitted volume exposes the complete sample. `.on_volume(id)` shows direct
 associations only. A segment qualifies if any published asset targets that
-volume, including labels or renders without a mesh. Views share entity records
+volume, including labels or images without a mesh. Views share entity records
 and immutable `Source` descriptors; navigation never rewrites registration.
 
-- `volumes`, `segments`, `labels.ink`, `renders.zarr`, `representations`, and
+- `volumes`, `segments`, `labels`, `images`, `representations`, and
   `geometry` expose distinct kinds. `.artifacts` retains unknown types too.
-- `label.segment`, `label.volume`, `label.renders`, `label.masks`, and
-  `render.labels` follow the indexed relationships. Render variants remain
-  separate. Explicit published render references constrain the segment/target
+- `label.segment`, `label.volume`, `label.images`, `label.masks`, and
+  `image.labels` follow the indexed relationships. Image variants remain
+  separate. Explicit published image references constrain the segment/target
   canvas convention. Equal shapes do not establish a relationship.
 - `label.mappable_volumes` contains volume, transform, coverage (or `None`), and
   `required_operations`. Surface labels still need `surface_projection` for a
@@ -54,7 +66,7 @@ and immutable `Source` descriptors; navigation never rewrites registration.
 ```python
 matches = catalog.scrolls.volumes.at_resolution(8, rel_tol=.02)
 paris = catalog.scrolls['PHercParis4'].volumes.at_resolution(8, rel_tol=.02)
-match = paris.one(volume='20230206171837')
+match = paris.get(volume='20230206171837')
 resolved = match.resolve()
 print(resolved.selection, resolved.spacing_um, resolved.shape)
 with match.open() as reader:
@@ -75,15 +87,15 @@ explicitly, using its actual storage transform for aligned sampling.
 ```python
 with label.open_paired(layers=slice(40, 65), backend='cpu') as reader:
     patch = reader[18576:18704, 7984:8112]
-    image = patch.data['image']       # C,D,H,W
-    ink = patch.data['label']         # C,H,W
-    valid = patch.valid['label']      # 1,H,W geometric support
-    masks = patch.masks['label']      # published supervision/validation values
+    image = patch.image.data       # C,D,H,W
+    ink = patch.label.data         # C,H,W
+    valid = patch.label.valid      # 1,H,W geometric support
+    masks = patch.label.masks      # published supervision/validation values
     one_layer = reader['image'][0, -1, :32, :32]
 ```
 
-The default is render level zero and all stored layers. `render=` can be omitted
-only for exactly one paired render. Shared indexing is the selected render's
+The default is image level zero and all stored layers. `image=` can be omitted
+only for exactly one paired image. Shared indexing is the selected image's
 YX grid. Named indexing is CDYX for images and CYX for labels. An integer
 removes its axis; negative integers and unit-step slices follow NumPy rules.
 A `layers` integer removes the depth axis. `.read(start_yx, size_yx)` permits
@@ -115,15 +127,15 @@ be pickled or used after fork. CUDA belongs in the device-owning process.
 ## Local and external sources
 
 `scroll.with_source(source, kind=..., volume=..., segment=...)` returns an overlay
-view. Kinds are `volume`, `render`, `label`, `representation`, `geometry`, and
+view. Kinds are `volume`, `image`, `label`, `representation`, `geometry`, and
 `artifact`. Sources use `user:` IDs, as do newly created volume/segment IDs.
 Published metadata is unchanged and published descriptors are shared.
 
-For a custom label/render pair supply `render=render.id` when attaching the label
-(or `label=label.id` when attaching a render), plus exactly one of:
+For a custom label/image pair supply `image=image.id` when attaching the label
+(or `label=label.id` when attaching an image), plus exactly one of:
 
 - `same_grid=True`: a declared shared base pixel grid, validated at opening.
-- `pixel_affine=((a,b,tx),(c,d,ty))`: label base XY pixels to render base XY pixels.
+- `pixel_affine=((a,b,tx),(c,d,ty))`: label base XY pixels to image base XY pixels.
 
 Owning the same segment or having the same shape does not pair custom sources.
 Unregistered sources remain inspectable and raw-readable. Volume-aligned
@@ -154,6 +166,6 @@ Run [`scripts/paired_reading.py`](../scripts/paired_reading.py) with `--metadata
 and optionally `--native-dir` pointing to an existing build. It discovers the
 acceptance pair, reads the fixed crop, verifies all arrays independently, and
 asserts 9,926 nonzero ink pixels. `--backend cuda` repeats on CUDA.
-The CLI supports `samples`, `scrolls`, `volumes`, `labels`, `segments`, `renders`,
+The CLI supports `samples`, `scrolls`, `volumes`, `labels`, `segments`, `images`,
 and `representations`; `volumes --resolution 8 --rel-tol .02 --resolve` validates
 header selections. See [exact test/benchmark commands and results](scroll-reading-benchmarks.md).

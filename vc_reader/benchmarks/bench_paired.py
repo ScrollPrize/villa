@@ -45,15 +45,15 @@ def main():
     if args.backend == 'cuda' and not is_available():
         raise RuntimeError('CUDA device is unavailable')
     catalog = load(args.metadata)
-    label, render = discover(catalog)
-    ambiguous = catalog.scrolls['PHerc0139'].on_volume('20260413113053').segments['20260302000001'].renders.zarr
+    label, image = discover(catalog)
+    ambiguous = catalog.scrolls['PHerc0139'].on_volume('20260413113053').segments['20260302000001'].images.filter(format='zarr')
     assert len(ambiguous) == 2
     try:
-        ambiguous.one()
+        ambiguous.zarr()
     except AmbiguousMatchError:
         pass
     else:
-        raise AssertionError('ambiguous published renders were silently selected')
+        raise AssertionError('ambiguous published images were silently selected')
     resolutions = catalog.scrolls['PHercParis4'].volumes.at_resolution(8, rel_tol=.02)
     assert len(resolutions) == 2
     options = dict(cache_dir=str(args.cache_dir), offline=args.offline, memory_cache=64 << 20, threads=1)
@@ -63,16 +63,16 @@ def main():
         try:
             def open_readers():
                 if name == 'paired':
-                    return stack.enter_context(label.open_paired(render=render, layers=slice(40, 65), backend=args.backend, **options))
+                    return stack.enter_context(label.open_paired(image=image, layers=slice(40, 65), backend=args.backend, **options))
                 cache = MemoryCache(64 << 20)
                 return {key: stack.enter_context(ZarrGroup.open(source.storage.location, **{**options, 'memory_cache': cache})).level(0)
-                        for key, source in [('image', render.source), ('label', label.source), *[(c.name, c.source) for c in label.source.companions]]}
+                        for key, source in [('image', image.source), ('label', label.source), *[(c.name, c.source) for c in label.source.companions]]}
             reader, opening_ms = timed(open_readers)
             def request(start):
                 y, x = (slice(n, n+128) for n in start)
                 if name == 'paired':
                     patch = reader[y, x]
-                    return {**patch.data, **patch.masks['label']}
+                    return {**{name: target.data for name, target in patch.targets.items()}, **patch.label.masks}
                 result = {k: (r[40:65, y, x] if k == 'image' else r[y, x])[None] for k, r in reader.items()}
                 if args.backend == 'cuda':
                     result = {k: asarray(v) for k, v in result.items()}
@@ -135,8 +135,8 @@ def main():
     assert opened[0]['label_nonzero'][0] == 9926
     report = dict(command=sys.argv, platform=platform.platform(), python=sys.version, build='Release', backend=args.backend,
                   native_dir=str(args.native_dir), metadata_sha256=hashlib.sha256(Path(args.metadata).read_bytes()).hexdigest(),
-                  render=render.id, label=label.id, starts=STARTS, layers=[40,65], size=[128,128], warmups=2,
-                  repetitions=10, requests=6, ambiguous_render_ids=[a.id for a in ambiguous],
+                  image=image.id, label=label.id, starts=STARTS, layers=[40,65], size=[128,128], warmups=2,
+                  repetitions=10, requests=6, ambiguous_image_ids=[a.id for a in ambiguous],
                   resolution_candidates=[dict(volume=m.volume.id, level=m.level, estimate=m.estimated_resolution_um, verified=m.verified) for m in resolutions],
                   cache_protocol='64 MiB shared chunk cache per reader set; disk cache reused; OS caches not cleared; output validation/download outside timings',
                   rows=opened)

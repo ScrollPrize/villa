@@ -59,9 +59,11 @@ def main():
     with open_sample(reference, targets, backend=args.backend, cache_dir=args.cache_dir,
                      cache_writes=args.cache_writes, offline=args.offline) as reader:
         result = reader[tuple(args.slice)]
-        print(json.dumps(dict(data={k: dict(shape=v.shape, dtype=str(v.dtype)) for k, v in result.data.items()},
-                              valid={k: dict(shape=v.shape, dtype=str(v.dtype)) for k, v in result.valid.items()},
-                              masks={k: list(v) for k, v in result.masks.items()}, metadata=result.metadata), indent=2))
+        print(json.dumps(dict(targets={name: dict(
+            data=dict(shape=target.data.shape, dtype=str(target.data.dtype)),
+            valid=dict(shape=target.valid.shape, dtype=str(target.valid.dtype)),
+            masks=list(target.masks)) for name, target in result.targets.items()},
+            metadata=result.metadata), indent=2))
 
 
 if __name__ == '__main__':

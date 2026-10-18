@@ -9,8 +9,8 @@ import sys
 def discover(catalog):
     from vc_reader import ScrollSource
     scroll = ScrollSource('PHerc0009B', '20250820154339', catalog=catalog)
-    label = scroll.segments['20250919125754'].labels.ink.one(label_set='20260918')
-    return label, label.renders.zarr.one()
+    label = scroll.segments['20250919125754'].labels.ink(label_set='20260918')
+    return label, label.images.zarr()
 
 
 def main():
@@ -29,16 +29,16 @@ def main():
     from vc_reader import load
     from vc_reader.reader import ZarrGroup
     catalog = load(args.metadata) if args.metadata else load(cache_dir=args.cache_dir)
-    label, render = discover(catalog)
+    label, image = discover(catalog)
     options = dict(cache_dir=args.cache_dir, offline=args.offline, memory_cache=64 << 20, threads=1)
     y, x = slice(18576, 18704), slice(7984, 8112)
-    with label.open_paired(render=render, layers=slice(40, 65), backend=args.backend, **options) as reader:
+    with label.open_paired(image=image, layers=slice(40, 65), backend=args.backend, **options) as reader:
         patch = reader[y, x]
-        data = {k: v.numpy() if hasattr(v, 'numpy') else v for k, v in patch.data.items()}
-        masks = {k: v.numpy() if hasattr(v, 'numpy') else v for k, v in patch.masks['label'].items()}
+        data = {k: t.data.numpy() if hasattr(t.data, 'numpy') else t.data for k, t in patch.targets.items()}
+        masks = {k: v.numpy() if hasattr(v, 'numpy') else v for k, v in patch['label'].masks.items()}
         # Independently opened arrays: no pairing or sampling helper involved.
         with ExitStack() as stack:
-            image_group = stack.enter_context(ZarrGroup.open(render.source.storage.location, **options))
+            image_group = stack.enter_context(ZarrGroup.open(image.source.storage.location, **options))
             label_group = stack.enter_context(ZarrGroup.open(label.source.storage.location, **options))
             np.testing.assert_array_equal(data['image'], image_group.level(0)[40:65, y, x][None])
             np.testing.assert_array_equal(data['label'], label_group.level(0)[y, x][None])

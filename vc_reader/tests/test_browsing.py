@@ -33,9 +33,9 @@ class BrowsingTests(unittest.TestCase):
     def test_shared_records_direct_context_and_reverse_links(self):
         c = catalog()
         scroll = ScrollSource('s', 'a', catalog=c)
-        label = scroll.segments['seg'].labels.ink.one(label_set='2021')
-        self.assertEqual(label.id, scroll.labels.ink.one().id)
-        self.assertIs(label.source, c.samples['s'].labels.ink[label.id].source)
+        label = scroll.segments['seg'].labels.ink(label_set='2021')
+        self.assertEqual(label.id, scroll.labels.ink().id)
+        self.assertIs(label.source, c.samples['s'].labels[label.id].source)
         self.assertEqual(label.volume.id, 'a')
         self.assertEqual(label.segment.id, 'seg')
         self.assertEqual([s.id for s in scroll.segments], ['seg'])  # no mesh required
@@ -44,16 +44,19 @@ class BrowsingTests(unittest.TestCase):
         mapping = label.mappable_volumes['b']
         self.assertEqual(mapping.transform, Affine.scale(2))
         self.assertEqual(mapping.required_operations, ('surface_projection', 'volume_transform'))
-        self.assertEqual(len(label.renders.zarr), 2)
+        self.assertEqual(len(label.images.filter(format='zarr')), 2)
         with self.assertRaisesRegex(AmbiguousMatchError, 'render1'):
-            label.renders.one()
-        for render in label.renders:
-            self.assertEqual(render.labels.ink.one().id, label.id)
+            label.images.zarr()
+        self.assertEqual(label.images.zarr(artifact_id='render1').artifact_id, 'render1')
+        with self.assertRaisesRegex(NotFoundError, 'candidates'):
+            label.images.zarr(artifact_id='absent')
+        for render in label.images:
+            self.assertEqual(render.labels.ink().id, label.id)
             self.assertEqual(render.volume.id, 'a')
             self.assertEqual(render.depth_semantics, 'sampled_layers')
             self.assertEqual(render.source.axes, ('z', 'y', 'x'))
             self.assertIsNone(render.source.registration)
-        self.assertEqual(len(c.samples['s'].on_volume('b').segments['missing'].labels.ink.one().renders), 0)
+        self.assertEqual(len(c.samples['s'].on_volume('b').segments['missing'].labels.ink().images), 0)
         self.assertEqual(len(scroll.artifacts.filter(artifact_kind='new-kind')), 1)
         self.assertEqual(len(scroll.representations), 1)
         self.assertEqual(len(c.scrolls), 1)
@@ -62,16 +65,17 @@ class BrowsingTests(unittest.TestCase):
     def test_supersession_history_and_candidates(self):
         s = catalog().samples['s']
         labels = s.on_volume('a').labels
-        old = labels.filter(include_superseded=True, label_set='2020').one()
+        old = labels.ink(include_superseded=True, label_set='2020')
         self.assertEqual(labels[old.id].id, old.id)
         with self.assertRaisesRegex(NotFoundError, 'candidates'):
-            labels.one(label_set='2020')
+            labels.ink(label_set='2020')
+        self.assertEqual([v.artifact_id for v in labels.filter(artifact_kind='ink-labels')], ['new'])
         self.assertEqual(len(labels.filter(include_superseded=True)), 2)
         self.assertEqual(len(s.volumes), 3)
         self.assertTrue(s.volumes['historical'].is_superseded)
         self.assertEqual(len(s.volumes.filter(include_superseded=True)), 4)
         with self.assertRaises(AmbiguousMatchError):
-            s.labels.ink.one(label_set='2021')  # distinct targets stay visible
+            s.labels.ink(label_set='2021')  # distinct targets stay visible
 
     def test_resolution_all_matches_stable_and_metadata_only(self):
         c = catalog()
@@ -88,24 +92,24 @@ class BrowsingTests(unittest.TestCase):
         c = catalog()
         before = json.dumps(c.raw)
         s = c.samples['s']
-        native = s.labels.ink.one(artifact_id='new').source
+        native = s.labels.ink(artifact_id='new').source
         render = Source('render', Storage('/tmp/custom.zarr', 'zarr'), role='image', axes=('z', 'y', 'x'))
         label = Source('label', Storage('/tmp/label.png', 'png'), role='label', axes=('y', 'x'), artifact_kind='ink-labels')
-        s = s.with_source(render, kind='render', volume='a', segment='user:seg')
-        s = s.with_source(label, kind='label', volume='a', segment='user:seg', render=render.id, same_grid=True)
+        s = s.with_source(render, kind='image', volume='a', segment='user:seg')
+        s = s.with_source(label, kind='label', volume='a', segment='user:seg', image=render.id, same_grid=True)
         self.assertIs(s.labels[native.id].source, native)
-        self.assertEqual(s.labels[label.id].renders.one().id, render.id)
-        self.assertEqual(s.renders[render.id].labels.one().id, label.id)
+        self.assertEqual(s.labels[label.id].images.get().id, render.id)
+        self.assertEqual(s.images[render.id].labels.get().id, label.id)
         self.assertEqual(s.labels[label.id].segment.id, 'user:seg')
         self.assertEqual(json.dumps(c.raw), before)
         self.assertNotIn(label.id, [l.id for l in c.samples['s'].labels])
         for restored in (pickle.loads(pickle.dumps(s)), ScrollSource.from_dict(json.loads(json.dumps(s.to_dict())))):
-            self.assertEqual(restored.labels[label.id].renders.one().id, render.id)
+            self.assertEqual(restored.labels[label.id].images.get().id, render.id)
             self.assertEqual(restored.labels[native.id].source.registration, native.registration)
         with self.assertRaisesRegex(ValueError, 'exactly one'):
-            c.samples['s'].with_source(label, kind='label', render=render.id)
+            c.samples['s'].with_source(label, kind='label', image=render.id)
         unknown = c.samples['s'].with_source(label, kind='label')
-        self.assertFalse(unknown.labels[label.id].renders)
+        self.assertFalse(unknown.labels[label.id].images)
         self.assertFalse(unknown.labels[label.id].mappable_volumes)
         with self.assertRaisesRegex(ValueError, 'duplicate'):
             s.with_source(label, kind='label')
@@ -123,7 +127,7 @@ class BrowsingTests(unittest.TestCase):
     def test_unpublished_native_target_and_historical_mapped_destination(self):
         from test_sources import catalog as source_catalog
         c = source_catalog()
-        label = c.samples['s'].labels.ink.one(artifact_id='absent')
+        label = c.samples['s'].labels.ink(artifact_id='absent')
         self.assertEqual(label.volume.id, 'unpublished')
         self.assertIsNone(label.volume.record)
         self.assertEqual(label.mappable_volumes['a'].transform, Affine.scale(2))
@@ -144,8 +148,8 @@ class BrowsingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'unknown sample'):
             ScrollSource.from_dict(raw)
         raw = s.to_dict()
-        raw['overlays'][0]['pairs'] = [dict(label=first.id, render='absent', affine=((1,0,0),(0,1,0)))]
-        with self.assertRaisesRegex(ValueError, 'known label and render'):
+        raw['overlays'][0]['pairs'] = [dict(label=first.id, image='absent', affine=((1,0,0),(0,1,0)))]
+        with self.assertRaisesRegex(ValueError, 'known label and image'):
             ScrollSource.from_dict(raw)
 
     def test_explicit_published_reference_narrows_convention(self):
@@ -157,5 +161,5 @@ class BrowsingTests(unittest.TestCase):
                 a['origins'] = [dict(path=a['id'], access_roots=[dict(url='https://example.test')])]
             if a['id'] == 'new':
                 a['creation_info'] = dict(target=dict(render='https://example.test/render2'))
-        label = Catalog(tree).samples['s'].labels.ink.one(artifact_id='new')
-        self.assertEqual(label.renders.one().artifact_id, 'render2')
+        label = Catalog(tree).samples['s'].labels.ink(artifact_id='new')
+        self.assertEqual(label.images.zarr().artifact_id, 'render2')

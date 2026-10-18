@@ -573,20 +573,43 @@ class Source(_Value):
         return source
 
 
-@dataclass
-class SampleResult:
-    """One unbatched aligned result.
+@dataclass(slots=True)
+class TargetResult:
+    """One sampled target's arrays, sharing the requested spatial grid.
 
-    Slice-only volume data are CZYX; integer indexing removes spatial axes.
-    Valid/mask arrays have one channel. Every data key has
-    a valid entry and a masks dictionary (possibly empty). Metadata is optional
-    and should be omitted or converted before default DataLoader collation.
+    ``valid`` describes geometric support; ``masks`` retains companion values
+    without applying a training policy. Arrays retain their CPU/CUDA storage.
     """
 
-    data: dict[str, Any]
-    valid: dict[str, Any]
-    masks: dict[str, dict[str, Any]]
+    data: Any
+    valid: Any
+    masks: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class SampleResult:
+    """One unbatched crop, grouped by target name.
+
+    Access targets with ``sample[name]``; ``sample.image`` and ``sample.label``
+    select the corresponding named targets. Slice-only volume data are CZYX;
+    integer indexing removes spatial axes. Valid/mask arrays have one channel.
+    For default DataLoader collation, return a dictionary of the needed arrays
+    from the dataset. Metadata is optional and may require explicit conversion.
+    """
+
+    targets: dict[str, TargetResult]
     metadata: dict | None = None
+
+    def __getitem__(self, name: str) -> TargetResult:
+        return self.targets[name]
+
+    @property
+    def image(self) -> TargetResult:
+        return self.targets['image']
+
+    @property
+    def label(self) -> TargetResult:
+        return self.targets['label']
 
 
 _TYPES = {cls.__name__: cls for cls in (Frame, LevelRequest, Selection, Storage, Plane,

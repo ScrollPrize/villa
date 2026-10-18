@@ -56,8 +56,8 @@ def main():
                 results = []
                 for request in requests:
                     now = time.perf_counter(); result = reader.read(*request); cold.append((time.perf_counter()-now)*1000)
-                    results.append((result.data['coordinates'].numpy(), result.valid['coordinates'].numpy()) if backend == 'cuda'
-                                   else (result.data['coordinates'], result.valid['coordinates']))
+                    results.append((result['coordinates'].data.numpy(), result['coordinates'].valid.numpy()) if backend == 'cuda'
+                                   else (result['coordinates'].data, result['coordinates'].valid))
                 if expected is None:
                     expected = results
                 else:

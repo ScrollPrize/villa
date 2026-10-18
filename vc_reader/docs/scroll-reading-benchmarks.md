@@ -14,7 +14,7 @@ The canonical metadata fingerprint in catalog source IDs is
 `de38ba456eedfa4e0c4c6d6b4e093f4664d635eae551bfbe923bbdf6dc4ec58d`.
 
 `ScrollSource('PHerc0009B', '20250820154339')` discovers segment
-`20250919125754`, ink label set `20260918`, its render, and supervision/validation
+`20250919125754`, ink label set `20260918`, its image, and supervision/validation
 masks. The crop at YX `(18576,7984)`, size `(128,128)`, layers `40:65`, returned:
 
 - CT shape `(1,25,128,128)` and ink shape `(1,128,128)`.
@@ -22,9 +22,9 @@ masks. The crop at YX `(18576,7984)`, size `(128,128)`, layers `40:65`, returned
 - Byte-identical CT, ink, supervision, and validation compared with independently
   opened Zarr arrays on both CPU and CUDA.
 
-The label package is sharded Zarr v3; the render is Zarr v2 with 109 sampled
+The label package is sharded Zarr v3; the image is Zarr v2 with 109 sampled
 layers per chunk. The published metadata explicitly links the label to that
-render. Base pixel spacing and YX shapes agree in storage metadata. A source
+image. Base pixel spacing and YX shapes agree in storage metadata. A source
 transfer's canvas-offset history is not applied again to the published arrays.
 The public artifact array list includes supervision and validation. A creation
 report's mapping-validity output is absent from that list and from storage;
@@ -34,7 +34,7 @@ PHerc0009B has published type `fragment`. `catalog.samples` and `ScrollSource`
 retain it; `catalog.scrolls` filters to the 35 published scrolls.
 
 Ambiguity was exercised on PHerc0139, volume `20260413113053`, segment
-`20260302000001`: two Zarr renders remain discoverable and `.one()` raises.
+`20260302000001`: two Zarr images remain discoverable and `.get()` raises.
 
 The CT-only search `catalog.scrolls['PHercParis4'].volumes.at_resolution(8,
 rel_tol=.02)` returns both 7.91 µm native candidates:
@@ -97,7 +97,7 @@ Metadata indexing adapts 4,495 sources without array requests. With catalog
 parsing included, the pre-change index at `74aa6d007` measured
 **375.2 / 370.3 / 407.0 ms**; the relationship index measured
 **414.0 / 409.9 / 478.1 ms**, each with two warmups and ten repetitions.
-The new index additionally builds forward/reverse render links and direct owner
+The new index additionally builds forward/reverse image links and direct owner
 indexes. Peak Python allocation including records was 36,035,796 bytes.
 
 Repeated navigation across the six fixed PHercParis4 volumes averaged **7.16 µs**
@@ -178,5 +178,5 @@ macOS and arm64 validation was unavailable. No platform-specific code or new
 dependency was introduced. Generating new surface layers and projecting labels
 into 3D remain future geometry operations; their requirements are visible in
 discovery. Cold remote timing depends on network/storage conditions and the
-render's full-depth chunk layout, so the disk-warm results should not be used
+image's full-depth chunk layout, so the disk-warm results should not be used
 as download throughput estimates.

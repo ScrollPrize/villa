@@ -44,7 +44,7 @@ def main():
     rows = []
     for identifier in volumes:
         def navigate():
-            return list(scroll.on_volume(identifier).labels.ink)
+            return list(scroll.on_volume(identifier).labels.filter(artifact_kind='ink-labels'))
         # A direct relationship scan is an independent metadata-only baseline.
         def scan():
             return [a for segment in scroll.record.segments.values() for a in segment.artifacts

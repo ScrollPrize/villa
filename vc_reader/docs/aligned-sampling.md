@@ -14,13 +14,20 @@ from vc_reader.sampling import open_sample
 # label and field are explicitly chosen Source descriptors.
 with open_sample(reference, {"label": label, "field": field}) as reader:
     sample = reader[100:132, 200:328, 300:428]
-    image = sample.data["image"]
-    labels = sample.data["label"]
-    supported = sample.valid["label"]
-    source_masks = sample.masks["label"]
+    image = sample.image.data
+    labels = sample.label.data
+    supported = sample.label.valid
+    source_masks = sample.label.masks
+    field_data = sample["field"].data
     # A named target uses CZYX indexing and returns just that target's array.
     component = reader["field"][1, 100:132, 200:328, 300:428]
 ```
+
+Results group arrays by target: `sample[name]` returns a `TargetResult` with
+`data`, `valid`, and `masks`. `sample.image` and `sample.label` select the
+targets named `image` and `label`; custom names use indexing. Iterate through
+`sample.targets.items()` to visit every target. These containers retain the
+arrays without copying or moving them between CPU and CUDA.
 
 Index the shared reference grid in ZYX order. `reader.shape` is that grid's
 spatial shape. Unit-step slices, integers, negative indices, omitted trailing
@@ -94,8 +101,12 @@ requires a defined direction; other validity masks describe geometric support.
 Geometric targets populate `sample.metadata['value_frames']`, including
 component order, reference array placement/selection, or external name/units.
 For geometric fields, `component_order` describes the selected channels;
-update that declaration when changing their selection/order. Metadata otherwise defaults to `None`. Omit metadata from default DataLoader
-collation or convert the fields explicitly.
+update that declaration when changing their selection/order. Metadata otherwise
+defaults to `None`. For default DataLoader collation, return a dictionary of the
+needed arrays from `Dataset.__getitem__`, for example
+`{"image": sample.image.data, "label": sample.label.data,
+"supervision": sample.label.masks["supervision"]}`. Convert metadata explicitly
+if it is also needed in the batch.
 
 ## CUDA, ownership, and budgets
 

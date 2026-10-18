@@ -6,7 +6,7 @@ import operator
 from .affine import Affine
 from ._sampling_engine import SamplingEngine
 from .browsing import _select_level
-from .sources import SampleResult, SurfaceRegistration, VolumeRegistration
+from .sources import SampleResult, TargetResult, SurfaceRegistration, VolumeRegistration
 from .reader.source_resolution import array_placement, pixel_affine as _pixel_affine
 
 
@@ -26,7 +26,7 @@ def _companion_to_label(label, mask):
 
 
 def _xy(matrix):
-    """Keep the pixel plane; the render's stored z enumerates sampled layers."""
+    """Keep the pixel plane; the image's stored z enumerates sampled layers."""
     r = matrix.matrix
     return Affine.from_rows(((r[0][0], r[0][1], 0, r[0][3]),
                              (r[1][0], r[1][1], 0, r[1][3]), (0, 0, 1, 0)))
@@ -86,44 +86,44 @@ class _PairedTarget:
 
 
 class PairedReader(SamplingEngine):
-    """Shared indexing is YX on the selected render, with independent layer depth.
+    """Shared indexing is YX on the selected image, with independent layer depth.
 
     label/mask grids are selected independently. A matching stored grid is used
     when available; otherwise categorical values use exact nearest-neighbor
     sampling. CPU workers reopen descriptors; CUDA readers remain process-local.
     """
-    def __init__(self, label, render, pairing, *, level=0, layers=slice(None), backend='cpu',
+    def __init__(self, label, image, pairing, *, level=0, layers=slice(None), backend='cpu',
                  sampling_cache_bytes=64 << 20, sampling_work_bytes=64 << 20,
                  plan_cache_bytes=8 << 20, device=0, **reader_options):
         limits = tuple(map(operator.index, (sampling_cache_bytes, sampling_work_bytes, plan_cache_bytes)))
-        self._configuration = (label, render, backend, pairing, level, layers, limits, device, dict(reader_options))
+        self._configuration = (label, image, backend, pairing, level, layers, limits, device, dict(reader_options))
         self._initialize_runtime(backend, device, limits, reader_options)
         try:
-            if label.role != 'label' or render.role != 'image':
+            if label.role != 'label' or image.role != 'image':
                 raise ValueError('paired reading requires label and image source roles')
             # The original registration remains on public descriptors. A flattened
             # read uses its explicit pixel relationship, without projecting to 3D.
-            raw_render = replace(render, registration=None, companions=())
+            raw_image = replace(image, registration=None, companions=())
             raw_label = replace(label, registration=None, companions=())
-            render_base = self._open(_select_level(raw_render, 0))
-            image = self._open(_select_level(raw_render, level))
-            if image.spatial_axes != ('z', 'y', 'x'):
-                raise ValueError('paired render must have sampled layers and YX spatial axes')
-            self._shape = _shape_yx(image)
+            image_base = self._open(_select_level(raw_image, 0))
+            selected_image = self._open(_select_level(raw_image, level))
+            if selected_image.spatial_axes != ('z', 'y', 'x'):
+                raise ValueError('paired image must have sampled layers and YX spatial axes')
+            self._shape = _shape_yx(selected_image)
             from .reader._indexing import parse_index
-            layer_start, layer_size, layer_drop = parse_index(layers, (image.shape[image.axes.index('z')],))
+            layer_start, layer_size, layer_drop = parse_index(layers, (selected_image.shape[selected_image.axes.index('z')],))
             self._layer_start, self._layer_count, self._drop_layer = layer_start[0], layer_size[0], layer_drop[0]
-            self._targets['image'] = self._sampling_target(raw_render, image, Affine.identity())
+            self._targets['image'] = self._sampling_target(raw_image, selected_image, Affine.identity())
             label_base = self._open(_select_level(raw_label, 0))
             if label_base.spatial_axes != ('y', 'x'):
                 raise ValueError('paired labels must have YX spatial axes')
             if pairing.pixel_affine is None:
-                raise ValueError('label-pixel-to-render-pixel mapping is unresolved')
+                raise ValueError('label-pixel-to-image-pixel mapping is unresolved')
             rows = pairing.pixel_affine
             mapping = _pixel_affine(rows)
             # Published target-canvas relationships are expressed in the shared
             # storage frame when both arrays publish dimensional transforms.
-            a, b = render_base.resolved, label_base.resolved
+            a, b = image_base.resolved, label_base.resolved
             shared_metadata = a.storage_from_array is not None and b.storage_from_array is not None
             if shared_metadata and a.storage_units != b.storage_units and pairing.evidence != 'explicit user pixel mapping':
                 raise ValueError('paired pixel grids have incompatible storage units')
@@ -134,12 +134,12 @@ class PairedReader(SamplingEngine):
                     mapping = observed
                 elif pairing.evidence == 'explicit same grid' and not _same(observed, mapping):
                     raise ValueError('storage transforms contradict same_grid pairing')
-            elif pairing.evidence.startswith(('published', 'segment/')) and _shape_yx(render_base) != _shape_yx(label_base):
+            elif pairing.evidence.startswith(('published', 'segment/')) and _shape_yx(image_base) != _shape_yx(label_base):
                 raise ValueError('published pixel grids differ without storage transforms; pairing is unresolved')
-            if pairing.evidence == 'explicit same grid' and _shape_yx(render_base) != _shape_yx(label_base):
+            if pairing.evidence == 'explicit same grid' and _shape_yx(image_base) != _shape_yx(label_base):
                 raise ValueError('same_grid pairing has different base shapes')
-            render_from_selected = _relative(render_base, image)
-            label_to_selected = render_from_selected.inverse() @ mapping
+            image_from_selected = _relative(image_base, selected_image)
+            label_to_selected = image_from_selected.inverse() @ mapping
             self._targets['label'] = self._planar_target(raw_label, label_base, label_to_selected, level)
             self._masks = {}
             for companion in label.companions:
@@ -163,16 +163,16 @@ class PairedReader(SamplingEngine):
                     native_mask = self._open(_select_level(replace(companion.source, companions=()), 0))
                     mask_to_label = _companion_to_label(native_label.registration, native_mask.registration)
                 self._masks[companion.name] = self._planar_target(mask_source, base, label_to_selected @ mask_to_label, level)
-            self.metadata = dict(render_id=render.id, label_id=label.id, render_selection=image.resolved.selection,
+            self.metadata = dict(image_id=image.id, label_id=label.id, image_selection=selected_image.resolved.selection,
                                  label_selection=self._targets['label']['reader'].resolved.selection,
                                  depth_semantics='sampled_layers', pairing_evidence=pairing.evidence)
         except BaseException:
             self.close()
             raise
 
-    def _planar_target(self, source, base, base_to_render, preferred_level):
-        selected, selected_to_render = base, base_to_render
-        if not _same(selected_to_render, Affine.identity()) and source.storage.pyramid:
+    def _planar_target(self, source, base, base_to_image, preferred_level):
+        selected, selected_to_image = base, base_to_image
+        if not _same(selected_to_image, Affine.identity()) and source.storage.pyramid:
             # Header-declared levels are candidates, not an assumed shared level
             # count. Never request a nonexistent label/mask level.
             backend = base._backend
@@ -184,15 +184,15 @@ class PairedReader(SamplingEngine):
             for level in levels:
                 candidate = self._open(_select_level(source, level))
                 try:
-                    mapping = base_to_render @ _relative(base, candidate)
+                    mapping = base_to_image @ _relative(base, candidate)
                 except ValueError:
                     continue
                 if _same(mapping, Affine.identity()):
-                    selected, selected_to_render = candidate, Affine.identity()
+                    selected, selected_to_image = candidate, Affine.identity()
                     break
-        if _same(selected_to_render, Affine.identity()):
-            selected_to_render = Affine.identity()
-        target = self._sampling_target(source, selected, selected_to_render.inverse(), plane=True, planar_grid=True)
+        if _same(selected_to_image, Affine.identity()):
+            selected_to_image = Affine.identity()
+        target = self._sampling_target(source, selected, selected_to_image.inverse(), plane=True, planar_grid=True)
         return target
 
     @property
@@ -211,9 +211,11 @@ class PairedReader(SamplingEngine):
         result = self.read(start, size)
         if any(squeeze):
             spatial = tuple(n for n, drop in zip(size, squeeze) if not drop)
-            for values in (result.data, result.valid, *result.masks.values()):
-                for name, array in values.items():
-                    values[name] = array.reshape((*array.shape[:-2], *spatial))
+            for target in result.targets.values():
+                target.data = target.data.reshape((*target.data.shape[:-2], *spatial))
+                target.valid = target.valid.reshape((*target.valid.shape[:-2], *spatial))
+                for name, array in target.masks.items():
+                    target.masks[name] = array.reshape((*array.shape[:-2], *spatial))
         return result
 
     def read(self, start, size):
@@ -228,7 +230,7 @@ class PairedReader(SamplingEngine):
                 if len(start) != 2 or len(size) != 2 or any(n < 0 or n > 2**24 for n in size) or any(abs(v) > 2**40 for v in start):
                     raise ValueError('paired regions require YX start/size, nonnegative bounded sizes')
                 normalized.append((start, size))
-            results = [SampleResult({}, {}, {'image': {}, 'label': {}}, dict(self.metadata)) for _ in normalized]
+            results = [SampleResult({}, dict(self.metadata)) for _ in normalized]
             for name, target in self._targets.items():
                 z, depth = (self._layer_start, self._layer_count) if name == 'image' else (0, 1)
                 requests = [((z, *start), (depth, *size)) for start, size in normalized]
@@ -236,11 +238,11 @@ class PairedReader(SamplingEngine):
                     if name != 'image' or self._drop_layer:
                         array = array.reshape((array.shape[0], *array.shape[-2:]))
                         valid = valid.reshape((1, *valid.shape[-2:]))
-                    result.data[name], result.valid[name] = array, valid
+                    result.targets[name] = TargetResult(array, valid)
             requests = [((0, *start), (1, *size)) for start, size in normalized]
             for name, target in self._masks.items():
                 for result, (array, _) in zip(results, self._sample_many(target, requests)):
-                    result.masks['label'][name] = array.reshape((array.shape[0], *array.shape[-2:]))
+                    result['label'].masks[name] = array.reshape((array.shape[0], *array.shape[-2:]))
             return results
 
     def stats(self):
@@ -249,7 +251,7 @@ class PairedReader(SamplingEngine):
         return result
 
     def _restore(self, state):
-        label, render, backend, pairing, level, layers, limits, device, options = state
-        self.__init__(label, render, pairing, backend=backend, level=level, layers=layers,
+        label, image, backend, pairing, level, layers, limits, device, options = state
+        self.__init__(label, image, pairing, backend=backend, level=level, layers=layers,
                       sampling_cache_bytes=limits[0], sampling_work_bytes=limits[1], plan_cache_bytes=limits[2],
                       device=device, **options)
