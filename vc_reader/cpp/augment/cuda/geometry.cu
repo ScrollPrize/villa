@@ -59,20 +59,11 @@ template<class Acc, class T, class Real> __device__ Acc linear_sample(const T* s
 // Factor the interior tensor-product stencil into seven lerps (three in 2D).
 // Boundary/validity sampling still uses the shared corner evaluator. Avoid
 // b-a: that difference can overflow for finite endpoints of opposite signs.
-template<class Real> __device__ Real blend(Real a, Real b, Real t) {
-    if (t == 0) return a;
-    if (t == 1) return b;
-    return (Real(1)-t)*a+t*b;
-}
 template<int D, class Real, class T, class Index>
 __device__ Real interior_sample(const T* src, Index base, Layout in, const Real* f) {
-    const Index sy=Index(in.stride[D-2]);
-    const auto plane = [&](Index at) {
-        return blend(blend(Real(src[at]),Real(src[at+1]),f[D-1]),
-                     blend(Real(src[at+sy]),Real(src[at+sy+1]),f[D-1]),f[D-2]);
-    };
-    if constexpr (D == 3) return blend(plane(base),plane(base+Index(in.stride[0])),f[0]);
-    else return plane(base);
+    ResizePosition<Real,Index> q[D];
+    for (int a=0; a<D; ++a) q[a]={0,Index(in.stride[a]),f[a]};
+    return resize_sample<D,Real>(src+base,q);
 }
 template<class T, class Real, int D = 0, class Index = std::size_t>
 __global__ void geometry_kernel(const T* src, T* dst, Layout in, Layout out, std::size_t channels, GeometryArgs<Real> p, const float* field, T pad, int* used_pad) {

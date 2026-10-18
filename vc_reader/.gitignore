@@ -1,3 +1,6 @@
 # Generated benchmark reports.
 **/benchmarks/**/*.json
 !benchmarks/fixtures/**/*.json
+
+# Local implementation plans.
+/plans/

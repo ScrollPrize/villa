@@ -207,6 +207,73 @@ class PrecisionTests(unittest.TestCase):
             result = pipeline({'image': image}, seed=0)['image']
             self.assertEqual(result[0, 1, 4096], delta)
 
+    def test_low_resolution_composed_sampling(self):
+        # Independent reference materializes the nearest-reduced image, then
+        # reconstructs one axis at a time using NumPy linear interpolation.
+        def reference(image, scale, axes):
+            shape = image.shape[1:]
+            names = 'zyx'[-len(shape):]
+            reduced = tuple(max(1, round(n*scale)) if a in axes else n
+                            for n, a in zip(shape, names))
+            result = image.astype(np.float64)
+            for a, (n, m) in enumerate(zip(shape, reduced), 1):
+                result = np.take(result, ((2*np.arange(m)+1)*n)//(2*m), axis=a)
+            for a, (n, m) in enumerate(zip(shape, reduced), 1):
+                q = np.clip((np.arange(n)+.5)*m/n-.5, 0, m-1)
+                lo = np.floor(q).astype(int)
+                weights = (q-lo).reshape([n if j == a else 1 for j in range(image.ndim)])
+                result = (np.take(result, lo, axis=a)*(1-weights)
+                          + np.take(result, np.minimum(lo+1, m-1), axis=a)*weights)
+            return result.astype(image.dtype)
+
+        rng = np.random.default_rng(571)
+        for shape in ((1, 1), (1, 19), (13, 17), (1, 1, 1), (1, 7, 11),
+                      (7, 1, 11), (7, 11, 1), (9, 11, 13), (3, 5, 128)):
+            for dtype in (np.float32, np.float64):
+                image = rng.uniform(-2, 3, (2, *shape)).astype(dtype)
+                original = image.copy()
+                mask = (image > 0).astype(np.uint8)
+                for scale, axes in ((.01, 'zyx'), (.5, 'zyx'), (.85, 'x'),
+                                    (.7, 'zy'), (1., 'zyx')):
+                    expected = reference(image, scale, axes)
+                    for backend in self.backends():
+                        for channels in ([], [1]):
+                            with self.subTest(shape=shape, dtype=dtype, scale=scale,
+                                              axes=axes, backend=backend, channels=channels):
+                                pipe = A.Pipeline([A.LowResolution(scale, axes=axes, channels=channels)],
+                                                  backend=backend, compact=False)
+                                sample = {'image': image, 'mask': mask}
+                                actual = pipe(sample, seed=5)
+                                wanted = expected.copy()
+                                if channels:
+                                    wanted[0] = image[0]
+                                np.testing.assert_allclose(actual['image'], wanted, atol=2e-6, rtol=2e-6)
+                                np.testing.assert_array_equal(actual['mask'], mask)
+                                np.testing.assert_array_equal(image, original)
+                                replay = pickle.loads(pickle.dumps(pipe.sample(sample, seed=5))).apply(sample)
+                                np.testing.assert_array_equal(actual['image'], replay['image'])
+
+    def test_low_resolution_extremes_and_validity(self):
+        for dtype in (np.float32, np.float64):
+            limit = np.finfo(dtype).max
+            image = np.full((1, 5, 7, 9), limit, dtype=dtype)
+            image[..., ::2] = -limit
+            valid = np.ones(image.shape, dtype=np.uint8)
+            valid[..., 0] = 0
+            for backend in self.backends():
+                pipe = A.Pipeline([A.LowResolution(.7)], backend=backend, compact=False)
+                out = pipe({'image': image, 'padding_mask': valid}, seed=0)
+                self.assertTrue(np.isfinite(out['image']).all())
+                self.assertTrue((np.abs(out['image']) <= limit).all())
+                np.testing.assert_array_equal(out['image'][valid == 0], 0)
+                np.testing.assert_array_equal(out['padding_mask'], valid)
+                # A scale that rounds back to the input shape must preserve bits.
+                identity = A.Pipeline([A.LowResolution(.999)], backend=backend, compact=False)
+                zeros = np.zeros_like(image)
+                zeros[..., ::2] = -0.
+                result = identity({'image': zeros}, seed=0)['image']
+                self.assertEqual(result.tobytes(), zeros.tobytes())
+
     def test_gaussian_tiles_and_boundaries(self):
         # Independent separable reference: partial CUDA tiles, multiple rows,
         # singleton axes, identity taps, and radii on either side of the tiled

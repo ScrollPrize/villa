@@ -158,6 +158,29 @@ class BatchTests(unittest.TestCase):
         ref = p({'image': cuda.asarray(np.ones((1, 2, 3, 4), np.float32))}, seed=1)
         self.assertTrue(np.all(ref['image'].numpy() == 1))
 
+    def test_low_resolution_stream_and_output_ownership(self):
+        transforms = [A.LowResolution(.7), A.BrightnessAdd(.25), A.LowResolution(.85)]
+        cpu = A.Pipeline(transforms, compact=False)
+        gpu = A.Pipeline(transforms, backend='cuda', compact=False)
+        for channels in (1, 2):
+            for dtype in (torch.float32, torch.float64):
+                host = torch.arange(3*channels*5*7*9, dtype=dtype).reshape(3, channels, 5, 7, 9)/100
+                expected = torch.from_numpy(np.stack([
+                    cpu({'image': image.numpy()}, seed=i)['image'] for i, image in enumerate(host)]))
+                stream = torch.cuda.Stream()
+                with torch.cuda.stream(stream):
+                    source = host.to('cuda')
+                    first = gpu.batch({'image': source}, seeds=[0, 1, 2])['image']
+                    # Reuse the pool while retaining the first result.
+                    second = gpu.batch({'image': source}, seeds=[0, 1, 2])['image']
+                    weight = torch.ones((), device='cuda', requires_grad=True)
+                    (first*weight).sum().backward()
+                stream.synchronize()
+                torch.testing.assert_close(first.cpu(), expected, rtol=2e-6, atol=2e-6)
+                self.assertSame(first, second)
+                self.assertSame(source.cpu(), host)
+                self.assertSame(weight.grad, first.sum().to(weight.dtype))
+
     def test_full_uint64_seeds_after_default_collation(self):
         seeds = [(1 << 64) - 1, 1 << 63, 7]
         p = A.Pipeline([A.BrightnessMultiply((.5, 1.5))], backend='cuda')

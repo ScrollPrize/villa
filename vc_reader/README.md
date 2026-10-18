@@ -91,6 +91,12 @@ for timing scope and validation.
 
 ## Performance
 
+Low-resolution simulation composes nearest reduction and linear reconstruction
+into one sampling pass on CPU and CUDA. It avoids the reduced image and, for
+single-channel CUDA crops, two full-volume copies. See the
+[composed resize measurements](benchmarks/README.md#composed-low-resolution-sampling-2026-10-17)
+for transform timings and full-loader throughput.
+
 Local brightness, contrast, gamma and smoothing use separable float32 fields:
 a 128³ field needs 388 floats (1.52 KiB), with weights evaluated during image
 processing. See the [compact local-field measurements](benchmarks/README.md#compact-local-fields-2026-10-17)

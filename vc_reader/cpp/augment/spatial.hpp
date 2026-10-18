@@ -1,5 +1,5 @@
 #pragma once
-#include "resize_index.hpp"
+#include "resize_plan.hpp"
 #include "intensity.hpp"
 #include "elastic.hpp"
 
@@ -468,24 +468,15 @@ template<Geometric T> void apply(const T&, Sample& s, const Parameters& p) { app
 // from a geometric deformation (point coordinates do not move).
 struct LowResolution { Scalar scale = Uniform{.5, 1}; std::string axes = "zyx"; bool shared_axes = true; ChannelOptions options; };
 struct ThickSlice { Scalar scale = Uniform{.25, .6}; std::string axes; bool labels = true; double p = 1; };
-template<std::size_t D,class Real> Array resize_array_impl(const Array& a, const Shape& shape, bool nearest, bool legacy_nearest) {
+template<std::size_t D,class Real> Array resize_array_impl(const Array& a, const Shape& shape, bool nearest, bool legacy_nearest, const Shape* reduced = nullptr) {
     Grid input(a.spatial()), output(shape);
     Shape out_shape{a.shape[0]}; out_shape.insert(out_shape.end(), shape.begin(), shape.end());
     auto out = Array::uninitialized(out_shape, a.kind, a.bytes);
-    struct Axis { std::size_t lo, hi; Real fraction; };
+    using Axis = ResizePosition<Real>;
     std::array<std::vector<Axis>, D> positions;
-    for (std::size_t axis = 0; axis < D; ++axis) {
-        const double ratio = double(input.shape[axis]) / shape[axis];
-        const double offset = legacy_nearest ? 0 : .5 * ratio - .5;
-        for (std::size_t x = 0; x < shape[axis]; ++x) {
-            double q = std::clamp(ratio * double(x) + offset, 0., double(input.shape[axis] - 1));
-            auto lo = std::size_t(std::floor(q)); Real fraction = q - lo;
-            if (nearest) {
-                auto at = resize_nearest_index(x, input.shape[axis], shape[axis], legacy_nearest);
-                positions[axis].push_back({at * input.stride[axis], 0, 0});
-            } else positions[axis].push_back({lo * input.stride[axis], std::min(lo + 1, input.shape[axis] - 1) * input.stride[axis], fraction});
-        }
-    }
+    for (std::size_t axis = 0; axis < D; ++axis)
+        positions[axis] = resize_positions<Real>(input.shape[axis],shape[axis],input.stride[axis],
+                                                nearest,legacy_nearest,reduced ? (*reduced)[axis] : 0);
     a.typed([&](const auto* src) {
         using T = std::remove_cv_t<std::remove_pointer_t<decltype(src)>>;
         auto* dst = static_cast<T*>(out.data());
@@ -502,21 +493,7 @@ template<std::size_t D,class Real> Array resize_array_impl(const Array& a, const
                         for (const auto& axis : q) at += axis.lo;
                         dst[i] = src[at];
                     } else {
-                        const auto interpolate = [&]<class Acc>() {
-                        Acc value = 0;
-                        for (std::size_t corner = 0; corner < (1u << D); ++corner) {
-                            Acc weight = 1; std::size_t at = c * input.size;
-                            for (std::size_t axis = 0; axis < D; ++axis) {
-                                bool hi = (corner >> axis) & 1;
-                                weight *= hi ? Acc(q[axis].fraction) : Acc(1) - Acc(q[axis].fraction);
-                                at += hi ? q[axis].hi : q[axis].lo;
-                            }
-                            if (weight) value += weight * Acc(src[at]);
-                        }
-                        return value;
-                        };
-                        Real value=interpolate.template operator()<Real>();
-                        if constexpr(std::is_same_v<Real,float>) if(!std::isfinite(value)) value=float(interpolate.template operator()<double>());
+                        const Real value=resize_value<D>(src+c*input.size,q.data());
                         if constexpr (std::is_floating_point_v<T>) dst[i] = static_cast<T>(value);
                         else out.set(i, value);
                     }
@@ -524,12 +501,12 @@ template<std::size_t D,class Real> Array resize_array_impl(const Array& a, const
     });
     return out;
 }
-inline Array resize_array(const Array& a, const Shape& shape, bool nearest, bool legacy_nearest = false) {
+inline Array resize_array(const Array& a, const Shape& shape, bool nearest, bool legacy_nearest = false, const Shape* reduced = nullptr) {
     if (a.kind != 'f' || a.bytes == 4)
-        return shape.size() == 2 ? resize_array_impl<2,float>(a, shape, nearest, legacy_nearest)
-                                 : resize_array_impl<3,float>(a, shape, nearest, legacy_nearest);
-    return shape.size() == 2 ? resize_array_impl<2,double>(a, shape, nearest, legacy_nearest)
-                             : resize_array_impl<3,double>(a, shape, nearest, legacy_nearest);
+        return shape.size() == 2 ? resize_array_impl<2,float>(a, shape, nearest, legacy_nearest, reduced)
+                                 : resize_array_impl<3,float>(a, shape, nearest, legacy_nearest, reduced);
+    return shape.size() == 2 ? resize_array_impl<2,double>(a, shape, nearest, legacy_nearest, reduced)
+                             : resize_array_impl<3,double>(a, shape, nearest, legacy_nearest, reduced);
 }
 inline Parameters sample(const LowResolution& t, const Sample& s, Random& r) {
     return sample_channels(s, t.options, r, [&](const Array& a, Random& rng) {
@@ -541,14 +518,15 @@ inline Parameters sample(const LowResolution& t, const Sample& s, Random& r) {
         return p;
     });
 }
-template<class Resize>
-inline void apply_resolution(const LowResolution&, Sample& s, const Parameters& p, Resize&& resize) {
+inline void apply(const LowResolution&, Sample& s, const Parameters& p) {
     for (const auto& c : p.channels) {
         auto& a = s.at(c.key).array; Shape shape = a.spatial(); auto n = product(shape); Shape one_shape{1}; one_shape.insert(one_shape.end(), shape.begin(), shape.end());
         Array one(one_shape, a.kind, a.bytes, static_cast<const char*>(std::as_const(a).data()) + c.channel * n * a.bytes);
         for (std::size_t j = 0; j < shape.size(); ++j) shape[j] = std::max<std::size_t>(1, std::size_t(round_even(shape[j] * c.values[j])));
-        auto restored = resize(resize(one, shape, true, false), a.spatial(), false, false);
-        std::memcpy(static_cast<char*>(a.data()) + c.channel * n * a.bytes, restored.data(), n * a.bytes);
+        if (shape == a.spatial()) continue;
+        auto restored = resize_array(one, a.spatial(), false, false, &shape);
+        if (a.shape[0]==1) a=std::move(restored);
+        else std::memcpy(static_cast<char*>(a.data()) + c.channel * n * a.bytes, restored.data(), n * a.bytes);
     }
     restore_valid(s);
 }
@@ -565,6 +543,5 @@ inline void apply_resolution(const ThickSlice& t, Sample& s, const Parameters& p
     }
     restore_valid(s);
 }
-inline void apply(const LowResolution& t, Sample& s, const Parameters& p) { apply_resolution(t, s, p, resize_array); }
-inline void apply(const ThickSlice& t, Sample& s, const Parameters& p) { apply_resolution(t, s, p, resize_array); }
+inline void apply(const ThickSlice& t, Sample& s, const Parameters& p) { apply_resolution(t, s, p, [](const Array& a, const Shape& shape, bool nearest, bool aligned) { return resize_array(a,shape,nearest,aligned); }); }
 } // namespace vcr::augment

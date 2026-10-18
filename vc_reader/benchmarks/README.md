@@ -11,8 +11,110 @@ Release extensions for every suite. The refresh manifest (`docs/benchmarks/refre
 records report hashes and coverage. Current results are in the PyTorch, resident
 geometry, augmentation catalog, and reader/pipeline sections. The two optimization
 history sections are explicitly marked historical and retain their original data.
-The Gaussian and compact-field experiments below measure subsequent changes
+The resize, Gaussian and compact-field experiments below measure subsequent changes
 separately; they do not replace the catalog-wide refresh.
+
+## Composed low-resolution sampling (2026-10-17)
+
+LowResolution composes nearest reduction with linear reconstruction using one
+lookup table per axis. Both CPU and CUDA sample directly from the original
+image, eliminating the reduced image and its sampling pass. Single-channel
+outputs replace the working buffer: CUDA also removes the initial channel copy
+and final copy, and CPU removes the final copy. Multiple selected channels keep
+a final per-channel copy so unselected channels remain intact. Identity scales
+skip sampling. A 128³ float32 CUDA crop uses a 4.5 KiB table, with 32-bit offsets;
+larger volumes retain 64-bit offsets. Shared CPU/CUDA helpers construct the
+tables and factor interpolation into seven blends in 3D or three in 2D.
+
+Measured on Linux amd64 / RTX 5090, Release, CUDA architecture 120, against the
+saved build of `641e562e6`. The isolated recipe is `LowResolution(scale=0.5)` on
+a PHercParis4 level-2 128³ float32 CT crop at `(9000, 3600, 3600)`, divided by 255.
+There is one CPU thread. Results combine two blocks of 60 measurements per route,
+each after five warmups, with seeds 123–182 and deterministically shuffled route
+order. Repeated blocks measure variability on the same input. Public-call input
+preservation and validation are included; reads, output comparisons/disposal,
+and initial resident upload/final download are excluded. Uploaded CUDA includes
+transfers. Values are **mean / p50 / p95 milliseconds**.
+
+| LowResolution route | Before | After |
+| --- | ---: | ---: |
+| CPU | 10.534 / 12.090 / 12.721 | 7.173 / 7.162 / 7.366 |
+| CUDA uploaded | 2.189 / 1.632 / 4.136 | 1.315 / 1.320 / 1.466 |
+| CUDA resident | 0.319 / 0.354 / 0.428 | 0.132 / 0.122 / 0.301 |
+
+The full loader uses min-max normalization and `heavy_transforms()`'s shared
+12-transform chain (including `LowResolution(.85)`), four spawned loader workers
+with four reader threads each, and batches of four 128³ crops. Each route has a
+validation/warmup epoch followed by three repetitions of 64 batches, with rotating
+route order and warm caches. Reading, transfers, casts, augmentation, collation,
+disposal, and stream completion are included; model computation is excluded.
+All 256 validation crop hashes match across routes within each build; rounding
+changes mean hashes differ between builds.
+
+| Loader route | Before mean / p50 / p95 ms | After mean / p50 / p95 ms | Crops/s before → after |
+| --- | ---: | ---: | ---: |
+| `Pipeline.batch()` | 4.311 / 3.972 / 4.898 | 3.937 / 3.672 / 4.680 | 927.27 → 1015.36 (+9.5%) |
+| `CudaLoader` prefetch | 4.185 / 3.746 / 4.754 | 3.714 / 3.332 / 4.374 | 955.44 → 1076.61 (+12.7%) |
+
+Separate Nsight Systems traces cover four warmup and four measured batches
+(32 crops). Baseline leading kernel groups are general resampling (15.1%),
+statistics collection (11.1%), and median filtering (8.1%); nearest resizing
+alone takes another 7.3%. The change removes all 32 nearest-resize launches,
+reduces general-resampling launches from 64 to 32, and adds 32 composed-sampling
+launches averaging **10.24 µs**. Device-to-device copies fall from 224 to 160,
+removing 512 MiB of copied data across the trace. Total kernel time falls from
+22.397 to 18.905 ms. The leading remaining groups are statistics collection
+(13.2%), median filtering (9.6%), and strided convolution (8.8%). Instrumented
+timings are excluded from throughput results; trace totals include scheduling
+outliers.
+
+All 38 tests pass with CUDA; the separate CPU-only precision suite passes all
+15 tests. Independent NumPy references materialize the two resize stages and
+cover 2D/3D, singleton axes, identity scales, multiple and selected channels,
+float32/float64, exact nearest ties, overflow-prone finite values, validity masks,
+input preservation, and pickle replay. A batch test checks retained outputs,
+nondefault CUDA streams, and training backward after buffer replacement.
+Comparing before/after outputs on the real crop for scales .5, .85, and randomly
+sampled per-axis scales at seeds 123–125 gives a maximum absolute difference of
+**1.79e-7** across CPU/CUDA. This is a numerical check, not model-quality evidence.
+macOS/arm64 and arrays requiring CUDA's 64-bit offset path were not runtime-tested.
+Some loader runs emit Python resource-tracker semaphore cleanup warnings at
+process shutdown; validation and measured epochs complete successfully.
+
+Local ignored reports `docs/benchmarks/resize-{before,after}{,-repeat}.json`,
+`resize-loader-{before,after}.json`, and `resize-profile-{before,after}.json`
+record commands, configuration, extension hashes, and raw measurements.
+`resize-summary.json` combines the 120 samples per route. Nsight traces and
+CSV summaries are under `/tmp/resize-profile-{before,after}.*`.
+
+Reproduce with the existing environments and builds (no installation):
+
+```bash
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-reader-cuda --target _augment --parallel 4
+VC_BENCH_VOLUME=/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr
+# Use /tmp/vc-resize-before and a distinct output path for the saved baseline.
+# Run twice with distinct report paths to reproduce the two measurement blocks.
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  .venv/bin/python benchmarks/bench_augmentations.py \
+  --native-dir /tmp/vc-reader-cuda --array "$VC_BENCH_VOLUME" \
+  --only LowResolution --warmup 5 --reps 60 --output /tmp/resize-after.json
+AGENTS_AGENT_MODE=1 .venv/bin/python benchmarks/bench_torch.py \
+  --native-dir /tmp/vc-reader-cuda --modes batch prefetch \
+  --array "$VC_BENCH_VOLUME" --level 2 --batches 64 --batch-size 4 --reps 3 \
+  --output /tmp/resize-loader-after.json
+AGENTS_AGENT_MODE=1 nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
+  --force-overwrite=true --output=/tmp/resize-profile-after \
+  .venv/bin/python benchmarks/bench_torch.py --native-dir /tmp/vc-reader-cuda \
+  --modes prefetch --array "$VC_BENCH_VOLUME" --level 2 \
+  --batches 4 --batch-size 4 --reps 1 --output /tmp/resize-profile-after.json
+nsys stats --report cuda_gpu_kern_sum,cuda_gpu_mem_time_sum --format csv \
+  /tmp/resize-profile-after.nsys-rep
+AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=/tmp/vc-reader-cuda \
+  .venv/bin/python -m unittest discover -s tests -v
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-volume-cpu --target _augment --parallel 4
+AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=/tmp/vc-volume-cpu \
+  .venv/bin/python -m unittest discover -s tests -p test_precision.py -v
+```
 
 ## Compact local fields (2026-10-17)
 

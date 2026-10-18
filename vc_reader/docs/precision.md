@@ -12,6 +12,15 @@ inputs retain their precision. Label indices use integer storage. Exact flips
 use integer addressing, without interpolation. Nearest resize uses a shared
 integer ratio in `resize_index.hpp`, avoiding floating-point half-voxel ties.
 
+LowResolution composes that nearest-index mapping with reconstruction in
+axis-sized tables shared by CPU and CUDA. `resize_plan.hpp` constructs coordinates
+in double, stores weights in the image dtype, and reads interpolation neighbors
+directly from the original image. Its factored interpolation is also shared with
+the CUDA geometry sampler. Float32 overflow retries in double; explicit float64
+images retain float64 weights and arithmetic. Identity reductions skip sampling.
+This changes rounding, but not the selected nearest neighbors, half-pixel mapping,
+boundary clamping, random draws, or channel/target selection.
+
 Local brightness, contrast, gamma and smoothing fields store four float32
 normalization scalars and one float32 vector per spatial axis. Both CPU and CUDA
 evaluate their separable product while consuming the image. Centered brightness
