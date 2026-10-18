@@ -645,12 +645,8 @@ void CPointCollectionWidget::updateMetadataWidgets()
             _absolute_winding_checkbox->setChecked(collection.metadata.absolute_winding_number);
             _absolute_winding_checkbox->blockSignals(false);
 
-            QPalette pal = _color_button->palette();
             QColor q_color(collection.color[0] * 255, collection.color[1] * 255, collection.color[2] * 255);
-            pal.setColor(QPalette::Button, q_color);
-            _color_button->setAutoFillBackground(true);
-            _color_button->setPalette(pal);
-            _color_button->update();
+            _color_button->setStyleSheet(QStringLiteral("background-color: %1;").arg(q_color.name()));
 
             // Update tags display
             if (collection.tags.empty()) {
@@ -685,7 +681,7 @@ void CPointCollectionWidget::updateMetadataWidgets()
     } else {
         _collection_name_edit->clear();
         _absolute_winding_checkbox->setChecked(false);
-        _color_button->setAutoFillBackground(false);
+        _color_button->setStyleSheet({});
         _anchor_status_label->setText("Anchor: none");
         _clear_anchor_button->setEnabled(false);
         _fill_winding_plus_button->setChecked(false);
