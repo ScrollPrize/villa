@@ -282,8 +282,11 @@ template<std::size_t D, class Real> Array resample_impl(const Array& src, const 
     return out;
 }
 inline Array resample(const Array& src, const Parameters& p, bool nearest, double fill, bool validity = false, std::size_t field_axis = 3) {
-    return p.shape.size() == 2 ? resample_impl<2>(src, p, nearest, fill, validity, field_axis)
-                               : resample_impl<3>(src, p, nearest, fill, validity, field_axis);
+    if (!(src.kind == 'f' && src.bytes == 8) && geometry_float32(p, src.spatial()))
+        return p.shape.size() == 2 ? resample_impl<2,float>(src, p, nearest, fill, validity, field_axis)
+                                   : resample_impl<3,float>(src, p, nearest, fill, validity, field_axis);
+    return p.shape.size() == 2 ? resample_impl<2,double>(src, p, nearest, fill, validity, field_axis)
+                               : resample_impl<3,double>(src, p, nearest, fill, validity, field_axis);
 }
 template<class Resample>
 inline void apply_geometry_with(Sample& sample, const Parameters& p, Resample&& resample) {
