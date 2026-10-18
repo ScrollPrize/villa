@@ -23,6 +23,7 @@
 #include "Keybinds.hpp"
 #include "CommandCatalog.hpp"
 #include "CommandPalette.hpp"
+#include "KeybindsSheet.hpp"
 #include "FileWatcherService.hpp"
 #include "LineAnnotationController.hpp"
 
@@ -48,12 +49,10 @@
 #include <QDateTime>
 #include <QDesktopServices>
 #include <QDialog>
-#include <QDialogButtonBox>
 #include <QDir>
 #include <QEventLoop>
 #include <QFileDialog>
 #include <QFileInfo>
-#include <QLabel>
 #include <QLineEdit>
 #include <QMainWindow>
 #include <QMetaObject>
@@ -65,7 +64,6 @@
 #include <QPointer>
 #include <QProcess>
 #include <QProgressDialog>
-#include <QScrollArea>
 #include <QSignalBlocker>
 #include <QStringList>
 #include <QSettings>
@@ -75,7 +73,6 @@
 #include <QTimer>
 #include <QTreeWidgetItem>
 #include <QUrl>
-#include <QVBoxLayout>
 
 #include "utils/Json.hpp"
 
@@ -1504,34 +1501,8 @@ void MenuActionController::showKeybindings()
         return;
     }
 
-    _keybindsDialog = new QDialog(_window);
+    _keybindsDialog = new KeybindsSheet(_window->commandCatalog(), _window);
     _keybindsDialog->setAttribute(Qt::WA_DeleteOnClose);
-    _keybindsDialog->setWindowTitle(QObject::tr("Keybindings for Volume Cartographer"));
-
-    auto* layout = new QVBoxLayout(_keybindsDialog);
-    auto* scrollArea = new QScrollArea(_keybindsDialog);
-    scrollArea->setWidgetResizable(true);
-
-    auto* content = new QWidget(scrollArea);
-    auto* contentLayout = new QVBoxLayout(content);
-    auto* label = new QLabel(content);
-    label->setTextFormat(Qt::PlainText);
-    label->setText(vc3d::keybinds::buildKeybindsHelpText());
-    label->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    label->setWordWrap(false);
-    contentLayout->addWidget(label);
-    contentLayout->addStretch();
-    content->setLayout(contentLayout);
-
-    scrollArea->setWidget(content);
-    layout->addWidget(scrollArea);
-
-    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok, _keybindsDialog);
-    connect(buttons, &QDialogButtonBox::accepted, _keybindsDialog, &QDialog::accept);
-    layout->addWidget(buttons);
-
-    _keybindsDialog->resize(640, 520);
-    _keybindsDialog->setMinimumHeight(360);
     _keybindsDialog->show();
     _keybindsDialog->raise();
     _keybindsDialog->activateWindow();

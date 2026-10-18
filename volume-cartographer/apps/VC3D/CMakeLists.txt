@@ -14,6 +14,8 @@ set(srcs
     CState.hpp
     Keybinds.cpp
     Keybinds.hpp
+    KeybindsSheet.cpp
+    KeybindsSheet.hpp
     CommandCatalog.cpp
     CommandCatalog.hpp
     CommandPalette.cpp

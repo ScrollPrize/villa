@@ -3,6 +3,8 @@
 #include <QKeySequence>
 #include <QString>
 
+#include <vector>
+
 namespace vc3d::keybinds {
 
 enum class ShortcutKind {
@@ -103,6 +105,17 @@ constexpr QKeySequence::StandardKey Open = QKeySequence::Open;
 QKeySequence sequenceFor(const ShortcutDef& def);
 QKeySequence sequenceFor(const KeyPressDef& def);
 
-QString buildKeybindsHelpText();
+// One row of the keybinds help: a key or mouse gesture and what it does.
+struct HelpRow {
+    QString section;
+    QString description;
+    QString keys;           // display text, native format for registry keys
+    QString id;             // ShortcutDef or KeyPressDef id; empty for literal rows
+    QKeySequence sequence;  // the registry key; empty for literal rows
+};
+
+// Every user-visible key binding, in display order. An id may appear in more
+// than one section.
+std::vector<HelpRow> helpRows();
 
 } // namespace vc3d::keybinds

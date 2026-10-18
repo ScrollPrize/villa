@@ -2,6 +2,8 @@
 
 #include <QString>
 
+#include <iterator>
+
 namespace vc3d::keybinds {
 
 namespace {
@@ -11,6 +13,10 @@ constexpr const char* kSectionHelpMenu = "Help";
 constexpr const char* kSectionViewerControls = "Viewer Controls";
 constexpr const char* kSectionNavigation = "Navigation";
 constexpr const char* kSectionLasagnaWorkspace = "Lasagna Workspace";
+constexpr const char* kSectionRangeSlider = "Range Slider (Focused)";
+constexpr const char* kSectionWrapAnnotation = "Same-Wrap Annotation (when enabled)";
+// SpiralWorkspace binds this key for its own panes.
+constexpr const char* kSectionSpiralWorkspace = "Spiral Workspace";
 constexpr const char* kSectionSegments = "Segments";
 constexpr const char* kSectionSurfaceTags = "Surface Tags";
 constexpr const char* kSectionSegEditing = "Segmentation Editing";
@@ -48,7 +54,8 @@ QString formatSequence(const QKeySequence& sequence)
 } // namespace
 
 namespace shortcuts {
-// Add new keybind definitions here, then list them in buildKeybindsHelpText() if they should be user-visible.
+// Add new keybind definitions here and list them in helpRows(); test_keybinds_sheet fails when a
+// definition is missing from the help.
 const ShortcutDef CommandPalette{
     "command_palette",
     kSectionHelpMenu,
@@ -459,7 +466,7 @@ const KeyPressDef DeletePoint{
 namespace range_slider {
 const KeyPressDef StepDownLeft{
     "range_slider_left",
-    "Range Slider (Focused)",
+    kSectionRangeSlider,
     "Step range down",
     Qt::Key_Left,
     Qt::NoModifier,
@@ -467,7 +474,7 @@ const KeyPressDef StepDownLeft{
 };
 const KeyPressDef StepDownDown{
     "range_slider_down",
-    "Range Slider (Focused)",
+    kSectionRangeSlider,
     "Step range down",
     Qt::Key_Down,
     Qt::NoModifier,
@@ -475,7 +482,7 @@ const KeyPressDef StepDownDown{
 };
 const KeyPressDef StepUpRight{
     "range_slider_right",
-    "Range Slider (Focused)",
+    kSectionRangeSlider,
     "Step range up",
     Qt::Key_Right,
     Qt::NoModifier,
@@ -483,7 +490,7 @@ const KeyPressDef StepUpRight{
 };
 const KeyPressDef StepUpUp{
     "range_slider_up",
-    "Range Slider (Focused)",
+    kSectionRangeSlider,
     "Step range up",
     Qt::Key_Up,
     Qt::NoModifier,
@@ -491,7 +498,7 @@ const KeyPressDef StepUpUp{
 };
 const KeyPressDef PageDown{
     "range_slider_page_down",
-    "Range Slider (Focused)",
+    kSectionRangeSlider,
     "Step range down (page)",
     Qt::Key_PageDown,
     Qt::NoModifier,
@@ -499,7 +506,7 @@ const KeyPressDef PageDown{
 };
 const KeyPressDef PageUp{
     "range_slider_page_up",
-    "Range Slider (Focused)",
+    kSectionRangeSlider,
     "Step range up (page)",
     Qt::Key_PageUp,
     Qt::NoModifier,
@@ -520,7 +527,7 @@ QKeySequence sequenceFor(const KeyPressDef& def)
     return QKeySequence(def.key | def.modifiers);
 }
 
-QString buildKeybindsHelpText()
+std::vector<HelpRow> helpRows()
 {
     const HelpEntry kHelpEntries[] = {
         { kSectionHelpMenu, shortcuts::CommandPalette.description, HelpKeyType::Shortcut, &shortcuts::CommandPalette, nullptr, nullptr },
@@ -548,6 +555,19 @@ QString buildKeybindsHelpText()
 
         { kSectionLasagnaWorkspace, shortcuts::OpenLasagnaWorkspace.description, HelpKeyType::Shortcut, &shortcuts::OpenLasagnaWorkspace, nullptr, nullptr },
         { kSectionLasagnaWorkspace, shortcuts::RepeatLasagnaAction.description, HelpKeyType::Shortcut, &shortcuts::RepeatLasagnaAction, nullptr, nullptr },
+        { kSectionLasagnaWorkspace, "Return to the main workspace", HelpKeyType::Literal, nullptr, nullptr, "Esc" },
+
+        { kSectionRangeSlider, range_slider::StepDownLeft.description, HelpKeyType::KeyPress, nullptr, &range_slider::StepDownLeft, nullptr },
+        { kSectionRangeSlider, range_slider::StepDownDown.description, HelpKeyType::KeyPress, nullptr, &range_slider::StepDownDown, nullptr },
+        { kSectionRangeSlider, range_slider::StepUpRight.description, HelpKeyType::KeyPress, nullptr, &range_slider::StepUpRight, nullptr },
+        { kSectionRangeSlider, range_slider::StepUpUp.description, HelpKeyType::KeyPress, nullptr, &range_slider::StepUpUp, nullptr },
+        { kSectionRangeSlider, range_slider::PageDown.description, HelpKeyType::KeyPress, nullptr, &range_slider::PageDown, nullptr },
+        { kSectionRangeSlider, range_slider::PageUp.description, HelpKeyType::KeyPress, nullptr, &range_slider::PageUp, nullptr },
+
+        { kSectionWrapAnnotation, "Commit the same-wrap preview to the point collection", HelpKeyType::Literal, nullptr, nullptr, "Shift+E" },
+        { kSectionWrapAnnotation, "Clear the preview, or undo the last same-wrap commit", HelpKeyType::Literal, nullptr, nullptr, "Ctrl+Z" },
+
+        { kSectionSpiralWorkspace, "Finish the line draft, or mark drawn inputs ready to add to the fit", HelpKeyType::Literal, nullptr, nullptr, "Shift+E" },
 
         { kSectionSegments, shortcuts::CycleNextSegment.description, HelpKeyType::Shortcut, &shortcuts::CycleNextSegment, nullptr, nullptr },
         { kSectionSegments, shortcuts::CyclePrevSegment.description, HelpKeyType::Shortcut, &shortcuts::CyclePrevSegment, nullptr, nullptr },
@@ -608,36 +628,34 @@ QString buildKeybindsHelpText()
         { kSectionLineAnnotation, "Snap the panes to the overview-bar cursor", HelpKeyType::Literal, nullptr, nullptr, "R" },
         { kSectionLineAnnotation, "Reset the side cut and strip normal offsets", HelpKeyType::Literal, nullptr, nullptr, "B" },
         { kSectionLineAnnotation, "Toggle the current cut following the strip mouse", HelpKeyType::Literal, nullptr, nullptr, "Space" },
+        { kSectionLineAnnotation, "Toggle the volume overlay", HelpKeyType::Literal, nullptr, nullptr, "Ctrl+Space" },
         { kSectionLineAnnotation, "Close the workspace", HelpKeyType::Literal, nullptr, nullptr, "Esc" },
         { kSectionLineAnnotation, "Step along the line (current cut) or the normal offset (side cut, strips)", HelpKeyType::Literal, nullptr, nullptr, "Shift+Scroll Wheel" },
     };
 
-    QString result;
-    QString currentSection;
+    std::vector<HelpRow> rows;
+    rows.reserve(std::size(kHelpEntries));
     for (const auto& entry : kHelpEntries) {
-        const QString section = QString::fromUtf8(entry.section);
-        if (section != currentSection) {
-            if (!result.isEmpty()) {
-                result += "\n";
-            }
-            result += "=== " + section + " ===\n";
-            currentSection = section;
-        }
-        QString keyText;
+        HelpRow row;
+        row.section = QString::fromUtf8(entry.section);
+        row.description = QString::fromUtf8(entry.description);
         if (entry.keyType == HelpKeyType::Shortcut && entry.shortcut) {
-            keyText = formatSequence(sequenceFor(*entry.shortcut));
+            row.id = QString::fromUtf8(entry.shortcut->id);
+            row.sequence = sequenceFor(*entry.shortcut);
+            row.keys = formatSequence(row.sequence);
         } else if (entry.keyType == HelpKeyType::KeyPress && entry.keypress) {
-            keyText = formatSequence(sequenceFor(*entry.keypress));
+            row.id = QString::fromUtf8(entry.keypress->id);
+            row.sequence = sequenceFor(*entry.keypress);
+            row.keys = formatSequence(row.sequence);
         } else if (entry.keyType == HelpKeyType::Literal && entry.literal) {
-            keyText = QString::fromUtf8(entry.literal);
+            row.keys = QString::fromUtf8(entry.literal);
         }
-        if (keyText.isEmpty()) {
+        if (row.keys.isEmpty()) {
             continue;
         }
-        result += keyText + ": " + QString::fromUtf8(entry.description) + "\n";
+        rows.push_back(std::move(row));
     }
-
-    return result.trimmed();
+    return rows;
 }
 
 } // namespace vc3d::keybinds

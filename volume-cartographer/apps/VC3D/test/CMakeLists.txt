@@ -182,6 +182,31 @@ add_test(NAME surface_rotation_transform COMMAND test_surface_rotation_transform
 vc_register_test_target(test_surface_rotation_transform)
 vc_register_ctest(surface_rotation_transform test_surface_rotation_transform)
 
+add_executable(test_keybinds_sheet
+    test_keybinds_sheet.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/KeybindsSheet.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/KeybindsSheet.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/CommandCatalog.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/CommandCatalog.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SettingsFilter.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SettingsFilter.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/Keybinds.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/Keybinds.hpp)
+set_target_properties(test_keybinds_sheet PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_keybinds_sheet PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+# The test reads the keybind definitions to check that the help lists them.
+target_compile_definitions(test_keybinds_sheet PRIVATE
+    VC3D_KEYBINDS_SOURCE="${PROJECT_SOURCE_DIR}/apps/VC3D/Keybinds.cpp")
+target_link_libraries(test_keybinds_sheet PRIVATE
+    Qt6::Core Qt6::Gui Qt6::Test Qt6::Widgets)
+add_test(NAME keybinds_sheet COMMAND test_keybinds_sheet)
+vc_register_test_target(test_keybinds_sheet)
+vc_register_ctest(keybinds_sheet test_keybinds_sheet)
+set_tests_properties(keybinds_sheet PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
 add_executable(test_vc_settings
     test_vc_settings.cpp)
 
