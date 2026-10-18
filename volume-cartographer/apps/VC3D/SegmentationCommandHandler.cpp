@@ -455,11 +455,7 @@ static bool writeJsonObject(const QString& path, const QJsonObject& obj)
     return true;
 }
 
-struct RasterizeDialogResult {
-    int chunkSize{128};
-    int zMin{0};
-    int zMax{-1};
-};
+using RasterizeDialogResult = SegmentationCommandHandler::RasterizeParams;
 
 static bool selectRasterizeParams(QWidget* parent, RasterizeDialogResult* out)
 {
@@ -4289,22 +4285,64 @@ void SegmentationCommandHandler::launchNeighborCopySecondPass()
 
 void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentIds)
 {
+    startRasterizeSegmentsImpl(segmentIds, std::nullopt, /*interactive=*/true,
+                               nullptr, nullptr);
+}
+
+bool SegmentationCommandHandler::startRasterizeSegments(const QStringList& segmentIds,
+                                                        const RasterizeParams& params,
+                                                        CommandLaunchError* error,
+                                                        RasterizeLaunch* launch)
+{
+    return startRasterizeSegmentsImpl(segmentIds, params, /*interactive=*/false,
+                                      error, launch);
+}
+
+bool SegmentationCommandHandler::startRasterizeSegmentsImpl(
+    const QStringList& segmentIds,
+    const std::optional<RasterizeParams>& requestedParams,
+    bool interactive,
+    CommandLaunchError* error,
+    RasterizeLaunch* launch)
+{
+    const CommandLaunchErrorSetter setErr{error};
+    // Interactive launches present each refusal as the menu always has: a
+    // status-bar note, a warning or a critical message box.
+    enum class Presentation { StatusNote, Warning, Critical };
+    auto refuse = [&](const QString& message, CommandLaunchError::Kind kind,
+                      Presentation presentation, const QString& title = {}) {
+        if (interactive) {
+            switch (presentation) {
+            case Presentation::StatusNote:
+                emit statusMessage(message, 3000);
+                break;
+            case Presentation::Warning:
+                QMessageBox::warning(_parentWidget, title, message);
+                break;
+            case Presentation::Critical:
+                QMessageBox::critical(_parentWidget, title, message);
+                break;
+            }
+        }
+        setErr(message, kind);
+        return false;
+    };
+
     if (!_state || !_state->vpkg()) {
-        emit statusMessage(tr("No volume package loaded"), 3000);
-        return;
+        return refuse(tr("No volume package loaded"), CommandLaunchError::InvalidState,
+                      Presentation::StatusNote);
     }
 
     if (_cmdRunner && _cmdRunner->isRunning()) {
-        QMessageBox::warning(_parentWidget, tr("Warning"),
-                             tr("A command line tool is already running."));
-        return;
+        return refuse(tr("A command line tool is already running."),
+                      CommandLaunchError::Busy, Presentation::Warning, tr("Warning"));
     }
 
     QStringList requestedIds = segmentIds;
     requestedIds.removeAll(QString());
     if (requestedIds.isEmpty()) {
-        emit statusMessage(tr("No segments selected"), 3000);
-        return;
+        return refuse(tr("No segments selected"), CommandLaunchError::InvalidState,
+                      Presentation::StatusNote);
     }
 
     QStringList rasterIds;
@@ -4323,8 +4361,8 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
     }
 
     if (rasterIds.isEmpty()) {
-        emit statusMessage(tr("No valid segments selected"), 3000);
-        return;
+        return refuse(tr("No valid segments selected"), CommandLaunchError::InvalidState,
+                      Presentation::StatusNote);
     }
 
     QStringList segmentPaths;
@@ -4351,10 +4389,9 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
     }
 
     if (segmentPaths.isEmpty()) {
-        QMessageBox::warning(_parentWidget, tr("Error"),
-                             tr("Selected segments are not tifxyz meshes: %1")
-                                 .arg(missingIds.join(QStringLiteral(", "))));
-        return;
+        return refuse(tr("Selected segments are not tifxyz meshes: %1")
+                          .arg(missingIds.join(QStringLiteral(", "))),
+                      CommandLaunchError::InputNotFound, Presentation::Warning, tr("Error"));
     }
     if (!missingIds.isEmpty()) {
         emit statusMessage(
@@ -4368,21 +4405,28 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
         referenceZarr = getCurrentVolumePath();
     }
     if (referenceZarr.isEmpty()) {
-        QMessageBox::warning(_parentWidget, tr("Error"),
-                             tr("Missing reference OME-Zarr. Load a normal3d/volume first."));
-        return;
+        return refuse(tr("Missing reference OME-Zarr. Load a normal3d/volume first."),
+                      CommandLaunchError::InvalidState, Presentation::Warning, tr("Error"));
     }
 
     const QString executable = findVcTool("vc_tifxyz2zarr_sparse");
     if (executable.isEmpty()) {
-        QMessageBox::warning(_parentWidget, tr("Error"),
-                             tr("vc_tifxyz2zarr_sparse tool not found. Configure tools/vc_tifxyz2zarr_sparse path."));
-        return;
+        return refuse(tr("vc_tifxyz2zarr_sparse tool not found. Configure tools/vc_tifxyz2zarr_sparse path."),
+                      CommandLaunchError::ToolUnavailable, Presentation::Warning, tr("Error"));
     }
 
     RasterizeDialogResult rasterizeParams;
-    if (!selectRasterizeParams(_parentWidget, &rasterizeParams)) {
-        return;
+    if (requestedParams) {
+        rasterizeParams = *requestedParams;
+        if (rasterizeParams.chunkSize < 1 || rasterizeParams.chunkSize > 4096 ||
+            rasterizeParams.zMin < 0 || rasterizeParams.zMax < -1 ||
+            (rasterizeParams.zMax >= 0 && rasterizeParams.zMin >= rasterizeParams.zMax)) {
+            return refuse(tr("Chunk size must be 1 to 4096, Z min non-negative, and Z min "
+                             "smaller than Z max unless Z max is -1."),
+                          CommandLaunchError::Other, Presentation::Warning, tr("Error"));
+        }
+    } else if (!interactive || !selectRasterizeParams(_parentWidget, &rasterizeParams)) {
+        return false;
     }
 
     const QString timestamp = QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMddHHmmss"));
@@ -4393,9 +4437,8 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
     const std::filesystem::path volumesDir = volpkgDir / "volumes";
     std::filesystem::create_directories(volumesDir, ec);
     if (ec) {
-        QMessageBox::critical(_parentWidget, tr("Error"),
-                              tr("Cannot create volumes directory: %1").arg(QString::fromStdString(ec.message())));
-        return;
+        return refuse(tr("Cannot create volumes directory: %1").arg(QString::fromStdString(ec.message())),
+                      CommandLaunchError::Other, Presentation::Critical, tr("Error"));
     }
 
     std::filesystem::path finalOutputRoot = volumesDir / baseOutputName.toStdString();
@@ -4404,10 +4447,9 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
             QStringLiteral("labels_%1_%2.zarr").arg(timestamp).arg(suffix).toStdString();
     }
     if (std::filesystem::exists(finalOutputRoot)) {
-        QMessageBox::critical(_parentWidget, tr("Error"),
-                              tr("Unable to reserve output directory after retries: %1")
-                                  .arg(QString::fromStdString(finalOutputRoot.string())));
-        return;
+        return refuse(tr("Unable to reserve output directory after retries: %1")
+                          .arg(QString::fromStdString(finalOutputRoot.string())),
+                      CommandLaunchError::Other, Presentation::Critical, tr("Error"));
     }
 
     std::filesystem::path stagedOutputRoot =
@@ -4428,17 +4470,15 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
         }
     }
     if (std::filesystem::exists(tempRoot, ec)) {
-        QMessageBox::critical(_parentWidget, tr("Error"),
-                              tr("Unable to reserve temporary input directory: %1")
-                                  .arg(QString::fromStdString(tempRoot.string())));
-        return;
+        return refuse(tr("Unable to reserve temporary input directory: %1")
+                          .arg(QString::fromStdString(tempRoot.string())),
+                      CommandLaunchError::Other, Presentation::Critical, tr("Error"));
     }
 
     if (!std::filesystem::create_directories(tempRoot, ec) || ec) {
-        QMessageBox::critical(_parentWidget, tr("Error"),
-                              tr("Cannot create temporary input directory: %1")
-                                  .arg(QString::fromStdString(ec.message())));
-        return;
+        return refuse(tr("Cannot create temporary input directory: %1")
+                          .arg(QString::fromStdString(ec.message())),
+                      CommandLaunchError::Other, Presentation::Critical, tr("Error"));
     }
 
     for (int i = 0; i < validIds.size(); ++i) {
@@ -4452,13 +4492,12 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
             std::filesystem::copy(sourceSeg, targetSeg,
                                   std::filesystem::copy_options::recursive, copyErr);
             if (copyErr) {
-                QMessageBox::critical(_parentWidget, tr("Error"),
-                                      tr("Failed to stage segment '%1': %2")
-                                          .arg(validIds.at(i))
-                                          .arg(QString::fromStdString(copyErr.message())));
                 std::filesystem::remove_all(stagedOutputRoot, ec);
                 std::filesystem::remove_all(tempRoot);
-                return;
+                return refuse(tr("Failed to stage segment '%1': %2")
+                                  .arg(validIds.at(i))
+                                  .arg(QString::fromStdString(copyErr.message())),
+                              CommandLaunchError::Other, Presentation::Critical, tr("Error"));
             }
         }
     }
@@ -4493,18 +4532,17 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
 
     auto runner = _cmdRunner;
     if (!runner) {
-        QMessageBox::critical(_parentWidget, tr("Error"),
-                              tr("Command runner is not available."));
         std::filesystem::remove_all(stagedOutputRoot);
         std::filesystem::remove_all(tempRoot);
-        return;
+        return refuse(tr("Command runner is not available."),
+                      CommandLaunchError::ToolUnavailable, Presentation::Critical, tr("Error"));
     }
 
     QPointer<SegmentationCommandHandler> guard(this);
     auto connection = std::make_shared<QMetaObject::Connection>();
     *connection = connect(runner, &CommandLineToolRunner::toolFinished,
                          this,
-                         [this, guard, connection, runner,
+                         [this, guard, connection, runner, interactive,
                           tempRootStr, stagedOutputRootStr, finalOutputRootStr,
                           validIds, segmentPaths, outputCoordinateIdentity](CommandLineToolRunner::Tool tool,
                                                   bool success,
@@ -4521,39 +4559,40 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
         disconnect(*connection);
 
         bool finalizeOutput = false;
+        QString outcome;
         if (!success) {
-            QMessageBox::critical(_parentWidget, tr("Error"),
-                                  tr("vc_tifxyz2zarr_sparse failed.\n%1")
-                                      .arg(message));
+            outcome = tr("vc_tifxyz2zarr_sparse failed.\n%1").arg(message);
+            if (interactive) {
+                QMessageBox::critical(_parentWidget, tr("Error"), outcome);
+            }
             emit statusMessage(tr("Rasterize failed"), 3000);
         } else if (!appendRasterizationMetadata(stagedOutputRootStr, validIds, segmentPaths)) {
-            emit showWarning(tr("Warning"), tr("Rasterization completed but metadata update failed"));
+            outcome = tr("Rasterization completed but metadata update failed");
+            emit showWarning(tr("Warning"), outcome);
             emit statusMessage(tr("Rasterize complete, but metadata update failed"), 5000);
         } else {
             std::error_code renameErr;
             std::filesystem::rename(stagedOutputRootStr.toStdString(), finalOutputRootStr.toStdString(), renameErr);
             if (renameErr) {
-                emit showWarning(tr("Warning"),
-                                 tr("Rasterization completed, but finalizing output folder failed: %1")
-                                     .arg(QString::fromStdString(renameErr.message())));
+                outcome = tr("Rasterization completed, but finalizing output folder failed: %1")
+                              .arg(QString::fromStdString(renameErr.message()));
+                emit showWarning(tr("Warning"), outcome);
                 emit statusMessage(tr("Rasterize complete, but finalizing output failed"), 5000);
             } else {
                 finalizeOutput = true;
                 if (!updateVolumeIdentityMetadata(
                         finalOutputRootStr, outputCoordinateIdentity)) {
-                    emit showWarning(
-                        tr("Warning"),
-                        tr("Rasterized volume created, but updating meta.json identity failed."));
+                    outcome = tr("Rasterized volume created, but updating meta.json identity failed.");
+                    emit showWarning(tr("Warning"), outcome);
                     emit statusMessage(
                         tr("Rasterized volume created, but metadata update failed -> %1")
                             .arg(QDir::toNativeSeparators(finalOutputRootStr)),
                         5000);
                 } else {
-                    emit statusMessage(
-                        tr("Rasterized %1 segment(s) -> %2")
-                            .arg(validIds.size())
-                            .arg(QDir::toNativeSeparators(finalOutputRootStr)),
-                        5000);
+                    outcome = tr("Rasterized %1 segment(s) -> %2")
+                                  .arg(validIds.size())
+                                  .arg(QDir::toNativeSeparators(finalOutputRootStr));
+                    emit statusMessage(outcome, 5000);
                 }
             }
         }
@@ -4563,20 +4602,31 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
             std::filesystem::remove_all(std::filesystem::path(stagedOutputRootStr.toStdString()), cleanupErr);
         }
         std::filesystem::remove_all(std::filesystem::path(tempRootStr.toStdString()), cleanupErr);
+        emit segmentOperationFinished(QStringLiteral("rasterize"), finalizeOutput, outcome,
+                                      finalizeOutput ? finalOutputRootStr : QString());
     });
 
-    if (!runner->executeCustomCommand(executable, args, QStringLiteral("vc_tifxyz2zarr_sparse"))) {
+    const auto options = interactive
+        ? CommandLineToolRunner::ExecutionOptions{}
+        : CommandLineToolRunner::ExecutionOptions::silent();
+    if (!runner->executeCustomCommand(executable, args, QStringLiteral("vc_tifxyz2zarr_sparse"),
+                                      options)) {
         QObject::disconnect(*connection);
-        QMessageBox::critical(_parentWidget, tr("Error"),
-                              tr("Failed to start vc_tifxyz2zarr_sparse."));
         std::error_code cleanupErr;
         std::filesystem::remove_all(stagedOutputRoot, cleanupErr);
         std::filesystem::remove_all(tempRoot);
-        return;
+        return refuse(tr("Failed to start vc_tifxyz2zarr_sparse."),
+                      CommandLaunchError::Other, Presentation::Critical, tr("Error"));
     }
 
     emit statusMessage(
         tr("Rasterization started for %1 segment(s)...").arg(validIds.size()), 0);
+    if (launch) {
+        launch->outputPath = finalOutputRootStr;
+        launch->segmentIds = validIds;
+        launch->skippedIds = missingIds;
+    }
+    return true;
 }
 
 void SegmentationCommandHandler::onMergeTifxyz(const QStringList& segmentIds)

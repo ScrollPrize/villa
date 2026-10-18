@@ -157,6 +157,20 @@ public:
         bool    overwrite{true};  // false => an existing OBJ file is refused
     };
 
+    // Arguments accepted by startRasterizeSegments.
+    struct RasterizeParams {
+        int chunkSize{128};       // isotropic chunk size, 1..4096
+        int zMin{0};              // level-0 Z min, >= 0
+        int zMax{-1};             // level-0 Z max (exclusive); -1 => volume end
+    };
+
+    // Segments accepted for rasterization by startRasterizeSegments.
+    struct RasterizeLaunch {
+        QString     outputPath;   // final labels_<timestamp>.zarr under volumes/
+        QStringList segmentIds;   // tifxyz segments passed to the tool
+        QStringList skippedIds;   // requested ids without tifxyz meshes
+    };
+
     // --- Construction ---
 
     explicit SegmentationCommandHandler(QWidget* parentWidget,
@@ -230,6 +244,16 @@ signals:
      * with an empty message denotes a user cancel.
      */
     void flattenJobFinished(bool success, QString message, QString outputPath);
+
+    /**
+     * Emitted once when a segment operation that post-processes command-line
+     * tool output reaches its terminal state, after that post-processing.
+     * Emitted for interactive and dialog-free launches. `kind` names the
+     * operation ("rasterize"); `outputPath` is the produced artifact on
+     * success.
+     */
+    void segmentOperationFinished(QString kind, bool success, QString message,
+                                  QString outputPath);
 
 public slots:
     void onRenderSegment(const std::string& segmentId);
@@ -345,6 +369,15 @@ public:
                            CommandLaunchError* error = nullptr,
                            QString* resolvedObjPath = nullptr);
 
+    /// Dialog-free rasterize launch (vc_tifxyz2zarr_sparse). Requested ids
+    /// without tifxyz meshes are skipped as in the interactive slot; at least
+    /// one must remain. Completion, including the rename into volumes/ and the
+    /// metadata update, is reported by segmentOperationFinished("rasterize").
+    bool startRasterizeSegments(const QStringList& segmentIds,
+                                const RasterizeParams& params,
+                                CommandLaunchError* error = nullptr,
+                                RasterizeLaunch* launch = nullptr);
+
     /// Dialog-free core of onCropSurfaceToValidRegion (the interactive slot wraps
     /// this). Crops the surface grid to its tightest valid bounds, writes it in
     /// place, and refreshes metrics; failures via `errorMessage` (never a dialog)
@@ -448,6 +481,13 @@ private:
     bool launchConvertToObj(const QString& tifxyzPath,
                             const ConvertToObjParams& params,
                             CommandLineToolRunner::ExecutionOptions options);
+    // Interactive launches ask for the parameters when `params` is empty and
+    // present refusals as the menu always has.
+    bool startRasterizeSegmentsImpl(const QStringList& segmentIds,
+                                    const std::optional<RasterizeParams>& params,
+                                    bool interactive,
+                                    CommandLaunchError* error,
+                                    RasterizeLaunch* launch);
 
     /**
      * Resolve a segment launch's output directory: the surface's own parent
