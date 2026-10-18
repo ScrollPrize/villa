@@ -1,5 +1,6 @@
 import dbm
 import importlib.util
+import os
 import pickle
 import sqlite3
 from pathlib import Path
@@ -24,6 +25,7 @@ def write_sqlite_dbm(path, items):
     # Same single-table layout as CPython's Lib/dbm/sqlite3.py, written with
     # plain sqlite3 so the fixture also builds on Python < 3.13.
     connection = sqlite3.connect(path)
+    connection.execute('PRAGMA journal_mode = wal')  # as dbm.sqlite3 writes it, and the published stores are
     connection.execute('CREATE TABLE IF NOT EXISTS Dict (key BLOB UNIQUE NOT NULL, value BLOB NOT NULL)')
     connection.executemany('REPLACE INTO Dict (key, value) VALUES (CAST(? AS BLOB), CAST(? AS BLOB))', items)
     connection.commit()
@@ -55,6 +57,27 @@ class SQLiteTrackDBMTests(unittest.TestCase):
                 loaded = tracks.load_tracks_from_dbm(path, show_progress=False)
             self.assertEqual(len(loaded), 2)
             self.assertEqual(sorted(len(track) for track in loaded), [21, 21])
+
+    def test_sqlite_store_is_read_without_writing_beside_it(self):
+        # A reader of a WAL store otherwise creates -wal and -shm files next to it.
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self.make_db(temporary)
+            with mock.patch.object(tracks.dbm, 'whichdb', return_value=''):
+                with tracks.open_tracks_dbm(path) as database:
+                    self.assertEqual(sorted(database.keys()), [b'h:0', b'vy:0'])
+            self.assertEqual(sorted(os.listdir(temporary)), ['tracks.dbm'])
+
+    @unittest.skipIf(os.name != 'posix' or os.geteuid() == 0, 'needs a directory this user cannot write')
+    def test_sqlite_store_opens_in_a_read_only_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self.make_db(temporary)
+            os.chmod(temporary, 0o500)
+            try:
+                with mock.patch.object(tracks.dbm, 'whichdb', return_value=''):
+                    with tracks.open_tracks_dbm(path) as database:
+                        self.assertEqual(len(database), 2)
+            finally:
+                os.chmod(temporary, 0o700)
 
     @unittest.skipUnless(importlib.util.find_spec('dbm.sqlite3'), 'needs dbm.sqlite3 (Python >= 3.13)')
     def test_native_dbm_path_is_unchanged(self):

@@ -210,7 +210,10 @@ class _SQLiteTrackDBM:
 
     def __init__(self, path):
         import sqlite3
-        uri = Path(os.path.abspath(path)).as_uri() + '?mode=ro'
+        # immutable=1, as dbm.open(path, 'r') adds in CPython 3.14: the stores are
+        # WAL databases, and without it reading one creates -wal and -shm files
+        # beside it, so a store in a read-only directory cannot be opened.
+        uri = Path(os.path.abspath(path)).as_uri() + '?mode=ro&immutable=1'
         self._connection = sqlite3.connect(uri, uri=True)
 
     def keys(self):
