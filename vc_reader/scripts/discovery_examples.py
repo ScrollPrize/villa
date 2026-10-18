@@ -1,36 +1,27 @@
-"""Metadata-only catalog/user-source example; the supplied crop is not opened."""
+"""Browse scroll relationships and attach an explicit local source without I/O."""
 import argparse
 import json
-
-from vc_reader import Affine, Catalog, Source, SourceCollection, Storage, VolumeRegistration
+from vc_reader import Affine, Catalog, ScrollSource, Source, Storage, VolumeRegistration
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--metadata', required=True, help='Local catalog snapshot')
+    parser.add_argument('--metadata', required=True)
     parser.add_argument('--sample', default='PHercParis4')
     parser.add_argument('--volume', required=True)
     args = parser.parse_args()
     catalog = Catalog.from_file(args.metadata)
-    volume = catalog.sample(args.sample).volume(args.volume)
-    crop = Source(
-        'my-annotation', storage=Storage('/data/annotation.zarr', 'zarr'),
-        role='label', axes=('z', 'y', 'x'),
-        registration=VolumeRegistration(volume.sample.id, volume.id, affine=Affine.from_rows([
-            [1, 0, 0, 120], [0, 1, 0, 80], [0, 0, 1, 40],
-        ])), provenance={'description': 'Explicit crop at level-0 XYZ origin (120, 80, 40)'},
-    )
-    collection = SourceCollection(catalog, [crop])
-    labels = collection.labels(volume=volume.level(2))
-    print('Label sources:', len(labels), '(including user:my-annotation)')
-    print('Registered volumes:', [v.id for v in collection.registered_volumes(volume=volume)])
-    for source in collection.representations(volume=volume.level(2), mappable=False):
-        print('Representation:', source.artifact_kind, source.storage.selection)
-    # Both published and supplied descriptors use the same serialization contract.
-    for source in [crop, *[s for s in labels if s.id.startswith('catalog:')][:1]]:
-        restored = Source.from_dict(json.loads(json.dumps(source.to_dict())))
-        assert restored == source
-        print('Round trip:', source.id, '; unresolved:', source.unresolved_fields)
+    scroll = ScrollSource(args.sample, args.volume, catalog=catalog)
+    crop = Source('annotation', Storage('/data/annotation.zarr', 'zarr'), role='label', axes=('z', 'y', 'x'),
+                  registration=VolumeRegistration(scroll.id, scroll.volume.id,
+                      affine=Affine.from_rows(((1, 0, 0, 120), (0, 1, 0, 80), (0, 0, 1, 40)))))
+    view = scroll.with_source(crop, kind='label', volume=scroll.volume)
+    print('Labels:', [s.id for s in view.labels])
+    print('Representations:', [(s.id, s.unresolved_fields) for s in view.representations])
+    print('8 um candidates:', [(m.volume.id, m.level, m.verified) for m in view.volumes.at_resolution(8, rel_tol=.02)])
+    restored = ScrollSource.from_dict(json.loads(json.dumps(view.to_dict())))
+    assert restored.labels[crop.id].source == view.labels[crop.id].source
+    print('Overlay descriptor round trip passed')
 
 
 if __name__ == '__main__':

@@ -1,42 +1,18 @@
-"""Find and locate Vesuvius Challenge open data from its published metadata.json.
-
-    >>> import vc_reader
-    >>> cat = vc_reader.load()
-    >>> vol = cat.sample("pherc paris 4").volume(resolution=2.4, energy_kev=78)
-    >>> lvl = vol.level(um=9.6)                      # pyramid level 2
-    >>> labels = vol.ink_labels()                    # direct + mappable via transforms
-"""
+"""Scroll-centered discovery and bounded image/label reading."""
 
 from __future__ import annotations
 
 from ._fetch import DEFAULT_METADATA_URL, default_cache_dir
 from .affine import Affine
 from .artifacts import AccessRoot, Artifact, ArtifactType, Origin, to_https, to_s3
-from .catalog import (
-    DEFAULT_RESOLUTION_REL_TOL,
-    PYRAMID_LEVELS,
-    Catalog,
-    InkLabelMatch,
-    InkLabelSet,
-    License,
-    Model,
-    PairedArtifact,
-    PairedData,
-    Sample,
-    Scan,
-    Segment,
-    SegmentOnVolume,
-    Volume,
-    VolumeCoverage,
-    VolumeLevel,
-)
+from .catalog import DEFAULT_RESOLUTION_REL_TOL, PYRAMID_LEVELS, Catalog, License, Model, Scan, VolumeCoverage
+from .browsing import ScrollSource, Collection, Asset, Volume, VolumeLevel, Segment, ResolutionCandidate, VolumeMapping
 from .errors import AmbiguousMatchError, CacheMissError, NotFoundError, VcReaderError
 from .sources import (
     Companion, Encoding, Frame, LevelRequest, Plane, QueryContext, SampleResult,
     Selection, Source, Storage, Surface, SurfaceRegistration, ValueFrame,
     VolumeRegistration,
 )
-from .discovery import SourceCollection
 
 __version__ = "0.1.0"
 
@@ -53,18 +29,17 @@ __all__ = [
     "Artifact",
     "ArtifactType",
     "Catalog",
-    "InkLabelMatch",
-    "InkLabelSet",
+    "ScrollSource",
+    "Collection",
+    "Asset",
+    "ResolutionCandidate",
+    "VolumeMapping",
     "License",
     "Model",
     "NotFoundError",
     "Origin",
-    "PairedArtifact",
-    "PairedData",
-    "Sample",
     "Scan",
     "Segment",
-    "SegmentOnVolume",
     "VcReaderError",
     "Volume",
     "VolumeCoverage",
@@ -82,7 +57,6 @@ __all__ = [
     "SampleResult",
     "Selection",
     "Source",
-    "SourceCollection",
     "Storage",
     "Surface",
     "SurfaceRegistration",

@@ -9,7 +9,7 @@ import unittest
 
 from vc_reader import (
     Affine, Catalog, Companion, Encoding, Plane, Selection, Source,
-    SourceCollection, Storage, Surface, SurfaceRegistration, ValueFrame,
+    Storage, Surface, SurfaceRegistration, ValueFrame,
     VolumeRegistration,
 )
 
@@ -38,55 +38,6 @@ def catalog():
 
 
 class SourceTests(unittest.TestCase):
-    def test_discovery_rules_and_level_selection(self):
-        c = catalog()
-        a, b = c.volume('a'), c.volume('b')
-        self.assertEqual([s.artifact_id for s in a.labels(mappable=False)], ['new'])
-        self.assertEqual({s.artifact_id for s in a.labels()}, {'new', 'absent'})
-        self.assertEqual([s.artifact_id for s in b.labels(mappable=False)], ['mapped'])
-        self.assertEqual({s.artifact_id for s in a.labels(latest_only=False)}, {'old', 'new', 'absent'})
-        for mappable in (False, True):
-            for latest in (False, True):
-                self.assertEqual(
-                    {s.artifact_id for s in a.labels(mappable=mappable, latest_only=latest)},
-                    {m.labels.artifact.id for m in a.ink_labels(mappable=mappable, latest_only=latest)},
-                )
-        self.assertEqual(a.registered_volumes(), [b])
-        source = a.level(1).representations(mappable=False)[0]
-        self.assertEqual(source.storage.selection.corresponding.sublevel, -1)
-        self.assertEqual(source.registration.affine, Affine.scale(4))
-        selected = source.with_selection(level=0)
-        self.assertEqual(selected.id, source.id)
-        self.assertEqual(selected.registration, source.registration)
-        self.assertIsNone(selected.storage.selection.corresponding)
-        self.assertIsNone(b.level(2).representations()[0].storage.selection.corresponding.sublevel)
-        a.labels().clear()
-        self.assertEqual(len(a.labels()), 2)  # Results do not expose the query cache.
-
-    def test_identity_unknown_assets_and_overlay(self):
-        c = catalog()
-        raw = json.dumps(c.raw)
-        unknown = [s for s in c.sources if s.artifact_kind == 'unknown-bundle']
-        self.assertEqual(len({s.id for s in unknown}), 2)
-        self.assertTrue(all(s.role is None and 'storage.format' in s.unresolved_fields for s in unknown))
-        self.assertEqual([s.id for s in c.sources], [s.id for s in SourceCollection(c)])
-        user = Source('custom', role='label', registration=VolumeRegistration('s', 'a'))
-        newer = replace(user, id='user:newer', supersedes=(user.id,))
-        collection = SourceCollection(c, [user, newer, Source('unregistered')])
-        self.assertEqual(collection.get('user:unregistered').unresolved_fields[-1], 'registration')
-        self.assertIn(newer.id, [s.id for s in collection.labels(volume=c.volume('a'))])
-        self.assertNotIn(user.id, [s.id for s in collection.labels(volume=c.volume('a'))])
-        with self.assertRaisesRegex(ValueError, 'duplicate source ID'):
-            SourceCollection(c, [user, user])
-        with self.assertRaisesRegex(ValueError, 'cycle'):
-            SourceCollection(c, [replace(user, supersedes=(newer.id,)), newer])
-        self.assertEqual(raw, json.dumps(c.raw))
-        restored = pickle.loads(pickle.dumps(collection))
-        self.assertEqual([s.id for s in restored.labels(volume=restored.catalog.volume('a'))],
-                         [s.id for s in collection.labels(volume=c.volume('a'))])
-        with self.assertRaisesRegex(ValueError, 'catalog'):
-            collection.labels(volume=catalog().volume('a'))
-
     def test_descriptor_round_trips_and_immutability(self):
         provenance = {'origin': {'notes': ['original']}}
         registration = VolumeRegistration('s', 'a', affine=Affine.scale(4), declared_grid=Selection(level=0))
@@ -138,9 +89,9 @@ from unittest.mock import patch
 from test_sources import catalog
 with patch('urllib.request.urlopen', side_effect=AssertionError('network request')):
     c = catalog()
-    list(c.sources)
-    c.volume('a').labels()
-    c.volume('a').level(2).representations()
+    list(c.samples['s'].artifacts)
+    c.samples['s'].on_volume('a').labels.ink
+    c.samples['s'].volumes.at_resolution(8)
 assert not any(n in sys.modules for n in ('numpy', 'torch', 'PIL', 'tifffile', 'vc_reader._native'))
 """
         subprocess.run([sys.executable, '-S', '-c', code], check=True, capture_output=True, text=True)

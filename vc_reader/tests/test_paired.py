@@ -1,0 +1,198 @@
+"""Flattened pair indexing, stored grids, exact categories, and worker lifetime."""
+from dataclasses import replace
+import json
+import multiprocessing
+import os
+from pathlib import Path
+import pickle
+import tempfile
+import unittest
+
+import numpy as np
+from vc_reader import Catalog, Companion, Selection, Source, Storage
+from test_source_storage import array
+from vc_reader.cuda import is_available
+
+
+def host(value):
+    return value.numpy() if hasattr(value, 'numpy') else value
+
+
+def read_worker(reader):
+    with reader:
+        return reader[1:3, 2:5].data
+
+
+def pyramid(path, values, scales):
+    path.mkdir()
+    axes = ('z', 'y', 'x') if values[0].ndim == 3 else ('y', 'x')
+    datasets = []
+    for level, (value, scale) in enumerate(zip(values, scales)):
+        array(path/str(level), value)
+        datasets.append(dict(path=str(level), coordinateTransformations=[dict(type='scale', scale=([1.] if 'z' in axes else []) + [scale, scale])]))
+    (path/'.zgroup').write_text('{"zarr_format":2}')
+    (path/'.zattrs').write_text(json.dumps(dict(multiscales=[dict(axes=[dict(name=a, unit='micrometer') for a in axes], datasets=datasets)])))
+    return Source(path.name, Storage(str(path), 'zarr', pyramid=True, selection=Selection(level=0)), axes=axes)
+
+
+class PairedTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.scroll = Catalog(dict(samples=dict(s=dict(sample=dict(id='s', properties=dict(type='scroll')), volumes=dict(v=dict(id='v')))))).scrolls['s']
+
+    def source(self, name, values, role):
+        path = self.root/name
+        axes = {2: ('y', 'x'), 3: ('z', 'y', 'x'), 4: ('c', 'z', 'y', 'x')}[values.ndim]
+        array(path, values, {'_ARRAY_DIMENSIONS': axes})
+        return Source(name, Storage(str(path), 'zarr'), role=role, axes=axes)
+
+    def pair(self, render, label, **mapping):
+        scroll = self.scroll.with_source(render, kind='render', volume='v')
+        scroll = scroll.with_source(label, kind='label', volume='v', render=render.id, **(mapping or {'same_grid': True}))
+        return scroll.labels[label.id]
+
+    def backends(self):
+        return ('cpu', 'cuda') if is_available() else ('cpu',)
+
+    def test_shapes_indexing_channels_layers_and_ownership(self):
+        image = np.arange(2*5*7*9, dtype='uint16').reshape(2, 5, 7, 9)
+        labels = np.arange(7*9, dtype='uint8').reshape(7, 9)
+        render = self.source('image', image, 'image')
+        label = self.source('labels', labels, 'label')
+        mask = self.source('mask', np.full((7, 9), 128, 'uint8'), 'label')
+        label = replace(label, companions=(Companion('supervision', mask, True),))
+        asset = self.pair(render, label)
+        for backend in self.backends():
+            with asset.open_paired(layers=slice(1, 4), backend=backend) as reader:
+                patch = reader[-6:-2, -7:-2]
+                np.testing.assert_array_equal(host(patch.data['image']), image[:, 1:4, 1:5, 2:7])
+                np.testing.assert_array_equal(host(patch.data['label']), labels[None, 1:5, 2:7])
+                np.testing.assert_array_equal(host(patch.masks['label']['supervision']), 128)
+                self.assertEqual(patch.valid['label'].shape, (1, 4, 5))
+                np.testing.assert_array_equal(host(reader['image'][1, -1, 2:5, 3:6]), image[1, 3, 2:5, 3:6])
+                np.testing.assert_array_equal(host(reader['label'][0, -1, -1]), labels[-1, -1])
+                self.assertEqual(reader[3, 2:4].data['image'].shape, (2, 3, 2))
+                self.assertEqual(reader[3, 2:4].data['label'].shape, (1, 2))
+                self.assertEqual(reader[:0, :].data['image'].shape, (2, 3, 0, 9))
+                self.assertEqual(reader['image'][:0, :, :, :].shape, (0, 3, 7, 9))
+                with self.assertRaises(IndexError):
+                    reader[99, :]
+                with self.assertRaises(IndexError):
+                    reader[::2, :]
+                clipped = reader[-100:100, :]
+                self.assertEqual(clipped.data['label'].shape, (1, 7, 9))
+                reader[0:1, 0:1]
+            np.testing.assert_array_equal(host(patch.data['label']), labels[None, 1:5, 2:7])
+            with asset.open_paired(layers=-1, backend=backend) as reader:
+                np.testing.assert_array_equal(host(reader[:2, :3].data['image']), image[:, -1, :2, :3])
+            with asset.open_paired(layers=slice(0, 0), backend=backend) as reader:
+                self.assertEqual(reader[:2, :3].data['image'].shape, (2, 0, 2, 3))
+                self.assertEqual(reader[:2, :3].data['label'].shape, (1, 2, 3))
+
+    def test_affine_exact_categories_validity_padding_and_cache(self):
+        image = np.zeros((3, 8, 10), 'uint8')
+        # Large categorical integers verify that nearest sampling never converts
+        # class IDs through floating point.
+        labels = np.arange(8*10, dtype='uint64').reshape(8, 10) + 2**55
+        asset = self.pair(self.source('render', image, 'image'), self.source('labels', labels, 'label'),
+                          pixel_affine=((2., 0., 1.), (0., 2., -1.)))
+        expected = np.zeros((1, 8, 10), dtype='uint64')
+        valid = np.zeros((1, 8, 10), dtype='bool')
+        for y in range(8):
+            for x in range(10):
+                sy, sx = round((y+1)/2), round((x-1)/2)
+                if 0 <= sy < 8 and 0 <= sx < 10:
+                    expected[0, y, x], valid[0, y, x] = labels[sy, sx], True
+        for backend in self.backends():
+            with asset.open_paired(backend=backend, sampling_cache_bytes=1024, plan_cache_bytes=1024) as reader:
+                for _ in range(2):
+                    result = reader[:, :]
+                    np.testing.assert_array_equal(host(result.data['label']), expected)
+                    np.testing.assert_array_equal(host(result.valid['label']), valid)
+                stats = reader.stats()
+                self.assertLessEqual(stats['tile_cache_bytes'], 1024)
+                self.assertLessEqual(stats['plan_cache_bytes'], 1024)
+                padded = reader.read((-3, -2), (5, 4))
+                self.assertFalse(host(padded.valid['image'])[..., :3, :].any())
+
+    def test_independent_pyramids_choose_matching_grid_or_sample_base(self):
+        image = np.arange(3*8*10, dtype='uint16').reshape(3, 8, 10)
+        labels = np.arange(8*10, dtype='uint16').reshape(8, 10)
+        render = replace(pyramid(self.root/'r', [image, image[:, ::2, ::2]], [1, 2]), role='image')
+        # Label level 1 is 4x; level 2 is 2x. Masks have only the base array.
+        label = replace(pyramid(self.root/'l', [labels, labels[::4, ::4], labels[::2, ::2]], [1, 4, 2]), role='label')
+        mask = self.source('mask', np.full((8, 10), 255, 'uint8'), 'label')
+        label = replace(label, companions=(Companion('validation', mask, True),))
+        asset = self.pair(render, label)
+        for backend in self.backends():
+            with asset.open_paired(level=1, backend=backend) as reader:
+                self.assertEqual(reader.metadata['label_selection'].array_path, '2')
+                result = reader[:, :]
+                np.testing.assert_array_equal(host(result.data['image']), image[None, :, ::2, ::2])
+                np.testing.assert_array_equal(host(result.data['label']), labels[None, ::2, ::2])
+                np.testing.assert_array_equal(host(result.masks['label']['validation']), 255)
+        # With no matching stored label level, resample categorical base values.
+        label2 = self.source('labels2', labels, 'label')
+        asset = self.pair(render, label2)
+        with asset.open_paired(level=1) as reader:
+            np.testing.assert_array_equal(reader[:, :].data['label'], labels[None, ::2, ::2])
+        with self.assertRaises((ValueError, FileNotFoundError)):
+            asset.open_paired(level=3)
+
+    def test_no_implicit_pairing_and_reject_contradictory_grids(self):
+        render = self.source('r', np.zeros((2, 4, 5), 'uint8'), 'image')
+        label = self.source('l', np.zeros((4, 5), 'uint8'), 'label')
+        scroll = self.scroll.with_source(render, kind='render', volume='v').with_source(label, kind='label', volume='v')
+        self.assertFalse(scroll.labels.one().renders)
+        with self.assertRaisesRegex(ValueError, 'absent'):
+            scroll.labels.one().open_paired(render=scroll.renders.one())
+        bad = self.source('bad', np.zeros((3, 5), 'uint8'), 'label')
+        with self.assertRaisesRegex(ValueError, 'shapes'):
+            self.pair(render, bad).open_paired()
+        render2 = replace(pyramid(self.root/'rp', [np.zeros((2, 4, 5), 'uint8')], [2]), role='image')
+        label2 = replace(pyramid(self.root/'lp', [np.zeros((4, 5), 'uint8')], [1]), role='label')
+        with self.assertRaisesRegex(ValueError, 'contradict'):
+            self.pair(render2, label2).open_paired()
+
+    def test_pickle_and_spawn_reopen_cpu_only(self):
+        image = np.arange(3*7*9, dtype='uint16').reshape(3, 7, 9)
+        labels = np.arange(7*9, dtype='uint8').reshape(7, 9)
+        asset = self.pair(self.source('r', image, 'image'), self.source('l', labels, 'label'))
+        with asset.open_paired() as reader:
+            restored = pickle.loads(pickle.dumps(reader))
+            self.assertTrue(restored._lazy)
+            np.testing.assert_array_equal(read_worker(restored)['label'], labels[None, 1:3, 2:5])
+            with multiprocessing.get_context('spawn').Pool(1) as pool:
+                result = pool.apply(read_worker, (reader,))
+            np.testing.assert_array_equal(result['image'], image[None, :, 1:3, 2:5])
+        if is_available():
+            with asset.open_paired(backend='cuda') as reader:
+                with self.assertRaisesRegex(TypeError, 'CUDA'):
+                    pickle.dumps(reader)
+
+
+class ResolutionTests(unittest.TestCase):
+    def test_header_resolution_absent_levels_and_contradictions(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source = pyramid(root/'ct', [np.zeros((8, 8, 8), 'uint8'), np.zeros((4, 4, 4), 'uint8')], [1, 2])
+            # CT spacing scales in all three dimensions.
+            attrs = json.loads((root/'ct'/'.zattrs').read_text())
+            attrs['multiscales'][0]['datasets'][1]['coordinateTransformations'][0]['scale'][0] = 2
+            (root/'ct'/'.zattrs').write_text(json.dumps(attrs))
+            data = dict(samples=dict(s=dict(sample=dict(id='s', properties=dict(type='scroll')), volumes=dict(v=dict(id='v', properties=dict(pixel_size_um=1, shape=[8, 8, 8]), data=[dict(type='ome-zarr', id='ct', origins=[dict(path=str(root/'ct'), access_roots=[dict(url='')])])])))))
+            c = Catalog(data)
+            candidate = c.scrolls.volumes.at_resolution(2).one()
+            resolved = candidate.resolve()
+            self.assertTrue(resolved.verified)
+            self.assertEqual(resolved.shape, (4, 4, 4))
+            self.assertEqual(resolved.spacing_um, (2., 2., 2.))
+            with candidate.open() as reader:
+                self.assertEqual(reader.shape, (4, 4, 4))
+            with self.assertRaises(ValueError):
+                c.scrolls.volumes.at_resolution(4).one().resolve()
+            data['samples']['s']['volumes']['v']['properties']['pixel_size_um'] = 2
+            with self.assertRaisesRegex(ValueError, 'contradicts'):
+                Catalog(data).scrolls.volumes.at_resolution(2).one().open()

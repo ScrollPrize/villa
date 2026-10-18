@@ -44,13 +44,13 @@ def main():
     from vc_reader import Catalog, Source
     from vc_reader.sampling import open_sample
     catalog = Catalog.from_file(args.metadata)
-    reference = catalog.sample(args.sample).volume(args.volume).level(args.level)
+    reference = catalog.samples[args.sample].volumes[args.volume].level(args.level)
     targets = {}
     for selection in args.catalog_target:
         name, identifier = selection.split('=', 1)
         if name in targets:
             raise ValueError('duplicate target name: '+name)
-        targets[name] = catalog.sources.get(identifier)
+        targets[name] = catalog.samples[args.sample].artifacts[identifier].source
     for selection in args.target:
         name, path = selection.split('=', 1)
         if name in targets:

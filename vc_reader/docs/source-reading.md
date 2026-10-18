@@ -30,7 +30,7 @@ Published ink-label descriptors select pyramid level zero, including their
 separately named supervision and validation arrays:
 
 ```python
-source = volume.labels()[0]
+source = volume.labels.ink.one().source
 with source.open(cache_dir='/data/label-cache', cache_max_bytes=1 << 30,
                  memory_cache=64 << 20, threads=1) as reader:
     labels = reader[100:228, 200:328]

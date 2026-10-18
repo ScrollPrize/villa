@@ -58,7 +58,7 @@ import json
 from pathlib import Path
 from vc_reader import Catalog
 catalog = Catalog.from_file('/home/sean/.cache/vc_reader/metadata-cff196b7c8a57b2d.bin')
-source = next(s for s in catalog.sources if s.role == 'label' and s.sample_id == 'PHerc0009B')
+source = catalog.samples['PHerc0009B'].on_volume('20250820154339').segments['20250919125754'].labels.ink.one(label_set='20260918').source
 Path('/tmp/plan02-label-source.json').write_text(json.dumps(source.to_dict()))
 starts = [[18576,7984], [19344,14192], [19856,15696], [20496,13232], [22128,11472], [23152,7984]]
 Path('/tmp/plan02-label-requests.json').write_text(json.dumps([[p,[128,128]] for p in starts]))

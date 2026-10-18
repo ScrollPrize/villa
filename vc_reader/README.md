@@ -1,19 +1,96 @@
 # vc_reader
 
-## Source discovery
+## Browse a sample and read CT with ink
 
-Describe published labels, derived representations, and explicit local/remote
-sources without opening storage. Query `volume.labels()`,
-`volume.level(2).representations()`, or `volume.registered_volumes()`; use
-`SourceCollection` to include user annotations. See [source discovery](docs/discovery.md)
-for registration, serialization, examples, and validation commands.
+```python
+from vc_reader import load, ScrollSource
 
-Open local/HTTP/S3 Zarr v2/v3, PNG/JPEG/TIFF, and ordered image stacks with
-`source.open()` for exact spatial crops, explicit label encodings, resolved
-registration, and bounded caching. Published sharded Zarr v3 ink labels and
-their companion masks share the existing native reader and authentication.
-See [source reading](docs/source-reading.md) for formats, worker lifecycle,
-examples, and [acceptance measurements](docs/source-reading-benchmarks.md).
+catalog = load()
+scroll = ScrollSource("PHerc0009B", "20250820154339", catalog=catalog)
+segment = scroll.segments["20250919125754"]
+label = segment.labels.ink.one(label_set="20260918")
+render = label.renders.zarr.one()
+
+with label.open_paired(render=render, layers=slice(40, 65), backend="cpu") as reader:
+    patch = reader[18576:18704, 7984:8112]
+    image = patch.data["image"]              # (1, 25, 128, 128)
+    ink = patch.data["label"]                # (1, 128, 128)
+    supervision = patch.masks["label"]["supervision"]
+    validation = patch.masks["label"]["validation"]
+    geometric_validity = patch.valid["label"]
+```
+
+This published crop contains **9,926 nonzero ink pixels**. CT, ink, and both
+masks are checked against independently opened arrays by
+[`scripts/paired_reading.py`](scripts/paired_reading.py). The stored depth axis
+contains sampled surface layers. Labels stay two-dimensional; masks retain
+their published values without choosing a training policy. `backend="cuda"`
+returns device arrays in the process that owns the GPU.
+
+Browse `scroll.volumes`, `scroll.segments`, `scroll.labels.ink`,
+`scroll.renders.zarr`, `scroll.representations`, and `scroll.geometry`.
+`label.volume` is its native target; `label.mappable_volumes` lists explicit
+transforms, known coverage, and required operations such as surface projection.
+`render.labels.ink` follows the same relationships in reverse. `.one()` raises
+with candidates when selection is missing or ambiguous.
+
+`catalog.samples[id]` and `ScrollSource(...)` return the same kind of view.
+`catalog.scrolls` filters samples to published type `scroll`; PHerc0009B is
+classified as a fragment and remains in `catalog.samples`. Omit `volume` to
+browse every direct association; `.on_volume(id)` returns a contextual view.
+Only explicitly superseded entries are hidden. Use
+`.filter(include_superseded=True)` or historical ID lookup to inspect them.
+
+## Discover CT by resolution
+
+```python
+matches = catalog.scrolls.volumes.at_resolution(8.0, rel_tol=0.02)
+paris = catalog.scrolls["PHercParis4"].volumes.at_resolution(8.0, rel_tol=0.02)
+for match in paris:
+    print(match.volume.id, match.level, match.estimated_resolution_um, match.verified)
+
+candidate = paris.one(volume="20230205180739")
+confirmed = candidate.resolve()  # reads headers; confirms selection, spacing, shape
+with candidate.open() as ct:
+    crop = ct[100:104, 200:204, 300:304]
+```
+
+Discovery makes no array requests. Native arrays and estimated pyramid levels
+are returned within tolerance, ordered by resolution difference and stable IDs.
+The default tolerance is 0.5%; 2% includes PHercParis4's 7.91 µm scans in an
+8 µm search. Opening validates headers and fails on missing levels or
+contradictions. It never resamples CT to satisfy a resolution query.
+
+## Attach custom data
+
+```python
+from vc_reader import Source, Storage
+
+view = scroll.with_source(
+    Source("my-render", Storage("/data/render.zarr", "zarr"),
+           role="image", axes=("z", "y", "x")),
+    kind="render", volume=scroll.volume, segment="user:my-segment",
+)
+view = view.with_source(
+    Source("my-ink", Storage("/data/ink.png", "png"),
+           role="label", axes=("y", "x"), artifact_kind="ink-labels"),
+    kind="label", volume=scroll.volume, segment="user:my-segment",
+    render="user:my-render", same_grid=True,
+)
+with view.labels["user:my-ink"].open_paired() as reader:
+    patch = reader[:128, :128]
+```
+
+Custom pairs require `same_grid=True` or an explicit 2×3 `pixel_affine` mapping
+label XY pixels into render XY pixels. Volume-aligned labels and representations
+use `VolumeRegistration` and `volume.open_aligned(...)`. Unregistered sources
+remain raw-readable through `.open()`. Overlays preserve published metadata and
+serialize with `view.to_dict()` / `ScrollSource.from_dict(...)`.
+
+See [discovery and pairing](docs/discovery.md), [source formats and caches](docs/source-reading.md),
+and [real-data validation and measurements](docs/scroll-reading-benchmarks.md).
+Generating new surface layers and projecting surface labels into 3D remain
+[planned geometry operations](plans/04-surface-labels-and-projection.md).
 
 ## PyTorch CUDA batches
 

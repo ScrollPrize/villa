@@ -1,203 +1,159 @@
-# Discovering registered sources
+# Scroll-centered discovery and paired reading
 
-Discovery describes published and user-supplied data using only catalog
-metadata. It does not open files, resolve Zarr metadata, decode images, or
-sample arrays. The catalog and discovery modules use only the Python standard
-library. Unknown storage, axes, and placement remain explicit unknowns.
+The catalog and public views use the standard library. `load()` reads catalog
+metadata; navigating an already loaded catalog does not request arrays or
+import NumPy, native extensions, Pillow, or PyTorch.
 
-```python
-from vc_reader import Catalog
-
-catalog = Catalog.from_file("metadata.json")  # Also accepts gzip snapshots.
-volume = catalog.sample("PHercParis4").volume("20260411134726")
-labels = volume.labels()
-representations = volume.level(2).representations(mappable=False)
-related_volumes = volume.registered_volumes()
-```
-
-`labels()` and `representations()` return deterministic lists of immutable
-`Source` values. `registered_volumes()` returns existing `Volume` objects;
-select their `.level(...)` explicitly. A relationship establishes coordinate
-connectivity and does not promise spatial overlap.
-
-`mappable=False` requires registration directly to the queried volume ID.
-`mappable=True` follows published transforms, including the catalog's existing
-same-frame relationships. Ink labels preserve the specialized API's preference,
-deduplication, supersession, and coverage rules. Generic sources retain distinct
-IDs and use only explicit supersession links for `latest_only=True`.
-`labels(label_set=...)` restricts to that recorded annotation set.
-
-Level-specific representation queries record a corresponding-level request in
-`source.storage.selection.corresponding`. For a prediction whose base grid is
-volume level 2, a query at level 3 requests sublevel 1. A query at level 1 records
-sublevel -1, indicating that the required finer array is unavailable under the
-catalog convention. Mapped-volume requests retain the requested reference
-frame and leave the sublevel unresolved. Opening in the subsequent reader
-increment will validate actual metadata and reject unavailable/ambiguous levels.
-There is no silent fallback to a coarser level.
-
-Use `source.with_selection(level=0)` or
-`source.with_selection(array_path="prediction", series="main")` to select an
-explicit array instead. These return a copy with the same source ID. The
-registration retains the grid for which it was declared; changing array
-selection never silently reinterprets an affine. Label queries retain the
-labels' native grid at every queried volume level.
-
-## Adding a local or remote source
+## Collections and relationships
 
 ```python
-import json
-from vc_reader import Affine, Source, SourceCollection, Storage, VolumeRegistration
-
-crop = Source(
-    "annotation",  # Normalized to the user:annotation namespace.
-    storage=Storage("/data/annotation.zarr", "zarr"),
-    role="label",
-    axes=("z", "y", "x"),
-    registration=VolumeRegistration(
-        volume.sample.id, volume.id,
-        affine=Affine.from_rows([
-            [1, 0, 0, 120],
-            [0, 1, 0, 80],
-            [0, 0, 1, 40],
-        ]),
-    ),
-)
-sources = SourceCollection(catalog, [crop])
-labels = sources.labels(volume=volume.level(2))
-restored = Source.from_dict(json.loads(json.dumps(crop.to_dict())))
-assert restored == crop
+from vc_reader import load, ScrollSource
+catalog = load()
+scroll = ScrollSource('PHerc0009B', '20250820154339', catalog=catalog)
+label = scroll.segments['20250919125754'].labels.ink.one(label_set='20260918')
+render = label.renders.zarr.one()
+assert render.labels.ink[label.id].id == label.id
+assert label.volume.id == '20250820154339'
 ```
 
-The affine maps array-local XYZ voxel centers to volume level-0 XYZ. Crop
-starts/sizes and declared storage axes use ZYX/YX. A `VolumeRegistration` can
-instead declare `mode="storage"`, a named `storage_frame`, and a
-storage-frame-to-volume affine. That mode requires composition with the array's
-storage metadata when opening; a direct array affine must not acquire a second
-copy of its scale.
+`catalog.samples` includes scrolls and fragments. `catalog.scrolls` filters on
+the published sample type. Both return `ScrollSource` views. PHerc0009B is a
+fragment in the acceptance snapshot; its classification is preserved.
+`ScrollSource` also resolves the catalog's common sample-name aliases.
 
-Use `Plane(origin, basis_x, basis_y, thickness)` for an embedded 2D slice, passed
-as `VolumeRegistration(..., plane=...)`. All four vectors are in level-0 XYZ;
-`thickness` is a perpendicular vector spanning one source voxel along the
-normal. An explicit stack uses `Storage(format="stack", locations=(...))` in
-caller-supplied order. No filenames are sorted or directories scanned.
+Collections iterate entities in stable ID order and support `[id]`,
+`.filter(attribute=value, ...)`, and `.one(...)`. Filters use exact values;
+relationship filters also accept entity IDs, e.g. `.one(volume='...')`.
+Resolution queries have their own explicit tolerance. `.one()` raises
+`NotFoundError` or `AmbiguousMatchError` with candidates, never a preference
+for the first alternative. A missing ID also raises `NotFoundError`.
 
-Surface labels use `SurfaceRegistration(surface, pixel_to_uv=...)`. A `Surface`
-declares its geometry storage, axes/component order, XYZ-to-volume transform,
-and geometry-pixel-to-UV transform. UV maps are 2x3 XY affines, with U increasing
-along columns and V along rows. UV scale is independent of geometry XYZ units.
-Published labels may lack these storage-level details; their descriptors retain
-known target identity while reporting the missing declarations.
+An omitted volume exposes the complete sample. `.on_volume(id)` shows direct
+associations only. A segment qualifies if any published asset targets that
+volume, including labels or renders without a mesh. Views share entity records
+and immutable `Source` descriptors; navigation never rewrites registration.
 
-Geometric roles (`vector`, `normal`, `coordinate`) require explicit
-`component_order` and `ValueFrame` declarations before sampling. Coordinate
-values may use a named external frame with explicit units. Vector normalization
-is an explicit boolean. `Encoding` supports integer or exact color-tuple
-lookups, an integer output dtype, and an optional fallback for unknown values.
+- `volumes`, `segments`, `labels.ink`, `renders.zarr`, `representations`, and
+  `geometry` expose distinct kinds. `.artifacts` retains unknown types too.
+- `label.segment`, `label.volume`, `label.renders`, `label.masks`, and
+  `render.labels` follow the indexed relationships. Render variants remain
+  separate. Explicit published render references constrain the segment/target
+  canvas convention. Equal shapes do not establish a relationship.
+- `label.mappable_volumes` contains volume, transform, coverage (or `None`), and
+  `required_operations`. Surface labels still need `surface_projection` for a
+  3D destination. Connectivity does not promise complete spatial coverage.
+- Explicit supersession hides assets and volumes by default. ID lookup finds
+  historical entries; `.filter(include_superseded=True)` includes them in
+  queries. Distinct alternatives without supersession links remain visible.
+- `asset.source.unresolved_fields` and `.source.provenance` expose missing
+  semantics and published metadata. Raw opening requires supported storage;
+  aligned operations additionally validate the required placement.
 
-`Companion(name, source, same_grid=True)` explicitly binds a single-channel mask
-to its parent's selected grid. Otherwise give the mask its own registration.
-Companion values never become geometric validity or training policy.
-`coverage` and `conflict` are reserved projection mask names.
-
-## Inspection and lifecycle
-
-`list(sources)` includes unknown, unregistered, and superseded assets.
-`sources.get(id)` retrieves a descriptor or raises `NotFoundError`.
-Unknown semantics are excluded from label/representation queries. Inspect
-`source.unresolved_fields`, `source.provenance`, and `source.query` for missing
-declarations, published metadata, and the queried relationship/coverage.
-An empty `unresolved_fields` tuple is not proof that storage can be opened.
-
-Catalog IDs include the sample/owner and published artifact ID. Missing IDs use
-the artifact's metadata position and canonical catalog SHA-256. Those fallback
-IDs are stable within a snapshot; record `sources.snapshot_sha256` alongside
-experiments. User entries use a separate namespace. Duplicate IDs and generic
-supersession cycles raise instead of replacing or merging assets.
-
-Descriptors are deeply immutable and support versioned JSON and pickle without
-storage handles. Collection entries and catalog relationships are snapshots;
-construct a new collection/catalog after changing metadata. Entity convenience
-queries reuse `catalog.sources`. A collection indexes artifacts once and retains
-up to 128 query results; each query returns a fresh list. Selected copies can
-share an ID, so downstream read/cache keys must include selection and placement.
-
-`SampleResult(data, valid, masks, metadata=None)` defines the later sampling
-contract without importing an array library. Volume data will use `(C,Z,Y,X)`,
-surface labels `(C,Y,X)`, and sampled surface layers `(C,D,Y,X)`. Each target has
-singleton-channel validity and a dictionary of named masks. `read_many` will
-return an ordered list of unbatched results; batching belongs to the caller.
-
-Aligned sampling uses these descriptors directly:
+## CT resolution candidates
 
 ```python
-from vc_reader.sampling import open_sample
-with open_sample(volume.level(2), targets={"annotation": crop}) as reader:
-    result = reader[:32, :32, :32]
+matches = catalog.scrolls.volumes.at_resolution(8, rel_tol=.02)
+paris = catalog.scrolls['PHercParis4'].volumes.at_resolution(8, rel_tol=.02)
+match = paris.one(volume='20230205180739')
+resolved = match.resolve()
+print(resolved.selection, resolved.spacing_um, resolved.shape)
+with match.open() as reader:
+    patch = reader[100:104, 200:204, 300:304]
 ```
+
+All native and catalog-convention pyramid matches within tolerance are returned,
+including nearby matches when another volume matches exactly. Ordering is
+resolution difference, scroll ID, volume ID, level, source ID. Tolerance
+is 0.5% by default. Candidates start `verified=False`; `.resolve()` checks
+storage and returns a confirmed copy. `.open()` runs the same checks. Missing
+levels, contradictory spacing, and contradictory shapes fail explicitly.
+Neither method resamples CT. `volume.level(n).open()` selects a stored level
+explicitly, using its actual storage transform for aligned sampling.
+
+## Flattened paired reads
+
+```python
+with label.open_paired(layers=slice(40, 65), backend='cpu') as reader:
+    patch = reader[18576:18704, 7984:8112]
+    image = patch.data['image']       # C,D,H,W
+    ink = patch.data['label']         # C,H,W
+    valid = patch.valid['label']      # 1,H,W geometric support
+    masks = patch.masks['label']      # published supervision/validation values
+    one_layer = reader['image'][0, -1, :32, :32]
+```
+
+The default is render level zero and all stored layers. `render=` can be omitted
+only for exactly one paired render. Shared indexing is the selected render's
+YX grid. Named indexing is CDYX for images and CYX for labels. An integer
+removes its axis; negative integers and unit-step slices follow NumPy rules.
+A `layers` integer removes the depth axis. `.read(start_yx, size_yx)` permits
+out-of-bounds requests with fill values and separate geometric validity;
+`.read_many(...)` returns results in request order.
+
+Published storage transforms resolve pixel grids. Labels and companion masks
+select matching stored grids independently; a missing matching grid uses the
+known affine and exact categorical nearest-neighbor sampling (ties to even).
+Level numbers across different pyramids are not assumed equivalent. Unknown
+transforms fail when required to relate grids. Layer depth is never interpreted
+as original-volume Z and 2D labels are never repeated through it.
+
+Companion values stay separate from `valid`: supervision and validation do not
+become an eligibility rule. The authoritative artifact `properties.arrays`
+list determines published companions. Creation reports can describe staging
+outputs not copied to the published package. In the acceptance snapshot that
+list names supervision and validation; a creation report also mentions an
+unavailable mapping-validity output, which is not attached as a published mask.
+
+Paired reads and volume-aligned reads share bounded CPU/CUDA affine execution,
+chunk/decoded caches, tile and plan budgets, and output ownership. Configure
+`memory_cache`, `decoded_cache_bytes`, `sampling_cache_bytes`,
+`sampling_work_bytes`, and `plan_cache_bytes` when opening. `stats()` reports
+I/O, cache bytes, and CUDA upload bytes. Results survive later reads and close.
+CPU readers serialize descriptors and reopen in workers; CUDA readers cannot
+be pickled or used after fork. CUDA belongs in the device-owning process.
+
+## Local and external sources
+
+`scroll.with_source(source, kind=..., volume=..., segment=...)` returns an overlay
+view. Kinds are `volume`, `render`, `label`, `representation`, `geometry`, and
+`artifact`. Sources use `user:` IDs, as do newly created volume/segment IDs.
+Published metadata is unchanged and published descriptors are shared.
+
+For a custom label/render pair supply `render=render.id` when attaching the label
+(or `label=label.id` when attaching a render), plus exactly one of:
+
+- `same_grid=True`: a declared shared base pixel grid, validated at opening.
+- `pixel_affine=((a,b,tx),(c,d,ty))`: label base XY pixels to render base XY pixels.
+
+Owning the same segment or having the same shape does not pair custom sources.
+Unregistered sources remain inspectable and raw-readable. Volume-aligned
+annotations use `VolumeRegistration`; `volume.open_aligned({'label': asset},
+level=0)` uses the existing volume sampling engine. Surface projection remains
+future work.
+
+```python
+from vc_reader import Affine, Source, Storage, VolumeRegistration
+volume = catalog.scrolls['PHercParis4'].volumes['20230205180739']
+source = Source('crop', Storage('/data/labels.zarr', 'zarr'), role='label',
+                axes=('z', 'y', 'x'),
+                registration=VolumeRegistration(volume.sample_id, volume.id,
+                    affine=Affine.from_rows(((1,0,0,120), (0,1,0,80), (0,0,1,40)))))
+view = volume.scroll.with_source(source, kind='label', volume=volume)
+with volume.open_aligned({'label': view.labels['user:crop']}) as reader:
+    result = reader[40:44, 80:84, 120:124]
+```
+
+`Source.to_dict()` / `Source.from_dict()` serialize individual descriptors.
+`ScrollSource.to_dict()` / `ScrollSource.from_dict()` include the catalog,
+overlays, relationships, and volume context without live readers. Pickling
+views also preserves those relationships.
 
 ## Run and verify
 
-No native build or dependency installation is needed. From `vc_reader/`:
-
-```bash
-AGENTS_AGENT_MODE=1 PYTHONPATH=src python3 -S scripts/discovery_examples.py \
-  --metadata /path/to/metadata.json --sample PHercParis4 --volume 20260411134726
-AGENTS_AGENT_MODE=1 PYTHONPATH=src python3 -S -m unittest discover \
-  -s tests -p test_sources.py -v
-AGENTS_AGENT_MODE=1 PYTHONPATH=src python3 -S benchmarks/bench_discovery.py \
-  --metadata /path/to/metadata.json --sample PHercParis4 \
-  --output /tmp/discovery.json --profile /tmp/discovery.pstats
-```
-
-`-S` excludes installed editable-import hooks, making these commands useful in
-an isolated worktree too. The benchmark uses six fixed volumes, two warmups, and
-ten measured repetitions per query. It checks specialized/new label agreement,
-records source IDs and snapshot hashes, and separates index time and traced
-Python allocation from warm-cache latency. Asset bytes read are zero. These
-measurements do not exercise file decoding, sampling, or CUDA.
-
-### Recorded validation (2026-10-17)
-
-On Linux amd64 / Python 3.14, the cached published catalog contains 45 samples
-and 4,495 artifacts. Its canonical snapshot SHA-256 is
-`de38ba456eedfa4e0c4c6d6b4e093f4664d635eae551bfbe923bbdf6dc4ec58d`.
-The measured command was:
-
-```bash
-AGENTS_AGENT_MODE=1 PYTHONPATH=src /usr/bin/python3.14 -S benchmarks/bench_discovery.py \
-  --metadata /home/sean/.cache/vc_reader/metadata-cff196b7c8a57b2d.bin \
-  --output /tmp/discovery-benchmark-final.json \
-  --profile /tmp/discovery-profile-final.pstats
-```
-
-Values below are warm-cache **mean / p50 / p95 microseconds**, with two warmups
-and ten measurements per case. The comparison is the existing specialized
-`ink_labels()` API versus indexed `SourceCollection.labels()` in this change;
-both return the same selected annotations. Catalog loading is excluded.
-
-| PHercParis4 volume | Specialized query | Indexed source query |
-| --- | ---: | ---: |
-| 20230205180739 | 36.98 / 36.81 / 38.45 | 1.76 / 1.56 / 2.58 |
-| 20230206171837 | 33.27 / 32.92 / 35.61 | 1.57 / 1.53 / 1.81 |
-| 20260310170716 | 36.99 / 36.87 / 37.99 | 1.60 / 1.55 / 1.85 |
-| 20260310173927 | 33.27 / 33.22 / 34.24 | 1.65 / 1.58 / 1.90 |
-| 20260323153942 | 36.49 / 36.15 / 37.92 | 1.59 / 1.55 / 1.82 |
-| 20260411134726 | 35.47 / 35.00 / 37.18 | 1.60 / 1.52 / 1.89 |
-
-Index construction takes 0.351 seconds. Separately instrumented initialization
-and queries retain 32.58 MiB of Python allocations, with a 32.58 MiB peak.
-The profile attributes most startup work to canonical JSON hashing and immutable
-descriptor adaptation/freezing; those costs are outside the repeated-query path.
-Metadata values and existing affine matrices are retained without introducing
-bulk numeric arrays or changing sampling precision.
-
-The five permanent discovery tests pass with Python 3.11 and 3.14 without
-optional packages. Real-snapshot validation round-tripped all 4,495 descriptors,
-checked 296 discovery queries against specialized matching, and confirmed 2,156
-specialized-query cases were unchanged from the original checkout. The existing
-Release CUDA-enabled build passes the full 45-test suite, including its CPU
-backend cases. The separately cached CPU-only build reproduces five existing
-augmentation failures in both checkouts (compact local-field plans and signed
-zero in low-resolution sampling); no native code was changed here. macOS and
-arm64 were not runtime-tested.
+Run [`scripts/paired_reading.py`](../scripts/paired_reading.py) with `--metadata`
+and optionally `--native-dir` pointing to an existing build. It discovers the
+acceptance pair, reads the fixed crop, verifies all arrays independently, and
+asserts 9,926 nonzero ink pixels. `--backend cuda` repeats on CUDA.
+The CLI supports `samples`, `scrolls`, `volumes`, `labels`, `segments`, `renders`,
+and `representations`; `volumes --resolution 8 --rel-tol .02 --resolve` validates
+header selections. See [exact test/benchmark commands and results](scroll-reading-benchmarks.md).

@@ -255,23 +255,17 @@ class SamplingTests(unittest.TestCase):
         path = self.root/'pyramid.zarr'
         pyramid(path, scales=(1, 3, 6), units='micrometer')
         cat = Catalog({'samples': {'s': {'sample': {'id': 's'}, 'volumes': {'v': {
-            'id': 'v', 'data': [{'id': 'image', 'type': 'ome-zarr', 'origins': [
+            'id': 'v', 'properties': {'pixel_size_um': 1}, 'data': [{'id': 'image', 'type': 'ome-zarr', 'origins': [
                 {'path': str(path), 'access_roots': [{'url': '', 'type': 'local'}]}]}]}}}}})
-        # Explicit voxel spacing resolves physical metadata into level-0 units.
-        from vc_reader.discovery import SourceCollection
-        level = cat.volume('v').level(1)
-        original = next(iter(cat.sources))
-        placed = replace(original, registration=replace(original.registration, volume_spacing_um=(1.,)*3))
-        # Exercise the public VolumeLevel adapter against a frozen catalog source.
-        with patch.object(type(cat.sources), '__iter__', lambda self: iter((placed,))):
-            values = np.ones((3, 7, 8, 9), dtype='float32')
-            field = self.source('level-field', values, role='vector', affine=Affine.scale(3),
-                                component_order=('x', 'y', 'z'), normalize=False,
-                                value_frame=ValueFrame(sample_id='s', volume_id='v', level=1))
-            with open_sample(level, {'label': replace(self.ref, role='label'), 'vector': field}) as reader:
-                np.testing.assert_array_equal(reader.read((0, 0, 0), (2, 2, 2)).data['vector'], 1)
-                self.assertEqual(reader._reference_map, Affine.scale(3))
-                np.testing.assert_array_equal(reader.read((0, 0, 0), (2, 2, 2)).data['image'], 2)
+        level = cat.samples['s'].volumes['v'].level(1)
+        values = np.ones((3, 7, 8, 9), dtype='float32')
+        field = self.source('level-field', values, role='vector', affine=Affine.scale(3),
+                            component_order=('x', 'y', 'z'), normalize=False,
+                            value_frame=ValueFrame(sample_id='s', volume_id='v', level=1))
+        with open_sample(level, {'label': replace(self.ref, role='label'), 'vector': field}) as reader:
+            np.testing.assert_array_equal(reader.read((0, 0, 0), (2, 2, 2)).data['vector'], 1)
+            self.assertEqual(reader._reference_map, Affine.scale(3))
+            np.testing.assert_array_equal(reader.read((0, 0, 0), (2, 2, 2)).data['image'], 2)
 
     def test_budget_eviction_repeated_requests_and_worker_reopening(self):
         values = np.arange(20*22*24, dtype='uint16').reshape(20, 22, 24)

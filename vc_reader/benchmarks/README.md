@@ -6,11 +6,12 @@ Generated JSON reports under `docs/benchmarks/` are kept locally and ignored by
 Git. Report paths below refer to those local files; benchmark input fixtures
 remain versioned.
 
-For metadata-only discovery, `bench_discovery.py` compares existing ink-label
-queries with indexed `SourceCollection` queries on six fixed volumes from a
-local catalog snapshot. It records hashes, query IDs, mean/p50/p95 latency,
-index initialization, and peak Python allocation without opening asset storage.
-See [discovery commands and methodology](../docs/discovery.md#run-and-verify).
+For metadata-only discovery, `bench_discovery.py` measures indexing and six
+scroll-volume navigation requests against a direct metadata scan. It records
+hashes, mean/p50/p95 latency, peak allocation, and optional cProfile output with
+no array requests. `bench_paired.py` compares six real PHerc0009B CT/ink/mask
+reads against independent array readers, with CPU and CUDA output options.
+See [commands and measurements](../docs/scroll-reading-benchmarks.md).
 
 For local label reading, `bench_source_readers.py` validates and times six fixed
 TIFF crops against equivalent tifffile reads, using the bundled PHercParis4

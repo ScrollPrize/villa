@@ -6,15 +6,12 @@ from dataclasses import asdict, replace
 import math
 import operator
 import os
-from collections import OrderedDict
-from threading import RLock
 
 from .affine import Affine
-from .catalog import VolumeLevel
+from .browsing import VolumeLevel
 from .sources import Source, VolumeRegistration, SampleResult
 
-# Forked readers may contain native locks held by vanished parent threads.
-_INHERITED = []
+from ._sampling_engine import SamplingEngine
 
 
 def open_sample(reference, targets=None, *, backend='cpu', catalog=None, **reader_options):
@@ -58,28 +55,6 @@ def _region(start, size):
     return start, size
 
 
-class _Bounded:
-    def __init__(self, limit):
-        self.limit = limit
-        self.items = OrderedDict()
-        self.bytes = self.hits = 0
-
-    def get(self, key):
-        item = self.items.get(key)
-        if item is not None:
-            self.items.move_to_end(key)
-            self.hits += 1
-            return item[0]
-
-    def put(self, key, value, size):
-        if size > self.limit:
-            return
-        if key in self.items:
-            self.bytes -= self.items.pop(key)[1]
-        while self.items and self.bytes + size > self.limit:
-            self.bytes -= self.items.popitem(last=False)[1][1]
-        self.items[key] = value, size
-        self.bytes += size
 
 
 class _SampleTarget:
@@ -113,46 +88,16 @@ class _SampleTarget:
             return array[()] if not shape else array
 
 
-class SampleReader:
+class SampleReader(SamplingEngine):
     def __init__(self, reference, targets=None, *, backend='cpu', catalog=None,
                  sampling_cache_bytes=64 << 20, sampling_work_bytes=64 << 20,
                  plan_cache_bytes=8 << 20, device=0, **reader_options):
-        import numpy as np
-        from . import _native
-        from .reader import DecodedCache, MemoryCache
-        if backend not in ('cpu', 'cuda'):
-            raise ValueError("backend must be 'cpu' or 'cuda'")
-        self.backend, self.device = backend, operator.index(device)
         limits = tuple(map(operator.index, (sampling_cache_bytes, sampling_work_bytes, plan_cache_bytes)))
-        if min(limits) < 0 or limits[1] == 0 or self.device < 0:
-            raise ValueError('cache/device settings must be nonnegative and sampling_work_bytes positive')
-        if backend == 'cuda':
-            from .cuda import is_available
-            if not is_available():
-                raise RuntimeError('CUDA sampling requires a configured CUDA build and device')
-            # Never create a CUDA context in a PyTorch DataLoader worker.
-            import sys
-            torch = sys.modules.get('torch')
-            if torch is not None and torch.utils.data.get_worker_info() is not None:
-                raise RuntimeError('CUDA sampling belongs in the device-owning process, not a DataLoader worker')
-        self._configuration = (reference, dict(targets or {}), backend, catalog, limits, self.device, dict(reader_options))
-        self._pid, self._closed, self._lock = os.getpid(), False, RLock()
-        self._readers, self._opened, self._targets = {}, [], {}
-        self._tiles, self._plans = _Bounded(limits[0]), _Bounded(limits[2])
-        self._work_bytes = limits[1]
-        self._uploads = self._tile_reads = self._peak_work = 0
-        self._catalog = reference.volume.sample.catalog if isinstance(reference, VolumeLevel) else catalog
+        self._configuration = (reference, dict(targets or {}), backend, catalog, limits, device, dict(reader_options))
+        self._catalog = reference.volume.scroll.catalog if isinstance(reference, VolumeLevel) else catalog
         if isinstance(reference, VolumeLevel) and catalog is not None and catalog is not self._catalog:
             raise ValueError('VolumeLevel and explicit catalog must belong to the same catalog')
-        options = dict(reader_options)
-        self._own_decoded = 'decoded_cache' not in options
-        self._own_memory = not isinstance(options.get('memory_cache'), MemoryCache)
-        if self._own_decoded:
-            options['decoded_cache'] = DecodedCache(max_bytes=options.pop('decoded_cache_bytes', 256 << 20),
-                                                   max_decode_bytes=options.pop('max_decode_bytes', 256 << 20))
-        if self._own_memory:
-            options['memory_cache'] = MemoryCache(options.get('memory_cache') if options.get('memory_cache') is not None else 64 << 20)
-        self._options = options
+        self._initialize_runtime(backend, device, limits, reader_options)
         try:
             if isinstance(reference, VolumeLevel):
                 reference = self._volume_source(reference)
@@ -188,25 +133,8 @@ class SampleReader:
             raise
 
     def _volume_source(self, level):
-        # Reuse discovery's adapter and storage-resolution contract.
-        volume = level.volume
-        candidates = [s for s in volume.sample.catalog.sources if s.sample_id == volume.sample.id
-                      and s.owner_id == volume.id and s.role == 'image' and not s.derived]
-        if len(candidates) != 1:
-            raise ValueError(f'{volume.id}: expected one reference volume image source, found {len(candidates)}')
-        source = candidates[0]
-        if source.registration.affine is None:
-            source = replace(source, registration=replace(source.registration, affine=Affine.identity(), origin='catalog-fallback'))
-        return source.with_selection(level=level.level)
+        return level.source
 
-    def _open(self, source):
-        # IDs alone do not identify selected arrays, encodings, or placement.
-        import json
-        key = json.dumps(source.to_dict(), sort_keys=True, separators=(',', ':'))
-        if key not in self._readers:
-            self._readers[key] = source.open(**self._options)
-            self._opened.append(self._readers[key])
-        return self._readers[key]
 
     def _between(self, source, frame):
         destination = self._reference_frame
@@ -218,7 +146,7 @@ class SampleReader:
             native = _frame(reg)
             qframe = (q.reference.sample_id, q.reference.volume_id)
             if self._catalog is not None:
-                expected = self._catalog.sample(reg.sample_id).transform(reg.volume_id, q.reference.volume_id)
+                expected = self._catalog.samples[reg.sample_id].transform(reg.volume_id, q.reference.volume_id)
                 if reg.sample_id != q.reference.sample_id or expected is None or expected.matrix != q.transform.matrix:
                     raise ValueError(f'{descriptor.id}: query context conflicts with catalog registration')
             candidate = None
@@ -233,7 +161,7 @@ class SampleReader:
         if frame == destination:
             known = Affine.identity()
         elif self._catalog is not None and frame[0] == destination[0]:
-            known = self._catalog.sample(frame[0]).transform(frame[1], destination[1])
+            known = self._catalog.samples[frame[0]].transform(frame[1], destination[1])
         else:
             known = None
         if known is not None and declared is not None and known.matrix != declared.matrix:
@@ -286,7 +214,7 @@ class SampleReader:
                         if value.level == 0:
                             value_map = Affine.identity()
                         elif value.level is not None and self._catalog is not None:
-                            volume = self._catalog.sample(value.sample_id).volumes[value.volume_id]
+                            volume = self._catalog.samples[value.sample_id].volumes[value.volume_id]
                             value_map = _placement(self._open(self._volume_source(volume.level(value.level))).registration)
                         else:
                             raise ValueError('value frame needs an affine or a resolvable volume level')
@@ -306,230 +234,19 @@ class SampleReader:
                 metadata['component_order'] = source.component_order
                 if value.kind == 'external':
                     field = None
-            # Native tile kernels operate in native byte order; categorical CPU
-            # outputs are converted back to the declared byte order at return.
-            storage_key = (reader.resolved.location, repr(reader.resolved.selection), reader.axes,
-                           str(dtype), repr(source.encoding), reader.fill_value)
-            direct = not plane and mapping.linear == Affine.identity().linear and all(v.is_integer() for v in mapping.translation)
-            return dict(source=source, reader=reader, mapping=mapping, shape=shape3, channels=channels,
-                        dtype=dtype, native_dtype=dtype.newbyteorder('='), plane=plane, storage_key=storage_key,
-                        order=int(source.role != 'label'), direct=direct, field=field, metadata=metadata,
-                        native_field=_native._aligned_make_field(*field) if field else _native.AlignedField())
+            return self._sampling_target(source, reader, mapping, plane=plane, field=field, metadata=metadata)
         except (ValueError, TypeError) as error:
             raise type(error)(f'{source.id}: {error}') from error
 
-    def _ready(self):
-        if self._closed:
-            raise ValueError('sample reader is closed')
-        if self._pid != os.getpid():
-            if self.backend == 'cuda':
-                raise RuntimeError('CUDA sample readers cannot be used after fork')
-            _INHERITED.append((self._opened, self._options, self._tiles, self._plans))
-            self._lazy = True
-        if getattr(self, '_lazy', False):
-            state = self._configuration
-            self._lazy = False
-            self._restore(state)
 
-    @staticmethod
-    def _canonical(array, reader):
-        import numpy as np
-        axes = list(reader.axes)
-        if 'c' not in axes:
-            array = np.expand_dims(array, 0)
-            axes.insert(0, 'c')
-        if 'z' not in axes:
-            array = np.expand_dims(array, 0)
-            axes.insert(0, 'z')
-        return np.ascontiguousarray(np.transpose(array, [axes.index(a) for a in ('c', 'z', 'y', 'x')]), dtype=array.dtype.newbyteorder('='))
 
-    def _blocks(self, size):
-        # Bounded affine work even when a request contains millions of voxels.
-        for z in range(0, size[0], 16):
-            for y in range(0, size[1], 32):
-                for x in range(0, size[2], 64):
-                    offset = (z, y, x)
-                    yield offset, tuple(min(n-o, step) for n, o, step in zip(size, offset, (16, 32, 64)))
 
-    def _plan(self, target, start, size, offset, block, tiles=True):
-        from . import _native
-        mapping = target['mapping']
-        # Only this small matrix/origin calculation uses Python double. Splitting
-        # before float32 preserves e.g. the subvoxel part of 2**26 + .25.
-        origin = mapping.apply(tuple(reversed(start)))
-        origin = tuple(reversed(origin))
-        base = tuple(math.floor(v) if not (target['plane'] and a == 0) else 0 for a, v in enumerate(origin))
-        local = tuple(v-b for v, b in zip(origin, base))
-        axes = tuple(mapping.linear[a][b] for a in (2, 1, 0) for b in (2, 1, 0))
-        limits = (1, 32, 32) if target['plane'] else (16, 16, 16)
-        tile = tuple(max(1, min(extent, limit)) for extent, limit in zip(target['shape'], limits))
-        key = (target['shape'], block, size, offset, base, local, axes, tile,
-               target['channels'], target['order'], target['plane'], tiles)
-        plan = self._plans.get(key)
-        if plan is None:
-            plan = _native.AlignedPlan(*key)
-            self._plans.put(key, plan, plan.nbytes)
-        return plan, tile
 
-    def _empty(self, shape, dtype):
-        import numpy as np
-        from . import _native
-        if self.backend == 'cpu':
-            return np.empty(shape, dtype=dtype)
-        return _native._aligned_empty(math.prod(shape), dtype.kind, dtype.itemsize, self.device)
 
-    @staticmethod
-    def _bytes(array):
-        import numpy as np
-        return array.reshape(-1).view(np.uint8)
 
-    def _tile_inputs(self, target, plan, tile):
-        from . import _native
-        reader = target['reader']
-        starts = [tuple(p) for p in plan.starts()]
-        tile_bytes = math.prod(tile)*target['channels']*target['dtype'].itemsize
-        # Source results, canonical copies, and CUDA tiles can overlap.
-        working = len(starts)*tile_bytes*3
-        if working > self._work_bytes:
-            return None
-        self._peak_work = max(self._peak_work, working)
-        inputs, missing, positions = [], [], []
-        # Selected output values are shared only when the reader/selection matches.
-        for start in starts:
-            key = (target['storage_key'], start, tile)
-            value = self._tiles.get(key)
-            inputs.append(value)
-            if value is None:
-                missing.append((start[1:] if target['plane'] else start, tile[1:] if target['plane'] else tile))
-                positions.append(len(inputs)-1)
-        arrays = reader.read_many(missing) if missing else []
-        self._tile_reads += len(arrays)
-        for position, array in zip(positions, arrays):
-            array = self._canonical(array, reader)
-            value = array
-            if self.backend == 'cuda':
-                value = _native._cuda_upload(array, self.device)
-                self._uploads += array.nbytes
-            inputs[position] = value
-            self._tiles.put((target['storage_key'], starts[position], tile), value, tile_bytes)
-        return inputs
 
-    def _execute(self, target, start, size, offset, block, output, valid):
-        import numpy as np
-        from . import _native
-        plan, tile = self._plan(target, start, size, offset, block)
-        inputs = self._tile_inputs(target, plan, tile)
-        if inputs is None:
-            axis = max(range(3), key=lambda a: block[a])
-            if block[axis] <= 1:
-                raise MemoryError(f"{target['source'].id}: one sampling stencil exceeds sampling_work_bytes")
-            left = list(block); left[axis] //= 2
-            right = list(block); right[axis] -= left[axis]
-            after = list(offset); after[axis] += left[axis]
-            self._execute(target, start, size, offset, tuple(left), output, valid)
-            self._execute(target, start, size, tuple(after), tuple(right), output, valid)
-            return
-        dtype = target['native_dtype']
-        fill = np.array([target['reader'].fill_value], dtype=dtype).view(np.uint8)
-        if self.backend == 'cpu':
-            plan.cpu([self._bytes(a) for a in inputs], fill, dtype.kind, dtype.itemsize, self._bytes(output), self._bytes(valid), target['native_field'])
-        else:
-            _native._aligned_cuda(plan, inputs, fill, dtype.kind, dtype.itemsize, output, valid, target['native_field'])
 
-    def _cuda_blocks(self, target, start, size, output, valid):
-        import numpy as np
-        from . import _native
-        dtype = target['native_dtype']
-        fill = np.array([target['reader'].fill_value], dtype=dtype).view(np.uint8)
-        plans, inputs, working = [], [], 0
 
-        def flush():
-            if plans:
-                _native._aligned_cuda_many(plans, inputs, fill, dtype.kind, dtype.itemsize,
-                                           output, valid, target['native_field'])
-                plans.clear()
-                inputs.clear()
-
-        for offset, block in self._blocks(size):
-            plan, tile = self._plan(target, start, size, offset, block)
-            needed = len(plan.starts()) * math.prod(tile) * target['channels'] * dtype.itemsize * 3
-            if needed + working > self._work_bytes or len(plans) == 64:
-                flush()
-                working = 0
-            tiles = self._tile_inputs(target, plan, tile)
-            if tiles is None:
-                self._execute(target, start, size, offset, block, output, valid)
-            else:
-                plans.append(plan)
-                inputs.append(tiles)
-                working += needed
-                self._peak_work = max(self._peak_work, working)
-        flush()
-
-    def _sample_many(self, target, regions):
-        import numpy as np
-        from . import _native
-        reader = target['reader']
-        arrays = None
-        if target['direct']:
-            shift = tuple(reversed(tuple(int(v) for v in target['mapping'].translation)))
-            arrays = reader.read_many([(tuple(s+d for s, d in zip(start, shift)), size) for start, size in regions])
-        affine_arrays = None
-        if (self.backend == 'cpu' and not target['direct'] and not target['plane']
-                and target['dtype'].name == 'uint8' and reader.axes == ('z', 'y', 'x')
-                and reader.source.encoding is None and reader._is_zarr
-                and reader.fill_value == reader._backend.fill_value):
-            grids = [(size, tuple(reversed(target['mapping'].apply(tuple(reversed(start))))),
-                      tuple(tuple(target['mapping'].linear[a][b] for b in (2, 1, 0)) for a in (2, 1, 0)))
-                     for start, size in regions]
-            if all(0 <= v <= 2**30 for _, origin, _ in grids for v in origin):
-                affine_arrays = reader._backend.reader.read_affine_many(grids, order=target['order'])
-        results = []
-        for index, (start, size) in enumerate(regions):
-            dtype = target['native_dtype'] if target['direct'] or not target['order'] else np.dtype('float32')
-            if target['metadata'] is not None:
-                dtype = np.dtype('float32')
-            shape = (target['channels'], *size)
-            valid = self._empty((1, *size), np.dtype('bool'))
-            if arrays is not None:
-                output = self._canonical(arrays[index], reader).astype(dtype, copy=False)
-                if self.backend == 'cuda':
-                    self._uploads += output.nbytes
-                    output = _native._cuda_upload(output, self.device)
-                at = tuple(s+d for s, d in zip(start, shift))
-                if self.backend == 'cpu':
-                    valid.fill(False)
-                    bounds = tuple(slice(max(0, -s), max(0, min(n, extent-s)))
-                                   for s, n, extent in zip(at, size, target['shape']))
-                    valid[(0, *bounds)] = True
-                else:
-                    _native._aligned_box_valid_cuda(target['shape'], at, size, valid)
-
-            elif affine_arrays is not None:
-                output = affine_arrays[index].reshape(shape)
-                for offset, block in self._blocks(size):
-                    plan, _ = self._plan(target, start, size, offset, block, False)
-                    plan.valid_cpu(self._bytes(valid))
-            else:
-                output = self._empty(shape, dtype)
-                if self.backend == 'cuda':
-                    self._cuda_blocks(target, start, size, output, valid)
-                else:
-                    for offset, block in self._blocks(size):
-                        self._execute(target, start, size, offset, block, output, valid)
-            if target['field'] is not None and (arrays is not None or affine_arrays is not None):
-                if self.backend == 'cpu':
-                    _native._aligned_field_cpu(self._bytes(output), self._bytes(valid), *target['field'])
-                else:
-                    _native._aligned_field_cuda(output, valid, *target['field'])
-            if self.backend == 'cuda':
-                from .cuda import DeviceArray
-                output = DeviceArray(output, shape, dtype, self.device)
-                valid = DeviceArray(valid, (1, *size), np.bool_, self.device)
-            elif not target['order']:
-                output = output.astype(target['dtype'], copy=False)
-            results.append((output, valid))
-        return results
 
     @property
     def shape(self):
@@ -575,55 +292,11 @@ class SampleReader:
                         result.masks[name][mask] = array
             return results
 
-    def stats(self):
-        self._ready()
-        return dict(tile_cache_bytes=self._tiles.bytes, tile_cache_hits=self._tiles.hits,
-                    plan_cache_bytes=self._plans.bytes, plan_cache_hits=self._plans.hits,
-                    tile_reads=self._tile_reads, uploaded_bytes=self._uploads, peak_tile_work_bytes=self._peak_work,
-                    sources={name: target['reader'].stats() for name, target in self._targets.items()})
 
-    def close(self):
-        if getattr(self, '_closed', True):
-            return
-        if self._pid != os.getpid() and not getattr(self, '_lazy', False):
-            _INHERITED.append((self._opened, self._options, self._tiles, self._plans))
-            self._closed = True
-            return
-        if getattr(self, '_lazy', False):
-            self._closed = True
-            return
-        with self._lock:
-            if self._closed:
-                return
-            for reader in self._opened:
-                reader.close()
-            self._opened.clear()
-            self._tiles.items.clear()
-            self._plans.items.clear()
-            if self._own_decoded:
-                self._options['decoded_cache'].clear()
-            if self._own_memory:
-                self._options['memory_cache'].clear()
-            self._closed = True
 
-    def __enter__(self):
-        self._ready()
-        return self
 
-    def __exit__(self, *exc):
-        self.close()
 
-    def __getstate__(self):
-        if self.backend == 'cuda':
-            raise TypeError('CUDA sample readers cannot be pickled')
-        if self._closed:
-            raise ValueError('sample reader is closed')
-        return self._configuration
 
-    def __setstate__(self, state):
-        self._configuration = state
-        self.backend = state[2]
-        self._closed, self._lazy, self._pid = False, True, os.getpid()
 
     def _restore(self, state):
         reference, targets, backend, catalog, limits, device, options = state

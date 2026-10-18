@@ -1,134 +1,71 @@
-"""``vc-reader`` command line: browse the open-data catalog.
-
-    vc-reader samples [QUERY]
-    vc-reader volumes SAMPLE [--resolution UM] [--energy KEV] [--scan ID]
-    vc-reader labels SAMPLE (--volume ID | --resolution UM [--energy KEV] [--scan ID]) [--um UM] [--direct-only]
-"""
-
-from __future__ import annotations
-
+"""Browse scrolls, direct relationships, and CT resolution candidates."""
 import argparse
 import sys
-from typing import Sequence
 
 from ._fetch import DEFAULT_METADATA_URL
-from .catalog import Catalog, Sample
+from .catalog import Catalog, DEFAULT_RESOLUTION_REL_TOL
+from .browsing import ScrollSource
 from .errors import VcReaderError
 
 
-def _table(rows: list[list[str]]) -> str:
-    if not rows:
-        return ""
-    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
-    return "\n".join("  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip() for r in rows)
+def _table(rows):
+    rows = [[str(c) if c is not None else '-' for c in row] for row in rows]
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+    return '\n'.join('  '.join(c.ljust(w) for c, w in zip(row, widths)).rstrip() for row in rows)
 
 
-def _fmt(x: float | None) -> str:
-    return "-" if x is None else f"{x:g}"
-
-
-def _cmd_samples(cat: Catalog, args: argparse.Namespace) -> None:
-    rows = [["sample", "type", "name", "volumes", "segments", "ink-label sets"]]
-    for s in cat.find_samples(args.query):
-        name = ", ".join(n for n in (s.display_name, *s.aliases) if n)
-        rows.append([s.id, s.type or "-", name or "-", str(len(s.volumes)), str(len(s.segments)), str(len(s.ink_labels()))])
-    print(_table(rows))
-
-
-def _cmd_volumes(cat: Catalog, args: argparse.Namespace) -> None:
-    sample = cat.sample(args.sample)
-    vols = sample.find_volumes(
-        resolution=args.resolution, energy_kev=args.energy, scan=args.scan, include_superseded=True
-    )
-    rows = [["volume", "um", "keV", "scan", "scan name", "shape zyx", "license", "segments", "labels on", "notes"]]
-    for v in vols:
-        notes = []
-        if v.is_superseded:
-            notes.append(f"superseded by {v.superseded_by_id}")
-        if v.is_secondary:
-            notes.append("secondary")
-        rows.append(
-            [
-                v.long_id or v.id,
-                _fmt(v.pixel_size_um),
-                _fmt(v.energy_kev),
-                v.scan_id or "-",
-                (v.scan.name if v.scan else None) or "-",
-                "x".join(map(str, v.shape_zyx)) if v.shape_zyx else "-",
-                v.license.name if v.license else "-",
-                str(len(v.segments())),
-                str(len(sample.ink_labels(target_volume=v))),
-                "; ".join(notes),
-            ]
-        )
-    print(_table(rows))
-
-
-def _pick_volume(sample: Sample, args: argparse.Namespace):
-    if args.volume:
-        return sample.volume(args.volume)
-    return sample.volume(resolution=args.resolution, energy_kev=args.energy, scan=args.scan)
-
-
-def _cmd_labels(cat: Catalog, args: argparse.Namespace) -> None:
-    sample = cat.sample(args.sample)
-    vol = _pick_volume(sample, args)
-    lvl = vol.level(um=args.um) if args.um is not None else vol.level(0)
-    print(f"{sample.id} / {vol.long_id}  level {lvl.level} ({_fmt(lvl.voxel_size_um)} um)  {vol.url()}")
-    rows = [["segment", "label set", "relation", "labels on", "registration", "coverage", "url"]]
-    for m in vol.ink_labels(mappable=not args.direct_only):
-        rows.append(
-            [
-                m.segment.long_id or m.segment.id,
-                m.labels.label_set or "-",
-                m.relation,
-                m.labels.target_volume_id,
-                m.labels.registration or "-",
-                f"{m.coverage.overlap_ratio:.3f}" if m.coverage else "-",
-                m.labels.url() or "-",
-            ]
-        )
-    print(_table(rows))
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="vc-reader", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--metadata", default=DEFAULT_METADATA_URL, help="metadata.json URL or local path")
-    p.add_argument("--refresh", action="store_true", help="revalidate the cached metadata.json now")
-    sub = p.add_subparsers(dest="command", required=True)
-
-    sp = sub.add_parser("samples", help="list samples")
-    sp.add_argument("query", nargs="?")
-    sp.set_defaults(func=_cmd_samples)
-
-    sp = sub.add_parser("volumes", help="list a sample's volumes")
-    sp.add_argument("sample")
-    sp.add_argument("--resolution", type=float, help="level-0 voxel size in um")
-    sp.add_argument("--energy", type=float, help="X-ray energy in keV")
-    sp.add_argument("--scan", help="scan id, long id or name")
-    sp.set_defaults(func=_cmd_volumes)
-
-    sp = sub.add_parser("labels", help="ink labels on, or mappable onto, a volume")
-    sp.add_argument("sample")
-    sp.add_argument("--volume", help="volume id or long id")
-    sp.add_argument("--resolution", type=float, help="level-0 voxel size in um")
-    sp.add_argument("--energy", type=float, help="X-ray energy in keV")
-    sp.add_argument("--scan", help="scan id, long id or name")
-    sp.add_argument("--um", type=float, help="working scale in um (selects the pyramid level)")
-    sp.add_argument("--direct-only", action="store_true", help="only labels published on this volume")
-    sp.set_defaults(func=_cmd_labels)
-
-    args = p.parse_args(argv)
-    if args.command == "labels" and not (args.volume or args.resolution or args.scan):
-        p.error("labels: pass --volume, --resolution or --scan")
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog='vc-reader', description=__doc__)
+    parser.add_argument('--metadata', default=DEFAULT_METADATA_URL)
+    parser.add_argument('--refresh', action='store_true')
+    commands = parser.add_subparsers(dest='command', required=True)
+    samples = commands.add_parser('samples', help='list scrolls and fragments')
+    samples.add_argument('--type', choices=('scroll', 'fragment'))
+    scrolls = commands.add_parser('scrolls', help='list scrolls')
+    for name in ('volumes', 'labels', 'segments', 'renders', 'representations'):
+        p = commands.add_parser(name, help=f'list directly associated {name}')
+        p.add_argument('scroll')
+        p.add_argument('--volume')
+        p.add_argument('--include-superseded', action='store_true')
+        if name == 'labels':
+            p.add_argument('--label-set')
+        if name == 'volumes':
+            p.add_argument('--resolution', type=float, help='native or pyramid resolution in micrometers')
+            p.add_argument('--rel-tol', type=float, default=DEFAULT_RESOLUTION_REL_TOL)
+            p.add_argument('--resolve', action='store_true', help='verify candidates against storage headers')
+    args = parser.parse_args(argv)
     try:
-        cat = Catalog.load(args.metadata, refresh=args.refresh)
-        args.func(cat, args)
-    except VcReaderError as exc:
-        print(f"vc-reader: {exc}", file=sys.stderr)
+        catalog = Catalog.load(args.metadata, refresh=args.refresh)
+        if args.command in ('samples', 'scrolls'):
+            values = catalog.scrolls if args.command == 'scrolls' else catalog.samples
+            if getattr(args, 'type', None):
+                values = values.filter(type=args.type)
+            rows = [['sample', 'type', 'volumes', 'segments', 'labels']]
+            rows.extend([s.id, s.type, len(s.volumes), len(s.segments), len(s.labels)] for s in values)
+        else:
+            scroll = ScrollSource(args.scroll, args.volume, catalog=catalog)
+            values = getattr(scroll, args.command).filter(include_superseded=args.include_superseded)
+            if args.command == 'volumes':
+                if args.resolution is not None:
+                    values = values.at_resolution(args.resolution, rel_tol=args.rel_tol)
+                    if args.resolve:
+                        values = [v.resolve() for v in values]
+                    rows = [['scroll', 'volume', 'level', 'estimated um', 'verified']]
+                    rows.extend([v.scroll.id, v.volume.id, v.level, v.estimated_resolution_um, v.verified] for v in values)
+                else:
+                    rows = [['volume', 'native um', 'labels', 'segments']]
+                    rows.extend([v.id, v.pixel_size_um, len(v.labels), len(v.segments)] for v in values)
+            elif args.command == 'segments':
+                rows = [['segment', 'labels', 'renders']]
+                rows.extend([s.id, len(s.labels), len(s.renders)] for s in values)
+            else:
+                if args.command == 'labels' and args.label_set:
+                    values = values.filter(label_set=args.label_set)
+                rows = [['id', 'kind', 'native volume', 'segment', 'label set', 'location']]
+                rows.extend([a.id, a.artifact_kind, a.volume.id if a.volume else None,
+                             a.segment.id if a.segment else None, a.label_set, a.source.storage.location] for a in values)
+        print(_table(rows))
+    except (VcReaderError, ValueError, OSError) as error:
+        print(f'vc-reader: {error}', file=sys.stderr)
         return 1
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
