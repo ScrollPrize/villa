@@ -7,6 +7,7 @@ namespace vc3d::keybinds {
 namespace {
 constexpr const char* kSectionFileMenu = "File Menu";
 constexpr const char* kSectionViewMenu = "View Menu";
+constexpr const char* kSectionHelpMenu = "Help Menu";
 constexpr const char* kSectionViewerControls = "Viewer Controls";
 constexpr const char* kSectionNavigation = "Navigation";
 constexpr const char* kSectionLasagnaWorkspace = "Lasagna Workspace";
@@ -48,6 +49,14 @@ QString formatSequence(const QKeySequence& sequence)
 
 namespace shortcuts {
 // Add new keybind definitions here, then list them in buildKeybindsHelpText() if they should be user-visible.
+const ShortcutDef CommandPalette{
+    "command_palette",
+    kSectionHelpMenu,
+    "Search and run commands (command palette)",
+    ShortcutKind::Text,
+    "Ctrl+K",
+    QKeySequence::Open
+};
 const ShortcutDef OpenLasagnaWorkspace{
     "open_lasagna_workspace",
     kSectionLasagnaWorkspace,
@@ -514,6 +523,8 @@ QKeySequence sequenceFor(const KeyPressDef& def)
 QString buildKeybindsHelpText()
 {
     const HelpEntry kHelpEntries[] = {
+        { kSectionHelpMenu, shortcuts::CommandPalette.description, HelpKeyType::Shortcut, &shortcuts::CommandPalette, nullptr, nullptr },
+
         { kSectionFileMenu, shortcuts::OpenVolpkg.description, HelpKeyType::Shortcut, &shortcuts::OpenVolpkg, nullptr, nullptr },
         { kSectionViewMenu, shortcuts::AxisAlignedSlices.description, HelpKeyType::Shortcut, &shortcuts::AxisAlignedSlices, nullptr, nullptr },
         { kSectionViewMenu, shortcuts::SurfaceNormals.description, HelpKeyType::Shortcut, &shortcuts::SurfaceNormals, nullptr, nullptr },

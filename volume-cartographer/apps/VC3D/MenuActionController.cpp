@@ -21,6 +21,7 @@
 #include "ui_VCMain.h"
 #include "Keybinds.hpp"
 #include "CommandCatalog.hpp"
+#include "CommandPalette.hpp"
 #include "FileWatcherService.hpp"
 #include "LineAnnotationController.hpp"
 
@@ -173,6 +174,13 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _exitAct = new QAction(qWindow->style()->standardIcon(QStyle::SP_DialogCloseButton), QObject::tr("E&xit..."), this);
     connect(_exitAct, &QAction::triggered, this, &MenuActionController::exitApplication);
 
+    _commandPaletteAct = new QAction(QObject::tr("Command &Palette..."), this);
+    _commandPaletteAct->setShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::CommandPalette));
+    // Application-wide like the window's other keyboard shortcuts, so the
+    // palette also opens from the workspaces and floating docks.
+    _commandPaletteAct->setShortcutContext(Qt::ApplicationShortcut);
+    connect(_commandPaletteAct, &QAction::triggered, this, &MenuActionController::showCommandPalette);
+
     _keybindsAct = new QAction(QObject::tr("&Keybinds"), this);
     connect(_keybindsAct, &QAction::triggered, this, &MenuActionController::showKeybindings);
 
@@ -285,6 +293,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _selectionMenu->addAction(_selectionClearAct);
 
     _helpMenu = new QMenu(QObject::tr("&Help"), qWindow);
+    _helpMenu->addAction(_commandPaletteAct);
     _helpMenu->addAction(_keybindsAct);
     _helpMenu->addAction(_aboutAct);
 
@@ -1430,8 +1439,16 @@ void MenuActionController::registerCommands()
     catalog->add(QStringLiteral("clear_selection"), _selectionClearAct, selection);
 
     const QString help = QObject::tr("Help");
+    catalog->add(QString::fromUtf8(vc3d::keybinds::shortcuts::CommandPalette.id), _commandPaletteAct, help);
     catalog->add(QStringLiteral("keybinds"), _keybindsAct, help);
     catalog->add(QStringLiteral("about"), _aboutAct, help);
+}
+
+void MenuActionController::showCommandPalette()
+{
+    if (_window) {
+        CommandPalette::open(_window->commandCatalog(), vc3d::settingsFilePath(), _window);
+    }
 }
 
 void MenuActionController::showKeybindings()

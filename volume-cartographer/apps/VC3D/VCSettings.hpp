@@ -292,6 +292,14 @@ namespace window {
     constexpr auto STATE_META_APP_VERSION = "mainWin/state_meta/app_version";
 }
 
+// -----------------------------------------------------------------------------
+// Command Palette
+// -----------------------------------------------------------------------------
+namespace command_palette {
+    // Ids of the commands last run from the palette, most recent first.
+    constexpr auto RECENT = "commandPalette/recent";
+}
+
 namespace line_annotation {
     constexpr auto GEOMETRY = "lineAnnotation/geometry";
     constexpr auto INITIAL_CENTERLINE_LENGTH_VX = "lineAnnotation/initial_centerline_length_vx";

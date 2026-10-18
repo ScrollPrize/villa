@@ -110,6 +110,7 @@ private slots:
     void attachRemoteZarr();
     void showSettingsDialog();
     void showAboutDialog();
+    void showCommandPalette();
     void showKeybindings();
     void resetSegmentationViews();
     void toggleConsoleOutput();
@@ -215,6 +216,7 @@ private:
     std::array<QAction*, kMaxRecentVolpkg> _recentActs{};
     QAction* _settingsAct{nullptr};
     QAction* _exitAct{nullptr};
+    QAction* _commandPaletteAct{nullptr};
     QAction* _keybindsAct{nullptr};
     QAction* _aboutAct{nullptr};
     QAction* _resetViewsAct{nullptr};

@@ -96,6 +96,28 @@ vc_register_ctest(command_catalog test_command_catalog)
 set_tests_properties(command_catalog PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
+add_executable(test_command_palette
+    test_command_palette.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/CommandPalette.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/CommandPalette.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/CommandCatalog.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/CommandCatalog.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/Keybinds.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/Keybinds.hpp)
+set_target_properties(test_command_palette PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+# VCSettings.hpp includes a vc_core header.
+target_include_directories(test_command_palette PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D
+    ${PROJECT_SOURCE_DIR}/core/include)
+target_link_libraries(test_command_palette PRIVATE
+    Qt6::Core Qt6::Gui Qt6::Test Qt6::Widgets)
+add_test(NAME command_palette COMMAND test_command_palette)
+vc_register_test_target(test_command_palette)
+vc_register_ctest(command_palette test_command_palette)
+set_tests_properties(command_palette PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
 add_executable(test_surface_rotation_transform
     test_surface_rotation_transform.cpp)
 
