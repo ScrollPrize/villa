@@ -440,7 +440,7 @@ the second output.
 | `--overlap` | Inference overlap fraction in `[0,1)`, default `0.5`. |
 | `--stride` | Explicit pixel stride; overrides `--overlap`. |
 | `--blend-mode` | `auto`, `constant`, `gaussian`, or `hann`; default `auto` (constant without overlap, Hann otherwise). |
-| `--layer-start`, `--layer-end` | Half-open source-Z selection before centered depth cropping; negative indices count from the end. |
+| `--layer-start`, `--layer-end` | Half-open source-Z selection before centered depth cropping; negative indices count from the end. The window is clamped to the source depth, and if nothing is left of it (empty, inverted, or entirely out of range) the full depth is used instead and a warning is logged. |
 | `--batch-size` | Batch size per selected device, default `1`. |
 | `--direction` | `forward`, `reverse`, or `both`; default `forward`. |
 | `--amp-dtype` | `auto`, `default`, `fp16`, or `bf16`; `auto` reads checkpoint precision. |
