@@ -1523,3 +1523,15 @@ AGENTS_AGENT_MODE=1 .venv/bin/python benchmarks/bench_pipeline.py --suite pipeli
   --output docs/benchmarks/pipeline-box-hybrid.json
 ```
 
+
+## Aligned sampling
+
+`bench_sampling.py` compares direct and controlled affine crops of an existing
+real Zarr volume with low-level reads. Supply `--array`, `--start Z Y X`,
+`--native-dir`, and `--output`; `--size` defaults to 64 cubed. `bench_sampling_fields.py`
+measures real XYZ field values from the bundled fixture, re-encoded temporarily
+as CZYX TIFF without surface projection. Both use six fixed requests, two warmup
+passes and ten measured passes, plus separate cold-reader, allocation and
+cProfile runs. Existing dependencies/builds are required; no installation occurs.
+
+See [measurement commands and results](../docs/aligned-sampling-benchmarks.md).

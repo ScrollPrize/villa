@@ -141,7 +141,7 @@ if(VC_READER_BUILD_READER)
     # NOMINSIZE: nanobind otherwise appends -Os, which costs the point samplers ~8%.
     nanobind_add_module(_native NB_STATIC NOMINSIZE cpp/bindings.cpp)
     if(VC_READER_ENABLE_CUDA)
-        target_sources(_native PRIVATE cpp/reader_cuda/kernels.cu)
+        target_sources(_native PRIVATE cpp/reader_cuda/kernels.cu cpp/aligned/kernels.cu)
         target_compile_definitions(_native PRIVATE VC_READER_CUDA=1)
         target_link_libraries(_native PRIVATE CUDA::cudart)
         set_target_properties(_native PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)

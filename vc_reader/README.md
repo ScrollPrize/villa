@@ -1456,3 +1456,15 @@ A.SurfacePerturb(blobs=3, amplitude=1, points_affected=100, p=1)
 2D-only companion: synthetic coordinate surface with CT-derived height. Preview is displacement magnitude, not an anatomical surface.
 
 </details>
+
+## Aligned source sampling
+
+Use `vc_reader.sampling.open_sample(reference, targets, backend="cpu")` to read
+registered labels and representations into a selected volume grid. Results
+contain channel-first data, per-target geometric validity, and separate source
+masks. CPU and CUDA sampling support integer labels, multichannel arrays,
+embedded slices, vectors, normals, and coordinate fields.
+
+See [aligned sampling](docs/aligned-sampling.md) for registration, value-frame,
+cache, worker, and build contracts, and [measurements](docs/aligned-sampling-benchmarks.md)
+for reproducible real-input benchmarks.

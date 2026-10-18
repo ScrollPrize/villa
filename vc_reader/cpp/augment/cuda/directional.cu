@@ -1,4 +1,5 @@
 #include "geometry.cuh"
+#include "../../directional_math.hpp"
 #include <cub/device/device_scan.cuh>
 // Device counterparts of spatial.hpp's backward/jacobian/forward mapping for
 // directional fields and sparse targets. Failures set Session::geometry_status.
@@ -73,15 +74,8 @@ __device__ bool invert(double* a, double* out, int d) {
     }
     return true;
 }
-__device__ void apply_matrix(const double* m, double* v, int d) {
-    double out[3]{};
-    for (int i = 0; i < d; ++i) for (int j = 0; j < d; ++j) out[i] += m[i*d+j]*v[j];
-    for (int i = 0; i < d; ++i) v[i] = out[i];
-}
-__device__ void unit(double* v, int d) {
-    double norm = 0; for (int i = 0; i < d; ++i) norm += v[i]*v[i];
-    if (norm > 0) for (int i = 0; i < d; ++i) v[i] /= sqrt(norm);
-}
+__device__ void apply_matrix(const double* m, double* v, int d) { vcr::direction::apply(m,v,d); }
+__device__ void unit(double* v, int d) { vcr::direction::unit(v,d); }
 // Output position of an input-frame point: Newton iteration on backward().
 __device__ bool forward(const Transform& t, double* point) {
     const int d = t.grid.dim; double source[3]{point[0],point[1],point[2]};

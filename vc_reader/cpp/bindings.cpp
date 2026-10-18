@@ -64,6 +64,8 @@ static std::vector<std::size_t> output_counts(const std::vector<vcr::Index>& sha
     return counts;
 }
 
+#include "aligned/bindings.hpp"
+
 NB_MODULE(_native, m)
 {
     m.doc() = "Native zarr v2 read path: local and HTTP chunks, disk cache layers, memory cache.";
@@ -72,6 +74,7 @@ NB_MODULE(_native, m)
 #else
     m.def("reader_cuda_available", [] { return false; });
 #endif
+    vcr::aligned::bind(m);
     // Engines inherited by a forked process are deliberately kept alive and never
     // destroyed there (their threads do not exist in the child), so they are
     // still referenced at exit; that is not a leak worth reporting.

@@ -2,6 +2,7 @@
 #include "resize_plan.hpp"
 #include "intensity.hpp"
 #include "elastic.hpp"
+#include "../directional_math.hpp"
 
 namespace vcr::augment {
 using Matrix = std::vector<double>;
@@ -26,7 +27,9 @@ inline Matrix inverse(Matrix a, std::size_t d) {
 }
 using Point = std::array<double, 3>;
 inline Point matvec(const Matrix& m, Point v, std::size_t d) {
-    Point out{}; for (std::size_t i = 0; i < d; ++i) for (std::size_t j = 0; j < d; ++j) out[i] += m[i * d + j] * v[j]; return out;
+    vcr::direction::apply(m.data(), v.data(), int(d));
+    for (std::size_t i=0; i<3; ++i) if (i>=d) v[i]=0;
+    return v;
 }
 inline std::int64_t nearest_index(double q, int mode) {
     auto lo = std::int64_t(std::floor(q)); auto fraction = q - lo;
@@ -310,7 +313,7 @@ inline void apply_geometry_with(Sample& sample, const Parameters& p, Resample&& 
                 point = role == Role::Points ? forward(p, point) : matvec(inverse(p.matrix, d), point, d);
                 bool inside = true; for (std::size_t j = 0; j < d; ++j) inside &= point[j] >= 0 && point[j] <= double(p.shape[j] - 1);
                 if (role == Role::Points && !inside) { require(t.outside != "error", name + ": point outside output"); if (t.outside == "drop") continue; }
-                if (role == Role::Vectors && t.normalize) { double norm = 0; for (std::size_t j = 0; j < d; ++j) norm += point[j] * point[j]; if (norm > 0) for (auto& v : point) v /= std::sqrt(norm); }
+                if (role == Role::Vectors && t.normalize) { vcr::direction::unit(point.data(), int(d)); }
                 for (std::size_t j = 0; j < d; ++j) out.set(kept * d + j, point[axis(t.components[j], d)]);
                 ++kept;
             }
@@ -325,7 +328,7 @@ inline void apply_geometry_with(Sample& sample, const Parameters& p, Resample&& 
                     auto j = jacobian(p, pos);
                     if (role == Role::NormalField) { Matrix transpose(d * d); for (std::size_t x = 0; x < d; ++x) for (std::size_t y = 0; y < d; ++y) transpose[x * d + y] = j[y * d + x]; v = matvec(transpose, v, d); }
                     else v = matvec(inverse(j, d), v, d);
-                    if (role == Role::NormalField || t.normalize) { double norm = 0; for (std::size_t j = 0; j < d; ++j) norm += v[j] * v[j]; if (norm > 0) for (auto& x : v) x /= std::sqrt(norm); }
+                    if (role == Role::NormalField || t.normalize) { vcr::direction::unit(v.data(), int(d)); }
                 }
                 for (std::size_t j = 0; j < d; ++j) out.set(j * output.size + i, v[axis(t.components[j], d)]);
             }
