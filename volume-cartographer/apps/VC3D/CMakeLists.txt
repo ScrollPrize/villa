@@ -20,6 +20,10 @@ set(srcs
     CWindowContextMenu.cpp
     StatusDockPanelHost.cpp
     StatusDockPanelHost.hpp
+    SessionRecovery.cpp
+    SessionRecovery.hpp
+    SessionRecoveryDialog.cpp
+    SessionRecoveryDialog.hpp
     RenderBenchRecorder.cpp
     RenderBenchRecorder.hpp
     RenderBenchReplay.cpp

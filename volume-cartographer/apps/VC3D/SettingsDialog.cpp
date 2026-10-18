@@ -106,6 +106,8 @@ SettingsDialog::SettingsDialog(std::shared_ptr<VolumePkg> volumePackage,
         spinSegmentBackupCount->setValue(
             settings.value(backup::SEGMENT_COUNT, backup::SEGMENT_COUNT_DEFAULT).toInt());
     }
+    chkSessionRecovery->setChecked(
+        settings.value(backup::SESSION_RECOVERY, backup::SESSION_RECOVERY_DEFAULT).toBool());
 
     const bool automaticDownloads = settings.value(
         perf::REMOTE_DOWNLOAD_AUTOMATIC,
@@ -298,6 +300,7 @@ void SettingsDialog::accept()
         settings.setValue(backup::SEGMENT_COUNT, backupCount);
         QuadSurface::setBackupCount(backupCount);
     }
+    settings.setValue(backup::SESSION_RECOVERY, chkSessionRecovery->isChecked());
 
     QMessageBox::information(this, tr("Restart required"), tr("Note: Some settings only take effect once you restarted the app."));
 
