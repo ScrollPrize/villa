@@ -89,6 +89,7 @@ def main():
                   protocol='single resident float32 image; synchronous wall time; includes input preservation, validation, '
                            'field construction and transform; excludes upload, download and output destruction; rotated case order',
                   validation=validation, reference=str(args.reference) if args.reference else None, differences=differences,
+                  reference_replay='byte-identical' if args.reference else None,
                   results={name: dict(timing=summary(values), raw_ms=values) for name, values in times.items()})
     args.output.write_text(json.dumps(report, indent=2)+'\n')
     for name, result in report['results'].items():
