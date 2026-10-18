@@ -3,8 +3,9 @@
 `vesuvius.label_topology_audit` measures the voxel-level topology of 3D surface
 label volumes (0 = background, 1 = surface, 2 = ignore; values configurable with
 `--surface-value` / `--ignore-value`). Use it on label crops, refined labels or
-binarised predictions to see holes, cavities, fragments, fused sheets and
-thickness before training on or trusting them.
+binarised predictions to inspect holes, cavities, fragments, possible fused
+sheets and a thickness proxy before training on or trusting them. These are
+inspection signals, not verified physical defects or correct-winding judgments.
 
 Needs `connected-components-3d`, `scikit-image`, `scipy`, `tifffile` (the
 `models` extra); `matplotlib` only for `--plot`.
@@ -25,19 +26,27 @@ vesuvius.label_topology_audit --batch DATA_DIR --out audit_out
 ```
 
 Outputs: `<crop>.json` (full metrics), `aggregate.csv` (one row per crop),
-`ranked.csv` with `--batch` (crops with any finding, worst first, with a one-line
+`ranked.csv` with `--batch` (crops with topology/fusion/junction findings, worst first, with a one-line
 reason), `<crop>.delta.json` (`metric: [before, after]`) with `--after`,
 `<crop>.png` and `<crop>.holes.png` (three orthogonal slices per located hole,
 label green, ignore blue, hole red) with `--plot`, `<crop>.hole_mask.tif` with
 `--hole-masks`.
 
-`ranked.csv` sorts on interior holes, then cavities, fused components, junction
-clusters, and finally holes that touch a crop face.
+`ranked.csv` sorts on located interior plus unlocated holes, then cavities,
+possible fused components, junction clusters, and finally located crop-face holes.
+Unlocated holes may be near a crop face; their location is unknown. Tiny-fragment
+and thickness findings appear in JSON/aggregate CSV but do not determine ranking.
+
+Labels must be nonempty 3D arrays; singleton axes are supported. Images and
+before/after labels must have matching shapes and refer to the same voxel grid
+(the shape check cannot verify registration). `--erode` and `--min-piece` must
+be positive, surface and ignore values must differ, and `--fail-on` limits must
+be finite. A batch may leave reports for earlier valid crops if a later crop fails.
 
 ## Workflow: from a dataset to fixed crops
 
 `ranked.csv` works as a proofreading queue: look at the top rows first, and fix
-or drop those crops before training.
+or drop those crops only after inspecting the supporting label and CT evidence.
 
 ```bash
 # 1. audit the dataset, write hole tiles and hole masks
@@ -53,7 +62,8 @@ cp audit_out/sample_00340.hole_mask.tif fix_in/sample_00340/hole_mask.tif
 # (run from vesuvius/; add --fg-value if your surface value is not 1)
 python src/vesuvius/scripts/fix_holes.py --in-dir fix_in --ignore-value 2 --method 2d_hole_fill
 
-# 4. check that the fix removed the holes and added nothing else
+# 4. compare topology counts, then inspect added voxels against CT;
+#    this report alone does not establish that a repair is physically correct
 vesuvius.label_topology_audit --label DATA_DIR/labels/sample_00340.tif \
   --after fix_in/sample_00340/sample_00340_surf_2d_hole_fill.tif --out audit_out
 ```
@@ -69,8 +79,8 @@ vesuvius.label_topology_audit --label DATA_DIR/labels/sample_00340.tif \
 | `n_holes_located`, `holes` | holes found by location: background blobs that a 3-step closing fills and whose filling lowers b1 (centre, voxels, interior or crop face); wider holes are not located |
 | `b1_face`, `b1_interior`, `b1_unlocated` | `b1_total_big` split by location: `b1_face` is located holes centred within 6 voxels of a crop face, `b1_interior` is the rest, including `b1_unlocated` (holes too wide to locate) |
 | `b2_total_big` | Betti-2: enclosed cavities (a hollow shell is 1) |
-| `n_closed_big`, `n_closed_with_b1` | big components not touching the crop border or ignore voxels; only these have untruncated topology |
-| `thick_*` | sheet thickness in voxels (`2*EDT-1` at medial ridge voxels); `frac_ge_7` is the share at 7 voxels or more |
+| `n_closed_big`, `n_closed_with_b1` | big components not touching the crop border or ignore voxels; this does not establish physical correctness |
+| `thick_*` | thickness proxy in voxel units (`2*EDT-1` at medial ridge voxels, with background padding); truncated at crop faces and not calibrated physical thickness; `frac_ge_7` is the share at 7 voxels or more |
 | `n_fused_components`, `bridge_voxels` | components that split into several large pieces after `--erode` erosion; blind on 1-3 voxel sheets |
 | `n_junction_clusters` | clusters (20+ voxels) where the structure tensor is not planar: merged sheets or bridges |
 | `largest_component_frac` | share of foreground in the biggest component |
@@ -105,16 +115,17 @@ located; the other 77 are too wide for a 3-step closing. Each located hole is
 measured with the earlier holes already filled, so one loop is never counted
 twice.
 
-Spot check: 29 located holes from 20 flagged crops, plus 10 clean crops as
-controls. Each was shown as three orthogonal CT slices with the label overlaid.
-- 12 holes were clear label defects: a gap inside continuous papyrus, or a
+Provisional AI spot check: 29 located holes from 20 flagged crops, plus 10 clean
+crops as controls. Each was shown as three orthogonal CT slices with the label overlaid.
+- 12 holes were judged apparent label defects: a gap inside continuous papyrus, or a
   pocket inside two merged sheets labelled as one slab.
-- 0 matched a real tear in the papyrus.
+- 0 were judged to match a real tear in the papyrus.
 - 17 could not be judged. Most sat on a crop face (20 of the 29 holes are within
   5 voxels of one), which is why `ranked.csv` puts interior holes first.
-- All 10 clean controls followed the sheet.
+- All 10 clean controls were judged to follow the sheet.
 
-The judging was done at thumbnail resolution, so treat the counts as indicative.
+The judging was done by an AI at thumbnail resolution, not by an expert
+annotator. These counts do not establish precision or correct winding identity.
 
 ### Before/after with `fix_holes.py`
 
@@ -149,7 +160,8 @@ the tiles are small, so treat this as a warning sign rather than a measurement:
 | `close`, kernel 2 | 1 | 4 | 8 | 7 |
 | `close`, kernel 3 | 1 | 6 | 8 | 5 |
 
-Closing mostly fills the dark wedge between two sheets, which joins them. Run
+Provisional inspection suggests some closing additions fill an inter-sheet wedge
+and join sheets. Run
 `--after` and look at the added voxels on the CT before keeping any automatic
 fill. Most holes that were left unchanged looked like pockets between merged
 sheets.

@@ -3,7 +3,7 @@
 Label convention (Kaggle/HF ``surfaces/kaggle``): 0 = background, 1 = surface,
 2 = ignore/unlabeled. Both values are configurable. Ignore voxels are never
 foreground; components touching them (or the crop border) are reported as
-``open`` because their topology is truncated rather than wrong.
+``open`` because their topology may be truncated; this is not a defect verdict.
 
 Per crop it measures:
   * connected components (26-connectivity): count, size histogram, tiny fragments
@@ -57,7 +57,7 @@ THICK = 7  # voxels; ridge thickness at or above this is flagged
 SIZE_BINS = [1, 10, 100, 1_000, 10_000, 100_000, 10**9]
 EDGE = 6  # voxels; a located hole centred closer than this to a crop face is not interior
 # ranked.csv order: most severe first; each entry is (metric, phrase for the reason column)
-SEVERITY = [("b1_interior", "interior holes"), ("b2_total_big", "cavities"),
+SEVERITY = [("b1_interior", "interior or unlocated holes"), ("b2_total_big", "cavities"),
             ("n_fused_components", "fused components"), ("n_junction_clusters", "junction clusters"),
             ("b1_total_big", "holes incl. crop faces")]
 
@@ -127,9 +127,12 @@ def locate_holes(mask: np.ndarray, b1: int, blocked: np.ndarray | None = None, c
 
 
 def thickness_stats(fg: np.ndarray):
-    """Thickness (voxels) sampled on medial-ridge voxels = local maxima of the EDT."""
+    """Thickness proxy on medial ridges; crop faces are treated as background boundaries.
+
+    Where material extends out of the crop, this is a truncated lower-bound estimate.
+    """
     _, ndi, _ = _deps()
-    edt = ndi.distance_transform_edt(fg)
+    edt = ndi.distance_transform_edt(np.pad(fg, 1))[1:-1, 1:-1, 1:-1]
     ridge = fg & (edt >= ndi.maximum_filter(edt, size=3)) & (edt > 0)
     t = 2 * edt[ridge] - 1
     if t.size == 0:
@@ -164,7 +167,9 @@ def fused_sheets(fg, comp, erode, min_piece):
 def junction_voxels(fg: np.ndarray, thresh: float = 0.3) -> np.ndarray:
     """Non-planar spots: structure tensor of the smoothed mask has a big 2nd eigenvalue."""
     _, ndi, _ = _deps()
-    g = np.gradient(ndi.gaussian_filter(fg.astype(np.float32), 1.5))
+    smoothed = ndi.gaussian_filter(fg.astype(np.float32), 1.5)
+    g = [np.gradient(smoothed, axis=ax) if fg.shape[ax] > 1 else np.zeros_like(smoothed)
+         for ax in range(3)]
     T = np.empty(fg.shape + (3, 3), np.float32)
     for i in range(3):
         for j in range(i, 3):
@@ -179,6 +184,12 @@ def junction_voxels(fg: np.ndarray, thresh: float = 0.3) -> np.ndarray:
 
 def audit(label, erode=1, min_piece=500, surface_value=1, ignore_value=2):
     """Return (metrics dict, flag masks dict) for one label volume."""
+    if label.ndim != 3 or label.size == 0:
+        raise ValueError(f"expected a nonempty 3D label volume, got shape {label.shape}")
+    if erode < 1 or min_piece < 1:
+        raise ValueError("--erode and --min-piece must be positive integers")
+    if ignore_value is not None and surface_value == ignore_value:
+        raise ValueError("--surface-value and --ignore-value must differ")
     cc3d, ndi, _ = _deps()
     ball = ndi.generate_binary_structure(3, 1)
     fg = label == surface_value
@@ -239,8 +250,8 @@ def audit(label, erode=1, min_piece=500, surface_value=1, ignore_value=2):
         "n_closed_with_b1": sum(r["b1"] > 0 for r in closed),
         "b2_total_big": int(sum(r["b2"] for r in big)),
         "n_holes_located": int(sum(h["fixes"] for h in holes)),
-        # b1_total_big = b1_face + b1_interior; b1_interior includes b1_unlocated, since holes
-        # too wide to locate are not crop-face slivers
+        # Legacy name: b1_interior includes unlocated holes, whose location is unknown.
+        # b1_total_big = b1_face + b1_interior; b1_interior includes b1_unlocated.
         "b1_face": int(sum(h["fixes"] for h in holes if not h["interior"])),
         "b1_unlocated": int(sum(r["b1"] for r in big) - sum(h["fixes"] for h in holes)),
         "b1_interior": int(sum(r["b1"] for r in big) - sum(h["fixes"] for h in holes if not h["interior"])),
@@ -343,6 +354,8 @@ def _parse_fail_on(specs: Sequence[str]) -> dict[str, float]:
             limits[key] = float(val)
         except ValueError:
             raise SystemExit(f"--fail-on limit must be a number: {spec!r}") from None
+        if not np.isfinite(limits[key]):
+            raise SystemExit(f"--fail-on limit must be finite: {spec!r}")
     return limits
 
 
@@ -395,21 +408,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         jobs = [(a.label, a.image, a.after)]
 
-    a.out.mkdir(parents=True, exist_ok=True)
     rows, failed = [], False
     for label_path, image_path, after_path in jobs:
         name = label_path.stem
         lab = tifffile.imread(label_path)
-        m, flags = audit(lab, a.erode, a.min_piece, a.surface_value, ignore)
+        after_lab = tifffile.imread(after_path) if after_path else None
+        if after_lab is not None and after_lab.shape != lab.shape:
+            ap.error(f"{name}: --after shape {after_lab.shape} differs from label shape {lab.shape}")
+        img = None
+        if a.plot and image_path is not None and Path(image_path).exists():
+            img = tifffile.imread(image_path)
+            if img.shape != lab.shape:
+                ap.error(f"{name}: image shape {img.shape} differs from label shape {lab.shape}")
+        try:
+            m, flags = audit(lab, a.erode, a.min_piece, a.surface_value, ignore)
+            if after_lab is not None:
+                m2, _ = audit(after_lab, a.erode, a.min_piece, a.surface_value, ignore)
+        except ValueError as exc:
+            ap.error(f"{name}: {exc}")
+        a.out.mkdir(parents=True, exist_ok=True)
         (a.out / f"{name}.json").write_text(json.dumps(m, indent=1))
         f = flat(m)
         rows.append({"crop": name, **f})
         print(name, json.dumps(f), flush=True)
         if a.plot:
-            if image_path is None or not Path(image_path).exists():
+            if img is None:
                 print(f"{name}: --plot skipped, no image", file=sys.stderr)
             else:
-                img = tifffile.imread(image_path)
                 overlay(img, lab, flags, a.out / f"{name}.png", a.surface_value)
                 if m["holes"]:
                     hole_tiles(img, lab, m["holes"], flags["hole"], a.out / f"{name}.holes.png",
@@ -417,7 +442,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         if a.hole_masks:
             tifffile.imwrite(a.out / f"{name}.hole_mask.tif", flags["hole"].astype(np.uint8))
         if after_path:
-            m2, _ = audit(tifffile.imread(after_path), a.erode, a.min_piece, a.surface_value, ignore)
             f2 = flat(m2)
             delta = {k: [f[k], f2[k]] for k in f}
             (a.out / f"{name}.delta.json").write_text(json.dumps(delta, indent=1))

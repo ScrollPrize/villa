@@ -150,7 +150,7 @@ def test_ranked_puts_interior_holes_first_and_drops_clean_crops():
             {"crop": "hole", **base, "b1_interior": 1, "b1_total_big": 1}]
     r = lta.ranked(rows)
     assert [x["crop"] for x in r] == ["hole", "junctions", "face_hole"]
-    assert r[0]["rank"] == 1 and r[0]["reason"] == "1 interior holes, 1 holes incl. crop faces"
+    assert r[0]["rank"] == 1 and r[0]["reason"] == "1 interior or unlocated holes, 1 holes incl. crop faces"
 
 
 def test_batch_writes_ranked_csv(tmp_path):
@@ -223,3 +223,67 @@ def test_cli_hole_masks_and_hole_tiles(tmp_path):
     mask = tifffile.imread(out / "lab.hole_mask.tif")
     assert mask.sum() == 9 * 2 and mask[18:20, 18:21, 18:21].all()
     assert (out / "lab.holes.png").exists()
+
+
+@pytest.mark.parametrize("limit", ["nan", "inf", "-inf"])
+def test_cli_rejects_nonfinite_limits_before_writing(tmp_path, limit):
+    out = tmp_path / "out"
+    with pytest.raises(SystemExit):
+        lta.main(["--label", str(tmp_path / "unused.tif"), "--out", str(out),
+                  "--fail-on", f"b1_total_big={limit}"])
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("extra", [["--erode", "0"], ["--erode", "-1"],
+                                   ["--min-piece", "0"], ["--ignore-value", "1"]])
+def test_cli_rejects_invalid_audit_options_before_writing(tmp_path, extra):
+    tifffile.imwrite(tmp_path / "label.tif", sheet())
+    out = tmp_path / "out"
+    with pytest.raises(SystemExit):
+        lta.main(["--label", str(tmp_path / "label.tif"), "--out", str(out), *extra])
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("paired_option", ["--after", "--image"])
+def test_cli_rejects_mismatched_volume_shapes_before_writing(tmp_path, paired_option):
+    tifffile.imwrite(tmp_path / "label.tif", sheet())
+    tifffile.imwrite(tmp_path / "mismatch.tif", sheet()[:20])
+    out = tmp_path / "out"
+    with pytest.raises(SystemExit):
+        lta.main(["--label", str(tmp_path / "label.tif"), "--out", str(out),
+                  paired_option, str(tmp_path / "mismatch.tif"), "--plot"])
+    assert not out.exists()
+
+
+def test_audit_rejects_2d_or_empty_input_with_clear_error():
+    for label in [np.zeros((20, 20), np.uint8), np.zeros((0, 20, 20), np.uint8)]:
+        with pytest.raises(ValueError, match="nonempty 3D"):
+            lta.audit(label)
+
+
+def test_singleton_axis_and_empty_foreground_are_supported():
+    label = np.ones((1, 20, 20), np.uint8)
+    metrics, _ = lta.audit(label)
+    assert metrics["n_components"] == 1
+    assert metrics["thickness"]["median"] == 1
+    metrics, _ = lta.audit(np.zeros((10, 10, 10), np.uint8))
+    assert metrics["n_components"] == metrics["b1_total_big"] == 0
+    assert metrics["thickness"] == {}
+
+
+def test_thickness_treats_all_crop_faces_as_truncated_boundaries():
+    # A full 10-voxel cube has no observed external background. Padding supplies a
+    # symmetric crop boundary; the lower-bound thickness must not exceed the crop.
+    stats, _, edt = lta.thickness_stats(np.ones((10, 10, 10), bool))
+    assert stats["max"] == 9
+    assert np.array_equal(edt, edt[::-1, ::-1, ::-1])
+
+
+def test_fusion_heuristic_flags_thick_lobes_joined_by_a_thin_bridge():
+    label = np.zeros((30, 30, 50), np.uint8)
+    label[8:22, 8:22, 4:18] = 1
+    label[8:22, 8:22, 32:46] = 1
+    label[14:16, 14:16, 18:32] = 1
+    metrics, _ = lta.audit(label)
+    assert metrics["n_components"] == metrics["n_fused_components"] == 1
+    assert metrics["fused_voxel_frac"] == 1
