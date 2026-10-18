@@ -216,6 +216,8 @@ set(srcs
     MenuActionController.hpp
     VolumeAttachmentController.cpp
     VolumeAttachmentController.hpp
+    ProjectAttachmentController.cpp
+    ProjectAttachmentController.hpp
     UnifiedBrowserDialog.cpp
     UnifiedBrowserDialog.hpp
     segmentation/SegmentationModule.cpp

@@ -1,6 +1,7 @@
 #include "MenuActionController.hpp"
 
 #include "VolumeAttachmentController.hpp"
+#include "ProjectAttachmentController.hpp"
 #include "VCSettings.hpp"
 #include "UnifiedBrowserDialog.hpp"
 #include "OpenDataCatalogWindow.hpp"
@@ -33,9 +34,7 @@
 #include "vc/core/util/Umbilicus.hpp"
 #include "vc/core/util/VolpkgConvert.hpp"
 #include "vc/core/types/Segmentation.hpp"
-#include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/lasagna/Dataset.hpp"
-#include "vc/lasagna/ProjectVolumes.hpp"
 
 #include <QAction>
 #include <QApplication>
@@ -75,8 +74,6 @@
 #include <QUrl>
 #include <QVBoxLayout>
 
-#include "utils/Json.hpp"
-
 #include <algorithm>
 #include <fstream>
 #include <filesystem>
@@ -99,11 +96,6 @@ struct MenuActionController::OpenDataOpenTaskResult {
     QString sampleId;
     qint64 tifxyzSegmentCount{0};
     bool freshProject{false};
-};
-
-struct MenuActionController::LasagnaAttachTaskResult {
-    std::vector<VolumePkg::PreparedVolumeAttachment> volumes;
-    QString error;
 };
 
 MenuActionController::MenuActionController(CWindow* window)
@@ -2047,7 +2039,7 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote, const QSt
         QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
         return;
     }
-    if (_lasagnaAttachmentInFlight) {
+    if (_window->_projectAttachmentController->lasagnaAttachmentInFlight()) {
         QMessageBox::information(_window, QObject::tr("Attachment in progress"), QObject::tr("A Lasagna manifest attachment is already in progress."));
         return;
     }
@@ -2079,110 +2071,27 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote, const QSt
         return;
     const bool fiberInference = role == QObject::tr("Fiber inference");
 
-    vc::lasagna::LasagnaDatasetOpenOptions openOptions;
-    bool needsRemoteCache = remote;
-    bool needsRemoteAuth = remote;
-    QString authLocation = location;
-    if (!remote) {
-        try {
-            const auto localManifest = std::filesystem::path(location.toStdString());
-            const auto parsed = vc::lasagna::LasagnaDatasetManifest::parseFile(localManifest);
-            const auto remoteGroup = std::find_if(parsed.groups.begin(), parsed.groups.end(), [](const auto& group) {
-                return vc::lasagna::isRemoteLasagnaLocation(group.relativeZarrKey);
-            });
-            if (remoteGroup != parsed.groups.end()) {
-                needsRemoteCache = true;
-                needsRemoteAuth = true;
-                authLocation = QString::fromStdString(remoteGroup->relativeZarrKey);
-            } else {
-                const auto markerPath = localManifest.parent_path() /
-                    vc::lasagna::kLasagnaRemoteMarker;
-                if (std::filesystem::is_regular_file(markerPath)) {
-                    const auto marker = utils::Json::parse_file(markerPath);
-                    const auto artifactUrl = marker.value(
-                        "artifact_url", std::string{});
-                    if (vc::lasagna::isRemoteLasagnaLocation(artifactUrl)) {
-                        needsRemoteAuth = true;
-                        authLocation = QString::fromStdString(artifactUrl);
-                    }
-                }
-            }
-        } catch (...) {
-            // The background loader reports manifest parse errors uniformly.
-        }
-    }
-    if (needsRemoteAuth || needsRemoteCache) {
-        auto* attachment = _window->_volumeAttachmentController.get();
-        if (!attachment) {
-            QMessageBox::warning(_window, QObject::tr("Attach failed"), QObject::tr("Remote attachment settings are unavailable."));
-            return;
-        }
-        QString authError;
-        if (!attachment->resolveRemoteAuth(authLocation, &openOptions.remoteAuth, &authError)) {
-            QMessageBox::warning(_window, QObject::tr("Attach failed"), authError);
-            return;
-        }
-    }
-    if (needsRemoteCache) {
-        openOptions.remoteCacheRoot = vc3d::remoteCachePathFs();
-    }
-
-    const auto targetPackage = _window->_state->vpkg();
-    const std::string persistedLocation = location.toStdString();
-    auto* watcher = new QFutureWatcher<LasagnaAttachTaskResult>(this);
-    connect(watcher, &QFutureWatcher<LasagnaAttachTaskResult>::finished, this, [this, watcher, targetPackage, persistedLocation, fiberInference]() {
-        auto task = watcher->result();
-        watcher->deleteLater();
-        _lasagnaAttachmentInFlight = false;
-        if (_attachLasagnaManifestAct)
-            _attachLasagnaManifestAct->setEnabled(true);
-        if (_attachRemoteLasagnaManifestAct)
-            _attachRemoteLasagnaManifestAct->setEnabled(true);
-        if (!task.error.isEmpty()) {
-            QMessageBox::warning(_window, QObject::tr("Attach Lasagna failed"), task.error);
-            return;
-        }
-        if (!_window || !_window->_state || _window->_state->vpkg() != targetPackage) {
-            QMessageBox::warning(_window, QObject::tr("Attach Lasagna failed"), QObject::tr("The open project changed while the manifest was loading."));
-            return;
-        }
-        try {
-            const auto result = targetPackage->attachPreparedLasagnaDataset(
-                persistedLocation, {}, fiberInference, task.volumes);
-            if (result == VolumePkg::AttachLasagnaResult::VolumeIdConflict) {
-                QMessageBox::warning(_window, QObject::tr("Attach Lasagna failed"), QObject::tr("A Lasagna volume conflicts with an existing volume id."));
+    QPointer<MenuActionController> guard(this);
+    QString startError;
+    const bool started = _window->_projectAttachmentController->startLasagnaAttachment(
+        location, fiberInference,
+        [guard](const ProjectAttachmentOutcome& outcome) {
+            if (!guard)
                 return;
-            }
-            _window->refreshCurrentVolumePackageUi(QString(), true);
-        } catch (const std::exception& error) {
-            QMessageBox::warning(_window, QObject::tr("Attach Lasagna failed"), QString::fromUtf8(error.what()));
-        }
-    });
-
-    _lasagnaAttachmentInFlight = true;
+            if (guard->_attachLasagnaManifestAct)
+                guard->_attachLasagnaManifestAct->setEnabled(true);
+            if (guard->_attachRemoteLasagnaManifestAct)
+                guard->_attachRemoteLasagnaManifestAct->setEnabled(true);
+            if (!outcome.success)
+                QMessageBox::warning(guard->_window, QObject::tr("Attach Lasagna failed"), outcome.error);
+        },
+        &startError);
+    if (!started) {
+        QMessageBox::warning(_window, QObject::tr("Attach failed"), startError);
+        return;
+    }
     _attachLasagnaManifestAct->setEnabled(false);
     _attachRemoteLasagnaManifestAct->setEnabled(false);
-    watcher->setFuture(QtConcurrent::run([persistedLocation, openOptions, fiberInference]() {
-        LasagnaAttachTaskResult result;
-        try {
-            const auto dataset = vc::lasagna::LasagnaDataset::openLocation(persistedLocation, openOptions);
-            if (dataset.manifest().groups.empty())
-                throw std::runtime_error("Lasagna manifest contains no channel groups");
-            if (fiberInference)
-                (void)vc::fiber_tracer::resolveFiberPredictionTraceScales(dataset.manifest());
-            else if (!dataset.hasNormalSource())
-                throw std::runtime_error("regular Lasagna data requires grad_mag, nx, and ny normal channels");
-            for (auto& prepared : vc::lasagna::prepareLasagnaProjectVolumes(
-                     dataset, persistedLocation)) {
-                result.volumes.push_back({std::move(prepared.location), std::move(prepared.tags), std::move(prepared.volume)});
-            }
-        } catch (const std::exception& error) {
-            result.error = QString::fromUtf8(error.what());
-        } catch (...) {
-            result.error = QObject::tr("Unknown error while loading the Lasagna manifest.");
-        }
-        return result;
-    }));
 }
 
 void MenuActionController::detachEntry()

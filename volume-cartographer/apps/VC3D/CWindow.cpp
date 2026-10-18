@@ -154,6 +154,7 @@
 #include "elements/DropdownChecklistButton.hpp"
 #include "MenuActionController.hpp"
 #include "VolumeAttachmentController.hpp"
+#include "ProjectAttachmentController.hpp"
 #include "FileWatcherService.hpp"
 #include "AxisAlignedSliceController.hpp"
 #include "SurfaceAreaCalculator.hpp"
@@ -2944,6 +2945,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
 
     _volumeAttachmentController =
         std::make_unique<VolumeAttachmentController>(this);
+    _projectAttachmentController =
+        std::make_unique<ProjectAttachmentController>(this);
 
     // create menus/actions controller
     _menuController = std::make_unique<MenuActionController>(this);

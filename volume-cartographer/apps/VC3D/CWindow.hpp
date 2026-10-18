@@ -108,6 +108,7 @@ class SegmentationModule;
 class SurfacePanelController;
 class MenuActionController;
 class VolumeAttachmentController;
+class ProjectAttachmentController;
 class SegmentationGrower;
 class ViewerControlsPanel;
 class QLabel;
@@ -139,6 +140,7 @@ class CWindow : public QMainWindow
 
     friend class MenuActionController;
     friend class VolumeAttachmentController;
+    friend class ProjectAttachmentController;
     friend class RenderBenchReplay;
     friend class AgentBridgeServer;
 
@@ -513,6 +515,7 @@ private:
     std::unique_ptr<SegmentationModule> _segmentationModule;
     std::unique_ptr<SurfacePanelController> _surfacePanel;
     std::unique_ptr<VolumeAttachmentController> _volumeAttachmentController;
+    std::unique_ptr<ProjectAttachmentController> _projectAttachmentController;
     std::unique_ptr<MenuActionController> _menuController;
     std::unique_ptr<SurfaceAffineTransformController> _surfaceAffineTransforms;
     // runner for command line tools

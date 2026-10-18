@@ -146,7 +146,6 @@ private:
     void attachRemoteZarrUrl(const QString& url);
     void beginLasagnaManifestAttachment(bool remote, const QString& initialUrl = {}, bool fiber = false);
     void attachCatalogLasagna(const QString& artifactUrl, bool fiber);
-    struct LasagnaAttachTaskResult;
     bool openOpenDataSample(const vc3d::opendata::OpenDataSample& sample,
                             bool interactive = true,
                             const vc3d::opendata::OpenDataResourceSelection* selection = nullptr,
@@ -235,5 +234,4 @@ private:
     std::shared_ptr<std::atomic<bool>> _openDataPrefillCancelFlag;
     // True from launch until the finished slot runs; prevents overlapping opens.
     bool _openDataSampleOpenInFlight{false};
-    bool _lasagnaAttachmentInFlight{false};
 };
