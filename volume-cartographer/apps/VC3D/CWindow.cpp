@@ -2966,6 +2966,12 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             this, [this](bool) {
                 updateVolumePackageEmptyState();
             });
+    connect(_menuController.get(), &MenuActionController::undoRequested,
+            _segmentationModule.get(), &SegmentationModule::undo);
+    connect(_menuController.get(), &MenuActionController::redoRequested,
+            _segmentationModule.get(), &SegmentationModule::redo);
+    connect(_segmentationModule.get(), &SegmentationModule::undoAvailabilityChanged,
+            _menuController.get(), &MenuActionController::setUndoRedoAvailable);
     connect(ui.btnOpenDataCatalog, &QPushButton::clicked, this, [this]() {
         if (_menuController) {
             _menuController->showOpenDataCatalog();

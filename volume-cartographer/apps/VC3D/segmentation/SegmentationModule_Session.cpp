@@ -195,7 +195,9 @@ bool SegmentationModule::captureUndoSnapshot()
         return false;
     }
 
-    return _undoHistory.capture(previewPoints);
+    const bool captured = _undoHistory.capture(previewPoints);
+    notifyUndoAvailability();
+    return captured;
 }
 
 bool SegmentationModule::captureUndoDelta()
@@ -219,12 +221,15 @@ bool SegmentationModule::captureUndoDelta()
         deltas.push_back({edit.row, edit.col, edit.originalWorld});
     }
 
-    return _undoHistory.captureDelta(deltas);
+    const bool captured = _undoHistory.captureDelta(deltas);
+    notifyUndoAvailability();
+    return captured;
 }
 
 void SegmentationModule::discardLastUndoSnapshot()
 {
     _undoHistory.discardLast();
+    notifyUndoAvailability();
 }
 
 // Applies the next undo (or redo) entry and stores the state it replaces on
@@ -326,12 +331,14 @@ bool SegmentationModule::applyHistoryEntry(bool redo)
     }
 
     _suppressUndoCapture = false;
+    notifyUndoAvailability();
     return applied;
 }
 
 void SegmentationModule::clearUndoStack()
 {
     _undoHistory.clear();
+    notifyUndoAvailability();
 }
 
 bool SegmentationModule::undo()
@@ -380,6 +387,16 @@ bool SegmentationModule::canRedo() const
     return hasActiveSession() && !_manualAddMode && !_growthInProgress && _undoHistory.canRedo();
 }
 
+void SegmentationModule::notifyUndoAvailability()
+{
+    const std::pair<bool, bool> availability{canUndo(), canRedo()};
+    if (availability == _undoAvailability) {
+        return;
+    }
+    _undoAvailability = availability;
+    emit undoAvailabilityChanged(availability.first, availability.second);
+}
+
 bool SegmentationModule::hasActiveSession() const
 {
     return _editManager && _editManager->hasSession();
@@ -410,6 +427,7 @@ void SegmentationModule::refreshSessionFromSurface(QuadSurface* surface)
     // over it; if the grid changed size, no entry fits it any more.
     _undoHistory.clearRedo();
     _undoHistory.setGridSize(_editManager->previewPoints().size());
+    notifyUndoAvailability();
     if (_state) {
         _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
     }
@@ -439,6 +457,7 @@ bool SegmentationModule::applySurfaceUpdateFromGrowth(const cv::Rect& vertexRect
     }
     // A redo would write pre-growth positions over the grown region.
     _undoHistory.clearRedo();
+    notifyUndoAvailability();
 
     auto* baseSurf = _editManager->baseSurface().get();
 

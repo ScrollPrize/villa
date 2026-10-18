@@ -256,6 +256,8 @@ signals:
     void annotationSelectionCleared();
     void annotationCollectionSelected(uint64_t collectionId);
     void annotationPointFocused(vc::PointRef point);
+    // Emitted when canUndo() or canRedo() changes.
+    void undoAvailabilityChanged(bool canUndo, bool canRedo);
 
 private:
     friend class SegmentationLineTool;
@@ -420,6 +422,7 @@ private:
     // True while a drag, push-pull, line stroke or mask stroke is unfinished.
     [[nodiscard]] bool editInProgress() const;
     void clearUndoStack();
+    void notifyUndoAvailability();
 
     [[nodiscard]] float gridStepWorld() const;
 
@@ -519,6 +522,7 @@ private:
 
     segmentation::UndoHistory _undoHistory;
     bool _suppressUndoCapture{false};
+    std::pair<bool, bool> _undoAvailability{false, false};
 
     static constexpr int kAutosaveIntervalMs = 10000;
     QTimer* _autosaveTimer{nullptr};
