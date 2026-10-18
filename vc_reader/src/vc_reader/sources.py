@@ -541,6 +541,12 @@ class Source(_Value):
         """Replace storage selection; the declaration's original grid stays fixed."""
         return replace(self, storage=replace(self.storage, selection=Selection(**kwargs)))
 
+    def open(self, **reader_options):
+        """Open a source for spatial crops; optional readers load only here."""
+        from .reader.source_reader import SourceReader
+
+        return SourceReader(self, **reader_options)
+
     def to_dict(self) -> dict:
         return {"schema_version": 1, "source": _encode(self)}
 
