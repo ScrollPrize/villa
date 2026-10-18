@@ -95,6 +95,85 @@ class PrecisionTests(unittest.TestCase):
                     with self.subTest(transform=repr(transform), dtype=dtype, comparison='cpu/cuda'):
                         np.testing.assert_allclose(results['cuda'], results['cpu'], atol=5e-5, rtol=1e-5)
 
+    def test_median_neighborhoods(self):
+        rng = np.random.default_rng(2026)
+        # Cross row, warp and block boundaries, including partially active warps.
+        shapes = [(1, 1), (1, 33), (7, 1), (9, 31), (7, 32), (9, 33), (3, 257),
+                  (1, 1, 1), (1, 7, 33), (5, 1, 33), (5, 7, 1), (3, 5, 31),
+                  (3, 5, 32), (3, 5, 33), (7, 9, 65)]
+        for shape in shapes:
+            for dtype in (np.float32, np.float64):
+                image = rng.normal(size=(2, *shape)).astype(dtype)
+                for quantize in (False, True):
+                    source = image.copy()
+                    if quantize:
+                        # An exact discrete palette should not be requantized.
+                        source = np.round(source*4).astype(dtype)
+                        source[source == 0] = 0  # One zero sign for the exact palette.
+                    padded = np.pad(source, [(0, 0)]+[(1, 1)]*len(shape), mode='symmetric')
+                    windows = np.lib.stride_tricks.sliding_window_view(
+                        padded, (3,)*len(shape), axis=tuple(range(1, source.ndim)))
+                    expected = np.median(windows, axis=tuple(range(-len(shape), 0)))
+                    for channels in ([], [1]):
+                        reference = expected.copy()
+                        if channels:
+                            reference[0] = source[0]
+                        for backend in self.backends():
+                            with self.subTest(shape=shape, dtype=dtype, quantize=quantize,
+                                              channels=channels, backend=backend):
+                                pipe = A.Pipeline([A.MedianFilter(3, quantize=quantize, channels=channels)],
+                                                  backend=backend, compact=False)
+                                sample = {'image': source.copy()}
+                                actual = pipe(sample, seed=19)['image']
+                                np.testing.assert_array_equal(actual, reference)
+                                np.testing.assert_array_equal(sample['image'], source)
+                                replay = pickle.loads(pickle.dumps(pipe.sample(sample, seed=19)))
+                                np.testing.assert_array_equal(replay.apply(sample)['image'], actual)
+
+        # Finite extremes and signed zeros must remain exact selected values.
+        for dtype in (np.float32, np.float64):
+            values = np.array([-np.finfo(dtype).max, -1, -0., 0., 1, np.finfo(dtype).max], dtype=dtype)
+            image = np.resize(values, (1, 3, 5, 33))
+            padded = np.pad(image, ((0, 0), (1, 1), (1, 1), (1, 1)), mode='symmetric')
+            windows = np.lib.stride_tricks.sliding_window_view(padded, (3, 3, 3), axis=(1, 2, 3))
+            reference = np.median(windows, axis=(-3, -2, -1))
+            valid = np.ones_like(image, dtype=np.uint8)
+            valid[..., ::11] = 0
+            reference[valid == 0] = -7
+            for backend in self.backends():
+                pipe = A.Pipeline([A.MedianFilter(3)], backend=backend, compact=False,
+                                  targets={'image': A.Image(fill=-7), 'padding_mask': A.ValidMask()})
+                actual = pipe({'image': image, 'padding_mask': valid}, seed=0)
+                np.testing.assert_array_equal(actual['image'], reference)
+                np.testing.assert_array_equal(actual['padding_mask'], valid)
+
+    def test_median_general_and_quantized(self):
+        rng = np.random.default_rng(54)
+        for shape in ((5, 7), (3, 5, 7)):
+            image = rng.normal(size=(1, *shape)).astype(np.float32)
+            for size in (1, 2, 4, 5):
+                # Even windows select the upper middle rank, not their average.
+                padded = np.pad(image, [(0, 0)]+[(size//2, (size-1)//2)]*len(shape), mode='symmetric')
+                windows = np.lib.stride_tricks.sliding_window_view(
+                    padded, (size,)*len(shape), axis=tuple(range(1, image.ndim)))
+                windows = windows.reshape(*image.shape, -1)
+                rank = windows.shape[-1]//2
+                reference = np.partition(windows, rank, axis=-1)[..., rank]
+                for backend in self.backends():
+                    pipe = A.Pipeline([A.MedianFilter(size)], backend=backend, compact=False)
+                    np.testing.assert_array_equal(pipe({'image': image}, seed=0)['image'], reference)
+        for dtype in (np.float32, np.float64):
+            image = rng.random((1, 9, 11, 33)).astype(dtype)
+            low, high = float(image.min()), float(image.max())
+            code = np.floor((image.astype(np.float64)-low)/(high-low)*255+.5)
+            quantized = (low+(high-low)*code/255).astype(dtype)
+            padded = np.pad(quantized, ((0, 0), (1, 1), (1, 1), (1, 1)), mode='symmetric')
+            windows = np.lib.stride_tricks.sliding_window_view(padded, (3, 3, 3), axis=(1, 2, 3))
+            reference = np.median(windows, axis=(-3, -2, -1))
+            for backend in self.backends():
+                pipe = A.Pipeline([A.MedianFilter(3, quantize=True)], backend=backend, compact=False)
+                np.testing.assert_allclose(pipe({'image': image}, seed=0)['image'], reference, atol=1e-7, rtol=1e-7)
+
     def test_derived_fields(self):
         rng = np.random.default_rng(99)
         image = rng.random((1, 7, 9, 11), dtype=np.float32)

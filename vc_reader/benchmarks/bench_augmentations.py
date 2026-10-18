@@ -76,6 +76,8 @@ def main():
     parser.add_argument('--level', default='2')
     parser.add_argument('--start', type=int, nargs=3, default=(9000, 3600, 3600))
     parser.add_argument('--size', type=positive, default=128)
+    parser.add_argument('--plane', action='store_true',
+                        help='read one Z plane for 2D image/strip recipes selected with --only')
     parser.add_argument('--reps', type=positive, default=5)
     parser.add_argument('--warmup', type=positive, default=1)
     parser.add_argument('--seed', type=nonnegative, default=123)
@@ -85,7 +87,7 @@ def main():
     parser.add_argument('--allow-differences', action='store_true', help='retain and report numerical mismatches')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
-    if args.update_readme and args.size != 128:
+    if args.update_readme and (args.size != 128 or args.plane):
         parser.error('README timing rows describe 128-cubed inputs')
     args.backend = 'both'
     load_extensions(args.native_dir)
@@ -98,7 +100,9 @@ def main():
         if set(args.only)-selected.keys():
             parser.error('unknown augmentation name')
         selected = {name: recipe for name, recipe in selected.items() if name in args.only}
-    shape = (args.size,)*3
+    if args.plane and any(workload(name).sample not in ('image', 'strip') for name in selected):
+        parser.error('--plane requires image-only or strip recipes; select them with --only')
+    shape = (1, args.size, args.size) if args.plane else (args.size,)*3
     reference_start = (args.start[0]+384, *args.start[1:])
     with ZarrReader.open(args.array, level=args.level, threads=1) as reader:
         for origin in (args.start, reference_start):
@@ -109,6 +113,9 @@ def main():
     if not np.isfinite(image).all() or not np.isfinite(reference).all() or np.ptp(image) == 0:
         parser.error('input must be finite and contain visible CT signal')
     samples = inputs(image)
+    if args.plane:
+        samples['image'] = samples['strip']
+        reference = np.ascontiguousarray(reference[:, 0])
     report = dict(command=[sys.executable, *sys.argv],
                   recorded_at=datetime.now(timezone.utc).isoformat(),
                   git_revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),

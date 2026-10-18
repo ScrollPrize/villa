@@ -1,25 +1,65 @@
 #include "channel.cuh"
 #include "median.cuh"
 namespace vcr::augment::cuda {
-template<class T> __global__ void median3_kernel(const T* src, T* dst, Layout g) {
-    EACH_INDEX(g.size) {
-        T v[27];
-        const auto z = g.coord(i,0), y = g.coord(i,1), x = g.coord(i,2);
+template<class T> __device__ __forceinline__ void sort_column(T (&v)[3]) {
+    const T low = min(v[0],v[1]), high = max(v[0],v[1]);
+    v[0] = min(low,v[2]); v[1] = max(low,min(high,v[2])); v[2] = max(high,v[2]);
+}
+// Each thread sorts one column per y row. Adjacent x outputs share those
+// columns through warp shuffles: nine loads and three sorts per 3D output,
+// instead of loading/sorting all 27 neighbors independently. Warp endpoints
+// load their missing column directly; reflection of a size-3 window clamps.
+template<class T, class Index, int D>
+__global__ void median3_kernel(const T* src, T* dst, Index nz, Index ny, Index nx, std::size_t n) {
+    EACH_INDEX(n) {
+        const Index z = Index(i)/(ny*nx), y = Index(i)/nx%ny, x = Index(i)%nx;
+        const Index axis = D == 3 ? z : y, extent = D == 3 ? nz : ny;
+        const Index before = axis ? axis-1 : 0, after = axis+1 < extent ? axis+1 : axis;
+        const unsigned active = __activemask(), lane = threadIdx.x % 32;
+        constexpr int rows = D == 3 ? 3 : 1;
+        T v[rows*9];
         #pragma unroll
-        for (int dz = 0; dz < 3; ++dz) {
+        for (int row = 0; row < rows; ++row) {
+            const Index yy = row == 0 ? (y ? y-1 : 0) : row == 2 ? (y+1 < ny ? y+1 : y) : y;
+            const Index b0 = D == 3 ? (before*ny+yy)*nx : before*nx;
+            const Index b1 = D == 3 ? (z*ny+yy)*nx : y*nx;
+            const Index b2 = D == 3 ? (after*ny+yy)*nx : after*nx;
+            T column[3] = {src[b0+x],src[b1+x],src[b2+x]}; sort_column(column);
             #pragma unroll
-            for (int dy = 0; dy < 3; ++dy) {
+            for (int dx = 0; dx < 3; ++dx) {
+                const Index xx = dx == 0 ? (x ? x-1 : 0) : dx == 2 ? (x+1 < nx ? x+1 : x) : x;
+                const int other = int(lane)+(xx > x ? 1 : xx < x ? -1 : 0);
+                const bool shared = other >= 0 && other < 32 && (active & (1u << other));
+                T neighbor[3];
                 #pragma unroll
-                for (int dx = 0; dx < 3; ++dx)
-                    v[(dz*3+dy)*3+dx] = src[boundary(static_cast<long long>(z)+dz-1,g.shape[0],Boundary::Reflect)*g.stride[0] + boundary(static_cast<long long>(y)+dy-1,g.shape[1],Boundary::Reflect)*g.stride[1] + boundary(static_cast<long long>(x)+dx-1,g.shape[2],Boundary::Reflect)];
+                for (int j = 0; j < 3; ++j)
+                    neighbor[j] = __shfl_sync(active,column[j],shared ? other : int(lane));
+                if (!shared) {
+                    neighbor[0]=src[b0+xx]; neighbor[1]=src[b1+xx]; neighbor[2]=src[b2+xx];
+                    sort_column(neighbor);
+                }
+                #pragma unroll
+                for (int j = 0; j < 3; ++j) v[(row*3+dx)*3+j] = neighbor[j];
             }
         }
-        select27(v); dst[i] = v[median_detail::network.output];
+        if constexpr (D == 3) {
+            select_median<median_detail::column_network>(v); dst[i] = v[median_detail::column_network.output];
+        } else {
+            select_median<median_detail::plane_network>(v); dst[i] = v[median_detail::plane_network.output];
+        }
     }
+}
+template<class T, class Index>
+void launch_median3(const T* src, T* dst, const Grid& g) {
+    const auto& s = g.shape;
+    if (s.size() == 3)
+        median3_kernel<T,Index,3><<<blocks(g.size),256,0,vcr::device::stream()>>>(src,dst,Index(s[0]),Index(s[1]),Index(s[2]),g.size);
+    else
+        median3_kernel<T,Index,2><<<blocks(g.size),256,0,vcr::device::stream()>>>(src,dst,1,Index(s[0]),Index(s[1]),g.size);
 }
 // General exact rank filter. Binary search in the monotone IEEE key space uses
 // bounded storage for all supported sizes (1..63), including even windows.
-// Size-3 3D uses the much faster register selector above.
+// Size-3 windows use the register selector above.
 template<class T> __device__ unsigned long long ordered_key(T x) {
     if constexpr (std::is_same_v<T,float>) {
         unsigned u = __float_as_uint(x); return (u & 0x80000000u) ? (~u) : (u ^ 0x80000000u);
@@ -89,14 +129,24 @@ template<class T> void quantize_median(View<T> v) {
     quantize_kernel<<<blocks(v.size),256,0,vcr::device::stream()>>>(v,values.ptr,bounds.low,range); check(cudaGetLastError());
 }
 void apply_cuda(const MedianFilter& t, Sample& s, const Parameters& p, Session& session) {
-    apply_channels(t,s,p,session,[](const auto& t, auto v, const Grid& grid, const ChannelPlan& c) {
-        using V = typename decltype(v)::value_type;
-        if (c.values[0] == 1) return;
-        if (t.quantize) quantize_median(v);
-        Buffer<V> out(v.size); Layout g(grid);
-        if (g.dim == 3 && c.values[0] == 3) median3_kernel<<<blocks(g.size),256,0,vcr::device::stream()>>>(v.ptr,out.ptr,g);
-        else median_general<<<blocks(g.size),256,0,vcr::device::stream()>>>(v.ptr,out.ptr,g,int(c.values[0]));
-        check(cudaGetLastError()); copy_device(v,View<V>{out.ptr,v.size});
-    });
+    for (const auto& c : p.channels) {
+        if (c.values[0] == 1) continue;
+        auto& a = session.arrays.at(c.key); Grid grid(a.spatial());
+        const auto run = [&]<class T>() {
+            auto input = a.channel<T>(c.channel);
+            if (t.quantize) quantize_median(input);
+            Shape shape{1}; shape.insert(shape.end(),grid.shape.begin(),grid.shape.end());
+            DeviceArray output(shape,'f',sizeof(T)); auto out = output.view<T>();
+            if (c.values[0] == 3) {
+                if (grid.size <= UINT32_MAX) launch_median3<T,std::uint32_t>(input.ptr,out.ptr,grid);
+                else launch_median3<T,std::size_t>(input.ptr,out.ptr,grid);
+            } else median_general<<<blocks(grid.size),256,0,vcr::device::stream()>>>(input.ptr,out.ptr,Layout(grid),int(c.values[0]));
+            check(cudaGetLastError());
+            if (a.shape[0] == 1) a = std::move(output);
+            else copy_device(input,out);
+        };
+        if (a.bytes == 4) run.template operator()<float>(); else run.template operator()<double>();
+    }
+    session.restore_valid(s);
 }
 } // namespace vcr::augment::cuda

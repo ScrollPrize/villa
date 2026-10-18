@@ -209,6 +209,30 @@ class BatchTests(unittest.TestCase):
                 self.assertSame(source.cpu(), host)
                 self.assertSame(weight.grad, first.sum().to(weight.dtype))
 
+    def test_median_stream_and_output_ownership(self):
+        rng = np.random.default_rng(18)
+        for shape in ((7, 33), (3, 5, 33)):
+            for channels in (1, 2):
+                for dtype in (np.float32, np.float64):
+                    host = rng.normal(size=(3, channels, *shape)).astype(dtype)
+                    transforms = [A.MedianFilter(3), A.BrightnessAdd(.25), A.MedianFilter(3)]
+                    cpu = A.Pipeline(transforms, compact=False)
+                    gpu = A.Pipeline(transforms, backend='cuda', compact=False)
+                    expected = torch.from_numpy(np.stack([
+                        cpu({'image': value}, seed=i)['image'] for i, value in enumerate(host)]))
+                    stream = torch.cuda.Stream()
+                    with torch.cuda.stream(stream):
+                        source = torch.from_numpy(host).to('cuda')
+                        first = gpu.batch({'image': source}, seeds=[0, 1, 2])['image']
+                        second = gpu.batch({'image': source}, seeds=[0, 1, 2])['image']
+                        weight = torch.ones((), device='cuda', requires_grad=True)
+                        (first*weight).sum().backward()
+                    stream.synchronize()
+                    self.assertSame(first.cpu(), expected)
+                    self.assertSame(first, second)
+                    self.assertSame(source.cpu(), torch.from_numpy(host))
+                    self.assertSame(weight.grad, first.sum().to(weight.dtype))
+
     def test_full_uint64_seeds_after_default_collation(self):
         seeds = [(1 << 64) - 1, 1 << 63, 7]
         p = A.Pipeline([A.BrightnessMultiply((.5, 1.5))], backend='cuda')

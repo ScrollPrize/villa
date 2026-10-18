@@ -81,3 +81,4 @@ volume-cartographer/AGENTS.md
 /vesuvius/src/vesuvius/neural_tracing/tracers/fibers/evaluation/audit
 /spiral-fitting/experiments
 /vc_reader/benchmarks/results
+*.csv
