@@ -125,11 +125,15 @@ does not lie on the selected viewer's current plane or surface.
 ### Viewer selection
 
 VC3D assigns every live base viewer a stable process-local id (`v1`, `v2`, …).
-Ids are never reused during that process. A viewer parameter resolves in this
-order:
+Viewers come from every workspace's viewer manager, so the Spiral workspace's
+panes are addressable too; the main window's own viewers are registered
+first. Ids are never reused during that process. A viewer parameter resolves
+in this order:
 
 1. exact bridge viewer id;
-2. unique `surfName`;
+2. `surfName`, unique among the main window's own viewers, else unique among
+   other workspaces' viewers (Spiral reuses the main slot names, so its panes
+   are addressed by id);
 3. the `segmentation` surface when the parameter is optional and omitted.
 
 An ambiguous surface name returns the matching viewer candidates. Canvas

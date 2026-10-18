@@ -101,15 +101,7 @@ AgentBridgeServer::AgentBridgeServer(CWindow* window, QObject* parent)
     : QObject(parent), _window(window)
 {
     registerHandlers();
-    seedViewerRegistry();
-
-    if (_window && _window->_viewerManager) {
-        ViewerManager* vm = _window->_viewerManager.get();
-        connect(vm, &ViewerManager::baseViewerCreated,
-                this, [this](VolumeViewerBase* v) { registerViewer(v); });
-        connect(vm, &ViewerManager::baseViewerClosing,
-                this, [this](VolumeViewerBase* v) { unregisterViewer(v); });
-    }
+    syncViewerManagers();
 
     subscribeJobSignals();
 }
@@ -378,6 +370,8 @@ void AgentBridgeServer::dispatch(QLocalSocket* socket, const QJsonObject& reques
         return;
     }
 
+    syncViewerManagers();
+
     ScopedLineAnnotationDialogSuppression suppressLineAnnotationDialogs(
         _window && _window->_lineAnnotationController
             ? _window->_lineAnnotationController.get()
@@ -501,16 +495,36 @@ void AgentBridgeServer::broadcastNotification(const QString& method, const QJson
 // Viewer registry
 // ---------------------------------------------------------------------------
 
-void AgentBridgeServer::seedViewerRegistry()
+void AgentBridgeServer::syncViewerManagers()
 {
-    if (!_window || !_window->_viewerManager)
-        return;
-    for (VolumeViewerBase* v : _window->_viewerManager->baseViewers())
-        registerViewer(v);
+    std::erase_if(_viewers, [](const ViewerEntry& e) { return e.object.isNull(); });
+    std::erase_if(_viewerManagers,
+                  [](const QPointer<ViewerManager>& m) { return m.isNull(); });
+
+    // Construction order puts the main workspace's manager first, so its
+    // viewers keep the lowest ids.
+    for (ViewerManager* manager : ViewerManager::allManagers()) {
+        if (!manager)
+            continue;
+        const bool known = std::any_of(
+            _viewerManagers.begin(), _viewerManagers.end(),
+            [manager](const QPointer<ViewerManager>& m) { return m.data() == manager; });
+        if (known)
+            continue;
+        _viewerManagers.emplace_back(manager);
+        const bool primary =
+            _window && _window->_viewerManager && manager == _window->_viewerManager.get();
+        connect(manager, &ViewerManager::baseViewerCreated,
+                this, [this, primary](VolumeViewerBase* v) { registerViewer(v, primary); });
+        connect(manager, &ViewerManager::baseViewerClosing,
+                this, [this](VolumeViewerBase* v) { unregisterViewer(v); });
+        for (VolumeViewerBase* v : manager->baseViewers())
+            registerViewer(v, primary);
+    }
 }
 
 
-void AgentBridgeServer::registerViewer(VolumeViewerBase* viewer)
+void AgentBridgeServer::registerViewer(VolumeViewerBase* viewer, bool primary)
 {
     if (!viewer)
         return;
@@ -518,7 +532,8 @@ void AgentBridgeServer::registerViewer(VolumeViewerBase* viewer)
         if (e.viewer == viewer)
             return; // already registered
     }
-    _viewers.push_back({QStringLiteral("v%1").arg(_nextViewerNum++), viewer});
+    _viewers.push_back({QStringLiteral("v%1").arg(_nextViewerNum++), viewer,
+                        QPointer<QObject>(viewer->asQObject()), primary});
 }
 
 
@@ -572,15 +587,22 @@ VolumeViewerBase* AgentBridgeServer::resolveViewer(const QJsonValue& ref,
 
     // Rule 1: exact registry id.
     for (const ViewerEntry& e : _viewers) {
-        if (e.id == key)
+        if (e.object && e.id == key)
             return e.viewer;
     }
 
-    // Rule 2: match against surface-slot name.
+    // Rule 2: match against surface-slot name, first among CWindow's own
+    // viewers, then among other workspaces' viewers (Spiral reuses the main
+    // slot names, so its panes are reached by id unless a name is theirs alone).
     std::vector<const ViewerEntry*> matches;
-    for (const ViewerEntry& e : _viewers) {
-        if (QString::fromStdString(e.viewer->surfName()) == key)
-            matches.push_back(&e);
+    for (const bool primary : {true, false}) {
+        for (const ViewerEntry& e : _viewers) {
+            if (e.object && e.primary == primary &&
+                QString::fromStdString(e.viewer->surfName()) == key)
+                matches.push_back(&e);
+        }
+        if (!matches.empty())
+            break;
     }
 
     if (matches.size() == 1)

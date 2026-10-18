@@ -31,6 +31,7 @@ class QLocalServer;
 class QLocalSocket;
 class QTimer;
 class CWindow;
+class ViewerManager;
 class VolumeViewerBase;
 struct CommandLaunchError;
 
@@ -113,12 +114,20 @@ private:
                                               const QString& source);
 
     // --- Viewer registry ---
+    // Viewers come from every live ViewerManager (one per workspace that owns
+    // viewers), so Spiral panes are targetable like the main ones.
     struct ViewerEntry {
         QString id;                 // stable "v<N>", never reused within a process
         VolumeViewerBase* viewer;   // live viewer; removed on baseViewerClosing
+        QPointer<QObject> object;   // drops viewers destroyed without that signal
+        // Owned by CWindow's own ViewerManager. Slot names resolve among these
+        // first, because Spiral reuses the main slot names for its panes.
+        bool primary = true;
     };
-    void seedViewerRegistry();
-    void registerViewer(VolumeViewerBase* viewer);
+    // Subscribes to managers not seen before and registers their viewers;
+    // prunes destroyed viewers. Cheap; runs before every dispatch.
+    void syncViewerManagers();
+    void registerViewer(VolumeViewerBase* viewer, bool primary);
     void unregisterViewer(VolumeViewerBase* viewer);
     QString viewerIdFor(VolumeViewerBase* viewer) const;
     QString viewerTitle(VolumeViewerBase* viewer) const;
@@ -425,6 +434,7 @@ private:
 
     std::vector<ViewerEntry> _viewers;
     int _nextViewerNum = 1;
+    std::vector<QPointer<ViewerManager>> _viewerManagers;
 
     // At most one active job per source, with the last eight completed records
     // retained per source. Job numbers are shared across sources.

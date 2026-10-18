@@ -180,9 +180,11 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         result["sameWrapAnnotation"] = QJsonValue::Null;
     }
 
-    // viewers
+    // viewers, from every workspace's viewer manager
     QJsonArray viewers;
     for (const ViewerEntry& e : _viewers) {
+        if (!e.object)
+            continue;
         QJsonObject v;
         v["viewerId"] = e.id;
         v["surfName"] = QString::fromStdString(e.viewer->surfName());

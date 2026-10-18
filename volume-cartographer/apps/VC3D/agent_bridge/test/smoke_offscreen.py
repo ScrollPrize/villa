@@ -474,6 +474,50 @@ def check_canvas_normalization(client: BridgeClient, results: Results) -> None:
         )
 
 
+def check_viewer_registry(client: BridgeClient, results: Results) -> None:
+    """Viewers of every viewer manager are addressable by id, and a slot name
+    resolves to the main window's own viewer first."""
+    try:
+        state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        viewers = state.get("viewers", [])
+        ids = [v.get("viewerId") for v in viewers]
+        segmentation = [
+            v.get("viewerId") for v in viewers if v.get("surfName") == "segmentation"
+        ]
+        centered, _ = client.call(
+            "viewer.center_on_point",
+            {"point": {"x": 8, "y": 8, "z": 8}},
+            timeout=RPC_TIMEOUT,
+        )
+        unresolved = []
+        for viewer in viewers:
+            if viewer.get("kind") != "chunked":
+                continue
+            # Resolution, not rendering: a zoom by 1.0 must reach every pane.
+            try:
+                client.call(
+                    "viewer.zoom",
+                    {"viewer": viewer.get("viewerId"), "factor": 1.0},
+                    timeout=RPC_TIMEOUT,
+                )
+            except BridgeError as error:
+                unresolved.append(f"{viewer.get('viewerId')}: {error.code}")
+        ok = (
+            len(ids) == len(set(ids))
+            and bool(segmentation)
+            and centered.get("viewerId") == segmentation[0]
+            and not unresolved
+        )
+        results.record(
+            "viewer_registry",
+            ok,
+            f"viewers={len(ids)} segmentation={segmentation} "
+            f"default={centered.get('viewerId')} unresolved={unresolved}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record("viewer_registry", False, f"{type(error).__name__}: {error}")
+
+
 def check_project_create(
     client: BridgeClient,
     results: Results,
@@ -1829,6 +1873,7 @@ def main() -> int:
             check_viewer_normalization(client, results)
             require_running(proc, results, "viewer normalization")
             check_canvas_normalization(client, results)
+            check_viewer_registry(client, results)
 
             check_volume_attach(client, results, tmp_path, volpkg)
             check_segments_attach(client, results, tmp_path, volpkg)
