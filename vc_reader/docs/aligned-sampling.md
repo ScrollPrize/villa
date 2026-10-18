@@ -75,7 +75,10 @@ level request needs a catalog to resolve its actual storage grid.
 - A 2D `Plane` has inclusive normal support `[-0.5, 0.5]` in units of its
   declared thickness vector. Sampling is nearest/bilinear in-plane, constant
   across that footprint. A surface registration requires the separate surface
-  operations; it is not implicitly projected into a volume crop.
+  [surface operations](surface-sampling.md); it is not implicitly projected
+  into a volume crop. Readers configured with surface targets use
+  `render_surface`, `project_surface`, or `iter_project_surface`; ordinary
+  `read`/`read_many` reject those targets rather than silently dropping them.
 
 Unsupported neighbors use the source reader's resolved output-domain fill.
 Partial linear samples blend that fill with supported values but have false

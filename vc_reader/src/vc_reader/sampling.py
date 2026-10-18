@@ -9,7 +9,7 @@ import os
 
 from .affine import Affine
 from .browsing import VolumeLevel
-from .sources import Source, VolumeRegistration, SampleResult
+from .sources import Source, VolumeRegistration, SurfaceRegistration, SampleResult
 
 from ._sampling_engine import SamplingEngine
 from .reader.source_resolution import array_placement
@@ -21,7 +21,9 @@ def open_sample(reference, targets=None, *, backend='cpu', catalog=None, **reade
     ``sampling_cache_bytes`` (64 MiB) bounds retained CPU/device tiles;
     ``sampling_work_bytes`` (64 MiB) bounds tiles held by one native request.
     ``plan_cache_bytes`` (8 MiB) bounds reusable affine plans. ``device`` selects
-    the CUDA device. Other options are passed to Source.open().
+    the CUDA device. ``surface_output_bytes`` (512 MiB) limits dense surface
+    results; projection can instead yield bounded tiles. Other options are
+    passed to Source.open().
     """
     return SampleReader(reference, targets, backend=backend, catalog=catalog, **reader_options)
 
@@ -83,7 +85,11 @@ class SampleReader(SamplingEngine):
         if isinstance(reference, VolumeLevel) and catalog is not None and catalog is not self._catalog:
             raise ValueError('VolumeLevel and explicit catalog must belong to the same catalog')
         self._initialize_runtime(backend, device, limits, reader_options)
+        self._surface_targets, self._geometries = {}, {}
         try:
+            self._surface_output_bytes = operator.index(self._options.pop('surface_output_bytes', 512 << 20))
+            if self._surface_output_bytes <= 0:
+                raise ValueError('surface_output_bytes must be positive')
             if isinstance(reference, VolumeLevel):
                 reference = self._volume_source(reference)
             if not isinstance(reference, Source) or reference.role != 'image':
@@ -103,6 +109,10 @@ class SampleReader(SamplingEngine):
                 if not isinstance(source, Source):
                     raise TypeError(f'{name}: target must be a Source')
                 reader = self._open(source)
+                if isinstance(reader.registration, SurfaceRegistration):
+                    from .surface import prepare_target
+                    self._surface_targets[name] = prepare_target(self, source, reader)
+                    continue
                 self._targets[name] = self._prepare(source, reader)
                 companions = {}
                 for companion in source.companions:
@@ -194,15 +204,7 @@ class SampleReader(SamplingEngine):
                     transform = Affine.identity()
                     metadata = dict(kind='external', name=value.name, units=value.units)
                 else:
-                    value_map = value.affine
-                    if value_map is None:
-                        if value.level == 0:
-                            value_map = Affine.identity()
-                        elif value.level is not None and self._catalog is not None:
-                            volume = self._catalog.samples[value.sample_id].volumes[value.volume_id]
-                            value_map = array_placement(self._open(self._volume_source(volume.level(value.level))).registration)
-                        else:
-                            raise ValueError('value frame needs an affine or a resolvable volume level')
+                    value_map = self._value_placement(value)
                     value_map.inverse()
                     transform = self._reference_map.inverse() @ self._between(source, (value.sample_id, value.volume_id)) @ value_map
                     metadata = dict(kind='volume', sample_id=self._reference_frame[0], volume_id=self._reference_frame[1],
@@ -264,6 +266,8 @@ class SampleReader(SamplingEngine):
     def read_many(self, regions):
         import copy
         self._ready()
+        if self._surface_targets:
+            raise ValueError('surface targets require explicit render_surface or project_surface')
         with self._lock:
             if self._closed:
                 raise ValueError('sample reader is closed')
@@ -276,6 +280,26 @@ class SampleReader(SamplingEngine):
                     for result, (array, _) in zip(results, self._sample_many(child, regions)):
                         result.masks[name][mask] = array
             return results
+
+    def render_surface(self, surface, start, size, *, offsets_um=(0,)):
+        """Sample physical-offset layers over a YX patch in native surface UV."""
+        from .surface import render_surface
+        self._ready()
+        with self._lock:
+            return render_surface(self, surface, start, size, offsets_um)
+
+    def project_surface(self, surface, start, size, *, label_target, thickness_um=0, padding_um=0):
+        """Derive and read a 3D crop from a YX patch of a registered label."""
+        from .surface import project_surface
+        self._ready()
+        with self._lock:
+            return project_surface(self, surface, start, size, label_target, thickness_um, padding_um)
+
+    def iter_project_surface(self, surface, start, size, *, label_target, tile_size,
+                             thickness_um=0, padding_um=0):
+        """Yield bounded CZYX results, with each tile's origin in metadata."""
+        from .surface import iter_project_surface
+        return iter_project_surface(self, surface, start, size, label_target, tile_size, thickness_um, padding_um)
 
 
 

@@ -89,8 +89,13 @@ serialize with `view.to_dict()` / `ScrollSource.from_dict(...)`.
 
 See [discovery and pairing](docs/discovery.md), [source formats and caches](docs/source-reading.md),
 and [real-data validation and measurements](docs/scroll-reading-benchmarks.md).
-Generating new surface layers and projecting surface labels into 3D remain
-[planned geometry operations](plans/04-surface-labels-and-projection.md).
+Generate physical-offset surface layers with `reader.render_surface(...)`, or
+turn a 2D label patch into aligned 3D CT/labels with
+`reader.project_surface(surface, start_yx, size_yx, label_target="ink")`.
+Projection derives the volume crop from registered geometry; `padding_um` adds
+CT context and `thickness_um` controls the label band. Large requests can use
+`iter_project_surface(...)`. See [surface sampling](docs/surface-sampling.md)
+for explicit geometry registration, coverage/conflict masks, and CPU/CUDA use.
 
 ## PyTorch CUDA batches
 

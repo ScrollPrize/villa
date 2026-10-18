@@ -345,6 +345,7 @@ class Surface(_Value):
     spacing_um: tuple[float, float, float] | None = None
     mask: Source | None = None
     normals: Source | None = None
+    tifxyz_mask: bool = True
 
     def _validate(self):
         for name in ("id", "sample_id", "volume_id"):
@@ -355,6 +356,8 @@ class Surface(_Value):
         _components(self.component_order)
         _affine(self.xyz_to_volume)
         _uv(self.pixel_to_uv)
+        if type(self.tifxyz_mask) is not bool:
+            raise TypeError('tifxyz_mask must be boolean')
         if self.spacing_um is not None:
             _vector(self.spacing_um, "spacing_um")
             if any(v <= 0 for v in self.spacing_um):

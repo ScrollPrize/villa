@@ -13,6 +13,12 @@ _UNITS = {'meter': 1e6, 'metre': 1e6, 'm': 1e6, 'millimeter': 1e3, 'mm': 1e3,
           'nanometer': .001, 'nm': .001}
 
 
+def pixel_affine(rows):
+    """Embed an explicit pixel-to-UV transform in XYZ affine arithmetic."""
+    return Affine.from_rows(((rows[0][0], rows[0][1], 0, rows[0][2]),
+                             (rows[1][0], rows[1][1], 0, rows[1][2]), (0, 0, 1, 0)))
+
+
 @dataclass(frozen=True)
 class ResolvedSource:
     location: str

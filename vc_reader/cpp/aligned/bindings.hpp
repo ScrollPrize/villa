@@ -34,6 +34,13 @@ inline void bind(nb::module_& m) {
             nb::gil_scoped_release release;
             for(std::size_t i=0;i<p.grid.count;++i) { valid.data()[output_index(p.grid,i)]=supported(p.grid,i); }
         });
+    nb::class_<PointPlan,Plan>(m,"PointPlan")
+        .def("__init__",[](PointPlan* self,Triple source,Triple base,
+             nb::ndarray<const float,nb::ndim<2>,nb::c_contig,nb::device::cpu> points,
+             Triple tile,int channels,int order,bool plane) {
+            if(points.shape(1)!=3 || points.shape(0)>32768) throw nb::value_error("point blocks require Nx3, N <= 32768");
+            new(self) PointPlan(source,base,points.data(),points.shape(0),tile,channels,order,plane);
+        });
     m.def("_aligned_field_cpu",[](Bytes data,Bytes valid,std::array<float,9> matrix,std::array<float,3> translation,
                                  std::array<int,3> components,bool normalize,bool normal) {
         if(data.size()!=valid.size()*3*4) throw nb::value_error("field shape mismatch");

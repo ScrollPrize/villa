@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "source": {
+    "type": "Source",
+    "fields": {
+      "id": "catalog:PHerc0009B/volume/20250820154339/snapshot/de38ba456eedfa4e0c4c6d6b4e093f4664d635eae551bfbe923bbdf6dc4ec58d/data/0",
+      "storage": {
+        "type": "Storage",
+        "fields": {
+          "location": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0009B/volumes/20250820154339-2.401um-0.3m-77keV-masked.zarr/",
+          "format": "zarr",
+          "locations": [],
+          "alternatives": [
+            "s3://vesuvius-challenge-open-data/PHerc0009B/volumes/20250820154339-2.401um-0.3m-77keV-masked.zarr/"
+          ],
+          "selection": {
+            "type": "Selection",
+            "fields": {
+              "array_path": null,
+              "level": 0,
+              "series": null,
+              "channels": null,
+              "time": null,
+              "corresponding": null
+            }
+          },
+          "pyramid": true,
+          "grid_level": 0
+        }
+      },
+      "role": "image",
+      "axes": [
+        "z",
+        "y",
+        "x"
+      ],
+      "registration": {
+        "type": "VolumeRegistration",
+        "fields": {
+          "sample_id": "PHerc0009B",
+          "volume_id": "20250820154339",
+          "affine": {
+            "type": "Affine",
+            "fields": {
+              "matrix": [
+                [
+                  1.0,
+                  0.0,
+                  0.0,
+                  0.0
+                ],
+                [
+                  0.0,
+                  1.0,
+                  0.0,
+                  0.0
+                ],
+                [
+                  0.0,
+                  0.0,
+                  1.0,
+                  0.0
+                ]
+              ],
+              "derivation_path": null
+            }
+          },
+          "plane": null,
+          "mode": "array",
+          "storage_frame": null,
+          "declared_grid": {
+            "type": "Selection",
+            "fields": {
+              "array_path": null,
+              "level": 0,
+              "series": null,
+              "channels": null,
+              "time": null,
+              "corresponding": null
+            }
+          },
+          "origin": "catalog-fallback",
+          "storage_units": null,
+          "volume_spacing_um": [
+            2.401,
+            2.401,
+            2.401
+          ]
+        }
+      },
+      "component_order": null,
+      "value_frame": null,
+      "normalize": null,
+      "encoding": null,
+      "companions": [],
+      "provenance": {
+        "type": "mapping",
+        "items": [
+          [
+            "catalog_snapshot_sha256",
+            "55aa3d217732a3c75401765f7d425738a35fecab75baad6e4ef5cb8d8b9844e3"
+          ],
+          [
+            "kind",
+            "real-published-volume"
+          ]
+        ]
+      },
+      "artifact_id": null,
+      "artifact_kind": "ome-zarr",
+      "sample_id": "PHerc0009B",
+      "owner_id": "20250820154339",
+      "model_id": null,
+      "label_set": null,
+      "supersedes": [],
+      "coverage": [],
+      "derived": false,
+      "shape": null,
+      "dtype": null,
+      "fill_value": null,
+      "query": null
+    }
+  }
+}

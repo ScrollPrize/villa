@@ -153,6 +153,18 @@ class RelationshipIndex:
         self.pairs[relationship.label_id].append(relationship)
         self.reverse_pairs[relationship.render_id].append(relationship)
 
+    def _surface_descriptor(self, sample, mesh, target, identifier):
+        volume = sample.volumes.get(target)
+        spacing = volume.pixel_size_um if volume else None
+        return Surface(
+            id=self._artifact_ids[mesh] if mesh else identifier + '/surface',
+            geometry=_storage(mesh, format='tifxyz') if mesh else Storage(),
+            sample_id=sample.id, volume_id=target, axes=('y', 'x'),
+            component_order=('x', 'y', 'z'),
+            xyz_to_volume=Affine.identity() if mesh else None,
+            spacing_um=(spacing,)*3 if spacing is not None else None,
+        )
+
     def _adapt(self, sample, kind, owner, artifact):
         identifier = self._artifact_ids[artifact]
         storage = _storage(artifact)
@@ -179,16 +191,7 @@ class RelationshipIndex:
                 labels = artifact
                 meshes = owner.artifacts_of(T.TIFXYZ_TRANSFORMED, target_volume=target)
                 mesh = meshes[0] if len(meshes) == 1 else None
-                target_volume = sample.volumes.get(target)
-                px = target_volume.pixel_size_um if target_volume else None
-                surface = Surface(
-                    id=self._artifact_ids[mesh] if mesh else identifier + "/surface",
-                    geometry=_storage(mesh, format="tifxyz") if mesh else Storage(),
-                    sample_id=sample.id, volume_id=target, axes=("y", "x"),
-                    component_order=("x", "y", "z"),
-                    xyz_to_volume=Affine.identity() if mesh else None,
-                    spacing_um=(px, px, px) if px is not None else None,
-                )
+                surface = self._surface_descriptor(sample, mesh, target, identifier)
                 registration = SurfaceRegistration(surface, origin="catalog")
                 root = storage.location
                 storage = Storage(
@@ -208,6 +211,9 @@ class RelationshipIndex:
                     ), same_grid=True,
                 ) for name in ("supervision", "validation", "mapping_validity")
                 if name in (labels.properties.get("arrays") or ()))
+            elif artifact.type == T.TIFXYZ_TRANSFORMED:
+                storage = _storage(artifact, format='tifxyz')
+                registration = SurfaceRegistration(self._surface_descriptor(sample, artifact, target, identifier), origin='catalog')
             elif artifact.type == T.LAYERS_ZARR:
                 storage = _storage(artifact, format="zarr", pyramid=True)
                 storage = replace(storage, selection=Selection(level=0))

@@ -34,6 +34,18 @@ class _Bounded:
         self.bytes += size
 
 class SamplingEngine:
+    def _value_placement(self, value):
+        """Resolve a declared geometric value grid without guessing its level."""
+        from .reader.source_resolution import array_placement
+        if value.affine is not None:
+            return value.affine
+        if value.level == 0:
+            return Affine.identity()
+        if value.level is not None and getattr(self, '_catalog', None) is not None:
+            volume = self._catalog.samples[value.sample_id].volumes[value.volume_id]
+            return array_placement(self._open(volume.level(value.level).source).registration)
+        raise ValueError('value frame needs an affine or a resolvable volume level')
+
     def _initialize_runtime(self, backend, device, limits, reader_options):
         from .reader import DecodedCache, MemoryCache
         if backend not in ('cpu', 'cuda'):
@@ -54,6 +66,9 @@ class SamplingEngine:
         self._tiles, self._plans = _Bounded(limits[0]), _Bounded(limits[2])
         self._work_bytes = limits[1]
         self._uploads = self._tile_reads = self._peak_work = 0
+        self._surface_metrics = dict(geometry_read_bytes=0, geometry_upload_bytes=0, geometry_download_bytes=0,
+                                     candidate_upload_bytes=0, preparation_seconds=0., candidate_index_seconds=0.,
+                                     raster_call_seconds=0., output_allocation_seconds=0.)
         options = dict(reader_options)
         self._own_decoded = 'decoded_cache' not in options
         self._own_memory = not isinstance(options.get('memory_cache'), MemoryCache)
@@ -307,10 +322,78 @@ class SamplingEngine:
 
     def stats(self):
         self._ready()
-        return dict(tile_cache_bytes=self._tiles.bytes, tile_cache_hits=self._tiles.hits,
+        result = dict(tile_cache_bytes=self._tiles.bytes, tile_cache_hits=self._tiles.hits,
                     plan_cache_bytes=self._plans.bytes, plan_cache_hits=self._plans.hits,
                     tile_reads=self._tile_reads, uploaded_bytes=self._uploads, peak_tile_work_bytes=self._peak_work,
                     sources={name: target['reader'].stats() for name, target in self._targets.items()})
+        if getattr(self, '_geometries', None) or any(self._surface_metrics.values()):
+            result['surface'] = dict(self._surface_metrics)
+            result['sources'].update({name: target['reader'].stats() for name,target in getattr(self,'_surface_targets',{}).items()})
+        return result
+
+    def _point_block(self, target, points, base):
+        """Sample one local-coordinate block using the shared tile kernels."""
+        import numpy as np
+        from . import _native
+        n = len(points)
+        limits = (1, 32, 32) if target['plane'] else (16, 16, 16)
+        tile = tuple(max(1, min(s, t)) for s, t in zip(target['shape'], limits))
+        plan = _native.PointPlan(target['shape'], base, points, tile,
+                                 target['channels'], target['order'], target['plane'])
+        inputs = self._tile_inputs(target, plan, tile)
+        if inputs is None:
+            if n <= 1:
+                raise MemoryError('one point stencil exceeds sampling_work_bytes')
+            yield from self._point_block(target, points[:n//2], base)
+            yield from self._point_block(target, points[n//2:], base)
+            return
+        dtype = np.dtype('float32') if target['order'] else target['native_dtype']
+        out = self._empty((target['channels'], n), dtype)
+        valid = self._empty((1, n), np.dtype('bool'))
+        fill = np.array([target['reader'].fill_value], dtype=target['native_dtype']).view(np.uint8)
+        if self.backend == 'cpu':
+            plan.cpu([self._bytes(a) for a in inputs], fill, target['dtype'].kind,
+                     target['dtype'].itemsize, self._bytes(out), self._bytes(valid), target['native_field'])
+        else:
+            _native._aligned_cuda(plan, inputs, fill, target['dtype'].kind, target['dtype'].itemsize,
+                                  out, valid, target['native_field'])
+            from .cuda import DeviceArray
+            out = DeviceArray(out, (target['channels'], n), dtype, self.device)
+            valid = DeviceArray(valid, (1, n), np.bool_, self.device)
+        yield out, valid
+
+    def _sample_points(self, target, points, base=(0, 0, 0)):
+        """ZYX local float32 points plus an integer source-grid origin."""
+        import numpy as np
+        n = len(points)
+        dtype = np.dtype('float32') if target['order'] else target['native_dtype']
+        if self.backend == 'cpu' and not target['order']:
+            dtype = target['dtype']
+        out, valid = self._owned_empty((target['channels'], n), dtype), self._owned_empty((1, n), np.dtype('bool'))
+        cursor = 0
+        for start in range(0, n, 32768):
+            block = np.ascontiguousarray(points[start:start+32768], dtype=np.float32)
+            for values, support in self._point_block(target, block, base):
+                self._copy_columns(values, out, cursor)
+                self._copy_columns(support, valid, cursor)
+                cursor += values.shape[-1]
+        return out, valid
+
+    def _owned_empty(self, shape, dtype):
+        out = self._empty(shape, dtype)
+        if self.backend == 'cuda':
+            from .cuda import DeviceArray
+            out = DeviceArray(out, shape, dtype, self.device)
+        return out
+
+    def _copy_columns(self, source, destination, offset):
+        """Copy a contiguous CxN block without downloading device values."""
+        if self.backend == 'cpu':
+            destination[:, offset:offset+source.shape[1]] = source
+        else:
+            from . import _native
+            _native._surface_copy_cuda(source._native, destination._native, source.shape[0],
+                                      source.shape[1], destination.shape[1], offset, source.dtype.itemsize)
 
     def close(self):
         if getattr(self, '_closed', True):
@@ -330,6 +413,8 @@ class SamplingEngine:
             self._opened.clear()
             self._tiles.items.clear()
             self._plans.items.clear()
+            if hasattr(self, '_geometries'):
+                self._geometries.clear()
             if self._own_decoded:
                 self._options['decoded_cache'].clear()
             if self._own_memory:

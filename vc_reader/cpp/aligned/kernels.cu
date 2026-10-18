@@ -30,10 +30,20 @@ void launch_many(const std::vector<Grid>& grids,const std::vector<std::vector<st
     if(!largest) return;
     auto k=device::allocate(all_keys.size()*8,id), t=device::allocate(all_tiles.size()*sizeof(void*),id);
     auto requests=device::allocate(grids.size()*sizeof(Job),id);
+    std::vector<float> points;
+    std::vector<std::size_t> point_offsets;
+    for(const auto& g:grids) {
+        point_offsets.push_back(points.size());
+        if(g.points) points.insert(points.end(),g.points,g.points+3*g.count);
+    }
+    auto device_points=device::allocate(points.size()*sizeof(float),id);
+    if(!points.empty()) device::check(cudaMemcpyAsync(device_points->ptr,points.data(),device_points->bytes,cudaMemcpyHostToDevice,device::stream()));
     std::vector<Job> jobs;
     for(std::size_t i=0;i<grids.size();++i) jobs.push_back({grids[i],
         all_keys.empty() ? nullptr : static_cast<std::int64_t*>(k->ptr)+offsets[i],
         all_tiles.empty() ? nullptr : static_cast<const void**>(t->ptr)+offsets[i],keys[i].size()});
+    for(std::size_t i=0;i<grids.size();++i) if(grids[i].points)
+        jobs[i].grid.points=static_cast<float*>(device_points->ptr)+point_offsets[i];
     if(!all_keys.empty()) {
         device::check(cudaMemcpyAsync(k->ptr,all_keys.data(),k->bytes,cudaMemcpyHostToDevice,device::stream()));
         device::check(cudaMemcpyAsync(t->ptr,all_tiles.data(),t->bytes,cudaMemcpyHostToDevice,device::stream()));

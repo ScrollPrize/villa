@@ -38,6 +38,7 @@ struct Grid {
     int channels=1, order=1;
     bool plane=false;
     Field field{};
+    const float* points=nullptr;
 };
 struct Cell {
     std::int64_t at[8][3]{};
@@ -70,7 +71,7 @@ VCR_ALIGNED_HD inline Cell cell(const Grid& g, std::size_t i) {
     c.output=((z+g.offset[0])*g.output[1]+y+g.offset[1])*g.output[2]+x+g.offset[2];
     float fraction[3]{}; std::int64_t lo[3]{};
     for (int a=0;a<3;++a) {
-        const float q=sampling::affine(g.origin[a],g.axes+3*a,float(z+g.offset[0]),float(y+g.offset[1]),float(x+g.offset[2]));
+        const float q=g.points ? g.points[3*i+a] : sampling::affine(g.origin[a],g.axes+3*a,float(z+g.offset[0]),float(y+g.offset[1]),float(x+g.offset[2]));
         if (!std::isfinite(q) || q<=-0x1p60f || q>=0x1p60f) return c;
         if (g.plane && a==0) {
             // The normal coordinate has no integer global origin.

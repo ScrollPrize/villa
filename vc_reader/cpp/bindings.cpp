@@ -65,6 +65,7 @@ static std::vector<std::size_t> output_counts(const std::vector<vcr::Index>& sha
 }
 
 #include "aligned/bindings.hpp"
+#include "surface/bindings.hpp"
 
 NB_MODULE(_native, m)
 {
@@ -75,6 +76,7 @@ NB_MODULE(_native, m)
     m.def("reader_cuda_available", [] { return false; });
 #endif
     vcr::aligned::bind(m);
+    vcr::surface::bind(m);
     // Engines inherited by a forked process are deliberately kept alive and never
     // destroyed there (their threads do not exist in the child), so they are
     // still referenced at exit; that is not a leak worth reporting.

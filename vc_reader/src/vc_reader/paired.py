@@ -7,12 +7,7 @@ from .affine import Affine
 from ._sampling_engine import SamplingEngine
 from .browsing import _select_level
 from .sources import SampleResult, SurfaceRegistration, VolumeRegistration
-from .reader.source_resolution import array_placement
-
-
-def _pixel_affine(rows):
-    return Affine.from_rows(((rows[0][0], rows[0][1], 0, rows[0][2]),
-                             (rows[1][0], rows[1][1], 0, rows[1][2]), (0, 0, 1, 0)))
+from .reader.source_resolution import array_placement, pixel_affine as _pixel_affine
 
 
 def _companion_to_label(label, mask):

@@ -1536,3 +1536,36 @@ passes and ten measured passes, plus separate cold-reader, allocation and
 cProfile runs. Existing dependencies/builds are required; no installation occurs.
 
 See [measurement commands and results](../docs/aligned-sampling-benchmarks.md).
+
+## Surface layers and label-patch projection
+
+`bench_surface.py` runs six real requests, two warmups and ten repetitions,
+recording first requests, initialization, profiles, cache/transfer counters and
+output hashes. The default uses the bundled PHercParis4 tifxyz and the existing
+local level-2 volume. It independently verifies coordinates with TIFF/SciPy
+and CT samples against direct volume reads.
+
+```bash
+AGENTS_AGENT_MODE=1 PYTHONPATH=src:benchmarks .venv/bin/python benchmarks/bench_surface.py \
+  --native-dir /tmp/vc-reader-cuda --backend both --output /tmp/surface-layers.json
+
+AGENTS_AGENT_MODE=1 PYTHONPATH=src:benchmarks .venv/bin/python benchmarks/bench_surface.py \
+  --native-dir /tmp/vc-reader-cuda --backend both \
+  --label-source benchmarks/fixtures/surface_projection/label.json \
+  --reference-source benchmarks/fixtures/surface_projection/reference.json \
+  --start 18576 7984 --size 16 16 --output /tmp/surface-projection.json
+```
+
+The second command uses a recorded real PHerc0009B label/geometry pair and an
+explicit render-convention registration. It compares the first zero-thickness
+projection to `surface_reference.py`, an independent float64 scalar oracle, and
+checks CT crops directly. It benchmarks a 2.4 µm label band with 2.4 µm context.
+The initial run fetches only geometry files and requested label/volume chunks;
+subsequent runs can add `--offline`. See
+[registration evidence and measurements](../docs/surface-sampling-benchmarks.md).
+
+`bench_pipeline.py` now uses `SurfaceGeometry` for its curved point workload.
+Tifxyz `scale` is XY, so the unequal scales in the bundled strip are applied to
+columns and rows respectively. Previous surface timing tables used the opposite
+axis interpretation; their selected UV requests and hashes are not comparable
+to new runs. The volume reader workload still samples one surface layer.

@@ -65,6 +65,22 @@ struct Plan {
         });
     }
 };
+struct PointPlan : Plan {
+    std::vector<float> coordinates;
+    PointPlan(Triple source, Triple base, const float* points, std::size_t n,
+              Triple tile, int channels, int order, bool plane)
+        : Plan(source,{1,1,std::int64_t(n)},{1,1,std::int64_t(n)},{0,0,0},base,
+               {0,0,0},{0,0,0,0,0,0,0,0,0},tile,channels,order,plane,false),
+          coordinates(points,points+3*n) {
+        grid.points=coordinates.data();
+        std::unordered_set<std::int64_t> seen;
+        for(std::size_t i=0;i<n;++i) {
+            const auto c=cell(grid,i);
+            for(int k=0;k<c.count;++k) if(c.support[k]) seen.insert(key(grid,c.at[k]));
+        }
+        keys.assign(seen.begin(),seen.end()); std::sort(keys.begin(),keys.end());
+    }
+};
 #ifdef VC_READER_CUDA
 void launch(const Grid&,const std::vector<std::int64_t>&,const std::vector<const void*>&,const void*,ElementType,void*,bool*,int);
 void launch_many(const std::vector<Grid>&,const std::vector<std::vector<std::int64_t>>&,
