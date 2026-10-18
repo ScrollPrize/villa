@@ -122,3 +122,52 @@ def test_batch_after_missing_pair_errors_before_writing(tmp_path):
     with pytest.raises(SystemExit):
         lta.main(["--batch", str(tmp_path), "--after", str(tmp_path / "after"), "--out", str(out)])
     assert not out.exists()
+
+
+def test_hole_at_crop_face_is_excluded_from_interior_b1():
+    # holes cut at the crop face are mostly unjudgeable slivers in the Kaggle crops; the
+    # interior count is what ranked.csv sorts on, so a face hole must not inflate it
+    face, mid = sheet(), sheet()
+    face[:, 4:7, 18:22] = 0     # hole whose rim is the first labelled rows next to the face
+    face[:, 3, 18:22] = 1       # close it off so it is a hole, not a notch
+    mid[:, 18:22, 18:22] = 0
+    mf, _ = lta.audit(face)
+    mm, _ = lta.audit(mid)
+    assert (mf["b1_total_big"], mf["b1_interior"]) == (1, 0)
+    assert (mm["b1_total_big"], mm["b1_interior"]) == (1, 1)
+
+    # a crop thinner than the trimmed margin has no interior
+    tiny = np.zeros((10, 40, 40), np.uint8); tiny[2:8, 4:-4, 4:-4] = 1; tiny[2:8, 18:22, 18:22] = 0
+    mt, _ = lta.audit(tiny)
+    assert (mt["b1_total_big"], mt["b1_interior"]) == (1, 0)
+
+
+def test_ranked_puts_interior_holes_first_and_drops_clean_crops():
+    base = {k: 0 for k, _ in lta.SEVERITY}
+    rows = [{"crop": "clean", **base},
+            {"crop": "junctions", **base, "n_junction_clusters": 9},
+            {"crop": "face_hole", **base, "b1_total_big": 5},
+            {"crop": "hole", **base, "b1_interior": 1, "b1_total_big": 1}]
+    r = lta.ranked(rows)
+    assert [x["crop"] for x in r] == ["hole", "junctions", "face_hole"]
+    assert r[0]["rank"] == 1 and r[0]["reason"] == "1 interior holes, 1 holes incl. crop faces"
+
+
+def test_batch_writes_ranked_csv(tmp_path):
+    (tmp_path / "labels").mkdir()
+    holed = sheet(); holed[:, 18:24, 18:24] = 0
+    tifffile.imwrite(tmp_path / "labels" / "a_clean.tif", sheet())
+    tifffile.imwrite(tmp_path / "labels" / "b_holed.tif", holed)
+    out = tmp_path / "out"
+    assert lta.main(["--batch", str(tmp_path), "--out", str(out)]) == 0
+    lines = (out / "ranked.csv").read_text().splitlines()
+    assert len(lines) == 2 and lines[1].startswith("1,b_holed,")
+
+
+def test_detect_holes_cpu_topology_matches_known_shapes():
+    # detect_holes/hole_viewer now get their CPU Betti numbers from the shared helper;
+    # both connectivity pairings must still give the textbook answers
+    dh = pytest.importorskip("vesuvius.scripts.detect_holes")
+    for fg, bg in ((26, 6), (6, 26)):
+        topo = lambda v: dh.compute_component_topology(v, fg_connectivity=fg, bg_connectivity=bg, use_cpu=True)[:2]
+        assert (topo(torus()), topo(shell()), topo(sheet())) == ((1, 0), (0, 1), (0, 0))

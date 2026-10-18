@@ -41,6 +41,8 @@ from tqdm import tqdm
 
 from scipy import ndimage as ndi
 
+from vesuvius.image_proc.topology import component_betti, conn_to_skimage
+
 try:
     import cripser
     _HAS_CRIPSER = True
@@ -126,16 +128,7 @@ def load_tif_3d(path: Path, allow_2d: bool = False) -> np.ndarray:
     return arr
 
 
-def _conn_to_skimage(conn: int, ndim: int) -> int:
-    if ndim == 3:
-        mapping = {6: 1, 18: 2, 26: 3}
-    elif ndim == 2:
-        mapping = {4: 1, 8: 2}
-    else:
-        raise ValueError(f"Unsupported ndim={ndim}")
-    if conn not in mapping:
-        raise ValueError(f"Invalid connectivity {conn} for ndim={ndim}")
-    return mapping[conn]
+_conn_to_skimage = conn_to_skimage
 
 
 def _border_mask(shape: Tuple[int, ...]) -> np.ndarray:
@@ -183,33 +176,27 @@ def compute_component_topology(
     Returns (holes_b1, cavities_b2, euler_characteristic) for a single component mask.
     For 3D, uses b1 = b0 + b2 - chi, with b0=1.
     """
-    comp = comp.astype(bool)
-    comp_pad = np.pad(comp, pad_width=1, mode="constant", constant_values=False)
+    if use_cpu:
+        if not _HAS_SKIMAGE:
+            raise ImportError("scikit-image is required for --cpu (Euler number).")
+        return component_betti(comp, fg_connectivity, bg_connectivity)
+    if not _HAS_CUPY:
+        raise ImportError("CuPy/cuCIM not available; use --cpu to run on CPU.")
+
+    comp_pad = np.pad(comp.astype(bool), pad_width=1, mode="constant", constant_values=False)
 
     # Cavities: background components not connected to the padded border
-    bg = ~comp_pad
-    if use_cpu:
-        struct_bg = ndi.generate_binary_structure(comp_pad.ndim, _conn_to_skimage(bg_connectivity, comp_pad.ndim))
-        bg_lab, num_bg = ndi.label(bg.astype(np.uint8), structure=struct_bg)
-    else:
-        if not _HAS_CUPY:
-            raise ImportError("CuPy/cuCIM not available; use --cpu to run on CPU.")
-        bg_gpu = cp.asarray(bg.astype(np.uint8))
-        bg_lab = cp.asnumpy(cucim_label(bg_gpu, connectivity=_conn_to_skimage(bg_connectivity, comp_pad.ndim)))
-        num_bg = int(bg_lab.max())
+    bg_gpu = cp.asarray((~comp_pad).astype(np.uint8))
+    bg_lab = cp.asnumpy(cucim_label(bg_gpu, connectivity=_conn_to_skimage(bg_connectivity, comp_pad.ndim)))
+    num_bg = int(bg_lab.max())
     border = _border_mask(bg_lab.shape)
     outside_ids = np.unique(bg_lab[border])
     outside_ids = outside_ids[outside_ids > 0]
     cavities = int(num_bg - outside_ids.size)
 
     # Euler characteristic (digital topology)
-    if use_cpu:
-        if not _HAS_SKIMAGE:
-            raise ImportError("scikit-image is required for --cpu (Euler number).")
-        chi = int(sk_euler_number(comp_pad, connectivity=_conn_to_skimage(fg_connectivity, comp_pad.ndim)))
-    else:
-        comp_pad_gpu = cp.asarray(comp_pad)
-        chi = int(cucim_euler_number(comp_pad_gpu, connectivity=_conn_to_skimage(fg_connectivity, comp_pad.ndim)))
+    comp_pad_gpu = cp.asarray(comp_pad)
+    chi = int(cucim_euler_number(comp_pad_gpu, connectivity=_conn_to_skimage(fg_connectivity, comp_pad.ndim)))
 
     # Betti numbers for a single component (b0 = 1)
     if comp_pad.ndim == 3:

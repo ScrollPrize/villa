@@ -8,7 +8,8 @@ foreground; components touching them (or the crop border) are reported as
 Per crop it measures:
   * connected components (26-connectivity): count, size histogram, tiny fragments
   * per component: Euler characteristic and Betti numbers b1 (handles/holes
-    through a sheet) and b2 (enclosed cavities), from a padded bounding box
+    through a sheet) and b2 (enclosed cavities), from a padded bounding box;
+    ``b1_interior`` repeats b1 with 6 voxels trimmed off each crop face
   * sheet thickness: 2*EDT-1 sampled at medial-ridge voxels (local EDT maxima)
   * fused sheets: after eroding by ``--erode`` voxels, a component that splits
     into >= 2 pieces of >= ``--min-piece`` voxels is "fused" (blind on 1-3
@@ -26,7 +27,8 @@ Usage:
 when present, for ``--plot``); with ``--after`` it names a directory holding
 same-named label files.
 
-Writes ``<crop>.json`` per crop, ``aggregate.csv`` for all crops, and
+Writes ``<crop>.json`` per crop, ``aggregate.csv`` for all crops,
+``ranked.csv`` (batch: crops with findings, worst first) and
 ``<crop>.delta.json`` (metric: [before, after]) with ``--after``.
 Exit code 0 on success, 2 when a ``--fail-on METRIC=MAX`` limit is exceeded.
 
@@ -45,13 +47,20 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from vesuvius.image_proc.topology import component_betti
+
 TINY = 100  # voxels; components smaller than this are "tiny fragments"
 THICK = 7  # voxels; ridge thickness at or above this is flagged
 SIZE_BINS = [1, 10, 100, 1_000, 10_000, 100_000, 10**9]
+EDGE = 6  # voxels; b1_interior ignores holes within this distance of a crop face
+# ranked.csv order: most severe first; each entry is (metric, phrase for the reason column)
+SEVERITY = [("b1_interior", "interior holes"), ("b2_total_big", "cavities"),
+            ("n_fused_components", "fused components"), ("n_junction_clusters", "junction clusters"),
+            ("b1_total_big", "holes incl. crop faces")]
 
 FLAT_KEYS = [
     "n_components", "n_tiny", "tiny_voxel_frac", "n_big_components", "n_closed_big",
-    "b1_total_big", "n_big_with_b1", "n_closed_with_b1", "b2_total_big",
+    "b1_total_big", "b1_interior", "n_big_with_b1", "n_closed_with_b1", "b2_total_big",
     "n_fused_components", "fused_voxel_frac", "bridge_voxels",
     "n_junction_clusters", "junction_voxel_frac", "n_components_with_junction",
     "largest_component_frac",
@@ -73,11 +82,21 @@ def _deps():
 
 def component_topology(mask: np.ndarray) -> dict[str, int]:
     """Euler number, b1, b2 of a connected binary mask (foreground 26-conn, background 6-conn)."""
-    cc3d, _, euler_number = _deps()
-    m = np.pad(mask, 1)
-    chi = int(euler_number(m, connectivity=3))
-    b2 = int(cc3d.connected_components(~m, connectivity=6).max()) - 1  # all bg but the outer one
-    return {"euler": chi, "b1": 1 + b2 - chi, "b2": b2}
+    _deps()
+    b1, b2, chi = component_betti(mask, fg_connectivity=26, bg_connectivity=6)
+    return {"euler": chi, "b1": b1, "b2": b2}
+
+
+def interior_b1(fg: np.ndarray, margin: int) -> int:
+    """Total b1 of the big components left after trimming ``margin`` voxels off every crop face."""
+    cc3d, ndi, _ = _deps()
+    if min(fg.shape) <= 2 * margin:
+        return 0
+    core = fg[(slice(margin, -margin or None),) * fg.ndim]
+    comp = cc3d.connected_components(core, connectivity=26)
+    return sum(component_topology(comp[sl] == cid)["b1"]
+               for cid, sl in enumerate(ndi.find_objects(comp), start=1)
+               if sl is not None and np.count_nonzero(comp[sl] == cid) >= TINY)
 
 
 def thickness_stats(fg: np.ndarray):
@@ -181,6 +200,7 @@ def audit(label, erode=1, min_piece=500, surface_value=1, ignore_value=2):
         "euler_total_big": int(sum(r["euler"] for r in big)),
         "b1_total_big": int(sum(r["b1"] for r in big)),
         "b1_total_closed": int(sum(r["b1"] for r in closed)),
+        "b1_interior": int(interior_b1(fg, EDGE)) if big else 0,
         "n_big_with_b1": sum(r["b1"] > 0 for r in big),
         "n_closed_with_b1": sum(r["b1"] > 0 for r in closed),
         "b2_total_big": int(sum(r["b2"] for r in big)),
@@ -227,6 +247,17 @@ def overlay(img, label, flags, path, surface_value=1):
     fig.tight_layout()
     fig.savefig(path, dpi=110)
     plt.close(fig)
+
+
+def ranked(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Crops with any finding, most severe first (lexicographic over SEVERITY), with a reason."""
+    keys = [k for k, _ in SEVERITY]
+    hit = [r for r in rows if any(r[k] for k in keys)]
+    hit.sort(key=lambda r: tuple(-r[k] for k in keys))
+    return [{"rank": i, "crop": r["crop"],
+             "reason": ", ".join(f"{r[k]} {name}" for k, name in SEVERITY if r[k]),
+             **{k: r[k] for k in keys}}
+            for i, r in enumerate(hit, start=1)]
 
 
 def _parse_fail_on(specs: Sequence[str]) -> dict[str, float]:
@@ -320,6 +351,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         w = csv.DictWriter(fh, fieldnames=list(rows[0]))
         w.writeheader()
         w.writerows(rows)
+    if a.batch:
+        top = ranked(rows)
+        with open(a.out / "ranked.csv", "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=["rank", "crop", "reason"] + [k for k, _ in SEVERITY])
+            w.writeheader()
+            w.writerows(top)
+        print(f"{len(top)} of {len(rows)} crops have findings; worst first in {a.out / 'ranked.csv'}")
     return 2 if failed else 0
 
 
