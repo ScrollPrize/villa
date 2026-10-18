@@ -11,7 +11,7 @@ struct UnsharpMaskKernel {
 };
 template<class T> inline void channel_apply(const UnsharpMask&,std::vector<T>& v,const Grid& g,const ChannelPlan& p){
     auto blurred=v;gaussian_blur(blurred,g,std::vector<double>(g.shape.size(),p.values[1]),4,Boundary::Nearest);
-    volume_detail::map_channel(v,g,UnsharpMaskKernel{p.values[0]},nullptr,{},blurred.data());
+    volume_detail::map_channel<UnsharpMask>(v,g,UnsharpMaskKernel{p.values[0]},nullptr,{},blurred.data());
 }
 inline void apply(const UnsharpMask& t,Sample& s,const Parameters& p) { volume_detail::apply_checked_channels(t,s,p); }
 } // namespace vcr::augment

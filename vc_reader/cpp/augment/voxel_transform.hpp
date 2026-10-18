@@ -1,6 +1,7 @@
 #pragma once
 #include "spatial.hpp"
 #include "precision.hpp"
+#include "channel_requirements.hpp"
 #include "histogram.hpp"
 #include "intensity_fields.hpp"
 namespace vcr::augment::volume_detail {
@@ -12,10 +13,12 @@ template<class T,int D=3> struct ChannelContextT {
     const T* auxiliary=nullptr;
 };
 using ChannelContext=ChannelContextT<double>;
-template<class Kernel,class T> void map_channel(std::vector<T>& values,const Grid& grid,const Kernel& kernel,
+template<class Transform,class Kernel,class T> void map_channel(std::vector<T>& values,const Grid& grid,const Kernel& kernel,
                                       const double* table=nullptr,Stats reference={},const T* auxiliary=nullptr) {
+    Stats input{};
+    if constexpr(channel_bounds<Transform>) input=stats<channel_moments<Transform>>(values.data(),values.size());
     with_grid(grid.shape,[&](const auto& g) {
-    ChannelContextT<T,std::decay_t<decltype(g)>::dim> context{g,stats(values.data(),values.size()),table,reference,auxiliary};
+    ChannelContextT<T,std::decay_t<decltype(g)>::dim> context{g,input,table,reference,auxiliary};
     std::vector<T> output(values.size());
     for(std::size_t i=0;i<values.size();++i){output[i]=kernel(values.data(),i,context);require(std::isfinite(output[i]),"augmentation produced nonfinite values");}
     values.swap(output);

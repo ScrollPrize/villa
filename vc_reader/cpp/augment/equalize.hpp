@@ -16,7 +16,7 @@ struct EqualizeKernel {
 };
 template<class T> inline void channel_apply(const Equalize& t,std::vector<T>& v,const Grid& g,const ChannelPlan&) {
     auto table=volume_detail::with_grid(g.shape,[&](const auto& grid){return volume_detail::channel_histograms(v,grid,volume_detail::HistogramGrid(grid,g.shape,t.bins,0));});
-    volume_detail::map_channel(v,g,EqualizeKernel{t.bins},table.data());
+    volume_detail::map_channel<Equalize>(v,g,EqualizeKernel{t.bins},table.data());
 }
 inline void apply(const Equalize& t,Sample& s,const Parameters& p) { volume_detail::apply_checked_channels(t,s,p); }
 } // namespace vcr::augment

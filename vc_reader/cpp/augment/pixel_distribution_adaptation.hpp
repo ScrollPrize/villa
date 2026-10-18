@@ -16,7 +16,7 @@ struct PixelDistributionAdaptationKernel {
 };
 template<class T> inline void channel_apply(const PixelDistributionAdaptation& t,std::vector<T>& v,const Grid& g,const ChannelPlan& p) {
     auto summary=volume_detail::visit_reference_channel(t.reference,p.channel,[](const auto& ref){return volume_detail::stats(ref.data(),ref.size());});
-    volume_detail::map_channel(v,g,PixelDistributionAdaptationKernel{p.values[0],t.mode},nullptr,summary);
+    volume_detail::map_channel<PixelDistributionAdaptation>(v,g,PixelDistributionAdaptationKernel{p.values[0],t.mode},nullptr,summary);
 }
 inline void apply(const PixelDistributionAdaptation& t,Sample& s,const Parameters& p) { volume_detail::apply_checked_channels(t,s,p); }
 } // namespace vcr::augment

@@ -2,10 +2,14 @@
 #include "volume_grid.hpp"
 namespace vcr::augment::volume_detail {
 struct Stats { double low,high,mean,stddev; };
-template<class T> VCR_HD Stats stats(const T* v,std::size_t n) {
+template<bool Moments=true,class T> VCR_HD Stats stats(const T* v,std::size_t n) {
     Stats s{double(v[0]),double(v[0]),0,0};double m2=0;
-    for(std::size_t i=0;i<n;++i) { double x=v[i];s.low=x<s.low?x:s.low;s.high=x>s.high?x:s.high;double d=x-s.mean;s.mean+=d/double(i+1);m2+=d*(x-s.mean); }
-    s.stddev=sqrt(m2>0?m2/double(n):0);return s;
+    for(std::size_t i=0;i<n;++i) {
+        double x=v[i];s.low=x<s.low?x:s.low;s.high=x>s.high?x:s.high;
+        if constexpr(Moments){double d=x-s.mean;s.mean+=d/double(i+1);m2+=d*(x-s.mean);}
+    }
+    if constexpr(Moments)s.stddev=sqrt(m2>0?m2/double(n):0);
+    return s;
 }
 VCR_HD inline int bin(double x,double lo,double hi,int bins) {
     return hi>lo?int(clamp((x-lo)/(hi-lo)*bins,0,bins-1)):0;

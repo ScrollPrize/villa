@@ -19,7 +19,7 @@ template<class T> inline void channel_apply(const HistogramMatching& t,std::vect
     visit_reference_channel(t.reference,p.channel,[&](const auto& ref){
         summary=stats(ref.data(),ref.size());histogram(ref.data(),ref.size(),table.data()+t.bins,t.bins,summary.low,summary.high);
     });cdf(table.data()+t.bins,t.bins);
-    map_channel(v,g,HistogramMatchingKernel{p.values[0],t.bins},table.data(),summary);
+    map_channel<HistogramMatching>(v,g,HistogramMatchingKernel{p.values[0],t.bins},table.data(),summary);
 }
 inline void apply(const HistogramMatching& t,Sample& s,const Parameters& p) { volume_detail::apply_checked_channels(t,s,p); }
 } // namespace vcr::augment

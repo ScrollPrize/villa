@@ -15,7 +15,7 @@ struct CLAHEKernel {
 };
 template<class T> inline void channel_apply(const CLAHE& t,std::vector<T>& v,const Grid& g,const ChannelPlan& p) {
     volume_detail::with_grid(g.shape,[&](const auto& grid){volume_detail::HistogramGrid layout(grid,t.tile_shape,t.bins,p.values[0]);
-    auto table=volume_detail::channel_histograms(v,grid,layout);volume_detail::map_channel(v,g,CLAHEKernel{layout},table.data());
+    auto table=volume_detail::channel_histograms(v,grid,layout);volume_detail::map_channel<CLAHE>(v,g,CLAHEKernel{layout},table.data());
     });
 }
 inline void apply(const CLAHE& t,Sample& s,const Parameters& p) { volume_detail::apply_checked_channels(t,s,p); }

@@ -2,13 +2,7 @@
 #include "channel.cuh"
 #include "channel_statistics.cuh"
 #include "../voxel_transform.hpp"
-namespace vcr::augment {
-struct Illumination;struct Vignetting;struct RandomToneCurve;struct SaltAndPepper;struct Equalize;struct CLAHE;struct HistogramMatching;
-struct PlasmaBrightnessContrast;struct PixelDistributionAdaptation;
-}
 namespace vcr::augment::cuda {
-template<class T> constexpr bool channel_moments = std::is_same_v<T,PlasmaBrightnessContrast> || std::is_same_v<T,PixelDistributionAdaptation>;
-template<class T> constexpr bool channel_bounds = channel_moments<T> || std::is_same_v<T,RandomToneCurve> || std::is_same_v<T,SaltAndPepper> || std::is_same_v<T,Equalize> || std::is_same_v<T,CLAHE> || std::is_same_v<T,HistogramMatching>;
 namespace vd = volume_detail;
 template<class T> __global__ void check_channel_output(const T* data,std::size_t size,double limit,int* error) {
     EACH_INDEX(size) if(!isfinite(data[i]) || fabs(data[i])>limit)atomicExch(error,1);

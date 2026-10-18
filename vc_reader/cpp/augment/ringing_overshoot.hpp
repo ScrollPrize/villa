@@ -25,11 +25,11 @@ template<int D,class T> inline void ringing_channel(std::vector<T>& v,const Grid
         weight*=.5+.5*cos(volume_detail::pi*j/(radius+1));
         total+=weights[j+radius]=weight;
     }
+    // Normalize the short kernel once; the image passes only accumulate taps.
+    for(auto& weight:weights) weight=T(double(weight)/total);
     std::vector<T> output(v.size());
     for(int a=0;a<D;++a){
         convolve_axis(v,output,g,a,weights,Boundary::Nearest);
-        // Divide after accumulation, matching the original rounding order.
-        for(auto& value:output){value/=total;require(std::isfinite(value),"augmentation produced nonfinite values");}
         v.swap(output);
     }
 }

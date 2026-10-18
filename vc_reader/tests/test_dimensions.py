@@ -136,6 +136,14 @@ class DimensionTests(unittest.TestCase):
                                center[1]+(x-center[1])/(1+.2*j/4)) for j in range(5))/5
             cases = [(A.Defocus(radius), defocused), (A.MotionBlur(length=3, direction=(1, 2), samples=5), motion),
                      (A.ZoomBlur(strength=.2, center=(.3, .7), samples=5), zoom)]
+            offsets = np.arange(-2, 3)
+            weights = .6*np.sinc(.6*offsets)*(.5+.5*np.cos(np.pi*offsets/3))
+            weights /= weights.sum()
+            ringing = image.astype(np.float64)
+            for direction in ((1, 0), (0, 1)):
+                ringing = sum(w*bilinear(ringing, y+k*direction[0], x+k*direction[1])
+                              for k, w in zip(offsets, weights))
+            cases.append((A.RingingOvershoot(cutoff=.6, radius=2), ringing))
             for axis in ((1., 0.), (0., 1.), (1., 2.)):
                 u = np.array(axis)/np.linalg.norm(axis)
                 frame = (u, np.array([-u[1], u[0]]))
