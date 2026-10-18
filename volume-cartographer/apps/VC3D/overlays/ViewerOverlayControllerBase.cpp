@@ -1605,6 +1605,7 @@ void ViewerOverlayControllerBase::rebuildOverlay(VolumeViewerBase* viewer)
         return;
     }
 
+    if (!needsOverlayRebuild(viewer)) return;
     OverlayBuilder builder(viewer);
     collectPrimitives(viewer, builder);
     auto primitives = builder.takePrimitives();

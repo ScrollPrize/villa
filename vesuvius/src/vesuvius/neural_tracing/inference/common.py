@@ -1349,6 +1349,18 @@ def _print_agg_extrap_sampling_debug(samples, extrap_lookup, grow_direction, max
         print(f"stack-count min/max/mean: {int(sc.min())}/{int(sc.max())}/{sc.mean():.2f}")
 
 
+def _existing_surface_uuid(tifxyz_path):
+    """The meta.json uuid of an existing tifxyz directory, or None."""
+    meta_path = os.path.join(tifxyz_path, "meta.json")
+    try:
+        with open(meta_path, "r", encoding="utf-8") as stream:
+            meta = json.load(stream)
+    except (OSError, ValueError):
+        return None
+    value = meta.get("uuid") if isinstance(meta, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
 def _save_merged_surface_tifxyz(args, merged, checkpoint_path, model_config, call_args,
                                  input_scale=None):
     merged_zyxs = np.asarray(merged.get("merged_zyxs"), dtype=np.float32)
@@ -1377,6 +1389,8 @@ def _save_merged_surface_tifxyz(args, merged, checkpoint_path, model_config, cal
     )
 
     overwrite_input_surface = bool(getattr(args, "overwrite_input_surface", False))
+    # meta.json identity: None mints a fresh uuid4 for a new output surface.
+    surface_uuid = None
     if overwrite_input_surface:
         input_tifxyz_path = os.path.abspath(str(args.tifxyz_path))
         tifxyz_uuid = os.path.basename(os.path.normpath(input_tifxyz_path))
@@ -1385,6 +1399,8 @@ def _save_merged_surface_tifxyz(args, merged, checkpoint_path, model_config, cal
                 "--overwrite-input-surface requires --tifxyz-path to point to a tifxyz directory."
             )
         out_dir = os.path.dirname(input_tifxyz_path)
+        # An in-place rewrite keeps the surface's existing identity.
+        surface_uuid = _existing_surface_uuid(input_tifxyz_path)
         if args.tifxyz_out_dir:
             print("--overwrite-input-surface set: ignoring --tifxyz-out-dir.")
     else:
@@ -1417,6 +1433,7 @@ def _save_merged_surface_tifxyz(args, merged, checkpoint_path, model_config, cal
         step_size=tifxyz_step_size,
         voxel_size_um=tifxyz_voxel_size_um,
         source=source,
+        surface_uuid=surface_uuid,
         additional_metadata={
             "grow_direction": args.grow_direction,
             "extrapolation_method": args.extrapolation_method,

@@ -229,6 +229,12 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addSeparator();
     _fileMenu->addAction(_attachVolumeAct);
     _fileMenu->addAction(_attachSegmentsAct);
+    _fileMenu->addAction(QObject::tr("Open Automated Fiber Volume…"), this, [qWindow]() {
+        // macOS hides the native file-type selector when there is only one filter.
+        const auto path = QFileDialog::getOpenFileName(qWindow, QObject::tr("Open Automated Fiber Volume (.afv)"),
+                                                     {}, QObject::tr("Automated Fiber Volume (*.afv);;All files (*)"));
+        if (!path.isEmpty()) qWindow->openFiberCollection(path);
+    });
     _fileMenu->addAction(_attachNormalGridAct);
     _fileMenu->addAction(_attachUmbilicusAct);
     _fileMenu->addAction(_detachUmbilicusAct);
@@ -474,16 +480,18 @@ void MenuActionController::showAttachRemoteZarrDialog(const QString& initialUrl)
         return;
     }
 
-    bool ok = false;
-    QString url = QInputDialog::getText(
-        _window,
+    const auto url = promptLocation(
         QObject::tr("Attach Remote Zarr"),
-        QObject::tr("Enter remote OME-Zarr URL (http://, https://, s3://):"),
-        QLineEdit::Normal,
-        initialUrl,
-        &ok);
+        QObject::tr("Select a remote OME-Zarr root (http://, https://, s3://, sftp://)."),
+        initialUrl.isEmpty() ? QStringLiteral("s3://") : initialUrl,
+        {}, false, true);
 
-    if (!ok || url.trimmed().isEmpty()) {
+    if (url.trimmed().isEmpty()) {
+        return;
+    }
+    if (!vc::project::isLocationRemote(url.toStdString())) {
+        QMessageBox::warning(_window, QObject::tr("Attach failed"),
+            QObject::tr("Select a remote volume, or use Attach Volume for a local one."));
         return;
     }
 
@@ -1519,7 +1527,7 @@ void MenuActionController::surfaceFromSelection()
         std::string newId = _window->_state->activeSurfaceId() + std::string("_sel_") + ts.toStdString() + std::string("_") + std::to_string(idx++);
         std::filesystem::path outDir = parentDir / newId;
         try {
-            filtered->save(outDir.string(), newId);
+            filtered->saveAsNew(outDir);
             created++;
         } catch (const std::exception& e) {
             _window->showStatusBarMessage(QObject::tr("Failed to save selection: ") + e.what(), 5000);
@@ -1789,7 +1797,7 @@ void MenuActionController::attachVolume()
     }
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     auto loc = promptLocation(QObject::tr("Attach Volume"),
-                              QObject::tr("Pick a zarr volume or a folder of zarrs (local or s3://, https://)."),
+                              QObject::tr("Pick a zarr volume or a folder of zarrs (local or s3://, https://, sftp://)."),
                               settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
                               {}, false, true);
     if (loc.isEmpty()) return;
@@ -2011,7 +2019,7 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote, const QSt
         if (location.isEmpty())
             return;
         if (!vc::lasagna::isRemoteLasagnaLocation(location.toStdString())) {
-            QMessageBox::warning(_window, QObject::tr("Attach failed"), QObject::tr("The remote action requires an s3://, http://, or https:// manifest."));
+            QMessageBox::warning(_window, QObject::tr("Attach failed"), QObject::tr("The remote action requires an s3://, http://, https://, or sftp:// manifest."));
             return;
         }
     } else {

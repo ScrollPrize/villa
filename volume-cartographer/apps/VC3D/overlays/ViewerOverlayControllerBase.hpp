@@ -343,6 +343,8 @@ protected:
     };
 
     virtual bool isOverlayEnabledFor(VolumeViewerBase* viewer) const;
+    // Lets a controller skip the rebuild when its primitives would be unchanged.
+    virtual bool needsOverlayRebuild(VolumeViewerBase*) const { return true; }
     virtual void collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder) = 0;
     FilteredPoints projectPointChainForHitTest(
         VolumeViewerBase* viewer,

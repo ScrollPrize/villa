@@ -7,6 +7,7 @@ import time
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from datetime import datetime
+from uuid import uuid4
 
 from vesuvius.neural_tracing.nets.models import make_model, load_checkpoint
 from vesuvius.neural_tracing.infer import Inference
@@ -549,6 +550,7 @@ def trace(checkpoint_path, out_path, start_xyz, volume_zarr, volume_scale, steps
             json.dump({
                 'collections': {
                     '0': {
+                        'uuid': str(uuid4()),
                         'name': 'strip',
                         'color': [1.0, 0.5, 0.5],
                         'metadata': {'winding_is_absolute': False},
