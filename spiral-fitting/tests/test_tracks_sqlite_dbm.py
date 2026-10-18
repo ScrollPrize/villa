@@ -25,7 +25,7 @@ def write_sqlite_dbm(path, items):
     # Same single-table layout as CPython's Lib/dbm/sqlite3.py, written with
     # plain sqlite3 so the fixture also builds on Python < 3.13.
     connection = sqlite3.connect(path)
-    connection.execute('PRAGMA journal_mode = wal')  # as dbm.sqlite3 writes it, and the published stores are
+    connection.execute('PRAGMA journal_mode = wal')  # like every store dbm.sqlite3 writes
     connection.execute('CREATE TABLE IF NOT EXISTS Dict (key BLOB UNIQUE NOT NULL, value BLOB NOT NULL)')
     connection.executemany('REPLACE INTO Dict (key, value) VALUES (CAST(? AS BLOB), CAST(? AS BLOB))', items)
     connection.commit()
