@@ -127,7 +127,26 @@ DeviceArray resample_cuda(const DeviceArray& src, const Parameters& p, bool near
     if (narrow) run.template operator()<float>(); else run.template operator()<double>();
     return out;
 }
+template<class T> __global__ void resize_nearest_kernel(const T* src,T* dst,Layout input,Layout output,
+                                                       std::size_t channels,bool legacy) {
+    EACH_INDEX(output.size*channels) {
+        const auto voxel=i%output.size;
+        std::size_t at=(i/output.size)*input.size;
+        for(int axis=0;axis<output.dim;++axis)
+            at+=resize_nearest_index(output.coord(voxel,axis),input.shape[axis],output.shape[axis],legacy)*input.stride[axis];
+        dst[i]=src[at];
+    }
+}
 DeviceArray resize_cuda(const DeviceArray& src, const Shape& shape, bool nearest, bool legacy) {
+    if(nearest) {
+        Shape target{src.shape[0]};target.insert(target.end(),shape.begin(),shape.end());
+        DeviceArray out(target,src.kind,src.bytes);
+        src.typed([&](auto input) {
+            using T=typename decltype(input)::value_type;
+            resize_nearest_kernel<<<blocks(out.size()),256,0,vcr::device::stream()>>>(input.ptr,out.view<T>().ptr,Layout{Grid(src.spatial())},Layout{Grid(shape)},src.shape[0],legacy);
+        });
+        check(cudaGetLastError());return out;
+    }
     auto p = geometry(shape); p.border = true; p.nearest_mode = legacy ? 2 : 1;
     for (std::size_t a = 0; a < shape.size(); ++a) {
         const double ratio = double(src.shape[a+1])/shape[a];

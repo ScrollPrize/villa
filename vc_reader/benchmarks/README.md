@@ -90,6 +90,154 @@ to `geometry_kernel`, 19.5% to `expand_controls`, and 10.4% to
 `field_energy_gradient`. These existing geometry/elastic kernels remain the
 main GPU costs. Profiling includes warmup and is excluded from the timing table.
 
+## CUDA geometry optimizations
+
+The precision pass builds on exact integer flips and float32 elastic construction.
+Ordinary crop geometry, resident fields, CPU image workspaces and new replay
+fields now use float32. Wider cases and replay-format changes are explained in
+the [precision policy](../docs/precision.md). Nearest resizing uses shared integer
+indices to resolve half-voxel ties consistently on CPU and CUDA.
+
+Measurements use an RTX 5090, Linux x86-64, Release builds without fast-math,
+and the PHercParis4 volume below at level 2. The loader chain is normalization,
+elastic, median, flip and gamma; the separate heavy pipeline has 12 transforms.
+Loader throughput includes reading, uploads, casts, augmentation and collation,
+with no model/backward work. This is not a training-throughput measurement.
+
+Reproduce with existing configured builds and dependencies. The saved baseline
+was the build at `5d2eda6f9` (already containing integer flips and float32 elastic
+construction). `--native-dir` selects its preserved extensions; the output JSON
+records extension hashes, compiler configuration, input and raw measurements.
+
+```bash
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-reader-cuda --parallel 4
+VC_BENCH_VOLUME=/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr
+
+# Resident float32 random 128³ image, 20 warmups and 200 timed calls per case.
+# Run against the baseline first to create the reference snapshot.
+AGENTS_AGENT_MODE=1 .venv/bin/python benchmarks/bench_cuda_geometry.py \
+  --native-dir /tmp/vc-precision-before --warmup 20 --reps 200 \
+  --snapshot /tmp/geometry-reference.npz --output /tmp/geometry-before.json
+AGENTS_AGENT_MODE=1 .venv/bin/python benchmarks/bench_cuda_geometry.py \
+  --native-dir /tmp/vc-reader-cuda --warmup 20 --reps 200 \
+  --reference /tmp/geometry-reference.npz --allow-differences \
+  --output /tmp/geometry-after.json
+
+# 3 timed epochs of 64 batches × four 128³ crops, after a validation/warmup epoch.
+# Repeat with --native-dir /tmp/vc-precision-before for the baseline.
+AGENTS_AGENT_MODE=1 .venv/bin/python benchmarks/bench_torch.py \
+  --native-dir /tmp/vc-reader-cuda --modes prefetch \
+  --array "$VC_BENCH_VOLUME" --level 2 --batches 64 --batch-size 4 --reps 3 \
+  --output /tmp/precision-loader.json
+
+# Synchronous full pipeline, 3 crops × 3 repetitions, one warmup.
+AGENTS_AGENT_MODE=1 .venv/bin/python benchmarks/bench_pipeline.py \
+  --suite pipeline --backend both --native-dir /tmp/vc-reader-cuda \
+  --array "$VC_BENCH_VOLUME" --level 2 --start 9000 3600 3600 \
+  --shape 128 128 128 --crops 3 --jitter 256 --warmup 1 --reps 3 \
+  --threads 8 --memory-cache-mib 0 --cuda-cache clear \
+  --augmentation heavy --pipeline-read box --include-hybrid \
+  --output /tmp/precision-ct.json
+
+# Separate profile; exclude this run from timing comparisons.
+AGENTS_AGENT_MODE=1 nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
+  --force-overwrite=true --output=/tmp/precision-profile \
+  .venv/bin/python benchmarks/bench_torch.py --native-dir /tmp/vc-reader-cuda \
+  --modes prefetch --array "$VC_BENCH_VOLUME" --level 2 \
+  --batches 4 --batch-size 4 --reps 1 --output /tmp/precision-profile.json
+nsys stats --report cuda_gpu_kern_sum,cuda_api_sum --format csv \
+  /tmp/precision-profile.nsys-rep > /tmp/precision-profile.csv
+```
+
+### Measured results
+
+GPU-ready batch latency and epoch throughput (192 timed batches per build):
+
+| Build | Mean batch ms | p50 ms | p95 ms | Crops/s |
+| --- | ---: | ---: | ---: | ---: |
+| [Original batch pipeline](../docs/benchmarks/torch-original.json) | 7.622 | 7.261 | 8.352 | 524.64 |
+| [Before this precision pass](../docs/benchmarks/torch-before-precision.json) | 5.627 | 5.260 | 6.114 | 710.47 |
+| [Float32 execution and fields](../docs/benchmarks/torch-float32.json) | 4.694 | 4.360 | 4.991 | 851.88 |
+
+This precision pass raised loader throughput by 19.9%; the full optimization
+sequence raised it by 62.4%. These are separate runs on the same machine/input,
+not confidence intervals. The final build retains overflow/range handling.
+
+Resident microbenchmarks (200 calls per case, 20 warmups, synchronous wall time):
+
+| Operation | Build | Mean ms | p50 ms | p95 ms |
+| --- | --- | ---: | ---: | ---: |
+| flip_x | Before this pass | 0.097 | 0.080 | 0.215 |
+| flip_all | Before this pass | 0.085 | 0.075 | 0.148 |
+| elastic | Before this pass | 1.099 | 1.071 | 1.271 |
+| flip_x | After | 0.099 | 0.099 | 0.105 |
+| flip_all | After | 0.090 | 0.078 | 0.103 |
+| elastic | After | 0.844 | 0.838 | 0.854 |
+
+Elastic mean time fell 23.2% in this pass. Flip timings are dominated by short-call
+host overhead and jitter; the integer flip kernel was already present in this
+baseline. [Original geometry timings](../docs/benchmarks/geometry-original.json),
+[pre-pass timings](../docs/benchmarks/geometry-before-precision.json), and
+[final timings/numerical comparisons](../docs/benchmarks/geometry-float32.json)
+include all raw samples and min/max values.
+
+The separate heavy pipeline uses three CT crops × three timed repetitions per
+backend, host outputs, and one warmup per backend. Augmentation excludes
+normalization and reading; total includes reading, normalization and download:
+
+| Route | Build | Augment mean ms | p50 ms | p95 ms | Total mean ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| cpu | Before | 171.738 | 172.064 | 172.523 | 177.630 |
+| cpu | After | 148.328 | 148.716 | 149.640 | 151.708 |
+| cuda | Before | 2.759 | 2.730 | 2.888 | 4.521 |
+| cuda | After | 2.222 | 2.187 | 2.422 | 4.016 |
+| hybrid | Before | 2.855 | 2.704 | 3.435 | 4.046 |
+| hybrid | After | 2.153 | 2.144 | 2.202 | 3.496 |
+
+CPU normalization also fell from 5.392 to 2.823 ms mean. Full stage distributions,
+commands and raw samples are in the [before](../docs/benchmarks/precision-ct-before.json)
+and [after](../docs/benchmarks/precision-ct-after.json) reports. Final CPU/CUDA
+maximum absolute difference across these three crops was 1.014e-6; hybrid and
+CUDA outputs matched exactly. This comparison is between current backends,
+not a claim of unchanged outputs from the old implementation.
+
+### Remaining GPU costs
+
+A separate Nsight Systems trace covered 32 crops (four warmup and four measured
+batches of four). The kernel-time sum was 29.390 ms, versus 36.398 ms
+before this precision pass and 49.847 ms before the whole optimization sequence.
+These sums exclude host work and transfers and are not end-to-end latency.
+
+| Kernel group | Final GPU kernel time |
+| --- | ---: |
+| Elastic resampling | 34.1% |
+| B-spline expansion | 29.5% |
+| Field energy/gradient | 10.2% |
+| Median filter | 6.1% |
+| Integer reflection | 4.5% |
+
+Geometry and field expansion remain the largest costs. Gamma fell from 2.267 ms
+total to .463 ms; normalization application fell from .879 to .332 ms.
+See the [final kernel/API report](../docs/benchmarks/precision-profile.csv),
+[pre-pass report](../docs/benchmarks/geometry-profile.csv), and
+[original report](../docs/benchmarks/original-profile.csv). The
+[profile configuration](../docs/benchmarks/precision-profile.json) identifies the
+build/input; its instrumented timings are excluded from performance comparisons.
+
+Validation: seven precision tests pass on both CPU-only and CUDA builds; all 18
+loader tests pass on CUDA (CPU-only: two pass, 16 GPU tests skip). Tests cover
+53 transforms in both float32/float64, exact current-backend replay, derived
+fields, integer resize ties, large-coordinate cancellation and extreme values.
+New replay fields halve the 128³ elastic record from 50,331,945 to 25,166,121 bytes.
+Older records must be regenerated. Float32 geometry can choose an adjacent label
+at a nearest-neighbor boundary; the three random 128³ comparison images changed
+31 label voxels out of 6,291,456 and had maximum image difference 7.451e-6.
+
+Some Python 3.14 multiprocessing runs emitted a shutdown resource-tracker warning
+about an already-removed semaphore; tests and benchmark validation completed.
+This precision pass does not resolve that intermittent cleanup warning. These
+measurements cover Linux/RTX 5090; macOS/arm64 were not tested.
+
 ## Reader and pipeline benchmarks
 
 [`bench_pipeline.py`](bench_pipeline.py) has two suites:

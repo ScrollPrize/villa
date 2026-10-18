@@ -8,13 +8,13 @@ VCR_HD inline std::uint64_t mix(std::uint64_t z) {
 VCR_HD inline double uniform(std::uint64_t seed,std::uint64_t index) {
     return (double(mix(seed+UINT64_C(0x9e3779b97f4a7c15)*(index+1))>>11)+.5)*0x1.0p-53;
 }
-VCR_HD inline double normal(std::uint64_t seed,std::uint64_t index) {
-    return sqrt(-2*log(uniform(seed,2*index)))*cos(2*pi*uniform(seed,2*index+1));
+template<class T=double> VCR_HD inline T normal(std::uint64_t seed,std::uint64_t index) {
+    return std::sqrt(T(-2)*std::log(T(uniform(seed,2*index))))*std::cos(T(2*pi)*T(uniform(seed,2*index+1)));
 }
 struct Rng {
     std::uint64_t seed,index=0;
     VCR_HD double u() { return uniform(seed,index++); }
-    VCR_HD double gaussian() { double a=u(),b=u(); return sqrt(-2*log(a))*cos(2*pi*b); }
+    template<class T=double> VCR_HD T gaussian() { T a=T(u()),b=T(u()); return std::sqrt(T(-2)*std::log(a))*std::cos(T(2*pi)*b); }
 };
 // Exact Poisson sampling: inversion for small rates, PTRS transformed rejection
 // for large rates (Hoermann 1993). There is no Gaussian approximation.

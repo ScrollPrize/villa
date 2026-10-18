@@ -1,4 +1,5 @@
 #pragma once
+#include "resize_index.hpp"
 #include "intensity.hpp"
 #include "elastic.hpp"
 
@@ -480,7 +481,7 @@ template<std::size_t D,class Real> Array resize_array_impl(const Array& a, const
             double q = std::clamp(ratio * double(x) + offset, 0., double(input.shape[axis] - 1));
             auto lo = std::size_t(std::floor(q)); Real fraction = q - lo;
             if (nearest) {
-                auto at = lo + (!legacy_nearest && fraction >= .5);
+                auto at = resize_nearest_index(x, input.shape[axis], shape[axis], legacy_nearest);
                 positions[axis].push_back({at * input.stride[axis], 0, 0});
             } else positions[axis].push_back({lo * input.stride[axis], std::min(lo + 1, input.shape[axis] - 1) * input.stride[axis], fraction});
         }

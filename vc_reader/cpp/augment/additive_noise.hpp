@@ -12,8 +12,8 @@ struct AdditiveNoiseKernel {
     template<class T> VCR_HD T operator()(const T* v,std::size_t i,const volume_detail::ChannelContextT<T>& c) const {
         using namespace volume_detail;
         Rng r{mix(seed+i)};double u=r.u(),noise=0;
-        if(distribution==0)noise=(2*u-1)*scale;
-        else if(distribution==1)noise=scale*r.gaussian();
+        if(distribution==0)return v[i]+T(mean)+(T(2)*T(u)-T(1))*T(scale);
+        else if(distribution==1)return v[i]+T(mean)+T(scale)*r.gaussian<T>();
         else if(distribution==2)noise=-scale*(u<.5?-1:1)*log(1-2*fabs(u-.5));
         else {double a=gamma_sample(alpha,r),b=gamma_sample(beta,r);noise=scale*(a/(a+b)-alpha/(alpha+beta));}
         return v[i]+T(mean)+T(noise);

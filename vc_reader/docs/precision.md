@@ -9,7 +9,8 @@ Dense elastic controls/displacements, local intensity fields, dropout fields,
 CPU image workspaces, FFT spectra, reference images and ordinary geometry now
 follow float32 rather than being unconditionally widened. Explicit float64 image
 inputs retain their precision. Label indices use integer storage. Exact flips
-use integer addressing, without interpolation.
+use integer addressing, without interpolation. Nearest resize uses a shared
+integer ratio in `resize_index.hpp`, avoiding floating-point half-voxel ties.
 
 ## Where wider arithmetic remains
 
@@ -26,11 +27,16 @@ use integer addressing, without interpolation.
 | `fourier.hpp` | Bluestein phase angles grow with squared indices; float32 phase rounding and repeated twiddle multiplication accumulate phase error. Phase generation/rotation state stay double. Full-volume spectra, line scratch, chirps and butterfly arithmetic follow the image dtype. |
 | `surface_displacement.hpp`, `tracing.hpp`, surface/strip CUDA code, directional mapping | Surface normals subtract coordinates and normalize near-parallel cross products. Squared distances choose support sets; many signed blobs accumulate into displacement. Strip control coordinates can be large and its hash arithmetic exceeds float32's exact integer range. Jacobian inversion and sparse inverse mapping need conditioning/convergence precision. Final dense displacement fields are float32. |
 | `volume_grid.hpp`, resize tables, oriented-blur frame construction | Index/coordinate construction must resolve large axes and rounding boundaries. Small rotation frames need stable normalization and cross products. Ordinary oriented-blur samples use float32 coordinates with a wide-coordinate fallback; image accumulators/workspaces follow the image dtype. |
-| `core.hpp`, scalar configs/bindings, sampling and replay scalar carriers | The shared scalar representation also carries global geometry, label values, explicit float64 parameters and exceptional values outside float32 range. Probability draws retain 53-bit resolution so rare-event probabilities are not quantized to a 24-bit grid. Pixel noise transcendental arithmetic follows the image dtype; scalar distribution sampling retains the wider range. |
+| `random_sampling.hpp`, Laplace/beta/Poisson sampling | Poisson counts can exceed 2^24 and its log rejection test subtracts large terms. Gamma rejection subtracts nearly equal terms; Laplace inverse-CDF tails can become infinite if a uniform draw rounds to an endpoint. These distribution calculations retain double; Gaussian and uniform pixel noise and lattice values follow the image precision. |
+| `core.hpp`, scalar configs/bindings, sampling and replay scalar carriers | The shared scalar representation also carries global geometry, label values, explicit float64 parameters and exceptional values outside float32 range. Probability draws retain 53-bit resolution so rare-event probabilities are not quantized to a 24-bit grid. Gaussian pixel-noise transcendental arithmetic follows the image dtype; scalar distribution sampling retains the wider range. |
 
 These exceptions do not promise arbitrary-precision geometry or exact results
 for ill-conditioned inputs. They identify where narrowing would remove a useful
-numerical capability. There is no public precision mode to tune for ordinary ML
+numerical capability. Asynchronous batch execution flags exceptional channel magnitudes that would
+require a statistics readback and rejects them at completion; the synchronous
+channel path can promote them. Ordinary CT batches avoid that readback.
+
+There is no public precision mode to tune for ordinary ML
 use, and no fast-math compiler change.
 
 ## Replay and numerical changes
@@ -46,7 +52,11 @@ produced maximum image error of about 7.5e-6 against the preceding double-geomet
 implementation. Thirty-one of 6,291,456 nearest-neighbor label voxels selected a
 neighboring source voxel. A 128³ elastic field's replay record fell from
 50,331,945 to 25,166,121 bytes. These are numerical checks, not model-quality
-measurements. See [performance measurements](../benchmarks/README.md#cuda-geometry-optimizations).
+measurements. Nearest resize now resolves exact half-voxel ties identically on
+CPU/CUDA (for example 128 → 109 selects source 64 at output 54). This can change
+whole sampled planes relative to previous floating-point tie rounding; it is
+a deliberate index-semantics correction, separate from small interpolation
+roundoff. See [performance measurements](../benchmarks/README.md#cuda-geometry-optimizations).
 
 ## Code boundaries and validation
 
@@ -68,6 +78,6 @@ AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=/tmp/vc-reader-cuda \
 ```
 
 Precision tests cover float32/float64 transforms, CPU/CUDA agreement, replay,
-derived fields, coordinate cancellation, normalization cancellation, overflow
+derived fields, resize ties, coordinate cancellation, normalization cancellation, overflow
 fallbacks and integer component indices. Loader tests cover the public batch
 API, stream lifetime, spawned workers, and backward execution.

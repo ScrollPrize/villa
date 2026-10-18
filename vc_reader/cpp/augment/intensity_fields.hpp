@@ -3,12 +3,12 @@
 namespace vcr::augment::volume_detail {
 // Random lattice evaluated in 3D. Bias uses trilinear Gaussian log-gains;
 // fractal fields use smooth value noise at successively finer octave scales.
-struct RandomLattice {
+template<class T> struct RandomLattice {
     std::uint64_t seed;bool gaussian;
-    VCR_HD double operator()(const long long* lo,int corner) const {
+    VCR_HD T operator()(const long long* lo,int corner) const {
         std::uint64_t h=seed;
         for(int a=0;a<3;++a){int bit=(corner>>a)&1;h=mix(h^mix(std::uint64_t(lo[a]+bit)+UINT64_C(0x9e3779b97f4a7c15)*(a+1)));}
-        return gaussian?normal(h,0):2*uniform(h,0)-1;
+        return gaussian?normal<T>(h,0):T(2)*T(uniform(h,0))-T(1);
     }
 };
 template<class T,class Nodes> VCR_HD inline T lattice_interpolate(const long long* lo,const T* f,const Nodes& nodes) {
@@ -22,7 +22,7 @@ template<class T,class Nodes> VCR_HD inline T lattice_interpolate(const long lon
 template<class T> VCR_HD inline T lattice(const T* q,std::uint64_t seed,bool gaussian,bool smooth) {
     long long lo[3];T f[3];
     for(int a=0;a<3;++a){lo[a]=(long long)floor(q[a]);f[a]=q[a]-lo[a];if(smooth)f[a]=f[a]*f[a]*(3-2*f[a]);}
-    return lattice_interpolate(lo,f,RandomLattice{seed,gaussian});
+    return lattice_interpolate(lo,f,RandomLattice<T>{seed,gaussian});
 }
 template<class T> VCR_HD inline T fractal(const Grid3& g, std::size_t i, std::uint64_t seed,
                               T scale, T persistence, int octaves) {
@@ -63,7 +63,7 @@ inline void accumulate_lattice(std::vector<float>& output,const Grid& g,float fr
         if(extent[a]>budget/count)cached=false;
         if(cached)count*=extent[a];
     }
-    const RandomLattice random{seed,gaussian};std::vector<float> nodes;
+    const RandomLattice<float> random{seed,gaussian};std::vector<float> nodes;
     if(cached){
         nodes.resize(count);
         for(std::size_t z=0;z<extent[0];++z)for(std::size_t y=0;y<extent[1];++y)for(std::size_t x=0;x<extent[2];++x){

@@ -41,6 +41,8 @@ class PrecisionTests(unittest.TestCase):
             A.Equalize(bins=16), A.CLAHE(bins=16, tile_shape=(3, 4, 5)),
             A.HistogramMatching(reference, bins=16), A.PixelDistributionAdaptation(reference),
             A.FDA(reference), A.MultiplicativeNoise(), A.ShotNoise(), A.AdditiveNoise(),
+            A.AdditiveNoise(distribution="gaussian"), A.AdditiveNoise(distribution="laplace"),
+            A.AdditiveNoise(distribution="beta"),
             A.SaltAndPepper(), A.MotionBlur(), A.Defocus(radius=1), A.ZoomBlur(),
             A.UnsharpMask(), A.GibbsRinging(), A.RingingOvershoot(),
             A.GridDropout(unit_size=(3, 3, 3)), A.StripeMasking(unit_size=(3, 3, 3)),
@@ -91,6 +93,20 @@ class PrecisionTests(unittest.TestCase):
             if len(results) == 2:
                 for key in results['cpu']:
                     np.testing.assert_allclose(results['cpu'][key], results['cuda'][key], atol=5e-5, rtol=1e-5)
+
+    def test_resize_exact_half_voxel_ties(self):
+        # 128 -> 109 maps output x=54 to source 63.5 exactly. Floating
+        # affine evaluation used to disagree across CPU/CUDA at that plane.
+        image = np.broadcast_to((np.arange(128) % 2).astype(np.float32), (1, 3, 128)).copy()
+        indices = ((2*np.arange(109)+1)*128)//(2*109)
+        reduced = image[..., indices]
+        q = np.clip((np.arange(128)+.5)*109/128-.5, 0, 108)
+        lo = np.floor(q).astype(int)
+        fraction = (q-lo).astype(np.float32)
+        reference = reduced[..., lo]*(1-fraction)+reduced[..., np.minimum(lo+1,108)]*fraction
+        for backend in self.backends():
+            out = A.Pipeline([A.LowResolution(.85, axes='x')], backend=backend)({'image': image}, seed=0)['image']
+            np.testing.assert_allclose(out, reference, atol=1e-5, rtol=0)
 
     def test_large_coordinates_keep_subvoxel_translation(self):
         # At 4096, float32 cannot represent this translation. Wider coordinate
