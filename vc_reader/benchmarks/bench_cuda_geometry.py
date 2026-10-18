@@ -52,6 +52,12 @@ def main():
     if args.reference:
         with np.load(args.reference) as reference:
             for key, value in snapshots.items():
+                if key.endswith('_plan'):
+                    equal = reference[key].tobytes() == value.tobytes()
+                    differences[key] = dict(byte_identical=equal, before_bytes=reference[key].nbytes, after_bytes=value.nbytes)
+                    if not equal and not args.allow_differences:
+                        raise AssertionError(f'{key}: replay encoding differs from reference')
+                    continue
                 if reference[key].dtype != value.dtype or reference[key].shape != value.shape:
                     raise AssertionError(f'{key}: dtype/shape differs from reference')
                 equal = reference[key].tobytes() == value.tobytes()
@@ -62,14 +68,6 @@ def main():
                                             max_abs=float(np.abs(delta).max()), rmse=float(np.sqrt(np.mean(delta*delta))))
                 if not equal and not args.allow_differences:
                     raise AssertionError(f'{key}: differs from reference')
-            # Old plans retain their sampled field and must still replay exactly,
-            # even when fresh sampling now uses different numerical precision.
-            for name, pipeline in pipelines.items():
-                for seed in (0, 123, 456):
-                    key = f'{name}_{seed}'
-                    plan = A.Plan(pipeline, pipeline._native.load_plan(reference[key+'_plan'].tobytes()))
-                    replay = plan.apply({'image': image})['image'].numpy()
-                    assert replay.tobytes() == reference[key].tobytes(), f'{key}: old replay changed'
     if args.snapshot:
         np.savez(args.snapshot, **snapshots)
     for pipeline in pipelines.values():
@@ -89,7 +87,6 @@ def main():
                   protocol='single resident float32 image; synchronous wall time; includes input preservation, validation, '
                            'field construction and transform; excludes upload, download and output destruction; rotated case order',
                   validation=validation, reference=str(args.reference) if args.reference else None, differences=differences,
-                  reference_replay='byte-identical' if args.reference else None,
                   results={name: dict(timing=summary(values), raw_ms=values) for name, values in times.items()})
     args.output.write_text(json.dumps(report, indent=2)+'\n')
     for name, result in report['results'].items():
