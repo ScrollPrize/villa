@@ -571,8 +571,15 @@ void AgentBridgeServer::broadcastNotification(const QString& method, const QJson
     message["jsonrpc"] = "2.0";
     message["method"] = method;
     message["params"] = params;
-    for (auto it = _buffers.begin(); it != _buffers.end(); ++it)
-        writeMessage(it.key(), message);
+    // A write to a peer that has gone away can emit disconnected at once,
+    // which removes that socket from _buffers, so iterate over a copy.
+    std::vector<QPointer<QLocalSocket>> sockets;
+    for (auto it = _buffers.keyBegin(); it != _buffers.keyEnd(); ++it)
+        sockets.emplace_back(*it);
+    for (const QPointer<QLocalSocket>& socket : sockets) {
+        if (socket)
+            writeMessage(socket.data(), message);
+    }
 }
 
 
