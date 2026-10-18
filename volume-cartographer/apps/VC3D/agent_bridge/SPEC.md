@@ -588,6 +588,24 @@ is; they are not a stable contract.
 - `segmentation.grow_patch_from_seed`, tracing, rendering, and reoptimization
   use the existing command-runner lifecycle and never open the interactive
   console or parameter dialogs.
+- `segmentation.get_settings` and `segmentation.set_settings` read and change
+  the Segmentation panel's settings. Brush, edit-scale and smoothing values go
+  through `SegmentationModule`'s setters, which the mouse-wheel shortcuts use
+  and which update and save the panel; the other values go through
+  `SegmentationWidget`'s panels, which clamp, save and signal the module.
+  Updates check the growth volume, patch tracer keys and types, direction
+  fields and Z range before changing anything, and apply the growth volume
+  first, since the panel may not offer a volume the project has (-32007).
+  `zRange` is always `{enabled, min, max}`; a bound left out keeps its value.
+  `growthMethod` is the method growth uses, with `manualAddSelected` telling
+  whether the Manual Add method is selected, so the reply of `get_settings`
+  can be passed to `set_settings` unchanged (a null `growthVolumeId` leaves
+  the volume as it is). Approval-mask opacity is in `[0,1]`. Neural tracer
+  executable and checkpoint paths are not exposed.
+- `segmentation.approval_mask.set_mode` selects approve, unapprove or off
+  painting (the B and N keys); painting requires an active segment and a shown
+  mask, which `show: true` provides. Strokes are painted with `canvas.drag`;
+  `segmentation.approval_mask.undo` undoes the last stroke (Ctrl+B).
 
 ### Points
 
@@ -789,6 +807,7 @@ is the sole bridge method without an MCP tool; `vc3d_wait_job` and
 | `vc3d_get_ink_overlay` | `viewer.get_ink_overlay` | Read the ink detection overlay: available detections for the active segment, selection, opacity, colormap, flips. |
 | `vc3d_get_overlay` | `viewer.get_overlay` | Read the active workspace's overlay-volume settings, shared with the GUI controls. |
 | `vc3d_get_render_settings` | `viewer.get_render_settings` | Read the shared viewer render/overlay settings (intersection lines, overlay opacity, surface normals, direction hints, highlighted surfaces). |
+| `vc3d_get_segmentation_settings` | `segmentation.get_settings` | Read the Segmentation panel settings: brushes, smoothing, growth options, patch tracer, direction fields, approval mask. |
 | `vc3d_get_state` | `state.get` | Snapshot of VC3D: open volume package, current volume, active segment, viewers (ids/names), editing mode, running job. Call this first. |
 | `vc3d_grow_patch_from_seed` | `segmentation.grow_patch_from_seed` | Create a brand-new segment by growing a patch from a 3D seed point (headless GrowPatch). Async: returns a jobId and outputDir. |
 | `vc3d_grow_segment` | `segmentation.grow` | Grow the active segmentation surface (method: tracer/corrections/patch_tracer; direction; steps). Async: returns a jobId. |
@@ -854,6 +873,7 @@ is the sole bridge method without an MCP tool; `vc3d_wait_job` and
 | `vc3d_seeding_run` | `seeding.run` |
 | `vc3d_seeding_set_winding_annotation_mode` | `seeding.set_winding_annotation_mode` |
 | `vc3d_select_volume` | `volume.select` |
+| `vc3d_set_approval_mask_mode` | `segmentation.approval_mask.set_mode` | Choose approve, unapprove or off painting on the approval mask (B / N keys); paint with `vc3d_drag`. |
 | `vc3d_set_auto_fill_mode` | `points.set_auto_fill_mode` |
 | `vc3d_set_axis_aligned_slices` | `viewer.set_axis_aligned_slices` | Enable/disable axis-aligned slice mode (checkbox equivalent) — prerequisite for `viewer.rotate`. |
 | `vc3d_set_ink_overlay` | `viewer.set_ink_overlay` | Select, clear, recolor, fade or flip the ink detection overlay; any subset. |
@@ -865,10 +885,12 @@ is the sole bridge method without an MCP tool; `vc3d_wait_job` and
 | `vc3d_set_point_windings_linked` | `points.set_windings_linked` |
 | `vc3d_set_render_settings` | `viewer.set_render_settings` | Set any subset of the viewer render/overlay settings; returns the full settings after applying. Viewer-specific toggle fields are no-ops when no viewer is open; highlighted surface ids are retained by the surface panel. Also sets the View dock (axis overlays, coordinate frames, raw points, focus bounds) and Composite dock controls. |
 | `vc3d_set_segment_tag` | `tags.set` |
+| `vc3d_set_segmentation_settings` | `segmentation.set_settings` | Change any subset of the Segmentation panel settings; accepts the reply of `vc3d_get_segmentation_settings` unchanged. |
 | `vc3d_set_wrap_annotation_mode` | `wrap_annotation.set_mode` | Enable/disable "Same-wrap annotation mode" (prerequisite for the shift+E commit workflow; seed the preview via `vc3d_shift_click`). |
 | `vc3d_shift_click` | `canvas.shift_click` | Shift+click convenience: the canonical place-point / set-focus gesture. |
 | `vc3d_switch_workspace` | `workspace.switch` | Switch to any of the seven workspace tabs, as a tab click does. |
 | `vc3d_transform_segment` | `segment.transform` | Flip a segment's surface grid, or rotate it 90 degrees clockwise (`confirm` required), in place. Synchronous. |
+| `vc3d_undo_approval_stroke` | `segmentation.approval_mask.undo` | Undo the last approval-mask stroke (Ctrl+B). |
 | `vc3d_undo_wrap_annotation` | `wrap_annotation.undo` | Undo the same-wrap annotation (Ctrl+Z equivalent): clear the preview or undo the last committed collection. |
 | `vc3d_update_point` | `points.update_point` |
 | `vc3d_wheel` | `canvas.wheel` | Turn the mouse wheel over a viewer point (zoom, slice step with Shift, tool radius with Ctrl). |

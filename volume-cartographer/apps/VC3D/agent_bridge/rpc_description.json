@@ -3123,6 +3123,47 @@
         "type": "object"
       }
     },
+    "segmentation.approval_mask.set_mode": {
+      "errors": [
+        -32602,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "tool": "vc3d_set_approval_mask_mode"
+      },
+      "params": {
+        "properties": {
+          "mode": {
+            "enum": [
+              "off",
+              "approve",
+              "unapprove"
+            ],
+            "type": "string"
+          },
+          "show": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "type": "object"
+      }
+    },
+    "segmentation.approval_mask.undo": {
+      "errors": [
+        -32009
+      ],
+      "mcp": {
+        "tool": "vc3d_undo_approval_stroke"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
     "segmentation.corrections.set_point_mode": {
       "errors": [
         -32602,
@@ -3165,6 +3206,18 @@
         "required": [
           "enabled"
         ],
+        "type": "object"
+      }
+    },
+    "segmentation.get_settings": {
+      "errors": [
+        -32009
+      ],
+      "mcp": {
+        "tool": "vc3d_get_segmentation_settings"
+      },
+      "params": {
+        "properties": {},
         "type": "object"
       }
     },
@@ -3506,6 +3559,209 @@
       },
       "params": {
         "properties": {},
+        "type": "object"
+      }
+    },
+    "segmentation.set_settings": {
+      "errors": [
+        -32602,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "paramRenames": {
+          "approvalMask": "approval_mask",
+          "directionFields": "direction_fields",
+          "editScale": "edit_scale",
+          "growthDirections": "growth_directions",
+          "growthMethod": "growth_method",
+          "growthScale": "growth_scale",
+          "growthSteps": "growth_steps",
+          "growthVolumeId": "growth_volume_id",
+          "patchTracer": "patch_tracer",
+          "pushPull": "push_pull",
+          "showHoverMarker": "show_hover_marker",
+          "smoothingIterations": "smoothing_iterations",
+          "smoothingStrength": "smoothing_strength",
+          "zRange": "z_range"
+        },
+        "tool": "vc3d_set_segmentation_settings"
+      },
+      "params": {
+        "properties": {
+          "approvalMask": {
+            "properties": {
+              "autoApprove": {
+                "type": "boolean"
+              },
+              "autoApproveMaxDistance": {
+                "type": "number"
+              },
+              "autoApproveRadius": {
+                "type": "number"
+              },
+              "autoApproveThreshold": {
+                "type": "number"
+              },
+              "brushDepth": {
+                "type": "number"
+              },
+              "brushRadius": {
+                "type": "number"
+              },
+              "opacity": {
+                "maximum": 1,
+                "minimum": 0,
+                "type": "number"
+              },
+              "show": {
+                "type": "boolean"
+              }
+            },
+            "type": "object"
+          },
+          "directionFields": {
+            "items": {
+              "properties": {
+                "orientation": {
+                  "enum": [
+                    "normal",
+                    "horizontal",
+                    "vertical"
+                  ],
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "scale": {
+                  "maximum": 2147483647,
+                  "minimum": -2147483648,
+                  "type": "integer"
+                },
+                "weight": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "path"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "drag": {
+            "properties": {
+              "radius": {
+                "type": "number"
+              },
+              "sigma": {
+                "type": "number"
+              }
+            },
+            "type": "object"
+          },
+          "editScale": {
+            "type": "number"
+          },
+          "growthDirections": {
+            "items": {
+              "enum": [
+                "up",
+                "down",
+                "left",
+                "right"
+              ],
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "growthMethod": {
+            "enum": [
+              "tracer",
+              "corrections",
+              "patch_tracer"
+            ],
+            "type": "string"
+          },
+          "growthScale": {
+            "maximum": 2147483647,
+            "minimum": -2147483648,
+            "type": "integer"
+          },
+          "growthSteps": {
+            "maximum": 2147483647,
+            "minimum": -2147483648,
+            "type": "integer"
+          },
+          "growthVolumeId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "line": {
+            "properties": {
+              "radius": {
+                "type": "number"
+              },
+              "sigma": {
+                "type": "number"
+              }
+            },
+            "type": "object"
+          },
+          "patchTracer": {
+            "properties": {},
+            "type": "object"
+          },
+          "pushPull": {
+            "properties": {
+              "radius": {
+                "type": "number"
+              },
+              "sigma": {
+                "type": "number"
+              },
+              "step": {
+                "type": "number"
+              }
+            },
+            "type": "object"
+          },
+          "showHoverMarker": {
+            "type": "boolean"
+          },
+          "smoothingIterations": {
+            "maximum": 2147483647,
+            "minimum": -2147483648,
+            "type": "integer"
+          },
+          "smoothingStrength": {
+            "type": "number"
+          },
+          "zRange": {
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "max": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "min": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "enabled"
+            ],
+            "type": "object"
+          }
+        },
         "type": "object"
       }
     },

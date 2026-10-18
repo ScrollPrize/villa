@@ -850,6 +850,7 @@ void AgentBridgeServer::registerHandlers()
     registerSegmentOpsHandlers();
     registerProjectHandlers();
     registerViewerDisplayHandlers();
+    registerEditSettingsHandlers();
 }
 
 

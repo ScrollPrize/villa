@@ -10,6 +10,7 @@ from __future__ import annotations
 from . import (  # noqa: F401  (imported for their registration side effects)
     atlas,
     catalog_volume,
+    editing_settings,
     fiber,
     flatten,
     jobs,

@@ -101,6 +101,7 @@ private:
     void registerSegmentOpsHandlers();
     void registerProjectHandlers();
     void registerViewerDisplayHandlers();
+    void registerEditSettingsHandlers();
     void registerMethod(AgentBridgeMethod method, Handler handler);
 
     // --- Discovery registry file (mirrors LasagnaServiceManager's
@@ -276,6 +277,13 @@ private:
     QJsonObject handleManualAddSetInterpolation(const QJsonValue& params);
     QJsonObject handleManualAddUndoConstraint(const QJsonValue& params);
     QJsonObject handleCorrectionsSetPointMode(const QJsonValue& params);
+    // Editing settings and approval-mask mode (AgentBridgeHandlers_editsettings.cpp)
+    // over SegmentationWidget and SegmentationModule.
+    QJsonObject handleSegmentationGetSettings(const QJsonValue& params);
+    QJsonObject handleSegmentationSetSettings(const QJsonValue& params);
+    QJsonObject handleApprovalMaskSetMode(const QJsonValue& params);
+    QJsonObject handleApprovalMaskUndo(const QJsonValue& params);
+    QJsonObject segmentationSettingsJson() const;
     // Same-winding wrap annotation (tutorial's shift+E). set_mode drives the
     // WrapAnnotationWidget checkbox; commit/undo mirror the shift+E / Ctrl+Z
     // key handlers over the chunked viewers.

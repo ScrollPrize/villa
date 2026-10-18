@@ -301,10 +301,10 @@ def check_rpc_describe(
         coverage = description.get("coverage", {})
         complete = (
             description.get("undocumented") == []
-            and coverage.get("described") == 137
-            and coverage.get("registered") == 137
+            and coverage.get("described") == 141
+            and coverage.get("registered") == 141
             and coverage.get("complete") is True
-            and len(snapshot["methods"]) == 137
+            and len(snapshot["methods"]) == 141
         )
         rendered = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         if update_snapshot:
@@ -2247,6 +2247,69 @@ def check_viewer_display_settings(client: BridgeClient, results: Results) -> Non
                        f"{type(error).__name__}: {error}")
 
 
+def check_segmentation_settings(client: BridgeClient, results: Results) -> None:
+    try:
+        settings, _ = client.call("segmentation.get_settings", {}, timeout=RPC_TIMEOUT)
+        z_range = settings.get("zRange", {})
+        ok = (
+            {"drag", "line", "pushPull", "growthMethod", "patchTracer",
+             "approvalMask"} <= set(settings)
+            and "umbilicus_path" not in settings.get("patchTracer", {})
+            and {"enabled", "min", "max"} <= set(z_range)
+            and settings.get("growthMethod") != "manual_add"
+            and 0.0 <= settings.get("approvalMask", {}).get("opacity", -1) <= 1.0
+        )
+        results.record("segmentation_get_settings", ok, f"keys={sorted(settings)}")
+    except Exception as error:  # noqa: BLE001
+        results.record("segmentation_get_settings", False,
+                       f"{type(error).__name__}: {error}")
+        return
+    try:
+        # get_settings feeds back into set_settings unchanged.
+        echoed, _ = client.call("segmentation.set_settings", settings, timeout=RPC_TIMEOUT)
+        radius = settings["drag"]["radius"]
+        target = radius + 1.0
+        changed, _ = client.call(
+            "segmentation.set_settings",
+            {"drag": {"radius": target}, "zRange": {"enabled": False, "min": 3}},
+            timeout=RPC_TIMEOUT,
+        )
+        restored, _ = client.call(
+            "segmentation.set_settings",
+            {"drag": {"radius": radius}, "zRange": settings["zRange"]},
+            timeout=RPC_TIMEOUT,
+        )
+        ok = (
+            echoed["drag"] == settings["drag"]
+            and changed["drag"]["radius"] == target
+            and changed["zRange"]["min"] == 3
+            and changed["zRange"]["max"] == settings["zRange"]["max"]
+            and restored["drag"]["radius"] == radius
+            and restored["zRange"] == settings["zRange"]
+        )
+        results.record("segmentation_set_settings_round_trip", ok,
+                       f"changed={changed['drag']} {changed['zRange']} "
+                       f"restored={restored['drag']} {restored['zRange']}")
+    except Exception as error:  # noqa: BLE001
+        results.record("segmentation_set_settings_round_trip", False,
+                       f"{type(error).__name__}: {error}")
+    ok, detail = expect_param_error(
+        client, "segmentation.set_settings",
+        {"patchTracer": {"no_such_parameter": 1}}, "patchTracer")
+    results.record("segmentation_set_settings_unknown_patch_key", ok, detail)
+    ok, detail = expect_bridge_error(
+        client, "segmentation.set_settings",
+        {"growthVolumeId": "no-such-volume"}, -32007)
+    results.record("segmentation_set_settings_unknown_volume", ok, detail)
+    ok, detail = expect_param_error(
+        client, "segmentation.set_settings",
+        {"zRange": {"enabled": True, "min": 10, "max": 2}}, "zRange")
+    results.record("segmentation_set_settings_z_range_order", ok, detail)
+    ok, detail = expect_bridge_error(
+        client, "segmentation.approval_mask.undo", {}, -32009)
+    results.record("approval_mask_undo_requires_mode", ok, detail)
+
+
 def check_open_data_editable_copy(
     client: BridgeClient,
     results: Results,
@@ -2958,6 +3021,7 @@ def main() -> int:
             check_project_attachments(client, results, tmp_path, volpkg)
             check_ink_overlay(client, results)
             check_viewer_display_settings(client, results)
+            check_segmentation_settings(client, results)
             check_open_data_editable_copy(client, results, tmp_path, volpkg)
             check_c4(client, results, str(volpkg), str(broken_volpkg))
             check_legacy_fiber_uuid(client, results, str(legacy_fiber_volpkg),
