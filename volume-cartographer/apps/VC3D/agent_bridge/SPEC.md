@@ -175,10 +175,11 @@ the key's own character, without a keyboard layout: `Shift+1` carries the text
 affected; a widget that reads the event text gets the unshifted character.
 Wheel deltas use Qt angle units, 120 per notch.
 
-Synthesized events bypass Qt's modal blocking, so `canvas.key` and
-`canvas.wheel` return -32009 with `data.window` (`class`, `title`) while a
-modal dialog or popup menu is open, as a person could not reach the viewers
-either.
+Synthesized events bypass Qt's modal blocking, so `canvas.click`,
+`canvas.shift_click`, `canvas.drag`, `canvas.key`, and `canvas.wheel` return
+-32009 with `data.window` (`class`, `title`) while a modal dialog or popup
+menu is open, as a person could not reach the viewers either; a `canvas.key`
+release is the exception.
 
 ### Identifiers
 

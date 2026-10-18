@@ -92,6 +92,9 @@ async def vc3d_click(
     button: "left" | "right" | "middle".
     modifiers: any of "shift", "ctrl", "alt", "meta", "keypad".
 
+    Fails -32009 while a modal dialog or menu is open in VC3D (the click
+    would land behind it), as for a person.
+
     On a fiber-tracing (Line Annotation) workspace pane specifically: a PLAIN
     click (no "shift" modifier) is what adds a control point. Adding "shift"
     switches to a different gesture there (see vc3d_shift_click) -- it does
@@ -412,7 +415,8 @@ async def vc3d_drag(
     (same rule as vc3d_click); an off-view endpoint fails -32003 with data.point
     naming the offender ("from" or "to").
     viewer: viewer id ("v1") or surface-slot name; default "segmentation". Must
-    resolve to a chunked volume viewer, else -32009.
+    resolve to a chunked volume viewer, else -32009. Also -32009 while a modal
+    dialog or menu is open in VC3D.
     space: "volume" | "scene"; applies to both endpoints.
     button: "left" | "right" | "middle", or "none" for a hover-only positioning
     drag -- press/release are skipped and only the interpolated move events fire

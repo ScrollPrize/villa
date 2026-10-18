@@ -138,6 +138,7 @@ QJsonObject AgentBridgeServer::handleCanvasClick(const QJsonValue& params, bool 
     CChunkedVolumeViewer* chunked = requireChunkedViewer(viewer);
     if (!chunked->currentVolume())
         throw AgentBridgeError{-32001, "No volume loaded", {}};
+    requireNoBlockingWindow();
 
     Qt::MouseButton button = jsonToMouseButton(p.value("button"));
     Qt::KeyboardModifiers modifiers = jsonToModifiers(p.value("modifiers"));
@@ -796,6 +797,7 @@ QJsonObject AgentBridgeServer::handleCanvasDrag(const QJsonValue& params)
     CChunkedVolumeViewer* chunked = requireChunkedViewer(viewer);
     if (!chunked->currentVolume())
         throw AgentBridgeError{-32001, "No volume loaded", {}};
+    requireNoBlockingWindow();
 
     // button, incl. the "none" hover-only variant.
     const QJsonValue btnv = p.value("button");
