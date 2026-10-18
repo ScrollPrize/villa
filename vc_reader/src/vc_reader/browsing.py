@@ -407,7 +407,7 @@ class Asset:
         if native is None or self.source.registration is None:
             return Collection()
         result = []
-        for volume in self.scroll.volumes:
+        for volume in self.scroll.volumes._all:
             transform = self.scroll.transform(native.id, volume.id)
             if transform is None:
                 continue
@@ -449,6 +449,10 @@ class VolumeMapping:
     @property
     def id(self):
         return self.volume.id
+
+    @property
+    def is_superseded(self):
+        return self.volume.is_superseded
 
 
 def _select_level(source, level):

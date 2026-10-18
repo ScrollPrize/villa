@@ -120,6 +120,15 @@ class BrowsingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'contradicts'):
             s.with_source(replace(rep, id='bad'), kind='representation', volume='b')
 
+    def test_unpublished_native_target_and_historical_mapped_destination(self):
+        from test_sources import catalog as source_catalog
+        c = source_catalog()
+        label = c.samples['s'].labels.ink.one(artifact_id='absent')
+        self.assertEqual(label.volume.id, 'unpublished')
+        self.assertIsNone(label.volume.record)
+        self.assertEqual(label.mappable_volumes['a'].transform, Affine.scale(2))
+        self.assertEqual([m.id for m in label.mappable_volumes.filter(include_superseded=True)], ['a'])
+
     def test_cycles_and_malformed_overlay_relationships(self):
         c = catalog()
         s = c.samples['s']
