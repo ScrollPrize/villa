@@ -61,6 +61,38 @@ and immutable `Source` descriptors; navigation never rewrites registration.
   semantics and published metadata. Raw opening requires supported storage;
   aligned operations additionally validate the required placement.
 
+## Find labels mapped to another scan
+
+Registrations connect **volumes**. Follow segment → label → native volume →
+volume affine → destination; a label need not have `VolumeRegistration` to
+have a known destination mapping. Surface labels require explicit projection.
+
+```python
+label = catalog.samples['PHerc0009B'].segments['20250919125754'].labels.ink(label_set='20260918')
+print(label.summary())  # native volume, destinations, affines, coverage, unresolved fields
+mapping = label.mappable_volumes['20250521125136']
+print(label.volume.id)             # 20250820154339
+print(mapping.required_operations) # ('surface_projection', 'volume_transform')
+print(mapping.transform.derivation_path)
+print(mapping.coverage.overlap_ratio)  # 1.0 for this published segment
+```
+
+`summary()` is JSON-ready and metadata-only. It reports unresolved pixel/UV
+fields separately from available volume affines. Resolve the pixel convention
+before projection; geometry headers may supply the surface grid's UV mapping.
+Published coverage describes the segment and does not guarantee coverage of
+any particular crop. Native ownership stays separate from mapped destinations.
+
+Enumerate actual published labels without opening arrays:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/discovery_examples.py --metadata /path/to/metadata.bin
+```
+
+Optional `--sample`, `--segment`, and `--volume` select sample, segment, and
+native ownership. The [training example](training-workflows.md) implements the
+complete `published-transfer` read with both scans and projected annotations.
+
 ## CT resolution candidates
 
 ```python

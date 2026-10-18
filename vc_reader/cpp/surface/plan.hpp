@@ -47,7 +47,7 @@ struct Plan {
     }
 };
 #ifdef VC_READER_CUDA
-void launch(const Plan&,Raster,const void*,ElementType,void*,bool*,bool*,float*,std::int64_t*,float*,int);
+void launch(const Plan&,Raster,const void*,ElementType,void*,bool*,bool*,float*,std::int64_t*,float*,bool*,int);
 void interpolate_cuda(Interpolation,const float*,const bool*,const float*,const float*,float*,bool*,std::size_t,int);
 void copy_cuda(const void*,void*,std::size_t,std::size_t,std::size_t,std::size_t,std::size_t,int);
 void copy_region_cuda(const void*,void*,aligned::Triple,aligned::Triple,aligned::Triple,int,std::size_t);

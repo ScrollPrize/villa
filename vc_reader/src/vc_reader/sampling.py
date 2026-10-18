@@ -291,7 +291,11 @@ class SampleReader(SamplingEngine):
             return render_surface(self, surface, start, size, offsets_um)
 
     def project_surface(self, surface, start, size, *, label_target, thickness_um=0, padding_um=0):
-        """Derive and read a 3D crop from a YX patch of a registered label."""
+        """Use a label YX patch to bound a crop, then project its sheet across it.
+
+        Geometric coverage includes sheet outside the selecting patch. Label
+        validity additionally requires annotation support at the surface point.
+        """
         from .surface import project_surface
         self._ready()
         with self._lock:

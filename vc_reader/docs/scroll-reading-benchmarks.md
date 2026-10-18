@@ -175,8 +175,8 @@ requests, exact 64-bit categorical values, CPU/CUDA agreement, bounded caches,
 retained output ownership, and CPU worker reopening.
 
 macOS and arm64 validation was unavailable. No platform-specific code or new
-dependency was introduced. Generating new surface layers and projecting labels
-into 3D remain future geometry operations; their requirements are visible in
-discovery. Cold remote timing depends on network/storage conditions and the
+dependency was introduced. Surface layers and projected 3D labels are now covered by the
+[surface validation report](surface-sampling-benchmarks.md) and
+[training integration acceptance](training-workflow-benchmarks.md). Cold remote timing depends on network/storage conditions and the
 image's full-depth chunk layout, so the disk-warm results should not be used
 as download throughput estimates.

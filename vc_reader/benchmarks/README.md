@@ -1569,3 +1569,20 @@ Tifxyz `scale` is XY, so the unequal scales in the bundled strip are applied to
 columns and rows respectively. Previous surface timing tables used the opposite
 axis interpretation; their selected UV requests and hashes are not comparable
 to new runs. The volume reader workload still samples one surface layer.
+
+## Composable training workflows
+
+`bench_training.py` shares the example-owned Dataset and input recipes from
+`scripts/training_workflows.py` and `scripts/training_inputs.py`. It compares
+reader and Dataset overhead, then measures default collation, host pinning,
+upload, resident augmentation and persistent-worker epochs separately. Each
+workload has six fixed requests, two warmup passes and ten measured passes.
+Use `--cuda` to add GPU stages; `--torch-threads` defaults to one. Real projection
+requires `--batch-size 1` because geometry determines its output bounds.
+
+Run `--help` for workflow names and options. Exact real IDs, independent
+comparisons, reproduction commands, measured costs and real volume-transfer
+acceptance are recorded in
+[training workflow acceptance](../docs/training-workflow-benchmarks.md).
+The [usage guide](../docs/training-workflows.md) documents cache budgets, field
+semantics, layer validity, seeds, process cleanup and optional dependencies.

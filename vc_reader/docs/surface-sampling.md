@@ -30,16 +30,21 @@ patch. All configured surface annotations must register to the selected surface;
 they remain separate named outputs with independent pixel registrations.
 
 The reader maps the patch footprint through UV into connected 3D geometry,
-clips geometry to that footprint, and calculates the enclosing reference-volume
-voxel bounds. It reads CT and configured volume targets over those bounds.
-`padding_um` adds physical CT context on every side; `thickness_um` sets the
-**total** physical label-band width. Padding never pulls unrelated surface
-regions into the annotation. Output shapes depend on the surface geometry.
+clips geometry to that footprint **to calculate the enclosing reference-volume
+voxel bounds**, then adds `padding_um` of physical CT context on every side.
+Within that fixed crop, it projects the complete registered surface, including
+sheet outside the selecting rectangle and folds that return from distant UV
+regions. Other surface IDs are not included. The selecting rectangle determines
+the crop, not an artificial boundary in the sheet. `thickness_um` sets the
+**total** physical label-band width. Output shapes depend on surface geometry.
 
-`valid['ink']` equals coverage. A covered zero label is a valid negative;
-uncovered voxels receive the source fill value. Source masks such as
-`supervision` retain their values at the winning surface point and do not alter
-coverage. CT validity independently records volume support. Context beyond the
+`sample['ink'].masks['coverage']` is geometric sheet coverage, independent of
+label availability and values. `sample['ink'].valid` additionally requires valid
+label support. A zero label with valid support is a negative; a fill value where
+label validity is false is unknown, not background. Source masks such as
+`supervision` retain their values at the winning labeled surface point and do not
+alter geometric coverage. For ink training, intersect label validity, image
+validity, supervision and the complement of `conflict` to form the loss mask. CT validity independently records volume support. Context beyond the
 volume boundary receives the ordinary reader fill and false image validity.
 No supervision policy, ignore index, loss mask, dataset split, fixed training
 shape, or collation rule is selected by the library.
@@ -124,7 +129,9 @@ coordinate-value frame. The benchmark uses this helper too.
 ## Projection geometry and determinism
 
 Projection splits each valid coordinate-grid quad along its top-left to
-bottom-right diagonal and clips those triangles to the selected label footprint.
+bottom-right diagonal. It clips triangles to the selected label footprint only
+when deriving crop bounds; rasterization uses complete triangles intersecting
+the resulting 3D crop.
 This piecewise-planar surface differs from bilinear layer sampling on curved
 quads; they agree on planar geometry.
 
@@ -138,7 +145,8 @@ contribute nothing. A patch without valid nondegenerate geometry raises
 For each contributing triangle/voxel, the closest surface point to the voxel
 center supplies barycentric UV coordinates. Labels use nearest-neighbor
 sampling with ties-to-even and exact integer comparisons, including multichannel
-values. Invalid label support contributes no coverage. Overlapping contributions
+values. Invalid label support contributes no label validity, but geometric
+coverage remains true where the surface intersects a voxel. Overlapping contributions
 select the smallest physical distance, then the stable triangle ID; each named
 target has a single source identity. Disagreeing values set `conflict` while
 retaining the selected value. Even coplanar neighboring triangles can disagree
@@ -160,11 +168,16 @@ before allocating its data. The iterator emits deterministic ZYX tiles,
 including empty context tiles; its results reproduce dense projection.
 Output accounting is conservative and separate from working/cache budgets.
 
-Geometry preparation visits only the selected UV region and halos. A cached BVH
-indexes conservative tile bounds when its metadata fits `plan_cache_bytes`;
-otherwise bounds are streamed over the selected region. Decoded coordinate and
-label tiles share `sampling_cache_bytes`; candidate batches obey
-`sampling_work_bytes`. Extremely small budgets that cannot hold a geometry tile
+Crop selection visits the selected UV region and halos. The first projection
+also scans the registered coordinate grid in bounded blocks to build a spatial
+index; this is necessary to find sheet regions that fold back into a crop. It
+reads geometry, not the complete CT or label image. The index is reused across
+patches while retained by `plan_cache_bytes`. Only intersecting leaves are
+triangulated, and triangle bounds are filtered before reading label pixels.
+Index metadata and coordinate blocks obey `sampling_work_bytes`; an index too
+large for that budget fails explicitly. If the index exceeds the cache budget,
+it is rebuilt for the next projection. Decoded coordinate and label tiles share
+`sampling_cache_bytes`; candidate batches obey `sampling_work_bytes`. Extremely small budgets that cannot hold a geometry tile
 or a single sampling stencil fail explicitly. TIFF decoding retains its existing
 separate decoded-cache and maximum-decode limits.
 

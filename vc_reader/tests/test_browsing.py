@@ -163,3 +163,29 @@ class BrowsingTests(unittest.TestCase):
                 a['creation_info'] = dict(target=dict(render='https://example.test/render2'))
         label = Catalog(tree).samples['s'].labels.ink(artifact_id='new')
         self.assertEqual(label.images.zarr().artifact_id, 'render2')
+
+
+class PublishedLabelMappingTests(unittest.TestCase):
+    def test_volume_affine_is_visible_with_unresolved_surface_pixels(self):
+        from pathlib import Path
+        fixture = Path(__file__).resolve().parents[1] / 'benchmarks/fixtures/training/catalog.json'
+        with patch('urllib.request.urlopen', side_effect=AssertionError('metadata browsing requested I/O')):
+            c = Catalog.from_file(fixture)
+            label = c.samples['PHerc0009B'].segments['20250919125754'].labels.ink(label_set='20260918')
+            summary = label.summary()
+            self.assertEqual(summary['native_volume'], '20250820154339')
+            self.assertIn('registration.pixel_to_uv', summary['unresolved_fields'])
+            mapping = label.mappable_volumes['20250521125136']
+            self.assertEqual(mapping.required_operations, ('surface_projection', 'volume_transform'))
+            self.assertEqual(mapping.coverage.overlap_ratio, 1.)
+            self.assertEqual(mapping.transform.derivation_path, '20250820154339-20250521125136⁻¹')
+            self.assertEqual(mapping.transform.matrix, (
+                (0.2776774047309435, 0.0004236055284734014, 0.010623949057789617, -50.119403010604934),
+                (-0.000621669391020947, 0.27727002476200535, -0.008217722069624534, 133.0058074289684),
+                (-0.010596257965952037, 0.007226232168178798, 0.27734094887564803, 250.4726348647675)))
+            self.assertIn('20250521125136', repr(label))
+            restored = json.loads(json.dumps(summary))
+            self.assertEqual(len(restored['mappable_volumes']), 2)
+            self.assertEqual(label.volume.id, summary['native_volume'])
+            # Native ownership never moves the label into B's direct-label list.
+            self.assertFalse(mapping.volume.labels)

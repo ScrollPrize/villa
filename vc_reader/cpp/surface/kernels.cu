@@ -2,18 +2,18 @@
 #include "../cuda_buffer.hpp"
 namespace vcr::surface {
 template<class T> __global__ void project(Raster g,const float* triangles,const std::int64_t* ids,const std::int64_t* offsets,
-    const int* candidates,const T* label,T* out,bool* coverage,bool* conflict,float* distance,std::int64_t* winner,float* uv){
+    const int* candidates,const T* label,T* out,bool* coverage,bool* conflict,float* distance,std::int64_t* winner,float* uv,bool* geometry){
     for(std::size_t i=blockIdx.x*blockDim.x+threadIdx.x;i<g.count;i+=std::size_t(blockDim.x)*gridDim.x)
-        raster(g,triangles,ids,offsets,candidates,label,out,coverage,conflict,distance,winner,uv,i);
+        raster(g,triangles,ids,offsets,candidates,label,out,coverage,conflict,distance,winner,uv,geometry,i);
 }
 void launch(const Plan& p,Raster g,const void* label,ElementType type,void* out,bool* coverage,bool* conflict,
-            float* distance,std::int64_t* winner,float* uv,int id){
+            float* distance,std::int64_t* winner,float* uv,bool* geometry,int id){
     auto upload=[&](const auto& values){auto a=device::allocate(values.size()*sizeof(values[0]),id);
         if(a->bytes)device::check(cudaMemcpyAsync(a->ptr,values.data(),a->bytes,cudaMemcpyHostToDevice,device::stream()));return a;};
     auto triangles=upload(p.triangles),ids=upload(p.ids),offsets=upload(p.offsets),candidates=upload(p.candidates);
     type.visit_load([&](auto load){using T=decltype(load(static_cast<const std::uint8_t*>(nullptr)));
         project<<<unsigned((g.count+127)/128),128,0,device::stream()>>>(g,static_cast<float*>(triangles->ptr),static_cast<std::int64_t*>(ids->ptr),
-            static_cast<std::int64_t*>(offsets->ptr),static_cast<int*>(candidates->ptr),static_cast<const T*>(label),static_cast<T*>(out),coverage,conflict,distance,winner,uv);
+            static_cast<std::int64_t*>(offsets->ptr),static_cast<int*>(candidates->ptr),static_cast<const T*>(label),static_cast<T*>(out),coverage,conflict,distance,winner,uv,geometry);
     });device::check(cudaGetLastError());device::complete();
 }
 __global__ void interpolations(Interpolation g,const float* xyz,const bool* mask,const float* queries,const float* normals,

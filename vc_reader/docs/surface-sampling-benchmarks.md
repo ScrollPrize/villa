@@ -1,11 +1,9 @@
 # Surface sampling validation and measurements
 
-Validated with Release CPU/CUDA builds on Linux amd64, Python 3.14 and an
-RTX 5090. The complete suite passed 140 tests and 2,908 subtests with the CUDA
-build; the CPU build passed 119 tests and 1,374 subtests, with 21 CUDA skips.
-After naming the layer operation `render_surface`, its 13 tests and four
-subtests passed again on the CUDA build, exercising both backends. macOS and
-arm64 runtime validation was unavailable. No dependencies were installed.
+Validated on Linux amd64, Python 3.14 and an RTX 5090 with the rebuilt native
+CPU/CUDA raster kernels. The projection regression suite covers both backends;
+related aligned-sampling and training tests also exercise DataLoader workers.
+No dependencies were installed.
 
 ## Correctness and registration
 
@@ -35,7 +33,9 @@ Projection uses real PHerc0009B volume `20250820154339`, segment
 in `benchmarks/fixtures/surface_projection/`. Six 16×16 label patches start at
 `(18576 + 2*i, 7984 + 2*i)` for i = 0…5. Thickness and padding are each 2.4 µm.
 The first crop has origin ZYX `(23696, 15856, 18653)`, shape `(20, 11, 19)`,
-4,180 valid CT voxels and 701 covered label voxels.
+4,180 valid CT voxels and 941 valid labeled sheet voxels. The seed rectangle
+defines the crop bounds; projection includes the registered sheet throughout
+that crop, including the padded margins.
 
 The fixture explicitly declares `pixel_to_uv=((1,0,.5),(0,1,.5))`, derived
 from the full-canvas, unit-scale, unrotated `vc_render_tifxyz` convention:
@@ -50,8 +50,10 @@ The fixture declares `tifxyz_mask=False` after the optional mask returned HTTP
 404, allowing unambiguous offline reopening.
 
 The first zero-thickness projection agrees exactly with an independent scalar
-triangle-clipping/intersection/closest-point oracle for categorical values,
-coverage and conflicts on both backends. All six CT crops match direct reads.
+triangle-intersection/closest-point oracle for categorical values,
+label validity, geometric coverage and conflicts on both backends. This oracle
+streams the complete raw TIFF geometry and samples label tiles independently
+of the production spatial index. All six CT crops match direct reads.
 CPU/CUDA label values, validity, conflicts and companion masks agree exactly
 for the positive-thickness benchmark. The existing real paired-reading script
 also passes on CUDA: 25×128×128 CT, 128×128 labels with 9,926 nonzero pixels,
@@ -69,43 +71,48 @@ end-to-end API baseline exists.
 | Workload | CPU mean / p50 / p95 ms | CUDA mean / p50 / p95 ms |
 | --- | --- | --- |
 | Three surface layers, 32×32 | 0.938 / 0.930 / 0.983 | 0.906 / 0.851 / 1.007 |
-| Label projection, 16×16 | 3.206 / 3.254 / 3.504 | 1.718 / 1.654 / 2.174 |
+| Label projection, 16×16 | 6.403 / 6.318 / 6.671 | 3.954 / 3.834 / 4.593 |
 
-Projection is about 1.87× faster on CUDA for these small requests, including
-CT, labels and companion masks. Reader opening took 13.6 ms CPU / 23.2 ms CUDA
-for projection and 5.1 / 13.8 ms for layers. The first projection took
-6.5 / 102.6 ms and first layer request 5.6 / 92.9 ms; CUDA includes initial
-device setup. Subsequent first visits to projection patches took 3.6–4.6 ms
-CPU and 2.3–3.5 ms CUDA.
+Projection is about 1.62× faster on CUDA for these requests, including CT,
+labels and companion masks. Reader opening took 13.8 ms CPU / 22.7 ms CUDA.
+The first projection took 128.5 / 213.6 ms, including construction of the
+whole-sheet spatial index; CUDA also includes initial device setup. Subsequent
+first visits took 10.5–11.3 ms CPU and 8.0–8.8 ms CUDA. Warm timings above reuse
+the index, coordinate tiles and label tiles.
+
+The six PHercParis4 notebook crops were also checked on both backends. Each uses
+a 64×64 seed, CT level 2, a 9.6 µm band and 19.2 µm padding. Sheet coverage reaches
+all six crop faces for these particular patches, and CPU/CUDA labels, validity,
+geometric coverage, supervision and conflicts agree exactly. One padded crop
+also matches the independent float64 oracle at zero thickness. Building the
+index and reading the first crop took 466–556 ms across the two segments/backends.
+Three repeats of each segment's first crop had median times of 22.2 / 12.6 ms
+on CPU and 16.2 / 7.9 ms on CUDA. These small repeat counts are a cache-reuse check,
+separate from the 60-request benchmark table.
 
 ## Memory and execution phases
 
-Projection retained 16,024 bytes of sampling tiles and 15,360 bytes of plans;
-reported peak sampling work was 138,696 bytes. Tracemalloc peaks were 258,540
-bytes CPU and 199,132 bytes CUDA. Layers retained 401,192 tile bytes, no plans,
-and peaked at 196,608 sampling work bytes; Python peaks were 183,012 / 168,372
-bytes. These figures are distinct budgets/counters, not whole-process or total
-GPU memory measurements. TIFF mappings and decoder caches are separate.
+For the 16×16 projection workload, both backends retained 20,443,541 bytes of
+sampling tiles and 714,752 bytes of plans; reported peak sampling work was
+5,980,240 bytes. Tracemalloc peaks during the instrumented warm pass were
+271,976 bytes CPU and 209,600 bytes CUDA. These are distinct budgets/counters,
+not whole-process or total GPU memory measurements. TIFF mappings and decoder
+caches are separate.
 
-Across the projection run, including correctness and instrumented passes,
-geometry preparation consumed 4.99 ms CPU / 4.65 ms CUDA; index construction
-1.18 / 1.19 ms; raster calls 226.21 / 29.77 ms. Those cumulative wall times
-include dispatch and uploads and are not unbiased per-request kernel timings.
-Geometry logical reads totaled 288 bytes; CUDA candidate payload uploads
-totaled 5,042,952 bytes and shared source/state uploads 9,443,744 bytes.
-Logical geometry bytes exclude TIFF headers and physical file/network reads;
-payload counters exclude some native dispatch-table transfers.
+Geometry logical reads totaled 15,772,908 bytes during preparation and remained
+unchanged throughout repeated requests: the whole-sheet index is reused.
+Across correctness, timing and instrumented passes, preparation consumed
+119.87 ms CPU / 117.09 ms CUDA; candidate indexing 1.42 / 1.40 ms; raster calls
+318.52 / 29.99 ms. Those cumulative wall times include dispatch and uploads.
+CUDA candidate payload uploads totaled 6,194,432 bytes and shared source/state
+uploads 9,839,320 bytes. Logical geometry bytes exclude TIFF headers and physical
+file/network reads; payload counters exclude some native dispatch transfers.
 
-A separate Nsight Systems projection profile, including startup and validation,
-measured 182 raster launches at mean 137.1 µs (median 117.2 µs), 364 aligned
-sampling launches at mean 5.77 µs, and 182 box-validity launches at mean
-0.707 µs. Rasterization dominated GPU kernel time (24.96 ms total).
-H2D copies totaled 24.063 MB / 1.758 ms, D2D 4.717 MB / 9.673 ms, and D2H
-3.256 MB / 0.129 ms across that entire profile. Small copies and Python/dispatch
-overhead remain significant at this patch size; this is not a large-patch
-throughput claim. Host decoding, UV planning and spatial indexing remain CPU
-work; interpolation, volume/categorical sampling and raster reduction have
-CUDA implementations.
+The regression suite also checks that larger padding preserves annotations in
+the overlapping crop, actual geometry holes remain uncovered, missing labels do
+not become valid negatives, distant folds are included, and the index is reused
+for different seed rectangles. Coverage is produced by the same CPU/CUDA raster
+pass as label validity, without a separate geometry rasterization.
 
 ## Reproduction
 

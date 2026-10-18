@@ -470,9 +470,9 @@ class Projection:
             # Python metadata/node overhead is deliberately budgeted conservatively.
             entries=[] if count*2048<=reader._plans.limit else None
             for tile in self.tiles():
-                bounds=reader._plans.get(('surface-bounds',(*self.key,tile)))
+                bounds=reader._plans.get(('surface-bounds',(*self.key,tile,True)))
                 if bounds is None:
-                    _,_,bounds=self.triangles(tile)
+                    _,_,bounds=self.triangles(tile,clip=True)
                 if bounds is None:
                     continue
                 if entries is not None:
@@ -490,6 +490,8 @@ class Projection:
         self.origin=tuple(reversed(origin));self.shape=tuple(b-a for a,b in zip(reversed(origin),reversed(end)))
         if any(n>2**24 for n in self.shape):
             raise ValueError('derived crop extent exceeds supported coordinate range')
+        # The label rectangle selects the crop, not the extent of its sheet.
+        self.index=None
         self.preparation_seconds=time.perf_counter()-before
         reader._surface_metrics['preparation_seconds'] += self.preparation_seconds
 
@@ -498,9 +500,52 @@ class Projection:
             for x in range(self.grid_start[1],self.grid_end[1],32):
                 yield (y,x),(min(32,self.grid_end[0]-y)+1,min(32,self.grid_end[1]-x)+1)
 
-    def triangles(self,tile):
+    def spatial_index(self):
+        """Index the whole registered sheet once, including folds returning to a crop."""
         import numpy as np
-        key=(*self.key,tile)
+        # Bulk coordinate reads amortize Python/decoder overhead. Index leaves are
+        # smaller; only intersecting leaves are triangulated and read as labels.
+        block=256
+        while (block+1)**2*80>self.reader._work_bytes//2 and block>1:
+            block//=2
+        step=min(64,block)
+        while math.prod((n-1+step-1)//step for n in self.geom.shape)*2048>self.reader._work_bytes//2 and step<block:
+            step*=2
+        count=math.prod((n-1+step-1)//step for n in self.geom.shape)
+        if count*2048>self.reader._work_bytes//2:
+            raise MemoryError('surface spatial index exceeds sampling_work_bytes')
+        key=('surface-spatial-index',self.surface,self.destination.matrix,step)
+        cached=self.reader._plans.get(key)
+        if cached is not None:
+            return cached
+        entries=[]
+        for y in range(0,self.geom.shape[0]-1,block):
+            for x in range(0,self.geom.shape[1]-1,block):
+                size=(min(block,self.geom.shape[0]-1-y)+1,min(block,self.geom.shape[1]-1-x)+1)
+                xyz,valid,_=self.geom.tile((y,x),size)
+                if not valid.any():
+                    continue
+                anchor=tuple(math.floor(float(v)) for v in xyz[valid][0])
+                points,base=_transform(xyz-np.asarray(anchor,np.float32),self.destination,anchor)
+                for iy in range(0,size[0]-1,step):
+                    for ix in range(0,size[1]-1,step):
+                        leaf=(min(step,size[0]-1-iy)+1,min(step,size[1]-1-ix)+1)
+                        mask=valid[iy:iy+leaf[0],ix:ix+leaf[1]]
+                        if not mask.any():
+                            continue
+                        vertices=points[iy:iy+leaf[0],ix:ix+leaf[1]][mask]
+                        lo,hi=vertices.min(axis=0),vertices.max(axis=0)
+                        bounds=(tuple(float(v)+b for v,b in zip(lo,base)),
+                                tuple(float(v)+b for v,b in zip(hi,base)))
+                        entries.append((((y+iy,x+ix),leaf),bounds))
+        index=_SurfaceIndex(entries)
+        self.reader._plans.put(key,index,count*2048)
+        self.reader._peak_work=max(self.reader._peak_work,count*2048+(block+1)**2*80)
+        return index
+
+    def triangles(self,tile,*,clip=False):
+        import numpy as np
+        key=(*self.key,tile,clip)
         cached=self.reader._tiles.get(key)
         if cached is not None:
             return cached
@@ -522,14 +567,15 @@ class Projection:
         triangles=np.concatenate((local,pix[...,:2]),axis=-1)
         ids=((iy.astype(np.int64)+start[0])*(self.geom.shape[1]-1)+ix+start[1])*2
         ids=np.stack((ids,ids+1),axis=1).ravel()
-        lower=(-.5,-.5);upper=(self.size[1]-.5,self.size[0]-.5)
-        inside=(triangles[...,3:]>=np.array(lower,np.float32)).all(axis=(1,2))&(triangles[...,3:]<=np.array(upper,np.float32)).all(axis=(1,2))
-        clipped=[triangles[inside]];identifiers=[ids[inside]]
-        for t,identifier in zip(triangles[~inside],ids[~inside]):
-            pieces=_clip(t,lower,upper)
-            if pieces:
-                clipped.append(np.asarray(pieces,np.float32));identifiers.append(np.full(len(pieces),identifier,np.int64))
-        triangles=np.concatenate(clipped);ids=np.concatenate(identifiers)
+        if clip:
+            lower=(-.5,-.5);upper=(self.size[1]-.5,self.size[0]-.5)
+            inside=(triangles[...,3:]>=np.array(lower,np.float32)).all(axis=(1,2))&(triangles[...,3:]<=np.array(upper,np.float32)).all(axis=(1,2))
+            clipped=[triangles[inside]];identifiers=[ids[inside]]
+            for t,identifier in zip(triangles[~inside],ids[~inside]):
+                pieces=_clip(t,lower,upper)
+                if pieces:
+                    clipped.append(np.asarray(pieces,np.float32));identifiers.append(np.full(len(pieces),identifier,np.int64))
+            triangles=np.concatenate(clipped);ids=np.concatenate(identifiers)
         if len(triangles):
             a=triangles[:,1,:3]-triangles[:,0,:3];b=triangles[:,2,:3]-triangles[:,0,:3]
             normal=np.cross(a,b);keep=np.any(normal!=0,axis=1)&np.isfinite(normal).all(axis=1)
@@ -545,7 +591,8 @@ class Projection:
         lo=triangles[...,:3].min(axis=(0,1));hi=triangles[...,:3].max(axis=(0,1))
         bounds=(tuple(float(v)+b for v,b in zip(lo,base)),tuple(float(v)+b for v,b in zip(hi,base)))
         result=(np.ascontiguousarray(triangles),ids,(bounds[0],bounds[1],base))
-        self.reader._tiles.put(key,result,triangles.nbytes+ids.nbytes+128)
+        if not clip:
+            self.reader._tiles.put(key,result,triangles.nbytes+ids.nbytes+128)
         self.reader._plans.put(('surface-bounds',key),result[2],512)
         return result
 
@@ -556,7 +603,7 @@ class Projection:
                     selection=self.reader._reference_reader.resolved.selection.__dict__,origin_zyx=start,shape_zyx=size,
                     crop_to_reference=_shift(tuple(reversed(start))).matrix,array_to_level0=self.reader._reference_map.matrix,
                     full_origin_zyx=self.origin,full_shape_zyx=self.shape,thickness_um=self.thickness,padding_um=self.padding,
-                    preparation_seconds=self.preparation_seconds)
+                    annotation_extent='crop',preparation_seconds=self.preparation_seconds)
 
     def _state(self,target,shape):
         import numpy as np
@@ -564,7 +611,8 @@ class Projection:
         before=time.perf_counter()
         arrays=[np.full((target['channels'],n),target['reader'].fill_value,target['native_dtype']),
                 np.zeros((1,n),bool),np.zeros((1,n),bool),np.full(n,np.inf,np.float32),
-                np.full(n,np.iinfo(np.int64).max,np.int64),np.full((n,2),np.nan,np.float32)]
+                np.full(n,np.iinfo(np.int64).max,np.int64),np.full((n,2),np.nan,np.float32),
+                np.zeros((1,n),bool)]
         if r.backend=='cuda':
             from .cuda import asarray
             r._uploads+=sum(a.nbytes for a in arrays)
@@ -598,7 +646,7 @@ class Projection:
             hi=tuple(min(target['shape'][a],math.ceil(float(p[:,a].max()))+base[a]+2) for a in (1,2))
             size=tuple(max(0,b-a) for a,b in zip(lo,hi))
             if not all(size):
-                continue
+                lo=(0,0);size=(0,0)
             if math.prod(size)*target['channels']*target['dtype'].itemsize*3>r._work_bytes:
                 if len(ids)<=1:
                     raise MemoryError('one triangle label footprint exceeds sampling_work_bytes')
@@ -615,7 +663,8 @@ class Projection:
             key=('surface-label',target['storage_key'],lo,size,r.backend)
             label=r._tiles.get(key)
             if label is None:
-                label=r._canonical(target['reader'].read(lo,size),target['reader'])[:,0]
+                label=(r._canonical(target['reader'].read(lo,size),target['reader'])[:,0] if all(size)
+                       else np.empty((target['channels'],0,0),target['native_dtype']))
                 r._tile_reads+=1
                 if r.backend=='cuda':
                     from .cuda import asarray
@@ -623,8 +672,7 @@ class Projection:
                 r._tiles.put(key,label,label.nbytes)
             matrix=_shift((-lo[1],-lo[0],0)) @ mapping
             rows=matrix.matrix
-            config=plan.configure(tuple(rows[a][b] for a in (0,1) for b in (0,1,3)),lo,size,target['channels'],
-                                  (*self.start,self.start[0]+self.size[0],self.start[1]+self.size[1]),name==self.label_target)
+            config=plan.configure(tuple(rows[a][b] for a in (0,1) for b in (0,1,3)),lo,size,target['channels'])
             state=states[name]
             before=time.perf_counter()
             if r.backend=='cpu':
@@ -638,6 +686,12 @@ class Projection:
         import numpy as np
         r=self.reader
         _check_budget(r,size)
+        if self.index is None:
+            before=time.perf_counter()
+            self.index=self.spatial_index()
+            elapsed=time.perf_counter()-before
+            self.preparation_seconds+=elapsed
+            r._surface_metrics['preparation_seconds']+=elapsed
         # These are ordinary volume reads; surface targets are explicitly handled below.
         result=SampleResult({}, dict(r.metadata or {}))
         result.metadata['projection']=self.metadata(start,size)
@@ -646,9 +700,9 @@ class Projection:
             result[name].masks={k:r._sample_many(t,[(start,size)])[0][0] for k,t in target['companions'].items()}
         states={name:self._state(t,size) for name,t in self.targets.items()}
         request_lo=tuple(reversed(start));request_hi=tuple(s+n-1 for s,n in zip(request_lo,reversed(size)))
-        tiles=self.index.query(request_lo,request_hi,self.expansion) if self.index is not None else self.tiles()
+        tiles=self.index.query(request_lo,request_hi,self.expansion)
         for tile in tiles:
-            key=('surface-bounds',(*self.key,tile))
+            key=('surface-bounds',(*self.key,tile,False))
             bounds=r._plans.get(key)
             if bounds is not None and any(b+e+.5<l or a-e-.5>h for a,b,e,l,h in zip(bounds[0],bounds[1],self.expansion,request_lo,request_hi)):
                 continue
@@ -656,15 +710,24 @@ class Projection:
             if bounds is None or any(b+e+.5<l or a-e-.5>h for a,b,e,l,h in zip(bounds[0],bounds[1],self.expansion,request_lo,request_hi)):
                 continue
             origin=tuple(s-b for b,s in zip(bounds[2],request_lo))
+            # Reject triangles before label reads and candidate construction. A
+            # spatial-index leaf can be much larger than a small training crop.
+            lower=np.asarray(origin,np.float32)-np.float32(.5)-np.asarray(self.expansion,np.float32)
+            upper=lower+np.asarray(tuple(reversed(size)),np.float32)+2*np.asarray(self.expansion,np.float32)
+            lower=np.nextafter(lower,np.float32(-np.inf));upper=np.nextafter(upper,np.float32(np.inf))
+            keep=(triangles[...,:3].max(axis=1)>=lower).all(axis=1)&(triangles[...,:3].min(axis=1)<=upper).all(axis=1)
+            if not keep.any():
+                continue
+            triangles,ids=triangles[keep],ids[keep]
             self._raster(triangles,ids,origin,size,states)
         patch_shift=_shift(self.uv_origin)
         for name,target in self.targets.items():
-            values,coverage,conflict,_,_,uv=states[name]
+            values,valid,conflict,_,_,uv,coverage=states[name]
             if r.backend == 'cpu':
                 values=values.astype(target['dtype'],copy=False)
             result.targets[name]=TargetResult(values.reshape((target['channels'],*size)),
-                                              coverage.reshape((1,*size)))
-            result[name].masks={'coverage':result[name].valid,'conflict':conflict.reshape((1,*size))}
+                                              valid.reshape((1,*size)))
+            result[name].masks={'coverage':coverage.reshape((1,*size)),'conflict':conflict.reshape((1,*size))}
             if target['companions']:
                 uv=uv.numpy() if r.backend=='cuda' else uv
                 for key,child in target['companions'].items():

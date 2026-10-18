@@ -4,17 +4,17 @@ namespace vcr::surface {
 using Floats=nb::ndarray<float,nb::c_contig,nb::device::cpu>;
 using Integers=nb::ndarray<std::int64_t,nb::c_contig,nb::device::cpu>;
 inline Raster configure(const Plan& p,std::array<float,6> mapping,std::array<std::int64_t,2> origin,
-    std::array<std::int64_t,2> shape,int channels,std::array<std::int64_t,4> patch,bool restrict_patch){
+    std::array<std::int64_t,2> shape,int channels){
     if(shape[0]<0||shape[1]<0||shape[0]>(1<<24)||shape[1]>(1<<24)||channels<1)throw nb::value_error("invalid label shape");
     for(float x:mapping)if(!std::isfinite(x))throw nb::value_error("nonfinite UV mapping");
     auto g=p.grid;g.channels=channels;g.label_h=int(shape[0]);g.label_w=int(shape[1]);
     std::copy(mapping.begin(),mapping.end(),g.uv_to_label);std::copy(origin.begin(),origin.end(),g.label_origin);
-    g.patch_start[0]=patch[0];g.patch_start[1]=patch[1];g.patch_end[0]=patch[2];g.patch_end[1]=patch[3];g.restrict_patch=restrict_patch;return g;
+    return g;
 }
 inline void check(const Raster& g,std::size_t item,std::size_t label,std::size_t out,std::size_t coverage,
-                  std::size_t conflict,std::size_t distance,std::size_t winner,std::size_t uv){
+                  std::size_t conflict,std::size_t distance,std::size_t winner,std::size_t uv,std::size_t geometry){
     if(label!=std::size_t(g.channels)*g.label_h*g.label_w*item||out!=g.count*g.channels*item||coverage!=g.count||
-       conflict!=g.count||distance!=g.count*4||winner!=g.count*8||uv!=g.count*8)throw nb::value_error("raster buffer size mismatch");
+       conflict!=g.count||distance!=g.count*4||winner!=g.count*8||uv!=g.count*8||geometry!=g.count)throw nb::value_error("raster buffer size mismatch");
 }
 inline void bind(nb::module_& m){
     nb::class_<Raster>(m,"SurfaceRaster");
@@ -28,14 +28,14 @@ inline void bind(nb::module_& m){
       .def_prop_ro("upload_bytes",[](const Plan& p){return p.triangles.size()*4+p.ids.size()*8+p.offsets.size()*8+p.candidates.size()*4;})
       .def("configure",&configure)
       .def("cpu",[](const Plan& p,Raster g,Bytes label,const std::string& kind,std::size_t item,
-                    Bytes out,Bytes coverage,Bytes conflict,Bytes distance,Bytes winner,Bytes uv){
+                    Bytes out,Bytes coverage,Bytes conflict,Bytes distance,Bytes winner,Bytes uv,Bytes geometry){
         auto type=sample_type(kind,item,false);if(kind=="f")throw nb::value_error("projection requires categorical integers");
-        check(g,item,label.size(),out.size(),coverage.size(),conflict.size(),distance.size(),winner.size(),uv.size());
+        check(g,item,label.size(),out.size(),coverage.size(),conflict.size(),distance.size(),winner.size(),uv.size(),geometry.size());
         nb::gil_scoped_release release;
         type.visit_load([&](auto load){using T=decltype(load(static_cast<const std::uint8_t*>(nullptr)));
             for(std::size_t i=0;i<g.count;++i)raster(g,p.triangles.data(),p.ids.data(),p.offsets.data(),p.candidates.data(),
                 reinterpret_cast<const T*>(label.data()),reinterpret_cast<T*>(out.data()),reinterpret_cast<bool*>(coverage.data()),
-                reinterpret_cast<bool*>(conflict.data()),reinterpret_cast<float*>(distance.data()),reinterpret_cast<std::int64_t*>(winner.data()),reinterpret_cast<float*>(uv.data()),i);
+                reinterpret_cast<bool*>(conflict.data()),reinterpret_cast<float*>(distance.data()),reinterpret_cast<std::int64_t*>(winner.data()),reinterpret_cast<float*>(uv.data()),reinterpret_cast<bool*>(geometry.data()),i);
         });
       });
     m.def("_surface_interpolate",[](Floats xyz,Bytes mask,Floats queries,Floats normals,Floats output,Bytes valid,
@@ -72,13 +72,13 @@ inline void bind(nb::module_& m){
         copy_region_cuda(src.data(),dst.data(),shape,output,offset,channels,item);
     });
     m.def("_surface_raster_cuda",[](const Plan& p,Raster g,Device label,const std::string& kind,std::size_t item,
-         Device out,Device coverage,Device conflict,Device distance,Device winner,Device uv){
+         Device out,Device coverage,Device conflict,Device distance,Device winner,Device uv,Device geometry){
         auto type=sample_type(kind,item,false);if(kind=="f")throw nb::value_error("projection requires categorical integers");
-        check(g,item,label.nbytes(),out.nbytes(),coverage.nbytes(),conflict.nbytes(),distance.nbytes(),winner.nbytes(),uv.nbytes());
-        for(const Device* a:std::initializer_list<const Device*>{&label,&out,&coverage,&conflict,&distance,&winner,&uv})if(a->device_id()!=out.device_id())throw nb::value_error("device mismatch");
+        check(g,item,label.nbytes(),out.nbytes(),coverage.nbytes(),conflict.nbytes(),distance.nbytes(),winner.nbytes(),uv.nbytes(),geometry.nbytes());
+        for(const Device* a:std::initializer_list<const Device*>{&label,&out,&coverage,&conflict,&distance,&winner,&uv,&geometry})if(a->device_id()!=out.device_id())throw nb::value_error("device mismatch");
         nb::gil_scoped_release release;device::Guard guard(out.device_id());
         launch(p,g,label.data(),type,out.data(),static_cast<bool*>(coverage.data()),static_cast<bool*>(conflict.data()),
-               static_cast<float*>(distance.data()),static_cast<std::int64_t*>(winner.data()),static_cast<float*>(uv.data()),out.device_id());
+               static_cast<float*>(distance.data()),static_cast<std::int64_t*>(winner.data()),static_cast<float*>(uv.data()),static_cast<bool*>(geometry.data()),out.device_id());
     });
     m.def("_surface_copy_cuda",[](Device src,Device dst,std::size_t rows,std::size_t source_width,std::size_t dest_width,
                                 std::size_t offset,std::size_t item){

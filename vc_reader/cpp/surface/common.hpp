@@ -86,8 +86,7 @@ struct Raster {
     int shape[3]{}, channels=1, label_h=0,label_w=0;
     std::size_t count=0;
     float metric[12]{}, uv_to_label[6]{}, origin[3]{}, radius=0;
-    std::int64_t label_origin[2]{}, patch_start[2]{},patch_end[2]{};
-    bool restrict_patch=false;
+    std::int64_t label_origin[2]{};
 };
 VCR_SURFACE_HD inline std::int64_t nearest(float q,std::int64_t base){
     float f=floorf(q);auto n=base+std::int64_t(f);float r=q-f;
@@ -97,12 +96,13 @@ VCR_SURFACE_HD inline std::int64_t nearest(float q,std::int64_t base){
 // and exact categorical conflict tests never require floating-point atomics.
 template<class T> VCR_SURFACE_HD void raster(const Raster& g,const float* triangles,const std::int64_t* ids,
     const std::int64_t* offsets,const int* candidates,const T* label,T* out,bool* coverage,bool* conflict,
-    float* distance,std::int64_t* winner,float* uv,std::size_t i){
+    float* distance,std::int64_t* winner,float* uv,bool* geometry,std::size_t i){
     V center{float(i%g.shape[2])+g.origin[0],float(i/g.shape[2]%g.shape[1])+g.origin[1],float(i/g.shape[2]/g.shape[1])+g.origin[2]};
     for(auto pos=offsets[i];pos<offsets[i+1];++pos){
         int t=candidates[pos];const float* p=triangles+15*t;
         V a=vector(p)-center,b=vector(p+5)-center,c=vector(p+10)-center;
         if(!band(a,b,c,g.metric,g.radius))continue;
+        geometry[i]=true;
         float u,v;V q=closest({0,0,0},linear(g.metric,a),linear(g.metric,b),linear(g.metric,c),u,v);
         float x=barycentric(p[3],p[8],p[13],u,v);
         float y=barycentric(p[4],p[9],p[14],u,v);
@@ -110,7 +110,6 @@ template<class T> VCR_SURFACE_HD void raster(const Raster& g,const float* triang
         float py=g.uv_to_label[3]*x+g.uv_to_label[4]*y+g.uv_to_label[5];
         if(!std::isfinite(px)||!std::isfinite(py)||fabsf(px)>0x1p30f||fabsf(py)>0x1p30f)continue;
         auto ix=nearest(px,g.label_origin[1]),iy=nearest(py,g.label_origin[0]);
-        if(g.restrict_patch&&(iy<g.patch_start[0]||iy>=g.patch_end[0]||ix<g.patch_start[1]||ix>=g.patch_end[1]))continue;
         ix-=g.label_origin[1];iy-=g.label_origin[0];
         if(ix<0||iy<0||ix>=g.label_w||iy>=g.label_h)continue;
         auto pixel=iy*g.label_w+ix;float d=dot(q,q);

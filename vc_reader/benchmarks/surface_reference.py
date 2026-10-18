@@ -8,34 +8,43 @@ import itertools
 import numpy as np
 
 
-def clipped_triangles(xyz, grid_to_label, start, size):
-    height,width=xyz.shape[:2]
-    lower=np.array(start[::-1],np.float64)-.5
-    upper=lower+np.array(size[::-1])
-    for y in range(height-1):
-        for x in range(width-1):
-            for ordinal,indices in enumerate((((y,x),(y,x+1),(y+1,x+1)),((y,x),(y+1,x+1),(y+1,x)))):
-                points=np.array([xyz[index] for index in indices],np.float64)
-                if not np.isfinite(points).all() or (points<0).any():continue
-                pixels=np.array([grid_to_label.apply((col,row,0))[:2] for row,col in indices])
-                if np.any(pixels.max(0)<lower) or np.any(pixels.min(0)>upper):continue
-                polygon=list(np.concatenate((points,pixels),axis=1))
-                for axis,side in itertools.product((0,1),(0,1)):
-                    edge=(lower if side==0 else upper)[axis]
-                    sign=1 if side==0 else -1
-                    old=polygon;polygon=[]
-                    if not old:break
-                    for a,b in zip(old,old[1:]+old[:1]):
-                        da,db=sign*(a[axis+3]-edge),sign*(b[axis+3]-edge)
-                        if da>=0:polygon.append(a)
-                        if (da<0)!=(db<0):
-                            intersection=(a*db-b*da)/(db-da)
-                            intersection[axis+3]=edge
-                            polygon.append(intersection)
-                for j in range(1,len(polygon)-1):
-                    tri=np.array((polygon[0],polygon[j],polygon[j+1]))
-                    if np.linalg.norm(np.cross(tri[1,:3]-tri[0,:3],tri[2,:3]-tri[0,:3]))>0:
-                        yield ((y*(width-1)+x)*2+ordinal),tri
+def crop_triangles(fields, placement, grid_to_label, origin, shape):
+    """Stream raw geometry; retain complete triangles touching the 3D crop."""
+    height,width=fields[0].shape
+    lower=np.asarray(origin[::-1],np.float64)-.5
+    upper=lower+np.asarray(shape[::-1])
+    for y in range(0,height-1,256):
+        for x in range(0,width-1,256):
+            size=(min(257,height-y),min(257,width-x))
+            xyz=np.stack([r.read((y,x),size) for r in fields],axis=-1).astype(np.float64)
+            valid=np.isfinite(xyz).all(axis=-1)&(xyz>=0).all(axis=-1)
+            iy,ix=np.nonzero(valid[:-1,:-1]&valid[1:,:-1]&valid[:-1,1:]&valid[1:,1:])
+            xyz=xyz@np.asarray(placement.linear).T+np.asarray(placement.translation)
+            for ordinal,indices in enumerate((((0,0),(0,1),(1,1)),((0,0),(1,1),(1,0)))):
+                points=np.stack([xyz[iy+dy,ix+dx] for dy,dx in indices],axis=1)
+                keep=(points.max(axis=1)>=lower).all(axis=1)&(points.min(axis=1)<=upper).all(axis=1)
+                for row,col,triangle in zip(iy[keep],ix[keep],points[keep]):
+                    if not np.any(np.cross(triangle[1]-triangle[0],triangle[2]-triangle[0])):
+                        continue
+                    pixels=np.array([grid_to_label.apply((x+col+dx,y+row+dy,0))[:2] for dy,dx in indices])
+                    yield ((y+row)*(width-1)+x+col)*2+ordinal,np.concatenate((triangle,pixels),axis=1)
+
+
+def label_sampler(reader):
+    """Independent bounded nearest-pixel reads, including distant folded regions."""
+    from collections import OrderedDict
+    tiles=OrderedDict()
+    def sample(y,x):
+        if not (0<=y<reader.shape[0] and 0<=x<reader.shape[1]):
+            return None
+        start=(y//128*128,x//128*128)
+        if start not in tiles:
+            if len(tiles)==32:
+                tiles.popitem(last=False)
+            tiles[start]=reader.read(start,tuple(min(128,n-a) for n,a in zip(reader.shape,start)))
+        tiles.move_to_end(start)
+        return tiles[start][y-start[0],x-start[1]]
+    return sample
 
 
 def nearest(p,triangle):
@@ -67,8 +76,9 @@ def intersects(relative):
     return True
 
 
-def project(triangles,labels,label_origin,start,size,origin,shape,spacing):
-    output=np.zeros(shape,labels.dtype);coverage=np.zeros(shape,bool);conflict=np.zeros(shape,bool)
+def project(triangles,label_at,dtype,origin,shape,spacing):
+    output=np.zeros(shape,dtype);valid=np.zeros(shape,bool);conflict=np.zeros(shape,bool)
+    coverage=np.zeros(shape,bool)
     distance=np.full(shape,np.inf);winners=np.full(shape,np.iinfo(np.int64).max,np.int64)
     winner_pixels=np.full((*shape,2),np.nan)
     for identifier,triangle in triangles:
@@ -78,6 +88,7 @@ def project(triangles,labels,label_origin,start,size,origin,shape,spacing):
         for index in itertools.product(*(range(a,b+1) for a,b in zip(lower,upper))):
             xyz=np.array(index[::-1])
             if not intersects(points-xyz):continue
+            coverage[index]=True
             q,w=nearest(xyz*np.array(spacing),points*np.array(spacing))
             active=np.flatnonzero(w)
             if len(active)==1:
@@ -87,12 +98,16 @@ def project(triangles,labels,label_origin,start,size,origin,shape,spacing):
                 pixel=triangle[a,3:]+w[b]*(triangle[b,3:]-triangle[a,3:])
             else:
                 pixel=triangle[0,3:]+w[1]*(triangle[1,3:]-triangle[0,3:])+w[2]*(triangle[2,3:]-triangle[0,3:])
+            # Surface intersections can land on exact half-pixel ties. Remove float64
+            # interpolation roundoff before applying nearest-even categorical sampling.
+            half=np.round(pixel*2)/2
+            pixel=np.where(np.abs(pixel-half)<1e-9,half,pixel)
             ix,iy=np.rint(pixel).astype(int)
-            if not(start[0]<=iy<start[0]+size[0] and start[1]<=ix<start[1]+size[1]):continue
-            value=labels[iy-label_origin[0],ix-label_origin[1]]
+            value=label_at(iy,ix)
+            if value is None:continue
             dist=np.sum((q-xyz*np.array(spacing))**2)
-            if coverage[index] and output[index]!=value:conflict[index]=True
-            if not coverage[index] or (dist,identifier)<(distance[index],winners[index]):
+            if valid[index] and output[index]!=value:conflict[index]=True
+            if not valid[index] or (dist,identifier)<(distance[index],winners[index]):
                 output[index]=value;distance[index]=dist;winners[index]=identifier;winner_pixels[index]=pixel
-            coverage[index]=True
-    return output,coverage,conflict,winner_pixels
+            valid[index]=True
+    return output,valid,conflict,winner_pixels,coverage

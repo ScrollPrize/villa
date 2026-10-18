@@ -62,8 +62,8 @@ class SurfaceTests(unittest.TestCase):
                 meta=result.metadata['projection'];self.assertEqual(meta['origin_zyx'],(4,2,3));self.assertEqual(meta['shape_zyx'],(3,6,7))
                 z,y,x=meta['origin_zyx'];d,h,w=meta['shape_zyx']
                 np.testing.assert_array_equal(host(result['image'].data),self.image[None,z:z+d,y:y+h,x:x+w])
-                coverage=host(result['ink'].valid);self.assertEqual(int(coverage.sum()),15)
-                np.testing.assert_array_equal(host(result['ink'].data)[coverage],self.labels[np.ix_([2,2,3],[2,2,3,4,4])].ravel())
+                coverage=host(result['ink'].valid);self.assertEqual(int(coverage.sum()),42)
+                np.testing.assert_array_equal(host(result['ink'].data)[coverage],self.labels[:6,:7].ravel())
                 self.assertTrue(host(result['ink'].masks['conflict']).any())
                 tiled=np.zeros_like(host(result['ink'].data));tilevalid=np.zeros_like(coverage)
                 for tile in reader.iter_project_surface(self.surface,(2,2),(2,3),label_target='ink',padding_um=1,tile_size=(1,2,3)):
@@ -78,11 +78,96 @@ class SurfaceTests(unittest.TestCase):
         for result in results[1:]:
             for actual,expected in zip(result,results[0]):np.testing.assert_array_equal(actual,expected)
 
+
+    def test_crop_context_contains_continuing_sheet_and_labels(self):
+        labels=(np.indices((8,9))[1]>=4).astype(np.uint8)
+        supervision=np.ones((8,9),np.uint8);supervision[0]=0
+        mask=self.source('support',supervision,('y','x'),role='label')
+        ink=self.source('binary',labels,('y','x'),role='label',registration=self.label.registration,
+                        companions=(Companion('supervision',mask,same_grid=True),))
+        outputs=[]
+        for backend in self.backends():
+            with self.subTest(backend=backend),open_sample(self.reference,{'ink':ink},backend=backend) as reader:
+                result=reader.project_surface(self.surface,(3,3),(1,1),label_target='ink',padding_um=2)
+                annotation=result['ink'];origin=result.metadata['projection']['origin_zyx']
+                z,y,x=np.indices(annotation.data.shape[1:])
+                z+=origin[0];y+=origin[1];x+=origin[2]
+                expected=(z==5)&(x>=3)&(x<=11)&(y>=2)&(y<=9)
+                np.testing.assert_array_equal(host(annotation.masks['coverage'])[0],expected)
+                np.testing.assert_array_equal(host(annotation.valid)[0],expected)
+                np.testing.assert_array_equal(host(annotation.data)[0][expected],(x[expected]>=7).astype(np.uint8))
+                # The seed label is zero. Positive labels must also be read from
+                # the continuing sheet in the padded part of this same crop.
+                self.assertTrue(host(annotation.data).any())
+                self.assertTrue(host(annotation.masks['coverage'])[0,:,:,0].any())
+                self.assertTrue(host(annotation.masks['coverage'])[0,:,:,-1].any())
+                self.assertEqual(result.metadata['projection']['annotation_extent'],'crop')
+                outputs.append((host(annotation.data),host(annotation.masks['coverage']),host(annotation.valid),
+                                host(annotation.masks['supervision']),host(annotation.masks['conflict'])))
+        for result in outputs[1:]:
+            for actual,expected in zip(result,outputs[0]):np.testing.assert_array_equal(actual,expected)
+
+    def test_padding_preserves_existing_annotations_and_geometry_holes(self):
+        xyz=self.xyz.copy();xyz[:,3,3]=np.nan
+        surf=replace(self.surface,geometry=self.source('hole',xyz,('c','y','x'),role='scalar').storage)
+        ink=self.source('hole-label',np.ones((8,9),np.uint8),('y','x'),role='label',
+                        registration=SurfaceRegistration(surf,((1,0,0),(0,1,0))))
+        for backend in self.backends():
+            with self.subTest(backend=backend),open_sample(self.reference,{'ink':ink},backend=backend) as reader:
+                small=reader.project_surface(surf,(2,2),(4,4),label_target='ink')
+                large=reader.project_surface(surf,(2,2),(4,4),label_target='ink',padding_um=2)
+                origin=small.metadata['projection']['origin_zyx']
+                offset=tuple(a-b for a,b in zip(origin,large.metadata['projection']['origin_zyx']))
+                region=(slice(None),*(slice(a,a+n) for a,n in zip(offset,small['ink'].data.shape[1:])))
+                for key in ('coverage','conflict'):
+                    np.testing.assert_array_equal(host(small['ink'].masks[key]),host(large['ink'].masks[key])[region])
+                np.testing.assert_array_equal(host(small['ink'].valid),host(large['ink'].valid)[region])
+                np.testing.assert_array_equal(host(small['ink'].data),host(large['ink'].data)[region])
+                hole=(0,*(p-a for p,a in zip((5,5,6),origin)))
+                self.assertFalse(host(small['ink'].masks['coverage'])[hole])
+                self.assertFalse(host(small['ink'].valid)[hole])
+                # Actual outer geometry boundaries remain boundaries.
+                coverage=host(large['ink'].masks['coverage'])[0]
+                z,y,x=np.indices(coverage.shape)
+                oz,oy,ox=large.metadata['projection']['origin_zyx']
+                outside=(x+ox<3)|(x+ox>11)|(y+oy<2)|(y+oy>9)
+                self.assertFalse(coverage[outside].any())
+
+    def test_geometric_hint_does_not_turn_missing_labels_into_negatives(self):
+        ink=self.source('partial-label',np.ones((8,4),np.uint8),('y','x'),role='label',registration=self.label.registration)
+        # This annotation has no pixels in this surface's UV range at all.
+        absent=replace(ink,id='absent',registration=SurfaceRegistration(self.surface,((1,0,1000),(0,1,1000))))
+        for backend in self.backends():
+            with self.subTest(backend=backend),open_sample(self.reference,{'ink':ink,'absent':absent},backend=backend) as reader:
+                result=reader.project_surface(self.surface,(3,2),(1,1),label_target='ink',padding_um=3)
+                annotation=result['ink']
+                coverage=host(annotation.masks['coverage']);valid=host(annotation.valid)
+                unknown=coverage&~valid
+                self.assertTrue(unknown.any())
+                self.assertTrue((host(annotation.data)[valid]==1).all())
+                self.assertFalse(valid[unknown].any())
+                self.assertFalse(host(result['absent'].valid).any())
+                np.testing.assert_array_equal(host(result['absent'].masks['coverage']),coverage)
+                self.assertFalse(host(result['absent'].masks['conflict']).any())
+
+    def test_projection_finds_sheet_returning_from_distant_uv_region(self):
+        y,x=np.indices((8,130),dtype=np.float32)
+        physical_x=np.where(x<=8,x+3,np.where(x>=121,132-x,100)).astype(np.float32)
+        xyz=np.stack((physical_x,y+2,np.full_like(x,5)))
+        surf=replace(self.surface,geometry=self.source('returning-sheet',xyz,('c','y','x'),role='scalar').storage)
+        ink=self.source('returning-label',(x>=121).astype(np.uint8),('y','x'),role='label',
+                        registration=SurfaceRegistration(surf,((1,0,0),(0,1,0))))
+        for backend in self.backends():
+            with self.subTest(backend=backend),open_sample(self.reference,{'ink':ink},backend=backend) as reader:
+                result=reader.project_surface(surf,(2,2),(2,2),label_target='ink')
+                self.assertFalse(host(result['ink'].data).any())  # nearest tie: smaller triangle ID
+                self.assertTrue(host(result['ink'].masks['conflict']).any())  # remote fold carries ink
+
     def test_validation_budget_worker_and_zero_labels(self):
         zero=replace(self.label,storage=self.source('zero',np.zeros((8,9),np.uint8),('y','x')).storage)
         with open_sample(self.reference,{'ink':zero}) as reader:
             result=reader.project_surface(self.surface,(2,2),(2,3),label_target='ink')
-            self.assertEqual(int(result['ink'].valid.sum()),15);self.assertFalse(result['ink'].data.any())
+            self.assertEqual(int(result['ink'].valid.sum()),20);self.assertFalse(result['ink'].data.any())
             restored=pickle.loads(pickle.dumps(reader))
             with restored:
                 np.testing.assert_array_equal(restored.project_surface(self.surface,(2,2),(2,3),label_target='ink')['ink'].valid,result['ink'].valid)
@@ -227,7 +312,11 @@ class SurfaceTests(unittest.TestCase):
             geom=next(iter(reader._geometries.values()))
             with patch.object(geom,'tile',wraps=geom.tile) as tiles:
                 small=reader.project_surface(surf,(3,3),(4,4),label_target='ink')
-                self.assertTrue(all(max(call.args[1])<=6 for call in tiles.call_args_list))
+                # The first crop indexes the complete sheet in bounded blocks.
+                self.assertTrue(all(max(call.args[1])<=257 for call in tiles.call_args_list))
+            with patch.object(geom,'tile',wraps=geom.tile) as tiles:
+                reader.project_surface(surf,(20,80),(4,4),label_target='ink')
+                self.assertTrue(all(max(call.args[1])<=65 for call in tiles.call_args_list))
             result=reader.project_surface(surf,(0,0),(70,160),label_target='ink')
             saved=result['ink'].data.copy()
             with patch.object(geom,'tile',wraps=geom.tile) as tiles:

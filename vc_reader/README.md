@@ -48,6 +48,19 @@ browse every direct association; `.on_volume(id)` returns a contextual view.
 Only explicitly superseded entries are hidden. Use
 `.filter(include_superseded=True)` or historical ID lookup to inspect them.
 
+Labels expose volume registrations through their native volume:
+
+```python
+label = catalog.samples["PHerc0009B"].segments["20250919125754"].labels.ink(label_set="20260918")
+print(label.summary())  # native volume, mapped destinations, coverage and unresolved fields
+mapping = label.mappable_volumes["20250521125136"]
+print(mapping.required_operations)  # surface_projection, volume_transform
+```
+
+Surface labels can have known volume affines while still needing an explicit
+pixel-to-UV declaration. See [discovery](docs/discovery.md#find-labels-mapped-to-another-scan)
+and the runnable [`published-transfer` workflow](docs/training-workflows.md).
+
 ## Discover CT by resolution
 
 ```python
@@ -103,6 +116,21 @@ Projection derives the volume crop from registered geometry; `padding_um` adds
 CT context and `thickness_um` controls the label band. Large requests can use
 `iter_project_surface(...)`. See [surface sampling](docs/surface-sampling.md)
 for explicit geometry registration, coverage/conflict masks, and CPU/CUDA use.
+
+## Notebook examples
+
+Start with the [notebooks in `examples/`](examples/README.md):
+
+- [2.5D ink training](examples/01_ink_training_25d.ipynb): discover PHercParis4 labels, train a small model on CT layers, and validate on a held-out segment.
+- [3D ink training](examples/02_ink_training_3d.ipynb): project ink into CT and supply a separate target-sheet input channel.
+- [General Zarr reading](examples/03_zarr_reader.ipynb): groups, levels, slices, batched reads, buffers and caches.
+- [Augmentations and the CUDA pipeline](examples/04_augmentations_and_cuda.ipynb): aligned targets through DataLoader, GPU augmentation and a model step.
+- [Render a mesh segment](examples/05_render_mesh_segment.ipynb): central CT surface and −1/+1 normal offsets.
+
+The notebooks show the Dataset, model, supervision policy, short training loop,
+validation and figures directly. For process-local streaming readers, persistent
+spawned workers and cache controls, see [training integration](docs/training-workflows.md)
+and its [acceptance measurements](docs/training-workflow-benchmarks.md).
 
 ## PyTorch CUDA batches
 

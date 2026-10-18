@@ -1,7 +1,7 @@
 """Scroll-centered views over shared metadata records and storage descriptors."""
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import copy
 import math
 import operator
@@ -414,6 +414,12 @@ class Asset:
 
     @property
     def mappable_volumes(self):
+        """Volume affines reachable from this asset's native volume.
+
+        Surface labels retain their native volume even when pixel-to-UV fields
+        are unresolved. Inspect required_operations before opening a destination.
+        This property reads metadata only.
+        """
         native = self.volume
         if native is None or self.source.registration is None:
             return Collection()
@@ -428,6 +434,23 @@ class Asset:
                 operations += ('volume_transform',)
             result.append(VolumeMapping(volume, transform, coverage, operations))
         return Collection(result)
+
+    def summary(self):
+        """JSON-ready native ownership, volume mappings and unresolved fields.
+
+        Mapping availability and pixel/geometry declarations are independent.
+        Coverage describes published segment bounds, not a crop guarantee.
+        No storage headers or image arrays are requested.
+        """
+        native, segment = self.volume, self.segment
+        return dict(id=self.id, kind=self.kind, sample=self.scroll.id,
+                    segment=None if segment is None else segment.id,
+                    native_volume=None if native is None else native.id,
+                    unresolved_fields=list(self.source.unresolved_fields),
+                    mappable_volumes=[dict(volume=m.id, required_operations=list(m.required_operations),
+                        affine=m.transform.matrix, derivation_path=m.transform.derivation_path,
+                        coverage=None if m.coverage is None else asdict(m.coverage))
+                        for m in self.mappable_volumes])
 
     def open(self, *, level=None, **options):
         source = self.source if level is None else _select_level(self.source, level)
@@ -447,7 +470,11 @@ class Asset:
         return PairedReader(self.source, image.source, matches[0], level=level, layers=layers, backend=backend, **options)
 
     def __repr__(self):
-        return f'Asset({self.id!r}, kind={self.kind!r})'
+        native = self.volume
+        details = f', native_volume={native.id!r}' if native is not None else ''
+        if self.kind == 'label':
+            details += f', mappable_volumes={[m.id for m in self.mappable_volumes]!r}'
+        return f'Asset({self.id!r}, kind={self.kind!r}{details})'
 
 
 @dataclass(frozen=True)

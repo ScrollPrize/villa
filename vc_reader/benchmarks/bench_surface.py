@@ -88,7 +88,7 @@ def main():
                     # TIFF geometry is read directly; the oracle uses double precision
                     # and its own clipping, intersection and closest-point routines.
                     if i == 0:
-                        from surface_reference import clipped_triangles, project
+                        from surface_reference import crop_triangles, label_sampler, project
                         from vc_reader.reader.encoded_files import EncodedFiles
                         from vc_reader.reader.source_resolution import pixel_affine
                         root=surface.geometry.location.rstrip('/')
@@ -97,27 +97,20 @@ def main():
                         files.close()
                         scale=meta['scale'];to_uv=Affine.from_rows(((1/scale[0],0,0,0),(0,1/scale[1],0,0),(0,0,1,0)))
                         label_to_uv=pixel_affine(label.registration.pixel_to_uv)
-                        to_grid=to_uv.inverse()@label_to_uv
-                        sy,sx=request[0];hy,wx=request[1]
-                        corners=[to_grid.apply((x,y,0)) for x in (sx-.5,sx+wx-.5) for y in (sy-.5,sy+hy-.5)]
-                        low=tuple(max(0,int(np.floor(min(p[a] for p in corners)))) for a in (1,0))
-                        high=tuple(int(np.ceil(max(p[a] for p in corners)))+1 for a in (1,0))
-                        fields=[]
-                        for axis in 'xyz':
-                            raw_source=Source('oracle/'+axis,Storage(root+'/'+axis+'.tif','tiff'),axes=('y','x'),role='scalar')
-                            with raw_source.open(cache_dir=args.cache_dir,offline=args.offline) as raw:
-                                fields.append(raw.read(low,tuple(b-a for a,b in zip(low,high))))
-                        xyz=np.stack(fields,axis=-1).astype(np.float64)
+                        from contextlib import ExitStack
                         placement=reference.registration.affine.inverse()@surface.xyz_to_volume
-                        xyz=xyz@np.array(placement.linear).T+np.array(placement.translation)
-                        shift=Affine.from_rows(((1,0,0,low[1]),(0,1,0,low[0]),(0,0,1,0)))
-                        triangles=list(clipped_triangles(xyz,label_to_uv.inverse()@to_uv@shift,request[0],request[1]))
-                        with label.open(cache_dir=args.cache_dir,offline=args.offline) as raw:
-                            labels=raw.read(*request)
                         zero=reader.project_surface(surface,*request,label_target='ink')
                         zmeta=zero.metadata['projection']
-                        oracle=project(triangles,labels,request[0],request[0],request[1],zmeta['origin_zyx'],zmeta['shape_zyx'],surface.spacing_um)
-                        for name,actual_field,expected_field in zip(('values','coverage','conflict'),(zero['ink'].data,zero['ink'].valid,zero['ink'].masks['conflict']),oracle[:3]):
+                        with ExitStack() as stack:
+                            fields=[stack.enter_context(Source('oracle/'+axis,Storage(root+'/'+axis+'.tif','tiff'),
+                                    axes=('y','x'),role='scalar').open(cache_dir=args.cache_dir,offline=args.offline)) for axis in 'xyz']
+                            raw=stack.enter_context(label.open(cache_dir=args.cache_dir,offline=args.offline))
+                            triangles=crop_triangles(fields,placement,label_to_uv.inverse()@to_uv,
+                                                     zmeta['origin_zyx'],zmeta['shape_zyx'])
+                            oracle=project(triangles,label_sampler(raw),raw.dtype,zmeta['origin_zyx'],zmeta['shape_zyx'],surface.spacing_um)
+                        for name,actual_field,expected_field in zip(('values','valid','conflict','coverage'),
+                                (zero['ink'].data,zero['ink'].valid,zero['ink'].masks['conflict'],zero['ink'].masks['coverage']),
+                                (*oracle[:3],oracle[4])):
                             np.testing.assert_array_equal(host(actual_field)[0],expected_field,err_msg=name)
                         report['independent_projection_oracle']='zero thickness: values, coverage and conflicts match float64 scalar geometry'
                 else:
