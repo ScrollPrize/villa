@@ -2,7 +2,6 @@
 import argparse
 import cProfile
 from contextlib import ExitStack
-from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
@@ -78,11 +77,12 @@ def main():
                 if args.backend == 'cuda':
                     result = {k: asarray(v) for k, v in result.items()}
                 return result
-            first, first_ms, hashes, nonzero = [], [], [], []
+            first_ms, hashes, nonzero, transfer_inputs = [], [], [], []
             for start in STARTS:
                 result, ms = timed(lambda: request(start))
                 values = {k: v.numpy() if hasattr(v, 'numpy') else v for k, v in result.items()}
                 first_ms.append(ms)
+                transfer_inputs.append(values)
                 hashes.append({k: hashlib.sha256(v.tobytes()).hexdigest() for k, v in values.items()})
                 nonzero.append(int(np.count_nonzero(values['label'])))
             for _ in range(2):
@@ -103,7 +103,31 @@ def main():
                         request(start)
                 profiler.disable()
                 profiler.dump_stats(args.profile)
-            opened.append(dict(name=name, opening_ms=opening_ms, first_reads=summary(first_ms), warm=summary(times),
+            opening_times, reopened_first_times = [], []
+            original_stack, original_reader = stack, reader
+            try:
+                for repetition in range(12):
+                    with ExitStack() as stack:
+                        reader, ms = timed(open_readers)
+                        if repetition >= 2:
+                            opening_times.append(ms)
+                        for start in STARTS:
+                            _, ms = timed(lambda: request(start))
+                            if repetition >= 2:
+                                reopened_first_times.append(ms)
+            finally:
+                stack, reader = original_stack, original_reader
+            transfer = None
+            if args.backend == 'cuda' and name == 'direct':
+                upload_times = []
+                for repetition in range(12):
+                    for values in transfer_inputs:
+                        _, ms = timed(lambda: {k: asarray(v) for k, v in values.items()})
+                        if repetition >= 2:
+                            upload_times.append(ms)
+                transfer = dict(bytes_per_six_requests=sum(v.nbytes for values in transfer_inputs for v in values.values()),
+                                host_to_device=summary(upload_times), output_download_in_timing=False)
+            opened.append(dict(name=name, transfers=transfer, opening_ms=opening_ms, opening=summary(opening_times), reopened_first_reads=summary(reopened_first_times), first_reads=summary(first_ms), warm=summary(times),
                                hashes=hashes, label_nonzero=nonzero, stats_before=before, stats_after=after))
         finally:
             stack.close()

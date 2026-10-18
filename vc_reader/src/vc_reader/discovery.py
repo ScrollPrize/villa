@@ -1,5 +1,6 @@
 """One metadata-only index shared by every public contextual view."""
 from __future__ import annotations
+import copy
 import hashlib
 import json
 from collections import defaultdict
@@ -7,7 +8,7 @@ from dataclasses import dataclass, replace
 from urllib.parse import quote
 from .affine import Affine
 from .artifacts import ArtifactType as T
-from .sources import Companion, Source, Storage, Selection, Surface, SurfaceRegistration, VolumeRegistration
+from .sources import _uv, Companion, Source, Storage, Selection, Surface, SurfaceRegistration, VolumeRegistration
 
 
 def _storage(artifact, *, format=None, pyramid=False):
@@ -23,10 +24,16 @@ class Pairing:
     pixel_affine: tuple | None
     evidence: str
 
+    def __post_init__(self):
+        if self.pixel_affine is not None:
+            _uv(self.pixel_affine)
+            a, b = self.pixel_affine
+            Affine.from_rows(((a[0], a[1], 0, a[2]), (b[0], b[1], 0, b[2]), (0, 0, 1, 0))).inverse()
+
 
 class RelationshipIndex:
     def __init__(self, catalog, overlays=()):
-        self.catalog, self.overlays = catalog, tuple(overlays)
+        self.catalog, self.overlays = catalog, tuple(copy.deepcopy(overlays))
         if overlays:
             self.snapshot_sha256 = catalog._index.snapshot_sha256
         else:
@@ -68,6 +75,15 @@ class RelationshipIndex:
                     self._add(source, asset_kind, sample.id, volume, segment)
         for entry in self.overlays:
             source = Source.from_dict(entry['source'])
+            if not source.id.startswith('user:') or entry['sample'] not in catalog._samples or source.sample_id != entry['sample']:
+                raise ValueError('overlay sources require user: IDs and a consistent owning sample')
+            if entry['kind'] not in ('volume', 'render', 'label', 'representation', 'geometry', 'artifact'):
+                raise ValueError('unknown overlay asset kind')
+            if entry['kind'] == 'volume' and (not entry['volume'] or not entry['volume'].startswith('user:')):
+                raise ValueError('new volume IDs must use the user: namespace')
+            reg = source.registration
+            if reg is not None and (reg.sample_id != entry['sample'] or reg.volume_id != entry['volume']):
+                raise ValueError('overlay ownership contradicts source registration')
             self._add(source, entry['kind'], entry['sample'], entry['volume'], entry['segment'])
         # Explicit supersession is resolved globally before filtering any view.
         for source in self.sources.values():
@@ -132,103 +148,105 @@ class RelationshipIndex:
                 self._pair(Pairing(label, render, tuple(tuple(r) for r in relationship['affine']), 'explicit same grid' if relationship.get('same_grid') else 'explicit user pixel mapping'))
 
     def _pair(self, relationship):
+        if any(p.render_id == relationship.render_id for p in self.pairs[relationship.label_id]):
+            raise ValueError('duplicate label/render relationship')
         self.pairs[relationship.label_id].append(relationship)
         self.reverse_pairs[relationship.render_id].append(relationship)
 
     def _adapt(self, sample, kind, owner, artifact):
-            identifier = self._artifact_ids[artifact]
-            storage = _storage(artifact)
-            role = axes = registration = None
-            companions = ()
-            derived = kind == "volume" and artifact.type != T.OME_ZARR
-            if kind == "volume":
-                registration = VolumeRegistration(sample.id, owner.id, origin="catalog")
-                if artifact.type in (T.OME_ZARR, T.SURFACE_PREDICTION_ZARR, T.INK_DETECTION_3D_ZARR):
-                    storage = _storage(artifact, format="zarr", pyramid=True)
-                    role = "image" if artifact.type == T.OME_ZARR else "scalar"
-                    axes = ("z", "y", "x")
-                    g = artifact.grid_level
-                    registration = VolumeRegistration(
-                        sample.id, owner.id, affine=Affine.scale(2**g) if g is not None else None,
-                        declared_grid=Selection(level=0), origin="catalog-fallback",
-                        volume_spacing_um=((owner.pixel_size_um,) * 3 if owner.pixel_size_um is not None else None),
-                    )
-                elif artifact.type == T.NORMAL_GRIDS:
-                    role = "normal"  # Bundle layout and component frame stay unknown.
-            elif kind == "segment" and artifact.target_volume_id:
-                target = artifact.target_volume_id
-                if artifact.type == T.INK_LABELS:
-                    labels = artifact
-                    meshes = owner.artifacts_of(T.TIFXYZ_TRANSFORMED, target_volume=target)
-                    mesh = meshes[0] if len(meshes) == 1 else None
-                    target_volume = sample.volumes.get(target)
-                    px = target_volume.pixel_size_um if target_volume else None
-                    surface = Surface(
-                        id=self._artifact_ids[mesh] if mesh else identifier + "/surface",
-                        geometry=_storage(mesh, format="tifxyz") if mesh else Storage(),
-                        sample_id=sample.id, volume_id=target, axes=("y", "x"),
-                        component_order=("x", "y", "z"),
-                        xyz_to_volume=Affine.identity() if mesh else None,
-                        spacing_um=(px, px, px) if px is not None else None,
-                    )
-                    registration = SurfaceRegistration(surface, origin="catalog")
-                    root = storage.location
-                    storage = Storage(
-                        location=(root.rstrip("/") + "/inklabels.zarr/" if root else None),
-                        alternatives=tuple(u.rstrip("/") + "/inklabels.zarr/" for u in artifact.urls()),
-                        format="zarr", pyramid=True, selection=Selection(level=0),
-                    )
-                    role, axes = "label", ("y", "x")
-                    companions = tuple(Companion(
-                        name, Source(
-                            id=identifier + "/" + name,
-                            storage=Storage(
-                                location=root.rstrip("/") + f"/{name}.zarr/" if root else None,
-                                alternatives=tuple(u.rstrip("/") + f"/{name}.zarr/" for u in artifact.urls()),
-                                format="zarr", pyramid=True, selection=Selection(level=0),
-                            ), role="label", axes=axes,
-                        ), same_grid=True,
-                    ) for name in ("supervision", "validation", "mapping_validity")
-                    if name in (labels.properties.get("arrays") or ()))
-                elif artifact.type == T.LAYERS_ZARR:
-                    storage = _storage(artifact, format="zarr", pyramid=True)
-                    storage = replace(storage, selection=Selection(level=0))
-                    role, axes = "image", ("z", "y", "x")
-                    # Stored z enumerates sampled surface layers, not volume voxels.
-                    registration = None
-                else:
-                    # Target identity is useful even when array/geometry semantics
-                    # are not declared by an adapter.
-                    registration = VolumeRegistration(sample.id, target, origin="catalog")
+        identifier = self._artifact_ids[artifact]
+        storage = _storage(artifact)
+        role = axes = registration = None
+        companions = ()
+        derived = kind == "volume" and artifact.type != T.OME_ZARR
+        if kind == "volume":
+            registration = VolumeRegistration(sample.id, owner.id, origin="catalog")
+            if artifact.type in (T.OME_ZARR, T.SURFACE_PREDICTION_ZARR, T.INK_DETECTION_3D_ZARR):
+                storage = _storage(artifact, format="zarr", pyramid=True)
+                role = "image" if artifact.type == T.OME_ZARR else "scalar"
+                axes = ("z", "y", "x")
+                g = artifact.grid_level
+                registration = VolumeRegistration(
+                    sample.id, owner.id, affine=Affine.scale(2**g) if g is not None else None,
+                    declared_grid=Selection(level=0), origin="catalog-fallback",
+                    volume_spacing_um=((owner.pixel_size_um,) * 3 if owner.pixel_size_um is not None else None),
+                )
+            elif artifact.type == T.NORMAL_GRIDS:
+                role = "normal"  # Bundle layout and component frame stay unknown.
+        elif kind == "segment" and artifact.target_volume_id:
+            target = artifact.target_volume_id
+            if artifact.type == T.INK_LABELS:
+                labels = artifact
+                meshes = owner.artifacts_of(T.TIFXYZ_TRANSFORMED, target_volume=target)
+                mesh = meshes[0] if len(meshes) == 1 else None
+                target_volume = sample.volumes.get(target)
+                px = target_volume.pixel_size_um if target_volume else None
+                surface = Surface(
+                    id=self._artifact_ids[mesh] if mesh else identifier + "/surface",
+                    geometry=_storage(mesh, format="tifxyz") if mesh else Storage(),
+                    sample_id=sample.id, volume_id=target, axes=("y", "x"),
+                    component_order=("x", "y", "z"),
+                    xyz_to_volume=Affine.identity() if mesh else None,
+                    spacing_um=(px, px, px) if px is not None else None,
+                )
+                registration = SurfaceRegistration(surface, origin="catalog")
+                root = storage.location
+                storage = Storage(
+                    location=(root.rstrip("/") + "/inklabels.zarr/" if root else None),
+                    alternatives=tuple(u.rstrip("/") + "/inklabels.zarr/" for u in artifact.urls()),
+                    format="zarr", pyramid=True, selection=Selection(level=0),
+                )
+                role, axes = "label", ("y", "x")
+                companions = tuple(Companion(
+                    name, Source(
+                        id=identifier + "/" + name,
+                        storage=Storage(
+                            location=root.rstrip("/") + f"/{name}.zarr/" if root else None,
+                            alternatives=tuple(u.rstrip("/") + f"/{name}.zarr/" for u in artifact.urls()),
+                            format="zarr", pyramid=True, selection=Selection(level=0),
+                        ), role="label", axes=axes,
+                    ), same_grid=True,
+                ) for name in ("supervision", "validation", "mapping_validity")
+                if name in (labels.properties.get("arrays") or ()))
+            elif artifact.type == T.LAYERS_ZARR:
+                storage = _storage(artifact, format="zarr", pyramid=True)
+                storage = replace(storage, selection=Selection(level=0))
+                role, axes = "image", ("z", "y", "x")
+                # Stored z enumerates sampled surface layers, not volume voxels.
+                registration = None
+            else:
+                # Target identity is useful even when array/geometry semantics
+                # are not declared by an adapter.
+                registration = VolumeRegistration(sample.id, target, origin="catalog")
 
-            supersedes = ()
-            if artifact.type != T.INK_LABELS:
-                declared = artifact.properties.get("supersedes") or ()
-                declared = (declared,) if isinstance(declared, str) else declared
-                prefix = identifier.split("/id/")[0] if artifact.id is not None else identifier.split("/snapshot/")[0]
-                supersedes = tuple(v if v.startswith(("catalog:", "user:")) else prefix + "/id/" + quote(v, safe="")
-                                   for v in declared)
-            return Source(
-                id=identifier, storage=storage, role=role, axes=axes, registration=registration,
-                companions=companions, artifact_id=artifact.id, artifact_kind=artifact.type,
-                sample_id=sample.id, owner_id=owner.id, model_id=artifact.model_id,
-                label_set=artifact.label_set, supersedes=supersedes, derived=derived,
-                coverage=tuple(owner.coverage.values()) if kind == "segment" else (),
-                provenance={"owner_kind": kind, "artifact": artifact.raw},
-            )
+        supersedes = ()
+        if artifact.type != T.INK_LABELS:
+            declared = artifact.properties.get("supersedes") or ()
+            declared = (declared,) if isinstance(declared, str) else declared
+            prefix = identifier.split("/id/")[0] if artifact.id is not None else identifier.split("/snapshot/")[0]
+            supersedes = tuple(v if v.startswith(("catalog:", "user:")) else prefix + "/id/" + quote(v, safe="")
+                               for v in declared)
+        return Source(
+            id=identifier, storage=storage, role=role, axes=axes, registration=registration,
+            companions=companions, artifact_id=artifact.id, artifact_kind=artifact.type,
+            sample_id=sample.id, owner_id=owner.id, model_id=artifact.model_id,
+            label_set=artifact.label_set, supersedes=supersedes, derived=derived,
+            coverage=tuple(owner.coverage.values()) if kind == "segment" else (),
+            provenance={"owner_kind": kind, "artifact": artifact.raw},
+        )
 
     def _validate_supersession(self):
-            visited, active = set(), set()
-            for root in self.sources:
-                stack = [(root, False)]
-                while stack:
-                    identifier, done = stack.pop()
-                    if done:
-                        active.remove(identifier)
-                        visited.add(identifier)
-                    elif identifier in active:
-                        raise ValueError(f"supersession cycle at {identifier}")
-                    elif identifier not in visited and identifier in self.sources:
-                        active.add(identifier)
-                        stack.append((identifier, True))
-                        stack.extend((older, False) for older in self.sources[identifier].supersedes)
+        visited, active = set(), set()
+        for root in self.sources:
+            stack = [(root, False)]
+            while stack:
+                identifier, done = stack.pop()
+                if done:
+                    active.remove(identifier)
+                    visited.add(identifier)
+                elif identifier in active:
+                    raise ValueError(f"supersession cycle at {identifier}")
+                elif identifier not in visited and identifier in self.sources:
+                    active.add(identifier)
+                    stack.append((identifier, True))
+                    stack.extend((older, False) for older in self.sources[identifier].supersedes)

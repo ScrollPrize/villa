@@ -159,3 +159,21 @@ def matches_reference(source, registration, reference, axes=None):
             if sum(linear[k][i]*linear[k][j] for k in range(3)) != (float(2**(2*reference.level)) if i == j else 0.):
                 return False
     return True
+
+
+def array_placement(reg):
+    if not isinstance(reg, VolumeRegistration):
+        raise ValueError('volume registration is required; surface targets require surface projection')
+    if reg.plane is not None:
+        p = reg.plane
+        affine = Affine.from_rows(tuple((x, y, n, o) for x, y, n, o in
+                                       zip(p.basis_x, p.basis_y, p.thickness, p.origin)))
+    else:
+        affine = reg.affine
+    if affine is None or reg.mode != 'array':
+        raise ValueError('complete resolved array placement is required')
+    inverse = affine.inverse()
+    if not all(math.isfinite(v) for row in (*affine.matrix, *inverse.matrix) for v in row):
+        raise ValueError('registration and its inverse must be finite')
+    return affine
+

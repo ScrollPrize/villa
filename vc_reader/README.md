@@ -49,7 +49,7 @@ paris = catalog.scrolls["PHercParis4"].volumes.at_resolution(8.0, rel_tol=0.02)
 for match in paris:
     print(match.volume.id, match.level, match.estimated_resolution_um, match.verified)
 
-candidate = paris.one(volume="20230205180739")
+candidate = paris.one(volume="20230206171837")
 confirmed = candidate.resolve()  # reads headers; confirms selection, spacing, shape
 with candidate.open() as ct:
     crop = ct[100:104, 200:204, 300:304]

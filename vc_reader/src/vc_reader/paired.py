@@ -6,7 +6,28 @@ import operator
 from .affine import Affine
 from ._sampling_engine import SamplingEngine
 from .browsing import _select_level
-from .sources import SampleResult
+from .sources import SampleResult, SurfaceRegistration, VolumeRegistration
+from .reader.source_resolution import array_placement
+
+
+def _pixel_affine(rows):
+    return Affine.from_rows(((rows[0][0], rows[0][1], 0, rows[0][2]),
+                             (rows[1][0], rows[1][1], 0, rows[1][2]), (0, 0, 1, 0)))
+
+
+def _companion_to_label(label, mask):
+    if isinstance(label, SurfaceRegistration) and isinstance(mask, SurfaceRegistration):
+        if label.surface.id != mask.surface.id or label.pixel_to_uv is None or mask.pixel_to_uv is None:
+            raise ValueError('companion surface registration has no shared pixel frame')
+        return _pixel_affine(label.pixel_to_uv).inverse() @ _pixel_affine(mask.pixel_to_uv)
+    if isinstance(label, VolumeRegistration) and isinstance(mask, VolumeRegistration):
+        if (label.sample_id, label.volume_id) != (mask.sample_id, mask.volume_id):
+            raise ValueError('flattened companion registration requires a shared volume frame')
+        mapping = array_placement(label).inverse() @ array_placement(mask)
+        if any(abs(mapping.matrix[2][i]) > 1e-7 for i in (0, 1, 3)):
+            raise ValueError('flattened companion registration must lie in the label plane')
+        return _xy(mapping)
+    raise ValueError('flattened companion needs same_grid or complete pixel registration')
 
 
 def _xy(matrix):
@@ -82,6 +103,8 @@ class PairedReader(SamplingEngine):
         self._configuration = (label, render, backend, pairing, level, layers, limits, device, dict(reader_options))
         self._initialize_runtime(backend, device, limits, reader_options)
         try:
+            if label.role != 'label' or render.role != 'image':
+                raise ValueError('paired reading requires label and image source roles')
             # The original registration remains on public descriptors. A flattened
             # read uses its explicit pixel relationship, without projecting to 3D.
             raw_render = replace(render, registration=None, companions=())
@@ -101,13 +124,14 @@ class PairedReader(SamplingEngine):
             if pairing.pixel_affine is None:
                 raise ValueError('label-pixel-to-render-pixel mapping is unresolved')
             rows = pairing.pixel_affine
-            mapping = Affine.from_rows(((rows[0][0], rows[0][1], 0, rows[0][2]),
-                                       (rows[1][0], rows[1][1], 0, rows[1][2]), (0, 0, 1, 0)))
+            mapping = _pixel_affine(rows)
             # Published target-canvas relationships are expressed in the shared
             # storage frame when both arrays publish dimensional transforms.
             a, b = render_base.resolved, label_base.resolved
-            dimensional = a.storage_units == b.storage_units == 'micrometer'
-            if dimensional and a.storage_from_array is not None and b.storage_from_array is not None:
+            shared_metadata = a.storage_from_array is not None and b.storage_from_array is not None
+            if shared_metadata and a.storage_units != b.storage_units and pairing.evidence != 'explicit user pixel mapping':
+                raise ValueError('paired pixel grids have incompatible storage units')
+            if shared_metadata and a.storage_units == b.storage_units:
                 observed = _xy(a.storage_from_array).inverse() @ _xy(b.storage_from_array)
                 if pairing.evidence.startswith('published') or pairing.evidence.startswith('segment/'):
                     mapping = observed
@@ -124,17 +148,24 @@ class PairedReader(SamplingEngine):
             for companion in label.companions:
                 mask_source = replace(companion.source, registration=None, companions=())
                 base = self._open(_select_level(mask_source, 0))
-                if not companion.same_grid:
-                    raise ValueError(f'{companion.name}: flattened companion needs an explicit same_grid binding')
-                if _shape_yx(base) != _shape_yx(label_base):
-                    raise ValueError(f'{companion.name}: companion base shape contradicts same_grid')
-                a, b = base.resolved, label_base.resolved
-                if a.storage_from_array is not None and b.storage_from_array is not None and (
-                        a.storage_units != b.storage_units or not _same(_xy(a.storage_from_array), _xy(b.storage_from_array))):
-                    raise ValueError(f'{companion.name}: companion storage transforms contradict same_grid')
                 if base.spatial_axes != ('y', 'x'):
                     raise ValueError('flattened masks require YX spatial axes')
-                self._masks[companion.name] = self._planar_target(mask_source, base, label_to_selected, level)
+                if 'c' in base.axes and base.shape[base.axes.index('c')] != 1:
+                    raise ValueError('companion masks require one channel')
+                mask_to_label = Affine.identity()
+                if companion.same_grid:
+                    if _shape_yx(base) != _shape_yx(label_base):
+                        raise ValueError(f'{companion.name}: companion base shape contradicts same_grid')
+                    a, b = base.resolved, label_base.resolved
+                    if a.storage_from_array is not None and b.storage_from_array is not None and (
+                            a.storage_units != b.storage_units or not _same(_xy(a.storage_from_array), _xy(b.storage_from_array))):
+                        raise ValueError(f'{companion.name}: companion storage transforms contradict same_grid')
+                else:
+                    # Resolve each declared grid before comparing placements.
+                    native_label = self._open(_select_level(replace(label, companions=()), 0))
+                    native_mask = self._open(_select_level(replace(companion.source, companions=()), 0))
+                    mask_to_label = _companion_to_label(native_label.registration, native_mask.registration)
+                self._masks[companion.name] = self._planar_target(mask_source, base, label_to_selected @ mask_to_label, level)
             self.metadata = dict(render_id=render.id, label_id=label.id, render_selection=image.resolved.selection,
                                  label_selection=self._targets['label']['reader'].resolved.selection,
                                  depth_semantics='sampled_layers', pairing_evidence=pairing.evidence)

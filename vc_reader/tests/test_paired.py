@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 import numpy as np
-from vc_reader import Catalog, Companion, Selection, Source, Storage
+from vc_reader import Affine, Catalog, Companion, Plane, Selection, Source, Storage, VolumeRegistration
 from test_source_storage import array
 from vc_reader.cuda import is_available
 
@@ -155,6 +155,42 @@ class PairedTests(unittest.TestCase):
         label2 = replace(pyramid(self.root/'lp', [np.zeros((4, 5), 'uint8')], [1]), role='label')
         with self.assertRaisesRegex(ValueError, 'contradict'):
             self.pair(render2, label2).open_paired()
+
+    def test_registered_companion_plane_and_local_image_formats(self):
+        from PIL import Image
+        import tifffile
+        image = np.arange(3*7*9, dtype='uint16').reshape(3, 7, 9)
+        labels = np.arange(7*9, dtype='uint8').reshape(7, 9)
+        tifffile.imwrite(self.root/'render.tif', image, photometric='minisblack', metadata={'axes': 'ZYX'})
+        Image.fromarray(labels).save(self.root/'label.png')
+        render = Source('tiff-render', Storage(str(self.root/'render.tif'), 'tiff'), role='image', axes=('z', 'y', 'x'))
+        registration = VolumeRegistration('s', 'v', plane=Plane((0,0,0), (1,0,0), (0,1,0), (0,0,1)))
+        label = Source('png-label', Storage(str(self.root/'label.png'), 'png'), role='label', axes=('y', 'x'), registration=registration)
+        mask = self.source('mask-registered', np.full((2, 3), 128, 'uint8'), 'label')
+        mask = replace(mask, registration=replace(registration, plane=Plane((2,1,0), (1,0,0), (0,1,0), (0,0,1))))
+        label = replace(label, companions=(Companion('supervision', mask),))
+        expected = np.zeros((1,7,9), 'uint8')
+        expected[:,1:3,2:5] = 128
+        for backend in self.backends():
+            with self.pair(render, label).open_paired(backend=backend) as reader:
+                result = reader[:, :]
+                np.testing.assert_array_equal(host(result.data['image']), image[None])
+                np.testing.assert_array_equal(host(result.data['label']), labels[None])
+                np.testing.assert_array_equal(host(result.masks['label']['supervision']), expected)
+                self.assertTrue(host(result.valid['label']).all())
+
+    def test_custom_volume_and_representation_alignment(self):
+        data = np.arange(3*7*9, dtype='uint16').reshape(3,7,9)
+        source = self.source('ct', data, 'image')
+        scroll = self.scroll.with_source(source, kind='volume')
+        volume = scroll.volumes['user:ct']
+        representation = self.source('representation', data, 'scalar')
+        representation = replace(representation, registration=VolumeRegistration('s', volume.id, affine=Affine.identity()))
+        scroll = scroll.with_source(representation, kind='representation', volume=volume)
+        with volume.open() as reader:
+            np.testing.assert_array_equal(reader[:], data)
+        with volume.open_aligned({'representation': scroll.representations[representation.id]}) as reader:
+            np.testing.assert_array_equal(reader[:].data['representation'], data[None])
 
     def test_pickle_and_spawn_reopen_cpu_only(self):
         image = np.arange(3*7*9, dtype='uint16').reshape(3, 7, 9)

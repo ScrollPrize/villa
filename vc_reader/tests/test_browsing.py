@@ -120,6 +120,25 @@ class BrowsingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'contradicts'):
             s.with_source(replace(rep, id='bad'), kind='representation', volume='b')
 
+    def test_cycles_and_malformed_overlay_relationships(self):
+        c = catalog()
+        s = c.samples['s']
+        first = Source('first', role='label', supersedes=('user:second',))
+        s = s.with_source(first, kind='label')
+        with self.assertRaisesRegex(ValueError, 'cycle'):
+            s.with_source(Source('second', role='label', supersedes=('user:first',)), kind='label')
+        raw = s.to_dict()
+        raw['catalog']['samples']['s']['sample']['id'] = 'changed'
+        self.assertEqual(c.raw['samples']['s']['sample']['id'], 's')
+        raw = s.to_dict()
+        raw['scroll'] = 'absent'
+        with self.assertRaisesRegex(ValueError, 'unknown sample'):
+            ScrollSource.from_dict(raw)
+        raw = s.to_dict()
+        raw['overlays'][0]['pairs'] = [dict(label=first.id, render='absent', affine=((1,0,0),(0,1,0)))]
+        with self.assertRaisesRegex(ValueError, 'known label and render'):
+            ScrollSource.from_dict(raw)
+
     def test_explicit_published_reference_narrows_convention(self):
         c = catalog()
         tree = c.raw

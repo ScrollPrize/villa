@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import copy
 import math
 import operator
 
@@ -243,16 +244,21 @@ class ScrollSource(_Context):
         return self._view(index, self.id, self._volume)
 
     def to_dict(self):
-        return dict(schema_version=1, catalog=self.catalog.raw, overlays=list(self._index.overlays), scroll=self.id, volume=self._volume)
+        return dict(schema_version=1, catalog=copy.deepcopy(self.catalog.raw), overlays=copy.deepcopy(list(self._index.overlays)), scroll=self.id, volume=self._volume)
 
     @classmethod
     def from_dict(cls, value):
         from .discovery import RelationshipIndex
-        if value.get('schema_version') != 1:
+        if set(value) != {'schema_version', 'catalog', 'overlays', 'scroll', 'volume'} or type(value.get('schema_version')) is not int or value['schema_version'] != 1:
             raise ValueError('unsupported scroll view schema version')
         catalog = Catalog(value['catalog'])
         index = RelationshipIndex(catalog, value['overlays'])
-        return cls._view(index, value['scroll'], value['volume'])
+        if value['scroll'] not in catalog._samples:
+            raise ValueError('overlay view names an unknown sample')
+        view = cls._view(index, value['scroll'], value['volume'])
+        if value['volume'] is not None:
+            view.volumes[value['volume']]
+        return view
 
     def __repr__(self):
         return f'ScrollSource({self.id!r}, volume={self._volume!r})'

@@ -54,7 +54,7 @@ and immutable `Source` descriptors; navigation never rewrites registration.
 ```python
 matches = catalog.scrolls.volumes.at_resolution(8, rel_tol=.02)
 paris = catalog.scrolls['PHercParis4'].volumes.at_resolution(8, rel_tol=.02)
-match = paris.one(volume='20230205180739')
+match = paris.one(volume='20230206171837')
 resolved = match.resolve()
 print(resolved.selection, resolved.spacing_um, resolved.shape)
 with match.open() as reader:

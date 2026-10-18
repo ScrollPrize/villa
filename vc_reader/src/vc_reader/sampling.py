@@ -12,6 +12,7 @@ from .browsing import VolumeLevel
 from .sources import Source, VolumeRegistration, SampleResult
 
 from ._sampling_engine import SamplingEngine
+from .reader.source_resolution import array_placement
 
 
 def open_sample(reference, targets=None, *, backend='cpu', catalog=None, **reader_options):
@@ -28,22 +29,6 @@ def open_sample(reference, targets=None, *, backend='cpu', catalog=None, **reade
 def _frame(reg):
     return reg.sample_id, reg.volume_id
 
-
-def _placement(reg):
-    if not isinstance(reg, VolumeRegistration):
-        raise ValueError('volume registration is required; surface targets require plan 04 methods')
-    if reg.plane is not None:
-        p = reg.plane
-        affine = Affine.from_rows(tuple((x, y, n, o) for x, y, n, o in
-                                       zip(p.basis_x, p.basis_y, p.thickness, p.origin)))
-    else:
-        affine = reg.affine
-    if affine is None or reg.mode != 'array':
-        raise ValueError('complete resolved array placement is required')
-    inverse = affine.inverse()
-    if not all(math.isfinite(v) for row in (*affine.matrix, *inverse.matrix) for v in row):
-        raise ValueError('registration and its inverse must be finite')
-    return affine
 
 
 def _region(start, size):
@@ -105,11 +90,11 @@ class SampleReader(SamplingEngine):
                 raise ValueError('reference must be a VolumeLevel or registered volumetric image Source')
             self.reference = reference
             ref = self._open(reference)
-            self._reference_map = _placement(ref.registration)
+            self._reference_map = array_placement(ref.registration)
             if ref.spatial_axes != ('z', 'y', 'x') or ref.registration.plane is not None:
                 raise ValueError('reference must have three volume spatial axes')
             self._reference_reader = ref
-            self._reference_map = _placement(ref.registration)
+            self._reference_map = array_placement(ref.registration)
             self._reference_frame = _frame(ref.registration)
             targets = dict(targets or {})
             if 'image' in targets or any(not isinstance(k, str) or not k for k in targets):
@@ -176,7 +161,7 @@ class SampleReader(SamplingEngine):
         import numpy as np
         from . import _native
         try:
-            placement = _placement(reader.registration)
+            placement = array_placement(reader.registration)
             if reader.spatial_axes not in (('z', 'y', 'x'), ('y', 'x')):
                 raise ValueError('sampling requires ZYX or YX spatial axes')
             plane = reader.registration.plane is not None
@@ -215,7 +200,7 @@ class SampleReader(SamplingEngine):
                             value_map = Affine.identity()
                         elif value.level is not None and self._catalog is not None:
                             volume = self._catalog.samples[value.sample_id].volumes[value.volume_id]
-                            value_map = _placement(self._open(self._volume_source(volume.level(value.level))).registration)
+                            value_map = array_placement(self._open(self._volume_source(volume.level(value.level))).registration)
                         else:
                             raise ValueError('value frame needs an affine or a resolvable volume level')
                     value_map.inverse()
