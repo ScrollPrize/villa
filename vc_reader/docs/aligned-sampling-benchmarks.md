@@ -161,7 +161,10 @@ AGENTS_AGENT_MODE=1 .venv/bin/python scripts/sampling_examples.py \
 
 Pass `--target name=source.json` for an explicitly registered user source or
 `--catalog-target name=source-id` for an explicitly chosen catalog descriptor.
-Surface registrations remain outside plan 03. Real scan-to-scan label transfer
+New surface-layer generation and volume projection remain
+[planned geometry work](../plans/04-surface-labels-and-projection.md). Reading
+published flattened render/label pairs is
+[implemented and verified](scroll-reading-benchmarks.md). Real scan-to-scan label transfer
 is not claimed by the controlled affine benchmark; cross-volume registration
 and independent component frames are covered by deterministic fixtures.
 

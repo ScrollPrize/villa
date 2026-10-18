@@ -180,8 +180,10 @@ HTTP tests use loopback servers. No dependencies were installed. Tests cover
 exact image/label values, selection and registration, pre-decode limits,
 shared budgets, eviction, atomic population, authentication/retries, offline
 hits/misses, v3 range/checksum failures, and process reopening. The configured
-CUDA build also runs existing sampling/augmentation/training tests; new aligned
-label sampling and its CPU/CUDA equality checks belong to plan 03.
+CUDA build also runs sampling/augmentation/training tests. Aligned label
+sampling and its CPU/CUDA equality checks are documented in
+[aligned sampling](aligned-sampling.md) and its
+[validation report](aligned-sampling-benchmarks.md).
 
 The complete configured suite passed 94 tests, including existing CUDA tests.
 The CPU-only build separately passed 36 source/descriptor tests and seven v3

@@ -1,6 +1,6 @@
 # Scroll discovery and paired-reading validation
 
-Measured on 2026-10-17, Linux amd64, Intel Core Ultra 7 270K Plus,
+Measured during 2026-10-17–18 on Linux amd64, Intel Core Ultra 7 270K Plus,
 CPython 3.14.4. Existing Release builds were used: CPU in
 `build/cp314-cp314-linux_x86_64`, CUDA in `/tmp/vc-reader-cuda` (architecture 120).
 No dependencies were installed and no native kernels changed.
@@ -161,6 +161,10 @@ build can be refreshed with `cmake --build build/cp314-cp314-linux_x86_64 -j2`
 when needed; no setup or install command was run for this work.
 
 ## Coverage and limits
+
+The complete CPU suite passed 105 tests with 21 CUDA skips; the complete CUDA
+suite passed 126 tests and 2,904 subtests. A subsequent large-canvas affine
+regression is covered by the paired-reader suite on both backends.
 
 The suite covers direct associations and reverse IDs, explicit mappings,
 missing/ambiguous relations, supersession, fragments, unknown artifacts,

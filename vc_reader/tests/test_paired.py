@@ -117,6 +117,27 @@ class PairedTests(unittest.TestCase):
                 padded = reader.read((-3, -2), (5, 4))
                 self.assertFalse(host(padded.valid['image'])[..., :3, :].any())
 
+    def test_small_affine_difference_on_large_canvas_is_not_snapped(self):
+        width = 20000001
+        for name, shape, chunks, axes in (('large-render', (1,1,width), (1,1,16), ('z','y','x')),
+                                         ('large-label', (1,width), (1,16), ('y','x'))):
+            path = self.root/name
+            path.mkdir()
+            (path/'.zarray').write_text(json.dumps(dict(zarr_format=2, shape=shape, chunks=chunks,
+                dtype='|u1', compressor=None, filters=None, fill_value=0, order='C')))
+            (path/'.zattrs').write_text(json.dumps({'_ARRAY_DIMENSIONS': axes}))
+        path = self.root/'large-label'
+        (path/'0.624999').write_bytes(bytes([99]*16))
+        (path/'0.625000').write_bytes(bytes([100]*16))
+        render = Source('large-render', Storage(str(self.root/'large-render'), 'zarr'), role='image', axes=('z','y','x'))
+        label = Source('large-label', Storage(str(path), 'zarr'), role='label', axes=('y','x'))
+        asset = self.pair(render, label, pixel_affine=((1.00000006,0,0),(0,1,0)))
+        # 10,000,000 / 1.00000006 rounds to 9,999,999. Snapping the
+        # small scale difference would instead select the next chunk's class.
+        for backend in self.backends():
+            with asset.open_paired(backend=backend) as reader:
+                np.testing.assert_array_equal(host(reader[:,10000000:10000001].data['label']), [[[99]]])
+
     def test_independent_pyramids_choose_matching_grid_or_sample_base(self):
         image = np.arange(3*8*10, dtype='uint16').reshape(3, 8, 10)
         labels = np.arange(8*10, dtype='uint16').reshape(8, 10)

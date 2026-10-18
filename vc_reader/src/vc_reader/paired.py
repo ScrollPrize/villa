@@ -38,8 +38,8 @@ def _xy(matrix):
 
 
 def _same(a, b):
-    return all(math.isclose(x, y, rel_tol=1e-7, abs_tol=1e-7)
-               for ar, br in zip(a.matrix, b.matrix) for x, y in zip(ar, br))
+    # A small coefficient difference can move pixels on a large canvas.
+    return a.matrix == b.matrix
 
 
 def _shape_yx(reader):
@@ -52,7 +52,8 @@ def _relative(base, selected):
         return Affine.identity()
     if a.storage_from_array is None or b.storage_from_array is None or a.storage_units != b.storage_units:
         raise ValueError('selected pixel grid has no known transform to its base grid')
-    return _xy(a.storage_from_array).inverse() @ _xy(b.storage_from_array)
+    original, current = _xy(a.storage_from_array), _xy(b.storage_from_array)
+    return Affine.identity() if _same(original, current) else original.inverse() @ current
 
 
 class _PairedTarget:
@@ -132,7 +133,8 @@ class PairedReader(SamplingEngine):
             if shared_metadata and a.storage_units != b.storage_units and pairing.evidence != 'explicit user pixel mapping':
                 raise ValueError('paired pixel grids have incompatible storage units')
             if shared_metadata and a.storage_units == b.storage_units:
-                observed = _xy(a.storage_from_array).inverse() @ _xy(b.storage_from_array)
+                original, current = _xy(a.storage_from_array), _xy(b.storage_from_array)
+                observed = Affine.identity() if _same(original, current) else original.inverse() @ current
                 if pairing.evidence.startswith('published') or pairing.evidence.startswith('segment/'):
                     mapping = observed
                 elif pairing.evidence == 'explicit same grid' and not _same(observed, mapping):
