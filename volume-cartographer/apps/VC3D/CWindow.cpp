@@ -8962,10 +8962,13 @@ void CWindow::updateSharedStatusLabel()
     }
     const QString text = items.join(QStringLiteral("  "));
     _sharedCacheStatsLabel->setText(text);
+    // Grow but never shrink, so the widgets beside it stop shifting whenever
+    // a number gets shorter.
     const QMargins margins = _sharedCacheStatsLabel->contentsMargins();
-    _sharedCacheStatsLabel->setMinimumWidth(
+    _sharedCacheStatsLabel->setMinimumWidth(std::max(
+        _sharedCacheStatsLabel->minimumWidth(),
         _sharedCacheStatsLabel->fontMetrics().horizontalAdvance(text) +
-        margins.left() + margins.right());
+        margins.left() + margins.right()));
 }
 
 // Open volume package
