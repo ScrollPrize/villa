@@ -24,6 +24,7 @@ block forever.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -297,10 +298,10 @@ def check_rpc_describe(
         coverage = description.get("coverage", {})
         complete = (
             description.get("undocumented") == []
-            and coverage.get("described") == 123
-            and coverage.get("registered") == 123
+            and coverage.get("described") == 124
+            and coverage.get("registered") == 124
             and coverage.get("complete") is True
-            and len(snapshot["methods"]) == 123
+            and len(snapshot["methods"]) == 124
         )
         rendered = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         if update_snapshot:
@@ -1685,6 +1686,97 @@ def check_segments_attach(
         )
 
 
+SMOKE_SEGMENT_ID = "20241113080880"
+
+
+def smoke_segment_dir(root: Path) -> Path:
+    """The tifxyz fixture check_segments_attach copies into the project."""
+    return root / "user-segments" / SMOKE_SEGMENT_ID
+
+
+def file_digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def expect_bridge_error(
+    client: BridgeClient,
+    method: str,
+    params: object,
+    code: int,
+) -> tuple[bool, str]:
+    """Calls `method`; expects a BridgeError with the given code."""
+    try:
+        result, _ = client.call(method, params, timeout=RPC_TIMEOUT)
+        return False, f"expected {code}, got result keys={list(result)[:6]}"
+    except BridgeError as error:
+        return error.code == code, f"code={error.code} message={error.message}"
+    except Exception as error:  # noqa: BLE001
+        return False, f"unexpected {type(error).__name__}: {error}"
+
+
+def check_segment_transform(client: BridgeClient, results: Results, root: Path) -> None:
+    ok, detail = expect_param_error(
+        client,
+        "segment.transform",
+        {"segmentId": SMOKE_SEGMENT_ID, "op": "flip_w"},
+        "op",
+    )
+    results.record("segment_transform_rejects_unknown_op", ok, detail)
+    ok, detail = expect_bridge_error(
+        client,
+        "segment.transform",
+        {"segmentId": "no-such-segment", "op": "flip_u"},
+        -32007,
+    )
+    results.record("segment_transform_unknown_segment", ok, detail)
+    ok, detail = expect_param_error(
+        client,
+        "segment.transform",
+        {"segmentId": SMOKE_SEGMENT_ID, "op": "rotate90"},
+        "confirm",
+    )
+    results.record("segment_transform_rotate_requires_confirm", ok, detail)
+
+    # The first save may re-encode the fixture's TIFFs, so compare saved
+    # states: four flips give A, B, A, B with A != B.
+    x_tif = smoke_segment_dir(root) / "x.tif"
+    try:
+        digests = []
+        replies = []
+        for _ in range(4):
+            reply, _ = client.call(
+                "segment.transform",
+                {"segmentId": SMOKE_SEGMENT_ID, "op": "flip_u"},
+                timeout=RPC_TIMEOUT,
+            )
+            replies.append(reply)
+            digests.append(file_digest(x_tif))
+        ok = (
+            all(
+                reply == {
+                    "transformed": True,
+                    "segmentId": SMOKE_SEGMENT_ID,
+                    "op": "flip_u",
+                }
+                for reply in replies
+            )
+            and digests[0] == digests[2]
+            and digests[1] == digests[3]
+            and digests[0] != digests[1]
+        )
+        results.record(
+            "segment_transform_flip_roundtrip",
+            ok,
+            f"replies={replies[0]} digests={[d[:12] for d in digests]}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "segment_transform_flip_roundtrip",
+            False,
+            f"{type(error).__name__}: {error}",
+        )
+
+
 def check_open_data_editable_copy(
     client: BridgeClient,
     results: Results,
@@ -2389,6 +2481,7 @@ def main() -> int:
 
             check_volume_attach(client, results, tmp_path, volpkg)
             check_segments_attach(client, results, tmp_path, volpkg)
+            check_segment_transform(client, results, tmp_path)
             check_open_data_editable_copy(client, results, tmp_path, volpkg)
             check_c4(client, results, str(volpkg), str(broken_volpkg))
             check_legacy_fiber_uuid(client, results, str(legacy_fiber_volpkg),

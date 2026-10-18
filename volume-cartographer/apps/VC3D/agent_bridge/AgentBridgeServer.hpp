@@ -97,6 +97,7 @@ private:
     void registerPointsHandlers();
     void registerSeedingHandlers();
     void registerSurfaceOpsHandlers();
+    void registerSegmentOpsHandlers();
     void registerMethod(AgentBridgeMethod method, Handler handler);
 
     // --- Discovery registry file (mirrors LasagnaServiceManager's
@@ -390,6 +391,13 @@ private:
     QJsonObject handleSegmentGenerateMask(const QJsonValue& params);
     QJsonObject handleSegmentAppendMask(const QJsonValue& params);
     QJsonObject handleSegmentMask(const QJsonValue& params, bool append);
+
+    // Segment file operations live in AgentBridgeHandlers_segmentops.cpp and
+    // drive SegmentationCommandHandler's dialog-free cores.
+    QJsonObject handleSegmentTransform(const QJsonValue& params);
+    // Throws -32004 while `segmentId` is being edited (any segment when
+    // empty), a mask render runs, or a "tool" job runs.
+    void requireSegmentFilesIdle(const QString& segmentId, const QString& operation) const;
 
     // --- Open Data manifest acquisition ---
     // Serves the cached manifest synchronously when available and `refresh` is

@@ -2716,6 +2716,47 @@
         "type": "object"
       }
     },
+    "segment.transform": {
+      "errors": [
+        -32602,
+        -32000,
+        -32001,
+        -32004,
+        -32005,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "paramRenames": {
+          "segmentId": "segment_id"
+        },
+        "tool": "vc3d_transform_segment"
+      },
+      "params": {
+        "properties": {
+          "confirm": {
+            "default": false,
+            "type": "boolean"
+          },
+          "op": {
+            "enum": [
+              "flip_u",
+              "flip_v",
+              "rotate90"
+            ],
+            "type": "string"
+          },
+          "segmentId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "segmentId",
+          "op"
+        ],
+        "type": "object"
+      }
+    },
     "segmentation.corrections.set_point_mode": {
       "errors": [
         -32602,

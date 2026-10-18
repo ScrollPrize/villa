@@ -18,6 +18,7 @@ from . import (  # noqa: F401  (imported for their registration side effects)
     points,
     review,
     seeding,
+    segment_ops,
     segmentation,
     session,
     surface_ops,

@@ -564,6 +564,20 @@ and never open file pickers.
   deferred completion from the in-process renderer.
 - Result paths are returned only after successful launch or completion.
 
+### Segment file operations
+
+These methods drive the dialog-free cores that the segment context menu and
+Actions menu run with their dialogs, so validation, persistence and UI
+refresh are shared. Methods that rewrite a segment's files in place are
+refused with -32004 for the segment being edited while editing is on, while a
+mask render runs, and while a `tool` job runs. They are not idempotent: a
+caller that retries after a timeout reads the segment's state first.
+
+- `segment.transform` flips a segment's grid over U or V, or rotates it 90
+  degrees clockwise, and saves it in place. The context menu's "Normals (H
+  Flip)" entry is `flip_v`. Flips are exact and their own inverse;
+  `rotate90` resamples the grid and requires `confirm: true`.
+
 ## MCP behavior
 
 The MCP server connects to an explicit socket, discovers the newest live
@@ -739,6 +753,7 @@ is the sole bridge method without an MCP tool; `vc3d_wait_job` and
 | `vc3d_set_wrap_annotation_mode` | `wrap_annotation.set_mode` | Enable/disable "Same-wrap annotation mode" (prerequisite for the shift+E commit workflow; seed the preview via `vc3d_shift_click`). |
 | `vc3d_shift_click` | `canvas.shift_click` | Shift+click convenience: the canonical place-point / set-focus gesture. |
 | `vc3d_switch_workspace` | `workspace.switch` | Switch to any of the seven workspace tabs, as a tab click does. |
+| `vc3d_transform_segment` | `segment.transform` | Flip a segment's surface grid, or rotate it 90 degrees clockwise (`confirm` required), in place. Synchronous. |
 | `vc3d_undo_wrap_annotation` | `wrap_annotation.undo` | Undo the same-wrap annotation (Ctrl+Z equivalent): clear the preview or undo the last committed collection. |
 | `vc3d_update_point` | `points.update_point` |
 | `vc3d_wheel` | `canvas.wheel` | Turn the mouse wheel over a viewer point (zoom, slice step with Shift, tool radius with Ctrl). |

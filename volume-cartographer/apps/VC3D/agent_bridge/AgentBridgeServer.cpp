@@ -847,6 +847,7 @@ void AgentBridgeServer::registerHandlers()
     registerFlattenHandlers();
 
     registerSurfaceOpsHandlers();
+    registerSegmentOpsHandlers();
 }
 
 
