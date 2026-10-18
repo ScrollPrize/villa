@@ -5,6 +5,9 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/Uuid.hpp"
+#include "vc/core/types/Segmentation.hpp"
+#include "vc/core/types/VolumePkg.hpp"
 
 #include <opencv2/core.hpp>
 
@@ -37,7 +40,146 @@ cv::Mat_<cv::Vec3f> grid(int rows = 8, int cols = 8, float z = 0.f)
 
 } // namespace
 
-TEST_CASE("save(path, uuid, force_overwrite=true): atomic-exchange replaces existing")
+TEST_CASE("new patch UUID survives metadata and geometry saves")
+{
+    auto root = tmpDir("identity");
+    auto segDir = root / "named_patch";
+    QuadSurface created(grid(), cv::Vec2f(1.f, 1.f));
+    created.save(segDir);
+    QuadSurface loaded(segDir);
+    const std::string uuid = loaded.meta["uuid"].get_string();
+    CHECK(vc::util::isUuid(uuid));
+    CHECK(loaded.id == "named_patch");
+    loaded.id = "changed_display_name";
+    loaded.save_meta();
+    CHECK(QuadSurface(segDir).meta["uuid"].get_string() == uuid);
+    loaded.ensureLoaded();
+    loaded.saveOverwrite();
+    CHECK(QuadSurface(segDir).meta["uuid"].get_string() == uuid);
+    fs::remove_all(root);
+}
+
+TEST_CASE("in-place edits keep the object UUID; copies get a new one")
+{
+    auto root = tmpDir("identity_lifecycle");
+    auto segDir = root / "original";
+    {
+        QuadSurface created(grid(), cv::Vec2f(1.f, 1.f));
+        created.save(segDir);
+    }
+    const std::string uuid = QuadSurface(segDir).objectUuid();
+    REQUIRE(vc::util::isUuid(uuid));
+
+    // In-place geometry edit (crop/flip/rotate path): save over the source.
+    {
+        auto loaded = load_quad_from_tifxyz(segDir.string());
+        loaded->save(segDir, true);
+        CHECK(loaded->objectUuid() == uuid);
+        CHECK(loaded->id == "original");
+    }
+    CHECK(QuadSurface(segDir).objectUuid() == uuid);
+
+    // A derived output whose meta was copied from the source is a new object.
+    auto copyDir = root / "derived";
+    {
+        auto loaded = load_quad_from_tifxyz(segDir.string());
+        loaded->saveAsNew(copyDir);
+    }
+    const std::string copyUuid = QuadSurface(copyDir).objectUuid();
+    CHECK(vc::util::isUuid(copyUuid));
+    CHECK(copyUuid != uuid);
+
+    // saveEdited decides by destination.
+    {
+        auto loaded = load_quad_from_tifxyz(segDir.string());
+        loaded->saveEdited(segDir, segDir, true);
+    }
+    CHECK(QuadSurface(segDir).objectUuid() == uuid);
+    auto editedDir = root / "edited_elsewhere";
+    {
+        auto loaded = load_quad_from_tifxyz(segDir.string());
+        loaded->saveEdited(segDir, editedDir);
+    }
+    const std::string editedUuid = QuadSurface(editedDir).objectUuid();
+    CHECK(vc::util::isUuid(editedUuid));
+    CHECK(editedUuid != uuid);
+    CHECK(editedUuid != copyUuid);
+
+    // An explicitly assigned identity (e.g. a catalog id) is kept as given.
+    auto catalogDir = root / "catalog";
+    {
+        QuadSurface created(grid(), cv::Vec2f(1.f, 1.f));
+        created.meta["uuid"] = "catalog-representation-id";
+        created.save(catalogDir);
+    }
+    CHECK(QuadSurface(catalogDir).objectUuid() == "catalog-representation-id");
+    fs::remove_all(root);
+}
+
+TEST_CASE("catalog-derived local copies use directory keys across reloads")
+{
+    const auto root = tmpDir("catalog_copy");
+    struct RestoreAutosaveRoot {
+        fs::path previous = VolumePkg::autosaveRoot();
+        ~RestoreAutosaveRoot() { VolumePkg::setAutosaveRoot(previous); }
+    } restoreAutosaveRoot;
+    VolumePkg::setAutosaveRoot(root / "autosave");
+    const auto source = root / "catalog";
+    const auto output = root / "local";
+    fs::create_directories(output);
+    QuadSurface original(grid(), cv::Vec2f(1.f, 1.f));
+    original.meta["uuid"] = "catalog-representation-id";
+    original.meta["vc_open_data_representation"] = "published-transformed";
+    original.meta["vc_open_data_coordinate_space"] = "sample/volume@L0";
+    original.meta["vc_open_data_segment_long_id"] = "source-segment";
+    original.save(source);
+    auto pkg = VolumePkg::newEmpty();
+    REQUIRE(pkg->addSegmentsEntry(output.string()));
+    const auto destination = output / "copy";
+
+    SUBCASE("Copy Surface metadata-only identity reset") {
+        fs::copy(source, destination, fs::copy_options::recursive);
+        auto copy = Segmentation::New(destination);
+        copy->resetIdentityForCopy();
+        copy->setName("copy");
+        copy->saveMetadata();
+        CHECK(copy->id() == "copy");
+    }
+    SUBCASE("Save Transformed and other derived saves") {
+        auto copy = load_quad_from_tifxyz(source.string());
+        copy->saveAsNew(destination);
+        CHECK(copy->id == "copy");
+    }
+    SUBCASE("saveEdited to a different directory") {
+        auto copy = load_quad_from_tifxyz(source.string());
+        copy->saveEdited(source, destination);
+    }
+
+    REQUIRE(pkg->addSingleSegmentation("copy"));
+    REQUIRE(pkg->segmentation("copy"));
+    const auto uuid = pkg->segmentation("copy")->uuid();
+    CHECK(vc::util::isUuid(uuid));
+    CHECK(uuid != "catalog-representation-id");
+    REQUIRE(pkg->loadSurface("copy"));
+    CHECK(pkg->loadSurface("copy")->id == "copy");
+    REQUIRE(pkg->reloadSingleSegmentation("copy"));
+    CHECK(pkg->segmentation("copy")->uuid() == uuid);
+    // A fresh project avoids reusing cached Segmentation objects.
+    pkg = VolumePkg::newEmpty();
+    REQUIRE(pkg->addSegmentsEntry(output.string()));
+    REQUIRE(pkg->segmentation("copy"));
+    const auto& meta = pkg->segmentation("copy")->metadata();
+    CHECK_FALSE(meta.contains("vc_open_data_representation"));
+    CHECK(meta["vc_open_data_coordinate_space"].get_string() == "sample/volume@L0");
+    CHECK(meta["vc_open_data_segment_long_id"].get_string() == "source-segment");
+    // The source remains a catalog surface, including on an in-place save.
+    original.save(source, true);
+    CHECK(Segmentation(source).id() == "catalog-representation-id");
+    CHECK(Segmentation(source).metadata().contains("vc_open_data_representation"));
+    fs::remove_all(root);
+}
+
+TEST_CASE("save(path, force_overwrite=true): atomic-exchange replaces existing")
 {
     auto root = tmpDir("force");
     auto segDir = root / "seg";
@@ -45,14 +187,16 @@ TEST_CASE("save(path, uuid, force_overwrite=true): atomic-exchange replaces exis
     // First save: creates the directory.
     {
         QuadSurface qs(grid(), cv::Vec2f(1.f, 1.f));
-        qs.save(segDir.string(), "uuid-a", /*force_overwrite=*/false);
+        qs.meta["uuid"] = "uuid-a";
+        qs.save(segDir.string(), /*force_overwrite=*/false);
     }
     REQUIRE(fs::exists(segDir / "x.tif"));
 
     // Second save with force_overwrite=true into the same dir.
     {
         QuadSurface qs(grid(8, 8, /*z=*/50.f), cv::Vec2f(1.f, 1.f));
-        qs.save(segDir.string(), "uuid-b", /*force_overwrite=*/true);
+        qs.meta["uuid"] = "uuid-b";
+        qs.save(segDir.string(), /*force_overwrite=*/true);
     }
     REQUIRE(fs::exists(segDir / "x.tif"));
     QuadSurface reloaded(segDir);
@@ -68,9 +212,11 @@ TEST_CASE("load rolls back an interrupted multi-file save generation")
 
     {
         QuadSurface original(grid(8, 8, /*z=*/1.f), cv::Vec2f(1.f, 1.f));
-        original.save(segDir.string(), "uuid-old", false);
+        original.meta["uuid"] = "uuid-old";
+        original.save(segDir.string(), false);
         QuadSurface replacement(grid(8, 8, /*z=*/99.f), cv::Vec2f(1.f, 1.f));
-        replacement.save(replacementDir.string(), "uuid-new", false);
+        replacement.meta["uuid"] = "uuid-new";
+        replacement.save(replacementDir.string(), false);
     }
 
     // Reproduce the durable state left when Windows stops after publishing
@@ -112,7 +258,8 @@ TEST_CASE("saveChannel: writes only the channel tif, no snapshot, round-trips")
     segDir = pathsDir / "seg";
 
     QuadSurface qs(grid(), cv::Vec2f(1.f, 1.f));
-    qs.save(segDir.string(), "uuid-a", /*force_overwrite=*/false);
+    qs.meta["uuid"] = "uuid-a";
+    qs.save(segDir.string(), /*force_overwrite=*/false);
     REQUIRE(fs::exists(segDir / "x.tif"));
 
     // Capture x.tif mtime so we can assert saveChannel leaves it untouched.
@@ -151,7 +298,8 @@ TEST_CASE("saveChannel: absent or empty channel is a no-op")
     auto root = tmpDir("savechannel_noop");
     auto segDir = root / "seg";
     QuadSurface qs(grid(), cv::Vec2f(1.f, 1.f));
-    qs.save(segDir.string(), "uuid-a", /*force_overwrite=*/false);
+    qs.meta["uuid"] = "uuid-a";
+    qs.save(segDir.string(), /*force_overwrite=*/false);
 
     qs.saveChannel("approval");  // never set
     CHECK_FALSE(fs::exists(segDir / "approval.tif"));
@@ -165,13 +313,15 @@ TEST_CASE("save without force_overwrite + existing dir throws (or overwrites)")
     auto segDir = root / "seg";
     {
         QuadSurface qs(grid(), cv::Vec2f(1.f, 1.f));
-        qs.save(segDir.string(), "uuid-a", /*force_overwrite=*/false);
+        qs.meta["uuid"] = "uuid-a";
+        qs.save(segDir.string(), /*force_overwrite=*/false);
     }
     // Second save without force_overwrite. Behavior is impl-defined — some
     // builds throw, others overwrite. We just exercise the path.
     try {
         QuadSurface qs(grid(), cv::Vec2f(1.f, 1.f));
-        qs.save(segDir.string(), "uuid-c", /*force_overwrite=*/false);
+        qs.meta["uuid"] = "uuid-c";
+        qs.save(segDir.string(), /*force_overwrite=*/false);
     } catch (const std::exception&) {
         // Acceptable.
     }
