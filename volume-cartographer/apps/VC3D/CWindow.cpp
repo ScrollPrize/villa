@@ -29,6 +29,7 @@
 
 #include "VCSettings.hpp"
 #include "Keybinds.hpp"
+#include "CommandCatalog.hpp"
 #include "OpenDataNormalGrids.hpp"
 #include "viewer_controls/panels/ViewerCompositePanel.hpp"
 #include "viewer_controls/panels/ViewerInkDetectionPanel.hpp"
@@ -2945,6 +2946,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         std::make_unique<VolumeAttachmentController>(this);
 
     // create menus/actions controller
+    _commandCatalog = new CommandCatalog(this);
     _menuController = std::make_unique<MenuActionController>(this);
     _menuController->populateMenus(menuBar());
     // Wire the Actions -> Merge tifxyz... menu entry to the handler.
@@ -3207,6 +3209,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                   static_cast<QDockWidget*>(_atlasControlDock),
                                   static_cast<QDockWidget*>(_fiberWidget)}) {
             _statusDockPanelHost->addDock(dock);
+            _commandCatalog->addPanel(dock, _statusDockPanelHost->openAction(dock));
         }
     }
 
@@ -3250,18 +3253,16 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     }
 
     // Create application-wide keyboard shortcuts
-    fCompositeViewShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::CompositeView), this);
-    fCompositeViewShortcut->setContext(Qt::ApplicationShortcut);
-    connect(fCompositeViewShortcut, &QShortcut::activated, [this]() {
+    fCompositeViewShortcut = _commandCatalog->addShortcut(vc3d::keybinds::shortcuts::CompositeView, this);
+    connect(fCompositeViewShortcut, &QAction::triggered, [this]() {
         if (_viewerCompositePanel) {
             _viewerCompositePanel->toggleSegmentationComposite();
         }
     });
 
     // Toggle direction hints overlay (Ctrl+T)
-    fDirectionHintsShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::DirectionHints), this);
-    fDirectionHintsShortcut->setContext(Qt::ApplicationShortcut);
-    connect(fDirectionHintsShortcut, &QShortcut::activated, [this]() {
+    fDirectionHintsShortcut = _commandCatalog->addShortcut(vc3d::keybinds::shortcuts::DirectionHints, this);
+    connect(fDirectionHintsShortcut, &QAction::triggered, [this]() {
         using namespace vc3d::settings;
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         bool current = settings.value(viewer::SHOW_DIRECTION_HINTS, viewer::SHOW_DIRECTION_HINTS_DEFAULT).toBool();
@@ -3273,9 +3274,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     });
 
     // Toggle surface normals visualization (Ctrl+N)
-    fSurfaceNormalsShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::SurfaceNormals), this);
-    fSurfaceNormalsShortcut->setContext(Qt::ApplicationShortcut);
-    connect(fSurfaceNormalsShortcut, &QShortcut::activated, [this]() {
+    fSurfaceNormalsShortcut = _commandCatalog->addShortcut(vc3d::keybinds::shortcuts::SurfaceNormals, this);
+    connect(fSurfaceNormalsShortcut, &QAction::triggered, [this]() {
         using namespace vc3d::settings;
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         bool current = settings.value(viewer::SHOW_SURFACE_NORMALS, viewer::SHOW_SURFACE_NORMALS_DEFAULT).toBool();
@@ -3287,18 +3287,16 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         showStatusBarMessage(next ? tr("Surface normals: ON") : tr("Surface normals: OFF"), 2000);
     });
 
-    fAxisAlignedSlicesShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::AxisAlignedSlices), this);
-    fAxisAlignedSlicesShortcut->setContext(Qt::ApplicationShortcut);
-    connect(fAxisAlignedSlicesShortcut, &QShortcut::activated, [this]() {
+    fAxisAlignedSlicesShortcut = _commandCatalog->addShortcut(vc3d::keybinds::shortcuts::AxisAlignedSlices, this);
+    connect(fAxisAlignedSlicesShortcut, &QAction::triggered, [this]() {
         if (chkAxisAlignedSlices) {
             chkAxisAlignedSlices->toggle();
         }
     });
 
     // Raw points overlay shortcut (P key)
-    auto* rawPointsShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::RawPointsOverlay), this);
-    rawPointsShortcut->setContext(Qt::ApplicationShortcut);
-    connect(rawPointsShortcut, &QShortcut::activated, [this]() {
+    auto* rawPointsShortcut = _commandCatalog->addShortcut(vc3d::keybinds::shortcuts::RawPointsOverlay, this);
+    connect(rawPointsShortcut, &QAction::triggered, [this]() {
         if (_rawPointsOverlay) {
             bool newEnabled = !_rawPointsOverlay->isEnabled();
             _rawPointsOverlay->setEnabled(newEnabled);
@@ -3311,26 +3309,23 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     // Zoom shortcuts (Shift+= for zoom in, Shift+- for zoom out)
     // Use 15% steps for smooth, proportional zooming - only affects active viewer
     constexpr float ZOOM_FACTOR = 1.15f;
-    fZoomInShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::ZoomIn), this);
-    fZoomInShortcut->setContext(Qt::ApplicationShortcut);
-    connect(fZoomInShortcut, &QShortcut::activated, [this]() {
+    fZoomInShortcut = _commandCatalog->addShortcut(vc3d::keybinds::shortcuts::ZoomIn, this);
+    connect(fZoomInShortcut, &QAction::triggered, [this]() {
         if (auto* viewer = activeBaseViewer()) {
             viewer->adjustZoomByFactor(ZOOM_FACTOR);
         }
     });
 
-    fZoomOutShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::ZoomOut), this);
-    fZoomOutShortcut->setContext(Qt::ApplicationShortcut);
-    connect(fZoomOutShortcut, &QShortcut::activated, [this]() {
+    fZoomOutShortcut = _commandCatalog->addShortcut(vc3d::keybinds::shortcuts::ZoomOut, this);
+    connect(fZoomOutShortcut, &QAction::triggered, [this]() {
         if (auto* viewer = activeBaseViewer()) {
             viewer->adjustZoomByFactor(1.0f / ZOOM_FACTOR);
         }
     });
 
     // Reset view shortcut (m to fit surface in view and reset all offsets)
-    fResetViewShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::ResetView), this);
-    fResetViewShortcut->setContext(Qt::ApplicationShortcut);
-    connect(fResetViewShortcut, &QShortcut::activated, [this]() {
+    fResetViewShortcut = _commandCatalog->addShortcut(vc3d::keybinds::shortcuts::ResetView, this);
+    connect(fResetViewShortcut, &QAction::triggered, [this]() {
         if (auto* viewer = activeBaseViewer()) {
             viewer->resetSurfaceOffsets();
             viewer->fitSurfaceInView();
@@ -3340,9 +3335,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
 
     // Zoom-to-fit shortcut (Ctrl+0): fit the current segment in the flattened
     // segmentation viewer, adjusting pan and zoom to its full extent.
-    fZoomToFitShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::ZoomToFit), this);
-    fZoomToFitShortcut->setContext(Qt::ApplicationShortcut);
-    connect(fZoomToFitShortcut, &QShortcut::activated, [this]() {
+    fZoomToFitShortcut = _commandCatalog->addShortcut(vc3d::keybinds::shortcuts::ZoomToFit, this);
+    connect(fZoomToFitShortcut, &QAction::triggered, [this]() {
         VolumeViewerBase* viewer = _viewerManager ? _viewerManager->segmentationViewer() : nullptr;
         if (viewer) {
             viewer->resetViewForCurrentContent(true);
@@ -3350,26 +3344,23 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     });
 
     // Z offset: Ctrl+. = +Z (further/deeper), Ctrl+, = -Z (closer)
-    fWorldOffsetZPosShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::WorldOffsetZPos), this);
-    fWorldOffsetZPosShortcut->setContext(Qt::ApplicationShortcut);
-    connect(fWorldOffsetZPosShortcut, &QShortcut::activated, [this]() {
+    fWorldOffsetZPosShortcut = _commandCatalog->addShortcut(vc3d::keybinds::shortcuts::WorldOffsetZPos, this);
+    connect(fWorldOffsetZPosShortcut, &QAction::triggered, [this]() {
         if (auto* viewer = activeBaseViewer()) {
             viewer->adjustSurfaceOffset(1.0f);
         }
     });
 
-    fWorldOffsetZNegShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::WorldOffsetZNeg), this);
-    fWorldOffsetZNegShortcut->setContext(Qt::ApplicationShortcut);
-    connect(fWorldOffsetZNegShortcut, &QShortcut::activated, [this]() {
+    fWorldOffsetZNegShortcut = _commandCatalog->addShortcut(vc3d::keybinds::shortcuts::WorldOffsetZNeg, this);
+    connect(fWorldOffsetZNegShortcut, &QAction::triggered, [this]() {
         if (auto* viewer = activeBaseViewer()) {
             viewer->adjustSurfaceOffset(-1.0f);
         }
     });
 
     // Segment cycling shortcuts (] for next, [ for previous)
-    fCycleNextSegmentShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::CycleNextSegment), this);
-    fCycleNextSegmentShortcut->setContext(Qt::ApplicationShortcut);
-    connect(fCycleNextSegmentShortcut, &QShortcut::activated, [this]() {
+    fCycleNextSegmentShortcut = _commandCatalog->addShortcut(vc3d::keybinds::shortcuts::CycleNextSegment, this);
+    connect(fCycleNextSegmentShortcut, &QAction::triggered, [this]() {
         if (!_surfacePanel) {
             return;
         }
@@ -3388,9 +3379,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         }
     });
 
-    fCyclePrevSegmentShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::CyclePrevSegment), this);
-    fCyclePrevSegmentShortcut->setContext(Qt::ApplicationShortcut);
-    connect(fCyclePrevSegmentShortcut, &QShortcut::activated, [this]() {
+    fCyclePrevSegmentShortcut = _commandCatalog->addShortcut(vc3d::keybinds::shortcuts::CyclePrevSegment, this);
+    connect(fCyclePrevSegmentShortcut, &QAction::triggered, [this]() {
         if (!_surfacePanel) {
             return;
         }
@@ -3409,18 +3399,16 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         }
     });
 
-    fApplyApprovedTagShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::ApplyApprovedTag), this);
-    fApplyApprovedTagShortcut->setContext(Qt::ApplicationShortcut);
-    connect(fApplyApprovedTagShortcut, &QShortcut::activated, [this]() {
+    fApplyApprovedTagShortcut = _commandCatalog->addShortcut(vc3d::keybinds::shortcuts::ApplyApprovedTag, this);
+    connect(fApplyApprovedTagShortcut, &QAction::triggered, [this]() {
         if (_surfacePanel &&
             _surfacePanel->setTagChecked(SurfacePanelController::Tag::Approved, true)) {
             showStatusBarMessage(tr("Applied Approved tag"), 2000);
         }
     });
 
-    fApplyDefectiveTagShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::ApplyDefectiveTag), this);
-    fApplyDefectiveTagShortcut->setContext(Qt::ApplicationShortcut);
-    connect(fApplyDefectiveTagShortcut, &QShortcut::activated, [this]() {
+    fApplyDefectiveTagShortcut = _commandCatalog->addShortcut(vc3d::keybinds::shortcuts::ApplyDefectiveTag, this);
+    connect(fApplyDefectiveTagShortcut, &QAction::triggered, [this]() {
         if (_surfacePanel &&
             _surfacePanel->setTagChecked(SurfacePanelController::Tag::Defective, true)) {
             showStatusBarMessage(tr("Applied Defective tag"), 2000);
@@ -3428,18 +3416,15 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     });
 
     // Focused view toggle (Shift+Ctrl+F) - hides dock widgets, keeps all viewers
-    fFocusedViewShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::FocusedView), this);
-    fFocusedViewShortcut->setContext(Qt::ApplicationShortcut);
-    connect(fFocusedViewShortcut, &QShortcut::activated, this, &CWindow::toggleFocusedView);
+    fFocusedViewShortcut = _commandCatalog->addShortcut(vc3d::keybinds::shortcuts::FocusedView, this);
+    connect(fFocusedViewShortcut, &QAction::triggered, this, &CWindow::toggleFocusedView);
 
-    fOpenLasagnaWorkspaceShortcut = new QShortcut(QKeySequence(QStringLiteral("Ctrl+L")), this);
-    fOpenLasagnaWorkspaceShortcut->setContext(Qt::ApplicationShortcut);
-    connect(fOpenLasagnaWorkspaceShortcut, &QShortcut::activated,
+    fOpenLasagnaWorkspaceShortcut = _commandCatalog->addShortcut(vc3d::keybinds::shortcuts::OpenLasagnaWorkspace, this);
+    connect(fOpenLasagnaWorkspaceShortcut, &QAction::triggered,
             this, &CWindow::switchToLasagnaWorkspace);
 
-    fRepeatLasagnaActionShortcut = new QShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+L")), this);
-    fRepeatLasagnaActionShortcut->setContext(Qt::ApplicationShortcut);
-    connect(fRepeatLasagnaActionShortcut, &QShortcut::activated,
+    fRepeatLasagnaActionShortcut = _commandCatalog->addShortcut(vc3d::keybinds::shortcuts::RepeatLasagnaAction, this);
+    connect(fRepeatLasagnaActionShortcut, &QAction::triggered,
             this, &CWindow::repeatLastLasagnaAction);
 
     connect(_surfacePanel.get(), &SurfacePanelController::moveToPathsRequested,

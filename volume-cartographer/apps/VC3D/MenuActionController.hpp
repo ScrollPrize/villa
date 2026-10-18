@@ -138,6 +138,8 @@ private:
     QStringList loadRecentPaths() const;
     void saveRecentPaths(const QStringList& paths);
     void ensureRecentActions();
+    // Gives every menu action a stable id in the window's command catalog.
+    void registerCommands();
 
     QStringList loadRecentRemoteUrls() const;
     void saveRecentRemoteUrls(const QStringList& urls);
@@ -198,6 +200,7 @@ private:
     QAction* _saveProjectAsAct{nullptr};
     QAction* _attachVolumeAct{nullptr};
     QAction* _attachSegmentsAct{nullptr};
+    QAction* _openFiberVolumeAct{nullptr};
     QAction* _attachNormalGridAct{nullptr};
     QAction* _attachUmbilicusAct{nullptr};
     QAction* _detachUmbilicusAct{nullptr};

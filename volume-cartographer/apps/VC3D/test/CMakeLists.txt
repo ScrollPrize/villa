@@ -75,6 +75,27 @@ vc_register_test_target(test_line_annotation_coordinate_scale)
 vc_register_ctest(line_annotation_coordinate_scale
     test_line_annotation_coordinate_scale)
 
+add_executable(test_command_catalog
+    test_command_catalog.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/CommandCatalog.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/CommandCatalog.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/Keybinds.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/Keybinds.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/StatusDockPanelHost.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/StatusDockPanelHost.hpp)
+set_target_properties(test_command_catalog PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_command_catalog PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+# StatusDockPanelHost reads the VC3D settings through vc_core.
+target_link_libraries(test_command_catalog PRIVATE
+    vc_core Qt6::Core Qt6::Gui Qt6::Test Qt6::Widgets)
+add_test(NAME command_catalog COMMAND test_command_catalog)
+vc_register_test_target(test_command_catalog)
+vc_register_ctest(command_catalog test_command_catalog)
+set_tests_properties(command_catalog PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
 add_executable(test_surface_rotation_transform
     test_surface_rotation_transform.cpp)
 

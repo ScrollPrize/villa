@@ -107,6 +107,7 @@ class FiberAnnotationController;
 class SegmentationModule;
 class SurfacePanelController;
 class MenuActionController;
+class CommandCatalog;
 class VolumeAttachmentController;
 class SegmentationGrower;
 class ViewerControlsPanel;
@@ -196,6 +197,8 @@ public:
 
     // Helper method to get the current volume path
     QString getCurrentVolumePath() const;
+    // Menu actions, keyboard shortcuts and status bar panels, by stable id.
+    CommandCatalog* commandCatalog() const { return _commandCatalog; }
     VCCollection* pointCollection() { return _state->pointCollection(); }
 
 protected:
@@ -514,6 +517,8 @@ private:
     std::unique_ptr<SurfacePanelController> _surfacePanel;
     std::unique_ptr<VolumeAttachmentController> _volumeAttachmentController;
     std::unique_ptr<MenuActionController> _menuController;
+    // A QObject child of this window.
+    CommandCatalog* _commandCatalog{nullptr};
     std::unique_ptr<SurfaceAffineTransformController> _surfaceAffineTransforms;
     // runner for command line tools
     CommandLineToolRunner* _cmdRunner;
@@ -530,28 +535,28 @@ private:
     std::unique_ptr<SegmentationCommandHandler> _segmentationCommandHandler;
     std::unique_ptr<LineAnnotationController> _lineAnnotationController;
     // Keyboard shortcuts
-    QShortcut* fCompositeViewShortcut;
-    QShortcut* fDirectionHintsShortcut;
-    QShortcut* fSurfaceNormalsShortcut;
-    QShortcut* fAxisAlignedSlicesShortcut;
-    QShortcut* fZoomInShortcut;
-    QShortcut* fZoomOutShortcut;
-    QShortcut* fResetViewShortcut;
-    QShortcut* fZoomToFitShortcut;
-    QShortcut* fOpenLasagnaWorkspaceShortcut{nullptr};
-    QShortcut* fRepeatLasagnaActionShortcut{nullptr};
+    QAction* fCompositeViewShortcut;
+    QAction* fDirectionHintsShortcut;
+    QAction* fSurfaceNormalsShortcut;
+    QAction* fAxisAlignedSlicesShortcut;
+    QAction* fZoomInShortcut;
+    QAction* fZoomOutShortcut;
+    QAction* fResetViewShortcut;
+    QAction* fZoomToFitShortcut;
+    QAction* fOpenLasagnaWorkspaceShortcut{nullptr};
+    QAction* fRepeatLasagnaActionShortcut{nullptr};
 
     // Z offset shortcuts (Ctrl+,/. for normal direction)
-    QShortcut* fWorldOffsetZPosShortcut;  // Ctrl+. (further/deeper)
-    QShortcut* fWorldOffsetZNegShortcut;  // Ctrl+, (closer)
+    QAction* fWorldOffsetZPosShortcut;  // Ctrl+. (further/deeper)
+    QAction* fWorldOffsetZNegShortcut;  // Ctrl+, (closer)
 
     // Segment cycling shortcuts
-    QShortcut* fCycleNextSegmentShortcut;
-    QShortcut* fCyclePrevSegmentShortcut;
-    QShortcut* fApplyApprovedTagShortcut{nullptr};
-    QShortcut* fApplyDefectiveTagShortcut{nullptr};
+    QAction* fCycleNextSegmentShortcut;
+    QAction* fCyclePrevSegmentShortcut;
+    QAction* fApplyApprovedTagShortcut{nullptr};
+    QAction* fApplyDefectiveTagShortcut{nullptr};
 
-    QShortcut* fFocusedViewShortcut;
+    QAction* fFocusedViewShortcut;
     bool _focusedViewActive{false};
     struct SavedDockState {
         bool visible;

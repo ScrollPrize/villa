@@ -14,6 +14,8 @@ set(srcs
     CState.hpp
     Keybinds.cpp
     Keybinds.hpp
+    CommandCatalog.cpp
+    CommandCatalog.hpp
     CWindow.cpp
     FiberCollectionController.cpp
     FiberCollectionController.hpp
