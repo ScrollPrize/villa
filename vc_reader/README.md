@@ -482,11 +482,13 @@ Warp the volume with a smooth random 3D B-spline displacement field, keeping ima
 A.Elastic(sigma=32, magnitude=8, border=True)
 ```
 
-CUDA constructs elastic fields in float32; CPU construction uses float64.
-Output dtypes are preserved. Fresh CUDA fields can differ slightly from CPU
-or older CUDA versions, including selecting a neighboring label at a
-nearest-neighbor rounding boundary. Saved plans keep their recorded field and
-replay unchanged. See the [geometry optimization measurements](benchmarks/README.md#cuda-geometry-optimizations).
+CPU and CUDA construct and store elastic fields in float32. Ordinary crop
+geometry also uses float32, with wider arithmetic where coordinate range or
+numerical conditioning requires it. Output dtypes are preserved. Small
+coordinate differences can select a neighboring label at a nearest-neighbor
+boundary. New replay plans use float32 fields; old plans must be regenerated.
+See the [precision policy](docs/precision.md) and
+[geometry optimization measurements](benchmarks/README.md#cuda-geometry-optimizations).
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |

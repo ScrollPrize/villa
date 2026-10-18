@@ -73,9 +73,10 @@ def Affine(degrees: Scalar = 0, scale: Scalar = 1, translate: Scalar = 0, shear:
 def Elastic(sigma: Scalar = ..., magnitude: Scalar = ..., border: bool = False, *, p: float = 1) -> _Config:
     """Cubic B-spline deformation: sigma is half knot spacing, magnitude is capped RMS vector displacement.
 
-    CUDA constructs the field in float32; CPU uses float64. Outputs retain
+    CPU and CUDA construct/store the field in float32. Outputs retain
     their dtype. Tiny coordinate differences can select neighboring labels at
-    nearest-neighbor boundaries. Saved plans retain their sampled field.
+    nearest-neighbor boundaries. New plans retain their sampled float32 field;
+    plans from the old replay format must be regenerated.
     """
     ...
 def SheetCompression(strength: Scalar = ..., intensity_sigma: Scalar = 1, smoothing: Scalar = ..., axes: str = "", image: str = "image", threshold: float = -1, *, p: float = 1) -> _Config: ...
