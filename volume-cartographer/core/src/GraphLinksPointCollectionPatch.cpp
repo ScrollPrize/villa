@@ -51,7 +51,7 @@ int64_t pointId(const std::string& key)
     return value;
 }
 
-std::string storageRef(const graph::GraphDb& db, const fs::path& path)
+std::string storageRef(const objects::ObjectStore& db, const fs::path& path)
 {
     return fs::absolute(path).lexically_normal().lexically_relative(fs::absolute(db.path()).parent_path()).string();
 }
@@ -63,11 +63,11 @@ struct Point {
     Json winding;
 };
 struct Collection {
-    graph::ObjectRecord object;
+    objects::ObjectRecord object;
     std::vector<Point> points;
 };
 struct Patch {
-    graph::ObjectRecord object;
+    objects::ObjectRecord object;
     std::shared_ptr<QuadSurface> surface;
     double area = 0;
 };
@@ -77,7 +77,7 @@ bool validPoint(const cv::Vec3f& p)
     return p[0] != -1 && std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
 }
 
-std::vector<Collection> loadCollections(const graph::GraphDb& db, const fs::path& path,
+std::vector<Collection> loadCollections(const objects::ObjectStore& db, const fs::path& path,
     const PointCollectionPatchParams& params, const std::atomic_bool* cancel)
 {
     const auto root = readJson(path);
@@ -129,7 +129,7 @@ std::vector<Collection> loadCollections(const graph::GraphDb& db, const fs::path
     return result;
 }
 
-std::vector<Patch> loadPatches(const graph::GraphDb& db, const fs::path& directory,
+std::vector<Patch> loadPatches(const objects::ObjectStore& db, const fs::path& directory,
     const PointCollectionPatchParams& params, const std::atomic_bool* cancel)
 {
     std::vector<fs::path> paths;
@@ -157,7 +157,7 @@ std::vector<Patch> loadPatches(const graph::GraphDb& db, const fs::path& directo
         if (!(scale[0] > 0 && scale[1] > 0) || !std::isfinite(scale[0]) || !std::isfinite(scale[1]))
             throw std::runtime_error("point-collection-patch: invalid patch scale");
         const auto& source = *original.rawPointsPtr();
-        graph::PatchDetail detail;
+        objects::PatchDetail detail;
         detail.gridWidth = source.cols; detail.gridHeight = source.rows;
         detail.scale = {scale[0], scale[1]};
         const auto bounds = original.bbox();
@@ -210,7 +210,7 @@ std::array<double, 3> projection(const Patch& patch, double row, double col, dou
 }
 } // namespace
 
-DetectorReport linkPointCollectionsToPatches(graph::GraphDb& db, const fs::path& file, const fs::path& patchesDir,
+DetectorReport linkPointCollectionsToPatches(objects::ObjectStore& db, const fs::path& file, const fs::path& patchesDir,
     const PointCollectionPatchParams& params, const std::atomic_bool* cancel)
 {
     if (!(params.tolerance > 0) || !std::isfinite(params.tolerance) || params.tolerance > std::numeric_limits<float>::max() ||
@@ -294,7 +294,7 @@ DetectorReport linkPointCollectionsToPatches(graph::GraphDb& db, const fs::path&
     }
     checkCancelled(cancel);
     auto txn = db.write();
-    auto registerObject = [&](const graph::ObjectRecord& object) {
+    auto registerObject = [&](const objects::ObjectRecord& object) {
         checkCancelled(cancel);
         if (auto existing = db.objectByUuid(txn, object.uuid)) {
             if (existing->kind != object.kind) throw std::runtime_error("point-collection-patch: object UUID kind conflict");

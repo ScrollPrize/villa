@@ -11,14 +11,14 @@ struct LineData {
     std::vector<double> arclength;
     std::vector<cv::Vec3d> controls; // fibers only
     size_t firstLine = 0, lastLine = 0; // inclusive eligible span, raw indices
-    graph::ObjectRecord object;
+    objects::ObjectRecord object;
     std::filesystem::path stripCacheFile; // empty for inputs without persistent strip caching
     bool rebuildStrip = false;
 };
 using LineLoader = std::function<std::optional<LineData>(size_t, DetectorReport&)>;
 void validateLinePatchParams(const LinePatchParams& params, double sourceScale);
 // Load one line at a time so track coordinates need not all be copied into RAM.
-DetectorReport linkLinesToPatches(graph::GraphDb& db, size_t lineCount, const LineLoader& load,
+DetectorReport linkLinesToPatches(objects::ObjectStore& db, size_t lineCount, const LineLoader& load,
     const std::filesystem::path& patchesDir, const std::filesystem::path& ctVolume,
     const LinePatchParams& params, double sourceScale, const char* detector, int version,
     const std::atomic_bool* cancel);

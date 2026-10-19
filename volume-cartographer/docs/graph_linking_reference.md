@@ -28,7 +28,7 @@ printing an operation's summary. Callback string views must be copied if retaine
 `vc_graph_import` proposes pending fiber-to-patch links using CT sheet normals:
 
 ```sh
-build/bin/vc_graph_import --db graph.vcgr --author "$USER" \
+build/bin/vc_graph_import --db objects.vcobj --author "$USER" \
   --link-fiber-patches /path/to/fibers --segments /path/to/patches \
   --ct /path/to/ct.zarr --ct-level 0
 ```
@@ -88,9 +88,9 @@ estimator ID, and detector version 3. Reruns preserve reviewed/manual edges; sta
 are removed only for successfully processed inputs. Failed inputs are excluded.
 
 C++ exposes `vc::graph_links::linkFibersToPatches`. Python exposes
-`GraphDb.link_fibers_to_patches(fibers_dir, patches_dir, ct_volume, **kwargs)`;
+`ObjectStore.link_fibers_to_patches(fibers_dir, patches_dir, ct_volume, **kwargs)`;
 snake_case keywords match `FiberPatchParams`, including `ct_level` and
-`ct_to_base_scale`. `vc.graph.CtSheetNormalSampler` exposes the same estimator
+`ct_to_base_scale`. `vc.objects.CtSheetNormalSampler` exposes the same estimator
 for numerical verification and direct normal queries.
 
 ## Cached fiber strips
@@ -99,7 +99,7 @@ for numerical verification and direct normal queries.
 built strip in `/path/to/fibers/.strip-cache/<fiber-uuid>.cbor`. Later runs
 discover matching entries and skip normal sampling and strip marching. No
 additional flag is needed. The cache also applies to Python's
-`GraphDb.link_fibers_to_patches`.
+`ObjectStore.link_fibers_to_patches`.
 
 Fiber geometry, controls, coordinate scales, strip settings, normal-source
 location/method, and local CT metadata or Lasagna manifest must match.
@@ -131,8 +131,8 @@ pending edges to SQLite. There is no selected-tracks JSON step and
 `crossings.npz` is neither read nor written.
 
 ```sh
-ninja -C build vc_graph_import vc_graph_bindings test_graph_links
-build/bin/vc_graph_import --db graph.vcgr --author "$USER" \
+ninja -C build vc_graph_import vc_object_bindings test_graph_links
+build/bin/vc_graph_import --db objects.vcobj --author "$USER" \
   --link-track-tracks /mnt/bigpc/spiral_dataset_working/tracks/2um_ds2_ps256_surf_v2.dbm \
   --track-workers 4
 ```
@@ -140,9 +140,9 @@ build/bin/vc_graph_import --db graph.vcgr --author "$USER" \
 Python uses the same entry point:
 
 ```python
-from vc.graph import GraphDb
+from vc.objects import ObjectStore
 
-with GraphDb.open("graph.vcgr", author="reviewer") as db:
+with ObjectStore.open("objects.vcobj", author="reviewer") as db:
     report = db.link_tracks_to_tracks("/data/tracks/example.dbm", workers=4)
     assert not report["problems"], report["problems"]
 ```
@@ -236,7 +236,7 @@ nearest hit within that named pair. If either patch is absent, they use the
 general rule. Remaining ties use sorted patch-directory order.
 
 ```sh
-build/bin/vc_graph_import --db graph.vcgr --author "$USER" \
+build/bin/vc_graph_import --db objects.vcobj --author "$USER" \
   --link-pcl-patches /data/relative_windings.json \
   --link-pcl-patches /data/abs_winding.json \
   --segments /data/verified_patches --pcl-tolerance 2.5
@@ -248,7 +248,7 @@ Tolerance is in working voxels. The default 2.5 matches Spiral's training
 configuration. Patch metadata's grid scale is separate from this XYZ scaling.
 
 ```python
-with GraphDb.open("graph.vcgr", author="reviewer") as db:
+with ObjectStore.open("objects.vcobj", author="reviewer") as db:
     report = db.link_point_collections_to_patches(
         "/data/relative_windings.json", "/data/verified_patches",
         tolerance=2.5, point_scale=1, patch_scale=1,
@@ -304,7 +304,7 @@ proximity, CT sheet-normal strips, long-contact anchors, strip agreement, and
 same-sheet growth all use the same rules and defaults.
 
 ```sh
-build/bin/vc_graph_import --db graph.vcgr --author "$USER" \
+build/bin/vc_graph_import --db objects.vcobj --author "$USER" \
   --link-track-patches /path/to/tracks.dbm --segments /path/to/patches \
   --ct /path/to/ct.zarr --track-scale 1 --patch-scale 1
 ```
@@ -327,7 +327,7 @@ C++ exposes `vc::graph_links::linkTracksToPatches` and `TrackPatchParams`.
 Python exposes:
 
 ```python
-with GraphDb.open("graph.vcgr", author="reviewer") as db:
+with ObjectStore.open("objects.vcobj", author="reviewer") as db:
     report = db.link_tracks_to_patches(
         "/path/to/tracks.dbm", "/path/to/patches", "/path/to/ct.zarr",
         track_scale=1, patch_scale=1,
@@ -400,7 +400,7 @@ and their complete fit metadata matched the original exactly across all runs.
 Regression tests additionally compare serial/parallel capped fits, cancellation,
 callback thread identity and batched/individual nearest queries.
 
-Build with `ninja -C build vc_graph_import vc_graph_bindings test_graph_links
+Build with `ninja -C build vc_graph_import vc_object_bindings test_graph_links
 test_surface_patch_index`. The benchmark harness in `/tmp/vc-overlap-perf/bench.py`
 times the command below, with a new output basename for each run. The original
 executable and core library were saved in that temporary directory for comparison;
@@ -408,7 +408,7 @@ benchmark inputs and output graphs are not repository files.
 
 ```sh
 VC_PATCH_OVERLAP_PROFILE=1 build/bin/vc_graph_import \
-  --db /tmp/vc-overlap-perf/example.vcgr --author overlap-perf \
+  --db /tmp/vc-overlap-perf/example.vcobj --author overlap-perf \
   --link-patch-overlaps /tmp/vc-overlap-perf/patches24 --no-progress \
   --export-json /tmp/vc-overlap-perf/example.json
 ```

@@ -21,13 +21,13 @@ GraphDbController* requireGraph(CWindow* window)
 {
     GraphDbController* graph = window ? window->graphDbController() : nullptr;
     if (!graph || !graph->isOpen())
-        throw AgentBridgeError{-32000, "No graph database is open (start VC3D with --graph-db <path> or set graph/db_path)", {}};
+        throw AgentBridgeError{-32000, "No object database is open (start VC3D with --object-db <path> or set objects/db_path)", {}};
     return graph;
 }
 
 QString qs(const std::string& s) { return QString::fromStdString(s); }
 
-QJsonObject commonJson(const vc::graph::RecordCommon& r)
+QJsonObject commonJson(const vc::objects::RecordCommon& r)
 {
     QJsonObject o;
     o["uuid"] = qs(r.uuid);
@@ -49,7 +49,7 @@ QJsonObject commonJson(const vc::graph::RecordCommon& r)
     return o;
 }
 
-QJsonObject objectJson(const vc::graph::ObjectRecord& r)
+QJsonObject objectJson(const vc::objects::ObjectRecord& r)
 {
     QJsonObject o = commonJson(r);
     o["name"] = qs(r.name);
@@ -59,7 +59,7 @@ QJsonObject objectJson(const vc::graph::ObjectRecord& r)
     return o;
 }
 
-QJsonObject anchorJson(const vc::graph::Anchor& a)
+QJsonObject anchorJson(const vc::objects::Anchor& a)
 {
     QJsonObject o;
     if (a.index) o["index"] = double(*a.index);
@@ -68,7 +68,7 @@ QJsonObject anchorJson(const vc::graph::Anchor& a)
     return o;
 }
 
-QJsonObject edgeJson(const vc::graph::EdgeRecord& e)
+QJsonObject edgeJson(const vc::objects::EdgeRecord& e)
 {
     QJsonObject o = commonJson(e);
     o["a"] = qs(e.aUuid);
@@ -90,7 +90,7 @@ std::optional<std::string> optParam(const QJsonValue& params, const char* key)
     return p.value(key).toString().toStdString();
 }
 
-void requireObject(vc::graph::GraphDb& db, const vc::graph::Txn& read, const std::string& uuid)
+void requireObject(vc::objects::ObjectStore& db, const vc::objects::Txn& read, const std::string& uuid)
 {
     if (!db.objectByUuid(read, uuid))
         throw AgentBridgeError{-32007, QStringLiteral("Unknown object uuid: %1").arg(qs(uuid)), {}};

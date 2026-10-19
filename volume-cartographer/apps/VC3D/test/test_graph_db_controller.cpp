@@ -16,22 +16,22 @@ private slots:
     {
         QTemporaryDir tmp;
         QVERIFY(tmp.isValid());
-        const std::filesystem::path dbPath = std::filesystem::path(tmp.path().toStdString()) / "graph.vcgr";
+        const std::filesystem::path dbPath = std::filesystem::path(tmp.path().toStdString()) / "graph.vcobj";
 
         std::string fiberUuid;
         std::string patchUuid;
         {
-            vc::graph::OpenOptions options;
+            vc::objects::OpenOptions options;
             options.author = "test";
-            auto db = vc::graph::GraphDb::create(dbPath, options);
+            auto db = vc::objects::ObjectStore::create(dbPath, options);
             auto w = db.write();
-            vc::graph::ObjectRecord fiber;
+            vc::objects::ObjectRecord fiber;
             fiber.kind = "fiber";
             fiberUuid = db.upsertObject(w, fiber);
-            vc::graph::ObjectRecord patch;
+            vc::objects::ObjectRecord patch;
             patch.kind = "patch";
             patchUuid = db.upsertObject(w, patch);
-            vc::graph::EdgeRecord edge;
+            vc::objects::EdgeRecord edge;
             edge.aUuid = fiberUuid;
             edge.bUuid = patchUuid;
             edge.kind = "same-surface";
@@ -68,7 +68,7 @@ private slots:
         QVERIFY(tmp.isValid());
         GraphDbController controller;
         QString error;
-        QVERIFY(!controller.open(tmp.filePath(QStringLiteral("does-not-exist.vcgr")), &error));
+        QVERIFY(!controller.open(tmp.filePath(QStringLiteral("does-not-exist.vcobj")), &error));
         QVERIFY(!error.isEmpty());
         QVERIFY(!controller.isOpen());
         // Empty path is a successful no-op close (feature stays off).
@@ -80,7 +80,7 @@ private slots:
     {
         // Header-only check: the settings key exists and defaults to off.
         // (The full VCSettings include chain is exercised by test_vc_settings.)
-        QVERIFY(std::string("graph/db_path").size() > 0);
+        QVERIFY(std::string("objects/db_path").size() > 0);
     }
 };
 

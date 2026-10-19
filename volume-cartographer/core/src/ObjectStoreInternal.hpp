@@ -1,5 +1,5 @@
 #pragma once
-#include "vc/core/storage/RecordDb.hpp"
+#include "vc/core/objects/ObjectStore.hpp"
 
 #include <sqlite3.h>
 
@@ -29,8 +29,8 @@
 
 #include "vc/core/util/Uuid.hpp"
 
-namespace vc::storage {
-struct RecordDb::Impl {
+namespace vc::objects {
+struct ObjectStore::Impl {
     std::filesystem::path path;
     OpenOptions options;
     std::string hostname;
@@ -53,7 +53,7 @@ struct RecordDb::Impl {
         std::unique_lock<std::mutex> lock(poolMutex);
         poolCv.wait(lock, [&] { return closing || !readerPool.empty(); });
         if (readerPool.empty())
-            throw std::runtime_error("graph db: handle is closing");
+            throw std::runtime_error("object store: handle is closing");
         sqlite3* conn = readerPool.back();
         readerPool.pop_back();
         return conn;
@@ -68,11 +68,11 @@ struct RecordDb::Impl {
     }
 };
 
-struct RecordDbImplAccess {
+struct ObjectStoreImplAccess {
     static sqlite3* conn(const Txn& txn)
     {
         if (!txn.active())
-            throw std::runtime_error("graph db: use of finished transaction");
+            throw std::runtime_error("object store: use of finished transaction");
         return static_cast<sqlite3*>(txn.handle_);
     }
 };
@@ -151,7 +151,7 @@ public:
     std::array<unsigned char, 16> blob16(int c) const
     {
         if (sqlite3_column_bytes(value, c) != 16)
-            throw std::runtime_error("graph db: uuid column is not 16 bytes");
+            throw std::runtime_error("object store: uuid column is not 16 bytes");
         std::array<unsigned char, 16> out{};
         std::memcpy(out.data(), sqlite3_column_blob(value, c), 16);
         return out;
@@ -166,7 +166,7 @@ private:
 std::array<unsigned char, 16> parseUuid(const std::string& uuid)
 {
     if (!util::isUuid(uuid))
-        throw std::runtime_error("graph db: not a UUID: " + uuid);
+        throw std::runtime_error("object store: not a UUID: " + uuid);
     std::array<unsigned char, 16> out{};
     int nibble = 0;
     for (char ch : uuid) {
@@ -240,7 +240,7 @@ sqlite3* openConnection(const std::filesystem::path& path, int flags, const Open
     if (rc != SQLITE_OK) {
         std::string msg = db ? sqlite3_errmsg(db) : "open failed";
         if (db) sqlite3_close(db);
-        throw std::runtime_error("graph db: cannot open " + path.string() + ": " + msg);
+        throw std::runtime_error("object store: cannot open " + path.string() + ": " + msg);
     }
     try {
         applyPragmas(db, options, queryOnly);
@@ -255,14 +255,10 @@ int pragmaInt(sqlite3* db, const char* pragma)
 {
     Statement s(db, (std::string("PRAGMA ") + pragma).c_str());
     if (!s.row())
-        throw std::runtime_error(std::string("graph db: PRAGMA ") + pragma + " returned no row");
+        throw std::runtime_error(std::string("object store: PRAGMA ") + pragma + " returned no row");
     return int(s.i64(0));
 }
 
-bool hasTable(sqlite3* db, const char* name) {
-    Statement s(db, "SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?");
-    s.bind(1, std::string(name)); return s.row();
-}
 const char* kObjectCols =
     "id,uuid,kind,name,generation,created_by,created_at,created_host,changed_by,changed_at,changed_host,"
     "approval_state,approved_by,approved_at,approved_host,approved_generation,format_version,storage_kind,"
@@ -271,10 +267,9 @@ const char* kObjectCols =
 void appendJournal(sqlite3* db, const std::string& author, const std::string& hostname,
                    const std::array<unsigned char, 16>& uuid, int64_t generation, const char* changeKind)
 {
-    const bool edges = hasTable(db, "edges");
-    Statement state(db, std::string("SELECT approval_state,approved_by,approved_at,approved_host,approved_generation FROM objects WHERE uuid=? ") +
-        (edges ? "UNION ALL SELECT approval_state,approved_by,approved_at,approved_host,approved_generation FROM edges WHERE uuid=?" : ""));
-    state.bindBlob(1, uuid); if (edges) state.bindBlob(2, uuid);
+    Statement state(db, "SELECT approval_state,approved_by,approved_at,approved_host,approved_generation FROM objects WHERE uuid=? "
+        "UNION ALL SELECT approval_state,approved_by,approved_at,approved_host,approved_generation FROM edges WHERE uuid=?");
+    state.bindBlob(1, uuid); state.bindBlob(2, uuid);
     const bool hasState = state.row();
     Statement s(db, "INSERT INTO journal(record_uuid,generation,author,hostname,timestamp,change_kind,"
                     "approval_state,approved_by,approved_at,approved_host,approved_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?)");
@@ -410,11 +405,11 @@ void writeObjectDetail(sqlite3* db, int64_t id, const ObjectRecord& rec)
         del.stepDone();
     }
     if (rec.fiber && rec.kind != "fiber")
-        throw std::runtime_error("graph db: fiber detail on object of kind " + rec.kind);
+        throw std::runtime_error("object store: fiber detail on object of kind " + rec.kind);
     if (rec.patch && rec.kind != "patch")
-        throw std::runtime_error("graph db: patch detail on object of kind " + rec.kind);
+        throw std::runtime_error("object store: patch detail on object of kind " + rec.kind);
     if (rec.track && rec.kind != "track")
-        throw std::runtime_error("graph db: track detail on object of kind " + rec.kind);
+        throw std::runtime_error("object store: track detail on object of kind " + rec.kind);
     if (rec.fiber) {
         Statement s(db, "INSERT INTO fibers(object_id,family,manual_family,control_point_count,line_point_count,length,width,"
                         "width_gap_fraction,optimization_mode,bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z) "
@@ -483,32 +478,30 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
                              bool preserveApproval, bool preserveRecord = false)
 {
     if (input.kind.empty())
-        throw std::runtime_error("graph db: object kind must be non-empty");
+        throw std::runtime_error("object store: object kind must be non-empty");
     if (input.patch)
         for (double axis : input.patch->scale)
             if (!std::isfinite(axis) || axis < 0)
-                throw std::runtime_error("graph db: patch scale must be finite and nonnegative");
+                throw std::runtime_error("object store: patch scale must be finite and nonnegative");
     ObjectRecord rec = input;
     if (rec.uuid.empty())
         rec.uuid = util::newUuid();
     if (rec.meta.empty())
         rec.meta = "{}";
     const auto uuid = parseUuid(rec.uuid);
-    if (hasTable(db, "edges")) {
     Statement collision(db, "SELECT 1 FROM edges WHERE uuid=?");
     collision.bindBlob(1, uuid);
-    if (collision.row()) throw std::runtime_error("graph db: UUID already belongs to an edge");
-    }
+    if (collision.row()) throw std::runtime_error("object store: UUID already belongs to an edge");
     const std::string now = nowIsoUtc();
     Statement managed(db, "SELECT o.data_generation,o.data_checksum,o.storage_ref FROM objects o JOIN geometry_heads h ON h.object_uuid=o.uuid WHERE o.uuid=?");
     managed.bindBlob(1, uuid);
     if (managed.row()) {
-        rec.storageKind = hasTable(db, "geometry_chunks") ? "sqlite" : "object_store";
+        rec.storageKind = "sqlite";
         rec.storageRef = managed.text(2);
         rec.dataGeneration = managed.i64(0);
         rec.dataChecksum = managed.text(1);
     } else if (rec.storageKind == "sqlite" || rec.storageKind == "object_store") {
-        throw std::invalid_argument("graph db: managed geometry requires putGeometry, not a storage_kind override");
+        throw std::invalid_argument("object store: managed geometry requires putGeometry, not a storage_kind override");
     }
 
     int64_t id = 0;
@@ -519,7 +512,7 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
         cur.bind(1, id);
         (void)cur.row();
         if (cur.text(0) != rec.kind)
-            throw std::runtime_error("graph db: object kind cannot change (" + cur.text(0) + " -> " + rec.kind + ")");
+            throw std::runtime_error("object store: object kind cannot change (" + cur.text(0) + " -> " + rec.kind + ")");
         generation = cur.i64(1) + 1;
         Statement s(db, "UPDATE objects SET name=?,generation=?,changed_by=?,changed_at=?,changed_host=?,"
                         "approval_state='pending',approved_by=NULL,approved_at=NULL,approved_host=NULL,approved_generation=NULL,"
@@ -567,7 +560,6 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
 
 std::optional<int64_t> edgeIdByUuid(sqlite3* db, const std::array<unsigned char, 16>& uuid)
 {
-    if (!hasTable(db, "edges")) return std::nullopt;
     Statement s(db, "SELECT id FROM edges WHERE uuid=?");
     s.bindBlob(1, uuid);
     if (!s.row()) return std::nullopt;
@@ -616,4 +608,4 @@ std::optional<std::string> geometryHead(sqlite3* db, const std::string& objectUu
     return s.row() ? std::optional(formatUuid(s.blob16(0))) : std::nullopt;
 }
 } // namespace
-} // namespace vc::storage
+} // namespace vc::objects

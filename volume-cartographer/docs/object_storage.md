@@ -1,68 +1,51 @@
-# Object storage and graph revision references
+# Object database and relationship metadata
 
-`ObjectStore` owns object identities, metadata, immutable geometry revisions,
-and content-addressed binary chunks in an independently openable SQLite file
-(`objects.vcobj`). It contains no graph tables and can be used without `GraphDb`.
-`GraphDb` owns graph-local membership records, edges, anchors, approvals, and
-explicit revision selections in a separate SQLite file (`relationships.vcgr`).
+`ObjectStore` is the primary database: one SQLite file (`objects.vcobj`) owns
+object identities, annotations, immutable geometry revisions, content-addressed
+binary chunks, and relationships between objects. Edges, anchors, approvals,
+and endpoint revision bindings are metadata in that same database. Objects can
+exist without geometry or relationships.
 
-The C++ libraries are `vc_objects` (standalone storage), `vc_graph` (graph
-operations), and `vc_object_geometry` (native file import/export, using `vc_core`).
-Headers live under `vc/core/objects/`; the corresponding namespace is
-`vc::objects`. Common record and transaction types live in `vc::storage`.
-The Python modules are `vc.objects` and `vc.graph`. There is no workspace wrapper.
+The C++ database library is `vc_objects`. Headers, record types, and transactions
+live under `vc/core/objects/` in `vc::objects`. Native file import/export lives
+in `vc_object_geometry`; link detectors live in `vc_graph_links`. These higher
+layers depend on the object store. The database library itself does not depend
+on CT readers or Qt. Python exposes the database and its helpers in `vc.objects`.
 
-This is a new WIP schema. Earlier unified databases are not supported or
-migrated. Create new object stores and graphs and re-ingest the source data.
+This is a deliberate WIP API/schema break. The separate `GraphDb` and `RecordDb`
+APIs and the `vc.graph` Python module have been removed. Object schema version 2
+uses application ID `0x56434f42`. Earlier object stores and unified or split graph
+databases are rejected without migration; create a new file and re-ingest sources.
 Geometry ingestion does not run link detectors or integrate stored arrays into
 VC3D/Spiral readers.
 
-## Standalone objects and graph membership
+## One handle and one transaction
 
 ```python
 from vc.objects import ObjectStore
-from vc.graph import GraphDb
 
 with ObjectStore.create("objects.vcobj", author="sean") as store:
     with store.write() as tx:
         patch_id = tx.upsert_object({"kind": "patch", "name": "patch-001"})
         first = tx.put_geometry(patch_id, patch_geometry, expected_revision=None)
+        other_id = tx.upsert_object({"kind": "patch", "name": "patch-002"})
+        edge_id = tx.add_edge({"kind": "same-surface", "a": patch_id, "b": other_id})
 
-    with GraphDb.create("relationships.vcgr", author="sean") as graph:
-        with graph.write() as tx:
-            tx.include_object(store, patch_id, revision=first)
-
-        second = store.put_geometry(
-            patch_id, edited_geometry, expected_revision=first
-        )
-        # The graph still selects first; publication does not change its edges.
-        updates = graph.available_updates(store)
-        with graph.write() as tx:
-            tx.advance_object(store, patch_id, revision=second,
-                              expected_revision=first)
+    second = store.put_geometry(patch_id, edited_geometry, expected_revision=first)
+    assert store.edge_geometry_state(edge_id)["stale"]
+    # After checking the relationship and its anchors against the new geometry:
+    with store.write() as tx:
+        tx.revalidate_edge_geometry(edge_id)
+        tx.set_approval(edge_id, "approved")
 ```
 
 `patch_geometry` and `edited_geometry` use the array dictionary described below.
-The equivalent C++ methods are `upsertObject`, `putGeometry`, `includeObject`,
-`advanceObject`, `selectedObject`, and `availableUpdates`. Each takes the
-appropriate store or graph transaction; inclusion/adoption additionally takes
-an explicit `ObjectStore&`.
-
-Inclusion verifies that the committed revision belongs to the specified object.
-A membership records `(object UUID, store UUID, revision UUID)`. A stable UUID
-inside each store identifies it independently of its pathname. Graphs do not
-save a store path or automatically open one. Pass the store handle when needed;
-read geometry through that handle using the graph's selected revision UUID.
-`selected_object(uuid)` returns those three IDs without opening the store.
-`available_updates(store)` compares selections for that store with its current
-heads, using a consistent store read snapshot.
-
-On first inclusion, object metadata seeds the graph's local membership record.
-Later graph annotations belong only to that graph; adoption preserves them.
-Object metadata edits belong to the store and do not automatically overwrite
-graph annotations. Topology queries and graph-local metadata edits work with
-the object store closed. Different graphs can select different revisions of
-the same object without copying geometry.
+C++ uses `ObjectStore::upsertObject`, `putGeometry`, `addEdge`, and
+`revalidateEdgeGeometry` with the same `WriteTxn`. Transactions can commit or
+roll back object records, geometry, and relationships together. There is one
+relationship set: no graph membership copies, explicit adoption, or independent
+graph revision selections. A stable store UUID identifies the database even
+when its file moves.
 
 ## Ingesting geometry
 
@@ -253,58 +236,45 @@ validate application-specific tracing semantics or update trace results.
 
 ## Relationships and approvals
 
-New edges bind to the revisions selected by their graph memberships, in the
-same normalized endpoint order as the edge. Unbound, metadata-only endpoints
-have null bindings. `edge_geometry_state(edge_uuid)` compares these bindings
-with the graph's selections, not with the latest revisions in the object store.
-An approval therefore applies to the explicitly selected geometry.
+New edges bind to their endpoints' current geometry revisions in normalized
+endpoint order. Objects without managed geometry have null bindings.
+`edge_geometry_state(edge_uuid)` compares the saved bindings with current
+object heads. Historical revisions remain readable and exportable.
 
-Publishing geometry bumps the object generation and resets its approval in the
-object store. It does not write to any graph. To adopt a revision, call
-`advance_object(store, uuid, revision=..., expected_revision=...)`. A stale
-expected selection fails, including for an otherwise identical adoption.
-Adopting the already selected revision is a no-op. Inclusion of a previously
-unbound graph record also counts as adoption.
+Publishing changed geometry bumps and journals the object and all connected
+edges, resetting their approvals in the same transaction. Existing endpoint
+bindings remain unchanged, identifying the revisions the old anchors refer to.
+This also applies when geometry is first published for an already linked object.
+Unrelated edges are unchanged, and identical-content publication with the correct
+expected revision is a complete no-op.
 
-Adoption changes the selection, bumps/journals the membership and its connected
-edges, and resets their approvals in one graph transaction. Existing endpoint
-bindings remain unchanged, identifying the revisions to which the old anchors
-refer. Stale edges cannot be approved. After checking/recomputing the relation,
-call `revalidate_edge_geometry(edge_uuid)` to bind it to the graph's selected
-revisions, then approve it. Revalidation does not move anchors or run a detector.
+Stale edges cannot be approved. After checking or recomputing the relationship,
+call `revalidate_edge_geometry(edge_uuid)` to bind current revisions, then approve
+it. Revalidation resets approval and journals the change; it does not move
+anchors or run a detector. Updating edge metadata alone does not revalidate it.
 
-Store publication must commit before graph inclusion/adoption: a graph validates
-against a separate committed read snapshot. Failure of a later graph transaction
-leaves the published object revision available for retry. There is no atomic
-transaction spanning the two databases. Both use WAL with FULL synchronous
-writes. Publication and adoption each use a savepoint so caught errors cannot
-leave partial updates within an enclosing transaction.
+The database uses WAL with FULL synchronous writes. Geometry publication and
+edge revalidation use savepoints: a caught failure cannot leave partial geometry,
+approval, or journal changes when the enclosing transaction commits other work.
 
 ## Retention, sources, and backup
 
 Revisions and chunks are immutable and retained. There is no pruning/GC API;
-objects with retained geometry cannot be deleted. This keeps references from
-independent graphs valid without a global graph registry. Removing an unconnected
-graph membership does not delete anything from the object store.
+objects with retained geometry cannot be deleted. Objects referenced by edges
+also cannot be deleted until those edges are removed.
 
-Object-store records with geometry use `storage_kind='sqlite'`. Bound graph
-membership records use `storage_kind='object_store'`; their `data_checksum` and
-`data_generation` describe the selected revision. A membership's own generation
-tracks graph-local edits and is independent of the object's generation.
-Metadata upserts cannot replace these managed storage fields.
-
-`storage_ref` remains a source-location hint for explicit re-ingestion, never
-the authoritative geometry. `resolve_storage_path` can locate that source by
-UUID. `sweep_external_data` excludes managed objects and bound memberships
+Objects with geometry use `storage_kind='sqlite'`; their `data_checksum` and
+`data_generation` describe the current geometry. Metadata upserts cannot replace
+these managed storage fields. `storage_ref` remains a source-location hint for
+explicit re-ingestion, never the authoritative geometry. `resolve_storage_path`
+can locate that source by UUID. `sweep_external_data` excludes managed objects
 because absent source files do not make retained geometry unavailable.
 
-Use SQLite's backup API for live copies, or close writers and copy fully
-checkpointed databases. Retain the object store together with every graph that
-references it. Because revisions are retained, backing up the graph first and
-then its referenced stores preserves the selected payloads. A graph-only backup
-contains references, not geometry. Store copies retain their identity; use one
-logical writable store per identity rather than editing divergent copies.
+Use SQLite's backup API for live copies, or stop writers, checkpoint, and copy
+the database. One backup contains objects, geometry history, relationships,
+approvals, revision bindings, and the journal. Copies retain the store identity;
+use one logical writable store per identity rather than editing divergent copies.
 
-Graph JSON export remains limited to unbound metadata-only selections. It
-rejects bound memberships rather than discarding their revision bindings.
-A portable archive format covering both databases is not provided.
+JSON export/import remains a metadata snapshot format. Export rejects selected
+objects with managed geometry instead of discarding payloads and revision bindings.
+Use a complete database backup for those objects.

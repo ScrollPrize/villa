@@ -1,7 +1,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
-#include "vc/core/graph/GraphDb.hpp"
+#include "vc/core/objects/ObjectStore.hpp"
 
 #include <atomic>
 #include <filesystem>
@@ -14,7 +14,7 @@
 
 namespace
 {
-using namespace vc::graph;
+using namespace vc::objects;
 namespace fs = std::filesystem;
 
 struct TempDir {
@@ -45,7 +45,7 @@ ObjectRecord makeObject(const std::string& kind, const std::string& name = "")
     return o;
 }
 
-std::string addObject(GraphDb& db, const std::string& kind, const std::string& name = "")
+std::string addObject(ObjectStore& db, const std::string& kind, const std::string& name = "")
 {
     auto w = db.write();
     std::string uuid = db.upsertObject(w, makeObject(kind, name));
@@ -62,7 +62,7 @@ EdgeRecord makeEdge(const std::string& a, const std::string& b, const std::strin
     return e;
 }
 
-std::string addEdge(GraphDb& db, const EdgeRecord& e)
+std::string addEdge(ObjectStore& db, const EdgeRecord& e)
 {
     auto w = db.write();
     std::string uuid = db.addEdge(w, e);
@@ -70,7 +70,7 @@ std::string addEdge(GraphDb& db, const EdgeRecord& e)
     return uuid;
 }
 
-ObjectRecord getObject(GraphDb& db, const std::string& uuid)
+ObjectRecord getObject(ObjectStore& db, const std::string& uuid)
 {
     auto r = db.read();
     auto obj = db.objectByUuid(r, uuid);
@@ -83,38 +83,38 @@ ObjectRecord getObject(GraphDb& db, const std::string& uuid)
 TEST_CASE("create, open, and validation")
 {
     TempDir tmp("create");
-    const auto path = tmp.dir / "graph.vcgr";
+    const auto path = tmp.dir / "graph.vcobj";
     {
-        auto db = GraphDb::create(path, testOptions());
+        auto db = ObjectStore::create(path, testOptions());
         CHECK(db.hostname() == "testhost");
         CHECK(db.author() == "tester");
         addObject(db, "patch", "p1");
     }
     {
-        auto db = GraphDb::open(path, testOptions());
+        auto db = ObjectStore::open(path, testOptions());
         auto r = db.read();
         CHECK(db.objectsByKind(r, "patch").size() == 1);
     }
     // Re-create over an existing DB is refused.
-    CHECK_THROWS(GraphDb::create(path, testOptions()));
+    CHECK_THROWS(ObjectStore::create(path, testOptions()));
     // Read-write open without an author is refused.
     OpenOptions noAuthor = testOptions();
     noAuthor.author = "";
-    CHECK_THROWS(GraphDb::open(path, noAuthor));
+    CHECK_THROWS(ObjectStore::open(path, noAuthor));
     // A non-graph file is refused.
     const auto bogus = tmp.dir / "bogus.db";
     { std::ofstream(bogus) << "not a database"; }
-    CHECK_THROWS(GraphDb::open(bogus, testOptions()));
+    CHECK_THROWS(ObjectStore::open(bogus, testOptions()));
     // WAL side files exist while open; checkpoint leaves a copyable main file.
     {
-        auto db = GraphDb::open(path, testOptions());
+        auto db = ObjectStore::open(path, testOptions());
         addObject(db, "patch", "p2");
         db.checkpoint();
-        const auto copy = tmp.dir / "copy.vcgr";
+        const auto copy = tmp.dir / "copy.vcobj";
         fs::copy_file(path, copy);
         OpenOptions ro = testOptions();
         ro.readOnly = true;
-        auto rodb = GraphDb::open(copy, ro);
+        auto rodb = ObjectStore::open(copy, ro);
         auto r = rodb.read();
         CHECK(rodb.objectsByKind(r, "patch").size() == 2);
         CHECK_THROWS(rodb.write());
@@ -124,7 +124,7 @@ TEST_CASE("create, open, and validation")
 TEST_CASE("changed track measurements invalidate review, journal changes and roll back")
 {
     TempDir tmp("track_length");
-    auto db = GraphDb::create(tmp.dir / "graph.vcgr", testOptions());
+    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
     auto object = makeObject("track");
     object.track = TrackDetail{"dataset", "1"};
     std::string uuid;
@@ -158,7 +158,7 @@ TEST_CASE("changed track measurements invalidate review, journal changes and rol
 TEST_CASE("object CRUD stamps, generation, journal, kinds as data")
 {
     TempDir tmp("crud");
-    auto db = GraphDb::create(tmp.dir / "graph.vcgr", testOptions());
+    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
 
     ObjectRecord fiber = makeObject("fiber", "f1");
     fiber.tags = {"reviewed", "h"};
@@ -240,7 +240,7 @@ TEST_CASE("object CRUD stamps, generation, journal, kinds as data")
 TEST_CASE("approval lifecycle and open-ended metadata")
 {
     TempDir tmp("approval");
-    auto db = GraphDb::create(tmp.dir / "graph.vcgr", testOptions());
+    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
     const std::string uuid = addObject(db, "fiber", "f");
 
     {
@@ -306,7 +306,7 @@ TEST_CASE("approval lifecycle and open-ended metadata")
 TEST_CASE("edges: canonicalisation, anchors, uniqueness")
 {
     TempDir tmp("edges");
-    auto db = GraphDb::create(tmp.dir / "graph.vcgr", testOptions());
+    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
     const std::string a = addObject(db, "fiber", "a");
     const std::string b = addObject(db, "patch", "b");
     const std::string c = addObject(db, "fiber", "c");
@@ -374,7 +374,7 @@ TEST_CASE("edges: canonicalisation, anchors, uniqueness")
 TEST_CASE("traversal crosses object kinds and filters by edge kind")
 {
     TempDir tmp("traversal");
-    auto db = GraphDb::create(tmp.dir / "graph.vcgr", testOptions());
+    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
     const std::string f1 = addObject(db, "fiber");
     const std::string p1 = addObject(db, "patch");
     const std::string f2 = addObject(db, "fiber");
@@ -403,7 +403,7 @@ TEST_CASE("traversal crosses object kinds and filters by edge kind")
 TEST_CASE("export and re-import preserve the graph")
 {
     TempDir tmp("export");
-    auto db = GraphDb::create(tmp.dir / "a.vcgr", testOptions());
+    auto db = ObjectStore::create(tmp.dir / "a.vcobj", testOptions());
     const std::string a = addObject(db, "fiber", "a");
     const std::string b = addObject(db, "patch", "b");
     const std::string e = addEdge(db, makeEdge(a, b, "same-surface"));
@@ -417,7 +417,7 @@ TEST_CASE("export and re-import preserve the graph")
         auto r = db.read();
         json = db.exportJson(r);
     }
-    auto db2 = GraphDb::create(tmp.dir / "b.vcgr", testOptions());
+    auto db2 = ObjectStore::create(tmp.dir / "b.vcobj", testOptions());
     {
         auto w = db2.write();
         db2.importJson(w, json);
@@ -436,12 +436,12 @@ TEST_CASE("export and re-import preserve the graph")
 TEST_CASE("snapshot conflicts roll back only the import when caught inside a transaction")
 {
     TempDir tmp("import_conflict");
-    auto source = GraphDb::create(tmp.dir / "source.vcgr", testOptions());
+    auto source = ObjectStore::create(tmp.dir / "source.vcobj", testOptions());
     const auto a = addObject(source, "fiber", "first");
     const auto b = addObject(source, "patch", "second");
     std::string snapshot;
     { auto read = source.read(); snapshot = source.exportJson(read); }
-    auto target = GraphDb::create(tmp.dir / "target.vcgr", testOptions());
+    auto target = ObjectStore::create(tmp.dir / "target.vcobj", testOptions());
     auto conflicting = makeObject("patch", "local edit");
     conflicting.uuid = b;
     auto write = target.write();
@@ -460,7 +460,7 @@ TEST_CASE("snapshot conflicts roll back only the import when caught inside a tra
 TEST_CASE("family-only refresh invalidates approval and unchanged measurements preserve it")
 {
     TempDir tmp("family_refresh");
-    auto db = GraphDb::create(tmp.dir / "graph.vcgr", testOptions());
+    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
     auto object = makeObject("track");
     object.track = TrackDetail{"dataset", "1"};
     object.track->length = 17;
@@ -519,7 +519,7 @@ TEST_CASE("fiber importer: reciprocal, one-sided, unresolved, pending mapping")
     writeText(dir / "f3.json", fiberJson(u3, ""));
     writeText(dir / "notes.json", R"({"unrelated":true})");
 
-    auto db = GraphDb::create(tmp.dir / "graph.vcgr", testOptions());
+    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
     ImportReport report;
     std::set<std::string> stages;
     {
@@ -575,7 +575,7 @@ TEST_CASE("patch importer registers segments and ignores overlapping.json")
     writeText(segs / "seg_b" / "overlapping.json", R"(["seg_a"])");
     writeText(segs / "no_uuid" / "meta.json", R"({"name":"x"})");
 
-    auto db = GraphDb::create(tmp.dir / "graph.vcgr", testOptions());
+    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
     ImportReport report;
     {
         auto w = db.write();
@@ -601,7 +601,7 @@ TEST_CASE("external geometry resolves by UUID after rename and path reuse")
     const std::string fiberUuid = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
     writeText(patches / "original" / "meta.json", "{\"uuid\":\"" + patchUuid + "\"}");
     writeText(fibers / "original.json", "{\"uuid\":\"" + fiberUuid + "\",\"line_points\":[]}");
-    auto db = GraphDb::create(tmp.dir / "graph.vcgr", testOptions());
+    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
     {
         auto w = db.write();
         REQUIRE(importPatches(db, w, patches).objectsImported == 1);
@@ -636,13 +636,13 @@ TEST_CASE("external geometry supports a separate dataset root on read-only graph
     const std::string uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     writeText(source / "patches" / "old" / "meta.json", "{\"uuid\":\"" + uuid + "\"}");
     {
-        auto db = GraphDb::create(source / "graph.vcgr", testOptions());
+        auto db = ObjectStore::create(source / "graph.vcobj", testOptions());
         auto w = db.write();
         importPatches(db, w, source / "patches");
         w.commit();
         db.checkpoint();
     }
-    fs::rename(source / "graph.vcgr", tmp.dir / "graph.vcgr");
+    fs::rename(source / "graph.vcobj", tmp.dir / "graph.vcobj");
     fs::rename(source, tmp.dir / "dataset");
     const auto root = tmp.dir / "dataset";
     fs::rename(root / "patches" / "old", root / "patches" / "new");
@@ -650,7 +650,7 @@ TEST_CASE("external geometry supports a separate dataset root on read-only graph
     writeText(root / ".strip-cache" / "copy" / "meta.json", "{\"uuid\":\"" + uuid + "\"}");
     OpenOptions options;
     options.readOnly = true;
-    auto db = GraphDb::open(tmp.dir / "graph.vcgr", options);
+    auto db = ObjectStore::open(tmp.dir / "graph.vcobj", options);
     auto r = db.read();
     CHECK(db.resolveStoragePath(r, uuid, root) == root / "patches" / "new");
     CHECK(db.resolveStoragePath(r, uuid, root / "patches" / "new") == root / "patches" / "new");
@@ -662,7 +662,7 @@ TEST_CASE("external geometry supports a separate dataset root on read-only graph
 TEST_CASE("sweep reports missing external data")
 {
     TempDir tmp("sweep");
-    auto db = GraphDb::create(tmp.dir / "graph.vcgr", testOptions());
+    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
     ObjectRecord o = makeObject("patch", "gone");
     o.storageKind = "file";
     o.storageRef = "nope.tifxyz";
@@ -681,7 +681,7 @@ TEST_CASE("sweep reports missing external data")
 TEST_CASE("reader snapshot is stable across a concurrent commit")
 {
     TempDir tmp("snapshot");
-    auto db = GraphDb::create(tmp.dir / "graph.vcgr", testOptions());
+    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
     const std::string first = addObject(db, "patch", "first");
     auto r = db.read();
     CHECK(db.objectsByKind(r, "patch").size() == 1);
@@ -696,7 +696,7 @@ TEST_CASE("reader snapshot is stable across a concurrent commit")
 TEST_CASE("concurrent readers while a writer commits")
 {
     TempDir tmp("concurrent");
-    auto db = GraphDb::create(tmp.dir / "graph.vcgr", testOptions());
+    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
     const std::string anchorObj = addObject(db, "patch", "anchor");
     std::atomic<int> errors{0};
     std::atomic<bool> done{false};
@@ -740,7 +740,7 @@ TEST_CASE("concurrent readers while a writer commits")
 TEST_CASE("traversal cancellation via atomic flag")
 {
     TempDir tmp("cancel");
-    auto db = GraphDb::create(tmp.dir / "graph.vcgr", testOptions());
+    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
     const std::string a = addObject(db, "fiber");
     const std::string b = addObject(db, "fiber");
     addEdge(db, makeEdge(a, b));
@@ -764,7 +764,7 @@ TEST_CASE("track list registration is identity-stable and idempotent")
                   {"dataset_ref":"spiral://scroll1/tracks","external_key":"t-002","family":"V"},
                   {"external_key":"no-dataset"},
                   42])");
-    auto db = GraphDb::create(tmp.dir / "graph.vcgr", testOptions());
+    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
     ImportReport report;
     {
         auto w = db.write();

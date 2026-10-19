@@ -718,7 +718,7 @@ void validateLinePatchParams(const LinePatchParams& params, double sourceScale)
         throw std::invalid_argument("graph links: invalid source coordinate scale");
 }
 
-DetectorReport linkLinesToPatches(graph::GraphDb& db, size_t lineCount, const LineLoader& load,
+DetectorReport linkLinesToPatches(objects::ObjectStore& db, size_t lineCount, const LineLoader& load,
     const std::filesystem::path& patchesDir, const std::filesystem::path& ctVolume,
     const LinePatchParams& params, double sourceScale, const char* detector, int version,
     const std::atomic_bool* cancel)
@@ -786,7 +786,7 @@ DetectorReport linkLinesToPatches(graph::GraphDb& db, size_t lineCount, const Li
         }
         util::reportProgress(params.progress, "loading patches", dirs.size(), dirs.size());
         report.objectsConsidered = int64_t(patches.size());
-        std::vector<graph::ObjectRecord> registrations;
+        std::vector<objects::ObjectRecord> registrations;
         // One discovery index finds every patch touched by each dense line
         // point. locateAll returns one nearest hit per surface.
         SurfacePatchIndex discovery;
@@ -912,7 +912,7 @@ DetectorReport linkLinesToPatches(graph::GraphDb& db, size_t lineCount, const Li
         util::reportProgress(params.progress, linkingStage, lineCount, lineCount);
         util::reportProgress(params.progress, "registering objects");
         auto txn = db.write();
-        auto registerObject = [&](graph::ObjectRecord rec) {
+        auto registerObject = [&](objects::ObjectRecord rec) {
             if (const auto existing = db.objectByUuid(txn, rec.uuid)) {
                 if (existing->kind != rec.kind) throw std::runtime_error("graph links: UUID kind conflict " + rec.uuid);
                 if (rec.track) db.setTrackLength(txn, rec.uuid, rec.track->length, rec.track->family);
@@ -923,10 +923,10 @@ DetectorReport linkLinesToPatches(graph::GraphDb& db, size_t lineCount, const Li
         };
         for (const auto& rec : registrations) registerObject(rec);
         for (const auto& patch : patches) {
-            graph::ObjectRecord rec;
+            objects::ObjectRecord rec;
             rec.uuid = patch.uuid;
             rec.kind = "patch";
-            graph::PatchDetail detail;
+            objects::PatchDetail detail;
             const auto& s = *patch.surface;
             detail.gridWidth = s.quad->rawPointsPtr()->cols;
             detail.gridHeight = s.quad->rawPointsPtr()->rows;

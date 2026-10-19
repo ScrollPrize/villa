@@ -1,10 +1,9 @@
 #include "vc/core/objects/ObjectStore.hpp"
-#include "RecordDbInternal.hpp"
+#include "ObjectStoreInternal.hpp"
 #include "ObjectGeometryInternal.hpp"
 namespace vc::objects {
-ObjectStore::ObjectStore(std::unique_ptr<Impl> impl) : RecordDb(std::move(impl)) {}
-ObjectStore ObjectStore::create(const std::filesystem::path& p, const OpenOptions& o) { return ObjectStore(openImpl(p,o,true,Kind::Objects)); }
-ObjectStore ObjectStore::open(const std::filesystem::path& p, const OpenOptions& o) { return ObjectStore(openImpl(p,o,false,Kind::Objects)); }
+ObjectStore ObjectStore::create(const std::filesystem::path& p, const OpenOptions& o) { return ObjectStore(openImpl(p,o,true)); }
+ObjectStore ObjectStore::open(const std::filesystem::path& p, const OpenOptions& o) { return ObjectStore(openImpl(p,o,false)); }
 std::string ObjectStore::uuid(const Txn& txn) const {
     Statement s(static_cast<sqlite3*>(connection(txn)), "SELECT uuid FROM store_identity");
     if (!s.row()) throw std::runtime_error("object store: missing identity");
@@ -106,6 +105,9 @@ std::string ObjectStore::putGeometry(WriteTxn& txn, const std::string& objectUui
         stampContentChange(db, author(), hostname(), "objects", id, parseUuid(objectUuid), "geometry");
         Statement update(db, "UPDATE objects SET storage_kind='sqlite',data_generation=generation,data_checksum=? WHERE id=?");
         update.bind(1, contentHash); update.bind(2, id); update.stepDone();
+        for (const auto& edge : edgesOf(txn, objectUuid))
+            stampContentChange(db, author(), hostname(), "edges",
+                *edgeIdByUuid(db, parseUuid(edge.uuid)), parseUuid(edge.uuid), "geometry_invalidated");
         exec(db, "RELEASE geometry_publish;");
         return revisionUuid;
     } catch (...) {

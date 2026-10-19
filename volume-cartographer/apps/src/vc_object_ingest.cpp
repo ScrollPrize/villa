@@ -38,7 +38,7 @@ try {
                 "  --no-progress             suppress progress display\n"
                 "Each object commits atomically. Failures are reported and exit status is nonzero.\n"
                 "Source flags are repeatable. Existing identities, tags and metadata are retained;\n"
-                "new geometry revisions reset object approval; graphs adopt revisions explicitly.\n";
+                "new geometry revisions reset object and connected-edge approvals atomically.\n";
             return 0;
         } else throw std::runtime_error("unknown argument: " + arg);
     }

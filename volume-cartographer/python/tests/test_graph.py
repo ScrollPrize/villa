@@ -1,4 +1,4 @@
-"""Tests for the ``vc.graph`` bindings (unified metadata graph DB).
+"""Tests for the ``vc.objects`` bindings (unified metadata graph DB).
 
 Run with the vesuvius interpreter that has the editable
 volume-cartographer install, e.g.
@@ -17,9 +17,8 @@ import pytest
 import vc
 if os.environ.get("VC_BUILD_PYTHON"):
     vc.__path__.insert(0, str(Path(os.environ["VC_BUILD_PYTHON"]) / "vc"))
-graph = pytest.importorskip("vc.graph")
-GraphDb = graph.GraphDb
-ObjectStore = pytest.importorskip("vc.objects").ObjectStore
+graph = pytest.importorskip("vc.objects")
+ObjectStore = graph.ObjectStore
 
 
 def test_snapshot_preserves_provenance_and_conflicts_are_atomic(db, tmp_path):
@@ -34,7 +33,7 @@ def test_snapshot_preserves_provenance_and_conflicts_are_atomic(db, tmp_path):
     db.set_approval(edge, "rejected")
     snapshot = json.loads(db.export_json())
     assert snapshot["version"] == 2
-    with GraphDb.create(str(tmp_path / "restored.vcgr"), author="importer", hostname="elsewhere") as restored:
+    with ObjectStore.create(str(tmp_path / "restored.vcobj"), author="importer", hostname="elsewhere") as restored:
         # Different internal IDs must not affect endpoint/anchor comparison.
         swapped = dict(snapshot, objects=list(reversed(snapshot["objects"])))
         restored.import_json(json.dumps(swapped))
@@ -97,7 +96,7 @@ def test_patch_import_tifxyz_metadata(db, tmp_path, scale, expected):
     record = db.object(uid)
     assert record["patch"]["scale"] == expected
     assert record["patch"]["bbox"] == [10, 20, 30, 40, 50, 60]
-    with GraphDb.create(str(tmp_path / "copy.vcgr"), author="copy") as copy:
+    with ObjectStore.create(str(tmp_path / "copy.vcobj"), author="copy") as copy:
         copy.import_json(db.export_json())
         assert copy.object(uid) == record
 
@@ -243,12 +242,12 @@ def test_pcl_stale_review_protection_and_invalid_input_atomicity(db, tmp_path):
 
 @pytest.fixture()
 def db_path(tmp_path: Path) -> str:
-    return str(tmp_path / "graph.vcgr")
+    return str(tmp_path / "graph.vcobj")
 
 
 @pytest.fixture()
 def db(db_path: str):
-    with GraphDb.create(db_path, author="pytest", hostname="testhost") as handle:
+    with ObjectStore.create(db_path, author="pytest", hostname="testhost") as handle:
         yield handle
 
 
@@ -346,7 +345,7 @@ def test_write_transaction_commit_and_rollback(db) -> None:
 
 
 def test_reopen_read_only_and_export(db_path: str) -> None:
-    with GraphDb.create(db_path, author="pytest") as db:
+    with ObjectStore.create(db_path, author="pytest") as db:
         a = db.upsert_object({"kind": "fiber", "name": "a"})
         b = db.upsert_object({"kind": "patch", "name": "b"})
         db.add_edge({"a": a, "b": b, "kind": "same-surface"})
@@ -355,13 +354,13 @@ def test_reopen_read_only_and_export(db_path: str) -> None:
     assert doc["format"] == "vc_graph_export"
     assert len(doc["objects"]) == 2 and len(doc["edges"]) == 1
 
-    with GraphDb.open(db_path, read_only=True) as db:
+    with ObjectStore.open(db_path, read_only=True) as db:
         assert len(db.objects_by_kind("fiber")) == 1
         with pytest.raises(RuntimeError):
             db.upsert_object({"kind": "fiber", "name": "nope"})
 
-    fresh = str(Path(db_path).with_name("copy.vcgr"))
-    with GraphDb.create(fresh, author="pytest") as db:
+    fresh = str(Path(db_path).with_name("copy.vcobj"))
+    with ObjectStore.create(fresh, author="pytest") as db:
         db.import_json(exported)
         assert len(db.objects_by_kind("patch")) == 1
 
@@ -840,9 +839,7 @@ def test_legacy_import_does_not_refresh_managed_geometry_from_files(db, tmp_path
     uid = str(uuid.uuid4())
     data = {"uuid": uid, "type": "vc3d_fiber", "control_points": [], "line_points": [[1, 2, 3]]}
     file = source / "fiber.json"; file.write_text(json.dumps(data))
-    with ObjectStore.create(str(tmp_path / "objects.vcobj"), author="pytest") as store:
-        assert store.ingest_geometry_source("fiber", file)["ingested"] == 1
-        db.include_object(store, uid, revision=store.current_geometry(uid)["uuid"])
+    assert db.ingest_geometry_source("fiber", file)["ingested"] == 1
     db.set_meta(uid, "review_note", "keep")
     before, journal = db.object(uid), db.journal_since()
     data["line_points"] = [[9, 8, 7]]; file.write_text(json.dumps(data))

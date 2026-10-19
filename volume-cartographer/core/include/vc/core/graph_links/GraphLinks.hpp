@@ -1,13 +1,13 @@
 #pragma once
 
 // Edge *detection* for the unified metadata graph: sibling layer above
-// vc_graph (the store). Detectors read objects from the graph DB, load
+// vc_objects (the store). Detectors read objects from the object DB, load
 // their external geometry, compute candidate connections outside any
 // write transaction, and commit them through commitCandidates(), which
 // stamps detector provenance into each edge's meta and leaves every
 // found edge approval_state='pending' until reviewed.
 //
-// vc_graph also stores immutable geometry; these detectors still read their
+// vc_objects also stores immutable geometry; these detectors still read their
 // external source formats. Detector entry points are placeholders
 // until their geometry passes land; the commit plumbing is final.
 
@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-#include "vc/core/graph/GraphDb.hpp"
+#include "vc/core/objects/ObjectStore.hpp"
 #include "vc/core/util/Progress.hpp"
 
 namespace vc::graph_links {
@@ -40,7 +40,7 @@ inline constexpr const char* kPointCollectionPatchDetector = "point-collection-p
 struct LinkCandidate {
     std::string aUuid, bUuid;
     std::string kind = "same-surface";
-    graph::Anchor aAnchor, bAnchor;
+    objects::Anchor aAnchor, bAnchor;
     std::optional<double> score;               // detector confidence/quality, if meaningful
     std::string meta = "{}";                   // extra JSON object merged into edge meta
     std::vector<std::string> tags;
@@ -65,7 +65,7 @@ struct StaleEdgeScope {
 
 // Commits candidates as edges in one write transaction:
 // - each new edge gets meta.detector = {name, version, score?} merged
-//   over candidate.meta, and starts life 'pending' (vc_graph default);
+//   over candidate.meta, and starts life 'pending' (vc_objects default);
 // - candidates already present (same kind, endpoints, anchor indexes)
 //   refresh this detector's pending edges when replacement is enabled,
 //   preserving their UUIDs and graph annotations; unchanged edges are skipped;
@@ -80,7 +80,7 @@ struct StaleEdgeScope {
 //   both endpoints in its object set, including for an empty batch.
 // - a candidate with a changed nonempty meta.anchor_index_space replaces
 //   this detector's matching pending edge when stale replacement is enabled.
-DetectorReport commitCandidates(graph::GraphDb& db, const std::string& detectorName, int detectorVersion,
+DetectorReport commitCandidates(objects::ObjectStore& db, const std::string& detectorName, int detectorVersion,
                                 const std::vector<LinkCandidate>& candidates,
                                 bool replaceStalePending = true,
                                 const StaleEdgeScope* staleScope = nullptr,
@@ -88,7 +88,7 @@ DetectorReport commitCandidates(graph::GraphDb& db, const std::string& detectorN
 
 // Same operation in a caller-owned transaction. The caller commits/rolls back;
 // permits atomic registration of new objects together with their links.
-DetectorReport commitCandidates(graph::GraphDb& db, graph::WriteTxn& txn,
+DetectorReport commitCandidates(objects::ObjectStore& db, objects::WriteTxn& txn,
                                 const std::string& detectorName, int detectorVersion,
                                 const std::vector<LinkCandidate>& candidates,
                                 bool replaceStalePending = true,
@@ -120,7 +120,7 @@ struct PointCollectionPatchParams {
 // between_patches__A__B collections prefer nearest within that pair.
 // Absolute collections bypass the neighbor window. Registration and links
 // commit together; malformed input/cancellation leaves the DB unchanged.
-DetectorReport linkPointCollectionsToPatches(graph::GraphDb& db,
+DetectorReport linkPointCollectionsToPatches(objects::ObjectStore& db,
     const std::filesystem::path& pointCollectionsJson, const std::filesystem::path& patchesDir,
     const PointCollectionPatchParams& params = {}, const std::atomic_bool* cancel = nullptr);
 
@@ -174,7 +174,7 @@ struct PatchOverlapParams {
 // weights, requires the inlier spread gates and dense 3D agreement,
 // and commits accepted pairs as pending edges with fit provenance
 // (inliers, RMS, spreads, agreement) in edge meta.
-DetectorReport linkPatchOverlaps(graph::GraphDb& db, const std::filesystem::path& patchesDir,
+DetectorReport linkPatchOverlaps(objects::ObjectStore& db, const std::filesystem::path& patchesDir,
                                  const PatchOverlapParams& params = {},
                                  const std::atomic_bool* cancel = nullptr);
 
@@ -249,7 +249,7 @@ struct FiberPatchParams : LinePatchParams {
 // Cancellation returns a problem without committing edges. Failed fibers
 // and unreadable patches are excluded from stale-edge removal, as are
 // objects outside these input directories.
-DetectorReport linkFibersToPatches(graph::GraphDb& db, const std::filesystem::path& fibersDir,
+DetectorReport linkFibersToPatches(objects::ObjectStore& db, const std::filesystem::path& fibersDir,
                                    const std::filesystem::path& patchesDir,
                                    const std::filesystem::path& ctVolume,
                                    const FiberPatchParams& params = {},
@@ -262,7 +262,7 @@ struct FiberFiberParams {
 };
 // Fiber <-> fiber: two fibers lie on the same surface (crossing or
 // otherwise co-located), anchored at the nearest control points.
-DetectorReport linkFibersToFibers(graph::GraphDb& db, const FiberFiberParams& params = {},
+DetectorReport linkFibersToFibers(objects::ObjectStore& db, const FiberFiberParams& params = {},
                                   const std::atomic_bool* cancel = nullptr);
 
 struct TrackFiberParams {
@@ -272,7 +272,7 @@ struct TrackFiberParams {
     bool replaceStalePending = true;
 };
 // Track -> fiber: an external (Spiral) track follows the same fiber.
-DetectorReport linkTracksToFibers(graph::GraphDb& db, const TrackFiberParams& params = {},
+DetectorReport linkTracksToFibers(objects::ObjectStore& db, const TrackFiberParams& params = {},
                                   const std::atomic_bool* cancel = nullptr);
 
 struct TrackTrackParams {
@@ -295,14 +295,14 @@ struct TrackTrackParams {
 // Spiral's exact-voxel crossing relation. tracksPath discovers the adjacent
 // .vctracks geometry for a DBM and registers the input tracks automatically.
 // It never reads or writes crossings.npz. Without tracksPath, reads directories
-// named by track.datasetRef (relative to the graph DB, or absolute). externalKey
+// named by track.datasetRef (relative to the object DB, or absolute). externalKey
 // is the decimal source_id, not the row index. Only registered/selected tracks
 // within the same dataset are paired; unknown families are ignored. Point
 // indices are raw local indices; anchor positions/directions are XYZ in dataset
 // voxel units. Selects one crossing per pair by clustered median and greatest
 // endpoint clearance. On load failure or cancellation, no edges are changed.
 // Stale removal is limited to selected endpoints and the requested edge kind.
-DetectorReport linkTracksToTracks(graph::GraphDb& db, const TrackTrackParams& params = {},
+DetectorReport linkTracksToTracks(objects::ObjectStore& db, const TrackTrackParams& params = {},
                                   const std::atomic_bool* cancel = nullptr);
 
 struct TrackPatchParams : LinePatchParams {
@@ -314,7 +314,7 @@ struct TrackPatchParams : LinePatchParams {
 // Accepts a DBM or packed .vctracks directory and registers tracks automatically.
 // Track anchors use raw point indices (median contact), with source XYZ positions.
 // Failed inputs are excluded from stale removal; registration/edges commit together.
-DetectorReport linkTracksToPatches(graph::GraphDb& db, const std::filesystem::path& tracksPath,
+DetectorReport linkTracksToPatches(objects::ObjectStore& db, const std::filesystem::path& tracksPath,
                                    const std::filesystem::path& patchesDir,
                                    const std::filesystem::path& ctVolume,
                                    const TrackPatchParams& params = {},

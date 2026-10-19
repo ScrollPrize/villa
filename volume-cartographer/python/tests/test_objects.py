@@ -298,7 +298,7 @@ def test_geometry_export_revision_readonly_and_overwrite(db, db_path, tmp_path):
     assert db.current_geometry(uid)["uuid"] == second
     assert not (tmp_path / "wrong.json").exists()
     assert not list(tmp_path.glob(".vc-export-*"))
-    with ObjectStore.create(str(tmp_path / "roundtrip.vcgr"), author="test") as restored:
+    with ObjectStore.create(str(tmp_path / "roundtrip.vcobj"), author="test") as restored:
         assert restored.ingest_geometry_source("fiber", destination)["ingested"] == 1
         revision = restored.current_geometry(uid)
         assert restored.read_geometry_array(revision["uuid"], "line_points") == db.read_geometry_array(first, "line_points")
@@ -343,7 +343,7 @@ def test_geometry_export_modified_patch_and_annotations(db, tmp_path):
     assert json.loads(fiber_file.read_text()) == fiber
     assert json.loads(pcl_file.read_text())["collections"] == {"17": pcl}
     assert db.journal_since() == before
-    with ObjectStore.create(str(tmp_path / "roundtrip.vcgr"), author="test") as restored:
+    with ObjectStore.create(str(tmp_path / "roundtrip.vcobj"), author="test") as restored:
         for uid, kind, source in ((patch_id, "patch", out), (fiber_id, "fiber", fiber_file), (pcl_id, "point_collection", pcl_file)):
             assert restored.ingest_geometry_source(kind, source) == {"ingested": 1, "unchanged": 0, "problems": []}
             original, roundtrip = _stored_geometry(db, uid), _stored_geometry(restored, uid)

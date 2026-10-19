@@ -147,9 +147,9 @@ private:
     // (AgentBridgeHandlers_review.cpp); reads meta["tags"] without forcing a
     // heavy surface load.
     QJsonObject handleSegmentsReview(const QJsonValue& params);
-    // Unified graph DB (read-only, opt-in via --graph-db /
-    // graph/db_path; AgentBridgeHandlers_graph.cpp). All throw
-    // -32000 when no graph database is open.
+    // Unified graph DB (read-only, opt-in via --object-db /
+    // objects/db_path; AgentBridgeHandlers_graph.cpp). All throw
+    // -32000 when no object database is open.
     QJsonObject deferGraphQuery(std::function<QJsonObject(const std::atomic_bool*)> query);
     QJsonObject handleGraphStatus(const QJsonValue& params);
     QJsonObject handleGraphObject(const QJsonValue& params);

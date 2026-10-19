@@ -27,7 +27,7 @@
 
 namespace
 {
-using namespace vc::graph;
+using namespace vc::objects;
 using namespace vc::graph_links;
 namespace fs = std::filesystem;
 
@@ -41,15 +41,15 @@ struct TempDir {
     ~TempDir() { fs::remove_all(dir); }
 };
 
-GraphDb makeDb(const fs::path& dir)
+ObjectStore makeDb(const fs::path& dir)
 {
     OpenOptions o;
     o.author = "links-test";
     o.hostnameOverride = "testhost";
-    return GraphDb::create(dir / "graph.vcgr", o);
+    return ObjectStore::create(dir / "graph.vcobj", o);
 }
 
-std::string addObject(GraphDb& db, const std::string& kind)
+std::string addObject(ObjectStore& db, const std::string& kind)
 {
     auto w = db.write();
     ObjectRecord o;
@@ -67,7 +67,7 @@ LinkCandidate cand(const std::string& a, const std::string& b)
     return c;
 }
 
-size_t edgeCount(GraphDb& db, const std::string& uuid)
+size_t edgeCount(ObjectStore& db, const std::string& uuid)
 {
     auto r = db.read();
     return db.edgesOf(r, uuid).size();
@@ -326,7 +326,7 @@ TEST_CASE("patch overlap: capped correspondences and parallel search are determi
     auto run = [&](int workers) {
         params.workers = workers;
         OpenOptions options; options.author = "test";
-        auto db = GraphDb::create(tmp.dir / (std::to_string(workers) + ".vcgr"), options);
+        auto db = ObjectStore::create(tmp.dir / (std::to_string(workers) + ".vcobj"), options);
         REQUIRE(linkPatchOverlaps(db, patches, params).edgesCreated == 3);
         std::map<std::pair<std::string, std::string>, std::string> evidence;
         { auto read = db.read();
@@ -389,14 +389,14 @@ std::string planePatch(const fs::path& dir, int x, int width)
     });
 }
 
-std::vector<EdgeRecord> fiberEdges(GraphDb& db, const std::string& fiber)
+std::vector<EdgeRecord> fiberEdges(ObjectStore& db, const std::string& fiber)
 {
     auto txn = db.read();
     return db.edgesOf(txn, fiber);
 }
 // Rerun/metadata tests use one 20-voxel march step on planar CT. The first
 // geometry test below separately exercises the default 5-voxel marching.
-DetectorReport linkTestFiberPatches(GraphDb& db, const fs::path& fibers, const fs::path& patches,
+DetectorReport linkTestFiberPatches(ObjectStore& db, const fs::path& fibers, const fs::path& patches,
                                    const fs::path& ct, FiberPatchParams params = {},
                                    const std::atomic_bool* cancel = nullptr)
 {
@@ -506,7 +506,7 @@ TEST_CASE("fiber-patch: persistent strips reuse exact geometry and rebuild stale
             saved |= u.detail.find("saved fiber strip cache") != std::string_view::npos;
         };
         OpenOptions options; options.author = "test";
-        auto db = GraphDb::create(tmp.dir / ("run" + std::to_string(runNumber++) + ".vcgr"), options);
+        auto db = ObjectStore::create(tmp.dir / ("run" + std::to_string(runNumber++) + ".vcobj"), options);
         const auto report = linkFibersToPatches(db, fibers, patches, ct, p);
         REQUIRE(report.problems.empty());
         const auto edges = fiberEdges(db, fiber);
@@ -611,7 +611,7 @@ TEST_CASE("fiber-patch: cache write failures do not discard links and cancellati
     fs::remove_all(cache.parent_path());
     std::ofstream(cache.parent_path()) << "block cache directory creation";
     OpenOptions options; options.author = "test";
-    auto fresh = GraphDb::create(tmp.dir / "fresh.vcgr", options);
+    auto fresh = ObjectStore::create(tmp.dir / "fresh.vcobj", options);
     const auto report = linkTestFiberPatches(fresh, fibers, patches, ct);
     CHECK(report.edgesCreated == 1);
     REQUIRE(report.problems.size() == 1);
@@ -1043,7 +1043,7 @@ TEST_CASE("track-patch uses fiber strip rules, raw anchors and existing track id
     // The patch linker also populates length without a prior crossing run.
     OpenOptions freshOptions;
     freshOptions.author = "test";
-    auto fresh = GraphDb::create(tmp.dir / "fresh.vcgr", freshOptions);
+    auto fresh = ObjectStore::create(tmp.dir / "fresh.vcobj", freshOptions);
     p.trackUuids.clear();
     REQUIRE(linkTracksToPatches(fresh, packed, patches, ct, p).problems.empty());
     { auto read = fresh.read(); const auto object = fresh.objectsByKind(read, "track").at(0);

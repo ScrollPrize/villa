@@ -1,6 +1,6 @@
 #pragma once
-#include "RecordDbInternal.hpp"
-namespace vc::storage { namespace {
+#include "ObjectStoreInternal.hpp"
+namespace vc::objects { namespace {
 const char* kObjectSchema = R"SQL(CREATE TABLE objects(
   id INTEGER PRIMARY KEY,
   uuid BLOB NOT NULL UNIQUE,
@@ -123,32 +123,25 @@ CREATE TRIGGER geometry_revision_chunks_immutable_update BEFORE UPDATE ON geomet
 CREATE TRIGGER geometry_revision_chunks_immutable_delete BEFORE DELETE ON geometry_revision_chunks
   BEGIN SELECT RAISE(ABORT,'geometry chunk references are retained'); END;
 )SQL";
-const char* kGraphSelectionSchema = R"SQL(
-CREATE TABLE geometry_heads(
-  object_uuid BLOB PRIMARY KEY REFERENCES objects(uuid) ON DELETE CASCADE,
-  revision_uuid BLOB NOT NULL CHECK(length(revision_uuid)=16),
-  store_uuid BLOB NOT NULL CHECK(length(store_uuid)=16)
-);
+const char* kEdgeGeometrySchema = R"SQL(
 CREATE TABLE edge_geometry_bindings(
   edge_id INTEGER PRIMARY KEY REFERENCES edges(id) ON DELETE CASCADE,
   a_revision BLOB, b_revision BLOB
 );
 )SQL";
-void createSchema(sqlite3* db, bool objects) {
+void createSchema(sqlite3* db) {
     exec(db, kObjectSchema);
-    if (objects) {
-        exec(db, kObjectGeometrySchema);
-        exec(db, "CREATE TABLE store_identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1), uuid BLOB NOT NULL UNIQUE CHECK(length(uuid)=16));");
-        Statement id(db, "INSERT INTO store_identity VALUES(1,?)");
-        id.bindBlob(1, parseUuid(util::newUuid())); id.stepDone();
-        exec(db, "CREATE TRIGGER store_identity_immutable_update BEFORE UPDATE ON store_identity "
-                 "BEGIN SELECT RAISE(ABORT,'store identity is immutable'); END;"
-                 "CREATE TRIGGER store_identity_immutable_delete BEFORE DELETE ON store_identity "
-                 "BEGIN SELECT RAISE(ABORT,'store identity is retained'); END;");
-    } else {
-        exec(db, kEdgeSchema);
-        exec(db, kGraphSelectionSchema);
-    }
+    exec(db, kEdgeSchema);
+    exec(db, kEdgeGeometrySchema);
+    exec(db, kObjectGeometrySchema);
+    exec(db, "CREATE TABLE store_identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1), uuid BLOB NOT NULL UNIQUE CHECK(length(uuid)=16));");
+    Statement id(db, "INSERT INTO store_identity VALUES(1,?)");
+    id.bindBlob(1, parseUuid(util::newUuid())); id.stepDone();
+    exec(db, "CREATE TRIGGER store_identity_immutable_update BEFORE UPDATE ON store_identity "
+             "BEGIN SELECT RAISE(ABORT,'store identity is immutable'); END;"
+             "CREATE TRIGGER store_identity_immutable_delete BEFORE DELETE ON store_identity "
+             "BEGIN SELECT RAISE(ABORT,'store identity is retained'); END;");
+
 }
 
 } }

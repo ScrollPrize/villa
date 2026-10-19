@@ -1,6 +1,6 @@
 #pragma once
 // Shared source identity and measurements for ingestion and link detection.
-#include "vc/core/storage/RecordDb.hpp"
+#include "vc/core/objects/ObjectStore.hpp"
 #include "vc/core/util/PackedTrackStore.hpp"
 #include <algorithm>
 #include <charconv>
@@ -38,7 +38,7 @@ inline std::string trackFamily(const PackedTrackStore& store, size_t row)
     const auto family = store.families()[row];
     return family == 0 ? "horizontal" : family == 1 ? "vertical" : "";
 }
-inline size_t trackRow(const PackedTrackStore& store, const storage::ObjectRecord& object)
+inline size_t trackRow(const PackedTrackStore& store, const ObjectRecord& object)
 {
     if (!object.track) throw std::runtime_error("missing track detail: " + object.uuid);
     const auto id = trackSourceId(object.track->externalKey);

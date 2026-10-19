@@ -383,12 +383,12 @@ auto main(int argc, char* argv[]) -> int
         "fiber-collection", "Attach a read-only Automated Fiber Volume (.afv) to the opened CT volume.", "path");
     parser.addOption(fiberCollectionOption);
 
-    QCommandLineOption graphDbOption(
-        "graph-db",
-        "Open a unified graph database (.vcgr) read-only (overrides the "
-        "graph/db_path setting; empty/unset keeps graph access off).",
+    QCommandLineOption objectDbOption(
+        "object-db",
+        "Open a unified object database (.vcobj) read-only (overrides the "
+        "objects/db_path setting; empty/unset keeps graph access off).",
         "path");
-    parser.addOption(graphDbOption);
+    parser.addOption(objectDbOption);
 
     QCommandLineOption debugOption(
         "debug",
@@ -600,19 +600,19 @@ auto main(int argc, char* argv[]) -> int
             aWin.openFiberCollection(parser.value(fiberCollectionOption).trimmed());
         }
 
-        // Graph DB (opt-in, off by default): CLI flag > graph/db_path
+        // Object DB (opt-in, off by default): CLI flag > objects/db_path
         // setting > no graph access.
         {
-            QString graphDbPath = parser.value(graphDbOption).trimmed();
-            if (graphDbPath.isEmpty()) {
+            QString objectDbPath = parser.value(objectDbOption).trimmed();
+            if (objectDbPath.isEmpty()) {
                 QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-                graphDbPath = settings.value(vc3d::settings::graph::DB_PATH,
-                                             vc3d::settings::graph::DB_PATH_DEFAULT)
+                objectDbPath = settings.value(vc3d::settings::objects::DB_PATH,
+                                             vc3d::settings::objects::DB_PATH_DEFAULT)
                                   .toString()
                                   .trimmed();
             }
-            if (!graphDbPath.isEmpty())
-                aWin.openGraphDb(graphDbPath);
+            if (!objectDbPath.isEmpty())
+                aWin.openObjectDb(objectDbPath);
         }
 
         // Agent bridge (opt-in, off by default). Constructed only when a bridge

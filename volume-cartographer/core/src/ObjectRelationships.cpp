@@ -1,27 +1,17 @@
-#include "vc/core/graph/GraphDb.hpp"
 #include "vc/core/objects/ObjectStore.hpp"
-#include "GraphDbInternal.hpp"
+#include "ObjectRelationshipsInternal.hpp"
 #include "ObjectFiberInput.hpp"
-namespace vc::graph {
-GraphDb::GraphDb(std::unique_ptr<Impl> impl) : RecordDb(std::move(impl)) {}
-GraphDb GraphDb::create(const std::filesystem::path& p, const OpenOptions& o) { return GraphDb(openImpl(p,o,true,Kind::Graph)); }
-GraphDb GraphDb::open(const std::filesystem::path& p, const OpenOptions& o) { return GraphDb(openImpl(p,o,false,Kind::Graph)); }
-void GraphDb::setApproval(WriteTxn& txn, const std::string& uuid, const std::string& state) {
-    (void)connection(txn);
-    if (state == "approved" && edgeByUuid(txn, uuid) && edgeGeometryState(txn, uuid).stale)
-        throw std::runtime_error("graph db: revalidate edge geometry before approving a stale edge");
-    RecordDb::setApproval(txn, uuid, state);
-}
-std::string GraphDb::addEdge(WriteTxn& txn, const EdgeRecord& record)
+namespace vc::objects {
+std::string ObjectStore::addEdge(WriteTxn& txn, const EdgeRecord& record)
 {
     return addEdgeImpl(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname, record, false);
 }
 
-void GraphDb::updateEdge(WriteTxn& txn, const EdgeRecord& record)
+void ObjectStore::updateEdge(WriteTxn& txn, const EdgeRecord& record)
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
     const auto existing = edgeByUuid(txn, record.uuid);
-    if (!existing) throw std::runtime_error("graph db: edge not found: " + record.uuid);
+    if (!existing) throw std::runtime_error("object store: edge not found: " + record.uuid);
     auto rec = record;
     rec.aUuid = formatUuid(parseUuid(rec.aUuid));
     rec.bUuid = formatUuid(parseUuid(rec.bUuid));
@@ -29,7 +19,7 @@ void GraphDb::updateEdge(WriteTxn& txn, const EdgeRecord& record)
         std::swap(rec.aUuid, rec.bUuid); std::swap(rec.aAnchor, rec.bAnchor);
     }
     if (rec.kind != existing->kind || rec.aUuid != existing->aUuid || rec.bUuid != existing->bUuid)
-        throw std::runtime_error("graph db: edge kind and endpoints cannot change");
+        throw std::runtime_error("object store: edge kind and endpoints cannot change");
     auto sameAnchor = [](const Anchor& a, const Anchor& b) {
         return a.index == b.index && a.position == b.position && a.direction == b.direction;
     };
@@ -53,7 +43,7 @@ void GraphDb::updateEdge(WriteTxn& txn, const EdgeRecord& record)
     }
 }
 
-std::optional<EdgeRecord> GraphDb::edgeByUuid(const Txn& txn, const std::string& uuid) const
+std::optional<EdgeRecord> ObjectStore::edgeByUuid(const Txn& txn, const std::string& uuid) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE uuid=?");
@@ -62,23 +52,23 @@ std::optional<EdgeRecord> GraphDb::edgeByUuid(const Txn& txn, const std::string&
     return readEdgeRow(db, s);
 }
 
-void GraphDb::removeEdge(WriteTxn& txn, const std::string& uuid)
+void ObjectStore::removeEdge(WriteTxn& txn, const std::string& uuid)
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     const auto bytes = parseUuid(uuid);
     auto id = edgeIdByUuid(db, bytes);
-    if (!id) throw std::runtime_error("graph db: edge not found: " + uuid);
+    if (!id) throw std::runtime_error("object store: edge not found: " + uuid);
     Statement s(db, "DELETE FROM edges WHERE id=?");
     s.bind(1, *id);
     s.stepDone();
     appendJournal(db, impl_->options.author, impl_->hostname, bytes, 0, "remove_edge");
 }
 
-std::vector<EdgeRecord> GraphDb::edgesOf(const Txn& txn, const std::string& objectUuid) const
+std::vector<EdgeRecord> ObjectStore::edgesOf(const Txn& txn, const std::string& objectUuid) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     auto id = objectIdByUuid(db, parseUuid(objectUuid));
-    if (!id) throw std::runtime_error("graph db: object not found: " + objectUuid);
+    if (!id) throw std::runtime_error("object store: object not found: " + objectUuid);
     Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE a_id=? OR b_id=? ORDER BY id");
     s.bind(1, *id);
     s.bind(2, *id);
@@ -87,7 +77,7 @@ std::vector<EdgeRecord> GraphDb::edgesOf(const Txn& txn, const std::string& obje
     return out;
 }
 
-std::vector<EdgeRecord> GraphDb::edgesByKind(const Txn& txn, const std::string& edgeKind) const
+std::vector<EdgeRecord> ObjectStore::edgesByKind(const Txn& txn, const std::string& edgeKind) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE kind=? ORDER BY id");
@@ -97,7 +87,7 @@ std::vector<EdgeRecord> GraphDb::edgesByKind(const Txn& txn, const std::string& 
     return out;
 }
 
-std::vector<std::string> GraphDb::neighbours(const Txn& txn, const std::string& objectUuid,
+std::vector<std::string> ObjectStore::neighbours(const Txn& txn, const std::string& objectUuid,
                                              const std::optional<std::string>& edgeKind,
                                              const std::optional<std::string>& neighbourKind) const
 {
@@ -129,7 +119,7 @@ std::vector<std::string> traverse(sqlite3* db, const std::string& startUuid, int
 {
     auto checkCancelled = [&] {
         if (cancel && cancel->load())
-            throw std::runtime_error("graph db: traversal cancelled");
+            throw std::runtime_error("object store: traversal cancelled");
     };
     checkCancelled();
     ProgressGuard guard{db};
@@ -139,7 +129,7 @@ std::vector<std::string> traverse(sqlite3* db, const std::string& startUuid, int
             const_cast<std::atomic_bool*>(cancel));
     const auto startBytes = parseUuid(startUuid);
     if (!objectIdByUuid(db, startBytes))
-        throw std::runtime_error("graph db: object not found: " + startUuid);
+        throw std::runtime_error("object store: object not found: " + startUuid);
     // Probe the endpoint indexes only for nodes reached by this traversal.
     // ORDER BY id preserves the previous breadth-first visitation order.
     std::string sql = "SELECT id,CASE WHEN a_id=? THEN b_id ELSE a_id END FROM edges WHERE (a_id=? OR b_id=?)";
@@ -180,18 +170,18 @@ std::vector<std::string> traverse(sqlite3* db, const std::string& startUuid, int
 
 }  // namespace
 
-std::vector<std::string> GraphDb::componentOf(const Txn& txn, const std::string& objectUuid,
+std::vector<std::string> ObjectStore::componentOf(const Txn& txn, const std::string& objectUuid,
                                               const std::vector<std::string>& edgeKindFilter,
                                               const std::atomic_bool* cancel) const
 {
     return traverse(static_cast<sqlite3*>(connection(txn)), objectUuid, INT_MAX, edgeKindFilter, cancel);
 }
 
-std::vector<std::string> GraphDb::reachableWithin(const Txn& txn, const std::string& objectUuid, int maxDepth,
+std::vector<std::string> ObjectStore::reachableWithin(const Txn& txn, const std::string& objectUuid, int maxDepth,
                                                   const std::vector<std::string>& edgeKindFilter,
                                                   const std::atomic_bool* cancel) const
 {
-    if (maxDepth < 0) throw std::runtime_error("graph db: maxDepth must be >= 0");
+    if (maxDepth < 0) throw std::runtime_error("object store: maxDepth must be >= 0");
     return traverse(static_cast<sqlite3*>(connection(txn)), objectUuid, maxDepth, edgeKindFilter, cancel);
 }
 
@@ -243,11 +233,11 @@ std::array<double, 2> scaleFromJson(const nlohmann::json& value)
     } else if (value.is_array() && value.size() == 2) {
         scale = {value.at(0).get<double>(), value.at(1).get<double>()};
     } else {
-        throw std::runtime_error("graph db: patch scale must be a number or a two-element array");
+        throw std::runtime_error("object store: patch scale must be a number or a two-element array");
     }
     for (double axis : scale)
         if (!std::isfinite(axis) || axis < 0)
-            throw std::runtime_error("graph db: patch scale must be finite and nonnegative");
+            throw std::runtime_error("object store: patch scale must be finite and nonnegative");
     return scale;
 }
 
@@ -267,7 +257,7 @@ nlohmann::json commonToJson(const RecordCommon& r)
 void commonFromJson(const nlohmann::json& j, RecordCommon& r)
 {
     r.generation = j.at("generation").get<int64_t>();
-    if (r.generation < 1) throw std::runtime_error("graph db: snapshot generation must be positive");
+    if (r.generation < 1) throw std::runtime_error("object store: snapshot generation must be positive");
     r.createdBy = j.at("created_by").get<std::string>();
     r.createdAt = j.at("created_at").get<std::string>();
     r.createdHost = j.at("created_host").get<std::string>();
@@ -283,11 +273,11 @@ void commonFromJson(const nlohmann::json& j, RecordCommon& r)
     r.approvedHost = optionalText("approved_host");
     if (!j.at("approved_generation").is_null()) r.approvedGeneration = j.at("approved_generation").get<int64_t>();
     if (r.approvalState != "pending" && r.approvalState != "approved" && r.approvalState != "rejected")
-        throw std::runtime_error("graph db: invalid snapshot approval state");
+        throw std::runtime_error("object store: invalid snapshot approval state");
     if (r.approvedGeneration && *r.approvedGeneration != r.generation)
-        throw std::runtime_error("graph db: snapshot approval does not cover its generation");
+        throw std::runtime_error("object store: snapshot approval does not cover its generation");
     if (r.approvalState == "pending" && (r.approvedBy || r.approvedAt || r.approvedHost || r.approvedGeneration))
-        throw std::runtime_error("graph db: pending snapshot has approval stamps");
+        throw std::runtime_error("object store: pending snapshot has approval stamps");
 }
 
 nlohmann::json objectToJson(const ObjectRecord& r)
@@ -386,7 +376,7 @@ nlohmann::json edgeToJson(EdgeRecord e)
 
 }  // namespace
 
-std::string GraphDb::exportJson(const Txn& txn, const std::optional<std::string>& objectKind,
+std::string ObjectStore::exportJson(const Txn& txn, const std::optional<std::string>& objectKind,
                                 const std::optional<std::string>& tag) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
@@ -409,8 +399,8 @@ std::string GraphDb::exportJson(const Txn& txn, const std::optional<std::string>
     if (tag && objectKind)
         std::erase_if(objects, [&](const ObjectRecord& o) { return o.kind != *objectKind; });
     for (const auto& o : objects) {
-        if (selectedObject(txn, o.uuid))
-            throw std::runtime_error("graph db: JSON export does not include object-store revision bindings; use a SQLite backup of the graph and retain its object stores");
+        if (currentGeometry(txn, o.uuid))
+            throw std::runtime_error("object store: JSON export does not include managed geometry; use a SQLite backup of the object database");
         included.insert(o.uuid);
         out["objects"].push_back(objectToJson(o));
     }
@@ -423,15 +413,15 @@ std::string GraphDb::exportJson(const Txn& txn, const std::optional<std::string>
     return out.dump(2);
 }
 
-void GraphDb::importJson(WriteTxn& txn, const std::string& jsonText)
+void ObjectStore::importJson(WriteTxn& txn, const std::string& jsonText)
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     const auto root = nlohmann::json::parse(jsonText);
     if (root.value("format", "") != "vc_graph_export")
-        throw std::runtime_error("graph db: not a vc_graph_export document");
+        throw std::runtime_error("object store: not a vc_graph_export document");
     const int version = root.value("version", 0);
     if (version != 2)
-        throw std::runtime_error("graph db: unsupported export version");
+        throw std::runtime_error("object store: unsupported export version");
     // A failed import must not leave half a snapshot, even if the caller
     // catches the error and commits other work in its enclosing transaction.
     exec(db, "SAVEPOINT graph_import;");
@@ -440,17 +430,17 @@ void GraphDb::importJson(WriteTxn& txn, const std::string& jsonText)
         auto checkIdentity = [&](std::string& uuid) {
             uuid = formatUuid(parseUuid(uuid));
             if (!seen.insert(uuid).second)
-                throw std::runtime_error("graph db: duplicate snapshot UUID: " + uuid);
+                throw std::runtime_error("object store: duplicate snapshot UUID: " + uuid);
         };
         for (const auto& j : root.at("objects")) {
             auto object = objectFromJson(j);
             checkIdentity(object.uuid);
             commonFromJson(j, object);
             if (edgeByUuid(txn, object.uuid))
-                throw std::runtime_error("graph db: snapshot UUID belongs to an edge: " + object.uuid);
+                throw std::runtime_error("object store: snapshot UUID belongs to an edge: " + object.uuid);
             if (auto existing = objectByUuid(txn, object.uuid)) {
                 if (objectToJson(*existing) == objectToJson(object)) continue;
-                throw std::runtime_error("graph db: snapshot conflicts with existing object: " + object.uuid);
+                throw std::runtime_error("object store: snapshot conflicts with existing object: " + object.uuid);
             }
             upsertObjectImpl(db, impl_->options.author, impl_->hostname, object, true, true);
         }
@@ -468,10 +458,10 @@ void GraphDb::importJson(WriteTxn& txn, const std::string& jsonText)
             e.approvalState = j.value("approval_state", "pending");
             commonFromJson(j, e);
             if (objectByUuid(txn, e.uuid))
-                throw std::runtime_error("graph db: snapshot UUID belongs to an object: " + e.uuid);
+                throw std::runtime_error("object store: snapshot UUID belongs to an object: " + e.uuid);
             if (auto existing = edgeByUuid(txn, e.uuid)) {
                 if (edgeToJson(*existing) == edgeToJson(e)) continue;
-                throw std::runtime_error("graph db: snapshot conflicts with existing edge: " + e.uuid);
+                throw std::runtime_error("object store: snapshot conflicts with existing edge: " + e.uuid);
             }
             addEdgeImpl(db, impl_->options.author, impl_->hostname, e, true, true);
         }
@@ -502,7 +492,7 @@ std::string fnvHashHex(const std::string& text)
     return buf;
 }
 
-std::string relativeToDb(GraphDb& db, const std::filesystem::path& file)
+std::string relativeToDb(ObjectStore& db, const std::filesystem::path& file)
 {
     std::error_code ec;
     auto rel = std::filesystem::relative(file, db.path().parent_path(), ec);
@@ -536,7 +526,7 @@ Anchor branchAnchor(const nlohmann::json& j, const char* indexKey, const char* p
 
 }  // namespace
 
-ImportReport importFibers(GraphDb& db, WriteTxn& txn, const std::filesystem::path& fiberDir,
+ImportReport importFibers(ObjectStore& db, WriteTxn& txn, const std::filesystem::path& fiberDir,
     const util::ProgressCallback& progress)
 {
     ImportReport report;
@@ -578,7 +568,7 @@ ImportReport importFibers(GraphDb& db, WriteTxn& txn, const std::filesystem::pat
             report.problems.push_back(file.filename().string() + ": missing/invalid uuid, skipped");
             continue;
         }
-        if (db.selectedObject(txn, uuid)) {
+        if (db.currentGeometry(txn, uuid)) {
             report.problems.push_back(file.filename().string() +
                 ": geometry is database-owned; use ingestGeometrySource to publish a revision (legacy branch import skipped)");
             continue;
@@ -662,8 +652,8 @@ ImportReport importFibers(GraphDb& db, WriteTxn& txn, const std::filesystem::pat
             refreshed.meta = existing->meta;
             refreshed.dataGeneration = existing->dataGeneration + 1;
             for (const auto& edge : db.edgesOf(txn, existing->uuid))
-                stampContentChange(RecordDbImplAccess::conn(txn), db.author(), db.hostname(), "edges",
-                    *edgeIdByUuid(RecordDbImplAccess::conn(txn), parseUuid(edge.uuid)), parseUuid(edge.uuid), "geometry_invalidated");
+                stampContentChange(ObjectStoreImplAccess::conn(txn), db.author(), db.hostname(), "edges",
+                    *edgeIdByUuid(ObjectStoreImplAccess::conn(txn), parseUuid(edge.uuid)), parseUuid(edge.uuid), "geometry_invalidated");
         }
         db.upsertObject(txn, refreshed);
         ++report.objectsImported;
@@ -732,7 +722,7 @@ ImportReport importFibers(GraphDb& db, WriteTxn& txn, const std::filesystem::pat
             edge.aAnchor = b.local; edge.bAnchor = b.target;
             edge.meta = nlohmann::json{{"adjacent", b.adjacent}, {"source_import", "fiber-json"}}.dump();
             edge.approvalState = b.pending ? "pending" : "approved";
-            retainedBranches.insert(addEdgeImpl(RecordDbImplAccess::conn(txn), db.author(), db.hostname(), edge, true));
+            retainedBranches.insert(addEdgeImpl(ObjectStoreImplAccess::conn(txn), db.author(), db.hostname(), edge, true));
             ++report.edgesImported;
         }
     }
@@ -747,7 +737,7 @@ ImportReport importFibers(GraphDb& db, WriteTxn& txn, const std::filesystem::pat
     return report;
 }
 
-ImportReport importPatches(GraphDb& db, WriteTxn& txn, const std::filesystem::path& segmentsDir,
+ImportReport importPatches(ObjectStore& db, WriteTxn& txn, const std::filesystem::path& segmentsDir,
     const util::ProgressCallback& progress)
 {
     ImportReport report;
@@ -809,7 +799,7 @@ ImportReport importPatches(GraphDb& db, WriteTxn& txn, const std::filesystem::pa
     return report;
 }
 
-ImportReport importTrackList(GraphDb& db, WriteTxn& txn, const std::filesystem::path& trackListJson,
+ImportReport importTrackList(ObjectStore& db, WriteTxn& txn, const std::filesystem::path& trackListJson,
     const util::ProgressCallback& progress)
 {
     ImportReport report;
@@ -818,10 +808,10 @@ ImportReport importTrackList(GraphDb& db, WriteTxn& txn, const std::filesystem::
     try {
         root = nlohmann::json::parse(readFile(trackListJson));
     } catch (const std::exception& e) {
-        throw std::runtime_error("graph db: cannot parse track list " + trackListJson.string() + ": " + e.what());
+        throw std::runtime_error("object store: cannot parse track list " + trackListJson.string() + ": " + e.what());
     }
     if (!root.is_array())
-        throw std::runtime_error("graph db: track list must be a JSON array: " + trackListJson.string());
+        throw std::runtime_error("object store: track list must be a JSON array: " + trackListJson.string());
 
     // Index already-registered tracks by identity so re-registration
     // reuses the minted UUID instead of colliding with the UNIQUE index.
@@ -867,7 +857,7 @@ ImportReport importTrackList(GraphDb& db, WriteTxn& txn, const std::filesystem::
         if (it != registered.end()) {
             const ObjectRecord& cur = it->second;
             o.name = cur.name; o.tags = cur.tags; o.meta = cur.meta;
-            if (db.selectedObject(txn, cur.uuid)) {
+            if (db.currentGeometry(txn, cur.uuid)) {
                 report.problems.push_back(label + ": geometry is database-owned; use ingestGeometrySource to publish a revision");
                 continue;
             }
@@ -890,7 +880,7 @@ ImportReport importTrackList(GraphDb& db, WriteTxn& txn, const std::filesystem::
     return report;
 }
 
-EdgeGeometryState GraphDb::edgeGeometryState(const Txn& txn, const std::string& edgeUuid) const
+EdgeGeometryState ObjectStore::edgeGeometryState(const Txn& txn, const std::string& edgeUuid) const
 {
     (void)connection(txn);
     auto* db = static_cast<sqlite3*>(connection(txn));
@@ -907,7 +897,7 @@ EdgeGeometryState GraphDb::edgeGeometryState(const Txn& txn, const std::string& 
     return result;
 }
 
-void GraphDb::revalidateEdgeGeometry(WriteTxn& txn, const std::string& edgeUuid)
+void ObjectStore::revalidateEdgeGeometry(WriteTxn& txn, const std::string& edgeUuid)
 {
     const auto state = edgeGeometryState(txn, edgeUuid);
     if (!state.stale) return;
@@ -931,4 +921,4 @@ void GraphDb::revalidateEdgeGeometry(WriteTxn& txn, const std::string& edgeUuid)
 }
 
 
-} // namespace vc::graph
+} // namespace vc::objects

@@ -10,17 +10,17 @@
 namespace vc::graph_links {
 namespace {
 
-using graph::EdgeRecord;
+using objects::EdgeRecord;
 
-std::string anchorKey(const std::string& uuid, const graph::Anchor& anchor)
+std::string anchorKey(const std::string& uuid, const objects::Anchor& anchor)
 {
     return uuid + "#" + (anchor.index ? std::to_string(*anchor.index) : std::string("-"));
 }
 
 // Order-independent identity of a (kind, endpoints, anchor indexes)
-// triple, matching vc_graph's uniqueness scopes.
-std::string candidateKey(const std::string& kind, const std::string& aUuid, const graph::Anchor& aAnchor,
-                         const std::string& bUuid, const graph::Anchor& bAnchor)
+// triple, matching vc_objects's uniqueness scopes.
+std::string candidateKey(const std::string& kind, const std::string& aUuid, const objects::Anchor& aAnchor,
+                         const std::string& bUuid, const objects::Anchor& bAnchor)
 {
     std::string first = anchorKey(aUuid, aAnchor);
     std::string second = anchorKey(bUuid, bAnchor);
@@ -55,7 +55,7 @@ std::string anchorIndexSpace(const std::string& meta)
     catch (const std::exception&) { return {}; }
 }
 
-DetectorReport placeholder(graph::GraphDb& db, const char* detectorName,
+DetectorReport placeholder(objects::ObjectStore& db, const char* detectorName,
                            const std::vector<std::string>& objectKinds, const std::atomic_bool* cancel)
 {
     DetectorReport report;
@@ -67,13 +67,13 @@ DetectorReport placeholder(graph::GraphDb& db, const char* detectorName,
     for (const auto& kind : objectKinds)
         report.objectsConsidered += int64_t(db.objectsByKind(txn, kind).size());
     report.problems.push_back(std::string(detectorName) +
-                              ": detector not implemented yet (placeholder in vc_graph_links); no edges written");
+                              ": detector not implemented yet (placeholder in vc_objects_links); no edges written");
     return report;
 }
 
 }  // namespace
 
-DetectorReport commitCandidates(graph::GraphDb& db, const std::string& detectorName, int detectorVersion,
+DetectorReport commitCandidates(objects::ObjectStore& db, const std::string& detectorName, int detectorVersion,
                                 const std::vector<LinkCandidate>& candidates, bool replaceStalePending,
                                 const StaleEdgeScope* staleScope, const util::ProgressCallback& progress)
 {
@@ -85,7 +85,7 @@ DetectorReport commitCandidates(graph::GraphDb& db, const std::string& detectorN
     return report;
 }
 
-DetectorReport commitCandidates(graph::GraphDb& db, graph::WriteTxn& txn,
+DetectorReport commitCandidates(objects::ObjectStore& db, objects::WriteTxn& txn,
                                 const std::string& detectorName, int detectorVersion,
                                 const std::vector<LinkCandidate>& candidates, bool replaceStalePending,
                                 const StaleEdgeScope* staleScope, const util::ProgressCallback& progress)
@@ -191,7 +191,7 @@ DetectorReport commitCandidates(graph::GraphDb& db, graph::WriteTxn& txn,
     return report;
 }
 
-DetectorReport linkFibersToFibers(graph::GraphDb& db, const FiberFiberParams& /*params*/,
+DetectorReport linkFibersToFibers(objects::ObjectStore& db, const FiberFiberParams& /*params*/,
                                   const std::atomic_bool* cancel)
 {
     // TODO: fiber/fiber proximity at control points (spatial index over
@@ -199,7 +199,7 @@ DetectorReport linkFibersToFibers(graph::GraphDb& db, const FiberFiberParams& /*
     return placeholder(db, kFiberFiberDetector, {"fiber"}, cancel);
 }
 
-DetectorReport linkTracksToFibers(graph::GraphDb& db, const TrackFiberParams& /*params*/,
+DetectorReport linkTracksToFibers(objects::ObjectStore& db, const TrackFiberParams& /*params*/,
                                   const std::atomic_bool* cancel)
 {
     // TODO: external track geometry vs fiber lines (distance + coverage).

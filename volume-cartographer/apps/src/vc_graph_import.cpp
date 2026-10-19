@@ -1,8 +1,8 @@
-// Import existing fiber/segment metadata into a vc_graph database and
+// Import existing fiber/segment metadata into an object database and
 // export the metadata graph as JSON. See
 // docs/plans/graph_db_initial_implementation.md (Phase 4).
 
-#include "vc/core/graph/GraphDb.hpp"
+#include "vc/core/objects/ObjectStore.hpp"
 #include "vc/core/graph_links/GraphLinks.hpp"
 #include "vc/core/util/TerminalProgress.hpp"
 
@@ -15,14 +15,14 @@
 #include <vector>
 
 namespace fs = std::filesystem;
-using namespace vc::graph;
+using namespace vc::objects;
 
 namespace {
 
 void usage()
 {
     std::cerr
-        << "usage: vc_graph_import --db <graph.vcgr> --author <name> [options]\n"
+        << "usage: vc_graph_import --db <graph.vcobj> --author <name> [options]\n"
         << "  --no-progress        disable terminal progress reporting (stderr)\n"
         << "  --fibers <dir>       import vc3d_fiber JSON files (objects + branch edges)\n"
         << "  --segments <dir>     register segment dirs with meta.json as patch objects\n"
@@ -193,9 +193,9 @@ try {
     options.author = author;
     std::error_code ec;
     const bool exists = fs::exists(dbPath) && fs::file_size(dbPath, ec) > 0;
-    GraphDb db = [&] {
+    ObjectStore db = [&] {
         vc::util::TerminalProgress progress("Open graph database", showProgress);
-        auto graph = exists ? GraphDb::open(dbPath, options) : GraphDb::create(dbPath, options);
+        auto graph = exists ? ObjectStore::open(dbPath, options) : ObjectStore::create(dbPath, options);
         progress.finish();
         return graph;
     }();

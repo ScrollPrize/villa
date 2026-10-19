@@ -24,7 +24,7 @@ std::set<std::string> requestedTrackUuids(const std::vector<std::string>& uuids)
     }
     return result;
 }
-TrackInput loadTrackInput(graph::GraphDb& db, const std::filesystem::path& path,
+TrackInput loadTrackInput(objects::ObjectStore& db, const std::filesystem::path& path,
     const std::vector<uint64_t>& sourceIds, const std::vector<std::string>& trackUuids,
     const std::atomic_bool* cancel, const util::ProgressCallback& progress)
 {
@@ -32,7 +32,7 @@ TrackInput loadTrackInput(graph::GraphDb& db, const std::filesystem::path& path,
     util::reportProgress(progress, "opening track dataset");
     TrackInput result;
     const auto requested = requestedTrackUuids(trackUuids);
-    std::vector<graph::ObjectRecord> registered;
+    std::vector<objects::ObjectRecord> registered;
     {
         auto read = db.read();
         registered = db.objectsByKind(read, "track");
@@ -59,7 +59,7 @@ TrackInput loadTrackInput(graph::GraphDb& db, const std::filesystem::path& path,
     if (matchingRefs.size() > 1)
         throw std::runtime_error("this packed dataset is registered under multiple dataset_ref aliases");
     if (!matchingRefs.empty()) dataset = *matchingRefs.begin();
-    std::map<uint64_t, graph::ObjectRecord> existing;
+    std::map<uint64_t, objects::ObjectRecord> existing;
     for (auto& object : registered)
         if (object.track && object.track->datasetRef == dataset)
             existing.emplace(trackSourceId(object.track->externalKey), std::move(object));
@@ -79,14 +79,14 @@ TrackInput loadTrackInput(graph::GraphDb& db, const std::filesystem::path& path,
             objects.push_back(std::move(found->second));
             continue;
         }
-        graph::ObjectRecord object;
+        objects::ObjectRecord object;
         object.uuid = vc::util::newUuid();
         object.kind = "track";
         object.name = std::to_string(id);
         object.storageKind = "dataset";
         object.storageRef = dataset;
         object.dataGeneration = 1;
-        graph::TrackDetail detail;
+        objects::TrackDetail detail;
         detail.datasetRef = dataset;
         detail.externalKey = object.name;
         detail.family = trackFamily(store, row);

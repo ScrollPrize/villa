@@ -145,10 +145,10 @@ class CWindow : public QMainWindow
 
 public:
     void openFiberCollection(const QString& path);
-    // Opens a unified graph database read-only (opt-in; see
+    // Opens a unified object database read-only (opt-in; see
     // GraphDbController). Failures are logged and shown in the status
     // bar, never fatal: VC3D keeps running without graph access.
-    void openGraphDb(const QString& path);
+    void openObjectDb(const QString& path);
     GraphDbController* graphDbController() { return _graphDb.get(); }
     // Starts an atlas fiber-intersection search without opening a dialog.
     // Progress and completion use the atlasSearch signals below.

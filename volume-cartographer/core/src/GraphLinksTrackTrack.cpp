@@ -21,7 +21,7 @@ void checkCancelled(const std::atomic_bool* cancel)
 
 }
 
-DetectorReport linkTracksToTracks(graph::GraphDb& db, const TrackTrackParams& params,
+DetectorReport linkTracksToTracks(objects::ObjectStore& db, const TrackTrackParams& params,
                                   const std::atomic_bool* cancel)
 {
     track_crossings::Parameters crossingParams{
@@ -43,9 +43,9 @@ DetectorReport linkTracksToTracks(graph::GraphDb& db, const TrackTrackParams& pa
     StaleEdgeScope scope{{params.edgeKind}, {}};
     try {
         checkCancelled(cancel);
-        std::map<std::string, std::vector<graph::ObjectRecord>> datasets;
+        std::map<std::string, std::vector<objects::ObjectRecord>> datasets;
         const auto requested = detail::requestedTrackUuids(params.trackUuids);
-        std::vector<graph::ObjectRecord> registered;
+        std::vector<objects::ObjectRecord> registered;
         if (params.tracksPath.empty()) {
             auto read = db.read();
             registered = db.objectsByKind(read, "track");
@@ -67,7 +67,7 @@ DetectorReport linkTracksToTracks(graph::GraphDb& db, const TrackTrackParams& pa
                 datasets[object.track->datasetRef].push_back(std::move(object));
             }
         }
-        std::vector<graph::ObjectRecord>().swap(registered);
+        std::vector<objects::ObjectRecord>().swap(registered);
         if (!requested.empty() && static_cast<size_t>(report.objectsConsidered) != requested.size())
             throw std::runtime_error("some requested track UUIDs were not found in the selected dataset");
         if (!params.datasetRef.empty() && datasets.empty())
@@ -79,7 +79,7 @@ DetectorReport linkTracksToTracks(graph::GraphDb& db, const TrackTrackParams& pa
             const auto resolved = path.is_absolute() ? path : db.path().parent_path() / path;
             util::reportProgress(progressCallback, "opening track geometry", 0, 0, dataset);
             PackedTrackStore store(resolved);
-            std::map<uint64_t, graph::ObjectRecord*> byId;
+            std::map<uint64_t, objects::ObjectRecord*> byId;
             for (auto& object : objects) {
                 const auto id = detail::trackSourceId(object.track->externalKey);
                 if (!byId.emplace(id, &object).second)
@@ -90,7 +90,7 @@ DetectorReport linkTracksToTracks(graph::GraphDb& db, const TrackTrackParams& pa
             std::vector<int64_t> offsets{0};
             std::vector<uint64_t> sourceIds;
             std::vector<int8_t> families;
-            std::vector<const graph::ObjectRecord*> rows;
+            std::vector<const objects::ObjectRecord*> rows;
             size_t loaded = 0;
             for (const auto& [id, object] : byId) {
                 util::reportProgress(progressCallback, "loading track geometry", loaded++, byId.size());
@@ -157,7 +157,7 @@ DetectorReport linkTracksToTracks(graph::GraphDb& db, const TrackTrackParams& pa
                         const auto point = offsets[track] + local;
                         const auto tangent = track_crossings::track_tangent(
                             coordinates.data(), offsets.data(), track, local, params.tangentRadiusVoxels);
-                        graph::Anchor result;
+                        objects::Anchor result;
                         result.index = local;
                         result.position = {double(coordinates[3*point+2]), double(coordinates[3*point+1]),
                                            double(coordinates[3*point])};

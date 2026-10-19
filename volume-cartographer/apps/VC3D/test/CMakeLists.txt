@@ -122,7 +122,7 @@ target_include_directories(test_graph_db_controller PRIVATE
     ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 target_link_libraries(test_graph_db_controller PRIVATE
-    vc_graph
+    vc_objects
     Qt6::Core
     Qt6::Test)
 

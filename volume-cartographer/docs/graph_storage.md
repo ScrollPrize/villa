@@ -1,28 +1,27 @@
-# Graph object identity and storage
+# Relationship metadata in the object database
 
-Geometry is owned by an independent [ObjectStore](object_storage.md).
-Graphs select committed object revisions explicitly and store relationships and
-graph-local annotations. Object storage can be used without a graph, and graph
-topology can be queried without opening the store. There is no legacy-schema
-migration: earlier WIP databases must be recreated.
+[ObjectStore](object_storage.md) owns objects, geometry, and relationships in
+one SQLite database. Edges reference its authoritative objects directly; graph
+queries are methods on the store. There are no graph-local memberships or
+revision-adoption steps. Earlier WIP databases must be recreated and re-ingested.
 
-The external-file behavior below applies to unbound graph registrations and
-source-location hints retained for re-ingestion.
+The external-file behavior below applies to objects without managed geometry
+and to source-location hints retained for re-ingestion.
 
-The graph identifies objects by UUID. Patch import preserves the UUID in
+The object store identifies objects by UUID. Patch import preserves the UUID in
 `meta.json`; fiber import preserves the UUID in the fiber JSON. PCL linking
 preserves each collection's UUID in its point-collections JSON. Edges reference
 those UUIDs. `name` is a display label, and `storage_ref` is a location hint,
-normally relative to the graph file's directory. Until explicitly ingested, the graph stores metadata and
+normally relative to the database file's directory. Until explicitly ingested, the object store holds metadata and
 relationships and geometry remains in the external files.
 
-Use `GraphDb::resolveStoragePath` in C++, or `resolve_storage_path` in Python,
+Use `ObjectStore::resolveStoragePath` in C++, or `resolve_storage_path` in Python,
 to locate a file-backed patch, fiber or point collection:
 
 ```python
-from vc.graph import GraphDb
+from vc.objects import ObjectStore
 
-with GraphDb.open("/data/graph.vcgr", read_only=True) as graph:
+with ObjectStore.open("/data/objects.vcobj", read_only=True) as graph:
     patch_uuid = "a8fc18bb-7710-4143-908f-6cc6d3e03ecc"
     patch_dir = graph.resolve_storage_path(patch_uuid)
     # If geometry lives elsewhere, supply its search root:
@@ -65,9 +64,8 @@ metadata, tags, detail fields and storage references. Import restores these
 fields exactly. Importing identical existing records is a no-op; a conflicting
 UUID rejects the whole import, without overwriting local changes. The import
 uses a savepoint, so a caller can catch a conflict without committing a partial
-snapshot. Unknown export versions are rejected. Selections containing bound
-object-store memberships are refused; use a graph database backup to preserve
-revision selections and endpoint bindings.
+snapshot. Unknown export versions are rejected. Selections containing managed geometry are refused; use an object database
+backup to preserve payloads, revision history, and endpoint bindings.
 
 Each imported record receives a local journal entry attributed to the importer;
 its original authors remain on the record. A snapshot contains current records,
@@ -94,9 +92,9 @@ or bounding-box fields are reported and that patch is skipped.
 Legacy file import seeds object names, tags, and metadata on first registration.
 Subsequent fiber/track imports preserve those database-owned annotations and
 refresh only source descriptors and measurements. A changed legacy fiber file
-invalidates connected-link approvals. Once a graph object selects stored geometry,
+invalidates connected-link approvals. Once an object has stored geometry,
 file import refuses to refresh it from external files. Use ObjectStore ingestion
-to publish a revision and explicit graph adoption to change the selection.
+to publish a revision.
 
 Newly imported fiber branches carry `meta.source_import="fiber-json"`. Re-import
 refreshes their anchors while preserving UUIDs and graph annotations, resets
@@ -114,8 +112,8 @@ newly created and skipped edges. Patch-overlap stale deletion is limited to
 pairs whose patches both loaded successfully, including when a run finds no
 candidates. Damaged TIFFs and interrupted saves are excluded from that scope.
 
-Adopting an object revision in a graph resets connected-link approvals and leaves
-revision bindings stale. ObjectStore publication alone does not change graphs. Refreshing edge content does not assert that an external
+Publishing a changed object revision resets connected-link approvals and leaves
+revision bindings stale in the same transaction. Refreshing edge content does not assert that an external
 file detector ran against the stored revision: explicit geometry revalidation
 is still required before approving stale links.
 
@@ -129,3 +127,7 @@ materializing all graph edges. Bridge graph queries execute on worker threads
 and retain the opened database through controller close/reopen. Responses retain
 the existing JSON shape; deferred queries have a 30-second deadline, and component
 traversal observes cancellation when the request expires or the server closes.
+
+VC3D opens this database read-only with `--object-db /data/objects.vcobj` or
+the `objects/db_path` setting. Agent-bridge graph query names and response shapes
+are unchanged.

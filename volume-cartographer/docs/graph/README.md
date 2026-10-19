@@ -1,8 +1,9 @@
 # Object graph
 
 Store and query relationships between patches, fibers, and Spiral tracks in a
-`.vcgr` SQLite database. The graph stores metadata and links; geometry stays in
-its original files. Imported patches and fibers retain their source UUIDs, so
+`.vcobj` SQLite database. ObjectStore owns objects and their relationship metadata. Geometry can
+remain in source files or be ingested into the same database; these examples
+register external sources. Imported patches and fibers retain their source UUIDs, so
 names and paths are labels and location hints, not identity.
 
 [Setup](#setup) · [Command line](#command-line) · [Python](#python) ·
@@ -14,7 +15,7 @@ names and paths are labels and location hints, not identity.
 From an already configured Volume Cartographer checkout:
 
 ```bash
-ninja -C build vc_graph_import vc_graph_bindings
+ninja -C build vc_graph_import vc_object_bindings
 ```
 
 For Python, install the [native prerequisites](../../README.md#python-source-builds)
@@ -28,7 +29,7 @@ Examples below use this layout; replace the paths with your own:
 
 ```text
 /data/dataset/
-├── graph.vcgr                 # created by the examples
+├── objects.vcobj                 # created by the examples
 ├── verified_patches/<name>/   # meta.json, x.tif, y.tif, z.tif
 └── fibers/<name>.json
 ```
@@ -38,7 +39,7 @@ Examples below use this layout; replace the paths with your own:
 Import objects and detect patch overlaps (creates the DB if needed):
 
 ```bash
-build/bin/vc_graph_import --db /data/dataset/graph.vcgr --author "$USER" \
+build/bin/vc_graph_import --db /data/dataset/objects.vcobj --author "$USER" \
   --fibers /data/dataset/fibers \
   --segments /data/dataset/verified_patches \
   --link-patch-overlaps /data/dataset/verified_patches
@@ -55,11 +56,11 @@ same operations in code.
 
 ```python
 from pathlib import Path
-from vc.graph import GraphDb
+from vc.objects import ObjectStore
 
 root = Path("/data/dataset")
-path = str(root / "graph.vcgr")
-open_db = GraphDb.open if Path(path).exists() else GraphDb.create
+path = str(root / "objects.vcobj")
+open_db = ObjectStore.open if Path(path).exists() else ObjectStore.create
 with open_db(path, author="reviewer") as db:
     for report in (
         db.import_patches(str(root / "verified_patches")),
@@ -91,9 +92,9 @@ call commits independently. Reports can include skipped inputs; inspect
 ### Find overlaps, attached fibers, and those fibers' neighbours
 
 ```python
-from vc.graph import GraphDb
+from vc.objects import ObjectStore
 
-with GraphDb.open("/data/dataset/graph.vcgr", read_only=True) as db:
+with ObjectStore.open("/data/dataset/objects.vcobj", read_only=True) as db:
     patches = db.objects_by_kind("patch")
     if not patches:
         raise RuntimeError("No patches have been imported")
@@ -130,13 +131,13 @@ manual edits such as `txn.set_approval(...)` and `txn.set_meta(...)` atomically.
 
 ## C++
 
-Link against `vc_graph` for storage and queries, or `vc_graph_links` for geometry
+Link against `vc_objects` for storage and queries, or `vc_graph_links` for geometry
 detectors. Both require C++20. In a CMake build that includes Volume Cartographer,
 add targets for the examples below:
 
 ```cmake
 add_executable(graph_query graph_query.cpp)
-target_link_libraries(graph_query PRIVATE vc_graph)
+target_link_libraries(graph_query PRIVATE vc_objects)
 add_executable(graph_build graph_build.cpp)
 target_link_libraries(graph_build PRIVATE vc_graph_links)
 ```
@@ -150,21 +151,21 @@ Save as `graph_query.cpp`. Pass the graph file and a patch UUID; optionally pass
 the dataset root if it differs from the graph's directory.
 
 ```bash
-build/bin/graph_query /data/dataset/graph.vcgr "<patch-uuid>" /data/dataset
+build/bin/graph_query /data/dataset/objects.vcobj "<patch-uuid>" /data/dataset
 ```
 
 ```cpp
 #include <iostream>
-#include "vc/core/graph/GraphDb.hpp"
+#include "vc/core/objects/ObjectStore.hpp"
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::cerr << "Usage: graph_query graph.vcgr patch-uuid [dataset-root]\n";
+        std::cerr << "Usage: graph_query objects.vcobj patch-uuid [dataset-root]\n";
         return 1;
     }
-    vc::graph::OpenOptions options;
+    vc::objects::OpenOptions options;
     options.readOnly = true;
-    auto db = vc::graph::GraphDb::open(argv[1], options);
+    auto db = vc::objects::ObjectStore::open(argv[1], options);
     auto txn = db.read();
     auto patch = db.objectByUuid(txn, argv[2]);
     if (!patch || patch->kind != "patch") return 1;
@@ -203,7 +204,7 @@ build/bin/graph_build /data/dataset /data/ct.zarr
 ```cpp
 #include <iostream>
 #include <stdexcept>
-#include "vc/core/graph/GraphDb.hpp"
+#include "vc/core/objects/ObjectStore.hpp"
 #include "vc/core/graph_links/GraphLinks.hpp"
 
 int main(int argc, char** argv) {
@@ -211,20 +212,20 @@ int main(int argc, char** argv) {
         std::cerr << "Usage: graph_build dataset-dir ct.zarr\n";
         return 1;
     }
-    const std::filesystem::path root = argv[1], path = root / "graph.vcgr";
-    vc::graph::OpenOptions options;
+    const std::filesystem::path root = argv[1], path = root / "objects.vcobj";
+    vc::objects::OpenOptions options;
     options.author = "reviewer";
     auto db = std::filesystem::exists(path)
-        ? vc::graph::GraphDb::open(path, options)
-        : vc::graph::GraphDb::create(path, options);
+        ? vc::objects::ObjectStore::open(path, options)
+        : vc::objects::ObjectStore::create(path, options);
     const auto check = [](const auto& report) {
         for (const auto& problem : report.problems) std::cerr << problem << '\n';
         if (!report.problems.empty()) throw std::runtime_error("Check input problems");
     };
     {
         auto txn = db.write();
-        check(vc::graph::importPatches(db, txn, root / "verified_patches"));
-        check(vc::graph::importFibers(db, txn, root / "fibers"));
+        check(vc::objects::importPatches(db, txn, root / "verified_patches"));
+        check(vc::objects::importFibers(db, txn, root / "fibers"));
         txn.commit();
     }
     // Detectors manage their own transactions: call outside the write scope.

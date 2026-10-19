@@ -114,20 +114,14 @@ set_target_properties(vc_object_bindings PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc"
     INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
 )
-target_link_libraries(vc_object_bindings PRIVATE vc_object_geometry)
+target_link_libraries(vc_object_bindings PRIVATE vc_object_geometry vc_graph_links vc_core)
 target_compile_features(vc_object_bindings PRIVATE cxx_std_23)
 
-nanobind_add_module(vc_graph_bindings
-    vc/graph.cpp
-)
-set_target_properties(vc_graph_bindings PROPERTIES
-    OUTPUT_NAME graph
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc"
-    INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
-)
-target_link_libraries(vc_graph_bindings PRIVATE vc_graph_links vc_core)
-target_compile_features(vc_graph_bindings PRIVATE cxx_std_23)
-add_dependencies(vc_graph_bindings vc_object_bindings)
+# A stale graph extension must not keep the removed split-database API importable.
+file(GLOB VC_STALE_GRAPH_MODULES "${CMAKE_CURRENT_BINARY_DIR}/vc/graph*${CMAKE_SHARED_MODULE_SUFFIX}")
+if(VC_STALE_GRAPH_MODULES)
+    file(REMOVE ${VC_STALE_GRAPH_MODULES})
+endif()
 
 install(TARGETS vc_lasagna_amgx
     LIBRARY DESTINATION .
@@ -140,7 +134,7 @@ install(TARGETS vc_core vc_lasagna vc_fiber_tracer utils utils_c3d_codec c3d uti
     ARCHIVE DESTINATION .
 )
 
-install(TARGETS vc_volume vc_surface_index vc_grid_raycast vc_fiber_trace vc_graph_bindings vc_object_bindings
+install(TARGETS vc_volume vc_surface_index vc_grid_raycast vc_fiber_trace vc_object_bindings
     LIBRARY DESTINATION vc
     RUNTIME DESTINATION vc
 )

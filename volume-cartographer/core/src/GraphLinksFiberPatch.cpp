@@ -36,7 +36,7 @@ std::optional<detail::LineData> loadFiber(const std::filesystem::path& file, dou
             return std::nullopt;
         }
         const auto sourceLine = objects::detail::fiberPoints(root, "line_points");
-        fiber.object.fiber = graph::FiberDetail{};
+        fiber.object.fiber = objects::FiberDetail{};
         fiber.object.fiber->length = objects::detail::fiberPolylineLength(sourceLine);
         for (const auto& p : sourceLine) fiber.line.emplace_back(p[0], p[1], p[2]);
         fiber.controls = parsePoints(root, "control_points");
@@ -92,7 +92,7 @@ std::optional<detail::LineData> loadFiber(const std::filesystem::path& file, dou
 
 } // namespace
 
-DetectorReport linkFibersToPatches(graph::GraphDb& db, const std::filesystem::path& fibersDir,
+DetectorReport linkFibersToPatches(objects::ObjectStore& db, const std::filesystem::path& fibersDir,
     const std::filesystem::path& patchesDir, const std::filesystem::path& ctVolume,
     const FiberPatchParams& params, const std::atomic_bool* cancel)
 {

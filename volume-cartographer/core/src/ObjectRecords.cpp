@@ -1,23 +1,23 @@
 #include "StorageSchemaInternal.hpp"
-namespace vc::storage {
-RecordDb::RecordDb(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
-RecordDb::~RecordDb() = default;
-RecordDb::RecordDb(RecordDb&&) noexcept = default;
-RecordDb& RecordDb::operator=(RecordDb&&) noexcept = default;
+namespace vc::objects {
+ObjectStore::ObjectStore(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+ObjectStore::~ObjectStore() = default;
+ObjectStore::ObjectStore(ObjectStore&&) noexcept = default;
+ObjectStore& ObjectStore::operator=(ObjectStore&&) noexcept = default;
 
-std::unique_ptr<RecordDb::Impl> RecordDb::openImpl(const std::filesystem::path& path, const OpenOptions& options, bool create, Kind kind)
+std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::path& path, const OpenOptions& options, bool create)
 {
-    const int kApplicationId = kind == Kind::Objects ? 0x56434f42 : 0x56434752;
-    const int kSchemaVersion = kind == Kind::Objects ? 1 : 4;
+    const int kApplicationId = 0x56434f42;
+    const int kSchemaVersion = 2;
     if (create && options.readOnly) throw std::invalid_argument("create requires writable options");
     if (sqlite3_threadsafe() == 0)
-        throw std::runtime_error("graph db: SQLite build is not thread-safe");
+        throw std::runtime_error("object store: SQLite build is not thread-safe");
     if (!create && !options.readOnly && options.author.empty())
-        throw std::runtime_error("graph db: read-write open requires an author (session identity)");
+        throw std::runtime_error("object store: read-write open requires an author (session identity)");
     if (create && options.author.empty())
-        throw std::runtime_error("graph db: create requires an author (session identity)");
+        throw std::runtime_error("object store: create requires an author (session identity)");
 
-    auto impl = std::make_unique<RecordDb::Impl>();
+    auto impl = std::make_unique<ObjectStore::Impl>();
     impl->path = path;
     impl->options = options;
     impl->options.readerPoolSize = std::max(1, options.readerPoolSize);
@@ -26,14 +26,14 @@ std::unique_ptr<RecordDb::Impl> RecordDb::openImpl(const std::filesystem::path& 
     if (create) {
         std::error_code ec;
         if (std::filesystem::exists(path) && std::filesystem::file_size(path, ec) > 0)
-            throw std::runtime_error("graph db: create refuses existing non-empty file: " + path.string());
+            throw std::runtime_error("object store: create refuses existing non-empty file: " + path.string());
         impl->writer = openConnection(path, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, options, false);
         exec(impl->writer, "PRAGMA journal_mode=WAL;");
         exec(impl->writer, "PRAGMA synchronous=FULL;");
         exec(impl->writer, ("PRAGMA application_id=" + std::to_string(kApplicationId) + ";").c_str());
         exec(impl->writer, "BEGIN IMMEDIATE;");
         try {
-            createSchema(impl->writer, kind == Kind::Objects);
+            createSchema(impl->writer);
             exec(impl->writer, ("PRAGMA user_version=" + std::to_string(kSchemaVersion) + ";").c_str());
             exec(impl->writer, "COMMIT;");
         } catch (...) {
@@ -43,12 +43,12 @@ std::unique_ptr<RecordDb::Impl> RecordDb::openImpl(const std::filesystem::path& 
     } else {
         if (!options.readOnly) {
             impl->writer = openConnection(path, SQLITE_OPEN_READWRITE, options, false);
+            if (pragmaInt(impl->writer, "application_id") != kApplicationId)
+                throw std::runtime_error("object store: unsupported database format; recreate and re-ingest: " + path.string());
+            if (pragmaInt(impl->writer, "user_version") != kSchemaVersion)
+                throw std::runtime_error("object store: unsupported schema version; recreate and re-ingest");
             exec(impl->writer, "PRAGMA journal_mode=WAL;");
             exec(impl->writer, "PRAGMA synchronous=FULL;");
-            if (pragmaInt(impl->writer, "application_id") != kApplicationId)
-                throw std::runtime_error("graph db: not a VC graph database: " + path.string());
-            if (pragmaInt(impl->writer, "user_version") != kSchemaVersion)
-                throw std::runtime_error("storage: unsupported schema version");
         }
     }
 
@@ -61,18 +61,18 @@ std::unique_ptr<RecordDb::Impl> RecordDb::openImpl(const std::filesystem::path& 
         impl->readerPool.push_back(conn);
         if (options.readOnly) {
             if (pragmaInt(conn, "application_id") != kApplicationId)
-                throw std::runtime_error("graph db: not a VC graph database: " + path.string());
+                throw std::runtime_error("object store: unsupported database format; recreate and re-ingest: " + path.string());
             const auto version = pragmaInt(conn, "user_version");
             if (version != kSchemaVersion)
-                throw std::runtime_error("graph db: unsupported schema version in " + path.string());
+                throw std::runtime_error("object store: unsupported schema version; recreate and re-ingest: " + path.string());
         }
     }
     return impl;
 }
 
-const std::filesystem::path& RecordDb::path() const { return impl_->path; }
-std::string RecordDb::hostname() const { return impl_->hostname; }
-std::string RecordDb::author() const { return impl_->options.author; }
+const std::filesystem::path& ObjectStore::path() const { return impl_->path; }
+std::string ObjectStore::hostname() const { return impl_->hostname; }
+std::string ObjectStore::author() const { return impl_->options.author; }
 
 Txn::Txn(Txn&& other) noexcept : db_(other.db_), handle_(other.handle_), write_(other.write_)
 {
@@ -92,7 +92,7 @@ Txn::~Txn()
 void Txn::commit()
 {
     if (!handle_)
-        throw std::runtime_error("graph db: commit on finished transaction");
+        throw std::runtime_error("object store: commit on finished transaction");
     release(true);
 }
 
@@ -112,12 +112,12 @@ void Txn::release(bool commit)
     releaseConnection();
 }
 
-void* RecordDb::connection(const Txn& txn) const {
+void* ObjectStore::connection(const Txn& txn) const {
     if (txn.db_ != this) throw std::invalid_argument("transaction belongs to another database");
-    return RecordDbImplAccess::conn(txn);
+    return ObjectStoreImplAccess::conn(txn);
 }
 
-ReadTxn RecordDb::read()
+ReadTxn ObjectStore::read()
 {
     sqlite3* conn = impl_->checkoutReader();
     try {
@@ -134,25 +134,25 @@ ReadTxn RecordDb::read()
     return ReadTxn(this, conn);
 }
 
-WriteTxn RecordDb::write()
+WriteTxn ObjectStore::write()
 {
     if (!impl_->writer)
-        throw std::runtime_error("graph db: handle is read-only");
+        throw std::runtime_error("object store: handle is read-only");
     std::unique_lock<std::mutex> lock(impl_->writerMutex);
     exec(impl_->writer, "BEGIN IMMEDIATE;");
     lock.release(); // WriteTxn releases the mutex on commit or rollback.
     return WriteTxn(this, impl_->writer);
 }
 
-void RecordDb::checkpoint()
+void ObjectStore::checkpoint()
 {
     if (!impl_->writer)
-        throw std::runtime_error("graph db: checkpoint on read-only handle");
+        throw std::runtime_error("object store: checkpoint on read-only handle");
     std::lock_guard<std::mutex> lock(impl_->writerMutex);
     check(sqlite3_wal_checkpoint_v2(impl_->writer, nullptr, SQLITE_CHECKPOINT_FULL, nullptr, nullptr), impl_->writer, "checkpoint");
 }
 
-std::string RecordDb::upsertObject(WriteTxn& txn, const ObjectRecord& record)
+std::string ObjectStore::upsertObject(WriteTxn& txn, const ObjectRecord& record)
 {
     return upsertObjectImpl(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname, record, false);
 }
@@ -163,15 +163,15 @@ void refreshLineMeasurements(sqlite3* db, const std::string& author, const std::
     const std::optional<std::string>& family, const char* journalKind)
 {
     if (!std::isfinite(length) || length < 0)
-        throw std::invalid_argument("graph db: line length must be finite and nonnegative");
+        throw std::invalid_argument("object store: line length must be finite and nonnegative");
     const auto key = parseUuid(uuid);
     Statement current(db, "SELECT o.id,o.generation,t.length,t.family FROM objects o JOIN " + table +
         " t ON t.object_id=o.id WHERE o.uuid=?");
     current.bindBlob(1, key);
-    if (!current.row()) throw std::runtime_error("graph db: " + table + " record not found: " + uuid);
+    if (!current.row()) throw std::runtime_error("object store: " + table + " record not found: " + uuid);
     const auto previousFamily = current.text(3);
     if (family && !previousFamily.empty() && previousFamily != *family)
-        throw std::runtime_error("graph db: registered family differs from source: " + uuid);
+        throw std::runtime_error("object store: registered family differs from source: " + uuid);
     const auto newFamily = family.value_or(previousFamily);
     if (current.f64(2) == length && previousFamily == newFamily) return;
     Statement update(db, "UPDATE " + table + " SET length=?,family=? WHERE object_id=?");
@@ -183,22 +183,22 @@ void refreshLineMeasurements(sqlite3* db, const std::string& author, const std::
 }
 } // namespace
 
-void RecordDb::setTrackLength(WriteTxn& txn, const std::string& uuid, double length,
+void ObjectStore::setTrackLength(WriteTxn& txn, const std::string& uuid, double length,
     const std::optional<std::string>& family)
 {
     if (family && *family != "" && *family != "horizontal" && *family != "vertical")
-        throw std::invalid_argument("graph db: invalid packed track family");
+        throw std::invalid_argument("object store: invalid packed track family");
     refreshLineMeasurements(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname,
         "tracks", uuid, length, family, family ? "track_measurements" : "track_length");
 }
 
-void RecordDb::setFiberLength(WriteTxn& txn, const std::string& uuid, double length)
+void ObjectStore::setFiberLength(WriteTxn& txn, const std::string& uuid, double length)
 {
     refreshLineMeasurements(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname,
         "fibers", uuid, length, std::nullopt, "fiber_length");
 }
 
-std::optional<ObjectRecord> RecordDb::objectByUuid(const Txn& txn, const std::string& uuid) const
+std::optional<ObjectRecord> ObjectStore::objectByUuid(const Txn& txn, const std::string& uuid) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     Statement s(db, std::string("SELECT ") + kObjectCols + " FROM objects WHERE uuid=?");
@@ -207,7 +207,7 @@ std::optional<ObjectRecord> RecordDb::objectByUuid(const Txn& txn, const std::st
     return readObjectRow(db, s);
 }
 
-std::vector<ObjectRecord> RecordDb::objectsByKind(const Txn& txn, const std::string& kind,
+std::vector<ObjectRecord> ObjectStore::objectsByKind(const Txn& txn, const std::string& kind,
                                                  const std::optional<std::string>& approvalState) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
@@ -222,7 +222,7 @@ std::vector<ObjectRecord> RecordDb::objectsByKind(const Txn& txn, const std::str
     return out;
 }
 
-int64_t RecordDb::objectCount(const Txn& txn, const std::string& kind) const
+int64_t ObjectStore::objectCount(const Txn& txn, const std::string& kind) const
 {
     Statement s(static_cast<sqlite3*>(connection(txn)), "SELECT count(*) FROM objects WHERE kind=?");
     s.bind(1, kind);
@@ -230,7 +230,7 @@ int64_t RecordDb::objectCount(const Txn& txn, const std::string& kind) const
     return s.i64(0);
 }
 
-std::vector<ObjectRecord> RecordDb::objectsByTag(const Txn& txn, const std::string& tag) const
+std::vector<ObjectRecord> ObjectStore::objectsByTag(const Txn& txn, const std::string& tag) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     std::string cols = kObjectCols;
@@ -246,23 +246,25 @@ std::vector<ObjectRecord> RecordDb::objectsByTag(const Txn& txn, const std::stri
     return out;
 }
 
-void RecordDb::deleteObject(WriteTxn& txn, const std::string& uuid)
+void ObjectStore::deleteObject(WriteTxn& txn, const std::string& uuid)
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     const auto bytes = parseUuid(uuid);
     auto id = objectIdByUuid(db, bytes);
-    if (!id) throw std::runtime_error("graph db: object not found: " + uuid);
+    if (!id) throw std::runtime_error("object store: object not found: " + uuid);
     Statement s(db, "DELETE FROM objects WHERE id=?");  // FK RESTRICT on edges refuses while referenced
     s.bind(1, *id);
     s.stepDone();
     appendJournal(db, impl_->options.author, impl_->hostname, bytes, 0, "delete");
 }
 
-void RecordDb::setApproval(WriteTxn& txn, const std::string& recordUuid, const std::string& state)
+void ObjectStore::setApproval(WriteTxn& txn, const std::string& recordUuid, const std::string& state)
 {
     if (state != "pending" && state != "approved" && state != "rejected")
-        throw std::runtime_error("graph db: invalid approval state: " + state);
+        throw std::runtime_error("object store: invalid approval state: " + state);
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
+    if (state == "approved" && edgeByUuid(txn, recordUuid) && edgeGeometryState(txn, recordUuid).stale)
+        throw std::runtime_error("object store: revalidate edge geometry before approving a stale edge");
     const auto bytes = parseUuid(recordUuid);
     const char* table = nullptr;
     int64_t id = 0;
@@ -274,7 +276,7 @@ void RecordDb::setApproval(WriteTxn& txn, const std::string& recordUuid, const s
         table = "edges";
         id = *eid;
     } else {
-        throw std::runtime_error("graph db: record not found: " + recordUuid);
+        throw std::runtime_error("object store: record not found: " + recordUuid);
     }
     {
         Statement cur(db, std::string("SELECT generation FROM ") + table + " WHERE id=?");
@@ -303,7 +305,7 @@ namespace {
 void mutateMeta(sqlite3* db, const std::string& author, const std::string& host, const std::string& recordUuid,
                 const std::string& key, const std::optional<std::string>& jsonValue)
 {
-    if (key.empty()) throw std::runtime_error("graph db: meta key must be non-empty");
+    if (key.empty()) throw std::runtime_error("object store: meta key must be non-empty");
     const auto bytes = parseUuid(recordUuid);
     const char* table = nullptr;
     int64_t id = 0;
@@ -314,7 +316,7 @@ void mutateMeta(sqlite3* db, const std::string& author, const std::string& host,
         table = "edges";
         id = *eid;
     } else {
-        throw std::runtime_error("graph db: record not found: " + recordUuid);
+        throw std::runtime_error("object store: record not found: " + recordUuid);
     }
     if (jsonValue) {
         Statement s(db, std::string("UPDATE ") + table + " SET meta=json_set(meta,?,json(?)) WHERE id=?");
@@ -333,17 +335,17 @@ void mutateMeta(sqlite3* db, const std::string& author, const std::string& host,
 
 }  // namespace
 
-void RecordDb::setMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key, const std::string& jsonValue)
+void ObjectStore::setMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key, const std::string& jsonValue)
 {
     mutateMeta(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname, recordUuid, key, jsonValue);
 }
 
-void RecordDb::removeMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key)
+void ObjectStore::removeMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key)
 {
     mutateMeta(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname, recordUuid, key, std::nullopt);
 }
 
-std::vector<JournalEntry> RecordDb::journalSince(const Txn& txn, int64_t afterSeq) const
+std::vector<JournalEntry> ObjectStore::journalSince(const Txn& txn, int64_t afterSeq) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     Statement s(db, "SELECT seq,record_uuid,generation,author,hostname,timestamp,change_kind,"
@@ -369,13 +371,13 @@ std::vector<JournalEntry> RecordDb::journalSince(const Txn& txn, int64_t afterSe
     return out;
 }
 
-std::optional<std::filesystem::path> RecordDb::resolveStoragePath(
+std::optional<std::filesystem::path> ObjectStore::resolveStoragePath(
     const Txn& txn, const std::string& objectUuid,
     const std::optional<std::filesystem::path>& datasetRoot) const
 {
     namespace fs = std::filesystem;
     const auto object = objectByUuid(txn, objectUuid);
-    if (!object || (object->storageKind != "file" && object->storageKind != "sqlite" && object->storageKind != "object_store") ||
+    if (!object || (object->storageKind != "file" && object->storageKind != "sqlite") ||
         (object->kind != "patch" && object->kind != "fiber" && object->kind != "point_collection"))
         return std::nullopt;
 
@@ -458,11 +460,11 @@ std::optional<std::filesystem::path> RecordDb::resolveStoragePath(
     return found;
 }
 
-std::vector<std::string> RecordDb::sweepExternalData(const Txn& txn) const
+std::vector<std::string> ObjectStore::sweepExternalData(const Txn& txn) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     std::vector<std::string> problems;
-    Statement s(db, "SELECT uuid,storage_ref,data_generation,generation FROM objects WHERE storage_ref<>'' AND storage_kind NOT IN ('sqlite','object_store') ORDER BY id");
+    Statement s(db, "SELECT uuid,storage_ref,data_generation,generation FROM objects WHERE storage_ref<>'' AND storage_kind<>'sqlite' ORDER BY id");
     const auto root = impl_->path.parent_path();
     while (s.row()) {
         const std::string uuid = formatUuid(s.blob16(0));
@@ -482,4 +484,4 @@ std::vector<std::string> RecordDb::sweepExternalData(const Txn& txn) const
 }
 
 
-} // namespace vc::storage
+} // namespace vc::objects

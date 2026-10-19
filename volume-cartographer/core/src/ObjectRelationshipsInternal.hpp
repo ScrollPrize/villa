@@ -1,6 +1,6 @@
 #pragma once
-#include "RecordDbInternal.hpp"
-namespace vc::graph { namespace {
+#include "ObjectStoreInternal.hpp"
+namespace vc::objects { namespace {
 const char* kEdgeCols =
     "id,uuid,a_id,b_id,kind,generation,created_by,created_at,created_host,changed_by,changed_at,changed_host,"
     "approval_state,approved_by,approved_at,approved_host,approved_generation,"
@@ -31,7 +31,7 @@ std::string uuidTextByObjectId(sqlite3* db, int64_t id)
 {
     Statement s(db, "SELECT uuid FROM objects WHERE id=?");
     s.bind(1, id);
-    if (!s.row()) throw std::runtime_error("graph db: dangling edge endpoint id");
+    if (!s.row()) throw std::runtime_error("object store: dangling edge endpoint id");
     return formatUuid(s.blob16(0));
 }
 
@@ -57,22 +57,22 @@ std::string addEdgeImpl(sqlite3* db, const std::string& author, const std::strin
                         bool preserveApproval, bool preserveRecord = false)
 {
     if (input.kind.empty())
-        throw std::runtime_error("graph db: edge kind must be non-empty");
+        throw std::runtime_error("object store: edge kind must be non-empty");
     EdgeRecord rec = input;
     if (rec.uuid.empty())
         rec.uuid = util::newUuid();
     if (rec.meta.empty())
         rec.meta = "{}";
     if (objectIdByUuid(db, parseUuid(rec.uuid)))
-        throw std::runtime_error("graph db: UUID already belongs to an object");
+        throw std::runtime_error("object store: UUID already belongs to an object");
     const auto aUuid = parseUuid(rec.aUuid);
     const auto bUuid = parseUuid(rec.bUuid);
     auto aId = objectIdByUuid(db, aUuid);
     auto bId = objectIdByUuid(db, bUuid);
-    if (!aId) throw std::runtime_error("graph db: edge endpoint not found: " + rec.aUuid);
-    if (!bId) throw std::runtime_error("graph db: edge endpoint not found: " + rec.bUuid);
+    if (!aId) throw std::runtime_error("object store: edge endpoint not found: " + rec.aUuid);
+    if (!bId) throw std::runtime_error("object store: edge endpoint not found: " + rec.bUuid);
     if (*aId == *bId)
-        throw std::runtime_error("graph db: self-edges are not allowed");
+        throw std::runtime_error("object store: self-edges are not allowed");
     if (*aId > *bId) {
         std::swap(aId, bId);
         std::swap(rec.aUuid, rec.bUuid);

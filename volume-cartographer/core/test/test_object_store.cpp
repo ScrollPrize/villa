@@ -64,10 +64,15 @@ TEST_CASE("geometry revisions preserve read snapshots and reject foreign transac
     vc::objects::GeometryData data;
     data.kind = "track";
     data.arrays.push_back({"points", "<i4", {1, 3}, std::vector<uint8_t>(12, 0)});
-    std::string first, second;
+    std::string first, second, edge;
     {
         auto w = db.write();
         first = db.putGeometry(w, id, data);
+        const auto otherId = db.upsertObject(w, makeObject("note"));
+        EdgeRecord link;
+        link.kind = "connected"; link.aUuid = id; link.bUuid = otherId;
+        edge = db.addEdge(w, link);
+        db.setApproval(w, edge, "approved");
         w.commit();
     }
     auto snapshot = db.read();
@@ -76,6 +81,9 @@ TEST_CASE("geometry revisions preserve read snapshots and reject foreign transac
         CHECK_THROWS(db.putGeometry(foreign, id, data));
         CHECK_THROWS(db.currentGeometry(foreign, id));
         CHECK_THROWS(db.objectByUuid(foreign, id));
+        CHECK_THROWS(db.edgeByUuid(foreign, edge));
+        CHECK_THROWS(db.edgeGeometryState(foreign, edge));
+        CHECK_THROWS(db.revalidateEdgeGeometry(foreign, edge));
         CHECK_THROWS(db.upsertObject(foreign, makeObject("note")));
     }
     data.arrays[0].bytes[0] = 3;
@@ -86,8 +94,12 @@ TEST_CASE("geometry revisions preserve read snapshots and reject foreign transac
     }
     CHECK(db.currentGeometry(snapshot, id)->uuid == first);
     CHECK_FALSE(db.geometryRevision(snapshot, second));
+    CHECK_FALSE(db.edgeGeometryState(snapshot, edge).stale);
+    CHECK(db.edgeByUuid(snapshot, edge)->approvalState == "approved");
     auto current = db.read();
     CHECK(db.currentGeometry(current, id)->uuid == second);
+    CHECK(db.edgeGeometryState(current, edge).stale);
+    CHECK(db.edgeByUuid(current, edge)->approvalState == "pending");
     CHECK(db.readGeometryArray(current, first, "points")[0] == 0);
     CHECK(db.readGeometryArray(current, second, "points")[0] == 3);
     CHECK(db.geometryHistory(current, id).size() == 2);

@@ -16,7 +16,6 @@
 #include "vc/core/objects/GeometryExport.hpp"
 
 namespace nb = nanobind;
-namespace vs = vc::storage;
 namespace vo = vc::objects;
 
 namespace {
@@ -80,9 +79,9 @@ nb::object bboxToPy(const std::optional<std::array<double, 6>>& box)
     return out;
 }
 
-vs::Anchor anchorFromPy(const nb::handle& obj)
+vo::Anchor anchorFromPy(const nb::handle& obj)
 {
-    vs::Anchor a;
+    vo::Anchor a;
     if (obj.is_none()) return a;
     nb::dict d = nb::cast<nb::dict>(obj);
     if (has(d, "index")) a.index = nb::cast<int64_t>(d["index"]);
@@ -97,7 +96,7 @@ vs::Anchor anchorFromPy(const nb::handle& obj)
     return a;
 }
 
-nb::dict anchorToPy(const vs::Anchor& a)
+nb::dict anchorToPy(const vo::Anchor& a)
 {
     nb::dict d;
     if (a.index) d["index"] = *a.index;
@@ -108,7 +107,7 @@ nb::dict anchorToPy(const vs::Anchor& a)
 
 nb::str pyStr(const std::string& s) { return nb::str(s.data(), s.size()); }
 
-void commonToPy(nb::dict& d, const vs::RecordCommon& r)
+void commonToPy(nb::dict& d, const vo::RecordCommon& r)
 {
     d["uuid"] = r.uuid;
     d["kind"] = r.kind;
@@ -130,7 +129,7 @@ void commonToPy(nb::dict& d, const vs::RecordCommon& r)
     d["meta"] = jsonLoads(r.meta);
 }
 
-nb::dict objectToPy(const vs::ObjectRecord& r)
+nb::dict objectToPy(const vo::ObjectRecord& r)
 {
     nb::dict d;
     commonToPy(d, r);
@@ -174,9 +173,9 @@ nb::dict objectToPy(const vs::ObjectRecord& r)
     return d;
 }
 
-vs::ObjectRecord objectFromPy(const nb::dict& d)
+vo::ObjectRecord objectFromPy(const nb::dict& d)
 {
-    vs::ObjectRecord r;
+    vo::ObjectRecord r;
     r.uuid = getStr(d, "uuid");
     r.kind = getStr(d, "kind");
     r.name = getStr(d, "name");
@@ -189,7 +188,7 @@ vs::ObjectRecord objectFromPy(const nb::dict& d)
     if (has(d, "meta")) r.meta = jsonDumps(d["meta"]);
     if (has(d, "fiber")) {
         const nb::dict f = nb::cast<nb::dict>(d["fiber"]);
-        vs::FiberDetail det;
+        vo::FiberDetail det;
         det.family = getStr(f, "family");
         det.manualFamily = getBool(f, "manual_family");
         det.controlPointCount = getInt(f, "control_point_count");
@@ -203,7 +202,7 @@ vs::ObjectRecord objectFromPy(const nb::dict& d)
     }
     if (has(d, "patch")) {
         const nb::dict p = nb::cast<nb::dict>(d["patch"]);
-        vs::PatchDetail det;
+        vo::PatchDetail det;
         det.gridWidth = getInt(p, "grid_width");
         det.gridHeight = getInt(p, "grid_height");
         if (has(p, "scale")) {
@@ -217,7 +216,7 @@ vs::ObjectRecord objectFromPy(const nb::dict& d)
     }
     if (has(d, "track")) {
         const nb::dict t = nb::cast<nb::dict>(d["track"]);
-        vs::TrackDetail det;
+        vo::TrackDetail det;
         det.datasetRef = getStr(t, "dataset_ref");
         det.externalKey = getStr(t, "external_key");
         det.family = getStr(t, "family");
@@ -229,7 +228,7 @@ vs::ObjectRecord objectFromPy(const nb::dict& d)
     return r;
 }
 
-nb::dict edgeToPy(const vs::EdgeRecord& e)
+nb::dict edgeToPy(const vo::EdgeRecord& e)
 {
     nb::dict d;
     commonToPy(d, e);
@@ -240,9 +239,9 @@ nb::dict edgeToPy(const vs::EdgeRecord& e)
     return d;
 }
 
-vs::EdgeRecord edgeFromPy(const nb::dict& d)
+vo::EdgeRecord edgeFromPy(const nb::dict& d)
 {
-    vs::EdgeRecord e;
+    vo::EdgeRecord e;
     e.uuid = getStr(d, "uuid");
     e.kind = getStr(d, "kind");
     e.aUuid = getStr(d, "a");
@@ -300,39 +299,38 @@ nb::dict geometryReportToPy(const vo::GeometryIngestReport& r)
 
 }
 namespace vc::python {
-template <typename Database>
-struct PyDatabase {
-    std::shared_ptr<Database> db;
+struct PyObjectStore {
+    std::shared_ptr<vo::ObjectStore> db;
 
-    Database& require()
+    vo::ObjectStore& require()
     {
-        if (!db) throw std::runtime_error("graph database is closed");
+        if (!db) throw std::runtime_error("object database is closed");
         return *db;
     }
 
-    static PyDatabase create(const std::string& path, const std::string& author,
+    static PyObjectStore create(const std::string& path, const std::string& author,
                                              const std::optional<std::string>& hostname, int readerPoolSize)
     {
-        vs::OpenOptions o;
+        vo::OpenOptions o;
         o.author = author;
         o.hostnameOverride = hostname;
         o.readerPoolSize = readerPoolSize;
-        PyDatabase self;
-        self.db = std::make_shared<Database>(Database::create(path, o));
+        PyObjectStore self;
+        self.db = std::make_shared<vo::ObjectStore>(vo::ObjectStore::create(path, o));
         return self;
     }
 
-    static PyDatabase open(const std::string& path, const std::optional<std::string>& author,
+    static PyObjectStore open(const std::string& path, const std::optional<std::string>& author,
                                            bool readOnly, const std::optional<std::string>& hostname,
                                            int readerPoolSize)
     {
-        vs::OpenOptions o;
+        vo::OpenOptions o;
         o.readOnly = readOnly;
         o.author = author.value_or("");
         o.hostnameOverride = hostname;
         o.readerPoolSize = readerPoolSize;
-        PyDatabase self;
-        self.db = std::make_shared<Database>(Database::open(path, o));
+        PyObjectStore self;
+        self.db = std::make_shared<vo::ObjectStore>(vo::ObjectStore::open(path, o));
         return self;
     }
 
@@ -362,11 +360,11 @@ struct PyDatabase {
         return result;
     }
 
-    std::string upsertObjectIn(Database& g, vs::WriteTxn& txn, const nb::dict& rec)
+    std::string upsertObjectIn(vo::ObjectStore& g, vo::WriteTxn& txn, const nb::dict& rec)
     {
         return g.upsertObject(txn, objectFromPy(rec));
     }
-    std::string addEdgeIn(Database& g, vs::WriteTxn& txn, const nb::dict& rec)
+    std::string addEdgeIn(vo::ObjectStore& g, vo::WriteTxn& txn, const nb::dict& rec)
     {
         return g.addEdge(txn, edgeFromPy(rec));
     }
@@ -375,23 +373,22 @@ struct PyDatabase {
 // Batch write transaction usable as a context manager:
 //   with db.write() as w: w.upsert_object(...); w.add_edge(...)
 // Commits on clean exit, rolls back on exception.
-template <typename Database>
-struct PyTransaction {
-    PyDatabase<Database>* owner = nullptr;
-    std::shared_ptr<Database> lease;
-    std::unique_ptr<vs::WriteTxn> txn;
+struct PyObjectWriteTxn {
+    PyObjectStore* owner = nullptr;
+    std::shared_ptr<vo::ObjectStore> lease;
+    std::unique_ptr<vo::WriteTxn> txn;
 
-    vs::WriteTxn& require()
+    vo::WriteTxn& require()
     {
         if (!txn) throw std::runtime_error("write transaction is finished; use it as a context manager");
         return *txn;
     }
-    PyTransaction& enter()
+    PyObjectWriteTxn& enter()
     {
         if (txn) throw std::runtime_error("transaction is already active");
         owner->require();
         lease = owner->db;
-        try { txn = std::make_unique<vs::WriteTxn>(lease->write()); }
+        try { txn = std::make_unique<vo::WriteTxn>(lease->write()); }
         catch (...) { lease.reset(); throw; }
         return *this;
     }
@@ -407,6 +404,4 @@ struct PyTransaction {
 };
 
 
-using PyObjectStore = PyDatabase<vo::ObjectStore>;
-using PyObjectWriteTxn = PyTransaction<vo::ObjectStore>;
 }

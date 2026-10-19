@@ -655,7 +655,7 @@ void validateParams(const PatchOverlapParams& params)
 
 }  // namespace
 
-DetectorReport linkPatchOverlaps(graph::GraphDb& db, const std::filesystem::path& patchesDir,
+DetectorReport linkPatchOverlaps(objects::ObjectStore& db, const std::filesystem::path& patchesDir,
                                  const PatchOverlapParams& params, const std::atomic_bool* cancel)
 {
     validateParams(params);
@@ -696,7 +696,7 @@ DetectorReport linkPatchOverlaps(graph::GraphDb& db, const std::filesystem::path
         for (const auto& patch : patches) {
             util::reportProgress(progress, "registering patches", registered++, patches.size());
             if (db.objectByUuid(txn, patch.uuid)) continue;
-            graph::ObjectRecord rec;
+            objects::ObjectRecord rec;
             rec.uuid = patch.uuid;
             rec.kind = "patch";
             rec.name = patch.path.filename().string();
@@ -705,7 +705,7 @@ DetectorReport linkPatchOverlaps(graph::GraphDb& db, const std::filesystem::path
             const auto rel = std::filesystem::relative(patch.path, dbDir, ec);
             rec.storageRef = ec ? patch.path.filename().string() : rel.string();
             rec.dataGeneration = 1;
-            graph::PatchDetail detail;
+            objects::PatchDetail detail;
             const auto* points = patch.surface->rawPointsPtr();
             detail.gridWidth = points->cols;
             detail.gridHeight = points->rows;
