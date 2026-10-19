@@ -2017,8 +2017,8 @@ build passed four applicable tests with six CUDA tests skipped.
 
 The target audit covers `fibers/data/targets.py`,
 `fibers/data/observations.py`, `fibers/data/afv_neighbors.py`, and
-`tracers/models/targets.py` in the trainer checkout. Geometry has **not** yet
-been moved into vc_reader:
+`tracers/models/targets.py` in the trainer checkout. Trainer target construction
+still uses its own geometry; general helpers are now available in vc_reader:
 
 | Work | Current result | Reusable CPU/CUDA support |
 | --- | --- | --- |
@@ -2069,12 +2069,89 @@ Existing implementation inventory, before adding geometry APIs:
   CUDA. `DistanceTransform` computes dense voxel-mask distances; it does not
   provide nearest annotated-polyline queries.
 
-No existing public packed-polyline arclength interpolation, directed
-curve/plane intersection, indexed point/segment nearest-query API, or sparse
-occupied-cell membership API was found in this audit. New APIs should expose
-these general operations with CPU/CUDA implementations and batched inputs.
+The audit found no existing public packed-polyline arclength interpolation,
+directed curve/plane intersection, indexed point/segment nearest-query API, or
+sparse occupied-cell membership API. `vc_reader.geometry` now provides those
+general operations with CPU/CUDA implementations and batched inputs.
 Fiber traversal windows, label names, endpoint interpretation and supervision
 policy are adapter concerns, not vc_reader API concepts.
+
+### General geometry helper benchmarks
+
+`bench_geometry.py` checks CPU/CUDA agreement and measures resident geometry
+operations with reusable output buffers. These are helper microbenchmarks;
+the fiber trainer has not yet been switched to the new geometry APIs, and
+these numbers are not 500-batch training times.
+
+Measured on the RTX 5090 with 512 curves / 65,536 vertices, 8,192 queries,
+three warmups and 30 repetitions. Each time includes Python validation and
+completion of the operation's CUDA stream. Index construction and upload,
+query upload, correctness downloads and profiling are outside timed queries.
+CPU queries use one native thread and release the GIL. CUDA uses the same
+float32 arithmetic with FMA contraction disabled. Results below are median
+milliseconds from `results/geometry_helpers/final.json`:
+
+| Operation | CPU ms | CUDA ms |
+| --- | ---: | ---: |
+| Arclength interpolation | 0.288 | 0.011 |
+| First directed plane crossing | 3.534 | 0.072 |
+| Nearest segment | 4.057 | 0.092 |
+| Nearest vertex | 3.675 | 0.069 |
+| Box candidates, capacity 32 | 2.170 | 0.074 |
+| Gather segment endpoints | 0.039 | 0.012 |
+| Affine transform | 0.008 | 0.009 |
+| Sparse occupancy lookup | 0.748 | 0.011 |
+| Dense occupancy materialization | 1.660 | 0.024 |
+| Sparse occupancy construction | 12.460 | 0.072 |
+
+The transform is only about eight microseconds on CPU; CUDA launch/completion
+overhead leaves it slightly slower at this size. Larger geometry operations
+benefit substantially. Repeated resident calls also benefit from hardware
+caches; these timings do not predict an end-to-end trainer speedup.
+
+The CPU curve/index build took 9.7 ms and stores 3,151,800 bytes. The first
+CUDA setup/upload call took 107.1 ms, including CUDA initialization. Occupancy
+construction uses 200,000 points across 32 grids of `(144,104,104)`. CUDA retains
+sorted duplicate keys to avoid reading a compacted count back to the CPU;
+storage is 1,600,000 bytes versus 49,840,128 bytes for the optional dense uint8
+output. CPU construction deduplicates keys (1,596,768 bytes). Both produce
+identical occupancy. Box queries similarly return fixed-capacity indices and
+total counts on the query device; `counts > capacity` reports truncation.
+
+A separate profiler pass over all resident CUDA operations, including sparse
+construction, measured **zero upload bytes, zero download bytes, and zero
+device-wide synchronization calls**. The trace is stored alongside the JSON.
+Static curve BVHs are built on CPU and uploaded once; query execution does
+not rebuild them or download query data. Geometry queries share the extracted
+surface vector/affine/nearest-cell arithmetic. The surface tile index and
+triangle rasterization retain their existing semantics.
+
+Reproduce from the vc_reader directory:
+
+```bash
+PYTHONPATH=src .venv/bin/python benchmarks/bench_geometry.py \
+  --native-dir /tmp/vc-reader-cuda --queries 8192 --reps 30 --profile \
+  --output benchmarks/results/geometry_helpers/final.json
+VC_READER_NATIVE_DIR=/tmp/vc-reader-cuda PYTHONPATH=benchmarks:src \
+  .venv/bin/python -m pytest \
+  tests/test_geometry.py tests/test_surface.py tests/test_cuda_outputs.py -q
+```
+
+Validation passed 53 tests and 12 surface subtests on the CUDA build. A CPU-only
+build passed 33 tests and six subtests, with 14 CUDA cases skipped. Independent
+references cover interpolation and crossings, brute-force nearest queries,
+singleton/duplicate vertices, exact ties, reversed intervals, invalid inputs,
+bounded box overflow, nearest-even voxel rounding, output alias rejection,
+concurrent CPU readers, resident candidate gathering and CUDA stream/lifetime behavior.
+
+Compute Sanitizer passed 29 geometry tests with **zero memory errors**. The
+wall-clock stream-overlap test is excluded from instrumentation:
+
+```bash
+VC_READER_NATIVE_DIR=/tmp/vc-reader-cuda PYTHONPATH=benchmarks:src \
+  /usr/local/cuda/bin/compute-sanitizer --tool memcheck --error-exitcode 99 \
+  .venv/bin/python -m pytest tests/test_geometry.py -q -k 'not other_stream'
+```
 
 # Native augmentation batches
 

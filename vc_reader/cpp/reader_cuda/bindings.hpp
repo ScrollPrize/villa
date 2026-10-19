@@ -34,6 +34,17 @@ inline void bind(nb::module_& m) {
         .def("array",[](nb::handle self) { return nb::cast<const Owned&>(self).array(self); })
         .def("export",[](Owned& o) { o.storage->exported=true; });
     m.def("_set_stream",[](std::uintptr_t handle) { device::current_stream()=handle ? device::stream_handle(handle) : nullptr; });
+    m.def("_cuda_empty",[](std::size_t count,const std::string& kind,std::size_t item,int id) {
+        if (count>SIZE_MAX/8 || (kind!="f" && kind!="i" && kind!="u" && kind!="b") ||
+            (item!=1 && item!=2 && item!=4 && item!=8) || (kind=="b" && item!=1) || (kind=="f" && item<2))
+            throw nb::value_error("invalid CUDA allocation dtype/size");
+        auto code=kind=="f"?nb::dlpack::dtype_code::Float:kind=="i"?nb::dlpack::dtype_code::Int:
+                  kind=="u"?nb::dlpack::dtype_code::UInt:nb::dlpack::dtype_code::Bool;
+        device::Storage storage;
+        { nb::gil_scoped_release release; device::Guard guard(id);
+          storage=device::allocate(count*item,id); device::complete(); }
+        return owned(std::move(storage),count,{std::uint8_t(code),std::uint8_t(item*8),1},id);
+    });
     nb::class_<device::Event>(m,"CudaEvent")
         .def("synchronize",&device::Event::synchronize,nb::call_guard<nb::gil_scoped_release>())
         .def("wait",&device::Event::wait)

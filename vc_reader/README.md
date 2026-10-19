@@ -89,6 +89,82 @@ reading, CUDA augmentation, and mesh-segment rendering.
 | Training integration measurements | [Training benchmark](benchmarks/training.md) |
 | Measurements and reproduction commands | [Benchmarks](benchmarks/README.md) |
 
+## Geometry queries
+
+`vc_reader.geometry` provides general batched CPU/CUDA geometry helpers.
+`PolylineSet` stores packed XYZ curves and indexes their vertices and segments
+with bounding-volume trees. Geometry and index storage are immutable and can
+be reused across batches; CPU calls release the GIL.
+
+```python
+import numpy as np
+from vc_reader.geometry import PolylineSet, VoxelSet, transform_points
+
+curves = PolylineSet(
+    np.array([[0, 0, 0], [0, 0, 10], [2, 0, 10]], np.float32),
+    np.array([0, 3], np.int64),
+)
+positions = curves.interpolate(np.array([0], np.int64), np.array([4], np.float32))
+crossings = curves.intersect_planes(
+    np.array([0], np.int64), np.array([[0, 0, 1, 5]], np.float32),
+)
+nearest = curves.nearest(np.array([[1, 0, 4]], np.float32))
+candidates = curves.query_boxes(
+    np.array([[-1, -1, 3]], np.float32),
+    np.array([[1, 1, 6]], np.float32), capacity=16,
+)
+```
+
+Interpolation returns points and validity, with finite out-of-range arclengths
+clipped to endpoints. Plane queries find the first directed crossing within
+an optional arclength interval; decreasing intervals traverse backwards.
+Nearest queries return positions, distances, arclengths, packed primitive
+indices, curve IDs and validity. They can search vertices or segments,
+restrict each query to one curve, and apply a distance bound. Box queries
+return bounding-box candidates with fixed capacity and total match counts;
+`counts > capacity` explicitly reports truncation. See method docstrings for
+crossing, tie-breaking, invalid-query and empty-input behavior.
+`gather(indices, segments=True)` retrieves candidate segment endpoints,
+arclengths and curve IDs directly from the resident index; the default gathers
+vertices. Padded indices produce invalid rows.
+
+`transform_points` applies a single affine or one per point, using the same
+CPU/CUDA arithmetic as surface sampling. `VoxelSet` stores sparse binary
+occupancy using sorted cell keys, with optional batch IDs for independent
+grids. It rounds continuous **ZYX** voxel coordinates to nearest-even cells,
+supports `contains` queries, and materializes a dense `(B,D,H,W)` uint8 mask
+only when `to_dense()` is requested. CUDA construction sorts resident points
+on device; no count download is needed.
+
+```python
+from vc_reader import cuda
+
+gpu_curves = curves.cuda()                  # Upload immutable geometry once.
+query = cuda.asarray(np.array([[1, 0, 4]], np.float32))
+result = gpu_curves.nearest(query)          # DeviceArray results, no download.
+gpu_curves.nearest(query, out=result)       # Reuse outputs on subsequent calls.
+
+cells = VoxelSet(cuda.asarray(np.array([[3.2, 4.0, 5.1]], np.float32)),
+                 shape=(144, 104, 104))
+occupied = cells.contains(cuda.asarray(np.array([[3, 4, 5]], np.float32)))
+```
+
+CUDA query arrays must already be on the index's device. Float geometry uses
+float32; IDs, offsets and cell keys use int64. Internal tree references use
+int32 to keep index storage bounded. Remove a suitable coordinate origin
+before converting large world coordinates to float32. CPU curve construction
+copies inputs, validates offsets and builds both indexes; `.cuda()` uploads
+them once. CPU occupancy indexes can also be uploaded once with `.cuda()`.
+
+All operations accept `out=` (a dictionary for multi-output queries), including
+contiguous Torch CUDA tensors. Outputs must have the documented shape/dtype
+and must not overlap inputs or each other. CUDA calls complete on the selected
+vc_reader stream before returning; finish external writes before passing shared
+arrays. Supplying Torch-owned outputs avoids native-storage export barriers.
+Neither query execution nor sparse CUDA construction implicitly downloads data.
+Create indexes in DataLoader workers; create CUDA indexes in the GPU-owning
+process. No fiber supervision rules or label names are part of these APIs.
+
 ## CT sheet normals
 
 `vc_reader.sheet_normal` implements the anisotropic structure tensor used for

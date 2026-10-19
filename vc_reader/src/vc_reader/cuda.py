@@ -129,6 +129,23 @@ def wrap(value):
     return DeviceArray(_native._cuda_view(value, shape, 0), shape, np.dtype(dtype), device)
 
 
+def empty(shape, dtype=np.float32, *, device=0):
+    """Allocate uninitialized contiguous CUDA storage, without a host buffer."""
+    if isinstance(shape, (int, np.integer)):
+        shape = (shape,)
+    shape = tuple(operator.index(n) for n in shape)
+    dtype = np.dtype(dtype)
+    if any(n < 0 for n in shape):
+        raise ValueError('negative array dimension')
+    if not dtype.isnative or dtype.kind not in 'buif':
+        raise TypeError('unsupported device dtype')
+    if not is_available():
+        raise RuntimeError('CUDA reader unavailable: build with VC_READER_ENABLE_CUDA=ON')
+    device = operator.index(device)
+    return DeviceArray(_native._cuda_empty(math.prod(shape), dtype.kind, dtype.itemsize, device),
+                       shape, dtype, device)
+
+
 def asarray(array, *, device=0):
     """Upload a native-endian NumPy array; no Torch/CuPy dependency."""
     if not is_available():

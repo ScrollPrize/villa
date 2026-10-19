@@ -1,22 +1,14 @@
 #pragma once
 #include "../aligned/common.hpp"
+#include "../geometry/math.hpp"
 #ifdef __CUDACC__
 #define VCR_SURFACE_HD __host__ __device__
 #else
 #define VCR_SURFACE_HD
 #endif
 namespace vcr::surface {
-struct V { float x,y,z;
-    VCR_SURFACE_HD V operator+(V b)const{return{x+b.x,y+b.y,z+b.z};}
-    VCR_SURFACE_HD V operator-(V b)const{return{x-b.x,y-b.y,z-b.z};}
-    VCR_SURFACE_HD V operator*(float s)const{return{x*s,y*s,z*s};}
-};
-VCR_SURFACE_HD inline float dot(V a,V b){return a.x*b.x+a.y*b.y+a.z*b.z;}
-VCR_SURFACE_HD inline V cross(V a,V b){return{a.y*b.z-a.z*b.y,a.z*b.x-a.x*b.z,a.x*b.y-a.y*b.x};}
-VCR_SURFACE_HD inline V vector(const float* p){return{p[0],p[1],p[2]};}
-VCR_SURFACE_HD inline V linear(const float* m,V p){return{dot(vector(m),p),dot(vector(m+4),p),dot(vector(m+8),p)};}
-VCR_SURFACE_HD inline V transform(const float* m,V p){return linear(m,p)+V{m[3],m[7],m[11]};}
-VCR_SURFACE_HD inline float clamp(float v){return fminf(1,fmaxf(0,v));}
+using geometry::V; using geometry::dot; using geometry::cross; using geometry::vector;
+using geometry::linear; using geometry::transform; using geometry::clamp; using geometry::nearest;
 VCR_SURFACE_HD inline float barycentric(float a,float b,float c,float u,float v){
     // Preserve constant edge coordinates, particularly clipped half-pixel ties.
     if(u==0)return a+v*(c-a);
@@ -88,10 +80,6 @@ struct Raster {
     float metric[12]{}, uv_to_label[6]{}, origin[3]{}, radius=0;
     std::int64_t label_origin[2]{};
 };
-VCR_SURFACE_HD inline std::int64_t nearest(float q,std::int64_t base){
-    float f=floorf(q);auto n=base+std::int64_t(f);float r=q-f;
-    return n+(r>.5f || (r==.5f && n%2!=0));
-}
 // One thread owns each output voxel. Batches update it serially, so selection
 // and exact categorical conflict tests never require floating-point atomics.
 template<class T> VCR_SURFACE_HD void raster(const Raster& g,const float* triangles,const std::int64_t* ids,
