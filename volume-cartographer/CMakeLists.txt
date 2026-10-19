@@ -962,11 +962,17 @@ if(VC_TESTING)
         DEPENDS ${_vc_test_targets}
         VERBATIM
         USES_TERMINAL)
+    if(TARGET test_slim_assembly)
+        add_dependencies(check test_slim_assembly)
+    endif()
 
     if(VC_ENABLE_COVERAGE)
         find_program(LLVM_PROFDATA NAMES llvm-profdata REQUIRED)
         find_program(LLVM_COV NAMES llvm-cov REQUIRED)
         get_property(_vc_coverage_targets GLOBAL PROPERTY VC_CTEST_TARGETS)
+        if(TARGET test_slim_assembly)
+            list(APPEND _vc_coverage_targets test_slim_assembly)
+        endif()
         string(REPLACE ";" "," _vc_test_targets_csv "${_vc_coverage_targets}")
         add_custom_target(coverage-report
             COMMAND ${CMAKE_COMMAND}

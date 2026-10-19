@@ -7,8 +7,6 @@
 // obtain one at http://mozilla.org/MPL/2.0/.
 #include "slim.h"
 
-#include <unordered_map>
-
 #include "boundary_loop.h"
 #include "cotmatrix.h"
 #include "edge_lengths.h"
@@ -78,6 +76,7 @@ namespace igl
                                                           Eigen::MatrixXd &uv);
     IGL_INLINE void compute_jacobians(igl::SLIMData& s, const Eigen::MatrixXd &uv);
     IGL_INLINE void build_linear_system(igl::SLIMData& s, Eigen::SparseMatrix<double> &L);
+    IGL_INLINE void build_linear_system_generic(igl::SLIMData& s, Eigen::SparseMatrix<double> &L);
     IGL_INLINE void pre_calc(igl::SLIMData& s);
 
     // Implementation
@@ -131,31 +130,15 @@ namespace igl
       //t.start();
       // solve
       Eigen::VectorXd Uc;
-      // PaStiX 6 multifrontal direct solver. We cache one solver per
-      // (SLIMData*, sparsity-pattern signature). Caching by SLIMData* alone
-      // is unsafe because s.dim changing or the user re-invoking SLIM with
-      // a different mesh would reuse a stale symbolic factorization.
-      //
-      // Signature: (rows, cols, nnz). Cheap to compute, sufficient to
-      // detect any pattern change that would invalidate analyzePattern().
-      // factorize() refreshes numerical values each iter regardless.
-      struct PastixCache {
-        igl::Pastix6LLT solver;
-        Eigen::Index rows = -1;
-        Eigen::Index cols = -1;
-        Eigen::Index nnz  = -1;
-      };
-      static std::unordered_map<const igl::SLIMData*, PastixCache> cache;
-      PastixCache& entry = cache[&s];
-      const Eigen::Index L_nnz = L.nonZeros();
-      if (entry.rows != L.rows() || entry.cols != L.cols() || entry.nnz != L_nnz) {
-        entry.solver.analyzePattern(L);
-        entry.rows = L.rows();
-        entry.cols = L.cols();
-        entry.nnz  = L_nnz;
+      /* Precomputation invalidates the owned solver even when a different
+         topology has the same vertex, face and nonzero counts. */
+      if (!s.cache.solver)
+      {
+        s.cache.solver=std::make_unique<igl::Pastix6LLT>();
+        s.cache.solver->analyzePattern(L);
       }
-      entry.solver.factorize(L);
-      Uc = entry.solver.solve(s.rhs);
+      s.cache.solver->factorize(L);
+      Uc = s.cache.solver->solve(s.rhs);
       for (int i = 0; i < s.dim; i++)
         uv.col(i) = Uc.block(i * s.v_n, 0, s.v_n, 1);
 
@@ -224,6 +207,21 @@ namespace igl
     }
 
     IGL_INLINE void build_linear_system(igl::SLIMData& s, Eigen::SparseMatrix<double> &L)
+    {
+      if (s.dim==2 && s.F.cols()==3)
+      {
+        if (!s.cache.triangles)
+          s.cache.triangles=std::make_unique<detail::TriangleAssembly>(s);
+        s.cache.triangles->update(s);
+        L=s.cache.triangles->matrix;
+        s.rhs=s.cache.triangles->rhs;
+        add_soft_constraints(s,L);
+      }
+      else
+        build_linear_system_generic(s,L);
+    }
+
+    IGL_INLINE void build_linear_system_generic(igl::SLIMData& s, Eigen::SparseMatrix<double> &L)
     {
       // formula (35) in paper
       std::vector<Eigen::Triplet<double> > IJV;
@@ -813,7 +811,16 @@ IGL_INLINE void igl::slim_precompute(
   const Eigen::MatrixXd &bc,
   double soft_p)
 {
-
+  if (F.cols()==3) igl::slim::detail::validate_triangle_input(V.rows(),F);
+  data.cache=igl::slim::Cache{};
+  data.has_pre_calc=false;
+  data.Dz.resize(0,0);
+#ifdef SLIM_CACHED
+  data.A.resize(0,0);
+  data.A_data.resize(0);
+  data.AtA.resize(0,0);
+  data.AtA_data=igl::AtA_cached_data{};
+#endif
   data.V = V;
   data.F = F;
   data.V_o = V_init;
