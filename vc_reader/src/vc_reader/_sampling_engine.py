@@ -88,7 +88,14 @@ class SamplingEngine:
         if source.role == 'label' and dtype.kind not in 'bui':
             raise TypeError('categorical sampling requires an integer/bool dtype or explicit encoding')
         shape = dict(zip(reader.axes, reader.shape))
-        storage_key = (reader.resolved.location, repr(reader.resolved.selection), reader.axes,
+        location = reader.resolved.location
+        if source.storage.locations:
+            import hashlib
+            import json
+            # Include every plane in order, hashing once so tile lookups stay
+            # constant-cost even for stacks containing thousands of files.
+            location = ('stack', hashlib.sha256(json.dumps(source.storage.locations).encode()).digest())
+        storage_key = (location, repr(reader.resolved.selection), reader.axes,
                        str(dtype), repr(source.encoding), reader.fill_value)
         direct = (not plane or planar_grid) and mapping.linear == Affine.identity().linear and all(v.is_integer() for v in mapping.translation)
         return dict(source=source, reader=reader, mapping=mapping,
@@ -265,7 +272,7 @@ class SamplingEngine:
             arrays = reader.read_many([(start[1:], size[1:]) if target['plane'] else (start, size) for start, size in shifted])
         affine_arrays = None
         if (self.backend == 'cpu' and not target['direct'] and not target['plane']
-                and target['dtype'].name == 'uint8' and reader.axes == ('z', 'y', 'x')
+                and target['dtype'].name == 'uint8' and reader._raw_axes == ('z', 'y', 'x')
                 and reader.source.encoding is None and reader._is_zarr
                 and reader.fill_value == reader._backend.fill_value):
             grids = [(size, tuple(reversed(target['mapping'].apply(tuple(reversed(start))))),

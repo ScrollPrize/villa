@@ -21,6 +21,16 @@ From the repository root, install the package with the extras used by the notebo
 python -m pip install -e '.[reader,labels,torch]'
 ```
 
+To install all optional Python dependencies, including benchmark tools, use:
+
+```bash
+python -m pip install -e '.[all]'
+```
+
+The `all` extra includes `reader`, `labels`, `transforms`, `torch`, `previews`
+and `bench` dependencies. CUDA extensions still require the
+`VC_READER_ENABLE_CUDA=ON` build option.
+
 This builds and installs the compiled extensions. The reader notebook needs NumPy
 and Pillow. The surface and training notebooks also need the `labels`
 dependencies (including tifffile),

@@ -6,6 +6,7 @@ import base64
 import hashlib
 import http.server
 import json
+import math
 import multiprocessing
 import os
 from pathlib import Path
@@ -226,6 +227,27 @@ class StorageTests(FixtureCase):
             self.assertEqual(out[1, 1], 2**40+1)
         with replace(source, fill_value=None).open() as reader:
             self.assertEqual(reader.fill_value, 2**40+1)
+
+    def test_zarr_time_selection_without_channels(self):
+        for axes in ('tyx', 'tzyx', 'zyxt'):
+            spatial_shape = (3, 4) if axes == 'tyx' else (2, 3, 4)
+            values = np.arange(math.prod(spatial_shape), dtype=np.uint16).reshape(spatial_shape)
+            for count in (1, 2):
+                with self.subTest(axes=axes, times=count):
+                    data = np.stack([values + 100*i for i in range(count)], axis=axes.index('t'))
+                    path = self.root / f'{axes}-{count}.zarr'
+                    array(path, data, {'_ARRAY_DIMENSIONS': list(axes)})
+                    source = Source('time', Storage(str(path), 'zarr'))
+                    if count > 1:
+                        source = source.with_selection(time=1)
+                    expected = values + 100*(count-1)
+                    start = (0,) * len(spatial_shape)
+                    with source.open() as reader:
+                        np.testing.assert_array_equal(reader.read(start, spatial_shape), expected)
+                        for result in reader.read_many([(start, spatial_shape)] * 2):
+                            np.testing.assert_array_equal(result, expected)
+                        np.testing.assert_array_equal(reader[...], expected)
+                        np.testing.assert_array_equal(reader[-1, ..., 1:], expected[-1, ..., 1:])
 
     def test_pyramid_selection_resolution_and_metadata_override(self):
         path = self.root / 'pyramid.zarr'

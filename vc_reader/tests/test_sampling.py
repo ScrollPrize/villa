@@ -94,6 +94,42 @@ class SamplingTests(unittest.TestCase):
     def backends(self):
         return ('cpu', 'cuda') if is_available() else ('cpu',)
 
+    def test_time_selected_zarr_direct_and_affine_sampling(self):
+        values = np.arange(3*4*5, dtype=np.uint8).reshape(3, 4, 5)
+        data = np.stack((np.zeros_like(values), values))
+        for scale in (1, 2):
+            source = self.source(f'time-{scale}', data, role='image', axes=('t', 'z', 'y', 'x'),
+                                 affine=Affine.scale(scale)).with_selection(time=1)
+            start, shape = (1, 1, 1), (2, 2, 3)
+            expected, valid = reference(values, Affine.scale(1/scale), start, shape, 1)
+            for backend in self.backends():
+                with self.subTest(scale=scale, backend=backend), open_sample(
+                        self.ref, {'selected': source}, backend=backend) as reader:
+                    result = reader.read(start, shape)['selected']
+                    np.testing.assert_allclose(host(result.data), expected, rtol=0, atol=1e-5)
+                    np.testing.assert_array_equal(host(result.valid), valid)
+
+    def test_sampling_cache_distinguishes_complete_file_stacks(self):
+        paths = {}
+        for name, value in (('common', 0), ('a', 10), ('b', 20)):
+            path = self.root / f'{name}.png'
+            Image.fromarray(np.full((4, 4), value, dtype=np.uint8)).save(path)
+            paths[name] = str(path)
+        targets = {name: Source(name, Storage(format='stack', locations=(paths['common'], paths[name])),
+                               role='image', registration=VolumeRegistration('s', 'v', affine=Affine.scale(2)))
+                   for name in ('a', 'b')}
+        for backend in self.backends():
+            for cache_bytes in (0, 1 << 20):
+                with self.subTest(backend=backend, cache_bytes=cache_bytes), open_sample(
+                        self.ref, targets, backend=backend, sampling_cache_bytes=cache_bytes) as reader:
+                    for _ in range(2):
+                        result = reader.read((1, 0, 0), (1, 2, 2))
+                        for name, value in (('a', 5), ('b', 10)):
+                            np.testing.assert_array_equal(host(result[name].data), value)
+                            self.assertTrue(host(result[name].valid).all())
+                    if cache_bytes:
+                        self.assertGreater(reader.stats()['tile_cache_hits'], 0)
+
     def test_numpy_indexing_shared_space_channels_and_validity(self):
         values = np.arange(7*8*9, dtype='uint16').reshape(7, 8, 9)
         channels = np.stack((values, values+1000, values+2000))

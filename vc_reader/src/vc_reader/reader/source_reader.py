@@ -362,7 +362,7 @@ class SourceReader:
             start, size = tuple(map(operator.index, start)), tuple(map(operator.index, size))
             if len(start) != len(self.spatial_axes) or len(size) != len(start) or any(n < 0 for n in size):
                 raise ValueError(f'start/size must have {len(self.spatial_axes)} spatial entries and nonnegative sizes')
-            if (self._is_zarr and self.axes == self.spatial_axes and self._lookup is None
+            if (self._is_zarr and self._raw_axes == self.spatial_axes and self._lookup is None
                     and self.fill_value == self._backend.fill_value):
                 return self._backend.reader.read_region(start, size)
             origin = dict(zip(self.spatial_axes, start))
@@ -473,7 +473,7 @@ class SourceReader:
     def read_many(self, regions):
         with self._errors():
             self._ready()
-            if (self._is_zarr and self.axes == self.spatial_axes and self._lookup is None
+            if (self._is_zarr and self._raw_axes == self.spatial_axes and self._lookup is None
                     and self.fill_value == self._backend.fill_value):
                 return self._backend.reader.read_regions(regions)
             return [self.read(start, size) for start, size in regions]
