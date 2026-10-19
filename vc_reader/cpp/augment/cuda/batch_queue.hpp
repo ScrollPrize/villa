@@ -38,6 +38,7 @@ class BatchQueue {
     std::vector<std::vector<std::unique_ptr<Command>>> lanes_;
     std::vector<Retired> retired_;
     std::size_t lane_ = 0;
+    std::size_t allocated_bytes_ = 0;
     bool enabled_;
     BatchQueue* previous_;
     void release() noexcept {
@@ -57,6 +58,8 @@ public:
     BatchQueue(const BatchQueue&) = delete;
     ~BatchQueue() { current = previous_; release(); }
     void lane(std::size_t i) { lane_ = i; }
+    void allocated(std::size_t bytes) { allocated_bytes_ += bytes; }
+    std::size_t allocated_bytes() const { return allocated_bytes_; }
     template<class T> void append(T command) {
         lanes_[lane_].push_back(std::make_unique<Stored<T>>(std::move(command)));
     }
@@ -84,9 +87,11 @@ public:
             }
             for (auto& lane : lanes_) lane.clear();
             release();
+            allocated_bytes_ = 0;
         } catch (...) {
             for (auto& lane : lanes_) lane.clear();
             release();
+            allocated_bytes_ = 0;
             current = this;
             throw;
         }

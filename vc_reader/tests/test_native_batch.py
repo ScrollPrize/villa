@@ -19,7 +19,8 @@ from vc_reader import augment as A, cuda
 @unittest.skipUnless(torch.cuda.is_available() and A._native.cuda_available(), 'CUDA build and device required')
 class NativeBatchTests(unittest.TestCase):
     def compare(self, transform, sample, *, targets=None, seeds=(3, 19, 107), params=None):
-        pipeline = A.Pipeline([transform], targets=targets, backend='cuda', compact=False)
+        pipeline = A.Pipeline(transform if isinstance(transform, list) else [transform],
+                              targets=targets, backend='cuda', compact=False)
         source = {key: torch.from_numpy(value.copy()).cuda() for key, value in sample.items()}
         saved = {key: value.clone() for key, value in source.items()}
         result = pipeline.batch(source, seeds=seeds, params=params)
@@ -127,6 +128,30 @@ class NativeBatchTests(unittest.TestCase):
             pipeline.batch({'image': image}, seeds=[1, 2, 3], params={'sigma': [.7, 1., -1.]})
         result = pipeline.batch({'image': image}, seeds=[1, 2, 3], params={'sigma': [.7, 1., 2.]})
         torch.testing.assert_close(result['image'], image)
+
+    def test_large_working_sets_and_pipeline_repartitioning(self):
+        image = np.random.default_rng(81).normal(size=(3, 1, 128, 128, 128)).astype(np.float32)
+        for transform in (A.Normalize('percentile'), A.Normalize('robust'), A.GibbsRinging(),
+                          A.Elastic(magnitude=2),
+                          [A.Flip(), A.GaussianBlur(A.Param('sigma')), A.GaussianNoise(.03)]):
+            with self.subTest(transform=repr(transform)):
+                self.compare(transform, {'image': image}, params={'sigma': [0., .9, 1.7]})
+
+    def test_failed_large_batch_after_completed_groups(self):
+        pipeline = A.Pipeline([A.GaussianBlur(A.Param('sigma'))], backend='cuda')
+        image = torch.ones((5, 1, 128, 128, 128), device='cuda')
+        seeds = list(range(5))
+        with self.assertRaises(ValueError):
+            pipeline.batch({'image': image}, seeds=seeds, params={'sigma': [.7, 1., 2., .9, -1.]})
+        result = pipeline.batch({'image': image}, seeds=seeds, params={'sigma': [.7, 1., 2., .9, .3]})
+        torch.testing.assert_close(result['image'], image)
+
+    def test_pipeline_groups_on_consumer_stream(self):
+        image = np.random.default_rng(82).random((9, 1, 128, 128, 128), dtype=np.float32)
+        with torch.cuda.stream(torch.cuda.Stream()):
+            self.compare([A.Flip(), A.GaussianBlur(A.Param('sigma')), A.GaussianNoise(.03)],
+                         {'image': image}, seeds=list(range(9)),
+                         params={'sigma': [0., .9, 1.7]*3})
 
 
 if __name__ == '__main__':

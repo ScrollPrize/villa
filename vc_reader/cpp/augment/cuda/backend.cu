@@ -44,19 +44,44 @@ void run_batch_steps(const Program& program, std::vector<Sample>& samples,
                      const std::map<std::string,std::vector<double>>& params,
                      const std::vector<std::shared_ptr<void>>& contexts) {
     BatchQueue queue(samples.size());
-    for (std::size_t step=0;step<program.transforms.size();++step) {
-        for (std::size_t b=0;b<samples.size();++b) {
-            queue.lane(b);
-            auto& sample=samples[b];
-            for (const auto& [name,f]:sample) require(f.pyramid.empty(),"DeepSupervision must be the last transform");
-            NamedValues values;
-            for (const auto& [name,v]:params) values[name]=v[b];
-            NamedScope named(&values);
-            Random random{split_seed(seeds[b],std::to_string(step))};
-            CompactState compact(false);
-            prepare(program.transforms[step],sample,random,{step},nullptr,compact,execute,contexts[b].get());
+    int device=0, cache_bytes=0;
+    check(cudaGetDevice(&device));
+    check(cudaDeviceGetAttribute(&cache_bytes,cudaDevAttrL2CacheSize,device));
+    // Leave cache space for resident inputs/outputs and library workspaces.
+    // Flush only between samples, after all of their dependencies are queued.
+    const auto scratch_budget=std::max<std::size_t>(1,std::size_t(cache_bytes)/4);
+    for (std::size_t first=0;first<samples.size();) {
+        // Keep a group's resident arrays hot across pipeline steps. Single
+        // stages need only the scratch bound, so pointwise batches stay fused.
+        std::size_t end=samples.size();
+        if (program.transforms.size()>1) {
+            std::size_t resident_bytes=0;
+            end=first;
+            do {
+                const auto& session=*static_cast<Session*>(contexts[end].get());
+                std::size_t bytes=0;
+                for (const auto& [name,array]:session.arrays) bytes+=array.size()*array.bytes;
+                if (end>first && resident_bytes+bytes>std::size_t(cache_bytes)/2) break;
+                resident_bytes+=bytes;
+                ++end;
+            } while (end<samples.size());
         }
-        queue.flush();
+        for (std::size_t step=0;step<program.transforms.size();++step) {
+            for (std::size_t b=first;b<end;++b) {
+                queue.lane(b);
+                auto& sample=samples[b];
+                for (const auto& [name,f]:sample) require(f.pyramid.empty(),"DeepSupervision must be the last transform");
+                NamedValues values;
+                for (const auto& [name,v]:params) values[name]=v[b];
+                NamedScope named(&values);
+                Random random{split_seed(seeds[b],std::to_string(step))};
+                CompactState compact(false);
+                prepare(program.transforms[step],sample,random,{step},nullptr,compact,execute,contexts[b].get());
+                if (queue.allocated_bytes()>=scratch_budget) queue.flush();
+            }
+            queue.flush();
+        }
+        first=end;
     }
     for (const auto& context:contexts) finish_device(context.get());
 }

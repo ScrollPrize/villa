@@ -1758,50 +1758,107 @@ PYTHONPATH=src python benchmarks/bench_batch_augmentations.py \
   --warmup 5 --reps 20 --profile --output /tmp/batch-augmentations.json
 ```
 
-Measured on 2026-10-19 with an RTX 5090, CUDA 13.3, and PyTorch
-2.14.1+cu130, against commit `f8e1bc05b`. Both builds used the same real
-PHercParis4 level-2 crop at `(9000, 3600, 3600)`, repeated across the batch,
-one float32 channel, five warmups and 30 timed calls. Reading and upload were
-excluded. The table reports median milliseconds at B=16; speedup is baseline
-latency divided by batch latency, so values below 1 indicate a regression.
+Measured on 2026-10-19 with an RTX 5090, CUDA 13.3, PyTorch
+2.14.1+cu130, and Release builds. The baseline is commit `483cb17f5`.
+Both builds use one float32 channel from the real PHercParis4 level-2 crop at
+`(9000, 3600, 3600)`, repeated across each batch. There are five warmups and
+30 timed calls at 64³/128³, and 15 at 256³. No compilation or correctness
+checks run concurrently with these timings. Profiling is a separate call.
 
-| Operation | 64³ baseline → batch (ms) | Speedup | 128³ baseline → batch (ms) | Speedup |
-|---|---:|---:|---:|---:|
-| brightness | 0.303 → 0.131 | 2.31× | 0.541 → 0.459 | 1.18× |
-| noise | 0.295 → 0.137 | 2.15× | 0.638 → 0.453 | 1.41× |
-| blur | 0.617 → 0.358 | 1.72× | 1.429 → 1.584 | 0.90× |
-| normalize | 0.816 → 0.456 | 1.79× | 2.014 → 1.172 | 1.72× |
-| percentile | 0.990 → 0.899 | 1.10× | 2.447 → 6.290 | 0.39× |
-| affine | 0.429 → 0.299 | 1.44× | 1.660 → 1.731 | 0.96× |
-| elastic | 1.542 → 1.534 | 1.01× | 3.720 → 7.190 | 0.52× |
-| equalize | 1.348 → 0.592 | 2.28× | 3.666 → 3.151 | 1.16× |
-| fft | 0.842 → 0.555 | 1.52× | 2.724 → 5.711 | 0.48× |
-| pipeline | 0.772 → 0.510 | 1.51× | 2.294 → 3.039 | 0.75× |
+At 128³/B=16, entries are **mean / median / p95 milliseconds**. Speedup uses
+median latency; values below 1 indicate a regression.
 
-Launch reduction does not guarantee a latency improvement. At 64³/B=16,
-brightness uses one augmentation kernel; total non-copy GPU events fall from
-48 to 3 (including validation and status initialization). Blur falls from
-96 to 7 events and the four-transform pipeline from 144 to 11. The profiler
-count excludes memcpy events and includes memset events; it is not a count
-of augmentation kernels alone. The launch-count test also covers B=65, which
-uses device-buffer descriptors instead of inline launch parameters.
+| Operation | Before (ms) | After (ms) | Speedup |
+|---|---:|---:|---:|
+| brightness | 0.473 / 0.458 / 0.550 | 0.482 / 0.456 / 0.580 | 1.00× |
+| noise | 0.470 / 0.453 / 0.570 | 0.462 / 0.453 / 0.514 | 1.00× |
+| blur | 1.654 / 1.585 / 1.992 | 1.082 / 1.043 / 1.196 | 1.52× |
+| normalize | 1.208 / 1.176 / 1.340 | 1.202 / 1.171 / 1.333 | 1.00× |
+| percentile | 6.209 / 6.262 / 6.688 | 2.220 / 2.220 / 2.335 | 2.82× |
+| affine | 1.811 / 1.784 / 1.987 | 1.693 / 1.628 / 1.943 | 1.10× |
+| elastic | 7.049 / 7.037 / 7.559 | 3.868 / 3.708 / 4.351 | 1.90× |
+| equalize | 3.052 / 3.119 / 3.465 | 3.125 / 3.010 / 3.538 | 1.04× |
+| fft | 5.617 / 5.663 / 5.954 | 2.522 / 2.448 / 2.866 | 2.31× |
+| pipeline | 3.156 / 3.034 / 3.544 | 2.412 / 2.409 / 2.497 | 1.26× |
 
-At 128³/B=16, percentile, elastic and FFT remain substantial regressions.
-The batch executor retains scratch for a whole stage, and sorting and FFTs
-pack data across samples. These increase working sets and memory traffic;
-the current implementation should not be treated as a universal throughput
-improvement. Arbitrary shape changes and `OneOf` branch optimization remain
-outside this work's scope.
+Small-crop and larger-crop checks, median milliseconds:
 
-The final CUDA correctness run passed 55 tests and 2,955 subtests across
-`test_torch.py`, `test_native_batch.py`, `test_dimensions.py`, and
-`test_precision.py`. A focused Compute Sanitizer memcheck passed two tests
-and four subtests with zero errors, filtering for batched kernels and covering
-large scans, signed order statistics, and exception cleanup. This was not a
-full sanitizer run of every transform.
+| Operation | 64³/B=16 before → after | 256³/B=4 before → after |
+|---|---:|---:|
+| brightness | 0.132 → 0.129 | — |
+| noise | 0.136 → 0.135 | — |
+| blur | 0.358 → 0.359 | 2.850 → 2.251 |
+| normalize | 0.455 → 0.453 | — |
+| percentile | 0.891 → 0.844 | 12.903 → 3.931 |
+| affine | 0.299 → 0.298 | — |
+| elastic | 1.517 → 1.257 | 12.042 → 8.215 |
+| equalize | 0.593 → 0.594 | — |
+| fft | 0.557 → 0.571 | 15.415 → 8.909 |
+| pipeline | 0.507 → 0.512 | 6.566 → 5.308 |
 
-Local raw timing samples and profiler event names are in
-`results/native_batch/{baseline,candidate}_{64,128}.json`, with derived
-comparisons in `results/native_batch/comparison.json`. These generated reports
-are ignored by Git. Reproduce with the command above, adding `--reps 30` and
-running both sizes against both build directories.
+The queue now tracks allocated bytes and flushes completed samples at a
+quarter of the device's L2 capacity, reserving space for resident arrays and
+library workspaces. Multi-step pipelines process groups whose resident input
+arrays fit within half of L2. These are scheduling targets: a single sample
+can exceed them, and the queue never splits a sample at a budget boundary.
+Small pointwise batches still share one augmentation launch, including the
+B=65 descriptor-buffer test.
+
+Sorts with at least 1,048,576 keys use per-sample CUB radix sorting with shared
+scratch, avoiding float32 keys enlarged by sample tags and pack/unpack passes.
+FFTs at that size also execute in place per sample, avoiding four spectrum
+packing passes for a forward/inverse pair. Smaller jobs retain packed batching.
+No precision, random parameters, or interpolation algorithms change.
+
+Profiler hotspots at 128³/B=16 support the memory-traffic diagnosis: FFT copy
+kernels fall from 1.508 ms to 0.058 ms; radix-sort sweep kernels from 1.754 ms
+to 0.728 ms; elastic field centering/scaling from 0.495 ms to 0.344 ms.
+The timings include all events with the relevant kernel name, including final
+output copies, and are separate from the public-call latency measurements.
+
+These measurements cover one GPU, not all cache sizes or workloads. At 64³,
+FFT is about 2.5% slower and the pipeline about 1% slower; other unchanged
+small-crop cases are effectively flat. Against the separate pre-batching build
+`f8e1bc05b`, the 128³ pipeline remains slightly slower (2.409 vs 2.327 ms),
+while elastic is 3.708 vs 3.781 ms and affine 1.628 vs 1.627 ms. Arbitrary shape
+changes and `OneOf` branch optimization remain outside this work's scope.
+
+Build and reproduce from `vc_reader/` using the existing environment:
+
+```bash
+cmake --build /tmp/vc-reader-native-batch-build --target _augment -j 8
+PYTHONPATH=src /home/sean/Documents/villa2/villa/vc_reader/.venv/bin/python \
+  benchmarks/bench_batch_augmentations.py \
+  --native-dir /tmp/vc-reader-native-batch-build \
+  --array /mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr \
+  --level 2 --start 9000 3600 3600 --size 128 --batches 1 4 16 \
+  --warmup 5 --reps 30 --profile --output /tmp/vcr-batch-after-128.json
+PYTHONPATH=src VC_READER_NATIVE_DIR=/tmp/vc-reader-native-batch-build \
+  /home/sean/Documents/villa2/villa/vc_reader/.venv/bin/python -m pytest -q \
+  tests/test_native_batch.py tests/test_torch.py tests/test_dimensions.py \
+  tests/test_precision.py tests/test_augment_benchmark.py
+```
+
+Repeat with `--size 64`; for 256³ use `--batches 1 4 --reps 15
+--cases blur percentile elastic fft pipeline`. Baseline commands use
+`--native-dir /tmp/vcr-batch-perf-before`, a preserved copy of the baseline
+extensions. Raw observations, mean/median/p95/min/max, commands, and per-kernel
+counts and durations are in the Git-ignored directory
+`results/native_batch_optimized/{before,after}_{64,128,256}.json`.
+
+Validation passed **63 tests and 2,960 subtests**. Added cases cover signed
+large-volume percentile/robust statistics, FFTs, elastic deformation, varied
+parameters and skipped stages, batch repartitioning, multi-step pipelines on a
+consumer stream, and failure cleanup after earlier groups have executed.
+
+The focused CUDA memory check passed all three new large-volume tests and five
+subtests with **zero errors**. It does not cover every augmentation under the
+sanitizer:
+
+```bash
+PYTHONPATH=src VC_READER_NATIVE_DIR=/tmp/vc-reader-native-batch-build \
+  /usr/local/cuda/bin/compute-sanitizer --tool memcheck --error-exitcode 99 \
+  /home/sean/Documents/villa2/villa/vc_reader/.venv/bin/python -m pytest -q \
+  tests/test_native_batch.py \
+  -k 'large_working_sets or failed_large_batch or pipeline_groups'
+```

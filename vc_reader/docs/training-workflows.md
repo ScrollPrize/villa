@@ -188,18 +188,22 @@ output = pipeline.batch({"image": cuda_images}, seeds=[11, 12],
 `Param` works wherever a transform accepts a scalar distribution. For a single
 CPU or CUDA sample, pass scalar values with `pipeline(sample, seed=11,
 params={"contrast": 0.8, "noise": 0.0})`. Recorded replay plans retain the
-resolved values. The native executor applies each pipeline step across the
-batch and combines compatible kernel stages into one launch. Each sample keeps
+resolved values. The native executor groups samples using the device's L2
+cache size and combines compatible kernel stages into one launch. Each sample keeps
 its own parameters, RNG, channel statistics and target alignment. Gaussian
 filters retain separate axis passes, reductions retain collection and finish
-passes, and FFT transforms use batched cuFFT plans. Different filter variants
+passes, and small FFT transforms use batched cuFFT plans. Large sorts and FFTs
+run directly on each sample to avoid packing and enlarged working sets. Different filter variants
 or selected branches can require separate groups. There is no promise of one
 kernel for an entire transform or pipeline, or for arbitrary ragged outputs.
 Deferred status flags are downloaded together at completion.
 
 Foreground selection, component selection and median quantization keep their
-intermediate decisions on the GPU. Scratch storage lives through the current
-pipeline step and is released on the caller's CUDA stream. Batch results are
+intermediate decisions on the GPU. Queued allocations are tracked and completed
+sample groups are flushed once they reach a quarter of L2 capacity. This is a
+scheduling target, not a hard allocation limit: a single sample can exceed it.
+Multi-step pipelines also group resident arrays within half of L2 capacity.
+Scratch is released on the caller's CUDA stream. Batch results are
 ordinary PyTorch-owned tensors; input tensors are preserved.
 Input validation and copying share one pass. Transforms that retain their
 working allocation return that tensor directly, avoiding a final stacking copy.

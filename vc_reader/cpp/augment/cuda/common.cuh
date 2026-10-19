@@ -27,9 +27,10 @@ template<class T> struct Buffer {
         int supported = 0;
         check(cudaDeviceGetAttribute(&supported,cudaDevAttrMemoryPoolsSupported,device));
         pooled = supported;
-        if (pooled) { check(cudaMallocAsync(&ptr,n*sizeof(T),stream)); return; }
+        if (pooled) check(cudaMallocAsync(&ptr,n*sizeof(T),stream)); else
 #endif
         check(cudaMalloc(&ptr,n*sizeof(T)));
+        if (BatchQueue::current) BatchQueue::current->allocated(n*sizeof(T));
     }
     explicit Buffer(const std::vector<T>& v) : Buffer(v.size()) { upload(v.data()); }
     Buffer(T* data, std::size_t n) : ptr(data),size(n),borrowed(true) { check(cudaGetDevice(&device)); }

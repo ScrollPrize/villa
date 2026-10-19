@@ -56,6 +56,12 @@ template<class T,int D> struct FFTJob {
     }
     static void run(const std::vector<const FFTJob*>& jobs) {
         const auto& first=*jobs.front();
+        // A large transform has enough parallelism on its own. Execute in
+        // place instead of copying every spectrum into and out of a batch.
+        if (jobs.size()>1 && first.grid.size>=1024*1024) {
+            for (const auto* job:jobs) run({job});
+            return;
+        }
         Buffer<vd::ComplexT<T>> packed(jobs.size()>1 ? first.grid.size*jobs.size() : 0);
         auto* values=jobs.size()>1?packed.ptr:first.data;
         if (jobs.size()>1) {

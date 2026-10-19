@@ -27,11 +27,20 @@ template<class K> struct SortJob {
     K* output;
     std::size_t size;
     static void run(const std::vector<const SortJob*>& jobs) {
-        if (jobs.size()==1) {
-            const auto& j=*jobs.front();std::size_t bytes=0;
-            check(cub::DeviceRadixSort::SortKeys(nullptr,bytes,j.input,j.output,j.size,0,int(sizeof(K)*8),vcr::device::stream()));
+        // Large arrays already occupy the GPU. Sorting them directly avoids
+        // sample tags, pack/unpack passes and the enlarged radix working set.
+        if (jobs.size()==1 || std::any_of(jobs.begin(),jobs.end(),[](const auto* j){return j->size>=1024*1024;})) {
+            std::size_t bytes=0;
+            for (const auto* j:jobs) {
+                std::size_t needed=0;
+                check(cub::DeviceRadixSort::SortKeys(nullptr,needed,j->input,j->output,j->size,0,int(sizeof(K)*8),vcr::device::stream()));
+                bytes=std::max(bytes,needed);
+            }
             Buffer<std::byte> scratch(bytes);
-            check(cub::DeviceRadixSort::SortKeys(scratch.ptr,bytes,j.input,j.output,j.size,0,int(sizeof(K)*8),vcr::device::stream()));
+            for (const auto* j:jobs) {
+                auto available=bytes;
+                check(cub::DeviceRadixSort::SortKeys(scratch.ptr,available,j->input,j->output,j->size,0,int(sizeof(K)*8),vcr::device::stream()));
+            }
             return;
         }
         std::vector<std::size_t> offsets{0};

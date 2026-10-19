@@ -72,10 +72,13 @@ def main():
                                                        torch.profiler.ProfilerActivity.CUDA]) as profile:
                     pipeline.batch({'image': source}, seeds=seeds)
                 kernels = {}
+                kernel_us = {}
                 for event in profile.events():
                     if event.device_type == torch.autograd.DeviceType.CUDA and not event.name.startswith('Memcpy'):
                         kernels[event.name] = kernels.get(event.name, 0)+1
+                        kernel_us[event.name] = kernel_us.get(event.name, 0.)+event.device_time_total
                 row['gpu_events'] = kernels
+                row['gpu_time_us'] = kernel_us
                 row['gpu_event_count'] = sum(kernels.values())
             report['results'][f'{name}/B{count}'] = row
             args.output.write_text(json.dumps(report, indent=2)+'\n')
