@@ -1178,6 +1178,38 @@ private slots:
         manager.setTheme(QStringLiteral("classic"), false);
     }
 
+    void docsMatchTheEngine()
+    {
+        QFile file(QStringLiteral(VC3D_THEME_DOCS));
+        QVERIFY2(file.open(QIODevice::ReadOnly), VC3D_THEME_DOCS);
+        const QString docs = QString::fromUtf8(file.readAll());
+        const auto& tokens = builtinTokens();
+        for (auto it = tokens.begin(); it != tokens.end(); ++it) {
+            QVERIFY2(docs.contains(QStringLiteral("| `%1` |").arg(it.key())),
+                     qPrintable(QStringLiteral("token %1 is missing from the docs").arg(it.key())));
+        }
+
+        // The accent recipe works when copied as is, and sets every accent token.
+        const qsizetype section = docs.indexOf(QStringLiteral("### Change the accent"));
+        QVERIFY(section >= 0);
+        const qsizetype start = docs.indexOf(QStringLiteral("```json\n"), section) + 8;
+        const qsizetype end = docs.indexOf(QStringLiteral("```"), start);
+        ThemeProblems problems;
+        const auto theme = parseTheme(docs.mid(start, end - start).toUtf8(),
+                                      QStringLiteral("/tmp/ocean-night.vc3dtheme"),
+                                      QStringLiteral("ocean-night"), ThemeSource::User, &problems);
+        QVERIFY2(theme && problems.isEmpty(), qPrintable(formatProblems(problems)));
+        ThemeRegistry registry;
+        const auto resolved = registry.resolve(*theme, &problems);
+        QVERIFY(resolved && checkRendering(*resolved, &problems) && problems.isEmpty());
+        for (auto it = tokens.begin(); it != tokens.end(); ++it) {
+            if (it.key().contains(QStringLiteral("accent")) || it.key().startsWith(QStringLiteral("focus")) ||
+                it.key().startsWith(QStringLiteral("selection"))) {
+                QVERIFY2(theme->tokens.contains(it.key()), qPrintable(it.key()));
+            }
+        }
+    }
+
     void importAndExportThroughManager()
     {
         QTemporaryDir user;

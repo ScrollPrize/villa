@@ -128,6 +128,9 @@ target_include_directories(test_theme_engine PRIVATE
     ${PROJECT_SOURCE_DIR}/apps/VC3D
     ${PROJECT_SOURCE_DIR}/core/include)
 
+target_compile_definitions(test_theme_engine PRIVATE
+    VC3D_THEME_DOCS="${PROJECT_SOURCE_DIR}/docs/vc3d_themes.md")
+
 target_link_libraries(test_theme_engine PRIVATE
     Qt6::Core
     Qt6::Gui
