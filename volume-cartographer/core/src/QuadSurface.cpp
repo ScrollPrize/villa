@@ -3312,7 +3312,42 @@ void QuadSurface::rotate(float angleDeg)
         return;
     }
 
-    // Compute rotation center (center of the image)
+    // Quarter turns are exact grid permutations. Do them as such so every
+    // vertex keeps its exact coordinates and no vertex next to a hole is
+    // dropped by the bilinear "all four neighbours valid" rule.
+    // Direction matches cv::getRotationMatrix2D below (positive = counter-
+    // clockwise in grid index space, x right / y down).
+    {
+        double a = std::fmod(static_cast<double>(angleDeg), 360.0);
+        if (a < 0.0) a += 360.0;
+        const double quarter = std::round(a / 90.0);
+        if (std::abs(a - quarter * 90.0) < 1e-3) {
+            const int k = static_cast<int>(quarter) % 4;
+            if (k == 0) {
+                return;
+            }
+            const int code = (k == 1) ? cv::ROTATE_90_COUNTERCLOCKWISE
+                           : (k == 2) ? cv::ROTATE_180
+                                      : cv::ROTATE_90_CLOCKWISE;
+            cv::Mat_<cv::Vec3f> rotatedPoints;
+            cv::rotate(*_points, rotatedPoints, code);
+            *_points = rotatedPoints;
+            for (auto& [name, channel] : _channels) {
+                if (channel.empty()) continue;
+                cv::Mat rotatedChannel;
+                cv::rotate(channel, rotatedChannel, code);
+                channel = rotatedChannel;
+            }
+            if (k % 2 == 1) {
+                std::swap(_scale[0], _scale[1]);
+            }
+            invalidateCache();
+            return;
+        }
+    }
+
+    // Rotate about the centre of the vertex grid. Vertices sit at integer
+    // indices 0..cols-1 / 0..rows-1, so the centre is ((cols-1)/2, (rows-1)/2).
     cv::Point2f center(
         static_cast<float>(_points->cols - 1) / 2.0f,
         static_cast<float>(_points->rows - 1) / 2.0f
@@ -3321,15 +3356,39 @@ void QuadSurface::rotate(float angleDeg)
     // Get rotation matrix
     cv::Mat rotMat = cv::getRotationMatrix2D(center, angleDeg, 1.0);
 
-    // Calculate bounding box of rotated image
-    cv::Rect2f bbox = cv::RotatedRect(center, _points->size(), angleDeg).boundingRect2f();
-
-    // Adjust rotation matrix to translate image to center of new canvas
-    rotMat.at<double>(0, 2) += bbox.width / 2.0 - center.x;
-    rotMat.at<double>(1, 2) += bbox.height / 2.0 - center.y;
+    // Size the new canvas from the extent of the rotated vertex corners and
+    // map the grid centre onto the canvas centre ((W-1)/2, (H-1)/2). The old
+    // code used the pixel-area bounding box of a cols x rows image and its
+    // half size, which put the whole grid half a cell off: every output vertex
+    // was a blend of four input vertices (even for a 180 degree turn), and any
+    // vertex next to a hole was dropped.
+    double minX = std::numeric_limits<double>::infinity();
+    double minY = std::numeric_limits<double>::infinity();
+    double maxX = -std::numeric_limits<double>::infinity();
+    double maxY = -std::numeric_limits<double>::infinity();
+    for (const cv::Point2d c : {cv::Point2d(0, 0),
+                                cv::Point2d(_points->cols - 1, 0),
+                                cv::Point2d(0, _points->rows - 1),
+                                cv::Point2d(_points->cols - 1, _points->rows - 1)}) {
+        const double x = rotMat.at<double>(0, 0) * c.x + rotMat.at<double>(0, 1) * c.y + rotMat.at<double>(0, 2);
+        const double y = rotMat.at<double>(1, 0) * c.x + rotMat.at<double>(1, 1) * c.y + rotMat.at<double>(1, 2);
+        minX = std::min(minX, x); maxX = std::max(maxX, x);
+        minY = std::min(minY, y); maxY = std::max(maxY, y);
+    }
+    constexpr double kSizeEpsilon = 1e-6;
+    auto canvasExtent = [&](double extent, int srcCount) {
+        int n = static_cast<int>(std::ceil(extent - kSizeEpsilon)) + 1;
+        // Keep the centre on the same lattice as the source centre (a vertex
+        // for odd sizes, a cell midpoint for even sizes).
+        if ((n - 1) % 2 != (srcCount - 1) % 2) ++n;
+        return n;
+    };
+    const cv::Size dstSize(canvasExtent(maxX - minX, _points->cols),
+                           canvasExtent(maxY - minY, _points->rows));
+    rotMat.at<double>(0, 2) += (dstSize.width - 1) / 2.0 - center.x;
+    rotMat.at<double>(1, 2) += (dstSize.height - 1) / 2.0 - center.y;
 
     // Rotate points without blending invalid sentinels into finite coordinates.
-    const cv::Size dstSize = bbox.size();
     cv::Mat_<cv::Vec3f> rotatedMat =
         warpAffinePointsLinearPreservingInvalids(*_points, rotMat, dstSize);
 

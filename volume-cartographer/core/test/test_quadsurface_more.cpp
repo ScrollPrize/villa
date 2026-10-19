@@ -367,3 +367,50 @@ TEST_CASE("lookupDepthIndex returns finite value or NAN; no crash")
     float v = lookupDepthIndex(&qs, 4, 4);
     CHECK((std::isfinite(v) || std::isnan(v)));
 }
+
+TEST_CASE("rotate by quarter turns is exact and keeps every valid vertex")
+{
+    // Non-square grid with a hole, so a half-cell shift or a lost vertex shows.
+    cv::Mat_<cv::Vec3f> pts(7, 11);
+    for (int r = 0; r < pts.rows; ++r)
+        for (int c = 0; c < pts.cols; ++c)
+            pts(r, c) = cv::Vec3f(20.f * c, 20.f * r, float(r * 100 + c));
+    pts(3, 5) = cv::Vec3f(-1.f, -1.f, -1.f);
+
+    struct Case { float angle; int code; };
+    for (const Case tc : {Case{90.f, cv::ROTATE_90_COUNTERCLOCKWISE},
+                          Case{180.f, cv::ROTATE_180},
+                          Case{270.f, cv::ROTATE_90_CLOCKWISE},
+                          Case{-90.f, cv::ROTATE_90_CLOCKWISE}}) {
+        QuadSurface qs(pts.clone(), cv::Vec2f(0.05f, 0.04f));
+        const int validBefore = qs.countValidPoints();
+        qs.rotate(tc.angle);
+        cv::Mat_<cv::Vec3f> expected;
+        cv::rotate(pts, expected, tc.code);
+        const auto* p = qs.rawPointsPtr();
+        REQUIRE(p);
+        REQUIRE(p->size() == expected.size());
+        CHECK(qs.countValidPoints() == validBefore);
+        CHECK(cv::norm(*p, expected, cv::NORM_INF) == 0.0);
+        const bool quarter = (tc.angle != 180.f);
+        CHECK(qs.scale()[0] == doctest::Approx(quarter ? 0.04f : 0.05f));
+        CHECK(qs.scale()[1] == doctest::Approx(quarter ? 0.05f : 0.04f));
+    }
+}
+
+TEST_CASE("rotate by an arbitrary angle keeps the centre vertex on a vertex")
+{
+    cv::Mat_<cv::Vec3f> pts(21, 21);
+    for (int r = 0; r < pts.rows; ++r)
+        for (int c = 0; c < pts.cols; ++c)
+            pts(r, c) = cv::Vec3f(20.f * c, 20.f * r, 0.f);
+    QuadSurface qs(pts.clone(), cv::Vec2f(0.05f, 0.05f));
+    qs.rotate(45.f);
+    const auto* p = qs.rawPointsPtr();
+    REQUIRE(p);
+    REQUIRE(p->cols % 2 == 1);
+    REQUIRE(p->rows % 2 == 1);
+    const cv::Vec3f centre = (*p)(p->rows / 2, p->cols / 2);
+    CHECK(centre[0] == doctest::Approx(200.f).epsilon(1e-4));
+    CHECK(centre[1] == doctest::Approx(200.f).epsilon(1e-4));
+}
