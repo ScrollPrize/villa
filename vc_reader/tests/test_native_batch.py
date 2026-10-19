@@ -71,6 +71,78 @@ class NativeBatchTests(unittest.TestCase):
         self.compare(A.GaussianBlur(A.Param('sigma')), {'image': image}, params={'sigma': [0., .3, 2.]})
         self.compare(A.BrightnessAdd(.1, p=.5, p_channel=.5), {'image': image})
         self.compare(A.GaussianNoise(.1, p=.5, p_channel=.5), {'image': image})
+        # Cross the inline-weight, tiled-filter and general-filter boundaries
+        # within one batch, including channels and nonuniform axis lengths.
+        for dtype in (np.float32, np.float64):
+            self.compare(A.GaussianBlur(A.Param('sigma'), full_width=False, truncate=1),
+                         {'image': image.astype(dtype)}, params={'sigma': [8., 9., 33.]})
+
+    def test_packed_status_errors_and_recovery(self):
+        pipeline = A.Pipeline([A.GaussianBlur(.9)], backend='cuda')
+        for count in (2, 16, 65):
+            with self.subTest(batch=count), torch.cuda.stream(torch.cuda.Stream()):
+                image = torch.ones((count, 1, 7, 9), device='cuda')
+                valid = torch.ones_like(image)
+                seeds = list(range(count))
+                image[-1, 0, -1, -1] = float('nan')
+                with self.assertRaisesRegex(ValueError, 'nonfinite'):
+                    pipeline.batch({'image': image}, seeds=seeds)
+                image.fill_(1)
+                valid[count//2, 0, -1, -1] = 2
+                with self.assertRaisesRegex(ValueError, 'zero or one'):
+                    pipeline.batch({'image': image, 'padding_mask': valid}, seeds=seeds)
+                valid.fill_(1)
+                image[-1, 0, -1, -1] = torch.finfo(torch.float32).max
+                with self.assertRaisesRegex(ValueError, 'values too large'):
+                    pipeline.batch({'image': image}, seeds=seeds)
+                image.fill_(1)
+                result = pipeline.batch({'image': image, 'padding_mask': valid}, seeds=seeds)
+                torch.testing.assert_close(result['image'], image)
+
+    def test_reflections_preserve_values(self):
+        # Odd extents exercise fixed points; mixed extents combine bit-based
+        # and general address mapping. Labels must retain their integer bits.
+        for shape in ((1, 9), (16, 32), (7, 16), (5, 7, 9), (3, 8, 16), (8, 1, 16)):
+            names = 'zyx'[-len(shape):]
+            count = 3*2*int(np.prod(shape))
+            image = np.arange(count, dtype=np.float32).reshape(3, 2, *shape)
+            image.reshape(-1)[::7] = -0.
+            labels = np.arange(count, dtype=np.int64).reshape(image.shape)+(1 << 40)
+            valid = np.ones((3, 1, *shape), dtype=np.float32)
+            valid.reshape(-1)[::11] = -0.
+            source = {key: torch.from_numpy(value).cuda()
+                      for key, value in {'image': image, 'mask': labels, 'padding_mask': valid}.items()}
+            saved = {key: value.clone() for key, value in source.items()}
+            for bits in range(1 << len(shape)):
+                selected = ''.join(name for a, name in enumerate(names) if bits & (1 << a))
+                dimensions = tuple(2+a for a in range(len(shape)) if bits & (1 << a))
+                pipeline = A.Pipeline([A.Flip(axes=selected, p_axis=1 if bits else 0)],
+                                      targets={'image': A.Image(valid=None), 'mask': A.Label(),
+                                               'padding_mask': A.ValidMask()}, backend='cuda')
+                with self.subTest(shape=shape, axes=selected):
+                    result = pipeline.batch(source, seeds=[3, 19, 107])
+                    for key, value in source.items():
+                        expected = torch.flip(value, dimensions)
+                        if key == 'padding_mask':
+                            expected = (expected >= 1).to(expected.dtype)
+                        torch.testing.assert_close(result[key], expected, atol=0, rtol=0)
+                        if key != 'mask':
+                            torch.testing.assert_close(torch.signbit(result[key]), torch.signbit(expected))
+                        torch.testing.assert_close(value, saved[key], atol=0, rtol=0)
+
+    def test_reflections_retain_batch_storage(self):
+        # A reflection should keep the preallocated batch output all the way
+        # through export instead of requiring a second full-volume copy.
+        pipeline = A.Pipeline([A.Flip(p_axis=1)], backend='cuda')
+        image = torch.arange(3*2*17*19, device='cuda', dtype=torch.float32).reshape(3, 2, 17, 19)
+        pipeline.batch({'image': image}, seeds=[1, 2, 3])
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                               torch.profiler.ProfilerActivity.CUDA]) as profile:
+            result = pipeline.batch({'image': image}, seeds=[1, 2, 3])
+        copies = [event.name for event in profile.events()
+                  if event.device_type == torch.autograd.DeviceType.CUDA and 'copy_bytes_launch' in event.name]
+        self.assertEqual(copies, [])
+        torch.testing.assert_close(result['image'], torch.flip(image, (-2, -1)), atol=0, rtol=0)
 
     def test_data_dependent_selection_and_empty_foreground(self):
         image = np.random.default_rng(10).random((3, 1, 11, 13), dtype=np.float32)

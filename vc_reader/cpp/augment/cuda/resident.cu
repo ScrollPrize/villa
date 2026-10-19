@@ -33,24 +33,54 @@ void Session::check_status() {
     if (geometry) geometry->download(&c);
     validate_status(a,b,c);
 }
+struct gather_status_launch {
+    __device__ void operator()(KernelIndex, int* output, const int* checks,
+                               const int* nonfinite, const int* geometry) const {
+        output[0]=checks ? *checks : 0;
+        output[1]=nonfinite ? *nonfinite : 0;
+        output[2]=geometry ? *geometry : 0;
+    }
+};
 void check_devices(const std::vector<std::shared_ptr<void>>& contexts) {
-    // Only status scalars cross to the host. Queue every sample's checks before
-    // waiting, so batch size does not multiply stream synchronizations.
+    // Pack batch status into one transfer while retaining sample order for
+    // validation. Individual scalar transfers cost more than the data itself.
     thread_local vcr::device::PinnedBuffer staging;
     staging.reserve(contexts.size()*3*sizeof(int));
     auto* flags=reinterpret_cast<int*>(staging.data());
     std::fill_n(flags,contexts.size()*3,0);
+    std::size_t transfers=0;
+    for (const auto& context:contexts) {
+        const auto& s=*static_cast<Session*>(context.get());
+        transfers+=bool(s.checks)+bool(s.nonfinite)+bool(s.geometry);
+    }
     bool pending=false;
     try {
-        for (std::size_t i=0;i<contexts.size();++i) {
-            auto& s=*static_cast<Session*>(contexts[i].get());
-            const Buffer<int>* buffers[]={s.checks.get(),s.nonfinite.get(),s.geometry.get()};
-            for (int j=0;j<3;++j) if (buffers[j]) {
-                check(copy_async(flags+3*i+j,buffers[j]->ptr,sizeof(int),cudaMemcpyDeviceToHost,vcr::device::stream()));
-                pending=true;
+        // A handful of scalar reads are cheaper than an allocation and launch.
+        if (transfers>4) {
+            Buffer<int> packed(contexts.size()*3);
+            BatchQueue queue(contexts.size());
+            for (std::size_t i=0;i<contexts.size();++i) {
+                queue.lane(i);
+                const auto& s=*static_cast<Session*>(contexts[i].get());
+                launch(1,1,0,vcr::device::stream(),gather_status_launch{},packed.ptr+3*i,
+                       s.checks ? s.checks->ptr : nullptr,
+                       s.nonfinite ? s.nonfinite->ptr : nullptr,
+                       s.geometry ? s.geometry->ptr : nullptr);
             }
+            queue.flush();
+            check(copy_async(flags,packed.ptr,packed.size*sizeof(int),cudaMemcpyDeviceToHost,vcr::device::stream()));
+            check(cudaStreamSynchronize(vcr::device::stream()));
+        } else {
+            for (std::size_t i=0;i<contexts.size();++i) {
+                auto& s=*static_cast<Session*>(contexts[i].get());
+                const Buffer<int>* buffers[]={s.checks.get(),s.nonfinite.get(),s.geometry.get()};
+                for (int j=0;j<3;++j) if (buffers[j]) {
+                    check(copy_async(flags+3*i+j,buffers[j]->ptr,sizeof(int),cudaMemcpyDeviceToHost,vcr::device::stream()));
+                    pending=true;
+                }
+            }
+            if (pending) check(cudaStreamSynchronize(vcr::device::stream()));
         }
-        if (pending) check(cudaStreamSynchronize(vcr::device::stream()));
     } catch (...) {
         cudaStreamSynchronize(vcr::device::stream());
         throw;

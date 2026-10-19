@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "geometry.cuh"
+#include <bit>
 namespace vcr::augment::cuda {
 template<class Real> struct GeometryArgs {
     Real matrix[9]{}, offset[3]{};
@@ -11,18 +12,26 @@ template<class Real> struct GeometryArgs {
 // Exact same-shape axis reflections need only integer address arithmetic.
 // Keep geometry_cuda's target routing, sparse/directional handling and validity
 // restoration shared with the general resampler.
-template<class T, class Index> __device__ void reflect_kernel(KernelIndex vcr_launch, const T* src, T* dst, Layout g, std::size_t channels,
-                                                            unsigned reflected, bool validity) {
-    EACH_INDEX(g.size*channels) {
-        const Index index=Index(i), size=Index(g.size), voxel=index%size;
-        Index at=voxel;
+template<class T, class Index> __device__ void reflect_kernel(KernelIndex vcr_launch, const T* src, T* dst, Layout g, std::size_t count,
+                                                            unsigned reflected, Index xor_mask, bool validity) {
+    EACH_INDEX(count) {
+        const Index index=Index(i);
+        Index at=index ^ xor_mask;
         for (int a=0;a<g.dim;++a) if (reflected & (1u<<a)) {
             const Index stride=Index(g.stride[a]), extent=Index(g.shape[a]);
-            const Index x=(voxel/stride)%extent;
+            const Index x=(index/stride)%extent;
             at -= x*stride;
             at += (extent-1-x)*stride;
         }
-        const T value=src[(index/size)*size+at];
+        // A reflection is an involution: only one thread touches each pair.
+        // Keeping the working buffer avoids a volume allocation and the copy
+        // back into the caller's contiguous batch output.
+        if (src==dst && index>at) continue;
+        const T value=src[at];
+        if (src==dst && index<at) {
+            const T other=src[index];
+            dst[at]=validity ? T(other>=T(1)) : other;
+        }
         // The general validity interpolation canonicalizes signed zero too.
         dst[i]=validity ? T(value>=T(1)) : value;
     }
@@ -30,6 +39,47 @@ template<class T, class Index> __device__ void reflect_kernel(KernelIndex vcr_la
 template<class T, class Index> struct reflect_kernel_launch2 {
     template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { reflect_kernel<T,Index>(index,args...); }
 };
+template<class T, class Index> struct reflect_pairs_launch {
+    __device__ void operator()(KernelIndex vcr_launch, T* data, std::size_t count,
+                               Index mask, Index pivot, bool validity) const {
+        EACH_INDEX(count/2) {
+            // Insert a zero at the highest reflected bit. This enumerates
+            // exactly one member of every pair, with no idle half of the grid.
+            const Index below=pivot-1;
+            const Index first=(Index(i)&below) | ((Index(i)&~below)<<1);
+            const Index second=first^mask;
+            const T a=data[first], b=data[second];
+            data[first]=validity ? T(b>=T(1)) : b;
+            data[second]=validity ? T(a>=T(1)) : a;
+        }
+    }
+};
+static void reflect_cuda(const DeviceArray& src, DeviceArray& out, unsigned reflected, bool validity) {
+    if (!reflected && !validity && src.buffer->ptr==out.buffer->ptr) return;
+    Layout grid{Grid(src.spatial())};
+    std::size_t xor_mask=0;
+    // Power-of-two axes occupy disjoint bits of the flattened index. Reverse
+    // those bits directly; other axes keep exact integer coordinate mapping.
+    for (int a=0;a<grid.dim;++a) if (reflected & (1u<<a)) {
+        const auto extent=grid.shape[a], stride=grid.stride[a];
+        if ((extent & (extent-1))==0 && (stride & (stride-1))==0) {
+            xor_mask |= (extent-1)*stride;
+            reflected &= ~(1u<<a);
+        }
+    }
+    src.typed([&](auto input) {
+        using T=typename decltype(input)::value_type;
+        const auto run=[&]<class Index>() {
+            if (!reflected && xor_mask && src.buffer->ptr==out.buffer->ptr)
+                launch(blocks(out.size()/2),256,0,vcr::device::stream(), reflect_pairs_launch<T,Index>{}, input.ptr,out.size(),Index(xor_mask),Index(std::bit_floor(xor_mask)),validity);
+            else
+                launch(blocks(out.size()),256,0,vcr::device::stream(), reflect_kernel_launch2<T,Index>{}, input.ptr,out.view<T>().ptr,grid,out.size(),reflected,Index(xor_mask),validity);
+        };
+        if (out.size()<=UINT32_MAX) run.template operator()<std::uint32_t>();
+        else run.template operator()<std::size_t>();
+    });
+    check(cudaGetLastError());
+}
 static int reflection_axes(const Parameters& p, const Shape& shape, const float* field) {
     if (!p.exact || field || p.shape!=shape) return -1;
     unsigned reflected=0;
@@ -135,14 +185,8 @@ DeviceArray resample_cuda(const DeviceArray& src, const Parameters& p, bool near
     Layout in{Grid(src.spatial())}, output{Grid(p.shape)};
     const int reflected=p.device_offset?-1:reflection_axes(p,src.spatial(),field);
     if (reflected>=0 && (nearest || validity)) {
-        src.typed([&](auto input) {
-            using T=typename decltype(input)::value_type;
-            if (out.size()<=UINT32_MAX)
-                launch(blocks(out.size()),256,0,vcr::device::stream(), reflect_kernel_launch2<T,std::uint32_t>{}, input.ptr,out.view<T>().ptr,in,src.shape[0],unsigned(reflected),validity);
-            else
-                launch(blocks(out.size()),256,0,vcr::device::stream(), reflect_kernel_launch2<T,std::size_t>{}, input.ptr,out.view<T>().ptr,in,src.shape[0],unsigned(reflected),validity);
-        });
-        check(cudaGetLastError()); return out;
+        reflect_cuda(src,out,unsigned(reflected),validity);
+        return out;
     }
     // Bound float32 affine roundoff to < 0.001 voxel. Large coordinates or
     // cancellation between large matrix/offset terms use float64 coordinates.
@@ -221,7 +265,9 @@ void geometry_cuda(Sample& s, const Parameters& p, Session& session) {
             sparse_cuda(a,f.target,p,displacement,session); f.array.shape = a.shape; continue;
         }
         auto& a = session.arrays.at(key);
-        a = resample_cuda(a,p,role == Role::Label || (p.exact && role != Role::Valid),f.target.fill,role == Role::Valid,field->ptr);
+        const int reflected=p.device_offset?-1:reflection_axes(p,a.spatial(),displacement);
+        if (reflected>=0) reflect_cuda(a,a,unsigned(reflected),role == Role::Valid);
+        else a = resample_cuda(a,p,role == Role::Label || (p.exact && role != Role::Valid),f.target.fill,role == Role::Valid,field->ptr);
         if (directional(role) || (role == Role::CoordinateField && !f.target.external))
             directional_cuda(a,f.target,p,displacement,session);
         f.array.shape = a.shape;

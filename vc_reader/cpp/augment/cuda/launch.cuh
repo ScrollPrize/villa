@@ -16,6 +16,7 @@ struct KernelArguments<std::index_sequence<I...>,T...> : KernelArgument<I,T>... 
     }
 };
 template<class F, class... T> struct KernelCall {
+    static constexpr bool inline_arguments = requires { F::inline_arguments; };
     F function;
     KernelArguments<std::index_sequence_for<T...>,T...> arguments;
     __device__ void operator()(KernelIndex index) const { arguments.invoke(function,index); }
@@ -28,8 +29,23 @@ template<class Call> struct KernelJob {
     bool compatible(const KernelJob& other) const { return threads==other.threads && stream==other.stream; }
     static void run(const std::vector<const KernelJob*>& jobs);
 };
+#if CUDART_VERSION >= 11070
+#define VCR_GRID_CONSTANT __grid_constant__
+#else
+#define VCR_GRID_CONSTANT
+#endif
 template<class Call> __global__ void single_kernel(Call call) {
     call(KernelIndex{blockIdx.x,gridDim.x});
+}
+// Opt in when arguments contain inline tables accessed by reference. Ordinary
+// scalar arguments keep the compiler's normal parameter handling.
+template<class Call> __global__ void single_inline_kernel(const VCR_GRID_CONSTANT Call call) {
+    call(KernelIndex{blockIdx.x,gridDim.x});
+}
+template<class Call> void launch_single(const KernelJob<Call>& job) {
+    if constexpr (Call::inline_arguments)
+        single_inline_kernel<<<job.blocks,job.threads,job.shared,job.stream>>>(job.call);
+    else single_kernel<<<job.blocks,job.threads,job.shared,job.stream>>>(job.call);
 }
 template<class Call> __global__ void batch_kernel(const KernelJob<Call>* jobs) {
     const auto& job = jobs[blockIdx.y];
@@ -42,11 +58,6 @@ template<class Job> struct KernelPacket {
     static constexpr std::size_t capacity=std::min<std::size_t>(32,4096/sizeof(Job));
     alignas(Job) unsigned char bytes[sizeof(Job)*std::max<std::size_t>(1,capacity)];
 };
-#if CUDART_VERSION >= 11070
-#define VCR_GRID_CONSTANT __grid_constant__
-#else
-#define VCR_GRID_CONSTANT
-#endif
 template<class Call> __global__ void batch_inline_kernel(const VCR_GRID_CONSTANT KernelPacket<KernelJob<Call>> packet) {
     const auto& job=reinterpret_cast<const KernelJob<Call>*>(packet.bytes)[blockIdx.y];
     if(blockIdx.x<job.blocks)job.call(KernelIndex{blockIdx.x,job.blocks});
@@ -55,7 +66,7 @@ template<class Call> __global__ void batch_inline_kernel(const VCR_GRID_CONSTANT
 template<class Call> void KernelJob<Call>::run(const std::vector<const KernelJob*>& jobs) {
     const auto& first = *jobs.front();
     if (jobs.size() == 1) {
-        single_kernel<<<first.blocks,first.threads,first.shared,first.stream>>>(first.call);
+        launch_single(first);
     } else {
         unsigned blocks = 0;
         std::size_t shared = 0;
@@ -89,6 +100,6 @@ void launch(unsigned blocks, unsigned threads, std::size_t shared, cudaStream_t 
     KernelJob<Call> job{blocks,threads,shared,stream,Call{function,{{arguments}...}}};
     if (!blocks) return;
     if (BatchQueue::current) BatchQueue::current->append(std::move(job));
-    else single_kernel<<<blocks,threads,shared,stream>>>(job.call);
+    else launch_single(job);
 }
 }

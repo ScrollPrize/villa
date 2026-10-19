@@ -38,6 +38,7 @@ def main():
         'blur': [A.GaussianBlur(.9)],
         'normalize': [A.Normalize('zscore')],
         'percentile': [A.Normalize('percentile')],
+        'flip': [A.Flip()],
         'affine': [A.Affine(degrees=5)],
         'elastic': [A.Elastic(magnitude=2)],
         'equalize': [A.Equalize(bins=64)],
@@ -73,13 +74,20 @@ def main():
                     pipeline.batch({'image': source}, seeds=seeds)
                 kernels = {}
                 kernel_us = {}
+                api_calls = {}
+                api_us = {}
                 for event in profile.events():
                     if event.device_type == torch.autograd.DeviceType.CUDA and not event.name.startswith('Memcpy'):
                         kernels[event.name] = kernels.get(event.name, 0)+1
                         kernel_us[event.name] = kernel_us.get(event.name, 0.)+event.device_time_total
+                    elif event.name.startswith('cuda'):
+                        api_calls[event.name] = api_calls.get(event.name, 0)+1
+                        api_us[event.name] = api_us.get(event.name, 0.)+event.cpu_time_total
                 row['gpu_events'] = kernels
                 row['gpu_time_us'] = kernel_us
                 row['gpu_event_count'] = sum(kernels.values())
+                row['cuda_api_calls'] = api_calls
+                row['cuda_api_time_us'] = api_us
             report['results'][f'{name}/B{count}'] = row
             args.output.write_text(json.dumps(report, indent=2)+'\n')
             print(f'{name}/B{count}: {row["p50_ms"]:.3f} ms', flush=True)

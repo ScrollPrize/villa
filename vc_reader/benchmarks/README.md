@@ -1748,7 +1748,9 @@ inside each wait. See `results/fiber_tensor_bottleneck_analysis.json`.
 `bench_batch_augmentations.py` measures resident batches on a local CT volume.
 Reading and the initial upload are excluded. Timings include public-call
 validation and completion; reports contain raw observations, mean, median,
-p95, minimum and maximum. `--profile` records GPU events separately from timing.
+p95, minimum and maximum. `--profile` records GPU events and CUDA runtime API
+counts/durations separately from timing. `--cases flip blur pipeline` isolates
+reflections, short filters, and their combined training workload.
 Use the same arguments with two native build directories for before/after runs:
 
 ```bash
@@ -1861,4 +1863,95 @@ PYTHONPATH=src VC_READER_NATIVE_DIR=/tmp/vc-reader-native-batch-build \
   /home/sean/Documents/villa2/villa/vc_reader/.venv/bin/python -m pytest -q \
   tests/test_native_batch.py \
   -k 'large_working_sets or failed_large_batch or pipeline_groups'
+```
+
+## Reflection and short-filter pipeline optimizations
+
+This follow-up compares commit `e2e3b1a06` with in-place CUDA reflections,
+inline Gaussian coefficients, and packed validation readback. Measurements
+use the same RTX 5090, Release build, float32 PHercParis4 crop, level and start
+as above: five warmups, 30 measured public calls, batches 1/4/16, with reading
+and initial upload excluded. No builds, tests or other benchmark runs execute
+concurrently with the timings. Profiles are separate calls.
+
+At **batch 16**, entries are **mean / median / p95 milliseconds**. Speedup uses
+the median. The pipeline is Flip → BrightnessMultiply → GaussianBlur →
+GaussianNoise, with the parameters in `bench_batch_augmentations.py`.
+
+| Workload | Before | After | Speedup |
+|---|---:|---:|---:|
+| Flip, 128³ | 1.473 / 1.417 / 1.701 | 0.459 / 0.422 / 0.632 | 3.36× |
+| Blur, 128³ | 1.080 / 1.049 / 1.150 | 1.023 / 0.970 / 1.170 | 1.08× |
+| Pipeline, 64³ | 0.471 / 0.434 / 0.645 | 0.274 / 0.234 / 0.432 | 1.86× |
+| Pipeline, 127³ | 2.374 / 2.376 / 2.450 | 1.898 / 1.836 / 2.068 | 1.29× |
+| Pipeline, 128³ | 2.397 / 2.410 / 2.469 | 1.364 / 1.341 / 1.487 | 1.80× |
+| Pipeline, 256³ | 21.041 / 20.822 / 22.015 | 11.696 / 11.727 / 12.460 | 1.78× |
+
+The 128³ pipeline also improves at batch 1 (0.173 → 0.123 ms) and batch 4
+(0.576 → 0.318 ms). The separately measured pre-batching build `f8e1bc05b`
+takes 2.227 ms at 128³/B=16, so the final pipeline is about **40% faster**.
+At 64³/B=16, blur improves from 0.294 to 0.198 ms; at 256³/B=16 it is
+effectively flat (9.093 → 8.975 ms).
+
+Reflections swap each voxel pair in the existing working buffer. Power-of-two
+axes use exact bit mappings and enumerate one thread per pair; arbitrary axes
+retain integer coordinate mapping. The input, validity handling, directional
+targets and integer label bits are preserved. This removes reflection scratch
+allocations and the final copy into the contiguous batch output. Gaussian
+filters with radius at most eight carry their coefficients in launch arguments;
+device code accesses them by reference without per-thread copies. Larger
+filters retain device coefficient buffers. Validation packs more than four
+status scalars into one readback while preserving sample order and error checks.
+No image precision, sampled parameters or RNG behavior changes.
+
+At 128³/B=16 the pipeline profile shows reflection kernels dropping from
+0.658 to 0.113 ms and copy kernels from 0.206 to 0.050 ms. Gaussian kernels
+total 0.594 → 0.569 ms. Per-call CUDA allocations fall from 96 to 33 and
+`cudaMemcpyAsync` calls from 64 to one: 48 coefficient uploads disappear and
+16 validation reads become one packed read. The gather kernel costs 0.001 ms.
+
+Timings have occasional outliers on this desktop GPU. An additional 100-call
+elastic check at 128³/B=16 gives before/after mean 3.776/3.763 ms, median
+3.575/3.555 ms and p95 4.182/4.204 ms, showing no sustained regression.
+Some unchanged 64³ single-sample operations vary by a few microseconds.
+Measurements cover this GPU and toolkit; other architectures were not timed.
+
+Reproduce from `vc_reader/` using the existing environment:
+
+```bash
+cmake --build /tmp/vc-reader-native-batch-build --target _augment -j 12
+PYTHONPATH=src /home/sean/Documents/villa2/villa/vc_reader/.venv/bin/python \
+  benchmarks/bench_batch_augmentations.py \
+  --native-dir /tmp/vc-reader-native-batch-build \
+  --array /mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr \
+  --level 2 --start 9000 3600 3600 --size 128 --batches 1 4 16 \
+  --warmup 5 --reps 30 --profile \
+  --output benchmarks/results/native_batch_pipeline/after_128.json
+```
+
+The before run uses `--native-dir /tmp/vcr-batch-round2-before` and
+`before_128.json`. Repeat at sizes 64, 127 and 256; the 127/256 runs select
+`--cases flip blur pipeline`. The elastic follow-up selects `--cases elastic
+--size 128 --batches 16 --reps 100`. The pre-batching comparison uses
+`--native-dir /tmp/vc-reader-native-batch-baseline --cases pipeline --size 128
+--batches 16 --reps 30`. Complete commands, raw times and summaries are saved
+under the Git-ignored `results/native_batch_pipeline/` directory, alongside
+the 128³ GPU and runtime API profiles.
+
+Validation passed **66 tests and 2,999 subtests** using the pytest command above.
+Added checks cover all reflection-axis combinations on odd, mixed and singleton
+dimensions, signed zeros, wide integer labels, retained batch output storage,
+Gaussian radii 8/9/33 with explicit float32/float64 inputs, and error recovery
+on side streams at batch sizes 2/16/65. The focused memory check passed three
+tests and 39 subtests with **zero errors**. It instruments the changed
+reflection, convolution and status-gather kernels; profiler assertions run
+separately in the normal test suite:
+
+```bash
+PYTHONPATH=src VC_READER_NATIVE_DIR=/tmp/vc-reader-native-batch-build \
+  /usr/local/cuda/bin/compute-sanitizer --tool memcheck --error-exitcode 99 \
+  --kernel-name 'regex=reflect_|convolution_|gather_status_' \
+  /home/sean/Documents/villa2/villa/vc_reader/.venv/bin/python -m pytest -q \
+  tests/test_native_batch.py \
+  -k 'reflections_preserve or packed_status or variable_parameters'
 ```
