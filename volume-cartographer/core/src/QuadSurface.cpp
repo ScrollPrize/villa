@@ -3405,9 +3405,12 @@ void QuadSurface::resample(float factor_x, float factor_y, int interpolation)
         channel = resampledChannel;
     }
 
-    // Update scale to maintain physical size
-    _scale[0] /= factor_x;
-    _scale[1] /= factor_y;
+    // _scale is grid cells per voxel (the reciprocal of the vertex spacing),
+    // so a grid that is factor times denser has factor times the scale.
+    // Dividing here wrote 1/factor^2 of the right value and made renders of a
+    // resampled surface come out factor^2 too large (or too small) per axis.
+    _scale[0] *= factor_x;
+    _scale[1] *= factor_y;
 
     // Invalidate cached bbox
     invalidateCache();

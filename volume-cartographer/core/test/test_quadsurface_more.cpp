@@ -207,9 +207,28 @@ TEST_CASE("resample (single factor) downscales by 0.5")
     REQUIRE(p);
     CHECK(p->rows == 10);
     CHECK(p->cols == 10);
-    // _scale should have inflated: 1.0 / 0.5 = 2.0
-    CHECK(qs.scale()[0] == doctest::Approx(2.0f));
-    CHECK(qs.scale()[1] == doctest::Approx(2.0f));
+    // _scale is grid cells per voxel: half as many cells -> half the scale
+    CHECK(qs.scale()[0] == doctest::Approx(0.5f));
+    CHECK(qs.scale()[1] == doctest::Approx(0.5f));
+}
+
+TEST_CASE("resample keeps scale equal to 1 / measured vertex spacing")
+{
+    // 41x41 planar grid with 20-voxel vertex spacing, like tracer output (scale 0.05).
+    cv::Mat_<cv::Vec3f> pts(41, 41);
+    for (int r = 0; r < pts.rows; ++r)
+        for (int c = 0; c < pts.cols; ++c)
+            pts(r, c) = cv::Vec3f(20.f * c, 20.f * r, 100.f);
+    for (float factor : {2.0f, 0.5f}) {
+        QuadSurface qs(pts.clone(), cv::Vec2f(0.05f, 0.05f));
+        qs.resample(factor);
+        const auto* p = qs.rawPointsPtr();
+        REQUIRE(p);
+        REQUIRE(p->cols > 2);
+        const float spacing = cv::norm((*p)(p->rows / 2, p->cols / 2 + 1) - (*p)(p->rows / 2, p->cols / 2));
+        CHECK(qs.scale()[0] == doctest::Approx(1.0f / spacing).epsilon(0.02));
+        CHECK(qs.scale()[1] == doctest::Approx(0.05f * factor));
+    }
 }
 
 TEST_CASE("resample (factor=1) is a no-op")
