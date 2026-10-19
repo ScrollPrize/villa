@@ -3,18 +3,20 @@
 
 This is a CPU-only, network-free QA pass over a *built* OME-Zarr group. It reads
 **only** zarr metadata (``.zarray`` / ``.zattrs`` for zarr v2, ``zarr.json`` for
-zarr v3) plus small chunk-directory listings — it never loads pixel data — so it
-is cheap enough to run in CI on every produced volume.
+zarr v3), volume JSON metadata, chunk-directory listings and targeted file stats.
+It never loads pixel data. Sampling sorts one directory at a time and stops
+descending once enough samples are found; very wide directories can still cost I/O.
 
 It exists to catch a family of real pyramid-production bugs seen in the field:
 
 * A downsampled level that is one voxel short on an odd axis, because the builder
   used banker's rounding (``round``) instead of ceil-division. VC3D expects every
   level ``== ceil(n / 2**level)`` per axis (its ``ceilDivPow2``); a short level
-  makes the viewer read past the array. (villa #2135, #2092)
+  makes the viewer read past the array. (villa #2135)
 * ``.zattrs`` multiscales missing physical scale metadata (axis units +
   ``coordinateTransformations`` scale), so viewers cannot draw a scale bar, or
-  carrying scale ratios that are not ~2x between consecutive levels. (villa #497)
+  carrying spatial scale ratios that are not ~2x between consecutive levels
+  (channel/time scales stay constant). (villa #497)
 * Level-0 chunk objects whose on-disk size is a large multiple (8x / 64x) of the
   declared ``chunks * dtype`` size — a sign the chunk grid was mis-declared.
   (villa #1965)
@@ -25,11 +27,20 @@ It exists to catch a family of real pyramid-production bugs seen in the field:
 Checks (each yields a structured :class:`CheckResult` with name / status / message /
 details; status is one of PASS / FAIL / WARN / SKIP):
 
-  1. ``pyramid_level_shapes``  — level L shape[axis] == ceil(level0[axis] / 2**L).
+  1. ``pyramid_level_shapes``  — spatial sizes follow ceil(level0 / 2**L); c/t stay fixed.
   2. ``ome_scale_metadata``    — multiscales datasets, scale ratios ~2x, axis units.
   3. ``chunk_object_sizes``    — sampled level-0 chunk files vs declared chunk bytes.
-  4. ``metadata_json_keys``    — sibling metadata.json has scan/voxelsize; z-direction set.
-  5. ``level_z_consistency``   — declared level count vs present level dirs; no gaps.
+  4. ``metadata_json_keys``    — sibling metadata.json has scan and resolvable voxel size; z-direction set.
+  5. ``level_z_consistency``   — declared dataset paths vs present arrays; no gaps.
+  6. ``chunk_coverage``        — heuristic WARN for absent coarse chunks whose
+     finer source region has stored chunks (#2092). Absent chunks may legitimately
+     encode fill values, so this never FAILs merely for absence. Examines at most
+     --sample coarse keys per level and 256 source keys per region; no pixel reads.
+     PASS means no suspect chunks in that bounded sample, not complete coverage.
+
+Axis semantics are shared by shape, scale and coverage checks. Without any axes
+metadata, scaling is inferred from shape changes. --levels selects arrays and
+metadata datasets together; directory gaps are still checked store-wide.
 
 Usage::
 
@@ -56,6 +67,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+from itertools import islice
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -103,6 +116,7 @@ class ArrayMeta:
     itemsize: int
     dimension_separator: str
     zarr_format: int
+    chunk_key_encoding: str = "v2"
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +170,7 @@ def read_array_meta(level: int, level_path: Path) -> ArrayMeta:
         dtype = str(zarr_json["data_type"])
         sep = "/"
         cke = zarr_json.get("chunk_key_encoding", {})
-        sep = cke.get("configuration", {}).get("separator", "/")
+        sep = cke.get("configuration", {}).get("separator", "." if cke.get("name") == "v2" else "/")
         return ArrayMeta(
             level=level,
             path=str(level_path),
@@ -166,6 +180,7 @@ def read_array_meta(level: int, level_path: Path) -> ArrayMeta:
             itemsize=_itemsize(dtype),
             dimension_separator=sep,
             zarr_format=3,
+            chunk_key_encoding=cke.get("name", "default"),
         )
 
     raise ValueError(f"no .zarray or array zarr.json at {level_path}")
@@ -229,11 +244,33 @@ def ceil_div_pow2(n: int, level: int) -> int:
 # ---------------------------------------------------------------------------
 
 
-def check_pyramid_level_shapes(metas: Sequence[ArrayMeta]) -> CheckResult:
+def _axis_scaling(metas, axes=None):
+    """Use axis semantics when available; infer from shapes only without axes."""
+    ndim = len(metas[0].shape)
+    if axes:
+        if len(axes) != ndim:
+            raise ValueError("axes length does not match array rank")
+        return [a.get("type") == "space" or
+                (not a.get("type") and a.get("name") in ("x", "y", "z"))
+                for a in axes]
+    return [any(len(m.shape) == ndim and m.shape[i] != metas[0].shape[i]
+                for m in metas) for i in range(ndim)]
+
+
+def _dataset_paths(group_path, datasets, metas):
+    paths = [(group_path / d.get("path", "")).resolve() for d in datasets]
+    expected = [Path(m.path).resolve() for m in metas]
+    if len(set(paths)) != len(paths):
+        return "duplicate dataset path references"
+    if paths != expected:
+        return "dataset paths do not match discovered level arrays in order (missing or reordered references)"
+    return None
+
+
+def check_pyramid_level_shapes(metas: Sequence[ArrayMeta], axes=None) -> CheckResult:
     """Level L must equal ceil(level0 / 2**L) on every downsampled axis.
 
-    An axis whose size is identical in *every* level is treated as
-    non-downsampled (e.g. a channel axis) and is expected to stay constant.
+    Axis semantics take precedence; shape inference is used only without axes.
     """
     name = "pyramid_level_shapes"
     if len(metas) < 2:
@@ -252,11 +289,7 @@ def check_pyramid_level_shapes(metas: Sequence[ArrayMeta]) -> CheckResult:
                 {"level": m.level, "shape": list(m.shape), "level0_shape": list(level0.shape)},
             )
 
-    # An axis is "downsampled" unless every level shares level 0's size there.
-    downsampled = [
-        any(m.shape[ax] != level0.shape[ax] for m in metas)
-        for ax in range(ndim)
-    ]
+    downsampled = _axis_scaling(metas, axes)
 
     violations = []
     for m in metas:
@@ -300,8 +333,8 @@ def _extract_scale(dataset: dict) -> Optional[List[float]]:
     return None
 
 
-def check_ome_scale_metadata(group_path: Path, metas: Sequence[ArrayMeta]) -> CheckResult:
-    """Validate OME multiscales: dataset count, ~2x scale ratios, axis units."""
+def check_ome_scale_metadata(group_path: Path, metas: Sequence[ArrayMeta], levels=None) -> CheckResult:
+    """Validate ordered dataset paths, ranks, semantic scale ratios and units."""
     name = "ome_scale_metadata"
     attrs = read_group_attrs(group_path)
     multiscales = attrs.get("multiscales")
@@ -314,7 +347,7 @@ def check_ome_scale_metadata(group_path: Path, metas: Sequence[ArrayMeta]) -> Ch
 
     ms = multiscales[0]
     axes = ms.get("axes", [])
-    datasets = ms.get("datasets", [])
+    datasets = ms.get("datasets", [])[:levels]
 
     problems: List[str] = []
     warnings: List[str] = []
@@ -326,18 +359,37 @@ def check_ome_scale_metadata(group_path: Path, metas: Sequence[ArrayMeta]) -> Ch
             f"multiscales lists {len(datasets)} datasets but {n_levels} levels are present"
         )
 
-    # Axis names + units.
-    axis_names = [a.get("name") for a in axes]
+    path_problem = _dataset_paths(group_path, datasets, metas)
+    if path_problem:
+        problems.append(path_problem)
+    ndim = len(metas[0].shape) if metas else len(axes)
+    if not axes:
+        version = tuple(int(part) for part in str(ms.get("version", "0.4")).split("."))
+        if version >= (0, 4):
+            problems.append("required axes metadata is missing")
+        else:
+            warnings.append("axes metadata is missing")
+    elif len(axes) != ndim:
+        problems.append(f"axes length {len(axes)} does not match array rank {ndim}")
     details["axes"] = axes
-    if any(n is None for n in axis_names):
+    if any(a.get("name") is None for a in axes):
         problems.append("one or more axes are missing a `name`")
     units = [a.get("unit") for a in axes]
-    if any(u is None for u in units):
-        warnings.append("one or more axes are missing a physical `unit`")
+    if any(a.get("unit") is None and a.get("type") not in ("channel", "time")
+           for a in axes):
+        warnings.append("one or more spatial axes are missing a physical `unit`")
 
     # Scale transforms + ratios.
     scales = [_extract_scale(d) for d in datasets]
     details["scales"] = scales
+    for i, scale in enumerate(scales):
+        rank = len(metas[i].shape) if i < len(metas) else ndim
+        if scale is not None and len(scale) != rank:
+            problems.append(f"dataset {i} scale length {len(scale)} does not match array rank {rank}")
+        if scale is not None and any(not math.isfinite(v) or v <= 0 for v in scale):
+            problems.append(f"dataset {i} scale must be positive and finite")
+    if problems:
+        return CheckResult(name, FAIL, "; ".join(problems), details)
     if all(s is None for s in scales):
         warnings.append(
             "no coordinateTransformations `scale` on any dataset; "
@@ -350,13 +402,7 @@ def check_ome_scale_metadata(group_path: Path, metas: Sequence[ArrayMeta]) -> Ch
             if units:
                 details["voxel_size_units"] = units
 
-        downsampled = None
-        if len(metas) >= 2:
-            ndim = len(metas[0].shape)
-            downsampled = [
-                any(m.shape[ax] != metas[0].shape[ax] for m in metas)
-                for ax in range(ndim)
-            ]
+        downsampled = _axis_scaling(metas, axes) if metas else None
 
         for i in range(1, len(scales)):
             prev, cur = scales[i - 1], scales[i]
@@ -395,17 +441,20 @@ def check_ome_scale_metadata(group_path: Path, metas: Sequence[ArrayMeta]) -> Ch
 
 
 def _chunk_files(level_path: Path, limit: int) -> List[Path]:
-    """List up to ``limit`` chunk files under a level (sorted), skipping metadata."""
-    out: List[Path] = []
-    for p in sorted(level_path.rglob("*")):
-        if not p.is_file():
-            continue
-        if p.name.startswith(".") or p.name == "zarr.json":
-            continue
-        out.append(p)
-        if len(out) >= limit:
-            break
-    return out
+    """Depth-first deterministic sample; sort only each visited directory."""
+    def walk(directory):
+        # Sort only one directory at a time, never the entire descendant tree.
+        with os.scandir(directory) as entries:
+            ordered = sorted(entries, key=lambda e: e.name)
+        for entry in ordered:
+            if entry.name.startswith(".") or entry.name == "zarr.json":
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                yield from walk(entry.path)
+            elif entry.is_file(follow_symlinks=False):
+                yield Path(entry.path)
+    return list(islice(walk(level_path), max(0, limit)))
+
 
 
 def check_chunk_object_sizes(
@@ -483,8 +532,135 @@ def check_chunk_object_sizes(
     )
 
 
+def _chunk_key(meta, coords):
+    key = meta.dimension_separator.join(map(str, coords))
+    if meta.chunk_key_encoding == "default":
+        key = "c" + meta.dimension_separator + key
+    return key
+
+
+def _coordinates(ranges, prefix=()):
+    """Lazy Cartesian product without materialising potentially huge ranges."""
+    if not ranges:
+        yield prefix
+        return
+    for value in ranges[0]:
+        yield from _coordinates(ranges[1:], prefix + (value,))
+
+
+def _sample_chunk_coordinates(grid_shape, sample):
+    """Evenly spaced C-order indices, with both endpoints when sample >= 2.
+
+    A single sample selects the first chunk. Memory use depends only on ndim.
+    """
+    total = math.prod(grid_shape)
+    count = min(total, max(0, sample))
+    for i in range(count):
+        index = i if total <= sample else i * (total - 1) // max(1, count - 1)
+        coord = [0] * len(grid_shape)
+        for axis in range(len(grid_shape) - 1, -1, -1):
+            index, coord[axis] = divmod(index, grid_shape[axis])
+        yield tuple(coord)
+
+
+def check_chunk_coverage(metas, sample=32, axes=None):
+    """Bounded presence heuristic, not a pixel or fill-value validation."""
+    name = "chunk_coverage"
+    if len(metas) < 2 or sample <= 0:
+        return CheckResult(name, SKIP, "requires two levels and a positive sample", {})
+    spatial = _axis_scaling(metas, axes)
+    offenders, examined = [], 0
+    per_level = []
+    for fine, coarse in zip(metas, metas[1:]):
+        if coarse.level != fine.level + 1 or len(fine.shape) != len(coarse.shape):
+            continue
+        grid = tuple((n + c - 1) // c for n, c in zip(coarse.shape, coarse.chunks))
+        level_examined = 0
+        for coord in _sample_chunk_coordinates(grid, sample):
+            level_examined += 1
+            examined += 1
+            key = _chunk_key(coarse, coord)
+            if (Path(coarse.path) / key).is_file():
+                continue
+            source_ranges = []
+            for i, index in enumerate(coord):
+                factor = 2 if spatial[i] else 1
+                start = index * coarse.chunks[i] * factor
+                end = min((index + 1) * coarse.chunks[i], coarse.shape[i]) * factor
+                end = min(end, fine.shape[i])
+                source_ranges.append(range(start // fine.chunks[i],
+                                           (end + fine.chunks[i] - 1) // fine.chunks[i]))
+            if any((Path(fine.path) / _chunk_key(fine, c)).is_file()
+                   for c in islice(_coordinates(source_ranges), 256)):
+                offenders.append({"level": coarse.level, "chunk": key})
+        per_level.append({"level": coarse.level, "examined": level_examined,
+                          "total": math.prod(grid)})
+    details = {"examined": examined, "per_level": per_level, "offenders": offenders,
+               "coarse_cap_per_level": sample, "source_cap_per_region": 256}
+    status = WARN if offenders else PASS if examined else SKIP
+    return CheckResult(name, status,
+                       f"{len(offenders)} likely missing coarse chunks (fill-value heuristic)", details)
+
+
+def _positive_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        number = float(value)
+        return number if math.isfinite(number) and number > 0 else None
+    except (ValueError, OverflowError):
+        return None
+
+
+def _walk(doc, keys):
+    for key in keys.split("."):
+        if not isinstance(doc, dict):
+            return None
+        doc = doc.get(key)
+    return doc
+
+
+def _voxel_size(doc):
+    for key in ("voxelsize", "voxel_size_um", "voxelSizeUm", "pixel_size_um",
+                "pixelSizeUm", "resolution_um", "scan.voxelsize"):
+        value = _positive_number(_walk(doc, key))
+        if value is not None:
+            return value, key
+    for prefix, level in (("", 0), ("source.metadata.", _walk(doc, "source.resolution"))):
+        if prefix:
+            if isinstance(level, bool):
+                continue
+            try:
+                level = float(level)
+            except (ValueError, TypeError, OverflowError):
+                continue
+            if not math.isfinite(level) or not 0 <= level <= 31 or not level.is_integer():
+                continue
+        for wrapper in ("scan.", ""):
+            key = prefix + wrapper + "tomo.acquisition.detector.samplePixelSize"
+            value = _positive_number(_walk(doc, key))
+            if value is not None:
+                value *= 1000 * 2 ** int(level)
+                if math.isfinite(value):
+                    return value, key
+    return None
+
+
+def _resolve_voxel_size(group_path, md_path):
+    for directory in dict.fromkeys((group_path, md_path.parent)):
+        for filename in ("meta.json", "metadata.json"):
+            path = directory / filename
+            try:
+                resolved = _voxel_size(_read_json(path))
+            except (ValueError, OSError):
+                continue
+            if resolved:
+                return {"value_um": resolved[0], "source": f"{path}:{resolved[1]}"}
+    return None
+
+
 def check_metadata_json_keys(group_path: Path) -> CheckResult:
-    """Validate a sibling metadata.json: require scan/voxelsize; z-direction set."""
+    """Require scan, VC3D-resolvable voxel size, and a set z-direction."""
     name = "metadata_json_keys"
     md_path = find_metadata_json(group_path)
     if md_path is None:
@@ -499,9 +675,14 @@ def check_metadata_json_keys(group_path: Path) -> CheckResult:
             {"path": str(md_path)},
         )
 
-    required = ["scan", "voxelsize"]
+    required = ["scan"]
     missing = [k for k in required if k not in md]
     details = {"path": str(md_path), "keys": sorted(md.keys())}
+
+    resolved = _resolve_voxel_size(group_path, md_path)
+    details["voxel_size"] = resolved
+    if resolved is None:
+        missing.append("resolvable voxel size")
 
     warnings = []
     if "z_direction_is_top_to_bottom" not in md:
@@ -519,12 +700,12 @@ def check_metadata_json_keys(group_path: Path) -> CheckResult:
     if warnings:
         return CheckResult(name, WARN, "; ".join(warnings), details)
     return CheckResult(
-        name, PASS, "metadata.json has scan/voxelsize and a set z-direction", details
+        name, PASS, "metadata.json has scan/resolvable voxel size and a set z-direction", details
     )
 
 
 def check_level_z_consistency(
-    group_path: Path, present_levels: Sequence[int]
+    group_path: Path, present_levels: Sequence[int], levels=None, inventory=None
 ) -> CheckResult:
     """Declared level count (from multiscales) vs present dirs; flag gaps."""
     name = "level_z_consistency"
@@ -534,8 +715,8 @@ def check_level_z_consistency(
     details = {"present_levels": list(present_levels)}
 
     # Contiguity from 0.
-    expected = list(range(len(present_levels)))
-    gaps = sorted(set(range(present_levels[0], present_levels[-1] + 1)) - set(present_levels))
+    inventory = list(present_levels if inventory is None else inventory)
+    gaps = sorted(set(range(inventory[0], inventory[-1] + 1)) - set(inventory))
     if present_levels[0] != 0:
         return CheckResult(
             name, WARN, f"levels do not start at 0 (start={present_levels[0]})",
@@ -550,7 +731,7 @@ def check_level_z_consistency(
     attrs = read_group_attrs(group_path)
     multiscales = attrs.get("multiscales")
     if multiscales:
-        datasets = multiscales[0].get("datasets", [])
+        datasets = multiscales[0].get("datasets", [])[:levels]
         details["declared_levels"] = len(datasets)
         if len(datasets) != len(present_levels):
             return CheckResult(
@@ -559,6 +740,11 @@ def check_level_z_consistency(
                 f"{len(present_levels)} are present on disk",
                 details,
             )
+
+        metas = [read_array_meta(l, group_path / str(l)) for l in present_levels]
+        problem = _dataset_paths(group_path, datasets, metas)
+        if problem:
+            return CheckResult(name, FAIL, problem, details)
 
     return CheckResult(
         name, PASS, f"{len(present_levels)} contiguous levels present from 0", details
@@ -584,7 +770,8 @@ def run_all_checks(
     if not group_path.exists():
         return [CheckResult("store", FAIL, f"path does not exist: {group_path}", {})]
 
-    present = discover_levels(group_path, max_levels=levels)
+    inventory = discover_levels(group_path)
+    present = inventory if levels is None else [l for l in inventory if l < levels]
     if not present:
         results.append(
             CheckResult("store", FAIL, f"no zarr levels found under {group_path}", {})
@@ -609,13 +796,19 @@ def run_all_checks(
         except Exception as exc:  # never crash the whole run
             return CheckResult(name, FAIL, f"check raised: {exc}", {})
 
-    results.append(guarded(check_pyramid_level_shapes, metas, name="pyramid_level_shapes"))
-    results.append(guarded(check_ome_scale_metadata, group_path, metas, name="ome_scale_metadata"))
+    try:
+        attrs = read_group_attrs(group_path)
+        axes = (attrs.get("multiscales") or [{}])[0].get("axes")
+    except (ValueError, TypeError, AttributeError, OSError):
+        axes = None
+    results.append(guarded(check_pyramid_level_shapes, metas, axes, name="pyramid_level_shapes"))
+    results.append(guarded(check_ome_scale_metadata, group_path, metas, levels, name="ome_scale_metadata"))
     results.append(
         guarded(lambda: check_chunk_object_sizes(metas, sample=sample), name="chunk_object_sizes")
     )
+    results.append(guarded(check_chunk_coverage, metas, sample, axes, name="chunk_coverage"))
     results.append(guarded(check_metadata_json_keys, group_path, name="metadata_json_keys"))
-    results.append(guarded(check_level_z_consistency, group_path, present, name="level_z_consistency"))
+    results.append(guarded(check_level_z_consistency, group_path, present, levels, inventory, name="level_z_consistency"))
     return results
 
 
@@ -646,7 +839,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument(
         "--sample", type=int, default=32,
-        help="Max number of level-0 chunk files to stat for the size check.",
+        help="Max level-0 files for sizes and coarse chunk keys per level for coverage.",
     )
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
     parser.add_argument(

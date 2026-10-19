@@ -14,6 +14,7 @@ import json
 import numpy as np
 import pytest
 
+from vesuvius.scripts import ome_zarr_qa as qa
 from vesuvius.scripts.ome_zarr_qa import (
     FAIL,
     PASS,
@@ -155,8 +156,8 @@ def test_round_pyramid_fails_pyramid_level_shapes(tmp_path):
     assert viol["axis"] == 0 and viol["expected"] == 5 and viol["actual"] == 4
 
 
-def test_missing_last_z_slice_fails(tmp_path):
-    """A level that is short a z slice (missing last z chunk) must FAIL (#2092)."""
+def test_declared_shape_short_z_axis_fails(tmp_path):
+    """A declared shape that is short a z slice must FAIL."""
     group = tmp_path / "vol.zarr"
     _write_level(group, 0, (8, 8, 8))
     _write_level(group, 1, (3, 4, 4))  # z should be ceil(8/2)==4, not 3
@@ -327,3 +328,280 @@ def test_cli_strict_fails_on_warn(tmp_path):
     _build_ceil_pyramid(group, fill=True)  # no multiscales => WARN
     assert main([str(group)]) == 0
     assert main([str(group), "--strict"]) == 2
+
+
+# Review regressions: path identity, dimensions, semantics, bounded I/O, coverage.
+
+
+def _good_store(group, shape=(8, 8, 8), levels=3):
+    _build_ceil_pyramid(group, base_shape=shape, num_levels=levels,
+                        chunks=(8,) * len(shape), fill=True)
+    _write_multiscales(group, num_levels=levels,
+                      scales=[[2**l] * len(shape) for l in range(levels)],
+                      units=["micrometer"] * len(shape))
+    (group / "metadata.json").write_text(json.dumps({
+        "scan": "s1", "voxelsize": 7.91, "z_direction_is_top_to_bottom": True}))
+    return group
+
+
+def _edit_ms(group, edit):
+    attrs = json.loads((group / ".zattrs").read_text())
+    edit(attrs["multiscales"][0])
+    (group / ".zattrs").write_text(json.dumps(attrs))
+
+
+@pytest.mark.parametrize("paths", [["0", "1", "99"], ["0", "0", "0"], ["1", "0", "2"]],
+                         ids=["missing", "duplicate", "reordered"])
+def test_dataset_paths_missing_duplicate_reordered_rejected(tmp_path, paths):
+    group = _good_store(tmp_path / "vol.zarr")
+    _edit_ms(group, lambda ms: [d.update(path=p) for d, p in zip(ms["datasets"], paths)])
+    results = _by_name(run_all_checks(group))
+    assert results["ome_scale_metadata"].status == FAIL
+    assert results["level_z_consistency"].status == FAIL
+
+
+@pytest.mark.parametrize("names", [("c", "z", "y", "x"), ("t", "c", "z", "y", "x")])
+def test_channel_time_axes_without_units_pass_strict(tmp_path, names):
+    group = tmp_path / "vol.zarr"
+    spatial = [n in "zyx" for n in names]
+    base = [2 if n in "tc" else 8 for n in names]
+    for l in range(3):
+        shape = [(_ceil_div(n, l) if sp else n) for n, sp in zip(base, spatial)]
+        _write_level(group, l, shape, chunks=(8,) * len(names), fill=True)
+    _write_multiscales(group, axes_names=names,
+                      scales=[[2**l if sp else 1 for sp in spatial] for l in range(3)])
+    def edit(ms):
+        for a in ms["axes"]:
+            a["type"] = {"c": "channel", "t": "time"}.get(a["name"], "space")
+            if a["type"] == "space":
+                a["unit"] = "micrometer"
+    _edit_ms(group, edit)
+    assert not [r for r in run_all_checks(group) if r.status in (WARN, FAIL)]
+    assert qa.main([str(group), "--strict"]) == 0
+
+
+@pytest.mark.parametrize("width", [2, 4], ids=["short", "oversized"])
+def test_scale_vector_rank_mismatch_fails_without_crash(tmp_path, width):
+    group = _good_store(tmp_path / "vol.zarr")
+    _edit_ms(group, lambda ms: [d.update(coordinateTransformations=[{
+        "type": "scale", "scale": [2**i] * width}]) for i, d in enumerate(ms["datasets"])])
+    result = qa.check_ome_scale_metadata(group, [read_array_meta(i, group / str(i)) for i in range(3)])
+    assert result.status == FAIL
+    assert "rank" in result.message
+
+
+@pytest.mark.parametrize("version,status", [("0.4", FAIL), ("0.10", FAIL), ("0.3", WARN)])
+def test_axes_omitted_reports_version_appropriate_status(tmp_path, version, status):
+    group = _good_store(tmp_path / "vol.zarr")
+    def edit(ms):
+        ms.pop("axes")
+        ms["version"] = version
+    _edit_ms(group, edit)
+    assert _by_name(run_all_checks(group))["ome_scale_metadata"].status == status
+
+
+def test_axes_wrong_length_fails(tmp_path):
+    group = _good_store(tmp_path / "vol.zarr")
+    _edit_ms(group, lambda ms: ms["axes"].pop())
+    assert _by_name(run_all_checks(group))["ome_scale_metadata"].status == FAIL
+
+
+@pytest.mark.parametrize("omit_types", [False, True])
+def test_singleton_spatial_axis_scale_doubles_without_warning(tmp_path, omit_types):
+    group = _good_store(tmp_path / "vol.zarr", shape=(1, 8, 8))
+    if omit_types:
+        _edit_ms(group, lambda ms: [a.pop("type") for a in ms["axes"]])
+    assert not [r for r in run_all_checks(group) if r.status in (WARN, FAIL)]
+
+
+def test_channel_shape_must_remain_constant(tmp_path):
+    group = _good_store(tmp_path / "vol.zarr")
+    _edit_ms(group, lambda ms: ms["axes"][0].update(name="c", type="channel"))
+    assert _by_name(run_all_checks(group))["pyramid_level_shapes"].status == FAIL
+
+
+def test_chunk_sampling_one_is_bounded_and_deterministic(tmp_path, monkeypatch):
+    root = tmp_path / "chunks"
+    for i in range(100):
+        directory = root / str(i) / "0"
+        directory.mkdir(parents=True)
+        for j in range(10):
+            (directory / str(j)).write_bytes(b"1")
+    real = qa.os.scandir
+    visited = []
+    def scan(path):
+        visited.append(str(path))
+        return real(path)
+    monkeypatch.setattr(qa.os, "scandir", scan)
+    first = qa._chunk_files(root, 1)
+    assert len(visited) == 3  # root, first branch, its leaf directory
+    visited.clear()
+    assert qa._chunk_files(root, 1) == first == [root / "0" / "0" / "0"]
+    assert len(visited) == 3
+    assert qa._chunk_files(root, 0) == []
+
+
+@pytest.mark.parametrize("layout,expected", [
+    ({"scan": {"voxelsize": "7.91"}}, 7.91),
+    ({"scan": {"tomo": {"acquisition": {"detector": {"samplePixelSize": "0.00791"}}}}}, 7.91),
+    ({"scan": {}, "tomo": {"acquisition": {"detector": {"samplePixelSize": 0.00791}}}}, 7.91),
+    ({"scan": {}, "source": {"resolution": "2", "metadata": {
+        "tomo": {"acquisition": {"detector": {"samplePixelSize": 0.00791}}}}}}, 31.64),
+])
+def test_voxel_size_resolver_supported_nested_sources(tmp_path, layout, expected):
+    group = tmp_path / "vol.zarr"
+    group.mkdir()
+    layout["z_direction_is_top_to_bottom"] = True
+    (group / "metadata.json").write_text(json.dumps(layout))
+    result = check_metadata_json_keys(group)
+    assert result.status == PASS
+    assert result.details["voxel_size"]["value_um"] == pytest.approx(expected)
+    assert "metadata.json:" in result.details["voxel_size"]["source"]
+
+
+@pytest.mark.parametrize("value", [True, False, 0, -1, "nan", "inf", "bad"])
+def test_voxel_size_unresolvable_values_fail(tmp_path, value):
+    group = tmp_path / "vol.zarr"
+    group.mkdir()
+    (group / "metadata.json").write_text(json.dumps({
+        "scan": {}, "voxelsize": value, "z_direction_is_top_to_bottom": True}))
+    assert check_metadata_json_keys(group).status == FAIL
+
+
+@pytest.mark.parametrize("key", ["voxelsize", "voxel_size_um", "voxelSizeUm", "pixel_size_um", "pixelSizeUm", "resolution_um"])
+def test_voxel_size_meta_json_precedence_and_aliases(tmp_path, key):
+    group = _good_store(tmp_path / "vol.zarr")
+    (group / "meta.json").write_text(json.dumps({key: "12.5"}))
+    result = check_metadata_json_keys(group)
+    assert result.status == PASS
+    assert result.details["voxel_size"]["value_um"] == 12.5
+    assert "meta.json:" in result.details["voxel_size"]["source"]
+
+
+def test_levels_limit_applies_to_datasets_and_cli(tmp_path):
+    group = _good_store(tmp_path / "vol.zarr", shape=(32, 32, 32), levels=6)
+    results = run_all_checks(group, levels=4)
+    assert all(r.status == PASS for r in results), results
+    assert qa.main([str(group), "--levels", "4", "--strict"]) == 0
+
+
+@pytest.mark.parametrize("encoding", ["v2-dot", "v2-slash", "v3-default", "v3-dot", "v3-v2"])
+@pytest.mark.parametrize("source_present", [True, False], ids=["missing_object_2092", "fill_region"])
+def test_chunk_coverage_missing_object_and_fill_region(tmp_path, encoding, source_present):
+    group = tmp_path / "vol.zarr"
+    group.mkdir()
+    for level, shape in enumerate([(8, 8, 8), (4, 4, 4)]):
+        directory = group / str(level)
+        directory.mkdir()
+        sep = "." if encoding in ("v2-dot", "v3-dot", "v3-v2") else "/"
+        if encoding.startswith("v2"):
+            (directory / ".zarray").write_text(json.dumps({
+                "shape": shape, "chunks": [4, 4, 4], "dtype": "|u1",
+                **({"dimension_separator": sep} if sep == "/" else {})}))
+        else:
+            enc = {"name": "v2"} if encoding == "v3-v2" else {"name": "default"}
+            if encoding == "v3-dot":
+                enc["configuration"] = {"separator": "."}
+            (directory / "zarr.json").write_text(json.dumps({
+                "node_type": "array", "shape": shape, "data_type": "uint8",
+                "chunk_grid": {"configuration": {"chunk_shape": [4, 4, 4]}},
+                "chunk_key_encoding": enc}))
+    metas = [read_array_meta(l, group / str(l)) for l in range(2)]
+    if source_present:
+        key = qa._chunk_key(metas[0], (0, 0, 0))
+        path = group / "0" / key
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"source")
+    result = qa.check_chunk_coverage(metas)
+    assert result.status == (WARN if source_present else PASS)
+    if source_present:
+        assert result.details["offenders"] == [{"level": 1, "chunk": qa._chunk_key(metas[1], (0, 0, 0))}]
+
+
+def test_chunk_coverage_targeted_lookups_bounded(tmp_path, monkeypatch):
+    group = _good_store(tmp_path / "vol.zarr")
+    metas = [read_array_meta(l, group / str(l)) for l in range(3)]
+    calls = []
+    real = qa.Path.is_file
+    def is_file(path):
+        calls.append(str(path))
+        return real(path)
+    monkeypatch.setattr(qa.Path, "is_file", is_file)
+    result = qa.check_chunk_coverage(metas, sample=1)
+    assert result.details["examined"] == 2
+    assert len(calls) == 2
+    assert qa.check_chunk_coverage(metas[:1]).status == SKIP
+
+
+def test_chunk_coverage_2092_deleted_written_chunk_correct_shape(tmp_path):
+    group = _good_store(tmp_path / "vol.zarr")
+    coarse = group / "1" / "0" / "0" / "0"
+    assert coarse.is_file()
+    coarse.unlink()
+    results = _by_name(run_all_checks(group))
+    assert results["pyramid_level_shapes"].status == PASS
+    assert results["chunk_coverage"].status == WARN
+    assert {"level": 1, "chunk": "0/0/0"} in results["chunk_coverage"].details["offenders"]
+
+
+def test_levels_limit_retains_store_wide_gap_check(tmp_path):
+    group = _good_store(tmp_path / "vol.zarr")
+    _write_level(group, 4, (1, 1, 1))
+    result = _by_name(run_all_checks(group, levels=2))["level_z_consistency"]
+    assert result.status == FAIL
+    assert result.details["gaps"] == [3]
+
+
+def test_voxel_size_meta_unresolvable_falls_back_and_scan_precedes_detector(tmp_path):
+    group = _good_store(tmp_path / "vol.zarr")
+    (group / "meta.json").write_text("{broken")
+    (group / "metadata.json").write_text(json.dumps({
+        "scan": {"voxelsize": "12.5", "tomo": {"acquisition": {
+            "detector": {"samplePixelSize": 0.00791}}}},
+        "z_direction_is_top_to_bottom": True}))
+    result = check_metadata_json_keys(group)
+    assert result.status == PASS
+    assert result.details["voxel_size"]["value_um"] == 12.5
+    assert result.details["voxel_size"]["source"].endswith(":scan.voxelsize")
+
+
+@pytest.mark.parametrize("resolution", [None, True, -1, 1.5, 32, "nan"])
+def test_voxel_size_source_requires_valid_resolution_level(tmp_path, resolution):
+    group = _good_store(tmp_path / "vol.zarr")
+    (group / "metadata.json").write_text(json.dumps({
+        "scan": {}, "source": {"resolution": resolution, "metadata": {
+            "tomo": {"acquisition": {"detector": {"samplePixelSize": 0.00791}}}}},
+        "z_direction_is_top_to_bottom": True}))
+    assert check_metadata_json_keys(group).status == FAIL
+
+
+@pytest.mark.parametrize("sample", [2, 5, 24, 32])
+def test_chunk_coverage_sample_coordinates_deterministic(sample):
+    grid = (2, 3, 4)
+    selected = list(qa._sample_chunk_coordinates(grid, sample))
+    assert selected == list(qa._sample_chunk_coordinates(grid, sample))
+    linear = [(z * 3 + y) * 4 + x for z, y, x in selected]
+    count = min(24, sample)
+    assert linear == [i * 23 // (count - 1) for i in range(count)]
+    assert selected[0] == (0, 0, 0)
+    assert selected[-1] == (1, 2, 3)
+    assert len(set(selected)) == count
+
+
+def test_chunk_coverage_sample_single_and_huge_grid():
+    assert list(qa._sample_chunk_coordinates((2, 3, 4), 1)) == [(0, 0, 0)]
+    assert list(qa._sample_chunk_coordinates((10**12, 10**12), 2)) == [
+        (0, 0), (10**12 - 1, 10**12 - 1)]
+
+
+def test_chunk_coverage_sample_detects_deleted_last_chunk(tmp_path):
+    group = tmp_path / "vol.zarr"
+    source = _write_level(group, 0, (16, 16, 16), fill=True)
+    assert source.shape == (16, 16, 16)
+    _write_level(group, 1, (8, 8, 8), fill=True)
+    metas = [read_array_meta(l, group / str(l)) for l in range(2)]
+    (group / "1" / "1" / "1" / "1").unlink()
+    result = qa.check_chunk_coverage(metas, sample=3)
+    assert result.status == WARN
+    assert result.details["offenders"] == [{"level": 1, "chunk": "1/1/1"}]
+    assert result.details["per_level"] == [{"level": 1, "examined": 3, "total": 8}]
