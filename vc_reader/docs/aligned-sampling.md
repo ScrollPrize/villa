@@ -155,8 +155,8 @@ changes nearest-neighbor decisions. There are no bulk float64 coordinate arrays.
 Using the existing environments and configured build directories:
 
 ```bash
-AGENTS_AGENT_MODE=1 cmake --build build/cp314-cp314-linux_x86_64 --target _reader _augment -j 2
-AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-reader-cuda --target _reader _augment -j 2
+AGENTS_AGENT_MODE=1 cmake --build build/cp314-cp314-linux_x86_64 --target _reader _transforms -j 2
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-reader-cuda --target _reader _transforms -j 2
 AGENTS_AGENT_MODE=1 VC_READER_BUILD_DIR=build/cp314-cp314-linux_x86_64 .venv/bin/python -m unittest discover -s tests -p test_sampling.py -v
 AGENTS_AGENT_MODE=1 VC_READER_BUILD_DIR=/tmp/vc-reader-cuda .venv/bin/python -m unittest discover -s tests -v
 ```

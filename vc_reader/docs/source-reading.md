@@ -211,7 +211,7 @@ HTTP tests use loopback servers. Tests cover
 exact image/label values, selection and registration, pre-decode limits,
 shared budgets, eviction, atomic population, authentication/retries, offline
 hits/misses, v3 range/checksum failures, and process reopening. The configured
-CUDA build also runs sampling/augmentation/training tests. Aligned label
+CUDA build also runs sampling/transform/training tests. Aligned label
 sampling and its CPU/CUDA equality checks are documented in
 [aligned sampling](aligned-sampling.md).
 

@@ -12,7 +12,7 @@ if os.environ.get('VC_READER_BUILD_DIR'):
     from extension_build import load_extensions
     load_extensions(Path(os.environ['VC_READER_BUILD_DIR']))
 
-from vc_reader import cuda, _reader, augment
+from vc_reader import cuda, _reader, transforms
 from vc_reader.reader import ZarrReader
 from vc_reader.sheet_normal import sheet_normals
 from test_source_storage import array
@@ -95,7 +95,7 @@ def test_exported_augmentation_views_keep_inputs_alive(torch_cuda,inplace):
     torch = torch_cuda
     host = np.arange(64,dtype=np.float32).reshape(1,4,4,4)
     source = cuda.asarray(host)
-    pipeline = augment.Pipeline([augment.BrightnessAdd(shift=3)],backend='cuda')
+    pipeline = transforms.Pipeline([transforms.BrightnessAdd(shift=3)],backend='cuda')
     output = pipeline({'image':source},seed=1,inplace=inplace)['image'].reshape(4,4,4)
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):

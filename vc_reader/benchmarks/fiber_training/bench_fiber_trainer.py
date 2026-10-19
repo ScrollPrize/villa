@@ -158,8 +158,8 @@ def main():
 
     extension_build = None
     if backend is not None:
-        from vc_reader import _augment, _reader
-        binary = Path(_augment.__file__).resolve()
+        from vc_reader import _transforms, _reader
+        binary = Path(_transforms.__file__).resolve()
         extension_build = dict(path=str(binary), sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
                             revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'],
                                 cwd=Path(__file__).resolve().parent, text=True).strip())

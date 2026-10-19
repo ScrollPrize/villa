@@ -108,7 +108,7 @@ def crop_affines(positions, frames, crop, scale):
 
 
 def augmentation_pipeline(backend='cuda'):
-    from vc_reader import augment as a
+    from vc_reader import transforms as a
     # Per-sample values are resolved by the common C++ batch executor.
     return a.Pipeline([
         a.Normalize(mode='fixed', scale=255.),

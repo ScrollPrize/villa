@@ -172,7 +172,7 @@ class TrainingDataset:
 
 
 def pipeline(arrays, *, spatial_dims, backend='cuda', transforms=None):
-    from vc_reader import augment as A
+    from vc_reader import transforms as A
     if spatial_dims not in (2, 3):
         raise ValueError('declare spatial_dims=2 or 3')
     targets = {}

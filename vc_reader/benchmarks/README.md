@@ -1,14 +1,14 @@
 # Benchmarks
 
 Run commands from the `vc_reader/` package directory. Use matching Release
-reader and augmentation extensions; CUDA measurements require a CUDA-enabled
+reader and transform extensions; CUDA measurements require a CUDA-enabled
 build. Generated reports in `benchmarks/results/` and `docs/benchmarks/` are
 local artifacts ignored by Git. Input fixtures remain versioned.
 
 | Suite | Measures |
 | --- | --- |
-| [`bench_pipeline.py`](bench_pipeline.py) | CPU/CUDA reading, sampling, normalization and augmentation |
-| [`bench_augmentations.py`](bench_augmentations.py) | Individual augmentation recipes, including transfers and resident CUDA arrays |
+| [`bench_pipeline.py`](bench_pipeline.py) | CPU/CUDA reading, sampling, normalization and transforms |
+| [`bench_transforms.py`](bench_transforms.py) | Individual transform recipes, including transfers and resident CUDA arrays |
 | [`bench_torch.py`](bench_torch.py) | Per-sample processing, CUDA batches and loader prefetch |
 | [`fiber_training/bench_fiber_trainer.py`](fiber_training/bench_fiber_trainer.py) | Full model and optimizer updates with the fiber trainer |
 
@@ -23,7 +23,7 @@ The CUDA run also uses `--heading-stream separate`. Supply `--checkpoint`,
 `--location-weights-dir`, and a fresh `--output` directory; `--help` lists the
 environment and build-selection options.
 
-| Input pipeline | Reading / sampling | Augmentation | Geometry targets | Heading |
+| Input pipeline | Reading / sampling | Transforms | Geometry targets | Heading |
 | --- | --- | --- | --- | --- |
 | Original trainer | Trainer CPU code | Trainer CPU code | Trainer CPU code | Learned heading model and trainer CT fallback |
 | vc_reader CPU | C++ CPU, loader workers | C++ CPU, loader workers | C++ CPU, loader workers | CPU structure tensor |
@@ -44,34 +44,14 @@ Throughput counts each **144×104×104** single-channel crop once: **24,920,064,
 and **99,680,256,000 bytes** across 16,000 float32 model-input crops. MB/s uses
 decimal megabytes (10⁶ bytes); Mvox/s uses 10⁶ voxels.
 
-The main-thread breakdown is shown below. For CPU inputs, image preparation
-happens in workers and is exposed through loader waits; transfer to the model
-is inside the update interval. CUDA image preparation is measured on the
-main thread, while target preparation overlaps it in batch prefetch.
-
-| Pipeline | Loader wait | Main input preparation | Model/optimizer | Update p50 / p95 |
-| --- | ---: | ---: | ---: | ---: |
-| Original trainer | 99.870 s | 0.029 s | 36.507 s | 72.99 / 1495.44 ms |
-| vc_reader CPU | 101.786 s | 0.032 s | 34.310 s | 69.53 / 1773.11 ms |
-| vc_reader CUDA | 0.756 s | 10.697 s | 35.805 s | 93.24 / 109.45 ms |
-
-Update percentiles include the loader/input interval. The stage sums omit
-between-update bookkeeping, which is included in the wall-time total.
-
-| Pipeline | Crops | Distinct positions | Distinct source-chunk footprints |
-| --- | ---: | ---: | ---: |
-| Original trainer | 16,000 | 15,493 | 36,966 |
-| vc_reader CPU | 16,000 | 15,528 | 37,037 |
-| vc_reader CUDA | 16,000 | 15,495 | 36,894 |
-
 
 ## Reader and pipeline benchmarks
 
 [`bench_pipeline.py`](bench_pipeline.py) compares reading/sampling or complete
-sampling/augmentation pipelines. It accepts local, HTTP or S3 3-D uint8 Zarr v2
+sampling/transform pipelines. It accepts local, HTTP or S3 3-D uint8 Zarr v2
 arrays. Reader comparisons include vc_reader CPU/CUDA, TensorStore and
 zarr-python. The pipeline suite compares vc_reader backends and optionally
-CPU reading followed by CUDA augmentation.
+CPU reading followed by CUDA transforms.
 
 ```bash
 .venv/bin/python benchmarks/bench_pipeline.py --suite readers --backend both \
@@ -80,7 +60,7 @@ CPU reading followed by CUDA augmentation.
   --plane-size 512 512 --batch-size 8 --output /tmp/readers.json
 
 .venv/bin/python benchmarks/bench_pipeline.py --suite pipeline --backend both \
-  --array /path/to/volume.zarr --level 2 --augmentation heavy \
+  --array /path/to/volume.zarr --level 2 --transform heavy \
   --shape 128 128 128 --output /tmp/pipeline.json
 ```
 
@@ -92,22 +72,22 @@ Reader baselines fetch enclosing regions and use the same SciPy trilinear
 sampler; vc_reader samples directly from chunks. These synchronous request
 measurements do not include a model or represent an overlapped trainer.
 
-## Augmentation benchmarks
+## Transform benchmarks
 
-[`bench_augmentations.py`](bench_augmentations.py) measures all README recipes
+[`bench_transforms.py`](bench_transforms.py) measures all README recipes
 on CPU, CUDA with transfers, and CUDA with resident arrays. Recipes and input
-construction live in [`augmentation_cases.py`](augmentation_cases.py), shared
-with [`generate_augment_previews.py`](generate_augment_previews.py).
+construction live in [`transform_cases.py`](transform_cases.py), shared
+with [`generate_transform_previews.py`](generate_transform_previews.py).
 `--update-readme` changes timing rows in the package
 README without altering examples or images.
 
 ```bash
 VC_BENCH_VOLUME=/path/to/PHercParis4-volume.zarr
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
-  .venv/bin/python benchmarks/bench_augmentations.py \
+  .venv/bin/python benchmarks/bench_transforms.py \
   --build-dir /tmp/vc-reader-cuda --array "$VC_BENCH_VOLUME" --level 2 \
   --start 9000 3600 3600 --size 128 --warmup 1 --reps 5 \
-  --output /tmp/augmentations.json
+  --output /tmp/transforms.json
 ```
 
 Use `--only Elastic Gamma` for selected recipes. Preparation, validation and
@@ -122,7 +102,7 @@ than treated as model-quality results.
 [`bench_torch.py`](bench_torch.py) compares per-sample processing,
 `Pipeline.batch()`, and `CudaLoader` with one prefetched batch. Routes use the
 same images and per-sample seeds; a validation/warmup epoch precedes timing.
-Reading, transfers, casting, augmentation and collation are included. There is
+Reading, transfers, casting, transform and collation are included. There is
 no forward/backward pass; use the fiber trainer comparison for actual training.
 
 ```bash

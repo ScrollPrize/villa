@@ -26,7 +26,7 @@ if os.environ.get("VC_READER_BUILD_DIR"):
 
 
 def pipeline():
-    from vc_reader import augment as A
+    from vc_reader import transforms as A
     return A.Pipeline([A.Normalize('minmax'), *heavy_transforms()],
                       backend='cuda', compact=False)
 
@@ -34,13 +34,13 @@ def pipeline():
 class Crops(Dataset):
     def __init__(self, args, location, serial=False):
         self.args, self.location, self.serial = args, location, serial
-        self.reader = self.augmentation = None
+        self.reader = self.transform = None
 
     def __len__(self):
         return self.args.batches * self.args.batch_size
 
     def __getitem__(self, index):
-        from vc_reader import augment as A, cuda
+        from vc_reader import transforms as A, cuda
         from vc_reader.reader import ZarrReader
         if self.reader is None:
             self.reader = ZarrReader.open(self.location, level=self.args.level, threads=self.args.reader_threads,
@@ -51,20 +51,20 @@ class Crops(Dataset):
         image = self.reader.read_region(origin, shape).reshape(1, *shape)
         seed = A.seed(self.args.seed, index)
         if self.serial:
-            if self.augmentation is None:
-                self.augmentation = pipeline()
-            output = self.augmentation({'image': cuda.asarray(image).astype(np.float32)}, seed=seed)['image']
+            if self.transform is None:
+                self.transform = pipeline()
+            output = self.transform({'image': cuda.asarray(image).astype(np.float32)}, seed=seed)['image']
             image = torch.from_dlpack(output)
         return {'image': image, 'aug_seed': np.asarray(seed, dtype=np.uint64)}
 
 
 class PublicBatch:
-    def __init__(self, loader, augmentation):
-        self.loader, self.augmentation = loader, augmentation
+    def __init__(self, loader, transform):
+        self.loader, self.transform = loader, transform
 
     def __iter__(self):
         for batch in self.loader:
-            yield self.augmentation.batch(batch, seeds=batch['aug_seed'])
+            yield self.transform.batch(batch, seeds=batch['aug_seed'])
 
 
 def main():
@@ -93,9 +93,9 @@ def main():
     # Reuse the existing benchmark environment/provenance recorder.
     args.backend = 'cuda'
     report = dict(command=[sys.executable, *sys.argv], config={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
-                  environment=environment(args, augmentation=True), torch=torch.__version__, results={},
+                  environment=environment(args, transform=True), torch=torch.__version__, results={},
                   protocol='one validation/warmup epoch per mode; rotated mode order per repetition; warm caches; '
-                           'GPU-ready batches; includes reads, transfers, casts, augmentation, collation and output disposal; '
+                           'GPU-ready batches; includes reads, transfers, casts, transform, collation and output disposal; '
                            'excludes startup/validation and model execution')
     with ExitStack() as stack:
         location = args.array
@@ -105,11 +105,11 @@ def main():
         report['input'] = location if args.array else 'temporary seeded uniform uint8 Zarr'
         cpu = DataLoader(Crops(args, location), batch_size=args.batch_size, num_workers=args.workers,
                          multiprocessing_context='spawn', persistent_workers=True, pin_memory=True)
-        augmentation = pipeline()
-        report['transforms'] = [repr(t) for t in augmentation.transforms]
+        transform = pipeline()
+        report['transforms'] = [repr(t) for t in transform.transforms]
         loaders = dict(serial=DataLoader(Crops(args, location, serial=True), batch_size=args.batch_size),
-                       batch=PublicBatch(cpu, augmentation),
-                       prefetch=CudaLoader(cpu, augmentation, seed_key='aug_seed'))
+                       batch=PublicBatch(cpu, transform),
+                       prefetch=CudaLoader(cpu, transform, seed_key='aug_seed'))
         hashes = {}
         for mode in args.modes:
             hashes[mode] = []

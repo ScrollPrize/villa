@@ -23,103 +23,103 @@ if(nanobind_VERSION VERSION_LESS 2.10.2)
 endif()
 find_package(Threads REQUIRED)
 
-# The augmentation module has no dependency on reader networking or codecs.
-nanobind_add_module(_augment NB_STATIC NOMINSIZE cpp/augment/bindings.cpp)
-install(TARGETS _augment LIBRARY DESTINATION vc_reader)
+# The transform module has no dependency on reader networking or codecs.
+nanobind_add_module(_transforms NB_STATIC NOMINSIZE src/cpp/transforms/bindings.cpp)
+install(TARGETS _transforms LIBRARY DESTINATION vc_reader)
 
 # CPU builds never require the toolkit or load the CUDA runtime.
-option(VC_READER_ENABLE_CUDA "Build optional CUDA reader and augmentation backends" OFF)
+option(VC_READER_ENABLE_CUDA "Build optional CUDA reader and transform backends" OFF)
 if(VC_READER_ENABLE_CUDA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
-    target_sources(_augment PRIVATE
-        cpp/augment/cuda/bias_field.cu
-        cpp/augment/cuda/plasma_brightness_contrast.cu
-        cpp/augment/cuda/plasma_shadow.cu
-        cpp/augment/cuda/illumination.cu
-        cpp/augment/cuda/vignetting.cu
-        cpp/augment/cuda/random_tone_curve.cu
-        cpp/augment/cuda/multiplicative_noise.cu
-        cpp/augment/cuda/shot_noise.cu
-        cpp/augment/cuda/additive_noise.cu
-        cpp/augment/cuda/salt_and_pepper.cu
-        cpp/augment/cuda/motion_blur.cu
-        cpp/augment/cuda/defocus.cu
-        cpp/augment/cuda/zoom_blur.cu
-        cpp/augment/cuda/equalize.cu
-        cpp/augment/cuda/clahe.cu
-        cpp/augment/cuda/histogram_matching.cu
-        cpp/augment/cuda/pixel_distribution_adaptation.cu
-        cpp/augment/cuda/fourier_domain_adaptation.cu
-        cpp/augment/cuda/unsharp_mask.cu
-        cpp/augment/cuda/gibbs_ringing.cu
-        cpp/augment/cuda/ringing_overshoot.cu
-        cpp/augment/cuda/foreground_crop.cu
-        cpp/augment/cuda/channel_misalignment.cu
-        cpp/augment/cuda/grid_dropout.cu
-        cpp/augment/cuda/stripe_masking.cu
-        cpp/augment/cuda/foreground_dropout.cu
-        cpp/augment/cuda/object_dropout.cu
-        cpp/augment/cuda/fourier.cu
-        cpp/augment/cuda/dropout_mask.cu
-        cpp/augment/cuda/clip_outliers.cu
-        cpp/augment/cuda/crop_pad.cu
-        cpp/augment/cuda/affine.cu
-        cpp/augment/cuda/sheet_compression.cu
-        cpp/augment/cuda/strip_geometry.cu
-        cpp/augment/cuda/surface_perturb.cu
-        cpp/augment/cuda/morphology.cu
-        cpp/augment/cuda/remove_components.cu
-        cpp/augment/cuda/replace_label.cu
-        cpp/augment/cuda/regions.cu
-        cpp/augment/cuda/one_hot.cu
-        cpp/augment/cuda/mask_image.cu
-        cpp/augment/cuda/deep_supervision.cu
-        cpp/augment/cuda/to_pseudo_2d.cu
-        cpp/augment/cuda/from_pseudo_2d.cu
-        cpp/augment/cuda/backend.cu
-        cpp/augment/cuda/blank_rectangle.cu
-        cpp/augment/cuda/brightness_add.cu
-        cpp/augment/cuda/brightness_gradient.cu
-        cpp/augment/cuda/brightness_multiply.cu
-        cpp/augment/cuda/contrast.cu
-        cpp/augment/cuda/directional.cu
-        cpp/augment/cuda/elastic.cu
-        cpp/augment/cuda/flip.cu
-        cpp/augment/cuda/gamma.cu
-        cpp/augment/cuda/gaussian_blur.cu
-        cpp/augment/cuda/gaussian_noise.cu
-        cpp/augment/cuda/geometry.cu
-        cpp/augment/cuda/invert.cu
-        cpp/augment/cuda/local_contrast.cu
-        cpp/augment/cuda/local_field.cu
-        cpp/augment/cuda/local_gamma.cu
-        cpp/augment/cuda/local_smoothing.cu
-        cpp/augment/cuda/low_resolution.cu
-        cpp/augment/cuda/median_filter.cu
-        cpp/augment/cuda/medial_surface.cu
-        cpp/augment/cuda/normalization.cu
-        cpp/augment/cuda/oriented_blur.cu
-        cpp/augment/cuda/random_binary_operator.cu
-        cpp/augment/cuda/resident.cu
-        cpp/augment/cuda/rician_noise.cu
-        cpp/augment/cuda/rotate90.cu
-        cpp/augment/cuda/sharpen.cu
-        cpp/augment/cuda/slice_illumination.cu
-        cpp/augment/cuda/smear.cu
-        cpp/augment/cuda/distance_transform.cu
-        cpp/augment/cuda/structure_tensor.cu
-        cpp/augment/cuda/statistics.cu
-        cpp/augment/cuda/thick_slice.cu
-        cpp/augment/cuda/transpose.cu
+    target_sources(_transforms PRIVATE
+        src/cpp/transforms/cuda/bias_field.cu
+        src/cpp/transforms/cuda/plasma_brightness_contrast.cu
+        src/cpp/transforms/cuda/plasma_shadow.cu
+        src/cpp/transforms/cuda/illumination.cu
+        src/cpp/transforms/cuda/vignetting.cu
+        src/cpp/transforms/cuda/random_tone_curve.cu
+        src/cpp/transforms/cuda/multiplicative_noise.cu
+        src/cpp/transforms/cuda/shot_noise.cu
+        src/cpp/transforms/cuda/additive_noise.cu
+        src/cpp/transforms/cuda/salt_and_pepper.cu
+        src/cpp/transforms/cuda/motion_blur.cu
+        src/cpp/transforms/cuda/defocus.cu
+        src/cpp/transforms/cuda/zoom_blur.cu
+        src/cpp/transforms/cuda/equalize.cu
+        src/cpp/transforms/cuda/clahe.cu
+        src/cpp/transforms/cuda/histogram_matching.cu
+        src/cpp/transforms/cuda/pixel_distribution_adaptation.cu
+        src/cpp/transforms/cuda/fourier_domain_adaptation.cu
+        src/cpp/transforms/cuda/unsharp_mask.cu
+        src/cpp/transforms/cuda/gibbs_ringing.cu
+        src/cpp/transforms/cuda/ringing_overshoot.cu
+        src/cpp/transforms/cuda/foreground_crop.cu
+        src/cpp/transforms/cuda/channel_misalignment.cu
+        src/cpp/transforms/cuda/grid_dropout.cu
+        src/cpp/transforms/cuda/stripe_masking.cu
+        src/cpp/transforms/cuda/foreground_dropout.cu
+        src/cpp/transforms/cuda/object_dropout.cu
+        src/cpp/transforms/cuda/fourier.cu
+        src/cpp/transforms/cuda/dropout_mask.cu
+        src/cpp/transforms/cuda/clip_outliers.cu
+        src/cpp/transforms/cuda/crop_pad.cu
+        src/cpp/transforms/cuda/affine.cu
+        src/cpp/transforms/cuda/sheet_compression.cu
+        src/cpp/transforms/cuda/strip_geometry.cu
+        src/cpp/transforms/cuda/surface_perturb.cu
+        src/cpp/transforms/cuda/morphology.cu
+        src/cpp/transforms/cuda/remove_components.cu
+        src/cpp/transforms/cuda/replace_label.cu
+        src/cpp/transforms/cuda/regions.cu
+        src/cpp/transforms/cuda/one_hot.cu
+        src/cpp/transforms/cuda/mask_image.cu
+        src/cpp/transforms/cuda/deep_supervision.cu
+        src/cpp/transforms/cuda/to_pseudo_2d.cu
+        src/cpp/transforms/cuda/from_pseudo_2d.cu
+        src/cpp/transforms/cuda/backend.cu
+        src/cpp/transforms/cuda/blank_rectangle.cu
+        src/cpp/transforms/cuda/brightness_add.cu
+        src/cpp/transforms/cuda/brightness_gradient.cu
+        src/cpp/transforms/cuda/brightness_multiply.cu
+        src/cpp/transforms/cuda/contrast.cu
+        src/cpp/transforms/cuda/directional.cu
+        src/cpp/transforms/cuda/elastic.cu
+        src/cpp/transforms/cuda/flip.cu
+        src/cpp/transforms/cuda/gamma.cu
+        src/cpp/transforms/cuda/gaussian_blur.cu
+        src/cpp/transforms/cuda/gaussian_noise.cu
+        src/cpp/transforms/cuda/geometry.cu
+        src/cpp/transforms/cuda/invert.cu
+        src/cpp/transforms/cuda/local_contrast.cu
+        src/cpp/transforms/cuda/local_field.cu
+        src/cpp/transforms/cuda/local_gamma.cu
+        src/cpp/transforms/cuda/local_smoothing.cu
+        src/cpp/transforms/cuda/low_resolution.cu
+        src/cpp/transforms/cuda/median_filter.cu
+        src/cpp/transforms/cuda/medial_surface.cu
+        src/cpp/transforms/cuda/normalization.cu
+        src/cpp/transforms/cuda/oriented_blur.cu
+        src/cpp/transforms/cuda/random_binary_operator.cu
+        src/cpp/transforms/cuda/resident.cu
+        src/cpp/transforms/cuda/rician_noise.cu
+        src/cpp/transforms/cuda/rotate90.cu
+        src/cpp/transforms/cuda/sharpen.cu
+        src/cpp/transforms/cuda/slice_illumination.cu
+        src/cpp/transforms/cuda/smear.cu
+        src/cpp/transforms/cuda/distance_transform.cu
+        src/cpp/transforms/cuda/structure_tensor.cu
+        src/cpp/transforms/cuda/statistics.cu
+        src/cpp/transforms/cuda/thick_slice.cu
+        src/cpp/transforms/cuda/transpose.cu
     )
-    target_compile_definitions(_augment PRIVATE VC_READER_CUDA=1)
-    target_link_libraries(_augment PRIVATE CUDA::cudart CUDA::cufft)
-    set_target_properties(_augment PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
-    target_compile_options(_augment PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+    target_compile_definitions(_transforms PRIVATE VC_READER_CUDA=1)
+    target_link_libraries(_transforms PRIVATE CUDA::cudart CUDA::cufft)
+    set_target_properties(_transforms PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+    target_compile_options(_transforms PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
 endif()
 
-option(VC_READER_BUILD_READER "Build the C++ Zarr reader as well as augmentation" ON)
+option(VC_READER_BUILD_READER "Build the C++ Zarr reader as well as transform" ON)
 if(VC_READER_BUILD_READER)
     find_package(CURL REQUIRED)
     find_package(PkgConfig REQUIRED)
@@ -139,16 +139,16 @@ if(VC_READER_BUILD_READER)
     set_target_properties(vc_delta3d PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
     # NOMINSIZE: nanobind otherwise appends -Os, which costs the point samplers ~8%.
-    nanobind_add_module(_reader NB_STATIC NOMINSIZE cpp/bindings.cpp)
+    nanobind_add_module(_reader NB_STATIC NOMINSIZE src/cpp/bindings.cpp)
     if(VC_READER_ENABLE_CUDA)
-        target_sources(_reader PRIVATE cpp/reader_cuda/kernels.cu cpp/aligned/kernels.cu cpp/surface/kernels.cu cpp/sheet_normal/kernels.cu cpp/geometry/kernels.cu)
+        target_sources(_reader PRIVATE src/cpp/reader_cuda/kernels.cu src/cpp/aligned/kernels.cu src/cpp/surface/kernels.cu src/cpp/sheet_normal/kernels.cu src/cpp/geometry/kernels.cu)
         # Separate float32 rounding preserves geometric ties and filter agreement.
-        set_source_files_properties(cpp/surface/kernels.cu cpp/sheet_normal/kernels.cu cpp/geometry/kernels.cu PROPERTIES COMPILE_OPTIONS "--fmad=false")
+        set_source_files_properties(src/cpp/surface/kernels.cu src/cpp/sheet_normal/kernels.cu src/cpp/geometry/kernels.cu PROPERTIES COMPILE_OPTIONS "--fmad=false")
         target_compile_definitions(_reader PRIVATE VC_READER_CUDA=1)
         target_link_libraries(_reader PRIVATE CUDA::cudart)
         set_target_properties(_reader PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
     endif()
-    target_include_directories(_reader PRIVATE cpp)
+    target_include_directories(_reader PRIVATE src/cpp)
     target_link_libraries(_reader PRIVATE CURL::libcurl PkgConfig::BLOSC PkgConfig::ZSTD SQLite::SQLite3 vc_delta3d::vc_delta3d Threads::Threads)
     install(TARGETS _reader LIBRARY DESTINATION vc_reader)
 endif()

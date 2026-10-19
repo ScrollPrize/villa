@@ -7,7 +7,7 @@ import sys
 def load_extensions(directory):
     import importlib.machinery
 
-    for name in ("_reader", "_augment"):
+    for name in ("_reader", "_transforms"):
         candidates = [directory / (name + suffix) for suffix in importlib.machinery.EXTENSION_SUFFIXES]
         path = next((p for p in candidates if p.is_file()), None)
         if path is None:

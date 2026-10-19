@@ -39,7 +39,7 @@ def _targets(pipeline, batch):
             raise ValueError("all targets must have the same batch size")
         count = value.shape[0]
         if isinstance(value, torch.Tensor) and value.requires_grad:
-            raise ValueError("augmentation does not support autograd inputs")
+            raise ValueError("transform does not support autograd inputs")
     return targets, count
 
 
@@ -48,7 +48,7 @@ def _seeds(values, count):
         if values.device.type != "cpu":
             raise ValueError("seeds must be on CPU")
         # Tensor.__index__ converts through signed int64 even for uint64.
-        # tolist() preserves the full range emitted by augment.seed().
+        # tolist() preserves the full range emitted by transforms.seed().
         values = values.tolist()
     result = [operator.index(value) for value in values]
     if len(result) != count:
@@ -197,7 +197,7 @@ class CudaLoader:
     retaining it after an early break to promptly release its pending batch.
 
     Default seeds depend on seed, epoch and the sample's position in this
-    rank's iteration order. set_epoch() changes augmentation seeds, not the
+    rank's iteration order. set_epoch() changes transform seeds, not the
     underlying sampler. seed_key selects a CPU batch field of explicit uint64
     seeds for reproducibility independent of ordering, batching or rank.
     """
@@ -220,7 +220,7 @@ class CudaLoader:
         return len(self.loader)
 
     def set_epoch(self, epoch):
-        """Set augmentation epoch; call your distributed sampler separately."""
+        """Set transform epoch; call your distributed sampler separately."""
         self.epoch = operator.index(epoch)
 
     def __iter__(self):
@@ -231,7 +231,7 @@ class CudaLoader:
         return self._iterate(self.epoch)
 
     def _iterate(self, epoch):
-        from .augment import seed as make_seed
+        from .transforms import seed as make_seed
         iterator = iter(self.loader)
         stream = torch.cuda.Stream(device=self.device)
         offset = 0

@@ -10,10 +10,10 @@ performance must be prioritized for anything implemented in this repository. the
 - for augmentations and sampling, whenever we add a cpu implementation we should have a matching cuda implementation
 - in many cases, these tools will be used in pytorch dataloaders or within ml training pipelines, and this should be considered when designing things
 - readme files and other repository files must not contain development notes unless they are relevant to the implementation (nonstandard implementation or gotcha that would be helpful to future developers). during development you are welcome to keep notes in a gitignored development_notes folder. 
+- you can access a nvidia-gpu on most development machines by elevating the request
 
 ### cuda implementations
 - vc_reader has two backends -- cpu and cuda -- for most things within vc_reader that operate on volumes or images, wherever a cpu implementation exists there should be a cuda implementation as well  
-
 
 ### precision and dtypes
 - any dtype higher than float32 must be justified. do not use higher dtypes just because you've seen them used elsewhere in the codebase. 

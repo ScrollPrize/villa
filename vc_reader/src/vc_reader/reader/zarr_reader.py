@@ -501,7 +501,7 @@ class ZarrReader:
         array. Request ``dtype=np.float32`` or ``np.float64`` to cast directly
         into floating output. No cast is inferred from ``out``. The source,
         cached chunks and reader dtype are unchanged. Use
-        ``vc_reader.augment.Normalize`` in an augmentation pipeline for
+        ``vc_reader.transforms.Normalize`` in an transform pipeline for
         min/max or zero-preserving z-score normalization.
         """
         self._ready()
@@ -597,7 +597,7 @@ class ZarrReader:
         Output buffers must not overlap. Dense uint8/float32 grids may use a
         contiguous source box, capped at 64 MiB and eight source voxels per
         output voxel. Sparse grids use direct chunks. No dense coordinate grid
-        is assembled. Use an augmentation pipeline to normalize the output.
+        is assembled. Use an transform pipeline to normalize the output.
         """
         self._ready()
         if self.ndim != 3:

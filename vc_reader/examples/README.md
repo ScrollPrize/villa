@@ -9,7 +9,7 @@ Saved outputs show an executed run on the published data.
 | [2.5D ink training](01_ink_training_25d.ipynb) | Uses all supervised labels at XY level 3 for one PHercParis4 segment, shows annotation sources and full-canvas masks, holds out a contiguous validation section, and trains a 3D convolutional stem with depth max pooling and a 2D U-Net on nine-layer CT chunks. |
 | [3D ink training](02_ink_training_3d.ipynb) | Scans a full PHercParis4 segment for supervised 512×512 seeds, caches projected CT patches on disk, trains a 3D U-Net for complete epochs, then stitches overlapping predictions into a flattened letter-scale image on a held-out segment. |
 | [Zarr reader](03_zarr_reader.ipynb) | Opens groups and arrays, selects levels, reads slices and batches of blocks, reuses buffers and bounded caches, and reopens a crop offline. |
-| [Augmentations and CUDA](04_augmentations_and_cuda.ipynb) | Shows image/label/validity semantics and reproducible CPU augmentation, then a pinned DataLoader → CudaLoader → model → optimizer path. |
+| [Transforms and CUDA](04_transforms_and_cuda.ipynb) | Shows image/label/validity semantics and reproducible CPU transforms, then a pinned DataLoader → CudaLoader → model → optimizer path. |
 | [Mesh segment rendering](05_render_mesh_segment.ipynb) | Discovers registered geometry and displays CT at −1, 0 and +1 source voxel along the surface normals, with an optional CUDA comparison. |
 
 ## Run
@@ -24,7 +24,7 @@ python -m pip install -e '.[reader,labels,torch]'
 This builds and installs the compiled extensions. The reader notebook needs NumPy
 and Pillow. The surface and training notebooks also need the `labels`
 dependencies (including tifffile),
-and training/augmentation need PyTorch. These correspond to the package's
+and the training and transform notebooks need PyTorch. These correspond to the package's
 `reader`, `labels` and `torch` extras. Jupyter and its Python kernel must already
 be installed in your chosen environment. No notebook installs packages.
 
@@ -41,10 +41,10 @@ kernel and extensions it loaded:
 
 ```python
 import sys
-from vc_reader import _reader, _augment
+from vc_reader import _reader, _transforms
 print(sys.executable)
 print(_reader.__file__)
-print(_augment.__file__)
+print(_transforms.__file__)
 ```
 
 Use the environment containing the current build. After reinstalling compiled
@@ -148,7 +148,7 @@ without a host round-trip. Training chunks use the same seed size as inference.
 Holding out a segment ID does not establish that different segments never cover
 overlapping physical sheet regions.
 
-For measurements of reading, collation, augmentation, and batch prefetch,
+For measurements of reading, collation, transform, and batch prefetch,
 see the [PyTorch batch benchmark](../benchmarks/README.md#pytorch-cuda-batches).
 
 ## Recorded validation
@@ -164,7 +164,7 @@ covering 19.7% of supervision. Saved outputs report the three-epoch metrics alon
 all-ink baseline; this short run demonstrates the workflow. Prepared patches occupy about 143 MiB on disk. The 2.5D notebook explicitly
 caps the shared source cache at 4 GiB so this full-segment run fits for replay.
 
-The reader, augmentation and mesh notebooks were executed on CPU, including
+The reader, transform and mesh notebooks were executed on CPU, including
 offline replay of real-data reads. CUDA runs exercised the full
 CudaLoader/model loop, and CPU/CUDA equality of rendered layers. Saved notebook
 outputs are from CUDA runs; finite-loss and optimizer-update assertions pass.

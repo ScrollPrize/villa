@@ -1,9 +1,9 @@
 # vc_reader
 
 Tools for working with Vesuvius Challenge data: discover scans and annotations,
-read and sample large CT volumes, and augment aligned training inputs on CPU
+read and sample large CT volumes, and transform aligned image and label inputs on CPU
 or CUDA. The package is built for large multidimensional images and PyTorch
-training pipelines; its Zarr reader and augmentations also work with your own data.
+training pipelines; its Zarr reader and transforms also work with your own data.
 
 - **Discover data:** browse published metadata for samples, volumes, segments,
   ink labels and geometry, including scans at a requested resolution.
@@ -11,9 +11,9 @@ training pipelines; its Zarr reader and augmentations also work with your own da
   batch reads, and sample rotated boxes or curved surfaces.
 - **Align targets:** read CT with ink and supervision masks, sample registered
   labels into a volume grid, or project surface annotations into 3D.
-- **Augment for training:** apply CPU/CUDA geometry, intensity, noise and filter
+- **Process images and labels:** apply CPU/CUDA geometry, intensity, noise and filter
   transforms to 2D or 3D inputs while keeping images and labels aligned.
-  `CudaLoader` adds GPU augmentation and prefetching to a PyTorch DataLoader.
+  `CudaLoader` adds GPU transforms and prefetching to a PyTorch DataLoader.
 
 ## Quick start
 
@@ -53,7 +53,7 @@ with ct_volume.open(level=0) as reader:
 raise an error. Use filters such as `artifact_id=...` to select among them.
 
 `patch` keeps each target's data, geometric validity and companion masks
-together. CUDA reading and augmentation require a build with
+together. CUDA reading and transform require a build with
 `VC_READER_ENABLE_CUDA=ON` and an accessible CUDA device.
 
 ## Performance 
@@ -67,18 +67,18 @@ together. CUDA reading and augmentation require a build with
 | Rotated box, 128³ | 69.288 | 65.259 | 13.792 | **1.629** |
 
 
-**Augmentation pipeline — median milliseconds per 128³ crop:**
+**Transform pipeline — median milliseconds per 128³ crop:**
 
 | Work | CPU throughout | CPU read → CUDA processing |
 | --- | ---: | ---: |
-| 12 augmentations only, excluding transfers | 146.465 | **0.673** |
-| Read + normalize + 12 augmentations + CPU output | 149.723 | **1.833** |
+| 12 transforms only, excluding transfers | 146.465 | **0.673** |
+| Read + normalize + 12 transforms + CPU output | 149.723 | **1.833** |
 
 
 ## Examples and guides
 
 The [notebooks](examples/README.md) cover 2.5D and 3D ink training, general Zarr
-reading, CUDA augmentation, and mesh-segment rendering.
+reading, CUDA transform, and mesh-segment rendering.
 
 | Topic | Guide |
 | --- | --- |
@@ -236,13 +236,29 @@ workers; create CUDA readers in the process owning the GPU. Chunk caches
 are bounded by the reader's cache budget; gradient fields are computed per
 request, without a separate persistent gradient cache.
 
-## Augmentations
+## Transforms
 
-Image augmentations and normalization support channel-first **2D `(C, Y, X)`
+Image transforms and normalization support channel-first **2D `(C, Y, X)`
 and 3D `(C, Z, Y, X)`** arrays on CPU and CUDA. Use
-`from vc_reader import augment as A`. Expand an entry for its measured
+`from vc_reader import transforms as A`. Expand an entry for its measured
 configuration, timings and previews; the recipes are examples, not constructor
-defaults. Z/Y/X slice pairs show the original above the augmented output.
+defaults. Z/Y/X slice pairs show the original above the transformed output.
+
+Use fixed parameters for processing, such as `A.GaussianBlur(sigma=1.0)`, or
+sample parameters with `A.Uniform`, `A.Normal` and `A.Choice` for augmentation.
+Several constructors have random defaults; pipeline calls take an explicit
+`seed` for reproducibility, and `Plan` records sampled operations for replay.
+
+| Operation family | Examples |
+| --- | --- |
+| Spatial | `Affine`, `Flip`, `CropPad`, `Elastic`, `ForegroundCrop` |
+| Intensity | `Normalize`, `Gamma`, `CLAHE`, `HistogramMatching` |
+| Filters | `GaussianBlur`, `MedianFilter`, `OrientedBlur`, `UnsharpMask` |
+| Noise and acquisition effects | `GaussianNoise`, `BiasField`, `GibbsRinging`, `ThickSlice` |
+| Masking and dropout | `MaskImage`, `GridDropout`, `ObjectDropout` |
+| Labels and morphology | `Morphology`, `ReplaceLabel`, `Regions`, `OneHot` |
+| Features | `DistanceTransform`, `StructureTensor`, `MedialSurface` |
+| Layout and output construction | `ToPseudo2D`, `FromPseudo2D`, `DeepSupervision` |
 
 Gallery timings use 128³ float32 CT crops, one CPU thread, and medians of five
 calls after one warmup. **CUDA uploaded** includes upload and download;
@@ -263,7 +279,7 @@ A.AdditiveNoise(scale=0.05, distribution='laplace', mean=0)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![AdditiveNoise: original and augmented Z slices](docs/augmentations/previews/AdditiveNoise-z.webp)](docs/augmentations/previews/AdditiveNoise-z.webp) | [![AdditiveNoise: original and augmented Y slices](docs/augmentations/previews/AdditiveNoise-y.webp)](docs/augmentations/previews/AdditiveNoise-y.webp) | [![AdditiveNoise: original and augmented X slices](docs/augmentations/previews/AdditiveNoise-x.webp)](docs/augmentations/previews/AdditiveNoise-x.webp) |
+| [![AdditiveNoise: original and transformed Z slices](docs/transforms/previews/AdditiveNoise-z.webp)](docs/transforms/previews/AdditiveNoise-z.webp) | [![AdditiveNoise: original and transformed Y slices](docs/transforms/previews/AdditiveNoise-y.webp)](docs/transforms/previews/AdditiveNoise-y.webp) | [![AdditiveNoise: original and transformed X slices](docs/transforms/previews/AdditiveNoise-x.webp)](docs/transforms/previews/AdditiveNoise-x.webp) |
 
 </details>
 
@@ -282,7 +298,7 @@ A.Affine(degrees=5, translate=2, scale=0.95)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![Affine: original and augmented Z slices](docs/augmentations/previews/Affine-z.webp)](docs/augmentations/previews/Affine-z.webp) | [![Affine: original and augmented Y slices](docs/augmentations/previews/Affine-y.webp)](docs/augmentations/previews/Affine-y.webp) | [![Affine: original and augmented X slices](docs/augmentations/previews/Affine-x.webp)](docs/augmentations/previews/Affine-x.webp) |
+| [![Affine: original and transformed Z slices](docs/transforms/previews/Affine-z.webp)](docs/transforms/previews/Affine-z.webp) | [![Affine: original and transformed Y slices](docs/transforms/previews/Affine-y.webp)](docs/transforms/previews/Affine-y.webp) | [![Affine: original and transformed X slices](docs/transforms/previews/Affine-x.webp)](docs/transforms/previews/Affine-x.webp) |
 
 </details>
 
@@ -301,7 +317,7 @@ A.BiasField(std=0.3, scale=0.025)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![BiasField: original and augmented Z slices](docs/augmentations/previews/BiasField-z.webp)](docs/augmentations/previews/BiasField-z.webp) | [![BiasField: original and augmented Y slices](docs/augmentations/previews/BiasField-y.webp)](docs/augmentations/previews/BiasField-y.webp) | [![BiasField: original and augmented X slices](docs/augmentations/previews/BiasField-x.webp)](docs/augmentations/previews/BiasField-x.webp) |
+| [![BiasField: original and transformed Z slices](docs/transforms/previews/BiasField-z.webp)](docs/transforms/previews/BiasField-z.webp) | [![BiasField: original and transformed Y slices](docs/transforms/previews/BiasField-y.webp)](docs/transforms/previews/BiasField-y.webp) | [![BiasField: original and transformed X slices](docs/transforms/previews/BiasField-x.webp)](docs/transforms/previews/BiasField-x.webp) |
 
 </details>
 
@@ -320,7 +336,7 @@ A.BlankRectangle(size=16, value=0, count=3)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![BlankRectangle: original and augmented Z slices](docs/augmentations/previews/BlankRectangle-z.webp)](docs/augmentations/previews/BlankRectangle-z.webp) | [![BlankRectangle: original and augmented Y slices](docs/augmentations/previews/BlankRectangle-y.webp)](docs/augmentations/previews/BlankRectangle-y.webp) | [![BlankRectangle: original and augmented X slices](docs/augmentations/previews/BlankRectangle-x.webp)](docs/augmentations/previews/BlankRectangle-x.webp) |
+| [![BlankRectangle: original and transformed Z slices](docs/transforms/previews/BlankRectangle-z.webp)](docs/transforms/previews/BlankRectangle-z.webp) | [![BlankRectangle: original and transformed Y slices](docs/transforms/previews/BlankRectangle-y.webp)](docs/transforms/previews/BlankRectangle-y.webp) | [![BlankRectangle: original and transformed X slices](docs/transforms/previews/BlankRectangle-x.webp)](docs/transforms/previews/BlankRectangle-x.webp) |
 
 </details>
 
@@ -339,7 +355,7 @@ A.BrightnessAdd(shift=0.1)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![BrightnessAdd: original and augmented Z slices](docs/augmentations/previews/BrightnessAdd-z.webp)](docs/augmentations/previews/BrightnessAdd-z.webp) | [![BrightnessAdd: original and augmented Y slices](docs/augmentations/previews/BrightnessAdd-y.webp)](docs/augmentations/previews/BrightnessAdd-y.webp) | [![BrightnessAdd: original and augmented X slices](docs/augmentations/previews/BrightnessAdd-x.webp)](docs/augmentations/previews/BrightnessAdd-x.webp) |
+| [![BrightnessAdd: original and transformed Z slices](docs/transforms/previews/BrightnessAdd-z.webp)](docs/transforms/previews/BrightnessAdd-z.webp) | [![BrightnessAdd: original and transformed Y slices](docs/transforms/previews/BrightnessAdd-y.webp)](docs/transforms/previews/BrightnessAdd-y.webp) | [![BrightnessAdd: original and transformed X slices](docs/transforms/previews/BrightnessAdd-x.webp)](docs/transforms/previews/BrightnessAdd-x.webp) |
 
 </details>
 
@@ -358,7 +374,7 @@ A.BrightnessGradient(scale=12, loc=0.5, strength=0.3)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![BrightnessGradient: original and augmented Z slices](docs/augmentations/previews/BrightnessGradient-z.webp)](docs/augmentations/previews/BrightnessGradient-z.webp) | [![BrightnessGradient: original and augmented Y slices](docs/augmentations/previews/BrightnessGradient-y.webp)](docs/augmentations/previews/BrightnessGradient-y.webp) | [![BrightnessGradient: original and augmented X slices](docs/augmentations/previews/BrightnessGradient-x.webp)](docs/augmentations/previews/BrightnessGradient-x.webp) |
+| [![BrightnessGradient: original and transformed Z slices](docs/transforms/previews/BrightnessGradient-z.webp)](docs/transforms/previews/BrightnessGradient-z.webp) | [![BrightnessGradient: original and transformed Y slices](docs/transforms/previews/BrightnessGradient-y.webp)](docs/transforms/previews/BrightnessGradient-y.webp) | [![BrightnessGradient: original and transformed X slices](docs/transforms/previews/BrightnessGradient-x.webp)](docs/transforms/previews/BrightnessGradient-x.webp) |
 
 </details>
 
@@ -377,7 +393,7 @@ A.BrightnessMultiply(factor=1.1)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![BrightnessMultiply: original and augmented Z slices](docs/augmentations/previews/BrightnessMultiply-z.webp)](docs/augmentations/previews/BrightnessMultiply-z.webp) | [![BrightnessMultiply: original and augmented Y slices](docs/augmentations/previews/BrightnessMultiply-y.webp)](docs/augmentations/previews/BrightnessMultiply-y.webp) | [![BrightnessMultiply: original and augmented X slices](docs/augmentations/previews/BrightnessMultiply-x.webp)](docs/augmentations/previews/BrightnessMultiply-x.webp) |
+| [![BrightnessMultiply: original and transformed Z slices](docs/transforms/previews/BrightnessMultiply-z.webp)](docs/transforms/previews/BrightnessMultiply-z.webp) | [![BrightnessMultiply: original and transformed Y slices](docs/transforms/previews/BrightnessMultiply-y.webp)](docs/transforms/previews/BrightnessMultiply-y.webp) | [![BrightnessMultiply: original and transformed X slices](docs/transforms/previews/BrightnessMultiply-x.webp)](docs/transforms/previews/BrightnessMultiply-x.webp) |
 
 </details>
 
@@ -396,7 +412,7 @@ A.ChannelMisalignment(degrees=5, translate=2, scale=1, channels=(1,))
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![ChannelMisalignment: original and augmented Z slices](docs/augmentations/previews/ChannelMisalignment-z.webp)](docs/augmentations/previews/ChannelMisalignment-z.webp) | [![ChannelMisalignment: original and augmented Y slices](docs/augmentations/previews/ChannelMisalignment-y.webp)](docs/augmentations/previews/ChannelMisalignment-y.webp) | [![ChannelMisalignment: original and augmented X slices](docs/augmentations/previews/ChannelMisalignment-x.webp)](docs/augmentations/previews/ChannelMisalignment-x.webp) |
+| [![ChannelMisalignment: original and transformed Z slices](docs/transforms/previews/ChannelMisalignment-z.webp)](docs/transforms/previews/ChannelMisalignment-z.webp) | [![ChannelMisalignment: original and transformed Y slices](docs/transforms/previews/ChannelMisalignment-y.webp)](docs/transforms/previews/ChannelMisalignment-y.webp) | [![ChannelMisalignment: original and transformed X slices](docs/transforms/previews/ChannelMisalignment-x.webp)](docs/transforms/previews/ChannelMisalignment-x.webp) |
 
 Two input channels (second is a copy of the CT); only channel 1 moves. Both channels are included in timing.
 
@@ -417,7 +433,7 @@ A.CLAHE(clip_limit=2, tile_shape=(16, 16, 16), bins=256)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![CLAHE: original and augmented Z slices](docs/augmentations/previews/CLAHE-z.webp)](docs/augmentations/previews/CLAHE-z.webp) | [![CLAHE: original and augmented Y slices](docs/augmentations/previews/CLAHE-y.webp)](docs/augmentations/previews/CLAHE-y.webp) | [![CLAHE: original and augmented X slices](docs/augmentations/previews/CLAHE-x.webp)](docs/augmentations/previews/CLAHE-x.webp) |
+| [![CLAHE: original and transformed Z slices](docs/transforms/previews/CLAHE-z.webp)](docs/transforms/previews/CLAHE-z.webp) | [![CLAHE: original and transformed Y slices](docs/transforms/previews/CLAHE-y.webp)](docs/transforms/previews/CLAHE-y.webp) | [![CLAHE: original and transformed X slices](docs/transforms/previews/CLAHE-x.webp)](docs/transforms/previews/CLAHE-x.webp) |
 
 </details>
 
@@ -436,7 +452,7 @@ A.ClipOutliers(lower=1, upper=99, p_retain_std=1)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![ClipOutliers: original and augmented Z slices](docs/augmentations/previews/ClipOutliers-z.webp)](docs/augmentations/previews/ClipOutliers-z.webp) | [![ClipOutliers: original and augmented Y slices](docs/augmentations/previews/ClipOutliers-y.webp)](docs/augmentations/previews/ClipOutliers-y.webp) | [![ClipOutliers: original and augmented X slices](docs/augmentations/previews/ClipOutliers-x.webp)](docs/augmentations/previews/ClipOutliers-x.webp) |
+| [![ClipOutliers: original and transformed Z slices](docs/transforms/previews/ClipOutliers-z.webp)](docs/transforms/previews/ClipOutliers-z.webp) | [![ClipOutliers: original and transformed Y slices](docs/transforms/previews/ClipOutliers-y.webp)](docs/transforms/previews/ClipOutliers-y.webp) | [![ClipOutliers: original and transformed X slices](docs/transforms/previews/ClipOutliers-x.webp)](docs/transforms/previews/ClipOutliers-x.webp) |
 
 </details>
 
@@ -455,7 +471,7 @@ A.Contrast(factor=1.2)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![Contrast: original and augmented Z slices](docs/augmentations/previews/Contrast-z.webp)](docs/augmentations/previews/Contrast-z.webp) | [![Contrast: original and augmented Y slices](docs/augmentations/previews/Contrast-y.webp)](docs/augmentations/previews/Contrast-y.webp) | [![Contrast: original and augmented X slices](docs/augmentations/previews/Contrast-x.webp)](docs/augmentations/previews/Contrast-x.webp) |
+| [![Contrast: original and transformed Z slices](docs/transforms/previews/Contrast-z.webp)](docs/transforms/previews/Contrast-z.webp) | [![Contrast: original and transformed Y slices](docs/transforms/previews/Contrast-y.webp)](docs/transforms/previews/Contrast-y.webp) | [![Contrast: original and transformed X slices](docs/transforms/previews/Contrast-x.webp)](docs/transforms/previews/Contrast-x.webp) |
 
 </details>
 
@@ -474,7 +490,7 @@ A.CropPad(shape=(112, 112, 112))
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![CropPad: original and augmented Z slices](docs/augmentations/previews/CropPad-z.webp)](docs/augmentations/previews/CropPad-z.webp) | [![CropPad: original and augmented Y slices](docs/augmentations/previews/CropPad-y.webp)](docs/augmentations/previews/CropPad-y.webp) | [![CropPad: original and augmented X slices](docs/augmentations/previews/CropPad-x.webp)](docs/augmentations/previews/CropPad-x.webp) |
+| [![CropPad: original and transformed Z slices](docs/transforms/previews/CropPad-z.webp)](docs/transforms/previews/CropPad-z.webp) | [![CropPad: original and transformed Y slices](docs/transforms/previews/CropPad-y.webp)](docs/transforms/previews/CropPad-y.webp) | [![CropPad: original and transformed X slices](docs/transforms/previews/CropPad-x.webp)](docs/transforms/previews/CropPad-x.webp) |
 
 </details>
 
@@ -493,7 +509,7 @@ A.Defocus(radius=2)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![Defocus: original and augmented Z slices](docs/augmentations/previews/Defocus-z.webp)](docs/augmentations/previews/Defocus-z.webp) | [![Defocus: original and augmented Y slices](docs/augmentations/previews/Defocus-y.webp)](docs/augmentations/previews/Defocus-y.webp) | [![Defocus: original and augmented X slices](docs/augmentations/previews/Defocus-x.webp)](docs/augmentations/previews/Defocus-x.webp) |
+| [![Defocus: original and transformed Z slices](docs/transforms/previews/Defocus-z.webp)](docs/transforms/previews/Defocus-z.webp) | [![Defocus: original and transformed Y slices](docs/transforms/previews/Defocus-y.webp)](docs/transforms/previews/Defocus-y.webp) | [![Defocus: original and transformed X slices](docs/transforms/previews/Defocus-x.webp)](docs/transforms/previews/Defocus-x.webp) |
 
 </details>
 
@@ -512,21 +528,21 @@ numerical conditioning requires it. Output dtypes are preserved. Small
 coordinate differences can select a neighboring label at a nearest-neighbor
 boundary. New replay plans use float32 fields; old plans must be regenerated.
 See the [precision policy](docs/precision.md) and
-[augmentation benchmarks](benchmarks/README.md#augmentation-benchmarks).
+[transform benchmarks](benchmarks/README.md#transform-benchmarks).
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |
 | 85.995 ms | 2.536 ms | 0.696 ms | 33.9× | 123.6× |
 
-[▶ Watch Elastic animation (WebM)](docs/augmentations/animations/Elastic.webm)
+[▶ Watch Elastic animation (WebM)](docs/transforms/animations/Elastic.webm)
 
 Strong cubic B-spline deformation: original → deformed → original. Fixed Z/Y/X slices, seed 125, achieved RMS 5.36 voxels.
 
-[![Elastic animation poster](docs/augmentations/animations/Elastic-poster.webp)](docs/augmentations/animations/Elastic.webm)
+[![Elastic animation poster](docs/transforms/animations/Elastic-poster.webp)](docs/transforms/animations/Elastic.webm)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![Elastic: original and augmented Z slices](docs/augmentations/previews/Elastic-z.webp)](docs/augmentations/previews/Elastic-z.webp) | [![Elastic: original and augmented Y slices](docs/augmentations/previews/Elastic-y.webp)](docs/augmentations/previews/Elastic-y.webp) | [![Elastic: original and augmented X slices](docs/augmentations/previews/Elastic-x.webp)](docs/augmentations/previews/Elastic-x.webp) |
+| [![Elastic: original and transformed Z slices](docs/transforms/previews/Elastic-z.webp)](docs/transforms/previews/Elastic-z.webp) | [![Elastic: original and transformed Y slices](docs/transforms/previews/Elastic-y.webp)](docs/transforms/previews/Elastic-y.webp) | [![Elastic: original and transformed X slices](docs/transforms/previews/Elastic-x.webp)](docs/transforms/previews/Elastic-x.webp) |
 
 Strong cubic B-spline example: 64-voxel knot spacing, requested RMS displacement 8 voxels, with border clamping.
 
@@ -547,7 +563,7 @@ A.Equalize(bins=256)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![Equalize: original and augmented Z slices](docs/augmentations/previews/Equalize-z.webp)](docs/augmentations/previews/Equalize-z.webp) | [![Equalize: original and augmented Y slices](docs/augmentations/previews/Equalize-y.webp)](docs/augmentations/previews/Equalize-y.webp) | [![Equalize: original and augmented X slices](docs/augmentations/previews/Equalize-x.webp)](docs/augmentations/previews/Equalize-x.webp) |
+| [![Equalize: original and transformed Z slices](docs/transforms/previews/Equalize-z.webp)](docs/transforms/previews/Equalize-z.webp) | [![Equalize: original and transformed Y slices](docs/transforms/previews/Equalize-y.webp)](docs/transforms/previews/Equalize-y.webp) | [![Equalize: original and transformed X slices](docs/transforms/previews/Equalize-x.webp)](docs/transforms/previews/Equalize-x.webp) |
 
 </details>
 
@@ -566,7 +582,7 @@ A.FDA(reference=reference, blend=1, fraction=0.1)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![FDA: original and augmented Z slices](docs/augmentations/previews/FDA-z.webp)](docs/augmentations/previews/FDA-z.webp) | [![FDA: original and augmented Y slices](docs/augmentations/previews/FDA-y.webp)](docs/augmentations/previews/FDA-y.webp) | [![FDA: original and augmented X slices](docs/augmentations/previews/FDA-x.webp)](docs/augmentations/previews/FDA-x.webp) |
+| [![FDA: original and transformed Z slices](docs/transforms/previews/FDA-z.webp)](docs/transforms/previews/FDA-z.webp) | [![FDA: original and transformed Y slices](docs/transforms/previews/FDA-y.webp)](docs/transforms/previews/FDA-y.webp) | [![FDA: original and transformed X slices](docs/transforms/previews/FDA-x.webp)](docs/transforms/previews/FDA-x.webp) |
 
 </details>
 
@@ -585,7 +601,7 @@ A.Flip(axes='x', p_axis=1)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![Flip: original and augmented Z slices](docs/augmentations/previews/Flip-z.webp)](docs/augmentations/previews/Flip-z.webp) | [![Flip: original and augmented Y slices](docs/augmentations/previews/Flip-y.webp)](docs/augmentations/previews/Flip-y.webp) | [![Flip: original and augmented X slices](docs/augmentations/previews/Flip-x.webp)](docs/augmentations/previews/Flip-x.webp) |
+| [![Flip: original and transformed Z slices](docs/transforms/previews/Flip-z.webp)](docs/transforms/previews/Flip-z.webp) | [![Flip: original and transformed Y slices](docs/transforms/previews/Flip-y.webp)](docs/transforms/previews/Flip-y.webp) | [![Flip: original and transformed X slices](docs/transforms/previews/Flip-x.webp)](docs/transforms/previews/Flip-x.webp) |
 
 </details>
 
@@ -604,7 +620,7 @@ A.ForegroundCrop(shape=(112, 112, 112))
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![ForegroundCrop: original and augmented Z slices](docs/augmentations/previews/ForegroundCrop-z.webp)](docs/augmentations/previews/ForegroundCrop-z.webp) | [![ForegroundCrop: original and augmented Y slices](docs/augmentations/previews/ForegroundCrop-y.webp)](docs/augmentations/previews/ForegroundCrop-y.webp) | [![ForegroundCrop: original and augmented X slices](docs/augmentations/previews/ForegroundCrop-x.webp)](docs/augmentations/previews/ForegroundCrop-x.webp) |
+| [![ForegroundCrop: original and transformed Z slices](docs/transforms/previews/ForegroundCrop-z.webp)](docs/transforms/previews/ForegroundCrop-z.webp) | [![ForegroundCrop: original and transformed Y slices](docs/transforms/previews/ForegroundCrop-y.webp)](docs/transforms/previews/ForegroundCrop-y.webp) | [![ForegroundCrop: original and transformed X slices](docs/transforms/previews/ForegroundCrop-x.webp)](docs/transforms/previews/ForegroundCrop-x.webp) |
 
 </details>
 
@@ -623,7 +639,7 @@ A.ForegroundDropout(size=(16, 16, 16), count=3)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![ForegroundDropout: original and augmented Z slices](docs/augmentations/previews/ForegroundDropout-z.webp)](docs/augmentations/previews/ForegroundDropout-z.webp) | [![ForegroundDropout: original and augmented Y slices](docs/augmentations/previews/ForegroundDropout-y.webp)](docs/augmentations/previews/ForegroundDropout-y.webp) | [![ForegroundDropout: original and augmented X slices](docs/augmentations/previews/ForegroundDropout-x.webp)](docs/augmentations/previews/ForegroundDropout-x.webp) |
+| [![ForegroundDropout: original and transformed Z slices](docs/transforms/previews/ForegroundDropout-z.webp)](docs/transforms/previews/ForegroundDropout-z.webp) | [![ForegroundDropout: original and transformed Y slices](docs/transforms/previews/ForegroundDropout-y.webp)](docs/transforms/previews/ForegroundDropout-y.webp) | [![ForegroundDropout: original and transformed X slices](docs/transforms/previews/ForegroundDropout-x.webp)](docs/transforms/previews/ForegroundDropout-x.webp) |
 
 </details>
 
@@ -642,7 +658,7 @@ A.Gamma(gamma=0.8)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![Gamma: original and augmented Z slices](docs/augmentations/previews/Gamma-z.webp)](docs/augmentations/previews/Gamma-z.webp) | [![Gamma: original and augmented Y slices](docs/augmentations/previews/Gamma-y.webp)](docs/augmentations/previews/Gamma-y.webp) | [![Gamma: original and augmented X slices](docs/augmentations/previews/Gamma-x.webp)](docs/augmentations/previews/Gamma-x.webp) |
+| [![Gamma: original and transformed Z slices](docs/transforms/previews/Gamma-z.webp)](docs/transforms/previews/Gamma-z.webp) | [![Gamma: original and transformed Y slices](docs/transforms/previews/Gamma-y.webp)](docs/transforms/previews/Gamma-y.webp) | [![Gamma: original and transformed X slices](docs/transforms/previews/Gamma-x.webp)](docs/transforms/previews/Gamma-x.webp) |
 
 </details>
 
@@ -665,7 +681,7 @@ A.GaussianBlur(sigma=1)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![GaussianBlur: original and augmented Z slices](docs/augmentations/previews/GaussianBlur-z.webp)](docs/augmentations/previews/GaussianBlur-z.webp) | [![GaussianBlur: original and augmented Y slices](docs/augmentations/previews/GaussianBlur-y.webp)](docs/augmentations/previews/GaussianBlur-y.webp) | [![GaussianBlur: original and augmented X slices](docs/augmentations/previews/GaussianBlur-x.webp)](docs/augmentations/previews/GaussianBlur-x.webp) |
+| [![GaussianBlur: original and transformed Z slices](docs/transforms/previews/GaussianBlur-z.webp)](docs/transforms/previews/GaussianBlur-z.webp) | [![GaussianBlur: original and transformed Y slices](docs/transforms/previews/GaussianBlur-y.webp)](docs/transforms/previews/GaussianBlur-y.webp) | [![GaussianBlur: original and transformed X slices](docs/transforms/previews/GaussianBlur-x.webp)](docs/transforms/previews/GaussianBlur-x.webp) |
 
 </details>
 
@@ -684,7 +700,7 @@ A.GaussianNoise(std=0.05)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![GaussianNoise: original and augmented Z slices](docs/augmentations/previews/GaussianNoise-z.webp)](docs/augmentations/previews/GaussianNoise-z.webp) | [![GaussianNoise: original and augmented Y slices](docs/augmentations/previews/GaussianNoise-y.webp)](docs/augmentations/previews/GaussianNoise-y.webp) | [![GaussianNoise: original and augmented X slices](docs/augmentations/previews/GaussianNoise-x.webp)](docs/augmentations/previews/GaussianNoise-x.webp) |
+| [![GaussianNoise: original and transformed Z slices](docs/transforms/previews/GaussianNoise-z.webp)](docs/transforms/previews/GaussianNoise-z.webp) | [![GaussianNoise: original and transformed Y slices](docs/transforms/previews/GaussianNoise-y.webp)](docs/transforms/previews/GaussianNoise-y.webp) | [![GaussianNoise: original and transformed X slices](docs/transforms/previews/GaussianNoise-x.webp)](docs/transforms/previews/GaussianNoise-x.webp) |
 
 </details>
 
@@ -703,7 +719,7 @@ A.GibbsRinging(cutoff=0.7)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![GibbsRinging: original and augmented Z slices](docs/augmentations/previews/GibbsRinging-z.webp)](docs/augmentations/previews/GibbsRinging-z.webp) | [![GibbsRinging: original and augmented Y slices](docs/augmentations/previews/GibbsRinging-y.webp)](docs/augmentations/previews/GibbsRinging-y.webp) | [![GibbsRinging: original and augmented X slices](docs/augmentations/previews/GibbsRinging-x.webp)](docs/augmentations/previews/GibbsRinging-x.webp) |
+| [![GibbsRinging: original and transformed Z slices](docs/transforms/previews/GibbsRinging-z.webp)](docs/transforms/previews/GibbsRinging-z.webp) | [![GibbsRinging: original and transformed Y slices](docs/transforms/previews/GibbsRinging-y.webp)](docs/transforms/previews/GibbsRinging-y.webp) | [![GibbsRinging: original and transformed X slices](docs/transforms/previews/GibbsRinging-x.webp)](docs/transforms/previews/GibbsRinging-x.webp) |
 
 </details>
 
@@ -722,7 +738,7 @@ A.GridDropout(unit_size=(16, 16, 16), ratio=0.4)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![GridDropout: original and augmented Z slices](docs/augmentations/previews/GridDropout-z.webp)](docs/augmentations/previews/GridDropout-z.webp) | [![GridDropout: original and augmented Y slices](docs/augmentations/previews/GridDropout-y.webp)](docs/augmentations/previews/GridDropout-y.webp) | [![GridDropout: original and augmented X slices](docs/augmentations/previews/GridDropout-x.webp)](docs/augmentations/previews/GridDropout-x.webp) |
+| [![GridDropout: original and transformed Z slices](docs/transforms/previews/GridDropout-z.webp)](docs/transforms/previews/GridDropout-z.webp) | [![GridDropout: original and transformed Y slices](docs/transforms/previews/GridDropout-y.webp)](docs/transforms/previews/GridDropout-y.webp) | [![GridDropout: original and transformed X slices](docs/transforms/previews/GridDropout-x.webp)](docs/transforms/previews/GridDropout-x.webp) |
 
 </details>
 
@@ -741,7 +757,7 @@ A.HistogramMatching(reference=reference, blend=1, bins=256)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![HistogramMatching: original and augmented Z slices](docs/augmentations/previews/HistogramMatching-z.webp)](docs/augmentations/previews/HistogramMatching-z.webp) | [![HistogramMatching: original and augmented Y slices](docs/augmentations/previews/HistogramMatching-y.webp)](docs/augmentations/previews/HistogramMatching-y.webp) | [![HistogramMatching: original and augmented X slices](docs/augmentations/previews/HistogramMatching-x.webp)](docs/augmentations/previews/HistogramMatching-x.webp) |
+| [![HistogramMatching: original and transformed Z slices](docs/transforms/previews/HistogramMatching-z.webp)](docs/transforms/previews/HistogramMatching-z.webp) | [![HistogramMatching: original and transformed Y slices](docs/transforms/previews/HistogramMatching-y.webp)](docs/transforms/previews/HistogramMatching-y.webp) | [![HistogramMatching: original and transformed X slices](docs/transforms/previews/HistogramMatching-x.webp)](docs/transforms/previews/HistogramMatching-x.webp) |
 
 </details>
 
@@ -760,7 +776,7 @@ A.Illumination(strength=0.3, mode='linear', direction=(1, 1, 1))
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![Illumination: original and augmented Z slices](docs/augmentations/previews/Illumination-z.webp)](docs/augmentations/previews/Illumination-z.webp) | [![Illumination: original and augmented Y slices](docs/augmentations/previews/Illumination-y.webp)](docs/augmentations/previews/Illumination-y.webp) | [![Illumination: original and augmented X slices](docs/augmentations/previews/Illumination-x.webp)](docs/augmentations/previews/Illumination-x.webp) |
+| [![Illumination: original and transformed Z slices](docs/transforms/previews/Illumination-z.webp)](docs/transforms/previews/Illumination-z.webp) | [![Illumination: original and transformed Y slices](docs/transforms/previews/Illumination-y.webp)](docs/transforms/previews/Illumination-y.webp) | [![Illumination: original and transformed X slices](docs/transforms/previews/Illumination-x.webp)](docs/transforms/previews/Illumination-x.webp) |
 
 </details>
 
@@ -779,7 +795,7 @@ A.Invert()
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![Invert: original and augmented Z slices](docs/augmentations/previews/Invert-z.webp)](docs/augmentations/previews/Invert-z.webp) | [![Invert: original and augmented Y slices](docs/augmentations/previews/Invert-y.webp)](docs/augmentations/previews/Invert-y.webp) | [![Invert: original and augmented X slices](docs/augmentations/previews/Invert-x.webp)](docs/augmentations/previews/Invert-x.webp) |
+| [![Invert: original and transformed Z slices](docs/transforms/previews/Invert-z.webp)](docs/transforms/previews/Invert-z.webp) | [![Invert: original and transformed Y slices](docs/transforms/previews/Invert-y.webp)](docs/transforms/previews/Invert-y.webp) | [![Invert: original and transformed X slices](docs/transforms/previews/Invert-x.webp)](docs/transforms/previews/Invert-x.webp) |
 
 </details>
 
@@ -798,7 +814,7 @@ A.LocalContrast(scale=12, loc=0.5, factor=1.2)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![LocalContrast: original and augmented Z slices](docs/augmentations/previews/LocalContrast-z.webp)](docs/augmentations/previews/LocalContrast-z.webp) | [![LocalContrast: original and augmented Y slices](docs/augmentations/previews/LocalContrast-y.webp)](docs/augmentations/previews/LocalContrast-y.webp) | [![LocalContrast: original and augmented X slices](docs/augmentations/previews/LocalContrast-x.webp)](docs/augmentations/previews/LocalContrast-x.webp) |
+| [![LocalContrast: original and transformed Z slices](docs/transforms/previews/LocalContrast-z.webp)](docs/transforms/previews/LocalContrast-z.webp) | [![LocalContrast: original and transformed Y slices](docs/transforms/previews/LocalContrast-y.webp)](docs/transforms/previews/LocalContrast-y.webp) | [![LocalContrast: original and transformed X slices](docs/transforms/previews/LocalContrast-x.webp)](docs/transforms/previews/LocalContrast-x.webp) |
 
 </details>
 
@@ -817,7 +833,7 @@ A.LocalGamma(scale=12, loc=0.5, gamma=0.8)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![LocalGamma: original and augmented Z slices](docs/augmentations/previews/LocalGamma-z.webp)](docs/augmentations/previews/LocalGamma-z.webp) | [![LocalGamma: original and augmented Y slices](docs/augmentations/previews/LocalGamma-y.webp)](docs/augmentations/previews/LocalGamma-y.webp) | [![LocalGamma: original and augmented X slices](docs/augmentations/previews/LocalGamma-x.webp)](docs/augmentations/previews/LocalGamma-x.webp) |
+| [![LocalGamma: original and transformed Z slices](docs/transforms/previews/LocalGamma-z.webp)](docs/transforms/previews/LocalGamma-z.webp) | [![LocalGamma: original and transformed Y slices](docs/transforms/previews/LocalGamma-y.webp)](docs/transforms/previews/LocalGamma-y.webp) | [![LocalGamma: original and transformed X slices](docs/transforms/previews/LocalGamma-x.webp)](docs/transforms/previews/LocalGamma-x.webp) |
 
 </details>
 
@@ -836,7 +852,7 @@ A.LocalSmoothing(scale=12, loc=0.5, strength=0.7, sigma=1)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![LocalSmoothing: original and augmented Z slices](docs/augmentations/previews/LocalSmoothing-z.webp)](docs/augmentations/previews/LocalSmoothing-z.webp) | [![LocalSmoothing: original and augmented Y slices](docs/augmentations/previews/LocalSmoothing-y.webp)](docs/augmentations/previews/LocalSmoothing-y.webp) | [![LocalSmoothing: original and augmented X slices](docs/augmentations/previews/LocalSmoothing-x.webp)](docs/augmentations/previews/LocalSmoothing-x.webp) |
+| [![LocalSmoothing: original and transformed Z slices](docs/transforms/previews/LocalSmoothing-z.webp)](docs/transforms/previews/LocalSmoothing-z.webp) | [![LocalSmoothing: original and transformed Y slices](docs/transforms/previews/LocalSmoothing-y.webp)](docs/transforms/previews/LocalSmoothing-y.webp) | [![LocalSmoothing: original and transformed X slices](docs/transforms/previews/LocalSmoothing-x.webp)](docs/transforms/previews/LocalSmoothing-x.webp) |
 
 </details>
 
@@ -855,7 +871,7 @@ A.LowResolution(scale=0.5)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![LowResolution: original and augmented Z slices](docs/augmentations/previews/LowResolution-z.webp)](docs/augmentations/previews/LowResolution-z.webp) | [![LowResolution: original and augmented Y slices](docs/augmentations/previews/LowResolution-y.webp)](docs/augmentations/previews/LowResolution-y.webp) | [![LowResolution: original and augmented X slices](docs/augmentations/previews/LowResolution-x.webp)](docs/augmentations/previews/LowResolution-x.webp) |
+| [![LowResolution: original and transformed Z slices](docs/transforms/previews/LowResolution-z.webp)](docs/transforms/previews/LowResolution-z.webp) | [![LowResolution: original and transformed Y slices](docs/transforms/previews/LowResolution-y.webp)](docs/transforms/previews/LowResolution-y.webp) | [![LowResolution: original and transformed X slices](docs/transforms/previews/LowResolution-x.webp)](docs/transforms/previews/LowResolution-x.webp) |
 
 </details>
 
@@ -874,7 +890,7 @@ A.MedianFilter(size=3)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![MedianFilter: original and augmented Z slices](docs/augmentations/previews/MedianFilter-z.webp)](docs/augmentations/previews/MedianFilter-z.webp) | [![MedianFilter: original and augmented Y slices](docs/augmentations/previews/MedianFilter-y.webp)](docs/augmentations/previews/MedianFilter-y.webp) | [![MedianFilter: original and augmented X slices](docs/augmentations/previews/MedianFilter-x.webp)](docs/augmentations/previews/MedianFilter-x.webp) |
+| [![MedianFilter: original and transformed Z slices](docs/transforms/previews/MedianFilter-z.webp)](docs/transforms/previews/MedianFilter-z.webp) | [![MedianFilter: original and transformed Y slices](docs/transforms/previews/MedianFilter-y.webp)](docs/transforms/previews/MedianFilter-y.webp) | [![MedianFilter: original and transformed X slices](docs/transforms/previews/MedianFilter-x.webp)](docs/transforms/previews/MedianFilter-x.webp) |
 
 </details>
 
@@ -893,7 +909,7 @@ A.Morphology(operation='close', radius=1)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![Morphology: original and augmented Z slices](docs/augmentations/previews/Morphology-z.webp)](docs/augmentations/previews/Morphology-z.webp) | [![Morphology: original and augmented Y slices](docs/augmentations/previews/Morphology-y.webp)](docs/augmentations/previews/Morphology-y.webp) | [![Morphology: original and augmented X slices](docs/augmentations/previews/Morphology-x.webp)](docs/augmentations/previews/Morphology-x.webp) |
+| [![Morphology: original and transformed Z slices](docs/transforms/previews/Morphology-z.webp)](docs/transforms/previews/Morphology-z.webp) | [![Morphology: original and transformed Y slices](docs/transforms/previews/Morphology-y.webp)](docs/transforms/previews/Morphology-y.webp) | [![Morphology: original and transformed X slices](docs/transforms/previews/Morphology-x.webp)](docs/transforms/previews/Morphology-x.webp) |
 
 </details>
 
@@ -912,7 +928,7 @@ A.MotionBlur(length=5, direction=(1, 1, 1), samples=9)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![MotionBlur: original and augmented Z slices](docs/augmentations/previews/MotionBlur-z.webp)](docs/augmentations/previews/MotionBlur-z.webp) | [![MotionBlur: original and augmented Y slices](docs/augmentations/previews/MotionBlur-y.webp)](docs/augmentations/previews/MotionBlur-y.webp) | [![MotionBlur: original and augmented X slices](docs/augmentations/previews/MotionBlur-x.webp)](docs/augmentations/previews/MotionBlur-x.webp) |
+| [![MotionBlur: original and transformed Z slices](docs/transforms/previews/MotionBlur-z.webp)](docs/transforms/previews/MotionBlur-z.webp) | [![MotionBlur: original and transformed Y slices](docs/transforms/previews/MotionBlur-y.webp)](docs/transforms/previews/MotionBlur-y.webp) | [![MotionBlur: original and transformed X slices](docs/transforms/previews/MotionBlur-x.webp)](docs/transforms/previews/MotionBlur-x.webp) |
 
 </details>
 
@@ -931,7 +947,7 @@ A.MultiplicativeNoise(low=0.8, high=1.2)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![MultiplicativeNoise: original and augmented Z slices](docs/augmentations/previews/MultiplicativeNoise-z.webp)](docs/augmentations/previews/MultiplicativeNoise-z.webp) | [![MultiplicativeNoise: original and augmented Y slices](docs/augmentations/previews/MultiplicativeNoise-y.webp)](docs/augmentations/previews/MultiplicativeNoise-y.webp) | [![MultiplicativeNoise: original and augmented X slices](docs/augmentations/previews/MultiplicativeNoise-x.webp)](docs/augmentations/previews/MultiplicativeNoise-x.webp) |
+| [![MultiplicativeNoise: original and transformed Z slices](docs/transforms/previews/MultiplicativeNoise-z.webp)](docs/transforms/previews/MultiplicativeNoise-z.webp) | [![MultiplicativeNoise: original and transformed Y slices](docs/transforms/previews/MultiplicativeNoise-y.webp)](docs/transforms/previews/MultiplicativeNoise-y.webp) | [![MultiplicativeNoise: original and transformed X slices](docs/transforms/previews/MultiplicativeNoise-x.webp)](docs/transforms/previews/MultiplicativeNoise-x.webp) |
 
 </details>
 
@@ -950,7 +966,7 @@ A.Normalize(mode='zscore')
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![Normalize: original and augmented Z slices](docs/augmentations/previews/Normalize-z.webp)](docs/augmentations/previews/Normalize-z.webp) | [![Normalize: original and augmented Y slices](docs/augmentations/previews/Normalize-y.webp)](docs/augmentations/previews/Normalize-y.webp) | [![Normalize: original and augmented X slices](docs/augmentations/previews/Normalize-x.webp)](docs/augmentations/previews/Normalize-x.webp) |
+| [![Normalize: original and transformed Z slices](docs/transforms/previews/Normalize-z.webp)](docs/transforms/previews/Normalize-z.webp) | [![Normalize: original and transformed Y slices](docs/transforms/previews/Normalize-y.webp)](docs/transforms/previews/Normalize-y.webp) | [![Normalize: original and transformed X slices](docs/transforms/previews/Normalize-x.webp)](docs/transforms/previews/Normalize-x.webp) |
 
 </details>
 
@@ -969,7 +985,7 @@ A.ObjectDropout(drop_probability=0.5)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![ObjectDropout: original and augmented Z slices](docs/augmentations/previews/ObjectDropout-z.webp)](docs/augmentations/previews/ObjectDropout-z.webp) | [![ObjectDropout: original and augmented Y slices](docs/augmentations/previews/ObjectDropout-y.webp)](docs/augmentations/previews/ObjectDropout-y.webp) | [![ObjectDropout: original and augmented X slices](docs/augmentations/previews/ObjectDropout-x.webp)](docs/augmentations/previews/ObjectDropout-x.webp) |
+| [![ObjectDropout: original and transformed Z slices](docs/transforms/previews/ObjectDropout-z.webp)](docs/transforms/previews/ObjectDropout-z.webp) | [![ObjectDropout: original and transformed Y slices](docs/transforms/previews/ObjectDropout-y.webp)](docs/transforms/previews/ObjectDropout-y.webp) | [![ObjectDropout: original and transformed X slices](docs/transforms/previews/ObjectDropout-x.webp)](docs/transforms/previews/ObjectDropout-x.webp) |
 
 </details>
 
@@ -988,7 +1004,7 @@ A.OrientedBlur(sigma_along=2, sigma_across=0.5, axis=(1, 0, 0))
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![OrientedBlur: original and augmented Z slices](docs/augmentations/previews/OrientedBlur-z.webp)](docs/augmentations/previews/OrientedBlur-z.webp) | [![OrientedBlur: original and augmented Y slices](docs/augmentations/previews/OrientedBlur-y.webp)](docs/augmentations/previews/OrientedBlur-y.webp) | [![OrientedBlur: original and augmented X slices](docs/augmentations/previews/OrientedBlur-x.webp)](docs/augmentations/previews/OrientedBlur-x.webp) |
+| [![OrientedBlur: original and transformed Z slices](docs/transforms/previews/OrientedBlur-z.webp)](docs/transforms/previews/OrientedBlur-z.webp) | [![OrientedBlur: original and transformed Y slices](docs/transforms/previews/OrientedBlur-y.webp)](docs/transforms/previews/OrientedBlur-y.webp) | [![OrientedBlur: original and transformed X slices](docs/transforms/previews/OrientedBlur-x.webp)](docs/transforms/previews/OrientedBlur-x.webp) |
 
 </details>
 
@@ -1007,7 +1023,7 @@ A.PixelDistributionAdaptation(reference=reference, blend=1, mode='standard')
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![PixelDistributionAdaptation: original and augmented Z slices](docs/augmentations/previews/PixelDistributionAdaptation-z.webp)](docs/augmentations/previews/PixelDistributionAdaptation-z.webp) | [![PixelDistributionAdaptation: original and augmented Y slices](docs/augmentations/previews/PixelDistributionAdaptation-y.webp)](docs/augmentations/previews/PixelDistributionAdaptation-y.webp) | [![PixelDistributionAdaptation: original and augmented X slices](docs/augmentations/previews/PixelDistributionAdaptation-x.webp)](docs/augmentations/previews/PixelDistributionAdaptation-x.webp) |
+| [![PixelDistributionAdaptation: original and transformed Z slices](docs/transforms/previews/PixelDistributionAdaptation-z.webp)](docs/transforms/previews/PixelDistributionAdaptation-z.webp) | [![PixelDistributionAdaptation: original and transformed Y slices](docs/transforms/previews/PixelDistributionAdaptation-y.webp)](docs/transforms/previews/PixelDistributionAdaptation-y.webp) | [![PixelDistributionAdaptation: original and transformed X slices](docs/transforms/previews/PixelDistributionAdaptation-x.webp)](docs/transforms/previews/PixelDistributionAdaptation-x.webp) |
 
 </details>
 
@@ -1026,7 +1042,7 @@ A.PlasmaBrightnessContrast(brightness=0.2, contrast=0.3, scale=0.025, persistenc
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![PlasmaBrightnessContrast: original and augmented Z slices](docs/augmentations/previews/PlasmaBrightnessContrast-z.webp)](docs/augmentations/previews/PlasmaBrightnessContrast-z.webp) | [![PlasmaBrightnessContrast: original and augmented Y slices](docs/augmentations/previews/PlasmaBrightnessContrast-y.webp)](docs/augmentations/previews/PlasmaBrightnessContrast-y.webp) | [![PlasmaBrightnessContrast: original and augmented X slices](docs/augmentations/previews/PlasmaBrightnessContrast-x.webp)](docs/augmentations/previews/PlasmaBrightnessContrast-x.webp) |
+| [![PlasmaBrightnessContrast: original and transformed Z slices](docs/transforms/previews/PlasmaBrightnessContrast-z.webp)](docs/transforms/previews/PlasmaBrightnessContrast-z.webp) | [![PlasmaBrightnessContrast: original and transformed Y slices](docs/transforms/previews/PlasmaBrightnessContrast-y.webp)](docs/transforms/previews/PlasmaBrightnessContrast-y.webp) | [![PlasmaBrightnessContrast: original and transformed X slices](docs/transforms/previews/PlasmaBrightnessContrast-x.webp)](docs/transforms/previews/PlasmaBrightnessContrast-x.webp) |
 
 </details>
 
@@ -1045,7 +1061,7 @@ A.PlasmaShadow(strength=0.5, scale=0.025, persistence=0.5, octaves=5)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![PlasmaShadow: original and augmented Z slices](docs/augmentations/previews/PlasmaShadow-z.webp)](docs/augmentations/previews/PlasmaShadow-z.webp) | [![PlasmaShadow: original and augmented Y slices](docs/augmentations/previews/PlasmaShadow-y.webp)](docs/augmentations/previews/PlasmaShadow-y.webp) | [![PlasmaShadow: original and augmented X slices](docs/augmentations/previews/PlasmaShadow-x.webp)](docs/augmentations/previews/PlasmaShadow-x.webp) |
+| [![PlasmaShadow: original and transformed Z slices](docs/transforms/previews/PlasmaShadow-z.webp)](docs/transforms/previews/PlasmaShadow-z.webp) | [![PlasmaShadow: original and transformed Y slices](docs/transforms/previews/PlasmaShadow-y.webp)](docs/transforms/previews/PlasmaShadow-y.webp) | [![PlasmaShadow: original and transformed X slices](docs/transforms/previews/PlasmaShadow-x.webp)](docs/transforms/previews/PlasmaShadow-x.webp) |
 
 </details>
 
@@ -1064,7 +1080,7 @@ A.RandomBinaryOperator(channels=(0,), radius=1, operations=('dilate',))
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![RandomBinaryOperator: original and augmented Z slices](docs/augmentations/previews/RandomBinaryOperator-z.webp)](docs/augmentations/previews/RandomBinaryOperator-z.webp) | [![RandomBinaryOperator: original and augmented Y slices](docs/augmentations/previews/RandomBinaryOperator-y.webp)](docs/augmentations/previews/RandomBinaryOperator-y.webp) | [![RandomBinaryOperator: original and augmented X slices](docs/augmentations/previews/RandomBinaryOperator-x.webp)](docs/augmentations/previews/RandomBinaryOperator-x.webp) |
+| [![RandomBinaryOperator: original and transformed Z slices](docs/transforms/previews/RandomBinaryOperator-z.webp)](docs/transforms/previews/RandomBinaryOperator-z.webp) | [![RandomBinaryOperator: original and transformed Y slices](docs/transforms/previews/RandomBinaryOperator-y.webp)](docs/transforms/previews/RandomBinaryOperator-y.webp) | [![RandomBinaryOperator: original and transformed X slices](docs/transforms/previews/RandomBinaryOperator-x.webp)](docs/transforms/previews/RandomBinaryOperator-x.webp) |
 
 </details>
 
@@ -1083,7 +1099,7 @@ A.RandomToneCurve(scale=0.1)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![RandomToneCurve: original and augmented Z slices](docs/augmentations/previews/RandomToneCurve-z.webp)](docs/augmentations/previews/RandomToneCurve-z.webp) | [![RandomToneCurve: original and augmented Y slices](docs/augmentations/previews/RandomToneCurve-y.webp)](docs/augmentations/previews/RandomToneCurve-y.webp) | [![RandomToneCurve: original and augmented X slices](docs/augmentations/previews/RandomToneCurve-x.webp)](docs/augmentations/previews/RandomToneCurve-x.webp) |
+| [![RandomToneCurve: original and transformed Z slices](docs/transforms/previews/RandomToneCurve-z.webp)](docs/transforms/previews/RandomToneCurve-z.webp) | [![RandomToneCurve: original and transformed Y slices](docs/transforms/previews/RandomToneCurve-y.webp)](docs/transforms/previews/RandomToneCurve-y.webp) | [![RandomToneCurve: original and transformed X slices](docs/transforms/previews/RandomToneCurve-x.webp)](docs/transforms/previews/RandomToneCurve-x.webp) |
 
 </details>
 
@@ -1102,7 +1118,7 @@ A.RemoveComponents(on='mask', max_fraction=0.25, p_fill=0)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![RemoveComponents: original and augmented Z slices](docs/augmentations/previews/RemoveComponents-z.webp)](docs/augmentations/previews/RemoveComponents-z.webp) | [![RemoveComponents: original and augmented Y slices](docs/augmentations/previews/RemoveComponents-y.webp)](docs/augmentations/previews/RemoveComponents-y.webp) | [![RemoveComponents: original and augmented X slices](docs/augmentations/previews/RemoveComponents-x.webp)](docs/augmentations/previews/RemoveComponents-x.webp) |
+| [![RemoveComponents: original and transformed Z slices](docs/transforms/previews/RemoveComponents-z.webp)](docs/transforms/previews/RemoveComponents-z.webp) | [![RemoveComponents: original and transformed Y slices](docs/transforms/previews/RemoveComponents-y.webp)](docs/transforms/previews/RemoveComponents-y.webp) | [![RemoveComponents: original and transformed X slices](docs/transforms/previews/RemoveComponents-x.webp)](docs/transforms/previews/RemoveComponents-x.webp) |
 
 </details>
 
@@ -1121,7 +1137,7 @@ A.RicianNoise(std=0.05)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![RicianNoise: original and augmented Z slices](docs/augmentations/previews/RicianNoise-z.webp)](docs/augmentations/previews/RicianNoise-z.webp) | [![RicianNoise: original and augmented Y slices](docs/augmentations/previews/RicianNoise-y.webp)](docs/augmentations/previews/RicianNoise-y.webp) | [![RicianNoise: original and augmented X slices](docs/augmentations/previews/RicianNoise-x.webp)](docs/augmentations/previews/RicianNoise-x.webp) |
+| [![RicianNoise: original and transformed Z slices](docs/transforms/previews/RicianNoise-z.webp)](docs/transforms/previews/RicianNoise-z.webp) | [![RicianNoise: original and transformed Y slices](docs/transforms/previews/RicianNoise-y.webp)](docs/transforms/previews/RicianNoise-y.webp) | [![RicianNoise: original and transformed X slices](docs/transforms/previews/RicianNoise-x.webp)](docs/transforms/previews/RicianNoise-x.webp) |
 
 </details>
 
@@ -1140,7 +1156,7 @@ A.RingingOvershoot(cutoff=0.7, radius=4)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![RingingOvershoot: original and augmented Z slices](docs/augmentations/previews/RingingOvershoot-z.webp)](docs/augmentations/previews/RingingOvershoot-z.webp) | [![RingingOvershoot: original and augmented Y slices](docs/augmentations/previews/RingingOvershoot-y.webp)](docs/augmentations/previews/RingingOvershoot-y.webp) | [![RingingOvershoot: original and augmented X slices](docs/augmentations/previews/RingingOvershoot-x.webp)](docs/augmentations/previews/RingingOvershoot-x.webp) |
+| [![RingingOvershoot: original and transformed Z slices](docs/transforms/previews/RingingOvershoot-z.webp)](docs/transforms/previews/RingingOvershoot-z.webp) | [![RingingOvershoot: original and transformed Y slices](docs/transforms/previews/RingingOvershoot-y.webp)](docs/transforms/previews/RingingOvershoot-y.webp) | [![RingingOvershoot: original and transformed X slices](docs/transforms/previews/RingingOvershoot-x.webp)](docs/transforms/previews/RingingOvershoot-x.webp) |
 
 </details>
 
@@ -1159,7 +1175,7 @@ A.Rotate90(planes=('yx',), turns=(1,))
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![Rotate90: original and augmented Z slices](docs/augmentations/previews/Rotate90-z.webp)](docs/augmentations/previews/Rotate90-z.webp) | [![Rotate90: original and augmented Y slices](docs/augmentations/previews/Rotate90-y.webp)](docs/augmentations/previews/Rotate90-y.webp) | [![Rotate90: original and augmented X slices](docs/augmentations/previews/Rotate90-x.webp)](docs/augmentations/previews/Rotate90-x.webp) |
+| [![Rotate90: original and transformed Z slices](docs/transforms/previews/Rotate90-z.webp)](docs/transforms/previews/Rotate90-z.webp) | [![Rotate90: original and transformed Y slices](docs/transforms/previews/Rotate90-y.webp)](docs/transforms/previews/Rotate90-y.webp) | [![Rotate90: original and transformed X slices](docs/transforms/previews/Rotate90-x.webp)](docs/transforms/previews/Rotate90-x.webp) |
 
 </details>
 
@@ -1178,7 +1194,7 @@ A.SaltAndPepper(amount=0.02, salt_fraction=0.5)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![SaltAndPepper: original and augmented Z slices](docs/augmentations/previews/SaltAndPepper-z.webp)](docs/augmentations/previews/SaltAndPepper-z.webp) | [![SaltAndPepper: original and augmented Y slices](docs/augmentations/previews/SaltAndPepper-y.webp)](docs/augmentations/previews/SaltAndPepper-y.webp) | [![SaltAndPepper: original and augmented X slices](docs/augmentations/previews/SaltAndPepper-x.webp)](docs/augmentations/previews/SaltAndPepper-x.webp) |
+| [![SaltAndPepper: original and transformed Z slices](docs/transforms/previews/SaltAndPepper-z.webp)](docs/transforms/previews/SaltAndPepper-z.webp) | [![SaltAndPepper: original and transformed Y slices](docs/transforms/previews/SaltAndPepper-y.webp)](docs/transforms/previews/SaltAndPepper-y.webp) | [![SaltAndPepper: original and transformed X slices](docs/transforms/previews/SaltAndPepper-x.webp)](docs/transforms/previews/SaltAndPepper-x.webp) |
 
 </details>
 
@@ -1197,7 +1213,7 @@ A.Sharpen(strength=0.25, p_clamp=0)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![Sharpen: original and augmented Z slices](docs/augmentations/previews/Sharpen-z.webp)](docs/augmentations/previews/Sharpen-z.webp) | [![Sharpen: original and augmented Y slices](docs/augmentations/previews/Sharpen-y.webp)](docs/augmentations/previews/Sharpen-y.webp) | [![Sharpen: original and augmented X slices](docs/augmentations/previews/Sharpen-x.webp)](docs/augmentations/previews/Sharpen-x.webp) |
+| [![Sharpen: original and transformed Z slices](docs/transforms/previews/Sharpen-z.webp)](docs/transforms/previews/Sharpen-z.webp) | [![Sharpen: original and transformed Y slices](docs/transforms/previews/Sharpen-y.webp)](docs/transforms/previews/Sharpen-y.webp) | [![Sharpen: original and transformed X slices](docs/transforms/previews/Sharpen-x.webp)](docs/transforms/previews/Sharpen-x.webp) |
 
 </details>
 
@@ -1216,7 +1232,7 @@ A.SheetCompression(strength=0.2, intensity_sigma=1, smoothing=2, axes='z')
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![SheetCompression: original and augmented Z slices](docs/augmentations/previews/SheetCompression-z.webp)](docs/augmentations/previews/SheetCompression-z.webp) | [![SheetCompression: original and augmented Y slices](docs/augmentations/previews/SheetCompression-y.webp)](docs/augmentations/previews/SheetCompression-y.webp) | [![SheetCompression: original and augmented X slices](docs/augmentations/previews/SheetCompression-x.webp)](docs/augmentations/previews/SheetCompression-x.webp) |
+| [![SheetCompression: original and transformed Z slices](docs/transforms/previews/SheetCompression-z.webp)](docs/transforms/previews/SheetCompression-z.webp) | [![SheetCompression: original and transformed Y slices](docs/transforms/previews/SheetCompression-y.webp)](docs/transforms/previews/SheetCompression-y.webp) | [![SheetCompression: original and transformed X slices](docs/transforms/previews/SheetCompression-x.webp)](docs/transforms/previews/SheetCompression-x.webp) |
 
 </details>
 
@@ -1235,7 +1251,7 @@ A.ShotNoise(photons=100)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![ShotNoise: original and augmented Z slices](docs/augmentations/previews/ShotNoise-z.webp)](docs/augmentations/previews/ShotNoise-z.webp) | [![ShotNoise: original and augmented Y slices](docs/augmentations/previews/ShotNoise-y.webp)](docs/augmentations/previews/ShotNoise-y.webp) | [![ShotNoise: original and augmented X slices](docs/augmentations/previews/ShotNoise-x.webp)](docs/augmentations/previews/ShotNoise-x.webp) |
+| [![ShotNoise: original and transformed Z slices](docs/transforms/previews/ShotNoise-z.webp)](docs/transforms/previews/ShotNoise-z.webp) | [![ShotNoise: original and transformed Y slices](docs/transforms/previews/ShotNoise-y.webp)](docs/transforms/previews/ShotNoise-y.webp) | [![ShotNoise: original and transformed X slices](docs/transforms/previews/ShotNoise-x.webp)](docs/transforms/previews/ShotNoise-x.webp) |
 
 </details>
 
@@ -1254,7 +1270,7 @@ A.SliceIllumination(defects=3, width=4, reduction=0.5, base_p=0.1, base_reductio
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![SliceIllumination: original and augmented Z slices](docs/augmentations/previews/SliceIllumination-z.webp)](docs/augmentations/previews/SliceIllumination-z.webp) | [![SliceIllumination: original and augmented Y slices](docs/augmentations/previews/SliceIllumination-y.webp)](docs/augmentations/previews/SliceIllumination-y.webp) | [![SliceIllumination: original and augmented X slices](docs/augmentations/previews/SliceIllumination-x.webp)](docs/augmentations/previews/SliceIllumination-x.webp) |
+| [![SliceIllumination: original and transformed Z slices](docs/transforms/previews/SliceIllumination-z.webp)](docs/transforms/previews/SliceIllumination-z.webp) | [![SliceIllumination: original and transformed Y slices](docs/transforms/previews/SliceIllumination-y.webp)](docs/transforms/previews/SliceIllumination-y.webp) | [![SliceIllumination: original and transformed X slices](docs/transforms/previews/SliceIllumination-x.webp)](docs/transforms/previews/SliceIllumination-x.webp) |
 
 </details>
 
@@ -1273,7 +1289,7 @@ A.Smear(shift=(3, 0), alpha=0.25)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![Smear: original and augmented Z slices](docs/augmentations/previews/Smear-z.webp)](docs/augmentations/previews/Smear-z.webp) | [![Smear: original and augmented Y slices](docs/augmentations/previews/Smear-y.webp)](docs/augmentations/previews/Smear-y.webp) | [![Smear: original and augmented X slices](docs/augmentations/previews/Smear-x.webp)](docs/augmentations/previews/Smear-x.webp) |
+| [![Smear: original and transformed Z slices](docs/transforms/previews/Smear-z.webp)](docs/transforms/previews/Smear-z.webp) | [![Smear: original and transformed Y slices](docs/transforms/previews/Smear-y.webp)](docs/transforms/previews/Smear-y.webp) | [![Smear: original and transformed X slices](docs/transforms/previews/Smear-x.webp)](docs/transforms/previews/Smear-x.webp) |
 
 </details>
 
@@ -1292,7 +1308,7 @@ A.StripeMasking(unit_size=(16, 16, 16), ratio=0.25, axes='zyx')
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![StripeMasking: original and augmented Z slices](docs/augmentations/previews/StripeMasking-z.webp)](docs/augmentations/previews/StripeMasking-z.webp) | [![StripeMasking: original and augmented Y slices](docs/augmentations/previews/StripeMasking-y.webp)](docs/augmentations/previews/StripeMasking-y.webp) | [![StripeMasking: original and augmented X slices](docs/augmentations/previews/StripeMasking-x.webp)](docs/augmentations/previews/StripeMasking-x.webp) |
+| [![StripeMasking: original and transformed Z slices](docs/transforms/previews/StripeMasking-z.webp)](docs/transforms/previews/StripeMasking-z.webp) | [![StripeMasking: original and transformed Y slices](docs/transforms/previews/StripeMasking-y.webp)](docs/transforms/previews/StripeMasking-y.webp) | [![StripeMasking: original and transformed X slices](docs/transforms/previews/StripeMasking-x.webp)](docs/transforms/previews/StripeMasking-x.webp) |
 
 </details>
 
@@ -1311,7 +1327,7 @@ A.ThickSlice(scale=0.5, axes='z')
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![ThickSlice: original and augmented Z slices](docs/augmentations/previews/ThickSlice-z.webp)](docs/augmentations/previews/ThickSlice-z.webp) | [![ThickSlice: original and augmented Y slices](docs/augmentations/previews/ThickSlice-y.webp)](docs/augmentations/previews/ThickSlice-y.webp) | [![ThickSlice: original and augmented X slices](docs/augmentations/previews/ThickSlice-x.webp)](docs/augmentations/previews/ThickSlice-x.webp) |
+| [![ThickSlice: original and transformed Z slices](docs/transforms/previews/ThickSlice-z.webp)](docs/transforms/previews/ThickSlice-z.webp) | [![ThickSlice: original and transformed Y slices](docs/transforms/previews/ThickSlice-y.webp)](docs/transforms/previews/ThickSlice-y.webp) | [![ThickSlice: original and transformed X slices](docs/transforms/previews/ThickSlice-x.webp)](docs/transforms/previews/ThickSlice-x.webp) |
 
 </details>
 
@@ -1330,7 +1346,7 @@ A.Transpose(order='zxy')
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![Transpose: original and augmented Z slices](docs/augmentations/previews/Transpose-z.webp)](docs/augmentations/previews/Transpose-z.webp) | [![Transpose: original and augmented Y slices](docs/augmentations/previews/Transpose-y.webp)](docs/augmentations/previews/Transpose-y.webp) | [![Transpose: original and augmented X slices](docs/augmentations/previews/Transpose-x.webp)](docs/augmentations/previews/Transpose-x.webp) |
+| [![Transpose: original and transformed Z slices](docs/transforms/previews/Transpose-z.webp)](docs/transforms/previews/Transpose-z.webp) | [![Transpose: original and transformed Y slices](docs/transforms/previews/Transpose-y.webp)](docs/transforms/previews/Transpose-y.webp) | [![Transpose: original and transformed X slices](docs/transforms/previews/Transpose-x.webp)](docs/transforms/previews/Transpose-x.webp) |
 
 </details>
 
@@ -1349,7 +1365,7 @@ A.UnsharpMask(strength=0.5, sigma=1)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![UnsharpMask: original and augmented Z slices](docs/augmentations/previews/UnsharpMask-z.webp)](docs/augmentations/previews/UnsharpMask-z.webp) | [![UnsharpMask: original and augmented Y slices](docs/augmentations/previews/UnsharpMask-y.webp)](docs/augmentations/previews/UnsharpMask-y.webp) | [![UnsharpMask: original and augmented X slices](docs/augmentations/previews/UnsharpMask-x.webp)](docs/augmentations/previews/UnsharpMask-x.webp) |
+| [![UnsharpMask: original and transformed Z slices](docs/transforms/previews/UnsharpMask-z.webp)](docs/transforms/previews/UnsharpMask-z.webp) | [![UnsharpMask: original and transformed Y slices](docs/transforms/previews/UnsharpMask-y.webp)](docs/transforms/previews/UnsharpMask-y.webp) | [![UnsharpMask: original and transformed X slices](docs/transforms/previews/UnsharpMask-x.webp)](docs/transforms/previews/UnsharpMask-x.webp) |
 
 </details>
 
@@ -1368,7 +1384,7 @@ A.Vignetting(strength=0.5, radius=0.8)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![Vignetting: original and augmented Z slices](docs/augmentations/previews/Vignetting-z.webp)](docs/augmentations/previews/Vignetting-z.webp) | [![Vignetting: original and augmented Y slices](docs/augmentations/previews/Vignetting-y.webp)](docs/augmentations/previews/Vignetting-y.webp) | [![Vignetting: original and augmented X slices](docs/augmentations/previews/Vignetting-x.webp)](docs/augmentations/previews/Vignetting-x.webp) |
+| [![Vignetting: original and transformed Z slices](docs/transforms/previews/Vignetting-z.webp)](docs/transforms/previews/Vignetting-z.webp) | [![Vignetting: original and transformed Y slices](docs/transforms/previews/Vignetting-y.webp)](docs/transforms/previews/Vignetting-y.webp) | [![Vignetting: original and transformed X slices](docs/transforms/previews/Vignetting-x.webp)](docs/transforms/previews/Vignetting-x.webp) |
 
 </details>
 
@@ -1387,7 +1403,7 @@ A.ZoomBlur(strength=0.15, samples=9)
 
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
-| [![ZoomBlur: original and augmented Z slices](docs/augmentations/previews/ZoomBlur-z.webp)](docs/augmentations/previews/ZoomBlur-z.webp) | [![ZoomBlur: original and augmented Y slices](docs/augmentations/previews/ZoomBlur-y.webp)](docs/augmentations/previews/ZoomBlur-y.webp) | [![ZoomBlur: original and augmented X slices](docs/augmentations/previews/ZoomBlur-x.webp)](docs/augmentations/previews/ZoomBlur-x.webp) |
+| [![ZoomBlur: original and transformed Z slices](docs/transforms/previews/ZoomBlur-z.webp)](docs/transforms/previews/ZoomBlur-z.webp) | [![ZoomBlur: original and transformed Y slices](docs/transforms/previews/ZoomBlur-y.webp)](docs/transforms/previews/ZoomBlur-y.webp) | [![ZoomBlur: original and transformed X slices](docs/transforms/previews/ZoomBlur-x.webp)](docs/transforms/previews/ZoomBlur-x.webp) |
 
 </details>
 
@@ -1408,7 +1424,7 @@ A.StripGeometry(degrees=5, smooth_offset=2, stride=16)
 | ---: | ---: | ---: | ---: | ---: |
 | 1.092 ms | 0.038 ms | 0.042 ms | 28.9× | 25.8× |
 
-[![StripGeometry: original and augmented 2D views](docs/augmentations/previews/StripGeometry.webp)](docs/augmentations/previews/StripGeometry.webp)
+[![StripGeometry: original and transformed 2D views](docs/transforms/previews/StripGeometry.webp)](docs/transforms/previews/StripGeometry.webp)
 
 2D-only companion: central Z slice, not a cubic-volume timing.
 
@@ -1427,7 +1443,7 @@ A.SurfacePerturb(blobs=3, amplitude=1, points_affected=100, p=1)
 | ---: | ---: | ---: | ---: | ---: |
 | 0.527 ms | 0.287 ms | 0.269 ms | 1.8× | 2.0× |
 
-[![SurfacePerturb: original and augmented 2D views](docs/augmentations/previews/SurfacePerturb.webp)](docs/augmentations/previews/SurfacePerturb.webp)
+[![SurfacePerturb: original and transformed 2D views](docs/transforms/previews/SurfacePerturb.webp)](docs/transforms/previews/SurfacePerturb.webp)
 
 2D-only companion: synthetic coordinate surface with CT-derived height. Preview is displacement magnitude, not an anatomical surface.
 

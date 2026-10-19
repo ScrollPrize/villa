@@ -13,10 +13,10 @@ if os.environ.get('VC_READER_BUILD_DIR'):
     from extension_build import load_extensions
     load_extensions(Path(os.environ['VC_READER_BUILD_DIR']))
 
-from vc_reader import augment as A, cuda
+from vc_reader import transforms as A, cuda
 
 
-@unittest.skipUnless(torch.cuda.is_available() and A._augment.cuda_available(), 'CUDA build and device required')
+@unittest.skipUnless(torch.cuda.is_available() and A._transforms.cuda_available(), 'CUDA build and device required')
 class CudaBatchTests(unittest.TestCase):
     def compare(self, transform, sample, *, targets=None, seeds=(3, 19, 107), params=None):
         pipeline = A.Pipeline(transform if isinstance(transform, list) else [transform],

@@ -13,7 +13,7 @@ if os.environ.get("VC_READER_BUILD_DIR"):
 
 import numpy as np
 import torch
-from vc_reader import augment as A, cuda
+from vc_reader import transforms as A, cuda
 from vc_reader.torch import CudaLoader
 
 
@@ -72,14 +72,14 @@ if os.environ.get('VC_READER_BUILD_DIR'):
     from extension_build import load_extensions
     load_extensions(Path(os.environ['VC_READER_BUILD_DIR']))
 import vc_reader
-from vc_reader import augment
+from vc_reader import transforms
 assert 'torch' not in sys.modules
 """
         subprocess.run([sys.executable, "-c", code], check=True, timeout=30,
                        cwd=Path(__file__).resolve().parents[1])
 
 
-@unittest.skipUnless(torch.cuda.is_available() and A._augment.cuda_available(), "CUDA build and device required")
+@unittest.skipUnless(torch.cuda.is_available() and A._transforms.cuda_available(), "CUDA build and device required")
 class BatchTests(unittest.TestCase):
     def assertSame(self, actual, expected):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -313,7 +313,7 @@ class BatchTests(unittest.TestCase):
         self.assertSame(next(iter(CudaLoader([batch], p, seed_key='seed')))['image'], expected)
 
 
-@unittest.skipUnless(torch.cuda.is_available() and A._augment.cuda_available(), "CUDA build and device required")
+@unittest.skipUnless(torch.cuda.is_available() and A._transforms.cuda_available(), "CUDA build and device required")
 class LoaderTests(unittest.TestCase):
     def pipeline(self):
         return A.Pipeline([A.Flip(axes='x', p_axis=.5), A.BrightnessMultiply((.5, 1.5))],
@@ -386,7 +386,7 @@ class LoaderTests(unittest.TestCase):
         torch.testing.assert_close(result, ref, rtol=0, atol=0)
 
 
-@unittest.skipUnless(torch.cuda.is_available() and A._augment.cuda_available(), "CUDA build and device required")
+@unittest.skipUnless(torch.cuda.is_available() and A._transforms.cuda_available(), "CUDA build and device required")
 class GeometryTests(unittest.TestCase):
     def test_exact_reflections_all_axes_shapes_and_dtypes(self):
         import itertools

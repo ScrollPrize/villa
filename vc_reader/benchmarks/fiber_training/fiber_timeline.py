@@ -79,7 +79,7 @@ class ProfileDataLoader(torch.utils.data.DataLoader):
 
 
 def install_main(train):
-    from vc_reader import augment
+    from vc_reader import transforms
     from vc_reader.reader.cuda import CudaReader
     import vc_reader.sheet_normal as normal
     original = train.DecisionBatchPrefetch.collect
@@ -92,7 +92,7 @@ def install_main(train):
             batch['_bench_collect_timing'] = dict(began=began, ready=ready)
         return batches
     train.DecisionBatchPrefetch.collect = collect
-    augment.Pipeline.batch = wrap('augmentation', augment.Pipeline.batch)
+    transforms.Pipeline.batch = wrap('augmentation', transforms.Pipeline.batch)
     normal.sheet_normals = wrap('heading.tensor', normal.sheet_normals)
     original_read = CudaReader.read_affine_batch
 

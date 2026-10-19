@@ -14,7 +14,7 @@ if os.environ.get('VC_READER_BUILD_DIR'):
     from extension_build import load_extensions
     load_extensions(Path(os.environ['VC_READER_BUILD_DIR']))
 
-from vc_reader import augment as A
+from vc_reader import transforms as A
 
 
 def elastic_field(plan):
@@ -43,7 +43,7 @@ def elastic_field(plan):
 
 class PrecisionTests(unittest.TestCase):
     def backends(self):
-        return ('cpu', 'cuda') if A._augment.cuda_available() else ('cpu',)
+        return ('cpu', 'cuda') if A._transforms.cuda_available() else ('cpu',)
 
     def test_transforms_and_replay(self):
         rng = np.random.default_rng(124)

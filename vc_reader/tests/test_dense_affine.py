@@ -81,7 +81,7 @@ def test_affine_sampling(tmp_path, shape, origin, axes, threads):
 
 
 def test_zscore_float_extremes_and_cancellation():
-    from vc_reader import augment as a
+    from vc_reader import transforms as a
     rng = np.random.default_rng(391)
     inputs = [rng.normal(size=(1, 31, 33, 35)).astype(np.float32),
         np.full((1, 17, 19), 1e6, np.float32), np.zeros((1, 9, 13), np.float32),
@@ -107,7 +107,7 @@ def test_zscore_float_extremes_and_cancellation():
 
 @pytest.mark.skipif(os.environ.get('VC_READER_LARGE_TESTS') != '1', reason='Requires a 2 GiB CPU array')
 def test_zscore_large_constant():
-    from vc_reader import augment as a
+    from vc_reader import transforms as a
     # A nonbinary constant and odd count make rounding of an unsegmented
     # double sum observable as a false nonzero standard deviation.
     value = np.nextafter(np.float32(1), np.float32(0))

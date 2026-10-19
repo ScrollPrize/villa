@@ -16,7 +16,7 @@ load_build()
 import numpy as np
 import torch
 from vc_reader import Affine, ScrollSource, ValueFrame
-from vc_reader import augment as A
+from vc_reader import transforms as A
 from vc_reader.cuda import is_available
 from training_inputs import build_workflow
 

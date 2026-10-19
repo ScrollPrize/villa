@@ -12,7 +12,7 @@ if os.environ.get('VC_READER_BUILD_DIR'):
     from extension_build import load_extensions
     load_extensions(Path(os.environ['VC_READER_BUILD_DIR']))
 
-from vc_reader import augment as A
+from vc_reader import transforms as A
 
 
 def image_transforms(reference, **options):
@@ -46,7 +46,7 @@ def bilinear(image, y, x):
 
 class DimensionTests(unittest.TestCase):
     def backends(self):
-        return ('cpu', 'cuda') if A._augment.cuda_available() else ('cpu',)
+        return ('cpu', 'cuda') if A._transforms.cuda_available() else ('cpu',)
 
     def check_transform(self, transform, sample, targets=None, atol=6e-5):
         results = {}

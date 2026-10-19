@@ -1,4 +1,4 @@
-"""Owned CUDA arrays shared by the optional reader and augmentation backends.
+"""Owned CUDA arrays shared by the optional reader and transform backends.
 
 Calls complete before returning. DLPack exports are consequently ready on any
 consumer stream. External writers must finish before handing a shared array back
@@ -16,7 +16,7 @@ def is_available():
 
 
 class _ExportOwners:
-    """Track allocations shared by views, including in-place augmentation inputs."""
+    """Track allocations shared by views, including in-place transform inputs."""
     def __init__(self, owners):
         self.owners = tuple(owner for owner in owners if owner is not None)
 

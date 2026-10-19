@@ -1,7 +1,7 @@
 """Benchmark volume reading/sampling, or the full CPU/CUDA training pipeline.
 
 The readers suite compares vc_reader with TensorStore and zarr-python + SciPy.
-The pipeline suite adds normalization and augmentation using vc_reader only.
+The pipeline suite adds normalization and transform using vc_reader only.
 Run --help for workload, real-data, synthetic-input, cache, and output options.
 """
 from __future__ import annotations
@@ -56,7 +56,7 @@ def arguments():
     parser.add_argument("--batch-size", type=positive, default=8, help="crops per ML request")
     parser.add_argument("--plane-size", type=positive, nargs=2, default=(256, 256), metavar=("H", "W"))
     parser.add_argument("--slab-depth", type=positive, default=16)
-    parser.add_argument("--augmentation", choices=("light", "heavy"), default="heavy", help="pipeline suite only")
+    parser.add_argument("--transform", choices=("light", "heavy"), default="heavy", help="pipeline suite only")
     parser.add_argument("--pipeline-read", choices=("affine", "box"), default="affine",
                         help="pipeline suite: affine sampling or integer axis-aligned box reads")
     parser.add_argument("--include-hybrid", action="store_true",
@@ -142,7 +142,7 @@ def summary(values):
                 p95_ms=float(np.percentile(values, 95)), min_ms=float(values.min()), max_ms=float(values.max()))
 
 
-def environment(args, *, augmentation=False):
+def environment(args, *, transform=False):
     from vc_reader import _reader
 
     result = dict(python=sys.version, numpy=np.__version__, platform=platform.platform(),
@@ -150,9 +150,9 @@ def environment(args, *, augmentation=False):
                   affinity=sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
                   extensions={})
     modules = {"reader": _reader}
-    if augmentation:
-        from vc_reader import _augment
-        modules["augment"] = _augment
+    if transform:
+        from vc_reader import _transforms
+        modules["transforms"] = _transforms
     for name, module in modules.items():
         path = Path(module.__file__)
         result["extensions"][name] = dict(path=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest())
@@ -360,7 +360,7 @@ def reading_benchmark(args):
                   config={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
                   environment=environment(args), workloads={},
                   protocol=dict(included="request planning, allocation, reads, decode, interpolation, final CUDA download when selected",
-                                excluded="normalization, augmentation, setup, warmup, validation, destruction, cache clearing",
+                                excluded="normalization, transform, setup, warmup, validation, destruction, cache clearing",
                                 sampling="TensorStore/zarr read an enclosing ROI then SciPy order=1 samples matched float32 coordinates; vc_reader samples chunks directly",
                                 batching="ML: one vc_reader read_many call, concurrent TensorStore futures, zarr thread-pool reads; no pre-stacking",
                                 order="cyclic rotation of backend order each repetition",
@@ -482,7 +482,7 @@ def reading_benchmark(args):
     return report
 
 
-def run_crop(reader, normalization, augmentation, origin, axes, args, seed, cuda=False, source="chunks"):
+def run_crop(reader, normalization, transform, origin, axes, args, seed, cuda=False, source="chunks"):
     # Cache clearing and output destruction are outside the timed interval.
     if cuda and args.cuda_cache == "clear":
         reader.clear_cache()
@@ -498,20 +498,20 @@ def run_crop(reader, normalization, augmentation, origin, axes, args, seed, cuda
     sampled = time.perf_counter_ns()
     normalized = normalization({"image": image}, seed=seed)["image"]
     norm_done = time.perf_counter_ns()
-    output = augmentation({"image": normalized}, seed=seed)["image"]
+    output = transform({"image": normalized}, seed=seed)["image"]
     augmented = time.perf_counter_ns()
     if cuda and args.cuda_output == "host":
         output = output.numpy()
     done = time.perf_counter_ns()
     times = dict(read_sample=(sampled - start) / 1e6, normalization=(norm_done - sampled) / 1e6,
-                 augmentation=(augmented - norm_done) / 1e6, download=(done - augmented) / 1e6 if cuda and args.cuda_output == "host" else 0.,
+                 transform=(augmented - norm_done) / 1e6, download=(done - augmented) / 1e6 if cuda and args.cuda_output == "host" else 0.,
                  total=(done - start) / 1e6)
     return output, times
 
 
 def heavy_transforms():
     """Shared 12-transform workload for single-crop and PyTorch benchmarks."""
-    from vc_reader import augment as A
+    from vc_reader import transforms as A
     return [A.Elastic(sigma=12, magnitude=2, border=True), A.MedianFilter(3),
             A.Flip(axes="x", p_axis=1), A.GaussianBlur(.7), A.BrightnessMultiply(1.1),
             A.BrightnessAdd(.03), A.Contrast(1.15), A.Gamma(.9),
@@ -523,7 +523,7 @@ def heavy_transforms():
 def benchmark(args):
     if args.build_dir:
         load_extensions(args.build_dir.resolve())
-    from vc_reader import augment as A, cuda
+    from vc_reader import transforms as A, cuda
     from vc_reader.reader import ZarrReader
 
     modes = ["cpu", "cuda"] if args.backend == "both" else [args.backend]
@@ -532,16 +532,16 @@ def benchmark(args):
     if args.include_hybrid:
         modes.append("hybrid")
     transforms = [A.Flip(axes="x", p_axis=1), A.BrightnessMultiply(1.1), A.Gamma(.9), A.GaussianBlur(1)]
-    if args.augmentation == "heavy":
+    if args.transform == "heavy":
         transforms = heavy_transforms()
     pipelines = {mode: (A.Pipeline([A.Normalize(args.normalization)], backend="cpu" if mode == "cpu" else "cuda", compact=False),
                         A.Pipeline(transforms, backend="cpu" if mode == "cpu" else "cuda", compact=False)) for mode in modes}
     report = dict(schema_version=2, suite="pipeline", command=[sys.executable, *sys.argv],
                   config={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
-                  environment=environment(args, augmentation=True),
+                  environment=environment(args, transform=True),
                   transforms=[repr(t) for t in transforms],
-                  protocol=dict(timing="synchronous wall time; fused read/sample, separate normalization and augmentation calls",
-                                included="chunk I/O/decode, planning, allocations, sampling, normalization, augmentation; CUDA upload on cache misses",
+                  protocol=dict(timing="synchronous wall time; fused read/sample, separate normalization and transform calls",
+                                included="chunk I/O/decode, planning, allocations, sampling, normalization, transform; CUDA upload on cache misses",
                                 excluded="input generation, reader/pipeline construction, validation, warmup, cache clearing, output destruction",
                                 caches="host and OS caches are not flushed; warm CUDA cache may evict if its budget is too small",
                                 order="backend order rotates each repetition; identical crops and seeds",
@@ -616,7 +616,7 @@ def benchmark(args):
         report["cache_stats"] = dict(before_measurement=before, after_measurement=after)
     voxels = int(np.prod(args.shape))
     for mode, rows in records.items():
-        timings = {stage: summary([row[stage] for row in rows]) for stage in ("read_sample", "normalization", "augmentation", "download", "total")}
+        timings = {stage: summary([row[stage] for row in rows]) for stage in ("read_sample", "normalization", "transform", "download", "total")}
         seconds = sum(row["total"] for row in rows) / 1000
         report["results"][mode] = dict(timings=timings, samples=len(rows), raw_ms=rows,
                                        crops_per_second=len(rows) / seconds,
@@ -625,7 +625,7 @@ def benchmark(args):
     if "cpu" in modes and "cuda" in modes:
         report["speedup_cpu_over_cuda"] = {stage: report["results"]["cpu"]["timings"][stage]["p50_ms"] /
                                            report["results"]["cuda"]["timings"][stage]["p50_ms"]
-                                           for stage in ("read_sample", "normalization", "augmentation", "total")}
+                                           for stage in ("read_sample", "normalization", "transform", "total")}
     if "hybrid" in modes:
         report["speedup_over_hybrid"] = {mode: report["results"][mode]["timings"]["total"]["p50_ms"] /
                                          report["results"]["hybrid"]["timings"]["total"]["p50_ms"]
@@ -638,7 +638,7 @@ def main():
     try:
         report = reading_benchmark(args) if args.suite == "readers" else benchmark(args)
     except (ImportError, AttributeError, RuntimeError, ValueError, AssertionError) as exc:
-        raise SystemExit(f"Benchmark failed: {exc}\nUse matching reader/augmentation extensions; --build-dir can select an existing build.") from exc
+        raise SystemExit(f"Benchmark failed: {exc}\nUse matching reader/transform extensions; --build-dir can select an existing build.") from exc
     if args.suite == "readers":
         print("Workload     Backend       mean ms     p50 ms     p95 ms      req/s     Mvox/s")
         for name, workload in report["workloads"].items():
