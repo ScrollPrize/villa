@@ -16,6 +16,7 @@
 #include <functional>
 
 class QAction;
+class QActionGroup;
 class QDialog;
 class QMenu;
 class QMenuBar;
@@ -121,6 +122,12 @@ private slots:
     void beginRotateSurfaceTransform();
     void materializeCurrentOpenDataSegmentFolder();
     void exitApplication();
+    void rebuildThemeMenu();
+    void importThemeFile();
+    void importThemeFolder();
+    void exportTheme();
+    void openThemesFolder();
+    void reloadThemes();
 
 signals:
     // Emitted when the user picks Actions -> Merge tifxyz... CWindow
@@ -135,6 +142,9 @@ signals:
     void openDataCatalogVisibilityChanged(bool visible);
 
 private:
+    void applyTheme(const QString& id);
+    void importThemeFrom(const QString& path);
+
     QStringList loadRecentPaths() const;
     void saveRecentPaths(const QStringList& paths);
     void ensureRecentActions();
@@ -193,6 +203,8 @@ private:
     QMenu* _selectionMenu{nullptr};
     QMenu* _helpMenu{nullptr};
     QMenu* _recentMenu{nullptr};
+    QMenu* _themeMenu{nullptr};
+    QPointer<QActionGroup> _themeActions;
 
     QAction* _newProjectAct{nullptr};
     QAction* _saveProjectAsAct{nullptr};

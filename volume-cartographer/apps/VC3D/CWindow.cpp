@@ -135,7 +135,7 @@
 #include "elements/ViewerSplitGrid.hpp"
 #include "CPointCollectionWidget.hpp"
 #include "WrapAnnotationWidget.hpp"
-#include "themes/ClassicTheme.hpp"
+#include "themes/ThemeManager.hpp"
 #include "AtlasControlPointsDock.hpp"
 #include "CFiberWidget.hpp"
 #include "FiberAnnotationController.hpp"
@@ -2941,12 +2941,17 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         }
     });
 
-    if (vc3d::theme::classicPrefersDark()) {
-        vc3d::theme::applyClassicDarkPalette();
-        setStyleSheet(vc3d::theme::classicWindowStyleSheet(true));
-    } else {
-        setStyleSheet(vc3d::theme::classicWindowStyleSheet(false));
-    }
+    // The theme. Classic, the default, installs its dark palette here when the
+    // system prefers dark; the window carries its gradient menu bar.
+    auto& themes = vc3d::theme::ThemeManager::instance();
+    connect(&themes, &vc3d::theme::ThemeManager::themeChanged, this, [this]() {
+        setStyleSheet(vc3d::theme::ThemeManager::instance().windowStyleSheet());
+        // The project name label is sized to its text, so size it again once
+        // the new theme's font has reached it.
+        QTimer::singleShot(0, this, &CWindow::updateProjectNameLabel);
+    });
+    connect(&themes, &vc3d::theme::ThemeManager::statusMessage, this, &CWindow::onShowStatusMessage);
+    themes.initialize(vc3d::settingsFilePath());
 
     // Restore geometry / sizes
     QSettings geometry(vc3d::settingsFilePath(), QSettings::IniFormat);
