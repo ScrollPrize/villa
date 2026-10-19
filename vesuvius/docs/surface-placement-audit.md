@@ -90,23 +90,32 @@ Use it with the topology audit, not instead of it.
 
 ## Results on the public Scroll 1 segments
 
-Three segments (20230827161847, 20231007101619, 20230929220926) against the
-public `54keV_7.91um_Scroll1A` volume, 20000 samples each, defaults:
+All 255 public segments with an obj (20230514182829 has only a points file)
+against the public `54keV_7.91um_Scroll1A` volume, 20000 samples each,
+defaults; 224 segments have 1000 or more valid samples. Quantiles across
+segments (10th / median / 90th):
 
 | | offset median | IQR | share > 2 vox | off sheet | no peak |
 | --- | --- | --- | --- | --- | --- |
-| all three | −1.5 | −3.5 … +1.0 | 0.56–0.59 | 0.35–0.37 | 0.24–0.31 |
+| across 255 segments | −1.5 / −0.5 / +1.5 | −2.5 … +1.5 (median) | 0.31 / 0.48 / 0.58 | 0.12 / 0.25 / 0.37 | 0.10 / 0.19 / 0.28 |
 
-The three segments give the same numbers, and the offset histogram is nearly
-flat from −6 to +6, so this is not three segments drifting the same way. The
-controls say what it is: the snap control remeasures at a spread of 0.4
+| control | 10th | median | 90th |
+| --- | --- | --- | --- |
+| `snap_remeasure_sd` | 0.25 | 0.34 | 0.42 |
+| `tangent_absdiff_median_2` / `_4` / `_8` | 0.5 / 0.5 / 0.5 | 0.5 / 0.5 / 1.0 | 0.5 / 0.5 / 1.0 |
+| `tangent_corr_2` / `_4` / `_8` | 0.79 / 0.62 / 0.41 | 0.85 / 0.72 / 0.54 | 0.89 / 0.79 / 0.66 |
+
+The segments give the same picture, and the offset histogram is nearly
+flat from −6 to +6, so this is not segments drifting the same way. The
+controls say what it is: the snap control remeasures at a spread of 0.3
 voxels, so the peak location is precise; the offsets of two points 2 and 4
-voxels apart agree (median difference 0.5, correlation 0.8), at 8 voxels they
-differ by 1 to 1.5 (correlation 0.5), and in a dense resample of one crop they
-are uncorrelated by 16 voxels. The public meshes are triangles of roughly 18
-voxels, and the sheet moves by several voxels inside one triangle. On half the
-surface area the mesh is more than 2 voxels (16 µm) from the sheet, and that
-is a resolution limit of the mesh, not a tracing error that a global shift
-would fix. At 20000 samples over a segment of hundreds of cm² no 32-voxel
+voxels apart agree (median difference 0.5, correlation 0.85 and 0.7), at 8
+voxels they differ by 1 (correlation 0.5), and in a dense resample of one crop
+they are uncorrelated by 16 voxels. The public meshes are triangles of roughly
+18 voxels, and the sheet moves by several voxels inside one triangle. On half
+the surface area the mesh is more than 2 voxels (16 µm) from the sheet, and
+that is a resolution limit of the mesh, not a tracing error that a global
+shift would fix. Per-segment rows are in the evidence repository
+(`data/scroll1_segment_placement.csv`). At 20000 samples over a segment of hundreds of cm² no 32-voxel
 cell collects 30 points, so the `patch_*` metrics are NaN; they need a dense
 sample (a small tifxyz patch, or `--samples` in the millions).
