@@ -1254,6 +1254,42 @@ private slots:
         manager.setTheme(QStringLiteral("classic"), false);
     }
 
+    void exampleThemesLoad()
+    {
+        const QDir examples(QStringLiteral(VC3D_THEME_EXAMPLES_DIR));
+        const QStringList files = examples.entryList({QStringLiteral("*.vc3dtheme")}, QDir::Files);
+        QVERIFY(!files.isEmpty());
+        ThemeRegistry registry;
+        const ThemeProblems scanProblems = registry.scan(examples.path(), {});
+        QVERIFY2(scanProblems.isEmpty(), qPrintable(formatProblems(scanProblems)));
+        for (const QString& file : files) {
+            const QString id = normalizeThemeId(QFileInfo(file).completeBaseName());
+            QVERIFY2(!isBuiltinThemeId(id), qPrintable(id));
+            ThemeProblems problems;
+            const auto theme = registry.resolve(id, &problems);
+            QVERIFY2(theme, qPrintable(formatProblems(problems)));
+            renderStyleSheet(*theme, QStringLiteral("key"), QStringLiteral("dark"), &problems);
+            QVERIFY2(problems.isEmpty(), qPrintable(formatProblems(problems)));
+        }
+
+        ThemeProblems problems;
+        const auto highContrast = registry.resolve(QStringLiteral("high-contrast"), &problems);
+        QVERIFY(highContrast);
+        const auto token = [&](const char* name) {
+            return QColor(highContrast->tokens.value(QLatin1String(name)));
+        };
+        QVERIFY(contrast(token("text"), token("window")) >= 7.0);
+        QVERIFY(contrast(token("text_muted"), token("window")) >= 4.5);
+        QVERIFY(contrast(token("on_accent"), token("accent")) >= 7.0);
+        QVERIFY(contrast(token("selection_text"), token("selection")) >= 7.0);
+        // Disabled text stands apart from normal text.
+        QVERIFY(contrast(token("text"), token("text_muted")) >= 3.0);
+        // A progress bar's label is drawn in one color over both the track and
+        // the filled part, so it needs 4.5:1 against each.
+        QVERIFY(contrast(token("progress_text"), token("progress_chunk")) >= 4.5);
+        QVERIFY(contrast(token("progress_text"), token("progress_track")) >= 4.5);
+    }
+
     void docsMatchTheEngine()
     {
         QFile file(QStringLiteral(VC3D_THEME_DOCS));

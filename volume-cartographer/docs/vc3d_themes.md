@@ -168,8 +168,8 @@ folder and choose Reload Themes.
 When you pick your own colors, keep text on `accent_soft` and
 `item_selected` above 4.5:1, `on_accent` on `accent_fill` above 4.5:1, and
 `accent` at least 3:1 against `border` so checked toggles stand out, or make
-the change visible another way, for example by switching from gray to a
-bright accent.
+the change visible another way, as the high-contrast example does with its
+switch from gray to yellow.
 
 ### The format
 
@@ -386,6 +386,17 @@ Warnings, such as a misspelled token, also show in the status bar.
 - A style sheet given with Qt's `-stylesheet` option applies under Classic
   and Classic-based themes; the Modern themes replace it.
 
+### Example
+
+[`examples/high-contrast.vc3dtheme`](../apps/VC3D/themes/examples/high-contrast.vc3dtheme)
+is a complete theme that is not built in: white text on black, a yellow
+accent and thick focus outlines on buttons, fields and lists, for low vision
+and bright rooms. Import it, or try it for one run from the repository root:
+
+```sh
+VC3D --theme volume-cartographer/apps/VC3D/themes/examples/high-contrast.vc3dtheme
+```
+
 ## For developers
 
 - Code: `apps/VC3D/themes/ThemeEngine.cpp` (parsing, validation, base
@@ -400,5 +411,6 @@ Warnings, such as a misspelled token, also show in the status bar.
   the `kIconRecipes` table in `ThemeEngine.cpp`.
 - Tests: `apps/VC3D/test/test_theme_engine.cpp` (QtTest, offscreen) checks
   that every template placeholder and icon is known, that every built-in
-  token is listed in this page's token table, and that the built-in themes
-  meet the contrast minimums this page gives.
+  token is listed in this page's token table, that the built-in themes
+  meet the contrast minimums this page gives, and loads every file in
+  `themes/examples/`.
