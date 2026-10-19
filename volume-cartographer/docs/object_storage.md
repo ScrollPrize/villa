@@ -12,7 +12,8 @@ in `vc_object_geometry`; link detectors live in `vc_object_links`. These higher
 layers depend on the object store. The database library itself does not depend
 on CT readers or Qt. Python exposes the database and its helpers in `vc.objects`.
 
-The database uses SQLite application ID `0x56434f42`. Geometry ingestion and
+The database uses SQLite application ID `0x56434f42`, schema version 2.
+Metadata JSON exports use `vc_object_metadata` version 2. Geometry ingestion and
 relationship discovery operate on the same store. VC3D/Spiral geometry readers
 are separate consumers.
 
@@ -26,19 +27,15 @@ with ObjectStore.create("objects.vcobj", author="sean") as store:
         patch_id = tx.upsert_object({"kind": "patch", "name": "patch-001"})
         first = tx.put_geometry(patch_id, patch_geometry, expected_revision=None)
         other_id = tx.upsert_object({"kind": "patch", "name": "patch-002"})
-        edge_id = tx.add_edge({"kind": "same-surface", "a": patch_id, "b": other_id})
+        edge_id = tx.add_edge({"kind": "same-surface", "a": patch_id, "b": other_id,
+                               "a_anchor": {"whole_geometry": True},
+                               "b_anchor": {"whole_geometry": True}})
 
-    second = store.put_geometry(patch_id, edited_geometry, expected_revision=first, force=True)
-    assert store.edge_geometry_state(edge_id)["stale"]
-    # After checking the relationship and its anchors against the new geometry:
-    with store.write() as tx:
-        tx.revalidate_edge_geometry(edge_id)
-        tx.set_approval(edge_id, "approved")
 ```
 
-`patch_geometry` and `edited_geometry` use the array dictionary described below.
+`patch_geometry` uses the array dictionary described below.
 C++ uses `ObjectStore::upsertObject`, `putGeometry`, `addEdge`, and
-`revalidateEdgeGeometry` with the same `WriteTxn`. Transactions can commit or
+`repairEdgeGeometry` with the same `WriteTxn`. Transactions can commit or
 roll back object records, geometry, and relationships together. There is one
 relationship set: no graph membership copies, explicit adoption, or independent
 graph revision selections. A stable store UUID identifies the database even
@@ -98,9 +95,9 @@ originating JSON document.
 
 Subsequent ingestion retains edited DB annotations and relationships, including
 manual deletions, and refreshes geometry measurements. Unchanged ingestion is a
-no-op. Replacing geometry that has edges requires `force=True` (`--force` in the
-CLI); it invalidates edge approvals and leaves old anchors stale. Source metadata
-is seeded when an object does not yet have `meta.source`.
+no-op. Changes to referenced points require explicit retain/update/remove
+relationship decisions through `put_geometry`; ingestion refuses such replacements.
+Source metadata is seeded when an object does not yet have `meta.source`.
 
 ## Discovering relationships from the store
 
@@ -218,7 +215,8 @@ To publish arrays directly, supply a dictionary with `kind`, optional
 `data` as Python bytes. Supported dtypes are `|u1`, `<i4`, `<i8`, `<u8`, `<f4`,
 and `<f8`; each object kind requires the layouts listed above. Patch attributes
 must contain a finite, positive two-axis scale. Both `db.put_geometry(...)` and
-`with db.write() as w: w.put_geometry(...)` accept `expected_revision` and `force=False`.
+`with db.write() as w: w.put_geometry(...)` accept `expected_revision` and an
+`edge_edits` list of explicit relationship decisions.
 The C++ equivalents accept `GeometryData` and an existing `WriteTxn`, so geometry
 and other object changes can commit atomically. Publication uses an internal
 savepoint: catching an error and committing other work cannot retain a partial
@@ -288,8 +286,8 @@ loader would discard it. Empty patch grids and nonfinite floating coordinates
 are also rejected. Exports use current object names, tags, typed properties, `meta.source`
 annotations, and stored native relationships. This also applies when selecting
 historical geometry: annotations are current, not historical snapshots. Native
-relationships must bind to the exported revision and be non-stale; otherwise
-export fails. Generic relationships remain available through metadata JSON export.
+relationships must be valid for the exported revision: their bindings must match
+or all declared point dependencies must be unchanged; otherwise export fails. Generic relationships remain available through metadata JSON export.
 Other derived source annotations remain the caller's responsibility when editing
 geometry. If point counts change, update or remove
 the corresponding positional annotation lists. Export rejects mismatched
@@ -297,29 +295,97 @@ annotation counts, duplicate/negative collection point IDs, and auxiliary arrays
 that native formats cannot represent, avoiding silent data loss. It does not
 validate application-specific tracing semantics or update trace results.
 
-## Relationships and approvals
+## Point relationships and geometry edits
 
-New edges bind to their endpoints' current geometry revisions in normalized
-endpoint order. Objects without managed geometry have null bindings.
-`edge_geometry_state(edge_uuid)` compares the saved bindings with current
-object heads. Historical revisions remain readable and exportable.
+Each geometry endpoint declares exactly which points the relationship references.
+An anchor's `points` list contains array names and point coordinates (excluding
+the final XYZ axis). The first entry is the attachment point; additional entries
+can describe the vertices or neighbours supporting an interpolated attachment or
+direction. The producer must declare every point the relationship depends on.
 
-Publishing changed geometry with existing edges fails by default. Passing
-`force=True` explicitly allows it, bumps and journals the object and all connected
-edges, and resets their approvals in the same transaction. Existing endpoint
-bindings remain unchanged, identifying the revisions the old anchors refer to.
-This also applies when geometry is first published for an already linked object.
-Unrelated edges are unchanged, and identical-content publication with the correct
-expected revision is a complete no-op.
+| Geometry | Point reference |
+| --- | --- |
+| Fiber control point 5 | `{"array": "control_points", "index": [5]}` |
+| Fiber line point 12 | `{"array": "line_points", "index": [12]}` |
+| Patch row 20, column 145 | `{"array": "points", "index": [20, 145]}` |
+| Collection stable point ID 42 | `{"array": "point_ids", "index": [42]}` |
+| Track point 8 | `{"array": "points", "index": [8]}` |
 
-Stale edges cannot be approved. After checking or recomputing the relationship,
-call `revalidate_edge_geometry(edge_uuid)` to bind current revisions, then approve
-it. Revalidation resets approval and journals the change; it does not move
-anchors or run a detector. Updating edge metadata alone does not revalidate it.
+Use `whole_geometry: true` for an actual object-wide relationship such as patch
+overlap. It cannot be combined with point references. Geometry-backed endpoints
+must declare dependencies when a relationship is created or updated. Relationships
+between objects without managed geometry may omit them; introducing geometry then
+requires explicitly updating those relationships or removing them.
 
-The database uses WAL with FULL synchronous writes. Geometry publication and
-edge revalidation use savepoints: a caught failure cannot leave partial geometry,
-approval, or journal changes when the enclosing transaction commits other work.
+`affected_geometry_edges(object_uuid, geometry)` previews the relationships whose
+dependencies change. `put_geometry` checks them again inside the write transaction.
+For every affected relationship, the caller must supply exactly one decision:
+
+- **retain**: keep the same relationship, point references, and annotations.
+- **update**: supply both complete replacement anchors in the stored edge's a/b order.
+- **remove**: delete the relationship.
+
+No decision is selected automatically. Missing, duplicate, unrelated, invalid, or
+outdated decisions reject the edit. A deleted point cannot be retained. A topology
+change requires decisions for positional references; stable collection IDs survive
+reordering and must never be reassigned to different points. Geometry attributes
+such as patch scale also participate in dependency checks.
+
+For example, create a fiber-to-patch attachment:
+
+```python
+edge_id = db.add_edge({
+    "kind": "contact", "a": fiber_id, "b": patch_id,
+    "a_anchor": {"points": [{"array": "control_points", "index": [5]}]},
+    "b_anchor": {"points": [{"array": "points", "index": [20, 145]}]},
+})
+```
+
+When changing fiber point 5, the caller can explicitly retain that attachment:
+
+```python
+edge = db.edge(edge_id)
+a = db.current_geometry(edge["a"])
+b = db.current_geometry(edge["b"])
+decision = {
+    "edge_uuid": edge_id,
+    "expected_generation": edge["generation"],
+    "a_revision": a["uuid"] if a else None,
+    "b_revision": b["uuid"] if b else None,
+    "action": "retain",
+}
+new_revision = db.put_geometry(
+    fiber_id, edited_geometry, expected_revision=original_revision,
+    edge_edits=[decision],
+)
+```
+
+The revisions in each decision are the endpoint heads observed **before** the edit.
+For `update`, add `a_anchor` and `b_anchor` containing the new references and any
+position/direction annotations. For `remove`, change `action` to `"remove"`.
+The complete decision list must cover the affected set returned by the preview;
+the example has one affected edge. C++ uses `GeometryEdgeEdit` and
+`affectedGeometryEdges` with the same transaction handle.
+
+Point references are authoritative for attachment identity. XYZ and direction
+annotations are caller-owned observations; retain does not recompute them. Use
+update to replace them when needed. Native fiber exports resolve point positions
+from the referenced geometry rather than treating an annotation as current geometry.
+
+Changes to unrelated points leave edge records, approvals, journals, and bindings
+untouched. A binding to an older revision remains valid if all declared point
+dependencies are unchanged. `edge_geometry_state` checks these dependencies.
+Retain/update publishes anchors and bindings together, resets approval to pending,
+and records one `geometry_repaired` journal entry. Geometry, decisions, approvals,
+and journals share a savepoint: a caught failure cannot leave partial changes when
+the caller commits other work. The database uses WAL with FULL synchronous writes.
+
+For a standalone relationship correction, `repair_edge_geometry(repair)` accepts
+`edge_uuid`, `expected_generation`, `a_revision`, `b_revision`, `a_anchor`, and
+`b_anchor`. It checks the exact current endpoint revisions and edge generation,
+publishes atomically, and never selects replacement points. Identical anchors and
+bindings are a no-op after validating those expectations. C++ uses
+`repairEdgeGeometry(WriteTxn&, EdgeGeometryRepair)`.
 
 ## Retention, sources, and backup
 
@@ -394,11 +460,12 @@ resolution. Object/edge UUID collisions, dangling endpoints and duplicate track
 or edge identities also block publication. Duplicate edges with distinct UUIDs
 can be resolved by choosing one duplicate's absent side.
 
-A geometry head change that affects existing edges requires `force=True` on
-synchronization too. Force does not resolve competing edits; explicit record
-choices are still required. Changed geometry invalidates edge approval, and old
-bindings remain stale until revalidation. Retained geometry cannot be deleted by
-merge. All retained geometry histories from both replicas are copied, including
+Synchronization also requires valid relationship decisions. If merging a geometry
+change with another replica's relationship would change its referenced points
+without a matching relationship update, sync reports a conflict and makes no
+changes. Resolve the relationship explicitly before retrying. Sync preserves
+unaffected relationships and the caller's recorded retain/update/remove decisions.
+All retained geometry histories from both replicas are copied, including
 unselected branches, with original revision UUIDs, provenance and verified chunk
 hashes. Record provenance is preserved; each replica keeps its own local journal
 of applied changes rather than combining journal sequence numbers.
@@ -442,7 +509,7 @@ QT_QPA_PLATFORM=offscreen ctest --test-dir build --output-on-failure \
   -R '^(test_object_store|test_object_records|test_object_links|test_progress|graph_db_controller)$'
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_BUILD_PYTHON=build/python .venv/bin/python -m pytest \
   python/tests/test_objects.py python/tests/test_object_records.py python/tests/test_object_geometry.py python/tests/test_object_links.py \
-  python/tests/test_object_ingestion.py python/tests/test_object_sync.py -q
+  python/tests/test_object_ingestion.py python/tests/test_object_sync.py python/tests/test_object_geometry_edits.py -q
 ```
 
 `VC_BUILD_PYTHON` selects the built package before any installed editable copy

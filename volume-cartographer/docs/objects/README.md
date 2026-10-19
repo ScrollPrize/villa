@@ -48,8 +48,10 @@ with ObjectStore.create("objects.vcobj", author="reviewer") as store:
 Names, tags, typed properties and native annotations belong to object metadata.
 Edges hold relationship types, anchors, provenance, approvals, and endpoint
 geometry bindings. Source paths are ingestion hints; UUIDs identify records.
-Changing geometry with existing edges requires `force=True`, invalidates edge
-approval, and leaves old anchors stale until explicitly revalidated.
+Geometry-backed endpoints declare their exact point dependencies. Changing a
+referenced point requires an explicit retain/update/remove decision for each affected
+relationship in `put_geometry(..., edge_edits=[...])`. Unrelated point edits leave
+relationships untouched. See the [edit contract](../object_storage.md#point-relationships-and-geometry-edits).
 
 ## C++
 

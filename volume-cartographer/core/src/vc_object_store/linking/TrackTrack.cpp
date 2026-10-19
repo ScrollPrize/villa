@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <limits>
 #include <map>
 #include <set>
@@ -136,7 +137,22 @@ DetectorReport linkTracksToTracks(objects::ObjectStore& db, const TrackTrackPara
                         const auto tangent = track_crossings::track_tangent(
                             coordinates.data(), offsets.data(), track, local, params.tangentRadiusVoxels);
                         objects::Anchor result;
-                        result.index = local;
+                        result.points.push_back({"points", {local}});
+                        // The tangent's stopping points and every point examined
+                        // on the way to them are dependencies of this anchor.
+                        auto withinRadius = [&](int64_t candidate) {
+                            double squared = 0;
+                            for (int axis = 0; axis < 3; ++axis) {
+                                const double delta = double(coordinates[3*candidate+axis]) - coordinates[3*point+axis];
+                                squared += delta * delta;
+                            }
+                            return std::sqrt(squared) < params.tangentRadiusVoxels;
+                        };
+                        auto left = point, right = point;
+                        while (left > offsets[track] && withinRadius(left)) --left;
+                        while (right + 1 < offsets[track+1] && withinRadius(right)) ++right;
+                        for (auto support = left; support <= right; ++support)
+                            if (support != point) result.points.push_back({"points", {support - offsets[track]}});
                         result.position = {double(coordinates[3*point+2]), double(coordinates[3*point+1]),
                                            double(coordinates[3*point])};
                         result.direction = {tangent.x, tangent.y, tangent.z};

@@ -5,17 +5,20 @@ namespace vc::objects { namespace {
 nlohmann::json anchorToJson(const Anchor& a)
 {
     nlohmann::json j = nlohmann::json::object();
-    if (a.index) j["index"] = *a.index;
     if (a.position) j["position"] = {(*a.position)[0], (*a.position)[1], (*a.position)[2]};
     if (a.direction) j["direction"] = {(*a.direction)[0], (*a.direction)[1], (*a.direction)[2]};
+    j.update(dependenciesToJson(a));
     return j;
 }
 
 Anchor anchorFromJson(const nlohmann::json& j)
 {
     Anchor a;
-    if (!j.is_object()) return a;
-    if (j.contains("index") && j.at("index").is_number_integer()) a.index = j.at("index").get<int64_t>();
+    if (!j.is_object()) throw std::invalid_argument("anchor must be a JSON object");
+    for (const auto& [key, value] : j.items())
+        if (key != "points" && key != "whole_geometry" && key != "position" && key != "direction")
+            throw std::invalid_argument("unknown anchor field: " + key);
+    dependenciesFromJson(a, j);
     for (const char* key : {"position", "direction"}) {
         if (j.contains(key) && j.at(key).is_array() && j.at(key).size() == 3) {
             std::array<double, 3> v{};
@@ -153,7 +156,7 @@ ObjectRecord objectFromJson(const nlohmann::json& j)
 nlohmann::json edgeToJson(EdgeRecord e)
 {
     // Stable across databases whose internal endpoint IDs differ.
-    if (e.bUuid < e.aUuid || (e.aUuid == e.bUuid && e.bAnchor.index < e.aAnchor.index)) {
+    if (e.bUuid < e.aUuid || (e.aUuid == e.bUuid && dependenciesToJson(e.bAnchor).dump() < dependenciesToJson(e.aAnchor).dump())) {
         std::swap(e.aUuid, e.bUuid);
         std::swap(e.aAnchor, e.bAnchor);
     }

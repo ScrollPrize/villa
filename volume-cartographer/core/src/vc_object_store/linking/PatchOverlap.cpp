@@ -761,6 +761,8 @@ DetectorReport linkPatchOverlaps(objects::ObjectStore& db,
             candidate.aUuid = seed.uuid;
             candidate.bUuid = target.uuid;
             candidate.kind = params.edgeKind;
+            candidate.aAnchor.wholeGeometry = true;
+            candidate.bAnchor.wholeGeometry = true;
             candidate.score = agreementRatio;
             nlohmann::json fitMeta{{"correspondences", correspondences.size()},
                                    {"inliers", fit.inliers},

@@ -1,5 +1,6 @@
 #include "geometry/SourceMetadata.hpp"
 #include "geometry/GeometrySnapshot.hpp"
+#include "geometry/Dependencies.hpp"
 
 namespace vc::objects::detail {
 using Json = nlohmann::json;
@@ -18,8 +19,21 @@ Json nativeMetadata(ObjectStore& db, const Txn& txn, const ObjectRecord& object,
     auto requireCurrentBinding = [&](const EdgeRecord& edge) {
         const auto state = db.edgeGeometryState(txn, edge.uuid);
         const auto binding = edge.aUuid == object.uuid ? state.aRevision : state.bRevision;
-        if (state.stale || binding != revision.uuid)
-            throw std::runtime_error("cannot export topology against a different or stale geometry revision; revalidate first");
+        const auto& anchor = edge.aUuid == object.uuid ? edge.aAnchor : edge.bAnchor;
+        if (state.stale || detail::endpointChanged(db, txn, anchor, binding, revision.uuid))
+            throw std::runtime_error("cannot export topology against a different or stale geometry revision; update the relationship first");
+    };
+    auto pointIdentity = [](const Anchor& anchor, const std::string& array) {
+        if (anchor.points.empty() || anchor.points.front().array != array || anchor.points.front().index.size() != 1)
+            throw std::runtime_error("native relationship requires an explicit " + array + " point reference");
+        return anchor.points.front().index.front();
+    };
+    auto controlPosition = [&](const Anchor& anchor, const GeometryRevision& geometry) {
+        const auto bytes = pointValue(dependencyGeometry(db, txn, geometry), anchor.points.front());
+        if (!bytes) throw std::runtime_error("native relationship control point is missing");
+        GeometrySnapshot snapshot; snapshot.arrays["point"] = *bytes;
+        const auto values = snapshot.values<double>("point");
+        return std::array<double, 3>{values[0], values[1], values[2]};
     };
     if (object.kind == "fiber") {
         result["version"] = object.formatVersion > 0 ? object.formatVersion : result.value("version", int64_t(1));
@@ -38,13 +52,15 @@ Json nativeMetadata(ObjectStore& db, const Txn& txn, const ObjectRecord& object,
             const auto& a = forward ? edge.aAnchor : edge.bAnchor;
             const auto& b = forward ? edge.bAnchor : edge.aAnchor;
             const auto target = db.objectByUuid(txn, forward ? edge.bUuid : edge.aUuid);
-            if (!a.index || !b.index) throw std::runtime_error("native fiber branch needs control point indices");
-            Json branch{{"control_point_index", *a.index}, {"branch_control_point_index", *b.index},
+            const auto aIndex = pointIdentity(a, "control_points"), bIndex = pointIdentity(b, "control_points");
+            const auto targetRevision = db.currentGeometry(txn, target->uuid);
+            if (!targetRevision) throw std::runtime_error("native fiber branch target has no geometry");
+            Json branch{{"control_point_index", aIndex}, {"branch_control_point_index", bIndex},
                 {"target_uuid", target->uuid}, {"branch_file", std::filesystem::path(target->storageRef).filename().string()},
                 {"pending", edge.approvalState != "approved"}};
             if (branch["branch_file"] == "") branch["branch_file"] = target->name + ".json";
-            if (a.position) branch["control_point_position"] = *a.position;
-            if (b.position) branch["branch_control_point_position"] = *b.position;
+            branch["control_point_position"] = controlPosition(a, revision);
+            branch["branch_control_point_position"] = controlPosition(b, *targetRevision);
             if (a.direction) branch["control_point_direction"] = *a.direction;
             if (b.direction) branch["branch_control_point_direction"] = *b.direction;
             result[Json::parse(edge.meta).value("adjacent", false) ? "adjacent_branches" : "branches"].push_back(std::move(branch));
@@ -64,10 +80,10 @@ Json nativeMetadata(ObjectStore& db, const Txn& txn, const ObjectRecord& object,
             if (edge.kind == "point_link") {
                 auto link = [&](const std::string& owner, const Anchor& a, const Anchor& b) {
                     if (owner != object.uuid) return;
-                    if (!a.index || !b.index) throw std::runtime_error("point link needs point ID anchors");
-                    const auto found = std::find(ids.begin(), ids.end(), *a.index);
+                    const auto aId = pointIdentity(a, "point_ids"), bId = pointIdentity(b, "point_ids");
+                    const auto found = std::find(ids.begin(), ids.end(), aId);
                     if (found == ids.end()) throw std::runtime_error("point link ID missing from exported geometry");
-                    extras[found - ids.begin()]["links"].push_back(*b.index);
+                    extras[found - ids.begin()]["links"].push_back(bId);
                 };
                 link(edge.aUuid, edge.aAnchor, edge.bAnchor); link(edge.bUuid, edge.bAnchor, edge.aAnchor);
             } else {

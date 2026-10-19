@@ -253,7 +253,7 @@ TEST_CASE("pending detector links refresh anchors and evidence while retaining i
     auto db = makeDb(tmp.dir);
     const auto a = addObject(db, "fiber"), b = addObject(db, "patch");
     auto c = cand(a, b);
-    c.aAnchor.index = 4; c.aAnchor.position = {1, 2, 3}; c.score = 0.5;
+    c.aAnchor.points = {{"control_points", {4}}}; c.aAnchor.position = {1, 2, 3}; c.score = 0.5;
     c.meta = R"({"distance":5})";
     REQUIRE(commitCandidates(db, "detector", 1, {c}).edgesCreated == 1);
     std::string id;
@@ -387,7 +387,7 @@ TEST_CASE("discovery refuses to publish links if stored inputs change during com
         if (progress.stage == "checking patch pairs" && !edited) {
             edited = true;
             auto txn = db.write();
-            db.putGeometry(txn, b, storedPlane(1000, 100), db.currentGeometry(txn, b)->uuid, true);
+            db.putGeometry(txn, b, storedPlane(1000, 100), db.currentGeometry(txn, b)->uuid);
             txn.commit();
         }
     };

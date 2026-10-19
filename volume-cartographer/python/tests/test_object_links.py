@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from vc.objects import ObjectStore
+from object_helpers import edge_choice
 
 
 @pytest.fixture
@@ -43,9 +44,9 @@ def test_patch_discovery_uses_current_revisions_and_preserves_review(db):
     assert db.link_patch_overlaps()["edges_skipped_existing"] == 1
     # A new revision with identical coordinates still needs revalidation.
     gb["attributes"]["edit"] = True
-    db.put_geometry(b, gb, expected_revision=db.current_geometry(b)["uuid"], force=True)
-    assert db.edge_geometry_state(edge)["stale"]
-    assert db.link_patch_overlaps()["edges_updated"] == 1
+    db.put_geometry(b, gb, expected_revision=db.current_geometry(b)["uuid"], edge_edits=[edge_choice(db, e["uuid"], "retain") for e in db.affected_geometry_edges(b, gb)])
+    assert not db.edge_geometry_state(edge)["stale"]
+    assert db.link_patch_overlaps()["edges_skipped_existing"] == 1
     assert db.edges_of(a)[0]["uuid"] == edge
     assert not db.edge_geometry_state(edge)["stale"]
     db.set_approval(edge, "approved")
@@ -86,8 +87,8 @@ def test_stored_track_crossings_selection_and_atomic_failure(db):
     assert edge["b_anchor"]["position"] == (15, 15, 20)
     assert db.link_tracks_to_tracks(track_uuids=[a.upper(), a])["stale_removed"] == 0
     gb["arrays"] = [array("points", [[50, y, 20] for y in range(31)], "<i4")]
-    db.put_geometry(b, gb, expected_revision=db.current_geometry(b)["uuid"], force=True)
-    assert db.link_tracks_to_tracks(track_uuids=[a, b])["stale_removed"] == 1
+    db.put_geometry(b, gb, expected_revision=db.current_geometry(b)["uuid"], edge_edits=[edge_choice(db, e["uuid"], "remove") for e in db.affected_geometry_edges(b, gb)])
+    assert db.link_tracks_to_tracks(track_uuids=[a, b])["stale_removed"] == 0
     bad = db.upsert_object({"kind": "track", "track": {"dataset_ref": "missing", "external_key": "0"}})
     before = db.journal_since()
     report = db.link_tracks_to_tracks()
@@ -107,7 +108,7 @@ def test_stored_collection_ids_winding_scaling_and_rerun(db):
     edges = db.edges_of(collection)
     for edge in edges:
         anchor = edge["a_anchor"] if edge["a"] == collection else edge["b_anchor"]
-        assert anchor["index"] in [7, 90]
+        assert anchor["points"][0]["index"][0] in [7, 90]
         assert anchor["position"][2] == 40
         evidence = edge["meta"]["point_collection_patch"]
         assert evidence["winding_is_absolute"]
@@ -115,8 +116,8 @@ def test_stored_collection_ids_winding_scaling_and_rerun(db):
     assert db.link_point_collections_to_patches(point_scale=0.5)["edges_updated"] == 2
     assert db.link_point_collections_to_patches(point_scale=0.5)["edges_skipped_existing"] == 2
     geometry["arrays"][0] = array("points", [[1000, 1000, 40], [2000, 2000, 40]], "<f8")
-    db.put_geometry(collection, geometry, expected_revision=db.current_geometry(collection)["uuid"], force=True)
-    assert db.link_point_collections_to_patches(collection_uuids=[collection], patch_uuids=[patch], point_scale=0.5)["stale_removed"] == 2
+    db.put_geometry(collection, geometry, expected_revision=db.current_geometry(collection)["uuid"], edge_edits=[edge_choice(db, e["uuid"], "remove") for e in db.affected_geometry_edges(collection, geometry)])
+    assert db.link_point_collections_to_patches(collection_uuids=[collection], patch_uuids=[patch], point_scale=0.5)["stale_removed"] == 0
 
 
 

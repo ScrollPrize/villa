@@ -212,9 +212,16 @@ DetectorReport linkPointCollectionsToPatches(objects::ObjectStore& db,
             LinkCandidate candidate;
             candidate.kind = params.edgeKind;
             candidate.aUuid = collection.object.uuid; candidate.bUuid = patch.object.uuid;
-            candidate.aAnchor.index = point.id;
+            candidate.aAnchor.points.push_back({"point_ids", {point.id}});
             candidate.aAnchor.position = point.source;
             candidate.bAnchor.position = projection(patch, row, col, params.patchScale);
+            const auto& grid = *patch.surface->rawPointsPtr();
+            const int r = std::clamp(int(std::floor(row)), 0, grid.rows - 2);
+            const int c = std::clamp(int(std::floor(col)), 0, grid.cols - 2);
+            const double dr = std::clamp(row - r, 0.0, 1.0), dc = std::clamp(col - c, 0.0, 1.0);
+            candidate.bAnchor.points = dr + dc <= 1
+                ? std::vector<objects::PointReference>{{"points", {r, c}}, {"points", {r, c+1}}, {"points", {r+1, c}}}
+                : std::vector<objects::PointReference>{{"points", {r+1, c+1}}, {"points", {r, c+1}}, {"points", {r+1, c}}};
             candidate.meta = Json{{"anchor_index_space", "point_id"},
                 {"point_collection_patch", {{"ij", {row, col}}, {"distance", hit.distance},
                     {"winding_annotation", point.winding}, {"winding_is_absolute", absolute},

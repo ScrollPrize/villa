@@ -4,26 +4,50 @@ namespace vc::objects { namespace {
 const char* kEdgeCols =
     "id,uuid,a_id,b_id,kind,generation,created_by,created_at,created_host,changed_by,changed_at,changed_host,"
     "approval_state,approved_by,approved_at,approved_host,approved_generation,"
-    "a_anchor_index,a_anchor_x,a_anchor_y,a_anchor_z,a_dir_x,a_dir_y,a_dir_z,"
-    "b_anchor_index,b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta";
+    "a_anchor_x,a_anchor_y,a_anchor_z,a_dir_x,a_dir_y,a_dir_z,"
+    "b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta,a_dependencies,b_dependencies";
+
+nlohmann::json dependenciesToJson(const Anchor& anchor)
+{
+    nlohmann::json value = nlohmann::json::object();
+    if (anchor.wholeGeometry) value["whole_geometry"] = true;
+    if (!anchor.points.empty()) {
+        value["points"] = nlohmann::json::array();
+        for (const auto& point : anchor.points) {
+            if (point.array.empty() || point.index.empty() ||
+                std::any_of(point.index.begin(), point.index.end(), [](auto i) { return i < 0; }))
+                throw std::invalid_argument("invalid anchor point reference");
+            value["points"].push_back({{"array", point.array}, {"index", point.index}});
+        }
+    }
+    if (anchor.wholeGeometry && !anchor.points.empty())
+        throw std::invalid_argument("anchor cannot have both whole_geometry and point dependencies");
+    return value;
+}
+
+void dependenciesFromJson(Anchor& anchor, const nlohmann::json& value)
+{
+    anchor.wholeGeometry = value.value("whole_geometry", false);
+    for (const auto& point : value.value("points", nlohmann::json::array()))
+        anchor.points.push_back({point.at("array").get<std::string>(), point.at("index").get<std::vector<int64_t>>()});
+    (void)dependenciesToJson(anchor);
+}
 
 Anchor readAnchor(const Statement& s, int firstCol)
 {
     Anchor a;
-    if (!s.isNull(firstCol)) a.index = s.i64(firstCol);
-    if (!s.isNull(firstCol + 1)) a.position = std::array<double, 3>{s.f64(firstCol + 1), s.f64(firstCol + 2), s.f64(firstCol + 3)};
-    if (!s.isNull(firstCol + 4)) a.direction = std::array<double, 3>{s.f64(firstCol + 4), s.f64(firstCol + 5), s.f64(firstCol + 6)};
+    if (!s.isNull(firstCol)) a.position = std::array<double, 3>{s.f64(firstCol), s.f64(firstCol + 1), s.f64(firstCol + 2)};
+    if (!s.isNull(firstCol + 3)) a.direction = std::array<double, 3>{s.f64(firstCol + 3), s.f64(firstCol + 4), s.f64(firstCol + 5)};
     return a;
 }
 
 void bindAnchor(Statement& s, int firstIdx, const Anchor& a)
 {
-    if (a.index) s.bind(firstIdx, *a.index); else s.bindNull(firstIdx);
     for (int i = 0; i < 3; ++i) {
-        if (a.position) s.bind(firstIdx + 1 + i, (*a.position)[size_t(i)]); else s.bindNull(firstIdx + 1 + i);
+        if (a.position) s.bind(firstIdx + i, (*a.position)[size_t(i)]); else s.bindNull(firstIdx + i);
     }
     for (int i = 0; i < 3; ++i) {
-        if (a.direction) s.bind(firstIdx + 4 + i, (*a.direction)[size_t(i)]); else s.bindNull(firstIdx + 4 + i);
+        if (a.direction) s.bind(firstIdx + 3 + i, (*a.direction)[size_t(i)]); else s.bindNull(firstIdx + 3 + i);
     }
 }
 
@@ -43,8 +67,10 @@ EdgeRecord readEdgeRow(sqlite3* db, const Statement& s)
     const int64_t bId = s.i64(3);
     readCommon(rec, s, 1, 4, 5);
     rec.aAnchor = readAnchor(s, 17);
-    rec.bAnchor = readAnchor(s, 24);
-    rec.meta = s.text(31);
+    rec.bAnchor = readAnchor(s, 23);
+    rec.meta = s.text(29);
+    dependenciesFromJson(rec.aAnchor, nlohmann::json::parse(s.text(30)));
+    dependenciesFromJson(rec.bAnchor, nlohmann::json::parse(s.text(31)));
     rec.aUuid = uuidTextByObjectId(db, aId);
     rec.bUuid = uuidTextByObjectId(db, bId);
     Statement tags(db, "SELECT tag FROM edge_tags WHERE edge_id=? ORDER BY tag");
@@ -71,9 +97,9 @@ std::string addEdgeImpl(sqlite3* db, const std::string& author, const std::strin
     auto bId = objectIdByUuid(db, bUuid);
     if (!aId) throw std::runtime_error("object store: edge endpoint not found: " + rec.aUuid);
     if (!bId) throw std::runtime_error("object store: edge endpoint not found: " + rec.bUuid);
-    if (*aId == *bId && (!rec.aAnchor.index || !rec.bAnchor.index || rec.aAnchor.index == rec.bAnchor.index))
-        throw std::runtime_error("object store: self-edges require two distinct anchor indices");
-    if (*aId > *bId || (*aId == *bId && rec.bAnchor.index < rec.aAnchor.index)) {
+    if (*aId == *bId && (rec.aAnchor.points.empty() || rec.bAnchor.points.empty() || rec.aAnchor.points.front() == rec.bAnchor.points.front()))
+        throw std::runtime_error("object store: self-edges require two distinct point references");
+    if (*aId > *bId || (*aId == *bId && dependenciesToJson(rec.bAnchor).dump() < dependenciesToJson(rec.aAnchor).dump())) {
         std::swap(aId, bId);
         std::swap(rec.aUuid, rec.bUuid);
         std::swap(rec.aAnchor, rec.bAnchor);
@@ -81,8 +107,8 @@ std::string addEdgeImpl(sqlite3* db, const std::string& author, const std::strin
     const std::string now = nowIsoUtc();
     Statement s(db, "INSERT INTO edges(uuid,a_id,b_id,kind,generation,created_by,created_at,created_host,changed_by,changed_at,"
                     "changed_host,approval_state,approved_by,approved_at,approved_host,approved_generation,"
-                    "a_anchor_index,a_anchor_x,a_anchor_y,a_anchor_z,a_dir_x,a_dir_y,a_dir_z,"
-                    "b_anchor_index,b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta) "
+                    "a_anchor_x,a_anchor_y,a_anchor_z,a_dir_x,a_dir_y,a_dir_z,"
+                    "b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta,a_dependencies,b_dependencies) "
                     "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
     s.bindBlob(1, parseUuid(rec.uuid));
     s.bind(2, *aId); s.bind(3, *bId); s.bind(4, rec.kind); s.bind(5, int64_t(1));
@@ -95,8 +121,10 @@ std::string addEdgeImpl(sqlite3* db, const std::string& author, const std::strin
     if (preserveRecord && rec.approvedHost) s.bind(15, *rec.approvedHost); else s.bindNull(15);
     if (preserveRecord && rec.approvedGeneration) s.bind(16, *rec.approvedGeneration); else s.bindNull(16);
     bindAnchor(s, 17, rec.aAnchor);
-    bindAnchor(s, 24, rec.bAnchor);
-    s.bind(31, rec.meta);
+    bindAnchor(s, 23, rec.bAnchor);
+    s.bind(29, rec.meta);
+    s.bind(30, dependenciesToJson(rec.aAnchor).dump());
+    s.bind(31, dependenciesToJson(rec.bAnchor).dump());
     s.stepDone();
     const int64_t id = sqlite3_last_insert_rowid(db);
     Statement binding(db, "INSERT INTO edge_geometry_bindings(edge_id,a_revision,b_revision) VALUES(?,"

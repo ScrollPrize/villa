@@ -9,7 +9,7 @@ try {
     std::optional<std::filesystem::path> root;
     std::vector<std::string> uuids;
     std::vector<std::pair<std::string, std::filesystem::path>> sources;
-    bool registered = false, showProgress = true, force = false;
+    bool registered = false, showProgress = true;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         auto next = [&]() -> std::string {
@@ -19,7 +19,6 @@ try {
         if (arg == "--db") path = next();
         else if (arg == "--author") author = next();
         else if (arg == "--dataset-root") root = next();
-        else if (arg == "--force") force = true;
         else if (arg == "--registered") registered = true;
         else if (arg == "--uuid") { uuids.push_back(next()); registered = true; }
         else if (arg == "--patch") sources.emplace_back("patch", next());
@@ -36,11 +35,10 @@ try {
                 "  --fiber PATH              ingest a fiber JSON or directory of connected fibers\n"
                 "  --point-collections FILE  ingest/register every collection in a JSON\n"
                 "  --tracks PATH             ingest/register packed tracks (or DBM with packed mirror)\n"
-                "  --force                   permit geometry changes affecting edges; invalidate their approvals\n"
                 "  --no-progress             suppress progress display\n"
                 "Fiber/collection sources and registered batches commit atomically; tracks commit individually. Failures are reported and exit status is nonzero.\n"
                 "Source flags are repeatable. Existing identities, tags and metadata are retained;\n"
-                "new geometry revisions reset object and connected-edge approvals atomically.\n";
+                "geometry changes affecting relationships require explicit edit decisions through the object API.\n";
             return 0;
         } else throw std::runtime_error("unknown argument: " + arg);
     }
@@ -56,12 +54,12 @@ try {
     };
     for (const auto& [kind, source] : sources) {
         vc::util::TerminalProgress progress("Ingest " + kind, showProgress);
-        const auto report = vc::objects::ingestGeometrySource(db, kind, source, progress.callback(), force);
+        const auto report = vc::objects::ingestGeometrySource(db, kind, source, progress.callback());
         progress.finish(); print(report);
     }
     if (registered) {
         vc::util::TerminalProgress progress("Ingest registered geometry", showProgress);
-        const auto report = vc::objects::ingestRegisteredGeometry(db, root, uuids, progress.callback(), force);
+        const auto report = vc::objects::ingestRegisteredGeometry(db, root, uuids, progress.callback());
         progress.finish(); print(report);
     }
     db.checkpoint();

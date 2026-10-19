@@ -5,6 +5,7 @@ import uuid
 
 import pytest
 from vc.objects import ObjectStore
+from object_helpers import edge_choice
 from test_objects import db, db_path, _geometry
 
 
@@ -28,8 +29,8 @@ def test_fiber_directory_topology_metadata_and_export(db, tmp_path):
     edge = db.edges_of(a)[0]
     assert edge["kind"] == "fiber_branch" and edge["approval_state"] == "pending"
     anchors = {edge["a"]: edge["a_anchor"], edge["b"]: edge["b_anchor"]}
-    assert anchors[a]["index"] == 1 and anchors[a]["position"] == (4, 5, 6)
-    assert anchors[b]["index"] == 0
+    assert anchors[a]["points"][0]["index"] == [1] and anchors[a]["position"] == (4, 5, 6)
+    assert anchors[b]["points"][0]["index"] == [0]
     assert not db.current_geometry(a)["attributes"]
     assert "branches" not in db.object(a)["meta"]["source"]
     assert db.select_objects(tag="seed")
@@ -78,7 +79,7 @@ def test_point_links_self_edges_winding_and_native_export(db, tmp_path):
     edges = db.edges_of(a)
     assert sum(e["kind"] == "point_link" for e in edges) == 2
     same = next(e for e in edges if e["a"] == e["b"])
-    assert same["a_anchor"]["index"] == 1 and same["b_anchor"]["index"] == 2
+    assert same["a_anchor"]["points"][0]["index"] == [1] and same["b_anchor"]["points"][0]["index"] == [2]
     assert not db.current_geometry(a)["attributes"]
     meta = db.object(a)["meta"]["source"]
     assert "links" not in meta["point_attributes"][0] and "windings_linked" not in meta
@@ -102,7 +103,7 @@ def test_selection_and_projected_metadata_export(db):
     revision = db.put_geometry(a, _geometry())
     b = db.upsert_object({"kind": "note", "tags": ["chosen"], "name": "b"})
     c = db.upsert_object({"kind": "note", "name": "c"})
-    ab = db.add_edge({"kind": "connection", "a": a, "b": b})
+    ab = db.add_edge({"kind": "connection", "a": a, "b": b, "a_anchor": {"whole_geometry": True}, "b_anchor": {"whole_geometry": True}})
     db.add_edge({"kind": "other", "a": b, "b": c})
     selection = dict(connected_to=a, edge_kinds=["connection"], tag="chosen")
     records = db.select_objects(**selection)
@@ -122,11 +123,36 @@ def test_selection_and_projected_metadata_export(db):
 
 
 
-def test_metadata_export_reports_unbound_stale_edges(db):
+def test_metadata_export_reports_explicitly_retained_edges(db):
     a = db.upsert_object({"kind": "fiber"})
     b = db.upsert_object({"kind": "note"})
-    edge = db.add_edge({"kind": "connected", "a": a, "b": b})
-    db.put_geometry(a, _geometry(), force=True)
+    edge = db.add_edge({"kind": "connected", "a": a, "b": b, "a_anchor": {"whole_geometry": True}, "b_anchor": {"whole_geometry": True}})
+    revision = db.put_geometry(a, _geometry(), edge_edits=[edge_choice(db, edge, "retain")])
     exported = json.loads(db.export_json())
     assert exported["edges"][0]["uuid"] == edge
-    assert exported["edges"][0]["geometry_bindings"] == {"a": None, "b": None, "stale": True}
+    assert exported["edges"][0]["geometry_bindings"] == {"a": revision if exported["edges"][0]["a"] == a else None,
+                                                              "b": revision if exported["edges"][0]["b"] == a else None, "stale": False}
+
+
+def test_retained_fiber_relationship_exports_current_referenced_positions(db, tmp_path):
+    import struct
+    a, b = str(uuid.uuid4()), str(uuid.uuid4())
+    source = tmp_path / "fibers"; source.mkdir()
+    (source / "a.json").write_text(json.dumps(fiber(a, [{
+        "control_point_index": 1, "branch_control_point_index": 0, "branch_file": "b.json"}])))
+    (source / "b.json").write_text(json.dumps(fiber(b)))
+    assert not db.ingest_geometry_source("fiber", source)["problems"]
+    edge = db.edges_of(a)[0]["uuid"]
+    revision = db.current_geometry(a)
+    geometry = {"kind": "fiber", "arrays": []}
+    for descriptor in revision["arrays"]:
+        data = db.read_geometry_array(revision["uuid"], descriptor["name"])
+        if descriptor["name"] == "control_points":
+            data = struct.pack("<6d", 1, 2, 3, 40, 50, 60)
+        geometry["arrays"].append({**descriptor, "data": data})
+    db.put_geometry(a, geometry, expected_revision=revision["uuid"], edge_edits=[edge_choice(db, edge, "retain")])
+    db.export_geometry(a, tmp_path / "export.json")
+    exported = json.loads((tmp_path / "export.json").read_text())
+    assert exported["branches"][0]["control_point_index"] == 1
+    assert exported["branches"][0]["control_point_position"] == [40, 50, 60]
+    assert exported["branches"][0]["branch_control_point_position"] == [1, 2, 3]

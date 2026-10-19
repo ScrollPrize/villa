@@ -857,13 +857,14 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, StoredGeometry& inpu
                 c.aUuid = fiber.uuid;
                 c.bUuid = patch.uuid;
                 c.kind = params.edgeKind;
-                c.aAnchor.index = int64_t(median);
+                c.aAnchor.points.push_back({tracks ? "points" : "line_points", {int64_t(median)}});
                 c.aAnchor.position = std::array<double, 3>{contact[0] / sourceScale,
                     contact[1] / sourceScale, contact[2] / sourceScale};
                 SurfacePatchIndex::PointQuery q;
                 q.worldPoint = cv::Vec3f(contact);
                 q.tolerance = float(params.proximity);
                 const auto hit = patch.surface->index.locate(q);
+                if (!hit) continue;
                 nlohmann::json evidence{{"contacts", p.contacts.size()}, {"contact_length", p.contact},
                     {"anchor", p.anchor}, {"round", p.round}, {"strip_same", p.stripSame},
                     {"strip_adjacent", p.stripAdjacent}, {"linked_same", p.linkedSame},
@@ -871,6 +872,11 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, StoredGeometry& inpu
                 if (hit) {
                     const auto grid = patch.surface->quad->ptrToGrid(hit->ptr);
                     evidence["patch_grid"] = {grid[0], grid[1]};
+                    const auto* points = patch.surface->quad->rawPointsPtr();
+                    const int row = std::clamp(int(std::floor(grid[1])), 0, points->rows - 2);
+                    const int col = std::clamp(int(std::floor(grid[0])), 0, points->cols - 2);
+                    c.bAnchor.points = {{"points", {row, col}}, {"points", {row, col+1}},
+                                        {"points", {row+1, col}}, {"points", {row+1, col+1}}};
                 }
                 c.score = p.anchor ? p.stripSame : p.linkedSame;
                 auto metadata = nlohmann::json{{tracks ? "track_patch" : "fiber_patch", evidence}, {"settings", settings},

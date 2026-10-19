@@ -64,19 +64,18 @@ const char* kEdgeSchema = R"SQL(CREATE TABLE edges(
   changed_by TEXT NOT NULL, changed_at TEXT NOT NULL, changed_host TEXT NOT NULL,
   approval_state TEXT NOT NULL DEFAULT 'pending' CHECK(approval_state IN ('pending','approved','rejected')),
   approved_by TEXT, approved_at TEXT, approved_host TEXT, approved_generation INTEGER,
-  a_anchor_index INTEGER, a_anchor_x REAL, a_anchor_y REAL, a_anchor_z REAL,
+  a_anchor_x REAL, a_anchor_y REAL, a_anchor_z REAL,
   a_dir_x REAL, a_dir_y REAL, a_dir_z REAL,
-  b_anchor_index INTEGER, b_anchor_x REAL, b_anchor_y REAL, b_anchor_z REAL,
+  b_anchor_x REAL, b_anchor_y REAL, b_anchor_z REAL,
   b_dir_x REAL, b_dir_y REAL, b_dir_z REAL,
   meta TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(meta) AND json_type(meta)='object'),
-  CHECK(a_id < b_id OR (a_id = b_id AND a_anchor_index IS NOT NULL AND b_anchor_index IS NOT NULL AND a_anchor_index < b_anchor_index))
+  a_dependencies TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(a_dependencies)),
+  b_dependencies TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(b_dependencies)),
+  CHECK(a_id < b_id OR (a_id = b_id AND COALESCE(json_array_length(a_dependencies,'$.points'),0)>0 AND COALESCE(json_array_length(b_dependencies,'$.points'),0)>0 AND a_dependencies < b_dependencies))
 );
 CREATE INDEX edges_a ON edges(a_id, kind);
 CREATE INDEX edges_b ON edges(b_id, kind);
-CREATE UNIQUE INDEX edges_unique_unanchored ON edges(kind, a_id, b_id)
-  WHERE a_anchor_index IS NULL AND b_anchor_index IS NULL;
-CREATE UNIQUE INDEX edges_unique_anchored ON edges(kind, a_id, a_anchor_index, b_id, b_anchor_index)
-  WHERE a_anchor_index IS NOT NULL AND b_anchor_index IS NOT NULL;
+CREATE UNIQUE INDEX edges_unique ON edges(kind, a_id, b_id, a_dependencies, b_dependencies);
 CREATE TABLE edge_tags(
   edge_id INTEGER NOT NULL REFERENCES edges(id) ON DELETE CASCADE,
   tag TEXT NOT NULL, PRIMARY KEY(edge_id, tag)

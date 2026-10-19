@@ -304,9 +304,9 @@ TEST_CASE("edges: canonicalisation, anchors, uniqueness")
 
     // Anchors swap along with endpoints under canonicalisation.
     EdgeRecord anchored = makeEdge(c, a, "fiber_branch");
-    anchored.aAnchor.index = 5;
+    anchored.aAnchor.points = {{"control_points", {5}}};
     anchored.aAnchor.position = std::array<double, 3>{1, 2, 3};
-    anchored.bAnchor.index = 2;
+    anchored.bAnchor.points = {{"control_points", {2}}};
     const std::string eA = addEdge(db, anchored);
     {
         auto r = db.read();
@@ -314,7 +314,7 @@ TEST_CASE("edges: canonicalisation, anchors, uniqueness")
         REQUIRE(stored.has_value());
         const bool cIsA = stored->aUuid == c;
         const Anchor& cAnchor = cIsA ? stored->aAnchor : stored->bAnchor;
-        CHECK(cAnchor.index == 5);
+        CHECK(cAnchor.points.at(0).index == std::vector<int64_t>{5});
         REQUIRE(cAnchor.position.has_value());
         CHECK((*cAnchor.position)[0] == doctest::Approx(1.0));
     }
@@ -323,7 +323,7 @@ TEST_CASE("edges: canonicalisation, anchors, uniqueness")
         auto w = db.write();
         CHECK_THROWS(db.addEdge(w, anchored));
     }
-    anchored.aAnchor.index = 9;
+    anchored.aAnchor.points = {{"control_points", {9}}};
     addEdge(db, anchored);
 
     // Deleting an object with edges is refused; after removing its edges it works.

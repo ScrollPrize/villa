@@ -6,6 +6,7 @@ import sqlite3
 import pytest
 from vc.objects import ObjectStore
 from test_objects import _geometry
+from object_helpers import edge_choice
 
 
 @pytest.fixture()
@@ -86,7 +87,7 @@ def test_delete_edit_and_delete_new_edge_conflicts(pair):
     assert preview["conflicts"][0]["local"] is None
     assert a.synchronize(b, resolutions={x: "remote"}, expected_plan=preview["plan_token"])["applied"]
     a.delete_object(x)
-    edge = b.add_edge({"kind": "connected", "a": x, "b": y})
+    edge = b.add_edge({"kind": "connected", "a": x, "b": y, "a_anchor": {"whole_geometry": True}, "b_anchor": {"whole_geometry": True}})
     before = state(a), state(b)
     report = a.synchronize(b)
     assert any(c["uuid"] == edge and "endpoint" in c["reason"] for c in report["conflicts"])
@@ -95,13 +96,13 @@ def test_delete_edit_and_delete_new_edge_conflicts(pair):
     assert report["applied"] and a.edge(edge)
 
 
-def test_geometry_history_bindings_and_force(pair):
+def test_geometry_history_bindings_and_explicit_retain(pair):
     a, b = pair
     x = a.upsert_object({"kind": "fiber"})
     first = a.put_geometry(x, _geometry())
     second = a.put_geometry(x, _geometry(value=2), expected_revision=first)
     y = a.upsert_object({"kind": "note"})
-    edge = a.add_edge({"kind": "connected", "a": y, "b": x})
+    edge = a.add_edge({"kind": "connected", "a": y, "b": x, "a_anchor": {"whole_geometry": True}, "b_anchor": {"whole_geometry": True}})
     a.set_approval(edge, "approved")
     assert a.synchronize(b)["applied"]
     assert state(a) == state(b)
@@ -109,21 +110,15 @@ def test_geometry_history_bindings_and_force(pair):
     assert b.read_geometry_array(first, "line_points") == a.read_geometry_array(first, "line_points")
     assert endpoint_bindings(a, edge) == endpoint_bindings(b, edge)
     before = a.journal_since()
-    with pytest.raises(RuntimeError, match="force=true"):
+    with pytest.raises(RuntimeError, match="explicit retain/update/remove"):
         a.put_geometry(x, _geometry(value=3), expected_revision=second)
     assert a.journal_since() == before
-    third = a.put_geometry(x, _geometry(value=3), expected_revision=second, force=True)
-    before = state(a), state(b)
-    report = a.synchronize(b)
-    assert not report["applied"] and any("force=true" in c["reason"] for c in report["conflicts"])
-    assert before == (state(a), state(b))
-    assert a.synchronize(b, force=True)["applied"]
+    third = a.put_geometry(x, _geometry(value=3), expected_revision=second, edge_edits=[edge_choice(a, edge, "retain")])
+    assert a.synchronize(b)["applied"]
     assert b.current_geometry(x)["uuid"] == third
     assert endpoint_bindings(a, edge) == endpoint_bindings(b, edge)
-    assert b.edge_geometry_state(edge)["stale"] and b.edge(edge)["approval_state"] == "pending"
-    with pytest.raises(RuntimeError, match="revalidate"):
-        b.set_approval(edge, "approved")
-    b.revalidate_edge_geometry(edge)
+    assert not b.edge_geometry_state(edge)["stale"]
+    assert b.edge(edge)["approval_state"] == "pending"
     b.set_approval(edge, "approved")
     assert a.synchronize(b)["applied"]
     assert a.edge(edge)["approval_state"] == "approved"
@@ -192,8 +187,8 @@ def test_duplicate_edges_require_explicit_choice(pair):
     x = a.upsert_object({"kind": "note"})
     y = a.upsert_object({"kind": "note"})
     a.synchronize(b)
-    local = a.add_edge({"kind": "connected", "a": x, "b": y})
-    remote = b.add_edge({"kind": "connected", "a": y, "b": x})
+    local = a.add_edge({"kind": "connected", "a": x, "b": y, "a_anchor": {"whole_geometry": True}, "b_anchor": {"whole_geometry": True}})
+    remote = b.add_edge({"kind": "connected", "a": y, "b": x, "a_anchor": {"whole_geometry": True}, "b_anchor": {"whole_geometry": True}})
     report = a.synchronize(b)
     assert not report["applied"] and "identity" in report["conflicts"][0]["reason"]
     assert a.synchronize(b, resolutions={remote: "local"}, expected_plan=report["plan_token"])["applied"]
@@ -236,7 +231,7 @@ def test_corrupt_incoming_geometry_rolls_back_both_stores(pair):
     assert before == (state(a), state(b), a.journal_since(), b.journal_since())
 
 
-def test_self_edge_sync_and_pending_invalidation(pair):
+def test_self_edge_sync_preserves_explicit_retain(pair):
     import struct
     a, b = pair
     x = a.upsert_object({"kind": "point_collection"})
@@ -245,31 +240,33 @@ def test_self_edge_sync_and_pending_invalidation(pair):
         {"name": "point_ids", "dtype": "<i8", "shape": [2], "data": struct.pack("<2q", 1, 2)}]}
     first = a.put_geometry(x, geometry)
     edge = a.add_edge({"kind": "point_link", "a": x, "b": x,
-                       "a_anchor": {"index": 2}, "b_anchor": {"index": 1}})
+                       "a_anchor": {"points": [{"array": "point_ids", "index": [2]}]},
+                       "b_anchor": {"points": [{"array": "point_ids", "index": [1]}]}})
     assert a.synchronize(b)["applied"]
     assert state(a) == state(b)
     geometry["arrays"][0]["data"] = struct.pack("<6d", 9, 2, 3, 4, 5, 6)
-    a.put_geometry(x, geometry, expected_revision=first, force=True)
+    a.put_geometry(x, geometry, expected_revision=first, edge_edits=[edge_choice(a, edge, "retain")])
     before = b.edge(edge)["generation"]
-    assert a.synchronize(b, force=True)["applied"]
-    assert b.edge(edge)["generation"] > before and b.edge_geometry_state(edge)["stale"]
+    assert a.synchronize(b)["applied"]
+    assert b.edge(edge)["generation"] > before and not b.edge_geometry_state(edge)["stale"]
     assert state(a) == state(b)
     assert any(j["change_kind"] == "sync" for j in b.journal_since())
 
 
-def test_independent_metadata_change_and_new_geometry_edge_require_force(pair):
+def test_new_relationship_on_changed_geometry_requires_explicit_resolution(pair):
     a, b = pair
     x = a.upsert_object({"kind": "fiber"})
     first = a.put_geometry(x, _geometry())
     y = a.upsert_object({"kind": "note"})
     a.synchronize(b)
     a.put_geometry(x, _geometry(value=3), expected_revision=first)
-    edge = b.add_edge({"kind": "connected", "a": x, "b": y})
+    edge = b.add_edge({"kind": "connected", "a": x, "b": y, "a_anchor": {"whole_geometry": True}, "b_anchor": {"whole_geometry": True}})
     report = a.synchronize(b)
-    assert any("force=true" in c["reason"] for c in report["conflicts"])
-    assert a.synchronize(b, force=True)["applied"]
-    assert a.edge_geometry_state(edge)["stale"]
-    assert b.edge(edge)["generation"] == 2
+    assert any("explicit relationship" in c["reason"] for c in report["conflicts"])
+    assert not a.synchronize(b)["applied"]
+    b.remove_edge(edge)  # Caller explicitly chooses removal before retrying.
+    assert a.synchronize(b)["applied"]
+    assert a.edge(edge) is None
 
 
 def test_kind_collision_is_reported_before_mutation(pair):

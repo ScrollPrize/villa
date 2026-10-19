@@ -7,7 +7,7 @@ void ObjectStore::setApproval(WriteTxn& txn, const std::string& recordUuid, cons
         throw std::runtime_error("object store: invalid approval state: " + state);
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     if (state == "approved" && edgeByUuid(txn, recordUuid) && edgeGeometryState(txn, recordUuid).stale)
-        throw std::runtime_error("object store: revalidate edge geometry before approving a stale edge");
+        throw std::runtime_error("object store: explicitly update the relationship before approving stale geometry");
     const auto bytes = parseUuid(recordUuid);
     const char* table = nullptr;
     int64_t id = 0;

@@ -71,6 +71,7 @@ TEST_CASE("geometry revisions preserve read snapshots and reject foreign transac
         const auto otherId = db.upsertObject(w, makeObject("note"));
         EdgeRecord link;
         link.kind = "connected"; link.aUuid = id; link.bUuid = otherId;
+        link.aAnchor.wholeGeometry = true; link.bAnchor.wholeGeometry = true;
         edge = db.addEdge(w, link);
         db.setApproval(w, edge, "approved");
         w.commit();
@@ -83,14 +84,19 @@ TEST_CASE("geometry revisions preserve read snapshots and reject foreign transac
         CHECK_THROWS(db.objectByUuid(foreign, id));
         CHECK_THROWS(db.edgeByUuid(foreign, edge));
         CHECK_THROWS(db.edgeGeometryState(foreign, edge));
-        CHECK_THROWS(db.revalidateEdgeGeometry(foreign, edge));
+        CHECK_THROWS(db.affectedGeometryEdges(foreign, id, data));
+        CHECK_THROWS(db.repairEdgeGeometry(foreign, {}));
         CHECK_THROWS(db.upsertObject(foreign, makeObject("note")));
     }
     data.arrays[0].bytes[0] = 3;
     {
         auto w = db.write();
         CHECK_THROWS_AS(db.putGeometry(w, id, data, first), std::runtime_error);
-        second = db.putGeometry(w, id, data, first, true);
+        const auto link = *db.edgeByUuid(w, edge);
+        GeometryEdgeEdit decision;
+        decision.edgeUuid = edge; decision.expectedGeneration = link.generation; decision.action = "retain";
+        decision.aRevision = first;
+        second = db.putGeometry(w, id, data, first, {decision});
         w.commit();
     }
     CHECK(db.currentGeometry(snapshot, id)->uuid == first);
@@ -99,7 +105,7 @@ TEST_CASE("geometry revisions preserve read snapshots and reject foreign transac
     CHECK(db.edgeByUuid(snapshot, edge)->approvalState == "approved");
     auto current = db.read();
     CHECK(db.currentGeometry(current, id)->uuid == second);
-    CHECK(db.edgeGeometryState(current, edge).stale);
+    CHECK_FALSE(db.edgeGeometryState(current, edge).stale);
     CHECK(db.edgeByUuid(current, edge)->approvalState == "pending");
     CHECK(db.readGeometryArray(current, first, "points")[0] == 0);
     CHECK(db.readGeometryArray(current, second, "points")[0] == 3);

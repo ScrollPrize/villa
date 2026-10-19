@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import vc
 from vc.objects import ObjectStore
+from object_helpers import edge_choice
 
 
 def geometry(value=1):
@@ -28,7 +29,8 @@ def seed(store):
         ra = tx.put_geometry(a, geometry())
         b = tx.upsert_object({"kind": "fiber"})
         rb = tx.put_geometry(b, geometry(2))
-        edge = tx.add_edge({"kind": "connected", "a": b, "b": a})
+        edge = tx.add_edge({"kind": "connected", "a": b, "b": a,
+                            "a_anchor": {"whole_geometry": True}, "b_anchor": {"whole_geometry": True}})
         tx.set_approval(edge, "approved")
     return a, b, ra, rb, edge
 
@@ -41,7 +43,7 @@ def test_one_database_owns_objects_geometry_and_relationships(store):
                           "geometry_chunks", "geometry_revisions", "geometry_revision_chunks", "store_identity"}
         assert {r[1] for r in sql.execute("PRAGMA table_info(geometry_heads)")} == {"object_uuid", "revision_uuid"}
         assert not list(sql.execute("PRAGMA foreign_key_check"))
-        assert sql.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert sql.execute("PRAGMA user_version").fetchone()[0] == 2
     assert store.neighbours(a) == [b]
     record, state = store.edge(edge), store.edge_geometry_state(edge)
     revisions = {a: ra, b: rb}
@@ -51,61 +53,55 @@ def test_one_database_owns_objects_geometry_and_relationships(store):
     assert len(exported["objects"]) == 2 and len(exported["edges"]) == 1
 
 
-def test_publication_invalidates_only_incident_edges_and_requires_revalidation(store):
+def test_publication_requires_explicit_decisions_and_preserves_unrelated_edges(store):
     a, b, first, rb, edge = seed(store)
     c = store.upsert_object({"kind": "note"})
-    unrelated = store.add_edge({"kind": "connected", "a": b, "b": c})
+    unrelated = store.add_edge({"kind": "connected", "a": b, "b": c, "a_anchor": {"whole_geometry": True}, "b_anchor": {"whole_geometry": True}})
     store.set_approval(unrelated, "approved")
     unrelated_before = store.edge(unrelated)
     store.set_meta(a, "review_note", "keep")
     before_edge = store.edge(edge)
     before_state = store.edge_geometry_state(edge)
     before = store.journal_since()
-    with pytest.raises(RuntimeError, match="force=true"):
+    with pytest.raises(RuntimeError, match="explicit retain/update/remove"):
         store.put_geometry(a, geometry(9), expected_revision=first)
     assert store.journal_since() == before
-    second = store.put_geometry(a, geometry(9), expected_revision=first, force=True)
+    second = store.put_geometry(a, geometry(9), expected_revision=first, edge_edits=[edge_choice(store, edge, "retain")])
     assert store.object(a)["meta"] == {"review_note": "keep"}
     assert store.object(a)["tags"] == ["source"]
     assert store.edge(edge)["approval_state"] == "pending"
     assert store.edge(edge)["generation"] == before_edge["generation"] + 1
     assert store.edge(unrelated) == unrelated_before
-    assert store.edge_geometry_state(edge) == dict(before_state, stale=True)
+    assert not store.edge_geometry_state(edge)["stale"]
     changes = store.journal_since(before[-1]["seq"])
-    assert [(c["record_uuid"], c["change_kind"]) for c in changes] == [(a, "geometry"), (edge, "geometry_invalidated")]
+    assert [(c["record_uuid"], c["change_kind"]) for c in changes] == [(a, "geometry"), (edge, "geometry_repaired")]
     assert store.read_geometry_array(first, "line_points") == geometry()["arrays"][1]["data"]
     assert store.read_geometry_array(second, "line_points") == geometry(9)["arrays"][1]["data"]
-    with pytest.raises(RuntimeError, match="revalidate"):
-        store.set_approval(edge, "approved")
-    with store.write() as tx:
-        tx.revalidate_edge_geometry(edge)
-        tx.set_approval(edge, "approved")
-    assert not store.edge_geometry_state(edge)["stale"]
+    store.set_approval(edge, "approved")
     before = store.journal_since()
     assert store.put_geometry(a, geometry(9), expected_revision=second) == second
-    store.revalidate_edge_geometry(edge)
     assert store.journal_since() == before
     with pytest.raises(RuntimeError, match="current revision changed"):
         store.put_geometry(a, geometry(9), expected_revision=first)
     assert store.journal_since() == before
 
 
-def test_initial_geometry_invalidates_existing_relationships(store):
+def test_initial_geometry_requires_explicit_relationship_decisions(store):
     a = store.upsert_object({"kind": "fiber"})
     b = store.upsert_object({"kind": "note"})
-    edge = store.add_edge({"kind": "connected", "a": a, "b": b})
+    edge = store.add_edge({"kind": "connected", "a": a, "b": b, "a_anchor": {"whole_geometry": True}, "b_anchor": {"whole_geometry": True}})
     store.set_approval(edge, "approved")
-    with pytest.raises(RuntimeError, match="force=true"):
+    with pytest.raises(RuntimeError, match="explicit retain/update/remove"):
         store.put_geometry(a, geometry())
-    store.put_geometry(a, geometry(), force=True)
+    store.put_geometry(a, geometry(), edge_edits=[edge_choice(store, edge, "retain")])
     assert store.edge(edge)["approval_state"] == "pending"
-    assert store.edge_geometry_state(edge)["stale"]
+    assert not store.edge_geometry_state(edge)["stale"]
 
 
-def test_invalidation_failure_rolls_back_geometry_and_metadata_within_transaction(store):
+def test_relationship_failure_rolls_back_geometry_and_metadata_within_transaction(store):
     a, b, first, rb, edge = seed(store)
     c = store.upsert_object({"kind": "note"})
-    second_edge = store.add_edge({"kind": "connected", "a": a, "b": c})
+    second_edge = store.add_edge({"kind": "connected", "a": a, "b": c, "a_anchor": {"whole_geometry": True}, "b_anchor": {"whole_geometry": True}})
     store.set_approval(second_edge, "approved")
     before_second_edge = store.edge(second_edge)
     before_object, before_edge = store.object(a), store.edge(edge)
@@ -117,9 +113,10 @@ def test_invalidation_failure_rolls_back_geometry_and_metadata_within_transactio
         sql.execute(f"CREATE TRIGGER reject_edge BEFORE UPDATE ON edges "
                     f"WHEN NEW.uuid=X'{second_edge.replace('-', '')}' "
                     "BEGIN SELECT RAISE(ABORT,'injected'); END")
+    choices = [edge_choice(store, uid, "retain") for uid in (edge, second_edge)]
     with store.write() as tx:
         with pytest.raises(RuntimeError, match="injected"):
-            tx.put_geometry(a, geometry(5), expected_revision=first, force=True)
+            tx.put_geometry(a, geometry(5), expected_revision=first, edge_edits=choices)
         tx.upsert_object({"kind": "note", "name": "survives"})
     assert store.current_geometry(a)["uuid"] == first
     assert store.object(a) == before_object
@@ -140,7 +137,7 @@ def test_object_geometry_and_edge_creation_roll_back_together(store):
             a = tx.upsert_object({"kind": "fiber"})
             revision = tx.put_geometry(a, geometry())
             b = tx.upsert_object({"kind": "note"})
-            edge = tx.add_edge({"kind": "connected", "a": a, "b": b})
+            edge = tx.add_edge({"kind": "connected", "a": a, "b": b, "a_anchor": {"whole_geometry": True}, "b_anchor": {"whole_geometry": True}})
             raise RuntimeError("abort")
     assert store.object(a) is None and store.object(b) is None
     assert store.geometry_revision(revision) is None
@@ -236,7 +233,7 @@ def test_real_segment_geometry_and_relationships_roundtrip(store, tmp_path):
         expected = np.stack([tifffile.imread(copied / f"{axis}.tif") for axis in "xyz"], axis=-1)
         np.testing.assert_array_equal(actual, expected)
         ids.append(uid)
-    edge = store.add_edge({"kind": "fixture-relationship", "a": ids[0], "b": ids[1]})
+    edge = store.add_edge({"kind": "fixture-relationship", "a": ids[0], "b": ids[1], "a_anchor": {"whole_geometry": True}, "b_anchor": {"whole_geometry": True}})
     store.set_approval(edge, "approved")
     store.checkpoint()
     with ObjectStore.open(store.path, read_only=True) as reader:

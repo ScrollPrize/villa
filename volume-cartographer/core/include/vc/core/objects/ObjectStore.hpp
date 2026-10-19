@@ -71,10 +71,22 @@ struct ObjectRecord : RecordCommon {
     std::optional<TrackDetail> track;
 };
 
+struct PointReference {
+    // Geometry array and point coordinates, excluding the final XYZ axis:
+    // control_points:[5], line_points:[12], points:[20,145] (patch row,col).
+    // point_ids:[42] addresses stable point ID 42 in a point_collection.
+    std::string array;
+    std::vector<int64_t> index;
+    bool operator==(const PointReference&) const = default;
+};
+
 struct Anchor {
-    std::optional<int64_t> index;
     std::optional<std::array<double, 3>> position;
     std::optional<std::array<double, 3>> direction;
+    // Exact geometry dependencies, including any neighbours used by a
+    // direction/interpolated anchor. Empty means unknown, not independent.
+    std::vector<PointReference> points;
+    bool wholeGeometry = false; // explicit object-wide relationship
 };
 
 struct EdgeRecord : RecordCommon {
@@ -111,7 +123,6 @@ struct JsonExportOptions {
 
 struct SyncOptions {
     bool dryRun = false;
-    bool force = false; // allow geometry-head changes; invalidate incident-edge approval
     std::map<std::string, std::string> resolutions; // record UUID -> "local" or "remote"
     std::optional<std::string> expectedPlan; // preview token; required with resolutions
 };
@@ -166,6 +177,27 @@ struct EdgeGeometryState {
     bool stale = false;
 };
 
+// A repair computed from one read snapshot. Anchors and revisions use the
+// stored edge's a/b order (edgeByUuid), not caller-selected endpoint order.
+// Null revisions explicitly mean the endpoint has no managed geometry.
+struct EdgeGeometryRepair {
+    std::string edgeUuid;
+    int64_t expectedGeneration = 0;
+    std::optional<std::string> aRevision, bRevision;
+    Anchor aAnchor, bAnchor;
+};
+
+struct GeometryEdgeEdit {
+    std::string edgeUuid;
+    int64_t expectedGeneration = 0;
+    // Exactly "retain", "update", or "remove". Retain keeps the same
+    // relationship and anchors; update supplies both complete anchors in
+    // stored a/b order. Revisions are the heads observed BEFORE the edit.
+    std::string action;
+    std::optional<std::string> aRevision, bRevision;
+    Anchor aAnchor, bAnchor;
+};
+
 // Primary database for objects, geometry, and relationships between objects.
 // One writer and a bounded reader pool per handle. Transactions are thread-confined
 // and must finish before their handle is moved/destroyed. Do not nest writes or
@@ -211,12 +243,17 @@ public:
     // Immutable geometry. A null expectedRevision means "expect no geometry";
     // pass the current revision UUID to replace it. Stale writers fail, even
     // when their proposed bytes match. Identical current content is a no-op.
-    // Changes with incident edges are refused unless force=true. Forced writes
-    // invalidate their approvals and retain old revision bindings (stale anchors).
+    // Every affected edge requires an explicit retain/update/remove decision.
     // The write is savepoint-protected. Identical content is always a no-op.
     std::string putGeometry(WriteTxn& txn, const std::string& objectUuid,
                             const GeometryData& data,
-                            const std::optional<std::string>& expectedRevision = std::nullopt, bool force = false);
+                            const std::optional<std::string>& expectedRevision = std::nullopt,
+                            const std::vector<GeometryEdgeEdit>& edgeEdits = {});
+    // Preview the relationships whose declared point dependencies change.
+    // Unknown dependencies are included and require update (with explicit
+    // dependencies) or removal. Does not publish geometry or modify edges.
+    std::vector<EdgeRecord> affectedGeometryEdges(const Txn&, const std::string& objectUuid,
+                                                const GeometryData&) const;
     std::optional<GeometryRevision> currentGeometry(const Txn& txn, const std::string& objectUuid) const;
     std::optional<GeometryRevision> geometryRevision(const Txn& txn, const std::string& revisionUuid) const;
     std::vector<GeometryRevision> geometryHistory(const Txn& txn, const std::string& objectUuid) const;
@@ -240,9 +277,12 @@ public:
     std::vector<JournalEntry> journalSince(const Txn& txn, int64_t afterSeq) const;
 
     EdgeGeometryState edgeGeometryState(const Txn& txn, const std::string& edgeUuid) const;
-    // Explicitly acknowledge that anchors/relationship have been revalidated
-    // against the current endpoint revisions. Resets approval and journals.
-    void revalidateEdgeGeometry(WriteTxn& txn, const std::string& edgeUuid);
+    // Publish corrected anchors and exact checked revision bindings together.
+    // Reject changed edge generations or endpoint heads, even for a no-op.
+    // Preserves other edge metadata, resets approval, and journals one change.
+    // Savepoint-protected; identical anchors/bindings are a complete no-op.
+    void repairEdgeGeometry(WriteTxn&, const EdgeGeometryRepair&);
+
 
     // Edges. addEdge normalises endpoint order (swapping anchors to
     // match) and enforces (kind, endpoints, anchors) uniqueness.

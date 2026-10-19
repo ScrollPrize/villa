@@ -15,10 +15,12 @@ using objects::EdgeRecord;
 
 std::string anchorKey(const std::string& uuid, const objects::Anchor& anchor)
 {
-    return uuid + "#" + (anchor.index ? std::to_string(*anchor.index) : std::string("-"));
+    nlohmann::json points = nlohmann::json::array();
+    for (const auto& point : anchor.points) points.push_back({{"array", point.array}, {"index", point.index}});
+    return uuid + "#" + nlohmann::json{{"whole_geometry", anchor.wholeGeometry}, {"points", points}}.dump();
 }
 
-// Order-independent identity of a (kind, endpoints, anchor indexes)
+// Order-independent identity of a (kind, endpoints, point dependencies)
 // triple, matching vc_objects's uniqueness scopes.
 std::string candidateKey(const std::string& kind, const std::string& aUuid, const objects::Anchor& aAnchor,
                          const std::string& bUuid, const objects::Anchor& bAnchor)
@@ -139,7 +141,15 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
             e.meta = merged.dump();
             e.tags.insert(e.tags.end(), old.tags.begin(), old.tags.end());
             db.updateEdge(txn, e);
-            if (validateGeometry) db.revalidateEdgeGeometry(txn, e.uuid);
+            if (validateGeometry) {
+                const auto updated = *db.edgeByUuid(txn, e.uuid);
+                objects::EdgeGeometryRepair repair;
+                repair.edgeUuid = updated.uuid; repair.expectedGeneration = updated.generation;
+                if (const auto revision = db.currentGeometry(txn, updated.aUuid)) repair.aRevision = revision->uuid;
+                if (const auto revision = db.currentGeometry(txn, updated.bUuid)) repair.bRevision = revision->uuid;
+                repair.aAnchor = updated.aAnchor; repair.bAnchor = updated.bAnchor;
+                db.repairEdgeGeometry(txn, repair);
+            }
             if (db.edgeByUuid(txn, e.uuid)->generation == old.generation) ++report.edgesSkippedExisting;
             else ++report.edgesUpdated;
         } else {

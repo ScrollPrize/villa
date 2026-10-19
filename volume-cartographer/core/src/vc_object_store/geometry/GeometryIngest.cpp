@@ -236,7 +236,7 @@ void normalizeMetadata(Prepared& p)
     p.object.meta = Json{{"source", source}}.dump();
 }
 void publishBatch(ObjectStore& db, std::vector<Prepared> batch,
-    const std::map<std::string, Expected>& expectations, GeometryIngestReport& report, bool force)
+    const std::map<std::string, Expected>& expectations, GeometryIngestReport& report)
 {
     auto write = db.write();
     int64_t ingested = 0, unchanged = 0;
@@ -249,7 +249,7 @@ void publishBatch(ObjectStore& db, std::vector<Prepared> batch,
         if (existing && existing->kind != p.object.kind) throw std::runtime_error("source UUID belongs to another object kind");
         normalizeMetadata(p);
         if (!existing) db.upsertObject(write, p.object);
-        const auto revision = db.putGeometry(write, p.object.uuid, p.geometry, e.revision, force);
+        const auto revision = db.putGeometry(write, p.object.uuid, p.geometry, e.revision);
         const bool seedMetadata = !existing || !Json::parse(existing->meta).contains("source");
         if (seedMetadata) sources.push_back({p.object, p.source});
         if (e.revision && revision == *e.revision && !seedMetadata) { ++unchanged; continue; }
@@ -281,10 +281,10 @@ void publishBatch(ObjectStore& db, std::vector<Prepared> batch,
     write.commit();
     report.ingested += ingested; report.unchanged += unchanged; report.edgesImported += edges;
 }
-void publish(ObjectStore& db, Prepared p, const Expected& expected, GeometryIngestReport& report, bool force)
+void publish(ObjectStore& db, Prepared p, const Expected& expected, GeometryIngestReport& report)
 {
     std::map<std::string, Expected> expectations{{p.object.uuid, expected}};
-    publishBatch(db, {std::move(p)}, expectations, report, force);
+    publishBatch(db, {std::move(p)}, expectations, report);
 }
 void problem(GeometryIngestReport& report, const std::string& label, const std::exception& error)
 {
@@ -293,7 +293,7 @@ void problem(GeometryIngestReport& report, const std::string& label, const std::
 }
 
 GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db, const std::optional<fs::path>& datasetRoot,
-    const std::vector<std::string>& objectUuids, const util::ProgressCallback& progress, bool force)
+    const std::vector<std::string>& objectUuids, const util::ProgressCallback& progress)
 {
     GeometryIngestReport report;
     std::vector<ObjectRecord> objects;
@@ -353,7 +353,7 @@ GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db, const std::option
         } catch (const std::exception& error) { problem(report, object.uuid, error); }
     }
     if (report.problems.empty()) {
-        try { publishBatch(db, std::move(prepared), expectations, report, force); }
+        try { publishBatch(db, std::move(prepared), expectations, report); }
         catch (const std::exception& error) { problem(report, "batch", error); }
     }
     util::reportProgress(progress, "ingesting geometry", objects.size(), objects.size());
@@ -361,7 +361,7 @@ GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db, const std::option
 }
 
 GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& kind, const fs::path& source,
-    const util::ProgressCallback& progress, bool force)
+    const util::ProgressCallback& progress)
 {
     GeometryIngestReport report;
     try {
@@ -398,7 +398,7 @@ GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& ki
                         object.track = TrackDetail{}; object.track->datasetRef = ref; object.track->externalKey = key;
                     }
                     const auto e = expectations.contains(object.uuid) ? expectations.at(object.uuid) : Expected{};
-                    publish(db, track(store, row, object), e, report, force);
+                    publish(db, track(store, row, object), e, report);
                 } catch (const std::exception& error) { problem(report, key, error); }
             }
         } else {
@@ -422,7 +422,7 @@ GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& ki
                 else throw std::runtime_error("unsupported geometry kind: " + kind);
                 for (const auto& p : batch) expectations[p.object.uuid] = expectedAt(db, read, p.object.uuid);
             }
-            publishBatch(db, std::move(batch), expectations, report, force);
+            publishBatch(db, std::move(batch), expectations, report);
         }
     } catch (const std::exception& error) { problem(report, source.string(), error); }
     return report;

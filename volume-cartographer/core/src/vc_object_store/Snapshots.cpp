@@ -27,7 +27,7 @@ std::vector<ObjectRecord> ObjectStore::selectObjects(const Txn& txn, const Objec
 std::string ObjectStore::exportJson(const Txn& txn, const JsonExportOptions& options) const
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
-    nlohmann::json out{{"format", "vc_object_metadata"}, {"version", 1}, {"metadata_only", true},
+    nlohmann::json out{{"format", "vc_object_metadata"}, {"version", 2}, {"metadata_only", true},
         {"store_uuid", uuid(txn)}, {"objects", nlohmann::json::array()}, {"edges", nlohmann::json::array()}};
     const std::set<std::string> fields(options.fields.begin(), options.fields.end());
     if (!fields.empty()) out["projected"] = true;
@@ -71,7 +71,7 @@ void ObjectStore::importJson(WriteTxn& txn, const std::string& jsonText)
     if (root.value("format", "") != "vc_object_metadata")
         throw std::runtime_error("object store: not a vc_object_metadata document");
     const int version = root.value("version", 0);
-    if (version != 1)
+    if (version != 2)
         throw std::runtime_error("object store: unsupported export version");
     if (root.value("projected", false)) throw std::runtime_error("projected exports are for inspection, not import");
     for (const auto& object : root.at("objects"))

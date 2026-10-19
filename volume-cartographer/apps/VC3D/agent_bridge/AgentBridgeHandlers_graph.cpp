@@ -62,7 +62,14 @@ QJsonObject objectJson(const vc::objects::ObjectRecord& r)
 QJsonObject anchorJson(const vc::objects::Anchor& a)
 {
     QJsonObject o;
-    if (a.index) o["index"] = double(*a.index);
+    if (a.wholeGeometry) o["wholeGeometry"] = true;
+    QJsonArray points;
+    for (const auto& point : a.points) {
+        QJsonArray index;
+        for (const auto coordinate : point.index) index.append(double(coordinate));
+        points.append(QJsonObject{{"array", qs(point.array)}, {"index", index}});
+    }
+    o["points"] = points;
     if (a.position) o["position"] = QJsonArray{(*a.position)[0], (*a.position)[1], (*a.position)[2]};
     if (a.direction) o["direction"] = QJsonArray{(*a.direction)[0], (*a.direction)[1], (*a.direction)[2]};
     return o;

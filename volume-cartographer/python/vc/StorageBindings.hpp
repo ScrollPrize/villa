@@ -84,7 +84,16 @@ vo::Anchor anchorFromPy(const nb::handle& obj)
     vo::Anchor a;
     if (obj.is_none()) return a;
     nb::dict d = nb::cast<nb::dict>(obj);
-    if (has(d, "index")) a.index = nb::cast<int64_t>(d["index"]);
+    for (auto item : d) {
+        const auto key = nb::cast<std::string>(item.first);
+        if (key != "points" && key != "whole_geometry" && key != "position" && key != "direction")
+            throw std::invalid_argument("unknown anchor field: " + key);
+    }
+    if (has(d, "whole_geometry")) a.wholeGeometry = nb::cast<bool>(d["whole_geometry"]);
+    if (has(d, "points")) for (nb::handle item : nb::cast<nb::list>(d["points"])) {
+        const auto point = nb::cast<nb::dict>(item);
+        a.points.push_back({nb::cast<std::string>(point["array"]), nb::cast<std::vector<int64_t>>(point["index"])});
+    }
     for (const char* key : {"position", "direction"}) {
         if (!has(d, key)) continue;
         nb::sequence seq = nb::cast<nb::sequence>(d[key]);
@@ -99,7 +108,14 @@ vo::Anchor anchorFromPy(const nb::handle& obj)
 nb::dict anchorToPy(const vo::Anchor& a)
 {
     nb::dict d;
-    if (a.index) d["index"] = *a.index;
+    if (a.wholeGeometry) d["whole_geometry"] = true;
+    if (!a.points.empty()) {
+        nb::list points;
+        for (const auto& point : a.points) {
+            nb::dict value; value["array"] = point.array; value["index"] = point.index; points.append(value);
+        }
+        d["points"] = points;
+    }
     if (a.position) d["position"] = nb::make_tuple((*a.position)[0], (*a.position)[1], (*a.position)[2]);
     if (a.direction) d["direction"] = nb::make_tuple((*a.direction)[0], (*a.direction)[1], (*a.direction)[2]);
     return d;

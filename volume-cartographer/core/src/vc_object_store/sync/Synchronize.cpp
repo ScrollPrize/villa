@@ -1,3 +1,4 @@
+#include "geometry/Dependencies.hpp"
 #include "internal/RecordJson.hpp"
 #include "geometry/GeometryInternal.hpp"
 #include "sync/GeometryTransfer.hpp"
@@ -145,7 +146,6 @@ SyncReport ObjectStore::synchronize(ObjectStore& peer, const SyncOptions& option
     // Validate dependencies before making any writes, including conflicts arising
     // from otherwise independent endpoint deletions and edge additions.
     std::map<std::string, std::string> identities;
-    std::set<std::string> invalidatedEdges;
     for (const auto& id : ids) {
         const auto chosen = at(merged, id);
         for (const auto* side : {&local, &remote}) {
@@ -156,12 +156,7 @@ SyncReport ObjectStore::synchronize(ObjectStore& peer, const SyncOptions& option
                 conflict(id, "object kind cannot change; assign distinct UUIDs before synchronizing");
             if (head(old) != nullptr && (chosen.is_null() || head(chosen) == nullptr))
                 conflict(id, "retained geometry cannot be deleted; select the replica containing geometry");
-            if (!chosen.is_null() && head(old) != head(chosen)) {
-                for (const auto& [edgeId, edge] : side->items()) if (!object(edge) && (edge.at("a") == id || edge.at("b") == id)) {
-                    if (!options.force) conflict(id, "geometry change affects existing edges; retry with force=true");
-                    invalidatedEdges.insert(edgeId);
-                }
-            }
+
         }
         if (chosen.is_null()) continue;
         if (object(chosen)) {
@@ -175,29 +170,38 @@ SyncReport ObjectStore::synchronize(ObjectStore& peer, const SyncOptions& option
                 const auto target = at(merged, chosen.at(endpoint).get<std::string>());
                 if (!object(target)) conflict(id, "edge endpoint was deleted or is not an object");
             }
-            const auto a = chosen.value("a_anchor", Json::object()).value("index", Json());
-            const auto b = chosen.value("b_anchor", Json::object()).value("index", Json());
-            if (a.is_null() == b.is_null()) {
-                const auto identity = Json::array({"edge", chosen["kind"], chosen["a"], a, chosen["b"], b}).dump();
-                auto [it, added] = identities.emplace(identity, id);
-                if (!added) conflict(id, "edge identity also belongs to " + it->second + "; resolve one duplicate to its absent side");
-            }
+            const auto identity = Json::array({"edge", chosen["kind"], chosen["a"], chosen["b"],
+                dependenciesToJson(anchorFromJson(chosen.at("a_anchor"))),
+                dependenciesToJson(anchorFromJson(chosen.at("b_anchor")))}).dump();
+            auto [it, added] = identities.emplace(identity, id);
+            if (!added) conflict(id, "edge identity also belongs to " + it->second + "; resolve one duplicate to its absent side");
         }
     }
     if (!report.conflicts.empty()) return report;
-    // Invalidate approval consistently in both replicas. Keep revision bindings:
-    // force acknowledges the edit, not the validity of old anchors.
-    for (auto& [id, edge] : merged.items()) if (!object(edge)) {
+    // Synchronization must not turn unresolved geometry/relationship combinations
+    // into stale links implicitly. A source edit must carry its explicit decision.
+    auto geometryFor = [&](const Json& uuid) -> std::optional<detail::DependencyGeometry> {
+        if (uuid.is_null()) return std::nullopt;
+        const auto id = uuid.get<std::string>();
+        if (const auto revision = geometryRevision(localTxn, id))
+            return detail::dependencyGeometry(*this, localTxn, *revision);
+        if (const auto revision = peer.geometryRevision(remoteTxn, id))
+            return detail::dependencyGeometry(peer, remoteTxn, *revision);
+        return std::nullopt;
+    };
+    for (const auto& [id, edge] : merged.items()) if (!object(edge)) {
         const auto binding = edge.value("geometry_bindings", Json::object());
-        const bool stale = binding.value("a", Json()) != head(merged.at(edge.at("a").get<std::string>())) ||
-            binding.value("b", Json()) != head(merged.at(edge.at("b").get<std::string>()));
-        if (invalidatedEdges.contains(id) || (stale && edge.at("approval_state") != "pending")) {
-            edge["generation"] = edge.at("generation").get<int64_t>() + 1;
-            edge["changed_by"] = author(); edge["changed_host"] = hostname(); edge["changed_at"] = nowIsoUtc();
-            edge["approval_state"] = "pending";
-            for (const auto* key : {"approved_by", "approved_at", "approved_host", "approved_generation"}) edge[key] = nullptr;
+        for (const auto* endpoint : {"a", "b"}) {
+            const auto bound = binding.value(endpoint, Json());
+            const auto current = head(merged.at(edge.at(endpoint).get<std::string>()));
+            if (bound == current) continue;
+            const auto before = geometryFor(bound), after = geometryFor(current);
+            const auto anchor = anchorFromJson(edge.at(std::string(endpoint) + "_anchor"));
+            if (!before || !after || detail::dependenciesChanged(anchor, *before, *after))
+                conflict(id, "geometry requires an explicit relationship retain/update/remove decision before synchronization");
         }
     }
+    if (!report.conflicts.empty()) return report;
     for (const auto& id : ids) {
         if (at(local, id) != at(merged, id)) ++report.localChanges;
         if (at(remote, id) != at(merged, id)) ++report.remoteChanges;

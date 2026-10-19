@@ -1,5 +1,6 @@
 #include "internal/RecordSql.hpp"
 #include "geometry/GeometryInternal.hpp"
+#include "geometry/Dependencies.hpp"
 
 namespace vc::objects {
 namespace {
@@ -48,8 +49,29 @@ std::vector<GeometryRevision> ObjectStore::geometryHistory(const Txn& txn, const
     return result;
 }
 
+std::vector<EdgeRecord> ObjectStore::affectedGeometryEdges(const Txn& txn, const std::string& objectUuid,
+                                                         const GeometryData& data) const
+{
+    const auto object = objectByUuid(txn, objectUuid);
+    if (!object || object->kind != data.kind) throw std::invalid_argument("geometry: object missing or kind mismatch");
+    const auto manifest = detail::geometryManifest(data).dump();
+    const auto current = currentGeometry(txn, objectUuid);
+    if (current && current->contentHash == detail::geometryHash(std::span(reinterpret_cast<const uint8_t*>(manifest.data()), manifest.size())))
+        return {};
+    const auto after = detail::dependencyGeometry(data);
+    std::vector<EdgeRecord> result;
+    for (const auto& edge : edgesOf(txn, objectUuid)) {
+        const auto changed = [&](const Anchor& anchor) {
+            return !current || detail::dependenciesChanged(anchor, detail::dependencyGeometry(*this, txn, *current), after);
+        };
+        if ((edge.aUuid == object->uuid && changed(edge.aAnchor)) ||
+            (edge.bUuid == object->uuid && changed(edge.bAnchor))) result.push_back(edge);
+    }
+    return result;
+}
+
 std::string ObjectStore::putGeometry(WriteTxn& txn, const std::string& objectUuid, const GeometryData& data,
-    const std::optional<std::string>& expectedRevision, bool force)
+    const std::optional<std::string>& expectedRevision, const std::vector<GeometryEdgeEdit>& edgeEdits)
 {
     (void)connection(txn);
     auto* db = static_cast<sqlite3*>(connection(txn));
@@ -62,10 +84,44 @@ std::string ObjectStore::putGeometry(WriteTxn& txn, const std::string& objectUui
     const auto manifest = detail::geometryManifest(data);
     const auto manifestText = manifest.dump();
     const auto contentHash = detail::geometryHash(std::span(reinterpret_cast<const uint8_t*>(manifestText.data()), manifestText.size()));
-    if (current && current->contentHash == contentHash) return current->uuid;
-
-    if (!force && !edgesOf(txn, objectUuid).empty())
-        throw std::runtime_error("geometry change affects existing edges; pass force=true to invalidate them");
+    if (current && current->contentHash == contentHash) {
+        if (!edgeEdits.empty()) throw std::invalid_argument("geometry is unchanged; edit relationships directly");
+        return current->uuid;
+    }
+    const auto affected = affectedGeometryEdges(txn, objectUuid, data);
+    std::map<std::string, GeometryEdgeEdit> decisions;
+    for (const auto& edit : edgeEdits) {
+        const auto uuid = formatUuid(parseUuid(edit.edgeUuid));
+        if (!decisions.emplace(uuid, edit).second) throw std::invalid_argument("duplicate geometry edge decision");
+    }
+    const auto after = detail::dependencyGeometry(data);
+    for (const auto& edge : affected) {
+        const auto found = decisions.find(edge.uuid);
+        if (found == decisions.end())
+            throw std::runtime_error("geometry edit requires explicit retain/update/remove for affected edge " + edge.uuid);
+        const auto& edit = found->second;
+        if (edit.expectedGeneration != edge.generation)
+            throw std::runtime_error("geometry edit: edge generation changed; reload decisions");
+        auto canonical = [](const std::optional<std::string>& id) -> std::optional<std::string> {
+            return id ? std::optional(formatUuid(parseUuid(*id))) : std::nullopt;
+        };
+        if (canonical(edit.aRevision) != geometryHead(db, edge.aUuid) || canonical(edit.bRevision) != geometryHead(db, edge.bUuid))
+            throw std::runtime_error("geometry edit: endpoint revision changed; reload decisions");
+        if (edit.action != "retain" && edit.action != "update" && edit.action != "remove")
+            throw std::invalid_argument("geometry edge action must be retain, update, or remove");
+        if (edit.action == "remove") continue;
+        auto validate = [&](const std::string& endpoint, const Anchor& anchor) {
+            if (endpoint == object->uuid) detail::validateDependencies(anchor, after);
+            else if (const auto revision = currentGeometry(txn, endpoint))
+                detail::validateDependencies(anchor, detail::dependencyGeometry(*this, txn, *revision));
+            else if (!anchor.wholeGeometry || !anchor.points.empty())
+                throw std::runtime_error("geometry edit: relationship endpoint has no geometry for its point references");
+        };
+        validate(edge.aUuid, edit.action == "retain" ? edge.aAnchor : edit.aAnchor);
+        validate(edge.bUuid, edit.action == "retain" ? edge.bAnchor : edit.bAnchor);
+    }
+    if (decisions.size() != affected.size())
+        throw std::invalid_argument("geometry decisions include an edge not affected by this edit");
 
     exec(db, "SAVEPOINT geometry_publish;");
     try {
@@ -101,9 +157,16 @@ std::string ObjectStore::putGeometry(WriteTxn& txn, const std::string& objectUui
         stampContentChange(db, author(), hostname(), "objects", id, parseUuid(objectUuid), "geometry");
         Statement update(db, "UPDATE objects SET storage_kind='sqlite',data_generation=generation,data_checksum=? WHERE id=?");
         update.bind(1, contentHash); update.bind(2, id); update.stepDone();
-        for (const auto& edge : edgesOf(txn, objectUuid))
-            stampContentChange(db, author(), hostname(), "edges",
-                *edgeIdByUuid(db, parseUuid(edge.uuid)), parseUuid(edge.uuid), "geometry_invalidated");
+        for (const auto& edge : affected) {
+            const auto& edit = decisions.at(edge.uuid);
+            if (edit.action == "remove") { removeEdge(txn, edge.uuid); continue; }
+            EdgeGeometryRepair repair;
+            repair.edgeUuid = edge.uuid; repair.expectedGeneration = edge.generation;
+            repair.aRevision = geometryHead(db, edge.aUuid); repair.bRevision = geometryHead(db, edge.bUuid);
+            repair.aAnchor = edit.action == "retain" ? edge.aAnchor : edit.aAnchor;
+            repair.bAnchor = edit.action == "retain" ? edge.bAnchor : edit.bAnchor;
+            repairEdgeGeometry(txn, repair);
+        }
         exec(db, "RELEASE geometry_publish;");
         return revisionUuid;
     } catch (...) {

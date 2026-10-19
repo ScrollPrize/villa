@@ -21,13 +21,13 @@ def test_snapshot_preserves_provenance_and_conflicts_are_atomic(db, tmp_path):
                           "patch": {"scale": [0.25, 0.5]}, "tags": ["review"]})
     b = db.upsert_object({"kind": "fiber"})
     edge = db.add_edge({"kind": "connected", "a": b, "b": a,
-                        "a_anchor": {"index": 3, "position": [1, 2, 3]}})
+                        "a_anchor": {"points": [{"array": "control_points", "index": [3]}], "position": [1, 2, 3]}})
     db.set_meta(a, "source", "scan")
     db.set_meta(edge, "confidence", 0.8)
     db.set_approval(a, "approved")
     db.set_approval(edge, "rejected")
     snapshot = json.loads(db.export_json())
-    assert snapshot["version"] == 1
+    assert snapshot["version"] == 2
     with ObjectStore.create(str(tmp_path / "restored.vcobj"), author="importer", hostname="elsewhere") as restored:
         # Different internal IDs must not affect endpoint/anchor comparison.
         swapped = dict(snapshot, objects=list(reversed(snapshot["objects"])))
@@ -93,7 +93,7 @@ def test_object_and_edge_roundtrip(db) -> None:
                           "patch": {"grid_width": 10, "grid_height": 20}})
     edge = db.add_edge({"a": a, "b": b, "kind": "same-surface",
                         "meta": {"source": "pytest"},
-                        "a_anchor": {"index": 1, "position": [0.0, 0.0, 0.0]}})
+                        "a_anchor": {"points": [{"array": "control_points", "index": [1]}], "position": [0.0, 0.0, 0.0]}})
 
     obj = db.object(a)
     assert obj["kind"] == "fiber"
@@ -108,7 +108,7 @@ def test_object_and_edge_roundtrip(db) -> None:
     assert stored["kind"] == "same-surface"
     assert stored["meta"] == {"source": "pytest"}
     anchor = stored["a_anchor"] if stored["a"] == a else stored["b_anchor"]
-    assert anchor["index"] == 1
+    assert anchor["points"][0]["index"] == [1]
 
     assert set(db.component(a)) == {a, b}
     assert db.neighbours(a) == [b]

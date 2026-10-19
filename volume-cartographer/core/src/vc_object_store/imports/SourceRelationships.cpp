@@ -19,7 +19,7 @@ struct Points {
         if (offset < 0 || static_cast<size_t>(offset) >= xyz.size() / 3)
             throw std::runtime_error("source branch control point index out of range");
         Anchor result;
-        result.index = index;
+        result.points.push_back({pointId ? "point_ids" : "control_points", {index}});
         result.position = {xyz[3*offset], xyz[3*offset+1], xyz[3*offset+2]};
         return result;
     }
@@ -49,9 +49,9 @@ int64_t importSourceRelationships(ObjectStore& db, WriteTxn& txn, const std::vec
         for (const auto& current : db.edgesOf(txn, edge.aUuid)) {
             if (current.kind != edge.kind) continue;
             const bool forward = current.aUuid == edge.aUuid && current.bUuid == edge.bUuid &&
-                current.aAnchor.index == edge.aAnchor.index && current.bAnchor.index == edge.bAnchor.index;
+                current.aAnchor.points == edge.aAnchor.points && current.bAnchor.points == edge.bAnchor.points;
             const bool reverse = current.bUuid == edge.aUuid && current.aUuid == edge.bUuid &&
-                current.bAnchor.index == edge.aAnchor.index && current.aAnchor.index == edge.bAnchor.index;
+                current.bAnchor.points == edge.aAnchor.points && current.aAnchor.points == edge.bAnchor.points;
             if (forward || reverse) return; // Existing DB annotations/reviews are authoritative.
         }
         db.addEdge(txn, edge); ++inserted;
@@ -125,6 +125,7 @@ int64_t importSourceRelationships(ObjectStore& db, WriteTxn& txn, const std::vec
             auto found = collections.find({origin, id});
             if (found == collections.end()) throw std::runtime_error("winding link target not ingested: " + id);
             EdgeRecord edge; edge.kind = "collection_winding"; edge.aUuid = entry.object.uuid; edge.bUuid = found->second;
+            edge.aAnchor.wholeGeometry = true; edge.bAnchor.wholeGeometry = true;
             edge.meta = R"({"source_import":"object-source"})";
             add(std::move(edge));
         }
