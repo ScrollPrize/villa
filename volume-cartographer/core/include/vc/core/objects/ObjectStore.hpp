@@ -117,6 +117,20 @@ struct ObjectSelection {
     std::vector<std::string> uuids, edgeKinds;
     std::optional<int64_t> limit; // UUID-ordered page; absent means all matches
     int64_t offset = 0;
+    // Inclusive object AABB overlap in source XYZ (minx,miny,minz,maxx,maxy,maxz).
+    // Geometry heads determine bounds; un-ingested objects use annotated boxes.
+    // Objects with no bounds do not match. This is not an exact mesh intersection.
+    std::optional<std::array<double, 6>> bbox;
+};
+// A conservative candidate, not an exact geometry hit. start/shape index
+// vertices (excluding XYZ); adjacent surface tiles and polyline blocks share
+// their boundary vertices. Empty arrayName/start/shape denotes an external
+// object's annotated box. Bounds and revision come from the same snapshot.
+struct SpatialRegion {
+    std::string objectUuid, kind, arrayName;
+    std::optional<std::string> revisionUuid;
+    std::vector<int64_t> start, shape;
+    std::array<double, 6> bbox;
 };
 struct JsonExportOptions {
     ObjectSelection selection;
@@ -317,7 +331,15 @@ public:
                                              const std::vector<std::string>& edgeKindFilter = {},
                                              const std::atomic_bool* cancel = nullptr) const;
 
-    std::vector<ObjectRecord> selectObjects(const Txn&, const ObjectSelection& = {}) const;
+    // No fields argument loads complete records. With fields, only requested
+    // top-level fields plus uuid/kind are loaded; other C++ members stay default.
+    // An empty fields vector requests identities only.
+    std::vector<ObjectRecord> selectObjects(const Txn&, const ObjectSelection& = {},
+        const std::optional<std::vector<std::string>>& fields = std::nullopt) const;
+    // Requires selection.bbox. Same filters as selectObjects, but pagination
+    // counts regions, ordered by object UUID, array name and start indices.
+    // Managed geometry returns tiles/blocks; external objects return boxes.
+    std::vector<SpatialRegion> spatialRegions(const Txn&, const ObjectSelection&) const;
     // Metadata only, with geometry UUID/hash references; payloads stay in the store.
     std::string exportJson(const Txn&, const JsonExportOptions& = {}) const;
     void importJson(WriteTxn&, const std::string&);

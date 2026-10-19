@@ -9,10 +9,12 @@ namespace vc::objects::detail {
 class GeometryReader {
 public:
     GeometryReader(const Txn& txn, const std::string& revision, bool cacheChunks = true);
+    GeometryReader(sqlite3* db, const std::string& revision, bool cacheChunks = true);
+    const nlohmann::json& manifest() const { return manifest_; }
     std::vector<uint8_t> read(const std::string& name, int64_t offset, std::optional<int64_t> count = std::nullopt);
 
 private:
-    const Txn& txn_;
+    sqlite3* db_;
     std::array<unsigned char, 16> revision_;
     bool cacheChunks_;
     nlohmann::json manifest_;

@@ -354,13 +354,40 @@ NB_MODULE(objects, m)
         .def("select_objects", [](PyObjectStore& self, const std::optional<std::string>& kind,
             const std::optional<std::string>& tag, const std::vector<std::string>& ids,
             const std::optional<std::string>& connected, const std::vector<std::string>& edgeKinds,
-            const std::optional<int64_t>& limit, int64_t offset) {
-            vo::ObjectSelection selection{kind, tag, connected, ids, edgeKinds, limit, offset};
-            auto records = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.selectObjects(txn, selection); });
-            nb::list result; for (const auto& record : records) result.append(objectToPy(record)); return result;
+            const std::optional<int64_t>& limit, int64_t offset,
+            const std::optional<std::array<double, 6>>& bbox, const std::optional<std::vector<std::string>>& fields) {
+            vo::ObjectSelection selection{kind, tag, connected, ids, edgeKinds, limit, offset, bbox};
+            std::vector<vo::ObjectRecord> records;
+            { auto lease = self.db; self.require(); nb::gil_scoped_release release;
+              records = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.selectObjects(txn, selection, fields); }); }
+            const std::set<std::string> selected = fields ? std::set<std::string>(fields->begin(), fields->end()) : std::set<std::string>{};
+            nb::list result;
+            for (const auto& record : records) result.append(objectToPy(record, fields ? &selected : nullptr));
+            return result;
         }, nb::arg("object_kind") = std::nullopt, nb::arg("tag") = std::nullopt,
            nb::arg("object_uuids") = std::vector<std::string>{}, nb::arg("connected_to") = std::nullopt,
-           nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("limit") = std::nullopt, nb::arg("offset") = 0)
+           nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("limit") = std::nullopt, nb::arg("offset") = 0,
+           nb::arg("bbox") = std::nullopt, nb::arg("fields") = std::nullopt)
+        .def("spatial_regions", [](PyObjectStore& self, const std::array<double, 6>& bbox,
+            const std::optional<std::string>& kind, const std::optional<std::string>& tag,
+            const std::vector<std::string>& ids, const std::optional<std::string>& connected,
+            const std::vector<std::string>& edgeKinds, const std::optional<int64_t>& limit, int64_t offset) {
+            vo::ObjectSelection selection{kind, tag, connected, ids, edgeKinds, limit, offset, bbox};
+            std::vector<vo::SpatialRegion> regions;
+            { auto lease = self.db; self.require(); nb::gil_scoped_release release;
+              regions = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.spatialRegions(txn, selection); }); }
+            nb::list result;
+            for (const auto& r : regions) {
+                nb::dict row; row["object_uuid"] = r.objectUuid; row["kind"] = r.kind;
+                row["revision_uuid"] = r.revisionUuid; row["array_name"] = r.arrayName;
+                row["start"] = r.start; row["shape"] = r.shape; row["bbox"] = r.bbox;
+                result.append(row);
+            }
+            return result;
+        }, nb::arg("bbox"), nb::arg("object_kind") = std::nullopt, nb::arg("tag") = std::nullopt,
+           nb::arg("object_uuids") = std::vector<std::string>{}, nb::arg("connected_to") = std::nullopt,
+           nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("limit") = std::nullopt, nb::arg("offset") = 0,
+           "Return revision-bound surface tiles, polyline/point blocks, or external object boxes. Bounds are conservative candidates.")
         .def("export_json", [](PyObjectStore& self, const std::optional<std::string>& kind,
             const std::optional<std::string>& tag, const std::vector<std::string>& ids,
             const std::optional<std::string>& connected, const std::vector<std::string>& edgeKinds,

@@ -12,9 +12,12 @@ in `vc_object_geometry`; link detectors live in `vc_object_links`. These higher
 layers depend on the object store. The database library itself does not depend
 on CT readers or Qt. Python exposes the database and its helpers in `vc.objects`.
 
-The database uses SQLite application ID `0x56434f42`, schema version 3.
-Writable opens migrate version-2 files transactionally; read-only opens can
-inspect either version without migration. Older binaries cannot open version 3.
+The database uses SQLite application ID `0x56434f42`, schema version 5.
+Writable opens migrate version-2/3/4 files transactionally, building spatial bounds
+from current geometry. This first migration reads the current geometry payloads;
+subsequent opens reuse the persisted index. Read-only opens can inspect older
+versions without migration. Whole-object spatial queries require version 4;
+fine spatial regions require version 5. Older binaries cannot open version 5. SQLite must include its R-tree module.
 Metadata JSON exports use `vc_object_metadata` version 2. Geometry ingestion and
 relationship discovery operate on the same store. VC3D/Spiral geometry readers
 are separate consumers.
@@ -424,6 +427,48 @@ editing either copy** to establish their shared baseline.
 
 ## Metadata selection and export
 
+`select_objects(bbox=[min_x, min_y, min_z, max_x, max_y, max_z])` uses one
+persisted SQLite R-tree shared by all geometry kinds. It returns objects whose
+axis-aligned bounds overlap the query, including boundary contact. This is a
+candidate query in source XYZ coordinates, not an exact surface/line intersection.
+Use `spatial_regions` below to refine these candidates without loading full arrays.
+
+Each object has one summary entry plus entries for its current geometry regions.
+Current stored geometry determines the bounds, including point collections and
+both line/control points of fibers. Non-finite coordinates are ignored. Patch
+indexing covers the union of VC3D's validity conventions: finite points with
+X != -1 **or** Z > 0. This excludes the standard (-1,-1,-1) sentinel but preserves
+geometry accepted by either raw-surface or mapped-surface consumers. Consumers
+still apply their own validity rules during exact intersection.
+Empty/entirely invalid geometries have no entry. Before geometry is ingested,
+fiber/patch/track annotations can supply bounds. Metadata edits cannot override
+the index for stored geometry; typed detail `bbox` fields remain annotations.
+Publication, deletion, rollback, and sync maintain
+the index transactionally; readers see bounds from their transaction snapshot.
+Exact double bounds are retained and checked after R-tree candidate discovery,
+so floating-point rounding in the R-tree does not change overlap results.
+Query and annotated bounds must be finite and ordered.
+
+For lightweight records, pass `fields` to `select_objects`. UUID and kind are
+always returned; `fields=[]` selects just those identities. `fields=None`
+(the default) returns complete records. Fields are top-level object fields,
+such as `name`, `generation`, `tags`, `meta`, or the complete `track` detail.
+Unknown fields are errors. Unrequested metadata, tags, and detail tables are
+not loaded or decoded. Spatial, kind, tag, UUID and component filters intersect
+before pagination. Component selection still traverses the entire component.
+
+```python
+visible = store.select_objects(
+    bbox=[100, 200, 300, 400, 500, 310],
+    object_kind="fiber", fields=["name", "generation"], limit=100,
+)
+```
+
+C++ uses `ObjectSelection::bbox` and the optional fields argument to
+`selectObjects`. Unrequested members of its returned `ObjectRecord`s retain
+default values; callers must not upsert projected records as complete objects.
+The composite `(kind, uuid)` index also supports ordered kind-filtered pages.
+
 `select_objects` and `export_json` share filters for `object_kind`, `tag`,
 `object_uuids`, and `connected_to` (the full connected component). `edge_kinds`
 restricts component traversal and exported edges. Filters intersect. Empty UUID
@@ -446,7 +491,7 @@ pages when they need a consistent listing. Filters run in SQL before records,
 tags and typed details are loaded. Neighbour and component queries probe endpoint
 indexes without decoding full edge records.
 
-`fields` projects top-level record fields; UUIDs, kinds, edge endpoints and
+For `export_json`, `fields` projects top-level record fields; UUIDs, kinds, edge endpoints and
 geometry references are always retained. An empty list exports all metadata.
 `import_json` accepts complete metadata-only records without managed geometry.
 Projected exports are for inspection; use synchronization to transfer objects
@@ -546,3 +591,110 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_BUILD_PYTHON=build/python .venv/bin/python -
 `VC_BUILD_PYTHON` selects the built package before any installed editable copy
 loads its native libraries. Plugin autoload is disabled to avoid unrelated
 application plugins in the shared development environment.
+
+
+## Fine spatial regions
+
+`spatial_regions(bbox, object_kind=None, tag=None, object_uuids=[],
+connected_to=None, edge_kinds=[], limit=None, offset=0)` queries the same
+persisted R-tree for lightweight geometry candidates. C++ uses
+`spatialRegions(txn, ObjectSelection)` with a required `bbox`. Filters intersect
+as in `select_objects`; pagination counts **regions**, ordered by object UUID,
+array name, and array start. Several regions can belong to one object.
+
+Each result has `object_uuid`, `kind`, `revision_uuid`, `array_name`, `start`,
+`shape`, and exact double `bbox`. Start and shape exclude the XYZ axis:
+
+- Patches: up to 32×32 cells / 33×33 vertices, with `[row, column]` starts and
+  vertex counts. Every vertex contributes to the box, including interior
+  extrema; adjacent tiles share boundary vertices. Final tiles can be smaller.
+  Single-row/column patches are indexed too, but have no surface cells.
+- Fibers and tracks: up to 256 segments / 257 vertices, with `[point_index]`
+  starts and counts. Adjacent blocks share one endpoint so segments crossing a
+  boundary are covered exactly once. Fiber line and control arrays are separate.
+- Point collections: up to 256 points per block, with no overlap. The same slice
+  selects corresponding `point_ids` in the revision.
+- External objects with annotated bounds: `revision_uuid=None`, empty
+  `array_name`, `start` and `shape`. Load these through their external source.
+
+Boxes are conservative for stored vertices, unit-grid triangles (either diagonal),
+and straight polyline segments. These are **not exact hits**, nearest-point
+answers, or bounds for an interpolated spline that can overshoot its vertices.
+Higher-level decimation that connects vertices across tile boundaries needs its
+own conservative handling. A caller can perform full-resolution intersection on
+returned slices without adopting VC3D's current tiling or sampling scheme.
+
+Region descriptors bind to immutable revisions. Use their `revision_uuid` when
+loading, even if the object's head changes between query and read. Fetch array
+layout once per revision (or cache it) and batch row ranges:
+
+```python
+for tile in store.spatial_regions(view_box, object_kind="patch"):
+    if tile["revision_uuid"] is None:
+        continue  # External geometry.
+    revision = store.geometry_revision(tile["revision_uuid"])
+    layout = next(a for a in revision["arrays"] if a["name"] == tile["array_name"])
+    columns = layout["shape"][1]
+    row, col = tile["start"]
+    height, width = tile["shape"]
+    rows = store.read_geometry_ranges(
+        tile["revision_uuid"], tile["array_name"],
+        [((y * columns + col) * 12, width * 12) for y in range(row, row + height)],
+    )  # Patch coordinates are little-endian float32 XYZ.
+```
+
+The index stores geometry ranges and bounds, not payload copies, and is rebuilt
+locally during migration/sync. Publication still scans the provided coordinates,
+but unchanged regions retain their R-tree entries; only changed/new/removed
+regions modify the tree. This avoids rewriting thousands of entries for a local
+edit. Index updates and head publication share the same savepoint. Migration
+uses verified, bounded reads in row-major order. All region reads honor the
+transaction snapshot. Historical revisions retain their payloads, but only the
+current head has a spatial index.
+
+Array slices are small, but storage chunks remain 1 MiB: a tiny tile can still
+require verifying several chunks, particularly in very wide patches. This is a
+separate payload-layout/cache issue, not something finer R-tree boxes eliminate.
+
+
+### Spatial performance checks
+
+Reproduce with `scripts/benchmark_object_store_workflows.py` (build bindings
+with `ninja -C build vc_object_bindings`). The spatial workers create temporary
+stores and check returned bytes against the original arrays. For example:
+
+```sh
+.venv/bin/python scripts/benchmark_object_store_workflows.py --worker spatial --n 2049
+.venv/bin/python scripts/benchmark_object_store_workflows.py --worker spatial_wide --n 65537
+.venv/bin/python scripts/benchmark_object_store_workflows.py --worker sampling --n 1048576
+```
+
+Measured on ARM64 Linux, RelWithDebInfo (`-O2 -g -DNDEBUG`), FULL durability,
+warm cache; one warmup and three timed repetitions. Both surface paths return
+the same 33×33 vertices. Region loading reuses known array layout. These are
+public Python API measurements, not VC3D frame times. Times below are median
+[min–max] milliseconds:
+
+| Surface shape | Whole-object query + full load + slice | Region query + partial load | Chunks verified for tile |
+|---|---:|---:|---:|
+| 1025×1025 | 18.219 [18.164–19.837] | 0.597 [0.579–0.635] | 1 |
+| 2049×2049 | 75.198 [74.722–75.211] | 0.630 [0.607–0.670] | 1 |
+| 65×65,537 | 77.366 [77.227–77.376] | 20.381 [19.905–20.574] | 25 |
+
+Each tile returns 13,068 bytes. The square 2049×2049 surface has 4,096 tiles;
+the region tables, R-tree and supporting index occupy about 0.60 MB. Candidate
+queries alone take about 0.011 ms. The very wide surface demonstrates the
+remaining amplification from row-major 1 MiB chunks: the same 13 KB tile
+requires verifying about 26 MB. Tile-friendly payload layout or a verified
+chunk cache is the next target for that workload.
+
+A 1,048,576-point fiber returns a 257-point block (6,168 bytes) in about
+0.57 ms including query/load, versus 31.3 ms for its full 24 MiB array.
+A 50,000-object catalog retains approximately 0.017 ms kind-filtered projected
+viewport queries. The 129×129 TIFF fixture also passes region/partial-read checks.
+
+Local index maintenance updates only changed boxes, but `put_geometry` still
+accepts, copies, hashes and scans the complete supplied arrays. A single-coordinate
+edit in the roughly 50 MB surface takes about 131 ms in this benchmark (including
+Python construction of the replacement payload). Finer indexing does not yet
+provide a partial geometry edit API or eliminate that full-array work.

@@ -1,4 +1,12 @@
 """Explicit caller decisions used in object-store tests."""
+def remove_spatial_schema(sql):
+    """Restore the pre-v4 schema for migration fixtures, including its indexes."""
+    sql.execute("DROP TABLE object_bounds")  # Also drops its maintenance triggers.
+    sql.execute("DROP TABLE spatial_regions")
+    sql.execute("DROP TABLE spatial_regions_rtree")
+    sql.execute("DROP INDEX objects_kind_uuid")
+
+
 def edge_choice(db, edge_uuid, action, **anchors):
     edge = db.edge(edge_uuid)
     revisions = [db.current_geometry(edge[side]) for side in ("a", "b")]

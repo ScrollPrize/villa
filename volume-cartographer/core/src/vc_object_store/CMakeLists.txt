@@ -6,6 +6,7 @@ add_library(vc_objects STATIC
     Metadata.cpp
     SourcePaths.cpp
     Snapshots.cpp
+    Spatial.cpp
     sync/Synchronize.cpp
     sync/GeometryTransfer.cpp
     geometry/Geometry.cpp

@@ -49,6 +49,7 @@ void applyHeadsAndEdges(ObjectStore& store, WriteTxn& txn, const Json& before, c
         if (head(record) != nullptr) {
             Statement put(db, "INSERT INTO geometry_heads VALUES(?,?) ON CONFLICT(object_uuid) DO UPDATE SET revision_uuid=excluded.revision_uuid");
             put.bindBlob(1, parseUuid(id)); put.bindBlob(2, parseUuid(head(record).get<std::string>())); put.stepDone();
+            if (head(record) != head(at(before, id))) detail::refreshGeometryBounds(db, id);
         }
         Statement storage(db, "UPDATE objects SET storage_kind=?,storage_ref=?,data_generation=?,data_checksum=? WHERE uuid=?");
         storage.bind(1, record.at("storage_kind").get<std::string>()); storage.bind(2, record.at("storage_ref").get<std::string>());

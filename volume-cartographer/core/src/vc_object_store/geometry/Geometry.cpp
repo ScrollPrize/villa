@@ -5,9 +5,12 @@
 namespace vc::objects {
 namespace detail {
 GeometryReader::GeometryReader(const Txn& txn, const std::string& revision, bool cacheChunks)
-    : txn_(txn), revision_(parseUuid(revision)), cacheChunks_(cacheChunks)
+    : GeometryReader(ObjectStoreImplAccess::conn(txn), revision, cacheChunks) {}
+
+GeometryReader::GeometryReader(sqlite3* db, const std::string& revision, bool cacheChunks)
+    : db_(db), revision_(parseUuid(revision)), cacheChunks_(cacheChunks)
 {
-    Statement row(ObjectStoreImplAccess::conn(txn_), "SELECT content_hash,manifest FROM geometry_revisions WHERE uuid=?");
+    Statement row(db_, "SELECT content_hash,manifest FROM geometry_revisions WHERE uuid=?");
     row.bindBlob(1, revision_);
     if (!row.row()) throw std::invalid_argument("geometry: revision not found");
     const auto text = row.text(1);
@@ -18,7 +21,7 @@ GeometryReader::GeometryReader(const Txn& txn, const std::string& revision, bool
 
 std::vector<uint8_t> GeometryReader::read(const std::string& name, int64_t offset, std::optional<int64_t> count)
 {
-    auto* db = ObjectStoreImplAccess::conn(txn_);
+    auto* db = db_;
     const auto& arrays = manifest_.at("arrays");
     if (!arrays.contains(name)) throw std::invalid_argument("geometry: array not found: " + name);
     const auto& array = arrays.at(name);
@@ -221,6 +224,7 @@ std::string ObjectStore::putGeometry(WriteTxn& txn, const std::string& objectUui
         Statement head(db, "INSERT INTO geometry_heads VALUES(?,?) ON CONFLICT(object_uuid) DO UPDATE SET revision_uuid=excluded.revision_uuid");
         head.bindBlob(1, parseUuid(objectUuid)); head.bindBlob(2, parseUuid(revisionUuid)); head.stepDone();
         const auto id = *objectIdByUuid(db, parseUuid(objectUuid));
+        detail::indexGeometryBounds(db, id, revisionUuid, data);
         stampContentChange(db, author(), hostname(), "objects", id, parseUuid(objectUuid), "geometry");
         Statement update(db, "UPDATE objects SET storage_kind='sqlite',data_generation=generation,data_checksum=? WHERE id=?");
         update.bind(1, contentHash); update.bind(2, id); update.stepDone();

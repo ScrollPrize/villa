@@ -1,11 +1,38 @@
 #pragma once
 #include "internal/Database.hpp"
+#include "internal/Spatial.hpp"
 
 namespace vc::objects { namespace {
 const char* kObjectCols =
     "id,uuid,kind,name,generation,created_by,created_at,created_host,changed_by,changed_at,changed_host,"
     "approval_state,approved_by,approved_at,approved_host,approved_generation,format_version,storage_kind,"
     "storage_ref,data_generation,data_checksum,meta";
+
+using ObjectFields = std::optional<std::set<std::string>>;
+bool wants(const ObjectFields& fields, const std::string& name) {
+    return !fields || fields->contains(name) || name == "uuid" || name == "kind";
+}
+std::string projectedObjectColumns(const ObjectFields& fields)
+{
+    if (!fields) return kObjectCols;
+    const std::vector<std::pair<std::string, std::string>> columns{
+        {"uuid", "NULL"}, {"kind", "''"}, {"name", "''"}, {"generation", "0"},
+        {"created_by", "''"}, {"created_at", "''"}, {"created_host", "''"},
+        {"changed_by", "''"}, {"changed_at", "''"}, {"changed_host", "''"},
+        {"approval_state", "''"}, {"approved_by", "NULL"}, {"approved_at", "NULL"},
+        {"approved_host", "NULL"}, {"approved_generation", "NULL"}, {"format_version", "0"},
+        {"storage_kind", "''"}, {"storage_ref", "''"}, {"data_generation", "0"},
+        {"data_checksum", "NULL"}, {"meta", "'{}'"}};
+    std::set<std::string> valid{"tags", "fiber", "patch", "track"};
+    std::string sql = "id";
+    for (const auto& [name, fallback] : columns) {
+        valid.insert(name);
+        sql += "," + (wants(fields, name) ? name : fallback);
+    }
+    for (const auto& field : *fields)
+        if (!valid.contains(field)) throw std::invalid_argument("unknown object projection field: " + field);
+    return sql;
+}
 
 void appendJournal(sqlite3* db, const std::string& author, const std::string& hostname,
                    const std::array<unsigned char, 16>& uuid, int64_t generation, const char* changeKind)
@@ -148,35 +175,39 @@ ObjectRecord readObjectRow(sqlite3* db, const Statement& s, bool details = true)
     return rec;
 }
 
-std::vector<ObjectRecord> readObjectRows(sqlite3* db, Statement& rows)
+std::vector<ObjectRecord> readObjectRows(sqlite3* db, Statement& rows, const ObjectFields& fields = std::nullopt)
 {
+    const bool hydrate = wants(fields, "tags") || wants(fields, "fiber") || wants(fields, "patch") || wants(fields, "track");
     std::vector<ObjectRecord> result;
     nlohmann::json ids = nlohmann::json::array();
     std::unordered_map<int64_t, size_t> positions;
     std::set<std::string> kinds;
     while (rows.row()) {
-        positions.emplace(rows.i64(0), result.size()); ids.push_back(rows.i64(0));
-        result.push_back(readObjectRow(db, rows, false)); kinds.insert(result.back().kind);
+        if (hydrate) { positions.emplace(rows.i64(0), result.size()); ids.push_back(rows.i64(0)); }
+        result.push_back(readObjectRow(db, rows, false));
+        if (hydrate) kinds.insert(result.back().kind);
     }
-    if (result.empty()) return result;
+    if (result.empty() || !hydrate) return result;
     const auto selection = ids.dump();
-    Statement tags(db, "SELECT object_id,tag FROM object_tags WHERE object_id IN (SELECT value FROM json_each(?)) ORDER BY object_id,tag");
-    tags.bind(1, selection);
-    while (tags.row()) result.at(positions.at(tags.i64(0))).tags.push_back(tags.text(1));
-    if (kinds.contains("fiber")) {
+    if (wants(fields, "tags")) {
+        Statement tags(db, "SELECT object_id,tag FROM object_tags WHERE object_id IN (SELECT value FROM json_each(?)) ORDER BY object_id,tag");
+        tags.bind(1, selection);
+        while (tags.row()) result.at(positions.at(tags.i64(0))).tags.push_back(tags.text(1));
+    }
+    if (kinds.contains("fiber") && wants(fields, "fiber")) {
         Statement detail(db, "SELECT family,manual_family,control_point_count,line_point_count,length,width,"
                         "width_gap_fraction,optimization_mode,bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z "
                         " ,object_id FROM fibers WHERE object_id IN (SELECT value FROM json_each(?))");
         detail.bind(1, selection);
         while (detail.row()) result.at(positions.at(detail.i64(14))).fiber = readFiberDetail(detail);
     }
-    if (kinds.contains("patch")) {
+    if (kinds.contains("patch") && wants(fields, "patch")) {
         Statement detail(db, "SELECT grid_width,grid_height,scale,scale_y,bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z "
                         " ,object_id FROM patches WHERE object_id IN (SELECT value FROM json_each(?))");
         detail.bind(1, selection);
         while (detail.row()) result.at(positions.at(detail.i64(10))).patch = readPatchDetail(detail);
     }
-    if (kinds.contains("track")) {
+    if (kinds.contains("track") && wants(fields, "track")) {
         Statement detail(db, "SELECT dataset_ref,external_key,family,point_count,length,bbox_min_x,bbox_min_y,bbox_min_z,"
                         "bbox_max_x,bbox_max_y,bbox_max_z  ,object_id FROM tracks WHERE object_id IN (SELECT value FROM json_each(?))");
         detail.bind(1, selection);
@@ -283,13 +314,16 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
     if (rec.meta.empty())
         rec.meta = "{}";
     const auto uuid = parseUuid(rec.uuid);
+    const auto bounds = detail::recordBounds(rec);
+    if (bounds) detail::validateBounds(*bounds);
     Statement collision(db, "SELECT 1 FROM edges WHERE uuid=?");
     collision.bindBlob(1, uuid);
     if (collision.row()) throw std::runtime_error("object store: UUID already belongs to an edge");
     const std::string now = nowIsoUtc();
     Statement managed(db, "SELECT o.data_generation,o.data_checksum,o.storage_ref FROM objects o JOIN geometry_heads h ON h.object_uuid=o.uuid WHERE o.uuid=?");
     managed.bindBlob(1, uuid);
-    if (managed.row()) {
+    const bool hasGeometry = managed.row();
+    if (hasGeometry) {
         rec.storageKind = "sqlite";
         rec.storageRef = managed.text(2);
         rec.dataGeneration = managed.i64(0);
@@ -336,6 +370,7 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
         id = sqlite3_last_insert_rowid(db);
     }
     writeObjectDetail(db, id, rec);
+    if (!hasGeometry) detail::setSpatialBounds(db, id, bounds);
     writeTags(db, "object_tags", "object_id", id, rec.tags);
     if (preserveRecord) restoreCommon(db, "objects", rec);
     appendJournal(db, author, host, uuid, preserveRecord ? rec.generation : generation, preserveRecord ? importOperation : "upsert");

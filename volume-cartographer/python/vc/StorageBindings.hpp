@@ -1,3 +1,4 @@
+#include <set>
 #pragma once
 #include <algorithm>
 #include <optional>
@@ -123,39 +124,43 @@ nb::dict anchorToPy(const vo::Anchor& a)
 
 nb::str pyStr(const std::string& s) { return nb::str(s.data(), s.size()); }
 
-void commonToPy(nb::dict& d, const vo::RecordCommon& r)
+void commonToPy(nb::dict& d, const vo::RecordCommon& r, const std::set<std::string>* fields = nullptr)
 {
+    auto include = [&](const char* name) { return !fields || fields->contains(name); };
     d["uuid"] = r.uuid;
     d["kind"] = r.kind;
-    d["generation"] = r.generation;
-    d["created_by"] = r.createdBy;
-    d["created_at"] = r.createdAt;
-    d["created_host"] = r.createdHost;
-    d["changed_by"] = r.changedBy;
-    d["changed_at"] = r.changedAt;
-    d["changed_host"] = r.changedHost;
-    d["approval_state"] = r.approvalState;
-    d["approved_by"] = r.approvedBy ? nb::object(pyStr(*r.approvedBy)) : nb::none();
-    d["approved_at"] = r.approvedAt ? nb::object(pyStr(*r.approvedAt)) : nb::none();
-    d["approved_host"] = r.approvedHost ? nb::object(pyStr(*r.approvedHost)) : nb::none();
-    d["approved_generation"] = r.approvedGeneration ? nb::object(nb::int_(*r.approvedGeneration)) : nb::none();
-    nb::list tags;
-    for (const auto& t : r.tags) tags.append(pyStr(t));
-    d["tags"] = tags;
-    d["meta"] = jsonLoads(r.meta);
+    if (include("generation")) d["generation"] = r.generation;
+    if (include("created_by")) d["created_by"] = r.createdBy;
+    if (include("created_at")) d["created_at"] = r.createdAt;
+    if (include("created_host")) d["created_host"] = r.createdHost;
+    if (include("changed_by")) d["changed_by"] = r.changedBy;
+    if (include("changed_at")) d["changed_at"] = r.changedAt;
+    if (include("changed_host")) d["changed_host"] = r.changedHost;
+    if (include("approval_state")) d["approval_state"] = r.approvalState;
+    if (include("approved_by")) d["approved_by"] = r.approvedBy ? nb::object(pyStr(*r.approvedBy)) : nb::none();
+    if (include("approved_at")) d["approved_at"] = r.approvedAt ? nb::object(pyStr(*r.approvedAt)) : nb::none();
+    if (include("approved_host")) d["approved_host"] = r.approvedHost ? nb::object(pyStr(*r.approvedHost)) : nb::none();
+    if (include("approved_generation")) d["approved_generation"] = r.approvedGeneration ? nb::object(nb::int_(*r.approvedGeneration)) : nb::none();
+    if (include("tags")) {
+        nb::list tags;
+        for (const auto& t : r.tags) tags.append(pyStr(t));
+        d["tags"] = tags;
+    }
+    if (include("meta")) d["meta"] = jsonLoads(r.meta);
 }
 
-nb::dict objectToPy(const vo::ObjectRecord& r)
+nb::dict objectToPy(const vo::ObjectRecord& r, const std::set<std::string>* fields = nullptr)
 {
+    auto include = [&](const char* name) { return !fields || fields->contains(name); };
     nb::dict d;
-    commonToPy(d, r);
-    d["name"] = r.name;
-    d["format_version"] = r.formatVersion;
-    d["storage_kind"] = r.storageKind;
-    d["storage_ref"] = r.storageRef;
-    d["data_generation"] = r.dataGeneration;
-    d["data_checksum"] = r.dataChecksum ? nb::object(pyStr(*r.dataChecksum)) : nb::none();
-    if (r.fiber) {
+    commonToPy(d, r, fields);
+    if (include("name")) d["name"] = r.name;
+    if (include("format_version")) d["format_version"] = r.formatVersion;
+    if (include("storage_kind")) d["storage_kind"] = r.storageKind;
+    if (include("storage_ref")) d["storage_ref"] = r.storageRef;
+    if (include("data_generation")) d["data_generation"] = r.dataGeneration;
+    if (include("data_checksum")) d["data_checksum"] = r.dataChecksum ? nb::object(pyStr(*r.dataChecksum)) : nb::none();
+    if (r.fiber && include("fiber")) {
         nb::dict f;
         f["family"] = r.fiber->family;
         f["manual_family"] = r.fiber->manualFamily;
@@ -168,7 +173,7 @@ nb::dict objectToPy(const vo::ObjectRecord& r)
         f["bbox"] = bboxToPy(r.fiber->bbox);
         d["fiber"] = f;
     }
-    if (r.patch) {
+    if (r.patch && include("patch")) {
         nb::dict p;
         p["grid_width"] = r.patch->gridWidth;
         p["grid_height"] = r.patch->gridHeight;
@@ -176,7 +181,7 @@ nb::dict objectToPy(const vo::ObjectRecord& r)
         p["bbox"] = bboxToPy(r.patch->bbox);
         d["patch"] = p;
     }
-    if (r.track) {
+    if (r.track && include("track")) {
         nb::dict t;
         t["dataset_ref"] = r.track->datasetRef;
         t["external_key"] = r.track->externalKey;

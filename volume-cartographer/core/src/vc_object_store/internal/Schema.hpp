@@ -1,5 +1,6 @@
 #pragma once
 #include "internal/Database.hpp"
+#include "internal/Spatial.hpp"
 namespace vc::objects { namespace {
 const char* kObjectSchema = R"SQL(CREATE TABLE objects(
   id INTEGER PRIMARY KEY,
@@ -159,6 +160,7 @@ void createSchema(sqlite3* db) {
     exec(db, kEdgeGeometrySchema);
     exec(db, kObjectGeometrySchema);
     createSyncSchema(db);
+    detail::createSpatialSchema(db);
     exec(db, "CREATE TABLE store_identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1), uuid BLOB NOT NULL UNIQUE CHECK(length(uuid)=16));");
     Statement id(db, "INSERT INTO store_identity VALUES(1,?)");
     id.bindBlob(1, parseUuid(util::newUuid())); id.stepDone();

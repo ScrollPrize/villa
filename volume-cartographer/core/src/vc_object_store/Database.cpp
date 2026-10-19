@@ -9,7 +9,7 @@ ObjectStore& ObjectStore::operator=(ObjectStore&&) noexcept = default;
 std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::path& path, const OpenOptions& options, bool create)
 {
     const int kApplicationId = 0x56434f42;
-    const int kSchemaVersion = 3;
+    const int kSchemaVersion = 5;
     if (create && options.readOnly) throw std::invalid_argument("create requires writable options");
     if (sqlite3_threadsafe() == 0)
         throw std::runtime_error("object store: SQLite build is not thread-safe");
@@ -47,9 +47,9 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
             if (pragmaInt(impl->writer, "application_id") != kApplicationId)
                 throw std::runtime_error("object store: unsupported database format: " + path.string());
             const auto version = pragmaInt(impl->writer, "user_version");
-            if (version != 2 && version != kSchemaVersion)
+            if (version < 2 || version > kSchemaVersion)
                 throw std::runtime_error("object store: unsupported database schema");
-            if (version == 2) {
+            if (version < kSchemaVersion) {
                 exec(impl->writer, "BEGIN IMMEDIATE;");
                 try {
                     // Recheck after acquiring the writer lock: another handle
@@ -57,6 +57,15 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
                     if (pragmaInt(impl->writer, "user_version") == 2) {
                         exec(impl->writer, kIncrementalSyncSchema);
                         exec(impl->writer, "PRAGMA user_version=3;");
+                    }
+                    if (pragmaInt(impl->writer, "user_version") == 3) {
+                        detail::createSpatialSchema(impl->writer);
+                        detail::backfillSpatialBounds(impl->writer);
+                        exec(impl->writer, "PRAGMA user_version=5;");
+                    }
+                    if (pragmaInt(impl->writer, "user_version") == 4) {
+                        detail::migrateSpatialRegions(impl->writer);
+                        exec(impl->writer, "PRAGMA user_version=5;");
                     }
                     exec(impl->writer, "COMMIT;");
                 } catch (...) { exec(impl->writer, "ROLLBACK;"); throw; }
@@ -78,7 +87,7 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
             if (pragmaInt(conn, "application_id") != kApplicationId)
                 throw std::runtime_error("object store: unsupported database format: " + path.string());
             const auto version = pragmaInt(conn, "user_version");
-            if (version != 2 && version != kSchemaVersion)
+            if (version < 2 || version > kSchemaVersion)
                 throw std::runtime_error("object store: unsupported database schema: " + path.string());
         }
     }

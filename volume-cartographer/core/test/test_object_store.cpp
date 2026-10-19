@@ -110,6 +110,25 @@ TEST_CASE("geometry revisions preserve read snapshots and reject foreign transac
     CHECK(db.readGeometryArray(current, first, "points")[0] == 0);
     CHECK(db.readGeometryArray(current, second, "points")[0] == 3);
     CHECK(db.geometryHistory(current, id).size() == 2);
+    ObjectSelection atOrigin;
+    atOrigin.bbox = std::array<double, 6>{0, 0, 0, 0, 0, 0};
+    const auto projected = db.selectObjects(snapshot, atOrigin, std::vector<std::string>{"generation"});
+    REQUIRE(projected.size() == 1);
+    CHECK(projected.front().uuid == id);
+    CHECK(projected.front().generation == db.objectByUuid(snapshot, id)->generation);
+    CHECK(projected.front().meta == "{}");
+    CHECK_FALSE(projected.front().track);
+    CHECK(db.selectObjects(current, atOrigin).empty());
+    const auto regions = db.spatialRegions(snapshot, atOrigin);
+    REQUIRE(regions.size() == 1);
+    CHECK(regions.front().objectUuid == id);
+    CHECK(regions.front().revisionUuid == first);
+    CHECK(regions.front().start == std::vector<int64_t>{0});
+    CHECK(regions.front().shape == std::vector<int64_t>{1});
+    CHECK(db.spatialRegions(current, atOrigin).empty());
+    CHECK_THROWS_AS(db.spatialRegions(current, {}), std::invalid_argument);
+    auto foreign = other.read();
+    CHECK_THROWS(db.spatialRegions(foreign, atOrigin));
 }
 
 TEST_CASE("object store serializes independent writer transactions")
