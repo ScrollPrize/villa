@@ -174,6 +174,7 @@ def main():
     original_next = train.DecisionBatchPrefetch.__next__
     original_update = train.optimizer_update
     pending = {}
+    optimizer_step_devices = {}
 
     def next_batches(prefetch):
         if args.profile_batches and len(records) == args.warmup:
@@ -212,6 +213,11 @@ def main():
         return batches
 
     def update(*pos, **kw):
+        if not records:
+            for state in pos[2].state.values():
+                if 'step' in state:
+                    device = str(state['step'].device)
+                    optimizer_step_devices[device] = optimizer_step_devices.get(device, 0) + 1
         started = time.perf_counter()
         with span('model.update'):
             metrics = original_update(*pos, **kw)
@@ -268,7 +274,12 @@ def main():
     measured = [r for r in records if r['measured']]
     if len(measured) != args.steps:
         raise RuntimeError('Trainer ended without completing the requested measurements')
+    from vesuvius.neural_tracing.tracers.fibers.train import step as training_step
+    trainer_source = Path(training_step.__file__).resolve()
     report = dict(backend=args.backend, heading=args.heading, geometry=args.geometry,
+                  trainer_step=dict(path=str(trainer_source),
+                                    sha256=hashlib.sha256(trainer_source.read_bytes()).hexdigest()),
+                  optimizer_step_devices=optimizer_step_devices,
                   geometry_placement=args.geometry_placement if geometry is not None else None,
                   validate_geometry=args.validate_geometry, checkpoint=str(args.checkpoint),
                   command=[sys.executable, *sys.argv],

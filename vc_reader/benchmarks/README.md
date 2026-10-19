@@ -2367,7 +2367,10 @@ PYTHONPATH=src VC_READER_NATIVE_DIR=/tmp/vc-reader-native-batch-build \
 
 ### Fiber trainer geometry integration
 
-**Current 500-batch results (2026-10-19, RTX 5090):** two sequential runs per
+For the subsequent AdamW counter-placement fix and measurements, see
+[the optimizer resume results](#fiber-trainer-adamw-resume).
+
+**Geometry comparison (2026-10-19, RTX 5090):** two sequential runs per
 configuration, using the same final native/Python build. Both use CUDA CT
 sampling, tensor heading on a separate stream, batched augmentation, shared
 chunk caches, lookahead **0**, 20 warmup batches, batch **32**, and **one
@@ -2511,3 +2514,89 @@ Using `TRAIN_PY`, `FIBER_CHECKPOINT`, and `VC_SITE` from the setup above:
 For the paired baseline, use `--geometry existing` and a different, unused
 output directory. Keep `--backend vc-reader`: this comparison isolates geometry
 while retaining the same CUDA images, augmentation and heading.
+
+### Fiber trainer AdamW resume
+
+The trainer in this branch (`../vesuvius/src/vesuvius/neural_tracing/tracers/fibers/train/step.py`)
+now restores AdamW step counters to CPU when a resumed parameter group is
+neither fused nor capturable. Its moment tensors stay on the parameter device.
+Memory-format restoration excludes step counters, including those belonging
+to scalar parameters. Fused/capturable groups retain their device counters.
+The trainer's default remote lookahead is also **0** in this branch.
+
+The checkpoint is loaded onto CUDA, so without this correction PyTorch's
+non-capturable AdamW path downloads each step twice for bias correction. This
+checkpoint has 168 states: **336 counter downloads per update**. The correction
+runs once during resume; it preserves counter values, moments, and the learning
+rate schedule. Both new benchmark reports verify **168 CPU step tensors**.
+
+Two new runs use this branch's trainer source, the same checkpoint and all five
+sources, CUDA images/augmentation/heading/geometry, shared caches, separate
+heading and geometry streams, lookahead 0, batch 32, one update per batch,
+20 warmup batches and **500 measured batches**. Reader/augmentation binaries,
+library Python code, and data adapters match the preceding geometry runs.
+The harness additionally records the trainer source path/hash and counter
+placements. The previous comparison used the villa4 trainer checkout; its
+trainer Python sources match this branch except for the resume correction
+and the default lookahead, which was explicitly overridden to 0 in every run.
+
+| Run | Total wall | Model/optimizer | Image preparation | Loader wait |
+| --- | ---: | ---: | ---: | ---: |
+| Previous CUDA pipeline, mean of two runs | 48.359 s | 37.280 s | 9.824 s | 0.589 s |
+| CPU counters, this branch, run 1 | 52.138 s | 36.318 s | 13.931 s | 1.140 s |
+| CPU counters, this branch, run 2 | 48.868 s | 35.437 s | 11.063 s | 1.699 s |
+| CPU counters, this branch, mean | **50.503 s** | **35.877 s** | **12.497 s** | **1.419 s** |
+
+The update interval decreased by 1.402 s (3.8%), but these runs **do not show
+an overall throughput improvement**: image preparation and loader waits took
+longer. Do not attribute those changes to the counter fix without a controlled
+follow-up. Sampling remains adaptive, so crop positions differ across runs.
+Each run used 16,000 crops with matching source allocations; the new runs had
+15,510 / 15,526 distinct positions and 36,355 / 36,506 source-chunk footprints.
+Batch p50/p95 were 98.258/120.191 ms and 93.246/109.757 ms. Background geometry
+is overlapped and excluded from this additive stage comparison.
+
+Reports: `results/fiber_optimizer_branch_500/summary.json`,
+`results/fiber_optimizer_branch_repeat_500/summary.json`, and
+`results/fiber_optimizer_comparison.json`. An earlier run of the same fix in
+the villa4 checkout (`results/fiber_optimizer_cpu_steps_500/summary.json`)
+measured 47.575 s wall / 36.329 s updates; it is **excluded** from the two-run
+branch average above.
+
+Run the trainer source in this branch while reusing the existing dependencies:
+
+```bash
+export PYTHONPATH="$(realpath ../vesuvius/src)"
+"$TRAIN_PY" benchmarks/bench_fiber_trainer.py \
+  --checkpoint "$FIBER_CHECKPOINT" --output benchmarks/results/fiber_optimizer_new_run \
+  --backend vc-reader --heading tensor --heading-stream separate \
+  --geometry vc-reader --geometry-placement prefetch \
+  --steps 500 --warmup 20 --grad-steps 1 --lookahead 0 \
+  --cuda-augmentation batch --cuda-cache shared --timing-sync stream --timeline \
+  --vc-site-packages "$VC_SITE"
+
+AGENTS_AGENT_MODE=1 NUMBA_CACHE_DIR=/tmp/fiber_optimizer_branch_numba \
+  "$TRAIN_PY" -m pytest \
+  ../vesuvius/src/vesuvius/neural_tracing/tracers/fibers/tests/test_optimizer_resume.py \
+  ../vesuvius/src/vesuvius/neural_tracing/tracers/fibers/tests/test_regression.py \
+  -k 'optimizer_resume or checkpoint_resume_and_init_weights' -q
+```
+
+Validation: **10 passed, 1 skipped** (capturable AdamW on CPU is unsupported).
+The new tests load checkpoints onto CPU/CUDA and check exact subsequent weights
+and moments, step increments, scalar parameters, unused parameters, changed
+convolution memory format, and default/foreach/single/fused/capturable AdamW.
+The existing model checkpoint/RNG resume regression also passes.
+
+A separate 100-batch Nsight run from this branch confirms the mechanism:
+four-byte device-to-host copies inside `model.update` fell from **337 to 1 per
+batch**, removing all **336 AdamW counter downloads**. It recorded **zero
+`cudaDeviceSynchronize` calls**. The remaining scalar download is not attributed
+here. Geometry still downloads only 128-byte component counts per batch; CT
+crops stay on CUDA. See `results/fiber_optimizer_branch_trace/transfer_audit.json`
+and `gpu_trace.nsys-rep`; profiler timings are excluded from the table above.
+Capture with `nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none
+--resolve-symbols=false --capture-range=cudaProfilerApi --capture-range-end=stop
+--cuda-graph-trace=node --output=/tmp/fiber_optimizer_new_trace` before the
+benchmark command, replacing `--steps 500` with `--steps 100 --profile-batches 100`
+and choosing a new output directory.

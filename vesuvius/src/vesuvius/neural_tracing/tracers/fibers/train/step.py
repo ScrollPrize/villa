@@ -91,7 +91,7 @@ def match_optimizer_layout(opt):
     """Resumed moment estimates take their parameter's memory format."""
     for param, state in opt.state.items():
         for key, value in state.items():
-            if torch.is_tensor(value) and value.shape == param.shape:
+            if key != 'step' and torch.is_tensor(value) and value.shape == param.shape:
                 state[key] = torch.empty_like(param).copy_(value)
 
 
@@ -307,6 +307,15 @@ def resume_training(ck, model, ema, opt, *, reset_optimizer=False):
     ema.load_state_dict(ck['ema'])
     if not reset_optimizer:
         opt.load_state_dict(ck['optimizer'])
+        # Non-capturable, non-fused AdamW computes bias corrections on the CPU.
+        # Loading a checkpoint onto CUDA also moves its counters there; restore
+        # their host placement once, avoiding scalar downloads on every update.
+        for group in opt.param_groups:
+            if not (group.get('capturable') or group.get('fused')):
+                for param in group['params']:
+                    state = opt.state.get(param, {})
+                    if 'step' in state:
+                        state['step'] = state['step'].cpu()
     if 'rng' in ck:
         restore_training_rng(ck['rng'])
     return int(ck['step'])
