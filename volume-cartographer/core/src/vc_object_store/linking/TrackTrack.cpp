@@ -1,7 +1,7 @@
 #include "vc/core/object_links/ObjectLinks.hpp"
-#include "vc/core/util/PackedTrackStore.hpp"
 #include "vc/core/util/TrackCrossings.hpp"
-#include "linking/TrackInput.hpp"
+#include "linking/StoredGeometry.hpp"
+#include "formats/TrackInput.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -30,62 +30,36 @@ DetectorReport linkTracksToTracks(objects::ObjectStore& db, const TrackTrackPara
     if (params.workers < 1 || params.edgeKind.empty())
         throw std::invalid_argument("track linking requires positive workers and a nonempty edge kind");
 
-    if (params.tracksPath.empty() && !params.sourceIds.empty())
-        throw std::invalid_argument("source_ids requires a tracks DBM or packed directory");
-    if (!params.tracksPath.empty() && !params.datasetRef.empty())
-        throw std::invalid_argument("use tracksPath or datasetRef, not both");
     const auto& progressCallback = params.progress;
     util::reportProgress(progressCallback, "loading track registrations");
     DetectorReport report;
-    std::vector<size_t> registrations;
-    std::string registrationDataset;
     std::vector<LinkCandidate> candidates;
     StaleEdgeScope scope{{params.edgeKind}, {}};
     try {
         checkCancelled(cancel);
         std::map<std::string, std::vector<objects::ObjectRecord>> datasets;
-        const auto requested = detail::requestedTrackUuids(params.trackUuids);
-        std::vector<objects::ObjectRecord> registered;
-        if (params.tracksPath.empty()) {
-            auto read = db.read();
-            registered = db.objectsByKind(read, "track");
-        }
-        if (!params.tracksPath.empty()) {
-            auto input = detail::loadTrackInput(db, params.tracksPath, params.sourceIds, params.trackUuids, cancel, params.progress);
-            registrationDataset = input.datasetRef;
-            registrations = std::move(input.registrations);
-            report.objectsConsidered = static_cast<int64_t>(input.objects.size());
-            datasets[input.datasetRef] = std::move(input.objects);
-        } else {
-            for (auto& object : registered) {
-                if (!requested.empty() && !requested.contains(object.uuid)) continue;
-                if (!params.datasetRef.empty()
-                    && (!object.track || object.track->datasetRef != params.datasetRef)) continue;
-                ++report.objectsConsidered;
-                if (!object.track || object.track->datasetRef.empty())
-                    throw std::runtime_error("track has no dataset_ref: " + object.uuid);
-                datasets[object.track->datasetRef].push_back(std::move(object));
+        detail::StoredGeometry inputs(db);
+        for (auto& object : inputs.select("track", params.trackUuids)) {
+            if (!params.datasetRef.empty() && (!object.track || object.track->datasetRef != params.datasetRef)) {
+                if (!params.trackUuids.empty()) throw std::runtime_error("selected track is outside dataset_ref");
+                continue;
             }
+            ++report.objectsConsidered;
+            if (!object.track || object.track->datasetRef.empty())
+                throw std::runtime_error("track has no dataset_ref: " + object.uuid);
+            datasets[object.track->datasetRef].push_back(std::move(object));
         }
-        std::vector<objects::ObjectRecord>().swap(registered);
-        if (!requested.empty() && static_cast<size_t>(report.objectsConsidered) != requested.size())
-            throw std::runtime_error("some requested track UUIDs were not found in the selected dataset");
         if (!params.datasetRef.empty() && datasets.empty())
             throw std::runtime_error("no registered tracks for dataset_ref: " + params.datasetRef);
 
         for (auto& [dataset, objects] : datasets) {
             checkCancelled(cancel);
-            const std::filesystem::path path(dataset);
-            const auto resolved = path.is_absolute() ? path : db.path().parent_path() / path;
-            util::reportProgress(progressCallback, "opening track geometry", 0, 0, dataset);
-            PackedTrackStore store(resolved);
             std::map<uint64_t, objects::ObjectRecord*> byId;
             for (auto& object : objects) {
-                const auto id = detail::trackSourceId(object.track->externalKey);
+                const auto id = objects::detail::trackSourceId(object.track->externalKey);
                 if (!byId.emplace(id, &object).second)
                     throw std::runtime_error("duplicate registered track source ID");
             }
-            const bool wholeStore = byId.size() == store.sourceIds().size();
             std::vector<int32_t> coordinateBuffer;
             std::vector<int64_t> offsets{0};
             std::vector<uint64_t> sourceIds;
@@ -95,26 +69,30 @@ DetectorReport linkTracksToTracks(objects::ObjectStore& db, const TrackTrackPara
             for (const auto& [id, object] : byId) {
                 util::reportProgress(progressCallback, "loading track geometry", loaded++, byId.size());
                 checkCancelled(cancel);
-                const auto row = detail::trackRow(store, *object);
-                object->track->length = detail::trackPolylineLength(store, row, cancel);
-                object->track->family = detail::trackFamily(store, row);
-                const int64_t begin = store.offsets()[row], end = store.offsets()[row+1];
-                const int8_t family = store.families()[row];
-                if (end - begin > std::numeric_limits<int32_t>::max()
-                    || uint64_t(offsets.back()) + uint64_t(end - begin) > std::numeric_limits<uint32_t>::max())
+                const auto geometry = inputs.load(*object);
+                const auto xyz = geometry.values<int32_t>("points");
+                const auto familyName = nlohmann::json::parse(geometry.revision.attributes).value("family", std::string());
+                if (!familyName.empty() && familyName != "horizontal" && familyName != "vertical")
+                    throw std::runtime_error("invalid stored track family");
+                const int8_t family = familyName == "horizontal" ? 0 : familyName == "vertical" ? 1 : -1;
+                const auto count = xyz.size() / 3;
+                if (count > std::numeric_limits<int32_t>::max()
+                    || uint64_t(offsets.back()) + count > std::numeric_limits<uint32_t>::max())
                     throw std::runtime_error("selected tracks exceed crossing kernel index limits");
-                if (!wholeStore && end != begin)
-                    coordinateBuffer.insert(coordinateBuffer.end(), store.coordinates().begin() + begin * 3,
-                                       store.coordinates().begin() + end * 3);
-                offsets.push_back(offsets.back() + end - begin);
+                // The crossing kernel consumes ZYX; stored geometry is always XYZ.
+                for (size_t i = 0; i < count; ++i) {
+                    coordinateBuffer.push_back(xyz[3*i+2]);
+                    coordinateBuffer.push_back(xyz[3*i+1]);
+                    coordinateBuffer.push_back(xyz[3*i]);
+                }
+                offsets.push_back(offsets.back() + static_cast<int64_t>(count));
                 sourceIds.push_back(id);
                 families.push_back(family);
                 rows.push_back(object);
                 scope.objectUuids.push_back(object->uuid);
             }
             util::reportProgress(progressCallback, "loading track geometry", byId.size(), byId.size());
-            const std::span<const int32_t> coordinates = wholeStore
-                ? store.coordinates() : std::span<const int32_t>(coordinateBuffer);
+            const std::span<const int32_t> coordinates(coordinateBuffer);
             std::vector<uint64_t> packed(coordinates.size() / 3);
             for (size_t i = 0; i < packed.size(); ++i) {
                 if (i % 500000 == 0) {
@@ -192,21 +170,11 @@ DetectorReport linkTracksToTracks(objects::ObjectStore& db, const TrackTrackPara
             }
         }
         checkCancelled(cancel);
-        util::reportProgress(progressCallback, "registering tracks");
         auto transaction = db.write();
-        for (const auto row : registrations) {
-            checkCancelled(cancel);
-            db.upsertObject(transaction, datasets.at(registrationDataset).at(row));
-        }
-        for (const auto& [dataset, objects] : datasets)
-            for (const auto& object : objects) {
-                checkCancelled(cancel);
-                db.setTrackLength(transaction, object.uuid, object.track->length, object.track->family);
-            }
-        const auto committed = commitCandidates(db, transaction, kTrackTrackDetector, 1, candidates,
+        const auto committed = detail::commitStoredCandidates(db, inputs, transaction, kTrackTrackDetector, 1, candidates,
                                                  params.replaceStalePending, &scope, progressCallback);
         checkCancelled(cancel);
-        util::reportProgress(progressCallback, "committing tracks and links");
+        util::reportProgress(progressCallback, "committing links");
         transaction.commit();
         report.candidatesFound = committed.candidatesFound;
         report.edgesCreated = committed.edgesCreated;

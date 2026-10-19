@@ -90,6 +90,54 @@ Re-running an unchanged ingestion does not create revisions, journal entries,
 or approval changes. A concurrent object edit causes that object's publication
 to fail rather than overwriting newer state.
 
+## Discovering relationships from the store
+
+Ingestion and discovery are separate operations on the same `ObjectStore`.
+After ingestion, discovery reads current immutable geometry revisions from the
+SQLite file; original JSON, TIFF and packed track files are no longer needed.
+Discovery does not register objects or refresh object measurements.
+
+```python
+with ObjectStore.create("objects.vcobj", author="sean") as store:
+    report = store.ingest_geometry_source("patch", "/data/patch-a")
+    assert not report["problems"], report["problems"]
+    report = store.ingest_geometry_source("patch", "/data/patch-b")
+    assert not report["problems"], report["problems"]
+    report = store.link_patch_overlaps()
+    print(report)
+```
+
+| Discovery method | Optional object selection | Other input |
+| --- | --- | --- |
+| `link_patch_overlaps()` | `patch_uuids` | None |
+| `link_point_collections_to_patches()` | `collection_uuids`, `patch_uuids` | None |
+| `link_tracks_to_tracks()` | `track_uuids`, `dataset_ref` | None |
+| `link_fibers_to_patches(ct_volume)` | `fiber_uuids`, `patch_uuids` | CT or `normals_manifest` |
+| `link_tracks_to_patches(ct_volume)` | `track_uuids`, `patch_uuids` | CT or `normals_manifest` |
+
+Empty UUID selections mean all objects of that kind; unknown/wrong-kind UUIDs
+are errors. Objects without stored geometry are reported, with no fallback to
+source paths. Track dataset references are grouping labels, not files to open.
+CT/normal-field data remains external because it supplies the detector's normal
+field rather than object geometry. Fiber strips can optionally use an explicit
+`cache_directory`; the default computes them in memory.
+
+The C++ equivalents in `vc/core/object_links/ObjectLinks.hpp` accept the store
+and parameter structs with the same selections (`patchUuids`, etc.). CLI link
+flags are now bare flags, for example:
+
+```sh
+build/bin/vc_graph_import --db objects.vcobj --author "$USER" --link-patch-overlaps
+```
+
+Each pass reads one snapshot, computes candidates, then checks the observed
+object generations and geometry revisions in its write transaction. Changed
+inputs abort publication. New links bind to those revisions. Reruns revalidate
+the detector's own pending links against the geometry it actually examined;
+reviewed/manual links remain untouched. Stale pending removal is limited to
+successfully processed selected endpoints. Inspect each report's `problems`.
+Fiber–fiber and track–fiber detectors remain unimplemented placeholders.
+
 ## Representations
 
 All arrays use contiguous C order and explicit little-endian dtype descriptors.
@@ -308,7 +356,7 @@ ninja -C build
 QT_QPA_PLATFORM=offscreen ctest --test-dir build --output-on-failure \
   -R '^(test_object_store|test_graph_db|test_object_links|test_progress|graph_db_controller)$'
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_BUILD_PYTHON=build/python .venv/bin/python -m pytest \
-  python/tests/test_objects.py python/tests/test_graph.py python/tests/test_graph_objects.py -q
+  python/tests/test_objects.py python/tests/test_graph.py python/tests/test_graph_objects.py python/tests/test_object_links.py -q
 ```
 
 `VC_BUILD_PYTHON` selects the built package before any installed editable copy

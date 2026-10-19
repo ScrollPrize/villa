@@ -35,7 +35,8 @@ nb::dict reportToPy(const vo::ImportReport& rep)
 
 bool setLinePatchParameter(vc::object_links::LinePatchParams& p, const std::string& key, nb::handle val)
 {
-    if (key == "patch_scale") p.patchScale = nb::cast<double>(val);
+    if (key == "patch_uuids") p.patchUuids = nb::cast<std::vector<std::string>>(val);
+    else if (key == "patch_scale") p.patchScale = nb::cast<double>(val);
     else if (key == "normals_manifest") p.normalsManifest = nb::cast<std::string>(val);
     else if (key == "ct_level") p.ctLevel = nb::cast<int>(val);
     else if (key == "ct_to_base_scale") p.ctToBaseScale = nb::cast<double>(val);
@@ -355,13 +356,14 @@ NB_MODULE(objects, m)
             nb::arg("file"))
         .def(
             "link_point_collections_to_patches",
-            [](PyObjectStore& self, const std::string& collectionsFile, const std::string& patchesDir,
-               const nb::kwargs& kwargs) {
+            [](PyObjectStore& self, const nb::kwargs& kwargs) {
                 vc::object_links::PointCollectionPatchParams p;
                 for (auto item : kwargs) {
                     const auto key = nb::cast<std::string>(item.first);
                     const nb::handle value = item.second;
-                    if (key == "tolerance") p.tolerance = nb::cast<double>(value);
+                    if (key == "collection_uuids") p.collectionUuids = nb::cast<std::vector<std::string>>(value);
+                    else if (key == "patch_uuids") p.patchUuids = nb::cast<std::vector<std::string>>(value);
+                    else if (key == "tolerance") p.tolerance = nb::cast<double>(value);
                     else if (key == "point_scale") p.pointScale = nb::cast<double>(value);
                     else if (key == "patch_scale") p.patchScale = nb::cast<double>(value);
                     else if (key == "window_points") p.windowPoints = nb::cast<int>(value);
@@ -372,25 +374,27 @@ NB_MODULE(objects, m)
                     else throw std::runtime_error("link_point_collections_to_patches: unknown parameter '" + key + "'");
                 }
                 vc::object_links::DetectorReport report;
+                auto lease = self.db;
                 auto& db = self.require();
                 {
                     nb::gil_scoped_release release;
-                    report = vc::object_links::linkPointCollectionsToPatches(db, collectionsFile, patchesDir, p);
+                    report = vc::object_links::linkPointCollectionsToPatches(db, p);
                 }
                 return detectorReportToPy(report);
             },
-            nb::arg("collections_file"), nb::arg("patches_dir"), nb::arg("kwargs"),
+            nb::arg("kwargs"),
             "Link regular PCL points to patches using Spiral's largest-area/nearest-named-pair rules. "
             "Point IDs anchor the edges; winding annotations and patch grid coordinates are retained. "
             "Defaults: tolerance=2.5, window_points=1, window_min_points=1; no CT required.")
         .def(
             "link_patch_overlaps",
-            [](PyObjectStore& self, const std::string& dir, const nb::kwargs& kwargs) {
+            [](PyObjectStore& self, const nb::kwargs& kwargs) {
                 vc::object_links::PatchOverlapParams p;
                 for (auto item : kwargs) {
                     const std::string key = nb::cast<std::string>(item.first);
                     const nb::handle val = item.second;
-                    if (key == "workers") p.workers = nb::cast<int>(val);
+                    if (key == "patch_uuids") p.patchUuids = nb::cast<std::vector<std::string>>(val);
+                    else if (key == "workers") p.workers = nb::cast<int>(val);
                     else if (key == "tolerance") p.tolerance = nb::cast<double>(val);
                     else if (key == "sample_spacing") p.sampleSpacing = nb::cast<double>(val);
                     else if (key == "thinning_spacing") p.thinningSpacing = nb::cast<double>(val);
@@ -409,16 +413,17 @@ NB_MODULE(objects, m)
                     else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(val);
                     else throw std::runtime_error("link_patch_overlaps: unknown parameter '" + key + "'");
                 }
-                auto rep = vc::object_links::linkPatchOverlaps(self.require(), dir, p);
+                vc::object_links::DetectorReport rep;
+                { auto lease = self.db; self.require(); nb::gil_scoped_release release;
+                  rep = vc::object_links::linkPatchOverlaps(*lease, p); }
                 return detectorReportToPy(rep);
             },
-            "Run the patch-overlap detector over the tifxyz segment dirs in dir; "
+            "Run patch-overlap discovery using stored geometry; patch_uuids optionally selects objects. "
             "kwargs mirror PatchOverlapParams (tolerance, min_minor_spread, ...).")
         .def(
             "link_tracks_to_tracks",
-            [](PyObjectStore& self, const std::string& tracksPath, const nb::kwargs& kwargs) {
+            [](PyObjectStore& self, const nb::kwargs& kwargs) {
                 vc::object_links::TrackTrackParams p;
-                p.tracksPath = tracksPath;
                 for (auto item : kwargs) {
                     const auto key = nb::cast<std::string>(item.first);
                     const nb::handle value = item.second;
@@ -426,7 +431,6 @@ NB_MODULE(objects, m)
                     else if (key == "tangent_radius_voxels") p.tangentRadiusVoxels = nb::cast<double>(value);
                     else if (key == "cluster_index_radius") p.clusterIndexRadius = nb::cast<int>(value);
                     else if (key == "workers") p.workers = nb::cast<int>(value);
-                    else if (key == "source_ids") p.sourceIds = nb::cast<std::vector<uint64_t>>(value);
                     else if (key == "dataset_ref") p.datasetRef = nb::cast<std::string>(value);
                     else if (key == "track_uuids") p.trackUuids = nb::cast<std::vector<std::string>>(value);
                     else if (key == "edge_kind") p.edgeKind = nb::cast<std::string>(value);
@@ -434,6 +438,7 @@ NB_MODULE(objects, m)
                     else throw std::runtime_error("link_tracks_to_tracks: unknown parameter '" + key + "'");
                 }
                 vc::object_links::DetectorReport report;
+                auto lease = self.db;
                 auto& db = self.require();
                 {
                     nb::gil_scoped_release release;
@@ -441,58 +446,55 @@ NB_MODULE(objects, m)
                 }
                 return detectorReportToPy(report);
             },
-            nb::arg("tracks_dbm") = "", nb::arg("kwargs"),
-            "Compute track crossings directly into the graph. A DBM path discovers adjacent "
-            "packed geometry and registers tracks automatically; no crossings.npz or JSON list is used. "
-            "source_ids optionally selects a subset. Omit the path to link registered tracks. "
-            "Anchors are raw point indices and XYZ positions in dataset voxels.")
+            nb::arg("kwargs"),
+            "Discover crossings from stored tracks, optionally selected by track_uuids and dataset_ref. "
+            "Anchors are raw point indices and source XYZ positions.")
         .def(
             "link_tracks_to_patches",
-            [](PyObjectStore& self, const std::string& tracksPath, const std::string& patchesDir,
-               const std::string& ctVolume, const nb::kwargs& kwargs) {
+            [](PyObjectStore& self, const std::string& ctVolume, const nb::kwargs& kwargs) {
                 vc::object_links::TrackPatchParams p;
                 for (auto item : kwargs) {
                     const auto key = nb::cast<std::string>(item.first);
                     const nb::handle val = item.second;
                     if (key == "track_scale") p.trackScale = nb::cast<double>(val);
-                    else if (key == "source_ids") p.sourceIds = nb::cast<std::vector<uint64_t>>(val);
                     else if (key == "track_uuids") p.trackUuids = nb::cast<std::vector<std::string>>(val);
                     else if (!setLinePatchParameter(p, key, val))
                         throw std::runtime_error("link_tracks_to_patches: unknown parameter '" + key + "'");
                 }
                 vc::object_links::DetectorReport report;
+                auto lease = self.db;
                 auto& db = self.require();
                 {
                     nb::gil_scoped_release release;
-                    report = vc::object_links::linkTracksToPatches(db, tracksPath, patchesDir, ctVolume, p);
+                    report = vc::object_links::linkTracksToPatches(db, ctVolume, p);
                 }
                 return detectorReportToPy(report);
             },
-            nb::arg("tracks_dbm"), nb::arg("patches_dir"), nb::arg("ct_volume"), nb::arg("kwargs"),
-            "Link DBM/packed tracks to tifxyz patches using the shared fiber/track strip rules. "
-            "CT supplies normals by default; source_ids optionally limits the tracks. "
-            "Anchors use raw point indices and source XYZ coordinates.")
+            nb::arg("ct_volume") = "", nb::arg("kwargs"),
+            "Link stored tracks to stored patches; select with track_uuids and patch_uuids. "
+            "CT supplies normals unless normals_manifest is set. Anchors retain raw indices and source XYZ.")
         .def(
             "link_fibers_to_patches",
-            [](PyObjectStore& self, const std::string& fibersDir, const std::string& patchesDir,
-               const std::string& ctVolume, const nb::kwargs& kwargs) {
+            [](PyObjectStore& self, const std::string& ctVolume, const nb::kwargs& kwargs) {
                 vc::object_links::FiberPatchParams p;
                 for (auto item : kwargs) {
                     const std::string key = nb::cast<std::string>(item.first);
                     const nb::handle val = item.second;
-                    if (key == "fiber_scale") p.fiberScale = nb::cast<double>(val);
+                    if (key == "fiber_uuids") p.fiberUuids = nb::cast<std::vector<std::string>>(val);
+                    else if (key == "cache_directory") p.cacheDirectory = nb::cast<std::string>(val);
+                    else if (key == "fiber_scale") p.fiberScale = nb::cast<double>(val);
                     else if (key == "rebuild_strips") p.rebuildStrips = nb::cast<bool>(val);
                     else if (!setLinePatchParameter(p, key, val))
                         throw std::runtime_error("link_fibers_to_patches: unknown parameter '" + key + "'");
                 }
-                return detectorReportToPy(vc::object_links::linkFibersToPatches(
-                    self.require(), fibersDir, patchesDir, ctVolume, p));
+                vc::object_links::DetectorReport report;
+                { auto lease = self.db; self.require(); nb::gil_scoped_release release;
+                  report = vc::object_links::linkFibersToPatches(*lease, ctVolume, p); }
+                return detectorReportToPy(report);
             },
-            nb::arg("fibers_dir"), nb::arg("patches_dir"), nb::arg("ct_volume"), nb::arg("kwargs"),
-            "Link fiber JSONs to tifxyz patches using CT sheet normals; creates pending edges. "
-            "kwargs mirror FiberPatchParams; normals_manifest selects a Lasagna reference source. "
-            "The default strip has one row at 20 voxels on each side. "
-            "Strips are cached in fibers_dir/.strip-cache; rebuild_strips=True refreshes them.")
+            nb::arg("ct_volume") = "", nb::arg("kwargs"),
+            "Link stored fibers to stored patches; select with fiber_uuids and patch_uuids. "
+            "CT or normals_manifest supplies normals. Optional cache_directory stores disposable strips.")
         .def_prop_ro("uuid", [](PyObjectStore& self) {
             return self.withRead([](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.uuid(txn); });
         })

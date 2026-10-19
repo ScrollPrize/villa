@@ -38,7 +38,7 @@ add_library(vc_object_links STATIC
     linking/PatchOverlap.cpp
     linking/FiberPatch.cpp
     linking/TrackTrack.cpp
-    linking/TrackInput.cpp
+    linking/StoredGeometry.cpp
     linking/LinePatch.cpp
     linking/TrackPatch.cpp
     linking/PointCollectionPatch.cpp

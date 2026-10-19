@@ -3,6 +3,9 @@
 [Graph README](graph/README.md) · [Volume Cartographer](../README.md)
 
 Detailed detector behavior, cache rules, and recorded validation results.
+All current detector APIs read ingested geometry from `ObjectStore`. Ingest
+sources first; see [the workflow](object_storage.md#discovering-relationships-from-the-store).
+The historical measurements below predate the store-based loaders.
 Benchmark paths and timings below describe historical experiments; those inputs
 and temporary harnesses are not distributed with the repository.
 
@@ -29,12 +32,12 @@ printing an operation's summary. Callback string views must be copied if retaine
 
 ```sh
 build/bin/vc_graph_import --db objects.vcobj --author "$USER" \
-  --link-fiber-patches /path/to/fibers --segments /path/to/patches \
+  --link-fiber-patches \
   --ct /path/to/ct.zarr --ct-level 0
 ```
 
-Inputs are fiber JSON files, tifxyz patch directories with valid UUIDs, and a
-uint8 CT volume. The detector registers missing objects, finds anchors through
+Inputs are stored fiber and patch geometry plus a uint8 CT volume. The detector
+finds anchors through
 long fiber contact and strip agreement, then grows through same-sheet patch
 overlap. The strip has the centerline plus **one row on each side at 20 working
 voxels**. `--fiber-strip-rows` and `--fiber-anchor-contact` control its width and
@@ -48,13 +51,8 @@ snapping to a control point. Edge metadata marks `anchor_index_space` as
 `line_points`. Reviewed legacy anchors are preserved; pending anchors with the
 old index convention are replaced on rerun.
 
-Both fiber import and fiber-to-patch linking populate `fiber.length` from the
-full dense polyline in source voxels, including extensions beyond the control
-points. The importer uses the control-point polyline when there are no dense
-points. Linking scales do not affect the stored length. Existing lengths are
-refreshed on processing, including re-imports of unchanged files. A changed
-length bumps the object generation, updates its change stamps, and resets its
-approval to pending. Identical lengths leave both generation and approval alone.
+Ingestion populates object measurements. Discovery reads geometry revisions and
+writes only relationship metadata, leaving object lengths and approvals alone.
 
 Normals use the selected CT-only estimator: a 2/24 isotropic seed, followed by
 three 1/24/4 anisotropic tensor refinements with gradient magnitude weighting.
@@ -88,18 +86,16 @@ estimator ID, and detector version 3. Reruns preserve reviewed/manual edges; sta
 are removed only for successfully processed inputs. Failed inputs are excluded.
 
 C++ exposes `vc::object_links::linkFibersToPatches`. Python exposes
-`ObjectStore.link_fibers_to_patches(fibers_dir, patches_dir, ct_volume, **kwargs)`;
+`ObjectStore.link_fibers_to_patches(ct_volume, **kwargs)`;
 snake_case keywords match `FiberPatchParams`, including `ct_level` and
 `ct_to_base_scale`. `vc.objects.CtSheetNormalSampler` exposes the same estimator
 for numerical verification and direct normal queries.
 
 ## Cached fiber strips
 
-`vc_graph_import --link-fiber-patches /path/to/fibers` automatically saves each
-built strip in `/path/to/fibers/.strip-cache/<fiber-uuid>.cbor`. Later runs
-discover matching entries and skip normal sampling and strip marching. No
-additional flag is needed. The cache also applies to Python's
-`ObjectStore.link_fibers_to_patches`.
+Use `--strip-cache /path/to/cache` (Python `cache_directory`, C++
+`cacheDirectory`) to save disposable `<fiber-uuid>.cbor` strips. Matching entries
+skip normal sampling and marching. The default keeps work in memory.
 
 Fiber geometry, controls, coordinate scales, strip settings, normal-source
 location/method, and local CT metadata or Lasagna manifest must match.
@@ -125,63 +121,28 @@ upper median. One crossing per pair survives: greatest minimum arclength to
 the four endpoints, then greatest first/second arclength and point indices.
 Tracks are ordered by source ID to make this tie-breaking deterministic.
 
-Pass the tracks DBM directly. The linker discovers its packed geometry,
-registers the tracks automatically, computes crossings in C++, and writes
-pending edges to SQLite. There is no selected-tracks JSON step and
-`crossings.npz` is neither read nor written.
+Ingest tracks first with `ingest_geometry_source("track", path)` or
+`vc_object_ingest --db objects.vcobj --author NAME --tracks path`. The ingestion adapter accepts
+packed `.vctracks` geometry or a DBM with a current packed mirror. Discovery
+only reads stored revisions; `crossings.npz` is neither read nor written.
 
 ```sh
 ninja -C build vc_graph_import vc_object_bindings test_object_links
 build/bin/vc_graph_import --db objects.vcobj --author "$USER" \
-  --link-track-tracks /mnt/bigpc/spiral_dataset_working/tracks/2um_ds2_ps256_surf_v2.dbm \
-  --track-workers 4
+  --link-track-tracks --track-workers 4
 ```
 
-Python uses the same entry point:
-
 ```python
-from vc.objects import ObjectStore
-
 with ObjectStore.open("objects.vcobj", author="reviewer") as db:
-    report = db.link_tracks_to_tracks("/data/tracks/example.dbm", workers=4)
+    report = db.link_tracks_to_tracks(workers=4)
     assert not report["problems"], report["problems"]
 ```
 
-The DBM logical path and its `.dbm.db` backing filename are both accepted.
-Geometry comes from the adjacent `<dbm>.vctracks` directory; this already exists
-for the example above. `extract_surface_tracks.py` writes the DBM during
-extraction and creates this packed directory when finished by default
-(`--no-packed-store` disables that final step). The linker checks its source
-fingerprint against the DBM backing files before linking. For older DBMs
-without a current packed geometry store, create one using Spiral's
-`convert_track_store.py` (use `--force` to refresh a stale store).
-A `.vctracks` directory can also be passed directly.
-The packed files must remain immutable during a run. Full-dataset runs keep
-coordinates memory mapped rather than copying the entire coordinate array.
-
-All tracks in the input are registered by default, including isolated tracks.
-For a small run, optionally select source IDs with repeated
-`--track-source-id <id>` flags, or `source_ids=[...]` in Python. Source IDs are
-stable `source_ids.u64` values, not row numbers. Registration and edge updates
-commit together; failures leave neither partial registration nor partial edges.
-Reruns reuse existing UUIDs. Object approvals and generations are preserved
-when the stored measurements are unchanged.
-Both track linkers populate `track.length` with polyline arclength: the sum of
-Euclidean distances between consecutive raw points, in source dataset voxels.
-Repeated points contribute zero. Track-to-patch coordinate scaling does not
-change this stored length. Reruns refresh lengths for processed existing tracks
-with normal content-change semantics: changed lengths bump generation and reset
-approval; unchanged lengths are a no-op.
-Track family is read from the packed family code: `horizontal`, `vertical`, or
-empty for unknown. Both linkers fill missing families on existing registrations;
-filling a missing family also bumps generation and resets approval, even if the
-length is unchanged. A conflicting nonempty family is reported as an input error.
-
-The advanced already-registered-track API is still available: omit the input
-path and optionally restrict `dataset_ref` / `track_uuids` in Python, or use a
-bare `--link-track-tracks` with `--track-dataset` / repeated `--track-uuid`.
-New registrations use the canonical packed path as `dataset_ref`; an existing
-relative-path identity is reused when it resolves to the same dataset.
+Select stored objects with `track_uuids` / repeated `--track-uuid`, optionally
+restricted by `dataset_ref` / `--track-dataset`. Dataset references group tracks;
+they are never opened as paths. Family comes from immutable geometry attributes.
+Only ingestion updates object measurements. Track crossings materialize the
+selected dataset coordinates for the existing crossing kernel.
 
 Other Python keywords are `min_angle_degrees` (30),
 `tangent_radius_voxels` (12), `cluster_index_radius` (4), `edge_kind`
@@ -212,15 +173,14 @@ previous native kernel exactly. The graph linker produced the same 18 edges
 and an idempotent rerun. The DBM CLI entry point also registered those 24 tracks
 from `/mnt/bigpc/spiral_dataset_working/tracks` and reproduced the same 18 edges;
 rerunning with the `.dbm.db` backing filename reused all identities and links.
-Regression tests cover missing and deliberately invalid `crossings.npz` files:
-neither is read, and no sidecar is created. No full-collection crossing test was run.
+Those source-path discovery entry points have since been removed. No full-collection crossing test was run.
 
 Regression checks:
 
 ```sh
 build/bin/test_object_links
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PWD/build/python" \
-  python -m pytest python/tests/test_graph.py -q
+  python -m pytest python/tests/test_object_links.py -q
 ```
 
 Use a Python interpreter matching the compiled bindings, with NumPy and pytest
@@ -233,13 +193,11 @@ chooses the largest patch within tolerance, then the closest on area ties.
 Area is the valid quad count divided by both grid scale factors, matching
 `tifxyz.Patch.area`. Collections named `between_patches__A__B` choose the
 nearest hit within that named pair. If either patch is absent, they use the
-general rule. Remaining ties use sorted patch-directory order.
+general rule. Remaining ties use sorted object UUID order.
 
 ```sh
 build/bin/vc_graph_import --db objects.vcobj --author "$USER" \
-  --link-pcl-patches /data/relative_windings.json \
-  --link-pcl-patches /data/abs_winding.json \
-  --segments /data/verified_patches --pcl-tolerance 2.5
+  --link-pcl-patches --pcl-tolerance 2.5
 ```
 
 No CT volume is required. `--point-scale` and `--patch-scale` independently
@@ -250,7 +208,6 @@ configuration. Patch metadata's grid scale is separate from this XYZ scaling.
 ```python
 with ObjectStore.open("objects.vcobj", author="reviewer") as db:
     report = db.link_point_collections_to_patches(
-        "/data/relative_windings.json", "/data/verified_patches",
         tolerance=2.5, point_scale=1, patch_scale=1,
         window_points=1, window_min_points=1,
     )
@@ -263,14 +220,12 @@ hit a patch, and at least `window_min_points` members of its centered
 the next odd size; the requirement is clipped at collection ends. CLI flags
 are `--pcl-window-points` and `--pcl-window-min-points`; both default to 1.
 
-As in `fit_spiral.py`, `abs_winding.json` denotes absolute winding annotations
-and bypasses the neighbor gate. Stored `metadata.winding_is_absolute` does not
-override the file role. Use Python `absolute_winding=True/False` or CLI
-`--pcl-absolute` / `--pcl-relative` to override the filename rule explicitly.
-The CLI override applies to every PCL file in that invocation.
+Ingestion records the `abs_winding.json` role as a `winding_is_absolute`
+geometry attribute. Absolute collections bypass the neighbor gate. Python
+`absolute_winding=True/False` or CLI `--pcl-absolute` / `--pcl-relative` overrides
+that stored role for the selected collections.
 
-Each collection becomes a `point_collection` object, preserving its source
-UUID. Every attached point creates a pending `point-patch` edge. Its collection
+Each stored `point_collection` retains its source UUID. Every attached point creates a pending `point-patch` edge. Its collection
 anchor stores the source point ID and source XYZ; its patch anchor stores the
 projected XYZ in source patch units. Metadata records grid `[row, column]`,
 distance in working units, the original winding annotation (null if unknown),
@@ -278,14 +233,11 @@ absolute/relative role, selection policy and detector settings. A collection
 can span several windings; its attachments retain their individual annotations.
 Python also accepts `edge_kind` and `replace_stale_pending`.
 
-The source JSON and TIFF files remain unchanged. Collections and patches must
-already carry valid source UUIDs; re-save legacy collections in VC3D first.
-Registration and links commit together for each input file. Malformed input or
-cancellation raises an exception and rolls back that run. Reruns deduplicate
-links and remove this detector's stale pending links only within the processed
-collection/patch scope. Reviewed and manual links survive. Geometry remains in
-the external files; `resolve_storage_path` locates a collection by UUID even
-after its JSON file is renamed.
+Discovery reads stored point arrays, point IDs and annotations. It writes links
+in one transaction, aborting if inputs change during computation. Reruns remove
+only this detector's stale pending links within the successfully processed
+collection/patch scope. Reviewed and manual links survive. The original source
+files can be removed or relocated after ingestion.
 
 Validation used 29 real collections (259 points) and 24 real patches from
 `/home/sean/Desktop/spiral_dataset_graph_uuid`. All 17 selected attachments and
@@ -293,8 +245,7 @@ winding annotations matched Spiral's Python fallback, with grid-coordinate
 differences below 0.000001 cells and distance differences below 0.0006 voxels.
 A three-point/two-hit neighbor gate rejected all 17 in both implementations;
 an absolute-role override restored them. CLI results and idempotent reruns
-matched. Regression tests also cover named pairs, anisotropic grid scales,
-independent XYZ scales, reviewed-edge preservation and cancellation rollback.
+matched. Those comparisons used the former file-based discovery API.
 No full-dataset run was performed.
 
 ## Track-to-patch graph links
@@ -305,15 +256,12 @@ same-sheet growth all use the same rules and defaults.
 
 ```sh
 build/bin/vc_graph_import --db objects.vcobj --author "$USER" \
-  --link-track-patches /path/to/tracks.dbm --segments /path/to/patches \
+  --link-track-patches \
   --ct /path/to/ct.zarr --track-scale 1 --patch-scale 1
 ```
 
-The DBM resolves to its adjacent `.vctracks` geometry, with the same freshness
-checks and object identities as track-to-track linking. A packed directory is
-also accepted. No selected-tracks JSON or `crossings.npz` is needed. By default
-all input tracks are considered; use repeated `--track-source-id <id>` or
-`--track-uuid <uuid>` flags to restrict the run.
+Select stored tracks and patches with repeated `--track-uuid` and
+`--patch-uuid` flags. By default all objects of those kinds are considered.
 
 `--track-scale` converts source track XYZ to working coordinates. Patch and CT
 scaling follow the fiber-to-patch rules above. For tracks, patches and CT all
@@ -329,22 +277,22 @@ Python exposes:
 ```python
 with ObjectStore.open("objects.vcobj", author="reviewer") as db:
     report = db.link_tracks_to_patches(
-        "/path/to/tracks.dbm", "/path/to/patches", "/path/to/ct.zarr",
+        "/path/to/ct.zarr",
         track_scale=1, patch_scale=1,
         working_to_base_scale=4, ct_to_base_scale=4,
-        source_ids=[6317896897264, 6317896894401],
+        track_uuids=selected_track_uuids,
     )
     assert not report["problems"], report["problems"]
 ```
 
 Python accepts all shared fiber-link keywords, with `track_scale` replacing
-`fiber_scale`, plus optional `source_ids` and `track_uuids` selections. Every raw
+`fiber_scale`, plus optional `track_uuids` and `patch_uuids` selections. Every raw
 track point is eligible. Anchors save the median contact's raw local index and
 source XYZ position, with `anchor_index_space: "line_points"`. Edge provenance
 records detector `track-patch` version 1, source identity, normal method, scales,
 and contact/strip/growth measurements.
 
-Registration and edges commit together. Reviewed/manual edges are preserved;
+Links commit together after validating input revisions. Reviewed/manual edges are preserved;
 stale pending links are removed only for successfully processed tracks and
 patches in the current selection. Unreadable geometry is reported and skipped,
 and its existing links remain. Cancellation commits no changes.
@@ -352,9 +300,7 @@ and its existing links remain. Cancellation commits no changes.
 Validation used four real tracks (977 points) and three real patches: three
 links matched equivalent fiber inputs exactly, including anchors and all
 contact/strip/growth measurements. Rerunning skipped all three existing links;
-the CLI produced the same result. No full-collection test was run. Synthetic
-regressions also cover coordinate scaling, growth, wrong-sheet rejection,
-fiber control-point bounds, identity reuse, and preservation of reviewed edges.
+the CLI produced the same result. No full-collection test was run. These results used the former file-based discovery API.
 
 ## Patch-to-patch graph linking performance
 
@@ -362,7 +308,7 @@ Patch overlap linking queries all eligible target patches together for each
 seed sample, instead of scanning the same seed separately for every target.
 Searches use up to eight workers automatically; small patches use fewer.
 `--overlap-workers 1` forces serial search, and a positive value requests that
-many workers. Python accepts `db.link_patch_overlaps(path, workers=4)`; C++ uses
+many workers. Python accepts `db.link_patch_overlaps(workers=4)`; C++ uses
 `PatchOverlapParams::workers`. The default is `0` (automatic).
 
 Workers retain bounded correspondence sets and merge in source order. Nearest
@@ -397,8 +343,7 @@ on 24 patches its median fell from 1.389 s to 0.144 s (9.6x), and spatial
 queries fell from 3,902,813 to 408,683. Loading, indexing, fitting and agreement
 checks accounted for much less time. All accepted links (1, 9 and 3 respectively)
 and their complete fit metadata matched the original exactly across all runs.
-Regression tests additionally compare serial/parallel capped fits, cancellation,
-callback thread identity and batched/individual nearest queries.
+These comparisons used the former file-based discovery API.
 
 Build with `ninja -C build vc_graph_import vc_object_bindings test_object_links
 test_surface_patch_index`. The benchmark harness in `/tmp/vc-overlap-perf/bench.py`

@@ -1,53 +1,33 @@
-// Fiber JSON adapter for the shared line-to-patch linker.
+// Stored fiber adapter for the shared line-to-patch linker.
 #include "linking/LinePatch.hpp"
-#include "formats/FiberInput.hpp"
-#include "vc/core/util/Uuid.hpp"
+#include "linking/StoredGeometry.hpp"
 #include <algorithm>
 #include <cmath>
-#include <fstream>
 #include <limits>
-#include <sstream>
-#include <nlohmann/json.hpp>
 
 namespace vc::object_links {
 namespace {
-std::vector<cv::Vec3d> parsePoints(const nlohmann::json& root, const char* key)
-{
-    std::vector<cv::Vec3d> out;
-    for (const auto& p : objects::detail::fiberPoints(root, key)) out.emplace_back(p[0], p[1], p[2]);
-    return out;
-}
-
-std::optional<detail::LineData> loadFiber(const std::filesystem::path& file, double scale, DetectorReport& report)
+std::optional<detail::LineData> loadFiber(detail::StoredGeometry& inputs,
+    const objects::ObjectRecord& object, double scale, DetectorReport& report)
 {
     try {
-        std::ifstream in(file);
-        if (!in) throw std::runtime_error("cannot read file");
-        std::ostringstream ss;
-        ss << in.rdbuf();
-        const auto root = nlohmann::json::parse(ss.str());
-        if (!root.is_object() || !root.contains("uuid") || !root.contains("line_points"))
-            return std::nullopt;  // not a vc3d_fiber file
+        const auto geometry = inputs.load(object);
         detail::LineData fiber;
-        fiber.path = file;
-        fiber.uuid = root.value("uuid", "");
-        if (!vc::util::isUuid(fiber.uuid)) {
-            report.problems.push_back(file.filename().string() + ": missing/invalid uuid, skipped");
-            return std::nullopt;
-        }
-        const auto sourceLine = objects::detail::fiberPoints(root, "line_points");
-        fiber.object.fiber = objects::FiberDetail{};
-        fiber.object.fiber->length = objects::detail::fiberPolylineLength(sourceLine);
-        for (const auto& p : sourceLine) fiber.line.emplace_back(p[0], p[1], p[2]);
-        fiber.controls = parsePoints(root, "control_points");
-        for (auto* points : {&fiber.line, &fiber.controls})
-            for (auto& p : *points) {
-                p *= scale;
-                if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2]))
-                    throw std::runtime_error("scaled fiber coordinate is non-finite");
+        fiber.uuid = object.uuid;
+        fiber.object = object;
+        auto points = [&](const char* name, auto& output) {
+            const auto xyz = geometry.values<double>(name);
+            for (size_t i = 0; i < xyz.size(); i += 3) {
+                const cv::Vec3d p = cv::Vec3d(xyz[i], xyz[i+1], xyz[i+2]) * scale;
+                for (int a = 0; a < 3; ++a)
+                    if (!std::isfinite(p[a])) throw std::runtime_error("scaled fiber coordinate is non-finite");
+                output.push_back(p);
             }
+        };
+        points("line_points", fiber.line);
+        points("control_points", fiber.controls);
         if (fiber.line.size() < 2) {
-            report.problems.push_back(file.filename().string() + ": fewer than two line points, skipped");
+            report.problems.push_back(object.uuid + ": fewer than two line points, skipped");
             return std::nullopt;
         }
         fiber.arclength.assign(fiber.line.size(), 0.0);
@@ -85,47 +65,28 @@ std::optional<detail::LineData> loadFiber(const std::filesystem::path& file, dou
         }
         return fiber;
     } catch (const std::exception& e) {
-        report.problems.push_back(file.filename().string() + ": unreadable fiber JSON: " + e.what());
+        report.problems.push_back(object.uuid + ": invalid stored fiber: " + e.what());
         return std::nullopt;
     }
 }
 
 } // namespace
 
-DetectorReport linkFibersToPatches(objects::ObjectStore& db, const std::filesystem::path& fibersDir,
-    const std::filesystem::path& patchesDir, const std::filesystem::path& ctVolume,
+DetectorReport linkFibersToPatches(objects::ObjectStore& db, const std::filesystem::path& ctVolume,
     const FiberPatchParams& params, const std::atomic_bool* cancel)
 {
     detail::validateLinePatchParams(params, params.fiberScale);
-    if (cancel && cancel->load()) {
-        DetectorReport report;
-        report.problems.push_back("fiber-patch: cancelled; no objects or edges committed");
-        return report;
-    }
-    util::reportProgress(params.progress, "scanning fiber directory");
-    std::vector<std::filesystem::path> files;
-    for (const auto& entry : std::filesystem::directory_iterator(fibersDir))
-        if (entry.is_regular_file() && entry.path().extension() == ".json") files.push_back(entry.path());
-    std::sort(files.begin(), files.end());
+    detail::StoredGeometry inputs(db);
+    const auto fibers = inputs.select("fiber", params.fiberUuids);
     auto load = [&](size_t index, DetectorReport& report) -> std::optional<detail::LineData> {
-        auto fiber = loadFiber(files[index], params.fiberScale, report);
-        if (!fiber) return {};
-        fiber->stripCacheFile = fibersDir / ".strip-cache" / (fiber->uuid + ".cbor");
-        fiber->rebuildStrip = params.rebuildStrips;
-        auto& object = fiber->object;
-        object.uuid = fiber->uuid;
-        object.kind = "fiber";
-        object.name = fiber->path.filename().string();
-        object.storageKind = "file";
-        object.storageRef = std::filesystem::absolute(fiber->path).lexically_relative(
-            std::filesystem::absolute(db.path().parent_path())).string();
-        object.dataGeneration = 1;
-        auto& detail = *object.fiber;
-        detail.controlPointCount = int64_t(fiber->controls.size());
-        detail.linePointCount = int64_t(fiber->line.size());
+        auto fiber = loadFiber(inputs, fibers[index], params.fiberScale, report);
+        if (fiber && !params.cacheDirectory.empty()) {
+            fiber->stripCacheFile = params.cacheDirectory / (fiber->uuid + ".cbor");
+            fiber->rebuildStrip = params.rebuildStrips;
+        }
         return fiber;
     };
-    return detail::linkLinesToPatches(db, files.size(), load, patchesDir, ctVolume,
+    return detail::linkLinesToPatches(db, inputs, fibers.size(), load, ctVolume,
         params, params.fiberScale, kFiberPatchDetector, 3, cancel);
 }
 } // namespace vc::object_links

@@ -167,6 +167,8 @@ std::vector<Prepared> collections(const fs::path& source)
         std::vector<std::array<double, 3>> coordinates;
         auto attributes = original; attributes.erase("points");
         attributes["source_collection_id"] = collectionId;
+        if (!attributes.contains("winding_is_absolute") && source.filename() == "abs_winding.json")
+            attributes["winding_is_absolute"] = true;
         attributes["point_attributes"] = Json::array();
         for (const auto& [id, entry] : ordered) {
             if (!entry.at("p").is_array() || entry.at("p").size() != 3) throw std::runtime_error("invalid XYZ point");

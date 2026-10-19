@@ -1,9 +1,8 @@
 # Object graph
 
 Store and query relationships between patches, fibers, and Spiral tracks in a
-`.vcobj` SQLite database. ObjectStore owns objects and their relationship metadata. Geometry can
-remain in source files or be ingested into the same database; these examples
-register external sources. Imported patches and fibers retain their source UUIDs, so
+`.vcobj` SQLite database. ObjectStore owns objects and their relationship metadata. Discovery uses geometry ingested into that same database; source files are
+only needed during ingestion. Imported patches and fibers retain their source UUIDs, so
 names and paths are labels and location hints, not identity.
 
 [Setup](#setup) · [Command line](#command-line) · [Python](#python) ·
@@ -15,7 +14,7 @@ names and paths are labels and location hints, not identity.
 From an already configured Volume Cartographer checkout:
 
 ```bash
-ninja -C build vc_graph_import vc_object_bindings
+ninja -C build vc_graph_import vc_object_ingest vc_object_bindings
 ```
 
 For Python, install the [native prerequisites](../../README.md#python-source-builds)
@@ -36,16 +35,17 @@ Examples below use this layout; replace the paths with your own:
 
 ## Command line
 
-Import objects and detect patch overlaps (creates the DB if needed):
+Register source metadata, ingest geometry, then discover patch overlaps:
 
 ```bash
 build/bin/vc_graph_import --db /data/dataset/objects.vcobj --author "$USER" \
   --fibers /data/dataset/fibers \
-  --segments /data/dataset/verified_patches \
-  --link-patch-overlaps /data/dataset/verified_patches
+  --segments /data/dataset/verified_patches
+build/bin/vc_object_ingest --db /data/dataset/objects.vcobj --author "$USER" --registered
+build/bin/vc_graph_import --db /data/dataset/objects.vcobj --author "$USER" --link-patch-overlaps
 ```
 
-Omit `--link-patch-overlaps` to import metadata only. Patch import does not infer
+The first command imports metadata only; discovery requires the ingestion step. Patch import does not infer
 links from `overlapping.json`; fiber import also reads existing branch links.
 Use `--help` for all options, or see the Python/C++ examples below to run the
 same operations in code.
@@ -69,13 +69,16 @@ with open_db(path, author="reviewer") as db:
         if report["problems"]:
             raise RuntimeError(report["problems"])
 
-    report = db.link_patch_overlaps(str(root / "verified_patches"), workers=4)
+    report = db.ingest_registered_geometry()
+    if report["problems"]:
+        raise RuntimeError(report["problems"])
+    report = db.link_patch_overlaps(workers=4)
     if report["problems"]:
         raise RuntimeError(report["problems"])
     print("new patch links:", report["edges_created"])
 
     report = db.link_fibers_to_patches(
-        str(root / "fibers"), str(root / "verified_patches"), "/data/ct.zarr",
+        "/data/ct.zarr",
         ct_level=0, fiber_scale=0.25, patch_scale=1,
         working_to_base_scale=4, ct_to_base_scale=4,
     )
@@ -139,7 +142,7 @@ add targets for the examples below:
 add_executable(graph_query graph_query.cpp)
 target_link_libraries(graph_query PRIVATE vc_objects)
 add_executable(graph_build graph_build.cpp)
-target_link_libraries(graph_build PRIVATE vc_object_links)
+target_link_libraries(graph_build PRIVATE vc_object_links vc_object_geometry)
 ```
 
 Build with `ninja -C build graph_query graph_build`. In the Volume Cartographer
@@ -205,6 +208,7 @@ build/bin/graph_build /data/dataset /data/ct.zarr
 #include <iostream>
 #include <stdexcept>
 #include "vc/core/objects/ObjectStore.hpp"
+#include "vc/core/objects/GeometryIngest.hpp"
 #include "vc/core/objects/import/FiberImport.hpp"
 #include "vc/core/objects/import/PatchImport.hpp"
 #include "vc/core/object_links/ObjectLinks.hpp"
@@ -230,10 +234,11 @@ int main(int argc, char** argv) {
         check(vc::objects::importFibers(db, txn, root / "fibers"));
         txn.commit();
     }
+    check(vc::objects::ingestRegisteredGeometry(db));
     // Detectors manage their own transactions: call outside the write scope.
     vc::object_links::PatchOverlapParams overlaps;
     overlaps.workers = 4;
-    check(vc::object_links::linkPatchOverlaps(db, root / "verified_patches", overlaps));
+    check(vc::object_links::linkPatchOverlaps(db, overlaps));
 
     vc::object_links::FiberPatchParams params;
     params.fiberScale = 0.25;
@@ -242,7 +247,7 @@ int main(int argc, char** argv) {
     params.ctToBaseScale = 4;
     params.ctLevel = 0;
     check(vc::object_links::linkFibersToPatches(
-        db, root / "fibers", root / "verified_patches", argv[2], params));
+        db, argv[2], params));
 }
 ```
 
@@ -257,7 +262,8 @@ write transaction and commit it.
   `working_to_base_scale` / `ct_to_base_scale` give working and selected-level
   CT voxel sizes in common base units. All default to 1. Changing `ct_level`
   does not automatically adjust these scales.
-- Fiber strips are saved automatically in `fibers/.strip-cache/<uuid>.cbor`.
+- Set `cache_directory` (C++ `cacheDirectory`, CLI `--strip-cache`) to save
+  disposable fiber strips. The default keeps work in memory.
   Changed geometry/settings invalidate them. After changing CT voxel data in
   place without changing metadata, use Python `rebuild_strips=True`, C++
   `params.rebuildStrips = true`, or CLI `--rebuild-fiber-strips`.
@@ -268,8 +274,9 @@ write transaction and commit it.
   It returns `None` / `std::nullopt` if missing and errors on ambiguous fallback
   matches. Existing graphs need no rebuild. See [storage and relocation](../graph_storage.md).
 
-For Spiral tracks, pass a DBM and its adjacent `.vctracks` store, or a packed
-store directly. See [track-to-track](../graph_linking_reference.md#track-to-track-graph-links)
-and [track-to-patch](../graph_linking_reference.md#track-to-patch-graph-links)
-examples and their Python/C++ entry points. Algorithm details, cache rules, and
-historical benchmarks live in the [linking reference](../graph_linking_reference.md).
+For Spiral tracks, ingest a DBM with its adjacent `.vctracks` store, or a packed
+store directly, using `ingest_geometry_source("track", path)`. Then call
+`link_tracks_to_tracks()` or `link_tracks_to_patches(ct_volume)` with optional
+`track_uuids`. Discovery never reopens the dataset path. See
+[the object-store workflow](../object_storage.md#discovering-relationships-from-the-store)
+and the [linking reference](../graph_linking_reference.md).

@@ -1,3 +1,4 @@
+#include "linking/StoredGeometry.hpp"
 #include "vc/core/object_links/ObjectLinks.hpp"
 
 #include <algorithm>
@@ -73,22 +74,10 @@ DetectorReport placeholder(objects::ObjectStore& db, const char* detectorName,
 
 }  // namespace
 
-DetectorReport commitCandidates(objects::ObjectStore& db, const std::string& detectorName, int detectorVersion,
-                                const std::vector<LinkCandidate>& candidates, bool replaceStalePending,
-                                const StaleEdgeScope* staleScope, const util::ProgressCallback& progress)
-{
-    auto txn = db.write();
-    auto report = commitCandidates(db, txn, detectorName, detectorVersion, candidates,
-                                   replaceStalePending, staleScope, progress);
-    util::reportProgress(progress, "committing links");
-    txn.commit();
-    return report;
-}
-
-DetectorReport commitCandidates(objects::ObjectStore& db, objects::WriteTxn& txn,
+static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::WriteTxn& txn,
                                 const std::string& detectorName, int detectorVersion,
                                 const std::vector<LinkCandidate>& candidates, bool replaceStalePending,
-                                const StaleEdgeScope* staleScope, const util::ProgressCallback& progress)
+                                const StaleEdgeScope* staleScope, const util::ProgressCallback& progress, bool validateGeometry)
 {
     if (detectorName.empty())
         throw std::runtime_error("graph links: detector name must be non-empty");
@@ -179,6 +168,7 @@ DetectorReport commitCandidates(objects::ObjectStore& db, objects::WriteTxn& txn
             e.meta = merged.dump();
             e.tags.insert(e.tags.end(), old.tags.begin(), old.tags.end());
             db.updateEdge(txn, e);
+            if (validateGeometry) db.revalidateEdgeGeometry(txn, e.uuid);
             if (db.edgeByUuid(txn, e.uuid)->generation == old.generation) ++report.edgesSkippedExisting;
             else ++report.edgesUpdated;
         } else {
@@ -189,6 +179,36 @@ DetectorReport commitCandidates(objects::ObjectStore& db, objects::WriteTxn& txn
 
     util::reportProgress(progress, "writing links", candidates.size(), candidates.size());
     return report;
+}
+
+DetectorReport commitCandidates(objects::ObjectStore& db, const std::string& detectorName, int detectorVersion,
+                                const std::vector<LinkCandidate>& candidates, bool replaceStalePending,
+                                const StaleEdgeScope* staleScope, const util::ProgressCallback& progress)
+{
+    auto txn = db.write();
+    auto report = commitCandidates(db, txn, detectorName, detectorVersion, candidates,
+                                   replaceStalePending, staleScope, progress);
+    util::reportProgress(progress, "committing links");
+    txn.commit();
+    return report;
+}
+
+DetectorReport commitCandidates(objects::ObjectStore& db, objects::WriteTxn& txn,
+    const std::string& detectorName, int detectorVersion, const std::vector<LinkCandidate>& candidates,
+    bool replaceStalePending, const StaleEdgeScope* staleScope, const util::ProgressCallback& progress)
+{
+    return commitCandidatesImpl(db, txn, detectorName, detectorVersion, candidates,
+        replaceStalePending, staleScope, progress, false);
+}
+
+DetectorReport detail::commitStoredCandidates(objects::ObjectStore& db, const StoredGeometry& inputs,
+    objects::WriteTxn& txn, const std::string& detectorName, int detectorVersion,
+    const std::vector<LinkCandidate>& candidates, bool replaceStalePending,
+    const StaleEdgeScope* staleScope, const util::ProgressCallback& progress)
+{
+    inputs.validate(txn);
+    return commitCandidatesImpl(db, txn, detectorName, detectorVersion, candidates,
+        replaceStalePending, staleScope, progress, true);
 }
 
 DetectorReport linkFibersToFibers(objects::ObjectStore& db, const FiberFiberParams& /*params*/,

@@ -1,15 +1,10 @@
 #pragma once
 
-// Edge *detection* for the unified metadata graph: sibling layer above
-// vc_objects (the store). Detectors read objects from the object DB, load
-// their external geometry, compute candidate connections outside any
-// write transaction, and commit them through commitCandidates(), which
-// stamps detector provenance into each edge's meta and leaves every
-// found edge approval_state='pending' until reviewed.
-//
-// vc_objects also stores immutable geometry; these detectors still read their
-// external source formats. Detector entry points are placeholders
-// until their geometry passes land; the commit plumbing is final.
+// Relationship discovery over immutable geometry in ObjectStore. Detectors
+// select stored objects, compute outside write transactions, and save pending
+// edges in the same store. Source files are only used by ingestion, never here.
+// An empty UUID selection means all objects of the relevant kind. Unknown or
+// wrong-kind UUIDs are errors. Inputs changed during discovery abort publication.
 
 #include <array>
 #include <atomic>
@@ -97,31 +92,23 @@ DetectorReport commitCandidates(objects::ObjectStore& db, objects::WriteTxn& txn
 
 // --- Detectors ---
 struct PointCollectionPatchParams {
+    std::vector<std::string> collectionUuids, patchUuids;
     double tolerance = 2.5;       // working voxels, matching fit_spiral's default
     double pointScale = 1.0;      // source XYZ -> working XYZ
     double patchScale = 1.0;
     int windowPoints = 1;         // even values use the next odd centered window
     int windowMinPoints = 1;      // clipped at collection ends
-    // Like fit_spiral's explicit input role. When unset, only abs_winding.json
-    // is absolute; source metadata.winding_is_absolute is not authoritative.
+    // Override the ingestion-time role stored in geometry attributes.
     std::optional<bool> absoluteWinding;
     std::string edgeKind = "point-patch";
     bool replaceStalePending = true;
     util::ProgressCallback progress;
 };
 
-// Regular vc_pointcollections JSON -> patches, using Spiral's point projection
-// policy (no CT/strip or fiber-side filtering). Each collection needs a source
-// UUID and becomes kind="point_collection"; geometry stays in the JSON file.
-// One edge per attached point: aAnchor.index is the source point ID,
-// aAnchor.position is source XYZ, bAnchor.position is projected patch XYZ.
-// Metadata retains grid [row,column], distance and winding annotation.
-// General collections prefer largest valid-quad area, then distance; named
-// between_patches__A__B collections prefer nearest within that pair.
-// Absolute collections bypass the neighbor window. Registration and links
-// commit together; malformed input/cancellation leaves the DB unchanged.
+// Stored point collections -> stored patches. Anchors retain point IDs and
+// source XYZ. General collections prefer largest valid-quad area, then distance;
+// between_patches__A__B collections prefer the nearest within that named pair.
 DetectorReport linkPointCollectionsToPatches(objects::ObjectStore& db,
-    const std::filesystem::path& pointCollectionsJson, const std::filesystem::path& patchesDir,
     const PointCollectionPatchParams& params = {}, const std::atomic_bool* cancel = nullptr);
 
 // PCL->patch, patch overlap, fiber->patch, track->track and track->patch are implemented; the rest are placeholders that
@@ -133,6 +120,7 @@ DetectorReport linkPointCollectionsToPatches(objects::ObjectStore& db,
 // (spiral-fitting's patch_merger, merging-patches branch). Distances
 // are in base-volume voxels unless noted.
 struct PatchOverlapParams {
+    std::vector<std::string> patchUuids;
     int workers = 0; // 0: auto, at most 8; positive: requested search concurrency
     util::ProgressCallback progress; // optional; no terminal output from the library
     // 3D distance within which two surface points are the same sheet.
@@ -165,18 +153,10 @@ struct PatchOverlapParams {
     std::string edgeKind = "same-surface";
     bool replaceStalePending = true;
 };
-// Patch <-> patch: surfaces physically connected along the same sheet.
-// Loads every tifxyz segment directory under patchesDir, registers
-// patch objects by their meta.json UUIDs where missing, and for each
-// pair: harvests 3D-proximity correspondences, fits a 2D rigid
-// (optionally reflected) pose between parameterizations by two-point
-// RANSAC gated on 3D tangent-frame agreement, refits with Huber
-// weights, requires the inlier spread gates and dense 3D agreement,
-// and commits accepted pairs as pending edges with fit provenance
-// (inliers, RMS, spreads, agreement) in edge meta.
-DetectorReport linkPatchOverlaps(objects::ObjectStore& db, const std::filesystem::path& patchesDir,
-                                 const PatchOverlapParams& params = {},
-                                 const std::atomic_bool* cancel = nullptr);
+// Stored patches on the same sheet, using 3D correspondences, robust UV fitting
+// and dense overlap agreement. Accepted pairs become pending edges.
+DetectorReport linkPatchOverlaps(objects::ObjectStore& db,
+    const PatchOverlapParams& params = {}, const std::atomic_bool* cancel = nullptr);
 
 // Shared parameters for fiber/track->patch auto-linking, ported from
 // vc::constraints::AutoLink. The historical review results apply to
@@ -185,6 +165,7 @@ DetectorReport linkPatchOverlaps(objects::ObjectStore& db, const std::filesystem
 // original 7-row ribbon: stripRowsEachSide rows at stripSpacing on
 // each side of the centerline (default: one row at 20 vx each side).
 struct LinePatchParams {
+    std::vector<std::string> patchUuids;
     util::ProgressCallback progress; // optional; no terminal output from the library
     // Isotropic coordinate multipliers: source XYZ * scale = working XYZ.
     // All detector distances are working voxels. Working XYZ multiplied by
@@ -222,38 +203,23 @@ struct LinePatchParams {
 };
 // The shared rules apply to both fiber and track centerlines.
 struct FiberPatchParams : LinePatchParams {
+    std::vector<std::string> fiberUuids;
+    // Optional disposable strip cache; empty keeps all work in memory.
+    std::filesystem::path cacheDirectory;
     double fiberScale = 1.0;
-    // Strips are automatically cached in fibersDir/.strip-cache/<uuid>.cbor.
+    // When cacheDirectory is set, strips use <uuid>.cbor entries.
     // Geometry, strip parameters, normal method, source location and source
     // metadata invalidate the cache. CT/normal voxel data is assumed immutable;
     // set this after editing it in place without changing its metadata.
     bool rebuildStrips = false;
 };
 
-// Fiber -> patch auto-linking, a port of vc::constraints::autoLinkFiber
-// (removed constraint-graph workspace; see ConstraintGraph.md in git
-// history). Loads vc3d_fiber JSON files from fibersDir and tifxyz
-// segment dirs from patchesDir, registers fiber/patch objects by UUID
-// where missing, and per fiber: discovers candidate patches by dense
-// line-point proximity, builds the (reduced) normal-field strip from
-// CT intensities at ctVolume, links long-contact patches
-// that agree with the strip as anchors, then grows the linked set by
-// same-sheet overlap until stable. Linked pairs become pending edges
-// (fiber anchor at the median contact line point) with
-// the linker measurements as provenance. Source geometry is scaled only
-// in memory; anchor positions and registered object geometry remain in
-// source coordinates. Only line points between the projected first and last
-// control points participate; without controls the full line is eligible.
-// Anchor indices address the original line_points array. Provenance records
-// the coordinate multipliers.
-// Cancellation returns a problem without committing edges. Failed fibers
-// and unreadable patches are excluded from stale-edge removal, as are
-// objects outside these input directories.
-DetectorReport linkFibersToPatches(objects::ObjectStore& db, const std::filesystem::path& fibersDir,
-                                   const std::filesystem::path& patchesDir,
-                                   const std::filesystem::path& ctVolume,
-                                   const FiberPatchParams& params = {},
-                                   const std::atomic_bool* cancel = nullptr);
+// Stored fibers -> stored patches. CT or Lasagna supplies the normal field.
+// Only line points between projected endpoint controls participate. Anchors use
+// raw line indices and source XYZ. Failed inputs are excluded from stale removal.
+DetectorReport linkFibersToPatches(objects::ObjectStore& db,
+    const std::filesystem::path& ctVolume, const FiberPatchParams& params = {},
+    const std::atomic_bool* cancel = nullptr);
 
 struct FiberFiberParams {
     double maxDistanceVoxels = 3.0;  // control/line point proximity for candidate pairs
@@ -277,11 +243,6 @@ DetectorReport linkTracksToFibers(objects::ObjectStore& db, const TrackFiberPara
 
 struct TrackTrackParams {
     util::ProgressCallback progress; // optional; no terminal output from the library
-    // DBM logical path (also accepts .dbm.db) or packed .vctracks directory.
-    // Nonempty: discover/register tracks and compute links, atomically.
-    // Empty: link already registered tracks as before.
-    std::filesystem::path tracksPath;
-    std::vector<uint64_t> sourceIds; // optional subset when tracksPath is supplied
     double minAngleDegrees = 30.0;
     double tangentRadiusVoxels = 12.0; // Euclidean radius, not arclength
     int clusterIndexRadius = 4;
@@ -291,33 +252,20 @@ struct TrackTrackParams {
     std::string edgeKind = "crossing";
     bool replaceStalePending = true;
 };
-// Track <-> track: opposite-family tracks sharing voxels, mirroring
-// Spiral's exact-voxel crossing relation. tracksPath discovers the adjacent
-// .vctracks geometry for a DBM and registers the input tracks automatically.
-// It never reads or writes crossings.npz. Without tracksPath, reads directories
-// named by track.datasetRef (relative to the object DB, or absolute). externalKey
-// is the decimal source_id, not the row index. Only registered/selected tracks
-// within the same dataset are paired; unknown families are ignored. Point
-// indices are raw local indices; anchor positions/directions are XYZ in dataset
-// voxel units. Selects one crossing per pair by clustered median and greatest
-// endpoint clearance. On load failure or cancellation, no edges are changed.
-// Stale removal is limited to selected endpoints and the requested edge kind.
+// Opposite-family stored tracks sharing voxels within the same dataset.
+// datasetRef is an identity/grouping label, never a path to open. Raw local point
+// indices and source XYZ anchor each crossing. Failure/cancellation writes nothing.
 DetectorReport linkTracksToTracks(objects::ObjectStore& db, const TrackTrackParams& params = {},
                                   const std::atomic_bool* cancel = nullptr);
 
 struct TrackPatchParams : LinePatchParams {
     double trackScale = 1.0; // source track XYZ -> working XYZ
-    std::vector<uint64_t> sourceIds; // optional subset of a packed dataset
     std::vector<std::string> trackUuids; // optional existing graph-object subset
 };
 // Uses the same discovery, CT strip, contact gates and growth as fiber->patch.
-// Accepts a DBM or packed .vctracks directory and registers tracks automatically.
-// Track anchors use raw point indices (median contact), with source XYZ positions.
-// Failed inputs are excluded from stale removal; registration/edges commit together.
-DetectorReport linkTracksToPatches(objects::ObjectStore& db, const std::filesystem::path& tracksPath,
-                                   const std::filesystem::path& patchesDir,
-                                   const std::filesystem::path& ctVolume,
-                                   const TrackPatchParams& params = {},
-                                   const std::atomic_bool* cancel = nullptr);
+// Reads stored tracks and patches; anchors use raw indices and source XYZ.
+DetectorReport linkTracksToPatches(objects::ObjectStore& db,
+    const std::filesystem::path& ctVolume, const TrackPatchParams& params = {},
+    const std::atomic_bool* cancel = nullptr);
 
 }  // namespace vc::object_links

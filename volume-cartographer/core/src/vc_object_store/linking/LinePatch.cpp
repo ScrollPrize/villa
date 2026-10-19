@@ -1,3 +1,4 @@
+#include "linking/StoredGeometry.hpp"
 // Shared line->patch geometry for fibers and tracks: a port of
 // vc::constraints::autoLinkFiber + makeFastFiberNode from the removed
 // constraint-graph workspace (see ConstraintGraph.md in git history at
@@ -431,7 +432,7 @@ std::shared_ptr<QuadSurface> cachedStrip(const LineData& fiber, const SheetNorma
         std::error_code ec;
         std::filesystem::remove(temporary, ec);
         checkCancelled(cancel);
-        report.problems.push_back(fiber.path.filename().string() + ": could not save strip cache: " + e.what());
+        report.problems.push_back(fiber.uuid + ": could not save strip cache: " + e.what());
     }
     return strip;
 }
@@ -526,7 +527,6 @@ struct Surface {
 };
 
 struct Patch {
-    std::filesystem::path path;
     std::string uuid;
     std::unique_ptr<Surface> surface;
 };
@@ -718,8 +718,8 @@ void validateLinePatchParams(const LinePatchParams& params, double sourceScale)
         throw std::invalid_argument("graph links: invalid source coordinate scale");
 }
 
-DetectorReport linkLinesToPatches(objects::ObjectStore& db, size_t lineCount, const LineLoader& load,
-    const std::filesystem::path& patchesDir, const std::filesystem::path& ctVolume,
+DetectorReport linkLinesToPatches(objects::ObjectStore& db, StoredGeometry& inputs, size_t lineCount, const LineLoader& load,
+    const std::filesystem::path& ctVolume,
     const LinePatchParams& params, double sourceScale, const char* detector, int version,
     const std::atomic_bool* cancel)
 {
@@ -738,11 +738,7 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, size_t lineCount, co
                 report.problems.push_back(std::string("fiber strip cache unavailable: ") + e.what());
             }
         }
-        util::reportProgress(params.progress, "scanning patch directory");
-        std::vector<std::filesystem::path> dirs;
-        for (const auto& e : std::filesystem::directory_iterator(patchesDir))
-            if (e.is_directory() && std::filesystem::exists(e.path() / "meta.json")) dirs.push_back(e.path());
-        std::sort(dirs.begin(), dirs.end());
+        const auto objects = inputs.select("patch", params.patchUuids);
         std::set<std::string> identities;
         auto unique = [&](const std::string& uuid) {
             if (!identities.insert(uuid).second)
@@ -750,16 +746,15 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, size_t lineCount, co
         };
         std::vector<Patch> patches;
         size_t patchNumber = 0;
-        for (const auto& dir : dirs) {
-            util::reportProgress(params.progress, "loading patches", patchNumber++, dirs.size(), dir.filename().string());
+        for (const auto& object : objects) {
+            util::reportProgress(params.progress, "loading patches", patchNumber++, objects.size(), object.uuid);
             checkCancelled(cancel);
             std::shared_ptr<QuadSurface> quad;
             std::unique_ptr<Surface> surface;
             std::string uuid;
             try {
-                quad = std::make_shared<QuadSurface>(dir);
-                if (!vc::util::isUuid(quad->objectUuid())) throw std::runtime_error("missing/invalid UUID");
-                uuid = quad->objectUuid();
+                quad = patchSurface(inputs.load(object));
+                uuid = object.uuid;
                 const auto scale = quad->scale();
                 if (!(scale[0] > 0) || !(scale[1] > 0) || !std::isfinite(scale[0]) || !std::isfinite(scale[1]))
                     throw std::runtime_error("invalid patch scale");
@@ -778,15 +773,14 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, size_t lineCount, co
                 }
                 surface = std::make_unique<Surface>(quad);
             } catch (const std::exception& e) {
-                report.problems.push_back(dir.filename().string() + ": " + e.what() + ", skipped");
+                report.problems.push_back(object.uuid + ": " + e.what() + ", skipped");
                 continue;
             }
             unique(uuid);
-            patches.push_back({dir, uuid, std::move(surface)});
+            patches.push_back({uuid, std::move(surface)});
         }
-        util::reportProgress(params.progress, "loading patches", dirs.size(), dirs.size());
+        util::reportProgress(params.progress, "loading patches", objects.size(), objects.size());
         report.objectsConsidered = int64_t(patches.size());
-        std::vector<objects::ObjectRecord> registrations;
         // One discovery index finds every patch touched by each dense line
         // point. locateAll returns one nearest hit per surface.
         SurfacePatchIndex discovery;
@@ -813,7 +807,6 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, size_t lineCount, co
             const auto& fiber = *loaded;
             unique(fiber.uuid);
             ++report.objectsConsidered;
-            registrations.push_back(fiber.object);
             const auto item = std::string(tracks ? "track " : "fiber ") +
                 std::to_string(input + 1) + "/" + std::to_string(lineCount);
             auto lineParams = params;
@@ -844,7 +837,7 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, size_t lineCount, co
                 autoLink(fiber, proposals, patches, sampler, lineParams, sourceScale, stripSource, report, cancel);
             } catch (const std::exception& e) {
                 checkCancelled(cancel);
-                report.problems.push_back(fiber.path.filename().string() + ": " + e.what() + ", skipped");
+                report.problems.push_back(fiber.uuid + ": " + e.what() + ", skipped");
                 continue;
             }
             if (std::getenv("VC_FIBER_PATCH_PROFILE")) {
@@ -858,7 +851,7 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, size_t lineCount, co
                     maxSame = std::max(maxSame, proposal.stripSame);
                     maxAdjacent = std::max(maxAdjacent, proposal.stripAdjacent);
                 }
-                const nlohmann::json profile{{"fiber", fiber.path.filename().string()},
+                const nlohmann::json profile{{"fiber", fiber.uuid},
                     {"proposals", proposals.size()}, {"eligible", eligible}, {"anchors", anchors},
                     {"linked", linked}, {"max_contact", maxContact},
                     {"max_strip_same", maxSame}, {"max_strip_adjacent", maxAdjacent}};
@@ -895,7 +888,7 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, size_t lineCount, co
                     {"normal_method", sampler.method()},
                     {"pred_dt_snap", false},
                     {"anchor_index_space", "line_points"}, {"anchor_position_space", "source"}, {"measurement_space", "working_voxels"}};
-                if (tracks) {
+                if (tracks && fiber.object.track) {
                     metadata["track_dataset_ref"] = fiber.object.track->datasetRef;
                     metadata["track_source_id"] = fiber.object.track->externalKey;
                 }
@@ -906,46 +899,12 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, size_t lineCount, co
             }
         }
         checkCancelled(cancel);
-        // Geometry work is complete before any registration writes. Preserve
-        // existing annotations; changed measurements invalidate approval.
-        // UUID kind conflicts abort atomically.
         util::reportProgress(params.progress, linkingStage, lineCount, lineCount);
-        util::reportProgress(params.progress, "registering objects");
         auto txn = db.write();
-        auto registerObject = [&](objects::ObjectRecord rec) {
-            if (const auto existing = db.objectByUuid(txn, rec.uuid)) {
-                if (existing->kind != rec.kind) throw std::runtime_error("graph links: UUID kind conflict " + rec.uuid);
-                if (rec.track) db.setTrackLength(txn, rec.uuid, rec.track->length, rec.track->family);
-                if (rec.fiber) db.setFiberLength(txn, rec.uuid, rec.fiber->length);
-                return;
-            }
-            db.upsertObject(txn, rec);
-        };
-        for (const auto& rec : registrations) registerObject(rec);
-        for (const auto& patch : patches) {
-            objects::ObjectRecord rec;
-            rec.uuid = patch.uuid;
-            rec.kind = "patch";
-            objects::PatchDetail detail;
-            const auto& s = *patch.surface;
-            detail.gridWidth = s.quad->rawPointsPtr()->cols;
-            detail.gridHeight = s.quad->rawPointsPtr()->rows;
-            detail.scale = {s.quad->scale()[0], s.quad->scale()[1]};
-            detail.bbox = std::array<double, 6>{s.low[0] / params.patchScale, s.low[1] / params.patchScale,
-                s.low[2] / params.patchScale, s.high[0] / params.patchScale,
-                s.high[1] / params.patchScale, s.high[2] / params.patchScale};
-            rec.patch = detail;
-            rec.name = patch.path.filename().string();
-            rec.storageKind = "file";
-            rec.storageRef = std::filesystem::absolute(patch.path).lexically_relative(
-                std::filesystem::absolute(db.path().parent_path())).string();
-            rec.dataGeneration = 1;
-            registerObject(rec);
-        }
         checkCancelled(cancel);
-        const auto committed = commitCandidates(db, txn, detector, version, candidates, params.replaceStalePending, &scope, params.progress);
+        const auto committed = commitStoredCandidates(db, inputs, txn, detector, version, candidates, params.replaceStalePending, &scope, params.progress);
         checkCancelled(cancel);
-        util::reportProgress(params.progress, "committing objects and links");
+        util::reportProgress(params.progress, "committing links");
         txn.commit();
         report.candidatesFound = committed.candidatesFound;
         report.edgesCreated = committed.edgesCreated;
@@ -954,7 +913,7 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, size_t lineCount, co
         report.staleRemoved = committed.staleRemoved;
     } catch (const std::exception&) {
         if (!cancel || !cancel->load()) throw;
-        report.problems.push_back(std::string(detector) + ": cancelled; no objects or edges committed");
+        report.problems.push_back(std::string(detector) + ": cancelled; no edges committed");
     }
     return report;
 }

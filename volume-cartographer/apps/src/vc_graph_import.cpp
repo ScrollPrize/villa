@@ -29,25 +29,24 @@ void usage()
         << "  --no-progress        disable terminal progress reporting (stderr)\n"
         << "  --fibers <dir>       import vc3d_fiber JSON files (objects + branch edges)\n"
         << "  --segments <dir>     register segment dirs with meta.json as patch objects\n"
-        << "  --link-pcl-patches <json>       link point collections to --segments patches (repeatable; no CT)\n"
-        << "  --pcl-tolerance <vx>           maximum point-to-patch distance (default 2.5)\n"
-        << "  --point-scale <factor>         point XYZ -> working XYZ (default 1)\n"
-        << "  --pcl-window-points <n>        centered support window (default 1)\n"
-        << "  --pcl-window-min-points <n>    required hits in that window (default 1)\n"
-        << "  --pcl-absolute / --pcl-relative override abs_winding.json filename rule\n"
-        << "  --tracks <file>      register tracks from a JSON interchange list\n"
-        << "                       ([{dataset_ref, external_key, family, point_count, ...}])\n"
-        << "  --link-track-tracks <dbm>       register tracks and compute crossings directly into SQLite\n"
-        << "  --track-source-id <id>         optional subset of source IDs (repeatable)\n"
-        << "  --track-dataset <ref>           restrict to this exact registered dataset_ref\n"
-        << "  --track-uuid <uuid>             restrict to these tracks (repeatable)\n"
-        << "  --track-workers <n>             crossing workers (default 1)\n"
-        << "  --track-min-angle <degrees>     minimum acute tangent angle (default 30)\n"
-        << "  --track-tangent-radius <vx>     tangent radius in dataset voxels (default 12)\n"
-        << "  --track-cluster-radius <n>      event index clustering radius (default 4)\n"
-        << "  --link-patch-overlaps <dir>\n"
-        << "                       run the patch-overlap detector over the tifxyz\n"
-        << "                       segment dirs in <dir>; creates pending edges\n"
+        << "  --tracks <json>      import track metadata from a track list\n"
+        << "  --link-pcl-patches             link stored point collections to stored patches\n"
+        << "  --pcl-tolerance <vx>           maximum point distance (default 2.5)\n"
+        << "  --point-scale <factor>         point XYZ -> working XYZ\n"
+        << "  --pcl-window-points <n>        support window (default 1)\n"
+        << "  --pcl-window-min-points <n>    required support (default 1)\n"
+        << "  --pcl-absolute / --pcl-relative override stored winding role\n"
+        << "  --link-track-tracks            discover crossings between stored tracks\n"
+        << "  --track-dataset <ref>          restrict to stored dataset identity\n"
+        << "  --track-uuid <uuid>            select track (repeatable)\n"
+        << "  --patch-uuid <uuid>            select patch (repeatable)\n"
+        << "  --fiber-uuid <uuid>            select fiber (repeatable)\n"
+        << "  --collection-uuid <uuid>       select collection (repeatable)\n"
+        << "  --track-workers <n>            crossing workers (default 1)\n"
+        << "  --track-min-angle <deg>        crossing angle gate (default 30)\n"
+        << "  --track-tangent-radius <vx>    tangent radius (default 12)\n"
+        << "  --track-cluster-radius <n>     cluster index radius (default 4)\n"
+        << "  --link-patch-overlaps          discover overlaps between stored patches\n"
         << "  --overlap-workers <n>            search workers (default 0: auto, up to 8)\n"
         << "  --overlap-tolerance <vx>          (default 2)\n"
         << "  --overlap-uv-tolerance <vx>       (default 3)\n"
@@ -59,12 +58,12 @@ void usage()
         << "  --overlap-agreement <0..1>        (default 0.6)\n"
         << "  --overlap-min-fraction <0..1>     (default 0 = off)\n"
         << "  --overlap-edge-kind <name>        (default same-surface)\n"
-        << "  --link-track-patches <dbm>      link tracks to --segments patches (same strip rules)\n"
+        << "  --link-track-patches            link stored tracks to stored patches\n"
         << "  --track-scale <factor>          track XYZ -> working XYZ (default 1)\n"
         << "  --strip-rows <n>                shared strip rows each side (default 1)\n"
         << "  --anchor-contact <vx>           shared minimum anchor contact (default 75)\n"
-        << "  --link-fiber-patches <dir>       link fibers in <dir> to --segments patches\n"
-        << "                       strips are cached automatically in <dir>/.strip-cache/\n"
+        << "  --link-fiber-patches            link stored fibers to stored patches\n"
+        << "  --strip-cache <dir>             optional disposable fiber-strip cache\n"
         << "  --rebuild-fiber-strips          refresh strip caches (e.g. after CT voxel edits)\n"
         << "  --ct <path>                     uint8 CT volume for linking (default normal source)\n"
         << "  --normals-manifest <path>        use Lasagna normals in the same linker instead of CT\n"
@@ -77,7 +76,7 @@ void usage()
         << "  --fiber-anchor-contact <vx>      minimum anchor contact (default 75)\n"
         << "  --import-json <path> import a vc_graph_export JSON document\n"
         << "  --export-json <path> write a vc_graph_export JSON document (- for stdout)\n"
-        << "Creates the database if it does not exist. Imports run in one write\n"
+        << "Ingest geometry with vc_object_ingest before discovery. Metadata imports run in one write\n"
         << "transaction each and print a report (problems go to stderr).\n";
 }
 
@@ -93,9 +92,9 @@ void printReport(const char* what, const ImportReport& report)
 
 int main(int argc, char** argv)
 try {
-    fs::path dbPath, fiberDir, segmentsDir, tracksPath, overlapDir, importJsonPath, exportJsonPath;
-    fs::path linkFiberDir, linkTrackPath, ctVolume;
-    std::vector<fs::path> pclFiles;
+    fs::path dbPath, fiberDir, segmentsDir, tracksPath, importJsonPath, exportJsonPath;
+    fs::path ctVolume;
+    bool linkFibers = false, linkTrackPatches = false, linkPcl = false, linkOverlaps = false;
     vc::object_links::PointCollectionPatchParams pclParams;
     vc::object_links::TrackPatchParams trackPatchParams;
     vc::object_links::FiberPatchParams fiberPatchParams;
@@ -115,7 +114,7 @@ try {
         else if (arg == "--author") author = next("--author");
         else if (arg == "--fibers") fiberDir = next("--fibers");
         else if (arg == "--segments") segmentsDir = next("--segments");
-        else if (arg == "--link-pcl-patches") pclFiles.emplace_back(next(arg.c_str()));
+        else if (arg == "--link-pcl-patches") linkPcl = true;
         else if (arg == "--pcl-tolerance") pclParams.tolerance = std::stod(next(arg.c_str()));
         else if (arg == "--point-scale") pclParams.pointScale = std::stod(next(arg.c_str()));
         else if (arg == "--pcl-window-points") pclParams.windowPoints = std::stoi(next(arg.c_str()));
@@ -123,27 +122,23 @@ try {
         else if (arg == "--pcl-absolute") pclParams.absoluteWinding = true;
         else if (arg == "--pcl-relative") pclParams.absoluteWinding = false;
         else if (arg == "--tracks") tracksPath = next("--tracks");
-        else if (arg == "--link-track-tracks") {
-            linkTracks = true;
-            // A bare flag retains the already-registered-track API.
-            if (i + 1 < argc && std::string(argv[i+1]).rfind("--", 0) != 0)
-                trackParams.tracksPath = next(arg.c_str());
+        else if (arg == "--link-track-tracks") linkTracks = true;
+        else if (arg == "--patch-uuid") {
+            const auto uuid = next(arg.c_str());
+            overlapParams.patchUuids.push_back(uuid);
+            fiberPatchParams.patchUuids.push_back(uuid);
+            pclParams.patchUuids.push_back(uuid);
         }
-        else if (arg == "--track-source-id") {
-            const auto text = next(arg.c_str());
-            size_t used = 0;
-            const auto id = std::stoull(text, &used);
-            if (text.empty() || text[0] == '-' || used != text.size())
-                throw std::runtime_error("invalid track source ID: " + text);
-            trackParams.sourceIds.push_back(id);
-        }
+        else if (arg == "--fiber-uuid") fiberPatchParams.fiberUuids.push_back(next(arg.c_str()));
+        else if (arg == "--collection-uuid") pclParams.collectionUuids.push_back(next(arg.c_str()));
+        else if (arg == "--strip-cache") fiberPatchParams.cacheDirectory = next(arg.c_str());
         else if (arg == "--track-dataset") trackParams.datasetRef = next(arg.c_str());
         else if (arg == "--track-uuid") trackParams.trackUuids.push_back(next(arg.c_str()));
         else if (arg == "--track-workers") trackParams.workers = std::stoi(next(arg.c_str()));
         else if (arg == "--track-min-angle") trackParams.minAngleDegrees = std::stod(next(arg.c_str()));
         else if (arg == "--track-tangent-radius") trackParams.tangentRadiusVoxels = std::stod(next(arg.c_str()));
         else if (arg == "--track-cluster-radius") trackParams.clusterIndexRadius = std::stoi(next(arg.c_str()));
-        else if (arg == "--link-patch-overlaps") overlapDir = next("--link-patch-overlaps");
+        else if (arg == "--link-patch-overlaps") linkOverlaps = true;
         else if (arg == "--overlap-workers") overlapParams.workers = std::stoi(next(arg.c_str()));
         else if (arg == "--overlap-tolerance") overlapParams.tolerance = std::stod(next(arg.c_str()));
         else if (arg == "--overlap-uv-tolerance") overlapParams.uvInlierTolerance = std::stod(next(arg.c_str()));
@@ -155,9 +150,9 @@ try {
         else if (arg == "--overlap-agreement") overlapParams.minAgreementRatio = std::stod(next(arg.c_str()));
         else if (arg == "--overlap-min-fraction") overlapParams.minOverlapFraction = std::stod(next(arg.c_str()));
         else if (arg == "--overlap-edge-kind") overlapParams.edgeKind = next(arg.c_str());
-        else if (arg == "--link-track-patches") linkTrackPath = next(arg.c_str());
+        else if (arg == "--link-track-patches") linkTrackPatches = true;
         else if (arg == "--track-scale") trackPatchParams.trackScale = std::stod(next(arg.c_str()));
-        else if (arg == "--link-fiber-patches") linkFiberDir = next(arg.c_str());
+        else if (arg == "--link-fiber-patches") linkFibers = true;
         else if (arg == "--rebuild-fiber-strips") fiberPatchParams.rebuildStrips = true;
         else if (arg == "--ct") ctVolume = next(arg.c_str());
         else if (arg == "--normals-manifest") fiberPatchParams.normalsManifest = next(arg.c_str());
@@ -182,14 +177,11 @@ try {
         return 2;
     }
 
-    if ((!linkFiberDir.empty() || !linkTrackPath.empty()) && (segmentsDir.empty() || (ctVolume.empty() && fiberPatchParams.normalsManifest.empty())))
-        throw std::runtime_error("patch linking requires --segments and either --ct or --normals-manifest");
-    if (!pclFiles.empty() && segmentsDir.empty())
-        throw std::runtime_error("PCL linking requires --segments");
+    if ((linkFibers || linkTrackPatches) && ctVolume.empty() && fiberPatchParams.normalsManifest.empty())
+        throw std::runtime_error("patch linking requires --ct or --normals-manifest");
     pclParams.patchScale = fiberPatchParams.patchScale;
 
     static_cast<vc::object_links::LinePatchParams&>(trackPatchParams) = fiberPatchParams;
-    trackPatchParams.sourceIds = trackParams.sourceIds;
     trackPatchParams.trackUuids = trackParams.trackUuids;
 
     OpenOptions options;
@@ -197,7 +189,7 @@ try {
     std::error_code ec;
     const bool exists = fs::exists(dbPath) && fs::file_size(dbPath, ec) > 0;
     ObjectStore db = [&] {
-        vc::util::TerminalProgress progress("Open graph database", showProgress);
+        vc::util::TerminalProgress progress("Open object database", showProgress);
         auto graph = exists ? ObjectStore::open(dbPath, options) : ObjectStore::create(dbPath, options);
         progress.finish();
         return graph;
@@ -214,7 +206,7 @@ try {
         progress.finish();
         printReport("fibers", report);
     }
-    if (!segmentsDir.empty() && linkFiberDir.empty() && linkTrackPath.empty() && pclFiles.empty()) {
+    if (!segmentsDir.empty()) {
         vc::util::TerminalProgress progress("Import patches", showProgress);
         auto w = db.write();
         ImportReport report = importPatches(db, w, segmentsDir, progress.callback());
@@ -245,10 +237,10 @@ try {
             std::cerr << "  ! " << problem << "\n";
         trackLinkFailed = !report.problems.empty();
     }
-    if (!overlapDir.empty()) {
+    if (linkOverlaps) {
         vc::util::TerminalProgress progress("Patch overlaps", showProgress);
         overlapParams.progress = progress.callback();
-        const auto report = vc::object_links::linkPatchOverlaps(db, overlapDir, overlapParams);
+        const auto report = vc::object_links::linkPatchOverlaps(db, overlapParams);
         progress.finish();
         std::cout << "patch-overlaps: " << report.objectsConsidered << " patches, "
                   << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
@@ -256,11 +248,11 @@ try {
         for (const auto& problem : report.problems)
             std::cerr << "  ! " << problem << "\n";
     }
-    if (!linkTrackPath.empty()) {
+    if (linkTrackPatches) {
         vc::util::TerminalProgress progress("Track to patch", showProgress);
         trackPatchParams.progress = progress.callback();
         const auto report = vc::object_links::linkTracksToPatches(
-            db, linkTrackPath, segmentsDir, ctVolume, trackPatchParams);
+            db, ctVolume, trackPatchParams);
         progress.finish();
         std::cout << "track-patches: " << report.objectsConsidered << " objects, "
                   << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
@@ -269,11 +261,11 @@ try {
             std::cerr << "  ! " << problem << "\n";
         trackLinkFailed |= !report.problems.empty();
     }
-    if (!linkFiberDir.empty()) {
+    if (linkFibers) {
         vc::util::TerminalProgress progress("Fiber to patch", showProgress);
         fiberPatchParams.progress = progress.callback();
         const auto report = vc::object_links::linkFibersToPatches(
-            db, linkFiberDir, segmentsDir, ctVolume, fiberPatchParams);
+            db, ctVolume, fiberPatchParams);
         progress.finish();
         std::cout << "fiber-patches: " << report.objectsConsidered << " objects, "
                   << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
@@ -281,10 +273,10 @@ try {
         for (const auto& problem : report.problems)
             std::cerr << "  ! " << problem << "\n";
     }
-    for (const auto& pclFile : pclFiles) {
+    if (linkPcl) {
         vc::util::TerminalProgress progress("Point collections to patches", showProgress);
         pclParams.progress = progress.callback();
-        const auto report = vc::object_links::linkPointCollectionsToPatches(db, pclFile, segmentsDir, pclParams);
+        const auto report = vc::object_links::linkPointCollectionsToPatches(db, pclParams);
         progress.finish();
         std::cout << "pcl-patches: " << report.objectsConsidered << " objects, "
                   << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "

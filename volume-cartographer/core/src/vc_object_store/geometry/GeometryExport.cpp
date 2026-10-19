@@ -1,3 +1,4 @@
+#include "geometry/GeometrySnapshot.hpp"
 #include "vc/core/objects/GeometryExport.hpp"
 #include "vc/core/util/Tiff.hpp"
 #include "vc/core/util/Uuid.hpp"
@@ -25,23 +26,7 @@ namespace vc::objects {
 namespace {
 namespace fs = std::filesystem;
 using Json = nlohmann::json;
-struct Snapshot {
-    GeometryRevision revision;
-    std::map<std::string, std::vector<uint8_t>> arrays;
-    template<class T> std::vector<T> values(const std::string& name) const {
-        auto bytes = arrays.at(name);
-        if (bytes.size() % sizeof(T)) throw std::runtime_error("invalid scalar array size");
-        if constexpr (std::endian::native != std::endian::little)
-            for (size_t i = 0; i < bytes.size(); i += sizeof(T))
-                std::reverse(bytes.begin() + i, bytes.begin() + i + sizeof(T));
-        std::vector<T> result(bytes.size() / sizeof(T));
-        if (!bytes.empty()) std::memcpy(result.data(), bytes.data(), bytes.size());
-        if constexpr (std::is_floating_point_v<T>)
-            for (auto value : result)
-                if (!std::isfinite(value)) throw std::runtime_error("native export requires finite coordinates");
-        return result;
-    }
-};
+using Snapshot = detail::GeometrySnapshot;
 void writeBytes(const fs::path& path, const void* data, size_t size)
 {
     std::ofstream output;

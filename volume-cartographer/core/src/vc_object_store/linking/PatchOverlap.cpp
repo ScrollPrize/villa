@@ -1,3 +1,4 @@
+#include "linking/StoredGeometry.hpp"
 // Patch-overlap detector for vc_object_links.
 //
 // Pair acceptance follows spiral-fitting's patch_merger (merging-patches
@@ -10,7 +11,6 @@
 // commitCandidates(); no merged geometry is produced here.
 
 #include "vc/core/object_links/ObjectLinks.hpp"
-#include "formats/PatchInput.hpp"
 
 #include <algorithm>
 #include <array>
@@ -90,7 +90,6 @@ struct SamplePoint {
 };
 
 struct LoadedPatch {
-    std::filesystem::path path;
     std::string uuid;
     std::shared_ptr<QuadSurface> surface;
     const cv::Mat_<cv::Vec3f>* points = nullptr; // stable for this read-only detector run
@@ -159,28 +158,21 @@ std::optional<cv::Vec3f> sampleXyz(const LoadedPatch& patch, Vec2 uv)
                      interp(p00[2], p10[2], p01[2], p11[2])};
 }
 
-std::optional<LoadedPatch> loadPatch(const std::filesystem::path& dir, const PatchOverlapParams& params,
+std::optional<LoadedPatch> loadPatch(detail::StoredGeometry& inputs, const objects::ObjectRecord& object, const PatchOverlapParams& params,
                                      DetectorReport& report)
 {
     LoadedPatch patch;
-    patch.path = dir;
     try {
-        objects::detail::validatePatchFiles(dir);
-        patch.surface = std::make_shared<QuadSurface>(dir);
-        patch.uuid = patch.surface->objectUuid();
-        if (!vc::util::isUuid(patch.uuid)) {
-            report.problems.push_back(dir.filename().string() +
-                                      ": meta.json has no valid uuid, skipped");
-            return std::nullopt;
-        }
+        patch.surface = detail::patchSurface(inputs.load(object));
+        patch.uuid = object.uuid;
         patch.scale = patch.surface->scale();
         if (!(patch.scale[0] > 0) || !(patch.scale[1] > 0)) {
-            report.problems.push_back(dir.filename().string() + ": invalid scale, skipped");
+            report.problems.push_back(object.uuid + ": invalid scale, skipped");
             return std::nullopt;
         }
         patch.surface->ensureLoaded();
     } catch (const std::exception& e) {
-        report.problems.push_back(dir.filename().string() + ": load failed: " + e.what());
+        report.problems.push_back(object.uuid + ": load failed: " + e.what());
         return std::nullopt;
     }
     const auto* points = patch.surface->rawPointsPtr();
@@ -207,7 +199,7 @@ std::optional<LoadedPatch> loadPatch(const std::filesystem::path& dir, const Pat
         }
     }
     if (patch.samples.empty()) {
-        report.problems.push_back(dir.filename().string() + ": no usable samples, skipped");
+        report.problems.push_back(object.uuid + ": no usable samples, skipped");
         return std::nullopt;
     }
     return patch;
@@ -309,7 +301,7 @@ std::map<size_t, CorrespondenceCollector> harvestTargets(const LoadedPatch& seed
     }
     using Matches = std::map<size_t, CorrespondenceCollector>;
     std::atomic_size_t completed{0};
-    const auto label = seed.path.filename().string() + " -> " + std::to_string(targets.size()) + " patches";
+    const auto label = seed.uuid + " -> " + std::to_string(targets.size()) + " patches";
     auto harvestRange = [&](size_t begin, size_t end) {
         Matches local;
         SurfacePatchIndex::SurfaceFilter filter;
@@ -655,69 +647,34 @@ void validateParams(const PatchOverlapParams& params)
 
 }  // namespace
 
-DetectorReport linkPatchOverlaps(objects::ObjectStore& db, const std::filesystem::path& patchesDir,
+DetectorReport linkPatchOverlaps(objects::ObjectStore& db,
                                  const PatchOverlapParams& params, const std::atomic_bool* cancel)
 {
     validateParams(params);
     Profile profile;
     const auto& progress = params.progress;
-    util::reportProgress(progress, "scanning patch directory");
+    util::reportProgress(progress, "selecting stored patches");
     DetectorReport report;
     auto cancelled = [&] { return cancel && cancel->load(); };
 
-    std::vector<std::filesystem::path> dirs;
-    for (const auto& entry : std::filesystem::directory_iterator(patchesDir))
-        if (entry.is_directory() && std::filesystem::exists(entry.path() / "meta.json"))
-            dirs.push_back(entry.path());
-    std::sort(dirs.begin(), dirs.end());
+    detail::StoredGeometry inputs(db);
+    const auto objects = inputs.select("patch", params.patchUuids);
 
     std::vector<LoadedPatch> patches;
     size_t loadedCount = 0;
-    for (const auto& dir : dirs) {
-        util::reportProgress(progress, "loading patches", loadedCount++, dirs.size(), dir.filename().string());
+    for (const auto& object : objects) {
+        util::reportProgress(progress, "loading patches", loadedCount++, objects.size(), object.uuid);
         if (cancelled()) {
             report.problems.push_back("patch-overlap: cancelled during loading");
             return report;
         }
         PhaseTimer loadingTimer(profile.enabled ? &profile.loading : nullptr);
-        if (auto loaded = loadPatch(dir, params, report))
+        if (auto loaded = loadPatch(inputs, object, params, report))
             patches.push_back(std::move(*loaded));
     }
-    util::reportProgress(progress, "loading patches", dirs.size(), dirs.size());
+    util::reportProgress(progress, "loading patches", objects.size(), objects.size());
     report.objectsConsidered = int64_t(patches.size());
     for (const auto& patch : patches) profile.samples += patch.samples.size();
-
-    // Register any patch objects the DB does not know about yet, so edges
-    // always have endpoints. Existing registrations are left untouched.
-    {
-        auto txn = db.write();
-        const auto dbDir = db.path().parent_path();
-        size_t registered = 0;
-        for (const auto& patch : patches) {
-            util::reportProgress(progress, "registering patches", registered++, patches.size());
-            if (db.objectByUuid(txn, patch.uuid)) continue;
-            objects::ObjectRecord rec;
-            rec.uuid = patch.uuid;
-            rec.kind = "patch";
-            rec.name = patch.path.filename().string();
-            rec.storageKind = "file";
-            std::error_code ec;
-            const auto rel = std::filesystem::relative(patch.path, dbDir, ec);
-            rec.storageRef = ec ? patch.path.filename().string() : rel.string();
-            rec.dataGeneration = 1;
-            objects::PatchDetail detail;
-            const auto* points = patch.surface->rawPointsPtr();
-            detail.gridWidth = points->cols;
-            detail.gridHeight = points->rows;
-            detail.scale = {patch.scale[0], patch.scale[1]};
-            detail.bbox = std::array<double, 6>{patch.bboxLow[0], patch.bboxLow[1], patch.bboxLow[2],
-                                                patch.bboxHigh[0], patch.bboxHigh[1], patch.bboxHigh[2]};
-            rec.patch = detail;
-            db.upsertObject(txn, rec);
-        }
-        util::reportProgress(progress, "registering patches", patches.size(), patches.size());
-        txn.commit();
-    }
 
     // Triangle-accurate spatial index over every loaded patch, as in
     // vc_seg_add_overlap; each seed sample queries all eligible targets at once.
@@ -827,7 +784,10 @@ DetectorReport linkPatchOverlaps(objects::ObjectStore& db, const std::filesystem
 
     StaleEdgeScope scope{{params.edgeKind}, {}};
     for (const auto& patch : patches) scope.objectUuids.push_back(patch.uuid);
-    DetectorReport committed = commitCandidates(db, kPatchOverlapDetector, 1, candidates, params.replaceStalePending, &scope, progress);
+    auto txn = db.write();
+    DetectorReport committed = detail::commitStoredCandidates(db, inputs, txn, kPatchOverlapDetector, 1, candidates, params.replaceStalePending, &scope, progress);
+    if (cancelled()) throw std::runtime_error("patch-overlap: cancelled before commit");
+    txn.commit();
     report.candidatesFound = committed.candidatesFound;
     report.edgesCreated = committed.edgesCreated;
     report.edgesUpdated = committed.edgesUpdated;
