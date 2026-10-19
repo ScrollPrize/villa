@@ -14,12 +14,15 @@ directory, plus the CT as a zarr array or OME-Zarr group (path or URL).
 Outputs per surface: ``<name>.json`` (summary), ``<name>.samples.csv`` (one row
 per sample with coordinates, so the offsets can be viewed in place), and
 ``aggregate.csv`` across surfaces. ``--plot`` adds ``<name>.png``.
+
+Assumes an isotropic voxel grid: offsets, smoothing and tangent radii are in voxels, not physical units.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -34,7 +37,7 @@ import numpy as np
 from vesuvius.image_proc.run.label_topology_audit import _parse_fail_on, open_volume
 
 METRICS = (
-    "n_samples", "n_inside_volume", "n_valid", "no_peak_frac",
+    "n_samples", "n_inside_volume", "n_valid", "no_peak_frac", "n_censored", "censored_frac",
     "offset_median", "offset_q25", "offset_q75", "offset_mean_abs",
     "offset_abs_gt_1_frac", "offset_abs_gt_2_frac", "offset_abs_gt_3_frac", "offset_at_limit_frac",
     "off_sheet_frac", "sheet_fwhm_median", "contrast_median",
@@ -234,13 +237,14 @@ class ChunkCache:
 
     A second run against the same remote volume (another surface, the controls'
     re-reads, a rerun with other settings) then reads from disk instead of the
-    server. Files are keyed by the volume's shape, chunk size and dtype, so a
-    different volume or level gets its own directory. Leading non-spatial axes
+    server. Files are keyed by the volume's source (path or URL, plus size and
+    mtime for a local file), level, shape, chunk size and dtype, so a different
+    volume or level gets its own directory even when the geometry is identical. Leading non-spatial axes
     are read at index 0. Writes go through a temp file and ``os.replace`` so
     concurrent threads never see a partial chunk.
     """
 
-    def __init__(self, vol, root: str, default_chunk: int = 128):
+    def __init__(self, vol, root: str, default_chunk: int = 128, source: str = "", level: str = "0"):
         self.vol = vol
         self.ndim = vol.ndim
         self.shape = tuple(int(n) for n in vol.shape)
@@ -248,7 +252,12 @@ class ChunkCache:
         self.spatial = self.shape[-3:]
         chunks = getattr(vol, "chunks", None) or (default_chunk,) * 3
         self.chunks = tuple(int(c) for c in chunks[-3:])
-        tag = "x".join(map(str, self.spatial)) + "_c" + "x".join(map(str, self.chunks)) + "_" + self.dtype.name
+        ident = f"{source}|{level}"
+        if source and os.path.exists(source):
+            st = os.stat(source)
+            ident += f"|{st.st_size}|{st.st_mtime_ns}"
+        digest = hashlib.sha1(ident.encode()).hexdigest()[:12]
+        tag = digest + "_" + "x".join(map(str, self.spatial)) + "_c" + "x".join(map(str, self.chunks)) + "_" + self.dtype.name
         self.root = os.path.join(root, tag)
         os.makedirs(self.root, exist_ok=True)
         self.fetched = 0
@@ -344,12 +353,11 @@ def nearest_peak(prof: np.ndarray, t: np.ndarray, min_contrast: float, min_promi
     rng_[has] = np.nanmax(prof[has], 1) - np.nanmin(prof[has], 1)
     off = np.full(n, np.nan)
     val = np.zeros(n, bool)
-    c = m // 2
     # local maxima (plateaus count once, at their first sample)
     left = np.hstack([np.full((n, 1), -np.inf), prof[:, :-1]])
     right = np.hstack([prof[:, 1:], np.full((n, 1), -np.inf)])
     ismax = (prof > left) & (prof >= right)
-    order = np.argsort(np.abs(np.arange(m) - c), kind="stable")
+    order = np.argsort(np.abs(t), kind="stable")  # nearest to t=0, not to the middle index
     for i in range(n):
         if not np.isfinite(rng_[i]) or rng_[i] < min_contrast:
             continue
@@ -366,8 +374,22 @@ def nearest_peak(prof: np.ndarray, t: np.ndarray, min_contrast: float, min_promi
     return off, rng_, val
 
 
+def censored_profiles(prof: np.ndarray, contrast: np.ndarray, valid: np.ndarray, min_contrast: float) -> np.ndarray:
+    """Profiles with enough contrast and no accepted peak whose maximum is an end sample.
+
+    The sheet may lie at or beyond the search limit; such a profile cannot be told from a rising
+    flank, so it is not an offset (``nearest_peak`` is unchanged) but it is not "no peak" either.
+    """
+    cen = np.zeros(len(prof), bool)
+    ok = np.isfinite(contrast) & (contrast >= min_contrast) & ~valid
+    for i in np.flatnonzero(ok):
+        j = int(np.nanargmax(prof[i]))
+        cen[i] = j == 0 or j == prof.shape[1] - 1
+    return cen
+
+
 def summarize(off: np.ndarray, contrast: np.ndarray, valid: np.ndarray, inside: np.ndarray, patch: np.ndarray,
-              prof: np.ndarray, t: np.ndarray, half: float) -> dict[str, Any]:
+              prof: np.ndarray, t: np.ndarray, half: float, min_contrast: float = 0.0) -> dict[str, Any]:
     o = off[valid]
     q = lambda x, p: float(np.percentile(x, p)) if len(x) else float("nan")  # noqa: E731
     # sheet width at the located peak: half-maximum width of the profile around it
@@ -385,12 +407,11 @@ def summarize(off: np.ndarray, contrast: np.ndarray, valid: np.ndarray, inside: 
         fw.append(t[b] - t[a])
     fw = np.asarray(fw)
     # on-sheet: the CT at the surface point is at least the half-maximum of its peak
-    c = len(t) // 2
     on = []
     for i in np.flatnonzero(valid):
         p = prof[i]
         j = int(np.argmin(np.abs(t - off[i])))
-        on.append(p[c] >= (p[j] + np.nanmin(p)) / 2)
+        on.append(np.interp(0.0, t, p) >= (p[j] + np.nanmin(p)) / 2)  # t=0 need not be a sample
     on = np.asarray(on, bool)
     # per-patch median offset: where the surface drifts
     pm = []
@@ -399,11 +420,14 @@ def summarize(off: np.ndarray, contrast: np.ndarray, valid: np.ndarray, inside: 
         if len(s) >= 30:
             pm.append(float(np.median(s)))
     pm = np.asarray(pm)
+    cen = censored_profiles(prof, contrast, valid, min_contrast) & inside
     out = {
         "n_samples": int(len(off)),
         "n_inside_volume": int(inside.sum()),
         "n_valid": int(valid.sum()),
         "no_peak_frac": float(1 - valid.sum() / max(1, inside.sum())),
+        "n_censored": int(cen.sum()),
+        "censored_frac": float(cen.sum() / max(1, inside.sum())),
         "offset_median": q(o, 50), "offset_q25": q(o, 25), "offset_q75": q(o, 75),
         "offset_mean_abs": float(np.mean(np.abs(o))) if len(o) else float("nan"),
         "offset_abs_gt_1_frac": float(np.mean(np.abs(o) > 1)) if len(o) else float("nan"),
@@ -518,7 +542,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     limits = parse_fail_on(a.fail_on)
     vol = open_volume(a.volume, a.level)
     if a.cache:
-        vol = ChunkCache(vol, a.cache)
+        vol = ChunkCache(vol, a.cache, source=a.volume, level=a.level)
     os.makedirs(a.out, exist_ok=True)
     rng = np.random.default_rng(a.seed)
     rows: list[dict[str, Any]] = []
@@ -532,7 +556,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         prof, t, inside = read_profiles(vol, P, N, a.half, a.step, a.sigma, workers=a.workers)
         off, contrast, valid = nearest_peak(prof, t, a.min_contrast, a.min_prominence)
         valid &= inside
-        m = summarize(off, contrast, valid, inside, patch, prof, t, a.half)
+        m = summarize(off, contrast, valid, inside, patch, prof, t, a.half, a.min_contrast)
         m.update(controls(vol, P, N, off, valid, a, rng))
         m.update({"surface": name, "source": src, "volume": a.volume, "n_vertices": int(n_vert),
                   "half": a.half, "step": a.step, "sigma": a.sigma,

@@ -20,6 +20,9 @@ Per crop it measures:
   * non-planar junction clusters (structure tensor): a clean sheet is rank-1;
     a second large eigenvalue marks merged sheets or bridges
 
+Assumes an isotropic voxel grid: connectivity, erosion, EDT thickness and smoothing are in
+voxels, not physical units.
+
 Usage:
   vesuvius.label_topology_audit --label LABEL.tif --out DIR
   vesuvius.label_topology_audit --label LABEL.tif --image IMG.tif --out DIR --plot
@@ -565,25 +568,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             return tifffile.imread(vol)
         return read_window(vol, w)
 
-    # one read per window; with several thresholds every cut becomes its own crop
-    cuts = []
-    for name, label_win, image_win, after_win in jobs:
-        raw = load(label_win)
-        raw_after = load(after_win) if after_win else None
-        if raw_after is not None and raw_after.shape != raw.shape:
-            ap.error(f"{name}: --after shape {raw_after.shape} differs from label shape {raw.shape}")
-        img = None
-        if a.plot and image_win is not None:
-            img = load(image_win)
-            if img.shape != raw.shape:
-                ap.error(f"{name}: image shape {img.shape} differs from label shape {raw.shape}")
-        for t in (thresholds or [None]):
-            cut = f"{name}_t{t:g}" if sweep else name
-            cuts.append((cut, binarise(raw, t), binarise(raw_after, t) if raw_after is not None else None,
-                         img, after_win is not None))
+    # one read per window, taken lazily so only the current window's cuts are in memory;
+    # with several thresholds every cut becomes its own crop
+    def iter_cuts():
+        for name, label_win, image_win, after_win in jobs:
+            raw = load(label_win)
+            raw_after = load(after_win) if after_win else None
+            if raw_after is not None and raw_after.shape != raw.shape:
+                ap.error(f"{name}: --after shape {raw_after.shape} differs from label shape {raw.shape}")
+            img = None
+            if a.plot and image_win is not None:
+                img = load(image_win)
+                if img.shape != raw.shape:
+                    ap.error(f"{name}: image shape {img.shape} differs from label shape {raw.shape}")
+            for t in (thresholds or [None]):
+                cut = f"{name}_t{t:g}" if sweep else name
+                yield (cut, binarise(raw, t), binarise(raw_after, t) if raw_after is not None else None,
+                       img, after_win is not None)
 
     rows, failed = [], False
-    for name, lab, after_lab, img, has_after in cuts:
+    for name, lab, after_lab, img, has_after in iter_cuts():
         try:
             m, flags = audit(lab, a.erode, a.min_piece, surface_value, ignore)
             if after_lab is not None:

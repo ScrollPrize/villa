@@ -222,3 +222,73 @@ def test_cache_flag_gives_the_same_result(tmp_path, ct):
     _, _, again = run(tmp_path / "c", ct, [str(tmp_path / "s.obj")], "--cache", str(tmp_path / "cache"))
     assert direct[0]["offset_median"] == cached[0]["offset_median"] == again[0]["offset_median"]
     assert list((tmp_path / "cache").rglob("*.npy"))
+
+
+def two_sheet_volume(zs, shape=(64, 64, 64), width=1.5):
+    z = np.arange(shape[0])[:, None, None]
+    v = 40 + sum(150 * np.exp(-0.5 * ((z - z0) / width) ** 2) for z0 in zs)
+    return np.broadcast_to(v, shape).astype(np.uint8)
+
+
+def one_surface(tmp_path, ct, z, *extra):
+    pts = grid_points(z)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    obj = tmp_path / "s.obj"
+    write_obj(obj, pts, np.tile([0, 0, 1.0], (len(pts), 1)))
+    _, out, _ = run(tmp_path, ct, [str(obj)], *extra)
+    return json.load(open(out / "s.json"))
+
+
+def test_cache_does_not_mix_two_volumes_with_the_same_geometry(tmp_path):
+    # Same shape, chunks and dtype but different scrolls: a shared --cache dir used to hand the
+    # second run the first volume's intensities, so its sheet appeared where the first one's was.
+    a, b = tmp_path / "a.tif", tmp_path / "b.tif"
+    tifffile.imwrite(a, sheet_volume(z0=30.0))
+    tifffile.imwrite(b, sheet_volume(z0=34.0))
+    cache = str(tmp_path / "cache")
+    ma = one_surface(tmp_path / "ra", str(a), 30.0, "--cache", cache)
+    mb = one_surface(tmp_path / "rb", str(b), 30.0, "--cache", cache)
+    assert ma["offset_median"] == pytest.approx(0.0, abs=0.5)
+    assert mb["offset_median"] == pytest.approx(4.0, abs=0.5)
+
+
+def test_cache_keeps_levels_of_one_source_apart(tmp_path):
+    vol = np.zeros((20, 20, 20), np.uint8)
+    c0 = spa.ChunkCache(vol, str(tmp_path), source="s", level="0")
+    c1 = spa.ChunkCache(vol, str(tmp_path), source="s", level="1")
+    assert c0.root != c1.root
+
+
+def test_non_default_spacing_picks_nearest_peak_by_distance_from_zero(tmp_path):
+    # t = -8, -6.5, ..., -0.5, 1, 2.5, ...: no sample at 0. Sheets at -2 and +2.5; the nearer is -2,
+    # but picking by index distance from the middle sample (t=+1) chose +2.5.
+    p = tmp_path / "ct.tif"
+    tifffile.imwrite(p, two_sheet_volume([28.0, 32.5]))
+    m = one_surface(tmp_path, str(p), 30.0, "--half", "8", "--step", "1.5", "--sigma", "0")
+    assert m["offset_median"] == pytest.approx(-2.0, abs=0.3)
+
+
+def test_non_default_spacing_reads_the_surface_intensity_at_zero(tmp_path):
+    # A narrow sheet exactly under the surface is on-sheet. With no sample at 0 the code read t=+1.
+    p = tmp_path / "ct.tif"
+    tifffile.imwrite(p, sheet_volume(z0=30.0, width=0.5))
+    m = one_surface(tmp_path, str(p), 30.0, "--half", "8", "--step", "1.5", "--sigma", "0")
+    assert m["n_valid"] > 0
+    assert m["off_sheet_frac"] == 0.0
+
+
+def test_a_peak_at_the_search_limit_is_censored_not_valid(tmp_path):
+    # The sheet sits at +8 = the search limit. It cannot be told from a profile still rising, so it
+    # stays out of the offsets (interior rule unchanged) but is counted as censored.
+    p = tmp_path / "ct.tif"
+    tifffile.imwrite(p, sheet_volume(z0=38.0))
+    m = one_surface(tmp_path, str(p), 30.0)
+    assert m["n_valid"] == 0
+    assert m["censored_frac"] == 1.0
+
+
+def test_interior_peaks_are_not_censored(tmp_path):
+    p = tmp_path / "ct.tif"
+    tifffile.imwrite(p, sheet_volume(z0=32.0))
+    m = one_surface(tmp_path, str(p), 30.0)
+    assert m["n_valid"] > 0 and m["censored_frac"] == 0.0

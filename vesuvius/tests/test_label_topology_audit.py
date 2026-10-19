@@ -397,3 +397,58 @@ def test_component_touching_ignore_only_at_a_corner_is_open():
     v[20, 30, 30] = 2
     m, _ = lta.audit(v)
     assert m["n_closed_big"] == 0
+
+
+def neck_fixture(gap):
+    label = np.zeros((30, 30, 50), np.uint8)
+    label[8:22, 8:22, 4:18] = 1
+    label[8:22, 8:22, 18 + gap:32 + gap] = 1
+    label[14:16, 14:16, 18:18 + gap] = 1
+    return label
+
+
+def test_short_neck_between_thick_lobes_is_localised_not_just_detected():
+    # The mask is what the overlay draws and what a reviewer follows to the defect. Zeroing it must
+    # fail this test: the voxels have to sit on the neck's cross-section, not merely exist.
+    metrics, flags = lta.audit(neck_fixture(gap=1))
+    assert metrics["n_fused_components"] == 1
+    assert metrics["bridge_voxels"] == int(flags["bridge"].sum()) > 0
+    z, y, x = np.nonzero(flags["bridge"])
+    assert z.min() >= 14 and z.max() <= 15 and y.min() >= 14 and y.max() <= 15
+    assert x.min() >= 17 and x.max() <= 19
+
+
+def test_long_bridge_is_detected_as_fused_but_the_mask_only_marks_necks_next_to_two_pieces():
+    # Erosion deletes a 2-voxel-wide bridge, so the split is detected. The bridge mask only marks
+    # voxels whose 3x3x3 neighbourhood touches two eroded pieces, so a long bridge is NOT localised.
+    # `n_fused_components` means "erosion split detected"; `bridge_voxels` means "neck localised".
+    metrics, flags = lta.audit(neck_fixture(gap=14))
+    assert metrics["n_fused_components"] == 1
+    assert metrics["bridge_voxels"] == int(flags["bridge"].sum()) == 0
+
+
+def test_tiling_audits_each_window_before_loading_the_next(tmp_path, monkeypatch):
+    # A tiled sweep over a large volume must hold one window at a time, not every window.
+    v = np.zeros((40, 40, 80), np.uint8)
+    v[18:20, 4:-4, 4:-4] = 1
+    tifffile.imwrite(tmp_path / "v.tif", v)
+    loads, seen = [], []
+    real_read, real_audit = lta.read_window, lta.audit
+    monkeypatch.setattr(lta, "read_window", lambda vol, w: (loads.append(w), real_read(vol, w))[1])
+    monkeypatch.setattr(lta, "audit", lambda *x, **k: (seen.append(len(loads)), real_audit(*x, **k))[1])
+    rc = lta.main(["--label", str(tmp_path / "v.tif"), "--tile", "40", "--out", str(tmp_path / "out")])
+    assert rc == 0 and len(loads) == 2
+    assert seen == [1, 2]
+
+
+def test_empty_crop_cannot_reach_a_gate_with_a_missing_value(tmp_path):
+    # An all-ignore crop has no thickness (thick_* are None), but every --fail-on key is a count or
+    # fraction that is always defined, and thick_* are refused as gate keys rather than compared as None.
+    tifffile.imwrite(tmp_path / "empty.tif", np.full((20, 20, 20), 2, np.uint8))
+    args = ["--label", str(tmp_path / "empty.tif"), "--out", str(tmp_path / "out")]
+    with pytest.raises(SystemExit):
+        lta.main(args + ["--fail-on", "thick_median=7"])
+    assert lta.main(args + ["--fail-on", "n_components=0"]) == 0
+    m, _ = lta.audit(np.full((20, 20, 20), 2, np.uint8))
+    flat = lta.flat(m)
+    assert all(flat[k] is not None for k in lta.flat_keys())
