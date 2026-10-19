@@ -884,6 +884,18 @@ if(TARGET vc_tifxyz_selfcross)
     add_dependencies(test_tifxyz_selfcross_cli vc_tifxyz_selfcross)
 endif()
 
+# vc_objrefine's opt-in offset report: the summary (header-only under
+# apps/src, shared with the tool) always, and the binary's end-to-end
+# contract when the apps are built.
+vc_add_test(NAME test_objrefine_offset_report)
+
+if(TARGET vc_objrefine)
+    vc_add_test(NAME test_objrefine_offset_report_cli
+        LIBS doctest::doctest vc_core opencv_core opencv_imgcodecs
+        DEFS VC_OBJREFINE_BIN="$<TARGET_FILE:vc_objrefine>")
+    add_dependencies(test_objrefine_offset_report_cli vc_objrefine)
+endif()
+
 if(TARGET vc_seg_add_overlap)
     vc_add_test(NAME test_seg_add_overlap_cli
         LIBS doctest::doctest vc_core opencv_core opencv_imgcodecs
