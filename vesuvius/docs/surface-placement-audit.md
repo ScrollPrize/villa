@@ -99,10 +99,14 @@ public `54keV_7.91um_Scroll1A` volume, 20000 samples each, defaults:
 
 The three segments give the same numbers, and the offset histogram is nearly
 flat from −6 to +6, so this is not three segments drifting the same way. The
-controls say what it is: the snap control remeasures at a spread of 0.5
-voxels, so the peak location is precise, and the offsets of two points 2
-voxels apart agree (median difference 0.5) while points 16 voxels apart are
-uncorrelated. The public meshes are triangles of roughly 18 voxels, and the
-sheet moves by several voxels inside one triangle. On half the surface area the
-mesh is more than 2 voxels (16 µm) from the sheet, and that is a resolution
-limit of the mesh, not a tracing error that a global shift would fix.
+controls say what it is: the snap control remeasures at a spread of 0.4
+voxels, so the peak location is precise; the offsets of two points 2 and 4
+voxels apart agree (median difference 0.5, correlation 0.8), at 8 voxels they
+differ by 1 to 1.5 (correlation 0.5), and in a dense resample of one crop they
+are uncorrelated by 16 voxels. The public meshes are triangles of roughly 18
+voxels, and the sheet moves by several voxels inside one triangle. On half the
+surface area the mesh is more than 2 voxels (16 µm) from the sheet, and that
+is a resolution limit of the mesh, not a tracing error that a global shift
+would fix. At 20000 samples over a segment of hundreds of cm² no 32-voxel
+cell collects 30 points, so the `patch_*` metrics are NaN; they need a dense
+sample (a small tifxyz patch, or `--samples` in the millions).
