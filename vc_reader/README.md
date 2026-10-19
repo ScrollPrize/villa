@@ -56,12 +56,7 @@ raise an error. Use filters such as `artifact_id=...` to select among them.
 together. CUDA reading and augmentation require a build with
 `VC_READER_ENABLE_CUDA=ON` and an accessible CUDA device.
 
-## Performance highlights
-
-Recorded on an **Intel Core Ultra 7 270K Plus / RTX 5090**, using PHercParis4
-level 2, a Release build, and a **local uncompressed Zarr cache with warm
-filesystem access**. These timings do not measure remote downloads or decoding
-compressed chunks.
+## Performance 
 
 **Zarr reading and sampling — median milliseconds per request:**
 
@@ -71,9 +66,6 @@ compressed chunks.
 | Curved surface, 96 × 512 | 10.824 | 6.645 | **0.868** | 1.792 |
 | Rotated box, 128³ | 69.288 | 65.259 | 13.792 | **1.629** |
 
-Eight reader workers; 60 measured requests per workload/backend. CUDA includes
-fresh uploads and final CPU outputs. The zarr-python and TensorStore sampling
-paths use SciPy interpolation. See [methodology and full results](benchmarks/README.md#readingsampling-timing-comparisons).
 
 **Augmentation pipeline — median milliseconds per 128³ crop:**
 
@@ -82,11 +74,6 @@ paths use SciPy interpolation. See [methodology and full results](benchmarks/REA
 | 12 augmentations only, excluding transfers | 146.465 | **0.673** |
 | Read + normalize + 12 augmentations + CPU output | 149.723 | **1.833** |
 
-The full pipeline is **81.7× faster** with CUDA processing in this measurement,
-including upload and download. The recipe includes elastic deformation,
-median filtering, blur, intensity transforms and low-resolution simulation;
-no model forward or backward pass is timed.
-[Recipe, validation and timing scope](benchmarks/README.md#single-crop-latency-12-augmentations-cpu-output).
 
 ## Examples and guides
 
@@ -113,8 +100,6 @@ defaults. Z/Y/X slice pairs show the original above the augmented output.
 Gallery timings use 128³ float32 CT crops, one CPU thread, and medians of five
 calls after one warmup. **CUDA uploaded** includes upload and download;
 **CUDA resident** starts and ends on the GPU. Reading is excluded.
-[Full measurement setup](benchmarks/README.md#readme-augmentation-timings).
-The two 2D tracing companions have separate input shapes noted below.
 
 <details>
 <summary><strong>AdditiveNoise</strong></summary>
