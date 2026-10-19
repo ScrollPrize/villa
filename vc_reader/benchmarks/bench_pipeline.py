@@ -433,7 +433,7 @@ def reading_benchmark(args):
             elif sampling:
                 out = reader.read_affine_many(grids, order=1, dtype=np.float32, **kwargs)
             else:
-                out = reader.read_many([(tuple(int(v) for v in g[1]), g[0]) for g in grids], **kwargs)
+                out = reader.read_regions([(tuple(int(v) for v in g[1]), g[0]) for g in grids], **kwargs)
             ready = time.perf_counter_ns()
             if mode == "cuda" and args.cuda_output == "host":
                 out = [a.numpy() for a in out]
@@ -510,7 +510,7 @@ def run_crop(reader, normalization, augmentation, origin, axes, args, seed, cuda
     if args.pipeline_read == "box":
         # source='cpu' reads uint8 crops, uploads only those bytes, then casts
         # to float32 on-device inside the public CUDA reader.
-        image = reader.read(tuple(origin), args.shape, dtype=np.float32, **kwargs)
+        image = reader.read_region(tuple(origin), args.shape, dtype=np.float32, **kwargs)
     else:
         image = reader.read_affine(args.shape, origin, axes, order=1, dtype=np.float32, **kwargs)
     image = image.reshape(1, *args.shape)

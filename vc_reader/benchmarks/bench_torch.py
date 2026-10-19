@@ -47,7 +47,7 @@ class Crops(Dataset):
         shape = self.args.shape
         center = tuple((s - n) // 2 for s, n in zip(self.reader.shape, shape))
         origin = tuple(c + ((index * (a * 10 + 7)) % 65 - 32) for a, c in enumerate(center))
-        image = self.reader.read(origin, shape).reshape(1, *shape)
+        image = self.reader.read_region(origin, shape).reshape(1, *shape)
         seed = A.seed(self.args.seed, index)
         if self.serial:
             if self.augmentation is None:

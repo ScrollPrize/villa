@@ -67,7 +67,7 @@ def main():
             compression = None
             if reader._is_zarr:
                 base = ZarrReader.open(reader.resolved.location, **options)
-                baseline = base.read
+                baseline = base.read_region
                 compression = base.meta.compressor
             else:
                 base = None

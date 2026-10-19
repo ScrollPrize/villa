@@ -81,6 +81,34 @@ in-bounds fill data and undergo normal encoding. Failed downloads, corrupt
 images, and missing stack planes raise. Returned arrays remain valid after
 subsequent reads, eviction, or close.
 
+## Direct Zarr array selections
+
+`ZarrReader` uses NumPy-style selections for indexing, dtype conversion,
+destination buffers and batched reads:
+
+```python
+import numpy as np
+
+crop = np.s_[9000:9128, 3600:3728, 3600:3728]
+block = reader[crop]
+float_block = reader.read(crop, dtype=np.float32)
+reader.read(crop, out=buffer, dtype=np.float32)
+blocks = reader.read_many([crop, np.s_[9032:9160, 3632:3760, 3632:3760]])
+```
+
+`np.s_` constructs a tuple of slices; a tuple of Python `slice` objects works
+equally well. These methods accept integers, unit-step slices and ellipsis.
+Negative indices wrap, slice bounds clip, and integer indices remove axes.
+Destination buffers must match the selected shape and requested dtype;
+conversion writes directly into those buffers. Batched selections share chunk
+reads and support one optional output buffer per selection.
+
+`reader.cuda()` accepts the same selections through indexing, `read` and
+`read_many`. Its arrays and optional `valid=True` masks stay on the device;
+batching shares chunk uploads. CPU destination buffers are supported by
+`ZarrReader`. Explicitly padded low-level geometry uses `read_region` and
+`read_regions`, whose bounds are not clipped or wrapped.
+
 ## Storage metadata and placement
 
 `reader.resolved` records the actual location/selection, selected output layout,

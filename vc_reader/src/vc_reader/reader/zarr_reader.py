@@ -436,15 +436,54 @@ class ZarrReader:
             return self._prefetch_client._backend.stats()
         return self._prefetch_scheduler.stats() if self._prefetch_scheduler else {}
 
-    def read(
+    def read(self, selection, *, out=None, dtype=None):
+        """Read a NumPy-style selection, optionally converting directly into out.
+
+        Accept integers, unit-step slices and ellipsis, with the same clipping
+        and axis removal as indexing. ``out`` uses the selected output shape.
+        """
+        return self.read_many([selection], out=None if out is None else [out], dtype=dtype)[0]
+
+    def read_many(self, selections, *, out=None, dtype=None):
+        """Read slice selections together, sharing chunk reads across the batch.
+
+        ``out`` supplies one optional destination per selection. Conversion
+        writes directly into the destinations; no intermediate crop is needed.
+        """
+        plans = [parse_index(selection, self.shape) for selection in selections]
+        if out is not None and len(out) != len(plans):
+            raise ValueError(f'out has {len(out)} arrays for {len(plans)} selections')
+        buffers = None
+        if out is not None:
+            buffers = []
+            for given, (_, size, squeeze) in zip(out, plans):
+                shape = tuple(n for n, drop in zip(size, squeeze) if not drop)
+                if given is not None:
+                    if not isinstance(given, np.ndarray) or given.shape != shape:
+                        raise ValueError(f'out must have shape {shape}')
+                    axes = tuple(i for i, drop in enumerate(squeeze) if drop)
+                    buffers.append(np.expand_dims(given, axes) if axes else given)
+                else:
+                    buffers.append(None)
+        values = self.read_regions([(start, size) for start, size, _ in plans], out=buffers, dtype=dtype)
+        results = []
+        for i, (value, (_, _, squeeze)) in enumerate(zip(values, plans)):
+            if out is not None and out[i] is not None:
+                results.append(out[i])
+            else:
+                index = tuple(0 if drop else slice(None) for drop in squeeze)
+                results.append(value[index] if any(squeeze) else value)
+        return results
+
+    def read_region(
         self, start: Sequence[int], size: Sequence[int], out: np.ndarray | None = None, *,
         dtype: Any = None,
     ) -> np.ndarray:
-        """Read a block, optionally cast it; see :meth:`read_many`."""
-        return self.read_many([(start, size)], None if out is None else [out],
+        """Read an explicitly sized region, filling coordinates outside the array."""
+        return self.read_regions([(start, size)], None if out is None else [out],
                               dtype=dtype)[0]
 
-    def read_many(
+    def read_regions(
         self,
         regions: Iterable[tuple[Sequence[int], Sequence[int]]],
         out: Sequence[np.ndarray | None] | None = None,
@@ -698,7 +737,7 @@ class ZarrReader:
                 return self._read_mixed_index(keys)
             return self.read_points(_index_points(keys, self.shape))
         start, size, squeeze = parse_index(key, self.shape)
-        out = self.read(start, size)
+        out = self.read_region(start, size)
         return out[tuple(0 if s else slice(None) for s in squeeze)] if any(squeeze) else out
 
     def __array__(self, dtype=None, copy=None) -> np.ndarray:
@@ -752,7 +791,7 @@ class ZarrReader:
                 view = np.expand_dims(view, axis)
             regions.append((start, sizes))
             outputs.append(view)
-        self.read_many(regions, out=outputs)
+        self.read_regions(regions, out=outputs)
         return result
 
     def _ready(self) -> None:

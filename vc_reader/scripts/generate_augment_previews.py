@@ -178,8 +178,8 @@ def generate(args):
         for origin in (start, reference_start):
             if any(s < 0 or s + args.size > n for s, n in zip(origin, reader.shape)):
                 raise ValueError("input/reference crop must fit inside the volume")
-        image = reader.read(start, shape, dtype=np.float32)[None] / np.float32(args.divisor)
-        reference = reader.read(reference_start, shape, dtype=np.float32)[None] / np.float32(args.divisor)
+        image = reader.read_region(start, shape, dtype=np.float32)[None] / np.float32(args.divisor)
+        reference = reader.read_region(reference_start, shape, dtype=np.float32)[None] / np.float32(args.divisor)
         source_metadata = dict(shape=list(reader.shape), chunks=list(reader.chunks), dtype=str(reader.dtype))
     if not np.isfinite(image).all() or not np.isfinite(reference).all() or np.ptp(image) == 0:
         raise ValueError("choose a finite crop with visible CT signal (not constant background)")

@@ -102,12 +102,12 @@ def main():
                         device_reader = raw.cuda(cache_bytes=128 << 20) if backend == 'cuda' else None
                         def baseline(start, size):
                             if backend == 'cuda':
-                                image = device_reader.read(start, size, valid=True)
+                                image = device_reader.read_region(start, size, valid=True)
                                 if name == 'direct':
                                     return image
                                 origin = tuple(reversed(pull.apply(tuple(reversed(start)))))
                                 return image, device_reader.read_affine(size, origin, matrix, valid=True, source='chunks')
-                            image = raw.read(start, size)
+                            image = raw.read_region(start, size)
                             if name == 'direct':
                                 return image, np.ones(size, dtype=bool)
                             origin = tuple(reversed(pull.apply(tuple(reversed(start)))))
@@ -120,7 +120,7 @@ def main():
                         for request in requests:
                             start, size = request
                             actual = reader.read(start, size)
-                            expected = raw.read(start, size) if name == 'direct' else raw.read_affine(
+                            expected = raw.read_region(start, size) if name == 'direct' else raw.read_affine(
                                 size, tuple(reversed(pull.apply(tuple(reversed(start))))), matrix)
                             output = actual['image' if name == 'direct' else 'target'].data
                             output = output.numpy() if backend == 'cuda' else output

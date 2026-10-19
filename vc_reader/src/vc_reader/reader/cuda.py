@@ -135,16 +135,32 @@ class CudaReader:
 
     def __getitem__(self, key):
         """Read a basic NumPy-style selection without downloading the result."""
-        self._ready()
-        start, size, squeeze = parse_index(key, self.reader.shape)
-        output = self.read(start, size)
-        return output.reshape(tuple(n for n, drop in zip(size, squeeze) if not drop))
+        return self.read(key)
 
-    def read(self, start, size, *, dtype=None, source="auto", valid=False):
-        out = self.read_many([(start, size)], dtype=dtype, source=source, valid=valid)
+    def read(self, selection, *, dtype=None, source="auto", valid=False):
+        """Read a NumPy-style selection, keeping output and optional masks on device."""
+        output = self.read_many([selection], dtype=dtype, source=source, valid=valid)
+        return (output[0][0], output[1][0]) if valid else output[0]
+
+    def read_many(self, selections, *, dtype=None, source="auto", valid=False):
+        """Read slice selections as one batch with shared chunk uploads."""
+        self._ready()
+        plans = [parse_index(selection, self.reader.shape) for selection in selections]
+        if not plans:
+            return ([], []) if valid else []
+        output = self.read_regions([(start, size) for start, size, _ in plans],
+                                   dtype=dtype, source=source, valid=valid)
+        shapes = [tuple(n for n, drop in zip(size, squeeze) if not drop) for _, size, squeeze in plans]
+        def reshape(values):
+            return [value.reshape(shape) for value, shape in zip(values, shapes)]
+        return (reshape(output[0]), reshape(output[1])) if valid else reshape(output)
+
+    def read_region(self, start, size, *, dtype=None, source="auto", valid=False):
+        """Read an explicitly sized region, with fill outside the array."""
+        out = self.read_regions([(start, size)], dtype=dtype, source=source, valid=valid)
         return (out[0][0], out[1][0]) if valid else out[0]
 
-    def read_many(self, regions, *, dtype=None, source="auto", valid=False):
+    def read_regions(self, regions, *, dtype=None, source="auto", valid=False):
         """valid=True also returns uint8 masks: 1 inside the volume (a padding mask)."""
         grids = []
         for start, size in regions:

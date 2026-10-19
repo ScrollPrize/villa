@@ -364,7 +364,7 @@ class SourceReader:
                 raise ValueError(f'start/size must have {len(self.spatial_axes)} spatial entries and nonnegative sizes')
             if (self._is_zarr and self.axes == self.spatial_axes and self._lookup is None
                     and self.fill_value == self._backend.fill_value):
-                return self._backend.reader.read(start, size)
+                return self._backend.reader.read_region(start, size)
             origin = dict(zip(self.spatial_axes, start))
             requested = dict(zip(self.spatial_axes, size))
             dims = dict(zip(self._raw_axes, self._raw_shape))
@@ -460,7 +460,7 @@ class SourceReader:
             if channel is not None:
                 start[self._raw_axes.index('c')] = channel
             regions.append((start, sizes))
-        arrays = self._backend.reader.read_many(regions)
+        arrays = self._backend.reader.read_regions(regions)
         raw = np.concatenate(arrays, axis=self._raw_axes.index('c')) if len(arrays) > 1 else arrays[0]
         if 't' in self._raw_axes:
             raw = np.squeeze(raw, axis=self._raw_axes.index('t'))
@@ -475,7 +475,7 @@ class SourceReader:
             self._ready()
             if (self._is_zarr and self.axes == self.spatial_axes and self._lookup is None
                     and self.fill_value == self._backend.fill_value):
-                return self._backend.reader.read_many(regions)
+                return self._backend.reader.read_regions(regions)
             return [self.read(start, size) for start, size in regions]
 
     def stats(self):

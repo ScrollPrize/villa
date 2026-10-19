@@ -1263,7 +1263,7 @@ for surfaces, oblique planes, and rotated boxes. ROI planning and interpolation
 are timed; float32 coordinates follow vc_reader's sampling contract. Affine
 coordinate construction is timed; tifxyz coordinate grids are prepared before
 timing for every backend, as described below. vc_reader
-samples directly from chunks. ML requests use vc_reader's `read_many`, concurrent
+samples directly from chunks. ML requests use vc_reader's `read_regions`, concurrent
 TensorStore futures, or zarr-python thread-pool reads. Batch outputs are lists of
 crops; no backend pays for a final stack. Baseline planning/read/sampling timings
 are also recorded in JSON; vc_reader's fused read/sample time cannot be split.

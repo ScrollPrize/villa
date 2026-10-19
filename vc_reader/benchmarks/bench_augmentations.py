@@ -108,8 +108,8 @@ def main():
         for origin in (args.start, reference_start):
             if len(reader.shape) != 3 or any(s < 0 or s+n > edge for s, n, edge in zip(origin, shape, reader.shape)):
                 parser.error('input/reference crop must fit in the 3D volume')
-        image = reader.read(args.start, shape, dtype=np.float32)[None]/np.float32(255)
-        reference = reader.read(reference_start, shape, dtype=np.float32)[None]/np.float32(255)
+        image = reader.read_region(args.start, shape, dtype=np.float32)[None]/np.float32(255)
+        reference = reader.read_region(reference_start, shape, dtype=np.float32)[None]/np.float32(255)
     if not np.isfinite(image).all() or not np.isfinite(reference).all() or np.ptp(image) == 0:
         parser.error('input must be finite and contain visible CT signal')
     if args.plane:

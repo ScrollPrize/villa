@@ -129,10 +129,10 @@ class V3Tests(FixtureCase):
                 path = self.root/f'{sharded}-{index_end}-{compressed}-{endian}'
                 expected, metadata = write_v3(path, sharded=sharded, index_end=index_end, compressed=compressed, endian=endian)
                 with ZarrReader.open(path, threads=2) as reader:
-                    np.testing.assert_array_equal(reader.read((0, 0), expected.shape), expected)
+                    np.testing.assert_array_equal(reader.read_region((0, 0), expected.shape), expected)
                     padded = np.full((6, 7), 7, dtype=expected.dtype)
                     padded[1:, 2:] = expected[:5, :5]
-                    np.testing.assert_array_equal(reader.read((-1, -2), (6, 7)), padded)
+                    np.testing.assert_array_equal(reader.read_region((-1, -2), (6, 7)), padded)
                 with Source('v3', Storage(str(path), 'zarr')).open() as reader:
                     np.testing.assert_array_equal(reader.read((2, 4), (8, 11)), expected[2:10, 4:15])
                     restored = pickle.loads(pickle.dumps(reader))
@@ -147,7 +147,7 @@ class V3Tests(FixtureCase):
         (group/'zarr.json').write_text(json.dumps(dict(zarr_format=3, node_type='group', attributes=attrs)))
         with ZarrGroup.open(group) as reader:
             self.assertEqual(reader.keys(), ['0'])
-            np.testing.assert_array_equal(reader.level(0).read((0, 0), expected.shape), expected)
+            np.testing.assert_array_equal(reader.level(0).read_region((0, 0), expected.shape), expected)
         source = Source('group', Storage(str(group), 'zarr', selection=Selection(level=0)),
             registration=VolumeRegistration('s', 'v', mode='storage', storage_frame='physical',
                                              storage_units='micrometer', affine=Affine.identity()))
@@ -172,14 +172,14 @@ class V3Tests(FixtureCase):
         shard.write_bytes(corrupt)
         with ZarrReader.open(path) as reader:
             with self.assertRaisesRegex(RuntimeError, 'CRC32C'):
-                reader.read((0, 0), (1, 1))
+                reader.read_region((0, 0), (1, 1))
         corrupt = bytearray(original)
         corrupt[-68:-60] = (2**63).to_bytes(8, 'little')
         corrupt[-4:] = crc32c(corrupt[-68:-4]).to_bytes(4, 'little')
         shard.write_bytes(corrupt)
         with ZarrReader.open(path) as reader:
             with self.assertRaisesRegex(RuntimeError, 'offset/length'):
-                reader.read((0, 0), (1, 1))
+                reader.read_region((0, 0), (1, 1))
 
 
 class V3RemoteTests(RemoteFixtureCase):
@@ -188,15 +188,15 @@ class V3RemoteTests(RemoteFixtureCase):
         for prefix, message in (('ignore-range', 'ignored HTTP Range'), ('bad-range', 'Content-Range')):
             with ZarrReader.open(self.url+f'/{prefix}/v3') as reader:
                 with self.assertRaisesRegex(RuntimeError, message):
-                    reader.read((0, 0), (1, 1))
+                    reader.read_region((0, 0), (1, 1))
         with ZarrReader.open(self.url+'/v3') as reader:
-            reader.read((0, 0), (1, 1))
+            reader.read_region((0, 0), (1, 1))
             shard = self.root/'v3/c/0/0'
             data = bytearray(shard.read_bytes())
             data[1] ^= 1
             shard.write_bytes(data)
             with self.assertRaisesRegex(RuntimeError, '412'):
-                reader.read((4, 0), (1, 1))
+                reader.read_region((4, 0), (1, 1))
 
 
     def test_remote_ranges_auth_offline_and_workers(self):
