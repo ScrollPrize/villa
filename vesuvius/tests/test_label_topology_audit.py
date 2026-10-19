@@ -345,6 +345,32 @@ def test_cli_zarr_roi_tile_threshold(tmp_path):
     assert json.loads((tmp_path / "out3" / "pred.json").read_text())["fg_voxels"] == 0
 
 
+def test_cli_threshold_sweep_reads_once_and_names_cuts(tmp_path, monkeypatch):
+    # a probability volume: a sheet of 200 with a weak (60) patch. Cutting at 50 keeps the
+    # patch (no hole), cutting at 100 opens it. One sweep must give both answers from one read,
+    # because the read is the expensive part for a volume served over HTTP.
+    v = np.zeros((40, 40, 40), np.uint8)
+    v[18:20, 4:-4, 4:-4] = 200
+    v[18:20, 16:24, 16:24] = 60
+    tifffile.imwrite(tmp_path / "prob.tif", v)
+    reads = []
+    orig = lta.read_window
+    monkeypatch.setattr(lta, "read_window", lambda vol, win, threshold=None: (reads.append(1), orig(vol, win, threshold))[1])
+    out = tmp_path / "out"
+    assert lta.main(["--label", str(tmp_path / "prob.tif"), "--threshold", "50,100", "--out", str(out)]) == 0
+    assert len(reads) == 1
+    rows = {r["crop"]: r for r in csv.DictReader(open(out / "aggregate.csv"))}
+    assert set(rows) == {"prob_t50", "prob_t100"}
+    assert (int(rows["prob_t50"]["b1_total_big"]), int(rows["prob_t100"]["b1_total_big"])) == (0, 1)
+    assert (out / "ranked.csv").exists()
+    # a single threshold keeps the plain crop name
+    out2 = tmp_path / "out2"
+    assert lta.main(["--label", str(tmp_path / "prob.tif"), "--threshold", "100", "--out", str(out2)]) == 0
+    assert (out2 / "prob.json").exists()
+    with pytest.raises(SystemExit):
+        lta.main(["--label", str(tmp_path / "prob.tif"), "--threshold", "50,x", "--out", str(tmp_path / "o3")])
+
+
 def test_cli_batch_rejects_roi_and_tile(tmp_path):
     (tmp_path / "labels").mkdir()
     tifffile.imwrite(tmp_path / "labels" / "a.tif", sheet())

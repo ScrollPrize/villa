@@ -32,7 +32,8 @@ Usage:
 OME-Zarr group (local path or http(s) URL; ``--level`` picks the pyramid level).
 ``--roi z0:z1,y0:y1,x0:x1`` reads a window of it, ``--tile N`` splits the window
 into N-voxel cubes audited as separate crops (``<name>_z<z0>_y<y0>_x<x0>``), and
-``--threshold T`` binarises an image or probability volume as ``value >= T``.
+``--threshold T[,T2,...]`` binarises an image or probability volume as ``value >= T``;
+several thresholds audit each window once per cut (``<name>_t<T>``) from one read.
 ``--batch`` reads ``DATA_DIR/labels/*.tif`` (and ``DATA_DIR/images/<same name>``
 when present, for ``--plot``); with ``--after`` it names a directory holding
 same-named label files.
@@ -442,9 +443,23 @@ def window_name(stem: str, win: Sequence[slice], tiled: bool) -> str:
 
 def read_window(vol, win: Sequence[slice], threshold: float | None = None) -> np.ndarray:
     arr = np.asarray(vol[tuple(win)])
-    if threshold is not None:
-        arr = (arr >= threshold).astype(np.uint8)
-    return arr
+    return binarise(arr, threshold)
+
+
+def binarise(arr: np.ndarray, threshold: float | None) -> np.ndarray:
+    return arr if threshold is None else (arr >= threshold).astype(np.uint8)
+
+
+def parse_thresholds(spec: str | None) -> list[float] | None:
+    if spec is None:
+        return None
+    try:
+        vals = [float(t) for t in spec.split(",") if t.strip()]
+    except ValueError:
+        raise ValueError(f"--threshold expects numbers separated by commas, got {spec!r}")
+    if not vals:
+        raise ValueError("--threshold is empty")
+    return vals
 
 
 def volume_stem(src: str) -> str:
@@ -471,9 +486,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="split the volume (or --roi) into N-voxel cubes audited as separate crops; "
                          "partial cubes at the far edge are dropped")
     ap.add_argument("--level", default="0", help="pyramid level of an OME-Zarr group (default 0)")
-    ap.add_argument("--threshold", type=float, metavar="T",
+    ap.add_argument("--threshold", metavar="T[,T2,...]",
                     help="binarise the label input as value >= T (e.g. 128 for uint8 probabilities, "
-                         "1 for 0/255 masks); implies --surface-value 1 and no ignore value")
+                         "1 for 0/255 masks); implies --surface-value 1 and no ignore value. Several "
+                         "thresholds audit every cut of each window from one read, as crops <name>_t<T>")
     ap.add_argument("--out", type=Path, default=Path("audit_out"), help="output directory")
     ap.add_argument("--surface-value", type=int, default=1, help="label value of the surface")
     ap.add_argument("--ignore-value", type=int, default=2,
@@ -500,8 +516,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     limits = _parse_fail_on(a.fail_on)
     ignore = None if a.ignore_value < 0 else a.ignore_value
     surface_value = a.surface_value
-    if a.threshold is not None:
+    try:
+        thresholds = parse_thresholds(a.threshold)
+    except ValueError as exc:
+        ap.error(str(exc))
+    if thresholds is not None:
         surface_value, ignore = 1, None
+    sweep = thresholds is not None and len(thresholds) > 1
 
     # each job: (name, label window, image window or None, after window or None), windows as (volume, slices)
     if a.batch:
@@ -533,23 +554,31 @@ def main(argv: Sequence[str] | None = None) -> int:
                  (img_vol, w) if img_vol is not None else None,
                  (after_vol, w) if after_vol is not None else None) for w in wins]
 
-    def load(window, threshold=None):
+    def load(window):
         vol, w = window
         if w is None:  # batch: a .tif path read whole
             return tifffile.imread(vol)
-        return read_window(vol, w, threshold)
+        return read_window(vol, w)
 
-    rows, failed = [], False
+    # one read per window; with several thresholds every cut becomes its own crop
+    cuts = []
     for name, label_win, image_win, after_win in jobs:
-        lab = load(label_win, a.threshold)
-        after_lab = load(after_win, a.threshold) if after_win else None
-        if after_lab is not None and after_lab.shape != lab.shape:
-            ap.error(f"{name}: --after shape {after_lab.shape} differs from label shape {lab.shape}")
+        raw = load(label_win)
+        raw_after = load(after_win) if after_win else None
+        if raw_after is not None and raw_after.shape != raw.shape:
+            ap.error(f"{name}: --after shape {raw_after.shape} differs from label shape {raw.shape}")
         img = None
         if a.plot and image_win is not None:
             img = load(image_win)
-            if img.shape != lab.shape:
-                ap.error(f"{name}: image shape {img.shape} differs from label shape {lab.shape}")
+            if img.shape != raw.shape:
+                ap.error(f"{name}: image shape {img.shape} differs from label shape {raw.shape}")
+        for t in (thresholds or [None]):
+            cut = f"{name}_t{t:g}" if sweep else name
+            cuts.append((cut, binarise(raw, t), binarise(raw_after, t) if raw_after is not None else None,
+                         img, after_win is not None))
+
+    rows, failed = [], False
+    for name, lab, after_lab, img, has_after in cuts:
         try:
             m, flags = audit(lab, a.erode, a.min_piece, surface_value, ignore)
             if after_lab is not None:
@@ -571,12 +600,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                                surface_value, -1 if ignore is None else ignore)
         if a.hole_masks:
             tifffile.imwrite(a.out / f"{name}.hole_mask.tif", flags["hole"].astype(np.uint8))
-        if after_win:
+        if has_after:
             f2 = flat(m2)
             delta = {k: [f[k], f2[k]] for k in f}
             (a.out / f"{name}.delta.json").write_text(json.dumps(delta, indent=1))
             print("delta (before, after):", json.dumps(delta))
-        checked = [("", f)] + ([(" (after)", f2)] if after_win else [])
+        checked = [("", f)] + ([(" (after)", f2)] if has_after else [])
         for tag, vals in checked:
             for key, limit in limits.items():
                 if vals[key] > limit:
@@ -586,7 +615,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         w = csv.DictWriter(fh, fieldnames=list(rows[0]))
         w.writeheader()
         w.writerows(rows)
-    if a.batch or a.tile is not None:
+    if a.batch or a.tile is not None or sweep:
         top = ranked(rows)
         with open(a.out / "ranked.csv", "w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=["rank", "crop", "reason"] + [k for k, _ in SEVERITY])
