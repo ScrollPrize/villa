@@ -33,7 +33,10 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    const fs::path in_path = argv[1];
+    // "seg/" and "seg" name the same segment; without this, a trailing slash
+    // gives an empty stem and the default output becomes "rgb/.png".
+    fs::path in_path = fs::path(argv[1]).lexically_normal();
+    if (!in_path.has_filename()) in_path = in_path.parent_path();
 
     fs::path out_path;
     if (argc == 3) {
@@ -120,7 +123,17 @@ int main(int argc, char** argv) {
     }
 
     // 4) Save
-    fs::create_directories(out_path.parent_path());
+    // A bare file name ("out.png") has an empty parent; create_directories("")
+    // throws, so only create a directory when there is one.
+    if (out_path.has_parent_path()) {
+        std::error_code ec;
+        fs::create_directories(out_path.parent_path(), ec);
+        if (ec) {
+            std::cerr << "Error: could not create output directory " << out_path.parent_path()
+                      << ": " << ec.message() << "\n";
+            return 5;
+        }
+    }
     if (!cv::imwrite(out_path.string(), rgb)) {
         std::cerr << "Error: could not write output image to " << out_path << "\n";
         return 5;
