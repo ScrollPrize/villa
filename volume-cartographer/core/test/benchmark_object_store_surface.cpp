@@ -54,7 +54,7 @@ Json stats(std::vector<double> samples) {
         {"mean_us", std::accumulate(samples.begin(), samples.end(), 0.)/samples.size()}};
 }
 
-Json run(int rows, int cols, size_t cacheBytes) {
+Json run(int rows, int cols, size_t cacheBytes, size_t spatialCacheBytes) {
     TempDir tmp;
     cv::Mat_<cv::Vec3f> points(rows, cols);
     for (int r = 0; r < rows; ++r)
@@ -72,6 +72,7 @@ Json run(int rows, int cols, size_t cacheBytes) {
 
     OpenOptions opts; opts.author = "benchmark";
     opts.geometryCacheBytes = cacheBytes;
+    opts.spatialCacheBytes = spatialCacheBytes;
     auto db = ObjectStore::create(tmp.path / "objects.vcobj", opts);
     GeometryData data; data.kind = "patch"; data.attributes = R"({"scale":[1,1]})";
     data.arrays.push_back({"points", "<f4", {rows,cols,3}, std::vector<uint8_t>(points.total()*12)});
@@ -83,6 +84,11 @@ Json run(int rows, int cols, size_t cacheBytes) {
     Json out = {{"rows",rows}, {"cols",cols}, {"vc3d_build_us",buildUs},
         {"vc3d_mapped_build_us",mappedBuildUs}, {"db_publish_us",publishUs},
         {"vc3d_index_tiles",index.patchCount()}, {"queries",Json::array()}};
+    ObjectSelection firstQuery;
+    firstQuery.bbox = std::array<double,6>{400.25, 32.25, -1, 401.25, 33.25, 100000};
+    out["db_first_spatial_query_us"] = elapsed([&] {
+        auto txn = db.read(); (void)db.spatialRegions(txn, firstQuery);
+    });
     // Non-integral bounds avoid ambiguous grid-edge inclusion in this planar fixture.
     for (const std::string name : {"small", "boundary", "viewport", "miss"}) {
         const float x = name == "boundary" ? 127.5f : 400.25f;
@@ -177,9 +183,30 @@ Json run(int rows, int cols, size_t cacheBytes) {
         if (!std::includes(oracle.begin(),oracle.end(),tri.begin(),tri.end()))
             throw std::runtime_error("native triangles outside oracle");
         size_t sink = 0;
+        std::vector<ObjectSelection> moving;
+        for (int i = 0; i < 64; ++i) {
+            auto s = selection;
+            const double dx = (i * 113) % (cols - 256) - x;
+            const double dy = (i * 17) % (rows - 16) - y;
+            for (int a : {0, 3}) (*s.bbox)[a] += dx;
+            for (int a : {1, 4}) (*s.bbox)[a] += dy;
+            // Independent grid oracle for changing viewports, outside timing.
+            std::set<Key> want, got;
+            const auto& b = *s.bbox;
+            for (int r=0;r<rows-1;r+=32) for (int c=0;c<cols-1;c+=32)
+                if (c+32 >= b[0] && c <= b[3] && r+32 >= b[1] && r <= b[4]) want.emplace(r,c);
+            for (const auto& region : db.spatialRegions(snapshot, s))
+                got.emplace(int(region.start[0]), int(region.start[1]));
+            if (got != want) throw std::runtime_error("moving region oracle differs");
+            moving.push_back(s);
+        }
+        size_t nextMoving = 0;
         std::vector<std::pair<std::string,std::function<void()>>> ops{
             {"vc3d_index_normalized", [&] {sink += vcKeys().size();}},
             {"db_index", [&] {auto txn=db.read(); sink += db.spatialRegions(txn,selection).size();}},
+            {"db_index_pinned_snapshot", [&] {sink += db.spatialRegions(snapshot,selection).size();}},
+            {"db_index_moving", [&] {auto txn=db.read(); sink += db.spatialRegions(txn,moving[nextMoving++ % moving.size()]).size();}},
+            {"db_empty_transaction", [&] {auto txn=db.read(); ++sink;}},
             {"vc3d_index_and_resident_copy", [&] {sink += vcLoad().size();}},
             {"db_index_and_rectangles", [&] {sink += dbLoad().size();}},
             {"db_index_and_batch", [&] {auto txn=db.read(); sink += dbBatchLoad(txn).size();}},
@@ -209,20 +236,22 @@ Json run(int rows, int cols, size_t cacheBytes) {
 
 int main(int argc, char** argv) {
     try {
-        if (argc < 2 || argc > 3) throw std::runtime_error("usage: benchmark_object_store_surface OUTPUT.json [CACHE_BYTES]");
-        const size_t cacheBytes = argc == 3 ? std::stoull(argv[2]) : OpenOptions{}.geometryCacheBytes;
+        if (argc < 2 || argc > 4) throw std::runtime_error("usage: benchmark_object_store_surface OUTPUT.json [GEOMETRY_CACHE_BYTES [SPATIAL_CACHE_BYTES]]");
+        const size_t cacheBytes = argc >= 3 ? std::stoull(argv[2]) : OpenOptions{}.geometryCacheBytes;
+        const size_t spatialCacheBytes = argc == 4 ? std::stoull(argv[3]) : OpenOptions{}.spatialCacheBytes;
         if constexpr (std::endian::native != std::endian::little)
             throw std::runtime_error("fixture byte serialization requires little endian");
         Json report = {{"warmup_calls",10},{"batches",9},{"calls_per_batch",20},
             {"units","microseconds per call; batch averages"},
             {"sampling_stride",1}, {"db_storage_tile_vertices",128},
             {"geometry_cache_bytes_per_connection",cacheBytes},
+            {"spatial_cache_bytes_per_connection",spatialCacheBytes},
             {"fixture","float32 XYZ=(column,row,1+column/16); scale=(1,1)"},
             {"candidate_adapter","VC3D query padded by 4; quantized 8-cell anchors rounded and normalized to exact 32-cell regions"},
             {"cache_policy","warm repeated ROI; resident/mapped VC3D; DB connection cache configurable; new transaction unless pinned_snapshot"},
             {"shapes",Json::array()}};
         for (auto [rows,cols] : {Key{1025,1025},Key{2049,2049},Key{65,65537}}) {
-            report["shapes"].push_back(run(rows,cols,cacheBytes));
+            report["shapes"].push_back(run(rows,cols,cacheBytes,spatialCacheBytes));
             std::ofstream file(argv[1]); file << report.dump(2) << '\n';
             if (!file) throw std::runtime_error("cannot write output report");
             std::cerr << "validated " << rows << 'x' << cols << '\n';

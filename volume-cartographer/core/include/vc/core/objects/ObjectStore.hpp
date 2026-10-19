@@ -114,6 +114,9 @@ struct OpenOptions {
     // Retained verified geometry per pooled read connection; zero disables it.
     // Payload bytes plus conservatively charged metadata, excluding active reads.
     std::size_t geometryCacheBytes = 16 * 1024 * 1024;
+    // Resident spatial descriptors/index per read connection; zero uses SQL.
+    // Built lazily; snapshots too large for this budget also use SQL.
+    std::size_t spatialCacheBytes = 16 * 1024 * 1024;
 };
 
 struct ObjectSelection {

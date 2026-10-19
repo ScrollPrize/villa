@@ -264,6 +264,28 @@ Newly loaded manifests/chunks are hash-verified; cache hits reuse verified RAM b
 `read_geometry_array`, exports, sync and internal publication/integrity paths still
 use fresh readers. No schema change or geometry migration is needed.
 
+Spatial region queries also have a separate **16 MiB per read connection** budget,
+configured with Python `spatial_cache_bytes` or C++ `OpenOptions::spatialCacheBytes`.
+The first eligible query lazily loads descriptors and builds a resident BVH with
+exact double bounds. Subsequent bounding-box queries, including kind/UUID filters
+and ordered paging, use that index. Tag/connectivity filters and write transactions
+use SQL. Setting the budget to zero disables the resident spatial index.
+
+The complete index must fit: a scan that exceeds the charged budget is discarded,
+and that connection uses SQL until its snapshot version changes. The scan stops
+at the budget rather than sorting the entire database in SQL first. Charges cover
+descriptor/vector capacities, index nodes and conservative allocation overhead;
+temporary construction and result buffers are separate. With both defaults, four
+reader connections can retain up to **128 MiB** of charged geometry and spatial
+cache data combined, in addition to SQLite's page cache.
+
+Both caches share the snapshot-pinned invalidation token. Any observed commit
+discards the resident spatial index too, including external SQL commits without
+journal entries. First use after invalidation pays index construction again.
+This trades startup/rebuild latency and memory for faster queries on a stable
+snapshot; workloads dominated by isolated queries or frequent commits can disable
+the spatial cache. See the measurements below for the startup cost.
+
 New patch `points` revisions use non-overlapping **128×128-vertex storage tiles**
 by default, independently of the 32×32-cell R-tree tiles. A full physical tile
 contains 192 KiB; boundary tiles store only their actual vertices, without
@@ -835,7 +857,7 @@ and the public `ObjectStore` API, without Python binding overhead:
 
 ```sh
 ninja -C build benchmark_object_store_surface test_surface_patch_index test_object_store
-build/bin/benchmark_object_store_surface /tmp/vcobj-vc3d-surface.json 0
+build/bin/benchmark_object_store_surface /tmp/vcobj-vc3d-surface.json 0 0
 ctest --test-dir build -R '^(test_surface_patch_index|test_object_store)$' --output-on-failure
 ```
 
@@ -898,8 +920,8 @@ box-test padding, so this finding is not evidence that its overlays miss those
 triangles. The DB and padded comparison adapter both return all four regions.
 
 This comparison motivated the batched rectangle reader and bounded connection
-cache described below. The optional final argument `0` disables retention to
-reproduce the baseline behavior. Merely changing chunk layout does not replace
+cache described below. The optional cache arguments `0 0` disable both geometry
+and spatial retention to reproduce the baseline behavior. Merely changing chunk layout does not replace
 VC3D's inexpensive cached geometry access.
 
 ### Retained geometry cache and batched rectangles
@@ -910,8 +932,8 @@ tests competing for CPU:
 
 ```sh
 ninja -C build benchmark_object_store_surface vc_object_bindings test_object_store test_object_records test_object_links
-build/bin/benchmark_object_store_surface /tmp/vcobj-resident-disabled.json 0
-build/bin/benchmark_object_store_surface /tmp/vcobj-resident-cached.json
+build/bin/benchmark_object_store_surface /tmp/vcobj-resident-disabled.json 0 0
+build/bin/benchmark_object_store_surface /tmp/vcobj-resident-cached.json 16777216 0
 ```
 
 ARM64 Linux, RelWithDebInfo, the same planar inputs, ten warmups and nine batches
@@ -947,8 +969,8 @@ retention, not individual native CPU hotspots; perf sampling remains unavailable
 These results apply to a resident working set and repeated queries. Cache misses,
 eviction, commits that invalidate retention, and new reader connections still pay
 verification costs. This does not establish full VC3D frame-rate or spiral-fitting
-throughput parity. The remaining warm-path target is candidate lookup, potentially
-through a reusable resident spatial index or query batching at the consumer level.
+throughput parity. The remaining warm-path target at this stage was candidate
+lookup, addressed by the resident spatial index below.
 
 Validation covers exact tiled/linear bytes and float bit patterns, ordered batches,
 invalid/empty rectangles, cache-disabled and undersized budgets, concurrent readers,
@@ -960,3 +982,61 @@ four CTest suites below pass:
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_BUILD_PYTHON=build/python .venv/bin/python -m pytest -q python/tests/test_object*.py python/tests/test_objects.py
 ctest --test-dir build -R '^(test_object_store|test_object_records|test_object_links|test_surface_patch_index)$' --output-on-failure
 ```
+
+### Resident spatial candidate index
+
+The next comparison keeps the 16 MiB geometry cache enabled in both runs and
+toggles only the spatial cache. Run sequentially, with no competing builds/tests:
+
+```sh
+ninja -C build benchmark_object_store_surface
+build/bin/benchmark_object_store_surface /tmp/spatial-sql.json 16777216 0
+build/bin/benchmark_object_store_surface /tmp/spatial-resident.json
+```
+
+ARM64 Linux, RelWithDebInfo (`-O2 -g -DNDEBUG`), the same three planar surfaces,
+ten warmups and nine batches of twenty calls. Microseconds per call, median
+[min–max] of batch averages; these combined queries include a fresh transaction
+and batched rectangle reads:
+
+| Surface / request | SQL candidates + retained geometry | Resident candidates + retained geometry |
+|---|---:|---:|
+| 1025×1025 / one region | 8.479 [8.445–8.561] | 2.138 [2.134–2.165] |
+| 2049×2049 / one region | 9.058 [9.031–9.235] | 2.148 [2.123–2.162] |
+| 65×65537 / one region | 8.958 [8.906–9.146] | 2.137 [2.118–2.165] |
+| 65×65537 / nine regions | 23.929 [23.691–24.670] | 7.392 [7.211–7.820] |
+
+The wide-surface complete query improves **4.2×** for one region and **3.2×** for
+nine. Corresponding means are 8.996 → 2.139 µs and 24.000 → 7.436 µs.
+VC3D's normalized index plus resident copies measures 0.482/5.524 µs in the
+resident-index run. Candidate lookup inside an existing snapshot now takes
+0.136/1.038 µs; lookup plus batched geometry takes 0.669/5.661 µs. A fresh empty
+read transaction costs about 1.40 µs, making transaction setup/teardown the main
+remaining cost for the one-region query. Snapshot reuse is useful only when
+the consumer can intentionally keep reading that snapshot.
+
+The harness also validates and times 64 changing viewports, rather than only
+repeating an identical box. For the wide small-query/viewport sequences,
+candidate queries with fresh transactions improve from 8.657/23.633 µs to
+1.579/3.313 µs. The moving sequences can return different region counts from
+the fixed queries. All fixed and moving candidate sets match the independent
+grid oracle, and fixed-query geometry still matches byte for byte.
+
+First-use spatial queries cost **1.61/5.66/5.46 ms** for the three surfaces with
+the resident index, versus **0.345/0.248/0.247 ms** with SQL. These are single
+observations after publication, not cold-disk measurements or distributions.
+Each connection builds its own index, and any observed commit invalidates it.
+An oversized index falls back to SQL after a bounded unsuccessful scan, once
+per connection/snapshot version. This is a warm-working-set optimization with
+an explicit startup and memory tradeoff, not a claim of real-scroll frame-rate
+or frequently edited workload performance. Native perf sampling remains
+unavailable; stage timings isolate the eliminated SQL work, not individual
+instruction-level hotspots.
+
+Validation: **151 Python tests and all four CTest suites above pass**. New checks
+compare complete descriptors against SQL over curved/overlapping surfaces,
+changing boxes, exact extreme double coordinates, kind/UUID filters, ordering,
+paging, tag/connectivity fallback, concurrent leases, disabled/tiny budgets,
+external commits with geometry caching disabled, deletion/reinsertion, warmed
+old snapshots, writer visibility and rollback. No numerical tolerance, geometry
+bytes, persisted schema or result-order contract changes.

@@ -114,6 +114,10 @@ TEST_CASE("geometry revisions preserve read snapshots and reject foreign transac
         w.commit();
     }
     auto snapshot = db.read();
+    ObjectSelection atOrigin;
+    atOrigin.bbox = std::array<double, 6>{0, 0, 0, 0, 0, 0};
+    // Populate the resident index before another connection publishes a head.
+    REQUIRE(db.spatialRegions(snapshot, atOrigin).size() == 1);
     {
         auto foreign = other.write();
         CHECK_THROWS(db.putGeometry(foreign, id, data));
@@ -147,8 +151,6 @@ TEST_CASE("geometry revisions preserve read snapshots and reject foreign transac
     CHECK(db.readGeometryArray(current, first, "points")[0] == 0);
     CHECK(db.readGeometryArray(current, second, "points")[0] == 3);
     CHECK(db.geometryHistory(current, id).size() == 2);
-    ObjectSelection atOrigin;
-    atOrigin.bbox = std::array<double, 6>{0, 0, 0, 0, 0, 0};
     const auto projected = db.selectObjects(snapshot, atOrigin, std::vector<std::string>{"generation"});
     REQUIRE(projected.size() == 1);
     CHECK(projected.front().uuid == id);
@@ -185,6 +187,46 @@ TEST_CASE("object store serializes independent writer transactions")
     CHECK_FALSE(failed.load());
     auto read = store.read();
     CHECK(store.objectCount(read, "note") == 30);
+}
+
+TEST_CASE("resident spatial queries keep writer changes out of reader caches")
+{
+    TempDir tmp("spatial_cache_writer");
+    auto options = testOptions();
+    options.geometryCacheBytes = 0;
+    auto db = ObjectStore::create(tmp.dir / "objects.vcobj", options);
+    auto object = makeObject("track");
+    object.track.emplace();
+    object.track->bbox = std::array<double, 6>{0, 0, 0, 0, 0, 0};
+    ObjectSelection selection;
+    selection.bbox = object.track->bbox;
+    auto old = db.read();
+    CHECK(db.spatialRegions(old, selection).empty()); // retain an empty index
+    {
+        auto w = db.write();
+        db.upsertObject(w, object);
+        CHECK(db.spatialRegions(w, selection).size() == 1);
+        CHECK(db.spatialRegions(old, selection).empty());
+        // Roll back the inserted region.
+    }
+    {
+        auto r = db.read();
+        CHECK(db.spatialRegions(r, selection).empty());
+    }
+    {
+        auto w = db.write();
+        const auto id = db.upsertObject(w, object);
+        REQUIRE(db.spatialRegions(w, selection).size() == 1);
+        db.deleteObject(w, id);
+        CHECK(db.spatialRegions(w, selection).empty());
+        db.upsertObject(w, object);
+        w.commit();
+    }
+    CHECK(db.spatialRegions(old, selection).empty());
+    old.commit();
+    CHECK_THROWS(db.spatialRegions(old, selection));
+    auto current = db.read(); // reuse the old snapshot's connection
+    CHECK(db.spatialRegions(current, selection).size() == 1);
 }
 
 TEST_CASE("tiled patch rectangles preserve revision snapshots and logical byte order")

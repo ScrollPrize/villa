@@ -113,11 +113,13 @@ NB_MODULE(objects, m)
         .def_static("create", &PyObjectStore::create, nb::arg("path"), nb::arg("author"),
                     nb::arg("hostname") = std::nullopt, nb::arg("reader_pool_size") = 4,
                     nb::arg("geometry_cache_bytes") = 16 * 1024 * 1024,
+                    nb::arg("spatial_cache_bytes") = 16 * 1024 * 1024,
                     "Create a new object database at path (refuses existing files).")
         .def_static("open", &PyObjectStore::open, nb::arg("path"), nb::arg("author") = std::nullopt,
                     nb::arg("read_only") = false, nb::arg("hostname") = std::nullopt,
                     nb::arg("reader_pool_size") = 4,
                     nb::arg("geometry_cache_bytes") = 16 * 1024 * 1024,
+                    nb::arg("spatial_cache_bytes") = 16 * 1024 * 1024,
                     "Open an existing object database. author is required unless read_only.")
         .def("close", &PyObjectStore::close)
         .def("__enter__", [](nb::object self) { return self; })

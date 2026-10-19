@@ -1,7 +1,14 @@
 #include "internal/RecordJson.hpp"
+#include "internal/SpatialCache.hpp"
 
 namespace vc::objects {
 
+void detail::beginSpatialRead(StatementPool& pool, size_t budget, int version)
+{
+    if (!budget) { pool.spatialCache.reset(); return; }
+    if (!pool.spatialCache) pool.spatialCache = std::make_shared<SpatialReadCache>(budget);
+    pool.spatialCache->begin(version);
+}
 
 namespace {
 struct SelectionFilter {
@@ -76,12 +83,16 @@ std::vector<SpatialRegion> ObjectStore::spatialRegions(const Txn& txn, const Obj
     auto* db = static_cast<sqlite3*>(connection(txn));
     if (!selection.bbox) throw std::invalid_argument("spatial regions require a bbox");
     detail::validateBounds(*selection.bbox);
+    if (selection.offset < 0 || (selection.limit && *selection.limit < 0))
+        throw std::invalid_argument("selection limit and offset must be nonnegative");
+    if (const auto lease = activeStatementPools.find(db); lease != activeStatementPools.end())
+        if (const auto& cache = lease->second->spatialCache)
+            if (auto result = cache->query(db, selection)) return std::move(*result);
     if (pragmaInt(db, "user_version") < 5)
         throw std::runtime_error("spatial regions require schema 5; open the store writable once to migrate");
     const auto filter = objectFilter(*this, txn, db, selection);
     // CROSS JOIN preserves the R-tree-first plan even with a kind filter.
-    std::string sql = "SELECT o.uuid,o.kind,h.revision_uuid,b.array_name,b.row_start,b.col_start,b.row_count,b.col_count,"
-        "b.min_x,b.min_y,b.min_z,b.max_x,b.max_y,b.max_z FROM spatial_regions_rtree r "
+    std::string sql = std::string("SELECT ") + detail::regionColumns + " FROM spatial_regions_rtree r "
         "CROSS JOIN spatial_regions b ON b.id=r.id CROSS JOIN objects o ON o.id=b.object_id "
         "CROSS JOIN object_bounds h ON h.object_id=b.object_id "
         "WHERE (b.array_name!='' OR h.revision_uuid IS NULL)" + filter.sql + " AND " +
@@ -90,18 +101,7 @@ std::vector<SpatialRegion> ObjectStore::spatialRegions(const Txn& txn, const Obj
     Statement rows(db, sql);
     bindSelection(rows, filter, selection);
     std::vector<SpatialRegion> result;
-    while (rows.row()) {
-        SpatialRegion r;
-        r.objectUuid = formatUuid(rows.blob16(0)); r.kind = rows.text(1);
-        if (!rows.isNull(2)) r.revisionUuid = formatUuid(rows.blob16(2));
-        r.arrayName = rows.text(3);
-        if (!r.arrayName.empty()) {
-            r.start.push_back(rows.i64(4)); r.shape.push_back(rows.i64(6));
-            if (rows.i64(7)) { r.start.push_back(rows.i64(5)); r.shape.push_back(rows.i64(7)); }
-        }
-        for (int i = 0; i < 6; ++i) r.bbox[i] = rows.f64(i + 8);
-        result.push_back(std::move(r));
-    }
+    while (rows.row()) result.push_back(detail::readSpatialRegion(rows));
     return result;
 }
 

@@ -52,11 +52,15 @@ private:
     std::list<std::string> recency_;
 };
 
-void beginGeometryRead(sqlite3* db, StatementPool& pool, size_t budget)
+void beginReadCaches(sqlite3* db, StatementPool& pool, size_t geometryBudget, size_t spatialBudget)
 {
-    if (!budget) { pool.geometryCache.reset(); return; }
-    if (!pool.geometryCache) pool.geometryCache = std::make_shared<GeometryReadCache>(budget);
-    pool.geometryCache->begin(pragmaInt(db, "data_version"));
+    const int version = geometryBudget || spatialBudget ? pragmaInt(db, "data_version") : 0;
+    if (!geometryBudget) pool.geometryCache.reset();
+    else {
+        if (!pool.geometryCache) pool.geometryCache = std::make_shared<GeometryReadCache>(geometryBudget);
+        pool.geometryCache->begin(version);
+    }
+    beginSpatialRead(pool, spatialBudget, version);
 }
 
 template<class F> auto withGeometryReader(const Txn& txn, const std::string& revision, F&& read)
