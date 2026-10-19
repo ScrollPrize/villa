@@ -20,7 +20,8 @@ public:
     int maximum() const { return _maximum; }
     int lowValue() const { return _lowValue; }
     int highValue() const { return _highValue; }
-    QColor handleBorderColor() const { return _handleBorderColor; }
+    // The ring of the handles: the palette's highlight color unless one was set.
+    QColor handleBorderColor() const;
 
     void setMinimumSeparation(int separation);
     int minimumSeparation() const { return _minimumSeparation; }
@@ -61,5 +62,5 @@ private:
 
     DragTarget _dragTarget;
     int _dragOffset{}; // pixel delta between cursor and handle center
-    QColor _handleBorderColor;
+    QColor _handleBorderColor;  // invalid: follow the palette, which a theme can change
 };

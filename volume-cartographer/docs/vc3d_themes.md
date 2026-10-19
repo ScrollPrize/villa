@@ -381,8 +381,8 @@ Warnings, such as a misspelled token, also show in the status bar.
 - A theme that sets a font makes the application font explicit: after
   switching back to a theme without one, VC3D uses its startup font but no
   longer follows system font changes until it restarts.
-- A few widgets pick their colors when they are created, such as the ring of
-  the range slider handles, and keep VC3D's startup colors until it restarts.
+- A few widgets pick some colors when they are created and keep VC3D's
+  startup colors until it restarts.
 - A style sheet given with Qt's `-stylesheet` option applies under Classic
   and Classic-based themes; the Modern themes replace it.
 
