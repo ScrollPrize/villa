@@ -1,0 +1,204 @@
+{
+  "free": {
+    "all": {
+      "events": 4918,
+      "l1": 0.04168361122407483,
+      "correct_percent": 95.85197234648231,
+      "max_error": 2
+    },
+    "perpendicular": {
+      "events": 575,
+      "l1": 0.1426086956521739,
+      "correct_percent": 85.91304347826086,
+      "max_error": 2
+    },
+    "parallel": {
+      "events": 4343,
+      "l1": 0.028321436794842274,
+      "correct_percent": 97.16785632051578,
+      "max_error": 1
+    },
+    "available_events": 5251,
+    "scored_events": 4918,
+    "unscored_events": 333,
+    "component_gauges": {
+      "0": {
+        "offset": 6,
+        "events": 4848
+      },
+      "1": {
+        "offset": 0,
+        "events": 1
+      },
+      "2": {
+        "offset": 4,
+        "events": 6
+      },
+      "3": {
+        "offset": 1,
+        "events": 63
+      }
+    },
+    "gauge_policy": "per-component integer median; GT used only for evaluation",
+    "reference": "frozen gt_winding_reference.json; source 7 excluded",
+    "single_global_gauge": {
+      "offset": 6,
+      "metrics": {
+        "all": {
+          "events": 4918,
+          "l1": 0.10898739324928833,
+          "correct_percent": 94.44896299308661,
+          "max_error": 6
+        },
+        "perpendicular": {
+          "events": 575,
+          "l1": 0.17391304347826086,
+          "correct_percent": 85.21739130434783,
+          "max_error": 6
+        },
+        "parallel": {
+          "events": 4343,
+          "l1": 0.10039143449228644,
+          "correct_percent": 95.6711950264794,
+          "max_error": 5
+        }
+      },
+      "signs": {
+        "parallel": {
+          "events": 4343,
+          "violations": 27
+        },
+        "perpendicular": {
+          "events": 575,
+          "violations": 5
+        }
+      }
+    },
+    "signs": {
+      "parallel": {
+        "events": 4343,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 575,
+        "violations": 4
+      }
+    },
+    "violation_detail": {
+      "events": 4,
+      "ordinary_fibers": 4,
+      "gt_fibers": {
+        "2": 1,
+        "1": 3
+      },
+      "steps": {
+        "1": 4
+      },
+      "reversals": 1,
+      "missing_next_winding": 3,
+      "ordinary_fiber_counts": {
+        "291441": 1,
+        "424632": 1,
+        "424646": 1,
+        "425073": 1
+      },
+      "normal_abs_cosine_min": 0.9143726200208947,
+      "normal_abs_cosine_max": 0.9974070831446663
+    },
+    "solution_sha256": "b8374087f64e9d8a8f168a63fdfa7945a57924d81103abde131436982b0a1063"
+  },
+  "joint": {
+    "all": {
+      "events": 4918,
+      "l1": 0.03355022366815779,
+      "correct_percent": 96.64497763318423,
+      "max_error": 1
+    },
+    "perpendicular": {
+      "events": 575,
+      "l1": 0.1356521739130435,
+      "correct_percent": 86.43478260869564,
+      "max_error": 1
+    },
+    "parallel": {
+      "events": 4343,
+      "l1": 0.020032235781717707,
+      "correct_percent": 97.99677642182823,
+      "max_error": 1
+    },
+    "available_events": 5251,
+    "scored_events": 4918,
+    "unscored_events": 333,
+    "component_gauges": {
+      "0": {
+        "offset": 6,
+        "events": 4918
+      }
+    },
+    "gauge_policy": "per-component integer median; GT used only for evaluation",
+    "reference": "frozen gt_winding_reference.json; source 7 excluded",
+    "single_global_gauge": {
+      "offset": 6,
+      "metrics": {
+        "all": {
+          "events": 4918,
+          "l1": 0.03355022366815779,
+          "correct_percent": 96.64497763318423,
+          "max_error": 1
+        },
+        "perpendicular": {
+          "events": 575,
+          "l1": 0.1356521739130435,
+          "correct_percent": 86.43478260869564,
+          "max_error": 1
+        },
+        "parallel": {
+          "events": 4343,
+          "l1": 0.020032235781717707,
+          "correct_percent": 97.99677642182823,
+          "max_error": 1
+        }
+      },
+      "signs": {
+        "parallel": {
+          "events": 4343,
+          "violations": 0
+        },
+        "perpendicular": {
+          "events": 575,
+          "violations": 3
+        }
+      }
+    },
+    "signs": {
+      "parallel": {
+        "events": 4343,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 575,
+        "violations": 3
+      }
+    },
+    "violation_detail": {
+      "events": 3,
+      "ordinary_fibers": 3,
+      "gt_fibers": {
+        "1": 3
+      },
+      "steps": {
+        "1": 3
+      },
+      "reversals": 0,
+      "missing_next_winding": 3,
+      "ordinary_fiber_counts": {
+        "424632": 1,
+        "424646": 1,
+        "425073": 1
+      },
+      "normal_abs_cosine_min": 0.9143726200208947,
+      "normal_abs_cosine_max": 0.9974070831446663
+    },
+    "solution_sha256": "49eb940f5e49a53b51d60b4320353317623d279d5ebdd0a85b8b0a5fd14d9977"
+  }
+}

@@ -31,6 +31,41 @@ def integer_targets(distance, sign, family_delta, parallel, offset=.5):
     return np.where(sign < 0, minus, plus), (sign != 0) | (plus == minus)
 
 
+def fractional_targets(distance, sign, family_delta, parallel, offset=.5):
+    """Calibrated signed centers, retaining the baseline outward-order clamp.
+
+    Unsigned evidence retains its baseline unique integer target, if valid;
+    selecting one of its fractional orientations would invent information.
+    """
+    rounded, valid = integer_targets(distance, sign, family_delta, parallel, offset)
+    distance, sign, family_delta, parallel = np.broadcast_arrays(
+        np.asarray(distance, float), sign, family_delta, np.asarray(parallel, bool))
+    outward = distance-sign*np.where(parallel, 0., offset*family_delta)
+    minimum = (~parallel) & (sign*family_delta < 0)
+    target = sign*np.maximum(outward, minimum)
+    return np.where(sign == 0, rounded, target), valid
+
+
+def split_fractional_edges(a, b, target, weight):
+    """Two integer targets with exactly the same L1 cost on integer labels.
+
+    Returns a solve-compatible graph and the source edge index for every arc.
+    Zero-weight upper arcs for integral targets are omitted.
+    """
+    a, b, target, weight = (np.asarray(v) for v in (a, b, target, weight))
+    if target.ndim != 1 or any(v.shape != target.shape for v in (a, b, weight)):
+        raise ValueError('Edge shapes disagree')
+    if not np.isfinite(target).all() or not np.isfinite(weight).all() or np.any(weight <= 0):
+        raise ValueError('Invalid fractional targets or weights')
+    lower = np.floor(target).astype(np.int64)
+    fraction = target-lower
+    upper = fraction > 0
+    source = np.r_[np.arange(len(a)), np.flatnonzero(upper)]
+    return dict(a=a[source], b=b[source], target=np.r_[lower, lower[upper]+1],
+                weight=np.r_[weight*(1-fraction), weight[upper]*fraction[upper]],
+                one_sided=np.zeros(len(source), bool)), source
+
+
 def solve(node_count, a, b, target, weight=None, one_sided=None):
     """Minimize sum w|Bk-d|, or w max(0,d-Bk) on one-sided edges.
 

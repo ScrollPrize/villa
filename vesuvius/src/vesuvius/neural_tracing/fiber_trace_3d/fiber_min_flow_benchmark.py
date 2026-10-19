@@ -7,7 +7,7 @@ import time
 
 import numpy as np
 
-from .fiber_min_flow import Seam, corrected_targets, integer_targets, solve
+from .fiber_min_flow import Seam, corrected_targets, integer_targets, fractional_targets, split_fractional_edges, solve
 
 
 def read(path):
@@ -68,12 +68,15 @@ class Paths:
         return np.array([s[0] for s in samples]), np.array([s[1] for s in samples])
 
 
-def graph(config, d, paths, sign_only=False):
+def graph(config, d, paths, sign_only=False, target_mode="fractional"):
+    if target_mode not in ("rounded", "fractional"):
+        raise ValueError("Unknown target mode: "+target_mode)
     a, ta = paths.ends('a')
     b, tb = paths.ends('b')
     c = np.array([paths.seam.segment(x, y) for x, y in zip(a, b)])
     fd = d['family'][d['j']]-d['family'][d['i']]
-    measured, valid = integer_targets(d['distance']*config.get('lasagna_winding_scale', 1.),
+    target_function = fractional_targets if target_mode == 'fractional' and not sign_only else integer_targets
+    measured, valid = target_function(d['distance']*config.get('lasagna_winding_scale', 1.),
         d['sign'], fd, d['parallel'], config.get('perpendicular_offset', .5))
     target = corrected_targets(measured, ta, tb, c)
     ia, ib = d['i'].copy(), d['j'].copy()
@@ -84,9 +87,14 @@ def graph(config, d, paths, sign_only=False):
         reverse = d['sign'] < 0
         ia[reverse], ib[reverse] = ib[reverse].copy(), ia[reverse].copy()
     weights = np.where(d['parallel'], 1., config.get('perpendicular_relative_weight', 1.))
-    return dict(a=ia[valid], b=ib[valid], target=target[valid], weight=weights[valid],
-        one_sided=np.full(valid.sum(), sign_only)), dict(valid=valid, fiber_a=ta,
-        fiber_b=tb, connector=c, measured_target=measured, corrected_target=target)
+    g = dict(a=ia[valid], b=ib[valid], target=target[valid], weight=weights[valid],
+             one_sided=np.full(valid.sum(), sign_only))
+    event_index = np.flatnonzero(valid)
+    if target_mode == 'fractional' and not sign_only:
+        g, source = split_fractional_edges(g['a'], g['b'], g['target'], g['weight'])
+        event_index = event_index[source]
+    return g, dict(valid=valid, fiber_a=ta, fiber_b=tb, connector=c,
+                   measured_target=measured, corrected_target=target, flow_event_index=event_index)
 
 
 def summarize_errors(error, parallel):
@@ -219,6 +227,9 @@ def audit_free(config, d):
 
 
 def run(settings):
+    target_mode = settings.get('target_mode', 'fractional')
+    if target_mode not in ('rounded', 'fractional'):
+        raise ValueError('Unknown target mode: '+target_mode)
     project = Path(settings['project'])
     output = Path(settings['output_root'])
     output.mkdir(parents=True, exist_ok=True)
@@ -254,7 +265,7 @@ def run(settings):
     dependencies.update(Path(gt_config[k]) for k in ('afv', 'umbilicus', 'tensor_cache'))
     input_hashes = {str(path): digest(path) for path in sorted(dependencies)}
     write(output/'manifest.json', dict(cases=cases, reference_sha256=digest(project/'gt_winding_reference.json'),
-        input_hashes=input_hashes,
+        input_hashes=input_hashes, target_mode=target_mode,
         source_branch='global-fiber-sgd-surface', source_commit='db07e60fd',
         notes='CPU integer-only model; no fitted widths/geometry, fiber disabling or uncertainty.'))
     results = {}
@@ -268,7 +279,7 @@ def run(settings):
         if key not in geometry_cache:
             geometry_cache[key] = Paths(config, d)
         paths = geometry_cache[key]
-        g, transport = graph(config, d, paths, case['sign_only'])
+        g, transport = graph(config, d, paths, case['sign_only'], target_mode)
         # Cached phases linearly interpolate ANGLE, whereas the physical seam
         # intersects linearly interpolated XYZ. They can disagree near a cut.
         anchor = np.floor(d['node_phase'][:, 0]+.25).astype(int)
@@ -282,7 +293,7 @@ def run(settings):
         fd = d['family'][d['j']]-d['family'][d['i']]
         margin = (~d['parallel']) & (d['sign']*fd < 0)
         wrong = (d['sign'] != 0) & (d['sign']*physical < margin)
-        metrics = dict(nodes=len(k), events=len(d['i']), used_events=int(transport['valid'].sum()),
+        metrics = dict(target_mode=target_mode, flow_arcs=len(g['a']), nodes=len(k), events=len(d['i']), used_events=int(transport['valid'].sum()),
             cached_interpolated_angle_seam_disagreements=phase_audit,
             unsigned_events=int(np.sum(d['sign'] == 0)),
             unsigned_unique_target_retained=int(np.sum((d['sign'] == 0)&transport['valid'])),

@@ -2,6 +2,8 @@
 
 Implemented on branch `fiber-min-flow`, based on requested `global-fiber-sgd-surface` commit `db07e60fd`. Worktree: `/home/hendrik/villa_super/villa-min-flow`. Original worktrees and datasets are unchanged. Current task and design contract live in [planning](../../planning/fiber-min-flow/task_plan.md).
 
+The current baseline uses fractional measurements expanded into adjacent integer targets; see [current results and timings](fractional-targets.md). The seven-case table below preserves the historical rounded-target results.
+
 ## Formulation
 
 One integer anchor winding `k_i` per original whole fiber. No optimized geometry, widths, probability distributions, or fiber enablement. H/V family labels do not add half-integers to positions.
@@ -12,11 +14,11 @@ Let `T_i(s)` be signed seam crossings along fiber i from its original first poin
 (k_b + T_b) - (k_a + T_a) - C_ab.
 ```
 
-For measured integer target m, optimize `sum_e w_e * abs(k_b-k_a-d_e)` where `d_e = m_e+C_ab-T_b+T_a`.
+For measured target m, optimize `sum_e w_e * abs(k_b-k_a-d_e)` where `d_e = m_e+C_ab-T_b+T_a`.
 
 The cut extends from the umbilicus toward image-up (negative Y), along every Z; its axis is linearly interpolated between control points. Positive crossing follows increasing atan2(Y-cY,X-cX). Paths are split at axis Z knots, so intersections are computed on piecewise-linear XYZ rather than interpolated angles. Half-open endpoint handling makes reversing a path negate its crossing count. Paths intersecting the axis are rejected as undefined.
 
-Targets use the existing measurement convention: outward H→V permits same winding, outward V→H requires at least the next winding. Distances select larger integer jumps when warranted. Subtract `.5*(family_b-family_a)` from signed measurement calibration only; round to nearest integer with ties toward smaller outward separation, and enforce the same/next minimum. Thus the half-step is in interpreting the measurement, never a winding variable. Lasagna measurement scale is inherited (1 in these cases).
+Targets use the existing measurement convention: outward H→V permits same winding, outward V→H requires at least the next winding. Distances select larger integer jumps when warranted. Subtract `.5*(family_b-family_a)` from signed measurement calibration only; enforce the same/next minimum, then split each fractional center between adjacent integer targets with proportional weights. Explicit rounded mode instead rounds to the nearest integer with ties toward smaller outward separation. Thus the half-step is in interpreting the measurement, never a winding variable. Lasagna measurement scale is inherited (1 in these cases).
 
 Dual circulation: minimize `-sum_e d_e*y_e`, conserve signed flow at every node, and bound `-w_e <= y_e <= w_e`. SciPy HiGHS dual simplex solves this network LP. Floating capacities preserve weights without quantization; weights are 1 for parallel and the saved `perpendicular_relative_weight` for perpendicular constraints. Geometry-dependent and uncertainty-dependent weights are absent. Integer arc costs yield integer optimal node potentials. Each solve checks the recovered integer primal value against the flow dual value, as well as flow conservation and capacity bounds. Disconnected components each have an arbitrary additive gauge.
 
@@ -37,9 +39,9 @@ PYTHONPATH=vesuvius/src /home/hendrik/.venv_las/bin/python -m pytest -q --noconf
 
 CPU only; no installation or GPU reservation required. Uses existing NumPy/SciPy. Source inputs remain under `/home/hendrik/villa2/global-fiber-sgd`. The surface branch predates the newer benchmark runner, so an additive adapter consumes its saved manifests and caches. `run_seven.json` sets absolute input/output paths; change these for another checkout. The runner overwrites its own output directory when rerun.
 
-[Input manifest](../../global-fiber-min-flow/data/seven_v1/manifest.json) records resolved configs and SHA-256 hashes of tensors, raw fiber geometry, umbilicus, cross events and reference. Both large tensor hashes match those recorded by the original SGD solves. The historical source AFC database path is missing, so raw AFC sign recomputation is unavailable; this does not prevent replaying the exact hashed SGD tensor inputs. No preprocessing was regenerated.
+[Current input manifest](../../global-fiber-min-flow/data/seven_fractional_v1/manifest.json) records resolved configs and SHA-256 hashes of tensors, raw fiber geometry, umbilicus, cross events and reference. Both large tensor hashes match those recorded by the original SGD solves. The historical source AFC database path is missing, so raw AFC sign recomputation is unavailable; this does not prevent replaying the exact hashed SGD tensor inputs. No preprocessing was regenerated.
 
-## Seven-case results
+## Historical rounded-target seven-case results
 
 All seven solves completed and have zero primal–dual gap. Each full small test scores 41 reference relations (35 perpendicular, six parallel); source fiber 7 is excluded from accuracy by the frozen reference definition but retained in solving. Width initialization variants collapse to the same integer problem. Dense and sparse geometry supervision are both absent, so the two sign-only cases likewise coincide. These are winding results, not passes of the old continuous geometry benchmark.
 
@@ -71,8 +73,12 @@ The saved free SGD report has perpendicular correctness 50.18%, continuous L1 .6
 - `fiber_min_flow_benchmark.py`: immutable dataset adapter, provenance, reference scoring, seven-case execution.
 - `crop_benchmark.py`: additive dispatch through the existing runner.
 - `test_fiber_min_flow.py`: brute-force random graph checks, direction reversal, gauges, self-edges, one-sided terms, H/V and unsigned targets, multiple seam crossings, seam movement, curved axis, endpoint conventions and XYZ/angle interpolation distinction.
-- Each case writes `solution.npz` and `metrics.json`; consolidated [results](../../global-fiber-min-flow/data/seven_v1/results.json) and manifest are retained.
+- Each case writes `solution.npz` and `metrics.json`; consolidated [current results](../../global-fiber-min-flow/data/seven_fractional_v1/results.json) and manifest are retained.
 
 Optimality certifies this fixed-target objective. It does not establish physical correctness of measurements, uniqueness of labels, or constrain relative gauges of disconnected components. Twenty ambiguous terms remain an explicit limitation of the fixed-target model; no uncertainty model, arbitrary sign choice, radial tie-break prior or geometry optimizer was introduced.
 
 Follow-up: [detailed signs versus GT audit](gt-sign-audit.md), including affected fibers, one-step errors, component alignment and reference coverage.
+
+## Fractional targets
+
+The accepted adjacent-integer weighting baseline, seven-case comparison and reproduction commands are documented in [fractional-targets.md](fractional-targets.md). Fractional targets are now the default in the benchmark and canonical `run_seven.json`; use explicit `target_mode: rounded` for the historical formulation. Saved historical outputs remain unchanged.

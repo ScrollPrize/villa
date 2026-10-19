@@ -115,3 +115,63 @@ def test_interpolated_angle_is_not_physical_seam_intersection():
     angle_interp = .7*np.arctan2(b[1], b[0])+.3*np.arctan2(a[1], a[0])
     assert angle_interp > -np.pi/2
     assert seam.segment(a, p) == 0
+
+
+def test_fractional_expansion_integer_domain_and_bruteforce():
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_min_flow import split_fractional_edges
+    rng = np.random.default_rng(134)
+    a, b = np.array([0, 1, 2, 0, 0]), np.array([1, 2, 0, 2, 0])
+    for _ in range(12):
+        target = rng.uniform(-2, 2, len(a))
+        target[0] = -1
+        w = rng.uniform(.1, 2, len(a))
+        g, source = split_fractional_edges(a, b, target, w)
+        np.testing.assert_allclose(np.bincount(source, weights=g['weight']), w)
+        candidates = [np.array([0, *v]) for v in itertools.product(range(-5, 6), repeat=2)]
+        for k in candidates:
+            direct = np.sum(w*abs(k[b]-k[a]-target))
+            expanded = np.sum(g['weight']*abs(k[g['b']]-k[g['a']]-g['target']))
+            assert expanded == pytest.approx(direct)
+        result = solve(3, **g)
+        brute = min(np.sum(w*abs(k[b]-k[a]-target)) for k in candidates)
+        assert result['certificate']['primal'] == pytest.approx(brute)
+        reversed_graph, _ = split_fractional_edges(b, a, -target, w)
+        assert solve(3, **reversed_graph)['certificate']['primal'] == pytest.approx(brute)
+        gauge = np.array([0, 2, -1])
+        shifted, _ = split_fractional_edges(a, b, target+gauge[b]-gauge[a], w)
+        assert solve(3, **shifted)['certificate']['primal'] == pytest.approx(brute)
+
+
+def test_fractional_calibration_order_and_unsigned_policy():
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_min_flow import fractional_targets
+    d = np.array([.8, .8, .2, .2, .2, .8, 2.3])
+    s = np.array([1, -1, 1, -1, 0, 0, 1])
+    f = np.array([1, -1, -1, 1, 0, 0, 0])
+    p = np.array([False]*4+[True]*3)
+    target, valid = fractional_targets(d, s, f, p)
+    np.testing.assert_allclose(target[valid], [.3, -.3, 1, -1, 0, 2.3])
+    np.testing.assert_array_equal(valid, [True]*5+[False, True])
+    reverse, reverse_valid = fractional_targets(d, -s, -f, p)
+    np.testing.assert_allclose(target[valid], -reverse[valid])
+    np.testing.assert_array_equal(valid, reverse_valid)
+
+
+def test_fractional_adapter_transport_and_sign_only_unchanged():
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_min_flow_benchmark import graph
+    class Paths:
+        seam = Seam([[0, 0, -1], [0, 0, 1]])
+        def ends(self, side):
+            return (np.array([[-1, -2, 0]]), np.array([0])) if side == 'a' else (np.array([[1, -2, 0]]), np.array([2]))
+    d = dict(family=np.array([0, 1]), i=np.array([0]), j=np.array([1]),
+             distance=np.array([.8]), sign=np.array([1]), parallel=np.array([False]))
+    g, t = graph({}, d, Paths())  # fractional is the accepted default
+    rounded, _ = graph({}, d, Paths(), target_mode='rounded')
+    np.testing.assert_array_equal(rounded['target'], [-1])
+    np.testing.assert_array_equal(g['target'], [-1, 0])
+    np.testing.assert_allclose(g['weight'], [.7, .3])
+    np.testing.assert_array_equal(t['flow_event_index'], [0, 0])
+    assert t['valid'].sum() == 1
+    old, _ = graph({}, d, Paths(), sign_only=True)
+    new, _ = graph({}, d, Paths(), sign_only=True, target_mode='fractional')
+    for key in old:
+        np.testing.assert_array_equal(old[key], new[key])

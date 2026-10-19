@@ -1,0 +1,834 @@
+{
+  "full": {
+    "objectives": {
+      "rounded_baseline": 15.0,
+      "rounded_trial": 17.5,
+      "fractional_baseline": 30.13396543264389,
+      "fractional_trial": 28.75115704536438
+    },
+    "changed_nodes_after_component_mode_gauge": 1,
+    "changed_node_ids": [
+      7
+    ],
+    "max_node_change": 1,
+    "rounded_reference": {
+      "all": {
+        "exact": 41,
+        "events": 41,
+        "l1": 0.0
+      },
+      "perpendicular": {
+        "exact": 35,
+        "events": 35,
+        "l1": 0.0
+      },
+      "parallel": {
+        "exact": 6,
+        "events": 6,
+        "l1": 0.0
+      }
+    },
+    "fractional_reference": {
+      "all": {
+        "exact": 41,
+        "events": 41,
+        "l1": 0.0
+      },
+      "perpendicular": {
+        "exact": 35,
+        "events": 35,
+        "l1": 0.0
+      },
+      "parallel": {
+        "exact": 6,
+        "events": 6,
+        "l1": 0.0
+      }
+    },
+    "rounded_gt_signs": null,
+    "fractional_gt_signs": null,
+    "rounded_internal_signs": {
+      "parallel": {
+        "events": 6,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 40,
+        "violations": 0
+      }
+    },
+    "fractional_internal_signs": {
+      "parallel": {
+        "events": 6,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 40,
+        "violations": 0
+      }
+    },
+    "rounded_flow_seconds": 0.011212582001462579,
+    "fractional_flow_seconds": 0.010290190111845732,
+    "rounded_arcs": 46,
+    "fractional_arcs": 88,
+    "fractional_certificate": {
+      "primal": 28.75115704536438,
+      "dual": 28.75115704536438,
+      "gap": 0.0,
+      "conservation_max": 0.0,
+      "capacity_violation_max": 0.0,
+      "potential_rounding_max": 0.0,
+      "components": 1,
+      "seconds": 0.010290190111845732,
+      "optimal": true,
+      "backend": "scipy.optimize.linprog/highs-ds capacitated circulation",
+      "iterations": 9
+    },
+    "baseline_solution_sha256": "7370e950532ee548f4d934c8622532f043022aac6eed9072862eacf597dbd989",
+    "trial_solution_sha256": "831d159342bd3b783630632aa6959862ba41dda1c4c42c8b4fec23efab947e32"
+  },
+  "half": {
+    "objectives": {
+      "rounded_baseline": 15.0,
+      "rounded_trial": 17.5,
+      "fractional_baseline": 30.13396543264389,
+      "fractional_trial": 28.75115704536438
+    },
+    "changed_nodes_after_component_mode_gauge": 1,
+    "changed_node_ids": [
+      7
+    ],
+    "max_node_change": 1,
+    "rounded_reference": {
+      "all": {
+        "exact": 41,
+        "events": 41,
+        "l1": 0.0
+      },
+      "perpendicular": {
+        "exact": 35,
+        "events": 35,
+        "l1": 0.0
+      },
+      "parallel": {
+        "exact": 6,
+        "events": 6,
+        "l1": 0.0
+      }
+    },
+    "fractional_reference": {
+      "all": {
+        "exact": 41,
+        "events": 41,
+        "l1": 0.0
+      },
+      "perpendicular": {
+        "exact": 35,
+        "events": 35,
+        "l1": 0.0
+      },
+      "parallel": {
+        "exact": 6,
+        "events": 6,
+        "l1": 0.0
+      }
+    },
+    "rounded_gt_signs": null,
+    "fractional_gt_signs": null,
+    "rounded_internal_signs": {
+      "parallel": {
+        "events": 6,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 40,
+        "violations": 0
+      }
+    },
+    "fractional_internal_signs": {
+      "parallel": {
+        "events": 6,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 40,
+        "violations": 0
+      }
+    },
+    "rounded_flow_seconds": 0.003090738086029887,
+    "fractional_flow_seconds": 0.002912241965532303,
+    "rounded_arcs": 46,
+    "fractional_arcs": 88,
+    "fractional_certificate": {
+      "primal": 28.75115704536438,
+      "dual": 28.75115704536438,
+      "gap": 0.0,
+      "conservation_max": 0.0,
+      "capacity_violation_max": 0.0,
+      "potential_rounding_max": 0.0,
+      "components": 1,
+      "seconds": 0.002912241965532303,
+      "optimal": true,
+      "backend": "scipy.optimize.linprog/highs-ds capacitated circulation",
+      "iterations": 9
+    },
+    "baseline_solution_sha256": "7370e950532ee548f4d934c8622532f043022aac6eed9072862eacf597dbd989",
+    "trial_solution_sha256": "831d159342bd3b783630632aa6959862ba41dda1c4c42c8b4fec23efab947e32"
+  },
+  "double": {
+    "objectives": {
+      "rounded_baseline": 15.0,
+      "rounded_trial": 17.5,
+      "fractional_baseline": 30.13396543264389,
+      "fractional_trial": 28.75115704536438
+    },
+    "changed_nodes_after_component_mode_gauge": 1,
+    "changed_node_ids": [
+      7
+    ],
+    "max_node_change": 1,
+    "rounded_reference": {
+      "all": {
+        "exact": 41,
+        "events": 41,
+        "l1": 0.0
+      },
+      "perpendicular": {
+        "exact": 35,
+        "events": 35,
+        "l1": 0.0
+      },
+      "parallel": {
+        "exact": 6,
+        "events": 6,
+        "l1": 0.0
+      }
+    },
+    "fractional_reference": {
+      "all": {
+        "exact": 41,
+        "events": 41,
+        "l1": 0.0
+      },
+      "perpendicular": {
+        "exact": 35,
+        "events": 35,
+        "l1": 0.0
+      },
+      "parallel": {
+        "exact": 6,
+        "events": 6,
+        "l1": 0.0
+      }
+    },
+    "rounded_gt_signs": null,
+    "fractional_gt_signs": null,
+    "rounded_internal_signs": {
+      "parallel": {
+        "events": 6,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 40,
+        "violations": 0
+      }
+    },
+    "fractional_internal_signs": {
+      "parallel": {
+        "events": 6,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 40,
+        "violations": 0
+      }
+    },
+    "rounded_flow_seconds": 0.002856981009244919,
+    "fractional_flow_seconds": 0.0027185878716409206,
+    "rounded_arcs": 46,
+    "fractional_arcs": 88,
+    "fractional_certificate": {
+      "primal": 28.75115704536438,
+      "dual": 28.75115704536438,
+      "gap": 0.0,
+      "conservation_max": 0.0,
+      "capacity_violation_max": 0.0,
+      "potential_rounding_max": 0.0,
+      "components": 1,
+      "seconds": 0.0027185878716409206,
+      "optimal": true,
+      "backend": "scipy.optimize.linprog/highs-ds capacitated circulation",
+      "iterations": 9
+    },
+    "baseline_solution_sha256": "7370e950532ee548f4d934c8622532f043022aac6eed9072862eacf597dbd989",
+    "trial_solution_sha256": "831d159342bd3b783630632aa6959862ba41dda1c4c42c8b4fec23efab947e32"
+  },
+  "sign": {
+    "objectives": {
+      "rounded_baseline": 0.0,
+      "rounded_trial": 0.0,
+      "fractional_baseline": 0.0,
+      "fractional_trial": 0.0
+    },
+    "changed_nodes_after_component_mode_gauge": 0,
+    "changed_node_ids": [],
+    "max_node_change": 0,
+    "rounded_reference": {
+      "all": {
+        "exact": 41,
+        "events": 41,
+        "l1": 0.0
+      },
+      "perpendicular": {
+        "exact": 35,
+        "events": 35,
+        "l1": 0.0
+      },
+      "parallel": {
+        "exact": 6,
+        "events": 6,
+        "l1": 0.0
+      }
+    },
+    "fractional_reference": {
+      "all": {
+        "exact": 41,
+        "events": 41,
+        "l1": 0.0
+      },
+      "perpendicular": {
+        "exact": 35,
+        "events": 35,
+        "l1": 0.0
+      },
+      "parallel": {
+        "exact": 6,
+        "events": 6,
+        "l1": 0.0
+      }
+    },
+    "rounded_gt_signs": null,
+    "fractional_gt_signs": null,
+    "rounded_internal_signs": {
+      "parallel": {
+        "events": 6,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 40,
+        "violations": 0
+      }
+    },
+    "fractional_internal_signs": {
+      "parallel": {
+        "events": 6,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 40,
+        "violations": 0
+      }
+    },
+    "rounded_flow_seconds": 0.0027127161156386137,
+    "fractional_flow_seconds": 0.0026087940204888582,
+    "rounded_arcs": 46,
+    "fractional_arcs": 46,
+    "fractional_certificate": {
+      "primal": 0.0,
+      "dual": 0.0,
+      "gap": 0.0,
+      "conservation_max": 0.0,
+      "capacity_violation_max": 0.0,
+      "potential_rounding_max": 0.0,
+      "components": 1,
+      "seconds": 0.0026087940204888582,
+      "optimal": true,
+      "backend": "scipy.optimize.linprog/highs-ds capacitated circulation",
+      "iterations": 9
+    },
+    "baseline_solution_sha256": "b838735ea18071c8ffa8fa7a4ace4f2d51a18e22a78f2d46917cf9f20733065b",
+    "trial_solution_sha256": "8b8083595178a1f5a854f961837491f22d0283afc960af57724b48f7b6c72ba5"
+  },
+  "sign_sparse_control": {
+    "objectives": {
+      "rounded_baseline": 0.0,
+      "rounded_trial": 0.0,
+      "fractional_baseline": 0.0,
+      "fractional_trial": 0.0
+    },
+    "changed_nodes_after_component_mode_gauge": 0,
+    "changed_node_ids": [],
+    "max_node_change": 0,
+    "rounded_reference": {
+      "all": {
+        "exact": 41,
+        "events": 41,
+        "l1": 0.0
+      },
+      "perpendicular": {
+        "exact": 35,
+        "events": 35,
+        "l1": 0.0
+      },
+      "parallel": {
+        "exact": 6,
+        "events": 6,
+        "l1": 0.0
+      }
+    },
+    "fractional_reference": {
+      "all": {
+        "exact": 41,
+        "events": 41,
+        "l1": 0.0
+      },
+      "perpendicular": {
+        "exact": 35,
+        "events": 35,
+        "l1": 0.0
+      },
+      "parallel": {
+        "exact": 6,
+        "events": 6,
+        "l1": 0.0
+      }
+    },
+    "rounded_gt_signs": null,
+    "fractional_gt_signs": null,
+    "rounded_internal_signs": {
+      "parallel": {
+        "events": 6,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 40,
+        "violations": 0
+      }
+    },
+    "fractional_internal_signs": {
+      "parallel": {
+        "events": 6,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 40,
+        "violations": 0
+      }
+    },
+    "rounded_flow_seconds": 0.0026275641284883022,
+    "fractional_flow_seconds": 0.0026020249351859093,
+    "rounded_arcs": 46,
+    "fractional_arcs": 46,
+    "fractional_certificate": {
+      "primal": 0.0,
+      "dual": 0.0,
+      "gap": 0.0,
+      "conservation_max": 0.0,
+      "capacity_violation_max": 0.0,
+      "potential_rounding_max": 0.0,
+      "components": 1,
+      "seconds": 0.0026020249351859093,
+      "optimal": true,
+      "backend": "scipy.optimize.linprog/highs-ds capacitated circulation",
+      "iterations": 9
+    },
+    "baseline_solution_sha256": "b838735ea18071c8ffa8fa7a4ace4f2d51a18e22a78f2d46917cf9f20733065b",
+    "trial_solution_sha256": "8b8083595178a1f5a854f961837491f22d0283afc960af57724b48f7b6c72ba5"
+  },
+  "free": {
+    "objectives": {
+      "rounded_baseline": 886.0,
+      "rounded_trial": 909.0,
+      "fractional_baseline": 3270.8446505917236,
+      "fractional_trial": 3232.192058558576
+    },
+    "changed_nodes_after_component_mode_gauge": 94,
+    "changed_node_ids": [
+      86985,
+      87273,
+      87274,
+      87377,
+      87757,
+      88516,
+      88531,
+      88547,
+      89365,
+      89373,
+      89374,
+      89787,
+      90203,
+      90518,
+      90535,
+      90565,
+      90606,
+      90623,
+      90638,
+      90716,
+      90731,
+      91038,
+      91053,
+      91082,
+      91212,
+      91957,
+      92361,
+      92396,
+      92564,
+      92818,
+      116042,
+      117585,
+      117902,
+      118186,
+      243930,
+      244354,
+      244375,
+      244649,
+      245159,
+      245196,
+      245199,
+      245526,
+      245538,
+      245984,
+      246692,
+      247136,
+      269828,
+      269843,
+      270204,
+      270230,
+      270263,
+      270659,
+      270707,
+      270751,
+      271026,
+      271034,
+      271093,
+      271400,
+      271668,
+      271710,
+      271802,
+      271829,
+      273820,
+      274193,
+      274396,
+      274497,
+      274549,
+      283594,
+      292590,
+      292604,
+      293806,
+      294128,
+      294510,
+      420073,
+      420811,
+      420812,
+      421094,
+      423521,
+      423963,
+      425404,
+      448538,
+      448768,
+      448782,
+      449126,
+      449240,
+      449484,
+      450761,
+      451454,
+      451718,
+      451794,
+      452125,
+      452644,
+      452714,
+      453007
+    ],
+    "max_node_change": 3,
+    "rounded_reference": {
+      "all": {
+        "exact": 4670,
+        "events": 4918,
+        "l1": 0.0508336722244815
+      },
+      "perpendicular": {
+        "exact": 491,
+        "events": 575,
+        "l1": 0.14782608695652175
+      },
+      "parallel": {
+        "exact": 4179,
+        "events": 4343,
+        "l1": 0.03799217131015427
+      }
+    },
+    "fractional_reference": {
+      "all": {
+        "exact": 4714,
+        "events": 4918,
+        "l1": 0.04168361122407483
+      },
+      "perpendicular": {
+        "exact": 494,
+        "events": 575,
+        "l1": 0.1426086956521739
+      },
+      "parallel": {
+        "exact": 4220,
+        "events": 4343,
+        "l1": 0.028321436794842274
+      }
+    },
+    "rounded_gt_signs": {
+      "parallel": {
+        "events": 4343,
+        "violations": 9
+      },
+      "perpendicular": {
+        "events": 575,
+        "violations": 4
+      }
+    },
+    "fractional_gt_signs": {
+      "parallel": {
+        "events": 4343,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 575,
+        "violations": 4
+      }
+    },
+    "rounded_internal_signs": {
+      "parallel": {
+        "events": 10772,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 4283,
+        "violations": 22
+      }
+    },
+    "fractional_internal_signs": {
+      "parallel": {
+        "events": 10772,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 4283,
+        "violations": 3
+      }
+    },
+    "rounded_flow_seconds": 0.13001960492692888,
+    "fractional_flow_seconds": 0.1931837508454919,
+    "rounded_arcs": 15869,
+    "fractional_arcs": 30179,
+    "fractional_certificate": {
+      "primal": 3232.192058558576,
+      "dual": 3232.192058558576,
+      "gap": 0.0,
+      "conservation_max": 0.0,
+      "capacity_violation_max": 0.0,
+      "potential_rounding_max": 0.0,
+      "components": 5,
+      "seconds": 0.1931837508454919,
+      "optimal": true,
+      "backend": "scipy.optimize.linprog/highs-ds capacitated circulation",
+      "iterations": 4273
+    },
+    "baseline_solution_sha256": "f124c6d0919b105b31546dea3dd05c3a729554af4228baed5a8778d2ba606a24",
+    "trial_solution_sha256": "b8374087f64e9d8a8f168a63fdfa7945a57924d81103abde131436982b0a1063"
+  },
+  "joint": {
+    "objectives": {
+      "rounded_baseline": 1099.0,
+      "rounded_trial": 1127.5,
+      "fractional_baseline": 4149.353655269173,
+      "fractional_trial": 4108.967315392596
+    },
+    "changed_nodes_after_component_mode_gauge": 92,
+    "changed_node_ids": [
+      87273,
+      87274,
+      88516,
+      88531,
+      88547,
+      89373,
+      89374,
+      89787,
+      90518,
+      90535,
+      90565,
+      90606,
+      90623,
+      90638,
+      90716,
+      90731,
+      91038,
+      91053,
+      91082,
+      91131,
+      91212,
+      91957,
+      92361,
+      92396,
+      92484,
+      92564,
+      92818,
+      116414,
+      117585,
+      117902,
+      118186,
+      243930,
+      244354,
+      244375,
+      244649,
+      245159,
+      245196,
+      245199,
+      245526,
+      245538,
+      245984,
+      246692,
+      247136,
+      269828,
+      269843,
+      270204,
+      270230,
+      270263,
+      270659,
+      270707,
+      270751,
+      271026,
+      271034,
+      271093,
+      271400,
+      271668,
+      271710,
+      271802,
+      271829,
+      273820,
+      274193,
+      274396,
+      274497,
+      274549,
+      283594,
+      292590,
+      292604,
+      293806,
+      294128,
+      294510,
+      420073,
+      420811,
+      420812,
+      421094,
+      423521,
+      424266,
+      425404,
+      448538,
+      448562,
+      448768,
+      448782,
+      449126,
+      449240,
+      449484,
+      450761,
+      451355,
+      451454,
+      451718,
+      451794,
+      452125,
+      452644,
+      453007
+    ],
+    "max_node_change": 3,
+    "rounded_reference": {
+      "all": {
+        "exact": 4754,
+        "events": 4918,
+        "l1": 0.03355022366815779
+      },
+      "perpendicular": {
+        "exact": 495,
+        "events": 575,
+        "l1": 0.1408695652173913
+      },
+      "parallel": {
+        "exact": 4259,
+        "events": 4343,
+        "l1": 0.019341469030623993
+      }
+    },
+    "fractional_reference": {
+      "all": {
+        "exact": 4753,
+        "events": 4918,
+        "l1": 0.03355022366815779
+      },
+      "perpendicular": {
+        "exact": 497,
+        "events": 575,
+        "l1": 0.1356521739130435
+      },
+      "parallel": {
+        "exact": 4256,
+        "events": 4343,
+        "l1": 0.020032235781717707
+      }
+    },
+    "rounded_gt_signs": {
+      "parallel": {
+        "events": 4343,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 575,
+        "violations": 3
+      }
+    },
+    "fractional_gt_signs": {
+      "parallel": {
+        "events": 4343,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 575,
+        "violations": 3
+      }
+    },
+    "rounded_internal_signs": {
+      "parallel": {
+        "events": 15428,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 4924,
+        "violations": 24
+      }
+    },
+    "fractional_internal_signs": {
+      "parallel": {
+        "events": 15428,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 4924,
+        "violations": 6
+      }
+    },
+    "rounded_flow_seconds": 0.15855977521277964,
+    "fractional_flow_seconds": 0.22375364019535482,
+    "rounded_arcs": 21166,
+    "fractional_arcs": 40682,
+    "fractional_certificate": {
+      "primal": 4108.967315392596,
+      "dual": 4108.967315392599,
+      "gap": -2.7284841053187847e-12,
+      "conservation_max": 7.297495940861154e-13,
+      "capacity_violation_max": 0.0,
+      "potential_rounding_max": 0.0,
+      "components": 2,
+      "seconds": 0.22375364019535482,
+      "optimal": true,
+      "backend": "scipy.optimize.linprog/highs-ds capacitated circulation",
+      "iterations": 4059
+    },
+    "baseline_solution_sha256": "a3e61c6bf40c43573f42a2dfb9765fb2eca2592449d524b0970c2cec7732ec7a",
+    "trial_solution_sha256": "49eb940f5e49a53b51d60b4320353317623d279d5ebdd0a85b8b0a5fd14d9977"
+  }
+}

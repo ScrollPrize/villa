@@ -1,21 +1,8 @@
 # Task plan
-1. Reload and hash-check saved seven-case inputs/solutions; independently reconstruct physical endpoint winding differences and H/V ordering bounds.
-2. Export internal violations with source IDs, event IDs, raw distances, signed winding, ordering margin, residual and seam transport. Separate reversed order from missing V-to-H next-winding steps. Aggregate concentration and overlap between large cases.
-3. Recheck frozen GT reference violation counts, gauges and coverage. Assess the 20 excluded unsigned terms against the fitted solution without adding them to the objective. Distinguish contradictory measured targets from sign violations.
-4. Check whether all signs can be satisfied simultaneously using difference constraints; if feasible, measure the minimum L1 cost under those bounds without replacing saved results.
-5. Write an audit artifact and concise findings. Do not equate different historical SGD metrics.
+Promote fractional targets in benchmark and graph defaults, canonical seven-case config and default GT audit paths. Preserve rounded mode explicitly and historical result artifacts. Update documentation to identify the new baseline. Run regression tests, inspect artifact sizes and diff, commit the reviewed files. Report recorded large-case solver and total processing times without claiming a repeated timing benchmark.
 
 ## spec update
-No change to the solver contract. Audit only; original solutions and input files unchanged.
+Fractional becomes default; rounded remains selectable. No mathematical or evidence policy changes.
 
 ## docs updates
-Add sign audit report and detailed CSVs; update status and task log.
-
-## Testing
-Check reconstructed counts against saved metrics, reversed-edge invariance, primal objective and constrained-solve feasibility. Report any disagreement explicitly.
-
-## Changelog update
-Record the sign audit and its quantitative findings.
-
-## User clarification
-User means signs versus GT. Prioritize a dedicated GT-event CSV/JSON audit using the existing reference scorer, verify summary equality, classify severity, identify ordinary and GT fibers, and report global versus component gauge effects. Internal constrained alternatives are auxiliary findings, not the requested result and are not promoted.
+Update README, fractional report, status, task log and changelog with promotion and validation.

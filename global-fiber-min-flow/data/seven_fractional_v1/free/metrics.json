@@ -1,0 +1,128 @@
+{
+  "target_mode": "fractional",
+  "flow_arcs": 30179,
+  "nodes": 2053,
+  "events": 15889,
+  "used_events": 15869,
+  "cached_interpolated_angle_seam_disagreements": {
+    "a": 2,
+    "b": 9
+  },
+  "unsigned_events": 834,
+  "unsigned_unique_target_retained": 814,
+  "excluded_ambiguous_events": 20,
+  "signs": {
+    "parallel": {
+      "events": 10772,
+      "violations": 0
+    },
+    "perpendicular": {
+      "events": 4283,
+      "violations": 3
+    }
+  },
+  "seam": {
+    "fiber_endpoint_crossings": 1422,
+    "connectors_crossing": 54
+  },
+  "certificate": {
+    "primal": 3232.192058558576,
+    "dual": 3232.192058558576,
+    "gap": 0.0,
+    "conservation_max": 0.0,
+    "capacity_violation_max": 0.0,
+    "potential_rounding_max": 0.0,
+    "components": 5,
+    "seconds": 0.1931837508454919,
+    "optimal": true,
+    "backend": "scipy.optimize.linprog/highs-ds capacitated circulation",
+    "iterations": 4273
+  },
+  "sign_only": false,
+  "reference": {
+    "all": {
+      "events": 4918,
+      "l1": 0.04168361122407483,
+      "correct_percent": 95.85197234648231,
+      "max_error": 2
+    },
+    "perpendicular": {
+      "events": 575,
+      "l1": 0.1426086956521739,
+      "correct_percent": 85.91304347826086,
+      "max_error": 2
+    },
+    "parallel": {
+      "events": 4343,
+      "l1": 0.028321436794842274,
+      "correct_percent": 97.16785632051578,
+      "max_error": 1
+    },
+    "available_events": 5251,
+    "scored_events": 4918,
+    "unscored_events": 333,
+    "component_gauges": {
+      "0": {
+        "offset": 6,
+        "events": 4848
+      },
+      "1": {
+        "offset": 0,
+        "events": 1
+      },
+      "2": {
+        "offset": 4,
+        "events": 6
+      },
+      "3": {
+        "offset": 1,
+        "events": 63
+      }
+    },
+    "gauge_policy": "per-component integer median; GT used only for evaluation",
+    "reference": "frozen gt_winding_reference.json; source 7 excluded",
+    "single_global_gauge": {
+      "offset": 6,
+      "metrics": {
+        "all": {
+          "events": 4918,
+          "l1": 0.10898739324928833,
+          "correct_percent": 94.44896299308661,
+          "max_error": 6
+        },
+        "perpendicular": {
+          "events": 575,
+          "l1": 0.17391304347826086,
+          "correct_percent": 85.21739130434783,
+          "max_error": 6
+        },
+        "parallel": {
+          "events": 4343,
+          "l1": 0.10039143449228644,
+          "correct_percent": 95.6711950264794,
+          "max_error": 5
+        }
+      }
+    },
+    "signs": {
+      "parallel": {
+        "events": 4343,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 575,
+        "violations": 4
+      }
+    }
+  },
+  "retained_fiber_percent": 100.0,
+  "geometry_width_metrics": "not applicable: no optimized geometry or widths",
+  "source_measurement_audit": {
+    "tensor_hash_matches_original_sgd_solve": true,
+    "tensor_sha256": "4f03b705a79be3f8ff17965f1baf78845f91cdc9ac5b8a34c8f27e1070730d55",
+    "source_afc_recomputation": "unavailable: original database path no longer exists",
+    "missing_database": "/home/hendrik/villa2/global-fiber-sgd/data/oriented_normals_v1/full.afc.sqlite",
+    "rows_verified": 0
+  },
+  "seconds_total": 7.616638092091307
+}
