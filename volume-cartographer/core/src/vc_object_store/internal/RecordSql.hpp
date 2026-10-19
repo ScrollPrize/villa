@@ -4,6 +4,9 @@
 
 namespace vc::objects::detail {
 extern const char* kObjectCols;
+// Shared selection semantics for records and compact graph topology.
+std::unique_ptr<Statement> objectSelectionQuery(sqlite3* db, const ObjectSelection& selection,
+                                               const std::string& columns);
 
 using ObjectFields = std::optional<std::set<std::string>>;
 bool wants(const ObjectFields& fields, const std::string& name);

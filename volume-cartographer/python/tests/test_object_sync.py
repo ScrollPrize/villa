@@ -386,7 +386,7 @@ def test_version_two_baseline_migration_and_read_only_open(pair):
         assert a.synchronize(b)["applied"]
         assert state(a) == state(b)
         with sqlite3.connect(a.path) as sql:
-            assert sql.execute("PRAGMA user_version").fetchone()[0] == 6
+            assert sql.execute("PRAGMA user_version").fetchone()[0] == 7
             assert sql.execute("SELECT count(*) FROM sync_baseline_records").fetchone()[0] == 1
         a.set_approval(uid, "approved")
         assert a.synchronize(b)["applied"]
@@ -397,6 +397,7 @@ def test_incremental_matches_full_snapshot_merge(pair, tmp_path):
     """Use the legacy full-snapshot path as an independent merge oracle."""
     import random
     import uuid
+    from scripts.object_store_sqlite import sqlite_backup, sqlite_rows
     a, b = pair
     ids = [a.upsert_object(dict(kind="note")) for _ in range(20)]
     a.synchronize(b)
@@ -411,10 +412,11 @@ def test_incremental_matches_full_snapshot_merge(pair, tmp_path):
                     record["geometry_bindings"].pop("stale", None)
                 baseline[record["uuid"]] = record
         for source, destination in zip((a, b), paths):
-            with sqlite3.connect(source.path) as src, sqlite3.connect(destination) as dst:
-                src.backup(dst)
-                dst.execute("UPDATE sync_baselines SET state=? WHERE seq=(SELECT max(seq) FROM sync_baselines)",
-                            (json.dumps(baseline),))
+            # Python and the native store may use different SQLite builds.
+            # In-process connections can invalidate each other's POSIX locks.
+            sqlite_backup(source.path, destination)
+            sqlite_rows(destination, "UPDATE sync_baselines SET state=? WHERE seq=(SELECT max(seq) FROM sync_baselines)",
+                        (json.dumps(baseline),))
         with ObjectStore.open(str(paths[0]), author="alice") as oa, ObjectStore.open(str(paths[1]), author="bob") as ob:
             left, right = rng.sample(ids, 2)
             for store in (a, oa):

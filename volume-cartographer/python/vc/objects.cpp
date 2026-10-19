@@ -1,4 +1,5 @@
 #include "StorageBindings.hpp"
+#include "ObjectReadBindings.hpp"
 #include <nanobind/stl/map.h>
 #include "vc/core/objects/ObjectStore.hpp"
 #include "vc/core/object_links/ObjectLinks.hpp"
@@ -108,6 +109,8 @@ NB_MODULE(objects, m)
 
     m.doc() = "Object database with immutable geometry and relationship metadata. Records are dicts; "
               "'kind' is metadata in the dict, never part of a method name.";
+
+    bindGraphReadView(m);
 
     nb::class_<PyObjectStore>(m, "ObjectStore")
         .def_static("create", &PyObjectStore::create, nb::arg("path"), nb::arg("author"),
@@ -244,7 +247,21 @@ NB_MODULE(objects, m)
                     return 0;
                 });
             },
-            nb::arg("uuid"), nb::arg("key"), nb::arg("value"), "Set one open-ended metadata key (any JSON value).")
+            nb::arg("uuid"), nb::arg("key"), nb::arg("value").none(), "Set one open-ended metadata key (any JSON value).")
+        .def("set_meta_many", [](PyObjectStore& self, const nb::list& updates) {
+            struct Update { std::string uuid, key, value; };
+            std::vector<Update> batch;
+            for (nb::handle item : updates) {
+                auto row = nb::cast<nb::sequence>(item);
+                if (nb::len(row) != 3) throw std::invalid_argument("metadata updates must be (uuid,key,value) triples");
+                batch.push_back({nb::cast<std::string>(row[0]), nb::cast<std::string>(row[1]), jsonDumps(row[2])});
+            }
+            auto lease = self.db; self.require(); nb::gil_scoped_release release;
+            self.withWrite([&](auto& db, auto& txn) {
+                for (const auto& update : batch) db.setMeta(txn, update.uuid, update.key, update.value);
+                return 0;
+            });
+        }, nb::arg("updates"), "Apply metadata triples atomically in one durable transaction.")
         .def(
             "remove_meta",
             [](PyObjectStore& self, const std::string& uuid, const std::string& key) {
@@ -310,6 +327,15 @@ NB_MODULE(objects, m)
               bytes = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.readGeometryArray(txn, uuid, name, offset, count); }); }
             return nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size());
         }, nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("byte_offset") = 0, nb::arg("byte_count") = std::nullopt)
+        .def("read_geometry_arrays", [](PyObjectStore& self, const std::vector<std::string>& revisions,
+                                       const std::string& name) {
+            std::shared_ptr<vo::PackedGeometryArray> packed;
+            { auto lease = self.db; self.require(); nb::gil_scoped_release release;
+              packed = std::make_shared<vo::PackedGeometryArray>(self.withRead([&](auto& db, auto& txn) {
+                  return db.readGeometryArrays(txn, revisions, name); })); }
+            return PyPackedGeometryArray{std::move(packed)};
+        }, nb::arg("revision_uuids"), nb::arg("array_name"),
+           "Read homogeneous arrays into one verified packed buffer with row offsets.")
         .def("read_geometry_rectangle", [](PyObjectStore& self, const std::string& uuid, const std::string& name,
                                            int64_t row, int64_t column, int64_t rows, int64_t columns) {
             std::vector<uint8_t> bytes;
@@ -375,12 +401,51 @@ NB_MODULE(objects, m)
              }, nb::arg("uuid"), nb::arg("dataset_root") = std::nullopt,
              "Find a patch/fiber by source UUID, verifying the saved path before searching the dataset root.")
         .def("checkpoint", [](PyObjectStore& self) { self.require().checkpoint(); })
+        .def("select_edges", [](PyObjectStore& self, const std::optional<std::string>& kind,
+            const std::vector<std::string>& states, const std::optional<std::vector<std::string>>& endpoints,
+            bool both, const std::optional<std::string>& tag, const std::optional<int64_t>& limit,
+            const std::optional<std::string>& after, const std::optional<std::vector<std::string>>& fields) {
+            vo::EdgeSelection selection; selection.kind = kind; selection.approvalStates = states;
+            selection.endpointUuids = endpoints; selection.bothEndpoints = both;
+            selection.tag = tag; selection.limit = limit; selection.afterUuid = after;
+            std::vector<vo::EdgeRecord> records;
+            { auto lease = self.db; self.require(); nb::gil_scoped_release release;
+              records = self.withRead([&](auto& db, auto& txn) { return db.selectEdges(txn, selection, fields); }); }
+            const std::set<std::string> projection = fields ? std::set<std::string>(fields->begin(), fields->end()) : std::set<std::string>{};
+            nb::list out; for (const auto& record : records) out.append(edgeToPy(record, fields ? &projection : nullptr));
+            return out;
+        }, nb::arg("edge_kind") = std::nullopt, nb::arg("approval_states") = std::vector<std::string>{},
+           nb::arg("endpoint_uuids") = std::nullopt, nb::arg("both_endpoints") = false,
+           nb::arg("tag") = std::nullopt, nb::arg("limit") = std::nullopt,
+           nb::arg("after_uuid") = std::nullopt, nb::arg("fields") = std::nullopt)
+        .def("graph_read", [](PyObjectStore& self, const std::optional<std::string>& kind,
+            const std::vector<std::string>& ids, const std::optional<std::string>& edgeKind,
+            const std::vector<std::string>& states, const std::optional<std::array<double, 6>>& bbox,
+            const std::optional<std::string>& tag) {
+            self.require();
+            auto view = std::make_unique<PyGraphReadView>(); view->store = self.db;
+            vo::ObjectSelection objects; objects.kind = kind; objects.uuids = ids; objects.bbox = bbox;
+            vo::EdgeSelection edges; edges.kind = edgeKind; edges.approvalStates = states; edges.tag = tag;
+            { nb::gil_scoped_release release;
+              view->txn = std::make_unique<vo::ReadTxn>(view->store->read());
+              view->graph = std::make_shared<vo::GraphReadView>(view->store->graphReadView(*view->txn, objects, edges)); }
+            return view.release();
+        }, nb::rv_policy::take_ownership, nb::arg("object_kind") = std::nullopt,
+           nb::arg("object_uuids") = std::vector<std::string>{}, nb::arg("edge_kind") = std::nullopt,
+           nb::arg("approval_states") = std::vector<std::string>{"approved"},
+           nb::arg("bbox") = std::nullopt, nb::arg("edge_tag") = std::nullopt,
+           "Pin a store graph read view; use as a context manager and close before checkpointing.")
         .def("select_objects", [](PyObjectStore& self, const std::optional<std::string>& kind,
             const std::optional<std::string>& tag, const std::vector<std::string>& ids,
             const std::optional<std::string>& connected, const std::vector<std::string>& edgeKinds,
             const std::optional<int64_t>& limit, int64_t offset,
-            const std::optional<std::array<double, 6>>& bbox, const std::optional<std::vector<std::string>>& fields) {
+            const std::optional<std::array<double, 6>>& bbox, const std::optional<std::vector<std::string>>& fields,
+            const std::optional<std::string>& family, const std::optional<double>& minLength,
+            const std::string& orderBy, const std::optional<std::string>& afterUuid,
+            const std::optional<double>& afterLength) {
             vo::ObjectSelection selection{kind, tag, connected, ids, edgeKinds, limit, offset, bbox};
+            selection.family = family; selection.minLength = minLength; selection.orderBy = orderBy;
+            selection.afterUuid = afterUuid; selection.afterLength = afterLength;
             std::vector<vo::ObjectRecord> records;
             { auto lease = self.db; self.require(); nb::gil_scoped_release release;
               records = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.selectObjects(txn, selection, fields); }); }
@@ -391,12 +456,16 @@ NB_MODULE(objects, m)
         }, nb::arg("object_kind") = std::nullopt, nb::arg("tag") = std::nullopt,
            nb::arg("object_uuids") = std::vector<std::string>{}, nb::arg("connected_to") = std::nullopt,
            nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("limit") = std::nullopt, nb::arg("offset") = 0,
-           nb::arg("bbox") = std::nullopt, nb::arg("fields") = std::nullopt)
+           nb::arg("bbox") = std::nullopt, nb::arg("fields") = std::nullopt,
+           nb::arg("family") = std::nullopt, nb::arg("min_length") = std::nullopt,
+           nb::arg("order_by") = "uuid", nb::arg("after_uuid") = std::nullopt, nb::arg("after_length") = std::nullopt)
         .def("spatial_regions", [](PyObjectStore& self, const std::array<double, 6>& bbox,
             const std::optional<std::string>& kind, const std::optional<std::string>& tag,
             const std::vector<std::string>& ids, const std::optional<std::string>& connected,
-            const std::vector<std::string>& edgeKinds, const std::optional<int64_t>& limit, int64_t offset) {
+            const std::vector<std::string>& edgeKinds, const std::optional<int64_t>& limit, int64_t offset,
+            const std::optional<std::string>& family, const std::optional<double>& minLength) {
             vo::ObjectSelection selection{kind, tag, connected, ids, edgeKinds, limit, offset, bbox};
+            selection.family = family; selection.minLength = minLength;
             std::vector<vo::SpatialRegion> regions;
             { auto lease = self.db; self.require(); nb::gil_scoped_release release;
               regions = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.spatialRegions(txn, selection); }); }
@@ -411,6 +480,7 @@ NB_MODULE(objects, m)
         }, nb::arg("bbox"), nb::arg("object_kind") = std::nullopt, nb::arg("tag") = std::nullopt,
            nb::arg("object_uuids") = std::vector<std::string>{}, nb::arg("connected_to") = std::nullopt,
            nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("limit") = std::nullopt, nb::arg("offset") = 0,
+           nb::arg("family") = std::nullopt, nb::arg("min_length") = std::nullopt,
            "Return revision-bound surface tiles, polyline/point blocks, or external object boxes. Bounds are conservative candidates.")
         .def("export_json", [](PyObjectStore& self, const std::optional<std::string>& kind,
             const std::optional<std::string>& tag, const std::vector<std::string>& ids,
@@ -641,7 +711,7 @@ NB_MODULE(objects, m)
         .def("set_meta",
              [](PyObjectWriteTxn& self, const std::string& uuid, const std::string& key, const nb::object& value) {
                  self.owner->require().setMeta(self.require(), uuid, key, jsonDumps(value));
-             })
+             }, nb::arg("uuid"), nb::arg("key"), nb::arg("value").none())
         .def("set_approval", [](PyObjectWriteTxn& self, const std::string& uuid, const std::string& state) {
             self.owner->require().setApproval(self.require(), uuid, state);
         });

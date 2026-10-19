@@ -10,7 +10,7 @@ ObjectStore& ObjectStore::operator=(ObjectStore&&) noexcept = default;
 std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::path& path, const OpenOptions& options, bool create)
 {
     const int kApplicationId = 0x56434f42;
-    const int kSchemaVersion = 6;
+    const int kSchemaVersion = 7;
     if (create && options.readOnly) throw std::invalid_argument("create requires writable options");
     if (sqlite3_threadsafe() == 0)
         throw std::runtime_error("object store: SQLite build is not thread-safe");
@@ -72,6 +72,10 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
                     // payloads are immutable and need no eager conversion.
                     if (pragmaInt(impl->writer, "user_version") == 5)
                         exec(impl->writer, "PRAGMA user_version=6;");
+                    if (pragmaInt(impl->writer, "user_version") == 6) {
+                        exec(impl->writer, kConsumerQueryIndexes);
+                        exec(impl->writer, "PRAGMA user_version=7;");
+                    }
                     exec(impl->writer, "COMMIT;");
                 } catch (...) { exec(impl->writer, "ROLLBACK;"); throw; }
             }

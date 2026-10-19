@@ -1,0 +1,57 @@
+...........................................................F............ [ 96%]
+...                                                                      [100%]
+=================================== FAILURES ===================================
+_________________ test_incremental_matches_full_snapshot_merge _________________
+
+pair = (<vc.objects.ObjectStore object at 0xec743427dda0>, <vc.objects.ObjectStore object at 0xec74342aea60>)
+tmp_path = PosixPath('/tmp/pytest-of-sean/pytest-458/test_incremental_matches_full_0')
+
+    def test_incremental_matches_full_snapshot_merge(pair, tmp_path):
+        """Use the legacy full-snapshot path as an independent merge oracle."""
+        import random
+        import uuid
+        a, b = pair
+        ids = [a.upsert_object(dict(kind="note")) for _ in range(20)]
+        a.synchronize(b)
+        rng = random.Random(17)
+        for step in range(12):
+            paths = [tmp_path / f"oracle-{step}-{side}.vcobj" for side in (0, 1)]
+            baseline = {}
+            for kind, records in state(a).items():
+                for record in records:
+                    record["record_type"] = kind
+                    if "geometry_bindings" in record:
+                        record["geometry_bindings"].pop("stale", None)
+                    baseline[record["uuid"]] = record
+            for source, destination in zip((a, b), paths):
+                with sqlite3.connect(source.path) as src, sqlite3.connect(destination) as dst:
+                    src.backup(dst)
+                    dst.execute("UPDATE sync_baselines SET state=? WHERE seq=(SELECT max(seq) FROM sync_baselines)",
+                                (json.dumps(baseline),))
+            with ObjectStore.open(str(paths[0]), author="alice") as oa, ObjectStore.open(str(paths[1]), author="bob") as ob:
+                left, right = rng.sample(ids, 2)
+                for store in (a, oa):
+                    store.set_meta(left, "step", step)
+                for store in (b, ob):
+                    store.set_approval(right, "approved" if step % 2 else "rejected")
+                if step % 3 == 0:
+                    edge = dict(uuid=str(uuid.uuid4()), kind="test", a=left, b=right)
+                    for store in (a, oa):
+                        store.add_edge(edge)
+                elif step % 3 == 1:
+                    edges = a.edges_by_kind("test")
+                    if edges:
+                        for store in (b, ob):
+                            store.remove_edge(edges[0]["uuid"])
+                if step % 4 == 0:
+                    # Force an explicit conflict and compare its chosen outcome too.
+                    for store in (b, ob):
+                        store.set_meta(left, "step", -1)
+>               ir, fr = a.synchronize(b, dry_run=True), oa.synchronize(ob, dry_run=True)
+                                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E               RuntimeError: sync: inconsistent shared baseline
+
+python/tests/test_object_sync.py:437: RuntimeError
+=========================== short test summary info ============================
+FAILED python/tests/test_object_sync.py::test_incremental_matches_full_snapshot_merge
+1 failed, 74 passed in 5.73s

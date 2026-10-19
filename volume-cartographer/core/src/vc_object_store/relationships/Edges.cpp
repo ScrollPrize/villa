@@ -86,4 +86,65 @@ std::vector<EdgeRecord> ObjectStore::edgesByKind(const Txn& txn, const std::stri
     return readEdgeRows(db, s);
 }
 
+std::unique_ptr<Statement> detail::edgeSelectionQuery(sqlite3* db, const EdgeSelection& selection,
+    const std::string& columns, const std::optional<std::vector<int64_t>>& endpointIds)
+{
+    if (selection.limit && *selection.limit < 0) throw std::invalid_argument("edge limit must be nonnegative");
+    const bool candidates = endpointIds || selection.endpointUuids || selection.uuids || selection.tag;
+    std::string sql = "SELECT " + columns + " FROM edges" +
+        (candidates ? " NOT INDEXED" : "") + " WHERE 1";
+    std::vector<std::string> parameters;
+    auto parameter = [&](const std::string& value) {
+        parameters.push_back(value);
+        return "?" + std::to_string(parameters.size());
+    };
+    if (selection.kind) sql += " AND kind=" + parameter(*selection.kind);
+    for (const auto& state : selection.approvalStates)
+        if (state != "pending" && state != "approved" && state != "rejected")
+            throw std::invalid_argument("invalid edge approval state: " + state);
+    if (selection.approvalStates.size() == 1)
+        sql += " AND approval_state=" + parameter(selection.approvalStates.front());
+    else if (!selection.approvalStates.empty())
+        sql += " AND approval_state IN (SELECT value FROM json_each(" + parameter(nlohmann::json(selection.approvalStates).dump()) + "))";
+    if (selection.tag)
+        sql += " AND id IN (SELECT edge_id FROM edge_tags WHERE tag=" + parameter(*selection.tag) + ")";
+    if (endpointIds || selection.endpointUuids) {
+        nlohmann::json ids = endpointIds ? nlohmann::json(*endpointIds) : nlohmann::json::array();
+        if (!endpointIds) for (const auto& uuid : *selection.endpointUuids)
+            if (auto id = objectIdByUuid(db, parseUuid(uuid))) ids.push_back(*id);
+        const auto members = " IN (SELECT value FROM json_each(" + parameter(ids.dump()) + "))";
+        const std::string kind = selection.kind ? " AND kind=?1" : "";
+        // Materialize endpoint-index candidates, then probe by primary key.
+        // Otherwise SQLite may scan an entire kind's UUID index to avoid sorting.
+        sql += " AND id IN (SELECT id FROM edges INDEXED BY edges_a WHERE a_id" + members + kind;
+        if (selection.bothEndpoints) sql += " AND b_id" + members;
+        else sql += " UNION SELECT id FROM edges INDEXED BY edges_b WHERE b_id" + members + kind;
+        sql += ")";
+    }
+    if (selection.uuids) {
+        nlohmann::json ids = nlohmann::json::array();
+        for (const auto& uuid : *selection.uuids)
+            if (auto id = edgeIdByUuid(db, parseUuid(uuid))) ids.push_back(*id);
+        sql += " AND id IN (SELECT value FROM json_each(" + parameter(ids.dump()) + "))";
+    }
+    const auto cursorParameter = parameters.size() + 1;
+    if (selection.afterUuid) sql += " AND uuid>?" + std::to_string(cursorParameter);
+    sql += " ORDER BY uuid LIMIT ?" + std::to_string(cursorParameter + (selection.afterUuid ? 1 : 0));
+    auto rows = std::make_unique<Statement>(db, sql);
+    int next = 1;
+    for (const auto& value : parameters) rows->bind(next++, value);
+    if (selection.afterUuid) rows->bindBlob(next++, parseUuid(*selection.afterUuid));
+    rows->bind(next, selection.limit.value_or(-1));
+    return rows;
+}
+
+std::vector<EdgeRecord> ObjectStore::selectEdges(const Txn& txn, const EdgeSelection& selection,
+    const std::optional<std::vector<std::string>>& projection) const
+{
+    auto* db = static_cast<sqlite3*>(connection(txn));
+    const ObjectFields fields = projection ? ObjectFields(std::in_place, projection->begin(), projection->end()) : std::nullopt;
+    auto rows = edgeSelectionQuery(db, selection, projectedEdgeColumns(fields));
+    return readEdgeRows(db, *rows, fields);
+}
+
 } // namespace vc::objects

@@ -7,6 +7,28 @@ const char* kEdgeCols =
     "a_anchor_x,a_anchor_y,a_anchor_z,a_dir_x,a_dir_y,a_dir_z,"
     "b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta,a_dependencies,b_dependencies";
 
+std::string projectedEdgeColumns(const ObjectFields& fields)
+{
+    if (!fields) return kEdgeCols;
+    std::string sql;
+    std::set<std::string> valid{"a", "b", "a_anchor", "b_anchor", "tags"};
+    std::istringstream input(kEdgeCols);
+    std::string name;
+    while (std::getline(input, name, ',')) {
+        std::string field = name;
+        if (name.starts_with("a_anchor_") || name.starts_with("a_dir_") || name == "a_dependencies") field = "a_anchor";
+        if (name.starts_with("b_anchor_") || name.starts_with("b_dir_") || name == "b_dependencies") field = "b_anchor";
+        const bool identity = name == "id" || name == "uuid" || name == "kind" || name == "a_id" || name == "b_id";
+        if (!identity || name == "uuid" || name == "kind") valid.insert(field);
+        if (!sql.empty()) sql += ',';
+        sql += identity || fields->contains(field) ? name :
+            (name == "meta" || name.ends_with("_dependencies") ? "'{}'" : "NULL");
+    }
+    for (const auto& field : *fields)
+        if (!valid.contains(field)) throw std::invalid_argument("unknown edge projection field: " + field);
+    return sql;
+}
+
 Anchor readAnchor(const Statement& s, int firstCol)
 {
     Anchor a;
@@ -33,18 +55,22 @@ std::string uuidTextByObjectId(sqlite3* db, int64_t id)
     return formatUuid(s.blob16(0));
 }
 
-EdgeRecord readEdgeRow(sqlite3* db, const Statement& s, bool details)
+EdgeRecord readEdgeRow(sqlite3* db, const Statement& s, bool details, const ObjectFields& fields)
 {
     EdgeRecord rec;
     const int64_t id = s.i64(0);
     const int64_t aId = s.i64(2);
     const int64_t bId = s.i64(3);
     readCommon(rec, s, 1, 4, 5);
-    rec.aAnchor = readAnchor(s, 17);
-    rec.bAnchor = readAnchor(s, 23);
+    if (wants(fields, "a_anchor")) {
+        rec.aAnchor = readAnchor(s, 17);
+        dependenciesFromJson(rec.aAnchor, nlohmann::json::parse(s.text(30)));
+    }
+    if (wants(fields, "b_anchor")) {
+        rec.bAnchor = readAnchor(s, 23);
+        dependenciesFromJson(rec.bAnchor, nlohmann::json::parse(s.text(31)));
+    }
     rec.meta = s.text(29);
-    dependenciesFromJson(rec.aAnchor, nlohmann::json::parse(s.text(30)));
-    dependenciesFromJson(rec.bAnchor, nlohmann::json::parse(s.text(31)));
     if (!details) return rec;
     rec.aUuid = uuidTextByObjectId(db, aId);
     rec.bUuid = uuidTextByObjectId(db, bId);
@@ -54,7 +80,7 @@ EdgeRecord readEdgeRow(sqlite3* db, const Statement& s, bool details)
     return rec;
 }
 
-std::vector<EdgeRecord> readEdgeRows(sqlite3* db, Statement& rows)
+std::vector<EdgeRecord> readEdgeRows(sqlite3* db, Statement& rows, const ObjectFields& fields)
 {
     std::vector<EdgeRecord> result;
     std::unordered_map<int64_t, size_t> positions;
@@ -62,7 +88,7 @@ std::vector<EdgeRecord> readEdgeRows(sqlite3* db, Statement& rows)
     while (rows.row()) {
         positions.emplace(rows.i64(0), result.size());
         ids.push_back(rows.i64(0));
-        result.push_back(readEdgeRow(db, rows, false));
+        result.push_back(readEdgeRow(db, rows, false, fields));
     }
     if (result.empty()) return result;
     const auto selection = ids.dump();
@@ -75,10 +101,12 @@ std::vector<EdgeRecord> readEdgeRows(sqlite3* db, Statement& rows)
         edge.aUuid = formatUuid(endpoints.blob16(1));
         edge.bUuid = formatUuid(endpoints.blob16(2));
     }
-    Statement tags(db, "SELECT edge_id,tag FROM edge_tags "
-        "WHERE edge_id IN (SELECT value FROM json_each(?)) ORDER BY edge_id,tag");
-    tags.bind(1, selection);
-    while (tags.row()) result.at(positions.at(tags.i64(0))).tags.push_back(tags.text(1));
+    if (wants(fields, "tags")) {
+        Statement tags(db, "SELECT edge_id,tag FROM edge_tags "
+            "WHERE edge_id IN (SELECT value FROM json_each(?)) ORDER BY edge_id,tag");
+        tags.bind(1, selection);
+        while (tags.row()) result.at(positions.at(tags.i64(0))).tags.push_back(tags.text(1));
+    }
     return result;
 }
 

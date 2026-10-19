@@ -12,14 +12,15 @@ in `vc_object_geometry`; link detectors live in `vc_object_links`. These higher
 layers depend on the object store. The database library itself does not depend
 on CT readers or Qt. Python exposes the database and its helpers in `vc.objects`.
 
-The database uses SQLite application ID `0x56434f42`, schema version 6.
-Writable opens migrate versions 2–5 transactionally. Versions 2–4 build spatial
+The database uses SQLite application ID `0x56434f42`, schema version 7.
+Writable opens migrate versions 2–6 transactionally. Versions 2–4 build spatial
 bounds from current geometry, reading the current payloads once; version 5 only
-advances the schema marker to permit tiled patch storage. Existing geometry
+advances the schema marker to permit tiled patch storage. Version 6 adds the
+edge approval/cursor and typed family/length query indexes. Existing geometry
 manifests, revision identities, and payloads are never rewritten by migration.
 Read-only opens can inspect older versions without migration. Whole-object
 spatial queries require version 4; fine spatial regions require version 5.
-Older binaries cannot open version 6. SQLite must include its R-tree module.
+Older binaries cannot open version 7. SQLite must include its R-tree module.
 Metadata JSON exports use `vc_object_metadata` version 2. Geometry ingestion and
 relationship discovery operate on the same store. VC3D/Spiral geometry readers
 are separate consumers.
@@ -243,7 +244,11 @@ For many point reads from the same array, use
 `read_geometry_ranges(revision_uuid, array_name, ranges)`, where each range is
 `(byte_offset, byte_count)`. The result is a list of byte strings in caller order.
 C++ exposes `readGeometryRanges` with an existing transaction. These calls share
-one verified manifest and a bounded 8 MiB LRU chunk cache. Geometry edit and repair
+one verified manifest and a bounded 8 MiB LRU chunk cache. Range batches plan
+copies by physical chunk, verify each touched chunk once and restore caller
+order, including overlapping, duplicated and unaligned ranges. Small explicit
+single-array ranges (up to 1 MiB) also reuse the validated read cache; full-array
+reads stream without retaining the full payload. Geometry edit and repair
 operations also reuse readers and stable-point-ID indexes across relationship
 checks. Write/internal readers remain scoped to their operation.
 
@@ -596,6 +601,138 @@ geometry references are always retained. An empty list exports all metadata.
 `import_json` accepts complete metadata-only records without managed geometry.
 Projected exports are for inspection; use synchronization to transfer objects
 with geometry and their revision bindings.
+
+## Consumer queries and store-backed graph reads
+
+`select_edges` filters kind, approval states, tag and endpoint sets before loading
+records. It returns UUID-ordered pages; `after_uuid` is an exclusive cursor that
+remains usable if the cursor edge is deleted. Projection always includes
+`uuid`, `kind`, `a`, and `b`; `fields=[]` requests only those identities.
+`endpoint_uuids=None` is unrestricted; `endpoint_uuids=[]` matches nothing.
+`both_endpoints=True` restricts both endpoints to the set, otherwise either may
+match. Empty `approval_states` includes every state. Parallel and self-links
+retain their individual identities and anchors.
+
+```python
+page = store.select_edges(
+    edge_kind="crossing", approval_states=["approved"], limit=100,
+    fields=["a_anchor", "b_anchor", "meta"],
+)
+next_page = store.select_edges(
+    edge_kind="crossing", approval_states=["approved"], limit=100,
+    fields=["a_anchor", "b_anchor", "meta"], after_uuid=page[-1]["uuid"],
+) if page else []
+```
+
+Typed catalog queries support `family`, `min_length` and `order_by="length_desc"`
+for `object_kind="fiber"` or `"track"`. Length uses the ingested summary in source
+units, not a new geometry measurement. Ties use ascending UUID order. The cursor
+is the last row's `(length, uuid)`; supply both `after_length` and `after_uuid`.
+Default UUID ordering also accepts `after_uuid`. Cursor and offset cannot be
+combined. `spatial_regions` accepts family/minimum-length filters before its
+region limit. Convert physical UI units to the source units before querying.
+
+```python
+page = store.select_objects(
+    object_kind="track", family="horizontal", min_length=100,
+    order_by="length_desc", limit=200, fields=["name", "track"],
+)
+```
+
+C++ equivalents are `selectEdges(txn, EdgeSelection, fields)` and the additional
+`ObjectSelection` fields. Python convenience queries each open a new snapshot;
+use one C++ transaction when an entire sequence of pages must be consistent.
+Connected selections still compute the complete component before applying the
+page limit. Component membership uses internal IDs and is reused within the same
+read transaction, with a bounded cache; it is never reused after a write or
+across separate snapshots.
+
+`graph_read` pins one read transaction and provides a compact in-memory view of
+that store's graph. There is no exported file, sidecar or second database.
+The Python default includes only approved edges; pass `approval_states=[]` to
+include every state. `object_kind`, `object_uuids` and `bbox` select nodes;
+`edge_kind` and `edge_tag` further restrict relationships. Both endpoints must
+be selected. Nodes include isolated objects. As with `select_objects`, an empty
+`object_uuids` list is unrestricted.
+
+```python
+with store.graph_read(object_kind="track", edge_kind="crossing",
+                      approval_states=["approved"]) as graph:
+    node_uuids = graph.object_uuids
+    revisions = graph.geometry_revisions
+    offsets = graph.offsets
+    partners = graph.partners
+    edge_indices = graph.edge_indices
+    neighbours_of_first = graph.neighbours(0) if node_uuids else None
+    # Optional projected records and geometry come from the same snapshot.
+    crossings = graph.edges(fields=["a_anchor", "b_anchor", "meta"])
+    summaries = graph.objects(fields=["track"])
+    # graph.read_geometry_ranges(node_index, "points", [(byte_offset, byte_count)])
+```
+
+`offsets`, `partners`, `edge_indices`, `endpoints`, and neighbor slices are
+read-only NumPy views of native uint64 arrays, not Python records. Edge rows
+correspond to `edge_uuids` and `graph.edges()`; node rows correspond to
+`object_uuids`, `geometry_revisions`, `generations`, and `graph.objects()`.
+Every edge has two CSR incidences, including self-links; parallel links are not
+deduplicated. `endpoints` has shape `[edge_count, 2]`. `journal_sequence` identifies
+the journal position observed by the view. UUID-keyed endpoint metadata and
+anchor dependencies preserve source identities; no coordinate conversion or
+application-specific crossing interpretation is applied automatically.
+
+Views are thread-confined and must close on their creating thread. They use a
+reader-pool slot and hold a WAL snapshot, so close them after preparing the fit's
+inputs, before checkpointing, or before opening more views than the reader pool
+can supply. Metadata/geometry methods fail after close; previously obtained NumPy
+arrays remain valid through their own memory owner. Reopen the view explicitly
+when accepting changed inputs. A store cannot close while its view is active.
+C++ `graphReadView(txn, objects, edges)` supplies the same topology and revision
+identities using the caller's transaction and explicit `EdgeSelection` policy;
+its default edge selection is unfiltered.
+
+For fitting inputs, `graph.read_geometry_arrays(array_name, nodes=None)` loads
+the selected nodes' pinned revisions into one packed native buffer. `nodes=None`
+uses graph node order; an explicit list preserves its order and duplicates, and
+`nodes=[]` returns an empty result. Missing geometry or arrays fail explicitly.
+`store.read_geometry_arrays(revision_uuids, array_name)` provides the same loader
+for known revisions in one read transaction. C++ uses `readGeometryArrays`.
+
+```python
+with store.graph_read(object_kind="track", edge_kind="crossing") as graph:
+    source_uuids = graph.object_uuids
+    topology_offsets, partners = graph.offsets, graph.partners
+    packed = graph.read_geometry_arrays("points")
+    points, track_offsets = packed.values, packed.offsets
+
+# These arrays remain valid after the read transaction closes. Fitting gathers
+# use ordinary NumPy indexing, without a database call or an export step.
+first_track = points[track_offsets[0]:track_offsets[1]] if source_uuids else points
+```
+
+`PackedGeometryArray.values` is a read-only NumPy view with the stored dtype,
+byte order and coordinate convention. Arrays concatenate along the first
+dimension; `offsets` contains one more entry than the number of requested
+revisions and indexes that dimension, not bytes. Dtypes and trailing dimensions
+must match. Tiled and linear physical layouts can be combined when their logical
+dimensions match. `data` exposes the same buffer as read-only bytes, and `shape`
+and `dtype` describe it. Every view owns its native buffer independently of the
+store/view/wrapper lifetime. No payload conversion or Python bytes copy occurs
+when obtaining `values`. Empty revision lists have dtype `|u1`, shape `[0]`,
+and offsets `[0]`; selected empty arrays retain their declared dtype and shape.
+
+Packed loading verifies manifests and every selected chunk on each call, using
+bounded SQL parameter batches and the same integrity/layout helpers as ordinary
+reads. The buffer occupies the full selected payload size, plus offsets and
+temporary layout/hash metadata. Keep the returned arrays for repeated fitting
+access; calling the loader repeatedly repeats the read and verification work.
+For subsets larger than available RAM, partition node lists explicitly. Sparse
+range reads remain available when loading the full selected arrays is unsuitable.
+
+`set_meta` and `remove_meta` are idempotent for unchanged JSON values or missing
+keys. Missing and explicit JSON null remain different. A no-op preserves
+approval, generation, timestamps and journal. Use `set_meta_many` for atomic
+`(uuid, key, value)` triples or the existing `with store.write()` context for
+mixed changes. A failed batch rolls back all its updates; durability remains FULL.
 
 ## Two-store three-way synchronization
 

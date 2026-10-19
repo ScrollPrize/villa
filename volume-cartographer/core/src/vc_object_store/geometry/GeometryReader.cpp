@@ -90,9 +90,7 @@ GeometryReader::GeometryReader(sqlite3* db, const std::string& revision, bool ca
     // Charge JSON nodes/strings, layouts and cache bookkeeping conservatively,
     // in addition to the separately accounted retained payload bytes.
     metadataCharge_ = text.size() * 32 + 4096;
-    if (geometryHash(std::span(reinterpret_cast<const uint8_t*>(text.data()), text.size())) != row.text(0))
-        throw std::runtime_error("geometry: corrupt revision manifest");
-    manifest_ = nlohmann::json::parse(text);
+    manifest_ = verifiedGeometryManifest(text, row.text(0));
     for (const auto& [name, array] : manifest_.at("arrays").items())
         layouts_.emplace(name, geometryLayout(array));
 }
@@ -115,8 +113,7 @@ void GeometryReader::visitChunk(const std::string& name, int64_t index,
     if (!chunk.row()) throw std::runtime_error("geometry: missing payload chunk");
     const auto bytes = std::span(static_cast<const uint8_t*>(sqlite3_column_blob(chunk.value, 0)),
                                 static_cast<size_t>(sqlite3_column_bytes(chunk.value, 0)));
-    if (static_cast<int64_t>(bytes.size()) != expectedSize || chunk.text(1) != expectedHash || geometryHash(bytes) != expectedHash)
-        throw std::runtime_error("geometry: corrupt payload chunk");
+    verifyGeometryChunk(bytes, chunk.text(1), expectedHash, expectedSize);
     if (!cacheChunks_) { visit(bytes); return; }
     // Bound bytes, not chunk count: tiled chunks are smaller than linear ones.
     constexpr size_t budget = 8 * geometryChunkSize;
@@ -142,6 +139,11 @@ std::vector<uint8_t> GeometryReader::read(const std::string& name, int64_t offse
     if (size < 0 || size > length - offset) throw std::out_of_range("geometry: invalid byte count");
     std::vector<uint8_t> result(static_cast<size_t>(size));
     if (!size) return result;
+    if (offset == 0 && size == length) {
+        for (int64_t index = 0; index < layout.chunkCount(); ++index)
+            visitChunk(name, index, [&](auto bytes) { copyGeometryChunk(layout, index, bytes, result.data()); });
+        return result;
+    }
     if (!layout.tile) {
         for (int64_t index = offset / geometryChunkSize; index <= (offset + size - 1) / geometryChunkSize; ++index) {
             const int64_t base = index * geometryChunkSize;
@@ -179,6 +181,60 @@ std::vector<uint8_t> GeometryReader::read(const std::string& name, int64_t offse
                 }
             });
         }
+    return result;
+}
+
+std::vector<std::vector<uint8_t>> GeometryReader::ranges(const std::string& name,
+    const std::vector<std::array<int64_t, 2>>& ranges)
+{
+    const auto found = layouts_.find(name);
+    if (found == layouts_.end()) throw std::invalid_argument("geometry: array not found: " + name);
+    const auto& layout = found->second;
+    struct Copy { size_t output; int64_t source, destination, count; };
+    std::map<int64_t, std::vector<Copy>> plan;
+    std::vector<std::vector<uint8_t>> result;
+    result.reserve(ranges.size());
+    for (const auto& range : ranges) {
+        const auto [offset, size] = range;
+        if (offset < 0 || offset > layout.length || size < 0 || size > layout.length - offset)
+            throw std::out_of_range("geometry: invalid byte range");
+        const auto output = result.size();
+        result.emplace_back(static_cast<size_t>(size));
+        if (!size) continue;
+        if (!layout.tile) {
+            for (auto chunk = offset / geometryChunkSize; chunk <= (offset + size - 1) / geometryChunkSize; ++chunk) {
+                const int64_t base = chunk * geometryChunkSize;
+                const auto begin = std::max(base, offset);
+                const auto end = std::min(base + layout.chunkBytes(chunk), offset + size);
+                plan[chunk].push_back({output, begin - base, begin - offset, end - begin});
+            }
+        } else {
+            // Split logical row-major bytes into physical tile spans, including
+            // partial XYZ elements and ranges crossing row/tile boundaries.
+            const auto rowBytes = layout.cols * 12;
+            for (auto row = offset / rowBytes; row <= (offset + size - 1) / rowBytes; ++row) {
+                const auto first = std::max(offset, row * rowBytes);
+                const auto last = std::min(offset + size, (row + 1) * rowBytes);
+                for (auto col = (first % rowBytes) / (layout.tile * 12);
+                     col <= (last - 1 - row * rowBytes) / (layout.tile * 12); ++col) {
+                    const auto chunk = row / layout.tile * layout.tileColumns() + col;
+                    const auto [y, x, h, w] = layout.rectangle(chunk);
+                    const auto base = row * rowBytes + x * 12;
+                    const auto begin = std::max(base, first), end = std::min(base + w * 12, last);
+                    plan[chunk].push_back({output, (row - y) * w * 12 + begin - base,
+                                          begin - offset, end - begin});
+                }
+            }
+        }
+    }
+    // Each touched chunk is loaded and verified once, independently of caller
+    // order or cache capacity. Duplicates/overlaps scatter to every destination.
+    for (const auto& [chunk, copies] : plan)
+        visitChunk(name, chunk, [&](auto bytes) {
+            for (const auto& copy : copies)
+                std::memcpy(result[copy.output].data() + copy.destination,
+                            bytes.data() + copy.source, copy.count);
+        });
     return result;
 }
 
@@ -224,7 +280,98 @@ std::vector<uint8_t> ObjectStore::readGeometryArray(const Txn& txn, const std::s
     const std::string& arrayName, int64_t byteOffset, const std::optional<int64_t>& byteCount) const
 {
     (void)connection(txn);
+    if (byteCount && *byteCount <= detail::geometryChunkSize)
+        return detail::withGeometryReader(txn, revisionUuid, [&](auto& reader) {
+            return reader.read(arrayName, byteOffset, byteCount);
+        });
     return detail::GeometryReader(txn, revisionUuid, false).read(arrayName, byteOffset, byteCount);
+}
+
+PackedGeometryArray ObjectStore::readGeometryArrays(const Txn& txn,
+    const std::vector<std::string>& revisions, const std::string& name) const
+{
+    auto* db = static_cast<sqlite3*>(connection(txn));
+    PackedGeometryArray result;
+    struct ArrayPlan {
+        GeometryLayout layout;
+        std::vector<std::string> hashes;
+        size_t offset;
+    };
+    std::vector<ArrayPlan> plan;
+    plan.reserve(revisions.size());
+    size_t totalBytes = 0;
+    // Bound parameters/manifest parsing; retain only layouts and expected hashes
+    // before allocating the final packed payload once.
+    constexpr size_t window = 256;
+    auto request = [](size_t count) {
+        std::string sql = "WITH requested(pos,uuid) AS (VALUES ";
+        for (size_t i = 0; i < count; ++i)
+            sql += (i ? "," : "") + std::string("(") + std::to_string(i) + ",?" + std::to_string(i+1) + ")";
+        return sql + ") ";
+    };
+    auto bind = [&](Statement& query, size_t begin, size_t count) {
+        for (size_t i = 0; i < count; ++i) query.bindBlob(int(i+1), parseUuid(revisions[begin+i]));
+    };
+    for (size_t begin = 0; begin < revisions.size(); begin += window) {
+        const auto count = std::min(window, revisions.size() - begin);
+        Statement manifests(db, request(count) + "SELECT q.pos,r.content_hash,r.manifest FROM requested q "
+            "LEFT JOIN geometry_revisions r ON r.uuid=q.uuid ORDER BY q.pos");
+        bind(manifests, begin, count);
+        while (manifests.row()) {
+            if (manifests.isNull(1)) throw std::invalid_argument("geometry: revision not found");
+            auto manifest = verifiedGeometryManifest(manifests.text(2), manifests.text(1));
+            const auto& descriptors = manifest.at("arrays");
+            if (!descriptors.contains(name)) throw std::invalid_argument("geometry: array not found: " + name);
+            GeometryLayout layout;
+            for (const auto& [key, array] : descriptors.items()) {
+                const auto validated = geometryLayout(array);
+                if (key == name) layout = validated;
+            }
+            const auto& array = descriptors.at(name);
+            const auto shape = array.at("shape").get<std::vector<int64_t>>();
+            const auto dtype = array.at("dtype").get<std::string>();
+            if (result.offsets.size() == 1) {
+                result.dtype = dtype; result.shape = shape; result.shape[0] = 0;
+            }
+            if (dtype != result.dtype || shape.size() != result.shape.size() ||
+                !std::equal(shape.begin()+1, shape.end(), result.shape.begin()+1))
+                throw std::invalid_argument("geometry: packed arrays require matching dtype and trailing dimensions");
+            if (shape[0] > std::numeric_limits<int64_t>::max() - result.shape[0] ||
+                uint64_t(layout.length) > result.data.max_size() - totalBytes)
+                throw std::overflow_error("geometry: packed array size overflow");
+            result.shape[0] += shape[0];
+            result.offsets.push_back(uint64_t(result.shape[0]));
+            plan.push_back({layout, array.at("chunks").get<std::vector<std::string>>(), totalBytes});
+            totalBytes += size_t(layout.length);
+        }
+        if (plan.size() != begin + count) throw std::runtime_error("geometry: incomplete revision selection");
+    }
+    result.data.resize(totalBytes);
+    for (size_t begin = 0; begin < revisions.size(); begin += window) {
+        const auto count = std::min(window, revisions.size() - begin);
+        // Keep requested revisions outermost: otherwise SQLite can scan the
+        // entire reference table for every window, even with its primary key.
+        Statement chunks(db, request(count) + "SELECT q.pos,r.chunk_index,r.hash,c.data FROM requested q "
+            "CROSS JOIN geometry_revision_chunks r ON r.revision_uuid=q.uuid AND r.array_name=?" + std::to_string(count+1) +
+            " LEFT JOIN geometry_chunks c ON c.hash=r.hash");
+        bind(chunks, begin, count); chunks.bind(int(count+1), name);
+        std::vector<int64_t> seen(count, 0);
+        while (chunks.row()) {
+            const auto row = size_t(chunks.i64(0));
+            const auto index = chunks.i64(1);
+            ++seen.at(row); // unique (revision,array,index), independent of SQL row order
+            if (chunks.isNull(3)) throw std::runtime_error("geometry: missing payload chunk");
+            const auto bytes = std::span(static_cast<const uint8_t*>(sqlite3_column_blob(chunks.value, 3)),
+                                        size_t(sqlite3_column_bytes(chunks.value, 3)));
+            const auto& array = plan.at(begin + row);
+            const auto expectedSize = array.layout.chunkBytes(index);
+            verifyGeometryChunk(bytes, chunks.text(2), array.hashes.at(index), expectedSize);
+            copyGeometryChunk(array.layout, index, bytes, result.data.data() + array.offset);
+        }
+        for (size_t i = 0; i < count; ++i)
+            if (seen[i] != plan[begin+i].layout.chunkCount()) throw std::runtime_error("geometry: missing payload chunk");
+    }
+    return result;
 }
 
 std::vector<std::vector<uint8_t>> ObjectStore::readGeometryRanges(const Txn& txn, const std::string& revisionUuid,
@@ -232,10 +379,7 @@ std::vector<std::vector<uint8_t>> ObjectStore::readGeometryRanges(const Txn& txn
 {
     (void)connection(txn);
     return detail::withGeometryReader(txn, revisionUuid, [&](auto& reader) {
-        std::vector<std::vector<uint8_t>> result;
-        result.reserve(ranges.size());
-        for (const auto& range : ranges) result.push_back(reader.read(arrayName, range[0], range[1]));
-        return result;
+        return reader.ranges(arrayName, ranges);
     });
 }
 

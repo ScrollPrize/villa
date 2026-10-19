@@ -1,0 +1,13 @@
+{
+  "date": "2026-10-19",
+  "platform": "Linux-6.14.0-1015-nvidia-aarch64-with-glibc2.39",
+  "compiler": "c++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+  "compile_command": "/usr/bin/c++ -I/home/sean/villa/volume-cartographer/core/include -I/home/sean/villa/volume-cartographer/core/src/vc_object_store -isystem /home/sean/villa/volume-cartographer/build/core/src/vc_object_store/vc_objects_autogen/include -O2 -g -DNDEBUG -std=gnu++23 -fPIC -fPIC -pipe -march=armv8.2-a -g3 -fno-omit-frame-pointer -fasynchronous-unwind-tables -fno-eliminate-unused-debug-types -ffunction-sections -fdata-sections -O2 -flto=auto -Wno-psabi -Wno-ignored-attributes -Wno-narrowing -o core/src/vc_object_store/CMakeFiles/vc_objects.dir/Metadata.cpp.o -c /home/sean/villa/volume-cartographer/core/src/vc_object_store/Metadata.cpp",
+  "filesystem": "ext4 on /dev/nvme0n1p2; /tmp and checkout share filesystem",
+  "git_revision": "fee3f2a7b9195bb0b90436bdd174b292eb76401f",
+  "benchmark_sha256": {
+    "scripts/benchmark_object_store.py": "6e7b5526f41af373194236fa76216cda9487f723206073009c318939348eaa4b",
+    "scripts/benchmark_object_store_workflows.py": "78e09f4a43ceb3bc0aafcc9284955a5b1e905874fbf32a83ae0e59c41bee2740",
+    "scripts/benchmark_object_store_metadata.py": "cb94ce3442ad3eac1e931c8d4f4fde1e556a3fdbc5af112fc959a4c3eff66847"
+  }
+}

@@ -61,9 +61,21 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
 
     util::reportProgress(progress, "reading existing links");
     std::unordered_map<std::string, EdgeRecord> existing;
-    for (const auto& kind : kinds)
-        for (auto& e : db.edgesByKind(txn, kind))
+    // A scoped rerun only needs links within its stale scope plus candidate
+    // endpoints. Keep unscoped stale replacement's dataset-wide semantics.
+    auto relevantObjects = scopedObjects;
+    for (const auto& candidate : candidates) {
+        relevantObjects.insert(candidate.aUuid); relevantObjects.insert(candidate.bUuid);
+    }
+    for (const auto& kind : kinds) {
+        objects::EdgeSelection selection; selection.kind = kind;
+        if (staleScope || !replaceStalePending) {
+            selection.endpointUuids = std::vector<std::string>(relevantObjects.begin(), relevantObjects.end());
+            selection.bothEndpoints = true;
+        }
+        for (auto& e : db.selectEdges(txn, selection))
             existing[candidateKey(e)] = e;
+    }
 
     std::set<std::string> candidateKeys;
     for (const auto& c : candidates) {

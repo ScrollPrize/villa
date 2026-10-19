@@ -1,0 +1,1566 @@
+{
+  "platform": "Linux-6.14.0-1015-nvidia-aarch64-with-glibc2.39",
+  "python": "3.14.0 (main, Oct 14 2025, 21:26:03) [Clang 20.1.4 ]",
+  "git_revision": "fee3f2a7b9195bb0b90436bdd174b292eb76401f",
+  "benchmark_sha256": "78e09f4a43ceb3bc0aafcc9284955a5b1e905874fbf32a83ae0e59c41bee2740",
+  "python_sqlite": "3.50.4",
+  "cpu_affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19
+  ],
+  "scenarios": [
+    {
+      "scenario": "catalog",
+      "n": 1000,
+      "results": [
+        {
+          "name": "catalog_all_records",
+          "median_ms": 5.464158,
+          "min_ms": 4.932843,
+          "max_ms": 5.665183,
+          "samples_ms": [
+            5.665183,
+            5.464158,
+            4.932843
+          ],
+          "warmup": true,
+          "mean_ms": 5.354061333333334
+        },
+        {
+          "name": "catalog_projected_names",
+          "median_ms": 1.83889,
+          "min_ms": 1.834843,
+          "max_ms": 1.858874,
+          "samples_ms": [
+            1.858874,
+            1.83889,
+            1.834843
+          ],
+          "warmup": true,
+          "mean_ms": 1.8442023333333333
+        },
+        {
+          "name": "catalog_projected_ids",
+          "median_ms": 1.562936,
+          "min_ms": 1.554489,
+          "max_ms": 1.611161,
+          "samples_ms": [
+            1.562936,
+            1.611161,
+            1.554489
+          ],
+          "warmup": true,
+          "mean_ms": 1.5761953333333334
+        },
+        {
+          "name": "catalog_page_offset_0",
+          "median_ms": 0.536675,
+          "min_ms": 0.508771,
+          "max_ms": 0.543795,
+          "samples_ms": [
+            0.543795,
+            0.508771,
+            0.536675
+          ],
+          "warmup": true,
+          "mean_ms": 0.529747
+        },
+        {
+          "name": "catalog_page_offset_900",
+          "median_ms": 0.532547,
+          "min_ms": 0.532515,
+          "max_ms": 0.537603,
+          "samples_ms": [
+            0.537603,
+            0.532547,
+            0.532515
+          ],
+          "warmup": true,
+          "mean_ms": 0.5342216666666667
+        },
+        {
+          "name": "component_ids",
+          "median_ms": 2.484157,
+          "min_ms": 2.475742,
+          "max_ms": 2.536334,
+          "samples_ms": [
+            2.536334,
+            2.484157,
+            2.475742
+          ],
+          "warmup": true,
+          "mean_ms": 2.4987443333333332
+        },
+        {
+          "name": "component_first_record_limit_1",
+          "median_ms": 3.501283,
+          "min_ms": 3.47362,
+          "max_ms": 3.530163,
+          "samples_ms": [
+            3.530163,
+            3.501283,
+            3.47362
+          ],
+          "warmup": true,
+          "mean_ms": 3.5016886666666664
+        },
+        {
+          "name": "graph_adjacency_per_object",
+          "median_ms": 7.590074,
+          "min_ms": 7.570362,
+          "max_ms": 7.603322,
+          "samples_ms": [
+            7.570362,
+            7.603322,
+            7.590074
+          ],
+          "warmup": true,
+          "mean_ms": 7.587919333333335
+        },
+        {
+          "name": "graph_projected_export",
+          "median_ms": 19.19929,
+          "min_ms": 19.180601,
+          "max_ms": 19.489179,
+          "samples_ms": [
+            19.489179,
+            19.180601,
+            19.19929
+          ],
+          "warmup": true,
+          "mean_ms": 19.28969
+        },
+        {
+          "name": "viewport_hydrate_then_filter",
+          "median_ms": 5.370046,
+          "min_ms": 5.344749,
+          "max_ms": 5.480286,
+          "samples_ms": [
+            5.480286,
+            5.344749,
+            5.370046
+          ],
+          "warmup": true,
+          "mean_ms": 5.398360333333334
+        },
+        {
+          "name": "viewport_rtree_fields_None",
+          "median_ms": 0.024192,
+          "min_ms": 0.022928,
+          "max_ms": 0.028896,
+          "samples_ms": [
+            0.028896,
+            0.024192,
+            0.022928
+          ],
+          "warmup": true,
+          "mean_ms": 0.025338666666666666
+        },
+        {
+          "name": "viewport_rtree_fields_[]",
+          "median_ms": 0.01632,
+          "min_ms": 0.016304,
+          "max_ms": 0.017745,
+          "samples_ms": [
+            0.017745,
+            0.01632,
+            0.016304
+          ],
+          "warmup": true,
+          "mean_ms": 0.016789666666666665
+        },
+        {
+          "name": "viewport_rtree_fields_['name', 'generation']",
+          "median_ms": 0.016688,
+          "min_ms": 0.016448,
+          "max_ms": 0.017712,
+          "samples_ms": [
+            0.017712,
+            0.016688,
+            0.016448
+          ],
+          "warmup": true,
+          "mean_ms": 0.016949333333333334
+        },
+        {
+          "name": "viewport_rtree_kind_projected",
+          "median_ms": 0.016624,
+          "min_ms": 0.01648,
+          "max_ms": 0.017296,
+          "samples_ms": [
+            0.017296,
+            0.016624,
+            0.01648
+          ],
+          "warmup": true,
+          "mean_ms": 0.0168
+        },
+        {
+          "name": "viewport_cached_python_filter",
+          "median_ms": 0.065377,
+          "min_ms": 0.06384,
+          "max_ms": 0.067137,
+          "samples_ms": [
+            0.065377,
+            0.06384,
+            0.067137
+          ],
+          "warmup": true,
+          "mean_ms": 0.06545133333333333
+        },
+        {
+          "name": "sql_bbox_scan_ids_only_lower_bound",
+          "median_ms": 0.104513,
+          "min_ms": 0.103856,
+          "max_ms": 0.107569,
+          "samples_ms": [
+            0.107569,
+            0.103856,
+            0.104513
+          ],
+          "warmup": true,
+          "mean_ms": 0.10531266666666667
+        },
+        {
+          "name": "bbox_query_plan",
+          "plan": "QUERY PLAN\n`--SCAN tracks\n"
+        },
+        {
+          "name": "rtree_query_plan",
+          "plan": "QUERY PLAN\n|--SEARCH objects USING INTEGER PRIMARY KEY (rowid=?)\n|--LIST SUBQUERY 1\n|  |--SCAN r VIRTUAL TABLE INDEX 2:D1B0D3B2D5B4\n|  `--SEARCH b USING INTEGER PRIMARY KEY (rowid=?)\n`--USE TEMP B-TREE FOR ORDER BY\n"
+        },
+        {
+          "name": "catalog_profile",
+          "top_cumulative": [
+            {
+              "function": "('/home/sean/villa/volume-cartographer/scripts/benchmark_object_store_workflows.py', 101, '<lambda>')",
+              "calls": 1,
+              "self_seconds": 0.006573857000000001,
+              "cumulative_seconds": 0.009357571
+            },
+            {
+              "function": "('/home/sean/.local/share/uv/python/cpython-3.14.0-linux-aarch64-gnu/lib/python3.14/json/__init__.py', 299, 'loads')",
+              "calls": 1000,
+              "self_seconds": 0.00047153900000000004,
+              "cumulative_seconds": 0.002703233
+            },
+            {
+              "function": "('/home/sean/.local/share/uv/python/cpython-3.14.0-linux-aarch64-gnu/lib/python3.14/json/decoder.py', 340, 'decode')",
+              "calls": 1000,
+              "self_seconds": 0.001001029,
+              "cumulative_seconds": 0.002087598
+            },
+            {
+              "function": "('/home/sean/.local/share/uv/python/cpython-3.14.0-linux-aarch64-gnu/lib/python3.14/json/decoder.py', 351, 'raw_decode')",
+              "calls": 1000,
+              "self_seconds": 0.000460307,
+              "cumulative_seconds": 0.000460307
+            },
+            {
+              "function": "('~', 0, \"<method 'match' of 're.Pattern' objects>\")",
+              "calls": 2000,
+              "self_seconds": 0.000412514,
+              "cumulative_seconds": 0.000412514
+            },
+            {
+              "function": "('~', 0, \"<method 'end' of 're.Match' objects>\")",
+              "calls": 2000,
+              "self_seconds": 0.000146737,
+              "cumulative_seconds": 0.000146737
+            },
+            {
+              "function": "('/home/sean/villa/volume-cartographer/scripts/benchmark_object_store_workflows.py', 73, 'in_slab')",
+              "calls": 1,
+              "self_seconds": 8.0481e-05,
+              "cumulative_seconds": 8.0481e-05
+            },
+            {
+              "function": "('~', 0, \"<method 'startswith' of 'str' objects>\")",
+              "calls": 1000,
+              "self_seconds": 7.8032e-05,
+              "cumulative_seconds": 7.8032e-05
+            },
+            {
+              "function": "('~', 0, '<built-in method builtins.len>')",
+              "calls": 1000,
+              "self_seconds": 6.7011e-05,
+              "cumulative_seconds": 6.7011e-05
+            },
+            {
+              "function": "('~', 0, '<built-in method builtins.isinstance>')",
+              "calls": 1000,
+              "self_seconds": 6.606400000000001e-05,
+              "cumulative_seconds": 6.606400000000001e-05
+            }
+          ]
+        }
+      ],
+      "module": "/home/sean/villa/volume-cartographer/build/python/vc/objects.cpython-314-aarch64-linux-gnu.so",
+      "peak_rss_bytes": 83771392
+    },
+    {
+      "scenario": "catalog",
+      "n": 10000,
+      "results": [
+        {
+          "name": "catalog_all_records",
+          "median_ms": 68.482553,
+          "min_ms": 67.075009,
+          "max_ms": 75.663888,
+          "samples_ms": [
+            75.663888,
+            68.482553,
+            67.075009
+          ],
+          "warmup": true,
+          "mean_ms": 70.40715
+        },
+        {
+          "name": "catalog_projected_names",
+          "median_ms": 22.004793,
+          "min_ms": 21.932537,
+          "max_ms": 22.298922,
+          "samples_ms": [
+            21.932537,
+            22.298922,
+            22.004793
+          ],
+          "warmup": true,
+          "mean_ms": 22.078750666666668
+        },
+        {
+          "name": "catalog_projected_ids",
+          "median_ms": 17.226767,
+          "min_ms": 16.996029,
+          "max_ms": 17.236687,
+          "samples_ms": [
+            17.226767,
+            16.996029,
+            17.236687
+          ],
+          "warmup": true,
+          "mean_ms": 17.153161
+        },
+        {
+          "name": "catalog_page_offset_0",
+          "median_ms": 0.545843,
+          "min_ms": 0.528739,
+          "max_ms": 0.572163,
+          "samples_ms": [
+            0.572163,
+            0.545843,
+            0.528739
+          ],
+          "warmup": true,
+          "mean_ms": 0.5489149999999999
+        },
+        {
+          "name": "catalog_page_offset_9900",
+          "median_ms": 0.82594,
+          "min_ms": 0.820964,
+          "max_ms": 0.851173,
+          "samples_ms": [
+            0.851173,
+            0.82594,
+            0.820964
+          ],
+          "warmup": true,
+          "mean_ms": 0.8326923333333333
+        },
+        {
+          "name": "component_ids",
+          "median_ms": 25.486236,
+          "min_ms": 25.401724,
+          "max_ms": 25.740301,
+          "samples_ms": [
+            25.740301,
+            25.486236,
+            25.401724
+          ],
+          "warmup": true,
+          "mean_ms": 25.54275366666667
+        },
+        {
+          "name": "component_first_record_limit_1",
+          "median_ms": 37.948273,
+          "min_ms": 37.931345,
+          "max_ms": 38.150466,
+          "samples_ms": [
+            37.931345,
+            37.948273,
+            38.150466
+          ],
+          "warmup": true,
+          "mean_ms": 38.010028
+        },
+        {
+          "name": "graph_adjacency_per_object",
+          "median_ms": 77.98667,
+          "min_ms": 77.925309,
+          "max_ms": 78.131086,
+          "samples_ms": [
+            77.925309,
+            77.98667,
+            78.131086
+          ],
+          "warmup": true,
+          "mean_ms": 78.01435500000001
+        },
+        {
+          "name": "graph_projected_export",
+          "median_ms": 234.543421,
+          "min_ms": 234.348044,
+          "max_ms": 238.204016,
+          "samples_ms": [
+            238.204016,
+            234.348044,
+            234.543421
+          ],
+          "warmup": true,
+          "mean_ms": 235.69849366666665
+        },
+        {
+          "name": "viewport_hydrate_then_filter",
+          "median_ms": 77.683292,
+          "min_ms": 77.609916,
+          "max_ms": 78.363104,
+          "samples_ms": [
+            78.363104,
+            77.683292,
+            77.609916
+          ],
+          "warmup": true,
+          "mean_ms": 77.88543733333334
+        },
+        {
+          "name": "viewport_rtree_fields_None",
+          "median_ms": 0.025057,
+          "min_ms": 0.023808,
+          "max_ms": 0.038368,
+          "samples_ms": [
+            0.038368,
+            0.025057,
+            0.023808
+          ],
+          "warmup": true,
+          "mean_ms": 0.02907766666666667
+        },
+        {
+          "name": "viewport_rtree_fields_[]",
+          "median_ms": 0.016833,
+          "min_ms": 0.01648,
+          "max_ms": 0.018416,
+          "samples_ms": [
+            0.018416,
+            0.016833,
+            0.01648
+          ],
+          "warmup": true,
+          "mean_ms": 0.017242999999999998
+        },
+        {
+          "name": "viewport_rtree_fields_['name', 'generation']",
+          "median_ms": 0.017472,
+          "min_ms": 0.017024,
+          "max_ms": 0.018256,
+          "samples_ms": [
+            0.018256,
+            0.017472,
+            0.017024
+          ],
+          "warmup": true,
+          "mean_ms": 0.017584000000000002
+        },
+        {
+          "name": "viewport_rtree_kind_projected",
+          "median_ms": 0.017312,
+          "min_ms": 0.016944,
+          "max_ms": 0.018256,
+          "samples_ms": [
+            0.018256,
+            0.017312,
+            0.016944
+          ],
+          "warmup": true,
+          "mean_ms": 0.017504000000000002
+        },
+        {
+          "name": "viewport_cached_python_filter",
+          "median_ms": 0.814501,
+          "min_ms": 0.765828,
+          "max_ms": 0.875908,
+          "samples_ms": [
+            0.875908,
+            0.814501,
+            0.765828
+          ],
+          "warmup": true,
+          "mean_ms": 0.8187456666666666
+        },
+        {
+          "name": "sql_bbox_scan_ids_only_lower_bound",
+          "median_ms": 1.010533,
+          "min_ms": 1.004614,
+          "max_ms": 1.01999,
+          "samples_ms": [
+            1.01999,
+            1.010533,
+            1.004614
+          ],
+          "warmup": true,
+          "mean_ms": 1.0117123333333333
+        },
+        {
+          "name": "bbox_query_plan",
+          "plan": "QUERY PLAN\n`--SCAN tracks\n"
+        },
+        {
+          "name": "rtree_query_plan",
+          "plan": "QUERY PLAN\n|--SEARCH objects USING INTEGER PRIMARY KEY (rowid=?)\n|--LIST SUBQUERY 1\n|  |--SCAN r VIRTUAL TABLE INDEX 2:D1B0D3B2D5B4\n|  `--SEARCH b USING INTEGER PRIMARY KEY (rowid=?)\n`--USE TEMP B-TREE FOR ORDER BY\n"
+        },
+        {
+          "name": "catalog_profile",
+          "top_cumulative": [
+            {
+              "function": "('/home/sean/villa/volume-cartographer/scripts/benchmark_object_store_workflows.py', 101, '<lambda>')",
+              "calls": 1,
+              "self_seconds": 0.07097867100000001,
+              "cumulative_seconds": 0.102353764
+            },
+            {
+              "function": "('/home/sean/.local/share/uv/python/cpython-3.14.0-linux-aarch64-gnu/lib/python3.14/json/__init__.py', 299, 'loads')",
+              "calls": 10000,
+              "self_seconds": 0.004677915,
+              "cumulative_seconds": 0.030340735
+            },
+            {
+              "function": "('/home/sean/.local/share/uv/python/cpython-3.14.0-linux-aarch64-gnu/lib/python3.14/json/decoder.py', 340, 'decode')",
+              "calls": 10000,
+              "self_seconds": 0.014193435,
+              "cumulative_seconds": 0.024228910000000003
+            },
+            {
+              "function": "('~', 0, \"<method 'match' of 're.Pattern' objects>\")",
+              "calls": 20000,
+              "self_seconds": 0.004376967000000001,
+              "cumulative_seconds": 0.004376967000000001
+            },
+            {
+              "function": "('/home/sean/.local/share/uv/python/cpython-3.14.0-linux-aarch64-gnu/lib/python3.14/json/decoder.py', 351, 'raw_decode')",
+              "calls": 10000,
+              "self_seconds": 0.0035526890000000004,
+              "cumulative_seconds": 0.0035526890000000004
+            },
+            {
+              "function": "('~', 0, \"<method 'end' of 're.Match' objects>\")",
+              "calls": 20000,
+              "self_seconds": 0.001418599,
+              "cumulative_seconds": 0.001418599
+            },
+            {
+              "function": "('/home/sean/villa/volume-cartographer/scripts/benchmark_object_store_workflows.py', 73, 'in_slab')",
+              "calls": 1,
+              "self_seconds": 0.001034358,
+              "cumulative_seconds": 0.001034358
+            },
+            {
+              "function": "('~', 0, \"<method 'startswith' of 'str' objects>\")",
+              "calls": 10000,
+              "self_seconds": 0.0007493150000000001,
+              "cumulative_seconds": 0.0007493150000000001
+            },
+            {
+              "function": "('~', 0, '<built-in method builtins.len>')",
+              "calls": 10000,
+              "self_seconds": 0.00068722,
+              "cumulative_seconds": 0.00068722
+            },
+            {
+              "function": "('~', 0, '<built-in method builtins.isinstance>')",
+              "calls": 10000,
+              "self_seconds": 0.0006845950000000001,
+              "cumulative_seconds": 0.0006845950000000001
+            }
+          ]
+        }
+      ],
+      "module": "/home/sean/villa/volume-cartographer/build/python/vc/objects.cpython-314-aarch64-linux-gnu.so",
+      "peak_rss_bytes": 206307328
+    },
+    {
+      "scenario": "catalog",
+      "n": 50000,
+      "results": [
+        {
+          "name": "catalog_all_records",
+          "median_ms": 396.559249,
+          "min_ms": 396.271823,
+          "max_ms": 398.618428,
+          "samples_ms": [
+            396.271823,
+            398.618428,
+            396.559249
+          ],
+          "warmup": true,
+          "mean_ms": 397.14983333333333
+        },
+        {
+          "name": "catalog_projected_names",
+          "median_ms": 173.600992,
+          "min_ms": 173.075949,
+          "max_ms": 174.00229,
+          "samples_ms": [
+            173.075949,
+            173.600992,
+            174.00229
+          ],
+          "warmup": true,
+          "mean_ms": 173.55974366666666
+        },
+        {
+          "name": "catalog_projected_ids",
+          "median_ms": 122.041891,
+          "min_ms": 121.208318,
+          "max_ms": 122.969929,
+          "samples_ms": [
+            122.969929,
+            122.041891,
+            121.208318
+          ],
+          "warmup": true,
+          "mean_ms": 122.07337933333334
+        },
+        {
+          "name": "catalog_page_offset_0",
+          "median_ms": 0.540195,
+          "min_ms": 0.524787,
+          "max_ms": 0.5717,
+          "samples_ms": [
+            0.5717,
+            0.540195,
+            0.524787
+          ],
+          "warmup": true,
+          "mean_ms": 0.5455606666666667
+        },
+        {
+          "name": "catalog_page_offset_49900",
+          "median_ms": 2.260269,
+          "min_ms": 2.230844,
+          "max_ms": 2.304813,
+          "samples_ms": [
+            2.304813,
+            2.230844,
+            2.260269
+          ],
+          "warmup": true,
+          "mean_ms": 2.2653086666666664
+        },
+        {
+          "name": "component_ids",
+          "median_ms": 147.190911,
+          "min_ms": 146.389803,
+          "max_ms": 147.802242,
+          "samples_ms": [
+            146.389803,
+            147.190911,
+            147.802242
+          ],
+          "warmup": true,
+          "mean_ms": 147.127652
+        },
+        {
+          "name": "component_first_record_limit_1",
+          "median_ms": 228.212176,
+          "min_ms": 225.678802,
+          "max_ms": 228.244224,
+          "samples_ms": [
+            225.678802,
+            228.244224,
+            228.212176
+          ],
+          "warmup": true,
+          "mean_ms": 227.37840066666664
+        },
+        {
+          "name": "graph_adjacency_per_object",
+          "median_ms": 415.799186,
+          "min_ms": 415.443695,
+          "max_ms": 415.818866,
+          "samples_ms": [
+            415.443695,
+            415.799186,
+            415.818866
+          ],
+          "warmup": true,
+          "mean_ms": 415.687249
+        },
+        {
+          "name": "graph_projected_export",
+          "median_ms": 1412.914324,
+          "min_ms": 1412.8459,
+          "max_ms": 1425.928319,
+          "samples_ms": [
+            1425.928319,
+            1412.8459,
+            1412.914324
+          ],
+          "warmup": true,
+          "mean_ms": 1417.2295143333333
+        },
+        {
+          "name": "viewport_hydrate_then_filter",
+          "median_ms": 430.605278,
+          "min_ms": 430.465149,
+          "max_ms": 431.708437,
+          "samples_ms": [
+            430.605278,
+            430.465149,
+            431.708437
+          ],
+          "warmup": true,
+          "mean_ms": 430.92628799999994
+        },
+        {
+          "name": "viewport_rtree_fields_None",
+          "median_ms": 0.026112,
+          "min_ms": 0.024801,
+          "max_ms": 0.034032,
+          "samples_ms": [
+            0.034032,
+            0.026112,
+            0.024801
+          ],
+          "warmup": true,
+          "mean_ms": 0.028314999999999996
+        },
+        {
+          "name": "viewport_rtree_fields_[]",
+          "median_ms": 0.017488,
+          "min_ms": 0.017057,
+          "max_ms": 0.018864,
+          "samples_ms": [
+            0.018864,
+            0.017488,
+            0.017057
+          ],
+          "warmup": true,
+          "mean_ms": 0.017803
+        },
+        {
+          "name": "viewport_rtree_fields_['name', 'generation']",
+          "median_ms": 0.017936,
+          "min_ms": 0.017728,
+          "max_ms": 0.01888,
+          "samples_ms": [
+            0.01888,
+            0.017936,
+            0.017728
+          ],
+          "warmup": true,
+          "mean_ms": 0.018181333333333334
+        },
+        {
+          "name": "viewport_rtree_kind_projected",
+          "median_ms": 0.017664,
+          "min_ms": 0.017536,
+          "max_ms": 0.018704,
+          "samples_ms": [
+            0.018704,
+            0.017664,
+            0.017536
+          ],
+          "warmup": true,
+          "mean_ms": 0.017967999999999998
+        },
+        {
+          "name": "viewport_cached_python_filter",
+          "median_ms": 4.659978,
+          "min_ms": 4.547098,
+          "max_ms": 4.843163,
+          "samples_ms": [
+            4.659978,
+            4.547098,
+            4.843163
+          ],
+          "warmup": true,
+          "mean_ms": 4.683413
+        },
+        {
+          "name": "sql_bbox_scan_ids_only_lower_bound",
+          "median_ms": 5.082572,
+          "min_ms": 5.07158,
+          "max_ms": 5.119901,
+          "samples_ms": [
+            5.119901,
+            5.07158,
+            5.082572
+          ],
+          "warmup": true,
+          "mean_ms": 5.0913509999999995
+        },
+        {
+          "name": "bbox_query_plan",
+          "plan": "QUERY PLAN\n`--SCAN tracks\n"
+        },
+        {
+          "name": "rtree_query_plan",
+          "plan": "QUERY PLAN\n|--SEARCH objects USING INTEGER PRIMARY KEY (rowid=?)\n|--LIST SUBQUERY 1\n|  |--SCAN r VIRTUAL TABLE INDEX 2:D1B0D3B2D5B4\n|  `--SEARCH b USING INTEGER PRIMARY KEY (rowid=?)\n`--USE TEMP B-TREE FOR ORDER BY\n"
+        },
+        {
+          "name": "catalog_profile",
+          "top_cumulative": [
+            {
+              "function": "('/home/sean/villa/volume-cartographer/scripts/benchmark_object_store_workflows.py', 101, '<lambda>')",
+              "calls": 1,
+              "self_seconds": 0.35326562,
+              "cumulative_seconds": 0.551466497
+            },
+            {
+              "function": "('/home/sean/.local/share/uv/python/cpython-3.14.0-linux-aarch64-gnu/lib/python3.14/json/__init__.py', 299, 'loads')",
+              "calls": 50000,
+              "self_seconds": 0.023024782,
+              "cumulative_seconds": 0.193151905
+            },
+            {
+              "function": "('/home/sean/.local/share/uv/python/cpython-3.14.0-linux-aarch64-gnu/lib/python3.14/json/decoder.py', 340, 'decode')",
+              "calls": 50000,
+              "self_seconds": 0.108860147,
+              "cumulative_seconds": 0.16288048400000002
+            },
+            {
+              "function": "('~', 0, \"<method 'match' of 're.Pattern' objects>\")",
+              "calls": 100000,
+              "self_seconds": 0.022266554,
+              "cumulative_seconds": 0.022266554
+            },
+            {
+              "function": "('/home/sean/.local/share/uv/python/cpython-3.14.0-linux-aarch64-gnu/lib/python3.14/json/decoder.py', 351, 'raw_decode')",
+              "calls": 50000,
+              "self_seconds": 0.021170256000000002,
+              "cumulative_seconds": 0.021170256000000002
+            },
+            {
+              "function": "('~', 0, \"<method 'end' of 're.Match' objects>\")",
+              "calls": 100000,
+              "self_seconds": 0.0072154490000000005,
+              "cumulative_seconds": 0.0072154490000000005
+            },
+            {
+              "function": "('/home/sean/villa/volume-cartographer/scripts/benchmark_object_store_workflows.py', 73, 'in_slab')",
+              "calls": 1,
+              "self_seconds": 0.0050489720000000005,
+              "cumulative_seconds": 0.0050489720000000005
+            },
+            {
+              "function": "('~', 0, \"<method 'startswith' of 'str' objects>\")",
+              "calls": 50000,
+              "self_seconds": 0.003783273,
+              "cumulative_seconds": 0.003783273
+            },
+            {
+              "function": "('~', 0, '<built-in method builtins.isinstance>')",
+              "calls": 50000,
+              "self_seconds": 0.0034633660000000003,
+              "cumulative_seconds": 0.0034633660000000003
+            },
+            {
+              "function": "('~', 0, '<built-in method builtins.len>')",
+              "calls": 50000,
+              "self_seconds": 0.003368078,
+              "cumulative_seconds": 0.003368078
+            }
+          ]
+        }
+      ],
+      "module": "/home/sean/villa/volume-cartographer/build/python/vc/objects.cpython-314-aarch64-linux-gnu.so",
+      "peak_rss_bytes": 691351552
+    },
+    {
+      "scenario": "sampling",
+      "n": 1048576,
+      "results": [
+        {
+          "name": "fiber_block_query",
+          "median_ms": 0.003696,
+          "min_ms": 0.003152,
+          "max_ms": 0.007168,
+          "samples_ms": [
+            0.007168,
+            0.003696,
+            0.003152
+          ],
+          "warmup": true,
+          "mean_ms": 0.004672
+        },
+        {
+          "name": "fiber_block_query_and_load",
+          "median_ms": 0.552003,
+          "min_ms": 0.541491,
+          "max_ms": 0.590435,
+          "samples_ms": [
+            0.590435,
+            0.552003,
+            0.541491
+          ],
+          "warmup": true,
+          "mean_ms": 0.5613096666666667
+        },
+        {
+          "name": "fiber_block_working_set",
+          "points": 1048576,
+          "total_bytes": 25165824,
+          "returned_bytes": 6168
+        },
+        {
+          "name": "cyclic_8_chunks_512_points",
+          "median_ms": 0.0396,
+          "min_ms": 0.038481,
+          "max_ms": 0.052464,
+          "samples_ms": [
+            0.052464,
+            0.0396,
+            0.038481
+          ],
+          "warmup": true,
+          "mean_ms": 0.043515
+        },
+        {
+          "name": "grouped_8_chunks_512_points",
+          "median_ms": 0.085457,
+          "min_ms": 0.085136,
+          "max_ms": 0.089008,
+          "samples_ms": [
+            0.089008,
+            0.085457,
+            0.085136
+          ],
+          "warmup": true,
+          "mean_ms": 0.08653366666666668
+        },
+        {
+          "name": "cyclic_9_chunks_512_points",
+          "median_ms": 292.158798,
+          "min_ms": 291.7643,
+          "max_ms": 293.094995,
+          "samples_ms": [
+            292.158798,
+            293.094995,
+            291.7643
+          ],
+          "warmup": true,
+          "mean_ms": 292.3393643333333
+        },
+        {
+          "name": "grouped_9_chunks_512_points",
+          "median_ms": 5.32163,
+          "min_ms": 5.304653,
+          "max_ms": 5.331662,
+          "samples_ms": [
+            5.32163,
+            5.304653,
+            5.331662
+          ],
+          "warmup": true,
+          "mean_ms": 5.319315
+        },
+        {
+          "name": "cyclic_16_chunks_512_points",
+          "median_ms": 307.714678,
+          "min_ms": 307.473972,
+          "max_ms": 308.616731,
+          "samples_ms": [
+            307.473972,
+            308.616731,
+            307.714678
+          ],
+          "warmup": true,
+          "mean_ms": 307.935127
+        },
+        {
+          "name": "grouped_16_chunks_512_points",
+          "median_ms": 9.744775,
+          "min_ms": 9.707687,
+          "max_ms": 9.789718,
+          "samples_ms": [
+            9.744775,
+            9.789718,
+            9.707687
+          ],
+          "warmup": true,
+          "mean_ms": 9.747393333333333
+        },
+        {
+          "name": "random_512_points",
+          "median_ms": 188.756031,
+          "min_ms": 188.366972,
+          "max_ms": 189.352945,
+          "samples_ms": [
+            188.366972,
+            189.352945,
+            188.756031
+          ],
+          "warmup": true,
+          "mean_ms": 188.82531600000002
+        },
+        {
+          "name": "random_512_points_grouped",
+          "median_ms": 14.696834,
+          "min_ms": 14.671874,
+          "max_ms": 14.697858,
+          "samples_ms": [
+            14.696834,
+            14.671874,
+            14.697858
+          ],
+          "warmup": true,
+          "mean_ms": 14.688855333333334
+        },
+        {
+          "name": "full_array",
+          "median_ms": 29.237972,
+          "min_ms": 29.200435,
+          "max_ms": 30.065849,
+          "samples_ms": [
+            29.237972,
+            29.200435,
+            30.065849
+          ],
+          "warmup": true,
+          "mean_ms": 29.501418666666666
+        },
+        {
+          "name": "mmap_random_512_points_no_verification_lower_bound",
+          "median_ms": 0.021328,
+          "min_ms": 0.020416,
+          "max_ms": 0.02728,
+          "samples_ms": [
+            0.02728,
+            0.021328,
+            0.020416
+          ],
+          "warmup": true,
+          "mean_ms": 0.023008
+        },
+        {
+          "name": "single_coordinate_edit",
+          "median_ms": 34.183567,
+          "min_ms": 27.519898,
+          "max_ms": 40.50789,
+          "samples_ms": [
+            34.183567,
+            27.519898,
+            40.50789
+          ],
+          "warmup": true,
+          "mean_ms": 34.07045166666666
+        },
+        {
+          "name": "retained_geometry_storage",
+          "chunks": 28,
+          "bytes": 29360128,
+          "original_bytes": 25165824,
+          "edits": 4,
+          "database_bytes": 30371840
+        }
+      ],
+      "module": "/home/sean/villa/volume-cartographer/build/python/vc/objects.cpython-314-aarch64-linux-gnu.so",
+      "peak_rss_bytes": 243470336
+    },
+    {
+      "scenario": "tracks",
+      "n": 1000,
+      "results": [
+        {
+          "name": "load_current_heads_and_arrays",
+          "median_ms": 18.28463,
+          "min_ms": 18.238614,
+          "max_ms": 18.451768,
+          "samples_ms": [
+            18.451768,
+            18.238614,
+            18.28463
+          ],
+          "warmup": true,
+          "mean_ms": 18.325004
+        },
+        {
+          "name": "load_arrays_known_revisions",
+          "median_ms": 8.734288,
+          "min_ms": 8.716929,
+          "max_ms": 8.790657,
+          "samples_ms": [
+            8.716929,
+            8.790657,
+            8.734288
+          ],
+          "warmup": true,
+          "mean_ms": 8.747291333333333
+        },
+        {
+          "name": "packed_mmap_copy_lower_bound",
+          "median_ms": 0.089616,
+          "min_ms": 0.088416,
+          "max_ms": 0.104656,
+          "samples_ms": [
+            0.104656,
+            0.089616,
+            0.088416
+          ],
+          "warmup": true,
+          "mean_ms": 0.09422933333333333
+        }
+      ],
+      "module": "/home/sean/villa/volume-cartographer/build/python/vc/objects.cpython-314-aarch64-linux-gnu.so",
+      "peak_rss_bytes": 82038784
+    },
+    {
+      "scenario": "tracks",
+      "n": 10000,
+      "results": [
+        {
+          "name": "load_current_heads_and_arrays",
+          "median_ms": 197.687442,
+          "min_ms": 197.358512,
+          "max_ms": 198.224501,
+          "samples_ms": [
+            197.358512,
+            198.224501,
+            197.687442
+          ],
+          "warmup": true,
+          "mean_ms": 197.7568183333333
+        },
+        {
+          "name": "load_arrays_known_revisions",
+          "median_ms": 100.653588,
+          "min_ms": 100.438674,
+          "max_ms": 100.976853,
+          "samples_ms": [
+            100.653588,
+            100.438674,
+            100.976853
+          ],
+          "warmup": true,
+          "mean_ms": 100.689705
+        },
+        {
+          "name": "packed_mmap_copy_lower_bound",
+          "median_ms": 1.136919,
+          "min_ms": 1.127318,
+          "max_ms": 1.224471,
+          "samples_ms": [
+            1.224471,
+            1.127318,
+            1.136919
+          ],
+          "warmup": true,
+          "mean_ms": 1.1629026666666666
+        }
+      ],
+      "module": "/home/sean/villa/volume-cartographer/build/python/vc/objects.cpython-314-aarch64-linux-gnu.so",
+      "peak_rss_bytes": 128024576
+    },
+    {
+      "scenario": "spatial",
+      "n": 1025,
+      "results": [
+        {
+          "name": "initial_geometry_publication",
+          "elapsed_ms": 60.537683,
+          "payload_bytes": 12607500,
+          "shape": [
+            1025,
+            1025,
+            3
+          ]
+        },
+        {
+          "name": "viewport_working_set",
+          "candidate_regions": 1,
+          "returned_bytes": 13068,
+          "chunks_touched": 1,
+          "chunk_bytes_to_verify": 196608
+        },
+        {
+          "name": "spatial_regions_query",
+          "median_ms": 0.00344,
+          "min_ms": 0.003056,
+          "max_ms": 0.004736,
+          "samples_ms": [
+            0.004736,
+            0.00344,
+            0.003056
+          ],
+          "warmup": true,
+          "mean_ms": 0.0037439999999999995
+        },
+        {
+          "name": "whole_object_query",
+          "median_ms": 0.015889,
+          "min_ms": 0.014352,
+          "max_ms": 0.020672,
+          "samples_ms": [
+            0.020672,
+            0.015889,
+            0.014352
+          ],
+          "warmup": true,
+          "mean_ms": 0.016971
+        },
+        {
+          "name": "whole_object_query_and_load_then_slice",
+          "median_ms": 17.545682,
+          "min_ms": 17.333217,
+          "max_ms": 17.843412,
+          "samples_ms": [
+            17.843412,
+            17.333217,
+            17.545682
+          ],
+          "warmup": true,
+          "mean_ms": 17.57410366666667
+        },
+        {
+          "name": "region_query_and_load_slice",
+          "median_ms": 0.01048,
+          "min_ms": 0.00952,
+          "max_ms": 0.015873,
+          "samples_ms": [
+            0.015873,
+            0.01048,
+            0.00952
+          ],
+          "warmup": true,
+          "mean_ms": 0.011957666666666667
+        },
+        {
+          "name": "region_query_and_load_rectangle",
+          "median_ms": 0.007104,
+          "min_ms": 0.007072,
+          "max_ms": 0.007888,
+          "samples_ms": [
+            0.007888,
+            0.007072,
+            0.007104
+          ],
+          "warmup": true,
+          "mean_ms": 0.0073546666666666665
+        },
+        {
+          "name": "region_query_reject_empty_space_in_object_aabb",
+          "median_ms": 0.002608,
+          "min_ms": 0.002496,
+          "max_ms": 0.002944,
+          "samples_ms": [
+            0.002944,
+            0.002608,
+            0.002496
+          ],
+          "warmup": true,
+          "mean_ms": 0.0026826666666666665
+        },
+        {
+          "name": "index_storage",
+          "regions": 1024,
+          "database_bytes": 13045760,
+          "index_bytes": 172032
+        },
+        {
+          "name": "spatial_region_query_plan",
+          "plan": "QUERY PLAN\n|--SCAN r VIRTUAL TABLE INDEX 2:D1B0D3B2D5B4\n|--SEARCH b USING INTEGER PRIMARY KEY (rowid=?)\n|--SEARCH o USING INTEGER PRIMARY KEY (rowid=?)\n|--SEARCH h USING INTEGER PRIMARY KEY (rowid=?)\n`--USE TEMP B-TREE FOR ORDER BY\n"
+        },
+        {
+          "name": "surface_single_coordinate_edit",
+          "median_ms": 18.391223,
+          "min_ms": 18.106629,
+          "max_ms": 21.720074,
+          "samples_ms": [
+            21.720074,
+            18.391223,
+            18.106629
+          ],
+          "warmup": true,
+          "mean_ms": 19.405975333333334
+        }
+      ],
+      "module": "/home/sean/villa/volume-cartographer/build/python/vc/objects.cpython-314-aarch64-linux-gnu.so",
+      "peak_rss_bytes": 144498688
+    },
+    {
+      "scenario": "spatial",
+      "n": 2049,
+      "results": [
+        {
+          "name": "initial_geometry_publication",
+          "elapsed_ms": 202.17782,
+          "payload_bytes": 50380812,
+          "shape": [
+            2049,
+            2049,
+            3
+          ]
+        },
+        {
+          "name": "viewport_working_set",
+          "candidate_regions": 1,
+          "returned_bytes": 13068,
+          "chunks_touched": 1,
+          "chunk_bytes_to_verify": 196608
+        },
+        {
+          "name": "spatial_regions_query",
+          "median_ms": 0.003536,
+          "min_ms": 0.00312,
+          "max_ms": 0.005776,
+          "samples_ms": [
+            0.005776,
+            0.003536,
+            0.00312
+          ],
+          "warmup": true,
+          "mean_ms": 0.004144
+        },
+        {
+          "name": "whole_object_query",
+          "median_ms": 0.016992,
+          "min_ms": 0.015232,
+          "max_ms": 0.022656,
+          "samples_ms": [
+            0.022656,
+            0.016992,
+            0.015232
+          ],
+          "warmup": true,
+          "mean_ms": 0.01829333333333333
+        },
+        {
+          "name": "whole_object_query_and_load_then_slice",
+          "median_ms": 68.369391,
+          "min_ms": 65.558672,
+          "max_ms": 68.4772,
+          "samples_ms": [
+            65.558672,
+            68.369391,
+            68.4772
+          ],
+          "warmup": true,
+          "mean_ms": 67.46842099999999
+        },
+        {
+          "name": "region_query_and_load_slice",
+          "median_ms": 0.01096,
+          "min_ms": 0.009648,
+          "max_ms": 0.017505,
+          "samples_ms": [
+            0.017505,
+            0.01096,
+            0.009648
+          ],
+          "warmup": true,
+          "mean_ms": 0.012704333333333333
+        },
+        {
+          "name": "region_query_and_load_rectangle",
+          "median_ms": 0.007136,
+          "min_ms": 0.006864,
+          "max_ms": 0.008128,
+          "samples_ms": [
+            0.008128,
+            0.007136,
+            0.006864
+          ],
+          "warmup": true,
+          "mean_ms": 0.007376000000000001
+        },
+        {
+          "name": "region_query_reject_empty_space_in_object_aabb",
+          "median_ms": 0.003008,
+          "min_ms": 0.002576,
+          "max_ms": 0.0108,
+          "samples_ms": [
+            0.003008,
+            0.0108,
+            0.002576
+          ],
+          "warmup": true,
+          "mean_ms": 0.005461333333333333
+        },
+        {
+          "name": "index_storage",
+          "regions": 4096,
+          "database_bytes": 51417088,
+          "index_bytes": 602112
+        },
+        {
+          "name": "spatial_region_query_plan",
+          "plan": "QUERY PLAN\n|--SCAN r VIRTUAL TABLE INDEX 2:D1B0D3B2D5B4\n|--SEARCH b USING INTEGER PRIMARY KEY (rowid=?)\n|--SEARCH o USING INTEGER PRIMARY KEY (rowid=?)\n|--SEARCH h USING INTEGER PRIMARY KEY (rowid=?)\n`--USE TEMP B-TREE FOR ORDER BY\n"
+        },
+        {
+          "name": "surface_single_coordinate_edit",
+          "median_ms": 120.845189,
+          "min_ms": 116.873711,
+          "max_ms": 121.505833,
+          "samples_ms": [
+            120.845189,
+            121.505833,
+            116.873711
+          ],
+          "warmup": true,
+          "mean_ms": 119.74157766666667
+        }
+      ],
+      "module": "/home/sean/villa/volume-cartographer/build/python/vc/objects.cpython-314-aarch64-linux-gnu.so",
+      "peak_rss_bytes": 285540352
+    },
+    {
+      "scenario": "spatial_wide",
+      "n": 65537,
+      "results": [
+        {
+          "name": "initial_geometry_publication",
+          "elapsed_ms": 193.665966,
+          "payload_bytes": 51118860,
+          "shape": [
+            65,
+            65537,
+            3
+          ]
+        },
+        {
+          "name": "viewport_working_set",
+          "candidate_regions": 1,
+          "returned_bytes": 13068,
+          "chunks_touched": 1,
+          "chunk_bytes_to_verify": 99840
+        },
+        {
+          "name": "spatial_regions_query",
+          "median_ms": 0.003552,
+          "min_ms": 0.00312,
+          "max_ms": 0.00472,
+          "samples_ms": [
+            0.00472,
+            0.003552,
+            0.00312
+          ],
+          "warmup": true,
+          "mean_ms": 0.003797333333333333
+        },
+        {
+          "name": "whole_object_query",
+          "median_ms": 0.016432,
+          "min_ms": 0.015248,
+          "max_ms": 0.020928,
+          "samples_ms": [
+            0.020928,
+            0.016432,
+            0.015248
+          ],
+          "warmup": true,
+          "mean_ms": 0.017536
+        },
+        {
+          "name": "whole_object_query_and_load_then_slice",
+          "median_ms": 76.385324,
+          "min_ms": 76.223516,
+          "max_ms": 76.98192,
+          "samples_ms": [
+            76.98192,
+            76.385324,
+            76.223516
+          ],
+          "warmup": true,
+          "mean_ms": 76.53025333333333
+        },
+        {
+          "name": "region_query_and_load_slice",
+          "median_ms": 0.011184,
+          "min_ms": 0.011008,
+          "max_ms": 0.017312,
+          "samples_ms": [
+            0.017312,
+            0.011184,
+            0.011008
+          ],
+          "warmup": true,
+          "mean_ms": 0.013168
+        },
+        {
+          "name": "region_query_and_load_rectangle",
+          "median_ms": 0.007616,
+          "min_ms": 0.007265,
+          "max_ms": 0.008736,
+          "samples_ms": [
+            0.008736,
+            0.007616,
+            0.007265
+          ],
+          "warmup": true,
+          "mean_ms": 0.007872333333333334
+        },
+        {
+          "name": "region_query_reject_empty_space_in_object_aabb",
+          "median_ms": 0.002688,
+          "min_ms": 0.002561,
+          "max_ms": 0.003152,
+          "samples_ms": [
+            0.003152,
+            0.002688,
+            0.002561
+          ],
+          "warmup": true,
+          "mean_ms": 0.002800333333333333
+        },
+        {
+          "name": "index_storage",
+          "regions": 4096,
+          "database_bytes": 52396032,
+          "index_bytes": 659456
+        },
+        {
+          "name": "spatial_region_query_plan",
+          "plan": "QUERY PLAN\n|--SCAN r VIRTUAL TABLE INDEX 2:D1B0D3B2D5B4\n|--SEARCH b USING INTEGER PRIMARY KEY (rowid=?)\n|--SEARCH o USING INTEGER PRIMARY KEY (rowid=?)\n|--SEARCH h USING INTEGER PRIMARY KEY (rowid=?)\n`--USE TEMP B-TREE FOR ORDER BY\n"
+        },
+        {
+          "name": "surface_single_coordinate_edit",
+          "median_ms": 123.155267,
+          "min_ms": 120.483108,
+          "max_ms": 132.148758,
+          "samples_ms": [
+            123.155267,
+            120.483108,
+            132.148758
+          ],
+          "warmup": true,
+          "mean_ms": 125.26237766666667
+        }
+      ],
+      "module": "/home/sean/villa/volume-cartographer/build/python/vc/objects.cpython-314-aarch64-linux-gnu.so",
+      "peak_rss_bytes": 302821376
+    }
+  ],
+  "build": [
+    "CMAKE_BUILD_TYPE:STRING=RelWithDebInfo",
+    "CMAKE_CXX_COMPILER:FILEPATH=/usr/bin/c++",
+    "CMAKE_CXX_FLAGS_RELWITHDEBINFO:STRING=-O2 -g -DNDEBUG"
+  ]
+}

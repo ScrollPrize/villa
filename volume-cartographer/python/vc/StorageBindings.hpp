@@ -253,14 +253,14 @@ vo::ObjectRecord objectFromPy(const nb::dict& d)
     return r;
 }
 
-nb::dict edgeToPy(const vo::EdgeRecord& e)
+nb::dict edgeToPy(const vo::EdgeRecord& e, const std::set<std::string>* fields = nullptr)
 {
     nb::dict d;
-    commonToPy(d, e);
+    commonToPy(d, e, fields);
     d["a"] = e.aUuid;
     d["b"] = e.bUuid;
-    d["a_anchor"] = anchorToPy(e.aAnchor);
-    d["b_anchor"] = anchorToPy(e.bAnchor);
+    if (!fields || fields->contains("a_anchor")) d["a_anchor"] = anchorToPy(e.aAnchor);
+    if (!fields || fields->contains("b_anchor")) d["b_anchor"] = anchorToPy(e.bAnchor);
     return d;
 }
 

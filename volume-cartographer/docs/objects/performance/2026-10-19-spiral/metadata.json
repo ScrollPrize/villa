@@ -1,0 +1,1451 @@
+{
+  "platform": "Linux-6.14.0-1015-nvidia-aarch64-with-glibc2.39",
+  "python": "3.14.0 (main, Oct 14 2025, 21:26:03) [Clang 20.1.4 ]",
+  "python_sqlite": "3.50.4",
+  "git_revision": "fee3f2a7b9195bb0b90436bdd174b292eb76401f",
+  "benchmark_sha256": "3189ae26b05751ebbd1420b9df54a668065085d53ad3e5572dbbb9df3d02d04a",
+  "cpu_affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19
+  ],
+  "build": [
+    "CMAKE_BUILD_TYPE:STRING=RelWithDebInfo",
+    "CMAKE_CXX_COMPILER:FILEPATH=/usr/bin/c++",
+    "CMAKE_CXX_FLAGS_RELWITHDEBINFO:STRING=-O2 -g -DNDEBUG",
+    "VC_MARCH_NATIVE:BOOL=OFF"
+  ],
+  "compiler": "c++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+  "scenarios": [
+    {
+      "n": 1000,
+      "edges": 2001,
+      "payload_bytes": 256,
+      "module": "/home/sean/villa/volume-cartographer/build/python/vc/objects.cpython-314-aarch64-linux-gnu.so",
+      "results": [
+        {
+          "name": "crossings_bulk_records",
+          "median_ms": 6.648419,
+          "min_ms": 6.283376,
+          "max_ms": 6.650867,
+          "samples_ms": [
+            6.648419,
+            6.650867,
+            6.283376
+          ],
+          "warmup": true,
+          "mean_ms": 6.527553999999999
+        },
+        {
+          "name": "rare_edge_kind",
+          "median_ms": 0.012912,
+          "min_ms": 0.012544,
+          "max_ms": 0.015856,
+          "samples_ms": [
+            0.015856,
+            0.012912,
+            0.012544
+          ],
+          "warmup": true,
+          "mean_ms": 0.013770666666666665
+        },
+        {
+          "name": "approved_crossing_page_100",
+          "median_ms": 6.391792,
+          "min_ms": 6.22267,
+          "max_ms": 6.512194,
+          "samples_ms": [
+            6.512194,
+            6.391792,
+            6.22267
+          ],
+          "warmup": true,
+          "mean_ms": 6.375552
+        },
+        {
+          "name": "approved_crossing_page_100_sql_projected",
+          "median_ms": 0.346436,
+          "min_ms": 0.339828,
+          "max_ms": 0.350947,
+          "samples_ms": [
+            0.350947,
+            0.346436,
+            0.339828
+          ],
+          "warmup": true,
+          "mean_ms": 0.345737
+        },
+        {
+          "name": "patch_incident_records",
+          "median_ms": 5.337558,
+          "min_ms": 5.289654,
+          "max_ms": 5.37015,
+          "samples_ms": [
+            5.289654,
+            5.337558,
+            5.37015
+          ],
+          "warmup": true,
+          "mean_ms": 5.332453999999999
+        },
+        {
+          "name": "track_incident_records",
+          "median_ms": 0.026688,
+          "min_ms": 0.026417,
+          "max_ms": 0.035168,
+          "samples_ms": [
+            0.035168,
+            0.026688,
+            0.026417
+          ],
+          "warmup": true,
+          "mean_ms": 0.029424333333333334
+        },
+        {
+          "name": "track_crossing_records_scoped",
+          "median_ms": 0.026001,
+          "min_ms": 0.0252,
+          "max_ms": 0.028896,
+          "samples_ms": [
+            0.028896,
+            0.026001,
+            0.0252
+          ],
+          "warmup": true,
+          "mean_ms": 0.026699
+        },
+        {
+          "name": "patch_filtered_neighbours_absent_kind",
+          "median_ms": 0.00608,
+          "min_ms": 0.005872,
+          "max_ms": 0.006721,
+          "samples_ms": [
+            0.006721,
+            0.00608,
+            0.005872
+          ],
+          "warmup": true,
+          "mean_ms": 0.0062243333333333335
+        },
+        {
+          "name": "family_length_page_fields_None",
+          "median_ms": 5.94014,
+          "min_ms": 5.504296,
+          "max_ms": 6.098349,
+          "samples_ms": [
+            5.94014,
+            6.098349,
+            5.504296
+          ],
+          "warmup": true,
+          "mean_ms": 5.847595
+        },
+        {
+          "name": "family_length_page_fields_['name', 'track']",
+          "median_ms": 2.775804,
+          "min_ms": 2.766892,
+          "max_ms": 2.777436,
+          "samples_ms": [
+            2.777436,
+            2.775804,
+            2.766892
+          ],
+          "warmup": true,
+          "mean_ms": 2.7733773333333334
+        },
+        {
+          "name": "family_length_page_sql_projected",
+          "median_ms": 0.625926,
+          "min_ms": 0.623879,
+          "max_ms": 0.627814,
+          "samples_ms": [
+            0.627814,
+            0.625926,
+            0.623879
+          ],
+          "warmup": true,
+          "mean_ms": 0.625873
+        },
+        {
+          "name": "1000_crossing_neighbour_queries",
+          "median_ms": 7.679166,
+          "min_ms": 7.659229,
+          "max_ms": 7.680446,
+          "samples_ms": [
+            7.679166,
+            7.680446,
+            7.659229
+          ],
+          "warmup": true,
+          "mean_ms": 7.672947
+        },
+        {
+          "name": "1000_resident_adjacency_copies_lower_bound",
+          "median_ms": 0.038768,
+          "min_ms": 0.038673,
+          "max_ms": 0.038848,
+          "samples_ms": [
+            0.038768,
+            0.038673,
+            0.038848
+          ],
+          "warmup": true,
+          "mean_ms": 0.038763
+        },
+        {
+          "name": "store_graph_read_view",
+          "median_ms": 1.633744,
+          "min_ms": 1.621376,
+          "max_ms": 1.873299,
+          "samples_ms": [
+            1.873299,
+            1.633744,
+            1.621376
+          ],
+          "warmup": true,
+          "mean_ms": 1.709473
+        },
+        {
+          "name": "1000_store_graph_neighbour_views",
+          "median_ms": 0.233106,
+          "min_ms": 0.23245,
+          "max_ms": 0.237906,
+          "samples_ms": [
+            0.237906,
+            0.23245,
+            0.233106
+          ],
+          "warmup": true,
+          "mean_ms": 0.23448733333333333
+        },
+        {
+          "name": "object_200_metadata_updates_batch_1",
+          "median_ms": 242.52923,
+          "min_ms": 237.854846,
+          "max_ms": 246.545302,
+          "samples_ms": [
+            242.52923,
+            237.854846,
+            246.545302
+          ],
+          "warmup": true,
+          "mean_ms": 242.30979266666668
+        },
+        {
+          "name": "object_200_metadata_updates_batch_200",
+          "median_ms": 4.913233,
+          "min_ms": 4.754976,
+          "max_ms": 5.674682,
+          "samples_ms": [
+            4.754976,
+            4.913233,
+            5.674682
+          ],
+          "warmup": true,
+          "mean_ms": 5.114297
+        },
+        {
+          "name": "object_identical_metadata_write",
+          "median_ms": 0.009312,
+          "min_ms": 0.00904,
+          "max_ms": 0.012032,
+          "samples_ms": [
+            0.012032,
+            0.009312,
+            0.00904
+          ],
+          "warmup": true,
+          "mean_ms": 0.010128
+        },
+        {
+          "name": "object_identical_write_effects",
+          "generation_delta": 0,
+          "journal_entries": 0,
+          "writes": 4,
+          "approval_before": "approved",
+          "approval_after": "approved"
+        },
+        {
+          "name": "edge_200_metadata_updates_batch_1",
+          "median_ms": 252.781699,
+          "min_ms": 248.739627,
+          "max_ms": 268.372225,
+          "samples_ms": [
+            248.739627,
+            268.372225,
+            252.781699
+          ],
+          "warmup": true,
+          "mean_ms": 256.6311836666667
+        },
+        {
+          "name": "edge_200_metadata_updates_batch_200",
+          "median_ms": 8.932282,
+          "min_ms": 8.929066,
+          "max_ms": 9.528512,
+          "samples_ms": [
+            9.528512,
+            8.932282,
+            8.929066
+          ],
+          "warmup": true,
+          "mean_ms": 9.129953333333333
+        },
+        {
+          "name": "edge_identical_metadata_write",
+          "median_ms": 0.028256,
+          "min_ms": 0.024225,
+          "max_ms": 0.029168,
+          "samples_ms": [
+            0.028256,
+            0.024225,
+            0.029168
+          ],
+          "warmup": true,
+          "mean_ms": 0.027216333333333332
+        },
+        {
+          "name": "edge_identical_write_effects",
+          "generation_delta": 0,
+          "journal_entries": 0,
+          "writes": 4,
+          "approval_before": "approved",
+          "approval_after": "approved"
+        },
+        {
+          "name": "review_page_python_profile",
+          "top_cumulative": [
+            {
+              "function": "('/home/sean/villa/volume-cartographer/scripts/benchmark_object_store_metadata.py', 101, 'reviewed_page')",
+              "calls": 1,
+              "self_seconds": 0.009376627,
+              "cumulative_seconds": 0.014613876000000001
+            },
+            {
+              "function": "('/home/sean/.local/share/uv/python/cpython-3.14.0-linux-aarch64-gnu/lib/python3.14/json/__init__.py', 299, 'loads')",
+              "calls": 1000,
+              "self_seconds": 0.0007274930000000001,
+              "cumulative_seconds": 0.005237249
+            },
+            {
+              "function": "('/home/sean/.local/share/uv/python/cpython-3.14.0-linux-aarch64-gnu/lib/python3.14/json/decoder.py', 340, 'decode')",
+              "calls": 1000,
+              "self_seconds": 0.0014238520000000002,
+              "cumulative_seconds": 0.004285498
+            },
+            {
+              "function": "('/home/sean/.local/share/uv/python/cpython-3.14.0-linux-aarch64-gnu/lib/python3.14/json/decoder.py', 351, 'raw_decode')",
+              "calls": 1000,
+              "self_seconds": 0.001871124,
+              "cumulative_seconds": 0.001871124
+            },
+            {
+              "function": "('~', 0, \"<method 'match' of 're.Pattern' objects>\")",
+              "calls": 2000,
+              "self_seconds": 0.000648233,
+              "cumulative_seconds": 0.000648233
+            },
+            {
+              "function": "('~', 0, \"<method 'end' of 're.Match' objects>\")",
+              "calls": 2000,
+              "self_seconds": 0.00024168,
+              "cumulative_seconds": 0.00024168
+            },
+            {
+              "function": "('~', 0, \"<method 'startswith' of 'str' objects>\")",
+              "calls": 1000,
+              "self_seconds": 0.000121954,
+              "cumulative_seconds": 0.000121954
+            },
+            {
+              "function": "('~', 0, '<built-in method builtins.isinstance>')",
+              "calls": 1000,
+              "self_seconds": 0.000102304,
+              "cumulative_seconds": 0.000102304
+            }
+          ]
+        },
+        {
+          "name": "store_bytes",
+          "bytes": 3055616
+        },
+        {
+          "name": "sql_rare_edge_ids_index_False_lower_bound",
+          "median_ms": 0.00336,
+          "min_ms": 0.003312,
+          "max_ms": 0.00424,
+          "samples_ms": [
+            0.00424,
+            0.003904,
+            0.00336,
+            0.003312,
+            0.003344
+          ],
+          "warmup": true,
+          "plan": [
+            [
+              3,
+              0,
+              53,
+              "SEARCH edges USING COVERING INDEX edges_kind_id (kind=?)"
+            ]
+          ],
+          "mean_ms": 0.003632
+        },
+        {
+          "name": "sql_approved_crossing_page_index_False_lower_bound",
+          "median_ms": 0.498789,
+          "min_ms": 0.493845,
+          "max_ms": 0.510037,
+          "samples_ms": [
+            0.510037,
+            0.506069,
+            0.498789,
+            0.497781,
+            0.493845
+          ],
+          "warmup": true,
+          "plan": [
+            [
+              7,
+              0,
+              61,
+              "SEARCH e USING INDEX edges_kind_id (kind=?)"
+            ],
+            [
+              14,
+              0,
+              45,
+              "SEARCH a USING INTEGER PRIMARY KEY (rowid=?)"
+            ],
+            [
+              17,
+              0,
+              45,
+              "SEARCH b USING INTEGER PRIMARY KEY (rowid=?)"
+            ]
+          ],
+          "mean_ms": 0.5013042
+        },
+        {
+          "name": "sql_rare_edge_ids_index_True_lower_bound",
+          "median_ms": 0.00256,
+          "min_ms": 0.002496,
+          "max_ms": 0.002832,
+          "samples_ms": [
+            0.002832,
+            0.002544,
+            0.00256,
+            0.002496,
+            0.00256
+          ],
+          "warmup": true,
+          "plan": [
+            [
+              3,
+              0,
+              53,
+              "SEARCH edges USING COVERING INDEX edges_kind_id (kind=?)"
+            ]
+          ],
+          "mean_ms": 0.0025984
+        },
+        {
+          "name": "sql_approved_crossing_page_index_True_lower_bound",
+          "median_ms": 0.151122,
+          "min_ms": 0.150945,
+          "max_ms": 0.157314,
+          "samples_ms": [
+            0.154977,
+            0.157314,
+            0.151122,
+            0.150945,
+            0.151074
+          ],
+          "warmup": true,
+          "plan": [
+            [
+              7,
+              0,
+              61,
+              "SEARCH e USING INDEX benchmark_kind_approval (kind=? AND approval_state=?)"
+            ],
+            [
+              13,
+              0,
+              45,
+              "SEARCH a USING INTEGER PRIMARY KEY (rowid=?)"
+            ],
+            [
+              16,
+              0,
+              45,
+              "SEARCH b USING INTEGER PRIMARY KEY (rowid=?)"
+            ]
+          ],
+          "mean_ms": 0.1530864
+        }
+      ],
+      "peak_rss_bytes": 102232064
+    },
+    {
+      "n": 10000,
+      "edges": 20001,
+      "payload_bytes": 256,
+      "module": "/home/sean/villa/volume-cartographer/build/python/vc/objects.cpython-314-aarch64-linux-gnu.so",
+      "results": [
+        {
+          "name": "crossings_bulk_records",
+          "median_ms": 81.858232,
+          "min_ms": 81.61887,
+          "max_ms": 89.706007,
+          "samples_ms": [
+            89.706007,
+            81.61887,
+            81.858232
+          ],
+          "warmup": true,
+          "mean_ms": 84.39436966666666
+        },
+        {
+          "name": "rare_edge_kind",
+          "median_ms": 0.01368,
+          "min_ms": 0.012592,
+          "max_ms": 0.017616,
+          "samples_ms": [
+            0.017616,
+            0.01368,
+            0.012592
+          ],
+          "warmup": true,
+          "mean_ms": 0.014629333333333333
+        },
+        {
+          "name": "approved_crossing_page_100",
+          "median_ms": 89.858697,
+          "min_ms": 89.310212,
+          "max_ms": 90.188476,
+          "samples_ms": [
+            90.188476,
+            89.858697,
+            89.310212
+          ],
+          "warmup": true,
+          "mean_ms": 89.78579500000001
+        },
+        {
+          "name": "approved_crossing_page_100_sql_projected",
+          "median_ms": 0.37466,
+          "min_ms": 0.364835,
+          "max_ms": 0.407076,
+          "samples_ms": [
+            0.407076,
+            0.37466,
+            0.364835
+          ],
+          "warmup": true,
+          "mean_ms": 0.38219033333333335
+        },
+        {
+          "name": "patch_incident_records",
+          "median_ms": 67.9399,
+          "min_ms": 67.552568,
+          "max_ms": 68.532834,
+          "samples_ms": [
+            68.532834,
+            67.9399,
+            67.552568
+          ],
+          "warmup": true,
+          "mean_ms": 68.008434
+        },
+        {
+          "name": "track_incident_records",
+          "median_ms": 0.028784,
+          "min_ms": 0.028289,
+          "max_ms": 0.034528,
+          "samples_ms": [
+            0.034528,
+            0.028784,
+            0.028289
+          ],
+          "warmup": true,
+          "mean_ms": 0.030533666666666667
+        },
+        {
+          "name": "track_crossing_records_scoped",
+          "median_ms": 0.02744,
+          "min_ms": 0.026704,
+          "max_ms": 0.030289,
+          "samples_ms": [
+            0.030289,
+            0.02744,
+            0.026704
+          ],
+          "warmup": true,
+          "mean_ms": 0.028144333333333334
+        },
+        {
+          "name": "patch_filtered_neighbours_absent_kind",
+          "median_ms": 0.006272,
+          "min_ms": 0.006144,
+          "max_ms": 0.007104,
+          "samples_ms": [
+            0.007104,
+            0.006272,
+            0.006144
+          ],
+          "warmup": true,
+          "mean_ms": 0.006506666666666667
+        },
+        {
+          "name": "family_length_page_fields_None",
+          "median_ms": 75.367799,
+          "min_ms": 74.344636,
+          "max_ms": 76.526786,
+          "samples_ms": [
+            76.526786,
+            74.344636,
+            75.367799
+          ],
+          "warmup": true,
+          "mean_ms": 75.41307366666666
+        },
+        {
+          "name": "family_length_page_fields_['name', 'track']",
+          "median_ms": 33.335391,
+          "min_ms": 32.855066,
+          "max_ms": 33.632306,
+          "samples_ms": [
+            33.335391,
+            32.855066,
+            33.632306
+          ],
+          "warmup": true,
+          "mean_ms": 33.27425433333333
+        },
+        {
+          "name": "family_length_page_sql_projected",
+          "median_ms": 0.651623,
+          "min_ms": 0.634215,
+          "max_ms": 0.691863,
+          "samples_ms": [
+            0.651623,
+            0.691863,
+            0.634215
+          ],
+          "warmup": true,
+          "mean_ms": 0.6592336666666666
+        },
+        {
+          "name": "1000_crossing_neighbour_queries",
+          "median_ms": 7.89216,
+          "min_ms": 7.860223,
+          "max_ms": 7.938832,
+          "samples_ms": [
+            7.938832,
+            7.89216,
+            7.860223
+          ],
+          "warmup": true,
+          "mean_ms": 7.897071666666666
+        },
+        {
+          "name": "1000_resident_adjacency_copies_lower_bound",
+          "median_ms": 0.035153,
+          "min_ms": 0.035136,
+          "max_ms": 0.036177,
+          "samples_ms": [
+            0.036177,
+            0.035136,
+            0.035153
+          ],
+          "warmup": true,
+          "mean_ms": 0.03548866666666667
+        },
+        {
+          "name": "store_graph_read_view",
+          "median_ms": 26.002438,
+          "min_ms": 25.730499,
+          "max_ms": 26.423242,
+          "samples_ms": [
+            26.002438,
+            25.730499,
+            26.423242
+          ],
+          "warmup": true,
+          "mean_ms": 26.052059666666665
+        },
+        {
+          "name": "1000_store_graph_neighbour_views",
+          "median_ms": 0.239635,
+          "min_ms": 0.227442,
+          "max_ms": 0.239938,
+          "samples_ms": [
+            0.239938,
+            0.239635,
+            0.227442
+          ],
+          "warmup": true,
+          "mean_ms": 0.23567166666666667
+        },
+        {
+          "name": "object_200_metadata_updates_batch_1",
+          "median_ms": 252.16201,
+          "min_ms": 240.708454,
+          "max_ms": 256.512646,
+          "samples_ms": [
+            240.708454,
+            252.16201,
+            256.512646
+          ],
+          "warmup": true,
+          "mean_ms": 249.79437000000001
+        },
+        {
+          "name": "object_200_metadata_updates_batch_200",
+          "median_ms": 8.277395,
+          "min_ms": 8.225907,
+          "max_ms": 9.18374,
+          "samples_ms": [
+            8.225907,
+            9.18374,
+            8.277395
+          ],
+          "warmup": true,
+          "mean_ms": 8.562347333333333
+        },
+        {
+          "name": "object_identical_metadata_write",
+          "median_ms": 0.010064,
+          "min_ms": 0.009392,
+          "max_ms": 0.015744,
+          "samples_ms": [
+            0.015744,
+            0.010064,
+            0.009392
+          ],
+          "warmup": true,
+          "mean_ms": 0.011733333333333333
+        },
+        {
+          "name": "object_identical_write_effects",
+          "generation_delta": 0,
+          "journal_entries": 0,
+          "writes": 4,
+          "approval_before": "approved",
+          "approval_after": "approved"
+        },
+        {
+          "name": "edge_200_metadata_updates_batch_1",
+          "median_ms": 248.481236,
+          "min_ms": 246.425231,
+          "max_ms": 253.975739,
+          "samples_ms": [
+            246.425231,
+            253.975739,
+            248.481236
+          ],
+          "warmup": true,
+          "mean_ms": 249.627402
+        },
+        {
+          "name": "edge_200_metadata_updates_batch_200",
+          "median_ms": 9.501423,
+          "min_ms": 9.401103,
+          "max_ms": 10.021749,
+          "samples_ms": [
+            9.401103,
+            10.021749,
+            9.501423
+          ],
+          "warmup": true,
+          "mean_ms": 9.641425
+        },
+        {
+          "name": "edge_identical_metadata_write",
+          "median_ms": 0.012032,
+          "min_ms": 0.011328,
+          "max_ms": 0.017776,
+          "samples_ms": [
+            0.017776,
+            0.012032,
+            0.011328
+          ],
+          "warmup": true,
+          "mean_ms": 0.013712
+        },
+        {
+          "name": "edge_identical_write_effects",
+          "generation_delta": 0,
+          "journal_entries": 0,
+          "writes": 4,
+          "approval_before": "approved",
+          "approval_after": "approved"
+        },
+        {
+          "name": "review_page_python_profile",
+          "top_cumulative": [
+            {
+              "function": "('/home/sean/villa/volume-cartographer/scripts/benchmark_object_store_metadata.py', 101, 'reviewed_page')",
+              "calls": 1,
+              "self_seconds": 0.073271847,
+              "cumulative_seconds": 0.11263150100000001
+            },
+            {
+              "function": "('/home/sean/.local/share/uv/python/cpython-3.14.0-linux-aarch64-gnu/lib/python3.14/json/__init__.py', 299, 'loads')",
+              "calls": 10000,
+              "self_seconds": 0.0045690520000000005,
+              "cumulative_seconds": 0.039359654
+            },
+            {
+              "function": "('/home/sean/.local/share/uv/python/cpython-3.14.0-linux-aarch64-gnu/lib/python3.14/json/decoder.py', 340, 'decode')",
+              "calls": 10000,
+              "self_seconds": 0.016500112,
+              "cumulative_seconds": 0.033390303
+            },
+            {
+              "function": "('/home/sean/.local/share/uv/python/cpython-3.14.0-linux-aarch64-gnu/lib/python3.14/json/decoder.py', 351, 'raw_decode')",
+              "calls": 10000,
+              "self_seconds": 0.010177969,
+              "cumulative_seconds": 0.010177969
+            },
+            {
+              "function": "('~', 0, \"<method 'match' of 're.Pattern' objects>\")",
+              "calls": 20000,
+              "self_seconds": 0.0044662370000000005,
+              "cumulative_seconds": 0.0044662370000000005
+            },
+            {
+              "function": "('~', 0, \"<method 'end' of 're.Match' objects>\")",
+              "calls": 20000,
+              "self_seconds": 0.001567678,
+              "cumulative_seconds": 0.001567678
+            },
+            {
+              "function": "('~', 0, \"<method 'startswith' of 'str' objects>\")",
+              "calls": 10000,
+              "self_seconds": 0.000742087,
+              "cumulative_seconds": 0.000742087
+            },
+            {
+              "function": "('~', 0, '<built-in method builtins.len>')",
+              "calls": 10000,
+              "self_seconds": 0.0006783070000000001,
+              "cumulative_seconds": 0.0006783070000000001
+            }
+          ]
+        },
+        {
+          "name": "store_bytes",
+          "bytes": 24997888
+        },
+        {
+          "name": "sql_rare_edge_ids_index_False_lower_bound",
+          "median_ms": 0.003456,
+          "min_ms": 0.003248,
+          "max_ms": 0.004337,
+          "samples_ms": [
+            0.004337,
+            0.003856,
+            0.003456,
+            0.003328,
+            0.003248
+          ],
+          "warmup": true,
+          "plan": [
+            [
+              3,
+              0,
+              53,
+              "SEARCH edges USING COVERING INDEX edges_kind_id (kind=?)"
+            ]
+          ],
+          "mean_ms": 0.003645
+        },
+        {
+          "name": "sql_approved_crossing_page_index_False_lower_bound",
+          "median_ms": 0.590326,
+          "min_ms": 0.585046,
+          "max_ms": 0.606934,
+          "samples_ms": [
+            0.599846,
+            0.606934,
+            0.587974,
+            0.590326,
+            0.585046
+          ],
+          "warmup": true,
+          "plan": [
+            [
+              7,
+              0,
+              61,
+              "SEARCH e USING INDEX edges_kind_id (kind=?)"
+            ],
+            [
+              14,
+              0,
+              45,
+              "SEARCH a USING INTEGER PRIMARY KEY (rowid=?)"
+            ],
+            [
+              17,
+              0,
+              45,
+              "SEARCH b USING INTEGER PRIMARY KEY (rowid=?)"
+            ]
+          ],
+          "mean_ms": 0.5940252
+        },
+        {
+          "name": "sql_rare_edge_ids_index_True_lower_bound",
+          "median_ms": 0.002736,
+          "min_ms": 0.002464,
+          "max_ms": 0.003136,
+          "samples_ms": [
+            0.003136,
+            0.002736,
+            0.002464,
+            0.002544,
+            0.002784
+          ],
+          "warmup": true,
+          "plan": [
+            [
+              3,
+              0,
+              53,
+              "SEARCH edges USING COVERING INDEX edges_kind_id (kind=?)"
+            ]
+          ],
+          "mean_ms": 0.0027328
+        },
+        {
+          "name": "sql_approved_crossing_page_index_True_lower_bound",
+          "median_ms": 0.176082,
+          "min_ms": 0.172226,
+          "max_ms": 0.181794,
+          "samples_ms": [
+            0.18045,
+            0.176082,
+            0.173425,
+            0.181794,
+            0.172226
+          ],
+          "warmup": true,
+          "plan": [
+            [
+              7,
+              0,
+              61,
+              "SEARCH e USING INDEX benchmark_kind_approval (kind=? AND approval_state=?)"
+            ],
+            [
+              13,
+              0,
+              45,
+              "SEARCH a USING INTEGER PRIMARY KEY (rowid=?)"
+            ],
+            [
+              16,
+              0,
+              45,
+              "SEARCH b USING INTEGER PRIMARY KEY (rowid=?)"
+            ]
+          ],
+          "mean_ms": 0.1767954
+        }
+      ],
+      "peak_rss_bytes": 205148160
+    },
+    {
+      "n": 50000,
+      "edges": 100001,
+      "payload_bytes": 256,
+      "module": "/home/sean/villa/volume-cartographer/build/python/vc/objects.cpython-314-aarch64-linux-gnu.so",
+      "results": [
+        {
+          "name": "crossings_bulk_records",
+          "median_ms": 484.199337,
+          "min_ms": 478.754099,
+          "max_ms": 484.452605,
+          "samples_ms": [
+            484.452605,
+            478.754099,
+            484.199337
+          ],
+          "warmup": true,
+          "mean_ms": 482.46868033333334
+        },
+        {
+          "name": "rare_edge_kind",
+          "median_ms": 0.014704,
+          "min_ms": 0.013408,
+          "max_ms": 0.019952,
+          "samples_ms": [
+            0.019952,
+            0.014704,
+            0.013408
+          ],
+          "warmup": true,
+          "mean_ms": 0.016021333333333332
+        },
+        {
+          "name": "approved_crossing_page_100",
+          "median_ms": 529.518574,
+          "min_ms": 526.281068,
+          "max_ms": 529.552507,
+          "samples_ms": [
+            529.518574,
+            526.281068,
+            529.552507
+          ],
+          "warmup": true,
+          "mean_ms": 528.4507163333333
+        },
+        {
+          "name": "approved_crossing_page_100_sql_projected",
+          "median_ms": 0.407972,
+          "min_ms": 0.39298,
+          "max_ms": 0.436852,
+          "samples_ms": [
+            0.436852,
+            0.407972,
+            0.39298
+          ],
+          "warmup": true,
+          "mean_ms": 0.4126013333333333
+        },
+        {
+          "name": "patch_incident_records",
+          "median_ms": 380.516565,
+          "min_ms": 380.286977,
+          "max_ms": 381.902801,
+          "samples_ms": [
+            380.516565,
+            380.286977,
+            381.902801
+          ],
+          "warmup": true,
+          "mean_ms": 380.9021143333333
+        },
+        {
+          "name": "track_incident_records",
+          "median_ms": 0.029089,
+          "min_ms": 0.027488,
+          "max_ms": 0.03616,
+          "samples_ms": [
+            0.03616,
+            0.029089,
+            0.027488
+          ],
+          "warmup": true,
+          "mean_ms": 0.030912333333333333
+        },
+        {
+          "name": "track_crossing_records_scoped",
+          "median_ms": 0.028624,
+          "min_ms": 0.026257,
+          "max_ms": 0.032336,
+          "samples_ms": [
+            0.032336,
+            0.028624,
+            0.026257
+          ],
+          "warmup": true,
+          "mean_ms": 0.029072333333333332
+        },
+        {
+          "name": "patch_filtered_neighbours_absent_kind",
+          "median_ms": 0.0064,
+          "min_ms": 0.006096,
+          "max_ms": 0.007728,
+          "samples_ms": [
+            0.007728,
+            0.0064,
+            0.006096
+          ],
+          "warmup": true,
+          "mean_ms": 0.0067413333333333336
+        },
+        {
+          "name": "family_length_page_fields_None",
+          "median_ms": 494.474822,
+          "min_ms": 473.75583,
+          "max_ms": 497.652824,
+          "samples_ms": [
+            497.652824,
+            494.474822,
+            473.75583
+          ],
+          "warmup": true,
+          "mean_ms": 488.62782533333336
+        },
+        {
+          "name": "family_length_page_fields_['name', 'track']",
+          "median_ms": 228.467535,
+          "min_ms": 225.710499,
+          "max_ms": 228.595472,
+          "samples_ms": [
+            225.710499,
+            228.467535,
+            228.595472
+          ],
+          "warmup": true,
+          "mean_ms": 227.59116866666668
+        },
+        {
+          "name": "family_length_page_sql_projected",
+          "median_ms": 0.667479,
+          "min_ms": 0.655703,
+          "max_ms": 0.668567,
+          "samples_ms": [
+            0.668567,
+            0.667479,
+            0.655703
+          ],
+          "warmup": true,
+          "mean_ms": 0.6639163333333333
+        },
+        {
+          "name": "1000_crossing_neighbour_queries",
+          "median_ms": 8.067617,
+          "min_ms": 8.027681,
+          "max_ms": 8.132929,
+          "samples_ms": [
+            8.132929,
+            8.067617,
+            8.027681
+          ],
+          "warmup": true,
+          "mean_ms": 8.076075666666666
+        },
+        {
+          "name": "1000_resident_adjacency_copies_lower_bound",
+          "median_ms": 0.038784,
+          "min_ms": 0.037712,
+          "max_ms": 0.041601,
+          "samples_ms": [
+            0.041601,
+            0.038784,
+            0.037712
+          ],
+          "warmup": true,
+          "mean_ms": 0.03936566666666667
+        },
+        {
+          "name": "store_graph_read_view",
+          "median_ms": 145.628737,
+          "min_ms": 144.300995,
+          "max_ms": 145.810435,
+          "samples_ms": [
+            144.300995,
+            145.628737,
+            145.810435
+          ],
+          "warmup": true,
+          "mean_ms": 145.24672233333334
+        },
+        {
+          "name": "1000_store_graph_neighbour_views",
+          "median_ms": 0.226723,
+          "min_ms": 0.226467,
+          "max_ms": 0.24149,
+          "samples_ms": [
+            0.24149,
+            0.226467,
+            0.226723
+          ],
+          "warmup": true,
+          "mean_ms": 0.23156000000000002
+        },
+        {
+          "name": "object_200_metadata_updates_batch_1",
+          "median_ms": 235.968136,
+          "min_ms": 230.204942,
+          "max_ms": 243.066527,
+          "samples_ms": [
+            235.968136,
+            230.204942,
+            243.066527
+          ],
+          "warmup": true,
+          "mean_ms": 236.41320166666665
+        },
+        {
+          "name": "object_200_metadata_updates_batch_200",
+          "median_ms": 8.570758,
+          "min_ms": 8.323395,
+          "max_ms": 9.193532,
+          "samples_ms": [
+            8.323395,
+            9.193532,
+            8.570758
+          ],
+          "warmup": true,
+          "mean_ms": 8.695895
+        },
+        {
+          "name": "object_identical_metadata_write",
+          "median_ms": 0.01096,
+          "min_ms": 0.009728,
+          "max_ms": 0.017488,
+          "samples_ms": [
+            0.017488,
+            0.01096,
+            0.009728
+          ],
+          "warmup": true,
+          "mean_ms": 0.012725333333333333
+        },
+        {
+          "name": "object_identical_write_effects",
+          "generation_delta": 0,
+          "journal_entries": 0,
+          "writes": 4,
+          "approval_before": "approved",
+          "approval_after": "approved"
+        },
+        {
+          "name": "edge_200_metadata_updates_batch_1",
+          "median_ms": 233.129578,
+          "min_ms": 231.881502,
+          "max_ms": 248.84964,
+          "samples_ms": [
+            231.881502,
+            233.129578,
+            248.84964
+          ],
+          "warmup": true,
+          "mean_ms": 237.95357333333334
+        },
+        {
+          "name": "edge_200_metadata_updates_batch_200",
+          "median_ms": 10.156885,
+          "min_ms": 9.704737,
+          "max_ms": 10.669947,
+          "samples_ms": [
+            9.704737,
+            10.669947,
+            10.156885
+          ],
+          "warmup": true,
+          "mean_ms": 10.177189666666667
+        },
+        {
+          "name": "edge_identical_metadata_write",
+          "median_ms": 0.012944,
+          "min_ms": 0.011216,
+          "max_ms": 0.018736,
+          "samples_ms": [
+            0.018736,
+            0.012944,
+            0.011216
+          ],
+          "warmup": true,
+          "mean_ms": 0.014298666666666666
+        },
+        {
+          "name": "edge_identical_write_effects",
+          "generation_delta": 0,
+          "journal_entries": 0,
+          "writes": 4,
+          "approval_before": "approved",
+          "approval_after": "approved"
+        },
+        {
+          "name": "review_page_python_profile",
+          "top_cumulative": [
+            {
+              "function": "('/home/sean/villa/volume-cartographer/scripts/benchmark_object_store_metadata.py', 101, 'reviewed_page')",
+              "calls": 1,
+              "self_seconds": 0.39121026600000003,
+              "cumulative_seconds": 0.617109942
+            },
+            {
+              "function": "('/home/sean/.local/share/uv/python/cpython-3.14.0-linux-aarch64-gnu/lib/python3.14/json/__init__.py', 299, 'loads')",
+              "calls": 50000,
+              "self_seconds": 0.023482659000000003,
+              "cumulative_seconds": 0.22589967600000002
+            },
+            {
+              "function": "('/home/sean/.local/share/uv/python/cpython-3.14.0-linux-aarch64-gnu/lib/python3.14/json/decoder.py', 340, 'decode')",
+              "calls": 50000,
+              "self_seconds": 0.11044176800000001,
+              "cumulative_seconds": 0.19538470000000002
+            },
+            {
+              "function": "('/home/sean/.local/share/uv/python/cpython-3.14.0-linux-aarch64-gnu/lib/python3.14/json/decoder.py', 351, 'raw_decode')",
+              "calls": 50000,
+              "self_seconds": 0.054081245,
+              "cumulative_seconds": 0.054081245
+            },
+            {
+              "function": "('~', 0, \"<method 'match' of 're.Pattern' objects>\")",
+              "calls": 100000,
+              "self_seconds": 0.019498915000000002,
+              "cumulative_seconds": 0.019498915000000002
+            },
+            {
+              "function": "('~', 0, \"<method 'end' of 're.Match' objects>\")",
+              "calls": 100000,
+              "self_seconds": 0.007906439000000001,
+              "cumulative_seconds": 0.007906439000000001
+            },
+            {
+              "function": "('~', 0, \"<method 'startswith' of 'str' objects>\")",
+              "calls": 50000,
+              "self_seconds": 0.0037404520000000004,
+              "cumulative_seconds": 0.0037404520000000004
+            },
+            {
+              "function": "('~', 0, '<built-in method builtins.len>')",
+              "calls": 50000,
+              "self_seconds": 0.0034563330000000002,
+              "cumulative_seconds": 0.0034563330000000002
+            }
+          ]
+        },
+        {
+          "name": "store_bytes",
+          "bytes": 124407808
+        },
+        {
+          "name": "sql_rare_edge_ids_index_False_lower_bound",
+          "median_ms": 0.003552,
+          "min_ms": 0.003392,
+          "max_ms": 0.004448,
+          "samples_ms": [
+            0.004448,
+            0.004,
+            0.003552,
+            0.003408,
+            0.003392
+          ],
+          "warmup": true,
+          "plan": [
+            [
+              3,
+              0,
+              53,
+              "SEARCH edges USING COVERING INDEX edges_kind_id (kind=?)"
+            ]
+          ],
+          "mean_ms": 0.00376
+        },
+        {
+          "name": "sql_approved_crossing_page_index_False_lower_bound",
+          "median_ms": 0.611798,
+          "min_ms": 0.607702,
+          "max_ms": 0.614695,
+          "samples_ms": [
+            0.614695,
+            0.61383,
+            0.611798,
+            0.607702,
+            0.609254
+          ],
+          "warmup": true,
+          "plan": [
+            [
+              7,
+              0,
+              61,
+              "SEARCH e USING INDEX edges_kind_id (kind=?)"
+            ],
+            [
+              14,
+              0,
+              45,
+              "SEARCH a USING INTEGER PRIMARY KEY (rowid=?)"
+            ],
+            [
+              17,
+              0,
+              45,
+              "SEARCH b USING INTEGER PRIMARY KEY (rowid=?)"
+            ]
+          ],
+          "mean_ms": 0.6114558
+        },
+        {
+          "name": "sql_rare_edge_ids_index_True_lower_bound",
+          "median_ms": 0.003073,
+          "min_ms": 0.002736,
+          "max_ms": 0.003856,
+          "samples_ms": [
+            0.003856,
+            0.003136,
+            0.00304,
+            0.002736,
+            0.003073
+          ],
+          "warmup": true,
+          "plan": [
+            [
+              3,
+              0,
+              53,
+              "SEARCH edges USING COVERING INDEX edges_kind_id (kind=?)"
+            ]
+          ],
+          "mean_ms": 0.0031682
+        },
+        {
+          "name": "sql_approved_crossing_page_index_True_lower_bound",
+          "median_ms": 0.178306,
+          "min_ms": 0.177346,
+          "max_ms": 0.195298,
+          "samples_ms": [
+            0.182641,
+            0.177633,
+            0.177346,
+            0.195298,
+            0.178306
+          ],
+          "warmup": true,
+          "plan": [
+            [
+              7,
+              0,
+              61,
+              "SEARCH e USING INDEX benchmark_kind_approval (kind=? AND approval_state=?)"
+            ],
+            [
+              13,
+              0,
+              45,
+              "SEARCH a USING INTEGER PRIMARY KEY (rowid=?)"
+            ],
+            [
+              16,
+              0,
+              45,
+              "SEARCH b USING INTEGER PRIMARY KEY (rowid=?)"
+            ]
+          ],
+          "mean_ms": 0.1822448
+        }
+      ],
+      "peak_rss_bytes": 501841920
+    }
+  ]
+}

@@ -154,9 +154,19 @@ void createSyncSchema(sqlite3* db) {
     exec(db, kIncrementalSyncSchema);
     Statement id(db, "INSERT INTO sync_replica VALUES(1,?)"); id.bind(1, util::newUuid()); id.stepDone();
 }
+const char* kConsumerQueryIndexes = R"SQL(
+CREATE INDEX IF NOT EXISTS edges_kind_approval_uuid ON edges(kind,approval_state,uuid);
+CREATE INDEX IF NOT EXISTS edges_kind_uuid ON edges(kind,uuid);
+CREATE INDEX IF NOT EXISTS edges_kind_id ON edges(kind,id);
+CREATE INDEX IF NOT EXISTS fibers_family_length ON fibers(family,length DESC,object_id);
+CREATE INDEX IF NOT EXISTS fibers_length ON fibers(length DESC,object_id);
+CREATE INDEX IF NOT EXISTS tracks_family_length ON tracks(family,length DESC,object_id);
+CREATE INDEX IF NOT EXISTS tracks_length ON tracks(length DESC,object_id);
+)SQL";
 void createSchema(sqlite3* db) {
     exec(db, kObjectSchema);
     exec(db, kEdgeSchema);
+    exec(db, kConsumerQueryIndexes);
     exec(db, kEdgeGeometrySchema);
     exec(db, kObjectGeometrySchema);
     createSyncSchema(db);

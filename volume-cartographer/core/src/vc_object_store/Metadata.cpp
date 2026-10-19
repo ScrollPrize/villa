@@ -53,6 +53,7 @@ void mutateMeta(sqlite3* db, const std::string& author, const std::string& host,
 {
     Savepoint savepoint(db);
     if (key.empty()) throw std::runtime_error("object store: meta key must be non-empty");
+    const auto path = jsonPathForKey(key);
     const auto bytes = parseUuid(recordUuid);
     const char* table = nullptr;
     int64_t id = 0;
@@ -65,15 +66,30 @@ void mutateMeta(sqlite3* db, const std::string& author, const std::string& host,
     } else {
         throw std::runtime_error("object store: record not found: " + recordUuid);
     }
+    // Compare JSON values, not their spelling. Missing and explicit null are
+    // distinct; removing a missing key is also a no-op. Keep approval/history
+    // untouched when an autosave submits the same logical value.
+    {
+        Statement current(db, std::string("SELECT meta FROM ") + table + " WHERE id=?");
+        current.bind(1, id);
+        (void)current.row();
+        const auto meta = nlohmann::json::parse(current.text(0));
+        const auto found = meta.find(key);
+        if (jsonValue ? found != meta.end() && *found == nlohmann::json::parse(*jsonValue)
+                      : found == meta.end()) {
+            savepoint.release();
+            return;
+        }
+    }
     if (jsonValue) {
         Statement s(db, std::string("UPDATE ") + table + " SET meta=json_set(meta,?,json(?)) WHERE id=?");
-        s.bind(1, jsonPathForKey(key));
+        s.bind(1, path);
         s.bind(2, *jsonValue);
         s.bind(3, id);
         s.stepDone();
     } else {
         Statement s(db, std::string("UPDATE ") + table + " SET meta=json_remove(meta,?) WHERE id=?");
-        s.bind(1, jsonPathForKey(key));
+        s.bind(1, path);
         s.bind(2, id);
         s.stepDone();
     }

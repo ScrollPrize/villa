@@ -134,6 +134,43 @@ struct ObjectSelection {
     // Geometry heads determine bounds; un-ingested objects use annotated boxes.
     // Objects with no bounds do not match. This is not an exact mesh intersection.
     std::optional<std::array<double, 6>> bbox;
+    // Typed filters require kind="fiber" or "track". Length uses source units
+    // and the ingested summary, not a live geometry measurement.
+    std::optional<std::string> family;
+    std::optional<double> minLength;
+    std::string orderBy = "uuid"; // or "length_desc", UUID tie break
+    std::optional<std::string> afterUuid;
+    std::optional<double> afterLength; // paired with afterUuid for length_desc
+};
+struct EdgeSelection {
+    std::optional<std::string> kind, tag;
+    std::vector<std::string> approvalStates; // empty means all states
+    // nullopt means unrestricted; an explicitly empty set matches no edges.
+    std::optional<std::vector<std::string>> endpointUuids, uuids;
+    bool bothEndpoints = false; // induced subgraph vs incident edges
+    std::optional<int64_t> limit;
+    std::optional<std::string> afterUuid; // exclusive, UUID-ordered cursor
+};
+
+// Compact topology read from one store transaction. No separate persistent
+// representation. Parallel edges retain identity; each has two CSR incidences,
+// including self-links. Node order follows the object selection.
+struct GraphReadView {
+    std::vector<std::string> objectUuids, edgeUuids;
+    std::vector<std::optional<std::string>> geometryRevisions;
+    std::vector<int64_t> generations;
+    std::vector<uint64_t> offsets, neighbours, edgeIndices;
+    std::vector<std::array<uint64_t, 2>> endpoints;
+    int64_t journalSequence = 0;
+};
+
+// Homogeneous arrays concatenated along their first dimension. Offsets index
+// that dimension (not bytes); values retain their stored dtype and coordinates.
+struct PackedGeometryArray {
+    std::string dtype = "|u1";
+    std::vector<int64_t> shape{0};
+    std::vector<uint64_t> offsets{0};
+    std::vector<uint8_t> data;
 };
 // A conservative candidate, not an exact geometry hit. start/shape index
 // vertices (excluding XYZ); adjacent surface tiles and polyline blocks share
@@ -297,6 +334,11 @@ public:
     std::vector<std::vector<uint8_t>> readGeometryRanges(const Txn&, const std::string& revisionUuid,
         const std::string& arrayName, const std::vector<std::array<int64_t, 2>>& ranges) const;
 
+    // One packed buffer, caller revision order (including duplicates).
+    // Dtype and trailing dimensions must match. All chunks remain verified.
+    PackedGeometryArray readGeometryArrays(const Txn&, const std::vector<std::string>& revisionUuids,
+        const std::string& arrayName) const;
+
     // Dense row-major float32 XYZ rectangle from a patch points array. Exact
     // bytes; handles tiled and legacy layouts. Coordinates/counts are vertices.
     // Rectangle/range reads may reuse verified bytes on a pooled reader until
@@ -339,6 +381,13 @@ public:
     void removeEdge(WriteTxn& txn, const std::string& uuid);
     std::vector<EdgeRecord> edgesOf(const Txn& txn, const std::string& objectUuid) const;
     std::vector<EdgeRecord> edgesByKind(const Txn& txn, const std::string& edgeKind) const;
+    // Projection always includes uuid/kind/a/b; empty fields means identities.
+    std::vector<EdgeRecord> selectEdges(const Txn&, const EdgeSelection& = {},
+        const std::optional<std::vector<std::string>>& fields = std::nullopt) const;
+    // Both endpoints must belong to the selected objects. Reads topology,
+    // generations and geometry heads from the caller's consistent snapshot.
+    GraphReadView graphReadView(const Txn&, const ObjectSelection& = {},
+                               const EdgeSelection& = {}) const;
     // Neighbour object UUIDs, optionally filtered by edge kind and/or
     // neighbour object kind.
     std::vector<std::string> neighbours(const Txn& txn, const std::string& objectUuid,

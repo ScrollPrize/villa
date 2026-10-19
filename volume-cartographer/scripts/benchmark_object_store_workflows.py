@@ -108,6 +108,7 @@ def catalog(Store, root, n, results):
 
 
 def sampling(Store, root, n, results):
+    import numpy as np
     # 24 MiB by default: crosses the operation-local eight-chunk cache.
     coords = array.array('d', (float(i) for i in range(n * 3)))
     if sys.byteorder != 'little':
@@ -159,9 +160,21 @@ def sampling(Store, root, n, results):
         bench(results, 'full_array', lambda: db.read_geometry_array(rev, 'line_points'), lambda v: count_is(len(payload))(v))
         raw = root / 'raw.bin'
         raw.write_bytes(payload)
+        indices = np.array([offset // 24 for offset, count in ranges], dtype=np.int64)
+        expected_points = np.frombuffer(b''.join(expected), dtype='<f8').reshape(-1, 3)
         with raw.open('rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
             bench(results, 'mmap_random_512_points_no_verification_lower_bound',
                   lambda: [mapped[o:o+c] for o, c in ranges], verify)
+            mapped_points = np.ndarray((n, 3), dtype='<f8', buffer=mapped)
+            bench(results, 'mmap_numpy_random_512_points_lower_bound', lambda: mapped_points[indices],
+                  lambda value: np.testing.assert_array_equal(value, expected_points))
+            del mapped_points
+        with db.graph_read(object_uuids=[obj]) as graph:
+            bench(results, 'graph_load_packed_fiber', lambda: graph.read_geometry_arrays('line_points'),
+                  lambda value: assert_equal(value.values.tobytes(), payload))
+            resident = graph.read_geometry_arrays('line_points').values
+        bench(results, 'resident_packed_random_512_points', lambda: resident[indices],
+              lambda value: np.testing.assert_array_equal(value, expected_points))
         # One-coordinate edit: cost and retained storage, independently of links.
         changed = dict(kind='fiber', arrays=[dict(a) for a in data['arrays']])
         counter = 0
@@ -198,6 +211,22 @@ def tracks(Store, root, n, results):
             lambda v: assert_equal(v, payloads))
         bench(results, 'load_arrays_known_revisions', lambda: [db.read_geometry_array(r, 'points') for r in revisions],
               lambda v: assert_equal(v, payloads))
+        profile = cProfile.Profile()
+        profile.runcall(lambda: [db.read_geometry_array(r, 'points') for r in revisions])
+        import pstats
+        results.append(dict(name='track_read_python_profile', top_cumulative=[
+            dict(function=str(k), calls=v[1], self_seconds=v[2], cumulative_seconds=v[3])
+            for k, v in sorted(pstats.Stats(profile).stats.items(), key=lambda kv: kv[1][3], reverse=True)[:8]]))
+        packed_payload = b''.join(payloads)
+        def check_packed(value):
+            assert value.values.tobytes() == packed_payload
+            assert value.offsets.tolist() == [i*100 for i in range(n+1)]
+        bench(results, 'load_arrays_packed', lambda: db.read_geometry_arrays(revisions, 'points'), check_packed)
+        by_uuid = dict(zip(ids, payloads))
+        with db.graph_read(object_kind='track') as graph:
+            graph_payload = b''.join(by_uuid[i] for i in graph.object_uuids)
+            bench(results, 'graph_load_arrays_packed', lambda: graph.read_geometry_arrays('points'),
+                  lambda value: assert_equal(value.values.tobytes(), graph_payload))
         raw = root / 'packed.bin'
         raw.write_bytes(b''.join(payloads))
         with raw.open('rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
@@ -323,6 +352,9 @@ def patch(Store, root, source, results):
               lambda v: assert_equal(v, expected))
         bench(results, 'patch_full_array', lambda: db.read_geometry_array(revision['uuid'], 'points'),
               lambda v: assert_equal(v, payload))
+        with db.graph_read(object_uuids=[meta['uuid']]) as graph:
+            bench(results, 'real_patch_graph_packed', lambda: graph.read_geometry_arrays('points'),
+                  lambda value: assert_equal(value.values.tobytes(), payload))
         xyz = next(p for p in struct.iter_unpack('<fff', payload) if p[2] > 0)
         bench(results, 'real_patch_spatial_projected',
               lambda: db.select_objects(bbox=list(xyz) + list(xyz), fields=['name']),

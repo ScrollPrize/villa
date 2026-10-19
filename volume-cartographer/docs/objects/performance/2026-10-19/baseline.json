@@ -1,0 +1,1615 @@
+{
+  "platform": "Linux-6.14.0-1015-nvidia-aarch64-with-glibc2.39",
+  "python": "3.14.0 (main, Oct 14 2025, 21:26:03) [Clang 20.1.4 ]",
+  "python_sqlite": "3.50.4",
+  "system_sqlite_cli": "3.45.1 2024-01-30 16:01:20 e876e51a0ed5c5b3126f52e532044363a014bc594cfefa87ffb5b82257ccalt1 (64-bit)",
+  "git_revision": "fee3f2a7b9195bb0b90436bdd174b292eb76401f",
+  "cpu_affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19
+  ],
+  "scenarios": [
+    {
+      "scenario": "graph",
+      "n": 1000,
+      "results": [
+        {
+          "name": "seed",
+          "elapsed_ms": 101.24502377584577,
+          "objects": 1000,
+          "edges": 1981
+        },
+        {
+          "name": "lookup_uuid",
+          "median_ms": 0.007184,
+          "min_ms": 0.007024,
+          "max_ms": 0.01872,
+          "samples_ms": [
+            0.01872,
+            0.0092,
+            0.007872,
+            0.007504,
+            0.007344,
+            0.007184,
+            0.007024,
+            0.007137,
+            0.011264,
+            0.007152,
+            0.0072,
+            0.007024,
+            0.007232,
+            0.00752,
+            0.007104,
+            0.0072,
+            0.007056,
+            0.007136,
+            0.007088,
+            0.007056,
+            0.007184
+          ],
+          "warmup": true
+        },
+        {
+          "name": "select_one_uuid",
+          "median_ms": 0.01424,
+          "min_ms": 0.013872,
+          "max_ms": 0.017952,
+          "samples_ms": [
+            0.017952,
+            0.014928,
+            0.01424,
+            0.013872,
+            0.01392
+          ],
+          "warmup": true
+        },
+        {
+          "name": "indexed_rare_kind",
+          "median_ms": 0.00952,
+          "min_ms": 0.009376,
+          "max_ms": 0.010496,
+          "samples_ms": [
+            0.010496,
+            0.009696,
+            0.00952,
+            0.009472,
+            0.009376
+          ],
+          "warmup": true
+        },
+        {
+          "name": "select_rare_kind",
+          "median_ms": 0.009968,
+          "min_ms": 0.009697,
+          "max_ms": 0.011104,
+          "samples_ms": [
+            0.011104,
+            0.01,
+            0.009968,
+            0.009888,
+            0.009697
+          ],
+          "warmup": true
+        },
+        {
+          "name": "indexed_rare_tag",
+          "median_ms": 0.01064,
+          "min_ms": 0.01048,
+          "max_ms": 0.011936,
+          "samples_ms": [
+            0.011936,
+            0.010816,
+            0.01064,
+            0.010576,
+            0.01048
+          ],
+          "warmup": true
+        },
+        {
+          "name": "select_rare_tag",
+          "median_ms": 0.013408,
+          "min_ms": 0.013152,
+          "max_ms": 0.014321,
+          "samples_ms": [
+            0.014321,
+            0.013632,
+            0.013296,
+            0.013152,
+            0.013408
+          ],
+          "warmup": true
+        },
+        {
+          "name": "component_16",
+          "median_ms": 0.042224,
+          "min_ms": 0.041344,
+          "max_ms": 0.046449,
+          "samples_ms": [
+            0.043521,
+            0.04216,
+            0.042224,
+            0.041344,
+            0.046449
+          ],
+          "warmup": true
+        },
+        {
+          "name": "select_component_16",
+          "median_ms": 0.133633,
+          "min_ms": 0.131041,
+          "max_ms": 0.158129,
+          "samples_ms": [
+            0.158129,
+            0.133633,
+            0.131937,
+            0.131041,
+            0.141777
+          ],
+          "warmup": true
+        },
+        {
+          "name": "export_one_projected",
+          "median_ms": 0.023728,
+          "min_ms": 0.023024,
+          "max_ms": 0.02728,
+          "samples_ms": [
+            0.02728,
+            0.024737,
+            0.023728,
+            0.023312,
+            0.023024
+          ],
+          "warmup": true
+        },
+        {
+          "name": "component_large_chain",
+          "median_ms": 1.721866,
+          "min_ms": 1.718794,
+          "max_ms": 1.733722,
+          "samples_ms": [
+            1.733722,
+            1.721866,
+            1.718794
+          ],
+          "warmup": true
+        },
+        {
+          "name": "component_large_unfiltered",
+          "median_ms": 3.01421,
+          "min_ms": 3.008546,
+          "max_ms": 3.039377,
+          "samples_ms": [
+            3.01421,
+            3.039377,
+            3.008546
+          ],
+          "warmup": true
+        },
+        {
+          "name": "component_16_filtered",
+          "median_ms": 0.03032,
+          "min_ms": 0.030048,
+          "max_ms": 0.031904,
+          "samples_ms": [
+            0.031904,
+            0.030913,
+            0.03032,
+            0.03016,
+            0.030048
+          ],
+          "warmup": true
+        },
+        {
+          "name": "reachable_chain_depth_2",
+          "median_ms": 0.00776,
+          "min_ms": 0.007504,
+          "max_ms": 0.008176,
+          "samples_ms": [
+            0.008176,
+            0.00776,
+            0.007712,
+            0.00792,
+            0.007504
+          ],
+          "warmup": true
+        },
+        {
+          "name": "hub_neighbours_filtered_chain",
+          "median_ms": 0.007472,
+          "min_ms": 0.007344,
+          "max_ms": 0.0088,
+          "samples_ms": [
+            0.0088,
+            0.007648,
+            0.007472,
+            0.007472,
+            0.007344
+          ],
+          "warmup": true
+        },
+        {
+          "name": "hub_neighbours",
+          "median_ms": 0.711844,
+          "min_ms": 0.708356,
+          "max_ms": 0.717204,
+          "samples_ms": [
+            0.717204,
+            0.71314,
+            0.711764,
+            0.708356,
+            0.711844
+          ],
+          "warmup": true
+        },
+        {
+          "name": "legacy_adjacency_query_plan",
+          "python_sqlite_rows": [
+            [
+              3,
+              0,
+              54,
+              "SEARCH edges USING COVERING INDEX edges_unique (kind=?)"
+            ],
+            [
+              22,
+              0,
+              0,
+              "USE TEMP B-TREE FOR ORDER BY"
+            ]
+          ],
+          "system_sqlite_plan": "QUERY PLAN\n|--SEARCH edges USING COVERING INDEX edges_unique (kind=?)\n`--USE TEMP B-TREE FOR ORDER BY\n"
+        },
+        {
+          "name": "python_sqlite_filtered_adjacency_lower_bound",
+          "median_ms": 0.116193,
+          "min_ms": 0.115233,
+          "max_ms": 0.119825,
+          "samples_ms": [
+            0.118416,
+            0.119825,
+            0.116193,
+            0.116112,
+            0.115233
+          ],
+          "warmup": true
+        },
+        {
+          "name": "python_sqlite_union_adjacency_lower_bound",
+          "median_ms": 0.004224,
+          "min_ms": 0.004048,
+          "max_ms": 0.004848,
+          "samples_ms": [
+            0.004848,
+            0.004336,
+            0.004224,
+            0.004048,
+            0.004208
+          ],
+          "warmup": true
+        },
+        {
+          "name": "union_adjacency_query_plan",
+          "system_sqlite_plan": "QUERY PLAN\n`--MERGE (UNION)\n   |--LEFT\n   |  `--SEARCH edges USING INDEX edges_a (a_id=? AND kind=?)\n   `--RIGHT\n      `--SEARCH edges USING INDEX edges_b (b_id=? AND kind=?)\n"
+        },
+        {
+          "name": "analyzed_adjacency_query_plan",
+          "system_sqlite_plan": "QUERY PLAN\n|--MULTI-INDEX OR\n|  |--INDEX 1\n|  |  `--SEARCH edges USING COVERING INDEX edges_unique (kind=? AND a_id=?)\n|  `--INDEX 2\n|     `--SEARCH edges USING INDEX edges_b (b_id=? AND kind=?)\n`--USE TEMP B-TREE FOR ORDER BY\n"
+        },
+        {
+          "name": "database_bytes",
+          "bytes": 1556480
+        },
+        {
+          "name": "analyzed_component_16_filtered",
+          "median_ms": 0.026144,
+          "min_ms": 0.025472,
+          "max_ms": 0.028896,
+          "samples_ms": [
+            0.028896,
+            0.02672,
+            0.026144,
+            0.025488,
+            0.025472
+          ],
+          "warmup": true
+        },
+        {
+          "name": "analyzed_reachable_chain_depth_2",
+          "median_ms": 0.00736,
+          "min_ms": 0.007216,
+          "max_ms": 0.008096,
+          "samples_ms": [
+            0.008096,
+            0.00752,
+            0.007328,
+            0.007216,
+            0.00736
+          ],
+          "warmup": true
+        },
+        {
+          "name": "analyzed_component_large_chain",
+          "median_ms": 1.434233,
+          "min_ms": 1.421144,
+          "max_ms": 1.459208,
+          "samples_ms": [
+            1.434233,
+            1.459208,
+            1.421144
+          ],
+          "warmup": true
+        }
+      ],
+      "module": "/home/sean/villa/volume-cartographer/build/python/vc/objects.cpython-314-aarch64-linux-gnu.so",
+      "peak_rss_kib": 69652
+    },
+    {
+      "scenario": "graph",
+      "n": 10000,
+      "results": [
+        {
+          "name": "seed",
+          "elapsed_ms": 801.6359652392566,
+          "objects": 10000,
+          "edges": 19981
+        },
+        {
+          "name": "lookup_uuid",
+          "median_ms": 0.007264,
+          "min_ms": 0.007008,
+          "max_ms": 0.019024,
+          "samples_ms": [
+            0.019024,
+            0.009104,
+            0.007696,
+            0.00744,
+            0.00728,
+            0.007104,
+            0.007232,
+            0.007456,
+            0.0072,
+            0.007872,
+            0.007312,
+            0.007296,
+            0.007264,
+            0.007136,
+            0.007232,
+            0.007088,
+            0.0072,
+            0.007248,
+            0.007168,
+            0.007264,
+            0.007008
+          ],
+          "warmup": true
+        },
+        {
+          "name": "select_one_uuid",
+          "median_ms": 0.014176,
+          "min_ms": 0.01376,
+          "max_ms": 0.017664,
+          "samples_ms": [
+            0.017664,
+            0.014688,
+            0.014176,
+            0.014065,
+            0.01376
+          ],
+          "warmup": true
+        },
+        {
+          "name": "indexed_rare_kind",
+          "median_ms": 0.009536,
+          "min_ms": 0.009264,
+          "max_ms": 0.010256,
+          "samples_ms": [
+            0.010256,
+            0.009536,
+            0.00928,
+            0.00968,
+            0.009264
+          ],
+          "warmup": true
+        },
+        {
+          "name": "select_rare_kind",
+          "median_ms": 0.009856,
+          "min_ms": 0.009696,
+          "max_ms": 0.015088,
+          "samples_ms": [
+            0.015088,
+            0.010065,
+            0.009696,
+            0.009856,
+            0.009712
+          ],
+          "warmup": true
+        },
+        {
+          "name": "indexed_rare_tag",
+          "median_ms": 0.010448,
+          "min_ms": 0.010416,
+          "max_ms": 0.011808,
+          "samples_ms": [
+            0.011808,
+            0.01096,
+            0.010416,
+            0.010448,
+            0.010448
+          ],
+          "warmup": true
+        },
+        {
+          "name": "select_rare_tag",
+          "median_ms": 0.01376,
+          "min_ms": 0.013488,
+          "max_ms": 0.014608,
+          "samples_ms": [
+            0.014608,
+            0.013904,
+            0.013632,
+            0.013488,
+            0.01376
+          ],
+          "warmup": true
+        },
+        {
+          "name": "component_16",
+          "median_ms": 0.043104,
+          "min_ms": 0.042481,
+          "max_ms": 0.04512,
+          "samples_ms": [
+            0.04512,
+            0.043392,
+            0.043104,
+            0.042481,
+            0.04264
+          ],
+          "warmup": true
+        },
+        {
+          "name": "select_component_16",
+          "median_ms": 0.134161,
+          "min_ms": 0.133345,
+          "max_ms": 0.142193,
+          "samples_ms": [
+            0.142193,
+            0.139713,
+            0.134161,
+            0.133345,
+            0.133712
+          ],
+          "warmup": true
+        },
+        {
+          "name": "export_one_projected",
+          "median_ms": 0.024064,
+          "min_ms": 0.02368,
+          "max_ms": 0.02776,
+          "samples_ms": [
+            0.02776,
+            0.02464,
+            0.024064,
+            0.023777,
+            0.02368
+          ],
+          "warmup": true
+        },
+        {
+          "name": "component_large_chain",
+          "median_ms": 18.520236,
+          "min_ms": 18.377835,
+          "max_ms": 18.635869,
+          "samples_ms": [
+            18.520236,
+            18.635869,
+            18.377835
+          ],
+          "warmup": true
+        },
+        {
+          "name": "component_large_unfiltered",
+          "median_ms": 32.291581,
+          "min_ms": 32.272604,
+          "max_ms": 32.453949,
+          "samples_ms": [
+            32.453949,
+            32.291581,
+            32.272604
+          ],
+          "warmup": true
+        },
+        {
+          "name": "component_16_filtered",
+          "median_ms": 0.032273,
+          "min_ms": 0.031712,
+          "max_ms": 0.034416,
+          "samples_ms": [
+            0.034416,
+            0.032704,
+            0.032273,
+            0.032048,
+            0.031712
+          ],
+          "warmup": true
+        },
+        {
+          "name": "reachable_chain_depth_2",
+          "median_ms": 0.007824,
+          "min_ms": 0.007696,
+          "max_ms": 0.008448,
+          "samples_ms": [
+            0.008448,
+            0.008224,
+            0.007824,
+            0.007824,
+            0.007696
+          ],
+          "warmup": true
+        },
+        {
+          "name": "hub_neighbours_filtered_chain",
+          "median_ms": 0.007728,
+          "min_ms": 0.007568,
+          "max_ms": 0.00904,
+          "samples_ms": [
+            0.00904,
+            0.007824,
+            0.007728,
+            0.007696,
+            0.007568
+          ],
+          "warmup": true
+        },
+        {
+          "name": "hub_neighbours",
+          "median_ms": 7.806381,
+          "min_ms": 7.798382,
+          "max_ms": 8.094175,
+          "samples_ms": [
+            8.094175,
+            7.899998,
+            7.806381,
+            7.801742,
+            7.798382
+          ],
+          "warmup": true
+        },
+        {
+          "name": "legacy_adjacency_query_plan",
+          "python_sqlite_rows": [
+            [
+              3,
+              0,
+              54,
+              "SEARCH edges USING COVERING INDEX edges_unique (kind=?)"
+            ],
+            [
+              22,
+              0,
+              0,
+              "USE TEMP B-TREE FOR ORDER BY"
+            ]
+          ],
+          "system_sqlite_plan": "QUERY PLAN\n|--SEARCH edges USING COVERING INDEX edges_unique (kind=?)\n`--USE TEMP B-TREE FOR ORDER BY\n"
+        },
+        {
+          "name": "python_sqlite_filtered_adjacency_lower_bound",
+          "median_ms": 1.121895,
+          "min_ms": 1.119623,
+          "max_ms": 1.125079,
+          "samples_ms": [
+            1.125079,
+            1.121895,
+            1.119654,
+            1.119623,
+            1.124118
+          ],
+          "warmup": true
+        },
+        {
+          "name": "python_sqlite_union_adjacency_lower_bound",
+          "median_ms": 0.00448,
+          "min_ms": 0.004272,
+          "max_ms": 0.004752,
+          "samples_ms": [
+            0.004752,
+            0.004608,
+            0.00448,
+            0.004336,
+            0.004272
+          ],
+          "warmup": true
+        },
+        {
+          "name": "union_adjacency_query_plan",
+          "system_sqlite_plan": "QUERY PLAN\n`--MERGE (UNION)\n   |--LEFT\n   |  `--SEARCH edges USING INDEX edges_a (a_id=? AND kind=?)\n   `--RIGHT\n      `--SEARCH edges USING INDEX edges_b (b_id=? AND kind=?)\n"
+        },
+        {
+          "name": "analyzed_adjacency_query_plan",
+          "system_sqlite_plan": "QUERY PLAN\n|--MULTI-INDEX OR\n|  |--INDEX 1\n|  |  `--SEARCH edges USING COVERING INDEX edges_unique (kind=? AND a_id=?)\n|  `--INDEX 2\n|     `--SEARCH edges USING INDEX edges_b (b_id=? AND kind=?)\n`--USE TEMP B-TREE FOR ORDER BY\n"
+        },
+        {
+          "name": "database_bytes",
+          "bytes": 13570048
+        },
+        {
+          "name": "analyzed_component_16_filtered",
+          "median_ms": 0.027056,
+          "min_ms": 0.026784,
+          "max_ms": 0.031952,
+          "samples_ms": [
+            0.031952,
+            0.027825,
+            0.027056,
+            0.026784,
+            0.02704
+          ],
+          "warmup": true
+        },
+        {
+          "name": "analyzed_reachable_chain_depth_2",
+          "median_ms": 0.007376,
+          "min_ms": 0.007344,
+          "max_ms": 0.007952,
+          "samples_ms": [
+            0.007952,
+            0.007456,
+            0.00736,
+            0.007344,
+            0.007376
+          ],
+          "warmup": true
+        },
+        {
+          "name": "analyzed_component_large_chain",
+          "median_ms": 15.282282,
+          "min_ms": 15.185977,
+          "max_ms": 15.601083,
+          "samples_ms": [
+            15.601083,
+            15.282282,
+            15.185977
+          ],
+          "warmup": true
+        }
+      ],
+      "module": "/home/sean/villa/volume-cartographer/build/python/vc/objects.cpython-314-aarch64-linux-gnu.so",
+      "peak_rss_kib": 86188
+    },
+    {
+      "scenario": "graph",
+      "n": 50000,
+      "results": [
+        {
+          "name": "seed",
+          "elapsed_ms": 4086.361309979111,
+          "objects": 50000,
+          "edges": 99981
+        },
+        {
+          "name": "lookup_uuid",
+          "median_ms": 0.007264,
+          "min_ms": 0.006992,
+          "max_ms": 0.019056,
+          "samples_ms": [
+            0.019056,
+            0.009152,
+            0.00816,
+            0.007456,
+            0.007392,
+            0.0072,
+            0.007184,
+            0.007152,
+            0.007152,
+            0.007328,
+            0.007168,
+            0.007088,
+            0.007264,
+            0.007344,
+            0.007152,
+            0.007232,
+            0.007328,
+            0.007345,
+            0.007264,
+            0.006992,
+            0.007152
+          ],
+          "warmup": true
+        },
+        {
+          "name": "select_one_uuid",
+          "median_ms": 0.014336,
+          "min_ms": 0.01424,
+          "max_ms": 0.017408,
+          "samples_ms": [
+            0.017408,
+            0.014753,
+            0.014336,
+            0.014304,
+            0.01424
+          ],
+          "warmup": true
+        },
+        {
+          "name": "indexed_rare_kind",
+          "median_ms": 0.009536,
+          "min_ms": 0.009264,
+          "max_ms": 0.010384,
+          "samples_ms": [
+            0.010384,
+            0.0096,
+            0.009536,
+            0.009264,
+            0.009296
+          ],
+          "warmup": true
+        },
+        {
+          "name": "select_rare_kind",
+          "median_ms": 0.009936,
+          "min_ms": 0.009856,
+          "max_ms": 0.010928,
+          "samples_ms": [
+            0.010928,
+            0.009952,
+            0.009856,
+            0.009936,
+            0.009904
+          ],
+          "warmup": true
+        },
+        {
+          "name": "indexed_rare_tag",
+          "median_ms": 0.011056,
+          "min_ms": 0.01056,
+          "max_ms": 0.0116,
+          "samples_ms": [
+            0.0116,
+            0.011168,
+            0.010721,
+            0.011056,
+            0.01056
+          ],
+          "warmup": true
+        },
+        {
+          "name": "select_rare_tag",
+          "median_ms": 0.014096,
+          "min_ms": 0.013584,
+          "max_ms": 0.014688,
+          "samples_ms": [
+            0.014688,
+            0.0144,
+            0.01376,
+            0.014096,
+            0.013584
+          ],
+          "warmup": true
+        },
+        {
+          "name": "component_16",
+          "median_ms": 0.044625,
+          "min_ms": 0.04392,
+          "max_ms": 0.04664,
+          "samples_ms": [
+            0.04664,
+            0.04512,
+            0.044625,
+            0.04392,
+            0.044176
+          ],
+          "warmup": true
+        },
+        {
+          "name": "select_component_16",
+          "median_ms": 0.135553,
+          "min_ms": 0.134001,
+          "max_ms": 0.148929,
+          "samples_ms": [
+            0.148929,
+            0.137169,
+            0.135553,
+            0.134593,
+            0.134001
+          ],
+          "warmup": true
+        },
+        {
+          "name": "export_one_projected",
+          "median_ms": 0.024192,
+          "min_ms": 0.024,
+          "max_ms": 0.027296,
+          "samples_ms": [
+            0.027296,
+            0.025281,
+            0.024,
+            0.02408,
+            0.024192
+          ],
+          "warmup": true
+        },
+        {
+          "name": "component_large_chain",
+          "median_ms": 109.528546,
+          "min_ms": 108.983999,
+          "max_ms": 110.196358,
+          "samples_ms": [
+            110.196358,
+            108.983999,
+            109.528546
+          ],
+          "warmup": true
+        },
+        {
+          "name": "component_large_unfiltered",
+          "median_ms": 179.823038,
+          "min_ms": 179.726638,
+          "max_ms": 180.437938,
+          "samples_ms": [
+            180.437938,
+            179.823038,
+            179.726638
+          ],
+          "warmup": true
+        },
+        {
+          "name": "component_16_filtered",
+          "median_ms": 0.033792,
+          "min_ms": 0.033104,
+          "max_ms": 0.0376,
+          "samples_ms": [
+            0.0376,
+            0.034784,
+            0.033792,
+            0.033601,
+            0.033104
+          ],
+          "warmup": true
+        },
+        {
+          "name": "reachable_chain_depth_2",
+          "median_ms": 0.008256,
+          "min_ms": 0.008048,
+          "max_ms": 0.00912,
+          "samples_ms": [
+            0.00912,
+            0.008832,
+            0.008256,
+            0.008208,
+            0.008048
+          ],
+          "warmup": true
+        },
+        {
+          "name": "hub_neighbours_filtered_chain",
+          "median_ms": 0.007936,
+          "min_ms": 0.007648,
+          "max_ms": 0.010256,
+          "samples_ms": [
+            0.010256,
+            0.008384,
+            0.007936,
+            0.007776,
+            0.007648
+          ],
+          "warmup": true
+        },
+        {
+          "name": "hub_neighbours",
+          "median_ms": 47.806008,
+          "min_ms": 47.484086,
+          "max_ms": 48.302763,
+          "samples_ms": [
+            47.806008,
+            48.164011,
+            47.64868,
+            48.302763,
+            47.484086
+          ],
+          "warmup": true
+        },
+        {
+          "name": "legacy_adjacency_query_plan",
+          "python_sqlite_rows": [
+            [
+              3,
+              0,
+              54,
+              "SEARCH edges USING COVERING INDEX edges_unique (kind=?)"
+            ],
+            [
+              22,
+              0,
+              0,
+              "USE TEMP B-TREE FOR ORDER BY"
+            ]
+          ],
+          "system_sqlite_plan": "QUERY PLAN\n|--SEARCH edges USING COVERING INDEX edges_unique (kind=?)\n`--USE TEMP B-TREE FOR ORDER BY\n"
+        },
+        {
+          "name": "python_sqlite_filtered_adjacency_lower_bound",
+          "median_ms": 5.656625,
+          "min_ms": 5.643506,
+          "max_ms": 5.733234,
+          "samples_ms": [
+            5.733234,
+            5.656593,
+            5.656625,
+            5.660353,
+            5.643506
+          ],
+          "warmup": true
+        },
+        {
+          "name": "python_sqlite_union_adjacency_lower_bound",
+          "median_ms": 0.004641,
+          "min_ms": 0.00448,
+          "max_ms": 0.005488,
+          "samples_ms": [
+            0.005488,
+            0.004704,
+            0.00456,
+            0.00448,
+            0.004641
+          ],
+          "warmup": true
+        },
+        {
+          "name": "union_adjacency_query_plan",
+          "system_sqlite_plan": "QUERY PLAN\n`--MERGE (UNION)\n   |--LEFT\n   |  `--SEARCH edges USING INDEX edges_a (a_id=? AND kind=?)\n   `--RIGHT\n      `--SEARCH edges USING INDEX edges_b (b_id=? AND kind=?)\n"
+        },
+        {
+          "name": "analyzed_adjacency_query_plan",
+          "system_sqlite_plan": "QUERY PLAN\n|--MULTI-INDEX OR\n|  |--INDEX 1\n|  |  `--SEARCH edges USING COVERING INDEX edges_unique (kind=? AND a_id=?)\n|  `--INDEX 2\n|     `--SEARCH edges USING INDEX edges_b (b_id=? AND kind=?)\n`--USE TEMP B-TREE FOR ORDER BY\n"
+        },
+        {
+          "name": "database_bytes",
+          "bytes": 68018176
+        },
+        {
+          "name": "analyzed_component_16_filtered",
+          "median_ms": 0.027985,
+          "min_ms": 0.02744,
+          "max_ms": 0.032672,
+          "samples_ms": [
+            0.032672,
+            0.028912,
+            0.027936,
+            0.027985,
+            0.02744
+          ],
+          "warmup": true
+        },
+        {
+          "name": "analyzed_reachable_chain_depth_2",
+          "median_ms": 0.00768,
+          "min_ms": 0.0076,
+          "max_ms": 0.008576,
+          "samples_ms": [
+            0.008576,
+            0.007712,
+            0.007632,
+            0.00768,
+            0.0076
+          ],
+          "warmup": true
+        },
+        {
+          "name": "analyzed_component_large_chain",
+          "median_ms": 92.787248,
+          "min_ms": 91.844715,
+          "max_ms": 93.12437,
+          "samples_ms": [
+            91.844715,
+            92.787248,
+            93.12437
+          ],
+          "warmup": true
+        }
+      ],
+      "module": "/home/sean/villa/volume-cartographer/build/python/vc/objects.cpython-314-aarch64-linux-gnu.so",
+      "peak_rss_kib": 97268
+    },
+    {
+      "scenario": "writes",
+      "n": 1000,
+      "results": [
+        {
+          "name": "metadata_1000_updates_batch_1",
+          "median_ms": 1216.704127,
+          "min_ms": 1181.080586,
+          "max_ms": 1246.538647,
+          "samples_ms": [
+            1246.538647,
+            1181.080586,
+            1216.704127
+          ],
+          "warmup": true,
+          "updates": 1000,
+          "transaction_batch": 1
+        },
+        {
+          "name": "metadata_1000_updates_batch_100",
+          "median_ms": 64.480731,
+          "min_ms": 63.107075,
+          "max_ms": 72.373097,
+          "samples_ms": [
+            64.480731,
+            63.107075,
+            72.373097
+          ],
+          "warmup": true,
+          "updates": 1000,
+          "transaction_batch": 100
+        },
+        {
+          "name": "metadata_1000_updates_batch_1000",
+          "median_ms": 18.167195,
+          "min_ms": 17.766968,
+          "max_ms": 18.849663,
+          "samples_ms": [
+            17.766968,
+            18.849663,
+            18.167195
+          ],
+          "warmup": true,
+          "updates": 1000,
+          "transaction_batch": 1000
+        }
+      ],
+      "module": "/home/sean/villa/volume-cartographer/build/python/vc/objects.cpython-314-aarch64-linux-gnu.so",
+      "peak_rss_kib": 74832
+    },
+    {
+      "scenario": "geometry",
+      "n": 262144,
+      "results": [
+        {
+          "name": "fiber_read_24_bytes",
+          "median_ms": 0.539428,
+          "min_ms": 0.530419,
+          "max_ms": 0.585811,
+          "samples_ms": [
+            0.585811,
+            0.539428,
+            0.540211,
+            0.530419,
+            0.533107
+          ],
+          "warmup": true,
+          "bytes": 24
+        },
+        {
+          "name": "fiber_read_4096_bytes",
+          "median_ms": 0.531379,
+          "min_ms": 0.527603,
+          "max_ms": 0.53354,
+          "samples_ms": [
+            0.53354,
+            0.528115,
+            0.531955,
+            0.527603,
+            0.531379
+          ],
+          "warmup": true,
+          "bytes": 4096
+        },
+        {
+          "name": "fiber_read_1048576_bytes",
+          "median_ms": 0.56762,
+          "min_ms": 0.561443,
+          "max_ms": 0.569556,
+          "samples_ms": [
+            0.567507,
+            0.56762,
+            0.561443,
+            0.568851,
+            0.569556
+          ],
+          "warmup": true,
+          "bytes": 1048576
+        },
+        {
+          "name": "fiber_read_6291456_bytes",
+          "median_ms": 7.037833,
+          "min_ms": 6.857384,
+          "max_ms": 7.659277,
+          "samples_ms": [
+            7.172315,
+            6.910697,
+            6.857384,
+            7.037833,
+            7.659277
+          ],
+          "warmup": true,
+          "bytes": 6291456
+        },
+        {
+          "name": "fiber_100_separate_points",
+          "median_ms": 52.888647,
+          "min_ms": 52.857543,
+          "max_ms": 52.930984,
+          "samples_ms": [
+            52.857543,
+            52.930984,
+            52.862439,
+            52.919255,
+            52.888647
+          ],
+          "warmup": true
+        },
+        {
+          "name": "fiber_100_points_batched_ranges",
+          "median_ms": 0.012096,
+          "min_ms": 0.01176,
+          "max_ms": 0.019472,
+          "samples_ms": [
+            0.019472,
+            0.013328,
+            0.012096,
+            0.012,
+            0.01176
+          ],
+          "warmup": true
+        },
+        {
+          "name": "fiber_100_points_one_range",
+          "median_ms": 0.534131,
+          "min_ms": 0.528403,
+          "max_ms": 0.537539,
+          "samples_ms": [
+            0.537539,
+            0.534148,
+            0.530003,
+            0.534131,
+            0.528403
+          ],
+          "warmup": true
+        },
+        {
+          "name": "fiber_put_identical",
+          "median_ms": 2.784784,
+          "min_ms": 2.759776,
+          "max_ms": 2.936049,
+          "samples_ms": [
+            2.784784,
+            2.770289,
+            2.759776,
+            2.832337,
+            2.936049
+          ],
+          "warmup": true
+        },
+        {
+          "name": "fiber_unrelated_edit_preview_degree_0",
+          "median_ms": 2.697904,
+          "min_ms": 2.683936,
+          "max_ms": 2.824016,
+          "samples_ms": [
+            2.824016,
+            2.701184,
+            2.697904,
+            2.683936,
+            2.687504
+          ],
+          "warmup": true,
+          "degree": 0,
+          "points": 262144
+        },
+        {
+          "name": "fiber_unrelated_edit_preview_degree_10",
+          "median_ms": 3.431973,
+          "min_ms": 3.377332,
+          "max_ms": 3.604661,
+          "samples_ms": [
+            3.604661,
+            3.431973,
+            3.406996,
+            3.436756,
+            3.377332
+          ],
+          "warmup": true,
+          "degree": 10,
+          "points": 262144
+        },
+        {
+          "name": "fiber_unrelated_edit_preview_degree_100",
+          "median_ms": 3.972007,
+          "min_ms": 3.904711,
+          "max_ms": 4.031544,
+          "samples_ms": [
+            4.031544,
+            3.929815,
+            3.995176,
+            3.904711,
+            3.972007
+          ],
+          "warmup": true,
+          "degree": 100,
+          "points": 262144
+        },
+        {
+          "name": "point_collection_read_24_bytes",
+          "median_ms": 0.542899,
+          "min_ms": 0.536627,
+          "max_ms": 0.594227,
+          "samples_ms": [
+            0.594227,
+            0.54826,
+            0.542899,
+            0.536627,
+            0.540979
+          ],
+          "warmup": true,
+          "bytes": 24
+        },
+        {
+          "name": "point_collection_read_4096_bytes",
+          "median_ms": 0.537844,
+          "min_ms": 0.535987,
+          "max_ms": 0.549747,
+          "samples_ms": [
+            0.549747,
+            0.536675,
+            0.539395,
+            0.535987,
+            0.537844
+          ],
+          "warmup": true,
+          "bytes": 4096
+        },
+        {
+          "name": "point_collection_read_1048576_bytes",
+          "median_ms": 0.583044,
+          "min_ms": 0.576516,
+          "max_ms": 0.593507,
+          "samples_ms": [
+            0.58154,
+            0.593507,
+            0.576516,
+            0.585427,
+            0.583044
+          ],
+          "warmup": true,
+          "bytes": 1048576
+        },
+        {
+          "name": "point_collection_read_6291456_bytes",
+          "median_ms": 4.033735,
+          "min_ms": 3.965127,
+          "max_ms": 4.114616,
+          "samples_ms": [
+            4.114616,
+            3.965127,
+            4.00956,
+            4.067304,
+            4.033735
+          ],
+          "warmup": true,
+          "bytes": 6291456
+        },
+        {
+          "name": "point_collection_100_separate_points",
+          "median_ms": 53.432346,
+          "min_ms": 53.371915,
+          "max_ms": 53.471755,
+          "samples_ms": [
+            53.44209,
+            53.471755,
+            53.418058,
+            53.371915,
+            53.432346
+          ],
+          "warmup": true
+        },
+        {
+          "name": "point_collection_100_points_batched_ranges",
+          "median_ms": 0.012352,
+          "min_ms": 0.011952,
+          "max_ms": 0.018272,
+          "samples_ms": [
+            0.018272,
+            0.012848,
+            0.012288,
+            0.012352,
+            0.011952
+          ],
+          "warmup": true
+        },
+        {
+          "name": "point_collection_100_points_one_range",
+          "median_ms": 0.535331,
+          "min_ms": 0.533171,
+          "max_ms": 0.538868,
+          "samples_ms": [
+            0.533171,
+            0.538868,
+            0.535331,
+            0.537603,
+            0.534947
+          ],
+          "warmup": true
+        },
+        {
+          "name": "point_collection_put_identical",
+          "median_ms": 3.847239,
+          "min_ms": 3.776198,
+          "max_ms": 4.122393,
+          "samples_ms": [
+            4.06852,
+            3.776198,
+            3.847239,
+            3.787974,
+            4.122393
+          ],
+          "warmup": true
+        },
+        {
+          "name": "point_collection_unrelated_edit_preview_degree_0",
+          "median_ms": 3.883847,
+          "min_ms": 3.701654,
+          "max_ms": 4.495819,
+          "samples_ms": [
+            4.338121,
+            3.739366,
+            4.495819,
+            3.883847,
+            3.701654
+          ],
+          "warmup": true,
+          "degree": 0,
+          "points": 262144
+        },
+        {
+          "name": "point_collection_unrelated_edit_preview_degree_10",
+          "median_ms": 17.400806,
+          "min_ms": 17.318118,
+          "max_ms": 18.461581,
+          "samples_ms": [
+            18.461581,
+            17.401959,
+            17.400806,
+            17.342598,
+            17.318118
+          ],
+          "warmup": true,
+          "degree": 10,
+          "points": 262144
+        },
+        {
+          "name": "point_collection_unrelated_edit_preview_degree_100",
+          "median_ms": 18.135275,
+          "min_ms": 17.883978,
+          "max_ms": 18.220539,
+          "samples_ms": [
+            18.220539,
+            17.916425,
+            17.883978,
+            18.219547,
+            18.135275
+          ],
+          "warmup": true,
+          "degree": 100,
+          "points": 262144
+        }
+      ],
+      "module": "/home/sean/villa/volume-cartographer/build/python/vc/objects.cpython-314-aarch64-linux-gnu.so",
+      "peak_rss_kib": 125756
+    },
+    {
+      "scenario": "sync",
+      "n": 1000,
+      "results": [
+        {
+          "name": "initial_sync",
+          "median_ms": 259.171302,
+          "min_ms": 259.171302,
+          "max_ms": 259.171302,
+          "samples_ms": [
+            259.171302
+          ],
+          "warmup": false
+        },
+        {
+          "name": "noop_sync_history_1",
+          "median_ms": 0.027361,
+          "min_ms": 0.02608,
+          "max_ms": 0.033936,
+          "samples_ms": [
+            0.033936,
+            0.027361,
+            0.02608
+          ],
+          "warmup": true
+        },
+        {
+          "name": "baseline_storage_history_1",
+          "count": 1,
+          "json_bytes": 1230724,
+          "record_versions": 1998
+        },
+        {
+          "name": "one_record_sync_history_2",
+          "median_ms": 6.190661,
+          "min_ms": 6.190661,
+          "max_ms": 6.190661,
+          "samples_ms": [
+            6.190661
+          ],
+          "warmup": false
+        },
+        {
+          "name": "one_record_sync_history_3",
+          "median_ms": 6.19506,
+          "min_ms": 6.19506,
+          "max_ms": 6.19506,
+          "samples_ms": [
+            6.19506
+          ],
+          "warmup": false
+        },
+        {
+          "name": "one_record_sync_history_4",
+          "median_ms": 6.190836,
+          "min_ms": 6.190836,
+          "max_ms": 6.190836,
+          "samples_ms": [
+            6.190836
+          ],
+          "warmup": false
+        },
+        {
+          "name": "one_record_sync_history_5",
+          "median_ms": 6.21738,
+          "min_ms": 6.21738,
+          "max_ms": 6.21738,
+          "samples_ms": [
+            6.21738
+          ],
+          "warmup": false
+        },
+        {
+          "name": "noop_sync_history_5",
+          "median_ms": 0.026272,
+          "min_ms": 0.02504,
+          "max_ms": 0.027841,
+          "samples_ms": [
+            0.027841,
+            0.026272,
+            0.02504
+          ],
+          "warmup": true
+        },
+        {
+          "name": "baseline_storage_history_5",
+          "count": 5,
+          "json_bytes": 1233704,
+          "record_versions": 2002
+        },
+        {
+          "name": "database_bytes",
+          "bytes": 2981888
+        }
+      ],
+      "module": "/home/sean/villa/volume-cartographer/build/python/vc/objects.cpython-314-aarch64-linux-gnu.so",
+      "peak_rss_kib": 91124
+    },
+    {
+      "scenario": "sync",
+      "n": 5000,
+      "results": [
+        {
+          "name": "initial_sync",
+          "median_ms": 1324.200136,
+          "min_ms": 1324.200136,
+          "max_ms": 1324.200136,
+          "samples_ms": [
+            1324.200136
+          ],
+          "warmup": false
+        },
+        {
+          "name": "noop_sync_history_1",
+          "median_ms": 0.0312,
+          "min_ms": 0.027008,
+          "max_ms": 0.038753,
+          "samples_ms": [
+            0.038753,
+            0.0312,
+            0.027008
+          ],
+          "warmup": true
+        },
+        {
+          "name": "baseline_storage_history_1",
+          "count": 1,
+          "json_bytes": 6166724,
+          "record_versions": 9998
+        },
+        {
+          "name": "one_record_sync_history_2",
+          "median_ms": 5.187615,
+          "min_ms": 5.187615,
+          "max_ms": 5.187615,
+          "samples_ms": [
+            5.187615
+          ],
+          "warmup": false
+        },
+        {
+          "name": "one_record_sync_history_3",
+          "median_ms": 2.553567,
+          "min_ms": 2.553567,
+          "max_ms": 2.553567,
+          "samples_ms": [
+            2.553567
+          ],
+          "warmup": false
+        },
+        {
+          "name": "one_record_sync_history_4",
+          "median_ms": 2.769729,
+          "min_ms": 2.769729,
+          "max_ms": 2.769729,
+          "samples_ms": [
+            2.769729
+          ],
+          "warmup": false
+        },
+        {
+          "name": "one_record_sync_history_5",
+          "median_ms": 2.605215,
+          "min_ms": 2.605215,
+          "max_ms": 2.605215,
+          "samples_ms": [
+            2.605215
+          ],
+          "warmup": false
+        },
+        {
+          "name": "noop_sync_history_5",
+          "median_ms": 0.025344,
+          "min_ms": 0.024896,
+          "max_ms": 0.026577,
+          "samples_ms": [
+            0.026577,
+            0.025344,
+            0.024896
+          ],
+          "warmup": true
+        },
+        {
+          "name": "baseline_storage_history_5",
+          "count": 5,
+          "json_bytes": 6169704,
+          "record_versions": 10002
+        },
+        {
+          "name": "database_bytes",
+          "bytes": 14004224
+        }
+      ],
+      "module": "/home/sean/villa/volume-cartographer/build/python/vc/objects.cpython-314-aarch64-linux-gnu.so",
+      "peak_rss_kib": 161936
+    }
+  ]
+}

@@ -220,7 +220,7 @@ def test_v4_migration_preserves_read_only_object_queries_and_builds_regions(tmp_
         assert (db.uuid, db.journal_since(), db.export_json()) == before
         assert regions(db, uid) == expected
     with sqlite3.connect(path) as sql:
-        assert sql.execute('PRAGMA user_version').fetchone()[0] == 6
+        assert sql.execute('PRAGMA user_version').fetchone()[0] == 7
         assert sql.execute('PRAGMA foreign_key_check').fetchall() == []
         assert sql.execute("SELECT name FROM sqlite_master WHERE sql LIKE 'CREATE VIRTUAL TABLE%rtree%'").fetchall() == [('spatial_regions_rtree',)]
 

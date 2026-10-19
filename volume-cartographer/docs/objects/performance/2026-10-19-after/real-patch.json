@@ -1,0 +1,83 @@
+{
+  "scenario": "patch",
+  "n": 1000,
+  "results": [
+    {
+      "name": "real_patch_fixture",
+      "source": "core/test/data/segments/20241113070770",
+      "shape": [
+        129,
+        129,
+        3
+      ],
+      "bytes": 199692
+    },
+    {
+      "name": "patch_column_separate",
+      "median_ms": 1.906412,
+      "min_ms": 0.612665,
+      "max_ms": 2.681463,
+      "samples_ms": [
+        2.681463,
+        0.612665,
+        1.906412
+      ],
+      "warmup": true,
+      "mean_ms": 1.7335133333333335
+    },
+    {
+      "name": "patch_column_batched",
+      "median_ms": 0.02456,
+      "min_ms": 0.020561,
+      "max_ms": 0.206547,
+      "samples_ms": [
+        0.02456,
+        0.020561,
+        0.206547
+      ],
+      "warmup": true,
+      "mean_ms": 0.08388933333333333
+    },
+    {
+      "name": "patch_full_array",
+      "median_ms": 0.250084,
+      "min_ms": 0.228884,
+      "max_ms": 0.406358,
+      "samples_ms": [
+        0.406358,
+        0.250084,
+        0.228884
+      ],
+      "warmup": true,
+      "mean_ms": 0.29510866666666663
+    },
+    {
+      "name": "real_patch_spatial_projected",
+      "median_ms": 0.035424,
+      "min_ms": 0.031553,
+      "max_ms": 0.046545,
+      "samples_ms": [
+        0.046545,
+        0.035424,
+        0.031553
+      ],
+      "warmup": true,
+      "mean_ms": 0.03784066666666667
+    },
+    {
+      "name": "real_patch_spatial_regions",
+      "median_ms": 0.007184,
+      "min_ms": 0.00664,
+      "max_ms": 0.00936,
+      "samples_ms": [
+        0.00936,
+        0.007184,
+        0.00664
+      ],
+      "warmup": true,
+      "mean_ms": 0.007728
+    }
+  ],
+  "module": "/home/sean/villa/volume-cartographer/build/python/vc/objects.cpython-314-aarch64-linux-gnu.so",
+  "peak_rss_bytes": 75612160
+}

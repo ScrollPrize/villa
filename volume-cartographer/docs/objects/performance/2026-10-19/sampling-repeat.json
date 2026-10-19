@@ -1,0 +1,191 @@
+{
+  "scenario": "sampling",
+  "n": 1048576,
+  "results": [
+    {
+      "name": "fiber_block_query",
+      "median_ms": 0.00368,
+      "min_ms": 0.003104,
+      "max_ms": 0.007472,
+      "samples_ms": [
+        0.007472,
+        0.00368,
+        0.003104
+      ],
+      "warmup": true,
+      "mean_ms": 0.004752
+    },
+    {
+      "name": "fiber_block_query_and_load",
+      "median_ms": 0.571603,
+      "min_ms": 0.549908,
+      "max_ms": 0.62226,
+      "samples_ms": [
+        0.62226,
+        0.571603,
+        0.549908
+      ],
+      "warmup": true,
+      "mean_ms": 0.581257
+    },
+    {
+      "name": "fiber_block_working_set",
+      "points": 1048576,
+      "total_bytes": 25165824,
+      "returned_bytes": 6168
+    },
+    {
+      "name": "cyclic_8_chunks_512_points",
+      "median_ms": 0.041696,
+      "min_ms": 0.03904,
+      "max_ms": 0.053441,
+      "samples_ms": [
+        0.053441,
+        0.041696,
+        0.03904
+      ],
+      "warmup": true,
+      "mean_ms": 0.044725666666666664
+    },
+    {
+      "name": "grouped_8_chunks_512_points",
+      "median_ms": 0.086817,
+      "min_ms": 0.086704,
+      "max_ms": 0.091041,
+      "samples_ms": [
+        0.091041,
+        0.086704,
+        0.086817
+      ],
+      "warmup": true,
+      "mean_ms": 0.08818733333333334
+    },
+    {
+      "name": "cyclic_9_chunks_512_points",
+      "median_ms": 294.32302,
+      "min_ms": 294.041978,
+      "max_ms": 297.001196,
+      "samples_ms": [
+        297.001196,
+        294.32302,
+        294.041978
+      ],
+      "warmup": true,
+      "mean_ms": 295.12206466666663
+    },
+    {
+      "name": "grouped_9_chunks_512_points",
+      "median_ms": 5.416657,
+      "min_ms": 5.389873,
+      "max_ms": 5.425442,
+      "samples_ms": [
+        5.416657,
+        5.389873,
+        5.425442
+      ],
+      "warmup": true,
+      "mean_ms": 5.410657333333333
+    },
+    {
+      "name": "cyclic_16_chunks_512_points",
+      "median_ms": 313.254017,
+      "min_ms": 312.178442,
+      "max_ms": 313.889188,
+      "samples_ms": [
+        313.889188,
+        313.254017,
+        312.178442
+      ],
+      "warmup": true,
+      "mean_ms": 313.10721566666666
+    },
+    {
+      "name": "grouped_16_chunks_512_points",
+      "median_ms": 9.918221,
+      "min_ms": 9.908685,
+      "max_ms": 10.039646,
+      "samples_ms": [
+        9.918221,
+        10.039646,
+        9.908685
+      ],
+      "warmup": true,
+      "mean_ms": 9.955517333333333
+    },
+    {
+      "name": "random_512_points",
+      "median_ms": 198.728771,
+      "min_ms": 192.526733,
+      "max_ms": 201.095777,
+      "samples_ms": [
+        192.526733,
+        198.728771,
+        201.095777
+      ],
+      "warmup": true,
+      "mean_ms": 197.450427
+    },
+    {
+      "name": "random_512_points_grouped",
+      "median_ms": 15.751568,
+      "min_ms": 15.718865,
+      "max_ms": 15.865393,
+      "samples_ms": [
+        15.751568,
+        15.865393,
+        15.718865
+      ],
+      "warmup": true,
+      "mean_ms": 15.778608666666665
+    },
+    {
+      "name": "full_array",
+      "median_ms": 30.665068,
+      "min_ms": 30.590651,
+      "max_ms": 31.826579,
+      "samples_ms": [
+        31.826579,
+        30.665068,
+        30.590651
+      ],
+      "warmup": true,
+      "mean_ms": 31.02743266666667
+    },
+    {
+      "name": "mmap_random_512_points_no_verification_lower_bound",
+      "median_ms": 0.020752,
+      "min_ms": 0.020544,
+      "max_ms": 0.029232,
+      "samples_ms": [
+        0.029232,
+        0.020752,
+        0.020544
+      ],
+      "warmup": true,
+      "mean_ms": 0.023509333333333337
+    },
+    {
+      "name": "single_coordinate_edit",
+      "median_ms": 37.163156,
+      "min_ms": 29.660902,
+      "max_ms": 43.603419,
+      "samples_ms": [
+        43.603419,
+        29.660902,
+        37.163156
+      ],
+      "warmup": true,
+      "mean_ms": 36.809159
+    },
+    {
+      "name": "retained_geometry_storage",
+      "chunks": 28,
+      "bytes": 29360128,
+      "original_bytes": 25165824,
+      "edits": 4,
+      "database_bytes": 30371840
+    }
+  ],
+  "module": "/home/sean/villa/volume-cartographer/build/python/vc/objects.cpython-314-aarch64-linux-gnu.so",
+  "peak_rss_bytes": 243843072
+}

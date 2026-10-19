@@ -18,6 +18,8 @@ public:
     const nlohmann::json& manifest() const { return manifest_; }
     size_t retainedCharge() const { return metadataCharge_ + cachedBytes_ + chunks_.size() * 256; }
     std::vector<uint8_t> read(const std::string& name, int64_t offset, std::optional<int64_t> count = std::nullopt);
+    std::vector<std::vector<uint8_t>> ranges(const std::string& name,
+        const std::vector<std::array<int64_t, 2>>& ranges);
 
     std::vector<uint8_t> rectangle(const std::string& name, int64_t row, int64_t column,
                                    int64_t rows, int64_t columns);

@@ -7,6 +7,14 @@ geometry, then query, annotate, export, or synchronize using that same handle.
 [Storage and synchronization API](../object_storage.md) ·
 [Link detector reference](../object_links.md)
 
+[Consumer performance investigation](performance.md) maps vc3d and Spiral access
+patterns to measured metadata, graph, geometry and synchronization costs.
+[Implemented improvements](performance-improvements.md) records the follow-up
+measurements. The [consumer query APIs](../object_storage.md#consumer-queries-and-store-backed-graph-reads)
+provide bounded pages and a store-backed graph view for fitting without exports.
+[Spiral input-loading improvements](performance-spiral.md) cover packed geometry
+buffers and compact graph construction, including comparisons with per-track reads.
+
 ## Build and command line
 
 ```sh

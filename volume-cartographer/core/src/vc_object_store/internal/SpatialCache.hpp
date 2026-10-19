@@ -134,7 +134,8 @@ public:
         if (version != version_) { index_.reset(); attempted_ = false; version_ = version; }
     }
     std::optional<std::vector<SpatialRegion>> query(sqlite3* db, const ObjectSelection& selection) {
-        if (selection.tag || selection.connectedTo) return std::nullopt;
+        if (selection.tag || selection.connectedTo || selection.family || selection.minLength ||
+            selection.afterUuid || selection.afterLength || selection.orderBy != "uuid") return std::nullopt;
         if (!attempted_) {
             if (pragmaInt(db, "user_version") < 5) return std::nullopt;
             auto index = std::make_unique<ResidentSpatialIndex>();

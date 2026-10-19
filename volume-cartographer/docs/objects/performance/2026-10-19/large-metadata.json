@@ -1,0 +1,462 @@
+{
+  "platform": "Linux-6.14.0-1015-nvidia-aarch64-with-glibc2.39",
+  "python": "3.14.0 (main, Oct 14 2025, 21:26:03) [Clang 20.1.4 ]",
+  "python_sqlite": "3.50.4",
+  "git_revision": "fee3f2a7b9195bb0b90436bdd174b292eb76401f",
+  "benchmark_sha256": "cb94ce3442ad3eac1e931c8d4f4fde1e556a3fdbc5af112fc959a4c3eff66847",
+  "cpu_affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19
+  ],
+  "build": [
+    "CMAKE_BUILD_TYPE:STRING=RelWithDebInfo",
+    "CMAKE_CXX_COMPILER:FILEPATH=/usr/bin/c++",
+    "CMAKE_CXX_FLAGS_RELWITHDEBINFO:STRING=-O2 -g -DNDEBUG",
+    "VC_MARCH_NATIVE:BOOL=OFF"
+  ],
+  "compiler": "c++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+  "scenarios": [
+    {
+      "n": 10000,
+      "edges": 20001,
+      "payload_bytes": 4096,
+      "module": "/home/sean/villa/volume-cartographer/build/python/vc/objects.cpython-314-aarch64-linux-gnu.so",
+      "results": [
+        {
+          "name": "crossings_bulk_records",
+          "median_ms": 140.139913,
+          "min_ms": 140.123353,
+          "max_ms": 140.490747,
+          "samples_ms": [
+            140.490747,
+            140.123353,
+            140.139913
+          ],
+          "warmup": true,
+          "mean_ms": 140.25133766666667
+        },
+        {
+          "name": "rare_edge_kind",
+          "median_ms": 0.015104,
+          "min_ms": 0.013761,
+          "max_ms": 0.020304,
+          "samples_ms": [
+            0.020304,
+            0.015104,
+            0.013761
+          ],
+          "warmup": true,
+          "mean_ms": 0.016389666666666667
+        },
+        {
+          "name": "approved_crossing_page_100",
+          "median_ms": 151.948049,
+          "min_ms": 150.423144,
+          "max_ms": 152.053634,
+          "samples_ms": [
+            151.948049,
+            152.053634,
+            150.423144
+          ],
+          "warmup": true,
+          "mean_ms": 151.47494233333333
+        },
+        {
+          "name": "patch_incident_records",
+          "median_ms": 65.639506,
+          "min_ms": 65.348224,
+          "max_ms": 65.900787,
+          "samples_ms": [
+            65.900787,
+            65.639506,
+            65.348224
+          ],
+          "warmup": true,
+          "mean_ms": 65.62950566666666
+        },
+        {
+          "name": "track_incident_records",
+          "median_ms": 0.034656,
+          "min_ms": 0.032976,
+          "max_ms": 0.040128,
+          "samples_ms": [
+            0.040128,
+            0.034656,
+            0.032976
+          ],
+          "warmup": true,
+          "mean_ms": 0.03592
+        },
+        {
+          "name": "patch_filtered_neighbours_absent_kind",
+          "median_ms": 0.006432,
+          "min_ms": 0.006192,
+          "max_ms": 0.007584,
+          "samples_ms": [
+            0.007584,
+            0.006432,
+            0.006192
+          ],
+          "warmup": true,
+          "mean_ms": 0.006736
+        },
+        {
+          "name": "family_length_page_fields_None",
+          "median_ms": 118.075362,
+          "min_ms": 116.862987,
+          "max_ms": 118.803863,
+          "samples_ms": [
+            118.803863,
+            116.862987,
+            118.075362
+          ],
+          "warmup": true,
+          "mean_ms": 117.91407066666667
+        },
+        {
+          "name": "family_length_page_fields_['name', 'track']",
+          "median_ms": 33.378317,
+          "min_ms": 33.071514,
+          "max_ms": 33.452621,
+          "samples_ms": [
+            33.378317,
+            33.452621,
+            33.071514
+          ],
+          "warmup": true,
+          "mean_ms": 33.300817333333335
+        },
+        {
+          "name": "1000_crossing_neighbour_queries",
+          "median_ms": 7.822768,
+          "min_ms": 7.805424,
+          "max_ms": 7.850816,
+          "samples_ms": [
+            7.850816,
+            7.805424,
+            7.822768
+          ],
+          "warmup": true,
+          "mean_ms": 7.826336
+        },
+        {
+          "name": "1000_resident_adjacency_copies_lower_bound",
+          "median_ms": 0.035841,
+          "min_ms": 0.035649,
+          "max_ms": 0.037921,
+          "samples_ms": [
+            0.037921,
+            0.035841,
+            0.035649
+          ],
+          "warmup": true,
+          "mean_ms": 0.036470333333333334
+        },
+        {
+          "name": "object_200_metadata_updates_batch_1",
+          "median_ms": 248.445217,
+          "min_ms": 237.415149,
+          "max_ms": 254.309252,
+          "samples_ms": [
+            237.415149,
+            254.309252,
+            248.445217
+          ],
+          "warmup": true,
+          "mean_ms": 246.723206
+        },
+        {
+          "name": "object_200_metadata_updates_batch_200",
+          "median_ms": 4.642381,
+          "min_ms": 4.452203,
+          "max_ms": 5.064415,
+          "samples_ms": [
+            4.642381,
+            4.452203,
+            5.064415
+          ],
+          "warmup": true,
+          "mean_ms": 4.7196663333333335
+        },
+        {
+          "name": "object_identical_metadata_write",
+          "median_ms": 0.959078,
+          "min_ms": 0.942326,
+          "max_ms": 1.54929,
+          "samples_ms": [
+            1.54929,
+            0.942326,
+            0.959078
+          ],
+          "warmup": true,
+          "mean_ms": 1.1502313333333334
+        },
+        {
+          "name": "object_identical_write_effects",
+          "generation_delta": 4,
+          "journal_entries": 4,
+          "writes": 4,
+          "approval_before": "approved",
+          "approval_after": "pending"
+        },
+        {
+          "name": "edge_200_metadata_updates_batch_1",
+          "median_ms": 247.721853,
+          "min_ms": 243.999446,
+          "max_ms": 250.282333,
+          "samples_ms": [
+            247.721853,
+            250.282333,
+            243.999446
+          ],
+          "warmup": true,
+          "mean_ms": 247.334544
+        },
+        {
+          "name": "edge_200_metadata_updates_batch_200",
+          "median_ms": 8.302995,
+          "min_ms": 8.19237,
+          "max_ms": 8.868102,
+          "samples_ms": [
+            8.868102,
+            8.19237,
+            8.302995
+          ],
+          "warmup": true,
+          "mean_ms": 8.454489
+        },
+        {
+          "name": "edge_identical_metadata_write",
+          "median_ms": 0.968598,
+          "min_ms": 0.954806,
+          "max_ms": 1.476297,
+          "samples_ms": [
+            0.968598,
+            0.954806,
+            1.476297
+          ],
+          "warmup": true,
+          "mean_ms": 1.1332336666666667
+        },
+        {
+          "name": "edge_identical_write_effects",
+          "generation_delta": 4,
+          "journal_entries": 4,
+          "writes": 4,
+          "approval_before": "approved",
+          "approval_after": "pending"
+        },
+        {
+          "name": "review_page_python_profile",
+          "top_cumulative": [
+            {
+              "function": "('/home/sean/villa/volume-cartographer/scripts/benchmark_object_store_metadata.py', 101, 'reviewed_page')",
+              "calls": 1,
+              "self_seconds": 0.091409076,
+              "cumulative_seconds": 0.14627808
+            },
+            {
+              "function": "('/home/sean/.local/share/uv/python/cpython-3.14.0-linux-aarch64-gnu/lib/python3.14/json/__init__.py', 299, 'loads')",
+              "calls": 10000,
+              "self_seconds": 0.0046685400000000005,
+              "cumulative_seconds": 0.054869004000000006
+            },
+            {
+              "function": "('/home/sean/.local/share/uv/python/cpython-3.14.0-linux-aarch64-gnu/lib/python3.14/json/decoder.py', 340, 'decode')",
+              "calls": 10000,
+              "self_seconds": 0.011972075,
+              "cumulative_seconds": 0.048746001000000004
+            },
+            {
+              "function": "('/home/sean/.local/share/uv/python/cpython-3.14.0-linux-aarch64-gnu/lib/python3.14/json/decoder.py', 351, 'raw_decode')",
+              "calls": 10000,
+              "self_seconds": 0.030088769,
+              "cumulative_seconds": 0.030088769
+            },
+            {
+              "function": "('~', 0, \"<method 'match' of 're.Pattern' objects>\")",
+              "calls": 20000,
+              "self_seconds": 0.004386921,
+              "cumulative_seconds": 0.004386921
+            },
+            {
+              "function": "('~', 0, \"<method 'end' of 're.Match' objects>\")",
+              "calls": 20000,
+              "self_seconds": 0.001590599,
+              "cumulative_seconds": 0.001590599
+            },
+            {
+              "function": "('~', 0, \"<method 'startswith' of 'str' objects>\")",
+              "calls": 10000,
+              "self_seconds": 0.0007657520000000001,
+              "cumulative_seconds": 0.0007657520000000001
+            },
+            {
+              "function": "('~', 0, '<built-in method builtins.len>')",
+              "calls": 10000,
+              "self_seconds": 0.000707637,
+              "cumulative_seconds": 0.000707637
+            }
+          ]
+        },
+        {
+          "name": "store_bytes",
+          "bytes": 103260160
+        },
+        {
+          "name": "sql_rare_edge_ids_index_False_lower_bound",
+          "median_ms": 0.00408,
+          "min_ms": 0.003984,
+          "max_ms": 0.005312,
+          "samples_ms": [
+            0.005312,
+            0.004736,
+            0.00408,
+            0.003984,
+            0.003985
+          ],
+          "warmup": true,
+          "plan": [
+            [
+              3,
+              0,
+              54,
+              "SEARCH edges USING COVERING INDEX edges_unique (kind=?)"
+            ],
+            [
+              11,
+              0,
+              0,
+              "USE TEMP B-TREE FOR ORDER BY"
+            ]
+          ],
+          "mean_ms": 0.0044193999999999995
+        },
+        {
+          "name": "sql_approved_crossing_page_index_False_lower_bound",
+          "median_ms": 8.355139,
+          "min_ms": 8.314291,
+          "max_ms": 8.604181,
+          "samples_ms": [
+            8.486052,
+            8.604181,
+            8.355139,
+            8.314291,
+            8.336291
+          ],
+          "warmup": true,
+          "plan": [
+            [
+              7,
+              0,
+              62,
+              "SEARCH e USING INDEX edges_unique (kind=?)"
+            ],
+            [
+              14,
+              0,
+              45,
+              "SEARCH a USING INTEGER PRIMARY KEY (rowid=?)"
+            ],
+            [
+              17,
+              0,
+              45,
+              "SEARCH b USING INTEGER PRIMARY KEY (rowid=?)"
+            ],
+            [
+              35,
+              0,
+              0,
+              "USE TEMP B-TREE FOR ORDER BY"
+            ]
+          ],
+          "mean_ms": 8.4191908
+        },
+        {
+          "name": "sql_rare_edge_ids_index_True_lower_bound",
+          "median_ms": 0.003488,
+          "min_ms": 0.00328,
+          "max_ms": 0.004032,
+          "samples_ms": [
+            0.004032,
+            0.00336,
+            0.003808,
+            0.00328,
+            0.003488
+          ],
+          "warmup": true,
+          "plan": [
+            [
+              3,
+              0,
+              53,
+              "SEARCH edges USING COVERING INDEX benchmark_kind_approval (kind=?)"
+            ],
+            [
+              11,
+              0,
+              0,
+              "USE TEMP B-TREE FOR ORDER BY"
+            ]
+          ],
+          "mean_ms": 0.0035936
+        },
+        {
+          "name": "sql_approved_crossing_page_index_True_lower_bound",
+          "median_ms": 0.178161,
+          "min_ms": 0.175873,
+          "max_ms": 0.190786,
+          "samples_ms": [
+            0.190786,
+            0.180721,
+            0.177441,
+            0.175873,
+            0.178161
+          ],
+          "warmup": true,
+          "plan": [
+            [
+              7,
+              0,
+              61,
+              "SEARCH e USING INDEX benchmark_kind_approval (kind=? AND approval_state=?)"
+            ],
+            [
+              13,
+              0,
+              45,
+              "SEARCH a USING INTEGER PRIMARY KEY (rowid=?)"
+            ],
+            [
+              16,
+              0,
+              45,
+              "SEARCH b USING INTEGER PRIMARY KEY (rowid=?)"
+            ]
+          ],
+          "mean_ms": 0.1805964
+        }
+      ],
+      "peak_rss_bytes": 257597440
+    }
+  ]
+}

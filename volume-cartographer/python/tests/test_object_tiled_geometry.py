@@ -172,7 +172,7 @@ def test_v5_open_does_not_rewrite_history(tmp_path):
     with ObjectStore.open(path, author='test') as db:
         assert (db.uuid, db.export_json(), db.journal_since(), manifest(db, rev)) == before
         assert db.put_geometry(uid, data, expected_revision=rev) == rev
-    assert sqlite_rows(path, 'PRAGMA user_version')[0][0] == 6
+    assert sqlite_rows(path, 'PRAGMA user_version')[0][0] == 7
 
 
 def test_corrupt_tiles_are_checked_on_each_operation_and_sync(db, tmp_path):

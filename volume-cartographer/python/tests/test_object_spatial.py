@@ -187,7 +187,7 @@ def test_migration_backfills_actual_geometry_and_preserves_identity(tmp_path, ve
         assert len(hits) == 1 and hits[0]["object_uuid"] == uid
         assert hits[0]["array_name"] == "points" and hits[0]["shape"] == [1]
     with sqlite3.connect(path) as sql:
-        assert sql.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert sql.execute("PRAGMA user_version").fetchone()[0] == 7
         assert sql.execute("PRAGMA foreign_key_check").fetchall() == []
 
 

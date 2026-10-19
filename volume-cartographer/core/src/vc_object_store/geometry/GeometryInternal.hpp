@@ -26,6 +26,18 @@ inline std::string geometryHash(std::span<const uint8_t> bytes)
     }
     return result;
 }
+inline nlohmann::json verifiedGeometryManifest(const std::string& text, const std::string& hash)
+{
+    if (geometryHash(std::span(reinterpret_cast<const uint8_t*>(text.data()), text.size())) != hash)
+        throw std::runtime_error("geometry: corrupt revision manifest");
+    return nlohmann::json::parse(text);
+}
+inline void verifyGeometryChunk(std::span<const uint8_t> bytes, const std::string& storedHash,
+                                const std::string& expectedHash, int64_t expectedSize)
+{
+    if (static_cast<int64_t>(bytes.size()) != expectedSize || storedHash != expectedHash || geometryHash(bytes) != expectedHash)
+        throw std::runtime_error("geometry: corrupt payload chunk");
+}
 inline int64_t geometryByteLength(const std::string& dtype, const std::vector<int64_t>& shape)
 {
     int64_t bytes;
@@ -61,6 +73,19 @@ struct GeometryLayout {
         return rect[2] * rect[3] * 12;
     }
 };
+// Copy one physical chunk into its full logical row-major array destination.
+inline void copyGeometryChunk(const GeometryLayout& layout, int64_t index,
+                              std::span<const uint8_t> bytes, uint8_t* destination)
+{
+    if (!layout.tile) {
+        std::memcpy(destination + index * geometryChunkSize, bytes.data(), bytes.size());
+    } else {
+        const auto [y, x, h, w] = layout.rectangle(index);
+        for (int64_t row = 0; row < h; ++row)
+            std::memcpy(destination + ((y + row) * layout.cols + x) * 12,
+                        bytes.data() + row * w * 12, w * 12);
+    }
+}
 inline void validatePatchTileSize(int64_t size) {
     if (size != 0 && size != 32 && size != 64 && size != 128)
         throw std::invalid_argument("patch tile size must be 0 (linear), 32, 64, or 128");

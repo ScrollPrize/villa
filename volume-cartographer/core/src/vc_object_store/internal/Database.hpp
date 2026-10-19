@@ -34,6 +34,9 @@ namespace detail { class GeometryReadCache; class SpatialReadCache; }
 // Connections are leased to one thread per transaction. Cache idle statements
 // on the connection; the thread-local registry only identifies the active lease.
 struct StatementPool {
+    bool readSnapshot = false;
+    std::map<std::string, std::vector<int64_t>> components;
+    size_t componentNodes = 0;
     std::shared_ptr<detail::GeometryReadCache> geometryCache;
     std::shared_ptr<detail::SpatialReadCache> spatialCache;
     std::unordered_multimap<std::string, sqlite3_stmt*> idle;

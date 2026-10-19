@@ -32,7 +32,7 @@ struct ProgressGuard {
     ~ProgressGuard() { sqlite3_progress_handler(db, 0, nullptr, nullptr); }
 };
 
-std::vector<std::string> traverse(sqlite3* db, const std::string& startUuid, int maxDepth,
+std::vector<int64_t> traverse(sqlite3* db, const std::string& startUuid, int maxDepth,
                                   const std::vector<std::string>& edgeKindFilter, const std::atomic_bool* cancel)
 {
     auto checkCancelled = [&] {
@@ -62,7 +62,7 @@ std::vector<std::string> traverse(sqlite3* db, const std::string& startUuid, int
         " UNION SELECT id,a_id FROM edges INDEXED BY edges_b WHERE b_id=?1" + filter + " ORDER BY id";
     Statement adjacent(db, sql);
     const int64_t startId = *objectIdByUuid(db, startBytes);
-    std::vector<std::string> out;
+    std::vector<int64_t> out;
     std::unordered_set<int64_t> visited{startId};
     std::queue<std::pair<int64_t, int>> queue;
     queue.emplace(startId, 0);
@@ -70,7 +70,7 @@ std::vector<std::string> traverse(sqlite3* db, const std::string& startUuid, int
         checkCancelled();
         auto [id, depth] = queue.front();
         queue.pop();
-        out.push_back(uuidTextByObjectId(db, id));
+        out.push_back(id);
         if (depth >= maxDepth) continue;
         adjacent.reset();
         adjacent.bind(1, id);
@@ -89,13 +89,44 @@ std::vector<std::string> traverse(sqlite3* db, const std::string& startUuid, int
     return out;
 }
 
+std::vector<std::string> uuidList(sqlite3* db, const std::vector<int64_t>& ids)
+{
+    Statement rows(db, "SELECT id,uuid FROM objects WHERE id IN (SELECT value FROM json_each(?))");
+    rows.bind(1, nlohmann::json(ids).dump());
+    std::unordered_map<int64_t, std::string> uuids;
+    while (rows.row()) uuids.emplace(rows.i64(0), formatUuid(rows.blob16(1)));
+    std::vector<std::string> result;
+    result.reserve(ids.size());
+    for (auto id : ids) result.push_back(uuids.at(id));
+    return result;
+}
 }  // namespace
+
+std::vector<int64_t> detail::componentIds(sqlite3* db, const std::string& start,
+                                        const std::vector<std::string>& kinds)
+{
+    StatementPool* pool = nullptr;
+    if (auto it = activeStatementPools.find(db); it != activeStatementPools.end() && it->second->readSnapshot)
+        pool = it->second;
+    const auto key = nlohmann::json({formatUuid(parseUuid(start)), kinds}).dump();
+    if (pool) if (auto it = pool->components.find(key); it != pool->components.end()) return it->second;
+    auto ids = traverse(db, start, INT_MAX, kinds, nullptr);
+    // Bound the transaction-local membership cache; never reuse across snapshots.
+    if (pool && ids.size() <= 262144) {
+        if (pool->componentNodes + ids.size() > 262144) { pool->components.clear(); pool->componentNodes = 0; }
+        pool->componentNodes += ids.size();
+        pool->components.emplace(key, ids);
+    }
+    return ids;
+}
 
 std::vector<std::string> ObjectStore::componentOf(const Txn& txn, const std::string& objectUuid,
                                               const std::vector<std::string>& edgeKindFilter,
                                               const std::atomic_bool* cancel) const
 {
-    return traverse(static_cast<sqlite3*>(connection(txn)), objectUuid, INT_MAX, edgeKindFilter, cancel);
+    auto* db = static_cast<sqlite3*>(connection(txn));
+    return uuidList(db, cancel ? traverse(db, objectUuid, INT_MAX, edgeKindFilter, cancel)
+                              : componentIds(db, objectUuid, edgeKindFilter));
 }
 
 std::vector<std::string> ObjectStore::reachableWithin(const Txn& txn, const std::string& objectUuid, int maxDepth,
@@ -103,7 +134,51 @@ std::vector<std::string> ObjectStore::reachableWithin(const Txn& txn, const std:
                                                   const std::atomic_bool* cancel) const
 {
     if (maxDepth < 0) throw std::runtime_error("object store: maxDepth must be >= 0");
-    return traverse(static_cast<sqlite3*>(connection(txn)), objectUuid, maxDepth, edgeKindFilter, cancel);
+    auto* db = static_cast<sqlite3*>(connection(txn));
+    return uuidList(db, traverse(db, objectUuid, maxDepth, edgeKindFilter, cancel));
+}
+
+GraphReadView ObjectStore::graphReadView(const Txn& txn, const ObjectSelection& objects,
+                                       const EdgeSelection& edges) const
+{
+    auto* db = static_cast<sqlite3*>(connection(txn));
+    GraphReadView result;
+    if (edges.endpointUuids)
+        throw std::invalid_argument("graph endpoint scope is specified by its object selection");
+    std::unordered_map<int64_t, uint64_t> nodes;
+    std::vector<int64_t> ids;
+    auto objectsQuery = objectSelectionQuery(db, objects,
+        "o.id,o.uuid,o.generation,(SELECT revision_uuid FROM geometry_heads WHERE object_uuid=o.uuid)");
+    while (objectsQuery->row()) {
+        const auto node = result.objectUuids.size();
+        const auto id = objectsQuery->i64(0);
+        nodes.emplace(id, node); ids.push_back(id);
+        result.objectUuids.push_back(formatUuid(objectsQuery->blob16(1)));
+        result.generations.push_back(objectsQuery->i64(2));
+        result.geometryRevisions.push_back(objectsQuery->isNull(3) ? std::nullopt :
+            std::optional(formatUuid(objectsQuery->blob16(3))));
+    }
+    auto selection = edges; selection.bothEndpoints = true;
+    auto links = edgeSelectionQuery(db, selection, "uuid,a_id,b_id", ids);
+    while (links->row()) {
+        result.edgeUuids.push_back(formatUuid(links->blob16(0)));
+        result.endpoints.push_back({nodes.at(links->i64(1)), nodes.at(links->i64(2))});
+    }
+    result.offsets.resize(nodes.size() + 1);
+    for (const auto& [a, b] : result.endpoints) { ++result.offsets[a+1]; ++result.offsets[b+1]; }
+    for (size_t i = 1; i < result.offsets.size(); ++i) result.offsets[i] += result.offsets[i-1];
+    result.neighbours.resize(result.offsets.back()); result.edgeIndices.resize(result.offsets.back());
+    auto next = result.offsets;
+    for (size_t edge = 0; edge < result.endpoints.size(); ++edge) {
+        const auto [a, b] = result.endpoints[edge];
+        for (const auto& [from, to] : {std::pair{a, b}, std::pair{b, a}}) {
+            const auto slot = next[from]++;
+            result.neighbours[slot] = to; result.edgeIndices[slot] = edge;
+        }
+    }
+    Statement journal(db, "SELECT coalesce(max(seq),0) FROM journal");
+    (void)journal.row(); result.journalSequence = journal.i64(0);
+    return result;
 }
 
 } // namespace vc::objects

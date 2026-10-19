@@ -51,6 +51,9 @@ ReadTxn ObjectStore::read()
     sqlite3* conn = impl_->checkoutReader();
     try {
         activeStatementPools[conn] = impl_->statementPools.at(conn).get();
+        auto& pool = *impl_->statementPools.at(conn);
+        pool.readSnapshot = true;
+        pool.components.clear(); pool.componentNodes = 0;
         exec(conn, "BEGIN;");
         // Establish the snapshot now, so all reads in this transaction
         // see one consistent state even before the first real query.
@@ -73,6 +76,7 @@ WriteTxn ObjectStore::write()
         throw std::runtime_error("object store: handle is read-only");
     std::unique_lock<std::mutex> lock(impl_->writerMutex);
     activeStatementPools[impl_->writer] = impl_->statementPools.at(impl_->writer).get();
+    impl_->statementPools.at(impl_->writer)->readSnapshot = false;
     try { exec(impl_->writer, "BEGIN IMMEDIATE;"); }
     catch (...) { activeStatementPools.erase(impl_->writer); throw; }
     lock.release(); // WriteTxn releases the mutex on commit or rollback.
