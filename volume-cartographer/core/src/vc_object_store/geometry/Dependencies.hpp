@@ -2,6 +2,7 @@
 #include "vc/core/objects/ObjectStore.hpp"
 #include "geometry/GeometrySnapshot.hpp"
 #include <functional>
+#include "geometry/GeometryReader.hpp"
 
 namespace vc::objects::detail {
 // A bounded reader for either a published revision or a proposed payload.
@@ -9,15 +10,45 @@ struct DependencyGeometry {
     std::string kind, attributes;
     std::map<std::string, GeometryArrayInfo> arrays;
     std::function<std::vector<uint8_t>(const std::string&, int64_t, int64_t)> read;
+    struct PointIndex {
+        bool loaded = false;
+        std::vector<std::pair<int64_t, int64_t>> offsets;
+    };
+    std::shared_ptr<PointIndex> pointIndex = std::make_shared<PointIndex>();
+};
+
+// Nested helpers in a publication/repair share revision readers. The cache is
+// confined to this operation, not the connection or a future transaction.
+using DependencyCache = std::map<std::pair<const Txn*, std::string>, DependencyGeometry>;
+inline thread_local DependencyCache* activeDependencies = nullptr;
+class DependencyScope {
+    std::unique_ptr<DependencyCache> owned_;
+public:
+    DependencyScope() {
+        if (!activeDependencies) {
+            owned_ = std::make_unique<DependencyCache>(); activeDependencies = owned_.get();
+        }
+    }
+    ~DependencyScope() { if (owned_) activeDependencies = nullptr; }
 };
 
 inline DependencyGeometry dependencyGeometry(const ObjectStore& db, const Txn& txn, const GeometryRevision& revision)
 {
+    const auto key = std::make_pair(&txn, revision.uuid);
+    if (activeDependencies) {
+        const auto cached = activeDependencies->find(key);
+        if (cached != activeDependencies->end()) return cached->second;
+    }
     DependencyGeometry result{revision.kind, revision.attributes, {}, {}};
     for (const auto& array : revision.arrays) result.arrays.emplace(array.name, array);
-    result.read = [&db, &txn, uuid = revision.uuid](const auto& name, auto offset, auto count) {
-        return db.readGeometryArray(txn, uuid, name, offset, count);
+    auto reader = std::make_shared<GeometryReader>(txn, revision.uuid);
+    result.read = [reader](const auto& name, auto offset, auto count) {
+        return reader->read(name, offset, count);
     };
+    if (activeDependencies) {
+        if (activeDependencies->size() == 8) activeDependencies->erase(activeDependencies->begin());
+        activeDependencies->emplace(key, result);
+    }
     return result;
 }
 
@@ -44,14 +75,21 @@ inline std::optional<std::vector<uint8_t>> pointValue(const DependencyGeometry& 
         if (geometry.kind != "point_collection" || index.size() != 1 || index[0] < 0) return std::nullopt;
         const auto found = geometry.arrays.find(name);
         if (found == geometry.arrays.end()) return std::nullopt;
-        GeometrySnapshot snapshot;
-        snapshot.arrays[name] = geometry.read(name, 0, found->second.byteLength);
-        const auto ids = snapshot.values<int64_t>(name);
-        const auto id = std::find(ids.begin(), ids.end(), index[0]);
-        if (id == ids.end()) return std::nullopt;
-        if (std::find(id + 1, ids.end(), index[0]) != ids.end())
+        auto& cache = *geometry.pointIndex;
+        if (!cache.loaded) {
+            GeometrySnapshot snapshot;
+            snapshot.arrays[name] = geometry.read(name, 0, found->second.byteLength);
+            const auto ids = snapshot.values<int64_t>(name);
+            cache.offsets.reserve(ids.size());
+            for (size_t i = 0; i < ids.size(); ++i) cache.offsets.emplace_back(ids[i], int64_t(i));
+            std::sort(cache.offsets.begin(), cache.offsets.end());
+            cache.loaded = true;
+        }
+        const auto id = std::lower_bound(cache.offsets.begin(), cache.offsets.end(), std::pair{index[0], int64_t(0)});
+        if (id == cache.offsets.end() || id->first != index[0]) return std::nullopt;
+        if (id + 1 != cache.offsets.end() && (id + 1)->first == index[0])
             throw std::runtime_error("geometry dependency has ambiguous point ID");
-        index = {static_cast<int64_t>(id - ids.begin())}; name = "points";
+        index = {id->second}; name = "points";
     } else {
         // Collections use stable IDs, never vector offsets.
         if (geometry.kind == "point_collection") return std::nullopt;

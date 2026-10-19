@@ -3,6 +3,61 @@
 #include "geometry/Dependencies.hpp"
 
 namespace vc::objects {
+namespace detail {
+GeometryReader::GeometryReader(const Txn& txn, const std::string& revision, bool cacheChunks)
+    : txn_(txn), revision_(parseUuid(revision)), cacheChunks_(cacheChunks)
+{
+    Statement row(ObjectStoreImplAccess::conn(txn_), "SELECT content_hash,manifest FROM geometry_revisions WHERE uuid=?");
+    row.bindBlob(1, revision_);
+    if (!row.row()) throw std::invalid_argument("geometry: revision not found");
+    const auto text = row.text(1);
+    if (geometryHash(std::span(reinterpret_cast<const uint8_t*>(text.data()), text.size())) != row.text(0))
+        throw std::runtime_error("geometry: corrupt revision manifest");
+    manifest_ = nlohmann::json::parse(text);
+}
+
+std::vector<uint8_t> GeometryReader::read(const std::string& name, int64_t offset, std::optional<int64_t> count)
+{
+    auto* db = ObjectStoreImplAccess::conn(txn_);
+    const auto& arrays = manifest_.at("arrays");
+    if (!arrays.contains(name)) throw std::invalid_argument("geometry: array not found: " + name);
+    const auto& array = arrays.at(name);
+    const int64_t length = array.at("byte_length");
+    if (offset < 0 || offset > length) throw std::out_of_range("geometry: invalid byte offset");
+    const int64_t size = count.value_or(length - offset);
+    if (size < 0 || size > length - offset) throw std::out_of_range("geometry: invalid byte count");
+    std::vector<uint8_t> result(static_cast<size_t>(size));
+    if (!size) return result;
+    Statement chunk(db, "SELECT c.data,r.hash FROM geometry_revision_chunks r JOIN geometry_chunks c ON c.hash=r.hash "
+                        "WHERE r.revision_uuid=? AND r.array_name=? AND r.chunk_index=?");
+    for (int64_t index = offset / geometryChunkSize; index <= (offset + size - 1) / geometryChunkSize; ++index) {
+        const int64_t base = index * geometryChunkSize;
+        const auto key = std::make_pair(name, index);
+        auto found = chunks_.find(key);
+        if (found == chunks_.end()) {
+            chunk.reset(); chunk.bindBlob(1, revision_); chunk.bind(2, name); chunk.bind(3, index);
+            if (!chunk.row()) throw std::runtime_error("geometry: missing payload chunk");
+            const auto bytes = std::span(static_cast<const uint8_t*>(sqlite3_column_blob(chunk.value, 0)),
+                                        static_cast<size_t>(sqlite3_column_bytes(chunk.value, 0)));
+            if (static_cast<int64_t>(bytes.size()) != std::min<int64_t>(geometryChunkSize, length - base) ||
+                chunk.text(1) != array.at("chunks").at(index).get<std::string>() || geometryHash(bytes) != chunk.text(1))
+                throw std::runtime_error("geometry: corrupt payload chunk");
+            if (!cacheChunks_) {
+                const auto begin = std::max(base, offset), end = std::min(base + int64_t(bytes.size()), offset + size);
+                std::memcpy(result.data() + begin - offset, bytes.data() + begin - base, size_t(end - begin));
+                continue;
+            }
+            // At most eight 1 MiB chunks per reader, independently of array size.
+            if (chunks_.size() == 8) chunks_.erase(chunks_.begin());
+            found = chunks_.emplace(key, std::vector<uint8_t>(bytes.begin(), bytes.end())).first;
+        }
+        const auto begin = std::max(base, offset), end = std::min(base + int64_t(found->second.size()), offset + size);
+        std::memcpy(result.data() + begin - offset, found->second.data() + begin - base, size_t(end - begin));
+    }
+    return result;
+}
+
+} // namespace detail
 namespace {
 GeometryRevision readGeometryRevision(const Statement& s)
 {
@@ -49,30 +104,42 @@ std::vector<GeometryRevision> ObjectStore::geometryHistory(const Txn& txn, const
     return result;
 }
 
+namespace {
+std::vector<EdgeRecord> affectedEdges(const ObjectStore& store, const Txn& txn, const std::string& objectUuid,
+    const std::optional<GeometryRevision>& current, const detail::DependencyGeometry& after)
+{
+    const auto edges = store.edgesOf(txn, objectUuid);
+    if (edges.empty()) return {};
+    const auto before = current ? std::optional(detail::dependencyGeometry(store, txn, *current)) : std::nullopt;
+    std::vector<EdgeRecord> result;
+    for (const auto& edge : edges) {
+        const auto changed = [&](const Anchor& anchor) {
+            return !before || detail::dependenciesChanged(anchor, *before, after);
+        };
+        if ((edge.aUuid == objectUuid && changed(edge.aAnchor)) ||
+            (edge.bUuid == objectUuid && changed(edge.bAnchor))) result.push_back(edge);
+    }
+    return result;
+}
+}
+
 std::vector<EdgeRecord> ObjectStore::affectedGeometryEdges(const Txn& txn, const std::string& objectUuid,
                                                          const GeometryData& data) const
 {
+    detail::DependencyScope dependencyScope;
     const auto object = objectByUuid(txn, objectUuid);
     if (!object || object->kind != data.kind) throw std::invalid_argument("geometry: object missing or kind mismatch");
     const auto manifest = detail::geometryManifest(data).dump();
     const auto current = currentGeometry(txn, objectUuid);
     if (current && current->contentHash == detail::geometryHash(std::span(reinterpret_cast<const uint8_t*>(manifest.data()), manifest.size())))
         return {};
-    const auto after = detail::dependencyGeometry(data);
-    std::vector<EdgeRecord> result;
-    for (const auto& edge : edgesOf(txn, objectUuid)) {
-        const auto changed = [&](const Anchor& anchor) {
-            return !current || detail::dependenciesChanged(anchor, detail::dependencyGeometry(*this, txn, *current), after);
-        };
-        if ((edge.aUuid == object->uuid && changed(edge.aAnchor)) ||
-            (edge.bUuid == object->uuid && changed(edge.bAnchor))) result.push_back(edge);
-    }
-    return result;
+    return affectedEdges(*this, txn, object->uuid, current, detail::dependencyGeometry(data));
 }
 
 std::string ObjectStore::putGeometry(WriteTxn& txn, const std::string& objectUuid, const GeometryData& data,
     const std::optional<std::string>& expectedRevision, const std::vector<GeometryEdgeEdit>& edgeEdits)
 {
+    detail::DependencyScope dependencyScope;
     (void)connection(txn);
     auto* db = static_cast<sqlite3*>(connection(txn));
     const auto object = objectByUuid(txn, objectUuid);
@@ -88,13 +155,13 @@ std::string ObjectStore::putGeometry(WriteTxn& txn, const std::string& objectUui
         if (!edgeEdits.empty()) throw std::invalid_argument("geometry is unchanged; edit relationships directly");
         return current->uuid;
     }
-    const auto affected = affectedGeometryEdges(txn, objectUuid, data);
+    const auto after = detail::dependencyGeometry(data);
+    const auto affected = affectedEdges(*this, txn, object->uuid, current, after);
     std::map<std::string, GeometryEdgeEdit> decisions;
     for (const auto& edit : edgeEdits) {
         const auto uuid = formatUuid(parseUuid(edit.edgeUuid));
         if (!decisions.emplace(uuid, edit).second) throw std::invalid_argument("duplicate geometry edge decision");
     }
-    const auto after = detail::dependencyGeometry(data);
     for (const auto& edge : affected) {
         const auto found = decisions.find(edge.uuid);
         if (found == decisions.end())
@@ -178,33 +245,18 @@ std::string ObjectStore::putGeometry(WriteTxn& txn, const std::string& objectUui
 std::vector<uint8_t> ObjectStore::readGeometryArray(const Txn& txn, const std::string& revisionUuid,
     const std::string& arrayName, int64_t byteOffset, const std::optional<int64_t>& byteCount) const
 {
-    const auto revision = geometryRevision(txn, revisionUuid);
-    if (!revision) throw std::invalid_argument("geometry: revision not found");
-    const auto array = std::find_if(revision->arrays.begin(), revision->arrays.end(), [&](const auto& a) { return a.name == arrayName; });
-    if (array == revision->arrays.end()) throw std::invalid_argument("geometry: array not found: " + arrayName);
-    if (byteOffset < 0 || byteOffset > array->byteLength) throw std::out_of_range("geometry: invalid byte offset");
-    const auto count = byteCount.value_or(array->byteLength - byteOffset);
-    if (count < 0 || count > array->byteLength - byteOffset) throw std::out_of_range("geometry: invalid byte count");
-    std::vector<uint8_t> result(static_cast<size_t>(count));
-    if (!count) return result;
-    auto* db = static_cast<sqlite3*>(connection(txn));
-    Statement manifestQuery(db, "SELECT manifest FROM geometry_revisions WHERE uuid=?");
-    manifestQuery.bindBlob(1, parseUuid(revisionUuid)); (void)manifestQuery.row();
-    const auto hashes = nlohmann::json::parse(manifestQuery.text(0)).at("arrays").at(arrayName).at("chunks");
-    const auto first = byteOffset / detail::geometryChunkSize, last = (byteOffset + count - 1) / detail::geometryChunkSize;
-    Statement chunk(db, "SELECT c.data,r.hash FROM geometry_revision_chunks r JOIN geometry_chunks c ON c.hash=r.hash "
-        "WHERE r.revision_uuid=? AND r.array_name=? AND r.chunk_index=?");
-    for (auto i = first; i <= last; ++i) {
-        chunk.reset(); chunk.bindBlob(1, parseUuid(revisionUuid)); chunk.bind(2, arrayName); chunk.bind(3, static_cast<int64_t>(i));
-        if (!chunk.row()) throw std::runtime_error("geometry: missing payload chunk");
-        const auto bytes = std::span(static_cast<const uint8_t*>(sqlite3_column_blob(chunk.value, 0)), static_cast<size_t>(sqlite3_column_bytes(chunk.value, 0)));
-        const auto base = static_cast<int64_t>(i * detail::geometryChunkSize);
-        if (static_cast<int64_t>(bytes.size()) != std::min<int64_t>(detail::geometryChunkSize, array->byteLength - base) ||
-            chunk.text(1) != hashes.at(i).get<std::string>() || detail::geometryHash(bytes) != chunk.text(1))
-            throw std::runtime_error("geometry: corrupt payload chunk");
-        const auto begin = std::max(base, byteOffset), end = std::min(base + static_cast<int64_t>(bytes.size()), byteOffset + count);
-        std::memcpy(result.data() + begin - byteOffset, bytes.data() + begin - base, static_cast<size_t>(end - begin));
-    }
+    (void)connection(txn);
+    return detail::GeometryReader(txn, revisionUuid, false).read(arrayName, byteOffset, byteCount);
+}
+
+std::vector<std::vector<uint8_t>> ObjectStore::readGeometryRanges(const Txn& txn, const std::string& revisionUuid,
+    const std::string& arrayName, const std::vector<std::array<int64_t, 2>>& ranges) const
+{
+    (void)connection(txn);
+    detail::GeometryReader reader(txn, revisionUuid);
+    std::vector<std::vector<uint8_t>> result;
+    result.reserve(ranges.size());
+    for (const auto& range : ranges) result.push_back(reader.read(arrayName, range[0], range[1]));
     return result;
 }
 

@@ -4,6 +4,7 @@
 namespace vc::objects {
 void ObjectStore::repairEdgeGeometry(WriteTxn& txn, const EdgeGeometryRepair& repair)
 {
+    detail::DependencyScope dependencyScope;
     auto* db = static_cast<sqlite3*>(connection(txn));
     const auto edge = edgeByUuid(txn, repair.edgeUuid);
     if (!edge) throw std::runtime_error("geometry repair: edge not found");
@@ -58,6 +59,7 @@ void ObjectStore::repairEdgeGeometry(WriteTxn& txn, const EdgeGeometryRepair& re
 
 EdgeGeometryState ObjectStore::edgeGeometryState(const Txn& txn, const std::string& edgeUuid) const
 {
+    detail::DependencyScope dependencyScope;
     (void)connection(txn);
     auto* db = static_cast<sqlite3*>(connection(txn));
     const auto edge = edgeByUuid(txn, edgeUuid);

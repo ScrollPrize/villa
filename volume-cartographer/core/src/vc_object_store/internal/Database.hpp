@@ -30,6 +30,13 @@
 #include "vc/core/util/Uuid.hpp"
 
 namespace vc::objects {
+// Connections are leased to one thread per transaction. Cache idle statements
+// on the connection; the thread-local registry only identifies the active lease.
+struct StatementPool {
+    std::unordered_multimap<std::string, sqlite3_stmt*> idle;
+    ~StatementPool() { for (auto& [sql, stmt] : idle) sqlite3_finalize(stmt); }
+};
+inline thread_local std::unordered_map<sqlite3*, StatementPool*> activeStatementPools;
 struct ObjectStore::Impl {
     std::filesystem::path path;
     OpenOptions options;
@@ -40,9 +47,11 @@ struct ObjectStore::Impl {
     std::mutex poolMutex;
     std::condition_variable poolCv;
     bool closing = false;
+    std::map<sqlite3*, std::unique_ptr<StatementPool>> statementPools;
 
     ~Impl()
     {
+        statementPools.clear();
         for (sqlite3* c : readerPool)
             if (c) sqlite3_close(c);
         if (writer) sqlite3_close(writer);
@@ -101,12 +110,26 @@ void exec(sqlite3* db, const char* sql)
 
 class Statement {
 public:
-    Statement(sqlite3* db, const char* sql) : db_(db)
+    Statement(sqlite3* db, const char* sql) : db_(db), sql_(sql)
     {
+        if (auto lease = activeStatementPools.find(db); lease != activeStatementPools.end()) {
+            pool_ = lease->second;
+            if (auto cached = pool_->idle.find(sql_); cached != pool_->idle.end()) {
+                value = cached->second; pool_->idle.erase(cached); return;
+            }
+        }
         check(sqlite3_prepare_v2(db, sql, -1, &value, nullptr), db, "prepare");
     }
     Statement(sqlite3* db, const std::string& sql) : Statement(db, sql.c_str()) {}
-    ~Statement() { sqlite3_finalize(value); }
+    ~Statement() {
+        sqlite3_reset(value);
+        sqlite3_clear_bindings(value); // release SQLITE_STATIC buffers too
+        const auto lease = activeStatementPools.find(db_);
+        if (pool_ && lease != activeStatementPools.end() && lease->second == pool_ && pool_->idle.size() < 128) {
+            try { pool_->idle.emplace(sql_, value); return; } catch (...) {}
+        }
+        sqlite3_finalize(value);
+    }
     Statement(const Statement&) = delete;
     Statement& operator=(const Statement&) = delete;
 
@@ -161,6 +184,8 @@ public:
 
 private:
     sqlite3* db_;
+    std::string sql_;
+    StatementPool* pool_ = nullptr;
 };
 
 std::array<unsigned char, 16> parseUuid(const std::string& uuid)

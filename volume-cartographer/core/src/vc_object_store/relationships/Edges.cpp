@@ -4,6 +4,7 @@
 namespace vc::objects {
 std::string ObjectStore::addEdge(WriteTxn& txn, const EdgeRecord& record)
 {
+    detail::DependencyScope dependencyScope;
     for (const auto& [uuid, anchor] : {std::pair{record.aUuid, record.aAnchor}, std::pair{record.bUuid, record.bAnchor}})
         if (const auto revision = currentGeometry(txn, uuid))
             detail::validateDependencies(anchor, detail::dependencyGeometry(*this, txn, *revision));
@@ -12,6 +13,7 @@ std::string ObjectStore::addEdge(WriteTxn& txn, const EdgeRecord& record)
 
 void ObjectStore::updateEdge(WriteTxn& txn, const EdgeRecord& record)
 {
+    detail::DependencyScope dependencyScope;
     auto* db = static_cast<sqlite3*>(connection(txn));
     const auto existing = edgeByUuid(txn, record.uuid);
     if (!existing) throw std::runtime_error("object store: edge not found: " + record.uuid);

@@ -11,17 +11,33 @@ std::vector<ObjectRecord> ObjectStore::selectObjects(const Txn& txn, const Objec
     if (selection.connectedTo) {
         for (const auto& id : componentOf(txn, *selection.connectedTo, selection.edgeKinds)) connected.insert(id);
     }
-    std::vector<ObjectRecord> result;
-    Statement rows(db, std::string("SELECT ") + kObjectCols + " FROM objects ORDER BY uuid");
-    while (rows.row()) {
-        auto o = readObjectRow(db, rows);
-        if (selection.kind && o.kind != *selection.kind) continue;
-        if (selection.tag && std::find(o.tags.begin(), o.tags.end(), *selection.tag) == o.tags.end()) continue;
-        if (!selected.empty() && !selected.contains(o.uuid)) continue;
-        if (selection.connectedTo && !connected.contains(o.uuid)) continue;
-        result.push_back(std::move(o));
+    std::string sql = std::string("SELECT ") + kObjectCols + " FROM objects WHERE 1";
+    std::vector<std::string> parameters;
+    auto bindFilter = [&](const std::string& clause, const std::string& value) {
+        sql += clause; parameters.push_back(value);
+    };
+    if (!selected.empty() || selection.connectedTo) {
+        nlohmann::json ids = nlohmann::json::array();
+        const auto& candidates = selected.empty() ? connected : selected;
+        for (const auto& uuid : candidates) {
+            if (selection.connectedTo && !connected.contains(uuid)) continue;
+            if (auto id = objectIdByUuid(db, parseUuid(uuid))) ids.push_back(*id);
+        }
+        // json_each is a read-only, single-parameter selection table. Unlike a
+        // temporary table it also works on query_only pooled connections.
+        bindFilter(" AND id IN (SELECT value FROM json_each(?))", ids.dump());
     }
-    return result;
+    if (selection.kind) bindFilter(" AND kind=?", *selection.kind);
+    if (selection.tag) bindFilter(" AND id IN (SELECT object_id FROM object_tags INDEXED BY object_tags_tag WHERE tag=?)", *selection.tag);
+    sql += " ORDER BY uuid";
+    if (selection.offset < 0 || (selection.limit && *selection.limit < 0))
+        throw std::invalid_argument("selection limit and offset must be nonnegative");
+    sql += " LIMIT ? OFFSET ?";
+    Statement rows(db, sql);
+    for (size_t i = 0; i < parameters.size(); ++i) rows.bind(int(i) + 1, parameters[i]);
+    rows.bind(int(parameters.size()) + 1, selection.limit.value_or(-1));
+    rows.bind(int(parameters.size()) + 2, selection.offset);
+    return readObjectRows(db, rows);
 }
 
 std::string ObjectStore::exportJson(const Txn& txn, const JsonExportOptions& options) const
@@ -31,35 +47,31 @@ std::string ObjectStore::exportJson(const Txn& txn, const JsonExportOptions& opt
         {"store_uuid", uuid(txn)}, {"objects", nlohmann::json::array()}, {"edges", nlohmann::json::array()}};
     const std::set<std::string> fields(options.fields.begin(), options.fields.end());
     if (!fields.empty()) out["projected"] = true;
-    auto project = [&](nlohmann::json record) {
-        if (!fields.empty()) for (auto it = record.begin(); it != record.end();) {
-            if (it.key() != "uuid" && it.key() != "kind" && it.key() != "a" && it.key() != "b" &&
-                it.key() != "geometry" && it.key() != "geometry_bindings" && !fields.contains(it.key())) it = record.erase(it);
-            else ++it;
-        }
-        return record;
-    };
-    std::set<std::string> included;
+    nlohmann::json included = nlohmann::json::array();
     for (const auto& object : selectObjects(txn, options.selection)) {
-        included.insert(object.uuid);
-        auto record = objectToJson(object);
+        included.push_back(*objectIdByUuid(db, parseUuid(object.uuid)));
+        auto record = objectToJson(object, fields.empty() ? nullptr : &fields);
         if (const auto geometry = currentGeometry(txn, object.uuid))
             record["geometry"] = {{"revision_uuid", geometry->uuid}, {"content_hash", geometry->contentHash}};
-        out["objects"].push_back(project(std::move(record)));
+        out["objects"].push_back(std::move(record));
     }
-    Statement edges(db, std::string("SELECT ") + kEdgeCols + " FROM edges ORDER BY uuid");
+    std::string edgeSql = std::string("SELECT ") + kEdgeCols + " FROM edges WHERE id IN ("
+        "SELECT e.id FROM json_each(?1) selected CROSS JOIN edges e INDEXED BY edges_a "
+        "WHERE e.a_id=selected.value AND e.b_id IN (SELECT value FROM json_each(?1))";
+    if (!options.selection.edgeKinds.empty()) edgeSql += " AND e.kind IN (SELECT value FROM json_each(?2))";
+    edgeSql += ") ORDER BY uuid";
+    Statement edges(db, edgeSql);
+    edges.bind(1, included.dump());
+    if (!options.selection.edgeKinds.empty()) edges.bind(2, nlohmann::json(options.selection.edgeKinds).dump());
     while (edges.row()) {
         const auto edge = readEdgeRow(db, edges);
-        if (!included.contains(edge.aUuid) || !included.contains(edge.bUuid)) continue;
-        if (!options.selection.edgeKinds.empty() && std::find(options.selection.edgeKinds.begin(),
-            options.selection.edgeKinds.end(), edge.kind) == options.selection.edgeKinds.end()) continue;
-        auto record = edgeToJson(edge);
+        auto record = edgeToJson(edge, fields.empty() ? nullptr : &fields);
         const auto state = edgeGeometryState(txn, edge.uuid);
         const bool swap = record["a"] != edge.aUuid;
         auto a = swap ? state.bRevision : state.aRevision, b = swap ? state.aRevision : state.bRevision;
         record["geometry_bindings"] = {{"a", a ? nlohmann::json(*a) : nlohmann::json()},
             {"b", b ? nlohmann::json(*b) : nlohmann::json()}, {"stale", state.stale}};
-        out["edges"].push_back(project(std::move(record)));
+        out["edges"].push_back(std::move(record));
     }
     return out.dump(2);
 }

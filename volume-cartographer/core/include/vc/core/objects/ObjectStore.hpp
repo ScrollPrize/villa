@@ -115,6 +115,8 @@ struct OpenOptions {
 struct ObjectSelection {
     std::optional<std::string> kind, tag, connectedTo;
     std::vector<std::string> uuids, edgeKinds;
+    std::optional<int64_t> limit; // UUID-ordered page; absent means all matches
+    int64_t offset = 0;
 };
 struct JsonExportOptions {
     ObjectSelection selection;
@@ -262,6 +264,10 @@ public:
     std::vector<uint8_t> readGeometryArray(const Txn& txn, const std::string& revisionUuid,
         const std::string& arrayName, int64_t byteOffset = 0,
         const std::optional<int64_t>& byteCount = std::nullopt) const;
+
+    // Batched byte ranges [offset,count], in caller order, sharing verified chunks.
+    std::vector<std::vector<uint8_t>> readGeometryRanges(const Txn&, const std::string& revisionUuid,
+        const std::string& arrayName, const std::vector<std::array<int64_t, 2>>& ranges) const;
 
     // Approval: one generic call for objects and edges. Stamps the
     // current generation without bumping it. State must be

@@ -12,7 +12,9 @@ in `vc_object_geometry`; link detectors live in `vc_object_links`. These higher
 layers depend on the object store. The database library itself does not depend
 on CT readers or Qt. Python exposes the database and its helpers in `vc.objects`.
 
-The database uses SQLite application ID `0x56434f42`, schema version 2.
+The database uses SQLite application ID `0x56434f42`, schema version 3.
+Writable opens migrate version-2 files transactionally; read-only opens can
+inspect either version without migration. Older binaries cannot open version 3.
 Metadata JSON exports use `vc_object_metadata` version 2. Geometry ingestion and
 relationship discovery operate on the same store. VC3D/Spiral geometry readers
 are separate consumers.
@@ -34,6 +36,11 @@ with ObjectStore.create("objects.vcobj", author="sean") as store:
 ```
 
 `patch_geometry` uses the array dictionary described below.
+Use one `with store.write()` block for a batch of metadata updates instead of
+committing each key separately. For independent bulk updates, batches of roughly
+100–1,000 changes balance commit cost against writer lock duration; keep changes
+that must be atomic in the same transaction. Connections reuse prepared
+statements, and commits retain SQLite's `synchronous=FULL` durability.
 C++ uses `ObjectStore::upsertObject`, `putGeometry`, `addEdge`, and
 `repairEdgeGeometry` with the same `WriteTxn`. Transactions can commit or
 roll back object records, geometry, and relationships together. There is one
@@ -209,6 +216,14 @@ only descriptors and attributes. `read_geometry_array` accepts optional
 `byte_offset` and `byte_count` for bounded reads and verifies every touched
 chunk against its hash. It works without the source files. Read transactions
 see a coherent SQLite snapshot of heads, revisions, and payloads.
+
+For many point reads from the same array, use
+`read_geometry_ranges(revision_uuid, array_name, ranges)`, where each range is
+`(byte_offset, byte_count)`. The result is a list of byte strings in caller order.
+C++ exposes `readGeometryRanges` with an existing transaction. These calls share
+one verified manifest and a bounded eight-chunk cache. Geometry edit and repair
+operations also reuse readers and stable-point-ID indexes across relationship
+checks. Caches end with the operation; subsequent calls reverify stored bytes.
 
 To publish arrays directly, supply a dictionary with `kind`, optional
 `attributes`, and an `arrays` list. Each array has `name`, `dtype`, `shape`, and
@@ -419,8 +434,17 @@ bindings; binary payloads are never included.
 ```python
 selection = dict(connected_to=object_uuid, edge_kinds=["fiber_branch"], tag="reviewed")
 records = store.select_objects(**selection)
+page = store.select_objects(**selection, limit=100, offset=0)
 metadata_json = store.export_json(**selection, fields=["name", "tags", "meta"])
 ```
+
+Selections use UUID order. `select_objects` accepts nonnegative `limit` and
+`offset`; omitted `limit` returns all matches. C++ uses `ObjectSelection::limit`
+and `offset`. Separate Python calls use separate snapshots, so concurrent edits
+can change page boundaries; C++ callers can hold one read transaction across
+pages when they need a consistent listing. Filters run in SQL before records,
+tags and typed details are loaded. Neighbour and component queries probe endpoint
+indexes without decoding full edge records.
 
 `fields` projects top-level record fields; UUIDs, kinds, edge endpoints and
 geometry references are always retained. An empty list exports all metadata.
@@ -471,13 +495,20 @@ hashes. Record provenance is preserved; each replica keeps its own local journal
 of applied changes rather than combining journal sequence numbers.
 
 The report includes `applied`, `conflicts`, `plan_token`, replica IDs and counts
-of local/remote record changes. Sync is currently whole-store and record-level;
-there is no server, field-level merge, pruning, or payload garbage collection.
+of local/remote record changes. Sync is record-level. After a shared baseline is
+established, journal positions identify changed records (including approvals and
+deletions), and geometry revision positions identify newly received histories.
+The merge loads those records plus their endpoint and identity dependencies.
+Baselines retain per-record versions and deletion tombstones instead of another
+full snapshot for every edit. The first sync, or the first sync against a legacy
+version-2 baseline, uses a full snapshot to establish this incremental state.
+There is no server, field-level merge, pruning, or payload garbage collection.
 Shared baseline histories are retained in both files. SQLite commits across two
 WAL files are sequential: if interrupted after the first commit, retry sync. It
 uses the last baseline present in **both** files and reconciles any subsequent
 edits normally; there is no claim of distributed atomic commit. Do not discard a
-replica's baseline history between syncs.
+replica's baseline history or journal between syncs. Mutations must go through
+the store API so incremental synchronization can observe them.
 
 ## Implementation layout and validation
 

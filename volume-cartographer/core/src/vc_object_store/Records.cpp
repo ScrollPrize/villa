@@ -25,9 +25,7 @@ std::vector<ObjectRecord> ObjectStore::objectsByKind(const Txn& txn, const std::
     Statement s(db, sql);
     s.bind(1, kind);
     if (approvalState) s.bind(2, *approvalState);
-    std::vector<ObjectRecord> out;
-    while (s.row()) out.push_back(readObjectRow(db, s));
-    return out;
+    return readObjectRows(db, s);
 }
 
 int64_t ObjectStore::objectCount(const Txn& txn, const std::string& kind) const
@@ -46,12 +44,10 @@ std::vector<ObjectRecord> ObjectStore::objectsByTag(const Txn& txn, const std::s
     Statement s(db, "SELECT o.id,o.uuid,o.kind,o.name,o.generation,o.created_by,o.created_at,o.created_host,o.changed_by,o.changed_at,"
                     "o.changed_host,o.approval_state,o.approved_by,o.approved_at,o.approved_host,o.approved_generation,o.format_version,"
                     "o.storage_kind,o.storage_ref,o.data_generation,o.data_checksum,o.meta FROM objects o "
-                    "JOIN object_tags t ON t.object_id=o.id WHERE t.tag=? ORDER BY o.id");
+                    "JOIN object_tags t INDEXED BY object_tags_tag ON t.object_id=o.id WHERE t.tag=? ORDER BY o.id");
     (void)cols;
     s.bind(1, tag);
-    std::vector<ObjectRecord> out;
-    while (s.row()) out.push_back(readObjectRow(db, s));
-    return out;
+    return readObjectRows(db, s);
 }
 
 void ObjectStore::deleteObject(WriteTxn& txn, const std::string& uuid)

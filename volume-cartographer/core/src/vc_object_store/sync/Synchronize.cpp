@@ -2,6 +2,7 @@
 #include "internal/RecordJson.hpp"
 #include "geometry/GeometryInternal.hpp"
 #include "sync/GeometryTransfer.hpp"
+#include "sync/Baselines.hpp"
 
 namespace vc::objects {
 namespace {
@@ -21,19 +22,8 @@ Json snapshot(ObjectStore& store, const Txn& txn) {
     return result;
 }
 Json at(const Json& state, const std::string& id) { return state.value(id, Json()); }
-Json head(const Json& record) { return record.value("geometry", Json::object()).value("revision_uuid", Json()); }
+Json head(const Json& record) { return record.is_object() ? record.value("geometry", Json::object()).value("revision_uuid", Json()) : Json(); }
 bool object(const Json& record) { return record.is_object() && record.at("record_type") == "objects"; }
-struct Baseline { std::string token; Json state; };
-std::vector<Baseline> baselines(sqlite3* db, const std::string& peer) {
-    Statement rows(db, "SELECT token,state FROM sync_baselines WHERE peer=? ORDER BY seq DESC"); rows.bind(1, peer);
-    std::vector<Baseline> result;
-    while (rows.row()) result.push_back({rows.text(0), Json::parse(rows.text(1))});
-    return result;
-}
-void saveBaseline(sqlite3* db, const std::string& peer, const std::string& token, const Json& state) {
-    Statement row(db, "INSERT OR IGNORE INTO sync_baselines(peer,token,state) VALUES(?,?,?)");
-    row.bind(1, peer); row.bind(2, token); row.bind(3, state.dump()); row.stepDone();
-}
 void applyObjects(ObjectStore& store, WriteTxn& txn, const Json& before, const Json& merged) {
     auto* db = ObjectStoreImplAccess::conn(txn);
     // Remove changed edges first so deletions and identity swaps cannot transiently collide.
@@ -94,6 +84,7 @@ std::string ObjectStore::forkReplica() {
 }
 SyncReport ObjectStore::synchronize(ObjectStore& peer, const SyncOptions& options)
 {
+    detail::DependencyScope dependencyScope;
     if (this == &peer || std::filesystem::equivalent(path(), peer.path()))
         throw std::invalid_argument("sync: source and peer are the same database");
     if (impl_->options.readOnly || peer.impl_->options.readOnly) throw std::invalid_argument("sync: both stores must be writable");
@@ -109,25 +100,67 @@ SyncReport ObjectStore::synchronize(ObjectStore& peer, const SyncOptions& option
     report.localReplica = replicaUuid(localTxn); report.remoteReplica = peer.replicaUuid(remoteTxn);
     if (report.localReplica == report.remoteReplica)
         throw std::runtime_error("sync: copied stores share a replica UUID; call fork_replica on the copy, then synchronize before editing either replica");
-    const auto local = snapshot(*this, localTxn), remote = snapshot(peer, remoteTxn);
-    auto base = Json::object();
-    std::string baseToken;
-    const auto ours = baselines(localDb, report.remoteReplica), theirs = baselines(remoteDb, report.localReplica);
-    for (const auto& a : ours) {
-        const auto found = std::find_if(theirs.begin(), theirs.end(), [&](const auto& b) { return a.token == b.token; });
-        if (found != theirs.end()) {
-            if (a.state != found->state) throw std::runtime_error("sync: inconsistent shared baseline");
-            base = a.state; baseToken = a.token; break;
+    const auto shared = sharedBaseline(localDb, remoteDb, report.remoteReplica, report.localReplica);
+    const auto localCursor = syncCursor(localDb), remoteCursor = syncCursor(remoteDb);
+    auto local = Json::object(), remote = Json::object(), base = Json::object();
+    std::set<std::string> ids;
+    if (shared.incremental) {
+        if (shared.localCursor.journal > localCursor.journal || shared.remoteCursor.journal > remoteCursor.journal ||
+            shared.localCursor.geometry > localCursor.geometry || shared.remoteCursor.geometry > remoteCursor.geometry)
+            throw std::runtime_error("sync: baseline cursor is ahead of retained history");
+        changedRecords(localDb, shared.localCursor, ids);
+        changedRecords(remoteDb, shared.remoteCursor, ids);
+        const auto changed = ids;
+        for (const auto& [id, side] : options.resolutions) ids.insert(id);
+        // This token covers all writes, including approvals and geometry history
+        // received from a third replica, without serializing unchanged records.
+        report.planToken = hash(Json{{"local_replica", report.localReplica}, {"remote_replica", report.remoteReplica},
+            {"base_token", shared.token}, {"base", shared.state},
+            {"local_cursor", {localCursor.journal, localCursor.geometry}},
+            {"remote_cursor", {remoteCursor.journal, remoteCursor.geometry}}}.dump());
+        std::set<std::string> loaded;
+        while (loaded.size() != ids.size()) {
+            const auto pending = ids;
+            for (const auto& id : pending) {
+                if (!loaded.insert(id).second) continue;
+                const auto l = syncRecord(*this, localTxn, id), r = syncRecord(peer, remoteTxn, id);
+                const auto b = baselineRecord(localDb, report.remoteReplica, shared.localSeq, id);
+                if (b != baselineRecord(remoteDb, report.localReplica, shared.remoteSeq, id))
+                    throw std::runtime_error("sync: inconsistent shared baseline record");
+                if (!l.is_null()) local[id] = l;
+                if (!r.is_null()) remote[id] = r;
+                if (!b.is_null()) base[id] = b;
+                for (const auto* record : {&l, &r, &b}) {
+                    identityPeers(localDb, *record, ids); identityPeers(remoteDb, *record, ids);
+                    if (!record->is_null() && !object(*record)) {
+                        ids.insert(record->at("a").get<std::string>()); ids.insert(record->at("b").get<std::string>());
+                    }
+                }
+                // Metadata-only edits need no graph walk. Endpoint deletions or
+                // geometry changes must check even unchanged incident edges.
+                if (changed.contains(id) && (object(l) || object(r) || object(b)) &&
+                    (l.is_null() || r.is_null() || head(l) != head(b) || head(r) != head(b))) {
+                    for (auto* db : {localDb, remoteDb}) {
+                        Statement edges(db, "SELECT uuid FROM edges WHERE a_id=(SELECT id FROM objects WHERE uuid=?1) "
+                                            "OR b_id=(SELECT id FROM objects WHERE uuid=?1)");
+                        edges.bindBlob(1, parseUuid(id));
+                        while (edges.row()) ids.insert(formatUuid(edges.blob16(0)));
+                    }
+                }
+            }
         }
+    } else {
+        local = snapshot(*this, localTxn); remote = snapshot(peer, remoteTxn);
+        base = shared.state;
+        for (const auto* state : {&base, &local, &remote}) for (const auto& item : state->items()) ids.insert(item.key());
+        report.planToken = hash(Json{{"local_replica", report.localReplica}, {"remote_replica", report.remoteReplica},
+            {"local", local}, {"remote", remote}, {"base", base}}.dump());
     }
-    report.planToken = hash(Json{{"local_replica", report.localReplica}, {"remote_replica", report.remoteReplica},
-        {"local", local}, {"remote", remote}, {"base", base}}.dump());
     if ((!options.resolutions.empty() && !options.expectedPlan) || (options.expectedPlan && *options.expectedPlan != report.planToken))
         throw std::runtime_error("sync: conflict resolutions require the current preview's expected_plan token");
-    std::set<std::string> ids;
-    for (const auto* state : std::array<const Json*, 3>{&base, &local, &remote}) for (const auto& item : state->items()) ids.insert(item.key());
     for (const auto& [id, side] : options.resolutions)
-        if (!ids.contains(id) || (side != "local" && side != "remote")) throw std::invalid_argument("sync: invalid record resolution");
+        if ((!local.contains(id) && !remote.contains(id) && !base.contains(id)) || (side != "local" && side != "remote"))
+            throw std::invalid_argument("sync: invalid record resolution");
     auto merged = Json::object();
     auto conflict = [&](const std::string& id, const std::string& reason) {
         report.conflicts.push_back({id, reason, at(base, id).dump(), at(local, id).dump(), at(remote, id).dump()});
@@ -207,16 +240,27 @@ SyncReport ObjectStore::synchronize(ObjectStore& peer, const SyncOptions& option
         if (at(remote, id) != at(merged, id)) ++report.remoteChanges;
     }
     if (options.dryRun) return report;
+    if (shared.incremental && ids.empty()) {
+        first.commit(); second.commit(); report.applied = true; return report;
+    }
     applyObjects(*this, localTxn, local, merged); applyObjects(peer, remoteTxn, remote, merged);
     for (const auto& [id, record] : merged.items()) if (object(record)) {
-        detail::transferGeometry(localDb, remoteDb, id);
-        detail::transferGeometry(remoteDb, localDb, id);
+        detail::transferGeometry(localDb, remoteDb, id, shared.incremental ? shared.localCursor.geometry : 0);
+        detail::transferGeometry(remoteDb, localDb, id, shared.incremental ? shared.remoteCursor.geometry : 0);
     }
     applyHeadsAndEdges(*this, localTxn, local, merged); applyHeadsAndEdges(peer, remoteTxn, remote, merged);
-    if (snapshot(*this, localTxn) != merged || snapshot(peer, remoteTxn) != merged)
-        throw std::runtime_error("sync: applied state differs from merge; both transactions rolled back");
-    const auto token = !baseToken.empty() && merged == base ? baseToken : util::newUuid();
-    saveBaseline(localDb, report.remoteReplica, token, merged); saveBaseline(remoteDb, report.localReplica, token, merged);
+    // Verify exactly the records in the merge and its dependency closure.
+    for (const auto& id : ids)
+        if (syncRecord(*this, localTxn, id) != at(merged, id) || syncRecord(peer, remoteTxn, id) != at(merged, id))
+            throw std::runtime_error("sync: applied state differs from merge; both transactions rolled back");
+    std::string digest = shared.incremental ? shared.state.at("digest").get<std::string>() : std::string(64, '0');
+    if (shared.incremental) {
+        for (const auto& [id, record] : base.items()) toggleDigest(digest, record);
+    }
+    for (const auto& [id, record] : merged.items()) toggleDigest(digest, record);
+    const auto token = util::newUuid();
+    saveBaseline(localDb, report.remoteReplica, token, digest, merged, ids, !shared.incremental);
+    saveBaseline(remoteDb, report.localReplica, token, digest, merged, ids, !shared.incremental);
     // SQLite cannot atomically commit two WAL databases. Keep historical baselines
     // in both files so a retry after the first commit uses their last common state.
     first.commit();

@@ -66,7 +66,44 @@ void bindBbox(Statement& s, int firstIdx, const std::optional<std::array<double,
     }
 }
 
-ObjectRecord readObjectRow(sqlite3* db, const Statement& s)
+FiberDetail readFiberDetail(const Statement& d)
+{
+    FiberDetail f;
+    f.family = d.text(0);
+    f.manualFamily = d.i64(1) != 0;
+    f.controlPointCount = d.i64(2);
+    f.linePointCount = d.i64(3);
+    f.length = d.f64(4);
+    f.width = d.f64(5);
+    f.widthGapFraction = d.f64(6);
+    f.optimizationMode = d.text(7);
+    f.bbox = readBbox(d, 8);
+    return f;
+}
+
+PatchDetail readPatchDetail(const Statement& d)
+{
+    PatchDetail p;
+    p.gridWidth = d.i64(0);
+    p.gridHeight = d.i64(1);
+    p.scale = {d.f64(2), d.f64(3)};
+    p.bbox = readBbox(d, 4);
+    return p;
+}
+
+TrackDetail readTrackDetail(const Statement& d)
+{
+    TrackDetail t;
+    t.datasetRef = d.text(0);
+    t.externalKey = d.text(1);
+    t.family = d.text(2);
+    t.pointCount = d.i64(3);
+    t.length = d.f64(4);
+    t.bbox = readBbox(d, 5);
+    return t;
+}
+
+ObjectRecord readObjectRow(sqlite3* db, const Statement& s, bool details = true)
 {
     ObjectRecord rec;
     const int64_t id = s.i64(0);
@@ -79,6 +116,7 @@ ObjectRecord readObjectRow(sqlite3* db, const Statement& s)
     rec.dataChecksum = s.optText(20);
     rec.meta = s.text(21);
 
+    if (!details) return rec;
     {
         Statement tags(db, "SELECT tag FROM object_tags WHERE object_id=? ORDER BY tag");
         tags.bind(1, id);
@@ -90,46 +128,61 @@ ObjectRecord readObjectRow(sqlite3* db, const Statement& s)
                         "FROM fibers WHERE object_id=?");
         d.bind(1, id);
         if (d.row()) {
-            FiberDetail f;
-            f.family = d.text(0);
-            f.manualFamily = d.i64(1) != 0;
-            f.controlPointCount = d.i64(2);
-            f.linePointCount = d.i64(3);
-            f.length = d.f64(4);
-            f.width = d.f64(5);
-            f.widthGapFraction = d.f64(6);
-            f.optimizationMode = d.text(7);
-            f.bbox = readBbox(d, 8);
-            rec.fiber = f;
+            rec.fiber = readFiberDetail(d);
         }
     } else if (rec.kind == "patch") {
         Statement d(db, "SELECT grid_width,grid_height,scale,scale_y,bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z "
                         "FROM patches WHERE object_id=?");
         d.bind(1, id);
         if (d.row()) {
-            PatchDetail p;
-            p.gridWidth = d.i64(0);
-            p.gridHeight = d.i64(1);
-            p.scale = {d.f64(2), d.f64(3)};
-            p.bbox = readBbox(d, 4);
-            rec.patch = p;
+            rec.patch = readPatchDetail(d);
         }
     } else if (rec.kind == "track") {
         Statement d(db, "SELECT dataset_ref,external_key,family,point_count,length,bbox_min_x,bbox_min_y,bbox_min_z,"
                         "bbox_max_x,bbox_max_y,bbox_max_z FROM tracks WHERE object_id=?");
         d.bind(1, id);
         if (d.row()) {
-            TrackDetail t;
-            t.datasetRef = d.text(0);
-            t.externalKey = d.text(1);
-            t.family = d.text(2);
-            t.pointCount = d.i64(3);
-            t.length = d.f64(4);
-            t.bbox = readBbox(d, 5);
-            rec.track = t;
+            rec.track = readTrackDetail(d);
         }
     }
     return rec;
+}
+
+std::vector<ObjectRecord> readObjectRows(sqlite3* db, Statement& rows)
+{
+    std::vector<ObjectRecord> result;
+    nlohmann::json ids = nlohmann::json::array();
+    std::unordered_map<int64_t, size_t> positions;
+    std::set<std::string> kinds;
+    while (rows.row()) {
+        positions.emplace(rows.i64(0), result.size()); ids.push_back(rows.i64(0));
+        result.push_back(readObjectRow(db, rows, false)); kinds.insert(result.back().kind);
+    }
+    if (result.empty()) return result;
+    const auto selection = ids.dump();
+    Statement tags(db, "SELECT object_id,tag FROM object_tags WHERE object_id IN (SELECT value FROM json_each(?)) ORDER BY object_id,tag");
+    tags.bind(1, selection);
+    while (tags.row()) result.at(positions.at(tags.i64(0))).tags.push_back(tags.text(1));
+    if (kinds.contains("fiber")) {
+        Statement detail(db, "SELECT family,manual_family,control_point_count,line_point_count,length,width,"
+                        "width_gap_fraction,optimization_mode,bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z "
+                        " ,object_id FROM fibers WHERE object_id IN (SELECT value FROM json_each(?))");
+        detail.bind(1, selection);
+        while (detail.row()) result.at(positions.at(detail.i64(14))).fiber = readFiberDetail(detail);
+    }
+    if (kinds.contains("patch")) {
+        Statement detail(db, "SELECT grid_width,grid_height,scale,scale_y,bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z "
+                        " ,object_id FROM patches WHERE object_id IN (SELECT value FROM json_each(?))");
+        detail.bind(1, selection);
+        while (detail.row()) result.at(positions.at(detail.i64(10))).patch = readPatchDetail(detail);
+    }
+    if (kinds.contains("track")) {
+        Statement detail(db, "SELECT dataset_ref,external_key,family,point_count,length,bbox_min_x,bbox_min_y,bbox_min_z,"
+                        "bbox_max_x,bbox_max_y,bbox_max_z  ,object_id FROM tracks WHERE object_id IN (SELECT value FROM json_each(?))");
+        detail.bind(1, selection);
+        while (detail.row()) result.at(positions.at(detail.i64(11))).track = readTrackDetail(detail);
+    }
+    return result;
 }
 
 std::optional<int64_t> objectIdByUuid(sqlite3* db, const std::array<unsigned char, 16>& uuid)

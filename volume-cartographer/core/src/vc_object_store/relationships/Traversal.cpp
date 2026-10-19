@@ -5,19 +5,22 @@ std::vector<std::string> ObjectStore::neighbours(const Txn& txn, const std::stri
                                              const std::optional<std::string>& edgeKind,
                                              const std::optional<std::string>& neighbourKind) const
 {
+    auto* db = static_cast<sqlite3*>(connection(txn));
+    const auto id = objectIdByUuid(db, parseUuid(objectUuid));
+    if (!id) throw std::runtime_error("object store: object not found: " + objectUuid);
+    const std::string filter = edgeKind ? " AND kind=?2" : "";
+    // Order by the first incident edge, as edgesOf() did, without hydrating edges.
+    std::string sql = "SELECT o.uuid FROM (SELECT id,b_id AS neighbour FROM edges INDEXED BY edges_a WHERE a_id=?1" + filter +
+        " UNION SELECT id,a_id AS neighbour FROM edges INDEXED BY edges_b WHERE b_id=?1" + filter +
+        ") e JOIN objects o ON o.id=e.neighbour";
+    if (neighbourKind) sql += " WHERE o.kind=?3";
+    sql += " GROUP BY o.id ORDER BY min(e.id)";
+    Statement rows(db, sql);
+    rows.bind(1, *id);
+    if (edgeKind) rows.bind(2, *edgeKind);
+    if (neighbourKind) rows.bind(3, *neighbourKind);
     std::vector<std::string> out;
-    std::set<std::string> seen;
-    const auto canonical = formatUuid(parseUuid(objectUuid));
-    for (const auto& e : edgesOf(txn, canonical)) {
-        if (edgeKind && e.kind != *edgeKind) continue;
-        const std::string& other = (e.aUuid == canonical) ? e.bUuid : e.aUuid;
-        if (!seen.insert(other).second) continue;
-        if (neighbourKind) {
-            auto obj = objectByUuid(txn, other);
-            if (!obj || obj->kind != *neighbourKind) continue;
-        }
-        out.push_back(other);
-    }
+    while (rows.row()) out.push_back(formatUuid(rows.blob16(0)));
     return out;
 }
 
@@ -46,13 +49,16 @@ std::vector<std::string> traverse(sqlite3* db, const std::string& startUuid, int
         throw std::runtime_error("object store: object not found: " + startUuid);
     // Probe the endpoint indexes only for nodes reached by this traversal.
     // Visit neighbours in stable internal-ID order.
-    std::string sql = "SELECT id,CASE WHEN a_id=? THEN b_id ELSE a_id END FROM edges WHERE (a_id=? OR b_id=?)";
+    std::string filter;
     if (!edgeKindFilter.empty()) {
-        sql += " AND kind IN (";
-        for (size_t i = 0; i < edgeKindFilter.size(); ++i) sql += (i ? ",?" : "?");
-        sql += ")";
+        filter = " AND kind IN (";
+        for (size_t i = 0; i < edgeKindFilter.size(); ++i)
+            filter += (i ? ",?" : "?") + std::to_string(i + 2);
+        filter += ")";
     }
-    sql += " ORDER BY id";
+    // Each UNION arm uses an endpoint-leading index even without ANALYZE.
+    std::string sql = "SELECT id,b_id FROM edges INDEXED BY edges_a WHERE a_id=?1" + filter +
+        " UNION SELECT id,a_id FROM edges INDEXED BY edges_b WHERE b_id=?1" + filter + " ORDER BY id";
     Statement adjacent(db, sql);
     const int64_t startId = *objectIdByUuid(db, startBytes);
     std::vector<std::string> out;
@@ -66,8 +72,8 @@ std::vector<std::string> traverse(sqlite3* db, const std::string& startUuid, int
         out.push_back(uuidTextByObjectId(db, id));
         if (depth >= maxDepth) continue;
         adjacent.reset();
-        adjacent.bind(1, id); adjacent.bind(2, id); adjacent.bind(3, id);
-        for (size_t i = 0; i < edgeKindFilter.size(); ++i) adjacent.bind(int(i) + 4, edgeKindFilter[i]);
+        adjacent.bind(1, id);
+        for (size_t i = 0; i < edgeKindFilter.size(); ++i) adjacent.bind(int(i) + 2, edgeKindFilter[i]);
         try {
             while (adjacent.row()) {
                 checkCancelled();

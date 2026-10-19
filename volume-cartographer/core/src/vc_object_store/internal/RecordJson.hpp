@@ -35,16 +35,24 @@ nlohmann::json bboxToJson(const std::optional<std::array<double, 6>>& box)
     return {(*box)[0], (*box)[1], (*box)[2], (*box)[3], (*box)[4], (*box)[5]};
 }
 
-nlohmann::json commonToJson(const RecordCommon& r)
+bool includeField(const std::set<std::string>* fields, const char* key)
 {
-    nlohmann::json j{{"uuid", r.uuid}, {"kind", r.kind}, {"generation", r.generation},
-        {"created_by", r.createdBy}, {"created_at", r.createdAt}, {"created_host", r.createdHost},
-        {"changed_by", r.changedBy}, {"changed_at", r.changedAt}, {"changed_host", r.changedHost},
-        {"tags", r.tags}, {"meta", nlohmann::json::parse(r.meta)}, {"approval_state", r.approvalState}};
-    j["approved_by"] = r.approvedBy ? nlohmann::json(*r.approvedBy) : nlohmann::json(nullptr);
-    j["approved_at"] = r.approvedAt ? nlohmann::json(*r.approvedAt) : nlohmann::json(nullptr);
-    j["approved_host"] = r.approvedHost ? nlohmann::json(*r.approvedHost) : nlohmann::json(nullptr);
-    j["approved_generation"] = r.approvedGeneration ? nlohmann::json(*r.approvedGeneration) : nlohmann::json(nullptr);
+    return !fields || fields->contains(key);
+}
+
+nlohmann::json commonToJson(const RecordCommon& r, const std::set<std::string>* fields = nullptr)
+{
+    nlohmann::json j{{"uuid", r.uuid}, {"kind", r.kind}};
+    auto put = [&](const char* key, const auto& value) { if (includeField(fields, key)) j[key] = value; };
+    put("generation", r.generation);
+    put("created_by", r.createdBy); put("created_at", r.createdAt); put("created_host", r.createdHost);
+    put("changed_by", r.changedBy); put("changed_at", r.changedAt); put("changed_host", r.changedHost);
+    put("tags", r.tags); put("approval_state", r.approvalState);
+    if (includeField(fields, "meta")) j["meta"] = nlohmann::json::parse(r.meta);
+    put("approved_by", r.approvedBy ? nlohmann::json(*r.approvedBy) : nlohmann::json());
+    put("approved_at", r.approvedAt ? nlohmann::json(*r.approvedAt) : nlohmann::json());
+    put("approved_host", r.approvedHost ? nlohmann::json(*r.approvedHost) : nlohmann::json());
+    put("approved_generation", r.approvedGeneration ? nlohmann::json(*r.approvedGeneration) : nlohmann::json());
     return j;
 }
 
@@ -74,27 +82,27 @@ void commonFromJson(const nlohmann::json& j, RecordCommon& r)
         throw std::runtime_error("object store: pending snapshot has approval stamps");
 }
 
-nlohmann::json objectToJson(const ObjectRecord& r)
+nlohmann::json objectToJson(const ObjectRecord& r, const std::set<std::string>* fields = nullptr)
 {
-    nlohmann::json j = commonToJson(r);
-    j["name"] = r.name;
-    j["format_version"] = r.formatVersion;
-    j["storage_kind"] = r.storageKind;
-    j["storage_ref"] = r.storageRef;
-    j["data_generation"] = r.dataGeneration;
-    if (r.dataChecksum) j["data_checksum"] = *r.dataChecksum;
-    if (r.fiber) {
+    nlohmann::json j = commonToJson(r, fields);
+    if (includeField(fields, "name")) j["name"] = r.name;
+    if (includeField(fields, "format_version")) j["format_version"] = r.formatVersion;
+    if (includeField(fields, "storage_kind")) j["storage_kind"] = r.storageKind;
+    if (includeField(fields, "storage_ref")) j["storage_ref"] = r.storageRef;
+    if (includeField(fields, "data_generation")) j["data_generation"] = r.dataGeneration;
+    if (r.dataChecksum && includeField(fields, "data_checksum")) j["data_checksum"] = *r.dataChecksum;
+    if (r.fiber && includeField(fields, "fiber")) {
         j["fiber"] = {{"family", r.fiber->family}, {"manual_family", r.fiber->manualFamily},
                       {"control_point_count", r.fiber->controlPointCount}, {"line_point_count", r.fiber->linePointCount},
                       {"length", r.fiber->length}, {"width", r.fiber->width},
                       {"width_gap_fraction", r.fiber->widthGapFraction}, {"optimization_mode", r.fiber->optimizationMode},
                       {"bbox", bboxToJson(r.fiber->bbox)}};
     }
-    if (r.patch) {
+    if (r.patch && includeField(fields, "patch")) {
         j["patch"] = {{"grid_width", r.patch->gridWidth}, {"grid_height", r.patch->gridHeight},
                       {"scale", r.patch->scale}, {"bbox", bboxToJson(r.patch->bbox)}};
     }
-    if (r.track) {
+    if (r.track && includeField(fields, "track")) {
         j["track"] = {{"dataset_ref", r.track->datasetRef}, {"external_key", r.track->externalKey},
                       {"family", r.track->family}, {"point_count", r.track->pointCount},
                       {"length", r.track->length}, {"bbox", bboxToJson(r.track->bbox)}};
@@ -153,18 +161,18 @@ ObjectRecord objectFromJson(const nlohmann::json& j)
     return r;
 }
 
-nlohmann::json edgeToJson(EdgeRecord e)
+nlohmann::json edgeToJson(EdgeRecord e, const std::set<std::string>* fields = nullptr)
 {
     // Stable across databases whose internal endpoint IDs differ.
     if (e.bUuid < e.aUuid || (e.aUuid == e.bUuid && dependenciesToJson(e.bAnchor).dump() < dependenciesToJson(e.aAnchor).dump())) {
         std::swap(e.aUuid, e.bUuid);
         std::swap(e.aAnchor, e.bAnchor);
     }
-    auto j = commonToJson(e);
+    auto j = commonToJson(e, fields);
     j["a"] = e.aUuid;
     j["b"] = e.bUuid;
-    j["a_anchor"] = anchorToJson(e.aAnchor);
-    j["b_anchor"] = anchorToJson(e.bAnchor);
+    if (includeField(fields, "a_anchor")) j["a_anchor"] = anchorToJson(e.aAnchor);
+    if (includeField(fields, "b_anchor")) j["b_anchor"] = anchorToJson(e.bAnchor);
     return j;
 }
 

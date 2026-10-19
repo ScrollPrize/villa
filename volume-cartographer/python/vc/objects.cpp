@@ -306,6 +306,15 @@ NB_MODULE(objects, m)
               bytes = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.readGeometryArray(txn, uuid, name, offset, count); }); }
             return nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size());
         }, nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("byte_offset") = 0, nb::arg("byte_count") = std::nullopt)
+        .def("read_geometry_ranges", [](PyObjectStore& self, const std::string& uuid, const std::string& name,
+                                        const std::vector<std::array<int64_t, 2>>& ranges) {
+            std::vector<std::vector<uint8_t>> values;
+            { auto lease = self.db; self.require(); nb::gil_scoped_release release;
+              values = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.readGeometryRanges(txn, uuid, name, ranges); }); }
+            nb::list out;
+            for (const auto& bytes : values) out.append(nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
+            return out;
+        }, nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("ranges"))
         .def("ingest_registered_geometry", [](PyObjectStore& self, const std::optional<std::filesystem::path>& root,
                                              const std::vector<std::string>& uuids) {
             vo::GeometryIngestReport result;
@@ -344,13 +353,14 @@ NB_MODULE(objects, m)
         .def("checkpoint", [](PyObjectStore& self) { self.require().checkpoint(); })
         .def("select_objects", [](PyObjectStore& self, const std::optional<std::string>& kind,
             const std::optional<std::string>& tag, const std::vector<std::string>& ids,
-            const std::optional<std::string>& connected, const std::vector<std::string>& edgeKinds) {
-            vo::ObjectSelection selection{kind, tag, connected, ids, edgeKinds};
+            const std::optional<std::string>& connected, const std::vector<std::string>& edgeKinds,
+            const std::optional<int64_t>& limit, int64_t offset) {
+            vo::ObjectSelection selection{kind, tag, connected, ids, edgeKinds, limit, offset};
             auto records = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.selectObjects(txn, selection); });
             nb::list result; for (const auto& record : records) result.append(objectToPy(record)); return result;
         }, nb::arg("object_kind") = std::nullopt, nb::arg("tag") = std::nullopt,
            nb::arg("object_uuids") = std::vector<std::string>{}, nb::arg("connected_to") = std::nullopt,
-           nb::arg("edge_kinds") = std::vector<std::string>{})
+           nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("limit") = std::nullopt, nb::arg("offset") = 0)
         .def("export_json", [](PyObjectStore& self, const std::optional<std::string>& kind,
             const std::optional<std::string>& tag, const std::vector<std::string>& ids,
             const std::optional<std::string>& connected, const std::vector<std::string>& edgeKinds,

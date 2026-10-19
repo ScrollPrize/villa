@@ -24,11 +24,11 @@ void insertRow(sqlite3* destination, const Statement& row, const char* sql)
     insert.stepDone();
 }
 }
-void transferGeometry(sqlite3* source, sqlite3* destination, const std::string& objectUuid)
+void transferGeometry(sqlite3* source, sqlite3* destination, const std::string& objectUuid, int64_t afterRow)
 {
     const std::string columns = "uuid,object_uuid,parent_uuid,content_hash,manifest,object_generation,created_by,created_at,created_host";
-    Statement revisions(source, "SELECT " + columns + " FROM geometry_revisions WHERE object_uuid=? ORDER BY object_generation,uuid");
-    revisions.bindBlob(1, parseUuid(objectUuid));
+    Statement revisions(source, "SELECT " + columns + " FROM geometry_revisions WHERE object_uuid=? AND rowid>? ORDER BY object_generation,uuid");
+    revisions.bindBlob(1, parseUuid(objectUuid)); revisions.bind(2, afterRow);
     while (revisions.row()) {
         const auto manifest = revisions.text(4);
         if (geometryHash(std::span(reinterpret_cast<const uint8_t*>(manifest.data()), manifest.size())) != revisions.text(3))
