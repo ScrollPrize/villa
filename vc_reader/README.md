@@ -136,6 +136,12 @@ supports `contains` queries, and materializes a dense `(B,D,H,W)` uint8 mask
 only when `to_dense()` is requested. CUDA construction sorts resident points
 on device; no count download is needed.
 
+`VoxelSet.sorted_keys(capacity=..., out=...)` copies keys into owned NumPy or
+CUDA/Torch storage, optionally padded to a fixed capacity for compiled tensor
+consumers. Keys encode `((batch*D+z)*H+y)*W+x`; `INT64_MAX` denotes padding or
+invalid points and must not match a query. CUDA keys may contain duplicates.
+The output remains sorted, and insufficient capacity raises an error.
+
 ```python
 from vc_reader import cuda
 

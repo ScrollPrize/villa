@@ -120,11 +120,26 @@ def is_device_array(value):
         return False
 
 
+class _StreamInput:
+    """Import on the selected consumer stream, without fencing the default one."""
+    def __init__(self, value, stream):
+        self.value, self.stream = value, stream
+
+    def __dlpack_device__(self):
+        return self.value.__dlpack_device__()
+
+    def __dlpack__(self, *, stream=None, **kwargs):
+        return self.value.__dlpack__(stream=self.stream, **kwargs)
+
+
 def wrap(value):
-    """DeviceArray view sharing a CUDA DLPack producer's storage (no copy)."""
+    """Share CUDA storage, importing on vc_reader's selected consumer stream."""
     if isinstance(value, DeviceArray):
         value._ready()
         return value
+    # DLPack uses 1 for CUDA's default stream. An omitted stream would make
+    # Torch fence its default stream even when all work uses a separate stream.
+    value = _StreamInput(value, _native._get_stream() or 1)
     shape, dtype, device = _native._cuda_describe(value)
     return DeviceArray(_native._cuda_view(value, shape, 0), shape, np.dtype(dtype), device)
 

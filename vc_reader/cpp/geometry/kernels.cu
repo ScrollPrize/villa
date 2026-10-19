@@ -65,6 +65,14 @@ CudaVoxels voxelize_cuda(const float* p,const std::int64_t* batch,std::size_t n,
 void contains_cuda(const CudaVoxels& v,const float* p,const std::int64_t* batch,bool* out,std::size_t n){
     if(n)contains_kernel<<<(n+255)/256,256,0,device::stream()>>>(static_cast<const std::int64_t*>(v.keys->ptr),v.count,v.grid,p,batch,out,n);finish();
 }
+__global__ void copy_keys_kernel(const std::int64_t* source,std::size_t count,std::int64_t* out,std::size_t n){
+    auto i=std::size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(i<n)out[i]=i<count?source[i]:missing_key;
+}
+void keys_cuda(const CudaVoxels& v,std::int64_t* out,std::size_t n){
+    if(n)copy_keys_kernel<<<(n+255)/256,256,0,device::stream()>>>(static_cast<const std::int64_t*>(v.keys->ptr),v.count,out,n);
+    finish();
+}
 void dense_cuda(const CudaVoxels& v,std::uint8_t* out){
     device::check(cudaMemsetAsync(out,0,std::size_t(v.grid.batches)*v.grid.volume,device::stream()));
     if(v.count)dense_kernel<<<(v.count+255)/256,256,0,device::stream()>>>(static_cast<const std::int64_t*>(v.keys->ptr),v.count,out);finish();

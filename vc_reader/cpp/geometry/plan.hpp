@@ -111,5 +111,6 @@ void boxes_cuda(CurvesView,const float*,const float*,const std::int64_t*,int,std
 CudaVoxels voxelize_cuda(const float*,const std::int64_t*,std::size_t,VoxelGrid,int);
 void contains_cuda(const CudaVoxels&,const float*,const std::int64_t*,bool*,std::size_t);
 void dense_cuda(const CudaVoxels&,std::uint8_t*);
+void keys_cuda(const CudaVoxels&,std::int64_t*,std::size_t);
 #endif
 }

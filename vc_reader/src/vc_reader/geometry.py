@@ -323,6 +323,25 @@ class VoxelSet(_Resident):
         _native._geometry_contains(self._native, _native_array(p), _native_array(ids), output)
         return result
 
+    def sorted_keys(self, *, capacity=None, out=None):
+        """Copy sorted int64 occupancy keys into caller-owned storage.
+
+        Keys encode ``((batch*D+z)*H+y)*W+x``. CUDA storage can contain
+        duplicate keys and INT64_MAX for invalid points; padding also uses
+        INT64_MAX, which must never match a query. CPU storage is deduplicated.
+        Capacity defaults to the stored count (nbytes/8), and cannot be smaller.
+        A fixed capacity allows tensor consumers to compile stable input shapes
+        without downloading the number of occupied cells. No storage is shared.
+        """
+        self._ready()
+        count = self.nbytes // 8
+        capacity = count if capacity is None else operator.index(capacity)
+        if capacity < count:
+            raise ValueError('key output capacity is too small')
+        result, output = _output(out, (capacity,), np.int64, self.device)
+        _native._geometry_keys(self._native, output)
+        return result
+
     def to_dense(self, *, out=None):
         """Explicitly materialize (B,D,H,W) uint8 occupancy on this device."""
         self._ready()

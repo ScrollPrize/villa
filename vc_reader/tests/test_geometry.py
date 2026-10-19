@@ -34,6 +34,20 @@ def upload(x, backend):
     return cuda.asarray(x) if backend == 'cuda' else x
 
 
+def test_sorted_voxel_keys(backend):
+    p = np.array([[1, 2, 3], [1, 2, 3], [0, 0, 0], [np.nan, 0, 0]], np.float32)
+    voxels = VoxelSet(upload(p, backend), (3, 4, 5))
+    result = host(voxels.sorted_keys(capacity=8))
+    expected = [0, 33, 33] if backend == 'cuda' else [0, 33]
+    np.testing.assert_array_equal(result, expected + [np.iinfo(np.int64).max]*(8-len(expected)))
+    assert np.all(result[:-1] <= result[1:])
+    with pytest.raises(ValueError, match='capacity'):
+        voxels.sorted_keys(capacity=1)
+    empty = VoxelSet(upload(np.empty((0, 3), np.float32), backend), (3, 4, 5))
+    assert host(empty.sorted_keys()).shape == (0,)
+    np.testing.assert_array_equal(host(empty.sorted_keys(capacity=3)), [np.iinfo(np.int64).max]*3)
+
+
 def curves(points, offsets, backend, **kw):
     c = PolylineSet(points, offsets, **kw)
     return c.cuda() if backend == 'cuda' else c
@@ -227,9 +241,36 @@ def test_cuda_torch_owned_outputs_and_other_stream():
         c.interpolate(ids,s,out=out)
         vox=VoxelSet(cuda.asarray(np.array([[0,0,0]],np.float32)),(4,4,4))
         assert vox.contains(cuda.asarray(np.array([[0,0,0]],np.float32))).shape == (1,)
+        keys = torch.empty(8, device='cuda', dtype=torch.int64)
+        assert vox.sorted_keys(capacity=8, out=keys) is keys
         del vox;gc.collect()
         assert not done.query()
     finally: stream.synchronize()
+    np.testing.assert_array_equal(keys.cpu(), [0]+[np.iinfo(np.int64).max]*7)
+
+
+def test_cuda_wrap_does_not_fence_default_stream():
+    torch = pytest.importorskip('torch')
+    if not cuda.is_available() or not torch.cuda.is_available():
+        pytest.skip('CUDA required')
+    producer = torch.cuda.Stream()
+    done = torch.cuda.Event()
+    torch.cuda.default_stream().synchronize()
+    try:
+        with torch.cuda.stream(producer):
+            tensor = torch.empty(16, device='cuda')
+            torch.cuda._sleep(500_000_000)
+            done.record()
+            _native._set_stream(producer.cuda_stream)
+            wrapped = cuda.wrap(tensor)
+            assert wrapped.shape == (16,)
+        # Importing storage must not make the unrelated default stream wait
+        # for the producer. The consumer is the producer stream itself.
+        torch.cuda.default_stream().synchronize()
+        assert not done.query()
+    finally:
+        producer.synchronize()
+        _native._set_stream(0)
 
 
 def test_many_curves_and_zero_length_segments(backend):

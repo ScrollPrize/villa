@@ -34,6 +34,7 @@ inline void bind(nb::module_& m) {
         .def("array",[](nb::handle self) { return nb::cast<const Owned&>(self).array(self); })
         .def("export",[](Owned& o) { o.storage->exported=true; });
     m.def("_set_stream",[](std::uintptr_t handle) { device::current_stream()=handle ? device::stream_handle(handle) : nullptr; });
+    m.def("_get_stream",[] { return reinterpret_cast<std::uintptr_t>(device::current_stream()); });
     m.def("_cuda_empty",[](std::size_t count,const std::string& kind,std::size_t item,int id) {
         if (count>SIZE_MAX/8 || (kind!="f" && kind!="i" && kind!="u" && kind!="b") ||
             (item!=1 && item!=2 && item!=4 && item!=8) || (kind=="b" && item!=1) || (kind=="f" && item<2))

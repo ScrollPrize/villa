@@ -149,6 +149,19 @@ inline void bind(nb::module_& m){
         else{auto& v=nb::cast<const CudaVoxels&>(obj);if(v.device!=id)throw nb::value_error("voxel device mismatch");execute(id,[&]{contains_cuda(v,p,ip,o,n);});}
 #endif
     });
+    m.def("_geometry_keys",[](nb::object obj,Array out){
+        int id=array_device(out);auto n=out.size();check(out,nb::dtype<std::int64_t>(),{n},id);
+        auto o=static_cast<std::int64_t*>(out.data());
+        if(id<0){auto& v=nb::cast<const Voxels&>(obj);
+            if(n<v.keys.size())throw nb::value_error("key output capacity is too small");
+            execute(id,[&]{std::copy(v.keys.begin(),v.keys.end(),o);std::fill(o+v.keys.size(),o+n,missing_key);});}
+#ifdef VC_READER_CUDA
+        else{auto& v=nb::cast<const CudaVoxels&>(obj);
+            if(v.device!=id)throw nb::value_error("voxel device mismatch");
+            if(n<v.count)throw nb::value_error("key output capacity is too small");
+            execute(id,[&]{keys_cuda(v,o,n);});}
+#endif
+    });
     m.def("_geometry_dense",[](nb::object obj,Array out){
         int id=array_device(out);VoxelGrid g;
         if(id<0)g=nb::cast<const Voxels&>(obj).grid;

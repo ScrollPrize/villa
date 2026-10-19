@@ -1607,8 +1607,8 @@ semantics, layer validity, seeds, process cleanup and optional dependencies.
 
 ## Fiber trainer comparison
 
-**Current repeated results:** see [the native-batching/cache experiment](#repeated-fiber-batching-and-cache-comparison).
-It measures all four configurations twice on the merged native CUDA build.
+**Latest 500-batch comparison:** see [the geometry integration](#fiber-trainer-geometry-integration).
+The batching/cache and output-ownership tables below record separate experiments.
 The 227.589 / 184.847 / 124.608 s table below uses lookahead 16; it is a different
 configuration. Earlier no-lookahead results are listed separately below.
 
@@ -2079,9 +2079,8 @@ policy are adapter concerns, not vc_reader API concepts.
 ### General geometry helper benchmarks
 
 `bench_geometry.py` checks CPU/CUDA agreement and measures resident geometry
-operations with reusable output buffers. These are helper microbenchmarks;
-the fiber trainer has not yet been switched to the new geometry APIs, and
-these numbers are not 500-batch training times.
+operations with reusable output buffers. These are helper microbenchmarks,
+not 500-batch training times. The trainer integration is described below.
 
 Measured on the RTX 5090 with 512 curves / 65,536 vertices, 8,192 queries,
 three warmups and 30 repetitions. Each time includes Python validation and
@@ -2365,3 +2364,150 @@ PYTHONPATH=src VC_READER_NATIVE_DIR=/tmp/vc-reader-native-batch-build \
   tests/test_native_batch.py \
   -k 'reflections_preserve or packed_status or variable_parameters'
 ```
+
+### Fiber trainer geometry integration
+
+**Current 500-batch results (2026-10-19, RTX 5090):** two sequential runs per
+configuration, using the same final native/Python build. Both use CUDA CT
+sampling, tensor heading on a separate stream, batched augmentation, shared
+chunk caches, lookahead **0**, 20 warmup batches, batch **32**, and **one
+gradient step per batch**. These are complete forward/backward/AdamW/EMA runs.
+
+| Geometry | Run 1 wall | Run 2 wall | Mean wall |
+| --- | ---: | ---: | ---: |
+| Existing trainer geometry | 52.137 s | 50.616 s | **51.376 s** |
+| vc_reader helpers, CUDA targets in batch prefetch | 48.351 s | 48.368 s | **48.359 s** |
+
+The new path reduces mean wall time by **5.9%** (throughput increases **6.2%**).
+The main-thread timing breakdown, averaged over the two runs, is:
+
+| Stage | Existing geometry | vc_reader geometry |
+| --- | ---: | ---: |
+| Wait for prepared batch | 4.074 s | 0.589 s |
+| Image sampling/augmentation preparation | 10.112 s | 9.824 s |
+| Model/optimizer update interval | 36.581 s | 37.280 s |
+
+Model/optimizer updates remain the largest interval, about **77%** of the new
+wall time. They take slightly longer with concurrent geometry preparation;
+the gain comes primarily from removing exposed loader waits. Background
+geometry work totals 19.646 s, but overlaps these intervals: **do not add it
+to wall time**. Remaining wall time is inter-update bookkeeping.
+
+Each run consumed **16,000 real crops** across all five sources. The new runs
+had 15,496 / 15,521 distinct positions and 36,890 / 36,577 distinct source-chunk
+footprints (summed by dataset). Sampling and live continuation remain adaptive,
+so individual crops differ between runs; source draw allocations match.
+
+Canonical reports:
+`results/fiber_geometry_existing_stream_500/summary.json`,
+`results/fiber_geometry_existing_stream_repeat_500/summary.json`,
+`results/fiber_geometry_prefetch_500/summary.json`, and
+`results/fiber_geometry_prefetch_repeat_500/summary.json`.
+`results/fiber_geometry_comparison.json` contains their comparison.
+All four use reader binary SHA-256
+`b580ce104b0fc79225898fdec44b92703be6f858aa915ad91e15721194e1fa94`;
+reports also record Python/adapter hashes and complete commands. Earlier
+tables in this document measure other configurations or implementation stages.
+
+`bench_fiber_trainer.py --geometry vc-reader` installs `fiber_geometry.py` in
+addition to the CUDA image and heading adapters. It uses the general geometry
+APIs without putting trainer label policy into the library:
+
+- Workers use native CPU directed plane intersections for state labels needed
+  during sampling. Traversal windows, endpoint labels, reference evidence and
+  sampling feedback retain the trainer's policy.
+- Final foreign-fiber targets use CUDA nearest-vertex queries, frame transforms
+  and sparse voxelization. Annotation blocks are restricted to a conservative
+  crop bounding box before upload. Parent curve indexes are cached on CUDA.
+- `VoxelSet.sorted_keys()` supplies owned Torch tensors to the fullgraph
+  compiled loss. Sparse binary search replaces dense-mask `grid_sample` and its
+  uint8-to-float conversion. Key padding keeps compilation shapes fixed, with
+  an explicit error on overflow. CPU decision diagnostics use the same keys.
+- CT images remain on CUDA. Small foreign-component counts return to the CPU
+  for the trainer's sampling statistics. CPU annotation coordinates are
+  rebased before upload; CUDA query results stay on the device.
+
+By default, geometry preparation runs in the trainer's existing one-batch
+prefetch thread on a separate CUDA stream (`--geometry-placement prefetch`).
+Completed sparse target tensors record the model stream before consumption.
+This adds no remote lookahead plans. `--geometry-placement main` measures the
+same computations on the main thread. Background geometry duration overlaps
+model work and must not be added to the wall-time breakdown.
+
+CUDA DLPack imports explicitly request vc_reader's selected consumer stream.
+Omitting it makes Torch insert a wait on its default stream when the producer
+uses another stream, unnecessarily coupling model work to background targets
+or heading estimation. A regression test checks that wrapping a tensor on a
+busy producer stream leaves the unrelated default stream free.
+
+Coordinate-to-cell quantization retains float64 through the batched crop
+rotation and rounding, then supplies integer-valued float32 cells to
+`VoxelSet`. This precision is necessary: a real annotation produced voxel
+coordinate `87.49999701`, which float32 transformed into exactly `87.5` and
+rounded into the adjacent cell. Nearest queries, cell-center affine transforms,
+distances and model tensors remain float32. Parent indexes are reused; identity
+queries, rotations, bounds tests, clearance masks and voxelization are batched.
+
+`check_fiber_geometry.py` compares synthetic masks, plane intersections and
+sparse lookup results with the trainer. Both eager and compiled sparse lookups
+are checked against the corresponding dense `grid_sample` implementation;
+compiled arithmetic can change rounding at exact half-cell ties. Use
+`--validate-geometry` for a separate real-data run that compares plane labels
+and complete masks. Validation downloads are excluded from throughput runs.
+
+Validation artifacts: `results/fiber_geometry_validation/final_synthetic.json`
+checks 200 plane cases and 80,000 lookup queries. The real run in
+`results/fiber_geometry_validate_real4/summary.json` passed all 30 batches
+(960 samples), with exact foreign-mask/component-count agreement across all
+five sources and plane-label comparisons enabled throughout. It evaluated
+2,858,690 neighbor candidates, at most 236,255 in one batch. CUDA API tests
+passed 56 tests plus 12 surface subtests; the CPU-only build passed 34 tests
+plus six subtests (16 CUDA cases skipped). Three targeted batched-augmentation
+tests also passed, including 39 subtests and non-default-stream error recovery.
+
+The separate-stream real-data validation in
+`results/fiber_geometry_validate_prefetch/summary.json` also passed all target
+comparisons: 30 consumed batches plus one already being prefetched at shutdown.
+An isolated adapter profile measured about 1.24 ms in nearest-query kernels
+for 138,657 candidate points; index construction and Python dispatch dominated
+the 13–20 ms preparation time. Its geometry range contained zero device-wide
+barriers and only a 128-byte device-to-host copy of component counts.
+
+The final, separately profiled 100-batch run is in
+`results/fiber_geometry_final_trace/` (`gpu_trace.nsys-rep` and
+`transfer_audit.json`). It recorded **zero `cudaDeviceSynchronize` calls**.
+Geometry ran on stream 13, model/images on stream 7, and heading on stream 17.
+The geometry stream downloaded only 100 × 128-byte component-count arrays.
+The two largest downloads were 8 MiB sparse-key tensors for periodic CPU
+decision diagnostics; CT crops and tensor patches were not downloaded.
+The new key-export kernel also passed Compute Sanitizer with **zero errors**.
+
+The trace additionally shows 337 four-byte scalar downloads per batch inside
+`model.update`. These are separate from geometry preparation. The checkpoint
+has 168 AdamW step tensors; loading the checkpoint onto CUDA retains those
+CUDA scalars in the non-capturable optimizer, whose bias corrections read each
+step twice. This code path accounts for the pattern of 336 optimizer scalar
+reads per update and is a further optimization target. Optimizer behavior is
+the same in every reported comparison above.
+
+The benchmark still performs forward/backward, AdamW and EMA updates. Use
+`--steps 500 --warmup 20 --grad-steps 1 --lookahead 0 --heading tensor
+--heading-stream separate --cuda-augmentation batch --cuda-cache shared
+--timing-sync stream`. The report records geometry time separately from image
+preparation and loader waits, plus unique crop positions and chunk footprints.
+
+Using `TRAIN_PY`, `FIBER_CHECKPOINT`, and `VC_SITE` from the setup above:
+
+```bash
+"$TRAIN_PY" benchmarks/bench_fiber_trainer.py \
+  --checkpoint "$FIBER_CHECKPOINT" --output benchmarks/results/fiber_geometry_new_run \
+  --backend vc-reader --heading tensor --heading-stream separate \
+  --geometry vc-reader --geometry-placement prefetch \
+  --steps 500 --warmup 20 --grad-steps 1 --lookahead 0 \
+  --cuda-augmentation batch --cuda-cache shared --timing-sync stream --timeline \
+  --vc-site-packages "$VC_SITE"
+```
+
+For the paired baseline, use `--geometry existing` and a different, unused
+output directory. Keep `--backend vc-reader`: this comparison isolates geometry
+while retaining the same CUDA images, augmentation and heading.

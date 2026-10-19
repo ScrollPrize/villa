@@ -48,6 +48,11 @@ def main():
                         help='Future batch plans per source/worker (default: disabled)')
     parser.add_argument('--cuda-augmentation', choices=('sample', 'batch'), default='batch')
     parser.add_argument('--cuda-cache', choices=('separate', 'shared'), default='shared')
+    parser.add_argument('--geometry', choices=('existing', 'vc-reader'), default='existing')
+    parser.add_argument('--geometry-placement', choices=('main', 'prefetch'), default='prefetch',
+                        help='Prepare CUDA geometry in the existing batch producer or on the main thread')
+    parser.add_argument('--validate-geometry', action='store_true',
+                        help='Compare targets against the trainer during a separate correctness run')
     parser.add_argument('--timeline', action='store_true')
     parser.add_argument('--timing-sync', choices=('stream','device'), default='stream',
                         help='Wait for measured work on its stream; device also drains background work')
@@ -63,6 +68,10 @@ def main():
         parser.error('steps and grad-steps must be positive; warmup must be nonnegative')
     if args.heading == 'tensor' and args.backend != 'vc-reader':
         parser.error('tensor heading benchmark requires --backend vc-reader')
+    if args.geometry == 'vc-reader' and args.backend != 'vc-reader':
+        parser.error('vc-reader geometry requires --backend vc-reader')
+    if args.validate_geometry and args.geometry != 'vc-reader':
+        parser.error('validate-geometry requires --geometry vc-reader')
     if args.profile_workers and not args.timeline:
         parser.error('profile-workers requires --timeline')
     if args.lookahead < 0:
@@ -113,6 +122,11 @@ def main():
         from fiber_cuda_pipeline import install
         backend = install(augmentation=args.cuda_augmentation, cache=args.cuda_cache)
     heading = None
+    geometry = None
+    if args.geometry == 'vc-reader':
+        os.environ['FIBER_BENCH_GEOMETRY_FAILURE'] = str(args.output/'geometry_failure.pt')
+        from fiber_geometry import install
+        geometry = install(validate=args.validate_geometry, placement=args.geometry_placement)
     if args.heading == 'tensor':
         from fiber_tensor_heading import install
         heading = install(backend.pool, stream=args.heading_stream)
@@ -126,6 +140,11 @@ def main():
                                 cwd=Path(__file__).resolve().parent, text=True).strip())
         reader_binary = Path(_native.__file__).resolve()
         native_build['reader'] = dict(path=str(reader_binary), sha256=hashlib.sha256(reader_binary.read_bytes()).hexdigest())
+        native_build['adapters'] = {name: hashlib.sha256((Path(__file__).parent/name).read_bytes()).hexdigest()
+            for name in ('bench_fiber_trainer.py', 'fiber_cuda_pipeline.py', 'fiber_tensor_heading.py', 'fiber_geometry.py')}
+        from vc_reader import cuda
+        native_build['python'] = {name: hashlib.sha256((Path(cuda.__file__).parent/name).read_bytes()).hexdigest()
+                                 for name in ('cuda.py', 'geometry.py')}
     from fiber_timeline import span
     if args.timeline:
         from fiber_timeline import install_main
@@ -167,6 +186,8 @@ def main():
             batches = original_next(prefetch)
         returned = time.perf_counter()
         pending['loader_seconds'] = returned - pending['started']
+        pending['geometry_seconds'] = 0.
+        pending['geometry_background_seconds'] = 0.
         if args.timeline:
             pending['trace'] = dict(sync_started=sync_started, requested=pending['started'], returned=returned,
                 worker=[b.get('_bench_worker_timing') for b in batches],
@@ -174,6 +195,15 @@ def main():
         if backend is not None:
             for batch in batches:
                 backend.materialize(batch)
+                if geometry is not None and args.geometry_placement == 'main':
+                    geometry_started = time.perf_counter()
+                    with span('geometry.materialize'):
+                        geometry.materialize(batch)
+                    pending['geometry_seconds'] += time.perf_counter()-geometry_started
+                elif geometry is not None:
+                    batch['foreign'].record_stream(torch.cuda.current_stream())
+                    timing = batch['_bench_geometry_timing']
+                    pending['geometry_background_seconds'] += timing['ready']-timing['began']
         with span('images.synchronize'):
             synchronize()
         if args.timeline:
@@ -193,6 +223,8 @@ def main():
         row = dict(index=index, measured=index >= args.warmup,
                    seconds=finished - pending['started'],
                    loader_seconds=pending['loader_seconds'],
+                   geometry_seconds=pending['geometry_seconds'],
+                   geometry_background_seconds=pending['geometry_background_seconds'],
                    input_seconds=pending['input_seconds'],
                    update_seconds=finished - started, loss=metrics['loss'],
                    error_mean=metrics['error_mean'],
@@ -236,7 +268,9 @@ def main():
     measured = [r for r in records if r['measured']]
     if len(measured) != args.steps:
         raise RuntimeError('Trainer ended without completing the requested measurements')
-    report = dict(backend=args.backend, heading=args.heading, checkpoint=str(args.checkpoint),
+    report = dict(backend=args.backend, heading=args.heading, geometry=args.geometry,
+                  geometry_placement=args.geometry_placement if geometry is not None else None,
+                  validate_geometry=args.validate_geometry, checkpoint=str(args.checkpoint),
                   command=[sys.executable, *sys.argv],
                   cuda_augmentation=args.cuda_augmentation if backend is not None else None,
                   cuda_cache=args.cuda_cache if backend is not None else None,
@@ -257,7 +291,8 @@ def main():
                                     unique_crop_footprint_chunks=len(state['chunks']),
                                     crop_footprint_chunk_touches=state['touches'])
                           for name, state in coverage.items()}
-    for key in ('seconds', 'loader_seconds', 'input_seconds', 'update_seconds'):
+    for key in ('seconds', 'loader_seconds', 'geometry_seconds', 'geometry_background_seconds',
+                'input_seconds', 'update_seconds'):
         values = np.array([r[key] for r in measured])
         report[key] = dict(total=float(values.sum()), mean=float(values.mean()),
                            p50=float(np.median(values)), p95=float(np.percentile(values, 95)),
@@ -268,6 +303,8 @@ def main():
         report['reader_stats'] = backend.stats()
     if heading is not None:
         report['heading_stats'] = heading.stats()
+    if geometry is not None:
+        report['geometry_stats'] = geometry.stats()
     (args.output / 'summary.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report, indent=2), flush=True)
 

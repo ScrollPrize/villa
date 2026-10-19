@@ -61,6 +61,9 @@ def deferred_augmentation(*args, **kwargs):
 
 def install_worker_reader(worker_id=None):
     load_reader_package()
+    if os.environ.get('FIBER_BENCH_GEOMETRY') == '1':
+        from fiber_geometry import install_worker
+        install_worker()
     volume.ChunkedArray.read = read_block
     volume.ChunkedArray.sample_nearest = read_nearest
     observations.augment_image_pair = deferred_augmentation
