@@ -488,9 +488,15 @@ async def vc3d_key(
     Keys held by this MCP connection are released automatically if it
     disconnects; vc3d_get_state lists them in "heldKeys". Do not send keys
     while a person is typing in VC3D: the events share the real focus chain.
+    Menu-bar shortcuts such as Ctrl+O or reset view fire only while VC3D's
+    window is the active window, as for a hardware keyboard; when VC3D runs
+    in the background on a desktop they return "accepted": false, while keys
+    the viewer or main window handle directly still work.
     A key whose shortcut opens a dialog or menu has it answered as Escape
     would (Cancel or No, never a destructive choice) and listed in
-    "dismissed"; use the typed tool for that action instead.
+    "dismissed"; use the typed tool for that action instead. Any modal
+    dialog that appears while the key is delivered is answered the same
+    way, including one a finishing background tool raises at that moment.
 
     Returns {"viewerId", "key", "modifiers", "action", "accepted" (a widget or
     shortcut handled the key), "heldKeys" (keys this connection still holds),

@@ -375,10 +375,15 @@ dialog.
   escape button (its Cancel, No, or only button), or is closed without a
   button when it has none; any other modal dialog is rejected; a menu is
   closed. Each is listed in `dismissed` with `class`, `title`, and `answer`.
-  Non-modal windows and progress dialogs are left alone. Native dialogs are
-  switched off for the call, so file pickers are Qt dialogs. Requests from
-  any client, the bridge's key-release timers, and its queued state checks
-  that come due meanwhile wait until the call ends.
+  Non-modal windows and progress dialogs are left alone. The rule applies to
+  every modal dialog or menu shown while the key is delivered, whatever
+  opened it, so a message box raised at that moment by a background tool
+  finishing (such as its completion or error box) is answered too and is
+  listed in `dismissed`. Native dialogs are switched off for the call
+  (`Qt::AA_DontUseNativeDialogs`, an application-wide attribute, restored
+  afterwards), so file pickers are Qt dialogs. Requests from any client, the
+  bridge's key-release timers, and its queued state checks that come due
+  meanwhile wait until the call ends.
 - `canvas.wheel` rejects a zero `deltaY`. It requires a current volume and,
   for volume-space positions, a point on the viewer's current view. Partial
   notches accumulate in the view as they do for a smooth-scrolling mouse.
@@ -650,3 +655,6 @@ volume-package fixtures and is intentionally separate from hermetic CI.
   them until the bridge resets them. Window-context shortcuts match only while
   VC3D's window is active, as for hardware keys; after answering a dialog the
   bridge activates the previously active window again if no window is active.
+- While `canvas.key` delivers a key, any modal dialog that opens is answered
+  as Escape would, including one raised by unrelated application code at
+  that moment, and native dialogs are off application-wide for the call.
