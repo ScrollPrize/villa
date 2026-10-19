@@ -533,8 +533,10 @@ void AgentBridgeServer::dispatch(QLocalSocket* socket, const QJsonObject& reques
     _currentMethod.clear();
 
     // A request's state.changed goes out before its response, so a client
-    // that has the response has also seen the change it caused.
-    refreshObservedStateNow();
+    // that has the response has also seen the change it caused. state.get
+    // has already checked against the snapshot it returns.
+    if (method != QLatin1String("state.get"))
+        refreshObservedStateNow();
     if (!isNotification)
         sendResponse(socket, id, result);
 }
