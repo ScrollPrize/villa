@@ -1607,6 +1607,11 @@ semantics, layer validity, seeds, process cleanup and optional dependencies.
 
 ## Fiber trainer comparison
 
+**Current repeated results:** see [the native-batching/cache experiment](#repeated-fiber-batching-and-cache-comparison).
+It measures all four configurations twice on the merged native CUDA build.
+The 227.589 / 184.847 / 124.608 s table below uses lookahead 16; it is a different
+configuration. Earlier no-lookahead results are listed separately below.
+
 `bench_fiber_trainer.py` runs the Vesuvius fiber trainer itself from a resumable
 checkpoint, including its five-source loader, live continuation feedback,
 forward/backward, AdamW and EMA. The default is 20 warmup batches followed by
@@ -1667,8 +1672,13 @@ augmentation parameters. The training process samples source chunks with
 `source="chunks"`, then applies vc_reader CUDA normalization and photometric
 augmentation. Images stay on CUDA through model input; only chunk uploads,
 small geometry/label transfers and the trainer's ordinary feedback occur.
-Each source has a bounded 512 MiB device chunk cache, and batches are sampled
-four crops at a time. A nonzero CPU sampling-route counter fails the benchmark.
+Training caches are bounded: `--cuda-cache shared` uses 768 MiB per physical
+volume for both consumers; `--cuda-cache separate` splits that into 512 MiB for
+images and 256 MiB for headings. CPU decoded caches use the same budgets.
+Batches are sampled four crops at a time. `--cuda-augmentation batch` submits
+all 32 images to native batch execution; `sample` submits one image at a time
+through the same pipeline and merged binary, with the same parameters/seeds.
+A nonzero CPU sampling-route counter fails the benchmark.
 
 `check_fiber_pipeline.py` compares real CT crops from every dataset against the
 trainer, including normalization, contrast, brightness and reflected Gaussian
@@ -1686,7 +1696,7 @@ bookkeeping; the summed step interval isolates input preparation and updates.
 `--heading tensor` additionally replaces learned frame inference and CT seed
 heading estimation with the graph-linking anisotropic sheet normal on CUDA.
 `fiber_tensor_heading.py` serves small worker requests from a thread in the
-training process. It reads CT using bounded 256 MiB device caches and computes
+training process. It reads CT using the selected cache layout and computes
 normal, H/V heading, sign alignment and orthonormal frame on CUDA. Only a
 three-component heading or 3×3 frame, plus a validity flag, is downloaded for
 CPU geometry and label construction. Image data and tensor intermediates are
@@ -1702,12 +1712,13 @@ ambiguous tensors, fractional lattice positions, and volume boundaries.
 The estimator profile contains no device-to-host copies. Normal result
 downloads for numerical validation occur outside that profile.
 
-### Measured fiber results (RTX 5090)
+### Fiber results with lookahead 16 (RTX 5090)
 
 Checkpoint `polar_tokens_a3_ms_slim_dagger_b32x2_50k/ckpt_050000.pt`,
 PyTorch 2.12.1+cu130, compiled model with bfloat16 autocast, 10 workers and
 4 trainer threads. Each row is 500 measured batches × 32 crops, grad steps 1,
-after 20 warmup batches. Times include real forward/backward/optimizer updates.
+after 20 warmup batches. Every row in this table uses lookahead 16. Times include
+real forward/backward/optimizer updates.
 
 | Input pipeline / frame estimator | Wall time | Crops/s | Loader wait | Model updates |
 | --- | ---: | ---: | ---: | ---: |
@@ -1760,6 +1771,310 @@ worker/source combinations. Consequently, the reported total is not a
 steady-state CUDA throughput measurement. The timing hooks do not separately
 measure plan generation, source readiness, heading requests, and CPU labels
 inside each wait. See `results/fiber_tensor_bottleneck_analysis.json`.
+
+### Earlier fiber results with lookahead disabled
+
+These are single 500-batch runs before the native batch-kernel merge, with
+20 warmup batches, batch 32, grad steps 1, and lookahead 0:
+
+| Configuration | Measured wall time |
+| --- | ---: |
+| Original trainer / learned heading | 174.502 s |
+| CUDA images / tensor heading / per-sample calls / separate caches | 62.236 s |
+| CUDA images / tensor heading / batch submission / shared caches | 64.957 s |
+
+The last row submitted a batch through the common executor; the native
+multi-sample kernels had not yet been merged. Saved reports are
+`results/fiber_existing_no_lookahead_500/summary.json`,
+`results/fiber_cuda_tensor_no_lookahead_500/summary.json`, and
+`results/fiber_cuda_tensor_batch_shared_no_lookahead_500/summary.json`.
+
+### Repeated fiber batching and cache comparison
+
+Measured on the merged native batching code, commit `de4497b77`, RTX 5090,
+trainer PyTorch 2.12.1+cu130. Each cell below is **500 real batches of 32**,
+with forward/backward/optimizer/EMA, grad steps 1, lookahead 0, after 20 warmup
+batches. Setup and warmup are excluded from wall time. All four configurations
+use the same native binary and augmentation recipe, seeds and parameters.
+Only submission granularity and cache layout change. Round two reverses the
+first round's order. Total training cache capacity is equal at 768 MiB per
+physical volume; startup readers use 256 MiB and are released before training.
+
+| Augmentation | Cache | Run 1 | Run 2 | Mean |
+| --- | --- | ---: | ---: | ---: |
+| Per-sample | separate | 62.495 s | 60.086 s | 61.290 s |
+| Native batch | separate | 64.561 s | 63.825 s | 64.193 s |
+| Per-sample | shared | 59.783 s | 60.383 s | 60.083 s |
+| Native batch | shared | 60.863 s | 63.695 s | 62.279 s |
+
+Mean elapsed-phase breakdown, in seconds:
+
+| Augmentation / cache | Loader wait | Image preparation | Update interval |
+| --- | ---: | ---: | ---: |
+| sample / separate | 2.444 | 17.624 | 40.572 |
+| batch / separate | 7.369 | 13.661 | 42.438 |
+| sample / shared | 3.163 | 15.603 | 40.645 |
+| batch / shared | 9.697 | 11.143 | 40.755 |
+
+Native batching reduced augmentation time from about 7.0 s to 2.5–2.6 s
+(including warmup), but total wall time increased in all four matched
+comparisons. Its mean wall-time penalty was 2.903 s with separate caches and
+2.196 s with shared caches. Sharing caches reduced training uploads from
+about 83.4 GiB to 53.3–54.8 GiB (including warmup/prefetch). Its mean wall-time
+benefit was 1.207 s with per-sample calls and 1.914 s with batching; one paired
+per-sample run was slightly slower with shared caches. With two repetitions,
+these are observed differences, not statistical significance claims.
+
+**Interpretation limits:** loader wait measures time blocked on the prefetched
+batch's future, not total time spent producing that batch. Augmentation of the
+current batch overlaps production of future batches. Reaching `next()` sooner
+can increase its wait even if the next batch's ready time is unchanged. That
+moves elapsed time between categories; it does not explain an increase in total
+wall time. The logs do not record request and ready timestamps, so they do not
+establish the cause of the extra total time. Heading production also uses the
+same GPU. Device-wide synchronization in the timing hooks can include that
+background work in the input/update intervals; these columns do not isolate
+model kernel time or exclusive augmentation GPU time. A scheduling explanation
+requires a producer/consumer timeline, rather than inference from wait totals.
+
+All eight runs used identical source-draw sequences, delivered 16,000 measured
+crops each, and had finite loss/error metrics. Each used 15,505–15,531 distinct
+positions and 5,565–10,029 crop-footprint chunks per source. Counters verified
+four shared readers or eight separate readers at equal total capacity, zero CPU
+sampling routes, and 520 batch augmentation calls or 16,640 per-sample calls.
+The rebuilt CUDA extension passed 37 tests and 267 subtests. All four real-CT
+validation configurations passed; each profiled image path downloaded only
+16 bytes of validation flags, with no image download.
+
+Run with the trainer Python and paths defined above:
+
+```bash
+"$TRAIN_PY" benchmarks/bench_fiber_ablation.py --checkpoint "$FIBER_CHECKPOINT" \
+  --vc-site-packages "$VC_SITE" --output benchmarks/results/my_fiber_ablation
+python benchmarks/analyze_fiber_ablation.py benchmarks/results/my_fiber_ablation
+```
+
+Reports are under `results/fiber_merged_ablation/`: `comparison.json` contains
+all observations and effects; each named run has `summary.json`, `steps.jsonl`,
+its full command and native binary SHA-256. Validation reports/traces are under
+`results/fiber_merged_validation/`. The runner uses real continuation feedback,
+so individual crops and work can differ despite identical source draws.
+
+### Fiber producer/consumer timing investigation
+
+`bench_fiber_trainer.py --timeline` records worker batch start/ready times,
+worker CPU time, heading request send/service/finish times, loader collection,
+and consumer request/update times. These timestamps use the same monotonic
+clock across processes. NVTX ranges are also available for a separate profiler
+run. The following runs used timestamps without an external profiler, shared
+caches, lookahead 0, and 500 real measured batches of 32 after 20 warmup:
+
+| Augmentation | Wall | Loader wait | Image preparation | Update interval |
+| --- | ---: | ---: | ---: | ---: |
+| Per-sample | 58.071 s | 0.958 s | 15.717 s | 40.730 s |
+| Native batch | 59.754 s | 8.235 s | 10.790 s | 40.059 s |
+
+Batching saved 4.927 s in image preparation, but exposed 7.277 s more loader
+wait. This was more than an accounting shift: average worker production time
+increased from 0.973 s to 1.035 s. Worker CPU work was almost unchanged
+(316.0 versus 312.8 summed CPU-seconds across ten workers). Time blocked on
+heading requests increased from 161.6 to 195.5 summed worker-seconds. Mean
+heading queue delay increased from 14.71 to 19.38 ms, while mean service time
+was essentially unchanged at 6.97 versus 6.92 ms. These overlapping worker
+totals must not be added to wall time.
+
+The heading service completed 3,357 requests during per-sample image preparation,
+versus 1,880 with native batching. Heading computation shares the GPU with the
+model, so changing the consumer's cadence also changes producer progress.
+In the batched run, 6.551 s of loader wait preceded worker readiness, including
+5.745 s after that worker's last heading result; 1.684 s followed worker
+readiness during delivery/collection. During 8.223 s of the 8.235 s total wait,
+later batches were already ready (7.44 on average), but ordered delivery had
+to wait for the requested batch. Thus variable CPU geometry/label work after
+heading and ordered delivery amplify delayed heading results.
+
+A separate 500-batch control shortened Python's thread switch interval from
+5 ms to 1 ms. It took 60.998 s with 9.265 s loader wait, so this did not resolve
+the regression. The default thread switch interval is unchanged.
+
+Changing only the heading service to a separate CUDA stream (`--heading-stream
+separate`) took **57.425 s**, with **5.425 s** loader wait. Mean heading queue
+delay fell to **13.93 ms** and summed worker heading wait to **150.1 s**, while
+worker CPU work remained **313.8 CPU-seconds**. This recovered **2.329 s**
+relative to the batch/default-stream run. It is one diagnostic run, not a
+repeated speedup estimate. The stream choice remains an explicit benchmark
+option. Both native reader/tensor operations and Torch frame construction use
+that stream; CT images and tensor intermediates remain on CUDA. Shared-reader
+cache access retains its existing lock and cross-stream event dependencies.
+
+CPU profiles of one batch per worker identified `afv_neighbors.draw_path`,
+`IdentityObservationBuilder.bank_targets` / neighbor candidates, and
+`targets.plane_targets` as substantial remaining CPU work. Profiles are in
+`results/fiber_cuda_schedule/worker_*.pstats`; their profiled run is not a
+throughput measurement. Ordered delivery still exposes CPU stragglers after
+moving headings to another stream, and exported native buffer destruction
+still contains device-wide synchronization; the stream probe does not remove
+all heading/model dependencies.
+
+A separate 100-batch Nsight trace confirmed that heading, preprocessing and
+model kernels all used the same CUDA stream (trace stream ID 7). The heading
+service spent 10.838 s handling 1,604 requests; its kernels accounted for
+0.986 GPU-seconds, while stream/device synchronization calls occupied 4.295 s.
+Of that synchronization time, 2.896 s overlapped kernels launched by other
+threads. The service issued 156,299 kernels, 15,086 stream synchronizations
+and 3,916 device synchronizations. These are diagnostic trace totals including
+concurrent prefetch, not 500-batch throughput numbers. They demonstrate that
+heading latency contains substantial waiting for other GPU work, beyond the
+structure-tensor arithmetic itself.
+
+The trace and extracted counters are in `results/fiber_cuda_schedule_nosymbols/`.
+Nsight required `--resolve-symbols=false` to avoid stalling on symbol downloads;
+the earlier profiler attempts did not produce usable GPU traces. Capture used
+`--trace=cuda,nvtx --sample=none --cpuctxsw=none --cuda-graph-trace=node
+--capture-range=cudaProfilerApi`, with benchmark `--steps 100 --warmup 20
+--timeline --profile-batches -1`. All performance comparisons above are from
+the unprofiled 500-batch runs.
+
+Reports: `results/fiber_timestamps_sample/`, `results/fiber_timestamps_batch/`,
+`results/fiber_timestamps_batch_gil1ms/`, and
+`results/fiber_timestamps_batch_stream/`. All four completed 16,000 measured
+crops with finite metrics, varied positions/chunks and zero CPU sampling routes.
+Recompute the breakdown with:
+
+```bash
+python3 benchmarks/analyze_fiber_timeline.py \
+  benchmarks/results/fiber_timestamps_sample \
+  benchmarks/results/fiber_timestamps_batch
+```
+
+### Consumer-owned CUDA outputs and geometry audit
+
+The CUDA adapter now supplies Torch-owned output buffers to
+`read_affine_batch(..., out=images)` and
+`sample_sheet_normals(..., out=normals)`. Sampling writes into the final image
+tensor directly, eliminating its temporary allocation and device-to-device
+copy. Structure-tensor patches remain internal native arrays. These arrays
+are marked as externally shared only when actually exported through DLPack,
+including exports of reshaped and in-place augmentation views. Internal
+destruction can therefore use stream-ordered release. Actual native DLPack
+exports retain their lifetime protection for arbitrary consumer streams.
+
+Benchmark timing defaults to `--timing-sync stream`: timing waits for the
+current Torch stream, allowing independent heading work to continue. The
+final optimizer update still completes before the measured interval ends.
+`--timing-sync device` retains the device-wide timing control for comparisons.
+Use `--heading-stream separate` to allow heading/model concurrency. Shared
+chunk-cache locks and cross-stream event dependencies remain necessary.
+
+RTX 5090 results for **500 real batches of 32**, one gradient step, 20 warmup
+batches, lookahead 0, native batched augmentation, shared chunk caches and
+separate heading stream:
+
+| Output ownership / timing barrier | Wall | Loader wait | Image preparation | Update interval |
+| --- | ---: | ---: | ---: | ---: |
+| Native exported outputs / device timing | 57.425 s | 5.425 s | 10.921 s | 40.384 s |
+| Consumer-owned outputs / device timing | 50.660 s | 3.980 s | 10.160 s | 35.901 s |
+| Consumer-owned outputs / stream timing | 51.594 s | 4.642 s | 10.064 s | 36.290 s |
+
+The first row is `results/fiber_timestamps_batch_stream/`; the new runs are
+`results/fiber_owned_outputs_device/` and `results/fiber_owned_outputs_stream/`.
+Image preparation subtracts loader wait from the recorded input interval.
+Wall time includes inter-update bookkeeping, so the columns need not sum
+exactly. The ownership change recovered 6.766 s in the device-timing control;
+these single runs do not establish an additional benefit from changing timing
+barriers. Adaptive continuation feedback also changes individual crops.
+All runs retain forward/backward, AdamW and EMA updates. The two new runs
+completed 16,000 measured crops each, with finite metrics, varied positions
+and thousands of distinct crop-footprint chunks across all five sources,
+and zero CPU sampling routes.
+
+Mean heading queue delay fell from 13.93 ms to 7.27/7.62 ms (device/stream
+timing). Summed worker heading waits fell from 150.1 to 91.5/95.7 seconds.
+These are overlapping producer totals, not wall-time components. In the
+stream-timed run, 3.467 s of loader wait occurred after the requested worker's
+last heading result and before batch readiness, consistent with the remaining
+CPU geometry work. Reports include both native-module hashes and the timing
+barrier choice. The final exception-handling check additionally drains only
+the active stream before releasing borrowed tensor inputs/outputs on an error;
+it does not change successful-call execution.
+
+A separate 100-batch Nsight capture (`results/fiber_owned_outputs_trace/`)
+recorded **zero `cudaDeviceSynchronize` calls across the captured process**.
+Heading and model kernels ran on distinct streams (trace IDs 13 and 7).
+The heading service handled 1,593 requests in 8.791 s, with 2.209 s in
+stream synchronization. These trace timings include profiler overhead and
+concurrent prefetch; use the unprofiled table for throughput.
+
+The trace also exposed two 47.53 MiB downloads during periodic trainer
+diagnostics: `decision_rows` copies top-level batch tensors, including the
+`foreign` mask, to CPU. CT images are nested under `x` and excluded from that
+copy. A separate real-CT validation across all five sources passed crop,
+normalization, blur and noise checks; the profiled image-input call downloaded
+only 16 bytes of validation flags. No CT images made a host round trip.
+CUDA regression validation passed 65 tests and 307 subtests; the final
+error-cleanup adjustment passed all 10 output/normal tests. The CPU-only
+build passed four applicable tests with six CUDA tests skipped.
+
+The target audit covers `fibers/data/targets.py`,
+`fibers/data/observations.py`, `fibers/data/afv_neighbors.py`, and
+`tracers/models/targets.py` in the trainer checkout. Geometry has **not** yet
+been moved into vc_reader:
+
+| Work | Current result | Reusable CPU/CUDA support |
+| --- | --- | --- |
+| Arclength interpolation and crop-frame transforms | Ground-truth history, future points, endpoint coordinates and masks | Batched interpolation of packed polylines with per-query traversal direction, arclength, origin and frame |
+| First directed forward-plane crossing | `plane_ab` / `plane_mask` and `dense_ab` / `dense_mask` | One batched intersection operation for both plane sets, respecting the bounded traversal window and first-crossing rule |
+| Neighbor clearance and identity support | Valid neighboring samples, observability and matching evidence | Indexed nearest-point/segment queries and crop-region queries |
+| Foreign-fiber raster | `foreign`, used by confidence and geometry losses to reject paths/connectors crossing another fiber | Sparse occupied-cell rasterization and batched membership lookup, with an optional dense output |
+| Training-example selection | Supported neighbor intervals and nearest matched positions for `draw_path` | Reuse the same spatial-query and interpolation primitives |
+
+The current checkpoint has 35 coarse and 137 dense forward planes. The
+`foreign` uint8 tensor is `(32,144,104,104)`: **47.53 MiB per batch**, or
+**23.21 GiB across 500 batches**, before its GPU float32 conversion. Candidate
+rasterization already queries only occupied cells; the avoidable work is the
+dense allocation, transfer and later conversion. A sparse replacement must
+preserve nearest-cell rounding, out-of-bounds behavior and conservative
+whole-cell clearance from the annotated target fiber.
+
+A useful geometry backend would retain immutable packed annotation curves
+and a spatial index, accept small batched queries, and write results directly
+into consumer-owned outputs. Local geometry should use float32 after removing
+a suitable coordinate origin; precision needs validation against the existing
+coordinate and boundary rules. Coarse/dense intersections currently repeat
+curve preparation, and heading changes can rebuild targets, so reducing that
+work should precede a direct port of every call. Some crossings are needed
+during state classification, which prevents blindly deferring all geometry
+until the final image batch.
+
+Following/recoverable/terminal/unknown supervision, explicit endpoint tags,
+replay policy, RNG and sampling feedback belong in the trainer. These consume
+geometry results but are not generic geometry operations. CPU profiles also
+include example selection and heading waits, so their cumulative timings
+cannot all be attributed to target construction or added to wall time.
+
+Existing implementation inventory, before adding geometry APIs:
+
+- `affine.py`, `reader/_sampling.py`, `cpp/sampling_math.hpp` and the aligned
+  sampler already implement coordinate conventions and shared CPU/CUDA
+  sampling arithmetic. Reuse these conventions and numerical rules.
+- `cpp/surface/common.hpp` already has CPU/CUDA vector/frame arithmetic,
+  closest points on triangles, segment-distance helpers, nearest-cell
+  rounding and triangle rasterization. Extract or extend shared primitives
+  where their semantics match; do not copy these into a fiber module.
+- `surface.py::_SurfaceIndex` provides a CPU BVH over surface-tile bounds.
+  Its query includes surface-cell expansion; it is not currently a generic
+  point/segment nearest-neighbor index. Generalizing indexing should preserve
+  those existing surface semantics and add the required CUDA support.
+- Augmentation geometry already transforms sparse points/vectors on CPU and
+  CUDA. `DistanceTransform` computes dense voxel-mask distances; it does not
+  provide nearest annotated-polyline queries.
+
+No existing public packed-polyline arclength interpolation, directed
+curve/plane intersection, indexed point/segment nearest-query API, or sparse
+occupied-cell membership API was found in this audit. New APIs should expose
+these general operations with CPU/CUDA implementations and batched inputs.
+Fiber traversal windows, label names, endpoint interpretation and supervision
+policy are adapter concerns, not vc_reader API concepts.
 
 # Native augmentation batches
 

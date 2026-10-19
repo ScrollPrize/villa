@@ -15,7 +15,7 @@ from . import _native
 RECIPE = "ct-anisotropic-1-24-4-grid3-r48-v4"
 
 
-def sheet_normals(patches, offsets_xyz=None, *, valid=None):
+def sheet_normals(patches, offsets_xyz=None, *, valid=None, out=None):
     """Estimate (B,4) normal XYZ + gap from (B,109,109,109) uint8/float32 CT.
 
     CT intensities are in [0,255]. Patches start at floor(query/3)*3 - 54
@@ -24,6 +24,8 @@ def sheet_normals(patches, offsets_xyz=None, *, valid=None):
     DLPack input returns DeviceArray, without a download or Torch dependency.
     CUDA calls complete before returning; finish external writes first.
     Only small host offsets and validity metadata are uploaded.
+    out optionally supplies writable contiguous (B,4) float32 storage on the
+    same device. The supplied object is returned, without a temporary output.
     """
     from .cuda import is_device_array, wrap, DeviceArray
     device = is_device_array(patches)
@@ -44,8 +46,19 @@ def sheet_normals(patches, offsets_xyz=None, *, valid=None):
             raise ValueError("valid must have shape (B,)")
         centers[:, 3] = mask
     if device:
+        if out is not None:
+            if not is_device_array(out):
+                raise TypeError('out must be a CUDA array for CUDA patches')
+            destination = wrap(out)
+            _native._sheet_normals_cuda(patches._native, centers, destination._native)
+            return out
         return DeviceArray(_native._sheet_normals_cuda(patches._native, centers), (n, 4), np.float32, patches.device)
-    return _native._sheet_normals_cpu(np.ascontiguousarray(patches), centers)
+    if out is not None:
+        if not isinstance(out, np.ndarray) or out.dtype != np.float32 or out.shape != (n,4) or not out.flags.c_contiguous or not out.flags.writeable:
+            raise ValueError('out must be writable contiguous (B,4) float32 NumPy storage')
+        if np.shares_memory(patches, out):
+            raise ValueError('out must not overlap input patches')
+    return _native._sheet_normals_cpu(np.ascontiguousarray(patches), centers, out)
 
 
 def sheet_normal_regions(points_xyz, shape_zyx):
@@ -69,7 +82,7 @@ def sheet_normal_regions(points_xyz, shape_zyx):
     return starts, (points - lattice).astype(np.float32), valid
 
 
-def sample_sheet_normals(reader, points_xyz):
+def sample_sheet_normals(reader, points_xyz, *, out=None):
     """Read one bounded batch and estimate normals with a ZarrReader/CudaReader.
 
     CUDA uses source='chunks' with no CPU sampling fallback. Batch requests
@@ -85,4 +98,4 @@ def sample_sheet_normals(reader, points_xyz):
         patches = reader.read_affine_batch((109, 109, 109), starts, axes, order=0, source="chunks")
     else:
         patches = np.stack([reader.read_region(start, (109, 109, 109)) for start in starts]) if len(starts) else np.empty((0,109,109,109),np.uint8)
-    return sheet_normals(patches, offsets, valid=valid)
+    return sheet_normals(patches, offsets, valid=valid, out=out)

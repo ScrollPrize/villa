@@ -3,7 +3,7 @@
 #ifdef VC_READER_CUDA
 #include "../cuda_buffer.hpp"
 namespace vcr::sheet_normal {
-device::Storage cuda(const void* image,bool floating,const float* centers,std::size_t batch,int device);
+device::Storage cuda(const void* image,bool floating,const float* centers,std::size_t batch,int device,device::Storage output={});
 }
 #endif
 namespace vcr::sheet_normal {
@@ -25,24 +25,48 @@ inline void bind(nb::module_& m) {
             if(!std::isfinite(c.data()[4*b+j]) || c.data()[4*b+j]<48 || c.data()[4*b+j]>=51)
                 throw nb::value_error("center must be in [48,51)");
     };
-    m.def("_sheet_normals_cpu",[check](Host image,Centers centers) {
+    const auto check_output=[](auto image,auto out,std::size_t n) {
+        if (out.ndim()!=2 || out.shape(0)!=n || out.shape(1)!=4 || out.dtype()!=nb::dtype<float>() || out.device_id()!=image.device_id())
+            throw nb::value_error("out must be contiguous (B,4) float32 on the input device");
+        auto a=reinterpret_cast<std::uintptr_t>(image.data()),b=reinterpret_cast<std::uintptr_t>(out.data());
+        if (image.nbytes() && out.nbytes() && a<b+out.nbytes() && b<a+image.nbytes())
+            throw nb::value_error("out must not overlap input patches");
+    };
+    m.def("_sheet_normals_cpu",[check,check_output](Host image,Centers centers,nb::object destination) -> nb::object {
         check(centers); const auto n=centers.shape(0); bool floating=validate(image,n);
-        auto out=std::make_unique<float[]>(n*4);
+        std::unique_ptr<float[]> out;
+        float* data;
+        if (destination.is_none()) { out=std::make_unique<float[]>(n*4); data=out.get(); }
+        else {
+            const auto target=nb::cast<nb::ndarray<float,nb::c_contig,nb::device::cpu>>(destination);
+            check_output(image,target,n); data=target.data();
+        }
         { nb::gil_scoped_release release;
-          if(floating) cpu(static_cast<const float*>(image.data()),centers.data(),out.get(),n);
-          else cpu(static_cast<const std::uint8_t*>(image.data()),centers.data(),out.get(),n); }
+          if(floating) cpu(static_cast<const float*>(image.data()),centers.data(),data,n);
+          else cpu(static_cast<const std::uint8_t*>(image.data()),centers.data(),data,n); }
+        if (!destination.is_none()) return destination;
         auto* ptr=out.release(); nb::capsule owner(ptr,[](void* p) noexcept {delete[] static_cast<float*>(p);});
-        return nb::ndarray<nb::numpy,float>(ptr,{n,4},owner);
-    });
+        return nb::cast(nb::ndarray<nb::numpy,float>(ptr,{n,4},owner));
+    },"image"_a,"centers"_a,"out"_a=nb::none());
 #ifdef VC_READER_CUDA
     using Device=nb::ndarray<nb::array_api,nb::c_contig,nb::device::cuda>;
-    m.def("_sheet_normals_cuda",[check](Device image,Centers centers) {
+    m.def("_sheet_normals_cuda",[check,check_output](Device image,Centers centers,nb::object destination) -> nb::object {
         check(centers); const auto n=centers.shape(0); bool floating=validate(image,n);
         device::Storage out;
+        if (!destination.is_none()) {
+            const auto target=nb::cast<Device>(destination);
+            check_output(image,target,n); out=device::borrow(target.data(),target.nbytes(),target.device_id());
+        }
         { nb::gil_scoped_release release; device::Guard guard(image.device_id());
-          out=cuda(image.data(),floating,centers.data(),n,image.device_id()); }
+          try { out=cuda(image.data(),floating,centers.data(),n,image.device_id(),std::move(out)); }
+          catch (...) {
+              // External inputs/outputs may be released as soon as we unwind.
+              cudaStreamSynchronize(device::stream());
+              throw;
+          } }
+        if (!destination.is_none()) return nb::none();
         return reader_cuda::owned(std::move(out),n*4,nb::dtype<float>(),image.device_id());
-    });
+    },"image"_a,"centers"_a,"out"_a=nb::none());
 #endif
 }
 }

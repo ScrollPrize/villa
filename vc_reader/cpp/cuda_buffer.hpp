@@ -26,7 +26,10 @@ struct Buffer {
     pid_t pid = getpid();
     bool pooled = false;
     bool exported = false;
+    bool borrowed = false;
     cudaStream_t stream = vcr::device::stream();
+    // The synchronous caller retains external storage until all writes finish.
+    Buffer(void* p, std::size_t n, int d) : ptr(p),bytes(n),device(d),borrowed(true) {}
     Buffer(std::size_t n, int d) : bytes(n),device(d) {
         Guard guard(device);
         if (!n) return;
@@ -38,7 +41,7 @@ struct Buffer {
         check(cudaMalloc(&ptr,n));
     }
     ~Buffer() {
-        if (!ptr || pid != getpid()) return;
+        if (!ptr || borrowed || pid != getpid()) return;
         int previous = 0; if (cudaGetDevice(&previous) != cudaSuccess) return;
         if (cudaSetDevice(device) != cudaSuccess) return;
         // DLPack consumers may enqueue work on any stream and then drop their
@@ -54,6 +57,7 @@ struct Buffer {
 };
 using Storage = std::shared_ptr<Buffer>;
 inline Storage allocate(std::size_t bytes, int device) { return std::make_shared<Buffer>(bytes,device); }
+inline Storage borrow(void* ptr, std::size_t bytes, int device) { return std::make_shared<Buffer>(ptr,bytes,device); }
 inline void complete() { check(cudaStreamSynchronize(stream())); }
 
 // Reusable page-locked staging. The caller must finish all transfers before

@@ -195,15 +195,12 @@ class Pipeline:
         return arrays
 
     @staticmethod
-    def _device_result(result):
-        from ..cuda import DeviceArray
+    def _device_result(result, inputs=()):
+        from ..cuda import DeviceArray, _ExportOwners
         arrays, sources, timings, plan = result[:4]
-        if len(result) == 5:
-            # Native device results carry an owner for deferred checks and
-            # lifetime tracking. This synchronous adapter exposes the arrays
-            # directly, so protect external DLPack users on destruction.
-            result[4].export()
-        return ({k: [DeviceArray(*level) for level in v] if isinstance(v, list) else DeviceArray(*v)
+        owner = _ExportOwners([result[4] if len(result) == 5 else None,
+                               *(v._export_owner for v in inputs)])
+        return ({k: [DeviceArray(*level, _export_owner=owner) for level in v] if isinstance(v, list) else DeviceArray(*v, _export_owner=owner)
                  for k, v in arrays.items()}, sources, timings, plan)
 
     @staticmethod
@@ -222,7 +219,8 @@ class Pipeline:
     def __call__(self, sample, *, seed, profile=False, inplace=False, params=None):
         device = self._device_inputs(sample)
         if device is not None:
-            result = self._device_result(self._native.run_device(device, seed, False, profile, inplace, params=params or {}))
+            result = self._device_result(self._native.run_device(device, seed, False, profile, inplace, params=params or {}),
+                                         [sample[k] for k in device] if inplace else ())
             return self._outputs(sample, dict.fromkeys(device), result, profile)
         arrays, converters = self._inputs(sample, inplace)
         result = self._native.run(arrays, seed, False, profile, inplace, params=params or {})

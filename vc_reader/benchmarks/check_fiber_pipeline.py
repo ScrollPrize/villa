@@ -14,6 +14,8 @@ def main():
     parser.add_argument('--checkpoint', type=Path, required=True)
     parser.add_argument('--vc-site-packages', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--cuda-augmentation', choices=('sample', 'batch'), default='batch')
+    parser.add_argument('--cuda-cache', choices=('separate', 'shared'), default='shared')
     args = parser.parse_args()
     sys.path.append(str(args.vc_site_packages))
     importlib.import_module('_editable_skbc_vc_reader')
@@ -24,7 +26,7 @@ def main():
     from vesuvius.neural_tracing.tracers.fibers.data.observations import augment_ct
     checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     crop = CropSpec(**checkpoint['crop'])
-    pipeline = CudaInputs()
+    pipeline = CudaInputs(augmentation=args.cuda_augmentation, cache=args.cuda_cache)
     report = []
     for source in checkpoint['dataset_config']['sources']:
         doc = json.loads((args.checkpoint.parent / f'validation_{source["name"]}.json').read_text())
@@ -80,11 +82,10 @@ def main():
             raise AssertionError(f'Noise distribution mismatch: {noise_result}')
         report.append(noise_result)
         print(noise_result, flush=True)
-        # Both consumers must resolve to the same resident chunk cache. A second
-        # tensor query at the same points must reuse its previously uploaded bricks.
+        # Check the selected cache layout and reuse of resident heading chunks.
         from vc_reader.sheet_normal import sample_sheet_normals
         gpu = pipeline.pool.get(reader, 'heading')
-        assert gpu is pipeline.pool.get(reader, 'images')
+        assert (gpu is pipeline.pool.get(reader, 'images')) == (args.cuda_cache == 'shared')
         points = np.stack([i['pos'] for i in items]) * volume.input_scale
         sample_sheet_normals(gpu, points)
         before = gpu.stats
@@ -96,7 +97,8 @@ def main():
     trace = json.loads(args.output.with_suffix('.trace.json').read_text())
     downloads = [e for e in trace['traceEvents']
                  if e.get('cat') == 'gpu_memcpy' and 'DtoH' in e.get('name', '')]
-    assert all(e.get('args', {}).get('bytes', 0) <= 4 for e in downloads), downloads
+    # Three int32 status fields per sample is the maximum packed flag payload.
+    assert sum(e.get('args', {}).get('bytes', 0) for e in downloads) <= 12 * len(items), downloads
     print('Image-path downloads: validation flags only:',
           sum(e.get('args', {}).get('bytes', 0) for e in downloads), 'bytes', flush=True)
     args.output.write_text(json.dumps(report, indent=2) + '\n')

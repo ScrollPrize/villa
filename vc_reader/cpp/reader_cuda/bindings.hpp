@@ -46,14 +46,21 @@ inline void bind(nb::module_& m) {
         return nb::ndarray<nb::array_api, nb::device::cuda>(static_cast<char*>(input.data())+offset*input.dtype().bits/8,
             shape.size(),shape.data(),nb::cast(input,nb::rv_policy::reference),nullptr,input.dtype(),nb::device::cuda::value,input.device_id());
     });
-    m.def("_cuda_describe",[](Device input) {
+    m.def("_cuda_describe",[](nb::ndarray<nb::ro,nb::device::cuda> input) {
+        if (input.size()) {
+            std::int64_t stride=1;
+            for (std::size_t a=input.ndim();a-->0;) {
+                if (input.shape(a)>1 && input.stride(a)!=stride) throw nb::type_error("CUDA array must be contiguous");
+                stride*=input.shape(a);
+            }
+        }
         std::vector<std::size_t> shape; for (std::size_t a=0;a<input.ndim();++a) shape.push_back(input.shape(a));
         const auto dt=input.dtype();
         const char kind=dt.code==std::uint8_t(nb::dlpack::dtype_code::Float) ? 'f' : dt.code==std::uint8_t(nb::dlpack::dtype_code::Int) ? 'i' :
                         dt.code==std::uint8_t(nb::dlpack::dtype_code::UInt) ? 'u' : dt.code==std::uint8_t(nb::dlpack::dtype_code::Bool) ? 'b' : '?';
         if (kind=='?' || dt.lanes!=1) throw nb::value_error("unsupported device dtype");
         return nb::make_tuple(shape,std::string(1,kind)+std::to_string(dt.bits/8),input.device_id());
-    });
+    },"input"_a.noconvert());
     m.def("_cuda_download",[](Device input,Bytes out) {
         if (input.nbytes()!=out.nbytes()) throw nb::value_error("download size mismatch");
         nb::gil_scoped_release release; device::Guard guard(input.device_id());
@@ -106,13 +113,32 @@ inline void bind(nb::module_& m) {
         },nb::keep_alive<0,1>())
         .def("grids",[](Reader& r,const std::vector<std::array<std::int64_t,3>>& shapes,
             const std::vector<std::array<std::int64_t,3>>& bases,const std::vector<std::array<float,3>>& origins,
-            const std::vector<std::array<float,9>>& axes,int kind,int order,bool floating,const std::string& route,bool valid) {
+            const std::vector<std::array<float,9>>& axes,int kind,int order,bool floating,const std::string& route,bool valid,nb::object out) -> nb::object {
             if (shapes.size()!=bases.size() || shapes.size()!=origins.size() || shapes.size()!=axes.size()) throw nb::value_error("grid counts differ");
             std::vector<Grid> grids(shapes.size());
             for (std::size_t i=0;i<grids.size();++i) { auto& g=grids[i]; std::copy_n(shapes[i].begin(),3,g.shape); std::copy_n(bases[i].begin(),3,g.base); std::copy_n(origins[i].begin(),3,g.origin); std::copy_n(axes[i].begin(),9,g.axes); }
-            Result result; { nb::gil_scoped_release release; result=r.grids(std::move(grids),kind,order,floating,route,valid); }
+            device::Storage destination;
+            if (!out.is_none()) {
+                const auto a=nb::cast<Device>(out);
+                const auto expected=floating ? nb::dtype<float>() : nb::dtype<std::uint8_t>();
+                if (a.device_id()!=r.device_id() || a.dtype()!=expected) throw nb::value_error("output dtype/device mismatch");
+                destination=device::borrow(a.data(),a.nbytes(),a.device_id());
+            }
+            Result result;
+            { nb::gil_scoped_release release;
+              try { result=r.grids(std::move(grids),kind,order,floating,route,valid,std::move(destination)); }
+              catch (...) {
+                  // Keep borrowed output storage alive until outstanding writes finish.
+                  device::Guard guard(r.device_id());
+                  cudaStreamSynchronize(device::stream());
+                  throw;
+              } }
+            if (!out.is_none()) {
+                if (!valid) return nb::none();
+                return owned(std::move(result.valid),result.count,nb::dtype<std::uint8_t>(),r.device_id());
+            }
             return outputs(std::move(result),r.device_id());
-        },"shapes"_a,"bases"_a,"origins"_a,"axes"_a,"kind"_a,"order"_a,"floating"_a,"route"_a,"valid"_a=false)
+        },"shapes"_a,"bases"_a,"origins"_a,"axes"_a,"kind"_a,"order"_a,"floating"_a,"route"_a,"valid"_a=false,"out"_a=nb::none())
         .def("warm",[make_grids](Reader& r,const std::vector<std::array<std::int64_t,3>>& shapes,const std::vector<std::array<std::int64_t,3>>& bases) {
             auto grids=make_grids(shapes,bases,std::vector<std::array<float,3>>(shapes.size()),std::vector<std::array<float,9>>(shapes.size()));
             nb::gil_scoped_release release; r.warm(std::move(grids));

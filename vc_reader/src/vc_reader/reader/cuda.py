@@ -110,7 +110,7 @@ class CudaReader:
             offset += int(np.prod(shape))
         return result
 
-    def _grids(self, grids, kind, order, dtype, source, valid=False):
+    def _grids(self, grids, kind, order, dtype, source, valid=False, out=None):
         """Samples (and validity) as one flat device allocation plus per-crop views."""
         self._ready()
         if order not in (0, 1): raise ValueError("order must be 0 or 1")
@@ -120,9 +120,18 @@ class CudaReader:
         if source == "resident":
             raise ValueError("source='resident' needs device frames; use read_affine_batch with CUDA arrays")
         shapes, bases, origins, axes = zip(*grids) if grids else ((), (), (), ())
-        native = self._native.grids(shapes, bases, [list(o) for o in origins], [np.asarray(a).ravel().tolist() for a in axes],
-                                    kind, order, dtype == np.float32, source, valid)
         total = sum(int(np.prod(s)) for s in shapes)
+        if out is not None and not is_device_array(out):
+            raise TypeError('out must be a CUDA array')
+        destination = None if out is None else _device_input(out, self.device, dtype)
+        if destination is not None and destination.size != total:
+            raise ValueError('output size mismatch')
+        native = self._native.grids(shapes, bases, [list(o) for o in origins], [np.asarray(a).ravel().tolist() for a in axes],
+                                    kind, order, dtype == np.float32, source, valid,
+                                    None if destination is None else destination._native)
+        if destination is not None:
+            masks = DeviceArray(native, (total,), np.uint8, self.device) if valid else None
+            return destination.reshape(total), masks, shapes
         native, mask = native if valid else (native, None)
         flat = DeviceArray(native, (total,), dtype, self.device)
         masks = DeviceArray(mask, (total,), np.uint8, self.device) if valid else None
@@ -181,7 +190,7 @@ class CudaReader:
         return self._crops(grids, 1, order, dtype, source, valid)
 
     def read_affine_batch(self, shape, origins, axes, *, order=1, dtype=None, coordinate_origin=None,
-                          source="auto", valid=False):
+                          source="auto", valid=False, out=None):
         """Crops of one shape as a single (B, *shape) array.
 
         origins (B, 3) and axes (B, 3, 3) may be host arrays or CUDA arrays
@@ -189,12 +198,19 @@ class CudaReader:
         already cached bricks with no planning or coordinate transfer; bricks
         that are not resident read as fill and are invalid in the mask. Other
         sources copy device frames to the host to plan brick loads.
+
+        out may be a contiguous CUDA array of the exact output shape/dtype.
+        Writes complete before return and the supplied object is returned.
+        Consumer-owned storage avoids exporting a native allocation or copying
+        a temporary output. out requires source='auto', 'chunks', or 'cpu'.
         """
         self._ready()
         shape = shape3(shape)
         dtype = np.dtype((np.float32 if order else np.uint8) if dtype is None else dtype)
         if order not in (0, 1): raise ValueError("order must be 0 or 1")
         if source == "resident":
+            if out is not None:
+                raise ValueError("out requires a host-planned source")
             if dtype not in (np.dtype("uint8"), np.dtype("float32")) or (order == 1 and dtype != np.float32):
                 raise TypeError("CUDA crops support uint8 or float32; linear sampling requires float32")
             origins = _device_input(origins, self.device)
@@ -211,9 +227,12 @@ class CudaReader:
         if origins.ndim != 2 or origins.shape[1] != 3 or axes.shape != (len(origins), 3, 3):
             raise ValueError("origins must be (B, 3) and axes (B, 3, 3)")
         grids = [affine32(shape, o, a, coordinate_origin) for o, a in zip(origins, axes)]
-        flat, masks, _ = self._grids(grids, 1, order, dtype, source, valid)
-        out = flat.reshape((len(grids), *shape))
-        return (out, masks.reshape(out.shape)) if valid else out
+        output_shape = (len(grids), *shape)
+        if out is not None and tuple(out.shape) != output_shape:
+            raise ValueError(f'out must have shape {output_shape}')
+        flat, masks, _ = self._grids(grids, 1, order, dtype, source, valid, out)
+        result = flat.reshape(output_shape) if out is None else out
+        return (result, masks.reshape(output_shape)) if valid else result
 
     def warm(self, regions):
         """Load the bricks of voxel boxes [(start, size), ...] without output."""

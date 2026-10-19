@@ -313,7 +313,7 @@ public:
         cache_.clear(); lru_.clear(); free_.clear(); segments_.clear(); slots_=0; resident_dirty_=true; device::complete();
     }
     std::vector<std::uint64_t> stats() { ready(); std::lock_guard lock(mutex_); return {cache_.size()*brick_bytes_,budget_,hits_,uploads_,uploaded_,cpu_routes_,gpu_routes_}; }
-    Result grids(std::vector<Grid> grids, int kind, int order, bool floating, const std::string& route, bool valid=false) {
+    Result grids(std::vector<Grid> grids, int kind, int order, bool floating, const std::string& route, bool valid=false, device::Storage destination={}) {
         ready(); std::lock_guard lock(mutex_); device::Guard guard(device_); chain();
         if (grids.size()>65535 || (kind!=0 && kind!=1) || (order!=0 && order!=1) || (kind==1 && order==1 && !floating)) throw std::invalid_argument("invalid CUDA grid request");
         std::set<std::int64_t> needed;
@@ -373,7 +373,10 @@ public:
             std::sort(all.begin(),all.end()); all.erase(std::unique(all.begin(),all.end()),all.end());
             needed.insert(all.begin(),all.end());
         }
-        auto result=output(total,floating,valid);
+        if (destination && (destination->bytes!=total*(floating ? 4 : 1) || destination->device!=device_))
+            throw std::invalid_argument("output size/device mismatch");
+        auto result=destination ? Result{std::move(destination),total,floating,valid ? device::allocate(total,device_) : nullptr}
+                                : output(total,floating,valid);
         if (!total) return result;
         if (route_cpu(needed,total,kind,route)) {
             ++cpu_routes_;

@@ -5,6 +5,8 @@ from the input checkpoint. Diagnostics and new DAgger collection are disabled.
 """
 import argparse
 import importlib
+import hashlib
+import subprocess
 import json
 import os
 from pathlib import Path
@@ -37,26 +39,49 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--backend', choices=('existing', 'vc-reader'), required=True)
     parser.add_argument('--heading', choices=('learned', 'tensor'), default='learned')
+    parser.add_argument('--heading-stream', choices=('default', 'separate'), default='default',
+                        help='Diagnostic CUDA stream for the tensor heading service')
     parser.add_argument('--steps', type=int, default=500)
     parser.add_argument('--warmup', type=int, default=20)
     parser.add_argument('--grad-steps', type=int, default=1)
     parser.add_argument('--lookahead', type=int, default=0,
                         help='Future batch plans per source/worker (default: disabled)')
+    parser.add_argument('--cuda-augmentation', choices=('sample', 'batch'), default='batch')
+    parser.add_argument('--cuda-cache', choices=('separate', 'shared'), default='shared')
+    parser.add_argument('--timeline', action='store_true')
+    parser.add_argument('--timing-sync', choices=('stream','device'), default='stream',
+                        help='Wait for measured work on its stream; device also drains background work')
+    parser.add_argument('--profile-workers', action='store_true',
+                        help='Profile one geometry/label batch per worker (requires --timeline)')
+    parser.add_argument('--gil-interval', type=float,
+                        help='Diagnostic Python thread switch interval in seconds')
+    parser.add_argument('--profile-batches', type=int, default=0,
+                        help='Capture this many measured batches with an external CUDA profiler; -1 captures through process exit')
     parser.add_argument('--vc-site-packages', type=Path)
     args = parser.parse_args()
     if args.steps < 1 or args.warmup < 0 or args.grad_steps < 1:
         parser.error('steps and grad-steps must be positive; warmup must be nonnegative')
     if args.heading == 'tensor' and args.backend != 'vc-reader':
         parser.error('tensor heading benchmark requires --backend vc-reader')
+    if args.profile_workers and not args.timeline:
+        parser.error('profile-workers requires --timeline')
     if args.lookahead < 0:
         parser.error('lookahead must be nonnegative')
+    if args.gil_interval is not None:
+        if args.gil_interval <= 0:
+            parser.error('gil-interval must be positive')
+        sys.setswitchinterval(args.gil_interval)
     args.checkpoint = args.checkpoint.resolve()
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=False)
+    os.environ['FIBER_BENCH_TIMELINE'] = '1' if args.timeline else '0'
+    if args.profile_workers:
+        os.environ['FIBER_BENCH_WORKER_PROFILE'] = str(args.output)
     os.environ.setdefault('AGENTS_AGENT_MODE', '1')
     os.environ.setdefault('NUMBA_CACHE_DIR', str(args.output / 'numba_cache'))
     import torch
     import numpy as np
+    synchronize = torch.cuda.synchronize if args.timing_sync == 'device' else lambda: torch.cuda.current_stream().synchronize()
     from vesuvius.neural_tracing.tracers.fibers.train import train
 
     if args.vc_site_packages:
@@ -86,12 +111,25 @@ def main():
     backend = None
     if args.backend == 'vc-reader':
         from fiber_cuda_pipeline import install
-        backend = install()
+        backend = install(augmentation=args.cuda_augmentation, cache=args.cuda_cache)
     heading = None
     if args.heading == 'tensor':
         from fiber_tensor_heading import install
-        heading = install(backend.pool)
+        heading = install(backend.pool, stream=args.heading_stream)
 
+    native_build = None
+    if backend is not None:
+        from vc_reader import _augment, _native
+        binary = Path(_augment.__file__).resolve()
+        native_build = dict(path=str(binary), sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
+                            revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'],
+                                cwd=Path(__file__).resolve().parent, text=True).strip())
+        reader_binary = Path(_native.__file__).resolve()
+        native_build['reader'] = dict(path=str(reader_binary), sha256=hashlib.sha256(reader_binary.read_bytes()).hexdigest())
+    from fiber_timeline import span
+    if args.timeline:
+        from fiber_timeline import install_main
+        install_main(train)
     records = []
     coverage = {}
     from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import tight_block
@@ -119,21 +157,37 @@ def main():
     pending = {}
 
     def next_batches(prefetch):
-        torch.cuda.synchronize()
+        if args.profile_batches and len(records) == args.warmup:
+            torch.cuda.profiler.start()
+        sync_started = time.perf_counter()
+        with span('before_batch.synchronize'):
+            synchronize()
         pending['started'] = time.perf_counter()
-        batches = original_next(prefetch)
-        pending['loader_seconds'] = time.perf_counter() - pending['started']
+        with span('loader.wait'):
+            batches = original_next(prefetch)
+        returned = time.perf_counter()
+        pending['loader_seconds'] = returned - pending['started']
+        if args.timeline:
+            pending['trace'] = dict(sync_started=sync_started, requested=pending['started'], returned=returned,
+                worker=[b.get('_bench_worker_timing') for b in batches],
+                collect=[b.get('_bench_collect_timing') for b in batches])
         if backend is not None:
             for batch in batches:
                 backend.materialize(batch)
-        torch.cuda.synchronize()
+        with span('images.synchronize'):
+            synchronize()
+        if args.timeline:
+            pending['trace']['prepared'] = time.perf_counter()
         pending['input_seconds'] = time.perf_counter() - pending['started']
         return batches
 
     def update(*pos, **kw):
         started = time.perf_counter()
-        metrics = original_update(*pos, **kw)
-        torch.cuda.synchronize()
+        with span('model.update'):
+            metrics = original_update(*pos, **kw)
+        metrics_done = time.perf_counter()
+        with span('model.synchronize'):
+            synchronize()
         finished = time.perf_counter()
         index = len(records)
         row = dict(index=index, measured=index >= args.warmup,
@@ -146,7 +200,11 @@ def main():
                    observed_states=metrics['observed_states'])
         if not np.isfinite(row['loss']) or not np.isfinite(row['error_mean']):
             raise RuntimeError('Training produced nonfinite benchmark metrics')
+        if args.timeline:
+            row['trace'] = dict(pending['trace'], update_started=started, metrics_done=metrics_done, finished=finished)
         records.append(row)
+        if args.profile_batches and len(records) == args.warmup + args.profile_batches:
+            torch.cuda.profiler.stop()
         if index == args.warmup:
             pending['measured_started'] = pending['started']
         if row['measured']:
@@ -173,11 +231,18 @@ def main():
     finally:
         if heading is not None:
             heading.close()
+    if args.timeline and heading is not None:
+        (args.output / 'heading_timeline.json').write_text(json.dumps(heading.timeline) + '\n')
     measured = [r for r in records if r['measured']]
     if len(measured) != args.steps:
         raise RuntimeError('Trainer ended without completing the requested measurements')
     report = dict(backend=args.backend, heading=args.heading, checkpoint=str(args.checkpoint),
                   command=[sys.executable, *sys.argv],
+                  cuda_augmentation=args.cuda_augmentation if backend is not None else None,
+                  cuda_cache=args.cuda_cache if backend is not None else None,
+                  native_build=native_build, timeline=args.timeline, profile_batches=args.profile_batches,
+                  timing_sync=args.timing_sync,
+                  gil_interval=sys.getswitchinterval(),
                   warmup=args.warmup, steps=args.steps, batch=run['training']['batch'],
                   grad_steps=run['training']['grad_steps'],
                   workers=run['runtime']['workers'], threads=run['runtime']['threads'],

@@ -15,20 +15,28 @@ def is_available():
     return bool(getattr(_native, "reader_cuda_available", lambda: False)())
 
 
+class _ExportOwners:
+    """Track allocations shared by views, including in-place augmentation inputs."""
+    def __init__(self, owners):
+        self.owners = tuple(owner for owner in owners if owner is not None)
+
+    def export(self):
+        for owner in self.owners:
+            owner.export()
+
+
 class DeviceArray:
     """Contiguous device storage. Use numpy() for an explicit host copy.
 
     DLPack consumers (e.g. torch.from_dlpack) share storage and its lifetime.
     reshape() is a view; astype(float32) converts uint8 on device.
     """
-    def __init__(self, native, shape, dtype, device=0):
+    def __init__(self, native, shape, dtype, device=0, *, _export_owner=None):
         storage_type = getattr(_native, "CudaStorage", None)
         if storage_type is not None and isinstance(native, storage_type):
-            # Native reader results own storage; kernels consume its array view.
-            # This synchronous public adapter can export views through DLPack,
-            # so keep destruction safe for consumers on external streams.
-            native.export()
+            _export_owner = native
             native = _native._cuda_view(native.array(), shape, 0)
+        self._export_owner = _export_owner
         self._native = native
         self.shape = tuple(shape)
         self.dtype = np.dtype(dtype)
@@ -54,7 +62,8 @@ class DeviceArray:
 
     def _view(self, shape, offset=0):
         self._ready()
-        return DeviceArray(_native._cuda_view(self._native, shape, offset), shape, self.dtype, self.device)
+        return DeviceArray(_native._cuda_view(self._native, shape, offset), shape, self.dtype, self.device,
+                           _export_owner=self._export_owner)
 
     def reshape(self, *shape):
         if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
@@ -82,6 +91,8 @@ class DeviceArray:
 
     def __dlpack__(self, *, stream=None, **kwargs):
         self._ready()
+        if self._export_owner is not None:
+            self._export_owner.export()
         return self._native.__dlpack__(stream=stream, **kwargs)
 
     def __dlpack_device__(self):

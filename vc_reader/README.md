@@ -106,9 +106,30 @@ from vc_reader.sheet_normal import sample_sheet_normals
 reader = ZarrReader.open("/path/to/ct.zarr", level=0)
 points_xyz = np.array([[1000.25, 1200.5, 3000.0]])  # native CT voxel coordinates
 cpu = sample_sheet_normals(reader, points_xyz)    # NumPy (B, 4)
-gpu = sample_sheet_normals(reader.cuda(cache_bytes=256 << 20), points_xyz)
+cuda_reader = reader.cuda(cache_bytes=256 << 20)
+gpu = sample_sheet_normals(cuda_reader, points_xyz)
 # gpu is a DeviceArray: torch.from_dlpack(gpu) shares its CUDA storage.
 ```
+
+For training, supply consumer-owned output storage to avoid a temporary
+allocation and its external-storage lifetime barrier:
+
+```python
+import torch
+
+normals = torch.empty((len(points_xyz), 4), device="cuda", dtype=torch.float32)
+sample_sheet_normals(cuda_reader, points_xyz, out=normals)
+```
+
+Both `sample_sheet_normals` and `sheet_normals` accept `out=`: contiguous
+`(B,4)` float32 NumPy storage for CPU execution, or CUDA storage on the input
+device. They return the supplied object. CUDA `read_affine_batch` also accepts
+`out=` with the exact `(B, *shape)` and output dtype for host-planned sources
+(`auto`, `chunks`, `cpu`). Outputs are written directly and complete before
+return. Finish external writes before calling, including writes to reused
+output buffers. Native arrays kept within vc_reader do not acquire the
+device-wide destruction barrier required after exporting their storage to an
+external DLPack consumer. No CT image download is involved.
 
 Columns are unsigned unit normal X/Y/Z and relative principal eigengap.
 Insufficient volume support, flat CT, and ambiguous principal axes return a

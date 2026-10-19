@@ -12,6 +12,7 @@ import threading
 import time
 import traceback
 from types import SimpleNamespace
+from fiber_timeline import ENABLED as TIMELINE, LOCAL, span
 
 import numpy as np
 import torch
@@ -27,6 +28,9 @@ class Client:
         self.connection = connection
         self.lock = threading.Lock()
         self.seeds = OrderedDict()
+        self.trace_context = None
+        self.trace_seconds = 0.
+        self.trace_requests = 0
 
     def request(self, vol, positions, priors, families, mode='frame', previous=None):
         spec = reader_spec(vol.ct)
@@ -41,8 +45,15 @@ class Client:
                        priors=np.asarray(priors, np.float32), families=list(families),
                        anchors=anchors.astype(np.float32), mode=mode)
         with self.lock:
+            began = time.perf_counter()
+            if TIMELINE:
+                request['trace_sent'] = began
+                request['trace_context'] = self.trace_context
             self.connection.send(request)
             ok, value = self.connection.recv()
+            if TIMELINE:
+                self.trace_seconds += time.perf_counter()-began
+                self.trace_requests += 1
         if not ok:
             raise RuntimeError('CUDA heading service failed:\n'+value)
         return value
@@ -135,6 +146,9 @@ def install_heading(connection):
 def init_worker(worker_id, connections):
     install_worker_reader(worker_id)
     install_heading(connections[worker_id])
+    if TIMELINE:
+        from fiber_timeline import install_worker
+        install_worker(CLIENT)
 
 
 class HeadingDataLoader(ReaderDataLoader.__bases__[0]):
@@ -145,8 +159,10 @@ class HeadingDataLoader(ReaderDataLoader.__bases__[0]):
 
 
 class Service:
-    def __init__(self, pool):
+    def __init__(self, pool, *, stream='default'):
+        self.stream_mode = stream
         self.connections = []
+        self.timeline = []
         self.pool = pool
         self.stop = threading.Event()
         self.lock = threading.Lock()
@@ -171,7 +187,8 @@ class Service:
         outputs = []
         for start in range(0,len(request['points']),8):
             part = slice(start,start+8)
-            result = torch.from_dlpack(sample_sheet_normals(gpu,request['points'][part]))
+            result = torch.empty((len(request['points'][part]),4),device='cuda',dtype=torch.float32)
+            sample_sheet_normals(gpu,request['points'][part],out=result)
             normal, gap = result[:,:3],result[:,3]
             prior = torch.as_tensor(request['priors'][part],device='cuda')
             vertical = torch.tensor([str(f).upper() in ('V','VERTICAL') for f in request['families'][part]],device='cuda')
@@ -197,6 +214,20 @@ class Service:
         return np.concatenate(outputs)
 
     def run(self):
+        if self.stream_mode == 'separate':
+            from vc_reader import _native
+            stream = torch.cuda.Stream()
+            with torch.cuda.stream(stream):
+                _native._set_stream(stream.cuda_stream)
+                try:
+                    self.serve()
+                finally:
+                    stream.synchronize()
+                    _native._set_stream(0)
+        else:
+            self.serve()
+
+    def serve(self):
         while not self.stop.is_set():
             with self.lock:
                 connections = list(self.connections)
@@ -208,15 +239,24 @@ class Service:
                         self.connections.remove(conn)
                     continue
                 began = time.perf_counter()
+                cpu = time.thread_time()
+                if TIMELINE:
+                    LOCAL.stages = {}
                 try:
-                    result = self.calculate(request)
+                    with span('heading.request'):
+                        result = self.calculate(request)
                     self.counters['requests'] += 1
                     self.counters['queries'] += len(result)
                     self.counters['seed_queries' if request['mode']=='seed' else 'frame_queries'] += len(result)
                     conn.send((True,result))
                 except Exception:
                     conn.send((False,traceback.format_exc()))
-                self.counters['seconds'] += time.perf_counter()-began
+                finished = time.perf_counter()
+                self.counters['seconds'] += finished-began
+                if TIMELINE:
+                    self.timeline.append(dict(sent=request['trace_sent'], began=began, finished=finished,
+                        context=request['trace_context'], mode=request['mode'], queries=len(request['points']),
+                        cpu_seconds=time.thread_time()-cpu, stages=LOCAL.stages))
 
     def close(self):
         self.stop.set()
@@ -227,15 +267,16 @@ class Service:
     def stats(self):
         from vc_reader.sheet_normal import RECIPE
         return dict(recipe=RECIPE,backend='cuda',counters_including_startup_warmup_prefetch=self.counters,
-                    chunk_cache='shared with image sampler; statistics in reader_stats.shared_cache',
+                    stream=self.stream_mode,
+                    chunk_cache='statistics in reader_stats.chunk_cache',
                     reference_commit='cd0ee74e3a4f8dd7f3b4884b01c7e411fc49ee6e',
                     result_transfer='GPU to CPU: headings/frames and validity only',
                     continuation_axis='trained previous-prediction policy retained',
                     recorded_replay_frames='retained')
 
 
-def install(pool):
+def install(pool, *, stream='default'):
     global SERVICE
-    SERVICE = Service(pool)
+    SERVICE = Service(pool, stream=stream)
     torch.utils.data.DataLoader = HeadingDataLoader
     return SERVICE

@@ -118,8 +118,9 @@ def augmentation_pipeline():
 
 
 class CudaReaderPool:
-    """One training cache per volume shared by image and heading consumers."""
-    def __init__(self):
+    """Compare shared and consumer-specific caches at equal total capacity."""
+    def __init__(self, *, shared=True):
+        self.shared = shared
         self.readers = {}
         self.consumers = {}
         self.startup_stats = {}
@@ -127,12 +128,17 @@ class CudaReaderPool:
 
     def get(self, spec, consumer):
         from vc_reader.reader import ZarrReader
-        key = tuple(sorted(spec.items()))
+        partition = 'shared' if self.shared else consumer
+        key = (partition, tuple(sorted(spec.items())))
         with self.lock:
             if key not in self.readers:
-                # Preserve the sum of the separate image/heading cache budgets.
-                reader = ZarrReader.open(**spec, threads=4, memory_cache=768 << 20)
-                self.readers[key] = (reader, reader.cuda(cache_bytes=768 << 20))
+                # Equal combined training budgets: 768 MiB shared, or 512 MiB
+                # images plus 256 MiB headings. Startup is identical in all runs.
+                budget = (768 if self.shared else 512 if consumer == 'images' else 256) << 20
+                if not spec.get('offline', False):
+                    budget = 256 << 20
+                reader = ZarrReader.open(**spec, threads=4, memory_cache=budget)
+                self.readers[key] = (reader, reader.cuda(cache_bytes=budget))
                 self.consumers[key] = set()
             self.consumers[key].add(consumer)
             return self.readers[key][1]
@@ -142,29 +148,38 @@ class CudaReaderPool:
         # online readers; all training reads must obey the offline readiness gate.
         with self.lock:
             for key in list(self.readers):
-                if 'cache_dir' in dict(key) and not dict(key).get('offline', False):
+                spec = dict(key[1])
+                if 'cache_dir' in spec and not spec.get('offline', False):
                     cpu, gpu = self.readers.pop(key)
-                    self.startup_stats[str(dict(key))] = gpu.stats
+                    self.startup_stats[self.label(key)] = gpu.stats
                     self.consumers.pop(key)
                     gpu.close()
                     cpu.close()
 
+    @staticmethod
+    def label(key):
+        return f'{key[0]}: {dict(key[1])}'
+
     def stats(self):
         with self.lock:
-            readers = {str(dict(key)): gpu.stats for key, (_, gpu) in self.readers.items()}
+            readers = {self.label(key): gpu.stats for key, (_, gpu) in self.readers.items()}
             if any(s['cpu_routes'] for s in [*readers.values(), *self.startup_stats.values()]):
                 raise RuntimeError('CUDA sampling unexpectedly routed through CPU')
             return dict(readers=readers, startup_readers=self.startup_stats,
-                        consumers={str(dict(k)): sorted(v) for k, v in self.consumers.items()},
-                        cache_bytes_per_volume=768 << 20)
+                        consumers={self.label(k): sorted(v) for k, v in self.consumers.items()},
+                        layout='shared' if self.shared else 'separate',
+                        combined_cache_bytes_per_volume=768 << 20)
 
 
 class CudaInputs:
-    def __init__(self):
+    def __init__(self, *, augmentation="batch", cache="shared"):
         from vc_reader.cuda import is_available
         if not is_available():
             raise RuntimeError('The benchmark requires a CUDA-enabled vc_reader build')
-        self.pool = CudaReaderPool()
+        if augmentation not in ('sample', 'batch') or cache not in ('separate', 'shared'):
+            raise ValueError('Invalid CUDA benchmark configuration')
+        self.augmentation = augmentation
+        self.pool = CudaReaderPool(shared=cache == 'shared')
         self.pipeline = augmentation_pipeline()
         self.stage_seconds = dict(read_sample=0., augmentation=0.)
         self.batch_calls = 0
@@ -182,8 +197,8 @@ class CudaInputs:
         # Bound the resident chunk working set; no CPU sampling fallback.
         for start in range(0, len(origins), 4):
             end = min(start + 4, len(origins))
-            sampled = reader.read_affine_batch(shape, origins[start:end], axes[start:end], source='chunks')
-            images[start:end, 0].copy_(torch.from_dlpack(sampled))
+            reader.read_affine_batch(shape, origins[start:end], axes[start:end], source='chunks',
+                                     out=images[start:end, 0])
         self.stage_seconds['read_sample'] += time.perf_counter() - began
         began = time.perf_counter()
         params = dict(blur=[], contrast=[], brightness=[], noise=[])
@@ -193,24 +208,33 @@ class CudaInputs:
             params['contrast'].append(contrast)
             params['brightness'].append(brightness * 8.)
             params['noise'].append(noise * 8.)
-        result = self.pipeline.batch({'image': images}, seeds=request['seeds'], params=params)
-        if not result['image'].is_cuda:
+        if self.augmentation == 'batch':
+            output = self.pipeline.batch({'image': images}, seeds=request['seeds'], params=params)['image']
+            self.batch_calls += 1
+        else:
+            output = torch.empty_like(images)
+            for i in range(len(images)):
+                result = self.pipeline.batch({'image': images[i:i+1]}, seeds=request['seeds'][i:i+1],
+                                             params={k: v[i:i+1] for k, v in params.items()})['image']
+                output[i:i+1].copy_(result)
+                self.batch_calls += 1
+        if not output.is_cuda:
             raise RuntimeError('Augmentation returned a host image')
         self.stage_seconds['augmentation'] += time.perf_counter() - began
-        self.batch_calls += 1
-        batch['x']['fine'] = result['image']
+        batch['x']['fine'] = output
 
     def stats(self):
-        return dict(shared_cache=self.pool.stats(), image_output_device='cuda', sampling_source='chunks',
+        return dict(chunk_cache=self.pool.stats(), augmentation=self.augmentation,
+                    image_output_device='cuda', sampling_source='chunks',
                     augmentation_batch_calls_including_warmup=self.batch_calls,
                     stage_seconds_including_warmup=self.stage_seconds)
 
 
-def install():
+def install(*, augmentation="batch", cache="shared"):
     from vesuvius.neural_tracing.tracers.fibers.train import train
     from vesuvius.neural_tracing.tracers.fibers.data import datasets
     install_worker_reader()
     train.IdentityObservationBuilder = DeferredObservationBuilder
     datasets.IdentityObservationBuilder = DeferredObservationBuilder
     torch.utils.data.DataLoader = ReaderDataLoader
-    return CudaInputs()
+    return CudaInputs(augmentation=augmentation, cache=cache)

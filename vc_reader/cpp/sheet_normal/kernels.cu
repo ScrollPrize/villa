@@ -64,9 +64,9 @@ __global__ void solve(const double* partial,double* normals,float* output,int n)
     bool valid=principal(sums,normal,gap);
     for(int j=0;j<4;++j) { double value=valid ? (j==3 ? gap : normal[j]) : 0.; normals[4*b+j]=value; output[4*b+j]=float(value); }
 }
-device::Storage cuda(const void* image,bool floating,const float* centers,std::size_t batch,int id) {
+device::Storage cuda(const void* image,bool floating,const float* centers,std::size_t batch,int id,device::Storage out) {
     if(batch>128) throw std::invalid_argument("sheet normal CUDA batch must be <=128; process larger requests in groups");
-    auto out=device::allocate(batch*4*sizeof(float),id);
+    if (!out) out=device::allocate(batch*4*sizeof(float),id);
     if(!batch) return out;
     const int n=int(batch); auto stream=device::stream(); Kernels k;
     auto z=device::allocate(n*4*zcount*sizeof(float),id), y=device::allocate(n*6*ycount*sizeof(float),id);
