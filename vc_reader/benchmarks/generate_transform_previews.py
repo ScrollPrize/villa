@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+from io import BytesIO
 import json
 from pathlib import Path
 import textwrap
@@ -25,6 +26,17 @@ PREVIEW_GAP = 24
 PREVIEW_TOP = 210
 PREVIEW_ROW_HEIGHT = PREVIEW_TILE + 62
 PREVIEW_FOOTER = 65
+
+
+def save_preview(image, path):
+    """Keep captions at full resolution; use lossless for simpler label images."""
+    encodings = []
+    for lossless in (False, True):
+        buffer = BytesIO()
+        image.save(buffer, format="WEBP", lossless=lossless,
+                   quality=100 if lossless else 75, method=6)
+        encodings.append(buffer.getvalue())
+    path.write_bytes(min(encodings, key=len))
 
 
 def font(size):
@@ -206,14 +218,14 @@ def generate(args):
         paths = []
         if case.sample in ("strip", "surface"):
             path = args.output / f"{name}.webp"
-            canvas.save(path, format="WEBP", lossless=True, method=6)
+            save_preview(canvas, path)
             paths.append(path.name)
         else:
             for axis, label in enumerate(("z", "y", "x")):
                 left = PREVIEW_GAP + axis * (PREVIEW_TILE + PREVIEW_GAP)
                 panel = canvas.crop((left, PREVIEW_TOP, left + PREVIEW_TILE, PREVIEW_TOP + 2 * PREVIEW_ROW_HEIGHT))
                 path = args.output / f"{name}-{label}.webp"
-                panel.save(path, format="WEBP", lossless=True, method=6)
+                save_preview(panel, path)
                 paths.append(path.name)
         manifest["previews"][name] = dict(recipe=recipe, files=paths, note=case.note, **metadata)
         print(f"{name}: seed={best_seed}, " + ", ".join(paths), flush=True)
