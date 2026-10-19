@@ -10,7 +10,7 @@ template<class T> __device__ __forceinline__ void sort_column(T (&v)[3]) {
 // instead of loading/sorting all 27 neighbors independently. Warp endpoints
 // load their missing column directly; reflection of a size-3 window clamps.
 template<class T, class Index, int D>
-__global__ void median3_kernel(const T* src, T* dst, Index nz, Index ny, Index nx, std::size_t n) {
+__device__ void median3_kernel(KernelIndex vcr_launch, const T* src, T* dst, Index nz, Index ny, Index nx, std::size_t n) {
     EACH_INDEX(n) {
         const Index z = Index(i)/(ny*nx), y = Index(i)/nx%ny, x = Index(i)%nx;
         const Index axis = D == 3 ? z : y, extent = D == 3 ? nz : ny;
@@ -49,13 +49,16 @@ __global__ void median3_kernel(const T* src, T* dst, Index nz, Index ny, Index n
         }
     }
 }
+template<class T, class Index, int D> struct median3_kernel_launch3 {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { median3_kernel<T,Index,D>(index,args...); }
+};
 template<class T, class Index>
 void launch_median3(const T* src, T* dst, const Grid& g) {
     const auto& s = g.shape;
     if (s.size() == 3)
-        median3_kernel<T,Index,3><<<blocks(g.size),256,0,vcr::device::stream()>>>(src,dst,Index(s[0]),Index(s[1]),Index(s[2]),g.size);
+        launch(blocks(g.size),256,0,vcr::device::stream(), median3_kernel_launch3<T,Index,3>{}, src,dst,Index(s[0]),Index(s[1]),Index(s[2]),g.size);
     else
-        median3_kernel<T,Index,2><<<blocks(g.size),256,0,vcr::device::stream()>>>(src,dst,1,Index(s[0]),Index(s[1]),g.size);
+        launch(blocks(g.size),256,0,vcr::device::stream(), median3_kernel_launch3<T,Index,2>{}, src,dst,1,Index(s[0]),Index(s[1]),g.size);
 }
 // General exact rank filter. Binary search in the monotone IEEE key space uses
 // bounded storage for all supported sizes (1..63), including even windows.
@@ -73,7 +76,7 @@ template<class T> __device__ T from_key(unsigned long long key) {
         unsigned u = unsigned(key); return __uint_as_float((u & 0x80000000u) ? (u ^ 0x80000000u) : ~u);
     } else return __longlong_as_double((key & (1ull<<63)) ? (key ^ (1ull<<63)) : ~key);
 }
-template<class T> __global__ void median_general(const T* src, T* dst, Layout g, int k) {
+template<class T> __device__ void median_general(KernelIndex vcr_launch, const T* src, T* dst, Layout g, int k) {
     EACH_INDEX(g.size) {
         const int kz = g.dim == 3 ? k : 1;
         const auto nz = g.dim == 3 ? g.shape[0] : 1, ny = g.shape[g.dim-2], nx = g.shape[g.dim-1];
@@ -91,7 +94,10 @@ template<class T> __global__ void median_general(const T* src, T* dst, Layout g,
         dst[i] = from_key<T>(low);
     }
 }
-template<class T> __global__ void palette_probe(View<T> input, unsigned long long* table, int* counts) {
+struct median_general_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { median_general(index,args...); }
+};
+template<class T> __device__ void palette_probe(KernelIndex vcr_launch, View<T> input, unsigned long long* table, int* counts) {
     EACH_INDEX(input.size) {
         T value = input.ptr[i];
         if (value == 0) atomicOr(counts+1,signbit(value) ? 2 : 1);
@@ -107,26 +113,36 @@ template<class T> __global__ void palette_probe(View<T> input, unsigned long lon
         }
     }
 }
-template<class T> __global__ void quantize_kernel(View<T> data, const T* palette, double low, double range) {
-    EACH_INDEX(data.size) {
-        int code = int(clamp_value(floor((double(data.ptr[i])-low)/range*255+.5),0,255));
-        data.ptr[i] = palette[code];
+struct palette_probe_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { palette_probe(index,args...); }
+};
+struct MedianPalette {
+    template<class T> __device__ void operator()(KernelIndex, T* palette,const Statistics* stats) const {
+        const double low=stats->low,high=stats->high,t=double(threadIdx.x)/255.;
+        const double value=(low<=0 && high>=0)?t*high+(1-t)*low:low+t*(high-low);
+        palette[threadIdx.x]=T(fmin(high,fmax(low,value)));
     }
-}
+};
+struct QuantizeMedian {
+    template<class T> __device__ void operator()(KernelIndex vcr_launch,View<T> data,const T* palette,const Statistics* stats,const int* counts) const {
+        if (counts[0]<=256 && counts[1]!=3) return;
+        const double low=stats->low,range=stats->high-low;
+        if (!(range>0) || !isfinite(range)) return;
+        EACH_INDEX(data.size) {
+            const int code=int(clamp_value(floor((double(data.ptr[i])-low)/range*255+.5),0,255));
+            data.ptr[i]=palette[code];
+        }
+    }
+};
 template<class T> void quantize_median(View<T> v) {
     Buffer<unsigned long long> table(1024); Buffer<int> counts(2);
-    check(cudaMemsetAsync(table.ptr,255,1024*sizeof(unsigned long long),vcr::device::stream()));
-    check(cudaMemsetAsync(counts.ptr,0,2*sizeof(int),vcr::device::stream()));
-    palette_probe<<<blocks(v.size),256,0,vcr::device::stream()>>>(v,table.ptr,counts.ptr); check(cudaGetLastError());
-    int result[2]; counts.download(result);
-    if (result[0] <= 256 && result[1] != 3) return;
-    auto stats = bounds(v); Statistics bounds; stats.download(&bounds);
-    double range = bounds.high-bounds.low;
-    if (!(range > 0) || !std::isfinite(range)) return;
-    std::vector<T> palette(256);
-    for (std::size_t i = 0; i < 256; ++i) palette[i] = T(std::lerp(bounds.low,bounds.high,double(i)/255));
-    Buffer<T> values(palette);
-    quantize_kernel<<<blocks(v.size),256,0,vcr::device::stream()>>>(v,values.ptr,bounds.low,range); check(cudaGetLastError());
+    check(memset_async(table.ptr,255,1024*sizeof(unsigned long long),vcr::device::stream()));
+    check(memset_async(counts.ptr,0,2*sizeof(int),vcr::device::stream()));
+    launch(blocks(v.size),256,0,vcr::device::stream(),palette_probe_launch{},v,table.ptr,counts.ptr);
+    auto stats=bounds(v);Buffer<T> palette(256);
+    launch(1,256,0,vcr::device::stream(),MedianPalette{},palette.ptr,stats.ptr);
+    launch(blocks(v.size),256,0,vcr::device::stream(),QuantizeMedian{},v,palette.ptr,stats.ptr,counts.ptr);
+    check(cudaGetLastError());
 }
 void apply_cuda(const MedianFilter& t, Sample& s, const Parameters& p, Session& session) {
     for (const auto& c : p.channels) {
@@ -140,7 +156,7 @@ void apply_cuda(const MedianFilter& t, Sample& s, const Parameters& p, Session& 
             if (c.values[0] == 3) {
                 if (grid.size <= UINT32_MAX) launch_median3<T,std::uint32_t>(input.ptr,out.ptr,grid);
                 else launch_median3<T,std::size_t>(input.ptr,out.ptr,grid);
-            } else median_general<<<blocks(grid.size),256,0,vcr::device::stream()>>>(input.ptr,out.ptr,Layout(grid),int(c.values[0]));
+            } else launch(blocks(grid.size),256,0,vcr::device::stream(), median_general_launch{}, input.ptr,out.ptr,Layout(grid),int(c.values[0]));
             check(cudaGetLastError());
             if (a.shape[0] == 1) a = std::move(output);
             else copy_device(input,out);

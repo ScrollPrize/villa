@@ -7,7 +7,7 @@ namespace vcr::augment::cuda {
 __device__ inline double uniform_at(std::uint64_t state, std::uint64_t draw) {
     return volume_detail::uniform(state, draw);
 }
-template<class T> __global__ void noise_kernel(T* data, std::size_t n, double sigma, std::uint64_t seed, bool rician) {
+template<class T> __device__ void noise_kernel(KernelIndex vcr_launch, T* data, std::size_t n, double sigma, std::uint64_t seed, bool rician) {
     EACH_INDEX(rician ? n : (n + 1) / 2) {
         const T u = from_double<T>(uniform_at(seed, 2*i));
         const T angle = T(6.2831853071795864769) * from_double<T>(uniform_at(seed, 2*i+1));
@@ -30,5 +30,8 @@ template<class T> __global__ void noise_kernel(T* data, std::size_t n, double si
         }
     }
 }
+struct noise_kernel_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { noise_kernel(index,args...); }
+};
 
 } // namespace vcr::augment::cuda

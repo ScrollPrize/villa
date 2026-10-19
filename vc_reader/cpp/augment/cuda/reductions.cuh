@@ -16,7 +16,7 @@ template<int Metrics, class Real> __device__ void block_reduce(Real (&values)[Me
         __syncthreads();
     }
 }
-template<int Metrics, bool Mean = false, class Real> __global__ void finish_reduce(const Real* partial, Real* stats, int blocks, std::size_t count = 1) {
+template<int Metrics, bool Mean = false, class Real> __device__ void finish_reduce(KernelIndex vcr_launch, const Real* partial, Real* stats, int blocks, std::size_t count = 1) {
     __shared__ Real values[Metrics][256];
     const int t = threadIdx.x;
     #pragma unroll
@@ -35,4 +35,10 @@ template<int Metrics, bool Mean = false, class Real> __global__ void finish_redu
         else stats[m] = values[m][0];
     }
 }
+template<int Metrics> struct finish_reduce_launch1 {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { finish_reduce<Metrics>(index,args...); }
+};
+template<int Metrics, bool Mean = false> struct finish_reduce_launch2 {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { finish_reduce<Metrics,Mean>(index,args...); }
+};
 }

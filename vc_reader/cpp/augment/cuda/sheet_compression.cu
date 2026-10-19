@@ -1,7 +1,7 @@
 #include "geometry.cuh"
 #include "gaussian.cuh"
 namespace vcr::augment::cuda {
-template<class T> __global__ void compression_prefix(T* values,Layout g,int axis,double strength,double threshold,const Statistics* stats) {
+template<class T> __device__ void compression_prefix(KernelIndex vcr_launch, T* values,Layout g,int axis,double strength,double threshold,const Statistics* stats) {
     const double span=stats->high-stats->low; const auto step=g.stride[axis],extent=g.shape[axis],lines=g.size/extent;
     EACH_INDEX(lines) {
         const auto base=(i/step)*extent*step+i%step; double sum=0;
@@ -12,9 +12,15 @@ template<class T> __global__ void compression_prefix(T* values,Layout g,int axis
         }
     }
 }
-template<class T> __global__ void compression_field(const T* values,float* field,Layout g,int axis) {
+struct compression_prefix_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { compression_prefix(index,args...); }
+};
+template<class T> __device__ void compression_field(KernelIndex vcr_launch, const T* values,float* field,Layout g,int axis) {
     EACH_INDEX(g.size) for(int a=0;a<g.dim;++a) field[i*g.dim+a]=a==axis?-values[i]*double(g.shape[a]-1)/g.shape[a]:0;
 }
+struct compression_field_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { compression_field(index,args...); }
+};
 Parameters sample_sheet(const SheetCompression& t,const Sample& s,Random& r,bool record,Session& session) {
     auto [p,chosen,strength,sigma,smooth]=sheet_parameters(t,s,r); Grid g(p.shape); const auto d=p.shape.size();
     const auto& image=session.arrays.at(t.image);
@@ -23,10 +29,10 @@ Parameters sample_sheet(const SheetCompression& t,const Sample& s,Random& r,bool
     copy_device(data,View<T>{image.view<T>().ptr,g.size});
     if(sigma>.5) blur(data,g,std::vector<double>(d,sigma),6,Boundary::Mirror,true);
     auto stats=bounds(data);
-    compression_prefix<<<blocks(g.size/g.shape[chosen]),256,0,vcr::device::stream()>>>(values.ptr,Layout(g),int(chosen),strength,t.threshold,stats.ptr);
+    launch(blocks(g.size/g.shape[chosen]),256,0,vcr::device::stream(), compression_prefix_launch{}, values.ptr,Layout(g),int(chosen),strength,t.threshold,stats.ptr);
     if(smooth>.5) {std::vector<double> sigmas(d,smooth);sigmas[chosen]=0;blur(data,g,sigmas,6,Boundary::Mirror,true);}
     auto field=std::make_shared<Buffer<float>>(g.size*d);
-    compression_field<<<blocks(g.size),256,0,vcr::device::stream()>>>(values.ptr,field->ptr,Layout(g),int(chosen));
+    launch(blocks(g.size),256,0,vcr::device::stream(), compression_field_launch{}, values.ptr,field->ptr,Layout(g),int(chosen));
     check(cudaGetLastError());p.device_field=field;p.border=true;
     if(record) {p.field.resize(field->size);field->download(p.field.data());}
     };

@@ -9,16 +9,19 @@ template<class T> struct View {
     T* ptr;
     std::size_t size;
 };
-template<class To, class From> __global__ void convert_kernel(To* out, const From* in, std::size_t n) {
+template<class To, class From> __device__ void convert_kernel(KernelIndex vcr_launch, To* out, const From* in, std::size_t n) {
     EACH_INDEX(n) out[i] = To(in[i]);
 }
+struct convert_kernel_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { convert_kernel(index,args...); }
+};
 template<class To, class From> void convert(View<To> to, View<From> from) {
     require(to.size == from.size,"CUDA conversion size mismatch");
-    convert_kernel<<<blocks(to.size),256,0,vcr::device::stream()>>>(to.ptr,from.ptr,to.size); check(cudaGetLastError());
+    launch(blocks(to.size),256,0,vcr::device::stream(), convert_kernel_launch{}, to.ptr,from.ptr,to.size); check(cudaGetLastError());
 }
 template<class T> void copy_device(View<T> to, View<T> from) {
     require(to.size == from.size,"CUDA copy size mismatch");
-    check(cudaMemcpyAsync(to.ptr,from.ptr,to.size*sizeof(T),cudaMemcpyDeviceToDevice,vcr::device::stream()));
+    check(copy_async(to.ptr,from.ptr,to.size*sizeof(T),cudaMemcpyDeviceToDevice,vcr::device::stream()));
 }
 struct DeviceArray {
     Shape shape;

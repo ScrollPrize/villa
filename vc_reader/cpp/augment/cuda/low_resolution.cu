@@ -1,7 +1,7 @@
 #include "geometry.cuh"
 namespace vcr::augment::cuda {
 template<class T, class Index, int D>
-__global__ void resolution_kernel(const T* src, T* dst, Layout g,
+__device__ void resolution_kernel(KernelIndex vcr_launch, const T* src, T* dst, Layout g,
                                   const ResizePosition<T,Index>* positions) {
     EACH_INDEX(g.size) {
         ResizePosition<T,Index> q[D];
@@ -14,6 +14,9 @@ __global__ void resolution_kernel(const T* src, T* dst, Layout g,
         dst[i]=resize_value<D>(src,q);
     }
 }
+template<class T, class Index, int D> struct resolution_kernel_launch3 {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { resolution_kernel<T,Index,D>(index,args...); }
+};
 template<class T, class Index>
 DeviceArray resolution_channel(View<T> data, const Grid& grid, const Shape& reduced) {
     std::vector<ResizePosition<T,Index>> positions;
@@ -25,9 +28,9 @@ DeviceArray resolution_channel(View<T> data, const Grid& grid, const Shape& redu
     Shape shape{1}; shape.insert(shape.end(),grid.shape.begin(),grid.shape.end());
     DeviceArray output(shape,'f',sizeof(T));
     if (reduced.size()==3)
-        resolution_kernel<T,Index,3><<<blocks(data.size),256,0,vcr::device::stream()>>>(data.ptr,output.view<T>().ptr,Layout(grid),table.ptr);
+        launch(blocks(data.size),256,0,vcr::device::stream(), resolution_kernel_launch3<T,Index,3>{}, data.ptr,output.view<T>().ptr,Layout(grid),table.ptr);
     else
-        resolution_kernel<T,Index,2><<<blocks(data.size),256,0,vcr::device::stream()>>>(data.ptr,output.view<T>().ptr,Layout(grid),table.ptr);
+        launch(blocks(data.size),256,0,vcr::device::stream(), resolution_kernel_launch3<T,Index,2>{}, data.ptr,output.view<T>().ptr,Layout(grid),table.ptr);
     check(cudaGetLastError());
     return output;
 }

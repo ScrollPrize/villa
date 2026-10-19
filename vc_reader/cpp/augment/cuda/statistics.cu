@@ -2,7 +2,7 @@
 #include "statistics.cuh"
 #include "channel_statistics.cuh"
 namespace vcr::augment::cuda {
-template<class T, bool Variance> __global__ void collect(View<T> input, Partial* output, const float* weights, const Statistics* stats) {
+template<class T, bool Variance> __device__ void collect(KernelIndex vcr_launch, View<T> input, Partial* output, const float* weights, const Statistics* stats) {
     __shared__ Partial values[256];
     Partial p{0,0,INFINITY,-INFINITY};
     // Versioned on the uniform weights test. Unweighted, the weight stays +0
@@ -20,9 +20,12 @@ template<class T, bool Variance> __global__ void collect(View<T> input, Partial*
     };
     if (weights) each(std::true_type{}); else each(std::false_type{});
     values[threadIdx.x] = p; reduce(values);
-    if (!threadIdx.x) output[blockIdx.x] = values[0];
+    if (!threadIdx.x) output[vcr_launch.block] = values[0];
 }
-__global__ void finish_stats(const Partial* input, unsigned count, std::size_t n, bool weighted, bool variance, Statistics* output) {
+template<class T, bool Variance> struct collect_launch2 {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { collect<T,Variance>(index,args...); }
+};
+__device__ void finish_stats(KernelIndex vcr_launch, const Partial* input, unsigned count, std::size_t n, bool weighted, bool variance, Statistics* output) {
     __shared__ Partial values[256]; Partial p{0,0,INFINITY,-INFINITY};
     for (unsigned i = threadIdx.x; i < count; i += 256) {
         auto q = input[i]; p.sum += q.sum; p.weight += q.weight;
@@ -35,29 +38,35 @@ __global__ void finish_stats(const Partial* input, unsigned count, std::size_t n
         else *output = {q.sum/(weighted ? q.weight+1e-8 : double(n)),q.low,q.high,0};
     }
 }
+struct finish_stats_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { finish_stats(index,args...); }
+};
 template<class T> Buffer<Statistics> stats_impl(View<T> data, bool deviation, const float* weights) {
     const unsigned count = std::min(blocks(data.size),1024u);
     Buffer<Partial> partial(count); Buffer<Statistics> result(1);
-    collect<T,false><<<count,256,0,vcr::device::stream()>>>(data,partial.ptr,weights,nullptr);
-    finish_stats<<<1,256,0,vcr::device::stream()>>>(partial.ptr,count,data.size,weights != nullptr,false,result.ptr);
+    launch(count,256,0,vcr::device::stream(), collect_launch2<T,false>{}, data,partial.ptr,weights,nullptr);
+    launch(1,256,0,vcr::device::stream(), finish_stats_launch{}, partial.ptr,count,data.size,weights != nullptr,false,result.ptr);
     if (deviation) {
-        collect<T,true><<<count,256,0,vcr::device::stream()>>>(data,partial.ptr,nullptr,result.ptr);
-        finish_stats<<<1,256,0,vcr::device::stream()>>>(partial.ptr,count,data.size,false,true,result.ptr);
+        launch(count,256,0,vcr::device::stream(), collect_launch2<T,true>{}, data,partial.ptr,nullptr,result.ptr);
+        launch(1,256,0,vcr::device::stream(), finish_stats_launch{}, partial.ptr,count,data.size,false,true,result.ptr);
     }
     check(cudaGetLastError()); return result;
 }
-__global__ void magnitude_flag(View<float> input, float limit, int* flags, int bit) {
+__device__ void magnitude_flag(KernelIndex vcr_launch, View<float> input, float limit, int* flags, int bit) {
     bool exceeded = false;
     EACH_INDEX(input.size) exceeded |= fabsf(input.ptr[i]) > limit;
     // Ordinary images perform no atomics. Exceptional blocks publish once.
     const bool any = __syncthreads_or(exceeded);
     if (!threadIdx.x && any) atomicOr(flags,bit);
 }
+struct magnitude_flag_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { magnitude_flag(index,args...); }
+};
 void flag_magnitude(View<float> input, double limit, int* flags, int bit) {
     // Round down so comparing float inputs preserves the double threshold.
     float threshold = float(limit);
     if (double(threshold) > limit) threshold = std::nextafter(threshold,-INFINITY);
-    magnitude_flag<<<blocks(input.size),256,0,vcr::device::stream()>>>(input,threshold,flags,bit);
+    launch(blocks(input.size),256,0,vcr::device::stream(), magnitude_flag_launch{}, input,threshold,flags,bit);
     check(cudaGetLastError());
 }
 template<class T> Buffer<Statistics> bounds_impl(View<T> input) {

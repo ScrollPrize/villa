@@ -1,9 +1,12 @@
 #include "channel.cuh"
 namespace vcr::augment::cuda {
-template<class T> __global__ void invert_kernel(View<T> data) {
+template<class T> __device__ void invert_kernel(KernelIndex vcr_launch, View<T> data) {
     EACH_INDEX(data.size) data.ptr[i] = -data.ptr[i];
 }
-template<class T> __global__ void gamma_kernel(View<T> data, const Statistics* stats, double gamma) {
+struct invert_kernel_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { invert_kernel(index,args...); }
+};
+template<class T> __device__ void gamma_kernel(KernelIndex vcr_launch, View<T> data, const Statistics* stats, double gamma) {
     EACH_INDEX(data.size) {
         const T low = T(stats->low), range = T(stats->high)-low;
         T value = pow((data.ptr[i]-low)/fmax(range,T(1e-7)),T(gamma))*range+low;
@@ -17,7 +20,10 @@ template<class T> __global__ void gamma_kernel(View<T> data, const Statistics* s
         data.ptr[i] = value;
     }
 }
-template<class T> __global__ void finish_gamma(View<T> data, const Statistics* before, const Statistics* after, bool retain, bool invert) {
+struct gamma_kernel_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { gamma_kernel(index,args...); }
+};
+template<class T> __device__ void finish_gamma(KernelIndex vcr_launch, View<T> data, const Statistics* before, const Statistics* after, bool retain, bool invert) {
     EACH_INDEX(data.size) {
         T x = data.ptr[i];
         if (retain) x = T((x-after->mean)*(before->deviation/fmax(after->deviation,1e-7))+before->mean);
@@ -25,16 +31,19 @@ template<class T> __global__ void finish_gamma(View<T> data, const Statistics* b
         data.ptr[i] = x;
     }
 }
+struct finish_gamma_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { finish_gamma(index,args...); }
+};
 void apply_cuda(const Gamma& t, Sample& s, const Parameters& p, Session& session) {
     apply_channels(t,s,p,session,[](const auto&, auto v, const Grid&, const ChannelPlan& c) {
         const bool invert = c.values[1], retain = c.values[2];
-        if (invert) invert_kernel<<<blocks(v.size),256,0,vcr::device::stream()>>>(v);
+        if (invert) launch(blocks(v.size),256,0,vcr::device::stream(), invert_kernel_launch{}, v);
         auto before = retain ? statistics(v,true) : bounds(v);
-        gamma_kernel<<<blocks(v.size),256,0,vcr::device::stream()>>>(v,before.ptr,c.values[0]);
+        launch(blocks(v.size),256,0,vcr::device::stream(), gamma_kernel_launch{}, v,before.ptr,c.values[0]);
         if (retain) {
             auto after = statistics(v,true);
-            finish_gamma<<<blocks(v.size),256,0,vcr::device::stream()>>>(v,before.ptr,after.ptr,true,invert);
-        } else if (invert) invert_kernel<<<blocks(v.size),256,0,vcr::device::stream()>>>(v);
+            launch(blocks(v.size),256,0,vcr::device::stream(), finish_gamma_launch{}, v,before.ptr,after.ptr,true,invert);
+        } else if (invert) launch(blocks(v.size),256,0,vcr::device::stream(), invert_kernel_launch{}, v);
         check(cudaGetLastError());
     });
 }

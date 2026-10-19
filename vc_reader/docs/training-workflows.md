@@ -188,9 +188,25 @@ output = pipeline.batch({"image": cuda_images}, seeds=[11, 12],
 `Param` works wherever a transform accepts a scalar distribution. For a single
 CPU or CUDA sample, pass scalar values with `pipeline(sample, seed=11,
 params={"contrast": 0.8, "noise": 0.0})`. Recorded replay plans retain the
-resolved values. Batch submission uses the shared native executor for every
-CUDA transform; it still launches kernels per sample, rather than fusing them
-across the batch. Deferred status flags are downloaded together at completion.
+resolved values. The native executor applies each pipeline step across the
+batch and combines compatible kernel stages into one launch. Each sample keeps
+its own parameters, RNG, channel statistics and target alignment. Gaussian
+filters retain separate axis passes, reductions retain collection and finish
+passes, and FFT transforms use batched cuFFT plans. Different filter variants
+or selected branches can require separate groups. There is no promise of one
+kernel for an entire transform or pipeline, or for arbitrary ragged outputs.
+Deferred status flags are downloaded together at completion.
+
+Foreground selection, component selection and median quantization keep their
+intermediate decisions on the GPU. Scratch storage lives through the current
+pipeline step and is released on the caller's CUDA stream. Batch results are
+ordinary PyTorch-owned tensors; input tensors are preserved.
+Input validation and copying share one pass. Transforms that retain their
+working allocation return that tensor directly, avoiding a final stacking copy.
+Batching reduces launch overhead but can increase the working set and memory
+traffic, particularly when FFTs need packed storage. Benchmark representative
+crop sizes and pipelines rather than assuming that fewer launches always means
+lower latency.
 
 See [acceptance and measurements](training-workflow-benchmarks.md) for independent
 comparisons, exact commands, measured overhead and outstanding real fixtures.

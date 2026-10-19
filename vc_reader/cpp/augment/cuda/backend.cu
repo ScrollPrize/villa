@@ -26,7 +26,7 @@ Parameters sample_parameters(const Op& op, const Sample& s, Random& r, bool reco
         else if constexpr (std::is_same_v<T,SheetCompression>) return sample_sheet(t,s,r,record,*static_cast<Session*>(context));
         else if constexpr (std::is_same_v<T,SurfacePerturb>) return sample_surface(t,s,r,record,*static_cast<Session*>(context));
         else if constexpr (std::is_same_v<T,RemoveComponents>) return sample_components(t,s,r,record,*static_cast<Session*>(context));
-        else if constexpr (std::is_same_v<T,ForegroundCrop>) return sample_foreground(t,s,r,*static_cast<Session*>(context));
+        else if constexpr (std::is_same_v<T,ForegroundCrop>) return sample_foreground(t,s,r,record,*static_cast<Session*>(context));
         else if constexpr (std::is_same_v<T,GridDropout> || std::is_same_v<T,StripeMasking> || std::is_same_v<T,ForegroundDropout> || std::is_same_v<T,ObjectDropout>) return sample_dropout(t,s,r,record,*static_cast<Session*>(context));
         else if constexpr (std::is_same_v<T,std::shared_ptr<OneOf>>) throw std::invalid_argument("unresolved OneOf");
         else return sample(t,s,r);
@@ -37,6 +37,28 @@ void execute(const Op& op, Sample& s, const Parameters& p, void* context) {
         if constexpr (std::is_same_v<std::decay_t<decltype(t)>,std::shared_ptr<OneOf>>) throw std::invalid_argument("unresolved OneOf");
         else apply_cuda(t,s,p,*static_cast<Session*>(context));
     },op);
+}
+
+void run_batch_steps(const Program& program, std::vector<Sample>& samples,
+                     const std::vector<std::uint64_t>& seeds,
+                     const std::map<std::string,std::vector<double>>& params,
+                     const std::vector<std::shared_ptr<void>>& contexts) {
+    BatchQueue queue(samples.size());
+    for (std::size_t step=0;step<program.transforms.size();++step) {
+        for (std::size_t b=0;b<samples.size();++b) {
+            queue.lane(b);
+            auto& sample=samples[b];
+            for (const auto& [name,f]:sample) require(f.pyramid.empty(),"DeepSupervision must be the last transform");
+            NamedValues values;
+            for (const auto& [name,v]:params) values[name]=v[b];
+            NamedScope named(&values);
+            Random random{split_seed(seeds[b],std::to_string(step))};
+            CompactState compact(false);
+            prepare(program.transforms[step],sample,random,{step},nullptr,compact,execute,contexts[b].get());
+        }
+        queue.flush();
+    }
+    for (const auto& context:contexts) finish_device(context.get());
 }
 
 } // namespace vcr::augment::cuda

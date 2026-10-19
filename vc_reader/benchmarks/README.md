@@ -1742,3 +1742,66 @@ worker/source combinations. Consequently, the reported total is not a
 steady-state CUDA throughput measurement. The timing hooks do not separately
 measure plan generation, source readiness, heading requests, and CPU labels
 inside each wait. See `results/fiber_tensor_bottleneck_analysis.json`.
+
+# Native augmentation batches
+
+`bench_batch_augmentations.py` measures resident batches on a local CT volume.
+Reading and the initial upload are excluded. Timings include public-call
+validation and completion; reports contain raw observations, mean, median,
+p95, minimum and maximum. `--profile` records GPU events separately from timing.
+Use the same arguments with two native build directories for before/after runs:
+
+```bash
+PYTHONPATH=src python benchmarks/bench_batch_augmentations.py \
+  --native-dir /path/to/native-build --array /path/to/volume.zarr --level 2 \
+  --start 9000 3600 3600 --size 64 --batches 1 4 16 \
+  --warmup 5 --reps 20 --profile --output /tmp/batch-augmentations.json
+```
+
+Measured on 2026-10-19 with an RTX 5090, CUDA 13.3, and PyTorch
+2.14.1+cu130, against commit `f8e1bc05b`. Both builds used the same real
+PHercParis4 level-2 crop at `(9000, 3600, 3600)`, repeated across the batch,
+one float32 channel, five warmups and 30 timed calls. Reading and upload were
+excluded. The table reports median milliseconds at B=16; speedup is baseline
+latency divided by batch latency, so values below 1 indicate a regression.
+
+| Operation | 64³ baseline → batch (ms) | Speedup | 128³ baseline → batch (ms) | Speedup |
+|---|---:|---:|---:|---:|
+| brightness | 0.303 → 0.131 | 2.31× | 0.541 → 0.459 | 1.18× |
+| noise | 0.295 → 0.137 | 2.15× | 0.638 → 0.453 | 1.41× |
+| blur | 0.617 → 0.358 | 1.72× | 1.429 → 1.584 | 0.90× |
+| normalize | 0.816 → 0.456 | 1.79× | 2.014 → 1.172 | 1.72× |
+| percentile | 0.990 → 0.899 | 1.10× | 2.447 → 6.290 | 0.39× |
+| affine | 0.429 → 0.299 | 1.44× | 1.660 → 1.731 | 0.96× |
+| elastic | 1.542 → 1.534 | 1.01× | 3.720 → 7.190 | 0.52× |
+| equalize | 1.348 → 0.592 | 2.28× | 3.666 → 3.151 | 1.16× |
+| fft | 0.842 → 0.555 | 1.52× | 2.724 → 5.711 | 0.48× |
+| pipeline | 0.772 → 0.510 | 1.51× | 2.294 → 3.039 | 0.75× |
+
+Launch reduction does not guarantee a latency improvement. At 64³/B=16,
+brightness uses one augmentation kernel; total non-copy GPU events fall from
+48 to 3 (including validation and status initialization). Blur falls from
+96 to 7 events and the four-transform pipeline from 144 to 11. The profiler
+count excludes memcpy events and includes memset events; it is not a count
+of augmentation kernels alone. The launch-count test also covers B=65, which
+uses device-buffer descriptors instead of inline launch parameters.
+
+At 128³/B=16, percentile, elastic and FFT remain substantial regressions.
+The batch executor retains scratch for a whole stage, and sorting and FFTs
+pack data across samples. These increase working sets and memory traffic;
+the current implementation should not be treated as a universal throughput
+improvement. Arbitrary shape changes and `OneOf` branch optimization remain
+outside this work's scope.
+
+The final CUDA correctness run passed 55 tests and 2,955 subtests across
+`test_torch.py`, `test_native_batch.py`, `test_dimensions.py`, and
+`test_precision.py`. A focused Compute Sanitizer memcheck passed two tests
+and four subtests with zero errors, filtering for batched kernels and covering
+large scans, signed order statistics, and exception cleanup. This was not a
+full sanitizer run of every transform.
+
+Local raw timing samples and profiler event names are in
+`results/native_batch/{baseline,candidate}_{64,128}.json`, with derived
+comparisons in `results/native_batch/comparison.json`. These generated reports
+are ignored by Git. Reproduce with the command above, adding `--reps 30` and
+running both sizes against both build directories.

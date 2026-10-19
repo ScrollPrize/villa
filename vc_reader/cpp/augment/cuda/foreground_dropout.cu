@@ -2,7 +2,7 @@
 #include "dropout_mask.cuh"
 #include "foreground_selection.cuh"
 namespace vcr::augment::cuda {
-template<class T,int D> __global__ void foreground_holes(ForegroundDropoutKernel kernel,const T* mask,volume_detail::GridND<D> grid,const ForegroundCount* centers,float* field) {
+template<class T,int D> __device__ void foreground_holes(KernelIndex vcr_launch, ForegroundDropoutKernel kernel,const T* mask,volume_detail::GridND<D> grid,const ForegroundCount* centers,float* field) {
     EACH_INDEX(grid.size) {
         bool erase=false;
         if(double(mask[i])>kernel.threshold)for(std::size_t h=0;h<kernel.count && !erase;++h) {
@@ -13,13 +13,16 @@ template<class T,int D> __global__ void foreground_holes(ForegroundDropoutKernel
         field[i]=erase;
     }
 }
+struct foreground_holes_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { foreground_holes(index,args...); }
+};
 Parameters sample_dropout(const ForegroundDropout& t,const Sample& s,Random& r,bool record,Session& session){
     auto kernel=sample_holes(t,r,sample_shape(s).size());volume_detail::mask_field(s,t.mask,t.mask_channel);auto p=volume_detail::select_dropout_channels(t.options,s,r);auto field=std::make_shared<Buffer<float>>(product(p.shape));
     volume_detail::with_grid(p.shape,[&](const auto& g){
     Buffer<ForegroundCount> prefix(g.size),centers(kernel.count);
     session.arrays.at(t.mask).typed([&](auto v){
         foreground_prefix(v.ptr+t.mask_channel*g.size,g.size,t.threshold,prefix);choose_foreground_indices(prefix,kernel.seed,centers,true);
-        foreground_holes<<<blocks(g.size),256,0,vcr::device::stream()>>>(kernel,v.ptr+t.mask_channel*g.size,g,centers.ptr,field->ptr);
+        launch(blocks(g.size),256,0,vcr::device::stream(), foreground_holes_launch{}, kernel,v.ptr+t.mask_channel*g.size,g,centers.ptr,field->ptr);
     });check(cudaGetLastError());});record_dropout(p,field,record);return p;
 }
 void apply_cuda(const ForegroundDropout& t,Sample& s,const Parameters& p,Session& session){erase_mask(s,p,session,t.fill);}

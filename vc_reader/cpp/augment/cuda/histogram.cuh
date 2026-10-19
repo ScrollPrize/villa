@@ -3,27 +3,36 @@
 namespace vcr::augment::cuda {
 // Integer counts permit parallel accumulation without changing histogram/CDF
 // values. The short CDF/clip pass retains the CPU's bin order and arithmetic.
-template<class T> __global__ void global_histogram_counts(const T* data,std::size_t n,const vd::Stats* summary,int bins,unsigned long long* partial) {
+template<class T> __device__ void global_histogram_counts(KernelIndex vcr_launch, const T* data,std::size_t n,const vd::Stats* summary,int bins,unsigned long long* partial) {
     extern __shared__ unsigned long long counts[];
     for(int b=threadIdx.x;b<bins;b+=blockDim.x)counts[b]=0;__syncthreads();
     const auto s=*summary;
     EACH_INDEX(n) atomicAdd(counts+vd::bin(data[i],s.low,s.high,bins),1ULL);
     __syncthreads();
-    for(int b=threadIdx.x;b<bins;b+=blockDim.x)partial[std::size_t(blockIdx.x)*bins+b]=counts[b];
+    for(int b=threadIdx.x;b<bins;b+=blockDim.x)partial[std::size_t(vcr_launch.block)*bins+b]=counts[b];
 }
-__global__ inline void finish_histogram_counts(const unsigned long long* partial,unsigned groups,int bins,double* table) {
+struct global_histogram_counts_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { global_histogram_counts(index,args...); }
+};
+__device__ inline void finish_histogram_counts(KernelIndex vcr_launch, const unsigned long long* partial,unsigned groups,int bins,double* table) {
     EACH_INDEX(std::size_t(bins)){unsigned long long total=0;for(unsigned j=0;j<groups;++j)total+=partial[std::size_t(j)*bins+i];table[i]=double(total);}
 }
-__global__ inline void histogram_cdf(double* table,int bins,double clip) {vd::cdf(table,bins,clip);}
+struct finish_histogram_counts_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { finish_histogram_counts(index,args...); }
+};
+__device__ inline void histogram_cdf(KernelIndex vcr_launch, double* table,int bins,double clip) {vd::cdf(table,bins,clip);}
+struct histogram_cdf_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { histogram_cdf(index,args...); }
+};
 template<class T> void build_global_histogram(View<T> data,const vd::Stats* summary,int bins,double* table,double clip=0) {
     const auto groups=std::min(blocks(data.size),1024u);Buffer<unsigned long long> partial(std::size_t(groups)*bins);
-    global_histogram_counts<<<groups,256,std::size_t(bins)*sizeof(unsigned long long),vcr::device::stream()>>>(data.ptr,data.size,summary,bins,partial.ptr);
-    finish_histogram_counts<<<blocks(bins),256,0,vcr::device::stream()>>>(partial.ptr,groups,bins,table);
-    histogram_cdf<<<1,1,0,vcr::device::stream()>>>(table,bins,clip);check(cudaGetLastError());
+    launch(groups,256,std::size_t(bins)*sizeof(unsigned long long),vcr::device::stream(), global_histogram_counts_launch{}, data.ptr,data.size,summary,bins,partial.ptr);
+    launch(blocks(bins),256,0,vcr::device::stream(), finish_histogram_counts_launch{}, partial.ptr,groups,bins,table);
+    launch(1,1,0,vcr::device::stream(), histogram_cdf_launch{}, table,bins,clip);check(cudaGetLastError());
 }
-template<class T,int D> __global__ void histogram_tiles(const T* data,vd::GridND<D> grid,const vd::Stats* summary,vd::HistogramGrid layout,double* table) {
+template<class T,int D> __device__ void histogram_tiles(KernelIndex vcr_launch, const T* data,vd::GridND<D> grid,const vd::Stats* summary,vd::HistogramGrid layout,double* table) {
     extern __shared__ unsigned long long counts[];
-    for(std::size_t tile=blockIdx.x;tile<layout.count;tile+=gridDim.x) {
+    for(std::size_t tile=vcr_launch.block;tile<layout.count;tile+=vcr_launch.blocks) {
         for(int b=threadIdx.x;b<layout.bins;b+=blockDim.x)counts[b]=0;__syncthreads();
         std::size_t pos[3];
         if constexpr(D==3){pos[0]=tile/(layout.tiles[1]*layout.tiles[2]);pos[1]=tile/layout.tiles[2]%layout.tiles[1];pos[2]=tile%layout.tiles[2];}
@@ -41,10 +50,13 @@ template<class T,int D> __global__ void histogram_tiles(const T* data,vd::GridND
         if(!threadIdx.x)vd::cdf(histogram,layout.bins,layout.clip_limit);__syncthreads();
     }
 }
+struct histogram_tiles_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { histogram_tiles(index,args...); }
+};
 template<class T> void build_histograms(View<T> data,const Grid& grid,const vd::Stats* summary,const vd::HistogramGrid& layout,double* table) {
     if(layout.count==1){build_global_histogram(data,summary,layout.bins,table,layout.clip_limit);return;}
     vd::with_grid(grid.shape,[&](const auto& g){
-    histogram_tiles<<<unsigned(std::min<std::size_t>(layout.count,65535)),256,std::size_t(layout.bins)*sizeof(unsigned long long),vcr::device::stream()>>>(data.ptr,g,summary,layout,table);check(cudaGetLastError());
+    launch(unsigned(std::min<std::size_t>(layout.count,65535)),256,std::size_t(layout.bins)*sizeof(unsigned long long),vcr::device::stream(), histogram_tiles_launch{}, data.ptr,g,summary,layout,table);check(cudaGetLastError());
     });
 }
 }

@@ -11,7 +11,7 @@ Session::Session(const Sample& s) {
 int* Session::check_flags() {
     if (!checks) {
         checks = std::make_unique<Buffer<int>>(1);
-        check(cudaMemsetAsync(checks->ptr,0,sizeof(int),vcr::device::stream()));
+        check(memset_async(checks->ptr,0,sizeof(int),vcr::device::stream()));
     }
     return checks->ptr;
 }
@@ -46,7 +46,7 @@ void check_devices(const std::vector<std::shared_ptr<void>>& contexts) {
             auto& s=*static_cast<Session*>(contexts[i].get());
             const Buffer<int>* buffers[]={s.checks.get(),s.nonfinite.get(),s.geometry.get()};
             for (int j=0;j<3;++j) if (buffers[j]) {
-                check(cudaMemcpyAsync(flags+3*i+j,buffers[j]->ptr,sizeof(int),cudaMemcpyDeviceToHost,vcr::device::stream()));
+                check(copy_async(flags+3*i+j,buffers[j]->ptr,sizeof(int),cudaMemcpyDeviceToHost,vcr::device::stream()));
                 pending=true;
             }
         }
@@ -60,7 +60,7 @@ void check_devices(const std::vector<std::shared_ptr<void>>& contexts) {
 int* Session::geometry_status() {
     if (!geometry) {
         geometry = std::make_unique<Buffer<int>>(1);
-        check(cudaMemsetAsync(geometry->ptr,0,sizeof(int),vcr::device::stream()));
+        check(memset_async(geometry->ptr,0,sizeof(int),vcr::device::stream()));
     }
     return geometry->ptr;
 }
@@ -83,21 +83,24 @@ void Session::finish(Sample& s) {
 int* Session::finite_status() {
     if (!nonfinite) {
         nonfinite = std::make_unique<Buffer<int>>(1);
-        check(cudaMemsetAsync(nonfinite->ptr,0,sizeof(int),vcr::device::stream()));
+        check(memset_async(nonfinite->ptr,0,sizeof(int),vcr::device::stream()));
     }
     return nonfinite->ptr;
 }
-template<class T, class M> __global__ void restore_kernel(T* image, const M* valid, std::size_t n, std::size_t mask_size, double fill) {
+template<class T, class M> __device__ void restore_kernel(KernelIndex vcr_launch, T* image, const M* valid, std::size_t n, std::size_t mask_size, double fill) {
     EACH_INDEX(n) if (!valid[i%mask_size]) image[i] = T(fill);
 }
+struct restore_kernel_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { restore_kernel(index,args...); }
+};
 void Session::restore_valid(const Sample& s) {
     for (const auto& [key,f] : s) {
         if (f.target.role != Role::Image || !s.count(f.target.valid)) continue;
         auto& image = arrays.at(key); const auto& mask = arrays.at(f.target.valid);
         require(image.spatial() == mask.spatial() && (mask.shape[0] == 1 || mask.shape[0] == image.shape[0]),"validity mask no longer matches image channels");
         mask.typed([&](auto valid) {
-            if (image.bytes == 4) restore_kernel<<<blocks(image.size()),256,0,vcr::device::stream()>>>(image.view<float>().ptr,valid.ptr,image.size(),mask.size(),f.target.fill);
-            else restore_kernel<<<blocks(image.size()),256,0,vcr::device::stream()>>>(image.view<double>().ptr,valid.ptr,image.size(),mask.size(),f.target.fill);
+            if (image.bytes == 4) launch(blocks(image.size()),256,0,vcr::device::stream(), restore_kernel_launch{}, image.view<float>().ptr,valid.ptr,image.size(),mask.size(),f.target.fill);
+            else launch(blocks(image.size()),256,0,vcr::device::stream(), restore_kernel_launch{}, image.view<double>().ptr,valid.ptr,image.size(),mask.size(),f.target.fill);
         });
         check(cudaGetLastError());
     }
@@ -109,28 +112,37 @@ void synchronize() { check(cudaStreamSynchronize(vcr::device::stream())); }
 
 #include "device_io.hpp"
 namespace vcr::augment::cuda {
-template<class T> __global__ void validate_device_values(View<T> data, bool mask, int* invalid) {
+template<class T> __device__ void validate_device_values(KernelIndex vcr_launch, View<T> data, T* output, bool mask, int* invalid) {
     EACH_INDEX(data.size) {
         if constexpr (std::is_floating_point_v<T>) if (!isfinite(data.ptr[i])) atomicOr(invalid,1);
         if (mask && data.ptr[i]!=0 && data.ptr[i]!=1) atomicOr(invalid,2);
+        if (output != data.ptr) output[i]=data.ptr[i];
     }
 }
-std::shared_ptr<void> begin_device(const std::map<std::string,DeviceInput>& inputs, Sample& sample, bool inplace, bool async) {
+struct validate_device_values_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { validate_device_values(index,args...); }
+};
+std::shared_ptr<void> begin_device(const std::map<std::string,DeviceInput>& inputs, Sample& sample, bool inplace, bool async,
+                                   const std::map<std::string,DeviceInput>& destinations) {
     auto session=std::make_shared<Session>(); session->async=async;
     Buffer<int> invalid(async ? 0 : 1); int flags=0;
     int* status=async ? session->check_flags() : invalid.ptr;
-    if (!async) check(cudaMemsetAsync(invalid.ptr,0,sizeof(int),vcr::device::stream()));
+    if (!async) check(memset_async(invalid.ptr,0,sizeof(int),vcr::device::stream()));
     for (const auto& [key,in]:inputs) {
         auto& f=sample.at(key);
         DeviceArray array(in.shape,in.kind,in.bytes,in.data);
-        array.typed([&](auto view) { if (view.size) validate_device_values<<<blocks(view.size),256,0,vcr::device::stream()>>>(view,f.target.role==Role::Valid,status); });
+        // Validate while copying into the working output, avoiding a second
+        // read of the entire batch. In-place callers only validate.
+        DeviceArray output = inplace ? array : destinations.count(key)
+            ? DeviceArray(in.shape,in.kind,in.bytes,destinations.at(key).data)
+            : DeviceArray(in.shape,in.kind,in.bytes);
+        array.typed([&](auto view) {
+            using T=std::remove_pointer_t<decltype(view.ptr)>;
+            if (view.size) launch(blocks(view.size),256,0,vcr::device::stream(),validate_device_values_launch{},
+                                  view,reinterpret_cast<T*>(output.buffer->ptr),f.target.role==Role::Valid,status);
+        });
         check(cudaGetLastError());
-        if (inplace) session->arrays.emplace(key,std::move(array));
-        else {
-            DeviceArray copy(in.shape,in.kind,in.bytes);
-            check(cudaMemcpyAsync(copy.buffer->ptr,in.data,array.size()*array.bytes,cudaMemcpyDeviceToDevice,vcr::device::stream()));
-            session->arrays.emplace(key,std::move(copy));
-        }
+        session->arrays.emplace(key,std::move(output));
     }
     if (async) return session;
     invalid.download(&flags);
@@ -143,6 +155,17 @@ std::map<std::string,DeviceInput> device_outputs(void* context) {
     for (const auto& [key,a]:static_cast<Session*>(context)->arrays)
         out.emplace(key,DeviceInput{a.buffer->ptr,a.shape,a.kind,a.bytes,a.buffer->device});
     return out;
+}
+void copy_batch_output(void* destination,const std::vector<DeviceInput>& inputs) {
+    BatchQueue copies(inputs.size());
+    std::size_t offset=0;
+    for(std::size_t b=0;b<inputs.size();++b) {
+        copies.lane(b);
+        const auto& input=inputs[b];const auto bytes=product(input.shape)*input.bytes;
+        check(copy_async(static_cast<std::byte*>(destination)+offset,input.data,bytes,cudaMemcpyDeviceToDevice,vcr::device::stream()));
+        offset+=bytes;
+    }
+    copies.flush();
 }
 std::map<std::string,std::vector<DeviceInput>> device_pyramids(void* context) {
     std::map<std::string,std::vector<DeviceInput>> out;

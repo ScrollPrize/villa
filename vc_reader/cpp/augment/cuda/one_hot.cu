@@ -6,7 +6,7 @@ void apply_cuda(const OneHot& t,Sample& s,const Parameters&,Session& session) {
     if (!t.append_to.empty()) {
         auto& image=session.arrays.at(t.append_to); require(image.spatial()==encoded.spatial(),"one-hot image grid mismatch");
         auto shape=image.shape; shape[0]+=encoded.shape[0]; DeviceArray combined(shape,image.kind,image.bytes); const auto count=image.size();
-        check(cudaMemcpyAsync(combined.buffer->ptr,image.buffer->ptr,count*image.bytes,cudaMemcpyDeviceToDevice,vcr::device::stream()));
+        check(copy_async(combined.buffer->ptr,image.buffer->ptr,count*image.bytes,cudaMemcpyDeviceToDevice,vcr::device::stream()));
         combined.typed([&](auto data) { using T=typename decltype(data)::value_type; convert(View<T>{data.ptr+count,encoded.size()},encoded.view<std::uint8_t>()); });
         s.at(t.append_to).array=array_metadata(combined); image=std::move(combined);
     } else {
@@ -19,7 +19,7 @@ void apply_cuda(const OneHot& t,Sample& s,const Parameters&,Session& session) {
         else {
             auto shape=a.shape; --shape[0]; DeviceArray remaining(shape,a.kind,a.bytes); std::size_t out=0;
             for (std::size_t c=0;c<a.shape[0];++c) if (c!=t.channel) {
-                check(cudaMemcpyAsync(remaining.buffer->ptr+out*n*a.bytes,a.buffer->ptr+c*n*a.bytes,n*a.bytes,cudaMemcpyDeviceToDevice,vcr::device::stream())); ++out;
+                check(copy_async(remaining.buffer->ptr+out*n*a.bytes,a.buffer->ptr+c*n*a.bytes,n*a.bytes,cudaMemcpyDeviceToDevice,vcr::device::stream())); ++out;
             }
             s.at(t.on).array=array_metadata(remaining); a=std::move(remaining);
         }
