@@ -8,12 +8,6 @@ from vc.objects import ObjectStore
 from object_helpers import edge_choice
 
 
-@pytest.fixture
-def db(tmp_path):
-    with ObjectStore.create(str(tmp_path / "objects.vcobj"), author="test") as store:
-        yield store
-
-
 def array(name, values, dtype):
     data = np.asarray(values, dtype=dtype)
     return {"name": name, "dtype": dtype, "shape": list(data.shape), "data": data.tobytes()}
@@ -118,7 +112,6 @@ def test_stored_collection_ids_winding_scaling_and_rerun(db):
     geometry["arrays"][0] = array("points", [[1000, 1000, 40], [2000, 2000, 40]], "<f8")
     db.put_geometry(collection, geometry, expected_revision=db.current_geometry(collection)["uuid"], edge_edits=[edge_choice(db, e["uuid"], "remove") for e in db.affected_geometry_edges(collection, geometry)])
     assert db.link_point_collections_to_patches(collection_uuids=[collection], patch_uuids=[patch], point_scale=0.5)["stale_removed"] == 0
-
 
 
 def test_ingested_real_patch_links_after_sources_removed_and_store_moved(tmp_path):

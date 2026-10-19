@@ -1,20 +1,16 @@
 """Objects, geometry, and relationship metadata share one atomic database."""
 import json
 import sqlite3
-import struct
 from pathlib import Path
 
 import pytest
 import vc
 from vc.objects import ObjectStore
-from object_helpers import edge_choice
+from object_helpers import _geometry, edge_choice
 
 
 def geometry(value=1):
-    return {"kind": "fiber", "arrays": [
-        {"name": "control_points", "dtype": "<f8", "shape": [0, 3], "data": b""},
-        {"name": "line_points", "dtype": "<f8", "shape": [1, 3],
-         "data": struct.pack("<ddd", value, 2, 3)}]}
+    return _geometry(value=value)
 
 
 @pytest.fixture()

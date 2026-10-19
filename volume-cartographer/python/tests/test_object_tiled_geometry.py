@@ -6,14 +6,7 @@ import struct
 
 import pytest
 from vc.objects import ObjectStore
-from object_helpers import patch
-from object_helpers import edge_choice, sqlite_rows
-
-
-@pytest.fixture()
-def db(tmp_path):
-    with ObjectStore.create(str(tmp_path / 'tiles.vcobj'), author='test') as store:
-        yield store
+from object_helpers import edge_choice, patch, sqlite_rows
 
 
 def crop(payload, cols, y, x, h, w):

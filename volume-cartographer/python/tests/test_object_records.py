@@ -74,18 +74,6 @@ def test_approval_journal_keeps_decisions_and_stamps(db, kind):
 
 
 
-
-@pytest.fixture()
-def db_path(tmp_path: Path) -> str:
-    return str(tmp_path / "objects.vcobj")
-
-
-@pytest.fixture()
-def db(db_path: str):
-    with ObjectStore.create(db_path, author="pytest", hostname="testhost") as handle:
-        yield handle
-
-
 def test_object_and_edge_roundtrip(db) -> None:
     a = db.upsert_object({"kind": "fiber", "name": "a", "tags": ["h"],
                           "fiber": {"family": "H", "control_point_count": 3}})
@@ -204,8 +192,6 @@ def test_reopen_read_only_and_export(db_path: str) -> None:
 
 
 
-
-
 def test_object_edge_uuids_share_namespace(db):
     a = db.upsert_object({"kind": "fiber", "uuid": "abcdefab-1111-4111-8111-111111111111"})
     b = db.upsert_object({"kind": "fiber"})
@@ -222,7 +208,6 @@ def test_object_edge_uuids_share_namespace(db):
     assert db.edge(edge)["approval_state"] == "approved"
     assert db.object(a)["approval_state"] == "pending"
     assert db.neighbours(a.upper()) == [b]
-
 
 
 

@@ -70,9 +70,6 @@ vc_add_test(NAME test_fiber_collection LIBS doctest::doctest vc_fiber_collection
 
 vc_add_test(NAME test_object_records LIBS doctest::doctest vc_objects)
 vc_add_test(NAME test_object_store LIBS doctest::doctest vc_objects)
-# Manual performance harness; not a timing-sensitive CTest.
-add_executable(benchmark_object_store_surface EXCLUDE_FROM_ALL benchmark_object_store_surface.cpp)
-target_link_libraries(benchmark_object_store_surface PRIVATE vc_objects vc_core)
 vc_add_test(NAME test_progress LIBS doctest::doctest vc_objects)
 
 vc_add_test(NAME test_object_links LIBS doctest::doctest vc_object_links vc_core)

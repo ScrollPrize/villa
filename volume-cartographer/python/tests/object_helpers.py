@@ -1,7 +1,24 @@
 """Geometry builders, diagnostics and caller decisions for object-store tests."""
+import json
 import struct
+import subprocess
+import sys
 
-from scripts.object_store_sqlite import sqlite_rows
+
+def sqlite_rows(path, statement, parameters=()):
+    # Python and vc.objects can link different SQLite builds. Closing one
+    # build's WAL connection in-process can invalidate the other's POSIX locks.
+    code = "import json,sqlite3,sys; c=sqlite3.connect(sys.argv[1]); r=c.execute(sys.argv[2],json.loads(sys.argv[3])).fetchall(); c.commit(); print(json.dumps(r)); c.close()"
+    return json.loads(subprocess.check_output(
+        [sys.executable, '-c', code, str(path), statement, json.dumps(parameters)], text=True))
+
+
+def sqlite_backup(source, destination):
+    """Copy a live native store without disturbing its SQLite file locks."""
+    code = ("import sqlite3,sys; "
+            "s=sqlite3.connect(sys.argv[1]); d=sqlite3.connect(sys.argv[2]); "
+            "s.backup(d); d.close(); s.close()")
+    subprocess.run([sys.executable, '-c', code, str(source), str(destination)], check=True)
 
 
 def remove_spatial_schema(sql):

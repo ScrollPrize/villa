@@ -397,7 +397,7 @@ def test_incremental_matches_full_snapshot_merge(pair, tmp_path):
     """Use the legacy full-snapshot path as an independent merge oracle."""
     import random
     import uuid
-    from scripts.object_store_sqlite import sqlite_backup, sqlite_rows
+    from object_helpers import sqlite_backup, sqlite_rows
     a, b = pair
     ids = [a.upsert_object(dict(kind="note")) for _ in range(20)]
     a.synchronize(b)

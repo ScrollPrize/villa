@@ -7,12 +7,6 @@ import pytest
 from vc.objects import ObjectStore
 
 
-@pytest.fixture()
-def db(tmp_path):
-    with ObjectStore.create(str(tmp_path / "queries.vcobj"), author="test") as store:
-        yield store
-
-
 def test_selection_intersection_pagination_and_export(db):
     with db.write() as tx:
         ids = [tx.upsert_object(dict(kind="fiber", name=str(i), tags=["even"] if i % 2 == 0 else [],
