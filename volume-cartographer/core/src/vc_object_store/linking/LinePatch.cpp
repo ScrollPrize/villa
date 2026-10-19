@@ -9,7 +9,7 @@
 //    results are committed as pending graph edges via commitCandidates
 //    instead of review decisions.
 
-#include "GraphLinksLinePatch.hpp"
+#include "linking/LinePatch.hpp"
 
 #include <algorithm>
 #include <cmath>

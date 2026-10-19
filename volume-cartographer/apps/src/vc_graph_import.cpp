@@ -1,3 +1,6 @@
+#include "vc/core/objects/import/TrackImport.hpp"
+#include "vc/core/objects/import/PatchImport.hpp"
+#include "vc/core/objects/import/FiberImport.hpp"
 // Import existing fiber/segment metadata into an object database and
 // export the metadata graph as JSON. See
 // docs/plans/graph_db_initial_implementation.md (Phase 4).

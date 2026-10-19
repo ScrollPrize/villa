@@ -1,3 +1,6 @@
+#include "vc/core/objects/import/TrackImport.hpp"
+#include "vc/core/objects/import/PatchImport.hpp"
+#include "vc/core/objects/import/FiberImport.hpp"
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 

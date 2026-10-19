@@ -1,7 +1,7 @@
 #include "vc/core/objects/GeometryExport.hpp"
 #include "vc/core/util/Tiff.hpp"
 #include "vc/core/util/Uuid.hpp"
-#include "ObjectTrackInput.hpp"
+#include "formats/TrackInput.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <bit>

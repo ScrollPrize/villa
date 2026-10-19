@@ -1,14 +1,7 @@
-#include "vc/core/objects/ObjectStore.hpp"
-#include "ObjectStoreInternal.hpp"
-#include "ObjectGeometryInternal.hpp"
+#include "internal/RecordSql.hpp"
+#include "geometry/GeometryInternal.hpp"
+
 namespace vc::objects {
-ObjectStore ObjectStore::create(const std::filesystem::path& p, const OpenOptions& o) { return ObjectStore(openImpl(p,o,true)); }
-ObjectStore ObjectStore::open(const std::filesystem::path& p, const OpenOptions& o) { return ObjectStore(openImpl(p,o,false)); }
-std::string ObjectStore::uuid(const Txn& txn) const {
-    Statement s(static_cast<sqlite3*>(connection(txn)), "SELECT uuid FROM store_identity");
-    if (!s.row()) throw std::runtime_error("object store: missing identity");
-    return formatUuid(s.blob16(0));
-}
 namespace {
 GeometryRevision readGeometryRevision(const Statement& s)
 {
@@ -148,6 +141,5 @@ std::vector<uint8_t> ObjectStore::readGeometryArray(const Txn& txn, const std::s
     }
     return result;
 }
-
 
 } // namespace vc::objects

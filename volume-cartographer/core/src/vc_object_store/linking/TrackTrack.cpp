@@ -1,7 +1,7 @@
 #include "vc/core/graph_links/GraphLinks.hpp"
 #include "vc/core/util/PackedTrackStore.hpp"
 #include "vc/core/util/TrackCrossings.hpp"
-#include "GraphLinksTrackInput.hpp"
+#include "linking/TrackInput.hpp"
 
 #include <algorithm>
 #include <charconv>

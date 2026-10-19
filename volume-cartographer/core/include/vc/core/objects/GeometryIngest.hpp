@@ -1,5 +1,6 @@
 #pragma once
 #include "vc/core/objects/ObjectStore.hpp"
+#include "vc/core/util/Progress.hpp"
 
 namespace vc::objects {
 struct GeometryIngestReport {

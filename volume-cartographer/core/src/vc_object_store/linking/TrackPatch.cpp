@@ -1,5 +1,5 @@
-#include "GraphLinksLinePatch.hpp"
-#include "GraphLinksTrackInput.hpp"
+#include "linking/LinePatch.hpp"
+#include "linking/TrackInput.hpp"
 #include <cmath>
 #include <stdexcept>
 

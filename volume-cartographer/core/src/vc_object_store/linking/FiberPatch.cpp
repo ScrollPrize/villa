@@ -1,6 +1,6 @@
 // Fiber JSON adapter for the shared line-to-patch linker.
-#include "GraphLinksLinePatch.hpp"
-#include "ObjectFiberInput.hpp"
+#include "linking/LinePatch.hpp"
+#include "formats/FiberInput.hpp"
 #include "vc/core/util/Uuid.hpp"
 #include <algorithm>
 #include <cmath>

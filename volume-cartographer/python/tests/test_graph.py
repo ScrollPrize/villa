@@ -1,24 +1,19 @@
-"""Tests for the ``vc.objects`` bindings (unified metadata graph DB).
+"""Tests for the ``vc.objects`` bindings (object records and relationships).
 
-Run with the vesuvius interpreter that has the editable
-volume-cartographer install, e.g.
-``VC_BUILD_PYTHON=build/python .venv/bin/python -m pytest python/tests/test_graph.py``.
+Run against the built module with
+``PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_BUILD_PYTHON=build/python
+.venv/bin/python -m pytest python/tests/test_graph.py``.
 """
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import uuid
 from pathlib import Path
 
 import pytest
 
-import vc
-if os.environ.get("VC_BUILD_PYTHON"):
-    vc.__path__.insert(0, str(Path(os.environ["VC_BUILD_PYTHON"]) / "vc"))
-graph = pytest.importorskip("vc.objects")
-ObjectStore = graph.ObjectStore
+ObjectStore = pytest.importorskip("vc.objects").ObjectStore
 
 
 def test_snapshot_preserves_provenance_and_conflicts_are_atomic(db, tmp_path):

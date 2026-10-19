@@ -1,5 +1,5 @@
 #pragma once
-#include "ObjectStoreInternal.hpp"
+#include "internal/RecordSql.hpp"
 namespace vc::objects { namespace {
 const char* kEdgeCols =
     "id,uuid,a_id,b_id,kind,generation,created_by,created_at,created_host,changed_by,changed_at,changed_host,"

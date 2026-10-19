@@ -1,5 +1,5 @@
 // Shared track identity/selection adapter for all graph-link detectors.
-#include "GraphLinksTrackInput.hpp"
+#include "linking/TrackInput.hpp"
 #include "vc/core/util/Uuid.hpp"
 #include <algorithm>
 #include <charconv>

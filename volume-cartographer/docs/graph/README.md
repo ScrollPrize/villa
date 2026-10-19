@@ -205,6 +205,8 @@ build/bin/graph_build /data/dataset /data/ct.zarr
 #include <iostream>
 #include <stdexcept>
 #include "vc/core/objects/ObjectStore.hpp"
+#include "vc/core/objects/import/FiberImport.hpp"
+#include "vc/core/objects/import/PatchImport.hpp"
 #include "vc/core/graph_links/GraphLinks.hpp"
 
 int main(int argc, char** argv) {

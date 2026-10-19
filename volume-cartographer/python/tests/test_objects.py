@@ -1,13 +1,9 @@
 """Standalone object storage: no graph database is needed."""
 import json
-import os
 import sqlite3
 import uuid
 from pathlib import Path
 import pytest
-import vc
-if os.environ.get("VC_BUILD_PYTHON"):
-    vc.__path__.insert(0, str(Path(os.environ["VC_BUILD_PYTHON"]) / "vc"))
 ObjectStore = pytest.importorskip("vc.objects").ObjectStore
 
 @pytest.fixture()

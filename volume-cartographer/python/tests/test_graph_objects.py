@@ -1,13 +1,10 @@
 """Objects, geometry, and relationship metadata share one atomic database."""
-import os
 import sqlite3
 import struct
 from pathlib import Path
 
 import pytest
 import vc
-if os.environ.get("VC_BUILD_PYTHON"):
-    vc.__path__.insert(0, str(Path(os.environ["VC_BUILD_PYTHON"]) / "vc"))
 from vc.objects import ObjectStore
 
 
@@ -209,3 +206,42 @@ with ObjectStore.create({str(tmp_path / 'independent.vcobj')!r}, author='test') 
     assert store.neighbours(a) == [b]
 """
     subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, text=True)
+
+
+def test_real_segment_geometry_and_relationships_roundtrip(store, tmp_path):
+    import json
+    import shutil
+    import uuid
+    np = pytest.importorskip("numpy")
+    tifffile = pytest.importorskip("tifffile")
+    fixtures = Path(__file__).resolve().parents[2] / "core/test/data/segments"
+    ids = []
+    for name in ("20241113070770", "20241113080880"):
+        copied = tmp_path / name
+        shutil.copytree(fixtures / name, copied)
+        metadata = json.loads((copied / "meta.json").read_text())
+        # These real segment fixtures predate canonical UUIDs. Only the copied
+        # metadata identity changes; the measured coordinates remain untouched.
+        uid = str(uuid.uuid5(uuid.NAMESPACE_URL, "vc-test-segment:" + name))
+        metadata["uuid"] = uid
+        (copied / "meta.json").write_text(json.dumps(metadata))
+        assert store.ingest_geometry_source("patch", copied)["ingested"] == 1
+        revision = store.current_geometry(uid)
+        descriptor = revision["arrays"][0]
+        actual = np.frombuffer(store.read_geometry_array(revision["uuid"], "points"), dtype="<f4").reshape(descriptor["shape"])
+        expected = np.stack([tifffile.imread(copied / f"{axis}.tif") for axis in "xyz"], axis=-1)
+        np.testing.assert_array_equal(actual, expected)
+        ids.append(uid)
+    edge = store.add_edge({"kind": "fixture-relationship", "a": ids[0], "b": ids[1]})
+    store.set_approval(edge, "approved")
+    store.checkpoint()
+    with ObjectStore.open(store.path, read_only=True) as reader:
+        assert reader.neighbours(ids[0]) == [ids[1]]
+        assert reader.edge(edge)["approval_state"] == "approved"
+        revision = reader.current_geometry(ids[0])
+        points = reader.read_geometry_array(revision["uuid"], "points")
+        reader.export_geometry(ids[0], tmp_path / "export")
+    with ObjectStore.create(str(tmp_path / "roundtrip.vcobj"), author="test") as restored:
+        assert restored.ingest_geometry_source("patch", tmp_path / "export")["ingested"] == 1
+        revision = restored.current_geometry(ids[0])
+        assert restored.read_geometry_array(revision["uuid"], "points") == points

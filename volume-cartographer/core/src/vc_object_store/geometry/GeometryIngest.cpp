@@ -3,9 +3,9 @@
 #include "vc/core/util/Tiff.hpp"
 #include "vc/core/util/PackedTrackStore.hpp"
 #include "vc/core/util/Uuid.hpp"
-#include "ObjectFiberInput.hpp"
-#include "ObjectPatchInput.hpp"
-#include "ObjectTrackInput.hpp"
+#include "formats/FiberInput.hpp"
+#include "formats/PatchInput.hpp"
+#include "formats/TrackInput.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <bit>

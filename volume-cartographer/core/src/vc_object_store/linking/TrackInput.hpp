@@ -1,7 +1,7 @@
 #pragma once
 #include "vc/core/graph_links/GraphLinks.hpp"
 #include "vc/core/util/PackedTrackStore.hpp"
-#include "ObjectTrackInput.hpp"
+#include "formats/TrackInput.hpp"
 #include <set>
 namespace vc::graph_links::detail {
 // Normalize before deduplication so casing variants select one object.

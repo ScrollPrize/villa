@@ -278,3 +278,39 @@ use one logical writable store per identity rather than editing divergent copies
 JSON export/import remains a metadata snapshot format. Export rejects selected
 objects with managed geometry instead of discarding payloads and revision bindings.
 Use a complete database backup for those objects.
+
+## Implementation layout and validation
+
+Implementation and target definitions are grouped in `core/src/vc_object_store/`.
+`vc_objects` owns the database; `vc_object_geometry` and `vc_graph_links` are
+higher-level adapters, not alternative database owners.
+
+| Location | Responsibility |
+| --- | --- |
+| `Database.cpp`, `Transactions.cpp` | Opening, connection lifetime, transactions, checkpointing |
+| `Records.cpp`, `Metadata.cpp` | Object records, annotations, approval, and journal |
+| `SourcePaths.cpp`, `Snapshots.cpp` | Source lookup and metadata JSON snapshots |
+| `geometry/` | Revision/chunk storage and native geometry ingestion/export |
+| `relationships/` | Edge CRUD, traversal, and geometry revision validation |
+| `imports/` | Separate fiber, patch, and track metadata registration |
+| `linking/` | Geometry detectors that propose relationship metadata |
+| `formats/`, `internal/` | Shared source-format helpers and private SQLite machinery |
+
+The source import APIs have explicit public headers under
+`vc/core/objects/import/`: `FiberImport.hpp`, `PatchImport.hpp`, and
+`TrackImport.hpp`. Including `ObjectStore.hpp` alone exposes database operations,
+not filesystem import entry points.
+
+Build and run the affected tests:
+
+```sh
+ninja -C build
+QT_QPA_PLATFORM=offscreen ctest --test-dir build --output-on-failure \
+  -R '^(test_object_store|test_graph_db|test_graph_links|test_progress|graph_db_controller)$'
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_BUILD_PYTHON=build/python .venv/bin/python -m pytest \
+  python/tests/test_objects.py python/tests/test_graph.py python/tests/test_graph_objects.py -q
+```
+
+`VC_BUILD_PYTHON` selects the built package before any installed editable copy
+loads its native libraries. Plugin autoload is disabled to avoid unrelated
+application plugins in the shared development environment.

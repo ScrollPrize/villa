@@ -14,18 +14,6 @@ endif()
 target_compile_features(vc_fiber_collection PUBLIC cxx_std_20)
 set_target_properties(vc_fiber_collection PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-# Standalone object database, including relationship metadata; no CT/Qt dependencies.
-add_library(vc_objects STATIC src/ObjectRecords.cpp src/ObjectStore.cpp src/ObjectRelationships.cpp)
-target_include_directories(vc_objects PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-if(TARGET SQLite3::SQLite3)
-    target_link_libraries(vc_objects PUBLIC SQLite3::SQLite3)
-else()
-    target_link_libraries(vc_objects PUBLIC SQLite::SQLite3)
-endif()
-target_link_libraries(vc_objects PRIVATE nlohmann_json::nlohmann_json OpenSSL::Crypto)
-target_compile_features(vc_objects PUBLIC cxx_std_20)
-set_target_properties(vc_objects PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
 # Shared with Spiral's native Python adapter; independent of geometry/Qt/Python.
 add_library(vc_track_crossings STATIC src/TrackCrossings.cpp)
 target_include_directories(vc_track_crossings PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -33,24 +21,8 @@ target_link_libraries(vc_track_crossings PRIVATE OpenMP::OpenMP_CXX)
 target_compile_features(vc_track_crossings PUBLIC cxx_std_20)
 set_target_properties(vc_track_crossings PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-# Source-format ingestion/export is separate from the standalone SQLite store.
-add_library(vc_object_geometry STATIC src/GeometryIngest.cpp src/GeometryExport.cpp)
-target_include_directories(vc_object_geometry PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(vc_object_geometry PUBLIC vc_objects PRIVATE vc_core nlohmann_json::nlohmann_json)
-target_compile_features(vc_object_geometry PUBLIC cxx_std_20)
-set_target_properties(vc_object_geometry PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
-# Edge detection layer above vc_objects: geometry passes that propose
-# edges (pending approval, provenance in edge meta). Depends on vc_core
-# for geometry (QuadSurface, SurfacePatchIndex, ...); graph topology and
-# object payload storage remain independent of source-format readers.
-add_library(vc_graph_links STATIC src/GraphLinks.cpp src/GraphLinksPatchOverlap.cpp src/GraphLinksFiberPatch.cpp src/GraphLinksTrackTrack.cpp
-    src/GraphLinksTrackInput.cpp src/GraphLinksLinePatch.cpp src/GraphLinksTrackPatch.cpp
-    src/GraphLinksPointCollectionPatch.cpp)
-target_include_directories(vc_graph_links PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(vc_graph_links PUBLIC vc_objects PRIVATE vc_track_crossings vc_core vc_lasagna nlohmann_json::nlohmann_json)
-target_compile_features(vc_graph_links PUBLIC cxx_std_20)
-set_target_properties(vc_graph_links PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# Object storage and its adapters have their own source/build boundary.
+add_subdirectory(src/vc_object_store)
 
 add_library(vc_core
         src/CtSheetNormal.cpp

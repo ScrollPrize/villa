@@ -1,3 +1,6 @@
+#include "vc/core/objects/import/TrackImport.hpp"
+#include "vc/core/objects/import/PatchImport.hpp"
+#include "vc/core/objects/import/FiberImport.hpp"
 #include "StorageBindings.hpp"
 #include "vc/core/objects/ObjectStore.hpp"
 #include "vc/core/graph_links/GraphLinks.hpp"

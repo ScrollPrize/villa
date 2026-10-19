@@ -1,5 +1,5 @@
 #pragma once
-#include "ObjectStoreInternal.hpp"
+#include "internal/Database.hpp"
 namespace vc::objects { namespace {
 const char* kObjectSchema = R"SQL(CREATE TABLE objects(
   id INTEGER PRIMARY KEY,

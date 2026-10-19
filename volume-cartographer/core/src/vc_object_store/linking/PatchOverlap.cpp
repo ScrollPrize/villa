@@ -10,7 +10,7 @@
 // commitCandidates(); no merged geometry is produced here.
 
 #include "vc/core/graph_links/GraphLinks.hpp"
-#include "ObjectPatchInput.hpp"
+#include "formats/PatchInput.hpp"
 
 #include <algorithm>
 #include <array>
