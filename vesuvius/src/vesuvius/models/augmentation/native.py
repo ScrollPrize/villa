@@ -1,4 +1,4 @@
-"""Dataset integration for vc_reader.augment (no augmentation kernels in Python).
+"""Dataset integration for vc_reader.transforms (no augmentation kernels in Python).
 
 Epoch and draw identity travel with sampler indices, so persistent DataLoader
 workers see epoch updates without shared mutable RNG or worker-local counters.
@@ -40,11 +40,14 @@ class AugmentationSampler:
 
 def apply_native(pipeline, sample, index, run_seed, *, profile=False, inplace=False):
     """Adapt sampler identity to the native pipeline's explicit seed argument."""
-    from vc_reader.augment import seed
+    from vc_reader.transforms import seed
 
     token = index if isinstance(index, AugmentationIndex) else AugmentationIndex(int(index))
-    return pipeline(sample, seed=seed(int(run_seed), token.epoch, token.index, token.draw, token.view),
-                    profile=profile, inplace=inplace)
+    result = pipeline(sample, seed=seed(int(run_seed), token.epoch, token.index, token.draw, token.view),
+                      profile=profile, inplace=inplace)
+    if profile:
+        result["_aug_perf"] = result.pop("_transform_perf")
+    return result
 
 
 class AugmentedDataset:

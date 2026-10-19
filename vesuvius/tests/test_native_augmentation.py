@@ -4,7 +4,8 @@ import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
-A = pytest.importorskip("vc_reader.augment")
+pytest.importorskip("vc_reader")
+from vc_reader import transforms as A
 from vesuvius.models.augmentation.native import (
     AugmentationIndex, AugmentationSampler, AugmentedDataset,
 )
@@ -81,7 +82,8 @@ def test_zarr_dataset_native_hook_without_io():
         targets={"image": A.Image(), "ink": A.Label(), "padding_mask": A.ValidMask()})
     dataset._native_augmentation_seed = 17
     dataset._profile_augmentations = True
-    dataset.transforms = None
+    dataset._initialize_transforms()
+    assert dataset.transforms is None
     result = dataset[AugmentationIndex(0, epoch=2)]
     np.testing.assert_array_equal(result["image"].numpy()[0], image[:, ::-1])
     np.testing.assert_array_equal(result["ink"].numpy()[0], (image > 10)[:, ::-1])
@@ -95,3 +97,11 @@ def test_dataset_can_reuse_fresh_reader_style_buffers():
     inplace = pickle.loads(pickle.dumps(inplace))
     token = AugmentationIndex(2, epoch=3, draw=4)
     torch.testing.assert_close(inplace[token]["image"], safe[token]["image"], rtol=0, atol=0)
+
+
+def test_native_profile_uses_training_metric_key():
+    dataset = AugmentedDataset(Patches(), A.Pipeline([A.BrightnessAdd(.5)]), profile=True)
+    result = dataset[0]
+    assert set(result['_aug_perf']) == {'0'}
+    assert result['_aug_perf']['0'] >= 0
+    assert '_transform_perf' not in result

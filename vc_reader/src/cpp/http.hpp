@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -49,6 +50,8 @@ struct HttpResponse {
     long status = 0;
     std::string etag, modified, content_range;
     std::size_t bytes = 0;
+    std::optional<std::size_t> content_length;
+    std::string content_encoding;
 };
 
 class HttpClient {
@@ -121,7 +124,8 @@ public:
     // caller-owned sink. Exceptions from callbacks never cross the C ABI.
     HttpResponse get_stream(const std::string& url, std::function<void()> reset,
                             std::function<void(const char*, std::size_t)> write,
-                            const std::vector<std::pair<std::string, std::string>>& extra = {}, long body_status = 200)
+                            const std::vector<std::pair<std::string, std::string>>& extra = {}, long body_status = 200,
+                            std::function<void(const HttpResponse&)> begin_body = {})
     {
         Lease lease(*this);
         CURL* h = lease.handle;
@@ -131,7 +135,7 @@ public:
         std::string last_error;
         for (int attempt = 0; attempt <= options_.retries; ++attempt) {
             reset();
-            Transfer transfer{write, body_status};
+            Transfer transfer{write, body_status, begin_body};
             curl_easy_reset(h);
             curl_easy_setopt(h, CURLOPT_URL, url.c_str());
             curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
@@ -220,6 +224,7 @@ private:
     struct Transfer {
         std::function<void(const char*, std::size_t)>& sink;
         long body_status;
+        std::function<void(const HttpResponse&)>& begin_body;
         HttpResponse response;
         std::string snippet;
         std::exception_ptr error;
@@ -233,6 +238,7 @@ private:
             if (t.body_status == 206 && t.response.status == 200)
                 throw std::runtime_error("server ignored HTTP Range; refusing a whole-shard download");
             if (t.response.status == t.body_status) {
+                if (!t.response.bytes && t.begin_body) t.begin_body(t.response);
                 t.sink(data, n);
                 t.response.bytes += n;
             } else if (t.snippet.size() < 300) t.snippet.append(data, std::min(n, 300-t.snippet.size()));
@@ -258,6 +264,8 @@ private:
                 if (name == "etag") t.response.etag = value;
                 if (name == "last-modified") t.response.modified = value;
                 if (name == "content-range") t.response.content_range = value;
+                if (name == "content-length") t.response.content_length = std::stoull(value);
+                if (name == "content-encoding") t.response.content_encoding = value;
             }
             return n;
         } catch (...) { t.error = std::current_exception(); return 0; }

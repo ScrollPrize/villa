@@ -11,10 +11,13 @@ import multiprocessing
 import os
 from pathlib import Path
 import pickle
+import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
+import zlib
 from unittest.mock import patch
 
 import numpy as np
@@ -28,8 +31,8 @@ if os.environ.get('VC_READER_BUILD_DIR'):
 
 from vc_reader import (Affine, Companion, Encoding, Frame, LevelRequest, Plane, QueryContext,
                        Selection, Source, Storage, VolumeRegistration, CacheMissError)
-from vc_reader.reader import S3Credentials
-from vc_reader.reader.disk_cache import disk_budget
+from vc_reader.reader import S3Credentials, MemoryCache, ZarrReader
+from vc_reader.reader.disk_cache import disk_budget, decoded_cache_path
 
 
 def process_read(reader):
@@ -37,6 +40,11 @@ def process_read(reader):
         return reader.read((0, 0), (3, 4))
     finally:
         reader.close()
+
+
+def read_remote_source(source, options):
+    with source.open(**options) as reader:
+        return reader.read((0, 0), (5, 7))
 
 
 def array(path, data, attrs=None, fill=0):
@@ -66,6 +74,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        hook = getattr(self.server, 'request_hook', None)
+        if hook is not None and hook(self):
+            return
         ignore_range = self.path.startswith('/ignore-range/')
         bad_range = self.path.startswith('/bad-range/')
         with self.lock:
@@ -380,6 +391,194 @@ class RemoteFixtureCase(FixtureCase):
 
 
 class RemoteTests(RemoteFixtureCase):
+    def test_shared_memory_cache_separates_lossy_and_exact_reads(self):
+        data = np.arange(64, dtype=np.uint8).reshape(4, 4, 4)
+        array(self.root/'volume.zarr', data)
+        url = self.url+'/volume.zarr'
+        metadata = json.loads((self.root/'volume.zarr/.zarray').read_text())
+        lossy = Path(decoded_cache_path(self.cache, url))
+        lossy.mkdir(parents=True)
+        (lossy/'.zarray').write_text(json.dumps(dict(metadata, compressor={'id': 'vc-delta3d', 'quant': 8})))
+        (lossy/'.zattrs').write_text(json.dumps({'vc_reader': {'source_url': url, 'source_zarray': metadata}}))
+        # VC-Delta3D quant=8 payload for arange(64).reshape(4,4,4), compressed
+        # here with zlib to keep the fixture independent of Python codec extras.
+        (lossy/'0.0.0').write_bytes(zlib.decompress(base64.b64decode(
+            'eJxzMXYxZGTkmMjCwMAAww48DCiggYG+fAeGUTCQYJ55hSUriMGoaMOChZ4/hxHIxi3PsNbye8Pe6v8A9AcPSA==')))
+        memory = MemoryCache(4096)
+        with ZarrReader.open(url, cache_dir=self.cache, allow_lossy_cache=True,
+                             memory_cache=memory, cache_writes=False) as reader:
+            quantized = reader[:]
+            self.assertTrue(np.any(quantized != data))
+        exact_cache = self.root/'exact'
+        with ZarrReader.open(url, cache_dir=exact_cache, memory_cache=memory) as reader:
+            np.testing.assert_array_equal(reader[:], data)
+        # An exact cache hit stays available to another exact reader offline.
+        with ZarrReader.open(url, cache_dir=exact_cache, memory_cache=memory, offline=True) as reader:
+            np.testing.assert_array_equal(reader[:], data)
+            self.assertEqual(reader.stats()['memory_hits'], 1)
+        with ZarrReader.open(url, cache_dir=self.cache, memory_cache=memory,
+                             allow_lossy_cache=True, offline=True) as reader:
+            np.testing.assert_array_equal(reader[:], quantized)
+
+    def test_unrelated_downloads_overlap_with_a_shared_cache(self):
+        for processes in (False, True):
+            with self.subTest(processes=processes):
+                barrier = threading.Barrier(4, timeout=10)
+                def hook(handler):
+                    if not handler.path.startswith('/parallel/'):
+                        return False
+                    try:
+                        barrier.wait()
+                    except threading.BrokenBarrierError:
+                        handler.send_error(400, 'downloads were serialized')
+                        return True
+                    handler.path = '/' + handler.path.rsplit('/', 1)[-1]
+                    return False
+                self.server.request_hook = hook
+                for i in range(4):
+                    Image.fromarray(self.data+i).save(self.root/f'{i}.png')
+                cache = self.cache/str(processes)
+                sources = [Source(str(i), Storage(self.url+f'/parallel/{i}.png', 'png')) for i in range(4)]
+                options = dict(cache_dir=cache, cache_max_bytes=4096)
+                if processes:
+                    with multiprocessing.get_context('spawn').Pool(4) as pool:
+                        results = pool.starmap(read_remote_source, [(s, options) for s in sources])
+                else:
+                    with ThreadPoolExecutor(4) as pool:
+                        results = list(pool.map(lambda s: read_remote_source(s, options), sources))
+                for i, result in enumerate(results):
+                    np.testing.assert_array_equal(result, self.data+i)
+                self.assertFalse(barrier.broken)
+                self.assertEqual(list(cache.rglob('*.tmp.*')), [])
+                with sqlite3.connect(cache/'.vc_reader_cache.sqlite3') as db:
+                    self.assertEqual(db.execute('select count(*) from downloads').fetchone()[0], 0)
+
+    def test_live_download_survives_another_cache_owner_and_budget_pressure(self):
+        from vc_reader import _reader
+        payload = (self.root/'image.png').read_bytes()
+        release = threading.Event()
+        def hook(handler):
+            if handler.path != '/held.png':
+                return False
+            handler.send_response(200)
+            handler.send_header('Content-Length', str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload[:len(payload)//2])
+            handler.wfile.flush()
+            if release.wait(15):
+                handler.wfile.write(payload[len(payload)//2:])
+            return True
+        self.server.request_hook = hook
+        options = dict(cache_dir=self.cache, cache_max_bytes=len(payload))
+        held = Source('held', Storage(self.url+'/held.png', 'png'))
+        other = Source('other', Storage(self.url+'/image.png', 'png'))
+        with ThreadPoolExecutor(2) as pool:
+            first = pool.submit(read_remote_source, held, options)
+            try:
+                deadline = time.monotonic()+10
+                while time.monotonic() < deadline:
+                    temporary = list(self.cache.rglob('*.tmp.*'))
+                    if temporary and temporary[0].stat().st_size:
+                        break
+                    time.sleep(.01)
+                else:
+                    self.fail('download did not start writing')
+                # A separately opened native owner runs the same reconciliation
+                # as a newly started worker, while the first transfer is live.
+                owner = _reader.DiskCache(str(self.cache), -1)
+                self.assertTrue(temporary[0].exists())
+                with sqlite3.connect(self.cache/'.vc_reader_cache.sqlite3') as db:
+                    reserved = db.execute('select sum(size) from downloads').fetchone()[0]
+                    self.assertEqual(reserved, len(payload))
+                with self.assertRaisesRegex(RuntimeError, 'active download'):
+                    owner.set_max_bytes(len(payload)-1)
+                second = pool.submit(read_remote_source, other, options)
+                # Other network requests may begin, but cannot consume the
+                # reserved bytes until the first download publishes.
+                deadline = time.monotonic()+5
+                while self.counts.get('/image.png', 0) == 0 and time.monotonic() < deadline:
+                    time.sleep(.01)
+                self.assertEqual(self.counts.get('/image.png'), 1)
+                self.assertFalse(second.done())
+                with sqlite3.connect(self.cache/'.vc_reader_cache.sqlite3') as db:
+                    total, limit = db.execute('select total,max_bytes from budget').fetchone()
+                    reserved = db.execute('select sum(size) from downloads').fetchone()[0]
+                    self.assertLessEqual(total+reserved, limit)
+            finally:
+                release.set()
+            np.testing.assert_array_equal(first.result(10), self.data)
+            np.testing.assert_array_equal(second.result(10), self.data)
+        self.assertLessEqual(sum(p.stat().st_size for p in self.cache.rglob('*.blob')), len(payload))
+        self.assertEqual(list(self.cache.rglob('*.tmp.*')), [])
+
+    def test_abandoned_download_releases_its_reservation(self):
+        payload = (self.root/'image.png').read_bytes()
+        release = threading.Event()
+        def hook(handler):
+            if handler.path != '/abandoned.png':
+                return False
+            handler.send_response(200)
+            handler.send_header('Content-Length', str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload[:len(payload)//2])
+            handler.wfile.flush()
+            release.wait(15)
+            return True
+        self.server.request_hook = hook
+        disk_budget(str(self.cache), len(payload))
+        source = Source('abandoned', Storage(self.url+'/abandoned.png', 'png'))
+        process = multiprocessing.get_context('spawn').Process(
+            target=read_remote_source, args=(source, dict(cache_dir=self.cache)))
+        process.start()
+        try:
+            deadline = time.monotonic()+10
+            while time.monotonic() < deadline:
+                temporary = list(self.cache.rglob('*.tmp.*'))
+                if temporary and temporary[0].stat().st_size:
+                    break
+                time.sleep(.01)
+            else:
+                self.fail('download did not start writing')
+            process.terminate()
+            process.join(5)
+            self.assertFalse(process.is_alive())
+            with sqlite3.connect(self.cache/'.vc_reader_cache.sqlite3') as db:
+                self.assertEqual(db.execute('select sum(size) from downloads').fetchone()[0], len(payload))
+            other = Source('other', Storage(self.url+'/image.png', 'png'))
+            # Reuse the already-open parent cache, so admission (not startup)
+            # must reclaim the dead worker's reservation to make progress.
+            np.testing.assert_array_equal(read_remote_source(other, dict(cache_dir=self.cache)), self.data)
+            with sqlite3.connect(self.cache/'.vc_reader_cache.sqlite3') as db:
+                self.assertEqual(db.execute('select count(*) from downloads').fetchone()[0], 0)
+            self.assertEqual(list(self.cache.rglob('*.tmp.*')), [])
+        finally:
+            release.set()
+            if process.is_alive():
+                process.terminate()
+            process.join(5)
+
+    def test_unsized_and_http_compressed_images_respect_the_payload_budget(self):
+        import gzip
+        payload = (self.root/'image.png').read_bytes()
+        def hook(handler):
+            compressed = handler.path == '/gzip.png'
+            body = gzip.compress(payload) if compressed else payload
+            handler.send_response(200)
+            if compressed:
+                handler.send_header('Content-Encoding', 'gzip')
+                handler.send_header('Content-Length', str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+            return True
+        self.server.request_hook = hook
+        for name in ('unsized', 'gzip'):
+            source = Source(name, Storage(self.url+f'/{name}.png', 'png'))
+            options = dict(cache_dir=self.cache/name, cache_max_bytes=len(payload))
+            np.testing.assert_array_equal(read_remote_source(source, options), self.data)
+            with self.assertRaisesRegex(RuntimeError, 'cache_max_bytes'):
+                read_remote_source(source, dict(cache_dir=self.cache/(name+'-small'), cache_max_bytes=len(payload)-1))
+        self.assertEqual(list(self.cache.rglob('*.tmp.*')), [])
+
     def test_remote_offline_validation_auth_s3_and_alternatives(self):
         source = Source('remote', Storage(self.url+'/image.png', 'png'))
         with source.open(cache_dir=self.cache) as reader:

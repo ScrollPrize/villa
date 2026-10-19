@@ -212,6 +212,8 @@ public:
     ~AtomicFile() { if (fd_ >= 0) ::close(fd_); if (!tmp_.empty()) ::unlink(tmp_.c_str()); }
     AtomicFile(const AtomicFile&) = delete;
     AtomicFile& operator=(const AtomicFile&) = delete;
+    int fd() const noexcept { return fd_; }
+    const std::string& temporary_path() const noexcept { return tmp_; }
     void reset()
     {
         if (::ftruncate(fd_, 0) || ::lseek(fd_, 0, SEEK_SET) < 0)

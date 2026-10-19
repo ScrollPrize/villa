@@ -145,6 +145,12 @@ a writable cache also has a finite budget. An image larger than the limit raises
 with instructions to increase it. Metadata/index files and filesystem overhead
 are separate from the payload budget.
 
+Different image files download concurrently when the budget has room for their
+in-flight reservations. Responses without a usable Content-Length reserve the
+whole budget. Reducing the limit below active reservations raises; retry after
+the downloads finish. Interrupted workers' reservations are reclaimed using
+file locks, without removing live workers' temporary files.
+
 ETag/Last-Modified revalidation occurs once per image location and reader/process.
 Decoded keys include content identity. Repeated reads use pinned file handles
 and avoid rehashing unchanged content. `offline=True` serves cached files/chunks

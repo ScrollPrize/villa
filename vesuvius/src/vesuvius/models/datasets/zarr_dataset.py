@@ -800,9 +800,9 @@ class ZarrDataset(Dataset):
     def _initialize_transforms(self) -> None:
         """Initialize augmentation transforms."""
         if self._native_augmentation is not None:
-            from vc_reader.augment import Pipeline
+            from vc_reader.transforms import Pipeline
             if not isinstance(self._native_augmentation, Pipeline):
-                raise TypeError("augmentation must be a vc_reader.augment.Pipeline")
+                raise TypeError("augmentation must be a vc_reader.transforms.Pipeline")
             self.transforms = None
             if self._profile_augmentations:
                 self._augmentation_names = [str(i) for i in range(len(self._native_augmentation.transforms))]

@@ -135,7 +135,9 @@ class ZarrReader:
                     write_index = self.cache_layers.index(self.write_layer)
             if self.offline and not self.cache_layers:
                 raise CacheMissError(f"no disk cache of {self.location} under {spec['cache_dirs']} (offline)")
-            identity = key_url
+            # A shared decoded cache must not let quantized reads satisfy an
+            # exact reader, even when both open the same source URL.
+            identity = json.dumps((key_url, bool(spec["allow_lossy_cache"])))
         else:
             root = os.path.abspath(self.location)
             layers = [] if v3 is not None else [("array", root, codec, "", False)]
