@@ -192,9 +192,6 @@ def _read_gray_any(path: str) -> np.ndarray:
                 profiler.add_note(f"Local read byte size unavailable for {path}")
 
 
-LAYER_WINDOW_ATTRS = ("layer_start", "layer_end")
-
-
 def contiguous_layer_window(layer_names: List[str]) -> Tuple[int, int]:
     """Return [first, last + 1) for layer files named by their index (e.g. ``01.tif``).
 
@@ -226,26 +223,11 @@ def resolve_zarr_layer_window(zarr_path: str, start_layer: int, end_layer: int):
 
     A zarr written by the prepare step records its layer window in attrs and already holds only
     [layer_start, layer_end); the requested window is rebased onto it. A zarr without the attrs
-    (an externally built full-depth stack) is indexed with the absolute layer indices as before. The attrs are
-    all-or-nothing: one of the pair without the other, or attrs that cannot be read at all, is an error rather
-    than a fallback.
+    (an externally built full-depth stack) is indexed with the absolute layer indices as before.
     """
-    try:
-        attrs = dict(zarr.open(get_cached_zarr_store(zarr_path), mode="r").attrs)
-    except Exception as exc:
-        # Guessing absolute indices here could silently shift the window again; only attrs that were read and are
-        # absent mean an externally built zarr.
-        raise RuntimeError(f"Could not read the layer-window attrs of {zarr_path}: {exc}") from exc
-    present = [name for name in LAYER_WINDOW_ATTRS if name in attrs]
-    if not present:
+    attrs = zarr.open(get_cached_zarr_store(zarr_path), mode="r").attrs
+    if "layer_start" not in attrs:
         return int(start_layer), int(end_layer)
-    if len(present) != len(LAYER_WINDOW_ATTRS):
-        # Half a window is not a window: filling in the other half from the request would rebase the stack by a
-        # guess, so a partially written or hand-added attribute is an error rather than a legacy or prepared zarr.
-        raise RuntimeError(
-            f"{zarr_path} records only {present[0]!r} of the layer-window attrs {LAYER_WINDOW_ATTRS}; "
-            "a zarr written by the prepare step records both"
-        )
     base, top = int(attrs["layer_start"]), int(attrs["layer_end"])
     if int(start_layer) < base or int(end_layer) > top:
         raise RuntimeError(
