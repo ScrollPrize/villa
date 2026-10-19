@@ -407,8 +407,8 @@ _Widget for creating initial segmentations which can be used for traces or later
 - `Clear all paths` : clears any user drawn paths / points (use this over the clear buttons most of the time)
 - `Start label wraps` : this is used for absolute or relative wrap labels, is not used during the seeding step, will detail in another document
 
-### Object graph
+### Object store
 
-The graph database stores patches, fibers, tracks, and their relationships by UUID.
-See the [object-store guide](docs/objects/README.md) for importing and linking objects,
-querying overlaps and neighbours in Python and C++, and locating their files.
+The object database stores geometry, annotations, and relationships by UUID.
+See the [object-store guide](docs/objects/README.md) for ingesting data, discovering
+relationships, querying objects, and synchronizing stores in Python and C++.
