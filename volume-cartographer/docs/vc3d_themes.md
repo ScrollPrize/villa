@@ -399,5 +399,6 @@ Warnings, such as a misspelled token, also show in the status bar.
   which tokens are known. The icons the template refers to are drawn from
   the `kIconRecipes` table in `ThemeEngine.cpp`.
 - Tests: `apps/VC3D/test/test_theme_engine.cpp` (QtTest, offscreen) checks
-  that every template placeholder and icon is known and that every built-in
-  token is listed in this page's token table.
+  that every template placeholder and icon is known, that every built-in
+  token is listed in this page's token table, and that the built-in themes
+  meet the contrast minimums this page gives.

@@ -60,6 +60,21 @@ bool containsMessage(const ThemeProblems& problems, const QString& text, bool wa
     return false;
 }
 
+// WCAG 2 contrast ratio of two colors.
+double contrast(const QColor& a, const QColor& b)
+{
+    const auto luminance = [](const QColor& color) {
+        const auto channel = [](double c) {
+            return c <= 0.03928 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4);
+        };
+        return 0.2126 * channel(color.redF()) + 0.7152 * channel(color.greenF()) +
+               0.0722 * channel(color.blueF());
+    };
+    const double la = luminance(a);
+    const double lb = luminance(b);
+    return (std::max(la, lb) + 0.05) / (std::min(la, lb) + 0.05);
+}
+
 QString styleName()
 {
     const QStyle* style = QApplication::style();
@@ -138,6 +153,47 @@ private slots:
         QCOMPARE(registry.resolve(QStringLiteral("modern-light"), &problems)->colorScheme,
                  QStringLiteral("light"));
         QVERIFY(registry.resolve(QStringLiteral("classic"), &problems)->colorScheme.isEmpty());
+    }
+
+    void builtinThemesMeetDocumentedContrast()
+    {
+        // The minimums the token table and the accent recipe in
+        // docs/vc3d_themes.md promise.
+        struct Pair
+        {
+            const char* foreground;
+            const char* background;
+            double minimum;
+        };
+        const Pair pairs[] = {
+            {"text", "window", 4.5},
+            {"scroll_handle", "window", 3.0},
+            {"field_border", "window", 3.0},
+            {"progress_chunk", "progress_track", 3.0},
+            {"progress_text", "progress_chunk", 4.5},
+            {"progress_text", "progress_track", 4.5},
+            {"accent_soft_text", "accent_soft", 4.5},
+            {"text", "item_selected", 4.5},
+            {"on_accent", "accent_fill", 4.5},
+            {"selection_text", "selection", 4.5},
+            {"accent", "border", 3.0},
+        };
+        ThemeRegistry registry;
+        for (const char* id : {kModernDarkId, kModernLightId}) {
+            ThemeProblems problems;
+            const auto theme = registry.resolve(QString::fromLatin1(id), &problems);
+            QVERIFY2(theme, qPrintable(formatProblems(problems)));
+            for (const Pair& pair : pairs) {
+                const double ratio = contrast(QColor(theme->tokens.value(QLatin1String(pair.foreground))),
+                                              QColor(theme->tokens.value(QLatin1String(pair.background))));
+                QVERIFY2(ratio >= pair.minimum,
+                         qPrintable(QStringLiteral("%1: %2 on %3 is %4:1, below %5:1")
+                                        .arg(QLatin1String(id), QLatin1String(pair.foreground),
+                                             QLatin1String(pair.background))
+                                        .arg(ratio, 0, 'f', 2)
+                                        .arg(pair.minimum)));
+            }
+        }
     }
 
     void templatePlaceholdersAreKnown()
