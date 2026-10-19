@@ -115,22 +115,29 @@ class CNNEmbeddingTests(unittest.TestCase):
         torch.manual_seed(23)
         recipe = Path(__file__).resolve().parents[1] / "dinovol_2/configs/pretrain_8_9um.json"
         recipe_config = json.loads(recipe.read_text())
-        config = recipe_config["model"]
+        config = dict(recipe_config["model"])
         self.assertEqual(config["global_crops_size"], [128] * 3)
         self.assertEqual(config["local_crops_size"], [64] * 3)
         self.assertEqual(recipe_config["dataset"]["global_crop_size"], config["global_crops_size"])
         self.assertEqual(recipe_config["dataset"]["local_crop_size"], config["local_crops_size"])
-        self.assertEqual(recipe_config["dataset"]["num_local_crops"], 2)
+        self.assertEqual(recipe_config["dataset"]["num_global_crops"], 2)
+        self.assertEqual(recipe_config["dataset"]["num_local_crops"], 4)
+        self.assertEqual(recipe_config["batch_size"], 12)
+        self.assertEqual(recipe_config["grad_accumulation_steps"], 2)
         resolved = _materialize_backbone_config(config)
-        self.assertEqual(resolved["embed_dim"], 288)
-        self.assertEqual(resolved["num_heads"], 6)
+        self.assertEqual(resolved["embed_dim"], 480)
+        self.assertEqual(resolved["num_heads"], 10)
         self.assertEqual(resolved["depth"], 10)
         self.assertEqual(resolved["attention_type"], "full")
+        self.assertEqual(resolved["rope_type"], "mixed")
+        self.assertEqual(resolved["mlp_ratio"], 7.2)
+        self.assertTrue(resolved["grad_checkpointing"])
         self.assertEqual(resolved["patch_size"], (8, 8, 8))
-        self.assertEqual(resolved["deeper_embed_stage_channels"], [16, 48, 128, 192])
+        self.assertEqual(resolved["deeper_embed_stage_channels"], [32, 64, 128, 256])
         self.assertEqual(resolved["deeper_embed_stage_strides"], [1, 2, 2, 2])
         self.assertEqual(resolved["deeper_embed_depth_per_level"], [1, 2, 2, 1])
         self.assertTrue(resolved["deeper_embed_use_stem"])
+        self.assertEqual(resolved["deeper_embed_stem_channels"], 32)
         self.assertTrue(resolved["deeper_embed_final_projection"])
         # Keep the recipe's architecture, but use a small crop for CPU validation.
         config.update(global_crops_size=[32] * 3, local_crops_size=[32] * 3)
@@ -140,19 +147,20 @@ class CNNEmbeddingTests(unittest.TestCase):
         for block in blocks:
             self.assertEqual(block.attention_type, "full")
             self.assertEqual(len(block.axial_attns), 0)
-            self.assertEqual(block.mlp.fc1.in_features, 288)
-            self.assertEqual(block.mlp.fc1.out_features, 4096)  # Two 2048-wide SwiGLU branches.
-            self.assertEqual(block.mlp.fc2.in_features, 2048)
-            self.assertEqual(block.mlp.fc2.out_features, 288)
+            self.assertEqual(block.attn.num_heads, 10)
+            self.assertEqual(block.mlp.fc1.in_features, 480)
+            self.assertEqual(block.mlp.fc1.out_features, 6912)  # Two 3456-wide SwiGLU branches.
+            self.assertEqual(block.mlp.fc2.in_features, 3456)
+            self.assertEqual(block.mlp.fc2.out_features, 480)
         encoder = backbone.down_projection
         stem_convs = [module for module in encoder.stem.modules() if isinstance(module, nn.Conv3d)]
         self.assertEqual(len(stem_convs), 1)
-        self.assertEqual((stem_convs[0].in_channels, stem_convs[0].out_channels), (1, 16))
+        self.assertEqual((stem_convs[0].in_channels, stem_convs[0].out_channels), (1, 32))
         self.assertEqual(stem_convs[0].kernel_size, (3, 3, 3))
         self.assertEqual(stem_convs[0].stride, (1, 1, 1))
         # The last stage is projected to the embedding width by a 1x1x1 convolution.
         self.assertIsInstance(encoder.final_proj, nn.Conv3d)
-        self.assertEqual((encoder.final_proj.in_channels, encoder.final_proj.out_channels), (192, 288))
+        self.assertEqual((encoder.final_proj.in_channels, encoder.final_proj.out_channels), (256, 480))
         self.assertEqual(encoder.final_proj.kernel_size, (1, 1, 1))
         self.assertEqual([len(stage.blocks) for stage in encoder.stages], [1, 2, 2, 1])
         for module in encoder.modules():
@@ -170,12 +178,12 @@ class CNNEmbeddingTests(unittest.TestCase):
         finally:
             for handle in handles:
                 handle.remove()
-        self.assertEqual(shapes, [(1, 16, 32, 32, 32), (1, 16, 32, 32, 32),
-                                  (1, 48, 16, 16, 16), (1, 128, 8, 8, 8),
-                                  (1, 192, 4, 4, 4)])
+        self.assertEqual(shapes, [(1, 32, 32, 32, 32), (1, 32, 32, 32, 32),
+                                  (1, 64, 16, 16, 16), (1, 128, 8, 8, 8),
+                                  (1, 256, 4, 4, 4)])
         tokens = features["x_norm_patchtokens"]
-        self.assertEqual(tuple(tokens.shape), (1, 64, 288))
-        self.assertEqual(tuple(features["x_norm_clstoken"].shape), (1, 288))
+        self.assertEqual(tuple(tokens.shape), (1, 64, 480))
+        self.assertEqual(tuple(features["x_norm_clstoken"].shape), (1, 480))
         (tokens * torch.randn_like(tokens)).sum().backward()
         self.assertIsNotNone(stem_convs[0].weight.grad)
         self.assertTrue(torch.isfinite(stem_convs[0].weight.grad).all())

@@ -37,19 +37,20 @@ To select the new defaults, set `model.model_type` to `v3`:
 ## Pretraining on 8–9 µm scroll volumes
 
 [`dinovol_2/configs/pretrain_8_9um.json`](dinovol_2/configs/pretrain_8_9um.json)
-is a standalone base-pretraining config with 128³ global crops, 64³ local crops,
-and `volume_scale: 0` for every volume. It uses a CNN feeding a width-288 `v3`
-backbone with 10 full-attention transformer blocks, a 2,048-wide SwiGLU FFN, and six attention
-heads, batch size 16 per GPU without gradient checkpointing, two global views,
-and two local views. Gram and
-point supervision are disabled for this initial stage.
-The FFN uses `mlp_ratio: 7.111111111111111` (2,048 / 288); its packed input
-projection produces two 2,048-wide branches before gating.
+is a standalone pretraining config with 128³ global crops and 64³ local crops.
+Volumes use pyramid level 0 or 2 to target roughly 8–9 µm voxels, as listed below.
+It uses a CNN feeding a width-480 `v3` backbone with 10 full-attention transformer
+blocks, a 3,456-wide SwiGLU FFN, 10 attention heads, and mixed RoPE. The recipe uses
+batch size 12 per GPU, two gradient-accumulation steps, gradient checkpointing,
+two global views, and four local views. Pseudo-object losses are enabled; Gram
+and point supervision are disabled.
+The FFN uses `mlp_ratio: 7.2` (3,456 / 480); its packed input projection produces
+two 3,456-wide branches before gating.
 
 Compilation is enabled for this recipe with the top-level setting:
 
 ```json
-"compile": {"enabled": true, "backend": "inductor", "mode": "default", "dynamic": {"backbone": false}}
+"compile": {"enabled": true, "backend": "inductor", "mode": "max-autotune-no-cudagraphs", "dynamic": {"backbone": false}}
 ```
 
 The trainer compiles the student and teacher backbones (CNN plus transformer)
@@ -106,9 +107,11 @@ a config sets it:
   compile time and keeps the fastest. The first launch compiles for about 13
   minutes; the inductor cache makes later launches fast.
 
-Optimizer-step time of `pretrain_8_9um.json` on one H100 (batch 16, 2 accumulation
-steps, `train_step` on real batches preloaded into memory so there is no data
-wait; median of 10 steps after 6 warmup steps):
+Historical optimizer-step measurements used an earlier version of
+`pretrain_8_9um.json` with width 288, a 2,048-wide FFN, a 16-channel CNN stem,
+and two local views. They do not measure the current recipe. On one H100
+(batch 16, 2 accumulation steps, `train_step` on real batches preloaded into
+memory so there is no data wait; median of 10 steps after 6 warmup steps):
 
 | setting | s/step | samples/s |
 | --- | --- | --- |
@@ -117,8 +120,8 @@ wait; median of 10 steps after 6 warmup steps):
 | + `model.attention_backend: "cudnn"` | 1.389 | 23.0 |
 | + `compile.mode: "max-autotune-no-cudagraphs"` | 1.350 | 23.7 |
 
-The GPU is the bottleneck (97–100% utilization in training; the loaders supply
-about 46 samples/s). The largest remaining cost is the CNN embedding's
+In those measurements, the GPU was the bottleneck (97–100% utilization in
+training; the loaders supplied about 46 samples/s). The largest cost was the CNN embedding's
 full-resolution layers: with 16 channels, a 16→16 3×3×3 convolution at 128³ runs
 at about 87 TFLOPS, against about 600 TFLOPS for 128→128 at 32³ with the same
 arithmetic, because the narrow channel dimension leaves tensor-core tiles
@@ -166,11 +169,11 @@ mostly empty.
   (dropped connections, truncated responses, timeouts) with doubling backoff,
   re-reading the same window, so a single dropped S3 connection no longer kills
   a run. Each retry is printed to stderr.
-- `dataset.gaussian_blur: false` and `dataset.global_crop_scale: [0.18, 0.45]` /
+- `dataset.gaussian_blur: true` and `dataset.global_crop_scale: [0.18, 0.45]` /
   `dataset.local_crop_scale: [0.023, 0.057]`: views are resampled only 0.87–1.18×
   from the 192³ source window (global 108–147 → 128 voxels, local 55–74 → 64)
-  and are never blurred, so one-voxel structures survive augmentation. The zoom
-  range still covers the 7.9–9.4 µm spread in voxel size between scans.
+  with Gaussian blur enabled as part of the augmentation. The zoom range
+  covers the 7.9–9.4 µm spread in voxel size between scans.
 - `num_workers: 24`, `prefetch_factor: 2`, `persistent_workers: true`: with
   read-ahead, one worker produces about 1.8 samples/s (augmentation-bound), so 24
   workers comfortably exceed the GPU's ~20 samples/s on an H100.
@@ -195,41 +198,41 @@ Full-attention checkpoints keep their existing parameter layout when
 `attention_type` is omitted. Switching to axial adds parameters and requires
 a matching checkpoint or a new training run.
 
-The CNN uses the existing `deeper` embedding with a 16-channel full-resolution
+The CNN uses the existing `deeper` embedding with a 32-channel full-resolution
 stem: one 3×3×3 stride-1 convolution, normalization, and activation. Four residual
-stages follow, with 16, 48, 128, and 192 channels, strides 1, 2, 2, and 2, and
+stages follow, with 32, 64, 128, and 256 channels, strides 1, 2, 2, and 2, and
 1, 2, 2, and 1 basic residual blocks (two 3×3×3 convolutions per block).
 The first stage operates entirely at full resolution; subsequent stages
 downsample in the first convolution of their first block. This gives three
 convolutions before the first downsampling, enough to resolve one-voxel
 structure while keeping full-resolution activations small. Capacity sits in the
-64³ and 32³ stages; a single 192-channel block at token resolution is followed
-by a 1×1×1 projection to the 288-wide EVA tokens. Residual skip connections
+64³ and 32³ stages; a single 256-channel block at token resolution is followed
+by a 1×1×1 projection to the 480-wide EVA tokens. Residual skip connections
 retain their channel projections. Total stride is 8, giving 4,096 global
-tokens and 512 local tokens, before CLS/register tokens. The CNN has 3.5M
-parameters and the backbone 24.5M; the CNN trains at the full learning rate
+tokens and 512 local tokens, before CLS/register tokens. The CNN trains at the full learning rate
 (`patch_embed_lr_mult: 1.0`).
 
 The recipe uses a 192³ source sampling window, from which augmented crops are
 drawn. CNN convolutions use zero padding, and the model receives exactly the
 128³ global and 64³ local crops. There is no halo expansion, extra context read,
-or cropping of the embedded grid. The output directory is
-`dinovol_pretrain_8_9um_cnn192proj_10blocks_ffn2048_full_g128_p8_stem16/` to avoid automatically resuming
-incompatible checkpoints from earlier architectures.
+or cropping of the embedded grid. The recipe retains the historical output-directory
+name `dinovol_pretrain_8_9um_cnn192proj_10blocks_ffn2048_full_g128_p8_stem16/`;
+that name no longer describes its architecture. Since automatic resume is enabled,
+use a fresh output directory for a new architecture unless its checkpoint is compatible.
 
 The configurable CNN options under `model` are:
 
 ```json
 {
   "embedding_type": "deeper",
-  "embed_dim": 288,
-  "num_heads": 6,
+  "embed_dim": 480,
+  "num_heads": 10,
   "patch_size": [8, 8, 8],
-  "deeper_embed_stage_channels": [16, 48, 128, 192],
+  "deeper_embed_stage_channels": [32, 64, 128, 256],
   "deeper_embed_stage_strides": [1, 2, 2, 2],
   "deeper_embed_depth_per_level": [1, 2, 2, 1],
   "deeper_embed_use_stem": true,
-  "deeper_embed_stem_channels": 16,
+  "deeper_embed_stem_channels": 32,
   "deeper_embed_stem_type": "conv",
   "deeper_embed_final_projection": true
 }
@@ -340,7 +343,7 @@ keypoints. On real data a sample carries about 110 labeled points on 7 objects,
 about 0.3 s per sample in a loader worker.
 
 `object_losses` adds, for each view, a point embedding from a small MLP over the
-trilinearly interpolated ViT tokens and CNN stage outputs (16, 48 and 128
+trilinearly interpolated ViT tokens and CNN stage outputs (32, 64 and 128
 channels at full, 1/2 and 1/4 resolution), and compares the student with the EMA
 teacher's other view:
 
@@ -361,9 +364,8 @@ Each weight is 0.1 relative to the DINO loss, and all three ramp up linearly ove
 heads can be resumed: the heads are initialized (the teacher's copied from the
 student) and the optimizer state of existing parameters is kept.
 
-`grad_accumulation_steps: 2` runs two batches of 16 per optimizer step
-(effective batch 32); the learning rate follows the DINOv3 square-root rule,
-1e-3 × √(32 / 1024) = 1.768e-4.
+`grad_accumulation_steps: 2` runs two batches of 12 per optimizer step
+(effective batch 24 per GPU). The configured learning rate is `1.768e-4`.
 
 `dataset.augmentation` selects the view augmentation applied after the random
 resized crop. `"full"` (the default, used by `pretrain_8_9um.json` together with
