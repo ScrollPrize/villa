@@ -818,15 +818,16 @@ QStatusBar QLabel {
 
 /* Bottom dock bar: flat buttons that show an outline only under the pointer
    and when their panel is open. StatusDockPanelHost draws the panel frames
-   from the palette (Window, Mid, Highlight). */
+   from the palette (Window, Mid, Highlight). At laptop widths the labels do
+   not fit; centered text in the application font, with little padding,
+   keeps them as readable as under Classic. */
 QPushButton[statusDockPanelButton="true"] {
     background: transparent;
     color: @text_secondary@;
-    text-align: left;
+    text-align: center;
     border: 1px solid transparent;
     border-radius: @radius@;
-    padding: 2px 6px;
-    font-size: @font_size_small@;
+    padding: 2px 3px;
 }
 QPushButton[statusDockPanelButton="true"]:hover {
     background: @hover@;

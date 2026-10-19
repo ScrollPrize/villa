@@ -298,7 +298,6 @@ and
 | `radius_large` | `8px` | `8px` | Corners of tab panes. |
 | `radius_popup` | `0px` | `0px` | Corners of menus, tool tips and combo box lists. These are separate windows that Qt fills edge to edge, so anything above 0px shows square corners unless VC3D makes pop-ups translucent. |
 | **Type** | | | |
-| `font_size_small` | `12px` | `12px` | Text size of the bottom dock bar buttons. |
 | `mono` | see below | see below | Font stack for code and logs in plain text views (JSON profiles, the console, fiber trace details). |
 
 `mono` is `"JetBrains Mono", "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace`.

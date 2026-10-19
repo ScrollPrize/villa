@@ -59,7 +59,6 @@
     "radius": "6px",
     "radius_large": "8px",
     "radius_popup": "0px",
-    "font_size_small": "12px",
     "mono": "\"JetBrains Mono\", \"SF Mono\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace"
   },
   "palette": {
