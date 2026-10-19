@@ -1,0 +1,442 @@
+"""Measure where a traced surface sits relative to the papyrus sheet in the CT.
+
+For a sample of surface points the CT is read along the surface normal and the
+nearest density peak (the sheet) is located. The signed distance from the
+surface point to that peak, along the stored normal, is the placement offset.
+A surface that tracks one sheet has offsets that are small and constant; a
+surface that wiggles, drifts across fibre layers or leaves the sheet shows
+offsets that spread, change sign or hit the search limit.
+
+Inputs: a VolCart ``.obj`` (local path or ``http(s)://`` URL; the vertex block
+is range-sampled so a large remote file is not downloaded) or a tifxyz
+directory, plus the CT as a zarr array or OME-Zarr group (path or URL).
+
+Outputs per surface: ``<name>.json`` (summary), ``<name>.samples.csv`` (one row
+per sample with coordinates, so the offsets can be viewed in place), and
+``aggregate.csv`` across surfaces. ``--plot`` adds ``<name>.png``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import os
+import re
+import sys
+import urllib.request
+from typing import Any, Sequence
+
+import numpy as np
+
+from vesuvius.image_proc.run.label_topology_audit import open_volume
+
+METRICS = (
+    "n_samples", "n_inside_volume", "n_valid", "no_peak_frac",
+    "offset_median", "offset_q25", "offset_q75", "offset_mean_abs",
+    "offset_abs_gt_1_frac", "offset_abs_gt_2_frac", "offset_abs_gt_3_frac", "offset_at_limit_frac",
+    "off_sheet_frac", "sheet_fwhm_median", "contrast_median",
+    "n_patches", "patch_offset_q25", "patch_offset_median", "patch_offset_q75",
+    "patch_offset_range", "patch_abs_gt_2_frac",
+)
+
+
+def parse_fail_on(specs: Sequence[str]) -> dict[str, float]:
+    limits = {}
+    for spec in specs:
+        key, sep, val = spec.partition("=")
+        if not sep or key not in METRICS:
+            raise SystemExit(f"--fail-on expects METRIC=MAX with METRIC in {METRICS}: {spec!r}")
+        try:
+            limits[key] = float(val)
+        except ValueError:
+            raise SystemExit(f"--fail-on limit must be a number: {spec!r}") from None
+        if not np.isfinite(limits[key]):
+            raise SystemExit(f"--fail-on limit must be finite: {spec!r}")
+    return limits
+
+
+# --------------------------------------------------------------------------- surfaces
+
+
+def _http_size(url: str) -> int:
+    req = urllib.request.Request(url, method="HEAD")
+    with urllib.request.urlopen(req) as r:
+        return int(r.headers["Content-Length"])
+
+
+def _http_range(url: str, start: int, length: int) -> bytes:
+    req = urllib.request.Request(url, headers={"Range": f"bytes={start}-{start + length - 1}"})
+    with urllib.request.urlopen(req) as r:
+        return r.read()
+
+
+def _parse_v_vn(blob: bytes, at_start: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    """Vertices and normals from a byte block of ``v``/``vn`` lines (pairs only).
+
+    Returns (points xyz, normals xyz); a vertex without a following ``vn`` is dropped.
+    """
+    # drop the partial first and last lines (a blob starting at byte 0 has a whole first line)
+    lines = blob.split(b"\n")
+    lines = lines[(0 if at_start else 1):-1]
+    pts, nrm = [], []
+    last_v = None
+    for ln in lines:
+        if ln.startswith(b"vn "):
+            if last_v is not None:
+                try:
+                    nrm.append([float(t) for t in ln[3:].split()[:3]])
+                    pts.append(last_v)
+                except ValueError:
+                    pass
+            last_v = None
+        elif ln.startswith(b"v "):
+            try:
+                last_v = [float(t) for t in ln[2:].split()[:3]]
+            except ValueError:
+                last_v = None
+        else:
+            last_v = None
+    if not pts:
+        return np.zeros((0, 3)), np.zeros((0, 3))
+    return np.asarray(pts, np.float64), np.asarray(nrm, np.float64)
+
+
+def _vertex_region_end(reader, size: int, probe: int = 4096) -> int:
+    """Byte offset where the ``v``/``vn`` block ends (first ``f``/``vt`` line), by bisection."""
+
+    def is_vertex_block(pos: int) -> bool:
+        blob = reader(pos, probe)
+        lines = [ln for ln in blob.split(b"\n")[1:-1] if ln]
+        if not lines:
+            return False
+        return all(ln.startswith((b"v ", b"vn ")) for ln in lines)
+
+    lo, hi = 0, size
+    if not is_vertex_block(0):
+        # header comments first: skip ahead a little
+        lo = min(size, 2048)
+    while hi - lo > probe:
+        mid = (lo + hi) // 2
+        if is_vertex_block(mid):
+            lo = mid
+        else:
+            hi = mid
+    # exact end: scan the last window line by line
+    blob = reader(lo, min(2 * probe, size - lo))
+    pos = lo if lo == 0 else lo + blob.index(b"\n") + 1
+    for ln in blob[pos - lo:].split(b"\n"):
+        if not ln.startswith((b"v ", b"vn ", b"#")):
+            break
+        pos += len(ln) + 1
+    return min(pos, size)
+
+
+def sample_obj(src: str, samples: int, blobs: int, rng: np.random.Generator, blob_bytes: int = 1 << 19):
+    """Random surface points and normals from an obj, reading ``blobs`` byte ranges of the vertex block.
+
+    Vertices in VolCart objs are written in grid order, so each range is one spatially
+    compact patch; ``samples`` points are drawn evenly across the patches. Returns
+    (points zyx, normals zyx, n_vertices_declared).
+    """
+    if src.startswith(("http://", "https://")):
+        size = _http_size(src)
+        reader = lambda s, n: _http_range(src, s, n)  # noqa: E731
+    else:
+        size = os.path.getsize(src)
+        fh = open(src, "rb")
+
+        def reader(s, n):
+            fh.seek(s)
+            return fh.read(n)
+
+    head = reader(0, 4096)
+    m = re.search(rb"# Vertices: (\d+)", head)
+    declared = int(m.group(1)) if m else -1
+    end = _vertex_region_end(reader, size)
+    if end <= 0:
+        raise ValueError(f"{src}: no v/vn vertex block found")
+    blobs = max(1, min(blobs, max(1, end // blob_bytes)))
+    starts = np.sort(rng.integers(0, max(1, end - blob_bytes), blobs)) if end > blob_bytes else np.array([0])
+    per = max(1, math.ceil(samples / len(starts)))
+    P, N, patch = [], [], []
+    for k, s in enumerate(starts):
+        pts, nrm = _parse_v_vn(reader(int(s), min(blob_bytes, end - int(s)) + 1), at_start=int(s) == 0)
+        if len(pts) == 0:
+            continue
+        pick = rng.choice(len(pts), min(per, len(pts)), replace=False)
+        P.append(pts[pick]); N.append(nrm[pick]); patch.append(np.full(len(pick), k))
+    if not P:
+        raise ValueError(f"{src}: vertex block yielded no v/vn pairs")
+    P = np.concatenate(P)[:, ::-1]
+    N = np.concatenate(N)[:, ::-1]
+    N /= np.linalg.norm(N, axis=1, keepdims=True) + 1e-12
+    return P, N, np.concatenate(patch), declared
+
+
+def sample_tifxyz(path: str, samples: int, rng: np.random.Generator):
+    """Random points and normals from a tifxyz directory at its stored resolution."""
+    from vesuvius.tifxyz import read_tifxyz
+
+    surf = read_tifxyz(path)
+    nx, ny, nz = surf.compute_normals()
+    x, y, z = surf._x, surf._y, surf._z
+    ok = np.isfinite(nx) & np.isfinite(x) & (x > 0) & (y > 0) & (z > 0)
+    if surf._mask is not None:
+        ok &= surf._mask.astype(bool)
+    idx = np.flatnonzero(ok)
+    if len(idx) == 0:
+        raise ValueError(f"{path}: no valid surface points")
+    pick = rng.choice(idx, min(samples, len(idx)), replace=False)
+    r, c = np.unravel_index(pick, x.shape)
+    P = np.stack([z.ravel()[pick], y.ravel()[pick], x.ravel()[pick]], 1).astype(np.float64)
+    N = np.stack([nz.ravel()[pick], ny.ravel()[pick], nx.ravel()[pick]], 1).astype(np.float64)
+    N /= np.linalg.norm(N, axis=1, keepdims=True) + 1e-12
+    # patch id: 64x64 cells of the stored grid
+    patch = (r // 64) * (x.shape[1] // 64 + 1) + (c // 64)
+    return P, N, patch, int(ok.sum())
+
+
+def is_tifxyz(src: str) -> bool:
+    return os.path.isdir(src) and all(os.path.exists(os.path.join(src, f)) for f in ("x.tif", "y.tif", "z.tif"))
+
+
+# --------------------------------------------------------------------------- profiles
+
+
+def read_profiles(vol, P: np.ndarray, N: np.ndarray, half: float, step: float, sigma: float, chunk: int = 128,
+                  workers: int = 8):
+    """CT profile along each normal, t in [-half, half] (step), from a lazily read volume.
+
+    Points are grouped by ``chunk``-voxel cell so each cell's padded box is read once;
+    cells are read on ``workers`` threads (remote zarr reads are latency-bound).
+    Returns (profiles, t, kept) where ``kept`` marks points inside the volume.
+    """
+    from scipy import ndimage as ndi
+
+    t = np.arange(-half, half + step / 2, step)
+    shape = np.asarray(vol.shape[-3:])
+    pad = int(math.ceil(half + 3 * sigma + 2))
+    prof = np.full((len(P), len(t)), np.nan, np.float32)
+    inside = np.all((P >= pad) & (P <= shape - 1 - pad), 1)
+    cell = np.floor(P / chunk).astype(np.int64)
+    key = cell[:, 0] * 10**8 + cell[:, 1] * 10**4 + cell[:, 2]
+    def one_cell(k):
+        sel = np.flatnonzero((key == k) & inside)
+        lo = np.maximum(P[sel].min(0).astype(int) - pad, 0)
+        hi = np.minimum(P[sel].max(0).astype(int) + pad + 1, shape)
+        box = np.asarray(vol[tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))], dtype=np.float32)
+        if box.ndim > 3:
+            box = box.reshape(box.shape[-3:])
+        if sigma > 0:
+            box = ndi.gaussian_filter(box, sigma)
+        q = (P[sel] - lo)[:, None, :] + t[None, :, None] * N[sel][:, None, :]
+        prof[sel] = ndi.map_coordinates(box, q.reshape(-1, 3).T, order=1, mode="nearest").reshape(len(sel), len(t))
+
+    cells = np.unique(key[inside])
+    if workers > 1 and len(cells) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(workers) as ex:
+            list(ex.map(one_cell, cells))
+    else:
+        for k in cells:
+            one_cell(k)
+    return prof, t, inside
+
+
+def nearest_peak(prof: np.ndarray, t: np.ndarray, min_contrast: float, min_prominence: float):
+    """Offset of the nearest local maximum of each profile to t=0, and its contrast.
+
+    A peak counts when the profile range is at least ``min_contrast`` and the peak
+    rises at least ``min_prominence`` x range above the lower of its two flanking minima.
+    Returns (offset, contrast, valid); offset is NaN when no peak qualifies.
+    """
+    n, m = prof.shape
+    has = np.isfinite(prof).any(1)
+    rng_ = np.full(n, np.nan)
+    rng_[has] = np.nanmax(prof[has], 1) - np.nanmin(prof[has], 1)
+    off = np.full(n, np.nan)
+    val = np.zeros(n, bool)
+    c = m // 2
+    # local maxima (plateaus count once, at their first sample)
+    left = np.hstack([np.full((n, 1), -np.inf), prof[:, :-1]])
+    right = np.hstack([prof[:, 1:], np.full((n, 1), -np.inf)])
+    ismax = (prof > left) & (prof >= right)
+    order = np.argsort(np.abs(np.arange(m) - c), kind="stable")
+    for i in range(n):
+        if not np.isfinite(rng_[i]) or rng_[i] < min_contrast:
+            continue
+        p = prof[i]
+        for j in order:
+            if not ismax[i, j]:
+                continue
+            lmin = p[: j + 1].min()
+            rmin = p[j:].min()
+            if p[j] - max(lmin, rmin) >= min_prominence * rng_[i]:
+                off[i] = t[j]
+                val[i] = True
+                break
+    return off, rng_, val
+
+
+def summarize(off: np.ndarray, contrast: np.ndarray, valid: np.ndarray, inside: np.ndarray, patch: np.ndarray,
+              prof: np.ndarray, t: np.ndarray, half: float) -> dict[str, Any]:
+    o = off[valid]
+    q = lambda x, p: float(np.percentile(x, p)) if len(x) else float("nan")  # noqa: E731
+    # sheet width at the located peak: half-maximum width of the profile around it
+    fw = []
+    for i in np.flatnonzero(valid)[:20000]:
+        p = prof[i]
+        j = int(np.argmin(np.abs(t - off[i])))
+        hm = (p[j] + np.nanmin(p)) / 2
+        a = j
+        while a > 0 and p[a - 1] >= hm:
+            a -= 1
+        b = j
+        while b < len(p) - 1 and p[b + 1] >= hm:
+            b += 1
+        fw.append(t[b] - t[a])
+    fw = np.asarray(fw)
+    # on-sheet: the CT at the surface point is at least the half-maximum of its peak
+    c = len(t) // 2
+    on = []
+    for i in np.flatnonzero(valid):
+        p = prof[i]
+        j = int(np.argmin(np.abs(t - off[i])))
+        on.append(p[c] >= (p[j] + np.nanmin(p)) / 2)
+    on = np.asarray(on, bool)
+    # per-patch median offset: where the surface drifts
+    pm = []
+    for k in np.unique(patch[valid]):
+        s = off[valid & (patch == k)]
+        if len(s) >= 30:
+            pm.append(float(np.median(s)))
+    pm = np.asarray(pm)
+    out = {
+        "n_samples": int(len(off)),
+        "n_inside_volume": int(inside.sum()),
+        "n_valid": int(valid.sum()),
+        "no_peak_frac": float(1 - valid.sum() / max(1, inside.sum())),
+        "offset_median": q(o, 50), "offset_q25": q(o, 25), "offset_q75": q(o, 75),
+        "offset_mean_abs": float(np.mean(np.abs(o))) if len(o) else float("nan"),
+        "offset_abs_gt_1_frac": float(np.mean(np.abs(o) > 1)) if len(o) else float("nan"),
+        "offset_abs_gt_2_frac": float(np.mean(np.abs(o) > 2)) if len(o) else float("nan"),
+        "offset_abs_gt_3_frac": float(np.mean(np.abs(o) > 3)) if len(o) else float("nan"),
+        "offset_at_limit_frac": float(np.mean(np.abs(o) >= half)) if len(o) else float("nan"),
+        "off_sheet_frac": float(1 - on.mean()) if len(on) else float("nan"),
+        "sheet_fwhm_median": float(np.median(fw)) if len(fw) else float("nan"),
+        "contrast_median": float(np.nanmedian(contrast[inside])) if inside.any() else float("nan"),
+        "n_patches": int(len(pm)),
+        "patch_offset_q25": q(pm, 25), "patch_offset_median": q(pm, 50), "patch_offset_q75": q(pm, 75),
+        "patch_offset_range": float(np.ptp(pm)) if len(pm) else float("nan"),
+        "patch_abs_gt_2_frac": float(np.mean(np.abs(pm) > 2)) if len(pm) else float("nan"),
+    }
+    return out
+
+
+def plot(P, off, valid, path: str, name: str) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(1, 2, figsize=(11, 5))
+    v = valid
+    sc = None
+    for a, (i, j, lab) in zip(ax, [(2, 1, "x / y"), (2, 0, "x / z")]):
+        sc = a.scatter(P[v, i], P[v, j], c=off[v], s=2, cmap="coolwarm", vmin=-4, vmax=4)
+        a.scatter(P[~v, i], P[~v, j], c="0.7", s=1)
+        a.set_xlabel(lab.split(" / ")[0]); a.set_ylabel(lab.split(" / ")[1]); a.set_aspect("equal")
+    if sc is not None:
+        fig.colorbar(sc, ax=ax, label="offset to sheet peak (vox, along normal)")
+    fig.suptitle(f"{name}: surface placement (grey = no peak found)")
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+
+
+# --------------------------------------------------------------------------- CLI
+
+
+def surface_name(src: str) -> str:
+    s = src.rstrip("/")
+    base = s.rsplit("/", 1)[-1]
+    return base[:-4] if base.endswith(".obj") else base
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--surface", nargs="+", required=True, help="obj file(s) (path or URL) or tifxyz directories")
+    p.add_argument("--volume", required=True, help="CT zarr array or OME-Zarr group (path or URL)")
+    p.add_argument("--level", default="0", help="multiscale level of an OME-Zarr group (default 0)")
+    p.add_argument("--out", required=True)
+    p.add_argument("--samples", type=int, default=20000, help="surface points per surface (default 20000)")
+    p.add_argument("--blobs", type=int, default=40, help="byte ranges read from a remote/large obj (default 40)")
+    p.add_argument("--half", type=float, default=8.0, help="search half-length along the normal, voxels (default 8)")
+    p.add_argument("--step", type=float, default=0.5, help="profile step, voxels (default 0.5)")
+    p.add_argument("--sigma", type=float, default=1.0, help="CT smoothing before profiling (default 1.0)")
+    p.add_argument("--min-contrast", type=float, default=8.0, help="profile range below which no peak is accepted")
+    p.add_argument("--min-prominence", type=float, default=0.15, help="peak prominence as a fraction of the profile range")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--workers", type=int, default=8, help="threads for volume reads (default 8)")
+    p.add_argument("--plot", action="store_true")
+    p.add_argument("--fail-on", action="append", default=[], metavar="METRIC=MAX",
+                   help="exit 2 if any surface exceeds MAX for METRIC (e.g. offset_abs_gt_2_frac=0.5)")
+    return p
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    a = build_parser().parse_args(argv)
+    if a.half <= 0 or a.step <= 0 or a.samples <= 0:
+        print("--half, --step and --samples must be positive", file=sys.stderr)
+        return 1
+    limits = parse_fail_on(a.fail_on)
+    vol = open_volume(a.volume, a.level)
+    os.makedirs(a.out, exist_ok=True)
+    rng = np.random.default_rng(a.seed)
+    rows: list[dict[str, Any]] = []
+    failed = False
+    for src in a.surface:
+        name = surface_name(src)
+        if is_tifxyz(src):
+            P, N, patch, n_vert = sample_tifxyz(src, a.samples, rng)
+        else:
+            P, N, patch, n_vert = sample_obj(src, a.samples, a.blobs, rng)
+        prof, t, inside = read_profiles(vol, P, N, a.half, a.step, a.sigma, workers=a.workers)
+        off, contrast, valid = nearest_peak(prof, t, a.min_contrast, a.min_prominence)
+        valid &= inside
+        m = summarize(off, contrast, valid, inside, patch, prof, t, a.half)
+        m.update({"surface": name, "source": src, "volume": a.volume, "n_vertices": int(n_vert),
+                  "half": a.half, "step": a.step, "sigma": a.sigma,
+                  "min_contrast": a.min_contrast, "min_prominence": a.min_prominence})
+        with open(os.path.join(a.out, f"{name}.json"), "w") as f:
+            json.dump(m, f, indent=1)
+        with open(os.path.join(a.out, f"{name}.samples.csv"), "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["z", "y", "x", "nz", "ny", "nx", "patch", "offset", "contrast", "valid"])
+            for i in range(len(P)):
+                w.writerow([f"{P[i,0]:.2f}", f"{P[i,1]:.2f}", f"{P[i,2]:.2f}",
+                            f"{N[i,0]:.4f}", f"{N[i,1]:.4f}", f"{N[i,2]:.4f}", int(patch[i]),
+                            "" if not valid[i] else f"{off[i]:.2f}",
+                            "" if not np.isfinite(contrast[i]) else f"{contrast[i]:.1f}", int(valid[i])])
+        if a.plot:
+            plot(P, off, valid, os.path.join(a.out, f"{name}.png"), name)
+        rows.append(m)
+        print(f"{name}: valid {m['n_valid']}/{m['n_samples']} offset median {m['offset_median']:+.2f} "
+              f"IQR [{m['offset_q25']:+.2f}, {m['offset_q75']:+.2f}] |off|>2 {m['offset_abs_gt_2_frac']:.2f} "
+              f"off-sheet {m['off_sheet_frac']:.2f} no-peak {m['no_peak_frac']:.2f}", flush=True)
+        for k, lim in limits.items():
+            if k in m and isinstance(m[k], (int, float)) and m[k] > lim:
+                print(f"FAIL {name}: {k}={m[k]} > {lim}", flush=True)
+                failed = True
+    keys = [k for k in rows[0] if k not in ("source", "volume")]
+    with open(os.path.join(a.out, "aggregate.csv"), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+    return 2 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
