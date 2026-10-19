@@ -549,7 +549,9 @@ A.Gamma(gamma=0.8)
 
 Smooth the volume with a separable 3D Gaussian filter.
 
-`full_width=False, truncate=4` uses radius `round(4*sigma)`, matching SciPy Gaussian filter support. The default `full_width=True` interprets `truncate` as the full width. Both CPU and CUDA use the same convention.
+`full_width=False, truncate=4` uses radius `floor(4*sigma + 0.5)`, matching
+SciPy Gaussian filter support. The default `full_width=True` interprets
+`truncate` as the full width. CPU and CUDA use the same convention.
 
 ```python
 A.GaussianBlur(sigma=1)

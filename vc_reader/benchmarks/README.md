@@ -1586,3 +1586,159 @@ acceptance are recorded in
 [training workflow acceptance](../docs/training-workflow-benchmarks.md).
 The [usage guide](../docs/training-workflows.md) documents cache budgets, field
 semantics, layer validity, seeds, process cleanup and optional dependencies.
+
+## Fiber trainer comparison
+
+`bench_fiber_trainer.py` runs the Vesuvius fiber trainer itself from a resumable
+checkpoint, including its five-source loader, live continuation feedback,
+forward/backward, AdamW and EMA. The default is 20 warmup batches followed by
+500 measured batches, with one gradient step and the checkpoint's batch size.
+No fixed crop list or precomputed image batches are used. The report counts
+distinct crop positions and source-chunk footprints per dataset.
+
+The benchmark defaults to `--lookahead 0`, overriding any saved nonzero
+lookahead in the checkpoint's run configuration. This disables deep future
+plan generation while retaining asynchronous remote fetching and demand
+readiness checks. Set `--lookahead N` to opt in. The reproduction commands
+below explicitly use 16 to match the recorded comparison results.
+
+Use the trainer's Python environment for both backends. The optional
+`--vc-site-packages` loads this repository's existing editable vc_reader
+installation without replacing the trainer's PyTorch or installing packages:
+
+```bash
+TRAIN_PY=/home/sean/Documents/villa4/vesuvius/.venv/bin/python
+FIBER_CHECKPOINT=/home/sean/Documents/villa4/vesuvius/src/vesuvius/neural_tracing/tracers/fibers/output/polar_tokens_a3_ms_slim_dagger_b32x2_50k/ckpt_050000.pt
+VC_SITE=/home/sean/Documents/villa2/villa/vc_reader/.venv/lib/python3.14/site-packages
+
+AGENTS_AGENT_MODE=1 "$TRAIN_PY" benchmarks/bench_fiber_trainer.py \
+  --checkpoint "$FIBER_CHECKPOINT" --backend existing --grad-steps 1 --lookahead 16 \
+  --output benchmarks/results/fiber_existing_b32_g1_500
+
+AGENTS_AGENT_MODE=1 "$TRAIN_PY" benchmarks/check_fiber_pipeline.py \
+  --checkpoint "$FIBER_CHECKPOINT" --vc-site-packages "$VC_SITE" \
+  --output benchmarks/results/fiber_pipeline_validation.json
+
+AGENTS_AGENT_MODE=1 "$TRAIN_PY" benchmarks/bench_fiber_trainer.py \
+  --checkpoint "$FIBER_CHECKPOINT" --backend vc-reader --grad-steps 1 --lookahead 16 \
+  --vc-site-packages "$VC_SITE" \
+  --output benchmarks/results/fiber_cuda_b32_g1_500
+
+AGENTS_AGENT_MODE=1 "$TRAIN_PY" benchmarks/check_sheet_normal.py \
+  --checkpoint "$FIBER_CHECKPOINT" --vc-site-packages "$VC_SITE" \
+  --output benchmarks/results/sheet_normal_validation.json
+
+AGENTS_AGENT_MODE=1 "$TRAIN_PY" benchmarks/bench_fiber_trainer.py \
+  --checkpoint "$FIBER_CHECKPOINT" --backend vc-reader --heading tensor \
+  --grad-steps 1 --lookahead 16 --vc-site-packages "$VC_SITE" \
+  --output benchmarks/results/fiber_cuda_tensor_b32_g1_500
+```
+
+Run these sequentially on the same GPU. Output directories must be new. The
+input run is read-only; private replay directories retain references to its
+arrays. New DAgger collection, periodic rendering, checkpoint writes and curve
+plots are disabled in both runs. The existing replay banks, task shares, seed,
+model precision, compiled model and optimizer state are retained. The LR
+schedule extends to the same endpoint for both runs.
+
+`fiber_cuda_pipeline.py` installs benchmark-local input hooks. CPU workers keep
+the learned frame estimator and label/geometry construction. Native vc_reader
+reads replace the CT block reads; the shared remote prefetch service continues
+to populate the same disk cache. Workers return final crop geometry and
+augmentation parameters. The training process samples source chunks with
+`source="chunks"`, then applies vc_reader CUDA normalization and photometric
+augmentation. Images stay on CUDA through model input; only chunk uploads,
+small geometry/label transfers and the trainer's ordinary feedback occur.
+Each source has a bounded 512 MiB device chunk cache, and batches are sampled
+four crops at a time. A nonzero CPU sampling-route counter fails the benchmark.
+
+`check_fiber_pipeline.py` compares real CT crops from every dataset against the
+trainer, including normalization, contrast, brightness and reflected Gaussian
+blur. Its image downloads are outside the timing runs. Gaussian noise preserves
+the trainer's sampled standard deviations but uses vc_reader's RNG. Live
+feedback and worker scheduling therefore need not produce identical later
+crop coordinates or losses between runs.
+
+`steps.jsonl` records every batch's loader wait, input preparation, model update
+time, loss and source counts. `summary.json` includes mean/p50/p95 timings,
+the measured wall interval, coverage, and CUDA upload/cache statistics. Startup
+and warmup are excluded. The wall interval includes between-update trainer
+bookkeeping; the summed step interval isolates input preparation and updates.
+
+`--heading tensor` additionally replaces learned frame inference and CT seed
+heading estimation with the graph-linking anisotropic sheet normal on CUDA.
+`fiber_tensor_heading.py` serves small worker requests from a thread in the
+training process. It reads CT using bounded 256 MiB device caches and computes
+normal, H/V heading, sign alignment and orthonormal frame on CUDA. Only a
+three-component heading or 3×3 frame, plus a validity flag, is downloaded for
+CPU geometry and label construction. Image data and tensor intermediates are
+never downloaded. Seeds without usable H/V evidence are resampled; weak
+frames hold their prior heading. Recorded replay frames and the trained
+previous-prediction continuation-axis policy are retained. This is a change
+to training inputs; timing alone does not establish model-quality equivalence.
+
+`check_sheet_normal.py` checks four real points in every source against an
+independent separable-filter/tensor/eigen reference and profiles transfers.
+`tests/test_sheet_normal.py` also covers curved low-contrast sheets, flat and
+ambiguous tensors, fractional lattice positions, and volume boundaries.
+The estimator profile contains no device-to-host copies. Normal result
+downloads for numerical validation occur outside that profile.
+
+### Measured fiber results (RTX 5090)
+
+Checkpoint `polar_tokens_a3_ms_slim_dagger_b32x2_50k/ckpt_050000.pt`,
+PyTorch 2.12.1+cu130, compiled model with bfloat16 autocast, 10 workers and
+4 trainer threads. Each row is 500 measured batches × 32 crops, grad steps 1,
+after 20 warmup batches. Times include real forward/backward/optimizer updates.
+
+| Input pipeline / frame estimator | Wall time | Crops/s | Loader wait | Model updates |
+| --- | ---: | ---: | ---: | ---: |
+| Original / learned | 227.589 s | 70.30 | 185.016 s | 41.637 s |
+| vc_reader CUDA / learned | 184.847 s | 86.56 | 127.943 s | 34.220 s |
+| vc_reader CUDA / anisotropic tensor CUDA | **124.608 s** | **128.40** | **67.894 s** | 37.506 s |
+
+The tensor variant took 45.2% less wall time than the original (1.83×
+throughput), and 32.6% less than CUDA inputs with learned frames (1.48×).
+These are single sequential runs with the shared existing disk cache; they
+are not cold-cache measurements or repeated statistical estimates. Each
+run used the same source-selection sequence for all 520 batches. Losses and
+geometry metrics remained finite. Changed headings and augmentation RNG make
+this a throughput comparison, not a model-quality equivalence claim.
+
+Measured tensor-run coverage:
+
+| Source | Crops | Unique positions | Unique 128³ crop-footprint chunks |
+| --- | ---: | ---: | ---: |
+| paris4 | 2,912 | 2,912 | 5,611 |
+| 0175A_5mm_v1 | 2,720 | 2,720 | 7,579 |
+| 1447_5mm_v1 | 3,200 | 3,114 | 8,571 |
+| paris4_afv_central | 3,936 | 3,649 | 9,974 |
+| PHerc0125_3mm_v2 | 3,232 | 3,232 | 5,649 |
+
+These are actual delivered training crops, not a repeating request list.
+Paris sources share a volume, so chunk counts should not be summed as globally
+distinct chunks. All CUDA image and heading reader counters reported zero CPU
+routes. The heading service evaluated 26,312 queries including startup,
+warmup, and prefetched work, and downloaded 812,384 bytes total of headings,
+frames and validity flags. No CT image or tensor field was downloaded.
+
+CPU and CUDA normals were identical in float32 at the 20 real validation
+points; maximum angular error against the independent reference was below
+0.000002 degrees. Full results and traces are in
+`results/fiber_comparison.json`, the three run directories' `summary.json`
+and `steps.jsonl`, `results/fiber_pipeline_validation.*`, and
+`results/sheet_normal_validation.*`. The new tensor API is documented in the
+[package README](../README.md#ct-sheet-normals).
+
+The tensor run's 124.608 s includes deferred loader initialization: 67.894 s
+was spent waiting for batches, 18.650 s materializing CUDA images after their
+geometry arrived, and 37.506 s updating the model. Reconstructing worker IDs
+from the ordered 10-worker loader shows that all 14 waits longer than one
+second occurred on a worker's second visit to a source. Second visits account
+for 65.764 s of loader waiting. `FollowDataset.__iter__` delivers its first
+batch immediately, then synchronously fills its 16-batch lookahead queue on
+the next visit. Twenty global warmup batches do not initialize all 50
+worker/source combinations. Consequently, the reported total is not a
+steady-state CUDA throughput measurement. The timing hooks do not separately
+measure plan generation, source readiness, heading requests, and CPU labels
+inside each wait. See `results/fiber_tensor_bottleneck_analysis.json`.
