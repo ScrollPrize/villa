@@ -383,7 +383,9 @@ def flat_keys() -> list[str]:
 
 def _is_zarr(src: str) -> bool:
     s = str(src)
-    return s.rstrip("/").endswith(".zarr") or "://" in s or (Path(s) / ".zarray").exists() \
+    if "://" in s:  # a URL is zarr unless it names a tif
+        return not s.lower().endswith((".tif", ".tiff"))
+    return s.rstrip("/").endswith(".zarr") or (Path(s) / ".zarray").exists() \
         or (Path(s) / ".zattrs").exists() or (Path(s) / "zarr.json").exists()
 
 

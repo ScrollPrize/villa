@@ -65,7 +65,8 @@ surface, and `<name>.png` with `--plot` (offset as colour in two projections).
 | `no_peak_frac` | share of inside points with no qualifying peak (low contrast, air, or a shoulder) |
 | `offset_median`, `offset_q25`, `offset_q75`, `offset_mean_abs` | signed offset from the surface point to the sheet peak, in voxels along the stored normal; positive means the peak lies in the normal direction |
 | `offset_abs_gt_1_frac`, `_2_`, `_3_` | share of valid points more than 1, 2 or 3 voxels from the peak |
-| `offset_at_limit_frac` | share at the search limit (`half`); a sheet further away than that |
+| `n_censored`, `censored_frac` | inside points with enough contrast whose profile rises to an end sample and has no accepted peak: the sheet may lie at or beyond the search limit (`half`) |
+| `offset_at_limit_frac` | share of valid offsets at `half` exactly; with the default grid an end sample cannot be an accepted peak, so this stays 0 and `censored_frac` carries the signal |
 | `off_sheet_frac` | share of valid points where the CT at the point is below the half-maximum of its peak, i.e. the point is outside the sheet |
 | `sheet_fwhm_median` | half-maximum width of the located sheet, voxels |
 | `contrast_median` | median profile range |

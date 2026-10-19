@@ -452,3 +452,11 @@ def test_empty_crop_cannot_reach_a_gate_with_a_missing_value(tmp_path):
     m, _ = lta.audit(np.full((20, 20, 20), 2, np.uint8))
     flat = lta.flat(m)
     assert all(flat[k] is not None for k in lta.flat_keys())
+
+
+def test_url_input_is_zarr_unless_it_names_a_tif():
+    from vesuvius.image_proc.run.label_topology_audit import _is_zarr
+    assert _is_zarr("https://host/vol.zarr")
+    assert _is_zarr("s3://bucket/vol")
+    assert not _is_zarr("https://host/label.tif")
+    assert not _is_zarr("https://host/label.TIFF")

@@ -45,15 +45,16 @@ meaningful for topology). Zarr input is read lazily, so:
 - `--tile N` splits the window into N-voxel cubes and audits each as its own
   crop named `<name>_z<z0>_y<y0>_x<x0>`, with `aggregate.csv` and `ranked.csv`
   as for `--batch`. Partial cubes at the far edge are dropped, so choose the
-  window as a multiple of N. Topology is measured per cube: a hole or sheet cut
-  by a cube face counts as open (`b1_face`), the same way crop faces do.
+  window as a multiple of N. Topology is measured per cube: a sheet cut by a
+  cube face is open at that face, and a hole that survives the cut is located
+  against the cube face (`b1_face`), the same way crop faces do.
 - `--threshold T` binarises the input as `value >= T`, for probability volumes
   (`128` for a uint8 probability at 0.5) and for `0/255` masks (`1`). It sets
   the surface value to 1 and disables the ignore value.
 - `--threshold T1,T2,...` audits every cut of each window from a single read,
   as crops named `<name>_t<T>` (so `pred_z0_y0_x0_t128`), and writes
   `ranked.csv`. Use it to pick a binarisation threshold for a probability
-  volume: plot `b1_total_big`, `b2_total_big` and `fused_frac` against `T`
+  volume: plot `b1_total_big`, `b2_total_big` and `fused_voxel_frac` against `T`
   per tile; a cut that is too high fragments the sheets, one that is too low
   closes cavities between them.
 
