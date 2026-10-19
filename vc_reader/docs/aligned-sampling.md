@@ -161,5 +161,5 @@ AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=build/cp314-cp314-linux_x86_64 .venv/bi
 AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=/tmp/vc-reader-cuda .venv/bin/python -m unittest discover -s tests -v
 ```
 
-See [sampling measurements](aligned-sampling-benchmarks.md) for fixed real
-inputs, baseline comparisons, profiling, and remaining platform limitations.
+See the [reader and pipeline benchmarks](../benchmarks/README.md#reader-and-pipeline-benchmarks)
+for CPU/CUDA sampling workloads and baseline comparisons.

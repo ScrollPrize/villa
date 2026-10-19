@@ -17,7 +17,8 @@ import time
 
 import numpy as np
 
-from bench_pipeline import environment, load_extensions, nonnegative, positive, summary
+from native_build import load_extensions
+from bench_pipeline import environment, nonnegative, positive, summary
 from augmentation_cases import CASES, input_sample
 
 ROOT = Path(__file__).resolve().parents[1]

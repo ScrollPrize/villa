@@ -100,8 +100,8 @@ before projection; geometry headers may supply the surface grid's UV mapping.
 Published coverage describes the segment and does not guarantee coverage of
 any particular crop. Native ownership stays separate from mapped destinations.
 
-The [training benchmark](../benchmarks/training.md) exercises the complete
-`published-transfer` read with both scans and projected annotations.
+See [surface sampling](surface-sampling.md) for projecting annotations into
+a destination volume.
 
 ## CT resolution candidates
 
@@ -206,10 +206,8 @@ views also preserves those relationships.
 
 ## Run and verify
 
-[`benchmarks/bench_paired.py`](../benchmarks/bench_paired.py) discovers the
-acceptance pair and verifies six fixed crops against independently opened
-arrays. Supply `--metadata`, `--native-dir`, `--cache-dir`, and `--output`;
-`--backend cuda` repeats on CUDA.
 The CLI supports `samples`, `scrolls`, `volumes`, `labels`, `segments`, `images`,
 and `representations`; `volumes --resolution 8 --rel-tol .02 --resolve` validates
-header selections. See [exact test/benchmark commands and results](scroll-reading-benchmarks.md).
+header selections. Discovery and paired-reading tests are in
+[`test_browsing.py`](../tests/test_browsing.py) and
+[`test_paired.py`](../tests/test_paired.py).

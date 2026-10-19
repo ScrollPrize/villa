@@ -12,7 +12,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
 from bench_augmentations import compare, update_readme
 from augmentation_cases import CASES, input_sample
-from bench_pipeline import load_extensions
+from native_build import load_extensions
 
 
 class AugmentationBenchmarkTests(unittest.TestCase):

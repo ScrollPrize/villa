@@ -207,20 +207,13 @@ AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=build/cp314-cp314-linux_x86_64 .venv/bi
 AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=build/cp314-cp314-linux_x86_64 .venv/bin/python -m unittest discover -s tests -p test_zarr_v3.py -v
 ```
 
-HTTP tests use loopback servers. No dependencies were installed. Tests cover
+HTTP tests use loopback servers. Tests cover
 exact image/label values, selection and registration, pre-decode limits,
 shared budgets, eviction, atomic population, authentication/retries, offline
 hits/misses, v3 range/checksum failures, and process reopening. The configured
 CUDA build also runs sampling/augmentation/training tests. Aligned label
 sampling and its CPU/CUDA equality checks are documented in
-[aligned sampling](aligned-sampling.md) and its
-[validation report](aligned-sampling-benchmarks.md).
+[aligned sampling](aligned-sampling.md).
 
-The complete configured suite passed 94 tests, including existing CUDA tests.
-The CPU-only build separately passed 36 source/descriptor tests and seven v3
-tests. Validation was performed on Linux amd64. macOS and arm64 runtime checks were
-not available; the implementation uses portable CPU code without new SIMD or
-GPU codec dependencies.
-
-See [label-reader benchmark results](source-reading-benchmarks.md) for exact
-inputs, reproduction commands, latency, memory, I/O, and profiling limits.
+See the [reader and pipeline benchmarks](../benchmarks/README.md#reader-and-pipeline-benchmarks)
+for throughput measurements and cache controls.

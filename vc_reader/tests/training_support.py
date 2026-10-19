@@ -1,4 +1,4 @@
-"""Training benchmark support: Dataset, collation and CPU/CUDA augmentation.
+"""Training test support: Dataset, collation and CPU/CUDA augmentation.
 
 No random region selection or supervision policy is implemented here. Importing
 this module does not import Torch; only loader construction requires it.
@@ -14,7 +14,7 @@ def load_native(directory=None):
     """Use an existing build, including in spawned workers; never install it."""
     directory = directory or os.environ.get('VC_READER_NATIVE_DIR')
     if directory:
-        from bench_pipeline import load_extensions
+        from native_build import load_extensions
         load_extensions(Path(directory))
 
 
@@ -104,7 +104,7 @@ def select_arrays(sample, arrays):
 
 
 class TrainingDataset:
-    """Map-style benchmark Dataset with explicit (reader_index, start, size) requests.
+    """Map-style test Dataset with explicit (reader_index, start, size) requests.
 
     One decoded chunk budget is shared by all readers in each process. Sampling
     and plan budgets are per reader. Use spawn when the parent has opened data.

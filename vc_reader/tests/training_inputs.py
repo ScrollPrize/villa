@@ -1,18 +1,15 @@
-"""Explicit input fixtures for the training benchmark and its validation tests.
+"""Input fixtures for training integration tests.
 
-Local analytic arrays exercise registration; they are never reported as real
-annotation acceptance. Published selections pin IDs and caller-owned regions.
+Local analytic arrays exercise registration. The published transfer recipe
+uses a catalog fixture to check discovery and serialization without data reads.
 """
 from dataclasses import replace
 import json
 from training_support import Array, ReadSpec, image_arrays, label_arrays
 
-PAIRED_STARTS = ((18576, 7984), (19344, 14192), (19856, 15696),
-                 (20496, 13232), (22128, 11472), (23152, 7984))
-
 
 def write_array(path, values, axes):
-    """Write tiny uncompressed deterministic benchmark inputs, one chunk each."""
+    """Write tiny uncompressed deterministic test inputs, one chunk each."""
     path.mkdir(parents=True, exist_ok=True)
     (path / '.zarray').write_text(json.dumps(dict(zarr_format=2, shape=values.shape,
         chunks=values.shape, dtype=values.dtype.str, compressor=None, filters=None,
@@ -110,35 +107,8 @@ def build_workflow(name, root, metadata=None):
                           native_registration=label.source.to_dict(), component_frame='selected reference volume XYZ voxels')
         return [ReadSpec(volume, targets=targets)], [(0, (1, 2, i), (3, 4, 5)) for i in range(6)], arrays, 3, provenance
 
-    catalog = load(metadata) if metadata else load()
-    if name == 'paired':
-        from bench_paired import discover
-        label, image = discover(catalog)
-        return ([ReadSpec(label, mode='paired', image=image, layers=slice(40, 65))],
-                [(0, start, (128, 128)) for start in PAIRED_STARTS],
-                {**image_arrays(layers=True), **label_arrays(masks=('supervision', 'validation'))}, 2,
-                dict(image=image.id, label=label.id, scroll=label.scroll.id, layers=[40, 65]))
-    if name == 'published-target':
-        from vc_reader import Selection
-        volume = catalog.scrolls['PHercParis4'].volumes['20260411134726']
-        identifier = ('catalog:PHercParis4/volume/20260411134726/snapshot/'
-                      'de38ba456eedfa4e0c4c6d6b4e093f4664d635eae551bfbe923bbdf6dc4ec58d/data/2')
-        asset = volume.representations[identifier]
-        source = replace(asset.source, storage=replace(asset.source.storage, selection=Selection(level=0)))
-        return ([ReadSpec(volume, level=2, targets={'features': source})],
-                [(0, (9000 + i*2, 3600, 3600), (8, 8, 8)) for i in range(6)],
-                {**image_arrays(), 'features': Array('features', role='scalar'),
-                 'features_valid': Array('features', 'valid', 'valid')}, 3,
-                dict(reference=volume.id, reference_level=2, target=source.to_dict(),
-                     target_level=0, kind='published surface prediction, not a categorical annotation'))
-    if name == 'ct':
-        candidates = catalog.scrolls['PHercParis4'].volumes.at_resolution(8., rel_tol=.02)
-        selected = candidates.get(volume='20230206171837')
-        return ([ReadSpec(selected.volume, level=selected.level, resolution=selected)],
-                [(0, (5264 + i, 3906, 4158), (4, 4, 4)) for i in range(6)], image_arrays(), 3,
-                dict(volume=selected.volume.id, level=selected.level, candidates=[c.volume.id for c in candidates],
-                     resolution_um=8., relative_tolerance=.02))
-    if name in ('render', 'project', 'published-transfer'):
+    if name == 'published-transfer':
+        catalog = load(metadata)
         # Discover ownership/geometry/affines first; declare only the canvas
         # convention missing from metadata. The optional TIFF mask is absent.
         scroll = catalog.samples['PHerc0009B']
@@ -150,20 +120,18 @@ def build_workflow(name, root, metadata=None):
         scroll = scroll.with_source(label, kind='label', volume=published.volume.id,
                                     segment=published.segment.id)
         asset = scroll.labels[label.id]
-        destination = '20250521125136' if name == 'published-transfer' else published.volume.id
+        destination = '20250521125136'
         mapping = asset.mappable_volumes[destination]
         targets = {'label': asset}
-        mode = 'render' if name == 'render' else 'project'
-        arrays = {**image_arrays(layers=mode == 'render'),
-                  **label_arrays(masks=('supervision', 'validation', 'conflict') if mode == 'project' else ('supervision', 'validation'))}
-        if name == 'published-transfer':
-            targets['scan_a'] = scroll.volumes[published.volume.id].level(0).source
-            arrays.update(scan_a=Array('scan_a', valid='scan_a_valid'),
-                          scan_a_valid=Array('scan_a', 'valid', 'valid'))
+        mode = 'project'
+        arrays = {**image_arrays(), **label_arrays(masks=('supervision', 'validation', 'conflict'))}
+        targets['scan_a'] = scroll.volumes[published.volume.id].level(0).source
+        arrays.update(scan_a=Array('scan_a', valid='scan_a_valid'),
+                      scan_a_valid=Array('scan_a', 'valid', 'valid'))
         spec = ReadSpec(mapping.volume, mode=mode, targets=targets, surface=surface)
         # Projection bounds depend on geometry: use batch_size=1 or explicitly pad.
         return ([spec], [(0, (18576 + 2*i, 7984 + 2*i), (16, 16)) for i in range(6)], arrays,
-                2 if mode == 'render' else 3, dict(label=label.to_dict(), workflow=name,
+                3, dict(label=label.to_dict(), workflow=name,
                 published=published.summary(), native_volume=published.volume.id,
                 reference_volume=destination, native_level=0, reference_level=0,
                 required_operations=mapping.required_operations, affine=mapping.transform.matrix,

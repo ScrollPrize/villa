@@ -192,6 +192,5 @@ CPU readers reopen in workers after serialization/fork. CUDA readers must live
 in the device-owning process. Returned arrays survive later reads and reader
 close. `stats()` reports shared cache usage, geometry payload reads/transfers,
 candidate uploads and preparation/index/raster/output-allocation wall times.
-Raster-call wall time includes dispatch and uploads; use the separate CUDA
-profile in the [validation report](surface-sampling-benchmarks.md) for resident
-kernel timings.
+Raster-call wall time includes dispatch and uploads. Use a CUDA profiler to
+measure resident kernel execution separately.

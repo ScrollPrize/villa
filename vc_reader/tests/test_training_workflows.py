@@ -1,4 +1,4 @@
-"""Exercise benchmark-owned integration, without adding a package Dataset API."""
+"""Exercise Dataset integration, collation and CPU/CUDA training workflows."""
 from dataclasses import replace
 import json
 import os
@@ -219,9 +219,9 @@ class TrainingTests(unittest.TestCase):
             for key in arrays:
                 np.testing.assert_allclose(actual[key][0].cpu().numpy(), result[key], rtol=1e-6, atol=1e-6)
 
-    def test_catalog_and_benchmark_import_without_torch_numpy(self):
+    def test_catalog_and_training_support_import_without_torch_numpy(self):
         code = "import sys; import vc_reader; import training_support; assert 'torch' not in sys.modules; assert 'numpy' not in sys.modules"
-        environment = {**os.environ, 'PYTHONPATH': os.pathsep.join(['src', 'benchmarks'])}
+        environment = {**os.environ, 'PYTHONPATH': os.pathsep.join(['src', 'tests'])}
         subprocess.run([sys.executable, '-c', code], env=environment, check=True, timeout=30,
                        cwd=Path(__file__).resolve().parents[1])
 
@@ -252,7 +252,7 @@ if __name__ == '__main__':
 
 class PublishedTransferRecipeTests(unittest.TestCase):
     def test_discovery_and_serialization_preserve_volume_mapping(self):
-        fixture = Path(__file__).resolve().parents[1] / 'benchmarks/fixtures/training/catalog.json'
+        fixture = Path(__file__).resolve().parent / 'fixtures/training/catalog.json'
         specs, requests, arrays, dimensions, provenance = build_workflow('published-transfer', Path('/tmp'), fixture)
         spec = pickle.loads(pickle.dumps(specs[0]))
         self.assertEqual(spec.reference.id, '20250521125136')

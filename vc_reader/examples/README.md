@@ -148,8 +148,8 @@ without a host round-trip. Training chunks use the same seed size as inference.
 Holding out a segment ID does not establish that different segments never cover
 overlapping physical sheet regions.
 
-For measurements of reading, collation, augmentation, and persistent spawned
-workers, see the [training benchmark](../benchmarks/training.md).
+For measurements of reading, collation, augmentation, and batch prefetch,
+see the [PyTorch batch benchmark](../benchmarks/README.md#pytorch-cuda-batches).
 
 ## Recorded validation
 

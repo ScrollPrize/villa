@@ -17,7 +17,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from bench_pipeline import environment, heavy_transforms, load_extensions, positive, summary, synthetic_array
+from native_build import load_extensions
+from bench_pipeline import environment, heavy_transforms, positive, summary, synthetic_array
 
 # Spawned DataLoader workers must import the same extensions as the parent.
 if os.environ.get("VC_READER_NATIVE_DIR"):

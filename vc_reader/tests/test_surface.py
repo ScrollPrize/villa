@@ -1,5 +1,6 @@
 """Analytic surface geometry, exact projection and CPU/CUDA parity."""
 import os
+import sys
 import pickle
 import tempfile
 import unittest
@@ -8,7 +9,8 @@ from pathlib import Path
 import numpy as np
 
 if os.environ.get('VC_READER_NATIVE_DIR'):
-    from bench_pipeline import load_extensions
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
+    from native_build import load_extensions
     load_extensions(Path(os.environ['VC_READER_NATIVE_DIR']))
 from vc_reader import Affine, Source, Storage, Surface, SurfaceRegistration, VolumeRegistration, Companion
 from vc_reader.sampling import open_sample

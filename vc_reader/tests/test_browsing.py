@@ -227,7 +227,7 @@ class BrowsingTests(unittest.TestCase):
 class PublishedLabelMappingTests(unittest.TestCase):
     def test_volume_affine_is_visible_with_unresolved_surface_pixels(self):
         from pathlib import Path
-        fixture = Path(__file__).resolve().parents[1] / 'benchmarks/fixtures/training/catalog.json'
+        fixture = Path(__file__).resolve().parent / 'fixtures/training/catalog.json'
         with patch('urllib.request.urlopen', side_effect=AssertionError('metadata browsing requested I/O')):
             c = Catalog.from_file(fixture)
             label = c.samples['PHerc0009B'].segments['20250919125754'].labels.ink(label_set='20260918')

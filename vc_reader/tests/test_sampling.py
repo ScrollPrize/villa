@@ -19,7 +19,7 @@ import tifffile
 
 if os.environ.get('VC_READER_NATIVE_DIR'):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
-    from bench_pipeline import load_extensions
+    from native_build import load_extensions
     load_extensions(Path(os.environ['VC_READER_NATIVE_DIR']))
 
 from vc_reader import (Affine, Catalog, Companion, Encoding, Frame, Plane, QueryContext, Selection,

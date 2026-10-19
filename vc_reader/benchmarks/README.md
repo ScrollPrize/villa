@@ -5,6 +5,13 @@ reader and augmentation extensions; CUDA measurements require a CUDA-enabled
 build. Generated reports in `benchmarks/results/` and `docs/benchmarks/` are
 local artifacts ignored by Git. Input fixtures remain versioned.
 
+| Suite | Measures |
+| --- | --- |
+| [`bench_pipeline.py`](bench_pipeline.py) | CPU/CUDA reading, sampling, normalization and augmentation |
+| [`bench_augmentations.py`](bench_augmentations.py) | Individual augmentation recipes, including transfers and resident CUDA arrays |
+| [`bench_torch.py`](bench_torch.py) | Per-sample processing, CUDA batches and loader prefetch |
+| [`bench_fiber_trainer.py`](bench_fiber_trainer.py) | Full model and optimizer updates with the fiber trainer |
+
 ## Fiber trainer comparison
 
 [`bench_fiber_trainer.py`](bench_fiber_trainer.py) runs real sampled batches
@@ -60,9 +67,6 @@ between-update bookkeeping, which is included in the wall-time total.
 
 ## Reader and pipeline benchmarks
 
-
-### General reader workloads
-
 [`bench_pipeline.py`](bench_pipeline.py) compares reading/sampling or complete
 sampling/augmentation pipelines. It accepts local, HTTP or S3 3-D uint8 Zarr v2
 arrays. Reader comparisons include vc_reader CPU/CUDA, TensorStore and
@@ -93,7 +97,8 @@ measurements do not include a model or represent an overlapped trainer.
 [`bench_augmentations.py`](bench_augmentations.py) measures all README recipes
 on CPU, CUDA with transfers, and CUDA with resident arrays. Recipes and input
 construction live in [`augmentation_cases.py`](augmentation_cases.py), shared
-with the preview generator. `--update-readme` changes timing rows in the package
+with [`generate_augment_previews.py`](generate_augment_previews.py).
+`--update-readme` changes timing rows in the package
 README without altering examples or images.
 
 ```bash
@@ -130,16 +135,7 @@ Use `--help` for workload and profiling options. Correctness coverage is in `tes
 `tests/test_native_batch.py`.
 
 
-## Other suites
-
-| Workload | Harness / guide |
-| --- | --- |
-| Metadata discovery and navigation | [`bench_discovery.py`](bench_discovery.py), [protocol](../docs/scroll-reading-benchmarks.md) |
-| Paired CT/ink/mask reads | [`bench_paired.py`](bench_paired.py), [protocol](../docs/scroll-reading-benchmarks.md) |
-| TIFF and label readers | [`bench_source_readers.py`](bench_source_readers.py), [reader guide](../docs/source-reading.md#run-and-validate) |
-| Storage formats and cache behavior | [`bench_source_storage.py`](bench_source_storage.py), [protocol](../docs/source-reading-benchmarks.md) |
-| tifxyz layers and surface projection | [`bench_surface.py`](bench_surface.py) |
-| Dataset/collation/transfer integration | [`bench_training.py`](bench_training.py), [guide](training.md), [acceptance](../docs/training-workflow-benchmarks.md) |
+## Reporting
 
 Use `--help` for each harness. Keep validation/profiling separate from throughput
 runs, retain JSON reports with commands and build hashes, and report the input

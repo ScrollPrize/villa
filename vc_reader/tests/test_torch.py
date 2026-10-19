@@ -8,7 +8,7 @@ import unittest
 
 if os.environ.get("VC_READER_NATIVE_DIR"):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarks"))
-    from bench_pipeline import load_extensions
+    from native_build import load_extensions
     load_extensions(Path(os.environ["VC_READER_NATIVE_DIR"]))
 
 import numpy as np
@@ -69,7 +69,7 @@ import sys, os
 if os.environ.get('VC_READER_NATIVE_DIR'):
     sys.path.insert(0, 'benchmarks')
     from pathlib import Path
-    from bench_pipeline import load_extensions
+    from native_build import load_extensions
     load_extensions(Path(os.environ['VC_READER_NATIVE_DIR']))
 import vc_reader
 from vc_reader import augment
