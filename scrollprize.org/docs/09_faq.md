@@ -66,7 +66,7 @@ Many of the team first arrived as contestants, won prizes, and [were then recrui
 
 ### What dates do I need to know?
 
-The [2027 Grand Prize](prizes#2027-grand-prize), [First Letters](prizes#first-letters-prizes), and [PHerc. Paris 4's Title](prizes#first-title-prize) prizes all close on **June 25th, 2027 (11:59pm Pacific)**. [Progress Prizes](prizes#progress-prizes) are awarded every month — including \$20,000 guaranteed for the best submission. See [Open Prizes](prizes) for everything in one place, and [join the community](get_started) to stay tuned!
+The [2027 Grand Prize](prizes#2027-grand-prize), [First Letters](prizes#first-letters-prizes), and [PHerc. Paris. 4's Title](prizes#first-title-prize) prizes all close on **June 25th, 2027 (11:59pm Pacific)**. [Progress Prizes](prizes#progress-prizes) are awarded every month — including \$20,000 guaranteed for the best submission. See [Open Prizes](prizes) for everything in one place, and [join the community](get_started) to stay tuned!
 
 ### What's the historical background of Herculaneum and the scrolls?
 
@@ -172,7 +172,7 @@ Here are some other excellent books we recommend:
 
 Yes, in fact we encourage you to share your progress. Be sure to also post in our Discord, to get feedback from the community.
 
-The only exception: if you are competing for a prize that involves reading new text (the [Grand Prize](prizes#2027-grand-prize), [First Letters](prizes#first-letters-prizes), or [PHerc. Paris 4’s Title](prizes#first-title-prize)), do not make your discovery public — e.g., entire words or passages — until the prize is officially announced. We will work with you to announce your findings.
+The only exception: if you are competing for a prize that involves reading new text (the [Grand Prize](prizes#2027-grand-prize), [First Letters](prizes#first-letters-prizes), or [PHerc. Paris. 4’s Title](prizes#first-title-prize)), do not make your discovery public — e.g., entire words or passages — until the prize is officially announced. We will work with you to announce your findings.
 
 ### I’m outside the United States, can I participate and win prizes?
 
@@ -234,7 +234,7 @@ There are two ways you can write on papyrus: horizontally (“volumen”) or [ve
 
 ### How big are the letters, and where can we expect to find text?
 
-Letter sizes vary, and of course we don’t know what’s inside the unopened scrolls, but we expect the opened fragments to be fairly representative. You can measure how big the letters are by looking at the aligned surface images, which have a voxel resolution of approximately 3.24µm, like the original CT data (though there can be some local variation due to the registration / flattening process). For example, open a fragment page in the [Data Browser](data_browser) — say [PHerc. Paris 2 Fr 47](data_browser/PHercParis2Fr47) — measure a letter size in pixels on its surface image, and multiply by the pixel size.
+Letter sizes vary, and of course we don’t know what’s inside the unopened scrolls, but we expect the opened fragments to be fairly representative. You can measure how big the letters are by looking at the aligned surface images, which have a voxel resolution of approximately 3.24µm, like the original CT data (though there can be some local variation due to the registration / flattening process). For example, open a fragment page in the [Data Browser](data_browser) — say [PHerc. Paris. 2 Fr 47](data_browser/PHercParis2Fr47) — measure a letter size in pixels on its surface image, and multiply by the pixel size.
 
 There are also some measurements in [this paper by Richard Janko](http://www-personal.umich.edu/~rjanko/how-to-read-and-reconstruct-a-herculaneum-papyrus.pdf), though it’s a little hard to infer actual letter sizing from it. If someone wants to do a more thorough review of the range of letter sizes found in all the Herculaneum papyri, we’d happily include your results here!
 
@@ -406,7 +406,7 @@ It could be worthwhile to try to reverse engineer what machine learning models a
 
 ### Does segmenting and flattening need to happen before ink detection?
 
-This ordering is largely historical and due to the way our label sets were constructed, which relied on doing the segmentation and flattening first. It is no longer the only way: alongside surface-conditioned ink detection, **direct 3D ink segmentation** is now in use — on PHerc. Paris 4, ink is segmented directly in the 3D volume. See [Ink recovery](2026_open_problems#3-ink-recovery-reading-the-scrolls) and [Direct 3D ink segmentation](2026_open_problems#direct-3d-ink-segmentation) in the Open Problems post, and the released [ink\_3d\_dino\_guided](https://huggingface.co/scrollprize/ink_3d_dino_guided) checkpoint.
+This ordering is largely historical and due to the way our label sets were constructed, which relied on doing the segmentation and flattening first. It is no longer the only way: alongside surface-conditioned ink detection, **direct 3D ink segmentation** is now in use — on PHerc. Paris. 4, ink is segmented directly in the 3D volume. See [Ink recovery](2026_open_problems#3-ink-recovery-reading-the-scrolls) and [Direct 3D ink segmentation](2026_open_problems#direct-3d-ink-segmentation) in the Open Problems post, and the released [ink\_3d\_dino\_guided](https://huggingface.co/scrollprize/ink_3d_dino_guided) checkpoint.
 
 Sampling model inputs directly from the original 3D X-ray volume avoids the loss of resolution that resampling into a differently oriented surface volume introduces. The trade-off is data scale: full-scroll volumes are teravoxel-sized, which is why current releases are cloud-optimized OME-Zarr streamed from S3 so tools read only the region they need — see [Data scale](2026_open_problems#4-data-scale-the-infrastructure-bottleneck).
 
