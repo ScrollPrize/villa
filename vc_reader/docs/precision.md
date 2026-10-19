@@ -76,6 +76,21 @@ existing wider arithmetic.
 There is no public precision mode to tune for ordinary ML
 use, and no fast-math compiler change.
 
+Unmasked float32 z-score normalization uses independent double accumulators
+for the mean and centered variance, then a double reciprocal for scaling.
+It omits extrema and magnitude rescaling: finite float32 values and their
+squared deviations fit in double even when summed over a size_t-sized array.
+The mean remains double so small deviations on a large baseline survive.
+Above 2^29 voxels, the extrema-aware path preserves exact zeros for constant
+float32 arrays even when their total sum no longer fits exactly in double.
+CUDA combines float32 mean collection with its bounds/count pass when zeros
+are included, avoiding a separate scan and reduction without host readback.
+
+Dense uint8 affine crops on CPU may use a contiguous source block. Axis-sized
+coordinate tables retain the same ordered float32 operations as direct chunk
+sampling and CUDA; source addressing remains integer. Sparse grids continue
+to use direct chunks. Neither route changes interpolation or fill semantics.
+
 ## Replay and numerical changes
 
 New replay records use `VCA2`. Local intensity fields serialize their compact
@@ -94,9 +109,9 @@ measurements. Nearest resize now resolves exact half-voxel ties identically on
 CPU/CUDA (for example 128 → 109 selects source 64 at output 54). This can change
 whole sampled planes relative to previous floating-point tie rounding; it is
 a deliberate index-semantics correction, separate from small interpolation
-roundoff. See [performance measurements](../benchmarks/README.md#cuda-geometry-optimizations).
+roundoff.
 
-The subsequent [CUDA work-reduction pass](../benchmarks/README.md#cuda-geometry-work-reduction)
+The subsequent CUDA work-reduction pass
 factors interior interpolation into axis blends, shares B-spline expansion work
 across components, fuses field centering with statistics/scaling, and changes
 the reduction grid. The lattice, float32 field storage, RMS convention and
@@ -117,11 +132,15 @@ neither transform includes the other's implementation.
 Using existing configured Release builds, without installing dependencies:
 
 ```bash
-AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-reader-cuda --parallel 4
-AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=/tmp/vc-reader-cuda \
+export VC_READER_NATIVE_DIR=/path/to/configured/cuda-build
+AGENTS_AGENT_MODE=1 cmake --build "$VC_READER_NATIVE_DIR" --parallel 4
+AGENTS_AGENT_MODE=1 \
   .venv/bin/python tests/test_precision.py -v
-AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=/tmp/vc-reader-cuda \
+AGENTS_AGENT_MODE=1 \
   .venv/bin/python tests/test_torch.py -v
+# Optional 2 GiB constant-array regression, plus dense crop boundary checks.
+AGENTS_AGENT_MODE=1 VC_READER_LARGE_TESTS=1 \
+  .venv/bin/python -m pytest tests/test_dense_affine.py
 # Repeat with a configured VC_READER_ENABLE_CUDA=OFF build for CPU-only coverage.
 ```
 

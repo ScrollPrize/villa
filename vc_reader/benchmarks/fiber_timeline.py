@@ -66,6 +66,18 @@ def install_worker(client):
     WeightedDatasets.__iter__ = iterate
 
 
+def init_profile_worker(worker_id=None):
+    from types import SimpleNamespace
+    install_worker(SimpleNamespace())
+
+
+class ProfileDataLoader(torch.utils.data.DataLoader):
+    def __init__(self, *args, **kwargs):
+        if kwargs.get('worker_init_fn') is not None:
+            raise ValueError('Profiling loader requires ownership of worker initialization')
+        super().__init__(*args, worker_init_fn=init_profile_worker, **kwargs)
+
+
 def install_main(train):
     from vc_reader import augment
     from vc_reader.reader.cuda import CudaReader

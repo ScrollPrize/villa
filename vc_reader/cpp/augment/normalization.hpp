@@ -71,12 +71,45 @@ template<class F> void for_parts(std::size_t count, F&& fn) {
 inline void require_finite(double v) {
     if (!std::isfinite(v)) throw std::invalid_argument("normalization requires finite crop values");
 }
+// Unmasked float32 z-score needs neither extrema nor overflow rescaling:
+// even FLT_MAX squared, summed over a size_t-sized image, fits in double.
+// Four independent sums expose SIMD without reassociating compiler flags.
+// Keep the mean/subtraction wide for small deviations on a large baseline.
+inline void zscore_float(float* values, std::size_t n, double eps) {
+    if (!n) return;
+    double sums[4]={};
+    std::size_t i=0;
+    for (;i+4<=n;i+=4)
+        for (int j=0;j<4;++j) sums[j]+=double(values[i+j]);
+    double sum=(sums[0]+sums[1])+(sums[2]+sums[3]);
+    for (;i<n;++i) sum+=double(values[i]);
+    require_finite(sum);
+    const double mean=sum/double(n);
+    double squares[4]={}; i=0;
+    for (;i+4<=n;i+=4)
+        for (int j=0;j<4;++j) { const double d=double(values[i+j])-mean; squares[j]+=d*d; }
+    double squared=(squares[0]+squares[1])+(squares[2]+squares[3]);
+    for (;i<n;++i) { const double d=double(values[i])-mean; squared+=d*d; }
+    if (!squared) { std::fill(values,values+n,0.f); return; }
+    const double divisor=std::max(std::sqrt(squared/double(n)),eps);
+    const double inverse=1/divisor;
+    for (i=0;i<n;++i) values[i]=float((double(values[i])-mean)*inverse);
+}
 // Fixed segments and ordered reductions: the answer does not depend on worker
 // count or completion order. Statistics use float64, on the converted output.
 template <class T>
 void normalize_crop(T* values, std::size_t n, const Normalize& t, const std::uint8_t* valid)
 {
     if (!n) return;
+    if constexpr (std::is_same_v<T,float>) {
+        // Up to 2^29 values, a constant float32 image has an exact double
+        // sum (24 significand bits + 29 count bits). Larger arrays retain
+        // the extrema check so mean rounding cannot turn a constant into ±1.
+        if (t.mode==Normalization::ZScore && !t.nonzero && !valid && n <= (std::size_t{1}<<29)) {
+            zscore_float(values,n,t.eps);
+            return;
+        }
+    }
     const bool nonzero = t.mode == Normalization::ZScore && t.nonzero;
     const auto skip = [&](std::size_t i) { return (valid && !valid[i]) || (nonzero && values[i] == T{0}); };
     constexpr std::size_t grain = 65536;

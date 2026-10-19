@@ -107,7 +107,7 @@ def crop_affines(positions, frames, crop, scale):
     return origins[:, ::-1], axes.astype(np.float32)
 
 
-def augmentation_pipeline():
+def augmentation_pipeline(backend='cuda'):
     from vc_reader import augment as a
     # Per-sample values are resolved by the common native batch executor.
     return a.Pipeline([
@@ -117,7 +117,18 @@ def augmentation_pipeline():
         a.Contrast(factor=a.Param('contrast'), preserve_range=False),
         a.BrightnessAdd(shift=a.Param('brightness')),
         a.GaussianNoise(std=a.Param('noise')),
-    ], targets={'image': a.Image()}, backend='cuda')
+    ], targets={'image': a.Image()}, backend=backend)
+
+
+def augmentation_params(request):
+    params = dict(blur=[], contrast=[], brightness=[], noise=[])
+    for photometric, sigma in zip(request['photometric'], request['blur']):
+        contrast, brightness, noise = photometric if photometric is not None else (1., 0., 0.)
+        params['blur'].append(sigma if photometric is not None else 0.)
+        params['contrast'].append(contrast)
+        params['brightness'].append(brightness * 8.)
+        params['noise'].append(noise * 8.)
+    return params
 
 
 class CudaReaderPool:
@@ -204,13 +215,7 @@ class CudaInputs:
                                      out=images[start:end, 0])
         self.stage_seconds['read_sample'] += time.perf_counter() - began
         began = time.perf_counter()
-        params = dict(blur=[], contrast=[], brightness=[], noise=[])
-        for photometric, sigma in zip(request['photometric'], request['blur']):
-            contrast, brightness, noise = photometric if photometric is not None else (1., 0., 0.)
-            params['blur'].append(sigma if photometric is not None else 0.)
-            params['contrast'].append(contrast)
-            params['brightness'].append(brightness * 8.)
-            params['noise'].append(noise * 8.)
+        params = augmentation_params(request)
         if self.augmentation == 'batch':
             output = self.pipeline.batch({'image': images}, seeds=request['seeds'], params=params)['image']
             self.batch_calls += 1

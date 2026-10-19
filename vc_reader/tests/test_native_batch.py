@@ -59,7 +59,8 @@ class NativeBatchTests(unittest.TestCase):
                 A.Smear(axis='y', shift=(1,) if len(shape)==2 else (1, 0)),
                 A.Flip(), A.Affine(degrees=7), A.Elastic(magnitude=1), A.LowResolution(.7),
                 A.Rotate90(planes=['yx'], turns=[2]), A.CropPad(shape), A.SheetCompression(),
-                A.Normalize('minmax'), A.Normalize('zscore'), A.Normalize('percentile'),
+                A.Normalize('minmax'), A.Normalize('zscore'), A.Normalize('zscore', nonzero=False),
+                A.Normalize('percentile'),
                 A.GridDropout(), A.StripeMasking(), A.ForegroundDropout(), A.ObjectDropout(),
             ]
             for transform in transforms:

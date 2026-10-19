@@ -2,7 +2,7 @@
 
 Sampling/state decisions remain in workers. Native CPU plane intersections
 replace their Python plane loops. Final neighbor clearance, frame transforms
-and voxelization run on CUDA; compiled losses consume sorted sparse keys.
+and voxelization use the selected backend; compiled losses consume sorted sparse keys.
 """
 from collections import OrderedDict
 import os
@@ -120,7 +120,7 @@ def install_worker():
         observations.IdentityObservationBuilder.bank_targets = bank_targets
 
 
-def install(*, validate=False, placement='prefetch'):
+def install(*, validate=False, placement='prefetch', backend='cuda'):
     global ORIGINAL_HITS
     os.environ['FIBER_BENCH_GEOMETRY'] = '1'
     os.environ['FIBER_BENCH_GEOMETRY_VALIDATE'] = '1' if validate else '0'
@@ -129,9 +129,11 @@ def install(*, validate=False, placement='prefetch'):
     if ORIGINAL_HITS is None:
         ORIGINAL_HITS = targets.foreign_hits
         targets.foreign_hits = foreign_hits
-    geometry = CudaGeometry()
+    geometry = Geometry(backend=backend)
     geometry.placement = placement
     if placement == 'prefetch':
+        if backend != 'cuda':
+            raise ValueError('CPU geometry runs in loader workers or on the main thread')
         from vesuvius.neural_tracing.tracers.fibers.train import train
         from vc_reader import _native
         from fiber_timeline import span
@@ -169,8 +171,11 @@ def nearest_outputs(points):
     return result
 
 
-class CudaGeometry:
-    def __init__(self):
+class Geometry:
+    def __init__(self, *, backend='cuda'):
+        if backend not in ('cpu', 'cuda'):
+            raise ValueError('geometry backend must be cpu or cuda')
+        self.device = backend
         self.parents = OrderedDict()
         self.placement = 'main'
         self.counters = dict(batches=0, candidate_points=0, max_candidate_points=0,
@@ -185,16 +190,16 @@ class CudaGeometry:
         sizes = [len(item['points']) if item is not None else 0 for item in requests]
         offsets = np.r_[0, np.cumsum(sizes)]
         n = int(offsets[-1])
-        keys = torch.empty((len(requests), 32768), device='cuda', dtype=torch.int64)
+        keys = torch.empty((len(requests), 32768), device=self.device, dtype=torch.int64)
         if n > keys.numel():
             raise ValueError(f'{n} candidate points exceed sparse key capacity {keys.numel()}')
-        counts = torch.zeros(len(requests), device='cuda')
-        ids = torch.as_tensor(np.repeat(np.arange(len(requests)), sizes), device='cuda')
-        voxels = torch.empty((n, 3), device='cuda')
+        counts = torch.zeros(len(requests), device=self.device)
+        ids = torch.as_tensor(np.repeat(np.arange(len(requests)), sizes), device=self.device)
+        voxels = torch.empty((n, 3), device=self.device)
         if n:
-            points = torch.as_tensor(np.concatenate([i['points'] for i in requests if i is not None]), device='cuda')
+            points = torch.as_tensor(np.concatenate([i['points'] for i in requests if i is not None]), device=self.device)
             frames = torch.as_tensor(np.stack([i['frame'] if i is not None else np.eye(3)
-                                               for i in requests]), device='cuda')
+                                               for i in requests]), device=self.device)
             # Only cell quantization needs float64. Native nearest-query inputs,
             # distances, cell centers and all model tensors remain float32.
             local = torch.bmm(points[:, None], frames[ids]).squeeze(1)
@@ -206,21 +211,21 @@ class CudaGeometry:
                 near &= indices[:, a] <= size-1
             identities = [i['identity'] if i is not None else np.zeros((1, 3), np.float32) for i in requests]
             identity_offsets = np.r_[0, np.cumsum([len(p) for p in identities])]
-            identity = PolylineSet(np.concatenate(identities), identity_offsets).cuda()
+            identity = self.resident(PolylineSet(np.concatenate(identities), identity_offsets))
             local32 = local.float()
             result = nearest_outputs(local32)
-            identity.nearest(local32, curve_ids=ids, vertices=True, out=result)
-            bounds = torch.as_tensor(identity_offsets, device='cuda')
+            identity.nearest(local32, curve_ids=ids, vertices=True, out=self.output(result))
+            bounds = torch.as_tensor(identity_offsets, device=self.device)
             keep = near & (result['indices'] > bounds[ids]) & (result['indices'] < bounds[ids+1]-1)
             voxels = indices.round().float()
             centers = torch.stack(((voxels[:, 2]-(crop.width-1)/2)*crop.spacing,
                                    (voxels[:, 1]-(crop.width-1)/2)*crop.spacing,
                                    (voxels[:, 0]-crop.behind)*crop.spacing), -1)
             positions = torch.as_tensor(np.stack([i['position'] if i is not None else np.zeros(3, np.float32)
-                                                  for i in requests]), device='cuda')
+                                                  for i in requests]), device=self.device)
             affines = torch.cat((frames.float(), positions[:, :, None]), -1)
             world_centers = torch.empty_like(centers)
-            transform_points(centers, affines[ids], out=world_centers)
+            transform_points(centers, affines[ids], out=self.output(world_centers))
             queries = torch.stack((points.float()+positions[ids], world_centers), 1).reshape(-1, 3)
             parent_result = nearest_outputs(queries)
         for row, item in enumerate(requests):
@@ -228,17 +233,17 @@ class CudaGeometry:
                 continue
             key = item['key']
             if key not in self.parents:
-                self.parents[key] = PolylineSet(item['parent'], [0, len(item['parent'])]).cuda()
-                self.counters['parent_uploads'] += 1
+                self.parents[key] = self.resident(PolylineSet(item['parent'], [0, len(item['parent'])]))
+                self.counters['parent_uploads'] += int(self.device == 'cuda')
                 if len(self.parents) > 256:
                     self.parents.popitem(last=False)
             self.parents.move_to_end(key)
             part = slice(2*offsets[row], 2*offsets[row+1])
             self.parents[key].nearest(queries[part], vertices=True,
-                                     out={k: v[part] for k, v in parent_result.items()})
+                                     out=self.output({k: v[part] for k, v in parent_result.items()}))
         if n:
             margins = torch.as_tensor(np.array([[i['gap'], i['exclusion']] if i is not None else [0., 0.]
-                                                for i in requests], np.float32), device='cuda')[ids]
+                                                for i in requests], np.float32), device=self.device)[ids]
             distances = parent_result['distances'].reshape(-1, 2)
             keep &= distances[:, 0]-margins[:, 0] > margins[:, 1]
             counts.scatter_reduce_(0, ids, keep.float(), reduce='amax')
@@ -247,7 +252,7 @@ class CudaGeometry:
         occupancy = VoxelSet(voxels, shape, batch_ids=ids, batches=len(requests))
         # Stable shape for the trainer's fullgraph compiled loss. Oversize
         # inputs raise rather than silently discarding any occupied cells.
-        occupancy.sorted_keys(capacity=keys.numel(), out=keys.view(-1))
+        occupancy.sorted_keys(capacity=keys.numel(), out=self.output(keys.view(-1)))
         batch['foreign'] = keys
         # These small counts feed the trainer's existing CPU metrics only.
         batch['foreign_components'] = counts.cpu()
@@ -257,8 +262,8 @@ class CudaGeometry:
         self.counters['seconds'] += time.perf_counter()-began
         if 'expected' in request:
             expected = request['expected']
-            actual = torch.empty((len(requests), *shape), device='cuda', dtype=torch.uint8)
-            occupancy.to_dense(out=actual)
+            actual = torch.empty((len(requests), *shape), device=self.device, dtype=torch.uint8)
+            occupancy.to_dense(out=self.output(actual))
             try:
                 np.testing.assert_array_equal(actual.cpu().numpy(), expected['foreign'].numpy())
                 torch.testing.assert_close(batch['foreign_components'], expected['foreign_components'])
@@ -269,8 +274,16 @@ class CudaGeometry:
                 raise
             self.counters['validated_batches'] += 1
 
+    def resident(self, curves):
+        return curves.cuda() if self.device == 'cuda' else curves
+
+    def output(self, value):
+        if isinstance(value, dict):
+            return {key: self.output(array) for key, array in value.items()}
+        return value if self.device == 'cuda' else value.numpy()
+
     def stats(self):
-        return dict(self.counters, backend='cuda', worker_planes='vc_reader CPU',
+        return dict(self.counters, backend=self.device, worker_planes='vc_reader CPU',
                     placement=self.placement,
-                    foreign='sorted sparse keys; CUDA clearance, transforms and voxelization',
+                    foreign='sorted sparse keys; native clearance, transforms and voxelization',
                     sampling_feedback='CPU trainer policy', resident_parent_limit=256)

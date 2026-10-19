@@ -18,7 +18,7 @@ template<class T> __device__ inline bool skip(const Selection& s, std::size_t i,
 // Bounds/count, scaled mean, then centered population variance. Separate
 // passes retain the reader's protection against overflow and cancellation.
 template<class T, int Phase> __device__ void collect_normalization(KernelIndex vcr_launch,
-        View<T> input, Partial* output, const ParametersGPU* params, Selection select, int* invalid) {
+        View<T> input, Partial* output, const ParametersGPU* params, Selection select, int* invalid, bool mean_ready) {
     if constexpr (Phase != 0) if (params->constant) return;
     __shared__ Partial values[256];
     Partial p{0,0,INFINITY,-INFINITY};
@@ -48,6 +48,7 @@ template<class T, int Phase> __device__ void collect_normalization(KernelIndex v
             if constexpr (Phase == 0) {
                 if (!isfinite(x)) { atomicExch(invalid,1); continue; }
                 p.low = fmin(p.low,x); p.high = fmax(p.high,x); p.weight += 1;
+                if (mean_ready) p.sum += x;
             } else {
                 const double scaled = decltype(unscaled)::value ? x : x/scale;
                 if constexpr (Phase == 1) p.sum += scaled;
@@ -64,7 +65,7 @@ template<class T, int Phase> struct collect_normalization_launch2 {
 };
 
 template<int Phase> __device__ void finish_normalization(KernelIndex vcr_launch,
-        const Partial* input, unsigned count, ParametersGPU* params, bool zscore, double eps) {
+        const Partial* input, unsigned count, ParametersGPU* params, bool zscore, double eps, bool mean_ready) {
     if constexpr (Phase != 0) if (params->constant) return;
     __shared__ Partial values[256];
     Partial p{0,0,INFINITY,-INFINITY};
@@ -79,6 +80,7 @@ template<int Phase> __device__ void finish_normalization(KernelIndex vcr_launch,
             *params = {q.low,1,q.high-q.low,q.weight,q.low,q.high,q.weight == 0 || q.low == q.high};
             if (params->constant) { params->divisor = 0; return; }
             if (zscore) {
+                if (mean_ready) { params->center=q.sum/q.weight; return; }
                 const double magnitude = fmax(fabs(q.low),fabs(q.high));
                 if (magnitude > 1e150 || magnitude < 1e-150) params->scale = magnitude;
             } else if (!isfinite(params->divisor)) {
@@ -244,13 +246,19 @@ struct fixed_values_launch {
 template<class T> void moments(View<T> data, Selection select, ParametersGPU* params, int* invalid, double eps, bool zscore) {
     const unsigned count = std::min(blocks(data.size),1024u);
     Buffer<Partial> partial(count);
-    launch(count,256,0,vcr::device::stream(), collect_normalization_launch2<T,0>{}, data,partial.ptr,nullptr,select,invalid);
-    launch(1,256,0,vcr::device::stream(), finish_normalization_launch1<0>{}, partial.ptr,count,params,zscore,eps);
+    // Every finite float32 input can be summed safely in double without a
+    // magnitude-dependent scale. Collect its mean with bounds/count instead
+    // of reading the image and reducing a second time. No host readback.
+    const bool mean_ready=std::is_same_v<T,float> && !select.nonzero && zscore;
+    launch(count,256,0,vcr::device::stream(), collect_normalization_launch2<T,0>{}, data,partial.ptr,nullptr,select,invalid,mean_ready);
+    launch(1,256,0,vcr::device::stream(), finish_normalization_launch1<0>{}, partial.ptr,count,params,zscore,eps,mean_ready);
     if (!zscore) return;
-    launch(count,256,0,vcr::device::stream(), collect_normalization_launch2<T,1>{}, data,partial.ptr,params,select,invalid);
-    launch(1,256,0,vcr::device::stream(), finish_normalization_launch1<1>{}, partial.ptr,count,params,true,eps);
-    launch(count,256,0,vcr::device::stream(), collect_normalization_launch2<T,2>{}, data,partial.ptr,params,select,invalid);
-    launch(1,256,0,vcr::device::stream(), finish_normalization_launch1<2>{}, partial.ptr,count,params,true,eps);
+    if (!mean_ready) {
+        launch(count,256,0,vcr::device::stream(), collect_normalization_launch2<T,1>{}, data,partial.ptr,params,select,invalid,false);
+        launch(1,256,0,vcr::device::stream(), finish_normalization_launch1<1>{}, partial.ptr,count,params,true,eps,false);
+    }
+    launch(count,256,0,vcr::device::stream(), collect_normalization_launch2<T,2>{}, data,partial.ptr,params,select,invalid,false);
+    launch(1,256,0,vcr::device::stream(), finish_normalization_launch1<2>{}, partial.ptr,count,params,true,eps,false);
 }
 } // namespace
 

@@ -6,6 +6,7 @@
 #include "chunk_io.hpp"
 #include "output.hpp"
 #include "sampling_math.hpp"
+#include "dense_affine.hpp"
 #include "codecs.hpp"
 #include "disk_cache.hpp"
 #include "http.hpp"
@@ -444,15 +445,40 @@ public:
         });
     }
 
-    // Float32 uint8 CT entry: shares the general planner and interpolation math.
+    // Float32 uint8 CT entry: select a dense workspace only when its volume is
+    // bounded relative to the requested samples; otherwise plan direct chunks.
     template<class Coordinates>
     void sample_u8_float32(const Coordinates& coords, std::size_t n, int order, void* out) {
         if (ndim() != 3 || spec_.itemsize != 1)
             throw std::invalid_argument("float32 sampling requires 3-D uint8 CT");
         if (order == 0) read_points_as<3>(coords,n,static_cast<std::uint8_t*>(out));
-        else if (order == 1)
+        else if (order == 1) {
+            if constexpr (std::is_same_v<Coordinates,FloatAffine>) {
+                sampling::DenseAffineBlock block;
+                if (block.plan(coords,n)) {
+                    std::vector<std::uint8_t> raw(block.count);
+                    bool resident=true;
+                    try {
+                        read_many({Index(block.start.begin(),block.start.end())},
+                                  {Index(block.size.begin(),block.size.end())},{raw.data()});
+                    } catch (const CacheMiss&) {
+                        // An offline cache may contain the sampled chunks but
+                        // not every chunk in the enclosing box.
+                        resident=false;
+                    }
+                    if (resident) {
+                        block.sample(coords,raw.data(),static_cast<float*>(out),
+                            [&](std::size_t count,const auto& fn) {
+                                if (pool_.size()==1) for (std::size_t z=0;z<count;++z) fn(z);
+                                else pool_.parallel_for(count,fn);
+                            });
+                        return;
+                    }
+                }
+            }
             sample_linear_as<3>(coords,n,ElementType{'u',1,false},false,out,
                                [](const std::uint8_t* at) { return float(*at); });
+        }
         else throw std::invalid_argument("order must be 0 or 1");
     }
 

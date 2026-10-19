@@ -594,8 +594,10 @@ class ZarrReader:
         reader's caches. Chunk loads are deduplicated within each point batch
         (up to 2**20 points); reuse across grids depends on the caches.
         ``out`` optionally supplies one destination (or None) per grid.
-        Output buffers must not overlap. No full source box or coordinate
-        grid is assembled. Use an augmentation pipeline to normalize the output.
+        Output buffers must not overlap. Dense uint8/float32 grids may use a
+        contiguous source box, capped at 64 MiB and eight source voxels per
+        output voxel. Sparse grids use direct chunks. No dense coordinate grid
+        is assembled. Use an augmentation pipeline to normalize the output.
         """
         self._ready()
         if self.ndim != 3:

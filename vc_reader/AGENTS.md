@@ -4,11 +4,16 @@ this package is intended to provide useful tools for working with the vesuvius c
 - volume and image data fetching and sampling
 - augmentations
 
-performance is not an afterthought for anything implemented in this repository. these tools are intended for very large scale multidimensional image processing and machine learning training. it is critical that we account for performance with any changes. 
+performance must be prioritized for anything implemented in this repository. these tools are intended for very large scale multidimensional image processing and machine learning training. it is critical that we account for performance with any changes. 
 
 ### general rules
 - for augmentations and sampling, whenever we add a cpu implementation we should have a matching cuda implementation
 - in many cases, these tools will be used in pytorch dataloaders or within ml training pipelines, and this should be considered when designing things
+- readme files and other repository files must not contain development notes unless they are relevant to the implementation (nonstandard implementation or gotcha that would be helpful to future developers). during development you are welcome to keep notes in a gitignored development_notes folder. 
+
+### cuda implementations
+- vc_reader has two backends -- cpu and cuda -- for most things within vc_reader that operate on volumes or images, wherever a cpu implementation exists there should be a cuda implementation as well  
+
 
 ### precision and dtypes
 - any dtype higher than float32 must be justified. do not use higher dtypes just because you've seen them used elsewhere in the codebase. 

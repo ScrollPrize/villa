@@ -513,7 +513,7 @@ numerical conditioning requires it. Output dtypes are preserved. Small
 coordinate differences can select a neighboring label at a nearest-neighbor
 boundary. New replay plans use float32 fields; old plans must be regenerated.
 See the [precision policy](docs/precision.md) and
-[geometry optimization measurements](benchmarks/README.md#cuda-geometry-optimizations).
+[augmentation benchmarks](benchmarks/README.md#augmentation-benchmarks).
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |
 | ---: | ---: | ---: | ---: | ---: |

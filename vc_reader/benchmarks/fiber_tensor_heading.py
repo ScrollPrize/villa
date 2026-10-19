@@ -1,4 +1,4 @@
-"""CUDA sheet-normal service for CPU geometry/label workers in the benchmark.
+"""Sheet-normal heading calculation and CUDA service for the fiber benchmark.
 
 The service runs in the training process. Workers send small query descriptions;
 only headings/frames return to CPU. CT patches and tensor intermediates remain
@@ -49,14 +49,17 @@ class Client:
             if TIMELINE:
                 request['trace_sent'] = began
                 request['trace_context'] = self.trace_context
-            self.connection.send(request)
-            ok, value = self.connection.recv()
+            ok, value = self.exchange(request)
             if TIMELINE:
                 self.trace_seconds += time.perf_counter()-began
                 self.trace_requests += 1
         if not ok:
-            raise RuntimeError('CUDA heading service failed:\n'+value)
+            raise RuntimeError('Heading calculation failed:\n'+value)
         return value
+
+    def exchange(self, request):
+        self.connection.send(request)
+        return self.connection.recv()
 
     def seed_key(self, vol, pos, family, direction):
         return (id(vol), tuple(pos), str(family), tuple(direction))
@@ -107,8 +110,8 @@ def held_frame(vol, pos, heading, previous=None, *, fallback=None, diagnostics=N
     return frame.astype(np.float64)
 
 
-def forbid_cpu_tensor(*args, **kwargs):
-    raise RuntimeError('CPU structure tensor called during CUDA heading benchmark')
+def forbid_trainer_tensor(*args, **kwargs):
+    raise RuntimeError('Trainer tensor calculation bypassed the selected vc_reader backend')
 
 
 class Predictor:
@@ -122,9 +125,9 @@ def load_predictor(*args):
     return Predictor()
 
 
-def install_heading(connection):
+def install_heading(connection=None, *, client=None):
     global CLIENT
-    CLIENT = Client(connection)
+    CLIENT = Client(connection) if client is None else client
     from vesuvius.neural_tracing.tracers.fibers.frames import ct, learned
     from vesuvius.neural_tracing.tracers.fibers.data import observations, targets, follow_dataset, seeds
     from vesuvius.neural_tracing.tracers.fibers.train import live_continuation
@@ -133,7 +136,7 @@ def install_heading(connection):
     learned.crop_frame_bounds = observations.crop_frame_bounds = crop_frame_bounds
     ct.oriented_seed_heading = targets.oriented_seed_heading = seeds.oriented_seed_heading = seed_heading
     ct.ct_frame = live_continuation.ct_frame = held_frame
-    ct.ct_normal = ct.ct_tensor = forbid_cpu_tensor
+    ct.ct_normal = ct.ct_tensor = forbid_trainer_tensor
     original = follow_dataset.FollowDataset.resolve_seeds
     if not getattr(original, '_tensor_heading', False):
         def resolve_seeds(self, items, vol, rng, windows):
@@ -158,40 +161,26 @@ class HeadingDataLoader(ReaderDataLoader.__bases__[0]):
         super().__init__(*args, worker_init_fn=partial(init_worker, connections=connections), **kwargs)
 
 
-class Service:
-    def __init__(self, pool, *, stream='default'):
-        self.stream_mode = stream
-        self.connections = []
-        self.timeline = []
-        self.pool = pool
-        self.stop = threading.Event()
-        self.lock = threading.Lock()
+class HeadingCalculator:
+    def __init__(self, pool, *, device):
+        self.pool, self.device = pool, device
         self.counters = dict(requests=0, queries=0, seed_queries=0, frame_queries=0,
                              invalid_normals=0, result_download_bytes=0, seconds=0.)
-        main = self.add_clients(1)[0]
-        install_heading(main)
-        self.thread = threading.Thread(target=self.run, name='cuda-sheet-heading', daemon=True)
-        self.thread.start()
-
-    def add_clients(self, n):
-        pairs = [mp.get_context().Pipe() for _ in range(n)]
-        with self.lock:
-            self.connections.extend(a for a,b in pairs)
-        return [b for a,b in pairs]
 
     @torch.no_grad()
     def calculate(self, request):
         from vc_reader.sheet_normal import sample_sheet_normals
         from vesuvius.neural_tracing.tracers.fibers.heading_model.frames import orthonormal_frame
-        gpu = self.pool.get(request['reader'], 'heading')
+        reader = self.pool.get(request['reader'], 'heading')
         outputs = []
         for start in range(0,len(request['points']),8):
             part = slice(start,start+8)
-            result = torch.empty((len(request['points'][part]),4),device='cuda',dtype=torch.float32)
-            sample_sheet_normals(gpu,request['points'][part],out=result)
+            result = torch.empty((len(request['points'][part]),4),device=self.device,dtype=torch.float32)
+            sample_sheet_normals(reader,request['points'][part],
+                                 out=result if self.device == 'cuda' else result.numpy())
             normal, gap = result[:,:3],result[:,3]
-            prior = torch.as_tensor(request['priors'][part],device='cuda')
-            vertical = torch.tensor([str(f).upper() in ('V','VERTICAL') for f in request['families'][part]],device='cuda')
+            prior = torch.as_tensor(request['priors'][part],device=self.device)
+            vertical = torch.tensor([str(f).upper() in ('V','VERTICAL') for f in request['families'][part]],device=self.device)
             z = normal.new_tensor([0.,0.,1.]).expand_as(normal)
             heading = torch.where(vertical[:,None],z-normal[:,2:3]*normal,torch.linalg.cross(z,normal,dim=-1))
             length = heading.norm(dim=-1,keepdim=True)
@@ -204,14 +193,35 @@ class Service:
                 output = torch.where(valid[:,None],heading,torch.nan)
             else:
                 heading = prior if request['mode']=='held' else torch.where(valid[:,None],heading,prior)
-                anchors = torch.as_tensor(request['anchors'][part],device='cuda')
+                anchors = torch.as_tensor(request['anchors'][part],device=self.device)
                 output = orthonormal_frame(heading,normal,anchors)
             # One small result download includes the validity flag for accounting.
             packed = torch.cat((output.flatten(1),(gap<=0).float()[:,None]),dim=1).cpu().numpy()
-            self.counters['result_download_bytes'] += packed.nbytes
+            self.counters['result_download_bytes'] += packed.nbytes if self.device == 'cuda' else 0
             self.counters['invalid_normals'] += int(packed[:,-1].sum())
             outputs.append(packed[:,:-1].reshape(output.shape))
         return np.concatenate(outputs)
+
+
+class Service(HeadingCalculator):
+    def __init__(self, pool, *, stream='default'):
+        super().__init__(pool, device='cuda')
+        self.stream_mode = stream
+        self.connections = []
+        self.timeline = []
+        self.pool = pool
+        self.stop = threading.Event()
+        self.lock = threading.Lock()
+        main = self.add_clients(1)[0]
+        install_heading(main)
+        self.thread = threading.Thread(target=self.run, name='cuda-sheet-heading', daemon=True)
+        self.thread.start()
+
+    def add_clients(self, n):
+        pairs = [mp.get_context().Pipe() for _ in range(n)]
+        with self.lock:
+            self.connections.extend(a for a,b in pairs)
+        return [b for a,b in pairs]
 
     def run(self):
         if self.stream_mode == 'separate':
