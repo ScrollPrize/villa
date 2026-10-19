@@ -109,7 +109,7 @@ This is not covered by scrollprize.org/tutorial_spiral. Required keys:
 - `schema_version` — must equal `1`.
 - `name`, `voxel_size_um` — required, no validation beyond presence.
 - `z_direction_is_top_to_bottom`, `left_handed_coordinates` — the fitted
-  volume's two properties from the open-data catalog (`metadata.json`), copied
+  volume's two properties from the open-data catalog (`metadata.json`), copied 
 - verbatim as `true`/`false`. Together they fix the spiral's sense under the catalog convention that every scroll
   shows the same spiral seen from its top: `"CW"` when they are equal, `"ACW"`
   when they differ. The z direction also orients exported surfaces (below).
@@ -1155,29 +1155,6 @@ retained catalogs against the resident patches and re-derive all the
 point-collection views (cross-patch groups and unattached strips); the fiber
 side-rule settings below only affect fibers, so they re-link and
 re-materialise the fibers alone.
-
-### Explicit fiber links
-
-`pcl_fiber_explicit_links_only` (default off) replaces the fitter's own
-fiber-to-patch proximity linking with links decided elsewhere. Each fiber JSON
-may carry document-level tags `explicit_link:<patch id>` naming the tifxyz
-folders it lies on; with the setting on, a fiber attaches only to those
-patches (its points still need to be within tolerance of them) and a fiber
-without such tags attaches to no patch and is fitted as an unattached strip.
-Regular and absolute-winding point collections, and fiber-to-fiber bridge
-links (`branches`), are unaffected; with the setting off the tags are ignored.
-Tags naming patches that are not loaded are reported once and ignored.
-Changing the setting at a Run boundary re-links every resident collection.
-
-`auto_link_fibers.py` imports the tags from an existing `vc_fiber_patch_links`
-document or a legacy `vc3d_fiber_review` workspace. The command imports saved
-decisions; it does not discover new links.
-
-```sh
-python auto_link_fibers.py --links fiber_patch_links.json --fibers FIBERS          # dry run
-python auto_link_fibers.py --links fiber_patch_links.json --fibers FIBERS --apply  # writes, with backups
-python auto_link_fibers.py --review fiber_review.json --fibers FIBERS --apply      # legacy review
-```
 
 `pcl_link_window_points` and `pcl_link_window_min_points` (both default 1)
 gate candidates on their neighbours: a patch the point itself lies within

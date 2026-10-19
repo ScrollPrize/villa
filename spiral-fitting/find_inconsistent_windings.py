@@ -78,24 +78,6 @@ of that short step is counted on the pcl side: relative edges are expressed
 between the two points' attachments, and absolute anchors carry it as
 attachment_branch_delta.
 
-Before constructing graph edges, same-winding fiber attachments are checked
-against the first contact with each patch. Transport follows the complete fiber
-chain, including linked horizontal/vertical continuations and junction seam
-crossings, and is compared with transport along the patch. Later contacts on a
-different relative turn are rejected from the analysis graph. The first contact
-is defined by the deterministic member-tree traversal; Euler backtracking does
-not create another contact. Non-tree fiber links remain cycle constraints.
-This preserves genuine within-patch winding changes and rejects a fiber winding
-around and accidentally touching another turn of the same patch. Source files
-are never changed. Rejections appear in "attachment_return_filter"; a subsequent
-independent per-member return audit appears in "attachment_returns".
-
-All attachment connectors include source-to-projected-point seam transport.
-Graph point IDs use collection dictionary keys (unique in merged components);
-source point/collection IDs and component member files are recorded separately.
-An inconsistent graph cycle implicates its constraints; it does not on its own
-establish a sheet switch inside a patch or fiber.
-
 The transform's flow field is shaped by the checkpoint's own z-range; the
 --z-range arg only filters patches/pcls (and must lie within the checkpoint's
 range, like fit_spiral's resume path). Both are expressed in full-resolution
@@ -110,107 +92,6 @@ Run from the spiral/ directory, e.g.
         --pcl /path/to/abs_windings.json \
         --pcl /path/to/rel_windings.json \
         --z-range 10000,13000
-
-Alternatively, pass --config params.json with any or all options in a JSON object:
-
-    {
-        "checkpoint": "out/checkpoint_fitted.ckpt",
-        "patches_dir": "/path/to/dataset/patches",
-        "patch_id": "seed-patch",
-        "pcl": ["/path/to/abs_windings.json", "/path/to/rel_windings.json"],
-        "z_range": "10000,13000",
-        "detect_loops": true,
-        "plot": false
-    }
-
-Keys use option names without leading dashes; hyphens and underscores are both
-accepted. Use JSON booleans for toggles, an array for pcl, and an empty string
-for fibers to infer the dataset's fibers directory. Relative paths are resolved
-from the working directory, as on the CLI. Explicit CLI options override JSON
-values; omitted options retain their usual defaults.
-
-An optional JSON-only "linking" object controls analysis attachments (omitting
-it preserves checkpoint/legacy linking). For example:
-
-    "linking": {
-        "distance": 2.5,
-        "window_points": 5,
-        "min_points": 3,
-        "vertical_max_behind_fraction": 0.2,
-        "horizontal_max_front_fraction": 0.2,
-        "side_margin_voxels": 0.5,
-        "selection": "support_then_distance",
-        "fiber_stride": 1,
-        "patch_stride": 1,
-        "strips": false,
-        "strip_max_gap": null,
-        "strip_claim_gap": null,
-        "strip_rank": "fit",
-        "strip_fit_resolution": 0.25
-    }
-
-Distance (positive float, full-resolution scan voxels) defaults to the saved
-checkpoint tolerance and affects every collection. Patch stride also affects
-every collection, but only its link-query geometry; winding analysis uses the
-original patches. Coarse cells spanning invalid fine quads are excluded.
-Absolute winding annotations attach independently within the distance tolerance;
-checkpoint window-support requirements and fiber side rules do not apply to them.
-
-The remaining settings affect fibers only. Stride samples the original trimmed
-fiber, replacing checkpoint spacing-based thinning, and always keeps endpoints
-and branch junctions. Windows count sampled points within each individual fiber
-(before merging fibers), including the center point. window_points defaults to
-5 and must be odd; min_points defaults to 1 and is strict even at fiber ends.
-The center point must itself be within distance of the candidate patch.
-
-Front points inward along the checkpoint's negative winding gradient in scan
-space. Each orientation's wrong-side fraction defaults to null (disabled).
-Enabled fractions are in [0,1] and count nearby hits in the local window, with
-offsets within side_margin_voxels (default 0.5) treated as on-surface. Undefined
-directions do not support a side-filtered link. A fraction equal to the limit
-passes. Eligible patches rank by support count, RMS distance, center distance,
-then patch ID. selection may instead be "nearest" or "largest_area". Both
-strides default to 1.
-
-An optional JSON-only "edge_divergence" object drops same-winding fiber edges
-whose two patches diverge away from the hop (see edge_divergence.py):
-
-    "edge_divergence": {
-        "radius": 60.0,
-        "max_median_offset": 2.0,
-        "max_spread": null,
-        "min_samples": 6,
-        "kinds": ["neither"],
-        "report_kept": false
-    }
-
-Vertices of each patch within radius voxels of the fiber's hop are projected
-onto the other patch and their offsets signed along the umbilicus-inward
-direction; a direction with at least min_samples samples is measured, and the
-edge is dropped when a measured direction's median absolute offset exceeds
-max_median_offset or, with max_spread set (default null: off), its p10-p90
-spread exceeds it. Edges measured in
-neither direction (long hops) are kept and counted. Settings, counts and the
-dropped edges (plus kept ones with report_kept) are saved under
-"edge_divergence" in the report.
-
-strips (default false) switches fibers from per-point selection to
-strip-level winner-take-all. A strip is one fiber's sampled points hitting one
-patch, from the first hit to the last; strip_max_gap (default null, unlimited)
-starts a new strip after that many consecutive points without a hit.
-window_points is unused and min_points is the minimum number of hits per strip.
-strip_rank "fit" (default) ranks strips by RMS hit distance in
-strip_fit_resolution voxel bins (default 0.25), then more hits; "hits" ranks by
-more hits, then fit bins. Both then prefer larger patch area and patch ID. Each
-strip claims every point of its span that no better strip already owns, so a
-stretch of fiber never alternates between two patches; strip_claim_gap (default
-null: the whole span) limits the claim to the hits and the holes of at most
-that many points between them, leaving longer holes open to other patches. What a losing strip keeps is split at the claimed points and at its
-gap rule, and fragments below min_points are dropped. Wrong-side fractions are
-tested per strip. Resolved settings and counts are saved under "linking" in
-the report; candidate rejection counts refer to (sampled point, patch) pairs,
-and in strip mode strip_overruled_candidates counts eligible hits that a better
-strip claimed.
 """
 
 import os
@@ -238,9 +119,6 @@ from sample_spiral import (
 # (never slicing through invalid regions, where theta would jump and the unwrap
 # would miscount whole windings).
 import connect_overlapping_patches as cop
-from edge_divergence import EdgeDivergenceConfig, filter_divergent_edges
-from point_collection import umbilicus_inward_direction
-from winding_linking import AnalysisLinkingConfig, AnalysisPointLinker, model_inward_direction
 
 
 def resolve_umbilicus_path(patches_dir, explicit_path=None):
@@ -299,28 +177,6 @@ def _to_py(x):
     return x
 
 
-def resolve_base_shape_zyx(checkpoint, patches_dir):
-    """The dataset's volume coordinate domain (ZYX shape), or None.
-
-    Fibers exported with coordinate_base_shape_zyx can only be scaled into the
-    dataset's domain when that domain is known, so the analysis ScrollSpec must
-    carry it like a real fit's does. Prefer the shape the checkpoint was fit
-    against; legacy checkpoints predate that field, so fall back to the
-    dataset's spiral-scroll.json next to --patches-dir when one exists."""
-    shape = checkpoint.get('base_shape_zyx')
-    if shape is not None:
-        return tuple(int(v) for v in shape)
-    from fit_session import SCROLL_SPEC_FILENAME, ScrollSpecError, load_scroll_spec
-    dataset_root = os.path.dirname(os.path.abspath(os.path.expanduser(patches_dir)))
-    if not os.path.isfile(os.path.join(dataset_root, SCROLL_SPEC_FILENAME)):
-        return None
-    try:
-        return load_scroll_spec(dataset_root).base_shape_zyx
-    except ScrollSpecError as e:
-        print(f'WARNING: ignoring {SCROLL_SPEC_FILENAME}: {e}')
-        return None
-
-
 def build_fit_inputs(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_z_end, umbilicus_path,
                      fibers_path=None):
     """Build the explicit FitConfig / ScrollSpec / SpiralInputPaths pointing
@@ -330,24 +186,18 @@ def build_fit_inputs(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_
     z-range shapes the transform's flow field independently of the filtering
     z-range."""
     from fit_session import PclInputSpec, ScrollSpec, SpiralInputPaths
-    from config import filter_known_config_keys
 
     cfg = fs.Config().as_dict()
-    # Analysis needs the saved model/input settings, not an exact match to
-    # the training config schema. Backfill new defaults and report old keys.
-    cfg.update(filter_known_config_keys(
-        checkpoint['cfg'], cfg, label='checkpoint config'))
+    cfg.update(checkpoint['cfg'])
     # This tool IS the patch graph — a checkpoint trained supervision-free
     # (disable_patches, e.g. the 2026-07-17 normals-only baseline) must not
     # stop the loaders from reading the patches it wants to analyse.
     cfg['input_disable_patches'] = False
-    # Analysis needs neither shell supervision nor fiber-direction loss inputs.
-    # Disable the shell source too: winding-model checkpoints require it even
-    # with both shell loss weights zero.
-    cfg['input_use_outer_shell'] = False
+    # We compute no shell losses; zero the weight so the context's
+    # shell_losses_enabled() gate stops load_host_inputs() from loading the
+    # shell (replacing the old fs.shell_losses_enabled = lambda: False
+    # override). Nothing else in the host-loading path reads this weight.
     cfg['loss_weight_shell_outer'] = 0.0
-    cfg['loss_weight_shell_patch_radius'] = 0.0
-    cfg['loss_weight_fiber_directions'] = 0.0
     # The filtering z-range is the optimisation window this analysis uses.
     cfg['z_begin'] = int(filter_z_begin)
     cfg['z_end'] = int(filter_z_end)
@@ -356,7 +206,6 @@ def build_fit_inputs(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_
         name='analysis',
         voxel_size_um=9.6,
         spiral_outward_sense=checkpoint.get('spiral_outward_sense') or 'CW',
-        base_shape_zyx=resolve_base_shape_zyx(checkpoint, patches_dir),
     )
     # This analysis needs no scroll volume, track store, or outer shell:
     # leaving those paths empty keeps load_host_inputs() from touching the
@@ -375,11 +224,11 @@ def build_fit_inputs(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_
     return fit_config, scroll, paths, int(checkpoint['z_begin']), int(checkpoint['z_end'])
 
 
-def build_transform(checkpoint, cfg, context, model_z_begin, model_z_end, *, device='cuda'):
+def build_transform(checkpoint, cfg, context, model_z_begin, model_z_end):
     """Reconstruct the slice->spiral transform and dr_per_winding from the
     checkpoint, using fit_spiral's own model class. The flow field is shaped by
     the checkpoint's (model) z-range, not the filtering z-range."""
-    device = torch.device(device)
+    device = torch.device('cuda')
 
     all_zs = np.arange(model_z_begin, model_z_end)
     umbilicus_fn = context.umbilicus_z_to_yx()
@@ -401,12 +250,7 @@ def build_transform(checkpoint, cfg, context, model_z_begin, model_z_end, *, dev
         spiral_outward_sense=context.spiral_outward_sense,
     )
     model.to(device)
-    model_state = dict(checkpoint['spiral_and_transform'])
-    # Older fits learned a shell-loss winding index. It is not part of the
-    # slice->spiral transform and is no longer a model parameter. Keep strict
-    # loading for every other key so missing/incompatible geometry still fails.
-    model_state.pop('shell_outer_winding_param', None)
-    model.load_state_dict(model_state)
+    model.load_state_dict(checkpoint['spiral_and_transform'])
     model.eval()
 
     transform = model.get_slice_to_spiral_transform()
@@ -545,282 +389,6 @@ def strip_winding_delta(transform, dr, graph, from_ij, to_ij, step_size):
     }
 
 
-def _sample_polylines_batch(polylines, step_size):
-    """Vectorised _polyline_ijs over many polylines at once.
-
-    `polylines` is a list of (K_k, 2) float32 vertex arrays. Returns
-    (ijs, owner): the concatenated samples (N, 2) float32 and, per sample, the
-    index of the polyline it belongs to. Each polyline's samples are exactly the
-    array _polyline_ijs(vertices, step_size) would produce (same float32
-    arithmetic, sample for sample), so the two are interchangeable."""
-    if not polylines:
-        return np.empty((0, 2), dtype=np.float32), np.empty(0, dtype=np.int64)
-    seg_a = np.concatenate([p[:-1] for p in polylines], axis=0).astype(np.float32, copy=False)
-    seg_b = np.concatenate([p[1:] for p in polylines], axis=0).astype(np.float32, copy=False)
-    seg_owner = np.repeat(np.arange(len(polylines)), [len(p) - 1 for p in polylines])
-    seg_first = np.ones(len(seg_a), dtype=bool)
-    seg_first[1:] = seg_owner[1:] != seg_owner[:-1]
-
-    # Segment lengths: float32 hypot exactly like np.linalg.norm on a float32
-    # 2-vector (dot then sqrt, no fused multiply-add). Only ceil(len / step) is
-    # consumed, so a last-bit difference could only matter right at an integer
-    # quotient; re-measure those few segments with the scalar reference call.
-    d = seg_b - seg_a
-    seg_len = np.sqrt(d[:, 0] * d[:, 0] + d[:, 1] * d[:, 1]).astype(np.float64)
-    quotient = seg_len / step_size
-    near_integer = np.flatnonzero(np.abs(quotient - np.round(quotient)) < 1e-4)
-    for m in near_integer:
-        quotient[m] = float(np.linalg.norm(seg_b[m] - seg_a[m])) / step_size
-    counts = np.maximum(1, np.ceil(quotient).astype(np.int64)) + 1  # samples per segment
-
-    # Per-sample segment id and rank within the segment; the duplicated junction
-    # vertex (rank 0 of every non-leading segment) is dropped, as in _polyline_ijs.
-    sample_seg = np.repeat(np.arange(len(seg_a)), counts)
-    seg_start = np.concatenate([[0], np.cumsum(counts)[:-1]])
-    rank = np.arange(len(sample_seg)) - seg_start[sample_seg]
-    keep = seg_first[sample_seg] | (rank > 0)
-    sample_seg = sample_seg[keep]
-    rank = rank[keep]
-
-    # np.linspace(0, 1, n, dtype=float32): float64 rank * (1 / (n - 1)), the
-    # endpoint pinned to exactly 1.0, then cast.
-    div = (counts - 1).astype(np.float64)
-    t = (rank.astype(np.float64) * (1.0 / div[sample_seg])).astype(np.float32)
-    t[rank == counts[sample_seg] - 1] = 1.0
-    t = t[:, None]
-    ijs = seg_a[sample_seg] * (1.0 - t) + seg_b[sample_seg] * t
-    return ijs.astype(np.float32, copy=False), seg_owner[sample_seg]
-
-
-def _bilinear_ij_to_zyx_np(zyxs, valid_quad, ijs):
-    """numpy twin of tifxyz.Patch.ij_to_zyx (bilinear, not triangulated).
-
-    `zyxs` is the patch's (H, W, 3) float32 vertex grid, `valid_quad` its
-    (H-1, W-1) bool quad mask, `ijs` (N, 2) float32. Returns (zyx, valid) with
-    invalid samples filled with -1, using the same float32 operation sequence as
-    the torch implementation so results agree bit for bit."""
-    h, w = zyxs.shape[:2]
-    i = ijs[:, 0]
-    j = ijs[:, 1]
-    i0 = np.floor(i).astype(np.int64)
-    j0 = np.floor(j).astype(np.int64)
-    in_bounds = (i0 >= 0) & (j0 >= 0) & (i0 < h - 1) & (j0 < w - 1)
-    valid = np.zeros(len(ijs), dtype=bool)
-    if in_bounds.any():
-        valid[in_bounds] = valid_quad[i0[in_bounds], j0[in_bounds]]
-    out = np.full((len(ijs), 3), -1.0, dtype=np.float32)
-    if valid.any():
-        vi0 = i0[valid]
-        vj0 = j0[valid]
-        di = (i[valid] - vi0.astype(np.float32))[:, None]
-        dj = (j[valid] - vj0.astype(np.float32))[:, None]
-        tl = zyxs[vi0, vj0]
-        tr = zyxs[vi0, vj0 + 1]
-        bl = zyxs[vi0 + 1, vj0]
-        br = zyxs[vi0 + 1, vj0 + 1]
-        top = tl + (tr - tl) * dj
-        bottom = bl + (br - bl) * dj
-        out[valid] = top + (bottom - top) * di
-    return out, valid
-
-
-class StripMeasurer:
-    """Batched, memoised within-patch strip winding measurements.
-
-    Measures exactly what strip_winding_delta measures (that function stays as
-    the single-strip reference), but for many strips at once: the fringe-avoiding
-    valid-quad routing and polyline sampling run vectorised in numpy, the
-    spiral transform runs on one concatenated point cloud per batch instead of
-    once per strip, and the theta=0 crossing bookkeeping is done in numpy on the
-    transformed thetas. The transform is elementwise per point, so batching does
-    not change any sample's spiral-space coordinates; the integer winding
-    delta and the raw-winding diagnostics are identical to the reference. The
-    unwrapped-residual diagnostic is accumulated sequentially in float32 (the
-    reference used a device cumsum), which can differ in the last bits only on
-    strips crossing the seam three or more times.
-
-    Every measured strip is memoised by (patch, from_ij, to_ij), so callers may
-    `prefetch` every strip a phase might need and then `measure` them one at a
-    time in whatever order the algorithm dictates."""
-
-    def __init__(self, transform, dr, patches, medial_weight, step_size, *,
-                 max_transform_points=1 << 20):
-        self.transform = transform
-        self.dr = dr
-        self.dr_value = np.float32(dr.detach().float().cpu().item())
-        self.patches = patches
-        self.medial_weight = medial_weight
-        self.step_size = float(step_size)
-        self.max_transform_points = int(max_transform_points)
-        self._graphs = {}
-        self._results = {}
-        self.num_measured = 0
-        self.num_batches = 0
-
-    def graph_for(self, pid):
-        """Lazily-built, memoised valid-quad graph of a patch (with its per-start
-        Dijkstra predecessor cache)."""
-        g = self._graphs.get(pid)
-        if g is None:
-            g = cop.build_patch_graph(self.patches[pid], self.medial_weight,
-                                      lift_quad_centres=False)
-            g._dij_cache = {}
-            self._graphs[pid] = g
-        return g
-
-    @staticmethod
-    def _key(pid, from_ij, to_ij):
-        a = np.asarray(from_ij, dtype=np.float32)
-        b = np.asarray(to_ij, dtype=np.float32)
-        return (pid, float(a[0]), float(a[1]), float(b[0]), float(b[1]))
-
-    def measure(self, pid, from_ij, to_ij):
-        """strip_winding_delta(transform, dr, graph_for(pid), from_ij, to_ij,
-        step_size), served from the memo (measuring on a miss)."""
-        key = self._key(pid, from_ij, to_ij)
-        if key not in self._results:
-            self.prefetch([(pid, from_ij, to_ij)])
-        return self._results[key]
-
-    def prefetch(self, requests):
-        """Measure every not-yet-memoised (pid, from_ij, to_ij) in one batch."""
-        pending = {}
-        for pid, from_ij, to_ij in requests:
-            key = self._key(pid, from_ij, to_ij)
-            if key not in self._results and key not in pending:
-                pending[key] = (pid, np.asarray(from_ij, dtype=np.float32),
-                                np.asarray(to_ij, dtype=np.float32))
-        if not pending:
-            return
-        keys = list(pending.keys())
-        results = self._measure_batch([pending[k] for k in keys])
-        for key, result in zip(keys, results):
-            self._results[key] = result
-        self.num_measured += len(keys)
-        self.num_batches += 1
-
-    def _measure_batch(self, requests):
-        n_req = len(requests)
-        results = [None] * n_req
-
-        # --- route through valid quads; collect polylines per request ---
-        polylines = []       # (K, 2) float32 vertex arrays
-        routed = []          # request index per polyline
-        num_path_quads = []
-        for k, (pid, from_ij, to_ij) in enumerate(requests):
-            graph = self.graph_for(pid)
-            centres = _valid_quad_path_centres(
-                graph,
-                _nearest_valid_quad_node(graph, from_ij),
-                _nearest_valid_quad_node(graph, to_ij),
-            )
-            if centres is None:
-                continue
-            verts = np.concatenate([
-                from_ij[None],
-                np.array(centres, dtype=np.float32).reshape(-1, 2),
-                to_ij[None],
-            ], axis=0)
-            polylines.append(verts)
-            routed.append(k)
-            num_path_quads.append(len(centres))
-        if not polylines:
-            return results
-        routed = np.asarray(routed, dtype=np.int64)
-
-        # --- sample every polyline, lift the samples onto their patch ---
-        ijs, owner = _sample_polylines_batch(polylines, self.step_size)
-        zyx_all = np.empty((len(ijs), 3), dtype=np.float32)
-        valid_all = np.zeros(len(ijs), dtype=bool)
-        # Group the samples by patch (one stable sort) and lift each group with
-        # its patch's grid.
-        pids = []
-        pid_index = {}
-        poly_pid = np.empty(len(polylines), dtype=np.int64)
-        for p, k in enumerate(routed):
-            pid = requests[k][0]
-            if pid not in pid_index:
-                pid_index[pid] = len(pids)
-                pids.append(pid)
-            poly_pid[p] = pid_index[pid]
-        sample_pid = poly_pid[owner]
-        order = np.argsort(sample_pid, kind='stable')
-        bounds = np.searchsorted(sample_pid[order], np.arange(len(pids) + 1))
-        for pi, pid in enumerate(pids):
-            rows = order[bounds[pi]:bounds[pi + 1]]
-            graph = self.graph_for(pid)
-            zyxs = graph.patch.zyxs.detach().cpu().numpy()
-            zyx_all[rows], valid_all[rows] = _bilinear_ij_to_zyx_np(zyxs, graph.valid_quad, ijs[rows])
-
-        # Per polyline: dropped-invalid count and valid-sample count (strips with
-        # fewer than two valid samples are unmeasurable, as in the reference).
-        n_poly = len(polylines)
-        num_samples = np.bincount(owner, minlength=n_poly)
-        num_valid = np.bincount(owner, weights=valid_all, minlength=n_poly).astype(np.int64)
-        num_invalid = num_samples - num_valid
-        measurable = num_valid >= 2
-        keep = measurable[owner] & valid_all
-        zyx = zyx_all[keep]
-        strip_of_point = owner[keep]  # polyline index per kept point, non-decreasing
-
-        # --- one transform pass over every kept sample ---
-        theta = np.empty(len(zyx), dtype=np.float32)
-        shifted = np.empty(len(zyx), dtype=np.float32)
-        device = self.dr.device
-        with torch.no_grad():
-            for start in range(0, len(zyx), self.max_transform_points):
-                chunk = torch.from_numpy(zyx[start:start + self.max_transform_points]).to(device)
-                spiral = self.transform(chunk)
-                th, _, sh = get_theta_and_radii(spiral[..., 1:], self.dr)
-                theta[start:start + len(chunk)] = th.float().cpu().numpy()
-                shifted[start:start + len(chunk)] = sh.float().cpu().numpy()
-
-        # --- theta=0 seam crossings per strip (numpy twin of the torch helpers) ---
-        dr = self.dr_value
-        strip_start = np.concatenate([[0], np.cumsum(np.bincount(strip_of_point, minlength=n_poly))])
-        counts = np.diff(strip_start)
-        diffs = theta[1:] - theta[:-1]
-        same_strip = strip_of_point[1:] == strip_of_point[:-1]
-        pi = np.float32(np.pi)  # torch compares float32 tensors against float32(pi) too
-        sign = ((diffs > pi).astype(np.float32) - (diffs < -pi).astype(np.float32))
-        sign[~same_strip] = 0.0
-        step_adjust = sign * dr                     # get_theta_crossing_step_adjustments
-        step_windings = step_adjust / dr           # exactly -1, 0 or +1 per step
-        diff_strip = strip_of_point[:-1]
-        cumulative_windings = np.bincount(diff_strip, weights=step_windings.astype(np.float64),
-                                          minlength=n_poly)  # exact small integers
-        # Sequential float32 sum of the (few) nonzero step adjustments per strip:
-        # zeros add exactly, so this is the strip's running cumsum end value.
-        seam_total = np.zeros(n_poly, dtype=np.float32)
-        nonzero = np.flatnonzero(step_adjust != 0.0)
-        if len(nonzero):
-            nz_strip = diff_strip[nonzero]
-            nz_value = step_adjust[nonzero]
-            nz_rank = np.arange(len(nonzero)) - np.searchsorted(nz_strip, nz_strip, side='left')
-            for r in range(int(nz_rank.max()) + 1):
-                sel = nz_rank == r
-                seam_total[nz_strip[sel]] = seam_total[nz_strip[sel]] + nz_value[sel]
-
-        first = strip_start[:-1]
-        last = strip_start[1:] - 1
-        for p in np.flatnonzero(measurable):
-            shifted_first = shifted[first[p]]
-            shifted_last = shifted[last[p]]
-            unwrapped_last = shifted_last + seam_total[p]
-            cumulative = float(np.float32(cumulative_windings[p]))
-            results[routed[p]] = {
-                'delta_windings': int(round(-cumulative)),
-                'residual_unwrapped_delta_windings': float((unwrapped_last - shifted_first) / dr),
-                'unwrap_adjustment_windings': cumulative,
-                'from_raw_winding': float(shifted_first / dr),
-                'to_raw_winding': float(shifted_last / dr),
-                'strip_num_path_quads': int(num_path_quads[p]),
-                'strip_num_points': int(counts[p]),
-                'strip_num_invalid_dropped': int(num_invalid[p]),
-            }
-        return results
-
-
 def classify_pcl(pcl):
     """Classify a pcl by how it carries winding information:
 
@@ -842,50 +410,14 @@ def classify_pcl(pcl):
     return 'neither'
 
 
-def attachment_branch_deltas(cross_patch_pcls, patches, transform, dr):
-    """Integer branch transport from each source point to its patch endpoint.
-
-    Fiber paths use source coordinates; patch strips use bilinear coordinates.
-    Even a sub-voxel projection can cross theta=0. Those short connectors must
-    be included to make the cycle a closed geometric path.
-    """
-    by_patch = {}
-    for pcl in cross_patch_pcls.values():
-        for point in pcl['points'].values():
-            attachment = point.get('on_patch')
-            if attachment is not None and attachment['id'] in patches:
-                by_patch.setdefault(attachment['id'], {})[id(point)] = point
-    result = {}
-    for pid, unique in by_patch.items():
-        points = list(unique.values())
-        patch = patches[pid]
-        ijs = np.asarray([p['on_patch']['ij'] for p in points], dtype=np.float32)
-        feet, valid = _bilinear_ij_to_zyx_np(
-            patch.zyxs.detach().cpu().numpy(),
-            patch.valid_quad_mask.detach().cpu().numpy(), ijs)
-        # Do not invent transport to an endpoint outside the valid surface.
-        # Callers omit attachments absent from the result; never transform the
-        # invalid -1 coordinate sentinel.
-        selected = np.flatnonzero(valid)
-        if not len(selected):
-            continue
-        raw = np.asarray([points[i]['zyx'] for i in selected], dtype=np.float32)
-        pairs = np.stack([raw, feet[selected]], axis=1)
-        with torch.no_grad():
-            spiral = transform(torch.as_tensor(pairs.reshape(-1, 3), device=dr.device))
-            theta, _, _ = get_theta_and_radii(spiral[..., 1:], dr)
-            delta = -get_theta_crossing_step_adjustments(theta.reshape(-1, 2), dr) / dr
-        for i, value in zip(selected, delta.cpu().numpy().reshape(-1)):
-            result[id(points[i])] = int(round(float(value)))
-    return result
-
-
-def build_abs_anchors_by_patch(cross_patch_pcls, patches, attachment_deltas=None):
+def build_abs_anchors_by_patch(cross_patch_pcls, patches, transform, dr):
     """patch_id -> list of absolute-winding anchors attached to that patch.
 
     Each anchor is a dict carrying the source absolute-winding pcl, the point and
-    its absolute winding annotation, and the point's on-patch ij. Anchors with a
-    non-finite annotation are skipped (warned about elsewhere)."""
+    its absolute winding annotation, the point's on-patch ij, and the theta=0
+    branch transport from the point to its attachment (`attachment_branch_delta`:
+    the winding the annotation gains by the time the anchor's strip starts).
+    Anchors with a non-finite annotation are skipped (warned about elsewhere)."""
     anchors = {}
     for pid, pcl in cross_patch_pcls.items():
         if not pcl.get('metadata', {}).get('winding_is_absolute', False):
@@ -894,20 +426,19 @@ def build_abs_anchors_by_patch(cross_patch_pcls, patches, attachment_deltas=None
             if patch_id not in patches:
                 continue
             for p in points:
-                if attachment_deltas is not None and id(p) not in attachment_deltas:
-                    continue
                 w = float(p['winding_annotation'])
                 if not np.isfinite(w):
                     continue
+                attachment_branch_delta = -int(_tour_unwrap_adjustments(
+                    transform, dr, [p['zyx'], _strip_end_zyx(patches, p)])[1])
                 anchors.setdefault(patch_id, []).append({
                     'pcl_id': int(pid),
                     'pcl_name': pcl.get('name'),
                     'source_file': pcl.get('source_file'),
                     'point_id': int(p['id']),
                     # Absolute-winding annotations are integer winding numbers.
-                    'winding': int(round(w)) + (attachment_deltas or {}).get(id(p), 0),
-                    'source_winding': int(round(w)),
-                    'attachment_branch_delta': (attachment_deltas or {}).get(id(p), 0),
+                    'winding': int(round(w)),
+                    'attachment_branch_delta': attachment_branch_delta,
                     'ij': np.array(p['on_patch']['ij'], dtype=np.float32),
                     'distance': float(p['on_patch'].get('distance', float('nan'))),
                     # Source [z, y, x]; point['p'] is [x, y, z] from the pcl json.
@@ -916,10 +447,22 @@ def build_abs_anchors_by_patch(cross_patch_pcls, patches, attachment_deltas=None
     return anchors
 
 
-def _tour_unwrap_adjustments(transform, dr, tour):
-    """Cumulative theta=0 branch adjustment (winding units) at each tour point."""
+def _strip_end_zyx(patches, p):
+    """The point's attachment on its patch, where the within-patch strips through
+    it start and end; the point itself if the bilinear lookup rejects that ij."""
+    on_patch = p['on_patch']
+    patch = patches[on_patch['id']]
+    zyx, valid = patch.ij_to_zyx(torch.as_tensor(
+        np.asarray(on_patch['ij'], dtype=np.float32), device=patch.zyxs.device))
+    if not bool(valid):
+        return p['zyx']
+    return zyx.cpu().numpy()
+
+
+def _tour_unwrap_adjustments(transform, dr, zyxs):
+    """Cumulative theta=0 branch adjustment (winding units) at each of `zyxs`."""
     zyx = torch.as_tensor(
-        np.stack([p['zyx'] for p in tour], axis=0).astype(np.float32),
+        np.stack(zyxs, axis=0).astype(np.float32),
         device=dr.device,
     )
     with torch.no_grad():
@@ -930,7 +473,7 @@ def _tour_unwrap_adjustments(transform, dr, tour):
         return np.round((adjustments[0] / dr).cpu().numpy()).astype(np.int64)
 
 
-def build_rel_adjacency(cross_patch_pcls, patches, transform, dr, attachment_deltas=None):
+def build_rel_adjacency(cross_patch_pcls, patches, transform, dr):
     """patch_id -> list of relative-winding edges leaving that patch.
 
     For each relative-winding pcl we walk its chain-valid point sequence
@@ -958,16 +501,11 @@ def build_rel_adjacency(cross_patch_pcls, patches, transform, dr, attachment_del
         def attached(p):
             on_patch = p.get('on_patch')
             return (on_patch is not None and on_patch['id'] in patches
-                    and (attachment_deltas is None or id(p) in attachment_deltas)
                     and np.isfinite(float(p['winding_annotation'])))
 
-        # Component points retain member-local IDs. The collection dictionary
-        # keys, unlike point['id'], are unique across the merged component.
-        # Every downstream edge cache (including divergence rejection) uses
-        # these IDs, so using member-local IDs can apply another edge's verdict.
-        point_ids = {id(p): int(key) for key, p in pcl['points'].items()}
         tour = list(pcl['chain'].iter_chain())
-        tour_adjustments = _tour_unwrap_adjustments(transform, dr, tour)
+        tour_adjustments = _tour_unwrap_adjustments(
+            transform, dr, [_strip_end_zyx(patches, p) if attached(p) else p['zyx'] for p in tour])
         attached_tour = [(k, p) for k, p in enumerate(tour) if attached(p)]
         pairs = []
         seen_pairs = set()
@@ -989,9 +527,7 @@ def build_rel_adjacency(cross_patch_pcls, patches, transform, dr, attachment_del
             # convention is -c (same sign as strip_winding_delta).
             raw_dwind = int(round(wb - wa))
             branch_delta = -unwrap_adjustment
-            connector_delta = ((attachment_deltas or {}).get(id(pb), 0)
-                               - (attachment_deltas or {}).get(id(pa), 0))
-            dwind = raw_dwind + branch_delta + connector_delta
+            dwind = raw_dwind + branch_delta
             ija = np.array(pa['on_patch']['ij'], dtype=np.float32)
             ijb = np.array(pb['on_patch']['ij'], dtype=np.float32)
             # Source [z, y, x] of each attached point, so the departure/arrival
@@ -1002,194 +538,26 @@ def build_rel_adjacency(cross_patch_pcls, patches, transform, dr, attachment_del
                       'kind': kind}
             adjacency.setdefault(ida, []).append({
                 **common, 'neighbor': idb, 'from_ij': ija, 'to_ij': ijb,
-                'from_point_id': point_ids[id(pa)], 'to_point_id': point_ids[id(pb)],
-                'from_source_point_id': int(pa['id']), 'to_source_point_id': int(pb['id']),
-                'from_source_collection_id': pa.get('collectionId'),
-                'to_source_collection_id': pb.get('collectionId'),
+                'from_point_id': int(pa['id']), 'to_point_id': int(pb['id']),
                 'from_zyx': za, 'to_zyx': zb,
                 'winding_delta': dwind,
                 'raw_winding_delta': raw_dwind,
                 'pcl_unwrap_adjustment': unwrap_adjustment,
                 'pcl_branch_delta': branch_delta,
-                'attachment_branch_delta': connector_delta,
             })
             adjacency.setdefault(idb, []).append({
                 **common, 'neighbor': ida, 'from_ij': ijb, 'to_ij': ija,
-                'from_point_id': point_ids[id(pb)], 'to_point_id': point_ids[id(pa)],
-                'from_source_point_id': int(pb['id']), 'to_source_point_id': int(pa['id']),
-                'from_source_collection_id': pb.get('collectionId'),
-                'to_source_collection_id': pa.get('collectionId'),
+                'from_point_id': int(pb['id']), 'to_point_id': int(pa['id']),
                 'from_zyx': zb, 'to_zyx': za,
                 'winding_delta': -dwind,
                 'raw_winding_delta': -raw_dwind,
                 'pcl_unwrap_adjustment': -unwrap_adjustment,
                 'pcl_branch_delta': -branch_delta,
-                'attachment_branch_delta': -connector_delta,
             })
     return adjacency
 
 
-def filter_attachment_returns(pcls, patches, transform, dr, measurer, attachment_deltas):
-    """Keep the first sheet assignment for each (fiber component, patch).
-
-    The full tree traversal carries branch transport through member junctions,
-    including H->H continuations and reversed members. Euler backtracking does
-    not constitute a new contact. Non-tree fiber links remain constraints for
-    cycle detection; they must not redefine the first-visit branch frame.
-
-    Compare every later contact with the first one, including transport along
-    the patch: a seam crossing or a genuinely multi-turn patch is not itself a
-    reason to reject. A nonzero *relative* turn is a wrong-sheet reattachment.
-    Only analysis eligibility changes; source point collections are untouched.
-    """
-    allowed = dict(attachment_deltas)
-    candidates = []
-    for pid, pcl in pcls.items():
-        if classify_pcl(pcl) != 'neither':
-            continue
-        chain = pcl['chain']
-        if hasattr(chain, 'member_sorted'):
-            from spiral_helpers import ComponentChain
-            chain = ComponentChain(chain.member_sorted, chain.pos_of, chain.tree_parent)
-        tour = list(chain.iter_chain())
-        if not tour:
-            continue
-        adjustments = _tour_unwrap_adjustments(transform, dr, tour)
-        point_ids = {id(p): int(key) for key, p in pcl['points'].items()}
-        seen, first = set(), {}
-        for index, point in enumerate(tour):
-            identity = id(point)
-            if identity in seen or identity not in allowed:
-                continue
-            seen.add(identity)
-            patch_id = point['on_patch']['id']
-            if patch_id not in patches:
-                continue
-            branch = -int(adjustments[index]) + attachment_deltas[identity]
-            if patch_id not in first:
-                first[patch_id] = point, branch
-                continue
-            anchor, anchor_branch = first[patch_id]
-            candidates.append((pid, pcl, patch_id, anchor, point,
-                               point_ids[id(anchor)], point_ids[identity],
-                               branch - anchor_branch))
-    rejected = []
-    unmeasurable = 0
-    # Bound sampled-path memory even for millions of attachment candidates.
-    for start in range(0, len(candidates), 4096):
-        batch = candidates[start:start + 4096]
-        requests = [(patch, a['on_patch']['ij'], b['on_patch']['ij'])
-                    for _, _, patch, a, b, _, _, _ in batch]
-        measurer.prefetch(requests)
-        for request, item in zip(requests, batch):
-            pid, pcl, patch, a, b, ida, idb, fiber_delta = item
-            strip = measurer.measure(*request)
-            patch_delta = None if strip is None else strip['delta_windings']
-            if patch_delta == fiber_delta:
-                continue
-            unmeasurable += strip is None
-            allowed.pop(id(b), None)
-            rejected.append({
-                'pcl_id': pid, 'pcl_name': pcl.get('name'), 'patch_id': patch,
-                'first_point_id': ida, 'rejected_point_id': idb,
-                'first_source_point_id': int(a['id']), 'rejected_source_point_id': int(b['id']),
-                'first_source_collection_id': a.get('collectionId'),
-                'rejected_source_collection_id': b.get('collectionId'),
-                'first_zyx': _to_py(a['zyx']), 'rejected_zyx': _to_py(b['zyx']),
-                'fiber_delta': fiber_delta, 'patch_delta': patch_delta,
-                'reason': 'unmeasurable_patch_path' if strip is None else 'different_turn',
-            })
-    return allowed, {'num_checked': len(candidates), 'num_rejected': len(rejected),
-                     'num_unmeasurable': unmeasurable, 'rejected': rejected}
-
-
-def audit_attachment_returns(pcls, patches, transform, dr, measurer, attachment_deltas):
-    """Find local certificates: one fiber returns to a different turn of a patch.
-
-    Check each member separately, without any inferred cross-fiber traversal or
-    BFS tree. Consecutive visits to the same patch separated by other/unattached
-    points must have the same branch transport along the fiber and the surface.
-    A disagreement implicates the two attachments or intervening geometry; it
-    does not by itself identify a sheet switch in either source.
-    """
-    requests, candidates = [], []
-    for pid, pcl in pcls.items():
-        if classify_pcl(pcl) == 'absolute':
-            continue
-        point_ids = {id(p): int(key) for key, p in pcl['points'].items()}
-        chain = pcl['chain']
-        members = (chain.member_sorted if hasattr(chain, 'member_sorted')
-                   else [list(chain.iter_chain())])
-        for member_index, points in enumerate(members):
-            if not points:
-                continue
-            adjustments = _tour_unwrap_adjustments(transform, dr, points)
-            previous = {}
-            for index, point in enumerate(points):
-                on = point.get('on_patch')
-                if on is None or on['id'] not in patches:
-                    continue
-                if id(point) not in attachment_deltas:
-                    continue
-                patch_id = on['id']
-                if patch_id in previous:
-                    old_index, old = previous[patch_id]
-                    if index > old_index + 1:
-                        delta = (int(round(float(point['winding_annotation'])
-                                           - float(old['winding_annotation'])))
-                                 + int(adjustments[old_index] - adjustments[index])
-                                 + attachment_deltas.get(id(point), 0)
-                                 - attachment_deltas.get(id(old), 0))
-                        request = (patch_id, old['on_patch']['ij'], on['ij'])
-                        requests.append(request)
-                        candidates.append((pid, pcl, member_index, old, point,
-                                           point_ids[id(old)], point_ids[id(point)],
-                                           delta, index - old_index))
-                previous[patch_id] = index, point
-    measurer.prefetch(requests)
-    conflicts = []
-    unmeasurable = 0
-    for request, candidate in zip(requests, candidates):
-        strip = measurer.measure(*request)
-        if strip is None:
-            unmeasurable += 1
-            continue
-        pid, pcl, member, a, b, ida, idb, delta, gap = candidate
-        if delta == strip['delta_windings']:
-            continue
-        source = (pcl.get('link_members') or [{}])[member if pcl.get('link_members') else 0]
-        conflicts.append({
-            'pcl_id': pid, 'pcl_name': pcl.get('name'), 'member_index': member,
-            'source_file': source.get('source_file', pcl.get('source_file')),
-            'source_name': source.get('name', pcl.get('name')),
-            'patch_id': request[0], 'from_point_id': ida, 'to_point_id': idb,
-            'from_source_point_id': int(a['id']), 'to_source_point_id': int(b['id']),
-            'source_collection_id': a.get('collectionId'),
-            'from_ij': _to_py(a['on_patch']['ij']), 'to_ij': _to_py(b['on_patch']['ij']),
-            'from_zyx': _to_py(a['zyx']), 'to_zyx': _to_py(b['zyx']),
-            'from_distance': float(a['on_patch']['distance']),
-            'to_distance': float(b['on_patch']['distance']),
-            'fiber_delta': delta, 'patch_delta': strip['delta_windings'],
-            'winding_residual': delta - strip['delta_windings'],
-            'fiber_steps': gap,
-        })
-    return {'num_checked': len(requests), 'num_unmeasurable': unmeasurable,
-            'num_conflicts': len(conflicts), 'conflicts': conflicts}
-
-
-def edge_provenance(edge, reverse=False):
-    """Preserve source IDs when graph IDs belong to a merged collection."""
-    result = {'attachment_branch_delta': (-1 if reverse else 1)
-              * edge.get('attachment_branch_delta', 0)}
-    for side, source in (('from', 'to' if reverse else 'from'),
-                         ('to', 'from' if reverse else 'to')):
-        for suffix in ('source_point_id', 'source_collection_id'):
-            if source + '_' + suffix in edge:
-                result[side + '_' + suffix] = edge[source + '_' + suffix]
-    return result
-
-
-def build_loop_cycles(loops, tree_edge_by_child, strip_delta_fn, prefetch_fn=None):
+def build_loop_cycles(loops, tree_edge_by_child, strip_delta_fn):
     """For each inconsistent loop (a non-tree relative edge whose winding holonomy
     is nonzero), reconstruct the full fundamental cycle it closes: the BFS-tree
     path between the edge's two patches, plus the closing edge itself.
@@ -1207,11 +575,7 @@ def build_loop_cycles(loops, tree_edge_by_child, strip_delta_fn, prefetch_fn=Non
     across a patch may itself cross theta=0, exactly like the tree edges'
     intra_patch_strip_delta. plot_winding_graph renders each cycle as a vertical
     patch/pcl stack; precomputing it here keeps the tree-walking reconstruction next
-    to the BFS that produced the tree.
-
-    `prefetch_fn(requests)`, when given, is handed every ``(patch, top_ij, bot_ij)``
-    the cycles need before any `strip_delta_fn` call, so a batched measurer can
-    measure them all at once."""
+    to the BFS that produced the tree."""
     def path_to_root(p):
         """Patch ids from p up to the seed (root) via tree-edge parent pointers."""
         path = [p]
@@ -1227,7 +591,7 @@ def build_loop_cycles(loops, tree_edge_by_child, strip_delta_fn, prefetch_fn=Non
         (a, b are parent/child in some order; orient the pcl delta along a -> b)."""
         hop = tree_edge_by_child.get(b)
         if hop is not None and hop['from_patch'] == a:
-            return {**edge_provenance(hop), 'from_patch': a, 'to_patch': b,
+            return {'from_patch': a, 'to_patch': b,
                     'rel_pcl_id': hop['rel_pcl_id'], 'rel_pcl_name': hop['rel_pcl_name'],
                     'from_point_id': hop['from_point_id'], 'to_point_id': hop['to_point_id'],
                     'from_ij': hop['from_ij'], 'to_ij': hop['to_ij'],
@@ -1242,7 +606,7 @@ def build_loop_cycles(loops, tree_edge_by_child, strip_delta_fn, prefetch_fn=Non
         assert hop is not None and hop['from_patch'] == b, (a, b)
         # Stored as b -> a; we walk a -> b, so swap the points (and their coords) and
         # negate the delta.
-        return {**edge_provenance(hop, reverse=True), 'from_patch': a, 'to_patch': b,
+        return {'from_patch': a, 'to_patch': b,
                 'rel_pcl_id': hop['rel_pcl_id'], 'rel_pcl_name': hop['rel_pcl_name'],
                 'from_point_id': hop['to_point_id'], 'to_point_id': hop['from_point_id'],
                 'from_ij': hop['to_ij'], 'to_ij': hop['from_ij'],
@@ -1268,7 +632,6 @@ def build_loop_cycles(loops, tree_edge_by_child, strip_delta_fn, prefetch_fn=Non
         steps = [tree_step(a, b) for a, b in zip(patches, patches[1:])]
         # the non-tree edge, drawn as one arrow from R (bottom) back up to P (top).
         closing_step = {
-            **edge_provenance(L, reverse=True),
             'from_patch': R, 'to_patch': P,
             'rel_pcl_id': L['rel_pcl_id'], 'rel_pcl_name': L['rel_pcl_name'],
             'from_point_id': L['to_point_id'], 'to_point_id': L['from_point_id'],
@@ -1288,11 +651,11 @@ def build_loop_cycles(loops, tree_edge_by_child, strip_delta_fn, prefetch_fn=Non
         # downward (winding(bottom) - winding(top)) as integer theta=0 seam transport;
         # None where the strip can't be measured.
         m = len(patches)
-        strip_requests = []
+        patch_strip_deltas = []
         for i in range(m):
             top_ij = closing_step['to_ij'] if i == 0 else steps[i - 1]['to_ij']
             bot_ij = closing_step['from_ij'] if i == m - 1 else steps[i]['from_ij']
-            strip_requests.append((patches[i], top_ij, bot_ij))
+            patch_strip_deltas.append(strip_delta_fn(patches[i], top_ij, bot_ij))
         cycles.append({
             'closing_rel_pcl_id': L['rel_pcl_id'],
             'closing_rel_pcl_name': L['rel_pcl_name'],
@@ -1301,13 +664,9 @@ def build_loop_cycles(loops, tree_edge_by_child, strip_delta_fn, prefetch_fn=Non
             'from_patch': P, 'to_patch': R, 'lca': lca,
             'patches': patches,
             'steps': steps,
-            'patch_strip_deltas': strip_requests,  # measured below
+            'patch_strip_deltas': patch_strip_deltas,
             'closing_step': closing_step,
         })
-    if prefetch_fn is not None:
-        prefetch_fn([request for cycle in cycles for request in cycle['patch_strip_deltas']])
-    for cycle in cycles:
-        cycle['patch_strip_deltas'] = [strip_delta_fn(*request) for request in cycle['patch_strip_deltas']]
     return cycles
 
 
@@ -1553,51 +912,7 @@ def parse_z_range(z_range):
     return lo, hi
 
 
-def load_cli_config(ctx, param, value):
-    """Supply JSON values as Click defaults, preserving CLI validation/precedence."""
-    if value is None or ctx.resilient_parsing:
-        return
-    try:
-        with open(value, encoding='utf-8') as config_file:
-            config = json.load(config_file)
-    except (OSError, ValueError) as exc:
-        raise click.BadParameter(f'cannot read JSON configuration: {exc}', ctx=ctx, param=param) from exc
-    if not isinstance(config, dict):
-        raise click.BadParameter('must contain a JSON object', ctx=ctx, param=param)
-
-    names = {}
-    for option in ctx.command.params:
-        if option.name == param.name:
-            continue
-        names[option.name] = option.name
-        for flag in option.opts:
-            names[flag.lstrip('-').replace('-', '_')] = option.name
-
-    defaults = {}
-    for key, setting in config.items():
-        if key in ('linking', 'edge_divergence'):
-            try:
-                if key == 'linking':
-                    ctx.meta['analysis_linking'] = AnalysisLinkingConfig.from_json(setting)
-                else:
-                    ctx.meta['edge_divergence'] = EdgeDivergenceConfig.from_json(setting)
-            except ValueError as exc:
-                raise click.BadParameter(str(exc), ctx=ctx, param=param) from exc
-            continue
-        name = names.get(key.replace('-', '_'))
-        if name is None:
-            raise click.BadParameter(f'unknown option {key!r}', ctx=ctx, param=param)
-        if name in defaults:
-            raise click.BadParameter(f'duplicate option {key!r}', ctx=ctx, param=param)
-        defaults[name] = setting
-    ctx.default_map = {**(ctx.default_map or {}), **defaults}
-
-
 @click.command()
-@click.option('--config', type=click.Path(exists=True, dir_okay=False),
-              is_eager=True, expose_value=False, callback=load_cli_config,
-              help='JSON object with option values (hyphen or underscore keys). '
-                   'CLI options override JSON; use arrays for pcl and booleans for toggles.')
 @click.option('--checkpoint', required=True, type=click.Path(exists=True, dir_okay=False),
               help='Path to a checkpoint_*.ckpt saved by fit_spiral.')
 @click.option('--patches-dir', required=True, type=click.Path(exists=True, file_okay=False),
@@ -1696,37 +1011,9 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
             f'z-range [{model_z_begin}, {model_z_end}); the transform is undefined outside its domain.'
         )
 
-    context = fs.FitContext(fit_config, scroll=scroll, paths=input_paths)
-    linking_config = click.get_current_context().meta.get('analysis_linking')
-    point_linker = None
-    transform = dr = None
-    if linking_config is not None:
-        try:
-            linking_config = linking_config.resolve_distance(fit_config['pcl_link_distance_tolerance'])
-        except ValueError as exc:
-            raise click.BadParameter(str(exc), param_hint='linking.distance') from exc
-        print('rebuilding spiral transform before linking')
-        transform, dr = build_transform(ckpt, fit_config, context, model_z_begin, model_z_end)
-        from point_collection import PatchLinkOptions
-        point_linker = AnalysisPointLinker(
-            linking_config,
-            model_inward_direction(transform, dr, device, model_z_begin, model_z_end),
-            min_z_fraction=fit_config['pcl_vertical_fiber_min_z_fraction'],
-            min_auto_certainty=fit_config['pcl_vertical_fiber_min_auto_certainty'],
-            annotation_options=PatchLinkOptions(
-                window_points=fit_config['pcl_link_window_points'],
-                window_min_points=fit_config['pcl_link_window_min_points']),
-            explicit_links_only=fit_config.get('pcl_fiber_explicit_links_only', False))
     print('loading + z-filtering patches and point-collections')
-    # Analysis reads only the loaded patches and the linked, classified point
-    # collections; the fit-only caches (sampling caches, device atlases,
-    # trusted-geometry index, DT targets) are skipped.
-    if point_linker is None:
-        context.load_host_inputs(training_caches=False)
-    else:
-        context.load_host_inputs(point_linker=point_linker, fiber_min_point_spacing=0.0,
-                                 training_caches=False)
-        print(f'analysis linking: {json.dumps(point_linker.report)}')
+    context = fs.FitContext(fit_config, scroll=scroll, paths=input_paths)
+    context.load_host_inputs()
     patches = context.verified_patches
     # fit_spiral holds the cross-patch pcls as a list; this tool's
     # vote/edge builders key their reports by pcl id. Per-file collection
@@ -1743,9 +1030,8 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
         )
     patch = patches[patch_id]
 
-    if transform is None:
-        print('rebuilding spiral transform from checkpoint')
-        transform, dr = build_transform(ckpt, fit_config, context, model_z_begin, model_z_end)
+    print('rebuilding spiral transform from checkpoint')
+    transform, dr = build_transform(ckpt, fit_config, context, model_z_begin, model_z_end)
     dr_value = float(dr.item())
     print(f'dr_per_winding = {dr_value:.4f}')
 
@@ -1767,26 +1053,8 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
           f'model raw winding = {seed_model_winding_raw:.3f} (rounded to {seed_model_winding})')
 
     # --- build the absolute anchors and the relative-pcl patch graph ---
-    attachment_deltas = attachment_branch_deltas(cross_patch_pcls, patches, transform, dr)
-    measurer = StripMeasurer(transform, dr, patches, medial_weight, step_size)
-    print('rejecting different-turn reattachments, including linked fiber continuations')
-    attachment_deltas, attachment_return_filter = filter_attachment_returns(
-        cross_patch_pcls, patches, transform, dr, measurer, attachment_deltas)
-    print(f'attachment return filter: {attachment_return_filter["num_rejected"]} rejected '
-          f'of {attachment_return_filter["num_checked"]} later contacts '
-          f'({attachment_return_filter["num_unmeasurable"]} unmeasurable)')
-    abs_anchors_by_patch = build_abs_anchors_by_patch(cross_patch_pcls, patches, attachment_deltas)
-    rel_adjacency = build_rel_adjacency(cross_patch_pcls, patches, transform, dr, attachment_deltas)
-    divergence_config = click.get_current_context().meta.get('edge_divergence')
-    divergence_report = None
-    if divergence_config is not None:
-        # Same-winding fiber edges whose two patches diverge away from the hop
-        # (a neighbouring winding touching, or a patch crossing another) are
-        # dropped before the graph walk; see edge_divergence.py.
-        rel_adjacency, divergence_report = filter_divergent_edges(
-            rel_adjacency, patches, umbilicus_inward_direction(context.umbilicus_z_to_yx()),
-            divergence_config, )
-        print(f'edge divergence filter: {json.dumps(divergence_report["counts"])}')
+    abs_anchors_by_patch = build_abs_anchors_by_patch(cross_patch_pcls, patches, transform, dr)
+    rel_adjacency = build_rel_adjacency(cross_patch_pcls, patches, transform, dr)
     # Per-pcl classification (absolute / relative / neither) so it is clear what each
     # pcl is doing: absolute pcls anchor windings, relative pcls supply long-range edges
     # with real winding deltas, and 'neither' pcls (fibers / new_same_wind) supply
@@ -1794,7 +1062,6 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
     pcl_summary = []
     for pid, pcl in sorted(cross_patch_pcls.items()):
         num_attached = sum(1 for p in pcl['points'].values() if 'on_patch' in p)
-        eligible = [p for p in pcl['points'].values() if id(p) in attachment_deltas]
         pcl_summary.append({
             'id': int(pid),
             'name': pcl.get('name'),
@@ -1802,10 +1069,7 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
             'winding_is_absolute': bool(pcl.get('metadata', {}).get('winding_is_absolute', False)),
             'has_winding_annotations': bool(pcl.get('has_winding_annotations', False)),
             'num_points': len(pcl['points']),
-            'num_input_attached_points': num_attached,
-            'num_attached_points': len(eligible),
-            'num_attached_patches': len({p['on_patch']['id'] for p in eligible}),
-            'members': pcl.get('link_members', []),
+            'num_attached_patches': len(pcl.get('points_by_patch', {})),
         })
     num_abs_pcls = sum(1 for s in pcl_summary if s['kind'] == 'absolute')
     num_rel_pcls = sum(1 for s in pcl_summary if s['kind'] == 'relative')
@@ -1815,12 +1079,17 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
           f'(fiber/same-wind) pcl(s); absolute anchor {len(abs_anchors_by_patch)} patch(es); '
           f'relative+neither -> {num_rel_edges} cross-patch edge(s) over {len(rel_adjacency)} patch(es)')
 
-    # Batched, memoised strip measurements (see StripMeasurer): the BFS below
-    # prefetches every strip a level can ask for, so the transform runs once per
-    # level instead of once per strip. It also owns the per-patch valid-quad
-    # graphs (built once the first time a strip is needed on that patch).
-    def strip_delta(pid, from_ij, to_ij):
-        return measurer.measure(pid, from_ij, to_ij)
+    # Lazily-built, memoised valid-quad graph per patch (built once the first time
+    # a strip is needed on that patch; carries a per-start Dijkstra cache).
+    graph_cache = {}
+
+    def graph_for(pid):
+        g = graph_cache.get(pid)
+        if g is None:
+            g = cop.build_patch_graph(patches[pid], medial_weight)
+            g._dij_cache = {}
+            graph_cache[pid] = g
+        return g
 
     # --- backwards BFS over patches from the seed patch ---
     # State: (patch P, entry ij q on P, acc) with acc = winding(seed) - winding(q).
@@ -1839,12 +1108,7 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
     num_loops_unmeasurable = 0
     # acc = winding(seed) - winding(entry); integer throughout (sum of integer
     # strip + edge deltas), so the predicted seed windings come out as integers.
-    # The queue is consumed one BFS level (hop depth) at a time: the states of a
-    # level are known before any of them is expanded, so every strip the level
-    # can request is measured in one batch first. Expansion order within the
-    # level -- and therefore which edge first reaches each patch -- is the plain
-    # FIFO order the per-state queue produced.
-    frontier = [{'patch': patch_id, 'entry_ij': seed_ij, 'acc': 0, 'hops': 0, 'path': []}]
+    queue = deque([{'patch': patch_id, 'entry_ij': seed_ij, 'acc': 0, 'hops': 0, 'path': []}])
 
     def record_vote(expected, anchor, hops, acc, anchor_strip, path):
         expected_int = int(np.round(expected))
@@ -1856,14 +1120,15 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
             'abs_pcl_name': anchor['pcl_name'],
             'abs_source_file': anchor['source_file'],
             'abs_point_id': anchor['point_id'],
-            'abs_winding_annotation': anchor['source_winding'],
-            'abs_attachment_branch_delta': anchor['attachment_branch_delta'],
+            'abs_winding_annotation': anchor['winding'],
             'abs_patch_id': path[-1]['to_patch'] if path else patch_id,
             'abs_ij': anchor['ij'].tolist(),
             'abs_distance_to_patch': anchor['distance'],
             'abs_zyx_raw': _to_py(anchor['zyx']),
-            # winding(seed) = acc_seed_minus_entry + abs_winding + anchor_to_entry_delta
+            # winding(seed) = acc_seed_minus_entry + abs_winding + abs_attachment_branch_delta
+            #                 + anchor_to_entry_delta
             'acc_seed_minus_entry': acc,
+            'abs_attachment_branch_delta': anchor['attachment_branch_delta'],
             'anchor_to_entry_delta': anchor_strip['delta_windings'],
             'anchor_to_entry_residual_unwrapped_delta': anchor_strip['residual_unwrapped_delta_windings'],
             'anchor_to_entry_unwrap_adjustment': anchor_strip['unwrap_adjustment_windings'],
@@ -1876,133 +1141,56 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
         votes.setdefault(str(expected_int), []).append(voter)
         chain = '' if not path else ' via ' + ' -> '.join(
             [path[0]['from_patch']] + [h['to_patch'] for h in path])
-        return (f'  [{hops} hop(s)] abs pcl {anchor["pcl_id"]} ({anchor["pcl_name"]!r}) '
-                f'point {anchor["point_id"]} on patch {voter["abs_patch_id"]}: '
-                f'annotation={anchor["winding"]:g} -> expected seed winding={expected:.3f} '
-                f'(round {expected_int}){chain}')
+        print(f'  [{hops} hop(s)] abs pcl {anchor["pcl_id"]} ({anchor["pcl_name"]!r}) '
+              f'point {anchor["point_id"]} on patch {voter["abs_patch_id"]}: '
+              f'annotation={anchor["winding"]:g} -> expected seed winding={expected:.3f} '
+              f'(round {expected_int}){chain}')
 
-    def check_loop(P, q, acc, hops, edge, rstate):
-        """Non-tree edge P -> R (R already reached): it closes a cycle. Express
-        winding(seed) - winding(e) at the edge's arrival point e two ways and
-        difference them:
-          * via this edge from P: acc - strip(P, q->d) - edge_delta
-          * via R's stored tree path: acc_R - strip(R, entry_R->e)
-        The gap is the cycle's winding holonomy (0 == the loop closes). Returns
-        the console line to print (or None)."""
-        nonlocal num_loops_unmeasurable
-        R = edge['neighbor']
-        edge_key = (edge['pcl_id'], frozenset((edge['from_point_id'], edge['to_point_id'])))
-        if edge_key in loops_seen:
-            return None
-        strip = strip_delta(P, q, edge['from_ij'])
-        rstrip = strip_delta(R, rstate['entry_ij'], edge['to_ij'])
-        if strip is None or rstrip is None:
-            num_loops_unmeasurable += 1
-            return None  # can't measure one side; the reverse direction may still succeed
-        acc_arrival_via_edge = acc - strip['delta_windings'] - edge['winding_delta']
-        acc_arrival_via_tree = rstate['acc'] - rstrip['delta_windings']
-        holonomy = acc_arrival_via_edge - acc_arrival_via_tree
-        holonomy_int = int(round(holonomy))
-        loops_seen.add(edge_key)
-        loops.append({
-            **edge_provenance(edge),
-            'rel_pcl_id': edge['pcl_id'],
-            'rel_pcl_name': edge['pcl_name'],
-            'rel_source_file': edge['source_file'],
-            'from_patch': P,
-            'to_patch': R,
-            'from_ij': edge['from_ij'].tolist(),
-            'to_ij': edge['to_ij'].tolist(),
-            'from_point_id': edge['from_point_id'],
-            'to_point_id': edge['to_point_id'],
-            'from_zyx_raw': _to_py(edge['from_zyx']),
-            'to_zyx_raw': _to_py(edge['to_zyx']),
-            'edge_winding_delta': edge['winding_delta'],
-            'raw_edge_winding_delta': edge['raw_winding_delta'],
-            'pcl_unwrap_adjustment': edge['pcl_unwrap_adjustment'],
-            'pcl_branch_delta': edge['pcl_branch_delta'],
-            'from_depth': hops,
-            'to_depth': rstate['hops'],
-            # winding(seed) - winding(entry) of each end, so the plot can place the
-            # loop's departure (from_patch) and arrival (to_patch) ends in x.
-            'from_acc': acc,
-            'to_acc': rstate['acc'],
-            'intra_patch_strip_delta_from': strip['delta_windings'],
-            'intra_patch_strip_delta_to': rstrip['delta_windings'],
-            'loop_winding_delta': holonomy_int,
-            'loop_winding_residual': float(holonomy),
-            'is_inconsistent': holonomy_int != 0,
-        })
-        if holonomy_int != 0:
-            return (f'  LOOP inconsistency: rel pcl {edge["pcl_id"]} ({edge["pcl_name"]!r}) '
-                    f'reconnects {P} (d{hops}) <-> {R} (d{rstate["hops"]}): winding holonomy '
-                    f'{holonomy_int:+d} (residual {holonomy:+.3f})')
-        return None
+    while queue:
+        state = queue.popleft()
+        P, q, acc, hops, path = state['patch'], state['entry_ij'], state['acc'], state['hops'], state['path']
+        graph_P = graph_for(P)
 
-    while frontier:
-        # Every strip this level can ask for while voting and growing the tree:
-        # anchor -> entry on each state's patch, and entry -> departure point of
-        # each of its edges.
-        requests = []
-        for state in frontier:
-            P, q = state['patch'], state['entry_ij']
-            for anchor in abs_anchors_by_patch.get(P, []):
-                requests.append((P, anchor['ij'], q))
-            for edge in rel_adjacency.get(P, []):
-                requests.append((P, q, edge['from_ij']))
-        measurer.prefetch(requests)
+        # (a) votes from absolute anchors on this patch: propagate from anchor to
+        #     the entry point (strip_delta(P, anchor, q) = winding(q) - winding(anchor)).
+        for anchor in abs_anchors_by_patch.get(P, []):
+            anchor_strip = strip_winding_delta(transform, dr, graph_P, anchor['ij'], q, step_size)
+            if anchor_strip is None:
+                print(f'  [{hops} hop(s)] abs pcl {anchor["pcl_id"]} ({anchor["pcl_name"]!r}) '
+                      f'point {anchor["point_id"]} on patch {P}: anchor->entry strip had <2 valid '
+                      f'points; skipped')
+                continue
+            expected = (acc + anchor['winding'] + anchor['attachment_branch_delta']
+                        + anchor_strip['delta_windings'])
+            record_vote(expected, anchor, hops, acc, anchor_strip, path)
 
-        next_frontier = []
-        # Console lines in encounter order; loop checks are filled in below.
-        messages = []
-        pending_loops = []  # (message slot, P, q, acc, hops, edge, rstate)
-        for state in frontier:
-            P, q, acc, hops, path = state['patch'], state['entry_ij'], state['acc'], state['hops'], state['path']
+        # (b) relative edges: grow the BFS tree into unreached neighbours, and check
+        #     edges that reconnect an already-reached patch for loop holonomy.
+        for edge in rel_adjacency.get(P, []):
+            R = edge['neighbor']
+            edge_key = (edge['pcl_id'], frozenset((edge['from_point_id'], edge['to_point_id'])))
 
-            # (a) votes from absolute anchors on this patch: propagate from anchor to
-            #     the entry point (strip_delta(P, anchor, q) = winding(q) - winding(anchor)).
-            for anchor in abs_anchors_by_patch.get(P, []):
-                anchor_strip = strip_delta(P, anchor['ij'], q)
-                if anchor_strip is None:
-                    messages.append(
-                        f'  [{hops} hop(s)] abs pcl {anchor["pcl_id"]} ({anchor["pcl_name"]!r}) '
-                        f'point {anchor["point_id"]} on patch {P}: anchor->entry strip had <2 valid '
-                        f'points; skipped')
+            if R in reached:
+                # Non-tree edge -> it closes a cycle. Express winding(seed) - winding(e)
+                # at the edge's arrival point e two ways and difference them:
+                #   * via this edge from P: acc - strip(P, q->d) - edge_delta
+                #   * via R's stored tree path: acc_R - strip(R, entry_R->e)
+                # The gap is the cycle's winding holonomy (0 == the loop closes).
+                if (not detect_loops) or edge_key in tree_edges or edge_key in loops_seen:
                     continue
-                expected = acc + anchor['winding'] + anchor_strip['delta_windings']
-                messages.append(record_vote(expected, anchor, hops, acc, anchor_strip, path))
-
-            # (b) relative edges: grow the BFS tree into unreached neighbours, and check
-            #     edges that reconnect an already-reached patch for loop holonomy.
-            for edge in rel_adjacency.get(P, []):
-                R = edge['neighbor']
-                edge_key = (edge['pcl_id'], frozenset((edge['from_point_id'], edge['to_point_id'])))
-
-                if R in reached:
-                    # Non-tree edge -> a loop check. Its arrival-side strip depends on
-                    # R's entry point, which may only have been fixed earlier in this
-                    # level, so the checks are batched after the level's tree growth.
-                    # Loop checks never change `reached` or the tree, and a check's
-                    # outcome depends only on its two strips, so deferring them (in
-                    # encounter order) leaves every result unchanged.
-                    if (not detect_loops) or edge_key in tree_edges:
-                        continue
-                    messages.append(None)
-                    pending_loops.append((len(messages) - 1, P, q, acc, hops, edge, reached[R]))
-                    continue
-
-                # Unreached neighbour: grow the tree into it (bounded by --max-hops).
-                if max_hops is not None and hops >= max_hops:
-                    continue
-                # Propagate within P from the entry point to the edge's departure point.
-                strip = strip_delta(P, q, edge['from_ij'])
-                if strip is None:
-                    continue  # can't carry the winding across this edge; another path may reach R
-                acc2 = acc - strip['delta_windings'] - edge['winding_delta']
-                tree_edges.add(edge_key)
-                reached[R] = {'acc': acc2, 'entry_ij': edge['to_ij'], 'hops': hops + 1}
-                hop_record = {
-                    **edge_provenance(edge),
+                strip = strip_winding_delta(transform, dr, graph_P, q, edge['from_ij'], step_size)
+                rstate = reached[R]
+                rstrip = strip_winding_delta(transform, dr, graph_for(R), rstate['entry_ij'],
+                                             edge['to_ij'], step_size)
+                if strip is None or rstrip is None:
+                    num_loops_unmeasurable += 1
+                    continue  # can't measure one side; the reverse direction may still succeed
+                acc_arrival_via_edge = acc - strip['delta_windings'] - edge['winding_delta']
+                acc_arrival_via_tree = rstate['acc'] - rstrip['delta_windings']
+                holonomy = acc_arrival_via_edge - acc_arrival_via_tree
+                holonomy_int = int(round(holonomy))
+                loops_seen.add(edge_key)
+                loops.append({
                     'rel_pcl_id': edge['pcl_id'],
                     'rel_pcl_name': edge['pcl_name'],
                     'rel_source_file': edge['source_file'],
@@ -2018,29 +1206,60 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
                     'raw_edge_winding_delta': edge['raw_winding_delta'],
                     'pcl_unwrap_adjustment': edge['pcl_unwrap_adjustment'],
                     'pcl_branch_delta': edge['pcl_branch_delta'],
-                    'intra_patch_strip_delta': strip['delta_windings'],
-                    'intra_patch_residual_unwrapped_delta': strip['residual_unwrapped_delta_windings'],
-                    'intra_patch_unwrap_adjustment': strip['unwrap_adjustment_windings'],
-                    'intra_patch_strip_num_path_quads': strip['strip_num_path_quads'],
-                    'intra_patch_strip_num_points': strip['strip_num_points'],
-                    'intra_patch_strip_num_invalid_dropped': strip['strip_num_invalid_dropped'],
-                }
-                tree_edge_by_child[R] = hop_record
-                next_frontier.append({'patch': R, 'entry_ij': edge['to_ij'], 'acc': acc2,
-                                      'hops': hops + 1, 'path': path + [hop_record]})
+                    'from_depth': hops,
+                    'to_depth': rstate['hops'],
+                    # winding(seed) - winding(entry) of each end, so the plot can place the
+                    # loop's departure (from_patch) and arrival (to_patch) ends in x.
+                    'from_acc': acc,
+                    'to_acc': rstate['acc'],
+                    'intra_patch_strip_delta_from': strip['delta_windings'],
+                    'intra_patch_strip_delta_to': rstrip['delta_windings'],
+                    'loop_winding_delta': holonomy_int,
+                    'loop_winding_residual': float(holonomy),
+                    'is_inconsistent': holonomy_int != 0,
+                })
+                if holonomy_int != 0:
+                    print(f'  LOOP inconsistency: rel pcl {edge["pcl_id"]} ({edge["pcl_name"]!r}) '
+                          f'reconnects {P} (d{hops}) <-> {R} (d{rstate["hops"]}): winding holonomy '
+                          f'{holonomy_int:+d} (residual {holonomy:+.3f})')
+                continue
 
-        # Loop checks of this level: the arrival-side strips are known now.
-        measurer.prefetch([(edge['neighbor'], rstate['entry_ij'], edge['to_ij'])
-                           for _, _, _, _, _, edge, rstate in pending_loops])
-        for slot, P, q, acc, hops, edge, rstate in pending_loops:
-            messages[slot] = check_loop(P, q, acc, hops, edge, rstate)
-        for message in messages:
-            if message is not None:
-                print(message)
-        frontier = next_frontier
-
-    print(f'measured {measurer.num_measured} within-patch strip(s) in {measurer.num_batches} batch(es) '
-          f'over {len(measurer._graphs)} patch graph(s)')
+            # Unreached neighbour: grow the tree into it (bounded by --max-hops).
+            if max_hops is not None and hops >= max_hops:
+                continue
+            # Propagate within P from the entry point to the edge's departure point.
+            strip = strip_winding_delta(transform, dr, graph_P, q, edge['from_ij'], step_size)
+            if strip is None:
+                continue  # can't carry the winding across this edge; another path may reach R
+            acc2 = acc - strip['delta_windings'] - edge['winding_delta']
+            tree_edges.add(edge_key)
+            reached[R] = {'acc': acc2, 'entry_ij': edge['to_ij'], 'hops': hops + 1}
+            hop_record = {
+                'rel_pcl_id': edge['pcl_id'],
+                'rel_pcl_name': edge['pcl_name'],
+                'rel_source_file': edge['source_file'],
+                'from_patch': P,
+                'to_patch': R,
+                'from_ij': edge['from_ij'].tolist(),
+                'to_ij': edge['to_ij'].tolist(),
+                'from_point_id': edge['from_point_id'],
+                'to_point_id': edge['to_point_id'],
+                'from_zyx_raw': _to_py(edge['from_zyx']),
+                'to_zyx_raw': _to_py(edge['to_zyx']),
+                'edge_winding_delta': edge['winding_delta'],
+                'raw_edge_winding_delta': edge['raw_winding_delta'],
+                'pcl_unwrap_adjustment': edge['pcl_unwrap_adjustment'],
+                'pcl_branch_delta': edge['pcl_branch_delta'],
+                'intra_patch_strip_delta': strip['delta_windings'],
+                'intra_patch_residual_unwrapped_delta': strip['residual_unwrapped_delta_windings'],
+                'intra_patch_unwrap_adjustment': strip['unwrap_adjustment_windings'],
+                'intra_patch_strip_num_path_quads': strip['strip_num_path_quads'],
+                'intra_patch_strip_num_points': strip['strip_num_points'],
+                'intra_patch_strip_num_invalid_dropped': strip['strip_num_invalid_dropped'],
+            }
+            tree_edge_by_child[R] = hop_record
+            queue.append({'patch': R, 'entry_ij': edge['to_ij'], 'acc': acc2,
+                          'hops': hops + 1, 'path': path + [hop_record]})
 
     agreeing = sorted(votes.keys(), key=lambda k: int(k))
     num_direct = sum(1 for v in voter_details if v['hops'] == 0)
@@ -2078,19 +1297,12 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
         within-patch valid-quad strip (None if unmeasurable). Same machinery as the
         BFS's intra_patch_strip_delta, used here for each loop patch's two cycle
         points (which, at the LCA / loop endpoints, are not the BFS tree points)."""
-        s = strip_delta(pid, np.asarray(top_ij, dtype=np.float32), np.asarray(bot_ij, dtype=np.float32))
+        s = strip_winding_delta(transform, dr, graph_for(pid),
+                                np.asarray(top_ij, dtype=np.float32),
+                                np.asarray(bot_ij, dtype=np.float32), step_size)
         return None if s is None else s['delta_windings']
 
-    loop_cycles = build_loop_cycles(loops, tree_edge_by_child, loop_patch_strip_delta,
-                                    prefetch_fn=measurer.prefetch)
-    attachment_returns = None
-    if detect_loops:
-        print('checking individual fiber returns to the same patch')
-        attachment_returns = audit_attachment_returns(
-            cross_patch_pcls, patches, transform, dr, measurer, attachment_deltas)
-        print(f'attachment returns: {attachment_returns["num_conflicts"]} conflict(s) '
-              f'in {attachment_returns["num_checked"]} checks; '
-              f'{attachment_returns["num_unmeasurable"]} unmeasurable')
+    loop_cycles = build_loop_cycles(loops, tree_edge_by_child, loop_patch_strip_delta)
 
     # Edges lying on the inconsistent fundamental cycles (each cycle's tree-path steps plus
     # its closing edge), keyed exactly as solve_min_edge_fix keys edges. Only these edges
@@ -2153,10 +1365,6 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
     disconnected_subgraphs['components'] = comps[:max_subgraphs]
 
     out = {
-        'graph_point_id_convention': 'collection_dictionary_key',
-        'attachment_returns': attachment_returns,
-        'attachment_return_filter': attachment_return_filter,
-        'num_attachment_seam_crossings': sum(v != 0 for v in attachment_deltas.values()),
         'checkpoint': os.path.abspath(checkpoint),
         'patches_dir': os.path.abspath(patches_dir),
         'umbilicus': os.path.abspath(umbilicus_path),
@@ -2196,11 +1404,6 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
         'min_edge_fix': min_edge_fix,
         'disconnected_subgraphs': disconnected_subgraphs,
     }
-
-    if point_linker is not None:
-        out['linking'] = point_linker.report
-    if divergence_report is not None:
-        out['edge_divergence'] = divergence_report
 
     if output is None:
         output = os.path.join(os.path.dirname(os.path.abspath(checkpoint)), f'winding_votes_{patch_id}.json')

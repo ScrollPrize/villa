@@ -50,23 +50,18 @@ def _patch_graph(patch):
     return graph
 
 
-def _build_rel_adjacency(pcls, patches, transform, dr):
-    deltas = fiw.attachment_branch_deltas(pcls, patches, transform, dr)
-    return fiw.build_rel_adjacency(pcls, patches, transform, dr, deltas)
-
-
 def test_relative_edge_is_expressed_between_attachments():
     patches = {'P': _arc_patch(-0.002, 0.002, 3), 'R': _arc_patch(0.998, 1.002, 3)}
     b = _point(2, 1.0, 'R', (1.0, 1.0))
 
     across_the_ray = _point(1, TWO_PI - 0.001, 'P', (1.0, 1.5))
-    adjacency = _build_rel_adjacency(
+    adjacency = fiw.build_rel_adjacency(
         {0: _relative_pcl([across_the_ray, b])}, patches, IdentityTransform(), DR)
     assert adjacency['P'][0]['winding_delta'] == 0
     assert adjacency['R'][0]['winding_delta'] == 0
 
     same_side = _point(1, TWO_PI - 0.001, 'P', (1.0, 0.5))
-    adjacency = _build_rel_adjacency(
+    adjacency = fiw.build_rel_adjacency(
         {0: _relative_pcl([same_side, b])}, patches, IdentityTransform(), DR)
     assert adjacency['P'][0]['winding_delta'] == 1
     assert adjacency['R'][0]['winding_delta'] == -1
@@ -84,7 +79,7 @@ def test_consistent_two_patch_loop_closes_when_a_point_straddles_the_ray():
     b1 = _point(2, 1.0, 'R', (1.0, 0.5))
     a2 = _point(3, 0.2, 'P', (1.0, 25.25))
     b2 = _point(4, 1.2, 'R', (1.0, 25.5))
-    adjacency = _build_rel_adjacency(
+    adjacency = fiw.build_rel_adjacency(
         {0: _relative_pcl([a1, b1]), 1: _relative_pcl([a2, b2])},
         patches, IdentityTransform(), DR)
     tree_edge, closing_edge = adjacency['P']
@@ -102,10 +97,7 @@ def test_absolute_anchor_carries_the_step_to_its_attachment():
     same_side = _point(2, TWO_PI - 0.001, 'P', (1.0, 0.5), winding=7.0)
     pcl = {'name': 'abs', 'source_file': 'abs_winding.json',
            'metadata': {'winding_is_absolute': True},
-           'points_by_patch': {'P': [across_the_ray, same_side]},
-           'points': {1: across_the_ray, 2: same_side}}
-    deltas = fiw.attachment_branch_deltas({0: pcl}, patches, IdentityTransform(), DR)
-    anchors = fiw.build_abs_anchors_by_patch({0: pcl}, patches, deltas)
-    assert [a['source_winding'] for a in anchors['P']] == [7, 7]
-    assert [a['winding'] for a in anchors['P']] == [8, 7]
+           'points_by_patch': {'P': [across_the_ray, same_side]}}
+    anchors = fiw.build_abs_anchors_by_patch({0: pcl}, patches, IdentityTransform(), DR)
+    assert [a['winding'] for a in anchors['P']] == [7, 7]
     assert [a['attachment_branch_delta'] for a in anchors['P']] == [1, 0]
