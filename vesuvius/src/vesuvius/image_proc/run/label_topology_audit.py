@@ -126,6 +126,10 @@ def locate_holes(mask: np.ndarray, b1: int, blocked: np.ndarray | None = None, c
         before = cur[win]
         if euler_number(np.pad(before | blob[win], 1), 3) <= euler_number(np.pad(before, 1), 3):
             continue
+        # a blob the sheet does not touch (cut off by blocked voxels) is an island: it raises
+        # the Euler number without closing a loop, and b1 is computed assuming one component
+        if not (ndi.binary_dilation(blob[win], st) & before).any():
+            continue
         b1_after = component_topology(cur | blob)["b1"]
         if b1_after < b1:
             c = np.argwhere(blob).mean(0).round().astype(int)
@@ -200,7 +204,7 @@ def audit(label, erode=1, min_piece=500, surface_value=1, ignore_value=2):
     if ignore_value is not None and surface_value == ignore_value:
         raise ValueError("--surface-value and --ignore-value must differ")
     cc3d, ndi, _ = _deps()
-    ball = ndi.generate_binary_structure(3, 1)
+    ball = ndi.generate_binary_structure(3, 3)  # match the 26-connected foreground
     fg = label == surface_value
     unl = (label == ignore_value) if ignore_value is not None else np.zeros_like(fg)
     comp, n = cc3d.connected_components(fg, connectivity=26, return_N=True)

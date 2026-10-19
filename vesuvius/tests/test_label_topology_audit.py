@@ -376,3 +376,24 @@ def test_cli_batch_rejects_roi_and_tile(tmp_path):
     tifffile.imwrite(tmp_path / "labels" / "a.tif", sheet())
     with pytest.raises(SystemExit):
         lta.main(["--batch", str(tmp_path), "--tile", "20", "--out", str(tmp_path / "out")])
+
+
+def test_fill_cut_off_by_ignore_ring_is_not_a_located_hole():
+    # a fill that does not touch the sheet is an island: it raises the Euler number without
+    # closing any loop, so counting it as a repair would report a hole fixed that is still open
+    v = sheet()
+    v[18:20, 9:14, 9:14] = 2
+    v[18:20, 10:13, 10:13] = 0
+    m, flags = lta.audit(v)
+    assert m["n_holes_located"] == 0
+    assert not flags["hole"].any()
+
+
+def test_component_touching_ignore_only_at_a_corner_is_open():
+    # foreground is 26-connected, so a corner contact with an ignore voxel is contact: the
+    # component may continue through the unlabeled region and its topology is truncated
+    v = np.zeros((40, 40, 40), np.uint8)
+    v[18:20, 10:30, 10:30] = 1
+    v[20, 30, 30] = 2
+    m, _ = lta.audit(v)
+    assert m["n_closed_big"] == 0
