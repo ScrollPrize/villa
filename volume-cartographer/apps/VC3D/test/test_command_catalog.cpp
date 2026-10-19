@@ -10,6 +10,8 @@
 #include <QPointer>
 #include <QPushButton>
 #include <QSignalSpy>
+#include <QStatusBar>
+#include <QTabWidget>
 #include <QTemporaryDir>
 #include <QtTest/QtTest>
 
@@ -266,6 +268,45 @@ private slots:
         QVERIFY(!button->isHidden());
         QVERIFY(dock->toggleViewAction()->isChecked());
         QVERIFY(frame->isVisible());
+    }
+
+    void panelsOpenOverAnotherWorkspaceTab()
+    {
+        // As in CWindow: the panel host is the central widget of the "main"
+        // workspace tab and its button bar sits in the window's status bar,
+        // so a panel opens over whichever workspace tab is showing.
+        QMainWindow window;
+        window.resize(900, 600);
+        auto* tabs = new QTabWidget(&window);
+        window.setCentralWidget(tabs);
+        auto* workspace = new QMainWindow(&window);
+        auto* host = new StatusDockPanelHost(new QWidget, workspace);
+        workspace->setCentralWidget(host);
+        auto* dock = new QDockWidget(QStringLiteral("Segmentation"), workspace);
+        dock->setObjectName(QStringLiteral("dockWidgetSegmentation"));
+        auto* content = new QLabel(QStringLiteral("segmentation"));
+        dock->setWidget(content);
+        workspace->addDockWidget(Qt::RightDockWidgetArea, dock);
+        tabs->addTab(workspace, QStringLiteral("main"));
+        auto* other = new QWidget;
+        tabs->addTab(other, QStringLiteral("Lasagna"));
+        window.statusBar()->insertWidget(0, host->takeBarWidget(), 0);
+        host->addDock(dock);
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+        tabs->setCurrentWidget(other);
+        QVERIFY(!host->isVisible());
+
+        CommandCatalog catalog;
+        QVERIFY(catalog.addPanel(dock, host->openAction(dock)));
+        QVERIFY(catalog.invoke(QStringLiteral("panel.segmentation")));
+        auto* frame = window.findChild<QFrame*>(QStringLiteral("statusDockPanelFrame"));
+        QVERIFY(frame);
+        QCOMPARE(frame->window(), &window);
+        QVERIFY(frame->isVisible());
+        QVERIFY(content->isVisible());
+        // Like a click on its status bar button, it leaves the tab alone.
+        QCOMPARE(tabs->currentWidget(), other);
     }
 
     void displayTextDropsMnemonicMarkers()
