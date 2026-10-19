@@ -82,3 +82,6 @@ Follow-up: [detailed signs versus GT audit](gt-sign-audit.md), including affecte
 ## Fractional targets
 
 The accepted adjacent-integer weighting baseline, seven-case comparison and reproduction commands are documented in [fractional-targets.md](fractional-targets.md). Fractional targets are now the default in the benchmark and canonical `run_seven.json`; use explicit `target_mode: rounded` for the historical formulation. Saved historical outputs remain unchanged.
+
+Follow-up variation: [split-fiber three-case experiment](split-fibers.md), with
+perpendicular L1, separate GT sign counts, and explicit GT-splittable semantics.

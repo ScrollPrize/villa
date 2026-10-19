@@ -1,0 +1,403 @@
+{
+  "free": {
+    "original_fibers": 2053,
+    "pieces": 2273,
+    "split_original_fibers": 184,
+    "gt_original_fibers": 0,
+    "gt_pieces": 0,
+    "protected_gt_sources": [],
+    "events": 15889,
+    "used_events": 15869,
+    "excluded_events": 20,
+    "flow_arcs": 30179,
+    "retained_length_percent": 100.0,
+    "continuation_weight": 0,
+    "boundaries": 220,
+    "nonzero_boundary_jumps": 0,
+    "boundary_max_jump": 0,
+    "boundary_note": "Independent component offsets make cross-component jumps unidentifiable",
+    "identifiable_nonzero_boundary_jumps": 0,
+    "certificate": {
+      "primal": 3232.192058558576,
+      "dual": 3232.192058558576,
+      "gap": 0.0,
+      "conservation_max": 0.0,
+      "capacity_violation_max": 0.0,
+      "potential_rounding_max": 0.0,
+      "components": 5,
+      "seconds": 0.21236093319021165,
+      "optimal": true,
+      "backend": "scipy.optimize.linprog/highs-ds capacitated circulation",
+      "iterations": 4640
+    },
+    "component_sizes": [
+      2258,
+      4,
+      4,
+      6,
+      1
+    ],
+    "child_components_per_baseline_component": {
+      "0": 1,
+      "1": 1,
+      "2": 1,
+      "3": 1,
+      "4": 1
+    },
+    "reference": {
+      "all": {
+        "events": 4918,
+        "l1": 0.04168361122407483,
+        "correct_percent": 95.85197234648231,
+        "max_error": 2
+      },
+      "perpendicular": {
+        "events": 575,
+        "l1": 0.1426086956521739,
+        "correct_percent": 85.91304347826086,
+        "max_error": 2
+      },
+      "parallel": {
+        "events": 4343,
+        "l1": 0.028321436794842274,
+        "correct_percent": 97.16785632051578,
+        "max_error": 1
+      },
+      "available_events": 5251,
+      "scored_events": 4918,
+      "unscored_events": 333,
+      "component_gauges": {
+        "0": {
+          "offset": 6,
+          "events": 4848
+        },
+        "1": {
+          "offset": 0,
+          "events": 1
+        },
+        "2": {
+          "offset": 4,
+          "events": 6
+        },
+        "3": {
+          "offset": 1,
+          "events": 63
+        }
+      },
+      "gauge_policy": "per-component integer median; GT used only for evaluation",
+      "reference": "frozen gt_winding_reference.json; source 7 excluded",
+      "single_global_gauge": {
+        "offset": 6,
+        "metrics": {
+          "all": {
+            "events": 4918,
+            "l1": 0.10898739324928833,
+            "correct_percent": 94.44896299308661,
+            "max_error": 6
+          },
+          "perpendicular": {
+            "events": 575,
+            "l1": 0.17391304347826086,
+            "correct_percent": 85.21739130434783,
+            "max_error": 6
+          },
+          "parallel": {
+            "events": 4343,
+            "l1": 0.10039143449228644,
+            "correct_percent": 95.6711950264794,
+            "max_error": 5
+          }
+        },
+        "signs": {
+          "perpendicular": {
+            "events": 575,
+            "violations": 5
+          },
+          "parallel": {
+            "events": 4343,
+            "violations": 27
+          }
+        }
+      },
+      "signs": {
+        "parallel": {
+          "events": 4343,
+          "violations": 0
+        },
+        "perpendicular": {
+          "events": 575,
+          "violations": 4
+        }
+      }
+    },
+    "internal_signs": {
+      "perpendicular": {
+        "events": 4283,
+        "violations": 3
+      },
+      "parallel": {
+        "events": 10772,
+        "violations": 0
+      }
+    },
+    "seconds_total": 11.61359805194661
+  },
+  "joint_intact_gt": {
+    "original_fibers": 2060,
+    "pieces": 2291,
+    "split_original_fibers": 194,
+    "gt_original_fibers": 7,
+    "gt_pieces": 7,
+    "protected_gt_sources": [
+      471177,
+      471178,
+      471179,
+      471180,
+      471181,
+      471182,
+      471183
+    ],
+    "events": 21186,
+    "used_events": 21166,
+    "excluded_events": 20,
+    "flow_arcs": 40682,
+    "retained_length_percent": 100.0,
+    "continuation_weight": 0,
+    "boundaries": 231,
+    "nonzero_boundary_jumps": 0,
+    "boundary_max_jump": 0,
+    "boundary_note": "Independent component offsets make cross-component jumps unidentifiable",
+    "identifiable_nonzero_boundary_jumps": 0,
+    "certificate": {
+      "primal": 4108.967315392596,
+      "dual": 4108.967315392601,
+      "gap": -5.4569682106375694e-12,
+      "conservation_max": 7.579492589115944e-13,
+      "capacity_violation_max": 0.0,
+      "potential_rounding_max": 0.0,
+      "components": 2,
+      "seconds": 0.24101531482301652,
+      "optimal": true,
+      "backend": "scipy.optimize.linprog/highs-ds capacitated circulation",
+      "iterations": 4870
+    },
+    "component_sizes": [
+      2290,
+      1
+    ],
+    "child_components_per_baseline_component": {
+      "0": 1,
+      "1": 1
+    },
+    "reference": {
+      "all": {
+        "events": 4918,
+        "l1": 0.03355022366815779,
+        "correct_percent": 96.64497763318423,
+        "max_error": 1
+      },
+      "perpendicular": {
+        "events": 575,
+        "l1": 0.1356521739130435,
+        "correct_percent": 86.43478260869564,
+        "max_error": 1
+      },
+      "parallel": {
+        "events": 4343,
+        "l1": 0.020032235781717707,
+        "correct_percent": 97.99677642182823,
+        "max_error": 1
+      },
+      "available_events": 5251,
+      "scored_events": 4918,
+      "unscored_events": 333,
+      "component_gauges": {
+        "0": {
+          "offset": 6,
+          "events": 4918
+        }
+      },
+      "gauge_policy": "per-component integer median; GT used only for evaluation",
+      "reference": "frozen gt_winding_reference.json; source 7 excluded",
+      "single_global_gauge": {
+        "offset": 6,
+        "metrics": {
+          "all": {
+            "events": 4918,
+            "l1": 0.03355022366815779,
+            "correct_percent": 96.64497763318423,
+            "max_error": 1
+          },
+          "perpendicular": {
+            "events": 575,
+            "l1": 0.1356521739130435,
+            "correct_percent": 86.43478260869564,
+            "max_error": 1
+          },
+          "parallel": {
+            "events": 4343,
+            "l1": 0.020032235781717707,
+            "correct_percent": 97.99677642182823,
+            "max_error": 1
+          }
+        },
+        "signs": {
+          "perpendicular": {
+            "events": 575,
+            "violations": 3
+          },
+          "parallel": {
+            "events": 4343,
+            "violations": 0
+          }
+        }
+      },
+      "signs": {
+        "parallel": {
+          "events": 4343,
+          "violations": 0
+        },
+        "perpendicular": {
+          "events": 575,
+          "violations": 3
+        }
+      }
+    },
+    "internal_signs": {
+      "perpendicular": {
+        "events": 4924,
+        "violations": 6
+      },
+      "parallel": {
+        "events": 15428,
+        "violations": 0
+      }
+    },
+    "seconds_total": 14.690123806940392
+  },
+  "joint_splittable_gt": {
+    "original_fibers": 2060,
+    "pieces": 2421,
+    "split_original_fibers": 201,
+    "gt_original_fibers": 7,
+    "gt_pieces": 137,
+    "protected_gt_sources": [],
+    "events": 21186,
+    "used_events": 21166,
+    "excluded_events": 20,
+    "flow_arcs": 40682,
+    "retained_length_percent": 100.0,
+    "continuation_weight": 0,
+    "boundaries": 361,
+    "nonzero_boundary_jumps": 5,
+    "boundary_max_jump": 1,
+    "boundary_note": "Independent component offsets make cross-component jumps unidentifiable",
+    "identifiable_nonzero_boundary_jumps": 5,
+    "certificate": {
+      "primal": 4102.3546766036525,
+      "dual": 4102.3546766036525,
+      "gap": 0.0,
+      "conservation_max": 2.5424107263916085e-14,
+      "capacity_violation_max": 0.0,
+      "potential_rounding_max": 0.0,
+      "components": 2,
+      "seconds": 0.267733900109306,
+      "optimal": true,
+      "backend": "scipy.optimize.linprog/highs-ds capacitated circulation",
+      "iterations": 5246
+    },
+    "component_sizes": [
+      2420,
+      1
+    ],
+    "child_components_per_baseline_component": {
+      "0": 1,
+      "1": 1
+    },
+    "reference": {
+      "all": {
+        "events": 4918,
+        "l1": 0.03456689711264742,
+        "correct_percent": 96.54331028873526,
+        "max_error": 1
+      },
+      "perpendicular": {
+        "events": 575,
+        "l1": 0.13391304347826086,
+        "correct_percent": 86.60869565217392,
+        "max_error": 1
+      },
+      "parallel": {
+        "events": 4343,
+        "l1": 0.021413769283905135,
+        "correct_percent": 97.85862307160949,
+        "max_error": 1
+      },
+      "available_events": 5251,
+      "scored_events": 4918,
+      "unscored_events": 333,
+      "component_gauges": {
+        "0": {
+          "offset": 6,
+          "events": 4918
+        }
+      },
+      "gauge_policy": "per-component integer median; GT used only for evaluation",
+      "reference": "frozen gt_winding_reference.json; source 7 excluded",
+      "single_global_gauge": {
+        "offset": 6,
+        "metrics": {
+          "all": {
+            "events": 4918,
+            "l1": 0.03456689711264742,
+            "correct_percent": 96.54331028873526,
+            "max_error": 1
+          },
+          "perpendicular": {
+            "events": 575,
+            "l1": 0.13391304347826086,
+            "correct_percent": 86.60869565217392,
+            "max_error": 1
+          },
+          "parallel": {
+            "events": 4343,
+            "l1": 0.021413769283905135,
+            "correct_percent": 97.85862307160949,
+            "max_error": 1
+          }
+        },
+        "signs": {
+          "perpendicular": {
+            "events": 575,
+            "violations": 4
+          },
+          "parallel": {
+            "events": 4343,
+            "violations": 0
+          }
+        }
+      },
+      "signs": {
+        "parallel": {
+          "events": 4343,
+          "violations": 0
+        },
+        "perpendicular": {
+          "events": 575,
+          "violations": 4
+        }
+      }
+    },
+    "internal_signs": {
+      "perpendicular": {
+        "events": 4924,
+        "violations": 3
+      },
+      "parallel": {
+        "events": 15428,
+        "violations": 0
+      }
+    },
+    "seconds_total": 14.87513152207248
+  }
+}

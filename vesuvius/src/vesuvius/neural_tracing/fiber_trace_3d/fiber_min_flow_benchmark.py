@@ -123,7 +123,7 @@ def small_reference(d, solution, reference, transport):
     return result
 
 
-def large_reference(project, d, solution, paths, reference, details=None):
+def large_reference(project, d, solution, paths, reference, details=None, pieces=None):
     root = project/'data'
     events = read(root/'neighbor_round10_pair_v1/prepared/gt_events.json')
     gc = read(root/'bbox_gt_solve_v3/uv_whole/config.json')
@@ -143,7 +143,8 @@ def large_reference(project, d, solution, paths, reference, details=None):
         if not valid:
             skipped += 1
             continue
-        p = picks[e['test_source']]
+        p = (picks[e['test_source']] if pieces is None else
+             pieces.locate(e['test_source'], e['test_arc']))
         x, t = paths.at(e['test_source'], e['test_arc'])
         y, gt_transport = gp.at(e['gt_source'], e['gt_arc'])
         c = paths.seam.segment(x, y)

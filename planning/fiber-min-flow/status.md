@@ -1,6 +1,9 @@
-# Baseline promotion status
-- [x] Record task and plan.
-- [x] Independent plan review; fractional-default spec correction applied.
-- [x] Promote defaults and update docs; retain explicit rounded mode and historical results.
-- [x] Regression tests: 37 passed; diff check clean.
-- [x] Prepared implementation and results for the requested baseline commit.
+# Split experiment status
+- [x] Record task/plan and locate existing splitter.
+- [x] Independent review; original-start charts approved, duplicate observations handled, global-gauge signs reported.
+- [x] Implement and validate piece mapping/scoring;40 tests pass.
+- [x] Run free, joint intact-GT, joint GT-splittable; all certificates pass.
+- [x] Verify unsplit mapping/scoring equivalence against accepted results on all three inputs.
+- [x] Inspect breaks, sign violations and component changes; document results.
+
+Complete; accepted whole-fiber baseline remains unchanged. Split implementation and results prepared for the user-requested commit.

@@ -1,0 +1,7 @@
+{
+  "project": "/home/hendrik/villa2/global-fiber-sgd",
+  "output_root": "/home/hendrik/villa_super/villa-min-flow/global-fiber-min-flow/data/split_large_v1",
+  "minimum_length_vx": 1000,
+  "minimum_perpendicular": 4,
+  "continuation_weight": 0
+}

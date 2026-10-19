@@ -1,0 +1,103 @@
+{
+  "free": {
+    "baseline_perpendicular_l1": 0.1426086956521739,
+    "split_perpendicular_l1": 0.1426086956521739,
+    "baseline_gt_signs": {
+      "parallel": {
+        "events": 4343,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 575,
+        "violations": 4
+      }
+    },
+    "split_gt_signs": {
+      "parallel": {
+        "events": 4343,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 575,
+        "violations": 4
+      }
+    },
+    "breaks": []
+  },
+  "joint_intact_gt": {
+    "baseline_perpendicular_l1": 0.1356521739130435,
+    "split_perpendicular_l1": 0.1356521739130435,
+    "baseline_gt_signs": {
+      "parallel": {
+        "events": 4343,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 575,
+        "violations": 3
+      }
+    },
+    "split_gt_signs": {
+      "parallel": {
+        "events": 4343,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 575,
+        "violations": 3
+      }
+    },
+    "breaks": []
+  },
+  "joint_splittable_gt": {
+    "baseline_perpendicular_l1": 0.1356521739130435,
+    "split_perpendicular_l1": 0.13391304347826086,
+    "baseline_gt_signs": {
+      "parallel": {
+        "events": 4343,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 575,
+        "violations": 3
+      }
+    },
+    "split_gt_signs": {
+      "parallel": {
+        "events": 4343,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 575,
+        "violations": 4
+      }
+    },
+    "breaks": [
+      {
+        "source": 471177,
+        "arc": 3298.582381380267,
+        "winding_jump": -1
+      },
+      {
+        "source": 471178,
+        "arc": 47379.39704807509,
+        "winding_jump": 1
+      },
+      {
+        "source": 471178,
+        "arc": 48709.40562169033,
+        "winding_jump": -1
+      },
+      {
+        "source": 471178,
+        "arc": 63229.99235359165,
+        "winding_jump": 1
+      },
+      {
+        "source": 471178,
+        "arc": 66192.8903754416,
+        "winding_jump": -1
+      }
+    ]
+  }
+}

@@ -9,3 +9,6 @@ Added opt-in exact adjacent-integer decomposition of signed fractional L1 target
 
 ### Accepted baseline
 Promoted fractional mode to default at user request, including canonical runner and GT audit. Historical rounded artifacts and explicit rounded compatibility preserved; 37 regression tests pass.
+
+### Split-fiber variation
+Added independent piece mapping with original-source arc identity and shared piece-aware GT scoring. Three large runs (free/intact-GT/splittable-GT),40 tests, certified optima and detailed results; whole-fiber default preserved. Ordinary splitting leaves headline metrics unchanged; GT splitting slightly improves perpL1 but adds one GT sign violation.

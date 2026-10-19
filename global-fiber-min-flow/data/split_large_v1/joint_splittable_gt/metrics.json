@@ -1,0 +1,125 @@
+{
+  "original_fibers": 2060,
+  "pieces": 2421,
+  "split_original_fibers": 201,
+  "gt_original_fibers": 7,
+  "gt_pieces": 137,
+  "protected_gt_sources": [],
+  "events": 21186,
+  "used_events": 21166,
+  "excluded_events": 20,
+  "flow_arcs": 40682,
+  "retained_length_percent": 100.0,
+  "continuation_weight": 0,
+  "boundaries": 361,
+  "nonzero_boundary_jumps": 5,
+  "boundary_max_jump": 1,
+  "boundary_note": "Independent component offsets make cross-component jumps unidentifiable",
+  "identifiable_nonzero_boundary_jumps": 5,
+  "certificate": {
+    "primal": 4102.3546766036525,
+    "dual": 4102.3546766036525,
+    "gap": 0.0,
+    "conservation_max": 2.5424107263916085e-14,
+    "capacity_violation_max": 0.0,
+    "potential_rounding_max": 0.0,
+    "components": 2,
+    "seconds": 0.267733900109306,
+    "optimal": true,
+    "backend": "scipy.optimize.linprog/highs-ds capacitated circulation",
+    "iterations": 5246
+  },
+  "component_sizes": [
+    2420,
+    1
+  ],
+  "child_components_per_baseline_component": {
+    "0": 1,
+    "1": 1
+  },
+  "reference": {
+    "all": {
+      "events": 4918,
+      "l1": 0.03456689711264742,
+      "correct_percent": 96.54331028873526,
+      "max_error": 1
+    },
+    "perpendicular": {
+      "events": 575,
+      "l1": 0.13391304347826086,
+      "correct_percent": 86.60869565217392,
+      "max_error": 1
+    },
+    "parallel": {
+      "events": 4343,
+      "l1": 0.021413769283905135,
+      "correct_percent": 97.85862307160949,
+      "max_error": 1
+    },
+    "available_events": 5251,
+    "scored_events": 4918,
+    "unscored_events": 333,
+    "component_gauges": {
+      "0": {
+        "offset": 6,
+        "events": 4918
+      }
+    },
+    "gauge_policy": "per-component integer median; GT used only for evaluation",
+    "reference": "frozen gt_winding_reference.json; source 7 excluded",
+    "single_global_gauge": {
+      "offset": 6,
+      "metrics": {
+        "all": {
+          "events": 4918,
+          "l1": 0.03456689711264742,
+          "correct_percent": 96.54331028873526,
+          "max_error": 1
+        },
+        "perpendicular": {
+          "events": 575,
+          "l1": 0.13391304347826086,
+          "correct_percent": 86.60869565217392,
+          "max_error": 1
+        },
+        "parallel": {
+          "events": 4343,
+          "l1": 0.021413769283905135,
+          "correct_percent": 97.85862307160949,
+          "max_error": 1
+        }
+      },
+      "signs": {
+        "perpendicular": {
+          "events": 575,
+          "violations": 4
+        },
+        "parallel": {
+          "events": 4343,
+          "violations": 0
+        }
+      }
+    },
+    "signs": {
+      "parallel": {
+        "events": 4343,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 575,
+        "violations": 4
+      }
+    }
+  },
+  "internal_signs": {
+    "perpendicular": {
+      "events": 4924,
+      "violations": 3
+    },
+    "parallel": {
+      "events": 15428,
+      "violations": 0
+    }
+  },
+  "seconds_total": 14.87513152207248
+}

@@ -12,3 +12,6 @@ Retain unsigned observations only where both signed target interpretations coinc
 
 ## Fractional measurement mode
 Default `target_mode: fractional` preserves signed calibrated fractional centers, clamped in outward coordinates to the existing same/next order margin. Add exact integer seam transport, then represent t=n+alpha by targets n and n+1 with weights w(1-alpha), w*alpha. This equals w|integer_difference-t| exactly on integer labels. Retain baseline-unique unsigned integer targets; exclude the same ambiguous observations. Sign-only cases keep their original integer hinges. Expanded flow arcs carry an original-event index; event coverage is not an arc count. Rounded targets remain available through explicit `target_mode: rounded`.
+
+## Split-fiber variation
+Optional independent integer variables per eligible original-source arc piece; use shared eligible-midpoint split_bounds. Variables retain original fiber-start charts, so transport is unchanged. Reference prediction lookup must select the piece by source and original arc. GT reference remains unsplit. All pieces retained; GT-splittable is distinct from selectable/disabling. Whole-fiber default remains the accepted baseline. Report global/component gauge metrics, event coverage and connectivity changes.

@@ -1,2 +1,2 @@
 # Current task
-Promote the validated fractional-target experiment to the default baseline, commit its implementation and results, and report measured solve time separately from total case processing.
+Run fractional flow with fiber splitting on three large cases and report perpendicular GT L1 and perpendicular/parallel GT sign violation counts separately.
